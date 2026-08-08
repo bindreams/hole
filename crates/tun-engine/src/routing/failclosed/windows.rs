@@ -9,6 +9,13 @@
 //! belt-and-suspenders) — + the SS server IP on CONNECT, block everything else on
 //! CONNECT (egress kill switch).
 //!
+//! Optionally also permits ONE more address on its own family's CONNECT layer,
+//! scoped to `RESOLVER_PERMIT_PORT`: the resolver the caller's own `ech-doh`
+//! URL names, so a plugin's later ECH-config fetch (dialing that same
+//! resolver under this same cover) is not blocked. Omitted whenever nothing
+//! should be permitted — see `Routing::install_failclosed_cover`'s doc for
+//! the exact conditions.
+//!
 //! One sublayer, weight-based arbitration: the permits sit at weight 15 and the
 //! block-all at weight 0, so within the sublayer the higher-weight permit wins.
 //! NO filter sets `CLEAR_ACTION_RIGHT`. That flag makes THIS filter's own action
@@ -37,15 +44,26 @@ use windows::Win32::Foundation::{ERROR_SUCCESS, HANDLE};
 use windows::Win32::NetworkManagement::WindowsFilteringPlatform::*;
 use windows::Win32::System::Rpc::RPC_C_AUTHN_WINNT;
 
+use super::RESOLVER_PERMIT_PORT;
 use crate::error::RoutingError;
 
 // Fixed Hole identifiers. Compiled in so recovery can delete by key with no
 // persisted runtime state. Generated once; never reuse for anything else.
 pub const PROVIDER_GUID: GUID = GUID::from_u128(0xa3f1c2d4_5b6e_47a8_9c0d_1e2f3a4b5c6d);
 pub const SUBLAYER_GUID: GUID = GUID::from_u128(0xb4e2d3c5_6c7f_58b9_ad1e_2f3a4b5c6d7e);
-// Ten fixed filter GUIDs — recovery deletes all ten unconditionally
-// (idempotent), so the set is deterministic regardless of server family.
-pub const FILTER_GUIDS: [GUID; 10] = [
+// Twelve fixed filter GUIDs — recovery deletes all twelve unconditionally
+// (idempotent), so the set is deterministic regardless of server/resolver
+// family. CROSS-VERSION CONTRACT: `delete_all`/`recover_cover` sweep by
+// enumerating exactly this compiled-in array, not by querying the OS for
+// "every filter this provider owns" — so a crash-then-downgrade (a build
+// that knows all twelve GUIDs engages, crashes, and an OLDER build that
+// only knows ten runs recovery) leaves the two new resolver-permit filters
+// permanently un-swept inside the sublayer the standing lockdown cover also
+// uses (tracked: bindreams/hole#754). Growing this array again inherits the
+// same risk; a version-independent sweep (enumerate live filters by
+// PROVIDER_GUID instead of a fixed array) would remove it but is a separate,
+// self-contained change.
+pub const FILTER_GUIDS: [GUID; 12] = [
     GUID::from_u128(0xc5f3e4d6_7d80_69ca_be2f_3a4b5c6d7e8f), // loopback CONNECT V4
     GUID::from_u128(0xd6041507_8e91_7adb_cf30_4b5c6d7e8f90), // loopback CONNECT V6
     GUID::from_u128(0xe7152618_9fa2_8bec_d041_5c6d7e8f9001), // server V4
@@ -56,7 +74,14 @@ pub const FILTER_GUIDS: [GUID; 10] = [
     GUID::from_u128(0x64f1885c_8acb_79c4_fac2_cd84e29f45eb), // loopback RECV_ACCEPT V6
     GUID::from_u128(0x8827e6e8_461b_48a0_9e88_dc6371486cb0), // loopback-net CONNECT V4 (127.0.0.0/8)
     GUID::from_u128(0x07d38d29_4bbb_472f_aeb3_e9d71f8967d9), // loopback-net CONNECT V6 (::1/128)
+    GUID::from_u128(0xa2a6419f_0dd6_4628_9578_0424bf1cc9b2), // resolver CONNECT V4
+    GUID::from_u128(0xa020f996_e73f_488c_b1c9_5fce3ea0b1eb), // resolver CONNECT V6
 ];
+
+/// IANA protocol number for TCP (RFC 790; never changes — not sourced from
+/// the `windows` crate's `WinSock::IPPROTO_TCP` to avoid an extra import for
+/// a value this stable).
+const IPPROTO_TCP: u8 = 6;
 
 // Lockdown-cover filter GUIDs — disjoint from FILTER_GUIDS. Recovery sweeps
 // these (Sweep) or deletes the volatile TUN + server pairs (Adopt) — see
@@ -109,7 +134,7 @@ fn appid_filter_guid(index: usize, v6: bool) -> GUID {
 const MAX_APPID_BINARIES: usize = 4;
 
 /// Every transient-cover filter GUID a recovery `delete_all` must remove: the
-/// ten fixed GUIDs. Mirrors [`swept_lockdown_guids`] for the lockdown cover.
+/// twelve fixed GUIDs. Mirrors [`swept_lockdown_guids`] for the lockdown cover.
 fn swept_transient_guids() -> Vec<GUID> {
     FILTER_GUIDS.to_vec()
 }
@@ -173,6 +198,11 @@ pub enum Condition {
     LoopbackNet(IpAddr),
     /// Match a single remote host address (`FWPM_CONDITION_IP_REMOTE_ADDRESS`).
     RemoteIp(IpAddr),
+    /// Match a single remote host address AND TCP protocol AND a specific
+    /// remote port — all ANDed (WFP: every condition on one filter must
+    /// match). Used ONLY for the resolver permit: least privilege over the
+    /// unrestricted `RemoteIp` the server permit uses.
+    RemoteIpPortTcp(IpAddr, u16),
     /// Match the local interface by `NET_LUID` (`FWPM_CONDITION_IP_LOCAL_INTERFACE`,
     /// `FWP_UINT64`). Carries app traffic: route selection picks hole-tun
     /// before `ALE_AUTH_CONNECT`, so a connect to any destination classifies
@@ -214,14 +244,16 @@ pub const PERMIT_WEIGHT: u8 = 15;
 /// Filter weight for the block-all filters.
 pub const BLOCK_WEIGHT: u8 = 0;
 
-/// Build the data description of the fail-closed cover for `server_ip`.
+/// Build the data description of the fail-closed cover for `server_ip`, and
+/// (when `Some`) `resolver_ip` — see `Routing::install_failclosed_cover`'s
+/// doc for the trust condition a caller must meet to pass `Some` here.
 /// Permits loopback on CONNECT *and* RECV_ACCEPT (loopback connects authorize on
 /// both ALE directions) by the loopback address range (127.0.0.0/8, ::1/128) on
 /// all four layers, plus the IS_LOOPBACK flag on CONNECT as belt-and-suspenders,
 /// plus the server IP on CONNECT (its own family's layer); blocks all else on
 /// CONNECT only (egress kill switch). Pure — no FFI; `engage` submits it in one
 /// transaction.
-pub fn build_cover_spec(server_ip: IpAddr) -> CoverSpec {
+pub fn build_cover_spec(server_ip: IpAddr, resolver_ip: Option<IpAddr>) -> CoverSpec {
     let server_layer = match server_ip {
         IpAddr::V4(_) => Layer::ConnectV4,
         IpAddr::V6(_) => Layer::ConnectV6,
@@ -292,6 +324,19 @@ pub fn build_cover_spec(server_ip: IpAddr) -> CoverSpec {
             weight: PERMIT_WEIGHT,
         },
     ];
+    if let Some(ip) = resolver_ip {
+        let (guid, layer) = match ip {
+            IpAddr::V4(_) => (FILTER_GUIDS[10], Layer::ConnectV4),
+            IpAddr::V6(_) => (FILTER_GUIDS[11], Layer::ConnectV6),
+        };
+        filters.push(FilterSpec {
+            guid,
+            layer,
+            action: Action::Permit,
+            condition: Condition::RemoteIpPortTcp(ip, RESOLVER_PERMIT_PORT),
+            weight: PERMIT_WEIGHT,
+        });
+    }
     filters.push(block(FILTER_GUIDS[4], Layer::ConnectV4));
     filters.push(block(FILTER_GUIDS[5], Layer::ConnectV6));
     CoverSpec {
@@ -450,6 +495,16 @@ fn wfp_check(code: u32, what: &str) -> Result<(), RoutingError> {
 
 /// As [`wfp_check`], but a duplicate-add (`FWP_E_ALREADY_EXISTS`) is also OK —
 /// re-engaging over an unswept cover is idempotent.
+///
+/// CROSS-VERSION CONTRACT, disclosed residual: this idempotency also means a
+/// repair (release the held cover, re-engage with a corrected server/resolver
+/// value — `ProxyManager`'s retry-repair path) can silently keep the OLD
+/// filter value live if the release's `FwpmFilterDeleteByKey0` (in
+/// `delete_all`, whose return codes are discarded) fails for that GUID: the
+/// re-add then hits `FWP_E_ALREADY_EXISTS` and reports success while the LIVE
+/// filter still carries the value the delete failed to remove. A stale
+/// PERMIT surviving, never a leaked block. Tracked separately:
+/// bindreams/hole#761.
 fn ok_or_exists(code: u32, what: &str) -> Result<(), RoutingError> {
     if code == FWP_E_ALREADY_EXISTS_DWORD {
         return Ok(());
@@ -458,8 +513,13 @@ fn ok_or_exists(code: u32, what: &str) -> Result<(), RoutingError> {
 }
 
 #[allow(clippy::disallowed_methods)] // THIS is the sanctioned FWPM call site
-pub fn engage(server_ip: IpAddr, _state_dir: &Path, _owner: Option<(u32, u32)>) -> Result<Cover, RoutingError> {
-    let spec = build_cover_spec(server_ip);
+pub fn engage(
+    server_ip: IpAddr,
+    resolver_ip: Option<IpAddr>,
+    _state_dir: &Path,
+    _owner: Option<(u32, u32)>,
+) -> Result<Cover, RoutingError> {
+    let spec = build_cover_spec(server_ip, resolver_ip);
     unsafe {
         // A NON-dynamic engine session (`session = None`): a dynamic session
         // would auto-delete our filters when this process exits, reopening the
@@ -706,6 +766,64 @@ unsafe fn add_filter(engine: HANDLE, provider: GUID, sublayer: GUID, f: &FilterS
                     Anonymous: FWP_CONDITION_VALUE0_0 {
                         byteArray16: &mut v6buf,
                     },
+                },
+            });
+        }
+        // Resolver permit: address + protocol + port, ANDed on one filter (WFP
+        // requires every condition on a filter to match). Least privilege over
+        // the unrestricted RemoteIp arms above — see the Condition doc.
+        Condition::RemoteIpPortTcp(IpAddr::V4(v4), port) => {
+            conditions.push(FWPM_FILTER_CONDITION0 {
+                fieldKey: FWPM_CONDITION_IP_REMOTE_ADDRESS,
+                matchType: FWP_MATCH_EQUAL,
+                conditionValue: FWP_CONDITION_VALUE0 {
+                    r#type: FWP_UINT32,
+                    Anonymous: FWP_CONDITION_VALUE0_0 { uint32: u32::from(*v4) },
+                },
+            });
+            conditions.push(FWPM_FILTER_CONDITION0 {
+                fieldKey: FWPM_CONDITION_IP_PROTOCOL,
+                matchType: FWP_MATCH_EQUAL,
+                conditionValue: FWP_CONDITION_VALUE0 {
+                    r#type: FWP_UINT8,
+                    Anonymous: FWP_CONDITION_VALUE0_0 { uint8: IPPROTO_TCP },
+                },
+            });
+            conditions.push(FWPM_FILTER_CONDITION0 {
+                fieldKey: FWPM_CONDITION_IP_REMOTE_PORT,
+                matchType: FWP_MATCH_EQUAL,
+                conditionValue: FWP_CONDITION_VALUE0 {
+                    r#type: FWP_UINT16,
+                    Anonymous: FWP_CONDITION_VALUE0_0 { uint16: *port },
+                },
+            });
+        }
+        Condition::RemoteIpPortTcp(IpAddr::V6(v6), port) => {
+            v6buf.byteArray16 = v6.octets();
+            conditions.push(FWPM_FILTER_CONDITION0 {
+                fieldKey: FWPM_CONDITION_IP_REMOTE_ADDRESS,
+                matchType: FWP_MATCH_EQUAL,
+                conditionValue: FWP_CONDITION_VALUE0 {
+                    r#type: FWP_BYTE_ARRAY16_TYPE,
+                    Anonymous: FWP_CONDITION_VALUE0_0 {
+                        byteArray16: &mut v6buf,
+                    },
+                },
+            });
+            conditions.push(FWPM_FILTER_CONDITION0 {
+                fieldKey: FWPM_CONDITION_IP_PROTOCOL,
+                matchType: FWP_MATCH_EQUAL,
+                conditionValue: FWP_CONDITION_VALUE0 {
+                    r#type: FWP_UINT8,
+                    Anonymous: FWP_CONDITION_VALUE0_0 { uint8: IPPROTO_TCP },
+                },
+            });
+            conditions.push(FWPM_FILTER_CONDITION0 {
+                fieldKey: FWPM_CONDITION_IP_REMOTE_PORT,
+                matchType: FWP_MATCH_EQUAL,
+                conditionValue: FWP_CONDITION_VALUE0 {
+                    r#type: FWP_UINT16,
+                    Anonymous: FWP_CONDITION_VALUE0_0 { uint16: *port },
                 },
             });
         }

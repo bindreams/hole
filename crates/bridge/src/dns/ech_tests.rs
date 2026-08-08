@@ -83,6 +83,28 @@ fn ipv6_authority_is_bracketed() {
     );
 }
 
+// An executable pin, not just prose: the URL never carries an explicit port
+// (see `DOH_PORT`'s doc), so this asserts against the `url` crate's own
+// scheme-default table instead of restating the assumption.
+#[skuld::test]
+fn doh_url_for_ip_ports_to_the_https_default() {
+    for addr in ["1.1.1.1", "2606:4700:4700::1111"] {
+        let url = doh_url_for_ip(ip(addr));
+        let parsed = url::Url::parse(&url).expect("doh_url_for_ip must produce a parseable URL");
+        assert_eq!(parsed.port_or_known_default(), Some(DOH_PORT));
+    }
+}
+
+// The one enforced link between DOH_PORT and RESOLVER_PERMIT_PORT (see
+// DOH_PORT's doc for why they can't just share one declaration): if either
+// constant is ever edited alone, this fails instead of the two silently
+// drifting (the fail-closed cover would then permit a port ex-ray never
+// dials while blocking the one it does).
+#[skuld::test]
+fn resolver_permit_port_matches_doh_port() {
+    assert_eq!(tun_engine::routing::failclosed::RESOLVER_PERMIT_PORT, DOH_PORT);
+}
+
 // The shipped default is Cloudflare: the ECH lookup must not be handed
 // `cloudflare-dns.com`, whose resolution would go over plaintext system DNS.
 #[skuld::test]
@@ -237,4 +259,13 @@ fn every_provider_ip_yields_a_name_free_authority() {
             "ech-doh authority for {resolver} must be the IP literal, got {url}"
         );
     }
+}
+
+#[skuld::test]
+fn verified_ip_is_some_only_for_answered() {
+    let addr = ip("1.1.1.1");
+    assert_eq!(PinSource::Answered(addr).verified_ip(), Some(addr));
+    assert_eq!(PinSource::NoQueryNeeded.verified_ip(), None);
+    assert_eq!(PinSource::SecureBootstrapFailed.verified_ip(), None);
+    assert_eq!(PinSource::ResolverDeselected.verified_ip(), None);
 }

@@ -241,10 +241,15 @@ pub struct ProxyManager<P: Proxy = ShadowsocksProxy, R: Routing = SystemRouting,
     last_ech_doh: Option<String>,
 }
 
-/// A held block-until-connected cover plus the server identity it permits. The
-/// cover permits exactly `server_ip`, so a covered retry for the same `host`
-/// reuses `server_ip` rather than re-resolving — re-resolution under the held
-/// cover would be blocked (the cover permits the server, not the DoH resolvers).
+/// A held block-until-connected cover plus the server identity it permits.
+/// `resolver_permit` is what was ACTUALLY passed to `install_failclosed_cover`
+/// at the engage that produced `cover` — ground truth for what the LIVE OS
+/// cover permits, frozen until the next fresh engage. A covered retry against
+/// the same `host` reuses `server_ip` and never re-engages the cover UNLESS
+/// this attempt's freshly re-derived permit now differs from `resolver_permit`
+/// (e.g. the user added a plugin since the first attempt) — that drift makes
+/// the held cover stale, and `start_cancellable` releases it so the engage
+/// block re-engages fresh with the corrected permit.
 struct BlockedStart<C> {
     cover: C,
     host: String,
@@ -253,6 +258,27 @@ struct BlockedStart<C> {
     /// retry never re-resolves, so it reuses this — revalidated against the
     /// retry's own config, so an edited resolver set is never overridden.
     pin: crate::dns::ech::PinSource,
+    /// The resolver this cover's ENGAGE actually permitted (or `None`) — see
+    /// the struct doc. Distinct from `pin`: `pin` is revalidated every retry,
+    /// this field is not, because it describes the live OS cover, not the
+    /// current config.
+    resolver_permit: Option<IpAddr>,
+    /// `Some(x)` when the LAST repair attempt wanted to correct the permit to
+    /// `x` but the corrected engage failed and a compensating restore fell
+    /// back to `resolver_permit` instead (`x != Some(resolver_permit)`, by
+    /// construction — the outer `Option` marks "a dead value is known", the
+    /// inner one is the resolver-permit value itself, which can legitimately
+    /// be `None`). A retry whose freshly-derived permit is again exactly `x`
+    /// skips the repair attempt ONCE (bounding the release-then-reengage
+    /// window from reopening on every single retry of an unreachable value)
+    /// and CLEARS this marker for the retry after — a fresh attempt is never
+    /// permanently withheld, since the corrected engage's failure could be
+    /// transient (a momentary OS-level condition), not a lasting property of
+    /// the value itself. Net effect for a persistently-failing value: retried
+    /// every OTHER matching retry, not every one and not never. `None` once a
+    /// correction lands (the held permit is exactly what this attempt wants)
+    /// or has never been attempted.
+    dead_permit: Option<Option<IpAddr>>,
 }
 
 impl<P: Proxy, R: Routing> ProxyManager<P, R, SystemDns> {
@@ -546,9 +572,10 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         #[cfg(not(test))]
         let bootstrap_querier: Option<std::sync::Arc<dyn crate::dns::bootstrap::DohQuerier>> = None;
 
-        // A held cover permits only the OLD server IP, so a start for a DIFFERENT
-        // server must release it BEFORE resolving — DoH under the stale cover would
-        // be blocked (the resolvers aren't permitted) and wedge.
+        // A DIFFERENT server's hostname needs a FRESH DoH resolution — not
+        // guaranteed to land on the resolver already baked into the held cover
+        // (see `BlockedStart`'s doc) — so a start for a different server must
+        // release the held cover BEFORE resolving.
         let stale = self.blocked.as_ref().is_some_and(|b| b.host != config.server.server);
         if stale {
             debug_assert!(self.blocked.is_some(), "stale implies a held cover");
@@ -556,8 +583,8 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
             warn!("start for a different server while blocked: releasing the held cover before re-resolving");
         }
 
-        // Resolve the server IP over private DoH. A same-server retry under the held
-        // cover reuses the cached IP (the cover blocks the resolvers).
+        // Resolve the server IP over private DoH. A same-server retry under the
+        // held cover reuses the cached IP and pin.
         let (server_ip, pin) = match self.blocked.as_ref().filter(|b| b.host == config.server.server) {
             Some(b) => (b.server_ip, crate::dns::ech::revalidate(b.pin, &config.dns.servers)),
             None => match Self::resolve_server_ip(config, &bootstrap_querier, &cancel).await {
@@ -577,25 +604,61 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
             },
         };
 
-        // Only a plugin chain carries an ECH lookup, so a plugin-less start
-        // derives nothing and reports nothing — an "unpinned ECH lookup" line
-        // there would name an exposure that does not exist. Every pin outcome
-        // reaches ex-ray as one URL, so the reason is named here or it is
-        // unrecoverable from the log.
-        let ech_doh = if config.server.plugin.is_some() {
-            let derived = crate::dns::ech::ech_doh_url(&config.dns, pin);
-            debug!(ech_doh = ?derived, ?pin, "ech-doh source");
-            if matches!(pin, crate::dns::ech::PinSource::ResolverDeselected) {
+        // `ech_doh` (what ex-ray is TOLD to fetch) and `ech_resolver_permit`
+        // (what THIS ATTEMPT would permit it to reach) both read the same
+        // plugin-presence + pin inputs — computed ONCE here so the two cannot
+        // drift apart under a future edit to either gate. Only a plugin chain
+        // carries an ECH lookup, so a plugin-less start derives nothing.
+        let plugin_pin: Option<crate::dns::ech::PinSource> = config.server.plugin.is_some().then_some(pin);
+
+        // Every pin outcome reaches ex-ray as one URL, so the reason is named
+        // here or it is unrecoverable from the log. An "unpinned ECH lookup"
+        // line for a plugin-less start would name an exposure that does not
+        // exist, hence `plugin_pin` gating this too.
+        let ech_doh = plugin_pin.and_then(|p| {
+            let derived = crate::dns::ech::ech_doh_url(&config.dns, p);
+            debug!(ech_doh = ?derived, ?p, "ech-doh source");
+            if matches!(p, crate::dns::ech::PinSource::ResolverDeselected) {
                 warn!("covered retry: the cached DoH resolver is no longer configured; the ECH lookup is unpinned");
             }
             derived
-        } else {
-            None
-        };
+        });
         #[cfg(test)]
         {
             self.last_ech_doh = ech_doh.as_ref().map(|e| e.url.clone());
         }
+
+        // `ech_doh` is Hole's CANDIDATE — what it would tell ex-ray, before
+        // `inject_plugin_directives` runs. That injection only rewrites
+        // `ech-doh` for the v2ray-family plugin names, and even then an
+        // operator's own `ech-doh` already in `plugin_opts` can win
+        // first-wins over Hole's (see `effective_ech_doh`'s doc). The cover
+        // must be gated on whether Hole's candidate is the EFFECTIVE value
+        // ex-ray actually dials — not on `ech_doh.is_some()` alone — or a
+        // non-ECH-capable plugin, or an operator's own override, would widen
+        // the cover for a fetch that provably does not use it. The residual
+        // warning below also reads `effective_ech_doh` directly, to name an
+        // operator-won address the cover cannot permit either.
+        let effective_ech_doh = crate::proxy::plugin::effective_ech_doh(
+            config.server.plugin.as_deref().unwrap_or_default(),
+            config.server.plugin_opts.as_deref(),
+            ech_doh.as_ref(),
+        );
+        let ech_effective = matches!(effective_ech_doh, crate::proxy::plugin::EffectiveEchDoh::Holes);
+
+        // `ech_doh.resolver`, read directly — not re-derived from `pin` — is
+        // the exact address the ECH-config fetch will dial (see `EchDoh`'s
+        // doc for why permitting it costs no new trust regardless of
+        // `PinSource`). Gated on `ech_effective`, not `ech_doh.is_some()`: a
+        // non-ECH-capable plugin or an operator's own override never widens
+        // the cover for a fetch that provably won't use Hole's address.
+        let ech_resolver_permit = ech_effective.then_some(ech_doh.as_ref()).flatten().map(|e| e.resolver);
+        debug!(
+            ?ech_resolver_permit,
+            ?pin,
+            ech_effective,
+            "failclosed cover resolver permit"
+        );
 
         // Engage the block-until-connected cover for a covered start UNLESS the
         // standing lockdown intent is on: that cohort installs the lockdown cover
@@ -607,23 +670,107 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
             .as_deref()
             .map(lockdown_state::load_enabled)
             .unwrap_or(false);
+
+        // A held cover's resolver_permit is fixed at engage time; re-engage
+        // only when this attempt's fresh derivation NEEDS a specific address
+        // the held cover doesn't already have (`ech_resolver_permit.is_some_and`
+        // below — a narrowing to `None`, e.g. the plugin was removed, is left
+        // as a superset permit rather than paying the release-to-reengage
+        // window for a correction with no benefit). `repair_fallback`
+        // captures what's being given up: `Some(old_permit)` means a good
+        // cover existed a moment ago, so a failed fresh engage below
+        // restores it instead of leaving the host uncovered.
+        //
+        // A drift matching a KNOWN-DEAD value (see `dead_permit`'s doc) skips
+        // the repair this retry and clears the marker so the next retry gets
+        // a fresh attempt — a single `install_failclosed_cover` failure
+        // (e.g. a momentary WFP/pf contention) must not wedge the repair
+        // permanently.
+        let repair_fallback: Option<Option<IpAddr>> = if covered && !lockdown_on {
+            match self.blocked.as_mut().filter(|b| {
+                b.host == config.server.server && ech_resolver_permit.is_some_and(|r| b.resolver_permit != Some(r))
+            }) {
+                Some(b) if b.dead_permit == Some(ech_resolver_permit) => {
+                    b.dead_permit = None;
+                    None
+                }
+                Some(b) => Some(b.resolver_permit),
+                None => None,
+            }
+        } else {
+            None
+        };
+        if repair_fallback.is_some() {
+            self.blocked.take();
+            warn!(
+                "covered retry: this attempt's resolver permit differs from the held cover's; \
+                 releasing it so a fresh engage can correct it — egress is briefly OPEN until \
+                 the corrected (or, on failure, the restored) cover re-engages below"
+            );
+        }
+
         if covered && !lockdown_on {
             // The transient cover is a global singleton — never construct a second
             // over the same objects. An engage failure proceeds UNCOVERED (aborting
-            // would leave the user unconnected AND unprotected), surfaced via last_error.
+            // would leave the user unconnected AND unprotected), surfaced via last_error
+            // — UNLESS this was a repair (`repair_fallback` is `Some`), in which case
+            // the host was ALREADY covered a moment ago and a compensating re-engage
+            // of the OLD permit is attempted first: correcting a permit now takes
+            // BOTH the corrected AND the restore engage failing to lose the cover
+            // (the `Err(e2)` arm below), not one — never impossible, just
+            // narrowed from the ordinary single-engage failure case. On that
+            // double failure this attempt proceeds open, same as the
+            // non-repair case; the NEXT retry finds `self.blocked` is `None`
+            // and re-engages fresh from scratch.
             if self.blocked.is_none() {
-                match self.routing.install_failclosed_cover(server_ip) {
+                match self.routing.install_failclosed_cover(server_ip, ech_resolver_permit) {
                     Ok(cover) => {
                         self.blocked = Some(BlockedStart {
                             cover,
                             host: config.server.server.clone(),
                             server_ip,
                             pin,
+                            resolver_permit: ech_resolver_permit,
+                            dead_permit: None,
                         });
                     }
                     Err(e) => {
-                        warn!(error = %e, "failed to engage fail-closed cover on covered start; host NOT blocked, proceeding open");
-                        self.last_error = Some(e.to_string());
+                        if let Some(old_permit) = repair_fallback {
+                            match self.routing.install_failclosed_cover(server_ip, old_permit) {
+                                Ok(cover) => {
+                                    self.blocked = Some(BlockedStart {
+                                        cover,
+                                        host: config.server.server.clone(),
+                                        server_ip,
+                                        pin,
+                                        resolver_permit: old_permit,
+                                        // Remember the value we WANTED but could not
+                                        // reach, so a same-value retry doesn't retry
+                                        // this same failing correction forever.
+                                        dead_permit: Some(ech_resolver_permit),
+                                    });
+                                    warn!(
+                                        error = %e,
+                                        "failed to engage the corrected fail-closed cover; restored the \
+                                         PREVIOUS permit instead of leaving the host open — ex-ray's ECH \
+                                         fetch may still stall against the now-stale permit"
+                                    );
+                                    self.last_error = Some(e.to_string());
+                                }
+                                Err(e2) => {
+                                    warn!(
+                                        error = %e,
+                                        restore_error = %e2,
+                                        "failed to engage BOTH the corrected and the previous fail-closed \
+                                         cover; host NOT blocked, proceeding open"
+                                    );
+                                    self.last_error = Some(e.to_string());
+                                }
+                            }
+                        } else {
+                            warn!(error = %e, "failed to engage fail-closed cover on covered start; host NOT blocked, proceeding open");
+                            self.last_error = Some(e.to_string());
+                        }
                     }
                 }
             }
@@ -644,6 +791,40 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
             warn!("uncovered start while blocked: releasing the held cover (host fail-open by design)");
         }
         let blocking_engaged = self.blocked.is_some();
+
+        // Disclosed residual (see CONTRIBUTING.md's "Transient cutover
+        // cover" section) gated on `effective_ech_doh`, the value that will
+        // ACTUALLY reach ex-ray: `Holes` still stalls only if a repair's
+        // restore left the LIVE held permit different from what this
+        // attempt needs (`live_permit != ech_resolver_permit`); `Operators(url)`
+        // always stalls, since the cover never permits an operator-chosen
+        // address.
+        if blocking_engaged {
+            match &effective_ech_doh {
+                crate::proxy::plugin::EffectiveEchDoh::None => {}
+                crate::proxy::plugin::EffectiveEchDoh::Holes => {
+                    let live_permit = self.blocked.as_ref().and_then(|b| b.resolver_permit);
+                    if live_permit != ech_resolver_permit {
+                        warn!(
+                            ?pin,
+                            ech_doh_url = ?ech_doh.as_ref().map(|e| &e.url),
+                            ?live_permit,
+                            ?ech_resolver_permit,
+                            "covered start: the ECH-config fetch will dial a resolver the fail-closed cover \
+                             does not permit (a repair's restore left it stale); it may stall to ex-ray's \
+                             client timeout"
+                        );
+                    }
+                }
+                crate::proxy::plugin::EffectiveEchDoh::Operators(url) => {
+                    warn!(
+                        operator_ech_doh = %url,
+                        "covered start: the plugin's own ech-doh overrides Hole's and dials a resolver the \
+                         fail-closed cover does not permit; it may stall to ex-ray's client timeout"
+                    );
+                }
+            }
+        }
 
         debug!("awaiting start_inner");
         let result: Result<RunningState<P, R, D>, ProxyError> = Self::start_inner(
