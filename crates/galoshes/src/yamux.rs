@@ -1150,28 +1150,38 @@ async fn echo_keepalive(mut stream: yamux::Stream) -> Result<()> {
 /// Parse the optional client-side `udp_timeout` (whole seconds) from an
 /// `SS_PLUGIN_OPTIONS` string.
 ///
-/// Returns [`DEFAULT_UDP_TIMEOUT`] when the key is absent. The last occurrence
-/// wins (consistent with ex-ray's duplicate-key semantics). A value that
-/// is not a positive integer is a hard error — `0` would evict every
-/// association immediately, breaking all UDP. ex-ray ignores this key,
-/// so it can share the same options string.
+/// Returns [`DEFAULT_UDP_TIMEOUT`] when the key is absent. The FIRST
+/// occurrence wins on a duplicate key — matching every other reader of this
+/// same options string (ex-ray's own `Args.Get`, and the bridge's
+/// `classify_transport`/garter-bin's `config_path_from_plugin_options`),
+/// even though `udp_timeout` is galoshes' own extension ex-ray never reads:
+/// there is no cross-tool parity requirement for this key, but there IS an
+/// intra-string one — an operator reading one options string should not
+/// see different keys resolve duplicates in opposite directions.
+///
+/// EVERY occurrence is validated, not just the winning first one — a value
+/// that is not a positive integer is a hard error on ANY occurrence (`0`
+/// would evict every association immediately, breaking all UDP), so a
+/// self-contradictory duplicate still refuses the start rather than
+/// silently keeping the first value and discarding the rest unchecked.
 pub fn parse_udp_timeout(plugin_options: Option<&str>) -> Result<Duration> {
     let Some(opts) = plugin_options else {
         return Ok(DEFAULT_UDP_TIMEOUT);
     };
-    let mut timeout = DEFAULT_UDP_TIMEOUT;
-    for (key, value) in garter::parse_plugin_options(opts) {
-        if key == "udp_timeout" {
-            let secs: u64 = value
-                .parse()
-                .with_context(|| format!("invalid udp_timeout (expected a positive integer of seconds): {value:?}"))?;
-            if secs == 0 {
-                anyhow::bail!("udp_timeout must be greater than 0 seconds");
-            }
-            timeout = Duration::from_secs(secs);
+    let mut selected: Option<Duration> = None;
+    for (key, value) in garter::parse_plugin_options(opts).map_err(garter::Error::from)? {
+        if key != "udp_timeout" {
+            continue;
         }
+        let secs: u64 = value
+            .parse()
+            .with_context(|| format!("invalid udp_timeout (expected a positive integer of seconds): {value:?}"))?;
+        if secs == 0 {
+            anyhow::bail!("udp_timeout must be greater than 0 seconds");
+        }
+        selected.get_or_insert(Duration::from_secs(secs));
     }
-    Ok(timeout)
+    Ok(selected.unwrap_or(DEFAULT_UDP_TIMEOUT))
 }
 
 pub struct YamuxPlugin {

@@ -1,4 +1,3 @@
-use garter::sip003::parse_plugin_options;
 use garter::{BinaryPlugin, ChainRunner, Mode, PluginEnv};
 
 #[tokio::main]
@@ -12,21 +11,24 @@ async fn main() -> anyhow::Result<()> {
 
     let env = PluginEnv::from_env().map_err(|e| anyhow::anyhow!("failed to parse SIP003u environment: {e}"))?;
 
-    let config_path = env
-        .plugin_options
-        .as_ref()
-        .and_then(|opts| {
-            parse_plugin_options(opts)
-                .into_iter()
-                .find(|(k, _)| k == "config")
-                .map(|(_, v)| v)
-        })
-        .ok_or_else(|| anyhow::anyhow!("SS_PLUGIN_OPTIONS must contain config=/path/to/chain.yaml"))?;
+    let cfg = garter_bin::config::resolve_chain_config(env.plugin_options.as_deref())?;
 
-    let cfg = garter_bin::config::load_config(std::path::Path::new(&config_path))?;
-    anyhow::ensure!(!cfg.chain.is_empty(), "chain config must have at least one plugin");
-
-    let mode = Mode::from_plugin_options(env.plugin_options.as_deref());
+    // Contract, not input validation: `resolve_chain_config` above already
+    // ran the same string through the identical parser
+    // (`config_path_from_plugin_options` → `split_plugin_options`) and
+    // returned `Ok`, so this is provably unreachable on every real input.
+    // `debug_assert!` makes a violation panic loudly in debug/test builds —
+    // a genuine contract break, not routine input handling — while staying
+    // truly zero-cost in release (compiled out entirely, per CLAUDE.md);
+    // the `?` alongside it is release's own fallback, so a violation there
+    // degrades to a normal, well-formed error instead of an uncontrolled
+    // panic in a binary that ships.
+    let mode_result = Mode::from_plugin_options(env.plugin_options.as_deref());
+    debug_assert!(
+        mode_result.is_ok(),
+        "already validated by resolve_chain_config's config_path_from_plugin_options call above"
+    );
+    let mode = mode_result?;
     let mut runner = ChainRunner::new().mode(mode);
     for entry in cfg.chain {
         runner = runner.add(Box::new(BinaryPlugin::new(entry.plugin, entry.options.as_deref())));

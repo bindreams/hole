@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
-use crate::chain::{allocate_ports, ChainRunner};
+use crate::chain::{allocate_ports, run_readiness_aggregator, ChainRunner, Mode};
 use crate::plugin::ChainPlugin;
 use crate::sitrep::{PluginReady, StartError, Transports};
 
@@ -340,22 +340,193 @@ async fn on_ready_dropped_on_plugin_failure() {
 
     let handle = tokio::spawn(runner.run(env));
 
-    // The plugin exits before readying, so the aggregator synthesizes a
-    // process-exit `StartError::Fatal` and sends it through ready_tx.
+    // The plugin exits before readying, so the aggregator synthesizes
+    // `StartError::ExitedBeforeReady` and sends it through ready_tx.
     let outcome = rx.await.expect("aggregator should report a start error, not drop");
-    match outcome {
-        Err(StartError::Fatal { detail, .. }) => {
-            assert!(
-                detail.contains("exited before becoming ready"),
-                "expected exited-before-ready Fatal, got: {detail}"
-            );
-        }
-        other => panic!("expected StartError::Fatal, got {other:?}"),
-    }
+    assert!(
+        matches!(outcome, Err(StartError::ExitedBeforeReady)),
+        "expected StartError::ExitedBeforeReady, got {outcome:?}"
+    );
 
     // The chain should have returned an error.
     let chain_result = handle.await.unwrap();
     assert!(chain_result.is_err());
+}
+
+// Reproduces the race `run_readiness_aggregator`'s `biased` comment
+// describes: send on `rtx` and cancel `shutdown` BEFORE the aggregator is
+// ever polled, so both arms are ready at the very first poll and `biased`
+// picks shutdown every time — only the recovery scan below can recover the
+// already-delivered value.
+#[skuld::test]
+async fn aggregator_shutdown_race_does_not_discard_an_already_delivered_start_error() {
+    let (rtx, rrx) = oneshot::channel::<Result<PluginReady, StartError>>();
+    rtx.send(Err(StartError::BindConflict {
+        errno: 10048,
+        addr: "127.0.0.1:1080".parse().unwrap(),
+    }))
+    .unwrap();
+
+    let shutdown = CancellationToken::new();
+    shutdown.cancel();
+
+    let (ready_tx, ready_rx) = oneshot::channel();
+    run_readiness_aggregator(vec![(0, rrx)], 1, Mode::Client, shutdown, ready_tx).await;
+
+    let outcome = ready_rx
+        .await
+        .expect("aggregator must not drop ready_tx: a value WAS delivered");
+    assert!(
+        matches!(outcome, Err(StartError::BindConflict { errno: 10048, .. })),
+        "expected the delivered BindConflict to survive the shutdown race, got {outcome:?}"
+    );
+}
+
+// The same race, but the delivered `StartError` sits on a LATER receiver
+// than the one the loop is currently polling: index 0 is still pending (its
+// sender is alive but hasn't sent), index 1 already holds a delivered
+// `BindConflict`. The recovery scan must check every remaining receiver,
+// not just the one that lost the `biased` race.
+#[skuld::test]
+async fn aggregator_shutdown_race_recovers_from_a_later_receiver() {
+    let (rtx0, rrx0) = oneshot::channel::<Result<PluginReady, StartError>>();
+    let (rtx1, rrx1) = oneshot::channel::<Result<PluginReady, StartError>>();
+    rtx1.send(Err(StartError::BindConflict {
+        errno: 10048,
+        addr: "127.0.0.1:1080".parse().unwrap(),
+    }))
+    .unwrap();
+    // rtx0 is kept alive (not sent, not dropped) so index 0's receiver is
+    // genuinely `Empty`, not `Closed` — a live plugin still starting up.
+    let _keep_alive = rtx0;
+
+    let shutdown = CancellationToken::new();
+    shutdown.cancel();
+
+    let (ready_tx, ready_rx) = oneshot::channel();
+    run_readiness_aggregator(vec![(0, rrx0), (1, rrx1)], 2, Mode::Client, shutdown, ready_tx).await;
+
+    let outcome = ready_rx
+        .await
+        .expect("aggregator must not drop ready_tx: plugin 1 already delivered a value");
+    assert!(
+        matches!(outcome, Err(StartError::BindConflict { errno: 10048, .. })),
+        "expected plugin 1's delivered BindConflict to survive, got {outcome:?}"
+    );
+}
+
+// A recovered `Ok(PluginReady)` must NOT let the aggregator report the
+// chain ready — shutdown having already fired makes this a start failure,
+// never a success, exactly like the pre-recovery behavior (an unconditional
+// `return`, dropping `ready_tx`) for this case.
+#[skuld::test]
+async fn aggregator_shutdown_race_never_reports_ready_after_shutdown() {
+    let (rtx, rrx) = oneshot::channel::<Result<PluginReady, StartError>>();
+    rtx.send(Ok(PluginReady {
+        listen: "127.0.0.1:1080".parse().unwrap(),
+        transports: Transports::TCP,
+    }))
+    .unwrap();
+
+    let shutdown = CancellationToken::new();
+    shutdown.cancel();
+
+    let (ready_tx, ready_rx) = oneshot::channel();
+    run_readiness_aggregator(vec![(0, rrx)], 1, Mode::Client, shutdown, ready_tx).await;
+
+    let outcome = ready_rx.await;
+    assert!(
+        outcome.is_err(),
+        "a recovered PluginReady after shutdown must not produce a chain-level Ok, got {outcome:?}"
+    );
+}
+
+// The ordinary case the recovery scan exists ALONGSIDE, not instead of:
+// shutdown fires while every remaining plugin is still legitimately starting
+// up — neither delivered nor closed, genuinely `Empty`. The scan must find
+// nothing to recover and terminate promptly with `ready_tx` dropped (the
+// pre-recovery behavior for this case), not hang or misclassify an `Empty`
+// receiver as `Closed`.
+#[skuld::test]
+async fn aggregator_shutdown_with_nothing_to_recover_drops_ready_tx_promptly() {
+    let (rtx0, rrx0) = oneshot::channel::<Result<PluginReady, StartError>>();
+    let (rtx1, rrx1) = oneshot::channel::<Result<PluginReady, StartError>>();
+    // Kept alive (not sent, not dropped): both plugins are still starting.
+    let _keep_alive = (rtx0, rtx1);
+
+    let shutdown = CancellationToken::new();
+    shutdown.cancel();
+
+    let (ready_tx, ready_rx) = oneshot::channel();
+    run_readiness_aggregator(vec![(0, rrx0), (1, rrx1)], 2, Mode::Client, shutdown, ready_tx).await;
+
+    let outcome = ready_rx.await;
+    assert!(
+        outcome.is_err(),
+        "shutdown with nothing delivered anywhere must drop ready_tx (RecvError), got {outcome:?}"
+    );
+}
+
+// A `Closed` sender earlier in iteration order must never mask a specific
+// `Err(StartError)` delivered by a LATER plugin, regardless of scan order.
+// Index 0's sender is dropped unsent (Closed); index 1 already holds a
+// delivered `BindConflict`. Shutdown is pre-cancelled so this exercises the
+// shutdown-branch scan specifically.
+#[skuld::test]
+async fn aggregator_shutdown_scan_prefers_a_later_specific_error_over_an_earlier_closed_one() {
+    let (rtx0, rrx0) = oneshot::channel::<Result<PluginReady, StartError>>();
+    drop(rtx0);
+
+    let (rtx1, rrx1) = oneshot::channel::<Result<PluginReady, StartError>>();
+    rtx1.send(Err(StartError::BindConflict {
+        errno: 10048,
+        addr: "127.0.0.1:1080".parse().unwrap(),
+    }))
+    .unwrap();
+
+    let shutdown = CancellationToken::new();
+    shutdown.cancel();
+
+    let (ready_tx, ready_rx) = oneshot::channel();
+    run_readiness_aggregator(vec![(0, rrx0), (1, rrx1)], 2, Mode::Client, shutdown, ready_tx).await;
+
+    let outcome = ready_rx
+        .await
+        .expect("aggregator must not drop ready_tx: plugin 1 already delivered a value");
+    assert!(
+        matches!(outcome, Err(StartError::BindConflict { errno: 10048, .. })),
+        "expected plugin 1's delivered BindConflict to survive despite plugin 0 being closed first, got {outcome:?}"
+    );
+}
+
+// The same preference, but reached via the plain (non-shutdown) `Err(_recv)`
+// arm: index 0's sender drops unsent with NO shutdown involved at all (a
+// natural RecvError on the receiver the loop is sitting on), while index 1
+// already holds a delivered `BindConflict`.
+#[skuld::test]
+async fn aggregator_recv_error_prefers_a_later_specific_error_over_an_earlier_closed_one() {
+    let (rtx0, rrx0) = oneshot::channel::<Result<PluginReady, StartError>>();
+    drop(rtx0);
+
+    let (rtx1, rrx1) = oneshot::channel::<Result<PluginReady, StartError>>();
+    rtx1.send(Err(StartError::BindConflict {
+        errno: 10048,
+        addr: "127.0.0.1:1080".parse().unwrap(),
+    }))
+    .unwrap();
+
+    let shutdown = CancellationToken::new(); // never cancelled
+
+    let (ready_tx, ready_rx) = oneshot::channel();
+    run_readiness_aggregator(vec![(0, rrx0), (1, rrx1)], 2, Mode::Client, shutdown, ready_tx).await;
+
+    let outcome = ready_rx
+        .await
+        .expect("aggregator must not drop ready_tx: plugin 1 already delivered a value");
+    assert!(
+        matches!(outcome, Err(StartError::BindConflict { errno: 10048, .. })),
+        "expected plugin 1's delivered BindConflict to survive despite plugin 0 closing first, got {outcome:?}"
+    );
 }
 
 /// The aggregator reports the end-to-end transports as the intersection
@@ -632,22 +803,28 @@ async fn chain_runner_default_matches_explicit_client_mode() {
 #[skuld::test]
 async fn mode_from_plugin_options_detects_bare_server_keyword() {
     use crate::chain::Mode;
-    assert_eq!(Mode::from_plugin_options(Some("server")), Mode::Server);
-    assert_eq!(Mode::from_plugin_options(Some("server;path=/")), Mode::Server);
-    assert_eq!(Mode::from_plugin_options(Some("path=/;server;host=h")), Mode::Server);
+    assert_eq!(Mode::from_plugin_options(Some("server")).unwrap(), Mode::Server);
+    assert_eq!(Mode::from_plugin_options(Some("server;path=/")).unwrap(), Mode::Server);
+    assert_eq!(
+        Mode::from_plugin_options(Some("path=/;server;host=h")).unwrap(),
+        Mode::Server
+    );
 }
 
 #[skuld::test]
 async fn mode_from_plugin_options_false_when_server_only_appears_as_substring() {
     use crate::chain::Mode;
     assert_eq!(
-        Mode::from_plugin_options(Some("servername=cdn.example.com")),
+        Mode::from_plugin_options(Some("servername=cdn.example.com")).unwrap(),
         Mode::Client
     );
-    assert_eq!(Mode::from_plugin_options(Some("path=/serverlist")), Mode::Client);
-    assert_eq!(Mode::from_plugin_options(Some("path=/server")), Mode::Client);
     assert_eq!(
-        Mode::from_plugin_options(Some("path=/serverlist;servername=foo")),
+        Mode::from_plugin_options(Some("path=/serverlist")).unwrap(),
+        Mode::Client
+    );
+    assert_eq!(Mode::from_plugin_options(Some("path=/server")).unwrap(), Mode::Client);
+    assert_eq!(
+        Mode::from_plugin_options(Some("path=/serverlist;servername=foo")).unwrap(),
         Mode::Client
     );
 }
@@ -655,8 +832,8 @@ async fn mode_from_plugin_options_false_when_server_only_appears_as_substring() 
 #[skuld::test]
 async fn mode_from_plugin_options_false_when_options_missing() {
     use crate::chain::Mode;
-    assert_eq!(Mode::from_plugin_options(None), Mode::Client);
-    assert_eq!(Mode::from_plugin_options(Some("")), Mode::Client);
+    assert_eq!(Mode::from_plugin_options(None).unwrap(), Mode::Client);
+    assert_eq!(Mode::from_plugin_options(Some("")).unwrap(), Mode::Client);
 }
 
 #[skuld::test]
@@ -665,7 +842,7 @@ async fn mode_from_plugin_options_handles_mixed_options() {
     // Realistic server-side `plugin_opts`:
     // `server;fast-open;path=/t/<token>;host=<fqdn>`.
     let opts = "server;fast-open;path=/t/abc123;host=hole-stgn.binarydreams.me";
-    assert_eq!(Mode::from_plugin_options(Some(opts)), Mode::Server);
+    assert_eq!(Mode::from_plugin_options(Some(opts)).unwrap(), Mode::Server);
 }
 
 #[skuld::test]
@@ -674,8 +851,8 @@ async fn mode_from_plugin_options_false_for_capitalized_keyword() {
     // SIP003 keys are lowercase per v2ray-plugin convention; pin the
     // case-sensitive behavior so a future "be lenient about case" patch
     // is a conscious decision rather than drift.
-    assert_eq!(Mode::from_plugin_options(Some("Server")), Mode::Client);
-    assert_eq!(Mode::from_plugin_options(Some("SERVER;path=/")), Mode::Client);
+    assert_eq!(Mode::from_plugin_options(Some("Server")).unwrap(), Mode::Client);
+    assert_eq!(Mode::from_plugin_options(Some("SERVER;path=/")).unwrap(), Mode::Client);
 }
 
 #[skuld::test]
@@ -685,17 +862,40 @@ async fn mode_from_plugin_options_true_when_key_has_value() {
     // own parser uses `opts.Get("server")` which matches `server=value`
     // (value ignored). Mirror that semantics: presence of the key triggers
     // server mode regardless of value.
-    assert_eq!(Mode::from_plugin_options(Some("server=1;path=/")), Mode::Server);
-    assert_eq!(Mode::from_plugin_options(Some("server=true")), Mode::Server);
+    assert_eq!(
+        Mode::from_plugin_options(Some("server=1;path=/")).unwrap(),
+        Mode::Server
+    );
+    assert_eq!(Mode::from_plugin_options(Some("server=true")).unwrap(), Mode::Server);
 }
 
 #[skuld::test]
-async fn mode_from_plugin_options_false_for_escaped_server() {
+async fn mode_from_plugin_options_true_for_escaped_server() {
     use crate::chain::Mode;
-    // `\s` is not a SIP003-recognized escape (only \;, \\, \= per
-    // parse_plugin_options). So `\server` parses as the literal
-    // string `\server` -- which is NOT the bare key `server`.
-    assert_eq!(Mode::from_plugin_options(Some(r"\server")), Mode::Client);
+    // A backslash escapes whatever byte follows, so `\server` IS the bare
+    // key `server` — to ex-ray, and here.
+    assert_eq!(Mode::from_plugin_options(Some(r"\server")).unwrap(), Mode::Server);
+}
+
+#[skuld::test]
+async fn mode_from_plugin_options_errors_on_malformed_options() {
+    use crate::chain::Mode;
+    // See Mode::from_plugin_options's doc comment for why neither Client
+    // nor Server is a safe default here.
+    assert!(Mode::from_plugin_options(Some(r"server;path=/a\")).is_err());
+    assert!(Mode::from_plugin_options(Some("server;;path=/a")).is_err());
+}
+
+#[skuld::test]
+async fn mode_from_plugin_options_unaffected_by_a_duplicate_non_deciding_key() {
+    use crate::chain::Mode;
+    // `server` is decided by presence (`.any(...)`), not by ex-ray's
+    // first-wins `Get` — a duplicate, unrelated key elsewhere in the string
+    // must not perturb that.
+    assert_eq!(
+        Mode::from_plugin_options(Some("path=/a;path=/b;server")).unwrap(),
+        Mode::Server
+    );
 }
 
 // Drain-timeout semantics tests =======================================================================================

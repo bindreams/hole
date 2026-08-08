@@ -15,14 +15,17 @@ fn server_mode_and_other_directives_survive() {
     // `Mode::from_plugin_options` keys off `server`; appending must not disturb it.
     let out = ex_ray_options(Some("server;host=cloudfront.com;path=/;tls")).unwrap();
     assert_eq!(out, "server;host=cloudfront.com;path=/;tls;mux=0");
-    assert_eq!(garter::Mode::from_plugin_options(Some(&out)), garter::Mode::Server);
+    assert_eq!(
+        garter::Mode::from_plugin_options(Some(&out)).unwrap(),
+        garter::Mode::Server
+    );
 }
 
 #[skuld::test]
 fn an_operator_mux_wins() {
     // ex-ray is first-wins, so an earlier `mux=` overrides the appended default.
     let out = ex_ray_options(Some("mux=8;path=/")).unwrap();
-    let pairs = garter::parse_plugin_options(&out);
+    let pairs = garter::parse_plugin_options(&out).unwrap();
     let first_mux = pairs.iter().find(|(k, _)| k == "mux").expect("mux key present");
     assert_eq!(first_mux.1, "8");
 }
@@ -44,7 +47,7 @@ fn an_escaped_trailing_semicolon_is_not_swallowed() {
     let out = ex_ray_options(Some(r"path=/a\;")).unwrap();
     assert_eq!(out, r"path=/a\;;mux=0");
     assert_eq!(
-        garter::parse_plugin_options(&out),
+        garter::parse_plugin_options(&out).unwrap(),
         vec![("path".into(), "/a;".into()), ("mux".into(), "0".into())]
     );
 }

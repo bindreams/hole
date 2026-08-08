@@ -138,21 +138,21 @@ impl BinaryPlugin {
     /// to `crate` for testability; production callers use [`Self::run`]
     /// which feeds this into `Command::env`. See [`Sip003Env`] for the
     /// client/server semantics.
-    pub(crate) fn sip003_env(&self, local: SocketAddr, remote: SocketAddr) -> Sip003Env {
+    pub(crate) fn sip003_env(&self, local: SocketAddr, remote: SocketAddr) -> crate::Result<Sip003Env> {
         // In server mode the binary itself swaps SS_LOCAL/SS_REMOTE
         // semantics (SS_REMOTE = inbound listener, SS_LOCAL = outbound
         // dial). We swap here first so the binary's swap restores the
         // direction we wanted.
-        let (ss_local, ss_remote) = match Mode::from_plugin_options(self.options.as_deref()) {
+        let (ss_local, ss_remote) = match Mode::from_plugin_options(self.options.as_deref())? {
             Mode::Client => (local, remote),
             Mode::Server => (remote, local),
         };
-        Sip003Env {
+        Ok(Sip003Env {
             ss_local_host: ss_local.ip().to_string(),
             ss_local_port: ss_local.port(),
             ss_remote_host: ss_remote.ip().to_string(),
             ss_remote_port: ss_remote.port(),
-        }
+        })
     }
 }
 
@@ -185,7 +185,7 @@ impl ChainPlugin for BinaryPlugin {
         shutdown: CancellationToken,
         ready: oneshot::Sender<Result<PluginReady, StartError>>,
     ) -> crate::Result<()> {
-        let env = self.sip003_env(local, remote);
+        let env = self.sip003_env(local, remote)?;
         let mut cmd = Command::new(&self.path);
         cmd.env("SS_LOCAL_HOST", env.ss_local_host);
         cmd.env("SS_LOCAL_PORT", env.ss_local_port.to_string());

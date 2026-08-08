@@ -37,6 +37,10 @@ pub struct PluginReady {
     pub transports: Transports,
 }
 
+/// Display text for [`StartError::ExitedBeforeReady`] and the fallback a
+/// caller shows if it can't recover anything more specific.
+pub const EXITED_BEFORE_READY_DETAIL: &str = "plugin exited before becoming ready";
+
 /// A typed start failure reported by a plugin (or synthesized from a
 /// bare process exit by the runner). The consumer maps this to a retry
 /// decision — `BindConflict` is the only retryable class.
@@ -45,9 +49,25 @@ pub enum StartError {
     /// The plugin could not bind its listener. `errno` is the raw OS
     /// error (locale-proof) where the plugin could type it; 0 if unknown.
     BindConflict { errno: i32, addr: SocketAddr },
-    /// Any terminal start failure (config error, upstream-dial failure,
-    /// bare process exit). Never retried.
+    /// Any terminal start failure the reporter can already name (config
+    /// error, upstream-dial failure, bare process exit). Never retried.
     Fatal { detail: String, errno: Option<i32> },
+    /// A plugin's readiness sender dropped unsent before ever reporting
+    /// `ready` or a specific `Fatal` — synthesized locally
+    /// (`ChainRunner`'s readiness aggregator, `TapPlugin`'s inner-exit
+    /// race) when the cause is not known at the point this is raised.
+    ///
+    /// Deliberately distinct from `Fatal`, not just a `Fatal` with
+    /// [`EXITED_BEFORE_READY_DETAIL`] text: `SitrepEvent` has no wire
+    /// counterpart for this variant, so a `StartError` reconstructed FROM
+    /// a parsed sitrep event can only ever be `BindConflict`/`Fatal`, never
+    /// this. A caller holding the plugin's own driving task (e.g. bridge's
+    /// `spawn_plugin_runner_at`) can therefore match on the variant — not
+    /// compare `detail` text — to tell "no reason was ever given, go look"
+    /// from a genuine plugin-reported `Fatal` apart, even one forwarded
+    /// verbatim by a nested garter whose own placeholder text happens to
+    /// read the same.
+    ExitedBeforeReady,
 }
 
 impl std::fmt::Display for StartError {
@@ -57,6 +77,7 @@ impl std::fmt::Display for StartError {
                 write!(f, "bind conflict on {addr} (errno {errno})")
             }
             StartError::Fatal { detail, .. } => write!(f, "{detail}"),
+            StartError::ExitedBeforeReady => write!(f, "{EXITED_BEFORE_READY_DETAIL}"),
         }
     }
 }
