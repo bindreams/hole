@@ -143,15 +143,28 @@ pub async fn run_roundtrip(
 
     let listen = match timeout(cfg.ready_timeout, ready_rx).await {
         Ok(Ok(Ok(chain_ready))) => chain_ready.listen,
+        // Both arms below join `handle` for a specific reason instead of
+        // discarding it — e.g. a malformed `client_opts` string now fails
+        // `BinaryPlugin::run` (via `Mode::from_plugin_options`) before it
+        // ever touches `ready`, so the readiness signal alone (a bare
+        // `StartError::ExitedBeforeReady`, or `ready_tx` dropped unsent)
+        // carries no diagnosis — mirrors bridge's own `recover_exit_detail`
+        // for the identical gap.
         Ok(Ok(Err(start_err))) => {
             cancel.cancel();
-            let _ = handle.await;
-            return Roundtrip::ChainFailed(format!("{start_err:?}"));
+            let detail = match handle.await {
+                Ok(Err(e)) => e.to_string(),
+                _ => format!("{start_err:?}"),
+            };
+            return Roundtrip::ChainFailed(detail);
         }
         Ok(Err(_recv)) => {
             cancel.cancel();
-            let _ = handle.await;
-            return Roundtrip::ChainFailed("client plugin exited before becoming ready".into());
+            let detail = match handle.await {
+                Ok(Err(e)) => e.to_string(),
+                _ => "client plugin exited before becoming ready".into(),
+            };
+            return Roundtrip::ChainFailed(detail);
         }
         Err(_timeout) => {
             cancel.cancel();

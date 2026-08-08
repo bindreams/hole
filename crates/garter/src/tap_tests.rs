@@ -152,6 +152,34 @@ impl ChainPlugin for ExitsBeforeReadyPlugin {
     }
 }
 
+/// Sends a specific `StartError::BindConflict` on its own readiness channel
+/// then exits — the shape that used to collapse to a bare
+/// `ExitedBeforeReady` through the tap's inner-exit race arm before it
+/// recovered a delivered error the same way the chain aggregator does. See
+/// `TapPlugin::run`'s inner-exit race doc comment.
+struct BindConflictPlugin;
+
+#[async_trait::async_trait]
+impl ChainPlugin for BindConflictPlugin {
+    fn name(&self) -> &str {
+        "bind-conflict"
+    }
+
+    async fn run(
+        self: Box<Self>,
+        local: SocketAddr,
+        _remote: SocketAddr,
+        _shutdown: CancellationToken,
+        ready: tokio::sync::oneshot::Sender<Result<crate::sitrep::PluginReady, crate::sitrep::StartError>>,
+    ) -> crate::Result<()> {
+        let _ = ready.send(Err(crate::sitrep::StartError::BindConflict {
+            errno: 10048,
+            addr: local,
+        }));
+        Ok(())
+    }
+}
+
 fn unused_remote() -> SocketAddr {
     // The stubs ignore `remote`; any valid address works.
     "127.0.0.1:1".parse().unwrap()
@@ -416,12 +444,16 @@ async fn cross_check_inbound_and_upstream_counters_match() {
     );
 }
 
-// `StartError::ExitedBeforeReady` lets a caller `match` on the variant
-// instead of comparing `detail` text (see its doc comment, which names
-// TapPlugin's inner-exit race by name) — this pins that TapPlugin actually
-// emits it.
+// When the inner exits cleanly and silently — never sending anything on its
+// own readiness channel — the tap has NOTHING to recover beyond what it
+// already knows: which plugin, wrapped by which tap, didn't bind. So it
+// reports a name-bearing `Fatal` directly rather than the bare
+// `ExitedBeforeReady` placeholder — a caller that later joins the whole
+// chain's own driving task for more detail (bridge's `recover_exit_detail`)
+// would find only the same already-resolved clean exit and recover nothing
+// better, so deferring to it here would only lose the plugin name for free.
 #[skuld::test]
-async fn tap_reports_exited_before_ready_when_inner_exits_without_binding() {
+async fn tap_reports_a_name_bearing_fatal_when_inner_exits_cleanly_and_silently() {
     let local = pick_local().await;
     let remote = unused_remote();
     let shutdown = CancellationToken::new();
@@ -434,9 +466,39 @@ async fn tap_reports_exited_before_ready_when_inner_exits_without_binding() {
     let outcome = ready_rx
         .await
         .expect("tap must report something on its own ready channel");
+    match outcome {
+        Err(crate::sitrep::StartError::Fatal { detail, errno: None }) => {
+            assert!(
+                detail.contains("exits-before-ready") && detail.contains("inner exited before becoming ready"),
+                "expected the plugin name and reason in the detail, got {detail:?}"
+            );
+        }
+        other => panic!("expected a name-bearing Fatal, got {other:?}"),
+    }
+}
+
+// A specific `StartError` the inner delivered on its own readiness channel
+// before exiting must survive the tap's inner-exit race, not collapse to
+// the generic `ExitedBeforeReady` placeholder — `BindConflict` is the only
+// retryable class, so losing it here turns a transient port collision into
+// a hard failure.
+#[skuld::test]
+async fn tap_forwards_a_specific_bind_conflict_the_inner_delivered_before_exiting() {
+    let local = pick_local().await;
+    let remote = unused_remote();
+    let shutdown = CancellationToken::new();
+    let inner = Box::new(BindConflictPlugin) as Box<dyn ChainPlugin>;
+    let tap = Box::new(TapPlugin::wrap(inner));
+
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    let _ = tap.run(local, remote, shutdown, ready_tx).await;
+
+    let outcome = ready_rx
+        .await
+        .expect("tap must report something on its own ready channel");
     assert!(
-        matches!(outcome, Err(crate::sitrep::StartError::ExitedBeforeReady)),
-        "expected ExitedBeforeReady, got {outcome:?}"
+        matches!(outcome, Err(crate::sitrep::StartError::BindConflict { .. })),
+        "expected the inner's BindConflict to survive the tap, got {outcome:?}"
     );
 }
 

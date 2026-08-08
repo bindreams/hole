@@ -2,7 +2,7 @@ use std::net::SocketAddr;
 
 use garter::{ChainReady, SitrepEvent, StartError, Transports};
 
-use crate::sitrep_out::{chain_result_to_event, GALOSHES_TRANSPORTS};
+use crate::sitrep_out::{chain_result_to_event, recover_exit_detail, GALOSHES_TRANSPORTS};
 
 fn addr() -> SocketAddr {
     "127.0.0.1:1080".parse().unwrap()
@@ -120,4 +120,31 @@ fn exited_before_ready_maps_to_fatal_with_generic_detail() {
             errno: None,
         }
     );
+}
+
+#[skuld::test]
+fn recover_exit_detail_surfaces_the_chains_specific_error() {
+    let joined: Result<garter::Result<()>, tokio::task::JoinError> = Ok(Err(garter::Error::Chain(
+        "tap[ex-ray]: alloc inner port: address in use".into(),
+    )));
+    assert_eq!(
+        recover_exit_detail(&joined),
+        "tap[ex-ray]: alloc inner port: address in use"
+    );
+}
+
+#[skuld::test]
+fn recover_exit_detail_falls_back_on_a_clean_exit() {
+    // `run()` returning `Ok(())` here means shutdown raced the readiness
+    // report, not a real failure — nothing more specific to recover.
+    let joined: Result<garter::Result<()>, tokio::task::JoinError> = Ok(Ok(()));
+    assert_eq!(recover_exit_detail(&joined), garter::EXITED_BEFORE_READY_DETAIL);
+}
+
+#[skuld::test]
+async fn recover_exit_detail_falls_back_when_the_task_panicked() {
+    let handle = tokio::spawn(async { panic!("boom") });
+    let joined = handle.await;
+    assert!(joined.is_err(), "expected a real JoinError from the panicked task");
+    assert_eq!(recover_exit_detail(&joined), garter::EXITED_BEFORE_READY_DETAIL);
 }

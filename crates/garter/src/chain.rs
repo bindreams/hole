@@ -371,7 +371,25 @@ impl ChainRunner {
 /// arrives. Returns `None` only when every scanned receiver is genuinely
 /// `Empty` (or holds an `Ok(PluginReady)`, which is not a failure and is
 /// ignored here) — the caller then has nothing to recover.
-fn scan_for_delivered_error<'a>(
+///
+/// A point-in-time `try_recv` snapshot, not an await-to-resolution drain,
+/// is deliberate: [`run_readiness_aggregator`] must terminate PROMPTLY when
+/// nothing is recoverable (a remaining plugin can be legitimately,
+/// indefinitely `Empty` — still starting up, not yet failed) rather than
+/// block on it — see `aggregator_shutdown_with_nothing_to_recover_drops_ready_tx_promptly`
+/// in `chain_tests.rs`, which pins exactly that. This narrows the window
+/// where a `BindConflict`/`Fatal` delivered a moment AFTER the snapshot is
+/// missed; it does not close it. Closing it fully would need the scan
+/// bounded by the SAME `drain_timeout` [`ChainRunner`] already uses to
+/// force-kill a lingering plugin — a real change to this fn's signature and
+/// caller, not a local tweak — so it is left as a known, narrowed gap
+/// rather than traded for a hang.
+///
+/// `pub(crate)`: also used by [`crate::tap::TapPlugin`], which races its
+/// inner plugin's own (otherwise-discarded) readiness channel against that
+/// plugin's exit for the identical reason — an inner `BindConflict`/`Fatal`
+/// must survive the race, not collapse to `ExitedBeforeReady`.
+pub(crate) fn scan_for_delivered_error<'a>(
     rxs: impl Iterator<Item = &'a mut oneshot::Receiver<Result<PluginReady, StartError>>>,
 ) -> Option<StartError> {
     let mut saw_generic = false;
@@ -438,7 +456,8 @@ pub(crate) async fn run_readiness_aggregator(
         let outcome = match selected {
             Some(r) => r,
             None => {
-                // See `scan_for_delivered_error`'s doc comment.
+                // Same preference as the shutdown-arm scan above: see
+                // `scan_for_delivered_error`'s doc comment.
                 let rest = std::iter::once(&mut rrx).chain(remaining.iter_mut().map(|(_, r)| r));
                 match scan_for_delivered_error(rest) {
                     Some(e) => {
@@ -456,15 +475,12 @@ pub(crate) async fn run_readiness_aggregator(
             }
             // A delivered `ExitedBeforeReady` is itself a "no reason known"
             // placeholder (see its doc comment) — before forwarding it,
-            // check whether a LATER plugin already delivered something more
-            // specific, same preference and same reason as the shutdown
-            // scan above and the `Err(_recv)` scan below. Otherwise this
-            // arm would let the FIRST plugin to report "I have no reason"
-            // permanently mask a later plugin's real `BindConflict`/`Fatal`.
+            // check whether a LATER plugin already delivered (or still
+            // delivers) something more specific: same preference as
+            // `scan_for_delivered_error`'s doc comment.
             Ok(Err(StartError::ExitedBeforeReady)) => {
                 let rest = remaining.iter_mut().map(|(_, r)| r);
-                let recovered = scan_for_delivered_error(rest).unwrap_or(StartError::ExitedBeforeReady);
-                let _ = ready_tx.send(Err(recovered));
+                send_recovered_or_generic(rest, ready_tx);
                 return;
             }
             Ok(Err(start_err)) => {
@@ -472,27 +488,38 @@ pub(crate) async fn run_readiness_aggregator(
                 return;
             }
             Err(_recv) => {
-                // This receiver's sender was dropped unsent → it exited
-                // before readying. Before synthesizing the generic
-                // `ExitedBeforeReady` cause, check whether a LATER plugin
-                // already delivered a specific one — same preference as the
-                // shutdown scan above, and for the same reason. This is the
-                // START-GATE channel; the SAME exit is independently observed by the
-                // Phase-1 record_exit loop, which sets first_error +
-                // cancels — that is the LIFECYCLE channel that becomes
-                // run()'s return. The two are intentionally separate
-                // observers of one event (typed cause to on_ready AND
-                // lifecycle error to teardown). Do NOT try to reconcile them
-                // into one value.
+                // Sender dropped unsent → exited before readying; same recovery
+                // preference as above (see `scan_for_delivered_error`'s doc
+                // comment). This is the START-GATE channel — the SAME exit is
+                // independently observed by the Phase-1 record_exit loop as
+                // the LIFECYCLE channel that becomes run()'s return. The two
+                // are intentionally separate observers of one event; do NOT
+                // reconcile them into one value.
                 let rest = remaining.iter_mut().map(|(_, r)| r);
-                let recovered = scan_for_delivered_error(rest).unwrap_or(StartError::ExitedBeforeReady);
-                let _ = ready_tx.send(Err(recovered));
+                send_recovered_or_generic(rest, ready_tx);
                 return;
             }
         }
     }
     let listen = plugin_listens[public_index].expect("public plugin must have reported a listen address");
     let _ = ready_tx.send(Ok(ChainReady { listen, transports }));
+}
+
+/// Scan `rest` and send the best recoverable error on `ready_tx` — shared by
+/// the `ExitedBeforeReady` and `Err(_recv)` arms above, which reach this in
+/// the identical shape: one plugin has already confirmed "I have no reason
+/// of my own", so scan every other not-yet-processed receiver for something
+/// better, falling back to the generic placeholder rather than dropping
+/// `ready_tx` unsent. Unlike the shutdown-preempted arm (which drops
+/// `ready_tx` when nothing is recoverable, matching "shutdown before
+/// anything ready"), these two arms already KNOW a plugin failed — there is
+/// always something to report here, even if it's only "no reason given".
+fn send_recovered_or_generic<'a>(
+    rest: impl Iterator<Item = &'a mut oneshot::Receiver<Result<PluginReady, StartError>>>,
+    ready_tx: oneshot::Sender<Result<ChainReady, StartError>>,
+) {
+    let recovered = scan_for_delivered_error(rest).unwrap_or(StartError::ExitedBeforeReady);
+    let _ = ready_tx.send(Err(recovered));
 }
 
 /// Shared handler for a single plugin-task exit result. Updates

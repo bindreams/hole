@@ -1,6 +1,6 @@
 #![cfg_attr(ex_ray_missing, allow(dead_code, unused_imports))]
 
-use galoshes::sitrep_out::{chain_result_to_event, emit};
+use galoshes::sitrep_out::{chain_result_to_event, emit, recover_exit_detail};
 use garter::{
     BinaryPlugin, ChainReady, ChainRunner, Mode, PluginEnv, ReadinessMode, SitrepEvent, StartError, SITREP_PROTOCOL,
 };
@@ -100,30 +100,57 @@ async fn main() -> anyhow::Result<()> {
     // structured `ready`/`bind_conflict`/`fatal` on galoshes' stdout.
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<Result<ChainReady, StartError>>();
 
-    // The emitter must run concurrently with `runner.run`: the plugins
-    // only start (and report ready) once `run` is driving them, so we
-    // cannot await `ready_rx` before calling `run`. On channel drop
-    // (RecvError) we emit nothing — galoshes will exit and the bridge sees
-    // stdout EOF, which is the backstop.
-    let emitter = tokio::spawn(async move {
-        if let Ok(outcome) = ready_rx.await {
-            emit(&chain_result_to_event(outcome));
-        }
-    });
-
     let runner = ChainRunner::new()
         .mode(mode)
         .on_ready(ready_tx)
         .add(Box::new(yamux_plugin))
         .add(Box::new(ex_ray_plugin));
 
+    // `run()` is spawned rather than awaited inline: the plugins only start
+    // (and report ready) once `run` is driving them, so we cannot await
+    // `ready_rx` before calling `run`. Spawning (instead of racing a second
+    // task against an inline `.await`, as before) also gives the
+    // `ExitedBeforeReady` arm below a handle it can join early, to recover
+    // a more specific reason from the chain's own terminal result — the
+    // same recovery bridge's `recover_exit_detail` performs against the
+    // plugin-driving task IT holds. `run_handle` is consumed by exactly one
+    // of the two branches below (`Pending` tracks which), never twice.
+    let run_handle = tokio::spawn(runner.run(env));
+
+    enum Pending {
+        NotJoined(tokio::task::JoinHandle<garter::Result<()>>),
+        Joined(Result<garter::Result<()>, tokio::task::JoinError>),
+    }
+
+    let (event, pending) = match ready_rx.await {
+        Ok(Ok(ready)) => (Some(chain_result_to_event(Ok(ready))), Pending::NotJoined(run_handle)),
+        Ok(Err(StartError::ExitedBeforeReady)) => {
+            let joined = run_handle.await;
+            let detail = recover_exit_detail(&joined);
+            (
+                Some(chain_result_to_event(Err(StartError::Fatal { detail, errno: None }))),
+                Pending::Joined(joined),
+            )
+        }
+        Ok(Err(other)) => (Some(chain_result_to_event(Err(other))), Pending::NotJoined(run_handle)),
+        // The ready channel itself dropped unsent (shutdown fired before the
+        // aggregator sent anything) — emit nothing; galoshes will exit and
+        // the bridge sees stdout EOF, the existing backstop.
+        Err(_) => (None, Pending::NotJoined(run_handle)),
+    };
+    if let Some(event) = &event {
+        emit(event);
+    }
+
     // `verified` must remain alive here -- its open handle prevents TOCTOU
-    // attacks on the extracted binary. It is dropped after `run()` returns.
-    let result = runner.run(env).await.map_err(|e| anyhow::anyhow!(e));
-    // The aggregator drops `ready_tx` once the chain ends (or on shutdown),
-    // so the emitter task either already emitted or sees RecvError; await
-    // it to completion rather than fire-and-forget.
-    let _ = emitter.await;
+    // attacks on the extracted binary. It is dropped after the chain's own
+    // task is fully joined (below), whichever branch above already did so.
+    let joined = match pending {
+        Pending::Joined(j) => j,
+        Pending::NotJoined(h) => h.await,
+    };
     drop(verified);
-    result
+    joined
+        .map_err(|je| anyhow::anyhow!("plugin-driving task ended abnormally: {je}"))
+        .and_then(|r| r.map_err(|e| anyhow::anyhow!(e)))
 }

@@ -21,10 +21,12 @@
 //!    that internal port.
 //! 3. Wait for the inner plugin to actually accept TCP via
 //!    [`crate::chain::poll_ready`], racing the inner task's `JoinHandle`
-//!    so an early inner failure unblocks us. (The inner's own readiness
-//!    channel is discarded — the tap detects inner readiness by the probe
-//!    and inner failure by the join.) Bounded at 30s; on timeout the
-//!    inner task is aborted and `Error::Chain` propagates.
+//!    so an early inner failure unblocks us. (Inner readiness itself is
+//!    still detected by the probe, not the inner's own readiness channel —
+//!    but on the early-exit race arm, a specific `StartError` already
+//!    delivered on that channel is recovered rather than lost.) Bounded at
+//!    30s; on timeout the inner task is aborted and `Error::Chain`
+//!    propagates.
 //! 4. Bind the tap's public listener on `local` (only after step 3, so the
 //!    public bind happens only once the data plane is actually wired
 //!    through), then report the tap's OWN readiness on the `ready` channel
@@ -119,13 +121,16 @@ impl ChainPlugin for TapPlugin {
             }
         };
 
-        // 2. Spawn the inner plugin against `inner_local`. The trait
-        //    requires a readiness channel, but the tap discards the inner's
-        //    (it detects inner readiness via the TCP probe in step 3 and
-        //    inner failure via the join); the tap reports its OWN readiness
-        //    (below) once the public listener is bound.
+        // 2. Spawn the inner plugin against `inner_local`. The tap detects
+        //    inner readiness via the TCP probe in step 3 and inner SUCCESS
+        //    via the join, not via the inner's own readiness channel — but
+        //    that channel is still kept (not discarded): on the inner-exit
+        //    race arm below, a specific `StartError` the inner already
+        //    delivered on it is recovered rather than lost, so the tap
+        //    reports its OWN readiness (below) once the public listener is
+        //    bound.
         let inner_shutdown = shutdown.clone();
-        let (inner_ready_tx, _inner_ready_rx) = oneshot::channel();
+        let (inner_ready_tx, mut inner_ready_rx) = oneshot::channel();
         let mut inner_handle = tokio::spawn(self.inner.run(inner_local, remote, inner_shutdown, inner_ready_tx));
 
         // 3. Wait for the inner plugin to bind the inner port. Race
@@ -139,10 +144,33 @@ impl ChainPlugin for TapPlugin {
             r = tokio::time::timeout(INNER_READY_TIMEOUT, crate::chain::poll_ready(inner_local, ready_token)) => r,
             join = &mut inner_handle => {
                 // Inner exited before binding — propagate its result. No
-                // tap listener was ever opened. Report the inner's failure
-                // through our own readiness channel so the chain aggregator
-                // sees a typed cause.
-                let _ = ready.send(Err(StartError::ExitedBeforeReady));
+                // tap listener was ever opened. The inner may have already
+                // delivered a specific `StartError` (e.g. `BindConflict`)
+                // on its own readiness channel before exiting; forward that
+                // instead of the generic placeholder, so a retryable class
+                // survives through the tap — mirroring
+                // `chain::scan_for_delivered_error`, which the aggregator
+                // applies for the same reason. If the inner sent nothing at
+                // all (a clean, silent exit — e.g. `join` resolves
+                // `Ok(Ok(()))`), fall back to a name-bearing `Fatal` rather
+                // than the bare `ExitedBeforeReady` placeholder: a caller
+                // that later joins the WHOLE chain's own driving task to
+                // recover more detail (bridge's `recover_exit_detail`) finds
+                // nothing better than the same already-resolved `Ok(Ok(()))`
+                // this arm is looking at right now, so naming which plugin,
+                // wrapped by which tap, right here is strictly more useful
+                // than deferring to a recovery that cannot succeed.
+                // `scan_for_delivered_error` returns `Some(ExitedBeforeReady)`
+                // itself (not `None`) for "closed, nothing specific" — so the
+                // fallback below must match on THAT too, not just `None`.
+                let err = match crate::chain::scan_for_delivered_error(std::iter::once(&mut inner_ready_rx)) {
+                    Some(e) if !matches!(e, StartError::ExitedBeforeReady) => e,
+                    _ => StartError::Fatal {
+                        detail: format!("tap[{plugin_name}]: inner exited before becoming ready"),
+                        errno: None,
+                    },
+                };
+                let _ = ready.send(Err(err));
                 return match join {
                     Ok(result) => result,
                     Err(je) => Err(crate::Error::Chain(format!("tap[{plugin_name}]: inner task: {je}"))),
