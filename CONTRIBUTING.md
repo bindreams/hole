@@ -395,8 +395,7 @@ changes again still repairs normally.
 **Disclosed residual:** an operator's OWN `ech-doh` in `plugin_opts`
 outranking Hole's (`EffectiveEchDoh::Operators`) is never permitted — Hole did
 not author that address, so config-authorship trust does not extend to it,
-making this a real widening rather than the config-authorship trust extended
-to Hole's own addresses — and is therefore *always* a stall risk under a
+making this a real widening — and is therefore *always* a stall risk under a
 covered start; `ProxyManager::start_cancellable` logs a dedicated `warn!`
 naming the operator's URL. A repair's compensating restore can also leave the
 LIVE held cover's permit mismatched from what THIS attempt actually needs
@@ -416,7 +415,21 @@ between the release and the corrected (or restored) re-engage — disclosed in
 the repair's own `warn!` lines, not silent, but not eliminated either: both
 platforms' engage primitives are delete-then-add / flush-then-reload, not an
 atomic in-place update. Tracked separately:
-[#758](https://github.com/bindreams/hole/issues/758).
+[#758](https://github.com/bindreams/hole/issues/758). If BOTH the corrected
+engage AND the compensating restore fail — two independent OS-level
+failures back to back — the attempt proceeds fully uncovered: the same
+fail-open outcome as an ordinary single-engage failure, just requiring two
+failures instead of one to reach. The next retry finds the held cover is
+`None` and re-engages fresh from scratch. Also disclosed via its own
+`warn!`. **Windows only:** the two new resolver-permit filters grew
+`FILTER_GUIDS` from ten entries to twelve — before this change there were NO
+resolver-permit filters at all, so a crash-then-downgrade (this build
+engages, crashes, an older build's recovery sweep only knows the first ten
+GUIDs) leaves those two permits un-swept; they are *permits*, never blocks,
+so this is bounded and self-healing (a later upgrade's sweep cleans them up),
+not a leak of blocked traffic. Disclosed as a source comment on
+`FILTER_GUIDS` itself. Tracked separately:
+[#754](https://github.com/bindreams/hole/issues/754).
 
 It is **name-agnostic** — it does *not* permit the TUN interface. The new
 bridge's start-time DNS-forwarder self-test runs over loopback to the SS client

@@ -421,12 +421,16 @@ pub trait Routing: Send + Sync {
     /// permitted as "no restriction" — a retry whose resolver changed since
     /// the cover engaged compares this attempt's freshly-derived
     /// `resolver_ip` against the held cover's, and on drift releases and
-    /// re-engages with the corrected value (falling back to the OLD value if
-    /// the corrected engage itself fails, so a permit correction can never
-    /// be how a covered start loses its cover outright — see
-    /// `BlockedStart`'s doc). See CONTRIBUTING.md's "Transient cutover
-    /// cover" section for the full retry-repair state machine and the
-    /// disclosed residuals this trait's caller does not close.
+    /// re-engages with the corrected value, falling back to restoring the OLD
+    /// value if the corrected engage itself fails: a permit correction takes
+    /// BOTH engages failing to lose the cover, not one — narrower than the
+    /// ordinary single-engage failure case, not impossible. On that double
+    /// failure the attempt proceeds uncovered (same as any other engage
+    /// failure) and the next retry re-engages fresh, since the held cover is
+    /// now `None` — see `BlockedStart`'s doc. See CONTRIBUTING.md's
+    /// "Transient cutover cover" section for the full retry-repair state
+    /// machine and the disclosed residuals this trait's caller does not
+    /// close.
     /// The cover survives a process crash (Windows: persistent WFP filters keyed by fixed
     /// GUID; macOS: pf enable token persisted to `bridge-failclosed.json`) and is
     /// swept by [`recover_routes`] on the next start. Does NOT permit the TUN
