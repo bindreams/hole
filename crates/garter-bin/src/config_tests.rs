@@ -128,6 +128,12 @@ fn config_path_reports_no_mangling_for_a_correctly_escaped_path() {
 #[skuld::test]
 fn config_path_unc_prefix_keeps_both_leading_backslashes() {
     let config = config_path_from_plugin_options(Some(r"config=\\fileserver\share\chain.yaml")).unwrap();
+    // `config.path` is the ordinary decode (not `reconstruct_intended`'s
+    // leading-pair special case), so it's the garbled, separator-free
+    // reading — this is the value that's ABOUT to fail to load; pin it so a
+    // regression in the ordinary decode for this exact shape is caught,
+    // not just a regression in the suggestion built from it.
+    assert_eq!(config.path, r"\fileserversharechain.yaml");
     let mangled = config.mangled_from.expect("expected mangling to be detected");
     assert_eq!(mangled.doubled, r"\\\\fileserver\\share\\chain.yaml");
     assert_forward_slashes_platform_correct(&mangled, "//fileserver/share/chain.yaml");
@@ -143,6 +149,9 @@ fn config_path_unc_prefix_keeps_both_leading_backslashes() {
 #[skuld::test]
 fn config_path_extended_length_prefix_keeps_both_leading_backslashes() {
     let config = config_path_from_plugin_options(Some(r"config=\\?\C:\very\long\chain.yaml")).unwrap();
+    // Same reasoning as `config_path_unc_prefix_keeps_both_leading_backslashes`:
+    // pin the ordinary (garbled) decode this exact shape produces.
+    assert_eq!(config.path, r"\?C:verylongchain.yaml");
     let mangled = config.mangled_from.expect("expected mangling to be detected");
     let doubled_opts = format!("config={}", mangled.doubled);
     let doubled_segments = garter::split_plugin_options(&doubled_opts).unwrap();

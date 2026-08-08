@@ -168,3 +168,30 @@ fn fatal_includes_errno_key_when_some() {
         r#"{"event":"fatal","detail":"boom","errno":13}"#
     );
 }
+
+#[skuld::test]
+fn recover_exit_detail_from_joined_surfaces_the_tasks_specific_error() {
+    let joined: Result<crate::Result<()>, tokio::task::JoinError> = Ok(Err(crate::Error::Chain(
+        "tap[ex-ray]: alloc inner port: address in use".into(),
+    )));
+    assert_eq!(
+        recover_exit_detail_from_joined(&joined),
+        "tap[ex-ray]: alloc inner port: address in use"
+    );
+}
+
+#[skuld::test]
+fn recover_exit_detail_from_joined_falls_back_on_a_clean_exit() {
+    // `run()` returning `Ok(())` here means shutdown raced the readiness
+    // report, not a real failure — nothing more specific to recover.
+    let joined: Result<crate::Result<()>, tokio::task::JoinError> = Ok(Ok(()));
+    assert_eq!(recover_exit_detail_from_joined(&joined), EXITED_BEFORE_READY_DETAIL);
+}
+
+#[skuld::test]
+async fn recover_exit_detail_from_joined_falls_back_when_the_task_panicked() {
+    let handle = tokio::spawn(async { panic!("boom") });
+    let joined = handle.await;
+    assert!(joined.is_err(), "expected a real JoinError from the panicked task");
+    assert_eq!(recover_exit_detail_from_joined(&joined), EXITED_BEFORE_READY_DETAIL);
+}

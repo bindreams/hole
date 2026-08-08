@@ -143,27 +143,29 @@ pub async fn run_roundtrip(
 
     let listen = match timeout(cfg.ready_timeout, ready_rx).await {
         Ok(Ok(Ok(chain_ready))) => chain_ready.listen,
-        // Both arms below join `handle` for a specific reason instead of
-        // discarding it — e.g. a malformed `client_opts` string now fails
-        // `BinaryPlugin::run` (via `Mode::from_plugin_options`) before it
-        // ever touches `ready`, so the readiness signal alone (a bare
-        // `StartError::ExitedBeforeReady`, or `ready_tx` dropped unsent)
-        // carries no diagnosis — mirrors bridge's own `recover_exit_detail`
-        // for the identical gap.
+        // A generic `ExitedBeforeReady` joins `handle` for a specific reason
+        // instead of discarding it — e.g. a malformed `client_opts` string
+        // now fails `BinaryPlugin::run` (via `Mode::from_plugin_options`)
+        // before it ever touches `ready`, so the readiness signal alone
+        // carries no diagnosis — delegates to `garter::recover_exit_detail_from_joined`,
+        // the same recovery bridge's and galoshes' own `recover_exit_detail`
+        // callers use for the identical gap. Any OTHER `StartError`
+        // (`BindConflict`, `Fatal`) is already as specific as it gets and
+        // must not be overridden by whatever `ChainRunner::run` happens to
+        // return on teardown (e.g. a generic "drain timeout expired").
+        Ok(Ok(Err(garter::StartError::ExitedBeforeReady))) => {
+            cancel.cancel();
+            let detail = garter::recover_exit_detail_from_joined(&handle.await);
+            return Roundtrip::ChainFailed(detail);
+        }
         Ok(Ok(Err(start_err))) => {
             cancel.cancel();
-            let detail = match handle.await {
-                Ok(Err(e)) => e.to_string(),
-                _ => format!("{start_err:?}"),
-            };
-            return Roundtrip::ChainFailed(detail);
+            let _ = handle.await;
+            return Roundtrip::ChainFailed(format!("{start_err:?}"));
         }
         Ok(Err(_recv)) => {
             cancel.cancel();
-            let detail = match handle.await {
-                Ok(Err(e)) => e.to_string(),
-                _ => "client plugin exited before becoming ready".into(),
-            };
+            let detail = garter::recover_exit_detail_from_joined(&handle.await);
             return Roundtrip::ChainFailed(detail);
         }
         Err(_timeout) => {

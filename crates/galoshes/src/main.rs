@@ -1,6 +1,6 @@
 #![cfg_attr(ex_ray_missing, allow(dead_code, unused_imports))]
 
-use galoshes::sitrep_out::{chain_result_to_event, emit, recover_exit_detail};
+use galoshes::sitrep_out::{chain_result_to_event, emit};
 use garter::{
     BinaryPlugin, ChainReady, ChainRunner, Mode, PluginEnv, ReadinessMode, SitrepEvent, StartError, SITREP_PROTOCOL,
 };
@@ -108,8 +108,7 @@ async fn main() -> anyhow::Result<()> {
 
     // `run()` is spawned rather than awaited inline: the plugins only start
     // (and report ready) once `run` is driving them, so we cannot await
-    // `ready_rx` before calling `run`. Spawning (instead of racing a second
-    // task against an inline `.await`, as before) also gives the
+    // `ready_rx` before calling `run`. Spawning also gives the
     // `ExitedBeforeReady` arm below a handle it can join early, to recover
     // a more specific reason from the chain's own terminal result — the
     // same recovery bridge's `recover_exit_detail` performs against the
@@ -126,7 +125,7 @@ async fn main() -> anyhow::Result<()> {
         Ok(Ok(ready)) => (Some(chain_result_to_event(Ok(ready))), Pending::NotJoined(run_handle)),
         Ok(Err(StartError::ExitedBeforeReady)) => {
             let joined = run_handle.await;
-            let detail = recover_exit_detail(&joined);
+            let detail = garter::recover_exit_detail_from_joined(&joined);
             (
                 Some(chain_result_to_event(Err(StartError::Fatal { detail, errno: None }))),
                 Pending::Joined(joined),

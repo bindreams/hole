@@ -433,24 +433,11 @@ async fn spawn_plugin_runner_at(
 /// process mid-startup, via `garter`'s own signal handler) — the plugin is
 /// then still alive and only now begins its graceful-stop sequence, so
 /// this join is bounded by `ChainRunner`'s `drain_timeout` (5s default),
-/// not instant. Falls back to [`garter::EXITED_BEFORE_READY_DETAIL`] if
-/// `handle` has nothing better.
+/// not instant. Delegates the actual recovery (and its `EXITED_BEFORE_READY_DETAIL`
+/// fallback) to [`garter::recover_exit_detail_from_joined`] — the single
+/// implementation shared with galoshes and plugin-e2e's own identical need.
 async fn recover_exit_detail(handle: tokio::task::JoinHandle<garter::Result<()>>) -> String {
-    match handle.await {
-        Ok(Err(e)) => e.to_string(),
-        Ok(Ok(())) => garter::EXITED_BEFORE_READY_DETAIL.into(),
-        Err(join_err) => {
-            // The plugin-driving task panicked or was cancelled while we
-            // were recovering its exit detail — a bug signal, not routine
-            // diagnostic noise, so it's logged at the same level
-            // `chain.rs`'s own `record_exit` uses for an individual
-            // plugin-task panic, not silently absorbed at `debug!` into
-            // the same generic fallback text used for a genuinely clean
-            // exit.
-            tracing::error!(error = %join_err, "plugin-driving task ended abnormally while recovering exit detail");
-            garter::EXITED_BEFORE_READY_DETAIL.into()
-        }
-    }
+    garter::recover_exit_detail_from_joined(&handle.await)
 }
 
 /// Convert a [`ProxyError`] from `spawn_plugin_runner_at` into an

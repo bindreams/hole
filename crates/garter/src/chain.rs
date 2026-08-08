@@ -372,23 +372,22 @@ impl ChainRunner {
 /// `Empty` (or holds an `Ok(PluginReady)`, which is not a failure and is
 /// ignored here) — the caller then has nothing to recover.
 ///
-/// A point-in-time `try_recv` snapshot, not an await-to-resolution drain,
-/// is deliberate: [`run_readiness_aggregator`] must terminate PROMPTLY when
-/// nothing is recoverable (a remaining plugin can be legitimately,
-/// indefinitely `Empty` — still starting up, not yet failed) rather than
-/// block on it — see `aggregator_shutdown_with_nothing_to_recover_drops_ready_tx_promptly`
-/// in `chain_tests.rs`, which pins exactly that. This narrows the window
-/// where a `BindConflict`/`Fatal` delivered a moment AFTER the snapshot is
-/// missed; it does not close it. Closing it fully would need the scan
-/// bounded by the SAME `drain_timeout` [`ChainRunner`] already uses to
-/// force-kill a lingering plugin — a real change to this fn's signature and
-/// caller, not a local tweak — so it is left as a known, narrowed gap
-/// rather than traded for a hang.
+/// A point-in-time `try_recv` snapshot — used ONLY where the caller must
+/// terminate PROMPTLY even when a remaining receiver is legitimately,
+/// indefinitely `Empty` (a plugin still starting up, not yet failed): the
+/// shutdown-preempted arm of [`run_readiness_aggregator`] (shutdown does not
+/// itself mean any plugin failed) and [`crate::tap::TapPlugin`]'s inner-exit
+/// race (the single receiver scanned there is already resolved by the time
+/// it's reached, so this is exact, not approximate). See
+/// `aggregator_shutdown_with_nothing_to_recover_drops_ready_tx_promptly` in
+/// `chain_tests.rs`, which pins the prompt-termination requirement.
 ///
-/// `pub(crate)`: also used by [`crate::tap::TapPlugin`], which races its
-/// inner plugin's own (otherwise-discarded) readiness channel against that
-/// plugin's exit for the identical reason — an inner `BindConflict`/`Fatal`
-/// must survive the race, not collapse to `ExitedBeforeReady`.
+/// For the OTHER two arms of `run_readiness_aggregator` — `Err(_recv)` and a
+/// delivered `ExitedBeforeReady` — a plugin has already DEFINITIVELY failed,
+/// so [`drain_for_delivered_error`] is used instead: awaiting there cannot
+/// hang, because that same failure fires `shutdown` via `record_exit`,
+/// which bounds every other remaining plugin via `ChainRunner::run`'s own
+/// `drain_timeout`/`abort_all`.
 pub(crate) fn scan_for_delivered_error<'a>(
     rxs: impl Iterator<Item = &'a mut oneshot::Receiver<Result<PluginReady, StartError>>>,
 ) -> Option<StartError> {
@@ -399,6 +398,32 @@ pub(crate) fn scan_for_delivered_error<'a>(
             Ok(Err(e)) => return Some(e),
             Err(oneshot::error::TryRecvError::Closed) => saw_generic = true,
             Ok(Ok(_)) | Err(oneshot::error::TryRecvError::Empty) => {}
+        }
+    }
+    saw_generic.then_some(StartError::ExitedBeforeReady)
+}
+
+/// Await `rxs` — each to ITS OWN resolution — for the same preference
+/// [`scan_for_delivered_error`] applies (a SPECIFIC `Err(StartError)` over a
+/// generic `Closed`/delivered-`ExitedBeforeReady` signal, regardless of
+/// order). Used only by [`send_recovered_or_generic`], from the TWO
+/// `run_readiness_aggregator` arms where a plugin has already definitively
+/// failed — see [`scan_for_delivered_error`]'s doc comment for why awaiting
+/// is safe (bounded by `ChainRunner`'s own `drain_timeout`) in exactly those
+/// two arms and NOT the shutdown-preempted one. Closes the window
+/// `scan_for_delivered_error`'s try_recv snapshot leaves open: a
+/// `BindConflict`/`Fatal` delivered a moment AFTER a snapshot would run is
+/// still recovered here, not silently downgraded.
+async fn drain_for_delivered_error<'a>(
+    rxs: impl Iterator<Item = &'a mut oneshot::Receiver<Result<PluginReady, StartError>>>,
+) -> Option<StartError> {
+    let mut saw_generic = false;
+    for r in rxs {
+        match r.await {
+            Ok(Err(StartError::ExitedBeforeReady)) => saw_generic = true,
+            Ok(Err(e)) => return Some(e),
+            Err(_recv) => saw_generic = true,
+            Ok(Ok(_)) => {}
         }
     }
     saw_generic.then_some(StartError::ExitedBeforeReady)
@@ -480,7 +505,7 @@ pub(crate) async fn run_readiness_aggregator(
             // `scan_for_delivered_error`'s doc comment.
             Ok(Err(StartError::ExitedBeforeReady)) => {
                 let rest = remaining.iter_mut().map(|(_, r)| r);
-                send_recovered_or_generic(rest, ready_tx);
+                send_recovered_or_generic(rest, ready_tx).await;
                 return;
             }
             Ok(Err(start_err)) => {
@@ -496,7 +521,7 @@ pub(crate) async fn run_readiness_aggregator(
                 // are intentionally separate observers of one event; do NOT
                 // reconcile them into one value.
                 let rest = remaining.iter_mut().map(|(_, r)| r);
-                send_recovered_or_generic(rest, ready_tx);
+                send_recovered_or_generic(rest, ready_tx).await;
                 return;
             }
         }
@@ -505,20 +530,26 @@ pub(crate) async fn run_readiness_aggregator(
     let _ = ready_tx.send(Ok(ChainReady { listen, transports }));
 }
 
-/// Scan `rest` and send the best recoverable error on `ready_tx` — shared by
-/// the `ExitedBeforeReady` and `Err(_recv)` arms above, which reach this in
-/// the identical shape: one plugin has already confirmed "I have no reason
-/// of my own", so scan every other not-yet-processed receiver for something
-/// better, falling back to the generic placeholder rather than dropping
-/// `ready_tx` unsent. Unlike the shutdown-preempted arm (which drops
-/// `ready_tx` when nothing is recoverable, matching "shutdown before
-/// anything ready"), these two arms already KNOW a plugin failed — there is
-/// always something to report here, even if it's only "no reason given".
-fn send_recovered_or_generic<'a>(
+/// Drain `rest` to resolution and send the best recoverable error on
+/// `ready_tx` — shared by the `ExitedBeforeReady` and `Err(_recv)` arms
+/// above, which reach this in the identical shape: one plugin has already
+/// confirmed "I have no reason of my own", so drain every other
+/// not-yet-processed receiver for something better, falling back to the
+/// generic placeholder rather than dropping `ready_tx` unsent. Unlike the
+/// shutdown-preempted arm (which drops `ready_tx` when nothing is
+/// recoverable, matching "shutdown before anything ready"), these two arms
+/// already KNOW a plugin failed — there is always something to report here,
+/// even if it's only "no reason given". Uses [`drain_for_delivered_error`]
+/// (await-to-resolution), not [`scan_for_delivered_error`] (point-in-time
+/// snapshot) — see the latter's doc comment for why that's safe here and
+/// not in the shutdown-preempted arm.
+async fn send_recovered_or_generic<'a>(
     rest: impl Iterator<Item = &'a mut oneshot::Receiver<Result<PluginReady, StartError>>>,
     ready_tx: oneshot::Sender<Result<ChainReady, StartError>>,
 ) {
-    let recovered = scan_for_delivered_error(rest).unwrap_or(StartError::ExitedBeforeReady);
+    let recovered = drain_for_delivered_error(rest)
+        .await
+        .unwrap_or(StartError::ExitedBeforeReady);
     let _ = ready_tx.send(Err(recovered));
 }
 

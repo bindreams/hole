@@ -82,6 +82,34 @@ impl std::fmt::Display for StartError {
     }
 }
 
+/// Recover a specific exit reason from `joined` — the outcome of joining a
+/// plugin-driving task (a `ChainRunner::run` future, or equivalent) — for
+/// the case where the ready-gate signal itself carried no diagnosis (a bare
+/// [`StartError::ExitedBeforeReady`], or the ready channel dropping unsent
+/// before anything was reported).
+///
+/// `Ok(Err(e))` (the task's own `run()` call returned a specific error)
+/// yields that error's `Display` text. `Ok(Ok(()))` (a clean exit — e.g.
+/// shutdown raced the readiness report) and `Err(_)` (the task panicked or
+/// was cancelled while being joined) both fall back to
+/// [`EXITED_BEFORE_READY_DETAIL`]; the panic/cancel case is also logged at
+/// `error!`, since it signals a bug rather than routine diagnostic noise.
+///
+/// Shared by every caller that joins a plugin-driving task for this exact
+/// gap — bridge's `spawn_plugin_runner_at`, galoshes' `main`, and
+/// plugin-e2e's `run_roundtrip` all reach the identical three-way match;
+/// this is the single implementation.
+pub fn recover_exit_detail_from_joined(joined: &Result<crate::Result<()>, tokio::task::JoinError>) -> String {
+    match joined {
+        Ok(Err(e)) => e.to_string(),
+        Ok(Ok(())) => EXITED_BEFORE_READY_DETAIL.into(),
+        Err(join_err) => {
+            tracing::error!(error = %join_err, "plugin-driving task ended abnormally while recovering exit detail");
+            EXITED_BEFORE_READY_DETAIL.into()
+        }
+    }
+}
+
 /// A parsed sitrep control event.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "event", rename_all = "snake_case")]

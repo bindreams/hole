@@ -144,29 +144,36 @@ impl ChainPlugin for TapPlugin {
             r = tokio::time::timeout(INNER_READY_TIMEOUT, crate::chain::poll_ready(inner_local, ready_token)) => r,
             join = &mut inner_handle => {
                 // Inner exited before binding — propagate its result. No
-                // tap listener was ever opened. The inner may have already
-                // delivered a specific `StartError` (e.g. `BindConflict`)
-                // on its own readiness channel before exiting; forward that
-                // instead of the generic placeholder, so a retryable class
-                // survives through the tap — mirroring
-                // `chain::scan_for_delivered_error`, which the aggregator
-                // applies for the same reason. If the inner sent nothing at
-                // all (a clean, silent exit — e.g. `join` resolves
-                // `Ok(Ok(()))`), fall back to a name-bearing `Fatal` rather
-                // than the bare `ExitedBeforeReady` placeholder: a caller
-                // that later joins the WHOLE chain's own driving task to
-                // recover more detail (bridge's `recover_exit_detail`) finds
-                // nothing better than the same already-resolved `Ok(Ok(()))`
-                // this arm is looking at right now, so naming which plugin,
-                // wrapped by which tap, right here is strictly more useful
-                // than deferring to a recovery that cannot succeed.
+                // tap listener was ever opened. Preference order, most to
+                // least specific:
+                //  1. A `StartError` the inner already delivered on its own
+                //     readiness channel (e.g. `BindConflict`) — mirroring
+                //     `chain::scan_for_delivered_error`, which the
+                //     aggregator applies for the same reason.
+                //  2. `join`'s own `Err` — `self.inner.run(...)`'s actual
+                //     returned error (e.g. a malformed-options
+                //     `crate::Error`), sitting right here in `join` and
+                //     otherwise destroyed: bridge's `spawn_plugin_runner_at`
+                //     treats a `Fatal` (unlike `ExitedBeforeReady`) as
+                //     already-as-specific-as-it-gets and does NOT join the
+                //     handle for more detail, so if this arm didn't consult
+                //     `join` here, that Err would be lost for good, not
+                //     just deferred to a later recovery.
+                //  3. A generic, name-bearing `Fatal` (not the bare
+                //     `ExitedBeforeReady` placeholder) — reached only on a
+                //     clean, silent inner exit (`join == Ok(Ok(()))`), where
+                //     naming the tap and plugin is strictly more useful
+                //     than a placeholder no later recovery can improve on.
                 // `scan_for_delivered_error` returns `Some(ExitedBeforeReady)`
-                // itself (not `None`) for "closed, nothing specific" — so the
-                // fallback below must match on THAT too, not just `None`.
+                // itself (not `None`) for "closed, nothing specific" — so
+                // step 3's fallback must match on THAT too, not just `None`.
                 let err = match crate::chain::scan_for_delivered_error(std::iter::once(&mut inner_ready_rx)) {
                     Some(e) if !matches!(e, StartError::ExitedBeforeReady) => e,
                     _ => StartError::Fatal {
-                        detail: format!("tap[{plugin_name}]: inner exited before becoming ready"),
+                        detail: match &join {
+                            Ok(Err(e)) => format!("tap[{plugin_name}]: {e}"),
+                            _ => format!("tap[{plugin_name}]: inner exited before becoming ready"),
+                        },
                         errno: None,
                     },
                 };

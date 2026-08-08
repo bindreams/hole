@@ -529,6 +529,51 @@ async fn aggregator_recv_error_prefers_a_later_specific_error_over_an_earlier_cl
     );
 }
 
+// The `Err(_recv)` arm's drain must recover a value that arrives strictly
+// AFTER the drain begins awaiting it, not just one already buffered
+// beforehand (which a `try_recv` snapshot could also catch) — the exact race
+// `scan_for_delivered_error`'s point-in-time snapshot leaves open, and
+// `drain_for_delivered_error` (used only by this arm and the delivered-
+// `ExitedBeforeReady` arm, never the shutdown-preempted one) exists to
+// close.
+//
+// No sleep, no spawned task, no scheduler race: `tokio::join!` polls its
+// arguments once per round, in declaration order, all within this ONE task.
+// Plugin 0's sender is already dropped before the aggregator starts, so on
+// round 1 the aggregator (first argument) runs synchronously through the
+// `Err(_recv)` arm and into the drain, which registers its interest on
+// plugin 1's receiver and returns Pending — only THEN does the second
+// argument's synchronous `rtx1.send` run, later in that same round. That
+// ordering is a documented `join!` guarantee, not a race bet.
+#[skuld::test]
+async fn aggregator_recv_error_recovers_a_value_delivered_after_the_drain_begins() {
+    let (rtx0, rrx0) = oneshot::channel::<Result<PluginReady, StartError>>();
+    drop(rtx0);
+
+    let (rtx1, rrx1) = oneshot::channel::<Result<PluginReady, StartError>>();
+
+    let shutdown = CancellationToken::new(); // never cancelled
+    let (ready_tx, ready_rx) = oneshot::channel();
+
+    let ((), ()) = tokio::join!(
+        run_readiness_aggregator(vec![(0, rrx0), (1, rrx1)], 2, Mode::Client, shutdown, ready_tx),
+        async {
+            let _ = rtx1.send(Err(StartError::BindConflict {
+                errno: 10048,
+                addr: "127.0.0.1:1080".parse().unwrap(),
+            }));
+        }
+    );
+
+    let outcome = ready_rx
+        .await
+        .expect("aggregator must not drop ready_tx: plugin 1 delivered a value");
+    assert!(
+        matches!(outcome, Err(StartError::BindConflict { errno: 10048, .. })),
+        "expected plugin 1's BindConflict, delivered after the drain began, to still be recovered, got {outcome:?}"
+    );
+}
+
 // A THIRD way an early generic placeholder can reach the aggregator: index
 // 0 actively SENDS `ExitedBeforeReady` (e.g. a `TapPlugin` reporting its
 // inner's exit race) rather than dropping its sender unsent, while index 1

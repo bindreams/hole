@@ -152,6 +152,33 @@ impl ChainPlugin for ExitsBeforeReadyPlugin {
     }
 }
 
+/// Drops its readiness channel unsent (like `ExitsBeforeReadyPlugin`) but
+/// returns a specific `Err` from `run()` itself — the shape a malformed
+/// SS_PLUGIN_OPTIONS string produces (`BinaryPlugin::run` fails via
+/// `Mode::from_plugin_options`? before ever touching `ready`). Pins that
+/// this reaches the tap's `ready.send`, not just `join`'s own return value.
+struct ExitsWithASpecificErrorPlugin;
+
+#[async_trait::async_trait]
+impl ChainPlugin for ExitsWithASpecificErrorPlugin {
+    fn name(&self) -> &str {
+        "exits-with-a-specific-error"
+    }
+
+    async fn run(
+        self: Box<Self>,
+        _local: SocketAddr,
+        _remote: SocketAddr,
+        _shutdown: CancellationToken,
+        ready: tokio::sync::oneshot::Sender<Result<crate::sitrep::PluginReady, crate::sitrep::StartError>>,
+    ) -> crate::Result<()> {
+        drop(ready);
+        Err(crate::Error::Chain(
+            "malformed SS_PLUGIN_OPTIONS: plugin options end in an unpaired backslash".into(),
+        ))
+    }
+}
+
 /// Sends a specific `StartError::BindConflict` on its own readiness channel
 /// then exits — the shape that used to collapse to a bare
 /// `ExitedBeforeReady` through the tap's inner-exit race arm before it
@@ -474,6 +501,42 @@ async fn tap_reports_a_name_bearing_fatal_when_inner_exits_cleanly_and_silently(
             );
         }
         other => panic!("expected a name-bearing Fatal, got {other:?}"),
+    }
+}
+
+// When the inner returns a SPECIFIC `Err` from `run()` itself (e.g. a
+// malformed-options error `BinaryPlugin::run` returns before ever touching
+// `ready`) without ever sending on its own readiness channel, the tap must
+// forward that text, not the generic "inner exited before becoming ready"
+// placeholder. Losing it here is worse than the clean-silent-exit case:
+// bridge's `spawn_plugin_runner_at` treats a `Fatal` as already-as-specific-
+// as-it-gets and does not join the handle for more detail, so a `Fatal`
+// without this text would discard the real reason permanently, not just
+// defer recovering it.
+#[skuld::test]
+async fn tap_forwards_the_inner_runs_own_specific_error_when_it_exits_silently() {
+    let local = pick_local().await;
+    let remote = unused_remote();
+    let shutdown = CancellationToken::new();
+    let inner = Box::new(ExitsWithASpecificErrorPlugin) as Box<dyn ChainPlugin>;
+    let tap = Box::new(TapPlugin::wrap(inner));
+
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    let _ = tap.run(local, remote, shutdown, ready_tx).await;
+
+    let outcome = ready_rx
+        .await
+        .expect("tap must report something on its own ready channel");
+    match outcome {
+        Err(crate::sitrep::StartError::Fatal { detail, errno: None }) => {
+            assert!(
+                detail.contains("exits-with-a-specific-error")
+                    && detail.contains("malformed SS_PLUGIN_OPTIONS")
+                    && detail.contains("unpaired backslash"),
+                "expected the plugin name and the inner's own specific reason in the detail, got {detail:?}"
+            );
+        }
+        other => panic!("expected a Fatal carrying the inner's specific reason, got {other:?}"),
     }
 }
 

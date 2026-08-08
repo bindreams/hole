@@ -49,10 +49,10 @@ pub const GALOSHES_TRANSPORTS: Transports = Transports::TCP.union(Transports::UD
 /// corresponding sitrep event — `ExitedBeforeReady` included: `SitrepEvent`
 /// has no counterpart for it, so it downgrades to a plain `Fatal` with
 /// [`garter::EXITED_BEFORE_READY_DETAIL`] text. `main` recovers a more
-/// specific reason itself before calling this (see [`recover_exit_detail`])
-/// and passes that in as an ordinary `Fatal` instead, so a bare
-/// `ExitedBeforeReady` only ever reaches here when nothing more specific
-/// was recoverable either.
+/// specific reason itself before calling this (via
+/// [`garter::recover_exit_detail_from_joined`]) and passes that in as an
+/// ordinary `Fatal` instead, so a bare `ExitedBeforeReady` only ever
+/// reaches here when nothing more specific was recoverable either.
 pub fn chain_result_to_event(result: Result<ChainReady, StartError>) -> SitrepEvent {
     match result {
         Ok(chain_ready) => SitrepEvent::Ready {
@@ -67,33 +67,6 @@ pub fn chain_result_to_event(result: Result<ChainReady, StartError>) -> SitrepEv
             detail: garter::EXITED_BEFORE_READY_DETAIL.into(),
             errno: None,
         },
-    }
-}
-
-/// Recover a specific exit reason from `joined` — the outcome of joining
-/// galoshes' own plugin-driving task (its `ChainRunner::run` future) —
-/// for the case where the ready-gate signal itself carried no diagnosis
-/// (a bare `StartError::ExitedBeforeReady`). Mirrors bridge's own
-/// `recover_exit_detail`, which performs the identical join-for-detail
-/// recovery against the plugin-driving task IT holds.
-///
-/// `Ok(Err(e))` (the chain's own `run()` call returned a specific error)
-/// yields that error's `Display` text — the same text `main`'s own
-/// `anyhow::Result` return would otherwise carry, now surfaced to the
-/// bridge via the sitrep event too. `Ok(Ok(()))` (a clean exit — e.g.
-/// shutdown raced the readiness report) and `Err(_)` (the task panicked or
-/// was cancelled while being joined) both fall back to
-/// [`garter::EXITED_BEFORE_READY_DETAIL`]; the panic/cancel case is also
-/// logged at `error!`, since it signals a bug rather than routine
-/// diagnostic noise.
-pub fn recover_exit_detail(joined: &Result<garter::Result<()>, tokio::task::JoinError>) -> String {
-    match joined {
-        Ok(Err(e)) => e.to_string(),
-        Ok(Ok(())) => garter::EXITED_BEFORE_READY_DETAIL.into(),
-        Err(join_err) => {
-            tracing::error!(error = %join_err, "plugin-driving task ended abnormally while recovering exit detail");
-            garter::EXITED_BEFORE_READY_DETAIL.into()
-        }
     }
 }
 
