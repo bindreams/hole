@@ -362,25 +362,28 @@ impl ChainRunner {
 // Helpers =============================================================================================================
 
 /// Scan `rxs` for an already-delivered start-failure signal, preferring a
-/// SPECIFIC `Err(StartError)` over a generic `Closed` sender (dropped
-/// unsent) regardless of which order they're found in — a `Closed` earlier
-/// in iteration order must never mask a real `BindConflict`/`Fatal`
-/// delivered by a later one. Returns `None` only when every scanned
-/// receiver is genuinely `Empty` (or holds an `Ok(PluginReady)`, which is
-/// not a failure and is ignored here) — the caller then has nothing to
-/// recover.
+/// SPECIFIC `Err(StartError)` — anything other than `ExitedBeforeReady`,
+/// which is itself a "no reason known" placeholder, not a real diagnosis —
+/// over a generic signal (a `Closed` sender, or a *delivered*
+/// `ExitedBeforeReady`) regardless of which order they're found in. A
+/// generic signal earlier in iteration order must never mask a real
+/// `BindConflict`/`Fatal` delivered by a later one, however that later one
+/// arrives. Returns `None` only when every scanned receiver is genuinely
+/// `Empty` (or holds an `Ok(PluginReady)`, which is not a failure and is
+/// ignored here) — the caller then has nothing to recover.
 fn scan_for_delivered_error<'a>(
     rxs: impl Iterator<Item = &'a mut oneshot::Receiver<Result<PluginReady, StartError>>>,
 ) -> Option<StartError> {
-    let mut any_closed = false;
+    let mut saw_generic = false;
     for r in rxs {
         match r.try_recv() {
+            Ok(Err(StartError::ExitedBeforeReady)) => saw_generic = true,
             Ok(Err(e)) => return Some(e),
-            Err(oneshot::error::TryRecvError::Closed) => any_closed = true,
+            Err(oneshot::error::TryRecvError::Closed) => saw_generic = true,
             Ok(Ok(_)) | Err(oneshot::error::TryRecvError::Empty) => {}
         }
     }
-    any_closed.then_some(StartError::ExitedBeforeReady)
+    saw_generic.then_some(StartError::ExitedBeforeReady)
 }
 
 /// Aggregate the N per-plugin readiness results into a single chain-level

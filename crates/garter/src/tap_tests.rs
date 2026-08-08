@@ -419,7 +419,7 @@ async fn cross_check_inbound_and_upstream_counters_match() {
 // `StartError::ExitedBeforeReady` lets a caller `match` on the variant
 // instead of comparing `detail` text (see its doc comment, which names
 // TapPlugin's inner-exit race by name) — this pins that TapPlugin actually
-// emits it, not the `Fatal` variant it used before.
+// emits it.
 #[skuld::test]
 async fn tap_reports_exited_before_ready_when_inner_exits_without_binding() {
     let local = pick_local().await;

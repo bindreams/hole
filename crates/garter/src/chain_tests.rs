@@ -563,6 +563,48 @@ async fn aggregator_delivered_exited_before_ready_prefers_a_later_specific_error
     );
 }
 
+// `scan_for_delivered_error` itself must not stop at the FIRST generic
+// placeholder it scans past: two plugins ahead of the specific error both
+// deliver `ExitedBeforeReady`, so a scan that treats the first one as
+// "specific" (returning early) would mask index 2's real `BindConflict`
+// just as surely as a single placeholder would.
+#[skuld::test]
+async fn aggregator_delivered_exited_before_ready_prefers_a_specific_error_past_two_placeholders() {
+    let (rtx0, rrx0) = oneshot::channel::<Result<PluginReady, StartError>>();
+    rtx0.send(Err(StartError::ExitedBeforeReady)).unwrap();
+
+    let (rtx1, rrx1) = oneshot::channel::<Result<PluginReady, StartError>>();
+    rtx1.send(Err(StartError::ExitedBeforeReady)).unwrap();
+
+    let (rtx2, rrx2) = oneshot::channel::<Result<PluginReady, StartError>>();
+    rtx2.send(Err(StartError::BindConflict {
+        errno: 10048,
+        addr: "127.0.0.1:1080".parse().unwrap(),
+    }))
+    .unwrap();
+
+    let shutdown = CancellationToken::new(); // never cancelled
+
+    let (ready_tx, ready_rx) = oneshot::channel();
+    run_readiness_aggregator(
+        vec![(0, rrx0), (1, rrx1), (2, rrx2)],
+        3,
+        Mode::Client,
+        shutdown,
+        ready_tx,
+    )
+    .await;
+
+    let outcome = ready_rx
+        .await
+        .expect("aggregator must not drop ready_tx: plugin 2 already delivered a value");
+    assert!(
+        matches!(outcome, Err(StartError::BindConflict { errno: 10048, .. })),
+        "expected plugin 2's delivered BindConflict to survive past TWO generic ExitedBeforeReady \
+         placeholders, got {outcome:?}"
+    );
+}
+
 /// The aggregator reports the end-to-end transports as the intersection
 /// across every hop: a transport is carried only if EVERY plugin serves
 /// it. Here a TCP|UDP hop and a TCP-only hop must intersect to TCP. The
