@@ -341,17 +341,82 @@ they permit.
 
 #### Transient cutover cover
 
-`Routing::install_failclosed_cover(server_ip)` engages a leak-free egress block —
-permit loopback and the SS server IP, **block everything else** — as an RAII
-guard whose `Drop` disengages it. It is a bounded-window kill switch holding the
-line regardless of [lockdown](#lockdown-mode); a crash while it is held leaves
-traffic **blocked, not leaked**. It has **no production caller today**: the
-[update cutover](#update-cutover) holds its gap with the *standing* lockdown cover
-(disarmed across the restart), not a transient one, and a lockdown-off cutover
-fails *open* by design. The trait method + RAII guard stay for the test seam and
-as the recovery target swept on every start. It does *not* cover an indefinite
-outage (a bridge that stays down) — without lockdown, default-off Hole fails
-*open* there; lockdown closes that broader gap.
+`Routing::install_failclosed_cover(server_ip, resolver_ip)` engages a leak-free
+egress block — permit loopback and the SS server IP, **block everything else** —
+as an RAII guard whose `Drop` disengages it. It is a bounded-window kill switch
+holding the line regardless of [lockdown](#lockdown-mode); a crash while it is
+held leaves traffic **blocked, not leaked**. `ProxyManager::start_cancellable`
+is its production caller: every covered (auto-connect) start engages it before
+`start_inner`, retaining it (host stays blocked, not leaked) if the start fails,
+and releasing it on success, cancel, or a user stop. It does *not* cover an
+indefinite outage (a bridge that stays down) — without lockdown, default-off
+Hole fails *open* there; lockdown closes that broader gap.
+
+`resolver_ip` optionally permits ONE more address, scoped to **TCP port 443**
+(not the server permit's unrestricted shape — `doh_url_for_ip` in
+`crate::dns::ech` never constructs a URL with any other port, so 443 is
+structurally the only value this fetch can need, not a heuristic threshold):
+`EchDoh::resolver`, the exact address Hole's own `ech-doh` URL names, gated on
+a plugin being configured at all (no plugin, no later ECH lookup, so nothing
+to permit for). Without it, ex-ray's later lazy ECH-config fetch — which fires
+on the plugin chain's first dial, i.e. *under* this same cover — would be
+blocked and stall to ex-ray's client timeout. **Permitting it grants no new
+trust regardless of `PinSource`:** Hole *authored* the address — `ech_doh_url`
+either uses the bootstrap-verified IP or falls back to one in the user's own
+configured `dns.servers` — so config-authorship trust alone is judged
+sufficient. This is NOT a claim that this attempt personally dialed the
+address: `resolve_via_doh` does dial every configured resolver even on total
+failure (so `Answered` and `SecureBootstrapFailed` both had it dialed this
+session), but `NoQueryNeeded` (a literal-IP server) dials nothing at all, and
+`ResolverDeselected` (a covered retry whose `dns.servers` changed) may name an
+address only a prior resolve dialed, or never dialed by this bridge process
+at all — see `EchDoh`'s doc for the exact breakdown. An OPERATOR-supplied
+address is different: an operator's own `ech-doh` in `plugin_opts` can win
+first-wins over Hole's (`crate::proxy::plugin::effective_ech_doh`, not
+`ech_doh.is_some()` alone, decides which value actually reaches ex-ray), and
+that address is never permitted — Hole did not author it, so config-authorship
+trust does not extend to it. `effective_ech_doh` also means a non-ECH-capable
+plugin never widens the cover for a fetch that provably does not use it. A
+covered retry against the same server reuses the held cover as-is UNLESS this
+attempt's freshly-derived permit now differs from what the cover was actually
+engaged with (e.g. `dns.servers` changed the fallback address, or a plugin was
+added between attempts) — that drift makes the held cover stale, and it is
+released and re-engaged fresh with the corrected permit, the same repair
+pattern already used for a different-server retry, EXCEPT when the new
+derivation only NARROWS to nothing needed (e.g. the plugin was removed): a
+superset permit is left in place rather than opening the release-to-reengage
+window for a correction with no benefit. If the corrected engage itself
+fails, the repair falls back to restoring the PREVIOUS permit rather than
+leaving the host uncovered, and remembers that specific corrected value as
+unreachable (`BlockedStart::dead_permit`) so an unchanged retry does not
+retry the same failing correction forever — a later retry whose derivation
+changes again still repairs normally.
+
+**Disclosed residual:** an operator's OWN `ech-doh` in `plugin_opts`
+outranking Hole's (`EffectiveEchDoh::Operators`) is never permitted — Hole did
+not author that address, so config-authorship trust does not extend to it,
+making this a real widening rather than the config-authorship trust extended
+to Hole's own addresses — and is therefore *always* a stall risk under a
+covered start; `ProxyManager::start_cancellable` logs a dedicated `warn!`
+naming the operator's URL. A repair's compensating restore can also leave the
+LIVE held cover's permit mismatched from what THIS attempt actually needs
+(the corrected engage failed) — a separate `warn!` fires for that case too,
+comparing against the live permit rather than re-trusting that the repair
+always converges. A THIRD case is untouched by this mechanism entirely
+(not merely a residual within it), **macOS only**: a restart that adopts a
+pre-existing [standing lockdown cover](#lockdown-mode) sees no transient
+cover engage at all, so there is no in-process signal to gate a diagnostic on
+— the adopted pf ruleset can block the same ECH fetch, silently. Windows is
+unaffected: the adopted lockdown cover's App-ID floor already permits the
+plugin process outright (pf has no per-process matcher, so macOS has no
+equivalent floor). Tracked separately:
+[#753](https://github.com/bindreams/hole/issues/753). Finally, the
+release-then-reengage repair itself has a brief window with NO cover at all
+between the release and the corrected (or restored) re-engage — disclosed in
+the repair's own `warn!` lines, not silent, but not eliminated either: both
+platforms' engage primitives are delete-then-add / flush-then-reload, not an
+atomic in-place update. Tracked separately:
+[#758](https://github.com/bindreams/hole/issues/758).
 
 It is **name-agnostic** — it does *not* permit the TUN interface. The new
 bridge's start-time DNS-forwarder self-test runs over loopback to the SS client
@@ -425,15 +490,17 @@ three axes:
 
 - **Permit set.** Lockdown adds a TUN-interface permit (Windows: by `NET_LUID`;
   macOS: `pass out quick on <tun>`) so app traffic flows; the transient cover
-  deliberately omits it (permit loopback + server only) because holding it while
-  connected would block all browsing.
+  deliberately omits it (permit loopback + server + the resolver Hole's own
+  `ech-doh` names, when a plugin needs it) because holding it while connected
+  would block all browsing.
 - **Lifetime.** Lockdown is authoritative and standing — it persists across a
   crash or restart and is reconciled on the next start via
   `decide_cover_recovery` (Adopt keeps the host fail-closed, dropping the
   volatile TUN + server permits so the next connect re-adds them fresh; Sweep
   disengages when intent is off). The transient cover is a non-standing,
-  bounded-window RAII guard with **no production caller today** (a test seam +
-  recovery target swept by `recover_routes`).
+  bounded-window RAII guard engaged only for the duration of one covered
+  (auto-connect) start attempt, and swept by `recover_routes` like every other
+  cover state on the next start.
 - **Failure mode.** A failed lockdown engage during a lockdown-on start is
   **fail-FATAL** — it aborts the start and tears everything down; the transient
   cover fails *open* on its own engage error so a half-loaded ruleset never

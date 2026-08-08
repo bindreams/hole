@@ -462,6 +462,129 @@ fn unpinned_reason(ech_doh: Option<&crate::dns::ech::EchDoh>) -> &'static str {
     }
 }
 
+/// The v2ray-family plugin names `inject_plugin_directives` rewrites
+/// `ech-doh` for. `v2ray-plugin` resolves to the first-party `ex-ray` binary,
+/// but a config may also name `ex-ray` directly, so both spellings are
+/// covered; `galoshes` ignores the keys itself but forwards the whole options
+/// string to its inner ex-ray. Every OTHER plugin name is passed through
+/// `inject_plugin_directives` completely unmodified — no `ech-doh` is ever
+/// injected, so nothing that plugin does can be influenced by Hole's ECH
+/// derivation at all.
+fn takes_ech_directives(plugin_name: &str) -> bool {
+    matches!(plugin_name, "v2ray-plugin" | "ex-ray" | "galoshes")
+}
+
+/// Whether Hole's OWN `ech_doh` outranks (and should replace) an operator's
+/// existing `ech-doh` value already present in `plugin_opts`: only a resolver
+/// that ANSWERED the bootstrap, or a name-authority operator value carrying
+/// the plaintext-DNS leak Hole's own pin exists to close. Against an
+/// IP-literal operator value with an unpinned Hole guess, the operator's own
+/// choice stands. The ONE formula both `inject_plugin_directives` (decides
+/// whether to STRIP the operator's entry) and `ech_doh_will_reach_ex_ray`
+/// (decides whether Hole's directive — appended either way — is what
+/// actually reaches ex-ray) read, so the two can never silently disagree.
+fn hole_ech_doh_outranks(ech_doh: &crate::dns::ech::EchDoh, config_value: &str) -> bool {
+    ech_doh.is_pinned() || crate::dns::ech::authority_is_a_name(config_value)
+}
+
+/// Which `ech-doh` value (if any) will actually reach ex-ray once
+/// `inject_plugin_directives` runs — computed ONCE inside it, so
+/// `ProxyManager`'s cover-permit and residual-warning decisions and the
+/// actual plugin spawn always agree on the same answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum EffectiveEchDoh {
+    /// A non-ECH-capable plugin, or an ECH-capable one with no `ech-doh`
+    /// from any source — ECH is off, nothing will be fetched.
+    None,
+    /// Hole's own `ech_doh` is the value ex-ray will fetch.
+    Holes,
+    /// An OPERATOR's own `ech-doh` (already in `plugin_opts`, not displaced
+    /// by Hole's) is the value ex-ray will fetch instead — carried so a
+    /// caller can name the address in a diagnostic. Hole's fail-closed cover
+    /// never permits an operator-chosen address: the permit rests on
+    /// config-authorship trust — Hole itself authored the address (see
+    /// `hole_bridge::dns::ech::EchDoh`'s doc) — and an operator-supplied
+    /// address carries no such guarantee, so permitting it would be a real
+    /// widening. A covered start with this outcome is therefore a disclosed
+    /// residual: ex-ray will dial an address the cover does not permit and
+    /// can stall.
+    Operators(String),
+}
+
+/// Whether ex-ray will actually receive HOLE'S `ech_doh` as the winning
+/// `ech-doh=` value once `inject_plugin_directives` runs on this exact
+/// `(plugin_name, opts)` pair. Test-only: production code (`ProxyManager`)
+/// reads the full [`EffectiveEchDoh`] off [`effective_ech_doh`] directly, so
+/// it can ALSO warn about the `Operators` case — this bool-only view is a
+/// convenience for tests that only care about the `Holes` outcome.
+#[cfg(test)]
+pub(crate) fn ech_doh_will_reach_ex_ray(
+    plugin_name: &str,
+    opts: Option<&str>,
+    ech_doh: Option<&crate::dns::ech::EchDoh>,
+) -> bool {
+    matches!(effective_ech_doh(plugin_name, opts, ech_doh), EffectiveEchDoh::Holes)
+}
+
+/// Which `ech-doh` value ex-ray will actually dial for this exact
+/// `(plugin_name, opts, ech_doh)` triple — a PURE query, no logging. Shares
+/// [`classify_ech_doh`] with `inject_plugin_directives`, so the "will
+/// something fetch an ECH config, and whose value" question and the actual
+/// plugin spawn read the exact same parse and the exact same outrank
+/// decision (they cannot drift the way two independent re-derivations of
+/// `takes_ech_directives` + `hole_ech_doh_outranks` could), WITHOUT also
+/// re-triggering `inject_plugin_directives`'s `tracing::warn!` calls: this
+/// is queried once per start attempt from the permit-derivation path
+/// (`ProxyManager::start_cancellable`), and the eventual plugin spawn calls
+/// `inject_plugin_directives` again for real — calling that function here
+/// too would double-emit every ECH-posture warning on every start. A
+/// malformed `opts` string reads as `None` too — the same input that would
+/// make `inject_plugin_directives` return `Err`, so the plugin chain never
+/// starts and nothing ech-doh-shaped ever reaches ex-ray.
+pub(crate) fn effective_ech_doh(
+    plugin_name: &str,
+    opts: Option<&str>,
+    ech_doh: Option<&crate::dns::ech::EchDoh>,
+) -> EffectiveEchDoh {
+    if !takes_ech_directives(plugin_name) {
+        return EffectiveEchDoh::None;
+    }
+    let Ok(segments) = garter::split_plugin_options(opts.unwrap_or_default()) else {
+        return EffectiveEchDoh::None;
+    };
+    classify_ech_doh(&segments, ech_doh).0
+}
+
+/// The `(EffectiveEchDoh, displaces)` decision shared by [`effective_ech_doh`]
+/// (reads only the first element) and `inject_plugin_directives` (reads
+/// both: `displaces` decides which keys to strip). The ONE place this
+/// formula is written — see `effective_ech_doh`'s doc for why the parse
+/// itself is NOT similarly shared (the logging that must stay
+/// spawn-side-only lives one level up, in `inject_plugin_directives`, past
+/// where `segments` is produced).
+fn classify_ech_doh(
+    segments: &[garter::OptionSegment<'_>],
+    ech_doh: Option<&crate::dns::ech::EchDoh>,
+) -> (EffectiveEchDoh, bool) {
+    let config_ech_doh = segments.iter().find(|s| s.key == "ech-doh");
+    // Hole's URL is name-free, so it displaces one whose authority is a
+    // name — that lookup is the defect. Against an IP-literal value there
+    // is no leak to fix, so only a resolver that ANSWERED outranks the
+    // operator's own choice.
+    let displaces = match (ech_doh, config_ech_doh) {
+        (Some(e), Some(s)) => hole_ech_doh_outranks(e, &s.value),
+        _ => false,
+    };
+    let effective = if ech_doh.is_some() && (config_ech_doh.is_none() || displaces) {
+        EffectiveEchDoh::Holes
+    } else if let Some(s) = config_ech_doh {
+        EffectiveEchDoh::Operators(s.value.to_string())
+    } else {
+        EffectiveEchDoh::None
+    };
+    (effective, displaces)
+}
+
 /// Remove any existing copy of a key Hole is about to set, then append it.
 /// ex-ray's `Args.Get` is first-wins, so an appended duplicate would silently
 /// lose to a user's, and postern writes `ech-doh` before Hole ever sees the
@@ -471,86 +594,85 @@ fn unpinned_reason(ech_doh: Option<&crate::dns::ech::EchDoh>) -> &'static str {
 /// Only the v2ray-family plugins receive these: `v2ray-plugin` resolves to the
 /// first-party `ex-ray` binary, but a config may also name `ex-ray` directly,
 /// so both spellings are covered; `galoshes` ignores the keys itself but
-/// forwards the whole options string to its inner ex-ray.
+/// forwards the whole options string to its inner ex-ray. Every other plugin
+/// name is passed through unmodified — the ONE gate (`takes_ech_directives`)
+/// both this function and its callers rely on, checked exactly once, here.
+/// Emits the ECH-posture `tracing::warn!` lines — called exactly once per
+/// actual plugin spawn (`start_plugin_chain`); the permit-derivation query
+/// [`effective_ech_doh`] deliberately does NOT call this, to avoid
+/// double-emitting them (see that function's doc).
 fn inject_plugin_directives(
     plugin_name: &str,
     opts: Option<&str>,
     ech_doh: Option<&crate::dns::ech::EchDoh>,
 ) -> Result<Option<String>, ProxyError> {
-    match plugin_name {
-        "v2ray-plugin" | "ex-ray" | "galoshes" => {
-            let opts = opts.unwrap_or_default();
-            // Refuse rather than forward — see `ProxyError::MalformedPluginOptions`.
-            // Position only in the message; a segment can carry a secret.
-            let segments = garter::split_plugin_options(opts)
-                .map_err(|e| ProxyError::MalformedPluginOptions(format!("{plugin_name}: {e}")))?;
+    if !takes_ech_directives(plugin_name) {
+        return Ok(opts.map(String::from));
+    }
+    {
+        let opts = opts.unwrap_or_default();
+        // Refuse rather than forward — see `ProxyError::MalformedPluginOptions`.
+        // Position only in the message; a segment can carry a secret.
+        let segments = garter::split_plugin_options(opts)
+            .map_err(|e| ProxyError::MalformedPluginOptions(format!("{plugin_name}: {e}")))?;
 
-            let config_ech_doh = segments.iter().find(|s| s.key == "ech-doh");
-            // Hole's URL is name-free, so it displaces one whose authority is a
-            // name — that lookup is the defect. Against an IP-literal value there
-            // is no leak to fix, so only a resolver that ANSWERED outranks the
-            // operator's own choice.
-            let displaces = match (ech_doh, config_ech_doh) {
-                (Some(e), Some(s)) => e.is_pinned() || crate::dns::ech::authority_is_a_name(&s.value),
-                _ => false,
-            };
-            // Strip only what we are about to set, so an override never becomes
-            // a deletion. Keys compare as the PLUGIN decodes them.
-            let owned: &[&str] = if displaces {
-                &["loglevel", "ech-doh"]
-            } else {
-                &["loglevel"]
-            };
+        let (_effective, displaces) = classify_ech_doh(&segments, ech_doh);
+        let config_ech_doh = segments.iter().find(|s| s.key == "ech-doh");
+        // Strip only what we are about to set, so an override never becomes
+        // a deletion. Keys compare as the PLUGIN decodes them.
+        let owned: &[&str] = if displaces {
+            &["loglevel", "ech-doh"]
+        } else {
+            &["loglevel"]
+        };
 
-            // Which ECH source won, and how much is known about it. Every outcome
-            // reaches ex-ray as one URL, so this is the only record of the choice.
-            // `find`, not `any`: ex-ray reads the FIRST `ech`, so a later one
-            // reporting a posture it will never apply would invert the line.
-            let fail_closed = segments
-                .iter()
-                .find(|s| s.key == "ech")
-                .is_some_and(|s| s.value == "always");
-            match (ech_doh, config_ech_doh) {
-                (Some(_), Some(s)) if !displaces => tracing::warn!(
-                    plugin = %plugin_name,
-                    "{}, so the config's own name-free ech-doh stands: {}",
-                    unpinned_reason(ech_doh),
-                    s.raw
-                ),
-                (Some(e), _) if !e.is_pinned() => tracing::warn!(
-                    plugin = %plugin_name, fail_closed,
-                    "{}; the ECH lookup uses a resolver that has not been exercised: {}",
-                    unpinned_reason(ech_doh),
-                    e.url
-                ),
-                (Some(_), _) => {}
-                // Stripping this would disarm ECH altogether, so it stands — but
-                // a name authority is resolved over plaintext system DNS.
-                (None, Some(s)) => tracing::warn!(
-                    plugin = %plugin_name,
-                    "no configured resolver to pin the ECH lookup to; the config's own ech-doh stands: {}", s.raw
-                ),
-                // ECH is armed only by `ech-doh`, so there is none. Under
-                // `ech=always` ex-ray refuses to start over exactly this.
-                (None, None) => tracing::warn!(
-                    plugin = %plugin_name,
-                    fail_closed,
-                    "no ech-doh from any source; ECH is off"
-                ),
-            }
-
-            let directive = ech_doh.map(|e| format!("ech-doh={}", e.url));
-
-            Ok(Some(garter::join_plugin_options(
-                segments
-                    .iter()
-                    .filter(|s| !owned.contains(&s.key.as_str()))
-                    .map(|s| s.raw)
-                    .chain(["loglevel=debug"])
-                    .chain(directive.as_deref()),
-            )))
+        // Which ECH source won, and how much is known about it. Every outcome
+        // reaches ex-ray as one URL, so this is the only record of the choice.
+        // `find`, not `any`: ex-ray reads the FIRST `ech`, so a later one
+        // reporting a posture it will never apply would invert the line.
+        let fail_closed = segments
+            .iter()
+            .find(|s| s.key == "ech")
+            .is_some_and(|s| s.value == "always");
+        match (ech_doh, config_ech_doh) {
+            (Some(_), Some(s)) if !displaces => tracing::warn!(
+                plugin = %plugin_name,
+                "{}, so the config's own name-free ech-doh stands: {}",
+                unpinned_reason(ech_doh),
+                s.raw
+            ),
+            (Some(e), _) if !e.is_pinned() => tracing::warn!(
+                plugin = %plugin_name, fail_closed,
+                "{}; the ECH lookup uses a resolver that has not been exercised: {}",
+                unpinned_reason(ech_doh),
+                e.url
+            ),
+            (Some(_), _) => {}
+            // Stripping this would disarm ECH altogether, so it stands — but
+            // a name authority is resolved over plaintext system DNS.
+            (None, Some(s)) => tracing::warn!(
+                plugin = %plugin_name,
+                "no configured resolver to pin the ECH lookup to; the config's own ech-doh stands: {}", s.raw
+            ),
+            // ECH is armed only by `ech-doh`, so there is none. Under
+            // `ech=always` ex-ray refuses to start over exactly this.
+            (None, None) => tracing::warn!(
+                plugin = %plugin_name,
+                fail_closed,
+                "no ech-doh from any source; ECH is off"
+            ),
         }
-        _ => Ok(opts.map(String::from)),
+
+        let directive = ech_doh.map(|e| format!("ech-doh={}", e.url));
+
+        Ok(Some(garter::join_plugin_options(
+            segments
+                .iter()
+                .filter(|s| !owned.contains(&s.key.as_str()))
+                .map(|s| s.raw)
+                .chain(["loglevel=debug"])
+                .chain(directive.as_deref()),
+        )))
     }
 }
 
@@ -584,11 +706,26 @@ mod inject_tests {
         inject_plugin_directives(plugin, opts, ech_doh).expect("well-formed options")
     }
 
+    /// The IP `url`'s authority names, per `EchDoh::resolver`'s contract
+    /// (Hole always constructs `url` FROM this address, in production) — or
+    /// a placeholder when the fixture deliberately uses a NAME authority
+    /// (e.g. to exercise `authority_is_a_name`'s injection-priority path):
+    /// `resolver` is irrelevant to what those fixtures assert, only `url`
+    /// and `source` are.
+    fn ip_from_test_url(url: &str) -> IpAddr {
+        url::Url::parse(url)
+            .ok()
+            .and_then(|u| u.host_str().map(str::to_string))
+            .and_then(|h| h.trim_start_matches('[').trim_end_matches(']').parse().ok())
+            .unwrap_or_else(|| "192.0.2.1".parse().expect("test IP literal"))
+    }
+
     /// An `ech-doh` naming a resolver that ANSWERED the bootstrap.
     fn pinned(url: &str) -> EchDoh {
         EchDoh {
             url: url.to_string(),
-            source: PinSource::Answered("9.9.9.9".parse().expect("test IP literal")),
+            resolver: ip_from_test_url(url),
+            source: PinSource::Answered(ip_from_test_url(url)),
         }
     }
 
@@ -596,6 +733,7 @@ mod inject_tests {
     fn unpinned_for(url: &str, source: PinSource) -> EchDoh {
         EchDoh {
             url: url.to_string(),
+            resolver: ip_from_test_url(url),
             source,
         }
     }
@@ -1014,6 +1152,68 @@ mod inject_tests {
         assert_eq!(
             out.as_deref(),
             Some("mode=websocket;host=cdn.example;tls;ech=always;loglevel=debug;ech-doh=https://9.9.9.9/dns-query"),
+        );
+    }
+
+    // effective_ech_doh / ech_doh_will_reach_ex_ray ===================================================================
+
+    // A regression that made this return `true` whenever `ech_doh.is_some()`
+    // (the old, simpler gate this function replaces) would pass this test if
+    // the plugin-family gate were dropped: a non-ECH-capable plugin name
+    // must never be told it will fetch Hole's ech_doh, even with a pinned
+    // candidate in hand.
+    #[skuld::test]
+    fn non_family_plugin_never_reaches_ex_ray() {
+        assert!(!ech_doh_will_reach_ex_ray(
+            "obfs-local",
+            None,
+            Some(&pinned("https://9.9.9.9/dns-query"))
+        ));
+        assert_eq!(
+            effective_ech_doh("obfs-local", None, Some(&pinned("https://9.9.9.9/dns-query"))),
+            EffectiveEchDoh::None
+        );
+    }
+
+    #[skuld::test]
+    fn family_plugin_with_no_ech_doh_from_any_source_is_not_applicable() {
+        assert_eq!(effective_ech_doh("ex-ray", None, None), EffectiveEchDoh::None);
+    }
+
+    #[skuld::test]
+    fn family_plugin_with_no_operator_override_reaches_ex_ray_as_holes() {
+        let e = pinned("https://9.9.9.9/dns-query");
+        assert!(ech_doh_will_reach_ex_ray("ex-ray", None, Some(&e)));
+        assert_eq!(effective_ech_doh("ex-ray", None, Some(&e)), EffectiveEchDoh::Holes);
+    }
+
+    // The exact scenario the mismatched-warning fix targets: an unpinned Hole
+    // guess against an operator's own IP-literal `ech-doh` — the operator's
+    // choice stands, so ex-ray fetches THEIRS, not Hole's.
+    #[skuld::test]
+    fn family_plugin_with_a_winning_operator_override_reaches_ex_ray_as_operators() {
+        let e = unpinned("https://1.1.1.1/dns-query");
+        assert!(!ech_doh_will_reach_ex_ray(
+            "ex-ray",
+            Some("ech-doh=https://8.8.8.8/dns-query"),
+            Some(&e)
+        ));
+        assert_eq!(
+            effective_ech_doh("ex-ray", Some("ech-doh=https://8.8.8.8/dns-query"), Some(&e)),
+            EffectiveEchDoh::Operators("https://8.8.8.8/dns-query".to_string())
+        );
+    }
+
+    // A malformed `opts` string makes `inject_plugin_directives` return `Err`
+    // and the plugin chain never starts — neither accessor may panic, and
+    // both must read this as "nothing reaches ex-ray".
+    #[skuld::test]
+    fn malformed_opts_reaches_ex_ray_as_nothing_not_a_panic() {
+        let e = pinned("https://9.9.9.9/dns-query");
+        assert!(!ech_doh_will_reach_ex_ray("ex-ray", Some(r"path=/a\"), Some(&e)));
+        assert_eq!(
+            effective_ech_doh("ex-ray", Some(r"path=/a\"), Some(&e)),
+            EffectiveEchDoh::None
         );
     }
 

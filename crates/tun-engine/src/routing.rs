@@ -405,16 +405,38 @@ pub trait Routing: Send + Sync {
     /// can disarm it (persist-without-disengage).
     type Cover: Send + CoverGuard;
 
-    /// Engage a fail-closed cover: block all egress except loopback and
-    /// `server_ip`. Returns an RAII guard whose Drop disengages it. The cover
-    /// survives a process crash (Windows: persistent WFP filters keyed by fixed
+    /// Engage a fail-closed cover: block all egress except loopback, `server_ip`,
+    /// and (when `Some`) `resolver_ip` — the address the caller's own
+    /// `ech-doh` URL names (`hole_bridge::dns::ech::EchDoh::resolver`), scoped
+    /// to TCP/443 (see `crate::dns::ech::DOH_PORT`). The caller authors that
+    /// URL from its own configured resolver set, so config-authorship trust
+    /// alone is judged sufficient — permitting it is never a claim that this
+    /// exact attempt personally dialed the address (see `EchDoh`'s doc: that
+    /// additionally holds for some `PinSource` variants but not all). `None`
+    /// covers every case where nothing should be permitted: no plugin
+    /// configured, a non-ECH-capable plugin, malformed plugin options, or an
+    /// OPERATOR's own `ech-doh` winning instead of Hole's (an address Hole
+    /// did not author, so the config-authorship trust does not extend to it
+    /// — a disclosed residual, see CONTRIBUTING.md). `None` is never
+    /// permitted as "no restriction" — a retry whose resolver changed since
+    /// the cover engaged compares this attempt's freshly-derived
+    /// `resolver_ip` against the held cover's, and on drift releases and
+    /// re-engages with the corrected value (falling back to the OLD value if
+    /// the corrected engage itself fails, so a permit correction can never
+    /// be how a covered start loses its cover outright — see
+    /// `BlockedStart`'s doc). See CONTRIBUTING.md's "Transient cutover
+    /// cover" section for the full retry-repair state machine and the
+    /// disclosed residuals this trait's caller does not close.
+    /// The cover survives a process crash (Windows: persistent WFP filters keyed by fixed
     /// GUID; macOS: pf enable token persisted to `bridge-failclosed.json`) and is
     /// swept by [`recover_routes`] on the next start. Does NOT permit the TUN
     /// interface — the block-until-connected connect gate holds it only until the
-    /// tunnel comes up. It permits the resolved `server_ip`, not the DoH resolvers:
-    /// a stay-blocked retry reuses the already-resolved IP rather than re-resolving
-    /// under the cover.
-    fn install_failclosed_cover(&self, server_ip: IpAddr) -> Result<Self::Cover, RoutingError>;
+    /// tunnel comes up.
+    fn install_failclosed_cover(
+        &self,
+        server_ip: IpAddr,
+        resolver_ip: Option<IpAddr>,
+    ) -> Result<Self::Cover, RoutingError>;
 
     /// Engage the STANDING lockdown cover for this connected session: permit
     /// loopback + the `tun_name` interface + the onward server connection (and,
@@ -501,8 +523,12 @@ impl Routing for SystemRouting {
         get_default_gateway_info().map_err(|e| RoutingError::Gateway(e.to_string()))
     }
 
-    fn install_failclosed_cover(&self, server_ip: IpAddr) -> Result<Self::Cover, RoutingError> {
-        failclosed::engage(server_ip, &self.state_dir, self.owner)
+    fn install_failclosed_cover(
+        &self,
+        server_ip: IpAddr,
+        resolver_ip: Option<IpAddr>,
+    ) -> Result<Self::Cover, RoutingError> {
+        failclosed::engage(server_ip, resolver_ip, &self.state_dir, self.owner)
     }
 
     fn install_lockdown(
