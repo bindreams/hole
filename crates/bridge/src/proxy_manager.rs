@@ -681,15 +681,11 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         // cover existed a moment ago, so a failed fresh engage below
         // restores it instead of leaving the host uncovered.
         //
-        // A drift that matches a KNOWN-DEAD value (see `dead_permit`'s doc)
-        // skips the repair THIS retry — bounding the release-to-reengage
-        // window from reopening on every single retry of an unreachable
-        // value — but clears the marker so the NEXT retry gets a fresh
-        // attempt: `install_failclosed_cover` can fail on a transient OS
-        // condition (a momentary WFP/pf contention), and a single such
-        // failure must not wedge the repair for the rest of the session.
-        // Net effect: a persistently-failing value is retried every OTHER
-        // drift-matching retry, not every one and not never.
+        // A drift matching a KNOWN-DEAD value (see `dead_permit`'s doc) skips
+        // the repair this retry and clears the marker so the next retry gets
+        // a fresh attempt — a single `install_failclosed_cover` failure
+        // (e.g. a momentary WFP/pf contention) must not wedge the repair
+        // permanently.
         let repair_fallback: Option<Option<IpAddr>> = if covered && !lockdown_on {
             match self.blocked.as_mut().filter(|b| {
                 b.host == config.server.server && ech_resolver_permit.is_some_and(|r| b.resolver_permit != Some(r))

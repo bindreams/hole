@@ -555,13 +555,15 @@ pub(crate) fn effective_ech_doh(
     classify_ech_doh(&segments, ech_doh).0
 }
 
-/// The `(EffectiveEchDoh, displaces)` decision shared by [`effective_ech_doh`]
-/// (reads only the first element) and `inject_plugin_directives` (reads
-/// both: `displaces` decides which keys to strip). The ONE place this
-/// formula is written — see `effective_ech_doh`'s doc for why the parse
-/// itself is NOT similarly shared (the logging that must stay
-/// spawn-side-only lives one level up, in `inject_plugin_directives`, past
-/// where `segments` is produced).
+/// ex-ray's own default for the `host` option
+/// (`crates/ex-ray/config.go:45`: `flag.String("host", "cloudfront.com", ...)`)
+/// — a real DOMAIN, not "no SNI". An absent `host` segment is NOT the same
+/// as an unreachable config; see `doh_default_host_matches_ex_ray_config_go`
+/// for the executable pin against the vendored Go source (can't run the Go
+/// code itself, but a text-level assertion still fails loudly if the
+/// literal ever changes there without a matching edit here).
+const EX_RAY_DEFAULT_HOST: &str = "cloudfront.com";
+
 /// Whether ex-ray will even ATTEMPT an ECH-config fetch for this segment
 /// set, independent of which `ech-doh` value would win. Neither the cover
 /// permit, the residual-stall warning, nor `inject_plugin_directives`'s own
@@ -576,13 +578,18 @@ pub(crate) fn effective_ech_doh(
 ///   plain non-quic transport (e.g. `mode=websocket` with no `tls`) never
 ///   calls it.
 /// - `ApplyECH` bails before dialing DoH unless the TLS `ServerName` is a
-///   DOMAIN: an absent, empty, or IP-literal `host` means ex-ray dials with
-///   an IP-literal `ServerName` (Hole never hands ex-ray a raw hostname as
-///   the connection target — everything is pre-resolved, `host` only ever
-///   supplies SNI), which `echCacheDomain` treats as "no SNI to use", so ECH
-///   is unreachable regardless of `tls`/`ech-doh`
+///   DOMAIN: an EXPLICIT empty or IP-literal `host` means ex-ray dials with
+///   an IP-literal `ServerName`, which `echCacheDomain` treats as "no SNI to
+///   use" — but an ABSENT `host` falls back to ex-ray's own
+///   [`EX_RAY_DEFAULT_HOST`], a real domain, so it's reachable. Normalizing
+///   the IP-literal test mirrors v2ray-core's `net.ParseAddress` exactly
+///   (only a MATCHED `[...]` pair is stripped, once; whitespace is trimmed
+///   only when the first or last byte is non-alphanumeric) — an
+///   approximation here would itself misjudge reachability in either
+///   direction.
 ///   (third_party/v2ray-core/transport/internet/tls/ech.go:26-51,
-///   config.go:250-264,296-303; main.go:67-69).
+///   config.go:250-264,296-303; third_party/v2ray-core/common/net/address.go:78-95;
+///   main.go:67-69).
 fn ech_fetch_is_reachable(segments: &[garter::OptionSegment<'_>]) -> bool {
     let ech_never = segments
         .iter()
@@ -593,13 +600,39 @@ fn ech_fetch_is_reachable(segments: &[garter::OptionSegment<'_>]) -> bool {
             .iter()
             .find(|s| s.key == "mode")
             .is_some_and(|s| s.value == "quic");
-    let sni_is_a_domain = segments.iter().find(|s| s.key == "host").is_some_and(|s| {
-        let bare = s.value.trim_start_matches('[').trim_end_matches(']');
-        !bare.is_empty() && bare.parse::<std::net::IpAddr>().is_err()
-    });
-    !ech_never && tls_enabled && sni_is_a_domain
+    let host = segments
+        .iter()
+        .find(|s| s.key == "host")
+        .map_or(EX_RAY_DEFAULT_HOST, |s| s.value.as_str());
+    !ech_never && tls_enabled && v2ray_core_parses_as_a_domain(host)
 }
 
+/// Mirrors v2ray-core's `net.ParseAddress` (see `ech_fetch_is_reachable`'s
+/// doc for the exact source lines): strips ONE matched `[...]` bracket pair,
+/// then trims surrounding whitespace ONLY when the first or last byte isn't
+/// alphanumeric, then tests whether what's left parses as an IP. An empty
+/// result (whether from the input or after normalization) is never a
+/// domain — `echCacheDomain`'s own caller excludes it explicitly.
+fn v2ray_core_parses_as_a_domain(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    let unbracketed = if !bytes.is_empty() && bytes[0] == b'[' && bytes[bytes.len() - 1] == b']' {
+        &value[1..value.len() - 1]
+    } else {
+        value
+    };
+    let ub = unbracketed.as_bytes();
+    let needs_trim = !ub.is_empty() && (!ub[0].is_ascii_alphanumeric() || !ub[ub.len() - 1].is_ascii_alphanumeric());
+    let normalized = if needs_trim { unbracketed.trim() } else { unbracketed };
+    !normalized.is_empty() && normalized.parse::<std::net::IpAddr>().is_err()
+}
+
+/// The `(EffectiveEchDoh, displaces)` decision shared by [`effective_ech_doh`]
+/// (reads only the first element) and `inject_plugin_directives` (reads
+/// both: `displaces` decides which keys to strip). The ONE place this
+/// formula is written — see `effective_ech_doh`'s doc for why the parse
+/// itself is NOT similarly shared (the logging that must stay
+/// spawn-side-only lives one level up, in `inject_plugin_directives`, past
+/// where `segments` is produced).
 fn classify_ech_doh(
     segments: &[garter::OptionSegment<'_>],
     ech_doh: Option<&crate::dns::ech::EchDoh>,
@@ -1079,6 +1112,29 @@ mod inject_tests {
         );
     }
 
+    // The round-3 regression this guards against: an UNREACHABLE config
+    // (`ech=never` here) with a PRE-EXISTING operator `ech-doh=` key and a
+    // PINNED Hole candidate. `displaces` must still be computed correctly
+    // (pinned always outranks) and the strip must still happen, even though
+    // no fetch will ever occur — `classify_ech_doh`'s reachability gate may
+    // only change `EffectiveEchDoh`, never silently disable the strip.
+    // Exercised at the actual joined-string level, not just the
+    // `EffectiveEchDoh` enum.
+    #[skuld::test]
+    fn displaces_is_still_correct_when_the_config_is_unreachable() {
+        let out = merged(
+            "ex-ray",
+            Some("ech=never;ech-doh=https://evil.example/dns-query"),
+            Some(&pinned("https://9.9.9.9/dns-query")),
+        );
+        assert_eq!(
+            out.as_deref(),
+            Some("ech=never;loglevel=debug;ech-doh=https://9.9.9.9/dns-query"),
+            "exactly one ech-doh key (Hole's), the operator's stripped, even though ech=never means \
+             neither will ever be dialed"
+        );
+    }
+
     // ex-ray discards the whole SS_* environment on a parse error and reports
     // `ready` on its default port, so forwarding these would produce a dead
     // tunnel that looks healthy. Refuse the start instead.
@@ -1329,19 +1385,72 @@ mod inject_tests {
         );
     }
 
-    // The SNI (`host`) must be a DOMAIN for `ApplyECH` to ever dial DoH at
-    // all (`echCacheDomain` returns "" and `ApplyECH` bails otherwise) —
-    // absent, empty, or IP-literal all mean "no SNI to key the lookup on".
+    // An ABSENT `host` is NOT "no SNI" — ex-ray defaults it to
+    // `EX_RAY_DEFAULT_HOST` (a real domain), so the fetch IS reachable.
+    #[skuld::test]
+    fn absent_host_falls_back_to_ex_rays_own_domain_default_and_reaches_ex_ray() {
+        let e = pinned("https://9.9.9.9/dns-query");
+        assert_eq!(
+            effective_ech_doh("ex-ray", Some("tls"), Some(&e)),
+            EffectiveEchDoh::Holes
+        );
+    }
+
+    // But an EXPLICIT `host` must still be a DOMAIN for `ApplyECH` to ever
+    // dial DoH at all (`echCacheDomain` returns "" and `ApplyECH` bails
+    // otherwise) — explicitly empty or IP-literal both mean "no SNI to key
+    // the lookup on", matching v2ray-core's `net.ParseAddress` exactly:
+    // only a MATCHED `[...]` pair strips, and only a non-alphanumeric edge
+    // trims whitespace.
     #[skuld::test]
     fn no_domain_host_never_reaches_ex_ray() {
         let e = pinned("https://9.9.9.9/dns-query");
-        for opts in ["tls", "tls;host=", "tls;host=203.0.113.5", "tls;host=[2001:db8::1]"] {
+        for opts in [
+            "tls;host=",
+            "tls;host=203.0.113.5",
+            "tls;host=[2001:db8::1]",
+            "tls;host= 203.0.113.5", // ParseAddress TrimSpaces a non-alnum edge, still an IP
+            "tls;host=203.0.113.5 ", // same, trailing
+        ] {
             assert_eq!(
                 effective_ech_doh("ex-ray", Some(opts), Some(&e)),
                 EffectiveEchDoh::None,
                 "opts={opts:?} must not reach ex-ray: no domain SNI to key the DoH lookup on"
             );
         }
+    }
+
+    // `ParseAddress` strips only a MATCHED `[...]` pair — an unmatched
+    // bracket is left as part of the (non-IP, therefore domain) string, so
+    // ex-ray treats it as a real SNI and DOES dial DoH.
+    #[skuld::test]
+    fn unmatched_brackets_are_not_stripped_and_reach_ex_ray() {
+        let e = pinned("https://9.9.9.9/dns-query");
+        for opts in ["tls;host=[2001:db8::1", "tls;host=2001:db8::1]"] {
+            assert_eq!(
+                effective_ech_doh("ex-ray", Some(opts), Some(&e)),
+                EffectiveEchDoh::Holes,
+                "opts={opts:?}: an unmatched bracket is not IPv6-literal stripping, so this is a \
+                 (nonsensical but real) domain string ex-ray will dial DoH for"
+            );
+        }
+    }
+
+    // The Go source cited by `EX_RAY_DEFAULT_HOST`'s doc, pinned at the text
+    // level: this crate can't execute ex-ray's Go code, but a literal-string
+    // check still fails loudly if the vendored default ever changes without
+    // a matching edit here — the same spirit as `resolver_permit_port_matches_doh_port`
+    // pinning a value across the tun-engine/hole-bridge crate boundary,
+    // applied across the Rust/Go boundary instead.
+    #[skuld::test]
+    fn ex_ray_default_host_matches_vendored_config_go() {
+        let source = include_str!("../../../ex-ray/config.go");
+        let expected = format!("flag.String(\"host\", \"{EX_RAY_DEFAULT_HOST}\", \"Hostname for server.\")");
+        assert!(
+            source.contains(&expected),
+            "EX_RAY_DEFAULT_HOST ({EX_RAY_DEFAULT_HOST:?}) no longer matches config.go's `host` flag \
+             default — update the constant to match the vendored source"
+        );
     }
 
     // `host` uses first-wins too, matching every other flag here.
