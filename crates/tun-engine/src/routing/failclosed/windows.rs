@@ -59,10 +59,10 @@ pub const SUBLAYER_GUID: GUID = GUID::from_u128(0xb4e2d3c5_6c7f_58b9_ad1e_2f3a4b
 // that knows all twelve GUIDs engages, crashes, and an OLDER build that
 // only knows ten runs recovery) leaves the two new resolver-permit filters
 // permanently un-swept inside the sublayer the standing lockdown cover also
-// uses (tracked: bindreams/hole#754). Growing this array again inherits the
-// same risk; a version-independent sweep (enumerate live filters by
-// PROVIDER_GUID instead of a fixed array) would remove it but is a separate,
-// self-contained change.
+// uses; see CONTRIBUTING.md's "Transient cutover cover" section. Growing
+// this array again inherits the same risk; a version-independent sweep
+// (enumerate live filters by PROVIDER_GUID instead of a fixed array) would
+// remove it but is a separate, self-contained change.
 pub const FILTER_GUIDS: [GUID; 12] = [
     GUID::from_u128(0xc5f3e4d6_7d80_69ca_be2f_3a4b5c6d7e8f), // loopback CONNECT V4
     GUID::from_u128(0xd6041507_8e91_7adb_cf30_4b5c6d7e8f90), // loopback CONNECT V6
@@ -503,8 +503,8 @@ fn wfp_check(code: u32, what: &str) -> Result<(), RoutingError> {
 /// `delete_all`, whose return codes are discarded) fails for that GUID: the
 /// re-add then hits `FWP_E_ALREADY_EXISTS` and reports success while the LIVE
 /// filter still carries the value the delete failed to remove. A stale
-/// PERMIT surviving, never a leaked block. Tracked separately:
-/// bindreams/hole#761.
+/// PERMIT surviving, never a leaked block; see CONTRIBUTING.md's "Transient
+/// cutover cover" section.
 fn ok_or_exists(code: u32, what: &str) -> Result<(), RoutingError> {
     if code == FWP_E_ALREADY_EXISTS_DWORD {
         return Ok(());

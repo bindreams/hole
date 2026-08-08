@@ -677,16 +677,19 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         // below — a narrowing to `None`, e.g. the plugin was removed, is left
         // as a superset permit rather than paying the release-to-reengage
         // window for a correction with no benefit). `repair_fallback`
-        // captures what's being given up: `Some(old_permit)` means a good
-        // cover existed a moment ago, so a failed fresh engage below
-        // restores it instead of leaving the host uncovered.
+        // captures what's being given up: `Some((old_permit, original_pin))`
+        // means a good cover existed a moment ago, so a failed fresh engage
+        // below restores it instead of leaving the host uncovered.
+        // `original_pin` is `pin` BEFORE this attempt's own `revalidate` —
+        // see the repair arms below for why it, not the local `pin`
+        // variable, is what gets stored back.
         //
         // A drift matching a KNOWN-DEAD value (see `dead_permit`'s doc) skips
         // the repair this retry and clears the marker so the next retry gets
         // a fresh attempt — a single `install_failclosed_cover` failure
         // (e.g. a momentary WFP/pf contention) must not wedge the repair
         // permanently.
-        let repair_fallback: Option<Option<IpAddr>> = if covered && !lockdown_on {
+        let repair_fallback: Option<(Option<IpAddr>, crate::dns::ech::PinSource)> = if covered && !lockdown_on {
             match self.blocked.as_mut().filter(|b| {
                 b.host == config.server.server && ech_resolver_permit.is_some_and(|r| b.resolver_permit != Some(r))
             }) {
@@ -694,7 +697,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
                     b.dead_permit = None;
                     None
                 }
-                Some(b) => Some(b.resolver_permit),
+                Some(b) => Some((b.resolver_permit, b.pin)),
                 None => None,
             }
         } else {
@@ -723,26 +726,38 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
             // non-repair case; the NEXT retry finds `self.blocked` is `None`
             // and re-engages fresh from scratch.
             if self.blocked.is_none() {
+                // A repair's corrected engage still carries forward the
+                // ORIGINAL cover's `pin`, not this attempt's locally
+                // revalidated `pin`: `pin` (the struct field) records when
+                // the SERVER IP was resolved, a fact independent of which
+                // ECH resolver this attempt's permit needs — `revalidate`
+                // only ever downgrades (`Answered` -> `ResolverDeselected`),
+                // so persisting an already-downgraded value here would make
+                // that loss permanent, unrecoverable even once the original
+                // resolver returns to `dns.servers`. A fresh (non-repair)
+                // engage has no prior cover to preserve, so `pin` (fresh
+                // from resolve, or a first same-host reuse) is correct as-is.
+                let engaged_pin = repair_fallback.map_or(pin, |(_, original_pin)| original_pin);
                 match self.routing.install_failclosed_cover(server_ip, ech_resolver_permit) {
                     Ok(cover) => {
                         self.blocked = Some(BlockedStart {
                             cover,
                             host: config.server.server.clone(),
                             server_ip,
-                            pin,
+                            pin: engaged_pin,
                             resolver_permit: ech_resolver_permit,
                             dead_permit: None,
                         });
                     }
                     Err(e) => {
-                        if let Some(old_permit) = repair_fallback {
+                        if let Some((old_permit, original_pin)) = repair_fallback {
                             match self.routing.install_failclosed_cover(server_ip, old_permit) {
                                 Ok(cover) => {
                                     self.blocked = Some(BlockedStart {
                                         cover,
                                         host: config.server.server.clone(),
                                         server_ip,
-                                        pin,
+                                        pin: original_pin,
                                         resolver_permit: old_permit,
                                         // Remember the value we WANTED but could not
                                         // reach, so a same-value retry doesn't retry

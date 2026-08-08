@@ -3650,6 +3650,104 @@ mod self_test {
         });
     }
 
+    // A repair must not overwrite the held cover's ORIGINAL pin with the
+    // revalidated (possibly downgraded) snapshot from the repairing
+    // attempt — `revalidate` only ever downgrades `Answered` to
+    // `ResolverDeselected`, never the reverse, so storing the downgraded
+    // value back into `BlockedStart::pin` makes the loss PERMANENT: a later
+    // retry that restores the original resolver to `dns.servers` can never
+    // recover `Answered`, even though a same-host retry that never
+    // triggered a repair would have (it always revalidates the covers's
+    // ORIGINAL `pin`, untouched). Attempt 3 here reverts `dns.servers` to
+    // exactly what attempt 1 answered from — the "unpinned" warning must
+    // NOT fire, proving the original `Answered` provenance survived the
+    // attempt-2 repair.
+    #[skuld::test]
+    fn covered_retry_repair_preserves_the_original_pin_across_a_correction() {
+        use crate::test_support::log_capture::VecWriter;
+        use tracing_subscriber::fmt;
+        use tracing_subscriber::layer::{Layer, SubscriberExt};
+
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+            let writer = VecWriter::new();
+            let subscriber = tracing_subscriber::registry().with(
+                fmt::layer()
+                    .with_writer(writer.clone())
+                    .with_ansi(false)
+                    .with_filter(tracing_subscriber::filter::LevelFilter::WARN),
+            );
+            let _guard = garter::tracing_test::set_default_in_current_thread(subscriber);
+
+            let probe_l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let closed = probe_l.local_addr().unwrap();
+            drop(probe_l);
+            let resolver_a: IpAddr = "1.0.0.1".parse().unwrap();
+            let resolver_b: IpAddr = "9.9.9.9".parse().unwrap();
+            let querier = Arc::new(CountingQuerier {
+                host: "proxy.example".into(),
+                ip: closed.ip(),
+                queries: AtomicU32::new(0),
+            });
+            let dir = tempfile::tempdir().unwrap();
+            let routing = MockRouting::new(dir.path().to_path_buf());
+            let st = routing.state();
+            let (mut pm, _dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, false);
+            pm.set_bootstrap_querier_for_test(querier);
+            let mut cfg = test_config();
+            cfg.server.server = "proxy.example".into();
+            cfg.server.server_port = closed.port();
+            cfg.server.plugin = Some("ex-ray".into());
+            cfg.server.plugin_opts = Some(ECH_CAPABLE_OPTS.into());
+            cfg.dns.enabled = true;
+            cfg.dns.servers = vec![resolver_a];
+
+            // Attempt 1: fresh resolve, A answers -> pin = Answered(A).
+            pm.start_cancellable(&cfg, true, CancellationToken::new())
+                .await
+                .unwrap_err();
+            assert_eq!(*st.last_cover_resolver_ip.lock().unwrap(), Some(resolver_a));
+
+            // Attempt 2: `dns.servers` -> [B]. A same-host retry never
+            // re-resolves, so B is never actually queried this session —
+            // ResolverDeselected is the CORRECT pin for attempt 2 itself.
+            // The corrected engage (permit Some(B)) succeeds; this is the
+            // bug's site: the new BlockedStart must still remember A was
+            // ONCE verified-answering, not just that B currently isn't.
+            cfg.dns.servers = vec![resolver_b];
+            pm.start_cancellable(&cfg, true, CancellationToken::new())
+                .await
+                .unwrap_err();
+            assert_eq!(*st.last_cover_resolver_ip.lock().unwrap(), Some(resolver_b));
+            let after_attempt_2 = writer.snapshot_string();
+            assert!(
+                after_attempt_2.contains("the cached DoH resolver is no longer configured"),
+                "attempt 2: B was never queried this session, so the unpinned warning is correct here; got:\n{after_attempt_2}"
+            );
+
+            // Attempt 3: `dns.servers` reverts to exactly [A] — the SAME
+            // resolver attempt 1 verified answering. Repair corrects the
+            // permit back to Some(A); the unpinned warning must NOT
+            // reappear, because `revalidate` is being applied to the
+            // ORIGINAL Answered(A), not to attempt 2's ResolverDeselected.
+            cfg.dns.servers = vec![resolver_a];
+            pm.start_cancellable(&cfg, true, CancellationToken::new())
+                .await
+                .unwrap_err();
+            assert_eq!(*st.last_cover_resolver_ip.lock().unwrap(), Some(resolver_a));
+            let after_attempt_3 = writer.snapshot_string();
+            assert_eq!(
+                after_attempt_3.matches("the cached DoH resolver is no longer configured").count(),
+                1,
+                "attempt 3 reverts to the ORIGINALLY-answered resolver; the unpinned warning must not \
+                 fire again (only attempt 2's occurrence should be present) — got:\n{after_attempt_3}"
+            );
+        });
+    }
+
     // An operator's own `ech-doh` (not Hole's) winning is a stall risk the
     // cover can never fix by permitting it — the residual-stall diagnostic
     // must still name it, distinctly from the "nothing pinned" case.
@@ -3698,12 +3796,12 @@ mod self_test {
             });
     }
 
-    // Positive proof the old literal-IP-server residual is GONE: `ech_doh_url`
-    // constructs a real address from the configured resolvers even for
-    // `PinSource::NoQueryNeeded`, and the cover now permits exactly that
-    // address (`covered_start_with_a_literal_server_ip_still_permits_the_constructed_resolver`),
-    // so the "genuinely can't permit anything" residual warning must NOT fire
-    // here anymore.
+    // `ech_doh_url` constructs a real address from the configured resolvers
+    // even for `PinSource::NoQueryNeeded`, and the cover permits exactly
+    // that address
+    // (`covered_start_with_a_literal_server_ip_still_permits_the_constructed_resolver`),
+    // so the "genuinely can't permit anything" residual warning must not
+    // fire for a literal-IP server.
     #[skuld::test]
     fn covered_start_no_residual_warning_for_a_literal_server_ip() {
         use crate::test_support::log_capture::VecWriter;

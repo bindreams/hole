@@ -840,17 +840,14 @@ fn v2ray_core_parses_as_a_domain(value: &str) -> bool {
     !normalized.is_empty() && normalized.parse::<std::net::IpAddr>().is_err()
 }
 
-/// Whether Hole's own `ech_doh` outranks the operator's own `ech-doh`
-/// already in `segments` — a VALUE-PRECEDENCE question independent of
-/// whether a fetch happens at all. The ONE place this formula is written;
-/// shared by [`classify_ech_doh`] (where it also decides which keys
+/// The `segments`-based wrapper around [`hole_ech_doh_outranks`] — extracts
+/// the operator's own `ech-doh` value (if any) and applies the same
+/// precedence formula (see that function's doc for the why). Shared by
+/// [`classify_ech_doh`] (where it also decides which keys
 /// `inject_plugin_directives` strips) and [`resolved_ech_doh_is_empty`]
 /// (which needs the same precedence but, being reachable from
 /// `ex_ray_fatal_config_error` via `ech_fetch_is_reachable`, cannot call
-/// `classify_ech_doh` itself without cycling). Hole's URL is name-free, so
-/// it displaces one whose authority is a name — that lookup is the defect.
-/// Against an IP-literal value there is no leak to fix, so only a resolver
-/// that ANSWERED outranks the operator's own choice.
+/// `classify_ech_doh` itself without cycling).
 fn ech_doh_displaces(segments: &[garter::OptionSegment<'_>], ech_doh: Option<&crate::dns::ech::EchDoh>) -> bool {
     let config_ech_doh = segments.iter().find(|s| s.key == "ech-doh");
     match (ech_doh, config_ech_doh) {
@@ -1361,9 +1358,8 @@ mod inject_tests {
         );
     }
 
-    // The round-3 regression this guards against: an UNREACHABLE config
-    // (`ech=never` here) with a PRE-EXISTING operator `ech-doh=` key and a
-    // PINNED Hole candidate. `displaces` must still be computed correctly
+    // An UNREACHABLE config (`ech=never` here) with a PRE-EXISTING operator
+    // `ech-doh=` key and a PINNED Hole candidate. `displaces` must still be computed correctly
     // (pinned always outranks) and the strip must still happen, even though
     // no fetch will ever occur — `classify_ech_doh`'s reachability gate may
     // only change `EffectiveEchDoh`, never silently disable the strip.
@@ -1486,7 +1482,7 @@ mod inject_tests {
         assert_eq!(out, "", "a pinned ech-doh has nothing to report");
     }
 
-    // The new reachability gate: an ech-doh source (pinned or not) that would
+    // The reachability gate: an ech-doh source (pinned or not) that would
     // otherwise read as active must be reported as inert, not silently
     // dropped or misreported as exercised/unexercised.
     #[skuld::test]
@@ -1624,8 +1620,8 @@ mod inject_tests {
     // effective_ech_doh / ech_doh_will_reach_ex_ray ===================================================================
 
     // A regression that made this return `true` whenever `ech_doh.is_some()`
-    // (the old, simpler gate this function replaces) would pass this test if
-    // the plugin-family gate were dropped: a non-ECH-capable plugin name
+    // would pass this test if the plugin-family gate were dropped: a
+    // non-ECH-capable plugin name
     // must never be told it will fetch Hole's ech_doh, even with a pinned
     // candidate in hand.
     #[skuld::test]
@@ -1804,6 +1800,19 @@ mod inject_tests {
         let e = pinned("https://9.9.9.9/dns-query");
         let segments = garter::split_plugin_options("tls;host=cdn.example;ech=always").unwrap();
         assert_eq!(ex_ray_fatal_config_error(&segments, Some(&e)), None);
+    }
+
+    // The nested `ech=always` + empty-resolved-`ech-doh` check lives INSIDE
+    // the `tls_enabled` gate, same as the enum check — with no `tls` and no
+    // `mode=quic`, `buildTLSConfig` (and the whole `ech` switch within it)
+    // never runs, so `ech=always` with no `ech-doh` from any source is
+    // inert, not fatal. A regression that moved this check outside the
+    // `tls_enabled` guard would pass every OTHER `ech=always` test (all of
+    // which include `tls`) but not this one.
+    #[skuld::test]
+    fn ech_always_without_tls_is_inert_not_fatal() {
+        let segments = garter::split_plugin_options("host=cdn.example;ech=always").unwrap();
+        assert_eq!(ex_ray_fatal_config_error(&segments, None), None);
     }
 
     // Every new `ex_ray_fatal_config_error` check reads its key via `find`

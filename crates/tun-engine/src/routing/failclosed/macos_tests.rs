@@ -104,7 +104,7 @@ fn ruleset_resolver_pass_is_scoped_to_tcp_443_not_unrestricted() {
         .expect("server pass rule must exist");
     assert!(
         !server_line.contains("port"),
-        "server permit stays unrestricted (unchanged by this plan): {server_line}"
+        "server permit stays unrestricted: {server_line}"
     );
 }
 
