@@ -415,16 +415,17 @@ pub(crate) fn scan_for_delivered_error<'a>(
 /// `BindConflict`/`Fatal` delivered a moment AFTER a snapshot would run is
 /// still recovered here, not silently downgraded.
 ///
-/// `pub(crate)`: also used by [`crate::tap::TapPlugin`]'s `join` arm, for
-/// the identical reason — `BinaryPlugin::run` (the only inner the bridge
-/// ever taps) hands its readiness sender to a spawned reader task that is
-/// only best-effort-joined (a 100ms grace window) before `run` returns, so
-/// `inner_handle` completing does NOT guarantee `inner_ready_rx` has
-/// resolved yet. Awaiting here is bounded the same way: the child process
-/// has already exited by this point, so its stdout pipe closes and the
-/// reader task's own `lines.next_line()` loop terminates on EOF shortly
-/// after, dropping the sender if it never sent.
-pub(crate) async fn drain_for_delivered_error<'a>(
+/// NOT safe for [`crate::tap::TapPlugin`]'s inner-exit race, despite the
+/// superficially identical shape — confirmed by a reproduced deadlock, not
+/// just reasoned about: for `BinaryPlugin` in `ReadinessMode::Probe`, the
+/// readiness sender lives in a task the tap never joins, whose own exit is
+/// gated on the SAME `shutdown` token the tap itself is currently blocking
+/// on returning — a circular wait with nothing to break it. The "the
+/// process already exited, so its reader task will EOF shortly" reasoning
+/// that justifies awaiting here does NOT hold there: Probe mode's
+/// readiness task is a self-probe racing `shutdown`, not a stdout reader
+/// racing process exit.
+async fn drain_for_delivered_error<'a>(
     rxs: impl Iterator<Item = &'a mut oneshot::Receiver<Result<PluginReady, StartError>>>,
 ) -> Option<StartError> {
     let mut saw_generic = false;

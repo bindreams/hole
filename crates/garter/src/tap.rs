@@ -158,14 +158,24 @@ impl ChainPlugin for TapPlugin {
                 // itself (not `None`) for "closed, nothing specific", so
                 // this fallback must match on THAT too, not just `None`.
                 //
-                // Drains (awaits) `inner_ready_rx` to resolution rather than
-                // sampling it: `inner_handle` completing does NOT mean the
-                // reader task that owns the inner's `ready` sender has
-                // finished too (`BinaryPlugin::run` only best-effort-joins
-                // it under a short grace window before returning) — see
-                // `drain_for_delivered_error`'s doc comment for why awaiting
-                // here is still bounded, not a hang risk.
-                let err = match crate::chain::drain_for_delivered_error(std::iter::once(&mut inner_ready_rx)).await {
+                // Deliberately `scan_for_delivered_error` (point-in-time
+                // `try_recv`), NOT an await-to-resolution drain: for
+                // `BinaryPlugin` in `ReadinessMode::Probe`, the readiness
+                // sender lives in a task this fn never joins, whose own
+                // exit is gated on THIS `shutdown` token — which nothing
+                // cancels until the tap's own task (the one currently
+                // executing this line) returns. Awaiting `inner_ready_rx`
+                // here is a real, reproduced circular-wait deadlock in that
+                // case, not just an unbounded wait — confirmed by a
+                // temporary repro test (a Probe-shaped inner whose
+                // detached readiness task only resolves on `shutdown`,
+                // with nothing external to cancel it): `tap.run` hung past
+                // a 5s bound with the drain, returned in a few ms without
+                // it. This narrows a delivery race (see the doc comment on
+                // `scan_for_delivered_error`) rather than closing it —
+                // closing it needs `BinaryPlugin::run` itself to guarantee
+                // its readiness sender resolves before `run` returns.
+                let err = match crate::chain::scan_for_delivered_error(std::iter::once(&mut inner_ready_rx)) {
                     Some(e) if !matches!(e, StartError::ExitedBeforeReady) => e,
                     _ => StartError::Fatal {
                         detail: match &join {
