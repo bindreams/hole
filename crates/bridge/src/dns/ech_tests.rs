@@ -95,9 +95,8 @@ fn doh_url_for_ip_ports_to_the_https_default() {
     }
 }
 
-// `tun-engine` sits BELOW `hole-bridge` in the crate dependency graph, so its
-// `RESOLVER_PERMIT_PORT` can't import THIS crate's `DOH_PORT` — but this
-// crate CAN import tun-engine's, so this is the one enforced link: if either
+// The one enforced link between DOH_PORT and RESOLVER_PERMIT_PORT (see
+// DOH_PORT's doc for why they can't just share one declaration): if either
 // constant is ever edited alone, this fails instead of the two silently
 // drifting (the fail-closed cover would then permit a port ex-ray never
 // dials while blocking the one it does).

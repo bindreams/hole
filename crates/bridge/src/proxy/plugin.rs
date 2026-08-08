@@ -562,21 +562,28 @@ pub(crate) fn effective_ech_doh(
 /// itself is NOT similarly shared (the logging that must stay
 /// spawn-side-only lives one level up, in `inject_plugin_directives`, past
 /// where `segments` is produced).
-fn classify_ech_doh(
-    segments: &[garter::OptionSegment<'_>],
-    ech_doh: Option<&crate::dns::ech::EchDoh>,
-) -> (EffectiveEchDoh, bool) {
-    // Whether ex-ray will even ATTEMPT an ECH-config fetch for this segment
-    // set, independent of which `ech-doh` value would win: `ech=never`
-    // (first-wins, matching `Args.Get`) short-circuits ECH entirely before
-    // it ever looks at `ech-doh` (crates/ex-ray/config.go:209-211).
-    // Otherwise ECH is only reachable when TLS is enabled at all — an
-    // explicit `tls` flag, or `mode=quic` forcing it on — since
-    // `buildTLSConfig` (which contains the whole `ech` switch) is called
-    // only when `tlsEnabled` (config.go:290-294, 334); a plain non-quic
-    // transport (e.g. `mode=websocket` with no `tls`) never calls it.
-    // Neither the cover permit nor the residual-stall warning may treat a
-    // fetch that provably cannot happen as one that will.
+/// Whether ex-ray will even ATTEMPT an ECH-config fetch for this segment
+/// set, independent of which `ech-doh` value would win. Neither the cover
+/// permit, the residual-stall warning, nor `inject_plugin_directives`'s own
+/// ECH-posture logging may treat a fetch that provably cannot happen as one
+/// that will — three independent conditions, each first-wins (matching
+/// `Args.Get`):
+/// - `ech=never` short-circuits ECH entirely before it ever looks at
+///   `ech-doh` (crates/ex-ray/config.go:209-211).
+/// - TLS must be enabled at all — an explicit `tls` flag, or `mode=quic`
+///   forcing it on — since `buildTLSConfig` (which contains the whole `ech`
+///   switch) is called only when `tlsEnabled` (config.go:290-294, 334); a
+///   plain non-quic transport (e.g. `mode=websocket` with no `tls`) never
+///   calls it.
+/// - `ApplyECH` bails before dialing DoH unless the TLS `ServerName` is a
+///   DOMAIN: an absent, empty, or IP-literal `host` means ex-ray dials with
+///   an IP-literal `ServerName` (Hole never hands ex-ray a raw hostname as
+///   the connection target — everything is pre-resolved, `host` only ever
+///   supplies SNI), which `echCacheDomain` treats as "no SNI to use", so ECH
+///   is unreachable regardless of `tls`/`ech-doh`
+///   (third_party/v2ray-core/transport/internet/tls/ech.go:26-51,
+///   config.go:250-264,296-303; main.go:67-69).
+fn ech_fetch_is_reachable(segments: &[garter::OptionSegment<'_>]) -> bool {
     let ech_never = segments
         .iter()
         .find(|s| s.key == "ech")
@@ -586,19 +593,36 @@ fn classify_ech_doh(
             .iter()
             .find(|s| s.key == "mode")
             .is_some_and(|s| s.value == "quic");
-    if ech_never || !tls_enabled {
-        return (EffectiveEchDoh::None, false);
-    }
+    let sni_is_a_domain = segments.iter().find(|s| s.key == "host").is_some_and(|s| {
+        let bare = s.value.trim_start_matches('[').trim_end_matches(']');
+        !bare.is_empty() && bare.parse::<std::net::IpAddr>().is_err()
+    });
+    !ech_never && tls_enabled && sni_is_a_domain
+}
 
+fn classify_ech_doh(
+    segments: &[garter::OptionSegment<'_>],
+    ech_doh: Option<&crate::dns::ech::EchDoh>,
+) -> (EffectiveEchDoh, bool) {
+    // `displaces` answers a VALUE-PRECEDENCE question (does Hole's ech_doh
+    // outrank the operator's own `ech-doh` already in the segments?) that is
+    // independent of whether a fetch happens at all — computed unconditionally,
+    // BEFORE the reachability gate below, so `inject_plugin_directives`'s
+    // strip decision never disagrees with what `hole_ech_doh_outranks` says
+    // regardless of reachability. Hole's URL is name-free, so it displaces one
+    // whose authority is a name — that lookup is the defect. Against an
+    // IP-literal value there is no leak to fix, so only a resolver that
+    // ANSWERED outranks the operator's own choice.
     let config_ech_doh = segments.iter().find(|s| s.key == "ech-doh");
-    // Hole's URL is name-free, so it displaces one whose authority is a
-    // name — that lookup is the defect. Against an IP-literal value there
-    // is no leak to fix, so only a resolver that ANSWERED outranks the
-    // operator's own choice.
     let displaces = match (ech_doh, config_ech_doh) {
         (Some(e), Some(s)) => hole_ech_doh_outranks(e, &s.value),
         _ => false,
     };
+
+    if !ech_fetch_is_reachable(segments) {
+        return (EffectiveEchDoh::None, displaces);
+    }
+
     let effective = if ech_doh.is_some() && (config_ech_doh.is_none() || displaces) {
         EffectiveEchDoh::Holes
     } else if let Some(s) = config_ech_doh {
@@ -658,7 +682,21 @@ fn inject_plugin_directives(
             .iter()
             .find(|s| s.key == "ech")
             .is_some_and(|s| s.value == "always");
+        // Whether ex-ray will even ATTEMPT a fetch — shared with
+        // `classify_ech_doh` (see `ech_fetch_is_reachable`'s doc). Checked
+        // FIRST here: an `ech-doh` source (Hole's or the config's) that
+        // would otherwise read as active must not be reported as such when
+        // no fetch will ever happen (`ech=never`, or no TLS-enabled domain
+        // SNI) — the `(None, None)` case below stays correct either way,
+        // since "ECH is off" holds regardless of reachability.
+        let reachable = ech_fetch_is_reachable(&segments);
         match (ech_doh, config_ech_doh) {
+            _ if !reachable && (ech_doh.is_some() || config_ech_doh.is_some()) => tracing::warn!(
+                plugin = %plugin_name,
+                fail_closed,
+                "ex-ray will never attempt an ECH-config fetch for this configuration (ech=never, \
+                 or no TLS-enabled domain SNI); any ech-doh source is inert"
+            ),
             (Some(_), Some(s)) if !displaces => tracing::warn!(
                 plugin = %plugin_name,
                 "{}, so the config's own name-free ech-doh stands: {}",
@@ -1116,7 +1154,7 @@ mod inject_tests {
             ),
         ] {
             let ech_doh = unpinned_for("https://1.1.1.1/dns-query", source);
-            let out = warnings_for("ex-ray", Some("path=/x"), Some(&ech_doh));
+            let out = warnings_for("ex-ray", Some("tls;host=cdn.example;path=/x"), Some(&ech_doh));
             assert!(
                 out.contains(expected),
                 "{source:?} must be reported as {expected:?}, got:
@@ -1130,11 +1168,29 @@ mod inject_tests {
         }
     }
 
-    // A pinned resolver is the good case and warns about nothing.
+    // A pinned resolver is the good case and warns about nothing — for a
+    // config where the fetch is actually reachable; an unreachable one has
+    // its own dedicated warning (see `ech_fetch_is_reachable`'s callers).
     #[skuld::test]
     fn a_pinned_resolver_warns_about_nothing() {
-        let out = warnings_for("ex-ray", Some("path=/x"), Some(&pinned("https://9.9.9.9/dns-query")));
+        let out = warnings_for(
+            "ex-ray",
+            Some("tls;host=cdn.example;path=/x"),
+            Some(&pinned("https://9.9.9.9/dns-query")),
+        );
         assert_eq!(out, "", "a pinned ech-doh has nothing to report");
+    }
+
+    // The new reachability gate: an ech-doh source (pinned or not) that would
+    // otherwise read as active must be reported as inert, not silently
+    // dropped or misreported as exercised/unexercised.
+    #[skuld::test]
+    fn an_unreachable_config_reports_any_ech_doh_source_as_inert() {
+        let out = warnings_for("ex-ray", Some("path=/x"), Some(&pinned("https://9.9.9.9/dns-query")));
+        assert!(
+            out.contains("ex-ray will never attempt an ECH-config fetch"),
+            "expected the unreachable-config warning; got:\n{out}"
+        );
     }
 
     // ex-ray reads the FIRST `ech`, so a later `always` it will never apply must
@@ -1213,9 +1269,13 @@ mod inject_tests {
     #[skuld::test]
     fn family_plugin_with_no_operator_override_reaches_ex_ray_as_holes() {
         let e = pinned("https://9.9.9.9/dns-query");
-        assert!(ech_doh_will_reach_ex_ray("ex-ray", Some("tls"), Some(&e)));
+        assert!(ech_doh_will_reach_ex_ray(
+            "ex-ray",
+            Some("tls;host=cdn.example"),
+            Some(&e)
+        ));
         assert_eq!(
-            effective_ech_doh("ex-ray", Some("tls"), Some(&e)),
+            effective_ech_doh("ex-ray", Some("tls;host=cdn.example"), Some(&e)),
             EffectiveEchDoh::Holes
         );
     }
@@ -1227,23 +1287,27 @@ mod inject_tests {
         let e = unpinned("https://1.1.1.1/dns-query");
         assert!(!ech_doh_will_reach_ex_ray(
             "ex-ray",
-            Some("tls;ech-doh=https://8.8.8.8/dns-query"),
+            Some("tls;host=cdn.example;ech-doh=https://8.8.8.8/dns-query"),
             Some(&e)
         ));
         assert_eq!(
-            effective_ech_doh("ex-ray", Some("tls;ech-doh=https://8.8.8.8/dns-query"), Some(&e)),
+            effective_ech_doh(
+                "ex-ray",
+                Some("tls;host=cdn.example;ech-doh=https://8.8.8.8/dns-query"),
+                Some(&e)
+            ),
             EffectiveEchDoh::Operators("https://8.8.8.8/dns-query".to_string())
         );
     }
 
     // `classify_ech_doh` must read whether ex-ray will even ATTEMPT ECH, not
     // just plugin family + ech-doh presence — `ech=never` short-circuits it
-    // (config.go:209-211) regardless of `tls`/`ech-doh`.
+    // (config.go:209-211) regardless of `tls`/`host`/`ech-doh`.
     #[skuld::test]
     fn ech_never_never_reaches_ex_ray_even_with_tls_and_ech_doh() {
         let e = pinned("https://9.9.9.9/dns-query");
         assert_eq!(
-            effective_ech_doh("ex-ray", Some("tls;ech=never"), Some(&e)),
+            effective_ech_doh("ex-ray", Some("tls;host=cdn.example;ech=never"), Some(&e)),
             EffectiveEchDoh::None
         );
     }
@@ -1255,13 +1319,44 @@ mod inject_tests {
     fn ech_never_is_first_wins() {
         let e = pinned("https://9.9.9.9/dns-query");
         assert_eq!(
-            effective_ech_doh("ex-ray", Some("tls;ech=never;ech=auto"), Some(&e)),
+            effective_ech_doh("ex-ray", Some("tls;host=cdn.example;ech=never;ech=auto"), Some(&e)),
             EffectiveEchDoh::None
         );
         assert_eq!(
-            effective_ech_doh("ex-ray", Some("tls;ech=auto;ech=never"), Some(&e)),
+            effective_ech_doh("ex-ray", Some("tls;host=cdn.example;ech=auto;ech=never"), Some(&e)),
             EffectiveEchDoh::Holes,
             "the FIRST ech= wins — auto here, so never (second) is ignored"
+        );
+    }
+
+    // The SNI (`host`) must be a DOMAIN for `ApplyECH` to ever dial DoH at
+    // all (`echCacheDomain` returns "" and `ApplyECH` bails otherwise) —
+    // absent, empty, or IP-literal all mean "no SNI to key the lookup on".
+    #[skuld::test]
+    fn no_domain_host_never_reaches_ex_ray() {
+        let e = pinned("https://9.9.9.9/dns-query");
+        for opts in ["tls", "tls;host=", "tls;host=203.0.113.5", "tls;host=[2001:db8::1]"] {
+            assert_eq!(
+                effective_ech_doh("ex-ray", Some(opts), Some(&e)),
+                EffectiveEchDoh::None,
+                "opts={opts:?} must not reach ex-ray: no domain SNI to key the DoH lookup on"
+            );
+        }
+    }
+
+    // `host` uses first-wins too, matching every other flag here.
+    #[skuld::test]
+    fn domain_host_is_first_wins() {
+        let e = pinned("https://9.9.9.9/dns-query");
+        assert_eq!(
+            effective_ech_doh("ex-ray", Some("tls;host=203.0.113.5;host=cdn.example"), Some(&e)),
+            EffectiveEchDoh::None,
+            "the FIRST host= wins — an IP literal here, so the later domain is ignored"
+        );
+        assert_eq!(
+            effective_ech_doh("ex-ray", Some("tls;host=cdn.example;host=203.0.113.5"), Some(&e)),
+            EffectiveEchDoh::Holes,
+            "the FIRST host= wins — a domain here, so the later IP literal is ignored"
         );
     }
 
@@ -1273,7 +1368,7 @@ mod inject_tests {
     fn no_tls_and_not_quic_never_reaches_ex_ray() {
         let e = pinned("https://9.9.9.9/dns-query");
         assert_eq!(
-            effective_ech_doh("ex-ray", Some("mode=websocket"), Some(&e)),
+            effective_ech_doh("ex-ray", Some("host=cdn.example;mode=websocket"), Some(&e)),
             EffectiveEchDoh::None
         );
         assert_eq!(effective_ech_doh("ex-ray", None, Some(&e)), EffectiveEchDoh::None);
@@ -1285,11 +1380,11 @@ mod inject_tests {
     fn quic_mode_reaches_ex_ray_without_an_explicit_tls_flag() {
         let e = pinned("https://9.9.9.9/dns-query");
         assert_eq!(
-            effective_ech_doh("ex-ray", Some("mode=quic"), Some(&e)),
+            effective_ech_doh("ex-ray", Some("host=cdn.example;mode=quic"), Some(&e)),
             EffectiveEchDoh::Holes
         );
         assert_eq!(
-            effective_ech_doh("ex-ray", Some("mode=quic;mode=websocket"), Some(&e)),
+            effective_ech_doh("ex-ray", Some("host=cdn.example;mode=quic;mode=websocket"), Some(&e)),
             EffectiveEchDoh::Holes,
             "first-wins: the second mode= does not un-set the quic TLS force-enable"
         );

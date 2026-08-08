@@ -495,6 +495,16 @@ fn wfp_check(code: u32, what: &str) -> Result<(), RoutingError> {
 
 /// As [`wfp_check`], but a duplicate-add (`FWP_E_ALREADY_EXISTS`) is also OK —
 /// re-engaging over an unswept cover is idempotent.
+///
+/// CROSS-VERSION CONTRACT, disclosed residual: this idempotency also means a
+/// repair (release the held cover, re-engage with a corrected server/resolver
+/// value — `ProxyManager`'s retry-repair path) can silently keep the OLD
+/// filter value live if the release's `FwpmFilterDeleteByKey0` (in
+/// `delete_all`, whose return codes are discarded) fails for that GUID: the
+/// re-add then hits `FWP_E_ALREADY_EXISTS` and reports success while the LIVE
+/// filter still carries the value the delete failed to remove. A stale
+/// PERMIT surviving, never a leaked block. Tracked separately:
+/// bindreams/hole#761.
 fn ok_or_exists(code: u32, what: &str) -> Result<(), RoutingError> {
     if code == FWP_E_ALREADY_EXISTS_DWORD {
         return Ok(());

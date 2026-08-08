@@ -429,7 +429,17 @@ GUIDs) leaves those two permits un-swept; they are *permits*, never blocks,
 so this is bounded and self-healing (a later upgrade's sweep cleans them up),
 not a leak of blocked traffic. Disclosed as a source comment on
 `FILTER_GUIDS` itself. Tracked separately:
-[#754](https://github.com/bindreams/hole/issues/754).
+[#754](https://github.com/bindreams/hole/issues/754). **Windows only, also
+pre-existing:** the repair's release step deletes the held cover's filters by
+fixed GUID and discards the result; if a delete genuinely fails, the
+subsequent re-engage's add for that same GUID reports success
+(`FWP_E_ALREADY_EXISTS` is treated as OK, by design, for the crash-recovery
+idempotency case) while the LIVE filter still carries the OLD value — a
+stale permit surviving, not a leaked block, and not new to this PR (the
+different-server retry already relied on the same delete-then-add sequence
+for the server permit; this change adds a second GUID pair that exercises
+it too). Disclosed as a source comment on `ok_or_exists`. Tracked
+separately: [#761](https://github.com/bindreams/hole/issues/761).
 
 It is **name-agnostic** — it does *not* permit the TUN interface. The new
 bridge's start-time DNS-forwarder self-test runs over loopback to the SS client

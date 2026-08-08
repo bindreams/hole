@@ -431,6 +431,7 @@ pub trait Routing: Send + Sync {
     /// "Transient cutover cover" section for the full retry-repair state
     /// machine and the disclosed residuals this trait's caller does not
     /// close.
+    ///
     /// The cover survives a process crash (Windows: persistent WFP filters keyed by fixed
     /// GUID; macOS: pf enable token persisted to `bridge-failclosed.json`) and is
     /// swept by [`recover_routes`] on the next start. Does NOT permit the TUN

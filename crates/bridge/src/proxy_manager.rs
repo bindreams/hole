@@ -268,12 +268,16 @@ struct BlockedStart<C> {
     /// back to `resolver_permit` instead (`x != Some(resolver_permit)`, by
     /// construction — the outer `Option` marks "a dead value is known", the
     /// inner one is the resolver-permit value itself, which can legitimately
-    /// be `None`). A later retry whose freshly-derived permit is again
-    /// exactly `x` must NOT re-attempt the same failing correction — that
-    /// would oscillate forever, each cycle re-opening the release-then-
-    /// reengage window for no progress. `None` once a correction lands (the
-    /// held permit is exactly what this attempt wants) or has never been
-    /// attempted.
+    /// be `None`). A retry whose freshly-derived permit is again exactly `x`
+    /// skips the repair attempt ONCE (bounding the release-then-reengage
+    /// window from reopening on every single retry of an unreachable value)
+    /// and CLEARS this marker for the retry after — a fresh attempt is never
+    /// permanently withheld, since the corrected engage's failure could be
+    /// transient (a momentary OS-level condition), not a lasting property of
+    /// the value itself. Net effect for a persistently-failing value: retried
+    /// every OTHER matching retry, not every one and not never. `None` once a
+    /// correction lands (the held permit is exactly what this attempt wants)
+    /// or has never been attempted.
     dead_permit: Option<Option<IpAddr>>,
 }
 
@@ -672,20 +676,31 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         // the held cover doesn't already have (`ech_resolver_permit.is_some_and`
         // below — a narrowing to `None`, e.g. the plugin was removed, is left
         // as a superset permit rather than paying the release-to-reengage
-        // window for a correction with no benefit) AND that correction isn't
-        // already known-dead (see `dead_permit`'s doc). `repair_fallback`
+        // window for a correction with no benefit). `repair_fallback`
         // captures what's being given up: `Some(old_permit)` means a good
         // cover existed a moment ago, so a failed fresh engage below
         // restores it instead of leaving the host uncovered.
+        //
+        // A drift that matches a KNOWN-DEAD value (see `dead_permit`'s doc)
+        // skips the repair THIS retry — bounding the release-to-reengage
+        // window from reopening on every single retry of an unreachable
+        // value — but clears the marker so the NEXT retry gets a fresh
+        // attempt: `install_failclosed_cover` can fail on a transient OS
+        // condition (a momentary WFP/pf contention), and a single such
+        // failure must not wedge the repair for the rest of the session.
+        // Net effect: a persistently-failing value is retried every OTHER
+        // drift-matching retry, not every one and not never.
         let repair_fallback: Option<Option<IpAddr>> = if covered && !lockdown_on {
-            self.blocked
-                .as_ref()
-                .filter(|b| {
-                    b.host == config.server.server
-                        && ech_resolver_permit.is_some_and(|r| b.resolver_permit != Some(r))
-                        && b.dead_permit != Some(ech_resolver_permit)
-                })
-                .map(|b| b.resolver_permit)
+            match self.blocked.as_mut().filter(|b| {
+                b.host == config.server.server && ech_resolver_permit.is_some_and(|r| b.resolver_permit != Some(r))
+            }) {
+                Some(b) if b.dead_permit == Some(ech_resolver_permit) => {
+                    b.dead_permit = None;
+                    None
+                }
+                Some(b) => Some(b.resolver_permit),
+                None => None,
+            }
         } else {
             None
         };
