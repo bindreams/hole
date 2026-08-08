@@ -672,12 +672,11 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         // the held cover doesn't already have (`ech_resolver_permit.is_some_and`
         // below — a narrowing to `None`, e.g. the plugin was removed, is left
         // as a superset permit rather than paying the release-to-reengage
-        // window for a correction with no benefit: see the failure-lens
-        // finding this guards against) AND that correction isn't already
-        // known-dead (see `dead_permit`'s doc). `repair_fallback` captures
-        // what's being given up: `Some(old_permit)` means a good cover
-        // existed a moment ago, so a failed fresh engage below restores it
-        // instead of leaving the host uncovered.
+        // window for a correction with no benefit) AND that correction isn't
+        // already known-dead (see `dead_permit`'s doc). `repair_fallback`
+        // captures what's being given up: `Some(old_permit)` means a good
+        // cover existed a moment ago, so a failed fresh engage below
+        // restores it instead of leaving the host uncovered.
         let repair_fallback: Option<Option<IpAddr>> = if covered && !lockdown_on {
             self.blocked
                 .as_ref()
@@ -705,8 +704,13 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
             // would leave the user unconnected AND unprotected), surfaced via last_error
             // — UNLESS this was a repair (`repair_fallback` is `Some`), in which case
             // the host was ALREADY covered a moment ago and a compensating re-engage
-            // of the OLD permit is attempted first, so correcting a permit can never
-            // be how a covered start loses its cover outright.
+            // of the OLD permit is attempted first: correcting a permit now takes
+            // BOTH the corrected AND the restore engage failing to lose the cover
+            // (the `Err(e2)` arm below), not one — never impossible, just
+            // narrowed from the ordinary single-engage failure case. On that
+            // double failure this attempt proceeds open, same as the
+            // non-repair case; the NEXT retry finds `self.blocked` is `None`
+            // and re-engages fresh from scratch.
             if self.blocked.is_none() {
                 match self.routing.install_failclosed_cover(server_ip, ech_resolver_permit) {
                     Ok(cover) => {

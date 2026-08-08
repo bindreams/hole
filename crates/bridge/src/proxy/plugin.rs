@@ -566,6 +566,30 @@ fn classify_ech_doh(
     segments: &[garter::OptionSegment<'_>],
     ech_doh: Option<&crate::dns::ech::EchDoh>,
 ) -> (EffectiveEchDoh, bool) {
+    // Whether ex-ray will even ATTEMPT an ECH-config fetch for this segment
+    // set, independent of which `ech-doh` value would win: `ech=never`
+    // (first-wins, matching `Args.Get`) short-circuits ECH entirely before
+    // it ever looks at `ech-doh` (crates/ex-ray/config.go:209-211).
+    // Otherwise ECH is only reachable when TLS is enabled at all — an
+    // explicit `tls` flag, or `mode=quic` forcing it on — since
+    // `buildTLSConfig` (which contains the whole `ech` switch) is called
+    // only when `tlsEnabled` (config.go:290-294, 334); a plain non-quic
+    // transport (e.g. `mode=websocket` with no `tls`) never calls it.
+    // Neither the cover permit nor the residual-stall warning may treat a
+    // fetch that provably cannot happen as one that will.
+    let ech_never = segments
+        .iter()
+        .find(|s| s.key == "ech")
+        .is_some_and(|s| s.value == "never");
+    let tls_enabled = segments.iter().any(|s| s.key == "tls")
+        || segments
+            .iter()
+            .find(|s| s.key == "mode")
+            .is_some_and(|s| s.value == "quic");
+    if ech_never || !tls_enabled {
+        return (EffectiveEchDoh::None, false);
+    }
+
     let config_ech_doh = segments.iter().find(|s| s.key == "ech-doh");
     // Hole's URL is name-free, so it displaces one whose authority is a
     // name — that lookup is the defect. Against an IP-literal value there
@@ -938,13 +962,13 @@ mod inject_tests {
         for their_url in ["https://8.8.8.8/dns-query", "https://[2620:fe::fe]/dns-query"] {
             let out = merged(
                 "ex-ray",
-                Some(&format!("ech-doh={their_url}")),
+                Some(&format!("tls;ech-doh={their_url}")),
                 Some(&unpinned("https://1.1.1.1/dns-query")),
             );
             assert_eq!(
                 out.as_deref(),
                 Some(&*format!(
-                    "ech-doh={their_url};loglevel=debug;ech-doh=https://1.1.1.1/dns-query"
+                    "tls;ech-doh={their_url};loglevel=debug;ech-doh=https://1.1.1.1/dns-query"
                 )),
             );
         }
@@ -957,12 +981,12 @@ mod inject_tests {
     fn an_unpinned_url_still_displaces_a_name_config_value() {
         let out = merged(
             "ex-ray",
-            Some("ech=always;ech-doh=https://cloudflare-dns.com/dns-query"),
+            Some("tls;ech=always;ech-doh=https://cloudflare-dns.com/dns-query"),
             Some(&unpinned("https://1.1.1.1/dns-query")),
         );
         assert_eq!(
             out.as_deref(),
-            Some("ech=always;loglevel=debug;ech-doh=https://1.1.1.1/dns-query"),
+            Some("tls;ech=always;loglevel=debug;ech-doh=https://1.1.1.1/dns-query"),
         );
     }
 
@@ -1008,10 +1032,13 @@ mod inject_tests {
     fn an_escaped_spelling_of_an_owned_key_is_still_stripped() {
         let out = merged(
             "ex-ray",
-            Some(r"ech\-doh=https://evil.example/dns-query;log\level=warning"),
+            Some(r"tls;ech\-doh=https://evil.example/dns-query;log\level=warning"),
             Some(&pinned("https://9.9.9.9/dns-query")),
         );
-        assert_eq!(out.as_deref(), Some("loglevel=debug;ech-doh=https://9.9.9.9/dns-query"),);
+        assert_eq!(
+            out.as_deref(),
+            Some("tls;loglevel=debug;ech-doh=https://9.9.9.9/dns-query"),
+        );
     }
 
     // ex-ray discards the whole SS_* environment on a parse error and reports
@@ -1050,10 +1077,13 @@ mod inject_tests {
         // ex-ray, so a duplicate would win at that hop.
         let out = merged(
             "galoshes",
-            Some("loglevel=warning;ech-doh=https://stale.example/dns-query"),
+            Some("tls;loglevel=warning;ech-doh=https://stale.example/dns-query"),
             Some(&pinned("https://9.9.9.9/dns-query")),
         );
-        assert_eq!(out.as_deref(), Some("loglevel=debug;ech-doh=https://9.9.9.9/dns-query"),);
+        assert_eq!(
+            out.as_deref(),
+            Some("tls;loglevel=debug;ech-doh=https://9.9.9.9/dns-query"),
+        );
     }
 
     // An unknown plugin gets no injection, so it gets no strip either.
@@ -1183,24 +1213,85 @@ mod inject_tests {
     #[skuld::test]
     fn family_plugin_with_no_operator_override_reaches_ex_ray_as_holes() {
         let e = pinned("https://9.9.9.9/dns-query");
-        assert!(ech_doh_will_reach_ex_ray("ex-ray", None, Some(&e)));
-        assert_eq!(effective_ech_doh("ex-ray", None, Some(&e)), EffectiveEchDoh::Holes);
+        assert!(ech_doh_will_reach_ex_ray("ex-ray", Some("tls"), Some(&e)));
+        assert_eq!(
+            effective_ech_doh("ex-ray", Some("tls"), Some(&e)),
+            EffectiveEchDoh::Holes
+        );
     }
 
-    // The exact scenario the mismatched-warning fix targets: an unpinned Hole
-    // guess against an operator's own IP-literal `ech-doh` — the operator's
-    // choice stands, so ex-ray fetches THEIRS, not Hole's.
+    // An unpinned Hole guess against an operator's own IP-literal `ech-doh` —
+    // the operator's choice stands, so ex-ray fetches THEIRS, not Hole's.
     #[skuld::test]
     fn family_plugin_with_a_winning_operator_override_reaches_ex_ray_as_operators() {
         let e = unpinned("https://1.1.1.1/dns-query");
         assert!(!ech_doh_will_reach_ex_ray(
             "ex-ray",
-            Some("ech-doh=https://8.8.8.8/dns-query"),
+            Some("tls;ech-doh=https://8.8.8.8/dns-query"),
             Some(&e)
         ));
         assert_eq!(
-            effective_ech_doh("ex-ray", Some("ech-doh=https://8.8.8.8/dns-query"), Some(&e)),
+            effective_ech_doh("ex-ray", Some("tls;ech-doh=https://8.8.8.8/dns-query"), Some(&e)),
             EffectiveEchDoh::Operators("https://8.8.8.8/dns-query".to_string())
+        );
+    }
+
+    // `classify_ech_doh` must read whether ex-ray will even ATTEMPT ECH, not
+    // just plugin family + ech-doh presence — `ech=never` short-circuits it
+    // (config.go:209-211) regardless of `tls`/`ech-doh`.
+    #[skuld::test]
+    fn ech_never_never_reaches_ex_ray_even_with_tls_and_ech_doh() {
+        let e = pinned("https://9.9.9.9/dns-query");
+        assert_eq!(
+            effective_ech_doh("ex-ray", Some("tls;ech=never"), Some(&e)),
+            EffectiveEchDoh::None
+        );
+    }
+
+    // `ech=never` uses first-wins (matching ex-ray's own `Args.Get`), same as
+    // `fail_closed` elsewhere in this module — a later `ech=auto` must not
+    // resurrect it.
+    #[skuld::test]
+    fn ech_never_is_first_wins() {
+        let e = pinned("https://9.9.9.9/dns-query");
+        assert_eq!(
+            effective_ech_doh("ex-ray", Some("tls;ech=never;ech=auto"), Some(&e)),
+            EffectiveEchDoh::None
+        );
+        assert_eq!(
+            effective_ech_doh("ex-ray", Some("tls;ech=auto;ech=never"), Some(&e)),
+            EffectiveEchDoh::Holes,
+            "the FIRST ech= wins — auto here, so never (second) is ignored"
+        );
+    }
+
+    // ex-ray's `buildTLSConfig` (and therefore its whole `ech` switch) is
+    // only called when `tlsEnabled` — never for a plain, non-quic transport
+    // with no `tls` flag (config.go:290-294,334). A permit or warning for
+    // this config would be for a fetch that provably cannot happen.
+    #[skuld::test]
+    fn no_tls_and_not_quic_never_reaches_ex_ray() {
+        let e = pinned("https://9.9.9.9/dns-query");
+        assert_eq!(
+            effective_ech_doh("ex-ray", Some("mode=websocket"), Some(&e)),
+            EffectiveEchDoh::None
+        );
+        assert_eq!(effective_ech_doh("ex-ray", None, Some(&e)), EffectiveEchDoh::None);
+    }
+
+    // `mode=quic` force-enables TLS even with no explicit `tls` flag
+    // (config.go:290-294) — first-wins, matching every other flag here.
+    #[skuld::test]
+    fn quic_mode_reaches_ex_ray_without_an_explicit_tls_flag() {
+        let e = pinned("https://9.9.9.9/dns-query");
+        assert_eq!(
+            effective_ech_doh("ex-ray", Some("mode=quic"), Some(&e)),
+            EffectiveEchDoh::Holes
+        );
+        assert_eq!(
+            effective_ech_doh("ex-ray", Some("mode=quic;mode=websocket"), Some(&e)),
+            EffectiveEchDoh::Holes,
+            "first-wins: the second mode= does not un-set the quic TLS force-enable"
         );
     }
 
