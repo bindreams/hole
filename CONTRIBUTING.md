@@ -498,6 +498,81 @@ because its BPF tap sits upstream of pf, so an en0 capture would record packets 
 later drops (unsound). The recovery sweep runs on every bridge start via
 `recover_routes`.
 
+#### ECH-config-fetch reachability gate
+
+The resolver permit above must not widen for a fetch that provably cannot
+happen. `crate::proxy::plugin::ech_fetch_is_reachable` and its helper
+`ex_ray_fatal_config_error` model ex-ray's own decision of whether it will
+even attempt an ECH-config fetch, reading `plugin_opts` the way ex-ray's own
+SIP003 parser does (`ex_ray_flag_value`: a bare key is ex-ray's `"1"`, not
+`garter`'s `""`) and mirroring every `plugin_opts`-reachable config-build
+error ex-ray's `main.go`/`config.go` treats as `os.Exit(23)` — `ech`/`mode`
+closed enums, `mux`/`fwmark`/`tcp-keepalive` numeric ranges,
+`localPort`/`remotePort` port parsing (Go's `strconv.ParseUint` rejects a
+leading `+` that Rust's `u32::from_str` accepts — checked against both
+toolchains directly), and, checked separately and later (it fires inside
+`core.New`, only once `generateConfig` itself has already succeeded), the
+websocket transport's `mux` concurrency bound `1..=1024`. Each vendored
+literal this mirrors is pinned by an `include_str!`-based test against the
+vendored source (`ech_and_mode_enums_match_vendored_config_go`), so a future
+ex-ray bump that adds or renames a value fails loudly here instead of
+silently drifting.
+
+An explicit empty `host=` is NOT "no SNI": ex-ray's own `Config.ServerName`
+falls back to the DIAL DESTINATION when `host` is empty
+(`tls.WithDestination`), and that destination is `remoteAddr` — itself a
+`plugin_opts` option that can name a domain. `ech_fetch_is_reachable`
+resolves that fallback the same first-wins way as every other key here; an
+absent `remoteAddr` is correctly treated as an IP (Hole's own
+`SS_REMOTE_HOST`, which this function cannot see, is always an IP by
+construction — Hole resolves the server before ever spawning the plugin).
+
+`ech=always` with an empty *resolved* `ech-doh` — the value ex-ray actually
+receives once Hole's own injection wins or loses against the operator's own,
+not just the raw `ech-doh` segment — is itself an `os.Exit(23)` class
+(`config.go:218-220`, `"ech=always requires ech-doh to be set"`); detecting
+it needs that same precedence `classify_ech_doh` resolves, recomputed by
+`resolved_ech_doh_is_empty` rather than threaded through (the two functions
+would otherwise call each other in a cycle: `classify_ech_doh` calls
+`ech_fetch_is_reachable`, which calls `ex_ray_fatal_config_error`).
+
+**Disclosed, deliberately unmodeled:**
+
+- `cert` (an operator-supplied file path, `readCertificate`/
+  `filesystem.ReadFile`) can fail config-build, but only by reading the
+  filesystem — a check this otherwise pure, `plugin_opts`-only gate
+  deliberately does not perform: the same path could read successfully now
+  and fail moments later at the real spawn, or vice versa, so duplicating
+  the read here would be stale, not accurate. `certRaw` never fails on its
+  own.
+- ex-ray's `server` plugin option (settable via `plugin_opts`, like `tls`)
+  cross-assigns `localPort`/`remotePort` to the opposite internal flag
+  (`tcp-keepalive`'s range check runs unconditionally regardless of
+  `server`, so that one is unaffected) — `ex_ray_fatal_config_error` does
+  not account for the cross-assignment. Hole's bridge never spawns ex-ray as
+  a server; an operator who puts `server` in their own `plugin_opts` already
+  has a tunnel that will not establish for a much more obvious reason
+  (ex-ray listens instead of connects) than anything this gate decides, so
+  the cross-assignment is not modeled — as is the trailing `mux` concurrency
+  check (below): `MultiplexingConfig` is attached only on ex-ray's
+  non-`server` branch, so this gate skips that check too whenever a
+  `server` segment is present, rather than reporting a false fatal.
+- On the `remoteAddr` SNI fallback (an explicit empty `host=`) only: ex-ray
+  applies `net.ParseAddress` TWICE on that path (once building the dial
+  destination, once more computing the ECH domain from the
+  destination-derived `ServerName`), while the gate normalizes once. The two
+  disagree only for a value where a SECOND unwrap still changes the result —
+  a doubly-bracketed `remoteAddr=[[::1]]` is the only class found so far.
+  Modeling the second pass needs mirroring v2ray-core's `Domain`/`IP`
+  address-family round-trip, not just another `net.ParseAddress` call; not
+  modeled.
+
+The websocket transport's `mux` additionally has a SECOND, separately
+checked bound: `core.New` rejects a non-zero `Concurrency` outside
+`1..=1024` (third_party/v2ray-core/app/proxyman/outbound/handler.go), a
+narrower and later-evaluated check than `uint32Opt`'s own `0..=u32::MAX`
+(both pinned against the vendored source, same as the enum sets).
+
 ### Lockdown mode
 
 The **standing lockdown cover** (`Routing::install_lockdown`, #527) is an
