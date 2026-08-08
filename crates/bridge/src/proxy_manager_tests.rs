@@ -525,14 +525,18 @@ fn test_config() -> ProxyConfig {
 }
 
 /// `plugin_opts` for a plugin config that actually reaches ex-ray's ECH
-/// switch (`crates/ex-ray/config.go:209-223,290-294,334`): TLS enabled via
-/// the bare `tls` flag, `ech` left at its `auto` default. Bare `plugin =
-/// Some("ex-ray")` with no options — TCP-only, no `tls`, no `mode=quic` —
-/// never calls `buildTLSConfig` at all, so ECH is never touched regardless
-/// of `ech-doh`; tests that need a real cover permit or an ECH-posture
-/// warning must opt in via this constant, matching a real postern config
+/// switch: TLS enabled via the bare `tls` flag, a domain `host` (ECH needs
+/// an SNI domain to key its DoH lookup on — an absent, empty, or IP-literal
+/// `host` means ex-ray dials with an IP-literal `ServerName`, so
+/// `ApplyECH` bails before ever dialing DoH), `ech` left at its `auto`
+/// default (`crates/ex-ray/config.go:209-223,290-294,334`;
+/// `third_party/v2ray-core/transport/internet/tls/ech.go:26-51`). Bare
+/// `plugin = Some("ex-ray")` with no options — TCP-only, no `tls`, no
+/// `host` — never reaches ECH at all regardless of `ech-doh`; tests that
+/// need a real cover permit or an ECH-posture warning must opt in via this
+/// constant, matching a real postern config
 /// (`a_postern_config_composes_into_holes_pinned_url` in plugin.rs).
-const ECH_CAPABLE_OPTS: &str = "tls";
+const ECH_CAPABLE_OPTS: &str = "tls;host=cdn.example";
 
 // Tests ===============================================================================================================
 
@@ -2785,6 +2789,49 @@ mod self_test {
         });
     }
 
+    // Integration-level proof of the reachability gate, at the WIRING
+    // boundary (`start_cancellable` -> `effective_ech_doh` ->
+    // `install_failclosed_cover`), not just the pure `classify_ech_doh`
+    // function boundary covered in plugin.rs's own unit tests. A plugin IS
+    // configured and a resolver DID answer, but `plugin_opts` never enables
+    // TLS (no `tls`, no `mode=quic`) — ex-ray's `buildTLSConfig` (and its
+    // whole `ech` switch) is unreachable, so the cover must not widen for a
+    // fetch that provably cannot happen.
+    #[skuld::test]
+    fn covered_start_with_a_non_tls_capable_plugin_does_not_permit_a_resolver() {
+        rt().block_on(async {
+            let resolved: IpAddr = "203.0.113.9".parse().unwrap();
+            let answering_resolver: IpAddr = "1.0.0.1".parse().unwrap();
+            let querier = Arc::new(CountingQuerier {
+                host: "proxy.example".into(),
+                ip: resolved,
+                queries: AtomicU32::new(0),
+            });
+            let dir = tempfile::tempdir().unwrap();
+            let routing = MockRouting::new(dir.path().to_path_buf());
+            let st = routing.state();
+            let (mut pm, _dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, false);
+            pm.set_bootstrap_querier_for_test(querier);
+            let mut cfg = test_config();
+            cfg.server.server = "proxy.example".into();
+            cfg.server.plugin = Some("ex-ray".into());
+            cfg.server.plugin_opts = Some("mode=websocket;host=cdn.example".into()); // no `tls`, no `mode=quic`
+            cfg.dns.enabled = true;
+            cfg.dns.servers = vec![answering_resolver];
+            let _ = pm
+                .start_cancellable(&cfg, true, CancellationToken::new())
+                .await
+                .unwrap_err();
+            assert_eq!(st.cover_engage_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                *st.last_cover_resolver_ip.lock().unwrap(),
+                None,
+                "a resolver answered and a plugin is configured, but TLS is never enabled, so ex-ray \
+                 never reaches its ECH switch — the cover must not permit the resolver"
+            );
+        });
+    }
+
     #[skuld::test]
     fn covered_start_without_a_plugin_does_not_permit_any_resolver() {
         rt().block_on(async {
@@ -3278,11 +3325,14 @@ mod self_test {
 
     // Without a `dead_permit` marker, a retry whose corrected permit keeps
     // failing to engage would release-then-reengage-then-restore on EVERY
-    // retry: an infinite non-convergent cycle, each turn re-opening the
-    // release-to-reengage uncovered window for zero progress. This proves
-    // convergence: a THIRD attempt with an UNCHANGED config (still wanting
-    // the same permit the second attempt already proved unreachable) must
-    // NOT trigger another engage cycle at all.
+    // retry: a non-convergent cycle, each turn re-opening the
+    // release-to-reengage uncovered window for zero progress. Attempt 3
+    // proves the skip: an UNCHANGED config (still wanting the same permit
+    // attempt 2 already proved unreachable) must NOT trigger another engage
+    // cycle. Attempt 4 proves the skip is not permanent: `dead_permit` is
+    // cleared by the skip itself, so a later retry for the SAME value gets a
+    // fresh attempt — a transient engage failure must eventually heal, not
+    // wedge the repair for the rest of the session.
     #[skuld::test]
     fn covered_retry_after_a_dead_repair_does_not_oscillate() {
         rt().block_on(async {
@@ -3346,6 +3396,26 @@ mod self_test {
                 *st.last_cover_resolver_ip.lock().unwrap(),
                 None,
                 "the held cover still permits the restored OLD value, not the still-unreachable one"
+            );
+
+            // Attempt 4: STILL the same desired value, but now able to engage
+            // (the transient failure has passed). Skipping attempt 3 cleared
+            // `dead_permit`, so this retry gets a fresh attempt rather than
+            // staying wedged forever on a value that failed exactly once.
+            st.fail_cover_for_resolvers.lock().unwrap().clear();
+            pm.start_cancellable(&cfg, true, CancellationToken::new())
+                .await
+                .unwrap_err();
+            assert_eq!(
+                st.cover_engage_calls.load(Ordering::SeqCst),
+                3,
+                "a transient failure must not permanently wedge repair for this value — the retry \
+                 after a skip must try again"
+            );
+            assert_eq!(
+                *st.last_cover_resolver_ip.lock().unwrap(),
+                Some(answering_resolver),
+                "the repair finally lands once the value is reachable again"
             );
         });
     }

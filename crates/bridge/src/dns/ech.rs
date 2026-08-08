@@ -110,11 +110,8 @@ impl EchDoh {
 
 impl PinSource {
     /// The address this pin has demonstrated reachable via a verified DoH
-    /// exchange, if any. Only `Answered` names one. Used ONLY for
-    /// [`EchDoh::is_pinned`]'s injection-priority tiebreak — the fail-closed
-    /// cover's permit reads `EchDoh::resolver` directly and does NOT gate on
-    /// this, since Hole constructed `resolver` either way (see `EchDoh`'s
-    /// doc).
+    /// exchange, if any. Only `Answered` names one; see `EchDoh::is_pinned`'s
+    /// doc for how this is used.
     pub fn verified_ip(self) -> Option<IpAddr> {
         match self {
             PinSource::Answered(ip) => Some(ip),
