@@ -305,7 +305,7 @@ fn lockdown_spec_permits_loopback_tun_appids_and_server_then_blocks() {
     );
 }
 
-// tun_luid: None (Phase-0 permits-only engage, #753) ==================================================================
+// tun_luid: None (Phase-0 permits-only engage) ========================================================================
 
 #[skuld::test]
 fn lockdown_spec_omits_tun_permit_when_luid_is_none() {

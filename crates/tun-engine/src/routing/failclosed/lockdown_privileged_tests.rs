@@ -244,7 +244,7 @@ fn windows_lockdown_permits_resolver_blocks_other_egress() {
     );
 }
 
-/// Windows real-engage verification of the two-phase handoff (#753):
+/// Windows real-engage verification of the two-phase handoff:
 /// `engage_lockdown` with `tun_name: None` (Phase 0) followed by
 /// `engage_lockdown_tun` (Phase 6) adding the TUN permit to the SAME
 /// already-returned `Cover` -- proving (a) the Phase-0-only cover is already
@@ -533,7 +533,7 @@ fn macos_lockdown_permits_resolver_blocks_other_egress() {
     );
 }
 
-/// macOS real-engage verification of the two-phase handoff (#753):
+/// macOS real-engage verification of the two-phase handoff:
 /// `engage_lockdown` with `tun_name: None` (Phase 0) followed by
 /// `engage_lockdown_tun` (Phase 6, a full pf ruleset reload adding the TUN
 /// pass line) -- proving (a) the Phase-0-only cover is already selective

@@ -210,7 +210,7 @@ pub struct ProxyManager<P: Proxy = ShadowsocksProxy, R: Routing = SystemRouting,
     /// carries the server identity it permits so a same-server retry reuses the
     /// resolved IP instead of re-resolving under the cover (which it would block).
     blocked: Option<BlockedStart<R::Cover>>,
-    /// The standing lockdown cover's Phase-0 guard (#753): engaged in
+    /// The standing lockdown cover's Phase-0 guard: engaged in
     /// `start_cancellable` BEFORE `start_inner` runs (mirroring exactly when
     /// `blocked` engages), so it is live before Phase 1. Mutually exclusive
     /// with `blocked` in practice — a start engages one or the other, gated
@@ -709,7 +709,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
 
         // The standing cover only ever completes for a Full-mode start:
         // SocksOnly's `start_inner` returns before Phase 6 (`routing.install`)
-        // ever runs, exactly as it did before #753 — there is no TUN to
+        // ever runs -- there is no TUN to
         // protect and no adapter to resolve a LUID from. Gating the NEW
         // Phase-0 engage below on this too (not just `lockdown_on`) preserves
         // that pre-existing "lockdown never engages for SocksOnly" invariant;
@@ -869,7 +869,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         }
         let blocking_engaged = self.blocked.is_some();
 
-        // Standing lockdown cover, Phase 0 (#753): engage the non-TUN
+        // Standing lockdown cover, Phase 0: engage the non-TUN
         // permits BEFORE `start_inner` runs, mirroring exactly when the
         // transient cover engages above -- so a plugin's Phase-4 forwarder
         // self-test already has the resolver permit it needs. `start_inner`
@@ -970,7 +970,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         } else if lockdown_applies {
             // `self.lockdown_pending` now tracks the standing cover's live
             // permit exactly like `self.blocked` does for the transient one
-            // (#753), so this mirrors the `blocking_engaged` arms above
+            // so this mirrors the `blocking_engaged` arms above
             // verbatim — the "no live-permit tracking" gap that used to limit
             // this branch to the `Operators` case alone is closed.
             match &effective_ech_doh {
@@ -1120,7 +1120,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
     /// 3. `R::Installed` — on drop, tears down routes and clears the
     ///    crash-recovery state file.
     ///
-    /// The standing lockdown cover's guard is NOT in this list (#753): it is
+    /// The standing lockdown cover's guard is NOT in this list: it is
     /// engaged and owned by the CALLER (`start_cancellable`'s
     /// `lockdown_pending`), never constructed inside this fn, so it is never
     /// part of this fn's own unwind — an Err return here leaves it exactly as
@@ -1128,7 +1128,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
     /// rules for what happens to it next).
     ///
     /// Per-phase cancellation strategy:
-    /// - **Phase 0 (standing-lockdown Phase-0 engage, #753)**: happens in the
+    /// - **Phase 0 (standing-lockdown Phase-0 engage)**: happens in the
     ///   CALLER before this fn is even invoked — see
     ///   `Routing::install_lockdown_permits`'s doc for why. This fn only
     ///   re-derives `lockdown_applies` (same inputs, so it always agrees)
@@ -1202,7 +1202,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         // the first (see CONTRIBUTING.md's "Lockdown mode").
         let server_host = crate::dns::bootstrap::handoff_host(server_ip);
 
-        // Phase 0 (#753): the standing lockdown cover's non-TUN permits are
+        // Phase 0: the standing lockdown cover's non-TUN permits are
         // already engaged by the caller (`start_cancellable`, held in
         // `lockdown_pending`) BEFORE this fn even runs — mirroring exactly
         // when the transient cover engages — so a plugin's Phase-4 forwarder
@@ -1560,7 +1560,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         // Install the routes — NOW traffic starts flowing to the TUN.
         let routes = routing.install(TUN_DEVICE_NAME, server_ip, gw_info.gateway_ip, &gw_info.interface_name)?;
 
-        // Standing lockdown cover (#527, #753). Engaged only when
+        // Standing lockdown cover (#527). Engaged only when
         // `lockdown_applies`; when false this whole block is a no-op and the
         // start is byte-identical to today. Adds the TUN permit to the SAME
         // guard Phase 0 already engaged (`Routing::engage_lockdown_tun`) — no
@@ -1673,7 +1673,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         }
         // Same fate, same reasoning, for a covered start that engaged the
         // STANDING lockdown cover's Phase-0 guard and then failed before
-        // ever reaching `running` (#753): `blocked` and `lockdown_pending`
+        // ever reaching `running`: `blocked` and `lockdown_pending`
         // are mutually exclusive in practice (one attempt engages one or the
         // other), but both are handled here unconditionally, matching the
         // same "runs BEFORE the running.take() early-return" requirement.

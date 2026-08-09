@@ -434,8 +434,7 @@ sweep only knows the first ten) leaves those two permits un-swept; they are
 so this is bounded and self-healing (a later upgrade's sweep cleans them up),
 not a leak of blocked traffic. Disclosed as a source comment on
 `FILTER_GUIDS` itself. The standing lockdown cover's `LOCKDOWN_FILTER_GUIDS`
-grew the same way for the same reason (#753's two new resolver-permit
-filters, twelve entries to fourteen), disclosed as a source comment there
+grew the same way for the same reason, disclosed as a source comment there
 too; both arrays share the one tracking issue:
 [#754](https://github.com/bindreams/hole/issues/754). **Windows only, also
 pre-existing:** the repair's release step deletes the held cover's filters by

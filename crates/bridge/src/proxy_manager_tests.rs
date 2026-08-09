@@ -201,7 +201,7 @@ struct MockRoutingState {
     /// TUN permit to the cover `install_lockdown_permits` already returned).
     last_lockdown_resolver_ip: std::sync::Mutex<Option<IpAddr>>,
     /// Count of `install_lockdown_permits` calls — the Phase-0, pre-Phase-1
-    /// early engage (#753), which returns the cover the running session
+    /// early engage, which returns the cover the running session
     /// holds. Distinct from `lockdown_engage_calls` (Phase 6, stateless
     /// TUN-add on the SAME cover) so a test can prove the EARLY call fires
     /// even when Phase 6 never runs (e.g. the self-test fails first).
@@ -1278,7 +1278,7 @@ fn stage_real_ex_ray() -> (tempfile::TempDir, String) {
 
 #[skuld::test]
 fn lockdown_on_permits_the_gated_ech_resolver_for_a_real_plugin_chain() {
-    // Proves the FIX (#753): the resolver permit reaches the standing cover's
+    // The resolver permit reaches the standing cover's
     // Phase-0 early engage (`install_lockdown_permits`) -- BEFORE Phase 1, so
     // BEFORE the plugin chain's Phase-4 dial that actually fetches the
     // ECH config. `dns.enabled = true` (the default) is left ON, unlike the
@@ -1397,7 +1397,7 @@ fn lockdown_on_omits_the_resolver_permit_for_a_non_ech_capable_plugin() {
 
 #[skuld::test]
 fn lockdown_on_never_reaches_phase_6_when_the_self_test_fails() {
-    // PROVES THE GAP (#753) IS CLOSED: the standing lockdown cover's TUN
+    // The standing lockdown cover's TUN
     // permit is still only installed at Phase 6 (`routing.install` /
     // `engage_lockdown_tun`) -- that half of the claim stays true, asserted
     // below via `lockdown_engage_calls`. But ex-ray's lazy ECH-config fetch
@@ -1546,7 +1546,7 @@ fn lockdown_pending_survives_a_start_failure_and_is_disengaged_by_stop() {
 fn lockdown_on_never_engages_for_socks_only_mode() {
     // SocksOnly's `start_inner` returns before Phase 6 (`routing.install`)
     // ever runs -- there is no TUN to protect and no adapter to resolve a
-    // LUID from, exactly as before #753. The Phase-0 engage must respect
+    // LUID from. The Phase-0 engage must respect
     // that SAME invariant: engaging a cover Phase 6 can never complete would
     // leave it permanently orphaned (nothing ever moves it into a
     // `RunningState`, since SocksOnly's has no lockdown field to fill).
@@ -3690,7 +3690,7 @@ mod self_test {
         // `None`-permit guard (Windows' `FWP_E_ALREADY_EXISTS` swallow means
         // a naive re-add would never update it) would leave block-all still
         // governing the new resolver — reintroducing the exact class of
-        // wedge #753 closed, one layer up. The fix releases (disengages) the
+        // the standing cover was built to remove, one layer up. The fix releases (disengages) the
         // stale guard and re-engages fresh with the corrected value.
         rt().block_on(async {
             let probe_l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();

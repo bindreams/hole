@@ -224,7 +224,7 @@ fn lockdown_main_passes_tun_interface() {
     );
 }
 
-// tun_name: None (Phase-0 permits-only engage, #753) ==================================================================
+// tun_name: None (Phase-0 permits-only engage) ========================================================================
 
 #[skuld::test]
 fn lockdown_main_omits_tun_pass_when_none() {
