@@ -383,7 +383,7 @@ fn windows_lockdown_permits_phase_0_then_phase_6_share_one_cover() {
 /// packet classification.
 #[cfg(target_os = "windows")]
 #[skuld::test(labels = [TUN], serial = TUN)]
-fn windows_engage_lockdown_tun_retry_replaces_the_stale_luid_condition() {
+fn windows_lockdown_permits_tun_retry_replaces_the_stale_luid_condition() {
     let dir = tempfile::tempdir().unwrap();
     let resolver = SystemLuidResolver;
     let server_ip: std::net::IpAddr = "1.1.1.1".parse().unwrap();

@@ -479,6 +479,43 @@ pub trait Routing: Send + Sync {
         app_ids: &[PathBuf],
     ) -> Result<Self::Cover, RoutingError>;
 
+    /// Release an already-engaged Phase-0 guard and re-engage fresh with
+    /// corrected values, as ONE checked operation — used ONLY for the
+    /// stale-permit repair path (server, resolver, or `app_ids` drifted from
+    /// what `old` was engaged with), never for a first-ever engage (that's
+    /// [`install_lockdown_permits`](Self::install_lockdown_permits), whose
+    /// tolerant re-add is correct there: a first-engage/Adopt-continuation
+    /// can legitimately see already-present floor filters it does not need
+    /// to update).
+    ///
+    /// A bare `drop(old)` followed by a fresh `install_lockdown_permits`
+    /// call is UNSOUND for a repair specifically: `Cover`'s `Drop` cannot
+    /// return `Result`, so a delete that fails for a reason other than
+    /// "wasn't there" is silently discarded, and `install_lockdown_permits`'s
+    /// intentionally tolerant re-add then reports `FWP_E_ALREADY_EXISTS` as
+    /// success — leaving the OLD (stale) permit live on the persistent
+    /// kill-switch cover while callers believe the correction landed. This
+    /// method checks every delete's return code and re-adds strictly (an
+    /// unexpected `FWP_E_ALREADY_EXISTS` is a hard error, since after a
+    /// confirmed delete it is impossible unless the delete silently failed).
+    /// `old` is consumed without running its own `Drop` — see the
+    /// implementation's doc for why racing the two matters.
+    ///
+    /// On FAILURE the underlying primitive guarantees nothing actually
+    /// changed (an aborted FWPM transaction on Windows / a rejected atomic
+    /// `pfctl -f -` reload on macOS), so the `Err` variant hands back a
+    /// [`Self::Cover`] for that SAME still-live OLD state — the caller MUST
+    /// restore it (under its OLD identity, not the attempted new one) rather
+    /// than treat the guard as gone: losing it here would orphan a live,
+    /// correct standing cover with nothing left to eventually disengage it.
+    fn reengage_lockdown_permits(
+        &self,
+        old: Self::Cover,
+        server_ip: IpAddr,
+        resolver_ip: Option<IpAddr>,
+        app_ids: &[PathBuf],
+    ) -> Result<Self::Cover, (RoutingError, Self::Cover)>;
+
     /// Add the TUN-interface permit (Windows: by `NET_LUID`, re-resolved on
     /// every call, never persisted; macOS: `pass out quick on <tun_name>`) to
     /// the standing lockdown cover [`install_lockdown_permits`](Self::install_lockdown_permits)
@@ -592,6 +629,16 @@ impl Routing for SystemRouting {
             &self.state_dir,
             self.owner,
         )
+    }
+
+    fn reengage_lockdown_permits(
+        &self,
+        old: Self::Cover,
+        server_ip: IpAddr,
+        resolver_ip: Option<IpAddr>,
+        app_ids: &[PathBuf],
+    ) -> Result<Self::Cover, (RoutingError, Self::Cover)> {
+        failclosed::reengage_lockdown(old, server_ip, resolver_ip, app_ids, &self.state_dir, self.owner)
     }
 
     fn engage_lockdown_tun(

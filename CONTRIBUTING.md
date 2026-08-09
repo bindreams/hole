@@ -635,42 +635,57 @@ a connect must not open the host or tear down a cover that might be
 protecting a pre-existing adopted session. `stop_with` disengages or disarms
 it exactly like `blocked` when a covered start left it engaged but never
 reached `running`. On success, `start_cancellable` moves the guard from
-`lockdown_pending` into `RunningState.lockdown`. A retry whose server,
-resolver permit, or `app_ids` (`lockdown_app_ids(config)`, baked into the
-live cover as Windows App-ID permits) DRIFTS from what `lockdown_pending`
-already holds releases (disengages) the stale guard before re-engaging fresh
-— mirroring the transient cover's stale-permit repair, but without a
-restore-previous fallback (`install_lockdown_permits` is fail-FATAL, so a
-failed re-engage just aborts the start with the host open — the same
-disclosed release-then-reengage residual class as the transient cover's
-own). `app_ids` is compared alongside `server_ip`/`resolver_permit` because
+`lockdown_pending` into `RunningState.lockdown`.
+
+**A retry whose server, resolver permit, or `app_ids` DRIFTS is a REPAIR, not
+a release-then-fresh-engage.** `app_ids` (`lockdown_app_ids(config)`, baked
+into the live cover as Windows App-ID permits) is compared alongside
+`server_ip`/`resolver_permit` in `LockdownPending`'s staleness check because
 it drifts independently of both: a retry that only changes
 `config.server.plugin` (e.g. switching plugin binaries) leaves the other two
 unchanged, and reusing the held guard in that case would leave the OLD
 plugin's unrestricted-egress App-ID permit (no address/port scoping) live
-while the new plugin never gets one. The re-engage stores the RELEASED
-guard's own `pin` (captured before the `take()`), not this attempt's locally
-`revalidate`d one: `revalidate` only ever downgrades (`Answered` →
-`ResolverDeselected`), so persisting the downgraded local value would make
-that loss permanent even once the original resolver returns to
-`dns.servers`.
+while the new plugin never gets one. On drift, `Routing::reengage_lockdown_permits`
+consumes the held guard directly — an ordinary `take()` (drop, which cannot
+return `Result`, so a delete that fails for any reason other than "wasn't
+there" is silently discarded) followed by a fresh `install_lockdown_permits`
+call (whose tolerant re-add — needed for a genuine
+first-engage/Adopt-continuation, which can legitimately see already-present
+floor filters — would then report `FWP_E_ALREADY_EXISTS` as success) is the
+exact silently-stale-permit shape this method exists to close. On Windows
+this checks every delete's return code (`ok_or_not_found`: only "wasn't
+there" is tolerated) and re-adds via the STRICT `add_filter` (`strict: true`, treating `FWP_E_ALREADY_EXISTS` as a hard error — impossible after a
+confirmed delete in the same transaction unless the delete silently failed).
+On macOS this reloads the full ruleset via a DEDICATED function — never
+`engage_lockdown` itself, whose own load-failure branch disengages (correct
+for a first-ever engage, wrong for a repair, where the OLD ruleset is still
+live and correct) — `pfctl -f -`'s atomicity means a rejected reload leaves
+that OLD ruleset unchanged. `engage_lockdown_tun` (Phase 6, the TUN permit)
+uses the identical checked-delete/strict-add discipline on Windows, and the
+identical dedicated-function-not-`engage_lockdown` discipline on macOS, for
+the TUN-LUID pair specifically — `recover_lockdown`'s Adopt path deletes the
+same class of volatile GUID for the identical reason.
 
-On Windows, `engage_lockdown_tun` (Phase 6) deletes its two TUN-LUID filters
-by GUID before re-adding them, for the identical reason `recover_lockdown`'s
-Adopt path deletes the volatile GUIDs: `add_filter`'s normal `ok_or_exists`
-path treats an already-present fixed-GUID filter as satisfied WITHOUT
-updating its condition, so a bare re-add after a failed/cancelled attempt's
-TUN teardown (which mints a new LUID) would silently keep the OLD, now-dead
-LUID's permit live. Both halves of the delete-then-add CHECK their return
-code instead of discarding it, unlike every other `FwpmFilterDeleteByKey0`
-call site in the file: the delete tolerates only `FWP_E_FILTER_NOT_FOUND`
-(`ok_or_not_found`) and propagates any other error, and the re-add is the
-STRICT variant of `add_filter` (`strict: true`), which treats
-`FWP_E_ALREADY_EXISTS` as a hard error instead of tolerating it. After a
-confirmed delete (or confirmed absence) in the SAME transaction,
-`ALREADY_EXISTS` on the following add is impossible unless the delete
-silently failed to take — exactly the failure this mechanism exists to
-surface, not swallow.
+**A FAILED repair must not orphan the guard.** Both platforms' repair
+primitives are transactional: a rejected Windows FWPM transaction
+(`FwpmTransactionAbort0`) rolls back every delete and add issued since
+`FwpmTransactionBegin0`, and a rejected macOS `pfctl -f -` reload leaves the
+PREVIOUSLY loaded ruleset untouched — so on failure, NOTHING actually
+changed at the OS level; the OLD permits are still fully live and correct.
+`reengage_lockdown_permits` returns `Result<Cover, (RoutingError, Cover)>` —
+the `Err` variant hands back a `Cover` for that same still-live OLD state,
+and `start_cancellable` restores `self.lockdown_pending` under the OLD
+identity (host/server_ip/resolver_permit/app_ids/pin), not the
+attempted-but-failed new one. Losing that `Cover` (e.g. discarding it and
+leaving `lockdown_pending` `None`) would orphan a live, correct standing
+cover with nothing left to eventually disengage it — a leak that would only
+resolve on the next bridge restart's crash-recovery sweep.
+
+The re-engage (repair OR fresh) stores the RELEASED guard's own `pin`
+(captured before the `take()`), not this attempt's locally `revalidate`d
+one: `revalidate` only ever downgrades (`Answered` → `ResolverDeselected`),
+so persisting the downgraded local value would make that loss permanent
+even once the original resolver returns to `dns.servers`.
 
 Full mode completes both phases: Phase 0 here, Phase 6 (the TUN permit) in
 `start_inner`. SocksOnly's `start_inner` returns before Phase 6 ever runs —

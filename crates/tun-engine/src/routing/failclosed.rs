@@ -136,6 +136,53 @@ pub fn engage_lockdown(
     }
 }
 
+/// Release an already-engaged Phase-0 guard and re-engage fresh with
+/// corrected values, as ONE checked operation — see
+/// [`crate::routing::Routing::reengage_lockdown_permits`]'s doc for why a
+/// bare drop-then-[`engage_lockdown`] is unsound for a repair specifically
+/// (a silently-failed delete masked by `engage_lockdown`'s intentionally
+/// tolerant re-add, which a genuine first-engage/Adopt-continuation still
+/// needs). On Windows this checks every delete's return code and uses a
+/// strict re-add (`FWP_E_ALREADY_EXISTS` becomes a hard error, since after a
+/// confirmed delete it is impossible unless the delete silently failed). On
+/// macOS this reloads the full ruleset via a DEDICATED function (never
+/// `engage_lockdown` itself, whose own load-failure branch disengages —
+/// correct for a first-ever engage, wrong for a repair) — `pfctl -f -` is
+/// atomic, so a rejected reload leaves the PREVIOUS (still-live, correct)
+/// ruleset unchanged.
+///
+/// On EITHER platform, a FAILED repair hands back a `Cover` for that SAME
+/// still-live OLD state in the `Err` — the underlying primitive guarantees
+/// nothing actually changed (an aborted FWPM transaction / a rejected pf
+/// reload), so the caller must not lose track of it: doing so would orphan
+/// a live, correct standing cover with nothing left to eventually disengage
+/// it.
+pub fn reengage_lockdown(
+    old: Cover,
+    server_ip: IpAddr,
+    resolver_ip: Option<IpAddr>,
+    app_ids: &[std::path::PathBuf],
+    state_dir: &Path,
+    owner: Option<(u32, u32)>,
+) -> Result<Cover, (RoutingError, Cover)> {
+    #[cfg(target_os = "windows")]
+    {
+        let _ = (state_dir, owner);
+        match platform::reengage_lockdown(old._inner, server_ip, resolver_ip, app_ids) {
+            Ok(inner) => Ok(Cover { _inner: inner }),
+            Err((e, inner)) => Err((e, Cover { _inner: inner })),
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = (app_ids, owner, state_dir);
+        match platform::reengage_lockdown(old._inner, server_ip, resolver_ip) {
+            Ok(inner) => Ok(Cover { _inner: inner }),
+            Err((e, inner)) => Err((e, Cover { _inner: inner })),
+        }
+    }
+}
+
 /// Add the TUN permit to an already-engaged standing lockdown cover — see
 /// [`crate::routing::Routing::engage_lockdown_tun`]'s doc for the full
 /// rationale (no guard needed; the earlier [`engage_lockdown`] call's

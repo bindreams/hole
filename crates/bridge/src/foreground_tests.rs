@@ -148,6 +148,15 @@ impl Routing for StubRouting {
     fn install_lockdown_permits(&self, _: IpAddr, _: Option<IpAddr>, _: &[PathBuf]) -> Result<StubCover, RoutingError> {
         Ok(StubCover)
     }
+    fn reengage_lockdown_permits(
+        &self,
+        _old: StubCover,
+        _: IpAddr,
+        _: Option<IpAddr>,
+        _: &[PathBuf],
+    ) -> Result<StubCover, (RoutingError, StubCover)> {
+        Ok(StubCover)
+    }
     fn engage_lockdown_tun(&self, _: &str, _: IpAddr, _: Option<IpAddr>) -> Result<(), RoutingError> {
         Ok(())
     }

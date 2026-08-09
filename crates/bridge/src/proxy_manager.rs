@@ -941,46 +941,88 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
 
         // Standing lockdown cover, Phase 0 (see `lockdown_pending`'s doc). The
         // `else` release for when `lockdown_applies` is false already ran
-        // above, before the transient block -- this arm only ever engages or
-        // reuses. Release-then-reengage only on drift (a different server,
-        // resolver permit, or app_ids than what's held), mirroring the
-        // transient cover's stale-permit repair above but WITHOUT a
-        // restore-previous fallback: `install_lockdown_permits` is
-        // fail-FATAL, so a failed re-engage here aborts the whole start with
-        // the host open -- the same disclosed residual class as the
-        // transient cover's own release-then-reengage window
-        // (`LockdownPending`'s doc). `app_ids` is computed once here (not
-        // inside the engage-only branch below) so the staleness check can
-        // compare it: `config.server.plugin` can change between retries with
-        // server/resolver both unchanged, and reusing the held guard in that
-        // case would leave the OLD plugin's Windows App-ID permit live
-        // (unrestricted egress, no address/port scoping) while the new
-        // plugin never gets one.
+        // above, before the transient block -- this arm only ever engages,
+        // repairs, or reuses. `app_ids` is computed once here so the
+        // staleness check can compare it: `config.server.plugin` can change
+        // between retries with server/resolver both unchanged, and reusing
+        // the held guard in that case would leave the OLD plugin's Windows
+        // App-ID permit live (unrestricted egress, no address/port scoping)
+        // while the new plugin never gets one.
         if lockdown_applies {
             let app_ids = lockdown_app_ids(config);
             let stale = self.lockdown_pending.as_ref().is_some_and(|p| {
                 p.server_ip != server_ip || p.resolver_permit != ech_resolver_permit || p.app_ids != app_ids
             });
-            // Capture the HELD guard's original `pin` (pre-`revalidate`)
-            // before a stale release takes it, mirroring `repair_fallback`
-            // above: `pin` here is refreshed by `revalidate` every retry, so
-            // persisting THAT (instead of what the guard already held) would
-            // turn an already-downgraded `ResolverDeselected` outcome
-            // permanent, even after the original resolver returns to
-            // `dns.servers`. `None` (no prior guard: first engage, or one
-            // released above for a different reason) falls back to the local
-            // `pin`, which is correct as-is for a fresh (non-repair) engage.
-            let original_pin = self.lockdown_pending.as_ref().map(|p| p.pin);
             if stale {
-                self.lockdown_pending.take(); // drop -> disengage; brief open window until the fresh engage below
+                // Repair, not release-then-fresh-engage: `reengage_lockdown_permits`
+                // consumes the HELD guard directly (checked delete + strict
+                // re-add, see its doc) instead of an ordinary `take()`
+                // (drop, discarding delete errors) followed by
+                // `install_lockdown_permits` (tolerant re-add) -- the same
+                // silently-stale-permit class `install_lockdown_permits`'s
+                // tolerance is fine for on a fresh/Adopt-continuation engage,
+                // but not here, where every filter this guard owns is
+                // SUPPOSED to be gone before the correction lands.
+                //
+                // The re-engage stores the guard's OWN `pin` (pre-`revalidate`,
+                // captured from `held` before it's consumed), not this
+                // attempt's locally revalidated one, mirroring
+                // `repair_fallback` above for the identical reason:
+                // `revalidate` only ever downgrades (`Answered` ->
+                // `ResolverDeselected`), so persisting the downgraded local
+                // value would make that loss permanent even once the
+                // original resolver returns to `dns.servers`.
+                let held = self.lockdown_pending.take().expect("stale is only true when Some");
+                let engaged_pin = held.pin;
                 warn!(
                     "lockdown retry: this attempt's server, resolver permit, or app_ids differs from the held \
-                     early cover's; releasing it so a fresh engage can correct it -- egress is briefly OPEN \
-                     until the corrected cover re-engages below"
+                     early cover's; repairing it in place -- egress stays covered by the OLD values until the \
+                     corrected cover replaces them, or the start aborts (fail-FATAL) if the repair itself fails"
                 );
-            }
-            if self.lockdown_pending.is_none() {
-                let engaged_pin = original_pin.unwrap_or(pin);
+                match self
+                    .routing
+                    .reengage_lockdown_permits(held.cover, server_ip, ech_resolver_permit, &app_ids)
+                {
+                    Ok(cover) => {
+                        self.lockdown_pending = Some(LockdownPending {
+                            cover,
+                            host: config.server.server.clone(),
+                            server_ip,
+                            pin: engaged_pin,
+                            resolver_permit: ech_resolver_permit,
+                            app_ids: app_ids.clone(),
+                        });
+                    }
+                    Err((e, cover)) => {
+                        // The repair failed, but the underlying primitive
+                        // guarantees nothing actually changed (an aborted
+                        // FWPM transaction / a rejected atomic pf reload):
+                        // `cover` still represents the SAME permits it did
+                        // before this attempt. Restore it under its OLD
+                        // identity (not this attempt's, which never landed)
+                        // so a later retry's drift check compares against
+                        // what is ACTUALLY still live -- losing it here
+                        // would orphan a live, correct standing cover with
+                        // nothing left to eventually disengage it.
+                        self.lockdown_pending = Some(LockdownPending {
+                            cover,
+                            host: held.host,
+                            server_ip: held.server_ip,
+                            pin: engaged_pin,
+                            resolver_permit: held.resolver_permit,
+                            app_ids: held.app_ids,
+                        });
+                        self.last_error = Some(e.to_string());
+                        return Err(e.into());
+                    }
+                }
+            } else if self.lockdown_pending.is_none() {
+                // Fresh engage: no prior guard exists to repair (first-ever
+                // engage, or one released above for a different reason --
+                // intent just turned on, etc). `install_lockdown_permits`'s
+                // tolerant re-add IS correct here: an Adopt-continuation can
+                // legitimately see already-present floor filters
+                // (loopback/block-all/App-ID) it does not need to update.
                 match self
                     .routing
                     .install_lockdown_permits(server_ip, ech_resolver_permit, &app_ids)
@@ -990,7 +1032,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
                             cover,
                             host: config.server.server.clone(),
                             server_ip,
-                            pin: engaged_pin,
+                            pin,
                             resolver_permit: ech_resolver_permit,
                             app_ids: app_ids.clone(),
                         });
@@ -1050,44 +1092,32 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
                 }
             }
         } else if lockdown_applies {
-            // `self.lockdown_pending` tracks the standing cover's live permit
-            // exactly like `self.blocked` does for the transient one, so this
-            // mirrors the `blocking_engaged` arms above verbatim.
-            match &effective_ech_doh {
-                crate::proxy::plugin::EffectiveEchDoh::None => {
-                    let live_permit = self.lockdown_pending.as_ref().and_then(|p| p.resolver_permit);
-                    if live_permit.is_some() {
-                        warn!(
-                            ?pin,
-                            ?live_permit,
-                            "covered start under lockdown: the standing cover still permits a resolver \
-                             address this attempt does not need (a repair's restore left it stale); the \
-                             kill switch is wider than the current config requires"
-                        );
-                    }
-                }
-                crate::proxy::plugin::EffectiveEchDoh::Holes => {
-                    let live_permit = self.lockdown_pending.as_ref().and_then(|p| p.resolver_permit);
-                    if live_permit != ech_resolver_permit {
-                        warn!(
-                            ?pin,
-                            ech_doh_url = ?ech_doh.as_ref().map(|e| &e.url),
-                            ?live_permit,
-                            ?ech_resolver_permit,
-                            "covered start under lockdown: the ECH-config fetch will dial a resolver the \
-                             standing cover does not permit (a repair's restore left it stale); it may \
-                             stall to ex-ray's client timeout"
-                        );
-                    }
-                }
-                crate::proxy::plugin::EffectiveEchDoh::Operators(url) => {
-                    warn!(
-                        operator_ech_doh = %url,
-                        "covered start under lockdown: the plugin's own ech-doh overrides Hole's and dials a \
-                         resolver the standing lockdown cover does not permit; it may stall to ex-ray's client \
-                         timeout"
-                    );
-                }
+            // Unlike `blocking_engaged`'s repair (which has a
+            // restore-previous fallback, so its LIVE permit can legitimately
+            // differ from what this attempt needs), the standing cover's
+            // stale-permit repair has NO restore step (`LockdownPending`'s
+            // doc): a successful repair always lands
+            // `self.lockdown_pending`'s permit == `ech_resolver_permit`, and
+            // a failed repair aborts the whole start (fail-FATAL) before
+            // this point is ever reached. So there is no "a repair's restore
+            // left it stale" case to warn about here the way the transient
+            // cover's `None`/`Holes` arms do — the invariant is enforced
+            // structurally; assert it rather than dead-code a warning that
+            // can never fire.
+            debug_assert_eq!(
+                self.lockdown_pending.as_ref().and_then(|p| p.resolver_permit),
+                ech_resolver_permit,
+                "the standing cover's live resolver permit must always match this attempt's derived \
+                 one here -- a failed repair aborts the start (fail-FATAL) before this point, so any \
+                 drift is a bug in the engage/repair block above, not a residual to warn about"
+            );
+            if let crate::proxy::plugin::EffectiveEchDoh::Operators(url) = &effective_ech_doh {
+                warn!(
+                    operator_ech_doh = %url,
+                    "covered start under lockdown: the plugin's own ech-doh overrides Hole's and dials a \
+                     resolver the standing lockdown cover does not permit; it may stall to ex-ray's client \
+                     timeout"
+                );
             }
         }
 

@@ -208,9 +208,18 @@ struct MockRoutingState {
     /// TUN-add on the SAME cover) so a test can prove the EARLY call fires
     /// even when Phase 6 never runs (e.g. the self-test fails first).
     lockdown_permits_calls: AtomicU32,
-    /// Last `resolver_ip` passed to `install_lockdown_permits`.
+    /// Last `resolver_ip` passed to `install_lockdown_permits` OR
+    /// `reengage_lockdown_permits` (shared -- both are "what does the live
+    /// cover now permit").
     last_lockdown_permits_resolver_ip: std::sync::Mutex<Option<IpAddr>>,
     fail_lockdown_permits: AtomicBool,
+    /// Count of `reengage_lockdown_permits` calls — the stale-permit REPAIR
+    /// path, distinct from `lockdown_permits_calls` (a fresh/first-ever
+    /// engage): a repair consumes the held guard directly instead of
+    /// dropping it and calling `install_lockdown_permits` again, so a test
+    /// can prove the repair path is what actually ran.
+    reengage_lockdown_permits_calls: AtomicU32,
+    fail_reengage_lockdown_permits: AtomicBool,
 }
 
 impl Default for MockRoutingState {
@@ -235,6 +244,8 @@ impl Default for MockRoutingState {
             lockdown_permits_calls: AtomicU32::new(0),
             last_lockdown_permits_resolver_ip: std::sync::Mutex::new(None),
             fail_lockdown_permits: AtomicBool::new(false),
+            reengage_lockdown_permits_calls: AtomicU32::new(0),
+            fail_reengage_lockdown_permits: AtomicBool::new(false),
         }
     }
 }
@@ -283,6 +294,16 @@ impl MockRouting {
     fn failing_lockdown_permits(state_dir: PathBuf) -> Self {
         let m = Self::new(state_dir);
         m.state.fail_lockdown_permits.store(true, Ordering::SeqCst);
+        m
+    }
+
+    /// Makes the stale-permit REPAIR (`reengage_lockdown_permits`) fail,
+    /// distinct from `failing_lockdown_permits` (which fails a FRESH
+    /// engage) -- simulates the real Windows repair's checked delete
+    /// failing loud instead of being silently swallowed.
+    fn failing_reengage_lockdown_permits(state_dir: PathBuf) -> Self {
+        let m = Self::new(state_dir);
+        m.state.fail_reengage_lockdown_permits.store(true, Ordering::SeqCst);
         m
     }
 
@@ -382,6 +403,40 @@ impl Routing for MockRouting {
         }
         *self.state.last_lockdown_permits_resolver_ip.lock().unwrap() = resolver_ip;
         self.state.lockdown_permits_calls.fetch_add(1, Ordering::SeqCst);
+        Ok(MockCover {
+            state: Arc::clone(&self.state),
+            lockdown: true,
+        })
+    }
+
+    fn reengage_lockdown_permits(
+        &self,
+        old: MockCover,
+        _server_ip: IpAddr,
+        resolver_ip: Option<IpAddr>,
+        _app_ids: &[std::path::PathBuf],
+    ) -> Result<MockCover, (RoutingError, MockCover)> {
+        if self.state.fail_reengage_lockdown_permits.load(Ordering::SeqCst) {
+            // Give `old` back UNCHANGED -- mirrors the real primitive's
+            // atomicity guarantee (an aborted FWPM transaction / a rejected
+            // pf reload leaves the OLD state untouched): the caller must be
+            // able to keep tracking the SAME still-live guard, not lose it.
+            return Err((
+                RoutingError::RouteSetup("mock reengage-lockdown-permits failure".into()),
+                old,
+            ));
+        }
+        // `old` is consumed WITHOUT running its own Drop on the SUCCESS path
+        // -- mirrors the real implementation's contract (the repair's own
+        // checked teardown replaces the old guard's ordinary
+        // disengage-on-drop, so this must NOT bump `lockdown_disengage_calls`;
+        // a real repair produces no observable "gap" between the old and
+        // new values, just a replacement).
+        std::mem::forget(old);
+        *self.state.last_lockdown_permits_resolver_ip.lock().unwrap() = resolver_ip;
+        self.state
+            .reengage_lockdown_permits_calls
+            .fetch_add(1, Ordering::SeqCst);
         Ok(MockCover {
             state: Arc::clone(&self.state),
             lockdown: true,
@@ -3942,8 +3997,10 @@ mod self_test {
         // `None`-permit guard (Windows' `FWP_E_ALREADY_EXISTS` swallow means
         // a naive re-add would never update it) would leave block-all still
         // governing the new resolver. This test proves the standing cover
-        // releases (disengages) the stale guard and re-engages fresh with
-        // the corrected value.
+        // repairs the stale guard in place via `reengage_lockdown_permits`
+        // (checked delete + strict re-add, not an ordinary drop followed by
+        // a fresh `install_lockdown_permits` — see that method's doc for
+        // why the distinction matters) with the corrected value.
         rt().block_on(async {
             let probe_l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             let closed = probe_l.local_addr().unwrap();
@@ -3990,19 +4047,101 @@ mod self_test {
             let _ = pm.start_cancellable(&cfg, true, CancellationToken::new()).await;
             assert_eq!(
                 st.lockdown_permits_calls.load(Ordering::SeqCst),
-                2,
-                "the stale-permit guard is released and a FRESH one is engaged — the repair, not just a diagnosis"
+                1,
+                "the drift is a REPAIR, not a second fresh engage -- install_lockdown_permits must not be \
+                 called again"
+            );
+            assert_eq!(
+                st.reengage_lockdown_permits_calls.load(Ordering::SeqCst),
+                1,
+                "the stale-permit guard is repaired in place via reengage_lockdown_permits"
             );
             assert_eq!(
                 st.lockdown_disengage_calls.load(Ordering::SeqCst),
-                1,
-                "releasing the stale guard must actually disengage it"
+                0,
+                "a repair is NOT an ordinary disengage -- reengage_lockdown_permits consumes the held guard \
+                 directly, it is never dropped ordinarily"
             );
             assert_eq!(
                 *st.last_lockdown_permits_resolver_ip.lock().unwrap(),
                 Some(answering_resolver),
-                "the fresh engage permits exactly what THIS attempt's ech-doh now needs"
+                "the repaired cover permits exactly what THIS attempt's ech-doh now needs"
             );
+        });
+    }
+
+    #[skuld::test]
+    fn lockdown_pending_repair_failure_restores_the_old_identity_not_orphaned() {
+        // A stale-permit repair's `reengage_lockdown_permits` failing must
+        // NOT leave the guard orphaned (`lockdown_pending: None` while the
+        // OS-level cover is actually still live): the underlying primitive
+        // guarantees nothing changed on failure (an aborted FWPM
+        // transaction / a rejected atomic pf reload), so the repair must
+        // restore `lockdown_pending` under the OLD (still-live) identity,
+        // not the attempted-but-failed new one -- otherwise a later retry's
+        // drift check compares against the wrong value, and a `stop()`
+        // would find nothing to disengage even though the OS-level cover
+        // is still armed.
+        rt().block_on(async {
+            let probe_l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let closed = probe_l.local_addr().unwrap();
+            drop(probe_l);
+            let old_resolver: IpAddr = "9.9.9.9".parse().unwrap();
+            let new_resolver: IpAddr = "1.0.0.1".parse().unwrap();
+            let querier = Arc::new(CountingQuerier {
+                host: "proxy.example".into(),
+                ip: closed.ip(),
+                queries: AtomicU32::new(0),
+            });
+            let dir = tempfile::tempdir().unwrap();
+            let routing = MockRouting::failing_reengage_lockdown_permits(dir.path().to_path_buf());
+            let st = routing.state();
+            let (mut pm, _dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, true);
+            pm.set_bootstrap_querier_for_test(querier);
+            let mut cfg = test_config();
+            cfg.server.server = "proxy.example".into();
+            cfg.server.server_port = closed.port();
+            cfg.server.plugin = Some("ex-ray".into());
+            cfg.server.plugin_opts = Some(ECH_CAPABLE_OPTS.into());
+            cfg.dns.enabled = true; // forces the self-test gate to fail every attempt
+            cfg.dns.servers = vec![old_resolver];
+
+            // Attempt 1: fresh engage (install_lockdown_permits, unaffected
+            // by `fail_reengage_lockdown_permits`) with resolver = old_resolver.
+            let _ = pm.start_cancellable(&cfg, true, CancellationToken::new()).await;
+            assert_eq!(st.lockdown_permits_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                *st.last_lockdown_permits_resolver_ip.lock().unwrap(),
+                Some(old_resolver)
+            );
+
+            // Attempt 2: resolver drifts to new_resolver -> triggers a
+            // repair, which this mock is configured to fail.
+            cfg.dns.servers = vec![new_resolver];
+            let err = pm
+                .start_cancellable(&cfg, true, CancellationToken::new())
+                .await
+                .unwrap_err();
+            assert!(
+                err.to_string().contains("mock reengage-lockdown-permits failure"),
+                "expected the repair's own error, got {err}"
+            );
+
+            assert!(
+                pm.lockdown_active(),
+                "a failed repair must NOT orphan the guard -- the OLD cover is still live"
+            );
+            assert_eq!(
+                pm.lockdown_pending.as_ref().and_then(|p| p.resolver_permit),
+                Some(old_resolver),
+                "the restored guard must reflect the OLD (still-live) identity, not the attempted new one"
+            );
+
+            // A later stop() must still find and disengage the restored
+            // guard -- proving it is actually reachable for cleanup, not a
+            // phantom `lockdown_active()` merely reports as true.
+            pm.stop().await.unwrap();
+            assert_eq!(st.lockdown_disengage_calls.load(Ordering::SeqCst), 1);
         });
     }
 
@@ -4068,14 +4207,20 @@ mod self_test {
             let _ = pm.start_cancellable(&cfg, true, CancellationToken::new()).await;
             assert_eq!(
                 st.lockdown_permits_calls.load(Ordering::SeqCst),
-                2,
-                "app_ids drift ALONE (server_ip and resolver_permit both unchanged) must still \
-                 release the stale guard and re-engage fresh"
+                1,
+                "app_ids drift is a REPAIR, not a second fresh engage -- install_lockdown_permits must not \
+                 be called again"
+            );
+            assert_eq!(
+                st.reengage_lockdown_permits_calls.load(Ordering::SeqCst),
+                1,
+                "app_ids drift ALONE (server_ip and resolver_permit both unchanged) must still repair the \
+                 stale guard in place via reengage_lockdown_permits"
             );
             assert_eq!(
                 st.lockdown_disengage_calls.load(Ordering::SeqCst),
-                1,
-                "releasing the stale guard must actually disengage it"
+                0,
+                "a repair is NOT an ordinary disengage -- see the resolver-drift test's identical assertion"
             );
         });
     }

@@ -490,6 +490,61 @@ pub fn engage_lockdown_tun(
     Ok(())
 }
 
+/// Release an already-engaged Phase-0 guard and re-engage fresh with
+/// corrected values, reloading the FULL ruleset (pf has no incremental
+/// update) — reusing the SAME persisted token/nat_snapshot [`engage_lockdown`]
+/// (Phase 0) already wrote, exactly like [`engage_lockdown_tun`]'s Phase-6
+/// add. This deliberately does NOT reuse [`engage_lockdown`] itself: that
+/// function's OWN load-failure branch calls [`lockdown_disengage`] — correct
+/// for a FIRST-EVER engage (nothing valid was live before a failed load),
+/// but wrong for a repair, where the OLD ruleset (this guard's pre-repair
+/// permits) is still live and correct. `pfctl -f -` is atomic — a rejected
+/// reload leaves that OLD ruleset unchanged and still fully enforced — so
+/// calling `lockdown_disengage` here would OPEN THE HOST, destroying a cover
+/// that is still live and correct just because the correction didn't land
+/// (mirrors `engage_lockdown_tun`'s own reasoning for the identical
+/// atomicity property).
+///
+/// `old` is consumed either way: on success its `token`/`state_dir` carry
+/// forward unchanged (only the loaded ruleset content changed, the pf
+/// enable-refcount session persists across a repair); on failure the SAME
+/// `old` is handed back in the `Err` so the caller does not lose track of
+/// the still-live guard.
+pub fn reengage_lockdown(
+    old: Cover,
+    server_ip: IpAddr,
+    resolver_ip: Option<IpAddr>,
+) -> Result<Cover, (RoutingError, Cover)> {
+    debug_assert_eq!(
+        old.kind,
+        CoverKind::Lockdown,
+        "reengage_lockdown only ever repairs a standing lockdown cover"
+    );
+    let Some(persisted) = lockdown_state::load(&old.state_dir) else {
+        return Err((
+            RoutingError::RouteSetup(
+                "reengage_lockdown: no lockdown state on disk -- called before the Phase-0 engage".into(),
+            ),
+            old,
+        ));
+    };
+    let main = build_lockdown_main_ruleset(None, server_ip, resolver_ip, &persisted.nat_snapshot);
+    let out = match pfctl(&["-f", "-"], Some(main.as_bytes()), PHASE_COVER) {
+        Ok(o) => o,
+        Err(e) => return Err((e, old)),
+    };
+    if !out.status.success() {
+        return Err((
+            RoutingError::RouteSetup(format!(
+                "pfctl lockdown repair load failed (the OLD ruleset is unaffected -- pfctl's reload is atomic): {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            )),
+            old,
+        ));
+    }
+    Ok(old) // token/state_dir/kind unchanged -- only the loaded ruleset content changed
+}
+
 /// Fail-loud disengage: restore the pre-lockdown ruleset from the snapshot, drop
 /// our pf refcount, clear the state. An ABSENT cover (no state file) is `Ok` —
 /// nothing to disengage, so no pfctl is spawned. A PRESENT cover that fails to

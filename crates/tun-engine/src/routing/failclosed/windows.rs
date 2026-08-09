@@ -678,6 +678,81 @@ pub fn engage_lockdown(
     }
 }
 
+/// Release an already-engaged Phase-0 guard and re-engage fresh with
+/// corrected values, as ONE checked operation. Unlike a bare `drop(old)`
+/// followed by [`engage_lockdown`] — `Cover::drop`'s deletes discard their
+/// return codes, and `engage_lockdown`'s adds tolerate `FWP_E_ALREADY_EXISTS`
+/// (needed there for a genuine first-engage/Adopt-continuation, which can
+/// legitimately see already-present floor filters) — every delete here is
+/// checked (`ok_or_not_found`: anything but "wasn't there" aborts loudly)
+/// and every add is the STRICT variant (`FWP_E_ALREADY_EXISTS` is a hard
+/// error): after `old`'s filters are confirmed gone, `ALREADY_EXISTS` on the
+/// re-add is impossible unless a delete silently failed to take, which must
+/// not be reported as a successful repair.
+///
+/// `old` is NOT dropped ordinarily: its `engine` handle is reused for this
+/// function's own transaction (so the checked-delete and strict-add commit
+/// or abort together), and `old` itself is forgotten rather than dropped —
+/// letting its own `Drop` run first would race this function's checked
+/// deletes with no ordering guarantee between the two engine handles, and
+/// its outcome would be discarded either way (`Drop` cannot return
+/// `Result`), which is the exact swallow this function exists to avoid.
+///
+/// On FAILURE the transaction ABORTS (`FwpmTransactionAbort0`), which rolls
+/// back every delete AND add issued since `FwpmTransactionBegin0` — the
+/// OLD filters (this guard's pre-repair values) are therefore still fully
+/// live and correct, unaffected by the failed attempt. The `Err` variant
+/// hands back a `Cover` for that SAME still-live state (same engine, same
+/// kind) so the caller does not lose track of it: losing it here would
+/// orphan a live, correct standing cover with nothing left to eventually
+/// disengage it — the same class of leak a lost `Cover` anywhere else in
+/// this module would be.
+#[allow(clippy::disallowed_methods)] // THIS is the sanctioned FWPM call site
+pub fn reengage_lockdown(
+    old: Cover,
+    server_ip: IpAddr,
+    resolver_ip: Option<IpAddr>,
+    app_ids: &[std::path::PathBuf],
+) -> Result<Cover, (RoutingError, Cover)> {
+    debug_assert_eq!(
+        old.kind,
+        CoverKind::Lockdown,
+        "reengage_lockdown only ever repairs a standing lockdown cover"
+    );
+    let spec = build_lockdown_spec(server_ip, resolver_ip, None, app_ids);
+    let engine = old.engine;
+    std::mem::forget(old); // see doc: this fn now owns the engine's teardown+re-add as one transaction
+    unsafe {
+        let result = (|| -> Result<(), RoutingError> {
+            wfp_check(FwpmTransactionBegin0(engine, 0), "FwpmTransactionBegin0")?;
+            add_provider(engine, spec.provider)?;
+            add_sublayer(engine, spec.sublayer, spec.provider)?;
+            for g in swept_lockdown_guids() {
+                ok_or_not_found(FwpmFilterDeleteByKey0(engine, &g), "FwpmFilterDeleteByKey0")?;
+            }
+            for f in &spec.filters {
+                add_filter(engine, spec.provider, spec.sublayer, f, true)?;
+            }
+            wfp_check(FwpmTransactionCommit0(engine), "FwpmTransactionCommit0")?;
+            Ok(())
+        })();
+        // Reconstruct a `Cover` from the SAME engine either way: the engine
+        // SESSION stays valid across a transaction abort (only the pending
+        // writes roll back), so there is always something for a `Cover` to
+        // own -- on failure this is the OLD (still-live) state, on success
+        // it is the newly-corrected one.
+        let cover = Cover {
+            engine,
+            kind: CoverKind::Lockdown,
+        };
+        if let Err(e) = result {
+            let _ = FwpmTransactionAbort0(engine);
+            return Err((e, cover));
+        }
+        Ok(cover)
+    }
+}
+
 /// Add ONLY the TUN-interface permit pair to an already-engaged standing
 /// lockdown cover (from [`engage_lockdown`] with `tun_luid: None`), once
 /// `routing.install` has resolved the adapter. Idempotent, and returns no
