@@ -413,15 +413,27 @@ LIVE held cover's permit mismatched from what THIS attempt actually needs
 comparing against the live permit rather than re-trusting that the repair
 always converges, in EITHER direction: too narrow (`Holes`, an ECH-fetch stall
 risk) or too wide (`None`, the kill switch permits a resolver address nothing
-needs). A THIRD case is untouched by this mechanism entirely
-(not merely a residual within it), **macOS only**: a restart that adopts a
-pre-existing [standing lockdown cover](#lockdown-mode) sees no transient
-cover engage at all, so there is no in-process signal to gate a diagnostic on
-— the adopted pf ruleset can block the same ECH fetch, silently. Windows is
-unaffected: the adopted lockdown cover's App-ID floor already permits the
-plugin process outright (pf has no per-process matcher, so macOS has no
-equivalent floor). Tracked separately:
-[#753](https://github.com/bindreams/hole/issues/753). Finally, the
+needs). A THIRD case is untouched by this mechanism entirely (not merely a
+residual within it): the [standing lockdown cover](#lockdown-mode)'s own
+ruleset never carries a resolver permit at all, on EITHER platform, whether
+the cover was just engaged fresh (`routing.install_lockdown`, called from
+`start_cancellable`'s `lockdown_on` branch on every covered start) or adopted
+across a restart — `build_lockdown_main_ruleset` (macOS) and
+`lockdown_app_ids` (Windows) take no `resolver_ip`/`EchDoh` input at all. On
+macOS this blocks the fetch outright, silently, on every lockdown-on covered
+start with an ECH-effective config — not only a restart-adopt, which merely
+compounds it by also removing the in-process signal a fresh engage still has
+(`effective_ech_doh`, computed before `install_lockdown` runs) but has no API
+to consume. On Windows the App-ID floor (`resolve_plugin_path(plugin)` — the
+plugin's OWN resolved binary) is sufficient for a direct `ex-ray`/
+`v2ray-plugin` config, but NOT for a chained plugin like `galoshes`: it
+`include_bytes!`s ex-ray and spawns it as a separate process from its own
+extracted runtime path (`crates/galoshes/src/embedded.rs`), which
+`lockdown_app_ids` never adds to the permit set — WFP's App-ID condition
+matches the RUNNING process's own image path, so ex-ray (the process that
+actually dials the DoH resolver) is unpermitted there too. Tracked
+separately: [#753](https://github.com/bindreams/hole/issues/753) (filed
+narrower than this; scope correction pending). Finally, the
 release-then-reengage repair itself has a brief window with NO cover at all
 between the release and the corrected (or restored) re-engage — disclosed in
 the repair's own `warn!` lines, not silent, but not eliminated either: both
@@ -434,10 +446,10 @@ fail-open outcome as an ordinary single-engage failure, just requiring two
 failures instead of one to reach. The next retry finds the held cover is
 `None` and re-engages fresh from scratch. Also disclosed via its own
 `warn!`. **Windows only:** the two new resolver-permit filters grew
-`FILTER_GUIDS` from ten entries to twelve — before this change there were NO
-resolver-permit filters at all, so a crash-then-downgrade (this build
-engages, crashes, an older build's recovery sweep only knows the first ten
-GUIDs) leaves those two permits un-swept; they are *permits*, never blocks,
+`FILTER_GUIDS` from ten entries to twelve, so a crash-then-downgrade (a build
+that knows all twelve GUIDs engages, crashes, and an older build's recovery
+sweep only knows the first ten) leaves those two permits un-swept; they are
+*permits*, never blocks,
 so this is bounded and self-healing (a later upgrade's sweep cleans them up),
 not a leak of blocked traffic. Disclosed as a source comment on
 `FILTER_GUIDS` itself. Tracked separately:
