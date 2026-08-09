@@ -236,6 +236,7 @@ impl Drop for MockCover {
 
 impl tun_engine::routing::CoverGuard for MockCover {
     fn disarm(self) {}
+    fn mark_owned(&mut self) {}
 }
 
 struct MockRoutes {

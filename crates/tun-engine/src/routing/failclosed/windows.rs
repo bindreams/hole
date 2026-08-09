@@ -520,16 +520,38 @@ enum CoverKind {
     Lockdown,
 }
 
-/// WFP-backed cover guard. Drop deletes the filters it installed by GUID.
+/// Whether THIS `engage_lockdown` call created the standing cover from
+/// nothing, or found one already live (adopted from a prior bridge process
+/// that crashed or cutover, `CoverRecovery::Adopt`). Consulted ONLY by
+/// `Drop` — see there for why. Meaningless for `CoverKind::Transient` (the
+/// transient cover has no adoption concept; every engage is fresh), always
+/// `Fresh` in that case.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Ownership {
+    Fresh,
+    Adopted,
+}
+
+/// WFP-backed cover guard. Drop deletes the filters it installed by GUID —
+/// unless `ownership` is `Adopted`, in which case Drop leaves them alone;
+/// see `Drop for Cover`.
 pub struct Cover {
     engine: HANDLE,
     kind: CoverKind,
+    ownership: Ownership,
 }
 
 // SAFETY: the FWPM engine handle is owned exclusively by this guard and only
 // touched in `engage` and `Drop`. Sending it between threads is sound; FWPM
 // engine handles are not thread-affine.
 unsafe impl Send for Cover {}
+
+impl Cover {
+    /// See [`crate::routing::CoverGuard::mark_owned`].
+    pub fn mark_owned(&mut self) {
+        self.ownership = Ownership::Fresh;
+    }
+}
 
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
@@ -604,6 +626,7 @@ pub fn engage(
         Ok(Cover {
             engine,
             kind: CoverKind::Transient,
+            ownership: Ownership::Fresh,
         })
     }
 }
@@ -623,6 +646,18 @@ pub fn engage_lockdown(
             FwpmEngineOpen0(PCWSTR::null(), RPC_C_AUTHN_WINNT, None, None, &mut engine),
             "FwpmEngineOpen0",
         )?;
+        // Ownership: was the floor (loopback permit) already live BEFORE this
+        // call touched anything? `Fresh` means this call created the cover
+        // from nothing; `Adopted` means it found one already live (a prior
+        // bridge process's cover, surviving a crash/cutover via
+        // `CoverRecovery::Adopt`). Checked before the transaction below
+        // mutates anything, so it reflects the pre-call state. Consulted
+        // ONLY by `Drop` — see there for why this matters.
+        let ownership = if phase_0_engaged(engine)? {
+            Ownership::Adopted
+        } else {
+            Ownership::Fresh
+        };
         let result = (|| -> Result<(), RoutingError> {
             wfp_check(FwpmTransactionBegin0(engine, 0), "FwpmTransactionBegin0")?;
             // Idempotent over an unswept cover: add_provider/add_sublayer use
@@ -647,6 +682,7 @@ pub fn engage_lockdown(
         Ok(Cover {
             engine,
             kind: CoverKind::Lockdown,
+            ownership,
         })
     }
 }
@@ -1049,15 +1085,38 @@ impl Drop for Cover {
         unsafe {
             match self.kind {
                 // Transient: today's full sweep (filters + sublayer + provider).
+                // No ownership concept here -- every transient engage is Fresh.
                 CoverKind::Transient => delete_all(self.engine),
-                // Lockdown: delete only the lockdown + App-ID filters; the
-                // shared sublayer/provider are owned by the transient sweep.
+                // Lockdown, Fresh: THIS call created the cover from nothing --
+                // delete only the lockdown + App-ID filters it (potentially)
+                // added; the shared sublayer/provider are owned by the
+                // transient sweep.
                 #[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
-                CoverKind::Lockdown => {
+                CoverKind::Lockdown if self.ownership == Ownership::Fresh => {
                     for g in swept_lockdown_guids() {
                         let _ = FwpmFilterDeleteByKey0(self.engine, &g);
                     }
                 }
+                // Lockdown, Adopted: THIS call found the cover already live
+                // (a prior bridge process's, surviving a crash/cutover) --
+                // ordinary RAII ownership means Drop must not destroy what
+                // this attempt did not create. Leave every filter exactly as
+                // it stands: the floor (loopback/block-all/App-ID) untouched,
+                // and the volatile TUN/server/resolver permits either the
+                // adopted values (existing GUIDs are add-idempotent, so a
+                // re-engage over an unchanged config never touched them) or
+                // THIS attempt's own re-added values (a config change since
+                // the crash: `recover_lockdown`'s Adopt path deletes the
+                // volatile GUIDs first specifically so a re-engage's add
+                // lands fresh) -- whichever this attempt's own engage above
+                // actually wrote is what remains; there is no separate
+                // "restore to before this attempt" snapshot to fall back to
+                // (see CONTRIBUTING.md's "Lockdown mode"). Either way the
+                // result is still a complete, self-consistent, fully
+                // fail-closed floor for this attempt's own config -- just
+                // missing whatever this attempt itself never reached (e.g.
+                // the TUN permit, if Phase 6 never ran).
+                CoverKind::Lockdown => {}
             }
             #[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
             let _ = FwpmEngineClose0(self.engine);

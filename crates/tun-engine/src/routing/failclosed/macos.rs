@@ -226,12 +226,34 @@ enum CoverKind {
     Lockdown,
 }
 
+/// Whether THIS `engage_lockdown` call created the standing cover from
+/// nothing, or found one already live (adopted from a prior bridge process
+/// that crashed or cutover, `CoverRecovery::Adopt`). Consulted ONLY by
+/// `Drop` — see there for why. Meaningless for `CoverKind::Transient` (the
+/// transient cover has no adoption concept; every engage is fresh), always
+/// `Fresh` in that case.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Ownership {
+    Fresh,
+    Adopted,
+}
+
 /// pf-backed cover guard. Drop disengages per [`CoverKind`]: the transient
-/// cover restores `/etc/pf.conf`; the lockdown cover restores the snapshot.
+/// cover restores `/etc/pf.conf`; the lockdown cover restores the snapshot —
+/// UNLESS `ownership` is `Adopted`, in which case Drop leaves pf exactly as
+/// this attempt's own engage left it; see `Drop for Cover`.
 pub struct Cover {
     token: String,
     state_dir: std::path::PathBuf,
     kind: CoverKind,
+    ownership: Ownership,
+}
+
+impl Cover {
+    /// See [`crate::routing::CoverGuard::mark_owned`].
+    pub fn mark_owned(&mut self) {
+        self.ownership = Ownership::Fresh;
+    }
 }
 
 pub fn engage(
@@ -285,15 +307,35 @@ pub fn engage(
         token,
         state_dir: state_dir.to_owned(),
         kind: CoverKind::Transient,
+        ownership: Ownership::Fresh,
     })
 }
 
 impl Drop for Cover {
     fn drop(&mut self) {
-        match self.kind {
+        match (self.kind, self.ownership) {
             // A user-stop drop never has a standing cover being adopted.
-            CoverKind::Transient => disengage(&self.token, &self.state_dir, false),
-            CoverKind::Lockdown => lockdown_disengage(&self.state_dir),
+            (CoverKind::Transient, _) => disengage(&self.token, &self.state_dir, false),
+            // Lockdown, Fresh: THIS call created the cover from nothing --
+            // restore the pre-lockdown snapshot and drop the refcount, same
+            // as always.
+            (CoverKind::Lockdown, Ownership::Fresh) => lockdown_disengage(&self.state_dir),
+            // Lockdown, Adopted: THIS call found the cover already live (a
+            // prior bridge process's, surviving a crash/cutover) --
+            // ordinary RAII ownership means Drop must not destroy what this
+            // attempt did not create. Leave pf exactly as it stands: either
+            // the adopted ruleset unchanged (this attempt's own
+            // `engage_lockdown` call above failed before its `pfctl -f -`
+            // ever ran) or THIS attempt's own rewritten ruleset (its
+            // `pfctl -f -` succeeded, reloading with THIS attempt's own
+            // server/resolver/App-ID values, and a LATER phase then failed)
+            // -- there is no separate "restore to before this attempt"
+            // snapshot to fall back to (see CONTRIBUTING.md's "Lockdown
+            // mode"). Either way the result is still a complete,
+            // self-consistent, fully fail-closed ruleset -- just possibly
+            // missing whatever this attempt itself never reached (e.g. the
+            // TUN permit, if Phase 6 never ran).
+            (CoverKind::Lockdown, Ownership::Adopted) => {}
         }
     }
 }
@@ -458,6 +500,18 @@ pub fn engage_lockdown(
     owner: Option<(u32, u32)>,
 ) -> Result<Cover, RoutingError> {
     let persisted = lockdown_state::load(state_dir);
+    // Ownership (see `Ownership`'s own doc and `Drop for Cover`): a
+    // persisted state file means SOME cover already existed when this call
+    // started -- either adopted from a prior bridge process, or (within
+    // this SAME process) a previous attempt's own Adopted cover that a
+    // still-earlier failure already declined to tear down. Either way,
+    // THIS attempt did not create it from nothing, so it must not be the
+    // one to destroy it either.
+    let ownership = if persisted.is_some() {
+        Ownership::Adopted
+    } else {
+        Ownership::Fresh
+    };
 
     // `resave_after_success` carries the main_snapshot for a `Some(st)`
     // re-engage ONLY -- see the self-healing re-persist below for why.
@@ -553,6 +607,7 @@ pub fn engage_lockdown(
         token,
         state_dir: state_dir.to_owned(),
         kind: CoverKind::Lockdown,
+        ownership,
     })
 }
 
@@ -572,10 +627,14 @@ pub fn engage_lockdown(
 /// restores on failure itself either way: within the full bridge flow, the
 /// caller (`start_cancellable`) holds the Phase-0 `Cover` as a plain local
 /// and it drops via ordinary RAII on ANY `start_inner` failure (this one
-/// included), so the aggregate outcome is a disengage regardless of what
-/// this function does internally — restoring here too would just double it.
-/// A STANDALONE call (e.g. a test driving this function directly, with no
-/// such caller) has no such backstop; see [`reconcile_pf_enabled`]'s
+/// included) — a `Fresh`-owned guard disengages there; an `Adopted` one
+/// (Phase 0 found a standing cover already live, from a prior bridge
+/// process) does not, by design (see `Ownership` and `Drop for Cover`), so
+/// the aggregate outcome depends on ownership, not solely on what this
+/// function does internally. Restoring here too would double a `Fresh`
+/// disengage and would be wrong outright for an `Adopted` one. A STANDALONE
+/// call (e.g. a test driving this function directly, with no such caller)
+/// has no such backstop; see [`reconcile_pf_enabled`]'s
 /// `PfReconciled::JustReenabled` case for when "still fully enforced" does
 /// NOT hold even for an atomic reload (pf had nothing loaded going in).
 ///

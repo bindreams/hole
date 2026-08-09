@@ -212,6 +212,11 @@ struct MockRoutingState {
     /// Last `resolver_ip` passed to `install_lockdown_permits`.
     last_lockdown_permits_resolver_ip: std::sync::Mutex<Option<IpAddr>>,
     fail_lockdown_permits: AtomicBool,
+    /// When set, `install_lockdown_permits` returns a `MockCover` with
+    /// `owned: false` -- simulating Phase 0 finding a cover already live
+    /// (adopted from a prior bridge process), mirroring the platform
+    /// `Ownership::Adopted` case. See `MockCover::owned`'s doc.
+    lockdown_adopted: AtomicBool,
 }
 
 impl Default for MockRoutingState {
@@ -236,6 +241,7 @@ impl Default for MockRoutingState {
             lockdown_permits_calls: AtomicU32::new(0),
             last_lockdown_permits_resolver_ip: std::sync::Mutex::new(None),
             fail_lockdown_permits: AtomicBool::new(false),
+            lockdown_adopted: AtomicBool::new(false),
         }
     }
 }
@@ -284,6 +290,15 @@ impl MockRouting {
     fn failing_lockdown_permits(state_dir: PathBuf) -> Self {
         let m = Self::new(state_dir);
         m.state.fail_lockdown_permits.store(true, Ordering::SeqCst);
+        m
+    }
+
+    /// Makes `install_lockdown_permits` return an ADOPTED (`owned: false`)
+    /// cover -- simulating Phase 0 finding a standing cover already live
+    /// from a prior bridge process, instead of creating one fresh.
+    fn adopted_lockdown(state_dir: PathBuf) -> Self {
+        let m = Self::new(state_dir);
+        m.state.lockdown_adopted.store(true, Ordering::SeqCst);
         m
     }
 
@@ -368,6 +383,7 @@ impl Routing for MockRouting {
         Ok(MockCover {
             state: Arc::clone(&self.state),
             lockdown: false,
+            owned: true,
         })
     }
 
@@ -385,6 +401,7 @@ impl Routing for MockRouting {
         Ok(MockCover {
             state: Arc::clone(&self.state),
             lockdown: true,
+            owned: !self.state.lockdown_adopted.load(Ordering::SeqCst),
         })
     }
 
@@ -422,13 +439,27 @@ struct MockCover {
     /// fail-closed cover) — selects which disengage counter Drop bumps, mirroring
     /// the kind-aware `failclosed::Cover`.
     lockdown: bool,
+    /// Mirrors the platform `Ownership` enum (`true` == `Fresh`, `false` ==
+    /// `Adopted`) collapsed to a bool since the mock only needs the two
+    /// states, not the platforms' own reasons for being in either. Only
+    /// meaningful when `lockdown` is true — the transient cover has no
+    /// adoption concept and is always constructed `owned: true`. An
+    /// `Adopted` (`owned: false`) lockdown cover's Drop does NOT disengage,
+    /// mirroring `Drop for (platform) Cover`; `mark_owned` flips it to
+    /// `true`, mirroring `CoverGuard::mark_owned`.
+    owned: bool,
 }
 
 impl Drop for MockCover {
     fn drop(&mut self) {
         if self.lockdown {
-            self.state.lockdown_disengage_calls.fetch_add(1, Ordering::SeqCst);
-            self.state.teardown_order.lock().unwrap().push("lockdown");
+            if self.owned {
+                self.state.lockdown_disengage_calls.fetch_add(1, Ordering::SeqCst);
+                self.state.teardown_order.lock().unwrap().push("lockdown");
+            }
+            // Adopted (`owned: false`): ordinary RAII ownership -- Drop must
+            // not destroy a cover this guard did not create. No-op, exactly
+            // like the platform `Drop for Cover`'s `Adopted` arm.
         } else {
             self.state.cover_disengage_calls.fetch_add(1, Ordering::SeqCst);
         }
@@ -441,6 +472,10 @@ impl tun_engine::routing::CoverGuard for MockCover {
     /// cover instead of disengaging it.
     fn disarm(self) {
         std::mem::forget(self);
+    }
+
+    fn mark_owned(&mut self) {
+        self.owned = true;
     }
 }
 
@@ -1659,6 +1694,80 @@ fn lockdown_cover_disengages_immediately_when_a_later_phase_fails() {
             !pm.lockdown_active(),
             "nothing is held once the failed attempt has already returned"
         );
+    });
+}
+
+#[skuld::test]
+fn adopted_lockdown_cover_survives_a_later_phase_failure() {
+    // Mirrors `lockdown_cover_disengages_immediately_when_a_later_phase_fails`
+    // for an ADOPTED cover specifically: Phase 0 finds a standing cover
+    // already live (from a prior bridge process that crashed or
+    // cutover-restarted), not one this attempt created. Ordinary RAII
+    // ownership means the guard's Drop must not destroy what this attempt
+    // did not create -- unlike the Fresh case, a later-phase failure here
+    // must NOT disengage.
+    rt().block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        let routing = MockRouting::adopted_lockdown(dir.path().to_path_buf());
+        let st = routing.state();
+        st.fail_install.store(true, Ordering::SeqCst);
+        let (mut pm, _dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, true);
+
+        let err = pm.start(&test_config()).await.unwrap_err();
+        assert!(
+            err.to_string().contains("mock install failure"),
+            "expected the routes-install error, got {err}"
+        );
+        assert_eq!(pm.state(), ProxyState::Stopped);
+        assert_eq!(
+            st.lockdown_permits_calls.load(Ordering::SeqCst),
+            1,
+            "Phase 0 must have engaged (re-engaged over the adopted cover) before routes failed"
+        );
+        assert_eq!(
+            st.lockdown_disengage_calls.load(Ordering::SeqCst),
+            0,
+            "an ADOPTED cover must NOT be torn down by a failure THIS attempt did not create the cover for"
+        );
+        assert!(
+            !pm.lockdown_active(),
+            "the manager itself holds nothing once the failed attempt has returned -- \
+             the adopted cover lives on at the OS level, outside this manager's tracking, exactly \
+             as an adopted cover already does today when nothing ever calls start_cancellable again"
+        );
+    });
+}
+
+#[skuld::test]
+fn adopted_lockdown_cover_disengages_on_an_explicit_stop_after_success() {
+    // The other half of ownership: once a connect attempt SUCCEEDS, the
+    // running session is what the user sees as "connected" and explicitly
+    // disconnects from -- an explicit stop must always open the host from
+    // there on, regardless of whether the cover was originally adopted.
+    // Proves `mark_owned` actually flips the guard before it reaches
+    // `RunningState.lockdown`: without it, `stop_with`'s `drop(lk)` would
+    // silently no-op on an adopted-then-successful session, same as the
+    // failure-path case above -- but a user-initiated stop must never do
+    // that.
+    rt().block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        let routing = MockRouting::adopted_lockdown(dir.path().to_path_buf());
+        let st = routing.state();
+        let (mut pm, _dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, true);
+
+        pm.start(&test_config())
+            .await
+            .expect("adopted-cover start must still succeed");
+        assert_eq!(st.lockdown_permits_calls.load(Ordering::SeqCst), 1);
+        assert!(pm.lockdown_active());
+
+        pm.stop().await.unwrap();
+        assert_eq!(
+            st.lockdown_disengage_calls.load(Ordering::SeqCst),
+            1,
+            "an explicit stop after success must disengage even an originally-adopted cover"
+        );
+        assert!(!pm.lockdown_active());
     });
 }
 

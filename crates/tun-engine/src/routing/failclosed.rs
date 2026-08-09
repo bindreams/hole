@@ -67,6 +67,10 @@ impl crate::routing::CoverGuard for Cover {
     fn disarm(self) {
         std::mem::forget(self._inner);
     }
+
+    fn mark_owned(&mut self) {
+        self._inner.mark_owned();
+    }
 }
 
 /// Engage the cover blocking all egress except loopback, `server_ip`, and

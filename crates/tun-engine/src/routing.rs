@@ -354,6 +354,28 @@ pub trait CoverGuard {
     /// engine handle), which the kernel reclaims on exit but which a long-lived
     /// caller would leak per call.
     fn disarm(self);
+
+    /// Mark this guard as fully owned by the caller from this point on, so
+    /// its ordinary `Drop` always disengages regardless of how the
+    /// underlying cover came to exist.
+    ///
+    /// The standing lockdown cover's Phase-0 engage may find one already
+    /// live — adopted from a prior bridge process that crashed or
+    /// cutover-restarted (`CoverRecovery::Adopt`) — and in that case its
+    /// `Drop` deliberately does NOT tear the ruleset down on an early
+    /// failure: ordinary RAII ownership means a guard must not destroy what
+    /// it did not create (see the platform `Drop for Cover` impls). But
+    /// once a connect attempt actually SUCCEEDS, the running session is now
+    /// the thing the user sees as "connected" and explicitly disconnects
+    /// from — an explicit stop from that point on must always be able to
+    /// open the host, independent of the cover's provenance before this
+    /// attempt started. `ProxyManager::start_cancellable` calls this
+    /// exactly once, right before moving a successful guard into
+    /// `RunningState.lockdown`.
+    ///
+    /// A no-op for a guard that was already fully owned (a fresh engage, or
+    /// the transient cover, which has no adoption concept at all).
+    fn mark_owned(&mut self);
 }
 
 /// OS routing: install split-tunnel routes and query routing state.

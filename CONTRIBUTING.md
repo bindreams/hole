@@ -627,7 +627,8 @@ start fails identically on every retry. Both engage calls are fail-FATAL.
 
 **The guard's lifetime is bounded to one attempt.** `start_cancellable` holds
 the `Option<R::Cover>` Phase 0 returns as a plain local and passes it into
-`start_inner` for Phase 6 to add the TUN permit to. On success it moves into
+`start_inner` for Phase 6 to add the TUN permit to. On success it is marked
+fully owned (`CoverGuard::mark_owned`, next paragraph) and moved into
 `RunningState.lockdown`, where it disengages on an ordinary `stop()` and
 disarms (persist-without-disengage) on a cutover, exactly like every other
 cover this manager holds. On EVERY early return — an ordinary `Err` from any
@@ -637,15 +638,58 @@ own `routes` guard unwinds on a Phase 1-5 failure: no special-cased
 retention, no separate "pending" bucket for `stop_with` to reconcile, and no
 distinction between an ordinary failure and a cancel (the transient cover
 already treats those identically — "same trust as a user disconnect" — and
-the standing cover now does too).
+the standing cover now does too) — **except one: ownership.**
 
-This accepts a retry-window gap: a failed or cancelled attempt's guard
-disengages immediately, opening the host briefly until the NEXT retry's own
-Phase 0 re-engages fresh. The window is not new: an ordinary `main` connect
-has the identical gap on every failed or cancelled attempt, so retaining
-state only for the two-phase split would have spent real complexity
-protecting a window that predates this fix and was never in its scope.
-Tracked as [#768](https://github.com/bindreams/hole/issues/768).
+**Ownership: a guard must not destroy a cover it did not create.** Phase 0's
+engage can find a standing cover already live — adopted from a prior bridge
+process that crashed or cutover-restarted (`CoverRecovery::Adopt`), not
+created by this attempt at all. If a *later* phase then fails, the local's
+ordinary-RAII drop described above would, unqualified, tear that adopted
+cover down: on Windows every lockdown GUID deleted, on macOS the
+pre-lockdown snapshot restored and the state file cleared — regressing the
+crash-recovery guarantee for exactly the failure (a blocked self-test) the
+kill switch exists to survive. Each platform's `engage_lockdown` records
+which case it was in an `Ownership` enum on the returned `Cover` (Windows:
+was the floor filter already present before this call touched anything;
+macOS: was there already a persisted state file) and `Drop for Cover`
+branches on it: `Fresh` (this call created the cover from nothing)
+disengages as before; `Adopted` (this call found one already live) does
+nothing, leaving pf/WFP exactly as this attempt's own re-engage left them —
+either the adopted values unchanged (this attempt's engage never reached its
+own mutate) or this attempt's own rewritten ruleset (the engage succeeded,
+loading THIS attempt's server/resolver/App-IDs, and a later phase then
+failed). Either state is still a complete, self-consistent, fully
+fail-closed floor for this attempt's config — never less restrictive than
+before this attempt started, just possibly missing whatever this attempt
+itself never reached (e.g. the TUN permit, if Phase 6 never ran). There is
+no separate "restore to before this attempt" snapshot to fall back to — that
+would be exactly the identity-tracking machinery the simplification above
+dropped, applied one layer further out.
+
+Ownership is consulted ONLY by `Drop`, and is otherwise inert: no identity
+comparison (host/server/resolver/App-IDs), no staleness check, no repair
+path, no cross-attempt state. It answers exactly one question, asked once,
+at Phase 0: did this attempt create the cover, or find one already there?
+Once a connect attempt actually SUCCEEDS, the running session is what the
+user sees as "connected" and explicitly disconnects from — an explicit stop
+from that point on must always be able to open the host, independent of the
+cover's provenance before this attempt started. `CoverGuard::mark_owned`
+flips an `Adopted` guard to `Fresh` for exactly this reason, called once, in
+`start_cancellable`, immediately before the guard moves into
+`RunningState.lockdown` — without it, `stop_with`'s ordinary `drop(lk)` on
+UserStop would silently no-op for a session that started from an adopted
+cover, which is never correct: a user-initiated disconnect must open the
+host regardless of how the standing cover came to exist.
+
+This accepts a retry-window gap, now narrower than it first appears: a
+`Fresh`-owned attempt's guard disengages immediately on failure or
+cancellation, opening the host briefly until the NEXT retry's own Phase 0
+re-engages fresh — the identical gap an ordinary `main` connect already has
+on every failed or cancelled attempt, so retaining state only for the
+two-phase split would have spent real complexity protecting a window that
+predates this fix and was never in its scope. An `Adopted` attempt's guard
+has no such gap at all: it never disengages on failure, by design. Tracked
+as [#768](https://github.com/bindreams/hole/issues/768).
 
 On macOS, `reconcile_pf_enabled` runs before `engage_lockdown_tun`'s (Phase
 6\) reload, which assumes an already-persisted token: `pfctl -f -` into a

@@ -166,6 +166,7 @@ impl Drop for StubCover {
 
 impl tun_engine::routing::CoverGuard for StubCover {
     fn disarm(self) {}
+    fn mark_owned(&mut self) {}
 }
 
 fn test_socket_path(suffix: &str) -> PathBuf {
