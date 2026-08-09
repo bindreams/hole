@@ -300,6 +300,16 @@ struct LockdownPending<C> {
     server_ip: IpAddr,
     pin: crate::dns::ech::PinSource,
     resolver_permit: Option<IpAddr>,
+    /// `lockdown_app_ids(config)` at engage time, baked into the live cover
+    /// on Windows as unrestricted-egress App-ID permits (no address/port
+    /// scoping). Compared in the staleness check alongside `server_ip` /
+    /// `resolver_permit`: `config.server.plugin` can change between retries
+    /// with the server host and resolver permit both unchanged (e.g.
+    /// switching plugin binaries), and reusing the held guard in that case
+    /// would leave the OLD plugin's App-ID permit live while the new one
+    /// never gets one — the App-ID analogue of the resolver-permit widening
+    /// this struct's other fields already guard against.
+    app_ids: Vec<std::path::PathBuf>,
 }
 
 impl<P: Proxy, R: Routing> ProxyManager<P, R, SystemDns> {
@@ -758,15 +768,23 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         // fully-uncovered gap to close outside the covered/auto-connect path.
         let lockdown_applies = lockdown_on && (matches!(config.tunnel_mode, TunnelMode::Full) || covered);
 
-        // If lockdown intent no longer applies to THIS attempt (turned off,
-        // or a manual SocksOnly start), release any held Phase-0 guard NOW --
-        // strictly before the transient cover below has a chance to engage.
-        // Releasing it after (where this used to run) would, on macOS, have
-        // the disengage's restore-to-original `pfctl -f -` wipe the transient
+        // Release a held Phase-0 guard ONLY when the persisted INTENT itself
+        // is off -- never merely because THIS attempt doesn't apply
+        // (`lockdown_applies` is also false for a manual SocksOnly start
+        // while intent is still on). A manual SocksOnly start must not ADD
+        // to a held guard (it's gated out of the engage block below via
+        // `lockdown_applies`), but it must not TEAR ONE DOWN either: intent
+        // is still armed, and there is no replacement cover for a manual
+        // (uncovered) start to fall back to (the transient cover only
+        // engages when `covered`) -- disengaging here would silently fail
+        // the kill switch open while `lockdown_enabled()` keeps reading true.
+        // This release runs strictly before the transient cover below has a
+        // chance to engage: on macOS, releasing it AFTER would have the
+        // disengage's restore-to-original `pfctl -f -` wipe the transient
         // ruleset the block below just installed, silently opening the host
         // during the very covered-start window that cover exists to protect.
-        if !lockdown_applies && self.lockdown_pending.take().is_some() {
-            warn!("lockdown early cover released: intent is off, or this is a manual SocksOnly start");
+        if !lockdown_on && self.lockdown_pending.take().is_some() {
+            warn!("lockdown early cover released: intent is off");
         }
 
         // A held cover's resolver_permit is fixed at engage time; re-engage
@@ -924,18 +942,25 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         // Standing lockdown cover, Phase 0 (see `lockdown_pending`'s doc). The
         // `else` release for when `lockdown_applies` is false already ran
         // above, before the transient block -- this arm only ever engages or
-        // reuses. Release-then-reengage only on drift (a different server or
-        // resolver permit than what's held), mirroring the transient cover's
-        // stale-permit repair above but WITHOUT a restore-previous fallback:
-        // `install_lockdown_permits` is fail-FATAL, so a failed re-engage
-        // here aborts the whole start with the host open -- the same
-        // disclosed residual class as the transient cover's own
-        // release-then-reengage window (`LockdownPending`'s doc).
+        // reuses. Release-then-reengage only on drift (a different server,
+        // resolver permit, or app_ids than what's held), mirroring the
+        // transient cover's stale-permit repair above but WITHOUT a
+        // restore-previous fallback: `install_lockdown_permits` is
+        // fail-FATAL, so a failed re-engage here aborts the whole start with
+        // the host open -- the same disclosed residual class as the
+        // transient cover's own release-then-reengage window
+        // (`LockdownPending`'s doc). `app_ids` is computed once here (not
+        // inside the engage-only branch below) so the staleness check can
+        // compare it: `config.server.plugin` can change between retries with
+        // server/resolver both unchanged, and reusing the held guard in that
+        // case would leave the OLD plugin's Windows App-ID permit live
+        // (unrestricted egress, no address/port scoping) while the new
+        // plugin never gets one.
         if lockdown_applies {
-            let stale = self
-                .lockdown_pending
-                .as_ref()
-                .is_some_and(|p| p.server_ip != server_ip || p.resolver_permit != ech_resolver_permit);
+            let app_ids = lockdown_app_ids(config);
+            let stale = self.lockdown_pending.as_ref().is_some_and(|p| {
+                p.server_ip != server_ip || p.resolver_permit != ech_resolver_permit || p.app_ids != app_ids
+            });
             // Capture the HELD guard's original `pin` (pre-`revalidate`)
             // before a stale release takes it, mirroring `repair_fallback`
             // above: `pin` here is refreshed by `revalidate` every retry, so
@@ -949,13 +974,12 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
             if stale {
                 self.lockdown_pending.take(); // drop -> disengage; brief open window until the fresh engage below
                 warn!(
-                    "lockdown retry: this attempt's server or resolver permit differs from the held early \
-                     cover's; releasing it so a fresh engage can correct it -- egress is briefly OPEN until \
-                     the corrected cover re-engages below"
+                    "lockdown retry: this attempt's server, resolver permit, or app_ids differs from the held \
+                     early cover's; releasing it so a fresh engage can correct it -- egress is briefly OPEN \
+                     until the corrected cover re-engages below"
                 );
             }
             if self.lockdown_pending.is_none() {
-                let app_ids = lockdown_app_ids(config);
                 let engaged_pin = original_pin.unwrap_or(pin);
                 match self
                     .routing
@@ -968,6 +992,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
                             server_ip,
                             pin: engaged_pin,
                             resolver_permit: ech_resolver_permit,
+                            app_ids: app_ids.clone(),
                         });
                     }
                     Err(e) => {

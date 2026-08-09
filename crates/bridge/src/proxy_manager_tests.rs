@@ -1545,6 +1545,50 @@ fn lockdown_pending_survives_a_start_failure_and_is_disengaged_by_stop() {
 }
 
 #[skuld::test]
+fn cutover_while_lockdown_pending_disarms_not_disengages() {
+    // Mirrors `cutover_while_blocked_disarms_the_transient_cover_user_stop_disengages`
+    // for the STANDING cover's PENDING (not-yet-running) guard specifically:
+    // `lockdown_pending_survives_a_start_failure_and_is_disengaged_by_stop`
+    // (above) only ever calls `pm.stop()` (== UserStop). The sibling
+    // `stop_with_cutover_disarms_lockdown_but_user_stop_disengages` test
+    // exercises Cutover, but only AFTER a start that reached `running` --
+    // by then the guard already moved out of `lockdown_pending` into
+    // `RunningState.lockdown`, so it tests a different branch of
+    // `stop_with` than the one this test targets. A covered lockdown-on
+    // start that fails BEFORE ever reaching `running` (Phase 0 engaged,
+    // Phase 6 never ran) leaves the guard in `lockdown_pending`; a cutover
+    // there must DISARM it (persist across the restart), never disengage.
+    rt().block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        let routing = MockRouting::failing_install(dir.path().to_path_buf());
+        let st = routing.state();
+        let (mut pm, _dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, true);
+
+        pm.start_cancellable(&test_config(), true, CancellationToken::new())
+            .await
+            .expect_err("routing.install fails on this mock");
+        assert_eq!(st.lockdown_permits_calls.load(Ordering::SeqCst), 1);
+        assert!(
+            pm.lockdown_active(),
+            "sanity: the Phase-0 guard is retained across the Err"
+        );
+
+        pm.stop_with(StopReason::Cutover).await.unwrap();
+        assert_eq!(
+            st.lockdown_disengage_calls.load(Ordering::SeqCst),
+            0,
+            "cutover must DISARM the still-pending guard (filters persist across the restart), \
+             never disengage it -- disengaging here would open the host during the cutover gap \
+             the standing cover exists to hold"
+        );
+        assert!(
+            !pm.lockdown_active(),
+            "the manager releases lockdown_pending either way -- the disarm keeps only the OS filters"
+        );
+    });
+}
+
+#[skuld::test]
 fn lockdown_on_never_engages_for_socks_only_mode() {
     // A MANUAL (uncovered) SocksOnly start never applies lockdown, matching
     // every other manual connect's fail-open-by-design convention -- unlike
@@ -1616,6 +1660,58 @@ fn covered_socks_only_start_with_lockdown_on_uses_the_standing_cover_not_the_tra
             st.lockdown_disengage_calls.load(Ordering::SeqCst),
             1,
             "stop must release the Phase-0-only guard SocksOnly never completes to Phase 6"
+        );
+    });
+}
+
+#[skuld::test]
+fn manual_socks_only_start_does_not_disengage_an_already_armed_standing_cover() {
+    // A manual SocksOnly start does not APPLY lockdown (its own test above),
+    // but it must not TEAR ONE DOWN either: a prior covered Full-mode attempt
+    // may have engaged Phase 0 and then failed, retaining `lockdown_pending`
+    // while lockdown intent is still on. The release condition must key on
+    // the persisted INTENT, not on whether THIS attempt applies -- a manual
+    // SocksOnly start has `lockdown_applies == false` even while intent is
+    // on, and there is no replacement cover for an uncovered start to fall
+    // back to (the transient cover only engages when `covered`), so gating
+    // the release on `lockdown_applies` would silently fail the kill switch
+    // open while `lockdown_enabled()` keeps reading true.
+    rt().block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        let routing = MockRouting::failing_install(dir.path().to_path_buf());
+        let st = routing.state();
+        let (mut pm, _dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, true);
+
+        // Attempt 1: covered Full-mode start under lockdown -> Phase 0
+        // engages, then `routing.install` (Phase 6) fails -> lockdown_pending
+        // retained across the ordinary Err.
+        pm.start_cancellable(&test_config(), true, CancellationToken::new())
+            .await
+            .expect_err("routing.install fails on this mock");
+        assert_eq!(st.lockdown_permits_calls.load(Ordering::SeqCst), 1);
+        assert!(
+            pm.lockdown_active(),
+            "sanity: the Phase-0 guard is retained across the Err"
+        );
+
+        // A manual (uncovered) SocksOnly start, intent still on.
+        let mut cfg = test_config();
+        cfg.tunnel_mode = hole_common::protocol::TunnelMode::SocksOnly;
+        let _ = pm.start(&cfg).await; // outcome irrelevant; only the cover state matters
+
+        assert_eq!(
+            st.lockdown_disengage_calls.load(Ordering::SeqCst),
+            0,
+            "a manual SocksOnly start must NOT disengage an already-armed standing cover"
+        );
+        assert!(
+            pm.lockdown_active(),
+            "the kill switch must still read armed after a manual SocksOnly start"
+        );
+        assert_eq!(
+            st.cover_engage_calls.load(Ordering::SeqCst),
+            0,
+            "a manual (uncovered) start never engages the transient cover either -- fail-open by design"
         );
     });
 }
@@ -3906,6 +4002,80 @@ mod self_test {
                 *st.last_lockdown_permits_resolver_ip.lock().unwrap(),
                 Some(answering_resolver),
                 "the fresh engage permits exactly what THIS attempt's ech-doh now needs"
+            );
+        });
+    }
+
+    // `lockdown_app_ids` only ever populates entries on Windows (App-ID
+    // matching has no macOS/Linux equivalent), so this drift can only be
+    // observed there -- on other platforms `app_ids` is always `[]` for
+    // every attempt and this scenario collapses to "no drift".
+    #[cfg(target_os = "windows")]
+    #[skuld::test]
+    fn lockdown_pending_releases_and_reengages_on_app_ids_drift() {
+        // Same shape as `..._on_resolver_drift`, but drifts `app_ids`
+        // instead: attempt 1 and attempt 2 use DIFFERENT plugin binaries
+        // while `server_ip` and `resolver_permit` both stay unchanged.
+        // Neither plugin name is in the v2ray ECH family
+        // (`takes_ech_directives`), so `effective_ech_doh` stays `None` and
+        // `ech_resolver_permit` is `None` in both attempts -- isolating
+        // `app_ids` as the ONLY thing that drifts. Reusing the held guard
+        // verbatim (Windows' `FWP_E_ALREADY_EXISTS` swallow means a naive
+        // re-add would never update it) would leave the OLD plugin's
+        // unrestricted-egress App-ID permit live while the new plugin never
+        // gets one.
+        rt().block_on(async {
+            let probe_l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let closed = probe_l.local_addr().unwrap();
+            drop(probe_l);
+            let querier = Arc::new(CountingQuerier {
+                host: "proxy.example".into(),
+                ip: closed.ip(),
+                queries: AtomicU32::new(0),
+            });
+            let dir = tempfile::tempdir().unwrap();
+            let routing = MockRouting::new(dir.path().to_path_buf());
+            let st = routing.state();
+            let (mut pm, _dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, true);
+            pm.set_bootstrap_querier_for_test(querier);
+            let mut cfg = test_config();
+            cfg.server.server = "proxy.example".into();
+            cfg.server.server_port = closed.port();
+            cfg.server.plugin = Some("not-a-real-v2ray-plugin-a".into()); // attempt 1
+            cfg.dns.enabled = true; // forces attempt 1 to fail via the self-test gate
+            cfg.dns.servers = vec!["1.0.0.1".parse().unwrap()];
+
+            let err1 = pm
+                .start_cancellable(&cfg, true, CancellationToken::new())
+                .await
+                .unwrap_err();
+            assert!(
+                !matches!(err1, ProxyError::Cancelled),
+                "sanity: attempt 1 must fail via the self-test gate, not cancel, got {err1:?}"
+            );
+            assert!(
+                pm.lockdown_active(),
+                "sanity: attempt 1's failure must retain the Phase-0 guard"
+            );
+            assert_eq!(st.lockdown_permits_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                *st.last_lockdown_permits_resolver_ip.lock().unwrap(),
+                None,
+                "sanity: neither plugin name takes ECH directives, so nothing is resolver-permitted"
+            );
+
+            cfg.server.plugin = Some("not-a-real-v2ray-plugin-b".into()); // attempt 2: DIFFERENT plugin
+            let _ = pm.start_cancellable(&cfg, true, CancellationToken::new()).await;
+            assert_eq!(
+                st.lockdown_permits_calls.load(Ordering::SeqCst),
+                2,
+                "app_ids drift ALONE (server_ip and resolver_permit both unchanged) must still \
+                 release the stale guard and re-engage fresh"
+            );
+            assert_eq!(
+                st.lockdown_disengage_calls.load(Ordering::SeqCst),
+                1,
+                "releasing the stale guard must actually disengage it"
             );
         });
     }

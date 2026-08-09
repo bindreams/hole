@@ -635,24 +635,42 @@ a connect must not open the host or tear down a cover that might be
 protecting a pre-existing adopted session. `stop_with` disengages or disarms
 it exactly like `blocked` when a covered start left it engaged but never
 reached `running`. On success, `start_cancellable` moves the guard from
-`lockdown_pending` into `RunningState.lockdown`. A retry whose server or
-resolver permit DRIFTS from what `lockdown_pending` already holds releases
-(disengages) the stale guard before re-engaging fresh — mirroring the
-transient cover's stale-permit repair, but without a restore-previous
-fallback (`install_lockdown_permits` is fail-FATAL, so a failed re-engage
-just aborts the start with the host open — the same disclosed
-release-then-reengage residual class as the transient cover's own). The
-re-engage stores the RELEASED guard's own `pin` (captured before the
-`take()`), not this attempt's locally `revalidate`d one: `revalidate` only
-ever downgrades (`Answered` → `ResolverDeselected`), so persisting the
-downgraded local value would make that loss permanent even once the
-original resolver returns to `dns.servers`. On Windows, `engage_lockdown_tun`
-(Phase 6) deletes its two TUN-LUID filters by GUID before re-adding them,
-for the identical reason `recover_lockdown`'s Adopt path deletes the
-volatile GUIDs: `ok_or_exists` treats an already-present fixed-GUID filter as
-satisfied WITHOUT updating its condition, so a bare re-add after a
-failed/cancelled attempt's TUN teardown (which mints a new LUID) would
-silently keep the OLD, now-dead LUID's permit live.
+`lockdown_pending` into `RunningState.lockdown`. A retry whose server,
+resolver permit, or `app_ids` (`lockdown_app_ids(config)`, baked into the
+live cover as Windows App-ID permits) DRIFTS from what `lockdown_pending`
+already holds releases (disengages) the stale guard before re-engaging fresh
+— mirroring the transient cover's stale-permit repair, but without a
+restore-previous fallback (`install_lockdown_permits` is fail-FATAL, so a
+failed re-engage just aborts the start with the host open — the same
+disclosed release-then-reengage residual class as the transient cover's
+own). `app_ids` is compared alongside `server_ip`/`resolver_permit` because
+it drifts independently of both: a retry that only changes
+`config.server.plugin` (e.g. switching plugin binaries) leaves the other two
+unchanged, and reusing the held guard in that case would leave the OLD
+plugin's unrestricted-egress App-ID permit (no address/port scoping) live
+while the new plugin never gets one. The re-engage stores the RELEASED
+guard's own `pin` (captured before the `take()`), not this attempt's locally
+`revalidate`d one: `revalidate` only ever downgrades (`Answered` →
+`ResolverDeselected`), so persisting the downgraded local value would make
+that loss permanent even once the original resolver returns to
+`dns.servers`.
+
+On Windows, `engage_lockdown_tun` (Phase 6) deletes its two TUN-LUID filters
+by GUID before re-adding them, for the identical reason `recover_lockdown`'s
+Adopt path deletes the volatile GUIDs: `add_filter`'s normal `ok_or_exists`
+path treats an already-present fixed-GUID filter as satisfied WITHOUT
+updating its condition, so a bare re-add after a failed/cancelled attempt's
+TUN teardown (which mints a new LUID) would silently keep the OLD, now-dead
+LUID's permit live. Both halves of the delete-then-add CHECK their return
+code instead of discarding it, unlike every other `FwpmFilterDeleteByKey0`
+call site in the file: the delete tolerates only `FWP_E_FILTER_NOT_FOUND`
+(`ok_or_not_found`) and propagates any other error, and the re-add is the
+STRICT variant of `add_filter` (`strict: true`), which treats
+`FWP_E_ALREADY_EXISTS` as a hard error instead of tolerating it. After a
+confirmed delete (or confirmed absence) in the SAME transaction,
+`ALREADY_EXISTS` on the following add is impossible unless the delete
+silently failed to take — exactly the failure this mechanism exists to
+surface, not swallow.
 
 Full mode completes both phases: Phase 0 here, Phase 6 (the TUN permit) in
 `start_inner`. SocksOnly's `start_inner` returns before Phase 6 ever runs —
@@ -673,13 +691,19 @@ fully-uncovered gap to close on a connect the user drove directly.
 `start_inner` as a parameter, the same pattern `ech_resolver_permit` already
 uses — `start_inner` does not independently re-read the persisted intent
 file, which has out-of-process writers (`hole bridge unlock`) that could
-otherwise flip it mid-attempt and desync the two phases. Whenever
-`lockdown_applies` is false for the current attempt (intent off, or a manual
-SocksOnly start), `start_cancellable` releases any held `lockdown_pending`
-BEFORE the transient-cover block below has a chance to engage — releasing it
-after (as an earlier revision of this mechanism did) would, on macOS, have
-the disengage's restore-to-original `pfctl -f -` wipe the transient ruleset
-that block had just installed, silently opening the host during the very
+otherwise flip it mid-attempt and desync the two phases.
+
+The Phase-0 guard's RELEASE, unlike its ENGAGE, is keyed on the persisted
+intent alone (`!lockdown_on`), not on whether THIS attempt applies — gating
+it on `lockdown_applies` would disengage an already-armed guard on every
+manual SocksOnly start while intent is still on (`lockdown_applies` is false
+there too, same as when intent is genuinely off), with no replacement cover
+to fall back to (the transient cover only engages when `covered`), silently
+failing the kill switch open while `lockdown_enabled()` keeps reading true.
+`start_cancellable` runs this release strictly before the transient-cover
+block has a chance to engage: releasing it after would, on macOS, have the
+disengage's restore-to-original `pfctl -f -` wipe the transient ruleset that
+block had just installed, silently opening the host during the very
 covered-start window the transient cover exists to protect.
 
 `hole bridge unlock` is the elevated escape hatch to disengage a standing cover

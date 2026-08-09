@@ -228,7 +228,7 @@ fn windows_lockdown_permits_resolver_blocks_other_egress() {
     );
     assert!(
         r.is_ok(),
-        "resolver-IP permit must beat block-all: {RESOLVER}={:?} -- PERMITTED ({PERMITTED}) was {} at the          same instant, so if it was reachable this is very unlikely to be a general network outage rather          than a real block; if it also failed, treat this as NETWORK/ENVIRONMENT, not the cover",
+        "resolver-IP permit must beat block-all: {RESOLVER}={:?} -- PERMITTED ({PERMITTED}) was {} at the same instant, so if it was reachable this is very unlikely to be a general network outage rather than a real block; if it also failed, treat this as NETWORK/ENVIRONMENT, not the cover",
         r.err().map(|e| e.kind()),
         if p.is_ok() { "reachable" } else { "ALSO unreachable" }
     );
@@ -308,7 +308,7 @@ fn windows_lockdown_permits_phase_0_then_phase_6_share_one_cover() {
     );
     assert!(
         r.is_ok(),
-        "resolver-IP permit must beat block-all: {RESOLVER}={:?} -- PERMITTED ({PERMITTED}) was {} at the          same instant, so if it was reachable this is very unlikely to be a general network outage rather          than a real block; if it also failed, treat this as NETWORK/ENVIRONMENT, not the cover",
+        "resolver-IP permit must beat block-all: {RESOLVER}={:?} -- PERMITTED ({PERMITTED}) was {} at the same instant, so if it was reachable this is very unlikely to be a general network outage rather than a real block; if it also failed, treat this as NETWORK/ENVIRONMENT, not the cover",
         r.err().map(|e| e.kind()),
         if p.is_ok() { "reachable" } else { "ALSO unreachable" }
     );
@@ -368,6 +368,102 @@ fn windows_lockdown_permits_phase_0_then_phase_6_share_one_cover() {
         rn.err().map(|e| e.kind()),
         rpo.err().map(|e| e.kind()),
     );
+}
+
+/// Proves `engage_lockdown_tun`'s delete-then-add ACTUALLY replaces a stale
+/// LUID's condition value, not just that a bare `add_filter` would silently
+/// report success while leaving it dead (the exact `FWP_E_ALREADY_EXISTS`
+/// swallow the delete-then-add exists to close). Traffic-based egress can't
+/// discriminate this: `LocalInterface` selects on a packet's real outbound
+/// interface, and there is no portable way to make a test connection
+/// actually egress via one fabricated LUID vs. another. So this reads the
+/// live filter's stored condition value directly via `FwpmFilterGetByKey0`
+/// -- the two LUIDs used are arbitrary (never a real adapter), which is fine
+/// here: only the STORED value under repeated engagement is under test, not
+/// packet classification.
+#[cfg(target_os = "windows")]
+#[skuld::test(labels = [TUN], serial = TUN)]
+fn windows_engage_lockdown_tun_retry_replaces_the_stale_luid_condition() {
+    let dir = tempfile::tempdir().unwrap();
+    let resolver = SystemLuidResolver;
+    let server_ip: std::net::IpAddr = "1.1.1.1".parse().unwrap();
+
+    // Phase 0: engage without a TUN permit -- owns the whole cover's
+    // disengage-on-drop, TUN filters included once added below.
+    let cover = engage_lockdown(server_ip, None, None, &resolver, &[], dir.path(), None)
+        .expect("engage the real WFP lockdown cover's Phase-0 permits");
+
+    let luid1: u64 = 0x1122_3344_5566_7788;
+    super::platform::engage_lockdown_tun(luid1).expect("first engage_lockdown_tun");
+    assert_eq!(
+        live_tun_v4_condition_luid(),
+        luid1,
+        "sanity: the filter's condition must carry the FIRST luid right after the first engage"
+    );
+
+    // A retry with a DIFFERENT luid -- e.g. the TUN adapter was torn down
+    // and re-created between attempts, which mints a new LUID (this
+    // module's own doc: "a teardown mints a new one"). The delete-then-add
+    // must REPLACE the stored condition, not silently keep the stale one:
+    // a bare `add_filter` alone would hit `FWP_E_ALREADY_EXISTS` on the
+    // already-present fixed GUID and report success without updating it.
+    let luid2: u64 = 0x8877_6655_4433_2211;
+    super::platform::engage_lockdown_tun(luid2).expect("second engage_lockdown_tun");
+    assert_eq!(
+        live_tun_v4_condition_luid(),
+        luid2,
+        "a retry with a DIFFERENT luid must replace the live filter's condition -- finding \
+         the FIRST (now-stale) luid still there would mean the delete silently failed to \
+         take and the add's FWP_E_ALREADY_EXISTS was swallowed"
+    );
+
+    drop(cover);
+}
+
+/// Read the live TUN-V4 lockdown filter's `LocalInterface` condition value
+/// directly via `FwpmFilterGetByKey0` -- panics (not a soft `Result`) on any
+/// FFI failure, since every failure here means the test itself cannot
+/// establish ground truth, not that the cover is broken.
+#[cfg(target_os = "windows")]
+fn live_tun_v4_condition_luid() -> u64 {
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::NetworkManagement::WindowsFilteringPlatform::{
+        FwpmEngineClose0, FwpmEngineOpen0, FwpmFilterGetByKey0, FwpmFreeMemory0, FWPM_FILTER0,
+    };
+    use windows::Win32::System::Rpc::RPC_C_AUTHN_WINNT;
+
+    #[allow(clippy::disallowed_methods)] // read-only FWPM query, test-only
+    unsafe {
+        let mut engine = HANDLE::default();
+        let rc = FwpmEngineOpen0(PCWSTR::null(), RPC_C_AUTHN_WINNT, None, None, &mut engine);
+        assert_eq!(rc, 0, "FwpmEngineOpen0 failed: 0x{rc:08x}");
+
+        let mut filter: *mut FWPM_FILTER0 = std::ptr::null_mut();
+        let rc = FwpmFilterGetByKey0(engine, &super::platform::LOCKDOWN_FILTER_GUIDS[2], &mut filter);
+        assert_eq!(rc, 0, "FwpmFilterGetByKey0 failed: 0x{rc:08x}");
+        assert!(
+            !filter.is_null(),
+            "FwpmFilterGetByKey0 returned success with a null filter"
+        );
+
+        let f = &*filter;
+        assert_eq!(
+            f.numFilterConditions, 1,
+            "expected exactly one condition on the TUN-V4 lockdown filter"
+        );
+        let cond = &*f.filterCondition;
+        let luid_ptr = cond.conditionValue.Anonymous.uint64;
+        assert!(
+            !luid_ptr.is_null(),
+            "LocalInterface condition carried a null uint64 pointer"
+        );
+        let value = *luid_ptr;
+
+        FwpmFreeMemory0(&mut (filter as *mut core::ffi::c_void));
+        let _ = FwpmEngineClose0(engine);
+        value
+    }
 }
 
 /// macOS real-engage verification. Engages the REAL pf lockdown cover (an
@@ -517,7 +613,7 @@ fn macos_lockdown_permits_resolver_blocks_other_egress() {
     );
     assert!(
         r.is_ok(),
-        "resolver-IP permit must beat block-all: {RESOLVER}={:?} -- PERMITTED ({PERMITTED}) was {} at the          same instant, so if it was reachable this is very unlikely to be a general network outage rather          than a real block; if it also failed, treat this as NETWORK/ENVIRONMENT, not the cover",
+        "resolver-IP permit must beat block-all: {RESOLVER}={:?} -- PERMITTED ({PERMITTED}) was {} at the same instant, so if it was reachable this is very unlikely to be a general network outage rather than a real block; if it also failed, treat this as NETWORK/ENVIRONMENT, not the cover",
         r.err().map(|e| e.kind()),
         if p.is_ok() { "reachable" } else { "ALSO unreachable" }
     );
@@ -604,7 +700,7 @@ fn macos_lockdown_permits_phase_0_then_phase_6_share_one_cover() {
     );
     assert!(
         r.is_ok(),
-        "resolver-IP permit must beat block-all: {RESOLVER}={:?} -- PERMITTED ({PERMITTED}) was {} at the          same instant, so if it was reachable this is very unlikely to be a general network outage rather          than a real block; if it also failed, treat this as NETWORK/ENVIRONMENT, not the cover",
+        "resolver-IP permit must beat block-all: {RESOLVER}={:?} -- PERMITTED ({PERMITTED}) was {} at the same instant, so if it was reachable this is very unlikely to be a general network outage rather than a real block; if it also failed, treat this as NETWORK/ENVIRONMENT, not the cover",
         r.err().map(|e| e.kind()),
         if p.is_ok() { "reachable" } else { "ALSO unreachable" }
     );
@@ -762,7 +858,7 @@ fn windows_failclosed_permits_resolver_blocks_other_egress() {
     );
     assert!(
         r.is_ok(),
-        "resolver-IP permit must beat block-all: {RESOLVER}={:?} -- PERMITTED ({PERMITTED}) was {} at the          same instant, so if it was reachable this is very unlikely to be a general network outage rather          than a real block; if it also failed, treat this as NETWORK/ENVIRONMENT, not the cover",
+        "resolver-IP permit must beat block-all: {RESOLVER}={:?} -- PERMITTED ({PERMITTED}) was {} at the same instant, so if it was reachable this is very unlikely to be a general network outage rather than a real block; if it also failed, treat this as NETWORK/ENVIRONMENT, not the cover",
         r.err().map(|e| e.kind()),
         if p.is_ok() { "reachable" } else { "ALSO unreachable" }
     );
@@ -896,7 +992,7 @@ fn macos_failclosed_permits_resolver_blocks_other_egress() {
     );
     assert!(
         r.is_ok(),
-        "resolver-IP permit must beat block-all: {RESOLVER}={:?} -- PERMITTED ({PERMITTED}) was {} at the          same instant, so if it was reachable this is very unlikely to be a general network outage rather          than a real block; if it also failed, treat this as NETWORK/ENVIRONMENT, not the cover",
+        "resolver-IP permit must beat block-all: {RESOLVER}={:?} -- PERMITTED ({PERMITTED}) was {} at the same instant, so if it was reachable this is very unlikely to be a general network outage rather than a real block; if it also failed, treat this as NETWORK/ENVIRONMENT, not the cover",
         r.err().map(|e| e.kind()),
         if p.is_ok() { "reachable" } else { "ALSO unreachable" }
     );

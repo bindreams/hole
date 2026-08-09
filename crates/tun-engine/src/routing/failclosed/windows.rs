@@ -570,6 +570,27 @@ fn ok_or_exists(code: u32, what: &str) -> Result<(), RoutingError> {
     wfp_check(code, what)
 }
 
+/// `FWP_E_FILTER_NOT_FOUND` as the Win32 DWORD `FwpmFilterDeleteByKey0`
+/// returns for a delete of a GUID with no matching filter (the `windows`
+/// crate exposes it only as an `HRESULT`, like `FWP_E_ALREADY_EXISTS_DWORD`
+/// above).
+const FWP_E_FILTER_NOT_FOUND_DWORD: u32 = 0x8032_0003;
+
+/// As [`wfp_check`], but a missing-object delete (`FWP_E_FILTER_NOT_FOUND`)
+/// is also OK — deleting a GUID that was never added, or was already
+/// removed, is idempotent, not an error. Any OTHER code (e.g. an RPC/engine
+/// error) is propagated: silently discarding it, as every other
+/// `FwpmFilterDeleteByKey0` call site in this file still does, is the exact
+/// residual `ok_or_exists`'s own doc discloses for the repair path — a real
+/// delete failure would let a following re-add's `FWP_E_ALREADY_EXISTS` look
+/// like idempotent success while the OLD filter value is still live.
+fn ok_or_not_found(code: u32, what: &str) -> Result<(), RoutingError> {
+    if code == FWP_E_FILTER_NOT_FOUND_DWORD {
+        return Ok(());
+    }
+    wfp_check(code, what)
+}
+
 #[allow(clippy::disallowed_methods)] // THIS is the sanctioned FWPM call site
 pub fn engage(
     server_ip: IpAddr,
@@ -596,7 +617,7 @@ pub fn engage(
             add_provider(engine, spec.provider)?;
             add_sublayer(engine, spec.sublayer, spec.provider)?;
             for f in &spec.filters {
-                add_filter(engine, spec.provider, spec.sublayer, f)?;
+                add_filter(engine, spec.provider, spec.sublayer, f, false)?;
             }
             wfp_check(FwpmTransactionCommit0(engine), "FwpmTransactionCommit0")?;
             Ok(())
@@ -640,7 +661,7 @@ pub fn engage_lockdown(
             add_provider(engine, spec.provider)?;
             add_sublayer(engine, spec.sublayer, spec.provider)?;
             for f in &spec.filters {
-                add_filter(engine, spec.provider, spec.sublayer, f)?;
+                add_filter(engine, spec.provider, spec.sublayer, f, false)?;
             }
             wfp_check(FwpmTransactionCommit0(engine), "FwpmTransactionCommit0")?;
             Ok(())
@@ -696,15 +717,23 @@ pub fn engage_lockdown_tun(tun_luid: u64) -> Result<(), RoutingError> {
             // alone routes through `ok_or_exists`, which treats an
             // already-present filter as satisfied WITHOUT updating its
             // condition, silently keeping the OLD (now-dead) luid live.
-            // Deleting first (idempotent -- a "not found" delete is ignored)
-            // guarantees the add always takes effect with the CURRENT luid,
-            // mirroring the Adopt path's own delete-then-re-add for this
-            // exact class of volatile permit (`adopt_delete_guids`).
+            // Deleting first, mirroring the Adopt path's own delete-then-add
+            // for this exact class of volatile permit (`adopt_delete_guids`),
+            // makes the add always take effect with the CURRENT luid --
+            // PROVIDED the delete actually removed the old filter, which is
+            // why both halves check their return code instead of discarding
+            // it: `ok_or_not_found` fails loud on any delete error other than
+            // "wasn't there", and the re-add below is the STRICT variant
+            // (`add_filter(..., strict: true)`), which fails loud on
+            // `FWP_E_ALREADY_EXISTS` instead of tolerating it -- after a
+            // confirmed delete/absence in the SAME transaction, that code is
+            // impossible unless the delete silently failed to take, which
+            // must not be reported as success.
             for f in &filters {
-                let _ = FwpmFilterDeleteByKey0(engine, &f.guid);
+                ok_or_not_found(FwpmFilterDeleteByKey0(engine, &f.guid), "FwpmFilterDeleteByKey0")?;
             }
             for f in &filters {
-                add_filter(engine, PROVIDER_GUID, SUBLAYER_GUID, f)?;
+                add_filter(engine, PROVIDER_GUID, SUBLAYER_GUID, f, true)?;
             }
             wfp_check(FwpmTransactionCommit0(engine), "FwpmTransactionCommit0")?;
             Ok(())
@@ -786,7 +815,20 @@ unsafe fn get_app_id_blob(path: &Path) -> Result<AppIdBlob, RoutingError> {
 }
 
 #[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
-unsafe fn add_filter(engine: HANDLE, provider: GUID, sublayer: GUID, f: &FilterSpec) -> Result<(), RoutingError> {
+/// Add one filter. `strict`: `false` tolerates `FWP_E_ALREADY_EXISTS`
+/// (re-engaging over an unswept cover with a fixed-GUID filter already
+/// present is idempotent); `true` treats it as a HARD error instead — for a
+/// call site that just confirmed-deleted (or confirmed-absent, via
+/// [`ok_or_not_found`]) the SAME guid in the SAME transaction, so
+/// `ALREADY_EXISTS` is impossible by construction and seeing it anyway means
+/// the delete silently failed to take (see `engage_lockdown_tun`).
+unsafe fn add_filter(
+    engine: HANDLE,
+    provider: GUID,
+    sublayer: GUID,
+    f: &FilterSpec,
+    strict: bool,
+) -> Result<(), RoutingError> {
     let layer = match f.layer {
         Layer::ConnectV4 => FWPM_LAYER_ALE_AUTH_CONNECT_V4,
         Layer::ConnectV6 => FWPM_LAYER_ALE_AUTH_CONNECT_V6,
@@ -1008,7 +1050,12 @@ unsafe fn add_filter(engine: HANDLE, provider: GUID, sublayer: GUID, f: &FilterS
         },
         ..Default::default()
     };
-    ok_or_exists(FwpmFilterAdd0(engine, &filter, None, None), "FwpmFilterAdd0")
+    let code = FwpmFilterAdd0(engine, &filter, None, None);
+    if strict {
+        wfp_check(code, "FwpmFilterAdd0")
+    } else {
+        ok_or_exists(code, "FwpmFilterAdd0")
+    }
 }
 
 impl Drop for Cover {
