@@ -239,6 +239,15 @@ pub struct ProxyManager<P: Proxy = ShadowsocksProxy, R: Routing = SystemRouting,
     /// derivation is otherwise observable only through the plugin it spawns.
     #[cfg(test)]
     last_ech_doh: Option<String>,
+    /// Test-only plugin-binary path override. Set by
+    /// `set_plugin_path_override_for_test`; when present, `start_inner`
+    /// spawns this exact path instead of `resolve_plugin_path`'s
+    /// next-to-exe/PATH lookup — lets a test point at a real, disposable
+    /// plugin binary (e.g. staged into its own private tempdir) without
+    /// mutating any process-global state (no shared destination file, no
+    /// env var).
+    #[cfg(test)]
+    plugin_path_override: Option<String>,
 }
 
 /// A held block-until-connected cover plus the server identity it permits.
@@ -294,6 +303,8 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
             bootstrap_querier: None,
             #[cfg(test)]
             last_ech_doh: None,
+            #[cfg(test)]
+            plugin_path_override: None,
         }
     }
 
@@ -303,6 +314,16 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
     #[cfg(test)]
     pub fn set_bootstrap_querier_for_test(&mut self, q: std::sync::Arc<dyn crate::dns::bootstrap::DohQuerier>) {
         self.bootstrap_querier = Some(q);
+    }
+
+    /// Test seam: spawn this exact path instead of resolving the plugin
+    /// binary via `resolve_plugin_path`. Lets a test drive a REAL plugin
+    /// chain (the plugin subprocess isn't behind a `Proxy`/`Routing`/`Dns`
+    /// trait seam) against a binary the test stages itself, with no shared
+    /// destination path and no process-global mutation.
+    #[cfg(test)]
+    pub fn set_plugin_path_override_for_test(&mut self, path: String) {
+        self.plugin_path_override = Some(path);
     }
 
     /// Set the state directory for plugin PID crash recovery.
@@ -554,6 +575,11 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         let bootstrap_querier = self.bootstrap_querier.clone();
         #[cfg(not(test))]
         let bootstrap_querier: Option<std::sync::Arc<dyn crate::dns::bootstrap::DohQuerier>> = None;
+
+        #[cfg(test)]
+        let plugin_path_override = self.plugin_path_override.clone();
+        #[cfg(not(test))]
+        let plugin_path_override: Option<String> = None;
 
         // A DIFFERENT server's hostname needs a FRESH DoH resolution — not
         // guaranteed to land on the resolver already baked into the held cover
@@ -866,6 +892,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
             blocking_engaged,
             self.state_dir.as_deref(),
             self.state_owner,
+            plugin_path_override,
             cancel,
         )
         .await;
@@ -1002,6 +1029,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         blocking_engaged: bool,
         state_dir: Option<&std::path::Path>,
         owner: Option<(u32, u32)>,
+        plugin_path_override: Option<String>,
         cancel: CancellationToken,
     ) -> Result<RunningState<P, R, D>, ProxyError> {
         debug!("start_inner entered");
@@ -1026,7 +1054,8 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         // `start_plugin_chain` threads `cancel` through to its readiness
         // wait + bind_ephemeral retries.
         let plugin_chain = if let Some(ref plugin_name) = config.server.plugin {
-            let plugin_path = crate::proxy::config::resolve_plugin_path(plugin_name);
+            let plugin_path =
+                plugin_path_override.unwrap_or_else(|| crate::proxy::config::resolve_plugin_path(plugin_name));
             let chain = crate::proxy::plugin::start_plugin_chain(
                 plugin_name,
                 &plugin_path,

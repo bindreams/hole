@@ -10,7 +10,7 @@ use hole_common::protocol::ProxyConfig;
 use plugin_e2e::locators::locate_ex_ray;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -1168,76 +1168,58 @@ fn lockdown_on_engages_with_no_resolver_permit_when_no_plugin_configured() {
 }
 
 /// Stage a copy of the real `ex-ray` binary (built by `cargo xtask ex-ray`)
-/// into `dir` and prepend `dir` to THIS PROCESS's `PATH`, so
-/// `resolve_plugin_path`'s bare-name PATH fallback finds it — `ProxyManager`
-/// has no plugin-path-override hook (unlike `server_test_tests.rs`'s
-/// lower-level SS-server harness), and the plugin subprocess isn't behind a
-/// `Proxy`/`Routing`/`Dns` trait seam — it's real code on every start — so
-/// reaching `install_lockdown` with a real plugin chain needs a real,
-/// spawnable binary somewhere `ProxyManager` will actually look. Panics
-/// loud, never skips, matching
+/// into a fresh, test-private tempdir and return the exact spawn path.
+/// Panics loud, never skips, matching
 /// `server_test_tests.rs::run_test_with_v2ray_plugin_happy_path`'s contract
-/// for a missing build.
-///
-/// `dir` must be a fresh, test-private directory (e.g. a `tempfile::tempdir`
-/// no other test shares) and the `PATH` mutation is process-global —
-/// deliberately: nextest runs every test in its OWN process, so this can
-/// never race a sibling test's copy of the same file the way a SHARED
-/// destination (e.g. next to the test binary's own `current_exe()`, which
-/// every test in this binary shares) would. See `dist_fixture.rs`'s doc for
-/// the cross-process race this sidesteps by construction rather than by
-/// locking.
-///
-/// # Safety
-/// `set_var` is sound here only because nothing else in this process reads
-/// or writes the environment concurrently: this runs at the very start of a
-/// single-threaded test body, before anything is spawned.
-fn stage_real_ex_ray_on_path(dir: &Path) {
+/// for a missing build. Callers pass the result to
+/// `ProxyManager::set_plugin_path_override_for_test` -- no shared destination
+/// path, no process-global mutation (`resolve_plugin_path`'s next-to-exe/PATH
+/// lookup is never consulted).
+fn stage_real_ex_ray() -> (tempfile::TempDir, String) {
     let ex_ray = locate_ex_ray();
     assert!(
         ex_ray.is_file(),
-        "ex-ray not built at {ex_ray:?} — run `cargo xtask ex-ray` before running this test"
+        "ex-ray not built at {ex_ray:?} -- run `cargo xtask ex-ray` before running this test"
     );
-    let dest = dir.join(if cfg!(windows) { "ex-ray.exe" } else { "ex-ray" });
+    let dir = tempfile::tempdir().unwrap();
+    let dest = dir.path().join(if cfg!(windows) { "ex-ray.exe" } else { "ex-ray" });
     std::fs::copy(&ex_ray, &dest).expect("copy ex-ray into the test's own private directory");
-
-    let mut paths = vec![dir.to_path_buf()];
-    if let Some(existing) = std::env::var_os("PATH") {
-        paths.extend(std::env::split_paths(&existing));
-    }
-    let new_path = std::env::join_paths(paths).expect("join PATH entries");
-    // SAFETY: see the fn doc — single-threaded, pre-spawn, this process only.
-    unsafe { std::env::set_var("PATH", new_path) };
+    let path = dest.to_string_lossy().into_owned();
+    (dir, path)
 }
 
 #[skuld::test]
 fn lockdown_on_permits_the_gated_ech_resolver_for_a_real_plugin_chain() {
-    // THE #753 REGRESSION TEST: a lockdown-armed start with an ECH-capable
-    // plugin chain must permit the resolver ex-ray's ECH-config fetch dials —
-    // the standing cover, not just the transient one. Exercises the REAL
-    // plugin chain end to end (`start_plugin_chain` isn't behind a trait
-    // seam), so this proves the value genuinely reaches `install_lockdown`,
-    // not just the isolated `MockRouting` contract
-    // (`mock_install_lockdown_records_the_resolver_permit` proves that half).
+    // Proves the WIRING: when `install_lockdown` (Phase 6) DOES run, it
+    // carries the correctly-gated resolver -- the standing cover, not just
+    // the transient one. Exercises the REAL plugin chain end to end
+    // (`start_plugin_chain` isn't behind a trait seam), so this proves the
+    // value genuinely reaches `install_lockdown`, not just the isolated
+    // `MockRouting` contract (`mock_install_lockdown_records_the_resolver_permit`
+    // proves that half).
+    //
+    // NOT a full regression test for #753: `dns.enabled = false` below
+    // skips the forwarder self-test (Phase 4) so the start reaches Phase 6
+    // at all under `MockProxy`. `lockdown_on_never_reaches_phase_6_when_the_self_test_fails`
+    // demonstrates the gap this leaves -- Phase 4 is where ex-ray's lazy
+    // ECH-config fetch actually fires (it dials through the plugin chain on
+    // its first real connection), strictly BEFORE this permit is installed.
     rt().block_on(async {
-        let plugin_dir = tempfile::tempdir().unwrap();
-        stage_real_ex_ray_on_path(plugin_dir.path());
+        let (_plugin_dir, plugin_path) = stage_real_ex_ray();
 
         let resolver: IpAddr = "198.51.100.5".parse().unwrap();
         let dir = tempfile::tempdir().unwrap();
         let routing = MockRouting::new(dir.path().to_path_buf());
         let st = routing.state();
         let (mut pm, _dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, true);
+        pm.set_plugin_path_override_for_test(plugin_path);
         let mut cfg = test_config();
         // Literal IP: no bootstrap query needed (`PinSource::NoQueryNeeded`),
-        // so this test doesn't need a mock DoH querier — `ech_doh_url` still
+        // so this test doesn't need a mock DoH querier -- `ech_doh_url` still
         // constructs a real IP-literal URL from `dns.servers`.
         cfg.server.server = "203.0.113.9".into();
         cfg.server.plugin = Some("ex-ray".into());
         cfg.server.plugin_opts = Some(ECH_CAPABLE_OPTS.into());
-        // dns.enabled = false skips the forwarder self-test (Phase 4, which
-        // MockProxy can't satisfy — see `test_config`'s doc) so the start
-        // reaches Phase 6 (routing.install / install_lockdown) and succeeds.
         cfg.dns.enabled = false;
         cfg.dns.servers = vec![resolver];
 
@@ -1254,18 +1236,18 @@ fn lockdown_on_omits_the_resolver_permit_for_a_non_ech_capable_plugin() {
     // reaches ECH, so the reachability gate must keep the lockdown permit at
     // `None` even though a plugin is genuinely running under the cover.
     rt().block_on(async {
-        let plugin_dir = tempfile::tempdir().unwrap();
-        stage_real_ex_ray_on_path(plugin_dir.path());
+        let (_plugin_dir, plugin_path) = stage_real_ex_ray();
 
         let resolver: IpAddr = "198.51.100.5".parse().unwrap();
         let dir = tempfile::tempdir().unwrap();
         let routing = MockRouting::new(dir.path().to_path_buf());
         let st = routing.state();
         let (mut pm, _dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, true);
+        pm.set_plugin_path_override_for_test(plugin_path);
         let mut cfg = test_config();
         cfg.server.server = "203.0.113.9".into();
         cfg.server.plugin = Some("ex-ray".into());
-        cfg.server.plugin_opts = None; // no tls, no host — never reaches ECH
+        cfg.server.plugin_opts = None; // no tls, no host -- never reaches ECH
         cfg.dns.enabled = false;
         cfg.dns.servers = vec![resolver];
 
@@ -1275,6 +1257,61 @@ fn lockdown_on_omits_the_resolver_permit_for_a_non_ech_capable_plugin() {
             *st.last_lockdown_resolver_ip.lock().unwrap(),
             None,
             "a non-ECH-capable plugin config must not widen the lockdown cover"
+        );
+    });
+}
+
+#[skuld::test]
+fn lockdown_on_never_reaches_phase_6_when_the_self_test_fails() {
+    // DOCUMENTS A GAP, NOT YET FIXED (see the deputy report for #753): the
+    // standing lockdown cover's resolver permit is installed at Phase 6
+    // (`routing.install` / `install_lockdown`), but ex-ray's lazy ECH-config
+    // fetch fires on the plugin chain's FIRST REAL DIAL -- which, whenever
+    // `dns.enabled` (the default), is the Phase 4 forwarder self-test, run
+    // strictly BEFORE Phase 6. A self-test failure aborts `start_inner`
+    // before Phase 6 ever runs, so a covered start that needs the resolver
+    // permit to make that VERY dial succeed can never reach the code that
+    // installs it. This test proves the ordering half of that claim
+    // (`lockdown_engage_calls` stays at zero on a self-test failure); it
+    // cannot prove the OS-level "fetch actually gets blocked" half without a
+    // real, privileged WFP/pf cover (see `lockdown_privileged_tests.rs`).
+    rt().block_on(async {
+        let (_plugin_dir, plugin_path) = stage_real_ex_ray();
+
+        let dir = tempfile::tempdir().unwrap();
+        let routing = MockRouting::new(dir.path().to_path_buf());
+        let st = routing.state();
+        let (mut pm, _dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, true);
+        pm.set_plugin_path_override_for_test(plugin_path);
+        let mut cfg = test_config();
+        cfg.server.server = "203.0.113.9".into();
+        cfg.server.plugin = Some("ex-ray".into());
+        cfg.server.plugin_opts = Some(ECH_CAPABLE_OPTS.into());
+        // dns.enabled = true (the default) arms the Phase 4 forwarder
+        // self-test, which MockProxy cannot satisfy (no real SOCKS5 server
+        // behind it) -- so it fails deterministically, same as a genuinely
+        // blocked/unreachable ECH-config fetch would under `ech=always`
+        // (crates/ex-ray/third_party/v2ray-core/transport/internet/tls/config.go's
+        // `RequireEchSatisfied`: an unobtainable ECH config makes the dial
+        // itself fail, not just disable ECH).
+        cfg.dns.enabled = true;
+        cfg.dns.servers = vec!["198.51.100.5".parse().unwrap()];
+
+        let err = pm.start(&cfg).await.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ProxyError::ForwarderSelfTestFailed { .. }
+                    | ProxyError::TunnelSilent { .. }
+                    | ProxyError::NoTunnelConnection { .. }
+            ),
+            "expected some Phase 4 self-test failure classification, got {err:?}"
+        );
+        assert_eq!(
+            st.lockdown_engage_calls.load(Ordering::SeqCst),
+            0,
+            "Phase 6 (install_lockdown, where the resolver permit is installed) must never run \
+             when Phase 4 fails first -- the permit this PR adds cannot protect the dial that needed it"
         );
     });
 }

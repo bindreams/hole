@@ -132,8 +132,9 @@ pub fn engage_lockdown(
 
 /// Act on a [`CoverRecovery`] decision for the standing lockdown cover at
 /// startup. Dispatches to the platform reconciler: `Adopt` keeps the host
-/// fail-closed, refreshing the volatile TUN + server permits; `Sweep` fully
-/// disengages; `Noop` does nothing. cfg-free for `routing::recover_routes`.
+/// fail-closed, refreshing the volatile TUN + server + resolver permits;
+/// `Sweep` fully disengages; `Noop` does nothing. cfg-free for
+/// `routing::recover_routes`.
 /// Best-effort: a `Sweep` that cannot disengage is logged, not propagated —
 /// startup recovery has no caller to act on it.
 pub fn recover_lockdown(decision: crate::routing::CoverRecovery, state_dir: &Path) {
