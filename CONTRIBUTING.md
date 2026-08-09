@@ -506,53 +506,25 @@ happen. `crate::proxy::plugin::ech_fetch_is_reachable` and its helper
 even attempt an ECH-config fetch, reading `plugin_opts` the way ex-ray's own
 SIP003 parser does (`ex_ray_flag_value`: a bare key is ex-ray's `"1"`, not
 `garter`'s `""`) and mirroring every `plugin_opts`-reachable config-build
-error ex-ray's `main.go`/`options.go`/`config.go` treats as `os.Exit(23)`.
+error ex-ray's `main.go`/`options.go`/`config.go` treats as `os.Exit(23)` —
+closed enums (`ech`, `mode`), numeric ranges (`mux`, `fwmark`,
+`tcp-keepalive`), port/address validity (`localPort`, `localAddr`,
+`remotePort`, `remoteAddr`), presence-only flags requiring an exact `"1"`
+(`tls`, `server`, `fastOpen`, `__android_vpn`), non-empty-required strings
+(`host`, `path`), a well-formed `https://` `ech-doh`, `ech=always`'s TLS and
+resolved-`ech-doh` requirements, and `cert`/`certRaw`/`key` requiring TLS.
+`ex_ray_fatal_config_error`'s own doc comment is the single source of truth
+for the full per-key rule set and ex-ray's real evaluation order (checked
+there, not duplicated here) — each numeric/enum literal it hardcodes is
+pinned by an `include_str!`-based test against the vendored source
+(`ech_and_mode_enums_match_vendored_config_go`), on the COMPARISON itself
+(e.g. `uint32Opt`'s `v <= math.MaxUint32`) where possible, not the error
+message text — a message is free to change for reasons unrelated to the
+bound it protects, and a message-text pin has already gone stale that way
+once.
 
-[#752](https://github.com/bindreams/hole/pull/752) rewrote the
-option-parsing step (`parseOptsIntoFlags`, `options.go`) to fail loud on a
-present-but-malformed value across the board, where several of these used
-to warn and keep the flag's default or apply nothing:
-
-- `mux`/`fwmark`/`tcp-keepalive` (`parseIntOption`): a present value
-  `strconv.Atoi` can't parse — non-numeric, or explicitly empty — is now
-  fatal (an operator's own unparseable `mux=` must not silently outrank
-  galoshes' appended `mux=0` and leave Mux.Cool on). A value that parses is
-  then range-checked as before: `tcp-keepalive` against `0..=32767`,
-  `mux`/`fwmark` against `uint32Opt`'s `0..=u32::MAX`.
-- `tls`/`server`/`fastOpen`/`__android_vpn` (`parseBoolOption`): a present
-  value other than `"1"` is now fatal — these used to be presence-only, any
-  value.
-- `host`/`path` (`parseStringOption`, `emptyOK=false`): a present but
-  EXPLICITLY EMPTY value is now fatal. This retires the old empty-`host=`
-  SNI fallback below.
-- `localAddr`/`localPort`/`remoteAddr`/`remotePort` are validated by
-  `main.go`/`generateConfig`, largely unchanged by #752 except that
-  `remotePort` now routes through the SAME `validPort`/`net.PortFromString`
-  as `localPort` (previously a bare `strconv.ParseUint` with no `65535`
-  ceiling and no `0` rejection): `localPort`/`remotePort` must be an
-  unsigned base-10 literal `<=65535`, not `0` (Go's `ParseUint` rejects a
-  leading `+` that Rust's `u32::from_str` accepts — checked against both
-  toolchains directly); `localAddr` must be a single (`|`-free) IP literal;
-  `remoteAddr` must not normalize to an empty domain or the unspecified IP
-  (`0.0.0.0`/`::`).
-- `ech` (`parseEnumOption`) is now validated UNCONDITIONALLY, at parse time
-  — before #752 the enum switch lived only inside `buildTLSConfig` (`if *tlsEnabled`), so an invalid `ech` with no `tls` and no `mode=quic` was
-  inert, not fatal. `generateConfig` separately rejects `ech=always` with
-  TLS not enabled — also NEW, a case that used to silently apply nothing.
-- `ech-doh` (`parseURLOption`): empty stays a documented no-op ("disables
-  ECH"), but a present, non-empty value that isn't a well-formed `https://`
-  URL with a host is now fatal — checked only for the operator's own value,
-  when it isn't displaced by Hole's own (always well-formed by
-  construction).
-- `cert`/`certRaw`/`key` present (non-empty) with TLS not enabled is now
-  fatal too — before, the material was silently never read.
-- `mode` (closed enum, `generateConfig`, unconditional) and, later —
-  checked separately, once `generateConfig` has already succeeded, inside
-  `core.New` — the websocket transport's `mux` concurrency bound `1..=1024`,
-  are unchanged by #752.
-
-`loglevel` is deliberately NOT modeled, even though #752 made an explicitly
-empty or unrecognized value fatal there too:
+`loglevel` is deliberately NOT modeled as a fatal class, even though ex-ray
+itself rejects an explicitly empty or unrecognized value there too:
 `crate::proxy::plugin::inject_plugin_directives` always strips the
 operator's own `loglevel` and appends `loglevel=debug`, unconditionally,
 whatever Hole's own `ech-doh` decision is — no value from `plugin_opts`
@@ -560,51 +532,29 @@ ever reaches ex-ray unmodified, so modeling it would produce a false fatal
 for a config that starts fine in practice, the opposite of the over-permit
 risk this gate exists to close.
 
-Each vendored numeric/enum literal this mirrors is pinned by an
-`include_str!`-based test against the vendored source
-(`ech_and_mode_enums_match_vendored_config_go`) — on the COMPARISON itself
-(e.g. `uint32Opt`'s `v <= math.MaxUint32`) where possible, not the error
-message text: #752 dropped `uint32Opt`'s `, got: <value>` message suffix (to
-stop a `mux=abc\;certRaw=SECRET`-shaped escape from leaking a later
-segment's value through it) without touching the bound it protects, which a
-message-text pin would have gone stale for — and did, the first time this
-gate hit that exact drift. A future ex-ray bump that adds or renames a
-value, or changes one of these bounds, fails loudly here instead of
-silently drifting.
+**Disclosed, deliberately unmodeled:** `cert`/`certRaw`/`key`'s CONTENT (an
+operator-supplied file path or PEM blob actually being a readable,
+well-formed X509 pair) can fail config-build, but only by reading the
+filesystem — a check this otherwise pure, `plugin_opts`-only gate
+deliberately does not perform (only their presence without TLS enabled is
+checked). ex-ray's `server` plugin option cross-assigns
+`localAddr`/`localPort` with `remoteAddr`/`remotePort` to the opposite
+internal flag; Hole's bridge never spawns ex-ray as a server, so the gate
+checks those four address/port keys assuming client mode and skips the
+`mux`-concurrency check too whenever a `server` segment is present
+(`MultiplexingConfig` is client-mode only), rather than reporting a false
+fatal.
 
-**Disclosed, deliberately unmodeled:**
-
-- `cert`/`certRaw`/`key`'s CONTENT (an operator-supplied file path or PEM
-  blob actually being a readable, well-formed X509 pair,
-  `readCertificate`/`filesystem.ReadFile`/`gotls.X509KeyPair`) can fail
-  config-build, but only by reading the filesystem — a check this
-  otherwise pure, `plugin_opts`-only gate deliberately does not perform: the
-  same path could read successfully now and fail moments later at the real
-  spawn, or vice versa, so duplicating the read here would be stale, not
-  accurate. Only their PRESENCE without TLS enabled is checked (above).
-- ex-ray's `server` plugin option (settable via `plugin_opts`, like `tls`)
-  cross-assigns `localAddr`/`localPort` with `remoteAddr`/`remotePort` to
-  the opposite internal flag (`tcp-keepalive`'s range check runs
-  unconditionally regardless of `server`, so that one is unaffected) —
-  `ex_ray_fatal_config_error` does not account for the cross-assignment, so
-  the four address/port checks above are checked assuming client mode.
-  Hole's bridge never spawns ex-ray as a server; an operator who puts
-  `server` in their own `plugin_opts` already has a tunnel that will not
-  establish for a much more obvious reason (ex-ray listens instead of
-  connects) than anything this gate decides, so the cross-assignment is not
-  modeled — as is the trailing `mux` concurrency check (below):
-  `MultiplexingConfig` is attached only on ex-ray's non-`server` branch, so
-  this gate skips that check too whenever a `server` segment is present,
-  rather than reporting a false fatal.
-
-An explicit empty `host=` used to NOT be "no SNI" before #752: ex-ray's own
-`Config.ServerName` fell back to the DIAL DESTINATION when `host` was empty
-(`tls.WithDestination`), and that destination is `remoteAddr` — itself a
-`plugin_opts` option that can name a domain. Since #752 rejects `host=` at
-parse time (`parseStringOption(..., emptyOK: false)`), `*host` can never
-actually BE `""` when that v2ray-core fallback would run — it still exists
-in the vendored source, just unreachable via `plugin_opts` now, and
-`ech_fetch_is_reachable` no longer models it.
+An explicit empty `host=` is fatal at parse time
+(`parseStringOption(..., emptyOK: false)`), so `*host` can never actually BE
+`""` when `buildTLSConfig` runs — v2ray-core's own `Config.ServerName`
+empty-`ServerName` fallback to the dial destination (`tls.WithDestination`,
+filling it from `remoteAddr`) still exists in the vendored source, just
+unreachable via `plugin_opts`, and `ech_fetch_is_reachable` does not model
+it. The reachable SNI check also strips a literal `experiment:8357` prefix
+before testing domain-ness, mirroring v2ray-core's own
+`Config.parseServerName` — `ApplyECH` reads the STRIPPED `ServerName`, not
+the raw `host` value.
 
 ### Lockdown mode
 
