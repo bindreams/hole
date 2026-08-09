@@ -607,7 +607,10 @@ const EX_RAY_DEFAULT_HOST: &str = "cloudfront.com";
 ///
 /// Then `registerTCPKeepAlive` and main()'s own pre-`generateConfig` guards:
 /// - `tcp-keepalive`, again: a value that parsed above is now range-checked
-///   against `tcpKeepAliveParams`' `0..=32767`.
+///   against `tcpKeepAliveParams`' `0..=32767` — EXCEPT under a `server`
+///   segment: `registerTCPKeepAlive` returns early for `*server`, without
+///   range-checking; server mode's own range check is unconditional inside
+///   `generateConfig` instead, much later (below).
 /// - `localPort` (main.go's cross-assign + `validPort` ==
 ///   `net.PortFromString`): must be an unsigned base-10 literal `<=65535`
 ///   and not `0` — `0` is otherwise valid syntax
@@ -633,6 +636,10 @@ const EX_RAY_DEFAULT_HOST: &str = "cloudfront.com";
 ///   `tls` and no `mode=quic` promises fail-closed ECH it cannot deliver.
 /// - `cert`/`certRaw`/`key` present (non-empty) with TLS not enabled is
 ///   fatal too — the material would otherwise be silently never read.
+/// - `tcp-keepalive`, again, under a `server` segment ONLY (the
+///   `registerTCPKeepAlive`-position check above skips it there): the same
+///   `0..=32767` range check `generateConfig` itself runs unconditionally,
+///   regardless of `*server`.
 /// - `ech=always` additionally requires a non-empty RESOLVED `ech-doh`
 ///   (`buildTLSConfig`, reached only `if *tlsEnabled`) — the value ex-ray
 ///   actually receives once Hole's own injection wins or loses against the
@@ -643,9 +650,11 @@ const EX_RAY_DEFAULT_HOST: &str = "cloudfront.com";
 /// - `mux`, a THIRD time: a non-zero `Concurrency` outside `1..=1024` on
 ///   the websocket transport only (`quic`'s mux is never read).
 ///
-/// `mux`/`tcp-keepalive`/`fwmark` are each checked TWICE (parse, then
-/// range) at their own two real positions above — no order fidelity is
-/// relaxed for these three.
+/// `mux`/`fwmark` are each checked TWICE (parse, then range) at their own
+/// two real positions above — no order fidelity is relaxed for these two.
+/// `tcp-keepalive` is checked twice too, but at ONE OF TWO MUTUALLY
+/// EXCLUSIVE positions depending on `server` (never both), not the same
+/// position regardless of mode.
 ///
 /// **Not modeled, and why it's safe not to:** `loglevel` is ALSO fatal when
 /// explicitly empty (`parseStringOption`) or unrecognized (`logConfig`) —
@@ -723,11 +732,18 @@ fn ex_ray_fatal_config_error(
     }
 
     // registerTCPKeepAlive + main()'s own pre-generateConfig guards.
-    if segments.iter().find(|s| s.key == "tcp-keepalive").is_some_and(|s| {
-        !ex_ray_flag_value(s)
-            .parse::<i64>()
-            .is_ok_and(|v| (0..=32767).contains(&v))
-    }) {
+    // registerTCPKeepAlive returns early under `*server` WITHOUT
+    // range-checking — server mode's own tcp-keepalive range check is
+    // unconditional inside generateConfig instead, much later (see below),
+    // so it must not fire here too.
+    let server_present = segments.iter().any(|s| s.key == "server");
+    if !server_present
+        && segments.iter().find(|s| s.key == "tcp-keepalive").is_some_and(|s| {
+            !ex_ray_flag_value(s)
+                .parse::<i64>()
+                .is_ok_and(|v| (0..=32767).contains(&v))
+        })
+    {
         return Some("tcp-keepalive");
     }
     if segments
@@ -788,13 +804,25 @@ fn ex_ray_fatal_config_error(
     if !tls_enabled && cert_material_present {
         return Some("cert");
     }
+    // Server mode's own tcp-keepalive range check — unconditional inside
+    // generateConfig, unlike registerTCPKeepAlive above, which never runs
+    // it for `*server`.
+    if server_present
+        && segments.iter().find(|s| s.key == "tcp-keepalive").is_some_and(|s| {
+            !ex_ray_flag_value(s)
+                .parse::<i64>()
+                .is_ok_and(|v| (0..=32767).contains(&v))
+        })
+    {
+        return Some("tcp-keepalive");
+    }
     if ech == Some("always") && tls_enabled && resolved_ech_doh_is_empty(segments, ech_doh) {
         return Some("ech-doh");
     }
 
     // core.New, once generateConfig has fully succeeded (doc: mux, a third
     // time; skipped alongside the server residual).
-    if mode != Some("quic") && !segments.iter().any(|s| s.key == "server") {
+    if mode != Some("quic") && !server_present {
         let mux = segments
             .iter()
             .find(|s| s.key == "mux")
@@ -1765,6 +1793,27 @@ mod inject_tests {
              returns) — a key checked in generateConfig/main()'s own pre-generateConfig guards must \
              never win over one checked earlier, inside parseOptsIntoFlags itself"
         );
+        // Under `server`, tcp-keepalive's range check moves from the early
+        // registerTCPKeepAlive position all the way to generateConfig's own
+        // unconditional call, well after `mode` — so `mode` must now win.
+        let segments = garter::split_plugin_options("server;host=cdn.example;mode=bogus;tcp-keepalive=99999").unwrap();
+        assert_eq!(
+            ex_ray_fatal_config_error(&segments, None),
+            Some("mode"),
+            "registerTCPKeepAlive skips the range check under *server; generateConfig's own mode \
+             switch runs long before its own (also unconditional) tcp-keepalive range check"
+        );
+    }
+
+    // As `two_distinct_fatal_keys_report_ex_rays_earlier_one`'s server-mode
+    // case, exercised end to end: `registerTCPKeepAlive` skips
+    // `tcp-keepalive`'s range check under `*server`, but `generateConfig`
+    // still range-checks it unconditionally, later — this must still be
+    // fatal, just at the later position.
+    #[skuld::test]
+    fn a_fatal_tcp_keepalive_value_under_server_still_reaches_the_late_check() {
+        let segments = garter::split_plugin_options("server;host=cdn.example;tcp-keepalive=99999").unwrap();
+        assert_eq!(ex_ray_fatal_config_error(&segments, None), Some("tcp-keepalive"));
     }
 
     // ex-ray reads the FIRST `ech`, so a later `always` it will never apply must

@@ -343,14 +343,19 @@ they permit.
 
 `Routing::install_failclosed_cover(server_ip, resolver_ip)` engages a leak-free
 egress block — permit loopback and the SS server IP, **block everything else** —
-as an RAII guard whose `Drop` disengages it. It is a bounded-window kill switch
-holding the line regardless of [lockdown](#lockdown-mode); a crash while it is
-held leaves traffic **blocked, not leaked**. `ProxyManager::start_cancellable`
-is its production caller: every covered (auto-connect) start engages it before
-`start_inner`, retaining it (host stays blocked, not leaked) if the start fails,
-and releasing it on success, cancel, or a user stop. It does *not* cover an
-indefinite outage (a bridge that stays down) — without lockdown, default-off
-Hole fails *open* there; lockdown closes that broader gap.
+as an RAII guard whose `Drop` disengages it. It is a bounded-window kill switch;
+a crash while it is held leaves traffic **blocked, not leaked**.
+`ProxyManager::start_cancellable` is its production caller: every covered
+(auto-connect) start whose **lockdown intent is OFF** engages it before
+`start_inner`, retaining it (host stays blocked, not leaked) if the start
+fails, and releasing it on success, cancel, or a user stop. When the standing
+lockdown intent is ON, a covered start does NOT engage this cover at all — that
+cohort's cover is installed once at `routing.install` instead
+([Lockdown mode](#lockdown-mode)) — and a HELD transient cover from a prior
+start is released outright, a brief, disclosed open window until the lockdown
+cover takes over. It does *not* cover an indefinite outage (a bridge that
+stays down) — without lockdown, default-off Hole fails *open* there; lockdown
+closes that broader gap.
 
 `resolver_ip` optionally permits ONE more address, scoped to **TCP port 443**
 (not the server permit's unrestricted shape — `doh_url_for_ip` in
@@ -523,27 +528,11 @@ message text — a message is free to change for reasons unrelated to the
 bound it protects, and a message-text pin has already gone stale that way
 once.
 
-`loglevel` is deliberately NOT modeled as a fatal class, even though ex-ray
-itself rejects an explicitly empty or unrecognized value there too:
-`crate::proxy::plugin::inject_plugin_directives` always strips the
-operator's own `loglevel` and appends `loglevel=debug`, unconditionally,
-whatever Hole's own `ech-doh` decision is — no value from `plugin_opts`
-ever reaches ex-ray unmodified, so modeling it would produce a false fatal
-for a config that starts fine in practice, the opposite of the over-permit
-risk this gate exists to close.
-
-**Disclosed, deliberately unmodeled:** `cert`/`certRaw`/`key`'s CONTENT (an
-operator-supplied file path or PEM blob actually being a readable,
-well-formed X509 pair) can fail config-build, but only by reading the
-filesystem — a check this otherwise pure, `plugin_opts`-only gate
-deliberately does not perform (only their presence without TLS enabled is
-checked). ex-ray's `server` plugin option cross-assigns
-`localAddr`/`localPort` with `remoteAddr`/`remotePort` to the opposite
-internal flag; Hole's bridge never spawns ex-ray as a server, so the gate
-checks those four address/port keys assuming client mode and skips the
-`mux`-concurrency check too whenever a `server` segment is present
-(`MultiplexingConfig` is client-mode only), rather than reporting a false
-fatal.
+`loglevel` is deliberately NOT modeled as a fatal class, and `cert`/
+`certRaw`/`key`'s CONTENT and ex-ray's `server` plugin option's
+cross-assignment are disclosed, deliberately unmodeled residuals — see
+`ex_ray_fatal_config_error`'s own doc comment (the single source of truth
+per the paragraph above) for the full reasoning behind each.
 
 An explicit empty `host=` is fatal at parse time
 (`parseStringOption(..., emptyOK: false)`), so `*host` can never be `""`

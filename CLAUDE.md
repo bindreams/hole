@@ -70,9 +70,11 @@ before editing; the sections linked below are the authoritative source.
   the bridge **disarms-not-drops** it across the restart and the new bridge
   re-adopts it (`decide_cover_recovery == Adopt`). The **transient**
   `install_failclosed_cover` (permit loopback + server, plus the resolver
-  Hole's own `ech-doh` URL names, when a plugin is configured — scoped to
-  TCP/443) is a bounded-window RAII guard engaged by every covered
-  (auto-connect) start.
+  Hole's own `ech-doh` URL names when it's the value ex-ray will actually dial
+  — `effective_ech_doh == Holes`, not merely a plugin being configured —
+  scoped to TCP/443) is a bounded-window RAII guard engaged by every covered
+  (auto-connect) start whose lockdown intent is OFF; a lockdown-on covered
+  start uses the standing cover instead and releases any held transient one.
   Both are persistent WFP filters (Win) / self-contained pf ruleset (mac), swept
   by `recover_routes` on next start. →
   [CONTRIBUTING.md#fail-closed-cover](CONTRIBUTING.md#fail-closed-cover)
