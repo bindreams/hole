@@ -46,17 +46,28 @@ use super::RESOLVER_PERMIT_PORT;
 /// that const's doc for why this is the only port this fetch can need) — NOT
 /// the server permit's unrestricted shape.
 pub fn build_pf_ruleset(server_ip: IpAddr, resolver_ip: Option<IpAddr>) -> String {
-    let resolver_pass = resolver_ip
-        .map(|ip| format!("pass out quick proto tcp from any to {ip} port {RESOLVER_PERMIT_PORT}\n"))
-        .unwrap_or_default();
     format!(
         "set block-policy drop\n\
          block out all\n\
          pass out quick on lo0 all\n\
          pass in quick on lo0 all\n\
          pass out quick from any to {server_ip}\n\
-         {resolver_pass}"
+         {resolver_pass}",
+        resolver_pass = resolver_pass_line(resolver_ip),
     )
+}
+
+/// The optional resolver-permit pf line for `resolver_ip`, scoped to
+/// `proto tcp port` [`RESOLVER_PERMIT_PORT`] — shared by `build_pf_ruleset`
+/// (transient) and `build_lockdown_main_ruleset` (standing): both covers
+/// permit the identical resolver address under the identical scope (see
+/// [`crate::routing::Routing::install_failclosed_cover`]'s doc for the trust
+/// condition). Empty string when `resolver_ip` is `None` — omitted whenever
+/// nothing should be permitted.
+fn resolver_pass_line(resolver_ip: Option<IpAddr>) -> String {
+    resolver_ip
+        .map(|ip| format!("pass out quick proto tcp from any to {ip} port {RESOLVER_PERMIT_PORT}\n"))
+        .unwrap_or_default()
 }
 
 /// Normalize a snapshot fragment to end in exactly one `\n`. Empty stays empty
@@ -96,9 +107,6 @@ pub fn build_lockdown_main_ruleset(
     nat_snapshot: &str,
 ) -> String {
     let proto = "tcp"; // +udp once a UDP-transport plugin lands; egress is TCP-only today.
-    let resolver_pass = resolver_ip
-        .map(|ip| format!("pass out quick proto tcp from any to {ip} port {RESOLVER_PERMIT_PORT}\n"))
-        .unwrap_or_default();
     format!(
         "set block-policy drop\n\
          set skip on lo0\n\
@@ -111,7 +119,7 @@ pub fn build_lockdown_main_ruleset(
         nat = ensure_trailing_nl(nat_snapshot),
         proto = proto,
         ip = server_ip,
-        resolver = resolver_pass,
+        resolver = resolver_pass_line(resolver_ip),
         tun = tun_name,
     )
 }

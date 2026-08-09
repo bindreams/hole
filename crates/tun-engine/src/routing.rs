@@ -214,12 +214,16 @@ pub enum CoverRecovery {
     /// Intent ON + cover present: KEEP the host fail-closed across the restart.
     /// The fail-closed floor (block-all + loopback + App-ID) stays in force; the
     /// volatile permits — the stale TUN-interface permit (dead LUID/utun after
-    /// teardown) and the server-IP permit (the server may change before the next
-    /// connect) — are refreshed by the next connect's `install_lockdown`. Windows
-    /// drops the volatile GUIDs at recovery so the re-add isn't a fixed-key
-    /// no-op; macOS reloads the whole pf ruleset, refreshing them implicitly.
-    /// This is the crash-leak fix: a crash never runs `stop()`, so the persistent
-    /// cover survives and Adopt holds it.
+    /// teardown), the server-IP permit (the server may change before the next
+    /// connect), and the resolver-IP permit (the ECH resolver may change, or be
+    /// dropped entirely, before the next connect) — are refreshed by the next
+    /// connect's `install_lockdown`. Windows drops the volatile GUIDs at THIS
+    /// recovery step so the re-add isn't a fixed-key no-op; macOS's Adopt step
+    /// removes nothing at all (the whole pf ruleset, resolver permit included,
+    /// stays live from before the crash/restart until the next connect's
+    /// `engage_lockdown` reloads it fresh). This is the crash-leak fix: a
+    /// crash never runs `stop()`, so the persistent cover survives and Adopt
+    /// holds it.
     Adopt,
     /// Intent OFF + cover present: fully disengage the leftover cover (Windows:
     /// delete all lockdown GUIDs; macOS: restore the pre-lockdown snapshot +

@@ -414,15 +414,8 @@ comparing against the live permit rather than re-trusting that the repair
 always converges, in EITHER direction: too narrow (`Holes`, an ECH-fetch stall
 risk) or too wide (`None`, the kill switch permits a resolver address nothing
 needs). The [standing lockdown cover](#lockdown-mode) carries the identical
-permit — see that section — closing what was originally a THIRD, untouched
-case ([#753](https://github.com/bindreams/hole/issues/753)): its own ruleset
-used to carry no resolver permit at all, on either platform, which on macOS
-blocked the fetch outright (pf has no per-process matcher) and on Windows was
-masked only for a direct `ex-ray`/`v2ray-plugin` config — a chained plugin
-like `galoshes` spawns its inner ex-ray from a separate, lazily-extracted
-path (`crates/galoshes/src/embedded.rs`) the App-ID floor never named, so the
-process that actually dials the resolver was unpermitted there too. Finally,
-the release-then-reengage repair itself has a brief window with NO cover at all
+permit — see that section. Finally, the release-then-reengage repair itself
+has a brief window with NO cover at all
 between the release and the corrected (or restored) re-engage — disclosed in
 the repair's own `warn!` lines, not silent, but not eliminated either: both
 platforms' engage primitives are delete-then-add / flush-then-reload, not an
@@ -580,11 +573,14 @@ three axes:
   the identical gate — see the paragraph above.
 - **Lifetime.** Lockdown is authoritative and standing — it persists across a
   crash or restart and is reconciled on the next start via
-  `decide_cover_recovery` (Adopt keeps the host fail-closed, dropping the
-  volatile TUN + server + resolver permits so the next connect re-adds them
-  fresh; Sweep disengages when intent is off). The transient cover is a
-  non-standing, bounded-window RAII guard engaged only for the duration of one
-  covered (auto-connect) start attempt, and swept by `recover_routes` like
+  `decide_cover_recovery` (Adopt keeps the host fail-closed; on Windows it
+  drops the volatile TUN + server + resolver GUIDs so the next connect
+  re-adds them fresh, on macOS it removes nothing at all — the whole pf
+  ruleset, resolver permit included, stays live from before the
+  crash/restart until the next connect's `engage_lockdown` reloads it; Sweep
+  disengages when intent is off). The transient cover is a non-standing,
+  bounded-window RAII guard engaged only for the duration of one covered
+  (auto-connect) start attempt, and swept by `recover_routes` like
   every other cover state on the next start.
 - **Failure mode.** A failed lockdown engage during a lockdown-on start is
   **fail-FATAL** — it aborts the start and tears everything down; the transient

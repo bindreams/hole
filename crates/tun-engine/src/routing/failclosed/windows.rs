@@ -97,8 +97,8 @@ const IPPROTO_TCP: u8 = 6;
 //          filters get per-binary dynamically-derived GUIDs (see build_lockdown_spec).
 //
 // CROSS-VERSION CONTRACT, same class as `FILTER_GUIDS` (see its own doc): the
-// two resolver-permit GUIDs (indices 12-13) grow this array from ten entries
-// (its size before #753) to fourteen. `swept_lockdown_guids`/`recover_lockdown`
+// two resolver-permit GUIDs (indices 12-13) grow this array from twelve
+// entries to fourteen. `swept_lockdown_guids`/`recover_lockdown`
 // sweep by enumerating this compiled-in array, not by querying the OS for
 // "every filter this provider owns" — so a crash-then-downgrade (a build that
 // knows all fourteen GUIDs engages, crashes, and an OLDER build's recovery
@@ -160,7 +160,7 @@ fn swept_transient_guids() -> Vec<GUID> {
     FILTER_GUIDS.to_vec()
 }
 
-/// Every lockdown filter GUID a full Sweep must delete: the ten fixed
+/// Every lockdown filter GUID a full Sweep must delete: the fourteen fixed
 /// lockdown GUIDs + the per-binary App-ID GUIDs. (Transient GUIDs are swept
 /// separately by `delete_all`.)
 fn swept_lockdown_guids() -> Vec<GUID> {
@@ -347,19 +347,7 @@ pub fn build_cover_spec(server_ip: IpAddr, resolver_ip: Option<IpAddr>) -> Cover
             weight: PERMIT_WEIGHT,
         },
     ];
-    if let Some(ip) = resolver_ip {
-        let (guid, layer) = match ip {
-            IpAddr::V4(_) => (FILTER_GUIDS[10], Layer::ConnectV4),
-            IpAddr::V6(_) => (FILTER_GUIDS[11], Layer::ConnectV6),
-        };
-        filters.push(FilterSpec {
-            guid,
-            layer,
-            action: Action::Permit,
-            condition: Condition::RemoteIpPortTcp(ip, RESOLVER_PERMIT_PORT),
-            weight: PERMIT_WEIGHT,
-        });
-    }
+    filters.extend(resolver_permit_filter(resolver_ip, FILTER_GUIDS[10], FILTER_GUIDS[11]));
     filters.push(block(FILTER_GUIDS[4], Layer::ConnectV4));
     filters.push(block(FILTER_GUIDS[5], Layer::ConnectV6));
     CoverSpec {
@@ -367,6 +355,29 @@ pub fn build_cover_spec(server_ip: IpAddr, resolver_ip: Option<IpAddr>) -> Cover
         sublayer: SUBLAYER_GUID,
         filters,
     }
+}
+
+/// The optional resolver-permit filter for `resolver_ip`, keyed to
+/// `guid_v4`/`guid_v6` per family — shared by `build_cover_spec` (transient)
+/// and `build_lockdown_spec` (standing): both covers permit the identical
+/// resolver address under the identical TCP/[`RESOLVER_PERMIT_PORT`] scope
+/// (see [`crate::routing::Routing::install_failclosed_cover`]'s doc for the
+/// trust condition). `None` in, `None` out — omitted whenever nothing should
+/// be permitted.
+fn resolver_permit_filter(resolver_ip: Option<IpAddr>, guid_v4: GUID, guid_v6: GUID) -> Option<FilterSpec> {
+    resolver_ip.map(|ip| {
+        let (guid, layer) = match ip {
+            IpAddr::V4(_) => (guid_v4, Layer::ConnectV4),
+            IpAddr::V6(_) => (guid_v6, Layer::ConnectV6),
+        };
+        FilterSpec {
+            guid,
+            layer,
+            action: Action::Permit,
+            condition: Condition::RemoteIpPortTcp(ip, RESOLVER_PERMIT_PORT),
+            weight: PERMIT_WEIGHT,
+        }
+    })
 }
 
 /// Build the data description of the standing lockdown cover for `server_ip`,
@@ -460,19 +471,11 @@ pub fn build_lockdown_spec(
         LOCKDOWN_FILTER_GUIDS[5]
     };
     filters.push(permit(server_guid, server_layer, Condition::RemoteIp(server_ip)));
-    if let Some(ip) = resolver_ip {
-        let (guid, layer) = match ip {
-            IpAddr::V4(_) => (LOCKDOWN_FILTER_GUIDS[12], Layer::ConnectV4),
-            IpAddr::V6(_) => (LOCKDOWN_FILTER_GUIDS[13], Layer::ConnectV6),
-        };
-        filters.push(FilterSpec {
-            guid,
-            layer,
-            action: Action::Permit,
-            condition: Condition::RemoteIpPortTcp(ip, RESOLVER_PERMIT_PORT),
-            weight: PERMIT_WEIGHT,
-        });
-    }
+    filters.extend(resolver_permit_filter(
+        resolver_ip,
+        LOCKDOWN_FILTER_GUIDS[12],
+        LOCKDOWN_FILTER_GUIDS[13],
+    ));
     filters.push(block(LOCKDOWN_FILTER_GUIDS[6], Layer::ConnectV4));
     filters.push(block(LOCKDOWN_FILTER_GUIDS[7], Layer::ConnectV6));
     CoverSpec {
@@ -962,10 +965,10 @@ impl Drop for Cover {
 
 /// Reconcile a possibly-present standing lockdown cover with the persisted
 /// intent. Opens the engine; `Adopt` deletes the volatile permits — the dead
-/// TUN-LUID pair and the server-IP pair — keeping the fail-closed floor
-/// (block-all + loopback + App-ID) so the host stays blocked across the restart
-/// and the next connect re-adds TUN + server fresh; `Sweep` deletes all
-/// lockdown + App-ID filters,
+/// TUN-LUID pair, the server-IP pair, and the resolver-IP pair — keeping the
+/// fail-closed floor (block-all + loopback + App-ID) so the host stays
+/// blocked across the restart and the next connect re-adds TUN + server +
+/// resolver fresh; `Sweep` deletes all lockdown + App-ID filters,
 /// then the sublayer/provider IFF the transient cover isn't also using them
 /// (they share PROVIDER_GUID/SUBLAYER_GUID, so leave them — the transient
 /// `delete_all` owns their removal, and an orphaned empty sublayer is benign).

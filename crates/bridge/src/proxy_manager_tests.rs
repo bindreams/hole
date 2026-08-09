@@ -10,7 +10,7 @@ use hole_common::protocol::ProxyConfig;
 use plugin_e2e::locators::locate_ex_ray;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -1168,35 +1168,46 @@ fn lockdown_on_engages_with_no_resolver_permit_when_no_plugin_configured() {
 }
 
 /// Stage a copy of the real `ex-ray` binary (built by `cargo xtask ex-ray`)
-/// next to the running test executable, so `resolve_plugin_path`'s
-/// next-to-exe lookup finds it. `ProxyManager` has no plugin-path-override
-/// hook (unlike `server_test_tests.rs`'s lower-level SS-server harness), and
-/// the plugin subprocess isn't behind a `Proxy`/`Routing`/`Dns` trait seam —
-/// it's real code on every start — so reaching `install_lockdown` with a
-/// real plugin chain needs a real, spawnable binary at the path
-/// `ProxyManager` will actually look. Panics loud, never skips, matching
+/// into `dir` and prepend `dir` to THIS PROCESS's `PATH`, so
+/// `resolve_plugin_path`'s bare-name PATH fallback finds it — `ProxyManager`
+/// has no plugin-path-override hook (unlike `server_test_tests.rs`'s
+/// lower-level SS-server harness), and the plugin subprocess isn't behind a
+/// `Proxy`/`Routing`/`Dns` trait seam — it's real code on every start — so
+/// reaching `install_lockdown` with a real plugin chain needs a real,
+/// spawnable binary somewhere `ProxyManager` will actually look. Panics
+/// loud, never skips, matching
 /// `server_test_tests.rs::run_test_with_v2ray_plugin_happy_path`'s contract
 /// for a missing build.
 ///
-/// Copies to a PID-suffixed temp file first, then `rename`s into place:
-/// nextest runs tests in parallel, and `std::fs::rename` replaces the
-/// destination atomically on both Windows (`MoveFileExW` +
-/// `MOVEFILE_REPLACE_EXISTING`) and POSIX (`rename(2)`), so a concurrent
-/// test's own stage-and-rename can never be observed half-written.
-fn stage_real_ex_ray_next_to_test_binary() {
+/// `dir` must be a fresh, test-private directory (e.g. a `tempfile::tempdir`
+/// no other test shares) and the `PATH` mutation is process-global —
+/// deliberately: nextest runs every test in its OWN process, so this can
+/// never race a sibling test's copy of the same file the way a SHARED
+/// destination (e.g. next to the test binary's own `current_exe()`, which
+/// every test in this binary shares) would. See `dist_fixture.rs`'s doc for
+/// the cross-process race this sidesteps by construction rather than by
+/// locking.
+///
+/// # Safety
+/// `set_var` is sound here only because nothing else in this process reads
+/// or writes the environment concurrently: this runs at the very start of a
+/// single-threaded test body, before anything is spawned.
+fn stage_real_ex_ray_on_path(dir: &Path) {
     let ex_ray = locate_ex_ray();
     assert!(
         ex_ray.is_file(),
         "ex-ray not built at {ex_ray:?} — run `cargo xtask ex-ray` before running this test"
     );
-    let dest_dir = std::env::current_exe().unwrap().parent().unwrap().to_path_buf();
-    let dest = dest_dir.join(if cfg!(windows) { "ex-ray.exe" } else { "ex-ray" });
-    if dest.is_file() {
-        return; // already staged by an earlier test in this process
+    let dest = dir.join(if cfg!(windows) { "ex-ray.exe" } else { "ex-ray" });
+    std::fs::copy(&ex_ray, &dest).expect("copy ex-ray into the test's own private directory");
+
+    let mut paths = vec![dir.to_path_buf()];
+    if let Some(existing) = std::env::var_os("PATH") {
+        paths.extend(std::env::split_paths(&existing));
     }
-    let tmp = dest_dir.join(format!(".ex-ray-stage-{}.tmp", std::process::id()));
-    std::fs::copy(&ex_ray, &tmp).expect("copy ex-ray into a staging temp file");
-    std::fs::rename(&tmp, &dest).expect("atomically place the staged ex-ray binary");
+    let new_path = std::env::join_paths(paths).expect("join PATH entries");
+    // SAFETY: see the fn doc — single-threaded, pre-spawn, this process only.
+    unsafe { std::env::set_var("PATH", new_path) };
 }
 
 #[skuld::test]
@@ -1209,7 +1220,8 @@ fn lockdown_on_permits_the_gated_ech_resolver_for_a_real_plugin_chain() {
     // not just the isolated `MockRouting` contract
     // (`mock_install_lockdown_records_the_resolver_permit` proves that half).
     rt().block_on(async {
-        stage_real_ex_ray_next_to_test_binary();
+        let plugin_dir = tempfile::tempdir().unwrap();
+        stage_real_ex_ray_on_path(plugin_dir.path());
 
         let resolver: IpAddr = "198.51.100.5".parse().unwrap();
         let dir = tempfile::tempdir().unwrap();
@@ -1242,7 +1254,8 @@ fn lockdown_on_omits_the_resolver_permit_for_a_non_ech_capable_plugin() {
     // reaches ECH, so the reachability gate must keep the lockdown permit at
     // `None` even though a plugin is genuinely running under the cover.
     rt().block_on(async {
-        stage_real_ex_ray_next_to_test_binary();
+        let plugin_dir = tempfile::tempdir().unwrap();
+        stage_real_ex_ray_on_path(plugin_dir.path());
 
         let resolver: IpAddr = "198.51.100.5".parse().unwrap();
         let dir = tempfile::tempdir().unwrap();
