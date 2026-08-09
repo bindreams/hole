@@ -564,92 +564,183 @@ pub(crate) fn effective_ech_doh(
 /// literal ever changes there without a matching edit here).
 const EX_RAY_DEFAULT_HOST: &str = "cloudfront.com";
 
-/// Whether ex-ray's own config-build step — `registerTCPKeepAlive` +
-/// `generateConfig` (main.go:206-213,223-226,237-243), run before
-/// `server.Start()` — would REJECT this segment set outright, in which case
-/// the whole plugin process exits (23) before it dials anything at all,
-/// ECH-config fetch included. Returns the rejecting key, first-wins
-/// (matching `Args.Get`) among segments sharing a key, checked in ex-ray's
-/// OWN evaluation order below so the diagnostic names the key ex-ray itself
-/// would report first (the cover-permit / reachability side only needs
-/// `.is_some()`, order-independent):
-/// - `tcp-keepalive` (config.go's `tcpKeepAliveParams`): called from
-///   `registerTCPKeepAlive` BEFORE `generateConfig` even starts, but only
-///   in CLIENT mode — `registerTCPKeepAlive` returns early under `*server`
-///   (config.go:153-155; the `server` residual below is why the ordering
-///   claim above assumes client mode) — and called AGAIN, unconditionally
-///   regardless of `*server`, inside `generateConfig` itself
-///   (config.go:306-309). Either call: a value ex-ray's own `strconv.Atoi`
-///   (main.go) parses successfully but that falls outside `0..=32767` is a
-///   build error. A value `Atoi` fails to parse at all is NOT an error —
-///   ex-ray logs a warning and silently keeps the default.
-/// - `localPort`: `"0"` or `""` is rejected unconditionally, before
-///   `generateConfig` even runs (main.go:223-226 — ex-ray cannot honor
-///   port-0 OS-assignment). Otherwise `net.PortFromString` requires an
-///   unsigned base-10 literal `<=65535`
-///   (third_party/v2ray-core/common/net/port.go).
-/// - `remotePort`: `strconv.ParseUint(s, 10, 32)` directly (config.go) — an
-///   unsigned base-10 literal `<=u32::MAX`, with NO further upper bound
-///   (ex-ray does not route it through `net.Port` at all).
-/// - `mux`/`fwmark` (config.go's `uint32Opt`, called unconditionally at
-///   config.go:260-267): a value that parses successfully but falls outside
-///   `0..=u32::MAX` is a build error; a parse failure is not (same rule as
-///   `tcp-keepalive`).
-/// - `mode` is a CLOSED enum (`switch *mode`, config.go:279-297,
-///   unconditional): outside `websocket`/`quic` is a build error.
-/// - `ech` is a CLOSED enum too (`switch *echMode`, config.go:209-223), but
-///   that switch lives INSIDE `buildTLSConfig`, called only `if
-///   *tlsEnabled` (config.go:290-294,334) — an invalid value on a plain,
-///   non-quic transport with no `tls` flag is never looked at, so it's
-///   inert, not fatal (mirrors `ech_fetch_is_reachable`'s own
-///   `tls_enabled`). Within that same switch, `ech=always` additionally
-///   requires a non-empty RESOLVED `ech-doh` (config.go:218-220) — the
+/// Whether ex-ray's own config-build step — `parseOptsIntoFlags`
+/// (options.go, main.go), `registerTCPKeepAlive` + `generateConfig`
+/// (config.go), run before `server.Start()` — would REJECT this segment set
+/// outright, in which case the whole plugin process exits (23) before it
+/// dials anything at all, ECH-config fetch included. Returns the rejecting
+/// key, first-wins (matching `Args.Get`) among segments sharing a key,
+/// checked in roughly ex-ray's OWN evaluation order below so the diagnostic
+/// names the key ex-ray itself would report first (the cover-permit /
+/// reachability side only needs `.is_some()`, order-independent — see the
+/// `tcp-keepalive`/`mux`/`fwmark` bullet for the one place order fidelity is
+/// deliberately relaxed, since it can only misname a SIMULTANEOUS second
+/// failure, never change `.is_some()`).
+///
+/// #752 rewrote `parseOptsIntoFlags` (options.go's `parseIntOption`/
+/// `parseBoolOption`/`parseStringOption`/`parseEnumOption`/
+/// `parseURLOption`) to share one rule across every option: an ABSENT key is
+/// a no-op (the flag keeps its default); any PRESENT value — an explicitly
+/// empty one included — must be well-formed or the option is fatal. Before
+/// #752, several of these were warn-and-keep-the-default instead; the
+/// checks below reflect the post-#752 source, not that history.
+/// - `tcp-keepalive`/`mux`/`fwmark` (`parseIntOption`): a present value
+///   `strconv.Atoi` can't parse (non-numeric, or explicitly empty) is fatal
+///   — `mux` specifically because galoshes appends `mux=0` and ex-ray is
+///   first-wins, so an operator's own unparseable `mux=` must not silently
+///   win over it and leave Mux.Cool on. A value that DOES parse is then
+///   range-checked: `tcp-keepalive` against `tcpKeepAliveParams`'
+///   `0..=32767` (`registerTCPKeepAlive`, main.go, before `generateConfig`
+///   even starts); `mux`/`fwmark` against `uint32Opt`'s `0..=u32::MAX`
+///   (`generateConfig`). Both failure modes name the same key, so each is
+///   one combined check here — the parse check runs earlier in the real
+///   source (`parseOptsIntoFlags`) than the range check
+///   (`registerTCPKeepAlive`/`generateConfig`), which is the fidelity this
+///   combining relaxes.
+/// - `localPort`/`remotePort` (main.go's cross-assign + `validPort` ==
+///   `net.PortFromString`): must be an unsigned base-10 literal `<=65535`
+///   and not `0` — `0` is otherwise valid syntax
+///   (`net.PortFromString("0")` succeeds) but ex-ray cannot honor
+///   OS-assigned-port semantics. `localPort` is rejected in main(), before
+///   `generateConfig` runs; `remotePort`, inside it — the ordering
+///   `two_distinct_fatal_keys_report_ex_rays_earlier_one` pins.
+/// - `localAddr` (main.go's cross-assign + `canonicalLocalAddr`): must be a
+///   single (`|`-free) IP literal — a domain or a `|`-joined multi-address
+///   list is fatal, since the sitrep's `ready` event can report only one
+///   `listen` address.
+/// - `remoteAddr` (`generateConfig`): must not normalize to an empty domain
+///   or the unspecified IP (`0.0.0.0`/`::`) — freedom's destination
+///   override would otherwise dial nowhere honestly.
+/// - `tls`/`server`/`fastOpen`/`__android_vpn` (`parseBoolOption`): a
+///   present value other than `"1"` is fatal — presence-only flags with no
+///   wider "truthy" vocabulary.
+/// - `host`/`path` (`parseStringOption`, `emptyOK=false`): a present but
+///   EXPLICITLY EMPTY value is fatal — unlike `cert`/`certRaw`/`key`
+///   (`emptyOK=true`, disclosed below), empty has no documented meaning for
+///   these two. This also closes the pre-#752 `host=` + `remoteAddr=`
+///   fallback path `ech_fetch_is_reachable` used to model — see its doc.
+/// - `ech-doh` (`parseURLOption`): empty is a documented no-op ("disables
+///   ECH"), but a present, non-empty value that isn't a well-formed
+///   `https://` URL with a host is fatal. Checked only when the CONFIG's
+///   own value is what ex-ray will actually read: Hole's own injection
+///   (always well-formed by construction) strips it whenever
+///   [`ech_doh_displaces`] is true.
+/// - `mode` is a CLOSED enum (`switch *mode`, `generateConfig`,
+///   unconditional): outside `websocket`/`quic` is fatal.
+/// - `ech` is a CLOSED enum too (`parseEnumOption`, `parseOptsIntoFlags`) —
+///   UNCONDITIONAL since #752, unlike before: it no longer lives only
+///   inside `buildTLSConfig` (`if *tlsEnabled`). `generateConfig`
+///   re-validates the same flag (redundant on ex-ray's real
+///   `SS_PLUGIN_OPTIONS`-driven path; independently reachable only from a
+///   raw CLI `-ech=`, which bypasses `parseOptsIntoFlags` entirely) and,
+///   separately, rejects `ech=always` with TLS not enabled — also NEW in
+///   #752: a valid-vocabulary `ech=always` with no `tls` and no
+///   `mode=quic` used to silently apply nothing; now it's fatal.
+///   `ech=always` additionally requires a non-empty RESOLVED `ech-doh`
+///   (`buildTLSConfig`, `if *tlsEnabled` only, unchanged by #752) — the
 ///   value ex-ray actually receives once Hole's own injection wins or loses
 ///   against the operator's; see [`resolved_ech_doh_is_empty`] for why that
 ///   is recomputed rather than shared with [`classify_ech_doh`].
+/// - `cert`/`certRaw`/`key` present (non-empty) with TLS not enabled is
+///   fatal too — NEW in #752; before, the material was silently never read.
 /// - `mux`, again, but LATER than its own `uint32Opt` check above: once
-///   `generateConfig` has fully succeeded, `core.New` (`buildV2Ray`,
-///   main.go:143-149) separately rejects a non-zero `Concurrency` outside
-///   `1..=1024` on the websocket transport ONLY
-///   (third_party/v2ray-core/app/proxyman/outbound/handler.go:114-116) —
-///   `quic`'s mux is never read (config.go:287-289's `connectionReuse`
-///   only sets under `case "websocket"`).
+///   `generateConfig` has fully succeeded, `core.New` separately rejects a
+///   non-zero `Concurrency` outside `1..=1024` on the websocket transport
+///   ONLY (`quic`'s mux is never read).
 ///
-/// **Disclosed, deliberately unmodeled:** `cert` requires filesystem I/O
-/// this otherwise-pure gate doesn't perform; `server` cross-assigns
-/// `localPort`/`remotePort` but Hole never spawns ex-ray as one. See
+/// **Not modeled, and why it's safe not to:** `loglevel` gained the same
+/// empty-is-fatal (`parseStringOption`) and unrecognized-is-fatal
+/// (`logConfig`) treatment in #752 — but `inject_plugin_directives` ALWAYS
+/// strips the operator's own `loglevel` and appends `loglevel=debug`,
+/// unconditionally, whether or not Hole's `ech-doh` wins. No value from
+/// `segments` (read pre-injection here) ever reaches ex-ray unmodified, so
+/// modeling it would produce a FALSE fatal for a config that starts fine in
+/// practice — the opposite of the over-permit risk this gate exists to
+/// close.
+///
+/// **Disclosed, deliberately unmodeled:** `cert`/`certRaw`/`key`'s CONTENT
+/// (a readable, well-formed X509 pair) requires filesystem I/O this
+/// otherwise-pure gate doesn't perform — only their presence-without-TLS is
+/// checked above. `server` cross-assigns `localAddr`/`localPort` with
+/// `remoteAddr`/`remotePort`, but Hole never spawns ex-ray as one, so the
+/// four address/port checks above are checked assuming client mode. See
 /// CONTRIBUTING.md's "ECH-config-fetch reachability gate" section for why.
 fn ex_ray_fatal_config_error(
     segments: &[garter::OptionSegment<'_>],
     ech_doh: Option<&crate::dns::ech::EchDoh>,
 ) -> Option<&'static str> {
     if segments.iter().find(|s| s.key == "tcp-keepalive").is_some_and(|s| {
-        ex_ray_flag_value(s)
+        !ex_ray_flag_value(s)
             .parse::<i64>()
-            .is_ok_and(|v| !(0..=32767).contains(&v))
+            .is_ok_and(|v| (0..=32767).contains(&v))
     }) {
         return Some("tcp-keepalive");
     }
-    if let Some(s) = segments.iter().find(|s| s.key == "localPort") {
-        let v = ex_ray_flag_value(s);
-        if v == "0" || v.is_empty() || !matches!(ex_ray_parses_as_uint32(v), Some(p) if p <= 65535) {
-            return Some("localPort");
-        }
+    if segments
+        .iter()
+        .find(|s| s.key == "localPort")
+        .is_some_and(|s| !matches!(ex_ray_parses_as_uint32(ex_ray_flag_value(s)), Some(p) if p != 0 && p <= 65535))
+    {
+        return Some("localPort");
+    }
+    if segments
+        .iter()
+        .find(|s| s.key == "localAddr")
+        .is_some_and(|s| ex_ray_local_addr_is_invalid(ex_ray_flag_value(s)))
+    {
+        return Some("localAddr");
     }
     if segments
         .iter()
         .find(|s| s.key == "remotePort")
-        .is_some_and(|s| ex_ray_parses_as_uint32(ex_ray_flag_value(s)).is_none())
+        .is_some_and(|s| !matches!(ex_ray_parses_as_uint32(ex_ray_flag_value(s)), Some(p) if p != 0 && p <= 65535))
     {
         return Some("remotePort");
     }
+    if segments
+        .iter()
+        .find(|s| s.key == "remoteAddr")
+        .is_some_and(|s| ex_ray_remote_addr_is_invalid(ex_ray_flag_value(s)))
+    {
+        return Some("remoteAddr");
+    }
     for key in ["mux", "fwmark"] {
         if segments.iter().find(|s| s.key == key).is_some_and(|s| {
-            ex_ray_flag_value(s)
+            !ex_ray_flag_value(s)
                 .parse::<i64>()
-                .is_ok_and(|v| v < 0 || v > i64::from(u32::MAX))
+                .is_ok_and(|v| (0..=i64::from(u32::MAX)).contains(&v))
         }) {
             return Some(key);
+        }
+    }
+    for key in ["tls", "server", "fastOpen", "__android_vpn"] {
+        if segments
+            .iter()
+            .find(|s| s.key == key)
+            .is_some_and(|s| ex_ray_flag_value(s) != "1")
+        {
+            return Some(key);
+        }
+    }
+    for key in ["host", "path"] {
+        if segments
+            .iter()
+            .find(|s| s.key == key)
+            .is_some_and(|s| ex_ray_flag_value(s).is_empty())
+        {
+            return Some(key);
+        }
+    }
+    if let Some(s) = segments.iter().find(|s| s.key == "ech-doh") {
+        let v = ex_ray_flag_value(s);
+        if !v.is_empty() && !ech_doh_displaces(segments, ech_doh) && !ex_ray_value_is_https_url(v) {
+            return Some("ech-doh");
+        }
+    }
+    let ech = segments.iter().find(|s| s.key == "ech").map(ex_ray_flag_value);
+    if let Some(v) = ech {
+        if !matches!(v, "never" | "auto" | "always") {
+            return Some("ech");
         }
     }
     let mode = segments.iter().find(|s| s.key == "mode").map(ex_ray_flag_value);
@@ -659,24 +750,30 @@ fn ex_ray_fatal_config_error(
         }
     }
     let tls_enabled = segments.iter().any(|s| s.key == "tls") || mode == Some("quic");
-    if tls_enabled {
-        if let Some(s) = segments.iter().find(|s| s.key == "ech") {
-            let v = ex_ray_flag_value(s);
-            if !matches!(v, "never" | "auto" | "always") {
-                return Some("ech");
-            }
-            if v == "always" && resolved_ech_doh_is_empty(segments, ech_doh) {
-                return Some("ech-doh");
-            }
+    if ech == Some("always") {
+        if !tls_enabled {
+            return Some("ech");
         }
+        if resolved_ech_doh_is_empty(segments, ech_doh) {
+            return Some("ech-doh");
+        }
+    }
+    let cert_material_present = ["cert", "certRaw", "key"].iter().any(|key| {
+        segments
+            .iter()
+            .find(|s| s.key == *key)
+            .is_some_and(|s| !ex_ray_flag_value(s).is_empty())
+    });
+    if !tls_enabled && cert_material_present {
+        return Some("cert");
     }
     // Same 1..=1024 concurrency bound as the `mux` bullet above (core.New,
     // only on websocket, only when non-zero). The effective value defaults
     // to ex-ray's own flag default (`1`) unless a segment both exists AND
-    // parses. `MultiplexSettings` is CLIENT-mode only (config.go:351-387 —
-    // the `server` branch never builds it), so this check is skipped
-    // alongside the rest of the disclosed, deliberately-unmodeled `server`
-    // residual below, not a separate gap.
+    // parses. `MultiplexSettings` is CLIENT-mode only (config.go — the
+    // `server` branch never builds it), so this check is skipped alongside
+    // the rest of the disclosed, deliberately-unmodeled `server` residual
+    // above, not a separate gap.
     if mode != Some("quic") && !segments.iter().any(|s| s.key == "server") {
         let mux = segments
             .iter()
@@ -735,56 +832,31 @@ fn ex_ray_parses_as_uint32(v: &str) -> Option<u32> {
 /// set, independent of which `ech-doh` value would win. Neither the cover
 /// permit, the residual-stall warning, nor `inject_plugin_directives`'s own
 /// ECH-posture logging may treat a fetch that provably cannot happen as one
-/// that will — four independent conditions, each first-wins (matching
+/// that will — three independent conditions, each first-wins (matching
 /// `Args.Get`):
 /// - [`ex_ray_fatal_config_error`] is `Some` — the whole plugin process
-///   exits before it ever starts, so no dial of any kind happens.
+///   exits before it ever starts, so no dial of any kind happens. This also
+///   covers an EXPLICITLY EMPTY `host=`: before #752, `Config.ServerName`
+///   (empty) fell back to the dial destination — `tls.WithDestination`
+///   filling it from `remoteAddr` (third_party/.../tls/config.go;
+///   `websocket/dialer.go`) — so this function used to re-derive an SNI
+///   from `remoteAddr` for that case. #752's `parseStringOption(...,
+///   "host", ..., emptyOK: false)` now rejects `host=` at parse time, so
+///   `*host` can never actually BE `""` when `buildTLSConfig` runs — the
+///   v2ray-core fallback still exists, just unreachable via `plugin_opts`.
 /// - `ech=never` short-circuits ECH entirely before it ever looks at
-///   `ech-doh` (crates/ex-ray/config.go:209-211).
+///   `ech-doh` (config.go).
 /// - TLS must be enabled at all — an explicit `tls` flag, or `mode=quic`
 ///   forcing it on — since `buildTLSConfig` (which contains the whole `ech`
-///   switch) is called only when `tlsEnabled` (config.go:290-294, 334); a
-///   plain non-quic transport (e.g. `mode=websocket` with no `tls`) never
-///   calls it.
+///   switch) is called only when `tlsEnabled`; a plain non-quic transport
+///   (e.g. `mode=websocket` with no `tls`) never calls it.
 /// - `ApplyECH` bails before dialing DoH unless the TLS `ServerName` is a
-///   DOMAIN: ex-ray sets `tlsConfig.ServerName = *host` directly
-///   (config.go:177), and an ABSENT `host` falls back to ex-ray's own
-///   [`EX_RAY_DEFAULT_HOST`], a real domain, so it's reachable. An EXPLICIT
-///   `host=<value>` wins outright, domain or not. But an EXPLICIT EMPTY
-///   `host=` is NOT "no SNI": `Config.parseServerName` treats a
-///   zero-length `ServerName` as absent (config.go:262 in the
-///   third_party path, `len(sn) > 0`) and `tls.WithDestination` then fills
-///   `ServerName` from the DIAL DESTINATION instead
-///   (third_party/.../transport/internet/tls/config.go:371-382,
-///   `websocket/dialer.go:67`) — and that destination is `remoteAddr`, a
-///   `plugin_opts` option in its own right (main.go:102-108) that can be a
-///   domain, first-wins same as every other key here. `remoteAddr` ABSENT
-///   falls back to Hole's OWN `SS_REMOTE_HOST`, which this function cannot
-///   see (env, not `plugin_opts`) — but is ALWAYS an IP literal in Hole's
-///   own spawn path (`crate::proxy::plugin` never resolves a domain later
-///   than `garter::binary::sip003_env`, which passes an already-resolved
-///   `SocketAddr`), so an absent `remoteAddr` is correctly treated as "not
-///   a domain" without needing to see it. Normalizing the IP-literal test
-///   (for `host` directly, or the `remoteAddr` fallback alike) mirrors
-///   v2ray-core's `net.ParseAddress` (only a MATCHED `[...]` pair is
-///   stripped, once; whitespace is trimmed only when the first or last
-///   byte is non-alphanumeric).
-///   (third_party/v2ray-core/transport/internet/tls/ech.go:26-51,
-///   config.go:250-264,296-303,371-382;
-///   third_party/v2ray-core/common/net/address.go:78-95; main.go:67-69,
-///   102-108).
-///
-/// **Disclosed, on the `remoteAddr` fallback only:** ex-ray applies
-/// `ParseAddress` TWICE on that path — once building the dial destination
-/// (`generateConfig`), once more computing the ECH domain from the
-/// destination-derived `ServerName` — while this normalizes once. The two
-/// disagree only for a value a SECOND unwrap would still change, e.g. a
-/// doubly-bracketed `remoteAddr=[[::1]]` (one strip leaves `[::1]`, itself
-/// still bracketed): this treats it as reachable, real ex-ray does not.
-/// Modeling the second pass needs mirroring v2ray-core's `Domain`/`IP`
-/// address-family round-trip (`net.NewIPOrDomain`), a materially larger
-/// change than a fallback lookup; see CONTRIBUTING.md's "ECH-config-fetch
-/// reachability gate" section.
+///   DOMAIN: ex-ray sets `tlsConfig.ServerName = *host` directly, and an
+///   ABSENT `host` falls back to ex-ray's own [`EX_RAY_DEFAULT_HOST`], a
+///   real domain, so it's reachable. An EXPLICIT `host=<value>` (now always
+///   non-empty, given the point above) wins outright, domain or not
+///   (third_party/v2ray-core/transport/internet/tls/ech.go:26-51;
+///   config.go; main.go).
 ///
 /// Every flag read here goes through [`ex_ray_flag_value`] rather than
 /// `OptionSegment::value` — see its doc. For `host` the divergence is
@@ -799,15 +871,12 @@ fn ech_fetch_is_reachable(segments: &[garter::OptionSegment<'_>], ech_doh: Optio
     }
     let mode = segments.iter().find(|s| s.key == "mode").map(ex_ray_flag_value);
     let tls_enabled = segments.iter().any(|s| s.key == "tls") || mode == Some("quic");
-    let host = segments.iter().find(|s| s.key == "host").map(ex_ray_flag_value);
-    let sni = match host {
-        None => EX_RAY_DEFAULT_HOST,
-        Some("") => segments
-            .iter()
-            .find(|s| s.key == "remoteAddr")
-            .map_or("", ex_ray_flag_value),
-        Some(v) => v,
-    };
+    // An explicitly empty `host=` is fatal (caught above) and never reaches
+    // here — only an ABSENT host falls back to ex-ray's own default.
+    let sni = segments
+        .iter()
+        .find(|s| s.key == "host")
+        .map_or(EX_RAY_DEFAULT_HOST, ex_ray_flag_value);
     tls_enabled && v2ray_core_parses_as_a_domain(sni)
 }
 
@@ -821,13 +890,11 @@ fn ex_ray_flag_value<'a>(s: &'a garter::OptionSegment<'_>) -> &'a str {
     }
 }
 
-/// Mirrors v2ray-core's `net.ParseAddress` (see `ech_fetch_is_reachable`'s
-/// doc for the exact source lines): strips ONE matched `[...]` bracket pair,
-/// then trims surrounding whitespace ONLY when the first or last byte isn't
-/// alphanumeric, then tests whether what's left parses as an IP. An empty
-/// result (whether from the input or after normalization) is never a
-/// domain — `echCacheDomain`'s own caller excludes it explicitly.
-fn v2ray_core_parses_as_a_domain(value: &str) -> bool {
+/// Mirrors v2ray-core's `net.ParseAddress` normalization
+/// (third_party/v2ray-core/common/net/address.go:78-95): strips ONE matched
+/// `[...]` bracket pair, then trims surrounding whitespace ONLY when the
+/// first or last byte isn't alphanumeric.
+fn v2ray_core_normalize(value: &str) -> &str {
     let bytes = value.as_bytes();
     let unbracketed = if !bytes.is_empty() && bytes[0] == b'[' && bytes[bytes.len() - 1] == b']' {
         &value[1..value.len() - 1]
@@ -836,8 +903,55 @@ fn v2ray_core_parses_as_a_domain(value: &str) -> bool {
     };
     let ub = unbracketed.as_bytes();
     let needs_trim = !ub.is_empty() && (!ub[0].is_ascii_alphanumeric() || !ub[ub.len() - 1].is_ascii_alphanumeric());
-    let normalized = if needs_trim { unbracketed.trim() } else { unbracketed };
+    if needs_trim {
+        unbracketed.trim()
+    } else {
+        unbracketed
+    }
+}
+
+/// Whether `value` parses as a v2ray-core DOMAIN address (non-empty, not an
+/// IP) once normalized as [`v2ray_core_normalize`]. An empty result
+/// (whether from the input or after normalization) is never a domain —
+/// `echCacheDomain`'s own caller excludes it explicitly.
+fn v2ray_core_parses_as_a_domain(value: &str) -> bool {
+    let normalized = v2ray_core_normalize(value);
     !normalized.is_empty() && normalized.parse::<std::net::IpAddr>().is_err()
+}
+
+/// Whether `value` parses as a v2ray-core IP-family address once normalized
+/// as [`v2ray_core_normalize`] — used by [`ex_ray_fatal_config_error`] for
+/// `localAddr`'s `canonicalLocalAddr` check, which requires an IP literal.
+fn v2ray_core_parses_as_an_ip(value: &str) -> bool {
+    v2ray_core_normalize(value).parse::<std::net::IpAddr>().is_ok()
+}
+
+/// Whether ex-ray's `canonicalLocalAddr` (config.go, reachable from main()'s
+/// pre-bind guard) would reject `value` for `localAddr`: not exactly one
+/// (`|`-free) address, or not an IP literal once normalized.
+fn ex_ray_local_addr_is_invalid(value: &str) -> bool {
+    value.contains('|') || !v2ray_core_parses_as_an_ip(value)
+}
+
+/// Whether ex-ray's `generateConfig` (config.go) would reject `value` for
+/// `remoteAddr`: an empty domain (normalizes to `""`, `ParseAddress`'s own
+/// domain fallback), or the unspecified IP (`0.0.0.0`/`::`) — freedom's
+/// destination override would otherwise dial nowhere honestly.
+fn ex_ray_remote_addr_is_invalid(value: &str) -> bool {
+    let normalized = v2ray_core_normalize(value);
+    match normalized.parse::<std::net::IpAddr>() {
+        Ok(ip) => ip.is_unspecified(),
+        Err(_) => normalized.is_empty(),
+    }
+}
+
+/// Whether ex-ray's `parseURLOption(opts, "ech-doh", ...)` (options.go)
+/// would accept `v` as a well-formed DoH URL: `url.Parse` succeeding, an
+/// `https` scheme, and a non-empty host. Only checked for the CONFIG's own
+/// `ech-doh` value, and only when it is NOT displaced by Hole's own —
+/// see [`ex_ray_fatal_config_error`]'s `ech-doh` bullet.
+fn ex_ray_value_is_https_url(v: &str) -> bool {
+    url::Url::parse(v).is_ok_and(|u| u.scheme() == "https" && u.host_str().is_some_and(|h| !h.is_empty()))
 }
 
 /// The `segments`-based wrapper around [`hole_ech_doh_outranks`] — extracts
@@ -1564,22 +1678,30 @@ mod inject_tests {
         let segments = garter::split_plugin_options("tls;host=cdn.example;mode=grpc;ech=bogus").unwrap();
         assert_eq!(
             ex_ray_fatal_config_error(&segments, None),
-            Some("mode"),
-            "mode's switch is unconditional and runs before ech's, which is gated on tlsEnabled"
+            Some("ech"),
+            "since #752, `ech`'s enum check runs unconditionally in parseOptsIntoFlags, structurally \
+             before generateConfig's `mode` switch even starts — not the other way around, and not \
+             gated on tlsEnabled anymore either"
         );
     }
 
     // ex-ray reads the FIRST `ech`, so a later `always` it will never apply must
-    // not be reported as a fail-closed posture.
+    // not be reported as a fail-closed posture. `tls` and a pinned candidate are
+    // required on both inputs so neither trips the (unrelated) ech=always-requires-
+    // tls / ech=always-requires-resolved-ech-doh fatal checks.
     #[skuld::test]
     fn fail_closed_reads_the_first_ech_not_any_of_them() {
-        let out = warnings_for("ex-ray", Some("ech=never;ech=always"), None);
+        // Unpinned, not pinned: a pinned candidate reaches the silent
+        // `(Some(_), _) => {}` warning arm (nothing to report), which would
+        // never contain "fail_closed" at all.
+        let e = unpinned("https://9.9.9.9/dns-query");
+        let out = warnings_for("ex-ray", Some("tls;ech=never;ech=always"), Some(&e));
         assert!(
             out.contains("fail_closed=false"),
             "the first `ech` is `never`; got:
 {out}"
         );
-        let out = warnings_for("ex-ray", Some("ech=always;ech=never"), None);
+        let out = warnings_for("ex-ray", Some("tls;ech=always;ech=never"), Some(&e));
         assert!(
             out.contains("fail_closed=true"),
             "the first `ech` is `always`; got:
@@ -1689,29 +1811,46 @@ mod inject_tests {
         );
     }
 
-    // A bare `ech-doh` (no `=`) reads as ex-ray's own `"1"` — non-empty, so
-    // ex-ray DOES arm `Ech_DOHserver = "1"` (config.go:213) and attempt to
-    // use it as a DoH URL, even though "1" itself is not a usable URL. The
-    // operator's value is reported as exactly what ex-ray will try, "1".
+    // A bare `ech-doh` (no `=`) reads as ex-ray's own `"1"` — non-empty, but
+    // (since #752's `parseURLOption`) NOT a well-formed `https://` URL, so
+    // it is now a fatal config error (`parseOptsIntoFlags`) rather than a
+    // value ex-ray tries and fails on later; the whole process exits before
+    // dialing anything.
     #[skuld::test]
-    fn bare_operator_ech_doh_reaches_ex_ray_as_ex_rays_own_placeholder() {
+    fn bare_operator_ech_doh_never_reaches_ex_ray() {
         assert_eq!(
             effective_ech_doh("ex-ray", Some("tls;host=cdn.example;ech-doh"), None),
-            EffectiveEchDoh::Operators("1".to_string())
+            EffectiveEchDoh::None
+        );
+        let segments = garter::split_plugin_options("tls;host=cdn.example;ech-doh").unwrap();
+        assert_eq!(ex_ray_fatal_config_error(&segments, None), Some("ech-doh"));
+    }
+
+    // A malformed operator `ech-doh` that Hole's OWN value DISPLACES is
+    // stripped before ex-ray ever sees it (`inject_plugin_directives`), so
+    // it must NOT be reported as fatal — the malformed string never reaches
+    // the plugin at all.
+    #[skuld::test]
+    fn a_malformed_operator_ech_doh_displaced_by_holes_own_is_not_fatal() {
+        let e = pinned("https://9.9.9.9/dns-query");
+        let segments = garter::split_plugin_options("tls;host=cdn.example;ech-doh=not-a-url").unwrap();
+        assert_eq!(ex_ray_fatal_config_error(&segments, Some(&e)), None);
+        assert_eq!(
+            effective_ech_doh("ex-ray", Some("tls;host=cdn.example;ech-doh=not-a-url"), Some(&e)),
+            EffectiveEchDoh::Holes
         );
     }
 
-    // `switch *echMode` lives INSIDE `buildTLSConfig`, called only `if
-    // *tlsEnabled` (config.go:209-223,290-294,334) — an invalid `ech` value
-    // with no `tls` flag and no `mode=quic` is never looked at, so ex-ray
-    // starts fine and dials the plaintext upstream normally. Must NOT be
-    // reported as a fatal config-build error (nor, since there's no `tls`,
-    // as reachable — `no_tls_and_not_quic_never_reaches_ex_ray` already
-    // covers that half).
+    // `ech`'s enum check (`parseEnumOption`, `parseOptsIntoFlags`) is
+    // UNCONDITIONAL since #752 — unlike before, when the switch lived only
+    // inside `buildTLSConfig` (`if *tlsEnabled`). An invalid `ech` value
+    // with no `tls` flag and no `mode=quic` is now fatal too, even though
+    // the fetch itself is (separately) unreachable either way — see
+    // `no_tls_and_not_quic_never_reaches_ex_ray` for that half.
     #[skuld::test]
-    fn an_invalid_ech_value_without_tls_is_inert_not_fatal() {
+    fn an_invalid_ech_value_without_tls_is_fatal_since_752() {
         let segments = garter::split_plugin_options("host=cdn.example;ech=bogus").unwrap();
-        assert_eq!(ex_ray_fatal_config_error(&segments, None), None);
+        assert_eq!(ex_ray_fatal_config_error(&segments, None), Some("ech"));
     }
 
     // As above, but `mode=quic` force-enables TLS with no explicit `tls`
@@ -1743,11 +1882,9 @@ mod inject_tests {
         );
     }
 
-    // `remotePort` has NO upper bound of its own (config.go routes it
-    // through raw `strconv.ParseUint`, not `net.Port`) — its only ceiling is
-    // u32::MAX from the parse itself. A value that overflows it is the one
-    // thing standing between a legal and a rejected remotePort, so it must
-    // be exercised, not just the non-digit / negative cases above.
+    // A value that overflows the parse itself (u32::MAX) is a distinct
+    // failure mode from the range check below and must independently be
+    // caught by `ex_ray_parses_as_uint32`.
     #[skuld::test]
     fn a_remote_port_above_u32_max_never_reaches_ex_ray() {
         let e = pinned("https://9.9.9.9/dns-query");
@@ -1757,9 +1894,7 @@ mod inject_tests {
         );
     }
 
-    // As above, for `localPort` (whose ceiling is the tighter 65535, but the
-    // u32::MAX parse overflow is a distinct failure mode from that range
-    // check and must independently be caught by `ex_ray_parses_as_uint32`).
+    // As above, for `localPort`.
     #[skuld::test]
     fn a_local_port_above_u32_max_never_reaches_ex_ray() {
         let e = pinned("https://9.9.9.9/dns-query");
@@ -1767,6 +1902,148 @@ mod inject_tests {
             effective_ech_doh("ex-ray", Some("tls;host=cdn.example;localPort=4294967296"), Some(&e)),
             EffectiveEchDoh::None
         );
+    }
+
+    // NEW in #752: `remotePort` now routes through the SAME `validPort` as
+    // `localPort` (config.go), so it shares localPort's tighter 65535
+    // ceiling and its `0` rejection — before, it went through a bare
+    // `strconv.ParseUint(_, 10, 32)` with no upper bound beyond u32::MAX and
+    // no zero check at all.
+    #[skuld::test]
+    fn a_remote_port_shares_local_ports_ceiling_and_zero_rejection_since_752() {
+        let e = pinned("https://9.9.9.9/dns-query");
+        for opts in [
+            "tls;host=cdn.example;remotePort=65536", // within u32::MAX, above the NEW 65535 ceiling
+            "tls;host=cdn.example;remotePort=0",
+            "tls;host=cdn.example;remotePort=",
+        ] {
+            assert_eq!(
+                effective_ech_doh("ex-ray", Some(opts), Some(&e)),
+                EffectiveEchDoh::None,
+                "opts={opts:?}"
+            );
+        }
+    }
+
+    // NEW-since-#752 non-canonical-zero coverage: `"00"` is valid
+    // `strconv.ParseUint` syntax (parses to `0`), so it is caught by
+    // `validPort`'s `== 0` rejection, not by a parse failure — a check that
+    // only compared against the LITERAL string `"0"` would miss it.
+    #[skuld::test]
+    fn a_non_canonical_zero_local_port_never_reaches_ex_ray() {
+        let e = pinned("https://9.9.9.9/dns-query");
+        assert_eq!(
+            effective_ech_doh("ex-ray", Some("tls;host=cdn.example;localPort=00"), Some(&e)),
+            EffectiveEchDoh::None
+        );
+        let segments = garter::split_plugin_options("tls;host=cdn.example;localPort=00").unwrap();
+        assert_eq!(ex_ray_fatal_config_error(&segments, None), Some("localPort"));
+    }
+
+    // `tls`/`server`/`fastOpen`/`__android_vpn` (`parseBoolOption`) accept
+    // ONLY a present `"1"` (or a bare key, which `Args` maps to `"1"`) —
+    // any other present value is fatal, NEW in #752 (before: presence alone
+    // enabled the flag, any value).
+    #[skuld::test]
+    fn a_bool_option_with_a_value_other_than_1_is_fatal_since_752() {
+        for (key, opts) in [
+            ("tls", "tls=0;host=cdn.example"),
+            ("tls", "tls=true;host=cdn.example"),
+            ("server", "tls;host=cdn.example;server=0"),
+            ("fastOpen", "tls;host=cdn.example;fastOpen=0"),
+            ("__android_vpn", "tls;host=cdn.example;__android_vpn=0"),
+        ] {
+            let segments = garter::split_plugin_options(opts).unwrap();
+            assert_eq!(ex_ray_fatal_config_error(&segments, None), Some(key), "opts={opts:?}");
+        }
+    }
+
+    // `path` (`parseStringOption`, `emptyOK=false`) is fatal when
+    // EXPLICITLY empty, same rule as `host`.
+    #[skuld::test]
+    fn an_explicitly_empty_path_is_fatal_since_752() {
+        let segments = garter::split_plugin_options("tls;host=cdn.example;path=").unwrap();
+        assert_eq!(ex_ray_fatal_config_error(&segments, None), Some("path"));
+    }
+
+    // `localAddr` (main.go's cross-assign + `canonicalLocalAddr`) must be a
+    // single IP literal — a domain or a `|`-joined multi-address list is
+    // fatal. Not new to #752, but never modeled until this reconciliation.
+    #[skuld::test]
+    fn an_invalid_local_addr_never_reaches_ex_ray() {
+        let e = pinned("https://9.9.9.9/dns-query");
+        for opts in [
+            "tls;host=cdn.example;localAddr=cdn.example",   // domain, not an IP
+            "tls;host=cdn.example;localAddr=127.0.0.1|::1", // multi-address
+        ] {
+            assert_eq!(
+                effective_ech_doh("ex-ray", Some(opts), Some(&e)),
+                EffectiveEchDoh::None,
+                "opts={opts:?}"
+            );
+        }
+        let segments = garter::split_plugin_options("tls;host=cdn.example;localAddr=cdn.example").unwrap();
+        assert_eq!(ex_ray_fatal_config_error(&segments, None), Some("localAddr"));
+    }
+
+    // `remoteAddr` (`generateConfig`) must not be an empty domain or the
+    // unspecified IP (`0.0.0.0`/`::`) — a wrong destination that binds fine
+    // and reports ready, then fails (or silently misroutes) every dial.
+    #[skuld::test]
+    fn an_unspecified_or_empty_remote_addr_never_reaches_ex_ray() {
+        let e = pinned("https://9.9.9.9/dns-query");
+        for opts in [
+            "tls;host=cdn.example;remoteAddr=0.0.0.0",
+            "tls;host=cdn.example;remoteAddr=::",
+            "tls;host=cdn.example;remoteAddr= ", // whitespace-only normalizes to empty
+        ] {
+            assert_eq!(
+                effective_ech_doh("ex-ray", Some(opts), Some(&e)),
+                EffectiveEchDoh::None,
+                "opts={opts:?}"
+            );
+        }
+        let segments = garter::split_plugin_options("tls;host=cdn.example;remoteAddr=0.0.0.0").unwrap();
+        assert_eq!(ex_ray_fatal_config_error(&segments, None), Some("remoteAddr"));
+    }
+
+    // A non-empty `cert`/`certRaw`/`key` with TLS not enabled is fatal, NEW
+    // in #752 — before, the material was silently never read.
+    #[skuld::test]
+    fn cert_material_without_tls_is_fatal_since_752() {
+        for opts in [
+            "host=cdn.example;cert=/tmp/cert.pem",
+            "host=cdn.example;certRaw=deadbeef",
+            "host=cdn.example;key=/tmp/key.pem",
+        ] {
+            let segments = garter::split_plugin_options(opts).unwrap();
+            assert_eq!(
+                ex_ray_fatal_config_error(&segments, None),
+                Some("cert"),
+                "opts={opts:?}"
+            );
+        }
+    }
+
+    // `loglevel` is NOT modeled: `inject_plugin_directives` always strips
+    // the operator's own `loglevel` and appends `loglevel=debug`, so no
+    // value from the pre-injection `segments` this gate reads ever reaches
+    // ex-ray — an explicitly empty or unrecognized `loglevel` here must NOT
+    // be reported as fatal, even though ex-ray itself would reject either
+    // one directly.
+    #[skuld::test]
+    fn loglevel_is_never_modeled_as_fatal() {
+        let e = pinned("https://9.9.9.9/dns-query");
+        for opts in [
+            "tls;host=cdn.example;loglevel=",
+            "tls;host=cdn.example;loglevel=verbose",
+        ] {
+            assert_eq!(
+                effective_ech_doh("ex-ray", Some(opts), Some(&e)),
+                EffectiveEchDoh::Holes,
+                "opts={opts:?}: loglevel is always overridden by Hole's own injection"
+            );
+        }
     }
 
     // `ech=always` with an empty RESOLVED `ech-doh` is itself a
@@ -1802,17 +2079,18 @@ mod inject_tests {
         assert_eq!(ex_ray_fatal_config_error(&segments, Some(&e)), None);
     }
 
-    // The nested `ech=always` + empty-resolved-`ech-doh` check lives INSIDE
-    // the `tls_enabled` gate, same as the enum check — with no `tls` and no
-    // `mode=quic`, `buildTLSConfig` (and the whole `ech` switch within it)
-    // never runs, so `ech=always` with no `ech-doh` from any source is
-    // inert, not fatal. A regression that moved this check outside the
-    // `tls_enabled` guard would pass every OTHER `ech=always` test (all of
-    // which include `tls`) but not this one.
+    // NEW in #752: `generateConfig` rejects `ech=always` outright when TLS
+    // isn't enabled (`if *echMode == "always" && !*tlsEnabled`) — before,
+    // a valid-vocabulary `ech=always` with no `tls` and no `mode=quic`
+    // silently applied nothing. This is a DIFFERENT fatal reason than the
+    // nested `ech=always` + empty-resolved-`ech-doh` check (which stays
+    // gated inside `tls_enabled`, since `buildTLSConfig` itself is) — this
+    // one is fatal precisely BECAUSE tls is off, regardless of whether an
+    // `ech-doh` is configured at all.
     #[skuld::test]
-    fn ech_always_without_tls_is_inert_not_fatal() {
+    fn ech_always_without_tls_is_fatal_since_752() {
         let segments = garter::split_plugin_options("host=cdn.example;ech=always").unwrap();
-        assert_eq!(ex_ray_fatal_config_error(&segments, None), None);
+        assert_eq!(ex_ray_fatal_config_error(&segments, None), Some("ech"));
     }
 
     // Every new `ex_ray_fatal_config_error` check reads its key via `find`
@@ -1861,16 +2139,30 @@ mod inject_tests {
         );
     }
 
-    // A `mux` that fails to parse at all is NOT a config-build error —
-    // ex-ray's own opts-to-flags step (main.go) logs a warning and silently
-    // keeps the flag's default, so the fetch is still reachable.
+    // NEW in #752: a `mux` that fails to parse at all is now a config-build
+    // error too — before, ex-ray's opts-to-flags step logged a warning and
+    // silently kept the flag's default. `parseIntOption`'s doc: an
+    // operator's own unparseable `mux=` must not silently outrank galoshes'
+    // appended `mux=0` and leave Mux.Cool on.
     #[skuld::test]
-    fn an_unparseable_mux_value_keeps_ex_ray_default_and_still_reaches_ex_ray() {
+    fn an_unparseable_mux_value_is_fatal_since_752() {
         let e = pinned("https://9.9.9.9/dns-query");
         assert_eq!(
             effective_ech_doh("ex-ray", Some("tls;host=cdn.example;mux=not-a-number"), Some(&e)),
-            EffectiveEchDoh::Holes
+            EffectiveEchDoh::None
         );
+        let segments = garter::split_plugin_options("tls;host=cdn.example;mux=not-a-number").unwrap();
+        assert_eq!(ex_ray_fatal_config_error(&segments, None), Some("mux"));
+    }
+
+    // As above, for an explicitly EMPTY `mux=` specifically — the case
+    // #752's own commit message calls out: galoshes appends `mux=0`, ex-ray
+    // is first-wins, so a bare `mux=` an operator left behind must not
+    // silently win over galoshes' append and leave Mux.Cool on.
+    #[skuld::test]
+    fn an_explicitly_empty_mux_value_is_fatal() {
+        let segments = garter::split_plugin_options("tls;host=cdn.example;mux=").unwrap();
+        assert_eq!(ex_ray_fatal_config_error(&segments, None), Some("mux"));
     }
 
     #[skuld::test]
@@ -1881,6 +2173,19 @@ mod inject_tests {
             EffectiveEchDoh::None,
             "fwmark above u32::MAX is out of uint32Opt's range — config.go rejects it"
         );
+    }
+
+    // As `an_unparseable_mux_value_is_fatal_since_752`, for `fwmark` and
+    // `tcp-keepalive` — `parseIntOption` is shared across all three.
+    #[skuld::test]
+    fn an_unparseable_fwmark_or_tcp_keepalive_value_is_fatal_since_752() {
+        for (key, opts) in [
+            ("fwmark", "tls;host=cdn.example;fwmark=not-a-number"),
+            ("tcp-keepalive", "tls;host=cdn.example;tcp-keepalive=not-a-number"),
+        ] {
+            let segments = garter::split_plugin_options(opts).unwrap();
+            assert_eq!(ex_ray_fatal_config_error(&segments, None), Some(key), "opts={opts:?}");
+        }
     }
 
     // `core.New` rejects a non-zero websocket `mux` `Concurrency` outside
@@ -2027,15 +2332,15 @@ mod inject_tests {
 
     // But an EXPLICIT `host` must still be a DOMAIN for `ApplyECH` to ever
     // dial DoH at all (`echCacheDomain` returns "" and `ApplyECH` bails
-    // otherwise) — explicitly empty or IP-literal both mean "no SNI to key
-    // the lookup on", matching v2ray-core's `net.ParseAddress` exactly:
-    // only a MATCHED `[...]` pair strips, and only a non-alphanumeric edge
-    // trims whitespace.
+    // otherwise) — an IP-literal `host` means "no SNI to key the lookup
+    // on", matching v2ray-core's `net.ParseAddress` exactly: only a MATCHED
+    // `[...]` pair strips, and only a non-alphanumeric edge trims
+    // whitespace. (An explicitly EMPTY `host=` is a DIFFERENT, fatal case —
+    // see `explicitly_empty_host_is_fatal_since_752` below, not this one.)
     #[skuld::test]
     fn no_domain_host_never_reaches_ex_ray() {
         let e = pinned("https://9.9.9.9/dns-query");
         for opts in [
-            "tls;host=",
             "tls;host=203.0.113.5",
             "tls;host=[2001:db8::1]",
             "tls;host= 203.0.113.5", // ParseAddress TrimSpaces a non-alnum edge, still an IP
@@ -2049,53 +2354,31 @@ mod inject_tests {
         }
     }
 
-    // An EXPLICIT empty `host=` is NOT "no SNI" — `Config.ServerName`
-    // (empty) falls back to the dial destination (`tls.WithDestination`),
-    // and that destination is `remoteAddr`, itself a `plugin_opts` option
-    // that can name a domain.
+    // NEW in #752: `parseStringOption(opts, "host", host, false)` rejects a
+    // present, explicitly EMPTY `host=` at parse time — the whole plugin
+    // process exits before it ever dials anything. Before #752, `host=""`
+    // instead reached `buildTLSConfig`, whose empty `ServerName` fell back
+    // to the dial destination (`remoteAddr`) via v2ray-core's own
+    // `tls.WithDestination` — that v2ray-core mechanism still exists, but
+    // is now unreachable via `plugin_opts`, regardless of what `remoteAddr`
+    // says (unlike the old fallback, which only unreached for an IP-literal
+    // `remoteAddr`).
     #[skuld::test]
-    fn empty_host_falls_back_to_a_domain_remote_addr_and_reaches_ex_ray() {
+    fn explicitly_empty_host_is_fatal_since_752() {
         let e = pinned("https://9.9.9.9/dns-query");
-        assert_eq!(
-            effective_ech_doh("ex-ray", Some("tls;host=;remoteAddr=cdn.example"), Some(&e)),
-            EffectiveEchDoh::Holes
-        );
-    }
-
-    // As above, but the destination fallback is itself an IP — no domain
-    // SNI either way, so still unreachable (same outcome as no `remoteAddr`
-    // at all, just via the explicit-IP branch instead of the absent one).
-    #[skuld::test]
-    fn empty_host_with_an_ip_remote_addr_never_reaches_ex_ray() {
-        let e = pinned("https://9.9.9.9/dns-query");
-        assert_eq!(
-            effective_ech_doh("ex-ray", Some("tls;host=;remoteAddr=203.0.113.5"), Some(&e)),
-            EffectiveEchDoh::None
-        );
-    }
-
-    // `remoteAddr` uses first-wins too, matching every other flag here.
-    #[skuld::test]
-    fn empty_host_remote_addr_fallback_is_first_wins() {
-        let e = pinned("https://9.9.9.9/dns-query");
-        assert_eq!(
-            effective_ech_doh(
-                "ex-ray",
-                Some("tls;host=;remoteAddr=203.0.113.5;remoteAddr=cdn.example"),
-                Some(&e)
-            ),
-            EffectiveEchDoh::None,
-            "the FIRST remoteAddr= wins — an IP literal here, so the later domain is ignored"
-        );
-        assert_eq!(
-            effective_ech_doh(
-                "ex-ray",
-                Some("tls;host=;remoteAddr=cdn.example;remoteAddr=203.0.113.5"),
-                Some(&e)
-            ),
-            EffectiveEchDoh::Holes,
-            "the FIRST remoteAddr= wins — a domain here, so the later IP literal is ignored"
-        );
+        for opts in [
+            "tls;host=",
+            "tls;host=;remoteAddr=cdn.example",
+            "tls;host=;remoteAddr=203.0.113.5",
+        ] {
+            assert_eq!(
+                effective_ech_doh("ex-ray", Some(opts), Some(&e)),
+                EffectiveEchDoh::None,
+                "opts={opts:?}: host= is fatal regardless of remoteAddr"
+            );
+        }
+        let segments = garter::split_plugin_options("tls;host=").unwrap();
+        assert_eq!(ex_ray_fatal_config_error(&segments, None), Some("host"));
     }
 
     // A bare `host` (no `=`) is `""` in `OptionSegment::value`, but ex-ray's
@@ -2243,9 +2526,15 @@ mod inject_tests {
 
         // The numeric bounds `ex_ray_fatal_config_error` hardcodes for
         // mux/fwmark (`uint32Opt`), tcp-keepalive (`keepAliveMaxSeconds`),
-        // and localPort (`net.PortFromString`) — same drift risk, same pin.
+        // and localPort/remotePort (`validPort`) — same drift risk, same
+        // pin. Pinned on the COMPARISON itself, not `uint32Opt`'s error
+        // message: #752 dropped that message's `, got: <value>` suffix (to
+        // stop a mux=abc\;certRaw=SECRET-shaped escape from leaking a later
+        // segment's value through it) without touching the bound, and a
+        // message-text pin would have (and did) gone stale for a reason
+        // that has nothing to do with the bound it exists to protect.
         assert!(
-            source.contains("(expected 0..4294967295), got:"),
+            source.contains("v >= 0 && v <= math.MaxUint32"),
             "ex_ray_fatal_config_error's mux/fwmark range (0..=u32::MAX) no longer matches \
              config.go's `uint32Opt` — update the range to the vendored source"
         );
@@ -2254,10 +2543,36 @@ mod inject_tests {
             "ex_ray_fatal_config_error's tcp-keepalive range (0..=32767) no longer matches \
              config.go's `keepAliveMaxSeconds` — update the range to the vendored source"
         );
+        assert!(
+            source.contains("rport, err := validPort(*remotePort)"),
+            "ex_ray_fatal_config_error's remotePort ceiling (65535, shared with localPort since \
+             #752) no longer matches config.go — remotePort must still route through the same \
+             `validPort` as localPort, not a bare `strconv.ParseUint`"
+        );
+        assert!(
+            source.contains("family.IsIP() && remoteAddress.IP().IsUnspecified()"),
+            "ex_ray_fatal_config_error's remoteAddr unspecified-IP check no longer matches \
+             config.go — update ex_ray_remote_addr_is_invalid to the vendored source"
+        );
+        assert!(
+            source.contains("func canonicalLocalAddr"),
+            "ex_ray_fatal_config_error's localAddr IP-literal check no longer matches config.go's \
+             `canonicalLocalAddr` — update ex_ray_local_addr_is_invalid to the vendored source"
+        );
+        assert!(
+            source.contains("if *echMode == \"always\" && !*tlsEnabled {"),
+            "ex_ray_fatal_config_error's ech=always-requires-tls check no longer matches \
+             config.go — update the vendored source reference"
+        );
+        assert!(
+            source.contains("if !*tlsEnabled && (*cert != \"\" || *certRaw != \"\" || *key != \"\") {"),
+            "ex_ray_fatal_config_error's cert/certRaw/key-requires-tls check no longer matches \
+             config.go — update the vendored source reference"
+        );
         let port_source = include_str!("../../../ex-ray/third_party/v2ray-core/common/net/port.go");
         assert!(
             port_source.contains("if val > 65535 {"),
-            "ex_ray_fatal_config_error's localPort ceiling (65535) no longer matches \
+            "ex_ray_fatal_config_error's localPort/remotePort ceiling (65535) no longer matches \
              port.go's `PortFromInt` — update the bound to the vendored source"
         );
         let handler_source = include_str!("../../../ex-ray/third_party/v2ray-core/app/proxyman/outbound/handler.go");
@@ -2265,6 +2580,34 @@ mod inject_tests {
             handler_source.contains("config.Concurrency < 1 || config.Concurrency > 1024"),
             "ex_ray_fatal_config_error's mux-concurrency range (1..=1024) no longer matches \
              handler.go's own bound — update the range to the vendored source"
+        );
+
+        let main_source = include_str!("../../../ex-ray/main.go");
+        assert!(
+            main_source.contains(r#"parseEnumOption(opts, "ech", allowedEchModes, echMode)"#),
+            "ex_ray_fatal_config_error's now-UNCONDITIONAL `ech` enum check (#752) no longer \
+             matches main.go's `parseOptsIntoFlags` — if this call moved back inside a \
+             `tlsEnabled` gate, the check must be re-gated too"
+        );
+
+        let options_source = include_str!("../../../ex-ray/options.go");
+        assert!(
+            options_source.contains("if c != \"1\" {"),
+            "ex_ray_fatal_config_error's tls/server/fastOpen/__android_vpn bad-value check no \
+             longer matches options.go's `parseBoolOption` — update the check to the vendored \
+             source"
+        );
+        assert!(
+            options_source.contains(r#"u.Scheme != "https" || u.Host == """#),
+            "ex_ray_value_is_https_url no longer matches options.go's `parseURLOption` — update \
+             the check to the vendored source"
+        );
+        assert!(
+            main_source.contains(r#"parseStringOption(opts, "host", host, false)"#)
+                && main_source.contains(r#"parseStringOption(opts, "path", path, false)"#),
+            "ex_ray_fatal_config_error's host/path empty-is-fatal check no longer matches \
+             main.go's `parseStringOption(..., emptyOK: false)` calls — update the check to the \
+             vendored source"
         );
     }
 
