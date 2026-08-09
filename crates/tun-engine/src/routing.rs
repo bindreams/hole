@@ -436,17 +436,29 @@ pub trait Routing: Send + Sync {
     ) -> Result<Self::Cover, RoutingError>;
 
     /// Engage the STANDING lockdown cover for this connected session: permit
-    /// loopback + the `tun_name` interface + the onward server connection (and,
-    /// on Windows, the `app_ids` binaries by App-ID), block all else. Returns
-    /// the SAME [`Cover`](Self::Cover) RAII guard
+    /// loopback + the `tun_name` interface + the onward server connection + (when
+    /// `Some`) `resolver_ip`, scoped to TCP/443 (and, on Windows, the `app_ids`
+    /// binaries by App-ID), block all else. Returns the SAME
+    /// [`Cover`](Self::Cover) RAII guard
     /// [`install_failclosed_cover`](Self::install_failclosed_cover) returns —
     /// the platform guard is kind-aware, so its Drop disengages whichever cover
     /// it holds. Distinct from `install_failclosed_cover`, which does NOT permit
     /// the TUN. The LUID is re-resolved on every call (never persisted).
     /// Fail-FATAL: the bridge aborts the start on Err.
+    ///
+    /// `resolver_ip` carries the exact same trust condition as
+    /// `install_failclosed_cover`'s (see that method's doc): the caller's own
+    /// `ech-doh` URL names it, gated on `effective_ech_doh == Holes`, so
+    /// config-authorship trust alone is judged sufficient. An App-ID permit
+    /// alone is NOT equivalent here — a chained plugin (e.g. `galoshes`)
+    /// extracts and spawns its inner ex-ray as a SEPARATE process the App-ID
+    /// set never names, so only an address-based permit reaches the process
+    /// that actually dials the resolver (see CONTRIBUTING.md's "Lockdown
+    /// mode" section).
     fn install_lockdown(
         &self,
         server_ip: IpAddr,
+        resolver_ip: Option<IpAddr>,
         tun_name: &str,
         app_ids: &[PathBuf],
     ) -> Result<Self::Cover, RoutingError>;
@@ -531,11 +543,20 @@ impl Routing for SystemRouting {
     fn install_lockdown(
         &self,
         server_ip: IpAddr,
+        resolver_ip: Option<IpAddr>,
         tun_name: &str,
         app_ids: &[PathBuf],
     ) -> Result<Self::Cover, RoutingError> {
-        let resolver = failclosed::SystemLuidResolver;
-        failclosed::engage_lockdown(server_ip, tun_name, &resolver, app_ids, &self.state_dir, self.owner)
+        let luid_resolver = failclosed::SystemLuidResolver;
+        failclosed::engage_lockdown(
+            server_ip,
+            resolver_ip,
+            tun_name,
+            &luid_resolver,
+            app_ids,
+            &self.state_dir,
+            self.owner,
+        )
     }
 }
 

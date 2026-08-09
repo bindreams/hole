@@ -862,6 +862,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
             config,
             server_ip,
             ech_doh,
+            ech_resolver_permit,
             blocking_engaged,
             self.state_dir.as_deref(),
             self.state_owner,
@@ -997,6 +998,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         config: &ProxyConfig,
         server_ip: IpAddr,
         ech_doh: Option<crate::dns::ech::EchDoh>,
+        ech_resolver_permit: Option<IpAddr>,
         blocking_engaged: bool,
         state_dir: Option<&std::path::Path>,
         owner: Option<(u32, u32)>,
@@ -1012,7 +1014,12 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         // DoH BEFORE this fn, so the fail-closed cover can be owned in the outer
         // scope — un-leakable by construction: `start_inner`'s many `?` exits
         // cannot drop a cover they never hold. `blocking_engaged` is whether that
-        // outer cover is live for this start.
+        // outer cover is live for this start. `ech_resolver_permit` is the SAME
+        // gated value `start_cancellable` already derived for the transient
+        // cover (`effective_ech_doh == Holes`, read from `ech_doh.resolver`) —
+        // passed through, not re-derived, so the standing lockdown cover engaged
+        // below can permit the identical address without a second derivation
+        // site drifting from the first (see CONTRIBUTING.md's "Lockdown mode").
         let server_host = crate::dns::bootstrap::handoff_host(server_ip);
 
         // Phase 1: start plugin chain via Garter if a plugin is configured.
@@ -1366,9 +1373,14 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         // locally-owned `routes` guard (declared above) Drops on the Err
         // unwind, tearing down — the opposite of the transient cover's
         // fail-open. Committed only on the Ok path (the field below).
+        // `ech_resolver_permit` (#753) is passed through unconditionally, not
+        // gated on `covered`: the standing cover is armed for manual AND
+        // covered starts alike, and the value is already gated on
+        // `effective_ech_doh == Holes` by the caller — see `start_inner`'s
+        // entry comment.
         let lockdown = if state_dir.map(lockdown_state::load_enabled).unwrap_or(false) {
             let app_ids = lockdown_app_ids(config);
-            Some(routing.install_lockdown(server_ip, TUN_DEVICE_NAME, &app_ids)?)
+            Some(routing.install_lockdown(server_ip, ech_resolver_permit, TUN_DEVICE_NAME, &app_ids)?)
         } else {
             None
         };

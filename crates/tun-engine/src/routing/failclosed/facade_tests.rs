@@ -24,7 +24,7 @@ fn engage_lockdown_reresolves_luid_every_call() {
         calls: std::sync::atomic::AtomicU32::new(0),
         luid: 0x99,
     };
-    let spec = build_lockdown_spec_for_test(&r, "hole-tun", "203.0.113.7".parse().unwrap(), &[]);
+    let spec = build_lockdown_spec_for_test(&r, "hole-tun", "203.0.113.7".parse().unwrap(), None, &[]);
     assert_eq!(r.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
     assert!(spec.filters.iter().any(|f| matches!(
         f.condition,

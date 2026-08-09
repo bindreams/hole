@@ -212,6 +212,7 @@ impl Routing for MockRouting {
     fn install_lockdown(
         &self,
         _server_ip: IpAddr,
+        _resolver_ip: Option<IpAddr>,
         _tun_name: &str,
         _app_ids: &[PathBuf],
     ) -> Result<MockCover, RoutingError> {

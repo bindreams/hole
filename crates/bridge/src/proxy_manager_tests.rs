@@ -7,6 +7,7 @@ use super::*;
 use crate::proxy::{Proxy, ProxyError, RunningProxy, TrafficTotals};
 use hole_common::config::ServerEntry;
 use hole_common::protocol::ProxyConfig;
+use plugin_e2e::locators::locate_ex_ray;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::PathBuf;
@@ -194,6 +195,10 @@ struct MockRoutingState {
     /// (a set containing both values) for the double-failure fail-open path.
     /// `fail_cover` (always-fail) is unaffected and takes priority.
     fail_cover_for_resolvers: std::sync::Mutex<std::collections::HashSet<Option<IpAddr>>>,
+    /// Last `resolver_ip` passed to `install_lockdown`, so a test can assert
+    /// the standing lockdown cover permits exactly the ONE gated resolver (or
+    /// none) — the #753 regression this whole mock exists to catch.
+    last_lockdown_resolver_ip: std::sync::Mutex<Option<IpAddr>>,
 }
 
 impl Default for MockRoutingState {
@@ -214,6 +219,7 @@ impl Default for MockRoutingState {
             last_cover_server_ip: std::sync::Mutex::new(None),
             last_cover_resolver_ip: std::sync::Mutex::new(None),
             fail_cover_for_resolvers: std::sync::Mutex::new(std::collections::HashSet::new()),
+            last_lockdown_resolver_ip: std::sync::Mutex::new(None),
         }
     }
 }
@@ -342,12 +348,14 @@ impl Routing for MockRouting {
     fn install_lockdown(
         &self,
         _server_ip: IpAddr,
+        resolver_ip: Option<IpAddr>,
         _tun_name: &str,
         _app_ids: &[std::path::PathBuf],
     ) -> Result<MockCover, RoutingError> {
         if self.state.fail_lockdown.load(Ordering::SeqCst) {
             return Err(RoutingError::RouteSetup("mock lockdown failure".into()));
         }
+        *self.state.last_lockdown_resolver_ip.lock().unwrap() = resolver_ip;
         self.state.lockdown_engage_calls.fetch_add(1, Ordering::SeqCst);
         Ok(MockCover {
             state: Arc::clone(&self.state),
@@ -410,7 +418,7 @@ fn mock_install_lockdown_records_engage_and_drop_records_disengage() {
     let state = routing.state();
 
     let cover = routing
-        .install_lockdown(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), "hole-tun", &[])
+        .install_lockdown(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), None, "hole-tun", &[])
         .expect("lockdown engages");
     assert_eq!(state.lockdown_engage_calls.load(Ordering::SeqCst), 1);
     // The transient-cover counter must NOT move — the two covers are distinct.
@@ -423,12 +431,33 @@ fn mock_install_lockdown_records_engage_and_drop_records_disengage() {
 }
 
 #[skuld::test]
+fn mock_install_lockdown_records_the_resolver_permit() {
+    // #753: the standing lockdown cover must receive the same gated resolver
+    // permit the transient cover would — recorded so ProxyManager-level tests
+    // can assert on it.
+    let dir = tempfile::tempdir().unwrap();
+    let routing = MockRouting::new(dir.path().to_path_buf());
+    let state = routing.state();
+    let resolver_ip = IpAddr::V4(Ipv4Addr::new(9, 9, 9, 9));
+
+    let _cover = routing
+        .install_lockdown(
+            IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)),
+            Some(resolver_ip),
+            "hole-tun",
+            &[],
+        )
+        .expect("lockdown engages");
+    assert_eq!(*state.last_lockdown_resolver_ip.lock().unwrap(), Some(resolver_ip));
+}
+
+#[skuld::test]
 fn mock_failing_lockdown_returns_err_without_recording() {
     let dir = tempfile::tempdir().unwrap();
     let routing = MockRouting::failing_lockdown(dir.path().to_path_buf());
     let state = routing.state();
 
-    let result = routing.install_lockdown(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), "hole-tun", &[]);
+    let result = routing.install_lockdown(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), None, "hole-tun", &[]);
     assert!(result.is_err(), "failing_lockdown must return Err");
     assert_eq!(state.lockdown_engage_calls.load(Ordering::SeqCst), 0);
 }
@@ -1102,6 +1131,137 @@ fn lockdown_on_engages_after_install_and_disengages_on_stop() {
             st.lockdown_disengage_calls.load(Ordering::SeqCst),
             1,
             "disengaged on stop"
+        );
+    });
+}
+
+// Standing lockdown resolver permit (#753) ============================================================================
+//
+// `ech_resolver_permit` is computed ONCE in `start_cancellable` (the same
+// value the transient cover's tests below already exercise extensively) and
+// threaded through `start_inner` into `install_lockdown` — see that fn's
+// entry comment. These tests prove the THREADING, not the derivation: the
+// derivation itself (`effective_ech_doh` / `ech_doh_url`) is already covered
+// by the `covered_start_*_permits_the_constructed_resolver` family for the
+// transient cover.
+
+#[skuld::test]
+fn lockdown_on_engages_with_no_resolver_permit_when_no_plugin_configured() {
+    // No plugin means no later ECH lookup, so `install_lockdown` must still be
+    // called (lockdown always engages when intent is on) but with `None` —
+    // negative direction, exercised through the REAL `start_inner` call chain
+    // (no plugin needed to reach it, unlike the positive-permit case below).
+    rt().block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        let routing = MockRouting::new(dir.path().to_path_buf());
+        let st = routing.state();
+        let (mut pm, _dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, true);
+
+        pm.start(&test_config()).await.unwrap();
+        assert_eq!(st.lockdown_engage_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            *st.last_lockdown_resolver_ip.lock().unwrap(),
+            None,
+            "no plugin configured means no resolver permit, even under lockdown"
+        );
+    });
+}
+
+/// Stage a copy of the real `ex-ray` binary (built by `cargo xtask ex-ray`)
+/// next to the running test executable, so `resolve_plugin_path`'s
+/// next-to-exe lookup finds it. `ProxyManager` has no plugin-path-override
+/// hook (unlike `server_test_tests.rs`'s lower-level SS-server harness), and
+/// the plugin subprocess isn't behind a `Proxy`/`Routing`/`Dns` trait seam —
+/// it's real code on every start — so reaching `install_lockdown` with a
+/// real plugin chain needs a real, spawnable binary at the path
+/// `ProxyManager` will actually look. Panics loud, never skips, matching
+/// `server_test_tests.rs::run_test_with_v2ray_plugin_happy_path`'s contract
+/// for a missing build.
+///
+/// Copies to a PID-suffixed temp file first, then `rename`s into place:
+/// nextest runs tests in parallel, and `std::fs::rename` replaces the
+/// destination atomically on both Windows (`MoveFileExW` +
+/// `MOVEFILE_REPLACE_EXISTING`) and POSIX (`rename(2)`), so a concurrent
+/// test's own stage-and-rename can never be observed half-written.
+fn stage_real_ex_ray_next_to_test_binary() {
+    let ex_ray = locate_ex_ray();
+    assert!(
+        ex_ray.is_file(),
+        "ex-ray not built at {ex_ray:?} — run `cargo xtask ex-ray` before running this test"
+    );
+    let dest_dir = std::env::current_exe().unwrap().parent().unwrap().to_path_buf();
+    let dest = dest_dir.join(if cfg!(windows) { "ex-ray.exe" } else { "ex-ray" });
+    if dest.is_file() {
+        return; // already staged by an earlier test in this process
+    }
+    let tmp = dest_dir.join(format!(".ex-ray-stage-{}.tmp", std::process::id()));
+    std::fs::copy(&ex_ray, &tmp).expect("copy ex-ray into a staging temp file");
+    std::fs::rename(&tmp, &dest).expect("atomically place the staged ex-ray binary");
+}
+
+#[skuld::test]
+fn lockdown_on_permits_the_gated_ech_resolver_for_a_real_plugin_chain() {
+    // THE #753 REGRESSION TEST: a lockdown-armed start with an ECH-capable
+    // plugin chain must permit the resolver ex-ray's ECH-config fetch dials —
+    // the standing cover, not just the transient one. Exercises the REAL
+    // plugin chain end to end (`start_plugin_chain` isn't behind a trait
+    // seam), so this proves the value genuinely reaches `install_lockdown`,
+    // not just the isolated `MockRouting` contract
+    // (`mock_install_lockdown_records_the_resolver_permit` proves that half).
+    rt().block_on(async {
+        stage_real_ex_ray_next_to_test_binary();
+
+        let resolver: IpAddr = "198.51.100.5".parse().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let routing = MockRouting::new(dir.path().to_path_buf());
+        let st = routing.state();
+        let (mut pm, _dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, true);
+        let mut cfg = test_config();
+        // Literal IP: no bootstrap query needed (`PinSource::NoQueryNeeded`),
+        // so this test doesn't need a mock DoH querier — `ech_doh_url` still
+        // constructs a real IP-literal URL from `dns.servers`.
+        cfg.server.server = "203.0.113.9".into();
+        cfg.server.plugin = Some("ex-ray".into());
+        cfg.server.plugin_opts = Some(ECH_CAPABLE_OPTS.into());
+        // dns.enabled = false skips the forwarder self-test (Phase 4, which
+        // MockProxy can't satisfy — see `test_config`'s doc) so the start
+        // reaches Phase 6 (routing.install / install_lockdown) and succeeds.
+        cfg.dns.enabled = false;
+        cfg.dns.servers = vec![resolver];
+
+        pm.start(&cfg).await.expect("a real ex-ray chain must start cleanly");
+        assert_eq!(st.lockdown_engage_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(*st.last_lockdown_resolver_ip.lock().unwrap(), Some(resolver));
+    });
+}
+
+#[skuld::test]
+fn lockdown_on_omits_the_resolver_permit_for_a_non_ech_capable_plugin() {
+    // Negative direction with a REAL plugin chain (not just the pure gate
+    // unit tests in plugin.rs): a plugin configured with no `tls`/`host` never
+    // reaches ECH, so the reachability gate must keep the lockdown permit at
+    // `None` even though a plugin is genuinely running under the cover.
+    rt().block_on(async {
+        stage_real_ex_ray_next_to_test_binary();
+
+        let resolver: IpAddr = "198.51.100.5".parse().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let routing = MockRouting::new(dir.path().to_path_buf());
+        let st = routing.state();
+        let (mut pm, _dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, true);
+        let mut cfg = test_config();
+        cfg.server.server = "203.0.113.9".into();
+        cfg.server.plugin = Some("ex-ray".into());
+        cfg.server.plugin_opts = None; // no tls, no host — never reaches ECH
+        cfg.dns.enabled = false;
+        cfg.dns.servers = vec![resolver];
+
+        pm.start(&cfg).await.expect("a real ex-ray chain must start cleanly");
+        assert_eq!(st.lockdown_engage_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            *st.last_lockdown_resolver_ip.lock().unwrap(),
+            None,
+            "a non-ECH-capable plugin config must not widen the lockdown cover"
         );
     });
 }

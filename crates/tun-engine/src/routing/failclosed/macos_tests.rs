@@ -188,7 +188,7 @@ fn ensure_trailing_nl_keeps_single_newline() {
 const TUN: &str = "hole-tun";
 
 fn lockdown(ip: IpAddr, nat: &str) -> String {
-    build_lockdown_main_ruleset(TUN, ip, nat)
+    build_lockdown_main_ruleset(TUN, ip, None, nat)
 }
 
 #[skuld::test]
@@ -317,6 +317,64 @@ fn lockdown_main_v6_server_permit_precedes_inet6_block() {
     assert!(
         permit_at < block_at,
         "v6 server permit must precede the inet6 block:\n{r}"
+    );
+}
+
+// build_lockdown_main_ruleset resolver permit (#753) ==================================================================
+
+#[skuld::test]
+fn lockdown_main_omits_resolver_pass_when_none() {
+    // Negative direction: no resolver_ip means no resolver pass rule at all —
+    // proves the widening is opt-in, never automatic.
+    let r = build_lockdown_main_ruleset(TUN, v4(), None, "");
+    assert!(
+        !r.contains("198.51.100.5"),
+        "lockdown main must not mention a resolver when resolver_ip is None:\n{r}"
+    );
+}
+
+#[skuld::test]
+fn lockdown_main_passes_resolver_scoped_to_tcp_443() {
+    // NOT the server permit's unrestricted shape: doh_url_for_ip
+    // (crates/bridge/src/dns/ech.rs) never constructs a URL with a port other
+    // than RESOLVER_PERMIT_PORT, so this is the one value the fetch can need.
+    let r = build_lockdown_main_ruleset(TUN, v4(), Some(resolver()), "");
+    assert!(
+        r.contains(&format!(
+            "pass out quick proto tcp from any to {} port {RESOLVER_PERMIT_PORT}",
+            resolver()
+        )),
+        "lockdown main must pass the resolver IP scoped to tcp/{RESOLVER_PERMIT_PORT}:\n{r}"
+    );
+}
+
+#[skuld::test]
+fn lockdown_main_resolver_pass_is_quick_and_precedes_block() {
+    let r = build_lockdown_main_ruleset(TUN, v4(), Some(resolver()), "");
+    let resolver_at = r.find(&resolver().to_string()).expect("resolver permit must appear");
+    let block_at = r.find("block drop out quick all").expect("block-all must appear");
+    assert!(
+        resolver_at < block_at,
+        "resolver permit must precede the block-all:\n{r}"
+    );
+    let line = r.lines().find(|l| l.contains(&resolver().to_string())).unwrap();
+    assert!(line.contains("quick"), "resolver pass rule must be quick: {line}");
+}
+
+#[skuld::test]
+fn lockdown_main_v6_resolver_permit_precedes_inet6_block() {
+    // A v6 resolver must be permitted BEFORE the wholesale inet6 block, or the
+    // ECH-config fetch to it is killed.
+    let r = build_lockdown_main_ruleset(TUN, v4(), Some(resolver_v6()), "");
+    let permit_at = r
+        .find(&resolver_v6().to_string())
+        .expect("v6 resolver permit must appear");
+    let block_at = r
+        .find("block drop out quick inet6 all")
+        .expect("inet6 block must appear");
+    assert!(
+        permit_at < block_at,
+        "v6 resolver permit must precede the inet6 block:\n{r}"
     );
 }
 

@@ -413,28 +413,16 @@ LIVE held cover's permit mismatched from what THIS attempt actually needs
 comparing against the live permit rather than re-trusting that the repair
 always converges, in EITHER direction: too narrow (`Holes`, an ECH-fetch stall
 risk) or too wide (`None`, the kill switch permits a resolver address nothing
-needs). A THIRD case is untouched by this mechanism entirely (not merely a
-residual within it): the [standing lockdown cover](#lockdown-mode)'s own
-ruleset never carries a resolver permit at all, on EITHER platform, whether
-the cover was just engaged fresh (`routing.install_lockdown`, called from
-`start_cancellable`'s `lockdown_on` branch on every covered start) or adopted
-across a restart — `build_lockdown_main_ruleset` (macOS) and
-`lockdown_app_ids` (Windows) take no `resolver_ip`/`EchDoh` input at all. On
-macOS this blocks the fetch outright, silently, on every lockdown-on covered
-start with an ECH-effective config — not only a restart-adopt, which merely
-compounds it by also removing the in-process signal a fresh engage still has
-(`effective_ech_doh`, computed before `install_lockdown` runs) but has no API
-to consume. On Windows the App-ID floor (`resolve_plugin_path(plugin)` — the
-plugin's OWN resolved binary) is sufficient for a direct `ex-ray`/
-`v2ray-plugin` config, but NOT for a chained plugin like `galoshes`: it
-`include_bytes!`s ex-ray and spawns it as a separate process from its own
-extracted runtime path (`crates/galoshes/src/embedded.rs`), which
-`lockdown_app_ids` never adds to the permit set — WFP's App-ID condition
-matches the RUNNING process's own image path, so ex-ray (the process that
-actually dials the DoH resolver) is unpermitted there too. Tracked
-separately: [#753](https://github.com/bindreams/hole/issues/753) (filed
-narrower than this; scope correction pending). Finally, the
-release-then-reengage repair itself has a brief window with NO cover at all
+needs). The [standing lockdown cover](#lockdown-mode) carries the identical
+permit — see that section — closing what was originally a THIRD, untouched
+case ([#753](https://github.com/bindreams/hole/issues/753)): its own ruleset
+used to carry no resolver permit at all, on either platform, which on macOS
+blocked the fetch outright (pf has no per-process matcher) and on Windows was
+masked only for a direct `ex-ray`/`v2ray-plugin` config — a chained plugin
+like `galoshes` spawns its inner ex-ray from a separate, lazily-extracted
+path (`crates/galoshes/src/embedded.rs`) the App-ID floor never named, so the
+process that actually dials the resolver was unpermitted there too. Finally,
+the release-then-reengage repair itself has a brief window with NO cover at all
 between the release and the corrected (or restored) re-engage — disclosed in
 the repair's own `warn!` lines, not silent, but not eliminated either: both
 platforms' engage primitives are delete-then-add / flush-then-reload, not an
@@ -452,7 +440,10 @@ sweep only knows the first ten) leaves those two permits un-swept; they are
 *permits*, never blocks,
 so this is bounded and self-healing (a later upgrade's sweep cleans them up),
 not a leak of blocked traffic. Disclosed as a source comment on
-`FILTER_GUIDS` itself. Tracked separately:
+`FILTER_GUIDS` itself. The standing lockdown cover's `LOCKDOWN_FILTER_GUIDS`
+grew the same way for the same reason (#753's two new resolver-permit
+filters, twelve entries to fourteen), disclosed as a source comment there
+too; both arrays share the one tracking issue:
 [#754](https://github.com/bindreams/hole/issues/754). **Windows only, also
 pre-existing:** the repair's release step deletes the held cover's filters by
 fixed GUID and discards the result; if a delete genuinely fails, the
@@ -569,7 +560,12 @@ reachability then depends on `remoteAddr` instead.
 The **standing lockdown cover** (`Routing::install_lockdown`, #527) is an
 opt-in, **default-off**, bridge-owned kill switch. When enabled it engages a
 persistent OS-level egress block permitting **only** loopback, the `hole-tun`
-interface, the onward server connection, and (Windows) the plugin + bridge
+interface, the onward server connection, the resolver Hole's own `ech-doh`
+names when a plugin needs it (#753 — same gate, same TCP/443 scope, same
+config-authorship trust as the [transient cover's resolver
+permit](#transient-cutover-cover); an address permit, not an App-ID one,
+because a chained plugin like `galoshes` spawns its inner ex-ray as a
+separate process no App-ID set names), and (Windows) the plugin + bridge
 binaries by App-ID — so normal traffic flows while connected and the block holds
 across a bridge restart for free. When disabled, behavior is byte-identical to a
 Hole without it.
@@ -579,17 +575,17 @@ three axes:
 
 - **Permit set.** Lockdown adds a TUN-interface permit (Windows: by `NET_LUID`;
   macOS: `pass out quick on <tun>`) so app traffic flows; the transient cover
-  deliberately omits it (permit loopback + server + the resolver Hole's own
-  `ech-doh` names, when a plugin needs it) because holding it while connected
-  would block all browsing.
+  deliberately omits it because holding it while connected would block all
+  browsing. Both covers otherwise permit the identical resolver address under
+  the identical gate — see the paragraph above.
 - **Lifetime.** Lockdown is authoritative and standing — it persists across a
   crash or restart and is reconciled on the next start via
   `decide_cover_recovery` (Adopt keeps the host fail-closed, dropping the
-  volatile TUN + server permits so the next connect re-adds them fresh; Sweep
-  disengages when intent is off). The transient cover is a non-standing,
-  bounded-window RAII guard engaged only for the duration of one covered
-  (auto-connect) start attempt, and swept by `recover_routes` like every other
-  cover state on the next start.
+  volatile TUN + server + resolver permits so the next connect re-adds them
+  fresh; Sweep disengages when intent is off). The transient cover is a
+  non-standing, bounded-window RAII guard engaged only for the duration of one
+  covered (auto-connect) start attempt, and swept by `recover_routes` like
+  every other cover state on the next start.
 - **Failure mode.** A failed lockdown engage during a lockdown-on start is
   **fail-FATAL** — it aborts the start and tears everything down; the transient
   cover fails *open* on its own engage error so a half-loaded ruleset never

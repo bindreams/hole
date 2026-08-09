@@ -84,17 +84,29 @@ pub const FILTER_GUIDS: [GUID; 12] = [
 const IPPROTO_TCP: u8 = 6;
 
 // Lockdown-cover filter GUIDs — disjoint from FILTER_GUIDS. Recovery sweeps
-// these (Sweep) or deletes the volatile TUN + server pairs (Adopt) — see
-// `recover_lockdown` / `swept_lockdown_guids`. A crash that leaves the cover
-// engaged is reconciled on the next start.
+// these (Sweep) or deletes the volatile TUN + server + resolver pairs (Adopt)
+// — see `recover_lockdown` / `swept_lockdown_guids`. A crash that leaves the
+// cover engaged is reconciled on the next start.
 // Layout: [loopback CONNECT V4, loopback CONNECT V6, TUN V4, TUN V6,
 //          server V4, server V6, block-all V4, block-all V6,
 //          loopback RECV_ACCEPT V4, loopback RECV_ACCEPT V6,
-//          loopback-net CONNECT V4, loopback-net CONNECT V6]. New pairs are
+//          loopback-net CONNECT V4, loopback-net CONNECT V6,
+//          resolver CONNECT V4, resolver CONNECT V6]. New pairs are
 //          appended so the earlier indices referenced by
 //          LOCKDOWN_{TUN,SERVER}_GUID_INDICES stay stable. App-ID
 //          filters get per-binary dynamically-derived GUIDs (see build_lockdown_spec).
-pub const LOCKDOWN_FILTER_GUIDS: [GUID; 12] = [
+//
+// CROSS-VERSION CONTRACT, same class as `FILTER_GUIDS` (see its own doc): the
+// two resolver-permit GUIDs (indices 12-13) grow this array from ten entries
+// (its size before #753) to fourteen. `swept_lockdown_guids`/`recover_lockdown`
+// sweep by enumerating this compiled-in array, not by querying the OS for
+// "every filter this provider owns" — so a crash-then-downgrade (a build that
+// knows all fourteen GUIDs engages, crashes, and an OLDER build's recovery
+// sweep only knows the first twelve) leaves the two resolver-permit filters
+// permanently un-swept. They are *permits*, never blocks, so this is bounded
+// and self-healing (a later upgrade's sweep cleans them up), not a leak of
+// blocked traffic. Tracked separately: #754.
+pub const LOCKDOWN_FILTER_GUIDS: [GUID; 14] = [
     GUID::from_u128(0x216a841b_f264_4047_8881_39f24b4d6dce), // loopback CONNECT V4
     GUID::from_u128(0x4d9cd0a2_c48f_40cf_8225_89ce3f8a1376), // loopback CONNECT V6
     GUID::from_u128(0x04216435_0209_4b16_95c4_41f7c26af397), // TUN V4
@@ -107,15 +119,24 @@ pub const LOCKDOWN_FILTER_GUIDS: [GUID; 12] = [
     GUID::from_u128(0xda582b53_9a85_b667_c519_e80db74ab67e), // loopback RECV_ACCEPT V6
     GUID::from_u128(0x2f10387e_8f54_4f82_91ca_44aa862d945e), // loopback-net CONNECT V4 (127.0.0.0/8)
     GUID::from_u128(0xd766a20f_050a_4c40_8de3_33bf259b7e34), // loopback-net CONNECT V6 (::1/128)
+    GUID::from_u128(0x668194ca_a46b_4c76_9b5c_e0f51b980f78), // resolver CONNECT V4
+    GUID::from_u128(0xf50b45a3_9209_4bbc_b5ef_ce2ccdc0b5bf), // resolver CONNECT V6
 ];
 
 /// Indices into [`LOCKDOWN_FILTER_GUIDS`] for the TUN-interface (LUID) permit
-/// pair — one of the two volatile permits Adopt drops (see
+/// pair — one of the three volatile permits Adopt drops (see
 /// [`adopt_delete_guids`]).
 const LOCKDOWN_TUN_GUID_INDICES: [usize; 2] = [2, 3]; // TUN V4, TUN V6
-/// Indices into [`LOCKDOWN_FILTER_GUIDS`] for the server-IP permit pair — the
-/// other volatile permit Adopt drops (see [`adopt_delete_guids`]).
+/// Indices into [`LOCKDOWN_FILTER_GUIDS`] for the server-IP permit pair —
+/// another volatile permit Adopt drops (see [`adopt_delete_guids`]).
 const LOCKDOWN_SERVER_GUID_INDICES: [usize; 2] = [4, 5]; // server V4, server V6
+/// Indices into [`LOCKDOWN_FILTER_GUIDS`] for the resolver-IP permit pair —
+/// the third volatile permit Adopt drops (see [`adopt_delete_guids`]): the
+/// ECH-config resolver a covered start derives is re-computed fresh on every
+/// connect exactly like `server_ip`, so a stale fixed-GUID permit surviving
+/// across an Adopt would (like an unfreshened server permit) silently keep
+/// permitting an address the current config no longer uses.
+const LOCKDOWN_RESOLVER_GUID_INDICES: [usize; 2] = [12, 13]; // resolver V4, resolver V6
 
 /// Derive a deterministic App-ID filter GUID per (binary index, layer) so a
 /// re-engage over an unswept cover is idempotent and recovery can delete by
@@ -152,15 +173,17 @@ fn swept_lockdown_guids() -> Vec<GUID> {
 }
 
 /// The GUIDs Adopt deletes: the VOLATILE permits — the TUN-LUID pair (dies with
-/// the TUN) and the server-IP pair (changes with the server). They carry fixed
-/// keys, so engage's `ok_or_exists` would silently keep a stale one; deleting
-/// them lets the next connect re-add both fresh with current values. The floor
-/// (block-all, loopback, App-ID) is left in force so the host stays fail-closed
-/// across the restart.
+/// the TUN), the server-IP pair (changes with the server), and the resolver-IP
+/// pair (changes with `dns.servers`/the plugin config, and is absent entirely
+/// on some configs). They carry fixed keys, so engage's `ok_or_exists` would
+/// silently keep a stale one; deleting them lets the next connect re-add all
+/// three fresh with current values. The floor (block-all, loopback, App-ID) is
+/// left in force so the host stays fail-closed across the restart.
 fn adopt_delete_guids() -> Vec<GUID> {
     LOCKDOWN_TUN_GUID_INDICES
         .iter()
         .chain(LOCKDOWN_SERVER_GUID_INDICES.iter())
+        .chain(LOCKDOWN_RESOLVER_GUID_INDICES.iter())
         .map(|&i| LOCKDOWN_FILTER_GUIDS[i])
         .collect()
 }
@@ -357,7 +380,19 @@ pub fn build_cover_spec(server_ip: IpAddr, resolver_ip: Option<IpAddr>) -> Cover
 /// kill switch, not inbound. Permits at `PERMIT_WEIGHT`, block at `BLOCK_WEIGHT`;
 /// within the single sublayer the higher-weight permit wins (no
 /// `CLEAR_ACTION_RIGHT`). Pure — no FFI.
-pub fn build_lockdown_spec(server_ip: IpAddr, tun_luid: u64, app_ids: &[std::path::PathBuf]) -> CoverSpec {
+///
+/// Optionally also permits ONE more address (`resolver_ip`) on its own
+/// family's CONNECT layer, scoped to `RESOLVER_PERMIT_PORT` — mirrors
+/// `build_cover_spec`'s resolver permit exactly (same trust condition, same
+/// port scope; see [`crate::routing::Routing::install_lockdown`]'s doc for
+/// why an App-ID permit alone does not cover a chained plugin's inner
+/// process). Omitted whenever nothing should be permitted.
+pub fn build_lockdown_spec(
+    server_ip: IpAddr,
+    resolver_ip: Option<IpAddr>,
+    tun_luid: u64,
+    app_ids: &[std::path::PathBuf],
+) -> CoverSpec {
     let server_layer = match server_ip {
         IpAddr::V4(_) => Layer::ConnectV4,
         IpAddr::V6(_) => Layer::ConnectV6,
@@ -425,6 +460,19 @@ pub fn build_lockdown_spec(server_ip: IpAddr, tun_luid: u64, app_ids: &[std::pat
         LOCKDOWN_FILTER_GUIDS[5]
     };
     filters.push(permit(server_guid, server_layer, Condition::RemoteIp(server_ip)));
+    if let Some(ip) = resolver_ip {
+        let (guid, layer) = match ip {
+            IpAddr::V4(_) => (LOCKDOWN_FILTER_GUIDS[12], Layer::ConnectV4),
+            IpAddr::V6(_) => (LOCKDOWN_FILTER_GUIDS[13], Layer::ConnectV6),
+        };
+        filters.push(FilterSpec {
+            guid,
+            layer,
+            action: Action::Permit,
+            condition: Condition::RemoteIpPortTcp(ip, RESOLVER_PERMIT_PORT),
+            weight: PERMIT_WEIGHT,
+        });
+    }
     filters.push(block(LOCKDOWN_FILTER_GUIDS[6], Layer::ConnectV4));
     filters.push(block(LOCKDOWN_FILTER_GUIDS[7], Layer::ConnectV6));
     CoverSpec {
@@ -559,11 +607,12 @@ pub fn engage(
 #[allow(clippy::disallowed_methods)] // THIS is the sanctioned FWPM call site
 pub fn engage_lockdown(
     server_ip: IpAddr,
+    resolver_ip: Option<IpAddr>,
     tun_luid: u64,
     app_ids: &[std::path::PathBuf],
     _state_dir: &Path,
 ) -> Result<Cover, RoutingError> {
-    let spec = build_lockdown_spec(server_ip, tun_luid, app_ids);
+    let spec = build_lockdown_spec(server_ip, resolver_ip, tun_luid, app_ids);
     unsafe {
         let mut engine = HANDLE::default();
         wfp_check(
@@ -574,9 +623,10 @@ pub fn engage_lockdown(
             wfp_check(FwpmTransactionBegin0(engine, 0), "FwpmTransactionBegin0")?;
             // Idempotent over an unswept cover: add_provider/add_sublayer use
             // ok_or_exists, and the filter keys are fixed — a re-engage after
-            // an Adopt re-adds the TUN + server permits fresh (their keys were
-            // deleted by `recover_lockdown`, so the new server IP takes effect);
-            // the kept floor (block-all + loopback + App-ID) is a benign re-add.
+            // an Adopt re-adds the TUN + server + resolver permits fresh (their
+            // keys were deleted by `recover_lockdown`, so the new values take
+            // effect); the kept floor (block-all + loopback + App-ID) is a
+            // benign re-add.
             add_provider(engine, spec.provider)?;
             add_sublayer(engine, spec.sublayer, spec.provider)?;
             for f in &spec.filters {

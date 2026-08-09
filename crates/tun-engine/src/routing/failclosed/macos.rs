@@ -7,7 +7,8 @@
 //!   `/etc/pf.conf` and drops the refcount.
 //! - **Standing lockdown** (`engage_lockdown`/`lockdown_disengage`): loads a
 //!   self-contained MAIN ruleset (NO `-Fa`) that carries the host's translation
-//!   rules forward and blocks all egress except the TUN and server IP. Disengage
+//!   rules forward and blocks all egress except the TUN, the server IP, and
+//!   (when a plugin needs it) the pinned resolver. Disengage
 //!   restores the host's pre-lockdown filter+nat from the persisted snapshot —
 //!   not a blind `/etc/pf.conf` reload — and drops the refcount. Engage
 //!   idempotently ENSURES pf is enabled (pf is disabled — and its refcount reset
@@ -72,27 +73,45 @@ pub fn ensure_trailing_nl(s: &str) -> String {
 /// Build the self-contained MAIN ruleset for the standing lockdown, loaded via
 /// `pfctl -f -` (NO `-Fa`). It IS the host's egress policy while engaged:
 /// `block drop out quick all` is the fail-closed base, with earlier `quick`
-/// permits for the TUN and the server IP.
+/// permits for the TUN, the server IP, and (when `Some`) the resolver Hole's
+/// own `ech-doh` URL names, scoped to `proto tcp port` [`RESOLVER_PERMIT_PORT`]
+/// — the same trust condition and port scope as the transient cover's
+/// `build_pf_ruleset` (see [`crate::routing::Routing::install_lockdown`]'s
+/// doc). pf has no per-process matching, so an App-ID-style permit isn't an
+/// option here even in principle — the address permit is the only way this
+/// fetch (which may run in a plugin's separately-spawned child process, e.g.
+/// galoshes' embedded ex-ray) is ever reachable under the cover.
 ///
 /// `set` lives here (main-ruleset-only — it is a parse error inside an anchor),
 /// and the host's translation rules (`nat_snapshot`, from `pfctl -sn`) are
 /// carried forward so the session does not flush NAT. Ordering is
 /// `require-order`-enforced: Options -> Translation (nat) -> Filter. The server
-/// permit precedes `block drop out quick inet6 all` so a v6 server is not
-/// killed. pf has no per-process matching, so the server permit is IP-based.
-pub fn build_lockdown_main_ruleset(tun_name: &str, server_ip: IpAddr, nat_snapshot: &str) -> String {
+/// (and resolver) permits precede `block drop out quick inet6 all` so a v6
+/// server/resolver is not killed. pf has no per-process matching, so the
+/// server permit is IP-based.
+pub fn build_lockdown_main_ruleset(
+    tun_name: &str,
+    server_ip: IpAddr,
+    resolver_ip: Option<IpAddr>,
+    nat_snapshot: &str,
+) -> String {
     let proto = "tcp"; // +udp once a UDP-transport plugin lands; egress is TCP-only today.
+    let resolver_pass = resolver_ip
+        .map(|ip| format!("pass out quick proto tcp from any to {ip} port {RESOLVER_PERMIT_PORT}\n"))
+        .unwrap_or_default();
     format!(
         "set block-policy drop\n\
          set skip on lo0\n\
          {nat}\
          pass out quick proto {proto} from any to {ip}\n\
+         {resolver}\
          pass out quick on {tun} all\n\
          block drop out quick inet6 all\n\
          block drop out quick all\n",
         nat = ensure_trailing_nl(nat_snapshot),
         proto = proto,
         ip = server_ip,
+        resolver = resolver_pass,
         tun = tun_name,
     )
 }
@@ -331,6 +350,7 @@ fn capture_and_persist(token: &str, state_dir: &Path, owner: Option<(u32, u32)>)
 /// the bridge's fail-FATAL caller aborts the start.
 pub fn engage_lockdown(
     server_ip: IpAddr,
+    resolver_ip: Option<IpAddr>,
     tun_name: &str,
     state_dir: &Path,
     owner: Option<(u32, u32)>,
@@ -391,7 +411,7 @@ pub fn engage_lockdown(
         }
     };
 
-    let main = build_lockdown_main_ruleset(tun_name, server_ip, &nat_snapshot);
+    let main = build_lockdown_main_ruleset(tun_name, server_ip, resolver_ip, &nat_snapshot);
     let out = pfctl(&["-f", "-"], Some(main.as_bytes()), PHASE_COVER)?;
     if !out.status.success() {
         // Restore the host (snapshot reload + drop refcount) before failing, so

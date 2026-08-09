@@ -94,15 +94,19 @@ pub fn recover_cover(state_dir: &Path, adopting: bool) {
     platform::recover_cover(state_dir, adopting);
 }
 
-/// Engage the standing lockdown cover (loopback + TUN + onward-server + —on
-/// Windows— plugin/bridge App-IDs permitted, all else blocked). Returns the
-/// SAME [`Cover`] wrapper the transient `engage` returns — the platform guard
-/// is kind-aware, so dropping it disengages the lockdown cover specifically.
-/// On Windows the LUID is re-resolved here every engage (never persisted). On
-/// failure the host is left uncovered; the bridge's fail-FATAL caller aborts
-/// the start. `app_ids` is empty on macOS (pf has no per-process matching).
+/// Engage the standing lockdown cover (loopback + TUN + onward-server + (when
+/// `Some`) `resolver_ip`, scoped to TCP/443 + —on Windows— plugin/bridge
+/// App-IDs permitted, all else blocked). Returns the SAME [`Cover`] wrapper
+/// the transient `engage` returns — the platform guard is kind-aware, so
+/// dropping it disengages the lockdown cover specifically. On Windows the
+/// LUID is re-resolved here every engage (never persisted). On failure the
+/// host is left uncovered; the bridge's fail-FATAL caller aborts the start.
+/// `app_ids` is empty on macOS (pf has no per-process matching); `resolver_ip`
+/// carries the same trust condition as [`engage`]'s — see
+/// [`crate::routing::Routing::install_lockdown`]'s doc.
 pub fn engage_lockdown(
     server_ip: IpAddr,
+    resolver_ip: Option<IpAddr>,
     tun_name: &str,
     resolver: &dyn LuidResolver,
     app_ids: &[std::path::PathBuf],
@@ -114,14 +118,14 @@ pub fn engage_lockdown(
         let _ = owner;
         let luid = resolver.resolve(tun_name)?;
         Ok(Cover {
-            _inner: platform::engage_lockdown(server_ip, luid, app_ids, state_dir)?,
+            _inner: platform::engage_lockdown(server_ip, resolver_ip, luid, app_ids, state_dir)?,
         })
     }
     #[cfg(target_os = "macos")]
     {
         let _ = (resolver, app_ids);
         Ok(Cover {
-            _inner: platform::engage_lockdown(server_ip, tun_name, state_dir, owner)?,
+            _inner: platform::engage_lockdown(server_ip, resolver_ip, tun_name, state_dir, owner)?,
         })
     }
 }
@@ -179,10 +183,11 @@ pub(crate) fn build_lockdown_spec_for_test(
     resolver: &dyn LuidResolver,
     tun_name: &str,
     server_ip: IpAddr,
+    resolver_ip: Option<IpAddr>,
     app_ids: &[std::path::PathBuf],
 ) -> platform::CoverSpec {
     let luid = resolver.resolve(tun_name).expect("mock resolver");
-    platform::build_lockdown_spec(server_ip, luid, app_ids)
+    platform::build_lockdown_spec(server_ip, resolver_ip, luid, app_ids)
 }
 
 // Windows-only: pins the resolve-then-build LUID ordering. macOS keys pf on the

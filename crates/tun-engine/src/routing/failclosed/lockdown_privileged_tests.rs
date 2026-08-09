@@ -27,11 +27,13 @@
 //! `serial = TUN` only serializes within one binary.
 //!
 //! COUPLED NAMES: that group's filter matches these tests by the name substrings
-//! `windows_lockdown_permits_server_ip_`, `macos_lockdown_permits_server_ip_`,
-//! and `failclosed_permits_` (the transient-cover tests). Renaming one
-//! WITHOUT updating `.config/nextest.toml` drops the test from the group → a
-//! silent cross-binary race with the bridge's live-egress
-//! `e2e_none_full_tunnel_roundtrip`. Change both together.
+//! `windows_lockdown_permits_`, `macos_lockdown_permits_` (every real-engage
+//! standing-lockdown test, server-IP and resolver-IP alike), and
+//! `failclosed_permits_` (the transient-cover tests). Renaming one, or adding a
+//! new real-engage test that doesn't share one of these substrings, WITHOUT
+//! updating `.config/nextest.toml` drops the test from the group → a silent
+//! cross-binary race with the bridge's live-egress `e2e_none_full_tunnel_roundtrip`.
+//! Change both together.
 
 use super::*;
 
@@ -100,6 +102,7 @@ fn windows_lockdown_permits_server_ip_and_blocks_other_egress() {
     // source to exercise the real resolve + `LocalInterface` filter path.
     let cover = engage_lockdown(
         server_ip,
+        None,
         "Loopback Pseudo-Interface 1",
         &resolver,
         &[],
@@ -131,6 +134,89 @@ fn windows_lockdown_permits_server_ip_and_blocks_other_egress() {
         connect(NON_PERMITTED).is_ok(),
         "disengage must restore egress to the previously-blocked host: {NON_PERMITTED}={:?}",
         connect(NON_PERMITTED).err().map(|e| e.kind()),
+    );
+}
+
+/// Windows real-engage verification (#753) that the STANDING lockdown cover's
+/// OPTIONAL resolver permit is real and selective — the Windows counterpart of
+/// `windows_failclosed_permits_resolver_blocks_other_egress` for the transient
+/// cover. With `resolver_ip = Some`, both the server AND the resolver stay
+/// reachable while a third, non-permitted host is still blocked, and the
+/// resolver permit is scoped to TCP/443 (the same resolver on a different port
+/// stays blocked).
+#[cfg(target_os = "windows")]
+#[skuld::test(labels = [TUN], serial = TUN)]
+fn windows_lockdown_permits_resolver_blocks_other_egress() {
+    use std::net::TcpStream;
+    use std::time::Duration;
+
+    let dir = tempfile::tempdir().unwrap();
+    let resolver = SystemLuidResolver;
+    let server_ip: std::net::IpAddr = "1.1.1.1".parse().unwrap();
+    let resolver_ip: std::net::IpAddr = "9.9.9.9".parse().unwrap();
+
+    let connect = |addr: &str| TcpStream::connect_timeout(&addr.parse().unwrap(), Duration::from_secs(5));
+
+    let (bp, br, bpo, bn) = (
+        connect(PERMITTED),
+        connect(RESOLVER),
+        connect(RESOLVER_OTHER_PORT),
+        connect(NON_PERMITTED),
+    );
+    assert!(
+        bp.is_ok() && br.is_ok() && bpo.is_ok() && bn.is_ok(),
+        "NETWORK/ENVIRONMENT problem (not the cover): baseline egress must reach all hosts; \
+         {PERMITTED}={:?} {RESOLVER}={:?} {RESOLVER_OTHER_PORT}={:?} {NON_PERMITTED}={:?}",
+        bp.err().map(|e| e.kind()),
+        br.err().map(|e| e.kind()),
+        bpo.err().map(|e| e.kind()),
+        bn.err().map(|e| e.kind()),
+    );
+
+    let cover = engage_lockdown(
+        server_ip,
+        Some(resolver_ip),
+        "Loopback Pseudo-Interface 1",
+        &resolver,
+        &[],
+        dir.path(),
+        None,
+    )
+    .expect("engage real WFP lockdown cover with a resolver permit");
+
+    let (p, r, po, n) = (
+        connect(PERMITTED),
+        connect(RESOLVER),
+        connect(RESOLVER_OTHER_PORT),
+        connect(NON_PERMITTED),
+    );
+    assert!(
+        p.is_ok(),
+        "server-IP permit must beat block-all: {PERMITTED}={:?}",
+        p.err().map(|e| e.kind())
+    );
+    assert!(
+        r.is_ok(),
+        "resolver-IP permit must beat block-all: {RESOLVER}={:?}",
+        r.err().map(|e| e.kind())
+    );
+    assert!(
+        po.is_err(),
+        "the resolver permit must be scoped to TCP/443, not the whole IP (leak!): \
+         {RESOLVER_OTHER_PORT} connected"
+    );
+    assert!(
+        n.is_err(),
+        "a third, non-permitted host must still be blocked (leak!): {NON_PERMITTED} connected"
+    );
+
+    drop(cover);
+    let (rn, rpo) = (connect(NON_PERMITTED), connect(RESOLVER_OTHER_PORT));
+    assert!(
+        rn.is_ok() && rpo.is_ok(),
+        "disengage must restore egress: {NON_PERMITTED}={:?} {RESOLVER_OTHER_PORT}={:?}",
+        rn.err().map(|e| e.kind()),
+        rpo.err().map(|e| e.kind()),
     );
 }
 
@@ -175,7 +261,7 @@ fn macos_lockdown_permits_server_ip_blocks_other_egress_and_restores() {
         base_non.err().map(|e| e.kind()),
     );
 
-    let cover = engage_lockdown(server_ip, "utun-absent", &resolver, &[], dir.path(), None)
+    let cover = engage_lockdown(server_ip, None, "utun-absent", &resolver, &[], dir.path(), None)
         .expect("engage real pf lockdown cover");
 
     // (a) The live main ruleset carries our authoritative block rule.
@@ -213,6 +299,94 @@ fn macos_lockdown_permits_server_ip_blocks_other_egress_and_restores() {
         connect(NON_PERMITTED).is_ok(),
         "disengage must restore egress to the previously-blocked host: {NON_PERMITTED}={:?}",
         connect(NON_PERMITTED).err().map(|e| e.kind()),
+    );
+}
+
+/// macOS real-engage verification (#753) that the STANDING lockdown cover's
+/// OPTIONAL resolver permit is real and selective — the macOS counterpart of
+/// `windows_lockdown_permits_resolver_blocks_other_egress`. Also proves the
+/// permit is scoped to TCP/443, not the whole resolver IP.
+#[cfg(target_os = "macos")]
+#[skuld::test(labels = [TUN], serial = TUN)]
+fn macos_lockdown_permits_resolver_blocks_other_egress() {
+    use std::net::TcpStream;
+    use std::process::Command;
+    use std::time::Duration;
+
+    let dir = tempfile::tempdir().unwrap();
+    let resolver = SystemLuidResolver;
+    let server_ip: std::net::IpAddr = "1.1.1.1".parse().unwrap();
+    let resolver_ip: std::net::IpAddr = "9.9.9.9".parse().unwrap();
+
+    let connect = |addr: &str| TcpStream::connect_timeout(&addr.parse().unwrap(), Duration::from_secs(5));
+
+    let (bp, br, bpo, bn) = (
+        connect(PERMITTED),
+        connect(RESOLVER),
+        connect(RESOLVER_OTHER_PORT),
+        connect(NON_PERMITTED),
+    );
+    assert!(
+        bp.is_ok() && br.is_ok() && bpo.is_ok() && bn.is_ok(),
+        "NETWORK/ENVIRONMENT problem (not the cover): baseline egress must reach all hosts; \
+         {PERMITTED}={:?} {RESOLVER}={:?} {RESOLVER_OTHER_PORT}={:?} {NON_PERMITTED}={:?}",
+        bp.err().map(|e| e.kind()),
+        br.err().map(|e| e.kind()),
+        bpo.err().map(|e| e.kind()),
+        bn.err().map(|e| e.kind()),
+    );
+
+    let cover = engage_lockdown(
+        server_ip,
+        Some(resolver_ip),
+        "utun-absent",
+        &resolver,
+        &[],
+        dir.path(),
+        None,
+    )
+    .expect("engage real pf lockdown cover with a resolver permit");
+
+    let sr = Command::new("pfctl").args(["-sr"]).output().unwrap();
+    let rules = String::from_utf8_lossy(&sr.stdout);
+    assert!(
+        rules.contains("9.9.9.9"),
+        "live lockdown ruleset must carry the resolver permit:\n{rules}"
+    );
+
+    let (p, r, po, n) = (
+        connect(PERMITTED),
+        connect(RESOLVER),
+        connect(RESOLVER_OTHER_PORT),
+        connect(NON_PERMITTED),
+    );
+    assert!(
+        p.is_ok(),
+        "server-IP permit must beat block-all: {PERMITTED}={:?}",
+        p.err().map(|e| e.kind())
+    );
+    assert!(
+        r.is_ok(),
+        "resolver-IP permit must beat block-all: {RESOLVER}={:?}",
+        r.err().map(|e| e.kind())
+    );
+    assert!(
+        po.is_err(),
+        "the resolver permit must be scoped to TCP/443, not the whole IP (leak!): \
+         {RESOLVER_OTHER_PORT} connected"
+    );
+    assert!(
+        n.is_err(),
+        "a third, non-permitted host must still be blocked (leak!): {NON_PERMITTED} connected"
+    );
+
+    drop(cover);
+    let (rn, rpo) = (connect(NON_PERMITTED), connect(RESOLVER_OTHER_PORT));
+    assert!(
+        rn.is_ok() && rpo.is_ok(),
+        "disengage must restore egress: {NON_PERMITTED}={:?} {RESOLVER_OTHER_PORT}={:?}",
+        rn.err().map(|e| e.kind()),
+        rpo.err().map(|e| e.kind()),
     );
 }
 
