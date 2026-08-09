@@ -398,10 +398,15 @@ fn resolver_permit_filter(resolver_ip: Option<IpAddr>, guid_v4: GUID, guid_v6: G
 /// port scope; see [`crate::routing::Routing::install_lockdown`]'s doc for
 /// why an App-ID permit alone does not cover a chained plugin's inner
 /// process). Omitted whenever nothing should be permitted.
+///
+/// `tun_luid` is `None` for the pre-Phase-1 permits-only engage (see
+/// [`crate::routing::Routing::install_lockdown_permits`]'s doc): the TUN
+/// filter pair is omitted entirely, not merely unmatchable, since no LUID is
+/// resolvable before `routing.install` creates the adapter.
 pub fn build_lockdown_spec(
     server_ip: IpAddr,
     resolver_ip: Option<IpAddr>,
-    tun_luid: u64,
+    tun_luid: Option<u64>,
     app_ids: &[std::path::PathBuf],
 ) -> CoverSpec {
     let server_layer = match server_ip {
@@ -442,17 +447,19 @@ pub fn build_lockdown_spec(
             Layer::RecvAcceptV6,
             Condition::LoopbackNet(IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)),
         ),
-        permit(
+    ];
+    if let Some(luid) = tun_luid {
+        filters.push(permit(
             LOCKDOWN_FILTER_GUIDS[2],
             Layer::ConnectV4,
-            Condition::LocalInterface(tun_luid),
-        ),
-        permit(
+            Condition::LocalInterface(luid),
+        ));
+        filters.push(permit(
             LOCKDOWN_FILTER_GUIDS[3],
             Layer::ConnectV6,
-            Condition::LocalInterface(tun_luid),
-        ),
-    ];
+            Condition::LocalInterface(luid),
+        ));
+    }
     for (i, path) in app_ids.iter().enumerate() {
         filters.push(permit(
             appid_filter_guid(i, false),
@@ -611,7 +618,7 @@ pub fn engage(
 pub fn engage_lockdown(
     server_ip: IpAddr,
     resolver_ip: Option<IpAddr>,
-    tun_luid: u64,
+    tun_luid: Option<u64>,
     app_ids: &[std::path::PathBuf],
     _state_dir: &Path,
 ) -> Result<Cover, RoutingError> {
@@ -647,6 +654,49 @@ pub fn engage_lockdown(
             engine,
             kind: CoverKind::Lockdown,
         })
+    }
+}
+
+/// Engage the standing lockdown cover's permits WITHOUT the TUN-interface
+/// permit, and without returning an RAII guard — see
+/// [`crate::routing::Routing::install_lockdown_permits`]'s doc for the full
+/// rationale. Opens its own engine, adds/refreshes the filters in one
+/// transaction (idempotent, same as [`engage_lockdown`]), and closes the
+/// engine immediately: unlike `engage_lockdown`, there is no long-lived guard
+/// here to own the handle, since the filters this installs are recovered by
+/// the SAME fixed GUIDs `engage_lockdown`'s later, TUN-inclusive call (or
+/// `recover_lockdown`/`disengage_lockdown`) already sweeps.
+#[allow(clippy::disallowed_methods)] // THIS is the sanctioned FWPM call site
+pub fn engage_lockdown_permits(
+    server_ip: IpAddr,
+    resolver_ip: Option<IpAddr>,
+    app_ids: &[std::path::PathBuf],
+    _state_dir: &Path,
+) -> Result<(), RoutingError> {
+    let spec = build_lockdown_spec(server_ip, resolver_ip, None, app_ids);
+    unsafe {
+        let mut engine = HANDLE::default();
+        wfp_check(
+            FwpmEngineOpen0(PCWSTR::null(), RPC_C_AUTHN_WINNT, None, None, &mut engine),
+            "FwpmEngineOpen0",
+        )?;
+        let result = (|| -> Result<(), RoutingError> {
+            wfp_check(FwpmTransactionBegin0(engine, 0), "FwpmTransactionBegin0")?;
+            add_provider(engine, spec.provider)?;
+            add_sublayer(engine, spec.sublayer, spec.provider)?;
+            for f in &spec.filters {
+                add_filter(engine, spec.provider, spec.sublayer, f)?;
+            }
+            wfp_check(FwpmTransactionCommit0(engine), "FwpmTransactionCommit0")?;
+            Ok(())
+        })();
+        if let Err(e) = result {
+            let _ = FwpmTransactionAbort0(engine);
+            let _ = FwpmEngineClose0(engine);
+            return Err(e);
+        }
+        let _ = FwpmEngineClose0(engine);
+        Ok(())
     }
 }
 

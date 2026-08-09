@@ -84,14 +84,16 @@ pub fn ensure_trailing_nl(s: &str) -> String {
 /// Build the self-contained MAIN ruleset for the standing lockdown, loaded via
 /// `pfctl -f -` (NO `-Fa`). It IS the host's egress policy while engaged:
 /// `block drop out quick all` is the fail-closed base, with earlier `quick`
-/// permits for the TUN, the server IP, and (when `Some`) the resolver Hole's
-/// own `ech-doh` URL names, scoped to `proto tcp port` [`RESOLVER_PERMIT_PORT`]
-/// — the same trust condition and port scope as the transient cover's
-/// `build_pf_ruleset` (see [`crate::routing::Routing::install_lockdown`]'s
-/// doc). pf has no per-process matching, so an App-ID-style permit isn't an
-/// option here even in principle — the address permit is the only way this
-/// fetch (which may run in a plugin's separately-spawned child process, e.g.
-/// galoshes' embedded ex-ray) is ever reachable under the cover.
+/// permits for the TUN (when `tun_name` is `Some` — see [`tun_pass_line`]'s
+/// doc for why the pre-Phase-1 engage omits it), the server IP, and (when
+/// `Some`) the resolver Hole's own `ech-doh` URL names, scoped to
+/// `proto tcp port` [`RESOLVER_PERMIT_PORT`] — the same trust condition and
+/// port scope as the transient cover's `build_pf_ruleset` (see
+/// [`crate::routing::Routing::install_lockdown`]'s doc). pf has no
+/// per-process matching, so an App-ID-style permit isn't an option here even
+/// in principle — the address permit is the only way this fetch (which may
+/// run in a plugin's separately-spawned child process, e.g. galoshes'
+/// embedded ex-ray) is ever reachable under the cover.
 ///
 /// `set` lives here (main-ruleset-only — it is a parse error inside an anchor),
 /// and the host's translation rules (`nat_snapshot`, from `pfctl -sn`) are
@@ -101,7 +103,7 @@ pub fn ensure_trailing_nl(s: &str) -> String {
 /// server/resolver is not killed. pf has no per-process matching, so the
 /// server permit is IP-based.
 pub fn build_lockdown_main_ruleset(
-    tun_name: &str,
+    tun_name: Option<&str>,
     server_ip: IpAddr,
     resolver_ip: Option<IpAddr>,
     nat_snapshot: &str,
@@ -113,15 +115,27 @@ pub fn build_lockdown_main_ruleset(
          {nat}\
          pass out quick proto {proto} from any to {ip}\n\
          {resolver}\
-         pass out quick on {tun} all\n\
+         {tun}\
          block drop out quick inet6 all\n\
          block drop out quick all\n",
         nat = ensure_trailing_nl(nat_snapshot),
         proto = proto,
         ip = server_ip,
         resolver = resolver_pass_line(resolver_ip),
-        tun = tun_name,
+        tun = tun_pass_line(tun_name),
     )
+}
+
+/// The optional TUN-interface pf line for `tun_name` — `None` for the
+/// pre-Phase-1 permits-only engage (see
+/// [`crate::routing::Routing::install_lockdown_permits`]'s doc): app traffic
+/// has nowhere to flow before `routing.install` creates the adapter, so the
+/// permit is omitted entirely rather than naming an interface that cannot yet
+/// exist.
+fn tun_pass_line(tun_name: Option<&str>) -> String {
+    tun_name
+        .map(|t| format!("pass out quick on {t} all\n"))
+        .unwrap_or_default()
 }
 
 /// Build the ruleset that restores the host's pre-lockdown policy on Sweep,
@@ -284,6 +298,22 @@ impl Drop for Cover {
     }
 }
 
+impl Cover {
+    /// Discard the guard without disengaging: used only by the facade's
+    /// early, non-owning `engage_lockdown_permits` call (see
+    /// [`crate::routing::Routing::install_lockdown_permits`]'s doc), which
+    /// reuses this module's full `engage_lockdown` (with `tun_name = None`)
+    /// and has no use for the returned guard — the permits it installed are
+    /// recovered by the persisted lockdown state file regardless of any
+    /// in-memory guard's lifetime. No OS handle needs releasing here (unlike
+    /// Windows' WFP engine handle): `pfctl` has already completed by the time
+    /// this runs, so this is a plain `mem::forget`, skipping only the Drop's
+    /// restore-from-snapshot side effect.
+    pub(crate) fn forget_without_disengage(self) {
+        std::mem::forget(self);
+    }
+}
+
 /// Drop the transient enable refcount + clear the file. When `adopting` is
 /// false, also restore the canonical ruleset (the transient engage did `-Fa`,
 /// flushing host rules, so the restore is mandatory to undo the flush). When a
@@ -359,7 +389,7 @@ fn capture_and_persist(token: &str, state_dir: &Path, owner: Option<(u32, u32)>)
 pub fn engage_lockdown(
     server_ip: IpAddr,
     resolver_ip: Option<IpAddr>,
-    tun_name: &str,
+    tun_name: Option<&str>,
     state_dir: &Path,
     owner: Option<(u32, u32)>,
 ) -> Result<Cover, RoutingError> {

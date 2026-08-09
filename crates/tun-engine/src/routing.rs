@@ -450,6 +450,12 @@ pub trait Routing: Send + Sync {
     /// the TUN. The LUID is re-resolved on every call (never persisted).
     /// Fail-FATAL: the bridge aborts the start on Err.
     ///
+    /// Called at Phase 6 (`ProxyManager::start_inner`), once `install` has
+    /// resolved the TUN adapter — NOT the first engage of a start: every
+    /// permit here except the TUN one is already live from Phase 0's
+    /// [`install_lockdown_permits`](Self::install_lockdown_permits), whose doc
+    /// explains why that earlier call exists.
+    ///
     /// `resolver_ip` carries the exact same trust condition as
     /// `install_failclosed_cover`'s (see that method's doc): the caller's own
     /// `ech-doh` URL names it, gated on `effective_ech_doh == Holes`, so
@@ -466,6 +472,35 @@ pub trait Routing: Send + Sync {
         tun_name: &str,
         app_ids: &[PathBuf],
     ) -> Result<Self::Cover, RoutingError>;
+
+    /// Engage the standing lockdown cover's permits WITHOUT the TUN-interface
+    /// permit: loopback, the onward server connection, (when `Some`)
+    /// `resolver_ip`, and (Windows) the `app_ids` binaries — every permit
+    /// [`install_lockdown`](Self::install_lockdown) installs except the TUN
+    /// one. Idempotent, and returns no guard: the permits it adds are
+    /// recovered by the SAME fixed key (Windows: compiled-in GUID; macOS: the
+    /// lockdown state file) that `install_lockdown`'s later call and the
+    /// whole recovery machinery (`recover_lockdown`/`disengage_lockdown`)
+    /// already use, so there is nothing here for an RAII guard to uniquely
+    /// own.
+    ///
+    /// Call this BEFORE Phase 1 (plugin-chain start) — mirroring exactly when
+    /// [`install_failclosed_cover`](Self::install_failclosed_cover) engages —
+    /// so a plugin's Phase-4 forwarder self-test (where ex-ray's lazy
+    /// ECH-config fetch actually fires, on the chain's first real dial) is
+    /// already covered. Without this, on an armed machine the standing cover
+    /// is already live during Phase 4 (installed by a previous run or adopted
+    /// at startup, blocking everything not yet permitted), and
+    /// `install_lockdown` alone — gated on Phase 6, which needs `install` to
+    /// have resolved the TUN adapter first — arrives too late to protect that
+    /// dial (#753). Fail-FATAL, matching `install_lockdown`: an engage error
+    /// under intent-on aborts the start.
+    fn install_lockdown_permits(
+        &self,
+        server_ip: IpAddr,
+        resolver_ip: Option<IpAddr>,
+        app_ids: &[PathBuf],
+    ) -> Result<(), RoutingError>;
 }
 
 // System (production) routing =========================================================================================
@@ -561,6 +596,15 @@ impl Routing for SystemRouting {
             &self.state_dir,
             self.owner,
         )
+    }
+
+    fn install_lockdown_permits(
+        &self,
+        server_ip: IpAddr,
+        resolver_ip: Option<IpAddr>,
+        app_ids: &[PathBuf],
+    ) -> Result<(), RoutingError> {
+        failclosed::engage_lockdown_permits(server_ip, resolver_ip, app_ids, &self.state_dir, self.owner)
     }
 }
 

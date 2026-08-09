@@ -199,6 +199,14 @@ struct MockRoutingState {
     /// the standing lockdown cover permits exactly the ONE gated resolver (or
     /// none).
     last_lockdown_resolver_ip: std::sync::Mutex<Option<IpAddr>>,
+    /// Count of `install_lockdown_permits` calls — the Phase-0, pre-Phase-1
+    /// early engage (#753). Distinct from `lockdown_engage_calls` (Phase 6,
+    /// TUN-inclusive) so a test can prove the EARLY call fires even when
+    /// Phase 6 never runs (e.g. the self-test fails first).
+    lockdown_permits_calls: AtomicU32,
+    /// Last `resolver_ip` passed to `install_lockdown_permits`.
+    last_lockdown_permits_resolver_ip: std::sync::Mutex<Option<IpAddr>>,
+    fail_lockdown_permits: AtomicBool,
 }
 
 impl Default for MockRoutingState {
@@ -220,6 +228,9 @@ impl Default for MockRoutingState {
             last_cover_resolver_ip: std::sync::Mutex::new(None),
             fail_cover_for_resolvers: std::sync::Mutex::new(std::collections::HashSet::new()),
             last_lockdown_resolver_ip: std::sync::Mutex::new(None),
+            lockdown_permits_calls: AtomicU32::new(0),
+            last_lockdown_permits_resolver_ip: std::sync::Mutex::new(None),
+            fail_lockdown_permits: AtomicBool::new(false),
         }
     }
 }
@@ -258,6 +269,14 @@ impl MockRouting {
     fn failing_lockdown(state_dir: PathBuf) -> Self {
         let m = Self::new(state_dir);
         m.state.fail_lockdown.store(true, Ordering::SeqCst);
+        m
+    }
+
+    /// Makes the Phase-0 early engage (`install_lockdown_permits`) fail,
+    /// distinct from `failing_lockdown` (which fails the Phase-6 call).
+    fn failing_lockdown_permits(state_dir: PathBuf) -> Self {
+        let m = Self::new(state_dir);
+        m.state.fail_lockdown_permits.store(true, Ordering::SeqCst);
         m
     }
 
@@ -362,6 +381,20 @@ impl Routing for MockRouting {
             lockdown: true,
         })
     }
+
+    fn install_lockdown_permits(
+        &self,
+        _server_ip: IpAddr,
+        resolver_ip: Option<IpAddr>,
+        _app_ids: &[std::path::PathBuf],
+    ) -> Result<(), RoutingError> {
+        if self.state.fail_lockdown_permits.load(Ordering::SeqCst) {
+            return Err(RoutingError::RouteSetup("mock lockdown-permits failure".into()));
+        }
+        *self.state.last_lockdown_permits_resolver_ip.lock().unwrap() = resolver_ip;
+        self.state.lockdown_permits_calls.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
 }
 
 struct MockRoutes {
@@ -460,6 +493,38 @@ fn mock_failing_lockdown_returns_err_without_recording() {
     let result = routing.install_lockdown(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), None, "hole-tun", &[]);
     assert!(result.is_err(), "failing_lockdown must return Err");
     assert_eq!(state.lockdown_engage_calls.load(Ordering::SeqCst), 0);
+}
+
+#[skuld::test]
+fn mock_install_lockdown_permits_records_the_call_and_resolver() {
+    // Distinct from install_lockdown's own mock counter: the Phase-0 early
+    // engage returns no guard at all (see `install_lockdown_permits`'s doc).
+    let dir = tempfile::tempdir().unwrap();
+    let routing = MockRouting::new(dir.path().to_path_buf());
+    let state = routing.state();
+    let resolver_ip = IpAddr::V4(Ipv4Addr::new(9, 9, 9, 9));
+
+    routing
+        .install_lockdown_permits(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), Some(resolver_ip), &[])
+        .expect("permits engage");
+    assert_eq!(state.lockdown_permits_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        *state.last_lockdown_permits_resolver_ip.lock().unwrap(),
+        Some(resolver_ip)
+    );
+    // The Phase-6, TUN-inclusive counter must NOT move.
+    assert_eq!(state.lockdown_engage_calls.load(Ordering::SeqCst), 0);
+}
+
+#[skuld::test]
+fn mock_failing_lockdown_permits_returns_err_without_recording() {
+    let dir = tempfile::tempdir().unwrap();
+    let routing = MockRouting::failing_lockdown_permits(dir.path().to_path_buf());
+    let state = routing.state();
+
+    let result = routing.install_lockdown_permits(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), None, &[]);
+    assert!(result.is_err(), "failing_lockdown_permits must return Err");
+    assert_eq!(state.lockdown_permits_calls.load(Ordering::SeqCst), 0);
 }
 
 // Helpers =============================================================================================================
@@ -1139,18 +1204,21 @@ fn lockdown_on_engages_after_install_and_disengages_on_stop() {
 //
 // `ech_resolver_permit` is computed ONCE in `start_cancellable` (the same
 // value the transient cover's tests below already exercise extensively) and
-// threaded through `start_inner` into `install_lockdown` — see that fn's
-// entry comment. These tests prove the THREADING, not the derivation: the
-// derivation itself (`effective_ech_doh` / `ech_doh_url`) is already covered
-// by the `covered_start_*_permits_the_constructed_resolver` family for the
-// transient cover.
+// threaded through `start_inner` into BOTH `install_lockdown_permits`
+// (Phase 0, before Phase 1 — see that fn's doc for why, #753) and
+// `install_lockdown` (Phase 6, which additionally adds the TUN permit) —
+// see `start_inner`'s entry comment. These tests prove the THREADING, not
+// the derivation: the derivation itself (`effective_ech_doh` / `ech_doh_url`)
+// is already covered by the `covered_start_*_permits_the_constructed_resolver`
+// family for the transient cover.
 
 #[skuld::test]
 fn lockdown_on_engages_with_no_resolver_permit_when_no_plugin_configured() {
-    // No plugin means no later ECH lookup, so `install_lockdown` must still be
-    // called (lockdown always engages when intent is on) but with `None` —
-    // negative direction, exercised through the REAL `start_inner` call chain
-    // (no plugin needed to reach it, unlike the positive-permit case below).
+    // No plugin means no later ECH lookup, so BOTH `install_lockdown_permits`
+    // (Phase 0) and `install_lockdown` (Phase 6) must still be called
+    // (lockdown always engages when intent is on) but with `None` — negative
+    // direction, exercised through the REAL `start_inner` call chain (no
+    // plugin needed to reach it, unlike the positive-permit case below).
     rt().block_on(async {
         let dir = tempfile::tempdir().unwrap();
         let routing = MockRouting::new(dir.path().to_path_buf());
@@ -1158,6 +1226,12 @@ fn lockdown_on_engages_with_no_resolver_permit_when_no_plugin_configured() {
         let (mut pm, _dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, true);
 
         pm.start(&test_config()).await.unwrap();
+        assert_eq!(st.lockdown_permits_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            *st.last_lockdown_permits_resolver_ip.lock().unwrap(),
+            None,
+            "no plugin configured means no resolver permit at the Phase-0 early engage either"
+        );
         assert_eq!(st.lockdown_engage_calls.load(Ordering::SeqCst), 1);
         assert_eq!(
             *st.last_lockdown_resolver_ip.lock().unwrap(),
@@ -1190,20 +1264,19 @@ fn stage_real_ex_ray() -> (tempfile::TempDir, String) {
 
 #[skuld::test]
 fn lockdown_on_permits_the_gated_ech_resolver_for_a_real_plugin_chain() {
-    // Proves the WIRING: when `install_lockdown` (Phase 6) DOES run, it
-    // carries the correctly-gated resolver -- the standing cover, not just
-    // the transient one. Exercises the REAL plugin chain end to end
-    // (`start_plugin_chain` isn't behind a trait seam), so this proves the
-    // value genuinely reaches `install_lockdown`, not just the isolated
-    // `MockRouting` contract (`mock_install_lockdown_records_the_resolver_permit`
-    // proves that half).
-    //
-    // NOT a full regression test: `dns.enabled = false` below skips the
-    // forwarder self-test (Phase 4) so the start reaches Phase 6
-    // at all under `MockProxy`. `lockdown_on_never_reaches_phase_6_when_the_self_test_fails`
-    // demonstrates the gap this leaves -- Phase 4 is where ex-ray's lazy
-    // ECH-config fetch actually fires (it dials through the plugin chain on
-    // its first real connection), strictly BEFORE this permit is installed.
+    // Proves the FIX (#753): the resolver permit reaches the standing cover's
+    // Phase-0 early engage (`install_lockdown_permits`) -- BEFORE Phase 1, so
+    // BEFORE the plugin chain's Phase-4 dial that actually fetches the
+    // ECH config. `dns.enabled = true` (the default) is left ON, unlike the
+    // old version of this test: it arms the Phase-4 forwarder self-test,
+    // which `MockProxy` cannot satisfy (no real SOCKS5 server behind it), so
+    // the start still fails overall -- but the assertion is on the EARLY
+    // call, which runs regardless of that later, unrelated failure. Exercises
+    // the REAL plugin chain end to end (`start_plugin_chain` isn't behind a
+    // trait seam), so this proves the value genuinely reaches the routing
+    // provider, not just the isolated `MockRouting` contract
+    // (`mock_install_lockdown_permits_records_the_call_and_resolver` proves
+    // that half).
     rt().block_on(async {
         let (_plugin_dir, plugin_path) = stage_real_ex_ray();
 
@@ -1220,12 +1293,14 @@ fn lockdown_on_permits_the_gated_ech_resolver_for_a_real_plugin_chain() {
         cfg.server.server = "203.0.113.9".into();
         cfg.server.plugin = Some("ex-ray".into());
         cfg.server.plugin_opts = Some(ECH_CAPABLE_OPTS.into());
-        cfg.dns.enabled = false;
+        cfg.dns.enabled = true;
         cfg.dns.servers = vec![resolver];
 
-        pm.start(&cfg).await.expect("a real ex-ray chain must start cleanly");
-        assert_eq!(st.lockdown_engage_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(*st.last_lockdown_resolver_ip.lock().unwrap(), Some(resolver));
+        // The overall start still fails (MockProxy can't satisfy Phase 4), but
+        // the early engage already ran by then.
+        let _ = pm.start(&cfg).await.unwrap_err();
+        assert_eq!(st.lockdown_permits_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(*st.last_lockdown_permits_resolver_ip.lock().unwrap(), Some(resolver));
     });
 }
 
@@ -1236,7 +1311,8 @@ fn lockdown_on_permits_the_gated_ech_resolver_on_a_covered_start_too() {
     // for manual AND covered starts alike. The sibling test above only
     // exercises the manual path (`pm.start`, `covered = false`); this proves
     // the claim on the covered (auto-connect) path too, via
-    // `start_cancellable(&cfg, true, ...)`.
+    // `start_cancellable(&cfg, true, ...)`. See that sibling's doc for why
+    // `dns.enabled = true` and an `unwrap_err()` are correct here.
     rt().block_on(async {
         let (_plugin_dir, plugin_path) = stage_real_ex_ray();
 
@@ -1250,14 +1326,15 @@ fn lockdown_on_permits_the_gated_ech_resolver_on_a_covered_start_too() {
         cfg.server.server = "203.0.113.9".into();
         cfg.server.plugin = Some("ex-ray".into());
         cfg.server.plugin_opts = Some(ECH_CAPABLE_OPTS.into());
-        cfg.dns.enabled = false;
+        cfg.dns.enabled = true;
         cfg.dns.servers = vec![resolver];
 
-        pm.start_cancellable(&cfg, true, CancellationToken::new())
+        let _ = pm
+            .start_cancellable(&cfg, true, CancellationToken::new())
             .await
-            .expect("a real ex-ray chain must start cleanly");
-        assert_eq!(st.lockdown_engage_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(*st.last_lockdown_resolver_ip.lock().unwrap(), Some(resolver));
+            .unwrap_err();
+        assert_eq!(st.lockdown_permits_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(*st.last_lockdown_permits_resolver_ip.lock().unwrap(), Some(resolver));
     });
 }
 
@@ -1295,21 +1372,24 @@ fn lockdown_on_omits_the_resolver_permit_for_a_non_ech_capable_plugin() {
 
 #[skuld::test]
 fn lockdown_on_never_reaches_phase_6_when_the_self_test_fails() {
-    // DOCUMENTS A GAP, NOT YET FIXED: the standing lockdown cover's
-    // resolver permit is installed at Phase 6
-    // (`routing.install` / `install_lockdown`), but ex-ray's lazy ECH-config
-    // fetch fires on the plugin chain's FIRST REAL DIAL -- which, whenever
+    // PROVES THE GAP (#753) IS CLOSED: the standing lockdown cover's TUN
+    // permit is still only installed at Phase 6 (`routing.install` /
+    // `install_lockdown`) -- that half of the claim stays true, asserted
+    // below via `lockdown_engage_calls`. But ex-ray's lazy ECH-config fetch
+    // fires on the plugin chain's FIRST REAL DIAL -- which, whenever
     // `dns.enabled` (the default), is the Phase 4 forwarder self-test, run
-    // strictly BEFORE Phase 6. A self-test failure aborts `start_inner`
-    // before Phase 6 ever runs, so a covered start that needs the resolver
-    // permit to make that VERY dial succeed can never reach the code that
-    // installs it. This test proves the ordering half of that claim
-    // (`lockdown_engage_calls` stays at zero on a self-test failure); it
-    // cannot prove the OS-level "fetch actually gets blocked" half without a
+    // strictly BEFORE Phase 6 -- and the resolver permit that dial needs is
+    // now installed at Phase 0 (`install_lockdown_permits`), BEFORE Phase 1,
+    // so it is already live by the time Phase 4 runs, regardless of whether
+    // Phase 6 is ever reached. This test proves the ordering half of that
+    // claim (the Phase-0 call already carries the correct resolver even
+    // though the self-test then fails for its own, unrelated reason); it
+    // cannot prove the OS-level "fetch actually gets through" half without a
     // real, privileged WFP/pf cover (see `lockdown_privileged_tests.rs`).
     rt().block_on(async {
         let (_plugin_dir, plugin_path) = stage_real_ex_ray();
 
+        let resolver: IpAddr = "198.51.100.5".parse().unwrap();
         let dir = tempfile::tempdir().unwrap();
         let routing = MockRouting::new(dir.path().to_path_buf());
         let st = routing.state();
@@ -1327,7 +1407,7 @@ fn lockdown_on_never_reaches_phase_6_when_the_self_test_fails() {
         // `RequireEchSatisfied`: an unobtainable ECH config makes the dial
         // itself fail, not just disable ECH).
         cfg.dns.enabled = true;
-        cfg.dns.servers = vec!["198.51.100.5".parse().unwrap()];
+        cfg.dns.servers = vec![resolver];
 
         let err = pm.start(&cfg).await.unwrap_err();
         assert!(
@@ -1339,12 +1419,50 @@ fn lockdown_on_never_reaches_phase_6_when_the_self_test_fails() {
             ),
             "expected some Phase 4 self-test failure classification, got {err:?}"
         );
+        // THE FIX: the early (Phase 0) engage already carried the correct
+        // resolver, before Phase 4 ever ran -- closing the gap this test used
+        // to document.
+        assert_eq!(
+            st.lockdown_permits_calls.load(Ordering::SeqCst),
+            1,
+            "the Phase-0 early engage must run before Phase 1, independent of whether Phase 4 later fails"
+        );
+        assert_eq!(*st.last_lockdown_permits_resolver_ip.lock().unwrap(), Some(resolver));
         assert_eq!(
             st.lockdown_engage_calls.load(Ordering::SeqCst),
             0,
-            "Phase 6 (install_lockdown, where the resolver permit is installed) must never run \
-             when Phase 4 fails first -- the permit this PR adds cannot protect the dial that needed it"
+            "Phase 6 (install_lockdown, where the TUN permit is added) must never run \
+             when Phase 4 fails first -- irrelevant to the ECH-fetch gap, since the resolver \
+             permit was already live from Phase 0 above"
         );
+    });
+}
+
+#[skuld::test]
+fn lockdown_permits_engage_failure_is_fatal_before_phase_1() {
+    // Fail-FATAL, mirroring `install_lockdown`'s own contract: a failed
+    // Phase-0 early engage aborts the start immediately, before Phase 1 ever
+    // spawns a plugin chain or Phase 2 touches the proxy -- nothing has been
+    // constructed yet, so there is nothing to tear down.
+    rt().block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        let routing = MockRouting::failing_lockdown_permits(dir.path().to_path_buf());
+        let st = routing.state();
+        let (mut pm, _dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, true);
+
+        let err = pm.start(&test_config()).await.unwrap_err();
+        assert!(
+            err.to_string().contains("mock lockdown-permits failure"),
+            "expected the early-engage error, got {err}"
+        );
+        assert_eq!(pm.state(), ProxyState::Stopped);
+        assert_eq!(
+            st.install_calls.load(Ordering::SeqCst),
+            0,
+            "routes must never be installed -- the early engage fails before Phase 1"
+        );
+        assert_eq!(st.lockdown_engage_calls.load(Ordering::SeqCst), 0);
+        assert!(pm.last_error().is_some());
     });
 }
 

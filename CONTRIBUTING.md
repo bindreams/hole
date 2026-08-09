@@ -593,6 +593,28 @@ pre-lockdown pf snapshot in `bridge-lockdown-pf.json` so Sweep restores the host
 without `-Fa`. The LUID is **never persisted** (a teardown mints a new one) —
 re-resolved every engage via `LuidResolver`.
 
+**Engage is two-phase (#753).** `Routing::install_lockdown_permits` engages
+every permit except the TUN one — loopback, server, (when `Some`) resolver,
+App-IDs — BEFORE Phase 1 of `ProxyManager::start_inner`, mirroring exactly
+when the transient cover engages (before `start_inner` is even called). It
+returns no guard: on Windows it opens its own FWPM engine, adds the filters in
+one transaction, and closes the engine immediately; on macOS it reuses
+`engage_lockdown` with `tun_name = None` and discards the returned guard via
+`Cover::forget_without_disengage` (a plain `mem::forget` — pf has no handle to
+leak, unlike Windows' engine). Either way the permits are keyed the same way
+the later call and `recover_lockdown`/`disengage_lockdown` already sweep
+(Windows: fixed GUID; macOS: the lockdown state file), so no guard is needed
+to own them. `install_lockdown` then re-engages (idempotent) the identical
+permits PLUS the TUN one at Phase 6, once `routing.install` has resolved the
+adapter, and returns the RAII guard the running session holds. Without the
+Phase-0 step, a plugin's Phase-4 forwarder self-test — where ex-ray's lazy
+ECH-config fetch actually fires, on the chain's first real dial — runs
+*before* Phase 6 ever installs the resolver permit; on an already-armed
+machine (a prior run's cover, live or adopted) that dial is blocked by the
+standing block-all with nothing yet permitting it, so the start fails
+identically on every retry. Both engage calls are fail-FATAL, matching
+`install_lockdown`'s existing contract.
+
 `hole bridge unlock` is the elevated escape hatch to disengage a standing cover
 when no bridge is alive (`cutover::unlock`). Unlike the best-effort startup
 Sweep, it is **fail-loud**: it disengages via `failclosed::disengage_lockdown`

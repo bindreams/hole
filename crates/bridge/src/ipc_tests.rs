@@ -218,6 +218,15 @@ impl Routing for MockRouting {
     ) -> Result<MockCover, RoutingError> {
         Ok(MockCover)
     }
+
+    fn install_lockdown_permits(
+        &self,
+        _server_ip: IpAddr,
+        _resolver_ip: Option<IpAddr>,
+        _app_ids: &[PathBuf],
+    ) -> Result<(), RoutingError> {
+        Ok(())
+    }
 }
 
 struct MockCover;

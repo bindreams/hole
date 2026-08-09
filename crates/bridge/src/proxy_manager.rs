@@ -1000,6 +1000,13 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
     ///    engage `?` it is never constructed, so only `R::Installed` tears down.
     ///
     /// Per-phase cancellation strategy:
+    /// - **Phase 0 (`install_lockdown_permits`, #753)**: sync, no dedicated
+    ///   checkpoint — it runs immediately after the pre-flight
+    ///   `cancel.is_cancelled()` check above, so a pre-cancelled token is
+    ///   already caught before this phase, and it is too fast (one FFI
+    ///   transaction / `pfctl` reload) to need mid-call preemption. Engages
+    ///   every standing-lockdown permit except the TUN one — see that fn's
+    ///   doc for why this runs before Phase 1 rather than only at Phase 6.
     /// - **Phase 1 (plugin chain)**: the bridge cancel is threaded into
     ///   `start_plugin_chain`, which derives child tokens for each
     ///   attempt and races readiness against cancel.
@@ -1065,6 +1072,26 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         // below can permit the identical address without a second derivation
         // site drifting from the first (see CONTRIBUTING.md's "Lockdown mode").
         let server_host = crate::dns::bootstrap::handoff_host(server_ip);
+
+        // Phase 0: engage the standing lockdown cover's non-TUN permits
+        // (loopback + server + (when Some) resolver + App-IDs) BEFORE Phase 1
+        // — mirroring exactly when the transient cover engages
+        // (`start_cancellable`, before `start_inner` is even called) — so a
+        // plugin's Phase-4 forwarder self-test (where ex-ray's lazy
+        // ECH-config fetch actually fires, on the chain's first real dial) is
+        // already covered. `lockdown_on` and `app_ids` are computed once here
+        // and reused at Phase 6, which adds the TUN permit once `install` has
+        // resolved the adapter. See `install_lockdown_permits`'s doc (#753)
+        // for why a TUN-gated `install_lockdown` alone arrives too late.
+        let lockdown_on = state_dir.map(lockdown_state::load_enabled).unwrap_or(false);
+        let app_ids = if lockdown_on {
+            lockdown_app_ids(config)
+        } else {
+            Vec::new()
+        };
+        if lockdown_on {
+            routing.install_lockdown_permits(server_ip, ech_resolver_permit, &app_ids)?;
+        }
 
         // Phase 1: start plugin chain via Garter if a plugin is configured.
         // `start_plugin_chain` threads `cancel` through to its readiness
@@ -1284,14 +1311,15 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
             // adds NO latency. Skip it under an active fail-closed cover: a
             // standing kill-switch (intent on) blocks non-permitted egress, so a
             // probe would mis-report Hole's OWN lockdown as censorship — keep the
-            // original self-test reason. This bridge installs its own cover later
-            // (after routing.install); at this gate the cover is a pre-existing /
-            // adopted one, and the intent is its honest signal.
+            // original self-test reason. This bridge already engaged its own
+            // lockdown permits at Phase 0 (above), so by this gate `lockdown_on`
+            // reflects a genuinely live in-process cover, not just a pre-existing
+            // / adopted one.
             // The live in-process signal (this start's engaged block-until-
-            // connected cover) OR a pre-existing/adopted standing lockdown — either
-            // means Hole's OWN cover would classify the probe's egress as blocked,
-            // so suppress it to avoid misreporting our cover as censorship.
-            let cover_active = blocking_engaged || state_dir.map(lockdown_state::load_enabled).unwrap_or(false);
+            // connected cover) OR the standing lockdown cover — either means
+            // Hole's OWN cover would classify the probe's egress as blocked, so
+            // suppress it to avoid misreporting our cover as censorship.
+            let cover_active = blocking_engaged || lockdown_on;
             let probe = (!cover_active).then(|| {
                 // The DoH-resolved IP, never the proxy domain: the reachability
                 // probe must not OS-resolve the hostname (that would reopen the
@@ -1412,19 +1440,20 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
 
         // Standing lockdown cover (#527). Engaged only when intent is on; when
         // off this whole block is a no-op and the start is byte-identical to
-        // today. Engaged AFTER routing.install (TUN exists => LUID resolvable)
-        // and BEFORE Dns::apply, so the line is held the moment routes go live.
-        // FAIL-FATAL: an engage error under intent-on aborts the start; the
-        // locally-owned `routes` guard (declared above) Drops on the Err
-        // unwind, tearing down — the opposite of the transient cover's
-        // fail-open. Committed only on the Ok path (the field below).
-        // `ech_resolver_permit` is passed through unconditionally, not
-        // gated on `covered`: the standing cover is armed for manual AND
-        // covered starts alike, and the value is already gated on
-        // `effective_ech_doh == Holes` by the caller — see `start_inner`'s
-        // entry comment.
-        let lockdown = if state_dir.map(lockdown_state::load_enabled).unwrap_or(false) {
-            let app_ids = lockdown_app_ids(config);
+        // today. This RE-engages (idempotent) the SAME permits Phase 0 already
+        // installed, PLUS the TUN one — done AFTER routing.install (TUN exists
+        // => LUID resolvable) and BEFORE Dns::apply, so the line is held the
+        // moment routes go live. FAIL-FATAL: an engage error under intent-on
+        // aborts the start; the locally-owned `routes` guard (declared above)
+        // Drops on the Err unwind, tearing down — the opposite of the
+        // transient cover's fail-open. Committed only on the Ok path (the
+        // field below). `ech_resolver_permit` is passed through
+        // unconditionally, not gated on `covered`: the standing cover is
+        // armed for manual AND covered starts alike, and the value is already
+        // gated on `effective_ech_doh == Holes` by the caller — see
+        // `start_inner`'s entry comment. `lockdown_on`/`app_ids` are the SAME
+        // values Phase 0 computed above.
+        let lockdown = if lockdown_on {
             Some(routing.install_lockdown(server_ip, ech_resolver_permit, TUN_DEVICE_NAME, &app_ids)?)
         } else {
             None

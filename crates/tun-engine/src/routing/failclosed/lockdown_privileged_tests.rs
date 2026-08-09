@@ -220,6 +220,85 @@ fn windows_lockdown_permits_resolver_blocks_other_egress() {
     );
 }
 
+/// Windows real-engage verification for the Phase-0 EARLY engage
+/// (`engage_lockdown_permits`, #753). No RAII guard is returned (see that
+/// fn's doc), so this test manually disengages via `disengage_lockdown` at
+/// the end -- proving the fixed-GUID sweep machinery a normal Phase-6
+/// disengage/recovery already uses fully restores egress even though no
+/// in-memory guard ever owned these particular filters. Proves (a) the
+/// server AND resolver permits are real and selective (a third,
+/// non-permitted host stays blocked) with NO TUN permit installed, and (b)
+/// the resolver permit stays scoped to TCP/443.
+#[cfg(target_os = "windows")]
+#[skuld::test(labels = [TUN], serial = TUN)]
+fn windows_lockdown_permits_early_engage_admits_nothing_beyond_the_gated_addresses() {
+    use std::net::TcpStream;
+    use std::time::Duration;
+
+    let dir = tempfile::tempdir().unwrap();
+    let server_ip: std::net::IpAddr = "1.1.1.1".parse().unwrap();
+    let resolver_ip: std::net::IpAddr = "9.9.9.9".parse().unwrap();
+
+    let connect = |addr: &str| TcpStream::connect_timeout(&addr.parse().unwrap(), Duration::from_secs(5));
+
+    let (bp, br, bpo, bn) = (
+        connect(PERMITTED),
+        connect(RESOLVER),
+        connect(RESOLVER_OTHER_PORT),
+        connect(NON_PERMITTED),
+    );
+    assert!(
+        bp.is_ok() && br.is_ok() && bpo.is_ok() && bn.is_ok(),
+        "NETWORK/ENVIRONMENT problem (not the cover): baseline egress must reach all hosts; \
+         {PERMITTED}={:?} {RESOLVER}={:?} {RESOLVER_OTHER_PORT}={:?} {NON_PERMITTED}={:?}",
+        bp.err().map(|e| e.kind()),
+        br.err().map(|e| e.kind()),
+        bpo.err().map(|e| e.kind()),
+        bn.err().map(|e| e.kind()),
+    );
+
+    engage_lockdown_permits(server_ip, Some(resolver_ip), &[], dir.path(), None)
+        .expect("engage the real WFP lockdown cover's Phase-0 permits");
+
+    let (p, r, po, n) = (
+        connect(PERMITTED),
+        connect(RESOLVER),
+        connect(RESOLVER_OTHER_PORT),
+        connect(NON_PERMITTED),
+    );
+    assert!(
+        p.is_ok(),
+        "server-IP permit must beat block-all even with no TUN permit installed: {PERMITTED}={:?}",
+        p.err().map(|e| e.kind())
+    );
+    assert!(
+        r.is_ok(),
+        "resolver-IP permit must beat block-all: {RESOLVER}={:?}",
+        r.err().map(|e| e.kind())
+    );
+    assert!(
+        po.is_err(),
+        "the resolver permit must be scoped to TCP/443, not the whole IP (leak!): \
+         {RESOLVER_OTHER_PORT} connected"
+    );
+    assert!(
+        n.is_err(),
+        "a third, non-permitted host must still be blocked (leak!): {NON_PERMITTED} connected"
+    );
+
+    // No RAII guard exists to disengage on drop -- prove the fixed-GUID sweep
+    // (the same `disengage_lockdown` a normal Phase-6 cover's stop/unlock
+    // path uses) still fully restores egress for filters no guard ever owned.
+    disengage_lockdown(dir.path()).expect("disengage the Phase-0-only cover via the fixed-GUID sweep");
+    let (rn, rpo) = (connect(NON_PERMITTED), connect(RESOLVER_OTHER_PORT));
+    assert!(
+        rn.is_ok() && rpo.is_ok(),
+        "disengage must restore egress: {NON_PERMITTED}={:?} {RESOLVER_OTHER_PORT}={:?}",
+        rn.err().map(|e| e.kind()),
+        rpo.err().map(|e| e.kind()),
+    );
+}
+
 /// macOS real-engage verification. Engages the REAL pf lockdown cover (an
 /// authoritative main-ruleset replace: `block drop out quick all` with earlier
 /// `quick` permits for loopback, the TUN, and the server IP — no anchor, so
@@ -381,6 +460,93 @@ fn macos_lockdown_permits_resolver_blocks_other_egress() {
     );
 
     drop(cover);
+    let (rn, rpo) = (connect(NON_PERMITTED), connect(RESOLVER_OTHER_PORT));
+    assert!(
+        rn.is_ok() && rpo.is_ok(),
+        "disengage must restore egress: {NON_PERMITTED}={:?} {RESOLVER_OTHER_PORT}={:?}",
+        rn.err().map(|e| e.kind()),
+        rpo.err().map(|e| e.kind()),
+    );
+}
+
+/// macOS real-engage verification for the Phase-0 EARLY engage
+/// (`engage_lockdown_permits`, #753). No RAII guard is returned (see that
+/// fn's doc), so this test manually disengages via `disengage_lockdown` at
+/// the end -- proving the persisted lockdown-state-file recovery machinery a
+/// normal Phase-6 disengage/recovery already uses fully restores egress even
+/// though no in-memory guard ever owned this particular pf load. Proves (a)
+/// the live ruleset carries NO TUN pass line, (b) the server AND resolver
+/// permits are real and selective, and (c) the resolver permit stays scoped
+/// to TCP/443.
+#[cfg(target_os = "macos")]
+#[skuld::test(labels = [TUN], serial = TUN)]
+fn macos_lockdown_permits_early_engage_admits_nothing_beyond_the_gated_addresses() {
+    use std::net::TcpStream;
+    use std::process::Command;
+    use std::time::Duration;
+
+    let dir = tempfile::tempdir().unwrap();
+    let server_ip: std::net::IpAddr = "1.1.1.1".parse().unwrap();
+    let resolver_ip: std::net::IpAddr = "9.9.9.9".parse().unwrap();
+
+    let connect = |addr: &str| TcpStream::connect_timeout(&addr.parse().unwrap(), Duration::from_secs(5));
+
+    let (bp, br, bpo, bn) = (
+        connect(PERMITTED),
+        connect(RESOLVER),
+        connect(RESOLVER_OTHER_PORT),
+        connect(NON_PERMITTED),
+    );
+    assert!(
+        bp.is_ok() && br.is_ok() && bpo.is_ok() && bn.is_ok(),
+        "NETWORK/ENVIRONMENT problem (not the cover): baseline egress must reach all hosts; \
+         {PERMITTED}={:?} {RESOLVER}={:?} {RESOLVER_OTHER_PORT}={:?} {NON_PERMITTED}={:?}",
+        bp.err().map(|e| e.kind()),
+        br.err().map(|e| e.kind()),
+        bpo.err().map(|e| e.kind()),
+        bn.err().map(|e| e.kind()),
+    );
+
+    engage_lockdown_permits(server_ip, Some(resolver_ip), &[], dir.path(), None)
+        .expect("engage the real pf lockdown cover's Phase-0 permits");
+
+    let sr = Command::new("pfctl").args(["-sr"]).output().unwrap();
+    let rules = String::from_utf8_lossy(&sr.stdout);
+    assert!(
+        !rules.contains("pass out quick on"),
+        "no TUN pass line must be live before routing.install has resolved the adapter:\n{rules}"
+    );
+
+    let (p, r, po, n) = (
+        connect(PERMITTED),
+        connect(RESOLVER),
+        connect(RESOLVER_OTHER_PORT),
+        connect(NON_PERMITTED),
+    );
+    assert!(
+        p.is_ok(),
+        "server-IP permit must beat block-all even with no TUN permit installed: {PERMITTED}={:?}",
+        p.err().map(|e| e.kind())
+    );
+    assert!(
+        r.is_ok(),
+        "resolver-IP permit must beat block-all: {RESOLVER}={:?}",
+        r.err().map(|e| e.kind())
+    );
+    assert!(
+        po.is_err(),
+        "the resolver permit must be scoped to TCP/443, not the whole IP (leak!): \
+         {RESOLVER_OTHER_PORT} connected"
+    );
+    assert!(
+        n.is_err(),
+        "a third, non-permitted host must still be blocked (leak!): {NON_PERMITTED} connected"
+    );
+
+    // No RAII guard exists to disengage on drop -- prove the persisted-state
+    // recovery (the same `disengage_lockdown` a normal Phase-6 cover's
+    // stop/unlock path uses) still fully restores egress.
+    disengage_lockdown(dir.path()).expect("disengage the Phase-0-only cover via the persisted state file");
     let (rn, rpo) = (connect(NON_PERMITTED), connect(RESOLVER_OTHER_PORT));
     assert!(
         rn.is_ok() && rpo.is_ok(),

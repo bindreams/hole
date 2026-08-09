@@ -154,6 +154,9 @@ impl Routing for StubRouting {
     ) -> Result<StubCover, RoutingError> {
         Ok(StubCover)
     }
+    fn install_lockdown_permits(&self, _: IpAddr, _: Option<IpAddr>, _: &[PathBuf]) -> Result<(), RoutingError> {
+        Ok(())
+    }
 }
 
 struct StubRoutes {
