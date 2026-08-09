@@ -32,7 +32,7 @@ fn sip003_env_client_mode_straight_through() {
     let listen: SocketAddr = "127.0.0.1:9001".parse().unwrap();
     let dial: SocketAddr = "203.0.113.1:8388".parse().unwrap();
     let plugin = BinaryPlugin::new("/usr/bin/v2ray-plugin", Some("tls;host=example.com"));
-    let env = plugin.sip003_env(listen, dial);
+    let env = plugin.sip003_env(listen, dial).unwrap();
     assert_eq!(env.ss_local_host, "127.0.0.1");
     assert_eq!(env.ss_local_port, 9001);
     assert_eq!(env.ss_remote_host, "203.0.113.1");
@@ -51,7 +51,7 @@ fn sip003_env_server_mode_swaps_addresses() {
     let listen: SocketAddr = "[::]:80".parse().unwrap();
     let dial: SocketAddr = "127.0.0.1:45589".parse().unwrap();
     let plugin = BinaryPlugin::new("/usr/bin/v2ray-plugin", Some("server;host=example.com"));
-    let env = plugin.sip003_env(listen, dial);
+    let env = plugin.sip003_env(listen, dial).unwrap();
     // Swap: BinaryPlugin's `local` (where the chain wants the binary to
     // bind, [::]:80) must reach v2ray-plugin as SS_REMOTE so its
     // server-mode swap interprets it as the listen address.
@@ -68,11 +68,22 @@ fn sip003_env_client_mode_when_options_only_have_servername() {
     let listen: SocketAddr = "127.0.0.1:9001".parse().unwrap();
     let dial: SocketAddr = "203.0.113.1:8388".parse().unwrap();
     let plugin = BinaryPlugin::new("/usr/bin/v2ray-plugin", Some("servername=cdn.example.com"));
-    let env = plugin.sip003_env(listen, dial);
+    let env = plugin.sip003_env(listen, dial).unwrap();
     assert_eq!(env.ss_local_host, "127.0.0.1");
     assert_eq!(env.ss_local_port, 9001);
     assert_eq!(env.ss_remote_host, "203.0.113.1");
     assert_eq!(env.ss_remote_port, 8388);
+}
+
+// Pinned here because this is the call site that actually wires
+// SS_LOCAL/SS_REMOTE, not just a diagnostic mode read: a malformed
+// per-plugin `options:` string must not silently pick a chain direction.
+#[skuld::test]
+fn sip003_env_errors_on_malformed_options() {
+    let listen: SocketAddr = "127.0.0.1:9001".parse().unwrap();
+    let dial: SocketAddr = "203.0.113.1:8388".parse().unwrap();
+    let plugin = BinaryPlugin::new("/usr/bin/v2ray-plugin", Some(r"server;path=/a\"));
+    assert!(plugin.sip003_env(listen, dial).is_err());
 }
 
 // Readiness-mode tests ================================================================================================

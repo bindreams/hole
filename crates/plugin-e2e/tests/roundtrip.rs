@@ -50,9 +50,9 @@ mod launcher_smoke {
 }
 
 /// A malformed options string must stop galoshes at startup with a diagnosable
-/// message. ex-ray would not: it discards every option and reports `ready` on
-/// the flag-default port, so galoshes is the last place the operator can be
-/// told. The bridge relays this stderr into its own log.
+/// message — before ever reaching the embedded ex-ray, which would itself
+/// fail fatally on the same string, but only after spawning and without
+/// galoshes' own framing. The bridge relays this stderr into its own log.
 mod malformed_options {
     use plugin_e2e::locators::locate_built_galoshes;
     use plugin_e2e::util::{require_binary, rt};
@@ -107,7 +107,7 @@ mod malformed_options {
             assert!(!out.status.success(), "galoshes must refuse to start: {:?}", out.status);
             let stderr = String::from_utf8_lossy(&out.stderr);
             assert!(
-                stderr.contains("embedded ex-ray") && stderr.contains("unpaired backslash"),
+                stderr.contains("malformed SS_PLUGIN_OPTIONS") && stderr.contains("unpaired backslash"),
                 "stderr must name the malformed options as the reason, got: {stderr}"
             );
         });

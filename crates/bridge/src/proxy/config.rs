@@ -52,11 +52,13 @@ pub enum ProxyError {
     #[error("plugin error: {0}")]
     Plugin(String),
     /// Plugin options a SIP003 parser rejects. Refused rather than forwarded:
-    /// ex-ray discards the whole SS_* environment on a parse error and reports
-    /// ready on its default port, so a forwarded string yields a dead tunnel
-    /// that looks healthy. PII-free `Display` by construction — the wrapped
-    /// `MalformedOptions` names the fault class and a segment index, never the
-    /// segment, which can carry a per-connection secret.
+    /// ex-ray fails fatally on the same string rather than silently
+    /// discarding it, so refusing here isn't preventing a silent bad-config
+    /// start — it's failing earlier and attributably, naming the fault
+    /// before spawning a process that would die immediately after. PII-free
+    /// `Display` by construction — the wrapped `MalformedOptions` names the
+    /// fault class and a segment index, never the segment, which can carry a
+    /// per-connection secret.
     #[error("malformed plugin options: {0}")]
     MalformedPluginOptions(String),
     /// A plugin reported a typed bind conflict (`StartError::BindConflict`

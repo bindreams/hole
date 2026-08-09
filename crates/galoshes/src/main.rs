@@ -75,7 +75,10 @@ async fn main() -> anyhow::Result<()> {
 
     let verified = ex_ray_binary.prepare()?;
 
-    let mode = Mode::from_plugin_options(env.plugin_options.as_deref());
+    // The same defect would also fail `parse_udp_timeout`/`ex_ray_options`
+    // below, but they can never reach that branch through this binary; both
+    // stay fallible for their own callers and unit tests.
+    let mode = Mode::from_plugin_options(env.plugin_options.as_deref())?;
     // Parse the galoshes-specific client UDP NAT idle-eviction timeout from the
     // shared options string before any I/O so a misconfiguration fails loudly
     // at startup. ex-ray ignores unrecognized keys (it only reads keys it knows).
