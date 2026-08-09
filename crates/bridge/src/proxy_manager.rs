@@ -885,7 +885,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         // `install_lockdown` (pre-dating the Phase-0/Phase-6 split), not a
         // new regression. See CONTRIBUTING.md's "Lockdown mode" and #768.
         let lockdown_cover: Option<R::Cover> = if lockdown_applies {
-            let app_ids = lockdown_app_ids(config);
+            let app_ids = lockdown_app_ids(config, plugin_path_override.as_deref());
             match self
                 .routing
                 .install_lockdown_permits(server_ip, ech_resolver_permit, &app_ids)
@@ -1837,19 +1837,28 @@ fn tunnel_mode_label(mode: &TunnelMode) -> &'static str {
 /// resolved plugin binary (if a plugin is configured) and the bridge's own exe.
 /// Empty on macOS (pf has no per-process matching). Path-keyed so the permit
 /// survives a cutover rename.
-fn lockdown_app_ids(config: &ProxyConfig) -> Vec<std::path::PathBuf> {
+///
+/// `plugin_path_override` must be the SAME value `start_inner`'s Phase 1
+/// threads into `start_plugin_chain` (`self.plugin_path_override`, test-only
+/// -- always `None` in production, see `start_cancellable`'s `#[cfg(test)]`
+/// split) — both describe the path of the SAME process this attempt
+/// actually spawns; reading `resolve_plugin_path` unconditionally here would
+/// give a test driving a real plugin chain under a staged binary path an
+/// App-ID permit for a location nothing was ever copied to.
+fn lockdown_app_ids(config: &ProxyConfig, plugin_path_override: Option<&str>) -> Vec<std::path::PathBuf> {
     #[cfg(not(target_os = "windows"))]
     {
-        let _ = config;
+        let _ = (config, plugin_path_override);
         Vec::new()
     }
     #[cfg(target_os = "windows")]
     {
         let mut ids: Vec<std::path::PathBuf> = Vec::new();
         if let Some(ref plugin) = config.server.plugin {
-            ids.push(std::path::PathBuf::from(crate::proxy::config::resolve_plugin_path(
-                plugin,
-            )));
+            let path = plugin_path_override
+                .map(str::to_owned)
+                .unwrap_or_else(|| crate::proxy::config::resolve_plugin_path(plugin));
+            ids.push(std::path::PathBuf::from(path));
         }
         match std::env::current_exe() {
             Ok(exe) => ids.push(exe),

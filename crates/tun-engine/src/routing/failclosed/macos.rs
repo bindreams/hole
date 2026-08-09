@@ -366,18 +366,39 @@ fn capture_and_persist(token: &str, state_dir: &Path, owner: Option<(u32, u32)>)
 /// factored out here so the Phase-6 TUN-add reload cannot load straight
 /// into whatever pf's live state happens to be, with no check.
 ///
-/// Returns the token to load the ruleset with: reused unchanged, or freshly
+/// Whether pf was found already enabled and enforcing going into a
+/// [`reconcile_pf_enabled`] call, or had to be freshly re-enabled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PfReconciled {
+    /// pf was already enabled: whatever ruleset was loaded under the
+    /// persisted token is genuinely live and has been continuously
+    /// enforcing.
+    AlreadyEnabled,
+    /// pf was DISABLED (e.g. a reboot reset its refcount and cleared its
+    /// in-memory loaded rules) and has just been freshly re-enabled under a
+    /// NEW refcount token. Nothing was being enforced immediately before
+    /// this call, regardless of what the state file claims was loaded --
+    /// `-E` alone does not reload any specific ruleset.
+    JustReenabled,
+}
+
+/// Returns the token to load the ruleset with (reused unchanged, or freshly
 /// re-enabled and re-persisted under the SAME host snapshot if pf had been
-/// disabled since the state file was written.
+/// disabled since the state file was written) alongside which of those two
+/// happened — callers need this to decide whether a SUBSEQUENT `pfctl -f -`
+/// failure leaves a genuinely-enforcing prior ruleset in place
+/// (`AlreadyEnabled`) or strands the host with nothing actually enforced
+/// (`JustReenabled`, where `-E` re-enabled filtering but loaded no ruleset
+/// of its own).
 fn reconcile_pf_enabled(
     persisted: &lockdown_state::LockdownPfState,
     state_dir: &Path,
     owner: Option<(u32, u32)>,
-) -> Result<String, RoutingError> {
+) -> Result<(String, PfReconciled), RoutingError> {
     let info = pfctl(&["-s", "info"], None, PHASE_COVER)?;
     let pf_enabled = parse_pf_enabled(&String::from_utf8_lossy(&info.stdout));
     match engage_pf_action(pf_enabled, true) {
-        PfEngageAction::ReuseToken => Ok(persisted.pf_token.clone()),
+        PfEngageAction::ReuseToken => Ok((persisted.pf_token.clone(), PfReconciled::AlreadyEnabled)),
         PfEngageAction::Reenable => {
             let token = enable_pf_capture_token()?;
             let fresh = lockdown_state::LockdownPfState {
@@ -394,7 +415,7 @@ fn reconcile_pf_enabled(
                     "failed to re-persist lockdown-pf-state: {e}"
                 )));
             }
-            Ok(token)
+            Ok((token, PfReconciled::JustReenabled))
         }
         // `has_persisted=true` (a `&LockdownPfState` was passed in) forces
         // `engage_pf_action`'s match into ReuseToken or Reenable -- see its
@@ -418,13 +439,17 @@ fn reconcile_pf_enabled(
 /// block takes effect while host translation is carried forward.
 ///
 /// On load failure Err is always returned (the bridge's fail-FATAL caller
-/// aborts the start), but the host is only actively restored
-/// (`lockdown_disengage`) for a FIRST-ever engage (`persisted` was `None`):
-/// `pfctl -f -`'s atomicity means a rejected reload over an ALREADY-LIVE
-/// cover (Adopt re-engage) leaves that previously-loaded ruleset unchanged
-/// and still fully enforced, so disengaging here would destroy a cover that
-/// is still live and correct — the same disposition
-/// [`engage_lockdown_tun`] uses for its own reload failure.
+/// aborts the start). The host is actively restored (`lockdown_disengage`)
+/// whenever nothing was GENUINELY enforcing immediately before this call:
+/// either a FIRST-ever engage (`persisted` was `None`), or a re-engage where
+/// [`reconcile_pf_enabled`] had to freshly re-enable a DISABLED pf
+/// (`PfReconciled::JustReenabled` — `-E` alone loads no ruleset, so nothing
+/// was actually being enforced despite the state file's claim). Only a
+/// re-engage that found pf ALREADY enabled (`PfReconciled::AlreadyEnabled`)
+/// skips the restore: `pfctl -f -`'s atomicity means a rejected reload there
+/// leaves that previously-loaded ruleset unchanged and still fully
+/// enforced, so disengaging would destroy a cover that is still live and
+/// correct.
 pub fn engage_lockdown(
     server_ip: IpAddr,
     resolver_ip: Option<IpAddr>,
@@ -433,27 +458,33 @@ pub fn engage_lockdown(
     owner: Option<(u32, u32)>,
 ) -> Result<Cover, RoutingError> {
     let persisted = lockdown_state::load(state_dir);
-    // Captured BEFORE the match below (which may itself persist a fresh
-    // token under `Some(st)` if `reconcile_pf_enabled` hits `Reenable`) --
-    // this must reflect whether a live, correct ruleset already existed
-    // when THIS call started, not whether one exists by the time the load
-    // below fails.
-    let is_first_engage = persisted.is_none();
 
-    let (token, nat_snapshot) = match &persisted {
+    let (token, nat_snapshot, restore_on_failure) = match &persisted {
         // Live Adopt re-engage, or a repair/TUN-add on an already-engaged
         // session: reconcile pf's enabled state against the persisted token
         // (reused unchanged if pf is still enabled, or freshly re-enabled
         // and re-persisted if a reboot reset it) — see `reconcile_pf_enabled`.
-        Some(st) => (reconcile_pf_enabled(st, state_dir, owner)?, st.nat_snapshot.clone()),
-        // First engage: enable + snapshot the host.
+        // `restore_on_failure` is false ONLY when pf was found genuinely
+        // already enabled -- a `JustReenabled` re-engage restores on failure
+        // exactly like a first-ever engage, since nothing was actually being
+        // enforced going in.
+        Some(st) => {
+            let (token, reconciled) = reconcile_pf_enabled(st, state_dir, owner)?;
+            (
+                token,
+                st.nat_snapshot.clone(),
+                reconciled != PfReconciled::AlreadyEnabled,
+            )
+        }
+        // First engage: enable + snapshot the host. Nothing was live before
+        // this call, so a load failure always restores.
         None => {
             let token = enable_pf_capture_token()?;
             // The refcount is now held. Capture + persist may fail, so undo the
             // `-E` on any error before propagating — else the refcount leaks with
             // no state file to recover it from.
             match capture_and_persist(&token, state_dir, owner) {
-                Ok(nat_snapshot) => (token, nat_snapshot),
+                Ok(nat_snapshot) => (token, nat_snapshot, true),
                 Err(e) => {
                     if let Err(xe) = pfctl(&["-X", &token], None, PHASE_COVER) {
                         tracing::warn!(error = %xe, "pfctl -X failed unwinding a failed lockdown engage");
@@ -467,21 +498,21 @@ pub fn engage_lockdown(
     let main = build_lockdown_main_ruleset(tun_name, server_ip, resolver_ip, &nat_snapshot);
     let out = pfctl(&["-f", "-"], Some(main.as_bytes()), PHASE_COVER)?;
     if !out.status.success() {
-        if is_first_engage {
-            // FIRST-ever engage: nothing was live before this call, so a
-            // partially-loaded ruleset would strand the host mid-lockdown.
-            // Restore the pre-lockdown host state (snapshot reload + drop
-            // refcount) before failing.
+        if restore_on_failure {
+            // Nothing was genuinely enforcing before this call (first-ever
+            // engage, or a JustReenabled re-engage) -- a partially-loaded
+            // ruleset would strand the host mid-lockdown. Restore the
+            // pre-lockdown host state (snapshot reload + drop refcount)
+            // before failing.
             lockdown_disengage(state_dir);
         }
-        // A re-engage over an ALREADY-LIVE cover (Adopt continuation, or a
-        // repeat call reusing `persisted`) must NOT call `lockdown_disengage`
-        // here: `pfctl -f -` is atomic, so this rejected reload left the
-        // PREVIOUSLY loaded ruleset (still fully enforced, still correct)
-        // untouched -- restoring the pre-lockdown snapshot would destroy a
-        // live, correct standing cover instead of merely failing this one
-        // call. Mirrors `engage_lockdown_tun`'s identical disposition for
-        // the same atomicity guarantee.
+        // Otherwise this was a re-engage over pf that was ALREADY enabled
+        // and enforcing: `pfctl -f -` is atomic, so this rejected reload
+        // left the PREVIOUSLY loaded ruleset (still fully enforced, still
+        // correct) untouched -- restoring the pre-lockdown snapshot would
+        // destroy a live, correct standing cover instead of merely failing
+        // this one call. Mirrors `engage_lockdown_tun`'s identical
+        // disposition for the same atomicity guarantee.
         return Err(RoutingError::RouteSetup(format!(
             "pfctl lockdown load failed: {}",
             String::from_utf8_lossy(&out.stderr).trim()
@@ -506,11 +537,17 @@ pub fn engage_lockdown(
 /// here does NOT call [`lockdown_disengage`]: `pfctl -f -` is atomic — a
 /// rejected ruleset leaves the PREVIOUSLY LOADED one (Phase 0's, permitting
 /// loopback/server/resolver/App-ID, minus only the TUN line this call was
-/// trying to add) unchanged and still fully enforced. Restoring the
-/// pre-lockdown snapshot here would destroy a cover that is still live and
-/// correct, just missing one permit — the exact mistake `engage_lockdown`'s
-/// own restore-on-failure is right to make for a FIRST-EVER engage (nothing
-/// was live yet), but wrong for this add-on-top call.
+/// trying to add) unchanged and still fully enforced -- true whenever
+/// [`reconcile_pf_enabled`] found pf already enabled. This function never
+/// restores on failure itself either way: within the full bridge flow, the
+/// caller (`start_cancellable`) holds the Phase-0 `Cover` as a plain local
+/// and it drops via ordinary RAII on ANY `start_inner` failure (this one
+/// included), so the aggregate outcome is a disengage regardless of what
+/// this function does internally — restoring here too would just double it.
+/// A STANDALONE call (e.g. a test driving this function directly, with no
+/// such caller) has no such backstop; see [`reconcile_pf_enabled`]'s
+/// `PfReconciled::JustReenabled` case for when "still fully enforced" does
+/// NOT hold even for an atomic reload (pf had nothing loaded going in).
 ///
 /// Reconciles pf's enabled state via [`reconcile_pf_enabled`] before the
 /// reload — `pfctl -f -` into a DISABLED pf exits 0 while enforcing nothing,

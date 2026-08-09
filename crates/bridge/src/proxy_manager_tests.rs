@@ -1622,6 +1622,84 @@ fn lockdown_cover_disengages_immediately_when_a_later_phase_fails() {
 }
 
 #[skuld::test]
+fn compound_failure_warns_when_phase_0_fails_right_after_releasing_the_transient_cover() {
+    // Covered retry with lockdown newly enabled mid-blocked-state: the
+    // `else if covered` branch releases the held transient cover (opening a
+    // brief window until Phase 0's engage a few lines below). If THAT
+    // engage then also fails, the host loses BOTH covers in one attempt --
+    // a strictly worse outcome than an ordinary Phase-0 failure with
+    // nothing lost, and must get its own compound-failure disclosure,
+    // mirroring the analogous double-failure warning the transient cover's
+    // own repair path already has.
+    use crate::test_support::log_capture::VecWriter;
+    use tracing_subscriber::fmt;
+    use tracing_subscriber::layer::{Layer, SubscriberExt};
+
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            let writer = VecWriter::new();
+            let subscriber = tracing_subscriber::registry().with(
+                fmt::layer()
+                    .with_writer(writer.clone())
+                    .with_ansi(false)
+                    .with_filter(tracing_subscriber::filter::LevelFilter::WARN),
+            );
+            let _guard = garter::tracing_test::set_default_in_current_thread(subscriber);
+
+            let dir = tempfile::tempdir().unwrap();
+            let routing = MockRouting::new(dir.path().to_path_buf());
+            let st = routing.state();
+            // Lockdown OFF at construction -- attempt 1 engages the TRANSIENT
+            // cover, matching every other covered-with-lockdown-off start.
+            let (mut pm, _dir) = new_manager_with_lockdown(MockProxy::failing_start(), routing, dir, false);
+
+            // Attempt 1: covered, lockdown off -> transient cover engages, then
+            // `proxy.start` fails -> the transient cover is RETAINED (the
+            // established `self.blocked` failure-retention pattern), not
+            // released, since this attempt never reached the lockdown-newly-on
+            // release branch.
+            pm.start_cancellable(&test_config(), true, CancellationToken::new())
+                .await
+                .expect_err("MockProxy::failing_start always fails");
+            assert_eq!(st.cover_engage_calls.load(Ordering::SeqCst), 1);
+            assert!(
+                pm.blocked_until_connected(),
+                "sanity: attempt 1 retains the transient cover"
+            );
+
+            // Lockdown turns on; the Phase-0 engage is set to fail.
+            pm.set_lockdown_intent(true).unwrap();
+            st.fail_lockdown_permits.store(true, Ordering::SeqCst);
+
+            let err = pm
+                .start_cancellable(&test_config(), true, CancellationToken::new())
+                .await
+                .expect_err("install_lockdown_permits fails on this mock");
+            assert!(
+                err.to_string().contains("mock lockdown-permits failure"),
+                "expected the Phase-0 error, got {err}"
+            );
+            assert!(
+                !pm.blocked_until_connected(),
+                "the transient cover was released for the lockdown attempt, not left double-held"
+            );
+            assert!(
+                !pm.lockdown_active(),
+                "the failed Phase-0 engage never produced a cover to hold"
+            );
+
+            let output = writer.snapshot_string();
+            assert!(
+                output.contains("host NOT covered by either"),
+                "expected the compound-failure warning naming BOTH covers lost; got:\n{output}"
+            );
+        });
+}
+
+#[skuld::test]
 fn lockdown_cover_disengages_immediately_on_cancel() {
     // Unlike the OLD retained-across-attempts design (where the standing
     // cover survived a cancel until an explicit stop), the simplified
@@ -4449,6 +4527,59 @@ mod self_test {
                 assert!(
                     output.contains("plugin's own ech-doh"),
                     "expected the operator-override residual warning; got:\n{output}"
+                );
+            });
+    }
+
+    // Sibling of the test above for the STANDING lockdown cover's own
+    // residual-stall diagnostic (`else if lockdown_applies` in
+    // `start_cancellable`) -- an operator's own `ech-doh` is never permitted
+    // by either cover, so the lockdown branch needs the identical
+    // disclosure, under lockdown-specific wording naming "the standing
+    // lockdown cover" rather than "the fail-closed cover".
+    #[skuld::test]
+    fn covered_start_under_lockdown_residual_warning_fires_for_an_operator_ech_doh_override() {
+        use crate::test_support::log_capture::VecWriter;
+        use tracing_subscriber::fmt;
+        use tracing_subscriber::layer::{Layer, SubscriberExt};
+
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let writer = VecWriter::new();
+                let subscriber = tracing_subscriber::registry().with(
+                    fmt::layer()
+                        .with_writer(writer.clone())
+                        .with_ansi(false)
+                        .with_filter(tracing_subscriber::filter::LevelFilter::WARN),
+                );
+                let _guard = garter::tracing_test::set_default_in_current_thread(subscriber);
+
+                let dir = tempfile::tempdir().unwrap();
+                let routing = MockRouting::new(dir.path().to_path_buf());
+                // Lockdown ON (the `true` below), unlike the transient-cover
+                // sibling test.
+                let (mut pm, _dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, true);
+                let mut cfg = test_config();
+                // Literal-IP server: Hole's own candidate is unpinned
+                // (NoQueryNeeded), so it never outranks an IP-literal operator
+                // value — the operator's own ech-doh wins.
+                cfg.server.server = "203.0.113.9".into();
+                cfg.server.plugin = Some("ex-ray".into());
+                cfg.server.plugin_opts = Some(format!("{ECH_CAPABLE_OPTS};ech-doh=https://8.8.8.8/dns-query"));
+                cfg.dns.enabled = true;
+                cfg.dns.servers = vec!["1.0.0.1".parse().unwrap()];
+                let _ = pm
+                    .start_cancellable(&cfg, true, CancellationToken::new())
+                    .await
+                    .unwrap_err();
+
+                let output = writer.snapshot_string();
+                assert!(
+                    output.contains("covered start under lockdown") && output.contains("plugin's own ech-doh"),
+                    "expected the lockdown-cover operator-override residual warning; got:\n{output}"
                 );
             });
     }

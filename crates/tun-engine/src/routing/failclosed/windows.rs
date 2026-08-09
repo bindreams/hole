@@ -725,12 +725,21 @@ pub fn engage_lockdown_tun(tun_luid: u64) -> Result<(), RoutingError> {
             "FwpmEngineOpen0",
         )?;
         let result = (|| -> Result<(), RoutingError> {
+            // The precondition check and the adds share ONE transaction --
+            // not check-then-act outside it -- so a concurrent
+            // `hole bridge unlock` (which deletes every lockdown GUID from
+            // any elevated process at any time, with no "only when no
+            // bridge is alive" enforcement) cannot land between the read
+            // and the commit: BFE serializes transactions against each
+            // other, so either that delete's transaction fully precedes
+            // ours (and this check correctly fails) or fully follows it (a
+            // deliberate post-commit unlock, not a race).
+            wfp_check(FwpmTransactionBegin0(engine, 0), "FwpmTransactionBegin0")?;
             if !phase_0_engaged(engine)? {
                 return Err(RoutingError::RouteSetup(
                     "engage_lockdown_tun: Phase-0 loopback permit not found -- called before the Phase-0 engage".into(),
                 ));
             }
-            wfp_check(FwpmTransactionBegin0(engine, 0), "FwpmTransactionBegin0")?;
             for f in &filters {
                 add_filter(engine, PROVIDER_GUID, SUBLAYER_GUID, f)?;
             }
