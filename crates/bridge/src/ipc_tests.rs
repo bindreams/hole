@@ -209,21 +209,20 @@ impl Routing for MockRouting {
         Ok(MockCover)
     }
 
-    fn install_lockdown(
-        &self,
-        _server_ip: IpAddr,
-        _resolver_ip: Option<IpAddr>,
-        _tun_name: &str,
-        _app_ids: &[PathBuf],
-    ) -> Result<MockCover, RoutingError> {
-        Ok(MockCover)
-    }
-
     fn install_lockdown_permits(
         &self,
         _server_ip: IpAddr,
         _resolver_ip: Option<IpAddr>,
         _app_ids: &[PathBuf],
+    ) -> Result<MockCover, RoutingError> {
+        Ok(MockCover)
+    }
+
+    fn engage_lockdown_tun(
+        &self,
+        _tun_name: &str,
+        _server_ip: IpAddr,
+        _resolver_ip: Option<IpAddr>,
     ) -> Result<(), RoutingError> {
         Ok(())
     }

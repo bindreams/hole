@@ -66,7 +66,7 @@ before editing; the sections linked below are the authoritative source.
   destination, so a `mux=0` client cannot reach a `mux=1` server. →
   [CONTRIBUTING.md#galoshes-mux-default](CONTRIBUTING.md#galoshes-mux-default)
 - **Fail-closed covers.** The **standing lockdown** cover
-  (`Routing::install_lockdown`, opt-in kill switch) holds the update-cutover gap:
+  (`Routing::install_lockdown_permits`, opt-in kill switch) holds the update-cutover gap:
   the bridge **disarms-not-drops** it across the restart and the new bridge
   re-adopts it (`decide_cover_recovery == Adopt`). Both it and the
   **transient** `install_failclosed_cover` permit loopback + server, plus the

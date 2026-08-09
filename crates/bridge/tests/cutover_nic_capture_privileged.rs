@@ -251,7 +251,7 @@ fn cutover_global_net_state_nic_capture_no_udp_leak() {
     let cover = engage_lockdown(
         server_ip,
         None,
-        "Loopback Pseudo-Interface 1", // always-present LUID source; the block governs the probed egress
+        Some("Loopback Pseudo-Interface 1"), // always-present LUID source; the block governs the probed egress
         &SystemLuidResolver,
         &[],
         dir.path(),

@@ -81,7 +81,7 @@ pub fn authority_is_a_name(url: &str) -> bool {
 /// `resolver` is the exact address `url` names — Hole constructed `url` from
 /// it (`doh_url_for_ip`), never a guess. Both fail-closed covers — the
 /// transient `install_failclosed_cover` and the standing
-/// `install_lockdown` — permit exactly this address regardless of `source`:
+/// `install_lockdown_permits` — permit exactly this address regardless of `source`:
 /// it always comes from the user's OWN configured `dns.servers`, so
 /// permitting it is config-authorship trust, not a claim that THIS attempt
 /// personally dialed it — `Answered` and `SecureBootstrapFailed` did

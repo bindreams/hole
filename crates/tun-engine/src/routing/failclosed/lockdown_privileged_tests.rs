@@ -103,7 +103,7 @@ fn windows_lockdown_permits_server_ip_and_blocks_other_egress() {
     let cover = engage_lockdown(
         server_ip,
         None,
-        "Loopback Pseudo-Interface 1",
+        Some("Loopback Pseudo-Interface 1"),
         &resolver,
         &[],
         dir.path(),
@@ -176,7 +176,7 @@ fn windows_lockdown_permits_resolver_blocks_other_egress() {
     let cover = engage_lockdown(
         server_ip,
         Some(resolver_ip),
-        "Loopback Pseudo-Interface 1",
+        Some("Loopback Pseudo-Interface 1"),
         &resolver,
         &[],
         dir.path(),
@@ -220,22 +220,23 @@ fn windows_lockdown_permits_resolver_blocks_other_egress() {
     );
 }
 
-/// Windows real-engage verification for the Phase-0 EARLY engage
-/// (`engage_lockdown_permits`, #753). No RAII guard is returned (see that
-/// fn's doc), so this test manually disengages via `disengage_lockdown` at
-/// the end -- proving the fixed-GUID sweep machinery a normal Phase-6
-/// disengage/recovery already uses fully restores egress even though no
-/// in-memory guard ever owned these particular filters. Proves (a) the
-/// server AND resolver permits are real and selective (a third,
-/// non-permitted host stays blocked) with NO TUN permit installed, and (b)
-/// the resolver permit stays scoped to TCP/443.
+/// Windows real-engage verification of the two-phase handoff (#753):
+/// `engage_lockdown` with `tun_name: None` (Phase 0) followed by
+/// `engage_lockdown_tun` (Phase 6) adding the TUN permit to the SAME
+/// already-returned `Cover` -- proving (a) the Phase-0-only cover is already
+/// selective (server + resolver permitted, a third host blocked) before any
+/// TUN permit exists, (b) adding the TUN permit via the second call does not
+/// disturb the already-engaged permits, and (c) the ONE `Cover` from Phase 0
+/// still owns the whole thing afterward: dropping it restores egress fully,
+/// with no second guard ever created.
 #[cfg(target_os = "windows")]
 #[skuld::test(labels = [TUN], serial = TUN)]
-fn windows_lockdown_permits_early_engage_admits_nothing_beyond_the_gated_addresses() {
+fn windows_lockdown_permits_phase_0_then_phase_6_share_one_cover() {
     use std::net::TcpStream;
     use std::time::Duration;
 
     let dir = tempfile::tempdir().unwrap();
+    let resolver = SystemLuidResolver;
     let server_ip: std::net::IpAddr = "1.1.1.1".parse().unwrap();
     let resolver_ip: std::net::IpAddr = "9.9.9.9".parse().unwrap();
 
@@ -257,7 +258,9 @@ fn windows_lockdown_permits_early_engage_admits_nothing_beyond_the_gated_address
         bn.err().map(|e| e.kind()),
     );
 
-    engage_lockdown_permits(server_ip, Some(resolver_ip), &[], dir.path(), None)
+    // Phase 0: engage without a TUN permit yet -- returns the ONE Cover this
+    // whole session will use.
+    let cover = engage_lockdown(server_ip, Some(resolver_ip), None, &resolver, &[], dir.path(), None)
         .expect("engage the real WFP lockdown cover's Phase-0 permits");
 
     let (p, r, po, n) = (
@@ -286,10 +289,45 @@ fn windows_lockdown_permits_early_engage_admits_nothing_beyond_the_gated_address
         "a third, non-permitted host must still be blocked (leak!): {NON_PERMITTED} connected"
     );
 
-    // No RAII guard exists to disengage on drop -- prove the fixed-GUID sweep
-    // (the same `disengage_lockdown` a normal Phase-6 cover's stop/unlock
-    // path uses) still fully restores egress for filters no guard ever owned.
-    disengage_lockdown(dir.path()).expect("disengage the Phase-0-only cover via the fixed-GUID sweep");
+    // Phase 6: add the TUN permit to the SAME cover (a fresh Cover is never
+    // created). "Loopback Pseudo-Interface 1" is an always-present alias
+    // used only as a LUID source to exercise the real resolve +
+    // `LocalInterface` filter path.
+    engage_lockdown_tun(
+        "Loopback Pseudo-Interface 1",
+        server_ip,
+        Some(resolver_ip),
+        &resolver,
+        dir.path(),
+        None,
+    )
+    .expect("add the TUN permit to the already-engaged cover");
+
+    let (p2, r2, po2, n2) = (
+        connect(PERMITTED),
+        connect(RESOLVER),
+        connect(RESOLVER_OTHER_PORT),
+        connect(NON_PERMITTED),
+    );
+    assert!(
+        p2.is_ok() && r2.is_ok(),
+        "server/resolver permits must still hold after adding the TUN permit: \
+         {PERMITTED}={:?} {RESOLVER}={:?}",
+        p2.err().map(|e| e.kind()),
+        r2.err().map(|e| e.kind()),
+    );
+    assert!(
+        po2.is_err() && n2.is_err(),
+        "adding the TUN permit must not widen anything else: \
+         {RESOLVER_OTHER_PORT}={:?} {NON_PERMITTED}={:?}",
+        po2.err().map(|e| e.kind()),
+        n2.err().map(|e| e.kind()),
+    );
+
+    // The ONE Cover from Phase 0 still owns the whole thing: dropping it
+    // restores egress fully, TUN permit included, with no second guard ever
+    // created.
+    drop(cover);
     let (rn, rpo) = (connect(NON_PERMITTED), connect(RESOLVER_OTHER_PORT));
     assert!(
         rn.is_ok() && rpo.is_ok(),
@@ -340,7 +378,7 @@ fn macos_lockdown_permits_server_ip_blocks_other_egress_and_restores() {
         base_non.err().map(|e| e.kind()),
     );
 
-    let cover = engage_lockdown(server_ip, None, "utun-absent", &resolver, &[], dir.path(), None)
+    let cover = engage_lockdown(server_ip, None, Some("utun-absent"), &resolver, &[], dir.path(), None)
         .expect("engage real pf lockdown cover");
 
     // (a) The live main ruleset carries our authoritative block rule.
@@ -418,7 +456,7 @@ fn macos_lockdown_permits_resolver_blocks_other_egress() {
     let cover = engage_lockdown(
         server_ip,
         Some(resolver_ip),
-        "utun-absent",
+        Some("utun-absent"),
         &resolver,
         &[],
         dir.path(),
@@ -469,23 +507,23 @@ fn macos_lockdown_permits_resolver_blocks_other_egress() {
     );
 }
 
-/// macOS real-engage verification for the Phase-0 EARLY engage
-/// (`engage_lockdown_permits`, #753). No RAII guard is returned (see that
-/// fn's doc), so this test manually disengages via `disengage_lockdown` at
-/// the end -- proving the persisted lockdown-state-file recovery machinery a
-/// normal Phase-6 disengage/recovery already uses fully restores egress even
-/// though no in-memory guard ever owned this particular pf load. Proves (a)
-/// the live ruleset carries NO TUN pass line, (b) the server AND resolver
-/// permits are real and selective, and (c) the resolver permit stays scoped
-/// to TCP/443.
+/// macOS real-engage verification of the two-phase handoff (#753):
+/// `engage_lockdown` with `tun_name: None` (Phase 0) followed by
+/// `engage_lockdown_tun` (Phase 6, a full pf ruleset reload adding the TUN
+/// pass line) -- proving (a) the Phase-0-only cover is already selective
+/// with NO TUN pass line live, (b) adding the TUN permit via the second call
+/// reuses the SAME pf enable token (no double `-E`) and does not disturb the
+/// already-engaged permits, and (c) the ONE `Cover` from Phase 0 still owns
+/// the whole thing afterward.
 #[cfg(target_os = "macos")]
 #[skuld::test(labels = [TUN], serial = TUN)]
-fn macos_lockdown_permits_early_engage_admits_nothing_beyond_the_gated_addresses() {
+fn macos_lockdown_permits_phase_0_then_phase_6_share_one_cover() {
     use std::net::TcpStream;
     use std::process::Command;
     use std::time::Duration;
 
     let dir = tempfile::tempdir().unwrap();
+    let resolver = SystemLuidResolver;
     let server_ip: std::net::IpAddr = "1.1.1.1".parse().unwrap();
     let resolver_ip: std::net::IpAddr = "9.9.9.9".parse().unwrap();
 
@@ -507,7 +545,9 @@ fn macos_lockdown_permits_early_engage_admits_nothing_beyond_the_gated_addresses
         bn.err().map(|e| e.kind()),
     );
 
-    engage_lockdown_permits(server_ip, Some(resolver_ip), &[], dir.path(), None)
+    // Phase 0: engage without a TUN pass line yet -- returns the ONE Cover
+    // this whole session will use.
+    let cover = engage_lockdown(server_ip, Some(resolver_ip), None, &resolver, &[], dir.path(), None)
         .expect("engage the real pf lockdown cover's Phase-0 permits");
 
     let sr = Command::new("pfctl").args(["-sr"]).output().unwrap();
@@ -543,10 +583,41 @@ fn macos_lockdown_permits_early_engage_admits_nothing_beyond_the_gated_addresses
         "a third, non-permitted host must still be blocked (leak!): {NON_PERMITTED} connected"
     );
 
-    // No RAII guard exists to disengage on drop -- prove the persisted-state
-    // recovery (the same `disengage_lockdown` a normal Phase-6 cover's
-    // stop/unlock path uses) still fully restores egress.
-    disengage_lockdown(dir.path()).expect("disengage the Phase-0-only cover via the persisted state file");
+    // Phase 6: add the TUN permit -- a full pf reload reusing the SAME
+    // persisted token (no double `-E`, no re-snapshot).
+    engage_lockdown_tun("utun-absent", server_ip, Some(resolver_ip), &resolver, dir.path(), None)
+        .expect("add the TUN permit to the already-engaged cover");
+
+    let sr2 = Command::new("pfctl").args(["-sr"]).output().unwrap();
+    let rules2 = String::from_utf8_lossy(&sr2.stdout);
+    assert!(
+        rules2.contains("pass out quick on utun-absent all"),
+        "the TUN pass line must be live after Phase 6:\n{rules2}"
+    );
+
+    let (p2, r2, po2, n2) = (
+        connect(PERMITTED),
+        connect(RESOLVER),
+        connect(RESOLVER_OTHER_PORT),
+        connect(NON_PERMITTED),
+    );
+    assert!(
+        p2.is_ok() && r2.is_ok(),
+        "server/resolver permits must still hold after adding the TUN permit: \
+         {PERMITTED}={:?} {RESOLVER}={:?}",
+        p2.err().map(|e| e.kind()),
+        r2.err().map(|e| e.kind()),
+    );
+    assert!(
+        po2.is_err() && n2.is_err(),
+        "adding the TUN permit must not widen anything else: \
+         {RESOLVER_OTHER_PORT}={:?} {NON_PERMITTED}={:?}",
+        po2.err().map(|e| e.kind()),
+        n2.err().map(|e| e.kind()),
+    );
+
+    // The ONE Cover from Phase 0 still owns the whole thing.
+    drop(cover);
     let (rn, rpo) = (connect(NON_PERMITTED), connect(RESOLVER_OTHER_PORT));
     assert!(
         rn.is_ok() && rpo.is_ok(),

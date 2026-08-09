@@ -89,7 +89,7 @@ pub fn ensure_trailing_nl(s: &str) -> String {
 /// `Some`) the resolver Hole's own `ech-doh` URL names, scoped to
 /// `proto tcp port` [`RESOLVER_PERMIT_PORT`] — the same trust condition and
 /// port scope as the transient cover's `build_pf_ruleset` (see
-/// [`crate::routing::Routing::install_lockdown`]'s doc). pf has no
+/// [`crate::routing::Routing::install_lockdown_permits`]'s doc). pf has no
 /// per-process matching, so an App-ID-style permit isn't an option here even
 /// in principle — the address permit is the only way this fetch (which may
 /// run in a plugin's separately-spawned child process, e.g. galoshes'

@@ -395,7 +395,7 @@ fn resolver_permit_filter(resolver_ip: Option<IpAddr>, guid_v4: GUID, guid_v6: G
 /// Optionally also permits ONE more address (`resolver_ip`) on its own
 /// family's CONNECT layer, scoped to `RESOLVER_PERMIT_PORT` — mirrors
 /// `build_cover_spec`'s resolver permit exactly (same trust condition, same
-/// port scope; see [`crate::routing::Routing::install_lockdown`]'s doc for
+/// port scope; see [`crate::routing::Routing::install_lockdown_permits`]'s doc for
 /// why an App-ID permit alone does not cover a chained plugin's inner
 /// process). Omitted whenever nothing should be permitted.
 ///
@@ -657,23 +657,30 @@ pub fn engage_lockdown(
     }
 }
 
-/// Engage the standing lockdown cover's permits WITHOUT the TUN-interface
-/// permit, and without returning an RAII guard — see
-/// [`crate::routing::Routing::install_lockdown_permits`]'s doc for the full
-/// rationale. Opens its own engine, adds/refreshes the filters in one
-/// transaction (idempotent, same as [`engage_lockdown`]), and closes the
-/// engine immediately: unlike `engage_lockdown`, there is no long-lived guard
-/// here to own the handle, since the filters this installs are recovered by
-/// the SAME fixed GUIDs `engage_lockdown`'s later, TUN-inclusive call (or
-/// `recover_lockdown`/`disengage_lockdown`) already sweeps.
+/// Add ONLY the TUN-interface permit pair to an already-engaged standing
+/// lockdown cover (from [`engage_lockdown`] with `tun_luid: None`), once
+/// `routing.install` has resolved the adapter. Idempotent, and returns no
+/// guard — see [`crate::routing::Routing::engage_lockdown_tun`]'s doc: the
+/// `Cover` the earlier `engage_lockdown` call already returned owns the
+/// WHOLE standing cover's disengage-on-drop (`swept_lockdown_guids`, TUN
+/// GUIDs included) regardless of whether this function was ever called, so
+/// there is nothing here for a new guard to uniquely own. Opens its own
+/// engine, adds the two filters in one transaction, and closes the engine
+/// immediately — unlike `engage_lockdown`, no handle is held past this call.
 #[allow(clippy::disallowed_methods)] // THIS is the sanctioned FWPM call site
-pub fn engage_lockdown_permits(
-    server_ip: IpAddr,
-    resolver_ip: Option<IpAddr>,
-    app_ids: &[std::path::PathBuf],
-    _state_dir: &Path,
-) -> Result<(), RoutingError> {
-    let spec = build_lockdown_spec(server_ip, resolver_ip, None, app_ids);
+pub fn engage_lockdown_tun(tun_luid: u64) -> Result<(), RoutingError> {
+    let filters = [
+        permit(
+            LOCKDOWN_FILTER_GUIDS[2],
+            Layer::ConnectV4,
+            Condition::LocalInterface(tun_luid),
+        ),
+        permit(
+            LOCKDOWN_FILTER_GUIDS[3],
+            Layer::ConnectV6,
+            Condition::LocalInterface(tun_luid),
+        ),
+    ];
     unsafe {
         let mut engine = HANDLE::default();
         wfp_check(
@@ -682,10 +689,8 @@ pub fn engage_lockdown_permits(
         )?;
         let result = (|| -> Result<(), RoutingError> {
             wfp_check(FwpmTransactionBegin0(engine, 0), "FwpmTransactionBegin0")?;
-            add_provider(engine, spec.provider)?;
-            add_sublayer(engine, spec.sublayer, spec.provider)?;
-            for f in &spec.filters {
-                add_filter(engine, spec.provider, spec.sublayer, f)?;
+            for f in &filters {
+                add_filter(engine, PROVIDER_GUID, SUBLAYER_GUID, f)?;
             }
             wfp_check(FwpmTransactionCommit0(engine), "FwpmTransactionCommit0")?;
             Ok(())

@@ -217,7 +217,8 @@ pub enum CoverRecovery {
     /// teardown), the server-IP permit (the server may change before the next
     /// connect), and the resolver-IP permit (the ECH resolver may change, or be
     /// dropped entirely, before the next connect) — are refreshed by the next
-    /// connect's `install_lockdown`. Windows drops the volatile GUIDs at THIS
+    /// connect's `install_lockdown_permits` (server/resolver) and
+    /// `engage_lockdown_tun` (TUN). Windows drops the volatile GUIDs at THIS
     /// recovery step so the re-add isn't a fixed-key no-op; macOS's Adopt step
     /// removes nothing at all (the whole pf ruleset, resolver permit included,
     /// stays live from before the crash/restart until the next connect's
@@ -439,22 +440,28 @@ pub trait Routing: Send + Sync {
         resolver_ip: Option<IpAddr>,
     ) -> Result<Self::Cover, RoutingError>;
 
-    /// Engage the STANDING lockdown cover for this connected session: permit
-    /// loopback + the `tun_name` interface + the onward server connection + (when
-    /// `Some`) `resolver_ip`, scoped to TCP/443 (and, on Windows, the `app_ids`
-    /// binaries by App-ID), block all else. Returns the SAME
-    /// [`Cover`](Self::Cover) RAII guard
+    /// Engage the STANDING lockdown cover's permits WITHOUT the TUN-interface
+    /// permit: loopback, the onward server connection, (when `Some`)
+    /// `resolver_ip`, and (Windows) the `app_ids` binaries, block all else.
+    /// Returns the SAME [`Cover`](Self::Cover) RAII guard
     /// [`install_failclosed_cover`](Self::install_failclosed_cover) returns —
-    /// the platform guard is kind-aware, so its Drop disengages whichever cover
-    /// it holds. Distinct from `install_failclosed_cover`, which does NOT permit
-    /// the TUN. The LUID is re-resolved on every call (never persisted).
-    /// Fail-FATAL: the bridge aborts the start on Err.
+    /// the platform guard is kind-aware, so its Drop disengages whichever
+    /// cover it holds. The caller owns this guard for the lifetime of the
+    /// standing cover: [`engage_lockdown_tun`](Self::engage_lockdown_tun)
+    /// later adds the TUN permit to the SAME already-engaged cover in place
+    /// (no second guard), and dropping THIS guard is what tears the whole
+    /// thing down, TUN permit included, whenever it was added.
     ///
-    /// Called at Phase 6 (`ProxyManager::start_inner`), once `install` has
-    /// resolved the TUN adapter — NOT the first engage of a start: every
-    /// permit here except the TUN one is already live from Phase 0's
-    /// [`install_lockdown_permits`](Self::install_lockdown_permits), whose doc
-    /// explains why that earlier call exists.
+    /// Call this BEFORE Phase 1 (plugin-chain start) — mirroring exactly when
+    /// [`install_failclosed_cover`](Self::install_failclosed_cover) engages —
+    /// so a plugin's Phase-4 forwarder self-test (where ex-ray's lazy
+    /// ECH-config fetch actually fires, on the chain's first real dial) is
+    /// already covered. Without this, on an armed machine the standing cover
+    /// is already live during Phase 4 (installed by a previous run or adopted
+    /// at startup, blocking everything not yet permitted), and a TUN-gated
+    /// engage alone — gated on Phase 6, which needs `install` to have
+    /// resolved the TUN adapter first — arrives too late to protect that
+    /// dial. Fail-FATAL: the bridge aborts the start on Err.
     ///
     /// `resolver_ip` carries the exact same trust condition as
     /// `install_failclosed_cover`'s (see that method's doc): the caller's own
@@ -465,41 +472,32 @@ pub trait Routing: Send + Sync {
     /// set never names, so only an address-based permit reaches the process
     /// that actually dials the resolver (see CONTRIBUTING.md's "Lockdown
     /// mode" section).
-    fn install_lockdown(
-        &self,
-        server_ip: IpAddr,
-        resolver_ip: Option<IpAddr>,
-        tun_name: &str,
-        app_ids: &[PathBuf],
-    ) -> Result<Self::Cover, RoutingError>;
-
-    /// Engage the standing lockdown cover's permits WITHOUT the TUN-interface
-    /// permit: loopback, the onward server connection, (when `Some`)
-    /// `resolver_ip`, and (Windows) the `app_ids` binaries — every permit
-    /// [`install_lockdown`](Self::install_lockdown) installs except the TUN
-    /// one. Idempotent, and returns no guard: the permits it adds are
-    /// recovered by the SAME fixed key (Windows: compiled-in GUID; macOS: the
-    /// lockdown state file) that `install_lockdown`'s later call and the
-    /// whole recovery machinery (`recover_lockdown`/`disengage_lockdown`)
-    /// already use, so there is nothing here for an RAII guard to uniquely
-    /// own.
-    ///
-    /// Call this BEFORE Phase 1 (plugin-chain start) — mirroring exactly when
-    /// [`install_failclosed_cover`](Self::install_failclosed_cover) engages —
-    /// so a plugin's Phase-4 forwarder self-test (where ex-ray's lazy
-    /// ECH-config fetch actually fires, on the chain's first real dial) is
-    /// already covered. Without this, on an armed machine the standing cover
-    /// is already live during Phase 4 (installed by a previous run or adopted
-    /// at startup, blocking everything not yet permitted), and
-    /// `install_lockdown` alone — gated on Phase 6, which needs `install` to
-    /// have resolved the TUN adapter first — arrives too late to protect that
-    /// dial (#753). Fail-FATAL, matching `install_lockdown`: an engage error
-    /// under intent-on aborts the start.
     fn install_lockdown_permits(
         &self,
         server_ip: IpAddr,
         resolver_ip: Option<IpAddr>,
         app_ids: &[PathBuf],
+    ) -> Result<Self::Cover, RoutingError>;
+
+    /// Add the TUN-interface permit (Windows: by `NET_LUID`, re-resolved on
+    /// every call, never persisted; macOS: `pass out quick on <tun_name>`) to
+    /// the standing lockdown cover [`install_lockdown_permits`](Self::install_lockdown_permits)
+    /// already engaged, once `install` has resolved the adapter. Idempotent;
+    /// returns no guard — the [`Cover`](Self::Cover)
+    /// `install_lockdown_permits` already returned still owns the whole
+    /// standing cover's disengage-on-drop, TUN permit included once this adds
+    /// it, so calling this does not create anything new to own. `server_ip`
+    /// and `resolver_ip` are the SAME values already passed to
+    /// `install_lockdown_permits` — Windows ignores them (the TUN filter pair
+    /// carries no address condition), macOS needs them again because pf has
+    /// no incremental update: every load replaces the whole ruleset, so this
+    /// rebuilds it with the identical server/resolver permits plus the new
+    /// TUN one. Fail-FATAL, matching `install_lockdown_permits`.
+    fn engage_lockdown_tun(
+        &self,
+        tun_name: &str,
+        server_ip: IpAddr,
+        resolver_ip: Option<IpAddr>,
     ) -> Result<(), RoutingError>;
 }
 
@@ -579,32 +577,37 @@ impl Routing for SystemRouting {
         failclosed::engage(server_ip, resolver_ip, &self.state_dir, self.owner)
     }
 
-    fn install_lockdown(
+    fn install_lockdown_permits(
         &self,
         server_ip: IpAddr,
         resolver_ip: Option<IpAddr>,
-        tun_name: &str,
         app_ids: &[PathBuf],
     ) -> Result<Self::Cover, RoutingError> {
-        let luid_resolver = failclosed::SystemLuidResolver;
         failclosed::engage_lockdown(
             server_ip,
             resolver_ip,
-            tun_name,
-            &luid_resolver,
+            None,
+            &failclosed::SystemLuidResolver,
             app_ids,
             &self.state_dir,
             self.owner,
         )
     }
 
-    fn install_lockdown_permits(
+    fn engage_lockdown_tun(
         &self,
+        tun_name: &str,
         server_ip: IpAddr,
         resolver_ip: Option<IpAddr>,
-        app_ids: &[PathBuf],
     ) -> Result<(), RoutingError> {
-        failclosed::engage_lockdown_permits(server_ip, resolver_ip, app_ids, &self.state_dir, self.owner)
+        failclosed::engage_lockdown_tun(
+            tun_name,
+            server_ip,
+            resolver_ip,
+            &failclosed::SystemLuidResolver,
+            &self.state_dir,
+            self.owner,
+        )
     }
 }
 

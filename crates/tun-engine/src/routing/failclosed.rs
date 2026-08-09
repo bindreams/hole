@@ -94,20 +94,23 @@ pub fn recover_cover(state_dir: &Path, adopting: bool) {
     platform::recover_cover(state_dir, adopting);
 }
 
-/// Engage the standing lockdown cover (loopback + TUN + onward-server + (when
-/// `Some`) `resolver_ip`, scoped to TCP/443 + —on Windows— plugin/bridge
-/// App-IDs permitted, all else blocked). Returns the SAME [`Cover`] wrapper
-/// the transient `engage` returns — the platform guard is kind-aware, so
+/// Engage the standing lockdown cover, WITHOUT the TUN permit when
+/// `tun_name` is `None` (the Phase-0 early engage, see
+/// [`crate::routing::Routing::install_lockdown_permits`]'s doc) or WITH it
+/// when `Some` (loopback + TUN + onward-server + (when `Some`)
+/// `resolver_ip`, scoped to TCP/443 + —on Windows— plugin/bridge App-IDs
+/// permitted, all else blocked). Returns the SAME [`Cover`] wrapper the
+/// transient `engage` returns — the platform guard is kind-aware, so
 /// dropping it disengages the lockdown cover specifically. On Windows the
-/// LUID is re-resolved here every engage (never persisted). On failure the
-/// host is left uncovered; the bridge's fail-FATAL caller aborts the start.
-/// `app_ids` is empty on macOS (pf has no per-process matching); `resolver_ip`
-/// carries the same trust condition as [`engage`]'s — see
-/// [`crate::routing::Routing::install_lockdown`]'s doc.
+/// LUID is re-resolved here every engage with `Some` (never persisted). On
+/// failure the host is left uncovered; the bridge's fail-FATAL caller aborts
+/// the start. `app_ids` is empty on macOS (pf has no per-process matching);
+/// `resolver_ip` carries the same trust condition as [`engage`]'s — see
+/// [`crate::routing::Routing::install_lockdown_permits`]'s doc.
 pub fn engage_lockdown(
     server_ip: IpAddr,
     resolver_ip: Option<IpAddr>,
-    tun_name: &str,
+    tun_name: Option<&str>,
     resolver: &dyn LuidResolver,
     app_ids: &[std::path::PathBuf],
     state_dir: &Path,
@@ -116,48 +119,54 @@ pub fn engage_lockdown(
     #[cfg(target_os = "windows")]
     {
         let _ = owner;
-        let luid = resolver.resolve(tun_name)?;
+        let luid = match tun_name {
+            Some(name) => Some(resolver.resolve(name)?),
+            None => None,
+        };
         Ok(Cover {
-            _inner: platform::engage_lockdown(server_ip, resolver_ip, Some(luid), app_ids, state_dir)?,
+            _inner: platform::engage_lockdown(server_ip, resolver_ip, luid, app_ids, state_dir)?,
         })
     }
     #[cfg(target_os = "macos")]
     {
         let _ = (resolver, app_ids);
         Ok(Cover {
-            _inner: platform::engage_lockdown(server_ip, resolver_ip, Some(tun_name), state_dir, owner)?,
+            _inner: platform::engage_lockdown(server_ip, resolver_ip, tun_name, state_dir, owner)?,
         })
     }
 }
 
-/// Engage the standing lockdown cover's permits WITHOUT the TUN-interface
-/// permit, and without returning a long-lived RAII guard — see
-/// [`crate::routing::Routing::install_lockdown_permits`]'s doc for the full
-/// rationale (the pre-Phase-1 timing, and why no guard is needed here).
-/// Idempotent: safe to call on every start attempt, including a retry.
-pub fn engage_lockdown_permits(
+/// Add the TUN permit to an already-engaged standing lockdown cover — see
+/// [`crate::routing::Routing::engage_lockdown_tun`]'s doc for the full
+/// rationale (no guard needed; the earlier [`engage_lockdown`] call's
+/// returned [`Cover`] already owns the whole thing). Idempotent.
+pub fn engage_lockdown_tun(
+    tun_name: &str,
     server_ip: IpAddr,
     resolver_ip: Option<IpAddr>,
-    app_ids: &[std::path::PathBuf],
+    resolver: &dyn LuidResolver,
     state_dir: &Path,
     owner: Option<(u32, u32)>,
 ) -> Result<(), RoutingError> {
     #[cfg(target_os = "windows")]
     {
-        let _ = owner;
-        platform::engage_lockdown_permits(server_ip, resolver_ip, app_ids, state_dir)
+        let _ = (server_ip, resolver_ip, state_dir, owner);
+        let luid = resolver.resolve(tun_name)?;
+        platform::engage_lockdown_tun(luid)
     }
     #[cfg(target_os = "macos")]
     {
-        let _ = app_ids;
-        // Reuses the full engage (tun_name = None omits the TUN pass line) and
-        // discards the returned guard WITHOUT running its Drop: the permits
-        // are recovered by the persisted lockdown state file regardless of
-        // any in-memory guard's lifetime (see `Cover::forget_without_disengage`'s
-        // doc), and there is no OS handle here to leak by forgetting it (unlike
-        // Windows' WFP engine handle, which `platform::engage_lockdown_permits`
-        // closes explicitly instead of going through this path).
-        let cover = platform::engage_lockdown(server_ip, resolver_ip, None, state_dir, owner)?;
+        let _ = resolver;
+        // pf has no incremental update: reload the FULL ruleset (server +
+        // resolver + the new TUN line), reusing the token/snapshot Phase 0
+        // already persisted (`engage_pf_action` sees `has_persisted &&
+        // pf_enabled` -> `ReuseToken`, so this does not re-`-E` or
+        // re-snapshot). The returned guard is discarded WITHOUT running its
+        // Drop: the REAL owning guard is the one `engage_lockdown` already
+        // returned at Phase 0, and its Drop already sweeps the FULL
+        // lockdown state (TUN included) via the persisted state file,
+        // regardless of which call added what.
+        let cover = platform::engage_lockdown(server_ip, resolver_ip, Some(tun_name), state_dir, owner)?;
         cover.forget_without_disengage();
         Ok(())
     }
