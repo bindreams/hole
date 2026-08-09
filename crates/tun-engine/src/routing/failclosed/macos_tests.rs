@@ -320,7 +320,7 @@ fn lockdown_main_v6_server_permit_precedes_inet6_block() {
     );
 }
 
-// build_lockdown_main_ruleset resolver permit (#753) ==================================================================
+// build_lockdown_main_ruleset resolver permit =========================================================================
 
 #[skuld::test]
 fn lockdown_main_omits_resolver_pass_when_none() {

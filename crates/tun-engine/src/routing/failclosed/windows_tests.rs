@@ -346,7 +346,7 @@ fn lockdown_spec_v6_server_lands_on_v6_layer() {
     assert_eq!(server[0].layer, Layer::ConnectV6);
 }
 
-// lockdown resolver permit (#753) =====================================================================================
+// lockdown resolver permit ============================================================================================
 
 #[skuld::test]
 fn lockdown_spec_permits_resolver_ip_on_its_own_family_layer_when_given() {
@@ -810,7 +810,7 @@ fn adopt_does_not_delete_the_address_range_loopback_floor() {
         );
     }
     // Adopt still drops exactly six volatile permits: TUN V4/V6, server V4/V6,
-    // resolver V4/V6 (grown by #753).
+    // resolver V4/V6.
     assert_eq!(
         adopt.len(),
         6,

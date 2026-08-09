@@ -239,13 +239,8 @@ pub struct ProxyManager<P: Proxy = ShadowsocksProxy, R: Routing = SystemRouting,
     /// derivation is otherwise observable only through the plugin it spawns.
     #[cfg(test)]
     last_ech_doh: Option<String>,
-    /// Test-only plugin-binary path override. Set by
-    /// `set_plugin_path_override_for_test`; when present, `start_inner`
-    /// spawns this exact path instead of `resolve_plugin_path`'s
-    /// next-to-exe/PATH lookup — lets a test point at a real, disposable
-    /// plugin binary (e.g. staged into its own private tempdir) without
-    /// mutating any process-global state (no shared destination file, no
-    /// env var).
+    /// Test-only plugin-binary path override — see
+    /// `set_plugin_path_override_for_test`.
     #[cfg(test)]
     plugin_path_override: Option<String>,
 }
@@ -878,6 +873,27 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
                     );
                 }
             }
+        } else if lockdown_on {
+            // The standing lockdown cover has no `self.blocked`-style live-permit
+            // tracking (a covered retry under lockdown never holds one — every
+            // `start_inner` re-derives and re-installs fresh), so unlike the
+            // transient-cover arms above, ONLY the operator-override case can be
+            // diagnosed here without inventing new cross-attempt state: it is
+            // unconditionally a stall risk regardless of which permit the
+            // (possibly adopted, possibly stale) live cover happens to carry —
+            // an operator's own `ech-doh` is never permitted by either cover. The
+            // `Holes`/`None` arms above need to know the LIVE lockdown cover's
+            // actual resolver value to warn accurately (e.g. an Adopt-stale
+            // permit), which today only `install_lockdown`'s own OS state
+            // has — a real gap, open for follow-up.
+            if let crate::proxy::plugin::EffectiveEchDoh::Operators(url) = &effective_ech_doh {
+                warn!(
+                    operator_ech_doh = %url,
+                    "covered start under lockdown: the plugin's own ech-doh overrides Hole's and dials a \
+                     resolver the standing lockdown cover does not permit; it may stall to ex-ray's client \
+                     timeout"
+                );
+            }
         }
 
         debug!("awaiting start_inner");
@@ -1402,7 +1418,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         // locally-owned `routes` guard (declared above) Drops on the Err
         // unwind, tearing down — the opposite of the transient cover's
         // fail-open. Committed only on the Ok path (the field below).
-        // `ech_resolver_permit` (#753) is passed through unconditionally, not
+        // `ech_resolver_permit` is passed through unconditionally, not
         // gated on `covered`: the standing cover is armed for manual AND
         // covered starts alike, and the value is already gated on
         // `effective_ech_doh == Holes` by the caller — see `start_inner`'s

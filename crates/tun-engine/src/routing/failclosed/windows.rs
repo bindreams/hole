@@ -105,7 +105,7 @@ const IPPROTO_TCP: u8 = 6;
 // sweep only knows the first twelve) leaves the two resolver-permit filters
 // permanently un-swept. They are *permits*, never blocks, so this is bounded
 // and self-healing (a later upgrade's sweep cleans them up), not a leak of
-// blocked traffic. Tracked separately: #754.
+// blocked traffic; see CONTRIBUTING.md's "Transient cutover cover" section.
 pub const LOCKDOWN_FILTER_GUIDS: [GUID; 14] = [
     GUID::from_u128(0x216a841b_f264_4047_8881_39f24b4d6dce), // loopback CONNECT V4
     GUID::from_u128(0x4d9cd0a2_c48f_40cf_8225_89ce3f8a1376), // loopback CONNECT V6

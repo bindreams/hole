@@ -137,7 +137,7 @@ fn windows_lockdown_permits_server_ip_and_blocks_other_egress() {
     );
 }
 
-/// Windows real-engage verification (#753) that the STANDING lockdown cover's
+/// Windows real-engage verification that the STANDING lockdown cover's
 /// OPTIONAL resolver permit is real and selective — the Windows counterpart of
 /// `windows_failclosed_permits_resolver_blocks_other_egress` for the transient
 /// cover. With `resolver_ip = Some`, both the server AND the resolver stay
@@ -302,7 +302,7 @@ fn macos_lockdown_permits_server_ip_blocks_other_egress_and_restores() {
     );
 }
 
-/// macOS real-engage verification (#753) that the STANDING lockdown cover's
+/// macOS real-engage verification that the STANDING lockdown cover's
 /// OPTIONAL resolver permit is real and selective — the macOS counterpart of
 /// `windows_lockdown_permits_resolver_blocks_other_egress`. Also proves the
 /// permit is scoped to TCP/443, not the whole resolver IP.

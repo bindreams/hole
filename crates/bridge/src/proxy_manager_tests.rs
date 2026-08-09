@@ -197,7 +197,7 @@ struct MockRoutingState {
     fail_cover_for_resolvers: std::sync::Mutex<std::collections::HashSet<Option<IpAddr>>>,
     /// Last `resolver_ip` passed to `install_lockdown`, so a test can assert
     /// the standing lockdown cover permits exactly the ONE gated resolver (or
-    /// none) — the #753 regression this whole mock exists to catch.
+    /// none).
     last_lockdown_resolver_ip: std::sync::Mutex<Option<IpAddr>>,
 }
 
@@ -432,7 +432,7 @@ fn mock_install_lockdown_records_engage_and_drop_records_disengage() {
 
 #[skuld::test]
 fn mock_install_lockdown_records_the_resolver_permit() {
-    // #753: the standing lockdown cover must receive the same gated resolver
+    // The standing lockdown cover must receive the same gated resolver
     // permit the transient cover would — recorded so ProxyManager-level tests
     // can assert on it.
     let dir = tempfile::tempdir().unwrap();
@@ -1135,7 +1135,7 @@ fn lockdown_on_engages_after_install_and_disengages_on_stop() {
     });
 }
 
-// Standing lockdown resolver permit (#753) ============================================================================
+// Standing lockdown resolver permit ===================================================================================
 //
 // `ech_resolver_permit` is computed ONCE in `start_cancellable` (the same
 // value the transient cover's tests below already exercise extensively) and
@@ -1198,8 +1198,8 @@ fn lockdown_on_permits_the_gated_ech_resolver_for_a_real_plugin_chain() {
     // `MockRouting` contract (`mock_install_lockdown_records_the_resolver_permit`
     // proves that half).
     //
-    // NOT a full regression test for #753: `dns.enabled = false` below
-    // skips the forwarder self-test (Phase 4) so the start reaches Phase 6
+    // NOT a full regression test: `dns.enabled = false` below skips the
+    // forwarder self-test (Phase 4) so the start reaches Phase 6
     // at all under `MockProxy`. `lockdown_on_never_reaches_phase_6_when_the_self_test_fails`
     // demonstrates the gap this leaves -- Phase 4 is where ex-ray's lazy
     // ECH-config fetch actually fires (it dials through the plugin chain on
@@ -1224,6 +1224,38 @@ fn lockdown_on_permits_the_gated_ech_resolver_for_a_real_plugin_chain() {
         cfg.dns.servers = vec![resolver];
 
         pm.start(&cfg).await.expect("a real ex-ray chain must start cleanly");
+        assert_eq!(st.lockdown_engage_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(*st.last_lockdown_resolver_ip.lock().unwrap(), Some(resolver));
+    });
+}
+
+#[skuld::test]
+fn lockdown_on_permits_the_gated_ech_resolver_on_a_covered_start_too() {
+    // `start_inner`'s own doc claims `ech_resolver_permit` is threaded through
+    // unconditionally, not gated on `covered` -- the standing cover is armed
+    // for manual AND covered starts alike. The sibling test above only
+    // exercises the manual path (`pm.start`, `covered = false`); this proves
+    // the claim on the covered (auto-connect) path too, via
+    // `start_cancellable(&cfg, true, ...)`.
+    rt().block_on(async {
+        let (_plugin_dir, plugin_path) = stage_real_ex_ray();
+
+        let resolver: IpAddr = "198.51.100.5".parse().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let routing = MockRouting::new(dir.path().to_path_buf());
+        let st = routing.state();
+        let (mut pm, _dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, true);
+        pm.set_plugin_path_override_for_test(plugin_path);
+        let mut cfg = test_config();
+        cfg.server.server = "203.0.113.9".into();
+        cfg.server.plugin = Some("ex-ray".into());
+        cfg.server.plugin_opts = Some(ECH_CAPABLE_OPTS.into());
+        cfg.dns.enabled = false;
+        cfg.dns.servers = vec![resolver];
+
+        pm.start_cancellable(&cfg, true, CancellationToken::new())
+            .await
+            .expect("a real ex-ray chain must start cleanly");
         assert_eq!(st.lockdown_engage_calls.load(Ordering::SeqCst), 1);
         assert_eq!(*st.last_lockdown_resolver_ip.lock().unwrap(), Some(resolver));
     });
@@ -1263,8 +1295,8 @@ fn lockdown_on_omits_the_resolver_permit_for_a_non_ech_capable_plugin() {
 
 #[skuld::test]
 fn lockdown_on_never_reaches_phase_6_when_the_self_test_fails() {
-    // DOCUMENTS A GAP, NOT YET FIXED (see the deputy report for #753): the
-    // standing lockdown cover's resolver permit is installed at Phase 6
+    // DOCUMENTS A GAP, NOT YET FIXED: the standing lockdown cover's
+    // resolver permit is installed at Phase 6
     // (`routing.install` / `install_lockdown`), but ex-ray's lazy ECH-config
     // fetch fires on the plugin chain's FIRST REAL DIAL -- which, whenever
     // `dns.enabled` (the default), is the Phase 4 forwarder self-test, run

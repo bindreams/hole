@@ -21,7 +21,7 @@ nextest-version = "0.9.130"
 #   - `_full_tunnel_roundtrip` suffix:
 #     crates/bridge/src/proxy_manager_e2e_tests.rs::e2e_none_full_tunnel_roundtrip
 #   - `windows_lockdown_permits_` / `macos_lockdown_permits_` (every real-engage
-#     standing-lockdown-cover test — server-IP AND, since #753, resolver-IP):
+#     standing-lockdown-cover test — server-IP AND resolver-IP):
 #     crates/tun-engine/src/routing/failclosed/lockdown_privileged_tests.rs
 #   - `failclosed_permits_` (transient block-until-connected cover real engage):
 #     crates/tun-engine/src/routing/failclosed/lockdown_privileged_tests.rs

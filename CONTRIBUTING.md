@@ -554,7 +554,7 @@ The **standing lockdown cover** (`Routing::install_lockdown`, #527) is an
 opt-in, **default-off**, bridge-owned kill switch. When enabled it engages a
 persistent OS-level egress block permitting **only** loopback, the `hole-tun`
 interface, the onward server connection, the resolver Hole's own `ech-doh`
-names when a plugin needs it (#753 — same gate, same TCP/443 scope, same
+names when a plugin needs it (same gate, same TCP/443 scope, same
 config-authorship trust as the [transient cover's resolver
 permit](#transient-cutover-cover); an address permit, not an App-ID one,
 because a chained plugin like `galoshes` spawns its inner ex-ray as a
