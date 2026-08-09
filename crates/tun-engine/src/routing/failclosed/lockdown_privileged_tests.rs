@@ -63,13 +63,8 @@ const PERMITTED: &str = "1.1.1.1:443";
 // and every other lane were unaffected), and PERMITTED=1.1.1.1 has never once
 // flaked across the SAME runner in the SAME file — same anycast network,
 // same edge presence, empirically the reliable choice on this infrastructure.
-// A residual live-network dependency remains (see this module's doc for why
-// a fully self-served target is NOT used instead: on macOS/BSD, a connect to
-// ANY address the host itself owns -- primary or aliased -- is routed via an
-// automatic host route through `lo0` before it ever reaches the real
-// interface, and this ruleset's `set skip on lo0` would silently exempt it,
-// making the permit assertion pass regardless of whether the resolver rule
-// works at all).
+// A residual live-network dependency remains (see this module's doc above
+// for why a fully self-served target isn't used instead).
 #[cfg(any(target_os = "windows", target_os = "macos"))]
 const RESOLVER: &str = "1.0.0.1:443";
 // The SAME resolver host, but on its DNS-over-TLS port rather than 443 —

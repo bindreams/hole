@@ -544,6 +544,47 @@ fn mock_failing_engage_lockdown_tun_returns_err_without_recording() {
     assert_eq!(state.lockdown_engage_calls.load(Ordering::SeqCst), 0);
 }
 
+// `lockdown_app_ids` (Windows App-ID permits) =========================================================================
+
+#[cfg(target_os = "windows")]
+#[skuld::test]
+fn lockdown_app_ids_uses_the_override_not_resolve_plugin_path() {
+    // The Windows App-ID permit must name the SAME plugin binary path
+    // `start_inner`'s Phase 1 actually spawns -- a test driving a real
+    // plugin chain under `set_plugin_path_override_for_test` (a staged
+    // binary, not wherever `resolve_plugin_path` would normally look) must
+    // get an App-ID permit for the staged path, not the unrelated default
+    // resolution.
+    let mut cfg = test_config();
+    cfg.server.plugin = Some("ex-ray".into());
+
+    let overridden = lockdown_app_ids(&cfg, Some(r"C:\staged\ex-ray.exe"));
+    assert!(
+        overridden.contains(&std::path::PathBuf::from(r"C:\staged\ex-ray.exe")),
+        "expected the override path in the App-ID set, got {overridden:?}"
+    );
+    assert!(
+        !overridden
+            .iter()
+            .any(|p| p != &std::path::PathBuf::from(r"C:\staged\ex-ray.exe") && p.ends_with("ex-ray.exe")),
+        "must not ALSO carry a resolve_plugin_path-derived ex-ray path alongside the override: {overridden:?}"
+    );
+}
+
+#[cfg(target_os = "windows")]
+#[skuld::test]
+fn lockdown_app_ids_falls_back_to_resolve_plugin_path_without_an_override() {
+    let mut cfg = test_config();
+    cfg.server.plugin = Some("ex-ray".into());
+
+    let without_override = lockdown_app_ids(&cfg, None);
+    let expected = std::path::PathBuf::from(crate::proxy::config::resolve_plugin_path("ex-ray"));
+    assert!(
+        without_override.contains(&expected),
+        "expected the resolve_plugin_path fallback in the App-ID set, got {without_override:?}"
+    );
+}
+
 // Helpers =============================================================================================================
 
 fn rt() -> tokio::runtime::Runtime {

@@ -642,21 +642,16 @@ the standing cover now does too).
 This accepts a retry-window gap: a failed or cancelled attempt's guard
 disengages immediately, opening the host briefly until the NEXT retry's own
 Phase 0 re-engages fresh. The window is not new: an ordinary `main` connect
-using the single-phase, pre-two-phase-split `install_lockdown` call (called
-once, from inside `start_inner`, before this mechanism existed) has the
-identical gap on every failed or cancelled attempt, so retaining state only
-for the two-phase split would have spent real complexity protecting a window
-that predates this fix and was never in its scope. Tracked as
-[#768](https://github.com/bindreams/hole/issues/768).
+has the identical gap on every failed or cancelled attempt, so retaining
+state only for the two-phase split would have spent real complexity
+protecting a window that predates this fix and was never in its scope.
+Tracked as [#768](https://github.com/bindreams/hole/issues/768).
 
-On macOS, `reconcile_pf_enabled` — factored out of `engage_lockdown`'s own
-`ReuseToken`/`Reenable` handling — runs before `engage_lockdown_tun`'s
-(Phase 6) reload, which assumes an already-persisted token: `pfctl -f -` into
-a DISABLED pf exits 0 while enforcing nothing, so skipping this check (as
-this call originally did) reports a connected, armed session as covered
-while pf enforces nothing at all — the identical fail-open `engage_lockdown`'s
-own inline reconciliation was written to close, just reopened on the one
-call site that came later and never inherited it. Phase 0 and Phase 6 can
+On macOS, `reconcile_pf_enabled` runs before `engage_lockdown_tun`'s (Phase
+6\) reload, which assumes an already-persisted token: `pfctl -f -` into a
+DISABLED pf exits 0 while enforcing nothing, so skipping this check reports a
+connected, armed session as covered while pf enforces nothing at all. Phase
+0 and Phase 6 can
 still be separated by several seconds within a SINGLE attempt (the plugin
 chain start, self-test, and route install all run in between), so this check
 stays load-bearing even though the guard no longer persists across attempts.

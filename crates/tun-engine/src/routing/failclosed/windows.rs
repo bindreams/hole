@@ -96,16 +96,10 @@ const IPPROTO_TCP: u8 = 6;
 //          LOCKDOWN_{TUN,SERVER}_GUID_INDICES stay stable. App-ID
 //          filters get per-binary dynamically-derived GUIDs (see build_lockdown_spec).
 //
-// CROSS-VERSION CONTRACT, same class as `FILTER_GUIDS` (see its own doc): the
-// two resolver-permit GUIDs (indices 12-13) grow this array from twelve
-// entries to fourteen. `swept_lockdown_guids`/`recover_lockdown`
-// sweep by enumerating this compiled-in array, not by querying the OS for
-// "every filter this provider owns" — so a crash-then-downgrade (a build that
-// knows all fourteen GUIDs engages, crashes, and an OLDER build's recovery
-// sweep only knows the first twelve) leaves the two resolver-permit filters
-// permanently un-swept. They are *permits*, never blocks, so this is bounded
-// and self-healing (a later upgrade's sweep cleans them up), not a leak of
-// blocked traffic; see CONTRIBUTING.md's "Transient cutover cover" section.
+// CROSS-VERSION CONTRACT, same class as `FILTER_GUIDS` (see its own doc for
+// the crash-then-downgrade mechanism): the two resolver-permit GUIDs
+// (indices 12-13) grow this array from twelve entries to fourteen, with the
+// identical un-swept-permit risk and the same bounded, self-healing outcome.
 pub const LOCKDOWN_FILTER_GUIDS: [GUID; 14] = [
     GUID::from_u128(0x216a841b_f264_4047_8881_39f24b4d6dce), // loopback CONNECT V4
     GUID::from_u128(0x4d9cd0a2_c48f_40cf_8225_89ce3f8a1376), // loopback CONNECT V6

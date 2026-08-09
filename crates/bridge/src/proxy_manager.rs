@@ -697,19 +697,10 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
             .map(lockdown_state::load_enabled)
             .unwrap_or(false);
 
-        // Full mode completes BOTH phases of the standing cover: Phase 0
-        // below, Phase 6 (`routing.install`'s TUN permit) in `start_inner`.
-        // SocksOnly's `start_inner` returns before Phase 6 ever runs -- no
-        // TUN, no LUID to protect -- but Phase 0 (loopback + server +
-        // resolver + App-IDs) needs no TUN either, so a COVERED SocksOnly
-        // start under lockdown intent still applies Phase 0: the transient
-        // cover is not a viable substitute here — its engage/disengage
-        // replace pf's entire main ruleset, which would clobber a standing
-        // cover a PRIOR process holds live (adopted at this bridge's own
-        // startup), and the transient cover's own gate can't tell that
-        // apart from a clean host. A MANUAL (uncovered) SocksOnly start does
-        // not apply: manual connects are fail-open by design (see the
-        // uncovered `blocked` release below).
+        // A COVERED SocksOnly start under lockdown intent still applies Phase 0
+        // (it needs no TUN); a MANUAL SocksOnly start does not, matching every
+        // other manual connect's fail-open design. See CONTRIBUTING.md's
+        // "Lockdown mode" for the full rationale.
         let lockdown_applies = lockdown_on && (matches!(config.tunnel_mode, TunnelMode::Full) || covered);
 
         // A held cover's resolver_permit is fixed at engage time; re-engage
@@ -1022,10 +1013,8 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
                 Ok(())
             }
             Err(ProxyError::Cancelled) => {
-                // User asked to cancel THIS connection attempt: release the
-                // transient cover (same trust as a user disconnect -- it exists
-                // only to protect a connection in flight, so there is no reason
-                // to keep it once the user has stopped trying to connect).
+                // User asked to cancel THIS connection attempt: release the transient
+                // cover (same trust as a user disconnect).
                 //
                 // `lockdown_cover` (if `Some`) is NOT moved here -- it drops via ordinary
                 // RAII, same accepted retry-window gap as the "Standing lockdown
@@ -1154,11 +1143,8 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         plugin_path_override: Option<String>,
         cancel: CancellationToken,
     ) -> Result<RunningState<P, R, D>, ProxyError> {
-        // Unwrapped immediately into plain `bool` locals of the SAME names --
-        // the newtypes above exist only to make a positional swap of these
-        // two same-typed flags at the call site a compile error; the 200+
-        // lines below read `blocking_engaged`/`lockdown_applies` exactly as
-        // before.
+        // Unwrapped immediately into plain `bool` locals of the SAME names -- the
+        // 200+ lines below read them exactly as before.
         let blocking_engaged = blocking_engaged.0;
         let lockdown_applies = lockdown_applies.0;
         debug!("start_inner entered");
@@ -1180,10 +1166,6 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         // identical address without a second derivation site drifting from
         // the first (see CONTRIBUTING.md's "Lockdown mode").
         let server_host = crate::dns::bootstrap::handoff_host(server_ip);
-
-        // Phase 0 already ran in the caller (see this fn's doc above);
-        // `lockdown_applies` is its already-computed value, used below by
-        // Phase 4's probe-suppression check and Phase 6's TUN-permit addition.
 
         // Phase 1: start plugin chain via Garter if a plugin is configured.
         // `start_plugin_chain` threads `cancel` through to its readiness

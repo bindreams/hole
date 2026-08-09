@@ -459,7 +459,9 @@ pub fn engage_lockdown(
 ) -> Result<Cover, RoutingError> {
     let persisted = lockdown_state::load(state_dir);
 
-    let (token, nat_snapshot, restore_on_failure) = match &persisted {
+    // `resave_after_success` carries the main_snapshot for a `Some(st)`
+    // re-engage ONLY -- see the self-healing re-persist below for why.
+    let (token, main_snapshot_for_resave, nat_snapshot, restore_on_failure) = match &persisted {
         // Live Adopt re-engage, or a repair/TUN-add on an already-engaged
         // session: reconcile pf's enabled state against the persisted token
         // (reused unchanged if pf is still enabled, or freshly re-enabled
@@ -472,19 +474,23 @@ pub fn engage_lockdown(
             let (token, reconciled) = reconcile_pf_enabled(st, state_dir, owner)?;
             (
                 token,
+                Some(st.main_snapshot.clone()),
                 st.nat_snapshot.clone(),
                 reconciled != PfReconciled::AlreadyEnabled,
             )
         }
         // First engage: enable + snapshot the host. Nothing was live before
-        // this call, so a load failure always restores.
+        // this call, so a load failure always restores. `capture_and_persist`
+        // already persists before this function's own `pfctl -f -` mutates
+        // (persist-before-mutate, its own doc), so this branch does not need
+        // the `Some(st)` branch's post-success re-persist below.
         None => {
             let token = enable_pf_capture_token()?;
             // The refcount is now held. Capture + persist may fail, so undo the
             // `-E` on any error before propagating — else the refcount leaks with
             // no state file to recover it from.
             match capture_and_persist(&token, state_dir, owner) {
-                Ok(nat_snapshot) => (token, nat_snapshot, true),
+                Ok(nat_snapshot) => (token, None, nat_snapshot, true),
                 Err(e) => {
                     if let Err(xe) = pfctl(&["-X", &token], None, PHASE_COVER) {
                         tracing::warn!(error = %xe, "pfctl -X failed unwinding a failed lockdown engage");
@@ -517,6 +523,30 @@ pub fn engage_lockdown(
             "pfctl lockdown load failed: {}",
             String::from_utf8_lossy(&out.stderr).trim()
         )));
+    }
+
+    if let Some(main_snapshot) = main_snapshot_for_resave {
+        // Self-healing re-persist, "ask forgiveness" rather than atomic
+        // check-then-act -- see `engage_lockdown_tun`'s identical rationale:
+        // this function's initial `load` above and this successful reload
+        // are not one atomic operation with a concurrent `hole bridge
+        // unlock` (`disengage_lockdown` clears the state file with no "only
+        // when no bridge is alive" enforcement). Without this, a clear
+        // racing in between would leave this just-reloaded ruleset live
+        // with NO state file to disengage it later. Only for the `Some(st)`
+        // (re-engage) case -- a first-ever engage already persisted before
+        // its own mutate, above.
+        let fresh = lockdown_state::LockdownPfState {
+            version: lockdown_state::SCHEMA_VERSION,
+            pf_token: token.clone(),
+            main_snapshot,
+            nat_snapshot: nat_snapshot.clone(),
+        };
+        if let Err(e) = lockdown_state::save(state_dir, &fresh, owner) {
+            return Err(RoutingError::RouteSetup(format!(
+                "engage_lockdown: failed to re-persist lockdown state after a successful reload: {e}"
+            )));
+        }
     }
 
     Ok(Cover {
@@ -553,6 +583,14 @@ pub fn engage_lockdown(
 /// reload — `pfctl -f -` into a DISABLED pf exits 0 while enforcing nothing,
 /// so skipping this would report a connected session as covered while pf
 /// enforces nothing at all.
+///
+/// The initial state-file `load` and the final reload+re-save are NOT one
+/// atomic operation — a concurrent `hole bridge unlock` can clear the state
+/// file in between. On success this function re-persists the state it just
+/// reloaded with ("ask forgiveness" rather than a lock), so that race leaves
+/// a live ruleset WITH a state file to recover it (self-healing on the next
+/// `unlock`/crash-recovery sweep) instead of a live ruleset with none (an
+/// unrecoverable, manually-`pfctl`-only stranding).
 pub fn engage_lockdown_tun(
     tun_name: &str,
     server_ip: IpAddr,
@@ -565,13 +603,7 @@ pub fn engage_lockdown_tun(
             "engage_lockdown_tun: no lockdown state on disk -- called before the Phase-0 engage".into(),
         )
     })?;
-    // `reconcile_pf_enabled`'s return value (the token) is not needed here —
-    // Phase 0's `Cover` already carries whichever token this call's own
-    // reconciliation may have refreshed (both write to the SAME state file,
-    // read by any later `disengage_lockdown`/Drop, which reload it instead
-    // of trusting an in-memory copy) — calling it purely for the "ensure pf
-    // is enabled before this load" side effect.
-    reconcile_pf_enabled(&persisted, state_dir, owner)?;
+    let (token, _reconciled) = reconcile_pf_enabled(&persisted, state_dir, owner)?;
     let main = build_lockdown_main_ruleset(Some(tun_name), server_ip, resolver_ip, &persisted.nat_snapshot);
     let out = pfctl(&["-f", "-"], Some(main.as_bytes()), PHASE_COVER)?;
     if !out.status.success() {
@@ -580,6 +612,30 @@ pub fn engage_lockdown_tun(
             String::from_utf8_lossy(&out.stderr).trim()
         )));
     }
+    // Self-healing re-persist, "ask forgiveness" rather than atomic
+    // check-then-act: this call's own initial `load` above and this final
+    // `save` are not one indivisible operation with a concurrent
+    // `hole bridge unlock` (`disengage_lockdown` deletes the state file
+    // with no "only when no bridge is alive" enforcement). Without this
+    // save, a clear racing between the load and the reload above would
+    // leave the just-loaded lockdown ruleset live with NO state file to
+    // disengage it later -- a silent no-op for both this attempt's own
+    // `Cover::drop` and any subsequent `unlock`, stranding pf permanently
+    // locked down. Re-saving the SAME already-known snapshots under
+    // `reconcile_pf_enabled`'s current token (idempotent when nothing
+    // raced) makes this successful reload authoritative over a racing
+    // clear instead of the reverse.
+    let fresh = lockdown_state::LockdownPfState {
+        version: lockdown_state::SCHEMA_VERSION,
+        pf_token: token,
+        main_snapshot: persisted.main_snapshot.clone(),
+        nat_snapshot: persisted.nat_snapshot.clone(),
+    };
+    lockdown_state::save(state_dir, &fresh, owner).map_err(|e| {
+        RoutingError::RouteSetup(format!(
+            "engage_lockdown_tun: failed to re-persist lockdown state after a successful reload: {e}"
+        ))
+    })?;
     Ok(())
 }
 
