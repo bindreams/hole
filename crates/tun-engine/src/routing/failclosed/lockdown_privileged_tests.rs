@@ -34,6 +34,16 @@
 //! updating `.config/nextest.toml` drops the test from the group → a silent
 //! cross-binary race with the bridge's live-egress `e2e_none_full_tunnel_roundtrip`.
 //! Change both together.
+//!
+//! The permitted/resolver/non-permitted targets MUST be addresses this host
+//! does NOT itself own (see `RESOLVER`'s doc for why a self-served target is
+//! unsound here: on macOS/BSD it would be silently exempted by `set skip on
+//! lo0` regardless of whether the resolver rule works at all). That leaves a
+//! residual live-network dependency; `RESOLVER` is picked to share PERMITTED's
+//! proven-reliable anycast network rather than eliminate it, and the
+//! resolver-permit assertions cross-check against PERMITTED at the same
+//! instant so a failure here is not blindly reported as "the permit failed"
+//! when it could be a general outage instead.
 
 use super::*;
 
@@ -47,14 +57,27 @@ const TUN: skuld::Label;
 #[cfg(any(target_os = "windows", target_os = "macos"))]
 const PERMITTED: &str = "1.1.1.1:443";
 // A third routable anycast host, standing in for the pinned DoH resolver.
+// Cloudflare's SECONDARY address (1.0.0.1, distinct from PERMITTED's 1.1.1.1)
+// rather than Quad9 (9.9.9.9): `macos_failclosed_permits_resolver_blocks_other_egress`
+// flaked TimedOut against 9.9.9.9 on the darwin/amd64 CI runner (darwin/arm64
+// and every other lane were unaffected), and PERMITTED=1.1.1.1 has never once
+// flaked across the SAME runner in the SAME file — same anycast network,
+// same edge presence, empirically the reliable choice on this infrastructure.
+// A residual live-network dependency remains (see this module's doc for why
+// a fully self-served target is NOT used instead: on macOS/BSD, a connect to
+// ANY address the host itself owns -- primary or aliased -- is routed via an
+// automatic host route through `lo0` before it ever reaches the real
+// interface, and this ruleset's `set skip on lo0` would silently exempt it,
+// making the permit assertion pass regardless of whether the resolver rule
+// works at all).
 #[cfg(any(target_os = "windows", target_os = "macos"))]
-const RESOLVER: &str = "9.9.9.9:443";
-// The SAME resolver host, but on its DNS-over-TLS port rather than 443 — Quad9
-// serves both. Proves the resolver permit is scoped to TCP/443, not the whole
-// IP: a permit that (wrongly) covered every port on RESOLVER would let this
-// through too.
+const RESOLVER: &str = "1.0.0.1:443";
+// The SAME resolver host, but on its DNS-over-TLS port rather than 443 —
+// Cloudflare serves both. Proves the resolver permit is scoped to TCP/443,
+// not the whole IP: a permit that (wrongly) covered every port on RESOLVER
+// would let this through too.
 #[cfg(any(target_os = "windows", target_os = "macos"))]
-const RESOLVER_OTHER_PORT: &str = "9.9.9.9:853";
+const RESOLVER_OTHER_PORT: &str = "1.0.0.1:853";
 #[cfg(any(target_os = "windows", target_os = "macos"))]
 const NON_PERMITTED: &str = "8.8.8.8:443";
 
@@ -197,8 +220,9 @@ fn windows_lockdown_permits_resolver_blocks_other_egress() {
     );
     assert!(
         r.is_ok(),
-        "resolver-IP permit must beat block-all: {RESOLVER}={:?}",
-        r.err().map(|e| e.kind())
+        "resolver-IP permit must beat block-all: {RESOLVER}={:?} -- PERMITTED ({PERMITTED}) was {} at the          same instant, so if it was reachable this is very unlikely to be a general network outage rather          than a real block; if it also failed, treat this as NETWORK/ENVIRONMENT, not the cover",
+        r.err().map(|e| e.kind()),
+        if p.is_ok() { "reachable" } else { "ALSO unreachable" }
     );
     assert!(
         po.is_err(),
@@ -276,8 +300,9 @@ fn windows_lockdown_permits_phase_0_then_phase_6_share_one_cover() {
     );
     assert!(
         r.is_ok(),
-        "resolver-IP permit must beat block-all: {RESOLVER}={:?}",
-        r.err().map(|e| e.kind())
+        "resolver-IP permit must beat block-all: {RESOLVER}={:?} -- PERMITTED ({PERMITTED}) was {} at the          same instant, so if it was reachable this is very unlikely to be a general network outage rather          than a real block; if it also failed, treat this as NETWORK/ENVIRONMENT, not the cover",
+        r.err().map(|e| e.kind()),
+        if p.is_ok() { "reachable" } else { "ALSO unreachable" }
     );
     assert!(
         po.is_err(),
@@ -484,8 +509,9 @@ fn macos_lockdown_permits_resolver_blocks_other_egress() {
     );
     assert!(
         r.is_ok(),
-        "resolver-IP permit must beat block-all: {RESOLVER}={:?}",
-        r.err().map(|e| e.kind())
+        "resolver-IP permit must beat block-all: {RESOLVER}={:?} -- PERMITTED ({PERMITTED}) was {} at the          same instant, so if it was reachable this is very unlikely to be a general network outage rather          than a real block; if it also failed, treat this as NETWORK/ENVIRONMENT, not the cover",
+        r.err().map(|e| e.kind()),
+        if p.is_ok() { "reachable" } else { "ALSO unreachable" }
     );
     assert!(
         po.is_err(),
@@ -570,8 +596,9 @@ fn macos_lockdown_permits_phase_0_then_phase_6_share_one_cover() {
     );
     assert!(
         r.is_ok(),
-        "resolver-IP permit must beat block-all: {RESOLVER}={:?}",
-        r.err().map(|e| e.kind())
+        "resolver-IP permit must beat block-all: {RESOLVER}={:?} -- PERMITTED ({PERMITTED}) was {} at the          same instant, so if it was reachable this is very unlikely to be a general network outage rather          than a real block; if it also failed, treat this as NETWORK/ENVIRONMENT, not the cover",
+        r.err().map(|e| e.kind()),
+        if p.is_ok() { "reachable" } else { "ALSO unreachable" }
     );
     assert!(
         po.is_err(),
@@ -727,8 +754,9 @@ fn windows_failclosed_permits_resolver_blocks_other_egress() {
     );
     assert!(
         r.is_ok(),
-        "resolver-IP permit must beat block-all: {RESOLVER}={:?}",
-        r.err().map(|e| e.kind())
+        "resolver-IP permit must beat block-all: {RESOLVER}={:?} -- PERMITTED ({PERMITTED}) was {} at the          same instant, so if it was reachable this is very unlikely to be a general network outage rather          than a real block; if it also failed, treat this as NETWORK/ENVIRONMENT, not the cover",
+        r.err().map(|e| e.kind()),
+        if p.is_ok() { "reachable" } else { "ALSO unreachable" }
     );
     assert!(
         po.is_err(),
@@ -860,8 +888,9 @@ fn macos_failclosed_permits_resolver_blocks_other_egress() {
     );
     assert!(
         r.is_ok(),
-        "resolver-IP permit must beat block-all: {RESOLVER}={:?}",
-        r.err().map(|e| e.kind())
+        "resolver-IP permit must beat block-all: {RESOLVER}={:?} -- PERMITTED ({PERMITTED}) was {} at the          same instant, so if it was reachable this is very unlikely to be a general network outage rather          than a real block; if it also failed, treat this as NETWORK/ENVIRONMENT, not the cover",
+        r.err().map(|e| e.kind()),
+        if p.is_ok() { "reachable" } else { "ALSO unreachable" }
     );
     assert!(
         po.is_err(),
