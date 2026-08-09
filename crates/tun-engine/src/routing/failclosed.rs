@@ -1,12 +1,28 @@
-//! Fail-closed network cover: block all egress except loopback and the SS server
-//! IP, as an RAII guard held across a connect attempt so a failed connect leaves
-//! the host blocked, not leaked. OS specifics live in the platform submodules;
-//! this facade is `#[cfg]`-free for callers.
+//! Fail-closed network cover: block all egress except loopback, the SS server
+//! IP, and (when a plugin needs it) the ECH-config DoH resolver, as an RAII
+//! guard held across a connect attempt so a failed connect leaves the host
+//! blocked, not leaked. OS specifics live in the platform submodules; this
+//! facade is `#[cfg]`-free for callers.
 
 use std::net::IpAddr;
 use std::path::Path;
 
 use crate::error::RoutingError;
+
+/// The one port the resolver permit ever needs: `doh_url_for_ip` in
+/// `hole_bridge::dns::ech` never constructs a URL with any other port
+/// (its bare `https://` scheme implies this one — see that crate's
+/// `DOH_PORT` and its executable pin,
+/// `doh_url_for_ip_ports_to_the_https_default`), so this is structurally the
+/// sole value the ECH-config fetch can dial. A separate declaration, not an
+/// import: this crate sits BELOW `hole-bridge` in the dependency graph and
+/// cannot import from it, so the reverse link is what's enforced instead —
+/// `pub` (not `pub(crate)`) so `hole-bridge` CAN import and pin it against
+/// its own `DOH_PORT` (see `crates/bridge/src/dns/ech_tests.rs`,
+/// `resolver_permit_port_matches_doh_port`). Shared by both platform
+/// modules here so the port is named in exactly one place on this side of
+/// the boundary too.
+pub const RESOLVER_PERMIT_PORT: u16 = 443;
 
 // macOS persists its pf enable token; Windows recovers WFP filters by fixed
 // GUID and needs no state.
@@ -53,12 +69,19 @@ impl crate::routing::CoverGuard for Cover {
     }
 }
 
-/// Engage the cover blocking all egress except loopback and `server_ip`.
+/// Engage the cover blocking all egress except loopback, `server_ip`, and
+/// (when `Some`) `resolver_ip` — see [`crate::routing::Routing::install_failclosed_cover`]
+/// for what a caller must already have demonstrated to pass `Some` here.
 /// `state_dir` is where macOS persists its enable token for crash recovery
 /// (unused on Windows). On failure the host is left uncovered.
-pub fn engage(server_ip: IpAddr, state_dir: &Path, owner: Option<(u32, u32)>) -> Result<Cover, RoutingError> {
+pub fn engage(
+    server_ip: IpAddr,
+    resolver_ip: Option<IpAddr>,
+    state_dir: &Path,
+    owner: Option<(u32, u32)>,
+) -> Result<Cover, RoutingError> {
     Ok(Cover {
-        _inner: platform::engage(server_ip, state_dir, owner)?,
+        _inner: platform::engage(server_ip, resolver_ip, state_dir, owner)?,
     })
 }
 

@@ -104,9 +104,18 @@ pub struct OptionSegment<'a> {
     /// decide which key a plugin will ACT on; a check that used the narrower
     /// rule could be evaded by escaping one character of the name.
     pub key: String,
-    /// The value, decoded by the same rule. Empty for a bare key — a caller
-    /// that must distinguish `tls` from `tls=` reads `raw`.
+    /// The value, decoded by the same rule. Empty for BOTH a bare key
+    /// (`tls`) and an explicit empty one (`tls=`) — the two are otherwise
+    /// indistinguishable here. A caller that must tell them apart reads
+    /// [`has_value`](Self::has_value): ex-ray's own options parser does, and
+    /// maps a bare key to `"1"` rather than `""` (`crates/ex-ray/args.go`'s
+    /// `parsePluginOptions`), so a caller replicating ex-ray's read of a flag
+    /// must too.
     pub value: String,
+    /// Whether the segment had an unescaped `=` at all — `true` for `tls=`,
+    /// `false` for bare `tls`. See [`value`](Self::value)'s doc for why this
+    /// exists.
+    pub has_value: bool,
 }
 
 /// Split an options string into segments on unescaped `;`, decoding each key for
@@ -138,7 +147,12 @@ pub fn split_plugin_options(opts: &str) -> Result<Vec<OptionSegment<'_>>, Malfor
                 Some(eq) => unescape_any(&raw[eq + 1..])?,
                 None => String::new(),
             };
-            Ok(OptionSegment { raw, key, value })
+            Ok(OptionSegment {
+                raw,
+                key,
+                value,
+                has_value: eq.is_some(),
+            })
         })
         .collect()
 }

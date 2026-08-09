@@ -177,6 +177,23 @@ fn split_of_the_empty_string_is_empty() {
     assert!(segs("").is_empty());
 }
 
+// `value` alone cannot tell `tls` (bare) from `tls=` (explicit empty) apart —
+// both decode to `""`. `has_value` is the field that can, which matters
+// because ex-ray's own parser does not treat them alike either: bare `tls`
+// reads as `"1"` there, `tls=` as `""` (`crates/ex-ray/args.go`).
+#[skuld::test]
+fn has_value_distinguishes_a_bare_key_from_an_explicit_empty_one() {
+    let s = segs("tls;host=");
+    assert_eq!(
+        (s[0].key.as_str(), s[0].value.as_str(), s[0].has_value),
+        ("tls", "", false)
+    );
+    assert_eq!(
+        (s[1].key.as_str(), s[1].value.as_str(), s[1].has_value),
+        ("host", "", true)
+    );
+}
+
 // A trailing unpaired backslash would escape the `;` a caller appends after it,
 // swallowing the appended directive. ex-ray already rejects such a string, so it
 // is rejected here rather than silently made parseable-but-wrong.
