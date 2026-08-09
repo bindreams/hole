@@ -3323,18 +3323,14 @@ mod self_test {
             });
     }
 
-    // Without a `dead_permit` marker, a retry whose corrected permit keeps
-    // failing to engage would release-then-reengage-then-restore on EVERY
-    // retry: a non-convergent cycle, each turn re-opening the
-    // release-to-reengage uncovered window for zero progress. Attempt 3
-    // proves the skip: an UNCHANGED config (still wanting the same permit
-    // attempt 2 already proved unreachable) must NOT trigger another engage
-    // cycle. Attempt 4 proves the skip is not permanent: `dead_permit` is
-    // cleared by the skip itself, so a later retry for the SAME value gets a
-    // fresh attempt — a transient engage failure must eventually heal, not
-    // wedge the repair for the rest of the session.
+    // A retry whose desired permit is UNCHANGED from one a previous repair
+    // already proved unreachable is not skipped: there is no principled way
+    // to tell a transient engage failure (e.g. momentary WFP/pf contention)
+    // from a lasting one without trying again, so every matching drift
+    // re-attempts the correction. Attempt 3 proves the retry happens (not
+    // skipped); attempt 4 proves it lands once the transient failure clears.
     #[skuld::test]
-    fn covered_retry_after_a_dead_repair_does_not_oscillate() {
+    fn covered_retry_repeats_the_correction_every_time_a_permit_stays_unreachable() {
         rt().block_on(async {
             let probe_l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             let closed = probe_l.local_addr().unwrap();
@@ -3364,8 +3360,7 @@ mod self_test {
             assert_eq!(st.cover_engage_calls.load(Ordering::SeqCst), 1);
 
             // Attempt 2: plugin added, wants Some(answering_resolver), that
-            // engage keeps failing — restore succeeds, dead_permit records
-            // the unreachable value.
+            // engage keeps failing — restore succeeds.
             st.fail_cover_for_resolvers
                 .lock()
                 .unwrap()
@@ -3381,16 +3376,17 @@ mod self_test {
                 "attempt 2: one failed corrected attempt (uncounted) + one successful restore"
             );
 
-            // Attempt 3: identical config — wants the SAME Some(answering_resolver)
-            // the previous attempt already proved unreachable. Must NOT
-            // re-attempt the repair: no release, no engage calls at all.
+            // Attempt 3: identical config — still wants the SAME
+            // Some(answering_resolver) the previous attempt already proved
+            // unreachable. Must re-attempt the correction (fails again,
+            // uncounted) and restore again (counted) — not skip.
             pm.start_cancellable(&cfg, true, CancellationToken::new())
                 .await
                 .unwrap_err();
             assert_eq!(
                 st.cover_engage_calls.load(Ordering::SeqCst),
-                2,
-                "a repeat of the same known-unreachable permit must not re-attempt the repair"
+                3,
+                "a repeat of the same still-unreachable permit must re-attempt the repair, not skip it"
             );
             assert_eq!(
                 *st.last_cover_resolver_ip.lock().unwrap(),
@@ -3399,18 +3395,15 @@ mod self_test {
             );
 
             // Attempt 4: STILL the same desired value, but now able to engage
-            // (the transient failure has passed). Skipping attempt 3 cleared
-            // `dead_permit`, so this retry gets a fresh attempt rather than
-            // staying wedged forever on a value that failed exactly once.
+            // (the transient failure has passed) — the repair lands.
             st.fail_cover_for_resolvers.lock().unwrap().clear();
             pm.start_cancellable(&cfg, true, CancellationToken::new())
                 .await
                 .unwrap_err();
             assert_eq!(
                 st.cover_engage_calls.load(Ordering::SeqCst),
-                3,
-                "a transient failure must not permanently wedge repair for this value — the retry \
-                 after a skip must try again"
+                4,
+                "a transient failure must not permanently wedge repair for this value"
             );
             assert_eq!(
                 *st.last_cover_resolver_ip.lock().unwrap(),
@@ -3570,20 +3563,16 @@ mod self_test {
             });
     }
 
-    // `dead_permit` bounds oscillation on a REPEAT of the same known-dead
-    // value (`covered_retry_after_a_dead_repair_does_not_oscillate`) — it
-    // must not wedge the repair mechanism itself. A retry whose desired
-    // permit changes AGAIN, to a genuinely THIRD value (neither the dead one
-    // nor the currently-held one), must still repair normally. Reachable
-    // because `ech_doh_url`'s unpinned fallback re-derives from THIS
-    // attempt's `dns.servers` every time, even once a pin has gone
+    // A repair that already failed once for a given desired permit (B) must
+    // still repair normally when a LATER retry wants a different value (C):
+    // nothing about a prior failed correction lingers onto an unrelated one.
+    // Reachable because `ech_doh_url`'s unpinned fallback re-derives from
+    // THIS attempt's `dns.servers` every time, even once a pin has gone
     // `ResolverDeselected` for good (`revalidate` never un-deselects it) —
     // editing `dns.servers` between retries changes the fallback address
-    // with no fresh DoH query. A `dead_permit.is_some()`-only regression
-    // (dropping the value comparison) would fail this test by staying wedged
-    // here too.
+    // with no fresh DoH query.
     #[skuld::test]
-    fn covered_retry_after_a_dead_repair_resumes_for_a_different_new_resolver() {
+    fn covered_retry_repair_resumes_normally_for_a_different_new_resolver() {
         rt().block_on(async {
             let probe_l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             let closed = probe_l.local_addr().unwrap();
@@ -3618,7 +3607,7 @@ mod self_test {
 
             // Attempt 2: `dns.servers` -> [B]; A is deselected, the fallback
             // picks B. B's engage is configured to fail; the restore falls
-            // back to A. `dead_permit` now remembers B as unreachable.
+            // back to A.
             st.fail_cover_for_resolvers.lock().unwrap().insert(Some(resolver_b));
             cfg.dns.servers = vec![resolver_b];
             pm.start_cancellable(&cfg, true, CancellationToken::new())
@@ -3635,8 +3624,8 @@ mod self_test {
                 "attempt 2: restored to A"
             );
 
-            // Attempt 3: `dns.servers` -> [C] — a genuinely NEW value, neither
-            // the dead B nor the currently-held A. Must resume the repair.
+            // Attempt 3: `dns.servers` -> [C] — a different value from either
+            // A or B. Must repair normally.
             cfg.dns.servers = vec![resolver_c];
             pm.start_cancellable(&cfg, true, CancellationToken::new())
                 .await
@@ -3644,7 +3633,7 @@ mod self_test {
             assert_eq!(
                 st.cover_engage_calls.load(Ordering::SeqCst),
                 3,
-                "a different new desired permit must resume the repair, not stay wedged on the old dead value"
+                "a different new desired permit must repair normally"
             );
             assert_eq!(*st.last_cover_resolver_ip.lock().unwrap(), Some(resolver_c));
         });

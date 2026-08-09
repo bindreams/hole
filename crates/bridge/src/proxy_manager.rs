@@ -262,22 +262,6 @@ struct BlockedStart<C> {
     /// not — it describes the live OS cover, not the current config. See the
     /// struct doc for what it means.
     resolver_permit: Option<IpAddr>,
-    /// `Some(x)` when the LAST repair attempt wanted to correct the permit to
-    /// `x` but the corrected engage failed and a compensating restore fell
-    /// back to `resolver_permit` instead (`x != Some(resolver_permit)`, by
-    /// construction — the outer `Option` marks "a dead value is known", the
-    /// inner one is the resolver-permit value itself, which can legitimately
-    /// be `None`). A retry whose freshly-derived permit is again exactly `x`
-    /// skips the repair attempt ONCE (bounding the release-then-reengage
-    /// window from reopening on every single retry of an unreachable value)
-    /// and CLEARS this marker for the retry after — a fresh attempt is never
-    /// permanently withheld, since the corrected engage's failure could be
-    /// transient (a momentary OS-level condition), not a lasting property of
-    /// the value itself. Net effect for a persistently-failing value: retried
-    /// every OTHER matching retry, not every one and not never. `None` once a
-    /// correction lands (the held permit is exactly what this attempt wants)
-    /// or has never been attempted.
-    dead_permit: Option<Option<IpAddr>>,
 }
 
 impl<P: Proxy, R: Routing> ProxyManager<P, R, SystemDns> {
@@ -683,22 +667,23 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         // see the repair arms below for why it, not the local `pin`
         // variable, is what gets stored back.
         //
-        // A drift matching a KNOWN-DEAD value (see `dead_permit`'s doc) skips
-        // the repair this retry and clears the marker so the next retry gets
-        // a fresh attempt — a single `install_failclosed_cover` failure
-        // (e.g. a momentary WFP/pf contention) must not wedge the repair
-        // permanently.
+        // A retry whose desired permit still matches a value a PRIOR repair
+        // already proved unreachable is not treated specially — it repairs
+        // again like any other drift. The corrected engage's own failure
+        // could be transient (a momentary OS-level condition), not a
+        // lasting property of the value, so there is no principled way to
+        // tell "will fail again" from "would now succeed" without trying;
+        // skipping on a heuristic (e.g. a fixed number of retries) would
+        // just delay a correction that could have landed this attempt. Each
+        // attempt's release-to-reengage window is bounded to this one
+        // (user-paced) retry either way — see the restore fallback below.
         let repair_fallback: Option<(Option<IpAddr>, crate::dns::ech::PinSource)> = if covered && !lockdown_on {
-            match self.blocked.as_mut().filter(|b| {
-                b.host == config.server.server && ech_resolver_permit.is_some_and(|r| b.resolver_permit != Some(r))
-            }) {
-                Some(b) if b.dead_permit == Some(ech_resolver_permit) => {
-                    b.dead_permit = None;
-                    None
-                }
-                Some(b) => Some((b.resolver_permit, b.pin)),
-                None => None,
-            }
+            self.blocked
+                .as_mut()
+                .filter(|b| {
+                    b.host == config.server.server && ech_resolver_permit.is_some_and(|r| b.resolver_permit != Some(r))
+                })
+                .map(|b| (b.resolver_permit, b.pin))
         } else {
             None
         };
@@ -745,7 +730,6 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
                             server_ip,
                             pin: engaged_pin,
                             resolver_permit: ech_resolver_permit,
-                            dead_permit: None,
                         });
                     }
                     Err(e) => {
@@ -758,10 +742,6 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
                                         server_ip,
                                         pin: original_pin,
                                         resolver_permit: old_permit,
-                                        // Remember the value we WANTED but could not
-                                        // reach, so a same-value retry doesn't retry
-                                        // this same failing correction forever.
-                                        dead_permit: Some(ech_resolver_permit),
                                     });
                                     warn!(
                                         error = %e,

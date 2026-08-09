@@ -615,17 +615,27 @@ const EX_RAY_DEFAULT_HOST: &str = "cloudfront.com";
 ///   `net.PortFromString`): must be an unsigned base-10 literal `<=65535`
 ///   and not `0` — `0` is otherwise valid syntax
 ///   (`net.PortFromString("0")` succeeds) but ex-ray cannot honor
-///   OS-assigned-port semantics.
+///   OS-assigned-port semantics. Under a `server` segment, main.go
+///   cross-assigns the `remotePort` KEY here instead of `localPort` — but
+///   both keys share this exact rule, so which one is checked never
+///   changes the verdict, only (irrelevantly) which literal key name a
+///   hypothetical diagnostic would cite; not worth branching on.
 /// - `localAddr` (main.go's cross-assign + `canonicalLocalAddr`): must be a
 ///   single (`|`-free) IP literal — a domain or a `|`-joined multi-address
 ///   list is fatal, since the sitrep's `ready` event can report only one
-///   `listen` address.
+///   `listen` address. Under a `server` segment, main.go cross-assigns the
+///   `remoteAddr` KEY to `*localAddr` — UNLIKE the port pair above, this
+///   rule genuinely differs from `remoteAddr`'s own (below), so which key
+///   is checked against which rule swaps under `server`.
 ///
 /// Then `generateConfig`:
-/// - `remotePort`, same rule as `localPort`, checked here instead.
+/// - `remotePort`, same rule and same server-mode key-swap non-issue as
+///   `localPort` above, checked here instead.
 /// - `remoteAddr`: must not normalize to an empty domain or the unspecified
 ///   IP (`0.0.0.0`/`::`) — freedom's destination override would otherwise
-///   dial nowhere honestly.
+///   dial nowhere honestly. Under a `server` segment, checked against the
+///   `localAddr` KEY instead (swapped with the bullet above, same
+///   cross-assign).
 /// - `mux`, again: a value that parsed above is now range-checked against
 ///   `uint32Opt`'s `0..=u32::MAX`.
 /// - `fwmark`, same range check as `mux`.
@@ -668,10 +678,22 @@ const EX_RAY_DEFAULT_HOST: &str = "cloudfront.com";
 /// **Disclosed, deliberately unmodeled:** `cert`/`certRaw`/`key`'s CONTENT
 /// (a readable, well-formed X509 pair) requires filesystem I/O this
 /// otherwise-pure gate doesn't perform — only their presence-without-TLS is
-/// checked above. `server` cross-assigns `localAddr`/`localPort` with
-/// `remoteAddr`/`remotePort`, but Hole never spawns ex-ray as one, so the
-/// four address/port checks above are checked assuming client mode. See
-/// CONTRIBUTING.md's "ECH-config-fetch reachability gate" section for why.
+/// checked above. `server`'s `localAddr`/`remoteAddr` cross-assign IS
+/// modeled (the two bullets above); its `mux`-concurrency exemption is
+/// modeled too (`core.New` bullet below). What stays unmodeled: whether
+/// ex-ray's OWN v2ray-core dependency even performs the DoH fetch this gate
+/// reasons about for a server listener at all — `GetTLSConfig` is called
+/// directly for server listeners too (their own doc: "only server
+/// listeners... call this directly"), and `ApplyECH` doesn't itself branch
+/// on `*server`, but `ech_fetch_is_reachable`'s empty-stripped-SNI fallback
+/// specifically models `tls.WithDestination`, a CLIENT-DIAL option
+/// (`websocket/dialer.go`) with no evident server-listener equivalent in
+/// this vendored source — modeling that with confidence needs tracing
+/// v2ray-core's server-listener construction path, not attempted here.
+/// Hole never spawns ex-ray as a server regardless, so an operator would
+/// have to hand-author `server` into their own `plugin_opts` to reach any
+/// of this. See CONTRIBUTING.md's "ECH-config-fetch reachability gate"
+/// section for why.
 fn ex_ray_fatal_config_error(
     segments: &[garter::OptionSegment<'_>],
     ech_doh: Option<&crate::dns::ech::EchDoh>,
@@ -753,12 +775,23 @@ fn ex_ray_fatal_config_error(
     {
         return Some("localPort");
     }
+    // main.go's cross-assign sends a `localAddr` OPTION to `*remoteAddr`
+    // under `*server` — so the KEY validated against `*localAddr`'s own
+    // rule (a single IP literal) is `remoteAddr`, not `localAddr`, in that
+    // mode. The two rules genuinely differ (unlike the port pair below,
+    // where both directions share one rule), so the swap changes the
+    // verdict.
+    let (local_addr_key, remote_addr_key) = if server_present {
+        ("remoteAddr", "localAddr")
+    } else {
+        ("localAddr", "remoteAddr")
+    };
     if segments
         .iter()
-        .find(|s| s.key == "localAddr")
+        .find(|s| s.key == local_addr_key)
         .is_some_and(|s| ex_ray_local_addr_is_invalid(ex_ray_flag_value(s)))
     {
-        return Some("localAddr");
+        return Some(local_addr_key);
     }
 
     // generateConfig.
@@ -771,10 +804,10 @@ fn ex_ray_fatal_config_error(
     }
     if segments
         .iter()
-        .find(|s| s.key == "remoteAddr")
+        .find(|s| s.key == remote_addr_key)
         .is_some_and(|s| ex_ray_remote_addr_is_invalid(ex_ray_flag_value(s)))
     {
-        return Some("remoteAddr");
+        return Some(remote_addr_key);
     }
     for key in ["mux", "fwmark"] {
         if segments.iter().find(|s| s.key == key).is_some_and(|s| {
@@ -2112,6 +2145,37 @@ mod inject_tests {
         }
         let segments = garter::split_plugin_options("tls;host=cdn.example;localAddr=cdn.example").unwrap();
         assert_eq!(ex_ray_fatal_config_error(&segments, None), Some("localAddr"));
+    }
+
+    // Under `server`, main.go cross-assigns a `localAddr` OPTION to
+    // `*remoteAddr` and a `remoteAddr` OPTION to `*localAddr` — so the
+    // single-IP-literal rule (`localAddr`'s own) must be checked against the
+    // `remoteAddr` KEY, and vice versa, or this either over-permits (a
+    // config that is actually fatal reads as reachable) or under-permits (a
+    // config that actually starts fine reads as unreachable, reintroducing
+    // the ECH-fetch stall this PR closes).
+    #[skuld::test]
+    fn server_mode_swaps_which_key_the_address_rules_apply_to() {
+        let e = pinned("https://9.9.9.9/dns-query");
+        // Over-permit repro: under `server`, the `remoteAddr` OPTION lands
+        // in `*localAddr`, so this domain value fails `canonicalLocalAddr`
+        // and the whole process exits 23 — never reachable.
+        let segments = garter::split_plugin_options("server;tls;host=cdn.example;remoteAddr=cdn.example").unwrap();
+        assert_eq!(ex_ray_fatal_config_error(&segments, None), Some("remoteAddr"));
+        assert_eq!(
+            effective_ech_doh(
+                "ex-ray",
+                Some("server;tls;host=cdn.example;remoteAddr=cdn.example"),
+                Some(&e)
+            ),
+            EffectiveEchDoh::None
+        );
+        // Under-permit repro: under `server`, the `localAddr` OPTION lands
+        // in `*remoteAddr`, which accepts a domain fine — ex-ray starts and
+        // (per the file's own residual disclosure on server-mode DoH
+        // reachability) may fetch.
+        let segments = garter::split_plugin_options("server;tls;host=cdn.example;localAddr=cdn.example").unwrap();
+        assert_eq!(ex_ray_fatal_config_error(&segments, None), None);
     }
 
     // `remoteAddr` (`generateConfig`) must not be an empty domain or the

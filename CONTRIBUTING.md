@@ -392,10 +392,10 @@ derivation only NARROWS to nothing needed (e.g. the plugin was removed): a
 superset permit is left in place rather than opening the release-to-reengage
 window for a correction with no benefit. If the corrected engage itself
 fails, the repair falls back to restoring the PREVIOUS permit rather than
-leaving the host uncovered, and remembers that specific corrected value as
-unreachable (`BlockedStart::dead_permit`) so an unchanged retry does not
-retry the same failing correction forever — a later retry whose derivation
-changes again still repairs normally.
+leaving the host uncovered; an unchanged retry (still wanting the same
+permit) repairs again rather than staying wedged — the failure could have
+been transient, and each attempt's release-to-reengage window is bounded to
+that one (user-paced) retry regardless.
 
 **Disclosed residual:** an operator's OWN `ech-doh` in `plugin_opts`
 outranking Hole's (`EffectiveEchDoh::Operators`) is never permitted — Hole did
