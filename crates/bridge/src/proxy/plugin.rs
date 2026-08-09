@@ -2148,7 +2148,7 @@ mod inject_tests {
     // `remoteAddr` KEY, and vice versa, or this either over-permits (a
     // config that is actually fatal reads as reachable) or under-permits (a
     // config that actually starts fine reads as unreachable, reintroducing
-    // the ECH-fetch stall this PR closes).
+    // the ECH-fetch stall).
     #[skuld::test]
     fn server_mode_swaps_which_key_the_address_rules_apply_to() {
         let e = pinned("https://9.9.9.9/dns-query");

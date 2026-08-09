@@ -2985,11 +2985,9 @@ mod self_test {
     }
 
     // A retry that NARROWS to nothing needed (e.g. the plugin was removed)
-    // must STILL release-then-reengage to correct the permit: the resolver
-    // permit carries no App-ID/process scoping on either platform, so
-    // leaving the OLD (wider) permit live is a real widening of the kill
-    // switch for the rest of the blocked state, not a harmless superset —
-    // any process on the host, not just the plugin chain, could use it.
+    // must STILL release-then-reengage — see `repair_fallback`'s doc in
+    // proxy_manager.rs for why a wider-than-needed permit is a real
+    // widening, not a harmless superset.
     #[skuld::test]
     fn covered_retry_narrowing_to_no_permit_re_engages_to_correct_it() {
         rt().block_on(async {
