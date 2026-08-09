@@ -145,8 +145,11 @@ impl Routing for StubRouting {
     fn install_failclosed_cover(&self, _: IpAddr, _: Option<IpAddr>) -> Result<StubCover, RoutingError> {
         Ok(StubCover)
     }
-    fn install_lockdown(&self, _: IpAddr, _: &str, _: &[PathBuf]) -> Result<StubCover, RoutingError> {
+    fn install_lockdown_permits(&self, _: IpAddr, _: Option<IpAddr>, _: &[PathBuf]) -> Result<StubCover, RoutingError> {
         Ok(StubCover)
+    }
+    fn engage_lockdown_tun(&self, _: &str, _: IpAddr, _: Option<IpAddr>) -> Result<(), RoutingError> {
+        Ok(())
     }
 }
 
@@ -163,6 +166,7 @@ impl Drop for StubCover {
 
 impl tun_engine::routing::CoverGuard for StubCover {
     fn disarm(self) {}
+    fn mark_owned(&mut self) {}
 }
 
 fn test_socket_path(suffix: &str) -> PathBuf {

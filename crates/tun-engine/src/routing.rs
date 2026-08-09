@@ -214,12 +214,17 @@ pub enum CoverRecovery {
     /// Intent ON + cover present: KEEP the host fail-closed across the restart.
     /// The fail-closed floor (block-all + loopback + App-ID) stays in force; the
     /// volatile permits — the stale TUN-interface permit (dead LUID/utun after
-    /// teardown) and the server-IP permit (the server may change before the next
-    /// connect) — are refreshed by the next connect's `install_lockdown`. Windows
-    /// drops the volatile GUIDs at recovery so the re-add isn't a fixed-key
-    /// no-op; macOS reloads the whole pf ruleset, refreshing them implicitly.
-    /// This is the crash-leak fix: a crash never runs `stop()`, so the persistent
-    /// cover survives and Adopt holds it.
+    /// teardown), the server-IP permit (the server may change before the next
+    /// connect), and the resolver-IP permit (the ECH resolver may change, or be
+    /// dropped entirely, before the next connect) — are refreshed by the next
+    /// connect's `install_lockdown_permits` (server/resolver) and
+    /// `engage_lockdown_tun` (TUN). Windows drops the volatile GUIDs at THIS
+    /// recovery step so the re-add isn't a fixed-key no-op; macOS's Adopt step
+    /// removes nothing at all (the whole pf ruleset, resolver permit included,
+    /// stays live from before the crash/restart until the next connect's
+    /// `engage_lockdown` reloads it fresh). This is the crash-leak fix: a
+    /// crash never runs `stop()`, so the persistent cover survives and Adopt
+    /// holds it.
     Adopt,
     /// Intent OFF + cover present: fully disengage the leftover cover (Windows:
     /// delete all lockdown GUIDs; macOS: restore the pre-lockdown snapshot +
@@ -349,6 +354,28 @@ pub trait CoverGuard {
     /// engine handle), which the kernel reclaims on exit but which a long-lived
     /// caller would leak per call.
     fn disarm(self);
+
+    /// Mark this guard as fully owned by the caller from this point on, so
+    /// its ordinary `Drop` always disengages regardless of how the
+    /// underlying cover came to exist.
+    ///
+    /// The standing lockdown cover's Phase-0 engage may find one already
+    /// live — adopted from a prior bridge process that crashed or
+    /// cutover-restarted (`CoverRecovery::Adopt`) — and in that case its
+    /// `Drop` deliberately does NOT tear the ruleset down on an early
+    /// failure: ordinary RAII ownership means a guard must not destroy what
+    /// it did not create (see the platform `Drop for Cover` impls). But
+    /// once a connect attempt actually SUCCEEDS, the running session is now
+    /// the thing the user sees as "connected" and explicitly disconnects
+    /// from — an explicit stop from that point on must always be able to
+    /// open the host, independent of the cover's provenance before this
+    /// attempt started. `ProxyManager::start_cancellable` calls this
+    /// exactly once, right before moving a successful guard into
+    /// `RunningState.lockdown`.
+    ///
+    /// A no-op for a guard that was already fully owned (a fresh engage, or
+    /// the transient cover, which has no adoption concept at all).
+    fn mark_owned(&mut self);
 }
 
 /// OS routing: install split-tunnel routes and query routing state.
@@ -435,21 +462,65 @@ pub trait Routing: Send + Sync {
         resolver_ip: Option<IpAddr>,
     ) -> Result<Self::Cover, RoutingError>;
 
-    /// Engage the STANDING lockdown cover for this connected session: permit
-    /// loopback + the `tun_name` interface + the onward server connection (and,
-    /// on Windows, the `app_ids` binaries by App-ID), block all else. Returns
-    /// the SAME [`Cover`](Self::Cover) RAII guard
+    /// Engage the STANDING lockdown cover's permits WITHOUT the TUN-interface
+    /// permit: loopback, the onward server connection, (when `Some`)
+    /// `resolver_ip`, and (Windows) the `app_ids` binaries, block all else.
+    /// Returns the SAME [`Cover`](Self::Cover) RAII guard
     /// [`install_failclosed_cover`](Self::install_failclosed_cover) returns —
-    /// the platform guard is kind-aware, so its Drop disengages whichever cover
-    /// it holds. Distinct from `install_failclosed_cover`, which does NOT permit
-    /// the TUN. The LUID is re-resolved on every call (never persisted).
-    /// Fail-FATAL: the bridge aborts the start on Err.
-    fn install_lockdown(
+    /// the platform guard is kind-aware, so its Drop disengages whichever
+    /// cover it holds. The caller owns this guard for the lifetime of the
+    /// standing cover: [`engage_lockdown_tun`](Self::engage_lockdown_tun)
+    /// later adds the TUN permit to the SAME already-engaged cover in place
+    /// (no second guard), and dropping THIS guard is what tears the whole
+    /// thing down, TUN permit included, whenever it was added.
+    ///
+    /// Call this BEFORE Phase 1 (plugin-chain start) — mirroring exactly when
+    /// [`install_failclosed_cover`](Self::install_failclosed_cover) engages —
+    /// so a plugin's Phase-4 forwarder self-test (where ex-ray's lazy
+    /// ECH-config fetch actually fires, on the chain's first real dial) is
+    /// already covered. Without this, on an armed machine the standing cover
+    /// is already live during Phase 4 (installed by a previous run or adopted
+    /// at startup, blocking everything not yet permitted), and a TUN-gated
+    /// engage alone — gated on Phase 6, which needs `install` to have
+    /// resolved the TUN adapter first — arrives too late to protect that
+    /// dial. Fail-FATAL: the bridge aborts the start on Err.
+    ///
+    /// `resolver_ip` carries the exact same trust condition as
+    /// `install_failclosed_cover`'s (see that method's doc): the caller's own
+    /// `ech-doh` URL names it, gated on `effective_ech_doh == Holes`, so
+    /// config-authorship trust alone is judged sufficient. An App-ID permit
+    /// alone is NOT equivalent here — a chained plugin (e.g. `galoshes`)
+    /// extracts and spawns its inner ex-ray as a SEPARATE process the App-ID
+    /// set never names, so only an address-based permit reaches the process
+    /// that actually dials the resolver (see CONTRIBUTING.md's "Lockdown
+    /// mode" section).
+    fn install_lockdown_permits(
         &self,
         server_ip: IpAddr,
-        tun_name: &str,
+        resolver_ip: Option<IpAddr>,
         app_ids: &[PathBuf],
     ) -> Result<Self::Cover, RoutingError>;
+
+    /// Add the TUN-interface permit (Windows: by `NET_LUID`, re-resolved on
+    /// every call, never persisted; macOS: `pass out quick on <tun_name>`) to
+    /// the standing lockdown cover [`install_lockdown_permits`](Self::install_lockdown_permits)
+    /// already engaged, once `install` has resolved the adapter. Idempotent;
+    /// returns no guard — the [`Cover`](Self::Cover)
+    /// `install_lockdown_permits` already returned still owns the whole
+    /// standing cover's disengage-on-drop, TUN permit included once this adds
+    /// it, so calling this does not create anything new to own. `server_ip`
+    /// and `resolver_ip` are the SAME values already passed to
+    /// `install_lockdown_permits` — Windows ignores them (the TUN filter pair
+    /// carries no address condition), macOS needs them again because pf has
+    /// no incremental update: every load replaces the whole ruleset, so this
+    /// rebuilds it with the identical server/resolver permits plus the new
+    /// TUN one. Fail-FATAL, matching `install_lockdown_permits`.
+    fn engage_lockdown_tun(
+        &self,
+        tun_name: &str,
+        server_ip: IpAddr,
+        resolver_ip: Option<IpAddr>,
+    ) -> Result<(), RoutingError>;
 }
 
 // System (production) routing =========================================================================================
@@ -528,14 +599,37 @@ impl Routing for SystemRouting {
         failclosed::engage(server_ip, resolver_ip, &self.state_dir, self.owner)
     }
 
-    fn install_lockdown(
+    fn install_lockdown_permits(
         &self,
         server_ip: IpAddr,
-        tun_name: &str,
+        resolver_ip: Option<IpAddr>,
         app_ids: &[PathBuf],
     ) -> Result<Self::Cover, RoutingError> {
-        let resolver = failclosed::SystemLuidResolver;
-        failclosed::engage_lockdown(server_ip, tun_name, &resolver, app_ids, &self.state_dir, self.owner)
+        failclosed::engage_lockdown(
+            server_ip,
+            resolver_ip,
+            None,
+            &failclosed::SystemLuidResolver,
+            app_ids,
+            &self.state_dir,
+            self.owner,
+        )
+    }
+
+    fn engage_lockdown_tun(
+        &self,
+        tun_name: &str,
+        server_ip: IpAddr,
+        resolver_ip: Option<IpAddr>,
+    ) -> Result<(), RoutingError> {
+        failclosed::engage_lockdown_tun(
+            tun_name,
+            server_ip,
+            resolver_ip,
+            &failclosed::SystemLuidResolver,
+            &self.state_dir,
+            self.owner,
+        )
     }
 }
 

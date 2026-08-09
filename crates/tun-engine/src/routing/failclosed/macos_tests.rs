@@ -188,7 +188,7 @@ fn ensure_trailing_nl_keeps_single_newline() {
 const TUN: &str = "hole-tun";
 
 fn lockdown(ip: IpAddr, nat: &str) -> String {
-    build_lockdown_main_ruleset(TUN, ip, nat)
+    build_lockdown_main_ruleset(Some(TUN), ip, None, nat)
 }
 
 #[skuld::test]
@@ -221,6 +221,54 @@ fn lockdown_main_passes_tun_interface() {
     assert!(
         r.contains("pass out quick on hole-tun all"),
         "lockdown main must pass the TUN interface:\n{r}"
+    );
+}
+
+// tun_name: None (Phase-0 permits-only engage) ========================================================================
+
+#[skuld::test]
+fn lockdown_main_omits_tun_pass_when_none() {
+    // The Phase-0 early engage (`install_lockdown_permits`) has no adapter
+    // yet (it doesn't exist before `routing.install`), so the TUN pass line
+    // must be omitted entirely -- not merely named against an absent
+    // interface.
+    let r = build_lockdown_main_ruleset(None, v4(), None, "");
+    assert!(
+        !r.contains("pass out quick on"),
+        "no TUN pass line must exist when tun_name is None:\n{r}"
+    );
+}
+
+#[skuld::test]
+fn lockdown_main_still_passes_server_and_resolver_when_tun_is_none() {
+    // Everything ELSE the Phase-0 early engage needs must still be present:
+    // omitting the TUN pass line must not accidentally omit anything else.
+    let r = build_lockdown_main_ruleset(None, v4(), Some(resolver()), "");
+    assert!(
+        r.contains("pass out quick proto tcp from any to 203.0.113.7"),
+        "lockdown main (tun=None) must still pass the server IP:\n{r}"
+    );
+    assert!(
+        r.contains(&format!(
+            "pass out quick proto tcp from any to {} port {RESOLVER_PERMIT_PORT}",
+            resolver()
+        )),
+        "lockdown main (tun=None) must still pass the resolver IP:\n{r}"
+    );
+    assert!(
+        r.contains("block drop out quick all"),
+        "lockdown main (tun=None) must still carry the fail-closed base:\n{r}"
+    );
+}
+
+#[skuld::test]
+fn lockdown_main_no_blank_line_when_tun_and_resolver_are_both_none() {
+    // Both optional lines omitted at once must not leave a stray blank line
+    // between the server permit and the inet6 block.
+    let r = build_lockdown_main_ruleset(None, v4(), None, "");
+    assert!(
+        !r.contains("\n\n"),
+        "no optional lines must not produce a blank line:\n{r}"
     );
 }
 
@@ -317,6 +365,64 @@ fn lockdown_main_v6_server_permit_precedes_inet6_block() {
     assert!(
         permit_at < block_at,
         "v6 server permit must precede the inet6 block:\n{r}"
+    );
+}
+
+// build_lockdown_main_ruleset resolver permit =========================================================================
+
+#[skuld::test]
+fn lockdown_main_omits_resolver_pass_when_none() {
+    // Negative direction: no resolver_ip means no resolver pass rule at all —
+    // proves the widening is opt-in, never automatic.
+    let r = build_lockdown_main_ruleset(Some(TUN), v4(), None, "");
+    assert!(
+        !r.contains("198.51.100.5"),
+        "lockdown main must not mention a resolver when resolver_ip is None:\n{r}"
+    );
+}
+
+#[skuld::test]
+fn lockdown_main_passes_resolver_scoped_to_tcp_443() {
+    // NOT the server permit's unrestricted shape: doh_url_for_ip
+    // (crates/bridge/src/dns/ech.rs) never constructs a URL with a port other
+    // than RESOLVER_PERMIT_PORT, so this is the one value the fetch can need.
+    let r = build_lockdown_main_ruleset(Some(TUN), v4(), Some(resolver()), "");
+    assert!(
+        r.contains(&format!(
+            "pass out quick proto tcp from any to {} port {RESOLVER_PERMIT_PORT}",
+            resolver()
+        )),
+        "lockdown main must pass the resolver IP scoped to tcp/{RESOLVER_PERMIT_PORT}:\n{r}"
+    );
+}
+
+#[skuld::test]
+fn lockdown_main_resolver_pass_is_quick_and_precedes_block() {
+    let r = build_lockdown_main_ruleset(Some(TUN), v4(), Some(resolver()), "");
+    let resolver_at = r.find(&resolver().to_string()).expect("resolver permit must appear");
+    let block_at = r.find("block drop out quick all").expect("block-all must appear");
+    assert!(
+        resolver_at < block_at,
+        "resolver permit must precede the block-all:\n{r}"
+    );
+    let line = r.lines().find(|l| l.contains(&resolver().to_string())).unwrap();
+    assert!(line.contains("quick"), "resolver pass rule must be quick: {line}");
+}
+
+#[skuld::test]
+fn lockdown_main_v6_resolver_permit_precedes_inet6_block() {
+    // A v6 resolver must be permitted BEFORE the wholesale inet6 block, or the
+    // ECH-config fetch to it is killed.
+    let r = build_lockdown_main_ruleset(Some(TUN), v4(), Some(resolver_v6()), "");
+    let permit_at = r
+        .find(&resolver_v6().to_string())
+        .expect("v6 resolver permit must appear");
+    let block_at = r
+        .find("block drop out quick inet6 all")
+        .expect("inet6 block must appear");
+    assert!(
+        permit_at < block_at,
+        "v6 resolver permit must precede the inet6 block:\n{r}"
     );
 }
 

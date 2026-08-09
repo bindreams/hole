@@ -67,6 +67,10 @@ impl crate::routing::CoverGuard for Cover {
     fn disarm(self) {
         std::mem::forget(self._inner);
     }
+
+    fn mark_owned(&mut self) {
+        self._inner.mark_owned();
+    }
 }
 
 /// Engage the cover blocking all egress except loopback, `server_ip`, and
@@ -94,16 +98,23 @@ pub fn recover_cover(state_dir: &Path, adopting: bool) {
     platform::recover_cover(state_dir, adopting);
 }
 
-/// Engage the standing lockdown cover (loopback + TUN + onward-server + —on
-/// Windows— plugin/bridge App-IDs permitted, all else blocked). Returns the
-/// SAME [`Cover`] wrapper the transient `engage` returns — the platform guard
-/// is kind-aware, so dropping it disengages the lockdown cover specifically.
-/// On Windows the LUID is re-resolved here every engage (never persisted). On
+/// Engage the standing lockdown cover, WITHOUT the TUN permit when
+/// `tun_name` is `None` (the Phase-0 early engage, see
+/// [`crate::routing::Routing::install_lockdown_permits`]'s doc) or WITH it
+/// when `Some` (loopback + TUN + onward-server + (when `Some`)
+/// `resolver_ip`, scoped to TCP/443 + —on Windows— plugin/bridge App-IDs
+/// permitted, all else blocked). Returns the SAME [`Cover`] wrapper the
+/// transient `engage` returns — the platform guard is kind-aware, so
+/// dropping it disengages the lockdown cover specifically. On Windows the
+/// LUID is re-resolved here every engage with `Some` (never persisted). On
 /// failure the host is left uncovered; the bridge's fail-FATAL caller aborts
-/// the start. `app_ids` is empty on macOS (pf has no per-process matching).
+/// the start. `app_ids` is empty on macOS (pf has no per-process matching);
+/// `resolver_ip` carries the same trust condition as [`engage`]'s — see
+/// [`crate::routing::Routing::install_lockdown_permits`]'s doc.
 pub fn engage_lockdown(
     server_ip: IpAddr,
-    tun_name: &str,
+    resolver_ip: Option<IpAddr>,
+    tun_name: Option<&str>,
     resolver: &dyn LuidResolver,
     app_ids: &[std::path::PathBuf],
     state_dir: &Path,
@@ -112,24 +123,53 @@ pub fn engage_lockdown(
     #[cfg(target_os = "windows")]
     {
         let _ = owner;
-        let luid = resolver.resolve(tun_name)?;
+        let luid = match tun_name {
+            Some(name) => Some(resolver.resolve(name)?),
+            None => None,
+        };
         Ok(Cover {
-            _inner: platform::engage_lockdown(server_ip, luid, app_ids, state_dir)?,
+            _inner: platform::engage_lockdown(server_ip, resolver_ip, luid, app_ids, state_dir)?,
         })
     }
     #[cfg(target_os = "macos")]
     {
         let _ = (resolver, app_ids);
         Ok(Cover {
-            _inner: platform::engage_lockdown(server_ip, tun_name, state_dir, owner)?,
+            _inner: platform::engage_lockdown(server_ip, resolver_ip, tun_name, state_dir, owner)?,
         })
+    }
+}
+
+/// Add the TUN permit to an already-engaged standing lockdown cover — see
+/// [`crate::routing::Routing::engage_lockdown_tun`]'s doc for the full
+/// rationale (no guard needed; the earlier [`engage_lockdown`] call's
+/// returned [`Cover`] already owns the whole thing). Idempotent.
+pub fn engage_lockdown_tun(
+    tun_name: &str,
+    server_ip: IpAddr,
+    resolver_ip: Option<IpAddr>,
+    resolver: &dyn LuidResolver,
+    state_dir: &Path,
+    owner: Option<(u32, u32)>,
+) -> Result<(), RoutingError> {
+    #[cfg(target_os = "windows")]
+    {
+        let _ = (server_ip, resolver_ip, state_dir, owner);
+        let luid = resolver.resolve(tun_name)?;
+        platform::engage_lockdown_tun(luid)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = resolver;
+        platform::engage_lockdown_tun(tun_name, server_ip, resolver_ip, state_dir, owner)
     }
 }
 
 /// Act on a [`CoverRecovery`] decision for the standing lockdown cover at
 /// startup. Dispatches to the platform reconciler: `Adopt` keeps the host
-/// fail-closed, refreshing the volatile TUN + server permits; `Sweep` fully
-/// disengages; `Noop` does nothing. cfg-free for `routing::recover_routes`.
+/// fail-closed, refreshing the volatile TUN + server + resolver permits;
+/// `Sweep` fully disengages; `Noop` does nothing. cfg-free for
+/// `routing::recover_routes`.
 /// Best-effort: a `Sweep` that cannot disengage is logged, not propagated —
 /// startup recovery has no caller to act on it.
 pub fn recover_lockdown(decision: crate::routing::CoverRecovery, state_dir: &Path) {
@@ -179,10 +219,11 @@ pub(crate) fn build_lockdown_spec_for_test(
     resolver: &dyn LuidResolver,
     tun_name: &str,
     server_ip: IpAddr,
+    resolver_ip: Option<IpAddr>,
     app_ids: &[std::path::PathBuf],
 ) -> platform::CoverSpec {
     let luid = resolver.resolve(tun_name).expect("mock resolver");
-    platform::build_lockdown_spec(server_ip, luid, app_ids)
+    platform::build_lockdown_spec(server_ip, resolver_ip, Some(luid), app_ids)
 }
 
 // Windows-only: pins the resolve-then-build LUID ordering. macOS keys pf on the
