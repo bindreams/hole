@@ -3034,6 +3034,83 @@ mod self_test {
         });
     }
 
+    // When a NARROWING repair's corrected engage (to `None`) itself fails,
+    // the restore falls back to the OLD (wider) permit — the residual is a
+    // kill-switch WIDENING (a live permit for a resolver nothing needs), not
+    // an ECH-fetch stall (no fetch is even attempted when the desired
+    // permit is `None`). Both the restore-success warning and the
+    // structural residual check must describe THIS direction accurately,
+    // not reuse the "may stall" wording written for the opposite
+    // (widening-repair) failure.
+    #[skuld::test]
+    fn covered_retry_narrowing_repair_failure_warns_about_the_stale_wide_permit_not_a_stall() {
+        use crate::test_support::log_capture::VecWriter;
+        use tracing_subscriber::fmt;
+        use tracing_subscriber::layer::{Layer, SubscriberExt};
+
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let writer = VecWriter::new();
+                let subscriber = tracing_subscriber::registry().with(
+                    fmt::layer()
+                        .with_writer(writer.clone())
+                        .with_ansi(false)
+                        .with_filter(tracing_subscriber::filter::LevelFilter::WARN),
+                );
+                let _guard = garter::tracing_test::set_default_in_current_thread(subscriber);
+
+                let answering_resolver: IpAddr = "1.0.0.1".parse().unwrap();
+                let querier = Arc::new(CountingQuerier {
+                    host: "proxy.example".into(),
+                    ip: "203.0.113.9".parse().unwrap(),
+                    queries: AtomicU32::new(0),
+                });
+                let dir = tempfile::tempdir().unwrap();
+                let routing = MockRouting::new(dir.path().to_path_buf());
+                let st = routing.state();
+                let (mut pm, _dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, false);
+                pm.set_bootstrap_querier_for_test(querier);
+                let mut cfg = test_config();
+                cfg.server.server = "proxy.example".into();
+                cfg.server.plugin = Some("ex-ray".into()); // attempt 1: plugin present
+                cfg.server.plugin_opts = Some(ECH_CAPABLE_OPTS.into());
+                cfg.dns.enabled = true;
+                cfg.dns.servers = vec![answering_resolver];
+
+                pm.start_cancellable(&cfg, true, CancellationToken::new())
+                    .await
+                    .unwrap_err();
+                assert_eq!(*st.last_cover_resolver_ip.lock().unwrap(), Some(answering_resolver));
+
+                // Attempt 2: plugin removed (wants None), but engaging None
+                // is configured to fail — the restore falls back to
+                // Some(answering_resolver).
+                st.fail_cover_for_resolvers.lock().unwrap().insert(None);
+                cfg.server.plugin = None;
+                pm.start_cancellable(&cfg, true, CancellationToken::new())
+                    .await
+                    .unwrap_err();
+                assert_eq!(
+                    *st.last_cover_resolver_ip.lock().unwrap(),
+                    Some(answering_resolver),
+                    "the restore falls back to the OLD, wider permit"
+                );
+
+                let output = writer.snapshot_string();
+                assert!(
+                    output.contains("no longer needs"),
+                    "expected the over-permit residual wording, not the ECH-stall one; got:\n{output}"
+                );
+                assert!(
+                    !output.contains("ECH fetch may still stall") && !output.contains("does not permit"),
+                    "must not claim an ECH-fetch stall risk when no fetch is attempted; got:\n{output}"
+                );
+            });
+    }
+
     #[skuld::test]
     fn covered_retry_after_adding_a_plugin_repairs_the_stale_permit() {
         rt().block_on(async {

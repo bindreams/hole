@@ -744,12 +744,31 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
                                         pin: original_pin,
                                         resolver_permit: old_permit,
                                     });
-                                    warn!(
-                                        error = %e,
-                                        "failed to engage the corrected fail-closed cover; restored the \
-                                         PREVIOUS permit instead of leaving the host open — ex-ray's ECH \
-                                         fetch may still stall against the now-stale permit"
-                                    );
+                                    // The restored permit is stale either way, but which
+                                    // direction it's stale in depends on whether the fetch
+                                    // this attempt needs an ECH resolver at all: widening
+                                    // repairs (`Holes`) restore something narrower than
+                                    // needed, so the fetch may stall; narrowing repairs
+                                    // (`None`/`Operators`, no fetch this cover permits
+                                    // anyway) instead restore something WIDER than needed —
+                                    // a live kill-switch permit for an address nothing
+                                    // dials, not a stall risk.
+                                    if matches!(effective_ech_doh, crate::proxy::plugin::EffectiveEchDoh::Holes) {
+                                        warn!(
+                                            error = %e,
+                                            "failed to engage the corrected fail-closed cover; restored the \
+                                             PREVIOUS permit instead of leaving the host open — ex-ray's ECH \
+                                             fetch may still stall against the now-stale permit"
+                                        );
+                                    } else {
+                                        warn!(
+                                            error = %e,
+                                            ?old_permit,
+                                            "failed to engage the corrected fail-closed cover; restored the \
+                                             PREVIOUS permit instead of leaving the host open — the fail-closed \
+                                             cover still permits a resolver address this attempt no longer needs"
+                                        );
+                                    }
                                     self.last_error = Some(e.to_string());
                                 }
                                 Err(e2) => {
@@ -793,10 +812,24 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         // restore left the LIVE held permit different from what this
         // attempt needs (`live_permit != ech_resolver_permit`); `Operators(url)`
         // always stalls, since the cover never permits an operator-chosen
-        // address.
+        // address; `None` never stalls (no fetch is attempted) but a
+        // repair's restore can still leave the LIVE permit WIDER than this
+        // attempt needs — the opposite residual direction, a kill-switch
+        // widening rather than a stall risk.
         if blocking_engaged {
             match &effective_ech_doh {
-                crate::proxy::plugin::EffectiveEchDoh::None => {}
+                crate::proxy::plugin::EffectiveEchDoh::None => {
+                    let live_permit = self.blocked.as_ref().and_then(|b| b.resolver_permit);
+                    if live_permit.is_some() {
+                        warn!(
+                            ?pin,
+                            ?live_permit,
+                            "covered start: the fail-closed cover still permits a resolver address this \
+                             attempt does not need (a repair's restore left it stale); the kill switch is \
+                             wider than the current config requires"
+                        );
+                    }
+                }
                 crate::proxy::plugin::EffectiveEchDoh::Holes => {
                     let live_permit = self.blocked.as_ref().and_then(|b| b.resolver_permit);
                     if live_permit != ech_resolver_permit {

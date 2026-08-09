@@ -192,9 +192,7 @@ fn resolver_permit_guids_are_distinct_and_swept() {
     // Every filter a cover installs must be deletable by recovery (else a
     // crash leaks an unswept permit across restarts), and every GUID in one
     // spec must be unique (else the second FwpmFilterAdd0 silently clobbers
-    // the first). BOTH families: a bug that swaps FILTER_GUIDS[10]/[11] (e.g.
-    // always emitting the V4 resolver GUID regardless of the resolver's own
-    // family) would pass if only one family were ever exercised here.
+    // the first).
     let transient_swept: std::collections::HashSet<GUID> = swept_transient_guids().into_iter().collect();
     for resolver in [resolver_v4(), resolver_v6()] {
         let s = build_cover_spec(v4(), Some(resolver));
@@ -212,6 +210,29 @@ fn resolver_permit_guids_are_distinct_and_swept() {
             "every filter GUID in the spec must be distinct"
         );
     }
+}
+
+#[skuld::test]
+fn resolver_permit_guid_matches_its_own_ip_family() {
+    // The GUID a resolver permit uses is family-specific (`FILTER_GUIDS[10]`
+    // for V4, `[11]` for V6, per `build_cover_spec`) — checked directly
+    // here, not just inferred from set-membership/distinctness (which BOTH
+    // families exercised in `resolver_permit_guids_are_distinct_and_swept`
+    // would still pass under a swapped V4/V6 match arm, since both GUIDs are
+    // in the swept set and distinct from each other either way).
+    let v4_filter = build_cover_spec(v4(), Some(resolver_v4()))
+        .filters
+        .into_iter()
+        .find(|f| matches!(f.condition, Condition::RemoteIpPortTcp(ip, _) if ip == resolver_v4()))
+        .expect("a V4 resolver permit filter");
+    assert_eq!(v4_filter.guid, FILTER_GUIDS[10]);
+
+    let v6_filter = build_cover_spec(v4(), Some(resolver_v6()))
+        .filters
+        .into_iter()
+        .find(|f| matches!(f.condition, Condition::RemoteIpPortTcp(ip, _) if ip == resolver_v6()))
+        .expect("a V6 resolver permit filter");
+    assert_eq!(v6_filter.guid, FILTER_GUIDS[11]);
 }
 
 // build_lockdown_spec =================================================================================================

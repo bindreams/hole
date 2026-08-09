@@ -411,7 +411,9 @@ naming the operator's URL. A repair's compensating restore can also leave the
 LIVE held cover's permit mismatched from what THIS attempt actually needs
 (the corrected engage failed) — a separate `warn!` fires for that case too,
 comparing against the live permit rather than re-trusting that the repair
-always converges. A THIRD case is untouched by this mechanism entirely
+always converges, in EITHER direction: too narrow (`Holes`, an ECH-fetch stall
+risk) or too wide (`None`, the kill switch permits a resolver address nothing
+needs). A THIRD case is untouched by this mechanism entirely
 (not merely a residual within it), **macOS only**: a restart that adopts a
 pre-existing [standing lockdown cover](#lockdown-mode) sees no transient
 cover engage at all, so there is no in-process signal to gate a diagnostic on
