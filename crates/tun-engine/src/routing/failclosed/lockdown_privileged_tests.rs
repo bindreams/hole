@@ -81,6 +81,14 @@ const RESOLVER_OTHER_PORT: &str = "1.0.0.1:853";
 #[cfg(any(target_os = "windows", target_os = "macos"))]
 const NON_PERMITTED: &str = "8.8.8.8:443";
 
+/// The bare IP a test engages the resolver permit with — parsed from
+/// `RESOLVER` itself so the address the cover PERMITS can never drift from
+/// the address these tests PROBE (both read the one const).
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+fn resolver_permit_ip() -> std::net::IpAddr {
+    RESOLVER.parse::<std::net::SocketAddr>().unwrap().ip()
+}
+
 /// Windows real-engage verification. Engages the REAL WFP lockdown cover with
 /// `server_ip = 1.1.1.1` and proves it is SELECTIVE: egress to the permitted
 /// server IP stays Ok (the permit beats block-all — the assertion that catches
@@ -176,7 +184,7 @@ fn windows_lockdown_permits_resolver_blocks_other_egress() {
     let dir = tempfile::tempdir().unwrap();
     let resolver = SystemLuidResolver;
     let server_ip: std::net::IpAddr = "1.1.1.1".parse().unwrap();
-    let resolver_ip: std::net::IpAddr = "9.9.9.9".parse().unwrap();
+    let resolver_ip: std::net::IpAddr = resolver_permit_ip();
 
     let connect = |addr: &str| TcpStream::connect_timeout(&addr.parse().unwrap(), Duration::from_secs(5));
 
@@ -262,7 +270,7 @@ fn windows_lockdown_permits_phase_0_then_phase_6_share_one_cover() {
     let dir = tempfile::tempdir().unwrap();
     let resolver = SystemLuidResolver;
     let server_ip: std::net::IpAddr = "1.1.1.1".parse().unwrap();
-    let resolver_ip: std::net::IpAddr = "9.9.9.9".parse().unwrap();
+    let resolver_ip: std::net::IpAddr = resolver_permit_ip();
 
     let connect = |addr: &str| TcpStream::connect_timeout(&addr.parse().unwrap(), Duration::from_secs(5));
 
@@ -458,7 +466,7 @@ fn macos_lockdown_permits_resolver_blocks_other_egress() {
     let dir = tempfile::tempdir().unwrap();
     let resolver = SystemLuidResolver;
     let server_ip: std::net::IpAddr = "1.1.1.1".parse().unwrap();
-    let resolver_ip: std::net::IpAddr = "9.9.9.9".parse().unwrap();
+    let resolver_ip: std::net::IpAddr = resolver_permit_ip();
 
     let connect = |addr: &str| TcpStream::connect_timeout(&addr.parse().unwrap(), Duration::from_secs(5));
 
@@ -492,7 +500,7 @@ fn macos_lockdown_permits_resolver_blocks_other_egress() {
     let sr = Command::new("pfctl").args(["-sr"]).output().unwrap();
     let rules = String::from_utf8_lossy(&sr.stdout);
     assert!(
-        rules.contains("9.9.9.9"),
+        rules.contains(&resolver_ip.to_string()),
         "live lockdown ruleset must carry the resolver permit:\n{rules}"
     );
 
@@ -551,7 +559,7 @@ fn macos_lockdown_permits_phase_0_then_phase_6_share_one_cover() {
     let dir = tempfile::tempdir().unwrap();
     let resolver = SystemLuidResolver;
     let server_ip: std::net::IpAddr = "1.1.1.1".parse().unwrap();
-    let resolver_ip: std::net::IpAddr = "9.9.9.9".parse().unwrap();
+    let resolver_ip: std::net::IpAddr = resolver_permit_ip();
 
     let connect = |addr: &str| TcpStream::connect_timeout(&addr.parse().unwrap(), Duration::from_secs(5));
 
@@ -718,7 +726,7 @@ fn windows_failclosed_permits_resolver_blocks_other_egress() {
 
     let dir = tempfile::tempdir().unwrap();
     let server_ip: std::net::IpAddr = "1.1.1.1".parse().unwrap();
-    let resolver_ip: std::net::IpAddr = "9.9.9.9".parse().unwrap();
+    let resolver_ip: std::net::IpAddr = resolver_permit_ip();
 
     let connect = |addr: &str| TcpStream::connect_timeout(&addr.parse().unwrap(), Duration::from_secs(5));
 
@@ -845,7 +853,7 @@ fn macos_failclosed_permits_resolver_blocks_other_egress() {
 
     let dir = tempfile::tempdir().unwrap();
     let server_ip: std::net::IpAddr = "1.1.1.1".parse().unwrap();
-    let resolver_ip: std::net::IpAddr = "9.9.9.9".parse().unwrap();
+    let resolver_ip: std::net::IpAddr = resolver_permit_ip();
 
     let connect = |addr: &str| TcpStream::connect_timeout(&addr.parse().unwrap(), Duration::from_secs(5));
 
@@ -871,7 +879,7 @@ fn macos_failclosed_permits_resolver_blocks_other_egress() {
     let sr = Command::new("pfctl").args(["-sr"]).output().unwrap();
     let rules = String::from_utf8_lossy(&sr.stdout);
     assert!(
-        rules.contains("9.9.9.9"),
+        rules.contains(&resolver_ip.to_string()),
         "live ruleset must carry the resolver permit:\n{rules}"
     );
 

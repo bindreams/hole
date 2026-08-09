@@ -176,9 +176,11 @@ struct MockRoutingState {
     /// Makes `engage_lockdown_tun` (Phase 6) fail.
     fail_lockdown: AtomicBool,
     fail_cover: AtomicBool,
-    /// Ordered record of teardown events ("routes" / "lockdown") so a test can
-    /// observe the unwind teardown sequence. Shared via the `Arc<MockRoutingState>`
-    /// both `MockRoutes` and `MockCover` clone.
+    /// Ordered record of lifecycle events ("routes" / "lockdown" teardown,
+    /// "cover_engage" transient-cover engage) so a test can observe
+    /// cross-call ordering — e.g. that a stale standing-cover guard releases
+    /// BEFORE the transient cover engages, not after. Shared via the
+    /// `Arc<MockRoutingState>` both `MockRoutes` and `MockCover` clone.
     teardown_order: std::sync::Mutex<Vec<&'static str>>,
     /// Last `server_ip` passed to `install`, so a test can assert the bypass
     /// route received the DoH-resolved IP (not a system-resolved one).
@@ -362,6 +364,7 @@ impl Routing for MockRouting {
         *self.state.last_cover_server_ip.lock().unwrap() = Some(server_ip);
         *self.state.last_cover_resolver_ip.lock().unwrap() = resolver_ip;
         self.state.cover_engage_calls.fetch_add(1, Ordering::SeqCst);
+        self.state.teardown_order.lock().unwrap().push("cover_engage");
         Ok(MockCover {
             state: Arc::clone(&self.state),
             lockdown: false,
@@ -1543,12 +1546,11 @@ fn lockdown_pending_survives_a_start_failure_and_is_disengaged_by_stop() {
 
 #[skuld::test]
 fn lockdown_on_never_engages_for_socks_only_mode() {
-    // SocksOnly's `start_inner` returns before Phase 6 (`routing.install`)
-    // ever runs -- there is no TUN to protect and no adapter to resolve a
-    // LUID from. The Phase-0 engage must respect
-    // that SAME invariant: engaging a cover Phase 6 can never complete would
-    // leave it permanently orphaned (nothing ever moves it into a
-    // `RunningState`, since SocksOnly's has no lockdown field to fill).
+    // A MANUAL (uncovered) SocksOnly start never applies lockdown, matching
+    // every other manual connect's fail-open-by-design convention -- unlike
+    // the covered path (next test), there is no fully-uncovered gap to close
+    // here: a manual connect that the user drove directly is not silently
+    // "supposed to be" protected.
     rt().block_on(async {
         let dir = tempfile::tempdir().unwrap();
         let routing = MockRouting::new(dir.path().to_path_buf());
@@ -1576,13 +1578,16 @@ fn lockdown_on_never_engages_for_socks_only_mode() {
 }
 
 #[skuld::test]
-fn covered_socks_only_start_with_lockdown_on_uses_the_transient_cover() {
-    // The standing cover never applies to SocksOnly (previous test), but a
+fn covered_socks_only_start_with_lockdown_on_uses_the_standing_cover_not_the_transient_one() {
+    // A manual SocksOnly start never applies lockdown (previous test), but a
     // COVERED SocksOnly start under lockdown intent must not be left with
-    // NEITHER cover: the transient cover's own gate must react to
-    // `lockdown_applies` (which is false here), not the raw intent (which
-    // is true) -- otherwise a covered SocksOnly start under lockdown runs
-    // fully uncovered for the whole connect window.
+    // NEITHER cover -- and must not use the TRANSIENT cover either: its
+    // engage/disengage replace pf's entire main ruleset, which would clobber
+    // a standing cover some other run (this process's prior attempt, or an
+    // adopted one from before a crash) holds live, and the transient cover's
+    // own gate has no way to tell that apart from a clean host. Phase 0 needs
+    // no TUN, so it applies here even though Phase 6 (TUN-only) never runs
+    // for SocksOnly.
     rt().block_on(async {
         let dir = tempfile::tempdir().unwrap();
         let routing = MockRouting::new(dir.path().to_path_buf());
@@ -1596,13 +1601,77 @@ fn covered_socks_only_start_with_lockdown_on_uses_the_transient_cover() {
             .expect("SocksOnly covered start must still succeed");
         assert_eq!(
             st.lockdown_permits_calls.load(Ordering::SeqCst),
+            1,
+            "Phase 0 must engage instead -- a covered start must never be left fully uncovered"
+        );
+        assert_eq!(
+            st.cover_engage_calls.load(Ordering::SeqCst),
             0,
-            "the standing cover still never applies to SocksOnly"
+            "the transient cover must never engage while lockdown intent is on -- it could clobber a live standing cover"
+        );
+        assert!(pm.lockdown_active());
+
+        pm.stop().await.unwrap();
+        assert_eq!(
+            st.lockdown_disengage_calls.load(Ordering::SeqCst),
+            1,
+            "stop must release the Phase-0-only guard SocksOnly never completes to Phase 6"
+        );
+    });
+}
+
+#[skuld::test]
+fn lockdown_pending_releases_before_the_transient_cover_engages_when_intent_turns_off() {
+    // A covered start that engaged Phase 0 and then failed at Phase 6 (here:
+    // `routing.install`) retains `lockdown_pending` (an ordinary Err, not a
+    // cancel). If the user then turns lockdown OFF and retries covered, the
+    // stale guard must release BEFORE the transient cover engages, not
+    // after: on macOS both covers replace the SAME singular pf main
+    // ruleset, so releasing the standing guard's restore-to-original AFTER
+    // the transient engage would wipe the transient ruleset the retry just
+    // installed, leaving the host silently open while believing it's
+    // covered.
+    rt().block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        let routing = MockRouting::failing_install(dir.path().to_path_buf());
+        let st = routing.state();
+        let (mut pm, _dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, true);
+        let cfg = test_config(); // Full mode
+
+        // Attempt 1: lockdown on -> Phase 0 engages, then `routing.install`
+        // (Phase 6) fails -> lockdown_pending retained across the Err.
+        pm.start_cancellable(&cfg, true, CancellationToken::new())
+            .await
+            .expect_err("routing.install fails on this mock");
+        assert_eq!(st.lockdown_permits_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            st.lockdown_disengage_calls.load(Ordering::SeqCst),
+            0,
+            "retained across an ordinary Err"
+        );
+        assert!(pm.lockdown_active());
+
+        // User turns lockdown off and retries covered.
+        pm.set_lockdown_intent(false).unwrap();
+        pm.start_cancellable(&cfg, true, CancellationToken::new())
+            .await
+            .expect_err("routing.install still fails on this mock");
+
+        assert_eq!(
+            st.lockdown_disengage_calls.load(Ordering::SeqCst),
+            1,
+            "the stale Phase-0 guard must be released once intent turns off"
         );
         assert_eq!(
             st.cover_engage_calls.load(Ordering::SeqCst),
             1,
-            "the transient cover must engage instead -- a covered start must never be left fully uncovered"
+            "the transient cover must engage now that lockdown no longer applies"
+        );
+        let order = st.teardown_order.lock().unwrap().clone();
+        assert_eq!(
+            order,
+            vec!["lockdown", "cover_engage"],
+            "the stale standing-cover guard must release BEFORE the transient cover engages"
         );
     });
 }
@@ -3842,6 +3911,61 @@ mod self_test {
     }
 
     #[skuld::test]
+    fn lockdown_pending_repair_preserves_the_original_pin_not_the_revalidated_one() {
+        // A stale-permit repair's re-engage must store the guard's ORIGINAL
+        // `pin` (pre-`revalidate`), not this attempt's locally revalidated
+        // value -- mirrors the transient cover's own `repair_fallback` for
+        // the identical reason: `revalidate` only ever downgrades (`Answered`
+        // -> `ResolverDeselected`, see its `other => other` arm), so
+        // persisting an already-downgraded value would make that loss
+        // PERMANENT even once the original resolver returns to
+        // `dns.servers` -- `revalidate` never upgrades back to `Answered`.
+        rt().block_on(async {
+            let probe_l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let closed = probe_l.local_addr().unwrap();
+            drop(probe_l);
+            let r: IpAddr = "1.0.0.1".parse().unwrap();
+            let querier = Arc::new(CountingQuerier {
+                host: "proxy.example".into(),
+                ip: closed.ip(),
+                queries: AtomicU32::new(0),
+            });
+            let dir = tempfile::tempdir().unwrap();
+            let routing = MockRouting::new(dir.path().to_path_buf());
+            let (mut pm, _dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, true);
+            pm.set_bootstrap_querier_for_test(querier);
+            let mut cfg = test_config();
+            cfg.server.server = "proxy.example".into();
+            cfg.server.server_port = closed.port();
+            cfg.server.plugin = Some("ex-ray".into());
+            cfg.server.plugin_opts = Some(ECH_CAPABLE_OPTS.into());
+            cfg.dns.enabled = true; // forces the self-test gate to fail every attempt
+            cfg.dns.servers = vec![r];
+
+            // Attempt 1: pin resolves to Answered(r); fails via the self-test
+            // gate, retaining the guard with pin: Answered(r).
+            let _ = pm.start_cancellable(&cfg, true, CancellationToken::new()).await;
+            assert_eq!(
+                pm.lockdown_pending.as_ref().map(|p| p.pin),
+                Some(crate::dns::ech::PinSource::Answered(r)),
+                "sanity: attempt 1 engages with a verified pin"
+            );
+
+            // Attempt 2: the resolver is deselected -- this attempt's local
+            // pin revalidates to ResolverDeselected, which ALSO drifts the
+            // resolver permit (no configured server left to fall back to),
+            // triggering a stale release + re-engage.
+            cfg.dns.servers = Vec::new();
+            let _ = pm.start_cancellable(&cfg, true, CancellationToken::new()).await;
+            assert_eq!(
+                pm.lockdown_pending.as_ref().map(|p| p.pin),
+                Some(crate::dns::ech::PinSource::Answered(r)),
+                "the re-engage must store the ORIGINAL pin, not this attempt's revalidated ResolverDeselected"
+            );
+        });
+    }
+
+    #[skuld::test]
     fn covered_retry_repair_restores_the_previous_permit_when_the_corrected_engage_fails() {
         rt().block_on(async {
             // Same drift as `covered_retry_after_adding_a_plugin_repairs_the_stale_permit`
@@ -4767,8 +4891,8 @@ mod self_test {
         // re-resolve via DoH on every attempt. With no plugin configured, the
         // retained standing cover permits no resolver at all, so a real
         // re-resolve would dial straight into its own block-all and wedge
-        // every retry identically -- #753's exact class of bug, one layer
-        // earlier than the ECH-config fetch it fixed.
+        // every retry identically -- one layer earlier than the ECH-config
+        // fetch this cover exists to unblock.
         rt().block_on(async {
             let querier = Arc::new(CountingQuerier {
                 host: "proxy.example".into(),

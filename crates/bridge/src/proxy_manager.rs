@@ -293,7 +293,7 @@ struct BlockedStart<C> {
 /// lockdown's engage is fail-FATAL (no restore-previous fallback), so a
 /// failed re-engage here just aborts the start with the host open — the same
 /// disclosed residual class as the transient cover's own release-then-reengage
-/// window (CONTRIBUTING.md's "Transient cutover cover" section, #758).
+/// window (CONTRIBUTING.md's "Transient cutover cover" section).
 struct LockdownPending<C> {
     cover: C,
     host: String,
@@ -646,8 +646,8 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         // resolver: without this reuse, a lockdown-on retry with no plugin
         // configured (so the standing cover permits no resolver at all)
         // would re-resolve via DoH on every attempt, dial into its own
-        // block-all, and fail identically forever (#753's exact class of
-        // wedge, one step earlier than the ECH-config fetch it fixed).
+        // block-all, and fail identically forever -- one step earlier than
+        // the ECH-config fetch this cover exists to unblock.
         let (server_ip, pin) = match self
             .blocked
             .as_ref()
@@ -740,15 +740,34 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
             .map(lockdown_state::load_enabled)
             .unwrap_or(false);
 
-        // The standing cover only ever completes for a Full-mode start:
-        // SocksOnly's `start_inner` returns before Phase 6 (`routing.install`)
-        // ever runs -- there is no TUN to
-        // protect and no adapter to resolve a LUID from. Gating the NEW
-        // Phase-0 engage below on this too (not just `lockdown_on`) preserves
-        // that pre-existing "lockdown never engages for SocksOnly" invariant;
-        // without it, Phase 0 would engage a cover Phase 6 never completes
-        // and nothing would ever own its disengage.
-        let lockdown_applies = lockdown_on && matches!(config.tunnel_mode, TunnelMode::Full);
+        // Full mode completes BOTH phases of the standing cover: Phase 0
+        // here, Phase 6 (`routing.install`'s TUN permit) in `start_inner`.
+        // SocksOnly's `start_inner` returns before Phase 6 ever runs -- no
+        // TUN, no LUID to protect -- but Phase 0 (loopback + server +
+        // resolver + App-IDs) needs no TUN either, and ownership doesn't
+        // either: `state.lockdown` is filled from `lockdown_pending` on the
+        // Ok path below regardless of mode, so a Phase-0-only guard is never
+        // orphaned. A COVERED SocksOnly start under lockdown intent therefore
+        // also applies Phase 0 -- the alternative (the transient cover) is
+        // unsound here: its engage/disengage replace pf's entire main
+        // ruleset, which would clobber a standing cover this or a prior
+        // process holds live (adopted or freshly engaged), and its own
+        // gate can't tell the two cases apart. A MANUAL (uncovered) SocksOnly
+        // start does not apply: manual connects are fail-open by design (see
+        // the uncovered `blocked` release below), and there is no
+        // fully-uncovered gap to close outside the covered/auto-connect path.
+        let lockdown_applies = lockdown_on && (matches!(config.tunnel_mode, TunnelMode::Full) || covered);
+
+        // If lockdown intent no longer applies to THIS attempt (turned off,
+        // or a manual SocksOnly start), release any held Phase-0 guard NOW --
+        // strictly before the transient cover below has a chance to engage.
+        // Releasing it after (where this used to run) would, on macOS, have
+        // the disengage's restore-to-original `pfctl -f -` wipe the transient
+        // ruleset the block below just installed, silently opening the host
+        // during the very covered-start window that cover exists to protect.
+        if !lockdown_applies && self.lockdown_pending.take().is_some() {
+            warn!("lockdown early cover released: intent is off, or this is a manual SocksOnly start");
+        }
 
         // A held cover's resolver_permit is fixed at engage time; re-engage
         // whenever this attempt's fresh derivation DIFFERS from what the
@@ -902,19 +921,31 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         }
         let blocking_engaged = self.blocked.is_some();
 
-        // Standing lockdown cover, Phase 0 (see `lockdown_pending`'s doc).
-        // Release-then-reengage only on drift (a different server or resolver
-        // permit than what's held), mirroring the transient cover's
+        // Standing lockdown cover, Phase 0 (see `lockdown_pending`'s doc). The
+        // `else` release for when `lockdown_applies` is false already ran
+        // above, before the transient block -- this arm only ever engages or
+        // reuses. Release-then-reengage only on drift (a different server or
+        // resolver permit than what's held), mirroring the transient cover's
         // stale-permit repair above but WITHOUT a restore-previous fallback:
         // `install_lockdown_permits` is fail-FATAL, so a failed re-engage
         // here aborts the whole start with the host open -- the same
         // disclosed residual class as the transient cover's own
-        // release-then-reengage window (`LockdownPending`'s doc, #758).
+        // release-then-reengage window (`LockdownPending`'s doc).
         if lockdown_applies {
             let stale = self
                 .lockdown_pending
                 .as_ref()
                 .is_some_and(|p| p.server_ip != server_ip || p.resolver_permit != ech_resolver_permit);
+            // Capture the HELD guard's original `pin` (pre-`revalidate`)
+            // before a stale release takes it, mirroring `repair_fallback`
+            // above: `pin` here is refreshed by `revalidate` every retry, so
+            // persisting THAT (instead of what the guard already held) would
+            // turn an already-downgraded `ResolverDeselected` outcome
+            // permanent, even after the original resolver returns to
+            // `dns.servers`. `None` (no prior guard: first engage, or one
+            // released above for a different reason) falls back to the local
+            // `pin`, which is correct as-is for a fresh (non-repair) engage.
+            let original_pin = self.lockdown_pending.as_ref().map(|p| p.pin);
             if stale {
                 self.lockdown_pending.take(); // drop -> disengage; brief open window until the fresh engage below
                 warn!(
@@ -925,6 +956,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
             }
             if self.lockdown_pending.is_none() {
                 let app_ids = lockdown_app_ids(config);
+                let engaged_pin = original_pin.unwrap_or(pin);
                 match self
                     .routing
                     .install_lockdown_permits(server_ip, ech_resolver_permit, &app_ids)
@@ -934,7 +966,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
                             cover,
                             host: config.server.server.clone(),
                             server_ip,
-                            pin,
+                            pin: engaged_pin,
                             resolver_permit: ech_resolver_permit,
                         });
                     }
@@ -944,10 +976,6 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
                     }
                 }
             }
-        } else if self.lockdown_pending.take().is_some() {
-            // Intent off, or this attempt is SocksOnly (the standing cover
-            // never applies there): release the held early cover.
-            warn!("lockdown early cover released: intent is off, or this start does not use the standing cover");
         }
 
         // Disclosed residual (see CONTRIBUTING.md's "Transient cutover

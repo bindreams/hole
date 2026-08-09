@@ -689,6 +689,20 @@ pub fn engage_lockdown_tun(tun_luid: u64) -> Result<(), RoutingError> {
         )?;
         let result = (|| -> Result<(), RoutingError> {
             wfp_check(FwpmTransactionBegin0(engine, 0), "FwpmTransactionBegin0")?;
+            // Delete-then-add: a retry after the TUN adapter was torn down
+            // (a failed/cancelled attempt's `routes` guard drop, per this
+            // module's own doc: "a teardown mints a new one") calls this fn
+            // again with a NEW luid, but the GUID key is fixed -- `add_filter`
+            // alone routes through `ok_or_exists`, which treats an
+            // already-present filter as satisfied WITHOUT updating its
+            // condition, silently keeping the OLD (now-dead) luid live.
+            // Deleting first (idempotent -- a "not found" delete is ignored)
+            // guarantees the add always takes effect with the CURRENT luid,
+            // mirroring the Adopt path's own delete-then-re-add for this
+            // exact class of volatile permit (`adopt_delete_guids`).
+            for f in &filters {
+                let _ = FwpmFilterDeleteByKey0(engine, &f.guid);
+            }
             for f in &filters {
                 add_filter(engine, PROVIDER_GUID, SUBLAYER_GUID, f)?;
             }

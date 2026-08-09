@@ -641,24 +641,46 @@ resolver permit DRIFTS from what `lockdown_pending` already holds releases
 transient cover's stale-permit repair, but without a restore-previous
 fallback (`install_lockdown_permits` is fail-FATAL, so a failed re-engage
 just aborts the start with the host open — the same disclosed
-release-then-reengage residual class as the transient cover's own, #758).
-Without this, Windows' `FWP_E_ALREADY_EXISTS` swallow (`ok_or_exists`) would
-silently keep re-adding over the STALE fixed-GUID filter, leaving the OLD
-resolver/server permitted forever instead of the new one.
+release-then-reengage residual class as the transient cover's own). The
+re-engage stores the RELEASED guard's own `pin` (captured before the
+`take()`), not this attempt's locally `revalidate`d one: `revalidate` only
+ever downgrades (`Answered` → `ResolverDeselected`), so persisting the
+downgraded local value would make that loss permanent even once the
+original resolver returns to `dns.servers`. On Windows, `engage_lockdown_tun`
+(Phase 6) deletes its two TUN-LUID filters by GUID before re-adding them,
+for the identical reason `recover_lockdown`'s Adopt path deletes the
+volatile GUIDs: `ok_or_exists` treats an already-present fixed-GUID filter as
+satisfied WITHOUT updating its condition, so a bare re-add after a
+failed/cancelled attempt's TUN teardown (which mints a new LUID) would
+silently keep the OLD, now-dead LUID's permit live.
 
-The standing cover only ever applies to a Full-mode start: SocksOnly's
-`start_inner` returns before Phase 6 (`routing.install`) ever runs, so there
-is no TUN to protect and no adapter to resolve a LUID from — both the Phase-0
-engage AND the transient cover's own gate (`covered && !lockdown_applies`,
-not the raw intent) key off `lockdown_applies = intent && tunnel_mode == Full`, so a covered SocksOnly start under lockdown intent still gets the
-transient cover instead of running fully uncovered, and the standing cover
-never engages a guard Phase 6 could never complete (which would leave it
-permanently orphaned). `lockdown_applies` is computed once in
-`start_cancellable` and passed into `start_inner` as a parameter, the same
-pattern `ech_resolver_permit` already uses — `start_inner` does not
-independently re-read the persisted intent file, which has out-of-process
-writers (`hole bridge unlock`) that could otherwise flip it mid-attempt and
-desync the two phases.
+Full mode completes both phases: Phase 0 here, Phase 6 (the TUN permit) in
+`start_inner`. SocksOnly's `start_inner` returns before Phase 6 ever runs —
+no TUN, no LUID — but Phase 0 needs neither, and guard ownership doesn't
+depend on Phase 6 either (`RunningState.lockdown` is filled from
+`lockdown_pending` on the `Ok` path regardless of mode), so a COVERED
+SocksOnly start under lockdown intent also applies Phase 0:
+`lockdown_applies = intent && (tunnel_mode == Full || covered)`. The
+transient cover is not a viable substitute here — its engage/disengage
+replace pf's entire main ruleset, and it has no way to tell a clean host
+apart from one where a standing cover (this process's own prior attempt, or
+one adopted from before a crash) is already live, so using it for SocksOnly
+would risk destroying that live cover instead of complementing it. A MANUAL
+(uncovered) SocksOnly start still never applies lockdown, matching every
+other manual connect's fail-open-by-design convention — there is no
+fully-uncovered gap to close on a connect the user drove directly.
+`lockdown_applies` is computed once in `start_cancellable` and passed into
+`start_inner` as a parameter, the same pattern `ech_resolver_permit` already
+uses — `start_inner` does not independently re-read the persisted intent
+file, which has out-of-process writers (`hole bridge unlock`) that could
+otherwise flip it mid-attempt and desync the two phases. Whenever
+`lockdown_applies` is false for the current attempt (intent off, or a manual
+SocksOnly start), `start_cancellable` releases any held `lockdown_pending`
+BEFORE the transient-cover block below has a chance to engage — releasing it
+after (as an earlier revision of this mechanism did) would, on macOS, have
+the disengage's restore-to-original `pfctl -f -` wipe the transient ruleset
+that block had just installed, silently opening the host during the very
+covered-start window the transient cover exists to protect.
 
 `hole bridge unlock` is the elevated escape hatch to disengage a standing cover
 when no bridge is alive (`cutover::unlock`). Unlike the best-effort startup
