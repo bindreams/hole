@@ -1772,6 +1772,94 @@ fn manual_socks_only_start_does_not_disengage_an_already_armed_standing_cover() 
 }
 
 #[skuld::test]
+fn lockdown_pending_host_drift_repairs_in_place_not_an_eager_release() {
+    // A covered start for a DIFFERENT host than the held guard's must route
+    // through the checked repair (`reengage_lockdown_permits`), like any
+    // other drift -- not an eager, unconditional `take()`/drop with no
+    // guaranteed re-engage. An eager release here has no `lockdown_applies`
+    // gate and no guaranteed re-engage on every exit path (e.g. a manual
+    // start for the new host, or a resolve failure on it, both leave
+    // `lockdown_pending: None` with nothing left to re-arm it).
+    rt().block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        let routing = MockRouting::failing_install(dir.path().to_path_buf());
+        let st = routing.state();
+        let (mut pm, _dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, true);
+        let mut cfg = test_config();
+        cfg.server.server = "127.0.0.1".into();
+
+        pm.start_cancellable(&cfg, true, CancellationToken::new())
+            .await
+            .expect_err("routing.install fails on this mock");
+        assert_eq!(st.lockdown_permits_calls.load(Ordering::SeqCst), 1);
+        assert!(
+            pm.lockdown_active(),
+            "sanity: attempt 1's failure retains the Phase-0 guard"
+        );
+
+        cfg.server.server = "127.0.0.2".into(); // DIFFERENT host
+        let _ = pm.start_cancellable(&cfg, true, CancellationToken::new()).await;
+
+        assert_eq!(
+            st.reengage_lockdown_permits_calls.load(Ordering::SeqCst),
+            1,
+            "host drift must repair the held guard in place"
+        );
+        assert_eq!(
+            st.lockdown_permits_calls.load(Ordering::SeqCst),
+            1,
+            "still just the one fresh engage from attempt 1 -- a repair never calls install_lockdown_permits again"
+        );
+        assert_eq!(
+            st.lockdown_disengage_calls.load(Ordering::SeqCst),
+            0,
+            "a repair is not an ordinary disengage"
+        );
+    });
+}
+
+#[skuld::test]
+fn manual_start_for_a_different_host_does_not_disengage_an_already_armed_standing_cover() {
+    // Mirrors `manual_socks_only_start_does_not_disengage_an_already_armed_standing_cover`
+    // for the HOST-drift transition specifically: a manual (uncovered)
+    // SocksOnly start for a DIFFERENT host than the held guard's must not
+    // eagerly release `lockdown_pending` either. The eager-release version
+    // of this code did exactly that, unconditionally, with no re-engage on
+    // a manual start (`lockdown_applies` is false for manual SocksOnly, so
+    // the engage/repair block never runs at all).
+    rt().block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        let routing = MockRouting::failing_install(dir.path().to_path_buf());
+        let st = routing.state();
+        let (mut pm, _dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, true);
+        let mut cfg = test_config();
+        cfg.server.server = "127.0.0.1".into();
+
+        pm.start_cancellable(&cfg, true, CancellationToken::new())
+            .await
+            .expect_err("routing.install fails on this mock");
+        assert_eq!(st.lockdown_permits_calls.load(Ordering::SeqCst), 1);
+        assert!(
+            pm.lockdown_active(),
+            "sanity: attempt 1's failure retains the Phase-0 guard"
+        );
+
+        // Manual SocksOnly start for a DIFFERENT host, intent still armed.
+        let mut cfg2 = test_config();
+        cfg2.server.server = "127.0.0.2".into();
+        cfg2.tunnel_mode = hole_common::protocol::TunnelMode::SocksOnly;
+        let _ = pm.start(&cfg2).await; // outcome irrelevant; only the cover state matters
+
+        assert_eq!(
+            st.lockdown_disengage_calls.load(Ordering::SeqCst),
+            0,
+            "a manual start for a different host must NOT disengage an already-armed standing cover"
+        );
+        assert!(pm.lockdown_active(), "the kill switch must still read armed");
+    });
+}
+
+#[skuld::test]
 fn lockdown_pending_releases_before_the_transient_cover_engages_when_intent_turns_off() {
     // A covered start that engaged Phase 0 and then failed at Phase 6 (here:
     // `routing.install`) retains `lockdown_pending` (an ordinary Err, not a
@@ -4276,6 +4364,108 @@ mod self_test {
                 pm.lockdown_pending.as_ref().map(|p| p.pin),
                 Some(crate::dns::ech::PinSource::Answered(r)),
                 "the re-engage must store the ORIGINAL pin, not this attempt's revalidated ResolverDeselected"
+            );
+        });
+    }
+
+    #[skuld::test]
+    fn blocked_to_lockdown_pending_handoff_preserves_the_original_pin() {
+        // A `blocked` -> `lockdown_pending` handoff (lockdown intent turned
+        // ON mid-blocked-state) is a FRESH engage for the standing cover,
+        // but the cached pin it inherits came from `blocked`, already
+        // revalidated by the SAME cache-reuse match this attempt used to
+        // resolve `server_ip` -- storing that revalidated value would make
+        // an already-downgraded `ResolverDeselected` outcome permanent even
+        // once the original resolver returns to `dns.servers`.
+        rt().block_on(async {
+            let probe_l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let closed = probe_l.local_addr().unwrap();
+            drop(probe_l);
+            let r: IpAddr = "1.0.0.1".parse().unwrap();
+            let querier = Arc::new(CountingQuerier {
+                host: "proxy.example".into(),
+                ip: closed.ip(),
+                queries: AtomicU32::new(0),
+            });
+            let dir = tempfile::tempdir().unwrap();
+            let routing = MockRouting::new(dir.path().to_path_buf());
+            let (mut pm, _dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, false); // intent OFF
+            pm.set_bootstrap_querier_for_test(querier);
+            let mut cfg = test_config();
+            cfg.server.server = "proxy.example".into();
+            cfg.server.server_port = closed.port();
+            cfg.server.plugin = Some("ex-ray".into());
+            cfg.server.plugin_opts = Some(ECH_CAPABLE_OPTS.into());
+            cfg.dns.enabled = true; // forces the self-test gate to fail every attempt
+            cfg.dns.servers = vec![r];
+
+            // Attempt 1: lockdown OFF -> transient cover engages, fails,
+            // retains `blocked` with pin: Answered(r).
+            let _ = pm.start_cancellable(&cfg, true, CancellationToken::new()).await;
+            assert!(
+                pm.blocked_until_connected(),
+                "sanity: attempt 1 retains the transient cover"
+            );
+
+            // Turn lockdown ON and drop r from dns.servers -- attempt 2's
+            // local pin revalidates to ResolverDeselected.
+            pm.set_lockdown_intent(true).unwrap();
+            cfg.dns.servers = Vec::new();
+            let _ = pm.start_cancellable(&cfg, true, CancellationToken::new()).await;
+
+            assert_eq!(
+                pm.lockdown_pending.as_ref().map(|p| p.pin),
+                Some(crate::dns::ech::PinSource::Answered(r)),
+                "the blocked -> lockdown_pending handoff must store the ORIGINAL pin, not the revalidated one"
+            );
+        });
+    }
+
+    #[skuld::test]
+    fn lockdown_pending_to_blocked_handoff_preserves_the_original_pin() {
+        // The reverse handoff: lockdown intent turned OFF while
+        // `lockdown_pending` is held -- a FRESH engage for the TRANSIENT
+        // cover this time, but the cached pin it inherits came from
+        // `lockdown_pending`, already revalidated by the SAME cache-reuse
+        // match. Same class of bug as the forward handoff, just crossing
+        // covers in the other direction.
+        rt().block_on(async {
+            let probe_l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let closed = probe_l.local_addr().unwrap();
+            drop(probe_l);
+            let r: IpAddr = "1.0.0.1".parse().unwrap();
+            let querier = Arc::new(CountingQuerier {
+                host: "proxy.example".into(),
+                ip: closed.ip(),
+                queries: AtomicU32::new(0),
+            });
+            let dir = tempfile::tempdir().unwrap();
+            let routing = MockRouting::new(dir.path().to_path_buf());
+            let (mut pm, _dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, true); // intent ON
+            pm.set_bootstrap_querier_for_test(querier);
+            let mut cfg = test_config();
+            cfg.server.server = "proxy.example".into();
+            cfg.server.server_port = closed.port();
+            cfg.server.plugin = Some("ex-ray".into());
+            cfg.server.plugin_opts = Some(ECH_CAPABLE_OPTS.into());
+            cfg.dns.enabled = true; // forces the self-test gate to fail every attempt
+            cfg.dns.servers = vec![r];
+
+            // Attempt 1: lockdown ON -> Phase 0 engages, fails, retains
+            // `lockdown_pending` with pin: Answered(r).
+            let _ = pm.start_cancellable(&cfg, true, CancellationToken::new()).await;
+            assert!(pm.lockdown_active(), "sanity: attempt 1 retains the Phase-0 guard");
+
+            // Turn lockdown OFF and drop r from dns.servers -- attempt 2's
+            // local pin revalidates to ResolverDeselected.
+            pm.set_lockdown_intent(false).unwrap();
+            cfg.dns.servers = Vec::new();
+            let _ = pm.start_cancellable(&cfg, true, CancellationToken::new()).await;
+
+            assert_eq!(
+                pm.blocked.as_ref().map(|b| b.pin),
+                Some(crate::dns::ech::PinSource::Answered(r)),
+                "the lockdown_pending -> blocked handoff must store the ORIGINAL pin, not the revalidated one"
             );
         });
     }

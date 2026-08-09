@@ -627,29 +627,34 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
 
         // A DIFFERENT server's hostname needs a FRESH DoH resolution — not
         // guaranteed to land on the resolver already baked into the held cover
-        // (see `BlockedStart`'s doc) — so a start for a different server must
-        // release the held cover BEFORE resolving. Applies to BOTH the
-        // transient (`blocked`) and standing (`lockdown_pending`) covers —
-        // either can be the one actually held, depending on lockdown intent.
+        // (see `BlockedStart`'s doc) — so a same-host cache reuse below is
+        // gated on host equality for both covers.
+        //
+        // The TRANSIENT cover releases eagerly on host mismatch (below) --
+        // sound for it specifically, because every path that reaches its
+        // engage block re-derives fresh from `self.blocked.is_none()`
+        // regardless of `covered`, and a manual (uncovered) start simply
+        // proceeds fail-open by design (an already-established, deliberate
+        // convention for this cover). The STANDING cover does NOT get the
+        // same eager release: a manual start under armed lockdown intent
+        // must NOT open the host (see the `!lockdown_on` release above,
+        // which fixed exactly this for the intent-unchanged case) --
+        // eagerly releasing `lockdown_pending` here on host drift would
+        // reopen that identical fail-open for the host-changed case, with
+        // no `lockdown_applies` gate and no guaranteed re-engage on every
+        // exit path (a resolve failure below returns early with the guard
+        // already gone). Host drift for the standing cover is instead
+        // routed through the ordinary staleness/repair check below,
+        // alongside `server_ip`/`resolver_permit`/`app_ids` — see the
+        // `stale` check's `p.host != config.server.server` term.
         let stale = self.blocked.as_ref().is_some_and(|b| b.host != config.server.server);
         if stale {
             debug_assert!(self.blocked.is_some(), "stale implies a held cover");
             self.blocked.take();
             warn!("start for a different server while blocked: releasing the held cover before re-resolving");
         }
-        let lockdown_pending_host_stale = self
-            .lockdown_pending
-            .as_ref()
-            .is_some_and(|p| p.host != config.server.server);
-        if lockdown_pending_host_stale {
-            self.lockdown_pending.take();
-            warn!(
-                "start for a different server while the standing cover's early guard is held: \
-                 releasing it before re-resolving"
-            );
-        }
 
-        // Resolve the server IP over private DoH. A same-server retry under
+        // Resolve the server IP over private DoH. A same-HOST retry under
         // EITHER held cover reuses the cached IP and pin — critically, this
         // means the resolution itself does NOT need to dial out under a
         // standing cover that may not yet (or may no longer) permit any
@@ -657,16 +662,34 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         // configured (so the standing cover permits no resolver at all)
         // would re-resolve via DoH on every attempt, dial into its own
         // block-all, and fail identically forever -- one step earlier than
-        // the ECH-config fetch this cover exists to unblock.
-        let (server_ip, pin) = match self
-            .blocked
-            .as_ref()
-            .map(|b| (b.server_ip, b.pin))
-            .or_else(|| self.lockdown_pending.as_ref().map(|p| (p.server_ip, p.pin)))
-        {
-            Some((server_ip, pin)) => (server_ip, crate::dns::ech::revalidate(pin, &config.dns.servers)),
+        // the ECH-config fetch this cover exists to unblock. `blocked`'s
+        // arm needs no host filter (its own eager release above already
+        // guarantees a host match whenever it's `Some`); `lockdown_pending`'s
+        // does, since it is no longer eagerly released on host drift.
+        //
+        // `raw_pin` is the value BEFORE `revalidate` -- carried alongside the
+        // already-revalidated `pin` so a FRESH engage below (e.g. a
+        // `blocked` -> `lockdown_pending` handoff, where the guard that
+        // cached this value was `blocked`, not `lockdown_pending`) can store
+        // the un-downgraded value, mirroring the repair arm's `held.pin` and
+        // `repair_fallback`'s `original_pin` for the identical reason:
+        // `revalidate` only ever downgrades (`Answered` -> `ResolverDeselected`),
+        // so storing the revalidated value in a cross-attempt cache would
+        // make that loss permanent even once the original resolver returns
+        // to `dns.servers`.
+        let (server_ip, raw_pin, pin) = match self.blocked.as_ref().map(|b| (b.server_ip, b.pin)).or_else(|| {
+            self.lockdown_pending
+                .as_ref()
+                .filter(|p| p.host == config.server.server)
+                .map(|p| (p.server_ip, p.pin))
+        }) {
+            Some((server_ip, raw_pin)) => (
+                server_ip,
+                raw_pin,
+                crate::dns::ech::revalidate(raw_pin, &config.dns.servers),
+            ),
             None => match Self::resolve_server_ip(config, &bootstrap_querier, &cancel).await {
-                Ok(b) => (b.server_ip, b.via),
+                Ok(b) => (b.server_ip, b.via, b.via),
                 Err(e) => {
                     if !matches!(e, ProxyError::Cancelled) {
                         self.last_error = Some(e.to_string());
@@ -853,9 +876,14 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
                 // so persisting an already-downgraded value here would make
                 // that loss permanent, unrecoverable even once the original
                 // resolver returns to `dns.servers`. A fresh (non-repair)
-                // engage has no prior cover to preserve, so `pin` (fresh
-                // from resolve, or a first same-host reuse) is correct as-is.
-                let engaged_pin = repair_fallback.map_or(pin, |(_, original_pin)| original_pin);
+                // engage falls back to `raw_pin` (pre-`revalidate`), not the
+                // local `pin`: a `lockdown_pending` -> `blocked` handoff
+                // (the guard that cached this value was `lockdown_pending`,
+                // not `blocked`) is a fresh engage HERE even though `pin`
+                // may already be revalidated-downgraded by the cache-reuse
+                // match above — the identical class of bug the repair arm
+                // guards against, just crossing covers instead of retries.
+                let engaged_pin = repair_fallback.map_or(raw_pin, |(_, original_pin)| original_pin);
                 match self.routing.install_failclosed_cover(server_ip, ech_resolver_permit) {
                     Ok(cover) => {
                         self.blocked = Some(BlockedStart {
@@ -951,8 +979,23 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         if lockdown_applies {
             let app_ids = lockdown_app_ids(config);
             let stale = self.lockdown_pending.as_ref().is_some_and(|p| {
-                p.server_ip != server_ip || p.resolver_permit != ech_resolver_permit || p.app_ids != app_ids
+                p.host != config.server.server || p.resolver_permit != ech_resolver_permit || p.app_ids != app_ids
             });
+            // `p.server_ip != server_ip` is NOT part of the OR above: it can
+            // never independently make `stale` true. Whenever `p.host ==
+            // config.server.server`, the cache-reuse match sets `server_ip`
+            // FROM `p.server_ip` (same value, by construction); whenever
+            // `p.host != config.server.server`, `stale` is already true via
+            // the host term. Assert the invariant instead of leaving a dead
+            // OR-term a future reader could mistake for a live guard against
+            // same-host server-IP drift (there is no such case: a same-host
+            // retry always reuses the cached IP, never re-resolves it).
+            debug_assert!(
+                self.lockdown_pending
+                    .as_ref()
+                    .is_none_or(|p| p.host != config.server.server || p.server_ip == server_ip),
+                "same-host lockdown_pending must always carry the SAME server_ip this attempt derived"
+            );
             if stale {
                 // Repair, not release-then-fresh-engage: `reengage_lockdown_permits`
                 // consumes the HELD guard directly (checked delete + strict
@@ -975,9 +1018,10 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
                 let held = self.lockdown_pending.take().expect("stale is only true when Some");
                 let engaged_pin = held.pin;
                 warn!(
-                    "lockdown retry: this attempt's server, resolver permit, or app_ids differs from the held \
-                     early cover's; repairing it in place -- egress stays covered by the OLD values until the \
-                     corrected cover replaces them, or the start aborts (fail-FATAL) if the repair itself fails"
+                    "lockdown retry: this attempt's host, server, resolver permit, or app_ids differs from the \
+                     held early cover's; repairing it in place -- egress stays covered by the OLD values until \
+                     the corrected cover replaces them, or the start aborts (fail-FATAL) if the repair itself \
+                     fails"
                 );
                 match self
                     .routing
@@ -1023,6 +1067,13 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
                 // tolerant re-add IS correct here: an Adopt-continuation can
                 // legitimately see already-present floor filters
                 // (loopback/block-all/App-ID) it does not need to update.
+                // Stores `raw_pin` (pre-`revalidate`), not the local `pin` --
+                // a `blocked` -> `lockdown_pending` handoff (the guard that
+                // cached this value was `blocked`, not `lockdown_pending`)
+                // is a FRESH engage here, and `pin` may already be
+                // downgraded by the cache-reuse match above; see `raw_pin`'s
+                // own doc for why persisting that downgrade would be
+                // permanent.
                 match self
                     .routing
                     .install_lockdown_permits(server_ip, ech_resolver_permit, &app_ids)
@@ -1032,7 +1083,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
                             cover,
                             host: config.server.server.clone(),
                             server_ip,
-                            pin,
+                            pin: raw_pin,
                             resolver_permit: ech_resolver_permit,
                             app_ids: app_ids.clone(),
                         });

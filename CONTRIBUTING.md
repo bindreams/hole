@@ -637,12 +637,24 @@ it exactly like `blocked` when a covered start left it engaged but never
 reached `running`. On success, `start_cancellable` moves the guard from
 `lockdown_pending` into `RunningState.lockdown`.
 
-**A retry whose server, resolver permit, or `app_ids` DRIFTS is a REPAIR, not
-a release-then-fresh-engage.** `app_ids` (`lockdown_app_ids(config)`, baked
-into the live cover as Windows App-ID permits) is compared alongside
-`server_ip`/`resolver_permit` in `LockdownPending`'s staleness check because
-it drifts independently of both: a retry that only changes
-`config.server.plugin` (e.g. switching plugin binaries) leaves the other two
+**A retry whose HOST, server, resolver permit, or `app_ids` DRIFTS is a
+REPAIR, not a release-then-fresh-engage.** All four dimensions route through
+the SAME checked repair — including a DIFFERENT host, which earlier engaged
+via a bare, unconditional `take()`/drop before `server_ip` was even
+resolved: sound for the transient cover (every path that reaches its own
+engage block re-derives fresh regardless of `covered`, and a manual start
+proceeds fail-open by design, an established convention for that cover), but
+NOT for the standing one — a manual start under armed lockdown intent must
+never open the host (the same invariant the `!lockdown_on`-keyed release
+above protects), and the eager release had no `lockdown_applies` gate and no
+guaranteed re-engage on every exit path. `host` is folded into
+`LockdownPending`'s staleness check instead; the cache-reuse match gates a
+same-host hit on `p.host == config.server.server`, so `p.server_ip != server_ip` can never independently make `stale` true (asserted, not checked
+live — see the `debug_assert!` beside it). `app_ids`
+(`lockdown_app_ids(config)`, baked into the live cover as Windows App-ID
+permits) is compared alongside `host`/`server_ip`/`resolver_permit` because
+it drifts independently of all three: a retry that only changes
+`config.server.plugin` (e.g. switching plugin binaries) leaves the others
 unchanged, and reusing the held guard in that case would leave the OLD
 plugin's unrestricted-egress App-ID permit (no address/port scoping) live
 while the new plugin never gets one. On drift, `Routing::reengage_lockdown_permits`
@@ -681,11 +693,29 @@ leaving `lockdown_pending` `None`) would orphan a live, correct standing
 cover with nothing left to eventually disengage it — a leak that would only
 resolve on the next bridge restart's crash-recovery sweep.
 
-The re-engage (repair OR fresh) stores the RELEASED guard's own `pin`
-(captured before the `take()`), not this attempt's locally `revalidate`d
-one: `revalidate` only ever downgrades (`Answered` → `ResolverDeselected`),
-so persisting the downgraded local value would make that loss permanent
-even once the original resolver returns to `dns.servers`.
+The re-engage (repair OR fresh) stores a PRE-`revalidate` pin, not this
+attempt's locally `revalidate`d one: `revalidate` only ever downgrades
+(`Answered` → `ResolverDeselected`), so persisting the downgraded local
+value would make that loss permanent even once the original resolver
+returns to `dns.servers`. A repair stores the RELEASED guard's own `pin`
+(captured before the `take()`); a fresh engage stores `raw_pin` — the
+cache-reuse match's own pre-`revalidate` value, returned alongside the
+already-revalidated `pin` specifically so a CROSS-COVER handoff (`blocked`
+→ `lockdown_pending` when lockdown turns on mid-blocked-state, or the
+reverse when it turns off) doesn't downgrade permanently either: the guard
+that cached the value is not the one about to (re)engage, so there is no
+`held`/`repair_fallback` local to read it from — only the shared match's
+`raw_pin`.
+
+On macOS, `reconcile_pf_enabled` — factored out of `engage_lockdown`'s own
+`ReuseToken`/`Reenable` handling — runs before EVERY reload that assumes an
+already-persisted token: `engage_lockdown_tun` (Phase 6) and
+`reengage_lockdown` (the repair) both call it first. `pfctl -f -` into a
+DISABLED pf exits 0 while enforcing nothing, so skipping this check (as
+these two calls originally did) reports a connected, armed session as
+covered while pf enforces nothing at all — the identical fail-open
+`engage_lockdown`'s own inline reconciliation was written to close, just
+reopened on the two call sites that came later and never inherited it.
 
 Full mode completes both phases: Phase 0 here, Phase 6 (the TUN permit) in
 `start_inner`. SocksOnly's `start_inner` returns before Phase 6 ever runs —

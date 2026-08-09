@@ -466,6 +466,75 @@ fn live_tun_v4_condition_luid() -> u64 {
     }
 }
 
+/// Windows real-engage verification of `reengage_lockdown` (the checked
+/// delete + strict re-add drift-repair path, as opposed to
+/// `windows_lockdown_permits_tun_retry_replaces_the_stale_luid_condition`
+/// above, which only exercises `engage_lockdown_tun`'s Phase-6 TUN pair):
+/// engages the real cover with `RESOLVER` permitted, repairs it to a
+/// DIFFERENT address (`NON_PERMITTED`'s IP -- its role here is just "some
+/// other routable address", not "must stay blocked"), and proves the OLD
+/// resolver is no longer permitted while the NEW one is -- a real
+/// REPLACEMENT, not just an addition, against the live WFP engine (the
+/// mocked orchestration test in `crates/bridge/src/proxy_manager_tests.rs`
+/// can prove the CALLER routes a repair correctly, but not that the real
+/// transactional discipline actually replaces a live permit).
+#[cfg(target_os = "windows")]
+#[skuld::test(labels = [TUN], serial = TUN)]
+fn windows_lockdown_permits_reengage_replaces_the_stale_resolver_permit() {
+    use std::net::TcpStream;
+    use std::time::Duration;
+
+    let dir = tempfile::tempdir().unwrap();
+    let resolver = SystemLuidResolver;
+    let server_ip: std::net::IpAddr = "1.1.1.1".parse().unwrap();
+    let old_resolver_ip: std::net::IpAddr = resolver_permit_ip();
+    let new_resolver_ip: std::net::IpAddr = NON_PERMITTED.parse::<std::net::SocketAddr>().unwrap().ip();
+
+    let connect = |addr: std::net::IpAddr| TcpStream::connect_timeout(&(addr, 443).into(), Duration::from_secs(5));
+
+    let cover = engage_lockdown(server_ip, Some(old_resolver_ip), None, &resolver, &[], dir.path(), None)
+        .expect("engage the real WFP lockdown cover's Phase-0 permits");
+
+    let (o, n) = (connect(old_resolver_ip), connect(new_resolver_ip));
+    assert!(
+        o.is_ok(),
+        "sanity: the OLD resolver must be permitted right after the first engage: {old_resolver_ip}={:?}",
+        o.err().map(|e| e.kind())
+    );
+    assert!(
+        n.is_err(),
+        "sanity: the address this test will repair TO must NOT be permitted yet: {new_resolver_ip} connected"
+    );
+
+    // Repair: drift the resolver permit to a DIFFERENT address, server_ip
+    // unchanged.
+    let cover = reengage_lockdown(cover, server_ip, Some(new_resolver_ip), &[], dir.path(), None)
+        .unwrap_or_else(|(e, _)| panic!("reengage_lockdown must repair the resolver permit: {e}"));
+
+    let (o2, n2) = (connect(old_resolver_ip), connect(new_resolver_ip));
+    assert!(
+        o2.is_err(),
+        "the OLD resolver's permit must be GONE after reengage_lockdown -- finding it still reachable would \
+         mean the repair replaced nothing: {old_resolver_ip}={o2:?}"
+    );
+    assert!(
+        n2.is_ok(),
+        "the NEW resolver must be permitted after reengage_lockdown: {new_resolver_ip}={:?}",
+        n2.err().map(|e| e.kind())
+    );
+
+    // The repaired `Cover` still owns the whole standing cover: dropping it
+    // restores egress fully, proving `reengage_lockdown` never created a
+    // second, un-owned guard.
+    drop(cover);
+    let ro = connect(old_resolver_ip);
+    assert!(
+        ro.is_ok(),
+        "disengage must restore egress even to the pre-repair address: {old_resolver_ip}={:?}",
+        ro.err().map(|e| e.kind())
+    );
+}
+
 /// macOS real-engage verification. Engages the REAL pf lockdown cover (an
 /// authoritative main-ruleset replace: `block drop out quick all` with earlier
 /// `quick` permits for loopback, the TUN, and the server IP — no anchor, so
@@ -755,6 +824,85 @@ fn macos_lockdown_permits_phase_0_then_phase_6_share_one_cover() {
         "disengage must restore egress: {NON_PERMITTED}={:?} {RESOLVER_OTHER_PORT}={:?}",
         rn.err().map(|e| e.kind()),
         rpo.err().map(|e| e.kind()),
+    );
+}
+
+/// macOS real-engage verification of `reengage_lockdown` (the DEDICATED
+/// pf-reload drift-repair path -- deliberately not `engage_lockdown` itself,
+/// whose own load-failure branch would wrongly disengage a still-live
+/// cover): engages the real cover with `RESOLVER` permitted, repairs it to a
+/// DIFFERENT address (`NON_PERMITTED`'s IP -- its role here is just "some
+/// other routable address", not "must stay blocked"), and proves the OLD
+/// resolver is no longer permitted while the NEW one is -- a real
+/// REPLACEMENT against the live pf ruleset, and (via `pfctl -sr`) that the
+/// reload actually reused the SAME persisted token (no double `-E`).
+#[cfg(target_os = "macos")]
+#[skuld::test(labels = [TUN], serial = TUN)]
+fn macos_lockdown_permits_reengage_replaces_the_stale_resolver_permit() {
+    use std::net::TcpStream;
+    use std::process::Command;
+    use std::time::Duration;
+
+    let dir = tempfile::tempdir().unwrap();
+    let resolver = SystemLuidResolver;
+    let server_ip: std::net::IpAddr = "1.1.1.1".parse().unwrap();
+    let old_resolver_ip: std::net::IpAddr = resolver_permit_ip();
+    let new_resolver_ip: std::net::IpAddr = NON_PERMITTED.parse::<std::net::SocketAddr>().unwrap().ip();
+
+    let connect = |addr: std::net::IpAddr| TcpStream::connect_timeout(&(addr, 443).into(), Duration::from_secs(5));
+
+    let cover = engage_lockdown(server_ip, Some(old_resolver_ip), None, &resolver, &[], dir.path(), None)
+        .expect("engage the real pf lockdown cover's Phase-0 permits");
+
+    let (o, n) = (connect(old_resolver_ip), connect(new_resolver_ip));
+    assert!(
+        o.is_ok(),
+        "sanity: the OLD resolver must be permitted right after the first engage: {old_resolver_ip}={:?}",
+        o.err().map(|e| e.kind())
+    );
+    assert!(
+        n.is_err(),
+        "sanity: the address this test will repair TO must NOT be permitted yet: {new_resolver_ip} connected"
+    );
+
+    // Repair: drift the resolver permit to a DIFFERENT address, server_ip
+    // unchanged.
+    let cover = reengage_lockdown(cover, server_ip, Some(new_resolver_ip), &[], dir.path(), None)
+        .unwrap_or_else(|(e, _)| panic!("reengage_lockdown must repair the resolver permit: {e}"));
+
+    let rules = Command::new("pfctl").args(["-sr"]).output().unwrap();
+    let rules = String::from_utf8_lossy(&rules.stdout);
+    assert!(
+        rules.contains(&new_resolver_ip.to_string()),
+        "live ruleset must carry the NEW resolver permit after reengage_lockdown:\n{rules}"
+    );
+    assert!(
+        !rules.contains(&old_resolver_ip.to_string()),
+        "live ruleset must NOT still carry the OLD resolver permit after reengage_lockdown -- a stale entry \
+         here means the repair replaced nothing:\n{rules}"
+    );
+
+    let (o2, n2) = (connect(old_resolver_ip), connect(new_resolver_ip));
+    assert!(
+        o2.is_err(),
+        "the OLD resolver's permit must be GONE after reengage_lockdown -- finding it still reachable would \
+         mean the repair replaced nothing: {old_resolver_ip}={o2:?}"
+    );
+    assert!(
+        n2.is_ok(),
+        "the NEW resolver must be permitted after reengage_lockdown: {new_resolver_ip}={:?}",
+        n2.err().map(|e| e.kind())
+    );
+
+    // The repaired `Cover` still owns the whole standing cover: dropping it
+    // restores egress fully, proving `reengage_lockdown` never created a
+    // second, un-owned guard.
+    drop(cover);
+    let ro = connect(old_resolver_ip);
+    assert!(
+        ro.is_ok(),
+        "disengage must restore egress even to the pre-repair address: {old_resolver_ip}={:?}",
+        ro.err().map(|e| e.kind())
     );
 }
 

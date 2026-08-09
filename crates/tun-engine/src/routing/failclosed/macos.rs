@@ -356,6 +356,55 @@ fn capture_and_persist(token: &str, state_dir: &Path, owner: Option<(u32, u32)>)
     Ok(nat_snapshot)
 }
 
+/// Reconcile pf's enabled state against an ALREADY-PERSISTED lockdown token,
+/// for a caller that never takes `FreshEnable` (Phase-6 TUN-add, or a Phase-0
+/// repair — an absent state file is already a hard error for both, checked
+/// before this runs). `pfctl -f -` into a DISABLED pf exits 0 while enforcing
+/// nothing (`engage_pf_action`'s own doc: "always load the ruleset into an
+/// ENABLED pf, never an inert one") — this is the SAME reconciliation
+/// [`engage_lockdown`] performs for its own `ReuseToken`/`Reenable` arms,
+/// factored out here so a TUN-add or a repair reload cannot load straight
+/// into whatever pf's live state happens to be, with no check.
+///
+/// Returns the token to load the ruleset with: reused unchanged, or freshly
+/// re-enabled and re-persisted under the SAME host snapshot if pf had been
+/// disabled since the state file was written.
+fn reconcile_pf_enabled(
+    persisted: &lockdown_state::LockdownPfState,
+    state_dir: &Path,
+    owner: Option<(u32, u32)>,
+) -> Result<String, RoutingError> {
+    let info = pfctl(&["-s", "info"], None, PHASE_COVER)?;
+    let pf_enabled = parse_pf_enabled(&String::from_utf8_lossy(&info.stdout));
+    match engage_pf_action(pf_enabled, true) {
+        PfEngageAction::ReuseToken => Ok(persisted.pf_token.clone()),
+        PfEngageAction::Reenable => {
+            let token = enable_pf_capture_token()?;
+            let fresh = lockdown_state::LockdownPfState {
+                version: lockdown_state::SCHEMA_VERSION,
+                pf_token: token.clone(),
+                main_snapshot: persisted.main_snapshot.clone(),
+                nat_snapshot: persisted.nat_snapshot.clone(),
+            };
+            if let Err(e) = lockdown_state::save(state_dir, &fresh, owner) {
+                if let Err(xe) = pfctl(&["-X", &token], None, PHASE_COVER) {
+                    tracing::warn!(error = %xe, "pfctl -X failed unwinding a failed lockdown re-enable");
+                }
+                return Err(RoutingError::RouteSetup(format!(
+                    "failed to re-persist lockdown-pf-state: {e}"
+                )));
+            }
+            Ok(token)
+        }
+        // `has_persisted=true` (a `&LockdownPfState` was passed in) forces
+        // `engage_pf_action`'s match into ReuseToken or Reenable -- see its
+        // own `(false, _) => FreshEnable` arm, unreachable with `true` fixed.
+        PfEngageAction::FreshEnable => {
+            unreachable!("reconcile_pf_enabled is only ever called with a persisted state already in hand")
+        }
+    }
+}
+
 /// Engage the standing lockdown cover. Persist-before-mutate, no `-Fa`. Engage
 /// idempotently ENSURES pf is enabled (`engage_pf_action` on the `pfctl -s info`
 /// read) so the ruleset never loads into a disabled, INERT pf. The three cases
@@ -377,46 +426,16 @@ pub fn engage_lockdown(
     state_dir: &Path,
     owner: Option<(u32, u32)>,
 ) -> Result<Cover, RoutingError> {
-    // The `pfctl -s info` read is decision-only — `LockdownPfState` records no
-    // `pf_was_enabled` bit (unlike the transient `FailClosedState`).
-    let info = pfctl(&["-s", "info"], None, PHASE_COVER)?;
-    let pf_enabled = parse_pf_enabled(&String::from_utf8_lossy(&info.stdout));
     let persisted = lockdown_state::load(state_dir);
 
-    let (token, nat_snapshot) = match engage_pf_action(pf_enabled, persisted.is_some()) {
-        // Live Adopt re-engage within one boot: pf still enabled and we hold the
-        // token+snapshot. Reuse both so the real host policy is preserved for the
-        // eventual restore. ReuseToken assumes our refcount is still live (the
-        // reboot case is `Reenable`); do not double `-E`.
-        PfEngageAction::ReuseToken => {
-            let st = persisted.expect("ReuseToken implies persisted state");
-            (st.pf_token, st.nat_snapshot)
-        }
-        // Persisted state survived but pf was disabled (reboot reset pf and its
-        // refcount). Enable afresh and re-persist the SAME host snapshot under the
-        // fresh token — never re-snapshot the live lockdown ruleset. The single
-        // `pfctl -X <fresh-token>` on disengage matches this single `-E`.
-        PfEngageAction::Reenable => {
-            let st = persisted.expect("Reenable implies persisted state");
-            let token = enable_pf_capture_token()?;
-            let fresh = lockdown_state::LockdownPfState {
-                version: lockdown_state::SCHEMA_VERSION,
-                pf_token: token.clone(),
-                main_snapshot: st.main_snapshot,
-                nat_snapshot: st.nat_snapshot.clone(),
-            };
-            if let Err(e) = lockdown_state::save(state_dir, &fresh, owner) {
-                if let Err(xe) = pfctl(&["-X", &token], None, PHASE_COVER) {
-                    tracing::warn!(error = %xe, "pfctl -X failed unwinding a failed lockdown re-enable");
-                }
-                return Err(RoutingError::RouteSetup(format!(
-                    "failed to re-persist lockdown-pf-state: {e}"
-                )));
-            }
-            (token, st.nat_snapshot)
-        }
+    let (token, nat_snapshot) = match &persisted {
+        // Live Adopt re-engage, or a repair/TUN-add on an already-engaged
+        // session: reconcile pf's enabled state against the persisted token
+        // (reused unchanged if pf is still enabled, or freshly re-enabled
+        // and re-persisted if a reboot reset it) — see `reconcile_pf_enabled`.
+        Some(st) => (reconcile_pf_enabled(st, state_dir, owner)?, st.nat_snapshot.clone()),
         // First engage: enable + snapshot the host.
-        PfEngageAction::FreshEnable => {
+        None => {
             let token = enable_pf_capture_token()?;
             // The refcount is now held. Capture + persist may fail, so undo the
             // `-E` on any error before propagating — else the refcount leaks with
@@ -468,17 +487,30 @@ pub fn engage_lockdown(
 /// correct, just missing one permit — the exact mistake `engage_lockdown`'s
 /// own restore-on-failure is right to make for a FIRST-EVER engage (nothing
 /// was live yet), but wrong for this add-on-top call.
+///
+/// Reconciles pf's enabled state via [`reconcile_pf_enabled`] before the
+/// reload — `pfctl -f -` into a DISABLED pf exits 0 while enforcing nothing,
+/// so skipping this would report a connected session as covered while pf
+/// enforces nothing at all.
 pub fn engage_lockdown_tun(
     tun_name: &str,
     server_ip: IpAddr,
     resolver_ip: Option<IpAddr>,
     state_dir: &Path,
+    owner: Option<(u32, u32)>,
 ) -> Result<(), RoutingError> {
     let persisted = lockdown_state::load(state_dir).ok_or_else(|| {
         RoutingError::RouteSetup(
             "engage_lockdown_tun: no lockdown state on disk -- called before the Phase-0 engage".into(),
         )
     })?;
+    // `reconcile_pf_enabled`'s return value (the token) is not needed here —
+    // Phase 0's `Cover` already carries whichever token this call's own
+    // reconciliation may have refreshed (both write to the SAME state file,
+    // read by any later `disengage_lockdown`/Drop, which reload it instead
+    // of trusting an in-memory copy) — calling it purely for the "ensure pf
+    // is enabled before this load" side effect.
+    reconcile_pf_enabled(&persisted, state_dir, owner)?;
     let main = build_lockdown_main_ruleset(Some(tun_name), server_ip, resolver_ip, &persisted.nat_snapshot);
     let out = pfctl(&["-f", "-"], Some(main.as_bytes()), PHASE_COVER)?;
     if !out.status.success() {
@@ -514,6 +546,7 @@ pub fn reengage_lockdown(
     old: Cover,
     server_ip: IpAddr,
     resolver_ip: Option<IpAddr>,
+    owner: Option<(u32, u32)>,
 ) -> Result<Cover, (RoutingError, Cover)> {
     debug_assert_eq!(
         old.kind,
@@ -528,6 +561,16 @@ pub fn reengage_lockdown(
             old,
         ));
     };
+    // Reconcile pf's enabled state BEFORE the reload, same as
+    // `engage_lockdown_tun` -- see `reconcile_pf_enabled`'s doc. Its return
+    // value (the token) is not needed here for the same reason: it already
+    // wrote any refreshed token to the state file, which `lockdown_disengage`
+    // and every later reconciliation read fresh from disk, never from a
+    // `Cover.token` field (this cover's own `token` field is unused for the
+    // Lockdown kind — see `Drop`).
+    if let Err(e) = reconcile_pf_enabled(&persisted, &old.state_dir, owner) {
+        return Err((e, old));
+    }
     let main = build_lockdown_main_ruleset(None, server_ip, resolver_ip, &persisted.nat_snapshot);
     let out = match pfctl(&["-f", "-"], Some(main.as_bytes()), PHASE_COVER) {
         Ok(o) => o,

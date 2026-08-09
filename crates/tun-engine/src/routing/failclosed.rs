@@ -175,8 +175,8 @@ pub fn reengage_lockdown(
     }
     #[cfg(target_os = "macos")]
     {
-        let _ = (app_ids, owner, state_dir);
-        match platform::reengage_lockdown(old._inner, server_ip, resolver_ip) {
+        let _ = (app_ids, state_dir);
+        match platform::reengage_lockdown(old._inner, server_ip, resolver_ip, owner) {
             Ok(inner) => Ok(Cover { _inner: inner }),
             Err((e, inner)) => Err((e, Cover { _inner: inner })),
         }
@@ -203,8 +203,8 @@ pub fn engage_lockdown_tun(
     }
     #[cfg(target_os = "macos")]
     {
-        let _ = (resolver, owner);
-        platform::engage_lockdown_tun(tun_name, server_ip, resolver_ip, state_dir)
+        let _ = resolver;
+        platform::engage_lockdown_tun(tun_name, server_ip, resolver_ip, state_dir, owner)
     }
 }
 
