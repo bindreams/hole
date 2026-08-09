@@ -417,8 +417,14 @@ fn reconcile_pf_enabled(
 /// Then load the self-contained main ruleset via `pfctl -f -` (NO `-Fa`), so the
 /// block takes effect while host translation is carried forward.
 ///
-/// On load failure the host is restored (`lockdown_disengage`) and Err returned;
-/// the bridge's fail-FATAL caller aborts the start.
+/// On load failure Err is always returned (the bridge's fail-FATAL caller
+/// aborts the start), but the host is only actively restored
+/// (`lockdown_disengage`) for a FIRST-ever engage (`persisted` was `None`):
+/// `pfctl -f -`'s atomicity means a rejected reload over an ALREADY-LIVE
+/// cover (Adopt re-engage) leaves that previously-loaded ruleset unchanged
+/// and still fully enforced, so disengaging here would destroy a cover that
+/// is still live and correct — the same disposition
+/// [`engage_lockdown_tun`] uses for its own reload failure.
 pub fn engage_lockdown(
     server_ip: IpAddr,
     resolver_ip: Option<IpAddr>,
@@ -427,6 +433,12 @@ pub fn engage_lockdown(
     owner: Option<(u32, u32)>,
 ) -> Result<Cover, RoutingError> {
     let persisted = lockdown_state::load(state_dir);
+    // Captured BEFORE the match below (which may itself persist a fresh
+    // token under `Some(st)` if `reconcile_pf_enabled` hits `Reenable`) --
+    // this must reflect whether a live, correct ruleset already existed
+    // when THIS call started, not whether one exists by the time the load
+    // below fails.
+    let is_first_engage = persisted.is_none();
 
     let (token, nat_snapshot) = match &persisted {
         // Live Adopt re-engage, or a repair/TUN-add on an already-engaged
@@ -455,9 +467,21 @@ pub fn engage_lockdown(
     let main = build_lockdown_main_ruleset(tun_name, server_ip, resolver_ip, &nat_snapshot);
     let out = pfctl(&["-f", "-"], Some(main.as_bytes()), PHASE_COVER)?;
     if !out.status.success() {
-        // Restore the host (snapshot reload + drop refcount) before failing, so
-        // a partially-loaded ruleset never strands the host.
-        lockdown_disengage(state_dir);
+        if is_first_engage {
+            // FIRST-ever engage: nothing was live before this call, so a
+            // partially-loaded ruleset would strand the host mid-lockdown.
+            // Restore the pre-lockdown host state (snapshot reload + drop
+            // refcount) before failing.
+            lockdown_disengage(state_dir);
+        }
+        // A re-engage over an ALREADY-LIVE cover (Adopt continuation, or a
+        // repeat call reusing `persisted`) must NOT call `lockdown_disengage`
+        // here: `pfctl -f -` is atomic, so this rejected reload left the
+        // PREVIOUSLY loaded ruleset (still fully enforced, still correct)
+        // untouched -- restoring the pre-lockdown snapshot would destroy a
+        // live, correct standing cover instead of merely failing this one
+        // call. Mirrors `engage_lockdown_tun`'s identical disposition for
+        // the same atomicity guarantee.
         return Err(RoutingError::RouteSetup(format!(
             "pfctl lockdown load failed: {}",
             String::from_utf8_lossy(&out.stderr).trim()

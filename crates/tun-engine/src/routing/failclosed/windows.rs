@@ -657,6 +657,36 @@ pub fn engage_lockdown(
     }
 }
 
+/// `FWP_E_FILTER_NOT_FOUND`, as the Win32 DWORD `FwpmFilterGetByKey0`
+/// returns for an absent filter.
+const FWP_E_FILTER_NOT_FOUND_DWORD: u32 = 0x8032_0003;
+
+/// Whether Phase 0's own loopback-permit filter (`LOCKDOWN_FILTER_GUIDS[0]`,
+/// installed unconditionally by `engage_lockdown` regardless of
+/// resolver/App-ID presence) is currently live in the FWPM engine.
+///
+/// Windows has no persisted marker file for "did Phase 0 run" the way
+/// macOS's `lockdown_pf_state::load(state_dir)` does — Windows Phase 0's
+/// state IS the live filters, keyed by fixed GUID — so this queries the
+/// engine directly instead of reading a file, mirroring the SAME
+/// precondition macOS's `engage_lockdown_tun` enforces before it will add
+/// the TUN permit.
+#[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
+unsafe fn phase_0_engaged(engine: HANDLE) -> Result<bool, RoutingError> {
+    let mut filter: *mut FWPM_FILTER0 = std::ptr::null_mut();
+    let code = unsafe { FwpmFilterGetByKey0(engine, &LOCKDOWN_FILTER_GUIDS[0], &mut filter) };
+    if code == ERROR_SUCCESS.0 {
+        unsafe { FwpmFreeMemory0(std::ptr::addr_of_mut!(filter).cast()) };
+        return Ok(true);
+    }
+    if code == FWP_E_FILTER_NOT_FOUND_DWORD {
+        return Ok(false);
+    }
+    Err(RoutingError::RouteSetup(format!(
+        "FwpmFilterGetByKey0 failed: 0x{code:08x}"
+    )))
+}
+
 /// Add ONLY the TUN-interface permit pair to an already-engaged standing
 /// lockdown cover (from [`engage_lockdown`] with `tun_luid: None`), once
 /// `routing.install` has resolved the adapter. Idempotent, and returns no
@@ -664,12 +694,16 @@ pub fn engage_lockdown(
 /// `Cover` the earlier `engage_lockdown` call already returned owns the
 /// WHOLE standing cover's disengage-on-drop (`swept_lockdown_guids`, TUN
 /// GUIDs included) regardless of whether this function was ever called, so
-/// there is nothing here for a new guard to uniquely own. Opens its own
-/// engine, adds the two filters in one transaction, and closes the engine
-/// immediately — unlike `engage_lockdown`, no handle is held past this call.
-/// Called exactly once per attempt's own guard (the guard does not persist
-/// across attempts — see CONTRIBUTING.md's "Lockdown mode"), so the fixed
-/// GUID key here is always genuinely fresh; a bare tolerant add is correct.
+/// there is nothing here for a new guard to uniquely own. Checks
+/// [`phase_0_engaged`] first — matching macOS's equivalent precondition
+/// check — so a call before Phase 0 fails loudly with a clear diagnostic
+/// instead of silently adding orphan TUN-permit filters with no floor. Opens
+/// its own engine, adds the two filters in one transaction, and closes the
+/// engine immediately — unlike `engage_lockdown`, no handle is held past
+/// this call. Called exactly once per attempt's own guard (the guard does
+/// not persist across attempts — see CONTRIBUTING.md's "Lockdown mode"), so
+/// the fixed GUID key here is always genuinely fresh; a bare tolerant add is
+/// correct.
 #[allow(clippy::disallowed_methods)] // THIS is the sanctioned FWPM call site
 pub fn engage_lockdown_tun(tun_luid: u64) -> Result<(), RoutingError> {
     let filters = [
@@ -691,6 +725,11 @@ pub fn engage_lockdown_tun(tun_luid: u64) -> Result<(), RoutingError> {
             "FwpmEngineOpen0",
         )?;
         let result = (|| -> Result<(), RoutingError> {
+            if !phase_0_engaged(engine)? {
+                return Err(RoutingError::RouteSetup(
+                    "engage_lockdown_tun: Phase-0 loopback permit not found -- called before the Phase-0 engage".into(),
+                ));
+            }
             wfp_check(FwpmTransactionBegin0(engine, 0), "FwpmTransactionBegin0")?;
             for f in &filters {
                 add_filter(engine, PROVIDER_GUID, SUBLAYER_GUID, f)?;

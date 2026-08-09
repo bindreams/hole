@@ -72,10 +72,8 @@ before editing; the sections linked below are the authoritative source.
   **transient** `install_failclosed_cover` permit loopback + server, plus the
   resolver Hole's own `ech-doh` URL names when it's the value ex-ray will
   actually dial — `effective_ech_doh == Holes`, not merely a plugin being
-  configured — scoped to TCP/443, by IP address on both platforms (not an
-  App-ID permit: a chained plugin like galoshes spawns its inner ex-ray as a
-  separate process an App-ID set never names). The transient cover is a
-  bounded-window RAII guard engaged by every covered (auto-connect) start
+  configured — scoped to TCP/443, by IP address on both platforms. The
+  transient cover is a bounded-window RAII guard engaged by every covered (auto-connect) start
   whose lockdown intent is OFF; a lockdown-on covered start uses the standing
   cover instead and releases any held transient one.
   Both are persistent WFP filters (Win) / self-contained pf ruleset (mac), swept

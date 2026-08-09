@@ -268,6 +268,19 @@ struct BlockedStart<C> {
     resolver_permit: Option<IpAddr>,
 }
 
+/// Whether the transient block-until-connected cover is live for this
+/// `start_inner` call. Wrapped (not a bare `bool`) solely so it cannot be
+/// positionally swapped with the adjacent, equally-`bool`-typed
+/// [`LockdownApplies`] parameter at the call site — the two select between
+/// mutually exclusive covers, so a silent swap would misroute which one a
+/// start attempt is actually protected by.
+struct BlockingEngaged(bool);
+
+/// Whether the standing lockdown cover's Phase 0 applies to this attempt —
+/// see [`BlockingEngaged`] for why this is a newtype rather than a bare
+/// `bool`.
+struct LockdownApplies(bool);
+
 impl<P: Proxy, R: Routing> ProxyManager<P, R, SystemDns> {
     pub fn new(proxy: P, routing: R) -> Self {
         Self::new_with_dns(proxy, routing, SystemDns::default())
@@ -742,6 +755,14 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
             );
         }
 
+        // Set when the branch below releases a still-good transient cover
+        // specifically because lockdown just turned on — so a Phase-0 engage
+        // failure a few lines below can disclose the COMPOUND failure (a
+        // cover that used to be live is now gone AND its replacement never
+        // engaged either), not just an ordinary Phase-0 failure with nothing
+        // lost.
+        let mut released_blocked_for_lockdown = false;
+
         if covered && !lockdown_applies {
             // The transient cover is a global singleton — never construct a second
             // over the same objects. An engage failure proceeds UNCOVERED (aborting
@@ -836,12 +857,13 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         } else if covered {
             // Covered retry after the user enabled lockdown mid-blocked-state:
             // release the held cover. This opens egress until the standing lockdown
-            // cover engages at routing.install — a brief, disclosed open window.
+            // cover's Phase-0 engage a few lines below — a brief, disclosed open window.
             if self.blocked.take().is_some() {
                 warn!(
                     "covered retry with lockdown newly enabled: releasing the held cover; the host is briefly \
-                     uncovered until the standing lockdown cover engages at connect"
+                     uncovered until the standing lockdown cover's Phase-0 engage below"
                 );
+                released_blocked_for_lockdown = true;
             }
         } else if self.blocked.take().is_some() {
             // Manual (uncovered) connect or reload-while-blocked: fail-open by
@@ -870,6 +892,13 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
             {
                 Ok(cover) => Some(cover),
                 Err(e) => {
+                    if released_blocked_for_lockdown {
+                        warn!(
+                            error = %e,
+                            "failed to engage the standing lockdown cover after releasing the held \
+                             transient cover for it; host NOT covered by either, proceeding open"
+                        );
+                    }
                     self.last_error = Some(e.to_string());
                     return Err(e.into());
                 }
@@ -949,8 +978,8 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
             server_ip,
             ech_doh,
             ech_resolver_permit,
-            blocking_engaged,
-            lockdown_applies,
+            BlockingEngaged(blocking_engaged),
+            LockdownApplies(lockdown_applies),
             self.state_dir.as_deref(),
             self.state_owner,
             plugin_path_override,
@@ -967,13 +996,10 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
                 // disengage; already None when lockdown subsumed it — the standing
                 // lockdown cover holds instead).
                 self.blocked = None;
-                // Move the Phase-0 standing-lockdown guard into the running
-                // session: `start_inner`'s Phase 6 already added the TUN
-                // permit to this SAME local guard in place
-                // (`Routing::engage_lockdown_tun`), so no second guard is
-                // ever created — this is the ONE `Cover` Phase 0 engaged,
-                // now owning the whole standing cover for as long as the
-                // session runs.
+                // Move the Phase-0 guard into the running session -- start_inner's
+                // Phase 6 already added the TUN permit to this SAME local guard
+                // in place (see start_inner's Phase-6 doc for why no second
+                // guard is ever created).
                 state.lockdown = lockdown_cover;
                 let server_ip = state.server_ip;
                 self.udp_proxy_available = state.udp_proxy_available;
@@ -1001,14 +1027,9 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
                 // only to protect a connection in flight, so there is no reason
                 // to keep it once the user has stopped trying to connect).
                 //
-                // `lockdown_cover` (if `Some`) is NOT moved here, so it drops
-                // via ordinary RAII at the end of this function -- opening
-                // the host for the duration of the gap until the next retry
-                // re-engages fresh. This is the accepted retry-window gap
-                // (#768; see the "Standing lockdown cover" comment above and
-                // CONTRIBUTING.md's "Lockdown mode"), not special-cased
-                // retention: a cancel and an ordinary failure below behave
-                // identically for the standing cover now.
+                // `lockdown_cover` (if `Some`) is NOT moved here -- it drops via ordinary
+                // RAII, same accepted retry-window gap as the "Standing lockdown
+                // cover" comment above (#768).
                 self.blocked = None;
                 info!("proxy start cancelled");
                 Err(ProxyError::Cancelled)
@@ -1052,6 +1073,10 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
     }
 
     /// Produce a [`RunningState`] without touching `self`.
+    ///
+    /// `start_inner` takes two adjacent, same-typed `bool` flags
+    /// (`blocking_engaged`, `lockdown_applies`) — see [`BlockingEngaged`] /
+    /// [`LockdownApplies`] for why they arrive wrapped.
     ///
     /// **Cooperative cancellation.** Each long-running phase
     /// observes the supplied `cancel` token and returns
@@ -1122,13 +1147,20 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         server_ip: IpAddr,
         ech_doh: Option<crate::dns::ech::EchDoh>,
         ech_resolver_permit: Option<IpAddr>,
-        blocking_engaged: bool,
-        lockdown_applies: bool,
+        blocking_engaged: BlockingEngaged,
+        lockdown_applies: LockdownApplies,
         state_dir: Option<&std::path::Path>,
         owner: Option<(u32, u32)>,
         plugin_path_override: Option<String>,
         cancel: CancellationToken,
     ) -> Result<RunningState<P, R, D>, ProxyError> {
+        // Unwrapped immediately into plain `bool` locals of the SAME names --
+        // the newtypes above exist only to make a positional swap of these
+        // two same-typed flags at the call site a compile error; the 200+
+        // lines below read `blocking_engaged`/`lockdown_applies` exactly as
+        // before.
+        let blocking_engaged = blocking_engaged.0;
+        let lockdown_applies = lockdown_applies.0;
         debug!("start_inner entered");
         // Pre-flight: short-circuit a pre-cancelled token before any work.
         if cancel.is_cancelled() {

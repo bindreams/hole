@@ -641,17 +641,13 @@ the standing cover now does too).
 
 This accepts a retry-window gap: a failed or cancelled attempt's guard
 disengages immediately, opening the host briefly until the NEXT retry's own
-Phase 0 re-engages fresh. An earlier iteration of this mechanism held the
-guard across attempts instead — a `lockdown_pending` field with a
-host/server_ip/resolver_permit/app_ids staleness comparison and an in-place
-repair path for a drifted permit — specifically to close this window; it was
-dropped as disproportionate to the risk it closed. The window is not new: an
-ordinary `main` connect using the single-phase, pre-two-phase-split
-`install_lockdown` call (called once, from inside `start_inner`, before this
-mechanism existed) has the identical gap on every failed or cancelled
-attempt, so retaining state only for the two-phase split would have spent
-real complexity protecting a window that predates this fix and was never in
-its scope. Tracked as [#768](https://github.com/bindreams/hole/issues/768).
+Phase 0 re-engages fresh. The window is not new: an ordinary `main` connect
+using the single-phase, pre-two-phase-split `install_lockdown` call (called
+once, from inside `start_inner`, before this mechanism existed) has the
+identical gap on every failed or cancelled attempt, so retaining state only
+for the two-phase split would have spent real complexity protecting a window
+that predates this fix and was never in its scope. Tracked as
+[#768](https://github.com/bindreams/hole/issues/768).
 
 On macOS, `reconcile_pf_enabled` — factored out of `engage_lockdown`'s own
 `ReuseToken`/`Reenable` handling — runs before `engage_lockdown_tun`'s

@@ -5,6 +5,7 @@
 
 use super::*;
 use crate::proxy::{Proxy, ProxyError, RunningProxy, TrafficTotals};
+use crate::test_support::skuld_fixtures::PORT_ALLOC;
 use hole_common::config::ServerEntry;
 use hole_common::protocol::ProxyConfig;
 use plugin_e2e::locators::locate_ex_ray;
@@ -176,10 +177,10 @@ struct MockRoutingState {
     /// Makes `engage_lockdown_tun` (Phase 6) fail.
     fail_lockdown: AtomicBool,
     fail_cover: AtomicBool,
-    /// Ordered record of lifecycle events ("routes" / "lockdown" teardown,
-    /// "cover_engage" transient-cover engage) so a test can observe
-    /// cross-call ordering — e.g. that a stale standing-cover guard releases
-    /// BEFORE the transient cover engages, not after. Shared via the
+    /// Ordered record of teardown events ("routes" from `MockRoutes::drop`,
+    /// "lockdown" from a standing-cover `MockCover::drop`) so a test can
+    /// observe cross-call teardown ordering — e.g. that routes tear down
+    /// before the standing cover disengages. Shared via the
     /// `Arc<MockRoutingState>` both `MockRoutes` and `MockCover` clone.
     teardown_order: std::sync::Mutex<Vec<&'static str>>,
     /// Last `server_ip` passed to `install`, so a test can assert the bypass
@@ -364,7 +365,6 @@ impl Routing for MockRouting {
         *self.state.last_cover_server_ip.lock().unwrap() = Some(server_ip);
         *self.state.last_cover_resolver_ip.lock().unwrap() = resolver_ip;
         self.state.cover_engage_calls.fetch_add(1, Ordering::SeqCst);
-        self.state.teardown_order.lock().unwrap().push("cover_engage");
         Ok(MockCover {
             state: Arc::clone(&self.state),
             lockdown: false,
@@ -1279,7 +1279,11 @@ fn stage_real_ex_ray() -> (tempfile::TempDir, String) {
     (dir, path)
 }
 
-#[skuld::test]
+// Real ex-ray subprocess via `start_plugin_chain` -- same async plugin-bind
+// TOCTOU as the `ssserver_*` fixtures (hole#304); both the label and the
+// serial gate are required (the label list does not propagate transitively
+// to an inline `start_plugin_chain` call -- see `PORT_ALLOC`'s docstring).
+#[skuld::test(labels = [PORT_ALLOC], serial = PORT_ALLOC)]
 fn lockdown_on_permits_the_gated_ech_resolver_for_a_real_plugin_chain() {
     // The resolver permit reaches the standing cover's
     // Phase-0 early engage (`install_lockdown_permits`) -- BEFORE Phase 1, so
@@ -1321,7 +1325,8 @@ fn lockdown_on_permits_the_gated_ech_resolver_for_a_real_plugin_chain() {
     });
 }
 
-#[skuld::test]
+// Real ex-ray subprocess -- see the PORT_ALLOC comment on the previous test.
+#[skuld::test(labels = [PORT_ALLOC], serial = PORT_ALLOC)]
 fn lockdown_on_permits_the_gated_ech_resolver_on_a_covered_start_too() {
     // `start_inner`'s own doc claims `ech_resolver_permit` is threaded through
     // unconditionally, not gated on `covered` -- the standing cover is armed
@@ -1355,7 +1360,8 @@ fn lockdown_on_permits_the_gated_ech_resolver_on_a_covered_start_too() {
     });
 }
 
-#[skuld::test]
+// Real ex-ray subprocess -- see the PORT_ALLOC comment above.
+#[skuld::test(labels = [PORT_ALLOC], serial = PORT_ALLOC)]
 fn lockdown_on_omits_the_resolver_permit_for_a_non_ech_capable_plugin() {
     // Negative direction with a REAL plugin chain (not just the pure gate
     // unit tests in plugin.rs): a plugin configured with no `tls`/`host` never
@@ -1398,7 +1404,8 @@ fn lockdown_on_omits_the_resolver_permit_for_a_non_ech_capable_plugin() {
     });
 }
 
-#[skuld::test]
+// Real ex-ray subprocess -- see the PORT_ALLOC comment above.
+#[skuld::test(labels = [PORT_ALLOC], serial = PORT_ALLOC)]
 fn lockdown_on_never_reaches_phase_6_when_the_self_test_fails() {
     // The standing lockdown cover's TUN
     // permit is still only installed at Phase 6 (`routing.install` /
