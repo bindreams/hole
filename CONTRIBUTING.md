@@ -666,6 +666,17 @@ no separate "restore to before this attempt" snapshot to fall back to — that
 would be exactly the identity-tracking machinery the simplification above
 dropped, applied one layer further out.
 
+On Windows specifically, `Ownership::Adopted` leaving the volatile TUN/
+server/resolver GUIDs untouched on Drop means a SECOND `Adopted` attempt in
+the SAME process (the first failed after Phase 0 without disengaging, so the
+cover is still `Adopted` for the retry too) can find those fixed-key filters
+already present when it re-engages. `add_filter`'s tolerant `ok_or_exists`
+would otherwise silently keep the FIRST attempt's stale values instead of
+the retry's own — so both `engage_lockdown` and `engage_lockdown_tun`
+delete the volatile GUIDs before re-adding them, every engage, not only in
+`recover_lockdown`'s one-time startup Adopt sweep. Idempotent (a "not
+found" delete is ignored) for `Fresh`, where they don't exist yet.
+
 Ownership is consulted ONLY by `Drop`, and is otherwise inert: no identity
 comparison (host/server/resolver/App-IDs), no staleness check, no repair
 path, no cross-attempt state. It answers exactly one question, asked once,

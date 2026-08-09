@@ -864,26 +864,12 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         }
         let blocking_engaged = self.blocked.is_some();
 
-        // Standing lockdown cover, Phase 0: engage fresh for THIS attempt
-        // only, held as a LOCAL variable -- no cross-attempt cache, no
-        // staleness comparison, no repair. Every attempt derives its own
-        // permits from its own config and engages exactly once; the guard
-        // is moved into `RunningState.lockdown` on success (after
-        // `mark_owned`, below), and otherwise drops via ordinary RAII on
-        // any early return (Err or Cancelled) below.
-        //
-        // That RAII drop is ownership-aware (`CoverGuard::mark_owned`'s
-        // doc): a `Fresh`-owned guard (this attempt created the cover from
-        // nothing) disengages, accepting a brief open window on every RETRY
-        // after a failed attempt -- the SAME gap `main` already has today
-        // for its own single-phase `install_lockdown` (pre-dating the
-        // Phase-0/Phase-6 split), not a new regression; tracked as #768. An
-        // `Adopted`-owned guard (Phase 0 found a standing cover already
-        // live, from a prior bridge process that crashed or cutover-
-        // restarted) does NOT disengage on that same drop -- ordinary RAII
-        // ownership means this attempt must not destroy a cover it did not
-        // create, even when a later phase fails. See CONTRIBUTING.md's
-        // "Lockdown mode" for both.
+        // Standing lockdown cover, Phase 0: engage fresh for THIS attempt only,
+        // held as a LOCAL variable -- no cross-attempt cache, no staleness
+        // comparison, no repair. Moved into `RunningState.lockdown` on success
+        // (after `mark_owned`, below); otherwise drops via ordinary
+        // ownership-aware RAII on any early return. See CONTRIBUTING.md's
+        // "Lockdown mode" > "Ownership" for the Fresh/Adopted rationale and #768.
         let mut lockdown_cover: Option<R::Cover> = if lockdown_applies {
             let app_ids = lockdown_app_ids(config, plugin_path_override.as_deref());
             match self
@@ -996,17 +982,9 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
                 // disengage; already None when lockdown subsumed it — the standing
                 // lockdown cover holds instead).
                 self.blocked = None;
-                // Mark the guard fully owned BEFORE moving it into the running
-                // session: Phase 0 may have found a standing cover already live
-                // (adopted from a prior bridge process) and, until now, its Drop
-                // deliberately would not have torn that ruleset down on a
-                // failure (ordinary RAII ownership -- see `CoverGuard::mark_owned`'s
-                // doc). Now that THIS attempt has actually succeeded, the running
-                // session is what the user sees as "connected" and disconnects
-                // from -- an explicit stop from here on must always be able to
-                // open the host, independent of the cover's provenance before
-                // this attempt started. A no-op for a guard that was already
-                // fully owned (the common case: a fresh engage, or lockdown off).
+                // Mark fully owned BEFORE moving into `RunningState.lockdown` --
+                // see `CoverGuard::mark_owned`'s doc. No-op if already Fresh
+                // (the common case).
                 if let Some(ref mut cover) = lockdown_cover {
                     cover.mark_owned();
                 }
@@ -1411,7 +1389,17 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
             // original self-test reason. This bridge already engaged its own
             // lockdown permits at Phase 0 (above), so by this gate `lockdown_applies`
             // reflects a genuinely live in-process cover, not just a pre-existing
-            // / adopted one.
+            // / adopted one. A THIRD term checking raw persisted intent (to also
+            // catch a still-live ADOPTED cover on a manual SocksOnly start, where
+            // `lockdown_applies` is false by design) is deliberately NOT added
+            // here: this whole Phase-4 gate is unreachable for `TunnelMode::SocksOnly`
+            // (that branch returns from `start_inner` earlier, before Phase 3/4 ever
+            // run — see the `if matches!(config.tunnel_mode, TunnelMode::SocksOnly)`
+            // branch above), and for `TunnelMode::Full` (the only mode that reaches
+            // here) `lockdown_applies` already reduces to exactly `lockdown_on`
+            // (`Full` alone satisfies the `(Full || covered)` term), so a third
+            // "raw intent" term would be a no-op duplicate of the second at every
+            // point this code can actually run.
             // The live in-process signal (this start's engaged block-until-
             // connected cover) OR the standing lockdown cover — either means
             // Hole's OWN cover would classify the probe's egress as blocked, so

@@ -646,39 +646,69 @@ pub fn engage_lockdown(
             FwpmEngineOpen0(PCWSTR::null(), RPC_C_AUTHN_WINNT, None, None, &mut engine),
             "FwpmEngineOpen0",
         )?;
-        // Ownership: was the floor (loopback permit) already live BEFORE this
-        // call touched anything? `Fresh` means this call created the cover
-        // from nothing; `Adopted` means it found one already live (a prior
+        // Ownership + transaction: the read and the mutation are one
+        // serialized BFE transaction, not check-then-act outside it -- same
+        // rationale as `engage_lockdown_tun`'s identical in-transaction
+        // probe (a concurrent `hole bridge unlock` deletes every lockdown
+        // GUID from any elevated process at any time, with no "only when no
+        // bridge is alive" enforcement, so a probe outside the transaction
+        // could read stale). `Fresh` means this call created the cover from
+        // nothing; `Adopted` means it found one already live (a prior
         // bridge process's cover, surviving a crash/cutover via
-        // `CoverRecovery::Adopt`). Checked before the transaction below
-        // mutates anything, so it reflects the pre-call state. Consulted
-        // ONLY by `Drop` — see there for why this matters.
-        let ownership = if phase_0_engaged(engine)? {
-            Ownership::Adopted
-        } else {
-            Ownership::Fresh
-        };
-        let result = (|| -> Result<(), RoutingError> {
+        // `CoverRecovery::Adopt`). Consulted ONLY by `Drop` — see there for
+        // why this matters. Any error from the probe itself (not just the
+        // adds) now routes through the same abort+close cleanup below,
+        // rather than leaking the just-opened engine handle.
+        let result = (|| -> Result<Ownership, RoutingError> {
             wfp_check(FwpmTransactionBegin0(engine, 0), "FwpmTransactionBegin0")?;
+            let ownership = if phase_0_engaged(engine)? {
+                Ownership::Adopted
+            } else {
+                Ownership::Fresh
+            };
+            // Delete the volatile permits (TUN + server + resolver) BEFORE
+            // re-adding, unconditionally — idempotent (a "not found" delete
+            // is ignored) for a `Fresh` engage where they don't exist yet,
+            // and load-bearing for `Adopted`: with `Drop for Cover`'s
+            // Adopted arm now leaving these fixed-GUID filters live across a
+            // failed attempt (ordinary RAII ownership -- see `Ownership`'s
+            // doc), a LATER attempt within the SAME process can find them
+            // still present, and `add_filter`'s tolerant `ok_or_exists`
+            // would otherwise silently keep THAT stale value instead of
+            // this attempt's own freshly-derived one. `recover_lockdown`'s
+            // Adopt sweep does the identical delete, but only once at
+            // bridge startup — this repeats it on every engage so "every
+            // attempt derives its own permits from its own config" (see
+            // CONTRIBUTING.md's "Lockdown mode") holds across repeated
+            // Adopted attempts too, not just the first. Same reasoning
+            // covers the TUN pair here even though Phase 0's own `spec`
+            // never adds it (tun_luid is None here) — a stale TUN permit
+            // from a PRIOR attempt's own Phase 6 must not survive into this
+            // attempt's window before its own (possible) Phase 6 runs.
+            for g in adopt_delete_guids() {
+                let _ = FwpmFilterDeleteByKey0(engine, &g);
+            }
             // Idempotent over an unswept cover: add_provider/add_sublayer use
             // ok_or_exists, and the filter keys are fixed — a re-engage after
             // an Adopt re-adds the TUN + server + resolver permits fresh (their
-            // keys were deleted by `recover_lockdown`, so the new values take
-            // effect); the kept floor (block-all + loopback + App-ID) is a
-            // benign re-add.
+            // keys were deleted just above, so the new values take effect);
+            // the kept floor (block-all + loopback + App-ID) is a benign re-add.
             add_provider(engine, spec.provider)?;
             add_sublayer(engine, spec.sublayer, spec.provider)?;
             for f in &spec.filters {
                 add_filter(engine, spec.provider, spec.sublayer, f)?;
             }
             wfp_check(FwpmTransactionCommit0(engine), "FwpmTransactionCommit0")?;
-            Ok(())
+            Ok(ownership)
         })();
-        if let Err(e) = result {
-            let _ = FwpmTransactionAbort0(engine);
-            let _ = FwpmEngineClose0(engine);
-            return Err(e);
-        }
+        let ownership = match result {
+            Ok(ownership) => ownership,
+            Err(e) => {
+                let _ = FwpmTransactionAbort0(engine);
+                let _ = FwpmEngineClose0(engine);
+                return Err(e);
+            }
+        };
         Ok(Cover {
             engine,
             kind: CoverKind::Lockdown,
@@ -728,12 +758,16 @@ unsafe fn phase_0_engaged(engine: HANDLE) -> Result<bool, RoutingError> {
 /// [`phase_0_engaged`] first — matching macOS's equivalent precondition
 /// check — so a call before Phase 0 fails loudly with a clear diagnostic
 /// instead of silently adding orphan TUN-permit filters with no floor. Opens
-/// its own engine, adds the two filters in one transaction, and closes the
-/// engine immediately — unlike `engage_lockdown`, no handle is held past
-/// this call. Called exactly once per attempt's own guard (the guard does
-/// not persist across attempts — see CONTRIBUTING.md's "Lockdown mode"), so
-/// the fixed GUID key here is always genuinely fresh; a bare tolerant add is
-/// correct.
+/// its own engine, deletes then re-adds the two filters in one transaction
+/// (delete-before-add, not a bare tolerant add: `engage_lockdown`'s own
+/// engage already clears the TUN pair unconditionally before this runs, but
+/// this is the function whose OWN correctness this specific GUID pair rests
+/// on, so it does not rely on that as its only line of defense — a stale
+/// pair here, from an `Adopted` attempt's own earlier Phase 6 that a later
+/// phase then failed without disengaging, would silently keep permitting a
+/// dead LUID while this attempt's own adapter's traffic is unpermitted and
+/// blocked), and closes the engine immediately — unlike `engage_lockdown`,
+/// no handle is held past this call.
 #[allow(clippy::disallowed_methods)] // THIS is the sanctioned FWPM call site
 pub fn engage_lockdown_tun(tun_luid: u64) -> Result<(), RoutingError> {
     let filters = [
@@ -755,20 +789,27 @@ pub fn engage_lockdown_tun(tun_luid: u64) -> Result<(), RoutingError> {
             "FwpmEngineOpen0",
         )?;
         let result = (|| -> Result<(), RoutingError> {
-            // The precondition check and the adds share ONE transaction --
-            // not check-then-act outside it -- so a concurrent
-            // `hole bridge unlock` (which deletes every lockdown GUID from
-            // any elevated process at any time, with no "only when no
-            // bridge is alive" enforcement) cannot land between the read
-            // and the commit: BFE serializes transactions against each
-            // other, so either that delete's transaction fully precedes
-            // ours (and this check correctly fails) or fully follows it (a
-            // deliberate post-commit unlock, not a race).
+            // The precondition check, the delete, and the adds all share ONE
+            // transaction -- not check-then-act outside it -- so a
+            // concurrent `hole bridge unlock` (which deletes every lockdown
+            // GUID from any elevated process at any time, with no "only
+            // when no bridge is alive" enforcement) cannot land partway
+            // through: BFE serializes transactions against each other, so
+            // that delete's transaction either fully precedes ours (and
+            // this check correctly fails) or fully follows it (a deliberate
+            // post-commit unlock, not a race).
             wfp_check(FwpmTransactionBegin0(engine, 0), "FwpmTransactionBegin0")?;
             if !phase_0_engaged(engine)? {
                 return Err(RoutingError::RouteSetup(
                     "engage_lockdown_tun: Phase-0 loopback permit not found -- called before the Phase-0 engage".into(),
                 ));
+            }
+            // Delete-before-add: idempotent (a "not found" delete is
+            // ignored) for the common case where `engage_lockdown` already
+            // cleared this pair, and load-bearing for the case where it
+            // didn't (see this fn's own doc).
+            for i in LOCKDOWN_TUN_GUID_INDICES {
+                let _ = FwpmFilterDeleteByKey0(engine, &LOCKDOWN_FILTER_GUIDS[i]);
             }
             for f in &filters {
                 add_filter(engine, PROVIDER_GUID, SUBLAYER_GUID, f)?;
@@ -1097,25 +1138,16 @@ impl Drop for Cover {
                         let _ = FwpmFilterDeleteByKey0(self.engine, &g);
                     }
                 }
-                // Lockdown, Adopted: THIS call found the cover already live
-                // (a prior bridge process's, surviving a crash/cutover) --
-                // ordinary RAII ownership means Drop must not destroy what
-                // this attempt did not create. Leave every filter exactly as
-                // it stands: the floor (loopback/block-all/App-ID) untouched,
-                // and the volatile TUN/server/resolver permits either the
-                // adopted values (existing GUIDs are add-idempotent, so a
-                // re-engage over an unchanged config never touched them) or
-                // THIS attempt's own re-added values (a config change since
-                // the crash: `recover_lockdown`'s Adopt path deletes the
-                // volatile GUIDs first specifically so a re-engage's add
-                // lands fresh) -- whichever this attempt's own engage above
-                // actually wrote is what remains; there is no separate
-                // "restore to before this attempt" snapshot to fall back to
-                // (see CONTRIBUTING.md's "Lockdown mode"). Either way the
-                // result is still a complete, self-consistent, fully
-                // fail-closed floor for this attempt's own config -- just
-                // missing whatever this attempt itself never reached (e.g.
-                // the TUN permit, if Phase 6 never ran).
+                // Lockdown, Adopted: ordinary RAII ownership -- Drop must not
+                // destroy a cover this attempt did not create. Leaves every
+                // filter exactly as this attempt's own engage left it: the
+                // floor (loopback/block-all/App-ID) untouched, and the
+                // volatile TUN/server/resolver permits at THIS attempt's own
+                // values (`engage_lockdown`/`engage_lockdown_tun` delete
+                // those fixed GUIDs before re-adding, so they are never
+                // silently left at a stale prior attempt's values). See
+                // CONTRIBUTING.md's "Lockdown mode" for why no
+                // restore-to-before-this-attempt snapshot exists.
                 CoverKind::Lockdown => {}
             }
             #[allow(clippy::disallowed_methods)] // sanctioned FWPM call site

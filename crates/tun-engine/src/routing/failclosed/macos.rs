@@ -320,21 +320,12 @@ impl Drop for Cover {
             // restore the pre-lockdown snapshot and drop the refcount, same
             // as always.
             (CoverKind::Lockdown, Ownership::Fresh) => lockdown_disengage(&self.state_dir),
-            // Lockdown, Adopted: THIS call found the cover already live (a
-            // prior bridge process's, surviving a crash/cutover) --
-            // ordinary RAII ownership means Drop must not destroy what this
-            // attempt did not create. Leave pf exactly as it stands: either
-            // the adopted ruleset unchanged (this attempt's own
-            // `engage_lockdown` call above failed before its `pfctl -f -`
-            // ever ran) or THIS attempt's own rewritten ruleset (its
-            // `pfctl -f -` succeeded, reloading with THIS attempt's own
-            // server/resolver/App-ID values, and a LATER phase then failed)
-            // -- there is no separate "restore to before this attempt"
-            // snapshot to fall back to (see CONTRIBUTING.md's "Lockdown
-            // mode"). Either way the result is still a complete,
-            // self-consistent, fully fail-closed ruleset -- just possibly
-            // missing whatever this attempt itself never reached (e.g. the
-            // TUN permit, if Phase 6 never ran).
+            // Lockdown, Adopted: ordinary RAII ownership -- Drop must not
+            // destroy a cover this attempt did not create. Leaves pf
+            // exactly as this attempt's own engage left it (untouched, or
+            // its own rewritten ruleset if the engage succeeded before a
+            // later phase failed). See CONTRIBUTING.md's "Lockdown mode"
+            // for why no restore-to-before-this-attempt snapshot exists.
             (CoverKind::Lockdown, Ownership::Adopted) => {}
         }
     }
