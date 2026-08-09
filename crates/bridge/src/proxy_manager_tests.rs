@@ -1444,9 +1444,8 @@ fn lockdown_on_never_reaches_phase_6_when_the_self_test_fails() {
             ),
             "expected some Phase 4 self-test failure classification, got {err:?}"
         );
-        // THE FIX: the early (Phase 0) engage already carried the correct
-        // resolver, before Phase 4 ever ran -- closing the gap this test used
-        // to document.
+        // The Phase-0 early engage already carries the correct resolver,
+        // before Phase 4 ever runs.
         assert_eq!(
             st.lockdown_permits_calls.load(Ordering::SeqCst),
             1,
@@ -1573,6 +1572,94 @@ fn lockdown_on_never_engages_for_socks_only_mode() {
             0,
             "nothing was engaged, so there is nothing to disengage"
         );
+    });
+}
+
+#[skuld::test]
+fn covered_socks_only_start_with_lockdown_on_uses_the_transient_cover() {
+    // The standing cover never applies to SocksOnly (previous test), but a
+    // COVERED SocksOnly start under lockdown intent must not be left with
+    // NEITHER cover: the transient cover's own gate must react to
+    // `lockdown_applies` (which is false here), not the raw intent (which
+    // is true) -- otherwise a covered SocksOnly start under lockdown runs
+    // fully uncovered for the whole connect window.
+    rt().block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        let routing = MockRouting::new(dir.path().to_path_buf());
+        let st = routing.state();
+        let (mut pm, _dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, true);
+        let mut cfg = test_config();
+        cfg.tunnel_mode = hole_common::protocol::TunnelMode::SocksOnly;
+
+        pm.start_cancellable(&cfg, true, CancellationToken::new())
+            .await
+            .expect("SocksOnly covered start must still succeed");
+        assert_eq!(
+            st.lockdown_permits_calls.load(Ordering::SeqCst),
+            0,
+            "the standing cover still never applies to SocksOnly"
+        );
+        assert_eq!(
+            st.cover_engage_calls.load(Ordering::SeqCst),
+            1,
+            "the transient cover must engage instead -- a covered start must never be left fully uncovered"
+        );
+    });
+}
+
+#[skuld::test]
+fn lockdown_pending_survives_cancel() {
+    // Unlike the transient cover (released on cancel -- "same trust as a
+    // user disconnect"), the standing cover represents the user's
+    // PERSISTENT kill-switch intent, independent of any one connection
+    // attempt: cancelling a covered start must NOT open the host, and must
+    // not tear down a cover that could be protecting a pre-existing
+    // (adopted) session.
+    //
+    // Phase 0 (in `start_cancellable`) engages BEFORE `start_inner`'s Phase 2
+    // (`proxy.start`), so parking on `MockProxy`'s start gate and firing the
+    // cancel only once `proxy.start` is *known* entered deterministically
+    // exercises "Phase 0 already engaged, then cancelled mid-flight" (a
+    // pre-cancelled token instead would short-circuit at the DoH bootstrap
+    // resolve, strictly BEFORE Phase 0 ever runs, and prove nothing).
+    rt().block_on(async {
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let (entered_tx, entered_rx) = oneshot::channel();
+        let proxy = MockProxy::with_start_gate(gate.clone()).with_entered_signal(entered_tx);
+        let dir = tempfile::tempdir().unwrap();
+        let routing = MockRouting::new(dir.path().to_path_buf());
+        let st = routing.state();
+        let (mut pm, _dir) = new_manager_with_lockdown(proxy, routing, dir, true);
+
+        let cancel = CancellationToken::new();
+        let cancel_clone = cancel.clone();
+        tokio::spawn(async move {
+            entered_rx.await.expect("MockProxy::start never entered");
+            cancel_clone.cancel();
+        });
+
+        let err = pm.start_cancellable(&test_config(), true, cancel).await.unwrap_err();
+        assert!(matches!(err, ProxyError::Cancelled), "expected Cancelled, got {err:?}");
+        assert_eq!(st.lockdown_permits_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            st.lockdown_disengage_calls.load(Ordering::SeqCst),
+            0,
+            "cancel must NOT disengage the standing cover"
+        );
+        assert!(
+            pm.lockdown_active(),
+            "the held guard must still be reported active after a cancel"
+        );
+
+        pm.stop().await.unwrap();
+        assert_eq!(
+            st.lockdown_disengage_calls.load(Ordering::SeqCst),
+            1,
+            "an explicit stop still disengages it"
+        );
+        // The gate is still held -- release it so the spawned mock task can
+        // drop cleanly (mirrors `start_cancellable_cancelled_during_ss_start_rolls_back`).
+        gate.notify_one();
     });
 }
 
@@ -3689,9 +3776,9 @@ mod self_test {
         // becomes `Some(answering_resolver)`. Silently REUSING the stale
         // `None`-permit guard (Windows' `FWP_E_ALREADY_EXISTS` swallow means
         // a naive re-add would never update it) would leave block-all still
-        // governing the new resolver — reintroducing the exact class of
-        // the standing cover was built to remove, one layer up. The fix releases (disengages) the
-        // stale guard and re-engages fresh with the corrected value.
+        // governing the new resolver. This test proves the standing cover
+        // releases (disengages) the stale guard and re-engages fresh with
+        // the corrected value.
         rt().block_on(async {
             let probe_l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             let closed = probe_l.local_addr().unwrap();
@@ -4668,6 +4755,52 @@ mod self_test {
                 querier.queries.load(Ordering::SeqCst),
                 after_first,
                 "the covered retry reuses the resolved IP and does NOT re-query DoH under the cover"
+            );
+        });
+    }
+
+    #[skuld::test]
+    fn lockdown_covered_retry_reuses_the_resolved_ip_without_re_querying_doh() {
+        // Mirrors `covered_retry_reuses_the_resolved_ip_without_re_querying_doh`
+        // for the STANDING cover: without `lockdown_pending` participating in
+        // the same cache-reuse match as `blocked`, a same-host retry would
+        // re-resolve via DoH on every attempt. With no plugin configured, the
+        // retained standing cover permits no resolver at all, so a real
+        // re-resolve would dial straight into its own block-all and wedge
+        // every retry identically -- #753's exact class of bug, one layer
+        // earlier than the ECH-config fetch it fixed.
+        rt().block_on(async {
+            let querier = Arc::new(CountingQuerier {
+                host: "proxy.example".into(),
+                ip: "203.0.113.9".parse().unwrap(),
+                queries: AtomicU32::new(0),
+            });
+            let dir = tempfile::tempdir().unwrap();
+            let routing = MockRouting::new(dir.path().to_path_buf());
+            let (mut pm, _dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, true);
+            pm.set_bootstrap_querier_for_test(querier.clone());
+            let mut cfg = test_config();
+            cfg.server.server = "proxy.example".into();
+            cfg.server.plugin = None; // no plugin -> the standing cover permits no resolver
+            cfg.dns.enabled = true; // forces attempt 1 to fail via the self-test gate
+
+            pm.start_cancellable(&cfg, true, CancellationToken::new())
+                .await
+                .unwrap_err();
+            let after_first = querier.queries.load(Ordering::SeqCst);
+            assert!(after_first >= 1, "the first covered start resolves via DoH");
+            assert!(
+                pm.lockdown_active(),
+                "the failed covered start holds the standing cover's guard"
+            );
+
+            pm.start_cancellable(&cfg, true, CancellationToken::new())
+                .await
+                .unwrap_err();
+            assert_eq!(
+                querier.queries.load(Ordering::SeqCst),
+                after_first,
+                "the covered retry reuses the resolved IP and does NOT re-query DoH under the standing cover"
             );
         });
     }

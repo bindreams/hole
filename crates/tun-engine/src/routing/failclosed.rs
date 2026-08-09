@@ -156,19 +156,8 @@ pub fn engage_lockdown_tun(
     }
     #[cfg(target_os = "macos")]
     {
-        let _ = resolver;
-        // pf has no incremental update: reload the FULL ruleset (server +
-        // resolver + the new TUN line), reusing the token/snapshot Phase 0
-        // already persisted (`engage_pf_action` sees `has_persisted &&
-        // pf_enabled` -> `ReuseToken`, so this does not re-`-E` or
-        // re-snapshot). The returned guard is discarded WITHOUT running its
-        // Drop: the REAL owning guard is the one `engage_lockdown` already
-        // returned at Phase 0, and its Drop already sweeps the FULL
-        // lockdown state (TUN included) via the persisted state file,
-        // regardless of which call added what.
-        let cover = platform::engage_lockdown(server_ip, resolver_ip, Some(tun_name), state_dir, owner)?;
-        cover.forget_without_disengage();
-        Ok(())
+        let _ = (resolver, owner);
+        platform::engage_lockdown_tun(tun_name, server_ip, resolver_ip, state_dir)
     }
 }
 

@@ -298,22 +298,6 @@ impl Drop for Cover {
     }
 }
 
-impl Cover {
-    /// Discard the guard without disengaging: used only by the facade's
-    /// early, non-owning `engage_lockdown_permits` call (see
-    /// [`crate::routing::Routing::install_lockdown_permits`]'s doc), which
-    /// reuses this module's full `engage_lockdown` (with `tun_name = None`)
-    /// and has no use for the returned guard — the permits it installed are
-    /// recovered by the persisted lockdown state file regardless of any
-    /// in-memory guard's lifetime. No OS handle needs releasing here (unlike
-    /// Windows' WFP engine handle): `pfctl` has already completed by the time
-    /// this runs, so this is a plain `mem::forget`, skipping only the Drop's
-    /// restore-from-snapshot side effect.
-    pub(crate) fn forget_without_disengage(self) {
-        std::mem::forget(self);
-    }
-}
-
 /// Drop the transient enable refcount + clear the file. When `adopting` is
 /// false, also restore the canonical ruleset (the transient engage did `-Fa`,
 /// flushing host rules, so the restore is mandatory to undo the flush). When a
@@ -466,6 +450,44 @@ pub fn engage_lockdown(
         state_dir: state_dir.to_owned(),
         kind: CoverKind::Lockdown,
     })
+}
+
+/// Add the TUN pass line to an already-engaged standing lockdown cover
+/// (Phase 6, once `routing.install` has resolved the adapter), by reloading
+/// the FULL ruleset — pf has no incremental update — reusing the SAME
+/// persisted token/nat_snapshot [`engage_lockdown`] (Phase 0) already wrote.
+/// Returns no guard: the [`Cover`] Phase 0 already returned still owns the
+/// whole standing cover.
+///
+/// Unlike [`engage_lockdown`]'s own load-failure branch, a failed reload
+/// here does NOT call [`lockdown_disengage`]: `pfctl -f -` is atomic — a
+/// rejected ruleset leaves the PREVIOUSLY LOADED one (Phase 0's, permitting
+/// loopback/server/resolver/App-ID, minus only the TUN line this call was
+/// trying to add) unchanged and still fully enforced. Restoring the
+/// pre-lockdown snapshot here would destroy a cover that is still live and
+/// correct, just missing one permit — the exact mistake `engage_lockdown`'s
+/// own restore-on-failure is right to make for a FIRST-EVER engage (nothing
+/// was live yet), but wrong for this add-on-top call.
+pub fn engage_lockdown_tun(
+    tun_name: &str,
+    server_ip: IpAddr,
+    resolver_ip: Option<IpAddr>,
+    state_dir: &Path,
+) -> Result<(), RoutingError> {
+    let persisted = lockdown_state::load(state_dir).ok_or_else(|| {
+        RoutingError::RouteSetup(
+            "engage_lockdown_tun: no lockdown state on disk -- called before the Phase-0 engage".into(),
+        )
+    })?;
+    let main = build_lockdown_main_ruleset(Some(tun_name), server_ip, resolver_ip, &persisted.nat_snapshot);
+    let out = pfctl(&["-f", "-"], Some(main.as_bytes()), PHASE_COVER)?;
+    if !out.status.success() {
+        return Err(RoutingError::RouteSetup(format!(
+            "pfctl lockdown TUN-add load failed (the Phase-0 cover is unaffected -- pfctl's reload is atomic): {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
+    }
+    Ok(())
 }
 
 /// Fail-loud disengage: restore the pre-lockdown ruleset from the snapshot, drop

@@ -604,12 +604,15 @@ pre-existing adopted cover's floor, since both share the same fixed identity).
 `Routing::engage_lockdown_tun` then adds ONLY the TUN permit to that SAME
 guard at Phase 6, once `routing.install` has resolved the adapter — it returns
 no guard of its own: on Windows it opens its own FWPM engine, adds the two TUN
-filters, and closes the engine immediately; on macOS it reloads the full pf
-ruleset (reusing the token/snapshot Phase 0 persisted) and discards the
-returned guard via `Cover::forget_without_disengage` (a plain `mem::forget` —
-pf has no handle to leak, unlike Windows' engine). Either way the ONE guard
-Phase 0 returned still owns the whole cover's disengage, TUN permit included
-once Phase 6 adds it.
+filters, and closes the engine immediately. On macOS it reloads the full pf
+ruleset (`pfctl -f -` has no incremental update), reusing the token/snapshot
+Phase 0 persisted — and, unlike Phase 0's own load-failure handling, a failed
+reload here does NOT restore the pre-lockdown snapshot: `pfctl -f -` is
+atomic, so a rejected ruleset leaves the PREVIOUSLY loaded one (Phase 0's,
+still fully enforced, just missing the TUN line) unchanged — destroying it
+anyway would take down a cover that is still live and correct. Either way the
+ONE guard Phase 0 returned still owns the whole cover's disengage, TUN permit
+included once Phase 6 adds it.
 
 Without the Phase-0 step, a plugin's Phase-4 forwarder self-test — where
 ex-ray's lazy ECH-config fetch actually fires, on the chain's first real dial
@@ -617,30 +620,45 @@ ex-ray's lazy ECH-config fetch actually fires, on the chain's first real dial
 already-armed machine (a prior run's cover, live or adopted) that dial is
 blocked by the standing block-all with nothing yet permitting it, so the
 start fails identically on every retry. Both engage calls are fail-FATAL.
+The bootstrap DoH resolution that resolves the server hostname runs even
+earlier, in `start_cancellable` before Phase 0 -- `lockdown_pending` (like
+`blocked`) caches the resolved IP so a same-host retry never re-dials that
+bootstrap query under a cover that may permit no resolver at all (no plugin
+configured); without the cache, that dial would repeat the same class of
+wedge on every retry, one layer earlier than the ECH-config fetch.
 
-`ProxyManager` retains `lockdown_pending` across an ordinary (non-cancel)
-start failure — same retention semantics as `blocked` — so the host stays
-blocked, not leaked; `stop_with` disengages or disarms it exactly like
-`blocked` when a covered start left it engaged but never reached `running`.
-On success, `start_cancellable` moves the guard from `lockdown_pending` into
-`RunningState.lockdown`. On cancel, it releases the guard (same trust as a
-user disconnect). A retry whose server or resolver permit DRIFTS from what
-`lockdown_pending` already holds releases (disengages) the stale guard before
-re-engaging fresh — mirroring the transient cover's stale-permit repair, but
-without a restore-previous fallback (`install_lockdown_permits` is
-fail-FATAL, so a failed re-engage just aborts the start with the host open —
-the same disclosed release-then-reengage residual class as the transient
-cover's own, #758). Without this, Windows' `FWP_E_ALREADY_EXISTS` swallow
-(`ok_or_exists`) would silently keep re-adding over the STALE fixed-GUID
-filter, leaving the OLD resolver/server permitted forever instead of the new
-one.
+`ProxyManager` retains `lockdown_pending` across BOTH an ordinary start
+failure AND a cancel — unlike `blocked` (released on cancel, "same trust as a
+user disconnect"), the standing cover represents the user's *persistent*
+kill-switch intent, independent of any one connection attempt, so cancelling
+a connect must not open the host or tear down a cover that might be
+protecting a pre-existing adopted session. `stop_with` disengages or disarms
+it exactly like `blocked` when a covered start left it engaged but never
+reached `running`. On success, `start_cancellable` moves the guard from
+`lockdown_pending` into `RunningState.lockdown`. A retry whose server or
+resolver permit DRIFTS from what `lockdown_pending` already holds releases
+(disengages) the stale guard before re-engaging fresh — mirroring the
+transient cover's stale-permit repair, but without a restore-previous
+fallback (`install_lockdown_permits` is fail-FATAL, so a failed re-engage
+just aborts the start with the host open — the same disclosed
+release-then-reengage residual class as the transient cover's own, #758).
+Without this, Windows' `FWP_E_ALREADY_EXISTS` swallow (`ok_or_exists`) would
+silently keep re-adding over the STALE fixed-GUID filter, leaving the OLD
+resolver/server permitted forever instead of the new one.
 
 The standing cover only ever applies to a Full-mode start: SocksOnly's
 `start_inner` returns before Phase 6 (`routing.install`) ever runs, so there
-is no TUN to protect and no adapter to resolve a LUID from — the Phase-0
-engage is gated on `tunnel_mode == Full` too, preserving that pre-existing
-"lockdown never engages for SocksOnly" invariant (engaging a cover Phase 6
-can never complete would leave it permanently orphaned).
+is no TUN to protect and no adapter to resolve a LUID from — both the Phase-0
+engage AND the transient cover's own gate (`covered && !lockdown_applies`,
+not the raw intent) key off `lockdown_applies = intent && tunnel_mode == Full`, so a covered SocksOnly start under lockdown intent still gets the
+transient cover instead of running fully uncovered, and the standing cover
+never engages a guard Phase 6 could never complete (which would leave it
+permanently orphaned). `lockdown_applies` is computed once in
+`start_cancellable` and passed into `start_inner` as a parameter, the same
+pattern `ech_resolver_permit` already uses — `start_inner` does not
+independently re-read the persisted intent file, which has out-of-process
+writers (`hole bridge unlock`) that could otherwise flip it mid-attempt and
+desync the two phases.
 
 `hole bridge unlock` is the elevated escape hatch to disengage a standing cover
 when no bridge is alive (`cutover::unlock`). Unlike the best-effort startup
