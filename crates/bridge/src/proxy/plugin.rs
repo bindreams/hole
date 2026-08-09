@@ -792,14 +792,8 @@ fn ex_ray_fatal_config_error(
         return Some("ech-doh");
     }
 
-    // core.New, once generateConfig has fully succeeded. Same 1..=1024
-    // concurrency bound as the `mux` bullet above, only on websocket, only
-    // when non-zero. The effective value defaults to ex-ray's own flag
-    // default (`1`) unless a segment both exists AND parses.
-    // `MultiplexSettings` is CLIENT-mode only (config.go — the `server`
-    // branch never builds it), so this check is skipped alongside the rest
-    // of the disclosed, deliberately-unmodeled `server` residual above, not
-    // a separate gap.
+    // core.New, once generateConfig has fully succeeded (doc: mux, a third
+    // time; skipped alongside the server residual).
     if mode != Some("quic") && !segments.iter().any(|s| s.key == "server") {
         let mux = segments
             .iter()
@@ -864,11 +858,7 @@ fn ex_ray_parses_as_uint32(v: &str) -> Option<u32> {
 ///   exits before it ever starts, so no dial of any kind happens. This also
 ///   covers an EXPLICITLY EMPTY `host=`: `parseStringOption(..., "host",
 ///   ..., emptyOK: false)` rejects it at parse time, so `*host` can never
-///   actually BE `""` when `buildTLSConfig` runs. (v2ray-core's own
-///   `Config.ServerName` empty-fallback to the dial destination —
-///   `tls.WithDestination` filling it from `remoteAddr`,
-///   third_party/.../tls/config.go, `websocket/dialer.go` — still exists in
-///   the vendored source; it is simply unreachable via `plugin_opts`.)
+///   actually BE `""` this way when `buildTLSConfig` runs.
 /// - `ech=never` short-circuits ECH entirely before it ever looks at
 ///   `ech-doh` (config.go).
 /// - TLS must be enabled at all — an explicit `tls` flag, or `mode=quic`
@@ -878,13 +868,21 @@ fn ex_ray_parses_as_uint32(v: &str) -> Option<u32> {
 /// - `ApplyECH` bails before dialing DoH unless the TLS `ServerName` is a
 ///   DOMAIN: ex-ray sets `tlsConfig.ServerName = *host` directly, and an
 ///   ABSENT `host` falls back to ex-ray's own [`EX_RAY_DEFAULT_HOST`], a
-///   real domain, so it's reachable. An EXPLICIT `host=<value>` (now always
-///   non-empty, given the point above) wins outright, domain or not — EXCEPT
-///   that `GetTLSConfig` resolves `config.ServerName` via `parseServerName`
-///   before `ApplyECH` ever reads it, which strips a literal
-///   [`V2RAY_CORE_EXP_8357_PREFIX`] prefix first
-///   (third_party/v2ray-core/transport/internet/tls/config.go:20,173-183,
-///   262-264,296-301; `ech.go:26-51,37-51`).
+///   real domain, so it's reachable. An EXPLICIT `host=<value>` wins
+///   outright, domain or not — EXCEPT that `GetTLSConfig` resolves
+///   `config.ServerName` via `parseServerName` before `ApplyECH` ever reads
+///   it, which strips a literal [`V2RAY_CORE_EXP_8357_PREFIX`] prefix
+///   first. If THAT strip leaves `*host` empty (only when `*host` is
+///   EXACTLY the bare prefix — an explicit `host=` alone is already fatal,
+///   above), `config.ServerName` is NOT `""`: `GetTLSConfig` applies
+///   `WithDestination` (an `Option` in its `opts...` — the websocket client
+///   dialer always passes one) BEFORE the `parseServerName` assignment,
+///   and `WithDestination` only ever fills an ALREADY-`""` `ServerName`
+///   from the dial destination — so the empty-after-strip case reaches
+///   `ApplyECH` with `remoteAddr` as its SNI, same first-wins rule as every
+///   other key here (third_party/v2ray-core/transport/internet/tls/
+///   config.go:20,173-183,262-264,296-301,371-381; `ech.go:26-51,37-51`;
+///   `websocket/dialer.go:67`).
 ///
 /// Every flag read here goes through [`ex_ray_flag_value`] rather than
 /// `OptionSegment::value` — see its doc. For `host` the divergence is
@@ -899,8 +897,6 @@ fn ech_fetch_is_reachable(segments: &[garter::OptionSegment<'_>], ech_doh: Optio
     }
     let mode = segments.iter().find(|s| s.key == "mode").map(ex_ray_flag_value);
     let tls_enabled = segments.iter().any(|s| s.key == "tls") || mode == Some("quic");
-    // An explicitly empty `host=` is fatal (caught above) and never reaches
-    // here — only an ABSENT host falls back to ex-ray's own default.
     let sni = segments
         .iter()
         .find(|s| s.key == "host")
@@ -910,6 +906,24 @@ fn ech_fetch_is_reachable(segments: &[garter::OptionSegment<'_>], ech_doh: Optio
     // "experiment:8357203.0.113.5") while the stripped value ex-ray
     // actually uses ("203.0.113.5") is an IP, unreachable.
     let sni = sni.strip_prefix(V2RAY_CORE_EXP_8357_PREFIX).unwrap_or(sni);
+    // `sni` is empty only when `*host` was EXACTLY the bare prefix —
+    // `WithDestination` (see this function's doc) then fills
+    // `config.ServerName` from `remoteAddr` instead, which `ApplyECH`
+    // actually reads. An absent `remoteAddr` falls back to Hole's own
+    // `SS_REMOTE_HOST`, which this function cannot see (env, not
+    // `plugin_opts`) — but is ALWAYS an IP literal in Hole's own spawn path
+    // (`crate::proxy::plugin` never resolves a domain later than
+    // `garter::binary::sip003_env`, which passes an already-resolved
+    // `SocketAddr`), so an absent `remoteAddr` is correctly treated as "not
+    // a domain" (`""`) without needing to see it.
+    let sni = if sni.is_empty() {
+        segments
+            .iter()
+            .find(|s| s.key == "remoteAddr")
+            .map_or("", ex_ray_flag_value)
+    } else {
+        sni
+    };
     tls_enabled && v2ray_core_parses_as_a_domain(sni)
 }
 
@@ -1171,19 +1185,16 @@ fn inject_plugin_directives(
                     plugin = %plugin_name,
                     "no configured resolver to pin the ECH lookup to; the config's own ech-doh stands: {}", s.raw
                 ),
-                // ECH is armed only by `ech-doh`, so there is none. Under
-                // `ech=always` WITH TLS enabled, this arm is unreachable —
-                // `ex_ray_fatal_config_error`'s `resolved_ech_doh_is_empty`
-                // check already routed that combination through the `if let
-                // Some(key) = ...` branch above. WITHOUT TLS (no `tls` flag,
-                // no `mode=quic`), `ech=always` is inert like everything
-                // else here — `buildTLSConfig` never runs, so `fail_closed`
-                // can legitimately be `true` on this arm.
-                (None, None) => tracing::warn!(
-                    plugin = %plugin_name,
-                    fail_closed,
-                    "no ech-doh from any source; ECH is off"
-                ),
+                // ECH is armed only by `ech-doh`, so there is none. `ech=always`
+                // can never reach this arm: with `ech_doh` and the config's own
+                // both absent/empty, `resolved_ech_doh_is_empty` is unconditionally
+                // true, so `ex_ray_fatal_config_error` already routed
+                // `ech=always` through the `if let Some(key) = ...` branch
+                // above — `Some("ech")` when TLS isn't enabled (`ech=always`
+                // requires it), else `Some("ech-doh")` (`ech=always` requires
+                // a non-empty resolved `ech-doh`). `ech` here is therefore
+                // never `"always"` — no `fail_closed` field to report.
+                (None, None) => tracing::warn!(plugin = %plugin_name, "no ech-doh from any source; ECH is off"),
             }
         }
 
@@ -2107,6 +2118,38 @@ mod inject_tests {
         );
     }
 
+    // `host` EXACTLY the bare prefix strips to an EMPTY `ServerName` —
+    // `WithDestination` then fills it from `remoteAddr` instead (see
+    // `ech_fetch_is_reachable`'s doc), so the fetch is reachable or not
+    // based on `remoteAddr`, not on the (now-empty) stripped host.
+    #[skuld::test]
+    fn exp_8357_with_nothing_after_it_falls_back_to_remote_addr() {
+        let e = pinned("https://9.9.9.9/dns-query");
+        assert_eq!(
+            effective_ech_doh(
+                "ex-ray",
+                Some("tls;host=experiment:8357;remoteAddr=cdn.example"),
+                Some(&e)
+            ),
+            EffectiveEchDoh::Holes,
+            "remoteAddr is a domain — reachable"
+        );
+        assert_eq!(
+            effective_ech_doh(
+                "ex-ray",
+                Some("tls;host=experiment:8357;remoteAddr=203.0.113.5"),
+                Some(&e)
+            ),
+            EffectiveEchDoh::None,
+            "remoteAddr is an IP — unreachable"
+        );
+        assert_eq!(
+            effective_ech_doh("ex-ray", Some("tls;host=experiment:8357"), Some(&e)),
+            EffectiveEchDoh::None,
+            "no remoteAddr — falls back to Hole's own SS_REMOTE_HOST, always an IP literal"
+        );
+    }
+
     // `ex_ray_value_is_https_url` is a deliberately lenient superset of Go's
     // `net/url.Parse` (see its doc): a syntax the `url` crate's stricter
     // WHATWG parser rejects but Go accepts must still read as well-formed
@@ -2208,6 +2251,22 @@ mod inject_tests {
     fn ech_always_without_tls_is_fatal() {
         let segments = garter::split_plugin_options("host=cdn.example;ech=always").unwrap();
         assert_eq!(ex_ray_fatal_config_error(&segments, None), Some("ech"));
+    }
+
+    // `ech=always` can never reach `inject_plugin_directives`'s `(None,
+    // None)` "no ech-doh from any source" warning arm: with no `ech_doh`
+    // and no config-side `ech-doh`, `resolved_ech_doh_is_empty` is
+    // unconditionally true, so `ex_ray_fatal_config_error` already routes
+    // it through the fatal-config warning first — regardless of `tls`.
+    #[skuld::test]
+    fn ech_always_with_no_ech_doh_never_reaches_the_ech_is_off_warning() {
+        for opts in ["ech=always", "tls;ech=always"] {
+            let out = warnings_for("ex-ray", Some(opts), None);
+            assert!(
+                out.contains("ex-ray will refuse to start") && !out.contains("ECH is off"),
+                "opts={opts:?}: expected the fatal-config warning, not the ECH-is-off one; got:\n{out}"
+            );
+        }
     }
 
     // Every new `ex_ray_fatal_config_error` check reads its key via `find`

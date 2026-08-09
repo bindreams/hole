@@ -546,15 +546,17 @@ checks those four address/port keys assuming client mode and skips the
 fatal.
 
 An explicit empty `host=` is fatal at parse time
-(`parseStringOption(..., emptyOK: false)`), so `*host` can never actually BE
-`""` when `buildTLSConfig` runs — v2ray-core's own `Config.ServerName`
+(`parseStringOption(..., emptyOK: false)`), so `*host` can never be `""`
+this way — but the reachable SNI check ALSO strips a literal
+`experiment:8357` prefix before testing domain-ness, mirroring v2ray-core's
+own `Config.parseServerName` (`ApplyECH` reads the STRIPPED `ServerName`,
+not the raw `host` value), and `*host` EXACTLY equal to that bare prefix
+strips to `""` without being fatal. v2ray-core's own `Config.ServerName`
 empty-`ServerName` fallback to the dial destination (`tls.WithDestination`,
-filling it from `remoteAddr`) still exists in the vendored source, just
-unreachable via `plugin_opts`, and `ech_fetch_is_reachable` does not model
-it. The reachable SNI check also strips a literal `experiment:8357` prefix
-before testing domain-ness, mirroring v2ray-core's own
-`Config.parseServerName` — `ApplyECH` reads the STRIPPED `ServerName`, not
-the raw `host` value.
+filling it from `remoteAddr`, applied BEFORE the `parseServerName`
+assignment and only when `ServerName` is still `""` at that point) IS
+reachable this way, and `ech_fetch_is_reachable` models it: the fetch's
+reachability then depends on `remoteAddr` instead.
 
 ### Lockdown mode
 
