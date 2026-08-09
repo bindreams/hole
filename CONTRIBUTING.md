@@ -362,8 +362,12 @@ closes that broader gap.
 `crate::dns::ech` never constructs a URL with any other port, so 443 is
 structurally the only value this fetch can need, not a heuristic threshold):
 `EchDoh::resolver`, the exact address Hole's own `ech-doh` URL names, gated on
-a plugin being configured at all (no plugin, no later ECH lookup, so nothing
-to permit for). Without it, ex-ray's later lazy ECH-config fetch — which fires
+`crate::proxy::plugin::effective_ech_doh` returning `Holes` — the value ex-ray
+will actually dial, not merely a plugin being configured (no plugin is one way
+to get `None`; a non-ECH-capable plugin, a fatal ex-ray config, `ech=never`,
+no TLS-enabled domain SNI, or an operator's own `ech-doh` outranking Hole's
+are the others — see `ech_fetch_is_reachable`'s and `classify_ech_doh`'s docs).
+Without it, ex-ray's later lazy ECH-config fetch — which fires
 on the plugin chain's first dial, i.e. *under* this same cover — would be
 blocked and stall to ex-ray's client timeout. **Permitting it grants no new
 trust regardless of `PinSource`:** Hole *authored* the address — `ech_doh_url`
@@ -384,24 +388,25 @@ trust does not extend to it. `effective_ech_doh` also means a non-ECH-capable
 plugin never widens the cover for a fetch that provably does not use it. A
 covered retry against the same server reuses the held cover as-is UNLESS this
 attempt's freshly-derived permit now differs from what the cover was actually
-engaged with (e.g. `dns.servers` changed the fallback address, or a plugin was
-added between attempts) — that drift makes the held cover stale, and it is
-released and re-engaged fresh with the corrected permit, the same repair
-pattern already used for a different-server retry, EXCEPT when the new
-derivation only NARROWS to nothing needed (e.g. the plugin was removed): a
-superset permit is left in place rather than opening the release-to-reengage
-window for a correction with no benefit. If the corrected engage itself
-fails, the repair falls back to restoring the PREVIOUS permit rather than
-leaving the host uncovered; an unchanged retry (still wanting the same
-permit) repairs again rather than staying wedged — the failure could have
-been transient, and each attempt's release-to-reengage window is bounded to
+engaged with (e.g. `dns.servers` changed the fallback address, a plugin was
+added or removed between attempts, or an operator's own `ech-doh` started or
+stopped outranking Hole's) — that drift, including a NARROWING to nothing
+needed, makes the held cover stale, and it is released and re-engaged fresh
+with the corrected permit, the same repair pattern already used for a
+different-server retry: the resolver permit carries no App-ID/process scoping
+on either platform, so leaving a wider-than-needed permit live for the rest
+of the blocked state is a real widening, not a correction with no benefit.
+If the corrected engage itself fails, the repair falls back to restoring the
+PREVIOUS permit rather than leaving the host uncovered; an unchanged retry
+(still wanting the same permit) repairs again rather than staying wedged —
+the failure could have been transient, and each attempt's release-to-reengage
+window is bounded to
 that one (user-paced) retry regardless.
 
-**Disclosed residual:** an operator's OWN `ech-doh` in `plugin_opts`
-outranking Hole's (`EffectiveEchDoh::Operators`) is never permitted — Hole did
-not author that address, so config-authorship trust does not extend to it,
-making this a real widening — and is therefore *always* a stall risk under a
-covered start; `ProxyManager::start_cancellable` logs a dedicated `warn!`
+**Disclosed residual:** an operator's OWN `ech-doh` outranking Hole's
+(`EffectiveEchDoh::Operators`, never permitted per above) is therefore
+*always* a stall risk under a covered start;
+`ProxyManager::start_cancellable` logs a dedicated `warn!`
 naming the operator's URL. A repair's compensating restore can also leave the
 LIVE held cover's permit mismatched from what THIS attempt actually needs
 (the corrected engage failed) — a separate `warn!` fires for that case too,

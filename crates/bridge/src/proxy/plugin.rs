@@ -754,10 +754,7 @@ fn ex_ray_fatal_config_error(
     }
 
     // registerTCPKeepAlive + main()'s own pre-generateConfig guards.
-    // registerTCPKeepAlive returns early under `*server` WITHOUT
-    // range-checking — server mode's own tcp-keepalive range check is
-    // unconditional inside generateConfig instead, much later (see below),
-    // so it must not fire here too.
+    // Server-mode tcp-keepalive split — see this fn's doc.
     let server_present = segments.iter().any(|s| s.key == "server");
     if !server_present
         && segments.iter().find(|s| s.key == "tcp-keepalive").is_some_and(|s| {
@@ -837,9 +834,7 @@ fn ex_ray_fatal_config_error(
     if !tls_enabled && cert_material_present {
         return Some("cert");
     }
-    // Server mode's own tcp-keepalive range check — unconditional inside
-    // generateConfig, unlike registerTCPKeepAlive above, which never runs
-    // it for `*server`.
+    // The `*server` case skipped above — checked here instead.
     if server_present
         && segments.iter().find(|s| s.key == "tcp-keepalive").is_some_and(|s| {
             !ex_ray_flag_value(s)

@@ -2985,12 +2985,13 @@ mod self_test {
     }
 
     // A retry that NARROWS to nothing needed (e.g. the plugin was removed)
-    // must NOT release-then-reengage: doing so would open the full-egress
-    // window for a correction with no benefit (the old, wider permit is
-    // already a superset of what's now required). The held cover stays
-    // exactly as-is.
+    // must STILL release-then-reengage to correct the permit: the resolver
+    // permit carries no App-ID/process scoping on either platform, so
+    // leaving the OLD (wider) permit live is a real widening of the kill
+    // switch for the rest of the blocked state, not a harmless superset —
+    // any process on the host, not just the plugin chain, could use it.
     #[skuld::test]
-    fn covered_retry_narrowing_to_no_permit_does_not_re_engage() {
+    fn covered_retry_narrowing_to_no_permit_re_engages_to_correct_it() {
         rt().block_on(async {
             let answering_resolver: IpAddr = "1.0.0.1".parse().unwrap();
             let querier = Arc::new(CountingQuerier {
@@ -3022,13 +3023,13 @@ mod self_test {
                 .unwrap_err();
             assert_eq!(
                 st.cover_engage_calls.load(Ordering::SeqCst),
-                1,
-                "narrowing to no permit must not release-then-reengage the cover"
+                2,
+                "narrowing to no permit must release-then-reengage to correct the cover"
             );
             assert_eq!(
                 *st.last_cover_resolver_ip.lock().unwrap(),
-                Some(answering_resolver),
-                "the OLD (wider) permit stays in place — a harmless superset, not a gap"
+                None,
+                "the corrected (narrower) permit replaces the old, wider one"
             );
         });
     }

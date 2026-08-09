@@ -655,17 +655,20 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
             .unwrap_or(false);
 
         // A held cover's resolver_permit is fixed at engage time; re-engage
-        // only when this attempt's fresh derivation NEEDS a specific address
-        // the held cover doesn't already have (`ech_resolver_permit.is_some_and`
-        // below — a narrowing to `None`, e.g. the plugin was removed, is left
-        // as a superset permit rather than paying the release-to-reengage
-        // window for a correction with no benefit). `repair_fallback`
-        // captures what's being given up: `Some((old_permit, original_pin))`
-        // means a good cover existed a moment ago, so a failed fresh engage
-        // below restores it instead of leaving the host uncovered.
-        // `original_pin` is `pin` BEFORE this attempt's own `revalidate` —
-        // see the repair arms below for why it, not the local `pin`
-        // variable, is what gets stored back.
+        // whenever this attempt's fresh derivation DIFFERS from what the
+        // held cover already has — a narrowing to `None` (e.g. the plugin
+        // was removed, or `effective_ech_doh` no longer resolves to
+        // `Holes`) drifts too: leaving a wider-than-needed permit live is a
+        // real widening of the kill switch (the resolver permit carries no
+        // App-ID/process scoping on either platform, so it is available to
+        // every process on the host, not just the plugin chain), not a
+        // correction with no benefit. `repair_fallback` captures what's
+        // being given up: `Some((old_permit, original_pin))` means a good
+        // cover existed a moment ago, so a failed fresh engage below
+        // restores it instead of leaving the host uncovered. `original_pin`
+        // is `pin` BEFORE this attempt's own `revalidate` — see the repair
+        // arms below for why it, not the local `pin` variable, is what gets
+        // stored back.
         //
         // A retry whose desired permit still matches a value a PRIOR repair
         // already proved unreachable is not treated specially — it repairs
@@ -680,9 +683,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         let repair_fallback: Option<(Option<IpAddr>, crate::dns::ech::PinSource)> = if covered && !lockdown_on {
             self.blocked
                 .as_mut()
-                .filter(|b| {
-                    b.host == config.server.server && ech_resolver_permit.is_some_and(|r| b.resolver_permit != Some(r))
-                })
+                .filter(|b| b.host == config.server.server && b.resolver_permit != ech_resolver_permit)
                 .map(|b| (b.resolver_permit, b.pin))
         } else {
             None
