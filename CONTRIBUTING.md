@@ -596,23 +596,27 @@ re-resolved every engage via `LuidResolver`.
 permit except the TUN one — loopback, server, (when `Some`) resolver, App-IDs
 — and RETURNS the RAII `Cover` the running session eventually holds.
 `ProxyManager::start_cancellable` calls it BEFORE `start_inner` even runs,
-mirroring exactly when the transient cover engages, holding the guard in its
-own `lockdown_pending` field (parallel to `blocked`, the transient cover's
-equivalent) — NOT inside `start_inner`, so a later phase's failure can't
-accidentally tear it down via ordinary RAII unwind (that would also delete a
-pre-existing adopted cover's floor, since both share the same fixed identity).
+mirroring exactly when the transient cover engages, holding the guard in a
+plain LOCAL variable scoped to `start_cancellable` itself — NOT inside
+`start_inner`, so a later phase's failure can't accidentally tear it down via
+`start_inner`'s own RAII unwind (that would also delete a pre-existing
+adopted cover's floor, since both share the same fixed identity).
 `Routing::engage_lockdown_tun` then adds ONLY the TUN permit to that SAME
 guard at Phase 6, once `routing.install` has resolved the adapter — it returns
 no guard of its own: on Windows it opens its own FWPM engine, adds the two TUN
-filters, and closes the engine immediately. On macOS it reloads the full pf
-ruleset (`pfctl -f -` has no incremental update), reusing the token/snapshot
-Phase 0 persisted — and, unlike Phase 0's own load-failure handling, a failed
-reload here does NOT restore the pre-lockdown snapshot: `pfctl -f -` is
-atomic, so a rejected ruleset leaves the PREVIOUSLY loaded one (Phase 0's,
-still fully enforced, just missing the TUN line) unchanged — destroying it
-anyway would take down a cover that is still live and correct. Either way the
-ONE guard Phase 0 returned still owns the whole cover's disengage, TUN permit
-included once Phase 6 adds it.
+filters (a tolerant add — `FWP_E_ALREADY_EXISTS` treated as success — is
+correct here because the guard never persists across attempts; there is no
+cross-attempt retry needing a strict add to distinguish from a genuine
+first-engage/Adopt-continuation, which can legitimately see already-present
+floor filters), and closes the engine immediately. On macOS it reloads the
+full pf ruleset (`pfctl -f -` has no incremental update), reusing the
+token/snapshot Phase 0 persisted — and, unlike Phase 0's own load-failure
+handling, a failed reload here does NOT restore the pre-lockdown snapshot:
+`pfctl -f -` is atomic, so a rejected ruleset leaves the PREVIOUSLY loaded
+one (Phase 0's, still fully enforced, just missing the TUN line) unchanged —
+destroying it anyway would take down a cover that is still live and correct.
+Either way the ONE guard Phase 0 returned still owns the whole cover's
+disengage, TUN permit included once Phase 6 adds it.
 
 Without the Phase-0 step, a plugin's Phase-4 forwarder self-test — where
 ex-ray's lazy ECH-config fetch actually fires, on the chain's first real dial
@@ -620,108 +624,52 @@ ex-ray's lazy ECH-config fetch actually fires, on the chain's first real dial
 already-armed machine (a prior run's cover, live or adopted) that dial is
 blocked by the standing block-all with nothing yet permitting it, so the
 start fails identically on every retry. Both engage calls are fail-FATAL.
-The bootstrap DoH resolution that resolves the server hostname runs even
-earlier, in `start_cancellable` before Phase 0 -- `lockdown_pending` (like
-`blocked`) caches the resolved IP so a same-host retry never re-dials that
-bootstrap query under a cover that may permit no resolver at all (no plugin
-configured); without the cache, that dial would repeat the same class of
-wedge on every retry, one layer earlier than the ECH-config fetch.
 
-`ProxyManager` retains `lockdown_pending` across BOTH an ordinary start
-failure AND a cancel — unlike `blocked` (released on cancel, "same trust as a
-user disconnect"), the standing cover represents the user's *persistent*
-kill-switch intent, independent of any one connection attempt, so cancelling
-a connect must not open the host or tear down a cover that might be
-protecting a pre-existing adopted session. `stop_with` disengages or disarms
-it exactly like `blocked` when a covered start left it engaged but never
-reached `running`. On success, `start_cancellable` moves the guard from
-`lockdown_pending` into `RunningState.lockdown`.
+**The guard's lifetime is bounded to one attempt.** `start_cancellable` holds
+the `Option<R::Cover>` Phase 0 returns as a plain local and passes it into
+`start_inner` for Phase 6 to add the TUN permit to. On success it moves into
+`RunningState.lockdown`, where it disengages on an ordinary `stop()` and
+disarms (persist-without-disengage) on a cutover, exactly like every other
+cover this manager holds. On EVERY early return — an ordinary `Err` from any
+later phase, or a `Cancelled` from mid-flight cancellation — the local simply
+goes out of scope and drops via Rust's own RAII, the same way `start_inner`'s
+own `routes` guard unwinds on a Phase 1-5 failure: no special-cased
+retention, no separate "pending" bucket for `stop_with` to reconcile, and no
+distinction between an ordinary failure and a cancel (the transient cover
+already treats those identically — "same trust as a user disconnect" — and
+the standing cover now does too).
 
-**A retry whose HOST, server, resolver permit, or `app_ids` DRIFTS is a
-REPAIR, not a release-then-fresh-engage.** All four dimensions route through
-the SAME checked repair — including a DIFFERENT host, which earlier engaged
-via a bare, unconditional `take()`/drop before `server_ip` was even
-resolved: sound for the transient cover (every path that reaches its own
-engage block re-derives fresh regardless of `covered`, and a manual start
-proceeds fail-open by design, an established convention for that cover), but
-NOT for the standing one — a manual start under armed lockdown intent must
-never open the host (the same invariant the `!lockdown_on`-keyed release
-above protects), and the eager release had no `lockdown_applies` gate and no
-guaranteed re-engage on every exit path. `host` is folded into
-`LockdownPending`'s staleness check instead; the cache-reuse match gates a
-same-host hit on `p.host == config.server.server`, so `p.server_ip != server_ip` can never independently make `stale` true (asserted, not checked
-live — see the `debug_assert!` beside it). `app_ids`
-(`lockdown_app_ids(config)`, baked into the live cover as Windows App-ID
-permits) is compared alongside `host`/`server_ip`/`resolver_permit` because
-it drifts independently of all three: a retry that only changes
-`config.server.plugin` (e.g. switching plugin binaries) leaves the others
-unchanged, and reusing the held guard in that case would leave the OLD
-plugin's unrestricted-egress App-ID permit (no address/port scoping) live
-while the new plugin never gets one. On drift, `Routing::reengage_lockdown_permits`
-consumes the held guard directly — an ordinary `take()` (drop, which cannot
-return `Result`, so a delete that fails for any reason other than "wasn't
-there" is silently discarded) followed by a fresh `install_lockdown_permits`
-call (whose tolerant re-add — needed for a genuine
-first-engage/Adopt-continuation, which can legitimately see already-present
-floor filters — would then report `FWP_E_ALREADY_EXISTS` as success) is the
-exact silently-stale-permit shape this method exists to close. On Windows
-this checks every delete's return code (`ok_or_not_found`: only "wasn't
-there" is tolerated) and re-adds via the STRICT `add_filter` (`strict: true`, treating `FWP_E_ALREADY_EXISTS` as a hard error — impossible after a
-confirmed delete in the same transaction unless the delete silently failed).
-On macOS this reloads the full ruleset via a DEDICATED function — never
-`engage_lockdown` itself, whose own load-failure branch disengages (correct
-for a first-ever engage, wrong for a repair, where the OLD ruleset is still
-live and correct) — `pfctl -f -`'s atomicity means a rejected reload leaves
-that OLD ruleset unchanged. `engage_lockdown_tun` (Phase 6, the TUN permit)
-uses the identical checked-delete/strict-add discipline on Windows, and the
-identical dedicated-function-not-`engage_lockdown` discipline on macOS, for
-the TUN-LUID pair specifically — `recover_lockdown`'s Adopt path deletes the
-same class of volatile GUID for the identical reason.
-
-**A FAILED repair must not orphan the guard.** Both platforms' repair
-primitives are transactional: a rejected Windows FWPM transaction
-(`FwpmTransactionAbort0`) rolls back every delete and add issued since
-`FwpmTransactionBegin0`, and a rejected macOS `pfctl -f -` reload leaves the
-PREVIOUSLY loaded ruleset untouched — so on failure, NOTHING actually
-changed at the OS level; the OLD permits are still fully live and correct.
-`reengage_lockdown_permits` returns `Result<Cover, (RoutingError, Cover)>` —
-the `Err` variant hands back a `Cover` for that same still-live OLD state,
-and `start_cancellable` restores `self.lockdown_pending` under the OLD
-identity (host/server_ip/resolver_permit/app_ids/pin), not the
-attempted-but-failed new one. Losing that `Cover` (e.g. discarding it and
-leaving `lockdown_pending` `None`) would orphan a live, correct standing
-cover with nothing left to eventually disengage it — a leak that would only
-resolve on the next bridge restart's crash-recovery sweep.
-
-The re-engage (repair OR fresh) stores a PRE-`revalidate` pin, not this
-attempt's locally `revalidate`d one: `revalidate` only ever downgrades
-(`Answered` → `ResolverDeselected`), so persisting the downgraded local
-value would make that loss permanent even once the original resolver
-returns to `dns.servers`. A repair stores the RELEASED guard's own `pin`
-(captured before the `take()`); a fresh engage stores `raw_pin` — the
-cache-reuse match's own pre-`revalidate` value, returned alongside the
-already-revalidated `pin` specifically so a CROSS-COVER handoff (`blocked`
-→ `lockdown_pending` when lockdown turns on mid-blocked-state, or the
-reverse when it turns off) doesn't downgrade permanently either: the guard
-that cached the value is not the one about to (re)engage, so there is no
-`held`/`repair_fallback` local to read it from — only the shared match's
-`raw_pin`.
+This accepts a retry-window gap: a failed or cancelled attempt's guard
+disengages immediately, opening the host briefly until the NEXT retry's own
+Phase 0 re-engages fresh. An earlier iteration of this mechanism held the
+guard across attempts instead — a `lockdown_pending` field with a
+host/server_ip/resolver_permit/app_ids staleness comparison and an in-place
+repair path for a drifted permit — specifically to close this window; it was
+dropped as disproportionate to the risk it closed. The window is not new: an
+ordinary `main` connect using the single-phase, pre-two-phase-split
+`install_lockdown` call (called once, from inside `start_inner`, before this
+mechanism existed) has the identical gap on every failed or cancelled
+attempt, so retaining state only for the two-phase split would have spent
+real complexity protecting a window that predates this fix and was never in
+its scope. Tracked as [#768](https://github.com/bindreams/hole/issues/768).
 
 On macOS, `reconcile_pf_enabled` — factored out of `engage_lockdown`'s own
-`ReuseToken`/`Reenable` handling — runs before EVERY reload that assumes an
-already-persisted token: `engage_lockdown_tun` (Phase 6) and
-`reengage_lockdown` (the repair) both call it first. `pfctl -f -` into a
-DISABLED pf exits 0 while enforcing nothing, so skipping this check (as
-these two calls originally did) reports a connected, armed session as
-covered while pf enforces nothing at all — the identical fail-open
-`engage_lockdown`'s own inline reconciliation was written to close, just
-reopened on the two call sites that came later and never inherited it.
+`ReuseToken`/`Reenable` handling — runs before `engage_lockdown_tun`'s
+(Phase 6) reload, which assumes an already-persisted token: `pfctl -f -` into
+a DISABLED pf exits 0 while enforcing nothing, so skipping this check (as
+this call originally did) reports a connected, armed session as covered
+while pf enforces nothing at all — the identical fail-open `engage_lockdown`'s
+own inline reconciliation was written to close, just reopened on the one
+call site that came later and never inherited it. Phase 0 and Phase 6 can
+still be separated by several seconds within a SINGLE attempt (the plugin
+chain start, self-test, and route install all run in between), so this check
+stays load-bearing even though the guard no longer persists across attempts.
 
 Full mode completes both phases: Phase 0 here, Phase 6 (the TUN permit) in
 `start_inner`. SocksOnly's `start_inner` returns before Phase 6 ever runs —
 no TUN, no LUID — but Phase 0 needs neither, and guard ownership doesn't
-depend on Phase 6 either (`RunningState.lockdown` is filled from
-`lockdown_pending` on the `Ok` path regardless of mode), so a COVERED
+depend on Phase 6 either (`RunningState.lockdown` is filled from the
+caller's local guard on the `Ok` path regardless of mode), so a COVERED
 SocksOnly start under lockdown intent also applies Phase 0:
 `lockdown_applies = intent && (tunnel_mode == Full || covered)`. The
 transient cover is not a viable substitute here — its engage/disengage
@@ -737,19 +685,6 @@ fully-uncovered gap to close on a connect the user drove directly.
 uses — `start_inner` does not independently re-read the persisted intent
 file, which has out-of-process writers (`hole bridge unlock`) that could
 otherwise flip it mid-attempt and desync the two phases.
-
-The Phase-0 guard's RELEASE, unlike its ENGAGE, is keyed on the persisted
-intent alone (`!lockdown_on`), not on whether THIS attempt applies — gating
-it on `lockdown_applies` would disengage an already-armed guard on every
-manual SocksOnly start while intent is still on (`lockdown_applies` is false
-there too, same as when intent is genuinely off), with no replacement cover
-to fall back to (the transient cover only engages when `covered`), silently
-failing the kill switch open while `lockdown_enabled()` keeps reading true.
-`start_cancellable` runs this release strictly before the transient-cover
-block has a chance to engage: releasing it after would, on macOS, have the
-disengage's restore-to-original `pfctl -f -` wipe the transient ruleset that
-block had just installed, silently opening the host during the very
-covered-start window the transient cover exists to protect.
 
 `hole bridge unlock` is the elevated escape hatch to disengage a standing cover
 when no bridge is alive (`cutover::unlock`). Unlike the best-effort startup

@@ -218,16 +218,6 @@ impl Routing for MockRouting {
         Ok(MockCover)
     }
 
-    fn reengage_lockdown_permits(
-        &self,
-        _old: MockCover,
-        _server_ip: IpAddr,
-        _resolver_ip: Option<IpAddr>,
-        _app_ids: &[PathBuf],
-    ) -> Result<MockCover, (RoutingError, MockCover)> {
-        Ok(MockCover)
-    }
-
     fn engage_lockdown_tun(
         &self,
         _tun_name: &str,
