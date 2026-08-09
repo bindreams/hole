@@ -258,10 +258,9 @@ struct BlockedStart<C> {
     /// retry never re-resolves, so it reuses this — revalidated against the
     /// retry's own config, so an edited resolver set is never overridden.
     pin: crate::dns::ech::PinSource,
-    /// The resolver this cover's ENGAGE actually permitted (or `None`) — see
-    /// the struct doc. Distinct from `pin`: `pin` is revalidated every retry,
-    /// this field is not, because it describes the live OS cover, not the
-    /// current config.
+    /// Distinct from `pin`: `pin` is revalidated every retry, this field is
+    /// not — it describes the live OS cover, not the current config. See the
+    /// struct doc for what it means.
     resolver_permit: Option<IpAddr>,
     /// `Some(x)` when the LAST repair attempt wanted to correct the permit to
     /// `x` but the corrected engage failed and a compensating restore fell

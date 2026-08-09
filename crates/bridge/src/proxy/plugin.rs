@@ -556,7 +556,7 @@ pub(crate) fn effective_ech_doh(
 }
 
 /// ex-ray's own default for the `host` option
-/// (`crates/ex-ray/config.go:45`: `flag.String("host", "cloudfront.com", ...)`)
+/// (`crates/ex-ray/config.go:65`: `flag.String("host", "cloudfront.com", ...)`)
 /// — a real DOMAIN, not "no SNI". An absent `host` segment is NOT the same
 /// as an unreachable config; see `ex_ray_default_host_matches_vendored_config_go`
 /// for the executable pin against the vendored Go source (can't run the Go
@@ -906,16 +906,10 @@ fn ech_fetch_is_reachable(segments: &[garter::OptionSegment<'_>], ech_doh: Optio
     // "experiment:8357203.0.113.5") while the stripped value ex-ray
     // actually uses ("203.0.113.5") is an IP, unreachable.
     let sni = sni.strip_prefix(V2RAY_CORE_EXP_8357_PREFIX).unwrap_or(sni);
-    // `sni` is empty only when `*host` was EXACTLY the bare prefix —
-    // `WithDestination` (see this function's doc) then fills
-    // `config.ServerName` from `remoteAddr` instead, which `ApplyECH`
-    // actually reads. An absent `remoteAddr` falls back to Hole's own
-    // `SS_REMOTE_HOST`, which this function cannot see (env, not
-    // `plugin_opts`) — but is ALWAYS an IP literal in Hole's own spawn path
-    // (`crate::proxy::plugin` never resolves a domain later than
-    // `garter::binary::sip003_env`, which passes an already-resolved
-    // `SocketAddr`), so an absent `remoteAddr` is correctly treated as "not
-    // a domain" (`""`) without needing to see it.
+    // An absent `remoteAddr` falls back to Hole's own `SS_REMOTE_HOST` (env,
+    // invisible here) — but is ALWAYS an IP literal in Hole's own spawn path
+    // (`garter::binary::sip003_env` passes an already-resolved `SocketAddr`),
+    // so treating an absent value as `""` here is safe.
     let sni = if sni.is_empty() {
         segments
             .iter()
@@ -1071,9 +1065,15 @@ fn classify_ech_doh(
     }
 
     // ex-ray only arms ECH_DOHserver when the value is non-empty
-    // (config.go:213: `if *echDoh != "" { tlsConfig.Ech_DOHserver = *echDoh }`)
-    // — an empty or bare (reads as ex-ray's own `"1"`, not a URL) operator
-    // value is silently inert, same as no `ech-doh` at all.
+    // (config.go:360-361: `if *echDoh != "" { tlsConfig.Ech_DOHserver =
+    // *echDoh }`) — an EMPTY operator value is inert, same as no `ech-doh`
+    // at all. A BARE `ech-doh` (no `=`) is different: it reads as ex-ray's
+    // own literal `"1"` (args.go), not an empty string, and `parseURLOption`
+    // (options.go) rejects any non-empty value that isn't a well-formed
+    // `https://` URL — so a bare `ech-doh` is FATAL, not inert;
+    // `ech_fetch_is_reachable`'s check above (which reads
+    // `ex_ray_fatal_config_error`) already routes it to `None` before this
+    // line is ever reached.
     let effective = if ech_doh.is_some() && (config_ech_doh.is_none() || displaces) {
         EffectiveEchDoh::Holes
     } else if let Some(v) = config_ech_doh.map(ex_ray_flag_value).filter(|v| !v.is_empty()) {
@@ -1154,10 +1154,10 @@ fn inject_plugin_directives(
             // off" holds regardless of reachability.
             let reachable = ech_fetch_is_reachable(&segments, ech_doh);
             // Presence alone isn't enough for the match below: ex-ray only
-            // arms `Ech_DOHserver` for a NON-empty value (config.go:213,
-            // same rule `classify_ech_doh` already applies to its
-            // `Operators` arm) — an explicitly empty `ech-doh=` must read
-            // as "no config value", not as one standing.
+            // arms `Ech_DOHserver` for a NON-empty value (same rule
+            // `classify_ech_doh` already applies to its `Operators` arm) —
+            // an explicitly empty `ech-doh=` must read as "no config
+            // value", not as one standing.
             let config_ech_doh_value = config_ech_doh.filter(|s| !ex_ray_flag_value(s).is_empty());
             match (ech_doh, config_ech_doh_value) {
                 _ if !reachable && (ech_doh.is_some() || config_ech_doh.is_some()) => tracing::warn!(
@@ -1186,14 +1186,9 @@ fn inject_plugin_directives(
                     "no configured resolver to pin the ECH lookup to; the config's own ech-doh stands: {}", s.raw
                 ),
                 // ECH is armed only by `ech-doh`, so there is none. `ech=always`
-                // can never reach this arm: with `ech_doh` and the config's own
-                // both absent/empty, `resolved_ech_doh_is_empty` is unconditionally
-                // true, so `ex_ray_fatal_config_error` already routed
-                // `ech=always` through the `if let Some(key) = ...` branch
-                // above — `Some("ech")` when TLS isn't enabled (`ech=always`
-                // requires it), else `Some("ech-doh")` (`ech=always` requires
-                // a non-empty resolved `ech-doh`). `ech` here is therefore
-                // never `"always"` — no `fail_closed` field to report.
+                // can't reach here — `ex_ray_fatal_config_error` already routes
+                // it through the fatal-config warning above (see that fn's
+                // doc). No `fail_closed` field to report.
                 (None, None) => tracing::warn!(plugin = %plugin_name, "no ech-doh from any source; ECH is off"),
             }
         }
@@ -2206,11 +2201,12 @@ mod inject_tests {
         }
     }
 
-    // `ech=always` with an empty RESOLVED `ech-doh` is itself a
-    // config-build error (config.go:218-220) distinct from a plain invalid
-    // `ech` value — ex-ray refuses to start rather than merely skipping
-    // ECH. Reachable whenever Hole has no candidate of its own (no pinned
-    // resolver) and the operator's own config supplies none either.
+    // `ech=always` with an empty RESOLVED `ech-doh` is itself a config-build
+    // error (config.go's `buildTLSConfig`, `"ech=always requires ech-doh to
+    // be set"`) distinct from a plain invalid `ech` value — ex-ray refuses
+    // to start rather than merely skipping ECH. Reachable whenever Hole has
+    // no candidate of its own (no pinned resolver) and the operator's own
+    // config supplies none either.
     #[skuld::test]
     fn ech_always_with_no_ech_doh_from_any_source_never_reaches_ex_ray() {
         assert_eq!(
@@ -2222,7 +2218,7 @@ mod inject_tests {
     }
 
     // As above, but the operator's OWN `ech-doh=` is explicitly empty
-    // rather than absent — same config.go:218-220 fatal, same expectation.
+    // rather than absent — same fatal check, same expectation.
     #[skuld::test]
     fn ech_always_with_an_explicitly_empty_operator_ech_doh_never_reaches_ex_ray() {
         let segments = garter::split_plugin_options("tls;host=cdn.example;ech=always;ech-doh=").unwrap();
@@ -2466,7 +2462,8 @@ mod inject_tests {
 
     // `classify_ech_doh` must read whether ex-ray will even ATTEMPT ECH, not
     // just plugin family + ech-doh presence — `ech=never` short-circuits it
-    // (config.go:209-211) regardless of `tls`/`host`/`ech-doh`.
+    // (config.go's `buildTLSConfig`, `case "never":`) regardless of
+    // `tls`/`host`/`ech-doh`.
     #[skuld::test]
     fn ech_never_never_reaches_ex_ray_even_with_tls_and_ech_doh() {
         let e = pinned("https://9.9.9.9/dns-query");
@@ -2567,7 +2564,7 @@ mod inject_tests {
     }
 
     // `ech` and `mode` are CLOSED enums to ex-ray (`switch *echMode` /
-    // `switch *mode`, config.go:209,281) — a value outside the known set is
+    // `switch *mode`, config.go) — a value outside the known set is
     // a config-build error and `main.go` exits (23) before the server ever
     // starts, so no dial of any kind happens. A bare `ech` (no `=`) reads as
     // `"1"` to ex-ray, which is exactly such an invalid value — NOT
@@ -2824,8 +2821,10 @@ mod inject_tests {
 
     // ex-ray's `buildTLSConfig` (and therefore its whole `ech` switch) is
     // only called when `tlsEnabled` — never for a plain, non-quic transport
-    // with no `tls` flag (config.go:290-294,334). A permit or warning for
-    // this config would be for a fetch that provably cannot happen.
+    // with no `tls` flag (config.go's `if *tlsEnabled { ... }` guard, and
+    // `mode=quic`'s own `*tlsEnabled = true` in the mode switch above it). A
+    // permit or warning for this config would be for a fetch that provably
+    // cannot happen.
     #[skuld::test]
     fn no_tls_and_not_quic_never_reaches_ex_ray() {
         let e = pinned("https://9.9.9.9/dns-query");
@@ -2837,7 +2836,8 @@ mod inject_tests {
     }
 
     // `mode=quic` force-enables TLS even with no explicit `tls` flag
-    // (config.go:290-294) — first-wins, matching every other flag here.
+    // (config.go's mode switch, `*tlsEnabled = true`) — first-wins, matching
+    // every other flag here.
     #[skuld::test]
     fn quic_mode_reaches_ex_ray_without_an_explicit_tls_flag() {
         let e = pinned("https://9.9.9.9/dns-query");

@@ -418,18 +418,10 @@ pub trait Routing: Send + Sync {
     /// OPERATOR's own `ech-doh` winning instead of Hole's (an address Hole
     /// did not author, so the config-authorship trust does not extend to it
     /// — a disclosed residual, see CONTRIBUTING.md). `None` is never
-    /// permitted as "no restriction" — a retry whose resolver changed since
-    /// the cover engaged compares this attempt's freshly-derived
-    /// `resolver_ip` against the held cover's, and on drift releases and
-    /// re-engages with the corrected value, falling back to restoring the OLD
-    /// value if the corrected engage itself fails: a permit correction takes
-    /// BOTH engages failing to lose the cover, not one — narrower than the
-    /// ordinary single-engage failure case, not impossible. On that double
-    /// failure the attempt proceeds uncovered (same as any other engage
-    /// failure) and the next retry re-engages fresh, since the held cover is
-    /// now `None` — see `BlockedStart`'s doc. See CONTRIBUTING.md's
-    /// "Transient cutover cover" section for the full retry-repair state
-    /// machine and the disclosed residuals this trait's caller does not
+    /// permitted as "no restriction". See CONTRIBUTING.md's "Transient
+    /// cutover cover" section for the full retry-repair state machine (a
+    /// resolver drift releases and re-engages the cover with the corrected
+    /// value) and the disclosed residuals this trait's caller does not
     /// close.
     ///
     /// The cover survives a process crash (Windows: persistent WFP filters keyed by fixed
