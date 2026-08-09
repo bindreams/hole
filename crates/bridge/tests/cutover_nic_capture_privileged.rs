@@ -250,8 +250,7 @@ fn cutover_global_net_state_nic_capture_no_udp_leak() {
     lockdown_state::set_enabled(dir.path(), true, None).expect("persist lockdown intent");
     let cover = engage_lockdown(
         server_ip,
-        None,
-        Some("Loopback Pseudo-Interface 1"), // always-present LUID source; the block governs the probed egress
+        "Loopback Pseudo-Interface 1", // always-present LUID source; the block governs the probed egress
         &SystemLuidResolver,
         &[],
         dir.path(),
