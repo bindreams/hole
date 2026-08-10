@@ -37,6 +37,18 @@ pub enum PinSource {
     ResolverDeselected,
 }
 
+/// The port implied by [`doh_url_for_ip`]'s bare `https://` scheme (RFC
+/// 9110's default port for `https`, since the URL never carries an explicit
+/// one) — the ONE port ex-ray's ECH-config fetch can ever dial for a URL this
+/// module builds. `doh_url_for_ip_ports_to_the_https_default` pins this with
+/// an executable assertion against the URL crate's own scheme-default table,
+/// not just prose. `tun-engine`'s fail-closed cover mirrors this value as
+/// `RESOLVER_PERMIT_PORT` (`crates/tun-engine/src/routing/failclosed.rs`) —
+/// a separate declaration, not an import: `tun-engine` sits BELOW
+/// `hole-bridge` in the crate dependency graph, so it cannot import from
+/// here.
+pub const DOH_PORT: u16 = 443;
+
 /// DoH endpoint URL that pins the resolver by IP: `https://<ip>/dns-query`,
 /// IPv6 bracketed per RFC 3986 §3.2.2. It names no host, so a client dials
 /// `ip` directly and verifies the certificate against an IP SAN — it has
@@ -65,16 +77,46 @@ pub fn authority_is_a_name(url: &str) -> bool {
 /// carried rather than reduced to "pinned": each one warrants a different line
 /// in the log, and only [`PinSource::Answered`] outranks a value the config
 /// already carries whose authority is not a name (see [`authority_is_a_name`]).
+///
+/// `resolver` is the exact address `url` names — Hole constructed `url` from
+/// it (`doh_url_for_ip`), never a guess. The fail-closed cover permits
+/// exactly this address regardless of `source`: it always comes from the
+/// user's OWN configured `dns.servers`, so permitting it is config-authorship
+/// trust, not a claim that THIS attempt personally dialed it — `Answered`
+/// and `SecureBootstrapFailed` did (`resolve_via_doh` dials every configured
+/// resolver even on total failure); `NoQueryNeeded` dialed nothing at all
+/// (a literal-IP server short-circuits before the loop), and
+/// `ResolverDeselected`'s fallback may name an address only a PRIOR resolve
+/// dialed, or never dialed this bridge process at all. See
+/// `Routing::install_failclosed_cover`'s doc for why config-authorship alone
+/// is judged sufficient.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EchDoh {
     pub url: String,
+    pub resolver: IpAddr,
     pub source: PinSource,
 }
 
 impl EchDoh {
-    /// Whether a resolver demonstrated it serves DoH from this host.
+    /// Whether a resolver demonstrated it serves DoH from this host. Used
+    /// ONLY to break a tie against an operator's own `ech-doh` already in
+    /// `plugin_opts` (`crate::proxy::plugin::hole_ech_doh_outranks`) — NOT to
+    /// gate the fail-closed cover's permit, which reads `resolver` directly
+    /// regardless of pin state (see `EchDoh`'s doc).
     pub fn is_pinned(&self) -> bool {
-        matches!(self.source, PinSource::Answered(_))
+        self.source.verified_ip().is_some()
+    }
+}
+
+impl PinSource {
+    /// The address this pin has demonstrated reachable via a verified DoH
+    /// exchange, if any. Only `Answered` names one; see `EchDoh::is_pinned`'s
+    /// doc for how this is used.
+    pub fn verified_ip(self) -> Option<IpAddr> {
+        match self {
+            PinSource::Answered(ip) => Some(ip),
+            _ => None,
+        }
     }
 }
 
@@ -88,17 +130,16 @@ impl EchDoh {
 /// one address family on a path where nothing demonstrated the host has it, and
 /// ex-ray cannot fail over to the other.
 pub fn ech_doh_url(dns: &DnsConfig, source: PinSource) -> Option<EchDoh> {
-    let resolver = match source {
-        PinSource::Answered(ip) => Some(ip),
-        _ => dns
-            .servers
+    let resolver = source.verified_ip().or_else(|| {
+        dns.servers
             .iter()
             .find(|ip| ip.is_ipv4())
             .or_else(|| dns.servers.first())
-            .copied(),
-    };
+            .copied()
+    });
     resolver.map(|ip| EchDoh {
         url: doh_url_for_ip(ip),
+        resolver: ip,
         source,
     })
 }

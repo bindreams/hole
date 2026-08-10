@@ -10,5 +10,6 @@ pub mod ech;
 pub mod forwarder;
 pub mod providers;
 pub mod recovery;
+pub(crate) mod self_test;
 pub mod socks5_connector;
 pub mod system;

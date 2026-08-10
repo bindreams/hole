@@ -44,6 +44,10 @@ use tun_engine::gateway::GatewayInfo;
 use tun_engine::routing::failclosed::lockdown_state;
 use tun_engine::routing::{CoverGuard, Routing, SystemRouting};
 
+use crate::dns::self_test::{
+    build_local_dns, implicates_plugin_transport, report_plugin_output, run_forwarder_self_test, self_test_error_for,
+    SelfTestOutcome,
+};
 use crate::dns::system::{Dns, DnsApplied, DnsError, SystemDns};
 use crate::proxy::{
     build_ss_config, Proxy, ProxyError, RunningProxy, ShadowsocksProxy, TrafficTotals, TUN_DEVICE_NAME,
@@ -237,10 +241,15 @@ pub struct ProxyManager<P: Proxy = ShadowsocksProxy, R: Routing = SystemRouting,
     last_ech_doh: Option<String>,
 }
 
-/// A held block-until-connected cover plus the server identity it permits. The
-/// cover permits exactly `server_ip`, so a covered retry for the same `host`
-/// reuses `server_ip` rather than re-resolving — re-resolution under the held
-/// cover would be blocked (the cover permits the server, not the DoH resolvers).
+/// A held block-until-connected cover plus the server identity it permits.
+/// `resolver_permit` is what was ACTUALLY passed to `install_failclosed_cover`
+/// at the engage that produced `cover` — ground truth for what the LIVE OS
+/// cover permits, frozen until the next fresh engage. A covered retry against
+/// the same `host` reuses `server_ip` and never re-engages the cover UNLESS
+/// this attempt's freshly re-derived permit now differs from `resolver_permit`
+/// (e.g. the user added a plugin since the first attempt) — that drift makes
+/// the held cover stale, and `start_cancellable` releases it so the engage
+/// block re-engages fresh with the corrected permit.
 struct BlockedStart<C> {
     cover: C,
     host: String,
@@ -249,6 +258,10 @@ struct BlockedStart<C> {
     /// retry never re-resolves, so it reuses this — revalidated against the
     /// retry's own config, so an edited resolver set is never overridden.
     pin: crate::dns::ech::PinSource,
+    /// Distinct from `pin`: `pin` is revalidated every retry, this field is
+    /// not — it describes the live OS cover, not the current config. See the
+    /// struct doc for what it means.
+    resolver_permit: Option<IpAddr>,
 }
 
 impl<P: Proxy, R: Routing> ProxyManager<P, R, SystemDns> {
@@ -542,9 +555,10 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         #[cfg(not(test))]
         let bootstrap_querier: Option<std::sync::Arc<dyn crate::dns::bootstrap::DohQuerier>> = None;
 
-        // A held cover permits only the OLD server IP, so a start for a DIFFERENT
-        // server must release it BEFORE resolving — DoH under the stale cover would
-        // be blocked (the resolvers aren't permitted) and wedge.
+        // A DIFFERENT server's hostname needs a FRESH DoH resolution — not
+        // guaranteed to land on the resolver already baked into the held cover
+        // (see `BlockedStart`'s doc) — so a start for a different server must
+        // release the held cover BEFORE resolving.
         let stale = self.blocked.as_ref().is_some_and(|b| b.host != config.server.server);
         if stale {
             debug_assert!(self.blocked.is_some(), "stale implies a held cover");
@@ -552,8 +566,8 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
             warn!("start for a different server while blocked: releasing the held cover before re-resolving");
         }
 
-        // Resolve the server IP over private DoH. A same-server retry under the held
-        // cover reuses the cached IP (the cover blocks the resolvers).
+        // Resolve the server IP over private DoH. A same-server retry under the
+        // held cover reuses the cached IP and pin.
         let (server_ip, pin) = match self.blocked.as_ref().filter(|b| b.host == config.server.server) {
             Some(b) => (b.server_ip, crate::dns::ech::revalidate(b.pin, &config.dns.servers)),
             None => match Self::resolve_server_ip(config, &bootstrap_querier, &cancel).await {
@@ -573,25 +587,61 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
             },
         };
 
-        // Only a plugin chain carries an ECH lookup, so a plugin-less start
-        // derives nothing and reports nothing — an "unpinned ECH lookup" line
-        // there would name an exposure that does not exist. Every pin outcome
-        // reaches ex-ray as one URL, so the reason is named here or it is
-        // unrecoverable from the log.
-        let ech_doh = if config.server.plugin.is_some() {
-            let derived = crate::dns::ech::ech_doh_url(&config.dns, pin);
-            debug!(ech_doh = ?derived, ?pin, "ech-doh source");
-            if matches!(pin, crate::dns::ech::PinSource::ResolverDeselected) {
+        // `ech_doh` (what ex-ray is TOLD to fetch) and `ech_resolver_permit`
+        // (what THIS ATTEMPT would permit it to reach) both read the same
+        // plugin-presence + pin inputs — computed ONCE here so the two cannot
+        // drift apart under a future edit to either gate. Only a plugin chain
+        // carries an ECH lookup, so a plugin-less start derives nothing.
+        let plugin_pin: Option<crate::dns::ech::PinSource> = config.server.plugin.is_some().then_some(pin);
+
+        // Every pin outcome reaches ex-ray as one URL, so the reason is named
+        // here or it is unrecoverable from the log. An "unpinned ECH lookup"
+        // line for a plugin-less start would name an exposure that does not
+        // exist, hence `plugin_pin` gating this too.
+        let ech_doh = plugin_pin.and_then(|p| {
+            let derived = crate::dns::ech::ech_doh_url(&config.dns, p);
+            debug!(ech_doh = ?derived, ?p, "ech-doh source");
+            if matches!(p, crate::dns::ech::PinSource::ResolverDeselected) {
                 warn!("covered retry: the cached DoH resolver is no longer configured; the ECH lookup is unpinned");
             }
             derived
-        } else {
-            None
-        };
+        });
         #[cfg(test)]
         {
             self.last_ech_doh = ech_doh.as_ref().map(|e| e.url.clone());
         }
+
+        // `ech_doh` is Hole's CANDIDATE — what it would tell ex-ray, before
+        // `inject_plugin_directives` runs. That injection only rewrites
+        // `ech-doh` for the v2ray-family plugin names, and even then an
+        // operator's own `ech-doh` already in `plugin_opts` can win
+        // first-wins over Hole's (see `effective_ech_doh`'s doc). The cover
+        // must be gated on whether Hole's candidate is the EFFECTIVE value
+        // ex-ray actually dials — not on `ech_doh.is_some()` alone — or a
+        // non-ECH-capable plugin, or an operator's own override, would widen
+        // the cover for a fetch that provably does not use it. The residual
+        // warning below also reads `effective_ech_doh` directly, to name an
+        // operator-won address the cover cannot permit either.
+        let effective_ech_doh = crate::proxy::plugin::effective_ech_doh(
+            config.server.plugin.as_deref().unwrap_or_default(),
+            config.server.plugin_opts.as_deref(),
+            ech_doh.as_ref(),
+        );
+        let ech_effective = matches!(effective_ech_doh, crate::proxy::plugin::EffectiveEchDoh::Holes);
+
+        // `ech_doh.resolver`, read directly — not re-derived from `pin` — is
+        // the exact address the ECH-config fetch will dial (see `EchDoh`'s
+        // doc for why permitting it costs no new trust regardless of
+        // `PinSource`). Gated on `ech_effective`, not `ech_doh.is_some()`: a
+        // non-ECH-capable plugin or an operator's own override never widens
+        // the cover for a fetch that provably won't use Hole's address.
+        let ech_resolver_permit = ech_effective.then_some(ech_doh.as_ref()).flatten().map(|e| e.resolver);
+        debug!(
+            ?ech_resolver_permit,
+            ?pin,
+            ech_effective,
+            "failclosed cover resolver permit"
+        );
 
         // Engage the block-until-connected cover for a covered start UNLESS the
         // standing lockdown intent is on: that cohort installs the lockdown cover
@@ -603,23 +653,138 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
             .as_deref()
             .map(lockdown_state::load_enabled)
             .unwrap_or(false);
+
+        // A held cover's resolver_permit is fixed at engage time; re-engage
+        // whenever this attempt's fresh derivation DIFFERS from what the
+        // held cover already has — a narrowing to `None` (e.g. the plugin
+        // was removed, or `effective_ech_doh` no longer resolves to
+        // `Holes`) drifts too: leaving a wider-than-needed permit live is a
+        // real widening of the kill switch (the resolver permit carries no
+        // App-ID/process scoping on either platform, so it is available to
+        // every process on the host, not just the plugin chain), not a
+        // correction with no benefit. `repair_fallback` captures what's
+        // being given up: `Some((old_permit, original_pin))` means a good
+        // cover existed a moment ago, so a failed fresh engage below
+        // restores it instead of leaving the host uncovered. `original_pin`
+        // is `pin` BEFORE this attempt's own `revalidate` — see the repair
+        // arms below for why it, not the local `pin` variable, is what gets
+        // stored back.
+        //
+        // A retry whose desired permit still matches a value a PRIOR repair
+        // already proved unreachable is not treated specially — it repairs
+        // again like any other drift. The corrected engage's own failure
+        // could be transient (a momentary OS-level condition), not a
+        // lasting property of the value, so there is no principled way to
+        // tell "will fail again" from "would now succeed" without trying;
+        // skipping on a heuristic (e.g. a fixed number of retries) would
+        // just delay a correction that could have landed this attempt. Each
+        // attempt's release-to-reengage window is bounded to this one
+        // (user-paced) retry either way — see the restore fallback below.
+        let repair_fallback: Option<(Option<IpAddr>, crate::dns::ech::PinSource)> = if covered && !lockdown_on {
+            self.blocked
+                .as_mut()
+                .filter(|b| b.host == config.server.server && b.resolver_permit != ech_resolver_permit)
+                .map(|b| (b.resolver_permit, b.pin))
+        } else {
+            None
+        };
+        if repair_fallback.is_some() {
+            self.blocked.take();
+            warn!(
+                "covered retry: this attempt's resolver permit differs from the held cover's; \
+                 releasing it so a fresh engage can correct it — egress is briefly OPEN until \
+                 the corrected (or, on failure, the restored) cover re-engages below"
+            );
+        }
+
         if covered && !lockdown_on {
             // The transient cover is a global singleton — never construct a second
             // over the same objects. An engage failure proceeds UNCOVERED (aborting
-            // would leave the user unconnected AND unprotected), surfaced via last_error.
+            // would leave the user unconnected AND unprotected), surfaced via last_error
+            // — UNLESS this was a repair (`repair_fallback` is `Some`), in which case
+            // the host was ALREADY covered a moment ago and a compensating re-engage
+            // of the OLD permit is attempted first: correcting a permit now takes
+            // BOTH the corrected AND the restore engage failing to lose the cover
+            // (the `Err(e2)` arm below), not one — never impossible, just
+            // narrowed from the ordinary single-engage failure case. On that
+            // double failure this attempt proceeds open, same as the
+            // non-repair case; the NEXT retry finds `self.blocked` is `None`
+            // and re-engages fresh from scratch.
             if self.blocked.is_none() {
-                match self.routing.install_failclosed_cover(server_ip) {
+                // A repair's corrected engage still carries forward the
+                // ORIGINAL cover's `pin`, not this attempt's locally
+                // revalidated `pin`: `pin` (the struct field) records when
+                // the SERVER IP was resolved, a fact independent of which
+                // ECH resolver this attempt's permit needs — `revalidate`
+                // only ever downgrades (`Answered` -> `ResolverDeselected`),
+                // so persisting an already-downgraded value here would make
+                // that loss permanent, unrecoverable even once the original
+                // resolver returns to `dns.servers`. A fresh (non-repair)
+                // engage has no prior cover to preserve, so `pin` (fresh
+                // from resolve, or a first same-host reuse) is correct as-is.
+                let engaged_pin = repair_fallback.map_or(pin, |(_, original_pin)| original_pin);
+                match self.routing.install_failclosed_cover(server_ip, ech_resolver_permit) {
                     Ok(cover) => {
                         self.blocked = Some(BlockedStart {
                             cover,
                             host: config.server.server.clone(),
                             server_ip,
-                            pin,
+                            pin: engaged_pin,
+                            resolver_permit: ech_resolver_permit,
                         });
                     }
                     Err(e) => {
-                        warn!(error = %e, "failed to engage fail-closed cover on covered start; host NOT blocked, proceeding open");
-                        self.last_error = Some(e.to_string());
+                        if let Some((old_permit, original_pin)) = repair_fallback {
+                            match self.routing.install_failclosed_cover(server_ip, old_permit) {
+                                Ok(cover) => {
+                                    self.blocked = Some(BlockedStart {
+                                        cover,
+                                        host: config.server.server.clone(),
+                                        server_ip,
+                                        pin: original_pin,
+                                        resolver_permit: old_permit,
+                                    });
+                                    // The restored permit is stale either way, but which
+                                    // direction it's stale in depends on whether the fetch
+                                    // this attempt needs an ECH resolver at all: widening
+                                    // repairs (`Holes`) restore something narrower than
+                                    // needed, so the fetch may stall; narrowing repairs
+                                    // (`None`/`Operators`, no fetch this cover permits
+                                    // anyway) instead restore something WIDER than needed —
+                                    // a live kill-switch permit for an address nothing
+                                    // dials, not a stall risk.
+                                    if matches!(effective_ech_doh, crate::proxy::plugin::EffectiveEchDoh::Holes) {
+                                        warn!(
+                                            error = %e,
+                                            "failed to engage the corrected fail-closed cover; restored the \
+                                             PREVIOUS permit instead of leaving the host open — ex-ray's ECH \
+                                             fetch may still stall against the now-stale permit"
+                                        );
+                                    } else {
+                                        warn!(
+                                            error = %e,
+                                            ?old_permit,
+                                            "failed to engage the corrected fail-closed cover; restored the \
+                                             PREVIOUS permit instead of leaving the host open — the fail-closed \
+                                             cover still permits a resolver address this attempt no longer needs"
+                                        );
+                                    }
+                                    self.last_error = Some(e.to_string());
+                                }
+                                Err(e2) => {
+                                    warn!(
+                                        error = %e,
+                                        restore_error = %e2,
+                                        "failed to engage BOTH the corrected and the previous fail-closed \
+                                         cover; host NOT blocked, proceeding open"
+                                    );
+                                    self.last_error = Some(e.to_string());
+                                }
+                            }
+                        } else {
+                            warn!(error = %e, "failed to engage fail-closed cover on covered start; host NOT blocked, proceeding open");
+                            self.last_error = Some(e.to_string());
+                        }
                     }
                 }
             }
@@ -640,6 +805,54 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
             warn!("uncovered start while blocked: releasing the held cover (host fail-open by design)");
         }
         let blocking_engaged = self.blocked.is_some();
+
+        // Disclosed residual (see CONTRIBUTING.md's "Transient cutover
+        // cover" section) gated on `effective_ech_doh`, the value that will
+        // ACTUALLY reach ex-ray: `Holes` still stalls only if a repair's
+        // restore left the LIVE held permit different from what this
+        // attempt needs (`live_permit != ech_resolver_permit`); `Operators(url)`
+        // always stalls, since the cover never permits an operator-chosen
+        // address; `None` never stalls (no fetch is attempted) but a
+        // repair's restore can still leave the LIVE permit WIDER than this
+        // attempt needs — the opposite residual direction, a kill-switch
+        // widening rather than a stall risk.
+        if blocking_engaged {
+            match &effective_ech_doh {
+                crate::proxy::plugin::EffectiveEchDoh::None => {
+                    let live_permit = self.blocked.as_ref().and_then(|b| b.resolver_permit);
+                    if live_permit.is_some() {
+                        warn!(
+                            ?pin,
+                            ?live_permit,
+                            "covered start: the fail-closed cover still permits a resolver address this \
+                             attempt does not need (a repair's restore left it stale); the kill switch is \
+                             wider than the current config requires"
+                        );
+                    }
+                }
+                crate::proxy::plugin::EffectiveEchDoh::Holes => {
+                    let live_permit = self.blocked.as_ref().and_then(|b| b.resolver_permit);
+                    if live_permit != ech_resolver_permit {
+                        warn!(
+                            ?pin,
+                            ech_doh_url = ?ech_doh.as_ref().map(|e| &e.url),
+                            ?live_permit,
+                            ?ech_resolver_permit,
+                            "covered start: the ECH-config fetch will dial a resolver the fail-closed cover \
+                             does not permit (a repair's restore left it stale); it may stall to ex-ray's \
+                             client timeout"
+                        );
+                    }
+                }
+                crate::proxy::plugin::EffectiveEchDoh::Operators(url) => {
+                    warn!(
+                        operator_ech_doh = %url,
+                        "covered start: the plugin's own ech-doh overrides Hole's and dials a resolver the \
+                         fail-closed cover does not permit; it may stall to ex-ray's client timeout"
+                    );
+                }
+            }
+        }
 
         debug!("awaiting start_inner");
         let result: Result<RunningState<P, R, D>, ProxyError> = Self::start_inner(
@@ -1046,7 +1259,6 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
                 (handle, stop)
             });
 
-            let started = std::time::Instant::now();
             let outcome = run_forwarder_self_test(
                 std::sync::Arc::clone(fwd),
                 config.dns.servers.clone(),
@@ -1054,26 +1266,39 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
                 cancel.clone(),
             )
             .await;
-            match outcome.into_result(started.elapsed().as_millis() as u64) {
+            match outcome {
                 // Self-test passed: cancel the probe token.
-                Ok(_) => {
+                SelfTestOutcome::Ok { .. } => {
                     if let Some((_, stop)) = probe {
                         stop.cancel();
                     }
                 }
+                // The user asked for the cancel; stop the probe and propagate.
+                SelfTestOutcome::Cancelled => {
+                    if let Some((_, stop)) = probe {
+                        stop.cancel();
+                    }
+                    return Err(ProxyError::Cancelled);
+                }
                 // The forwarder failed: await the concurrent probe's verdict and
                 // reclassify the error. It ran in parallel, so the wait is at most
                 // the probe's remaining budget, not its full duration on top.
-                Err(ProxyError::ForwarderSelfTestFailed {
+                // `elapsed_ms` rides in the outcome, measured by the self-test
+                // itself, so the duration in the user's sentence can never grow
+                // to include this wait.
+                SelfTestOutcome::Failed {
                     attempts,
                     elapsed_ms,
                     reason,
-                }) => {
+                } => {
                     let verdict = match probe {
                         Some((handle, _stop)) => match handle.await {
                             Ok(v) => Some(v),
+                            // The probe's verdict outranks the self-test's own
+                            // reading, so losing it degrades the report — WARN,
+                            // or the downgrade is invisible at the default level.
                             Err(e) => {
-                                tracing::debug!(%e, "reachability probe task did not complete");
+                                warn!(%e, "reachability probe task did not complete; its verdict is unavailable");
                                 None
                             }
                         },
@@ -1084,14 +1309,15 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
                     if cancel.is_cancelled() {
                         return Err(ProxyError::Cancelled);
                     }
-                    return Err(self_test_error_for(verdict, attempts, elapsed_ms, reason));
-                }
-                // Any other error (e.g. Cancelled): stop the probe, propagate as-is.
-                Err(e) => {
-                    if let Some((_, stop)) = probe {
-                        stop.cancel();
+                    // Checked against the pre-verdict `reason` AND `verdict`
+                    // directly (not against the FINAL `ProxyError`): once
+                    // `InconclusiveTransport` and `Other` both collapse into
+                    // `ForwarderSelfTestFailed`, that value alone can no
+                    // longer tell them apart — see `implicates_plugin_transport`'s doc.
+                    if implicates_plugin_transport(&reason, verdict) {
+                        report_plugin_output(plugin_chain.as_ref().map(|c| &**c.log()));
                     }
-                    return Err(e);
+                    return Err(self_test_error_for(verdict, attempts, elapsed_ms, reason));
                 }
             }
         }
@@ -1466,287 +1692,3 @@ mod proxy_manager_e2e_tests;
 #[cfg(test)]
 #[path = "proxy_manager_listener_e2e_tests.rs"]
 mod proxy_manager_listener_e2e_tests;
-
-// DNS wiring helpers ==================================================================================================
-
-/// Build the in-TUN DNS endpoint + forwarder, if the config enables it. The
-/// forwarder's upstream runs via [`crate::dns::socks5_connector::Socks5Connector`]
-/// targeting the just-started SS SOCKS5 listener, so user filter rules
-/// cannot strand our own queries.
-///
-/// Returns the `forwarder` Arc alongside the endpoint so the blocking
-/// self-test gate in `start_inner` can call `forwarder.forward(...)` without
-/// re-plumbing.
-///
-/// Rejects the `dns.enabled && servers.is_empty()` config combination with
-/// `ForwarderSelfTestFailed { reason: "no DNS servers configured" }` because
-/// that combination would otherwise produce a degenerate runtime (TUN routes
-/// go live but the forwarder has nothing to forward to).
-async fn build_local_dns(
-    dns_cfg: &hole_common::config::DnsConfig,
-    local_ss_port: u16,
-    ipv6_bypass_available: bool,
-    _cancel: CancellationToken,
-) -> Result<
-    (
-        Option<crate::endpoint::LocalDnsEndpoint>,
-        Option<std::sync::Arc<crate::dns::forwarder::DnsForwarder>>,
-    ),
-    ProxyError,
-> {
-    if !dns_cfg.enabled {
-        return Ok((None, None));
-    }
-    if dns_cfg.servers.is_empty() {
-        // Hard error: the only sensible recovery is to disable the forwarder.
-        // A live TUN with no upstream would strand every in-tunnel UDP/53
-        // flow at the LocalDnsEndpoint with nothing to forward to.
-        return Err(ProxyError::ForwarderSelfTestFailed {
-            reason: "no DNS servers configured".into(),
-            attempts: 0,
-            elapsed_ms: 0,
-        });
-    }
-
-    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-    use std::sync::Arc;
-
-    let socks_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), local_ss_port);
-    let connector = Arc::new(crate::dns::socks5_connector::Socks5Connector::new(socks_addr))
-        as Arc<dyn crate::dns::connector::UpstreamConnector>;
-    let forwarder = Arc::new(crate::dns::forwarder::DnsForwarder::new(
-        dns_cfg.clone(),
-        connector,
-        ipv6_bypass_available,
-    ));
-
-    // The in-TUN endpoint is the sole OS DNS path: OS DNS routes into hole-tun
-    // and is intercepted here, not via a loopback :53 server.
-    let endpoint = crate::endpoint::LocalDnsEndpoint::new(Arc::clone(&forwarder));
-
-    Ok((Some(endpoint), Some(forwarder)))
-}
-
-/// Hint logged on self-test failure when the plugin tap IS enabled.
-/// Tells the reader where the per-connection diagnostic lines are.
-pub(crate) const TAP_ENABLED_HINT: &str =
-    "DNS self-test failed with plugin tap enabled; check 'plugin tap: closed' lines above for per-connection bytes_to_plugin / bytes_from_plugin / ttfb_ms / close_kind";
-
-/// Hint logged on self-test failure when the plugin tap is NOT enabled.
-/// Tells the reader how to capture richer diagnostics next time.
-pub(crate) const TAP_DISABLED_HINT: &str =
-    "DNS self-test failed; to capture per-connection plugin diagnostics on next reproduction, set diagnostic_plugin_tap=true in AppConfig and restart the bridge";
-
-/// Run the forwarder self-test inline. Returns `SelfTestOutcome::Ok` when any
-/// well-formed non-SERVFAIL reply comes back within the 3×1500ms / 5s budget,
-/// else `Failed`.
-///
-/// `PER_ATTEMPT` is handed to `try_forward` as the PER-UPSTREAM budget, shrunk
-/// so that a whole attempt (one walk of N resolvers) still fits inside what is
-/// left of `OUTER_BUDGET`. `ATTEMPTS` is therefore a maximum: the loop stops
-/// early rather than overrun. Nothing wraps the call in a `timeout`, so every
-/// upstream failure is classified and logged before the gate gives up. Also writes
-/// the canonical `"forwarder self-test ok"` / `"forwarder self-test failed"`
-/// log line at `info!`. On failure, additionally emits a `warn!`
-/// correlation breadcrumb pointing the reader to the plugin tap
-/// (depending on whether it was enabled this run — see
-/// `TAP_ENABLED_HINT` / `TAP_DISABLED_HINT`).
-///
-/// A blocking gate: called from `start_inner` BEFORE `Dispatcher::new` /
-/// `routing.install` / `Dns::apply`. A failure short-circuits the start;
-/// the locally-owned `running_proxy` + `plugin_chain` RAII guards unwind
-/// without ever hijacking system DNS into a dead tunnel.
-async fn run_forwarder_self_test(
-    forwarder: std::sync::Arc<crate::dns::forwarder::DnsForwarder>,
-    servers: Vec<std::net::IpAddr>,
-    diagnostic_tap_enabled: bool,
-    cancel: CancellationToken,
-) -> SelfTestOutcome {
-    const PER_ATTEMPT: std::time::Duration = std::time::Duration::from_millis(1500);
-    const OUTER_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
-    const ATTEMPTS: u32 = 3;
-
-    let Some(&first_server) = servers.first() else {
-        info!("forwarder self-test skipped: no servers configured");
-        return SelfTestOutcome::Ok { attempts: 0 };
-    };
-
-    let query = sample_self_test_query();
-    let started = std::time::Instant::now();
-    // The overall bound is a DEADLINE the loop respects, not a `timeout` around
-    // it. A wrapping timeout would cancel — i.e. drop — whichever `forward_one`
-    // was in flight, and a dropped future produces no `UpstreamErr`, so that
-    // upstream's failure would never be classified or logged. Bounding each
-    // attempt by what remains instead means every attempt runs to completion
-    // and nothing is discarded.
-    let deadline = tokio::time::Instant::now() + OUTER_BUDGET;
-    let mut last_err: Option<String> = None;
-    let mut completed: u32 = 0;
-    let mut outcome = None;
-
-    for attempt in 1..=ATTEMPTS {
-        // Cooperative cancel check between retry attempts (#397).
-        if cancel.is_cancelled() {
-            return SelfTestOutcome::Cancelled;
-        }
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        if remaining.is_zero() {
-            break;
-        }
-        // `try_forward` walks every upstream it will attempt at `per_upstream`
-        // each, so divide what is left by that width to keep the whole attempt
-        // inside the deadline. The width comes from the forwarder, not from
-        // `servers.len()`: it skips IPv6 entries without an IPv6 bypass, and
-        // counting those would shrink every surviving upstream's budget while
-        // leaving part of the deadline unused. A zero-width walk dials nothing
-        // and returns immediately, so its budget is irrelevant.
-        let width = forwarder.attempted_upstreams();
-        let per_upstream = if width == 0 {
-            PER_ATTEMPT
-        } else {
-            PER_ATTEMPT.min(remaining / width as u32)
-        };
-        // The budget goes down into the forwarder so `forward_one`'s own
-        // deadline fires first, producing a classified `UpstreamErr` that
-        // `log_upstream_failure` can log. Cancel stays a `select!` arm:
-        // drop-on-cancel is the documented single exception in this module,
-        // since the forwarder's only in-flight resource is a socket that
-        // closes on Drop.
-        let result = tokio::select! {
-            biased;
-            _ = cancel.cancelled() => return SelfTestOutcome::Cancelled,
-            r = forwarder.try_forward(&query, per_upstream) => r,
-        };
-        completed = attempt;
-        match result {
-            Ok(reply) => {
-                if is_dns_reply_ok(&reply) {
-                    outcome = Some(SelfTestOutcome::Ok { attempts: attempt });
-                    break;
-                }
-                last_err = Some(format!("SERVFAIL reply on attempt {attempt}"));
-            }
-            Err(failure) => last_err = Some(format!("attempt {attempt} failed: {failure:?}")),
-        }
-    }
-
-    let outcome = outcome.unwrap_or_else(|| SelfTestOutcome::Failed {
-        attempts: completed,
-        reason: last_err.unwrap_or_else(|| format!("no attempt completed within {OUTER_BUDGET:?}")),
-    });
-
-    let elapsed_ms = started.elapsed().as_millis() as u64;
-    match &outcome {
-        SelfTestOutcome::Ok { attempts } => {
-            info!(%first_server, attempts, elapsed_ms, "forwarder self-test ok");
-        }
-        SelfTestOutcome::Failed { attempts, reason } => {
-            info!(%first_server, attempts, elapsed_ms, reason, "forwarder self-test failed");
-            // #388 correlation breadcrumb: tells the reader either
-            // where the tap data lives, or how to enable it for next
-            // reproduction. The actual error surfaces through
-            // ProxyError::ForwarderSelfTestFailed → IPC response →
-            // GUI; no error! log needed.
-            if diagnostic_tap_enabled {
-                warn!("{TAP_ENABLED_HINT}");
-            } else {
-                warn!("{TAP_DISABLED_HINT}");
-            }
-        }
-        SelfTestOutcome::Cancelled => {
-            info!(%first_server, elapsed_ms, "forwarder self-test cancelled");
-        }
-    }
-    outcome
-}
-
-#[derive(Debug)]
-enum SelfTestOutcome {
-    Ok {
-        attempts: u32,
-    },
-    Failed {
-        attempts: u32,
-        reason: String,
-    },
-    /// The bridge cancel token fired before the self-test could complete
-    /// or fail definitively (#397). Maps to `ProxyError::Cancelled` via
-    /// `into_result`; not a diagnostic failure (the user asked for it).
-    Cancelled,
-}
-
-impl SelfTestOutcome {
-    /// Convert outcome to a Result for use as a start-time gate.
-    /// `Ok(attempts)` carries the attempt count taken to succeed (0 when
-    /// skipped because no servers configured — only reachable via the
-    /// `dns.enabled = false` branch in `build_local_dns`).
-    fn into_result(self, elapsed_ms: u64) -> Result<u32, ProxyError> {
-        match self {
-            Self::Ok { attempts } => Ok(attempts),
-            Self::Failed { attempts, reason } => Err(ProxyError::ForwarderSelfTestFailed {
-                reason,
-                attempts,
-                elapsed_ms,
-            }),
-            Self::Cancelled => Err(ProxyError::Cancelled),
-        }
-    }
-}
-
-/// Map a self-test failure to the `ProxyError` the toast sees, given the
-/// out-of-band reachability `verdict` (`None` when the probe was skipped). A
-/// `Blocked` verdict becomes the typed [`ProxyError::NetworkBlocked`];
-/// `TcpRefused`/`TcpTimeout` rewrite the reason to the probe's `user_message`;
-/// every other verdict keeps the `original` self-test reason.
-fn self_test_error_for(
-    verdict: Option<crate::reachability::ReachabilityVerdict>,
-    attempts: u32,
-    elapsed_ms: u64,
-    original: String,
-) -> ProxyError {
-    use crate::reachability::ReachabilityVerdict::*;
-    match verdict {
-        Some(Blocked) => ProxyError::NetworkBlocked,
-        Some(v @ (TcpRefused | TcpTimeout)) => ProxyError::ForwarderSelfTestFailed {
-            attempts,
-            elapsed_ms,
-            reason: v
-                .user_message()
-                .expect("TcpRefused/TcpTimeout always carry a user_message")
-                .to_owned(),
-        },
-        _ => ProxyError::ForwarderSelfTestFailed {
-            attempts,
-            elapsed_ms,
-            reason: original,
-        },
-    }
-}
-
-/// Treat "any well-formed DNS reply that isn't SERVFAIL" as success.
-/// The reply header is 12 bytes; RCODE lives in the low nibble of byte 3
-/// (RFC 1035 §4.1.1). RCODE 2 = SERVFAIL (upstream failed explicitly);
-/// all other RCODEs (NoError, NXDOMAIN, REFUSED) mean the path works.
-fn is_dns_reply_ok(reply: &[u8]) -> bool {
-    reply.len() >= 12 && (reply[3] & 0x0F) != 2
-}
-
-/// Build a minimal wire-format DNS query: `example.com A`. Used by
-/// [`run_forwarder_self_test`] — hardcoded hostname is acceptable
-/// because the forwarder self-test is an internal probe, never a user-
-/// visible config. NXDOMAIN on this name still proves the path works.
-fn sample_self_test_query() -> Vec<u8> {
-    let mut q = Vec::with_capacity(32);
-    q.extend_from_slice(&0x0001_u16.to_be_bytes()); // id
-    q.extend_from_slice(&[0x01, 0x00]); // flags: RD=1
-    q.extend_from_slice(&[0x00, 0x01]); // QDCOUNT=1
-    q.extend_from_slice(&[0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
-    q.push(7);
-    q.extend_from_slice(b"example");
-    q.push(3);
-    q.extend_from_slice(b"com");
-    q.push(0);
-    q.extend_from_slice(&[0x00, 0x01]); // QTYPE=A
-    q.extend_from_slice(&[0x00, 0x01]); // QCLASS=IN
-    q
-}

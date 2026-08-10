@@ -5,7 +5,6 @@
 
 use super::*;
 use crate::proxy::{Proxy, ProxyError, RunningProxy, TrafficTotals};
-use crate::reachability::ReachabilityVerdict;
 use hole_common::config::ServerEntry;
 use hole_common::protocol::ProxyConfig;
 use std::io;
@@ -184,6 +183,17 @@ struct MockRoutingState {
     /// Last `server_ip` passed to `install_failclosed_cover`, so a test can assert
     /// the cover permits exactly the resolved server IP.
     last_cover_server_ip: std::sync::Mutex<Option<IpAddr>>,
+    /// Last `resolver_ip` passed to `install_failclosed_cover`, so a test can
+    /// assert the cover permits exactly the ONE pinned resolver (or none).
+    last_cover_resolver_ip: std::sync::Mutex<Option<IpAddr>>,
+    /// `install_failclosed_cover` fails whenever its `resolver_ip` argument
+    /// is a MEMBER of this set, succeeding for every other value — lets a
+    /// test simulate "the corrected permit fails to engage, but the previous
+    /// one still would" (a singleton set) for the stale-permit repair's
+    /// compensating restore, or "both the corrected AND the restore fail"
+    /// (a set containing both values) for the double-failure fail-open path.
+    /// `fail_cover` (always-fail) is unaffected and takes priority.
+    fail_cover_for_resolvers: std::sync::Mutex<std::collections::HashSet<Option<IpAddr>>>,
 }
 
 impl Default for MockRoutingState {
@@ -202,6 +212,8 @@ impl Default for MockRoutingState {
             teardown_order: std::sync::Mutex::new(Vec::new()),
             last_install_server_ip: std::sync::Mutex::new(None),
             last_cover_server_ip: std::sync::Mutex::new(None),
+            last_cover_resolver_ip: std::sync::Mutex::new(None),
+            fail_cover_for_resolvers: std::sync::Mutex::new(std::collections::HashSet::new()),
         }
     }
 }
@@ -301,11 +313,25 @@ impl Routing for MockRouting {
 
     type Cover = MockCover;
 
-    fn install_failclosed_cover(&self, server_ip: IpAddr) -> Result<MockCover, RoutingError> {
+    fn install_failclosed_cover(
+        &self,
+        server_ip: IpAddr,
+        resolver_ip: Option<IpAddr>,
+    ) -> Result<MockCover, RoutingError> {
         if self.state.fail_cover.load(Ordering::SeqCst) {
             return Err(RoutingError::RouteSetup("mock cover failure".into()));
         }
+        if self
+            .state
+            .fail_cover_for_resolvers
+            .lock()
+            .unwrap()
+            .contains(&resolver_ip)
+        {
+            return Err(RoutingError::RouteSetup("mock cover failure for this resolver".into()));
+        }
         *self.state.last_cover_server_ip.lock().unwrap() = Some(server_ip);
+        *self.state.last_cover_resolver_ip.lock().unwrap() = resolver_ip;
         self.state.cover_engage_calls.fetch_add(1, Ordering::SeqCst);
         Ok(MockCover {
             state: Arc::clone(&self.state),
@@ -497,6 +523,20 @@ fn test_config() -> ProxyConfig {
         diagnostic_plugin_tap: false,
     }
 }
+
+/// `plugin_opts` for a plugin config that actually reaches ex-ray's ECH
+/// switch: TLS enabled via the bare `tls` flag, a domain `host` (ECH needs
+/// an SNI domain to key its DoH lookup on — an absent, empty, or IP-literal
+/// `host` means ex-ray dials with an IP-literal `ServerName`, so
+/// `ApplyECH` bails before ever dialing DoH), `ech` left at its `auto`
+/// default (`crates/ex-ray/config.go:209-223,290-294,334`;
+/// `third_party/v2ray-core/transport/internet/tls/ech.go:26-51`). Bare
+/// `plugin = Some("ex-ray")` with no options — TCP-only, no `tls`, no
+/// `host` — never reaches ECH at all regardless of `ech-doh`; tests that
+/// need a real cover permit or an ECH-posture warning must opt in via this
+/// constant, matching a real postern config
+/// (`a_postern_config_composes_into_holes_pinned_url` in plugin.rs).
+const ECH_CAPABLE_OPTS: &str = "tls;host=cdn.example";
 
 // Tests ===============================================================================================================
 
@@ -968,13 +1008,39 @@ fn mock_cover_engage_disengage_never_spawns() {
     let routing = MockRouting::new(dir.path().to_path_buf());
     let st = routing.state();
     for _ in 0..10 {
-        let cover = routing.install_failclosed_cover("1.2.3.4".parse().unwrap()).unwrap();
+        let cover = routing
+            .install_failclosed_cover("1.2.3.4".parse().unwrap(), None)
+            .unwrap();
         drop(cover);
     }
 
     assert_eq!(routing::ROUTING_SUBPROCESS_SPAWN_COUNT.load(Ordering::SeqCst), 0);
     assert_eq!(st.cover_engage_calls.load(Ordering::SeqCst), 10);
     assert_eq!(st.cover_disengage_calls.load(Ordering::SeqCst), 10);
+}
+
+#[skuld::test(serial)]
+fn mock_install_failclosed_cover_records_the_resolver_argument() {
+    let dir = tempfile::tempdir().unwrap();
+    let routing = MockRouting::new(dir.path().to_path_buf());
+    let st = routing.state();
+    let resolver: IpAddr = "9.9.9.9".parse().unwrap();
+
+    let cover = routing
+        .install_failclosed_cover("1.2.3.4".parse().unwrap(), Some(resolver))
+        .unwrap();
+    assert_eq!(*st.last_cover_resolver_ip.lock().unwrap(), Some(resolver));
+    drop(cover);
+
+    let cover = routing
+        .install_failclosed_cover("1.2.3.4".parse().unwrap(), None)
+        .unwrap();
+    assert_eq!(
+        *st.last_cover_resolver_ip.lock().unwrap(),
+        None,
+        "a None resolver_ip must be recorded as None, not left stale from the prior call"
+    );
+    drop(cover);
 }
 
 // Standing lockdown guard lifecycle (#527) ============================================================================
@@ -1931,32 +1997,31 @@ fn full_start_fails_closed_when_doh_cannot_resolve() {
 #[cfg(test)]
 mod self_test {
     use super::*;
-    use crate::dns::forwarder::DnsForwarder;
+    use crate::dns::forwarder::UpstreamCause;
     use crate::test_support::log_capture::VecWriter;
-    use crate::test_support::refusing_connector::{HangingConnector, RefusingConnector};
     use hole_common::config::{DnsConfig, DnsProtocol};
-    use std::sync::Arc as SArc;
     use tracing_subscriber::fmt;
     use tracing_subscriber::layer::{Layer, SubscriberExt};
 
-    fn test_dns_cfg() -> DnsConfig {
-        DnsConfig {
-            enabled: true,
-            servers: vec!["127.0.0.1".parse().unwrap()],
-            protocol: DnsProtocol::PlainTcp,
-            allow_insecure_bootstrap: false,
-        }
-    }
-
-    /// The self-test hands its budget DOWN to the forwarder instead of
-    /// wrapping the call in a `timeout`, so a failing attempt is classified and
-    /// logged before the self-test's own budget can drop it. This asserts the
-    /// reason carries the typed cause, i.e. the gate reports WHAT failed.
+    /// The gate REACHES `report_plugin_output`. Driven through the real
+    /// `start_inner` failure arm with the mock backends: `MockProxy` binds no
+    /// listener, so the forwarder's SOCKS5 connect cannot complete and the gate
+    /// fails. No plugin is configured, so the `None` branch is what proves the
+    /// call site exists — the `Some` branch differs only in the argument, and
+    /// `tests/plugin_chain.rs` proves a real chain's ring holds the child's
+    /// lines.
+    ///
+    /// Which classification comes out is deliberately NOT asserted: the SOCKS5
+    /// port is a real one, and pinning a variant would make the test depend on
+    /// nothing else being bound there. `classify_failure_covers_every_branch`
+    /// and `a_refused_local_hop_is_reported_as_no_connection` pin the variants
+    /// against stub connectors that own their outcome.
     #[skuld::test]
-    fn self_test_failure_logs_the_typed_upstream_cause() {
+    fn a_failed_gate_reaches_the_plugin_output_report() {
         let writer = VecWriter::new();
-
-        let outcome = tokio::runtime::Builder::new_current_thread()
+        // Current-thread: `set_default_in_current_thread` is thread-local, and
+        // the gate's work runs in tasks this start spawns.
+        tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap()
@@ -1969,404 +2034,75 @@ mod self_test {
                 );
                 let _guard = garter::tracing_test::set_default_in_current_thread(subscriber);
 
-                let forwarder = SArc::new(DnsForwarder::new(test_dns_cfg(), RefusingConnector::all(), false));
-                run_forwarder_self_test(
-                    forwarder,
-                    vec!["127.0.0.1".parse().unwrap()],
-                    false,
-                    CancellationToken::new(),
-                )
-                .await
+                // A standing lockdown suppresses the out-of-band reachability probe,
+                // whose TcpRefused verdict would otherwise replace the gate's own
+                // reading (see `self_test_error_for`'s precedence).
+                let dir = tempfile::tempdir().unwrap();
+                let routing = MockRouting::new(dir.path().to_path_buf());
+                let (mut pm, _dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, true);
+                let mut cfg = test_config();
+                // A real listener HELD open for the whole test, not a
+                // free_port()-allocated number: `free_port` only proves the
+                // port was free at the moment it probed, and nothing stops
+                // another process claiming and answering on it before the
+                // gate dials — a TOCTOU that would flip this run to
+                // `Other` (a reply arrived) and fail the assertion below as
+                // a flake. The listener never `accept()`s, so the SOCKS5
+                // handshake `Socks5Connector::connect_tcp` waits on never
+                // completes; the gate still fails (this test's whole point),
+                // just via a hung handshake instead of an instant refusal.
+                let held_port = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                cfg.local_port = held_port.local_addr().unwrap().port();
+                cfg.dns = DnsConfig {
+                    enabled: true,
+                    servers: vec!["127.0.0.1".parse().unwrap()],
+                    protocol: DnsProtocol::PlainTcp,
+                    allow_insecure_bootstrap: false,
+                };
+                pm.start(&cfg).await.expect_err("the gate must fail with no listener");
             });
-
-        let reason = match outcome {
-            SelfTestOutcome::Failed { reason, .. } => reason,
-            other => panic!("expected Failed, got {other:?}"),
-        };
-        assert!(
-            reason.contains("Unreachable"),
-            "the reason must name the cause, not just 'timed out'; got: {reason}"
-        );
-
         let output = writer.snapshot_string();
         assert!(
-            output.contains("upstream failed"),
-            "the per-upstream WARN must survive the self-test's budget; got:\n{output}"
-        );
-        assert!(
-            output.contains("layer=connect"),
-            "expected 'layer=connect'; got:\n{output}"
-        );
-        assert!(
-            output.contains("cause=unreachable"),
-            "expected 'cause=unreachable'; got:\n{output}"
-        );
-        assert!(
-            output.contains("budget_ms=1500"),
-            "the WARN must report the SELF-TEST's budget, proving it reached forward_one; got:\n{output}"
+            output.contains(crate::proxy::plugin_log::NO_PLUGIN_CONFIGURED),
+            "the failed gate must report on the plugin chain; got:\n{output}"
         );
     }
 
-    /// The overall budget is a deadline the loop respects, so a self-test whose
-    /// upstreams all hang stops ON TIME, reports the real typed failure, and
-    /// counts only the attempts that ran. Virtual time: the connector never
-    /// completes, so every `forward_one` budget expires via auto-advance and no
-    /// wall-clock is consumed.
+    /// The `None` branch above proves the call site exists; this proves the
+    /// `Some` branch actually reaches a real chain's lines. Drives the EXACT
+    /// expression `start_inner` uses — `plugin_chain.as_ref().map(|c| &**c.log())`
+    /// — against a `PluginChain::for_test` seeded with lines, rather than a
+    /// hand-constructed `Option<&PluginLog>`, so a regression in that
+    /// double-deref/reference conversion would show up here. The spawn +
+    /// readiness machinery that BUILDS a real `PluginChain` is proven
+    /// separately, against a real child, by `tests/plugin_chain.rs`.
     #[skuld::test]
-    fn self_test_respects_the_overall_deadline_and_reports_the_real_failure() {
-        let (outcome, elapsed) = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap()
-            .block_on(async {
-                tokio::time::pause();
-                let servers: Vec<std::net::IpAddr> = vec!["127.0.0.1".parse().unwrap(), "127.0.0.2".parse().unwrap()];
-                let cfg = DnsConfig {
-                    servers: servers.clone(),
-                    ..test_dns_cfg()
-                };
-                let forwarder = SArc::new(DnsForwarder::new(cfg, SArc::new(HangingConnector), false));
-                let t0 = tokio::time::Instant::now();
-                let outcome = run_forwarder_self_test(forwarder, servers, false, CancellationToken::new()).await;
-                (outcome, t0.elapsed())
-            });
+    async fn a_configured_plugins_lines_reach_the_report_through_the_real_call_site() {
+        let log = crate::proxy::plugin_log::PluginLog::new();
+        log.push_line("transport/internet/tls: ECH required but no ECH config could be obtained");
+        let plugin_chain = Some(crate::proxy::plugin::PluginChain::for_test(
+            log,
+            CancellationToken::new(),
+        ));
 
-        // Unbounded, this would cost ATTEMPTS × servers × PER_ATTEMPT = 9s; the
-        // deadline must cut it near 5s. tokio rounds every timer deadline UP to
-        // a whole millisecond and the loop arms at most one per upstream per
-        // attempt, so allow exactly that many milliseconds of overshoot.
-        const UNBOUNDED: std::time::Duration = std::time::Duration::from_secs(9);
-        let quantization = std::time::Duration::from_millis(3 * 2);
-        assert!(
-            elapsed < UNBOUNDED,
-            "the deadline must truncate the retry sequence; took {elapsed:?}"
+        let writer = VecWriter::new();
+        let subscriber = tracing_subscriber::registry().with(
+            fmt::layer()
+                .with_writer(writer.clone())
+                .with_ansi(false)
+                .with_filter(tracing_subscriber::filter::LevelFilter::WARN),
         );
-        assert!(
-            elapsed <= std::time::Duration::from_secs(5) + quantization,
-            "the loop must stop at the overall deadline; took {elapsed:?}"
-        );
-        match outcome {
-            SelfTestOutcome::Failed { reason, attempts } => {
-                assert!(
-                    reason.contains("Timeout"),
-                    "every upstream hung, so the reason must say so; got: {reason}"
-                );
-                assert!(
-                    !reason.contains("no attempt completed"),
-                    "attempts run to completion under a deadline; got: {reason}"
-                );
-                assert!(
-                    (1..=3).contains(&attempts),
-                    "attempts must count what actually ran; got {attempts}"
-                );
-            }
-            other => panic!("expected Failed, got {other:?}"),
+        {
+            let _guard = garter::tracing_test::set_default_in_current_thread(subscriber);
+            // The exact expression from start_inner's SelfTestOutcome::Failed arm.
+            super::report_plugin_output(plugin_chain.as_ref().map(|c| &**c.log()));
         }
-    }
-
-    /// Empty servers → `run_forwarder_self_test` logs `skipped` and
-    /// returns `Ok(0)`. Empty-servers in production is rejected at
-    /// `build_local_dns` *before* `run_forwarder_self_test` is even
-    /// called (test below: `build_local_dns_returns_err_for_empty_servers`);
-    /// this test pins the helper's contract in isolation.
-    #[skuld::test]
-    fn self_test_empty_servers_returns_ok_zero() {
-        let writer = VecWriter::new();
-
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap()
-            .block_on(async {
-                let subscriber = tracing_subscriber::registry().with(
-                    fmt::layer()
-                        .with_writer(writer.clone())
-                        .with_ansi(false)
-                        .with_filter(tracing_subscriber::filter::LevelFilter::INFO),
-                );
-                let _guard = garter::tracing_test::set_default_in_current_thread(subscriber);
-
-                let forwarder = SArc::new(DnsForwarder::new(test_dns_cfg(), RefusingConnector::all(), false));
-                let outcome = run_forwarder_self_test(forwarder, vec![], false, CancellationToken::new()).await;
-                assert!(matches!(outcome, SelfTestOutcome::Ok { attempts: 0 }));
-            });
 
         let output = writer.snapshot_string();
         assert!(
-            output.contains("forwarder self-test skipped: no servers configured"),
-            "expected skipped log; got:\n{output}"
+            output.contains("ECH required"),
+            "a configured plugin's ring must reach the report through this call site; got:\n{output}"
         );
-    }
-
-    /// Dead upstream → `run_forwarder_self_test` returns
-    /// `SelfTestOutcome::Failed { attempts: 3, .. }` and logs `forwarder
-    /// self-test failed` at INFO. `into_result` then maps that to
-    /// `ProxyError::ForwarderSelfTestFailed`.
-    #[skuld::test]
-    fn self_test_dead_upstream_returns_failed() {
-        let writer = VecWriter::new();
-
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap()
-            .block_on(async {
-                let subscriber = tracing_subscriber::registry().with(
-                    fmt::layer()
-                        .with_writer(writer.clone())
-                        .with_ansi(false)
-                        .with_filter(tracing_subscriber::filter::LevelFilter::INFO),
-                );
-                let _guard = garter::tracing_test::set_default_in_current_thread(subscriber);
-
-                let forwarder = SArc::new(DnsForwarder::new(test_dns_cfg(), RefusingConnector::all(), false));
-                let outcome = run_forwarder_self_test(
-                    forwarder,
-                    vec!["127.0.0.1".parse().unwrap()],
-                    false,
-                    CancellationToken::new(),
-                )
-                .await;
-                let SelfTestOutcome::Failed { attempts, reason } = outcome else {
-                    panic!("expected Failed");
-                };
-                assert_eq!(attempts, 3);
-                assert!(
-                    !reason.is_empty(),
-                    "Failed reason must be non-empty for diagnostic value"
-                );
-                // into_result maps to the canonical error variant.
-                let err = SelfTestOutcome::Failed {
-                    attempts: 3,
-                    reason: reason.clone(),
-                }
-                .into_result(4500)
-                .unwrap_err();
-                assert!(matches!(
-                    err,
-                    ProxyError::ForwarderSelfTestFailed {
-                        attempts: 3,
-                        elapsed_ms: 4500,
-                        ..
-                    }
-                ));
-            });
-
-        let output = writer.snapshot_string();
-        assert!(
-            output.contains("forwarder self-test failed"),
-            "expected 'forwarder self-test failed' in log; got:\n{output}"
-        );
-        assert!(output.contains("INFO"), "expected INFO level; got:\n{output}");
-    }
-
-    /// When self-test fails AND `diagnostic_plugin_tap=true`,
-    /// emit a `warn!` breadcrumb pointing the reader to the tap output
-    /// above. Const-anchored so a text change breaks only the const.
-    #[skuld::test]
-    fn self_test_failure_with_tap_enabled_emits_correlation_hint() {
-        let writer = VecWriter::new();
-
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap()
-            .block_on(async {
-                let subscriber = tracing_subscriber::registry().with(
-                    fmt::layer()
-                        .with_writer(writer.clone())
-                        .with_ansi(false)
-                        .with_filter(tracing_subscriber::filter::LevelFilter::INFO),
-                );
-                let _guard = garter::tracing_test::set_default_in_current_thread(subscriber);
-
-                let forwarder = SArc::new(DnsForwarder::new(test_dns_cfg(), RefusingConnector::all(), false));
-                let _ = run_forwarder_self_test(
-                    forwarder,
-                    vec!["127.0.0.1".parse().unwrap()],
-                    true,
-                    CancellationToken::new(),
-                )
-                .await;
-            });
-
-        let output = writer.snapshot_string();
-        assert!(
-            output.contains(super::TAP_ENABLED_HINT),
-            "expected TAP_ENABLED_HINT in log; got:\n{output}"
-        );
-        assert!(
-            !output.contains(super::TAP_DISABLED_HINT),
-            "tap=true must NOT emit the disabled hint; got:\n{output}"
-        );
-    }
-
-    /// When self-test fails AND tap is OFF, emit a `warn!`
-    /// remediation hint pointing the reader to the config flag.
-    #[skuld::test]
-    fn self_test_failure_without_tap_emits_remediation_hint() {
-        let writer = VecWriter::new();
-
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap()
-            .block_on(async {
-                let subscriber = tracing_subscriber::registry().with(
-                    fmt::layer()
-                        .with_writer(writer.clone())
-                        .with_ansi(false)
-                        .with_filter(tracing_subscriber::filter::LevelFilter::INFO),
-                );
-                let _guard = garter::tracing_test::set_default_in_current_thread(subscriber);
-
-                let forwarder = SArc::new(DnsForwarder::new(test_dns_cfg(), RefusingConnector::all(), false));
-                let _ = run_forwarder_self_test(
-                    forwarder,
-                    vec!["127.0.0.1".parse().unwrap()],
-                    false,
-                    CancellationToken::new(),
-                )
-                .await;
-            });
-
-        let output = writer.snapshot_string();
-        assert!(
-            output.contains(super::TAP_DISABLED_HINT),
-            "expected TAP_DISABLED_HINT in log; got:\n{output}"
-        );
-        assert!(
-            !output.contains(super::TAP_ENABLED_HINT),
-            "tap=false must NOT emit the enabled hint; got:\n{output}"
-        );
-    }
-
-    /// `build_local_dns` rejects the degenerate `enabled=true, servers=[]`
-    /// config: a live TUN would strand every in-tunnel UDP/53 flow at the
-    /// LocalDnsEndpoint with no upstream to forward to.
-    #[skuld::test]
-    fn build_local_dns_returns_err_for_empty_servers() {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap()
-            .block_on(async {
-                let cfg = DnsConfig {
-                    enabled: true,
-                    servers: vec![], // degenerate
-                    protocol: DnsProtocol::PlainTcp,
-                    allow_insecure_bootstrap: false,
-                };
-                match build_local_dns(&cfg, 1080, false, CancellationToken::new()).await {
-                    Err(ProxyError::ForwarderSelfTestFailed {
-                        attempts: 0,
-                        elapsed_ms: 0,
-                        ..
-                    }) => {}
-                    Err(other) => panic!("unexpected error variant: {other:?}"),
-                    Ok(_) => panic!("expected ForwarderSelfTestFailed for empty servers"),
-                }
-            });
-    }
-
-    /// `is_dns_reply_ok` reply-decode contract — direct unit
-    /// tests of the RCODE check. Without these, a regression in the
-    /// mask (`0x0F` → `0xF0`) or the length check would only surface
-    /// once the gate runs against real upstream DNS in production.
-    #[skuld::test]
-    fn is_dns_reply_ok_treats_noerror_as_success() {
-        let mut reply = vec![0u8; 12];
-        reply[3] = 0x00; // RCODE = 0 (NoError)
-        assert!(super::is_dns_reply_ok(&reply));
-    }
-
-    #[skuld::test]
-    fn is_dns_reply_ok_treats_nxdomain_as_success() {
-        let mut reply = vec![0u8; 12];
-        reply[3] = 0x03; // RCODE = 3 (NXDOMAIN). Path probe semantic.
-        assert!(super::is_dns_reply_ok(&reply));
-    }
-
-    #[skuld::test]
-    fn is_dns_reply_ok_treats_refused_as_success() {
-        let mut reply = vec![0u8; 12];
-        reply[3] = 0x05; // RCODE = 5 (REFUSED). Resolver declined, path works.
-        assert!(super::is_dns_reply_ok(&reply));
-    }
-
-    #[skuld::test]
-    fn is_dns_reply_ok_rejects_servfail() {
-        let mut reply = vec![0u8; 12];
-        reply[3] = 0x02; // RCODE = 2 (SERVFAIL). Upstream explicitly failed.
-        assert!(!super::is_dns_reply_ok(&reply));
-    }
-
-    #[skuld::test]
-    fn is_dns_reply_ok_ignores_high_nibble_of_byte_3() {
-        // RFC 1035: low nibble = RCODE; high nibble = Z (reserved) + RA
-        // (recursion available). High-nibble bits set MUST NOT mask the
-        // RCODE check.
-        let mut reply = vec![0u8; 12];
-        reply[3] = 0xF2; // high nibble set + RCODE=2
-        assert!(!super::is_dns_reply_ok(&reply));
-        reply[3] = 0xF0; // high nibble set + RCODE=0
-        assert!(super::is_dns_reply_ok(&reply));
-    }
-
-    #[skuld::test]
-    fn is_dns_reply_ok_rejects_truncated_reply() {
-        // Fewer than 12 bytes is not a well-formed DNS header.
-        assert!(!super::is_dns_reply_ok(&[]));
-        assert!(!super::is_dns_reply_ok(&[0u8; 11]));
-    }
-
-    /// `dns.enabled = false` → `build_local_dns` returns
-    /// `(None, None)` → gate is skipped entirely in `start_inner`.
-    #[skuld::test]
-    fn build_local_dns_returns_none_when_disabled() {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap()
-            .block_on(async {
-                let cfg = DnsConfig {
-                    enabled: false,
-                    servers: vec![],
-                    protocol: DnsProtocol::PlainTcp,
-                    allow_insecure_bootstrap: false,
-                };
-                let res = build_local_dns(&cfg, 1080, false, CancellationToken::new()).await;
-                let (ep, fwd) = match res {
-                    Ok(t) => t,
-                    Err(e) => panic!("expected Ok((None, None)) for disabled DNS, got {e:?}"),
-                };
-                assert!(ep.is_none());
-                assert!(fwd.is_none());
-            });
-    }
-
-    /// The in-TUN LocalDnsEndpoint is the sole OS DNS path, so it must be
-    /// constructed whenever DNS is enabled with servers. `build_local_dns`
-    /// returns a 2-tuple `(Option<LocalDnsEndpoint>, Option<Arc<DnsForwarder>>)`.
-    #[skuld::test]
-    fn build_local_dns_builds_endpoint_when_enabled() {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap()
-            .block_on(async {
-                let cfg = DnsConfig {
-                    enabled: true,
-                    servers: vec!["1.1.1.1".parse().unwrap()],
-                    protocol: DnsProtocol::PlainTcp,
-                    allow_insecure_bootstrap: false,
-                };
-                let (ep, fwd) = build_local_dns(&cfg, 1080, false, CancellationToken::new())
-                    .await
-                    .expect("build_local_dns ok when enabled");
-                assert!(ep.is_some(), "endpoint must exist (sole DNS path)");
-                assert!(fwd.is_some(), "forwarder must exist for the self-test gate");
-            });
     }
 
     /// **Load-bearing**: when the forwarder self-test fails, `start_cancellable`
@@ -2486,76 +2222,6 @@ mod self_test {
     // `NetworkBlocked`; `TcpRefused`/`TcpTimeout` rewrite the reason; everything
     // else keeps the original self-test reason. No real TUN / bridge start needed.
 
-    fn original_reason() -> String {
-        "attempt 3 timed out".to_string()
-    }
-
-    #[skuld::test]
-    fn self_test_error_blocked_is_network_blocked() {
-        let e = self_test_error_for(Some(ReachabilityVerdict::Blocked), 3, 200, original_reason());
-        assert!(
-            matches!(e, ProxyError::NetworkBlocked),
-            "Blocked must map to the typed NetworkBlocked, got {e:?}"
-        );
-    }
-
-    #[skuld::test]
-    fn self_test_error_tcp_refused_rewrites_reason() {
-        let e = self_test_error_for(Some(ReachabilityVerdict::TcpRefused), 3, 200, original_reason());
-        match e {
-            ProxyError::ForwarderSelfTestFailed { reason, .. } => {
-                assert!(reason.contains("refused"), "got {reason:?}");
-            }
-            other => panic!("expected ForwarderSelfTestFailed, got {other:?}"),
-        }
-    }
-
-    #[skuld::test]
-    fn self_test_error_tcp_timeout_rewrites_reason() {
-        let e = self_test_error_for(Some(ReachabilityVerdict::TcpTimeout), 3, 200, original_reason());
-        match e {
-            ProxyError::ForwarderSelfTestFailed { reason, .. } => {
-                assert!(reason.contains("did not respond"), "got {reason:?}");
-            }
-            other => panic!("expected ForwarderSelfTestFailed, got {other:?}"),
-        }
-    }
-
-    #[skuld::test]
-    fn self_test_error_reachable_keeps_original() {
-        let e = self_test_error_for(Some(ReachabilityVerdict::Reachable), 3, 200, original_reason());
-        match e {
-            ProxyError::ForwarderSelfTestFailed {
-                reason,
-                attempts,
-                elapsed_ms,
-            } => {
-                assert_eq!(reason, original_reason());
-                assert_eq!(attempts, 3);
-                assert_eq!(elapsed_ms, 200);
-            }
-            other => panic!("expected ForwarderSelfTestFailed, got {other:?}"),
-        }
-    }
-
-    #[skuld::test]
-    fn self_test_error_inconclusive_keeps_original() {
-        let e = self_test_error_for(Some(ReachabilityVerdict::Inconclusive), 3, 200, original_reason());
-        match e {
-            ProxyError::ForwarderSelfTestFailed { reason, .. } => assert_eq!(reason, original_reason()),
-            other => panic!("expected ForwarderSelfTestFailed, got {other:?}"),
-        }
-    }
-
-    #[skuld::test]
-    fn self_test_error_none_keeps_original() {
-        let e = self_test_error_for(None, 3, 200, original_reason());
-        match e {
-            ProxyError::ForwarderSelfTestFailed { reason, .. } => assert_eq!(reason, original_reason()),
-            other => panic!("expected ForwarderSelfTestFailed, got {other:?}"),
-        }
-    }
-
     /// A server config whose `server` points at a closed loopback port, so the
     /// out-of-band probe (no plugin → Raw transport) terminates fast with a
     /// closed-port verdict (`TcpRefused`, or `TcpTimeout` on a Windows runner
@@ -2582,8 +2248,10 @@ mod self_test {
 
     /// cover-skip: with the lockdown intent ON, the gate must NOT run the probe
     /// (a standing kill-switch cover would block it and we'd mis-report Hole's own
-    /// lockdown as censorship). The probe would rewrite the reason to "refused";
-    /// with the probe skipped the ORIGINAL self-test reason survives.
+    /// lockdown as censorship). The probe would rewrite this into
+    /// `ForwarderSelfTestFailed` with a "refused"/"did not respond" reason; with
+    /// the probe skipped, the self-test's own reading decides instead — not one
+    /// byte was ever written, so it is the typed `NoTunnelConnection`.
     #[skuld::test]
     fn lockdown_on_skips_probe_keeps_original_reason() {
         rt().block_on(async {
@@ -2592,14 +2260,48 @@ mod self_test {
                 .start_cancellable(&cfg, false, CancellationToken::new())
                 .await
                 .unwrap_err();
-            match err {
-                ProxyError::ForwarderSelfTestFailed { reason, .. } => assert!(
-                    !reason.contains("refused"),
-                    "lockdown-on must skip the probe and keep the original reason, got {reason:?}"
-                ),
-                other => panic!("expected ForwarderSelfTestFailed, got {other:?}"),
-            }
+            assert!(
+                matches!(err, ProxyError::NoTunnelConnection { .. }),
+                "lockdown-on must skip the probe and keep the self-test's own reading, got {err:?}"
+            );
         });
+    }
+
+    /// Regression: the same closed-port setup as `lockdown_off_runs_probe_rewrites_reason`
+    /// (probe runs, its verdict overrides the gate's own `NoConnection`
+    /// reading) must NOT quote the plugin's output — no plugin is
+    /// configured here either, so a firing report would say
+    /// `NO_PLUGIN_CONFIGURED` beside a failure the code has already
+    /// attributed to the probe's verdict, not the (nonexistent) plugin.
+    /// Current-thread runtime: `set_default_in_current_thread` is
+    /// thread-local, and the gate's work runs in tasks this start spawns.
+    #[skuld::test]
+    fn a_probe_override_suppresses_the_plugin_output_report() {
+        let writer = VecWriter::new();
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let subscriber = tracing_subscriber::registry().with(
+                    fmt::layer()
+                        .with_writer(writer.clone())
+                        .with_ansi(false)
+                        .with_filter(tracing_subscriber::filter::LevelFilter::WARN),
+                );
+                let _guard = garter::tracing_test::set_default_in_current_thread(subscriber);
+
+                let (mut pm, cfg, _dir) = gate_failure_setup(false);
+                pm.start_cancellable(&cfg, false, CancellationToken::new())
+                    .await
+                    .expect_err("both the probe and the gate must fail");
+            });
+        let output = writer.snapshot_string();
+        assert!(
+            !output.contains(crate::proxy::plugin_log::NO_PLUGIN_CONFIGURED),
+            "the probe's verdict overrides the gate's own reading, so the plugin-output \
+             report must not fire; got:\n{output}"
+        );
     }
 
     /// Control: with lockdown OFF the probe DOES run, so the same closed-port
@@ -2979,7 +2681,6 @@ mod self_test {
 
     /// A one-hostname DoH stub that COUNTS queries, so a test can prove a covered
     /// retry reuses the resolved IP instead of re-querying under the held cover.
-    use crate::dns::forwarder::UpstreamCause;
     struct CountingQuerier {
         host: String,
         ip: IpAddr,
@@ -3006,6 +2707,1374 @@ mod self_test {
                 reply.to_vec().ok()
             })
         }
+    }
+
+    /// A DoH stub that answers ONLY for one specific resolver address and fails
+    /// every other. `CountingQuerier` ignores which resolver it was asked and
+    /// answers unconditionally, so it cannot distinguish "the resolver that
+    /// answered" from "the first resolver configured" — this one can, by putting
+    /// the answering address somewhere OTHER than `dns.servers[0]`.
+    struct SelectiveQuerier {
+        answering: IpAddr,
+        host: String,
+        ip: IpAddr,
+    }
+
+    #[async_trait::async_trait]
+    impl DohQuerier for SelectiveQuerier {
+        async fn query(&self, server: IpAddr, wire: &[u8]) -> Result<Vec<u8>, UpstreamCause> {
+            if server != self.answering {
+                return Err(UpstreamCause::Unreachable);
+            }
+            crate::dns::forwarder::answered_or_servfail(wire, || {
+                use hickory_proto::op::{Message, MessageType, OpCode, Query};
+                use hickory_proto::rr::rdata::A;
+                use hickory_proto::rr::{Name, RData, Record, RecordType};
+                let q = Message::from_vec(wire).ok()?;
+                if q.queries.first()?.query_type() != RecordType::A {
+                    return None; // force the resolver onto the A path (IPv4-preferred).
+                }
+                let IpAddr::V4(v4) = self.ip else { return None };
+                let n = Name::from_ascii(format!("{}.", self.host)).ok()?;
+                let mut reply = Message::new(0, MessageType::Response, OpCode::Query);
+                reply.add_query(Query::query(n.clone(), RecordType::A));
+                reply.add_answer(Record::from_rdata(n, 60, RData::A(A(v4))));
+                reply.to_vec().ok()
+            })
+        }
+    }
+
+    #[skuld::test]
+    fn covered_start_cover_permits_the_pinned_ech_resolver() {
+        rt().block_on(async {
+            // The cover must permit the resolver that ANSWERED the DoH bootstrap —
+            // proven by putting a resolver that never answers FIRST in
+            // `dns.servers` and the one that DOES answer second. `SelectiveQuerier`
+            // fails every server except `answering_resolver`, so a wrong
+            // implementation that permits `dns.servers[0]` (or "the first
+            // configured resolver") fails this assertion.
+            let resolved: IpAddr = "203.0.113.9".parse().unwrap();
+            let failing_resolver: IpAddr = "8.8.8.8".parse().unwrap();
+            let answering_resolver: IpAddr = "1.0.0.1".parse().unwrap();
+            let querier = Arc::new(SelectiveQuerier {
+                answering: answering_resolver,
+                host: "proxy.example".into(),
+                ip: resolved,
+            });
+            let dir = tempfile::tempdir().unwrap();
+            let routing = MockRouting::new(dir.path().to_path_buf());
+            let st = routing.state();
+            let (mut pm, _dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, false);
+            pm.set_bootstrap_querier_for_test(querier);
+            let mut cfg = test_config();
+            cfg.server.server = "proxy.example".into();
+            cfg.server.plugin = Some("ex-ray".into());
+            cfg.server.plugin_opts = Some(ECH_CAPABLE_OPTS.into());
+            // Forces the forwarder self-test gate, which MockProxy cannot satisfy —
+            // deterministic regardless of whether a real `ex-ray` happens to be on
+            // PATH on this host (resolve_plugin_path_inner falls back to a bare-name
+            // PATH lookup when no sibling binary exists).
+            cfg.dns.enabled = true;
+            cfg.dns.servers = vec![failing_resolver, answering_resolver];
+            let _ = pm
+                .start_cancellable(&cfg, true, CancellationToken::new())
+                .await
+                .unwrap_err();
+            assert_eq!(st.cover_engage_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                *st.last_cover_resolver_ip.lock().unwrap(),
+                Some(answering_resolver),
+                "the cover permits the resolver that ANSWERED, not the first one configured"
+            );
+        });
+    }
+
+    // Integration-level proof of the reachability gate, at the WIRING
+    // boundary (`start_cancellable` -> `effective_ech_doh` ->
+    // `install_failclosed_cover`), not just the pure `classify_ech_doh`
+    // function boundary covered in plugin.rs's own unit tests. A plugin IS
+    // configured and a resolver DID answer, but `plugin_opts` never enables
+    // TLS (no `tls`, no `mode=quic`) — ex-ray's `buildTLSConfig` (and its
+    // whole `ech` switch) is unreachable, so the cover must not widen for a
+    // fetch that provably cannot happen.
+    #[skuld::test]
+    fn covered_start_with_a_non_tls_capable_plugin_does_not_permit_a_resolver() {
+        rt().block_on(async {
+            let resolved: IpAddr = "203.0.113.9".parse().unwrap();
+            let answering_resolver: IpAddr = "1.0.0.1".parse().unwrap();
+            let querier = Arc::new(CountingQuerier {
+                host: "proxy.example".into(),
+                ip: resolved,
+                queries: AtomicU32::new(0),
+            });
+            let dir = tempfile::tempdir().unwrap();
+            let routing = MockRouting::new(dir.path().to_path_buf());
+            let st = routing.state();
+            let (mut pm, _dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, false);
+            pm.set_bootstrap_querier_for_test(querier);
+            let mut cfg = test_config();
+            cfg.server.server = "proxy.example".into();
+            cfg.server.plugin = Some("ex-ray".into());
+            cfg.server.plugin_opts = Some("mode=websocket;host=cdn.example".into()); // no `tls`, no `mode=quic`
+            cfg.dns.enabled = true;
+            cfg.dns.servers = vec![answering_resolver];
+            let _ = pm
+                .start_cancellable(&cfg, true, CancellationToken::new())
+                .await
+                .unwrap_err();
+            assert_eq!(st.cover_engage_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                *st.last_cover_resolver_ip.lock().unwrap(),
+                None,
+                "a resolver answered and a plugin is configured, but TLS is never enabled, so ex-ray \
+                 never reaches its ECH switch — the cover must not permit the resolver"
+            );
+        });
+    }
+
+    #[skuld::test]
+    fn covered_start_without_a_plugin_does_not_permit_any_resolver() {
+        rt().block_on(async {
+            // No plugin means no later ECH lookup at all — permitting a resolver
+            // here would widen the cover for no reason. Uses a HOSTNAME server
+            // with a querier that DOES answer (`pin` = `Answered`), so the ONLY
+            // reason the permit stays `None` is the plugin gate itself — a
+            // literal-IP fixture would already yield `NoQueryNeeded` regardless of
+            // that gate and could not isolate it.
+            let resolved: IpAddr = "203.0.113.9".parse().unwrap();
+            let answering_resolver: IpAddr = "1.0.0.1".parse().unwrap();
+            let querier = Arc::new(CountingQuerier {
+                host: "proxy.example".into(),
+                ip: resolved,
+                queries: AtomicU32::new(0),
+            });
+            let dir = tempfile::tempdir().unwrap();
+            let routing = MockRouting::new(dir.path().to_path_buf());
+            let st = routing.state();
+            let (mut pm, _dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, false);
+            pm.set_bootstrap_querier_for_test(querier);
+            let mut cfg = test_config();
+            cfg.server.server = "proxy.example".into();
+            assert!(cfg.server.plugin.is_none(), "sanity: this scenario requires no plugin");
+            cfg.dns.servers = vec![answering_resolver];
+            // Outcome (Ok/Err) is irrelevant here: `install_failclosed_cover` is
+            // called BEFORE `start_inner` runs, so the assertions below hold
+            // either way — no need to force a failure.
+            let _ = pm.start_cancellable(&cfg, true, CancellationToken::new()).await;
+            assert_eq!(
+                st.cover_engage_calls.load(Ordering::SeqCst),
+                1,
+                "sanity: the cover must actually have engaged, or `None` below proves nothing"
+            );
+            assert_eq!(*st.last_cover_resolver_ip.lock().unwrap(), None);
+        });
+    }
+
+    #[skuld::test]
+    fn covered_start_with_a_literal_server_ip_still_permits_the_constructed_resolver() {
+        rt().block_on(async {
+            // A literal-IP server needs no bootstrap query at all
+            // (`PinSource::NoQueryNeeded` short-circuits before dialing
+            // anything), but `ech_doh_url` still constructs a real,
+            // IP-literal `ech-doh` URL from the configured `dns.servers`
+            // (IPv4-preferred) — Hole authored that address, so
+            // config-authorship trust alone is judged sufficient to permit
+            // it (`a_literal_server_entry_falls_back_without_a_pin` proves
+            // the URL itself) — see `EchDoh::resolver`'s doc.
+            let permitted_resolver: IpAddr = "1.0.0.1".parse().unwrap();
+            let dir = tempfile::tempdir().unwrap();
+            let routing = MockRouting::new(dir.path().to_path_buf());
+            let st = routing.state();
+            let (mut pm, _dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, false);
+            let mut cfg = test_config();
+            cfg.server.server = "203.0.113.9".into();
+            cfg.server.plugin = Some("ex-ray".into());
+            cfg.server.plugin_opts = Some(ECH_CAPABLE_OPTS.into());
+            // Forces the forwarder self-test gate — deterministic regardless of
+            // whether `ex-ray` happens to be resolvable via PATH on this host.
+            cfg.dns.enabled = true;
+            cfg.dns.servers = vec![permitted_resolver];
+            let _ = pm
+                .start_cancellable(&cfg, true, CancellationToken::new())
+                .await
+                .unwrap_err();
+            assert_eq!(st.cover_engage_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(*st.last_cover_resolver_ip.lock().unwrap(), Some(permitted_resolver));
+        });
+    }
+
+    #[skuld::test]
+    fn covered_start_with_insecure_bootstrap_fallback_still_permits_the_constructed_resolver() {
+        rt().block_on(async {
+            // Every configured resolver failed and the OS resolver supplied the
+            // server address (`allow_insecure_bootstrap`, `PinSource::SecureBootstrapFailed`),
+            // but `ech_doh_url` still constructs the `ech-doh` URL from
+            // `dns.servers` the same way as the literal-IP case above — same
+            // reasoning, same permit.
+            let permitted_resolver: IpAddr = "1.0.0.1".parse().unwrap();
+            let dir = tempfile::tempdir().unwrap();
+            let routing = MockRouting::new(dir.path().to_path_buf());
+            let st = routing.state();
+            let (mut pm, _dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, false);
+            pm.set_bootstrap_querier_for_test(Arc::new(DeadQuerier));
+            let mut cfg = test_config();
+            // Resolvable on every CI host without network.
+            cfg.server.server = "localhost".into();
+            cfg.server.plugin = Some("ex-ray".into());
+            cfg.server.plugin_opts = Some(ECH_CAPABLE_OPTS.into());
+            // Forces the forwarder self-test gate — deterministic regardless of
+            // whether `ex-ray` happens to be resolvable via PATH on this host.
+            cfg.dns.enabled = true;
+            cfg.dns.allow_insecure_bootstrap = true;
+            cfg.dns.servers = vec![permitted_resolver];
+            let _ = pm
+                .start_cancellable(&cfg, true, CancellationToken::new())
+                .await
+                .unwrap_err();
+            assert_eq!(st.cover_engage_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(*st.last_cover_resolver_ip.lock().unwrap(), Some(permitted_resolver));
+        });
+    }
+
+    #[skuld::test]
+    fn covered_retry_does_not_re_engage_or_change_the_resolver_permit() {
+        rt().block_on(async {
+            // A same-server retry reuses the cached pin without a
+            // fresh DoH query, so the cover — engaged once, at the first attempt —
+            // must keep permitting the SAME resolver: never re-engaged, never
+            // widened, never narrowed.
+            let resolved: IpAddr = "203.0.113.9".parse().unwrap();
+            let answering_resolver: IpAddr = "1.0.0.1".parse().unwrap();
+            let querier = Arc::new(CountingQuerier {
+                host: "proxy.example".into(),
+                ip: resolved,
+                queries: AtomicU32::new(0),
+            });
+            let dir = tempfile::tempdir().unwrap();
+            let routing = MockRouting::new(dir.path().to_path_buf());
+            let st = routing.state();
+            let (mut pm, _dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, false);
+            pm.set_bootstrap_querier_for_test(querier);
+            let mut cfg = test_config();
+            cfg.server.server = "proxy.example".into();
+            cfg.server.plugin = Some("ex-ray".into());
+            cfg.server.plugin_opts = Some(ECH_CAPABLE_OPTS.into());
+            cfg.dns.enabled = true;
+            cfg.dns.servers = vec![answering_resolver];
+
+            pm.start_cancellable(&cfg, true, CancellationToken::new())
+                .await
+                .unwrap_err();
+            assert_eq!(st.cover_engage_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(*st.last_cover_resolver_ip.lock().unwrap(), Some(answering_resolver));
+
+            pm.start_cancellable(&cfg, true, CancellationToken::new())
+                .await
+                .unwrap_err();
+            assert_eq!(
+                st.cover_engage_calls.load(Ordering::SeqCst),
+                1,
+                "the retry reuses the held cover — no second engage"
+            );
+            assert_eq!(
+                *st.last_cover_resolver_ip.lock().unwrap(),
+                Some(answering_resolver),
+                "the recorded resolver permit is still the first attempt's — never re-derived on retry"
+            );
+        });
+    }
+
+    // A retry that NARROWS to nothing needed (e.g. the plugin was removed)
+    // must STILL release-then-reengage — see `repair_fallback`'s doc in
+    // proxy_manager.rs for why a wider-than-needed permit is a real
+    // widening, not a harmless superset.
+    #[skuld::test]
+    fn covered_retry_narrowing_to_no_permit_re_engages_to_correct_it() {
+        rt().block_on(async {
+            let answering_resolver: IpAddr = "1.0.0.1".parse().unwrap();
+            let querier = Arc::new(CountingQuerier {
+                host: "proxy.example".into(),
+                ip: "203.0.113.9".parse().unwrap(),
+                queries: AtomicU32::new(0),
+            });
+            let dir = tempfile::tempdir().unwrap();
+            let routing = MockRouting::new(dir.path().to_path_buf());
+            let st = routing.state();
+            let (mut pm, _dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, false);
+            pm.set_bootstrap_querier_for_test(querier);
+            let mut cfg = test_config();
+            cfg.server.server = "proxy.example".into();
+            cfg.server.plugin = Some("ex-ray".into()); // attempt 1: plugin present
+            cfg.server.plugin_opts = Some(ECH_CAPABLE_OPTS.into());
+            cfg.dns.enabled = true;
+            cfg.dns.servers = vec![answering_resolver];
+
+            pm.start_cancellable(&cfg, true, CancellationToken::new())
+                .await
+                .unwrap_err();
+            assert_eq!(st.cover_engage_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(*st.last_cover_resolver_ip.lock().unwrap(), Some(answering_resolver));
+
+            cfg.server.plugin = None; // attempt 2: plugin removed, nothing to permit now
+            pm.start_cancellable(&cfg, true, CancellationToken::new())
+                .await
+                .unwrap_err();
+            assert_eq!(
+                st.cover_engage_calls.load(Ordering::SeqCst),
+                2,
+                "narrowing to no permit must release-then-reengage to correct the cover"
+            );
+            assert_eq!(
+                *st.last_cover_resolver_ip.lock().unwrap(),
+                None,
+                "the corrected (narrower) permit replaces the old, wider one"
+            );
+        });
+    }
+
+    // When a NARROWING repair's corrected engage (to `None`) itself fails,
+    // the restore falls back to the OLD (wider) permit — the residual is a
+    // kill-switch WIDENING (a live permit for a resolver nothing needs), not
+    // an ECH-fetch stall (no fetch is even attempted when the desired
+    // permit is `None`). Both the restore-success warning and the
+    // structural residual check must describe THIS direction accurately,
+    // not reuse the "may stall" wording written for the opposite
+    // (widening-repair) failure.
+    #[skuld::test]
+    fn covered_retry_narrowing_repair_failure_warns_about_the_stale_wide_permit_not_a_stall() {
+        use crate::test_support::log_capture::VecWriter;
+        use tracing_subscriber::fmt;
+        use tracing_subscriber::layer::{Layer, SubscriberExt};
+
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let writer = VecWriter::new();
+                let subscriber = tracing_subscriber::registry().with(
+                    fmt::layer()
+                        .with_writer(writer.clone())
+                        .with_ansi(false)
+                        .with_filter(tracing_subscriber::filter::LevelFilter::WARN),
+                );
+                let _guard = garter::tracing_test::set_default_in_current_thread(subscriber);
+
+                let answering_resolver: IpAddr = "1.0.0.1".parse().unwrap();
+                let querier = Arc::new(CountingQuerier {
+                    host: "proxy.example".into(),
+                    ip: "203.0.113.9".parse().unwrap(),
+                    queries: AtomicU32::new(0),
+                });
+                let dir = tempfile::tempdir().unwrap();
+                let routing = MockRouting::new(dir.path().to_path_buf());
+                let st = routing.state();
+                let (mut pm, _dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, false);
+                pm.set_bootstrap_querier_for_test(querier);
+                let mut cfg = test_config();
+                cfg.server.server = "proxy.example".into();
+                cfg.server.plugin = Some("ex-ray".into()); // attempt 1: plugin present
+                cfg.server.plugin_opts = Some(ECH_CAPABLE_OPTS.into());
+                cfg.dns.enabled = true;
+                cfg.dns.servers = vec![answering_resolver];
+
+                pm.start_cancellable(&cfg, true, CancellationToken::new())
+                    .await
+                    .unwrap_err();
+                assert_eq!(*st.last_cover_resolver_ip.lock().unwrap(), Some(answering_resolver));
+
+                // Attempt 2: plugin removed (wants None), but engaging None
+                // is configured to fail — the restore falls back to
+                // Some(answering_resolver).
+                st.fail_cover_for_resolvers.lock().unwrap().insert(None);
+                cfg.server.plugin = None;
+                pm.start_cancellable(&cfg, true, CancellationToken::new())
+                    .await
+                    .unwrap_err();
+                assert_eq!(
+                    *st.last_cover_resolver_ip.lock().unwrap(),
+                    Some(answering_resolver),
+                    "the restore falls back to the OLD, wider permit"
+                );
+
+                let output = writer.snapshot_string();
+                assert!(
+                    output.contains("no longer needs"),
+                    "expected the over-permit residual wording, not the ECH-stall one; got:\n{output}"
+                );
+                assert!(
+                    !output.contains("ECH fetch may still stall") && !output.contains("does not permit"),
+                    "must not claim an ECH-fetch stall risk when no fetch is attempted; got:\n{output}"
+                );
+            });
+    }
+
+    #[skuld::test]
+    fn covered_retry_after_adding_a_plugin_repairs_the_stale_permit() {
+        rt().block_on(async {
+            // Attempt 1 has NO plugin, so the cover engages with
+            // `resolver_permit: None`. The user then adds a plugin (same host)
+            // and retries. Merely DETECTING the drift and warning would leave
+            // the held cover permitting `None` forever while `ech_doh` now
+            // targets a real address — a permanent stall. The fix instead
+            // REPAIRS it: releases the stale-permit cover and re-engages fresh
+            // with the corrected permit, so the retry can actually succeed
+            // instead of merely being diagnosed as broken.
+            //
+            // `dns.enabled = true` on attempt 1 is REQUIRED: with a plugin-less
+            // start and the default `dns.enabled = false` (`test_config()`'s own
+            // choice, to dodge the forwarder self-test gate), attempt 1
+            // SUCCEEDS outright (no gate to fail it) — same shape as
+            // `covered_start_success_releases_cover` — which releases the cover
+            // on success and leaves nothing held for attempt 2 to find. Setting
+            // `dns.enabled = true` routes attempt 1 through the forwarder
+            // self-test gate instead, which `MockProxy` cannot satisfy (it binds
+            // no real listener), so attempt 1 deterministically fails and RETAINS
+            // the cover — the precondition this whole test depends on. The
+            // resolved server address is a bound-then-dropped LOOPBACK port
+            // (closed, immediate ECONNREFUSED) rather than a routable address —
+            // matches `covered_gate_setup`'s own pattern — so the failure is
+            // fast and deterministic, not a network-timeout gamble.
+            let probe_l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let closed = probe_l.local_addr().unwrap();
+            drop(probe_l);
+            let answering_resolver: IpAddr = "1.0.0.1".parse().unwrap();
+            let querier = Arc::new(CountingQuerier {
+                host: "proxy.example".into(),
+                ip: closed.ip(),
+                queries: AtomicU32::new(0),
+            });
+            let dir = tempfile::tempdir().unwrap();
+            let routing = MockRouting::new(dir.path().to_path_buf());
+            let st = routing.state();
+            let (mut pm, _dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, false);
+            pm.set_bootstrap_querier_for_test(querier);
+            let mut cfg = test_config();
+            cfg.server.server = "proxy.example".into();
+            cfg.server.server_port = closed.port();
+            cfg.server.plugin = None; // attempt 1: no plugin
+            cfg.dns.enabled = true; // forces attempt 1 to fail via the self-test gate (see comment above)
+            cfg.dns.servers = vec![answering_resolver];
+
+            let err1 = pm
+                .start_cancellable(&cfg, true, CancellationToken::new())
+                .await
+                .unwrap_err();
+            assert!(
+                !matches!(err1, ProxyError::Cancelled),
+                "sanity: attempt 1 must fail via the self-test gate, not cancel, got {err1:?}"
+            );
+            assert!(
+                pm.blocked_until_connected(),
+                "sanity: attempt 1's failure must retain the cover"
+            );
+            assert_eq!(st.cover_engage_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                *st.last_cover_resolver_ip.lock().unwrap(),
+                None,
+                "attempt 1 has no plugin, so nothing is permitted"
+            );
+            assert_eq!(pm.last_ech_doh(), None, "attempt 1 has no plugin, so no ech-doh either");
+
+            cfg.server.plugin = Some("ex-ray".into()); // attempt 2: plugin added
+            cfg.server.plugin_opts = Some(ECH_CAPABLE_OPTS.into());
+            pm.start_cancellable(&cfg, true, CancellationToken::new())
+                .await
+                .unwrap_err();
+            assert_eq!(
+                st.cover_engage_calls.load(Ordering::SeqCst),
+                2,
+                "the stale-permit cover is released and a FRESH cover is engaged — the repair, not just a diagnosis"
+            );
+            assert_eq!(
+                *st.last_cover_resolver_ip.lock().unwrap(),
+                Some(answering_resolver),
+                "the fresh engage permits exactly what THIS attempt's ech-doh now needs"
+            );
+            assert_eq!(
+                pm.last_ech_doh(),
+                Some("https://1.0.0.1/dns-query"),
+                "and the cover now matches it — no more stall for this retry"
+            );
+        });
+    }
+
+    #[skuld::test]
+    fn covered_retry_repair_restores_the_previous_permit_when_the_corrected_engage_fails() {
+        rt().block_on(async {
+            // Same drift as `covered_retry_after_adding_a_plugin_repairs_the_stale_permit`
+            // (attempt 1: no plugin, permit `None`; attempt 2: plugin added, permit
+            // should become `Some(answering_resolver)`), but the corrected engage
+            // itself FAILS — simulated by `fail_cover_for_resolvers`, which fails
+            // `install_failclosed_cover` ONLY for `Some(answering_resolver)`. The
+            // repair must not let this failure leave the host uncovered: it falls
+            // back to re-engaging the OLD permit (`None`), so the host stays
+            // covered by SOMETHING rather than by nothing.
+            let probe_l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let closed = probe_l.local_addr().unwrap();
+            drop(probe_l);
+            let answering_resolver: IpAddr = "1.0.0.1".parse().unwrap();
+            let querier = Arc::new(CountingQuerier {
+                host: "proxy.example".into(),
+                ip: closed.ip(),
+                queries: AtomicU32::new(0),
+            });
+            let dir = tempfile::tempdir().unwrap();
+            let routing = MockRouting::new(dir.path().to_path_buf());
+            let st = routing.state();
+            let (mut pm, _dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, false);
+            pm.set_bootstrap_querier_for_test(querier);
+            let mut cfg = test_config();
+            cfg.server.server = "proxy.example".into();
+            cfg.server.server_port = closed.port();
+            cfg.server.plugin = None; // attempt 1: no plugin
+            cfg.dns.enabled = true; // forces attempt 1 to fail via the self-test gate
+            cfg.dns.servers = vec![answering_resolver];
+
+            pm.start_cancellable(&cfg, true, CancellationToken::new())
+                .await
+                .unwrap_err();
+            assert_eq!(st.cover_engage_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(*st.last_cover_resolver_ip.lock().unwrap(), None);
+
+            // Only the CORRECTED permit fails to engage — the previous one (`None`)
+            // still would, if retried.
+            st.fail_cover_for_resolvers
+                .lock()
+                .unwrap()
+                .insert(Some(answering_resolver));
+
+            cfg.server.plugin = Some("ex-ray".into()); // attempt 2: plugin added
+            cfg.server.plugin_opts = Some(ECH_CAPABLE_OPTS.into());
+            pm.start_cancellable(&cfg, true, CancellationToken::new())
+                .await
+                .unwrap_err();
+
+            assert!(
+                pm.blocked_until_connected(),
+                "the compensating restore must leave the host covered, not open"
+            );
+            assert_eq!(
+                st.cover_engage_calls.load(Ordering::SeqCst),
+                2,
+                "one failed corrected-permit attempt (uncounted) plus one successful restore of the old permit"
+            );
+            assert_eq!(
+                *st.last_cover_resolver_ip.lock().unwrap(),
+                None,
+                "the restored cover permits the OLD value, not the corrected one that failed to engage"
+            );
+        });
+    }
+
+    #[skuld::test]
+    fn covered_retry_repair_restore_warning_fires_when_the_corrected_engage_fails() {
+        use crate::test_support::log_capture::VecWriter;
+        use tracing_subscriber::fmt;
+        use tracing_subscriber::layer::{Layer, SubscriberExt};
+
+        // Same scenario as the structural test above; asserts the repair's OWN
+        // "restored the PREVIOUS permit" log line fires, so the operator sees WHY
+        // the cover is narrower than the current attempt's config would derive.
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let writer = VecWriter::new();
+                let subscriber = tracing_subscriber::registry().with(
+                    fmt::layer()
+                        .with_writer(writer.clone())
+                        .with_ansi(false)
+                        .with_filter(tracing_subscriber::filter::LevelFilter::WARN),
+                );
+                let _guard = garter::tracing_test::set_default_in_current_thread(subscriber);
+
+                let probe_l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+                let closed = probe_l.local_addr().unwrap();
+                drop(probe_l);
+                let answering_resolver: IpAddr = "1.0.0.1".parse().unwrap();
+                let querier = Arc::new(CountingQuerier {
+                    host: "proxy.example".into(),
+                    ip: closed.ip(),
+                    queries: AtomicU32::new(0),
+                });
+                let dir = tempfile::tempdir().unwrap();
+                let routing = MockRouting::new(dir.path().to_path_buf());
+                let st = routing.state();
+                let (mut pm, _dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, false);
+                pm.set_bootstrap_querier_for_test(querier);
+                let mut cfg = test_config();
+                cfg.server.server = "proxy.example".into();
+                cfg.server.server_port = closed.port();
+                cfg.server.plugin = None;
+                cfg.dns.enabled = true;
+                cfg.dns.servers = vec![answering_resolver];
+
+                pm.start_cancellable(&cfg, true, CancellationToken::new())
+                    .await
+                    .unwrap_err();
+                st.fail_cover_for_resolvers
+                    .lock()
+                    .unwrap()
+                    .insert(Some(answering_resolver));
+                cfg.server.plugin = Some("ex-ray".into());
+                cfg.server.plugin_opts = Some(ECH_CAPABLE_OPTS.into());
+                pm.start_cancellable(&cfg, true, CancellationToken::new())
+                    .await
+                    .unwrap_err();
+
+                let output = writer.snapshot_string();
+                assert!(
+                    output.contains("restored the PREVIOUS permit instead of leaving the host open"),
+                    "expected the compensating-restore warning; got:\n{output}"
+                );
+            });
+    }
+
+    // The LIVE cover (restored to the OLD permit) now permits something
+    // OTHER than what this attempt's ech_doh needs — the residual-stall
+    // warning must fire here too, not just the restore warning above: an
+    // operator debugging a stalled connect needs the "may stall" line, not
+    // only "a permit correction failed".
+    #[skuld::test]
+    fn covered_retry_repair_restore_also_fires_the_residual_stall_warning() {
+        use crate::test_support::log_capture::VecWriter;
+        use tracing_subscriber::fmt;
+        use tracing_subscriber::layer::{Layer, SubscriberExt};
+
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let writer = VecWriter::new();
+                let subscriber = tracing_subscriber::registry().with(
+                    fmt::layer()
+                        .with_writer(writer.clone())
+                        .with_ansi(false)
+                        .with_filter(tracing_subscriber::filter::LevelFilter::WARN),
+                );
+                let _guard = garter::tracing_test::set_default_in_current_thread(subscriber);
+
+                let probe_l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+                let closed = probe_l.local_addr().unwrap();
+                drop(probe_l);
+                let answering_resolver: IpAddr = "1.0.0.1".parse().unwrap();
+                let querier = Arc::new(CountingQuerier {
+                    host: "proxy.example".into(),
+                    ip: closed.ip(),
+                    queries: AtomicU32::new(0),
+                });
+                let dir = tempfile::tempdir().unwrap();
+                let routing = MockRouting::new(dir.path().to_path_buf());
+                let st = routing.state();
+                let (mut pm, _dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, false);
+                pm.set_bootstrap_querier_for_test(querier);
+                let mut cfg = test_config();
+                cfg.server.server = "proxy.example".into();
+                cfg.server.server_port = closed.port();
+                cfg.server.plugin = None;
+                cfg.dns.enabled = true;
+                cfg.dns.servers = vec![answering_resolver];
+
+                pm.start_cancellable(&cfg, true, CancellationToken::new())
+                    .await
+                    .unwrap_err();
+                st.fail_cover_for_resolvers
+                    .lock()
+                    .unwrap()
+                    .insert(Some(answering_resolver));
+                cfg.server.plugin = Some("ex-ray".into());
+                cfg.server.plugin_opts = Some(ECH_CAPABLE_OPTS.into());
+                pm.start_cancellable(&cfg, true, CancellationToken::new())
+                    .await
+                    .unwrap_err();
+
+                let output = writer.snapshot_string();
+                assert!(
+                    output.contains("the fail-closed cover does not permit"),
+                    "expected the residual-stall warning on the restore-mismatch path; got:\n{output}"
+                );
+            });
+    }
+
+    // A retry whose desired permit is UNCHANGED from one a previous repair
+    // already proved unreachable is not skipped: there is no principled way
+    // to tell a transient engage failure (e.g. momentary WFP/pf contention)
+    // from a lasting one without trying again, so every matching drift
+    // re-attempts the correction. Attempt 3 proves the retry happens (not
+    // skipped); attempt 4 proves it lands once the transient failure clears.
+    #[skuld::test]
+    fn covered_retry_repeats_the_correction_every_time_a_permit_stays_unreachable() {
+        rt().block_on(async {
+            let probe_l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let closed = probe_l.local_addr().unwrap();
+            drop(probe_l);
+            let answering_resolver: IpAddr = "1.0.0.1".parse().unwrap();
+            let querier = Arc::new(CountingQuerier {
+                host: "proxy.example".into(),
+                ip: closed.ip(),
+                queries: AtomicU32::new(0),
+            });
+            let dir = tempfile::tempdir().unwrap();
+            let routing = MockRouting::new(dir.path().to_path_buf());
+            let st = routing.state();
+            let (mut pm, _dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, false);
+            pm.set_bootstrap_querier_for_test(querier);
+            let mut cfg = test_config();
+            cfg.server.server = "proxy.example".into();
+            cfg.server.server_port = closed.port();
+            cfg.server.plugin = None;
+            cfg.dns.enabled = true;
+            cfg.dns.servers = vec![answering_resolver];
+
+            // Attempt 1: engages with permit None.
+            pm.start_cancellable(&cfg, true, CancellationToken::new())
+                .await
+                .unwrap_err();
+            assert_eq!(st.cover_engage_calls.load(Ordering::SeqCst), 1);
+
+            // Attempt 2: plugin added, wants Some(answering_resolver), that
+            // engage keeps failing — restore succeeds.
+            st.fail_cover_for_resolvers
+                .lock()
+                .unwrap()
+                .insert(Some(answering_resolver));
+            cfg.server.plugin = Some("ex-ray".into());
+            cfg.server.plugin_opts = Some(ECH_CAPABLE_OPTS.into());
+            pm.start_cancellable(&cfg, true, CancellationToken::new())
+                .await
+                .unwrap_err();
+            assert_eq!(
+                st.cover_engage_calls.load(Ordering::SeqCst),
+                2,
+                "attempt 2: one failed corrected attempt (uncounted) + one successful restore"
+            );
+
+            // Attempt 3: identical config — still wants the SAME
+            // Some(answering_resolver) the previous attempt already proved
+            // unreachable. Must re-attempt the correction (fails again,
+            // uncounted) and restore again (counted) — not skip.
+            pm.start_cancellable(&cfg, true, CancellationToken::new())
+                .await
+                .unwrap_err();
+            assert_eq!(
+                st.cover_engage_calls.load(Ordering::SeqCst),
+                3,
+                "a repeat of the same still-unreachable permit must re-attempt the repair, not skip it"
+            );
+            assert_eq!(
+                *st.last_cover_resolver_ip.lock().unwrap(),
+                None,
+                "the held cover still permits the restored OLD value, not the still-unreachable one"
+            );
+
+            // Attempt 4: STILL the same desired value, but now able to engage
+            // (the transient failure has passed) — the repair lands.
+            st.fail_cover_for_resolvers.lock().unwrap().clear();
+            pm.start_cancellable(&cfg, true, CancellationToken::new())
+                .await
+                .unwrap_err();
+            assert_eq!(
+                st.cover_engage_calls.load(Ordering::SeqCst),
+                4,
+                "a transient failure must not permanently wedge repair for this value"
+            );
+            assert_eq!(
+                *st.last_cover_resolver_ip.lock().unwrap(),
+                Some(answering_resolver),
+                "the repair finally lands once the value is reachable again"
+            );
+        });
+    }
+
+    // The one security-relevant fail-open branch of this state machine:
+    // BOTH the corrected engage AND the compensating restore fail. The host
+    // must end up genuinely uncovered (not a stale belief that it's still
+    // covered), a real reason must be surfaced (not silently cleared as if
+    // the attempt succeeded), and the next retry must start fresh rather
+    // than staying wedged.
+    #[skuld::test]
+    fn covered_retry_repair_both_engages_failing_leaves_the_host_uncovered() {
+        rt().block_on(async {
+            let probe_l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let closed = probe_l.local_addr().unwrap();
+            drop(probe_l);
+            let answering_resolver: IpAddr = "1.0.0.1".parse().unwrap();
+            let querier = Arc::new(CountingQuerier {
+                host: "proxy.example".into(),
+                ip: closed.ip(),
+                queries: AtomicU32::new(0),
+            });
+            let dir = tempfile::tempdir().unwrap();
+            let routing = MockRouting::new(dir.path().to_path_buf());
+            let st = routing.state();
+            let (mut pm, _dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, false);
+            pm.set_bootstrap_querier_for_test(querier);
+            let mut cfg = test_config();
+            cfg.server.server = "proxy.example".into();
+            cfg.server.server_port = closed.port();
+            cfg.server.plugin = None;
+            cfg.dns.enabled = true;
+            cfg.dns.servers = vec![answering_resolver];
+
+            // Attempt 1: engages with permit None.
+            pm.start_cancellable(&cfg, true, CancellationToken::new())
+                .await
+                .unwrap_err();
+            assert_eq!(st.cover_engage_calls.load(Ordering::SeqCst), 1);
+            assert!(pm.blocked_until_connected());
+
+            // Attempt 2: plugin added, wants Some(answering_resolver) — BOTH
+            // that corrected value AND the OLD value (None) it would restore
+            // to are configured to fail engaging.
+            st.fail_cover_for_resolvers.lock().unwrap().insert(Some(answering_resolver));
+            st.fail_cover_for_resolvers.lock().unwrap().insert(None);
+            cfg.server.plugin = Some("ex-ray".into());
+            cfg.server.plugin_opts = Some(ECH_CAPABLE_OPTS.into());
+            pm.start_cancellable(&cfg, true, CancellationToken::new())
+                .await
+                .unwrap_err();
+
+            assert_eq!(
+                st.cover_engage_calls.load(Ordering::SeqCst),
+                1,
+                "both engage attempts failed — neither counts as a successful engage"
+            );
+            assert!(
+                !pm.blocked_until_connected(),
+                "both engages failing must leave the host genuinely UNCOVERED, not a stale belief that it's still covered"
+            );
+            // NOT the specific cover-engage error text: the covered start still
+            // proceeds into `start_inner` on a fail-open engage failure (by
+            // design — see the surrounding comment), and its own outcome is
+            // what `last_error` ultimately reflects (or clears to `None`, on
+            // success) once the whole attempt concludes. The cover-engage
+            // failure itself is surfaced separately, in the WARN log (see
+            // `covered_retry_repair_both_engages_failing_warns_host_not_blocked`)
+            // — checked here only for "a real reason was surfaced", not
+            // silently cleared as if the attempt had succeeded.
+            assert!(
+                pm.last_error().is_some(),
+                "an uncovered host must surface SOME reason, not silently read as a clean success — got: {:?}",
+                pm.last_error()
+            );
+
+            // Attempt 3: unchanged config. With the cover gone, this is an
+            // ordinary fresh engage attempt (not a repair) — no wedge.
+            st.fail_cover_for_resolvers.lock().unwrap().clear();
+            pm.start_cancellable(&cfg, true, CancellationToken::new())
+                .await
+                .unwrap_err();
+            assert_eq!(
+                st.cover_engage_calls.load(Ordering::SeqCst),
+                2,
+                "the next retry must re-engage fresh from scratch, not stay wedged uncovered"
+            );
+            assert_eq!(*st.last_cover_resolver_ip.lock().unwrap(), Some(answering_resolver));
+        });
+    }
+
+    #[skuld::test]
+    fn covered_retry_repair_both_engages_failing_warns_host_not_blocked() {
+        use crate::test_support::log_capture::VecWriter;
+        use tracing_subscriber::fmt;
+        use tracing_subscriber::layer::{Layer, SubscriberExt};
+
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let writer = VecWriter::new();
+                let subscriber = tracing_subscriber::registry().with(
+                    fmt::layer()
+                        .with_writer(writer.clone())
+                        .with_ansi(false)
+                        .with_filter(tracing_subscriber::filter::LevelFilter::WARN),
+                );
+                let _guard = garter::tracing_test::set_default_in_current_thread(subscriber);
+
+                let probe_l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+                let closed = probe_l.local_addr().unwrap();
+                drop(probe_l);
+                let answering_resolver: IpAddr = "1.0.0.1".parse().unwrap();
+                let querier = Arc::new(CountingQuerier {
+                    host: "proxy.example".into(),
+                    ip: closed.ip(),
+                    queries: AtomicU32::new(0),
+                });
+                let dir = tempfile::tempdir().unwrap();
+                let routing = MockRouting::new(dir.path().to_path_buf());
+                let st = routing.state();
+                let (mut pm, _dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, false);
+                pm.set_bootstrap_querier_for_test(querier);
+                let mut cfg = test_config();
+                cfg.server.server = "proxy.example".into();
+                cfg.server.server_port = closed.port();
+                cfg.server.plugin = None;
+                cfg.dns.enabled = true;
+                cfg.dns.servers = vec![answering_resolver];
+
+                pm.start_cancellable(&cfg, true, CancellationToken::new())
+                    .await
+                    .unwrap_err();
+                st.fail_cover_for_resolvers
+                    .lock()
+                    .unwrap()
+                    .insert(Some(answering_resolver));
+                st.fail_cover_for_resolvers.lock().unwrap().insert(None);
+                cfg.server.plugin = Some("ex-ray".into());
+                cfg.server.plugin_opts = Some(ECH_CAPABLE_OPTS.into());
+                pm.start_cancellable(&cfg, true, CancellationToken::new())
+                    .await
+                    .unwrap_err();
+
+                let output = writer.snapshot_string();
+                assert!(
+                    output.contains("failed to engage BOTH the corrected and the previous fail-closed"),
+                    "expected the both-failed warning; got:\n{output}"
+                );
+            });
+    }
+
+    // A repair that already failed once for a given desired permit (B) must
+    // still repair normally when a LATER retry wants a different value (C):
+    // nothing about a prior failed correction lingers onto an unrelated one.
+    // Reachable because `ech_doh_url`'s unpinned fallback re-derives from
+    // THIS attempt's `dns.servers` every time, even once a pin has gone
+    // `ResolverDeselected` for good (`revalidate` never un-deselects it) —
+    // editing `dns.servers` between retries changes the fallback address
+    // with no fresh DoH query.
+    #[skuld::test]
+    fn covered_retry_repair_resumes_normally_for_a_different_new_resolver() {
+        rt().block_on(async {
+            let probe_l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let closed = probe_l.local_addr().unwrap();
+            drop(probe_l);
+            let resolver_a: IpAddr = "1.0.0.1".parse().unwrap();
+            let resolver_b: IpAddr = "9.9.9.9".parse().unwrap();
+            let resolver_c: IpAddr = "8.8.8.8".parse().unwrap();
+            let querier = Arc::new(CountingQuerier {
+                host: "proxy.example".into(),
+                ip: closed.ip(),
+                queries: AtomicU32::new(0),
+            });
+            let dir = tempfile::tempdir().unwrap();
+            let routing = MockRouting::new(dir.path().to_path_buf());
+            let st = routing.state();
+            let (mut pm, _dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, false);
+            pm.set_bootstrap_querier_for_test(querier);
+            let mut cfg = test_config();
+            cfg.server.server = "proxy.example".into();
+            cfg.server.server_port = closed.port();
+            cfg.server.plugin = Some("ex-ray".into());
+            cfg.server.plugin_opts = Some(ECH_CAPABLE_OPTS.into());
+            cfg.dns.enabled = true;
+            cfg.dns.servers = vec![resolver_a];
+
+            // Attempt 1: pin = Answered(A), engages Some(A).
+            pm.start_cancellable(&cfg, true, CancellationToken::new())
+                .await
+                .unwrap_err();
+            assert_eq!(st.cover_engage_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(*st.last_cover_resolver_ip.lock().unwrap(), Some(resolver_a));
+
+            // Attempt 2: `dns.servers` -> [B]; A is deselected, the fallback
+            // picks B. B's engage is configured to fail; the restore falls
+            // back to A.
+            st.fail_cover_for_resolvers.lock().unwrap().insert(Some(resolver_b));
+            cfg.dns.servers = vec![resolver_b];
+            pm.start_cancellable(&cfg, true, CancellationToken::new())
+                .await
+                .unwrap_err();
+            assert_eq!(
+                st.cover_engage_calls.load(Ordering::SeqCst),
+                2,
+                "attempt 2: restore re-engage"
+            );
+            assert_eq!(
+                *st.last_cover_resolver_ip.lock().unwrap(),
+                Some(resolver_a),
+                "attempt 2: restored to A"
+            );
+
+            // Attempt 3: `dns.servers` -> [C] — a different value from either
+            // A or B. Must repair normally.
+            cfg.dns.servers = vec![resolver_c];
+            pm.start_cancellable(&cfg, true, CancellationToken::new())
+                .await
+                .unwrap_err();
+            assert_eq!(
+                st.cover_engage_calls.load(Ordering::SeqCst),
+                3,
+                "a different new desired permit must repair normally"
+            );
+            assert_eq!(*st.last_cover_resolver_ip.lock().unwrap(), Some(resolver_c));
+        });
+    }
+
+    // A repair must not overwrite the held cover's ORIGINAL pin with the
+    // revalidated (possibly downgraded) snapshot from the repairing
+    // attempt — `revalidate` only ever downgrades `Answered` to
+    // `ResolverDeselected`, never the reverse, so storing the downgraded
+    // value back into `BlockedStart::pin` makes the loss PERMANENT: a later
+    // retry that restores the original resolver to `dns.servers` can never
+    // recover `Answered`, even though a same-host retry that never
+    // triggered a repair would have (it always revalidates the covers's
+    // ORIGINAL `pin`, untouched). Attempt 3 here reverts `dns.servers` to
+    // exactly what attempt 1 answered from — the "unpinned" warning must
+    // NOT fire, proving the original `Answered` provenance survived the
+    // attempt-2 repair.
+    #[skuld::test]
+    fn covered_retry_repair_preserves_the_original_pin_across_a_correction() {
+        use crate::test_support::log_capture::VecWriter;
+        use tracing_subscriber::fmt;
+        use tracing_subscriber::layer::{Layer, SubscriberExt};
+
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+            let writer = VecWriter::new();
+            let subscriber = tracing_subscriber::registry().with(
+                fmt::layer()
+                    .with_writer(writer.clone())
+                    .with_ansi(false)
+                    .with_filter(tracing_subscriber::filter::LevelFilter::WARN),
+            );
+            let _guard = garter::tracing_test::set_default_in_current_thread(subscriber);
+
+            let probe_l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let closed = probe_l.local_addr().unwrap();
+            drop(probe_l);
+            let resolver_a: IpAddr = "1.0.0.1".parse().unwrap();
+            let resolver_b: IpAddr = "9.9.9.9".parse().unwrap();
+            let querier = Arc::new(CountingQuerier {
+                host: "proxy.example".into(),
+                ip: closed.ip(),
+                queries: AtomicU32::new(0),
+            });
+            let dir = tempfile::tempdir().unwrap();
+            let routing = MockRouting::new(dir.path().to_path_buf());
+            let st = routing.state();
+            let (mut pm, _dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, false);
+            pm.set_bootstrap_querier_for_test(querier);
+            let mut cfg = test_config();
+            cfg.server.server = "proxy.example".into();
+            cfg.server.server_port = closed.port();
+            cfg.server.plugin = Some("ex-ray".into());
+            cfg.server.plugin_opts = Some(ECH_CAPABLE_OPTS.into());
+            cfg.dns.enabled = true;
+            cfg.dns.servers = vec![resolver_a];
+
+            // Attempt 1: fresh resolve, A answers -> pin = Answered(A).
+            pm.start_cancellable(&cfg, true, CancellationToken::new())
+                .await
+                .unwrap_err();
+            assert_eq!(*st.last_cover_resolver_ip.lock().unwrap(), Some(resolver_a));
+
+            // Attempt 2: `dns.servers` -> [B]. A same-host retry never
+            // re-resolves, so B is never actually queried this session —
+            // ResolverDeselected is the CORRECT pin for attempt 2 itself.
+            // The corrected engage (permit Some(B)) succeeds; this is the
+            // bug's site: the new BlockedStart must still remember A was
+            // ONCE verified-answering, not just that B currently isn't.
+            cfg.dns.servers = vec![resolver_b];
+            pm.start_cancellable(&cfg, true, CancellationToken::new())
+                .await
+                .unwrap_err();
+            assert_eq!(*st.last_cover_resolver_ip.lock().unwrap(), Some(resolver_b));
+            let after_attempt_2 = writer.snapshot_string();
+            assert!(
+                after_attempt_2.contains("the cached DoH resolver is no longer configured"),
+                "attempt 2: B was never queried this session, so the unpinned warning is correct here; got:\n{after_attempt_2}"
+            );
+
+            // Attempt 3: `dns.servers` reverts to exactly [A] — the SAME
+            // resolver attempt 1 verified answering. Repair corrects the
+            // permit back to Some(A); the unpinned warning must NOT
+            // reappear, because `revalidate` is being applied to the
+            // ORIGINAL Answered(A), not to attempt 2's ResolverDeselected.
+            cfg.dns.servers = vec![resolver_a];
+            pm.start_cancellable(&cfg, true, CancellationToken::new())
+                .await
+                .unwrap_err();
+            assert_eq!(*st.last_cover_resolver_ip.lock().unwrap(), Some(resolver_a));
+            let after_attempt_3 = writer.snapshot_string();
+            assert_eq!(
+                after_attempt_3.matches("the cached DoH resolver is no longer configured").count(),
+                1,
+                "attempt 3 reverts to the ORIGINALLY-answered resolver; the unpinned warning must not \
+                 fire again (only attempt 2's occurrence should be present) — got:\n{after_attempt_3}"
+            );
+        });
+    }
+
+    // An operator's own `ech-doh` (not Hole's) winning is a stall risk the
+    // cover can never fix by permitting it — the residual-stall diagnostic
+    // must still name it, distinctly from the "nothing pinned" case.
+    #[skuld::test]
+    fn covered_start_residual_warning_fires_for_an_operator_ech_doh_override() {
+        use crate::test_support::log_capture::VecWriter;
+        use tracing_subscriber::fmt;
+        use tracing_subscriber::layer::{Layer, SubscriberExt};
+
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let writer = VecWriter::new();
+                let subscriber = tracing_subscriber::registry().with(
+                    fmt::layer()
+                        .with_writer(writer.clone())
+                        .with_ansi(false)
+                        .with_filter(tracing_subscriber::filter::LevelFilter::WARN),
+                );
+                let _guard = garter::tracing_test::set_default_in_current_thread(subscriber);
+
+                let dir = tempfile::tempdir().unwrap();
+                let routing = MockRouting::new(dir.path().to_path_buf());
+                let (mut pm, _dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, false);
+                let mut cfg = test_config();
+                // Literal-IP server: Hole's own candidate is unpinned
+                // (NoQueryNeeded), so it never outranks an IP-literal operator
+                // value — the operator's own ech-doh wins.
+                cfg.server.server = "203.0.113.9".into();
+                cfg.server.plugin = Some("ex-ray".into());
+                cfg.server.plugin_opts = Some(format!("{ECH_CAPABLE_OPTS};ech-doh=https://8.8.8.8/dns-query"));
+                cfg.dns.enabled = true;
+                cfg.dns.servers = vec!["1.0.0.1".parse().unwrap()];
+                let _ = pm
+                    .start_cancellable(&cfg, true, CancellationToken::new())
+                    .await
+                    .unwrap_err();
+
+                let output = writer.snapshot_string();
+                assert!(
+                    output.contains("plugin's own ech-doh"),
+                    "expected the operator-override residual warning; got:\n{output}"
+                );
+            });
+    }
+
+    // `ech_doh_url` constructs a real address from the configured resolvers
+    // even for `PinSource::NoQueryNeeded`, and the cover permits exactly
+    // that address
+    // (`covered_start_with_a_literal_server_ip_still_permits_the_constructed_resolver`),
+    // so the "genuinely can't permit anything" residual warning must not
+    // fire for a literal-IP server.
+    #[skuld::test]
+    fn covered_start_no_residual_warning_for_a_literal_server_ip() {
+        use crate::test_support::log_capture::VecWriter;
+        use tracing_subscriber::fmt;
+        use tracing_subscriber::layer::{Layer, SubscriberExt};
+
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let writer = VecWriter::new();
+                let subscriber = tracing_subscriber::registry().with(
+                    fmt::layer()
+                        .with_writer(writer.clone())
+                        .with_ansi(false)
+                        .with_filter(tracing_subscriber::filter::LevelFilter::WARN),
+                );
+                let _guard = garter::tracing_test::set_default_in_current_thread(subscriber);
+
+                let dir = tempfile::tempdir().unwrap();
+                let routing = MockRouting::new(dir.path().to_path_buf());
+                let (mut pm, _dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, false);
+                let mut cfg = test_config();
+                cfg.server.server = "203.0.113.9".into();
+                cfg.server.plugin = Some("ex-ray".into());
+                cfg.server.plugin_opts = Some(ECH_CAPABLE_OPTS.into());
+                cfg.dns.enabled = true;
+                cfg.dns.servers = vec!["1.0.0.1".parse().unwrap()];
+                let _ = pm
+                    .start_cancellable(&cfg, true, CancellationToken::new())
+                    .await
+                    .unwrap_err();
+
+                let output = writer.snapshot_string();
+                assert!(
+                    !output.contains("the fail-closed cover does not permit"),
+                    "a literal-IP server's constructed resolver is now permitted; got:\n{output}"
+                );
+            });
+    }
+
+    // `effective_ech_doh` (queried once from the permit-derivation path) must
+    // NOT re-trigger `inject_plugin_directives`'s ECH-posture logging — that
+    // function runs a SECOND time, for real, when `start_plugin_chain`
+    // actually spawns the plugin. A regression that made `effective_ech_doh`
+    // call `inject_plugin_directives` (instead of the side-effect-free
+    // `classify_ech_doh`) would double-emit every such warning on every
+    // start. Literal-IP server: `ech_doh` derives an UNPINNED URL, which
+    // emits the "resolver has not been exercised" line exactly once per
+    // `inject_plugin_directives` call.
+    #[skuld::test]
+    fn effective_ech_doh_query_does_not_double_emit_the_injection_warning() {
+        use crate::test_support::log_capture::VecWriter;
+        use tracing_subscriber::fmt;
+        use tracing_subscriber::layer::{Layer, SubscriberExt};
+
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let writer = VecWriter::new();
+                let subscriber = tracing_subscriber::registry().with(
+                    fmt::layer()
+                        .with_writer(writer.clone())
+                        .with_ansi(false)
+                        .with_filter(tracing_subscriber::filter::LevelFilter::WARN),
+                );
+                let _guard = garter::tracing_test::set_default_in_current_thread(subscriber);
+
+                let dir = tempfile::tempdir().unwrap();
+                let routing = MockRouting::new(dir.path().to_path_buf());
+                let (mut pm, _dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, false);
+                let mut cfg = test_config();
+                cfg.server.server = "203.0.113.9".into();
+                cfg.server.plugin = Some("ex-ray".into());
+                cfg.server.plugin_opts = Some(ECH_CAPABLE_OPTS.into());
+                cfg.dns.enabled = true;
+                cfg.dns.servers = vec!["1.0.0.1".parse().unwrap()];
+                let _ = pm
+                    .start_cancellable(&cfg, true, CancellationToken::new())
+                    .await
+                    .unwrap_err();
+
+                let output = writer.snapshot_string();
+                let occurrences = output.matches("the ECH lookup uses a resolver that has not been exercised").count();
+                assert_eq!(
+                    occurrences, 1,
+                    "expected exactly one injection-warning emission (from the real spawn's \
+                     inject_plugin_directives call, not from effective_ech_doh's permit query too); got {occurrences}:\n{output}"
+                );
+            });
+    }
+
+    #[skuld::test]
+    fn covered_start_no_residual_warning_for_a_pinned_resolver() {
+        use crate::test_support::log_capture::VecWriter;
+        use tracing_subscriber::fmt;
+        use tracing_subscriber::layer::{Layer, SubscriberExt};
+
+        // Negative direction: a healthy, fully-permitted covered start must NOT
+        // emit the residual-gap warning — proves it isn't spuriously noisy.
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let writer = VecWriter::new();
+                let subscriber = tracing_subscriber::registry().with(
+                    fmt::layer()
+                        .with_writer(writer.clone())
+                        .with_ansi(false)
+                        .with_filter(tracing_subscriber::filter::LevelFilter::WARN),
+                );
+                let _guard = garter::tracing_test::set_default_in_current_thread(subscriber);
+
+                let resolved: IpAddr = "203.0.113.9".parse().unwrap();
+                let answering_resolver: IpAddr = "1.0.0.1".parse().unwrap();
+                let querier = Arc::new(CountingQuerier {
+                    host: "proxy.example".into(),
+                    ip: resolved,
+                    queries: AtomicU32::new(0),
+                });
+                let dir = tempfile::tempdir().unwrap();
+                let routing = MockRouting::new(dir.path().to_path_buf());
+                let (mut pm, _dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, false);
+                pm.set_bootstrap_querier_for_test(querier);
+                let mut cfg = test_config();
+                cfg.server.server = "proxy.example".into();
+                cfg.server.plugin = Some("ex-ray".into());
+                cfg.server.plugin_opts = Some(ECH_CAPABLE_OPTS.into());
+                // Forces the forwarder self-test gate — deterministic regardless of
+                // whether `ex-ray` happens to be resolvable via PATH on this host.
+                cfg.dns.enabled = true;
+                cfg.dns.servers = vec![answering_resolver];
+                let _ = pm
+                    .start_cancellable(&cfg, true, CancellationToken::new())
+                    .await
+                    .unwrap_err();
+
+                let output = writer.snapshot_string();
+                assert!(
+                    !output.contains("the fail-closed cover does not permit"),
+                    "a fully-pinned covered start must not emit the residual-gap warning; got:\n{output}"
+                );
+            });
+    }
+
+    #[skuld::test]
+    fn covered_retry_repair_warning_fires_when_the_permit_is_stale() {
+        use crate::test_support::log_capture::VecWriter;
+        use tracing_subscriber::fmt;
+        use tracing_subscriber::layer::{Layer, SubscriberExt};
+
+        // Same scenario as covered_retry_after_adding_a_plugin_repairs_the_stale_permit
+        // (plugin added between attempts), asserting the repair's OWN log line
+        // fires — that test only proves the structural effect (re-engage,
+        // corrected permit), not that the operator sees why.
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let writer = VecWriter::new();
+                let subscriber = tracing_subscriber::registry().with(
+                    fmt::layer()
+                        .with_writer(writer.clone())
+                        .with_ansi(false)
+                        .with_filter(tracing_subscriber::filter::LevelFilter::WARN),
+                );
+                let _guard = garter::tracing_test::set_default_in_current_thread(subscriber);
+
+                let probe_l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+                let closed = probe_l.local_addr().unwrap();
+                drop(probe_l);
+                let answering_resolver: IpAddr = "1.0.0.1".parse().unwrap();
+                let querier = Arc::new(CountingQuerier {
+                    host: "proxy.example".into(),
+                    ip: closed.ip(),
+                    queries: AtomicU32::new(0),
+                });
+                let dir = tempfile::tempdir().unwrap();
+                let routing = MockRouting::new(dir.path().to_path_buf());
+                let (mut pm, _dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, false);
+                pm.set_bootstrap_querier_for_test(querier);
+                let mut cfg = test_config();
+                cfg.server.server = "proxy.example".into();
+                cfg.server.server_port = closed.port();
+                cfg.server.plugin = None;
+                cfg.dns.enabled = true;
+                cfg.dns.servers = vec![answering_resolver];
+
+                pm.start_cancellable(&cfg, true, CancellationToken::new())
+                    .await
+                    .unwrap_err();
+                cfg.server.plugin = Some("ex-ray".into());
+                cfg.server.plugin_opts = Some(ECH_CAPABLE_OPTS.into());
+                pm.start_cancellable(&cfg, true, CancellationToken::new())
+                    .await
+                    .unwrap_err();
+
+                let output = writer.snapshot_string();
+                assert!(
+                    output.contains("releasing it so a fresh engage can correct it"),
+                    "expected the repair warning on the stale-permit retry; got:\n{output}"
+                );
+            });
     }
 
     #[skuld::test]
@@ -3049,24 +4118,36 @@ mod self_test {
     }
 
     /// A covered start that fails, leaving the cover (and its cached pin) held.
-    /// Returns the manager so a retry can be driven against an edited config.
+    /// Returns the manager (plus the mock routing state, so a test can assert
+    /// on re-engage counts and permits) so a retry can be driven against an
+    /// edited config.
     async fn covered_start_holding_the_cover(
         dir: tempfile::TempDir,
-    ) -> (ProxyManager<MockProxy, MockRouting>, ProxyConfig, tempfile::TempDir) {
+    ) -> (
+        ProxyManager<MockProxy, MockRouting>,
+        ProxyConfig,
+        tempfile::TempDir,
+        Arc<MockRoutingState>,
+    ) {
         let querier = Arc::new(CountingQuerier {
             host: "proxy.example".into(),
             ip: "203.0.113.9".parse().unwrap(),
             queries: AtomicU32::new(0),
         });
         let routing = MockRouting::new(dir.path().to_path_buf());
+        let st = routing.state();
         let (mut pm, dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, false);
         pm.set_bootstrap_querier_for_test(querier);
         let mut cfg = test_config();
         cfg.server.server = "proxy.example".into();
+        // Forces the forwarder self-test gate, which MockProxy cannot satisfy —
+        // deterministic regardless of whether `ex-ray` happens to be resolvable
+        // via PATH on this host, so the cover reliably stays held.
         cfg.dns.enabled = true;
-        // Only a plugin start derives an `ech-doh`. This name resolves to no
-        // binary, so phase 1 fails immediately and the cover stays held.
-        cfg.server.plugin = Some("hole-694-absent-plugin".into());
+        // A real ECH-family name: `ech_doh_will_reach_ex_ray`'s gate needs one
+        // for `ech_resolver_permit` to ever be `Some`.
+        cfg.server.plugin = Some("ex-ray".into());
+        cfg.server.plugin_opts = Some(ECH_CAPABLE_OPTS.into());
         // v6 first so the PIN and the IPv4-preferring fallback disagree — with a
         // single-entry list every assertion below would pass on a discarded pin.
         // `CountingQuerier` ignores which resolver it was asked, so the first
@@ -3077,13 +4158,13 @@ mod self_test {
             .await
             .unwrap_err();
         assert!(pm.blocked_until_connected(), "the failed covered start holds the cover");
-        (pm, cfg, dir)
+        (pm, cfg, dir, st)
     }
 
     #[skuld::test]
     fn a_covered_start_pins_the_ech_lookup_to_the_resolver_that_answered() {
         rt().block_on(async {
-            let (pm, _cfg, _dir) = covered_start_holding_the_cover(tempfile::tempdir().unwrap()).await;
+            let (pm, _cfg, _dir, _st) = covered_start_holding_the_cover(tempfile::tempdir().unwrap()).await;
             assert_eq!(pm.last_ech_doh(), Some("https://[2606:4700:4700::1111]/dns-query"));
         });
     }
@@ -3094,7 +4175,7 @@ mod self_test {
     #[skuld::test]
     fn a_covered_retry_keeps_the_pin_when_the_resolvers_are_unchanged() {
         rt().block_on(async {
-            let (mut pm, cfg, _dir) = covered_start_holding_the_cover(tempfile::tempdir().unwrap()).await;
+            let (mut pm, cfg, _dir, _st) = covered_start_holding_the_cover(tempfile::tempdir().unwrap()).await;
             pm.start_cancellable(&cfg, true, CancellationToken::new())
                 .await
                 .unwrap_err();
@@ -3167,10 +4248,23 @@ mod self_test {
 
     // The cover is keyed by hostname alone, so a retry can arrive with an edited
     // resolver set — `revalidate` must catch that here, not only in isolation.
+    // Also proves the drift is REPAIRED, not merely diagnosed: the deselected
+    // IPv6 resolver's stale permit must be released and re-engaged to match
+    // the NEW fallback address `ech_doh_url` constructs from the retry's own
+    // `dns.servers` (`ResolverDeselected` is still permitted — see
+    // `EchDoh::resolver`'s doc — just no longer the OLD address) — the same
+    // repair path as `covered_retry_after_adding_a_plugin_repairs_the_stale_permit`,
+    // exercised here via a resolver SWAP rather than a plugin addition.
     #[skuld::test]
     fn a_covered_retry_drops_a_resolver_the_user_deselected() {
         rt().block_on(async {
-            let (mut pm, mut cfg, _dir) = covered_start_holding_the_cover(tempfile::tempdir().unwrap()).await;
+            let (mut pm, mut cfg, _dir, st) = covered_start_holding_the_cover(tempfile::tempdir().unwrap()).await;
+            assert_eq!(st.cover_engage_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                *st.last_cover_resolver_ip.lock().unwrap(),
+                Some("2606:4700:4700::1111".parse().unwrap()),
+                "sanity: the initial engage pinned the answering IPv6 resolver"
+            );
             cfg.dns.servers = vec!["8.8.8.8".parse().unwrap()];
             pm.start_cancellable(&cfg, true, CancellationToken::new())
                 .await
@@ -3179,6 +4273,16 @@ mod self_test {
                 pm.last_ech_doh(),
                 Some("https://8.8.8.8/dns-query"),
                 "a deselected resolver is dropped and the retry's own config supplies the fallback"
+            );
+            assert_eq!(
+                st.cover_engage_calls.load(Ordering::SeqCst),
+                2,
+                "the stale IPv6 permit is released and a fresh cover is re-engaged — the repair, not just a diagnosis"
+            );
+            assert_eq!(
+                *st.last_cover_resolver_ip.lock().unwrap(),
+                Some("8.8.8.8".parse().unwrap()),
+                "the fresh engage permits the NEW fallback address, not the deselected one"
             );
         });
     }
@@ -3277,21 +4381,23 @@ mod self_test {
 
     /// The covered start engages the cover before start_inner, so the probe-
     /// suppression predicate (cover_active) sees the live in-process signal even
-    /// with NO lockdown intent — the original self-test reason survives. Mirrors
-    /// `lockdown_on_skips_probe_keeps_original_reason`; the control is
-    /// `lockdown_off_runs_probe_rewrites_reason` (uncovered → probe runs).
+    /// with NO lockdown intent — the self-test's own reading survives instead of
+    /// the probe's rewrite. Mirrors `lockdown_on_skips_probe_keeps_original_reason`;
+    /// the control is `lockdown_off_runs_probe_rewrites_reason` (uncovered → probe
+    /// runs).
     #[skuld::test]
     fn covered_start_without_lockdown_suppresses_probe() {
         rt().block_on(async {
             let (mut pm, cfg, _st, _dir) = covered_gate_setup(false);
-            let err = pm.start_cancellable(&cfg, true, CancellationToken::new()).await.unwrap_err();
-            match err {
-                ProxyError::ForwarderSelfTestFailed { reason, .. } => assert!(
-                    !reason.contains("refused"),
-                    "a covered start engages a cover, so the probe is skipped and the original reason survives, got {reason:?}"
-                ),
-                other => panic!("expected ForwarderSelfTestFailed, got {other:?}"),
-            }
+            let err = pm
+                .start_cancellable(&cfg, true, CancellationToken::new())
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, ProxyError::NoTunnelConnection { .. }),
+                "a covered start engages a cover, so the probe is skipped and the self-test's own \
+                 reading (not one byte written) surfaces, got {err:?}"
+            );
         });
     }
 
@@ -3349,32 +4455,5 @@ mod self_test {
                 other => panic!("expected ForwarderSelfTestFailed, got {other:?}"),
             }
         });
-    }
-
-    /// End-to-end-ish: a TLS-transport endpoint that accepts TCP then resets the
-    /// handshake → the live probe verdict is `Blocked` → `self_test_error_for`
-    /// yields the typed `NetworkBlocked`.
-    #[skuld::test(name = "proxy_manager_tests::reset_endpoint_maps_to_network_blocked")]
-    async fn reset_endpoint_maps_to_network_blocked() {
-        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let a = l.local_addr().unwrap();
-        tokio::spawn(async move {
-            while let Ok((s, _)) = l.accept().await {
-                drop(s);
-            }
-        });
-        let verdict = crate::reachability::probe_server_reachability(
-            &a.ip().to_string(),
-            a.port(),
-            Some("galoshes"),
-            Some("tls;host=h"),
-            &CancellationToken::new(),
-        )
-        .await;
-        assert_eq!(verdict, ReachabilityVerdict::Blocked);
-        assert!(matches!(
-            self_test_error_for(Some(verdict), 3, 200, original_reason()),
-            ProxyError::NetworkBlocked
-        ));
     }
 }

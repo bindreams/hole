@@ -11,6 +11,7 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{mpsc, oneshot};
+use tokio::time::Instant;
 use tokio_util::compat::TokioAsyncReadCompatExt as _;
 use tokio_util::sync::CancellationToken;
 
@@ -21,10 +22,10 @@ use crate::yamux::keepalive::Cadence;
 use crate::yamux::{
     bind_udp, connect_delay, connect_retrying, connection_task_fatal, deframe_udp_datagram, drive_connection,
     driver_panicked, enable_keepalive, frame_udp_datagram, next_failures, parse_udp_timeout, run_client,
-    run_client_session, run_server, run_server_with_connections, serve_driven_connection, session_reconnect_backoff,
-    ClientBoundAddrs, FrameAccumulator, OpenStreamReply, SessionOutcome, SessionTransport, StreamTag,
-    TransportLivenessTap, DEFAULT_UDP_TIMEOUT, KEEPALIVE_NONCE_LEN, LOOPBACK_CONNECT_RETRY, REMOTE_BACKOFF_BASE,
-    REMOTE_BACKOFF_MAX,
+    run_client_session, run_server, run_server_with_connections, saturating_deadline, serve_driven_connection,
+    session_reconnect_backoff, ClientBoundAddrs, FrameAccumulator, OpenStreamReply, SessionOutcome, SessionTransport,
+    StreamTag, TransportLivenessTap, DEFAULT_UDP_TIMEOUT, KEEPALIVE_NONCE_LEN, LOOPBACK_CONNECT_RETRY,
+    REMOTE_BACKOFF_BASE, REMOTE_BACKOFF_MAX,
 };
 
 #[skuld::test]
@@ -183,10 +184,10 @@ fn udp_timeout_parsed_value() {
 }
 
 #[skuld::test]
-fn udp_timeout_last_occurrence_wins() {
+fn udp_timeout_first_occurrence_wins() {
     assert_eq!(
         parse_udp_timeout(Some("udp_timeout=5;udp_timeout=20")).unwrap(),
-        Duration::from_secs(20)
+        Duration::from_secs(5)
     );
 }
 
@@ -197,6 +198,52 @@ fn udp_timeout_invalid_is_error() {
     // 0 would evict every association immediately — rejected.
     assert!(parse_udp_timeout(Some("udp_timeout=0")).is_err());
     assert!(parse_udp_timeout(Some("udp_timeout=-1")).is_err());
+    // Too large to fit `Instant` even right now — `run_udp_association`'s
+    // resets would saturate rather than panic on this, but it's still
+    // rejected early as a diagnostic (it would defeat idle-eviction as
+    // thoroughly as `0` does in the other direction).
+    assert!(parse_udp_timeout(Some("udp_timeout=18446744073709551615")).is_err());
+}
+
+#[skuld::test]
+fn udp_timeout_validates_every_occurrence_not_just_the_first() {
+    assert!(parse_udp_timeout(Some("udp_timeout=30;udp_timeout=0")).is_err());
+    assert!(parse_udp_timeout(Some("udp_timeout=30;udp_timeout=abc")).is_err());
+}
+
+#[skuld::test]
+fn udp_timeout_errors_on_malformed_options() {
+    // A dangling trailing backslash is fatal to ex-ray's own parser; failing
+    // loud here beats silently falling back to the default. The reason must
+    // survive in the error's own message, not just the fact that it failed.
+    let err = parse_udp_timeout(Some(r"udp_timeout=10;path=/a\")).unwrap_err();
+    assert!(
+        err.to_string().contains("unpaired backslash"),
+        "expected the specific reason in the message, got: {err}"
+    );
+}
+
+#[skuld::test]
+fn udp_timeout_rejected_value_never_reaches_the_error_message() {
+    // An escaped `;` absorbs the following segment into `udp_timeout`'s own
+    // value instead of starting a new one, so a naive `{value:?}` in the
+    // error would leak whatever follows — here, a stand-in secret.
+    let err = parse_udp_timeout(Some(r"udp_timeout=abc\;token=SECRET")).unwrap_err();
+    assert!(
+        !err.to_string().contains("SECRET"),
+        "error message leaks the rejected value: {err}"
+    );
+}
+
+#[skuld::test]
+fn saturating_deadline_never_panics_on_a_duration_too_large_to_add() {
+    // The value `parse_udp_timeout` rejects at parse time as too large to
+    // fit `Instant` right now still must not panic here: uptime narrows the
+    // margin, so a value that DID fit at parse time can still overflow by
+    // the time a reset actually runs. `saturating_deadline` is what
+    // `run_udp_association`'s resets call instead of a bare `+`.
+    let deadline = saturating_deadline(Duration::from_secs(u64::MAX));
+    assert!(deadline > Instant::now(), "must still land in the future");
 }
 
 // End-to-end UDP relay (#415) -----------------------------------------------------------------------------------------

@@ -4,13 +4,13 @@
 package main
 
 import (
+	"errors"
 	"flag"
 	"fmt"
 	"net"
 	"os"
 	"os/signal"
 	"runtime"
-	"strconv"
 	"syscall"
 
 	core "github.com/v2fly/v2ray-core/v5"
@@ -18,10 +18,23 @@ import (
 
 var VERSION = "ex-ray"
 
+// failFatal reports err as a `fatal` sitrep and exits with ex-ray's
+// config-class-error code (23) -- distinct from other exit codes so a
+// supervisor like systemd does not treat a bad config as a crash worth
+// restarting.
+func failFatal(err error) {
+	emitFatal(err.Error(), nil)
+	logFatal(err.Error())
+	os.Exit(23) // config-class error
+}
+
 // parseOptsIntoFlags reads SS_PLUGIN env vars and cross-assigns them into the
 // package-level flag pointers. This is the env-remap seam: it is split out of
 // buildV2Ray so main() can compute the listen address between the remap and
 // core.New (the config needs the remap to have happened first).
+//
+// A non-nil return is fatal: the caller must emit a `fatal` sitrep and exit
+// non-zero rather than proceed with partially-remapped flags.
 //
 // localAddr/localPort always name the inbound listener bound by this process,
 // in BOTH modes:
@@ -34,57 +47,72 @@ var VERSION = "ex-ray"
 // The cross-assignment below mirrors that: under `*server`, a `localAddr`
 // option lands in *remoteAddr and a `remoteAddr` option lands in *localAddr
 // (likewise for ports).
-func parseOptsIntoFlags() {
+func parseOptsIntoFlags() error {
 	opts, err := parseEnv()
 	if err != nil {
-		// parseEnv only errors on a malformed SS_PLUGIN_OPTIONS string; with
-		// no SS_* env set it returns empty opts and nil. Either way, leave the
-		// flag defaults in place (matches the prior behavior, which guarded the
-		// whole remap block on `err == nil`).
-		return
+		// Unwrapped, not "invalid SS_PLUGIN_OPTIONS"-prefixed: parseEnv
+		// returns two distinct fault classes (a malformed
+		// SS_PLUGIN_OPTIONS string, or an incomplete SS_* chain-handoff
+		// env, which SS_PLUGIN_OPTIONS may have nothing to do with), and
+		// each already names itself accurately.
+		return err
 	}
 
 	if c, b := opts.Get("mode"); b {
 		*mode = c
 	}
-	if c, b := opts.Get("mux"); b {
-		if i, err := strconv.Atoi(c); err == nil {
-			*mux = i
-		} else {
-			logWarn("failed to parse mux, use default value")
-		}
+	if err := parseIntOption(opts, "mux", mux); err != nil {
+		return err
 	}
-	if c, b := opts.Get("tcp-keepalive"); b {
-		if i, err := strconv.Atoi(c); err == nil {
-			*tcpKeepAlive = i
-		} else {
-			logWarn("failed to parse tcp-keepalive, use default value")
-		}
+	if err := parseIntOption(opts, "tcp-keepalive", tcpKeepAlive); err != nil {
+		return err
 	}
-	if _, b := opts.Get("tls"); b {
-		*tlsEnabled = true
+	if err := parseBoolOption(opts, "tls", tlsEnabled); err != nil {
+		return err
 	}
-	if c, b := opts.Get("host"); b {
-		*host = c
+	if err := parseStringOption(opts, "host", host, false); err != nil {
+		return err
 	}
-	if c, b := opts.Get("path"); b {
-		*path = c
+	if err := parseStringOption(opts, "path", path, false); err != nil {
+		return err
 	}
-	if c, b := opts.Get("cert"); b {
-		*cert = c
+	// cert/certRaw/key: empty is a documented, meaningful "use the
+	// default" spelling (config.go falls back to ~/.acme.sh when both
+	// are empty in server mode) -- not fatal, unlike host/path above.
+	if err := parseStringOption(opts, "cert", cert, true); err != nil {
+		return err
 	}
-	if c, b := opts.Get("certRaw"); b {
-		*certRaw = c
+	if err := parseStringOption(opts, "certRaw", certRaw, true); err != nil {
+		return err
 	}
-	if c, b := opts.Get("key"); b {
-		*key = c
+	if err := parseStringOption(opts, "key", key, true); err != nil {
+		return err
 	}
-	if c, b := opts.Get("loglevel"); b {
-		*logLevel = c
+	// loglevel's documented default spelling is "warning" (or an absent
+	// key); an explicit "loglevel=" has no legitimate meaning of its own
+	// -- treated as unrecognized like host/path, not as a meaningful
+	// "use the default" spelling like cert/certRaw/key/ech-doh, so a
+	// silent revert-to-default (e.g. discarding a CLI-set -loglevel=debug)
+	// is fatal instead of invisible.
+	if err := parseStringOption(opts, "loglevel", logLevel, false); err != nil {
+		return err
 	}
-	if _, b := opts.Get("server"); b {
-		*server = true
+	if err := parseBoolOption(opts, "server", server); err != nil {
+		return err
 	}
+	// localAddr/localPort/remoteAddr/remotePort are cross-assigned raw,
+	// with no parse*Option validator -- whether these four should be
+	// operator-settable via SS_PLUGIN_OPTIONS at all is an open question;
+	// adding validation here would answer it unilaterally. The same
+	// bare-key-resolves-to-"1" gap parseIntOption/parseStringOption
+	// document for their own options applies here too: a fat-fingered
+	// bare `remoteAddr` silently sets the upstream destination to the
+	// domain "1", and a bare `localPort`/`remotePort` silently sets port
+	// 1 -- both valid-looking values that sail past every guard added in
+	// this file (port-0 checks, empty/AnyIP remoteAddr checks) because
+	// "1" is neither zero nor empty. Fixing this needs the same args.go
+	// Args grammar change already tracked (not attempted here) to
+	// distinguish a bare key from an explicit "=1".
 	if c, b := opts.Get("localAddr"); b {
 		if *server {
 			*remoteAddr = c
@@ -114,32 +142,30 @@ func parseOptsIntoFlags() {
 		}
 	}
 
-	if _, b := opts.Get("fastOpen"); b {
-		*fastOpen = true
+	if err := parseBoolOption(opts, "fastOpen", fastOpen); err != nil {
+		return err
 	}
 
-	if _, b := opts.Get("__android_vpn"); b {
-		*vpn = true
+	if err := parseBoolOption(opts, "__android_vpn", vpn); err != nil {
+		return err
 	}
 
-	if c, b := opts.Get("fwmark"); b {
-		if i, err := strconv.Atoi(c); err == nil {
-			*fwmark = i
-		} else {
-			logWarn("failed to parse fwmark, use default value")
-		}
+	if err := parseIntOption(opts, "fwmark", fwmark); err != nil {
+		return err
 	}
 
-	if c, b := opts.Get("ech"); b {
-		*echMode = c
+	if err := parseEnumOption(opts, "ech", allowedEchModes, echMode); err != nil {
+		return err
 	}
-	if c, b := opts.Get("ech-doh"); b {
-		*echDoh = c
+	if err := parseURLOption(opts, "ech-doh", echDoh); err != nil {
+		return err
 	}
 
 	if *vpn {
 		registerControlFunc()
 	}
+
+	return nil
 }
 
 // buildV2Ray generates the v2ray-core config and constructs the instance. The
@@ -203,32 +229,73 @@ func main() {
 	logInit()
 	printCoreVersion()
 
-	parseOptsIntoFlags()
+	if err := parseOptsIntoFlags(); err != nil {
+		failFatal(err)
+	}
 
 	// Must precede core.New: app/proxyman/outbound reads the registered
 	// controllers when it builds each handler's dialer.
 	if err := registerTCPKeepAlive(); err != nil {
-		emitFatal(err.Error(), nil)
-		logFatal(err.Error())
-		os.Exit(23) // config-class error
+		failFatal(err)
 	}
 
 	// ex-ray requires a CONCRETE local port. It cannot honor the sitrep
 	// port-0 / OS-assigned-port contract: v2ray-core does not expose the
-	// inbound listener's bound port via any public API. Echoing ":0" as
-	// `ready.listen` would be a silent spec violation (SITREP.md: listen MUST be
-	// the bound address).
-	// Hole always hands ex-ray a concrete pre-allocated port; a port-0 input
-	// is a misconfiguration we fail loudly on rather than mis-report.
-	if *localPort == "0" || *localPort == "" {
-		emitFatal("ex-ray requires a concrete local port; port-0 OS-assignment is not supported (v2ray-core does not expose the bound port)", nil)
-		os.Exit(23) // config-class error
+	// inbound listener's bound port via any public API. Echoing a port-0
+	// spelling as `ready.listen` would be a silent spec violation
+	// (SITREP.md: listen MUST be the bound address).
+	// Hole always hands ex-ray a concrete pre-allocated port; a port-0
+	// input is a misconfiguration we fail loudly on rather than mis-report.
+	// validPort (config.go) is the same parser generateConfig's own
+	// localPort/remotePort validation uses -- a non-canonical spelling
+	// ("00", "000") is also port 0 to it, which would otherwise bind an
+	// OS-assigned ephemeral port while localListenAddr below -- built from
+	// this same raw string -- still reported the original spelling, a
+	// bound port that disagrees with what ready.listen claimed. A parse
+	// failure or an out-of-range value is a different fault (not a port-0
+	// request at all) and gets its own message so the detail doesn't
+	// misdirect the operator at a port-0/OS-assignment problem they don't
+	// have.
+	localPortNum, portErr := validPort(*localPort)
+	switch {
+	case portErr != nil:
+		failFatal(errors.New("invalid localPort: not a valid port"))
+	case localPortNum == 0:
+		failFatal(errors.New("ex-ray requires a concrete local port; port-0 OS-assignment is not supported (v2ray-core does not expose the bound port)"))
+	}
+
+	// localAddr must be exactly one IP literal. Two distinct failure modes
+	// this closes:
+	//   - Multiple addresses: parseLocalAddr (config.go) splits localAddr
+	//     on `|` for a genuine multi-address server-mode listen, but the
+	//     sitrep's `ready` event carries exactly one `listen` address
+	//     (SITREP.md) -- there is no honest way to report a `|`-joined
+	//     value there, and reporting it verbatim produces a string that
+	//     fails garter's SocketAddr parse and is silently dropped as an
+	//     unrecognized log line instead of being observed as ready.
+	//   - A non-IP hostname: "localhost" is the one spelling v2ray-core's
+	//     own listener silently rewrites to 127.0.0.1 (ListenTCP), so
+	//     reporting the raw *localAddr verbatim would produce
+	//     "localhost:<port>", the identical unparseable-SocketAddr
+	//     failure as the multi-address case. Every other non-IP hostname
+	//     already fails loudly via generateConfig's own "domain address
+	//     is not allowed for listening" error; these two are the only
+	//     silent gaps.
+	if len(parseLocalAddr(*localAddr)) != 1 {
+		failFatal(errors.New("invalid localAddr: a single listen address is required (the ready sitrep cannot report more than one)"))
+	}
+	// canonicalLocalAddr (config.go) folds IP spellings before binding; using
+	// it for both this guard and localListenAddr below keeps them from
+	// drifting apart -- see its doc comment for why.
+	canonicalAddr, ok := canonicalLocalAddr(*localAddr)
+	if !ok {
+		failFatal(errors.New("invalid localAddr: must be an IP literal"))
 	}
 
 	// localAddr/localPort name the inbound listener in both modes (see
 	// parseOptsIntoFlags for the client/server SS_*_* mapping). This is the
 	// address v2ray-core binds and that emitReady reports.
-	localListenAddr := net.JoinHostPort(*localAddr, *localPort)
+	localListenAddr := net.JoinHostPort(canonicalAddr, *localPort)
 
 	// network is the transport the inbound listener binds; emitReady reports it
 	// as the sitrep transports.
@@ -236,10 +303,7 @@ func main() {
 
 	server, err := buildV2Ray()
 	if err != nil {
-		emitFatal(err.Error(), nil)
-		logFatal(err.Error())
-		// Configuration error. Exit with a special value to prevent systemd from restarting.
-		os.Exit(23)
+		failFatal(err)
 	}
 
 	osSignals := make(chan os.Signal, 1)
@@ -250,6 +314,12 @@ func main() {
 	// asked v2ray-core for (never empty); refine to the classifier's exact failed
 	// endpoint only when it carries one, so the SITREP addr is never "" (an empty
 	// addr fails the host's SocketAddr parse and drops the whole bind_conflict).
+	// bind_conflict's addr is meant to name the contended endpoint -- legitimate
+	// diagnostic content, not an echo of a rejected value. The generic fatal
+	// branch is different: v2ray-core's own Start error is unredacted internal
+	// text that can embed *localAddr/*localPort verbatim (e.g. "domain address
+	// is not allowed for listening: <value>"), so it must not reach the sitrep;
+	// the raw error still reaches stderr via logFatal below.
 	if err := server.Start(); err != nil {
 		if errno, addr, ok := classifyBindError(err); ok {
 			if addr == "" {
@@ -257,7 +327,7 @@ func main() {
 			}
 			emitBindConflict(errno, addr)
 		} else {
-			emitFatal("start: "+err.Error(), nil)
+			emitFatal("failed to start the v2ray-core inbound listener", nil)
 		}
 		logFatal("failed to start server:", err.Error())
 		os.Exit(1)

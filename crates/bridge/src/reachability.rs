@@ -49,28 +49,66 @@ pub(crate) enum ProbeTransport {
     Raw,
 }
 
-pub(crate) fn classify_transport(plugin: Option<&str>, plugin_opts: Option<&str>, server_host: &str) -> ProbeTransport {
-    if plugin.is_none() {
-        return ProbeTransport::Raw;
+/// Mirrors vendored v2ray-core's `websocket.Config::GetNormalizedPath`
+/// (`crates/ex-ray/third_party/v2ray-core/transport/internet/websocket/config.go`)
+/// byte for byte: this is what actually decides the WebSocket
+/// request-target on the wire, applied unconditionally to whatever the
+/// `path` SIP003 flag decoded to.
+fn normalize_ws_path(path: String) -> String {
+    if path.is_empty() {
+        "/".into()
+    } else if !path.starts_with('/') {
+        format!("/{path}")
+    } else {
+        path
     }
-    let opts = plugin_opts.map(garter::parse_plugin_options).unwrap_or_default();
-    let get = |k: &str| opts.iter().find(|(kk, _)| kk == k).map(|(_, v)| v.clone());
-    let has = |k: &str| opts.iter().any(|(kk, _)| kk == k);
+}
+
+pub(crate) fn classify_transport(
+    plugin: Option<&str>,
+    plugin_opts: Option<&str>,
+    server_host: &str,
+) -> Result<ProbeTransport, garter::MalformedOptions> {
+    if plugin.is_none() {
+        return Ok(ProbeTransport::Raw);
+    }
+    // `split_plugin_options`, not `parse_plugin_options`: the latter maps a
+    // bare key and an explicit `key=` to the same decoded `""`, but ex-ray's
+    // own `Args.Get`/`main.go` do NOT treat them the same for `path` (see
+    // below) — only `OptionSegment::raw` can tell bare from valued apart.
+    let segments = plugin_opts
+        .map(garter::split_plugin_options)
+        .transpose()?
+        .unwrap_or_default();
+    let get = |k: &str| segments.iter().find(|s| s.key == k).map(|s| s.value.clone());
+    let has = |k: &str| segments.iter().any(|s| s.key == k);
     // The probe's first-flight SNI/Host is the connect target (the DoH-resolved
     // IP — IP-SNI): a failure-only diagnostic must not emit the domain in
     // cleartext, and the real tunnel hides it via ECH, so a domain-SNI probe
     // would test a path the client never uses.
     let sni = server_host.to_string();
     if get("mode").as_deref() == Some("quic") {
-        return ProbeTransport::Quic { sni };
+        return Ok(ProbeTransport::Quic { sni });
     }
     if has("tls") {
-        return ProbeTransport::TlsWs { sni };
+        return Ok(ProbeTransport::TlsWs { sni });
     }
-    ProbeTransport::PlainWs {
+    Ok(ProbeTransport::PlainWs {
         host: sni,
-        path: get("path").unwrap_or_else(|| "/".into()),
-    }
+        // Mirrors what ex-ray actually puts on the wire for the two shapes
+        // ex-ray itself accepts: an ABSENT `path` key uses the flag default
+        // "/"; a present key reads `exray_value` (a BARE `path` decodes as
+        // "1", matching `Args.Add`). An explicit `path=` (empty value) is
+        // NOT one of those shapes — ex-ray's own
+        // `parseStringOption(..., emptyOK=false)` (options.go) rejects it as
+        // a config error before ever building a websocket.Config, so there
+        // is no wire behavior to mirror here; "/" is this classifier's own
+        // graceful fallback for an input ex-ray would refuse to start on.
+        path: normalize_ws_path(match segments.iter().find(|s| s.key == "path") {
+            None => "/".into(),
+            Some(s) => s.exray_value().to_string(),
+        }),
+    })
 }
 
 pub async fn probe_server_reachability(
@@ -80,7 +118,19 @@ pub async fn probe_server_reachability(
     plugin_opts: Option<&str>,
     cancel: &CancellationToken,
 ) -> ReachabilityVerdict {
-    let transport = classify_transport(plugin, plugin_opts, host);
+    // A malformed options string means the transport can't be classified,
+    // and guessing wrong in either direction (TCP vs UDP) produces an
+    // actively false confident verdict — unlike `server_endpoint_is_udp`'s
+    // preflight-skip decision, there is no safe default transport to probe
+    // with here, so this best-effort diagnostic stays a graceful Result
+    // (Inconclusive) rather than an assertion.
+    let transport = match classify_transport(plugin, plugin_opts, host) {
+        Ok(t) => t,
+        Err(e) => {
+            debug!(%e, "malformed SS_PLUGIN_OPTIONS in reachability probe");
+            return ReachabilityVerdict::Inconclusive;
+        }
+    };
     let v = tokio::select! {
         _ = cancel.cancelled() => ReachabilityVerdict::Inconclusive,
         v = probe_inner(host, port, &transport) => v,

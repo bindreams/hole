@@ -251,14 +251,28 @@ async fn reclassify_blocked(
 /// TCP listener to connect to — so [`run_server_test`] skips it and lets the
 /// full tunnel handshake produce the diagnosis. Covers a direct
 /// v2ray-plugin/ex-ray QUIC server AND a galoshes server (which passes
-/// `mode=quic` through to its embedded ex-ray). Shares the reachability probe's
-/// transport classifier, so the two agree on what a QUIC endpoint is. See
-/// bindreams/hole#421.
+/// `mode=quic` through to its embedded ex-ray). Shares the reachability
+/// probe's transport classifier, so the two agree on what a QUIC endpoint
+/// is.
+///
+/// A malformed options string also skips the preflight, even though the
+/// endpoint might really be TCP: the risk is asymmetric. Guessing UDP when
+/// it's actually TCP costs only diagnosis precision (the full tunnel
+/// handshake still runs and produces a correct, if vaguer, verdict).
+/// Guessing TCP when it's actually UDP-only reproduces the exact false
+/// TcpTimeout/TcpRefused verdict this asymmetry exists to avoid, and a raw
+/// TCP connect can't distinguish "genuinely TCP" from "unclassifiable" to
+/// make that guess safely.
 fn server_endpoint_is_udp(entry: &ServerEntry) -> bool {
-    matches!(
-        crate::reachability::classify_transport(entry.plugin.as_deref(), entry.plugin_opts.as_deref(), &entry.server),
-        crate::reachability::ProbeTransport::Quic { .. }
-    )
+    match crate::reachability::classify_transport(entry.plugin.as_deref(), entry.plugin_opts.as_deref(), &entry.server)
+    {
+        Ok(crate::reachability::ProbeTransport::Quic { .. }) => true,
+        Ok(_) => false,
+        Err(e) => {
+            debug!(%e, "malformed SS_PLUGIN_OPTIONS in server_endpoint_is_udp, assuming UDP");
+            true
+        }
+    }
 }
 
 /// Raw-TCP-connect to the DoH-resolved `addr`. Returns `Err(outcome)` with a
