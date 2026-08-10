@@ -249,7 +249,7 @@ fn bridge_path() -> std::path::PathBuf {
 
 #[skuld::test]
 fn lockdown_spec_permits_loopback_tun_appids_and_server_then_blocks() {
-    let s = build_lockdown_spec(v4(), None, Some(luid()), &[plugin_path(), bridge_path()]);
+    let s = build_lockdown_spec(v4(), luid(), &[plugin_path(), bridge_path()]);
     // loopback on all four ALE layers (CONNECT + RECV_ACCEPT) by the deterministic
     // address-range matcher — see spec_permits_loopback_on_all_four_ale_layers for
     // why the accept side matters and why the flag is unreliable.
@@ -305,100 +305,10 @@ fn lockdown_spec_permits_loopback_tun_appids_and_server_then_blocks() {
     );
 }
 
-// tun_luid: None (Phase-0 permits-only engage) ========================================================================
-
-#[skuld::test]
-fn lockdown_spec_omits_tun_permit_when_luid_is_none() {
-    // The Phase-0 early engage (`install_lockdown_permits`) has no LUID to
-    // resolve yet (the adapter doesn't exist before `routing.install`), so
-    // the TUN filter pair must be omitted entirely -- not merely built with a
-    // dummy value.
-    let s = build_lockdown_spec(v4(), None, None, &[plugin_path(), bridge_path()]);
-    assert!(
-        !s.filters
-            .iter()
-            .any(|f| matches!(f.condition, Condition::LocalInterface(_))),
-        "no LocalInterface filter must exist when tun_luid is None"
-    );
-}
-
-#[skuld::test]
-fn lockdown_spec_still_permits_loopback_appids_and_server_when_tun_is_none() {
-    // Everything ELSE the Phase-0 early engage needs must still be present:
-    // omitting the TUN permit must not accidentally omit anything else.
-    let s = build_lockdown_spec(v4(), Some(resolver_v4()), None, &[plugin_path(), bridge_path()]);
-    for layer in [
-        Layer::ConnectV4,
-        Layer::ConnectV6,
-        Layer::RecvAcceptV4,
-        Layer::RecvAcceptV6,
-    ] {
-        assert!(
-            s.filters.iter().any(|f| f.layer == layer
-                && f.action == Action::Permit
-                && matches!(f.condition, Condition::LoopbackNet(_))),
-            "address-range loopback permit missing on {layer:?}"
-        );
-    }
-    let appids = s
-        .filters
-        .iter()
-        .filter(|f| f.action == Action::Permit && matches!(f.condition, Condition::AppId(_)))
-        .count();
-    assert_eq!(appids, 4, "two binaries x V4+V6");
-    let server: Vec<_> = s
-        .filters
-        .iter()
-        .filter(|f| f.action == Action::Permit && matches!(f.condition, Condition::RemoteIp(_)))
-        .collect();
-    assert_eq!(server.len(), 1);
-    let resolver_permits = s
-        .filters
-        .iter()
-        .filter(|f| {
-            f.action == Action::Permit
-                && matches!(f.condition, Condition::RemoteIpPortTcp(ip, _) if ip == resolver_v4())
-        })
-        .count();
-    assert_eq!(resolver_permits, 1);
-    assert!(s
-        .filters
-        .iter()
-        .any(|f| f.layer == Layer::ConnectV4 && f.action == Action::Block));
-    assert!(s
-        .filters
-        .iter()
-        .any(|f| f.layer == Layer::ConnectV6 && f.action == Action::Block));
-}
-
-#[skuld::test]
-fn lockdown_spec_tun_none_filters_are_a_subset_of_the_tun_some_filters() {
-    // The Phase-0 (tun=None) filter GUIDs must all reappear in the Phase-6
-    // (tun=Some) spec -- same fixed keys, so a re-engage over the Phase-0
-    // permits is a pure ADD of the two TUN filters, never a replace/rekey
-    // that could orphan a filter recovery doesn't know about.
-    let without_tun = build_lockdown_spec(v4(), Some(resolver_v4()), None, &[plugin_path()]);
-    let with_tun = build_lockdown_spec(v4(), Some(resolver_v4()), Some(luid()), &[plugin_path()]);
-    let with_tun_guids: std::collections::HashSet<GUID> = with_tun.filters.iter().map(|f| f.guid).collect();
-    for f in &without_tun.filters {
-        assert!(
-            with_tun_guids.contains(&f.guid),
-            "Phase-0 filter {:?} ({:?}) must also appear in the Phase-6 (tun=Some) spec",
-            f.guid,
-            f.layer
-        );
-    }
-    assert_eq!(
-        with_tun.filters.len(),
-        without_tun.filters.len() + 2,
-        "tun=Some must add EXACTLY the two TUN filters over tun=None"
-    );
-}
-
 #[skuld::test]
 fn lockdown_spec_permits_outweigh_block() {
     // Weight-only arbitration in one sublayer (see the const assert above).
-    let s = build_lockdown_spec(v6(), None, Some(luid()), &[plugin_path()]);
+    let s = build_lockdown_spec(v6(), luid(), &[plugin_path()]);
     for f in &s.filters {
         match f.action {
             Action::Permit => assert_eq!(f.weight, PERMIT_WEIGHT),
@@ -409,9 +319,7 @@ fn lockdown_spec_permits_outweigh_block() {
 
 #[skuld::test]
 fn lockdown_spec_uses_distinct_guids_from_transient_cover() {
-    // Exercise both specs WITH a resolver permit engaged, so the new
-    // lockdown resolver GUIDs are covered by this disjointness check too.
-    let lock = build_lockdown_spec(v4(), Some(resolver_v4()), Some(luid()), &[plugin_path()]);
+    let lock = build_lockdown_spec(v4(), luid(), &[plugin_path()]);
     let cover = build_cover_spec(v4(), Some(resolver_v4()));
     let lock_guids: std::collections::HashSet<_> = lock.filters.iter().map(|f| f.guid).collect();
     let cover_guids: std::collections::HashSet<_> = cover.filters.iter().map(|f| f.guid).collect();
@@ -426,7 +334,7 @@ fn lockdown_spec_uses_distinct_guids_from_transient_cover() {
 
 #[skuld::test]
 fn lockdown_spec_v6_server_lands_on_v6_layer() {
-    let s = build_lockdown_spec(v6(), None, Some(luid()), &[plugin_path()]);
+    let s = build_lockdown_spec(v6(), luid(), &[plugin_path()]);
     let server: Vec<_> = s
         .filters
         .iter()
@@ -434,144 +342,6 @@ fn lockdown_spec_v6_server_lands_on_v6_layer() {
         .collect();
     assert_eq!(server.len(), 1);
     assert_eq!(server[0].layer, Layer::ConnectV6);
-}
-
-// lockdown resolver permit ============================================================================================
-
-#[skuld::test]
-fn lockdown_spec_permits_resolver_ip_on_its_own_family_layer_when_given() {
-    let s = build_lockdown_spec(v4(), Some(resolver_v4()), Some(luid()), &[plugin_path()]);
-    let resolver_permits: Vec<_> = s
-        .filters
-        .iter()
-        .filter(|f| {
-            f.action == Action::Permit
-                && matches!(f.condition, Condition::RemoteIpPortTcp(ip, _) if ip == resolver_v4())
-        })
-        .collect();
-    assert_eq!(resolver_permits.len(), 1, "exactly one resolver permit");
-    assert_eq!(resolver_permits[0].layer, Layer::ConnectV4);
-}
-
-#[skuld::test]
-fn lockdown_spec_permits_v6_resolver_on_v6_layer_only() {
-    let s = build_lockdown_spec(v4(), Some(resolver_v6()), Some(luid()), &[plugin_path()]);
-    let resolver_permits: Vec<_> = s
-        .filters
-        .iter()
-        .filter(|f| {
-            f.action == Action::Permit
-                && matches!(f.condition, Condition::RemoteIpPortTcp(ip, _) if ip == resolver_v6())
-        })
-        .collect();
-    assert_eq!(resolver_permits.len(), 1);
-    assert_eq!(resolver_permits[0].layer, Layer::ConnectV6);
-}
-
-#[skuld::test]
-fn lockdown_spec_omits_resolver_permit_when_none() {
-    // Negative direction: no resolver_ip means no RemoteIpPortTcp permit
-    // exists at all — proves the widening is opt-in, never automatic.
-    let s = build_lockdown_spec(v4(), None, Some(luid()), &[plugin_path()]);
-    let resolver_permits: Vec<_> = s
-        .filters
-        .iter()
-        .filter(|f| f.action == Action::Permit && matches!(f.condition, Condition::RemoteIpPortTcp(..)))
-        .collect();
-    assert_eq!(resolver_permits.len(), 0, "no resolver permit when resolver_ip is None");
-}
-
-#[skuld::test]
-fn lockdown_spec_resolver_permit_is_scoped_to_tcp_443_not_unrestricted() {
-    let s = build_lockdown_spec(v4(), Some(resolver_v4()), Some(luid()), &[plugin_path()]);
-    let resolver_permit = s
-        .filters
-        .iter()
-        .find(|f| matches!(f.condition, Condition::RemoteIpPortTcp(ip, _) if ip == resolver_v4()))
-        .expect("resolver permit must exist");
-    assert!(
-        matches!(
-            resolver_permit.condition,
-            Condition::RemoteIpPortTcp(_, RESOLVER_PERMIT_PORT)
-        ),
-        "lockdown resolver permit must be scoped to RESOLVER_PERMIT_PORT, not unrestricted like the server permit: {:?}",
-        resolver_permit.condition
-    );
-}
-
-#[skuld::test]
-fn lockdown_resolver_permit_weight_outweighs_block() {
-    let s = build_lockdown_spec(v4(), Some(resolver_v4()), Some(luid()), &[plugin_path()]);
-    for f in s
-        .filters
-        .iter()
-        .filter(|f| matches!(f.condition, Condition::RemoteIpPortTcp(ip, _) if ip == resolver_v4()))
-    {
-        assert_eq!(f.weight, PERMIT_WEIGHT);
-    }
-}
-
-#[skuld::test]
-fn lockdown_resolver_permit_guid_matches_its_own_ip_family() {
-    let v4_filter = build_lockdown_spec(v4(), Some(resolver_v4()), Some(luid()), &[plugin_path()])
-        .filters
-        .into_iter()
-        .find(|f| matches!(f.condition, Condition::RemoteIpPortTcp(ip, _) if ip == resolver_v4()))
-        .expect("a V4 resolver permit filter");
-    assert_eq!(v4_filter.guid, LOCKDOWN_FILTER_GUIDS[12]);
-
-    let v6_filter = build_lockdown_spec(v4(), Some(resolver_v6()), Some(luid()), &[plugin_path()])
-        .filters
-        .into_iter()
-        .find(|f| matches!(f.condition, Condition::RemoteIpPortTcp(ip, _) if ip == resolver_v6()))
-        .expect("a V6 resolver permit filter");
-    assert_eq!(v6_filter.guid, LOCKDOWN_FILTER_GUIDS[13]);
-}
-
-#[skuld::test]
-fn lockdown_resolver_permit_guids_are_swept_and_distinct() {
-    let swept: std::collections::HashSet<GUID> = swept_lockdown_guids().into_iter().collect();
-    for resolver in [resolver_v4(), resolver_v6()] {
-        let s = build_lockdown_spec(v4(), Some(resolver), Some(luid()), &[plugin_path()]);
-        for f in &s.filters {
-            assert!(
-                swept.contains(&f.guid),
-                "{:?} must be in the lockdown sweep set",
-                f.guid
-            );
-        }
-        let unique: std::collections::HashSet<GUID> = s.filters.iter().map(|f| f.guid).collect();
-        assert_eq!(
-            unique.len(),
-            s.filters.len(),
-            "every filter GUID in the lockdown spec must be distinct"
-        );
-    }
-}
-
-#[skuld::test]
-fn adopt_deletes_the_resolver_permit_pair_so_reengage_can_update_it() {
-    // Regression class matching adopt_drops_server_permit_so_reengage_can_update_it:
-    // the resolver, like the server, is re-derived fresh on every connect (a plugin
-    // may be added/removed, or dns.servers may change the fallback address) — a
-    // fixed-key permit kept across Adopt would hit FWP_E_ALREADY_EXISTS on the next
-    // engage and silently keep serving the OLD resolver.
-    let adopt: std::collections::HashSet<GUID> = adopt_delete_guids().into_iter().collect();
-    assert!(
-        adopt.contains(&LOCKDOWN_FILTER_GUIDS[12]),
-        "resolver V4 must be dropped on Adopt"
-    );
-    assert!(
-        adopt.contains(&LOCKDOWN_FILTER_GUIDS[13]),
-        "resolver V6 must be dropped on Adopt"
-    );
-    // Adopt still drops exactly six volatile permits now: TUN V4/V6, server
-    // V4/V6, resolver V4/V6.
-    assert_eq!(
-        adopt.len(),
-        6,
-        "adopt_delete_guids now covers TUN + server + resolver pairs"
-    );
 }
 
 // lockdown sweep / Adopt GUID sets ====================================================================================
@@ -609,13 +379,12 @@ fn all_swept_guids_are_mutually_distinct() {
 #[skuld::test]
 fn adopt_deletes_volatile_permits() {
     // Adopt keeps the host fail-closed but drops the VOLATILE permits — the
-    // TUN-LUID pair (LUID dead after teardown), the server-IP pair (the server
-    // changes between connects), and the resolver-IP pair (the ECH resolver
-    // changes with dns.servers/the plugin config). All three are re-added
-    // fresh by the next connect's engage with current values. The fail-closed
-    // floor (block-all, loopback, App-ID) stays in force.
+    // TUN-LUID pair (LUID dead after teardown) AND the server-IP pair (the
+    // server changes between connects). Both are re-added fresh by the next
+    // connect's engage with current values. The fail-closed floor (block-all,
+    // loopback, App-ID) stays in force.
     let adopt = adopt_delete_guids();
-    assert_eq!(adopt.len(), 6, "TUN V4/V6 + server V4/V6 + resolver V4/V6");
+    assert_eq!(adopt.len(), 4, "TUN V4/V6 + server V4/V6");
     for &i in &LOCKDOWN_TUN_GUID_INDICES {
         assert!(
             adopt.contains(&LOCKDOWN_FILTER_GUIDS[i]),
@@ -626,12 +395,6 @@ fn adopt_deletes_volatile_permits() {
         assert!(
             adopt.contains(&LOCKDOWN_FILTER_GUIDS[i]),
             "Adopt must delete the server permit at index {i}"
-        );
-    }
-    for &i in &LOCKDOWN_RESOLVER_GUID_INDICES {
-        assert!(
-            adopt.contains(&LOCKDOWN_FILTER_GUIDS[i]),
-            "Adopt must delete the resolver permit at index {i}"
         );
     }
     // It must NOT delete the fail-closed floor: block-all or loopback.
@@ -710,7 +473,7 @@ fn both_specs_permit_loopback_recv_accept_by_address_range() {
     // V4 range on RecvAcceptV4, V6 range on RecvAcceptV6.
     for s in [
         build_cover_spec(v4(), None),
-        build_lockdown_spec(v4(), None, Some(luid()), &[plugin_path()]),
+        build_lockdown_spec(v4(), luid(), &[plugin_path()]),
     ] {
         assert!(
             s.filters.iter().any(|f| f.layer == Layer::RecvAcceptV4
@@ -763,8 +526,8 @@ fn every_emitted_filter_guid_is_in_its_sweep_set() {
     // Structural fail-closed invariant: any filter a cover installs must be
     // deletable by recovery, else a crash leaks an unswept block across restarts.
     // Transient -> delete_all iterates swept_transient_guids (the fixed GUIDs);
-    // lockdown -> swept_lockdown_guids. Both sides ALSO carry a resolver permit
-    // here so the new GUIDs' sweep membership is exercised.
+    // lockdown -> swept_lockdown_guids. The transient side ALSO carries a
+    // resolver permit here so the new GUIDs' sweep membership is exercised.
     let transient_swept: std::collections::HashSet<GUID> = swept_transient_guids().into_iter().collect();
     for ip in [v4(), v6()] {
         let cover = build_cover_spec(ip, Some(resolver_v4()));
@@ -777,7 +540,7 @@ fn every_emitted_filter_guid_is_in_its_sweep_set() {
             );
         }
         let swept: std::collections::HashSet<GUID> = swept_lockdown_guids().into_iter().collect();
-        let lock = build_lockdown_spec(ip, Some(resolver_v4()), Some(luid()), &[plugin_path(), bridge_path()]);
+        let lock = build_lockdown_spec(ip, luid(), &[plugin_path(), bridge_path()]);
         for f in &lock.filters {
             assert!(
                 swept.contains(&f.guid),
@@ -799,7 +562,7 @@ fn both_specs_permit_loopback_by_address_range_at_connect() {
     // matches deterministically: 127.0.0.0/8 on CONNECT V4, ::1/128 on CONNECT V6.
     for s in [
         build_cover_spec(v4(), None),
-        build_lockdown_spec(v4(), None, Some(luid()), &[plugin_path()]),
+        build_lockdown_spec(v4(), luid(), &[plugin_path()]),
     ] {
         let v4_net = s.filters.iter().any(|f| {
             f.layer == Layer::ConnectV4
@@ -866,7 +629,7 @@ fn new_loopbacknet_guids_are_in_their_sweep_floors_and_distinct() {
         );
     }
     let swept: std::collections::HashSet<GUID> = swept_lockdown_guids().into_iter().collect();
-    let lock = build_lockdown_spec(v4(), None, Some(luid()), &[plugin_path()]);
+    let lock = build_lockdown_spec(v4(), luid(), &[plugin_path()]);
     for f in lock
         .filters
         .iter()
@@ -883,11 +646,10 @@ fn new_loopbacknet_guids_are_in_their_sweep_floors_and_distinct() {
 #[skuld::test]
 fn adopt_does_not_delete_the_address_range_loopback_floor() {
     // The address-range loopback permits are floor, not volatile: Adopt must keep
-    // them (only the TUN-LUID + server-IP + resolver-IP pairs are dropped).
-    // adopt_delete_guids is keyed on the [2,3] / [4,5] / [12,13] indices, which
-    // the address-range loopback GUIDs do not touch.
+    // them (only the TUN-LUID + server-IP pairs are dropped). adopt_delete_guids
+    // is keyed on the [2,3] / [4,5] indices, which the appended GUIDs do not touch.
     let adopt: std::collections::HashSet<GUID> = adopt_delete_guids().into_iter().collect();
-    let lock = build_lockdown_spec(v4(), Some(resolver_v4()), Some(luid()), &[plugin_path()]);
+    let lock = build_lockdown_spec(v4(), luid(), &[plugin_path()]);
     for f in lock
         .filters
         .iter()
@@ -899,11 +661,6 @@ fn adopt_does_not_delete_the_address_range_loopback_floor() {
             f.guid
         );
     }
-    // Adopt still drops exactly six volatile permits: TUN V4/V6, server V4/V6,
-    // resolver V4/V6.
-    assert_eq!(
-        adopt.len(),
-        6,
-        "adopt_delete_guids: TUN V4/V6 + server V4/V6 + resolver V4/V6"
-    );
+    // Adopt still drops exactly the four volatile permits — unchanged by this fix.
+    assert_eq!(adopt.len(), 4, "adopt_delete_guids unchanged: TUN V4/V6 + server V4/V6");
 }

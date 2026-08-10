@@ -5,10 +5,8 @@
 
 use super::*;
 use crate::proxy::{Proxy, ProxyError, RunningProxy, TrafficTotals};
-use crate::test_support::skuld_fixtures::PORT_ALLOC;
 use hole_common::config::ServerEntry;
 use hole_common::protocol::ProxyConfig;
-use plugin_e2e::locators::locate_ex_ray;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::PathBuf;
@@ -171,17 +169,13 @@ struct MockRoutingState {
     fail_gateway: AtomicBool,
     cover_engage_calls: AtomicU32,
     cover_disengage_calls: AtomicU32,
-    /// Count of `engage_lockdown_tun` calls (Phase 6, adds the TUN permit).
     lockdown_engage_calls: AtomicU32,
     lockdown_disengage_calls: AtomicU32,
-    /// Makes `engage_lockdown_tun` (Phase 6) fail.
     fail_lockdown: AtomicBool,
     fail_cover: AtomicBool,
-    /// Ordered record of teardown events ("routes" from `MockRoutes::drop`,
-    /// "lockdown" from a standing-cover `MockCover::drop`) so a test can
-    /// observe cross-call teardown ordering — e.g. that routes tear down
-    /// before the standing cover disengages. Shared via the
-    /// `Arc<MockRoutingState>` both `MockRoutes` and `MockCover` clone.
+    /// Ordered record of teardown events ("routes" / "lockdown") so a test can
+    /// observe the unwind teardown sequence. Shared via the `Arc<MockRoutingState>`
+    /// both `MockRoutes` and `MockCover` clone.
     teardown_order: std::sync::Mutex<Vec<&'static str>>,
     /// Last `server_ip` passed to `install`, so a test can assert the bypass
     /// route received the DoH-resolved IP (not a system-resolved one).
@@ -200,23 +194,6 @@ struct MockRoutingState {
     /// (a set containing both values) for the double-failure fail-open path.
     /// `fail_cover` (always-fail) is unaffected and takes priority.
     fail_cover_for_resolvers: std::sync::Mutex<std::collections::HashSet<Option<IpAddr>>>,
-    /// Last `resolver_ip` passed to `engage_lockdown_tun` (Phase 6, adds the
-    /// TUN permit to the cover `install_lockdown_permits` already returned).
-    last_lockdown_resolver_ip: std::sync::Mutex<Option<IpAddr>>,
-    /// Count of `install_lockdown_permits` calls — the Phase-0, pre-Phase-1
-    /// early engage, which returns the cover the running session
-    /// holds. Distinct from `lockdown_engage_calls` (Phase 6, stateless
-    /// TUN-add on the SAME cover) so a test can prove the EARLY call fires
-    /// even when Phase 6 never runs (e.g. the self-test fails first).
-    lockdown_permits_calls: AtomicU32,
-    /// Last `resolver_ip` passed to `install_lockdown_permits`.
-    last_lockdown_permits_resolver_ip: std::sync::Mutex<Option<IpAddr>>,
-    fail_lockdown_permits: AtomicBool,
-    /// When set, `install_lockdown_permits` returns a `MockCover` with
-    /// `owned: false` -- simulating Phase 0 finding a cover already live
-    /// (adopted from a prior bridge process), mirroring the platform
-    /// `Ownership::Adopted` case. See `MockCover::owned`'s doc.
-    lockdown_adopted: AtomicBool,
 }
 
 impl Default for MockRoutingState {
@@ -237,11 +214,6 @@ impl Default for MockRoutingState {
             last_cover_server_ip: std::sync::Mutex::new(None),
             last_cover_resolver_ip: std::sync::Mutex::new(None),
             fail_cover_for_resolvers: std::sync::Mutex::new(std::collections::HashSet::new()),
-            last_lockdown_resolver_ip: std::sync::Mutex::new(None),
-            lockdown_permits_calls: AtomicU32::new(0),
-            last_lockdown_permits_resolver_ip: std::sync::Mutex::new(None),
-            fail_lockdown_permits: AtomicBool::new(false),
-            lockdown_adopted: AtomicBool::new(false),
         }
     }
 }
@@ -277,28 +249,9 @@ impl MockRouting {
         m
     }
 
-    /// Makes the Phase-6 TUN-add (`engage_lockdown_tun`) fail, distinct from
-    /// `failing_lockdown_permits` (which fails the Phase-0 call).
     fn failing_lockdown(state_dir: PathBuf) -> Self {
         let m = Self::new(state_dir);
         m.state.fail_lockdown.store(true, Ordering::SeqCst);
-        m
-    }
-
-    /// Makes the Phase-0 early engage (`install_lockdown_permits`) fail,
-    /// distinct from `failing_lockdown` (which fails the Phase-6 call).
-    fn failing_lockdown_permits(state_dir: PathBuf) -> Self {
-        let m = Self::new(state_dir);
-        m.state.fail_lockdown_permits.store(true, Ordering::SeqCst);
-        m
-    }
-
-    /// Makes `install_lockdown_permits` return an ADOPTED (`owned: false`)
-    /// cover -- simulating Phase 0 finding a standing cover already live
-    /// from a prior bridge process, instead of creating one fresh.
-    fn adopted_lockdown(state_dir: PathBuf) -> Self {
-        let m = Self::new(state_dir);
-        m.state.lockdown_adopted.store(true, Ordering::SeqCst);
         m
     }
 
@@ -383,40 +336,23 @@ impl Routing for MockRouting {
         Ok(MockCover {
             state: Arc::clone(&self.state),
             lockdown: false,
-            owned: true,
         })
     }
 
-    fn install_lockdown_permits(
+    fn install_lockdown(
         &self,
         _server_ip: IpAddr,
-        resolver_ip: Option<IpAddr>,
+        _tun_name: &str,
         _app_ids: &[std::path::PathBuf],
     ) -> Result<MockCover, RoutingError> {
-        if self.state.fail_lockdown_permits.load(Ordering::SeqCst) {
-            return Err(RoutingError::RouteSetup("mock lockdown-permits failure".into()));
-        }
-        *self.state.last_lockdown_permits_resolver_ip.lock().unwrap() = resolver_ip;
-        self.state.lockdown_permits_calls.fetch_add(1, Ordering::SeqCst);
-        Ok(MockCover {
-            state: Arc::clone(&self.state),
-            lockdown: true,
-            owned: !self.state.lockdown_adopted.load(Ordering::SeqCst),
-        })
-    }
-
-    fn engage_lockdown_tun(
-        &self,
-        _tun_name: &str,
-        _server_ip: IpAddr,
-        resolver_ip: Option<IpAddr>,
-    ) -> Result<(), RoutingError> {
         if self.state.fail_lockdown.load(Ordering::SeqCst) {
             return Err(RoutingError::RouteSetup("mock lockdown failure".into()));
         }
-        *self.state.last_lockdown_resolver_ip.lock().unwrap() = resolver_ip;
         self.state.lockdown_engage_calls.fetch_add(1, Ordering::SeqCst);
-        Ok(())
+        Ok(MockCover {
+            state: Arc::clone(&self.state),
+            lockdown: true,
+        })
     }
 }
 
@@ -439,27 +375,13 @@ struct MockCover {
     /// fail-closed cover) — selects which disengage counter Drop bumps, mirroring
     /// the kind-aware `failclosed::Cover`.
     lockdown: bool,
-    /// Mirrors the platform `Ownership` enum (`true` == `Fresh`, `false` ==
-    /// `Adopted`) collapsed to a bool since the mock only needs the two
-    /// states, not the platforms' own reasons for being in either. Only
-    /// meaningful when `lockdown` is true — the transient cover has no
-    /// adoption concept and is always constructed `owned: true`. An
-    /// `Adopted` (`owned: false`) lockdown cover's Drop does NOT disengage,
-    /// mirroring `Drop for (platform) Cover`; `mark_owned` flips it to
-    /// `true`, mirroring `CoverGuard::mark_owned`.
-    owned: bool,
 }
 
 impl Drop for MockCover {
     fn drop(&mut self) {
         if self.lockdown {
-            if self.owned {
-                self.state.lockdown_disengage_calls.fetch_add(1, Ordering::SeqCst);
-                self.state.teardown_order.lock().unwrap().push("lockdown");
-            }
-            // Adopted (`owned: false`): ordinary RAII ownership -- Drop must
-            // not destroy a cover this guard did not create. No-op, exactly
-            // like the platform `Drop for Cover`'s `Adopted` arm.
+            self.state.lockdown_disengage_calls.fetch_add(1, Ordering::SeqCst);
+            self.state.teardown_order.lock().unwrap().push("lockdown");
         } else {
             self.state.cover_disengage_calls.fetch_add(1, Ordering::SeqCst);
         }
@@ -473,10 +395,6 @@ impl tun_engine::routing::CoverGuard for MockCover {
     fn disarm(self) {
         std::mem::forget(self);
     }
-
-    fn mark_owned(&mut self) {
-        self.owned = true;
-    }
 }
 
 // MockRouting lockdown instrumentation ================================================================================
@@ -486,19 +404,15 @@ impl tun_engine::routing::CoverGuard for MockCover {
 // the counters, fail flag, and kind-aware Drop dispatch being correct.
 
 #[skuld::test]
-fn mock_install_lockdown_permits_records_engage_and_drop_records_disengage() {
-    // Phase 0 (`install_lockdown_permits`) is the call that returns the
-    // guard the whole standing-cover session holds -- Phase 6
-    // (`engage_lockdown_tun`) only adds to it, statelessly, and returns
-    // nothing to own.
+fn mock_install_lockdown_records_engage_and_drop_records_disengage() {
     let dir = tempfile::tempdir().unwrap();
     let routing = MockRouting::new(dir.path().to_path_buf());
     let state = routing.state();
 
     let cover = routing
-        .install_lockdown_permits(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), None, &[])
+        .install_lockdown(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), "hole-tun", &[])
         .expect("lockdown engages");
-    assert_eq!(state.lockdown_permits_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(state.lockdown_engage_calls.load(Ordering::SeqCst), 1);
     // The transient-cover counter must NOT move — the two covers are distinct.
     assert_eq!(state.cover_engage_calls.load(Ordering::SeqCst), 0);
     assert_eq!(state.lockdown_disengage_calls.load(Ordering::SeqCst), 0);
@@ -509,115 +423,14 @@ fn mock_install_lockdown_permits_records_engage_and_drop_records_disengage() {
 }
 
 #[skuld::test]
-fn mock_install_lockdown_permits_records_the_resolver_permit() {
-    // The standing lockdown cover must receive the same gated resolver
-    // permit the transient cover would — recorded so ProxyManager-level tests
-    // can assert on it.
-    let dir = tempfile::tempdir().unwrap();
-    let routing = MockRouting::new(dir.path().to_path_buf());
-    let state = routing.state();
-    let resolver_ip = IpAddr::V4(Ipv4Addr::new(9, 9, 9, 9));
-
-    let _cover = routing
-        .install_lockdown_permits(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), Some(resolver_ip), &[])
-        .expect("lockdown engages");
-    assert_eq!(
-        *state.last_lockdown_permits_resolver_ip.lock().unwrap(),
-        Some(resolver_ip)
-    );
-}
-
-#[skuld::test]
-fn mock_failing_lockdown_permits_returns_err_without_recording() {
-    let dir = tempfile::tempdir().unwrap();
-    let routing = MockRouting::failing_lockdown_permits(dir.path().to_path_buf());
-    let state = routing.state();
-
-    let result = routing.install_lockdown_permits(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), None, &[]);
-    assert!(result.is_err(), "failing_lockdown_permits must return Err");
-    assert_eq!(state.lockdown_permits_calls.load(Ordering::SeqCst), 0);
-}
-
-#[skuld::test]
-fn mock_engage_lockdown_tun_records_the_call_and_resolver_without_a_second_guard() {
-    // Phase 6 adds the TUN permit to the SAME cover Phase 0 already
-    // returned -- it returns `()`, not a second guard, so the ONE cover
-    // from Phase 0 (still) owns the whole disengage.
-    let dir = tempfile::tempdir().unwrap();
-    let routing = MockRouting::new(dir.path().to_path_buf());
-    let state = routing.state();
-    let resolver_ip = IpAddr::V4(Ipv4Addr::new(9, 9, 9, 9));
-
-    let cover = routing
-        .install_lockdown_permits(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), Some(resolver_ip), &[])
-        .expect("lockdown engages");
-    routing
-        .engage_lockdown_tun("hole-tun", IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), Some(resolver_ip))
-        .expect("tun permit added");
-    assert_eq!(state.lockdown_engage_calls.load(Ordering::SeqCst), 1);
-    assert_eq!(*state.last_lockdown_resolver_ip.lock().unwrap(), Some(resolver_ip));
-    // Adding the TUN permit must not disengage or double-engage anything.
-    assert_eq!(state.lockdown_disengage_calls.load(Ordering::SeqCst), 0);
-    assert_eq!(state.lockdown_permits_calls.load(Ordering::SeqCst), 1);
-
-    drop(cover);
-    assert_eq!(
-        state.lockdown_disengage_calls.load(Ordering::SeqCst),
-        1,
-        "the ONE cover from Phase 0 still owns the disengage"
-    );
-}
-
-#[skuld::test]
-fn mock_failing_engage_lockdown_tun_returns_err_without_recording() {
+fn mock_failing_lockdown_returns_err_without_recording() {
     let dir = tempfile::tempdir().unwrap();
     let routing = MockRouting::failing_lockdown(dir.path().to_path_buf());
     let state = routing.state();
 
-    let result = routing.engage_lockdown_tun("hole-tun", IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), None);
+    let result = routing.install_lockdown(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), "hole-tun", &[]);
     assert!(result.is_err(), "failing_lockdown must return Err");
     assert_eq!(state.lockdown_engage_calls.load(Ordering::SeqCst), 0);
-}
-
-// `lockdown_app_ids` (Windows App-ID permits) =========================================================================
-
-#[cfg(target_os = "windows")]
-#[skuld::test]
-fn lockdown_app_ids_uses_the_override_not_resolve_plugin_path() {
-    // The Windows App-ID permit must name the SAME plugin binary path
-    // `start_inner`'s Phase 1 actually spawns -- a test driving a real
-    // plugin chain under `set_plugin_path_override_for_test` (a staged
-    // binary, not wherever `resolve_plugin_path` would normally look) must
-    // get an App-ID permit for the staged path, not the unrelated default
-    // resolution.
-    let mut cfg = test_config();
-    cfg.server.plugin = Some("ex-ray".into());
-
-    let overridden = lockdown_app_ids(&cfg, Some(r"C:\staged\ex-ray.exe"));
-    assert!(
-        overridden.contains(&std::path::PathBuf::from(r"C:\staged\ex-ray.exe")),
-        "expected the override path in the App-ID set, got {overridden:?}"
-    );
-    assert!(
-        !overridden
-            .iter()
-            .any(|p| p != &std::path::PathBuf::from(r"C:\staged\ex-ray.exe") && p.ends_with("ex-ray.exe")),
-        "must not ALSO carry a resolve_plugin_path-derived ex-ray path alongside the override: {overridden:?}"
-    );
-}
-
-#[cfg(target_os = "windows")]
-#[skuld::test]
-fn lockdown_app_ids_falls_back_to_resolve_plugin_path_without_an_override() {
-    let mut cfg = test_config();
-    cfg.server.plugin = Some("ex-ray".into());
-
-    let without_override = lockdown_app_ids(&cfg, None);
-    let expected = std::path::PathBuf::from(crate::proxy::config::resolve_plugin_path("ex-ray"));
-    assert!(
-        without_override.contains(&expected),
-        "expected the resolve_plugin_path fallback in the App-ID set, got {without_override:?}"
-    );
 }
 
 // Helpers =============================================================================================================
@@ -1293,618 +1106,6 @@ fn lockdown_on_engages_after_install_and_disengages_on_stop() {
     });
 }
 
-// Standing lockdown resolver permit ===================================================================================
-//
-// `ech_resolver_permit` is computed ONCE in `start_cancellable` (the same
-// value the transient cover's tests below already exercise extensively) and
-// threaded into BOTH `install_lockdown_permits` (Phase 0, before Phase 1 —
-// see that fn's doc for why) and `engage_lockdown_tun` (Phase 6, which adds
-// the TUN permit to the SAME guard) — see `start_inner`'s entry comment.
-// These tests prove the THREADING, not
-// the derivation: the derivation itself (`effective_ech_doh` / `ech_doh_url`)
-// is already covered by the `covered_start_*_permits_the_constructed_resolver`
-// family for the transient cover.
-
-#[skuld::test]
-fn lockdown_on_engages_with_no_resolver_permit_when_no_plugin_configured() {
-    // No plugin means no later ECH lookup, so BOTH `install_lockdown_permits`
-    // (Phase 0) and `engage_lockdown_tun` (Phase 6) must still be called
-    // (lockdown always engages when intent is on) but with `None` — negative
-    // direction, exercised through the REAL `start_inner` call chain (no
-    // plugin needed to reach it, unlike the positive-permit case below).
-    rt().block_on(async {
-        let dir = tempfile::tempdir().unwrap();
-        let routing = MockRouting::new(dir.path().to_path_buf());
-        let st = routing.state();
-        let (mut pm, _dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, true);
-
-        pm.start(&test_config()).await.unwrap();
-        assert_eq!(st.lockdown_permits_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(
-            *st.last_lockdown_permits_resolver_ip.lock().unwrap(),
-            None,
-            "no plugin configured means no resolver permit at the Phase-0 early engage either"
-        );
-        assert_eq!(st.lockdown_engage_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(
-            *st.last_lockdown_resolver_ip.lock().unwrap(),
-            None,
-            "no plugin configured means no resolver permit, even under lockdown"
-        );
-    });
-}
-
-/// Stage a copy of the real `ex-ray` binary (built by `cargo xtask ex-ray`)
-/// into a fresh, test-private tempdir and return the exact spawn path.
-/// Panics loud, never skips, matching
-/// `server_test_tests.rs::run_test_with_v2ray_plugin_happy_path`'s contract
-/// for a missing build. Callers pass the result to
-/// `ProxyManager::set_plugin_path_override_for_test` -- no shared destination
-/// path, no process-global mutation (`resolve_plugin_path`'s next-to-exe/PATH
-/// lookup is never consulted).
-fn stage_real_ex_ray() -> (tempfile::TempDir, String) {
-    let ex_ray = locate_ex_ray();
-    assert!(
-        ex_ray.is_file(),
-        "ex-ray not built at {ex_ray:?} -- run `cargo xtask ex-ray` before running this test"
-    );
-    let dir = tempfile::tempdir().unwrap();
-    let dest = dir.path().join(if cfg!(windows) { "ex-ray.exe" } else { "ex-ray" });
-    std::fs::copy(&ex_ray, &dest).expect("copy ex-ray into the test's own private directory");
-    let path = dest.to_string_lossy().into_owned();
-    (dir, path)
-}
-
-// Real ex-ray subprocess via `start_plugin_chain` -- same async plugin-bind
-// TOCTOU as the `ssserver_*` fixtures (hole#304); both the label and the
-// serial gate are required (the label list does not propagate transitively
-// to an inline `start_plugin_chain` call -- see `PORT_ALLOC`'s docstring).
-#[skuld::test(labels = [PORT_ALLOC], serial = PORT_ALLOC)]
-fn lockdown_on_permits_the_gated_ech_resolver_for_a_real_plugin_chain() {
-    // The resolver permit reaches the standing cover's
-    // Phase-0 early engage (`install_lockdown_permits`) -- BEFORE Phase 1, so
-    // BEFORE the plugin chain's Phase-4 dial that actually fetches the
-    // ECH config. `dns.enabled = true` (the default) is left ON, unlike the
-    // old version of this test: it arms the Phase-4 forwarder self-test,
-    // which `MockProxy` cannot satisfy (no real SOCKS5 server behind it), so
-    // the start still fails overall -- but the assertion is on the EARLY
-    // call, which runs regardless of that later, unrelated failure. Exercises
-    // the REAL plugin chain end to end (`start_plugin_chain` isn't behind a
-    // trait seam), so this proves the value genuinely reaches the routing
-    // provider, not just the isolated `MockRouting` contract
-    // (`mock_install_lockdown_permits_records_the_call_and_resolver` proves
-    // that half).
-    rt().block_on(async {
-        let (_plugin_dir, plugin_path) = stage_real_ex_ray();
-
-        let resolver: IpAddr = "198.51.100.5".parse().unwrap();
-        let dir = tempfile::tempdir().unwrap();
-        let routing = MockRouting::new(dir.path().to_path_buf());
-        let st = routing.state();
-        let (mut pm, _dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, true);
-        pm.set_plugin_path_override_for_test(plugin_path);
-        let mut cfg = test_config();
-        // Literal IP: no bootstrap query needed (`PinSource::NoQueryNeeded`),
-        // so this test doesn't need a mock DoH querier -- `ech_doh_url` still
-        // constructs a real IP-literal URL from `dns.servers`.
-        cfg.server.server = "203.0.113.9".into();
-        cfg.server.plugin = Some("ex-ray".into());
-        cfg.server.plugin_opts = Some(ECH_CAPABLE_OPTS.into());
-        cfg.dns.enabled = true;
-        cfg.dns.servers = vec![resolver];
-
-        // The overall start still fails (MockProxy can't satisfy Phase 4), but
-        // the early engage already ran by then.
-        let _ = pm.start(&cfg).await.unwrap_err();
-        assert_eq!(st.lockdown_permits_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(*st.last_lockdown_permits_resolver_ip.lock().unwrap(), Some(resolver));
-    });
-}
-
-// Real ex-ray subprocess -- see the PORT_ALLOC comment on the previous test.
-#[skuld::test(labels = [PORT_ALLOC], serial = PORT_ALLOC)]
-fn lockdown_on_permits_the_gated_ech_resolver_on_a_covered_start_too() {
-    // `start_inner`'s own doc claims `ech_resolver_permit` is threaded through
-    // unconditionally, not gated on `covered` -- the standing cover is armed
-    // for manual AND covered starts alike. The sibling test above only
-    // exercises the manual path (`pm.start`, `covered = false`); this proves
-    // the claim on the covered (auto-connect) path too, via
-    // `start_cancellable(&cfg, true, ...)`. See that sibling's doc for why
-    // `dns.enabled = true` and an `unwrap_err()` are correct here.
-    rt().block_on(async {
-        let (_plugin_dir, plugin_path) = stage_real_ex_ray();
-
-        let resolver: IpAddr = "198.51.100.5".parse().unwrap();
-        let dir = tempfile::tempdir().unwrap();
-        let routing = MockRouting::new(dir.path().to_path_buf());
-        let st = routing.state();
-        let (mut pm, _dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, true);
-        pm.set_plugin_path_override_for_test(plugin_path);
-        let mut cfg = test_config();
-        cfg.server.server = "203.0.113.9".into();
-        cfg.server.plugin = Some("ex-ray".into());
-        cfg.server.plugin_opts = Some(ECH_CAPABLE_OPTS.into());
-        cfg.dns.enabled = true;
-        cfg.dns.servers = vec![resolver];
-
-        let _ = pm
-            .start_cancellable(&cfg, true, CancellationToken::new())
-            .await
-            .unwrap_err();
-        assert_eq!(st.lockdown_permits_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(*st.last_lockdown_permits_resolver_ip.lock().unwrap(), Some(resolver));
-    });
-}
-
-// Real ex-ray subprocess -- see the PORT_ALLOC comment above.
-#[skuld::test(labels = [PORT_ALLOC], serial = PORT_ALLOC)]
-fn lockdown_on_omits_the_resolver_permit_for_a_non_ech_capable_plugin() {
-    // Negative direction with a REAL plugin chain (not just the pure gate
-    // unit tests in plugin.rs): a plugin configured with no `tls`/`host` never
-    // reaches ECH, so the reachability gate must keep the lockdown permit at
-    // `None` even though a plugin is genuinely running under the cover.
-    rt().block_on(async {
-        let (_plugin_dir, plugin_path) = stage_real_ex_ray();
-
-        let resolver: IpAddr = "198.51.100.5".parse().unwrap();
-        let dir = tempfile::tempdir().unwrap();
-        let routing = MockRouting::new(dir.path().to_path_buf());
-        let st = routing.state();
-        let (mut pm, _dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, true);
-        pm.set_plugin_path_override_for_test(plugin_path);
-        let mut cfg = test_config();
-        cfg.server.server = "203.0.113.9".into();
-        cfg.server.plugin = Some("ex-ray".into());
-        cfg.server.plugin_opts = None; // no tls, no host -- never reaches ECH
-        cfg.dns.enabled = false;
-        cfg.dns.servers = vec![resolver];
-
-        pm.start(&cfg).await.expect("a real ex-ray chain must start cleanly");
-        // Phase 0 (the early engage) and Phase 6 (the TUN-add) share the
-        // SAME `ech_resolver_permit` value, computed once in
-        // `start_cancellable` -- assert both, not just Phase 6, so a future
-        // change that derives the two independently can't silently widen
-        // just the Phase-0 permit for this negative case.
-        assert_eq!(st.lockdown_permits_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(
-            *st.last_lockdown_permits_resolver_ip.lock().unwrap(),
-            None,
-            "a non-ECH-capable plugin config must not widen the Phase-0 early engage either"
-        );
-        assert_eq!(st.lockdown_engage_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(
-            *st.last_lockdown_resolver_ip.lock().unwrap(),
-            None,
-            "a non-ECH-capable plugin config must not widen the lockdown cover"
-        );
-    });
-}
-
-// Real ex-ray subprocess -- see the PORT_ALLOC comment above.
-#[skuld::test(labels = [PORT_ALLOC], serial = PORT_ALLOC)]
-fn lockdown_on_never_reaches_phase_6_when_the_self_test_fails() {
-    // The standing lockdown cover's TUN
-    // permit is still only installed at Phase 6 (`routing.install` /
-    // `engage_lockdown_tun`) -- that half of the claim stays true, asserted
-    // below via `lockdown_engage_calls`. But ex-ray's lazy ECH-config fetch
-    // fires on the plugin chain's FIRST REAL DIAL -- which, whenever
-    // `dns.enabled` (the default), is the Phase 4 forwarder self-test, run
-    // strictly BEFORE Phase 6 -- and the resolver permit that dial needs is
-    // now installed at Phase 0 (`install_lockdown_permits`), BEFORE Phase 1,
-    // so it is already live by the time Phase 4 runs, regardless of whether
-    // Phase 6 is ever reached. This test proves the ordering half of that
-    // claim (the Phase-0 call already carries the correct resolver even
-    // though the self-test then fails for its own, unrelated reason); it
-    // cannot prove the OS-level "fetch actually gets through" half without a
-    // real, privileged WFP/pf cover (see `lockdown_privileged_tests.rs`).
-    rt().block_on(async {
-        let (_plugin_dir, plugin_path) = stage_real_ex_ray();
-
-        let resolver: IpAddr = "198.51.100.5".parse().unwrap();
-        let dir = tempfile::tempdir().unwrap();
-        let routing = MockRouting::new(dir.path().to_path_buf());
-        let st = routing.state();
-        let (mut pm, _dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, true);
-        pm.set_plugin_path_override_for_test(plugin_path);
-        let mut cfg = test_config();
-        cfg.server.server = "203.0.113.9".into();
-        cfg.server.plugin = Some("ex-ray".into());
-        cfg.server.plugin_opts = Some(ECH_CAPABLE_OPTS.into());
-        // dns.enabled = true (the default) arms the Phase 4 forwarder
-        // self-test, which MockProxy cannot satisfy (no real SOCKS5 server
-        // behind it) -- so it fails deterministically, same as a genuinely
-        // blocked/unreachable ECH-config fetch would under `ech=always`
-        // (crates/ex-ray/third_party/v2ray-core/transport/internet/tls/config.go's
-        // `RequireEchSatisfied`: an unobtainable ECH config makes the dial
-        // itself fail, not just disable ECH).
-        cfg.dns.enabled = true;
-        cfg.dns.servers = vec![resolver];
-
-        let err = pm.start(&cfg).await.unwrap_err();
-        assert!(
-            matches!(
-                err,
-                ProxyError::ForwarderSelfTestFailed { .. }
-                    | ProxyError::TunnelSilent { .. }
-                    | ProxyError::NoTunnelConnection { .. }
-            ),
-            "expected some Phase 4 self-test failure classification, got {err:?}"
-        );
-        // The Phase-0 early engage already carries the correct resolver,
-        // before Phase 4 ever runs.
-        assert_eq!(
-            st.lockdown_permits_calls.load(Ordering::SeqCst),
-            1,
-            "the Phase-0 early engage must run before Phase 1, independent of whether Phase 4 later fails"
-        );
-        assert_eq!(*st.last_lockdown_permits_resolver_ip.lock().unwrap(), Some(resolver));
-        assert_eq!(
-            st.lockdown_engage_calls.load(Ordering::SeqCst),
-            0,
-            "Phase 6 (engage_lockdown_tun, where the TUN permit is added) must never run \
-             when Phase 4 fails first -- irrelevant to the ECH-fetch gap, since the resolver \
-             permit was already live from Phase 0 above"
-        );
-    });
-}
-
-#[skuld::test]
-fn lockdown_permits_engage_failure_is_fatal_before_phase_1() {
-    // Fail-FATAL, mirroring `engage_lockdown_tun`'s own contract: a failed
-    // Phase-0 early engage aborts the start immediately, before Phase 1 ever
-    // spawns a plugin chain or Phase 2 touches the proxy -- nothing has been
-    // constructed yet, so there is nothing to tear down.
-    rt().block_on(async {
-        let dir = tempfile::tempdir().unwrap();
-        let routing = MockRouting::failing_lockdown_permits(dir.path().to_path_buf());
-        let st = routing.state();
-        let (mut pm, _dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, true);
-
-        let err = pm.start(&test_config()).await.unwrap_err();
-        assert!(
-            err.to_string().contains("mock lockdown-permits failure"),
-            "expected the early-engage error, got {err}"
-        );
-        assert_eq!(pm.state(), ProxyState::Stopped);
-        assert_eq!(
-            st.install_calls.load(Ordering::SeqCst),
-            0,
-            "routes must never be installed -- the early engage fails before Phase 1"
-        );
-        assert_eq!(st.lockdown_engage_calls.load(Ordering::SeqCst), 0);
-        assert!(pm.last_error().is_some());
-    });
-}
-
-#[skuld::test]
-fn lockdown_on_never_engages_for_socks_only_mode() {
-    // A MANUAL (uncovered) SocksOnly start never applies lockdown, matching
-    // every other manual connect's fail-open-by-design convention -- unlike
-    // the covered path (next test), there is no fully-uncovered gap to close
-    // here: a manual connect that the user drove directly is not silently
-    // "supposed to be" protected.
-    rt().block_on(async {
-        let dir = tempfile::tempdir().unwrap();
-        let routing = MockRouting::new(dir.path().to_path_buf());
-        let st = routing.state();
-        let (mut pm, _dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, true);
-        let mut cfg = test_config();
-        cfg.tunnel_mode = hole_common::protocol::TunnelMode::SocksOnly;
-
-        pm.start(&cfg).await.expect("SocksOnly start must still succeed");
-        assert_eq!(
-            st.lockdown_permits_calls.load(Ordering::SeqCst),
-            0,
-            "the standing cover must never engage for a SocksOnly start"
-        );
-        assert_eq!(st.lockdown_engage_calls.load(Ordering::SeqCst), 0);
-        assert!(!pm.lockdown_active());
-
-        pm.stop().await.unwrap();
-        assert_eq!(
-            st.lockdown_disengage_calls.load(Ordering::SeqCst),
-            0,
-            "nothing was engaged, so there is nothing to disengage"
-        );
-    });
-}
-
-#[skuld::test]
-fn covered_socks_only_start_with_lockdown_on_uses_the_standing_cover_not_the_transient_one() {
-    // A manual SocksOnly start never applies lockdown (previous test), but a
-    // COVERED SocksOnly start under lockdown intent must not be left with
-    // NEITHER cover -- and must not use the TRANSIENT cover either: its
-    // engage/disengage replace pf's entire main ruleset, which would clobber
-    // a standing cover some other run (this process's prior attempt, or an
-    // adopted one from before a crash) holds live, and the transient cover's
-    // own gate has no way to tell that apart from a clean host. Phase 0 needs
-    // no TUN, so it applies here even though Phase 6 (TUN-only) never runs
-    // for SocksOnly.
-    rt().block_on(async {
-        let dir = tempfile::tempdir().unwrap();
-        let routing = MockRouting::new(dir.path().to_path_buf());
-        let st = routing.state();
-        let (mut pm, _dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, true);
-        let mut cfg = test_config();
-        cfg.tunnel_mode = hole_common::protocol::TunnelMode::SocksOnly;
-
-        pm.start_cancellable(&cfg, true, CancellationToken::new())
-            .await
-            .expect("SocksOnly covered start must still succeed");
-        assert_eq!(
-            st.lockdown_permits_calls.load(Ordering::SeqCst),
-            1,
-            "Phase 0 must engage instead -- a covered start must never be left fully uncovered"
-        );
-        assert_eq!(
-            st.cover_engage_calls.load(Ordering::SeqCst),
-            0,
-            "the transient cover must never engage while lockdown intent is on -- it could clobber a live standing cover"
-        );
-        assert!(pm.lockdown_active());
-
-        pm.stop().await.unwrap();
-        assert_eq!(
-            st.lockdown_disengage_calls.load(Ordering::SeqCst),
-            1,
-            "stop must release the Phase-0-only guard SocksOnly never completes to Phase 6"
-        );
-    });
-}
-
-#[skuld::test]
-fn lockdown_cover_disengages_immediately_when_a_later_phase_fails() {
-    // A covered lockdown-on start that engages the Phase-0 guard and THEN
-    // fails at a LATER phase (here, `routing.install`, before Phase 6 ever
-    // calls `engage_lockdown_tun`) does NOT retain that guard across the
-    // failure: it is a local in `start_cancellable`, never moved into
-    // `RunningState.lockdown` on a non-Ok path, so it drops via ordinary
-    // RAII when the function returns -- disengaging within the SAME failed
-    // attempt, not on some later explicit stop. This is the accepted
-    // retry-window gap of #768 (the NEXT retry's Phase 0 re-engages fresh,
-    // rather than reusing a still-armed guard).
-    rt().block_on(async {
-        let dir = tempfile::tempdir().unwrap();
-        let routing = MockRouting::failing_install(dir.path().to_path_buf());
-        let st = routing.state();
-        let (mut pm, _dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, true);
-
-        let err = pm.start(&test_config()).await.unwrap_err();
-        assert!(
-            err.to_string().contains("mock install failure"),
-            "expected the routes-install error, got {err}"
-        );
-        assert_eq!(pm.state(), ProxyState::Stopped);
-        assert_eq!(
-            st.lockdown_permits_calls.load(Ordering::SeqCst),
-            1,
-            "Phase 0 must have engaged before routes failed"
-        );
-        assert_eq!(
-            st.lockdown_engage_calls.load(Ordering::SeqCst),
-            0,
-            "Phase 6 (TUN permit) never runs -- routes failed first"
-        );
-        assert_eq!(
-            st.lockdown_disengage_calls.load(Ordering::SeqCst),
-            1,
-            "the Phase-0 guard disengages via RAII as part of THIS failed attempt (#768)"
-        );
-        assert!(
-            !pm.lockdown_active(),
-            "nothing is held once the failed attempt has already returned"
-        );
-    });
-}
-
-#[skuld::test]
-fn adopted_lockdown_cover_survives_a_later_phase_failure() {
-    // Mirrors `lockdown_cover_disengages_immediately_when_a_later_phase_fails`
-    // for an ADOPTED cover specifically: Phase 0 finds a standing cover
-    // already live (from a prior bridge process that crashed or
-    // cutover-restarted), not one this attempt created. Ordinary RAII
-    // ownership means the guard's Drop must not destroy what this attempt
-    // did not create -- unlike the Fresh case, a later-phase failure here
-    // must NOT disengage.
-    rt().block_on(async {
-        let dir = tempfile::tempdir().unwrap();
-        let routing = MockRouting::adopted_lockdown(dir.path().to_path_buf());
-        let st = routing.state();
-        st.fail_install.store(true, Ordering::SeqCst);
-        let (mut pm, _dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, true);
-
-        let err = pm.start(&test_config()).await.unwrap_err();
-        assert!(
-            err.to_string().contains("mock install failure"),
-            "expected the routes-install error, got {err}"
-        );
-        assert_eq!(pm.state(), ProxyState::Stopped);
-        assert_eq!(
-            st.lockdown_permits_calls.load(Ordering::SeqCst),
-            1,
-            "Phase 0 must have engaged (re-engaged over the adopted cover) before routes failed"
-        );
-        assert_eq!(
-            st.lockdown_disengage_calls.load(Ordering::SeqCst),
-            0,
-            "an ADOPTED cover must NOT be torn down by a failure THIS attempt did not create the cover for"
-        );
-        assert!(
-            !pm.lockdown_active(),
-            "the manager itself holds nothing once the failed attempt has returned -- \
-             the adopted cover lives on at the OS level, outside this manager's tracking, exactly \
-             as an adopted cover already does today when nothing ever calls start_cancellable again"
-        );
-    });
-}
-
-#[skuld::test]
-fn adopted_lockdown_cover_disengages_on_an_explicit_stop_after_success() {
-    // The other half of ownership: once a connect attempt SUCCEEDS, the
-    // running session is what the user sees as "connected" and explicitly
-    // disconnects from -- an explicit stop must always open the host from
-    // there on, regardless of whether the cover was originally adopted.
-    // Proves `mark_owned` actually flips the guard before it reaches
-    // `RunningState.lockdown`: without it, `stop_with`'s `drop(lk)` would
-    // silently no-op on an adopted-then-successful session, same as the
-    // failure-path case above -- but a user-initiated stop must never do
-    // that.
-    rt().block_on(async {
-        let dir = tempfile::tempdir().unwrap();
-        let routing = MockRouting::adopted_lockdown(dir.path().to_path_buf());
-        let st = routing.state();
-        let (mut pm, _dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, true);
-
-        pm.start(&test_config())
-            .await
-            .expect("adopted-cover start must still succeed");
-        assert_eq!(st.lockdown_permits_calls.load(Ordering::SeqCst), 1);
-        assert!(pm.lockdown_active());
-
-        pm.stop().await.unwrap();
-        assert_eq!(
-            st.lockdown_disengage_calls.load(Ordering::SeqCst),
-            1,
-            "an explicit stop after success must disengage even an originally-adopted cover"
-        );
-        assert!(!pm.lockdown_active());
-    });
-}
-
-#[skuld::test]
-fn compound_failure_warns_when_phase_0_fails_right_after_releasing_the_transient_cover() {
-    // Covered retry with lockdown newly enabled mid-blocked-state: the
-    // `else if covered` branch releases the held transient cover (opening a
-    // brief window until Phase 0's engage a few lines below). If THAT
-    // engage then also fails, the host loses BOTH covers in one attempt --
-    // a strictly worse outcome than an ordinary Phase-0 failure with
-    // nothing lost, and must get its own compound-failure disclosure,
-    // mirroring the analogous double-failure warning the transient cover's
-    // own repair path already has.
-    use crate::test_support::log_capture::VecWriter;
-    use tracing_subscriber::fmt;
-    use tracing_subscriber::layer::{Layer, SubscriberExt};
-
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap()
-        .block_on(async {
-            let writer = VecWriter::new();
-            let subscriber = tracing_subscriber::registry().with(
-                fmt::layer()
-                    .with_writer(writer.clone())
-                    .with_ansi(false)
-                    .with_filter(tracing_subscriber::filter::LevelFilter::WARN),
-            );
-            let _guard = garter::tracing_test::set_default_in_current_thread(subscriber);
-
-            let dir = tempfile::tempdir().unwrap();
-            let routing = MockRouting::new(dir.path().to_path_buf());
-            let st = routing.state();
-            // Lockdown OFF at construction -- attempt 1 engages the TRANSIENT
-            // cover, matching every other covered-with-lockdown-off start.
-            let (mut pm, _dir) = new_manager_with_lockdown(MockProxy::failing_start(), routing, dir, false);
-
-            // Attempt 1: covered, lockdown off -> transient cover engages, then
-            // `proxy.start` fails -> the transient cover is RETAINED (the
-            // established `self.blocked` failure-retention pattern), not
-            // released, since this attempt never reached the lockdown-newly-on
-            // release branch.
-            pm.start_cancellable(&test_config(), true, CancellationToken::new())
-                .await
-                .expect_err("MockProxy::failing_start always fails");
-            assert_eq!(st.cover_engage_calls.load(Ordering::SeqCst), 1);
-            assert!(
-                pm.blocked_until_connected(),
-                "sanity: attempt 1 retains the transient cover"
-            );
-
-            // Lockdown turns on; the Phase-0 engage is set to fail.
-            pm.set_lockdown_intent(true).unwrap();
-            st.fail_lockdown_permits.store(true, Ordering::SeqCst);
-
-            let err = pm
-                .start_cancellable(&test_config(), true, CancellationToken::new())
-                .await
-                .expect_err("install_lockdown_permits fails on this mock");
-            assert!(
-                err.to_string().contains("mock lockdown-permits failure"),
-                "expected the Phase-0 error, got {err}"
-            );
-            assert!(
-                !pm.blocked_until_connected(),
-                "the transient cover was released for the lockdown attempt, not left double-held"
-            );
-            assert!(
-                !pm.lockdown_active(),
-                "the failed Phase-0 engage never produced a cover to hold"
-            );
-
-            let output = writer.snapshot_string();
-            assert!(
-                output.contains("host NOT covered by either"),
-                "expected the compound-failure warning naming BOTH covers lost; got:\n{output}"
-            );
-        });
-}
-
-#[skuld::test]
-fn lockdown_cover_disengages_immediately_on_cancel() {
-    // Unlike the OLD retained-across-attempts design (where the standing
-    // cover survived a cancel until an explicit stop), the simplified
-    // per-attempt guard treats Cancelled exactly like any other early
-    // return: it is a local in `start_cancellable`, never moved into
-    // `RunningState.lockdown`, so it drops via ordinary RAII as soon as
-    // `start_cancellable` returns -- opening the host briefly until the
-    // next retry's Phase 0 re-engages. This is the accepted #768
-    // retry-window gap, exercised here for the cancel path specifically.
-    //
-    // Phase 0 (in `start_cancellable`) engages BEFORE `start_inner`'s Phase 2
-    // (`proxy.start`), so parking on `MockProxy`'s start gate and firing the
-    // cancel only once `proxy.start` is *known* entered deterministically
-    // exercises "Phase 0 already engaged, then cancelled mid-flight" (a
-    // pre-cancelled token instead would short-circuit at the DoH bootstrap
-    // resolve, strictly BEFORE Phase 0 ever runs, and prove nothing).
-    rt().block_on(async {
-        let gate = Arc::new(tokio::sync::Notify::new());
-        let (entered_tx, entered_rx) = oneshot::channel();
-        let proxy = MockProxy::with_start_gate(gate.clone()).with_entered_signal(entered_tx);
-        let dir = tempfile::tempdir().unwrap();
-        let routing = MockRouting::new(dir.path().to_path_buf());
-        let st = routing.state();
-        let (mut pm, _dir) = new_manager_with_lockdown(proxy, routing, dir, true);
-
-        let cancel = CancellationToken::new();
-        let cancel_clone = cancel.clone();
-        tokio::spawn(async move {
-            entered_rx.await.expect("MockProxy::start never entered");
-            cancel_clone.cancel();
-        });
-
-        let err = pm.start_cancellable(&test_config(), true, cancel).await.unwrap_err();
-        assert!(matches!(err, ProxyError::Cancelled), "expected Cancelled, got {err:?}");
-        assert_eq!(st.lockdown_permits_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(
-            st.lockdown_disengage_calls.load(Ordering::SeqCst),
-            1,
-            "cancel drops the Phase-0 guard via ordinary RAII, same as any other early return (#768)"
-        );
-        assert!(
-            !pm.lockdown_active(),
-            "nothing is held once the cancelled attempt has already returned"
-        );
-
-        // A subsequent stop on a manager that never reached `running` is a
-        // no-op -- there is nothing left to disengage a second time.
-        pm.stop().await.unwrap();
-        assert_eq!(st.lockdown_disengage_calls.load(Ordering::SeqCst), 1);
-        // The gate is still held -- release it so the spawned mock task can
-        // drop cleanly (mirrors `start_cancellable_cancelled_during_ss_start_rolls_back`).
-        gate.notify_one();
-    });
-}
-
 #[skuld::test]
 fn lockdown_engage_failure_is_fatal_and_tears_down() {
     // Fail-FATAL mirror of start_blocks_on_forwarder_self_test_failure: a
@@ -1930,32 +1131,21 @@ fn lockdown_engage_failure_is_fatal_and_tears_down() {
             1,
             "routes must be torn down when lockdown engage fails (fail-FATAL)"
         );
-        // The Phase-0 guard DID engage (before Phase 1 even ran) and drops
-        // via ordinary RAII once the Err unwinds out of `start_cancellable`
-        // -- the Phase-6 TUN-add never succeeded, and #768 accepts the
-        // resulting retry-window gap rather than retaining it.
-        assert_eq!(st.lockdown_permits_calls.load(Ordering::SeqCst), 1);
+        // The engage never succeeded, so no cover was committed and none disengaged.
         assert_eq!(st.lockdown_engage_calls.load(Ordering::SeqCst), 0);
-        assert_eq!(
-            st.lockdown_disengage_calls.load(Ordering::SeqCst),
-            1,
-            "the Phase-0 guard disengages via RAII, same as any other early return (#768)"
-        );
+        assert_eq!(st.lockdown_disengage_calls.load(Ordering::SeqCst), 0);
         assert!(pm.last_error().is_some());
     });
 }
 
 #[skuld::test]
 fn lockdown_engage_failure_tears_down_routes_only() {
-    // Fail-FATAL Phase-6 engage: routes were installed (Phase 6 runs after
-    // install), then the `?` on `engage_lockdown_tun` unwinds `start_inner`'s
-    // locally-owned `routes` guard FIRST (still inside `start_inner`); only
-    // once the resulting Err propagates back out to `start_cancellable`
-    // does the Phase-0 guard -- a local there, never moved into
-    // `RunningState.lockdown` -- drop via ordinary RAII. The ordered
-    // recorder shows routes tearing down before the standing cover
-    // disengages, exactly like a clean stop (see ProxyManager::stop) --
-    // there is no longer a separate "retained pending guard" branch.
+    // Fail-FATAL engage: routes were installed (engage runs after install) then the
+    // `?` on install_lockdown unwinds the locally-owned `routes` guard. The lockdown
+    // cover is never constructed (the `?` fires before the `lockdown` binding
+    // completes), so the ordered recorder must show exactly one teardown — "routes" —
+    // and the cover disengage counter must stay at zero. (On a clean stop the order
+    // is the reverse — routes then lockdown — by design; see ProxyManager::stop.)
     rt().block_on(async {
         let dir = tempfile::tempdir().unwrap();
         let routing = MockRouting::failing_lockdown(dir.path().to_path_buf());
@@ -1969,20 +1159,10 @@ fn lockdown_engage_failure_tears_down_routes_only() {
         let order = st.teardown_order.lock().unwrap().clone();
         assert_eq!(
             order,
-            vec!["routes", "lockdown"],
-            "routes tear down inside start_inner's unwind, then the Phase-0 guard drops via RAII \
-             once the Err reaches start_cancellable"
+            vec!["routes"],
+            "engage failure tears down routes only; no cover was created"
         );
-        assert_eq!(
-            st.lockdown_permits_calls.load(Ordering::SeqCst),
-            1,
-            "the Phase-0 guard WAS engaged"
-        );
-        assert_eq!(
-            st.lockdown_disengage_calls.load(Ordering::SeqCst),
-            1,
-            "...and disengages via RAII as part of THIS failed attempt (#768)"
-        );
+        assert_eq!(st.lockdown_disengage_calls.load(Ordering::SeqCst), 0);
     });
 }
 
@@ -4677,59 +3857,6 @@ mod self_test {
                 assert!(
                     output.contains("plugin's own ech-doh"),
                     "expected the operator-override residual warning; got:\n{output}"
-                );
-            });
-    }
-
-    // Sibling of the test above for the STANDING lockdown cover's own
-    // residual-stall diagnostic (`else if lockdown_applies` in
-    // `start_cancellable`) -- an operator's own `ech-doh` is never permitted
-    // by either cover, so the lockdown branch needs the identical
-    // disclosure, under lockdown-specific wording naming "the standing
-    // lockdown cover" rather than "the fail-closed cover".
-    #[skuld::test]
-    fn covered_start_under_lockdown_residual_warning_fires_for_an_operator_ech_doh_override() {
-        use crate::test_support::log_capture::VecWriter;
-        use tracing_subscriber::fmt;
-        use tracing_subscriber::layer::{Layer, SubscriberExt};
-
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap()
-            .block_on(async {
-                let writer = VecWriter::new();
-                let subscriber = tracing_subscriber::registry().with(
-                    fmt::layer()
-                        .with_writer(writer.clone())
-                        .with_ansi(false)
-                        .with_filter(tracing_subscriber::filter::LevelFilter::WARN),
-                );
-                let _guard = garter::tracing_test::set_default_in_current_thread(subscriber);
-
-                let dir = tempfile::tempdir().unwrap();
-                let routing = MockRouting::new(dir.path().to_path_buf());
-                // Lockdown ON (the `true` below), unlike the transient-cover
-                // sibling test.
-                let (mut pm, _dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, true);
-                let mut cfg = test_config();
-                // Literal-IP server: Hole's own candidate is unpinned
-                // (NoQueryNeeded), so it never outranks an IP-literal operator
-                // value — the operator's own ech-doh wins.
-                cfg.server.server = "203.0.113.9".into();
-                cfg.server.plugin = Some("ex-ray".into());
-                cfg.server.plugin_opts = Some(format!("{ECH_CAPABLE_OPTS};ech-doh=https://8.8.8.8/dns-query"));
-                cfg.dns.enabled = true;
-                cfg.dns.servers = vec!["1.0.0.1".parse().unwrap()];
-                let _ = pm
-                    .start_cancellable(&cfg, true, CancellationToken::new())
-                    .await
-                    .unwrap_err();
-
-                let output = writer.snapshot_string();
-                assert!(
-                    output.contains("covered start under lockdown") && output.contains("plugin's own ech-doh"),
-                    "expected the lockdown-cover operator-override residual warning; got:\n{output}"
                 );
             });
     }

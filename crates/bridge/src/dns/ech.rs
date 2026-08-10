@@ -79,18 +79,17 @@ pub fn authority_is_a_name(url: &str) -> bool {
 /// already carries whose authority is not a name (see [`authority_is_a_name`]).
 ///
 /// `resolver` is the exact address `url` names — Hole constructed `url` from
-/// it (`doh_url_for_ip`), never a guess. Both fail-closed covers — the
-/// transient `install_failclosed_cover` and the standing
-/// `install_lockdown_permits` — permit exactly this address regardless of `source`:
-/// it always comes from the user's OWN configured `dns.servers`, so
-/// permitting it is config-authorship trust, not a claim that THIS attempt
-/// personally dialed it — `Answered` and `SecureBootstrapFailed` did
-/// (`resolve_via_doh` dials every configured resolver even on total
-/// failure); `NoQueryNeeded` dialed nothing at all (a literal-IP server
-/// short-circuits before the loop), and `ResolverDeselected`'s fallback may
-/// name an address only a PRIOR resolve dialed, or never dialed this bridge
-/// process at all. See `Routing::install_failclosed_cover`'s doc for why
-/// config-authorship alone is judged sufficient.
+/// it (`doh_url_for_ip`), never a guess. The fail-closed cover permits
+/// exactly this address regardless of `source`: it always comes from the
+/// user's OWN configured `dns.servers`, so permitting it is config-authorship
+/// trust, not a claim that THIS attempt personally dialed it — `Answered`
+/// and `SecureBootstrapFailed` did (`resolve_via_doh` dials every configured
+/// resolver even on total failure); `NoQueryNeeded` dialed nothing at all
+/// (a literal-IP server short-circuits before the loop), and
+/// `ResolverDeselected`'s fallback may name an address only a PRIOR resolve
+/// dialed, or never dialed this bridge process at all. See
+/// `Routing::install_failclosed_cover`'s doc for why config-authorship alone
+/// is judged sufficient.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EchDoh {
     pub url: String,

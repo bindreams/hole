@@ -239,10 +239,6 @@ pub struct ProxyManager<P: Proxy = ShadowsocksProxy, R: Routing = SystemRouting,
     /// derivation is otherwise observable only through the plugin it spawns.
     #[cfg(test)]
     last_ech_doh: Option<String>,
-    /// Test-only plugin-binary path override — see
-    /// `set_plugin_path_override_for_test`.
-    #[cfg(test)]
-    plugin_path_override: Option<String>,
 }
 
 /// A held block-until-connected cover plus the server identity it permits.
@@ -267,19 +263,6 @@ struct BlockedStart<C> {
     /// struct doc for what it means.
     resolver_permit: Option<IpAddr>,
 }
-
-/// Whether the transient block-until-connected cover is live for this
-/// `start_inner` call. Wrapped (not a bare `bool`) solely so it cannot be
-/// positionally swapped with the adjacent, equally-`bool`-typed
-/// [`LockdownApplies`] parameter at the call site — the two select between
-/// mutually exclusive covers, so a silent swap would misroute which one a
-/// start attempt is actually protected by.
-struct BlockingEngaged(bool);
-
-/// Whether the standing lockdown cover's Phase 0 applies to this attempt —
-/// see [`BlockingEngaged`] for why this is a newtype rather than a bare
-/// `bool`.
-struct LockdownApplies(bool);
 
 impl<P: Proxy, R: Routing> ProxyManager<P, R, SystemDns> {
     pub fn new(proxy: P, routing: R) -> Self {
@@ -311,8 +294,6 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
             bootstrap_querier: None,
             #[cfg(test)]
             last_ech_doh: None,
-            #[cfg(test)]
-            plugin_path_override: None,
         }
     }
 
@@ -322,16 +303,6 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
     #[cfg(test)]
     pub fn set_bootstrap_querier_for_test(&mut self, q: std::sync::Arc<dyn crate::dns::bootstrap::DohQuerier>) {
         self.bootstrap_querier = Some(q);
-    }
-
-    /// Test seam: spawn this exact path instead of resolving the plugin
-    /// binary via `resolve_plugin_path`. Lets a test drive a REAL plugin
-    /// chain (the plugin subprocess isn't behind a `Proxy`/`Routing`/`Dns`
-    /// trait seam) against a binary the test stages itself, with no shared
-    /// destination path and no process-global mutation.
-    #[cfg(test)]
-    pub fn set_plugin_path_override_for_test(&mut self, path: String) {
-        self.plugin_path_override = Some(path);
     }
 
     /// Set the state directory for plugin PID crash recovery.
@@ -479,15 +450,9 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
     }
 
     /// Whether a standing lockdown cover is currently engaged (the `active`
-    /// signal). Distinct from the persisted intent (`enabled`). True only
-    /// while running (the cover lives in `RunningState.lockdown`) — the
-    /// Phase-0 guard is a LOCAL variable for the duration of one connect
-    /// attempt (see `start_cancellable`'s "Standing lockdown cover" section),
-    /// so there is no separate "engaged but not running" state to report
-    /// here the way `blocked_until_connected` reports for the transient
-    /// cover.
+    /// signal). Distinct from the persisted intent (`enabled`).
     pub fn lockdown_active(&self) -> bool {
-        self.running.as_ref().is_some_and(|r| r.lockdown.is_some())
+        self.running.as_ref().map(|r| r.lockdown.is_some()).unwrap_or(false)
     }
 
     /// Whether a covered start failed and left the host fail-closed (blocked, not
@@ -590,11 +555,6 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         #[cfg(not(test))]
         let bootstrap_querier: Option<std::sync::Arc<dyn crate::dns::bootstrap::DohQuerier>> = None;
 
-        #[cfg(test)]
-        let plugin_path_override = self.plugin_path_override.clone();
-        #[cfg(not(test))]
-        let plugin_path_override: Option<String> = None;
-
         // A DIFFERENT server's hostname needs a FRESH DoH resolution — not
         // guaranteed to land on the resolver already baked into the held cover
         // (see `BlockedStart`'s doc) — so a start for a different server must
@@ -606,12 +566,10 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
             warn!("start for a different server while blocked: releasing the held cover before re-resolving");
         }
 
-        // Resolve the server IP over private DoH. A same-server retry under
-        // the held transient cover reuses the cached IP and pin — critically,
-        // this means the resolution itself does NOT need to dial out under a
-        // cover that may not yet permit any resolver.
-        let (server_ip, pin) = match self.blocked.as_ref().map(|b| (b.server_ip, b.pin)) {
-            Some((server_ip, pin)) => (server_ip, crate::dns::ech::revalidate(pin, &config.dns.servers)),
+        // Resolve the server IP over private DoH. A same-server retry under the
+        // held cover reuses the cached IP and pin.
+        let (server_ip, pin) = match self.blocked.as_ref().filter(|b| b.host == config.server.server) {
+            Some(b) => (b.server_ip, crate::dns::ech::revalidate(b.pin, &config.dns.servers)),
             None => match Self::resolve_server_ip(config, &bootstrap_querier, &cancel).await {
                 Ok(b) => (b.server_ip, b.via),
                 Err(e) => {
@@ -686,22 +644,15 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         );
 
         // Engage the block-until-connected cover for a covered start UNLESS the
-        // standing lockdown cover applies instead: that cohort installs (and,
-        // via Phase 0 below, already holds) the lockdown cover, and engaging the
-        // transient cover too would (on macOS) clobber the singular pf ruleset.
-        // A corrupt/absent lockdown-state file resolves to off — the fail-SAFE
-        // direction (we engage, blocking not leaking).
+        // standing lockdown intent is on: that cohort installs the lockdown cover
+        // at routing.install, and engaging the transient cover too would (on macOS)
+        // clobber the singular pf ruleset. A corrupt/absent lockdown-state file
+        // resolves to off — the fail-SAFE direction (we engage, blocking not leaking).
         let lockdown_on = self
             .state_dir
             .as_deref()
             .map(lockdown_state::load_enabled)
             .unwrap_or(false);
-
-        // A COVERED SocksOnly start under lockdown intent still applies Phase 0
-        // (it needs no TUN); a MANUAL SocksOnly start does not, matching every
-        // other manual connect's fail-open design. See CONTRIBUTING.md's
-        // "Lockdown mode" for the full rationale.
-        let lockdown_applies = lockdown_on && (matches!(config.tunnel_mode, TunnelMode::Full) || covered);
 
         // A held cover's resolver_permit is fixed at engage time; re-engage
         // whenever this attempt's fresh derivation DIFFERS from what the
@@ -729,7 +680,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         // just delay a correction that could have landed this attempt. Each
         // attempt's release-to-reengage window is bounded to this one
         // (user-paced) retry either way — see the restore fallback below.
-        let repair_fallback: Option<(Option<IpAddr>, crate::dns::ech::PinSource)> = if covered && !lockdown_applies {
+        let repair_fallback: Option<(Option<IpAddr>, crate::dns::ech::PinSource)> = if covered && !lockdown_on {
             self.blocked
                 .as_mut()
                 .filter(|b| b.host == config.server.server && b.resolver_permit != ech_resolver_permit)
@@ -746,15 +697,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
             );
         }
 
-        // Set when the branch below releases a still-good transient cover
-        // specifically because lockdown just turned on — so a Phase-0 engage
-        // failure a few lines below can disclose the COMPOUND failure (a
-        // cover that used to be live is now gone AND its replacement never
-        // engaged either), not just an ordinary Phase-0 failure with nothing
-        // lost.
-        let mut released_blocked_for_lockdown = false;
-
-        if covered && !lockdown_applies {
+        if covered && !lockdown_on {
             // The transient cover is a global singleton — never construct a second
             // over the same objects. An engage failure proceeds UNCOVERED (aborting
             // would leave the user unconnected AND unprotected), surfaced via last_error
@@ -848,13 +791,12 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         } else if covered {
             // Covered retry after the user enabled lockdown mid-blocked-state:
             // release the held cover. This opens egress until the standing lockdown
-            // cover's Phase-0 engage a few lines below — a brief, disclosed open window.
+            // cover engages at routing.install — a brief, disclosed open window.
             if self.blocked.take().is_some() {
                 warn!(
                     "covered retry with lockdown newly enabled: releasing the held cover; the host is briefly \
-                     uncovered until the standing lockdown cover's Phase-0 engage below"
+                     uncovered until the standing lockdown cover engages at connect"
                 );
-                released_blocked_for_lockdown = true;
             }
         } else if self.blocked.take().is_some() {
             // Manual (uncovered) connect or reload-while-blocked: fail-open by
@@ -863,35 +805,6 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
             warn!("uncovered start while blocked: releasing the held cover (host fail-open by design)");
         }
         let blocking_engaged = self.blocked.is_some();
-
-        // Standing lockdown cover, Phase 0: engage fresh for THIS attempt only,
-        // held as a LOCAL variable -- no cross-attempt cache, no staleness
-        // comparison, no repair. Moved into `RunningState.lockdown` on success
-        // (after `mark_owned`, below); otherwise drops via ordinary
-        // ownership-aware RAII on any early return. See CONTRIBUTING.md's
-        // "Lockdown mode" > "Ownership" for the Fresh/Adopted rationale and #768.
-        let mut lockdown_cover: Option<R::Cover> = if lockdown_applies {
-            let app_ids = lockdown_app_ids(config, plugin_path_override.as_deref());
-            match self
-                .routing
-                .install_lockdown_permits(server_ip, ech_resolver_permit, &app_ids)
-            {
-                Ok(cover) => Some(cover),
-                Err(e) => {
-                    if released_blocked_for_lockdown {
-                        warn!(
-                            error = %e,
-                            "failed to engage the standing lockdown cover after releasing the held \
-                             transient cover for it; host NOT covered by either, proceeding open"
-                        );
-                    }
-                    self.last_error = Some(e.to_string());
-                    return Err(e.into());
-                }
-            }
-        } else {
-            None
-        };
 
         // Disclosed residual (see CONTRIBUTING.md's "Transient cutover
         // cover" section) gated on `effective_ech_doh`, the value that will
@@ -939,20 +852,6 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
                     );
                 }
             }
-        } else if lockdown_applies {
-            // The standing cover always engages fresh with THIS attempt's
-            // OWN `ech_resolver_permit` (no cross-attempt cache to drift
-            // from), so its live permit matches by construction -- only an
-            // operator's own override (never permitted, regardless of
-            // freshness) is worth a warning here.
-            if let crate::proxy::plugin::EffectiveEchDoh::Operators(url) = &effective_ech_doh {
-                warn!(
-                    operator_ech_doh = %url,
-                    "covered start under lockdown: the plugin's own ech-doh overrides Hole's and dials a \
-                     resolver the standing lockdown cover does not permit; it may stall to ex-ray's client \
-                     timeout"
-                );
-            }
         }
 
         debug!("awaiting start_inner");
@@ -963,12 +862,9 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
             config,
             server_ip,
             ech_doh,
-            ech_resolver_permit,
-            BlockingEngaged(blocking_engaged),
-            LockdownApplies(lockdown_applies),
+            blocking_engaged,
             self.state_dir.as_deref(),
             self.state_owner,
-            plugin_path_override,
             cancel,
         )
         .await;
@@ -977,22 +873,11 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         // only path that mutates `self.running = Some(..)` is strictly
         // after start_inner has completed successfully.
         match result {
-            Ok(mut state) => {
+            Ok(state) => {
                 // Tunnel is up: release the block-until-connected cover (drop →
                 // disengage; already None when lockdown subsumed it — the standing
                 // lockdown cover holds instead).
                 self.blocked = None;
-                // Mark fully owned BEFORE moving into `RunningState.lockdown` --
-                // see `CoverGuard::mark_owned`'s doc. No-op if already Fresh
-                // (the common case).
-                if let Some(ref mut cover) = lockdown_cover {
-                    cover.mark_owned();
-                }
-                // Move the Phase-0 guard into the running session -- start_inner's
-                // Phase 6 already added the TUN permit to this SAME local guard
-                // in place (see start_inner's Phase-6 doc for why no second
-                // guard is ever created).
-                state.lockdown = lockdown_cover;
                 let server_ip = state.server_ip;
                 self.udp_proxy_available = state.udp_proxy_available;
                 self.ipv6_bypass_available = state.ipv6_bypass_available;
@@ -1014,28 +899,17 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
                 Ok(())
             }
             Err(ProxyError::Cancelled) => {
-                // User asked to cancel THIS connection attempt: release the transient
-                // cover (same trust as a user disconnect).
-                //
-                // `lockdown_cover` (if `Some`) is NOT moved here -- it drops via ordinary
-                // RAII, same accepted retry-window gap as the "Standing lockdown
-                // cover" comment above (#768).
+                // User asked to cancel: release the cover (same trust as a user
+                // disconnect). Do NOT set last_error on cancel.
                 self.blocked = None;
                 info!("proxy start cancelled");
                 Err(ProxyError::Cancelled)
             }
             Err(e) => {
-                // Covered start failed: RETAIN the transient cover
-                // (`self.blocked` keeps it, so its Drop does NOT run) — the
-                // host stays blocked, not leaked, until a later successful
-                // start, a user stop/cancel, or a bridge restart. A retry
-                // reuses this held guard and the resolved IP.
-                //
-                // `lockdown_cover` (if `Some`) is a LOCAL variable, not
-                // retained anywhere on `self` — it drops via ordinary RAII
-                // at the end of this function, same as the `Cancelled` arm
-                // above. See that arm's comment for why this is an accepted
-                // gap (#768), not a bug.
+                // Covered start failed: RETAIN the held cover (`self.blocked` keeps
+                // it, so its Drop does NOT run) — the host stays blocked, not leaked,
+                // until a later successful start, a user stop/cancel, or a bridge
+                // restart. A retry reuses this single held guard and its resolved IP.
                 self.last_error = Some(e.to_string());
                 Err(e)
             }
@@ -1064,10 +938,6 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
 
     /// Produce a [`RunningState`] without touching `self`.
     ///
-    /// `start_inner` takes two adjacent, same-typed `bool` flags
-    /// (`blocking_engaged`, `lockdown_applies`) — see [`BlockingEngaged`] /
-    /// [`LockdownApplies`] for why they arrive wrapped.
-    ///
     /// **Cooperative cancellation.** Each long-running phase
     /// observes the supplied `cancel` token and returns
     /// `Err(ProxyError::Cancelled)` cooperatively. Earlier RAII guards
@@ -1080,21 +950,12 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
     /// 2. `P::Running` — on drop, aborts the spawned proxy task.
     /// 3. `R::Installed` — on drop, tears down routes and clears the
     ///    crash-recovery state file.
-    ///
-    /// The standing lockdown cover's guard is NOT in this list: it is
-    /// engaged and owned by the CALLER (`start_cancellable`'s local
-    /// `lockdown_cover`), never constructed inside this fn, so it is never
-    /// part of this fn's own unwind — an Err return here leaves it exactly as
-    /// the caller already has it (dropped via ordinary RAII once the caller
-    /// returns, unless this call succeeds).
+    /// 4. `Option<R::Cover>` (lockdown) — declared last, so it drops first,
+    ///    before `R::Installed`; disengages the standing cover (only `Some`
+    ///    when intent is on and engage already succeeded). On the fail-FATAL
+    ///    engage `?` it is never constructed, so only `R::Installed` tears down.
     ///
     /// Per-phase cancellation strategy:
-    /// - **Phase 0 (standing-lockdown Phase-0 engage)**: happens in the
-    ///   CALLER before this fn is even invoked — see
-    ///   `Routing::install_lockdown_permits`'s doc for why. `lockdown_applies`
-    ///   is the caller's own already-computed value, passed in as a
-    ///   parameter so Phase 4's probe-suppression check and Phase 6's
-    ///   TUN-permit addition below agree with what the caller actually did.
     /// - **Phase 1 (plugin chain)**: the bridge cancel is threaded into
     ///   `start_plugin_chain`, which derives child tokens for each
     ///   attempt and races readiness against cancel.
@@ -1136,18 +997,11 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         config: &ProxyConfig,
         server_ip: IpAddr,
         ech_doh: Option<crate::dns::ech::EchDoh>,
-        ech_resolver_permit: Option<IpAddr>,
-        blocking_engaged: BlockingEngaged,
-        lockdown_applies: LockdownApplies,
+        blocking_engaged: bool,
         state_dir: Option<&std::path::Path>,
         owner: Option<(u32, u32)>,
-        plugin_path_override: Option<String>,
         cancel: CancellationToken,
     ) -> Result<RunningState<P, R, D>, ProxyError> {
-        // Unwrapped immediately into plain `bool` locals of the SAME names -- the
-        // 200+ lines below read them exactly as before.
-        let blocking_engaged = blocking_engaged.0;
-        let lockdown_applies = lockdown_applies.0;
         debug!("start_inner entered");
         // Pre-flight: short-circuit a pre-cancelled token before any work.
         if cancel.is_cancelled() {
@@ -1155,25 +1009,17 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         }
 
         // `server_ip` is resolved by the caller (`start_cancellable`) via private
-        // DoH BEFORE this fn, so BOTH covers (transient and standing-lockdown)
-        // can be owned in the outer scope — un-leakable by construction:
-        // `start_inner`'s many `?` exits cannot drop a cover they never hold.
-        // `blocking_engaged` is whether the transient cover is live for this
-        // start. `ech_resolver_permit` is the SAME gated value
-        // `start_cancellable` already derived for it (`effective_ech_doh ==
-        // Holes`, read from `ech_doh.resolver`) — passed through, not
-        // re-derived, so the standing lockdown cover (engaged by the caller
-        // BEFORE this fn runs, and completed at Phase 6 below) permits the
-        // identical address without a second derivation site drifting from
-        // the first (see CONTRIBUTING.md's "Lockdown mode").
+        // DoH BEFORE this fn, so the fail-closed cover can be owned in the outer
+        // scope — un-leakable by construction: `start_inner`'s many `?` exits
+        // cannot drop a cover they never hold. `blocking_engaged` is whether that
+        // outer cover is live for this start.
         let server_host = crate::dns::bootstrap::handoff_host(server_ip);
 
         // Phase 1: start plugin chain via Garter if a plugin is configured.
         // `start_plugin_chain` threads `cancel` through to its readiness
         // wait + bind_ephemeral retries.
         let plugin_chain = if let Some(ref plugin_name) = config.server.plugin {
-            let plugin_path =
-                plugin_path_override.unwrap_or_else(|| crate::proxy::config::resolve_plugin_path(plugin_name));
+            let plugin_path = crate::proxy::config::resolve_plugin_path(plugin_name);
             let chain = crate::proxy::plugin::start_plugin_chain(
                 plugin_name,
                 &plugin_path,
@@ -1386,25 +1232,14 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
             // adds NO latency. Skip it under an active fail-closed cover: a
             // standing kill-switch (intent on) blocks non-permitted egress, so a
             // probe would mis-report Hole's OWN lockdown as censorship — keep the
-            // original self-test reason. This bridge already engaged its own
-            // lockdown permits at Phase 0 (above), so by this gate `lockdown_applies`
-            // reflects a genuinely live in-process cover, not just a pre-existing
-            // / adopted one. A THIRD term checking raw persisted intent (to also
-            // catch a still-live ADOPTED cover on a manual SocksOnly start, where
-            // `lockdown_applies` is false by design) is deliberately NOT added
-            // here: this whole Phase-4 gate is unreachable for `TunnelMode::SocksOnly`
-            // (that branch returns from `start_inner` earlier, before Phase 3/4 ever
-            // run — see the `if matches!(config.tunnel_mode, TunnelMode::SocksOnly)`
-            // branch above), and for `TunnelMode::Full` (the only mode that reaches
-            // here) `lockdown_applies` already reduces to exactly `lockdown_on`
-            // (`Full` alone satisfies the `(Full || covered)` term), so a third
-            // "raw intent" term would be a no-op duplicate of the second at every
-            // point this code can actually run.
+            // original self-test reason. This bridge installs its own cover later
+            // (after routing.install); at this gate the cover is a pre-existing /
+            // adopted one, and the intent is its honest signal.
             // The live in-process signal (this start's engaged block-until-
-            // connected cover) OR the standing lockdown cover — either means
-            // Hole's OWN cover would classify the probe's egress as blocked, so
-            // suppress it to avoid misreporting our cover as censorship.
-            let cover_active = blocking_engaged || lockdown_applies;
+            // connected cover) OR a pre-existing/adopted standing lockdown — either
+            // means Hole's OWN cover would classify the probe's egress as blocked,
+            // so suppress it to avoid misreporting our cover as censorship.
+            let cover_active = blocking_engaged || state_dir.map(lockdown_state::load_enabled).unwrap_or(false);
             let probe = (!cover_active).then(|| {
                 // The DoH-resolved IP, never the proxy domain: the reachability
                 // probe must not OS-resolve the hostname (that would reopen the
@@ -1523,30 +1358,20 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         // Install the routes — NOW traffic starts flowing to the TUN.
         let routes = routing.install(TUN_DEVICE_NAME, server_ip, gw_info.gateway_ip, &gw_info.interface_name)?;
 
-        // Standing lockdown cover (#527). Engaged only when
-        // `lockdown_applies`; when false this whole block is a no-op and the
-        // start is byte-identical to today. Adds the TUN permit to the SAME
-        // guard Phase 0 already engaged (`Routing::engage_lockdown_tun`) — no
-        // second guard is ever created; the caller (`start_cancellable`)
-        // moves that ONE local guard into `RunningState.lockdown` after this
-        // fn returns `Ok`, which is why this fn only sets a placeholder
-        // `None` below. Done AFTER routing.install (TUN exists => LUID
-        // resolvable) and BEFORE Dns::apply, so the line is held the moment
-        // routes go live. FAIL-FATAL: an engage error aborts the start; the
+        // Standing lockdown cover (#527). Engaged only when intent is on; when
+        // off this whole block is a no-op and the start is byte-identical to
+        // today. Engaged AFTER routing.install (TUN exists => LUID resolvable)
+        // and BEFORE Dns::apply, so the line is held the moment routes go live.
+        // FAIL-FATAL: an engage error under intent-on aborts the start; the
         // locally-owned `routes` guard (declared above) Drops on the Err
         // unwind, tearing down — the opposite of the transient cover's
-        // fail-open. The Phase-0 guard itself stays held in the caller's
-        // local variable either way (this fn never owns it), so an error
-        // here does not disengage it directly — it drops via ordinary RAII
-        // once the caller's own function returns (see `start_cancellable`'s
-        // "Standing lockdown cover" comment). `ech_resolver_permit` is
-        // passed through unconditionally, not gated on `covered`: the
-        // standing cover is armed for manual AND covered starts alike, and
-        // the value is already gated on `effective_ech_doh == Holes` by the
-        // caller — see `start_inner`'s entry comment.
-        if lockdown_applies {
-            routing.engage_lockdown_tun(TUN_DEVICE_NAME, server_ip, ech_resolver_permit)?;
-        }
+        // fail-open. Committed only on the Ok path (the field below).
+        let lockdown = if state_dir.map(lockdown_state::load_enabled).unwrap_or(false) {
+            let app_ids = lockdown_app_ids(config);
+            Some(routing.install_lockdown(server_ip, TUN_DEVICE_NAME, &app_ids)?)
+        } else {
+            None
+        };
 
         // Phase 7: apply system DNS AFTER routes install so the OS
         // "best-route to DNS server" lookup resolves through the TUN.
@@ -1594,10 +1419,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
             dispatcher,
             plugin_chain,
             routes: Some(routes),
-            // Placeholder: the caller (`start_cancellable`) fills this in
-            // from its own local guard on the Ok path -- see this fn's
-            // Phase-6 doc for why the guard is never owned here.
-            lockdown: None,
+            lockdown,
             proxy: running_proxy,
             server_ip: Some(server_ip),
             started_at: Instant::now(),
@@ -1635,13 +1457,6 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
             self.last_error = None;
             self.death_reason = None;
         }
-        // The standing lockdown cover has no separate "pending" bucket to
-        // handle here: its Phase-0 guard is a LOCAL variable scoped to one
-        // `start_cancellable` call, never stored on `self` — a covered start
-        // that engages it and then fails drops it via ordinary RAII before
-        // this function could ever observe it. Only a guard that made it
-        // into `RunningState.lockdown` (a genuinely running session) is
-        // handled here, in the `running.take()` teardown below.
         let Some(state) = self.running.take() else {
             return Ok(());
         };
@@ -1830,28 +1645,19 @@ fn tunnel_mode_label(mode: &TunnelMode) -> &'static str {
 /// resolved plugin binary (if a plugin is configured) and the bridge's own exe.
 /// Empty on macOS (pf has no per-process matching). Path-keyed so the permit
 /// survives a cutover rename.
-///
-/// `plugin_path_override` must be the SAME value `start_inner`'s Phase 1
-/// threads into `start_plugin_chain` (`self.plugin_path_override`, test-only
-/// -- always `None` in production, see `start_cancellable`'s `#[cfg(test)]`
-/// split) — both describe the path of the SAME process this attempt
-/// actually spawns; reading `resolve_plugin_path` unconditionally here would
-/// give a test driving a real plugin chain under a staged binary path an
-/// App-ID permit for a location nothing was ever copied to.
-fn lockdown_app_ids(config: &ProxyConfig, plugin_path_override: Option<&str>) -> Vec<std::path::PathBuf> {
+fn lockdown_app_ids(config: &ProxyConfig) -> Vec<std::path::PathBuf> {
     #[cfg(not(target_os = "windows"))]
     {
-        let _ = (config, plugin_path_override);
+        let _ = config;
         Vec::new()
     }
     #[cfg(target_os = "windows")]
     {
         let mut ids: Vec<std::path::PathBuf> = Vec::new();
         if let Some(ref plugin) = config.server.plugin {
-            let path = plugin_path_override
-                .map(str::to_owned)
-                .unwrap_or_else(|| crate::proxy::config::resolve_plugin_path(plugin));
-            ids.push(std::path::PathBuf::from(path));
+            ids.push(std::path::PathBuf::from(crate::proxy::config::resolve_plugin_path(
+                plugin,
+            )));
         }
         match std::env::current_exe() {
             Ok(exe) => ids.push(exe),

@@ -413,9 +413,28 @@ LIVE held cover's permit mismatched from what THIS attempt actually needs
 comparing against the live permit rather than re-trusting that the repair
 always converges, in EITHER direction: too narrow (`Holes`, an ECH-fetch stall
 risk) or too wide (`None`, the kill switch permits a resolver address nothing
-needs). The [standing lockdown cover](#lockdown-mode) carries the identical
-permit — see that section. Finally, the release-then-reengage repair itself
-has a brief window with NO cover at all
+needs). A THIRD case is untouched by this mechanism entirely (not merely a
+residual within it): the [standing lockdown cover](#lockdown-mode)'s own
+ruleset never carries a resolver permit at all, on EITHER platform, whether
+the cover was just engaged fresh (`routing.install_lockdown`, called from
+`start_cancellable`'s `lockdown_on` branch on every covered start) or adopted
+across a restart — `build_lockdown_main_ruleset` (macOS) and
+`lockdown_app_ids` (Windows) take no `resolver_ip`/`EchDoh` input at all. On
+macOS this blocks the fetch outright, silently, on every lockdown-on covered
+start with an ECH-effective config — not only a restart-adopt, which merely
+compounds it by also removing the in-process signal a fresh engage still has
+(`effective_ech_doh`, computed before `install_lockdown` runs) but has no API
+to consume. On Windows the App-ID floor (`resolve_plugin_path(plugin)` — the
+plugin's OWN resolved binary) is sufficient for a direct `ex-ray`/
+`v2ray-plugin` config, but NOT for a chained plugin like `galoshes`: it
+`include_bytes!`s ex-ray and spawns it as a separate process from its own
+extracted runtime path (`crates/galoshes/src/embedded.rs`), which
+`lockdown_app_ids` never adds to the permit set — WFP's App-ID condition
+matches the RUNNING process's own image path, so ex-ray (the process that
+actually dials the DoH resolver) is unpermitted there too. Tracked
+separately: [#753](https://github.com/bindreams/hole/issues/753) (filed
+narrower than this; scope correction pending). Finally, the
+release-then-reengage repair itself has a brief window with NO cover at all
 between the release and the corrected (or restored) re-engage — disclosed in
 the repair's own `warn!` lines, not silent, but not eliminated either: both
 platforms' engage primitives are delete-then-add / flush-then-reload, not an
@@ -433,9 +452,7 @@ sweep only knows the first ten) leaves those two permits un-swept; they are
 *permits*, never blocks,
 so this is bounded and self-healing (a later upgrade's sweep cleans them up),
 not a leak of blocked traffic. Disclosed as a source comment on
-`FILTER_GUIDS` itself. The standing lockdown cover's `LOCKDOWN_FILTER_GUIDS`
-grew the same way for the same reason, disclosed as a source comment there
-too; both arrays share the one tracking issue:
+`FILTER_GUIDS` itself. Tracked separately:
 [#754](https://github.com/bindreams/hole/issues/754). **Windows only, also
 pre-existing:** the repair's release step deletes the held cover's filters by
 fixed GUID and discards the result; if a delete genuinely fails, the
@@ -549,15 +566,10 @@ reachability then depends on `remoteAddr` instead.
 
 ### Lockdown mode
 
-The **standing lockdown cover** (`Routing::install_lockdown_permits`, #527) is an
+The **standing lockdown cover** (`Routing::install_lockdown`, #527) is an
 opt-in, **default-off**, bridge-owned kill switch. When enabled it engages a
 persistent OS-level egress block permitting **only** loopback, the `hole-tun`
-interface, the onward server connection, the resolver Hole's own `ech-doh`
-names when a plugin needs it (same gate, same TCP/443 scope, same
-config-authorship trust as the [transient cover's resolver
-permit](#transient-cutover-cover); an address permit, not an App-ID one,
-because a chained plugin like `galoshes` spawns its inner ex-ray as a
-separate process no App-ID set names), and (Windows) the plugin + bridge
+interface, the onward server connection, and (Windows) the plugin + bridge
 binaries by App-ID — so normal traffic flows while connected and the block holds
 across a bridge restart for free. When disabled, behavior is byte-identical to a
 Hole without it.
@@ -567,20 +579,17 @@ three axes:
 
 - **Permit set.** Lockdown adds a TUN-interface permit (Windows: by `NET_LUID`;
   macOS: `pass out quick on <tun>`) so app traffic flows; the transient cover
-  deliberately omits it because holding it while connected would block all
-  browsing. Both covers otherwise permit the identical resolver address under
-  the identical gate — see the paragraph above.
+  deliberately omits it (permit loopback + server + the resolver Hole's own
+  `ech-doh` names, when a plugin needs it) because holding it while connected
+  would block all browsing.
 - **Lifetime.** Lockdown is authoritative and standing — it persists across a
   crash or restart and is reconciled on the next start via
-  `decide_cover_recovery` (Adopt keeps the host fail-closed; on Windows it
-  drops the volatile TUN + server + resolver GUIDs so the next connect
-  re-adds them fresh, on macOS it removes nothing at all — the whole pf
-  ruleset, resolver permit included, stays live from before the
-  crash/restart until the next connect's `engage_lockdown` reloads it; Sweep
+  `decide_cover_recovery` (Adopt keeps the host fail-closed, dropping the
+  volatile TUN + server permits so the next connect re-adds them fresh; Sweep
   disengages when intent is off). The transient cover is a non-standing,
   bounded-window RAII guard engaged only for the duration of one covered
-  (auto-connect) start attempt, and swept by `recover_routes` like
-  every other cover state on the next start.
+  (auto-connect) start attempt, and swept by `recover_routes` like every other
+  cover state on the next start.
 - **Failure mode.** A failed lockdown engage during a lockdown-on start is
   **fail-FATAL** — it aborts the start and tears everything down; the transient
   cover fails *open* on its own engage error so a half-loaded ruleset never
@@ -591,146 +600,6 @@ Intent persists to `bridge-lockdown.json`; macOS additionally records the
 pre-lockdown pf snapshot in `bridge-lockdown-pf.json` so Sweep restores the host
 without `-Fa`. The LUID is **never persisted** (a teardown mints a new one) —
 re-resolved every engage via `LuidResolver`.
-
-**Engage is two-phase.** `Routing::install_lockdown_permits` engages every
-permit except the TUN one — loopback, server, (when `Some`) resolver, App-IDs
-— and RETURNS the RAII `Cover` the running session eventually holds.
-`ProxyManager::start_cancellable` calls it BEFORE `start_inner` even runs,
-mirroring exactly when the transient cover engages, holding the guard in a
-plain LOCAL variable scoped to `start_cancellable` itself — NOT inside
-`start_inner`, so a later phase's failure can't accidentally tear it down via
-`start_inner`'s own RAII unwind (that would also delete a pre-existing
-adopted cover's floor, since both share the same fixed identity).
-`Routing::engage_lockdown_tun` then adds ONLY the TUN permit to that SAME
-guard at Phase 6, once `routing.install` has resolved the adapter — it returns
-no guard of its own: on Windows it opens its own FWPM engine, adds the two TUN
-filters (a tolerant add — `FWP_E_ALREADY_EXISTS` treated as success — is
-correct here because the guard never persists across attempts; there is no
-cross-attempt retry needing a strict add to distinguish from a genuine
-first-engage/Adopt-continuation, which can legitimately see already-present
-floor filters), and closes the engine immediately. On macOS it reloads the
-full pf ruleset (`pfctl -f -` has no incremental update), reusing the
-token/snapshot Phase 0 persisted — and, unlike Phase 0's own load-failure
-handling, a failed reload here does NOT restore the pre-lockdown snapshot:
-`pfctl -f -` is atomic, so a rejected ruleset leaves the PREVIOUSLY loaded
-one (Phase 0's, still fully enforced, just missing the TUN line) unchanged —
-destroying it anyway would take down a cover that is still live and correct.
-Either way the ONE guard Phase 0 returned still owns the whole cover's
-disengage, TUN permit included once Phase 6 adds it.
-
-Without the Phase-0 step, a plugin's Phase-4 forwarder self-test — where
-ex-ray's lazy ECH-config fetch actually fires, on the chain's first real dial
-— runs *before* Phase 6 ever installs the resolver permit; on an
-already-armed machine (a prior run's cover, live or adopted) that dial is
-blocked by the standing block-all with nothing yet permitting it, so the
-start fails identically on every retry. Both engage calls are fail-FATAL.
-
-**The guard's lifetime is bounded to one attempt.** `start_cancellable` holds
-the `Option<R::Cover>` Phase 0 returns as a plain local and passes it into
-`start_inner` for Phase 6 to add the TUN permit to. On success it is marked
-fully owned (`CoverGuard::mark_owned`, next paragraph) and moved into
-`RunningState.lockdown`, where it disengages on an ordinary `stop()` and
-disarms (persist-without-disengage) on a cutover, exactly like every other
-cover this manager holds. On EVERY early return — an ordinary `Err` from any
-later phase, or a `Cancelled` from mid-flight cancellation — the local simply
-goes out of scope and drops via Rust's own RAII, the same way `start_inner`'s
-own `routes` guard unwinds on a Phase 1-5 failure: no special-cased
-retention, no separate "pending" bucket for `stop_with` to reconcile, and no
-distinction between an ordinary failure and a cancel (the transient cover
-already treats those identically — "same trust as a user disconnect" — and
-the standing cover now does too) — **except one: ownership.**
-
-**Ownership: a guard must not destroy a cover it did not create.** Phase 0's
-engage can find a standing cover already live — adopted from a prior bridge
-process that crashed or cutover-restarted (`CoverRecovery::Adopt`), not
-created by this attempt at all. If a *later* phase then fails, the local's
-ordinary-RAII drop described above would, unqualified, tear that adopted
-cover down: on Windows every lockdown GUID deleted, on macOS the
-pre-lockdown snapshot restored and the state file cleared — regressing the
-crash-recovery guarantee for exactly the failure (a blocked self-test) the
-kill switch exists to survive. Each platform's `engage_lockdown` records
-which case it was in an `Ownership` enum on the returned `Cover` (Windows:
-was the floor filter already present before this call touched anything;
-macOS: was there already a persisted state file) and `Drop for Cover`
-branches on it: `Fresh` (this call created the cover from nothing)
-disengages as before; `Adopted` (this call found one already live) does
-nothing, leaving pf/WFP exactly as this attempt's own re-engage left them —
-either the adopted values unchanged (this attempt's engage never reached its
-own mutate) or this attempt's own rewritten ruleset (the engage succeeded,
-loading THIS attempt's server/resolver/App-IDs, and a later phase then
-failed). Either state is still a complete, self-consistent, fully
-fail-closed floor for this attempt's config — never less restrictive than
-before this attempt started, just possibly missing whatever this attempt
-itself never reached (e.g. the TUN permit, if Phase 6 never ran). There is
-no separate "restore to before this attempt" snapshot to fall back to — that
-would be exactly the identity-tracking machinery the simplification above
-dropped, applied one layer further out.
-
-On Windows specifically, `Ownership::Adopted` leaving the volatile TUN/
-server/resolver GUIDs untouched on Drop means a SECOND `Adopted` attempt in
-the SAME process (the first failed after Phase 0 without disengaging, so the
-cover is still `Adopted` for the retry too) can find those fixed-key filters
-already present when it re-engages. `add_filter`'s tolerant `ok_or_exists`
-would otherwise silently keep the FIRST attempt's stale values instead of
-the retry's own — so both `engage_lockdown` and `engage_lockdown_tun`
-delete the volatile GUIDs before re-adding them, every engage, not only in
-`recover_lockdown`'s one-time startup Adopt sweep. Idempotent (a "not
-found" delete is ignored) for `Fresh`, where they don't exist yet.
-
-Ownership is consulted ONLY by `Drop`, and is otherwise inert: no identity
-comparison (host/server/resolver/App-IDs), no staleness check, no repair
-path, no cross-attempt state. It answers exactly one question, asked once,
-at Phase 0: did this attempt create the cover, or find one already there?
-Once a connect attempt actually SUCCEEDS, the running session is what the
-user sees as "connected" and explicitly disconnects from — an explicit stop
-from that point on must always be able to open the host, independent of the
-cover's provenance before this attempt started. `CoverGuard::mark_owned`
-flips an `Adopted` guard to `Fresh` for exactly this reason, called once, in
-`start_cancellable`, immediately before the guard moves into
-`RunningState.lockdown` — without it, `stop_with`'s ordinary `drop(lk)` on
-UserStop would silently no-op for a session that started from an adopted
-cover, which is never correct: a user-initiated disconnect must open the
-host regardless of how the standing cover came to exist.
-
-This accepts a retry-window gap, now narrower than it first appears: a
-`Fresh`-owned attempt's guard disengages immediately on failure or
-cancellation, opening the host briefly until the NEXT retry's own Phase 0
-re-engages fresh — the identical gap an ordinary `main` connect already has
-on every failed or cancelled attempt, so retaining state only for the
-two-phase split would have spent real complexity protecting a window that
-predates this fix and was never in its scope. An `Adopted` attempt's guard
-has no such gap at all: it never disengages on failure, by design. Tracked
-as [#768](https://github.com/bindreams/hole/issues/768).
-
-On macOS, `reconcile_pf_enabled` runs before `engage_lockdown_tun`'s (Phase
-6\) reload, which assumes an already-persisted token: `pfctl -f -` into a
-DISABLED pf exits 0 while enforcing nothing, so skipping this check reports a
-connected, armed session as covered while pf enforces nothing at all. Phase
-0 and Phase 6 can
-still be separated by several seconds within a SINGLE attempt (the plugin
-chain start, self-test, and route install all run in between), so this check
-stays load-bearing even though the guard no longer persists across attempts.
-
-Full mode completes both phases: Phase 0 here, Phase 6 (the TUN permit) in
-`start_inner`. SocksOnly's `start_inner` returns before Phase 6 ever runs —
-no TUN, no LUID — but Phase 0 needs neither, and guard ownership doesn't
-depend on Phase 6 either (`RunningState.lockdown` is filled from the
-caller's local guard on the `Ok` path regardless of mode), so a COVERED
-SocksOnly start under lockdown intent also applies Phase 0:
-`lockdown_applies = intent && (tunnel_mode == Full || covered)`. The
-transient cover is not a viable substitute here — its engage/disengage
-replace pf's entire main ruleset, and it has no way to tell a clean host
-apart from one where a standing cover (this process's own prior attempt, or
-one adopted from before a crash) is already live, so using it for SocksOnly
-would risk destroying that live cover instead of complementing it. A MANUAL
-(uncovered) SocksOnly start still never applies lockdown, matching every
-other manual connect's fail-open-by-design convention — there is no
-fully-uncovered gap to close on a connect the user drove directly.
-`lockdown_applies` is computed once in `start_cancellable` and passed into
-`start_inner` as a parameter, the same pattern `ech_resolver_permit` already
-uses — `start_inner` does not independently re-read the persisted intent
-file, which has out-of-process writers (`hole bridge unlock`) that could
-otherwise flip it mid-attempt and desync the two phases.
 
 `hole bridge unlock` is the elevated escape hatch to disengage a standing cover
 when no bridge is alive (`cutover::unlock`). Unlike the best-effort startup
