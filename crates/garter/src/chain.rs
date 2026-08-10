@@ -51,20 +51,43 @@ pub enum Mode {
 impl Mode {
     /// Derive the SIP003 chain mode from the `SS_PLUGIN_OPTIONS` string.
     /// Returns [`Mode::Server`] if a `server` key is present in the
-    /// options (with or without a value), [`Mode::Client`] otherwise.
-    /// Uses the spec-correct key parser ([`crate::parse_plugin_options`]),
-    /// so options like `servername=cdn.example.com` correctly resolve to
-    /// client mode.
-    pub fn from_plugin_options(opts: Option<&str>) -> Self {
-        let Some(opts) = opts else { return Mode::Client };
-        if crate::sip003::parse_plugin_options(opts)
-            .iter()
-            .any(|(k, _)| k == "server")
-        {
-            Mode::Server
-        } else {
-            Mode::Client
-        }
+    /// options (with or without a value), [`Mode::Client`] otherwise. Uses
+    /// [`crate::parse_plugin_options`] to decide, so options like
+    /// `servername=cdn.example.com` correctly resolve to client mode, and
+    /// an escaped spelling like `\server` still resolves to server mode —
+    /// matching how ex-ray reads the same string.
+    ///
+    /// Deliberately does NOT re-validate the `server` key's VALUE against
+    /// ex-ray's own `parseBoolOption` grammar (bare/`1` only): this function
+    /// is `BinaryPlugin::sip003_env`'s plugin-agnostic chain-direction
+    /// detector, reached for every `BinaryPlugin` in a chain, not only
+    /// ex-ray-family ones (garter's own README chains `obfs-local`
+    /// alongside `v2ray-plugin`) — hard-rejecting a value spelling a
+    /// third-party plugin accepts would be a false regression here. Where
+    /// it IS ex-ray, `parseBoolOption` is itself fatal on those same
+    /// spellings, so a real disagreement already fails loud when ex-ray
+    /// starts.
+    ///
+    /// `Err` on a malformed options string (e.g. a dangling trailing
+    /// backslash or an empty key). Neither `Mode::Client` nor `Mode::Server`
+    /// would be real parity with ex-ray here, and there is no safe default to
+    /// guess, so the failure is surfaced rather than papered over with one.
+    ///
+    /// Returns `crate::Error` (not the narrower `MalformedOptions`) so every
+    /// caller gets the canonical "malformed SS_PLUGIN_OPTIONS: {reason}"
+    /// wording through a plain `?`, with nothing to hand-write at the call site.
+    pub fn from_plugin_options(opts: Option<&str>) -> crate::Result<Self> {
+        let Some(opts) = opts else { return Ok(Mode::Client) };
+        Ok(
+            if crate::sip003::parse_plugin_options(opts)?
+                .iter()
+                .any(|(k, _)| k == "server")
+            {
+                Mode::Server
+            } else {
+                Mode::Client
+            },
+        )
     }
 }
 

@@ -1,6 +1,6 @@
 [package]
 name = "galoshes"
-version = "0.3.0"
+version = "0.3.1"
 edition.workspace = true
 license = "Apache-2.0"
 publish = false
@@ -34,6 +34,7 @@ contracts = { workspace = true }
 async-trait = { workspace = true }
 futures = "0.3"
 yamux = "0.14"
+socket2 = "0.6"
 sha2 = "0.11"
 tempfile = "3"
 tombstone = { path = "../tombstone" }

@@ -182,13 +182,19 @@ describe("init ordering", () => {
       return Promise.reject(new Error("capability missing"));
     });
     const { initDone } = await import("./main");
-    await initDone;
 
     // init reported the failure through the ui-ready handshake…
-    const signal = invokeMock.mock.calls.find(([cmd]) => cmd === "signal_ui_ready");
-    expect(signal).toBeDefined();
-    expect((signal![1] as { result: { ok: boolean } }).result.ok).toBe(false);
+    await expect(initDone).resolves.toMatchObject({ ok: false });
     // …and never proceeded to the config fetch.
     expect(callOrder).not.toContain("invoke:get_config");
+  });
+
+  it("publishes the ui-ready bridge on the document that ran init", async () => {
+    const { initDone } = await import("./main");
+
+    // The webdriver readiness gate's only entry point. It must resolve off
+    // THIS document's init, so a reload cannot serve a stale result.
+    expect(typeof window.__holeUiReady).toBe("function");
+    await expect(window.__holeUiReady!()).resolves.toEqual(await initDone);
   });
 });

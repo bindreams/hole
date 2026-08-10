@@ -4,28 +4,29 @@
 #![allow(clippy::disallowed_methods)]
 
 use std::net::{IpAddr, SocketAddr};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{mpsc, oneshot};
+use tokio::time::Instant;
 use tokio_util::compat::TokioAsyncReadCompatExt as _;
 use tokio_util::sync::CancellationToken;
 
 use garter::test_utils::WaitableWriter;
 use garter::tracing_test::set_default_in_current_thread;
 
+use crate::yamux::keepalive::Cadence;
 use crate::yamux::{
-    connect_delay, connect_retrying, deframe_udp_datagram, drive_connection, driver_panicked, frame_udp_datagram,
-    next_failures, parse_udp_timeout, run_client, run_server, session_reconnect_backoff, ClientBoundAddrs,
-    FrameAccumulator, OpenStreamReply, StreamTag, TransportLivenessTap, DEFAULT_UDP_TIMEOUT, LOOPBACK_CONNECT_RETRY,
+    bind_udp, connect_delay, connect_retrying, connection_task_fatal, deframe_udp_datagram, drive_connection,
+    driver_panicked, enable_keepalive, frame_udp_datagram, next_failures, parse_udp_timeout, run_client,
+    run_client_session, run_server, run_server_with_connections, saturating_deadline, serve_driven_connection,
+    session_reconnect_backoff, ClientBoundAddrs, FrameAccumulator, OpenStreamReply, SessionOutcome, SessionTransport,
+    StreamTag, TransportLivenessTap, DEFAULT_UDP_TIMEOUT, KEEPALIVE_NONCE_LEN, LOOPBACK_CONNECT_RETRY,
     REMOTE_BACKOFF_BASE, REMOTE_BACKOFF_MAX,
 };
-// Only the Windows-gated CONNRESET regression test uses this.
-#[cfg(windows)]
-use crate::yamux::bind_udp;
 
 #[skuld::test]
 fn stream_tag_tcp_roundtrip() {
@@ -37,6 +38,12 @@ fn stream_tag_tcp_roundtrip() {
 fn stream_tag_udp_roundtrip() {
     assert_eq!(StreamTag::Udp.to_byte(), 0x02);
     assert_eq!(StreamTag::from_byte(0x02).unwrap(), StreamTag::Udp);
+}
+
+#[skuld::test]
+fn stream_tag_keepalive_roundtrip() {
+    assert_eq!(StreamTag::Keepalive.to_byte(), 0x03);
+    assert_eq!(StreamTag::from_byte(0x03).unwrap(), StreamTag::Keepalive);
 }
 
 #[skuld::test]
@@ -177,10 +184,10 @@ fn udp_timeout_parsed_value() {
 }
 
 #[skuld::test]
-fn udp_timeout_last_occurrence_wins() {
+fn udp_timeout_first_occurrence_wins() {
     assert_eq!(
         parse_udp_timeout(Some("udp_timeout=5;udp_timeout=20")).unwrap(),
-        Duration::from_secs(20)
+        Duration::from_secs(5)
     );
 }
 
@@ -191,6 +198,52 @@ fn udp_timeout_invalid_is_error() {
     // 0 would evict every association immediately — rejected.
     assert!(parse_udp_timeout(Some("udp_timeout=0")).is_err());
     assert!(parse_udp_timeout(Some("udp_timeout=-1")).is_err());
+    // Too large to fit `Instant` even right now — `run_udp_association`'s
+    // resets would saturate rather than panic on this, but it's still
+    // rejected early as a diagnostic (it would defeat idle-eviction as
+    // thoroughly as `0` does in the other direction).
+    assert!(parse_udp_timeout(Some("udp_timeout=18446744073709551615")).is_err());
+}
+
+#[skuld::test]
+fn udp_timeout_validates_every_occurrence_not_just_the_first() {
+    assert!(parse_udp_timeout(Some("udp_timeout=30;udp_timeout=0")).is_err());
+    assert!(parse_udp_timeout(Some("udp_timeout=30;udp_timeout=abc")).is_err());
+}
+
+#[skuld::test]
+fn udp_timeout_errors_on_malformed_options() {
+    // A dangling trailing backslash is fatal to ex-ray's own parser; failing
+    // loud here beats silently falling back to the default. The reason must
+    // survive in the error's own message, not just the fact that it failed.
+    let err = parse_udp_timeout(Some(r"udp_timeout=10;path=/a\")).unwrap_err();
+    assert!(
+        err.to_string().contains("unpaired backslash"),
+        "expected the specific reason in the message, got: {err}"
+    );
+}
+
+#[skuld::test]
+fn udp_timeout_rejected_value_never_reaches_the_error_message() {
+    // An escaped `;` absorbs the following segment into `udp_timeout`'s own
+    // value instead of starting a new one, so a naive `{value:?}` in the
+    // error would leak whatever follows — here, a stand-in secret.
+    let err = parse_udp_timeout(Some(r"udp_timeout=abc\;token=SECRET")).unwrap_err();
+    assert!(
+        !err.to_string().contains("SECRET"),
+        "error message leaks the rejected value: {err}"
+    );
+}
+
+#[skuld::test]
+fn saturating_deadline_never_panics_on_a_duration_too_large_to_add() {
+    // The value `parse_udp_timeout` rejects at parse time as too large to
+    // fit `Instant` right now still must not panic here: uptime narrows the
+    // margin, so a value that DID fit at parse time can still overflow by
+    // the time a reset actually runs. `saturating_deadline` is what
+    // `run_udp_association`'s resets call instead of a bare `+`.
+    let deadline = saturating_deadline(Duration::from_secs(u64::MAX));
+    assert!(deadline > Instant::now(), "must still land in the future");
 }
 
 // End-to-end UDP relay (#415) -----------------------------------------------------------------------------------------
@@ -539,38 +592,40 @@ fn session_reconnect_backoff_schedule() {
 // TransportLivenessTap ------------------------------------------------------------------------------------------------
 
 #[skuld::test]
-async fn transport_tap_sets_on_inbound_bytes() {
+async fn transport_tap_counts_inbound_reads() {
     use futures::AsyncReadExt as _;
-    let productive = Arc::new(AtomicBool::new(false));
-    let mut tap = TransportLivenessTap::new(futures::io::Cursor::new(b"data".to_vec()), Arc::clone(&productive));
-    let mut buf = [0u8; 8];
+    let reads = Arc::new(AtomicU64::new(0));
+    let mut tap = TransportLivenessTap::new(futures::io::Cursor::new(b"datadata".to_vec()), Arc::clone(&reads));
+    let mut buf = [0u8; 4];
     assert_eq!(tap.read(&mut buf).await.unwrap(), 4);
-    assert!(productive.load(Ordering::Relaxed));
+    assert_eq!(reads.load(Ordering::Relaxed), 1);
+    assert_eq!(tap.read(&mut buf).await.unwrap(), 4);
+    assert_eq!(reads.load(Ordering::Relaxed), 2, "each non-empty read must be counted");
 }
 
 #[skuld::test]
 async fn transport_tap_silent_on_eof() {
     use futures::AsyncReadExt as _;
-    let productive = Arc::new(AtomicBool::new(false));
-    let mut tap = TransportLivenessTap::new(futures::io::Cursor::new(Vec::new()), Arc::clone(&productive));
+    let reads = Arc::new(AtomicU64::new(0));
+    let mut tap = TransportLivenessTap::new(futures::io::Cursor::new(Vec::new()), Arc::clone(&reads));
     let mut buf = [0u8; 8];
     assert_eq!(tap.read(&mut buf).await.unwrap(), 0);
-    assert!(!productive.load(Ordering::Relaxed));
+    assert_eq!(reads.load(Ordering::Relaxed), 0);
 }
 
 #[skuld::test]
 async fn transport_tap_delegates_writes() {
     use futures::{AsyncReadExt as _, AsyncWriteExt as _};
-    let productive = Arc::new(AtomicBool::new(false));
+    let reads = Arc::new(AtomicU64::new(0));
     let (a, b) = tokio::io::duplex(64);
-    let mut tap = TransportLivenessTap::new(a.compat(), Arc::clone(&productive));
+    let mut tap = TransportLivenessTap::new(a.compat(), Arc::clone(&reads));
     tap.write_all(b"ping").await.unwrap();
     tap.flush().await.unwrap();
     let mut b = b.compat();
     let mut buf = [0u8; 4];
     b.read_exact(&mut buf).await.unwrap();
     assert_eq!(&buf, b"ping");
-    assert!(!productive.load(Ordering::Relaxed), "writes never set productive");
+    assert_eq!(reads.load(Ordering::Relaxed), 0, "writes are never inbound liveness");
 }
 
 // Transport-reset reconnect -------------------------------------------------------------------------------------------
@@ -767,7 +822,7 @@ async fn backoff_escalates_then_resets_on_productive() {
 
 /// Install a per-test tracing subscriber that captures log lines for
 /// [`wait_for_log`] rendezvous, plus the `DefaultGuard` keeping it active.
-fn capture_logs() -> (WaitableWriter, tracing::subscriber::DefaultGuard) {
+pub(crate) fn capture_logs() -> (WaitableWriter, tracing::subscriber::DefaultGuard) {
     let writer = WaitableWriter::new();
     let subscriber = tracing_subscriber::fmt()
         .with_writer(writer.clone())
@@ -787,13 +842,19 @@ async fn wait_for_log(writer: &WaitableWriter, needle: &str) {
         .unwrap();
 }
 
-/// Strip the 1-byte stream tag, then echo everything else back.
 async fn echo_yamux_stream(mut stream: yamux::Stream) {
-    use futures::{AsyncReadExt as _, AsyncWriteExt as _};
+    use futures::AsyncReadExt as _;
     let mut tag = [0u8; 1];
     if stream.read_exact(&mut tag).await.is_err() {
         return;
     }
+    echo_yamux_stream_body(stream).await;
+}
+
+/// Echo every byte back until the peer goes away. Any stream tag must already
+/// have been consumed.
+pub(crate) async fn echo_yamux_stream_body(mut stream: yamux::Stream) {
+    use futures::{AsyncReadExt as _, AsyncWriteExt as _};
     let mut buf = vec![0u8; 4096];
     loop {
         match stream.read(&mut buf).await {
@@ -873,6 +934,12 @@ async fn driver_panicked_detects_panic_not_cancel() {
 
 #[skuld::test]
 async fn shutdown_during_backoff_exits_promptly() {
+    // Paused for the whole test so no wall-clock window exists between the
+    // rendezvous below and the backoff sleep it is supposed to freeze. The
+    // keepalive timer inside the span cannot change what is observed: the first
+    // session never receives a byte, so whether it dies from the relay's close
+    // or from a keepalive verdict, the reconnect event is `(1, false)` either
+    // way.
     tokio::time::pause();
     let upstream = spawn_tcp_responder(HTTP_RESPONSE.to_vec()).await;
     let shutdown = CancellationToken::new();
@@ -924,4 +991,428 @@ async fn server_shutdown_is_prompt_while_client_connected() {
 
     shutdown.cancel();
     server.await.expect("server task joined").expect("run_server ok");
+}
+
+#[skuld::test]
+async fn server_serves_a_client_while_an_idle_connection_is_open() {
+    // An idle connection must not starve a real client sharing the server (see
+    // `run_server_with_connections`'s per-connection-task comment).
+    const RESPONSE: &[u8] = b"HTTP/1.0 200 OK\r\n\r\nok";
+    let (writer, _g) = capture_logs();
+    let upstream = spawn_tcp_responder(RESPONSE.to_vec()).await;
+    let shutdown = CancellationToken::new();
+
+    let (srv_tx, srv_rx) = oneshot::channel();
+    tokio::spawn(run_server(
+        ::yamux::Config::default(),
+        "127.0.0.1:0".parse().unwrap(),
+        upstream,
+        shutdown.clone(),
+        Some(srv_tx),
+    ));
+    let server_addr = srv_rx.await.expect("server bound");
+
+    // The idle connection. Held for the whole test; never writes a frame.
+    let _idle = TcpStream::connect(server_addr).await.expect("connect idle");
+    wait_for_log(&writer, "accepted underlying connection").await;
+
+    let (cli_tx, cli_rx) = oneshot::channel();
+    tokio::spawn(run_client(
+        ::yamux::Config::default(),
+        "127.0.0.1:0".parse().unwrap(),
+        server_addr,
+        DEFAULT_UDP_TIMEOUT,
+        shutdown.clone(),
+        Some(cli_tx),
+        None,
+    ));
+    let addrs = cli_rx.await.expect("client bound");
+
+    let mut app = TcpStream::connect(addrs.tcp).await.expect("connect client TCP");
+    app.write_all(b"GET / HTTP/1.0\r\n\r\n").await.expect("write request");
+    let mut got = Vec::new();
+    app.read_to_end(&mut got).await.expect("read response to EOF");
+    assert_eq!(got, RESPONSE, "the relay must serve a client past an idle connection");
+
+    shutdown.cancel();
+}
+
+#[skuld::test]
+async fn connection_task_fatal_escalates_panics_not_aborts() {
+    assert!(!connection_task_fatal(tokio::spawn(async {}).await));
+
+    // Our own teardown abort → cancelled JoinError → not a bug.
+    let h = tokio::spawn(std::future::pending::<()>());
+    h.abort();
+    assert!(!connection_task_fatal(h.await));
+
+    // A panic — the single route by which a code bug reaches the supervisor,
+    // including a driver panic, which `serve_underlying` re-raises.
+    assert!(connection_task_fatal(tokio::spawn(async { panic!("boom") }).await));
+}
+
+#[skuld::test]
+async fn served_connection_gets_os_keepalive() {
+    // Without it a peer whose path dies silently is never reaped.
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("local_addr");
+    let _client = TcpStream::connect(addr).await.expect("connect");
+    let (accepted, _) = listener.accept().await.expect("accept");
+
+    let sock = socket2::SockRef::from(&accepted);
+    assert!(!sock.keepalive().expect("read keepalive"), "off before");
+    enable_keepalive(&accepted);
+    assert!(sock.keepalive().expect("read keepalive"), "on after");
+}
+
+#[skuld::test]
+async fn server_exits_on_a_panic_and_winds_down_its_other_connections() {
+    // A code bug must stop the whole plugin rather than let it limp on — and the
+    // surviving connections must be wound down cooperatively, so their drivers
+    // are aborted and their sockets closed before `run_server` returns.
+    let shutdown = CancellationToken::new();
+    let (srv_tx, srv_rx) = oneshot::channel();
+    let (serving_tx, mut serving_rx) = mpsc::channel::<()>(1);
+    let sibling_wound_down = Arc::new(AtomicBool::new(false));
+
+    let seen = Arc::new(AtomicBool::new(false));
+    let flag = Arc::clone(&sibling_wound_down);
+    let server = tokio::spawn(run_server_with_connections(
+        ::yamux::Config::default(),
+        "127.0.0.1:0".parse().unwrap(),
+        "127.0.0.1:9".parse().unwrap(),
+        shutdown.clone(),
+        Some(srv_tx),
+        move |_tcp, _peer, _config, _remote, shutdown| {
+            // First connection is the well-behaved sibling; the second panics.
+            let is_sibling = !seen.swap(true, Ordering::SeqCst);
+            let serving_tx = serving_tx.clone();
+            let flag = Arc::clone(&flag);
+            async move {
+                assert!(is_sibling, "boom");
+                let _ = serving_tx.send(()).await;
+                shutdown.cancelled().await;
+                flag.store(true, Ordering::SeqCst);
+            }
+        },
+    ));
+    let server_addr = srv_rx.await.expect("server bound");
+
+    let _sibling = TcpStream::connect(server_addr).await.expect("connect sibling");
+    serving_rx.recv().await.expect("sibling is being served");
+    let _bad = TcpStream::connect(server_addr).await.expect("connect panicking");
+
+    let err = server
+        .await
+        .expect("server task joined")
+        .expect_err("a panicking connection task must fail the plugin");
+    assert!(err.to_string().contains("panicked"), "unexpected error: {err}");
+    assert!(
+        sibling_wound_down.load(Ordering::SeqCst),
+        "the surviving connection must be wound down, not abandoned"
+    );
+}
+
+#[skuld::test]
+async fn server_exits_when_the_yamux_driver_panics() {
+    // The driver runs on a task of its own, so its panic must be re-raised in
+    // the connection task to reach the supervisor. The injected driver drops
+    // `inbound_tx` while unwinding exactly as the real one does, so the
+    // connection observes the close only after the driver has finished.
+    let shutdown = CancellationToken::new();
+    let (srv_tx, srv_rx) = oneshot::channel();
+    let server = tokio::spawn(run_server_with_connections(
+        ::yamux::Config::default(),
+        "127.0.0.1:0".parse().unwrap(),
+        "127.0.0.1:9".parse().unwrap(),
+        shutdown.clone(),
+        Some(srv_tx),
+        |_tcp, peer, _config, remote, shutdown| {
+            let (inbound_tx, inbound_rx) = mpsc::channel::<::yamux::Stream>(1);
+            let driver = tokio::spawn(async move {
+                let _inbound_tx = inbound_tx;
+                panic!("driver boom");
+            });
+            serve_driven_connection(peer, remote, shutdown, driver, inbound_rx)
+        },
+    ));
+    let server_addr = srv_rx.await.expect("server bound");
+
+    let _conn = TcpStream::connect(server_addr).await.expect("connect server");
+
+    let err = server
+        .await
+        .expect("server task joined")
+        .expect_err("a panicking driver must fail the plugin");
+    assert!(err.to_string().contains("panicked"), "unexpected error: {err}");
+}
+
+// Keepalive wire protocol ---------------------------------------------------------------------------------------------
+
+/// Open one substream through `open_tx`. Panics if the connection is gone.
+pub(crate) async fn open_test_stream(open_tx: &mpsc::Sender<OpenStreamReply>) -> yamux::Stream {
+    let (tx, rx) = oneshot::channel();
+    open_tx.send(tx).await.expect("driver alive");
+    rx.await.expect("open reply").expect("stream opened")
+}
+
+/// Write `payload` to `stream` and read exactly `expect_len` bytes back.
+/// `None` if the peer ended the substream instead of answering.
+async fn write_and_read(stream: &mut yamux::Stream, payload: &[u8], expect_len: usize) -> Option<Vec<u8>> {
+    use futures::{AsyncReadExt as _, AsyncWriteExt as _};
+    stream.write_all(payload).await.ok()?;
+    stream.flush().await.ok()?;
+    let mut echo = vec![0u8; expect_len];
+    stream.read_exact(&mut echo).await.ok().map(|()| echo)
+}
+
+/// A raw yamux client over a real TCP connection, kept alive so a test can send
+/// several substreams down the *same* session.
+struct RawYamuxClient {
+    open_tx: mpsc::Sender<OpenStreamReply>,
+    _inbound_rx: mpsc::Receiver<yamux::Stream>,
+    driver: tokio::task::JoinHandle<()>,
+}
+
+impl RawYamuxClient {
+    async fn connect(server_addr: SocketAddr) -> Self {
+        let tcp = TcpStream::connect(server_addr).await.expect("connect yamux server");
+        let conn = ::yamux::Connection::new(tcp.compat(), ::yamux::Config::default(), ::yamux::Mode::Client);
+        let (open_tx, open_rx) = mpsc::channel::<OpenStreamReply>(4);
+        let (inbound_tx, _inbound_rx) = mpsc::channel::<yamux::Stream>(4);
+        let driver = tokio::spawn(drive_connection(conn, open_rx, inbound_tx));
+        Self {
+            open_tx,
+            _inbound_rx,
+            driver,
+        }
+    }
+
+    /// Send `tag` + `payload` on a fresh substream and read `expect_len` bytes
+    /// back. `None` if the peer ended the substream first.
+    async fn exchange(&self, tag: u8, payload: &[u8], expect_len: usize) -> Option<Vec<u8>> {
+        use futures::AsyncWriteExt as _;
+        let mut stream = open_test_stream(&self.open_tx).await;
+        stream.write_all(&[tag]).await.expect("write tag");
+        write_and_read(&mut stream, payload, expect_len).await
+    }
+}
+
+impl Drop for RawYamuxClient {
+    fn drop(&mut self) {
+        self.driver.abort();
+    }
+}
+
+#[skuld::test]
+async fn the_server_echoes_a_keepalive_nonce_verbatim() {
+    let upstream = spawn_tcp_responder(HTTP_RESPONSE.to_vec()).await;
+    let shutdown = CancellationToken::new();
+    let server_addr = spawn_yamux_server(upstream, shutdown.clone()).await;
+
+    let client = RawYamuxClient::connect(server_addr).await;
+    let nonce: u64 = 0x0123_4567_89AB_CDEF;
+    assert_eq!(
+        client
+            .exchange(
+                StreamTag::Keepalive.to_byte(),
+                &nonce.to_be_bytes(),
+                KEEPALIVE_NONCE_LEN
+            )
+            .await,
+        Some(nonce.to_be_bytes().to_vec())
+    );
+
+    shutdown.cancel();
+}
+
+#[skuld::test]
+async fn an_unknown_stream_tag_costs_one_substream_not_the_session() {
+    // The version-skew property in mirror image, asserted on the SAME session:
+    // the server rejects the substream and keeps serving the connection. This is
+    // exactly what an un-upgraded server does to a keepalive probe.
+    let upstream = spawn_tcp_responder(HTTP_RESPONSE.to_vec()).await;
+    let shutdown = CancellationToken::new();
+    let server_addr = spawn_yamux_server(upstream, shutdown.clone()).await;
+
+    let client = RawYamuxClient::connect(server_addr).await;
+    assert_eq!(
+        client.exchange(0x7F, b"whatever", 1).await,
+        None,
+        "unknown tag rejected"
+    );
+    assert_eq!(
+        client
+            .exchange(0x01, b"GET / HTTP/1.0\r\n\r\n", HTTP_RESPONSE.len())
+            .await,
+        Some(HTTP_RESPONSE.to_vec()),
+        "the session must survive a rejected substream"
+    );
+
+    shutdown.cancel();
+}
+
+/// Fire a one-shot silent black hole on a relay connection.
+struct BlackholeHandle {
+    tx: Option<oneshot::Sender<()>>,
+}
+
+impl BlackholeHandle {
+    fn trigger(&mut self) {
+        if let Some(tx) = self.tx.take() {
+            let _ = tx.send(());
+        }
+    }
+}
+
+/// A TCP relay in front of `upstream` whose first connection can be silently
+/// black-holed: on `trigger()` it stops forwarding both ways but holds both
+/// sockets open forever, so neither peer sees a FIN or an RST and neither peer's
+/// TCP stack times out (the relay's kernel keeps ACKing). That is strictly
+/// harsher than the field condition, where the client's retransmits do
+/// eventually abort.
+async fn spawn_blackholing_relay(upstream: SocketAddr) -> (SocketAddr, BlackholeHandle) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind relay");
+    let addr = listener.local_addr().expect("relay addr");
+    let (hole_tx, hole_rx) = oneshot::channel::<()>();
+    tokio::spawn(async move {
+        let mut trigger = Some(hole_rx);
+        while let Ok((client_conn, _)) = listener.accept().await {
+            let server_conn = match TcpStream::connect(upstream).await {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            tokio::spawn(pump_with_optional_blackhole(client_conn, server_conn, trigger.take()));
+        }
+    });
+    (addr, BlackholeHandle { tx: Some(hole_tx) })
+}
+
+async fn pump_with_optional_blackhole(
+    mut client: TcpStream,
+    mut server: TcpStream,
+    hole: Option<oneshot::Receiver<()>>,
+) {
+    match hole {
+        Some(rx) => {
+            tokio::select! {
+                _ = tokio::io::copy_bidirectional(&mut client, &mut server) => {}
+                // `client` and `server` stay alive in this frame, so both
+                // sockets stay open: a true silent black hole.
+                _ = rx => std::future::pending::<()>().await,
+            }
+        }
+        None => {
+            let _ = tokio::io::copy_bidirectional(&mut client, &mut server).await;
+        }
+    }
+}
+
+#[skuld::test]
+async fn a_silently_blackholed_session_is_declared_dead() {
+    let (writer, _g) = capture_logs();
+    let upstream = spawn_tcp_responder(HTTP_RESPONSE.to_vec()).await;
+    let shutdown = CancellationToken::new();
+    let server_addr = spawn_yamux_server(upstream, shutdown.clone()).await;
+    let (relay_addr, mut hole) = spawn_blackholing_relay(server_addr).await;
+    let (addrs, mut events) = spawn_yamux_client(relay_addr, DEFAULT_UDP_TIMEOUT, shutdown.clone()).await;
+
+    // #1 proves the tunnel works and marks the session productive.
+    assert_eq!(
+        tcp_round_trip(addrs.tcp, b"GET /1 HTTP/1.0\r\n\r\n").await,
+        HTTP_RESPONSE
+    );
+
+    hole.trigger();
+    // From here nothing but a timer can make progress, and nothing that could
+    // ever come back is in flight, so where the paused clock jumps cannot change
+    // the outcome. Nothing in this window uses `spawn_blocking`, which would
+    // inhibit the advance.
+    tokio::time::pause();
+
+    // Productive before the hole, so failures reset to the floor. `run_client`
+    // emits this before any backoff or reconnect, so nothing else has started.
+    assert_eq!(events.recv().await.unwrap(), (0, true));
+    tokio::time::resume();
+
+    // Naming the mechanism: the fatal line is written by `run_keepalive`, which
+    // returns before `run_client_session` returns and therefore before the event
+    // above — same task, so the ordering is program order, not a race.
+    assert!(
+        writer
+            .snapshot()
+            .contains("transport silent across the keepalive deadline"),
+        "the reconnect must have been caused by the keepalive, not by anything else"
+    );
+
+    shutdown.cancel();
+}
+
+#[skuld::test]
+async fn a_healthy_session_is_kept_alive_by_its_own_probe() {
+    // The complementary direction, and the one that would otherwise ship green
+    // while tearing down every idle tunnel: the probe must travel the whole
+    // client path to the real server's `echo_keepalive` and come back as
+    // liveness on this session's own tap. The short cadence IS the behavior
+    // under test (mirroring the NAT idle-eviction test's short `udp_timeout`);
+    // the rendezvous is the log event, never a duration.
+    let (writer, _g) = capture_logs();
+    let upstream = spawn_tcp_responder(HTTP_RESPONSE.to_vec()).await;
+    let shutdown = CancellationToken::new();
+    let server_addr = spawn_yamux_server(upstream, shutdown.clone()).await;
+
+    let tcp = TcpStream::connect(server_addr).await.expect("connect yamux server");
+    let (mut session, _driver) = SessionTransport::spawn(tcp, &::yamux::Config::default());
+    let tcp_listener = TcpListener::bind("127.0.0.1:0").await.expect("bind local TCP");
+    let udp_socket = Arc::new(bind_udp("127.0.0.1:0".parse().unwrap()).expect("bind local UDP"));
+    // Short enough that the test does not idle, long enough that a loaded runner
+    // cannot miss a loopback round trip; `Cadence::new` requires the deadline to
+    // fit inside the interval, so they are equal rather than lopsided.
+    let cadence = Cadence::new(Duration::from_millis(500), Duration::from_millis(500));
+
+    // End the session as soon as the keepalive has reached *a* verdict, so the
+    // assertions below are on which verdict it was, not on how long it ran. The
+    // needle is the substring both verdict lines share ("transport answered
+    // inside the keepalive deadline" / "transport silent across the keepalive
+    // deadline") on purpose: waiting for the good one alone would hang here
+    // instead of failing, and the diagnosis would be lost.
+    let ender = {
+        let writer = writer.clone();
+        let shutdown = shutdown.clone();
+        tokio::spawn(async move {
+            wait_for_log(&writer, "the keepalive deadline").await;
+            shutdown.cancel();
+        })
+    };
+
+    let outcome = run_client_session(
+        &tcp_listener,
+        &udp_socket,
+        &mut session,
+        DEFAULT_UDP_TIMEOUT,
+        cadence,
+        &shutdown,
+    )
+    .await;
+
+    ender.await.expect("ender joined");
+    assert_eq!(
+        outcome,
+        SessionOutcome::Shutdown,
+        "a session whose probe is answered must end only on shutdown"
+    );
+    assert!(
+        !writer
+            .snapshot()
+            .contains("transport silent across the keepalive deadline"),
+        "a healthy transport must never be declared dead"
+    );
+    // And the liveness came from the server's *echo*, not from some other frame:
+    // a rejected or reset probe substream would end the probe's read, which logs.
+    // A coalesced data+FIN still reads as `Ok(8)`, since `poll_read` drains the
+    // buffer before consulting `can_read`.
+    assert!(
+        !writer.snapshot().contains("keepalive probe substream ended"),
+        "the probe must have been answered by `echo_keepalive`, not rejected"
+    );
 }

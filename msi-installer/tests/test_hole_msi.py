@@ -253,7 +253,7 @@ def test_arp_product_icon_in_msi(decompiled_tree: ET.ElementTree) -> None:
     pkg = decompiled_tree.getroot().find("wix:Package", NS)
     assert pkg is not None
 
-    icon_ids = {icon.get("Id") for icon in pkg.iter(f"{{{NS['wix']}}}Icon")}
+    icon_ids = {icon.get("Id", "") for icon in pkg.iter(f"{{{NS['wix']}}}Icon")}
     assert icon_ids, "Decompiled MSI has no <Icon> entries — ARPPRODUCTICON has nothing to reference"
 
     arp_property = None

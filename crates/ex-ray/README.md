@@ -51,6 +51,34 @@ reject-then-accept behavioral test, so a bump that drops or breaks the patch
 fails CI. (golangci-lint excludes the vendored tree, so this go-test lane — not
 the linter — is the guard.)
 
+## TCP keepalive
+
+A transport that is silently black-holed leaves an idle connection wedged:
+nothing is written, so nothing errors. ex-ray tightens the socket's own keepalive
+timers on the connection to the server so the kernel notices sooner.
+
+SIP003 opt: `tcp-keepalive=<seconds>` — idle time before probing (default `15`).
+Three probes follow at the same spacing, so a black-holed idle connection is
+dropped after roughly `4 x seconds`. Without it, Go's defaults give 15s idle + 9
+probes ≈ 150s.
+
+`tcp-keepalive=0` turns keepalive off on that connection entirely, including the
+~150s Go would otherwise apply — a full opt-out, not a return to the previous
+behaviour. Other internal dials (the ECH DoH bootstrap) keep Go's defaults either
+way.
+
+This sits on the WAN socket, below Mux.Cool, so it applies regardless of `mux`.
+It has no effect in `mode=quic`, which is UDP and carries its own keepalive, nor
+in server mode. A connection stalled with unacknowledged data is governed by the
+retransmit timer rather than keepalive and is not covered here (see
+[#707](https://github.com/bindreams/hole/issues/707)).
+
+**Maintenance.** `TestDialSystemAppliesKeepAlive` pins the two vendored
+behaviours this leans on — a registered dialer controller still reaching the fd,
+and `SocketConfig`'s keepalive fields still suppressing Go's own post-connect
+defaults — so a `third_party/v2ray-core` bump that breaks either fails CI rather
+than silently restoring the 150s bound.
+
 ## Build
 
 ```sh

@@ -27,8 +27,9 @@ import tempfile
 from pathlib import Path
 
 REPO = "bindreams/hole"
-EXPECTED_INSTALLER_COUNT = 3
 TAG_PREFIX = "releases/hole/v"
+# Assets that carry signing metadata rather than being covered by it.
+SIGNATURE_ASSETS = frozenset({"SHA256SUMS", "SHA256SUMS.minisig"})
 
 
 def normalize_tag(tag: str) -> str:
@@ -40,22 +41,42 @@ def normalize_tag(tag: str) -> str:
     return f"{TAG_PREFIX}{version}"
 
 
-def validate_sha256sums(path: Path) -> None:
-    """Validate that the SHA256SUMS file has the expected format."""
-    content = path.read_text()
-    lines = [line for line in content.splitlines() if line.strip()]
+def signable_asset_names(asset_names) -> set:
+    """Release assets that SHA256SUMS must cover: everything but the signing metadata."""
+    return {name for name in asset_names if name not in SIGNATURE_ASSETS}
 
-    if len(lines) != EXPECTED_INSTALLER_COUNT:
-        print(
-            f"error: SHA256SUMS has {len(lines)} entries, expected {EXPECTED_INSTALLER_COUNT}",
-            file=sys.stderr,
-        )
-        sys.exit(1)
 
+def validate_sha256sums(path: Path, expected: set) -> None:
+    """Assert SHA256SUMS covers exactly `expected`, one well-formed line each.
+
+    Derived from the release's own asset list rather than a count, so adding a
+    platform or artifact needs no change here (#682).
+    """
+    lines = [line for line in path.read_text().splitlines() if line.strip()]
+
+    listed = []
     for i, line in enumerate(lines, 1):
-        if not re.fullmatch(r"[0-9a-fA-F]{64}  .+", line):
+        match = re.fullmatch(r"([0-9a-fA-F]{64})  (.+)", line)
+        if not match:
             print(f"error: SHA256SUMS line {i} is malformed: {line!r}", file=sys.stderr)
             sys.exit(1)
+        listed.append(match.group(2))
+
+    duplicates = sorted({name for name in listed if listed.count(name) > 1})
+    if duplicates:
+        print(f"error: SHA256SUMS lists {', '.join(duplicates)} more than once", file=sys.stderr)
+        sys.exit(1)
+
+    if set(listed) != expected:
+        missing = sorted(expected - set(listed))
+        unknown = sorted(set(listed) - expected)
+        detail = []
+        if missing:
+            detail.append(f"release assets absent from SHA256SUMS: {', '.join(missing)}")
+        if unknown:
+            detail.append(f"SHA256SUMS entries not on the release: {', '.join(unknown)}")
+        print(f"error: {'; '.join(detail)}", file=sys.stderr)
+        sys.exit(1)
 
 
 def main() -> None:
@@ -102,7 +123,7 @@ def main() -> None:
         )
 
         sha256sums_path = tmpdir / "SHA256SUMS"
-        validate_sha256sums(sha256sums_path)
+        validate_sha256sums(sha256sums_path, signable_asset_names(asset_names))
 
         sign_cmd = ["minisign", "-Sm", str(sha256sums_path)]
         if args.secret_key:
@@ -157,6 +178,86 @@ def test_normalize_tag_invalid():
         normalize_tag("abc")
 
 
+# The 0.5.0 asset set: three installers plus the three update archives added in
+# #659. A hardcoded count went stale on exactly this change (#682).
+SIGNABLE_ASSETS = [
+    "hole-0.5.0-darwin-amd64.dmg",
+    "hole-0.5.0-darwin-amd64.tar.gz",
+    "hole-0.5.0-darwin-arm64.dmg",
+    "hole-0.5.0-darwin-arm64.tar.gz",
+    "hole-0.5.0-windows-amd64.msi",
+    "hole-0.5.0-windows-amd64.zip",
+]
+
+
+def _sums(names):
+    return "".join(f"{i:064x}  {name}\n" for i, name in enumerate(names, 1))
+
+
+def test_accepts_sums_covering_every_release_asset(tmp_path):
+    path = tmp_path / "SHA256SUMS"
+    path.write_text(_sums(SIGNABLE_ASSETS))
+
+    validate_sha256sums(path, set(SIGNABLE_ASSETS))
+
+
+def test_asset_count_is_not_fixed(tmp_path):
+    """Adding an asset to the release must not require touching this script."""
+    extended = [*SIGNABLE_ASSETS, "hole-0.5.0-linux-amd64.tar.gz"]
+    path = tmp_path / "SHA256SUMS"
+    path.write_text(_sums(extended))
+
+    validate_sha256sums(path, set(extended))
+
+
+def test_rejects_asset_missing_from_sums(tmp_path):
+    import pytest
+
+    path = tmp_path / "SHA256SUMS"
+    path.write_text(_sums(SIGNABLE_ASSETS[:-1]))
+
+    with pytest.raises(SystemExit):
+        validate_sha256sums(path, set(SIGNABLE_ASSETS))
+
+
+def test_rejects_sums_line_for_unknown_asset(tmp_path):
+    import pytest
+
+    path = tmp_path / "SHA256SUMS"
+    path.write_text(_sums([*SIGNABLE_ASSETS, "hole-0.5.0-windows-arm64.msi"]))
+
+    with pytest.raises(SystemExit):
+        validate_sha256sums(path, set(SIGNABLE_ASSETS))
+
+
+def test_rejects_duplicate_entry(tmp_path):
+    import pytest
+
+    path = tmp_path / "SHA256SUMS"
+    path.write_text(_sums(SIGNABLE_ASSETS) + f"{7:064x}  {SIGNABLE_ASSETS[0]}\n")
+
+    with pytest.raises(SystemExit):
+        validate_sha256sums(path, set(SIGNABLE_ASSETS))
+
+
+def test_rejects_malformed_line(tmp_path):
+    import pytest
+
+    path = tmp_path / "SHA256SUMS"
+    path.write_text("not-a-hash  hole-0.5.0-windows-amd64.msi\n")
+
+    with pytest.raises(SystemExit):
+        validate_sha256sums(path, {"hole-0.5.0-windows-amd64.msi"})
+
+
+def test_signature_assets_are_not_themselves_hashed(tmp_path):
+    """`SHA256SUMS`/`.minisig` are release assets but never entries."""
+    path = tmp_path / "SHA256SUMS"
+    path.write_text(_sums(SIGNABLE_ASSETS))
+
+    validate_sha256sums(path, signable_asset_names(SIGNABLE_ASSETS + ["SHA256SUMS"]))
+
+
 def test_validate_sha256sums_valid(tmp_path: Path):
     p = tmp_path / "SHA256SUMS"
     p.write_text(
@@ -164,16 +265,23 @@ def test_validate_sha256sums_valid(tmp_path: Path):
         "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  hole-1.0.0-darwin-arm64.dmg\n"
         "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc  hole-1.0.0-darwin-amd64.dmg\n"
     )
-    validate_sha256sums(p)  # should not raise
+    validate_sha256sums(
+        p,
+        {
+            "hole-1.0.0-windows-amd64.msi",
+            "hole-1.0.0-darwin-arm64.dmg",
+            "hole-1.0.0-darwin-amd64.dmg",
+        },
+    )  # should not raise
 
 
-def test_validate_sha256sums_wrong_line_count(tmp_path: Path):
+def test_validate_sha256sums_short_of_the_release_assets(tmp_path: Path):
     import pytest
 
     p = tmp_path / "SHA256SUMS"
     p.write_text("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  hole-1.0.0-windows-amd64.msi\n")
     with pytest.raises(SystemExit):
-        validate_sha256sums(p)
+        validate_sha256sums(p, {"hole-1.0.0-windows-amd64.msi", "hole-1.0.0-darwin-arm64.dmg"})
 
 
 def test_validate_sha256sums_malformed_hash(tmp_path: Path):
@@ -186,4 +294,11 @@ def test_validate_sha256sums_malformed_hash(tmp_path: Path):
         "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc  hole-1.0.0-darwin-amd64.dmg\n"
     )
     with pytest.raises(SystemExit):
-        validate_sha256sums(p)
+        validate_sha256sums(
+            p,
+            {
+                "hole-1.0.0-windows-amd64.msi",
+                "hole-1.0.0-darwin-arm64.dmg",
+                "hole-1.0.0-darwin-amd64.dmg",
+            },
+        )

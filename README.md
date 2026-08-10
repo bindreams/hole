@@ -45,7 +45,7 @@ The GUI is the primary interface; these CLI commands are also available:
 
 | Command                              | Description                                      |
 | ------------------------------------ | ------------------------------------------------ |
-| `hole [--show-dashboard]`            | Launch the GUI (default)                         |
+| `hole [--no-show-dashboard]`         | Launch the GUI (default); opens the dashboard    |
 | `hole version`                       | Print version information                        |
 | `hole upgrade`                       | Check for updates and install the latest version |
 | `hole path add` / `hole path remove` | Add / remove `hole` from the system PATH         |

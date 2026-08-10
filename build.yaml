@@ -272,6 +272,17 @@ targets:
     build: cargo nextest run --no-run -p util
     run: cargo nextest run -p util
 
+  ex-ray-unit-tests:
+    # ex-ray's own Go tests only -- no vendored packages. Separate from
+    # `ex-ray-tests` so it can run on windows and darwin without also dragging
+    # upstream v2ray-core's suites onto runners they have never been exercised
+    # on. This is what gives keepalive_{windows,darwin}.go CI teeth: they are
+    # build-tagged, so a linux-only lane would never even compile them.
+    platforms:
+      matrix: { os: [windows, linux, darwin], arch: [amd64, arm64] }
+    run:
+      - cd crates/ex-ray && go test ./...
+
   ex-ray-tests:
     # ex-ray's Go unit tests. Run-only: `go test` compiles + runs in one step,
     # unlike the nextest `*-tests` targets' --no-run/run split. This is the only
@@ -282,7 +293,8 @@ targets:
     # gate/refuse/round-trip + ECH-retry tests (tls incl. utls, quic, hysteria2,
     # transportcommon). Scoped to the ECH-touching packages, not the whole vendored tree (upstream's full suite is slow).
     # Gate logic is platform-independent (domainsocket is !windows); the matrix is wide so
-    # `cargo xtask run ex-ray-tests` works anywhere, though CI exercises only linux.
+    # `cargo xtask run ex-ray-tests` works anywhere, though CI exercises only linux --
+    # the per-OS socket code is covered by `ex-ray-unit-tests` instead.
     platforms:
       matrix: { os: [windows, linux, darwin], arch: [amd64, arm64] }
     run:

@@ -113,13 +113,14 @@ pub async fn run_server_test(entry: &ServerEntry, cfg: &TestConfig) -> ServerTes
             crate::dns::bootstrap::resolve_via_doh(&entry.server, &cfg.dns).await
         }
     };
-    let server_ip = match resolved {
-        Ok(ip) => ip,
+    let bootstrapped = match resolved {
+        Ok(b) => b,
         Err(e) => {
             tracing::warn!(host = %entry.server, error = %e, "server_test: DoH bootstrap failed");
             return ServerTestOutcome::DnsFailed;
         }
     };
+    let server_ip = bootstrapped.server_ip;
     let server_host = crate::dns::bootstrap::handoff_host(server_ip);
 
     // Phase 1: pre-flight DNS + TCP probe. Skipped for a QUIC server: its
@@ -139,7 +140,7 @@ pub async fn run_server_test(entry: &ServerEntry, cfg: &TestConfig) -> ServerTes
     };
 
     // Phase 2: spawn plugin if configured. The guard's Drop kills the child.
-    let _plugin_guard = match maybe_start_plugin(entry, &mut svr_cfg, &server_host, cfg).await {
+    let _plugin_guard = match maybe_start_plugin(entry, &mut svr_cfg, &server_host, cfg, bootstrapped.via).await {
         Ok(p) => p,
         Err(out) => return out,
     };
@@ -250,14 +251,28 @@ async fn reclassify_blocked(
 /// TCP listener to connect to — so [`run_server_test`] skips it and lets the
 /// full tunnel handshake produce the diagnosis. Covers a direct
 /// v2ray-plugin/ex-ray QUIC server AND a galoshes server (which passes
-/// `mode=quic` through to its embedded ex-ray). Shares the reachability probe's
-/// transport classifier, so the two agree on what a QUIC endpoint is. See
-/// bindreams/hole#421.
+/// `mode=quic` through to its embedded ex-ray). Shares the reachability
+/// probe's transport classifier, so the two agree on what a QUIC endpoint
+/// is.
+///
+/// A malformed options string also skips the preflight, even though the
+/// endpoint might really be TCP: the risk is asymmetric. Guessing UDP when
+/// it's actually TCP costs only diagnosis precision (the full tunnel
+/// handshake still runs and produces a correct, if vaguer, verdict).
+/// Guessing TCP when it's actually UDP-only reproduces the exact false
+/// TcpTimeout/TcpRefused verdict this asymmetry exists to avoid, and a raw
+/// TCP connect can't distinguish "genuinely TCP" from "unclassifiable" to
+/// make that guess safely.
 fn server_endpoint_is_udp(entry: &ServerEntry) -> bool {
-    matches!(
-        crate::reachability::classify_transport(entry.plugin.as_deref(), entry.plugin_opts.as_deref(), &entry.server),
-        crate::reachability::ProbeTransport::Quic { .. }
-    )
+    match crate::reachability::classify_transport(entry.plugin.as_deref(), entry.plugin_opts.as_deref(), &entry.server)
+    {
+        Ok(crate::reachability::ProbeTransport::Quic { .. }) => true,
+        Ok(_) => false,
+        Err(e) => {
+            debug!(%e, "malformed SS_PLUGIN_OPTIONS in server_endpoint_is_udp, assuming UDP");
+            true
+        }
+    }
 }
 
 /// Raw-TCP-connect to the DoH-resolved `addr`. Returns `Err(outcome)` with a
@@ -303,6 +318,7 @@ async fn maybe_start_plugin(
     svr_cfg: &mut ServerConfig,
     server_host: &str,
     cfg: &TestConfig,
+    pin: crate::dns::ech::PinSource,
 ) -> Result<Option<crate::proxy::plugin::PluginChain>, ServerTestOutcome> {
     let Some(plugin_name) = entry.plugin.as_ref() else {
         return Ok(None);
@@ -335,9 +351,9 @@ async fn maybe_start_plugin(
     #[allow(clippy::disallowed_methods)]
     // One-shot CLI probe: no caller-side cancel exists. See clippy.toml CancellationToken::new rule.
     let chain_cancel = CancellationToken::new();
-    // ech-doh = the first configured resolver's DoH URL, matching the bootstrap
-    // path; empty `dns.servers` ⇒ no ech-doh ⇒ ECH off.
-    let ech_doh = cfg.dns.servers.first().map(|ip| hole_common::doh_url(*ip));
+    // Same derivation as `start_cancellable` — see `dns::ech`.
+    let ech_doh = crate::dns::ech::ech_doh_url(&cfg.dns, pin);
+    debug!(ech_doh = ?ech_doh, ?pin, "ech-doh source");
     let chain = crate::proxy::plugin::start_plugin_chain(
         plugin_name,
         &plugin_path,
@@ -348,7 +364,7 @@ async fn maybe_start_plugin(
         None,
         false,
         &chain_cancel,
-        ech_doh.as_deref(),
+        ech_doh.as_ref(),
     )
     .await
     .map_err(|e| ServerTestOutcome::PluginStartFailed { detail: e.to_string() })?;

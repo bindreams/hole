@@ -24,12 +24,43 @@ use std::time::Instant;
 
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
-/// Per-stream byte counters and first-read timestamp. Cheap to clone
-/// (three `Arc` bumps).
+/// A cheap-to-clone (two `Arc` bumps) read/write byte-counter pair, with a
+/// manual `add_read`/`add_written` update API — for transports that don't go
+/// through a poll-based `AsyncRead`/`AsyncWrite` wrapper (e.g. a datagram
+/// socket's explicit `send`/`recv`) and so can't use [`CountingStream`].
+/// [`StreamCounters`] is built on this same primitive for the stream case.
 #[derive(Debug, Default, Clone)]
-pub struct StreamCounters {
+pub struct ByteCounters {
     read_bytes: Arc<AtomicU64>,
     write_bytes: Arc<AtomicU64>,
+}
+
+impl ByteCounters {
+    /// Record `n` more bytes read.
+    pub fn add_read(&self, n: u64) {
+        self.read_bytes.fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// Record `n` more bytes written.
+    pub fn add_written(&self, n: u64) {
+        self.write_bytes.fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// Total bytes read so far.
+    pub fn read(&self) -> u64 {
+        self.read_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Total bytes written so far.
+    pub fn written(&self) -> u64 {
+        self.write_bytes.load(Ordering::Relaxed)
+    }
+}
+
+/// Per-stream byte counters and first-read timestamp. Cheap to clone.
+#[derive(Debug, Default, Clone)]
+pub struct StreamCounters {
+    bytes: ByteCounters,
     /// Instant of the first non-zero `poll_read`. Set exactly once via
     /// `OnceLock::set`; subsequent reads do not update it. Use with the
     /// connection's `started` instant to compute time-to-first-upstream-byte.
@@ -39,12 +70,12 @@ pub struct StreamCounters {
 impl StreamCounters {
     /// Total bytes successfully read from the wrapped stream so far.
     pub fn read(&self) -> u64 {
-        self.read_bytes.load(Ordering::Relaxed)
+        self.bytes.read()
     }
 
     /// Total bytes successfully written to the wrapped stream so far.
     pub fn written(&self) -> u64 {
-        self.write_bytes.load(Ordering::Relaxed)
+        self.bytes.written()
     }
 
     /// `Instant` of the first non-zero read on the wrapped stream, if any.
@@ -85,7 +116,7 @@ impl<S: AsyncRead + Unpin> AsyncRead for CountingStream<S> {
         if let Poll::Ready(Ok(())) = &res {
             let delta = (buf.filled().len() - before) as u64;
             if delta > 0 {
-                self.counters.read_bytes.fetch_add(delta, Ordering::Relaxed);
+                self.counters.bytes.add_read(delta);
                 // OnceLock::set is no-op on subsequent calls — first wins.
                 let _ = self.counters.first_read_at.set(Instant::now());
             }
@@ -98,7 +129,7 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for CountingStream<S> {
     fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<std::io::Result<usize>> {
         let res = Pin::new(&mut self.inner).poll_write(cx, buf);
         if let Poll::Ready(Ok(n)) = &res {
-            self.counters.write_bytes.fetch_add(*n as u64, Ordering::Relaxed);
+            self.counters.bytes.add_written(*n as u64);
         }
         res
     }

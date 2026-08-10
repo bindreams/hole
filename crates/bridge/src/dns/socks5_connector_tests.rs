@@ -130,3 +130,46 @@ async fn udp_associate_returns_relay_address_from_reply() {
     let (_ctl, _udp, relay) = udp_associate(proxy).await.unwrap();
     assert_eq!(relay, SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 65300));
 }
+
+// Wire-level byte accounting ==========================================================================================
+
+/// A reply that arrives and then fails to parse is still proof something came
+/// back. The DNS self-test gate reads these counters to decide exactly that, so
+/// the wire read must be counted BEFORE the SOCKS5 header is interpreted —
+/// counting the parsed payload instead would report a tunnel that answered as
+/// silent.
+#[skuld::test]
+async fn a_reply_that_fails_to_parse_is_still_counted_as_read() {
+    // A relay that answers every datagram with a FRAG != 0 frame, which
+    // `parse_socks5_udp_header` rejects.
+    let relay = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let relay_port = relay.local_addr().unwrap().port();
+    let (got_tx, got_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let mut buf = [0u8; 1024];
+        let (_n, peer) = relay.recv_from(&mut buf).await.unwrap();
+        let frame = [SOCKS5_VER, 0, 1, SOCKS5_ATYP_IPV4, 1, 2, 3, 4, 0, 53, 0xAA, 0xBB];
+        relay.send_to(&frame, peer).await.unwrap();
+        let _ = got_tx.send(frame.len() as u64);
+    });
+
+    let proxy = start_udp_accepting_proxy(relay_port).await;
+    let socket = Socks5Connector::new(proxy)
+        .connect_udp("8.8.8.8:53".parse().unwrap())
+        .await
+        .expect("the stub proxy accepts ASSOCIATE");
+    let counters = socket.counters();
+
+    socket.send(b"query").await.expect("send");
+    let sent = got_rx.await.expect("the relay answered");
+    let mut buf = [0u8; 512];
+    let err = socket.recv(&mut buf).await.expect_err("the frame is fragmented");
+    assert!(format!("{err}").contains("ragmented"), "got: {err}");
+
+    assert_eq!(
+        counters.read(),
+        sent,
+        "the wire read must be counted even though the frame did not parse"
+    );
+    assert!(counters.written() > 0, "the query went out; got {}", counters.written());
+}

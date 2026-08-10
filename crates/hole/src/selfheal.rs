@@ -142,7 +142,19 @@ struct ProdOs {
 
 impl SelfHealOs for ProdOs {
     fn spawn_successor(&mut self) -> std::io::Result<()> {
-        crate::relaunch::spawn_successor(&self.exe)
+        use tauri::Manager;
+        // Read at the spawn, not earlier: the dashboard is mutated on the main
+        // thread while we run on a tokio worker, so a snapshot taken before the
+        // thread hop would discard a window opened in between. `current_label` is
+        // authoritative — `webview_windows` still lists a window between
+        // `CloseRequested` and the destroy, and not yet one between `allocate`
+        // and `build`.
+        let show_dashboard = self
+            .app
+            .state::<hole::dashboard::DashboardWindow>()
+            .current_label()
+            .is_some();
+        crate::relaunch::spawn_successor(&self.exe, show_dashboard)
     }
     fn show_reinstall_dialog(&mut self) {
         show_reinstall_dialog(&self.app);

@@ -37,18 +37,6 @@ import type { Config, DiagnosticsData, Metrics, ProxyStatus, Server, UiSettings 
 /// RAM and looks like a port scan from one IP to commercial SS providers.
 export const TEST_CONCURRENCY = 5;
 
-// Test seam: webdriver's `before` hook calls this to park until
-// `init()` has completed (success or failure). `withGlobalTauri: false`
-// strips `window.__TAURI__` from injected scripts, so this typed
-// global is the documented entry point. See
-// `crates/hole/src/ui_ready.rs`.
-declare global {
-  interface Window {
-    __holeUiReady?: () => Promise<{ ok: boolean; error: string | null }>;
-  }
-}
-window.__holeUiReady = () => invoke<{ ok: boolean; error: string | null }>("wait_ui_ready");
-
 // State ===============================================================================================================
 
 /** The current application config, loaded from the backend. */
@@ -436,37 +424,32 @@ async function init() {
     console.error(`init failed: ${msg}`);
     result = { ok: false, error: msg };
     // Toast may not be ready if init failed in its first two lines (before
-    // the OverlayScrollbars/load steps). Show the toast; on failure, fall
-    // back to a synchronous `alert()`. Both happen AFTER `signal_ui_ready`
-    // below — `alert()` is modal-blocking on Windows WebView2, and parking
-    // the JS event loop here would prevent the webdriver-side
-    // `wait_ui_ready` from observing the result.
-    queueMicrotask(() => {
-      try {
-        showToast(`Dashboard failed to initialize: ${msg}`, "error", 30_000);
-      } catch {
-        alert(`Hole dashboard failed to initialize: ${msg}`);
-      }
-    });
+    // the OverlayScrollbars/load steps). There is deliberately no modal
+    // fallback: `alert()` parks the WebView2 JS event loop, and the
+    // readiness handshake this failure has to travel through is in-page.
+    try {
+      showToast(`Dashboard failed to initialize: ${msg}`, "error", 30_000);
+    } catch (toastErr) {
+      console.error(`failed to show the init-failure toast: ${toastErr}`);
+    }
   }
 
-  // Always signal — even on init failure — so the webdriver test
-  // surfaces a real error instead of hanging on the watch channel.
-  // This MUST run before any modal UI (toast/alert) in the failure
-  // path; otherwise an alert dialog would park the JS event loop and
-  // wedge the webdriver session indefinitely.
-  try {
-    await invoke("signal_ui_ready", { result });
-  } catch (signalErr) {
-    // If the invoke itself fails the Tauri runtime is broken, which
-    // is an external-event-might-never-happen scenario. The webdriver
-    // test surfaces this via its framework timeout — there is no
-    // intra-process recovery available here.
-    logError(`signal_ui_ready failed: ${signalErr}`);
-  }
+  return result;
 }
 
-// Test seam: init() never rejects (its body is fully try/caught and the
-// trailing signal_ui_ready failure is logged, not thrown), so awaiting
-// this is a plain rendezvous on startup completion.
+// init() never rejects — its body is fully try/caught — so awaiting this is
+// a plain rendezvous on startup completion, success or failure.
 export const initDone = init();
+
+// Test seam: the webdriver readiness gate awaits this to park until `init()`
+// has settled in THIS document. Resolving off `initDone` (rather than a
+// backend latch) keeps the answer document-scoped: a reload cannot hand the
+// harness the previous document's result. `withGlobalTauri: false` strips
+// `window.__TAURI__` from injected scripts, so this typed global is the
+// documented entry point. See tests/webdriver/ui-ready.ts.
+declare global {
+  interface Window {
+    __holeUiReady?: () => Promise<{ ok: boolean; error: string | null }>;
+  }
+}
+window.__holeUiReady = () => initDone;
