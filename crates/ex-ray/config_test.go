@@ -1,16 +1,56 @@
 package main
 
 import (
+	"errors"
+	"flag"
 	"math"
+	"os"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
 	core "github.com/v2fly/v2ray-core/v5"
 	"github.com/v2fly/v2ray-core/v5/app/proxyman"
+	"github.com/v2fly/v2ray-core/v5/proxy/dokodemo"
+	"github.com/v2fly/v2ray-core/v5/transport/internet"
 	"github.com/v2fly/v2ray-core/v5/transport/internet/tls"
 	"github.com/v2fly/v2ray-core/v5/transport/internet/tls/utls"
 	"google.golang.org/protobuf/types/known/anypb"
 )
+
+// sentinelTestError is a distinct, named error type (unlike errors.New's
+// unexported concrete type) so errors.As below can prove it retrieves
+// this SPECIFIC underlying cause, not just any error in the chain --
+// errors.As against a bare `error`-typed target would trivially match
+// err itself without ever exercising Unwrap().
+type sentinelTestError struct{ msg string }
+
+func (e *sentinelTestError) Error() string { return e.msg }
+
+// redactedError exists specifically to let errors.Is/errors.As see through
+// to cause (needed by TestBuildV2RayMissingCertIsNotBindConflict's
+// fs.ErrNotExist check) while keeping Error() limited to msg. Both halves
+// of that contract are pinned directly here, not just exercised
+// incidentally through the sites that use it.
+func TestRedactedErrorUnwrapsToCauseWithoutEchoingItsText(t *testing.T) {
+	cause := &sentinelTestError{msg: "cause text: SUPERSECRETVALUE"}
+	err := &redactedError{msg: "redacted", cause: cause}
+
+	if got := err.Error(); got != "redacted" {
+		t.Errorf("Error() = %q, want %q", got, "redacted")
+	}
+	if strings.Contains(err.Error(), "SUPERSECRETVALUE") {
+		t.Errorf("Error() leaks the cause's text: %q", err.Error())
+	}
+	if !errors.Is(err, cause) {
+		t.Error("errors.Is(err, cause) = false, want true -- Unwrap must expose the cause")
+	}
+	var target *sentinelTestError
+	if !errors.As(err, &target) || target != cause {
+		t.Errorf("errors.As(err, &target): target = %v, want %v", target, cause)
+	}
+}
 
 func TestUint32OptInRange(t *testing.T) {
 	cases := []struct {
@@ -124,30 +164,6 @@ func withEchFlags(t *testing.T, modeV, dohV string) func() {
 	return func() { *echMode, *echDoh = origMode, origDoh }
 }
 
-// withEnv sets SS_PLUGIN_OPTIONS plus the four SS_* vars parseEnv gates on, for
-// the duration of the test (t.Setenv restores originals on cleanup). It also
-// snapshots and restores the address/port globals that a subsequent
-// parseOptsIntoFlags writes from SS_REMOTE_*/SS_LOCAL_*, so the restore boundary
-// matches the full mutation surface (withEchFlags only covers ech/ech-doh).
-func withEnv(t *testing.T, pluginOptions string) {
-	t.Helper()
-	origLocalAddr, origLocalPort := *localAddr, *localPort
-	origRemoteAddr, origRemotePort := *remoteAddr, *remotePort
-	t.Cleanup(func() {
-		*localAddr, *localPort = origLocalAddr, origLocalPort
-		*remoteAddr, *remotePort = origRemoteAddr, origRemotePort
-	})
-	for k, v := range map[string]string{
-		"SS_REMOTE_HOST":    "example.com",
-		"SS_REMOTE_PORT":    "443",
-		"SS_LOCAL_HOST":     "127.0.0.1",
-		"SS_LOCAL_PORT":     "1984",
-		"SS_PLUGIN_OPTIONS": pluginOptions,
-	} {
-		t.Setenv(k, v)
-	}
-}
-
 func TestEchFlagDefaults(t *testing.T) {
 	if *echMode != "auto" {
 		t.Errorf("ech flag default = %q, want %q", *echMode, "auto")
@@ -171,10 +187,16 @@ func TestParseOptsIntoFlagsEch(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.desc, func(t *testing.T) {
-			restore := withEchFlags(t, "auto", "")
-			defer restore()
+			// withEnv's snapshot must run before withEchFlags mutates
+			// echMode/echDoh, so its t.Cleanup restore (which runs after
+			// this func's own defers) captures the true pre-subtest state.
+			// withEchFlags's own returned restore func is deliberately left
+			// undeferred for the same reason.
 			withEnv(t, c.opts)
-			parseOptsIntoFlags()
+			withEchFlags(t, "auto", "")
+			if err := parseOptsIntoFlags(); err != nil {
+				t.Fatalf("parseOptsIntoFlags(): %v", err)
+			}
 			if *echMode != c.wantMode {
 				t.Errorf("%s: *echMode = %q, want %q", c.desc, *echMode, c.wantMode)
 			}
@@ -229,6 +251,42 @@ func TestBuildTLSConfigEch(t *testing.T) {
 				t.Errorf("%s: ServerName = %q, want SNI preserved", c.desc, tc.ServerName)
 			}
 		})
+	}
+}
+
+// A client-side pinned CA (certRaw, here) must set DisableSystemRoot on
+// Windows -- otherwise config_windows.go's getCertPool never applies the
+// pin at all and verification silently falls back to the system root
+// pool. Portable across CI platforms: asserts true on Windows, false
+// elsewhere (config_other.go already applies a supplied cert without the
+// flag, so setting it there is a separate, not-made-here decision).
+func TestBuildTLSConfigClientPinnedCADisablesSystemRootOnWindows(t *testing.T) {
+	restore := withFlags(t, 1, 0, false) // client mode
+	defer restore()
+	origCert, origCertRaw, origHost, origTLS := *cert, *certRaw, *host, *tlsEnabled
+	defer func() { *cert, *certRaw, *host, *tlsEnabled = origCert, origCertRaw, origHost, origTLS }()
+	*tlsEnabled = true
+	// readCertificate checks *cert first and only falls through to
+	// *certRaw when *cert is empty -- must be cleared explicitly so this
+	// test exercises the certRaw path it claims to, regardless of what an
+	// earlier test in the same binary left *cert holding.
+	*cert = ""
+
+	certPath, _ := writeSelfSignedCertKey(t, "example.com")
+	pem, err := os.ReadFile(certPath) //nolint:gosec // G304: certPath is this test's own t.TempDir() file, not external input.
+	if err != nil {
+		t.Fatalf("ReadFile(%q): %v", certPath, err)
+	}
+	*certRaw = strings.TrimSuffix(strings.TrimPrefix(string(pem), "-----BEGIN CERTIFICATE-----\n"), "-----END CERTIFICATE-----\n")
+	*host = "example.com"
+
+	tc, err := buildTLSConfig()
+	if err != nil {
+		t.Fatalf("buildTLSConfig(): %v", err)
+	}
+	want := runtime.GOOS == "windows"
+	if tc.DisableSystemRoot != want {
+		t.Errorf("DisableSystemRoot = %v, want %v (GOOS=%s)", tc.DisableSystemRoot, want, runtime.GOOS)
 	}
 }
 
@@ -352,5 +410,331 @@ func TestGenerateConfigKeepsPlainTLSForQuicClient(t *testing.T) {
 	tc := new(tls.Config)
 	if err := senderSecurity(t, cfg).UnmarshalTo(tc); err != nil {
 		t.Fatalf("quic client security must stay a bare tls.Config: %v", err)
+	}
+}
+
+// withKeepAliveFlag saves the tcp-keepalive global, applies a value, and returns
+// a restore func. Mirrors withFlags/withEchFlags: generateConfig and
+// registerTCPKeepAlive read this package-level pointer.
+func withKeepAliveFlag(t *testing.T, v int) func() {
+	t.Helper()
+	orig := *tcpKeepAlive
+	*tcpKeepAlive = v
+	return func() { *tcpKeepAlive = orig }
+}
+
+// outboundSocketConfig returns the SocketConfig generateConfig puts on the
+// client outbound, or nil when there is no outbound sender (server mode).
+func outboundSocketConfig(t *testing.T) *internet.SocketConfig {
+	t.Helper()
+	cfg, err := generateConfig()
+	if err != nil {
+		t.Fatalf("generateConfig: %v", err)
+	}
+	if cfg.Outbound[0].SenderSettings == nil {
+		return nil
+	}
+	sender := new(proxyman.SenderConfig)
+	if err := cfg.Outbound[0].SenderSettings.UnmarshalTo(sender); err != nil {
+		t.Fatalf("unmarshal sender settings: %v", err)
+	}
+	if sender.StreamSettings == nil {
+		return nil
+	}
+	return sender.StreamSettings.SocketSettings
+}
+
+// inboundSocketConfig returns the SocketConfig on the server-mode inbound
+// receiver. Server mode puts streamConfig there, NOT on an outbound sender, so
+// this is the surface a server-mode keepalive leak would show up on.
+func inboundSocketConfig(t *testing.T) *internet.SocketConfig {
+	t.Helper()
+	cfg, err := generateConfig()
+	if err != nil {
+		t.Fatalf("generateConfig: %v", err)
+	}
+	receiver := new(proxyman.ReceiverConfig)
+	if err := cfg.Inbound[0].ReceiverSettings.UnmarshalTo(receiver); err != nil {
+		t.Fatalf("unmarshal receiver settings: %v", err)
+	}
+	if receiver.StreamSettings == nil {
+		return nil
+	}
+	return receiver.StreamSettings.SocketSettings
+}
+
+func TestTCPKeepAliveDefaultIsFifteen(t *testing.T) {
+	// flag.Lookup reads the registered default, so this is immune to the other
+	// tests in this binary mutating *tcpKeepAlive.
+	if got := flag.Lookup("tcp-keepalive").DefValue; got != "15" {
+		t.Errorf("tcp-keepalive default = %q, want \"15\"", got)
+	}
+}
+
+func TestTCPKeepAliveParams(t *testing.T) {
+	for _, bad := range []int{-1, 32768} {
+		restore := withKeepAliveFlag(t, bad)
+		_, err := tcpKeepAliveParams()
+		restore()
+		if err == nil {
+			t.Errorf("tcpKeepAliveParams() with %d = nil error, want out-of-range error", bad)
+		}
+	}
+
+	restore := withKeepAliveFlag(t, 0)
+	got, err := tcpKeepAliveParams()
+	restore()
+	if err != nil {
+		t.Fatalf("tcpKeepAliveParams() with 0 returned error: %v", err)
+	}
+	if got.enabled() {
+		t.Errorf("tcpKeepAliveParams() with 0 = %+v, want disabled", got)
+	}
+
+	// The accepted side of the fencepost, so a `>=` typo in the bound check
+	// cannot pass with only the 32768 rejection covered.
+	restore = withKeepAliveFlag(t, keepAliveMaxSeconds)
+	got, err = tcpKeepAliveParams()
+	restore()
+	if err != nil {
+		t.Fatalf("tcpKeepAliveParams() with %d returned error: %v", keepAliveMaxSeconds, err)
+	}
+	if got.IdleSeconds != keepAliveMaxSeconds {
+		t.Errorf("tcpKeepAliveParams() with %d = %+v, want IdleSeconds %d", keepAliveMaxSeconds, got, keepAliveMaxSeconds)
+	}
+
+	restore = withKeepAliveFlag(t, 15)
+	got, err = tcpKeepAliveParams()
+	restore()
+	if err != nil {
+		t.Fatalf("tcpKeepAliveParams() with 15 returned error: %v", err)
+	}
+	if want := (keepAliveParams{IdleSeconds: 15, IntervalSeconds: 15, Probes: 3}); got != want {
+		t.Errorf("tcpKeepAliveParams() = %+v, want %+v", got, want)
+	}
+}
+
+func TestTCPKeepAliveReachesSocketConfig(t *testing.T) {
+	restore := withKeepAliveFlag(t, 15)
+	sock := outboundSocketConfig(t)
+	restore()
+	if sock == nil {
+		t.Fatal("outbound SocketConfig is nil; the keepalive fields must force one to exist")
+	}
+	if sock.TcpKeepAliveIdle != 15 || sock.TcpKeepAliveInterval != 15 {
+		t.Errorf("idle/interval = %d/%d, want 15/15", sock.TcpKeepAliveIdle, sock.TcpKeepAliveInterval)
+	}
+
+	// tcp-keepalive=0 must disable Go's own keepalive too, not merely skip
+	// ex-ray's; see the sentinel comment in config.go for why a negative value
+	// is what does that.
+	restore = withKeepAliveFlag(t, 0)
+	sock = outboundSocketConfig(t)
+	restore()
+	if sock == nil || sock.TcpKeepAliveIdle >= 0 {
+		t.Fatalf("SocketConfig with tcp-keepalive=0 = %+v, want a negative TcpKeepAliveIdle sentinel", sock)
+	}
+}
+
+// Server mode puts streamConfig on the INBOUND receiver, where a keepalive
+// field would strip Go's own keepalive from every accepted connection
+// (DefaultListener sets lc.KeepAlive = -1 and no dialer controller reaches a
+// listener). Asserting on the outbound would be vacuous: server mode builds no
+// outbound sender at all.
+func TestTCPKeepAliveSkippedInServerMode(t *testing.T) {
+	restoreFlags := withFlags(t, 1, 0, true)
+	restoreKA := withKeepAliveFlag(t, 15)
+	sock := inboundSocketConfig(t)
+	regErr := registerTCPKeepAlive()
+	restoreKA()
+	restoreFlags()
+
+	if sock != nil && (sock.TcpKeepAliveIdle != 0 || sock.TcpKeepAliveInterval != 0) {
+		t.Errorf("server mode inbound SocketConfig = %+v, want no keepalive fields", sock)
+	}
+	if regErr != nil {
+		t.Errorf("registerTCPKeepAlive() in server mode = %v, want nil", regErr)
+	}
+}
+
+// registerTCPKeepAlive short-circuits before validating in server mode, so
+// generateConfig is the only gate that rejects an out-of-range value there.
+func TestGenerateConfigRejectsOutOfRangeKeepAlive(t *testing.T) {
+	for _, srv := range []bool{false, true} {
+		restoreFlags := withFlags(t, 1, 0, srv)
+		restoreKA := withKeepAliveFlag(t, 32768)
+		_, err := generateConfig()
+		restoreKA()
+		restoreFlags()
+		if err == nil {
+			t.Errorf("server=%v: generateConfig() with tcp-keepalive=32768 = nil error, want out-of-range error", srv)
+			continue
+		}
+		if !strings.Contains(err.Error(), "tcp-keepalive") {
+			t.Errorf("server=%v: error %q does not mention tcp-keepalive", srv, err.Error())
+		}
+	}
+}
+
+// The declared default is what makes galoshes' appended mux=0 necessary at all.
+func TestMuxFlagDefault(t *testing.T) {
+	if *mux != 1 {
+		t.Errorf("mux flag default = %d, want 1", *mux)
+	}
+}
+
+// The same property for buildTLSConfig's cert/key read-failure sites --
+// cert, key, and host (via the ~/.acme.sh/{host}/... default path
+// construction) are all reachable from SS_PLUGIN_OPTIONS, and a missing
+// file's os.PathError text would otherwise embed the raw path verbatim.
+func TestBuildTLSConfigCertKeyErrorsNeverEchoOptionValues(t *testing.T) {
+	restore := withFlags(t, 1, 0, true) // server mode
+	defer restore()
+	origCert, origKey, origHost, origTLS := *cert, *key, *host, *tlsEnabled
+	defer func() { *cert, *key, *host, *tlsEnabled = origCert, origKey, origHost, origTLS }()
+	*tlsEnabled = true
+
+	// cert points at a nonexistent path carrying an absorbed secret.
+	*cert, *key, *host = `/nope\;certRaw=SUPERSECRETVALUE`, "", "example.com"
+	if _, err := buildTLSConfig(); err == nil || strings.Contains(err.Error(), "SUPERSECRETVALUE") {
+		t.Errorf("cert error = %v, want a non-nil error not containing the secret", err)
+	}
+
+	// key points at a nonexistent path carrying an absorbed secret; cert
+	// must be a real, readable file so the flow reaches the key read.
+	certPath, _ := writeSelfSignedCertKey(t, "example.com")
+	*cert, *key, *host = certPath, `/nope\;certRaw=SUPERSECRETVALUE`, "example.com"
+	if _, err := buildTLSConfig(); err == nil || strings.Contains(err.Error(), "SUPERSECRETVALUE") {
+		t.Errorf("key error = %v, want a non-nil error not containing the secret", err)
+	}
+
+	// host feeds the default ~/.acme.sh/{host}/... cert path when neither
+	// cert nor certRaw is given.
+	*cert, *key, *host = "", "", `nosuchhost.invalid\;certRaw=SUPERSECRETVALUE`
+	if _, err := buildTLSConfig(); err == nil || strings.Contains(err.Error(), "SUPERSECRETVALUE") {
+		t.Errorf("host-derived cert path error = %v, want a non-nil error not containing the secret", err)
+	}
+}
+
+// A readable cert/key pair that isn't a valid X509 key pair is otherwise
+// never caught before ready: v2ray-core's own BuildCertificates logs
+// "ignoring invalid X509 key pair" at Warning and silently drops it,
+// leaving zero certificates configured (TLS handshakes then fail with no
+// diagnostic ever reaching the sitrep) rather than failing to start.
+func TestBuildTLSConfigServerRejectsInvalidX509KeyPair(t *testing.T) {
+	restore := withFlags(t, 1, 0, true) // server mode
+	defer restore()
+	origCert, origKey, origHost, origTLS := *cert, *key, *host, *tlsEnabled
+	defer func() { *cert, *key, *host, *tlsEnabled = origCert, origKey, origHost, origTLS }()
+	*tlsEnabled = true
+
+	dir := t.TempDir()
+	garbageCertPath := filepath.Join(dir, "garbage-cert.pem")
+	garbageKeyPath := filepath.Join(dir, "garbage-key.pem")
+	writePEMFile(t, garbageCertPath, "CERTIFICATE", []byte("not a real certificate"))
+	writePEMFile(t, garbageKeyPath, "PRIVATE KEY", []byte("not a real key"))
+
+	realCertPath, realKeyPath := writeSelfSignedCertKey(t, "example.com")
+
+	*cert, *key, *host = garbageCertPath, realKeyPath, "example.com"
+	if _, err := buildTLSConfig(); err == nil {
+		t.Error("garbage cert, valid key: buildTLSConfig() = nil error, want an error mentioning X509")
+	} else if !strings.Contains(err.Error(), "X509") {
+		t.Errorf("garbage cert, valid key: error %q does not mention X509", err.Error())
+	}
+
+	*cert, *key, *host = realCertPath, garbageKeyPath, "example.com"
+	if _, err := buildTLSConfig(); err == nil {
+		t.Error("valid cert, garbage key: buildTLSConfig() = nil error, want an error mentioning X509")
+	} else if !strings.Contains(err.Error(), "X509") {
+		t.Errorf("valid cert, garbage key: error %q does not mention X509", err.Error())
+	}
+}
+
+// The client-side pinned-CA equivalent: an unparseable PEM cert is
+// otherwise never caught before ready either -- v2ray-core's GetTLSConfig
+// only logs AppendCertsFromPEM's failure and leaves RootCAs nil, silently
+// falling back to the system root pool instead of the operator's pinned
+// CA.
+func TestBuildTLSConfigClientRejectsInvalidPEMCert(t *testing.T) {
+	restore := withFlags(t, 1, 0, false) // client mode
+	defer restore()
+	origCert, origCertRaw, origHost, origTLS := *cert, *certRaw, *host, *tlsEnabled
+	defer func() { *cert, *certRaw, *host, *tlsEnabled = origCert, origCertRaw, origHost, origTLS }()
+	*tlsEnabled = true
+	*cert = ""
+
+	dir := t.TempDir()
+	garbageCertPath := filepath.Join(dir, "garbage-cert.pem")
+	writePEMFile(t, garbageCertPath, "CERTIFICATE", []byte("not a real certificate"))
+
+	*cert, *host = garbageCertPath, "example.com"
+	_, err := buildTLSConfig()
+	if err == nil {
+		t.Fatal("buildTLSConfig() = nil error, want an error mentioning PEM")
+	}
+	if !strings.Contains(err.Error(), "PEM") {
+		t.Errorf("error %q does not mention PEM", err.Error())
+	}
+}
+
+// The same property for buildTLSConfig's invalid-ech-mode site, which
+// needs tlsEnabled=true to reach (TestBuildTLSConfigEch's own precondition).
+func TestBuildTLSConfigEchErrorNeverEchoesValue(t *testing.T) {
+	restore := withEchFlags(t, `abc\;certRaw=SUPERSECRETVALUE`, "")
+	defer restore()
+	origHost, origTLS := *host, *tlsEnabled
+	*host, *tlsEnabled = "example.com", true
+	defer func() { *host, *tlsEnabled = origHost, origTLS }()
+
+	if _, err := buildTLSConfig(); err == nil || strings.Contains(err.Error(), "SUPERSECRETVALUE") {
+		t.Errorf("buildTLSConfig() error = %v, want a non-nil error not containing the secret", err)
+	}
+}
+
+// mux=0 must disable Mux.Cool on BOTH ends of a websocket chain: the client
+// stops attaching MultiplexSettings, and the server stops pointing dokodemo at
+// the v1.mux.cool sentinel. The server half is why a mux=0 client cannot talk
+// to a mux=1 server.
+func TestGenerateConfigMuxDisablesMultiplexing(t *testing.T) {
+	cases := []struct {
+		desc          string
+		mux           int
+		wantMultiplex bool
+		wantSrvAddr   string
+	}{
+		{"mux=1 keeps Mux.Cool", 1, true, "v1.mux.cool"},
+		{"mux=0 disables Mux.Cool", 0, false, "127.0.0.1"},
+	}
+	for _, c := range cases {
+		t.Run(c.desc, func(t *testing.T) {
+			restore := withFlags(t, c.mux, 0, false)
+			clientCfg, err := generateConfig()
+			restore()
+			if err != nil {
+				t.Fatalf("client generateConfig(): %v", err)
+			}
+			sender := new(proxyman.SenderConfig)
+			if err := clientCfg.Outbound[0].SenderSettings.UnmarshalTo(sender); err != nil {
+				t.Fatalf("unmarshal sender settings: %v", err)
+			}
+			if got := sender.MultiplexSettings != nil; got != c.wantMultiplex {
+				t.Errorf("client: MultiplexSettings present = %v, want %v", got, c.wantMultiplex)
+			}
+
+			restore = withFlags(t, c.mux, 0, true)
+			serverCfg, err := generateConfig()
+			restore()
+			if err != nil {
+				t.Fatalf("server generateConfig(): %v", err)
+			}
+			dk := new(dokodemo.Config)
+			if err := serverCfg.Inbound[0].ProxySettings.UnmarshalTo(dk); err != nil {
+				t.Fatalf("unmarshal dokodemo settings: %v", err)
+			}
+			if got := dk.Address.AsAddress().String(); got != c.wantSrvAddr {
+				t.Errorf("server: dokodemo address = %q, want %q", got, c.wantSrvAddr)
+			}
+		})
 	}
 }

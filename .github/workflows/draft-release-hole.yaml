@@ -19,6 +19,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.version.outputs.version }}
+      matrix: ${{ steps.matrix.outputs.matrix }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -40,6 +41,13 @@ jobs:
       - name: Validate Cargo.toml matches version
         run: cargo xtask version --check --exact --group hole
 
+      # Single definition of the build matrix, consumed by both the
+      # `build` job's strategy and the `release` job's Downloads table.
+      - name: Define build matrix
+        id: matrix
+        run: |
+          echo 'matrix=[{"os":"windows","arch":"amd64","runner":"windows-latest","ext":"msi"},{"os":"darwin","arch":"arm64","runner":"macos-latest","ext":"dmg"},{"os":"darwin","arch":"amd64","runner":"macos-15-intel","ext":"dmg"}]' >> "$GITHUB_OUTPUT"
+
   build:
     name: Build (${{ matrix.os }}/${{ matrix.arch }})
     needs: validate
@@ -47,10 +55,7 @@ jobs:
     strategy:
       fail-fast: true
       matrix:
-        include:
-          - { os: windows, arch: amd64, runner: windows-latest, ext: msi }
-          - { os: darwin,  arch: arm64, runner: macos-latest,   ext: dmg }
-          - { os: darwin,  arch: amd64, runner: macos-15-intel, ext: dmg }
+        include: ${{ fromJSON(needs.validate.outputs.matrix) }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -61,7 +66,7 @@ jobs:
 
       # Required by both bundle builds — hole-msi (Windows) and hole-dmg
       # (Darwin dmg-installer) — so it must run on every matrix target.
-      - uses: astral-sh/setup-uv@v8.3.2
+      - uses: astral-sh/setup-uv@v9.0.0
 
       - uses: ./.github/actions/setup-build
 
@@ -100,19 +105,12 @@ jobs:
           cargo xtask update-archive --out "$ARCHIVE"
           echo "Archive: $ARCHIVE"
 
-      - name: Verify Windows archive contents
-        if: matrix.os == 'windows'
+      - name: Verify archive contents
         shell: bash
         run: |
           VERSION="${{ needs.validate.outputs.version }}"
           ARCHIVE="hole-${VERSION}-$(cargo xtask asset-suffix)"
-          workdir="$(mktemp -d)"
-          unzip -q "$ARCHIVE" -d "$workdir"
-          # Derive the expected set from the single source of truth.
-          cargo xtask bindir-names --os windows | jq -r '.[]' | while read -r f; do
-            test -s "$workdir/$f" || { echo "::error::missing/empty $f in $ARCHIVE"; exit 1; }
-          done
-          echo "Windows archive contents verified"
+          cargo xtask verify-update-archive --archive "$ARCHIVE"
 
       - name: Verify macOS archive app is runnable (codesign)
         if: matrix.os == 'darwin'
@@ -168,7 +166,7 @@ jobs:
           # `path: source` so we don't clobber the downloaded artifacts in $GITHUB_WORKSPACE.
           path: source
 
-      - uses: astral-sh/setup-uv@v8.3.2
+      - uses: astral-sh/setup-uv@v9.0.0
 
       - name: Generate per-track release notes
         run: |
@@ -178,6 +176,8 @@ jobs:
             --new-tag "$TAG" \
             --head "${{ github.sha }}" \
             --repo-root source \
+            --platforms '${{ needs.validate.outputs.matrix }}' \
+            --version "$VERSION" \
             > release-notes.md
           echo "--- release-notes.md ---"
           cat release-notes.md

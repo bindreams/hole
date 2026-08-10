@@ -57,30 +57,38 @@ fn all_keys_parse_as_ip() {
     }
 }
 
-// This DoT/SNI table and hole_common's DoH-URL table are maintained by hand as
-// two tables (this one carries the extra tls_dns_name); they must cover the same
-// provider IPs and agree on each doh_url. Drift is otherwise silent: an IP here
-// but missing from hole_common makes `doh_url` fall back to a literal-IP URL that
-// is WRONG for the hostname-based providers (OpenDNS, AdGuard).
+// The table drives DoT SNI and the DoH `Host:`/certificate check
+// (`tls_server_name_for` / `https_target_for`), so a mistyped or dropped IP
+// silently downgrades a hostname-verified channel to IP-SAN verification. Pin
+// the set explicitly — the same resolvers `ui/settings.ts` offers as presets.
 #[skuld::test]
-fn provider_table_agrees_with_hole_common() {
+fn the_table_covers_exactly_the_shipped_resolver_ips() {
     use std::collections::BTreeSet;
 
-    let here: BTreeSet<IpAddr> = TABLE
+    let expected: BTreeSet<IpAddr> = [
+        "1.1.1.1",
+        "1.0.0.1",
+        "2606:4700:4700::1111",
+        "2606:4700:4700::1001",
+        "8.8.8.8",
+        "8.8.4.4",
+        "2001:4860:4860::8888",
+        "2001:4860:4860::8844",
+        "9.9.9.9",
+        "149.112.112.112",
+        "2620:fe::fe",
+        "2620:fe::9",
+        "208.67.222.222",
+        "208.67.220.220",
+        "94.140.14.14",
+        "94.140.15.15",
+    ]
+    .iter()
+    .map(|a| a.parse().expect("expected IP literal"))
+    .collect();
+    let actual: BTreeSet<IpAddr> = TABLE
         .iter()
         .map(|(addr, _)| addr.parse().expect("table IP literal"))
         .collect();
-    let common: BTreeSet<IpAddr> = hole_common::dns_providers::provider_ips().collect();
-    assert_eq!(here, common, "provider IP sets have drifted from hole_common");
-
-    for (addr, provider) in TABLE {
-        let ip = addr.parse::<IpAddr>().unwrap();
-        assert_eq!(
-            hole_common::doh_url(ip),
-            provider.doh_url,
-            "doh_url for {ip} disagrees: bridge={}, hole_common={}",
-            provider.doh_url,
-            hole_common::doh_url(ip),
-        );
-    }
+    assert_eq!(actual, expected, "the provider IP set changed");
 }

@@ -32,6 +32,16 @@
 //! WITHOUT updating `.config/nextest.toml` drops the test from the group → a
 //! silent cross-binary race with the bridge's live-egress
 //! `e2e_none_full_tunnel_roundtrip`. Change both together.
+//!
+//! The permitted/resolver/non-permitted targets MUST be addresses this host
+//! does NOT itself own (see `RESOLVER`'s doc for why a self-served target is
+//! unsound here: on macOS/BSD it would be silently exempted by `set skip on
+//! lo0` regardless of whether the resolver rule works at all). That leaves a
+//! residual live-network dependency; `RESOLVER` is picked to share PERMITTED's
+//! proven-reliable anycast network rather than eliminate it, and the
+//! resolver-permit assertions cross-check against PERMITTED at the same
+//! instant so a failure here is not blindly reported as "the permit failed"
+//! when it could be a general outage instead.
 
 use super::*;
 
@@ -44,6 +54,28 @@ const TUN: skuld::Label;
 // block holds.
 #[cfg(any(target_os = "windows", target_os = "macos"))]
 const PERMITTED: &str = "1.1.1.1:443";
+// A third routable anycast host, standing in for the pinned DoH resolver.
+// Cloudflare's SECONDARY address (1.0.0.1, distinct from PERMITTED's 1.1.1.1)
+// rather than Quad9 (9.9.9.9): `macos_failclosed_permits_resolver_blocks_other_egress`
+// flaked TimedOut against 9.9.9.9 on the darwin/amd64 CI runner (darwin/arm64
+// and every other lane were unaffected), and PERMITTED=1.1.1.1 has never once
+// flaked across the SAME runner in the SAME file — same anycast network,
+// same edge presence, empirically the reliable choice on this infrastructure.
+// A residual live-network dependency remains (see this module's doc for why
+// a fully self-served target is NOT used instead: on macOS/BSD, a connect to
+// ANY address the host itself owns -- primary or aliased -- is routed via an
+// automatic host route through `lo0` before it ever reaches the real
+// interface, and this ruleset's `set skip on lo0` would silently exempt it,
+// making the permit assertion pass regardless of whether the resolver rule
+// works at all).
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+const RESOLVER: &str = "1.0.0.1:443";
+// The SAME resolver host, but on its DNS-over-TLS port rather than 443 —
+// Cloudflare serves both. Proves the resolver permit is scoped to TCP/443,
+// not the whole IP: a permit that (wrongly) covered every port on RESOLVER
+// would let this through too.
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+const RESOLVER_OTHER_PORT: &str = "1.0.0.1:853";
 #[cfg(any(target_os = "windows", target_os = "macos"))]
 const NON_PERMITTED: &str = "8.8.8.8:443";
 
@@ -236,7 +268,7 @@ fn windows_failclosed_permits_server_blocks_other_egress() {
         bn.err().map(|e| e.kind()),
     );
 
-    let cover = engage(server_ip, dir.path(), None).expect("engage real WFP transient cover");
+    let cover = engage(server_ip, None, dir.path(), None).expect("engage real WFP transient cover");
 
     let (p, n) = (connect(PERMITTED), connect(NON_PERMITTED));
     assert!(
@@ -254,6 +286,82 @@ fn windows_failclosed_permits_server_blocks_other_egress() {
         connect(NON_PERMITTED).is_ok(),
         "disengage must restore egress: {NON_PERMITTED}={:?}",
         connect(NON_PERMITTED).err().map(|e| e.kind()),
+    );
+}
+
+/// Real-engage verification that the OPTIONAL resolver permit is
+/// real and selective: with `resolver_ip = Some`, both the server AND the
+/// resolver stay reachable while a THIRD, non-permitted host is still
+/// blocked — proving the widening is exactly one address, not a leak. Also
+/// proves the permit is scoped to TCP/443, not the whole resolver IP: the
+/// SAME resolver on a different port stays blocked.
+#[cfg(target_os = "windows")]
+#[skuld::test(labels = [TUN], serial = TUN)]
+fn windows_failclosed_permits_resolver_blocks_other_egress() {
+    use std::net::TcpStream;
+    use std::time::Duration;
+
+    let dir = tempfile::tempdir().unwrap();
+    let server_ip: std::net::IpAddr = "1.1.1.1".parse().unwrap();
+    let resolver_ip: std::net::IpAddr = "1.0.0.1".parse().unwrap();
+
+    let connect = |addr: &str| TcpStream::connect_timeout(&addr.parse().unwrap(), Duration::from_secs(5));
+
+    let (bp, br, bpo, bn) = (
+        connect(PERMITTED),
+        connect(RESOLVER),
+        connect(RESOLVER_OTHER_PORT),
+        connect(NON_PERMITTED),
+    );
+    assert!(
+        bp.is_ok() && br.is_ok() && bpo.is_ok() && bn.is_ok(),
+        "NETWORK/ENVIRONMENT problem (not the cover): baseline egress must reach all hosts; \
+         {PERMITTED}={:?} {RESOLVER}={:?} {RESOLVER_OTHER_PORT}={:?} {NON_PERMITTED}={:?}",
+        bp.err().map(|e| e.kind()),
+        br.err().map(|e| e.kind()),
+        bpo.err().map(|e| e.kind()),
+        bn.err().map(|e| e.kind()),
+    );
+
+    let cover = engage(server_ip, Some(resolver_ip), dir.path(), None)
+        .expect("engage real WFP transient cover with a resolver permit");
+
+    let (p, r, po, n) = (
+        connect(PERMITTED),
+        connect(RESOLVER),
+        connect(RESOLVER_OTHER_PORT),
+        connect(NON_PERMITTED),
+    );
+    assert!(
+        p.is_ok(),
+        "server-IP permit must beat block-all: {PERMITTED}={:?}",
+        p.err().map(|e| e.kind())
+    );
+    assert!(
+        r.is_ok(),
+        "resolver-IP permit must beat block-all: {RESOLVER}={:?} -- PERMITTED ({PERMITTED}) was {} at the \
+         same instant, so if it was reachable this is very unlikely to be a general network outage rather \
+         than a real block; if it also failed, treat this as NETWORK/ENVIRONMENT, not the cover",
+        r.err().map(|e| e.kind()),
+        if p.is_ok() { "reachable" } else { "ALSO unreachable" },
+    );
+    assert!(
+        po.is_err(),
+        "the resolver permit must be scoped to TCP/443, not the whole IP (leak!): \
+         {RESOLVER_OTHER_PORT} connected"
+    );
+    assert!(
+        n.is_err(),
+        "a third, non-permitted host must still be blocked (leak!): {NON_PERMITTED} connected"
+    );
+
+    drop(cover);
+    let (rn, rpo) = (connect(NON_PERMITTED), connect(RESOLVER_OTHER_PORT));
+    assert!(
+        rn.is_ok() && rpo.is_ok(),
+        "disengage must restore egress: {NON_PERMITTED}={:?} {RESOLVER_OTHER_PORT}={:?}",
+        rn.err().map(|e| e.kind()),
+        rpo.err().map(|e| e.kind()),
     );
 }
 
@@ -282,7 +390,7 @@ fn macos_failclosed_permits_server_blocks_other_egress() {
         bn.err().map(|e| e.kind()),
     );
 
-    let cover = engage(server_ip, dir.path(), None).expect("engage real pf transient cover");
+    let cover = engage(server_ip, None, dir.path(), None).expect("engage real pf transient cover");
 
     // (a) The live ruleset carries our block-all.
     let sr = Command::new("pfctl").args(["-sr"]).output().unwrap();
@@ -309,5 +417,86 @@ fn macos_failclosed_permits_server_blocks_other_egress() {
         connect(NON_PERMITTED).is_ok(),
         "disengage must restore egress: {NON_PERMITTED}={:?}",
         connect(NON_PERMITTED).err().map(|e| e.kind()),
+    );
+}
+
+/// macOS counterpart of `windows_failclosed_permits_resolver_blocks_other_egress`.
+/// Also proves the permit is scoped to TCP/443, not the whole resolver IP: the
+/// SAME resolver on a different port stays blocked.
+#[cfg(target_os = "macos")]
+#[skuld::test(labels = [TUN], serial = TUN)]
+fn macos_failclosed_permits_resolver_blocks_other_egress() {
+    use std::net::TcpStream;
+    use std::process::Command;
+    use std::time::Duration;
+
+    let dir = tempfile::tempdir().unwrap();
+    let server_ip: std::net::IpAddr = "1.1.1.1".parse().unwrap();
+    let resolver_ip: std::net::IpAddr = "1.0.0.1".parse().unwrap();
+
+    let connect = |addr: &str| TcpStream::connect_timeout(&addr.parse().unwrap(), Duration::from_secs(5));
+
+    let (bp, br, bpo, bn) = (
+        connect(PERMITTED),
+        connect(RESOLVER),
+        connect(RESOLVER_OTHER_PORT),
+        connect(NON_PERMITTED),
+    );
+    assert!(
+        bp.is_ok() && br.is_ok() && bpo.is_ok() && bn.is_ok(),
+        "NETWORK/ENVIRONMENT problem (not the cover): baseline egress must reach all hosts; \
+         {PERMITTED}={:?} {RESOLVER}={:?} {RESOLVER_OTHER_PORT}={:?} {NON_PERMITTED}={:?}",
+        bp.err().map(|e| e.kind()),
+        br.err().map(|e| e.kind()),
+        bpo.err().map(|e| e.kind()),
+        bn.err().map(|e| e.kind()),
+    );
+
+    let cover = engage(server_ip, Some(resolver_ip), dir.path(), None)
+        .expect("engage real pf transient cover with a resolver permit");
+
+    let sr = Command::new("pfctl").args(["-sr"]).output().unwrap();
+    let rules = String::from_utf8_lossy(&sr.stdout);
+    assert!(
+        rules.contains("1.0.0.1"),
+        "live ruleset must carry the resolver permit:\n{rules}"
+    );
+
+    let (p, r, po, n) = (
+        connect(PERMITTED),
+        connect(RESOLVER),
+        connect(RESOLVER_OTHER_PORT),
+        connect(NON_PERMITTED),
+    );
+    assert!(
+        p.is_ok(),
+        "server-IP permit must beat block-all: {PERMITTED}={:?}",
+        p.err().map(|e| e.kind())
+    );
+    assert!(
+        r.is_ok(),
+        "resolver-IP permit must beat block-all: {RESOLVER}={:?} -- PERMITTED ({PERMITTED}) was {} at the \
+         same instant, so if it was reachable this is very unlikely to be a general network outage rather \
+         than a real block; if it also failed, treat this as NETWORK/ENVIRONMENT, not the cover",
+        r.err().map(|e| e.kind()),
+        if p.is_ok() { "reachable" } else { "ALSO unreachable" },
+    );
+    assert!(
+        po.is_err(),
+        "the resolver permit must be scoped to TCP/443, not the whole IP (leak!): \
+         {RESOLVER_OTHER_PORT} connected"
+    );
+    assert!(
+        n.is_err(),
+        "a third, non-permitted host must still be blocked (leak!): {NON_PERMITTED} connected"
+    );
+
+    drop(cover);
+    let (rn, rpo) = (connect(NON_PERMITTED), connect(RESOLVER_OTHER_PORT));
+    assert!(
+        rn.is_ok() && rpo.is_ok(),
+        "disengage must restore egress: {NON_PERMITTED}={:?} {RESOLVER_OTHER_PORT}={:?}",
+        rn.err().map(|e| e.kind()),
+        rpo.err().map(|e| e.kind()),
     );
 }

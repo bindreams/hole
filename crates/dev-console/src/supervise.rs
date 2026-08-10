@@ -481,7 +481,6 @@ async fn startup_and_supervise(
         note!("{}", webview_debug_hint());
     }
     let mut cmd = Command::new(gui_bin);
-    cmd.arg("--show-dashboard");
     cmd.env("HOLE_BRIDGE_SOCKET", socket_path);
     cmd.env("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS", webview_args);
     for (k, v) in crate::policy::dev_run_child_env(run_dir, crate::policy::DEV_RUN_STDERR_GUI) {

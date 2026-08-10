@@ -20,10 +20,10 @@ jobs:
         with:
           fetch-depth: 0
 
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.x"
-      - uses: astral-sh/setup-uv@v8.3.2
+      - uses: astral-sh/setup-uv@v9.0.0
 
       - uses: ./.github/actions/setup-build
 
@@ -36,6 +36,14 @@ jobs:
       # SKIP=cargo-clippy lives in the prek target's `run.environment:`.
       - name: Run linters
         run: cargo xtask run prek
+
+      # `scripts/*.py` keep their tests inline, and the filenames are
+      # hyphenated, so pytest's default `test_*.py` collection finds nothing —
+      # which is why sign-release.py's stale asset-count check reached a release
+      # unnoticed (#682). `python_files` collects every script rather than a
+      # hand-listed set, so a new script's tests run without touching CI.
+      - name: Test release scripts
+        run: uv run --with pytest --with PyYAML --with pathspec pytest -o python_files="*.py" scripts/
 
   # Per-platform build job: compiles clippy + test binaries once and publishes
   # them as a platform-scoped artifact (`build-<os>-<arch>`). Test jobs below
@@ -64,7 +72,7 @@ jobs:
 
       - uses: ./.github/actions/setup-build
 
-      - uses: cargo-bins/cargo-binstall@v1.21.0
+      - uses: cargo-bins/cargo-binstall@v1.21.1
 
       - name: Install nextest
         shell: bash
@@ -255,16 +263,39 @@ jobs:
   test-hole:
     name: Test hole (${{ matrix.os }}/${{ matrix.arch }})
     runs-on: ${{ matrix.runner }}
-    # 45min: the non-TUN pass provisions stock upstream v2ray-plugin and runs
-    # the cross-impl interop tests (~78s each).
-    timeout-minutes: 45
+    # Per-leg, because the legs differ by ~2x: one number would either
+    # under-budget darwin/amd64 or push every leg's hang-detection deadline out
+    # to suit the slowest. Whole-job wall clock, 38 runs per leg on `main`:
+    #
+    #   darwin/arm64   16m31s - 32m01s, 0 killed  -> 45
+    #   windows/amd64  23m48s - 42m06s, 0 killed  -> 60
+    #   darwin/amd64   22m22s - 44m28s, 8 killed  -> 90
+    #
+    # darwin/amd64's distribution is right-CENSORED by the 45min wall replaced
+    # here, so 44m28s is a floor, not a maximum. Reconstructing the killed runs
+    # from their phase timings puts the real requirement near 56min. 90
+    # clears the censored region so the true tail becomes observable; tighten
+    # once it is. windows/amd64 has never been killed but sits at 94% of the old
+    # wall, so it is raised too; darwin/arm64 has 29% margin and stays.
+    #
+    # The macOS TUN step's own rebuild is gone (its feature set now matches), so
+    # the darwin measurements above predate that — re-measure those legs before
+    # tightening. windows/amd64 is unaffected; its TUN step already matched. The
+    # `hole` → `hole-tests` cascade still recompiles the shared crates (#723).
+    #
+    # The `ci_installer_assembly_jobs_share_a_timeout_budget` conformance test
+    # does not cover these: it selects jobs whose xtask cascade reaches a
+    # `uv run --directory <name>-installer build` handoff, and `hole-tests`
+    # (-> hole -> galoshes -> ex-ray) reaches none. Should that cascade ever
+    # gain an installer edge, this job joins that class and must match it.
+    timeout-minutes: ${{ matrix.timeout }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - { os: windows, arch: amd64, runner: windows-latest }
-          - { os: darwin,  arch: amd64, runner: macos-15-intel }
-          - { os: darwin,  arch: arm64, runner: macos-latest }
+          - { os: windows, arch: amd64, runner: windows-latest, timeout: 60 }
+          - { os: darwin,  arch: amd64, runner: macos-15-intel, timeout: 90 }
+          - { os: darwin,  arch: arm64, runner: macos-latest,   timeout: 45 }
     steps:
       - uses: actions/checkout@v7
         with:
@@ -272,7 +303,7 @@ jobs:
 
       - uses: ./.github/actions/setup-build
 
-      - uses: cargo-bins/cargo-binstall@v1.21.0
+      - uses: cargo-bins/cargo-binstall@v1.21.1
 
       - name: Install nextest
         shell: bash
@@ -298,6 +329,8 @@ jobs:
       # `--features tombstone/crash-dumps,tombstone/crash-child` + `package(tombstone)`
       # also mirror `hole-tests` so the crash-marker tests `build hole-tests`
       # compiled actually run (matching feature set → no rebuild). See #522.
+      # The `ci_test_hole_steps_match_the_hole_tests_target` conformance test
+      # holds every nextest step here equal to that target's `run:`.
       - name: Test (non-TUN)
         id: test-non-tun
         shell: bash
@@ -312,7 +345,8 @@ jobs:
               + package(handle-holders) + package(tombstone)
               + package(hole-test-observability)'
 
-      - name: Test (TUN, runs last for #200)
+      # Quoted: an unquoted ` #` opens a YAML comment and truncates the name.
+      - name: "Test (TUN, runs last for #200)"
         if: matrix.os == 'windows' && matrix.arch == 'amd64'
         id: test-tun
         shell: bash
@@ -333,6 +367,10 @@ jobs:
       # binaries are prebuilt above; nextest only re-executes them). macOS
       # runners have passwordless sudo. Windows engages WFP from the elevated
       # token above; macOS has no such token, so root is the equivalent.
+      #
+      # `--features` must match `Build hole test binaries` and the non-TUN
+      # step above (see that comment) or cargo rebuilds instead of reusing
+      # the prebuilt binaries.
       - name: Test (TUN, macOS — root for pfctl)
         if: matrix.os == 'darwin'
         id: test-tun-macos
@@ -340,10 +378,12 @@ jobs:
         run: >
           sudo env "PATH=$PATH" "HOME=$HOME" SKULD_LABELS=tun
           cargo nextest run --no-default-features
+          --features tombstone/crash-dumps,tombstone/crash-child
           -E 'package(hole) + package(hole-bridge) + package(hole-common)
               + package(tun-engine) + package(tun-engine-macros)
               + package(dump) + package(dump-macros)
-              + package(handle-holders)'
+              + package(handle-holders) + package(tombstone)
+              + package(hole-test-observability)'
 
       # Upload bridge.log produced by `DistHarness` subprocesses. Matches
       # files that the test harness redirected to `$RUNNER_TEMP` (see
@@ -385,7 +425,7 @@ jobs:
 
       - uses: ./.github/actions/setup-build
 
-      - uses: cargo-bins/cargo-binstall@v1.21.0
+      - uses: cargo-bins/cargo-binstall@v1.21.1
 
       - name: Install nextest
         shell: bash
@@ -422,13 +462,33 @@ jobs:
       - name: Test ex-ray Go (ECH gate)
         run: cargo xtask run ex-ray-tests
 
+  # Runs the ex-ray-unit-tests target (build.yaml) on windows/darwin -- see there
+  # for why it is split from test-ex-ray.
+  test-ex-ray-platforms:
+    name: Test ex-ray (Go, ${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: ./.github/actions/setup-build
+
+      - name: Test ex-ray Go
+        shell: bash
+        run: cargo xtask run ex-ray-unit-tests
+
   test-installer:
     name: Test installer (windows/amd64)
     runs-on: windows-latest
-    # 45m (was 20m): this job intermittently hit the 20m ceiling during the
-    # post-job cache save with the actual work already green, cancelling a
-    # would-be pass. The extra headroom absorbs slow cold-sccache/cache runs.
-    timeout-minutes: 45
+    # The installer-assembly budget, held equal to `test-dmg-signing` by
+    # `ci_installer_assembly_jobs_share_a_timeout_budget`. Sized for a cold
+    # sccache: GitHub evicts cache entries untouched for 7 days, so the first
+    # run after a quiet week compiles the workspace from scratch.
+    timeout-minutes: 60
     env:
       # renovate: datasource=github-releases depName=gerardog/gsudo
       GSUDO_VERSION: "2.6.1"
@@ -437,7 +497,7 @@ jobs:
         with:
           fetch-depth: 0
 
-      - uses: astral-sh/setup-uv@v8.3.2
+      - uses: astral-sh/setup-uv@v9.0.0
       - uses: ./.github/actions/setup-build
 
       - name: Test
@@ -607,7 +667,13 @@ jobs:
   test-dmg-signing:
     name: Test DMG signing (${{ matrix.os }}/${{ matrix.arch }})
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 30
+    # The installer-assembly budget, held equal to `test-installer` by
+    # `ci_installer_assembly_jobs_share_a_timeout_budget`. The darwin/amd64 leg
+    # sets the requirement: `macos-15-intel` runs ~1.7x slower than the arm64
+    # runner across every phase — ~25 min on a warm sccache, and 45m45s measured
+    # on a fully cold one (5% hit rate, the first run after a 7-day cache
+    # eviction). Roughly 8 min of that is the duplicated Rust build in #714.
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -619,7 +685,7 @@ jobs:
         with:
           fetch-depth: 0
 
-      - uses: astral-sh/setup-uv@v8.3.2
+      - uses: astral-sh/setup-uv@v9.0.0
       - uses: ./.github/actions/setup-build
 
       # One build+test via the run-cascade (builds hole-dmg once, then the
@@ -630,8 +696,10 @@ jobs:
 
       # hdiutil DMG creation/mounting is a non-deterministic macOS
       # DiskArbitration race; capture system state on any failure (build or the
-      # pytest mount) to diagnose the next occurrence (#446). `--last 30m` spans
-      # the job's whole lifetime (timeout-minutes: 30).
+      # pytest mount) to diagnose the next occurrence (#446). Note `if: failure()`
+      # does not fire when a timeout kills the job — that surfaces as `cancelled`,
+      # so a budget overrun leaves no diagnostics here.
+      # `--last 60m` spans the job's whole lifetime (timeout-minutes: 60).
       - name: Capture DiskArbitration/hdiutil state on failure
         if: failure()
         shell: bash
@@ -642,7 +710,7 @@ jobs:
           hdiutil info    > "$OUT/hdiutil-info.txt" 2>&1
           ls -la /Volumes > "$OUT/volumes.txt"      2>&1
           mount           > "$OUT/mount.txt"        2>&1
-          log show --last 30m --predicate \
+          log show --last 60m --predicate \
             'process == "diskarbitrationd" OR process == "diskimagesiod" OR process == "mds" OR process == "mds_stores"' \
             > "$OUT/diskarb-log.txt" 2>&1
           echo "captured DMG-flake diagnostics to $OUT"
@@ -671,7 +739,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v7
         with:
           node-version-file: package.json
           cache: npm

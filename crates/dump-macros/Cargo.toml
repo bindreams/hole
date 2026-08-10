@@ -1,6 +1,6 @@
 [package]
 name = "dump-macros"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 publish = false
 description = "Proc-macro support for the dump crate (provides #[derive(Dump)])."
@@ -17,7 +17,7 @@ proc-macro = true
 workspace = true
 
 [dependencies]
-syn = { version = "2", features = ["full", "extra-traits"] }
+syn = { version = "3", features = ["full", "extra-traits"] }
 quote = "1"
 proc-macro2 = "1"
 

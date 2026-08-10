@@ -2,8 +2,10 @@ package main
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"os"
+	"strings"
 )
 
 // Args maps a string key to a list of values. It is similar to url.Values.
@@ -42,7 +44,7 @@ func indexUnescaped(s string, term []byte) (int, string, error) {
 		if b == '\\' {
 			i++
 			if i >= len(s) {
-				return 0, "", fmt.Errorf("nothing following final escape in %q", s)
+				return 0, "", errors.New("plugin options end in an unpaired backslash")
 			}
 			b = s[i]
 		}
@@ -51,41 +53,73 @@ func indexUnescaped(s string, term []byte) (int, string, error) {
 	return i, string(unesc), nil
 }
 
-// Parse SS_PLUGIN options from environment variables
+// parseEnv validates SS_PLUGIN_OPTIONS and, if present, the SS_*
+// chain-handoff vars -- a partial SS_* set is fatal (see below); the
+// standalone/fully-complete cases are not.
 func parseEnv() (opts Args, err error) {
+	otherOpts, err := parsePluginOptions(os.Getenv("SS_PLUGIN_OPTIONS"))
+	if err != nil {
+		return nil, err
+	}
+
 	opts = make(Args)
-	ssRemoteHost := os.Getenv("SS_REMOTE_HOST")
-	ssRemotePort := os.Getenv("SS_REMOTE_PORT")
-	ssLocalHost := os.Getenv("SS_LOCAL_HOST")
-	ssLocalPort := os.Getenv("SS_LOCAL_PORT")
-	if len(ssRemoteHost) == 0 {
-		return
+	for k, v := range otherOpts {
+		opts[k] = v
 	}
-	if len(ssRemotePort) == 0 {
-		return
+
+	// LookupEnv, not Getenv: Getenv can't tell an unset var from one
+	// exported empty, and that distinction drives the partial-vs-absent
+	// check below.
+	ssRemoteHost, remoteHostSet := os.LookupEnv("SS_REMOTE_HOST")
+	ssRemotePort, remotePortSet := os.LookupEnv("SS_REMOTE_PORT")
+	ssLocalHost, localHostSet := os.LookupEnv("SS_LOCAL_HOST")
+	ssLocalPort, localPortSet := os.LookupEnv("SS_LOCAL_PORT")
+
+	// unset and empty are reported separately: a var that is exported but
+	// blank is a materially different operator mistake (e.g. an empty-
+	// string default in a wrapping script) than one never mentioned at
+	// all, and conflating them into a single "some but not all are set"
+	// message is actively misleading when every var IS set, just to "".
+	vars := [...]struct {
+		name string
+		val  string
+		set  bool
+	}{
+		{"SS_REMOTE_HOST", ssRemoteHost, remoteHostSet},
+		{"SS_REMOTE_PORT", ssRemotePort, remotePortSet},
+		{"SS_LOCAL_HOST", ssLocalHost, localHostSet},
+		{"SS_LOCAL_PORT", ssLocalPort, localPortSet},
 	}
-	if len(ssLocalHost) == 0 {
-		return
+	var unset, empty []string
+	for _, v := range vars {
+		switch {
+		case !v.set:
+			unset = append(unset, v.name)
+		case v.val == "":
+			empty = append(empty, v.name)
+		}
 	}
-	if len(ssLocalPort) == 0 {
-		return
+	if len(unset) == len(vars) {
+		// Fully absent: the legitimate standalone-invocation case.
+		return opts, nil
+	}
+	if len(unset) > 0 || len(empty) > 0 {
+		var detail []string
+		if len(unset) > 0 {
+			detail = append(detail, fmt.Sprintf("unset: %s", strings.Join(unset, ", ")))
+		}
+		if len(empty) > 0 {
+			detail = append(detail, fmt.Sprintf("set but empty: %s", strings.Join(empty, ", ")))
+		}
+		// Env var names only -- never operator/secret content, safe to
+		// name directly.
+		return nil, fmt.Errorf("SS_* chain-handoff env is incomplete (%s)", strings.Join(detail, "; "))
 	}
 
 	opts.Add("remoteAddr", ssRemoteHost)
 	opts.Add("remotePort", ssRemotePort)
 	opts.Add("localAddr", ssLocalHost)
 	opts.Add("localPort", ssLocalPort)
-
-	ssPluginOptions := os.Getenv("SS_PLUGIN_OPTIONS")
-	if len(ssPluginOptions) > 0 {
-		otherOpts, err := parsePluginOptions(ssPluginOptions)
-		if err != nil {
-			return nil, err
-		}
-		for k, v := range otherOpts {
-			opts[k] = v
-		}
-	}
 	return opts, nil
 }
 
@@ -97,41 +131,36 @@ func parsePluginOptions(s string) (opts Args, err error) {
 		return
 	}
 	i := 0
-	for {
+	for segmentIndex := 0; ; segmentIndex++ {
 		var key, value string
-		var offset, begin int
+		var offset int
 
 		if i >= len(s) {
 			break
 		}
-		begin = i
-		// Read the key.
 		offset, key, err = indexUnescaped(s[i:], []byte{'=', ';'})
 		if err != nil {
 			return
 		}
 		if len(key) == 0 {
-			err = fmt.Errorf("empty key in %q", s[begin:i])
+			// No segment content in the message: a value can carry a secret.
+			// Mirrors crates/garter/src/sip003.rs's MalformedOptions::EmptyKey.
+			err = fmt.Errorf("plugin options segment %d has no key", segmentIndex)
 			return
 		}
 		i += offset
-		// End of string or no equals sign?
 		if i >= len(s) || s[i] != '=' {
 			opts.Add(key, "1")
-			// Skip the semicolon.
 			i++
 			continue
 		}
-		// Skip the equals sign.
 		i++
-		// Read the value.
 		offset, value, err = indexUnescaped(s[i:], []byte{';'})
 		if err != nil {
 			return
 		}
 		i += offset
 		opts.Add(key, value)
-		// Skip the semicolon.
 		i++
 	}
 	return opts, nil

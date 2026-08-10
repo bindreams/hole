@@ -1,4 +1,4 @@
-use crate::update_archive::build_update_archive;
+use crate::update_archive::{build_update_archive, verify_update_archive};
 use crate::Profile;
 #[cfg(target_os = "windows")]
 use std::fs;
@@ -43,6 +43,92 @@ fn windows_archive_entry_names_equal_bindir_dest_names() {
         names, expected,
         "zip entries must equal bindir_dest_names, incl. ex-ray.exe"
     );
+}
+
+/// The release workflow verifies the *real* built archive, which no fake-tree
+/// test can stand in for; these pin the checker itself.
+#[cfg(target_os = "windows")]
+#[skuld::test]
+fn verify_accepts_a_freshly_built_archive() {
+    let repo = fake_repo();
+    let out = repo.path().join("hole.zip");
+    build_update_archive(Profile::Release, repo.path(), &out).unwrap();
+
+    verify_update_archive(&out).unwrap();
+}
+
+#[cfg(target_os = "windows")]
+#[skuld::test]
+fn verify_rejects_an_archive_missing_a_bindir_entry() {
+    let repo = fake_repo();
+    let out = repo.path().join("hole.zip");
+    build_update_archive(Profile::Release, repo.path(), &out).unwrap();
+    rewrite_zip_without(&out, "ex-ray.exe");
+
+    let err = verify_update_archive(&out).unwrap_err();
+    assert!(err.to_string().contains("ex-ray.exe"), "got: {err}");
+}
+
+#[cfg(target_os = "windows")]
+#[skuld::test]
+fn verify_rejects_an_empty_bindir_entry() {
+    let repo = fake_repo();
+    fs::write(repo.path().join("target/release/galoshes.exe"), b"").unwrap();
+    let out = repo.path().join("hole.zip");
+    build_update_archive(Profile::Release, repo.path(), &out).unwrap();
+
+    let err = verify_update_archive(&out).unwrap_err();
+    assert!(err.to_string().contains("galoshes.exe"), "got: {err}");
+}
+
+/// Repack `zip` keeping every entry except `drop_name`.
+#[cfg(target_os = "windows")]
+fn rewrite_zip_without(zip: &std::path::Path, drop_name: &str) {
+    let mut src = zip::ZipArchive::new(fs::File::open(zip).unwrap()).unwrap();
+    let mut kept = Vec::new();
+    for i in 0..src.len() {
+        let mut e = src.by_index(i).unwrap();
+        if e.name() == drop_name {
+            continue;
+        }
+        let name = e.name().to_string();
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut e, &mut bytes).unwrap();
+        kept.push((name, bytes));
+    }
+    let mut w = zip::ZipWriter::new(fs::File::create(zip).unwrap());
+    for (name, bytes) in kept {
+        w.start_file(name, zip::write::SimpleFileOptions::default()).unwrap();
+        std::io::Write::write_all(&mut w, &bytes).unwrap();
+    }
+    w.finish().unwrap();
+}
+
+#[cfg(target_os = "macos")]
+#[skuld::test]
+fn verify_accepts_a_freshly_built_archive() {
+    let repo = tempfile::tempdir().unwrap();
+    let macos = repo.path().join("target/release/bundle/macos/Hole.app/Contents/MacOS");
+    std::fs::create_dir_all(&macos).unwrap();
+    std::fs::write(macos.join("hole"), b"MACHO").unwrap();
+    let out = repo.path().join("hole.tar.gz");
+    build_update_archive(Profile::Release, repo.path(), &out).unwrap();
+
+    verify_update_archive(&out).unwrap();
+}
+
+#[cfg(target_os = "macos")]
+#[skuld::test]
+fn verify_rejects_an_archive_whose_app_binary_is_empty() {
+    let repo = tempfile::tempdir().unwrap();
+    let macos = repo.path().join("target/release/bundle/macos/Hole.app/Contents/MacOS");
+    std::fs::create_dir_all(&macos).unwrap();
+    std::fs::write(macos.join("hole"), b"").unwrap();
+    let out = repo.path().join("hole.tar.gz");
+    build_update_archive(Profile::Release, repo.path(), &out).unwrap();
+
+    let err = verify_update_archive(&out).unwrap_err();
+    assert!(err.to_string().contains("Contents/MacOS/hole"), "got: {err}");
 }
 
 #[cfg(target_os = "macos")]

@@ -20,7 +20,7 @@
 //!     `cargo xtask run <target>` through `build.yaml` and recurses into that
 //!     target's `run:`/`build:` commands under the same per-command rule.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 
 use anyhow::{Context, Result};
 use indexmap::IndexMap;
@@ -116,7 +116,7 @@ pub fn ci_run_packages(ci_yaml: &str, manifest: &Manifest) -> Result<BTreeSet<St
 /// Collapse shell backslash-newline line continuations into spaces, so a command
 /// written across several lines (as the archive-lane nextest invocations are)
 /// is one logical command before [`split_commands`] runs.
-fn join_line_continuations(script: &str) -> String {
+pub(crate) fn join_line_continuations(script: &str) -> String {
     script.replace("\\\r\n", " ").replace("\\\n", " ")
 }
 
@@ -154,7 +154,7 @@ fn collect_from_command(
 /// nextest `-E '…'` filter expression (folded YAML) carries newlines inside its
 /// single quotes. Tokens within a command stay whitespace-separated, so
 /// downstream `split_whitespace` matching is unaffected.
-fn split_commands(script: &str) -> Vec<String> {
+pub(crate) fn split_commands(script: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut cur = String::new();
     let mut quote: Option<char> = None;
@@ -195,7 +195,7 @@ fn push_command(out: &mut Vec<String>, cur: &mut String) {
 /// Does this single command RUN tests? True iff it spawns nextest with the `run`
 /// subcommand (`cargo nextest run` OR `cargo-nextest nextest run`) and is not a
 /// `--no-run` compile-only invocation.
-fn is_nextest_run(cmd: &str) -> bool {
+pub(crate) fn is_nextest_run(cmd: &str) -> bool {
     let toks: Vec<&str> = cmd.split_whitespace().collect();
     if toks.contains(&"--no-run") {
         return false;
@@ -211,10 +211,33 @@ fn xtask_run_target(cmd: &str) -> Option<&str> {
         .map(|w| w[3])
 }
 
+/// Strip one matched pair of surrounding shell quotes.
+///
+/// [`split_commands`] preserves quote characters, so `cargo xtask build
+/// "hole-msi"` yields the token `"hole-msi"`. Comparing that raw against a bare
+/// name silently drops the command out of every match — the exact invisible-miss
+/// the conformance tests exist to prevent.
+pub(crate) fn unquote(tok: &str) -> &str {
+    for q in ['"', '\''] {
+        if let Some(inner) = tok.strip_prefix(q).and_then(|t| t.strip_suffix(q)) {
+            return inner;
+        }
+    }
+    tok
+}
+
 /// The command-line text of a manifest step, for token extraction.
-fn step_command(step: &Step) -> String {
+pub(crate) fn step_command(step: &Step) -> String {
     match step {
         Step::Bash { command, .. } => command.clone(),
         Step::Process { args, .. } => args.join(" "),
+    }
+}
+
+/// The environment a manifest step exports, which [`step_command`] does not
+/// carry.
+pub(crate) fn step_environment(step: &Step) -> &HashMap<String, String> {
+    match step {
+        Step::Bash { environment, .. } | Step::Process { environment, .. } => environment,
     }
 }

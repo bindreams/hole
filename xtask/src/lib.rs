@@ -15,6 +15,8 @@ use crate::orchestrate::{execute, execute_run, relocate_self_if_windows, render_
 
 pub mod bindir;
 pub mod ci_coverage;
+pub mod ci_nextest_parity;
+pub mod ci_timeouts;
 // macOS-only: renders with the system font via the Typst library (a macOS-only
 // dependency — the DMG background is a darwin feature).
 #[cfg(target_os = "macos")]
@@ -28,6 +30,7 @@ pub mod manifest;
 pub mod orchestrate;
 pub mod stage;
 pub mod target;
+pub mod tauri_pairs;
 pub mod test_binaries;
 pub mod update_archive;
 pub mod upstream_v2ray;
@@ -39,6 +42,12 @@ mod bindir_tests;
 #[cfg(test)]
 #[path = "ci_coverage_tests.rs"]
 mod ci_coverage_tests;
+#[cfg(test)]
+#[path = "ci_nextest_parity_tests.rs"]
+mod ci_nextest_parity_tests;
+#[cfg(test)]
+#[path = "ci_timeouts_tests.rs"]
+mod ci_timeouts_tests;
 // These tests render with the macOS system font (/System/Library/Fonts/SFNS.ttf);
 // the DMG background is a darwin-only feature, so gate them to macOS. They fail
 // loudly on macOS if the font is missing — other platforms simply lack the feature.
@@ -222,6 +231,14 @@ pub enum Command {
         #[arg(long)]
         out: PathBuf,
     },
+    /// Assert an update archive carries every file the bridge needs to unpack a
+    /// working BINDIR. The expected set comes from `bindir_dest_names`, so the
+    /// release workflow cannot drift from what ships.
+    VerifyUpdateArchive {
+        /// Archive to check (`.zip` on Windows, `.tar.gz` on macOS).
+        #[arg(long)]
+        archive: PathBuf,
+    },
     /// Print this host's update-archive asset suffix (e.g. `windows-amd64.zip`).
     ///
     /// The release workflow captures it to name the published archive; the
@@ -291,6 +308,11 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             let repo_root = repo_root()?;
             update_archive::build_update_archive(Profile::Release, &repo_root, &out)?;
             println!("xtask: update archive written to {}", out.display());
+            Ok(())
+        }
+        Command::VerifyUpdateArchive { archive } => {
+            update_archive::verify_update_archive(&archive)?;
+            println!("xtask: update archive verified {}", archive.display());
             Ok(())
         }
         Command::AssetSuffix => {

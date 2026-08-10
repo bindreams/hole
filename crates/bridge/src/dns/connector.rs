@@ -54,6 +54,11 @@ impl ConnectedStream {
     }
 }
 
+/// Wire bytes an [`UpstreamUdp`] has moved, counted BEFORE any header
+/// parsing — a reply that arrives and then fails to parse is still
+/// recorded as something having come back. See [`garter::ByteCounters`].
+pub type DatagramCounters = garter::ByteCounters;
+
 /// UDP send/recv abstraction. Separate from [`AsyncDuplex`] because the
 /// SOCKS5 UDP ASSOCIATE path wraps an inner socket and prepends a header,
 /// which is orthogonal to the AsyncRead/AsyncWrite shape.
@@ -63,6 +68,10 @@ pub trait UpstreamUdp: Send + Sync {
     async fn send(&self, buf: &[u8]) -> io::Result<usize>;
     /// Receive one DNS datagram. Returns the number of bytes read.
     async fn recv(&self, buf: &mut [u8]) -> io::Result<usize>;
+    /// Wire bytes moved so far — see [`DatagramCounters`]. Required, not
+    /// defaulted: a silently-uncounted impl would make the forwarder's byte
+    /// reading a constant zero, which is what it exists not to be.
+    fn counters(&self) -> DatagramCounters;
 }
 
 #[async_trait]
@@ -106,21 +115,33 @@ impl UpstreamConnector for DirectConnector {
         };
         let socket = UdpSocket::bind(local).await?;
         socket.connect(target).await?;
-        Ok(Box::new(DirectUdp { socket }))
+        Ok(Box::new(DirectUdp {
+            socket,
+            counters: DatagramCounters::default(),
+        }))
     }
 }
 
 struct DirectUdp {
     socket: UdpSocket,
+    counters: DatagramCounters,
 }
 
 #[async_trait]
 impl UpstreamUdp for DirectUdp {
     async fn send(&self, buf: &[u8]) -> io::Result<usize> {
-        self.socket.send(buf).await
+        let n = self.socket.send(buf).await?;
+        self.counters.add_written(n as u64);
+        Ok(n)
     }
 
     async fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
-        self.socket.recv(buf).await
+        let n = self.socket.recv(buf).await?;
+        self.counters.add_read(n as u64);
+        Ok(n)
+    }
+
+    fn counters(&self) -> DatagramCounters {
+        self.counters.clone()
     }
 }

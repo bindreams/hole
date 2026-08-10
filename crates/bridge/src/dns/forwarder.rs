@@ -12,6 +12,7 @@
 use std::collections::{HashMap, HashSet};
 use std::io::{self, Write};
 use std::net::{IpAddr, SocketAddr};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -21,7 +22,7 @@ use rustls::{ClientConfig, RootCertStore};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::timeout;
 
-use crate::dns::connector::{StreamCounters, UpstreamConnector};
+use crate::dns::connector::{DatagramCounters, StreamCounters, UpstreamConnector};
 use crate::dns::providers;
 
 // Typed errors ========================================================================================================
@@ -45,10 +46,11 @@ pub enum UpstreamLayer {
     Http,
     /// Post-handshake read / write on the upstream stream.
     Io,
-    /// Outer `UPSTREAM_TIMEOUT` budget fired. Distinct from `Io` so
-    /// observers can tell "inner future completed with error at 2573ms"
-    /// from "outer timer cancelled the future at exactly 3000ms" —
-    /// different root causes, different fixes.
+    /// The per-upstream budget passed to `forward_one` fired. Distinct from
+    /// `Io` so observers can tell "inner future completed with error at
+    /// 2573ms" from "the timer cancelled the future at the deadline" —
+    /// different root causes, different fixes. `budget_ms` on the WARN
+    /// reports which budget was in force.
     Timeout,
 }
 
@@ -70,6 +72,72 @@ impl std::fmt::Display for UpstreamLayer {
     }
 }
 
+/// Coarse, `Copy` classification of an upstream failure. `UpstreamErr` owns an
+/// `io::Error` and is neither `Clone` nor `Eq`, so this is what travels out of
+/// the forwarder into a comparable error enum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpstreamCause {
+    /// Connect never completed — refused, unreachable, or a SOCKS5 failure.
+    Unreachable,
+    /// The peer's certificate chain did not verify against our trust roots.
+    CertificateRejected,
+    /// TLS failed for a non-certificate reason: unclean EOF, fatal alert,
+    /// version or cipher mismatch.
+    TlsFailed,
+    /// The DoH response was non-200, malformed, or truncated.
+    BadResponse,
+    /// Post-handshake read/write failure on the upstream stream.
+    Io,
+    /// The per-upstream budget fired before the attempt completed.
+    Timeout,
+}
+
+impl UpstreamCause {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Unreachable => "unreachable",
+            Self::CertificateRejected => "certificate-rejected",
+            Self::TlsFailed => "tls-failed",
+            Self::BadResponse => "bad-response",
+            Self::Io => "io",
+            Self::Timeout => "timeout",
+        }
+    }
+
+    /// Report priority when several upstreams fail differently — highest wins,
+    /// ties keep the first observed. Ordered by how much each cause tells the
+    /// user: a rejected certificate names a third party on the path, a failed
+    /// connect says only that the path is broken.
+    pub fn rank(self) -> u8 {
+        match self {
+            Self::CertificateRejected => 5,
+            Self::TlsFailed => 4,
+            Self::BadResponse => 3,
+            Self::Io => 2,
+            Self::Timeout => 1,
+            Self::Unreachable => 0,
+        }
+    }
+}
+
+impl std::fmt::Display for UpstreamCause {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Why [`DnsForwarder::try_forward`] produced no reply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForwardFailure {
+    /// The query is shorter than the 12-byte DNS header — a caller bug.
+    MalformedQuery,
+    /// Nothing was attempted: no servers configured, or every configured
+    /// server was skipped (IPv6 with no IPv6 bypass).
+    NoUpstream,
+    /// Every attempted upstream failed; carries the highest-ranked cause.
+    Upstream(UpstreamCause),
+}
+
 /// Tagged upstream failure: `{ layer, source, elapsed_ms }` plus optional
 /// diagnostic context captured at the point of failure. `io::Error` is
 /// `!Clone`, so `UpstreamErr` cannot be `Clone` — consumed once on the
@@ -79,22 +147,31 @@ pub struct UpstreamErr {
     pub layer: UpstreamLayer,
     pub source: io::Error,
     /// Wall-clock from `forward_one`'s `Instant::now()` to error emission.
-    /// Bounded above by [`UPSTREAM_TIMEOUT`].
+    /// Bounded above by the `budget` passed to `forward_one`.
     pub elapsed_ms: u64,
+    /// The per-upstream budget the attempt actually ran under, stamped by
+    /// `forward_one`. Logged as `budget_ms` so the WARN can never claim a
+    /// deadline that was not in force.
+    pub budget_ms: u64,
     /// Time from `forward_one` start to return of `connector.connect_tcp`.
-    /// `Some` whenever the TCP/SOCKS5-level connection completed
-    /// (Tls/Io/Http failures); `None` when we errored at `Connect` or
-    /// `Timeout` fired before connect completed.
+    /// `Some` whenever the TCP/SOCKS5-level connection completed; `None` when
+    /// we errored at `Connect`, or for a UDP transport.
     pub socks5_ms: Option<u64>,
-    /// Time spent inside `tokio_rustls::TlsConnector::connect(...)`.
-    /// `Some` on `Tls`/`Io`/`Http` layers; `None` otherwise.
+    /// Time spent inside `tokio_rustls::TlsConnector::connect(...)`. On a
+    /// handshake still in flight when the budget fired, how long it had run.
     pub tls_ms: Option<u64>,
     /// Raw bytes written to / read from the underlying TCP stream,
-    /// observed by [`crate::dns::connector::CountingStream`]. `None` when
-    /// connect failed (no stream existed). Post-SOCKS5 byte counts —
-    /// what a DoH server would see.
+    /// observed by [`crate::dns::connector::CountingStream`]. `None` when no
+    /// stream was opened (connect failed, or a UDP transport). Post-SOCKS5
+    /// byte counts — what a DoH server would see.
     pub tcp_wrote: Option<u64>,
     pub tcp_read: Option<u64>,
+    /// Wire bytes sent to / received from the upstream over the UDP transport,
+    /// counted before any SOCKS5 header parsing. `Some` exactly when a UDP
+    /// association was established; the stream transports leave these `None`
+    /// and report `tcp_*` instead.
+    pub udp_sent: Option<u64>,
+    pub udp_received: Option<u64>,
     /// First `io::Error::raw_os_error()` found walking
     /// `std::error::Error::source()` from `source`. Distinguishes FIN
     /// (graceful close, `None` on Windows since FIN surfaces as `Ok(0)`
@@ -109,28 +186,178 @@ impl UpstreamErr {
             layer,
             source,
             elapsed_ms: 0,
+            budget_ms: 0,
             socks5_ms: None,
             tls_ms: None,
             tcp_wrote: None,
             tcp_read: None,
+            udp_sent: None,
+            udp_received: None,
             os_errno,
         }
     }
 
-    fn with_socks5_ms(mut self, ms: u64) -> Self {
-        self.socks5_ms = Some(ms);
-        self
+    /// Classify this failure for reporting. Only the `Tls` layer needs the
+    /// error chain — it splits on whether `first_rustls_error` found a
+    /// TRUST-CHAIN rejection (see [`is_trust_chain_rejection`]).
+    pub fn cause(&self) -> UpstreamCause {
+        match self.layer {
+            UpstreamLayer::Connect => UpstreamCause::Unreachable,
+            UpstreamLayer::Timeout => UpstreamCause::Timeout,
+            UpstreamLayer::Http => UpstreamCause::BadResponse,
+            UpstreamLayer::Io => UpstreamCause::Io,
+            UpstreamLayer::Tls => match first_rustls_error(&self.source) {
+                Some(e) if is_trust_chain_rejection(e) => UpstreamCause::CertificateRejected,
+                _ => UpstreamCause::TlsFailed,
+            },
+        }
+    }
+}
+
+/// What a forwarder has done upstream, cumulative over its lifetime and counted
+/// whether the attempt succeeded, failed or was cancelled by its budget.
+/// Snapshot before a sequence and [`Self::since`] after: the difference is
+/// direct evidence, not an inference from a cause code.
+///
+/// `connects` is separate from `written` on purpose. A connection the upstream
+/// accepted and then reset before the first write leaves `written == 0`, and
+/// reading that as "no connection was opened" would be a positive claim about
+/// the local hop that the connect itself disproves.
+///
+/// `connects` and `associates` are two DIFFERENT strengths of evidence, kept
+/// apart rather than folded together:
+/// - A completed SOCKS5 CONNECT (`connects`) is evidence the attempt reached
+///   the plugin's local port — `shadowsocks-service` only answers it once it
+///   gets there.
+/// - A completed UDP ASSOCIATE (`associates`) is evidence of nothing beyond
+///   the SOCKS5 listener itself — `shadowsocks-service` answers it purely
+///   locally, without touching the plugin at all. It disproves "the local
+///   proxy refused a connection" but is NOT comparable to a CONNECT: it must
+///   never be counted toward `connects`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct UpstreamActivity {
+    pub read: u64,
+    pub written: u64,
+    /// A completed SOCKS5 CONNECT. See the struct doc for why this is not
+    /// interchangeable with `associates`.
+    pub connects: u64,
+    /// A completed UDP ASSOCIATE. See the struct doc for why this is not
+    /// interchangeable with `connects`.
+    pub associates: u64,
+}
+
+impl UpstreamActivity {
+    /// This snapshot minus an earlier one from the same forwarder.
+    pub fn since(self, earlier: Self) -> Self {
+        debug_assert!(
+            self.read >= earlier.read
+                && self.written >= earlier.written
+                && self.connects >= earlier.connects
+                && self.associates >= earlier.associates,
+            "upstream counters only increase; snapshots were passed out of order"
+        );
+        Self {
+            read: self.read.saturating_sub(earlier.read),
+            written: self.written.saturating_sub(earlier.written),
+            connects: self.connects.saturating_sub(earlier.connects),
+            associates: self.associates.saturating_sub(earlier.associates),
+        }
+    }
+}
+
+// Attempt probe -------------------------------------------------------------------------------------------------------
+
+/// Diagnostics an attempt publishes as it makes progress, owned by
+/// [`DnsForwarder::forward_one`] rather than by the transport future it bounds.
+/// The budget cancels that future by dropping it, which would take any state it
+/// still owned with it — so `tcp_read = None` on a timed-out attempt could not
+/// be told apart from "never connected".
+///
+/// All four transports feed it. UDP has no stream to wrap, so it reports its
+/// `send`/`recv` returns directly; without that, a byte reading would be a
+/// constant zero for `PlainUdp` rather than a measurement.
+#[derive(Default)]
+struct AttemptProbe {
+    state: Mutex<AttemptState>,
+}
+
+#[derive(Default)]
+struct AttemptState {
+    socks5_ms: Option<u64>,
+    /// Set when the TLS handshake starts. If the attempt is cancelled
+    /// mid-handshake, `apply` reports how long it had been running.
+    tls_started_at: Option<Instant>,
+    tls_ms: Option<u64>,
+    /// Counter handles for whichever transport ran. The presence of either IS
+    /// "a connection was established": both are published the instant the
+    /// connector hands the resource back, before a byte moves.
+    stream: Option<StreamCounters>,
+    datagram: Option<DatagramCounters>,
+}
+
+impl AttemptProbe {
+    /// The TCP/SOCKS5-level connection completed.
+    fn connected(&self, socks5_ms: u64, counters: &StreamCounters) {
+        let mut s = self.state.lock().expect("poisoned");
+        s.socks5_ms = Some(socks5_ms);
+        s.stream = Some(counters.clone());
     }
 
-    fn with_tls_ms(mut self, ms: u64) -> Self {
-        self.tls_ms = Some(ms);
-        self
+    /// The UDP association completed.
+    fn associated(&self, counters: DatagramCounters) {
+        self.state.lock().expect("poisoned").datagram = Some(counters);
     }
 
-    fn with_counters(mut self, c: &StreamCounters) -> Self {
-        self.tcp_read = Some(c.read());
-        self.tcp_wrote = Some(c.written());
-        self
+    fn tls_started(&self) {
+        self.state.lock().expect("poisoned").tls_started_at = Some(Instant::now());
+    }
+
+    fn tls_done(&self, tls_ms: u64) {
+        self.state.lock().expect("poisoned").tls_ms = Some(tls_ms);
+    }
+
+    /// Did the connector complete a SOCKS5 CONNECT? True the moment it
+    /// completes, independent of any byte moving — see [`UpstreamActivity`]
+    /// for why zero bytes must not read as "no connection" there. Excludes a
+    /// UDP ASSOCIATE on purpose: see [`Self::datagram_established`].
+    fn established(&self) -> bool {
+        self.state.lock().expect("poisoned").stream.is_some()
+    }
+
+    /// Did the connector complete a UDP ASSOCIATE? Weaker evidence than
+    /// [`Self::established`] — `shadowsocks-service` answers ASSOCIATE purely
+    /// locally, without touching the plugin — so this must never be folded
+    /// into `established`/`connects`. See [`UpstreamActivity`].
+    fn datagram_established(&self) -> bool {
+        self.state.lock().expect("poisoned").datagram.is_some()
+    }
+
+    /// `(read, written)` for the attempt, over whichever transport ran.
+    fn bytes(&self) -> (u64, u64) {
+        let s = self.state.lock().expect("poisoned");
+        let (sr, sw) = s.stream.as_ref().map_or((0, 0), |c| (c.read(), c.written()));
+        let (dr, dw) = s.datagram.as_ref().map_or((0, 0), |c| (c.read(), c.written()));
+        (sr + dr, sw + dw)
+    }
+
+    /// Decorate an error with everything the attempt had published. Each
+    /// transport's fields appear only when that transport actually ran — a
+    /// refused DoH connect must not report `udp_sent=Some(0)`, which reads as a
+    /// datagram transport that sent nothing.
+    fn apply(&self, e: &mut UpstreamErr) {
+        let s = self.state.lock().expect("poisoned");
+        e.socks5_ms = s.socks5_ms;
+        e.tls_ms = s
+            .tls_ms
+            .or_else(|| s.tls_started_at.map(|t| t.elapsed().as_millis() as u64));
+        if let Some(c) = s.stream.as_ref() {
+            e.tcp_read = Some(c.read());
+            e.tcp_wrote = Some(c.written());
+        }
+        if let Some(c) = s.datagram.as_ref() {
+            e.udp_sent = Some(c.written());
+            e.udp_received = Some(c.read());
+        }
     }
 }
 
@@ -175,15 +402,74 @@ fn first_os_errno(e: &(dyn std::error::Error + 'static)) -> Option<i32> {
     None
 }
 
+/// Does this rustls error mean the peer's chain did not verify against our
+/// trust roots — as opposed to any other certificate complaint?
+///
+/// Only trust-chain rejections justify telling the user something may be
+/// intercepting TLS. `InvalidCertificate` is much broader than that: it also
+/// carries `NotValidForName` (routine for a free-form resolver IP, since
+/// `https_target_for` falls back to IP-SAN verification for addresses outside
+/// the provider table) and `Expired` (a skewed system clock). Reporting those
+/// as interception would accuse the network of something the user's own
+/// configuration or clock caused, and — unlike a real interception — switching
+/// resolvers WOULD fix them.
+///
+/// `CertificateError` is `#[non_exhaustive]`, so the fallthrough deliberately
+/// answers "not a trust-chain rejection": a future variant we have not
+/// considered must not silently inherit the interception claim.
+fn is_trust_chain_rejection(e: &rustls::Error) -> bool {
+    match e {
+        rustls::Error::InvalidCertificate(c) => matches!(
+            c,
+            rustls::CertificateError::UnknownIssuer
+                | rustls::CertificateError::BadSignature
+                | rustls::CertificateError::Revoked
+                | rustls::CertificateError::UnknownRevocationStatus
+        ),
+        // Same discipline for revocation material, and only `BadSignature`
+        // qualifies: a malformed CRL number, a bad revoked-serial or a CA
+        // missing cRLSign are content/config faults in material WE supply —
+        // rustls never fetches CRLs from the network, so no interceptor can
+        // cause them. (Unreachable today: `build_tls_config` configures no
+        // CRLs, so rustls never checks revocation at all.)
+        rustls::Error::InvalidCertRevocationList(c) => {
+            matches!(c, rustls::CertRevocationListError::BadSignature)
+        }
+        _ => false,
+    }
+}
+
+/// Walk the chain for a `rustls::Error`. tokio-rustls reports a verification
+/// failure as `io::Error::new(InvalidData, rustls::Error)`, so the rustls error
+/// hangs off `io::Error::get_ref()` — `io::Error::source()` skips the wrapper
+/// and would hide it. Same descent as [`first_os_errno`].
+fn first_rustls_error<'a>(e: &'a (dyn std::error::Error + 'static)) -> Option<&'a rustls::Error> {
+    let mut current: Option<&(dyn std::error::Error + 'static)> = Some(e);
+    while let Some(err) = current {
+        if let Some(r) = err.downcast_ref::<rustls::Error>() {
+            return Some(r);
+        }
+        if let Some(io_err) = err.downcast_ref::<io::Error>() {
+            if let Some(inner) = io_err.get_ref() {
+                current = Some(inner);
+                continue;
+            }
+        }
+        current = err.source();
+    }
+    None
+}
+
 /// Upstream port for plain DNS (RFC 1035) and DoT (RFC 7858).
 const DNS_PORT_PLAIN: u16 = 53;
 const DNS_PORT_TLS: u16 = 853;
 /// DoH typically runs on 443 (RFC 8484 §3).
 const DNS_PORT_HTTPS: u16 = 443;
 
-/// Per-upstream attempt timeout. Shorter than the OS default TCP timeout
-/// so a dead server doesn't stall the whole forward loop.
-const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(3);
+/// Default per-upstream attempt budget, used by [`DnsForwarder::forward`].
+/// Shorter than the OS default TCP timeout so a dead server doesn't stall the
+/// whole forward loop.
+pub(crate) const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Maximum reply size we'll buffer (bytes). DNS messages cap around 65535
 /// but we cap even tighter — DoH servers never return more than ~8KB in
@@ -264,12 +550,18 @@ pub struct DnsForwarder {
     /// cannot change without a reconfigure; log-first-1-forever is
     /// correct there.
     ipv6_skip_logged: Mutex<HashSet<IpAddr>>,
-    /// Test-only upstream-port override so the cross-module
-    /// `bootstrap::test_loopback_querier` e2e can reach an ephemeral DoH
-    /// listener. Behind `#[cfg(test)]` so production `forward` stays
-    /// byte-identical.
+    /// Cumulative upstream bytes — see [`UpstreamBytes`]. Written by
+    /// `forward_one` on every attempt, read by snapshot/diff.
+    upstream_read: AtomicU64,
+    upstream_written: AtomicU64,
+    upstream_connects: AtomicU64,
+    upstream_associates: AtomicU64,
+    /// Test-only per-server upstream-port override, indexed against
+    /// `config.servers`, so tests can target ephemeral listeners without
+    /// binding privileged 53/853/443. Behind `#[cfg(test)]` so production
+    /// `try_forward` stays byte-identical.
     #[cfg(test)]
-    forced_port: Option<u16>,
+    forced_ports: Option<Vec<u16>>,
 }
 
 impl DnsForwarder {
@@ -285,8 +577,21 @@ impl DnsForwarder {
             ipv6_bypass_available,
             failure_throttle: Mutex::new(HashMap::new()),
             ipv6_skip_logged: Mutex::new(HashSet::new()),
+            upstream_read: AtomicU64::new(0),
+            upstream_written: AtomicU64::new(0),
+            upstream_connects: AtomicU64::new(0),
+            upstream_associates: AtomicU64::new(0),
             #[cfg(test)]
-            forced_port: None,
+            forced_ports: None,
+        }
+    }
+
+    pub fn upstream_activity(&self) -> UpstreamActivity {
+        UpstreamActivity {
+            read: self.upstream_read.load(Ordering::Relaxed),
+            written: self.upstream_written.load(Ordering::Relaxed),
+            connects: self.upstream_connects.load(Ordering::Relaxed),
+            associates: self.upstream_associates.load(Ordering::Relaxed),
         }
     }
 
@@ -294,59 +599,129 @@ impl DnsForwarder {
     /// Never errors — on total failure returns a synthesized SERVFAIL so
     /// the caller can always write a reply back.
     pub async fn forward(&self, query: &[u8]) -> Vec<u8> {
+        // Short-query check ahead of the delegation: this is the in-TUN
+        // datagram path, so arbitrary local traffic reaches it and must not be
+        // able to drive `try_forward`'s unthrottled malformed-query WARN.
         if query.len() < 12 {
             return synthesize_servfail(query);
         }
+        self.try_forward(query, UPSTREAM_TIMEOUT)
+            .await
+            .unwrap_or_else(|_| synthesize_servfail(query))
+    }
 
-        for &server in &self.config.servers {
+    /// How many configured upstreams a walk will ACTUALLY attempt. IPv6 entries
+    /// are skipped without an IPv6 bypass, so this can be less than
+    /// `servers.len()` — and zero, for an all-IPv6 config on an IPv4-only host,
+    /// where a walk returns `NoUpstream` without dialling anything.
+    ///
+    /// A caller that owns a total budget divides by this to size the
+    /// `per_upstream` it passes to [`Self::try_forward`]. The skip rule lives
+    /// here, next to the loop that applies it, so a caller cannot drift from it.
+    pub fn attempted_upstreams(&self) -> usize {
+        self.config
+            .servers
+            .iter()
+            .filter(|s| !s.is_ipv6() || self.ipv6_bypass_available)
+            .count()
+    }
+
+    /// [`Self::forward`] without the SERVFAIL synthesis: reports *why* no
+    /// upstream answered. Per-server failures are logged by the same throttle
+    /// either way; the returned cause is the highest-ranked one observed
+    /// (see [`UpstreamCause::rank`]), ties keeping the first.
+    ///
+    /// `per_upstream` bounds ONE upstream attempt. The walk tries up to
+    /// `config.servers.len()` of them, so bound the whole call at
+    /// `servers.len() * per_upstream`. A caller that owns a total budget should
+    /// pass this rather than wrapping the call in its own `timeout`: an outer
+    /// timer that fires first drops the future before `forward_one`'s deadline,
+    /// so nothing is classified and nothing is logged.
+    pub async fn try_forward(&self, query: &[u8], per_upstream: Duration) -> Result<Vec<u8>, ForwardFailure> {
+        if query.len() < 12 {
+            // A caller bug, and the one failure with no per-upstream WARN
+            // behind it — log at the point of detection or it is invisible to
+            // whichever caller consumes the `Err`.
+            tracing::warn!(
+                len = query.len(),
+                "DNS forward called with a query shorter than the header"
+            );
+            return Err(ForwardFailure::MalformedQuery);
+        }
+
+        let mut worst: Option<UpstreamCause> = None;
+        for (idx, &server) in self.config.servers.iter().enumerate() {
             if server.is_ipv6() && !self.ipv6_bypass_available {
                 self.log_ipv6_skip_once(server);
                 continue;
             }
 
-            let port = {
-                #[cfg(test)]
-                {
-                    self.forced_port.unwrap_or_else(|| default_port(self.config.protocol))
+            let target = SocketAddr::new(server, self.port_for(idx));
+            match self.forward_one(target, query, per_upstream).await {
+                Ok(reply) => return Ok(reply),
+                Err(e) => {
+                    let cause = e.cause();
+                    self.log_upstream_failure(server, &e);
+                    if worst.is_none_or(|w| cause.rank() > w.rank()) {
+                        worst = Some(cause);
+                    }
                 }
-                #[cfg(not(test))]
-                {
-                    default_port(self.config.protocol)
-                }
-            };
-            let target = SocketAddr::new(server, port);
-            match self.forward_one(target, query).await {
-                Ok(reply) => return reply,
-                Err(e) => self.log_upstream_failure(server, &e),
             }
         }
 
-        synthesize_servfail(query)
+        Err(worst.map_or(ForwardFailure::NoUpstream, ForwardFailure::Upstream))
     }
 
-    /// Single-attempt forward against `target`. Callers build `target`
-    /// from the config'd server plus the protocol's well-known port;
-    /// the test-only `forward_with_ports` builds it from an ephemeral
-    /// port so stubs don't need privilege to bind 53/853/443.
-    async fn forward_one(&self, target: SocketAddr, query: &[u8]) -> Result<Vec<u8>, UpstreamErr> {
+    /// Upstream port for the server at `_idx`. Production always answers the
+    /// protocol's well-known port; tests may override per server index.
+    fn port_for(&self, _idx: usize) -> u16 {
+        #[cfg(test)]
+        if let Some(ports) = self.forced_ports.as_ref() {
+            // `new_with_ports` is the only writer and asserts full coverage.
+            // Falling through here would dial a real public resolver.
+            return ports[_idx];
+        }
+        default_port(self.config.protocol)
+    }
+
+    /// Single-attempt forward against `target`, bounded by `budget`. Callers
+    /// build `target` from the config'd server plus the protocol's well-known
+    /// port; the test-only `port_for` / `forced_ports` seam substitutes an
+    /// ephemeral port so stubs don't need privilege to bind 53/853/443.
+    ///
+    /// Every error — including the budget's own — is decorated from the
+    /// [`AttemptProbe`], so the diagnostic fields mean the same thing on every
+    /// layer. The bytes the attempt moved fold into the forwarder's cumulative
+    /// totals whether it succeeded or not.
+    async fn forward_one(&self, target: SocketAddr, query: &[u8], budget: Duration) -> Result<Vec<u8>, UpstreamErr> {
         let started = Instant::now();
+        let probe = AttemptProbe::default();
         let fut = async {
             match self.config.protocol {
-                DnsProtocol::PlainUdp => self.forward_udp(target, query).await,
-                DnsProtocol::PlainTcp => self.forward_tcp(target, query).await,
-                DnsProtocol::Tls => self.forward_tls(target, query).await,
-                DnsProtocol::Https => self.forward_https(target, query).await,
+                DnsProtocol::PlainUdp => self.forward_udp(target, query, &probe).await,
+                DnsProtocol::PlainTcp => self.forward_tcp(target, query, &probe).await,
+                DnsProtocol::Tls => self.forward_tls(target, query, &probe).await,
+                DnsProtocol::Https => self.forward_https(target, query, &probe).await,
             }
         };
-        let result = match timeout(UPSTREAM_TIMEOUT, fut).await {
+        let result = match timeout(budget, fut).await {
             Ok(res) => res,
             Err(_) => Err(UpstreamErr::new(
                 UpstreamLayer::Timeout,
                 io::Error::new(io::ErrorKind::TimedOut, "upstream timeout"),
             )),
         };
+        let (read, written) = probe.bytes();
+        self.upstream_read.fetch_add(read, Ordering::Relaxed);
+        self.upstream_written.fetch_add(written, Ordering::Relaxed);
+        self.upstream_connects
+            .fetch_add(u64::from(probe.established()), Ordering::Relaxed);
+        self.upstream_associates
+            .fetch_add(u64::from(probe.datagram_established()), Ordering::Relaxed);
         result.map_err(|mut e| {
             e.elapsed_ms = started.elapsed().as_millis() as u64;
+            e.budget_ms = budget.as_millis() as u64;
+            probe.apply(&mut e);
             e
         })
     }
@@ -402,12 +777,15 @@ impl DnsForwarder {
                     %server,
                     protocol = ?self.config.protocol,
                     layer = %e.layer,
+                    cause = %e.cause(),
                     elapsed_ms = e.elapsed_ms,
-                    budget_ms = UPSTREAM_TIMEOUT.as_millis() as u64,
+                    budget_ms = e.budget_ms,
                     socks5_ms = ?e.socks5_ms,
                     tls_ms = ?e.tls_ms,
                     tcp_wrote = ?e.tcp_wrote,
                     tcp_read = ?e.tcp_read,
+                    udp_sent = ?e.udp_sent,
+                    udp_received = ?e.udp_received,
                     os_errno = ?e.os_errno,
                     caused_by = %format_error_chain(&e.source),
                     "upstream failed"
@@ -430,8 +808,8 @@ impl DnsForwarder {
     }
 }
 
-/// Well-known port per protocol. Split out so `forward_with_ports` (test
-/// helper) can reuse the mapping.
+/// Well-known port per protocol. Split out so the test-only `port_for`
+/// override can reuse the mapping.
 fn default_port(protocol: DnsProtocol) -> u16 {
     match protocol {
         DnsProtocol::PlainUdp | DnsProtocol::PlainTcp => DNS_PORT_PLAIN,
@@ -443,12 +821,20 @@ fn default_port(protocol: DnsProtocol) -> u16 {
 // Transport: plain UDP ================================================================================================
 
 impl DnsForwarder {
-    async fn forward_udp(&self, target: SocketAddr, query: &[u8]) -> Result<Vec<u8>, UpstreamErr> {
+    async fn forward_udp(
+        &self,
+        target: SocketAddr,
+        query: &[u8],
+        probe: &AttemptProbe,
+    ) -> Result<Vec<u8>, UpstreamErr> {
         let socket = self
             .connector
             .connect_udp(target)
             .await
             .map_err(|e| UpstreamErr::new(UpstreamLayer::Connect, e))?;
+        // Published before the first send: the handle counts at the wire, so a
+        // reply that arrives and then fails to parse still registers.
+        probe.associated(socket.counters());
         socket
             .send(query)
             .await
@@ -466,63 +852,68 @@ impl DnsForwarder {
 // Transport: plain TCP ================================================================================================
 
 impl DnsForwarder {
-    async fn forward_tcp(&self, target: SocketAddr, query: &[u8]) -> Result<Vec<u8>, UpstreamErr> {
+    async fn forward_tcp(
+        &self,
+        target: SocketAddr,
+        query: &[u8],
+        probe: &AttemptProbe,
+    ) -> Result<Vec<u8>, UpstreamErr> {
         let socks5_start = Instant::now();
         let connected = self
             .connector
             .connect_tcp(target)
             .await
             .map_err(|e| UpstreamErr::new(UpstreamLayer::Connect, e))?;
-        let socks5_ms = socks5_start.elapsed().as_millis() as u64;
         let (stream, counters) = connected.into_parts();
-        exchange_tcp_framed(stream, query).await.map_err(|e| {
-            UpstreamErr::new(UpstreamLayer::Io, e)
-                .with_socks5_ms(socks5_ms)
-                .with_counters(&counters)
-        })
+        probe.connected(socks5_start.elapsed().as_millis() as u64, &counters);
+        exchange_tcp_framed(stream, query)
+            .await
+            .map_err(|e| UpstreamErr::new(UpstreamLayer::Io, e))
     }
 }
 
 // Transport: DoT (TLS over TCP) =======================================================================================
 
 impl DnsForwarder {
-    async fn forward_tls(&self, target: SocketAddr, query: &[u8]) -> Result<Vec<u8>, UpstreamErr> {
+    async fn forward_tls(
+        &self,
+        target: SocketAddr,
+        query: &[u8],
+        probe: &AttemptProbe,
+    ) -> Result<Vec<u8>, UpstreamErr> {
         let socks5_start = Instant::now();
         let connected = self
             .connector
             .connect_tcp(target)
             .await
             .map_err(|e| UpstreamErr::new(UpstreamLayer::Connect, e))?;
-        let socks5_ms = socks5_start.elapsed().as_millis() as u64;
         let (stream, counters) = connected.into_parts();
+        probe.connected(socks5_start.elapsed().as_millis() as u64, &counters);
 
-        let server_name = tls_server_name_for(target.ip()).map_err(|e| {
-            UpstreamErr::new(UpstreamLayer::Tls, e)
-                .with_socks5_ms(socks5_ms)
-                .with_counters(&counters)
-        })?;
+        let server_name = tls_server_name_for(target.ip()).map_err(|e| UpstreamErr::new(UpstreamLayer::Tls, e))?;
         let tls_start = Instant::now();
+        probe.tls_started();
         let tls_connector = tokio_rustls::TlsConnector::from(Arc::clone(&self.tls_config));
-        let tls = tls_connector.connect(server_name, stream).await.map_err(|e| {
-            UpstreamErr::new(UpstreamLayer::Tls, e)
-                .with_socks5_ms(socks5_ms)
-                .with_tls_ms(tls_start.elapsed().as_millis() as u64)
-                .with_counters(&counters)
-        })?;
-        let tls_ms = tls_start.elapsed().as_millis() as u64;
-        exchange_tcp_framed(tls, query).await.map_err(|e| {
-            UpstreamErr::new(UpstreamLayer::Io, e)
-                .with_socks5_ms(socks5_ms)
-                .with_tls_ms(tls_ms)
-                .with_counters(&counters)
-        })
+        let tls = tls_connector
+            .connect(server_name, stream)
+            .await
+            .map_err(|e| UpstreamErr::new(UpstreamLayer::Tls, e))?;
+        probe.tls_done(tls_start.elapsed().as_millis() as u64);
+        exchange_tcp_framed(tls, query)
+            .await
+            .map_err(|e| UpstreamErr::new(UpstreamLayer::Io, e))
     }
 }
 
 // Transport: DoH (HTTP/1.1 over TLS) ==================================================================================
 
 impl DnsForwarder {
-    async fn forward_https(&self, target: SocketAddr, query: &[u8]) -> Result<Vec<u8>, UpstreamErr> {
+    async fn forward_https(
+        &self,
+        target: SocketAddr,
+        query: &[u8],
+        probe: &AttemptProbe,
+    ) -> Result<Vec<u8>, UpstreamErr> {
         let (server_name, path_and_host) =
             https_target_for(target.ip()).map_err(|e| UpstreamErr::new(UpstreamLayer::Http, e))?;
 
@@ -532,18 +923,17 @@ impl DnsForwarder {
             .connect_tcp(target)
             .await
             .map_err(|e| UpstreamErr::new(UpstreamLayer::Connect, e))?;
-        let socks5_ms = socks5_start.elapsed().as_millis() as u64;
         let (stream, counters) = connected.into_parts();
+        probe.connected(socks5_start.elapsed().as_millis() as u64, &counters);
 
         let tls_start = Instant::now();
+        probe.tls_started();
         let tls_connector = tokio_rustls::TlsConnector::from(Arc::clone(&self.tls_config));
-        let mut tls = tls_connector.connect(server_name, stream).await.map_err(|e| {
-            UpstreamErr::new(UpstreamLayer::Tls, e)
-                .with_socks5_ms(socks5_ms)
-                .with_tls_ms(tls_start.elapsed().as_millis() as u64)
-                .with_counters(&counters)
-        })?;
-        let tls_ms = tls_start.elapsed().as_millis() as u64;
+        let mut tls = tls_connector
+            .connect(server_name, stream)
+            .await
+            .map_err(|e| UpstreamErr::new(UpstreamLayer::Tls, e))?;
+        probe.tls_done(tls_start.elapsed().as_millis() as u64);
 
         let (host, path) = path_and_host;
         let mut req = Vec::with_capacity(256 + query.len());
@@ -561,12 +951,7 @@ impl DnsForwarder {
         .unwrap();
         req.extend_from_slice(query);
 
-        let io_err = |e: io::Error| {
-            UpstreamErr::new(UpstreamLayer::Io, e)
-                .with_socks5_ms(socks5_ms)
-                .with_tls_ms(tls_ms)
-                .with_counters(&counters)
-        };
+        let io_err = |e: io::Error| UpstreamErr::new(UpstreamLayer::Io, e);
         tls.write_all(&req).await.map_err(io_err)?;
         tls.flush().await.map_err(io_err)?;
 
@@ -577,12 +962,7 @@ impl DnsForwarder {
             .await
             .map_err(io_err)?;
 
-        parse_http_dns_response(&resp).map_err(|e| {
-            UpstreamErr::new(UpstreamLayer::Http, e)
-                .with_socks5_ms(socks5_ms)
-                .with_tls_ms(tls_ms)
-                .with_counters(&counters)
-        })
+        parse_http_dns_response(&resp).map_err(|e| UpstreamErr::new(UpstreamLayer::Http, e))
     }
 }
 
@@ -693,6 +1073,26 @@ pub(crate) fn build_tls_config_with_extra_root(extra: rustls_pki_types::Certific
 
 #[cfg(test)]
 impl DnsForwarder {
+    /// Test-only forwarder with per-server upstream-port overrides — see the
+    /// `forced_ports` field. Every server must get one: an uncovered index
+    /// falls back to the real well-known port, which would dial a public
+    /// resolver for real from a test.
+    pub(crate) fn new_with_ports(
+        config: DnsConfig,
+        connector: Arc<dyn UpstreamConnector>,
+        ipv6_bypass_available: bool,
+        ports: Vec<u16>,
+    ) -> Self {
+        assert_eq!(
+            ports.len(),
+            config.servers.len(),
+            "forced_ports must cover every configured server"
+        );
+        let mut s = Self::new(config, connector, ipv6_bypass_available);
+        s.forced_ports = Some(ports);
+        s
+    }
+
     /// Test-only forwarder trusting one extra root, with a fixed upstream port
     /// so the loopback e2e can target an ephemeral DoH listener. Compiled out
     /// of production — never weakens the real `webpki_roots` verifier.
@@ -703,9 +1103,9 @@ impl DnsForwarder {
         extra_root: rustls_pki_types::CertificateDer<'static>,
         forced_port: u16,
     ) -> Self {
-        let mut s = Self::new(config, connector, ipv6_bypass_available);
+        let ports = vec![forced_port; config.servers.len()];
+        let mut s = Self::new_with_ports(config, connector, ipv6_bypass_available, ports);
         s.tls_config = Arc::new(build_tls_config_with_extra_root(extra_root));
-        s.forced_port = Some(forced_port);
         s
     }
 }
@@ -771,6 +1171,19 @@ fn parse_http_dns_response(resp: &[u8]) -> io::Result<Vec<u8>> {
 fn find_double_crlf(buf: &[u8]) -> Option<usize> {
     const NEEDLE: &[u8] = b"\r\n\r\n";
     buf.windows(NEEDLE.len()).position(|w| w == NEEDLE)
+}
+
+/// Test-only adapter for `DohQuerier` stubs that model a resolver by building
+/// an answer or not building one. `None` means "this resolver served no record
+/// of that type" — a resolver that ANSWERED with nothing, which is `Ok` at the
+/// seam, not an `Err`. Collapses the six stubs that would otherwise each
+/// re-derive that mapping by hand.
+#[cfg(test)]
+pub(crate) fn answered_or_servfail(
+    wire: &[u8],
+    build: impl FnOnce() -> Option<Vec<u8>>,
+) -> Result<Vec<u8>, UpstreamCause> {
+    Ok(build().unwrap_or_else(|| synthesize_servfail(wire)))
 }
 
 /// Build a SERVFAIL response from an incoming query. Preserves the
