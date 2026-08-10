@@ -154,8 +154,15 @@ pass_filenames = false
 # `rules.unresolved-import = "ignore"`) and added false-positive
 # `invalid-argument-type` findings — see #667. Pinned so a new release can't
 # break every push.
+#
+# That regression is still present as of 0.0.65: PEP 723 scripts
+# (scripts/generate-release-notes.py, scripts/sign-release.py) no longer
+# inherit the root ty.toml's unresolved-import ignore, so their imports
+# must resolve for real. pathspec/PyYAML are the scripts' own PEP 723
+# deps; pytest is their inline test runner (supplied here the same way
+# CI's "Test release scripts" step supplies it).
 # renovate: datasource=pypi depName=ty
-additional_dependencies = ["ty==0.0.65"]
+additional_dependencies = ["ty==0.0.65", "pathspec>=0.12", "PyYAML>=6", "pytest"]
 
 # External hooks =======================================================================================================
 
