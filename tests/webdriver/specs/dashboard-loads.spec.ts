@@ -1,16 +1,17 @@
 // Regression gate: the dashboard webview must load the bundled frontend,
 // not WebView2's "localhost refused to connect" error page.
 //
-// Failure modes this guards against:
-// - hole.exe compiled with `cfg(dev)` ON (missing `tauri/custom-protocol`),
-//   so it tries `http://localhost:1420/` at runtime → connection refused.
-// - `ui/dist/` missing / empty at build time, so embedded assets are empty
-//   and the dashboard navigates to a stub or fallback URL.
+// The failure mode this guards: `ui/dist/` missing or empty at build time, so
+// the embedded assets serve nothing at `DASHBOARD_URL`. The other failure
+// mode — a release binary built without `tauri/custom-protocol`, which points
+// the webview at `http://localhost:1420/` — is a compile error in
+// crates/hole/src/main.rs, not something a spec can observe: the gate drives
+// the navigation, so no spec sees the app's own choice of URL.
 //
-// The wdio.conf.ts `before` hook parks the suite until `init()` in
-// ui/main.ts has signaled completion via the `wait_ui_ready` Tauri
-// command. By the time these specs run, the page is loaded and the
-// app's init() has finished — no per-test wait needed.
+// The Mocha root hook (tests/webdriver/root-hooks.ts) navigates to the
+// dashboard document and parks the suite until `init()` in ui/main.ts has
+// settled. By the time these specs run, the page is loaded and the app's
+// init() has finished — no per-test wait needed.
 
 describe("Dashboard window", () => {
   it("loads the bundled HTML (not the WebView2 error page)", async () => {

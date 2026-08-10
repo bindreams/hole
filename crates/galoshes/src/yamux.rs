@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 // `Context` alone would collide with `anyhow::Context` (the `.context()` combinator, used
 // throughout this file); the tap's poll methods spell out `std::task::Context` instead.
@@ -13,9 +13,16 @@ use futures::AsyncReadExt as _;
 use futures::AsyncWriteExt as _;
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{mpsc, oneshot};
+use tokio::task::JoinSet;
 use tokio::time::Instant;
 use tokio_util::compat::{FuturesAsyncReadCompatExt, TokioAsyncReadCompatExt};
 use tokio_util::sync::CancellationToken;
+
+pub(crate) mod keepalive;
+#[cfg(test)]
+mod keepalive_tests;
+
+use keepalive::Cadence;
 
 /// Maximum buffered outbound datagrams per UDP association before new ones are
 /// dropped. Bounded (not unbounded) so a stalled association — e.g. yamux
@@ -28,12 +35,33 @@ const UDP_ASSOC_CHANNEL_CAPACITY: usize = 64;
 /// in `SS_PLUGIN_OPTIONS`. Matches shadowsocks-rust's `udp_timeout` default.
 pub const DEFAULT_UDP_TIMEOUT: Duration = Duration::from_secs(300);
 
+/// `Instant::now() + udp_timeout`, saturating instead of panicking on
+/// overflow. `run_udp_association`'s idle-eviction reset re-reads the clock
+/// on every datagram for the process's whole lifetime, so a `udp_timeout`
+/// that fit `Instant::now()` at parse time (`parse_udp_timeout`'s own
+/// `checked_add` probe) is not guaranteed to still fit once the process has
+/// been up for a while — the margin shrinks as uptime grows. Mirrors the
+/// ask-forgiveness shape `tokio::time::sleep` itself uses (`checked_add`
+/// falling back to `Instant::far_future`), re-derived here because
+/// `far_future` is `pub(crate)` upstream.
+pub(crate) fn saturating_deadline(udp_timeout: Duration) -> Instant {
+    Instant::now().checked_add(udp_timeout).unwrap_or_else(|| {
+        // Roughly 30 years out — matches tokio::time::Instant::far_future's
+        // own margin, chosen there because 1000 years overflows on macOS and
+        // 100 years overflows on FreeBSD.
+        Instant::now() + Duration::from_secs(86_400 * 365 * 30)
+    })
+}
+
 // Protocol framing ====================================================================================================
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StreamTag {
     Tcp = 0x01,
     Udp = 0x02,
+    /// Client-opened liveness probe: the client writes `KEEPALIVE_NONCE_LEN`
+    /// bytes and the server echoes them back and closes.
+    Keepalive = 0x03,
 }
 
 impl StreamTag {
@@ -45,10 +73,14 @@ impl StreamTag {
         match b {
             0x01 => Some(Self::Tcp),
             0x02 => Some(Self::Udp),
+            0x03 => Some(Self::Keepalive),
             _ => None,
         }
     }
 }
+
+/// Payload size of one keepalive probe: a big-endian `u64` nonce.
+pub(crate) const KEEPALIVE_NONCE_LEN: usize = 8;
 
 /// Frame a UDP datagram with a 2-byte big-endian length prefix.
 pub fn frame_udp_datagram(payload: &[u8]) -> Vec<u8> {
@@ -286,23 +318,27 @@ async fn write_tag(stream: &mut yamux::Stream, tag: StreamTag) -> std::io::Resul
 
 // Liveness tap ========================================================================================================
 
-/// Wraps the yamux transport and sets `productive` on the first inbound byte.
+/// Wraps the yamux transport and counts inbound reads — this crate's single
+/// transport-liveness signal.
 ///
-/// `run_client` gives this to `yamux::Connection::new`, so the tap is polled only
-/// by the driver task; reading `productive` after `driver.await` therefore has a
-/// happens-before edge to every write here (no cross-task race). It sits *below*
-/// yamux framing, so any inbound frame counts — relayed data or flow-control /
-/// keepalive frames alike. That is deliberate: it measures *transport*-level
-/// liveness (the far yamux peer responded), which is the correct signal for a
-/// transport reconnect, not end-to-end application relay.
+/// `SessionTransport::spawn` gives this to `yamux::Connection::new`, so the tap
+/// is written only by the driver task. It sits *below* yamux framing, so any
+/// inbound frame counts — relayed data, a flow-control window update, a yamux
+/// pong, or a peer's stream reset alike. That is deliberate: it measures
+/// *transport*-level liveness (the far yamux peer responded), which is the right
+/// signal both for the reconnect backoff and for the keepalive's verdict, neither
+/// of which is about application relay.
+///
+/// `Relaxed` is sufficient: two samples of a monotonic counter are compared for
+/// inequality and no other memory is published through it.
 pub(crate) struct TransportLivenessTap<T> {
     inner: T,
-    productive: Arc<AtomicBool>,
+    inbound_reads: Arc<AtomicU64>,
 }
 
 impl<T> TransportLivenessTap<T> {
-    pub(crate) fn new(inner: T, productive: Arc<AtomicBool>) -> Self {
-        Self { inner, productive }
+    pub(crate) fn new(inner: T, inbound_reads: Arc<AtomicU64>) -> Self {
+        Self { inner, inbound_reads }
     }
 }
 
@@ -316,7 +352,7 @@ impl<T: futures::AsyncRead + Unpin> futures::AsyncRead for TransportLivenessTap<
         let r = Pin::new(&mut me.inner).poll_read(cx, buf);
         if let Poll::Ready(Ok(n)) = &r {
             if *n > 0 {
-                me.productive.store(true, Ordering::Relaxed);
+                me.inbound_reads.fetch_add(1, Ordering::Relaxed);
             }
         }
         r
@@ -536,7 +572,7 @@ async fn run_udp_association(
             // local app -> server
             maybe = outbound_rx.recv() => {
                 let Some(payload) = maybe else { break "channel closed" };
-                idle.as_mut().reset(Instant::now() + udp_timeout);
+                idle.as_mut().reset(saturating_deadline(udp_timeout));
                 let framed = frame_udp_datagram(&payload);
                 if stream.write_all(&framed).await.is_err() {
                     break "stream write error";
@@ -552,7 +588,7 @@ async fn run_udp_association(
                     Ok(n) => n,
                     Err(_) => break "stream read error",
                 };
-                idle.as_mut().reset(Instant::now() + udp_timeout);
+                idle.as_mut().reset(saturating_deadline(udp_timeout));
                 acc.push(&read_buf[..n]);
                 while let Some(payload) = acc.next_frame() {
                     if let Err(e) = udp_socket.send_to(&payload, peer).await {
@@ -584,29 +620,43 @@ async fn run_udp_association(
     let _ = cleanup_tx.send((peer, generation)).await;
 }
 
-/// The client's bound local listener addresses, reported via the `run_client`
-/// test seam. The TCP listener and UDP socket are bound separately, so on a
-/// `:0` (ephemeral) `local` they land on different ports — tests need both.
-/// Production passes `None` and never observes this.
-// The fields are read only from `#[cfg(test)]` code (the relay tests), so the
-// non-test lib build sees them as write-only; allow that, keep the lint in tests.
-#[cfg_attr(not(test), allow(dead_code))]
+/// The client's bound local listener addresses. `YamuxPlugin::run` reports
+/// readiness at `tcp`; the relay tests need both.
+///
+/// The TCP listener and UDP socket are bound separately, so on a `:0`
+/// (ephemeral) `local` they land on different ports — only the relay tests,
+/// which call `run_client` directly, ever pass `:0`. Reporting `tcp` as the
+/// hop's single `listen` is sound because the yamux client is chain position 0,
+/// so its `local` is `PluginEnv::local_addr()` — `SS_LOCAL_HOST`/`SS_LOCAL_PORT`,
+/// which shadowsocks-rust always sets to a concrete allocated port.
 pub(crate) struct ClientBoundAddrs {
     pub tcp: SocketAddr,
+    // Read only from `#[cfg(test)]` code, so the non-test lib build sees it as
+    // write-only; allow that, keep the lint in tests.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub udp: SocketAddr,
 }
 
-/// Join an aborted driver task. Returns `true` iff it ended by a genuine panic (a
-/// code bug, distinct from our own `abort()`), logging it. A panic must be
-/// fatal, not folded into ordinary reconnect churn — a driver panic drops
-/// `inbound_tx` and so is indistinguishable from a clean transport death at the
-/// `inbound_rx` seam, so the caller uses this to escalate instead of retrying.
+/// The sole definition of "this task ended by a genuine panic": a code bug,
+/// distinct from our own `abort()`. Every escalation path classifies through it.
+fn task_panic(result: std::result::Result<(), tokio::task::JoinError>) -> Option<tokio::task::JoinError> {
+    match result {
+        Ok(()) => None,
+        Err(e) if e.is_cancelled() => None,
+        Err(e) => Some(e),
+    }
+}
+
+/// Join an aborted driver task. Returns `true` iff it panicked, logging it. A
+/// panic must be fatal, not folded into ordinary reconnect churn — a driver
+/// panic drops `inbound_tx` and so is indistinguishable from a clean transport
+/// death at the `inbound_rx` seam, so the caller uses this to escalate instead
+/// of retrying.
 #[must_use]
 pub(crate) fn driver_panicked(result: std::result::Result<(), tokio::task::JoinError>) -> bool {
-    match result {
-        Ok(()) => false,
-        Err(e) if e.is_cancelled() => false,
-        Err(e) => {
+    match task_panic(result) {
+        None => false,
+        Some(e) => {
             tracing::error!(error = %e, "yamux driver task panicked");
             true
         }
@@ -614,24 +664,87 @@ pub(crate) fn driver_panicked(result: std::result::Result<(), tokio::task::JoinE
 }
 
 /// Why a single yamux client session ended, deciding what `run_client` does next.
-enum SessionOutcome {
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum SessionOutcome {
     /// Shutdown requested — stop for good.
     Shutdown,
     /// The transport (yamux) connection died — reconnect.
     TransportDied,
 }
 
+/// Everything one yamux connection owns, re-created on every reconnect. The
+/// local listeners and the shutdown token outlive it, so they stay separate.
+pub(crate) struct SessionTransport {
+    open_tx: mpsc::Sender<OpenStreamReply>,
+    /// Server-initiated substreams. The client expects none: the channel closing
+    /// is how the driver reports that the connection ended.
+    inbound_rx: mpsc::Receiver<yamux::Stream>,
+    /// Inbound reads counted below yamux framing.
+    inbound_reads: Arc<AtomicU64>,
+}
+
+impl SessionTransport {
+    /// Wrap `tcp` in a tapped yamux client connection and spawn its driver.
+    ///
+    /// The tap is owned by the driver (inside the `Connection`), so reading the
+    /// counter after the driver is joined is race-free.
+    pub(crate) fn spawn(tcp: TcpStream, config: &yamux::Config) -> (Self, tokio::task::JoinHandle<()>) {
+        let inbound_reads = Arc::new(AtomicU64::new(0));
+        let tapped = TransportLivenessTap::new(tcp.compat(), Arc::clone(&inbound_reads));
+        let conn = yamux::Connection::new(tapped, config.clone(), yamux::Mode::Client);
+
+        let (open_tx, open_rx) = mpsc::channel::<OpenStreamReply>(32);
+        let (inbound_tx, inbound_rx) = mpsc::channel::<yamux::Stream>(32);
+        let driver = tokio::spawn(drive_connection(conn, open_rx, inbound_tx));
+
+        (
+            Self {
+                open_tx,
+                inbound_rx,
+                inbound_reads,
+            },
+            driver,
+        )
+    }
+
+    /// Whether the far peer sent anything at all during this session — the
+    /// reconnect backoff's reset condition.
+    pub(crate) fn was_productive(&self) -> bool {
+        self.inbound_reads.load(Ordering::Relaxed) > 0
+    }
+
+    /// The client-side liveness loop for *this* connection.
+    ///
+    /// Both halves come from `self`, so a caller cannot hand the keepalive a
+    /// counter other than the one this session's tap feeds — which would declare
+    /// a perfectly healthy tunnel dead every cycle.
+    pub(crate) fn keepalive(&self, cadence: Cadence) -> impl std::future::Future<Output = ()> {
+        keepalive::run_keepalive(self.open_tx.clone(), Arc::clone(&self.inbound_reads), cadence)
+    }
+}
+
 /// Serve one yamux connection until it ends. The local TCP+UDP listeners are
-/// owned by `run_client` and persist across reconnects; only the yamux connection
-/// (its `open_tx` / `inbound_rx`) is per-session.
-async fn run_client_session(
+/// owned by `run_client` and persist across reconnects; only the `session` is
+/// per-connection.
+pub(crate) async fn run_client_session(
     tcp_listener: &TcpListener,
     udp_socket: &Arc<UdpSocket>,
-    open_tx: &mpsc::Sender<OpenStreamReply>,
-    inbound_rx: &mut mpsc::Receiver<yamux::Stream>,
+    session: &mut SessionTransport,
     udp_timeout: Duration,
+    cadence: Cadence,
     shutdown: &CancellationToken,
 ) -> SessionOutcome {
+    // Pinned outside the loop so the cadence survives every other select arm
+    // firing, and so an in-flight probe is not restarted by unrelated traffic.
+    let keepalive = session.keepalive(cadence);
+    tokio::pin!(keepalive);
+
+    let SessionTransport {
+        open_tx,
+        inbound_rx,
+        inbound_reads: _,
+    } = session;
+
     let mut associations: HashMap<SocketAddr, (u64, mpsc::Sender<Vec<u8>>)> = HashMap::new();
     let (cleanup_tx, mut cleanup_rx) = mpsc::channel::<(SocketAddr, u64)>(64);
     let mut next_gen: u64 = 0;
@@ -640,6 +753,9 @@ async fn run_client_session(
     loop {
         tokio::select! {
             _ = shutdown.cancelled() => return SessionOutcome::Shutdown,
+            // A transport that has gone silent: black-holed with no RST or FIN,
+            // so no other arm here would ever notice.
+            () = &mut keepalive => return SessionOutcome::TransportDied,
             // Transport death: the driver dropped its inbound sender. A `Some` is a
             // protocol violation (the server never opens streams to the client);
             // untrusted remote input — log and drop, never panic.
@@ -756,7 +872,7 @@ pub(crate) async fn run_client(
     let tcp_listener = TcpListener::bind(local).await.context("bind local TCP")?;
     let udp_socket = Arc::new(bind_udp(local).context("bind local UDP")?);
 
-    // Report the actual bound listener addresses (test seam). Production passes `None`.
+    // Readiness signal: both listeners are up, so the hop is serving.
     if let Some(tx) = bound_addr_tx {
         let _ = tx.send(ClientBoundAddrs {
             tcp: tcp_listener.local_addr().context("local tcp addr")?,
@@ -776,34 +892,24 @@ pub(crate) async fn run_client(
 
         tracing::info!(remote = %remote, "connected to yamux server");
 
-        // Tap the transport for inbound liveness. The tap is owned by the driver
-        // (inside the Connection), so reading `productive` after `driver.await`
-        // is race-free.
-        let productive = Arc::new(AtomicBool::new(false));
-        let tapped = TransportLivenessTap::new(tcp.compat(), Arc::clone(&productive));
-        let conn = yamux::Connection::new(tapped, config.clone(), yamux::Mode::Client);
-
-        let (open_tx, open_rx) = mpsc::channel::<OpenStreamReply>(32);
-        // The client never expects server-initiated streams; this channel is the
-        // transport-death signal — the driver drops `inbound_tx` when the yamux
-        // connection ends, so `inbound_rx.recv()` yields `None`.
-        let (inbound_tx, mut inbound_rx) = mpsc::channel::<yamux::Stream>(32);
-
-        let driver = tokio::spawn(drive_connection(conn, open_rx, inbound_tx));
+        let (mut session, driver) = SessionTransport::spawn(tcp, &config);
 
         let outcome = run_client_session(
             &tcp_listener,
             &udp_socket,
-            &open_tx,
-            &mut inbound_rx,
+            &mut session,
             udp_timeout,
+            Cadence::default(),
             &shutdown,
         )
         .await;
 
-        // Tear down the driver deterministically. On `TransportDied` it already
-        // finished (abort is a no-op); otherwise abort ends it instead of hanging
-        // until the chain drain-timeout (`drive_connection` has no shutdown hook).
+        // Tear down the driver deterministically. When the driver itself observed
+        // the death it has already returned and the abort is a no-op; when the
+        // keepalive declared it, or on shutdown, the driver is still live and the
+        // abort is what ends it — truncating any in-flight relay, per the teardown
+        // tradeoff — instead of hanging until the chain drain-timeout
+        // (`drive_connection` has no shutdown hook).
         // A driver panic is a code bug, not a transport event — exit rather than reconnect.
         driver.abort();
         if driver_panicked(driver.await) {
@@ -813,7 +919,7 @@ pub(crate) async fn run_client(
         match outcome {
             SessionOutcome::Shutdown => return Ok(()),
             SessionOutcome::TransportDied => {
-                let was_productive = productive.load(Ordering::Relaxed);
+                let was_productive = session.was_productive();
                 failures = next_failures(failures, was_productive);
                 tracing::warn!(
                     failures,
@@ -842,29 +948,60 @@ pub(crate) async fn run_server(
     shutdown: CancellationToken,
     bound_addr_tx: Option<oneshot::Sender<SocketAddr>>,
 ) -> Result<()> {
+    run_server_with_connections(config, local, remote, shutdown, bound_addr_tx, serve_underlying).await
+}
+
+/// [`run_server`] over an injectable per-connection handler; tests substitute
+/// `serve` to drive the supervision policy without a real yamux peer.
+pub(crate) async fn run_server_with_connections<S, F>(
+    config: yamux::Config,
+    local: SocketAddr,
+    remote: SocketAddr,
+    shutdown: CancellationToken,
+    bound_addr_tx: Option<oneshot::Sender<SocketAddr>>,
+    serve: S,
+) -> Result<()>
+where
+    S: Fn(TcpStream, SocketAddr, yamux::Config, SocketAddr, CancellationToken) -> F,
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
     let listener = TcpListener::bind(local)
         .await
         .with_context(|| format!("bind yamux server on {local}"))?;
     tracing::info!(local = %local, "yamux server listening");
 
-    // Signal the actual bound listen address (test seam). Production passes `None`.
+    // Readiness signal: the listener is up, so the hop is serving.
     if let Some(tx) = bound_addr_tx {
         let addr = listener.local_addr().context("local tcp addr")?;
         let _ = tx.send(addr);
     }
 
-    loop {
-        // Accept one underlying TCP connection. A real accept error is rare and
-        // transient (see `run_client_session`'s local-accept rationale); log and
-        // keep serving rather than tearing down the whole plugin.
-        let tcp = tokio::select! {
-            _ = shutdown.cancelled() => return Ok(()),
+    // Every connection task is owned here, never detached: joining them is what
+    // makes a panic fatal (below) and what makes `run_server` returning mean
+    // their drivers really were aborted and their sockets closed.
+    let mut connections: JoinSet<()> = JoinSet::new();
+
+    // Connection tasks wind down on this child token, so the fatal path below
+    // can stop them the same cooperative way an external shutdown does. Aborting
+    // them instead would drop each task at an await point, detaching its driver
+    // and leaking the socket the driver owns.
+    let connections_shutdown = shutdown.child_token();
+
+    let mut fatal = loop {
+        // A real accept error is rare and transient (see `run_client_session`'s
+        // local-accept rationale); log and keep serving rather than tearing down
+        // the whole plugin.
+        let (tcp, peer) = tokio::select! {
+            _ = shutdown.cancelled() => break false,
+            Some(joined) = connections.join_next() => {
+                if connection_task_fatal(joined) {
+                    break true;
+                }
+                continue;
+            }
             accept = listener.accept() => {
                 match accept {
-                    Ok((stream, peer)) => {
-                        tracing::info!(peer = %peer, "accepted underlying connection");
-                        stream
-                    }
+                    Ok(v) => v,
                     Err(e) => {
                         tracing::debug!(error = %e, "server accept error; continuing");
                         tokio::task::yield_now().await;
@@ -873,43 +1010,120 @@ pub(crate) async fn run_server(
                 }
             }
         };
+        tracing::info!(peer = %peer, "accepted underlying connection");
 
-        let compat_tcp = tcp.compat();
-        let conn = yamux::Connection::new(compat_tcp, config.clone(), yamux::Mode::Server);
+        // Each underlying connection is served on its own task. A server plugin
+        // fronts every client of its ss-server, and a reconnecting client opens
+        // its next transport before the previous one is reaped — so serving them
+        // one at a time leaves later connections accepted by the kernel but never
+        // read, black-holing their traffic.
+        connections.spawn(serve(tcp, peer, config.clone(), remote, connections_shutdown.clone()));
+    };
 
-        let (_open_tx, open_rx) = mpsc::channel::<OpenStreamReply>(32);
-        let (inbound_tx, mut inbound_rx) = mpsc::channel::<yamux::Stream>(64);
+    // A fatal exit cancels the child token so peers wind down cooperatively; an
+    // external shutdown already cancelled the parent. Either way we drain here,
+    // so a second panic racing the teardown is still escalated.
+    if fatal {
+        connections_shutdown.cancel();
+    }
+    while let Some(joined) = connections.join_next().await {
+        fatal |= connection_task_fatal(joined);
+    }
 
-        let driver = tokio::spawn(drive_connection(conn, open_rx, inbound_tx));
+    if fatal {
+        return Err(anyhow::anyhow!("yamux connection task panicked"));
+    }
+    Ok(())
+}
 
-        let server_shutdown = shutdown.clone();
-        let remote_addr = remote;
-
-        // Handle inbound streams until the connection closes.
-        loop {
-            let stream = tokio::select! {
-                _ = server_shutdown.cancelled() => break,
-                stream = inbound_rx.recv() => {
-                    match stream {
-                        Some(s) => s,
-                        None => break, // driver closed
-                    }
-                }
-            };
-
-            let remote = remote_addr;
-            tokio::spawn(async move {
-                if let Err(e) = handle_inbound_stream(stream, remote).await {
-                    tracing::debug!(error = %e, "inbound stream handler ended");
-                }
-            });
+/// Whether a joined connection task means the plugin must exit. A panic is a
+/// code bug, so it is fatal rather than folded into ordinary connection churn;
+/// an aborted task is our own teardown, not a bug.
+#[must_use]
+pub(crate) fn connection_task_fatal(joined: std::result::Result<(), tokio::task::JoinError>) -> bool {
+    match task_panic(joined) {
+        None => false,
+        Some(e) => {
+            tracing::error!(error = %e, "yamux connection task panicked");
+            true
         }
+    }
+}
 
-        driver.abort();
-        if driver_panicked(driver.await) {
-            return Err(anyhow::anyhow!("yamux driver task panicked"));
-        }
-        tracing::info!("underlying connection closed, waiting for next");
+/// Enable OS keepalive on an accepted connection: a peer whose path dies
+/// silently (no FIN, no RST) would otherwise hold its task, driver and socket
+/// for the plugin's lifetime, since yamux carries no liveness of its own.
+///
+/// `SO_KEEPALIVE` only — the kernel owns the cadence. socket2's
+/// `set_tcp_keepalive` would additionally issue `SIO_KEEPALIVE_VALS` on Windows
+/// and overwrite the system defaults with zeros.
+pub(crate) fn enable_keepalive(tcp: &TcpStream) {
+    if let Err(e) = socket2::SockRef::from(tcp).set_keepalive(true) {
+        tracing::debug!(error = %e, "could not enable TCP keepalive on the accepted connection");
+    }
+}
+
+/// Serve one underlying yamux connection until it ends.
+async fn serve_underlying(
+    tcp: TcpStream,
+    peer: SocketAddr,
+    config: yamux::Config,
+    remote: SocketAddr,
+    shutdown: CancellationToken,
+) {
+    enable_keepalive(&tcp);
+
+    let conn = yamux::Connection::new(tcp.compat(), config, yamux::Mode::Server);
+
+    let (_open_tx, open_rx) = mpsc::channel::<OpenStreamReply>(32);
+    let (inbound_tx, inbound_rx) = mpsc::channel::<yamux::Stream>(64);
+
+    let driver = tokio::spawn(drive_connection(conn, open_rx, inbound_tx));
+
+    serve_driven_connection(peer, remote, shutdown, driver, inbound_rx).await;
+}
+
+/// [`serve_underlying`] once its driver is spawned; tests substitute a panicking
+/// driver to drive the escalation without provoking a panic inside yamux.
+///
+/// A driver panic is re-raised here so that the supervisor's join is the single
+/// route by which a code bug reaches [`run_server`].
+pub(crate) async fn serve_driven_connection(
+    peer: SocketAddr,
+    remote: SocketAddr,
+    shutdown: CancellationToken,
+    driver: tokio::task::JoinHandle<()>,
+    mut inbound_rx: mpsc::Receiver<yamux::Stream>,
+) {
+    // Handle inbound streams until the connection closes.
+    loop {
+        let stream = tokio::select! {
+            _ = shutdown.cancelled() => break,
+            stream = inbound_rx.recv() => {
+                match stream {
+                    Some(s) => s,
+                    None => break, // driver closed
+                }
+            }
+        };
+
+        // Detached by design: one stream's bug must not take down every other
+        // client's traffic, so a panic here stays isolated to its stream and
+        // surfaces on stderr through the default hook rather than escalating.
+        tokio::spawn(async move {
+            if let Err(e) = handle_inbound_stream(stream, remote).await {
+                tracing::debug!(error = %e, "inbound stream handler ended");
+            }
+        });
+    }
+
+    driver.abort();
+    let panic = task_panic(driver.await);
+    tracing::info!(peer = %peer, "underlying connection closed");
+
+    if let Some(e) = panic {
+        tracing::error!(error = %e, "yamux driver task panicked");
+        std::panic::resume_unwind(e.into_panic());
     }
 }
 
@@ -929,9 +1143,24 @@ async fn handle_inbound_stream(mut stream: yamux::Stream, remote: SocketAddr) ->
         StreamTag::Udp => {
             relay_udp_server(stream, remote).await?;
         }
+        StreamTag::Keepalive => echo_keepalive(stream).await?,
     }
 
     Ok(())
+}
+
+/// Echo one keepalive nonce back to the client, then close the substream.
+///
+/// Exactly `KEEPALIVE_NONCE_LEN` bytes are read and written — never an open-ended
+/// echo, so a probe substream cannot be used to make the server relay arbitrary
+/// traffic. The client opens a fresh substream per probe, so one round is the
+/// whole exchange.
+async fn echo_keepalive(mut stream: yamux::Stream) -> Result<()> {
+    let mut nonce = [0u8; KEEPALIVE_NONCE_LEN];
+    stream.read_exact(&mut nonce).await.context("read keepalive nonce")?;
+    stream.write_all(&nonce).await.context("write keepalive echo")?;
+    stream.flush().await.context("flush keepalive echo")?;
+    stream.close().await.context("close keepalive substream")
 }
 
 // Plugin ==============================================================================================================
@@ -939,28 +1168,53 @@ async fn handle_inbound_stream(mut stream: yamux::Stream, remote: SocketAddr) ->
 /// Parse the optional client-side `udp_timeout` (whole seconds) from an
 /// `SS_PLUGIN_OPTIONS` string.
 ///
-/// Returns [`DEFAULT_UDP_TIMEOUT`] when the key is absent. The last occurrence
-/// wins (consistent with ex-ray's duplicate-key semantics). A value that
-/// is not a positive integer is a hard error — `0` would evict every
-/// association immediately, breaking all UDP. ex-ray ignores this key,
-/// so it can share the same options string.
+/// Returns [`DEFAULT_UDP_TIMEOUT`] when the key is absent. The FIRST
+/// occurrence wins on a duplicate key — matching every other reader of this
+/// same options string (ex-ray's own `Args.Get`, and the bridge's
+/// `classify_transport`/garter-bin's `config_path_from_plugin_options`),
+/// even though `udp_timeout` is galoshes' own extension ex-ray never reads:
+/// there is no cross-tool parity requirement for this key, but there IS an
+/// intra-string one — an operator reading one options string should not
+/// see different keys resolve duplicates in opposite directions.
+///
+/// EVERY occurrence is validated, not just the winning first one — a value
+/// that is not a positive integer is a hard error on ANY occurrence (`0`
+/// would evict every association immediately, breaking all UDP), so a
+/// self-contradictory duplicate still refuses the start rather than
+/// silently keeping the first value and discarding the rest unchecked.
 pub fn parse_udp_timeout(plugin_options: Option<&str>) -> Result<Duration> {
     let Some(opts) = plugin_options else {
         return Ok(DEFAULT_UDP_TIMEOUT);
     };
-    let mut timeout = DEFAULT_UDP_TIMEOUT;
-    for (key, value) in garter::parse_plugin_options(opts) {
-        if key == "udp_timeout" {
-            let secs: u64 = value
-                .parse()
-                .with_context(|| format!("invalid udp_timeout (expected a positive integer of seconds): {value:?}"))?;
-            if secs == 0 {
-                anyhow::bail!("udp_timeout must be greater than 0 seconds");
-            }
-            timeout = Duration::from_secs(secs);
+    let mut selected: Option<Duration> = None;
+    for (key, value) in garter::parse_plugin_options(opts).map_err(garter::Error::from)? {
+        if key != "udp_timeout" {
+            continue;
         }
+        // Never echo the rejected value: SIP003 escaping lets a `\` absorb a
+        // later segment into a value, so an unparseable
+        // `udp_timeout=abc\;token=SECRET` could otherwise leak `token`'s
+        // value through this message (same reason `Mode::from_plugin_options`
+        // and every `parse*Option` in ex-ray's own options.go withhold theirs).
+        let secs: u64 = value
+            .parse()
+            .context("invalid udp_timeout: value is not a positive integer of seconds")?;
+        if secs == 0 {
+            anyhow::bail!("udp_timeout must be greater than 0 seconds");
+        }
+        let timeout = Duration::from_secs(secs);
+        // A diagnostic, not the safety net: `run_udp_association`'s own idle
+        // resets use `saturating_deadline`, which can't panic no matter what
+        // `timeout` is. This check exists so a `udp_timeout` too large to
+        // fit `Instant` even right now — which would defeat NAT idle-eviction
+        // as thoroughly as `0` defeats it in the other direction — is
+        // reported at startup instead of silently accepted.
+        if std::time::Instant::now().checked_add(timeout).is_none() {
+            anyhow::bail!("udp_timeout is too large to represent as a deadline");
+        }
+        selected.get_or_insert(timeout);
     }
-    Ok(timeout)
+    Ok(selected.unwrap_or(DEFAULT_UDP_TIMEOUT))
 }
 
 pub struct YamuxPlugin {
@@ -997,64 +1251,49 @@ impl garter::ChainPlugin for YamuxPlugin {
         shutdown: CancellationToken,
         ready: tokio::sync::oneshot::Sender<std::result::Result<garter::PluginReady, garter::StartError>>,
     ) -> garter::Result<()> {
-        // Self-probe readiness: a YAMUX plugin serves both TCP and UDP at
-        // its local listener. Spawn a TCP-connect probe against `local`; on
-        // success report TCP|UDP readiness, on shutdown-first drop `ready`
-        // unsent (RecvError — the "shutdown before ready" semantics).
+        // Readiness comes from the bind point itself, over the same channel the
+        // tests use: `run_server`/`run_client` send their bound address once
+        // their listeners are up, and a YAMUX plugin serves both TCP and UDP
+        // there. A failed bind drops `ready` unsent (RecvError). Startup is not
+        // gated on `shutdown` here — garter's readiness aggregator is `biased` on
+        // it and owns the "shutdown before ready" outcome for the whole chain.
         //
-        // This is galoshes' INTERNAL hop-readiness signal: it feeds
-        // galoshes' OWN `ChainRunner` aggregator, which intersects it with
-        // the inner ex-ray hop and fires the chain-level `on_ready`. The
-        // PROCESS-level sitrep the bridge reads is emitted separately in
-        // `main.rs` off that `on_ready` outcome (see `galoshes::sitrep_out`).
-        // This probe knows only its own hop, not the chain, so it cannot
-        // own the process-stdout contract.
-        //
-        // A future refinement could replace the TCP-connect probe with a
-        // structured `ready` emitted from inside run_server/run_client at
-        // the exact bind point; the probe is the current pragmatic stand-in.
-        let probe_local = local;
-        let probe_shutdown = shutdown.clone();
-        tokio::spawn(async move {
-            if probe_tcp_ready(probe_local, &probe_shutdown).await {
-                let _ = ready.send(Ok(garter::PluginReady {
-                    listen: probe_local,
-                    transports: garter::Transports::TCP | garter::Transports::UDP,
-                }));
-            }
-        });
-
+        // This is galoshes' INTERNAL hop-readiness signal: it feeds galoshes'
+        // OWN `ChainRunner` aggregator, which intersects it with the inner
+        // ex-ray hop and fires the chain-level `on_ready`. The PROCESS-level
+        // sitrep the bridge reads is emitted separately in `main.rs` off that
+        // `on_ready` outcome (see `galoshes::sitrep_out`). This signal knows
+        // only its own hop, not the chain, so it cannot own the process-stdout
+        // contract.
+        let transports = garter::Transports::TCP | garter::Transports::UDP;
         let result = if self.is_server {
-            run_server(self.config, local, remote, shutdown, None).await
+            let (bound_tx, bound_rx) = oneshot::channel();
+            tokio::spawn(async move {
+                let Ok(listen) = bound_rx.await else { return };
+                let _ = ready.send(Ok(garter::PluginReady { listen, transports }));
+            });
+            run_server(self.config, local, remote, shutdown, Some(bound_tx)).await
         } else {
-            run_client(self.config, local, remote, self.udp_timeout, shutdown, None, None).await
+            let (bound_tx, bound_rx) = oneshot::channel::<ClientBoundAddrs>();
+            tokio::spawn(async move {
+                let Ok(addrs) = bound_rx.await else { return };
+                let _ = ready.send(Ok(garter::PluginReady {
+                    listen: addrs.tcp,
+                    transports,
+                }));
+            });
+            run_client(
+                self.config,
+                local,
+                remote,
+                self.udp_timeout,
+                shutdown,
+                Some(bound_tx),
+                None,
+            )
+            .await
         };
 
         result.map_err(|e| garter::Error::Chain(e.to_string()))
-    }
-}
-
-/// TCP-connect probe with exponential backoff. Returns `true` once `addr`
-/// accepts a connection, `false` if shutdown fires first. Mirrors garter's
-/// internal `poll_ready` (not exported), used to detect the YAMUX local
-/// listener coming up.
-async fn probe_tcp_ready(addr: SocketAddr, shutdown: &CancellationToken) -> bool {
-    let mut delay = Duration::from_millis(10);
-    let max_delay = Duration::from_secs(1);
-    loop {
-        tokio::select! {
-            result = TcpStream::connect(addr) => {
-                if result.is_ok() {
-                    return true;
-                }
-            }
-            () = shutdown.cancelled() => return false,
-        }
-        tokio::select! {
-            () = tokio::time::sleep(delay) => {
-                delay = (delay * 2).min(max_delay);
-            }
-            () = shutdown.cancelled() => return false,
-        }
     }
 }

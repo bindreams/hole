@@ -53,15 +53,28 @@ before editing; the sections linked below are the authoritative source.
   transport reset instead of wedging; death is detected via the driver's
   inbound channel closing, and reconnect backoff is floored and resets on
   transport-level liveness (any inbound yamux frame). `driver.abort()`
-  teardown deliberately truncates in-flight relays; a silent (no-RST)
-  black-hole is out of scope (→ #660). →
+  teardown deliberately truncates in-flight relays. A silent (no-RST) black
+  hole is caught by an idle-gated client keepalive on a `Keepalive` substream:
+  a cycle is fatal only when the transport tap counted no inbound read across a
+  whole interval and deadline, so an un-upgraded peer's tag rejection reads as
+  liveness and a busy tunnel is never probed at all. →
   [CONTRIBUTING.md#yamux-transport-self-heal](CONTRIBUTING.md#yamux-transport-self-heal)
+- **galoshes mux default.** galoshes appends `mux=0` for its embedded ex-ray —
+  its yamux already collapsed every stream onto one connection, so Mux.Cool is
+  pure overhead. ex-ray is first-wins on duplicate SIP003 keys, so an operator's
+  earlier `mux=` overrides it. `mux` also picks the server's dokodemo
+  destination, so a `mux=0` client cannot reach a `mux=1` server. →
+  [CONTRIBUTING.md#galoshes-mux-default](CONTRIBUTING.md#galoshes-mux-default)
 - **Fail-closed covers.** The **standing lockdown** cover
   (`Routing::install_lockdown`, opt-in kill switch) holds the update-cutover gap:
   the bridge **disarms-not-drops** it across the restart and the new bridge
   re-adopts it (`decide_cover_recovery == Adopt`). The **transient**
-  `install_failclosed_cover` (permit loopback + server only) is a bounded-window
-  RAII guard with **no production caller today** (test seam + recovery target).
+  `install_failclosed_cover` (permit loopback + server, plus the resolver
+  Hole's own `ech-doh` URL names when it's the value ex-ray will actually dial
+  — `effective_ech_doh == Holes`, not merely a plugin being configured —
+  scoped to TCP/443) is a bounded-window RAII guard engaged by every covered
+  (auto-connect) start whose lockdown intent is OFF; a lockdown-on covered
+  start uses the standing cover instead and releases any held transient one.
   Both are persistent WFP filters (Win) / self-contained pf ruleset (mac), swept
   by `recover_routes` on next start. →
   [CONTRIBUTING.md#fail-closed-cover](CONTRIBUTING.md#fail-closed-cover)

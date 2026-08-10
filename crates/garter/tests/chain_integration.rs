@@ -846,6 +846,298 @@ async fn force_kill_reaps_descendant_tree() {
 // `crates/test-observability/` and bindreams/hole#301.
 hole_test_observability::register!();
 
+/// A `log_sink` sees every line the child writes, including the ones the sitrep
+/// parser consumes — so a plugin that reports a failure over the protocol
+/// channel is not invisible to the consumer.
+///
+/// Determinism is stream ordering: `hello` and `ready` arrive on ONE pipe in
+/// that order, and the reader sinks each line before parsing it, so a chain
+/// that has reported ready has already sunk both. No timer, no poll, no loop.
+#[skuld::test]
+async fn log_sink_receives_every_line_including_sitrep_frames() {
+    let mock_path = mock_plugin_path();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let sink: garter::LogSink = Arc::new(move |line: &str| {
+        let _ = tx.send(line.to_string());
+    });
+
+    let chain_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let chain_local = chain_listener.local_addr().unwrap();
+    drop(chain_listener);
+
+    let (ready_tx, ready_rx) = oneshot::channel();
+    // `ExpectSitrep` is REQUIRED, not incidental: `BinaryPlugin::new` defaults
+    // to `Probe`, whose stdout task is a plain passthrough that never parses —
+    // the assertions below would pass while covering none of the arms this test
+    // exists for.
+    let runner = ChainRunner::new()
+        .add(Box::new(
+            BinaryPlugin::new(&mock_path, None)
+                .readiness(garter::binary::ReadinessMode::ExpectSitrep)
+                .log_sink(sink),
+        ))
+        .on_ready(ready_tx)
+        .drain_timeout(Duration::from_secs(3));
+
+    let env = PluginEnv {
+        local_host: chain_local.ip(),
+        local_port: chain_local.port(),
+        remote_host: "127.0.0.1".to_string(),
+        remote_port: 9,
+        plugin_options: None,
+    };
+    let chain_task = tokio::spawn(async move { runner.run(env).await });
+    ready_rx.await.expect("aggregator should send").expect("chain ready");
+
+    let mut sunk = Vec::new();
+    while let Ok(line) = rx.try_recv() {
+        sunk.push(line);
+    }
+    assert!(
+        sunk.iter().any(|l| l.contains(r#""event":"ready""#)),
+        "the reader must sink a line it parses as a sitrep event; got {sunk:?}"
+    );
+    assert!(
+        sunk.iter().any(|l| l.contains(r#""event":"hello""#)),
+        "every line, not just the last; got {sunk:?}"
+    );
+
+    chain_task.abort();
+}
+
+/// The arm this design exists for: a `fatal` frame is consumed by the sitrep
+/// parser and never reaches a relay, so only a sink placed BEFORE the parse can
+/// see it.
+#[skuld::test]
+async fn log_sink_receives_a_frame_the_sitrep_parser_consumes() {
+    let mock_path = mock_plugin_path();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let sink: garter::LogSink = Arc::new(move |line: &str| {
+        let _ = tx.send(line.to_string());
+    });
+
+    let chain_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let chain_local = chain_listener.local_addr().unwrap();
+    drop(chain_listener);
+
+    let (ready_tx, ready_rx) = oneshot::channel();
+    let runner = ChainRunner::new()
+        .add(Box::new(
+            BinaryPlugin::new(&mock_path, None)
+                .readiness(garter::binary::ReadinessMode::ExpectSitrep)
+                .env("MOCK_PLUGIN_FAIL", "fatal")
+                .log_sink(sink),
+        ))
+        .on_ready(ready_tx)
+        .drain_timeout(Duration::from_secs(3));
+
+    let env = PluginEnv {
+        local_host: chain_local.ip(),
+        local_port: chain_local.port(),
+        remote_host: "127.0.0.1".to_string(),
+        remote_port: 9,
+        plugin_options: None,
+    };
+    let chain_task = tokio::spawn(async move { runner.run(env).await });
+
+    let outcome = ready_rx.await.expect("aggregator should send");
+    assert!(
+        matches!(outcome, Err(garter::StartError::Fatal { .. })),
+        "expected StartError::Fatal, got {outcome:?}"
+    );
+
+    let mut sunk = Vec::new();
+    while let Ok(line) = rx.try_recv() {
+        sunk.push(line);
+    }
+    assert!(
+        sunk.iter().any(|l| l.contains("injected fatal")),
+        "a frame the parser consumed must still reach the sink; got {sunk:?}"
+    );
+
+    let _ = chain_task.await;
+}
+
+/// Wait for a sunk line matching `pred`. Bounded, unlike the two tests above:
+/// those rely on stdout-reader-then-parse ordering within ONE task, but here
+/// the line arrives on a task independent of whichever task signals chain
+/// readiness, so there is no ordering to snapshot after. The bound is a
+/// subprocess's own I/O arriving — a legitimate failure bound, not a step
+/// sync between two of our own tasks.
+async fn wait_for_sunk_line(
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<String>,
+    pred: impl Fn(&str) -> bool,
+) -> bool {
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while let Some(line) = rx.recv().await {
+            if pred(&line) {
+                return true;
+            }
+        }
+        false
+    })
+    .await
+    .unwrap_or(false)
+}
+
+/// Tier-2 `Probe` mode's stdout task is a pure passthrough that never parses
+/// a frame — unlike `ExpectSitrep`'s reader, it does not sink-then-parse in
+/// one step, so the sink call is the only thing distinguishing "relayed" from
+/// "silently dropped." Readiness here comes from a self-probe task independent
+/// of the stdout task, so see `wait_for_sunk_line` for why this is bounded.
+#[skuld::test]
+async fn log_sink_receives_probe_mode_stdout_lines() {
+    let mock_path = mock_plugin_path();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let sink: garter::LogSink = Arc::new(move |line: &str| {
+        let _ = tx.send(line.to_string());
+    });
+
+    let chain_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let chain_local = chain_listener.local_addr().unwrap();
+    drop(chain_listener);
+
+    let (ready_tx, ready_rx) = oneshot::channel();
+    let runner = ChainRunner::new()
+        .add(Box::new(
+            BinaryPlugin::new(&mock_path, None)
+                .readiness(garter::binary::ReadinessMode::Probe)
+                .log_sink(sink),
+        ))
+        .on_ready(ready_tx)
+        .drain_timeout(Duration::from_secs(3));
+
+    let env = PluginEnv {
+        local_host: chain_local.ip(),
+        local_port: chain_local.port(),
+        remote_host: "127.0.0.1".to_string(),
+        remote_port: 9,
+        plugin_options: None,
+    };
+    let chain_task = tokio::spawn(async move { runner.run(env).await });
+    ready_rx.await.expect("aggregator should send").expect("chain ready");
+
+    assert!(
+        wait_for_sunk_line(&mut rx, |l| l.contains(r#""event":"hello""#)).await,
+        "Probe mode's stdout task must still relay every line to the sink"
+    );
+
+    chain_task.abort();
+}
+
+/// The stderr reader relays independent of readiness mode — every mode's
+/// child writes to stderr through the same reader task, distinct from
+/// whichever task owns readiness. Covers a real, common plugin failure
+/// signal: a SIP003 binary crashing typically talks on stderr, not stdout.
+#[skuld::test]
+async fn log_sink_receives_stderr_lines() {
+    let mock_path = mock_plugin_path();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let sink: garter::LogSink = Arc::new(move |line: &str| {
+        let _ = tx.send(line.to_string());
+    });
+
+    let chain_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let chain_local = chain_listener.local_addr().unwrap();
+    drop(chain_listener);
+
+    let (ready_tx, ready_rx) = oneshot::channel();
+    let runner = ChainRunner::new()
+        .add(Box::new(
+            BinaryPlugin::new(&mock_path, None)
+                .readiness(garter::binary::ReadinessMode::ExpectSitrep)
+                .log_sink(sink),
+        ))
+        .on_ready(ready_tx)
+        .drain_timeout(Duration::from_secs(3));
+
+    let env = PluginEnv {
+        local_host: chain_local.ip(),
+        local_port: chain_local.port(),
+        remote_host: "127.0.0.1".to_string(),
+        remote_port: 9,
+        plugin_options: None,
+    };
+    let chain_task = tokio::spawn(async move { runner.run(env).await });
+    ready_rx.await.expect("aggregator should send").expect("chain ready");
+
+    assert!(
+        wait_for_sunk_line(&mut rx, |l| l.contains("mock-plugin: listening on")).await,
+        "the mock plugin's stderr line must reach the sink"
+    );
+
+    chain_task.abort();
+}
+
+/// The `FallBackToTier2` handoff hands the REST of stdout to
+/// `drain_remaining_logs`, a separate function from the reader's own
+/// sink-then-parse loop — its own sink call needs its own proof. Readiness
+/// here comes from the tier-2 self-probe, a task independent of the stdout
+/// reader, so this is bounded for the same reason as the two tests above.
+#[skuld::test]
+async fn log_sink_receives_lines_drained_after_version_skew_fallback() {
+    let mock_path = mock_plugin_path();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let sink: garter::LogSink = Arc::new(move |line: &str| {
+        let _ = tx.send(line.to_string());
+    });
+
+    let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let echo_addr = echo_listener.local_addr().unwrap();
+    let echo_task = tokio::spawn(async move {
+        loop {
+            match echo_listener.accept().await {
+                Ok((stream, _)) => {
+                    tokio::spawn(async move {
+                        let (mut reader, mut writer) = tokio::io::split(stream);
+                        let _ = tokio::io::copy(&mut reader, &mut writer).await;
+                    });
+                }
+                Err(_) => return,
+            }
+        }
+    });
+
+    let chain_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let chain_local = chain_listener.local_addr().unwrap();
+    drop(chain_listener);
+
+    let (ready_tx, ready_rx) = oneshot::channel();
+    let runner = ChainRunner::new()
+        .add(Box::new(
+            BinaryPlugin::new(&mock_path, None)
+                .readiness(garter::binary::ReadinessMode::ExpectSitrep)
+                .env("MOCK_PLUGIN_BAD_PROTOCOL", "1")
+                .log_sink(sink),
+        ))
+        .on_ready(ready_tx)
+        .drain_timeout(Duration::from_secs(3));
+
+    let env = PluginEnv {
+        local_host: chain_local.ip(),
+        local_port: chain_local.port(),
+        remote_host: echo_addr.ip().to_string(),
+        remote_port: echo_addr.port(),
+        plugin_options: None,
+    };
+    let chain_task = tokio::spawn(async move { runner.run(env).await });
+    ready_rx
+        .await
+        .expect("aggregator should send")
+        .expect("unknown-major should fall back to probe, not a start error");
+
+    // The bad-major `hello` is consumed by the reader's own loop before the
+    // handoff; the `ready` right after it can only have reached the sink
+    // through `drain_remaining_logs`.
+    assert!(
+        wait_for_sunk_line(&mut rx, |l| l.contains(r#""event":"ready""#)).await,
+        "the line drained after the version-skew handoff must still reach the sink"
+    );
+
+    echo_task.abort();
+    chain_task.abort();
+}
+
 fn main() {
     skuld::run_all();
 }

@@ -27,6 +27,7 @@ use shadowsocks_service::config::Config;
 
 pub mod config;
 pub mod plugin;
+pub mod plugin_log;
 pub mod shadowsocks;
 
 pub use config::{build_ss_config, validate_proxy_config, ProxyError, TUN_DEVICE_NAME, TUN_SUBNET};

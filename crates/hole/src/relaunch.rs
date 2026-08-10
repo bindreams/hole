@@ -33,15 +33,43 @@ impl ArmedWait {
     }
 }
 
+/// argv the successor needs to reproduce an open dashboard. Explicit rather than
+/// relying on the default: an older successor (a rollback) defaults to tray-only,
+/// which would silently drop the user's open window.
+fn successor_args(show_dashboard: bool) -> &'static [&'static str] {
+    if show_dashboard {
+        &[crate::launch::SHOW_DASHBOARD]
+    } else {
+        &[]
+    }
+}
+
+/// Env var to set so the successor suppresses its dashboard, or `None`.
+///
+/// Suppression travels out-of-band because the successor may predate the flag,
+/// and an unknown env var is inert where an unknown flag is a parse error.
+fn successor_env(show_dashboard: bool) -> Option<&'static str> {
+    if show_dashboard {
+        None
+    } else {
+        Some(crate::launch::NO_DASHBOARD_ENV)
+    }
+}
+
 /// Spawn the canonical image to take over after we exit, blocking until it
 /// has armed its wait on us (the `READY` line). The caller exits next, at
 /// which point the successor's wait fires.
-pub fn spawn_successor(canonical: &Path) -> std::io::Result<()> {
+pub fn spawn_successor(canonical: &Path, show_dashboard: bool) -> std::io::Result<()> {
     use std::io::BufRead;
-    let mut child = std::process::Command::new(canonical)
+    let mut command = std::process::Command::new(canonical);
+    command
+        .args(successor_args(show_dashboard))
         .env(AWAIT_ENV, std::process::id().to_string())
-        .stdout(std::process::Stdio::piped())
-        .spawn()?;
+        .stdout(std::process::Stdio::piped());
+    if let Some(key) = successor_env(show_dashboard) {
+        command.env(key, "1");
+    }
+    let mut child = command.spawn()?;
     let stdout = child.stdout.take().expect("stdout was piped");
     let mut line = String::new();
     std::io::BufReader::new(stdout).read_line(&mut line)?;

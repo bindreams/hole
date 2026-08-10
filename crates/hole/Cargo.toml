@@ -1,6 +1,6 @@
 [package]
 name = "hole"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 publish = false
 
@@ -89,6 +89,9 @@ walkdir = "2"
 # `relaunch::ArmedWait` uses kqueue (EVFILT_PROC/NOTE_EXIT) to wait on the
 # predecessor's exit during a self-heal relaunch.
 libc = "0.2"
+# LaunchAgent plist edits in `autostart_registration`: the dashboard flag is
+# migrated in place, so the file is read and rewritten rather than regenerated.
+plist = "1"
 # Runtime Dock icon (`dock_icon.rs`): unbundled dev runs (no Info.plist) still show the Hole icon.
 objc2 = "0.6"
 objc2-app-kit = { version = "0.3", features = ["NSApplication", "NSResponder", "NSImage"] }

@@ -57,6 +57,11 @@ fn non_quic_endpoint_is_tcp() {
     )));
 }
 
+#[skuld::test]
+fn malformed_options_endpoint_is_treated_as_udp() {
+    assert!(server_endpoint_is_udp(&entry(Some("galoshes"), Some(r"path=/a\"))));
+}
+
 // preflight ===========================================================================================================
 //
 // `preflight` takes a resolved `SocketAddr` (DoH already resolved the

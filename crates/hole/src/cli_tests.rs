@@ -27,30 +27,46 @@ fn service_never_gets_an_owner() {
 }
 
 #[skuld::test]
-fn no_args_means_gui_mode() {
+fn no_args_shows_the_dashboard() {
+    // The point of the feature: a bare launch is an explicit user launch.
     let cli = Cli::try_parse_from(["hole"]).unwrap();
     assert!(cli.command.is_none());
-    assert!(!cli.show_dashboard);
+    assert!(cli.show_dashboard());
 }
 
 #[skuld::test]
-fn show_dashboard_flag_alone() {
+fn show_dashboard_flag_is_explicit_default() {
     let cli = Cli::try_parse_from(["hole", "--show-dashboard"]).unwrap();
     assert!(cli.command.is_none());
-    assert!(cli.show_dashboard);
+    assert!(cli.show_dashboard());
+}
+
+#[skuld::test]
+fn no_show_dashboard_suppresses_it() {
+    let cli = Cli::try_parse_from(["hole", "--no-show-dashboard"]).unwrap();
+    assert!(!cli.show_dashboard());
+}
+
+#[skuld::test]
+fn last_dashboard_flag_wins() {
+    let suppressed = Cli::try_parse_from(["hole", "--show-dashboard", "--no-show-dashboard"]).unwrap();
+    assert!(!suppressed.show_dashboard(), "--no-show-dashboard came last");
+    let shown = Cli::try_parse_from(["hole", "--no-show-dashboard", "--show-dashboard"]).unwrap();
+    assert!(shown.show_dashboard(), "--show-dashboard came last");
 }
 
 #[skuld::test]
 fn version_subcommand_still_works() {
     let cli = Cli::try_parse_from(["hole", "version"]).unwrap();
     assert!(matches!(cli.command, Some(Command::Version)));
-    assert!(!cli.show_dashboard);
+    assert!(!cli.show_dashboard_flag_present());
 }
 
 #[skuld::test]
-fn show_dashboard_rejected_in_subcommand_position() {
-    // The flag is top-level only; mixing it after a subcommand should fail.
+fn dashboard_flags_rejected_in_subcommand_position() {
+    // The flags are top-level only; mixing either after a subcommand should fail.
     assert!(Cli::try_parse_from(["hole", "bridge", "run", "--show-dashboard"]).is_err());
+    assert!(Cli::try_parse_from(["hole", "bridge", "run", "--no-show-dashboard"]).is_err());
 }
 
 #[skuld::test]
@@ -60,8 +76,93 @@ fn show_dashboard_before_subcommand_parses() {
     // runtime so the user sees an error rather than the flag being silently
     // ignored.
     let cli = Cli::try_parse_from(["hole", "--show-dashboard", "version"]).unwrap();
-    assert!(cli.show_dashboard);
+    assert!(cli.show_dashboard_flag_present());
     assert!(matches!(cli.command, Some(Command::Version)));
+}
+
+#[skuld::test]
+fn launch_constants_are_the_flags_clap_accepts() {
+    // Guards drift between the lib constants and clap's derived long names.
+    let shown = Cli::try_parse_from(["hole", hole::launch::SHOW_DASHBOARD]).expect("SHOW_DASHBOARD must parse");
+    assert!(shown.show_dashboard());
+    let hidden = Cli::try_parse_from(["hole", hole::launch::NO_SHOW_DASHBOARD]).expect("NO_SHOW_DASHBOARD must parse");
+    assert!(!hidden.show_dashboard());
+}
+
+#[skuld::test]
+fn flag_presence_distinguishes_default_from_explicit() {
+    assert!(!Cli::try_parse_from(["hole"]).unwrap().show_dashboard_flag_present());
+    for flag in [hole::launch::SHOW_DASHBOARD, hole::launch::NO_SHOW_DASHBOARD] {
+        assert!(
+            Cli::try_parse_from(["hole", flag])
+                .unwrap()
+                .show_dashboard_flag_present(),
+            "{flag} must register as explicitly present"
+        );
+    }
+}
+
+#[skuld::test]
+fn resolve_show_dashboard_lets_an_explicit_flag_beat_the_env_var() {
+    // A relaunch sets the env var and passes no flag; a flag on the command line
+    // is the user speaking and wins.
+    assert!(
+        !resolve_show_dashboard(false, true, true),
+        "env suppresses a default launch"
+    );
+    assert!(
+        resolve_show_dashboard(false, true, false),
+        "no env, no flag: the default shows"
+    );
+    assert!(
+        resolve_show_dashboard(true, true, true),
+        "--show-dashboard beats the env var"
+    );
+    assert!(
+        !resolve_show_dashboard(true, false, false),
+        "--no-show-dashboard needs no env var"
+    );
+}
+
+// Duplicate-launch argv resolution (the single-instance callback).
+
+#[skuld::test]
+fn forwarded_argv_defaults_to_revealing() {
+    let argv = vec![r"C:\Program Files\hole\bin\hole.exe".to_string()];
+    assert!(show_dashboard_from_argv(&argv));
+}
+
+#[skuld::test]
+fn forwarded_argv_honors_suppression() {
+    // The autostart entry landing on a running instance must stay quiet.
+    let argv = vec![
+        "/Applications/Hole.app/Contents/MacOS/hole".to_string(),
+        hole::launch::NO_SHOW_DASHBOARD.to_string(),
+    ];
+    assert!(!show_dashboard_from_argv(&argv));
+}
+
+#[skuld::test]
+fn forwarded_argv_honors_explicit_show() {
+    let argv = vec!["hole".to_string(), hole::launch::SHOW_DASHBOARD.to_string()];
+    assert!(show_dashboard_from_argv(&argv));
+}
+
+#[skuld::test]
+fn unparseable_forwarded_argv_reveals() {
+    // Should be unreachable, but the fallback must be the useful response to a
+    // user double-clicking the icon, not silence.
+    let argv = vec!["hole".to_string(), "--not-a-flag".to_string()];
+    assert!(show_dashboard_from_argv(&argv));
+}
+
+#[skuld::test]
+fn only_subcommands_want_a_console() {
+    // A GUI launch must never attach: the console sends CTRL_CLOSE_EVENT to
+    // every attached process when its window closes.
+    assert!(!wants_console(&None));
+    assert!(wants_console(&Some(Command::Version)));
+    assert!(wants_console(&Some(Command::Upgrade { yes: false })));
 }
 
 // Dispatch guard exemption: must NOT install a gui-cli.log subscriber for

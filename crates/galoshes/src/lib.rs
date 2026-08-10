@@ -1,11 +1,14 @@
 #![cfg_attr(ex_ray_missing, allow(dead_code, unused_imports))]
 
 pub mod embedded;
+pub mod exray_options;
 pub mod sitrep_out;
 pub mod yamux;
 
 #[cfg(test)]
 mod embedded_tests;
+#[cfg(test)]
+mod exray_options_tests;
 #[cfg(test)]
 mod sitrep_out_tests;
 #[cfg(test)]
