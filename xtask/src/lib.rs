@@ -28,6 +28,7 @@ pub mod golangci_lint;
 pub mod interrupt;
 pub mod manifest;
 pub mod orchestrate;
+pub mod pull_subrepo;
 pub mod stage;
 pub mod target;
 pub mod tauri_pairs;
@@ -66,6 +67,9 @@ mod manifest_tests;
 #[cfg(test)]
 #[path = "orchestrate_tests.rs"]
 mod orchestrate_tests;
+#[cfg(test)]
+#[path = "pull_subrepo_tests.rs"]
+mod pull_subrepo_tests;
 #[cfg(test)]
 #[path = "stage_tests.rs"]
 mod stage_tests;
