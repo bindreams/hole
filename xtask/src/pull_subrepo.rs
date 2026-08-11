@@ -34,7 +34,7 @@ pub enum Outcome {
 pub fn run(repo_root: &Path, subdir: &str, tag: &str) -> Result<Outcome> {
     let subdir = &normalize_subdir(subdir);
     assert_subdir_is_ref_safe(repo_root, subdir)?;
-    ensure_clean_tree(repo_root)?;
+    ensure_clean_tree(repo_root, subdir)?;
     ensure_no_in_progress_conflict_resolution(repo_root, subdir)?;
 
     let first = attempt_pull(repo_root, subdir, tag)?;
@@ -47,28 +47,36 @@ pub fn run(repo_root: &Path, subdir: &str, tag: &str) -> Result<Outcome> {
     let stderr = String::from_utf8_lossy(&first.stderr);
     if stderr.contains("is not an ancestor") {
         let fixup_commit = fix_stale_parent(repo_root, subdir)?;
-        let second = attempt_pull(repo_root, subdir, tag).with_context(|| {
-            format!(
-                "a `.gitrepo` parent-realignment commit ({fixup_commit}) was already created \
-                 on this branch before this failure; `git reset --hard HEAD~1` undoes it if \
-                 you want to retry from a clean state"
-            )
-        })?;
-        if second.status.success() {
-            best_effort_clean(repo_root, subdir);
-            ensure_tag_pin_matches(repo_root, subdir, tag)?;
-            return Ok(Outcome::Clean);
-        }
-        return handle_conflict(repo_root, subdir, tag, &second).with_context(|| {
-            format!(
-                "a `.gitrepo` parent-realignment commit ({fixup_commit}) was already created \
-                 on this branch before this failure; `git reset --hard HEAD~1` undoes it if \
-                 you want to retry from a clean state"
-            )
-        });
+        return retry_after_stale_parent_fixup(repo_root, subdir, tag, &fixup_commit);
     }
 
     handle_conflict(repo_root, subdir, tag, &first)
+}
+
+/// Every fallible step after `fix_stale_parent` lands its `.gitrepo`
+/// parent-realignment commit is wrapped with the same disclosure context —
+/// a real, irreversible commit already exists on the branch by this point,
+/// and the module's contract (see the module doc) promises no error path
+/// after that leaves it a silent side effect. One shared closure, applied
+/// to every fallible call in this retry, so a future added step can't
+/// reintroduce the gap by omission (as three separate call sites already
+/// did once).
+fn retry_after_stale_parent_fixup(repo_root: &Path, subdir: &str, tag: &str, fixup_commit: &str) -> Result<Outcome> {
+    let disclose = || {
+        format!(
+            "a `.gitrepo` parent-realignment commit ({fixup_commit}) was already created on \
+             this branch before this failure; `git reset --hard HEAD~1` undoes it if you want \
+             to retry from a clean state"
+        )
+    };
+
+    let second = attempt_pull(repo_root, subdir, tag).with_context(disclose)?;
+    if second.status.success() {
+        best_effort_clean(repo_root, subdir);
+        ensure_tag_pin_matches(repo_root, subdir, tag).with_context(disclose)?;
+        return Ok(Outcome::Clean);
+    }
+    handle_conflict(repo_root, subdir, tag, &second).with_context(disclose)
 }
 
 /// Mirrors git-subrepo's own `check-and-normalize-subdir`: strips a leading
@@ -131,15 +139,35 @@ fn assert_subdir_is_ref_safe(repo_root: &Path, subdir: &str) -> Result<()> {
     Ok(())
 }
 
-/// Untracked files are deliberately excluded: `fix_stale_parent`'s commit
-/// below only ever `git add`s the `.gitrepo` pathspec, so an untracked file
-/// elsewhere can never be swept into it, and (unlike this check's earlier
-/// wording claimed) `git subrepo pull` itself doesn't refuse on them either
-/// — its own working-copy-clean assertion checks tracked changes only.
-fn ensure_clean_tree(repo_root: &Path) -> Result<()> {
+/// Untracked files outside `<subdir>` are deliberately allowed:
+/// `fix_stale_parent`'s commit only ever `git add`s the `.gitrepo`
+/// pathspec, so one elsewhere can never be swept into it, and `git subrepo
+/// pull` itself doesn't refuse on them either — its own working-copy-clean
+/// assertion checks tracked changes only.
+///
+/// An untracked file *inside* `<subdir>` is a different, real hazard:
+/// git-subrepo's fold-in step does `git rm -r <subdir>` and only then
+/// `git read-tree --prefix=<subdir> -u <upstream>` — if the untracked file
+/// collides with a path the new upstream tree introduces, `read-tree`
+/// aborts after the `rm` already deleted and staged the whole subtree,
+/// leaving `<subdir>` half-destroyed. That failure's stderr doesn't
+/// contain "is not an ancestor", so it routes to `handle_conflict`'s raw
+/// bail with no mention that `<subdir>` was just wiped.
+fn ensure_clean_tree(repo_root: &Path, subdir: &str) -> Result<()> {
     let status = run_git(repo_root, &["status", "--porcelain", "--untracked-files=no"])?;
     if !status.is_empty() {
         bail!("working tree has uncommitted changes; refusing to run against it:\n{status}");
+    }
+
+    let subdir_status = run_git(repo_root, &["status", "--porcelain", "--", subdir])?;
+    let untracked_in_subdir: Vec<&str> = subdir_status.lines().filter(|line| line.starts_with("??")).collect();
+    if !untracked_in_subdir.is_empty() {
+        bail!(
+            "untracked files exist under `{subdir}` — git-subrepo's pull step deletes and \
+             re-populates this whole subtree, and an untracked file colliding with a path in \
+             the new upstream tree aborts mid-way, leaving `{subdir}` half-destroyed:\n{}",
+            untracked_in_subdir.join("\n")
+        );
     }
     Ok(())
 }
@@ -156,11 +184,9 @@ fn ensure_clean_tree(repo_root: &Path) -> Result<()> {
 /// The `subrepo/<subdir>` branch needs a different test, not mere
 /// existence: git-subrepo leaves this branch behind after *every*
 /// successful pull too (`subrepo:pull` only deletes+recreates it on the
-/// *next* pull; nothing at the end of a successful one removes it) —
-/// confirmed live against this repo's own `.git`, which already carries
-/// `refs/heads/subrepo/crates/ex-ray/third_party/v2ray-core` from a past
-/// pull. A branch-existence-only check would permanently refuse to run
-/// wherever the documented manual flow was ever used. What distinguishes
+/// *next* pull; nothing at the end of a successful one removes it), so a
+/// branch-existence-only check would permanently refuse to run wherever
+/// the documented manual flow was ever used. What distinguishes
 /// "benign leftover from a completed pull" from "a human's resolution
 /// commit that was never folded in" (e.g. after a manual `rm -rf` of the
 /// worktree, bypassing `git subrepo commit <subdir>`) is
@@ -264,9 +290,7 @@ fn git_common_dir(repo_root: &Path) -> Result<PathBuf> {
 /// repo, and `.gitrepo` only exists once a commit introduced its `commit =`
 /// line — so no test fabricates them.
 ///
-/// Returns the SHA of the fixup commit it creates, so a caller whose
-/// subsequent retry still fails can disclose that this commit already
-/// landed on the branch rather than leaving it a silent side effect.
+/// Returns the SHA of the fixup commit it creates.
 fn fix_stale_parent(repo_root: &Path, subdir: &str) -> Result<String> {
     let gitrepo_rel = format!("{subdir}/.gitrepo");
 

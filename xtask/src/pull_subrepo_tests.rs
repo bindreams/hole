@@ -485,10 +485,8 @@ fn works_identically_from_a_linked_worktree() {
 fn leftover_subrepo_branch_from_a_manual_pull_does_not_block_a_later_pull() {
     // git-subrepo leaves the `subrepo/<subdir>` branch behind after EVERY
     // successful pull, including ones run outside this tool entirely (e.g.
-    // the documented manual VENDORING.md flow) — confirmed live against
-    // this very repo's own `.git`, which already carries
-    // `refs/heads/subrepo/crates/ex-ray/third_party/v2ray-core` from a past
-    // pull. `ensure_no_in_progress_conflict_resolution` must not treat that
+    // the documented manual VENDORING.md flow).
+    // `ensure_no_in_progress_conflict_resolution` must not treat that
     // benign residue as an in-progress conflict.
     let fx = Fixture::build(ConflictKind::None);
     git(&fx.downstream, &["subrepo", "pull", "vendor", "-b", "v2"]);
@@ -552,6 +550,105 @@ fn up_to_date_pull_still_realigns_the_branch_pin() {
     assert!(
         gitrepo.contains("branch = v3"),
         "the tag pin must be realigned even when git-subrepo itself no-ops: {gitrepo}"
+    );
+}
+
+#[skuld::test]
+fn untracked_file_inside_subdir_colliding_with_upstream_is_rejected_before_touching_anything() {
+    // git-subrepo's fold-in step does `git rm -r <subdir>` and only then
+    // `git read-tree --prefix=<subdir> -u <upstream>` — an untracked file
+    // under `<subdir>` colliding with a path the new upstream tree
+    // introduces makes `read-tree` abort AFTER the `rm` already deleted and
+    // staged the whole subtree. `ensure_clean_tree` must catch this before
+    // any of that runs, not just report git-subrepo's own opaque failure.
+    let fx = Fixture::build(ConflictKind::None);
+    let upstream = fx.dir.path().join("upstream");
+    std::fs::write(upstream.join("newfile.txt"), "new upstream content\n").unwrap();
+    git(&upstream, &["add", "-A"]);
+    git(&upstream, &["commit", "-m", "v2b: add newfile.txt"]);
+    git(&upstream, &["tag", "-f", "v2"]);
+
+    std::fs::write(fx.downstream.join("vendor/newfile.txt"), "untracked local content\n").unwrap();
+
+    let before_head = git_output(&fx.downstream, &["rev-parse", "HEAD"]);
+    let result = pull_subrepo::run(&fx.downstream, "vendor", "v2");
+    assert!(
+        result.is_err(),
+        "an untracked file colliding with upstream must be rejected up front"
+    );
+
+    let after_head = git_output(&fx.downstream, &["rev-parse", "HEAD"]);
+    assert_eq!(before_head, after_head, "nothing should be committed on rejection");
+    assert!(
+        fx.downstream.join("vendor/patched.txt").exists(),
+        "the vendored subtree must remain intact, not half-deleted"
+    );
+}
+
+#[skuld::test]
+fn leading_dot_slash_and_double_slash_subdir_normalize_and_pull_cleanly() {
+    // normalize_subdir strips a leading `./`, a trailing `/` (covered by
+    // trailing_slash_subdir_still_pulls_cleanly above), AND collapses
+    // repeated `/` — this test covers the other two forms.
+    let fx = Fixture::build(ConflictKind::None);
+    let outcome = pull_subrepo::run(&fx.downstream, "./vendor", "v2").expect("a leading ./ must not be rejected");
+    assert!(matches!(outcome, Outcome::Clean));
+}
+
+#[skuld::test]
+fn stale_parent_fixup_commit_is_disclosed_when_the_retry_still_conflicts() {
+    // The retry after fix_stale_parent lands its .gitrepo realignment
+    // commit; if the retried pull still fails, the error must name that
+    // commit rather than leaving it an undisclosed side effect.
+    let fx = Fixture::build(ConflictKind::Real);
+    fx.corrupt_parent();
+
+    let err = match pull_subrepo::run(&fx.downstream, "vendor", "v2") {
+        Err(e) => e,
+        Ok(_) => panic!("expected a real conflict to surface as an error after the stale-parent fixup"),
+    };
+    let message = format!("{err:#}");
+    assert!(
+        message.contains("was already created on this branch"),
+        "the fixup commit must be disclosed: {message}"
+    );
+
+    // A real conflict never commits anything further to the outer repo, so
+    // HEAD at this point is exactly the fixup commit fix_stale_parent made.
+    let fixup_commit = git_output(&fx.downstream, &["rev-parse", "HEAD"]).trim().to_string();
+    assert!(
+        message.contains(&fixup_commit),
+        "the disclosed message should name the actual fixup commit {fixup_commit}: {message}"
+    );
+}
+
+#[skuld::test]
+fn a_branch_with_unfolded_work_is_rejected_even_though_the_worktree_is_gone() {
+    // Distinguishes benign post-success branch residue (which must NOT
+    // block a later pull, see leftover_subrepo_branch_from_a_manual_pull_*)
+    // from a human's resolution commit that was never folded in via
+    // `git subrepo commit <subdir>` — simulated here by resolving a real
+    // conflict inside the temp worktree, committing there, then manually
+    // removing the worktree without ever running the fold-in step.
+    let fx = Fixture::build(ConflictKind::Real);
+    let raw = Command::new("git")
+        .args(["subrepo", "pull", "vendor", "-b", "v2"])
+        .current_dir(&fx.downstream)
+        .output()
+        .unwrap();
+    assert!(!raw.status.success(), "fixture should reproduce a real conflict");
+
+    let worktree = fx.dir.path().join("downstream/.git/tmp/subrepo/vendor");
+    std::fs::write(worktree.join("patched.txt"), "resolved content\n").unwrap();
+    git(&worktree, &["add", "-A"]);
+    git(&worktree, &["commit", "-m", "resolve conflict"]);
+    std::fs::remove_dir_all(&worktree).unwrap();
+
+    let result = pull_subrepo::run(&fx.downstream, "vendor", "v2");
+    assert!(
+        result.is_err(),
+        "a branch carrying an un-folded-in resolution commit must be refused even once its \
+         worktree is gone"
     );
 }
 
