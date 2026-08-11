@@ -53,7 +53,7 @@ Actions, Renovate `customManager` (regex), `git-subrepo` 0.4.9.
   thing.
 - Renovate never arms auto-merge for these PRs itself — this repo's
   existing `packageRules` already has an unscoped `"matchUpdateTypes": ["major"], "automerge": true` rule that would otherwise also match a
-  major `.gitrepo` bump (confirmed against the real file), so Task 6 adds
+  major `.gitrepo` bump, so Task 6 adds
   an explicit, later-in-array override. `vendor-bump.yaml` is the sole
   arming point, and only after a clean pull *and* a successful finish.
 - `nathan-blahaj` is the generic bot identity name (not vendor-specific) —
@@ -438,11 +438,9 @@ fn clean_pull_after_squash_merge_auto_fixes_stale_parent() {
     let fx = Fixture::build(ConflictKind::None);
     fx.corrupt_parent();
 
-    // Sanity: this reproduces the exact stale-parent failure the fixup
-    // exists to recover from. This text is genuinely on stderr (unlike
-    // the merge-conflict case in the other tests below, which is on
-    // stdout — see pull_subrepo.rs's handle_conflict for why that
-    // distinction matters).
+    // Sanity check: this reproduces the exact stale-parent failure the
+    // fixup exists to recover from (stdout/stderr distinction is
+    // documented in pull_subrepo.rs's handle_conflict).
     let raw = Command::new("git")
         .args(["subrepo", "pull", "vendor", "-b", "v2"])
         .current_dir(&fx.downstream)
@@ -583,19 +581,25 @@ fn two_real_conflicts_are_both_reported() {
 }
 
 #[skuld::test]
-fn a_second_run_recovers_from_a_leftover_conflicted_worktree() {
+fn refuses_to_run_when_a_conflict_resolution_is_already_in_progress() {
     let fx = Fixture::build(ConflictKind::Real);
 
     let first = pull_subrepo::run(&fx.downstream, "vendor", "v2").expect("first conflicted run should report Conflicted, not Err");
     assert!(matches!(first, Outcome::Conflicted { .. }));
 
-    // Without cleaning up in between: git-subrepo refuses a second pull
-    // ("There is already a worktree with branch subrepo/vendor") unless
-    // the leftover worktree/branch is cleaned first. attempt_pull's
-    // defensive `git subrepo clean` before every attempt must recover
-    // from this rather than erroring.
-    let second = pull_subrepo::run(&fx.downstream, "vendor", "v2").expect("second run should also cleanly report Conflicted, not error on the leftover worktree");
-    assert!(matches!(second, Outcome::Conflicted { .. }));
+    // Simulate the human being mid-resolution: the worktree pull_subrepo::run
+    // left behind still has unmerged patched.txt in it. Running again
+    // without cleaning up first must refuse, not silently `git subrepo
+    // clean` it out from under them — `git subrepo clean` skips
+    // git-subrepo's own working-copy-clean guard, so it would otherwise
+    // delete their in-progress resolution with no confirmation.
+    let result = pull_subrepo::run(&fx.downstream, "vendor", "v2");
+    assert!(result.is_err(), "must refuse rather than silently discard an in-progress resolution");
+
+    // The conflict markers must still be there — proving nothing got wiped.
+    let worktree = fx.dir.path().join("downstream/.git/tmp/subrepo/vendor");
+    let patched = std::fs::read_to_string(worktree.join("patched.txt")).unwrap();
+    assert!(patched.contains("<<<<<<<"), "the in-progress resolution's conflict markers must survive: {patched}");
 }
 
 #[skuld::test]
@@ -649,6 +653,32 @@ fn force_commit_conflicted_commits_the_conflicted_tree_and_fixes_the_branch_fiel
 
     let patched = std::fs::read_to_string(fx.downstream.join("vendor/patched.txt")).unwrap();
     assert!(patched.contains("<<<<<<<"), "conflict markers should be literally committed, per the CI-only policy: {patched}");
+}
+
+#[skuld::test]
+fn force_commit_conflicted_preserves_already_resolved_allowlisted_files() {
+    // The real CI path always follows a pull-subrepo call that returned
+    // exit code 2, which can leave a worktree mixing already-resolved
+    // allowlisted files (go.mod, auto-resolved by handle_conflict before
+    // it ever reports Conflicted) with still-conflicted real ones — not
+    // just a single conflicted file like the test above.
+    let fx = Fixture::build(ConflictKind::Mixed);
+    let outcome = pull_subrepo::run(&fx.downstream, "vendor", "v2").unwrap();
+    match outcome {
+        Outcome::Conflicted { unresolved, .. } => assert_eq!(unresolved, vec!["patched.txt".to_string()]),
+        Outcome::Clean => panic!("expected patched.txt to remain conflicted"),
+    }
+
+    pull_subrepo::force_commit_conflicted(&fx.downstream, "vendor", "v2").expect("force-commit should succeed on a mixed conflict");
+
+    let go_mod = std::fs::read_to_string(fx.downstream.join("vendor/go.mod")).unwrap();
+    assert!(
+        go_mod.contains("newdep") && !go_mod.contains("<<<<<<<"),
+        "go.mod should already be cleanly resolved to upstream, not committed with markers: {go_mod}"
+    );
+
+    let patched = std::fs::read_to_string(fx.downstream.join("vendor/patched.txt")).unwrap();
+    assert!(patched.contains("<<<<<<<"), "patched.txt's real conflict markers should be committed literally: {patched}");
 }
 
 #[skuld::test]
@@ -763,10 +793,11 @@ use crate::git_util::run_git;
 
 pub fn run(repo_root: &Path, subdir: &str, tag: &str) -> Result<Outcome> {
     ensure_clean_tree(repo_root)?;
+    ensure_no_in_progress_conflict_resolution(repo_root, subdir)?;
 
     let first = attempt_pull(repo_root, subdir, tag)?;
     if first.status.success() {
-        run_git(repo_root, &["subrepo", "clean", subdir]).ok();
+        best_effort_clean(repo_root, subdir);
         return Ok(Outcome::Clean);
     }
 
@@ -775,7 +806,7 @@ pub fn run(repo_root: &Path, subdir: &str, tag: &str) -> Result<Outcome> {
         fix_stale_parent(repo_root, subdir)?;
         let second = attempt_pull(repo_root, subdir, tag)?;
         if second.status.success() {
-            run_git(repo_root, &["subrepo", "clean", subdir]).ok();
+            best_effort_clean(repo_root, subdir);
             return Ok(Outcome::Clean);
         }
         return handle_conflict(repo_root, subdir, tag, &second);
@@ -792,25 +823,69 @@ fn ensure_clean_tree(repo_root: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Runs `git subrepo pull`, first defensively cleaning any worktree/branch
-/// left over from a previous attempt. A leftover `subrepo/<subdir>`
-/// worktree/branch (left behind by ANY prior pull attempt — successful,
-/// conflicted, or interrupted) makes the next `git subrepo pull` fail
-/// immediately with "There is already a worktree with branch
-/// subrepo/<subdir>", masking the real outcome of this attempt.
-/// `git subrepo clean` is a safe no-op when there's nothing to clean, so
-/// this is unconditional. If it fails for a real reason (not "nothing to
-/// clean"), a debug trace is left so a subsequent "already a worktree"
-/// pull failure is correlatable back to it.
-fn attempt_pull(repo_root: &Path, subdir: &str, tag: &str) -> Result<Output> {
-    if let Err(e) = run_git(repo_root, &["subrepo", "clean", subdir]) {
-        eprintln!("xtask: debug: pre-pull `git subrepo clean` failed (may be benign): {e}");
+/// `attempt_pull`'s defensive pre-clean (below) would otherwise silently
+/// `rm -rf` a worktree a human is actively resolving a real conflict in —
+/// `git subrepo clean` is the one git-subrepo subcommand that skips the
+/// tool's own working-copy-clean guard, so it deletes an in-progress
+/// resolution with no confirmation. Called once at the very start of
+/// `run`, before any cleaning happens: refuses if a leftover worktree from
+/// a *previous* invocation has real, unfinished content in it (unmerged
+/// paths, or anything staged/modified) rather than silently discarding it.
+/// A worktree with nothing in `git status --porcelain` is safe to treat as
+/// stale-but-harmless and gets cleaned normally by `attempt_pull`.
+fn ensure_no_in_progress_conflict_resolution(repo_root: &Path, subdir: &str) -> Result<()> {
+    let common_dir = git_common_dir(repo_root)?;
+    let worktree = common_dir.join("tmp").join("subrepo").join(subdir);
+    if !worktree.exists() {
+        return Ok(());
     }
+    let status = run_git(&worktree, &["status", "--porcelain"])?;
+    if !status.is_empty() {
+        bail!(
+            "a conflict-resolution worktree already exists at {} with in-progress changes — \
+             finish resolving it there, or run `git subrepo clean {subdir}` yourself first \
+             to discard it if it's stale",
+            worktree.display()
+        );
+    }
+    Ok(())
+}
+
+/// Runs `git subrepo pull`, first defensively cleaning any worktree/branch
+/// left over from a previous attempt *within this same `run` call* (the
+/// stale-parent-fixup retry can follow a first attempt that failed before
+/// ever creating a worktree — see `fix_stale_parent`'s doc comment — so
+/// this is always safe to call unconditionally here; genuine in-progress
+/// human work from a *prior, separate* invocation is what
+/// `ensure_no_in_progress_conflict_resolution` above guards, once, before
+/// either call). A leftover `subrepo/<subdir>` worktree/branch makes the
+/// next `git subrepo pull` fail immediately with "There is already a
+/// worktree with branch subrepo/<subdir>", masking the real outcome of
+/// this attempt.
+fn attempt_pull(repo_root: &Path, subdir: &str, tag: &str) -> Result<Output> {
+    best_effort_clean(repo_root, subdir);
     Command::new("git")
         .args(["subrepo", "pull", subdir, "-b", tag])
         .current_dir(repo_root)
         .output()
         .with_context(|| format!("failed to run `git subrepo pull {subdir} -b {tag}`"))
+}
+
+/// `git subrepo clean` is a safe no-op when there's nothing to clean. If it
+/// fails for a real reason, a debug trace is left so a subsequent
+/// "already a worktree" pull failure is correlatable back to it — every
+/// call site in this module uses this helper rather than a bare `.ok()`,
+/// so none of them silently swallow a genuine clean failure.
+fn best_effort_clean(repo_root: &Path, subdir: &str) {
+    if let Err(e) = run_git(repo_root, &["subrepo", "clean", subdir]) {
+        eprintln!("xtask: debug: `git subrepo clean {subdir}` failed (may be benign): {e}");
+    }
+}
+
+fn git_common_dir(repo_root: &Path) -> Result<PathBuf> {
+    let raw = run_git(repo_root, &["rev-parse", "--git-common-dir"])?;
+    let path = PathBuf::from(raw);
+    Ok(if path.is_absolute() { path } else { repo_root.join(path) })
 }
 
 /// Replicates git-subrepo's own recovery formula for a squash-merge-stale
@@ -992,6 +1067,7 @@ ______________________________________________________________________
 **Files:**
 
 - Modify: `xtask/src/pull_subrepo.rs` (replace `handle_conflict` and the `force_commit_conflicted` stub)
+- Modify: `xtask/Cargo.toml` (add `serde_json` if not already a dependency — needed to parse `go mod edit -json`'s output for the `go.mod` `replace`-directive preservation check; adding a dependency for this is preferable to hand-rolling a go.mod parser)
 
 **Interfaces:**
 
@@ -1007,8 +1083,8 @@ Expected: all FAIL.
 - [ ] **Step 2: Implement the real conflict handling**
 
 In `xtask/src/pull_subrepo.rs`, replace the placeholder `handle_conflict`
-and `force_commit_conflicted`, and add their helpers. Facts below are
-verified against the real installed tool:
+and `force_commit_conflicted`, and add their helpers. Facts driving the
+implementation below:
 
 - The merge-conflict text (`"git merge" command failed` + the full
   recovery instructions) is on **stdout**. stderr is 0 bytes on a
@@ -1076,7 +1152,7 @@ fn handle_conflict(repo_root: &Path, subdir: &str, tag: &str, pull_output: &Outp
 
     run_git(repo_root, &["subrepo", "commit", subdir])?;
     fixup_branch_field_if_needed(repo_root, subdir, tag)?;
-    run_git(repo_root, &["subrepo", "clean", subdir]).ok();
+    best_effort_clean(repo_root, subdir);
     Ok(Outcome::Clean)
 }
 
@@ -1101,7 +1177,7 @@ pub fn force_commit_conflicted(repo_root: &Path, subdir: &str, tag: &str) -> Res
     }
     run_git(repo_root, &["subrepo", "commit", subdir])?;
     fixup_branch_field_if_needed(repo_root, subdir, tag)?;
-    run_git(repo_root, &["subrepo", "clean", subdir]).ok();
+    best_effort_clean(repo_root, subdir);
     Ok(())
 }
 
@@ -1137,10 +1213,9 @@ fn resolve_to_theirs(worktree: &Path, path: &str) -> Result<bool> {
     if path == "go.mod" {
         let ours = run_git(worktree, &["show", ":2:go.mod"])?;
         let theirs = run_git(worktree, &["show", ":3:go.mod"])?;
-        let lost_a_replace = ours
-            .lines()
-            .filter(|line| line.trim_start().starts_with("replace "))
-            .any(|line| !theirs.contains(line.trim()));
+        let our_replaces = go_mod_replace_paths(&ours)?;
+        let their_replaces = go_mod_replace_paths(&theirs)?;
+        let lost_a_replace = our_replaces.iter().any(|p| !their_replaces.contains(p));
         if lost_a_replace {
             return Ok(false);
         }
@@ -1149,6 +1224,37 @@ fn resolve_to_theirs(worktree: &Path, path: &str) -> Result<bool> {
     run_git(worktree, &["checkout", "--theirs", "--", path])?;
     run_git(worktree, &["add", "--", path])?;
     Ok(true)
+}
+
+/// Extracts the `Old.Path` of every `replace` directive in a go.mod's
+/// content, via `go mod edit -json` (the Go toolchain's own parser)
+/// rather than line-prefix matching — go.mod's block syntax
+/// (`replace (\n\tmod => path\n)`) has individual entries that don't start
+/// with the literal text `"replace "`, so a naive per-line filter misses
+/// them and would silently pass a downstream-only replace hiding inside a
+/// block straight through to `checkout --theirs`.
+fn go_mod_replace_paths(content: &str) -> Result<Vec<String>> {
+    let tmp_dir = tempfile::tempdir().context("failed to create temp dir for go mod edit")?;
+    let tmp_path = tmp_dir.path().join("go.mod");
+    std::fs::write(&tmp_path, content).context("failed to write temp go.mod")?;
+    let output = Command::new("go")
+        .args(["mod", "edit", "-json"])
+        .arg(&tmp_path)
+        .output()
+        .context("failed to run `go mod edit -json`")?;
+    if !output.status.success() {
+        bail!("go mod edit -json failed: {}", String::from_utf8_lossy(&output.stderr));
+    }
+    let parsed: serde_json::Value =
+        serde_json::from_slice(&output.stdout).context("failed to parse go mod edit -json output")?;
+    let paths = parsed["Replace"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| entry["Old"]["Path"].as_str())
+        .map(|s| s.to_string())
+        .collect();
+    Ok(paths)
 }
 
 /// `git subrepo commit` doesn't touch `branch` (see the doc note above
@@ -1179,13 +1285,10 @@ fn unmerged_paths(worktree: &Path) -> Result<Vec<String>> {
     let output = run_git(worktree, &["diff", "--name-only", "--diff-filter=U"])?;
     Ok(output.lines().map(|s| s.to_string()).collect())
 }
-
-fn git_common_dir(repo_root: &Path) -> Result<PathBuf> {
-    let raw = run_git(repo_root, &["rev-parse", "--git-common-dir"])?;
-    let path = PathBuf::from(raw);
-    Ok(if path.is_absolute() { path } else { repo_root.join(path) })
-}
 ```
+
+(`git_common_dir` is already defined in Task 3's code — no need to
+redefine it here, `conflict_worktree` above just calls it.)
 
 - [ ] **Step 3: Wire the `force-commit-conflicted-subrepo` CLI command**
 
@@ -1208,7 +1311,7 @@ Dispatch arm: `Command::ForceCommitConflictedSubrepo { path, tag } => pull_subre
 - [ ] **Step 4: Run all `pull_subrepo` tests**
 
 Run: `cargo test -p xtask pull_subrepo -- --nocapture`
-Expected: all 15 tests from Task 2 PASS.
+Expected: all 16 tests from Task 2 PASS.
 
 - [ ] **Step 5: Commit**
 
@@ -1359,7 +1462,7 @@ fn run_updates_go_mod_and_commits_the_full_sequence() {
 
     std::fs::write(
         ex_ray.join("go.mod"),
-        "module example.com/ex-ray\n\ngo 1.25\n\nrequire example.com/widget v1.0.0\n\nreplace example.com/widget => ../../third_party/widget\n",
+        "module example.com/ex-ray\n\ngo 1.25\n\nrequire example.com/widget v1.0.0\n\nreplace example.com/widget => ./third_party/widget\n",
     )
     .unwrap();
     std::fs::write(
@@ -1396,7 +1499,13 @@ fn run_updates_go_mod_and_commits_the_full_sequence() {
 /// v2ray-core's real `ex-ray-tests` scope (build.yaml) additionally runs a
 /// scoped test inside the vendored module itself, detected by the
 /// presence of `transport/internet/tls` — not hardcoded to a dep name, so
-/// utls (which has no such directory) correctly skips it.
+/// utls (which has no such directory) correctly skips it. All four scoped
+/// directories are created here (not just `tls`): `go test` against a
+/// mix of existing and nonexistent package patterns fails on the missing
+/// ones regardless of whether the present package's own tests pass —
+/// creating only one directory would make this test's assertion pass for
+/// the wrong reason (a "no such directory" artifact, not the deliberate
+/// failure actually being detected).
 #[skuld::test]
 fn identity_check_runs_the_scoped_vendored_test_when_present() {
     let dir = tempfile::tempdir().unwrap();
@@ -1408,17 +1517,45 @@ fn identity_check_runs_the_scoped_vendored_test_when_present() {
     std::fs::write(ex_ray.join("main.go"), "package main\n\nfunc main() {}\n").unwrap();
 
     std::fs::write(vendored.join("go.mod"), "module example.com/vendored\n\ngo 1.25\n").unwrap();
-    let tls_dir = vendored.join("transport/internet/tls");
-    std::fs::create_dir_all(&tls_dir).unwrap();
-    std::fs::write(tls_dir.join("tls_test.go"), "package tls\n\nimport \"testing\"\n\nfunc TestBroken(t *testing.T) { t.Fatal(\"deliberate failure\") }\n").unwrap();
+    for pkg in ["tls", "quic", "hysteria2", "transportcommon"] {
+        let pkg_dir = vendored.join("transport/internet").join(pkg);
+        std::fs::create_dir_all(&pkg_dir).unwrap();
+        std::fs::write(pkg_dir.join(format!("{pkg}.go")), format!("package {pkg}\n")).unwrap();
+    }
+    std::fs::write(
+        vendored.join("transport/internet/tls/tls_test.go"),
+        "package tls\n\nimport \"testing\"\n\nfunc TestBroken(t *testing.T) { t.Fatal(\"deliberate failure\") }\n",
+    )
+    .unwrap();
 
     let outcome = finish_vendor_bump::run_identity_checks(dir.path(), "vendored").unwrap();
     match outcome {
         IdentityCheckOutcome::Failed { detail } => {
-            assert!(detail.contains("deliberate failure") || detail.contains("tls"), "the scoped vendored test's failure should surface: {detail}");
+            assert!(detail.contains("deliberate failure"), "the scoped vendored test's own failure should surface, not a missing-directory artifact: {detail}");
         }
         IdentityCheckOutcome::Passed => panic!("expected the deliberately failing scoped test to be exercised and fail"),
     }
+}
+
+#[skuld::test]
+fn identity_check_passes_when_all_scoped_vendored_tests_pass() {
+    let dir = tempfile::tempdir().unwrap();
+    let vendored = dir.path().join("vendored");
+    let ex_ray = dir.path().join("crates/ex-ray");
+    std::fs::create_dir_all(&vendored).unwrap();
+    std::fs::create_dir_all(&ex_ray).unwrap();
+    std::fs::write(ex_ray.join("go.mod"), "module example.com/ex-ray\n\ngo 1.25\n").unwrap();
+    std::fs::write(ex_ray.join("main.go"), "package main\n\nfunc main() {}\n").unwrap();
+
+    std::fs::write(vendored.join("go.mod"), "module example.com/vendored\n\ngo 1.25\n").unwrap();
+    for pkg in ["tls", "quic", "hysteria2", "transportcommon"] {
+        let pkg_dir = vendored.join("transport/internet").join(pkg);
+        std::fs::create_dir_all(&pkg_dir).unwrap();
+        std::fs::write(pkg_dir.join(format!("{pkg}.go")), format!("package {pkg}\n")).unwrap();
+    }
+
+    let outcome = finish_vendor_bump::run_identity_checks(dir.path(), "vendored").unwrap();
+    assert!(matches!(outcome, IdentityCheckOutcome::Passed));
 }
 ```
 
@@ -1503,12 +1640,18 @@ fn run_go_mod_tidy_and_commit(repo_root: &Path, subdir: &str, new_tag: &str) -> 
         bail!("`go mod tidy` failed in {}", ex_ray_dir.display());
     }
 
-    run_git(repo_root, &["add", "crates/ex-ray/go.mod", "crates/ex-ray/go.sum"])?;
-    commit_if_staged(
-        repo_root,
-        &["crates/ex-ray/go.mod", "crates/ex-ray/go.sum"],
-        &format!("build(ex-ray): bump {module_path} to {new_tag}"),
-    )
+    // `go.sum` may not exist at all: a module whose only requirement is
+    // satisfied by a local `replace` directory produces none. `git add` on
+    // a pathspec matching nothing is a hard error (not a no-op), so only
+    // add it when it's actually there.
+    let mut paths: Vec<&str> = vec!["crates/ex-ray/go.mod"];
+    if repo_root.join("crates/ex-ray/go.sum").exists() {
+        paths.push("crates/ex-ray/go.sum");
+    }
+    let mut add_args = vec!["add"];
+    add_args.extend(paths.iter().copied());
+    run_git(repo_root, &add_args)?;
+    commit_if_staged(repo_root, &paths, &format!("build(ex-ray): bump {module_path} to {new_tag}"))
 }
 
 fn read_module_path(go_mod_path: &Path) -> Result<String> {
@@ -1742,7 +1885,7 @@ customManager must not strip it:
 
 The file's existing `packageRules` array already has an unscoped
 `{"matchUpdateTypes": ["major"], "groupName": null, "automerge": true}`
-rule — confirmed by reading the real file — which would otherwise also
+rule, which would otherwise also
 match a major `.gitrepo` bump (e.g. v5→v6, v1→v2). Renovate uses
 last-match-wins semantics, so add this **after** that rule (append to the
 end of the array):
@@ -1761,12 +1904,10 @@ Run: `npx --yes --package renovate -- renovate-config-validator .github/renovate
 Expected: `Config validated successfully`.
 
 **Open question for you, not decided here:** should a *permanent*
-`renovate-config-validator` step be added to CI? Two of this plan's own
-review rounds were caught by exactly the class of bug a permanent
-validator would catch (the `packageName`-is-a-URL bug and the
-`extractVersionTemplate` write-back bug) — this isn't hypothetical, it's
-the same failure mode that already bit this plan's design twice. Flag this
-to the user explicitly when this plan is reviewed; don't decide silently
+`renovate-config-validator` step be added to CI? A permanent validator
+would have caught the `packageName`-is-a-URL and `extractVersionTemplate`
+write-back mistakes this design made — worth adding to CI? Flag this to
+the user explicitly when this plan is reviewed; don't decide silently
 either way.
 
 - [ ] **Step 4: Commit**
@@ -1853,13 +1994,24 @@ Renovate deliberately rate-limits its own PR-creation call
 (`prHourlyLimit`/`prConcurrentLimit`, both left at their defaults in this
 repo's config) — the branch and its push can exist well before the PR
 does, and `bump`'s own "find the PR" step may legitimately come up empty.
-Splitting into two jobs (rather than branching one job's steps on event
-type) keeps `arm-on-pr-open` simple: it doesn't need dep/tag detection,
-checkout, or the pipeline at all — just the PR number GitHub already hands
-it via `github.event.pull_request.number`, and `gh pr merge --auto`. If
-the earlier `bump` run already armed it, this is a harmless re-confirm.
 
-Other fixes below, verified or reasoned through, none assumed:
+`arm-on-pr-open` must **not** simply arm on every `opened`/`synchronize`
+event, though — Renovate's own PR-open call (fast, just an API call) can
+easily beat `bump`'s pipeline (slow: install git-subrepo, run Go tests,
+etc.), so an ungated version of this job would routinely arm auto-merge on
+Renovate's bare `.gitrepo`-branch-line-only commit, before `bump` has
+pulled anything — exactly the premature-merge race the Renovate
+`automerge: false` override (Task 6) exists to prevent, just reintroduced
+under a different trigger. It gates on the PR's *current head commit*
+having been authored by `nathan-blahaj[bot]` — i.e. that `bump` has
+already pushed *something* to this exact commit, whether the outcome was
+clean or conflicted (both are safe to arm on: a still-conflicted commit
+has literal markers in tracked source, which reliably breaks compilation,
+so CI naturally fails and blocks the merge regardless of arming).
+Renovate's own commits are never authored that way, so this structurally
+can't fire on the dangerous case.
+
+Other fixes below:
 
 - **Self-retrigger**: `bump`'s own successful push matches its own
   `push`+`paths` trigger. The job-level `if:` guard checks the pushing
@@ -1912,7 +2064,12 @@ permissions:
   pull-requests: write
 
 concurrency:
-  group: vendor-bump-${{ github.event.pull_request.head.ref || github.ref }}
+  # github.head_ref (pull_request) and github.ref_name (push) are both
+  # already the bare branch name — github.ref (a push-event fallback some
+  # designs use here) is instead the full refs/heads/... form, which would
+  # silently put push- and pull_request-triggered runs for the same branch
+  # into two different groups.
+  group: vendor-bump-${{ github.head_ref || github.ref_name }}
   cancel-in-progress: false
 
 jobs:
@@ -2088,7 +2245,19 @@ jobs:
           app-id: ${{ secrets.NATHAN_APP_ID }}
           private-key: ${{ secrets.NATHAN_APP_PRIVATE_KEY }}
 
+      # See the note above the workflow: only arm once `bump` has actually
+      # pushed something to this exact commit — never on Renovate's own
+      # bare branch-only commit, which would trivially pass CI.
+      - name: Check whether bump has already pushed its work
+        id: check-head
+        env:
+          GH_TOKEN: ${{ steps.nathan.outputs.token }}
+        run: |
+          author=$(gh api "repos/${{ github.repository }}/commits/${{ github.event.pull_request.head.sha }}" --jq '.commit.author.name')
+          echo "author=$author" >> "$GITHUB_OUTPUT"
+
       - name: Arm auto-merge
+        if: steps.check-head.outputs.author == 'nathan-blahaj[bot]'
         env:
           GH_TOKEN: ${{ steps.nathan.outputs.token }}
         run: gh pr merge --auto --squash "${{ github.event.pull_request.number }}" --repo "${{ github.repository }}"
