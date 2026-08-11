@@ -22,11 +22,13 @@ check `ci.yaml`'s "Test ex-ray (Go)" job itself runs), pushes, and arms
 GitHub-native auto-merge itself via `gh pr merge --auto` — both
 opportunistically right after a clean push, and via a second, lightweight
 job that fires whenever Renovate's own (rate-limited, sometimes delayed)
-PR-creation call finally happens. "Test ex-ray (Go)" is added to the
-repo's required-status-checks ruleset as one-time manual setup, so
-auto-merge cannot fire without the one check that actually validates the
-vendored code. The same App fixes the identical latent bug in
-`wix-hash-fixup.yaml`.
+PR-creation call finally happens — gated on a `vendor-bump-ready`
+check-run `bump` reports on its own pushed commit, not merely on who
+pushed it. "Test ex-ray (Go)" and `vendor-bump-ready` are both added to
+the repo's required-status-checks ruleset as one-time manual setup, so
+auto-merge cannot fire without both the check that actually validates the
+vendored code and confirmation the bump pipeline itself finished cleanly.
+The same App fixes the identical latent bug in `wix-hash-fixup.yaml`.
 
 **Tech Stack:** Rust (`xtask`, existing `clap`/`anyhow` conventions), GitHub
 Actions, Renovate `customManager` (regex), `git-subrepo` 0.4.9.
@@ -72,7 +74,13 @@ Actions, Renovate `customManager` (regex), `git-subrepo` 0.4.9.
   own tests) is not currently a required status check on `main`'s ruleset
   — added as one-time manual setup (Task 1), since without it auto-merge
   could fire on a vendor bump that breaks the ECH gate/patches with no
-  check catching it.
+  check catching it. `vendor-bump-ready` (Task 1, Task 8) is added
+  alongside it: a commit author check alone can't distinguish a genuinely
+  clean, fully-finished bump from a conflicted or partially-failed one
+  (both are equally `nathan-blahaj[bot]`-authored), and `Test ex-ray (Go)`
+  only compiles a scoped subset of the vendored tree, so a conflict
+  landing elsewhere in it wouldn't be caught by any required check without
+  this.
 - Design doc: `docs/superpowers/specs/2026-08-10-787-vendor-dependency-automation.md`.
 
 ______________________________________________________________________
@@ -146,16 +154,25 @@ In `bindreams/hole` → Settings → Secrets and variables → Actions, add:
 
 Delete the local `.pem` file copy once it's saved as a secret.
 
-- [ ] **Step 5: Add "Test ex-ray (Go)" as a required status check**
+- [ ] **Step 5: Add two required status checks**
 
 In `bindreams/hole` → Settings → Rules → Rulesets → "Default Branch", edit
-the `required_status_checks` rule and add `Test ex-ray (Go)` (the exact
-context name of `ci.yaml`'s `test-ex-ray` job) to the list. This is the
-*only* CI job that exercises the vendored/patched Go code at all — without
-it in the required list, `gh pr merge --auto` can fire on a vendor bump
-that silently breaks the ECH fail-closed gate or the ECH-retry patches,
-since every other required check builds crates that never touch the
-vendored Go module.
+the `required_status_checks` rule and add:
+
+- `Test ex-ray (Go)` (the exact context name of `ci.yaml`'s `test-ex-ray`
+  job) — the *only* CI job that exercises the vendored/patched Go code at
+  all. Without it in the required list, auto-merge can fire on a vendor
+  bump that silently breaks the ECH fail-closed gate or the ECH-retry
+  patches, since every other required check builds crates that never
+  touch the vendored Go module.
+
+- `vendor-bump-ready` — the check-run `vendor-bump.yaml`'s `bump` job
+  creates itself on its own pushed commit (Task 8), reporting whether the
+  pull was genuinely clean *and* `finish-vendor-bump` succeeded. Without
+  this required, a `bump` run that fails partway (e.g. `finish-vendor-bump`
+  bailing before its identity check even runs) or lands a conflicted
+  commit outside the scope `Test ex-ray (Go)` compiles has nothing
+  structurally blocking merge.
 
 - [ ] **Step 6: Confirm**
 
@@ -263,9 +280,14 @@ enum ConflictKind {
     /// documented "resolve to theirs" allowlist.
     Allowlisted,
     /// v2 rewrites `go.mod`, but our downstream version carries a
-    /// `replace` line theirs doesn't — resolving to theirs would silently
-    /// drop it. Must NOT auto-resolve.
+    /// single-line `replace` directive theirs doesn't — resolving to
+    /// theirs would silently drop it. Must NOT auto-resolve.
     AllowlistedWithReplace,
+    /// Same as `AllowlistedWithReplace`, but the downstream-only `replace`
+    /// is written in go.mod's block form (`replace (\n\t...\n)`) instead
+    /// of a single line — the exact syntax a naive line-prefix filter
+    /// would miss.
+    AllowlistedWithBlockReplace,
     /// v2 DELETES `go.sum` entirely while our downstream commit still has
     /// local edits to it — a delete/modify conflict.
     AllowlistedDelete,
@@ -304,7 +326,7 @@ impl Fixture {
             ConflictKind::None => {
                 std::fs::write(upstream.join("other.txt"), "unrelated changed\n").unwrap();
             }
-            ConflictKind::Allowlisted | ConflictKind::AllowlistedWithReplace => {
+            ConflictKind::Allowlisted | ConflictKind::AllowlistedWithReplace | ConflictKind::AllowlistedWithBlockReplace => {
                 std::fs::write(
                     upstream.join("go.mod"),
                     "module fixture\n\ngo 1.26\n\nrequire upstream/newdep v1.0.0\n",
@@ -347,6 +369,8 @@ impl Fixture {
 
         let go_mod_content = if matches!(conflict, ConflictKind::AllowlistedWithReplace) {
             "module fixture\n\ngo 1.25\n\nrequire ourdownstream/patchdep v1.0.0\n\nreplace ourdownstream/loadbearing => ../loadbearing\n"
+        } else if matches!(conflict, ConflictKind::AllowlistedWithBlockReplace) {
+            "module fixture\n\ngo 1.25\n\nrequire ourdownstream/patchdep v1.0.0\n\nreplace (\n\tourdownstream/loadbearing => ../loadbearing\n)\n"
         } else {
             "module fixture\n\ngo 1.25\n\nrequire ourdownstream/patchdep v1.0.0\n"
         };
@@ -501,6 +525,24 @@ fn allowlisted_go_mod_conflict_declines_when_a_downstream_replace_would_be_lost(
 }
 
 #[skuld::test]
+fn allowlisted_go_mod_conflict_declines_when_a_block_form_replace_would_be_lost() {
+    // go_mod_replace_directives exists specifically because a naive
+    // line-prefix filter misses go.mod's block replace syntax — this test
+    // only exercises the single-line form indirectly through the OTHER
+    // preservation test above wouldn't have caught a regression back to
+    // that naive approach. This one would.
+    let fx = Fixture::build(ConflictKind::AllowlistedWithBlockReplace);
+
+    let outcome = pull_subrepo::run(&fx.downstream, "vendor", "v2").expect("a real conflict is a reported Outcome, not an Err");
+    match outcome {
+        Outcome::Conflicted { unresolved, .. } => {
+            assert_eq!(unresolved, vec!["go.mod".to_string()], "go.mod must be treated as unresolved when a block-form downstream replace would be lost");
+        }
+        Outcome::Clean => panic!("expected go.mod to be left for a human, not silently resolved"),
+    }
+}
+
+#[skuld::test]
 fn allowlisted_delete_conflict_removes_the_file_instead_of_erroring() {
     // A delete/modify conflict (upstream deleted, downstream modified) has
     // no "theirs" blob for `git checkout --theirs` to check out — plain
@@ -600,6 +642,17 @@ fn refuses_to_run_when_a_conflict_resolution_is_already_in_progress() {
     let worktree = fx.dir.path().join("downstream/.git/tmp/subrepo/vendor");
     let patched = std::fs::read_to_string(worktree.join("patched.txt")).unwrap();
     assert!(patched.contains("<<<<<<<"), "the in-progress resolution's conflict markers must survive: {patched}");
+}
+
+#[skuld::test]
+fn an_unexpected_pull_failure_surfaces_as_an_error_not_a_conflict() {
+    // A nonexistent tag fails at git-subrepo's fetch step, with neither
+    // the stale-parent stderr text nor the merge-conflict stdout text —
+    // handle_conflict's catch-all bail branch, otherwise untested by every
+    // other ConflictKind (which only ever produce one of those two).
+    let fx = Fixture::build(ConflictKind::None);
+    let result = pull_subrepo::run(&fx.downstream, "vendor", "this-tag-does-not-exist");
+    assert!(result.is_err(), "a nonexistent tag should surface as an Err, not Outcome::Conflicted");
 }
 
 #[skuld::test]
@@ -828,23 +881,27 @@ fn ensure_clean_tree(repo_root: &Path) -> Result<()> {
 /// `git subrepo clean` is the one git-subrepo subcommand that skips the
 /// tool's own working-copy-clean guard, so it deletes an in-progress
 /// resolution with no confirmation. Called once at the very start of
-/// `run`, before any cleaning happens: refuses if a leftover worktree from
-/// a *previous* invocation has real, unfinished content in it (unmerged
-/// paths, or anything staged/modified) rather than silently discarding it.
-/// A worktree with nothing in `git status --porcelain` is safe to treat as
-/// stale-but-harmless and gets cleaned normally by `attempt_pull`.
+/// `run`, before any cleaning happens: refuses whenever a leftover
+/// worktree from a *previous* invocation exists at all, regardless of
+/// whether `git status --porcelain` inside it is empty. A dirtiness check
+/// is not sufficient: git-subrepo's own documented recovery steps (`cd
+/// <worktree>`, resolve, `git add`, `git commit`) have the human commit
+/// *inside* the temp worktree before the outer `git subrepo commit
+/// <subdir>` step folds it back in — so a worktree sitting in exactly
+/// that "resolved and committed, not yet folded in" state has an empty
+/// porcelain status but still represents real, valuable, unfinished work
+/// (the commit itself, and the `refs/heads/subrepo/<subdir>` branch
+/// pointing to it) that a dirtiness-only check would wrongly treat as
+/// stale-and-safe-to-discard.
 fn ensure_no_in_progress_conflict_resolution(repo_root: &Path, subdir: &str) -> Result<()> {
     let common_dir = git_common_dir(repo_root)?;
     let worktree = common_dir.join("tmp").join("subrepo").join(subdir);
-    if !worktree.exists() {
-        return Ok(());
-    }
-    let status = run_git(&worktree, &["status", "--porcelain"])?;
-    if !status.is_empty() {
+    if worktree.exists() {
         bail!(
-            "a conflict-resolution worktree already exists at {} with in-progress changes — \
-             finish resolving it there, or run `git subrepo clean {subdir}` yourself first \
-             to discard it if it's stale",
+            "a conflict-resolution worktree already exists at {} — if you're resolving a \
+             conflict there, finish it (see the earlier `pull-subrepo` output for the exact \
+             steps); if it's stale (e.g. left over from an interrupted run), run \
+             `git subrepo clean {subdir}` yourself first to discard it",
             worktree.display()
         );
     }
@@ -855,13 +912,12 @@ fn ensure_no_in_progress_conflict_resolution(repo_root: &Path, subdir: &str) -> 
 /// left over from a previous attempt *within this same `run` call* (the
 /// stale-parent-fixup retry can follow a first attempt that failed before
 /// ever creating a worktree — see `fix_stale_parent`'s doc comment — so
-/// this is always safe to call unconditionally here; genuine in-progress
-/// human work from a *prior, separate* invocation is what
-/// `ensure_no_in_progress_conflict_resolution` above guards, once, before
-/// either call). A leftover `subrepo/<subdir>` worktree/branch makes the
-/// next `git subrepo pull` fail immediately with "There is already a
-/// worktree with branch subrepo/<subdir>", masking the real outcome of
-/// this attempt.
+/// this is always safe to call unconditionally here — safe here, since a
+/// prior, separate invocation's in-progress work is guarded separately by
+/// `ensure_no_in_progress_conflict_resolution`). A leftover
+/// `subrepo/<subdir>` worktree/branch makes the next `git subrepo pull`
+/// fail immediately with "There is already a worktree with branch
+/// subrepo/<subdir>", masking the real outcome of this attempt.
 fn attempt_pull(repo_root: &Path, subdir: &str, tag: &str) -> Result<Output> {
     best_effort_clean(repo_root, subdir);
     Command::new("git")
@@ -892,12 +948,23 @@ fn git_common_dir(repo_root: &Path) -> Result<PathBuf> {
 /// `.gitrepo` `parent` (its own error message suggests exactly this SHA):
 /// the last commit that touched the `.gitrepo` file's `commit =` line,
 /// walked back one parent. This candidate is always an ancestor of HEAD by
-/// construction (it comes from `git log` starting at HEAD). The check
-/// below is still a real, always-on `bail!` rather than a `debug_assert!`
-/// despite that guarantee: it's the sole guard immediately before an
-/// irreversible committed write in unattended CI, where a silently
-/// compiled-away check (debug_assert! is a no-op in release builds) is the
-/// wrong trade.
+/// construction (it comes from `git log` starting at HEAD). The is-ancestor
+/// check below is still a real, always-on `bail!` rather than a
+/// `debug_assert!` despite that guarantee: it's the sole guard immediately
+/// before an irreversible committed write in unattended CI, where a
+/// silently compiled-away check (debug_assert! is a no-op in release
+/// builds) is the wrong trade. The two earlier `bail!`s (no commit found;
+/// root commit with no parent) are real defensive checks but effectively
+/// unreachable through any real `git subrepo` lifecycle — confirmed live:
+/// `git subrepo clone` refuses outright ("You can't clone into an empty
+/// repository") in a repo with zero prior commits, so the sync commit this
+/// function walks back from always has at least one parent to find, and a
+/// `.gitrepo` file only ever exists because some commit introduced its
+/// `commit =` line in the first place. No test fabricates either
+/// condition for the same reason no test fabricates a non-ancestor
+/// candidate for the check below — doing so would require hand-corrupting
+/// the git object graph outside any real git-subrepo operation, testing
+/// the fabrication rather than the code.
 fn fix_stale_parent(repo_root: &Path, subdir: &str) -> Result<()> {
     let gitrepo_rel = format!("{subdir}/.gitrepo");
 
@@ -1213,9 +1280,9 @@ fn resolve_to_theirs(worktree: &Path, path: &str) -> Result<bool> {
     if path == "go.mod" {
         let ours = run_git(worktree, &["show", ":2:go.mod"])?;
         let theirs = run_git(worktree, &["show", ":3:go.mod"])?;
-        let our_replaces = go_mod_replace_paths(&ours)?;
-        let their_replaces = go_mod_replace_paths(&theirs)?;
-        let lost_a_replace = our_replaces.iter().any(|p| !their_replaces.contains(p));
+        let our_directives = go_mod_replace_directives(&ours)?;
+        let their_directives = go_mod_replace_directives(&theirs)?;
+        let lost_a_replace = our_directives.iter().any(|d| !their_directives.contains(d));
         if lost_a_replace {
             return Ok(false);
         }
@@ -1226,14 +1293,20 @@ fn resolve_to_theirs(worktree: &Path, path: &str) -> Result<bool> {
     Ok(true)
 }
 
-/// Extracts the `Old.Path` of every `replace` directive in a go.mod's
-/// content, via `go mod edit -json` (the Go toolchain's own parser)
+/// Extracts every `replace` directive from a go.mod's content as raw JSON
+/// objects, via `go mod edit -json` (the Go toolchain's own parser)
 /// rather than line-prefix matching — go.mod's block syntax
 /// (`replace (\n\tmod => path\n)`) has individual entries that don't start
 /// with the literal text `"replace "`, so a naive per-line filter misses
 /// them and would silently pass a downstream-only replace hiding inside a
-/// block straight through to `checkout --theirs`.
-fn go_mod_replace_paths(content: &str) -> Result<Vec<String>> {
+/// block straight through to `checkout --theirs`. Compares whole
+/// directives (old path+version *and* new path+version), not just the
+/// replaced module's path: upstream rewriting the *target* of a directive
+/// we also carry (e.g. our `=> ../utls` becoming their own
+/// `=> some-fork`), while keeping the same left-hand path, would
+/// otherwise look unchanged to a path-only comparison and get silently
+/// dropped.
+fn go_mod_replace_directives(content: &str) -> Result<Vec<serde_json::Value>> {
     let tmp_dir = tempfile::tempdir().context("failed to create temp dir for go mod edit")?;
     let tmp_path = tmp_dir.path().join("go.mod");
     std::fs::write(&tmp_path, content).context("failed to write temp go.mod")?;
@@ -1247,14 +1320,7 @@ fn go_mod_replace_paths(content: &str) -> Result<Vec<String>> {
     }
     let parsed: serde_json::Value =
         serde_json::from_slice(&output.stdout).context("failed to parse go mod edit -json output")?;
-    let paths = parsed["Replace"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|entry| entry["Old"]["Path"].as_str())
-        .map(|s| s.to_string())
-        .collect();
-    Ok(paths)
+    Ok(parsed["Replace"].as_array().cloned().unwrap_or_default())
 }
 
 /// `git subrepo commit` doesn't touch `branch` (see the doc note above
@@ -1311,7 +1377,7 @@ Dispatch arm: `Command::ForceCommitConflictedSubrepo { path, tag } => pull_subre
 - [ ] **Step 4: Run all `pull_subrepo` tests**
 
 Run: `cargo test -p xtask pull_subrepo -- --nocapture`
-Expected: all 16 tests from Task 2 PASS.
+Expected: all 18 tests from Task 2 PASS.
 
 - [ ] **Step 5: Commit**
 
@@ -1494,6 +1560,67 @@ fn run_updates_go_mod_and_commits_the_full_sequence() {
     // VENDORING.md note's) also survives a no-op re-run.
     let second = finish_vendor_bump::run(dir.path(), "crates/ex-ray/third_party/widget", "widget", "v2.0.0");
     assert!(second.is_ok(), "a second, no-op run must not fail on an empty go.mod/go.sum commit: {second:?}");
+}
+
+/// The FinishVendorBump doc comment (Task 5 Step 5, xtask/src/lib.rs)
+/// claims `run()` "commit[s] each step's own changes — regardless of
+/// whether the identity check passed." The only prior test reaching
+/// `IdentityCheckOutcome::Failed` calls `run_identity_checks` directly,
+/// skipping the VENDORING.md/go.mod steps entirely — this exercises the
+/// claim through the actual `run()` entry point `cargo xtask
+/// finish-vendor-bump` calls.
+#[skuld::test]
+fn run_commits_earlier_steps_even_when_the_identity_check_fails() {
+    let dir = tempfile::tempdir().unwrap();
+    let vendored = dir.path().join("crates/ex-ray/third_party/widget");
+    let ex_ray = dir.path().join("crates/ex-ray");
+    let vendoring_dir = dir.path().join("crates/ex-ray/third_party");
+    std::fs::create_dir_all(&vendored).unwrap();
+    std::fs::create_dir_all(&ex_ray).unwrap();
+
+    std::fs::write(vendored.join("go.mod"), "module example.com/widget\n\ngo 1.25\n").unwrap();
+    std::fs::write(vendored.join("main.go"), "package widget\n").unwrap();
+
+    std::fs::write(
+        vendoring_dir.join("VENDORING.md"),
+        "# Vendoring\n\n## `widget/` — pinned **v1.0.0** ([upstream](https://example.com))\n",
+    )
+    .unwrap();
+
+    std::fs::write(
+        ex_ray.join("go.mod"),
+        "module example.com/ex-ray\n\ngo 1.25\n\nrequire example.com/widget v1.0.0\n\nreplace example.com/widget => ./third_party/widget\n",
+    )
+    .unwrap();
+    // Deliberate test failure in crates/ex-ray's own suite — the FIRST
+    // check run_identity_checks performs, so VENDORING.md and go.mod are
+    // already updated and committed by the time this fails.
+    std::fs::write(
+        ex_ray.join("main_test.go"),
+        "package main\n\nimport \"testing\"\n\nfunc TestBroken(t *testing.T) { t.Fatal(\"deliberate failure\") }\n",
+    )
+    .unwrap();
+    std::fs::write(ex_ray.join("main.go"), "package main\n\nfunc main() {}\n").unwrap();
+
+    git(dir.path(), &["init", "--initial-branch=main", "--quiet"]);
+    git(dir.path(), &["config", "user.email", "fixture@example.com"]);
+    git(dir.path(), &["config", "user.name", "fixture"]);
+    git(dir.path(), &["add", "-A"]);
+    git(dir.path(), &["commit", "-m", "initial"]);
+
+    let outcome = finish_vendor_bump::run(dir.path(), "crates/ex-ray/third_party/widget", "widget", "v2.0.0").unwrap();
+    assert!(matches!(outcome, IdentityCheckOutcome::Failed { .. }), "expected the deliberate test failure to surface");
+
+    let log = Command::new("git")
+        .args(["log", "--format=%s"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    let messages = String::from_utf8_lossy(&log.stdout);
+    assert!(messages.contains("widget"), "the VENDORING.md/go.mod commits must already be on HEAD despite the identity-check failure: {messages}");
+
+    let go_mod = std::fs::read_to_string(ex_ray.join("go.mod")).unwrap();
+    assert!(go_mod.contains("v2.0.0"), "go.mod should still be bumped even though the identity check failed: {go_mod}");
 }
 
 /// v2ray-core's real `ex-ray-tests` scope (build.yaml) additionally runs a
@@ -2000,16 +2127,25 @@ event, though — Renovate's own PR-open call (fast, just an API call) can
 easily beat `bump`'s pipeline (slow: install git-subrepo, run Go tests,
 etc.), so an ungated version of this job would routinely arm auto-merge on
 Renovate's bare `.gitrepo`-branch-line-only commit, before `bump` has
-pulled anything — exactly the premature-merge race the Renovate
-`automerge: false` override (Task 6) exists to prevent, just reintroduced
-under a different trigger. It gates on the PR's *current head commit*
-having been authored by `nathan-blahaj[bot]` — i.e. that `bump` has
-already pushed *something* to this exact commit, whether the outcome was
-clean or conflicted (both are safe to arm on: a still-conflicted commit
-has literal markers in tracked source, which reliably breaks compilation,
-so CI naturally fails and blocks the merge regardless of arming).
-Renovate's own commits are never authored that way, so this structurally
-can't fire on the dangerous case.
+pulled anything. Gating on the commit's *author* alone isn't enough
+either — a commit where `bump` pushed a still-conflicted tree, or where
+`finish-vendor-bump` failed before ever running its identity check, is
+just as `nathan-blahaj[bot]`-authored as a genuinely clean one, and "CI
+will catch a conflict anyway" isn't structurally true: `Test ex-ray (Go)`
+only compiles/tests a scoped subset of the vendored tree (`crates/ex-ray`
+plus four specific `transport/internet/*` packages), and `prek`/
+`golangci-lint` exclude `third_party` entirely, so conflict markers
+anywhere else in the vendored tree would never be caught by any required
+check. `bump` instead reports its *true* outcome directly, via a
+`vendor-bump-ready` check-run it creates on its own pushed commit
+(conclusion `success` only when the pull was clean *and* `finish-vendor-bump`
+itself succeeded, `failure` otherwise) — added to Task 1 Step 5's
+required-status-checks alongside `Test ex-ray (Go)`, so GitHub's own merge
+gate enforces it independently of anything `arm-on-pr-open` does.
+`arm-on-pr-open` queries that same check-run before arming, and both arm
+steps pass `--match-head-commit` so a Renovate force-push between the
+check and the `gh pr merge` call makes the arm attempt a no-op instead of
+merging a moved-on head.
 
 Other fixes below:
 
@@ -2064,12 +2200,20 @@ permissions:
   pull-requests: write
 
 concurrency:
-  # github.head_ref (pull_request) and github.ref_name (push) are both
-  # already the bare branch name — github.ref (a push-event fallback some
-  # designs use here) is instead the full refs/heads/... form, which would
-  # silently put push- and pull_request-triggered runs for the same branch
-  # into two different groups.
-  group: vendor-bump-${{ github.head_ref || github.ref_name }}
+  # `cancel-in-progress: false` does not mean "queue everything": when a
+  # new run is queued while another in the same group is in progress, the
+  # new one becomes pending, and any *previously pending* run in that
+  # group is cancelled — only one pending run survives per group. `bump`'s
+  # own push fires both a `push` event (a new `bump` run, skipped early by
+  # the self-retrigger guard but still occupying a concurrency slot) and a
+  # `pull_request: synchronize` event (an `arm-on-pr-open` run) — webhook
+  # delivery order between the two isn't guaranteed, so putting both event
+  # types in the same group risks `arm-on-pr-open` getting evicted before
+  # it ever starts. `bump` and `arm-on-pr-open` runs are kept in separate
+  # groups (prefixed by event type) so neither can evict the other;
+  # `github.head_ref` (pull_request) and `github.ref_name` (push) are both
+  # already the bare branch name.
+  group: vendor-bump-${{ github.event_name == 'pull_request' && 'arm' || 'bump' }}-${{ github.head_ref || github.ref_name }}
   cancel-in-progress: false
 
 jobs:
@@ -2102,10 +2246,9 @@ jobs:
       # git-subrepo isn't part of the ubuntu-latest image or any
       # apt/npm/go package — it's a bash-script tool installed by cloning
       # it and putting its lib/ dir (containing an executable named
-      # `git-subrepo`) on PATH, exactly how `git <subcommand>` dispatch
-      # finds any git-<name> executable on PATH. Pinned to 0.4.9 to match
-      # the version this workflow's fixup logic targets — confirm this tag
-      # exists on first real run.
+      # `git-subrepo`) on PATH. Pinned to 0.4.9 to match the version this
+      # workflow's fixup logic targets — confirm this tag exists on first
+      # real run.
       - name: Install git-subrepo 0.4.9
         run: |
           git clone --branch 0.4.9 --depth 1 https://github.com/ingydotnet/git-subrepo "$RUNNER_TEMP/git-subrepo"
@@ -2199,11 +2342,35 @@ jobs:
           pr_number=$(gh pr list --repo "${{ github.repository }}" --head "${{ github.ref_name }}" --json number --jq '.[0].number // empty')
           echo "pr_number=$pr_number" >> "$GITHUB_OUTPUT"
 
+      # The single source of truth for "is this pushed commit actually
+      # ready to merge" — arm-on-pr-open (below) queries this same
+      # check-run instead of re-deriving the answer, and it's a required
+      # status check (Task 1 Step 5) so GitHub's own merge gate enforces
+      # it too, independent of either arming path.
+      - name: Report vendor-bump-ready check for the pushed commit
+        if: steps.pull.outputs.result == 'clean' || steps.pull.outputs.result == 'conflicted'
+        env:
+          GH_TOKEN: ${{ steps.nathan.outputs.token }}
+        run: |
+          sha=$(git rev-parse HEAD)
+          if [[ "${{ steps.pull.outputs.result }}" == "clean" && "${{ steps.finish.outcome }}" == "success" ]]; then
+            conclusion=success
+          else
+            conclusion=failure
+          fi
+          gh api "repos/${{ github.repository }}/check-runs" -X POST \
+            -f name="vendor-bump-ready" \
+            -f head_sha="$sha" \
+            -f status=completed \
+            -f conclusion="$conclusion"
+
       - name: Arm auto-merge
         if: steps.pull.outputs.result == 'clean' && steps.finish.outcome == 'success' && steps.find-pr.outputs.pr_number != ''
         env:
           GH_TOKEN: ${{ steps.nathan.outputs.token }}
-        run: gh pr merge --auto --squash "${{ steps.find-pr.outputs.pr_number }}" --repo "${{ github.repository }}"
+        run: |
+          sha=$(git rev-parse HEAD)
+          gh pr merge --auto --squash --match-head-commit "$sha" "${{ steps.find-pr.outputs.pr_number }}" --repo "${{ github.repository }}"
 
       # Renovate's prHourlyLimit/prConcurrentLimit (both left at defaults
       # here) deliberately create the branch and defer PR creation — this
@@ -2245,22 +2412,23 @@ jobs:
           app-id: ${{ secrets.NATHAN_APP_ID }}
           private-key: ${{ secrets.NATHAN_APP_PRIVATE_KEY }}
 
-      # See the note above the workflow: only arm once `bump` has actually
-      # pushed something to this exact commit — never on Renovate's own
-      # bare branch-only commit, which would trivially pass CI.
-      - name: Check whether bump has already pushed its work
+      # Only `bump`'s own vendor-bump-ready check-run (not merely who
+      # authored the head commit — a conflicted or partially-failed bump
+      # is also nathan-authored) tells us whether this exact commit is
+      # actually ready.
+      - name: Check whether bump reported this commit ready
         id: check-head
         env:
           GH_TOKEN: ${{ steps.nathan.outputs.token }}
         run: |
-          author=$(gh api "repos/${{ github.repository }}/commits/${{ github.event.pull_request.head.sha }}" --jq '.commit.author.name')
-          echo "author=$author" >> "$GITHUB_OUTPUT"
+          conclusion=$(gh api "repos/${{ github.repository }}/commits/${{ github.event.pull_request.head.sha }}/check-runs" --jq '[.check_runs[] | select(.name == "vendor-bump-ready")][0].conclusion // empty')
+          echo "conclusion=$conclusion" >> "$GITHUB_OUTPUT"
 
       - name: Arm auto-merge
-        if: steps.check-head.outputs.author == 'nathan-blahaj[bot]'
+        if: steps.check-head.outputs.conclusion == 'success'
         env:
           GH_TOKEN: ${{ steps.nathan.outputs.token }}
-        run: gh pr merge --auto --squash "${{ github.event.pull_request.number }}" --repo "${{ github.repository }}"
+        run: gh pr merge --auto --squash --match-head-commit "${{ github.event.pull_request.head.sha }}" "${{ github.event.pull_request.number }}" --repo "${{ github.repository }}"
 ```
 
 - [ ] **Step 2: Validate the YAML syntactically**
@@ -2433,6 +2601,11 @@ To do it by hand (same tools the automation uses):
    target: `crates/ex-ray`'s own `go test ./...`, plus — for v2ray-core
    specifically — the scoped `transport/internet/{tls,quic,hysteria2,
    transportcommon}` test), committing regardless of whether it passed.
+3. `git push`, then `gh pr merge --auto --squash <PR>` yourself. Your
+   commit isn't authored by `nathan-blahaj[bot]`, so `vendor-bump.yaml`'s
+   automated arming (which checks for that identity's own
+   `vendor-bump-ready` check-run) never fires for a hand-resolved conflict
+   — arm it yourself once you've pushed a fix you're confident in.
 ```
 
 - [ ] **Step 2: Commit**
@@ -2466,9 +2639,9 @@ the workflow YAML don't break the existing build.
 
 `gh secret list --repo bindreams/hole` should show `NATHAN_APP_ID` and
 `NATHAN_APP_PRIVATE_KEY`. Also confirm via `gh api repos/bindreams/hole/rulesets/<id>`
-(or the Settings UI) that `Test ex-ray (Go)` now appears in
-`required_status_checks`. If either is missing, stop and complete Task 1
-first.
+(or the Settings UI) that both `Test ex-ray (Go)` and `vendor-bump-ready`
+now appear in `required_status_checks`. If any is missing, stop and
+complete Task 1 first.
 
 - [ ] **Step 4: Dry-run `vendor-bump.yaml` via `workflow_dispatch` on a harmless case**
 
