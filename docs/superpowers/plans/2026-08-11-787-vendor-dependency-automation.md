@@ -887,7 +887,11 @@ Modify `xtask/src/lib.rs`:
               println!("xtask: pulled {path} to {tag} cleanly");
               Ok(())
           }
-          pull_subrepo::Outcome::Conflicted { worktree, unresolved } => {
+          pull_subrepo::Outcome::Conflicted {
+              worktree,
+              unresolved,
+              fixup_commit,
+          } => {
               eprintln!(
                   "xtask: {path} pull to {tag} has unresolved conflicts in:\n  {}\n\
                    Resolve them in {}, `git add` the resolved files, `git commit`, \
@@ -895,6 +899,12 @@ Modify `xtask/src/lib.rs`:
                   unresolved.join("\n  "),
                   worktree.display()
               );
+              if let Some(fixup_commit) = fixup_commit {
+                  eprintln!(
+                      "xtask: note: a `.gitrepo` parent-realignment commit ({fixup_commit}) was \
+                       already created on this branch before the conflict."
+                  );
+              }
               // Exit code 2 distinguishes "real conflict, worktree left
               // for resolution" from any other failure (which propagates
               // as exit 1 via the `?` above) — vendor-bump.yaml branches
@@ -932,7 +942,7 @@ ______________________________________________________________________
 
 **Interfaces:**
 
-- Consumes: everything from Task 3 (`run_git`, `Outcome`, `replace_gitrepo_field`).
+- Consumes: everything from Task 3 (`run_git`, `Outcome`, `replace_gitrepo_field`, `git_common_dir`, `ensure_tag_pin_matches`).
 
 - Produces: the complete `pull_subrepo::{run, force_commit_conflicted, is_auto_resolvable}` — nothing further changes their public shape.
 
@@ -973,7 +983,13 @@ implementation below:
   silently losing it.
 
 ```rust
-fn handle_conflict(repo_root: &Path, subdir: &str, tag: &str, pull_output: &Output) -> Result<Outcome> {
+fn handle_conflict(
+    repo_root: &Path,
+    subdir: &str,
+    tag: &str,
+    pull_output: &Output,
+    fixup_commit: Option<&str>,
+) -> Result<Outcome> {
     let stdout = String::from_utf8_lossy(&pull_output.stdout);
     if !stdout.contains("\"git merge\" command failed") {
         bail!(
@@ -993,7 +1009,11 @@ fn handle_conflict(repo_root: &Path, subdir: &str, tag: &str, pull_output: &Outp
     }
 
     if !unresolved.is_empty() {
-        return Ok(Outcome::Conflicted { worktree, unresolved });
+        return Ok(Outcome::Conflicted {
+            worktree,
+            unresolved,
+            fixup_commit: fixup_commit.map(str::to_string),
+        });
     }
 
     // Every conflict was on the documented-safe allowlist — finish the
@@ -1012,7 +1032,7 @@ fn handle_conflict(repo_root: &Path, subdir: &str, tag: &str, pull_output: &Outp
     }
 
     run_git(repo_root, &["subrepo", "commit", subdir])?;
-    fixup_branch_field_if_needed(repo_root, subdir, tag)?;
+    ensure_tag_pin_matches(repo_root, subdir, tag)?;
     best_effort_clean(repo_root, subdir);
     Ok(Outcome::Clean)
 }
@@ -1037,7 +1057,7 @@ pub fn force_commit_conflicted(repo_root: &Path, subdir: &str, tag: &str) -> Res
         bail!("git commit failed in the subrepo temp worktree {}", worktree.display());
     }
     run_git(repo_root, &["subrepo", "commit", subdir])?;
-    fixup_branch_field_if_needed(repo_root, subdir, tag)?;
+    ensure_tag_pin_matches(repo_root, subdir, tag)?;
     best_effort_clean(repo_root, subdir);
     Ok(())
 }
@@ -1117,26 +1137,6 @@ fn go_mod_replace_directives(content: &str) -> Result<Vec<serde_json::Value>> {
     Ok(parsed["Replace"].as_array().cloned().unwrap_or_default())
 }
 
-/// `git subrepo commit` doesn't touch `branch` (see the doc note above
-/// `handle_conflict`), so this fixes it up — but only if it's actually
-/// stale, since committing an empty diff fails.
-fn fixup_branch_field_if_needed(repo_root: &Path, subdir: &str, tag: &str) -> Result<()> {
-    let gitrepo_path = repo_root.join(subdir).join(".gitrepo");
-    let contents = std::fs::read_to_string(&gitrepo_path)
-        .with_context(|| format!("failed to read {}", gitrepo_path.display()))?;
-    let updated = replace_gitrepo_field(&contents, "branch", tag)?;
-    if updated == contents {
-        return Ok(());
-    }
-    std::fs::write(&gitrepo_path, updated).with_context(|| format!("failed to write {}", gitrepo_path.display()))?;
-    run_git(repo_root, &["add", &format!("{subdir}/.gitrepo")])?;
-    run_git(
-        repo_root,
-        &["commit", "-m", &format!("fix: record {subdir} subrepo branch as {tag}")],
-    )?;
-    Ok(())
-}
-
 pub(crate) fn is_auto_resolvable(path: &str) -> bool {
     path == "go.mod" || path == "go.sum" || path.starts_with(".github/workflows/")
 }
@@ -1147,8 +1147,13 @@ fn unmerged_paths(worktree: &Path) -> Result<Vec<String>> {
 }
 ```
 
-(`git_common_dir` is already defined in Task 3's code — no need to
-redefine it here, `conflict_worktree` above just calls it.)
+(`git_common_dir` and `ensure_tag_pin_matches` are already defined in Task
+3's code — no need to redefine them here. `conflict_worktree` above calls
+the former; `handle_conflict`/`force_commit_conflicted` above call the
+latter instead of a separate `fixup_branch_field_if_needed` — it's the
+same read-`.gitrepo`/rewrite-`branch`/add/commit-if-changed logic Task 3
+already built and tested for its own tag-pin-realignment gap, so this path
+reuses it rather than defining a second, functionally identical copy.)
 
 - [ ] **Step 3: Wire the `force-commit-conflicted-subrepo` CLI command**
 
@@ -1171,7 +1176,11 @@ Dispatch arm: `Command::ForceCommitConflictedSubrepo { path, tag } => pull_subre
 - [ ] **Step 4: Run all `pull_subrepo` tests**
 
 Run: `cargo test -p xtask pull_subrepo -- --nocapture`
-Expected: all 18 tests from Task 2 PASS.
+Expected: all tests in `pull_subrepo_tests.rs` PASS — the original 18 from
+Task 2, plus 10 more Task 3 added while hardening its own guards past the
+original brief (see Task 3's commit history for what each covers); confirm
+the current count with `grep -c '#\[skuld::test\]' xtask/src/pull_subrepo_tests.rs`
+rather than trusting a hardcoded number here, since it'll drift again.
 
 - [ ] **Step 5: Commit**
 
