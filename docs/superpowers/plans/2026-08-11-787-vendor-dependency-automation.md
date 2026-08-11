@@ -9,26 +9,17 @@ result as a PR that merges automatically when clean+green or sits open/red
 when a real conflict or CI failure blocks it — with no self-hosted server.
 
 **Architecture:** Renovate (hosted GitHub App) bumps only the `branch =`
-line in each `.gitrepo` via a `customManager` and opens its normal PR. A new
-`vendor-bump.yaml` workflow, authenticated as a purpose-built GitHub App
-(`nathan-blahaj`, not the default `GITHUB_TOKEN`, so its pushes actually
-retrigger CI), runs `cargo xtask pull-subrepo` (a generic, human-usable
-wrapper around `git subrepo pull` that fixes the routine squash-merge
-parent-staleness automatically and behaves like `git pull` on a real
-conflict — stops, uncommitted) followed by `cargo xtask finish-vendor-bump`
-(version note + `go.mod` + identity build/test), then pushes. The same App
-fixes the identical latent bug in `wix-hash-fixup.yaml`.
-
-**Revision note (round 2):** The first draft of this plan went through a
-`running-troyka` plan review and came back `rejected` with 27 verified
-`must_fix` findings, most of them backed by the reviewer actually running
-`git subrepo` against constructed fixtures and reporting real command
-output. Every fix below was re-verified empirically against the real
-installed `git-subrepo` 0.4.9 before being written into this revision — see
-inline rationale comments citing what was actually run. The corrections are
-not superficial patches; several change the architecture (how `pull-subrepo`
-signals a conflict to its caller, how the workflow avoids retriggering
-itself, how Renovate groups the two deps).
+line in each `.gitrepo` via a `customManager` and opens its normal PR —
+without arming auto-merge itself. A new `vendor-bump.yaml` workflow,
+authenticated as a purpose-built GitHub App (`nathan-blahaj`, not the
+default `GITHUB_TOKEN`, so its pushes actually retrigger CI), runs
+`cargo xtask pull-subrepo` (a generic, human-usable wrapper around
+`git subrepo pull` that fixes the routine squash-merge parent-staleness
+automatically and behaves like `git pull` on a real conflict — stops,
+uncommitted) followed by `cargo xtask finish-vendor-bump` (version note +
+`go.mod` + identity build/test), pushes, and — only once the real work has
+actually landed — arms GitHub-native auto-merge itself via `gh pr merge --auto`. The same App fixes the identical latent bug in
+`wix-hash-fixup.yaml`.
 
 **Tech Stack:** Rust (`xtask`, existing `clap`/`anyhow` conventions), GitHub
 Actions, Renovate `customManager` (regex), `git-subrepo` 0.4.9.
@@ -44,7 +35,9 @@ Actions, Renovate `customManager` (regex), `git-subrepo` 0.4.9.
   tree itself — that decision belongs to the caller. It auto-resolves only
   the documented-safe allowlist (`go.mod`, `go.sum`,
   `.github/workflows/*`) to upstream's version; anything else conflicting
-  stops the tool with nothing committed, exactly like `git pull`.
+  stops the tool with nothing committed on the pull attempt itself, exactly
+  like `git pull` (a prior, independent `.gitrepo`-parent-realignment
+  commit may already be on the branch when this happens — see Task 4).
 - The CI-only "commit despite conflicts" behavior lives in
   `vendor-bump.yaml`, not in the xtask tool.
 - Renovate goes dormant on a dependency once a non-Renovate commit lands on
@@ -53,29 +46,33 @@ Actions, Renovate `customManager` (regex), `git-subrepo` 0.4.9.
 - `nathan-blahaj` is the generic bot identity name (not vendor-specific) —
   reused for `wix-hash-fixup.yaml` too. Secrets: `NATHAN_APP_ID`,
   `NATHAN_APP_PRIVATE_KEY`.
+- Renovate never arms auto-merge for these PRs itself (no `automerge` in
+  its packageRules) — `vendor-bump.yaml` is the sole arming point, and only
+  after a clean pull *and* a successful finish, to close the
+  premature-merge race described above.
 - `vendor-bump.yaml` must never act on its own pushes (it would otherwise
-  retrigger itself — verified this is not a hypothetical, see Task 8) and
-  must never treat a non-conflict failure (dirty tree, missing
-  `git-subrepo`, bad input) as if it were a real merge conflict.
+  retrigger itself) and must never treat a non-conflict failure (dirty
+  tree, missing `git-subrepo`, bad input) as if it were a real merge
+  conflict.
 - Design doc: `docs/superpowers/specs/2026-08-10-787-vendor-dependency-automation.md`.
 
 ______________________________________________________________________
 
 ## File Structure
 
-| File                                            | Responsibility                                                                                                                                                                                                                                                                                        |
-| ----------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `xtask/src/git_util.rs`                         | Shared `run_git` helper (shell out, check status, return trimmed stdout) used by `pull_subrepo.rs` and `finish_vendor_bump.rs` — avoids writing it twice.                                                                                                                                             |
-| `xtask/src/pull_subrepo.rs`                     | Generic `git subrepo pull` wrapper: dirty-tree guard, defensive leftover-worktree cleanup, automatic squash-merge parent fixup, allowlist conflict auto-resolution (including the `.gitrepo` `branch`-field fixup that path needs), `git-pull`-like stop on real conflicts. No Renovate/CI awareness. |
-| `xtask/src/pull_subrepo_tests.rs`               | Fixture-repo integration tests proving the above against a real installed `git subrepo`, including both a clean and a conflicted run from a linked worktree.                                                                                                                                          |
-| `xtask/src/finish_vendor_bump.rs`               | The separate, smaller VENDORING.md "step 3" work: version note, outer `go.mod` require-version bump + `go mod tidy`, identity build/test. Commits are guarded against "nothing to commit".                                                                                                            |
-| `xtask/src/finish_vendor_bump_tests.rs`         | Tests for the above, including a failing identity check.                                                                                                                                                                                                                                              |
-| `xtask/src/lib.rs`                              | Modify: two new `Command` variants + dispatch wrappers + module/test-module declarations.                                                                                                                                                                                                             |
-| `.github/renovate.json`                         | Modify: `customManager` tracking each `.gitrepo`'s `branch` line (capturing `owner/repo`, not a full URL) + a `packageRules` entry enabling automerge, deliberately *not* grouping the two deps.                                                                                                      |
-| `.github/actions/mint-nathan-token/action.yaml` | Composite action minting a `nathan-blahaj` installation token from App ID + private key inputs. Shared by both workflows below.                                                                                                                                                                       |
-| `.github/workflows/vendor-bump.yaml`            | New workflow: picks up Renovate's `.gitrepo` bump, installs `git-subrepo`, runs the two xtask commands, pushes via `nathan-blahaj`, comments on real conflicts. Guards against self-retriggering and against misreading a non-conflict failure as a conflict.                                         |
-| `.github/workflows/wix-hash-fixup.yaml`         | Modify: swap `GITHUB_TOKEN` for `nathan-blahaj`.                                                                                                                                                                                                                                                      |
-| `crates/ex-ray/third_party/VENDORING.md`        | Modify: document the new tooling, the CI-only conflict-commit policy, and the (broadened, dep-agnostic) identity check.                                                                                                                                                                               |
+| File                                            | Responsibility                                                                                                                                                                                                                                                                                                                                                                                                        |
+| ----------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `xtask/src/git_util.rs`                         | Shared `run_git` helper (shell out, check status, return trimmed stdout) used by `pull_subrepo.rs` and `finish_vendor_bump.rs`.                                                                                                                                                                                                                                                                                       |
+| `xtask/src/pull_subrepo.rs`                     | Generic `git subrepo pull` wrapper: dirty-tree guard, defensive leftover-worktree cleanup before every attempt, automatic squash-merge parent fixup, allowlist conflict auto-resolution (handling delete/modify conflicts, not just modify/modify, and the `.gitrepo` `branch`-field fixup that path needs — guarded against a no-op empty commit), `git-pull`-like stop on real conflicts. No Renovate/CI awareness. |
+| `xtask/src/pull_subrepo_tests.rs`               | Fixture-repo integration tests proving the above against a real installed `git subrepo`: clean, allowlisted, real, mixed (both in one pull), dirty-tree, both from a plain checkout and a linked worktree, and recovery from a leftover worktree left by a prior run.                                                                                                                                                 |
+| `xtask/src/finish_vendor_bump.rs`               | The separate, smaller VENDORING.md "step 3" work: version note, outer `go.mod` require-version bump (without double-prefixing `v`) + `go mod tidy`, identity build/test. Commits are guarded against "nothing to commit".                                                                                                                                                                                             |
+| `xtask/src/finish_vendor_bump_tests.rs`         | Tests for the above, including the full `run()` sequence end-to-end (not just its sub-steps) and a failing identity check.                                                                                                                                                                                                                                                                                            |
+| `xtask/src/lib.rs`                              | Modify: two new `Command` variants + dispatch wrappers + module/test-module declarations.                                                                                                                                                                                                                                                                                                                             |
+| `.github/renovate.json`                         | Modify: `customManager` tracking each `.gitrepo`'s `branch` line (capturing `owner/repo`, not a full URL; no `extractVersionTemplate`, since that would strip the `v` this repo's tags and `git subrepo pull -b` both need). No packageRules entry — automerge is armed by the workflow, not Renovate.                                                                                                                |
+| `.github/actions/mint-nathan-token/action.yaml` | Composite action minting a `nathan-blahaj` installation token from App ID + private key inputs. Shared by both workflows below.                                                                                                                                                                                                                                                                                       |
+| `.github/workflows/vendor-bump.yaml`            | New workflow: picks up Renovate's `.gitrepo` bump, installs `git-subrepo`, runs the two xtask commands, pushes via `nathan-blahaj`, arms auto-merge itself on a clean+finished result, comments on real conflicts. Guards against self-retriggering, branch-synchronization races, and misreading a non-conflict failure as a conflict.                                                                               |
+| `.github/workflows/wix-hash-fixup.yaml`         | Modify: swap `GITHUB_TOKEN` for `nathan-blahaj`.                                                                                                                                                                                                                                                                                                                                                                      |
+| `crates/ex-ray/third_party/VENDORING.md`        | Modify: document the new tooling, the CI-only conflict-commit policy, and the (broadened, dep-agnostic) identity check — with an accurate justification, not a citation of an unverified CI claim.                                                                                                                                                                                                                    |
 
 ______________________________________________________________________
 
@@ -141,12 +138,13 @@ ______________________________________________________________________
 
 This is the spike the design doc calls out: prove — against the *actually
 installed* `git-subrepo` 0.4.9, not assumptions — that the squash-merge
-parent-staleness fixup reliably recovers, and that a real conflict leaves
-the tree exactly as `git pull` would, in both a plain checkout and a linked
-worktree. These tests will fail against a not-yet-written `pull_subrepo`
-module — that's expected; Task 3/4 implement against them.
+parent-staleness fixup reliably recovers, that a real conflict leaves the
+tree exactly as `git pull` would, that a mixed conflict resolves only its
+allowlisted part, and that the tool recovers from a leftover worktree a
+prior run left behind. All in both a plain checkout and a linked worktree
+where relevant.
 
-**A note on how this fixture differs from the design's original assumption**
+**A note on how the fixture differs from the design's original assumption**
 (discovered by running it for real, not by further reasoning): a *single*
 clone-on-a-branch, patch, squash-merge, delete-branch cycle does **not**
 naturally produce a stale `.gitrepo` `parent` — the recorded parent is the
@@ -192,10 +190,12 @@ pub enum Outcome {
     /// documented-safe allowlist); a new commit updating `<subdir>` now
     /// sits on HEAD.
     Clean,
-    /// A conflict remains outside the safe allowlist. Nothing was
-    /// committed — the temp merge worktree `git subrepo pull` created is
-    /// left exactly as `git merge` would leave a conflicted tree, for a
-    /// human to resolve.
+    /// A conflict remains outside the safe allowlist. The pull attempt
+    /// itself committed nothing — the temp merge worktree `git subrepo
+    /// pull` created is left exactly as `git merge` would leave a
+    /// conflicted tree, for a human to resolve. (A prior, independent
+    /// `.gitrepo`-parent-realignment commit may already be on the branch
+    /// if that fixup ran first — see `fix_stale_parent`.)
     Conflicted { worktree: PathBuf, unresolved: Vec<String> },
 }
 
@@ -218,9 +218,10 @@ use std::process::Command;
 
 use super::pull_subrepo::{self, Outcome};
 
-/// Which upstream file (if any) v2 changes, matched against what our local
+/// Which upstream file(s) v2 changes, matched against what our local
 /// downstream patch also touches — this is what determines whether the
-/// eventual pull hits no conflict, an auto-resolvable one, or a real one.
+/// eventual pull hits no conflict, an auto-resolvable one, a real one, or
+/// both at once.
 enum ConflictKind {
     /// v2 changes only `other.txt`, which nothing downstream touches — a
     /// genuinely clean pull.
@@ -231,6 +232,14 @@ enum ConflictKind {
     /// v2 rewrites `patched.txt`, which our local ECH-style patch also
     /// edits — a real conflict outside the allowlist.
     Real,
+    /// v2 rewrites BOTH `go.mod` (allowlisted) and `patched.txt` (real) —
+    /// proves only the real one survives into `Outcome::Conflicted`.
+    Mixed,
+    /// v2 DELETES `go.sum` entirely while our downstream commit still has
+    /// local edits to it — a delete/modify conflict, not the more common
+    /// modify/modify case. `checkout --theirs` has no "theirs" blob to
+    /// check out here; resolving to theirs means removing the file.
+    AllowlistedDelete,
 }
 
 /// Builds a throwaway upstream + downstream repo pair replicating Hole's
@@ -271,6 +280,18 @@ impl Fixture {
             }
             ConflictKind::Real => {
                 std::fs::write(upstream.join("patched.txt"), "upstream line one CHANGED\n").unwrap();
+            }
+            ConflictKind::Mixed => {
+                std::fs::write(
+                    upstream.join("go.mod"),
+                    "module fixture\n\ngo 1.26\n\nrequire upstream/newdep v1.0.0\n",
+                )
+                .unwrap();
+                std::fs::write(upstream.join("patched.txt"), "upstream line one CHANGED\n").unwrap();
+            }
+            ConflictKind::AllowlistedDelete => {
+                std::fs::remove_file(upstream.join("go.sum")).unwrap();
+                git(&upstream, &["add", "-A"]);
             }
         }
         git(&upstream, &["commit", "-am", "v2"]);
@@ -367,11 +388,10 @@ fn clean_pull_after_squash_merge_auto_fixes_stale_parent() {
     fx.corrupt_parent();
 
     // Sanity: this reproduces the exact stale-parent failure the fixup
-    // exists to recover from. Verified against the real installed
-    // git-subrepo 0.4.9: this text is genuinely on stderr (unlike the
-    // merge-conflict case in the other tests below, which is on stdout —
-    // see pull_subrepo.rs's handle_conflict for why that distinction
-    // matters).
+    // exists to recover from. This text is genuinely on stderr (unlike
+    // the merge-conflict case in the other tests below, which is on
+    // stdout — see pull_subrepo.rs's handle_conflict for why that
+    // distinction matters).
     let raw = Command::new("git")
         .args(["subrepo", "pull", "vendor", "-b", "v2"])
         .current_dir(&fx.downstream)
@@ -406,11 +426,37 @@ fn allowlisted_conflict_auto_resolves_to_upstream() {
 
     // `git subrepo commit` (the finishing command on the conflict-resolve
     // path, unlike a clean pull which finishes on its own) does NOT
-    // update .gitrepo's `branch` field — verified against the real tool:
-    // it stayed at v1 even though `commit` and the tree content were v2.
-    // Confirms the explicit fixup in handle_conflict.
+    // update .gitrepo's `branch` field — it stays at v1 even though
+    // `commit` and the tree content are v2. Confirms the explicit fixup
+    // in handle_conflict.
     let gitrepo = std::fs::read_to_string(fx.downstream.join("vendor/.gitrepo")).unwrap();
     assert!(gitrepo.contains("branch = v2"), "the branch pin must be updated even on the conflict-resolve path: {gitrepo}");
+}
+
+#[skuld::test]
+fn allowlisted_delete_conflict_removes_the_file_instead_of_erroring() {
+    // A delete/modify conflict (upstream deleted, downstream modified) has
+    // no "theirs" blob for `git checkout --theirs` to check out — plain
+    // `checkout --theirs` fails here. Resolving to theirs means removing
+    // the file, since upstream's version of "the file" is "gone".
+    let fx = Fixture::build(ConflictKind::AllowlistedDelete);
+
+    let outcome = pull_subrepo::run(&fx.downstream, "vendor", "v2").expect("pull should succeed");
+    assert!(matches!(outcome, Outcome::Clean));
+    assert!(!fx.downstream.join("vendor/go.sum").exists(), "go.sum should be removed, matching upstream's deletion");
+}
+
+#[skuld::test]
+fn mixed_conflict_auto_resolves_the_allowlisted_part_only() {
+    let fx = Fixture::build(ConflictKind::Mixed);
+
+    let outcome = pull_subrepo::run(&fx.downstream, "vendor", "v2").expect("a real conflict is a reported Outcome, not an Err");
+    match outcome {
+        Outcome::Conflicted { unresolved, .. } => {
+            assert_eq!(unresolved, vec!["patched.txt".to_string()], "go.mod should have been auto-resolved, leaving only the real conflict");
+        }
+        Outcome::Clean => panic!("expected a real conflict on patched.txt to survive"),
+    }
 }
 
 #[skuld::test]
@@ -428,6 +474,49 @@ fn real_conflict_stops_uncommitted_like_git_pull() {
 
     let after_head = git_output(&fx.downstream, &["rev-parse", "HEAD"]);
     assert_eq!(before_head, after_head, "a real conflict must not commit anything on the downstream repo");
+}
+
+#[skuld::test]
+fn real_conflict_stops_uncommitted_from_a_linked_worktree() {
+    // The other two worktree tests (works_identically_from_a_linked_worktree,
+    // allowlisted_conflict_resolves_from_a_linked_worktree) only cover
+    // outcomes that end Clean. This is the only test that inspects
+    // Outcome::Conflicted's `worktree` field and asserts nothing was
+    // committed — and it needs to run from a linked worktree too, since
+    // that's exactly the scenario a real conflict during an in-worktree
+    // bump attempt would hit.
+    let fx = Fixture::build(ConflictKind::Real);
+    let worktree_path = fx.dir.path().join("downstream-worktree");
+    git(&fx.downstream, &["worktree", "add", worktree_path.to_str().unwrap()]);
+    let before_head = git_output(&worktree_path, &["rev-parse", "HEAD"]);
+
+    let outcome = pull_subrepo::run(&worktree_path, "vendor", "v2").expect("a real conflict is a reported Outcome, not an Err");
+    match outcome {
+        Outcome::Conflicted { worktree, unresolved } => {
+            assert_eq!(unresolved, vec!["patched.txt".to_string()]);
+            assert!(worktree.is_dir(), "the reported conflict worktree should exist: {}", worktree.display());
+        }
+        Outcome::Clean => panic!("expected a conflict on patched.txt"),
+    }
+
+    let after_head = git_output(&worktree_path, &["rev-parse", "HEAD"]);
+    assert_eq!(before_head, after_head, "a real conflict must not commit anything on the worktree's HEAD");
+}
+
+#[skuld::test]
+fn a_second_run_recovers_from_a_leftover_conflicted_worktree() {
+    let fx = Fixture::build(ConflictKind::Real);
+
+    let first = pull_subrepo::run(&fx.downstream, "vendor", "v2").expect("first conflicted run should report Conflicted, not Err");
+    assert!(matches!(first, Outcome::Conflicted { .. }));
+
+    // Without cleaning up in between: verified live that git-subrepo
+    // refuses a second pull ("There is already a worktree with branch
+    // subrepo/vendor") unless the leftover worktree/branch is cleaned
+    // first. attempt_pull's defensive `git subrepo clean` before every
+    // attempt must recover from this rather than erroring.
+    let second = pull_subrepo::run(&fx.downstream, "vendor", "v2").expect("second run should also cleanly report Conflicted, not error on the leftover worktree");
+    assert!(matches!(second, Outcome::Conflicted { .. }));
 }
 
 #[skuld::test]
@@ -617,13 +706,13 @@ fn ensure_clean_tree(repo_root: &Path) -> Result<()> {
 }
 
 /// Runs `git subrepo pull`, first defensively cleaning any worktree/branch
-/// left over from a previous attempt. Verified against the real tool: a
-/// leftover `subrepo/<subdir>` worktree/branch (left behind by ANY prior
-/// pull attempt — successful, conflicted, or interrupted) makes the next
-/// `git subrepo pull` fail immediately with "There is already a worktree
-/// with branch subrepo/<subdir>", masking the real outcome of this
-/// attempt. `git subrepo clean` is a verified-safe no-op when there's
-/// nothing to clean, so this is unconditional.
+/// left over from a previous attempt. A leftover `subrepo/<subdir>`
+/// worktree/branch (left behind by ANY prior pull attempt — successful,
+/// conflicted, or interrupted) makes the next `git subrepo pull` fail
+/// immediately with "There is already a worktree with branch
+/// subrepo/<subdir>", masking the real outcome of this attempt.
+/// `git subrepo clean` is a safe no-op when there's nothing to clean, so
+/// this is unconditional.
 fn attempt_pull(repo_root: &Path, subdir: &str, tag: &str) -> Result<Output> {
     run_git(repo_root, &["subrepo", "clean", subdir]).ok();
     Command::new("git")
@@ -636,11 +725,14 @@ fn attempt_pull(repo_root: &Path, subdir: &str, tag: &str) -> Result<Output> {
 /// Replicates git-subrepo's own recovery formula for a squash-merge-stale
 /// `.gitrepo` `parent` (its own error message suggests exactly this SHA):
 /// the last commit that touched the `.gitrepo` file's `commit =` line,
-/// walked back one parent. Verified empirically against the real 0.4.9
-/// tool: this candidate is always an ancestor of HEAD by construction (it
-/// comes from `git log` starting at HEAD), so the `debug_assert!` below is
-/// contract enforcement of a mathematically-guaranteed condition, not a
-/// recoverable runtime error.
+/// walked back one parent. This candidate is always an ancestor of HEAD by
+/// construction (it comes from `git log` starting at HEAD). The check
+/// below is still a real, always-on `bail!` rather than a `debug_assert!`
+/// despite that guarantee: it's the sole guard immediately before an
+/// irreversible committed write in unattended CI, where a silently
+/// compiled-away check (debug_assert! is a no-op in release builds) is the
+/// wrong trade — a crash-in-dev-loop benefit isn't worth a possible
+/// silent-corruption path in production.
 fn fix_stale_parent(repo_root: &Path, subdir: &str) -> Result<()> {
     let gitrepo_rel = format!("{subdir}/.gitrepo");
 
@@ -662,11 +754,13 @@ fn fix_stale_parent(repo_root: &Path, subdir: &str) -> Result<()> {
         .current_dir(repo_root)
         .status()
         .context("git merge-base --is-ancestor failed to run")?;
-    debug_assert!(
-        is_ancestor.success(),
-        "computed replacement parent {candidate} is not an ancestor of HEAD — \
-         the last-sync-commit formula is supposed to guarantee this by construction"
-    );
+    if !is_ancestor.success() {
+        bail!(
+            "computed replacement parent {candidate} is not an ancestor of HEAD — \
+             this should never happen (the last-sync-commit formula guarantees it by \
+             construction); something is deeply wrong with this repo's history"
+        );
+    }
 
     let gitrepo_path = repo_root.join(subdir).join(".gitrepo");
     let contents = std::fs::read_to_string(&gitrepo_path)
@@ -812,14 +906,13 @@ ______________________________________________________________________
 
 - [ ] **Step 1: Confirm the conflict tests still fail against Task 3's placeholder**
 
-Run: `cargo test -p xtask pull_subrepo::allowlisted pull_subrepo::real_conflict pull_subrepo::is_auto_resolvable -- --nocapture`
+Run: `cargo test -p xtask pull_subrepo::allowlisted pull_subrepo::real_conflict pull_subrepo::mixed pull_subrepo::is_auto_resolvable -- --nocapture`
 Expected: all FAIL (the placeholder `handle_conflict` just bails; `is_auto_resolvable` is still `unimplemented!`).
 
 - [ ] **Step 2: Implement the real conflict handling**
 
 In `xtask/src/pull_subrepo.rs`, replace the placeholder `handle_conflict`
-and add its helpers. Two facts below are verified against the real
-installed tool, not assumed:
+and add its helpers:
 
 - The merge-conflict text (`"git merge" command failed` + the full
   recovery instructions) is on **stdout**. stderr is 0 bytes on a
@@ -829,7 +922,14 @@ installed tool, not assumed:
   conflict-resolve path) does **not** update `.gitrepo`'s `branch` field —
   it stays at the pre-pull tag even though `commit` and the tree content
   are the new tag. Only `git subrepo pull -b <tag>` finishing on its own
-  (Task 3's clean path) does that. This path fixes it up explicitly.
+  (Task 3's clean path) does that. This path fixes it up explicitly — but
+  guarded: in the real Renovate-triggered flow, `.gitrepo`'s `branch` is
+  *already* the new tag (Renovate wrote it before this tool ever ran), so
+  the rewrite is a no-op and must not attempt an empty commit (`git commit` with nothing staged exits 1, verified).
+- `checkout --theirs <path>` has no "theirs" blob to check out on a
+  delete/modify conflict (upstream deleted the file, downstream modified
+  it) — resolving to theirs there means removing the file, not checking
+  out content that doesn't exist on that side.
 
 ```rust
 fn handle_conflict(repo_root: &Path, subdir: &str, tag: &str, pull_output: &Output) -> Result<Outcome> {
@@ -855,8 +955,7 @@ fn handle_conflict(repo_root: &Path, subdir: &str, tag: &str, pull_output: &Outp
     let mut unresolved = Vec::new();
     for path in &conflicted {
         if is_auto_resolvable(path) {
-            run_git(&worktree, &["checkout", "--theirs", "--", path])?;
-            run_git(&worktree, &["add", "--", path])?;
+            resolve_to_theirs(&worktree, path)?;
         } else {
             unresolved.push(path.clone());
         }
@@ -866,8 +965,6 @@ fn handle_conflict(repo_root: &Path, subdir: &str, tag: &str, pull_output: &Outp
         return Ok(Outcome::Conflicted { worktree, unresolved });
     }
 
-    // Every conflict was on the documented-safe allowlist — finish the
-    // merge exactly as git-subrepo's own instructions tell a human to.
     // PREK_ALLOW_NO_CONFIG=1 (not --no-verify): this temp worktree is a
     // standalone checkout of just the subrepo content, with no
     // prek.toml of its own.
@@ -882,22 +979,53 @@ fn handle_conflict(repo_root: &Path, subdir: &str, tag: &str, pull_output: &Outp
     }
 
     run_git(repo_root, &["subrepo", "commit", subdir])?;
+    fixup_branch_field_if_needed(repo_root, subdir, tag)?;
+    run_git(repo_root, &["subrepo", "clean", subdir]).ok();
+    Ok(Outcome::Clean)
+}
 
-    // See the doc comment above: git subrepo commit doesn't touch
-    // `branch`. Fix it up so the pin reflects reality.
+/// `checkout --theirs` fails on a delete/modify conflict (no "theirs" blob
+/// to check out when upstream deleted the file) — verified this is a real
+/// possibility for `.github/workflows/*` in particular (upstream renaming
+/// or dropping a workflow file is routine). Stage 3 in the index is
+/// "theirs" during a merge conflict; if it's absent, theirs deleted the
+/// path, and resolving to theirs means removing it.
+fn resolve_to_theirs(worktree: &Path, path: &str) -> Result<()> {
+    let staged = run_git(worktree, &["ls-files", "-u", "--", path])?;
+    let theirs_present = staged
+        .lines()
+        .any(|line| line.split_whitespace().nth(2).map(|stage| stage == "3").unwrap_or(false));
+
+    if theirs_present {
+        run_git(worktree, &["checkout", "--theirs", "--", path])?;
+        run_git(worktree, &["add", "--", path])?;
+    } else {
+        run_git(worktree, &["rm", "--", path])?;
+    }
+    Ok(())
+}
+
+/// See `handle_conflict`'s doc note: `git subrepo commit` doesn't touch
+/// `branch`, so this fixes it up — but only if it's actually stale. In
+/// the real Renovate flow it already reads `tag` (Renovate wrote it
+/// before this tool ran), so rewriting would be a no-op; committing an
+/// empty diff fails (`git commit` with nothing staged exits 1, verified),
+/// so this only adds+commits when the content genuinely changes.
+fn fixup_branch_field_if_needed(repo_root: &Path, subdir: &str, tag: &str) -> Result<()> {
     let gitrepo_path = repo_root.join(subdir).join(".gitrepo");
     let contents = std::fs::read_to_string(&gitrepo_path)
         .with_context(|| format!("failed to read {}", gitrepo_path.display()))?;
-    std::fs::write(&gitrepo_path, replace_gitrepo_field(&contents, "branch", tag)?)
-        .with_context(|| format!("failed to write {}", gitrepo_path.display()))?;
+    let updated = replace_gitrepo_field(&contents, "branch", tag)?;
+    if updated == contents {
+        return Ok(());
+    }
+    std::fs::write(&gitrepo_path, updated).with_context(|| format!("failed to write {}", gitrepo_path.display()))?;
     run_git(repo_root, &["add", &format!("{subdir}/.gitrepo")])?;
     run_git(
         repo_root,
         &["commit", "-m", &format!("fix: record {subdir} subrepo branch as {tag}")],
     )?;
-
-    run_git(repo_root, &["subrepo", "clean", subdir]).ok();
-    Ok(Outcome::Clean)
+    Ok(())
 }
 
 pub(crate) fn is_auto_resolvable(path: &str) -> bool {
@@ -919,7 +1047,7 @@ fn git_common_dir(repo_root: &Path) -> Result<PathBuf> {
 - [ ] **Step 3: Run all `pull_subrepo` tests**
 
 Run: `cargo test -p xtask pull_subrepo -- --nocapture`
-Expected: all 8 tests from Task 2 PASS.
+Expected: all 11 tests from Task 2 PASS.
 
 - [ ] **Step 4: Commit**
 
@@ -947,7 +1075,7 @@ it shouldn't be bundled with the merge mechanics).
 
 - Consumes: `git_util::run_git` (Task 3).
 
-- Produces: `finish_vendor_bump::{run, run_identity_checks, IdentityCheckOutcome}` — `run(repo_root: &Path, subdir: &str, dep_name: &str, new_tag: &str) -> Result<IdentityCheckOutcome>`, consumed by Task 8's workflow. `run_identity_checks` is `pub(crate)` so it can be unit-tested directly (see Step 3's failing-identity-check test).
+- Produces: `finish_vendor_bump::{run, run_identity_checks, IdentityCheckOutcome}` — `run(repo_root: &Path, subdir: &str, dep_name: &str, new_tag: &str) -> Result<IdentityCheckOutcome>`, consumed by Task 8's workflow. `run_identity_checks` is `pub(crate)` so it can be unit-tested directly.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -1029,6 +1157,61 @@ fn failing_identity_check_is_reported_not_swallowed() {
         }
         IdentityCheckOutcome::Passed => panic!("expected the syntax error to fail go build"),
     }
+}
+
+/// Exercises the FULL `run()` sequence end-to-end — including
+/// `run_go_mod_tidy_and_commit` (never called by the other tests here),
+/// the outer `go.mod` require-line rewrite, and all four identity checks
+/// (vendored build+test, ex-ray build+test) succeeding. Two real,
+/// self-contained Go modules (no external imports, so `go mod tidy`
+/// touches nothing over the network) linked by a `replace` directive,
+/// exactly like the real `crates/ex-ray` / vendored-dep pair.
+#[skuld::test]
+fn run_updates_go_mod_and_commits_the_full_sequence() {
+    let dir = tempfile::tempdir().unwrap();
+    let vendored = dir.path().join("crates/ex-ray/third_party/widget");
+    let ex_ray = dir.path().join("crates/ex-ray");
+    let vendoring_dir = dir.path().join("crates/ex-ray/third_party");
+    std::fs::create_dir_all(&vendored).unwrap();
+    std::fs::create_dir_all(&ex_ray).unwrap();
+
+    std::fs::write(vendored.join("go.mod"), "module example.com/widget\n\ngo 1.25\n").unwrap();
+    std::fs::write(vendored.join("main.go"), "package widget\n").unwrap();
+
+    std::fs::write(
+        vendoring_dir.join("VENDORING.md"),
+        "# Vendoring\n\n## `widget/` — pinned **v1.0.0** ([upstream](https://example.com))\n",
+    )
+    .unwrap();
+
+    std::fs::write(
+        ex_ray.join("go.mod"),
+        "module example.com/ex-ray\n\ngo 1.25\n\nrequire example.com/widget v1.0.0\n\nreplace example.com/widget => ../../third_party/widget\n",
+    )
+    .unwrap();
+    std::fs::write(
+        ex_ray.join("main.go"),
+        "package main\n\nimport _ \"example.com/widget\"\n\nfunc main() {}\n",
+    )
+    .unwrap();
+
+    git(dir.path(), &["init", "--initial-branch=main", "--quiet"]);
+    git(dir.path(), &["config", "user.email", "fixture@example.com"]);
+    git(dir.path(), &["config", "user.name", "fixture"]);
+    git(dir.path(), &["add", "-A"]);
+    git(dir.path(), &["commit", "-m", "initial"]);
+
+    let outcome = finish_vendor_bump::run(dir.path(), "crates/ex-ray/third_party/widget", "widget", "v2.0.0").unwrap();
+    assert!(matches!(outcome, IdentityCheckOutcome::Passed), "expected the minimal fixture to pass all four identity checks");
+
+    let go_mod = std::fs::read_to_string(ex_ray.join("go.mod")).unwrap();
+    assert!(
+        go_mod.contains("example.com/widget v2.0.0") && !go_mod.contains("vv2.0.0"),
+        "require line should be bumped to exactly v2.0.0, not double-prefixed: {go_mod}"
+    );
+
+    let note = std::fs::read_to_string(vendoring_dir.join("VENDORING.md")).unwrap();
+    assert!(note.contains("pinned **v2.0.0**"));
 }
 ```
 
@@ -1129,6 +1312,13 @@ fn read_module_path(go_mod_path: &Path) -> Result<String> {
         .ok_or_else(|| anyhow::anyhow!("{} has no `module` line", go_mod_path.display()))
 }
 
+/// `new_tag` already carries its own `v` prefix (e.g. `v5.53.0` — the
+/// literal `.gitrepo`/tag value, never stripped: see the Renovate
+/// customManager's lack of `extractVersionTemplate`). go.mod's own syntax
+/// separately always has a literal `v` before a require line's version
+/// number regardless — `prefix` below matches THAT syntax marker to find
+/// the line, then the replacement text supplies `new_tag` (which already
+/// has its `v`) directly, without adding a second one.
 fn rewrite_require_version(contents: &str, module_path: &str, new_tag: &str) -> Result<String> {
     let prefix = format!("{module_path} v");
     let mut found = false;
@@ -1145,9 +1335,9 @@ fn rewrite_require_version(contents: &str, module_path: &str, new_tag: &str) -> 
                     .map(|(_, r)| r)
                     .unwrap_or("");
                 if rest.is_empty() {
-                    format!("{indent}{module_path} v{new_tag}")
+                    format!("{indent}{module_path} {new_tag}")
                 } else {
-                    format!("{indent}{module_path} v{new_tag} {rest}")
+                    format!("{indent}{module_path} {new_tag} {rest}")
                 }
             } else {
                 line.to_string()
@@ -1162,18 +1352,21 @@ fn rewrite_require_version(contents: &str, module_path: &str, new_tag: &str) -> 
 
 /// `pub(crate)` so a test can exercise a failing identity check directly
 /// without needing two full, valid Go module trees — `run` still calls
-/// this the same way.
+/// this the same way. Deliberately `./...` on the vendored module itself,
+/// not `./transport/...` as VENDORING.md's original manual instructions
+/// (written before utls was vendored) named — utls's ECH patch lives at
+/// its module root, not under a transport/ dir, so that path doesn't
+/// generalize to both deps. `./...` is dep-agnostic and a strict
+/// superset. Note: this check is NOT redundant with anything already in
+/// `ci.yaml` — checked directly, the only Go test coverage there today is
+/// `ex-ray-tests` (`cd crates/ex-ray && go test ./...`), which never runs
+/// the vendored module's own test suite; this is genuinely the only place
+/// that coverage exists.
 pub(crate) fn run_identity_checks(repo_root: &Path, subdir: &str) -> Result<IdentityCheckOutcome> {
     let vendored_dir = repo_root.join(subdir);
     if let Some(detail) = go_command_failure(&vendored_dir, &["build", "./..."])? {
         return Ok(IdentityCheckOutcome::Failed { detail });
     }
-    // Deliberately `./...` on the vendored module itself, not the
-    // narrower `./transport/...` VENDORING.md's original manual
-    // instructions named — that path is v2ray-core-specific (utls's ECH
-    // patch lives at its module root, not under a transport/ dir), and
-    // `./...` is a strict superset that catches a patch lost in rebase
-    // regardless of which vendored dep or which file the patch lives in.
     if let Some(detail) = go_command_failure(&vendored_dir, &["test", "./..."])? {
         return Ok(IdentityCheckOutcome::Failed { detail });
     }
@@ -1209,8 +1402,8 @@ fn go_command_failure(cwd: &Path, args: &[&str]) -> Result<Option<String>> {
     }
 }
 
-/// `git commit` exits 1 with nothing staged (verified) — a no-op run
-/// (e.g. re-finishing an already-finished bump) must not treat that as a
+/// `git commit` exits 1 with nothing staged — a no-op run (e.g.
+/// re-finishing an already-finished bump) must not treat that as a
 /// failure.
 fn commit_if_staged(repo_root: &Path, message: &str) -> Result<()> {
     let staged = run_git(repo_root, &["diff", "--cached", "--name-only"])?;
@@ -1245,6 +1438,10 @@ Modify `xtask/src/lib.rs`, mirroring Task 3's Step 5 (Wire the CLI):
   /// failure is expected-and-reportable, not a reason to withhold the
   /// commit). The process still exits non-zero on a failed identity
   /// check, after committing, so the failure isn't silently swallowed.
+  /// Any earlier failure (e.g. a malformed go.mod, `go mod tidy` itself
+  /// failing) propagates as a normal error instead — distinguishable from
+  /// an identity-check failure since it comes back as `Err` rather than
+  /// `Ok(IdentityCheckOutcome::Failed)`.
   FinishVendorBump {
       /// Path to the subrepo directory, relative to the repo root.
       path: String,
@@ -1274,10 +1471,12 @@ Modify `xtask/src/lib.rs`, mirroring Task 3's Step 5 (Wire the CLI):
           }
           finish_vendor_bump::IdentityCheckOutcome::Failed { detail } => {
               // The version note / go.mod bump are already committed by
-              // this point (finish_vendor_bump::run commits before
-              // returning) — this failure must still turn the process
-              // (and so the CI step) red so it isn't silently
-              // downgraded to a log line.
+              // this point (finish_vendor_bump::run commits each of its
+              // own steps before returning) — this failure must still
+              // turn the process (and so the CI step) red so it isn't
+              // silently downgraded to a log line. An earlier failure
+              // (malformed go.mod, etc.) would have already propagated as
+              // an `Err` via the `?` above instead of reaching this arm.
               bail!("identity checks failed after committing the vendor bump for {dep_name} {tag}:\n{detail}");
           }
       }
@@ -1308,7 +1507,16 @@ existing `prek.toml` entry, before the closing `]`). Captures only
 `owner/repo` after `github.com/` — not the full URL — because the
 `github-tags` datasource looks up `https://api.github.com/repos/<packageName>/tags`
 and expects exactly that shape (matches this repo's existing WiX
-customManager's same capture pattern):
+customManager's same capture pattern). Deliberately **no**
+`extractVersionTemplate`: this repo's own existing workflow-version
+customManager uses that field to *strip* a leading `v` on write-back
+(verified: `.github/workflows/ci.yaml`'s `GSUDO_VERSION: "2.6.1"` is
+managed by that exact template pattern, and gerardog/gsudo's real tags are
+`v2.6.1` — the `v` is gone after Renovate writes it). Both `.gitrepo`
+files need the `v` kept (`branch = v5.52.0`, matching the real git tag
+`git subrepo pull -b` needs), so this customManager must not strip it —
+letting the datasource's own versioning handle the `v`-prefixed tag
+directly is correct and is what's needed here, unlike the WiX/gsudo case:
 
 ```json
     {
@@ -1317,44 +1525,30 @@ customManager's same capture pattern):
       "matchStrings": [
         "remote\\s*=\\s*https://github\\.com/(?<packageName>[^/\\s]+/[^/\\s]+)\\n\\tbranch\\s*=\\s*(?<currentValue>\\S+)"
       ],
-      "datasourceTemplate": "github-tags",
-      "extractVersionTemplate": "^v?(?<version>.+)$"
+      "datasourceTemplate": "github-tags"
     }
 ```
 
-- [ ] **Step 2: Add the packageRules entry**
+No `packageRules` entry for these deps — unlike round 1 of this plan,
+automerge is **not** armed by Renovate for this dependency at all (see
+Task 8's "Arm auto-merge" step and the note in Global Constraints on why:
+arming it at PR-creation time races with the actual vendor-bump work,
+since CI trivially passes on Renovate's branch-only, content-unchanged
+commit).
 
-Add to the `packageRules` array. Deliberately **no** `groupName`: unlike
-WiX's single-file customManager, this one matches two files
-(`v2ray-core/.gitrepo` and `utls/.gitrepo`), and `vendor-bump.yaml`
-(Task 8) assumes exactly one `.gitrepo` changes per triggering push —
-grouping them would let Renovate land both in one push and break that
-assumption. Explicit `automerge: true` because this repo's default
-"minor/patch" automerge rules are scoped to `matchManagers` that don't
-include `customManagers`, so without this the PR would never arm
-GitHub-native auto-merge even when clean+green — defeating this whole
-project's stated goal:
-
-```json
-    {
-      "description": "Vendored git-subrepo deps (v2ray-core, utls): auto-merges once vendor-bump.yaml's pull + rebase + CI all succeed, same as this file's other automerge-eligible rules. No grouping — vendor-bump.yaml assumes exactly one .gitrepo changes per push, so each dep always gets its own PR.",
-      "matchFileNames": ["crates/ex-ray/third_party/*/.gitrepo"],
-      "automerge": true
-    }
-```
-
-- [ ] **Step 3: Validate the config**
+- [ ] **Step 2: Validate the config**
 
 Run: `npx --yes --package renovate -- renovate-config-validator .github/renovate.json`
 Expected: `Config validated successfully`. This is a one-off local schema
 check, not a dry-run against the real GitHub-tags lookup — it would not
-have caught the `packageName`-is-a-URL bug this task just fixed. Whether to
-add a *permanent* `renovate-config-validator` CI step (so a future
+have caught the `packageName`-is-a-URL or `extractVersionTemplate`
+write-back bugs earlier rounds of review found. Whether to add a
+*permanent* `renovate-config-validator` CI step (so a future
 `renovate.json` edit that breaks lookup silently gets a red check instead
 of quietly never firing) is an open question for you, not decided here —
 flag it when this plan is reviewed.
 
-- [ ] **Step 4: Commit**
+- [ ] **Step 3: Commit**
 
 ```bash
 git add .github/renovate.json
@@ -1430,31 +1624,42 @@ ______________________________________________________________________
 
 - [ ] **Step 1: Write the workflow**
 
-Three things this version fixes that a naive design misses, all verified
-against real behavior or real GitHub Actions semantics:
+Fixes verified or reasoned through below, none assumed:
 
-- **Self-retrigger**: this workflow's own successful push (from the Push
-  step, at the end) matches its own `push`+`paths` trigger — GitHub's
-  push-path filter matches on any commit in the push, and the App-token
-  push is specifically *not* exempt from retriggering (that's the whole
-  point of using it instead of `GITHUB_TOKEN`). Without a guard, every
-  successful bump refires the workflow against a HEAD that doesn't touch
-  `.gitrepo`, computing garbage dep/tag. The job-level `if:` guard below
-  checks the pushing commit's author name against exactly what the "git
-  identity" step sets later in this same file.
-- **Conflict vs. other failure**: `cargo xtask pull-subrepo` can fail for
-  reasons that are *not* a real merge conflict (dirty tree, bad
-  dep/tag, `git-subrepo` missing) — none of those leave the temp
-  worktree the "commit the conflicted tree anyway" step assumes exists.
-  The Pull step below captures the command's actual exit code (0 = clean,
-  2 = real conflict per Task 3's `std::process::exit(2)`, anything else =
-  a genuine unexpected failure) instead of GitHub Actions' coarse
-  success/failure step outcome, so only a real exit-code-2 conflict routes
-  into conflict recovery.
+- **Self-retrigger**: this workflow's own successful push matches its own
+  `push`+`paths` trigger (App-token pushes aren't exempt from
+  retriggering — that's the whole point of using one). The job-level
+  `if:` guard checks the pushing commit's author name against exactly
+  what the "git identity" step sets later in this same file.
+- **Conflict vs. other failure**: the Pull step captures
+  `cargo xtask pull-subrepo`'s actual exit code (0 clean / 2 real conflict
+  per Task 4's `std::process::exit(2)` / anything else a genuine
+  unexpected failure) instead of GitHub Actions' coarse step outcome, so
+  only a real conflict routes into conflict recovery.
+- **Branch-synchronization**: Renovate can force-push this same branch at
+  any point (its default `rebaseWhen: auto` rebases open PRs whenever
+  `main` moves) — including while this job is mid-run. Diffing against
+  `github.event.before` (which may reference a commit no longer reachable
+  from any ref after a force-push) is fragile; diffing against `origin/main`'s
+  merge-base instead only depends on this run's own fetched history and
+  stays correct regardless of how many times the branch was rewritten.
+  `cancel-in-progress: true` additionally means a fresh push preempts an
+  in-flight run whose work is about to be superseded anyway, rather than
+  letting it finish and then queuing a redundant second run; the final
+  `git push` stays a plain (non-force) push, so if a race still slips
+  through despite this, it fails loudly (rejected push) instead of
+  silently overwriting Renovate's newer intent.
+- **Auto-merge timing**: arming GitHub-native auto-merge is done by this
+  workflow itself, via `gh pr merge --auto`, only after a clean pull *and*
+  a successful finish — never by Renovate at PR-creation time (see Global
+  Constraints for why that races).
 - **`workflow_dispatch` safety**: a manual run executes against whatever
   ref was selected when triggering it, which defaults to `main` if the
   caller doesn't pass `--ref` — never push straight to main. Manual runs
   always get a disposable scratch branch instead.
+- **Empty `gh pr list` results**: `--jq '.[0].number // empty'` (not
+  `.[0].number` alone) so a branch with no open PR yields an empty string,
+  not the literal text `null` fed into a following command.
 
 ```yaml
 name: Vendor bump
@@ -1478,17 +1683,14 @@ permissions:
 
 concurrency:
   group: vendor-bump-${{ github.ref }}
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 jobs:
   bump:
     name: Pull + rebase vendored dependency
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    # See the note above the workflow: this workflow's own pushes match
-    # its own trigger. nathan-blahaj[bot] is the exact author name the
-    # "git identity" step below sets, so any push this workflow itself
-    # makes is unambiguously identifiable and skipped.
+    # Self-retrigger guard — see Step 1's intro above the code block.
     if: github.event_name != 'push' || github.event.head_commit.author.name != 'nathan-blahaj[bot]'
     steps:
       - name: Mint nathan-blahaj token
@@ -1503,6 +1705,9 @@ jobs:
           fetch-depth: 0
           token: ${{ steps.nathan.outputs.token }}
 
+      - name: Ensure origin/main is available
+        run: git fetch origin main --quiet
+
       - uses: dtolnay/rust-toolchain@stable
       - uses: actions/setup-go@v7
         with:
@@ -1513,9 +1718,8 @@ jobs:
       # it and putting its lib/ dir (containing an executable named
       # `git-subrepo`) on PATH, exactly how `git <subcommand>` dispatch
       # finds any git-<name> executable on PATH. Pinned to 0.4.9 to match
-      # the version this workflow's fixup logic was verified against
-      # (confirm this tag exists on first real run — network access wasn't
-      # available while writing this plan to check).
+      # the version this workflow's fixup logic targets — confirm this tag
+      # exists on first real run.
       - name: Install git-subrepo 0.4.9
         run: |
           git clone --branch 0.4.9 --depth 1 https://github.com/ingydotnet/git-subrepo /opt/git-subrepo
@@ -1531,16 +1735,19 @@ jobs:
             dep="$INPUT_DEP"
             tag="$INPUT_TAG"
           else
-            before="${{ github.event.before }}"
-            if [[ "$before" == "0000000000000000000000000000000000000000" ]]; then
-              # Branch-creation push (Renovate's first push for a new PR)
-              # has no real "before" to diff against.
-              before="HEAD^"
+            # Diffing against origin/main's merge-base (not
+            # github.event.before/after) survives Renovate force-pushing
+            # this branch at any point — it only depends on this run's own
+            # fetched history, not on a possibly-now-unreachable SHA from
+            # the triggering event.
+            changed=$(git diff --name-only origin/main...HEAD -- 'crates/ex-ray/third_party/*/.gitrepo')
+            if [[ -z "$changed" ]]; then
+              count=0
+            else
+              count=$(printf '%s\n' "$changed" | wc -l)
             fi
-            changed=$(git diff --name-only "$before" "${{ github.event.after }}" -- 'crates/ex-ray/third_party/*/.gitrepo')
-            count=$(printf '%s\n' "$changed" | grep -c .)
             if [[ "$count" -ne 1 ]]; then
-              echo "::error::expected exactly one changed .gitrepo in this push, got $count: $changed"
+              echo "::error::expected exactly one changed .gitrepo relative to main, got $count: $changed"
               exit 1
             fi
             dep=$(basename "$(dirname "$changed")")
@@ -1610,24 +1817,41 @@ jobs:
         run: git push origin "HEAD:${{ steps.scratch-branch.outputs.ref_name || github.ref_name }}"
 
       # Only for the real Renovate-triggered flow — a workflow_dispatch
-      # scratch-branch run has no associated PR to comment on.
-      - name: Comment on the PR if conflicted
-        if: steps.pull.outputs.result == 'conflicted' && github.event_name == 'push'
+      # scratch-branch run has no associated PR.
+      - name: Find the PR for this branch
+        if: github.event_name == 'push' && (steps.pull.outputs.result == 'clean' || steps.pull.outputs.result == 'conflicted')
+        id: find-pr
         env:
           GH_TOKEN: ${{ steps.nathan.outputs.token }}
         run: |
-          pr_number=$(gh pr list --repo "${{ github.repository }}" --head "${{ github.ref_name }}" --json number --jq '.[0].number')
-          gh pr comment "$pr_number" --repo "${{ github.repository }}" --body "$(cat <<EOF
+          pr_number=$(gh pr list --repo "${{ github.repository }}" --head "${{ github.ref_name }}" --json number --jq '.[0].number // empty')
+          echo "pr_number=$pr_number" >> "$GITHUB_OUTPUT"
+
+      # Only arms auto-merge once the real work has landed: a clean pull
+      # AND a successful finish. This is the sole point anything arms
+      # auto-merge — Renovate itself never does (see Global Constraints).
+      - name: Arm auto-merge
+        if: steps.pull.outputs.result == 'clean' && steps.finish.outcome == 'success' && steps.find-pr.outputs.pr_number != ''
+        env:
+          GH_TOKEN: ${{ steps.nathan.outputs.token }}
+        run: gh pr merge --auto --squash "${{ steps.find-pr.outputs.pr_number }}" --repo "${{ github.repository }}"
+
+      - name: Comment on the PR if conflicted
+        if: steps.pull.outputs.result == 'conflicted' && steps.find-pr.outputs.pr_number != ''
+        env:
+          GH_TOKEN: ${{ steps.nathan.outputs.token }}
+        run: |
+          gh pr comment "${{ steps.find-pr.outputs.pr_number }}" --repo "${{ github.repository }}" --body "$(cat <<EOF
           Automated pull of \`${{ steps.target.outputs.dep }}\` to \`${{ steps.target.outputs.tag }}\` hit a real merge conflict outside the auto-resolved allowlist (go.mod/go.sum/.github/workflows). The conflicted tree is committed on this branch.
 
           To resolve: check out this PR branch, fix the conflicts, then run \`cargo xtask finish-vendor-bump crates/ex-ray/third_party/${{ steps.target.outputs.dep }} ${{ steps.target.outputs.dep }} ${{ steps.target.outputs.tag }}\` and push a normal commit.
           EOF
           )"
 
-      - name: Fail the job if the identity check failed
+      - name: Fail the job if Finish failed
         if: steps.finish.outcome == 'failure'
         run: |
-          echo "::error::finish-vendor-bump's identity check failed — see the 'Finish' step log above. The version-note/go.mod commit was still made and pushed."
+          echo "::error::the 'Finish' step failed — see its log above for the reason (an identity-check failure, or an earlier error like a malformed go.mod/VENDORING.md heading). Any commits it made before failing were still pushed."
           exit 1
 ```
 
@@ -1699,9 +1923,7 @@ jobs:
           git push
 ```
 
-(Only the token source and the two `git config` identity lines actually
-change from the original — everything else is unchanged. Note this
-workflow's own trigger is `paths: [wix-toolchain.toml]`, and its own
+(Note this workflow's own trigger is `paths: [wix-toolchain.toml]`, and its own
 commits never touch that file's *content* in a way that would re-match
 after the fact — the `git diff --quiet && exit 0` guard already makes a
 second run of this specific workflow a no-op, so it doesn't need the same
@@ -1737,11 +1959,17 @@ Replace the section (currently the last section in the file, from `## Bumping a 
 This is automated: Renovate opens a PR bumping just the `branch =` line in
 a `.gitrepo`, and `.github/workflows/vendor-bump.yaml` does the rest —
 `cargo xtask pull-subrepo` followed by `cargo xtask finish-vendor-bump` —
-pushing further commits to the same PR. It merges automatically if the
-pull is clean and CI is green; it sits open with a PR comment if a real
-merge conflict landed outside the auto-resolved `go.mod`/`go.sum`/
-`.github/workflows/*` allowlist (the authoritative policy lives in
-`xtask/src/pull_subrepo.rs`'s `is_auto_resolvable`).
+pushing further commits to the same PR, then arming auto-merge itself once
+that succeeds. It merges automatically if the pull is clean and CI is
+green; it sits open with a PR comment if a real merge conflict landed
+outside the auto-resolved `go.mod`/`go.sum`/`.github/workflows/*` allowlist
+(the authoritative policy lives in `xtask/src/pull_subrepo.rs`'s
+`is_auto_resolvable`).
+
+`pull-subrepo`'s "nothing committed" guarantee on a real conflict is about
+the pull attempt itself, not the whole run: if the routine squash-merge
+parent fixup ran first (see below), that's a separate, independently valid
+commit that stays even if the pull then hits a real conflict.
 
 To do it by hand (same tools the automation uses):
 
@@ -1756,7 +1984,10 @@ To do it by hand (same tools the automation uses):
    line and runs `go mod tidy`, and runs the identity build/test check
    (`go build ./...` and `go test ./...`, both in the vendored module and
    in `crates/ex-ray`), committing regardless of whether the identity
-   check passed.
+   check passed. The vendored-module test is the *only* place that code's
+   own test suite runs in this project — `ci.yaml`'s `ex-ray-tests` job
+   never runs it directly, only `crates/ex-ray`'s own tests (which
+   exercise the vendored code transitively, not its own internal tests).
 ```
 
 - [ ] **Step 2: Commit**
@@ -1813,7 +2044,8 @@ Watch the run via `gh run watch`. Expected: the Pull step's `result`
 output is `clean` (git-subrepo's own "already up to date" short-circuit,
 exit 0) and the job finishes without pushing a new commit (nothing was
 staged, so `finish-vendor-bump`'s commits are no-ops per Task 5's
-`commit_if_staged` guard).
+`commit_if_staged` guard). No PR exists for the scratch branch, so "Find
+the PR" / "Arm auto-merge" naturally no-op too.
 
 - [ ] **Step 5: Confirm a real bump reaches auto-merge or a correctly-red PR, and does NOT self-retrigger**
 
@@ -1825,8 +2057,10 @@ gh workflow run vendor-bump.yaml --repo bindreams/hole -f dep=v2ray-core -f tag=
 ```
 
 Watch: does CI (`ci.yaml`) actually rerun on the pushed commit (confirming
-the App-token retrigger works), does the PR either auto-merge or sit
-correctly red/commented, and — check the Actions run list for this
+the App-token retrigger works), does the PR either auto-merge (confirm via
+`gh pr view` that auto-merge was armed and it eventually merged, not that
+it merged suspiciously early on Renovate's original branch-only commit) or
+sit correctly red/commented, and — check the Actions run list for this
 branch — does `vendor-bump.yaml` run exactly once (not loop on its own
 push, confirming the job-level actor guard works)? This is the property
 the whole design rests on — confirm it live before considering #787 done.
