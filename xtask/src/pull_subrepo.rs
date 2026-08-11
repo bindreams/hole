@@ -25,10 +25,16 @@ pub enum Outcome {
     /// A conflict remains outside the safe allowlist. The pull attempt
     /// itself committed nothing — the temp merge worktree `git subrepo
     /// pull` created is left exactly as `git merge` would leave a
-    /// conflicted tree, for a human to resolve. (A prior, independent
-    /// `.gitrepo`-parent-realignment commit may already be on the branch
-    /// if that fixup ran first — see `fix_stale_parent`.)
-    Conflicted { worktree: PathBuf, unresolved: Vec<String> },
+    /// conflicted tree, for a human to resolve. `fixup_commit` is
+    /// `Some(sha)` when a prior, independent `.gitrepo`-parent-realignment
+    /// commit already landed on the branch before this conflict was hit
+    /// (see `fix_stale_parent`) — carried in the value, not just an error
+    /// path, so a real (non-`Err`) `Conflicted` result still discloses it.
+    Conflicted {
+        worktree: PathBuf,
+        unresolved: Vec<String>,
+        fixup_commit: Option<String>,
+    },
 }
 
 pub fn run(repo_root: &Path, subdir: &str, tag: &str) -> Result<Outcome> {
@@ -40,7 +46,15 @@ pub fn run(repo_root: &Path, subdir: &str, tag: &str) -> Result<Outcome> {
     let first = attempt_pull(repo_root, subdir, tag)?;
     if first.status.success() {
         best_effort_clean(repo_root, subdir);
-        ensure_tag_pin_matches(repo_root, subdir, tag)?;
+        // `git subrepo pull` has, in the usual (non-no-op) case, already
+        // committed real vendored content to HEAD by this point — if the
+        // tag-pin fixup below fails, say so, rather than leaving that
+        // already-landed commit an undisclosed side effect.
+        ensure_tag_pin_matches(repo_root, subdir, tag).with_context(|| {
+            "git subrepo pull already succeeded and (usually) committed to this branch before \
+             this failure — check `git log -1` before assuming nothing happened"
+                .to_string()
+        })?;
         return Ok(Outcome::Clean);
     }
 
@@ -50,7 +64,7 @@ pub fn run(repo_root: &Path, subdir: &str, tag: &str) -> Result<Outcome> {
         return retry_after_stale_parent_fixup(repo_root, subdir, tag, &fixup_commit);
     }
 
-    handle_conflict(repo_root, subdir, tag, &first)
+    handle_conflict(repo_root, subdir, tag, &first, None)
 }
 
 /// Every fallible step after `fix_stale_parent` lands its `.gitrepo`
@@ -59,14 +73,19 @@ pub fn run(repo_root: &Path, subdir: &str, tag: &str) -> Result<Outcome> {
 /// and the module's contract (see the module doc) promises no error path
 /// after that leaves it a silent side effect. One shared closure, applied
 /// to every fallible call in this retry, so a future added step can't
-/// reintroduce the gap by omission (as three separate call sites already
-/// did once).
+/// reintroduce the gap by omission.
 fn retry_after_stale_parent_fixup(repo_root: &Path, subdir: &str, tag: &str, fixup_commit: &str) -> Result<Outcome> {
+    // `{fixup_commit}~1` (not `HEAD~1`) is deliberate: by the time
+    // `ensure_tag_pin_matches` below runs, a successful `second` pull has
+    // already added its own content commit on top of `fixup_commit`, so
+    // `HEAD~1` would only undo *that* commit, not the fixup. Naming the
+    // fixup commit's own parent directly stays correct regardless of how
+    // many commits landed after it.
     let disclose = || {
         format!(
             "a `.gitrepo` parent-realignment commit ({fixup_commit}) was already created on \
-             this branch before this failure; `git reset --hard HEAD~1` undoes it if you want \
-             to retry from a clean state"
+             this branch before this failure; `git reset --hard {fixup_commit}~1` undoes it \
+             (and anything committed after it) if you want to retry from a clean state"
         )
     };
 
@@ -76,7 +95,7 @@ fn retry_after_stale_parent_fixup(repo_root: &Path, subdir: &str, tag: &str, fix
         ensure_tag_pin_matches(repo_root, subdir, tag).with_context(disclose)?;
         return Ok(Outcome::Clean);
     }
-    handle_conflict(repo_root, subdir, tag, &second).with_context(disclose)
+    handle_conflict(repo_root, subdir, tag, &second, Some(fixup_commit)).with_context(disclose)
 }
 
 /// Mirrors git-subrepo's own `check-and-normalize-subdir`: strips a leading
@@ -159,7 +178,13 @@ fn ensure_clean_tree(repo_root: &Path, subdir: &str) -> Result<()> {
         bail!("working tree has uncommitted changes; refusing to run against it:\n{status}");
     }
 
-    let subdir_status = run_git(repo_root, &["status", "--porcelain", "--", subdir])?;
+    // `--untracked-files=normal` is explicit rather than relying on the
+    // default: a user/CI image with `status.showUntrackedFiles=no` set
+    // would otherwise make this check silently see nothing to reject.
+    let subdir_status = run_git(
+        repo_root,
+        &["status", "--porcelain", "--untracked-files=normal", "--", subdir],
+    )?;
     let untracked_in_subdir: Vec<&str> = subdir_status.lines().filter(|line| line.starts_with("??")).collect();
     if !untracked_in_subdir.is_empty() {
         bail!(
@@ -227,17 +252,25 @@ fn ensure_no_in_progress_conflict_resolution(repo_root: &Path, subdir: &str) -> 
 
 /// `git rev-parse --verify --quiet <ref>`: `Some(sha)` if `ref` resolves,
 /// `None` if it doesn't exist — as opposed to `run_git`, which treats a
-/// nonzero exit as an error.
+/// nonzero exit as an error. `--quiet` only suppresses git's message for
+/// the "not a valid object" case (confirmed: a missing ref and a malformed
+/// one both exit 1 with empty stderr); any *other* stderr output on a
+/// nonzero exit means something else genuinely failed and must not be
+/// silently folded into "the ref doesn't exist".
 fn rev_parse_if_exists(repo_root: &Path, ref_name: &str) -> Result<Option<String>> {
     let output = Command::new("git")
         .args(["rev-parse", "--verify", "--quiet", ref_name])
         .current_dir(repo_root)
         .output()
         .with_context(|| format!("failed to run `git rev-parse --verify {ref_name}`"))?;
-    Ok(output
-        .status
-        .success()
-        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string()))
+    if output.status.success() {
+        return Ok(Some(String::from_utf8_lossy(&output.stdout).trim().to_string()));
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if !stderr.trim().is_empty() {
+        bail!("git rev-parse --verify --quiet {ref_name} failed: {}", stderr.trim());
+    }
+    Ok(None)
 }
 
 /// Runs `git subrepo pull`. Called up to twice per `run` (the
@@ -310,9 +343,19 @@ fn fix_stale_parent(repo_root: &Path, subdir: &str) -> Result<String> {
     let is_ancestor = Command::new("git")
         .args(["merge-base", "--is-ancestor", &candidate, "HEAD"])
         .current_dir(repo_root)
-        .status()
+        .output()
         .context("git merge-base --is-ancestor failed to run")?;
-    if !is_ancestor.success() {
+    if !is_ancestor.status.success() {
+        // Confirmed: "not an ancestor" is exit 1 with empty stderr; a
+        // genuinely malformed/invalid commit-ish exits 128 with a real
+        // stderr message — don't conflate the two under one canned message.
+        let stderr = String::from_utf8_lossy(&is_ancestor.stderr);
+        if !stderr.trim().is_empty() {
+            bail!(
+                "git merge-base --is-ancestor {candidate} HEAD failed: {}",
+                stderr.trim()
+            );
+        }
         bail!(
             "computed replacement parent {candidate} is not an ancestor of HEAD — \
              this should never happen (the last-sync-commit formula guarantees it by \
@@ -326,7 +369,9 @@ fn fix_stale_parent(repo_root: &Path, subdir: &str) -> Result<String> {
     std::fs::write(&gitrepo_path, replace_gitrepo_field(&contents, "parent", &candidate)?)
         .with_context(|| format!("failed to write {}", gitrepo_path.display()))?;
 
-    run_git(repo_root, &["add", &gitrepo_rel])?;
+    run_git(repo_root, &["add", &gitrepo_rel]).with_context(|| {
+        format!("`{gitrepo_rel}` was already modified on disk to realign `parent` before this failure")
+    })?;
     run_git(
         repo_root,
         &[
@@ -334,7 +379,10 @@ fn fix_stale_parent(repo_root: &Path, subdir: &str) -> Result<String> {
             "-m",
             &format!("fix: realign {subdir} subrepo parent after squash-merge"),
         ],
-    )?;
+    )
+    .with_context(|| {
+        format!("`{gitrepo_rel}` was already modified and staged to realign `parent` before this failure")
+    })?;
     run_git(repo_root, &["rev-parse", "HEAD"])
         .context("the .gitrepo parent-realignment commit was created but its SHA could not be read back")
 }
@@ -359,7 +407,9 @@ fn ensure_tag_pin_matches(repo_root: &Path, subdir: &str, tag: &str) -> Result<(
     let gitrepo_rel = format!("{subdir}/.gitrepo");
     std::fs::write(&gitrepo_path, replace_gitrepo_field(&contents, "branch", tag)?)
         .with_context(|| format!("failed to write {}", gitrepo_path.display()))?;
-    run_git(repo_root, &["add", &gitrepo_rel])?;
+    run_git(repo_root, &["add", &gitrepo_rel]).with_context(|| {
+        format!("`{gitrepo_rel}` was already modified on disk to realign `branch` before this failure")
+    })?;
     run_git(
         repo_root,
         &[
@@ -367,7 +417,10 @@ fn ensure_tag_pin_matches(repo_root: &Path, subdir: &str, tag: &str) -> Result<(
             "-m",
             &format!("fix: realign {subdir} subrepo branch pin to {tag}"),
         ],
-    )?;
+    )
+    .with_context(|| {
+        format!("`{gitrepo_rel}` was already modified and staged to realign `branch` before this failure")
+    })?;
     Ok(())
 }
 
@@ -400,7 +453,18 @@ fn replace_gitrepo_field(contents: &str, field: &str, value: &str) -> Result<Str
     Ok(lines.join("\n") + "\n")
 }
 
-fn handle_conflict(_repo_root: &Path, _subdir: &str, _tag: &str, output: &Output) -> Result<Outcome> {
+/// `fixup_commit` is `Some` when `fix_stale_parent` already landed a
+/// realignment commit before this conflict was hit — a real (`Ok`)
+/// `Outcome::Conflicted` needs to carry it in the value so it's still
+/// disclosed once this stub starts returning one instead of always
+/// bailing (Task 4).
+fn handle_conflict(
+    _repo_root: &Path,
+    _subdir: &str,
+    _tag: &str,
+    output: &Output,
+    _fixup_commit: Option<&str>,
+) -> Result<Outcome> {
     bail!(
         "git subrepo pull failed:\nstdout:\n{}\nstderr:\n{}",
         String::from_utf8_lossy(&output.stdout),
@@ -412,7 +476,7 @@ pub fn force_commit_conflicted(_repo_root: &Path, _subdir: &str, _tag: &str) -> 
     unimplemented!("Task 4")
 }
 
-// Only exercised by tests until Task 4 wires it into `run`/`force_commit_conflicted`.
+// Only exercised by tests until it's wired into `run`/`force_commit_conflicted`.
 #[allow(dead_code)]
 pub(crate) fn is_auto_resolvable(_path: &str) -> bool {
     unimplemented!("Task 4")

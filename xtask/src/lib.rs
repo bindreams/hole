@@ -414,7 +414,11 @@ pub fn run_pull_subrepo(path: String, tag: String) -> Result<()> {
             println!("xtask: pulled {path} to {tag} cleanly");
             Ok(())
         }
-        pull_subrepo::Outcome::Conflicted { worktree, unresolved } => {
+        pull_subrepo::Outcome::Conflicted {
+            worktree,
+            unresolved,
+            fixup_commit,
+        } => {
             eprintln!(
                 "xtask: {path} pull to {tag} has unresolved conflicts in:\n  {}\n\
                  Resolve them in {}, `git add` the resolved files, `git commit`, \
@@ -422,6 +426,12 @@ pub fn run_pull_subrepo(path: String, tag: String) -> Result<()> {
                 unresolved.join("\n  "),
                 worktree.display()
             );
+            if let Some(fixup_commit) = fixup_commit {
+                eprintln!(
+                    "xtask: note: a `.gitrepo` parent-realignment commit ({fixup_commit}) was \
+                     already created on this branch before the conflict."
+                );
+            }
             // Exit code 2 distinguishes "real conflict, worktree left
             // for resolution" from any other failure (which propagates
             // as exit 1 via the `?` above) — vendor-bump.yaml branches

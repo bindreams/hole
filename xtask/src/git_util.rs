@@ -14,8 +14,12 @@ pub fn run_git(cwd: &Path, args: &[&str]) -> Result<String> {
         .output()
         .with_context(|| format!("failed to run git {args:?}"))?;
     if !output.status.success() {
+        // Some git commands (notably `git commit`, e.g. on "nothing to
+        // commit") report the actual failure reason on stdout, not stderr —
+        // include both so the real cause isn't dropped.
         bail!(
-            "git {args:?} failed: {}",
+            "git {args:?} failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout).trim(),
             String::from_utf8_lossy(&output.stderr).trim()
         );
     }

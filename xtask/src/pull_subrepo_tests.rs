@@ -380,7 +380,9 @@ fn real_conflict_stops_uncommitted_from_a_linked_worktree() {
     let outcome =
         pull_subrepo::run(&worktree_path, "vendor", "v2").expect("a real conflict is a reported Outcome, not an Err");
     match outcome {
-        Outcome::Conflicted { worktree, unresolved } => {
+        Outcome::Conflicted {
+            worktree, unresolved, ..
+        } => {
             assert_eq!(unresolved, vec!["patched.txt".to_string()]);
             assert!(
                 worktree.is_dir(),
