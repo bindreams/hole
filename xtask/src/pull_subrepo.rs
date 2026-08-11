@@ -312,8 +312,20 @@ fn git_common_dir(repo_root: &Path) -> Result<PathBuf> {
 /// `.gitrepo` `parent` (its own error message suggests exactly this SHA):
 /// the last commit that touched the `.gitrepo` file's `commit =` line,
 /// walked back one parent. This candidate is always an ancestor of HEAD by
-/// construction (it comes from `git log` starting at HEAD). The is-ancestor
-/// check below is still a real, always-on `bail!` rather than a
+/// construction (it comes from `git log` starting at HEAD).
+///
+/// Verified against only HEAD, not also against `.gitrepo`'s recorded
+/// `commit` field: read the installed git-subrepo's own `subrepo:branch()`
+/// (the function that raises the "is not an ancestor" error this fixup
+/// exists to satisfy) — it performs exactly the same single
+/// `merge-base --is-ancestor $subrepo_parent HEAD` check before proceeding,
+/// never one against the `.gitrepo` `commit` field. Matching what
+/// git-subrepo itself actually validates is correct and sufficient for the
+/// retry to succeed; a second check against a field with no established
+/// operational meaning in this comparison would validate a requirement
+/// git-subrepo doesn't have.
+///
+/// The is-ancestor check below is still a real, always-on `bail!` rather than a
 /// `debug_assert!` despite that guarantee: it's the sole guard immediately
 /// before an irreversible committed write in unattended CI, where a
 /// silently compiled-away check (debug_assert! is a no-op in release
@@ -321,7 +333,7 @@ fn git_common_dir(repo_root: &Path) -> Result<PathBuf> {
 /// root commit with no parent) are unreachable through any real `git
 /// subrepo` lifecycle — `git subrepo clone` refuses cloning into an empty
 /// repo, and `.gitrepo` only exists once a commit introduced its `commit =`
-/// line — so no test fabricates them.
+/// line.
 ///
 /// Returns the SHA of the fixup commit it creates.
 fn fix_stale_parent(repo_root: &Path, subdir: &str) -> Result<String> {
@@ -456,8 +468,7 @@ fn replace_gitrepo_field(contents: &str, field: &str, value: &str) -> Result<Str
 /// `fixup_commit` is `Some` when `fix_stale_parent` already landed a
 /// realignment commit before this conflict was hit — a real (`Ok`)
 /// `Outcome::Conflicted` needs to carry it in the value so it's still
-/// disclosed once this stub starts returning one instead of always
-/// bailing (Task 4).
+/// disclosed once this stub starts returning one instead of always bailing.
 fn handle_conflict(
     _repo_root: &Path,
     _subdir: &str,

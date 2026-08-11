@@ -63,6 +63,9 @@ mod galoshes_tests;
 #[path = "gen_ui_constants_tests.rs"]
 mod gen_ui_constants_tests;
 #[cfg(test)]
+#[path = "git_util_tests.rs"]
+mod git_util_tests;
+#[cfg(test)]
 #[path = "manifest_tests.rs"]
 mod manifest_tests;
 #[cfg(test)]

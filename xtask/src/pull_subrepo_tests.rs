@@ -134,10 +134,12 @@ impl Fixture {
         Fixture { dir, downstream }
     }
 
-    /// Rewrites `.gitrepo`'s `parent` to a commit that exists but is not
-    /// an ancestor of HEAD — see the module-level note on why this is
-    /// constructed directly rather than produced naturally by the
-    /// clone+patch+squash-merge sequence above.
+    /// Rewrites `.gitrepo`'s `parent` to a commit that exists but is not an
+    /// ancestor of HEAD — the same symptom `Fixture::build`'s
+    /// clone+patch+squash-merge sequence already produces naturally (see
+    /// `clean_pull_after_squash_merge_auto_fixes_stale_parent`), just
+    /// forced directly so other tests that only need this precondition
+    /// don't have to repeat that whole dance.
     fn corrupt_parent(&self) {
         git(&self.downstream, &["checkout", "-b", "throwaway"]);
         std::fs::write(self.downstream.join("README.md"), "throwaway\n").unwrap();
@@ -186,6 +188,16 @@ fn git_output(cwd: &Path, args: &[&str]) -> String {
     let output = Command::new("git").args(args).current_dir(cwd).output().unwrap();
     assert!(output.status.success(), "git {args:?} failed in {}", cwd.display());
     String::from_utf8(output.stdout).unwrap()
+}
+
+/// Installs a `pre-commit` hook that unconditionally rejects the commit —
+/// a deterministic, cross-platform way to force a `git commit` to fail
+/// after its preceding `git add` already succeeded, for tests exercising
+/// the disclosure wrapped around exactly that gap.
+fn install_rejecting_pre_commit_hook(repo: &Path) {
+    let hooks_dir = repo.join(".git/hooks");
+    std::fs::create_dir_all(&hooks_dir).unwrap();
+    std::fs::write(hooks_dir.join("pre-commit"), "#!/bin/sh\nexit 1\n").unwrap();
 }
 
 #[skuld::test]
@@ -621,6 +633,62 @@ fn stale_parent_fixup_commit_is_disclosed_when_the_retry_still_conflicts() {
     assert!(
         message.contains(&fixup_commit),
         "the disclosed message should name the actual fixup commit {fixup_commit}: {message}"
+    );
+}
+
+#[skuld::test]
+fn stale_parent_fixup_add_commit_failure_is_disclosed() {
+    // fix_stale_parent writes .gitrepo to disk and `git add`s it before
+    // `git commit` — if the commit itself is blocked, the error must say
+    // the file was already modified/staged, not just report the raw git
+    // commit failure.
+    let fx = Fixture::build(ConflictKind::None);
+    fx.corrupt_parent();
+    install_rejecting_pre_commit_hook(&fx.downstream);
+
+    let err = match pull_subrepo::run(&fx.downstream, "vendor", "v2") {
+        Err(e) => e,
+        Ok(_) => panic!("expected the blocked fixup commit to surface as an error"),
+    };
+    let message = format!("{err:#}");
+    assert!(
+        message.contains("already modified and staged to realign `parent`"),
+        "fix_stale_parent's add/commit disclosure is missing: {message}"
+    );
+}
+
+#[skuld::test]
+fn tag_pin_realignment_commit_failure_after_a_plain_pull_discloses_both_layers() {
+    // ensure_tag_pin_matches, called from run()'s plain (non-stale-parent)
+    // success path, writes .gitrepo and `git add`s it before `git commit`.
+    // A blocked commit here must surface BOTH ensure_tag_pin_matches's own
+    // add/commit disclosure AND the outer plain-success-path disclosure
+    // (that git subrepo pull already committed real content before this
+    // failure) — anyhow's error chain should carry both layers.
+    let fx = Fixture::build(ConflictKind::None);
+    let upstream = fx.dir.path().join("upstream");
+    // v3 == v2's exact commit: forces git-subrepo's "already up to date"
+    // no-op on the second pull, so only ensure_tag_pin_matches's own
+    // realignment commit is at stake, not a real git-subrepo merge commit.
+    git(&upstream, &["tag", "v3", "v2"]);
+
+    let outcome = pull_subrepo::run(&fx.downstream, "vendor", "v2").expect("first pull to v2 should succeed");
+    assert!(matches!(outcome, Outcome::Clean));
+
+    install_rejecting_pre_commit_hook(&fx.downstream);
+
+    let err = match pull_subrepo::run(&fx.downstream, "vendor", "v3") {
+        Err(e) => e,
+        Ok(_) => panic!("expected the blocked tag-pin realignment commit to surface as an error"),
+    };
+    let message = format!("{err:#}");
+    assert!(
+        message.contains("already succeeded"),
+        "the outer plain-success-path disclosure is missing: {message}"
+    );
+    assert!(
+        message.contains("already modified and staged to realign `branch`"),
+        "ensure_tag_pin_matches's own add/commit disclosure is missing: {message}"
     );
 }
 
