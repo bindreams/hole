@@ -794,12 +794,12 @@ ancestor of HEAD by construction.
 
 - Produces: `pull_subrepo::{run, Outcome}` (already declared in Task 2; this task fills in the real logic behind it) and `git_util::run_git`, reused by Task 5.
 
-- [ ] **Step 1: Confirm Task 2's tests still fail the same way (baseline)**
+- [x] **Step 1: Confirm Task 2's tests still fail the same way (baseline)**
 
 Run: `cargo test -p xtask pull_subrepo::clean_pull -- --nocapture`
 Expected: both `clean_pull_*` tests FAIL on `unimplemented!`.
 
-- [ ] **Step 2: Extract a shared `run_git` helper**
+- [x] **Step 2: Extract a shared `run_git` helper**
 
 Create `xtask/src/git_util.rs`:
 
@@ -829,222 +829,27 @@ pub fn run_git(cwd: &Path, args: &[&str]) -> Result<String> {
 Add `pub mod git_util;` to `xtask/src/lib.rs` near the other `pub mod`
 declarations.
 
-- [ ] **Step 3: Implement the real logic**
+- [x] **Step 3: Implement the real logic**
 
-Replace `xtask/src/pull_subrepo.rs`'s body (keep the doc comment and
-`Outcome` enum from Task 2, add to the imports):
+Implemented in `xtask/src/pull_subrepo.rs` (and `xtask/src/git_util.rs` for
+the shared `run_git` helper) — see those files for the real, shipped code
+and its doc comments rather than a copy here, which would drift the moment
+either file changes again (as the original verbatim listing already had,
+after round-3 troyka review hardened several guards past what was drafted
+here: the in-progress-conflict guard now also handles the benign
+leftover-branch case left by every successful `git subrepo pull`, not just
+worktree existence; `attempt_pull` no longer pre-cleans unconditionally;
+`ensure_clean_tree` ignores untracked files; a `.gitrepo` `commit =`-field
+verification proposed in `specs/2026-08-10-787-vendor-dependency-automation.md`
+was evaluated against git-subrepo's own source and found inapplicable —
+see the review record for `b0a63bd8` — so it was not added; a new
+`assert_subdir_is_ref_safe` guard rejects subdirs `git-subrepo` would
+percent-encode; and a `normalize_subdir` step + `ensure_tag_pin_matches`
+close two more gaps the original listing didn't cover). `handle_conflict`
+and `force_commit_conflicted` remain deliberate placeholders — Task 4
+replaces them with the real allowlist/conflict logic.
 
-```rust
-use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
-
-use anyhow::{bail, Context, Result};
-
-use crate::git_util::run_git;
-
-// ... (Outcome enum from Task 2 stays) ...
-
-pub fn run(repo_root: &Path, subdir: &str, tag: &str) -> Result<Outcome> {
-    ensure_clean_tree(repo_root)?;
-    ensure_no_in_progress_conflict_resolution(repo_root, subdir)?;
-
-    let first = attempt_pull(repo_root, subdir, tag)?;
-    if first.status.success() {
-        best_effort_clean(repo_root, subdir);
-        return Ok(Outcome::Clean);
-    }
-
-    let stderr = String::from_utf8_lossy(&first.stderr);
-    if stderr.contains("is not an ancestor") {
-        fix_stale_parent(repo_root, subdir)?;
-        let second = attempt_pull(repo_root, subdir, tag)?;
-        if second.status.success() {
-            best_effort_clean(repo_root, subdir);
-            return Ok(Outcome::Clean);
-        }
-        return handle_conflict(repo_root, subdir, tag, &second);
-    }
-
-    handle_conflict(repo_root, subdir, tag, &first)
-}
-
-fn ensure_clean_tree(repo_root: &Path) -> Result<()> {
-    let status = run_git(repo_root, &["status", "--porcelain"])?;
-    if !status.is_empty() {
-        bail!("working tree is dirty; `git subrepo pull` refuses to run against a dirty tree:\n{status}");
-    }
-    Ok(())
-}
-
-/// `attempt_pull`'s defensive pre-clean (below) would otherwise silently
-/// `rm -rf` a worktree a human is actively resolving a real conflict in —
-/// `git subrepo clean` is the one git-subrepo subcommand that skips the
-/// tool's own working-copy-clean guard, so it deletes an in-progress
-/// resolution with no confirmation. Called once at the very start of
-/// `run`, before any cleaning happens: refuses whenever a leftover
-/// worktree from a *previous* invocation exists at all, regardless of
-/// whether `git status --porcelain` inside it is empty. A dirtiness check
-/// is not sufficient: git-subrepo's own documented recovery steps (`cd
-/// <worktree>`, resolve, `git add`, `git commit`) have the human commit
-/// *inside* the temp worktree before the outer `git subrepo commit
-/// <subdir>` step folds it back in — so a worktree sitting in exactly
-/// that "resolved and committed, not yet folded in" state has an empty
-/// porcelain status but still represents real, valuable, unfinished work
-/// (the commit itself, and the `refs/heads/subrepo/<subdir>` branch
-/// pointing to it) that a dirtiness-only check would wrongly treat as
-/// stale-and-safe-to-discard.
-fn ensure_no_in_progress_conflict_resolution(repo_root: &Path, subdir: &str) -> Result<()> {
-    let common_dir = git_common_dir(repo_root)?;
-    let worktree = common_dir.join("tmp").join("subrepo").join(subdir);
-    if worktree.exists() {
-        bail!(
-            "a conflict-resolution worktree already exists at {} — if you're resolving a \
-             conflict there, finish it (see the earlier `pull-subrepo` output for the exact \
-             steps); if it's stale (e.g. left over from an interrupted run), run \
-             `git subrepo clean {subdir}` yourself first to discard it",
-            worktree.display()
-        );
-    }
-    Ok(())
-}
-
-/// Runs `git subrepo pull`, first defensively cleaning any worktree/branch
-/// left over from a previous attempt *within this same `run` call* (the
-/// stale-parent-fixup retry can follow a first attempt that failed before
-/// ever creating a worktree — see `fix_stale_parent`'s doc comment — so
-/// this is always safe to call unconditionally here — safe here, since a
-/// prior, separate invocation's in-progress work is guarded separately by
-/// `ensure_no_in_progress_conflict_resolution`). A leftover
-/// `subrepo/<subdir>` worktree/branch makes the next `git subrepo pull`
-/// fail immediately with "There is already a worktree with branch
-/// subrepo/<subdir>", masking the real outcome of this attempt.
-fn attempt_pull(repo_root: &Path, subdir: &str, tag: &str) -> Result<Output> {
-    best_effort_clean(repo_root, subdir);
-    Command::new("git")
-        .args(["subrepo", "pull", subdir, "-b", tag])
-        .current_dir(repo_root)
-        .output()
-        .with_context(|| format!("failed to run `git subrepo pull {subdir} -b {tag}`"))
-}
-
-/// `git subrepo clean` is a safe no-op when there's nothing to clean. If it
-/// fails for a real reason, a debug trace is left so a subsequent
-/// "already a worktree" pull failure is correlatable back to it — every
-/// call site in this module uses this helper rather than a bare `.ok()`,
-/// so none of them silently swallow a genuine clean failure.
-fn best_effort_clean(repo_root: &Path, subdir: &str) {
-    if let Err(e) = run_git(repo_root, &["subrepo", "clean", subdir]) {
-        eprintln!("xtask: debug: `git subrepo clean {subdir}` failed (may be benign): {e}");
-    }
-}
-
-fn git_common_dir(repo_root: &Path) -> Result<PathBuf> {
-    let raw = run_git(repo_root, &["rev-parse", "--git-common-dir"])?;
-    let path = PathBuf::from(raw);
-    Ok(if path.is_absolute() { path } else { repo_root.join(path) })
-}
-
-/// Replicates git-subrepo's own recovery formula for a squash-merge-stale
-/// `.gitrepo` `parent` (its own error message suggests exactly this SHA):
-/// the last commit that touched the `.gitrepo` file's `commit =` line,
-/// walked back one parent. This candidate is always an ancestor of HEAD by
-/// construction (it comes from `git log` starting at HEAD). The is-ancestor
-/// check below is still a real, always-on `bail!` rather than a
-/// `debug_assert!` despite that guarantee: it's the sole guard immediately
-/// before an irreversible committed write in unattended CI, where a
-/// silently compiled-away check (debug_assert! is a no-op in release
-/// builds) is the wrong trade. The two earlier `bail!`s (no commit found;
-/// root commit with no parent) are real defensive checks but effectively
-/// unreachable through any real `git subrepo` lifecycle — confirmed live:
-/// `git subrepo clone` refuses outright ("You can't clone into an empty
-/// repository") in a repo with zero prior commits, so the sync commit this
-/// function walks back from always has at least one parent to find, and a
-/// `.gitrepo` file only ever exists because some commit introduced its
-/// `commit =` line in the first place. No test fabricates either
-/// condition for the same reason no test fabricates a non-ancestor
-/// candidate for the check below — doing so would require hand-corrupting
-/// the git object graph outside any real git-subrepo operation, testing
-/// the fabrication rather than the code.
-fn fix_stale_parent(repo_root: &Path, subdir: &str) -> Result<()> {
-    let gitrepo_rel = format!("{subdir}/.gitrepo");
-
-    let last_sync_commit = run_git(
-        repo_root,
-        &["log", "-1", "-G", "commit =", "--format=%H", "--", &gitrepo_rel],
-    )?;
-    if last_sync_commit.is_empty() {
-        bail!("could not find a commit that touched `{gitrepo_rel}`'s `commit =` line; cannot compute a replacement `parent`");
-    }
-
-    let parent_ref = format!("{last_sync_commit}^");
-    let candidate = run_git(repo_root, &["log", "-1", "--format=%H", &parent_ref]).with_context(|| {
-        format!("the last sync commit {last_sync_commit} has no parent (it's a root commit) — cannot compute a replacement `.gitrepo` parent")
-    })?;
-
-    let is_ancestor = Command::new("git")
-        .args(["merge-base", "--is-ancestor", &candidate, "HEAD"])
-        .current_dir(repo_root)
-        .status()
-        .context("git merge-base --is-ancestor failed to run")?;
-    if !is_ancestor.success() {
-        bail!(
-            "computed replacement parent {candidate} is not an ancestor of HEAD — \
-             this should never happen (the last-sync-commit formula guarantees it by \
-             construction); something is deeply wrong with this repo's history"
-        );
-    }
-
-    let gitrepo_path = repo_root.join(subdir).join(".gitrepo");
-    let contents = std::fs::read_to_string(&gitrepo_path)
-        .with_context(|| format!("failed to read {}", gitrepo_path.display()))?;
-    std::fs::write(&gitrepo_path, replace_gitrepo_field(&contents, "parent", &candidate)?)
-        .with_context(|| format!("failed to write {}", gitrepo_path.display()))?;
-
-    run_git(repo_root, &["add", &gitrepo_rel])?;
-    run_git(
-        repo_root,
-        &["commit", "-m", &format!("fix: realign {subdir} subrepo parent after squash-merge")],
-    )?;
-    Ok(())
-}
-
-fn replace_gitrepo_field(contents: &str, field: &str, value: &str) -> Result<String> {
-    let prefix = format!("{field} =");
-    let mut found = false;
-    let lines: Vec<String> = contents
-        .lines()
-        .map(|line| {
-            if line.trim_start().starts_with(&prefix) {
-                found = true;
-                format!("\t{field} = {value}")
-            } else {
-                line.to_string()
-            }
-        })
-        .collect();
-    if !found {
-        bail!("`.gitrepo` has no `{field} = ` line to replace");
-    }
-    Ok(lines.join("\n") + "\n")
-}
-
-fn handle_conflict(_repo_root: &Path, _subdir: &str, _tag: &str, output: &Output) -> Result<Outcome> {
-    bail!(
-        "git subrepo pull failed:\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-}
-
-pub fn force_commit_conflicted(_repo_root: &Path, _subdir: &str, _tag: &str) -> Result<()> {
-    unimplemented!("Task 4")
-}
-```
-
-(`handle_conflict` is a placeholder-that-errors-loudly deliberately — Task 4
-replaces it with the real allowlist/conflict logic.)
-
-- [ ] **Step 4: Run the three in-scope tests**
+- [x] **Step 4: Run the three in-scope tests**
 
 Run: `cargo test -p xtask pull_subrepo -- --nocapture`
 Expected: `clean_pull_on_the_very_first_attempt_from_a_plain_checkout`,
@@ -1053,7 +858,7 @@ Expected: `clean_pull_on_the_very_first_attempt_from_a_plain_checkout`,
 `works_identically_from_a_linked_worktree` PASS. The conflict/allowlist
 tests still FAIL (expected — Task 4).
 
-- [ ] **Step 5: Wire the CLI**
+- [x] **Step 5: Wire the CLI**
 
 Modify `xtask/src/lib.rs`:
 
@@ -1115,12 +920,12 @@ Modify `xtask/src/lib.rs`:
   (Add `bail` to the existing `use anyhow::{...}` import at the top of
   `lib.rs` if it isn't already imported there.)
 
-- [ ] **Step 6: Manually exercise the CLI once**
+- [x] **Step 6: Manually exercise the CLI once**
 
 Run: `cargo xtask pull-subrepo --help` to confirm it's wired in.
 Expected: clap-generated help showing `<PATH> <TAG>`.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add xtask/src/pull_subrepo.rs xtask/src/git_util.rs xtask/src/lib.rs

@@ -482,6 +482,80 @@ fn works_identically_from_a_linked_worktree() {
 }
 
 #[skuld::test]
+fn leftover_subrepo_branch_from_a_manual_pull_does_not_block_a_later_pull() {
+    // git-subrepo leaves the `subrepo/<subdir>` branch behind after EVERY
+    // successful pull, including ones run outside this tool entirely (e.g.
+    // the documented manual VENDORING.md flow) — confirmed live against
+    // this very repo's own `.git`, which already carries
+    // `refs/heads/subrepo/crates/ex-ray/third_party/v2ray-core` from a past
+    // pull. `ensure_no_in_progress_conflict_resolution` must not treat that
+    // benign residue as an in-progress conflict.
+    let fx = Fixture::build(ConflictKind::None);
+    git(&fx.downstream, &["subrepo", "pull", "vendor", "-b", "v2"]);
+    // Sanity: confirm the fixture reproduces the leftover-branch state this
+    // test exists to guard against (panics via `git`'s own assert if not).
+    git(
+        &fx.downstream,
+        &["show-ref", "--verify", "--quiet", "refs/heads/subrepo/vendor"],
+    );
+
+    let outcome = pull_subrepo::run(&fx.downstream, "vendor", "v2")
+        .expect("a leftover branch from a completed pull must not block a later pull");
+    assert!(matches!(outcome, Outcome::Clean));
+}
+
+#[skuld::test]
+fn ref_unsafe_subdir_is_rejected_before_touching_anything() {
+    let fx = Fixture::build(ConflictKind::None);
+    let before_head = git_output(&fx.downstream, &["rev-parse", "HEAD"]);
+
+    let err = match pull_subrepo::run(&fx.downstream, "some vendor", "v2") {
+        Err(e) => e,
+        Ok(_) => panic!("a subdir needing percent-encoding must be rejected up front"),
+    };
+    assert!(
+        format!("{err:#}").contains("check-ref-format"),
+        "error should name the actual cause: {err:#}"
+    );
+
+    let after_head = git_output(&fx.downstream, &["rev-parse", "HEAD"]);
+    assert_eq!(before_head, after_head, "nothing should be committed on rejection");
+}
+
+#[skuld::test]
+fn trailing_slash_subdir_still_pulls_cleanly() {
+    // git-subrepo's own `check-and-normalize-subdir` strips a trailing `/`
+    // before doing anything else (e.g. what shell tab-completion appends to
+    // a directory argument) — this module must normalize the same way
+    // before building worktree/branch paths from `subdir`.
+    let fx = Fixture::build(ConflictKind::None);
+    let outcome = pull_subrepo::run(&fx.downstream, "vendor/", "v2").expect("a trailing slash must not be rejected");
+    assert!(matches!(outcome, Outcome::Clean));
+}
+
+#[skuld::test]
+fn up_to_date_pull_still_realigns_the_branch_pin() {
+    // git-subrepo's "already up to date" no-op path (the requested tag
+    // resolves to the commit already recorded) leaves `.gitrepo` completely
+    // untouched — Outcome::Clean must still mean the tag pin is current.
+    let fx = Fixture::build(ConflictKind::None);
+    let outcome = pull_subrepo::run(&fx.downstream, "vendor", "v2").expect("first pull to v2 should succeed");
+    assert!(matches!(outcome, Outcome::Clean));
+
+    let upstream = fx.dir.path().join("upstream");
+    git(&upstream, &["tag", "v3", "v2"]);
+
+    let outcome = pull_subrepo::run(&fx.downstream, "vendor", "v3").expect("re-tag pull to v3 should succeed");
+    assert!(matches!(outcome, Outcome::Clean));
+
+    let gitrepo = std::fs::read_to_string(fx.downstream.join("vendor/.gitrepo")).unwrap();
+    assert!(
+        gitrepo.contains("branch = v3"),
+        "the tag pin must be realigned even when git-subrepo itself no-ops: {gitrepo}"
+    );
+}
+
+#[skuld::test]
 fn allowlisted_conflict_resolves_from_a_linked_worktree() {
     // Exercises the git_common_dir / temp-worktree-location code inside
     // handle_conflict — the part of pull_subrepo that's actually
