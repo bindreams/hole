@@ -24,6 +24,7 @@ pub mod dmg_background;
 pub mod ex_ray;
 pub mod galoshes;
 pub mod gen_ui_constants;
+pub mod git_util;
 pub mod golangci_lint;
 pub mod interrupt;
 pub mod manifest;
@@ -148,6 +149,18 @@ pub enum Command {
     /// keeping the build-deps lean. The `plugin-e2e-tests` build.yaml target
     /// runs it before the interop round-trip tests.
     ProvisionUpstreamV2ray,
+    /// Pull a vendored git-subrepo to a new upstream tag, fixing the
+    /// routine squash-merge parent-staleness gotcha automatically. A real
+    /// merge conflict stops here, uncommitted, exactly like `git pull` —
+    /// resolve it by hand in the printed temp worktree.
+    PullSubrepo {
+        /// Path to the subrepo directory, relative to the repo root (e.g.
+        /// `crates/ex-ray/third_party/v2ray-core`).
+        path: String,
+        /// Upstream tag to pull (e.g. `v5.53.0`). Not validated against any
+        /// datasource — the caller decides.
+        tag: String,
+    },
     /// Run all `cargo xtask <step>` commands required for a runnable build.
     ///
     /// Currently: `ex-ray` + `galoshes` + `wintun` + `golangci-lint`.
@@ -294,6 +307,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
         Command::Wintun => run_wintun(),
         Command::GolangciLint => run_golangci_lint(),
         Command::ProvisionUpstreamV2ray => run_provision_upstream_v2ray(),
+        Command::PullSubrepo { path, tag } => run_pull_subrepo(path, tag),
         Command::Deps => run_deps(),
         Command::Version { group, check, exact } => run_version(group, check, exact),
         Command::Build { target, all } => run_build(target, all),
@@ -391,6 +405,31 @@ pub fn run_provision_upstream_v2ray() -> Result<()> {
     let path = upstream_v2ray::ensure(&repo_root)?;
     println!("xtask: upstream v2ray-plugin at {}", path.display());
     Ok(())
+}
+
+pub fn run_pull_subrepo(path: String, tag: String) -> Result<()> {
+    let repo_root = repo_root()?;
+    match pull_subrepo::run(&repo_root, &path, &tag)? {
+        pull_subrepo::Outcome::Clean => {
+            println!("xtask: pulled {path} to {tag} cleanly");
+            Ok(())
+        }
+        pull_subrepo::Outcome::Conflicted { worktree, unresolved } => {
+            eprintln!(
+                "xtask: {path} pull to {tag} has unresolved conflicts in:\n  {}\n\
+                 Resolve them in {}, `git add` the resolved files, `git commit`, \
+                 then run `git subrepo commit {path}` from the repo root.",
+                unresolved.join("\n  "),
+                worktree.display()
+            );
+            // Exit code 2 distinguishes "real conflict, worktree left
+            // for resolution" from any other failure (which propagates
+            // as exit 1 via the `?` above) — vendor-bump.yaml branches
+            // on this instead of misapplying conflict-recovery to e.g.
+            // a dirty-tree rejection or a missing git-subrepo install.
+            std::process::exit(2);
+        }
+    }
 }
 
 pub fn run_deps() -> Result<()> {
