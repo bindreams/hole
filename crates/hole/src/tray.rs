@@ -253,15 +253,6 @@ const ID_INSTALL_UPDATE: &str = "install_update";
 const ID_LOCKDOWN: &str = "lockdown";
 const ID_BLOCKED_RETRY: &str = "blocked_retry";
 
-// Window menu ---------------------------------------------------------------------------------------------------------
-const ID_WINDOW_IMPORT: &str = "window_import";
-const ID_WINDOW_EXIT: &str = "window_exit";
-#[cfg(target_os = "macos")]
-const ID_UNINSTALL_HELPER: &str = "uninstall_helper";
-const ID_ABOUT: &str = "about";
-const ID_CHECK_UPDATE: &str = "check_update";
-const ID_COLLECT_LOGS: &str = "window_collect_logs";
-
 // Tray creation =======================================================================================================
 
 /// Tray label for the lockdown toggle from the (enabled, active) snapshot.
@@ -523,7 +514,7 @@ pub fn rebuild_tray_menu(app: &AppHandle) {
 /// the last honored intent (the `RestoreLastState` input read at next launch by
 /// `startup_should_connect`, #458), and the tray renders from bridge Status,
 /// never from that flag (#462).
-async fn exit_app(app: AppHandle) {
+pub(crate) async fn exit_app(app: AppHandle) {
     let state = app.state::<AppState>();
     let _ = state.bridge_send(BridgeRequest::Stop).await;
     app.exit(0);
@@ -878,59 +869,8 @@ fn handle_tray_event(app: &AppHandle, event: MenuEvent) {
     }
 }
 
-// Window event handler ================================================================================================
-
-/// Handle events from the dashboard window menu bar. See `handle_tray_event` for why this is separate.
-fn handle_window_menu_event(window: &tauri::Window, event: MenuEvent) {
-    let app = window.app_handle();
-    match event.id().as_ref() {
-        ID_WINDOW_IMPORT => {
-            info!("menu: import requested");
-            use tauri::Emitter;
-            // Emit to the menu's own window — no label lookup needed.
-            window.emit("import-requested", ()).ok();
-        }
-        ID_WINDOW_EXIT => {
-            info!("menu: exit requested");
-            let app_handle = app.clone();
-            tauri::async_runtime::spawn(async move { exit_app(app_handle).await });
-        }
-        ID_CHECK_UPDATE => {
-            info!("menu: check for updates");
-            let app_handle = app.clone();
-            tauri::async_runtime::spawn(async move {
-                handle_check_for_updates(app_handle).await;
-            });
-        }
-        ID_COLLECT_LOGS => {
-            info!("menu: collect logs");
-            let app_handle = app.clone();
-            tauri::async_runtime::spawn(async move {
-                handle_collect_logs(app_handle).await;
-            });
-        }
-        ID_ABOUT => {
-            info!("menu: about dialog");
-            use tauri_plugin_dialog::DialogExt;
-            app.dialog()
-                .message(format!("Hole {}", hole::version::VERSION))
-                .title("About Hole")
-                .blocking_show();
-        }
-        #[cfg(target_os = "macos")]
-        ID_UNINSTALL_HELPER => {
-            info!("menu: uninstall helper requested");
-            let app_handle = app.clone();
-            tauri::async_runtime::spawn(async move {
-                handle_uninstall_helper(app_handle).await;
-            });
-        }
-        _ => {}
-    }
-}
-
 #[cfg(target_os = "macos")]
-async fn handle_uninstall_helper(app: AppHandle) {
+pub(crate) async fn handle_uninstall_helper(app: AppHandle) {
     use tauri_plugin_dialog::{DialogExt, MessageDialogButtons};
 
     let confirmed = app
@@ -1155,7 +1095,7 @@ async fn handle_install_update_from_tray(app: AppHandle, precomputed_consent: Op
     }
 }
 
-async fn handle_collect_logs(app: AppHandle) {
+pub(crate) async fn handle_collect_logs(app: AppHandle) {
     use tauri_plugin_dialog::DialogExt;
 
     let zip_result = tokio::task::spawn_blocking(crate::log_collector::collect_logs_to_zip).await;
@@ -1196,7 +1136,7 @@ async fn handle_collect_logs(app: AppHandle) {
     }
 }
 
-async fn handle_check_for_updates(app: AppHandle) {
+pub(crate) async fn handle_check_for_updates(app: AppHandle) {
     use tauri_plugin_dialog::{DialogExt, MessageDialogButtons};
 
     let result = tokio::task::spawn_blocking(hole::update::check_for_update).await;
@@ -1289,7 +1229,7 @@ fn reveal(window: &tauri::WebviewWindow) {
 fn build_dashboard(app: &AppHandle, dashboard: &hole::dashboard::DashboardWindow) {
     let (generation, label) = dashboard.allocate();
 
-    let mut builder = WebviewWindowBuilder::new(app, &label, WebviewUrl::default())
+    let builder = WebviewWindowBuilder::new(app, &label, WebviewUrl::default())
         .title("Hole Dashboard")
         .inner_size(800.0, 600.0)
         .min_inner_size(800.0, 200.0)
@@ -1301,62 +1241,28 @@ fn build_dashboard(app: &AppHandle, dashboard: &hole::dashboard::DashboardWindow
         // Safari → Develop. Adds an "Inspect" context-menu item.
         .devtools(true);
 
-    // Menu bar (all platforms) ----------------------------------------------------------------------------------------
-    {
-        use tauri::menu::{Menu, Submenu};
-
-        // File menu
-        let import_item = MenuItem::with_id(app, ID_WINDOW_IMPORT, "Import...", true, Some("CmdOrCtrl+O"))
-            .expect("failed to create menu item");
-        let file_sep = PredefinedMenuItem::separator(app).expect("failed to create separator");
-        let exit_item = MenuItem::with_id(app, ID_WINDOW_EXIT, "Exit", true, Some("CmdOrCtrl+Q"))
-            .expect("failed to create menu item");
-        let file_submenu = Submenu::with_items(app, "File", true, &[&import_item, &file_sep, &exit_item])
-            .expect("failed to create submenu");
-
-        // Help menu
-        let check_update_item = MenuItem::with_id(app, ID_CHECK_UPDATE, "Check for Updates...", true, None::<&str>)
-            .expect("failed to create menu item");
-        let collect_logs_item = MenuItem::with_id(app, ID_COLLECT_LOGS, "Collect Logs...", true, None::<&str>)
-            .expect("failed to create menu item");
-        let about_item =
-            MenuItem::with_id(app, ID_ABOUT, "About Hole", true, None::<&str>).expect("failed to create menu item");
-        let help_submenu = Submenu::with_items(
-            app,
-            "Help",
-            true,
-            &[&check_update_item, &collect_logs_item, &about_item],
-        )
-        .expect("failed to create submenu");
-
-        #[cfg(not(target_os = "macos"))]
-        let menu = Menu::with_items(app, &[&file_submenu, &help_submenu]).expect("failed to create menu");
-
-        #[cfg(target_os = "macos")]
-        let menu = {
-            let uninstall_item = MenuItem::with_id(app, ID_UNINSTALL_HELPER, "Uninstall Helper...", true, None::<&str>)
-                .expect("failed to create menu item");
-            let hole_submenu =
-                Submenu::with_items(app, "Hole", true, &[&uninstall_item]).expect("failed to create submenu");
-            Menu::with_items(app, &[&hole_submenu, &file_submenu, &help_submenu]).expect("failed to create menu")
-        };
-
-        builder = builder.menu(menu).on_menu_event(|window, event| {
-            handle_window_menu_event(window, event);
-        });
-    }
-
     match builder.build() {
         Ok(window) => {
             // Stop tracking this generation on close; don't prevent the close,
             // so the webview is destroyed and freed. The generation tag stops a
             // late close from forgetting a newer dashboard.
+            //
+            // `remove_menu`: on Windows, muda keys its per-HWND menu install
+            // by HWND and rejects a second `SetMenu` on one it already knows
+            // (`Error::AlreadyInitialized`, swallowed by tauri) — without
+            // this, a HWND recycled for the next dashboard would silently
+            // get no menu bar at all. No-op on macOS (app-wide menu) and a
+            // clean no-prior-menu no-op on the very first dashboard.
             let close_handle = app.clone();
+            let close_window = window.clone();
             window.on_window_event(move |event| {
                 if let tauri::WindowEvent::CloseRequested { .. } = event {
                     close_handle
                         .state::<hole::dashboard::DashboardWindow>()
                         .forget(generation);
+                    if let Err(e) = close_window.remove_menu() {
+                        warn!(error = %e, "failed to remove dashboard window menu on close");
+                    }
                 }
             });
             #[cfg(target_os = "macos")]

@@ -609,12 +609,13 @@ fn corrupted_json_does_not_leak_content(#[fixture(temp_dir)] dir: &Path) {
     let file = dir.join("bad.json");
     std::fs::write(&file, "SUPER_SECRET_CONTENT_HERE").unwrap();
     let err = validate_and_read_import(&file).unwrap_err();
+    // A unit variant structurally cannot carry the file's content, which is
+    // a stronger guarantee than any assertion about a rendered string.
+    // `import_dialog_tests` covers what the user is actually shown.
     match err {
-        ImportFailure::CorruptedJson => {} // good — no detail to leak
+        ImportFailure::CorruptedJson => {}
         other => panic!("expected CorruptedJson, got {other:?}"),
     }
-    let json = serde_json::to_string(&err).unwrap();
-    assert!(!json.contains("SUPER_SECRET"), "wire form leaked file content: {json}");
 }
 
 /// `InvalidValue` is allowed to surface a port number — it's
@@ -811,7 +812,7 @@ fn apply_import_emits_summary_event() {
 
     let captured = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
     assert!(
-        captured.contains("import_servers_from_file: apply summary"),
+        captured.contains("import_file: apply summary"),
         "expected apply summary event in captured output:\n{captured}"
     );
     assert!(
@@ -886,43 +887,6 @@ fn to_import_failure_invalid_value_keeps_safe_detail() {
         }
         other => panic!("expected InvalidValue, got {other:?}"),
     }
-}
-
-/// `ImportFailure` must serialize as a `serde`-tagged enum so the JS
-/// `{ kind }` discriminator works.
-#[skuld::test]
-fn import_failure_serializes_with_kind_tag() {
-    let f = ImportFailure::CorruptedJson;
-    let json = serde_json::to_string(&f).unwrap();
-    assert_eq!(json, r#"{"kind":"corrupted_json"}"#);
-
-    let f = ImportFailure::UnrecognizedFormat {
-        missing_field: "method".to_string(),
-    };
-    let json = serde_json::to_string(&f).unwrap();
-    assert_eq!(json, r#"{"kind":"unrecognized_format","missing_field":"method"}"#);
-
-    let f = ImportFailure::UnsupportedPlugin {
-        plugin: "kcptun".to_string(),
-        supported: vec!["v2ray-plugin".to_string(), "galoshes".to_string()],
-    };
-    let json = serde_json::to_string(&f).unwrap();
-    assert!(json.contains(r#""kind":"unsupported_plugin""#));
-    assert!(json.contains(r#""plugin":"kcptun""#));
-    assert!(json.contains(r#""supported":["v2ray-plugin","galoshes"]"#));
-
-    let f = ImportFailure::FileError {
-        detail: "file not found or not accessible".to_string(),
-    };
-    let json = serde_json::to_string(&f).unwrap();
-    assert_eq!(
-        json,
-        r#"{"kind":"file_error","detail":"file not found or not accessible"}"#
-    );
-
-    let f = ImportFailure::SaveFailed;
-    let json = serde_json::to_string(&f).unwrap();
-    assert_eq!(json, r#"{"kind":"save_failed"}"#);
 }
 
 #[skuld::test]

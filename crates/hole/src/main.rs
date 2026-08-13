@@ -21,6 +21,7 @@ mod cli_log;
 mod cli;
 mod commands;
 mod elevation;
+mod import_dialog;
 mod log_collector;
 mod logging;
 mod orphan_sweep;
@@ -30,6 +31,7 @@ mod setup;
 mod state;
 mod tray;
 mod ui_settings;
+mod window_menu;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -150,7 +152,6 @@ fn launch_gui(show_dashboard: bool) {
         .invoke_handler(tauri::generate_handler![
             commands::get_config,
             commands::save_config,
-            commands::import_servers_from_file,
             commands::delete_server,
             commands::get_proxy_status,
             commands::get_metrics,
@@ -165,7 +166,11 @@ fn launch_gui(show_dashboard: bool) {
             tray::cancel_proxy,
             tray::get_autostart,
             tray::set_autostart,
+            import_dialog::import_from_dialog,
+            import_dialog::import_dropped_files,
         ])
+        .menu(window_menu::build)
+        .on_menu_event(window_menu::handle_event)
         .setup(move |app| {
             // Manage shared state here (instead of pre-`.setup()`) so that
             // `AppState` has access to a real `tauri::AppHandle` for emitting
@@ -186,6 +191,7 @@ fn launch_gui(show_dashboard: bool) {
             app.manage(hole::update::UpdateState::default());
             app.manage(tray::TransitionSlot::new());
             app.manage(hole::dashboard::DashboardWindow::new());
+            app.manage(std::sync::Arc::new(import_dialog::ImportFlow::default()));
             tray::create_tray(app)?;
             // Tray + webview follow the ProxyStateCell; the reconciler's
             // immediate first tick is the startup resync against the

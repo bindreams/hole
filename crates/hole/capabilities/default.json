@@ -3,9 +3,6 @@
   "windows": ["dashboard-*"],
   "permissions": [
     "core:default",
-    "dialog:allow-open",
-    "dialog:allow-message",
-    "dialog:allow-save",
     "log:allow-log"
   ]
 }

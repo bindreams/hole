@@ -14,7 +14,6 @@ const updateDiagnostics = vi.fn();
 const invokeMock = vi.fn<(...args: unknown[]) => Promise<unknown>>();
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: (...args: unknown[]) => invokeMock(...args) }));
-vi.mock("@tauri-apps/plugin-dialog", () => ({ message: vi.fn(), open: vi.fn() }));
 vi.mock("./main", () => ({
   get config() {
     return mainMock.config;
@@ -343,5 +342,24 @@ describe("userMessageFor", () => {
       "Validated by a recent successful connect.",
     );
     expect(userMessageFor({ kind: "reachable", latency_ms: LATENCY_VALIDATED_ON_CONNECT + 1 })).toMatch(/Round-trip/);
+  });
+});
+
+describe("importFromDialog", () => {
+  it("asks the backend to open the picker rather than opening one itself", async () => {
+    // The picker, the import and the failure dialogs all live in Rust so
+    // that this and File > Import are one path — see import_dialog.rs.
+    const { importFromDialog } = await import("./servers");
+    await importFromDialog();
+    expect(invokeMock).toHaveBeenCalledWith("import_from_dialog");
+  });
+
+  it("surfaces a picker the backend could not open", async () => {
+    // Nothing has happened yet at this point, so the user needs telling —
+    // otherwise clicking the import zone looks like it did nothing.
+    invokeMock.mockRejectedValueOnce(new Error("ipc gone"));
+    const { importFromDialog } = await import("./servers");
+    await importFromDialog();
+    expect(showToastMock).toHaveBeenCalledWith(expect.stringContaining("ipc gone"), "error");
   });
 });

@@ -1,10 +1,8 @@
 // Servers section: rendering server cards, selection, deletion, file import.
 
 import { invoke } from "@tauri-apps/api/core";
-import { message, open } from "@tauri-apps/plugin-dialog";
 import { LATENCY_VALIDATED_ON_CONNECT, NETWORK_BLOCKED_MESSAGE } from "./generated";
-import { describeUnknownImportError } from "./import-failure";
-import { config, loadConfig, runTestsBounded, saveConfig, TEST_CONCURRENCY } from "./main";
+import { config, loadConfig, saveConfig } from "./main";
 import { updateDiagnostics } from "./sidebar";
 import { showToast } from "./toast";
 import type { ServerTestOutcome, ValidationState } from "./types";
@@ -300,60 +298,20 @@ async function deleteServer(id: string) {
 // File import =========================================================================================================
 
 /**
- * Show a blocking error dialog for an import failure. The dialog
- * pauses the JS event loop until the user clicks OK — chosen
- * deliberately so import errors can't be missed (a toast that
- * auto-dismisses in 10s is easy to overlook). See bindreams/hole#385.
+ * Ask the backend to open the import file picker.
  *
- * Accepts `unknown` because the Tauri invoke rejection type is unknown:
- * the structured `ImportFailure` is the happy path, but a transport-
- * layer failure (channel closed mid-call) delivers a string/Error.
- * `describeUnknownImportError` handles both shapes uniformly.
+ * The picker, the import, and the per-failure dialogs all live in Rust so
+ * that this and File > Import are one code path — see
+ * `crates/hole/src/import_dialog.rs`. Results arrive as `servers-imported`,
+ * handled in main.ts.
  */
-export async function showImportFailureDialog(failure: unknown): Promise<void> {
-  const { title, body } = describeUnknownImportError(failure);
-  await message(body, { title, kind: "error" });
-}
-
-/** Open a file dialog and import servers from the selected JSON file. */
-export async function importFromDialog() {
-  let path: string | null;
+export async function importFromDialog(): Promise<void> {
   try {
-    path = await open({
-      filters: [{ name: "JSON", extensions: ["json"] }],
-      multiple: false,
-    });
+    await invoke("import_from_dialog");
   } catch (err) {
-    console.error("file dialog failed:", err);
-    showToast(`Could not open file dialog: ${err}`, "error");
-    return;
+    console.error("import_from_dialog failed:", err);
+    showToast(`Could not open the import dialog: ${err}`, "error");
   }
-  if (!path) return; // user cancelled
-
-  let newServers: { id: string }[];
-  try {
-    newServers = await invoke<{ id: string }[]>("import_servers_from_file", { path });
-  } catch (err) {
-    // Rust `ImportFailure` enum (happy path) or a transport-layer
-    // string/Error; `showImportFailureDialog` handles both.
-    console.error("import from dialog failed:", err);
-    await showImportFailureDialog(err);
-    return;
-  }
-
-  await loadConfig();
-
-  if (newServers.length === 0) {
-    showToast("No new servers — already in the list.", "info");
-    return;
-  }
-  showToast(`Imported ${newServers.length} server(s).`, "success");
-
-  // Auto-test imported servers in parallel (bounded). Fire and forget.
-  runTestsBounded(
-    newServers.map((s) => s.id),
-    TEST_CONCURRENCY,
-  );
 }
 
 /**

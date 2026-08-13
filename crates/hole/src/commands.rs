@@ -21,13 +21,11 @@ const MAX_IMPORT_FILE_SIZE: u64 = 10 * 1024 * 1024; // 10 MB
 
 // ImportFailure =======================================================================================================
 
-/// Structured import failure surfaced to the frontend. Tagged enum
-/// (serde `tag = "kind"`) so the JS side branches on the discriminator
-/// to pick a user-friendly blocking dialog rather than parsing failure
-/// mode out of a free-form error string. See the JS-side `friendlyDialog`
-/// helper at `ui/import-failure.ts`.
-#[derive(Debug, Clone, Serialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+/// Why an import failed, in the categories the user needs told apart.
+/// `import_dialog::describe_failure` turns one into the dialog text; the
+/// `match` there is exhaustive, so a variant added here cannot quietly go
+/// unworded.
+#[derive(Debug, Clone)]
 pub enum ImportFailure {
     /// File-system layer: not found / not accessible / not a regular
     /// file / wrong extension / too large to import. The `detail` is
@@ -52,10 +50,9 @@ pub enum ImportFailure {
     /// show — it never echoes file content (covered by tests in
     /// `import_tests.rs` and `commands_tests.rs`).
     InvalidValue { detail: String },
-    /// Config save to disk failed. The wire form stays detail-free on
-    /// purpose; the full `ConfigError` (whose Display is path- and
-    /// content-free) plus the config path is recorded in `gui.log` via
-    /// `warn!`.
+    /// Config save to disk failed. Deliberately detail-free; the full
+    /// `ConfigError` (whose Display is path- and content-free) plus the
+    /// config path is recorded in `gui.log` via `warn!`.
     SaveFailed,
 }
 
@@ -162,9 +159,8 @@ fn validate_and_read_import(path: &Path) -> Result<Vec<ServerEntry>, ImportFailu
 /// every import attempt leaves a trace in `gui.log`.
 ///
 /// Pure helper — no Tauri `State`, no `AppHandle`, no `Mutex` — so it is
-/// unit-testable without standing up a real Tauri app. The `#[tauri::command]`
-/// wrapper [`import_servers_from_file`] holds the lock and persists the
-/// resulting config; this helper does NOT save.
+/// unit-testable without standing up a real Tauri app. [`import_file`] holds
+/// the lock and persists the resulting config; this helper does NOT save.
 fn apply_import(config: &mut AppConfig, parsed: Vec<ServerEntry>) -> (Vec<ServerEntry>, usize) {
     let parsed_count = parsed.len();
     let existing_count = config.servers.len();
@@ -199,7 +195,7 @@ fn apply_import(config: &mut AppConfig, parsed: Vec<ServerEntry>) -> (Vec<Server
         total_after = existing_count + appended_count,
         selection_initialized_from_none,
         selection_healed,
-        "import_servers_from_file: apply summary"
+        "import_file: apply summary"
     );
 
     (appended, deduped_count)
@@ -236,22 +232,25 @@ fn remove_server(config: &mut AppConfig, id: &str) -> bool {
 /// Import servers from a config file path. Reads the file and parses it.
 ///
 /// Returns only the entries that were actually appended to the config —
-/// duplicates of existing servers are silently dropped. The frontend uses
-/// the returned IDs to auto-test *new* entries; returning phantom IDs for
+/// duplicates of existing servers are silently dropped. The caller uses the
+/// returned IDs to auto-test *new* entries; returning phantom IDs for
 /// deduped entries would produce silent "no server with id …" errors in
 /// the auto-test loop.
 ///
+/// Not a Tauri command: every import the user can start goes through
+/// `import_dialog`, which owns the picker and the failure dialogs. Keeping
+/// this off the IPC surface is what stops a second, unguarded import path
+/// from growing back.
+///
 /// Logging: emits `info!` at entry and through [`apply_import`]'s summary;
 /// emits `warn!` on validate/parse failure and on config-save failure. The
-/// save-failure path returns `ImportFailure::SaveFailed` (no detail in the
-/// wire form) — the structured wire variant is deliberately detail-free; the
+/// save-failure path returns `ImportFailure::SaveFailed` (no detail) — the
 /// full `ConfigError` (path- and content-free) plus the config path land in
 /// `gui.log` via `warn!`.
-#[tauri::command]
-pub fn import_servers_from_file(state: State<AppState>, path: String) -> Result<Vec<ServerEntry>, ImportFailure> {
-    info!(path = %path, "import_servers_from_file: start");
-    let parsed = validate_and_read_import(Path::new(&path)).inspect_err(|e| {
-        warn!(path = %path, error = ?e, "import_servers_from_file: validate/parse failed");
+pub fn import_file(state: &AppState, path: &Path) -> Result<Vec<ServerEntry>, ImportFailure> {
+    info!(path = %path.display(), "import_file: start");
+    let parsed = validate_and_read_import(path).inspect_err(|e| {
+        warn!(path = %path.display(), error = ?e, "import_file: validate/parse failed");
     })?;
 
     let mut current = state.config.lock().unwrap();
@@ -260,7 +259,7 @@ pub fn import_servers_from_file(state: State<AppState>, path: String) -> Result<
     let (appended, _deduped) = apply_import(&mut updated, parsed);
 
     state.config_store.save(&updated).map_err(|e| {
-        warn!(error = %e, path = %state.config_store.path().display(), "import_servers_from_file: config save failed");
+        warn!(error = %e, path = %state.config_store.path().display(), "import_file: config save failed");
         ImportFailure::SaveFailed
     })?;
     *current = updated;
