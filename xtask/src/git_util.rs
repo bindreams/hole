@@ -25,3 +25,25 @@ pub fn run_git(cwd: &Path, args: &[&str]) -> Result<String> {
     }
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
+
+/// Like `run_git`, but returns stdout without `.trim()`-ing it. For a
+/// caller whose output format can legitimately start or end with a byte
+/// `.trim()` treats as whitespace (e.g. NUL-delimited `-z` output, where a
+/// path can start with a literal space), `run_git`'s trim silently
+/// corrupts the first/last field — this is the untrimmed escape hatch for
+/// that one shape of output, not a general replacement for `run_git`.
+pub fn run_git_raw(cwd: &Path, args: &[&str]) -> Result<String> {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(cwd)
+        .output()
+        .with_context(|| format!("failed to run git {args:?}"))?;
+    if !output.status.success() {
+        bail!(
+            "git {args:?} failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout).trim(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}

@@ -441,11 +441,13 @@ pub fn run_pull_subrepo(path: String, tag: String) -> Result<()> {
         } => {
             eprintln!(
                 "xtask: {path} pull to {tag} has unresolved conflicts in:\n  {}\n\
-                 Resolve them in {}, `git add` the resolved files, `git commit`, \
-                 then from the repo root: run `git subrepo commit {path}`; check \
-                 `{path}/.gitrepo`'s `branch` field is `{tag}` (fix and commit it if not — \
-                 `git subrepo commit` does not update it); then run \
-                 `git subrepo clean {path}` to remove the temp worktree.",
+                 Resolve them in {}, `git add` the resolved files, then \
+                 `PREK_ALLOW_NO_CONFIG=1 git commit` (this worktree has no `prek.toml` of its \
+                 own — a plain `git commit` fails under this repo's pre-commit hook); then from \
+                 the repo root: run `git subrepo commit {path}`; check `{path}/.gitrepo`'s \
+                 `branch` field is `{tag}` (fix and commit it if not — `git subrepo commit` \
+                 does not update it); then run `git subrepo clean {path}` to remove the temp \
+                 worktree.",
                 unresolved.join("\n  "),
                 worktree.display()
             );
