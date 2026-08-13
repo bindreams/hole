@@ -44,6 +44,12 @@ serde_yml = "0.0.13"
 indexmap = { version = "2", features = ["serde"] }
 petgraph = "0.8"
 
+# `cargo xtask pull-subrepo` shells out to `go mod edit -json` on a scratch
+# copy of a conflicted go.mod (pull_subrepo::go_mod_replace_directives) — a
+# real (non-test) code path, so this must be a normal dependency, not
+# dev-only.
+tempfile = "3"
+
 # background.typ → transparent PNG via Typst. macOS-only: the DMG background is a
 # darwin feature and the Typst tree is heavy (~300 crates); compiling it on
 # windows/linux needlessly slowed every `cargo xtask` there (the MSI build hit its
@@ -59,7 +65,6 @@ png = "0.18"
 
 [dev-dependencies]
 skuld = { workspace = true }
-tempfile = "3"
 
 [target.'cfg(unix)'.dev-dependencies]
 libc = "0.2" # raise()/kill() + SIGINT in signal tests

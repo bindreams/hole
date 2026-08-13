@@ -164,6 +164,19 @@ pub enum Command {
         /// datasource — the caller decides.
         tag: String,
     },
+    /// The CI-only "commit despite conflicts" policy: force-finishes a
+    /// conflicted `pull-subrepo` attempt by committing the temp worktree
+    /// exactly as it sits, conflict markers and all. Never use this outside
+    /// automation — a human should resolve the conflict properly instead (see
+    /// `pull-subrepo`'s own error message for how).
+    ForceCommitConflictedSubrepo {
+        /// Path to the subrepo directory, relative to the repo root — same
+        /// value passed to the `pull-subrepo` invocation that conflicted.
+        path: String,
+        /// Upstream tag that was being pulled — same value passed to the
+        /// `pull-subrepo` invocation that conflicted.
+        tag: String,
+    },
     /// Run all `cargo xtask <step>` commands required for a runnable build.
     ///
     /// Currently: `ex-ray` + `galoshes` + `wintun` + `golangci-lint`.
@@ -311,6 +324,9 @@ pub fn dispatch(cli: Cli) -> Result<()> {
         Command::GolangciLint => run_golangci_lint(),
         Command::ProvisionUpstreamV2ray => run_provision_upstream_v2ray(),
         Command::PullSubrepo { path, tag } => run_pull_subrepo(path, tag),
+        Command::ForceCommitConflictedSubrepo { path, tag } => {
+            pull_subrepo::force_commit_conflicted(&repo_root()?, &path, &tag)
+        }
         Command::Deps => run_deps(),
         Command::Version { group, check, exact } => run_version(group, check, exact),
         Command::Build { target, all } => run_build(target, all),
@@ -420,15 +436,27 @@ pub fn run_pull_subrepo(path: String, tag: String) -> Result<()> {
         pull_subrepo::Outcome::Conflicted {
             worktree,
             unresolved,
+            auto_resolved,
             fixup_commit,
         } => {
             eprintln!(
                 "xtask: {path} pull to {tag} has unresolved conflicts in:\n  {}\n\
                  Resolve them in {}, `git add` the resolved files, `git commit`, \
-                 then run `git subrepo commit {path}` from the repo root.",
+                 then from the repo root: run `git subrepo commit {path}`; check \
+                 `{path}/.gitrepo`'s `branch` field is `{tag}` (fix and commit it if not — \
+                 `git subrepo commit` does not update it); then run \
+                 `git subrepo clean {path}` to remove the temp worktree.",
                 unresolved.join("\n  "),
                 worktree.display()
             );
+            if !auto_resolved.is_empty() {
+                eprintln!(
+                    "xtask: note: these allowlisted files were already auto-resolved to \
+                     upstream's content and staged in the worktree — no action needed on \
+                     them:\n  {}",
+                    auto_resolved.join("\n  ")
+                );
+            }
             if let Some(fixup_commit) = fixup_commit {
                 eprintln!(
                     "xtask: note: a `.gitrepo` parent-realignment commit ({fixup_commit}) was \
