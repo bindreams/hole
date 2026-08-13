@@ -161,3 +161,13 @@ export interface DiagnosticsData {
   internet: string;
   [key: string]: string;
 }
+
+/**
+ * Payload of the `servers-imported` event. Matches
+ * `crates/hole/src/import_dialog.rs::ImportOutcome`; `failed` counts files
+ * the user has already been shown a dialog for.
+ */
+export interface ImportOutcome {
+  appended: Server[];
+  failed: number;
+}

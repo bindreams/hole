@@ -11,13 +11,7 @@ import "overlayscrollbars/overlayscrollbars.css";
 import { filtersEpoch, initFilters, renderFilters, setInvalidFilters } from "./filters";
 import { postImportSummary } from "./import-summary";
 import { initSections } from "./sections";
-import {
-  clearImportZoneHighlight,
-  importFromDialog,
-  initServers,
-  renderServers,
-  showImportFailureDialog,
-} from "./servers";
+import { clearImportZoneHighlight, initServers, renderServers } from "./servers";
 import { initSettings, renderSettings } from "./settings";
 import {
   applyProxyStateObservation,
@@ -30,7 +24,7 @@ import {
   updatePublicIp,
 } from "./sidebar";
 import { showToast } from "./toast";
-import type { Config, DiagnosticsData, Metrics, ProxyStatus, Server, UiSettings } from "./types";
+import type { Config, DiagnosticsData, ImportOutcome, Metrics, ProxyStatus, UiSettings } from "./types";
 
 /// Maximum number of concurrent server tests during bulk auto-test (e.g.
 /// after a JSON import). 50 concurrent plugin processes is non-trivial
@@ -208,8 +202,31 @@ export async function runTestsBounded(ids: string[], maxInFlight: number) {
 // Event listeners =====================================================================================================
 
 function setupEventListeners(): Promise<unknown> {
-  // File > Import menu action (tray emits () as payload — open dialog).
-  const importReady = listen("import-requested", () => importFromDialog());
+  // Any import that changed something, from any entry point: File > Import,
+  // the import zone, and drag-drop all land here. The backend has already
+  // parsed, deduped, persisted, and shown a dialog for each failed file —
+  // this is the refresh, not the work. Missing it costs a stale list until
+  // the next config load, never the user's import.
+  const importedReady = listen<ImportOutcome>("servers-imported", async (event) => {
+    const { appended, failed } = event.payload;
+    // Unconditionally: the backend emits whenever an import touched the
+    // config, and appending nothing is not the same as changing nothing —
+    // `apply_import` also heals and persists the selected server.
+    await loadConfig();
+    if (appended.length > 0) {
+      // Auto-test the newly imported servers in parallel (bounded).
+      // Fire and forget — the validation-changed listener handles repaint.
+      runTestsBounded(
+        appended.map((s) => s.id),
+        TEST_CONCURRENCY,
+      );
+    }
+    // Failures already got their own blocking dialogs; the summary covers
+    // the success/info outcomes, and names any failure count so it can't
+    // claim a clean run that wasn't.
+    const summary = postImportSummary(appended.length, failed);
+    if (summary !== null) showToast(summary.message, summary.kind);
+  });
 
   // WebView2 (Windows) shows the OS "forbidden" cursor on file drags
   // unless JS calls `preventDefault()` on the `dragover` event — even
@@ -221,53 +238,20 @@ function setupEventListeners(): Promise<unknown> {
   window.addEventListener("dragover", (e) => e.preventDefault());
   window.addEventListener("drop", (e) => e.preventDefault());
 
-  // Drag-and-drop file import. The user may drop one or many files;
-  // iterate, showing a BLOCKING error dialog per failure (sequential —
-  // the user must acknowledge each), and aggregate any successes into
-  // a single end-of-loop toast. Per-failure errors use blocking dialogs
-  // (not auto-dismiss toasts) so they can't be missed.
-  const dropReady = listen<{ paths?: string[] }>("tauri://drag-drop", async (event) => {
+  // Drag-and-drop file import. The paths go straight to the backend, which
+  // owns the import and its per-file error dialogs and answers with
+  // `servers-imported` above.
+  const dropReady = listen<{ paths?: string[] }>("tauri://drag-drop", (event) => {
     // A successful drop may not fire `dragleave` on the import zone —
     // remove the visual highlight unconditionally before processing
     // (the no-op case where the zone wasn't highlighted is harmless).
     clearImportZoneHighlight();
     const paths = event.payload?.paths ?? [];
     if (paths.length === 0) return;
-
-    let totalAppended = 0;
-    let totalFailed = 0;
-    const newIds: string[] = [];
-    for (const path of paths) {
-      try {
-        const newServers = await invoke<Server[]>("import_servers_from_file", { path });
-        totalAppended += newServers.length;
-        for (const s of newServers) newIds.push(s.id);
-      } catch (err) {
-        totalFailed++;
-        console.error(`import failed for ${path}:`, err);
-        // Sequential, modal — `await` here parks the loop until the
-        // user dismisses the dialog before moving on to the next file.
-        await showImportFailureDialog(err);
-      }
-    }
-
-    // Skip the config reload when nothing was appended — the config
-    // didn't change, and a reload of an unchanged config would only
-    // risk a spurious "Failed to load config" dialog on top of the
-    // per-file error dialog(s) we already showed.
-    if (totalAppended > 0) {
-      await loadConfig();
-      // Auto-test the newly imported servers in parallel (bounded).
-      // Fire and forget — the validation-changed listener handles repaint.
-      runTestsBounded(newIds, TEST_CONCURRENCY);
-    }
-
-    // Errors were already delivered via blocking dialogs inside the
-    // per-file `catch`. The post-loop summary covers only success/info
-    // outcomes — and explicitly names any failure count in the partial
-    // case so the toast doesn't lie.
-    const summary = postImportSummary(totalAppended, totalFailed);
-    if (summary !== null) showToast(summary.message, summary.kind);
+    invoke("import_dropped_files", { paths }).catch((err) => {
+      console.error("import_dropped_files failed:", err);
+      showToast(`Import failed: ${err}`, "error");
+    });
   });
 
   // Persisted validation changed (from `test_server` or
@@ -303,7 +287,7 @@ function setupEventListeners(): Promise<unknown> {
   // interactive — an emit landing before listen() resolves is silently
   // lost. Rejection is deliberately fatal to init: a dashboard without
   // its listeners is broken in exactly the silent way this guards.
-  return Promise.all([importReady, dropReady, validationReady, proxyStateReady]);
+  return Promise.all([importedReady, dropReady, validationReady, proxyStateReady]);
 }
 
 // Initialization ======================================================================================================
@@ -385,8 +369,8 @@ async function init() {
     initSidebar();
 
     // Register Rust→JS event listeners BEFORE the first paint-driving
-    // fetches: the menu and drop targets are live from the first frame,
-    // and an emit before listen() resolves is dropped with no error.
+    // fetches: the drop target is live from the first frame, and an emit
+    // before listen() resolves is dropped with no error.
     await setupEventListeners();
 
     // Replace native scrollbars with fade-in/out overlay scrollbars.

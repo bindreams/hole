@@ -1,8 +1,9 @@
 //! Unit tests for the tray's pure decision logic (outcome mapping, the
-//! intended-enabled persist rule). The remaining handler glue (menu
-//! events, rebuilds, dialogs) requires a full Tauri app context and has
-//! no automated coverage; the Start-at-Login toggle logic is unit-tested
-//! in autostart_tests.rs.
+//! intended-enabled persist rule). The remaining handler glue (menu event
+//! dispatch, tray rebuilds, dialogs) requires a full Tauri app context and
+//! has no automated coverage; the Start-at-Login toggle logic is unit-tested
+//! in autostart_tests.rs, and the app-wide menu's structure in
+//! window_menu_tests.rs.
 
 use super::*;
 use crate::bridge_client::ClientError;
