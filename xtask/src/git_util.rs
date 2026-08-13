@@ -47,3 +47,18 @@ pub fn run_git_raw(cwd: &Path, args: &[&str]) -> Result<String> {
     }
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
+
+/// Wraps `err` with a disclosure that an irreversible commit `sha`
+/// (described by `what`, e.g. `"the VENDORING.md version-note commit"`)
+/// already landed on the branch before this failure, with a
+/// `git reset --hard <sha>~1` recovery hint. Every xtask module that
+/// commits something and can still fail on a later, independent step
+/// needs this same disclosure — never let such a failure propagate bare
+/// (see `pull_subrepo.rs`'s equivalent hand-written closures for the
+/// convention this centralizes).
+pub fn disclose_prior_commit(err: anyhow::Error, sha: &str, what: &str) -> anyhow::Error {
+    err.context(format!(
+        "{what} {sha} already landed on this branch before this failure — `git reset --hard \
+         {sha}~1` undoes it if you want to retry from a clean state"
+    ))
+}

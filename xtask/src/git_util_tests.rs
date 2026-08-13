@@ -1,7 +1,7 @@
 use std::path::Path;
 use std::process::Command;
 
-use super::git_util::run_git;
+use super::git_util::{disclose_prior_commit, run_git};
 
 fn git(cwd: &Path, args: &[&str]) {
     let status = Command::new("git")
@@ -31,5 +31,27 @@ fn run_git_failure_message_includes_stdout_not_just_stderr() {
     assert!(
         message.contains("nothing to commit"),
         "the stdout-only failure reason must be included: {message}"
+    );
+}
+
+#[skuld::test]
+fn disclose_prior_commit_names_the_sha_and_the_reset_command() {
+    let err = anyhow::anyhow!("go mod tidy failed");
+
+    let disclosed = disclose_prior_commit(err, "abc1234", "the VENDORING.md version-note commit");
+
+    let message = format!("{disclosed:#}");
+    assert!(message.contains("abc1234"), "the commit sha should be named: {message}");
+    assert!(
+        message.contains("git reset --hard abc1234~1"),
+        "the recovery command should be exact: {message}"
+    );
+    assert!(
+        message.contains("the VENDORING.md version-note commit"),
+        "the caller-supplied description should be included: {message}"
+    );
+    assert!(
+        message.contains("go mod tidy failed"),
+        "the original error must survive: {message}"
     );
 }

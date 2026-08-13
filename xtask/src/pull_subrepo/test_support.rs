@@ -1,6 +1,6 @@
 //! Shared test fixture infrastructure for `pull_subrepo`'s test suite,
-//! used by both `pull_subrepo_tests.rs` (Task 3's clean-pull/stale-parent
-//! concern) and `pull_subrepo/conflict_tests.rs` (conflict-handling).
+//! used by both `pull_subrepo_tests.rs` (clean-pull/stale-parent) and
+//! `pull_subrepo/conflict_tests.rs` (conflict-handling).
 
 use std::path::{Path, PathBuf};
 use std::process::Command;

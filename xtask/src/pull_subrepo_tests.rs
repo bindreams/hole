@@ -192,10 +192,12 @@ fn untracked_file_inside_subdir_colliding_with_upstream_is_rejected_before_touch
     );
 }
 #[skuld::test]
-fn leading_dot_slash_and_double_slash_subdir_normalize_and_pull_cleanly() {
-    // normalize_subdir strips a leading `./`, a trailing `/` (covered by
-    // trailing_slash_subdir_still_pulls_cleanly above), AND collapses
-    // repeated `/` — this test covers the other two forms.
+fn leading_dot_slash_subdir_normalizes_and_pulls_cleanly() {
+    // normalize_subdir also strips a trailing `/` (covered by
+    // trailing_slash_subdir_still_pulls_cleanly above) and collapses
+    // repeated `/` — the fixture's subrepo is a single path component
+    // ("vendor"), with no natural multi-component path to exercise that
+    // collapse against, so this test covers only the leading `./` form.
     let fx = Fixture::build(ConflictKind::None);
     let outcome = pull_subrepo::run(&fx.downstream, "./vendor", "v2").expect("a leading ./ must not be rejected");
     assert!(matches!(outcome, Outcome::Clean));

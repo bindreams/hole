@@ -2,7 +2,7 @@
 //! documented-safe allowlist (go.mod/go.sum/.github/workflows/*), leaves
 //! everything else as real conflict markers for a human, and the
 //! CI-only "commit anyway despite conflicts" policy. Split out from
-//! `pull_subrepo.rs`, which keeps Task 3's clean-pull/stale-parent-fixup
+//! `pull_subrepo.rs`, which keeps the clean-pull/stale-parent-fixup
 //! concern and the shared `Outcome`/`run` entry point.
 
 use std::path::{Path, PathBuf};

@@ -22,6 +22,7 @@ pub mod ci_timeouts;
 #[cfg(target_os = "macos")]
 pub mod dmg_background;
 pub mod ex_ray;
+pub mod finish_vendor_bump;
 pub mod galoshes;
 pub mod gen_ui_constants;
 pub mod git_util;
@@ -56,6 +57,9 @@ mod ci_timeouts_tests;
 #[cfg(all(test, target_os = "macos"))]
 #[path = "dmg_background_tests.rs"]
 mod dmg_background_tests;
+#[cfg(test)]
+#[path = "finish_vendor_bump_tests.rs"]
+mod finish_vendor_bump_tests;
 #[cfg(test)]
 #[path = "galoshes_tests.rs"]
 mod galoshes_tests;
@@ -175,6 +179,25 @@ pub enum Command {
         path: String,
         /// Upstream tag that was being pulled — same value passed to the
         /// `pull-subrepo` invocation that conflicted.
+        tag: String,
+    },
+    /// Finish a vendor bump after `pull-subrepo` succeeds: update the
+    /// VENDORING.md version note, bump + `go mod tidy` the outer module,
+    /// run the identity build/test check, and commit each step's own
+    /// changes — regardless of whether the identity check passed, so the
+    /// failure isn't silently swallowed. Exit code distinguishes the two
+    /// failure shapes a caller must handle differently: 2 means every
+    /// commit landed but the identity check itself failed (mirrors
+    /// `pull-subrepo`'s exit-2 convention for "conflicted, worktree left
+    /// for resolution"); any earlier failure (e.g. a malformed go.mod,
+    /// `go mod tidy` itself failing) propagates as the normal exit 1.
+    FinishVendorBump {
+        /// Path to the vendored dep's directory, relative to the repo root
+        /// (e.g. `crates/ex-ray/third_party/v2ray-core`).
+        path: String,
+        /// The dependency's VENDORING.md heading name (e.g. `v2ray-core`).
+        dep_name: String,
+        /// Upstream tag just pulled (e.g. `v5.53.0`).
         tag: String,
     },
     /// Run all `cargo xtask <step>` commands required for a runnable build.
@@ -327,6 +350,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
         Command::ForceCommitConflictedSubrepo { path, tag } => {
             pull_subrepo::force_commit_conflicted(&repo_root()?, &path, &tag)
         }
+        Command::FinishVendorBump { path, dep_name, tag } => run_finish_vendor_bump(path, dep_name, tag),
         Command::Deps => run_deps(),
         Command::Version { group, check, exact } => run_version(group, check, exact),
         Command::Build { target, all } => run_build(target, all),
@@ -470,6 +494,24 @@ pub fn run_pull_subrepo(path: String, tag: String) -> Result<()> {
             // as exit 1 via the `?` above) — vendor-bump.yaml branches
             // on this instead of misapplying conflict-recovery to e.g.
             // a dirty-tree rejection or a missing git-subrepo install.
+            std::process::exit(2);
+        }
+    }
+}
+
+pub fn run_finish_vendor_bump(path: String, dep_name: String, tag: String) -> Result<()> {
+    let repo_root = repo_root()?;
+    match finish_vendor_bump::run(&repo_root, &path, &dep_name, &tag)? {
+        finish_vendor_bump::IdentityCheckOutcome::Passed => {
+            println!("xtask: finished vendoring {dep_name} {tag}, identity checks passed");
+            Ok(())
+        }
+        finish_vendor_bump::IdentityCheckOutcome::Failed { detail } => {
+            eprintln!("xtask: identity checks failed after committing the vendor bump for {dep_name} {tag}:\n{detail}");
+            // Exit code 2 means every commit landed but the identity check
+            // itself failed — distinguishable from any earlier failure
+            // (propagates as exit 1 via the `?` above), mirroring
+            // `run_pull_subrepo`'s exit-2 convention.
             std::process::exit(2);
         }
     }
