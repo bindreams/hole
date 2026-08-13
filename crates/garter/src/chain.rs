@@ -220,7 +220,10 @@ impl ChainRunner {
     /// collects the N per-plugin results into one chain-level outcome.
     ///
     /// If shutdown fires before every plugin has readied, `tx` is dropped
-    /// and the receiver gets `RecvError`.
+    /// and the receiver gets `RecvError` — unless the plugin currently being
+    /// awaited had already delivered a `StartError`, which is reported rather
+    /// than discarded. A `StartError` sitting in a LATER plugin's channel is
+    /// still discarded (bindreams/hole#794).
     pub fn on_ready(mut self, tx: oneshot::Sender<Result<ChainReady, StartError>>) -> Self {
         self.ready_tx = Some(tx);
         self
@@ -373,7 +376,7 @@ impl ChainRunner {
 /// position-0 plugin's reported `listen` is the chain's public address in
 /// Client mode; in Server mode it is position N-1. The chain's transports
 /// are the intersection across all hops.
-async fn run_readiness_aggregator(
+pub(crate) async fn run_readiness_aggregator(
     ready_rxs: Vec<(usize, oneshot::Receiver<Result<PluginReady, StartError>>)>,
     n: usize,
     mode: Mode,
@@ -389,15 +392,22 @@ async fn run_readiness_aggregator(
         Mode::Client => 0,
         Mode::Server => n - 1,
     };
-    for (i, rrx) in ready_rxs {
+    for (i, mut rrx) in ready_rxs {
         let outcome = tokio::select! {
             biased;
-            () = shutdown.cancelled() => {
-                // Shutdown before all plugins readied → drop ready_tx; the
-                // receiver gets RecvError.
-                return;
-            }
-            r = rrx => r,
+            () = shutdown.cancelled() => match rrx.try_recv() {
+                // A plugin that reports a failure and exits cancels `shutdown`
+                // itself (`record_exit` cancels on every plugin exit), so this
+                // arm can win the race against a typed error already sitting
+                // in the channel. The error stands whoever cancelled.
+                Ok(Err(start_err)) => Ok(Err(start_err)),
+                // Anything else returns as before. A delivered `Ok(PluginReady)`
+                // is NOT rescued: `shutdown` is chain-wide and may have been
+                // cancelled by another plugin's exit or an external cancel, so
+                // nothing here shows the chain is still viable.
+                _ => return,
+            },
+            r = &mut rrx => r,
         };
         match outcome {
             Ok(Ok(pr)) => {
