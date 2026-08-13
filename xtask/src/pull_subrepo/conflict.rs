@@ -189,19 +189,7 @@ pub(super) fn handle_conflict(
             worktree.display()
         )
     };
-    let status = Command::new("git")
-        .args(["commit", "--no-edit"])
-        .current_dir(&worktree)
-        .env("PREK_ALLOW_NO_CONFIG", "1")
-        .status()
-        .with_context(already_staged_note)?;
-    if !status.success() {
-        bail!(
-            "git commit failed in the subrepo temp worktree {}: {}",
-            worktree.display(),
-            already_staged_note()
-        );
-    }
+    commit_in_worktree(&worktree, &["commit", "--no-edit"], already_staged_note)?;
 
     finish_conflict_fold_in(repo_root, subdir, tag)?;
     Ok(Outcome::Clean)
@@ -340,23 +328,8 @@ pub fn force_commit_conflicted(repo_root: &Path, subdir: &str, tag: &str) -> Res
             worktree.display()
         )
     };
-    let status = Command::new("git")
-        .args([
-            "commit",
-            "-m",
-            &format!("vendor: conflicted pull of {subdir} {tag} — needs manual resolution"),
-        ])
-        .current_dir(&worktree)
-        .env("PREK_ALLOW_NO_CONFIG", "1")
-        .status()
-        .with_context(already_staged_note)?;
-    if !status.success() {
-        bail!(
-            "git commit failed in the subrepo temp worktree {}: {}",
-            worktree.display(),
-            already_staged_note()
-        );
-    }
+    let message = format!("vendor: conflicted pull of {subdir} {tag} — needs manual resolution");
+    commit_in_worktree(&worktree, &["commit", "-m", &message], already_staged_note)?;
     finish_conflict_fold_in(repo_root, subdir, tag)
 }
 
@@ -388,6 +361,39 @@ fn finish_conflict_fold_in(repo_root: &Path, subdir: &str, tag: &str) -> Result<
              happened"
         )
     })?;
+    Ok(())
+}
+
+/// Runs `git <args>` (a commit, in practice) in `worktree` with
+/// `PREK_ALLOW_NO_CONFIG=1` — this temp worktree is a standalone checkout
+/// of just the subrepo content, with no prek.toml of its own, so the flag
+/// (not `--no-verify`) is what lets a hookless environment through while
+/// still running any hooks that do exist. Shared by `handle_conflict`'s
+/// allowlist-resolved-clean commit and `force_commit_conflicted`'s
+/// literal-conflict-markers commit so the two stay on one tested
+/// disclosure path instead of two copies silently drifting apart. On
+/// failure, the error carries git's own stdout+stderr (`run_git`'s own
+/// pattern in `git_util.rs`, for the same reason: some git commands,
+/// notably `commit`, report the real failure reason on stdout, not
+/// stderr) alongside `already_staged_note`'s call-site-specific context
+/// that the target content is already staged and only the commit itself
+/// needs retrying.
+fn commit_in_worktree(worktree: &Path, args: &[&str], already_staged_note: impl Fn() -> String) -> Result<()> {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(worktree)
+        .env("PREK_ALLOW_NO_CONFIG", "1")
+        .output()
+        .with_context(&already_staged_note)?;
+    if !output.status.success() {
+        bail!(
+            "git commit failed in the subrepo temp worktree {}:\nstdout:\n{}\nstderr:\n{}\n\n{}",
+            worktree.display(),
+            String::from_utf8_lossy(&output.stdout).trim(),
+            String::from_utf8_lossy(&output.stderr).trim(),
+            already_staged_note()
+        );
+    }
     Ok(())
 }
 
