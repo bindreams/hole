@@ -125,7 +125,13 @@ set:
   never receives events.
 
 - Repository permissions: `Contents` → `Read and write`, `Pull requests` →
-  `Read and write`. Leave everything else at "No access".
+  `Read and write`, `Checks` → `Read and write` (both `vendor-bump.yaml`
+  jobs mint this App's token to create/query the `vendor-bump-ready`
+  check-run — Task 8's implementation found this missing from an earlier
+  draft of this list; without it, the check-run POST 403s on the first
+  real run and the whole readiness-signaling mechanism, including both
+  auto-merge arming paths, is silently dead). Leave everything else at "No
+  access".
 
 - "Where can this GitHub App be installed?": **Any account** (so it can be
   installed on other repos later without recreating it).
