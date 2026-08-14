@@ -968,3 +968,91 @@ async fn plugin_panic_surfaces_as_chain_error() {
         other => panic!("expected Chain(\"...panicked...\") error, got {other:?}"),
     }
 }
+
+use crate::chain::run_readiness_aggregator;
+
+/// `BindConflict` is the only retryable class, so discarding one that the
+/// plugin already delivered turns a transient port collision into a hard
+/// start failure.
+#[skuld::test]
+async fn aggregator_reports_a_start_error_delivered_before_shutdown_won_the_race() {
+    let (tx0, rx0) = oneshot::channel();
+    let (ready_tx, ready_rx) = oneshot::channel();
+    let shutdown = CancellationToken::new();
+
+    tx0.send(Err(StartError::BindConflict {
+        errno: 98,
+        addr: "127.0.0.1:1080".parse().unwrap(),
+    }))
+    .unwrap();
+    shutdown.cancel();
+
+    run_readiness_aggregator(vec![(0, rx0)], 1, crate::chain::Mode::Client, shutdown, ready_tx).await;
+
+    match ready_rx
+        .await
+        .expect("a delivered StartError must be reported, not discarded")
+    {
+        Err(StartError::BindConflict { errno, .. }) => assert_eq!(errno, 98),
+        other => panic!("expected the delivered BindConflict, got {other:?}"),
+    }
+}
+
+/// A delivered `Ok(PluginReady)` must NOT be rescued (see the shutdown
+/// arm's comment for why).
+#[skuld::test]
+async fn aggregator_never_reports_ready_once_shutdown_won_the_race() {
+    let (tx0, rx0) = oneshot::channel();
+    let (ready_tx, ready_rx) = oneshot::channel();
+    let shutdown = CancellationToken::new();
+
+    tx0.send(Ok(PluginReady {
+        listen: "127.0.0.1:1080".parse().unwrap(),
+        transports: Transports::TCP,
+    }))
+    .unwrap();
+    shutdown.cancel();
+
+    run_readiness_aggregator(vec![(0, rx0)], 1, crate::chain::Mode::Client, shutdown, ready_tx).await;
+
+    assert!(
+        ready_rx.await.is_err(),
+        "a chain whose plugin already exited must never be reported ready"
+    );
+}
+
+/// Shutdown preempting a plugin that delivered nothing: `ready_tx` is still
+/// dropped. Covers `TryRecvError::Empty` — the sender is alive but unused.
+#[skuld::test]
+async fn aggregator_drops_ready_tx_when_shutdown_preempts_an_empty_receiver() {
+    let (tx0, rx0) = oneshot::channel::<Result<PluginReady, StartError>>();
+    let (ready_tx, ready_rx) = oneshot::channel();
+    let shutdown = CancellationToken::new();
+
+    shutdown.cancel();
+
+    run_readiness_aggregator(vec![(0, rx0)], 1, crate::chain::Mode::Client, shutdown, ready_tx).await;
+
+    assert!(ready_rx.await.is_err(), "nothing delivered must still drop ready_tx");
+    drop(tx0);
+}
+
+/// Covers `TryRecvError::Closed` — the sender was dropped unsent BEFORE the
+/// arm runs. Distinct from the empty case above, and pinned so a later PR
+/// that gives `Closed` its own meaning has to do so deliberately.
+#[skuld::test]
+async fn aggregator_drops_ready_tx_when_shutdown_preempts_a_closed_receiver() {
+    let (tx0, rx0) = oneshot::channel::<Result<PluginReady, StartError>>();
+    let (ready_tx, ready_rx) = oneshot::channel();
+    let shutdown = CancellationToken::new();
+
+    drop(tx0);
+    shutdown.cancel();
+
+    run_readiness_aggregator(vec![(0, rx0)], 1, crate::chain::Mode::Client, shutdown, ready_tx).await;
+
+    assert!(
+        ready_rx.await.is_err(),
+        "a sender dropped unsent must not become a synthesized Fatal in this arm"
+    );
+}
