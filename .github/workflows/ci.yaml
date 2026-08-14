@@ -224,6 +224,12 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      - name: Install git-subrepo 0.4.9
+        shell: bash
+        run: |
+          git clone --branch 0.4.9 --depth 1 https://github.com/ingydotnet/git-subrepo "$RUNNER_TEMP/git-subrepo"
+          echo "$RUNNER_TEMP/git-subrepo/lib" >> "$GITHUB_PATH"
+
       - name: Install nextest (pre-built binary)
         uses: taiki-e/install-action@v2
         with:
