@@ -1845,21 +1845,11 @@ ______________________________________________________________________
 
 **Status: implementation already landed, needs its `packageRules` entry
 flipped, not removed.** The `customManager` below is already shipped and
-correct — nothing to redo. The automerge-override entry that originally
-shipped alongside it (`"automerge": false`, a carve-out from the file's
-unscoped major-updates rule) needs to become the *opposite*: an
-unconditional `"automerge": true` for these files, not scoped to major
-updates. Neither a bare revert (delete the entry, fall back to the
-existing major-only rule) nor the original carve-out is correct — the
-file's unscoped major-updates rule only fires for major semver bumps, and
-neither existing `.gitrepo` naturally produces those often (v2ray-core's
-actual next tag, `v5.53.0`, is a *minor* bump from `v5.52.0`), and no
-other existing `packageRules` entry matches the `.gitrepo` customManager
-either (they're all scoped via `matchManagers` to specific ecosystems,
-none of which is the custom regex manager `.gitrepo` files use). Without
-an unconditional rule, ordinary minor/patch vendor bumps — the common
-case — would never get auto-merge armed at all, silently defeating the
-plan's own goal.
+correct — nothing to redo. Flip the automerge-override entry from the
+original carve-out (`"automerge": false`) to an unconditional
+`"automerge": true` for these files. A bare revert (deleting the entry,
+falling back to the file's existing major-only rule) is also wrong — see
+Global Constraints for why an unconditional rule is required.
 
 **Files:**
 
@@ -1879,7 +1869,7 @@ Find the entry this task originally added (`"matchFileNames": ["crates/ex-ray/th
 
 ```json
     {
-      "description": "Vendored git-subrepo deps (v2ray-core, utls): auto-merge armed for every update type, the same way this file already arms it per-manager for other dependency groups — the file's unscoped major-only rule above doesn't reach these (they're a custom regex manager, and a routine bump is typically minor/patch, not major). Safety is entirely the required checks' job (Test ex-ray (Go), and check-vendoring-integrity riding inside Lint), not this rule.",
+      "description": "Vendored git-subrepo deps (v2ray-core, utls): auto-merge armed for every update type — the file's unscoped major-only rule above doesn't reach these (they're a custom regex manager, and a routine bump is typically minor/patch, not major). Safety is entirely the required checks' job (Test ex-ray (Go), and check-vendoring-integrity riding inside Lint), not this rule.",
       "matchFileNames": ["crates/ex-ray/third_party/*/.gitrepo"],
       "automerge": true
     }
@@ -2175,6 +2165,12 @@ jobs:
           EOF
           )"
 
+      - name: Fail the job if the pull conflicted
+        if: steps.pull.outputs.result == 'conflicted'
+        run: |
+          echo "::error::a real merge conflict landed outside the auto-resolved allowlist — the conflicted tree was committed and pushed for a human to resolve (see the PR comment, if a PR exists). Failing this job's own status so a workflow_dispatch run (which has no PR to comment on) still surfaces this, not just push-triggered runs."
+          exit 1
+
       - name: Fail the job if Finish failed
         if: steps.finish.outcome == 'failure'
         run: |
@@ -2416,7 +2412,16 @@ PR attached.)
 
 Watch via `gh run watch`. Expected: the Pull step's `result` output is
 `clean` (git-subrepo's own already-up-to-date short-circuit) and the job
-finishes without pushing a new commit.
+finishes without pushing a new commit. This short-circuit is **not** a gap
+in `check-vendoring-integrity`'s coverage of the real automated flow: it
+only fires when git-subrepo resolves the requested tag to the exact SHA
+already recorded in `.gitrepo`'s `commit =` field — and Renovate's
+customManager only ever rewrites `branch =` (its `matchStrings` doesn't
+even capture `commit =`), so a genuine Renovate bump always leaves
+`commit =` stale relative to the newly-requested tag, meaning the
+short-circuit cannot fire on a real bump; it only ever fires on a
+same-tag re-run against a tree that's already genuinely, correctly at
+that tag (exactly this dry-run's own deliberate scenario).
 
 - [ ] **Step 5a: `workflow_dispatch` smoke test against a real newer tag**
 
@@ -2427,11 +2432,13 @@ gh workflow run vendor-bump.yaml --repo bindreams/hole -f dep=v2ray-core -f tag=
 This only proves pull → finish → push works end-to-end on a disposable
 scratch branch — `workflow_dispatch` runs push to a
 `vendor-bump-manual/...` branch that never matches `push:`'s
-`branches: ["renovate/**"]` filter, so no second `push` event, no PR, and
-no Renovate involvement happens here. It cannot exercise the self-retrigger
-guard (nothing to retrigger against) or auto-merge (no PR to arm). Confirm
-only: the job succeeds, a new commit lands on the scratch branch, and
-`ci.yaml` runs against it for real.
+`branches: ["renovate/**"]` filter, so no second `push` event and no PR
+happens here, and — per `ci.yaml`'s actual triggers (`push: branches: [main]`, `pull_request`, `workflow_dispatch`) — **no CI run happens on
+this scratch branch either**; neither trigger matches it. It cannot
+exercise the self-retrigger guard, `ci.yaml`, or auto-merge. Confirm only:
+the job succeeds and a new commit lands on the scratch branch (`git log`
+against it, or the job's own logs) — Step 5b below is what actually
+watches CI and auto-merge.
 
 - [ ] **Step 5b: Confirm a real Renovate PR reaches auto-merge or a correctly-red PR, does NOT self-retrigger, and does NOT merge prematurely**
 
@@ -2484,18 +2491,38 @@ live-workflow coverage yet.
 
 **Known residual gap, not addressed by this plan — surface to the user,
 don't decide silently:** `check-vendoring-integrity`'s conflict detection
-(Task 13) is marker-text-only. A delete/modify conflict (upstream deletes
-a file our patch modifies, or vice versa) produces **no marker text at
-all** — `force_commit_conflicted`'s `git add -A` simply stages whatever's
-on disk (either a silently-resurrected upstream deletion, or a
-silently-dropped local patch), which can pass every required check
-(no markers, `VENDORING.md`/`go.mod` consistent, code still compiles) and
-auto-merge cleanly despite being a botched resolution. Closing this
-requires touching Task 4's already-shipped `force_commit_conflicted` (e.g.
-a sentinel file marking "force-committed with unresolved paths," checked
-by Task 13) — out of this revision's declared scope, not fixed here. Watch
-for it if Step 6's forced conflict happens to land on a delete/modify
-shape rather than a content conflict; file a tracking issue either way.
+(Task 13) is marker-text-only, and git cannot write marker text for every
+conflict shape — a **delete/modify conflict** (upstream deletes a file our
+patch modifies, or vice versa) or a **binary-content conflict** (git
+cannot three-way-merge a binary blob at all; it leaves "ours" on disk
+verbatim, unmerged, with zero markers — the real vendored trees already
+carry tracked binaries today, e.g. `utls/logo.png` and its
+`testdata/Client-TLSv1*` transcripts, upstream-regenerated on essentially
+every `utls` release) both produce **no marker text at all**.
+
+This is *not* exploitable on the automated `force_commit_conflicted` path
+itself: that path never runs `finish-vendor-bump` (gated on
+`steps.pull.outputs.result == 'clean'`), so `VENDORING.md`/`go.mod` stay
+at the *old* version while `force_commit_conflicted`'s own
+`ensure_tag_pin_matches` call has already bumped `.gitrepo`'s `branch` to
+the *new* one — check 2/3's mismatch fires unconditionally, `Lint` stays
+red, regardless of whether markers exist. The real exposure is the
+**human hand-resolution path** this same file's instructions (and Task
+11's) prescribe: a human checks out the PR, resolves the conflict
+themselves — silently reproducing the same delete/modify or binary
+mis-resolution git's own working tree gave no error for — then runs
+`cargo xtask finish-vendor-bump` themselves as instructed, which updates
+`VENDORING.md`/`go.mod` to match and makes every check pass. Auto-merge
+is already armed on the PR (Renovate armed it at PR-creation time and it
+was never disarmed), so it fires on the push, merging the botched
+resolution with nothing having caught it.
+
+Closing this requires touching Task 4's already-shipped
+`force_commit_conflicted` (e.g. a sentinel file listing every unresolved
+path, written as part of the same commit; `finish-vendor-bump` refuses to
+clear it unless each listed path was actually touched, and Task 13 reports
+the sentinel's mere presence as a violation) — out of this revision's
+declared scope, not fixed here. File a tracking issue.
 
 - [ ] **Step 7: File a tracking issue for `wix-hash-fixup.yaml`'s verification**
 
@@ -2546,26 +2573,30 @@ discovery — do not hardcode `v2ray-core`/`utls` by name, matching
 same reason: a third vendored dep must not need this file edited too):
 
 1. **No merge-conflict markers.** For every file `git ls-files` reports as
-   tracked under that dependency's directory, check for the three
-   standard conflict-marker lines (`<<<<<<< `, `=======`, `>>>>>>> ` — the
-   exact prefixes `git merge`/`git subrepo` write) at the start of a line.
-   Report the file path and line number for every match found — don't
-   stop at the first one, a conflicted pull can produce many. This is the
-   one check that must see `force_commit_conflicted`'s literal
-   marker-laden commits (the CI-only "commit despite conflicts" policy)
-   as well as an ordinary unresolved conflict — both produce the same
-   marker text. **Read each file as bytes (`std::fs::read`), not as a
-   UTF-8 `String` (`std::fs::read_to_string`), and scan for the marker
-   prefixes as byte sequences.** The real vendored trees already carry
-   tracked binary files today (`crates/ex-ray/third_party/utls/logo.png`,
-   `logo_small.png`, and several `testdata/Client-TLSv1*` raw TLS
-   transcripts) — a UTF-8 read hard-errors on their content, and since
-   this hook is `always_run` inside the already-required `Lint` job, that
-   error would fail every PR in the repo, not just vendor-bump ones. A
-   binary file cannot carry a text merge-conflict marker, so skip a file
-   only if it fails to decode as UTF-8 at all *after* the byte-level
-   marker scan finds nothing — never fail the check itself on decode
-   errors.
+   tracked under that dependency's directory, check for a `<<<<<<< ` line
+   (that exact 8-byte prefix, the one marker git never writes standalone)
+   at the start of a line; only within a file where that's present, also
+   check for a line that is *exactly* `=======` (the whole line, not a
+   prefix — a bare `>=7`-equals-sign line is a plausible legitimate
+   divider, e.g. a Markdown setext underline or a doc/testdata banner
+   rule, and would false-positive-block the required `Lint` job on every
+   PR in the repo if matched as a prefix) and a `>>>>>>> ` line. Report the
+   file path and line number for every match found — don't stop at the
+   first one, a conflicted pull can produce many, and a single file can
+   contain more than one marker occurrence. This is the one check that
+   must see `force_commit_conflicted`'s literal marker-laden commits (the
+   CI-only "commit despite conflicts" policy) as well as an ordinary
+   unresolved conflict — both produce the same marker text. **Read each
+   file as bytes (`std::fs::read`), not as a UTF-8 `String`
+   (`std::fs::read_to_string`), and scan for the marker byte sequences
+   directly.** The real vendored trees already carry tracked binary files
+   today (`crates/ex-ray/third_party/utls/logo.png`, `logo_small.png`,
+   and several `testdata/Client-TLSv1*` raw TLS transcripts) — a UTF-8
+   read hard-errors on their content, and since this hook is `always_run`
+   inside the already-required `Lint` job, that error would fail every PR
+   in the repo, not just vendor-bump ones. A binary file cannot carry a
+   text merge-conflict marker, so never fail the check itself on a decode
+   error — a byte-level scan finding nothing is simply nothing to report.
 1. **`VENDORING.md`'s noted version matches `.gitrepo`'s `branch`, and a
    discovered dep with no heading at all is itself a violation.** Parse
    `crates/ex-ray/third_party/VENDORING.md`'s heading for this dep (same
@@ -2630,6 +2661,26 @@ against it for real, not a mock):
   `third_party/`) → empty violation list, no error (this check is
   `always_run` in `prek`, so it executes on every commit in every repo
   state, including hypothetically none).
+
+- A single dep with two independent, simultaneous violations (e.g. a
+  conflict marker *and* a `VENDORING.md`/`.gitrepo` mismatch) → both
+  appear in the returned `Vec`, not just the first one found — proves
+  `run()` accumulates rather than short-circuits on the first violation.
+
+- A single tracked file with two separate conflict-marker occurrences
+  (two `<<<<<<<`/`=======`/`>>>>>>>` triples at different line numbers) →
+  both are reported with their own, distinct line numbers.
+
+- A tracked, UTF-8 file containing the literal substring `<<<<<<< ` (or
+  `=======`/`>>>>>>> `) *not* at the start of a line (e.g. embedded
+  mid-line in a comment or string, plausible in tooling-adjacent vendored
+  content) → NOT reported. Proves the check matches at line-start, not
+  via a substring search.
+
+- A tracked file containing a standalone `=======`-style divider (7+
+  equals signs) with no accompanying `<<<<<<< `/`>>>>>>> ` lines anywhere
+  in the same file (e.g. a Markdown setext heading underline) → NOT
+  reported. Proves the equals-line alone isn't sufficient to flag a file.
 
 - [ ] **Step 1: Write the failing tests**, following the scenarios above.
 

@@ -473,7 +473,7 @@ fn run_fails_with_a_clear_message_when_the_vendored_go_mod_has_no_module_line() 
 }
 
 /// `dep_name` and `subdir` are two independent arguments only because
-/// Task 8's workflow (and a human running this by hand) always computes
+/// `vendor-bump.yaml` (and a human running this by hand) always computes
 /// both from the same `<name>` — a copy-paste mismatch between them (e.g.
 /// `finish-vendor-bump crates/ex-ray/third_party/utls v2ray-core v1.9.0`)
 /// must be refused before anything is written, not silently accepted as
