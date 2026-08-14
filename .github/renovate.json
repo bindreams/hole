@@ -29,6 +29,14 @@
       "matchStrings": [
         "# renovate: datasource=(?<datasource>\\S+) depName=(?<depName>\\S+)\\s+additional_dependencies\\s*=\\s*\\[\"[^\"=]+==(?<currentValue>[^\"]+)\"\\]"
       ]
+    },
+    {
+      "customType": "regex",
+      "managerFilePatterns": ["/^crates/ex-ray/third_party/.+/\\.gitrepo$/"],
+      "matchStrings": [
+        "remote\\s*=\\s*https://github\\.com/(?<packageName>[^/\\s]+/[^/\\s]+)\\n\\tbranch\\s*=\\s*(?<currentValue>\\S+)"
+      ],
+      "datasourceTemplate": "github-tags"
     }
   ],
   "packageRules": [
@@ -92,6 +100,11 @@
       "description": "Tauri ships each plugin as an npm/crate pair and `npx tauri build` refuses a major.minor mismatch (#679). The npm and cargo managers are grouped separately above, so without this a bump on one side lands alone and breaks the DMG bundle. Last rule wins, so this overrides those groups for these packages.",
       "matchPackageNames": ["@tauri-apps/**", "tauri", "tauri-build", "tauri-plugin-**"],
       "groupName": "Tauri"
+    },
+    {
+      "description": "Vendored git-subrepo deps (v2ray-core, utls): vendor-bump.yaml is the sole automerge-arming mechanism (see .github/workflows/vendor-bump.yaml), never Renovate itself — arming at PR-creation time races the actual pull/rebase work, since CI trivially passes on Renovate's content-unchanged branch-only commit. This explicitly overrides the file's existing unscoped 'Major updates' automerge:true rule above.",
+      "matchFileNames": ["crates/ex-ray/third_party/*/.gitrepo"],
+      "automerge": false
     }
   ]
 }
