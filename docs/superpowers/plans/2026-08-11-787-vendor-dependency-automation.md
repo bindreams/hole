@@ -159,7 +159,7 @@ ______________________________________________________________________
 | `xtask/src/finish_vendor_bump_tests.rs`         | Tests for the above, including the full `run()` sequence end-to-end and a failing identity check.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
 | `xtask/src/lib.rs`                              | Modify: three new `Command` variants + dispatch wrappers + module/test-module declarations.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
 | `xtask/src/check_vendoring_integrity.rs`        | New: walks each `crates/ex-ray/third_party/<dep>/` directory that has a `.gitrepo` (dynamic discovery, no hardcoded dep list), checking for merge-conflict markers in any git-tracked file and cross-checking `VENDORING.md`'s noted version + the outer `go.mod`'s require line (if present) against `.gitrepo`'s `branch` field. Reuses `pull_subrepo::gitrepo_field` and the `go mod edit -json` invocation shape from `pull_subrepo::conflict::go_mod_replace_directives` (adapted for `Require`, not `Replace`) rather than duplicating either.                                                                                                                                                                                                                                                                                                                                                                                                                                 |
-| `xtask/src/check_vendoring_integrity_tests.rs`  | Fixture-repo tests for the above: a clean tree, a tree with conflict markers, a `VENDORING.md`/`.gitrepo` mismatch, a `go.mod`/`.gitrepo` mismatch, a dep with no `go.mod` require line at all (`utls`-shaped).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| `xtask/src/check_vendoring_integrity_tests.rs`  | Fixture-repo tests for the above: a clean tree, a tree with conflict markers (including a realistic triple with real hunk content, and one exercising the real pre-commit hook end-to-end), a `VENDORING.md`/`.gitrepo` mismatch, a `go.mod`/`.gitrepo` mismatch (both `// indirect`, the real `utls` shape, and a synthetic no-require-line dep).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
 | `.github/renovate.json`                         | Modify: `customManager` tracking each `.gitrepo`'s `branch` line (capturing `owner/repo`, not a full URL; no `extractVersionTemplate`). `packageRules` entry arming automerge unconditionally (every update type, not just the file's existing major-only rule) for these files — arming parity with the file's other per-manager automerge rules, not vendor-specific gating.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
 | `prek.toml`                                     | Modify: new local hook running `cargo xtask check-vendoring-integrity`, `always_run = true` + `pass_filenames = false` (matching `check-workspace-lints`'s existing pattern) so it's unaffected by the file's top-level `third_party` exclude.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
 | `.github/actions/mint-nathan-token/action.yaml` | Composite action minting a `nathan-blahaj` installation token from App ID + private key inputs. Shared by both workflows below.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
@@ -2174,19 +2174,11 @@ jobs:
         run: cargo xtask force-commit-conflicted-subrepo "${{ steps.target.outputs.path }}" "${{ steps.target.outputs.tag }}"
 
       - name: Push
-        id: push
         if: steps.pull.outputs.result == 'clean' || steps.pull.outputs.result == 'conflicted'
         run: git push origin "HEAD:${{ steps.scratch-branch.outputs.ref_name || github.ref_name }}"
 
-      # `steps.push.outcome == 'success'` on every step below: a custom
-      # `if:` on a step is NOT implicitly ANDed with the previous step's
-      # own success — once a step has its own condition, it runs
-      # regardless of an earlier failure unless that condition itself
-      # checks it. Without this, a rejected Push (a real Renovate
-      # force-push mid-run) would still let these steps claim the
-      # conflicted tree "was committed and pushed", which is false.
       - name: Find the PR for this branch
-        if: github.event_name == 'push' && steps.pull.outputs.result == 'conflicted' && steps.push.outcome == 'success'
+        if: github.event_name == 'push' && steps.pull.outputs.result == 'conflicted'
         id: find-pr
         env:
           GH_TOKEN: ${{ steps.nathan.outputs.token }}
@@ -2195,34 +2187,29 @@ jobs:
           echo "pr_number=$pr_number" >> "$GITHUB_OUTPUT"
 
       - name: Comment on the PR if conflicted
-        if: steps.pull.outputs.result == 'conflicted' && steps.push.outcome == 'success' && steps.find-pr.outputs.pr_number != ''
+        if: steps.pull.outputs.result == 'conflicted' && steps.find-pr.outputs.pr_number != ''
         env:
           GH_TOKEN: ${{ steps.nathan.outputs.token }}
         run: |
           gh pr comment "${{ steps.find-pr.outputs.pr_number }}" --repo "${{ github.repository }}" --body "$(cat <<EOF
           Automated pull of \`${{ steps.target.outputs.dep }}\` to \`${{ steps.target.outputs.tag }}\` hit a real merge conflict outside the auto-resolved allowlist (go.mod/go.sum/.github/workflows). The conflicted tree is committed on this branch.
 
-          To resolve: check out this PR branch, fix the conflicts, then run \`cargo xtask finish-vendor-bump crates/ex-ray/third_party/${{ steps.target.outputs.dep }} ${{ steps.target.outputs.dep }} ${{ steps.target.outputs.tag }}\` and push a normal commit.
+          To resolve: see crates/ex-ray/third_party/VENDORING.md's "Bumping a pinned version" section, then run \`cargo xtask finish-vendor-bump crates/ex-ray/third_party/${{ steps.target.outputs.dep }} ${{ steps.target.outputs.dep }} ${{ steps.target.outputs.tag }}\` and push a normal commit.
           EOF
           )"
 
-      # Unconditional on event type (not scoped to push/workflow_dispatch)
-      # so a conflicted run's own job status is red on every trigger, not
-      # just push-triggered ones where the PR comment above is a separate
-      # signal. Three distinct messages, since "the conflicted tree was
-      # pushed" is only true in the first two: Push itself may have failed
-      # (a real force-push race, not this conflict), or push-triggered
-      # runs may hit this before Renovate's PR exists yet (its own
-      # push/PR-open are separate operations with no ordering guarantee)
-      # — the recovery instructions go directly into this annotation for
-      # that case too, since the PR comment above never posted.
+      # None of these steps ever run if an earlier one (Push included)
+      # failed: a step's own `if:` is implicitly ANDed with `success()`
+      # unless the condition itself names `always()`/`cancelled()`/
+      # `failure()` (confirmed against GitHub's own docs — none of the
+      # conditions in this job do) — so a rejected Push (a real
+      # force-push race) already fails the job on its own account, with
+      # no separate disposition needed here.
       - name: Fail the job if the pull conflicted
         if: steps.pull.outputs.result == 'conflicted'
         run: |
-          if [[ "${{ steps.push.outcome }}" != "success" ]]; then
-            echo "::error::a real merge conflict landed outside the auto-resolved allowlist, and the push that would have landed the conflicted tree also failed (see the 'Push' step above — likely a Renovate force-push mid-run). Nothing new was committed to this branch; re-run the workflow."
-          elif [[ "${{ github.event_name }}" == "push" && "${{ steps.find-pr.outputs.pr_number }}" == "" ]]; then
-            echo "::error::a real merge conflict landed outside the auto-resolved allowlist — the conflicted tree was committed and pushed, but no open PR was found yet to comment on. To resolve: check out this branch, fix the conflicts, then run \`cargo xtask finish-vendor-bump crates/ex-ray/third_party/${{ steps.target.outputs.dep }} ${{ steps.target.outputs.dep }} ${{ steps.target.outputs.tag }}\` and push a normal commit."
+          if [[ "${{ github.event_name }}" == "push" && "${{ steps.find-pr.outputs.pr_number }}" == "" ]]; then
+            echo "::error::a real merge conflict landed outside the auto-resolved allowlist — the conflicted tree was committed and pushed, but no open PR was found yet to comment on (Renovate's own push and PR-open are separate operations with no ordering guarantee). To resolve: see crates/ex-ray/third_party/VENDORING.md's \"Bumping a pinned version\" section, then run \`cargo xtask finish-vendor-bump crates/ex-ray/third_party/${{ steps.target.outputs.dep }} ${{ steps.target.outputs.dep }} ${{ steps.target.outputs.tag }}\` and push a normal commit."
           else
             echo "::error::a real merge conflict landed outside the auto-resolved allowlist — the conflicted tree was committed and pushed for a human to resolve (see the PR comment)."
           fi
@@ -2416,8 +2403,13 @@ To do it by hand (same tools the automation uses):
    On a real conflict it stops uncommitted, exactly like `git pull`, and
    prints the temp worktree to resolve it in — `cd` there, fix the
    conflicts (`git status` to see them), `git add`, `git commit`, then
-   `git subrepo commit crates/ex-ray/third_party/<name>` from the repo
-   root.
+   from the repo root: `SKIP=check-vendoring-integrity git subrepo commit
+   crates/ex-ray/third_party/<name>` — the `SKIP` is required if you have
+   this repo's git hooks installed (the default): at this exact point
+   `.gitrepo`'s `branch` names the new tag while this file and `go.mod`
+   still name the old one (step 2 fixes that next), which the
+   `check-vendoring-integrity` hook would otherwise correctly, but
+   unhelpfully, reject.
 2. `cargo xtask finish-vendor-bump crates/ex-ray/third_party/<name> <name> <new-tag>`
    — updates this file's version note, bumps the outer `go.mod` require
    line and runs `go mod tidy`, and runs the same identity check
@@ -2518,30 +2510,36 @@ This is the load-bearing property the whole redesign rests on, and the one
 thing Step 5a's `workflow_dispatch` path structurally cannot verify — it
 needs a real `renovate/**`-branch PR with auto-merge actually armed on it.
 Either wait for Renovate's own scheduled run to do all of this itself, or
-force it:
+force it. Observing `Lint` fail on the bare commit needs its own,
+non-racing branch first — `ci.yaml`'s own `Lint` job has
+`cancel-in-progress: ${{ github.event_name == 'pull_request' }}`, so the
+moment `bump`'s own push lands on the *same* branch, any still-running
+`Lint` run for the bare commit is **cancelled**, not left to settle red;
+a cancelled run proves nothing (it looks identical to "never observed"):
 
-1. Push a branch named `renovate/test-<dep>-<tag>` with only the target
-   `.gitrepo`'s `branch =` line changed (mimicking exactly what Renovate's
-   own commit would contain).
-1. `gh pr create` from it immediately (a real PR needs the branch to exist
-   first — do this right away, before `vendor-bump.yaml`'s own `push`
-   trigger, which fires on the same push, has time to finish its
-   multi-minute `bump` job and look for a PR that doesn't exist yet).
+1. Push a branch named `test-<dep>-<tag>` (deliberately **not** matching
+   `renovate/**`, so nothing else pushes to it and races the observation
+   below) with only the target `.gitrepo`'s `branch =` line changed
+   (mimicking exactly what Renovate's own commit would contain).
+1. Wait for `Lint` to settle on this commit and confirm it reports
+   **failure**, with `check-vendoring-integrity` naming both the
+   `VENDORING.md` and `go.mod` mismatches against `.gitrepo`'s
+   already-bumped `branch`. Do NOT expect `Test ex-ray (Go)` to be red
+   here — the vendored Go tree is still byte-identical to `main` at this
+   point, so it correctly passes; `Lint` failing is what's actually
+   holding the merge gate closed.
+1. Rename/push this same commit to a branch actually named
+   `renovate/test-<dep>-<tag>`, then `gh pr create` from it immediately (a
+   real PR needs the branch to exist first — do this right away, before
+   `vendor-bump.yaml`'s own `push` trigger, which fires on the same push,
+   has time to finish its multi-minute `bump` job and look for a PR that
+   doesn't exist yet).
 1. Arm auto-merge yourself, the same way Renovate's `platformAutomerge`
    would: `gh pr merge --auto --squash <PR>`. Neither the branch push nor
    `gh pr create` arms it — this step is what actually puts the design's
    load-bearing property under test.
 
 Watch:
-
-- On this bare, not-yet-pulled commit (before `bump`'s own push lands),
-  wait for `Lint` to settle and confirm it reports **failure**, with
-  `check-vendoring-integrity` naming both the `VENDORING.md` and `go.mod`
-  mismatches against `.gitrepo`'s already-bumped `branch`. Do NOT expect
-  `Test ex-ray (Go)` to be red here — the vendored Go tree is still
-  byte-identical to `main` at this point, so it correctly passes; `Lint`
-  failing is what's actually holding the merge gate closed, and is the
-  only required check verifiable in this narrow window.
 
 - `gh pr view --json autoMergeRequest` confirms auto-merge is armed
   (from your explicit `gh pr merge --auto` above).
@@ -2602,12 +2600,17 @@ is already armed on the PR (Renovate armed it at PR-creation time and it
 was never disarmed), so it fires on the push, merging the botched
 resolution with nothing having caught it.
 
-Closing this requires touching Task 4's already-shipped
+**Open question for you, not decided here:** this is a real, live,
+currently-unpatched gap — an auto-merge-armed PR can land a botched
+delete/modify or binary conflict resolution with no required check
+catching it, on the human hand-resolution path this same plan
+documents. Closing it requires touching Task 4's already-shipped
 `force_commit_conflicted` (e.g. a sentinel file listing every unresolved
 path, written as part of the same commit; `finish-vendor-bump` refuses to
 clear it unless each listed path was actually touched, and Task 13 reports
-the sentinel's mere presence as a violation) — out of this revision's
-declared scope, not fixed here. File a tracking issue.
+the sentinel's mere presence as a violation). Should this be folded into
+this same PR as an additional task, or tracked as a follow-up issue? Don't
+decide silently either way.
 
 - [ ] **Step 7: File a tracking issue for `wix-hash-fixup.yaml`'s verification**
 
@@ -2636,12 +2639,15 @@ can run before or after either.
 - Modify: `xtask/src/lib.rs` (module + test-module declarations, `Command`
   variant, dispatch, wrapper)
 - Modify: `prek.toml` (new local hook)
-- Modify: `xtask/src/git_util.rs` (new env-var-supporting `run_git`
-  variant — see "The `always_run` hazard" below)
+- Modify: `xtask/src/git_util.rs` (new `run_git_with_env` helper)
 - Modify: `xtask/src/pull_subrepo.rs`, `xtask/src/pull_subrepo/conflict.rs`,
-  `xtask/src/finish_vendor_bump.rs` (route their own repo-root commits, and
-  the `git subrepo pull`/`git subrepo commit` subprocess calls, through the
-  new env-var variant — same reason)
+  `xtask/src/finish_vendor_bump.rs` (route their repo-root commits through
+  `run_git_with_env`, and add `.env(...)` directly to `attempt_pull`'s own
+  `Command` — see "The `always_run` hazard" below)
+- Modify: `crates/ex-ray/third_party/VENDORING.md` (Task 11's own text,
+  fixed here since it documents the human recovery path this hazard
+  affects), `.github/workflows/vendor-bump.yaml` (Task 8's PR comment +
+  `::error::` text, same reason)
 
 **The `always_run` hazard — the new hook must not reject `pull-subrepo`'s
 own intermediate commits:** `git subrepo pull` does its own internal
@@ -2668,35 +2674,68 @@ Task 11 documents — and the one Task 12 Step 6 tells a human to use to
 resolve a conflicted PR — would be unusable on a machine with hooks
 installed.
 
-Fix: add an env-var-supporting `run_git` variant to `git_util.rs` (e.g.
-`run_git_with_env(cwd: &Path, args: &[&str], env: &[(&str, &str)]) -> Result<String>`,
-mirroring `run_git`/`run_git_raw`'s existing shape), and route every
-repo-root commit-triggering call through it with `SKIP=check-vendoring-integrity`
-set — this includes `pull_subrepo::attempt_pull`'s own `git subrepo pull`
-invocation (child processes inherit the parent's environment by default,
-so git-subrepo's own internal `git commit` inherits `SKIP` too, matching
-this repo's existing `PREK_ALLOW_NO_CONFIG=1` precedent for a different
-prek/git-hook interaction in `pull_subrepo/conflict.rs`), plus
-`ensure_tag_pin_matches`, `fix_stale_parent`, `finish_conflict_fold_in`'s
-`git subrepo commit`, `force_commit_conflicted`, and
-`finish_vendor_bump::commit_if_staged`. **Verify empirically, don't
-assume**, that `SKIP` is the correct env var for `prek` specifically (it's
-`pre-commit`'s own convention; `prek` is a from-scratch Rust
-reimplementation and may or may not honor the identical variable) — test
-against the actually-installed `prek` binary before writing this into the
-implementation, the same way every other cross-tool behavioral claim in
-this plan was grounded.
+Fix — two distinct call shapes, not one:
+
+- `pull_subrepo::attempt_pull` already builds its own `Command` directly
+  (`Command::new("git").args([...]).current_dir(repo_root).output()`,
+  `xtask/src/pull_subrepo.rs:304-310`) rather than going through
+  `run_git`, specifically because its caller needs the raw `Output`
+  (including a *failed* one) to detect a real conflict or a stale-parent
+  error — `run_git`/`run_git_raw` both `bail!` on a non-zero exit, which
+  would silently break conflict detection if `attempt_pull` were routed
+  through either. Add `.env("SKIP", "check-vendoring-integrity")` (merged
+  with any pre-existing `SKIP` value already in the process environment —
+  a comma-joined union, e.g. `SKIP=<existing>,check-vendoring-integrity` if
+  one is set, so a developer's own unrelated `SKIP` export isn't silently
+  clobbered) directly to `attempt_pull`'s own `Command` chain — no new
+  helper needed for this call site. Child processes inherit the parent's
+  environment by default, so git-subrepo's own internal `git commit`
+  inherits this too — matching this repo's existing
+  `PREK_ALLOW_NO_CONFIG=1` precedent for a different prek/git-hook
+  interaction in `pull_subrepo/conflict.rs`.
+- Every other repo-root commit-triggering call (`ensure_tag_pin_matches`,
+  `fix_stale_parent`, `finish_conflict_fold_in`'s `git subrepo commit`,
+  `force_commit_conflicted`, `finish_vendor_bump::commit_if_staged`)
+  already goes through `run_git`, which expects success and `bail!`s
+  otherwise — for these, add a same-shaped `run_git_with_env(cwd: &Path, args: &[&str], env: &[(&str, &str)]) -> Result<String>` to `git_util.rs`
+  (mirroring `run_git`'s existing bail-on-failure contract, just with
+  extra env vars — including the same pre-existing-`SKIP`-merge handling
+  above), and route these calls through it instead of `run_git`.
+
+**Verify empirically, don't assume**, that `SKIP` is the correct env var
+for `prek` specifically (it's `pre-commit`'s own convention; `prek` is a
+from-scratch Rust reimplementation and may or may not honor the identical
+variable) — test against the actually-installed `prek` binary before
+writing this into the implementation, the same way every other cross-tool
+behavioral claim in this plan was grounded.
+
+**This SKIP routing covers only git invocations xtask itself makes — it
+does not reach the human hand-resolution path Task 11 and `vendor-bump.yaml`'s
+PR comment both document.** After a real conflict, `force_commit_conflicted`
+has already bumped `.gitrepo`'s `branch` while `VENDORING.md`/`go.mod`
+stay at the old version (deliberately — `finish-vendor-bump` hasn't run
+yet). The documented recovery has a human resolve conflicts in the temp
+worktree (safe — `PREK_ALLOW_NO_CONFIG=1` already makes prek a no-op
+there, no `prek.toml` exists in that worktree) and then run
+`git subrepo commit <path>` **themselves, directly, from the repo root**
+— a commit xtask's own code never invokes and can't inject an env var
+into. On a machine with hooks installed, this human-run commit hits the
+exact same inconsistent-tree rejection the SKIP routing above exists to
+prevent, and the human cannot commit their own conflict resolution at
+all. Fix: document this explicitly everywhere the manual recovery is
+described (Task 11's `VENDORING.md` text, `vendor-bump.yaml`'s PR comment
+body, and the workflow's `::error::` fallback) — the human's own
+`git subrepo commit <path>` command must be run as
+`SKIP=check-vendoring-integrity git subrepo commit <path>`.
 
 **Interfaces:**
 
 - Consumes: `pull_subrepo::gitrepo_field` (already `pub(crate)`, Task 5's
-  fix round), `git_util::run_git`, the `go mod edit -json` pattern
-  `pull_subrepo::conflict::go_mod_replace_directives` already established
-  (`xtask/src/pull_subrepo/conflict.rs`) — that function parses the
-  `Replace` field of `go mod edit -json`'s output; this task needs
-  `Require` instead, so reuse its `go mod edit -json` invocation shape
-  (temp-dir write, `GOTOOLCHAIN=local`, `current_dir` pinning) rather than
-  its exact field, and rather than a third hand-rolled parser.
+  fix round), `git_util::run_git`. **Deliberately does NOT reuse
+  `go mod edit -json`** (unlike `pull_subrepo::conflict::go_mod_replace_directives`'s
+  `Replace`-directive parsing, or `finish_vendor_bump`'s `go mod edit -require` write) — see check 3 below for why a hand-written parser is
+  the correct choice here specifically, not the usual "reuse the
+  toolchain, don't hand-roll" default.
 - Produces: `check_vendoring_integrity::run(repo_root: &Path) -> Result<Vec<String>>` —
   returns a list of human-readable violation messages (empty = clean). A
   `Vec` of findings, not a single "the first thing that's wrong" error:
@@ -2712,25 +2751,29 @@ discovery — do not hardcode `v2ray-core`/`utls` by name, matching
 same reason: a third vendored dep must not need this file edited too):
 
 1. **No merge-conflict markers.** For every file `git ls-files` reports as
-   tracked under that dependency's directory, scan for a genuine, adjacent
-   marker *triple* — not a file-wide co-occurrence of the three marker
-   texts, which would false-positive on a file that happens to contain an
-   unrelated line-start `<<<<<<< ` occurrence (e.g. example text) anywhere
-   above an unrelated legitimate `=======` divider anywhere below it, with
-   no real relationship between them. Find a `<<<<<<< ` line (that exact
-   8-byte prefix, the one marker git never writes standalone), then the
-   next line after it that is *exactly* `=======` (the whole line, not a
-   prefix — a bare `>=7`-equals-sign line is a plausible legitimate
-   divider, e.g. a Markdown setext underline or a doc/testdata banner
-   rule, and would false-positive-block the required `Lint` job on every
-   PR in the repo if matched standalone or as a prefix), then the next
-   line after *that* that is `>>>>>>> ` — report a violation only when all
-   three are found in that order, forming one real triple; a `<<<<<<< `
-   with no matching `=======`/`>>>>>>> ` following it (or vice versa) is
-   not reported. After one triple is found, continue scanning from just
-   past it for further triples in the same file — don't stop at the
-   first one, a conflicted pull can produce many, and a single file can
-   contain more than one. This is the one check that
+   tracked under that dependency's directory, scan forward for a genuine
+   marker *triple*, in order — not a mere file-wide co-occurrence of the
+   three marker texts, which would false-positive on a file that happens
+   to contain an unrelated line-start `<<<<<<< ` occurrence (e.g. example
+   text) anywhere above an unrelated legitimate `=======` divider anywhere
+   below it, with no real relationship between them. Find a `<<<<<<< `
+   line (that exact 8-byte prefix, the one marker git never writes
+   standalone); then, continuing forward from there, find the next
+   occurrence — not the immediately-following line, since a real
+   conflict's hunk body sits between markers — of a line that is *exactly*
+   `=======` (the whole line, not a prefix — a bare `>=7`-equals-sign line
+   is a plausible legitimate divider, e.g. a Markdown setext underline or
+   a doc/testdata banner rule, and would false-positive-block the required
+   `Lint` job on every PR in the repo if matched standalone or as a
+   prefix); then, continuing forward from there, find the next occurrence
+   of a line that is `>>>>>>> ` — report a violation only when all three
+   are found, in that order, forming one real triple; a `<<<<<<< ` with no
+   matching `=======`/`>>>>>>> ` found anywhere after it in the file (or a
+   `=======`/`>>>>>>> ` with no `<<<<<<< ` before it) is not reported.
+   After one triple is found, continue scanning from just past it for
+   further triples in the same file — don't stop at the first one, a
+   conflicted pull can produce many, and a single file can contain more
+   than one. This is the one check that
    must see `force_commit_conflicted`'s literal marker-laden commits (the
    CI-only "commit despite conflicts" policy) as well as an ordinary
    unresolved conflict — both produce the same marker text. **Read each
@@ -2744,24 +2787,52 @@ same reason: a third vendored dep must not need this file edited too):
    in the repo, not just vendor-bump ones. A binary file cannot carry a
    text merge-conflict marker, so never fail the check itself on a decode
    error — a byte-level scan finding nothing is simply nothing to report.
+
 1. **`VENDORING.md`'s noted version matches `.gitrepo`'s `branch`, and a
    discovered dep with no heading at all is itself a violation.** Parse
    `crates/ex-ray/third_party/VENDORING.md`'s heading for this dep (same
    `## \`<dep>/\` — pinned **<version>**`shape`finish_vendor_bump::update_vendoring_note_and_commit`writes — reuse its parsing logic if it's already factored out as a helper, or factor it out now if not, rather than a second hand-rolled parser for the same heading format) and compare against`gitrepo_field(contents,
    "branch")`. Report a clear mismatch message naming both values if they differ. **If the heading doesn't exist at all for a discovered dep, that absence is itself a reported violation — not a skip.** Unlike check 3 below (where a missing `go.mod`require line genuinely doesn't apply to every dep), a missing`VENDORING.md`heading is exactly the state a Renovate-bare, not-yet-pulled`.gitrepo`commit for a *brand new* third vendored dep would be in if this check treated it as not-applicable — silently passing would let auto-merge fire before`vendor-bump.yaml\` ever pulls anything, defeating the whole design (see
    Global Constraints).
+
 1. **The outer `go.mod`'s require line matches `.gitrepo`'s `branch`, if
-   one exists.** Not every vendored dep necessarily has a direct
-   `require` line in `crates/ex-ray/go.mod` (it could be `// indirect`,
-   or absent if nothing imports it directly) — read the vendored dep's
+   one exists.** **Parse `require` lines by hand here — do not shell out
+   to `go mod edit -json`**, unlike every other go.mod-touching helper in
+   this codebase. This hook is `always_run`, so it runs on *every* commit
+   in the whole repo, not only vendor-related ones; shelling to `go`
+   would make the Go toolchain a hard prerequisite for committing
+   anything at all (this repo's existing Go-touching `prek` hooks are all
+   `types = ["go"]`-gated, so a contributor without Go installed can
+   commit normally today — this new hook would be the first exception,
+   and unlike a missing/wrong-version binary, there's no graceful
+   degradation available for a required check). The parse itself is
+   narrow and tractable by hand (unlike `go_mod_replace_directives`'s
+   whole-directive comparison, which genuinely needs the toolchain's own
+   semantics to get right): find the line for a known module path, in
+   either single-line (`require <path> <version>`) or block
+   (`require (\n\t<path> <version>\n)`) form, optionally followed by a
+   trailing `// indirect` comment — reuse `finish_vendor_bump`'s own
+   parsing conventions where they overlap, but do not invoke `go`.
+
+   Not every vendored dep necessarily has a require line in
+   `crates/ex-ray/go.mod` at all (nothing would if it were only reachable
+   transitively through another vendored dep's own imports, with no
+   direct or indirect use from `ex-ray` itself) — read the vendored dep's
    own `go.mod` for its module path (same approach
    `finish_vendor_bump::read_module_path` uses — reuse it), then check
-   whether `crates/ex-ray/go.mod` has *any* require line (direct or
-   `// indirect`) for that module path. If it does, compare its version
-   against `.gitrepo`'s `branch`; if it doesn't, this check simply
-   doesn't apply to this dep (not a violation — `utls` is currently
-   `// indirect` in the real `crates/ex-ray/go.mod`, confirm this
-   fixture case is covered by a test).
+   whether `crates/ex-ray/go.mod` has *any* require line (direct **or**
+   `// indirect` — indirect vs. direct doesn't matter to this check,
+   either way it's a claim about the version in use) for that module
+   path. If it does, compare its version against `.gitrepo`'s `branch` —
+   this is the applicable branch for both real deps today:
+   `crates/ex-ray/go.mod:31` carries
+   `github.com/refraction-networking/utls v1.8.2 // indirect`, matching
+   `utls/.gitrepo`'s `branch = v1.8.2`, so `utls` is a real, live test
+   case for the `// indirect` comparison, not the not-applicable branch.
+   If `crates/ex-ray/go.mod` has no require line for the module at all,
+   this check simply doesn't apply to that dep (not a violation) — use a
+   synthetic fixture dep for this branch, since neither real vendored dep
+   exercises it today.
 
 **Test scenarios** (fixture-repo style, matching
 `pull_subrepo/test_support.rs`'s/`finish_vendor_bump/test_support.rs`'s
@@ -2793,12 +2864,14 @@ against it for real, not a mock):
   version doesn't match `.gitrepo`'s `branch` → reported.
 
 - The outer `go.mod` has an `// indirect` require line that doesn't match
-  → still reported (indirect vs. direct shouldn't matter to this check —
-  either way it's a claim about the version in use).
+  → still reported (the real `utls`/`crates/ex-ray/go.mod` shape — `utls`
+  is `// indirect` there today, and indirect vs. direct shouldn't matter
+  to this check either way, it's a claim about the version in use).
 
-- The outer `go.mod` has *no* require line at all for the dep (the
-  `utls`-shaped case) → not reported as a violation; the other checks for
-  that dep still run normally.
+- The outer `go.mod` has *no* require line at all for the dep (a
+  synthetic fixture dep — neither real vendored dep is in this shape
+  today) → not reported as a violation; the other checks for that dep
+  still run normally.
 
 - Two vendored deps, one clean and one with a violation → only the
   violating one is reported; confirms per-dep isolation and the
@@ -2830,23 +2903,44 @@ against it for real, not a mock):
   the equals-line alone isn't sufficient to flag a file.
 
 - A tracked file containing one genuine line-start `<<<<<<< ` occurrence
-  unrelated to any real conflict (e.g. embedded example text) *and*, in
-  the same file but with no adjacency to it, a separate legitimate
-  `=======` divider line with no matching `>>>>>>> ` anywhere near it →
-  NOT reported. Proves the check requires a real, adjacent triple (each
-  marker immediately following the last in order), not merely that all
-  three marker texts appear somewhere in the same file.
+  unrelated to any real conflict (e.g. embedded example text), followed
+  later in the file by a separate legitimate `=======` divider line, with
+  no `>>>>>>> ` line anywhere after that → NOT reported. Proves the check
+  requires all three markers to actually be found, in order, forming a
+  complete triple — not merely that the first two marker texts each
+  appear somewhere in the file.
+
+- A realistic conflict fixture: a genuine `<<<<<<< HEAD` /
+  `=======` / `>>>>>>> theirs` triple with real, non-empty hunk content
+  (several lines of ordinary text, not blank) on both sides of the
+  `=======` divider → reported, at the `<<<<<<< ` line's number. Proves
+  the "scan forward for the next occurrence" design actually detects a
+  real conflict, where content always sits between each marker — not just
+  the contrived immediately-adjacent-lines fixtures the other scenarios
+  use for isolation.
 
 - **The `always_run` hazard, end-to-end, with the real git hook actually
-  installed**: install this repo's real `pre-commit` hook (`prek install`,
-  or replicate its exact invocation) into a fixture repo carrying the new
-  `check-vendoring-integrity` hook in its own `prek.toml`, then run the
-  full `pull-subrepo` → `finish-vendor-bump` sequence against a real
-  upstream bump (mirroring `finish_vendor_bump_tests.rs`'s own
+  installed — clean path**: install this repo's real `pre-commit` hook
+  (`prek install`, or replicate its exact invocation) into a fixture repo
+  carrying the new `check-vendoring-integrity` hook in its own
+  `prek.toml`, then run the full `pull-subrepo` → `finish-vendor-bump`
+  sequence against a real upstream bump (mirroring
+  `finish_vendor_bump_tests.rs`'s own
   `run_updates_go_mod_and_commits_the_full_sequence` fixture shape) →
   every intermediate commit succeeds, the hook never rejects one, and the
-  final state is clean. This is the test that actually proves the `SKIP`
-  fix works, not just that the check's own logic is correct in isolation.
+  final state is clean.
+
+- **The same hazard, end-to-end — conflicted path**: same real-hook setup,
+  but drive an actual conflicted `pull-subrepo` → `force-commit-conflicted-subrepo`
+  sequence (mirroring `pull_subrepo_tests.rs`'s own `force_commit_conflicted_*`
+  fixtures, e.g. a `ConflictKind::Real` or `ConflictKind::Mixed` case) with
+  the real hook installed → every intermediate commit `force_commit_conflicted`
+  and `handle_conflict`'s finishing commit make also succeeds, the hook
+  never rejects one. This is the scenario the clean-path test above can't
+  reach on its own (it never enters `handle_conflict`/`force_commit_conflicted`
+  at all) — together, these two are what actually prove the `SKIP` fix
+  works everywhere it's needed, not just that the check's own logic is
+  correct in isolation.
 
 - [ ] **Step 1: Write the failing tests**, following the scenarios above.
 
