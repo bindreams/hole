@@ -10,25 +10,41 @@ when a real conflict or CI failure blocks it — with no self-hosted server.
 
 **Architecture:** Renovate (hosted GitHub App) bumps only the `branch =`
 line in each `.gitrepo` via a `customManager` and opens its normal PR,
-explicitly excluded from this repo's existing unscoped "major updates"
-automerge rule. A `vendor-bump.yaml` workflow, authenticated as a
-purpose-built GitHub App (`nathan-blahaj`, not the default `GITHUB_TOKEN`,
-so its pushes actually retrigger CI), runs `cargo xtask pull-subrepo` (a
-generic, human-usable wrapper around `git subrepo pull` that fixes the
-routine squash-merge parent-staleness automatically and behaves like
-`git pull` on a real conflict — stops, uncommitted) followed by
-`cargo xtask finish-vendor-bump` (version note + `go.mod` + the identity
-check `ci.yaml`'s "Test ex-ray (Go)" job itself runs), pushes, and arms
-GitHub-native auto-merge itself via `gh pr merge --auto` — both
-opportunistically right after a clean push, and via a second, lightweight
-job that fires whenever Renovate's own (rate-limited, sometimes delayed)
-PR-creation call finally happens — gated on a `vendor-bump-ready`
-check-run `bump` reports on its own pushed commit, not merely on who
-pushed it. "Test ex-ray (Go)" and `vendor-bump-ready` are both added to
-the repo's required-status-checks ruleset as one-time manual setup, so
-auto-merge cannot fire without both the check that actually validates the
-vendored code and confirmation the bump pipeline itself finished cleanly.
-The same App fixes the identical latent bug in `wix-hash-fixup.yaml`.
+using this repo's existing unscoped "major updates" automerge rule
+unmodified — arming happens exactly the way it does for any other major
+bump, with no vendor-specific automerge logic anywhere. A `vendor-bump.yaml`
+workflow, authenticated as a purpose-built GitHub App (`nathan-blahaj`,
+not the default `GITHUB_TOKEN`, so its pushes actually retrigger CI), runs
+`cargo xtask pull-subrepo` (a generic, human-usable wrapper around
+`git subrepo pull` that fixes the routine squash-merge parent-staleness
+automatically and behaves like `git pull` on a real conflict — stops,
+uncommitted) followed by `cargo xtask finish-vendor-bump` (version note +
+`go.mod` + the identity check `ci.yaml`'s "Test ex-ray (Go)" job itself
+runs), then pushes. That's the whole workflow — it never touches
+auto-merge itself.
+
+Correctness is enforced entirely by ordinary, repo-wide required checks
+that apply to every PR, not a bot-specific "I attest I succeeded" signal:
+"Test ex-ray (Go)" (added to the required-status-checks ruleset as
+one-time manual setup, since it's the only CI job that exercises the
+vendored code's own tests) plus a new `cargo xtask check-vendoring-integrity`
+check wired into the existing, already-required `prek` lint job. That
+check enforces two structural invariants against the actual committed
+tree — no merge-conflict markers anywhere under a vendored dep's
+directory, and `VENDORING.md`'s noted version plus the outer `go.mod`'s
+require line both match `.gitrepo`'s checked-out `branch` — regardless of
+who or what committed the mismatch. Because these are ordinary required
+checks, GitHub's native auto-merge (armed by Renovate itself, immediately,
+the moment it opens the PR) simply refuses to merge until they're green —
+it already waits for a required check that hasn't reported yet, and stays
+armed across every later push `bump` makes, so there's no premature-arming
+race to guard against and no reason for arming to be gated, delayed, or
+handled by a second job. General principle: whatever a bot can commit, a
+human can too, so there is no such thing as a required check scoped to
+one automation's PRs — every invariant here is enforced the same way for
+everyone.
+The same `nathan-blahaj` App fixes the identical latent bug in
+`wix-hash-fixup.yaml`.
 
 **Tech Stack:** Rust (`xtask`, existing `clap`/`anyhow` conventions), GitHub
 Actions, Renovate `customManager` (regex), `git-subrepo` 0.4.9.
@@ -53,34 +69,59 @@ Actions, Renovate `customManager` (regex), `git-subrepo` 0.4.9.
   — the tool that resolves conflicts never commits one, full stop, but the
   workflow needs a testable, non-bash-reimplemented way to do the CI-only
   thing.
-- Renovate never arms auto-merge for these PRs itself — this repo's
-  existing `packageRules` already has an unscoped `"matchUpdateTypes": ["major"], "automerge": true` rule that would otherwise also match a
-  major `.gitrepo` bump, so Task 6 adds
-  an explicit, later-in-array override. `vendor-bump.yaml` is the sole
-  arming point, and only after a clean pull *and* a successful finish.
-- `nathan-blahaj` is the generic bot identity name (not vendor-specific) —
-  reused for `wix-hash-fixup.yaml` too. Secrets: `NATHAN_APP_ID`,
-  `NATHAN_APP_PRIVATE_KEY`.
-- `vendor-bump.yaml`'s main job must never act on its own pushes (it would
+- Renovate arms auto-merge for these PRs itself, the same unscoped
+  `"matchUpdateTypes": ["major"], "automerge": true` rule that arms it for
+  any other major dependency bump — no vendor-specific carve-out, no
+  workflow-side arming logic. This is safe *because* of the next two
+  bullets: GitHub's native auto-merge (which is what Renovate's
+  `platformAutomerge` arms) doesn't merge on arming, it merges once every
+  required check reports green — including one that hasn't started
+  reporting yet — and it stays armed across every subsequent push to the
+  PR. Arming on Renovate's own bare, not-yet-pulled `.gitrepo`-only commit
+  is therefore harmless: the required checks below correctly stay red
+  until `vendor-bump.yaml` actually pulls the dependency and pushes the
+  real update.
+- No required check may be scoped to one automation's PRs. Whatever a bot
+  can commit, a human can too, so a check that only verifies "did the bot
+  succeed" (e.g. a bot-authored, bot-reported check-run) misses a human
+  making the identical mistake by hand, and it's unnecessary machinery
+  besides — every invariant here is instead a structural fact checkable
+  directly against the committed tree, so it's enforced by an ordinary
+  required check that already applies to every PR:
+  - "Test ex-ray (Go)" (the only CI job that exercises the vendored code's
+    own tests) is not currently a required status check on `main`'s
+    ruleset — added as one-time manual setup (Task 1), since without it a
+    vendor bump that breaks the ECH gate/patches could merge with nothing
+    catching it.
+  - `cargo xtask check-vendoring-integrity` (Task 13) checks, for each
+    vendored dep: no merge-conflict markers anywhere in its directory
+    (catches a real conflict landing outside the scope `Test ex-ray (Go)`
+    compiles, including the CI-only "commit despite conflicts" policy's
+    literal markers), and `VENDORING.md`'s noted version plus the outer
+    `go.mod`'s require line both match `.gitrepo`'s checked-out `branch`
+    (catches `finish-vendor-bump` failing partway through and leaving
+    stale bookkeeping behind — no markers, nothing a test would notice,
+    since the vendored *code* itself would still be fine). Wired as an
+    `always_run`/`pass_filenames = false` local `prek` hook (matching
+    `check-workspace-lints`'s existing pattern) that does its own file
+    discovery rather than going through `prek`'s staged-file list — this
+    means it runs regardless of `prek.toml`'s top-level `exclude`, which
+    still blanket-protects vendored code from every *other* hook
+    (formatting/linting), and it needs no new required-status-check
+    ruleset entry at all: `prek`'s own CI job ("Lint") is already
+    required, so this rides along automatically.
+- `vendor-bump.yaml`'s job must never act on its own pushes (it would
   otherwise retrigger itself) and must never treat a non-conflict failure
   (dirty tree, missing `git-subrepo`, bad input) as if it were a real
-  merge conflict. `cancel-in-progress` stays `false`: combined with the
-  self-retrigger guard, a `true` value creates a race where the workflow's
-  own push cancels itself before it can arm auto-merge (GitHub evaluates
-  concurrency before the job-level `if:` guard) — a plain, non-force
-  `git push` failing loudly on an actual Renovate force-push mid-run is
-  the correct, safe fallback instead.
-- "Test ex-ray (Go)" (the only CI job that exercises the vendored code's
-  own tests) is not currently a required status check on `main`'s ruleset
-  — added as one-time manual setup (Task 1), since without it auto-merge
-  could fire on a vendor bump that breaks the ECH gate/patches with no
-  check catching it. `vendor-bump-ready` (Task 1, Task 8) is added
-  alongside it: a commit author check alone can't distinguish a genuinely
-  clean, fully-finished bump from a conflicted or partially-failed one
-  (both are equally `nathan-blahaj[bot]`-authored), and `Test ex-ray (Go)`
-  only compiles a scoped subset of the vendored tree, so a conflict
-  landing elsewhere in it wouldn't be caught by any required check without
-  this.
+  merge conflict. `cancel-in-progress` stays `false`, so an in-flight run
+  is never torn down mid-`git push` by its own later trigger; a plain,
+  non-force `git push` failing loudly on an actual Renovate force-push
+  mid-run is the correct, safe fallback instead.
+- `nathan-blahaj` is the generic bot identity name (not vendor-specific) —
+  reused for `wix-hash-fixup.yaml` too. Secrets: `NATHAN_APP_ID`,
+  `NATHAN_APP_PRIVATE_KEY`. Permissions: `Contents` and `Pull requests`
+  (`Read and write` each) only — no `Checks` permission, since nothing
+  creates or queries a check-run under this design.
 - Design doc: `docs/superpowers/specs/2026-08-10-787-vendor-dependency-automation.md`.
 
 ______________________________________________________________________
@@ -95,9 +136,12 @@ ______________________________________________________________________
 | `xtask/src/finish_vendor_bump.rs`               | The separate, smaller VENDORING.md "step 3" work: version note, outer `go.mod` require-version bump + `go mod tidy`, the identity check matching `build.yaml`'s `ex-ray-tests` target exactly. Commits are guarded against "nothing to commit" and scoped to only the paths each step itself staged.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
 | `xtask/src/finish_vendor_bump_tests.rs`         | Tests for the above, including the full `run()` sequence end-to-end and a failing identity check.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
 | `xtask/src/lib.rs`                              | Modify: three new `Command` variants + dispatch wrappers + module/test-module declarations.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
-| `.github/renovate.json`                         | Modify: `customManager` tracking each `.gitrepo`'s `branch` line (capturing `owner/repo`, not a full URL; no `extractVersionTemplate`). New `packageRules` entry explicitly disabling automerge for these deps, placed after the existing unscoped major-updates automerge rule so it correctly overrides it.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| `xtask/src/check_vendoring_integrity.rs`        | New: walks each `crates/ex-ray/third_party/<dep>/` directory that has a `.gitrepo` (dynamic discovery, no hardcoded dep list), checking for merge-conflict markers in any git-tracked file and cross-checking `VENDORING.md`'s noted version + the outer `go.mod`'s require line (if present) against `.gitrepo`'s `branch` field. Reuses `pull_subrepo::gitrepo_field` and the `go mod edit -json` pattern from `finish_vendor_bump.rs` rather than duplicating either.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
+| `xtask/src/check_vendoring_integrity_tests.rs`  | Fixture-repo tests for the above: a clean tree, a tree with conflict markers, a `VENDORING.md`/`.gitrepo` mismatch, a `go.mod`/`.gitrepo` mismatch, a dep with no `go.mod` require line at all (`utls`-shaped).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| `.github/renovate.json`                         | Modify: `customManager` tracking each `.gitrepo`'s `branch` line (capturing `owner/repo`, not a full URL; no `extractVersionTemplate`). No `packageRules` change — the existing unscoped major-updates automerge rule is left to apply to these deps unmodified.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| `prek.toml`                                     | Modify: new local hook running `cargo xtask check-vendoring-integrity`, `always_run = true` + `pass_filenames = false` (matching `check-workspace-lints`'s existing pattern) so it's unaffected by the file's top-level `third_party` exclude.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
 | `.github/actions/mint-nathan-token/action.yaml` | Composite action minting a `nathan-blahaj` installation token from App ID + private key inputs. Shared by both workflows below.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
-| `.github/workflows/vendor-bump.yaml`            | New workflow, two jobs: `bump` (push/workflow_dispatch-triggered — does the real work, pushes, opportunistically arms auto-merge) and `arm-on-pr-open` (pull_request-triggered — a lightweight catch-up that arms auto-merge once Renovate's own, sometimes-delayed, PR-creation call happens).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| `.github/workflows/vendor-bump.yaml`            | New workflow, one job (`bump`, push/workflow_dispatch-triggered): pull, finish (or force-commit on a real conflict), push, comment on the PR if conflicted. No auto-merge arming of any kind — that's entirely Renovate's + GitHub's required-checks' job.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
 | `.github/workflows/ci.yaml`                     | Modify: `test-tooling` job (which runs `xtask`'s own tests) gets a `git-subrepo` install step, matching what the new fixture tests need.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
 | `.github/workflows/wix-hash-fixup.yaml`         | Modify: swap `GITHUB_TOKEN` for `nathan-blahaj`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
 | `crates/ex-ray/third_party/VENDORING.md`        | Modify: document the new tooling, the CI-only conflict-commit policy, and the identity check (matching `build.yaml`'s real `ex-ray-tests` scope, not a broader claim).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
@@ -125,13 +169,9 @@ set:
   never receives events.
 
 - Repository permissions: `Contents` → `Read and write`, `Pull requests` →
-  `Read and write`, `Checks` → `Read and write` (both `vendor-bump.yaml`
-  jobs mint this App's token to create/query the `vendor-bump-ready`
-  check-run — Task 8's implementation found this missing from an earlier
-  draft of this list; without it, the check-run POST 403s on the first
-  real run and the whole readiness-signaling mechanism, including both
-  auto-merge arming paths, is silently dead). Leave everything else at "No
-  access".
+  `Read and write`. Leave everything else at "No access" — in particular,
+  no `Checks` permission: this design has no check-run of any kind, only
+  ordinary required status checks, so nothing ever creates or queries one.
 
 - "Where can this GitHub App be installed?": **Any account** (so it can be
   installed on other repos later without recreating it).
@@ -160,7 +200,7 @@ In `bindreams/hole` → Settings → Secrets and variables → Actions, add:
 
 Delete the local `.pem` file copy once it's saved as a secret.
 
-- [ ] **Step 5: Add two required status checks**
+- [ ] **Step 5: Add one required status check**
 
 In `bindreams/hole` → Settings → Rules → Rulesets → "Default Branch", edit
 the `required_status_checks` rule and add:
@@ -172,19 +212,17 @@ the `required_status_checks` rule and add:
   patches, since every other required check builds crates that never
   touch the vendored Go module.
 
-- `vendor-bump-ready` — the check-run `vendor-bump.yaml`'s `bump` job
-  creates itself on its own pushed commit (Task 8), reporting whether the
-  pull was genuinely clean *and* `finish-vendor-bump` succeeded. Without
-  this required, a `bump` run that fails partway (e.g. `finish-vendor-bump`
-  bailing before its identity check even runs) or lands a conflicted
-  commit outside the scope `Test ex-ray (Go)` compiles has nothing
-  structurally blocking merge.
+Nothing else needs adding here: `cargo xtask check-vendoring-integrity`
+(Task 13) rides along inside the existing, already-required `Lint` job
+(confirmed live via `gh api repos/bindreams/hole/rulesets/<id>` — `Lint`
+is already in `required_status_checks`, and `ci.yaml`'s `lint` job is what
+runs `cargo xtask run prek`), so no new ruleset entry is needed for it.
 
 - [ ] **Step 6: Confirm**
 
 Reply here (or note in the tracking issue) once done — later tasks that
 touch `vendor-bump.yaml`/`wix-hash-fixup.yaml` assume the secrets exist,
-and Task 11's live verification assumes the required-check change is live.
+and Task 12's live verification assumes the required-check change is live.
 
 ______________________________________________________________________
 
@@ -1784,7 +1822,16 @@ git commit -m "feat(xtask): add finish-vendor-bump (version note, go.mod tidy, i
 
 ______________________________________________________________________
 
-### Task 6: Renovate `customManager` + automerge override
+### Task 6: Renovate `customManager` (no automerge override)
+
+**Status: implementation already landed, needs a revert applied.** The
+`customManager` below is already shipped and correct — nothing to redo.
+The automerge-override `packageRules` entry that originally shipped
+alongside it needs to be **removed**: under the current design, Renovate's
+existing unscoped major-updates automerge rule is meant to apply to these
+deps too (see the plan's Global Constraints), so a carve-out excluding
+them is no longer correct — it would silently prevent Renovate from ever
+arming auto-merge on a vendor bump at all.
 
 **Files:**
 
@@ -1792,47 +1839,19 @@ ______________________________________________________________________
 
 **Interfaces:** none (config only)
 
-- [ ] **Step 1: Add the customManager**
+- [x] **Step 1: Add the customManager** — already done, unchanged. Tracks
+  each `.gitrepo`'s `branch` line (capturing `owner/repo`, not a full URL;
+  no `extractVersionTemplate`, since both `.gitrepo` files need the `v`
+  kept in `branch = v5.52.0`, matching the real git tag `git subrepo pull -b` needs).
 
-In `.github/renovate.json`, add to the `customManagers` array (after the
-existing `prek.toml` entry, before the closing `]`). Captures only
-`owner/repo` after `github.com/`, matching this repo's existing WiX
-customManager's same capture pattern (the `github-tags` datasource expects
-that shape). No `extractVersionTemplate`: this repo's own existing
-workflow-version customManager uses that field to strip a leading `v` on
-write-back (`.github/workflows/ci.yaml`'s `GSUDO_VERSION: "2.6.1"` is
-managed by that exact template pattern, and gerardog/gsudo's real tags are
-`v2.6.1`). Both `.gitrepo` files need the `v` kept (`branch = v5.52.0`,
-matching the real git tag `git subrepo pull -b` needs), so this
-customManager must not strip it:
+- [ ] **Step 2: Remove the automerge-override `packageRules` entry**
 
-```json
-    {
-      "customType": "regex",
-      "managerFilePatterns": ["/^crates/ex-ray/third_party/.+/\\.gitrepo$/"],
-      "matchStrings": [
-        "remote\\s*=\\s*https://github\\.com/(?<packageName>[^/\\s]+/[^/\\s]+)\\n\\tbranch\\s*=\\s*(?<currentValue>\\S+)"
-      ],
-      "datasourceTemplate": "github-tags"
-    }
-```
-
-- [ ] **Step 2: Add the automerge-override packageRules entry**
-
-The file's existing `packageRules` array already has an unscoped
-`{"matchUpdateTypes": ["major"], "groupName": null, "automerge": true}`
-rule, which would otherwise also
-match a major `.gitrepo` bump (e.g. v5→v6, v1→v2). Renovate uses
-last-match-wins semantics, so add this **after** that rule (append to the
-end of the array):
-
-```json
-    {
-      "description": "Vendored git-subrepo deps (v2ray-core, utls): vendor-bump.yaml is the sole automerge-arming mechanism (see .github/workflows/vendor-bump.yaml), never Renovate itself — arming at PR-creation time races the actual pull/rebase work, since CI trivially passes on Renovate's content-unchanged branch-only commit. This explicitly overrides the file's existing unscoped 'Major updates' automerge:true rule above.",
-      "matchFileNames": ["crates/ex-ray/third_party/*/.gitrepo"],
-      "automerge": false
-    }
-```
+Delete the entry this task originally added (the one with
+`"description": "Vendored git-subrepo deps (v2ray-core, utls): ..."`,
+`"matchFileNames": ["crates/ex-ray/third_party/*/.gitrepo"]`,
+`"automerge": false`) from `.github/renovate.json`'s `packageRules` array
+entirely. Leave every other entry (including the unscoped
+`"matchUpdateTypes": ["major"], "automerge": true` rule) untouched.
 
 - [ ] **Step 3: Validate the config**
 
@@ -1850,7 +1869,7 @@ either way.
 
 ```bash
 git add .github/renovate.json
-git commit -m "chore(renovate): track vendored .gitrepo tags via customManager, exclude from automerge"
+git commit -m "chore(renovate): revert automerge override, major-updates rule applies to vendored deps too"
 ```
 
 ______________________________________________________________________
@@ -1922,52 +1941,30 @@ ______________________________________________________________________
 
 - [ ] **Step 1: Write the workflow**
 
-Two jobs, not one: `bump` does the real work (push/workflow_dispatch
-triggered) and opportunistically arms auto-merge right after a clean push;
-`arm-on-pr-open` is a lightweight companion that fires on
-`pull_request: [opened, synchronize]` for a `renovate/**` branch, since
-Renovate deliberately rate-limits its own PR-creation call
-(`prHourlyLimit`/`prConcurrentLimit`, both left at their defaults in this
-repo's config) — the branch and its push can exist well before the PR
-does, and `bump`'s own "find the PR" step may legitimately come up empty.
+One job, not two: `bump` does the real work — pull, finish (or
+force-commit on a real conflict), push, comment on the PR if conflicted.
+It never touches auto-merge in any way. Arming is entirely Renovate's own
+job (its existing unscoped major-updates automerge rule, unmodified —
+Task 6) plus GitHub's native auto-merge, which doesn't merge on arming, it
+merges once every required check reports green, including one that hasn't
+started reporting yet, and it stays armed across every later push to the
+PR — so arming on Renovate's own bare, not-yet-pulled commit is harmless;
+the required checks (`Test ex-ray (Go)` and `cargo xtask check-vendoring-integrity`, Task 13, riding along inside the
+already-required `Lint` job) correctly stay red until this workflow
+actually pulls the dependency and pushes the real update. No check-run,
+no second job, no `pull_request` trigger, no `Checks` permission — see the
+plan's Global Constraints for the general principle this follows.
 
-`arm-on-pr-open` must **not** simply arm on every `opened`/`synchronize`
-event, though — Renovate's own PR-open call (fast, just an API call) can
-easily beat `bump`'s pipeline (slow: install git-subrepo, run Go tests,
-etc.), so an ungated version of this job would routinely arm auto-merge on
-Renovate's bare `.gitrepo`-branch-line-only commit, before `bump` has
-pulled anything. Gating on the commit's *author* alone isn't enough
-either — a commit where `bump` pushed a still-conflicted tree, or where
-`finish-vendor-bump` failed before ever running its identity check, is
-just as `nathan-blahaj[bot]`-authored as a genuinely clean one, and "CI
-will catch a conflict anyway" isn't structurally true: `Test ex-ray (Go)`
-only compiles/tests a scoped subset of the vendored tree (`crates/ex-ray`
-plus four specific `transport/internet/*` packages), and `prek`/
-`golangci-lint` exclude `third_party` entirely, so conflict markers
-anywhere else in the vendored tree would never be caught by any required
-check. `bump` instead reports its *true* outcome directly, via a
-`vendor-bump-ready` check-run it creates on its own pushed commit
-(conclusion `success` only when the pull was clean *and* `finish-vendor-bump`
-itself succeeded, `failure` otherwise) — added to Task 1 Step 5's
-required-status-checks alongside `Test ex-ray (Go)`, so GitHub's own merge
-gate enforces it independently of anything `arm-on-pr-open` does.
-`arm-on-pr-open` queries that same check-run before arming, and both arm
-steps pass `--match-head-commit` so a Renovate force-push between the
-check and the `gh pr merge` call makes the arm attempt a no-op instead of
-merging a moved-on head.
-
-Other fixes below:
+Fixes below (all still apply, independent of the auto-merge redesign):
 
 - **Self-retrigger**: `bump`'s own successful push matches its own
   `push`+`paths` trigger. The job-level `if:` guard checks the pushing
   commit's author name against exactly what the "git identity" step sets
   later in this same file.
-- **No `cancel-in-progress`**: combined with the self-retrigger guard
-  above, `cancel-in-progress: true` creates a race — GitHub evaluates
-  concurrency *before* the job-level `if:`, so the workflow's own push can
-  cancel its own still-running arming steps before they execute. Left at
-  the default (`false`); a genuinely stale run instead fails loudly on a
-  rejected non-force `git push` if Renovate force-pushed mid-run.
+- **No `cancel-in-progress`**: an in-flight run should never be torn down
+  mid-`git push` by its own later trigger. Left at the default (`false`);
+  a genuinely stale run instead fails loudly on a rejected non-force
+  `git push` if Renovate force-pushed mid-run.
 - **Conflict vs. other failure**: the Pull step captures
   `cargo xtask pull-subrepo`'s actual exit code (0 clean / 2 real conflict
   / anything else a genuine unexpected failure) instead of GitHub Actions'
@@ -1992,9 +1989,6 @@ on:
   push:
     branches: ["renovate/**"]
     paths: ["crates/ex-ray/third_party/*/.gitrepo"]
-  pull_request:
-    types: [opened, synchronize]
-    paths: ["crates/ex-ray/third_party/*/.gitrepo"]
   workflow_dispatch:
     inputs:
       dep:
@@ -2009,26 +2003,13 @@ permissions:
   pull-requests: write
 
 concurrency:
-  # `cancel-in-progress: false` does not mean "queue everything": when a
-  # new run is queued while another in the same group is in progress, the
-  # new one becomes pending, and any *previously pending* run in that
-  # group is cancelled — only one pending run survives per group. `bump`'s
-  # own push fires both a `push` event (a new `bump` run, skipped early by
-  # the self-retrigger guard but still occupying a concurrency slot) and a
-  # `pull_request: synchronize` event (an `arm-on-pr-open` run) — webhook
-  # delivery order between the two isn't guaranteed, so putting both event
-  # types in the same group risks `arm-on-pr-open` getting evicted before
-  # it ever starts. `bump` and `arm-on-pr-open` runs are kept in separate
-  # groups (prefixed by event type) so neither can evict the other;
-  # `github.head_ref` (pull_request) and `github.ref_name` (push) are both
-  # already the bare branch name.
-  group: vendor-bump-${{ github.event_name == 'pull_request' && 'arm' || 'bump' }}-${{ github.head_ref || github.ref_name }}
+  group: vendor-bump-${{ github.ref_name }}
   cancel-in-progress: false
 
 jobs:
   bump:
     name: Pull + rebase vendored dependency
-    if: github.event_name != 'pull_request' && (github.event_name != 'push' || github.event.head_commit.author.name != 'nathan-blahaj[bot]')
+    if: github.event_name != 'push' || github.event.head_commit.author.name != 'nathan-blahaj[bot]'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -2143,52 +2124,13 @@ jobs:
         run: git push origin "HEAD:${{ steps.scratch-branch.outputs.ref_name || github.ref_name }}"
 
       - name: Find the PR for this branch
-        if: github.event_name == 'push' && (steps.pull.outputs.result == 'clean' || steps.pull.outputs.result == 'conflicted')
+        if: github.event_name == 'push' && steps.pull.outputs.result == 'conflicted'
         id: find-pr
         env:
           GH_TOKEN: ${{ steps.nathan.outputs.token }}
         run: |
           pr_number=$(gh pr list --repo "${{ github.repository }}" --head "${{ github.ref_name }}" --json number --jq '.[0].number // empty')
           echo "pr_number=$pr_number" >> "$GITHUB_OUTPUT"
-
-      # The single source of truth for "is this pushed commit actually
-      # ready to merge" — arm-on-pr-open (below) queries this same
-      # check-run instead of re-deriving the answer, and it's a required
-      # status check (Task 1 Step 5) so GitHub's own merge gate enforces
-      # it too, independent of either arming path.
-      - name: Report vendor-bump-ready check for the pushed commit
-        if: steps.pull.outputs.result == 'clean' || steps.pull.outputs.result == 'conflicted'
-        env:
-          GH_TOKEN: ${{ steps.nathan.outputs.token }}
-        run: |
-          sha=$(git rev-parse HEAD)
-          if [[ "${{ steps.pull.outputs.result }}" == "clean" && "${{ steps.finish.outcome }}" == "success" ]]; then
-            conclusion=success
-          else
-            conclusion=failure
-          fi
-          gh api "repos/${{ github.repository }}/check-runs" -X POST \
-            -f name="vendor-bump-ready" \
-            -f head_sha="$sha" \
-            -f status=completed \
-            -f conclusion="$conclusion"
-
-      - name: Arm auto-merge
-        if: steps.pull.outputs.result == 'clean' && steps.finish.outcome == 'success' && steps.find-pr.outputs.pr_number != ''
-        env:
-          GH_TOKEN: ${{ steps.nathan.outputs.token }}
-        run: |
-          sha=$(git rev-parse HEAD)
-          gh pr merge --auto --squash --match-head-commit "$sha" "${{ steps.find-pr.outputs.pr_number }}" --repo "${{ github.repository }}"
-
-      # Renovate's prHourlyLimit/prConcurrentLimit (both left at defaults
-      # here) deliberately create the branch and defer PR creation — this
-      # is common, not a narrow race. The arm-on-pr-open job below is the
-      # guaranteed catch-up; this is just visibility for the common
-      # opportunistic-arm-skipped case.
-      - name: Note if no PR exists yet
-        if: github.event_name == 'push' && steps.pull.outputs.result == 'clean' && steps.finish.outcome == 'success' && steps.find-pr.outputs.pr_number == ''
-        run: echo "::notice::No open PR found yet for this branch — auto-merge will be armed by this workflow's pull_request trigger once Renovate opens it."
 
       - name: Comment on the PR if conflicted
         if: steps.pull.outputs.result == 'conflicted' && steps.find-pr.outputs.pr_number != ''
@@ -2207,37 +2149,6 @@ jobs:
         run: |
           echo "::error::the 'Finish' step failed — see its log above for the reason (an identity-check failure, or an earlier error like a malformed go.mod/VENDORING.md heading). Any commits it made before failing were still pushed."
           exit 1
-
-  arm-on-pr-open:
-    name: Arm auto-merge (PR opened/updated)
-    if: github.event_name == 'pull_request' && startsWith(github.head_ref, 'renovate/')
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    steps:
-      - name: Mint nathan-blahaj token
-        id: nathan
-        uses: ./.github/actions/mint-nathan-token
-        with:
-          app-id: ${{ secrets.NATHAN_APP_ID }}
-          private-key: ${{ secrets.NATHAN_APP_PRIVATE_KEY }}
-
-      # Only `bump`'s own vendor-bump-ready check-run (not merely who
-      # authored the head commit — a conflicted or partially-failed bump
-      # is also nathan-authored) tells us whether this exact commit is
-      # actually ready.
-      - name: Check whether bump reported this commit ready
-        id: check-head
-        env:
-          GH_TOKEN: ${{ steps.nathan.outputs.token }}
-        run: |
-          conclusion=$(gh api "repos/${{ github.repository }}/commits/${{ github.event.pull_request.head.sha }}/check-runs" --jq '[.check_runs[] | select(.name == "vendor-bump-ready")][0].conclusion // empty')
-          echo "conclusion=$conclusion" >> "$GITHUB_OUTPUT"
-
-      - name: Arm auto-merge
-        if: steps.check-head.outputs.conclusion == 'success'
-        env:
-          GH_TOKEN: ${{ steps.nathan.outputs.token }}
-        run: gh pr merge --auto --squash --match-head-commit "${{ github.event.pull_request.head.sha }}" "${{ github.event.pull_request.number }}" --repo "${{ github.repository }}"
 ```
 
 - [ ] **Step 2: Validate the YAML syntactically**
@@ -2377,18 +2288,23 @@ Replace the section (currently the last section in the file, from `## Bumping a 
 ## Bumping a pinned version
 
 This is automated: Renovate opens a PR bumping just the `branch =` line in
-a `.gitrepo`, and `.github/workflows/vendor-bump.yaml` does the rest —
-`cargo xtask pull-subrepo` followed by `cargo xtask finish-vendor-bump` —
-pushing further commits to the same PR, then arming auto-merge itself once
-that succeeds (immediately if Renovate's PR already exists, or via a
-separate trigger once it does — Renovate rate-limits its own PR-creation
-call, so the branch/push often lands before the PR). It merges
-automatically if the pull is clean and CI is green; it sits open with a PR
-comment if a real merge conflict landed outside the auto-resolved
-`go.mod`/`go.sum`/`.github/workflows/*` allowlist (the authoritative
-policy lives in `xtask/src/pull_subrepo.rs`'s `is_auto_resolvable` —
-`go.mod` conflicts specifically are only auto-resolved when doing so
-wouldn't drop a downstream-only `replace` directive, like the one below).
+a `.gitrepo`, and Renovate arms this repo's ordinary "major updates"
+auto-merge on it, the same way it would for any other dependency —
+nothing vendor-specific decides whether to arm. `.github/workflows/vendor-bump.yaml`
+does the rest: `cargo xtask pull-subrepo` followed by
+`cargo xtask finish-vendor-bump`, pushing further commits to the same PR.
+It merges automatically once the pull was clean and the required checks
+go green — including `cargo xtask check-vendoring-integrity` (part of the
+`prek`/`Lint` check), which fails the merge structurally if a conflict
+landed outside the auto-resolved `go.mod`/`go.sum`/`.github/workflows/*`
+allowlist (the authoritative policy lives in `xtask/src/pull_subrepo.rs`'s
+`is_auto_resolvable` — `go.mod` conflicts specifically are only
+auto-resolved when doing so wouldn't drop a downstream-only `replace`
+directive, like the one below) or if `VENDORING.md`/`go.mod` end up
+inconsistent with `.gitrepo`. On a real conflict, `vendor-bump.yaml`
+force-commits the conflicted tree (with real markers) and comments on the
+PR — auto-merge stays armed but can never fire, since GitHub's own
+required checks refuse to go green on a tree with conflict markers in it.
 
 `pull-subrepo`'s "nothing committed" guarantee on a real conflict is about
 the pull attempt itself, not the whole run: if the routine squash-merge
@@ -2410,11 +2326,12 @@ To do it by hand (same tools the automation uses):
    target: `crates/ex-ray`'s own `go test ./...`, plus — for v2ray-core
    specifically — the scoped `transport/internet/{tls,quic,hysteria2,
    transportcommon}` test), committing regardless of whether it passed.
-3. `git push`, then `gh pr merge --auto --squash <PR>` yourself. Your
-   commit isn't authored by `nathan-blahaj[bot]`, so `vendor-bump.yaml`'s
-   automated arming (which checks for that identity's own
-   `vendor-bump-ready` check-run) never fires for a hand-resolved conflict
-   — arm it yourself once you've pushed a fix you're confident in.
+3. `git push`. Auto-merge is already armed on the PR (Renovate arms it the
+   same way it does for any major bump, at PR-creation time) and stays
+   armed across your push, so nothing further is needed — it merges once
+   the required checks (including `cargo xtask check-vendoring-integrity`)
+   go green on your fix. If it somehow isn't armed, `gh pr merge --auto
+   --squash <PR>` arms it yourself.
 ```
 
 - [ ] **Step 2: Commit**
@@ -2448,9 +2365,9 @@ the workflow YAML don't break the existing build.
 
 `gh secret list --repo bindreams/hole` should show `NATHAN_APP_ID` and
 `NATHAN_APP_PRIVATE_KEY`. Also confirm via `gh api repos/bindreams/hole/rulesets/<id>`
-(or the Settings UI) that both `Test ex-ray (Go)` and `vendor-bump-ready`
-now appear in `required_status_checks`. If any is missing, stop and
-complete Task 1 first.
+(or the Settings UI) that `Test ex-ray (Go)` now appears in
+`required_status_checks` (`Lint`, which now also runs `cargo xtask check-vendoring-integrity`, should already be required — confirm it's
+still there too). If any is missing, stop and complete Task 1 first.
 
 - [ ] **Step 4: Dry-run `vendor-bump.yaml` via `workflow_dispatch` on a harmless case**
 
@@ -2468,7 +2385,7 @@ Watch via `gh run watch`. Expected: the Pull step's `result` output is
 `clean` (git-subrepo's own already-up-to-date short-circuit) and the job
 finishes without pushing a new commit.
 
-- [ ] **Step 5: Confirm a real bump reaches auto-merge or a correctly-red PR, and does NOT self-retrigger**
+- [ ] **Step 5: Confirm a real bump reaches auto-merge or a correctly-red PR, and does NOT self-retrigger or merge prematurely**
 
 Wait for (or manually trigger against) an actual newer tag:
 
@@ -2477,14 +2394,18 @@ gh workflow run vendor-bump.yaml --repo bindreams/hole -f dep=v2ray-core -f tag=
 ```
 
 Watch: does CI (`ci.yaml`) actually rerun on the pushed commit, does the
-PR either auto-merge (via `gh pr view`, confirm auto-merge was armed and
-it eventually merged — not suspiciously early on Renovate's original
-branch-only commit) or sit correctly red/commented, and does
-`vendor-bump.yaml`'s `bump` job run exactly once per push (not loop on its
-own push)? If Renovate's PR-creation is delayed, confirm the
-`arm-on-pr-open` job fires and arms it once the PR does appear. This is
-the property the whole design rests on — confirm it live before
-considering #787 done.
+PR either auto-merge (via `gh pr view`, confirm auto-merge was armed) or
+sit correctly red/commented, and does `vendor-bump.yaml`'s `bump` job run
+exactly once per push (not loop on its own push)? Critically — this is the
+load-bearing fact the whole redesign rests on, and the one thing no
+earlier task could verify without a live PR — confirm auto-merge really
+does NOT fire early on Renovate's original bare `.gitrepo`-only commit
+(before `bump` has pushed anything real): watch `gh pr checks` right after
+Renovate opens the PR and confirm `Test ex-ray (Go)` and `Lint` both sit
+pending/waiting rather than passing on that commit, and that the merge
+timestamp (`gh pr view --json mergedAt`) lands only after `bump`'s own
+push and its required checks go green on that later commit specifically —
+not the instant Renovate's PR opened.
 
 - [ ] **Step 6: Confirm a real conflicted bump end-to-end**
 
@@ -2506,3 +2427,169 @@ own WiX-toolchain version-bump schedule, not something this plan controls)
 — file a GitHub issue now to confirm on the next such PR that its fixup
 commit gets a fresh CI run and can auto-merge, and link it here so this
 doesn't silently fall through unverified.
+
+______________________________________________________________________
+
+### Task 13: `check-vendoring-integrity` xtask command + `prek` wiring
+
+**Added after the rest of this plan was implemented and reviewed** — see
+the Global Constraints and Task 8's rationale for why. Numbered last to
+avoid renumbering already-completed Tasks 9-12, but it is a **prerequisite
+for Task 12** (live verification depends on this check actually existing
+and being wired into a required CI job) and should be executed before
+Task 11 too (`VENDORING.md` documents it). Independent of Tasks 9 and 10 —
+can run before or after either.
+
+**Files:**
+
+- Create: `xtask/src/check_vendoring_integrity.rs`
+- Create: `xtask/src/check_vendoring_integrity_tests.rs`
+- Modify: `xtask/src/lib.rs` (module + test-module declarations, `Command`
+  variant, dispatch, wrapper)
+- Modify: `prek.toml` (new local hook)
+
+**Interfaces:**
+
+- Consumes: `pull_subrepo::gitrepo_field` (already `pub(crate)`, Task 5's
+  fix round), `git_util::run_git`, the `go mod edit -json` pattern
+  `finish_vendor_bump.rs` already uses for parsing a `go.mod`'s `require`
+  lines (reuse the same approach rather than a second hand-rolled parser).
+- Produces: `check_vendoring_integrity::run(repo_root: &Path) -> Result<Vec<String>>` —
+  returns a list of human-readable violation messages (empty = clean). A
+  `Vec` of findings, not a single "the first thing that's wrong" error:
+  a human resolving a conflict by hand benefits from seeing every problem
+  at once, not fixing one and re-running to discover the next. Consumed
+  by a thin CLI wrapper that prints each violation and exits non-zero if
+  the list is non-empty.
+
+**What it checks**, for every subdirectory directly under
+`crates/ex-ray/third_party/` that contains a `.gitrepo` file (dynamic
+discovery — do not hardcode `v2ray-core`/`utls` by name, matching
+`finish_vendor_bump.rs`'s own directory-detection precedent for the
+same reason: a third vendored dep must not need this file edited too):
+
+1. **No merge-conflict markers.** For every file `git ls-files` reports as
+   tracked under that dependency's directory, check for the three
+   standard conflict-marker lines (`<<<<<<< `, `=======`, `>>>>>>> ` — the
+   exact prefixes `git merge`/`git subrepo` write) at the start of a line.
+   Report the file path and line number for every match found — don't
+   stop at the first one, a conflicted pull can produce many. This is the
+   one check that must see `force_commit_conflicted`'s literal
+   marker-laden commits (the CI-only "commit despite conflicts" policy)
+   as well as an ordinary unresolved conflict — both produce the same
+   marker text.
+1. **`VENDORING.md`'s noted version matches `.gitrepo`'s `branch`.**
+   Parse `crates/ex-ray/third_party/VENDORING.md`'s heading for this dep
+   (same `## \`<dep>/\` — pinned **<version>**`shape`finish_vendor_bump::update_vendoring_note_and_commit`writes — reuse its parsing logic if it's already factored out as a helper, or factor it out now if not, rather than a second hand-rolled parser for the same heading format) and compare against`gitrepo_field(contents,
+   "branch")\`. Report a clear mismatch message naming both values if they
+   differ.
+1. **The outer `go.mod`'s require line matches `.gitrepo`'s `branch`, if
+   one exists.** Not every vendored dep necessarily has a direct
+   `require` line in `crates/ex-ray/go.mod` (it could be `// indirect`,
+   or absent if nothing imports it directly) — read the vendored dep's
+   own `go.mod` for its module path (same approach
+   `finish_vendor_bump::read_module_path` uses — reuse it), then check
+   whether `crates/ex-ray/go.mod` has *any* require line (direct or
+   `// indirect`) for that module path. If it does, compare its version
+   against `.gitrepo`'s `branch`; if it doesn't, this check simply
+   doesn't apply to this dep (not a violation — `utls` is currently
+   `// indirect` in the real `crates/ex-ray/go.mod`, confirm this
+   fixture case is covered by a test).
+
+**Test scenarios** (fixture-repo style, matching
+`pull_subrepo/test_support.rs`'s/`finish_vendor_bump/test_support.rs`'s
+established pattern — build a small real repo with a `.gitrepo`, a
+`VENDORING.md`, and an outer `go.mod`, then run `check_vendoring_integrity::run`
+against it for real, not a mock):
+
+- A fully clean, consistent tree → empty violation list.
+
+- Conflict markers present in a tracked file under the dep's directory →
+  reported with file:line.
+
+- Conflict markers in an *untracked* file under the dep's directory → NOT
+  reported (matches `git ls-files`-scoped discovery, not a filesystem
+  walk — an untracked scratch file is not this check's business).
+
+- `VENDORING.md`'s noted version doesn't match `.gitrepo`'s `branch` →
+  reported, naming both values.
+
+- The outer `go.mod` has a require line (direct) for the dep whose
+  version doesn't match `.gitrepo`'s `branch` → reported.
+
+- The outer `go.mod` has an `// indirect` require line that doesn't match
+  → still reported (indirect vs. direct shouldn't matter to this check —
+  either way it's a claim about the version in use).
+
+- The outer `go.mod` has *no* require line at all for the dep (the
+  `utls`-shaped case) → not reported as a violation; the other checks for
+  that dep still run normally.
+
+- Two vendored deps, one clean and one with a violation → only the
+  violating one is reported; confirms per-dep isolation and the
+  dynamic-discovery loop (not hardcoded to a single dep).
+
+- A repo with zero vendored deps (no `.gitrepo` files under
+  `third_party/`) → empty violation list, no error (this check is
+  `always_run` in `prek`, so it executes on every commit in every repo
+  state, including hypothetically none).
+
+- [ ] **Step 1: Write the failing tests**, following the scenarios above.
+
+- [ ] **Step 2: Run to verify they fail** (module doesn't exist yet).
+
+- [ ] **Step 3: Implement**, per the spec above. Reuse existing helpers
+  (`gitrepo_field`, `run_git`, the `go mod edit -json` pattern, `VENDORING.md`
+  heading parsing, `read_module_path`) rather than duplicating any of
+  them — if a needed helper isn't `pub(crate)` yet, make it so, matching
+  how Task 5's fix round already did this for `gitrepo_field`.
+
+- [ ] **Step 4: Run to verify they pass.**
+
+- [ ] **Step 5: Wire the CLI**, mirroring the existing `Command` variants'
+  pattern in `xtask/src/lib.rs` (module + test-module declarations,
+  `Command::CheckVendoringIntegrity` with no arguments — it always
+  operates on the whole repo — dispatch arm, and a wrapper that prints
+  every violation and exits non-zero if the list is non-empty, exits 0
+  with no output otherwise).
+
+- [ ] **Step 6: Wire `prek.toml`**
+
+Add a new local hook, modeled exactly on `check-workspace-lints`'s
+existing pattern (`always_run = true`, `pass_filenames = false`,
+`language = "system"`) so it performs its own file discovery and is
+unaffected by the file's top-level `exclude` (which continues to protect
+vendored code from every *other* hook, unmodified):
+
+```toml
+[[repos.hooks]]
+id = "check-vendoring-integrity"
+name = "check vendored deps for conflict markers and version drift"
+entry = "cargo xtask check-vendoring-integrity"
+language = "system"
+pass_filenames = false
+always_run = true
+```
+
+- [ ] **Step 7: Validate `prek.toml` + run the hook for real**
+
+Run `cargo xtask run prek` (or `prek run check-vendoring-integrity --all-files`) against this repo's actual current state — expect it to
+pass cleanly against the real `v2ray-core`/`utls` vendoring today. This is
+the empirical check that the tool works against the real repo, not just
+the fixtures.
+
+- [ ] **Step 8: Run this repo's mandatory troyka code review** before
+  considering the task done (per this repo's global instructions) — the
+  spec above is a design, not grounded, verified code the way Tasks 2-5's
+  sketches were after their own 5 review rounds; treat every fact above
+  that you can verify empirically (e.g. the exact heading format, the
+  exact conflict-marker prefixes, whether `crates/ex-ray/go.mod` really
+  does carry an `// indirect` require for `utls` today) as a claim to
+  check against the real repo, not an assumption to transcribe.
+
+- [ ] **Step 9: Commit**
+
+```bash
+git add xtask/src/check_vendoring_integrity.rs xtask/src/check_vendoring_integrity_tests.rs xtask/src/lib.rs prek.toml
+git commit -m "feat(xtask): add check-vendoring-integrity, wire into prek's already-required Lint job"
+```
