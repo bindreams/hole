@@ -32,7 +32,7 @@
     },
     {
       "customType": "regex",
-      "managerFilePatterns": ["/^crates/ex-ray/third_party/.+/\\.gitrepo$/"],
+      "managerFilePatterns": ["/^crates/ex-ray/third_party/[^/]+/\\.gitrepo$/"],
       "matchStrings": [
         "remote\\s*=\\s*https://github\\.com/(?<packageName>[^/\\s]+/[^/\\s]+)\\n\\tbranch\\s*=\\s*(?<currentValue>\\S+)"
       ],
