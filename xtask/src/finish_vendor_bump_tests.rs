@@ -1,6 +1,7 @@
 use std::path::Path;
 use std::process::Command;
 
+use super::finish_vendor_bump::test_support::FixtureBuilder;
 use super::finish_vendor_bump::{self, IdentityCheckOutcome};
 
 fn git(cwd: &Path, args: &[&str]) {
@@ -101,44 +102,13 @@ fn failing_identity_check_is_reported_not_swallowed() {
 /// and `run_identity_checks` reaching `IdentityCheckOutcome::Passed`. Two
 /// real, self-contained Go modules (no external imports, so `go mod tidy`
 /// touches nothing over the network) linked by a `replace` directive,
-/// mirroring the real `crates/ex-ray` / vendored-dep pair. No
-/// `transport/internet/tls` directory here, so the v2ray-core-specific
-/// scoped test is correctly skipped (see run_identity_checks).
+/// mirroring the real `crates/ex-ray` / vendored-dep pair. `run_identity_checks`
+/// runs its v2ray-core-scoped test unconditionally (not gated on `subdir`),
+/// so the fixture's `v2ray_core_stub()` gives it a minimal, always-passing
+/// target to run against.
 #[skuld::test]
 fn run_updates_go_mod_and_commits_the_full_sequence() {
-    let dir = tempfile::tempdir().unwrap();
-    let vendored = dir.path().join("crates/ex-ray/third_party/widget");
-    let ex_ray = dir.path().join("crates/ex-ray");
-    let vendoring_dir = dir.path().join("crates/ex-ray/third_party");
-    std::fs::create_dir_all(&vendored).unwrap();
-    std::fs::create_dir_all(&ex_ray).unwrap();
-
-    std::fs::write(vendored.join("go.mod"), "module example.com/widget\n\ngo 1.25\n").unwrap();
-    std::fs::write(vendored.join("main.go"), "package widget\n").unwrap();
-
-    std::fs::write(
-        vendoring_dir.join("VENDORING.md"),
-        "# Vendoring\n\n## `widget/` — pinned **v1.0.0** ([upstream](https://example.com))\n",
-    )
-    .unwrap();
-
-    std::fs::write(
-        ex_ray.join("go.mod"),
-        "module example.com/ex-ray\n\ngo 1.25\n\nrequire example.com/widget v1.0.0\n\nreplace example.com/widget => ./third_party/widget\n",
-    )
-    .unwrap();
-    std::fs::write(
-        ex_ray.join("main.go"),
-        "package main\n\nimport _ \"example.com/widget\"\n\nfunc main() {}\n",
-    )
-    .unwrap();
-    create_passing_v2ray_core_stub(dir.path());
-
-    git(dir.path(), &["init", "--initial-branch=main", "--quiet"]);
-    git(dir.path(), &["config", "user.email", "fixture@example.com"]);
-    git(dir.path(), &["config", "user.name", "fixture"]);
-    git(dir.path(), &["add", "-A"]);
-    git(dir.path(), &["commit", "-m", "initial"]);
+    let fx = FixtureBuilder::default().v2ray_core_stub().build();
 
     // v1.1.0, not v2.0.0: Go's semantic import versioning hard-rejects a
     // require line whose version is v2+ unless the module path itself
@@ -146,25 +116,25 @@ fn run_updates_go_mod_and_commits_the_full_sequence() {
     // toolchain — `go.mod` fails to parse at all, independent of the
     // `replace` directive). `example.com/widget` has no such suffix, so
     // this test bumps within the same major version.
-    let outcome = finish_vendor_bump::run(dir.path(), "crates/ex-ray/third_party/widget", "widget", "v1.1.0").unwrap();
+    let outcome = finish_vendor_bump::run(fx.root(), "crates/ex-ray/third_party/widget", "widget", "v1.1.0").unwrap();
     assert!(
         matches!(outcome, IdentityCheckOutcome::Passed),
         "expected the minimal fixture to pass identity checks"
     );
 
-    let go_mod = std::fs::read_to_string(ex_ray.join("go.mod")).unwrap();
+    let go_mod = std::fs::read_to_string(fx.ex_ray_dir().join("go.mod")).unwrap();
     assert!(
         go_mod.contains("example.com/widget v1.1.0") && !go_mod.contains("vv1.1.0"),
         "require line should be bumped to exactly v1.1.0, not double-prefixed: {go_mod}"
     );
 
-    let note = std::fs::read_to_string(vendoring_dir.join("VENDORING.md")).unwrap();
+    let note = std::fs::read_to_string(fx.vendoring_dir().join("VENDORING.md")).unwrap();
     assert!(note.contains("pinned **v1.1.0**"));
 
     // Re-run with the same target: proves the go.mod/go.sum commit path's
     // own commit_if_staged guard (distinct call site from the
     // VENDORING.md note's) also survives a no-op re-run.
-    let second = finish_vendor_bump::run(dir.path(), "crates/ex-ray/third_party/widget", "widget", "v1.1.0");
+    let second = finish_vendor_bump::run(fx.root(), "crates/ex-ray/third_party/widget", "widget", "v1.1.0");
     assert!(
         second.is_ok(),
         "a second, no-op run must not fail on an empty go.mod/go.sum commit: {second:?}"
@@ -180,55 +150,20 @@ fn run_updates_go_mod_and_commits_the_full_sequence() {
 /// finish-vendor-bump` calls.
 #[skuld::test]
 fn run_commits_earlier_steps_even_when_the_identity_check_fails() {
-    let dir = tempfile::tempdir().unwrap();
-    let vendored = dir.path().join("crates/ex-ray/third_party/widget");
-    let ex_ray = dir.path().join("crates/ex-ray");
-    let vendoring_dir = dir.path().join("crates/ex-ray/third_party");
-    std::fs::create_dir_all(&vendored).unwrap();
-    std::fs::create_dir_all(&ex_ray).unwrap();
-
-    std::fs::write(vendored.join("go.mod"), "module example.com/widget\n\ngo 1.25\n").unwrap();
-    std::fs::write(vendored.join("main.go"), "package widget\n").unwrap();
-
-    std::fs::write(
-        vendoring_dir.join("VENDORING.md"),
-        "# Vendoring\n\n## `widget/` — pinned **v1.0.0** ([upstream](https://example.com))\n",
-    )
-    .unwrap();
-
-    std::fs::write(
-        ex_ray.join("go.mod"),
-        "module example.com/ex-ray\n\ngo 1.25\n\nrequire example.com/widget v1.0.0\n\nreplace example.com/widget => ./third_party/widget\n",
-    )
-    .unwrap();
     // Deliberate test failure in crates/ex-ray's own suite — the FIRST
     // check run_identity_checks performs, so VENDORING.md and go.mod are
-    // already updated and committed by the time this fails.
-    std::fs::write(
-        ex_ray.join("main_test.go"),
-        "package main\n\nimport \"testing\"\n\nfunc TestBroken(t *testing.T) { t.Fatal(\"deliberate failure\") }\n",
-    )
-    .unwrap();
-    // Imports the widget package (unlike a bare `func main() {}`): without
-    // a real reference, `go mod tidy` prunes the require line entirely as
-    // unused rather than merely leaving it at the old version, which would
-    // make the "go.mod should still be bumped" assertion below pass for
-    // the wrong reason (confirmed empirically against the real toolchain).
-    std::fs::write(
-        ex_ray.join("main.go"),
-        "package main\n\nimport _ \"example.com/widget\"\n\nfunc main() {}\n",
-    )
-    .unwrap();
-
-    git(dir.path(), &["init", "--initial-branch=main", "--quiet"]);
-    git(dir.path(), &["config", "user.email", "fixture@example.com"]);
-    git(dir.path(), &["config", "user.name", "fixture"]);
-    git(dir.path(), &["add", "-A"]);
-    git(dir.path(), &["commit", "-m", "initial"]);
+    // already updated and committed by the time this fails. No
+    // `v2ray_core_stub()`: this failure short-circuits before the second,
+    // v2ray-core-scoped check ever runs.
+    let fx = FixtureBuilder::default()
+        .ex_ray_main_test_go(
+            "package main\n\nimport \"testing\"\n\nfunc TestBroken(t *testing.T) { t.Fatal(\"deliberate failure\") }\n",
+        )
+        .build();
 
     // v1.1.0, not v2.0.0 — see the comment in
     // run_updates_go_mod_and_commits_the_full_sequence.
-    let outcome = finish_vendor_bump::run(dir.path(), "crates/ex-ray/third_party/widget", "widget", "v1.1.0").unwrap();
+    let outcome = finish_vendor_bump::run(fx.root(), "crates/ex-ray/third_party/widget", "widget", "v1.1.0").unwrap();
     assert!(
         matches!(outcome, IdentityCheckOutcome::Failed { .. }),
         "expected the deliberate test failure to surface"
@@ -236,7 +171,7 @@ fn run_commits_earlier_steps_even_when_the_identity_check_fails() {
 
     let log = Command::new("git")
         .args(["log", "--format=%s"])
-        .current_dir(dir.path())
+        .current_dir(fx.root())
         .output()
         .unwrap();
     let messages = String::from_utf8_lossy(&log.stdout);
@@ -245,7 +180,7 @@ fn run_commits_earlier_steps_even_when_the_identity_check_fails() {
         "the VENDORING.md/go.mod commits must already be on HEAD despite the identity-check failure: {messages}"
     );
 
-    let go_mod = std::fs::read_to_string(ex_ray.join("go.mod")).unwrap();
+    let go_mod = std::fs::read_to_string(fx.ex_ray_dir().join("go.mod")).unwrap();
     assert!(
         go_mod.contains("v1.1.0"),
         "go.mod should still be bumped even though the identity check failed: {go_mod}"
@@ -317,23 +252,6 @@ fn identity_check_passes_when_all_scoped_v2ray_core_tests_pass() {
 
     let outcome = finish_vendor_bump::run_identity_checks(dir.path()).unwrap();
     assert!(matches!(outcome, IdentityCheckOutcome::Passed));
-}
-
-/// `run_identity_checks` unconditionally runs a scoped `go test` inside
-/// `crates/ex-ray/third_party/v2ray-core`, regardless of which dep is
-/// actually being bumped (see that function's doc comment) — so every
-/// test driving the full `run()` sequence through to
-/// `IdentityCheckOutcome::Passed` needs this minimal, always-passing stub
-/// alongside whatever it's actually bumping.
-fn create_passing_v2ray_core_stub(dir: &Path) {
-    let v2ray_core = dir.join("crates/ex-ray/third_party/v2ray-core");
-    std::fs::create_dir_all(&v2ray_core).unwrap();
-    std::fs::write(v2ray_core.join("go.mod"), "module example.com/v2ray-core\n\ngo 1.25\n").unwrap();
-    for pkg in ["tls", "quic", "hysteria2", "transportcommon"] {
-        let pkg_dir = v2ray_core.join("transport/internet").join(pkg);
-        std::fs::create_dir_all(&pkg_dir).unwrap();
-        std::fs::write(pkg_dir.join(format!("{pkg}.go")), format!("package {pkg}\n")).unwrap();
-    }
 }
 
 #[skuld::test]
@@ -419,50 +337,27 @@ fn update_vendoring_note_fails_when_the_heading_is_malformed_even_with_a_later_b
 /// proving the bump touches only the target entry.
 #[skuld::test]
 fn run_bumps_the_target_line_in_a_block_form_require_and_preserves_the_rest() {
-    let dir = tempfile::tempdir().unwrap();
-    let widget = dir.path().join("crates/ex-ray/third_party/widget");
-    let other = dir.path().join("crates/ex-ray/third_party/other");
-    let ex_ray = dir.path().join("crates/ex-ray");
-    let vendoring_dir = dir.path().join("crates/ex-ray/third_party");
-    std::fs::create_dir_all(&widget).unwrap();
-    std::fs::create_dir_all(&other).unwrap();
-    std::fs::create_dir_all(&ex_ray).unwrap();
+    // `other` is a second, real, locally-replaced module so `go mod tidy`
+    // has a reason to keep it — an unresolvable/unimported "unrelated"
+    // entry would just be pruned as unused, defeating the point of this
+    // test.
+    let fx = FixtureBuilder::default()
+        .extra_dep("other", "module example.com/other\n\ngo 1.25\n", "package other\n")
+        .ex_ray_go_mod(
+            "module example.com/ex-ray\n\ngo 1.25\n\nrequire (\n\texample.com/other v1.9.0\n\t\
+             example.com/widget v1.0.0\n)\n\nreplace example.com/other => ./third_party/other\n\n\
+             replace example.com/widget => ./third_party/widget\n",
+        )
+        .ex_ray_main_go(
+            "package main\n\nimport (\n\t_ \"example.com/other\"\n\t_ \"example.com/widget\"\n)\n\nfunc main() {}\n",
+        )
+        .v2ray_core_stub()
+        .build();
 
-    std::fs::write(widget.join("go.mod"), "module example.com/widget\n\ngo 1.25\n").unwrap();
-    std::fs::write(widget.join("main.go"), "package widget\n").unwrap();
-    // A second, real, locally-replaced module so `go mod tidy` has a
-    // reason to keep it — an unresolvable/unimported "unrelated" entry
-    // would just be pruned as unused, defeating the point of this test.
-    std::fs::write(other.join("go.mod"), "module example.com/other\n\ngo 1.25\n").unwrap();
-    std::fs::write(other.join("main.go"), "package other\n").unwrap();
-
-    std::fs::write(
-        vendoring_dir.join("VENDORING.md"),
-        "# Vendoring\n\n## `widget/` — pinned **v1.0.0** ([upstream](https://example.com))\n",
-    )
-    .unwrap();
-    std::fs::write(
-        ex_ray.join("go.mod"),
-        "module example.com/ex-ray\n\ngo 1.25\n\nrequire (\n\texample.com/other v1.9.0\n\texample.com/widget v1.0.0\n)\n\nreplace example.com/other => ./third_party/other\n\nreplace example.com/widget => ./third_party/widget\n",
-    )
-    .unwrap();
-    std::fs::write(
-        ex_ray.join("main.go"),
-        "package main\n\nimport (\n\t_ \"example.com/other\"\n\t_ \"example.com/widget\"\n)\n\nfunc main() {}\n",
-    )
-    .unwrap();
-    create_passing_v2ray_core_stub(dir.path());
-
-    git(dir.path(), &["init", "--initial-branch=main", "--quiet"]);
-    git(dir.path(), &["config", "user.email", "fixture@example.com"]);
-    git(dir.path(), &["config", "user.name", "fixture"]);
-    git(dir.path(), &["add", "-A"]);
-    git(dir.path(), &["commit", "-m", "initial"]);
-
-    let outcome = finish_vendor_bump::run(dir.path(), "crates/ex-ray/third_party/widget", "widget", "v1.1.0").unwrap();
+    let outcome = finish_vendor_bump::run(fx.root(), "crates/ex-ray/third_party/widget", "widget", "v1.1.0").unwrap();
     assert!(matches!(outcome, IdentityCheckOutcome::Passed));
 
-    let go_mod = std::fs::read_to_string(ex_ray.join("go.mod")).unwrap();
+    let go_mod = std::fs::read_to_string(fx.ex_ray_dir().join("go.mod")).unwrap();
     assert!(
         go_mod.contains("example.com/widget v1.1.0"),
         "target line should be bumped: {go_mod}"
@@ -478,39 +373,20 @@ fn run_bumps_the_target_line_in_a_block_form_require_and_preserves_the_rest() {
 /// must not silently gain a brand-new require line for the wrong tag.
 #[skuld::test]
 fn run_refuses_when_the_module_has_no_existing_require_line() {
-    let dir = tempfile::tempdir().unwrap();
-    let vendored = dir.path().join("crates/ex-ray/third_party/widget");
-    let ex_ray = dir.path().join("crates/ex-ray");
-    let vendoring_dir = dir.path().join("crates/ex-ray/third_party");
-    std::fs::create_dir_all(&vendored).unwrap();
-    std::fs::create_dir_all(&ex_ray).unwrap();
-
-    std::fs::write(vendored.join("go.mod"), "module example.com/widget\n\ngo 1.25\n").unwrap();
-    std::fs::write(vendored.join("main.go"), "package widget\n").unwrap();
-
-    std::fs::write(
-        vendoring_dir.join("VENDORING.md"),
-        "# Vendoring\n\n## `widget/` — pinned **v1.0.0** ([upstream](https://example.com))\n",
-    )
-    .unwrap();
     // No require line for example.com/widget at all.
-    std::fs::write(ex_ray.join("go.mod"), "module example.com/ex-ray\n\ngo 1.25\n").unwrap();
-    std::fs::write(ex_ray.join("main.go"), "package main\n\nfunc main() {}\n").unwrap();
+    let fx = FixtureBuilder::default()
+        .ex_ray_go_mod("module example.com/ex-ray\n\ngo 1.25\n")
+        .ex_ray_main_go("package main\n\nfunc main() {}\n")
+        .build();
 
-    git(dir.path(), &["init", "--initial-branch=main", "--quiet"]);
-    git(dir.path(), &["config", "user.email", "fixture@example.com"]);
-    git(dir.path(), &["config", "user.name", "fixture"]);
-    git(dir.path(), &["add", "-A"]);
-    git(dir.path(), &["commit", "-m", "initial"]);
-
-    let result = finish_vendor_bump::run(dir.path(), "crates/ex-ray/third_party/widget", "widget", "v1.1.0");
+    let result = finish_vendor_bump::run(fx.root(), "crates/ex-ray/third_party/widget", "widget", "v1.1.0");
     let err = result.expect_err("a module with no existing require line must refuse, not silently add one");
     assert!(
         format!("{err:#}").contains("no require line"),
         "error should explain there's nothing to bump: {err:#}"
     );
 
-    let go_mod = std::fs::read_to_string(ex_ray.join("go.mod")).unwrap();
+    let go_mod = std::fs::read_to_string(fx.ex_ray_dir().join("go.mod")).unwrap();
     assert!(
         !go_mod.contains("example.com/widget"),
         "go.mod must not gain a new require line: {go_mod}"
@@ -560,37 +436,18 @@ fn identity_checks_match_the_real_build_yaml_ex_ray_tests_target() {
 
 #[skuld::test]
 fn run_refuses_when_gitrepo_has_no_branch_line() {
-    let dir = tempfile::tempdir().unwrap();
-    let vendored = dir.path().join("crates/ex-ray/third_party/widget");
-    let ex_ray = dir.path().join("crates/ex-ray");
-    let vendoring_dir = dir.path().join("crates/ex-ray/third_party");
-    std::fs::create_dir_all(&vendored).unwrap();
-    std::fs::create_dir_all(&ex_ray).unwrap();
+    // Present but malformed: no `branch = ` line at all. No require line in
+    // ex-ray's go.mod either — this refusal must fire before that would
+    // otherwise matter.
+    let fx = FixtureBuilder::default()
+        .dep_gitrepo(
+            "[subrepo]\n\tremote = https://example.com/widget\n\tcommit = 0000000000000000000000000000000000000000\n",
+        )
+        .ex_ray_go_mod("module example.com/ex-ray\n\ngo 1.25\n")
+        .ex_ray_main_go("package main\n\nfunc main() {}\n")
+        .build();
 
-    std::fs::write(vendored.join("go.mod"), "module example.com/widget\n\ngo 1.25\n").unwrap();
-    std::fs::write(vendored.join("main.go"), "package widget\n").unwrap();
-    // Present but malformed: no `branch = ` line at all.
-    std::fs::write(
-        vendored.join(".gitrepo"),
-        "[subrepo]\n\tremote = https://example.com/widget\n\tcommit = 0000000000000000000000000000000000000000\n",
-    )
-    .unwrap();
-
-    std::fs::write(
-        vendoring_dir.join("VENDORING.md"),
-        "# Vendoring\n\n## `widget/` — pinned **v1.0.0** ([upstream](https://example.com))\n",
-    )
-    .unwrap();
-    std::fs::write(ex_ray.join("go.mod"), "module example.com/ex-ray\n\ngo 1.25\n").unwrap();
-    std::fs::write(ex_ray.join("main.go"), "package main\n\nfunc main() {}\n").unwrap();
-
-    git(dir.path(), &["init", "--initial-branch=main", "--quiet"]);
-    git(dir.path(), &["config", "user.email", "fixture@example.com"]);
-    git(dir.path(), &["config", "user.name", "fixture"]);
-    git(dir.path(), &["add", "-A"]);
-    git(dir.path(), &["commit", "-m", "initial"]);
-
-    let result = finish_vendor_bump::run(dir.path(), "crates/ex-ray/third_party/widget", "widget", "v1.1.0");
+    let result = finish_vendor_bump::run(fx.root(), "crates/ex-ray/third_party/widget", "widget", "v1.1.0");
     let err = result.expect_err("a .gitrepo with no branch line must refuse the run");
     assert!(
         format!("{err:#}").contains("no `branch = ` line"),
@@ -600,32 +457,14 @@ fn run_refuses_when_gitrepo_has_no_branch_line() {
 
 #[skuld::test]
 fn run_fails_with_a_clear_message_when_the_vendored_go_mod_has_no_module_line() {
-    let dir = tempfile::tempdir().unwrap();
-    let vendored = dir.path().join("crates/ex-ray/third_party/widget");
-    let ex_ray = dir.path().join("crates/ex-ray");
-    let vendoring_dir = dir.path().join("crates/ex-ray/third_party");
-    std::fs::create_dir_all(&vendored).unwrap();
-    std::fs::create_dir_all(&ex_ray).unwrap();
+    // No `module` line at all in the vendored dep's own go.mod.
+    let fx = FixtureBuilder::default()
+        .dep_go_mod("go 1.25\n")
+        .ex_ray_go_mod("module example.com/ex-ray\n\ngo 1.25\n")
+        .ex_ray_main_go("package main\n\nfunc main() {}\n")
+        .build();
 
-    // No `module` line at all.
-    std::fs::write(vendored.join("go.mod"), "go 1.25\n").unwrap();
-    std::fs::write(vendored.join("main.go"), "package widget\n").unwrap();
-
-    std::fs::write(
-        vendoring_dir.join("VENDORING.md"),
-        "# Vendoring\n\n## `widget/` — pinned **v1.0.0** ([upstream](https://example.com))\n",
-    )
-    .unwrap();
-    std::fs::write(ex_ray.join("go.mod"), "module example.com/ex-ray\n\ngo 1.25\n").unwrap();
-    std::fs::write(ex_ray.join("main.go"), "package main\n\nfunc main() {}\n").unwrap();
-
-    git(dir.path(), &["init", "--initial-branch=main", "--quiet"]);
-    git(dir.path(), &["config", "user.email", "fixture@example.com"]);
-    git(dir.path(), &["config", "user.name", "fixture"]);
-    git(dir.path(), &["add", "-A"]);
-    git(dir.path(), &["commit", "-m", "initial"]);
-
-    let result = finish_vendor_bump::run(dir.path(), "crates/ex-ray/third_party/widget", "widget", "v1.1.0");
+    let result = finish_vendor_bump::run(fx.root(), "crates/ex-ray/third_party/widget", "widget", "v1.1.0");
     let err = result.expect_err("a vendored go.mod with no module line must fail clearly");
     assert!(
         format!("{err:#}").contains("no `module` line"),
@@ -681,54 +520,25 @@ fn run_refuses_when_dep_name_does_not_match_subdirs_final_component() {
 /// nothing in the identity check inspects a version string.
 #[skuld::test]
 fn run_refuses_when_gitrepo_branch_does_not_match_new_tag() {
-    let dir = tempfile::tempdir().unwrap();
-    let vendored = dir.path().join("crates/ex-ray/third_party/widget");
-    let ex_ray = dir.path().join("crates/ex-ray");
-    let vendoring_dir = dir.path().join("crates/ex-ray/third_party");
-    std::fs::create_dir_all(&vendored).unwrap();
-    std::fs::create_dir_all(&ex_ray).unwrap();
-
-    std::fs::write(vendored.join("go.mod"), "module example.com/widget\n\ngo 1.25\n").unwrap();
-    std::fs::write(vendored.join("main.go"), "package widget\n").unwrap();
     // .gitrepo still records the OLD tag — the exact state a human leaves
     // behind by skipping the documented manual fixup after resolving a
     // conflict by hand.
-    std::fs::write(
-        vendored.join(".gitrepo"),
-        "[subrepo]\n\tremote = https://example.com/widget\n\tbranch = v1.0.0\n\tcommit = 0000000000000000000000000000000000000000\n\tparent = 0000000000000000000000000000000000000000\n\tmethod = merge\n\tcmdver = 0.4.9\n",
-    )
-    .unwrap();
+    let fx = FixtureBuilder::default()
+        .dep_gitrepo(
+            "[subrepo]\n\tremote = https://example.com/widget\n\tbranch = v1.0.0\n\t\
+             commit = 0000000000000000000000000000000000000000\n\t\
+             parent = 0000000000000000000000000000000000000000\n\tmethod = merge\n\tcmdver = 0.4.9\n",
+        )
+        .build();
 
-    std::fs::write(
-        vendoring_dir.join("VENDORING.md"),
-        "# Vendoring\n\n## `widget/` — pinned **v1.0.0** ([upstream](https://example.com))\n",
-    )
-    .unwrap();
-    std::fs::write(
-        ex_ray.join("go.mod"),
-        "module example.com/ex-ray\n\ngo 1.25\n\nrequire example.com/widget v1.0.0\n\nreplace example.com/widget => ./third_party/widget\n",
-    )
-    .unwrap();
-    std::fs::write(
-        ex_ray.join("main.go"),
-        "package main\n\nimport _ \"example.com/widget\"\n\nfunc main() {}\n",
-    )
-    .unwrap();
-
-    git(dir.path(), &["init", "--initial-branch=main", "--quiet"]);
-    git(dir.path(), &["config", "user.email", "fixture@example.com"]);
-    git(dir.path(), &["config", "user.name", "fixture"]);
-    git(dir.path(), &["add", "-A"]);
-    git(dir.path(), &["commit", "-m", "initial"]);
-
-    let result = finish_vendor_bump::run(dir.path(), "crates/ex-ray/third_party/widget", "widget", "v1.1.0");
+    let result = finish_vendor_bump::run(fx.root(), "crates/ex-ray/third_party/widget", "widget", "v1.1.0");
     let err = result.expect_err("a mismatched .gitrepo branch must refuse the run");
     assert!(
         format!("{err:#}").contains("v1.0.0") && format!("{err:#}").contains("v1.1.0"),
         "error should name both the recorded and the requested tag: {err:#}"
     );
 
-    let note = std::fs::read_to_string(vendoring_dir.join("VENDORING.md")).unwrap();
+    let note = std::fs::read_to_string(fx.vendoring_dir().join("VENDORING.md")).unwrap();
     assert!(
         note.contains("pinned **v1.0.0**"),
         "VENDORING.md must not be touched before the .gitrepo cross-check: {note}"
@@ -745,50 +555,28 @@ fn run_refuses_when_gitrepo_branch_does_not_match_new_tag() {
 /// must surface as an error, not a silently-wrong commit.
 #[skuld::test]
 fn run_bails_when_go_mod_tidy_raises_the_version_above_what_was_requested() {
-    let dir = tempfile::tempdir().unwrap();
-    let widget = dir.path().join("crates/ex-ray/third_party/widget");
-    let mid = dir.path().join("crates/ex-ray/third_party/mid");
-    let ex_ray = dir.path().join("crates/ex-ray");
-    let vendoring_dir = dir.path().join("crates/ex-ray/third_party");
-    std::fs::create_dir_all(&widget).unwrap();
-    std::fs::create_dir_all(&mid).unwrap();
-    std::fs::create_dir_all(&ex_ray).unwrap();
-
-    std::fs::write(widget.join("go.mod"), "module example.com/widget\n\ngo 1.25\n").unwrap();
-    std::fs::write(widget.join("main.go"), "package widget\n").unwrap();
-
     // `mid` requires widget at v1.5.0 directly — higher than the v1.2.0
-    // bump attempted below.
-    std::fs::write(
-        mid.join("go.mod"),
-        "module example.com/mid\n\ngo 1.25\n\nrequire example.com/widget v1.5.0\n\nreplace example.com/widget => ../widget\n",
-    )
-    .unwrap();
-    std::fs::write(mid.join("main.go"), "package mid\n\nimport _ \"example.com/widget\"\n").unwrap();
+    // bump attempted below. No `v2ray_core_stub()`: this bail happens
+    // inside `run_go_mod_tidy_and_commit`, before `run_identity_checks`
+    // ever runs.
+    let fx = FixtureBuilder::default()
+        .extra_dep(
+            "mid",
+            "module example.com/mid\n\ngo 1.25\n\nrequire example.com/widget v1.5.0\n\n\
+             replace example.com/widget => ../widget\n",
+            "package mid\n\nimport _ \"example.com/widget\"\n",
+        )
+        .ex_ray_go_mod(
+            "module example.com/ex-ray\n\ngo 1.25\n\nrequire (\n\texample.com/mid v1.0.0\n\t\
+             example.com/widget v1.0.0\n)\n\nreplace example.com/widget => ./third_party/widget\n\n\
+             replace example.com/mid => ./third_party/mid\n",
+        )
+        .ex_ray_main_go(
+            "package main\n\nimport (\n\t_ \"example.com/mid\"\n\t_ \"example.com/widget\"\n)\n\nfunc main() {}\n",
+        )
+        .build();
 
-    std::fs::write(
-        vendoring_dir.join("VENDORING.md"),
-        "# Vendoring\n\n## `widget/` — pinned **v1.0.0** ([upstream](https://example.com))\n",
-    )
-    .unwrap();
-    std::fs::write(
-        ex_ray.join("go.mod"),
-        "module example.com/ex-ray\n\ngo 1.25\n\nrequire (\n\texample.com/mid v1.0.0\n\texample.com/widget v1.0.0\n)\n\nreplace example.com/widget => ./third_party/widget\n\nreplace example.com/mid => ./third_party/mid\n",
-    )
-    .unwrap();
-    std::fs::write(
-        ex_ray.join("main.go"),
-        "package main\n\nimport (\n\t_ \"example.com/mid\"\n\t_ \"example.com/widget\"\n)\n\nfunc main() {}\n",
-    )
-    .unwrap();
-
-    git(dir.path(), &["init", "--initial-branch=main", "--quiet"]);
-    git(dir.path(), &["config", "user.email", "fixture@example.com"]);
-    git(dir.path(), &["config", "user.name", "fixture"]);
-    git(dir.path(), &["add", "-A"]);
-    git(dir.path(), &["commit", "-m", "initial"]);
-
-    let result = finish_vendor_bump::run(dir.path(), "crates/ex-ray/third_party/widget", "widget", "v1.2.0");
+    let result = finish_vendor_bump::run(fx.root(), "crates/ex-ray/third_party/widget", "widget", "v1.2.0");
     let err = result.expect_err("go mod tidy raising the version above v1.2.0 must surface as an error");
     let message = format!("{err:#}");
     assert!(
@@ -801,7 +589,7 @@ fn run_bails_when_go_mod_tidy_raises_the_version_above_what_was_requested() {
          VENDORING.md-commit disclosure as the go-mod-tidy-command-failure case: {message}"
     );
 
-    let go_mod = std::fs::read_to_string(ex_ray.join("go.mod")).unwrap();
+    let go_mod = std::fs::read_to_string(fx.ex_ray_dir().join("go.mod")).unwrap();
     assert!(
         go_mod.contains("v1.5.0"),
         "go.mod is left showing what `go mod tidy` actually produced, for inspection: {go_mod}"
@@ -815,38 +603,14 @@ fn run_bails_when_go_mod_tidy_raises_the_version_above_what_was_requested() {
 /// disclosure as every other failure inside `run_go_mod_tidy_and_commit`.
 #[skuld::test]
 fn run_bails_when_go_mod_tidy_prunes_the_require_line_as_unused() {
-    let dir = tempfile::tempdir().unwrap();
-    let widget = dir.path().join("crates/ex-ray/third_party/widget");
-    let ex_ray = dir.path().join("crates/ex-ray");
-    let vendoring_dir = dir.path().join("crates/ex-ray/third_party");
-    std::fs::create_dir_all(&widget).unwrap();
-    std::fs::create_dir_all(&ex_ray).unwrap();
-
-    std::fs::write(widget.join("go.mod"), "module example.com/widget\n\ngo 1.25\n").unwrap();
-    std::fs::write(widget.join("main.go"), "package widget\n").unwrap();
-
-    std::fs::write(
-        vendoring_dir.join("VENDORING.md"),
-        "# Vendoring\n\n## `widget/` — pinned **v1.0.0** ([upstream](https://example.com))\n",
-    )
-    .unwrap();
-    std::fs::write(
-        ex_ray.join("go.mod"),
-        "module example.com/ex-ray\n\ngo 1.25\n\nrequire example.com/widget v1.0.0\n\nreplace example.com/widget => ./third_party/widget\n",
-    )
-    .unwrap();
     // Deliberately does NOT import widget — `go mod tidy` prunes the
     // require line entirely as unused.
-    std::fs::write(ex_ray.join("main.go"), "package main\n\nfunc main() {}\n").unwrap();
-    create_passing_v2ray_core_stub(dir.path());
+    let fx = FixtureBuilder::default()
+        .ex_ray_main_go("package main\n\nfunc main() {}\n")
+        .v2ray_core_stub()
+        .build();
 
-    git(dir.path(), &["init", "--initial-branch=main", "--quiet"]);
-    git(dir.path(), &["config", "user.email", "fixture@example.com"]);
-    git(dir.path(), &["config", "user.name", "fixture"]);
-    git(dir.path(), &["add", "-A"]);
-    git(dir.path(), &["commit", "-m", "initial"]);
-
-    let result = finish_vendor_bump::run(dir.path(), "crates/ex-ray/third_party/widget", "widget", "v1.1.0");
+    let result = finish_vendor_bump::run(fx.root(), "crates/ex-ray/third_party/widget", "widget", "v1.1.0");
     let err = result.expect_err("a pruned require line must surface as an error, not an empty commit");
     let message = format!("{err:#}");
     assert!(
@@ -862,7 +626,7 @@ fn run_bails_when_go_mod_tidy_prunes_the_require_line_as_unused() {
     // human-authored replace just because nothing requires it anymore) —
     // only the `require` line vanishes, so check for that specifically
     // rather than any mention of the module path.
-    let go_mod = std::fs::read_to_string(ex_ray.join("go.mod")).unwrap();
+    let go_mod = std::fs::read_to_string(fx.ex_ray_dir().join("go.mod")).unwrap();
     assert!(
         !go_mod.contains("require"),
         "go.mod's require line should be pruned, left for inspection: {go_mod}"
@@ -877,51 +641,22 @@ fn run_bails_when_go_mod_tidy_prunes_the_require_line_as_unused() {
 /// the index is a hard `git add` error).
 #[skuld::test]
 fn a_tracked_go_sum_deleted_from_disk_has_its_deletion_committed() {
-    let dir = tempfile::tempdir().unwrap();
-    let vendored = dir.path().join("crates/ex-ray/third_party/widget");
-    let ex_ray = dir.path().join("crates/ex-ray");
-    let vendoring_dir = dir.path().join("crates/ex-ray/third_party");
-    std::fs::create_dir_all(&vendored).unwrap();
-    std::fs::create_dir_all(&ex_ray).unwrap();
-
-    std::fs::write(vendored.join("go.mod"), "module example.com/widget\n\ngo 1.25\n").unwrap();
-    std::fs::write(vendored.join("main.go"), "package widget\n").unwrap();
-
-    std::fs::write(
-        vendoring_dir.join("VENDORING.md"),
-        "# Vendoring\n\n## `widget/` — pinned **v1.0.0** ([upstream](https://example.com))\n",
-    )
-    .unwrap();
-    std::fs::write(
-        ex_ray.join("go.mod"),
-        "module example.com/ex-ray\n\ngo 1.25\n\nrequire example.com/widget v1.0.0\n\nreplace example.com/widget => ./third_party/widget\n",
-    )
-    .unwrap();
-    std::fs::write(
-        ex_ray.join("main.go"),
-        "package main\n\nimport _ \"example.com/widget\"\n\nfunc main() {}\n",
-    )
-    .unwrap();
     // A go.sum tracked from an earlier vendoring state — its content
     // doesn't matter here, nothing in this path parses it.
-    std::fs::write(ex_ray.join("go.sum"), "stale checksum line\n").unwrap();
-    create_passing_v2ray_core_stub(dir.path());
-
-    git(dir.path(), &["init", "--initial-branch=main", "--quiet"]);
-    git(dir.path(), &["config", "user.email", "fixture@example.com"]);
-    git(dir.path(), &["config", "user.name", "fixture"]);
-    git(dir.path(), &["add", "-A"]);
-    git(dir.path(), &["commit", "-m", "initial"]);
+    let fx = FixtureBuilder::default()
+        .go_sum("stale checksum line\n")
+        .v2ray_core_stub()
+        .build();
 
     // Deleted from disk without telling git — matches a `go.sum` whose
     // checksums this bump no longer needs, however it came to vanish.
-    std::fs::remove_file(ex_ray.join("go.sum")).unwrap();
+    std::fs::remove_file(fx.ex_ray_dir().join("go.sum")).unwrap();
 
-    finish_vendor_bump::run(dir.path(), "crates/ex-ray/third_party/widget", "widget", "v1.1.0").unwrap();
+    finish_vendor_bump::run(fx.root(), "crates/ex-ray/third_party/widget", "widget", "v1.1.0").unwrap();
 
     let tracked = Command::new("git")
         .args(["ls-files", "--", "crates/ex-ray/go.sum"])
-        .current_dir(dir.path())
+        .current_dir(fx.root())
         .output()
         .unwrap();
     assert!(
@@ -930,7 +665,7 @@ fn a_tracked_go_sum_deleted_from_disk_has_its_deletion_committed() {
     );
     let status = Command::new("git")
         .args(["status", "--porcelain"])
-        .current_dir(dir.path())
+        .current_dir(fx.root())
         .output()
         .unwrap();
     let status_str = String::from_utf8_lossy(&status.stdout);
@@ -948,42 +683,17 @@ fn a_tracked_go_sum_deleted_from_disk_has_its_deletion_committed() {
 /// original content rather than left half-applied and uncommitted.
 #[skuld::test]
 fn run_discloses_the_landed_vendoring_commit_when_go_mod_tidy_itself_fails() {
-    let dir = tempfile::tempdir().unwrap();
-    let vendored = dir.path().join("crates/ex-ray/third_party/widget");
-    let ex_ray = dir.path().join("crates/ex-ray");
-    let vendoring_dir = dir.path().join("crates/ex-ray/third_party");
-    std::fs::create_dir_all(&vendored).unwrap();
-    std::fs::create_dir_all(&ex_ray).unwrap();
-
-    std::fs::write(vendored.join("go.mod"), "module example.com/widget\n\ngo 1.25\n").unwrap();
-    std::fs::write(vendored.join("main.go"), "package widget\n").unwrap();
-
-    std::fs::write(
-        vendoring_dir.join("VENDORING.md"),
-        "# Vendoring\n\n## `widget/` — pinned **v1.0.0** ([upstream](https://example.com))\n",
-    )
-    .unwrap();
     // The `replace` target doesn't exist — `go mod tidy` fails
     // deterministically and offline, regardless of the require-line
     // rewrite succeeding.
-    std::fs::write(
-        ex_ray.join("go.mod"),
-        "module example.com/ex-ray\n\ngo 1.25\n\nrequire example.com/widget v1.0.0\n\nreplace example.com/widget => ./third_party/does-not-exist\n",
-    )
-    .unwrap();
-    std::fs::write(
-        ex_ray.join("main.go"),
-        "package main\n\nimport _ \"example.com/widget\"\n\nfunc main() {}\n",
-    )
-    .unwrap();
+    let fx = FixtureBuilder::default()
+        .ex_ray_go_mod(
+            "module example.com/ex-ray\n\ngo 1.25\n\nrequire example.com/widget v1.0.0\n\n\
+             replace example.com/widget => ./third_party/does-not-exist\n",
+        )
+        .build();
 
-    git(dir.path(), &["init", "--initial-branch=main", "--quiet"]);
-    git(dir.path(), &["config", "user.email", "fixture@example.com"]);
-    git(dir.path(), &["config", "user.name", "fixture"]);
-    git(dir.path(), &["add", "-A"]);
-    git(dir.path(), &["commit", "-m", "initial"]);
-
-    let result = finish_vendor_bump::run(dir.path(), "crates/ex-ray/third_party/widget", "widget", "v1.1.0");
+    let result = finish_vendor_bump::run(fx.root(), "crates/ex-ray/third_party/widget", "widget", "v1.1.0");
     let err = result.expect_err("a nonexistent replace target must fail go mod tidy");
     let message = format!("{err:#}");
     assert!(
@@ -997,7 +707,7 @@ fn run_discloses_the_landed_vendoring_commit_when_go_mod_tidy_itself_fails() {
 
     let log = Command::new("git")
         .args(["log", "-1", "--format=%s"])
-        .current_dir(dir.path())
+        .current_dir(fx.root())
         .output()
         .unwrap();
     assert!(
@@ -1005,7 +715,7 @@ fn run_discloses_the_landed_vendoring_commit_when_go_mod_tidy_itself_fails() {
         "the VENDORING.md commit must actually be on HEAD, matching what the disclosure claims"
     );
 
-    let go_mod = std::fs::read_to_string(ex_ray.join("go.mod")).unwrap();
+    let go_mod = std::fs::read_to_string(fx.ex_ray_dir().join("go.mod")).unwrap();
     assert!(
         go_mod.contains("v1.0.0") && !go_mod.contains("v1.1.0"),
         "go.mod should be restored to its pre-rewrite state after go mod tidy fails: {go_mod}"
@@ -1021,54 +731,29 @@ fn run_discloses_the_landed_vendoring_commit_when_go_mod_tidy_itself_fails() {
 /// sequence.
 #[skuld::test]
 fn run_folds_a_restore_failure_into_the_returned_error() {
-    let dir = tempfile::tempdir().unwrap();
-    let vendored = dir.path().join("crates/ex-ray/third_party/widget");
-    let ex_ray = dir.path().join("crates/ex-ray");
-    let vendoring_dir = dir.path().join("crates/ex-ray/third_party");
-    std::fs::create_dir_all(&vendored).unwrap();
-    std::fs::create_dir_all(&ex_ray).unwrap();
-
-    std::fs::write(vendored.join("go.mod"), "module example.com/widget\n\ngo 1.25\n").unwrap();
-    std::fs::write(vendored.join("main.go"), "package widget\n").unwrap();
-
-    std::fs::write(
-        vendoring_dir.join("VENDORING.md"),
-        "# Vendoring\n\n## `widget/` — pinned **v1.0.0** ([upstream](https://example.com))\n",
-    )
-    .unwrap();
     // The `replace` target doesn't exist — `go mod tidy` fails
     // deterministically and offline (see the sibling disclosure test).
-    std::fs::write(
-        ex_ray.join("go.mod"),
-        "module example.com/ex-ray\n\ngo 1.25\n\nrequire example.com/widget v1.0.0\n\nreplace example.com/widget => ./third_party/does-not-exist\n",
-    )
-    .unwrap();
-    std::fs::write(
-        ex_ray.join("main.go"),
-        "package main\n\nimport _ \"example.com/widget\"\n\nfunc main() {}\n",
-    )
-    .unwrap();
-    let go_sum = ex_ray.join("go.sum");
-    std::fs::write(&go_sum, "stale checksum line\n").unwrap();
+    let fx = FixtureBuilder::default()
+        .ex_ray_go_mod(
+            "module example.com/ex-ray\n\ngo 1.25\n\nrequire example.com/widget v1.0.0\n\n\
+             replace example.com/widget => ./third_party/does-not-exist\n",
+        )
+        .go_sum("stale checksum line\n")
+        .build();
+    let go_sum = fx.ex_ray_dir().join("go.sum");
 
-    git(dir.path(), &["init", "--initial-branch=main", "--quiet"]);
-    git(dir.path(), &["config", "user.email", "fixture@example.com"]);
-    git(dir.path(), &["config", "user.name", "fixture"]);
-    git(dir.path(), &["add", "-A"]);
-    git(dir.path(), &["commit", "-m", "initial"]);
-
-    // Made read-only only now, after the commit above (which just reads
-    // the file — read-only doesn't block that). The original permissions
-    // are kept so cleanup below restores the exact prior mode rather than
-    // blanket-clearing to world-writable (`set_readonly(false)` on Unix
-    // sets 0o666, which clippy's `permissions_set_readonly_false` lint
-    // flags for exactly this reason).
+    // Made read-only only now, after the fixture's own commit (which just
+    // reads the file — read-only doesn't block that). The original
+    // permissions are kept so cleanup below restores the exact prior mode
+    // rather than blanket-clearing to world-writable (`set_readonly(false)`
+    // on Unix sets 0o666, which clippy's `permissions_set_readonly_false`
+    // lint flags for exactly this reason).
     let original_perms = std::fs::metadata(&go_sum).unwrap().permissions();
     let mut readonly_perms = original_perms.clone();
     readonly_perms.set_readonly(true);
     std::fs::set_permissions(&go_sum, readonly_perms).unwrap();
 
-    let result = finish_vendor_bump::run(dir.path(), "crates/ex-ray/third_party/widget", "widget", "v1.1.0");
+    let result = finish_vendor_bump::run(fx.root(), "crates/ex-ray/third_party/widget", "widget", "v1.1.0");
 
     // Restore writability before any assertion can early-return via
     // `assert!` panicking, so `TempDir`'s teardown can still delete it.

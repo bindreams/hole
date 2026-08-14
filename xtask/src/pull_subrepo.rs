@@ -454,7 +454,7 @@ fn ensure_tag_pin_matches(repo_root: &Path, subdir: &str, tag: &str) -> Result<(
     Ok(())
 }
 
-fn gitrepo_field(contents: &str, field: &str) -> Option<String> {
+pub(crate) fn gitrepo_field(contents: &str, field: &str) -> Option<String> {
     let prefix = format!("{field} =");
     contents.lines().find_map(|line| {
         line.trim_start()

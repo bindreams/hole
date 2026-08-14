@@ -9,6 +9,11 @@ use std::process::Command;
 use anyhow::{bail, Context, Result};
 
 use crate::git_util::run_git;
+use crate::pull_subrepo::gitrepo_field;
+
+#[cfg(test)]
+#[path = "finish_vendor_bump/test_support.rs"]
+pub(crate) mod test_support;
 
 #[derive(Debug)]
 pub enum IdentityCheckOutcome {
@@ -76,10 +81,8 @@ fn ensure_gitrepo_branch_matches(repo_root: &Path, subdir: &str, new_tag: &str) 
     }
     let contents =
         std::fs::read_to_string(&gitrepo_path).with_context(|| format!("failed to read {}", gitrepo_path.display()))?;
-    let branch = contents
-        .lines()
-        .find_map(|line| line.trim_start().strip_prefix("branch =").map(str::trim));
-    match branch {
+    let branch = gitrepo_field(&contents, "branch");
+    match branch.as_deref() {
         Some(b) if b == new_tag => Ok(()),
         Some(b) => bail!(
             "{} still records `branch = {b}`, not the requested `{new_tag}` — if you resolved a \
