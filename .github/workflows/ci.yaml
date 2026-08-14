@@ -224,6 +224,18 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      # macOS runners ship only Apple's frozen Bash 3.2.57 (GPLv3 holdout) on
+      # /usr/bin/bash, ahead of Homebrew's bash on PATH; git-subrepo's
+      # `#!/usr/bin/env bash` shebang hard-requires Bash 4+ and refuses to run
+      # under 3.2. `brew install bash` puts a 4+ build in /opt/homebrew/bin
+      # (arm64) or /usr/local/bin (intel), both of which precede /usr/bin on
+      # the runner's default PATH. Linux and Windows (Git for Windows) already
+      # ship Bash 4+, so this is scoped to macOS only.
+      - name: Install Bash 4+ (macOS only, for git-subrepo)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: brew install bash
+
       - name: Install git-subrepo 0.4.9
         shell: bash
         run: |
