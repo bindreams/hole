@@ -1,0 +1,31 @@
+name: Mint nathan-blahaj token
+description: >-
+  Mint a short-lived GitHub App installation token for nathan-blahaj, the
+  bot identity used by any workflow that pushes commits and needs those
+  pushes to retrigger downstream required-status-check workflows (pushes
+  made with the default GITHUB_TOKEN do not retrigger them — GitHub's
+  anti-recursion behavior). No server or webhook involved; this just calls
+  GitHub's token-minting API with the App's credentials.
+
+inputs:
+  app-id:
+    description: nathan-blahaj's GitHub App ID (from secrets.NATHAN_APP_ID)
+    required: true
+  private-key:
+    description: nathan-blahaj's GitHub App private key (from secrets.NATHAN_APP_PRIVATE_KEY)
+    required: true
+
+outputs:
+  token:
+    description: Short-lived (1 hour) installation token
+    value: ${{ steps.mint.outputs.token }}
+
+runs:
+  using: composite
+  steps:
+    - name: Mint installation token
+      id: mint
+      uses: actions/create-github-app-token@v2
+      with:
+        app-id: ${{ inputs.app-id }}
+        private-key: ${{ inputs.private-key }}
