@@ -2218,7 +2218,7 @@ jobs:
       - name: Fail the job if Finish failed
         if: steps.finish.outcome == 'failure'
         run: |
-          echo "::error::the 'Finish' step failed — see its log above for the reason (an identity-check failure, or an earlier error like a malformed go.mod/VENDORING.md heading). Any commits it made before failing were still pushed."
+          echo "::error::the 'Finish' step failed — see its log above for the reason (an identity-check failure, an unresolved .vendor-conflict sentinel left by a prior conflicted push, or an earlier error like a malformed go.mod/VENDORING.md heading). Any commits it made before failing were still pushed."
           exit 1
 ```
 
