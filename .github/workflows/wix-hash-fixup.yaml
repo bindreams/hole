@@ -13,7 +13,22 @@ jobs:
     name: Update WiX hash
     runs-on: ubuntu-latest
     steps:
+      # `uses: ./...` (below) resolves against the checked-out workspace,
+      # which is empty at job start — this bootstrap checkout exists only
+      # to make the local mint-nathan-token action resolvable. The real
+      # checkout follows once the token exists.
       - uses: actions/checkout@v7
+
+      - name: Mint nathan-blahaj token
+        id: nathan
+        uses: ./.github/actions/mint-nathan-token
+        with:
+          app-id: ${{ secrets.NATHAN_APP_ID }}
+          private-key: ${{ secrets.NATHAN_APP_PRIVATE_KEY }}
+
+      - uses: actions/checkout@v7
+        with:
+          token: ${{ steps.nathan.outputs.token }}
 
       - uses: astral-sh/setup-uv@v9.0.0
 
@@ -23,8 +38,8 @@ jobs:
       - name: Commit if changed
         run: |
           git diff --quiet && exit 0
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config user.name "nathan-blahaj[bot]"
+          git config user.email "nathan-blahaj[bot]@users.noreply.github.com"
           git add msi-installer/src/msi_installer/wix-toolchain.toml
           git commit -m "Update WiX toolchain URL and SHA256"
           git push
