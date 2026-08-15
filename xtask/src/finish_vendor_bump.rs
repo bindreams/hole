@@ -8,7 +8,7 @@ use std::process::Command;
 
 use anyhow::{bail, Context, Result};
 
-use crate::git_util::{hash_object_or_deleted, run_git, run_git_with_env};
+use crate::git_util::{head_blob_hash_or_deleted, run_git, run_git_with_env};
 use crate::pull_subrepo::{gitrepo_field, skip_check_vendoring_integrity};
 
 #[cfg(test)]
@@ -98,7 +98,7 @@ fn clear_vendor_conflict_sentinel_if_resolved(repo_root: &Path, subdir: &str) ->
                 sentinel_path.display()
             );
         };
-        let current_hash = hash_object_or_deleted(&dep_dir, path)?;
+        let current_hash = head_blob_hash_or_deleted(&dep_dir, path)?;
         if current_hash == recorded_hash {
             bail!(
                 "`{subdir}/.vendor-conflict` still lists `{path}` as unchanged since the conflicted \

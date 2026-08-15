@@ -1,7 +1,10 @@
 use std::path::Path;
 use std::process::Command;
 
-use super::git_util::{disclose_prior_commit, hash_object_or_deleted, merge_skip_value, run_git, run_git_with_env};
+use super::git_util::{
+    disclose_prior_commit, head_blob_hash_or_deleted, index_blob_hash_or_deleted, merge_skip_value, run_git,
+    run_git_with_env,
+};
 
 fn git(cwd: &Path, args: &[&str]) {
     let status = Command::new("git")
@@ -142,11 +145,47 @@ fn merge_skip_value_unions_with_a_pre_existing_value_as_a_comma_join() {
 }
 
 #[skuld::test]
-fn hash_object_or_deleted_returns_the_git_blob_hash_for_a_present_file() {
+fn index_blob_hash_or_deleted_returns_the_staged_blob_hash_for_a_present_file() {
     let dir = tempfile::tempdir().unwrap();
     git(dir.path(), &["init", "--initial-branch=main", "--quiet"]);
     std::fs::write(dir.path().join("f.txt"), "hello\n").unwrap();
+    git(dir.path(), &["add", "f.txt"]);
 
+    let output = Command::new("git")
+        .args(["rev-parse", ":./f.txt"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    let expected = String::from_utf8_lossy(&output.stdout).trim().to_string();
+
+    let actual = index_blob_hash_or_deleted(dir.path(), "f.txt").unwrap();
+    assert_eq!(actual, expected);
+}
+
+#[skuld::test]
+fn index_blob_hash_or_deleted_returns_deleted_sentinel_for_an_unstaged_file() {
+    let dir = tempfile::tempdir().unwrap();
+    git(dir.path(), &["init", "--initial-branch=main", "--quiet"]);
+
+    let actual = index_blob_hash_or_deleted(dir.path(), "missing.txt").unwrap();
+    assert_eq!(actual, "<deleted>");
+}
+
+#[skuld::test]
+fn head_blob_hash_or_deleted_returns_the_committed_blob_hash_for_a_present_file() {
+    let dir = tempfile::tempdir().unwrap();
+    git(dir.path(), &["init", "--initial-branch=main", "--quiet"]);
+    git(dir.path(), &["config", "user.email", "fixture@example.com"]);
+    git(dir.path(), &["config", "user.name", "fixture"]);
+    std::fs::write(dir.path().join("f.txt"), "hello\n").unwrap();
+    git(dir.path(), &["add", "f.txt"]);
+    git(dir.path(), &["commit", "-m", "initial"]);
+
+    // This fixture never crosses a checkout boundary between write and
+    // read, so a plain (filtered) `hash-object` call agrees with the
+    // committed blob here regardless of platform — the smudge-immunity
+    // this helper actually exists for is covered by the dedicated autocrlf
+    // fixture below, which does cross that boundary.
     let output = Command::new("git")
         .args(["hash-object", "f.txt"])
         .current_dir(dir.path())
@@ -154,15 +193,71 @@ fn hash_object_or_deleted_returns_the_git_blob_hash_for_a_present_file() {
         .unwrap();
     let expected = String::from_utf8_lossy(&output.stdout).trim().to_string();
 
-    let actual = hash_object_or_deleted(dir.path(), "f.txt").unwrap();
+    let actual = head_blob_hash_or_deleted(dir.path(), "f.txt").unwrap();
     assert_eq!(actual, expected);
 }
 
 #[skuld::test]
-fn hash_object_or_deleted_returns_deleted_sentinel_for_an_absent_file() {
+fn head_blob_hash_or_deleted_returns_deleted_sentinel_for_a_path_not_in_head() {
     let dir = tempfile::tempdir().unwrap();
     git(dir.path(), &["init", "--initial-branch=main", "--quiet"]);
+    git(dir.path(), &["config", "user.email", "fixture@example.com"]);
+    git(dir.path(), &["config", "user.name", "fixture"]);
+    std::fs::write(dir.path().join("other.txt"), "x\n").unwrap();
+    git(dir.path(), &["add", "-A"]);
+    git(dir.path(), &["commit", "-m", "initial"]);
 
-    let actual = hash_object_or_deleted(dir.path(), "missing.txt").unwrap();
+    let actual = head_blob_hash_or_deleted(dir.path(), "missing.txt").unwrap();
     assert_eq!(actual, "<deleted>");
+}
+
+// The real bug this pair of helpers exists to fix: a checkout between
+// write-time and read-time can smudge a text file's line endings on disk
+// (Windows' `core.autocrlf=true` — GitHub's windows-latest runners default
+// to it) without changing what's actually stored in git. Re-hashing
+// filesystem content across that boundary (the old `hash_object_or_deleted`,
+// even with `--no-filters`) silently diverges from the canonical blob;
+// reading straight from the index/HEAD never does. `core.autocrlf` is set
+// locally on the fixture (not globally) so this reproduces deterministically
+// on any host, regardless of the developer's own git config.
+#[skuld::test]
+fn index_blob_hash_or_deleted_is_immune_to_a_prior_checkouts_autocrlf_smudge() {
+    let dir = tempfile::tempdir().unwrap();
+    git(dir.path(), &["init", "--initial-branch=main", "--quiet"]);
+    git(dir.path(), &["config", "user.email", "fixture@example.com"]);
+    git(dir.path(), &["config", "user.name", "fixture"]);
+    git(dir.path(), &["config", "core.autocrlf", "true"]);
+    std::fs::write(dir.path().join("f.txt"), "line one\nline two\n").unwrap();
+    git(dir.path(), &["add", "f.txt"]);
+    git(dir.path(), &["commit", "-m", "initial"]);
+    let canonical_hash = String::from_utf8_lossy(
+        &Command::new("git")
+            .args(["rev-parse", "HEAD:./f.txt"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .trim()
+    .to_string();
+
+    // Simulate what an actual conflict-resolution checkout does: rewrite
+    // f.txt from the object database, which smudges it to CRLF on disk
+    // under autocrlf=true — confirm the fixture actually reproduces this,
+    // not just assume it.
+    std::fs::remove_file(dir.path().join("f.txt")).unwrap();
+    git(dir.path(), &["checkout", "HEAD", "--", "f.txt"]);
+    let on_disk = std::fs::read(dir.path().join("f.txt")).unwrap();
+    assert!(
+        on_disk.windows(2).any(|w| w == b"\r\n"),
+        "fixture didn't reproduce the smudge — checkout should have written CRLF: {on_disk:?}"
+    );
+
+    // The writer's real sequence: re-stage (the clean filter recovers the
+    // same LF content, so this is a no-op for the index), then read the
+    // hash from the index — must equal the canonical hash despite the CRLF
+    // currently sitting on disk.
+    git(dir.path(), &["add", "-A"]);
+    let actual = index_blob_hash_or_deleted(dir.path(), "f.txt").unwrap();
+    assert_eq!(actual, canonical_hash);
 }

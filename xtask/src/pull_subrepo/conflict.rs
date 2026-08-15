@@ -10,7 +10,7 @@ use std::process::{Command, Output};
 
 use anyhow::{bail, Context, Result};
 
-use crate::git_util::{hash_object_or_deleted, run_git, run_git_raw, run_git_with_env};
+use crate::git_util::{index_blob_hash_or_deleted, run_git, run_git_raw, run_git_with_env};
 
 use super::Outcome;
 
@@ -321,15 +321,23 @@ pub fn force_commit_conflicted(repo_root: &Path, subdir: &str, tag: &str) -> Res
             worktree.display()
         );
     }
+    // Stage the conflicted tree *before* writing the sentinel, not after:
+    // `write_vendor_conflict_sentinel` needs each unmerged path's hash to be
+    // read from the index (see its own doc), which only reflects the
+    // to-be-committed content once these paths are actually staged.
+    run_git(&worktree, &["add", "-A"])?;
     // The unresolved-conflict sentinel: check-vendoring-integrity's own
     // marker scan can only see conflicts git represents as text — a
     // delete/modify or binary-content conflict never gets markers at all
     // (git just leaves "ours"/"theirs" on disk, unmerged in the index, with
-    // zero textual trace). The index-stage signal `unmerged_paths` just
-    // read is the only place every conflict shape shows up uniformly, and
-    // it only exists transiently — captured here, before `git add -A`
-    // commits the tree and it's gone.
+    // zero textual trace). The index-stage signal `unmerged_paths` read
+    // above is the only place every conflict shape shows up uniformly, and
+    // it only exists transiently — this is why `unmerged` was captured
+    // before the `git add -A` that just ran, even though the sentinel
+    // itself is written after it.
     write_vendor_conflict_sentinel(&worktree, &unmerged)?;
+    // Stage the sentinel file this just wrote to disk — a second `git add
+    // -A` is cheap and idempotent for everything already staged above.
     run_git(&worktree, &["add", "-A"])?;
     let already_staged_note = || {
         format!(
@@ -572,17 +580,19 @@ fn unmerged_paths(worktree: &Path) -> Result<Vec<String>> {
 
 /// Writes one `<path>\t<hash>` line per entry in `unmerged` to
 /// `.vendor-conflict` at `worktree`'s root — `hash` is `<deleted>` if
-/// `path` doesn't currently exist on disk in `worktree`, otherwise its
-/// `git hash-object` blob hash. Written to the worktree root (not
-/// `repo_root`) so it's swept into the same `git add -A` + commit as the
-/// rest of the conflicted tree, landing at
+/// `path` isn't staged in `worktree`'s index, otherwise the blob hash it's
+/// staged at (see `index_blob_hash_or_deleted`'s own doc for why this reads
+/// the index rather than re-hashing the file on disk — the caller must have
+/// already run `git add -A` before calling this). Written to the worktree
+/// root (not `repo_root`) so it's swept into the same `git add -A` + commit
+/// as the rest of the conflicted tree, landing at
 /// `crates/ex-ray/third_party/<dep>/.vendor-conflict` once
 /// `finish_conflict_fold_in` folds the worktree onto the branch — the same
 /// per-dep path `check_vendoring_integrity` scans.
 fn write_vendor_conflict_sentinel(worktree: &Path, unmerged: &[String]) -> Result<()> {
     let mut contents = String::new();
     for path in unmerged {
-        let hash = hash_object_or_deleted(worktree, path)?;
+        let hash = index_blob_hash_or_deleted(worktree, path)?;
         contents.push_str(&format!("{path}\t{hash}\n"));
     }
     let sentinel_path = worktree.join(".vendor-conflict");

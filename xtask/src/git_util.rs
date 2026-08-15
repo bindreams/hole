@@ -69,22 +69,58 @@ pub fn merge_skip_value(existing: Option<&str>, value: &str) -> String {
     }
 }
 
-/// `git hash-object <relative_path>` (run with `cwd` as the working
-/// directory), or the literal string `<deleted>` if `relative_path` doesn't
-/// exist on disk under `cwd` — the sentinel-comparison primitive shared by
-/// `pull_subrepo::conflict::force_commit_conflicted` (which records a
-/// conflicted path's hash at commit time) and
-/// `finish_vendor_bump::run` (which re-hashes it later to detect whether a
-/// human actually touched it). `--no-filters` keeps the comparison
-/// independent of `.gitattributes`: the writer hashes in git-subrepo's temp
-/// worktree (no `.gitattributes` in effect) and the reader hashes in the
-/// main worktree (repo-root `.gitattributes` in effect) — without it, the
-/// same untouched content could hash differently in the two contexts.
-pub fn hash_object_or_deleted(cwd: &Path, relative_path: &str) -> Result<String> {
-    if !cwd.join(relative_path).exists() {
-        return Ok("<deleted>".to_string());
+/// The git blob hash `spec` resolves to (e.g. `:./foo` for the current
+/// index, `HEAD:./foo` for the last commit), or the literal string
+/// `<deleted>` if it doesn't resolve to anything. Reads straight from the
+/// object database rather than re-hashing filesystem content, so it's the
+/// shared primitive behind `index_blob_hash_or_deleted`/
+/// `head_blob_hash_or_deleted` below.
+fn resolved_blob_hash_or_deleted(cwd: &Path, spec: &str) -> Result<String> {
+    let output = Command::new("git")
+        .args(["rev-parse", "--verify", "-q", spec])
+        .current_dir(cwd)
+        .output()
+        .with_context(|| format!("failed to run `git rev-parse {spec}` in {}", cwd.display()))?;
+    if output.status.success() {
+        Ok(String::from_utf8(output.stdout)
+            .with_context(|| format!("`git rev-parse {spec}` produced non-UTF-8 output"))?
+            .trim()
+            .to_string())
+    } else {
+        Ok("<deleted>".to_string())
     }
-    run_git(cwd, &["hash-object", "--no-filters", "--", relative_path])
+}
+
+/// The git blob hash `relative_path` is *staged* at right now (index stage
+/// 0), or the literal string `<deleted>` if it isn't staged — the
+/// sentinel-writing primitive `pull_subrepo::conflict::force_commit_conflicted`
+/// uses immediately after its own `git add -A`, before committing. Reading
+/// from the index (not re-hashing the filesystem) means the recorded hash
+/// is exactly the blob `git commit` is about to store, regardless of
+/// whatever the on-disk bytes look like at that moment — a prior checkout
+/// inside git-subrepo's temp worktree may have smudged them (Windows
+/// `core.autocrlf=true` converts LF to CRLF on checkout), and re-hashing
+/// filesystem content post-checkout would record that smudged form instead
+/// of the canonical one `git add` actually staged.
+pub fn index_blob_hash_or_deleted(cwd: &Path, relative_path: &str) -> Result<String> {
+    resolved_blob_hash_or_deleted(cwd, &format!(":./{relative_path}"))
+}
+
+/// The git blob hash `relative_path` has in `HEAD`, or the literal string
+/// `<deleted>` if `HEAD` has no such path — `finish_vendor_bump::run`'s
+/// sentinel-clearing check uses this once a human's own resolution has been
+/// committed (see `VENDORING.md`'s documented hand-resolution steps: commit
+/// before running `finish-vendor-bump`). Reading from `HEAD` rather than
+/// re-hashing the working tree makes this immune to the same checkout/smudge
+/// and `.gitattributes`-scope divergence `index_blob_hash_or_deleted`
+/// avoids — and since `git subrepo commit`'s fold-in is a tree-level merge
+/// (not a checkout-and-rewrite), a blob written by
+/// `index_blob_hash_or_deleted` in the temp worktree and later read here via
+/// `HEAD:./<path>` in the main worktree are guaranteed to agree for
+/// unchanged content, on any platform, regardless of either worktree's
+/// `.gitattributes` or `core.autocrlf` state.
+pub fn head_blob_hash_or_deleted(cwd: &Path, relative_path: &str) -> Result<String> {
+    resolved_blob_hash_or_deleted(cwd, &format!("HEAD:./{relative_path}"))
 }
 
 /// Like `run_git`, but returns stdout without `.trim()`-ing it. For a
