@@ -229,6 +229,18 @@ jobs:
           python-version: "3.x"
       - uses: astral-sh/setup-uv@v9.0.0
 
+      # `pull_subrepo`/`conflict.rs`'s tests (part of `package(xtask)`, run
+      # by this job) shell to `go mod edit -json` to exercise the
+      # allowlisted go.mod-conflict auto-resolution path for real — this
+      # job builds nothing itself (it runs the `build` job's prebuilt
+      # artifact), so unlike jobs that use `./.github/actions/setup-build`,
+      # `go` isn't otherwise provisioned here. Some runner images happen to
+      # ship a usable `go` anyway, which is why this gap surfaced only on
+      # one platform rather than failing everywhere from the start.
+      - uses: actions/setup-go@v7
+        with:
+          go-version: stable
+
       # `check_vendoring_integrity_tests`'s `always_run_hazard_end_to_end_*`
       # tests (part of `package(xtask)`, run by this job) install a real
       # `prek` hook and drive `pull_subrepo`/`finish_vendor_bump` through
