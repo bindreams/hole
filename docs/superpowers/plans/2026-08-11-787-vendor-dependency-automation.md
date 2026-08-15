@@ -2600,17 +2600,9 @@ is already armed on the PR (Renovate armed it at PR-creation time and it
 was never disarmed), so it fires on the push, merging the botched
 resolution with nothing having caught it.
 
-**Open question for you, not decided here:** this is a real, live,
-currently-unpatched gap — an auto-merge-armed PR can land a botched
-delete/modify or binary conflict resolution with no required check
-catching it, on the human hand-resolution path this same plan
-documents. Closing it requires touching Task 4's already-shipped
-`force_commit_conflicted` (e.g. a sentinel file listing every unresolved
-path, written as part of the same commit; `finish-vendor-bump` refuses to
-clear it unless each listed path was actually touched, and Task 13 reports
-the sentinel's mere presence as a violation). Should this be folded into
-this same PR as an additional task, or tracked as a follow-up issue? Don't
-decide silently either way.
+**Decision (2026-08-15): folded into this PR, as an addition to Task 13**
+(not a separate task — it touches the same two files Task 13 already
+modifies). Spec below, under Task 13's own "sentinel" subsection.
 
 - [ ] **Step 7: File a tracking issue for `wix-hash-fixup.yaml`'s verification**
 
@@ -2648,6 +2640,64 @@ can run before or after either.
   fixed here since it documents the human recovery path this hazard
   affects), `.github/workflows/vendor-bump.yaml` (Task 8's PR comment +
   `::error::` text, same reason)
+- Modify: `xtask/src/pull_subrepo/conflict.rs` (`force_commit_conflicted`
+  writes the sentinel — see below), `xtask/src/finish_vendor_bump.rs`
+  (`run` clears it — see below)
+
+**The unresolved-conflict sentinel — closes the delete/modify and
+binary-conflict gap for the human hand-resolution path.**
+`check-vendoring-integrity`'s marker scan (check 1) can only see conflicts
+git represents as text; a delete/modify conflict or a binary-content
+conflict never gets markers at all (git just leaves "ours" on disk,
+unmerged in the index, with zero textual trace). That index-stage
+signal — genuinely the only place *every* conflict shape shows up
+uniformly — only exists transiently, and disappears the moment
+`force_commit_conflicted` commits the tree. So capture it right there,
+before it's gone:
+
+- `force_commit_conflicted` (`pull_subrepo/conflict.rs:288`) already calls
+  `unmerged_paths(&worktree)` right before `git add -A` to guard against
+  force-committing a non-conflicted tree — reuse that same call's result.
+  For each returned path, hash the on-disk content in the conflict
+  worktree (`git hash-object <path>`; record the literal string
+  `<deleted>` instead if the path doesn't exist in the worktree — verify
+  empirically whether a real delete/modify conflict leaves the file
+  present or absent, don't assume either way). Write one `<path>\t<hash>`
+  line per unmerged path to `.vendor-conflict` at the worktree root,
+  *before* `git add -A` runs, so it's swept into the same commit as the
+  conflicted tree — since the worktree is git-subrepo's own
+  subdir-scoped temp worktree, this file lands at
+  `crates/ex-ray/third_party/<dep>/.vendor-conflict` once
+  `finish_conflict_fold_in` folds it onto the branch, matching where
+  `check-vendoring-integrity` already scans per-dep.
+- `check_vendoring_integrity` gets a fourth check: for every discovered
+  dep directory, a tracked `.vendor-conflict` file's mere *presence* is a
+  violation (content doesn't matter to this check — the sentinel's job is
+  done once it exists; only `finish_vendor_bump` interprets its content).
+  Report a message naming the dep and instructing to resolve every listed
+  path and run `cargo xtask finish-vendor-bump`, or to remove the file by
+  hand only once every listed path is confirmed genuinely resolved.
+- `finish_vendor_bump::run`, after its existing steps (VENDORING.md note,
+  go.mod bump, identity build/test), gets a new step: if
+  `crates/ex-ray/third_party/<subdir>/.vendor-conflict` exists, parse its
+  `<path>\t<hash>` lines and, for each, hash the *current* content at
+  `crates/ex-ray/third_party/<subdir>/<path>` the same way (`<deleted>` if
+  absent). If every listed path's current hash differs from its recorded
+  one — proving a human actually touched (re-authored, replaced, or
+  intentionally deleted) each one, not merely inherited whatever "ours"
+  content `force_commit_conflicted` silently wrote — delete the sentinel
+  and stage its removal into the same commit `commit_if_staged` already
+  makes for this step. If even one listed path is unchanged, `bail!` with
+  a message naming that specific path and refuse to clear the sentinel —
+  this is what actually closes the gap: a human who runs
+  `finish-vendor-bump` without touching a silently-wrong "ours" resolution
+  leaves the sentinel in place, so `check-vendoring-integrity` (and
+  therefore `Lint`) stays red and auto-merge cannot fire.
+- This is intentionally a "did a human engage with this exact path" check,
+  not a "is the resolution correct" check — correctness of a hand-resolved
+  conflict is inherently a human judgment call this tooling can't
+  automate. It converts a silent gap into a required, mechanically-checked
+  acknowledgment, matching every other check in this file.
 
 **The `always_run` hazard — the new hook must not reject `pull-subrepo`'s
 own intermediate commits:** `git subrepo pull` does its own internal
@@ -2930,6 +2980,40 @@ against it for real, not a mock):
   every intermediate commit succeeds, the hook never rejects one, and the
   final state is clean.
 
+- A dep directory with a `.vendor-conflict` sentinel present (any content)
+  → reported as a violation, regardless of what the marker scan (check 1)
+  finds in the same tree — proves check 4 is independent of check 1, not
+  a refinement of it.
+
+- `force_commit_conflicted` against a real delete/modify conflict fixture
+  → the resulting commit contains a `.vendor-conflict` sentinel listing
+  exactly the conflicted path(s), each with a recorded hash (or
+  `<deleted>`, whichever matches the real observed worktree state).
+
+- `force_commit_conflicted` against a real binary-content conflict fixture
+  (two different binary blobs on each side, matching the shape of a real
+  `utls/logo.png` upstream regeneration) → same, sentinel lists the binary
+  path.
+
+- `finish_vendor_bump::run` against a fixture with a `.vendor-conflict`
+  sentinel where every listed path's current content differs from its
+  recorded hash → sentinel is deleted and its removal is staged in the
+  same commit as the rest of the step's changes.
+
+- Same, but one listed path's current content is *unchanged* from its
+  recorded hash (the human never touched it — the silent-failure case
+  this whole mechanism exists to catch) → `run` returns an error naming
+  that specific path, the sentinel is *not* deleted, no commit is made for
+  this step.
+
+- Same, but the touched path was legitimately *deleted* by the human
+  (valid resolution for a delete/modify conflict where "theirs" wins) →
+  recorded `<deleted>` compared against current absence counts as
+  unchanged (still flagged, not cleared); recorded real-hash compared
+  against current absence counts as changed (cleared) — proves both
+  directions of the delete-conflict resolution are handled correctly, not
+  just content-to-content changes.
+
 - **The same hazard, end-to-end — conflicted path**: same real-hook setup,
   but drive an actual conflicted `pull-subrepo` → `force-commit-conflicted-subrepo`
   sequence (mirroring `pull_subrepo_tests.rs`'s own `force_commit_conflicted_*`
@@ -3000,4 +3084,6 @@ the fixtures.
 ```bash
 git add xtask/src/check_vendoring_integrity.rs xtask/src/check_vendoring_integrity_tests.rs xtask/src/lib.rs prek.toml
 git commit -m "feat(xtask): add check-vendoring-integrity, wire into prek's already-required Lint job"
+git add xtask/src/pull_subrepo/conflict.rs xtask/src/finish_vendor_bump.rs xtask/src/finish_vendor_bump_tests.rs xtask/src/pull_subrepo/conflict_tests.rs
+git commit -m "feat(xtask): sentinel-track unresolved delete/modify and binary conflicts through hand resolution"
 ```
