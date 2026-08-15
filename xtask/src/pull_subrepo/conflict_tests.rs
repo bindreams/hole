@@ -913,3 +913,153 @@ fn handle_conflict_bails_when_the_worktree_has_no_unmerged_paths() {
         "the worktree-exists-but-no-unmerged-paths bail branch's message is missing: {message}"
     );
 }
+
+// The unresolved-conflict sentinel ====================================================================================
+
+/// A standalone (non-`ConflictKind`) delete/modify fixture: downstream
+/// deletes `patched.txt` (a real, non-allowlisted conflict path — unlike
+/// the shared `Fixture`'s go.mod/go.sum delete/modify kinds), upstream
+/// modifies it. Confirmed empirically (both directly against `git merge`
+/// and against a real `git subrepo pull`) that a delete/modify conflict
+/// always leaves the surviving side's content present on disk in the
+/// conflict worktree — never absent — so this fixture exercises the
+/// present-content half of `hash_object_or_deleted`, matching real
+/// git(-subrepo) behavior.
+fn build_delete_modify_fixture(dir: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
+    let upstream = dir.join("upstream");
+    let downstream = dir.join("downstream");
+
+    git_init(&upstream);
+    std::fs::write(upstream.join("patched.txt"), "upstream line one\n").unwrap();
+    std::fs::write(upstream.join("go.mod"), "module fixture\n\ngo 1.25\n").unwrap();
+    git(&upstream, &["add", "-A"]);
+    git(&upstream, &["commit", "-m", "v1"]);
+    git(&upstream, &["tag", "v1"]);
+    std::fs::write(upstream.join("patched.txt"), "upstream line one\nupstream line two\n").unwrap();
+    git(&upstream, &["commit", "-am", "v2"]);
+    git(&upstream, &["tag", "v2"]);
+
+    git_init(&downstream);
+    std::fs::write(downstream.join("README.md"), "downstream\n").unwrap();
+    git(&downstream, &["add", "-A"]);
+    git(&downstream, &["commit", "-m", "initial"]);
+    git(
+        &downstream,
+        &["subrepo", "clone", upstream.to_str().unwrap(), "vendor", "-b", "v1"],
+    );
+    git(&downstream, &["rm", "vendor/patched.txt"]);
+    git(&downstream, &["commit", "-m", "patch: delete patched.txt downstream"]);
+
+    (upstream, downstream)
+}
+
+/// A standalone binary-content-conflict fixture: both sides change
+/// `logo.png`'s binary content differently — matching the shape of a real
+/// `utls/logo.png` upstream regeneration colliding with a downstream edit.
+fn build_binary_conflict_fixture(dir: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
+    let upstream = dir.join("upstream");
+    let downstream = dir.join("downstream");
+
+    git_init(&upstream);
+    std::fs::write(upstream.join("logo.png"), [b'B', b'A', b'S', b'E', 0x00, 0x01, 0x02]).unwrap();
+    std::fs::write(upstream.join("go.mod"), "module fixture\n\ngo 1.25\n").unwrap();
+    git(&upstream, &["add", "-A"]);
+    git(&upstream, &["commit", "-m", "v1"]);
+    git(&upstream, &["tag", "v1"]);
+    std::fs::write(
+        upstream.join("logo.png"),
+        [b'U', b'P', b'S', b'T', b'R', 0x00, 0x03, 0x04, 0x05],
+    )
+    .unwrap();
+    git(&upstream, &["commit", "-am", "v2"]);
+    git(&upstream, &["tag", "v2"]);
+
+    git_init(&downstream);
+    std::fs::write(downstream.join("README.md"), "downstream\n").unwrap();
+    git(&downstream, &["add", "-A"]);
+    git(&downstream, &["commit", "-m", "initial"]);
+    git(
+        &downstream,
+        &["subrepo", "clone", upstream.to_str().unwrap(), "vendor", "-b", "v1"],
+    );
+    std::fs::write(
+        downstream.join("vendor/logo.png"),
+        [b'D', b'O', b'W', b'N', 0x00, 0x09, 0x08],
+    )
+    .unwrap();
+    git(&downstream, &["add", "-A"]);
+    git(&downstream, &["commit", "-m", "patch: change logo.png downstream"]);
+
+    (upstream, downstream)
+}
+
+/// Parses a `.vendor-conflict` sentinel's `<path>\t<hash>` lines into pairs,
+/// for tests to assert against without duplicating the format elsewhere.
+fn parse_sentinel(contents: &str) -> Vec<(String, String)> {
+    contents
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(|line| {
+            let mut parts = line.splitn(2, '\t');
+            let path = parts.next().unwrap().to_string();
+            let hash = parts.next().unwrap().to_string();
+            (path, hash)
+        })
+        .collect()
+}
+
+#[skuld::test]
+fn force_commit_conflicted_against_a_delete_modify_conflict_writes_a_sentinel_recording_present_content() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_upstream, downstream) = build_delete_modify_fixture(dir.path());
+
+    let outcome = pull_subrepo::run(&downstream, "vendor", "v2").unwrap();
+    assert!(matches!(outcome, Outcome::Conflicted { .. }));
+
+    pull_subrepo::force_commit_conflicted(&downstream, "vendor", "v2").expect("force-commit should succeed");
+
+    let sentinel_path = downstream.join("vendor/.vendor-conflict");
+    let sentinel = std::fs::read_to_string(&sentinel_path).expect("sentinel should be committed");
+    let entries = parse_sentinel(&sentinel);
+    assert_eq!(entries.len(), 1, "{entries:?}");
+    assert_eq!(entries[0].0, "patched.txt");
+
+    // Confirmed empirically: git(-subrepo) leaves the surviving ("theirs")
+    // content present on disk for a delete/modify conflict, never absent —
+    // so the recorded hash must be a real git blob hash, not `<deleted>`.
+    let expected_hash = git_output(&downstream.join("vendor"), &["hash-object", "patched.txt"])
+        .trim()
+        .to_string();
+    assert_eq!(entries[0].1, expected_hash);
+    assert_ne!(entries[0].1, "<deleted>");
+
+    // The sentinel itself must be tracked (swept into the same commit as
+    // the conflicted tree), not left as scratch.
+    let tracked = git_output(&downstream, &["ls-files", "vendor/.vendor-conflict"]);
+    assert!(
+        !tracked.trim().is_empty(),
+        "the sentinel should be a tracked, committed file"
+    );
+}
+
+#[skuld::test]
+fn force_commit_conflicted_against_a_binary_content_conflict_writes_a_sentinel_with_the_binary_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_upstream, downstream) = build_binary_conflict_fixture(dir.path());
+
+    let outcome = pull_subrepo::run(&downstream, "vendor", "v2").unwrap();
+    assert!(matches!(outcome, Outcome::Conflicted { .. }));
+
+    pull_subrepo::force_commit_conflicted(&downstream, "vendor", "v2").expect("force-commit should succeed");
+
+    let sentinel_path = downstream.join("vendor/.vendor-conflict");
+    let sentinel = std::fs::read_to_string(&sentinel_path).expect("sentinel should be committed");
+    let entries = parse_sentinel(&sentinel);
+    assert_eq!(entries.len(), 1, "{entries:?}");
+    assert_eq!(entries[0].0, "logo.png");
+
+    let expected_hash = git_output(&downstream.join("vendor"), &["hash-object", "logo.png"])
+        .trim()
+        .to_string();
+    assert_eq!(entries[0].1, expected_hash);
+}

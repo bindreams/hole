@@ -200,9 +200,9 @@ jobs:
             conclusion=failure
             title="Merge conflict outside the auto-resolved allowlist"
             summary=$(cat <<EOF
-          Automated pull of \`${{ steps.target.outputs.dep }}\` to \`${{ steps.target.outputs.tag }}\` hit a real merge conflict outside the auto-resolved allowlist (go.mod/go.sum/.github/workflows). The conflicted tree is committed on this branch.
+          Automated pull of \`${{ steps.target.outputs.dep }}\` to \`${{ steps.target.outputs.tag }}\` hit a real merge conflict outside the auto-resolved allowlist (go.mod/go.sum/.github/workflows). The conflicted tree is committed on this branch, alongside a \`.vendor-conflict\` sentinel file listing every conflicted path.
 
-          To resolve: check out this branch, fix the conflicts, then run \`cargo xtask finish-vendor-bump crates/ex-ray/third_party/${{ steps.target.outputs.dep }} ${{ steps.target.outputs.dep }} ${{ steps.target.outputs.tag }}\` and push a normal commit.
+          To resolve: check out this branch, fix the conflicts (every path the sentinel lists), then run \`cargo xtask finish-vendor-bump crates/ex-ray/third_party/${{ steps.target.outputs.dep }} ${{ steps.target.outputs.dep }} ${{ steps.target.outputs.tag }}\` and push a normal commit — it clears the sentinel once it confirms every listed path was actually touched, or fails naming the one that wasn't. If you'd rather redo the pull locally instead of editing the committed conflict markers in place, discard this commit and run \`cargo xtask pull-subrepo\`; if you resolve the resulting conflict by hand and fold it in yourself with a raw \`git subrepo commit\` (see its own printed instructions), run it as \`SKIP=check-vendoring-integrity git subrepo commit <path>\` if this repo's git hooks are installed locally.
           EOF
           )
           else
@@ -280,9 +280,9 @@ jobs:
           GH_TOKEN: ${{ steps.nathan.outputs.token }}
         run: |
           gh pr comment "${{ steps.find-pr.outputs.pr_number }}" --repo "${{ github.repository }}" --body "$(cat <<EOF
-          Automated pull of \`${{ steps.target.outputs.dep }}\` to \`${{ steps.target.outputs.tag }}\` hit a real merge conflict outside the auto-resolved allowlist (go.mod/go.sum/.github/workflows). The conflicted tree is committed on this branch.
+          Automated pull of \`${{ steps.target.outputs.dep }}\` to \`${{ steps.target.outputs.tag }}\` hit a real merge conflict outside the auto-resolved allowlist (go.mod/go.sum/.github/workflows). The conflicted tree is committed on this branch, alongside a \`.vendor-conflict\` sentinel file listing every conflicted path.
 
-          To resolve: check out this PR branch, fix the conflicts, then run \`cargo xtask finish-vendor-bump crates/ex-ray/third_party/${{ steps.target.outputs.dep }} ${{ steps.target.outputs.dep }} ${{ steps.target.outputs.tag }}\` and push a normal commit.
+          To resolve: check out this PR branch, fix the conflicts (every path the sentinel lists), then run \`cargo xtask finish-vendor-bump crates/ex-ray/third_party/${{ steps.target.outputs.dep }} ${{ steps.target.outputs.dep }} ${{ steps.target.outputs.tag }}\` and push a normal commit — it clears the sentinel once it confirms every listed path was actually touched, or fails naming the one that wasn't. If you'd rather redo the pull locally instead of editing the committed conflict markers in place, discard this commit and run \`cargo xtask pull-subrepo\`; if you resolve the resulting conflict by hand and fold it in yourself with a raw \`git subrepo commit\` (see its own printed instructions), run it as \`SKIP=check-vendoring-integrity git subrepo commit <path>\` if this repo's git hooks are installed locally.
           EOF
           )"
 

@@ -770,3 +770,173 @@ fn run_folds_a_restore_failure_into_the_returned_error() {
         "the error should name the file that failed to restore: {message}"
     );
 }
+
+// The unresolved-conflict sentinel ====================================================================================
+
+fn git_hash_object(cwd: &Path, rel_path: &str) -> String {
+    let output = Command::new("git")
+        .args(["hash-object", rel_path])
+        .current_dir(cwd)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "git hash-object {rel_path} failed in {}",
+        cwd.display()
+    );
+    String::from_utf8(output.stdout).unwrap().trim().to_string()
+}
+
+#[skuld::test]
+fn run_clears_the_sentinel_when_every_listed_path_was_genuinely_touched() {
+    let fx = FixtureBuilder::default().v2ray_core_stub().build();
+    let widget_dir = fx.vendoring_dir().join("widget");
+
+    std::fs::write(widget_dir.join("patched.go"), "package widget\n\n// original\n").unwrap();
+    git(fx.root(), &["add", "-A"]);
+    git(fx.root(), &["commit", "-m", "conflicted commit (simulated)"]);
+    let recorded_hash = git_hash_object(&widget_dir, "patched.go");
+    std::fs::write(
+        widget_dir.join(".vendor-conflict"),
+        format!("patched.go\t{recorded_hash}\n"),
+    )
+    .unwrap();
+    git(fx.root(), &["add", "-A"]);
+    git(fx.root(), &["commit", "-m", "add sentinel (simulated force-commit)"]);
+
+    // The human resolves the conflict for real.
+    std::fs::write(widget_dir.join("patched.go"), "package widget\n\n// resolved by hand\n").unwrap();
+    git(fx.root(), &["add", "-A"]);
+    git(fx.root(), &["commit", "-m", "patch: resolve conflict by hand"]);
+
+    let outcome = finish_vendor_bump::run(fx.root(), "crates/ex-ray/third_party/widget", "widget", "v1.1.0").unwrap();
+    assert!(matches!(outcome, IdentityCheckOutcome::Passed), "{outcome:?}");
+
+    assert!(
+        !widget_dir.join(".vendor-conflict").exists(),
+        "the sentinel should be removed from disk"
+    );
+    let tracked = Command::new("git")
+        .args(["ls-files", "crates/ex-ray/third_party/widget/.vendor-conflict"])
+        .current_dir(fx.root())
+        .output()
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&tracked.stdout).trim().is_empty(),
+        "the sentinel's removal should be committed, not merely deleted on disk"
+    );
+}
+
+#[skuld::test]
+fn run_refuses_to_clear_the_sentinel_when_a_listed_path_is_unchanged() {
+    let fx = FixtureBuilder::default().v2ray_core_stub().build();
+    let widget_dir = fx.vendoring_dir().join("widget");
+
+    std::fs::write(
+        widget_dir.join("patched.go"),
+        "package widget\n\n// original, silently kept\n",
+    )
+    .unwrap();
+    git(fx.root(), &["add", "-A"]);
+    git(fx.root(), &["commit", "-m", "conflicted commit (simulated)"]);
+    let recorded_hash = git_hash_object(&widget_dir, "patched.go");
+    std::fs::write(
+        widget_dir.join(".vendor-conflict"),
+        format!("patched.go\t{recorded_hash}\n"),
+    )
+    .unwrap();
+    git(fx.root(), &["add", "-A"]);
+    git(fx.root(), &["commit", "-m", "add sentinel (simulated force-commit)"]);
+
+    // No further edit to patched.go — the human never actually touched it.
+    let err = finish_vendor_bump::run(fx.root(), "crates/ex-ray/third_party/widget", "widget", "v1.1.0")
+        .expect_err("must refuse to clear the sentinel when a listed path is unchanged");
+    let message = format!("{err:#}");
+    assert!(
+        message.contains("patched.go"),
+        "the specific unchanged path must be named: {message}"
+    );
+
+    assert!(
+        widget_dir.join(".vendor-conflict").exists(),
+        "the sentinel must not be removed"
+    );
+    let head_after = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(fx.root())
+        .output()
+        .unwrap();
+    let head_after = String::from_utf8_lossy(&head_after.stdout).trim().to_string();
+    // Confirms no sentinel-clearing commit was made — the earlier steps
+    // (VENDORING.md note, go.mod bump) DID land, per this module's own
+    // "commit each step's own changes" contract, so HEAD moved from the
+    // sentinel-add commit, but no *further* commit removed the sentinel.
+    let log = Command::new("git")
+        .args(["log", "--format=%s"])
+        .current_dir(fx.root())
+        .output()
+        .unwrap();
+    let subjects = String::from_utf8_lossy(&log.stdout);
+    assert!(
+        !subjects.contains("clear vendor-conflict sentinel"),
+        "no sentinel-clearing commit should exist: {subjects}"
+    );
+    let _ = head_after; // documents intent; the subject-log check above is the real assertion
+}
+
+#[skuld::test]
+fn run_treats_recorded_deleted_vs_still_absent_path_as_unchanged_still_flagged() {
+    // A delete/modify conflict resolved (or force-committed) with "theirs"
+    // recorded as `<deleted>` — if the human never touches the path (it's
+    // still absent), that must still count as unchanged, not a free pass.
+    let fx = FixtureBuilder::default().v2ray_core_stub().build();
+    let widget_dir = fx.vendoring_dir().join("widget");
+
+    std::fs::write(widget_dir.join(".vendor-conflict"), "gone.go\t<deleted>\n").unwrap();
+    git(fx.root(), &["add", "-A"]);
+    git(
+        fx.root(),
+        &["commit", "-m", "add sentinel recording a deleted path (simulated)"],
+    );
+
+    let err = finish_vendor_bump::run(fx.root(), "crates/ex-ray/third_party/widget", "widget", "v1.1.0")
+        .expect_err("recorded <deleted> vs. still-absent must count as unchanged");
+    assert!(format!("{err:#}").contains("gone.go"), "{err:#}");
+    assert!(
+        widget_dir.join(".vendor-conflict").exists(),
+        "the sentinel must not be removed"
+    );
+}
+
+#[skuld::test]
+fn run_treats_recorded_real_hash_vs_now_absent_path_as_changed_cleared() {
+    // The reverse delete-direction: the human's genuine resolution was to
+    // delete a path that had real content recorded — that's a valid
+    // resolution (e.g. "theirs" wins a delete/modify conflict) and must
+    // count as changed, clearing the sentinel.
+    let fx = FixtureBuilder::default().v2ray_core_stub().build();
+    let widget_dir = fx.vendoring_dir().join("widget");
+
+    std::fs::write(widget_dir.join("patched.go"), "package widget\n\n// will be deleted\n").unwrap();
+    git(fx.root(), &["add", "-A"]);
+    git(fx.root(), &["commit", "-m", "conflicted commit (simulated)"]);
+    let recorded_hash = git_hash_object(&widget_dir, "patched.go");
+    std::fs::write(
+        widget_dir.join(".vendor-conflict"),
+        format!("patched.go\t{recorded_hash}\n"),
+    )
+    .unwrap();
+    git(fx.root(), &["add", "-A"]);
+    git(fx.root(), &["commit", "-m", "add sentinel (simulated force-commit)"]);
+
+    // The human's real resolution: delete the path outright.
+    git(fx.root(), &["rm", "crates/ex-ray/third_party/widget/patched.go"]);
+    git(fx.root(), &["commit", "-m", "patch: resolve by deleting patched.go"]);
+
+    let outcome = finish_vendor_bump::run(fx.root(), "crates/ex-ray/third_party/widget", "widget", "v1.1.0").unwrap();
+    assert!(matches!(outcome, IdentityCheckOutcome::Passed), "{outcome:?}");
+    assert!(
+        !widget_dir.join(".vendor-conflict").exists(),
+        "the sentinel should be cleared"
+    );
+}

@@ -10,7 +10,7 @@ use std::process::{Command, Output};
 
 use anyhow::{bail, Context, Result};
 
-use crate::git_util::{run_git, run_git_raw};
+use crate::git_util::{hash_object_or_deleted, run_git, run_git_raw, run_git_with_env};
 
 use super::Outcome;
 
@@ -311,7 +311,8 @@ pub fn force_commit_conflicted(repo_root: &Path, subdir: &str, tag: &str) -> Res
     // A hard guard, not a debug_assert — this is immediately before an
     // irreversible commit in unattended CI (the same class of risk
     // fix_stale_parent's is-ancestor check guards against).
-    if unmerged_paths(&worktree)?.is_empty() {
+    let unmerged = unmerged_paths(&worktree)?;
+    if unmerged.is_empty() {
         bail!(
             "the subrepo temp worktree at {} has no unmerged paths — refusing to force-commit \
              what isn't actually a conflicted pull; if it's a stale worktree from an unrelated \
@@ -320,6 +321,15 @@ pub fn force_commit_conflicted(repo_root: &Path, subdir: &str, tag: &str) -> Res
             worktree.display()
         );
     }
+    // The unresolved-conflict sentinel: check-vendoring-integrity's own
+    // marker scan can only see conflicts git represents as text — a
+    // delete/modify or binary-content conflict never gets markers at all
+    // (git just leaves "ours"/"theirs" on disk, unmerged in the index, with
+    // zero textual trace). The index-stage signal `unmerged_paths` just
+    // read is the only place every conflict shape shows up uniformly, and
+    // it only exists transiently — captured here, before `git add -A`
+    // commits the tree and it's gone.
+    write_vendor_conflict_sentinel(&worktree, &unmerged)?;
     run_git(&worktree, &["add", "-A"])?;
     let already_staged_note = || {
         format!(
@@ -342,7 +352,18 @@ pub fn force_commit_conflicted(repo_root: &Path, subdir: &str, tag: &str) -> Res
 /// (see `run`'s own `ensure_tag_pin_matches` call): a real commit already
 /// exists on the branch by the time either could fail.
 fn finish_conflict_fold_in(repo_root: &Path, subdir: &str, tag: &str) -> Result<()> {
-    run_git(repo_root, &["subrepo", "commit", subdir]).with_context(|| {
+    // `run_git_with_env`, not `run_git`: `git subrepo commit` is a
+    // repo-root commit that lands the fold-in tree (real content, but not
+    // yet `ensure_tag_pin_matches`'s own `.gitrepo` `branch` realignment
+    // below) — the same intermediate-inconsistent-tree shape
+    // `pull_subrepo::skip_check_vendoring_integrity`'s own doc comment
+    // explains.
+    run_git_with_env(
+        repo_root,
+        &["subrepo", "commit", subdir],
+        &[("SKIP", &super::skip_check_vendoring_integrity())],
+    )
+    .with_context(|| {
         format!(
             "a commit was already made in the subrepo temp worktree before this failure — run \
              `git subrepo commit {subdir}` yourself to retry the fold-in once fixed, or `git \
@@ -547,4 +568,23 @@ fn unmerged_paths(worktree: &Path) -> Result<Vec<String>> {
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string())
         .collect())
+}
+
+/// Writes one `<path>\t<hash>` line per entry in `unmerged` to
+/// `.vendor-conflict` at `worktree`'s root — `hash` is `<deleted>` if
+/// `path` doesn't currently exist on disk in `worktree`, otherwise its
+/// `git hash-object` blob hash. Written to the worktree root (not
+/// `repo_root`) so it's swept into the same `git add -A` + commit as the
+/// rest of the conflicted tree, landing at
+/// `crates/ex-ray/third_party/<dep>/.vendor-conflict` once
+/// `finish_conflict_fold_in` folds the worktree onto the branch — the same
+/// per-dep path `check_vendoring_integrity` scans.
+fn write_vendor_conflict_sentinel(worktree: &Path, unmerged: &[String]) -> Result<()> {
+    let mut contents = String::new();
+    for path in unmerged {
+        let hash = hash_object_or_deleted(worktree, path)?;
+        contents.push_str(&format!("{path}\t{hash}\n"));
+    }
+    let sentinel_path = worktree.join(".vendor-conflict");
+    std::fs::write(&sentinel_path, contents).with_context(|| format!("failed to write {}", sentinel_path.display()))
 }

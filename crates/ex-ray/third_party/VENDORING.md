@@ -75,6 +75,18 @@ The pins are recorded in each `.gitrepo`. To move one:
 
 1. `git subrepo pull crates/ex-ray/third_party/<name> -b <new-tag>`
 1. Re-apply / re-review the local patch against the new base (resolve conflicts).
-   For utls, re-confirm the ECH-rejected verify still uses `c.serverName`.
+   For utls, re-confirm the ECH-rejected verify still uses `c.serverName`. If
+   `git subrepo pull` reports a real conflict, it leaves a temp worktree for
+   you to resolve in — once resolved and committed there (see its own
+   printed instructions), run `git subrepo commit <name>` **yourself, from
+   the repo root, as `SKIP=check-vendoring-integrity git subrepo commit <name>`** if this repo's git hooks are installed locally: this repo's
+   `check-vendoring-integrity` pre-commit hook correctly rejects that commit
+   otherwise, since `VENDORING.md`/`go.mod` (updated in step 3 below) are
+   deliberately not yet updated at that point.
 1. Update the version note here and re-run the identity check: from
    `crates/ex-ray`, `go test ./...` plus the vendored `go test ./transport/...`.
+
+(`cargo xtask pull-subrepo`/`cargo xtask finish-vendor-bump` automate this
+same sequence and already set `SKIP` for their own internal commits — the
+`SKIP=` prefix above is only needed for a `git subrepo commit` a human runs
+directly.)
