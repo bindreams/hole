@@ -75,12 +75,16 @@ pub fn merge_skip_value(existing: Option<&str>, value: &str) -> String {
 /// `pull_subrepo::conflict::force_commit_conflicted` (which records a
 /// conflicted path's hash at commit time) and
 /// `finish_vendor_bump::run` (which re-hashes it later to detect whether a
-/// human actually touched it).
+/// human actually touched it). `--no-filters` keeps the comparison
+/// independent of `.gitattributes`: the writer hashes in git-subrepo's temp
+/// worktree (no `.gitattributes` in effect) and the reader hashes in the
+/// main worktree (repo-root `.gitattributes` in effect) — without it, the
+/// same untouched content could hash differently in the two contexts.
 pub fn hash_object_or_deleted(cwd: &Path, relative_path: &str) -> Result<String> {
     if !cwd.join(relative_path).exists() {
         return Ok("<deleted>".to_string());
     }
-    run_git(cwd, &["hash-object", "--", relative_path])
+    run_git(cwd, &["hash-object", "--no-filters", "--", relative_path])
 }
 
 /// Like `run_git`, but returns stdout without `.trim()`-ing it. For a
