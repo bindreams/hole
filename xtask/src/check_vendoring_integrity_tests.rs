@@ -28,6 +28,13 @@ impl RepoBuilder {
     fn new() -> Self {
         let dir = tempfile::tempdir().unwrap();
         git(dir.path(), &["init", "--initial-branch=main", "--quiet"]);
+        // Fixtures never intend platform-dependent line-ending mutation —
+        // a checkout inside these tests (e.g. resolving an allowlisted
+        // conflict to upstream's content) must not silently smudge LF to
+        // CRLF on a Windows runner with a global `core.autocrlf=true`
+        // (GitHub's windows-latest default) and desync from what the test
+        // literally wrote/asserts.
+        git(dir.path(), &["config", "core.autocrlf", "false"]);
         git(dir.path(), &["config", "user.email", "fixture@example.com"]);
         git(dir.path(), &["config", "user.name", "fixture"]);
         Self { dir }
@@ -438,6 +445,13 @@ fn a_tracked_vendor_conflict_sentinel_is_reported_regardless_of_check_1() {
 fn build_upstream(dir: &Path, conflicting: bool) {
     std::fs::create_dir_all(dir).unwrap();
     git(dir, &["init", "--initial-branch=main", "--quiet"]);
+    // Fixtures never intend platform-dependent line-ending mutation —
+    // a checkout inside these tests (e.g. resolving an allowlisted
+    // conflict to upstream's content) must not silently smudge LF to
+    // CRLF on a Windows runner with a global `core.autocrlf=true`
+    // (GitHub's windows-latest default) and desync from what the test
+    // literally wrote/asserts.
+    git(dir, &["config", "core.autocrlf", "false"]);
     git(dir, &["config", "user.email", "fixture@example.com"]);
     git(dir, &["config", "user.name", "fixture"]);
     std::fs::write(dir.join("go.mod"), "module example.com/widget\n\ngo 1.25\n").unwrap();
@@ -474,6 +488,13 @@ fn build_upstream(dir: &Path, conflicting: bool) {
 fn build_downstream_with_widget(dir: &Path, upstream: &Path, patch_conflicting: bool) {
     std::fs::create_dir_all(dir).unwrap();
     git(dir, &["init", "--initial-branch=main", "--quiet"]);
+    // Fixtures never intend platform-dependent line-ending mutation —
+    // a checkout inside these tests (e.g. resolving an allowlisted
+    // conflict to upstream's content) must not silently smudge LF to
+    // CRLF on a Windows runner with a global `core.autocrlf=true`
+    // (GitHub's windows-latest default) and desync from what the test
+    // literally wrote/asserts.
+    git(dir, &["config", "core.autocrlf", "false"]);
     git(dir, &["config", "user.email", "fixture@example.com"]);
     git(dir, &["config", "user.name", "fixture"]);
     std::fs::create_dir_all(dir.join("crates/ex-ray/third_party")).unwrap();

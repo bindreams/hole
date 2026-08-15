@@ -427,6 +427,13 @@ impl Fixture {
 pub(crate) fn git_init(path: &Path) {
     std::fs::create_dir_all(path).unwrap();
     git(path, &["init", "--initial-branch=main", "--quiet"]);
+    // Fixtures never intend platform-dependent line-ending mutation —
+    // a checkout inside these tests (e.g. resolving an allowlisted
+    // conflict to upstream's content) must not silently smudge LF to
+    // CRLF on a Windows runner with a global `core.autocrlf=true`
+    // (GitHub's windows-latest default) and desync from what the test
+    // literally wrote/asserts.
+    git(path, &["config", "core.autocrlf", "false"]);
     git(path, &["config", "user.email", "fixture@example.com"]);
     git(path, &["config", "user.name", "fixture"]);
 }
