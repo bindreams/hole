@@ -90,7 +90,9 @@ fn clear_vendor_conflict_sentinel_if_resolved(repo_root: &Path, subdir: &str) ->
     };
 
     for line in contents.lines().filter(|l| !l.is_empty()) {
-        let Some((path, recorded_hash)) = line.split_once('\t') else {
+        // `rsplit_once`, not `split_once`: the hash never contains a tab, so splitting
+        // from the right is unambiguous and correct even for a path containing one.
+        let Some((path, recorded_hash)) = line.rsplit_once('\t') else {
             bail!(
                 "{} has a malformed line (expected `<path>\\t<hash>`): {line:?}",
                 sentinel_path.display()
@@ -100,10 +102,11 @@ fn clear_vendor_conflict_sentinel_if_resolved(repo_root: &Path, subdir: &str) ->
         if current_hash == recorded_hash {
             bail!(
                 "`{subdir}/.vendor-conflict` still lists `{path}` as unchanged since the conflicted \
-                 commit (recorded `{recorded_hash}`, still `{current_hash}`) — resolve it by hand (a \
-                 legitimate no-op resolution still needs re-saving the file) before this sentinel can \
-                 be cleared; every other listed path may already be fine, but this one specifically was \
-                 never actually engaged with"
+                 commit (recorded `{recorded_hash}`, still `{current_hash}`) — this sentinel isn't \
+                 cleared by re-saving byte-identical content (that hashes the same and loops forever); \
+                 either genuinely change `{path}`, or, once you've confirmed it's actually fine as-is \
+                 (no change needed), remove `{subdir}/.vendor-conflict` by hand; every other listed \
+                 path may already be fine, but this one specifically was never actually engaged with"
             );
         }
     }
