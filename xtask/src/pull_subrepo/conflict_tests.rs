@@ -1027,7 +1027,17 @@ fn force_commit_conflicted_against_a_delete_modify_conflict_writes_a_sentinel_re
     // Confirmed empirically: git(-subrepo) leaves the surviving ("theirs")
     // content present on disk for a delete/modify conflict, never absent —
     // so the recorded hash must be a real git blob hash, not `<deleted>`.
-    let expected_hash = git_output(&downstream.join("vendor"), &["hash-object", "patched.txt"])
+    //
+    // `rev-parse HEAD:<path>`, not `hash-object` against the checked-out
+    // file: the writer hashed the file in the temp worktree, before
+    // `force_commit_conflicted`'s fold-in checked it out into `downstream`
+    // — on a Windows runner with the (common, GitHub-hosted-default)
+    // `core.autocrlf=true`, that checkout can smudge LF to CRLF on disk,
+    // so re-hashing the post-checkout file diverges from the writer's
+    // pre-checkout hash even though the *committed content* never changed.
+    // Asking git for the blob OID it already stored sidesteps checkout
+    // artifacts entirely.
+    let expected_hash = git_output(&downstream.join("vendor"), &["rev-parse", "HEAD:./patched.txt"])
         .trim()
         .to_string();
     assert_eq!(entries[0].1, expected_hash);
@@ -1058,7 +1068,9 @@ fn force_commit_conflicted_against_a_binary_content_conflict_writes_a_sentinel_w
     assert_eq!(entries.len(), 1, "{entries:?}");
     assert_eq!(entries[0].0, "logo.png");
 
-    let expected_hash = git_output(&downstream.join("vendor"), &["hash-object", "logo.png"])
+    // See the delete/modify test above for why this reads the stored blob
+    // OID directly rather than re-hashing the checked-out file.
+    let expected_hash = git_output(&downstream.join("vendor"), &["rev-parse", "HEAD:./logo.png"])
         .trim()
         .to_string();
     assert_eq!(entries[0].1, expected_hash);
