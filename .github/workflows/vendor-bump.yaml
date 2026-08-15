@@ -4,9 +4,6 @@ on:
   push:
     branches: ["renovate/**"]
     paths: ["crates/ex-ray/third_party/*/.gitrepo"]
-  pull_request:
-    types: [opened, synchronize]
-    paths: ["crates/ex-ray/third_party/*/.gitrepo"]
   workflow_dispatch:
     inputs:
       dep:
@@ -21,32 +18,13 @@ permissions:
   pull-requests: write
 
 concurrency:
-  # `cancel-in-progress: false` does not mean "queue everything": when a
-  # new run is queued while another in the same group is in progress, the
-  # new one becomes pending, and any *previously pending* run in that
-  # group is cancelled — only one pending run survives per group. `bump`'s
-  # own push fires both a `push` event (a new `bump` run, skipped early by
-  # the self-retrigger guard but still occupying a concurrency slot) and a
-  # `pull_request: synchronize` event (an `arm-on-pr-open` run) — webhook
-  # delivery order between the two isn't guaranteed, so putting both event
-  # types in the same group risks `arm-on-pr-open` getting evicted before
-  # it ever starts. `bump` and `arm-on-pr-open` runs are kept in separate
-  # groups (prefixed by event type) so neither can evict the other;
-  # `github.head_ref` (pull_request) and `github.ref_name` (push) are both
-  # already the bare branch name.
-  # `github.head_ref` is empty for `workflow_dispatch`, so the final
-  # fallback there is `inputs.dep` (not `github.ref_name`, which is
-  # whatever ref the dispatch was launched against — normally `main` for
-  # every manual run, which would collapse all concurrent manual bumps for
-  # different deps into one group); `inputs.dep` is empty on `push`, so
-  # that event still falls through to `github.ref_name` as before.
-  group: vendor-bump-${{ github.event_name == 'pull_request' && 'arm' || 'bump' }}-${{ github.head_ref || inputs.dep || github.ref_name }}
+  group: vendor-bump-${{ github.ref_name }}
   cancel-in-progress: false
 
 jobs:
   bump:
     name: Pull + rebase vendored dependency
-    if: github.event_name != 'pull_request' && (github.event_name != 'push' || github.event.head_commit.author.name != 'nathan-blahaj[bot]')
+    if: github.event_name != 'push' || github.event.head_commit.author.name != 'nathan-blahaj[bot]'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -80,7 +58,8 @@ jobs:
       # apt/npm/go package — it's a bash-script tool installed by cloning
       # it and putting its lib/ dir (containing an executable named
       # `git-subrepo`) on PATH. Pinned to 0.4.9 to match the version this
-      # workflow's fixup logic targets.
+      # workflow's fixup logic targets — confirm this tag exists on first
+      # real run.
       - name: Install git-subrepo 0.4.9
         run: |
           git clone --branch 0.4.9 --depth 1 https://github.com/ingydotnet/git-subrepo "$RUNNER_TEMP/git-subrepo"
@@ -110,16 +89,11 @@ jobs:
             tag=$(sed -n 's/^\tbranch = //p' "$changed")
           fi
 
-          # No leading `-`: besides the injection-safety this shares with
-          # every other character class here, a leading `-` would let
-          # `dep`/`tag` be parsed as a flag by the `cargo xtask` calls below
-          # instead of a positional — defense in depth alongside the `--`
-          # separator those calls also use.
-          if ! [[ "$dep" =~ ^[a-zA-Z0-9_.][a-zA-Z0-9_.-]*$ ]]; then
+          if ! [[ "$dep" =~ ^[a-zA-Z0-9_.-]+$ ]]; then
             echo "::error::invalid dep name: $dep"
             exit 1
           fi
-          if ! [[ "$tag" =~ ^[a-zA-Z0-9_.][a-zA-Z0-9_.-]*$ ]]; then
+          if ! [[ "$tag" =~ ^[a-zA-Z0-9_.-]+$ ]]; then
             echo "::error::invalid tag: $tag"
             exit 1
           fi
@@ -145,7 +119,7 @@ jobs:
         id: pull
         run: |
           set +e
-          cargo xtask pull-subrepo -- "${{ steps.target.outputs.path }}" "${{ steps.target.outputs.tag }}"
+          cargo xtask pull-subrepo "${{ steps.target.outputs.path }}" "${{ steps.target.outputs.tag }}"
           code=$?
           set -e
           if [[ "$code" -eq 0 ]]; then
@@ -160,66 +134,18 @@ jobs:
         id: finish
         if: steps.pull.outputs.result == 'clean'
         continue-on-error: true
-        run: cargo xtask finish-vendor-bump -- "${{ steps.target.outputs.path }}" "${{ steps.target.outputs.dep }}" "${{ steps.target.outputs.tag }}"
+        run: cargo xtask finish-vendor-bump "${{ steps.target.outputs.path }}" "${{ steps.target.outputs.dep }}" "${{ steps.target.outputs.tag }}"
 
       - name: Commit the conflicted tree anyway (CI-only policy — see VENDORING.md)
         if: steps.pull.outputs.result == 'conflicted'
-        run: cargo xtask force-commit-conflicted-subrepo -- "${{ steps.target.outputs.path }}" "${{ steps.target.outputs.tag }}"
+        run: cargo xtask force-commit-conflicted-subrepo "${{ steps.target.outputs.path }}" "${{ steps.target.outputs.tag }}"
 
       - name: Push
         if: steps.pull.outputs.result == 'clean' || steps.pull.outputs.result == 'conflicted'
         run: git push origin "HEAD:${{ steps.scratch-branch.outputs.ref_name || github.ref_name }}"
 
-      # The single source of truth for "is this pushed commit actually
-      # ready to merge" — arm-on-pr-open (below) queries this same
-      # check-run instead of re-deriving the answer, and it's a required
-      # status check (a required branch-ruleset check) so GitHub's own
-      # merge gate enforces it too, independent of either arming path.
-      # Reported *before* "Find the PR" below: arm-on-pr-open's own PR-open
-      # run queries this check-run to decide whether to arm, so if
-      # Renovate's PR-creation call lands in the gap between these two
-      # steps, posting the check first guarantees whichever job observes
-      # the PR second still sees a decision it can act on — the reverse
-      # order leaves a window where neither job arms.
-      - name: Report vendor-bump-ready check for the pushed commit
-        if: steps.pull.outputs.result == 'clean' || steps.pull.outputs.result == 'conflicted'
-        env:
-          GH_TOKEN: ${{ steps.nathan.outputs.token }}
-        run: |
-          sha=$(git rev-parse HEAD)
-          # `output[title]`/`output[summary]` (below) put the reason on the
-          # check-run itself rather than only on a PR comment — Renovate's
-          # own PR-creation rate limiting means no PR may exist yet to
-          # comment on (see the "Note if no PR exists yet" step), and the
-          # check-run is always postable on this exact commit regardless.
-          if [[ "${{ steps.pull.outputs.result }}" == "clean" && "${{ steps.finish.outcome }}" == "success" ]]; then
-            conclusion=success
-            title="Vendor bump ready"
-            summary="Pulled \`${{ steps.target.outputs.dep }}\` to \`${{ steps.target.outputs.tag }}\` cleanly; identity checks passed."
-          elif [[ "${{ steps.pull.outputs.result }}" == "conflicted" ]]; then
-            conclusion=failure
-            title="Merge conflict outside the auto-resolved allowlist"
-            summary=$(cat <<EOF
-          Automated pull of \`${{ steps.target.outputs.dep }}\` to \`${{ steps.target.outputs.tag }}\` hit a real merge conflict outside the auto-resolved allowlist (go.mod/go.sum/.github/workflows). The conflicted tree is committed on this branch, alongside a \`.vendor-conflict\` sentinel file listing every conflicted path.
-
-          To resolve: check out this branch, fix the conflicts (every path the sentinel lists), then run \`cargo xtask finish-vendor-bump crates/ex-ray/third_party/${{ steps.target.outputs.dep }} ${{ steps.target.outputs.dep }} ${{ steps.target.outputs.tag }}\` and push a normal commit — it clears the sentinel once it confirms every listed path was actually touched, or fails naming the one that wasn't. If you'd rather redo the pull locally instead of editing the committed conflict markers in place, discard this commit and run \`cargo xtask pull-subrepo\`; if you resolve the resulting conflict by hand and fold it in yourself with a raw \`git subrepo commit\` (see its own printed instructions), run it as \`SKIP=check-vendoring-integrity git subrepo commit <path>\` if this repo's git hooks are installed locally.
-          EOF
-          )
-          else
-            conclusion=failure
-            title="Finish step failed"
-            summary="Pulled \`${{ steps.target.outputs.dep }}\` to \`${{ steps.target.outputs.tag }}\` cleanly, but the Finish step (version note, go.mod, identity checks) failed — see this run's own job log for the reason."
-          fi
-          gh api "repos/${{ github.repository }}/check-runs" -X POST \
-            -f name="vendor-bump-ready" \
-            -f head_sha="$sha" \
-            -f status=completed \
-            -f conclusion="$conclusion" \
-            -f "output[title]=$title" \
-            -f "output[summary]=$summary"
-
       - name: Find the PR for this branch
-        if: github.event_name == 'push' && (steps.pull.outputs.result == 'clean' || steps.pull.outputs.result == 'conflicted')
+        if: github.event_name == 'push' && steps.pull.outputs.result == 'conflicted'
         id: find-pr
         env:
           GH_TOKEN: ${{ steps.nathan.outputs.token }}
@@ -227,134 +153,37 @@ jobs:
           pr_number=$(gh pr list --repo "${{ github.repository }}" --head "${{ github.ref_name }}" --json number --jq '.[0].number // empty')
           echo "pr_number=$pr_number" >> "$GITHUB_OUTPUT"
 
-      # `--match-head-commit` makes a Renovate force-push racing this call a
-      # no-op instead of arming a moved-on head — but `gh` still exits
-      # non-zero on that rejection, indistinguishable by exit code alone
-      # from a real failure (e.g. auto-merge not permitted). On failure,
-      # re-querying the PR distinguishes three outcomes: head moved on
-      # (`arm-on-pr-open`'s next `synchronize` run will arm it instead),
-      # the PR was independently closed/merged (nothing to arm), or neither
-      # — a genuine error, failed loudly. The diagnostic query itself is
-      # guarded too (this `run:` block executes under bash `-e` like every
-      # other step here), so its own transient failure gets a crafted
-      # message instead of a bare shell abort.
-      - name: Arm auto-merge
-        if: steps.pull.outputs.result == 'clean' && steps.finish.outcome == 'success' && steps.find-pr.outputs.pr_number != ''
-        env:
-          GH_TOKEN: ${{ steps.nathan.outputs.token }}
-        run: |
-          sha=$(git rev-parse HEAD)
-          pr="${{ steps.find-pr.outputs.pr_number }}"
-          if gh pr merge --auto --squash --match-head-commit "$sha" "$pr" --repo "${{ github.repository }}"; then
-            exit 0
-          fi
-          if ! pr_info=$(gh pr view "$pr" --repo "${{ github.repository }}" --json headRefOid,state --jq '[.headRefOid, .state] | @tsv'); then
-            echo "::error::gh pr merge failed for PR #$pr, and the follow-up gh pr view to diagnose why also failed — see the output above for both"
-            exit 1
-          fi
-          current_head=$(printf '%s' "$pr_info" | cut -f1)
-          state=$(printf '%s' "$pr_info" | cut -f2)
-          if [[ "$current_head" != "$sha" ]]; then
-            echo "::notice::PR #$pr's head moved from $sha to $current_head before arming — arm-on-pr-open will catch up on the next synchronize event"
-            exit 0
-          fi
-          if [[ "$state" == "CLOSED" || "$state" == "MERGED" ]]; then
-            echo "::notice::PR #$pr is already $state — nothing to arm"
-            exit 0
-          fi
-          echo "::error::gh pr merge failed while PR #$pr was still open with head $sha — a genuine error, see the output above"
-          exit 1
-
-      # Renovate's prHourlyLimit/prConcurrentLimit (both left at defaults
-      # here) deliberately create the branch and defer PR creation — this
-      # is common, not a narrow race. The arm-on-pr-open job below is the
-      # guaranteed catch-up; this is just visibility for the common
-      # opportunistic-arm-skipped case.
-      - name: Note if no PR exists yet
-        if: github.event_name == 'push' && steps.pull.outputs.result == 'clean' && steps.finish.outcome == 'success' && steps.find-pr.outputs.pr_number == ''
-        run: echo "::notice::No open PR found yet for this branch — auto-merge will be armed by this workflow's pull_request trigger once Renovate opens it."
-
       - name: Comment on the PR if conflicted
         if: steps.pull.outputs.result == 'conflicted' && steps.find-pr.outputs.pr_number != ''
         env:
           GH_TOKEN: ${{ steps.nathan.outputs.token }}
         run: |
           gh pr comment "${{ steps.find-pr.outputs.pr_number }}" --repo "${{ github.repository }}" --body "$(cat <<EOF
-          Automated pull of \`${{ steps.target.outputs.dep }}\` to \`${{ steps.target.outputs.tag }}\` hit a real merge conflict outside the auto-resolved allowlist (go.mod/go.sum/.github/workflows). The conflicted tree is committed on this branch, alongside a \`.vendor-conflict\` sentinel file listing every conflicted path.
+          Automated pull of \`${{ steps.target.outputs.dep }}\` to \`${{ steps.target.outputs.tag }}\` hit a real merge conflict outside the auto-resolved allowlist (go.mod/go.sum/.github/workflows). The conflicted tree is committed on this branch.
 
-          To resolve: check out this PR branch, fix the conflicts (every path the sentinel lists), then run \`cargo xtask finish-vendor-bump crates/ex-ray/third_party/${{ steps.target.outputs.dep }} ${{ steps.target.outputs.dep }} ${{ steps.target.outputs.tag }}\` and push a normal commit — it clears the sentinel once it confirms every listed path was actually touched, or fails naming the one that wasn't. If you'd rather redo the pull locally instead of editing the committed conflict markers in place, discard this commit and run \`cargo xtask pull-subrepo\`; if you resolve the resulting conflict by hand and fold it in yourself with a raw \`git subrepo commit\` (see its own printed instructions), run it as \`SKIP=check-vendoring-integrity git subrepo commit <path>\` if this repo's git hooks are installed locally.
+          To resolve: see crates/ex-ray/third_party/VENDORING.md's "Bumping a pinned version" section, then run \`cargo xtask finish-vendor-bump crates/ex-ray/third_party/${{ steps.target.outputs.dep }} ${{ steps.target.outputs.dep }} ${{ steps.target.outputs.tag }}\` and push a normal commit.
           EOF
           )"
+
+      # None of these steps ever run if an earlier one (Push included)
+      # failed: a step's own `if:` is implicitly ANDed with `success()`
+      # unless the condition itself names `always()`/`cancelled()`/
+      # `failure()` (confirmed against GitHub's own docs — none of the
+      # conditions in this job do) — so a rejected Push (a real
+      # force-push race) already fails the job on its own account, with
+      # no separate disposition needed here.
+      - name: Fail the job if the pull conflicted
+        if: steps.pull.outputs.result == 'conflicted'
+        run: |
+          if [[ "${{ github.event_name }}" == "push" && "${{ steps.find-pr.outputs.pr_number }}" == "" ]]; then
+            echo "::error::a real merge conflict landed outside the auto-resolved allowlist — the conflicted tree was committed and pushed, but no open PR was found yet to comment on (Renovate's own push and PR-open are separate operations with no ordering guarantee). To resolve: see crates/ex-ray/third_party/VENDORING.md's \"Bumping a pinned version\" section, then run \`cargo xtask finish-vendor-bump crates/ex-ray/third_party/${{ steps.target.outputs.dep }} ${{ steps.target.outputs.dep }} ${{ steps.target.outputs.tag }}\` and push a normal commit."
+          else
+            echo "::error::a real merge conflict landed outside the auto-resolved allowlist — the conflicted tree was committed and pushed for a human to resolve (see the PR comment)."
+          fi
+          exit 1
 
       - name: Fail the job if Finish failed
         if: steps.finish.outcome == 'failure'
         run: |
-          echo "::error::the 'Finish' step failed — see its log above for the reason (an identity-check failure, or an earlier error like a malformed go.mod/VENDORING.md heading). Any commits it made before failing were still pushed."
-          exit 1
-
-  arm-on-pr-open:
-    name: Arm auto-merge (PR opened/updated)
-    if: github.event_name == 'pull_request' && startsWith(github.head_ref, 'renovate/')
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    steps:
-      # `uses: ./...` (below) resolves against the checked-out workspace,
-      # which is empty at job start — this checkout exists only to make
-      # the local mint-nathan-token action resolvable. This job runs no
-      # git commands of its own (only `gh api`/`gh pr merge` against the
-      # minted token), so no `fetch-depth`/`token` override is needed.
-      - uses: actions/checkout@v7
-
-      - name: Mint nathan-blahaj token
-        id: nathan
-        uses: ./.github/actions/mint-nathan-token
-        with:
-          app-id: ${{ secrets.NATHAN_APP_ID }}
-          private-key: ${{ secrets.NATHAN_APP_PRIVATE_KEY }}
-
-      # Only `bump`'s own vendor-bump-ready check-run (not merely who
-      # authored the head commit — a conflicted or partially-failed bump
-      # is also nathan-authored) tells us whether this exact commit is
-      # actually ready. `check_name=` filters server-side (the endpoint
-      # defaults to 30 results per page, fewer than this repo's per-commit
-      # check-run count) and `sort_by(.started_at) | last` picks the most
-      # recent report deterministically if `bump` was ever re-run on the
-      # same commit (each POST creates a new check-run rather than
-      # updating one, and the API's list order isn't documented as sorted).
-      - name: Check whether bump reported this commit ready
-        id: check-head
-        env:
-          GH_TOKEN: ${{ steps.nathan.outputs.token }}
-        run: |
-          conclusion=$(gh api -X GET "repos/${{ github.repository }}/commits/${{ github.event.pull_request.head.sha }}/check-runs?check_name=vendor-bump-ready" --jq '[.check_runs[]] | sort_by(.started_at) | last | .conclusion // empty')
-          echo "conclusion=$conclusion" >> "$GITHUB_OUTPUT"
-
-      # Same three-way disambiguation as `bump`'s own arm step (moved-on
-      # head / already closed-or-merged / genuine error), including
-      # guarding the diagnostic `gh pr view` call's own failure.
-      - name: Arm auto-merge
-        if: steps.check-head.outputs.conclusion == 'success'
-        env:
-          GH_TOKEN: ${{ steps.nathan.outputs.token }}
-        run: |
-          sha="${{ github.event.pull_request.head.sha }}"
-          pr="${{ github.event.pull_request.number }}"
-          if gh pr merge --auto --squash --match-head-commit "$sha" "$pr" --repo "${{ github.repository }}"; then
-            exit 0
-          fi
-          if ! pr_info=$(gh pr view "$pr" --repo "${{ github.repository }}" --json headRefOid,state --jq '[.headRefOid, .state] | @tsv'); then
-            echo "::error::gh pr merge failed for PR #$pr, and the follow-up gh pr view to diagnose why also failed — see the output above for both"
-            exit 1
-          fi
-          current_head=$(printf '%s' "$pr_info" | cut -f1)
-          state=$(printf '%s' "$pr_info" | cut -f2)
-          if [[ "$current_head" != "$sha" ]]; then
-            echo "::notice::PR #$pr's head moved from $sha to $current_head before arming — a later synchronize run will catch up"
-            exit 0
-          fi
-          if [[ "$state" == "CLOSED" || "$state" == "MERGED" ]]; then
-            echo "::notice::PR #$pr is already $state — nothing to arm"
-            exit 0
-          fi
-          echo "::error::gh pr merge failed while PR #$pr was still open with head $sha — a genuine error, see the output above"
+          echo "::error::the 'Finish' step failed — see its log above for the reason (an identity-check failure, an unresolved .vendor-conflict sentinel left by a prior conflicted push, or an earlier error like a malformed go.mod/VENDORING.md heading). Any commits it made before failing were still pushed."
           exit 1
