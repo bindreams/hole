@@ -8,8 +8,8 @@ use std::process::Command;
 
 use anyhow::{bail, Context, Result};
 
-use crate::git_util::run_git;
-use crate::pull_subrepo::gitrepo_field;
+use crate::git_util::{hash_object_or_deleted, run_git, run_git_with_env};
+use crate::pull_subrepo::{gitrepo_field, skip_check_vendoring_integrity};
 
 #[cfg(test)]
 #[path = "finish_vendor_bump/test_support.rs"]
@@ -60,7 +60,64 @@ pub fn run(repo_root: &Path, subdir: &str, dep_name: &str, new_tag: &str) -> Res
         return Err(disclose_note_commit(e));
     }
 
-    run_identity_checks(repo_root).map_err(disclose_note_commit)
+    let identity_outcome = run_identity_checks(repo_root).map_err(disclose_note_commit)?;
+    clear_vendor_conflict_sentinel_if_resolved(repo_root, subdir).map_err(disclose_note_commit)?;
+    Ok(identity_outcome)
+}
+
+/// After a real conflict was hand-resolved (or `force_commit_conflicted`'s
+/// CI-only policy committed one with literal markers for a human to fix
+/// later), `<subdir>/.vendor-conflict` may still list every path that was
+/// unmerged at commit time, each with its content hash then (or
+/// `<deleted>`). A no-op if no sentinel exists.
+///
+/// Intentionally a "did a human engage with this exact path" check, not "is
+/// the resolution correct" — clears the sentinel only once every listed
+/// path's *current* hash differs from what was recorded, proving each one
+/// was actually touched (re-authored, replaced, or intentionally deleted),
+/// not silently inherited from `force_commit_conflicted`'s "ours" content.
+/// If even one listed path is unchanged, refuses (naming that path) and
+/// leaves the sentinel in place — a human who runs this without touching a
+/// silently-wrong "ours" resolution leaves `check-vendoring-integrity` (and
+/// therefore `Lint`) red, so auto-merge cannot fire.
+fn clear_vendor_conflict_sentinel_if_resolved(repo_root: &Path, subdir: &str) -> Result<()> {
+    let dep_dir = repo_root.join(subdir);
+    let sentinel_path = dep_dir.join(".vendor-conflict");
+    let contents = match std::fs::read_to_string(&sentinel_path) {
+        Ok(contents) => contents,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e).with_context(|| format!("failed to read {}", sentinel_path.display())),
+    };
+
+    for line in contents.lines().filter(|l| !l.is_empty()) {
+        let Some((path, recorded_hash)) = line.split_once('\t') else {
+            bail!(
+                "{} has a malformed line (expected `<path>\\t<hash>`): {line:?}",
+                sentinel_path.display()
+            );
+        };
+        let current_hash = hash_object_or_deleted(&dep_dir, path)?;
+        if current_hash == recorded_hash {
+            bail!(
+                "`{subdir}/.vendor-conflict` still lists `{path}` as unchanged since the conflicted \
+                 commit (recorded `{recorded_hash}`, still `{current_hash}`) — resolve it by hand (a \
+                 legitimate no-op resolution still needs re-saving the file) before this sentinel can \
+                 be cleared; every other listed path may already be fine, but this one specifically was \
+                 never actually engaged with"
+            );
+        }
+    }
+
+    let sentinel_rel = format!("{subdir}/.vendor-conflict");
+    std::fs::remove_file(&sentinel_path).with_context(|| format!("failed to remove {}", sentinel_path.display()))?;
+    run_git(repo_root, &["add", "--", &sentinel_rel])
+        .with_context(|| format!("`{sentinel_rel}` was already deleted on disk before this failure"))?;
+    commit_if_staged(
+        repo_root,
+        &[sentinel_rel.as_str()],
+        "chore(ex-ray): clear vendor-conflict sentinel after hand resolution",
+    )
+    .with_context(|| format!("`{sentinel_rel}`'s removal was already staged before this failure"))
 }
 
 /// Best-effort cross-check: when `<subdir>/.gitrepo` exists (git-subrepo's
@@ -94,15 +151,20 @@ fn ensure_gitrepo_branch_matches(repo_root: &Path, subdir: &str, new_tag: &str) 
     }
 }
 
-/// Split out of `run` so tests can exercise the version-note rewrite
-/// without a real Go toolchain / vendored module tree.
-pub fn update_vendoring_note_and_commit(repo_root: &Path, dep_name: &str, new_tag: &str) -> Result<()> {
-    let path = repo_root.join("crates/ex-ray/third_party/VENDORING.md");
-    let contents = std::fs::read_to_string(&path).with_context(|| format!("failed to read {}", path.display()))?;
-
+/// Locates `dep_name`'s `## \`<dep>/\` — pinned **<version>**` heading in
+/// `VENDORING.md`'s `contents` and returns the byte range of just the
+/// version text between the two `**` markers. Shared by the writer
+/// (`update_vendoring_note_and_commit`, which splices a new version into
+/// this exact range) and the reader
+/// (`check_vendoring_integrity::check_vendoring_md_version`, which only
+/// needs the version string out of it) — one parser for this heading
+/// format, not two. `Ok(None)` means the heading doesn't exist for this dep
+/// at all; `Err` means it does, but is malformed (missing the closing `**`
+/// on the same line).
+pub(crate) fn find_vendoring_heading_version_range(contents: &str, dep_name: &str) -> Result<Option<(usize, usize)>> {
     let heading_prefix = format!("## `{dep_name}/` — pinned **");
     let Some(start) = contents.find(&heading_prefix) else {
-        bail!("VENDORING.md has no `{heading_prefix}` heading to update");
+        return Ok(None);
     };
     let version_start = start + heading_prefix.len();
     // Bounded to the heading's own line: VENDORING.md documents multiple
@@ -115,7 +177,18 @@ pub fn update_vendoring_note_and_commit(repo_root: &Path, dep_name: &str, new_ta
     let Some(version_end_offset) = heading_rest[..line_end].find("**") else {
         bail!("malformed VENDORING.md heading for `{dep_name}` (no closing `**` on the heading line)");
     };
-    let version_end = version_start + version_end_offset;
+    Ok(Some((version_start, version_start + version_end_offset)))
+}
+
+/// Split out of `run` so tests can exercise the version-note rewrite
+/// without a real Go toolchain / vendored module tree.
+pub fn update_vendoring_note_and_commit(repo_root: &Path, dep_name: &str, new_tag: &str) -> Result<()> {
+    let path = repo_root.join("crates/ex-ray/third_party/VENDORING.md");
+    let contents = std::fs::read_to_string(&path).with_context(|| format!("failed to read {}", path.display()))?;
+
+    let Some((version_start, version_end)) = find_vendoring_heading_version_range(&contents, dep_name)? else {
+        bail!("VENDORING.md has no `## `{dep_name}/` — pinned **` heading to update");
+    };
 
     let updated = format!("{}{new_tag}{}", &contents[..version_start], &contents[version_end..]);
     std::fs::write(&path, updated).with_context(|| format!("failed to write {}", path.display()))?;
@@ -338,7 +411,7 @@ fn resolved_module_version(ex_ray_dir: &Path, module_path: &str) -> Result<Optio
     );
 }
 
-fn read_module_path(go_mod_path: &Path) -> Result<String> {
+pub(crate) fn read_module_path(go_mod_path: &Path) -> Result<String> {
     let contents =
         std::fs::read_to_string(go_mod_path).with_context(|| format!("failed to read {}", go_mod_path.display()))?;
     contents
@@ -423,6 +496,11 @@ fn commit_if_staged(repo_root: &Path, paths: &[&str], message: &str) -> Result<(
     }
     let mut commit_args = vec!["commit", "-m", message, "--"];
     commit_args.extend(paths);
-    run_git(repo_root, &commit_args)?;
+    // `run_git_with_env`, not `run_git`: each of this function's callers
+    // commits only its own step's changes (the VENDORING.md note, the
+    // go.mod bump, the sentinel-clear step below) — an intermediate state
+    // the `always_run` `check-vendoring-integrity` hook would otherwise
+    // (correctly, but unhelpfully) reject mid-sequence.
+    run_git_with_env(repo_root, &commit_args, &[("SKIP", &skip_check_vendoring_integrity())])?;
     Ok(())
 }

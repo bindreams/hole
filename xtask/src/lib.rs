@@ -14,6 +14,7 @@ use crate::manifest::{Manifest, Platform};
 use crate::orchestrate::{execute, execute_run, relocate_self_if_windows, render_list, Plan};
 
 pub mod bindir;
+pub mod check_vendoring_integrity;
 pub mod ci_coverage;
 pub mod ci_nextest_parity;
 pub mod ci_timeouts;
@@ -42,6 +43,9 @@ pub mod wintun;
 #[cfg(test)]
 #[path = "bindir_tests.rs"]
 mod bindir_tests;
+#[cfg(test)]
+#[path = "check_vendoring_integrity_tests.rs"]
+mod check_vendoring_integrity_tests;
 #[cfg(test)]
 #[path = "ci_coverage_tests.rs"]
 mod ci_coverage_tests;
@@ -200,6 +204,14 @@ pub enum Command {
         /// Upstream tag just pulled (e.g. `v5.53.0`).
         tag: String,
     },
+    /// Check every git-subrepo-vendored dep under `crates/ex-ray/third_party/`
+    /// for unresolved merge-conflict markers, `VENDORING.md`/`.gitrepo`/
+    /// `go.mod` version drift, and a leftover `.vendor-conflict`
+    /// hand-resolution sentinel. Prints every violation found and exits
+    /// non-zero if any exist; silent and exit 0 otherwise. Wired into
+    /// `prek.toml` as an `always_run` local hook (`pass_filenames = false`
+    /// — it always operates on the whole repo).
+    CheckVendoringIntegrity,
     /// Run all `cargo xtask <step>` commands required for a runnable build.
     ///
     /// Currently: `ex-ray` + `galoshes` + `wintun` + `golangci-lint`.
@@ -351,6 +363,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             pull_subrepo::force_commit_conflicted(&repo_root()?, &path, &tag)
         }
         Command::FinishVendorBump { path, dep_name, tag } => run_finish_vendor_bump(path, dep_name, tag),
+        Command::CheckVendoringIntegrity => run_check_vendoring_integrity(),
         Command::Deps => run_deps(),
         Command::Version { group, check, exact } => run_version(group, check, exact),
         Command::Build { target, all } => run_build(target, all),
@@ -515,6 +528,18 @@ pub fn run_finish_vendor_bump(path: String, dep_name: String, tag: String) -> Re
             std::process::exit(2);
         }
     }
+}
+
+pub fn run_check_vendoring_integrity() -> Result<()> {
+    let repo_root = repo_root()?;
+    let violations = check_vendoring_integrity::run(&repo_root)?;
+    if violations.is_empty() {
+        return Ok(());
+    }
+    for violation in &violations {
+        eprintln!("xtask: {violation}");
+    }
+    std::process::exit(1);
 }
 
 pub fn run_deps() -> Result<()> {

@@ -14,7 +14,7 @@ use std::process::{Command, Output};
 
 use anyhow::{bail, Context, Result};
 
-use crate::git_util::run_git;
+use crate::git_util::{merge_skip_value, run_git, run_git_with_env};
 
 mod conflict;
 
@@ -302,11 +302,35 @@ fn rev_parse_if_exists(repo_root: &Path, ref_name: &str) -> Result<Option<String
 /// the top of `run`, to leave alone (re-checking and re-cleaning here would
 /// also race a concurrent, separate `git subrepo pull` invocation).
 fn attempt_pull(repo_root: &Path, subdir: &str, tag: &str) -> Result<Output> {
+    // `git subrepo pull` does its own internal `git commit` in `repo_root`
+    // partway through a real pull (after writing `.gitrepo`'s new `branch =`
+    // but before the vendored tree content is fully folded in) — on a
+    // machine with this repo's git hooks installed, that commit would
+    // otherwise trip `check-vendoring-integrity`'s `always_run` pre-commit
+    // hook on a genuinely-inconsistent intermediate tree. `SKIP` is
+    // inherited by this child process (and by whatever `git commit` it
+    // spawns internally) the same way `PREK_ALLOW_NO_CONFIG` is inherited
+    // elsewhere in this module — merged with any pre-existing `SKIP` so a
+    // developer's own unrelated export isn't silently clobbered.
     Command::new("git")
         .args(["subrepo", "pull", subdir, "-b", tag])
         .current_dir(repo_root)
+        .env("SKIP", skip_check_vendoring_integrity())
         .output()
         .with_context(|| format!("failed to run `git subrepo pull {subdir} -b {tag}`"))
+}
+
+/// This module's own repo-root commits (here, `fix_stale_parent`'s parent
+/// realignment and `ensure_tag_pin_matches`'s branch realignment; also used
+/// by `conflict::finish_conflict_fold_in`'s fold-in commit) each touch only
+/// part of the `.gitrepo`/`VENDORING.md`/`go.mod` consistency
+/// `check-vendoring-integrity` enforces — by design, that's the whole point
+/// of doing this work in separate, individually-committed steps. `SKIP`
+/// lets each such commit through the `always_run` pre-commit hook without
+/// clobbering a developer's own unrelated `SKIP` export (comma-joined
+/// union, matching `merge_skip_value`'s contract).
+pub(crate) fn skip_check_vendoring_integrity() -> String {
+    merge_skip_value(std::env::var("SKIP").ok().as_deref(), "check-vendoring-integrity")
 }
 
 /// `git subrepo clean` is a safe no-op when there's nothing to clean. If it
@@ -402,13 +426,20 @@ fn fix_stale_parent(repo_root: &Path, subdir: &str) -> Result<String> {
     run_git(repo_root, &["add", &gitrepo_rel]).with_context(|| {
         format!("`{gitrepo_rel}` was already modified on disk to realign `parent` before this failure")
     })?;
-    run_git(
+    // `run_git_with_env`, not `run_git`: this commit only realigns
+    // `.gitrepo`'s `parent`, leaving `VENDORING.md`/`go.mod` untouched —
+    // exactly the intermediate-inconsistent-tree state
+    // `check-vendoring-integrity`'s `always_run` pre-commit hook would
+    // otherwise (correctly, but unhelpfully) reject on a machine with this
+    // repo's git hooks installed.
+    run_git_with_env(
         repo_root,
         &[
             "commit",
             "-m",
             &format!("fix: realign {subdir} subrepo parent after squash-merge"),
         ],
+        &[("SKIP", &skip_check_vendoring_integrity())],
     )
     .with_context(|| {
         format!("`{gitrepo_rel}` was already modified and staged to realign `parent` before this failure")
@@ -440,13 +471,14 @@ fn ensure_tag_pin_matches(repo_root: &Path, subdir: &str, tag: &str) -> Result<(
     run_git(repo_root, &["add", &gitrepo_rel]).with_context(|| {
         format!("`{gitrepo_rel}` was already modified on disk to realign `branch` before this failure")
     })?;
-    run_git(
+    run_git_with_env(
         repo_root,
         &[
             "commit",
             "-m",
             &format!("fix: realign {subdir} subrepo branch pin to {tag}"),
         ],
+        &[("SKIP", &skip_check_vendoring_integrity())],
     )
     .with_context(|| {
         format!("`{gitrepo_rel}` was already modified and staged to realign `branch` before this failure")

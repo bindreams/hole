@@ -129,6 +129,14 @@ pass_filenames = false
 files = "^(ui/generated\\.ts|crates/common/src/protocol\\.rs|xtask/src/gen_ui_constants\\.rs)$"
 
 [[repos.hooks]]
+id = "check-vendoring-integrity"
+name = "check vendored deps for conflict markers and version drift"
+entry = "cargo xtask check-vendoring-integrity"
+language = "system"
+pass_filenames = false
+always_run = true
+
+[[repos.hooks]]
 id = "check-workspace-lints"
 name = "check workspace lints inheritance"
 entry = "python scripts/check-workspace-lints.py"

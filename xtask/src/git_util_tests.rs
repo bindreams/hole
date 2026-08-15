@@ -1,7 +1,7 @@
 use std::path::Path;
 use std::process::Command;
 
-use super::git_util::{disclose_prior_commit, run_git};
+use super::git_util::{disclose_prior_commit, hash_object_or_deleted, merge_skip_value, run_git, run_git_with_env};
 
 fn git(cwd: &Path, args: &[&str]) {
     let status = Command::new("git")
@@ -54,4 +54,115 @@ fn disclose_prior_commit_names_the_sha_and_the_reset_command() {
         message.contains("go mod tidy failed"),
         "the original error must survive: {message}"
     );
+}
+
+#[skuld::test]
+fn run_git_with_env_forwards_env_vars_to_the_git_subprocess() {
+    // A pre-commit hook that records the env var it actually saw proves the
+    // env reaches a child process git itself launches (the hook), not just
+    // the immediate `git` invocation — exactly the path the SKIP fix relies
+    // on (git-subrepo's own internal `git commit` inherits it the same way).
+    let dir = tempfile::tempdir().unwrap();
+    git(dir.path(), &["init", "--initial-branch=main", "--quiet"]);
+    git(dir.path(), &["config", "user.email", "fixture@example.com"]);
+    git(dir.path(), &["config", "user.name", "fixture"]);
+
+    let hooks_dir = dir.path().join(".git/hooks");
+    std::fs::create_dir_all(&hooks_dir).unwrap();
+    let captured_path = dir.path().join("captured-env.txt");
+    let captured_path_str = captured_path.display().to_string().replace('\\', "/");
+    std::fs::write(
+        hooks_dir.join("pre-commit"),
+        format!("#!/bin/sh\nprintf '%s' \"$XTASK_TEST_VAR\" > \"{captured_path_str}\"\n"),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(hooks_dir.join("pre-commit"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    std::fs::write(dir.path().join("f.txt"), "content\n").unwrap();
+    git(dir.path(), &["add", "f.txt"]);
+    run_git_with_env(
+        dir.path(),
+        &["commit", "-m", "test"],
+        &[("XTASK_TEST_VAR", "hello-from-run-git-with-env")],
+    )
+    .expect("commit should succeed");
+
+    let captured = std::fs::read_to_string(&captured_path).unwrap();
+    assert_eq!(captured, "hello-from-run-git-with-env");
+}
+
+#[skuld::test]
+fn run_git_with_env_bails_on_failure_like_run_git() {
+    let dir = tempfile::tempdir().unwrap();
+    git(dir.path(), &["init", "--initial-branch=main", "--quiet"]);
+    git(dir.path(), &["config", "user.email", "fixture@example.com"]);
+    git(dir.path(), &["config", "user.name", "fixture"]);
+    std::fs::write(dir.path().join("f.txt"), "content\n").unwrap();
+    git(dir.path(), &["add", "f.txt"]);
+    git(dir.path(), &["commit", "-m", "initial"]);
+
+    let err = run_git_with_env(
+        dir.path(),
+        &["commit", "-m", "nothing to see here"],
+        &[("SOME_VAR", "1")],
+    )
+    .expect_err("commit with nothing staged should fail");
+    assert!(
+        format!("{err:#}").contains("nothing to commit"),
+        "same bail-on-failure contract as run_git, including stdout: {err:#}"
+    );
+}
+
+#[skuld::test]
+fn merge_skip_value_appends_when_nothing_pre_existing() {
+    assert_eq!(
+        merge_skip_value(None, "check-vendoring-integrity"),
+        "check-vendoring-integrity"
+    );
+    assert_eq!(
+        merge_skip_value(Some(""), "check-vendoring-integrity"),
+        "check-vendoring-integrity"
+    );
+}
+
+#[skuld::test]
+fn merge_skip_value_unions_with_a_pre_existing_value_as_a_comma_join() {
+    assert_eq!(
+        merge_skip_value(Some("cargo-fmt"), "check-vendoring-integrity"),
+        "cargo-fmt,check-vendoring-integrity"
+    );
+    assert_eq!(
+        merge_skip_value(Some("cargo-fmt,cargo-clippy"), "check-vendoring-integrity"),
+        "cargo-fmt,cargo-clippy,check-vendoring-integrity"
+    );
+}
+
+#[skuld::test]
+fn hash_object_or_deleted_returns_the_git_blob_hash_for_a_present_file() {
+    let dir = tempfile::tempdir().unwrap();
+    git(dir.path(), &["init", "--initial-branch=main", "--quiet"]);
+    std::fs::write(dir.path().join("f.txt"), "hello\n").unwrap();
+
+    let output = Command::new("git")
+        .args(["hash-object", "f.txt"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    let expected = String::from_utf8_lossy(&output.stdout).trim().to_string();
+
+    let actual = hash_object_or_deleted(dir.path(), "f.txt").unwrap();
+    assert_eq!(actual, expected);
+}
+
+#[skuld::test]
+fn hash_object_or_deleted_returns_deleted_sentinel_for_an_absent_file() {
+    let dir = tempfile::tempdir().unwrap();
+    git(dir.path(), &["init", "--initial-branch=main", "--quiet"]);
+
+    let actual = hash_object_or_deleted(dir.path(), "missing.txt").unwrap();
+    assert_eq!(actual, "<deleted>");
 }

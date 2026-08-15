@@ -224,6 +224,22 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.x"
+      - uses: astral-sh/setup-uv@v9.0.0
+
+      # `check_vendoring_integrity_tests`'s `always_run_hazard_end_to_end_*`
+      # tests (part of `package(xtask)`, run by this job) install a real
+      # `prek` hook and drive `pull_subrepo`/`finish_vendor_bump` through
+      # it for real — unlike every other tool this job provisions,
+      # `prek` isn't otherwise on PATH here (only the `lint` job installs
+      # it), and per this repo's policy these tests must not skip on a
+      # missing dependency.
+      - name: Install prek
+        shell: bash
+        run: uv tool install prek
+
       # macOS runners ship only Apple's frozen Bash 3.2.57 (GPLv3 holdout) on
       # /usr/bin/bash, ahead of Homebrew's bash on PATH; git-subrepo's
       # `#!/usr/bin/env bash` shebang hard-requires Bash 4+ and refuses to run

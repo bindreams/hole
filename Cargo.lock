@@ -10911,6 +10911,7 @@ dependencies = [
  "cargo_metadata 0.23.1",
  "clap",
  "ctrlc",
+ "dunce",
  "flate2",
  "glob",
  "hole-common",
