@@ -317,3 +317,39 @@ fn a_branch_with_unfolded_work_is_rejected_even_though_the_worktree_is_gone() {
          worktree is gone"
     );
 }
+
+/// `skip_check_vendoring_integrity` hardcodes the literal `"check-vendoring-integrity"` as
+/// the `SKIP` value it sets, and `prek.toml`'s hook entry hardcodes the same string as its
+/// `id`. Nothing else ties these together — a rename of one without the other means every
+/// xtask-internal commit silently starts getting rejected by the local pre-commit hook
+/// again, with no test failure pointing at the cause. Mirrors
+/// `identity_checks_match_the_real_build_yaml_ex_ray_tests_target`'s pattern of checking a
+/// hardcoded expectation against the real files, rather than a full TOML parse.
+#[skuld::test]
+fn skip_check_vendoring_integrity_matches_prek_toml_hook_id() {
+    const HOOK_ID: &str = "check-vendoring-integrity";
+
+    let root = crate::repo_root().expect("repo root");
+    let prek_toml = std::fs::read_to_string(root.join("prek.toml")).expect("read prek.toml");
+    assert!(
+        prek_toml.contains(&format!("id = \"{HOOK_ID}\"")),
+        "prek.toml no longer has a hook with id = \"{HOOK_ID}\" — update it in lockstep with \
+         pull_subrepo::skip_check_vendoring_integrity"
+    );
+
+    // SKIP is process-global env state; save/restore around the read so this test doesn't
+    // observe, or leave behind, a developer's own unrelated SKIP export.
+    let saved = std::env::var_os("SKIP");
+    unsafe { std::env::remove_var("SKIP") };
+    let actual = pull_subrepo::skip_check_vendoring_integrity();
+    match saved {
+        Some(v) => unsafe { std::env::set_var("SKIP", v) },
+        None => unsafe { std::env::remove_var("SKIP") },
+    }
+
+    assert_eq!(
+        actual, HOOK_ID,
+        "skip_check_vendoring_integrity()'s hardcoded SKIP literal has drifted from \
+         prek.toml's check-vendoring-integrity hook id"
+    );
+}
