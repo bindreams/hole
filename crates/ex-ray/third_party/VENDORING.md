@@ -88,9 +88,14 @@ allowlist (the authoritative policy lives in `xtask/src/pull_subrepo.rs`'s
 auto-resolved when doing so wouldn't drop a downstream-only `replace`
 directive, like the one below) or if `VENDORING.md`/`go.mod` end up
 inconsistent with `.gitrepo`. On a real conflict, `vendor-bump.yaml`
-force-commits the conflicted tree (with real markers) and comments on the
-PR — auto-merge stays armed but can never fire, since GitHub's own
-required checks refuse to go green on a tree with conflict markers in it.
+force-commits the conflicted tree exactly as git leaves it — real conflict
+markers for a text conflict, but none at all for a delete/modify or
+binary-content one, which git can't represent that way — and comments on
+the PR. Auto-merge stays armed but can never fire: the required
+`cargo xtask check-vendoring-integrity` check catches both shapes,
+scanning for markers directly and, for the markerless ones, refusing the
+`.vendor-conflict` sentinel every force-committed conflict also carries
+(see the by-hand steps below).
 
 `pull-subrepo`'s "nothing committed" guarantee on a real conflict is about
 the pull attempt itself, not the whole run: if the routine squash-merge
@@ -112,17 +117,17 @@ To do it by hand (same tools the automation uses):
 
    If you're instead picking up a PR whose conflicted tree was already
    force-committed unresolved — by `vendor-bump.yaml` in CI, or by a human
-   running `cargo xtask force-commit-conflicted-subrepo` — it also carries
-   a `.vendor-conflict` sentinel in the dep's own directory, listing every
-   path left unmerged. `finish-vendor-bump` (step 2) clears it
-   automatically once every listed path's content has genuinely changed
-   since that commit — proof you actually touched it, not merely inherited
-   whatever content the force-commit left in place. If any listed path is
-   unchanged, it refuses and names that path in its error, and the
-   sentinel stays. `check-vendoring-integrity` rejects the sentinel's mere
-   presence, independent of any conflict markers — that's what blocks the
-   merge for delete/modify and binary conflicts, which git leaves no
-   markers to scan for.
+   running the same CI-only `cargo xtask force-commit-conflicted-subrepo` —
+   it also carries a `.vendor-conflict` sentinel in the dep's own
+   directory, listing every path left unmerged. `finish-vendor-bump`
+   (step 2) clears it automatically once every listed path's content has
+   genuinely changed since that commit — proof you actually touched it,
+   not merely inherited whatever content the force-commit left in place.
+   If any listed path is unchanged, it refuses and names that path in its
+   error, and the sentinel stays. `check-vendoring-integrity` rejects the
+   sentinel's mere presence, independent of any conflict markers — that's
+   what blocks the merge for delete/modify and binary conflicts, which
+   git leaves no markers to scan for.
 
 1. `cargo xtask finish-vendor-bump crates/ex-ray/third_party/<name> <name> <new-tag>`
    — updates this file's version note, bumps the outer `go.mod` require
