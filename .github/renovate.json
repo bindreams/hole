@@ -102,9 +102,21 @@
       "groupName": "Tauri"
     },
     {
-      "description": "Vendored git-subrepo deps (v2ray-core, utls): auto-merge armed for every update type — the file's unscoped major-only rule above doesn't reach these (they're a custom regex manager, and a routine bump is typically minor/patch, not major). Safety is entirely the required checks' job (Test ex-ray (Go), and check-vendoring-integrity riding inside Lint), not this rule.",
+      "description": "Vendored git-subrepo deps (v2ray-core, utls): auto-merge armed for every update type — a routine bump is typically minor/patch, not major, so the file's major-only rule above doesn't reach these. Safety is entirely the required checks' job (Test ex-ray (Go), and check-vendoring-integrity riding inside Lint), not this rule.",
       "matchFileNames": ["crates/ex-ray/third_party/*/.gitrepo"],
       "automerge": true
+    },
+    {
+      "description": "Don't update the vendored trees' own go.mod/go.sum under crates/ex-ray/third_party/*/. They're pristine upstream code (see VENDORING.md), excluded from this repo's tooling, and pull-subrepo's own allowlist silently overwrites them with upstream's version on the next bump anyway.",
+      "matchManagers": ["gomod"],
+      "matchFileNames": ["crates/ex-ray/third_party/*/go.mod", "crates/ex-ray/third_party/*/go.sum"],
+      "enabled": false
+    },
+    {
+      "description": "github.com/v2fly/v2ray-core/v5 and github.com/refraction-networking/utls in crates/ex-ray/go.mod are locally `replace`d to the vendored third_party trees (see VENDORING.md) — .gitrepo's branch, not this require line, is authoritative for their version. check-vendoring-integrity treats a mismatch as a violation; only finish-vendor-bump may bump this line, in lockstep with .gitrepo.",
+      "matchManagers": ["gomod"],
+      "matchDepNames": ["github.com/v2fly/v2ray-core/v5", "github.com/refraction-networking/utls"],
+      "enabled": false
     }
   ]
 }
