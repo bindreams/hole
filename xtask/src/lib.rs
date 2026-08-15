@@ -481,10 +481,13 @@ pub fn run_pull_subrepo(path: String, tag: String) -> Result<()> {
                  Resolve them in {}, `git add` the resolved files, then \
                  `PREK_ALLOW_NO_CONFIG=1 git commit` (this worktree has no `prek.toml` of its \
                  own — a plain `git commit` fails under this repo's pre-commit hook); then from \
-                 the repo root: run `git subrepo commit {path}`; check `{path}/.gitrepo`'s \
-                 `branch` field is `{tag}` (fix and commit it if not — `git subrepo commit` \
-                 does not update it); then run `git subrepo clean {path}` to remove the temp \
-                 worktree.",
+                 the repo root: run `SKIP=check-vendoring-integrity git subrepo commit {path}` \
+                 (the `SKIP` is required — at this exact point `{path}/.gitrepo`'s `branch` \
+                 already names {tag} while `VENDORING.md`/`go.mod` still name the old tag, \
+                 which `check-vendoring-integrity` would otherwise correctly, but unhelpfully, \
+                 reject); check `{path}/.gitrepo`'s `branch` field is `{tag}` (fix and commit it \
+                 if not — `git subrepo commit` does not update it); then run `git subrepo clean \
+                 {path}` to remove the temp worktree.",
                 unresolved.join("\n  "),
                 worktree.display()
             );

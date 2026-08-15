@@ -107,8 +107,10 @@ To do it by hand (same tools the automation uses):
 1. `cargo xtask pull-subrepo crates/ex-ray/third_party/<name> <new-tag>`.
    On a real conflict it stops uncommitted, exactly like `git pull`, and
    prints the temp worktree to resolve it in — `cd` there, fix the
-   conflicts (`git status` to see them), `git add`, `git commit`, then
-   from the repo root: `SKIP=check-vendoring-integrity git subrepo commit crates/ex-ray/third_party/<name>` — the `SKIP` is required if you have
+   conflicts (`git status` to see them), `git add`, then
+   `PREK_ALLOW_NO_CONFIG=1 git commit` (this worktree has no `prek.toml` of
+   its own — a plain `git commit` fails under this repo's pre-commit hook),
+   then from the repo root: `SKIP=check-vendoring-integrity git subrepo commit crates/ex-ray/third_party/<name>` — the `SKIP` is required if you have
    this repo's git hooks installed (the default): at this exact point
    `.gitrepo`'s `branch` names the new tag while this file and `go.mod`
    still name the old one (step 2 fixes that next), which the
@@ -128,6 +130,15 @@ To do it by hand (same tools the automation uses):
    sentinel's mere presence, independent of any conflict markers — that's
    what blocks the merge for delete/modify and binary conflicts, which
    git leaves no markers to scan for.
+
+   Your own resolution commit at this point (committing the actually-resolved
+   vendored files, in the main worktree, before running `finish-vendor-bump`)
+   also needs the `SKIP=check-vendoring-integrity` prefix — the sentinel is
+   still present, so check 4 rejects a plain commit the same way. Run
+   `SKIP=check-vendoring-integrity git commit ...` for it. `finish-vendor-bump`'s
+   own commit step (step 2, below) does not do this for you: it's
+   pathspec-scoped to `VENDORING.md`/`go.mod`/`go.sum`/the sentinel file
+   itself, never the vendored files.
 
 1. `cargo xtask finish-vendor-bump crates/ex-ray/third_party/<name> <name> <new-tag>`
    — updates this file's version note, bumps the outer `go.mod` require
