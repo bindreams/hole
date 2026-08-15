@@ -89,11 +89,16 @@ jobs:
             tag=$(sed -n 's/^\tbranch = //p' "$changed")
           fi
 
-          if ! [[ "$dep" =~ ^[a-zA-Z0-9_.-]+$ ]]; then
+          # No leading `-`: besides the injection-safety this shares with
+          # every other character class here, a leading `-` would let
+          # `dep`/`tag` be parsed as a flag by the `cargo xtask` calls below
+          # instead of a positional — defense in depth alongside the `--`
+          # separator those calls also use.
+          if ! [[ "$dep" =~ ^[a-zA-Z0-9][a-zA-Z0-9_.-]*$ ]]; then
             echo "::error::invalid dep name: $dep"
             exit 1
           fi
-          if ! [[ "$tag" =~ ^[a-zA-Z0-9_.-]+$ ]]; then
+          if ! [[ "$tag" =~ ^[a-zA-Z0-9][a-zA-Z0-9_.-]*$ ]]; then
             echo "::error::invalid tag: $tag"
             exit 1
           fi
@@ -119,7 +124,7 @@ jobs:
         id: pull
         run: |
           set +e
-          cargo xtask pull-subrepo "${{ steps.target.outputs.path }}" "${{ steps.target.outputs.tag }}"
+          cargo xtask pull-subrepo -- "${{ steps.target.outputs.path }}" "${{ steps.target.outputs.tag }}"
           code=$?
           set -e
           if [[ "$code" -eq 0 ]]; then
@@ -134,11 +139,11 @@ jobs:
         id: finish
         if: steps.pull.outputs.result == 'clean'
         continue-on-error: true
-        run: cargo xtask finish-vendor-bump "${{ steps.target.outputs.path }}" "${{ steps.target.outputs.dep }}" "${{ steps.target.outputs.tag }}"
+        run: cargo xtask finish-vendor-bump -- "${{ steps.target.outputs.path }}" "${{ steps.target.outputs.dep }}" "${{ steps.target.outputs.tag }}"
 
       - name: Commit the conflicted tree anyway (CI-only policy — see VENDORING.md)
         if: steps.pull.outputs.result == 'conflicted'
-        run: cargo xtask force-commit-conflicted-subrepo "${{ steps.target.outputs.path }}" "${{ steps.target.outputs.tag }}"
+        run: cargo xtask force-commit-conflicted-subrepo -- "${{ steps.target.outputs.path }}" "${{ steps.target.outputs.tag }}"
 
       - name: Push
         if: steps.pull.outputs.result == 'clean' || steps.pull.outputs.result == 'conflicted'
