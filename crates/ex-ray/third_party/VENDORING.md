@@ -110,15 +110,19 @@ To do it by hand (same tools the automation uses):
    `check-vendoring-integrity` hook would otherwise correctly, but
    unhelpfully, reject.
 
-   A conflicted commit (by either the automation or a human's own
-   force-committed resolution) also carries a `.vendor-conflict` sentinel
-   in the dep's own directory, listing every path that needs attention.
-   `finish-vendor-bump` (step 2) clears it automatically once every listed
-   path's content has genuinely changed since that commit — proof you
-   actually touched it, not merely inherited whatever content was
-   force-committed. If any listed path is unchanged, it refuses and names
-   that path in its error, and the sentinel stays; no separate manual step
-   is needed otherwise.
+   If you're instead picking up a PR whose conflicted tree was already
+   force-committed unresolved — by `vendor-bump.yaml` in CI, or by a human
+   running `cargo xtask force-commit-conflicted-subrepo` — it also carries
+   a `.vendor-conflict` sentinel in the dep's own directory, listing every
+   path left unmerged. `finish-vendor-bump` (step 2) clears it
+   automatically once every listed path's content has genuinely changed
+   since that commit — proof you actually touched it, not merely inherited
+   whatever content the force-commit left in place. If any listed path is
+   unchanged, it refuses and names that path in its error, and the
+   sentinel stays. `check-vendoring-integrity` rejects the sentinel's mere
+   presence, independent of any conflict markers — that's what blocks the
+   merge for delete/modify and binary conflicts, which git leaves no
+   markers to scan for.
 
 1. `cargo xtask finish-vendor-bump crates/ex-ray/third_party/<name> <name> <new-tag>`
    — updates this file's version note, bumps the outer `go.mod` require
