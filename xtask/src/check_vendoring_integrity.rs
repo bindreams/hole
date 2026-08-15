@@ -84,7 +84,15 @@ fn check_conflict_markers(repo_root: &Path, dep_dir_rel: &str) -> Result<Vec<Str
         // hard-error a UTF-8 read. A binary file cannot carry a text
         // merge-conflict marker, so a byte-level scan finding nothing is
         // simply nothing to report — never a reason to fail the check.
-        let bytes = std::fs::read(&abs_path).with_context(|| format!("failed to read {}", abs_path.display()))?;
+        let bytes = match std::fs::read(&abs_path) {
+            Ok(bytes) => bytes,
+            // `git ls-files` reports the index, not the worktree — a file deleted with a
+            // plain `rm` (not `git rm`) is still tracked but absent on disk. This hook is
+            // `always_run`, so that local worktree inconsistency must not become an opaque
+            // crash for every commit in the repo; there's nothing to scan, so report nothing.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e).with_context(|| format!("failed to read {}", abs_path.display())),
+        };
         for line in find_conflict_marker_triples(&bytes) {
             violations.push(format!("{rel_path}:{line}: unresolved merge-conflict markers"));
         }

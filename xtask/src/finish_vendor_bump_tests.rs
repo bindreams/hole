@@ -861,12 +861,6 @@ fn run_refuses_to_clear_the_sentinel_when_a_listed_path_is_unchanged() {
         widget_dir.join(".vendor-conflict").exists(),
         "the sentinel must not be removed"
     );
-    let head_after = Command::new("git")
-        .args(["rev-parse", "HEAD"])
-        .current_dir(fx.root())
-        .output()
-        .unwrap();
-    let head_after = String::from_utf8_lossy(&head_after.stdout).trim().to_string();
     // Confirms no sentinel-clearing commit was made — the earlier steps
     // (VENDORING.md note, go.mod bump) DID land, per this module's own
     // "commit each step's own changes" contract, so HEAD moved from the
@@ -881,7 +875,6 @@ fn run_refuses_to_clear_the_sentinel_when_a_listed_path_is_unchanged() {
         !subjects.contains("clear vendor-conflict sentinel"),
         "no sentinel-clearing commit should exist: {subjects}"
     );
-    let _ = head_after; // documents intent; the subject-log check above is the real assertion
 }
 
 #[skuld::test]
