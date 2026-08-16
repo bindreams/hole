@@ -44,6 +44,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // reaped. That is reuse-immune (a recycled PID cannot resurrect this specific
     // TCP connection) and needs no sleep. We never write to the socket — closing
     // it is purely an exit signal.
+    //
+    // MOCK_PLUGIN_GRANDCHILD_RENDEZVOUS is dialed LAST, and is what unblocks the
+    // parent: once it accepts, both this dial and the callback above have already
+    // happened, so the parent may exit without racing our startup.
     if std::env::var_os("MOCK_PLUGIN_SLEEP").is_some() {
         let _callback = match std::env::var_os("MOCK_PLUGIN_GRANDCHILD_CALLBACK") {
             Some(addr) => {
@@ -52,6 +56,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     TcpStream::connect(addr)
                         .await
                         .expect("grandchild dials the test callback"),
+                )
+            }
+            None => None,
+        };
+        let _rendezvous = match std::env::var_os("MOCK_PLUGIN_GRANDCHILD_RENDEZVOUS") {
+            Some(addr) => {
+                let addr = addr.to_str().expect("MOCK_PLUGIN_GRANDCHILD_RENDEZVOUS is valid utf-8");
+                Some(
+                    TcpStream::connect(addr)
+                        .await
+                        .expect("grandchild dials the parent rendezvous"),
                 )
             }
             None => None,
@@ -115,6 +130,53 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         sitrep_enabled,
     );
 
+    // Knob: MOCK_PLUGIN_SPAWN_GRANDCHILD=<callback_addr> — spawn a long-lived
+    // grandchild that INHERITS our stdio (default `Command` stdio), mimicking an
+    // inner plugin (galoshes→ex-ray) that, if orphaned, holds the host's
+    // stdout/stderr pipe. The grandchild dials <callback_addr> on startup and
+    // holds the connection, so a test can verify a force-kill of the chain reaps
+    // the whole process tree via the connection's liveness/EOF (reuse-immune, no
+    // PID poll). The grandchild gets MOCK_PLUGIN_SLEEP (so it short-circuits) plus
+    // the callback addr, and NOT this knob (so it does not recurse). std `Child`
+    // is not kill-on-drop, so letting it drop leaves the process running for the
+    // test.
+    //
+    // Placed BEFORE fault injection so a plugin that exits without ever binding
+    // still leaves the grandchild holding the pipes. `spawn` returns before the
+    // grandchild has run an instruction, so we block on its rendezvous dial: it
+    // makes "the grandchild is alive and holding our stdio" a fact before we can
+    // exit, with no timer.
+    if let Some(callback_addr) = std::env::var_os("MOCK_PLUGIN_SPAWN_GRANDCHILD") {
+        let rendezvous = TcpListener::bind("127.0.0.1:0").await?;
+        let exe = std::env::current_exe()?;
+        let mut cmd = std::process::Command::new(exe);
+        cmd.env("MOCK_PLUGIN_SLEEP", "1")
+            .env("MOCK_PLUGIN_GRANDCHILD_CALLBACK", &callback_addr)
+            .env(
+                "MOCK_PLUGIN_GRANDCHILD_RENDEZVOUS",
+                rendezvous.local_addr()?.to_string(),
+            )
+            .env_remove("MOCK_PLUGIN_SPAWN_GRANDCHILD");
+        // Mimic how garter spawns a NESTED plugin (galoshes→ex-ray) so this
+        // grandchild is reaped only by the root's process-tree kill, never by the
+        // parent's graceful stop:
+        //  - Windows: give it its OWN console group (CREATE_NEW_PROCESS_GROUP,
+        //    exactly as garter spawns every plugin) so graceful_stop's CTRL_BREAK
+        //    to the parent's group can't reach it; it still joins the root's job
+        //    object by handle inheritance and is reaped that way.
+        //  - Unix: do NOT setpgid — inherit the parent's process group like a
+        //    nested ex-ray, so the root's kill(-pgid) reaps it. graceful_stop's
+        //    SIGTERM is PID-targeted, so it can't reach the grandchild anyway.
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+            cmd.creation_flags(CREATE_NEW_PROCESS_GROUP);
+        }
+        let _grandchild = cmd.spawn()?;
+        let _ = rendezvous.accept().await?;
+    }
+
     // Knob: MOCK_PLUGIN_RAW_STDOUT_LINE — print this env var's value
     // verbatim as one extra stdout line, right after `hello`, then
     // continue normal startup (bind + `ready`). Lets a test hand-construct
@@ -127,8 +189,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let _ = std::io::stdout().flush();
     }
 
-    // Fault-injection knob: MOCK_PLUGIN_FAIL=fatal | bind_conflict | bind_conflict_once
+    // Fault-injection knob:
+    // MOCK_PLUGIN_FAIL=fatal | bind_conflict | bind_conflict_once | exit_silently
     let fail = std::env::var("MOCK_PLUGIN_FAIL").unwrap_or_default();
+    // The only mode that exits with NO readiness-bearing sitrep event, so a
+    // consumer's sole route to resolving readiness is stdout EOF.
+    if fail == "exit_silently" {
+        std::process::exit(1);
+    }
     if fail == "fatal" {
         emit(
             &SitrepEvent::Fatal {
@@ -192,41 +260,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
         sitrep_enabled,
     );
-
-    // Knob: MOCK_PLUGIN_SPAWN_GRANDCHILD=<callback_addr> — spawn a long-lived
-    // grandchild that INHERITS our stdio (default `Command` stdio), mimicking an
-    // inner plugin (galoshes→ex-ray) that, if orphaned, holds the host's
-    // stdout/stderr pipe. The grandchild dials <callback_addr> on startup and
-    // holds the connection, so a test can verify a force-kill of the chain reaps
-    // the whole process tree via the connection's liveness/EOF (reuse-immune, no
-    // PID poll). The grandchild gets MOCK_PLUGIN_SLEEP (so it short-circuits) plus
-    // the callback addr, and NOT this knob (so it does not recurse). std `Child`
-    // is not kill-on-drop, so letting it drop leaves the process running for the
-    // test.
-    if let Some(callback_addr) = std::env::var_os("MOCK_PLUGIN_SPAWN_GRANDCHILD") {
-        let exe = std::env::current_exe()?;
-        let mut cmd = std::process::Command::new(exe);
-        cmd.env("MOCK_PLUGIN_SLEEP", "1")
-            .env("MOCK_PLUGIN_GRANDCHILD_CALLBACK", &callback_addr)
-            .env_remove("MOCK_PLUGIN_SPAWN_GRANDCHILD");
-        // Mimic how garter spawns a NESTED plugin (galoshes→ex-ray) so this
-        // grandchild is reaped only by the root's process-tree kill, never by the
-        // parent's graceful stop:
-        //  - Windows: give it its OWN console group (CREATE_NEW_PROCESS_GROUP,
-        //    exactly as garter spawns every plugin) so graceful_stop's CTRL_BREAK
-        //    to the parent's group can't reach it; it still joins the root's job
-        //    object by handle inheritance and is reaped that way.
-        //  - Unix: do NOT setpgid — inherit the parent's process group like a
-        //    nested ex-ray, so the root's kill(-pgid) reaps it. graceful_stop's
-        //    SIGTERM is PID-targeted, so it can't reach the grandchild anyway.
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-            cmd.creation_flags(CREATE_NEW_PROCESS_GROUP);
-        }
-        let _grandchild = cmd.spawn()?;
-    }
 
     loop {
         let (inbound, peer) = listener.accept().await?;
