@@ -1,9 +1,11 @@
 default_install_hook_types = ["pre-commit", "commit-msg"]
 
 # Vendored upstream code is kept pristine; no hook may lint, format, or rewrite
-# it. crates/ex-ray/third_party/{v2ray-core,utls} are git-subrepos of pristine
-# upstream (build truth via go.mod replace); see their third_party/VENDORING.md.
-exclude = '^crates/ex-ray/third_party/(v2ray-core|utls)/'
+# it. Every immediate subdir of crates/ex-ray/third_party/ is a git-subrepo of
+# pristine upstream (build truth via go.mod replace; see third_party/VENDORING.md)
+# — matched generically, not by name, so a third vendored dep needs no edit
+# here either, matching check-vendoring-integrity's own dynamic discovery.
+exclude = '^crates/ex-ray/third_party/[^/]+/'
 
 # Local hooks ==========================================================================================================
 
@@ -61,7 +63,7 @@ name = "golangci-lint fmt (ex-ray)"
 # the repo root via `git rev-parse`) so there's no PATH dependency and the hook
 # behaves identically locally and in CI. `fmt --diff` is check-only (the v2
 # formatters/gofumpt run). `crates/ex-ray` is the only Go module today; if a
-# second appears, extend this hook (Task 12's grep catches strays).
+# second appears, extend this hook.
 entry = "bash -c 'cd crates/ex-ray && \"$(git rev-parse --show-toplevel)/.cache/golangci-lint/2.12.2/golangci-lint\" fmt --diff'"
 language = "system"
 # types=["go"] means the hook is SKIPPED when no .go file is staged (same as the
@@ -127,6 +129,14 @@ entry = "cargo xtask gen-ui-constants --check"
 language = "system"
 pass_filenames = false
 files = "^(ui/generated\\.ts|crates/common/src/protocol\\.rs|xtask/src/gen_ui_constants\\.rs)$"
+
+[[repos.hooks]]
+id = "check-vendoring-integrity"
+name = "check vendored deps for conflict markers and version drift"
+entry = "cargo xtask check-vendoring-integrity"
+language = "system"
+pass_filenames = false
+always_run = true
 
 [[repos.hooks]]
 id = "check-workspace-lints"

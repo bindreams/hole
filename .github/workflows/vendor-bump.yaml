@@ -1,0 +1,192 @@
+name: Vendor bump
+
+on:
+  push:
+    branches: ["renovate/**"]
+    paths: ["crates/ex-ray/third_party/*/.gitrepo"]
+  workflow_dispatch:
+    inputs:
+      dep:
+        description: Vendored dep directory name under crates/ex-ray/third_party (e.g. v2ray-core, utls)
+        required: true
+      tag:
+        description: Upstream tag to pull (e.g. v5.53.0)
+        required: true
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: vendor-bump-${{ github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  bump:
+    name: Pull + rebase vendored dependency
+    if: github.event_name != 'push' || github.event.head_commit.author.name != 'nathan-blahaj[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      # `uses: ./...` (below) resolves against the checked-out workspace,
+      # which is empty at job start — this bootstrap checkout exists only
+      # to make the local mint-nathan-token action resolvable. The real
+      # checkout follows once the token exists.
+      - uses: actions/checkout@v7
+
+      - name: Mint nathan-blahaj token
+        id: nathan
+        uses: ./.github/actions/mint-nathan-token
+        with:
+          app-id: ${{ secrets.NATHAN_APP_ID }}
+          private-key: ${{ secrets.NATHAN_APP_PRIVATE_KEY }}
+
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          token: ${{ steps.nathan.outputs.token }}
+
+      - name: Ensure origin/main is available
+        run: git fetch origin main --quiet
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-go@v7
+        with:
+          go-version: stable
+
+      # git-subrepo isn't part of the ubuntu-latest image or any
+      # apt/npm/go package — it's a bash-script tool installed by cloning
+      # it and putting its lib/ dir (containing an executable named
+      # `git-subrepo`) on PATH. Pinned to 0.4.9 to match the version this
+      # workflow's fixup logic targets.
+      - name: Install git-subrepo 0.4.9
+        run: |
+          git clone --branch 0.4.9 --depth 1 https://github.com/ingydotnet/git-subrepo "$RUNNER_TEMP/git-subrepo"
+          echo "$RUNNER_TEMP/git-subrepo/lib" >> "$GITHUB_PATH"
+
+      - name: Determine dep + tag
+        id: target
+        env:
+          INPUT_DEP: ${{ inputs.dep }}
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          if [[ -n "$INPUT_DEP" ]]; then
+            dep="$INPUT_DEP"
+            tag="$INPUT_TAG"
+          else
+            changed=$(git diff --name-only origin/main...HEAD -- 'crates/ex-ray/third_party/*/.gitrepo')
+            if [[ -z "$changed" ]]; then
+              count=0
+            else
+              count=$(printf '%s\n' "$changed" | wc -l)
+            fi
+            if [[ "$count" -ne 1 ]]; then
+              echo "::error::expected exactly one changed .gitrepo relative to main, got $count: $changed"
+              exit 1
+            fi
+            dep=$(basename "$(dirname "$changed")")
+            tag=$(sed -n 's/^\tbranch = //p' "$changed")
+          fi
+
+          # No leading `-`: besides the injection-safety this shares with
+          # every other character class here, a leading `-` would let
+          # `dep`/`tag` be parsed as a flag by the `cargo xtask` calls below
+          # instead of a positional — defense in depth alongside the `--`
+          # separator those calls also use.
+          if ! [[ "$dep" =~ ^[a-zA-Z0-9][a-zA-Z0-9_.-]*$ ]]; then
+            echo "::error::invalid dep name: $dep"
+            exit 1
+          fi
+          if ! [[ "$tag" =~ ^[a-zA-Z0-9][a-zA-Z0-9_.-]*$ ]]; then
+            echo "::error::invalid tag: $tag"
+            exit 1
+          fi
+
+          echo "dep=$dep" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "path=crates/ex-ray/third_party/$dep" >> "$GITHUB_OUTPUT"
+
+      - name: Create a scratch branch (workflow_dispatch only)
+        if: github.event_name == 'workflow_dispatch'
+        id: scratch-branch
+        run: |
+          branch="vendor-bump-manual/${{ steps.target.outputs.dep }}-${{ steps.target.outputs.tag }}-${{ github.run_id }}"
+          git checkout -b "$branch"
+          echo "ref_name=$branch" >> "$GITHUB_OUTPUT"
+
+      - name: git identity
+        run: |
+          git config user.name "nathan-blahaj[bot]"
+          git config user.email "nathan-blahaj[bot]@users.noreply.github.com"
+
+      - name: Pull the vendored subrepo
+        id: pull
+        run: |
+          set +e
+          cargo xtask pull-subrepo -- "${{ steps.target.outputs.path }}" "${{ steps.target.outputs.tag }}"
+          code=$?
+          set -e
+          if [[ "$code" -eq 0 ]]; then
+            echo "result=clean" >> "$GITHUB_OUTPUT"
+          elif [[ "$code" -eq 2 ]]; then
+            echo "result=conflicted" >> "$GITHUB_OUTPUT"
+          else
+            exit "$code"
+          fi
+
+      - name: Finish (version note, go.mod, identity checks)
+        id: finish
+        if: steps.pull.outputs.result == 'clean'
+        continue-on-error: true
+        run: cargo xtask finish-vendor-bump -- "${{ steps.target.outputs.path }}" "${{ steps.target.outputs.dep }}" "${{ steps.target.outputs.tag }}"
+
+      - name: Commit the conflicted tree anyway (CI-only policy — see VENDORING.md)
+        if: steps.pull.outputs.result == 'conflicted'
+        run: cargo xtask force-commit-conflicted-subrepo -- "${{ steps.target.outputs.path }}" "${{ steps.target.outputs.tag }}"
+
+      - name: Push
+        if: steps.pull.outputs.result == 'clean' || steps.pull.outputs.result == 'conflicted'
+        run: git push origin "HEAD:${{ steps.scratch-branch.outputs.ref_name || github.ref_name }}"
+
+      - name: Find the PR for this branch
+        if: github.event_name == 'push' && steps.pull.outputs.result == 'conflicted'
+        id: find-pr
+        env:
+          GH_TOKEN: ${{ steps.nathan.outputs.token }}
+        run: |
+          pr_number=$(gh pr list --repo "${{ github.repository }}" --head "${{ github.ref_name }}" --json number --jq '.[0].number // empty')
+          echo "pr_number=$pr_number" >> "$GITHUB_OUTPUT"
+
+      - name: Comment on the PR if conflicted
+        if: steps.pull.outputs.result == 'conflicted' && steps.find-pr.outputs.pr_number != ''
+        env:
+          GH_TOKEN: ${{ steps.nathan.outputs.token }}
+        run: |
+          gh pr comment "${{ steps.find-pr.outputs.pr_number }}" --repo "${{ github.repository }}" --body "$(cat <<EOF
+          Automated pull of \`${{ steps.target.outputs.dep }}\` to \`${{ steps.target.outputs.tag }}\` hit a real merge conflict outside the auto-resolved allowlist (go.mod/go.sum/.github/workflows). The conflicted tree is committed on this branch.
+
+          To resolve: see crates/ex-ray/third_party/VENDORING.md's "Bumping a pinned version" section, then run \`cargo xtask finish-vendor-bump crates/ex-ray/third_party/${{ steps.target.outputs.dep }} ${{ steps.target.outputs.dep }} ${{ steps.target.outputs.tag }}\` and push a normal commit.
+          EOF
+          )"
+
+      # None of these steps ever run if an earlier one (Push included)
+      # failed: a step's own `if:` is implicitly ANDed with `success()`
+      # unless the condition itself names `always()`/`cancelled()`/
+      # `failure()` (none of the conditions in this job do) — so a
+      # rejected Push (a real force-push race) already fails the job on
+      # its own account, with no separate disposition needed here.
+      - name: Fail the job if the pull conflicted
+        if: steps.pull.outputs.result == 'conflicted'
+        run: |
+          if [[ "${{ github.event_name }}" == "push" && "${{ steps.find-pr.outputs.pr_number }}" == "" ]]; then
+            echo "::error::a real merge conflict landed outside the auto-resolved allowlist — the conflicted tree was committed and pushed, but no open PR was found yet to comment on (Renovate's own push and PR-open are separate operations with no ordering guarantee). To resolve: see crates/ex-ray/third_party/VENDORING.md's \"Bumping a pinned version\" section, then run \`cargo xtask finish-vendor-bump crates/ex-ray/third_party/${{ steps.target.outputs.dep }} ${{ steps.target.outputs.dep }} ${{ steps.target.outputs.tag }}\` and push a normal commit."
+          else
+            echo "::error::a real merge conflict landed outside the auto-resolved allowlist — the conflicted tree was committed and pushed for a human to resolve (see the PR comment)."
+          fi
+          exit 1
+
+      - name: Fail the job if Finish failed
+        if: steps.finish.outcome == 'failure'
+        run: |
+          echo "::error::the 'Finish' step failed — see its log above for the reason (an identity-check failure, an unresolved .vendor-conflict sentinel left by a prior conflicted push, or an earlier error like a malformed go.mod/VENDORING.md heading). Any commits it made before failing were still pushed."
+          exit 1

@@ -14,6 +14,7 @@ use crate::manifest::{Manifest, Platform};
 use crate::orchestrate::{execute, execute_run, relocate_self_if_windows, render_list, Plan};
 
 pub mod bindir;
+pub mod check_vendoring_integrity;
 pub mod ci_coverage;
 pub mod ci_nextest_parity;
 pub mod ci_timeouts;
@@ -22,12 +23,15 @@ pub mod ci_timeouts;
 #[cfg(target_os = "macos")]
 pub mod dmg_background;
 pub mod ex_ray;
+pub mod finish_vendor_bump;
 pub mod galoshes;
 pub mod gen_ui_constants;
+pub mod git_util;
 pub mod golangci_lint;
 pub mod interrupt;
 pub mod manifest;
 pub mod orchestrate;
+pub mod pull_subrepo;
 pub mod stage;
 pub mod target;
 pub mod tauri_pairs;
@@ -39,6 +43,9 @@ pub mod wintun;
 #[cfg(test)]
 #[path = "bindir_tests.rs"]
 mod bindir_tests;
+#[cfg(test)]
+#[path = "check_vendoring_integrity_tests.rs"]
+mod check_vendoring_integrity_tests;
 #[cfg(test)]
 #[path = "ci_coverage_tests.rs"]
 mod ci_coverage_tests;
@@ -55,17 +62,26 @@ mod ci_timeouts_tests;
 #[path = "dmg_background_tests.rs"]
 mod dmg_background_tests;
 #[cfg(test)]
+#[path = "finish_vendor_bump_tests.rs"]
+mod finish_vendor_bump_tests;
+#[cfg(test)]
 #[path = "galoshes_tests.rs"]
 mod galoshes_tests;
 #[cfg(test)]
 #[path = "gen_ui_constants_tests.rs"]
 mod gen_ui_constants_tests;
 #[cfg(test)]
+#[path = "git_util_tests.rs"]
+mod git_util_tests;
+#[cfg(test)]
 #[path = "manifest_tests.rs"]
 mod manifest_tests;
 #[cfg(test)]
 #[path = "orchestrate_tests.rs"]
 mod orchestrate_tests;
+#[cfg(test)]
+#[path = "pull_subrepo_tests.rs"]
+mod pull_subrepo_tests;
 #[cfg(test)]
 #[path = "stage_tests.rs"]
 mod stage_tests;
@@ -144,6 +160,58 @@ pub enum Command {
     /// keeping the build-deps lean. The `plugin-e2e-tests` build.yaml target
     /// runs it before the interop round-trip tests.
     ProvisionUpstreamV2ray,
+    /// Pull a vendored git-subrepo to a new upstream tag, fixing the
+    /// routine squash-merge parent-staleness gotcha automatically. A real
+    /// merge conflict stops here, uncommitted, exactly like `git pull` —
+    /// resolve it by hand in the printed temp worktree.
+    PullSubrepo {
+        /// Path to the subrepo directory, relative to the repo root (e.g.
+        /// `crates/ex-ray/third_party/v2ray-core`).
+        path: String,
+        /// Upstream tag to pull (e.g. `v5.53.0`). Not validated against any
+        /// datasource — the caller decides.
+        tag: String,
+    },
+    /// The CI-only "commit despite conflicts" policy: force-finishes a
+    /// conflicted `pull-subrepo` attempt by committing the temp worktree
+    /// exactly as it sits, conflict markers and all. Never use this outside
+    /// automation — a human should resolve the conflict properly instead (see
+    /// `pull-subrepo`'s own error message for how).
+    ForceCommitConflictedSubrepo {
+        /// Path to the subrepo directory, relative to the repo root — same
+        /// value passed to the `pull-subrepo` invocation that conflicted.
+        path: String,
+        /// Upstream tag that was being pulled — same value passed to the
+        /// `pull-subrepo` invocation that conflicted.
+        tag: String,
+    },
+    /// Finish a vendor bump after `pull-subrepo` succeeds: update the
+    /// VENDORING.md version note, bump + `go mod tidy` the outer module,
+    /// run the identity build/test check, and commit each step's own
+    /// changes — regardless of whether the identity check passed, so the
+    /// failure isn't silently swallowed. Exit code distinguishes the two
+    /// failure shapes a caller must handle differently: 2 means every
+    /// commit landed but the identity check itself failed (mirrors
+    /// `pull-subrepo`'s exit-2 convention for "conflicted, worktree left
+    /// for resolution"); any earlier failure (e.g. a malformed go.mod,
+    /// `go mod tidy` itself failing) propagates as the normal exit 1.
+    FinishVendorBump {
+        /// Path to the vendored dep's directory, relative to the repo root
+        /// (e.g. `crates/ex-ray/third_party/v2ray-core`).
+        path: String,
+        /// The dependency's VENDORING.md heading name (e.g. `v2ray-core`).
+        dep_name: String,
+        /// Upstream tag just pulled (e.g. `v5.53.0`).
+        tag: String,
+    },
+    /// Check every git-subrepo-vendored dep under `crates/ex-ray/third_party/`
+    /// for unresolved merge-conflict markers, `VENDORING.md`/`.gitrepo`/
+    /// `go.mod` version drift, and a leftover `.vendor-conflict`
+    /// hand-resolution sentinel. Prints every violation found and exits
+    /// non-zero if any exist; silent and exit 0 otherwise. Wired into
+    /// `prek.toml` as an `always_run` local hook (`pass_filenames = false`
+    /// — it always operates on the whole repo).
+    CheckVendoringIntegrity,
     /// Run all `cargo xtask <step>` commands required for a runnable build.
     ///
     /// Currently: `ex-ray` + `galoshes` + `wintun` + `golangci-lint`.
@@ -290,6 +358,12 @@ pub fn dispatch(cli: Cli) -> Result<()> {
         Command::Wintun => run_wintun(),
         Command::GolangciLint => run_golangci_lint(),
         Command::ProvisionUpstreamV2ray => run_provision_upstream_v2ray(),
+        Command::PullSubrepo { path, tag } => run_pull_subrepo(path, tag),
+        Command::ForceCommitConflictedSubrepo { path, tag } => {
+            pull_subrepo::force_commit_conflicted(&repo_root()?, &path, &tag)
+        }
+        Command::FinishVendorBump { path, dep_name, tag } => run_finish_vendor_bump(path, dep_name, tag),
+        Command::CheckVendoringIntegrity => run_check_vendoring_integrity(),
         Command::Deps => run_deps(),
         Command::Version { group, check, exact } => run_version(group, check, exact),
         Command::Build { target, all } => run_build(target, all),
@@ -387,6 +461,88 @@ pub fn run_provision_upstream_v2ray() -> Result<()> {
     let path = upstream_v2ray::ensure(&repo_root)?;
     println!("xtask: upstream v2ray-plugin at {}", path.display());
     Ok(())
+}
+
+pub fn run_pull_subrepo(path: String, tag: String) -> Result<()> {
+    let repo_root = repo_root()?;
+    match pull_subrepo::run(&repo_root, &path, &tag)? {
+        pull_subrepo::Outcome::Clean => {
+            println!("xtask: pulled {path} to {tag} cleanly");
+            Ok(())
+        }
+        pull_subrepo::Outcome::Conflicted {
+            worktree,
+            unresolved,
+            auto_resolved,
+            fixup_commit,
+        } => {
+            eprintln!(
+                "xtask: {path} pull to {tag} has unresolved conflicts in:\n  {}\n\
+                 Resolve them in {}, `git add` the resolved files, then \
+                 `PREK_ALLOW_NO_CONFIG=1 git commit` (this worktree has no `prek.toml` of its \
+                 own — a plain `git commit` fails under this repo's pre-commit hook); then from \
+                 the repo root: run `SKIP=check-vendoring-integrity git subrepo commit {path}` \
+                 (the `SKIP` is required — at this exact point `{path}/.gitrepo`'s `branch` \
+                 already names {tag} while `VENDORING.md`/`go.mod` still name the old tag, \
+                 which `check-vendoring-integrity` would otherwise correctly, but unhelpfully, \
+                 reject); check `{path}/.gitrepo`'s `branch` field is `{tag}` (fix and commit it \
+                 if not — `git subrepo commit` does not update it); then run `git subrepo clean \
+                 {path}` to remove the temp worktree.",
+                unresolved.join("\n  "),
+                worktree.display()
+            );
+            if !auto_resolved.is_empty() {
+                eprintln!(
+                    "xtask: note: these allowlisted files were already auto-resolved to \
+                     upstream's content and staged in the worktree — no action needed on \
+                     them:\n  {}",
+                    auto_resolved.join("\n  ")
+                );
+            }
+            if let Some(fixup_commit) = fixup_commit {
+                eprintln!(
+                    "xtask: note: a `.gitrepo` parent-realignment commit ({fixup_commit}) was \
+                     already created on this branch before the conflict."
+                );
+            }
+            // Exit code 2 distinguishes "real conflict, worktree left
+            // for resolution" from any other failure (which propagates
+            // as exit 1 via the `?` above) — vendor-bump.yaml branches
+            // on this instead of misapplying conflict-recovery to e.g.
+            // a dirty-tree rejection or a missing git-subrepo install.
+            std::process::exit(2);
+        }
+    }
+}
+
+pub fn run_finish_vendor_bump(path: String, dep_name: String, tag: String) -> Result<()> {
+    let repo_root = repo_root()?;
+    match finish_vendor_bump::run(&repo_root, &path, &dep_name, &tag)? {
+        finish_vendor_bump::IdentityCheckOutcome::Passed => {
+            println!("xtask: finished vendoring {dep_name} {tag}, identity checks passed");
+            Ok(())
+        }
+        finish_vendor_bump::IdentityCheckOutcome::Failed { detail } => {
+            eprintln!("xtask: identity checks failed after committing the vendor bump for {dep_name} {tag}:\n{detail}");
+            // Exit code 2 means every commit landed but the identity check
+            // itself failed — distinguishable from any earlier failure
+            // (propagates as exit 1 via the `?` above), mirroring
+            // `run_pull_subrepo`'s exit-2 convention.
+            std::process::exit(2);
+        }
+    }
+}
+
+pub fn run_check_vendoring_integrity() -> Result<()> {
+    let repo_root = repo_root()?;
+    let violations = check_vendoring_integrity::run(&repo_root)?;
+    if violations.is_empty() {
+        return Ok(());
+    }
+    for violation in &violations {
+        eprintln!("xtask: {violation}");
+    }
+    std::process::exit(1);
 }
 
 pub fn run_deps() -> Result<()> {

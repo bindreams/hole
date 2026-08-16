@@ -1,0 +1,516 @@
+//! `cargo xtask pull-subrepo <path> <tag>` — a thin, honest wrapper around
+//! `git subrepo pull` that fixes the one squash-merge gotcha this repo
+//! hits on every pull (see crates/ex-ray/third_party/VENDORING.md) and
+//! otherwise behaves exactly like `git pull`: a real conflict stops here
+//! for a human to resolve. The one exception to "uncommitted": if the
+//! squash-merge fixup ran and a *later* step in the same attempt still
+//! fails, the fixup commit already landed — every such error path discloses
+//! that commit's SHA rather than leaving it a silent side effect. No
+//! Renovate/CI awareness — the caller decides `tag`, and the "commit anyway
+//! despite conflicts" CI-only policy is `force_commit_conflicted`.
+
+use std::path::{Path, PathBuf};
+use std::process::{Command, Output};
+
+use anyhow::{bail, Context, Result};
+
+use crate::git_util::{merge_skip_value, run_git, run_git_with_env};
+
+mod conflict;
+
+#[cfg(test)]
+#[path = "pull_subrepo/conflict_tests.rs"]
+mod conflict_tests;
+#[cfg(test)]
+#[path = "pull_subrepo/test_support.rs"]
+pub(crate) mod test_support;
+
+pub use conflict::force_commit_conflicted;
+
+pub enum Outcome {
+    /// Pull succeeded (cleanly, or after auto-resolving only the
+    /// documented-safe allowlist). Usually a new commit updating `<subdir>`
+    /// now sits on HEAD; if `<subdir>` was already at `tag`, `git subrepo
+    /// pull` is a no-op and HEAD is unchanged instead.
+    Clean,
+    /// A conflict remains outside the safe allowlist. The pull attempt
+    /// itself committed nothing to the caller's branch. `unresolved`'s
+    /// paths are left in the temp merge worktree exactly as `git merge`
+    /// would leave them, with real conflict markers, for a human to
+    /// resolve — but paths on the documented-safe allowlist are NOT left
+    /// that way even though the outcome as a whole is `Conflicted`:
+    /// `handle_conflict` already resolved and staged them to upstream's
+    /// content before returning, and their paths are disclosed in
+    /// `auto_resolved` rather than silently mutating the worktree with no
+    /// record of it. `fixup_commit` is `Some(sha)` when a prior,
+    /// independent `.gitrepo`-parent-realignment commit already landed on
+    /// the branch before this conflict was hit (see `fix_stale_parent`) —
+    /// carried in the value, not just an error path, so a real (non-`Err`)
+    /// `Conflicted` result still discloses it.
+    Conflicted {
+        worktree: PathBuf,
+        unresolved: Vec<String>,
+        auto_resolved: Vec<String>,
+        fixup_commit: Option<String>,
+    },
+}
+
+pub fn run(repo_root: &Path, subdir: &str, tag: &str) -> Result<Outcome> {
+    let subdir = &normalize_subdir(subdir);
+    assert_subdir_is_ref_safe(repo_root, subdir)?;
+    ensure_clean_tree(repo_root, subdir)?;
+    ensure_no_in_progress_conflict_resolution(repo_root, subdir)?;
+
+    let first = attempt_pull(repo_root, subdir, tag)?;
+    if first.status.success() {
+        best_effort_clean(repo_root, subdir);
+        // `git subrepo pull` has, in the usual (non-no-op) case, already
+        // committed real vendored content to HEAD by this point — if the
+        // tag-pin fixup below fails, say so, rather than leaving that
+        // already-landed commit an undisclosed side effect.
+        ensure_tag_pin_matches(repo_root, subdir, tag).with_context(|| {
+            "git subrepo pull already succeeded and (usually) committed to this branch before \
+             this failure — check `git log -1` before assuming nothing happened"
+                .to_string()
+        })?;
+        return Ok(Outcome::Clean);
+    }
+
+    let stderr = String::from_utf8_lossy(&first.stderr);
+    if stderr.contains("is not an ancestor") {
+        let fixup_commit = fix_stale_parent(repo_root, subdir)?;
+        return retry_after_stale_parent_fixup(repo_root, subdir, tag, &fixup_commit);
+    }
+
+    conflict::handle_conflict(repo_root, subdir, tag, &first, None)
+}
+
+/// Every fallible step after `fix_stale_parent` lands its `.gitrepo`
+/// parent-realignment commit is wrapped with the same disclosure context —
+/// a real, irreversible commit already exists on the branch by this point,
+/// and the module's contract (see the module doc) promises no error path
+/// after that leaves it a silent side effect. One shared closure, applied
+/// to every fallible call in this retry, so a future added step can't
+/// reintroduce the gap by omission.
+fn retry_after_stale_parent_fixup(repo_root: &Path, subdir: &str, tag: &str, fixup_commit: &str) -> Result<Outcome> {
+    // `{fixup_commit}~1` (not `HEAD~1`) is deliberate: by the time
+    // `ensure_tag_pin_matches` below runs, a successful `second` pull has
+    // already added its own content commit on top of `fixup_commit`, so
+    // `HEAD~1` would only undo *that* commit, not the fixup. Naming the
+    // fixup commit's own parent directly stays correct regardless of how
+    // many commits landed after it.
+    let disclose = || {
+        format!(
+            "a `.gitrepo` parent-realignment commit ({fixup_commit}) was already created on \
+             this branch before this failure; `git reset --hard {fixup_commit}~1` undoes it \
+             (and anything committed after it) if you want to retry from a clean state"
+        )
+    };
+
+    let second = attempt_pull(repo_root, subdir, tag).with_context(disclose)?;
+    if second.status.success() {
+        best_effort_clean(repo_root, subdir);
+        ensure_tag_pin_matches(repo_root, subdir, tag).with_context(disclose)?;
+        return Ok(Outcome::Clean);
+    }
+    conflict::handle_conflict(repo_root, subdir, tag, &second, Some(fixup_commit)).with_context(disclose)
+}
+
+/// Mirrors git-subrepo's own `check-and-normalize-subdir`: strips a leading
+/// `./`, a trailing `/`, and collapses repeated `/`. git-subrepo applies
+/// this to its own `$subdir` argument before doing anything else, so a
+/// caller passing e.g. a shell-tab-completed `vendor/` still works from
+/// git-subrepo's point of view — every check and path this module builds
+/// from `subdir` needs the same normalized value, not the raw argument, to
+/// stay consistent with what git-subrepo actually operates on.
+fn normalize_subdir(subdir: &str) -> String {
+    let s = subdir.strip_prefix("./").unwrap_or(subdir);
+    let s = s.strip_suffix('/').unwrap_or(s);
+    if !s.contains("//") {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut prev_slash = false;
+    for c in s.chars() {
+        if c == '/' {
+            if !prev_slash {
+                out.push(c);
+            }
+            prev_slash = true;
+        } else {
+            out.push(c);
+            prev_slash = false;
+        }
+    }
+    out
+}
+
+/// git-subrepo's own `encode-subdir` percent-encodes `subdir` into a
+/// distinct `subref` whenever `subdir` isn't already a valid git ref
+/// component (spaces, `~`, `^`, `:`, leading dots, etc.) — but leaves
+/// `subref == subdir` unchanged for every subdir already valid as one
+/// (confirmed in the installed `git-subrepo` lib: it early-returns before
+/// encoding whenever `git check-ref-format "subrepo/$subref"` succeeds).
+/// This module builds worktree/branch paths straight from `subdir`, which
+/// only matches what git-subrepo itself uses when no encoding was needed —
+/// so refuse up front rather than silently guarding (and later cleaning)
+/// the wrong path for a `subdir` that would encode. Must run on the
+/// already-`normalize_subdir`-ed value, since normalization (not encoding)
+/// is what git-subrepo applies first.
+fn assert_subdir_is_ref_safe(repo_root: &Path, subdir: &str) -> Result<()> {
+    let ref_name = format!("subrepo/{subdir}");
+    let ok = Command::new("git")
+        .args(["check-ref-format", &ref_name])
+        .current_dir(repo_root)
+        .status()
+        .context("git check-ref-format failed to run")?
+        .success();
+    if !ok {
+        bail!(
+            "`{subdir}` is not directly usable as a git ref component (`{ref_name}` fails \
+             `git check-ref-format`); git-subrepo's own `encode-subdir` would percent-encode it \
+             before naming its worktree/branch, which this tool does not replicate, so it can't \
+             safely locate the worktree/branch git-subrepo would create — rename the subdir"
+        );
+    }
+    Ok(())
+}
+
+/// Untracked files outside `<subdir>` are deliberately allowed:
+/// `fix_stale_parent`'s commit only ever `git add`s the `.gitrepo`
+/// pathspec, so one elsewhere can never be swept into it, and `git subrepo
+/// pull` itself doesn't refuse on them either — its own working-copy-clean
+/// assertion checks tracked changes only.
+///
+/// An untracked file *inside* `<subdir>` is a different, real hazard:
+/// git-subrepo's fold-in step does `git rm -r <subdir>` and only then
+/// `git read-tree --prefix=<subdir> -u <upstream>` — if the untracked file
+/// collides with a path the new upstream tree introduces, `read-tree`
+/// aborts after the `rm` already deleted and staged the whole subtree,
+/// leaving `<subdir>` half-destroyed. That failure's stderr doesn't
+/// contain "is not an ancestor", so it routes to `handle_conflict`'s raw
+/// bail with no mention that `<subdir>` was just wiped.
+fn ensure_clean_tree(repo_root: &Path, subdir: &str) -> Result<()> {
+    let status = run_git(repo_root, &["status", "--porcelain", "--untracked-files=no"])?;
+    if !status.is_empty() {
+        bail!("working tree has uncommitted changes; refusing to run against it:\n{status}");
+    }
+
+    // `--untracked-files=normal` is explicit rather than relying on the
+    // default: a user/CI image with `status.showUntrackedFiles=no` set
+    // would otherwise make this check silently see nothing to reject.
+    let subdir_status = run_git(
+        repo_root,
+        &["status", "--porcelain", "--untracked-files=normal", "--", subdir],
+    )?;
+    let untracked_in_subdir: Vec<&str> = subdir_status.lines().filter(|line| line.starts_with("??")).collect();
+    if !untracked_in_subdir.is_empty() {
+        bail!(
+            "untracked files exist under `{subdir}` — git-subrepo's pull step deletes and \
+             re-populates this whole subtree, and an untracked file colliding with a path in \
+             the new upstream tree aborts mid-way, leaving `{subdir}` half-destroyed:\n{}",
+            untracked_in_subdir.join("\n")
+        );
+    }
+    Ok(())
+}
+
+/// `best_effort_clean` runs `git subrepo clean`, the one git-subrepo
+/// subcommand that skips the tool's own working-copy-clean guard — it would
+/// silently discard a worktree a human is actively resolving a real
+/// conflict in. Existence, not dirtiness, is the right test for the
+/// worktree: after the human resolves and commits *inside* it (per
+/// git-subrepo's own recovery steps), porcelain status is clean again even
+/// though the outer `git subrepo commit <subdir>` fold-in hasn't happened
+/// yet — that state must still be refused, not discarded.
+///
+/// The `subrepo/<subdir>` branch needs a different test, not mere
+/// existence: git-subrepo leaves this branch behind after *every*
+/// successful pull too (`subrepo:pull` only deletes+recreates it on the
+/// *next* pull; nothing at the end of a successful one removes it), so a
+/// branch-existence-only check would permanently refuse to run wherever
+/// the documented manual flow was ever used. What distinguishes
+/// "benign leftover from a completed pull" from "a human's resolution
+/// commit that was never folded in" (e.g. after a manual `rm -rf` of the
+/// worktree, bypassing `git subrepo commit <subdir>`) is
+/// `refs/subrepo/<subdir>/commit`: git-subrepo's own `subrepo:commit` step
+/// — reached only on completion, auto-merged or manually folded in — always
+/// updates it to the branch's exact tip at that moment. So the branch is
+/// safe exactly when it matches that ref; anything else means unfolded
+/// work sits on it.
+fn ensure_no_in_progress_conflict_resolution(repo_root: &Path, subdir: &str) -> Result<()> {
+    let common_dir = git_common_dir(repo_root)?;
+    let worktree = common_dir.join("tmp").join("subrepo").join(subdir);
+    if worktree.exists() {
+        bail!(
+            "a conflict-resolution worktree already exists at {} — if you're resolving a \
+             conflict there, finish it (see the earlier `pull-subrepo` output for the exact \
+             steps); if it's stale (e.g. left over from an interrupted run), run \
+             `git subrepo clean {subdir}` yourself first to discard it",
+            worktree.display()
+        );
+    }
+
+    let branch_ref = format!("refs/heads/subrepo/{subdir}");
+    if let Some(branch_sha) = rev_parse_if_exists(repo_root, &branch_ref)? {
+        let commit_ref = format!("refs/subrepo/{subdir}/commit");
+        let folded_in = rev_parse_if_exists(repo_root, &commit_ref)?.as_deref() == Some(branch_sha.as_str());
+        if !folded_in {
+            bail!(
+                "the `{branch_ref}` branch carries commits never folded in via `git subrepo \
+                 commit {subdir}` (its tip doesn't match `{commit_ref}`) — if you're resolving \
+                 a conflict there, finish it (see the earlier `pull-subrepo` output for the \
+                 exact steps); if it's stale, run `git subrepo clean {subdir}` yourself first \
+                 to discard it"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// `git rev-parse --verify --quiet <ref>`: `Some(sha)` if `ref` resolves,
+/// `None` if it doesn't exist — as opposed to `run_git`, which treats a
+/// nonzero exit as an error. `--quiet` only suppresses git's message for
+/// the "not a valid object" case (confirmed: a missing ref and a malformed
+/// one both exit 1 with empty stderr); any *other* stderr output on a
+/// nonzero exit means something else genuinely failed and must not be
+/// silently folded into "the ref doesn't exist".
+fn rev_parse_if_exists(repo_root: &Path, ref_name: &str) -> Result<Option<String>> {
+    let output = Command::new("git")
+        .args(["rev-parse", "--verify", "--quiet", ref_name])
+        .current_dir(repo_root)
+        .output()
+        .with_context(|| format!("failed to run `git rev-parse --verify {ref_name}`"))?;
+    if output.status.success() {
+        return Ok(Some(String::from_utf8_lossy(&output.stdout).trim().to_string()));
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if !stderr.trim().is_empty() {
+        bail!("git rev-parse --verify --quiet {ref_name} failed: {}", stderr.trim());
+    }
+    Ok(None)
+}
+
+/// Runs `git subrepo pull`. Called up to twice per `run` (the
+/// stale-parent-fixup retry) without cleaning in between: `fix_stale_parent`
+/// only runs after a failure containing "is not an ancestor", which
+/// git-subrepo raises during its up-front ancestry check, before it ever
+/// creates a worktree — so there is nothing left over to clean before the
+/// retry. Deliberately does *not* pre-clean unconditionally: doing so would
+/// destroy a leftover `subrepo/<subdir>` worktree/branch that
+/// `ensure_no_in_progress_conflict_resolution` already decided, once, at
+/// the top of `run`, to leave alone (re-checking and re-cleaning here would
+/// also race a concurrent, separate `git subrepo pull` invocation).
+fn attempt_pull(repo_root: &Path, subdir: &str, tag: &str) -> Result<Output> {
+    // `git subrepo pull` does its own internal `git commit` in `repo_root`
+    // partway through a real pull (after writing `.gitrepo`'s new `branch =`
+    // but before the vendored tree content is fully folded in) — on a
+    // machine with this repo's git hooks installed, that commit would
+    // otherwise trip `check-vendoring-integrity`'s `always_run` pre-commit
+    // hook on a genuinely-inconsistent intermediate tree. `SKIP` is
+    // inherited by this child process (and by whatever `git commit` it
+    // spawns internally) the same way `PREK_ALLOW_NO_CONFIG` is inherited
+    // elsewhere in this module — merged with any pre-existing `SKIP` so a
+    // developer's own unrelated export isn't silently clobbered.
+    Command::new("git")
+        .args(["subrepo", "pull", subdir, "-b", tag])
+        .current_dir(repo_root)
+        .env("SKIP", skip_check_vendoring_integrity())
+        .output()
+        .with_context(|| format!("failed to run `git subrepo pull {subdir} -b {tag}`"))
+}
+
+/// This module's own repo-root commits (here, `fix_stale_parent`'s parent
+/// realignment and `ensure_tag_pin_matches`'s branch realignment; also used
+/// by `conflict::finish_conflict_fold_in`'s fold-in commit) each touch only
+/// part of the `.gitrepo`/`VENDORING.md`/`go.mod` consistency
+/// `check-vendoring-integrity` enforces — by design, that's the whole point
+/// of doing this work in separate, individually-committed steps. `SKIP`
+/// lets each such commit through the `always_run` pre-commit hook without
+/// clobbering a developer's own unrelated `SKIP` export (comma-joined
+/// union, matching `merge_skip_value`'s contract).
+pub(crate) fn skip_check_vendoring_integrity() -> String {
+    merge_skip_value(std::env::var("SKIP").ok().as_deref(), "check-vendoring-integrity")
+}
+
+/// `git subrepo clean` is a safe no-op when there's nothing to clean. If it
+/// fails for a real reason, a debug trace is left so a subsequent
+/// "already a worktree" pull failure is correlatable back to it — every
+/// call site in this module uses this helper rather than a bare `.ok()`,
+/// so none of them silently swallow a genuine clean failure.
+fn best_effort_clean(repo_root: &Path, subdir: &str) {
+    if let Err(e) = run_git(repo_root, &["subrepo", "clean", subdir]) {
+        eprintln!("xtask: debug: `git subrepo clean {subdir}` failed (may be benign): {e}");
+    }
+}
+
+fn git_common_dir(repo_root: &Path) -> Result<PathBuf> {
+    let raw = run_git(repo_root, &["rev-parse", "--git-common-dir"])?;
+    let path = PathBuf::from(raw);
+    Ok(if path.is_absolute() { path } else { repo_root.join(path) })
+}
+
+/// Replicates git-subrepo's own recovery formula for a squash-merge-stale
+/// `.gitrepo` `parent` (its own error message suggests exactly this SHA):
+/// the last commit that touched the `.gitrepo` file's `commit =` line,
+/// walked back one parent. This candidate is always an ancestor of HEAD by
+/// construction (it comes from `git log` starting at HEAD).
+///
+/// Verified against only HEAD, not also against `.gitrepo`'s recorded
+/// `commit` field: read the installed git-subrepo's own `subrepo:branch()`
+/// (the function that raises the "is not an ancestor" error this fixup
+/// exists to satisfy) — it performs exactly the same single
+/// `merge-base --is-ancestor $subrepo_parent HEAD` check before proceeding,
+/// never one against the `.gitrepo` `commit` field. Matching what
+/// git-subrepo itself actually validates is correct and sufficient for the
+/// retry to succeed; a second check against a field with no established
+/// operational meaning in this comparison would validate a requirement
+/// git-subrepo doesn't have.
+///
+/// The is-ancestor check below is still a real, always-on `bail!` rather than a
+/// `debug_assert!` despite that guarantee: it's the sole guard immediately
+/// before an irreversible committed write in unattended CI, where a
+/// silently compiled-away check (debug_assert! is a no-op in release
+/// builds) is the wrong trade. The two earlier `bail!`s (no commit found;
+/// root commit with no parent) are unreachable through any real `git
+/// subrepo` lifecycle — `git subrepo clone` refuses cloning into an empty
+/// repo, and `.gitrepo` only exists once a commit introduced its `commit =`
+/// line.
+///
+/// Returns the SHA of the fixup commit it creates.
+fn fix_stale_parent(repo_root: &Path, subdir: &str) -> Result<String> {
+    let gitrepo_rel = format!("{subdir}/.gitrepo");
+
+    let last_sync_commit = run_git(
+        repo_root,
+        &["log", "-1", "-G", "commit =", "--format=%H", "--", &gitrepo_rel],
+    )?;
+    if last_sync_commit.is_empty() {
+        bail!("could not find a commit that touched `{gitrepo_rel}`'s `commit =` line; cannot compute a replacement `parent`");
+    }
+
+    let parent_ref = format!("{last_sync_commit}^");
+    let candidate = run_git(repo_root, &["log", "-1", "--format=%H", &parent_ref]).with_context(|| {
+        format!("the last sync commit {last_sync_commit} has no parent (it's a root commit) — cannot compute a replacement `.gitrepo` parent")
+    })?;
+
+    let is_ancestor = Command::new("git")
+        .args(["merge-base", "--is-ancestor", &candidate, "HEAD"])
+        .current_dir(repo_root)
+        .output()
+        .context("git merge-base --is-ancestor failed to run")?;
+    if !is_ancestor.status.success() {
+        // Confirmed: "not an ancestor" is exit 1 with empty stderr; a
+        // genuinely malformed/invalid commit-ish exits 128 with a real
+        // stderr message — don't conflate the two under one canned message.
+        let stderr = String::from_utf8_lossy(&is_ancestor.stderr);
+        if !stderr.trim().is_empty() {
+            bail!(
+                "git merge-base --is-ancestor {candidate} HEAD failed: {}",
+                stderr.trim()
+            );
+        }
+        bail!(
+            "computed replacement parent {candidate} is not an ancestor of HEAD — \
+             this should never happen (the last-sync-commit formula guarantees it by \
+             construction); something is deeply wrong with this repo's history"
+        );
+    }
+
+    let gitrepo_path = repo_root.join(subdir).join(".gitrepo");
+    let contents =
+        std::fs::read_to_string(&gitrepo_path).with_context(|| format!("failed to read {}", gitrepo_path.display()))?;
+    std::fs::write(&gitrepo_path, replace_gitrepo_field(&contents, "parent", &candidate)?)
+        .with_context(|| format!("failed to write {}", gitrepo_path.display()))?;
+
+    run_git(repo_root, &["add", &gitrepo_rel]).with_context(|| {
+        format!("`{gitrepo_rel}` was already modified on disk to realign `parent` before this failure")
+    })?;
+    // `run_git_with_env`, not `run_git`: this commit only realigns
+    // `.gitrepo`'s `parent`, leaving `VENDORING.md`/`go.mod` untouched —
+    // exactly the intermediate-inconsistent-tree state
+    // `check-vendoring-integrity`'s `always_run` pre-commit hook would
+    // otherwise (correctly, but unhelpfully) reject on a machine with this
+    // repo's git hooks installed.
+    run_git_with_env(
+        repo_root,
+        &[
+            "commit",
+            "-m",
+            &format!("fix: realign {subdir} subrepo parent after squash-merge"),
+        ],
+        &[("SKIP", &skip_check_vendoring_integrity())],
+    )
+    .with_context(|| {
+        format!("`{gitrepo_rel}` was already modified and staged to realign `parent` before this failure")
+    })?;
+    run_git(repo_root, &["rev-parse", "HEAD"])
+        .context("the .gitrepo parent-realignment commit was created but its SHA could not be read back")
+}
+
+/// `git subrepo pull` exits 0 and returns `Outcome::Clean` for a genuine
+/// no-op too ("already up to date": `tag` resolves to the commit already
+/// recorded), and that path leaves `.gitrepo` completely untouched —
+/// including its `branch` field, which keeps naming the *old* tag. Every
+/// real merge already sets `branch` correctly (git-subrepo's own
+/// `update-gitrepo-file` step), so this is a no-op there; it only acts on
+/// the no-op-pull gap, keeping `Outcome::Clean`'s contract (the tag pin is
+/// current) true unconditionally rather than true only when git-subrepo
+/// happened to do real work.
+fn ensure_tag_pin_matches(repo_root: &Path, subdir: &str, tag: &str) -> Result<()> {
+    let gitrepo_path = repo_root.join(subdir).join(".gitrepo");
+    let contents =
+        std::fs::read_to_string(&gitrepo_path).with_context(|| format!("failed to read {}", gitrepo_path.display()))?;
+    if gitrepo_field(&contents, "branch").as_deref() == Some(tag) {
+        return Ok(());
+    }
+
+    let gitrepo_rel = format!("{subdir}/.gitrepo");
+    std::fs::write(&gitrepo_path, replace_gitrepo_field(&contents, "branch", tag)?)
+        .with_context(|| format!("failed to write {}", gitrepo_path.display()))?;
+    run_git(repo_root, &["add", &gitrepo_rel]).with_context(|| {
+        format!("`{gitrepo_rel}` was already modified on disk to realign `branch` before this failure")
+    })?;
+    run_git_with_env(
+        repo_root,
+        &[
+            "commit",
+            "-m",
+            &format!("fix: realign {subdir} subrepo branch pin to {tag}"),
+        ],
+        &[("SKIP", &skip_check_vendoring_integrity())],
+    )
+    .with_context(|| {
+        format!("`{gitrepo_rel}` was already modified and staged to realign `branch` before this failure")
+    })?;
+    Ok(())
+}
+
+pub(crate) fn gitrepo_field(contents: &str, field: &str) -> Option<String> {
+    let prefix = format!("{field} =");
+    contents.lines().find_map(|line| {
+        line.trim_start()
+            .strip_prefix(&prefix)
+            .map(|rest| rest.trim().to_string())
+    })
+}
+
+fn replace_gitrepo_field(contents: &str, field: &str, value: &str) -> Result<String> {
+    let prefix = format!("{field} =");
+    let mut found = false;
+    let lines: Vec<String> = contents
+        .lines()
+        .map(|line| {
+            if line.trim_start().starts_with(&prefix) {
+                found = true;
+                format!("\t{field} = {value}")
+            } else {
+                line.to_string()
+            }
+        })
+        .collect();
+    if !found {
+        bail!("`.gitrepo` has no `{field} = ` line to replace");
+    }
+    Ok(lines.join("\n") + "\n")
+}

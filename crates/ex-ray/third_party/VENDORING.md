@@ -71,10 +71,87 @@ other way around.
 
 ## Bumping a pinned version
 
-The pins are recorded in each `.gitrepo`. To move one:
+This is automated: Renovate opens a PR bumping just the `branch =` line in
+a `.gitrepo`, and Renovate arms auto-merge on it unconditionally (`.github/renovate.json`'s
+`packageRules` entry for these files), the same way it arms every other
+dependency group in this file — nothing vendor-specific decides *whether*
+to arm, only *whether it's safe to actually merge* (the required checks
+below). `.github/workflows/vendor-bump.yaml`
+does the rest: `cargo xtask pull-subrepo` followed by
+`cargo xtask finish-vendor-bump`, pushing further commits to the same PR.
+It merges automatically once the pull was clean and the required checks
+go green — including `cargo xtask check-vendoring-integrity` (part of the
+`prek`/`Lint` check), which fails the merge structurally if a conflict
+landed outside the auto-resolved `go.mod`/`go.sum`/`.github/workflows/*`
+allowlist (the authoritative policy lives in `xtask/src/pull_subrepo.rs`'s
+`is_auto_resolvable` — `go.mod` conflicts specifically are only
+auto-resolved when doing so wouldn't drop a downstream-only `replace`
+directive, like the one below) or if `VENDORING.md`/`go.mod` end up
+inconsistent with `.gitrepo`. On a real conflict, `vendor-bump.yaml`
+force-commits the conflicted tree exactly as git leaves it — real conflict
+markers for a text conflict, but none at all for a delete/modify or
+binary-content one, which git can't represent that way — and comments on
+the PR. Auto-merge stays armed but can never fire: the required
+`cargo xtask check-vendoring-integrity` check catches both shapes,
+scanning for markers directly and, for the markerless ones, refusing the
+`.vendor-conflict` sentinel every force-committed conflict also carries
+(see the by-hand steps below).
 
-1. `git subrepo pull crates/ex-ray/third_party/<name> -b <new-tag>`
-1. Re-apply / re-review the local patch against the new base (resolve conflicts).
-   For utls, re-confirm the ECH-rejected verify still uses `c.serverName`.
-1. Update the version note here and re-run the identity check: from
-   `crates/ex-ray`, `go test ./...` plus the vendored `go test ./transport/...`.
+`pull-subrepo`'s "nothing committed" guarantee on a real conflict is about
+the pull attempt itself, not the whole run: if the routine squash-merge
+parent fixup ran first, that's a separate, independently valid commit that
+stays even if the pull then hits a real conflict.
+
+To do it by hand (same tools the automation uses):
+
+1. `cargo xtask pull-subrepo crates/ex-ray/third_party/<name> <new-tag>`.
+   On a real conflict it stops uncommitted, exactly like `git pull`, and
+   prints the temp worktree to resolve it in — `cd` there, fix the
+   conflicts (`git status` to see them), `git add`, then
+   `PREK_ALLOW_NO_CONFIG=1 git commit` (this worktree has no `prek.toml` of
+   its own — a plain `git commit` fails under this repo's pre-commit hook),
+   then from the repo root: `SKIP=check-vendoring-integrity git subrepo commit crates/ex-ray/third_party/<name>` — the `SKIP` is required if you have
+   this repo's git hooks installed (the default): at this exact point
+   `.gitrepo`'s `branch` names the new tag while this file and `go.mod`
+   still name the old one (step 2 fixes that next), which the
+   `check-vendoring-integrity` hook would otherwise correctly, but
+   unhelpfully, reject.
+
+   If you're instead picking up a PR whose conflicted tree was already
+   force-committed unresolved — by `vendor-bump.yaml` in CI, or by a human
+   running the same CI-only `cargo xtask force-commit-conflicted-subrepo` —
+   it also carries a `.vendor-conflict` sentinel in the dep's own
+   directory, listing every path left unmerged. `finish-vendor-bump`
+   (step 2) clears it automatically once every listed path's content has
+   genuinely changed since that commit — proof you actually touched it,
+   not merely inherited whatever content the force-commit left in place.
+   If any listed path is unchanged, it refuses and names that path in its
+   error, and the sentinel stays. `check-vendoring-integrity` rejects the
+   sentinel's mere presence, independent of any conflict markers — that's
+   what blocks the merge for delete/modify and binary conflicts, which
+   git leaves no markers to scan for.
+
+   Your own resolution commit at this point (committing the actually-resolved
+   vendored files, in the main worktree, before running `finish-vendor-bump`)
+   also needs the `SKIP=check-vendoring-integrity` prefix — the sentinel is
+   still present, so check 4 rejects a plain commit the same way. Run
+   `SKIP=check-vendoring-integrity git commit ...` for it. `finish-vendor-bump`'s
+   own commit step (step 2, below) does not do this for you: it's
+   pathspec-scoped to `VENDORING.md`/`go.mod`/`go.sum`/the sentinel file
+   itself, never the vendored files.
+
+1. `cargo xtask finish-vendor-bump crates/ex-ray/third_party/<name> <name> <new-tag>`
+   — updates this file's version note, bumps the outer `go.mod` require
+   line and runs `go mod tidy`, and runs the same identity check
+   `ci.yaml`'s "Test ex-ray (Go)" job runs (`build.yaml`'s `ex-ray-tests`
+   target: `crates/ex-ray`'s own `go test ./...`, plus the scoped
+   `transport/internet/{tls,quic,hysteria2,transportcommon}` test in the
+   `v2ray-core` directory, unconditionally — including on a `utls` bump,
+   since the ECH-retry patch's only coverage lives in that same scoped
+   test), committing regardless of whether it passed.
+
+1. `git push`. Auto-merge is already armed on the PR (Renovate arms it
+   unconditionally at PR-creation time) and stays armed across your push,
+   so nothing further is needed — it merges once
+   the required checks (including `cargo xtask check-vendoring-integrity`)
+   go green on your fix. If it somehow isn't armed, `gh pr merge --auto --squash <PR>` arms it yourself.
