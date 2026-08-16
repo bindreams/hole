@@ -1273,6 +1273,56 @@ async fn no_color_and_clicolor_reach_the_real_child() {
     chain_task.abort();
 }
 
+/// bindreams/hole#802 (adversarial-hunt finding): `sitrep::parse_event`
+/// must see the UNTOUCHED line, never the ANSI-stripped display copy. A
+/// raw, unescaped ESC byte inside a JSON string is illegal per RFC 8259 —
+/// `serde_json` (confirmed directly) rejects it, so this line must stay
+/// inert log passthrough and the chain must ready normally. The embedded
+/// `\x1b[31m` is a COMPLETE SGR sequence, so stripping it turns the line
+/// into syntactically valid JSON that WOULD parse as a real `Fatal` event
+/// (confirmed directly too) — if the strip ever ran ahead of the parser,
+/// this test's `ready_rx` would resolve to `Err(StartError::Fatal(..))`
+/// instead of readying, and the assertion below would fail.
+#[skuld::test]
+async fn sitrep_parser_sees_the_line_before_any_ansi_strip() {
+    let mock_path = mock_plugin_path();
+
+    let chain_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let chain_local = chain_listener.local_addr().unwrap();
+    drop(chain_listener);
+
+    let malformed = "{\"event\":\"fatal\",\"detail\":\"conn \x1b[31m failed: timeout\"}";
+
+    let (ready_tx, ready_rx) = oneshot::channel();
+    let runner = ChainRunner::new()
+        .add(Box::new(
+            BinaryPlugin::new(&mock_path, None)
+                .readiness(garter::binary::ReadinessMode::ExpectSitrep)
+                .env("MOCK_PLUGIN_RAW_STDOUT_LINE", malformed),
+        ))
+        .on_ready(ready_tx)
+        .drain_timeout(Duration::from_secs(3));
+
+    let env = PluginEnv {
+        local_host: chain_local.ip(),
+        local_port: chain_local.port(),
+        remote_host: "127.0.0.1".to_string(),
+        remote_port: 9,
+        plugin_options: None,
+    };
+    let chain_task = tokio::spawn(async move { runner.run(env).await });
+
+    let outcome = ready_rx.await.expect("aggregator should send");
+    assert!(
+        outcome.is_ok(),
+        "the malformed line must stay inert passthrough (parse_event must see the RAW line, \
+         not an ANSI-stripped one); got {outcome:?} — Err(Fatal) here means the strip ran \
+         ahead of the parser"
+    );
+
+    chain_task.abort();
+}
+
 fn main() {
     skuld::run_all();
 }

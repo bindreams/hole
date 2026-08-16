@@ -115,6 +115,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         sitrep_enabled,
     );
 
+    // Knob: MOCK_PLUGIN_RAW_STDOUT_LINE — print this env var's value
+    // verbatim as one extra stdout line, right after `hello`, then
+    // continue normal startup (bind + `ready`). Lets a test hand-construct
+    // an exact byte sequence (e.g. a sitrep-shaped line with a raw,
+    // unescaped control byte inside a JSON string — illegal per RFC 8259)
+    // without teaching mock-plugin a new fault mode for every shape.
+    if let Ok(raw) = std::env::var("MOCK_PLUGIN_RAW_STDOUT_LINE") {
+        println!("{raw}");
+        use std::io::Write;
+        let _ = std::io::stdout().flush();
+    }
+
     // Fault-injection knob: MOCK_PLUGIN_FAIL=fatal | bind_conflict | bind_conflict_once
     let fail = std::env::var("MOCK_PLUGIN_FAIL").unwrap_or_default();
     if fail == "fatal" {
