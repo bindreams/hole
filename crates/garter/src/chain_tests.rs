@@ -1057,9 +1057,8 @@ async fn aggregator_drops_ready_tx_when_shutdown_preempts_a_closed_receiver() {
     );
 }
 
-/// #794 itself: a typed error in a LATER plugin's channel must not wait on an
-/// earlier plugin that has neither reported nor dropped its sender. Pre-fix the
-/// aggregator parks on index 0 forever and this HANGS.
+/// A typed error in a LATER plugin's channel must not wait on an earlier plugin
+/// that has neither reported nor dropped its sender.
 #[skuld::test]
 async fn aggregator_reports_a_later_plugins_error_while_an_earlier_one_is_still_starting() {
     let (_tx0, rx0) = oneshot::channel::<Result<PluginReady, StartError>>();
@@ -1152,8 +1151,7 @@ async fn aggregator_rescues_a_later_plugins_error_when_shutdown_won_the_race() {
     }
 }
 
-/// Two typed errors at once resolve to the lowest plugin index. Passes pre-fix
-/// too — it locks the rule against the rewrite rather than driving it.
+/// Two typed errors at once resolve to the lowest plugin index.
 #[skuld::test]
 async fn aggregator_reports_the_lowest_index_error_when_two_plugins_both_fail() {
     let (tx0, rx0) = oneshot::channel();
@@ -1190,7 +1188,7 @@ async fn aggregator_reports_the_lowest_index_error_when_two_plugins_both_fail() 
 /// The regression guard for deferral. A higher-index plugin's bare exit must not
 /// be reported while a lower-index plugin's sender is still alive — its typed
 /// error may be one poll behind, and reporting early destroys the only retryable
-/// class. `main` passes this by parking on index 0; a point-in-time sweep fails it.
+/// class.
 #[skuld::test]
 async fn aggregator_defers_an_exit_until_a_live_sibling_answers() {
     let (tx0, rx0) = oneshot::channel();
@@ -1293,9 +1291,9 @@ async fn aggregator_finds_an_error_behind_an_already_ready_plugin_on_shutdown() 
     }
 }
 
-/// Deliberately NOT an ordering test: both assertions are order-independent and
-/// this passes pre- and post-fix alike. It exists to catch a rewrite that keys
-/// `plugin_listens` by position in the pending set instead of by plugin index.
+/// Deliberately NOT an ordering test: both assertions are order-independent. It
+/// exists to catch a rewrite that keys `plugin_listens` by position in the
+/// pending set instead of by plugin index.
 #[skuld::test]
 async fn aggregator_keys_listens_and_transports_by_plugin_index() {
     let (tx0, rx0) = oneshot::channel();
@@ -1345,7 +1343,7 @@ async fn aggregator_keys_listens_and_transports_by_plugin_index() {
     );
 }
 
-/// #797's no-rescue rule, extended to the multi-plugin sweep: a LATER plugin's
+/// The no-rescue rule, extended to the multi-plugin sweep: a LATER plugin's
 /// delivered readiness is no evidence the chain survived the cancel either.
 #[skuld::test]
 async fn aggregator_never_reports_ready_when_a_later_plugin_readied_before_shutdown() {
@@ -1374,4 +1372,41 @@ async fn aggregator_never_reports_ready_when_a_later_plugin_readied_before_shutd
         ready_rx.await.is_err(),
         "a chain cancelled mid-start must never be reported ready"
     );
+}
+
+/// A deferred exit must survive the cancel that the very same exit triggers.
+/// `record_exit` fires `shutdown` on every plugin exit, so the shutdown arm is
+/// the normal way out of a deferral, not an edge case — returning empty-handed
+/// there would report a dropped channel where plugin order reported a `Fatal`.
+#[skuld::test]
+async fn aggregator_reports_a_deferred_exit_when_shutdown_ends_the_wait() {
+    let (_tx0, rx0) = oneshot::channel::<Result<PluginReady, StartError>>();
+    let (tx1, rx1) = oneshot::channel::<Result<PluginReady, StartError>>();
+    let (ready_tx, ready_rx) = oneshot::channel();
+    let shutdown = CancellationToken::new();
+
+    // Index 1 exits unsent; index 0 never answers, so the aggregator defers and
+    // parks — which is what lets the canceller below run.
+    drop(tx1);
+    let canceller = {
+        let shutdown = shutdown.clone();
+        tokio::spawn(async move { shutdown.cancel() })
+    };
+
+    run_readiness_aggregator(
+        vec![(0, rx0), (1, rx1)],
+        2,
+        crate::chain::Mode::Client,
+        shutdown,
+        ready_tx,
+    )
+    .await;
+    canceller.await.expect("canceller joined");
+
+    match ready_rx.await.expect("a deferred exit must not be lost to the cancel") {
+        Err(StartError::Fatal { detail, .. }) => {
+            assert_eq!(detail, "plugin exited before becoming ready");
+        }
+        other => panic!("expected the synthesized exit failure, got {other:?}"),
+    }
 }

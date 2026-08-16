@@ -284,12 +284,6 @@ pub(crate) fn prepare_udp(sock: std::net::UdpSocket) -> std::io::Result<UdpSocke
     UdpSocket::from_std(sock)
 }
 
-/// Classify an error from a `bind()` on `addr` for the readiness channel.
-///
-/// A bind race becomes [`garter::StartError::BindConflict`], the only class the
-/// caller retries on a fresh port; everything else is terminal. Feed this only
-/// errors that a `bind()` itself produced — `local_addr()` and socket setup fail
-/// for unrelated reasons and must not be diagnosed as an address conflict.
 /// Report a failed `bind()` on the hop's start-gate channel, and hand the error
 /// back for the lifecycle channel. Both observers see the same failure, by
 /// design: one gates the start, the other drives teardown.
@@ -304,6 +298,27 @@ fn report_bind_failure<A>(
     anyhow::Error::new(e)
 }
 
+/// As [`report_bind_failure`], for a failure AFTER the address was successfully
+/// bound. Always terminal: no retry can help, so it must not be classified as a
+/// conflict.
+fn report_setup_failure<A>(
+    bound_addr_tx: Option<oneshot::Sender<std::result::Result<A, garter::StartError>>>,
+    e: std::io::Error,
+    addr: SocketAddr,
+) -> anyhow::Error {
+    if let Some(tx) = bound_addr_tx {
+        let _ = tx.send(Err(setup_start_error(&e, addr)));
+    }
+    anyhow::Error::new(e)
+}
+
+/// Classify an error from a `bind()` on `addr` for the readiness channel.
+///
+/// A bind race becomes [`garter::StartError::BindConflict`], the only class the
+/// caller retries on a fresh port; everything else is terminal. Feed this only
+/// errors a `bind()` itself produced — `local_addr()` and socket setup fail for
+/// unrelated reasons and must not be diagnosed as an address conflict. Per
+/// [`garter::is_bind_race`]'s contract, `addr` must be an ephemeral bind.
 pub(crate) fn bind_start_error(e: &std::io::Error, addr: SocketAddr) -> garter::StartError {
     if garter::is_bind_race(e) {
         return garter::StartError::BindConflict {
@@ -311,8 +326,13 @@ pub(crate) fn bind_start_error(e: &std::io::Error, addr: SocketAddr) -> garter::
             addr,
         };
     }
+    setup_start_error(e, addr)
+}
+
+/// A terminal start failure on `addr`, carrying the raw OS errno.
+pub(crate) fn setup_start_error(e: &std::io::Error, addr: SocketAddr) -> garter::StartError {
     garter::StartError::Fatal {
-        detail: format!("could not bind {addr}: {e}"),
+        detail: format!("could not set up a listener on {addr}: {e}"),
         errno: e.raw_os_error(),
     }
 }
@@ -909,18 +929,23 @@ pub(crate) async fn run_client(
     // detached association tasks (which hold `Arc<UdpSocket>` clones) for the
     // port and could fail the rebind, terminating the client.
     //
-    // A bind failure is reported on `bound_addr_tx` before returning: it is the
-    // hop's start-gate, and an address conflict there is the one failure the
+    // Every failure below is reported on `bound_addr_tx` before returning: it is
+    // the hop's start-gate, and an address conflict there is the one failure the
     // caller can retry on a fresh port.
     let tcp_listener = match TcpListener::bind(local).await {
         Ok(l) => l,
-        Err(e) => return Err(report_bind_failure(bound_addr_tx, e, local).context("bind localTCP")),
+        Err(e) => return Err(report_bind_failure(bound_addr_tx, e, local).context("bind local TCP")),
     };
     let udp_std = match std::net::UdpSocket::bind(local) {
         Ok(s) => s,
-        Err(e) => return Err(report_bind_failure(bound_addr_tx, e, local).context("bind localUDP")),
+        Err(e) => return Err(report_bind_failure(bound_addr_tx, e, local).context("bind local UDP")),
     };
-    let udp_socket = Arc::new(prepare_udp(udp_std).context("prepare local UDP")?);
+    // Setting up an already-bound socket fails for reasons that have nothing to
+    // do with the address, so this is terminal rather than a conflict.
+    let udp_socket = match prepare_udp(udp_std) {
+        Ok(s) => Arc::new(s),
+        Err(e) => return Err(report_setup_failure(bound_addr_tx, e, local).context("prepare local UDP")),
+    };
 
     // Readiness signal: both listeners are up, so the hop is serving.
     if let Some(tx) = bound_addr_tx {
@@ -933,10 +958,7 @@ pub(crate) async fn run_client(
             }
             // The binds succeeded, so this is not an address conflict.
             Err(e) => {
-                let _ = tx.send(Err(garter::StartError::Fatal {
-                    detail: format!("could not read the local address of {local}: {e}"),
-                    errno: e.raw_os_error(),
-                }));
+                let _ = tx.send(Err(setup_start_error(&e, local)));
                 return Err(anyhow::Error::new(e).context("local addr"));
             }
         }
@@ -1046,10 +1068,7 @@ where
             }
             // The bind succeeded, so this is not an address conflict.
             Err(e) => {
-                let _ = tx.send(Err(garter::StartError::Fatal {
-                    detail: format!("could not read the local address of {local}: {e}"),
-                    errno: e.raw_os_error(),
-                }));
+                let _ = tx.send(Err(setup_start_error(&e, local)));
                 return Err(anyhow::Error::new(e).context("local tcp addr"));
             }
         }
@@ -1411,9 +1430,10 @@ where
         Some(Err(start_err)) => {
             let _ = ready.send(Err(start_err));
         }
-        // Never reached the bind (a panic unwinding through `run_fut`). Dropping
-        // `ready` unsent leaves the chain's synthesized process-exit failure as
-        // the backstop.
+        // The runner returned without reporting either way. `run_client` and
+        // `run_server` report on every path out of their bind, so this is the
+        // backstop for a future one that does not: dropping `ready` unsent
+        // leaves the chain's synthesized process-exit failure.
         None => {}
     }
 

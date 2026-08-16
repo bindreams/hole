@@ -1138,9 +1138,9 @@ async fn log_sink_receives_lines_drained_after_version_skew_fallback() {
     chain_task.abort();
 }
 
-/// #794 through the production sitrep reader rather than hand-built channels: a
-/// stub can pass while the reader ex-ray and galoshes actually use still loses
-/// the error.
+/// Through the production sitrep reader rather than hand-built channels: a stub
+/// can pass while the reader ex-ray and galoshes actually use still loses the
+/// error.
 ///
 /// Index 0 sleeps forever without ever printing, so the reader holds its
 /// readiness sender open indefinitely — what a yamux hop does while its own bind

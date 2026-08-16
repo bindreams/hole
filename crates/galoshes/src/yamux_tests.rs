@@ -23,9 +23,9 @@ use crate::yamux::{
     bind_start_error, bind_udp, connect_delay, connect_retrying, connection_task_fatal, deframe_udp_datagram,
     drive_connection, driver_panicked, enable_keepalive, frame_udp_datagram, next_failures, parse_udp_timeout,
     run_client, run_client_session, run_server, run_server_with_connections, saturating_deadline,
-    serve_driven_connection, session_reconnect_backoff, ClientBoundAddrs, FrameAccumulator, OpenStreamReply,
-    SessionOutcome, SessionTransport, StreamTag, TransportLivenessTap, DEFAULT_UDP_TIMEOUT, KEEPALIVE_NONCE_LEN,
-    LOOPBACK_CONNECT_RETRY, REMOTE_BACKOFF_BASE, REMOTE_BACKOFF_MAX,
+    serve_driven_connection, session_reconnect_backoff, setup_start_error, ClientBoundAddrs, FrameAccumulator,
+    OpenStreamReply, SessionOutcome, SessionTransport, StreamTag, TransportLivenessTap, DEFAULT_UDP_TIMEOUT,
+    KEEPALIVE_NONCE_LEN, LOOPBACK_CONNECT_RETRY, REMOTE_BACKOFF_BASE, REMOTE_BACKOFF_MAX,
 };
 
 #[skuld::test]
@@ -1420,7 +1420,7 @@ async fn a_healthy_session_is_kept_alive_by_its_own_probe() {
     );
 }
 
-// Bind-failure readiness (#795) =======================================================================================
+// Bind-failure readiness ==============================================================================================
 
 /// Run a yamux plugin whose bind is expected to fail, to completion.
 async fn run_yamux_plugin_expecting_failure(
@@ -1496,13 +1496,14 @@ async fn a_yamux_client_reports_bind_conflict_when_its_udp_port_is_taken() {
     }
 }
 
-/// A contract test, not a red: a current-thread runtime plus the success path's
-/// await on `TcpStream::connect` gives a detached relay room to deliver too.
+/// `relay_readiness` sends before `run` can return on the success path too, so
+/// readiness is reported without the caller driving anything else.
+///
+/// Binds `:0` and reads the port back rather than probing one and re-binding it:
+/// the client needs the SAME port on TCP and UDP, which no probe can reserve.
 #[skuld::test]
 async fn a_yamux_client_reports_ready_once_its_listeners_are_up() {
-    let probe = TcpListener::bind("127.0.0.1:0").await.expect("probe a free port");
-    let free = probe.local_addr().expect("probe addr");
-    drop(probe);
+    let free: SocketAddr = "127.0.0.1:0".parse().unwrap();
 
     let (ready_tx, ready_rx) = oneshot::channel();
     let shutdown = CancellationToken::new();
@@ -1518,7 +1519,8 @@ async fn a_yamux_client_reports_ready_once_its_listeners_are_up() {
 
     match ready_rx.await.expect("readiness must be reported, not dropped") {
         Ok(garter::PluginReady { listen, transports }) => {
-            assert_eq!(listen, free, "readiness must report the bound TCP address");
+            assert!(listen.ip().is_loopback(), "readiness must report the bound address");
+            assert_ne!(listen.port(), 0, "readiness must report the port the kernel chose");
             assert_eq!(
                 transports,
                 garter::Transports::TCP | garter::Transports::UDP,
@@ -1530,6 +1532,22 @@ async fn a_yamux_client_reports_ready_once_its_listeners_are_up() {
 
     shutdown.cancel();
     let _ = running.await.expect("plugin task joined");
+}
+
+/// A failure after the address was bound (`set_nonblocking`, the Windows
+/// `SIO_UDP_CONNRESET` ioctl, `from_std`) is terminal, never a conflict: no
+/// retry on a fresh port can resolve it.
+#[skuld::test]
+fn a_post_bind_setup_failure_is_fatal() {
+    let addr: SocketAddr = "127.0.0.1:1080".parse().unwrap();
+    // An excluded-range errno, which `bind_start_error` WOULD call a conflict.
+    let e = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "injected");
+    match setup_start_error(&e, addr) {
+        garter::StartError::Fatal { detail, .. } => {
+            assert!(detail.contains(&addr.to_string()), "the detail must name the address");
+        }
+        other => panic!("expected Fatal, got {other:?}"),
+    }
 }
 
 #[skuld::test]
@@ -1563,8 +1581,7 @@ fn a_windows_excluded_port_bind_error_is_a_conflict() {
 }
 
 /// End to end through a real `ChainRunner`: the aggregator must see the typed
-/// error rather than the synthesized process-exit placeholder. Pre-fix this is
-/// flaky rather than reliably red — that flakiness IS the defect.
+/// error rather than the synthesized process-exit placeholder.
 #[skuld::test]
 async fn a_yamux_bind_conflict_reaches_chain_on_ready() {
     let squatter = TcpListener::bind("127.0.0.1:0").await.expect("squat a port");

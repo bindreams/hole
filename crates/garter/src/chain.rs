@@ -120,6 +120,11 @@ pub fn allocate_ports(count: usize) -> crate::Result<Vec<SocketAddr>> {
 ///
 /// Retry these on a fresh ephemeral port; report a plugin's as
 /// [`crate::StartError::BindConflict`], the one class the caller retries.
+///
+/// **Contract**: use ONLY on ephemeral bind paths. On Unix `PermissionDenied`
+/// also means "bind to a privileged port without root", which no retry can
+/// resolve — classifying that as a race would burn attempts and bury the real
+/// permission error.
 pub fn is_bind_race(e: &std::io::Error) -> bool {
     matches!(
         e.kind(),
@@ -225,11 +230,17 @@ impl ChainRunner {
     ///
     /// Outcomes are consumed in completion order, not plugin order, so a typed
     /// failure is never held up behind a plugin that has neither reported nor
-    /// exited. A plugin that exits before readying does not immediately produce
-    /// the generic "exited before becoming ready": that is held while any other
-    /// plugin's sender is still alive, so a typed error one poll behind still
-    /// wins, and reported once every receiver has resolved. Among typed errors
-    /// available at once, the lowest plugin index wins.
+    /// exited. Among typed errors available at once, the lowest plugin index
+    /// wins.
+    ///
+    /// A plugin that exits before readying does not immediately produce the
+    /// generic "exited before becoming ready": that placeholder is held while
+    /// other senders are alive, and any typed error found meanwhile outranks it.
+    /// The hold is best-effort, not a guarantee — it ends when every receiver
+    /// resolves OR when shutdown fires, and the exit that started it cancels
+    /// shutdown itself, so a sibling's error that has not reached its channel by
+    /// then is still missed. It strictly improves on reporting the placeholder
+    /// immediately; it does not make the outcome deterministic.
     ///
     /// If shutdown fires before every plugin has readied, `tx` is dropped and the
     /// receiver gets `RecvError` — unless some plugin had already delivered a
@@ -430,8 +441,14 @@ pub(crate) async fn run_readiness_aggregator(
             // an external cancel all fire it — so a delivered `Ok(PluginReady)`
             // is no evidence the chain is still viable and is not rescued. A
             // delivered `StartError` needs no such evidence: that plugin failed
-            // whoever cancelled.
-            if let Some(start_err) = drain_available(&mut pending, &mut plugin_listens, &mut transports) {
+            // whoever cancelled, and it outranks a placeholder held below.
+            //
+            // `record_exit` cancels on the very exit that starts a deferral, so
+            // this is the ordinary end of one, not an edge case. Dropping
+            // `ready_tx` here would report nothing where plugin order reported a
+            // failure.
+            let delivered = drain_available(&mut pending, &mut plugin_listens, &mut transports);
+            if let Some(start_err) = delivered.or(deferred_exit) {
                 let _ = ready_tx.send(Err(start_err));
             }
             return;
@@ -454,12 +471,15 @@ pub(crate) async fn run_readiness_aggregator(
                 // observers of one event (typed cause to on_ready AND lifecycle
                 // error to teardown). Do NOT try to reconcile them into one value.
                 //
-                // A sibling's typed failure outranks this placeholder, and may be
+                // A sibling's typed failure outranks this placeholder and may be
                 // one poll behind rather than already delivered — reporting now
                 // would destroy a `BindConflict`, the only retryable class. So
-                // hold it while any sender is still alive. `record_exit` cancels
-                // `shutdown` on every plugin exit and the arm above stays first,
-                // so the wait is bounded without any timer.
+                // hold it while any sender is alive. The hold is best-effort:
+                // `record_exit` cancels `shutdown` on every plugin exit and the
+                // arm above stays first, which bounds the wait without a timer
+                // but also ends it, so an error that lands after the cancel is
+                // still missed. Waiting for every sender instead would stall a
+                // cancel behind readers that never watch the token.
                 if let Some(start_err) = drain_available(&mut pending, &mut plugin_listens, &mut transports) {
                     let _ = ready_tx.send(Err(start_err));
                     return;
