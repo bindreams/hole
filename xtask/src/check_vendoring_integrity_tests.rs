@@ -253,6 +253,42 @@ fn go_mod_with_no_require_line_for_the_dep_is_not_a_violation() {
 }
 
 #[skuld::test]
+fn a_dep_with_no_go_mod_at_all_is_not_a_violation() {
+    // A dep whose own go.mod is entirely absent — not the "outer go.mod has
+    // no require line for it" case above, but a dep that isn't a Go module
+    // at all. Must degrade to "not applicable", not a hard error that
+    // aborts the whole always_run hook.
+    let fx = RepoBuilder::new();
+    fx.write(
+        "crates/ex-ray/third_party/blobdep/.gitrepo",
+        GITREPO_TEMPLATE.replace("{branch}", "v1.0.0"),
+    );
+    fx.vendoring_md("# Vendoring\n\n## `blobdep/` — pinned **v1.0.0** ([upstream](https://example.com))\n");
+    fx.ex_ray_go_mod(&clean_ex_ray_go_mod());
+    fx.commit_all();
+
+    let violations = check_vendoring_integrity::run(fx.root()).unwrap();
+    assert_eq!(violations, Vec::<String>::new());
+}
+
+#[skuld::test]
+fn a_dep_with_a_malformed_go_mod_is_reported_not_silently_ignored() {
+    let fx = RepoBuilder::new();
+    fx.dep("widget", "v1.0.0", "example.com/widget");
+    // Overwrite widget's go.mod with content that has no `module` line — a
+    // real anomaly, not "this dep isn't a Go module" (see the sibling
+    // no-go-mod-at-all test above), so it must be reported, not swallowed.
+    fx.write("crates/ex-ray/third_party/widget/go.mod", "go 1.25\n");
+    fx.vendoring_md(&clean_vendoring_md());
+    fx.ex_ray_go_mod(&clean_ex_ray_go_mod());
+    fx.commit_all();
+
+    let violations = check_vendoring_integrity::run(fx.root()).unwrap();
+    assert_eq!(violations.len(), 1, "{violations:?}");
+    assert!(violations[0].contains("go.mod"), "{violations:?}");
+}
+
+#[skuld::test]
 fn two_deps_one_clean_one_violating_reports_only_the_violating_one() {
     let fx = RepoBuilder::new();
     fx.dep("widget", "v1.0.0", "example.com/widget");
@@ -445,12 +481,7 @@ fn a_tracked_vendor_conflict_sentinel_is_reported_regardless_of_check_1() {
 fn build_upstream(dir: &Path, conflicting: bool) {
     std::fs::create_dir_all(dir).unwrap();
     git(dir, &["init", "--initial-branch=main", "--quiet"]);
-    // Fixtures never intend platform-dependent line-ending mutation —
-    // a checkout inside these tests (e.g. resolving an allowlisted
-    // conflict to upstream's content) must not silently smudge LF to
-    // CRLF on a Windows runner with a global `core.autocrlf=true`
-    // (GitHub's windows-latest default) and desync from what the test
-    // literally wrote/asserts.
+    // Same autocrlf-smudge rationale as above.
     git(dir, &["config", "core.autocrlf", "false"]);
     git(dir, &["config", "user.email", "fixture@example.com"]);
     git(dir, &["config", "user.name", "fixture"]);
@@ -488,12 +519,7 @@ fn build_upstream(dir: &Path, conflicting: bool) {
 fn build_downstream_with_widget(dir: &Path, upstream: &Path, patch_conflicting: bool) {
     std::fs::create_dir_all(dir).unwrap();
     git(dir, &["init", "--initial-branch=main", "--quiet"]);
-    // Fixtures never intend platform-dependent line-ending mutation —
-    // a checkout inside these tests (e.g. resolving an allowlisted
-    // conflict to upstream's content) must not silently smudge LF to
-    // CRLF on a Windows runner with a global `core.autocrlf=true`
-    // (GitHub's windows-latest default) and desync from what the test
-    // literally wrote/asserts.
+    // Same autocrlf-smudge rationale as above.
     git(dir, &["config", "core.autocrlf", "false"]);
     git(dir, &["config", "user.email", "fixture@example.com"]);
     git(dir, &["config", "user.name", "fixture"]);
@@ -592,6 +618,10 @@ fn install_always_failing_check_vendoring_integrity_hook(dir: &Path) {
 
 #[skuld::test]
 fn always_run_hazard_end_to_end_clean_path() {
+    // Held for this whole test: see `pull_subrepo::test_support::SKIP_ENV_TEST_LOCK`'s
+    // own doc for the cross-test SKIP-env race this guards against.
+    let _skip_env_guard = pull_subrepo::test_support::SKIP_ENV_TEST_LOCK.lock().unwrap();
+
     let dir = tempfile::tempdir().unwrap();
     // Long-form path, not `dir.path()` directly: `std::env::temp_dir()` can
     // return an 8.3 short-name component (e.g. `BINDRE~1`) on some Windows
@@ -630,6 +660,10 @@ fn always_run_hazard_end_to_end_clean_path() {
 
 #[skuld::test]
 fn always_run_hazard_end_to_end_conflicted_path() {
+    // Held for this whole test: see `pull_subrepo::test_support::SKIP_ENV_TEST_LOCK`'s
+    // own doc for the cross-test SKIP-env race this guards against.
+    let _skip_env_guard = pull_subrepo::test_support::SKIP_ENV_TEST_LOCK.lock().unwrap();
+
     let dir = tempfile::tempdir().unwrap();
     // Long-form path, not `dir.path()` directly: `std::env::temp_dir()` can
     // return an 8.3 short-name component (e.g. `BINDRE~1`) on some Windows

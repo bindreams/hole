@@ -205,7 +205,22 @@ fn check_go_mod_require_version(repo_root: &Path, dep_dir_rel: &str) -> Result<V
         return Ok(Vec::new());
     };
 
-    let module_path = read_module_path(&repo_root.join(dep_dir_rel).join("go.mod"))?;
+    let dep_go_mod_path = repo_root.join(dep_dir_rel).join("go.mod");
+    // A dep with no `go.mod` at all has no Go module — nothing to compare,
+    // same as the `find_go_mod_require_version` "not applicable" case
+    // below, not a violation. Checked explicitly (not via `read_module_path`'s
+    // own error) so a *malformed* go.mod (present, but no `module` line —
+    // genuinely worth a human's attention, unlike a dep that's simply not a
+    // Go module) still degrades to a reported violation instead of a hard
+    // crash, matching check 2's "malformed heading is real reportable
+    // problem" precedent rather than silently swallowing it too.
+    if !dep_go_mod_path.exists() {
+        return Ok(Vec::new());
+    }
+    let module_path = match read_module_path(&dep_go_mod_path) {
+        Ok(path) => path,
+        Err(e) => return Ok(vec![format!("{}: {e:#}", dep_go_mod_path.display())]),
+    };
     let ex_ray_go_mod_path = repo_root.join("crates/ex-ray/go.mod");
     let ex_ray_go_mod = std::fs::read_to_string(&ex_ray_go_mod_path)
         .with_context(|| format!("failed to read {}", ex_ray_go_mod_path.display()))?;

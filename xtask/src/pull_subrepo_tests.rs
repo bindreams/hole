@@ -338,7 +338,10 @@ fn skip_check_vendoring_integrity_matches_prek_toml_hook_id() {
     );
 
     // SKIP is process-global env state; save/restore around the read so this test doesn't
-    // observe, or leave behind, a developer's own unrelated SKIP export.
+    // observe, or leave behind, a developer's own unrelated SKIP export. The lock guards
+    // against a concurrently-running `always_run_hazard_end_to_end_*` test observing SKIP
+    // mid-clear — see `test_support::SKIP_ENV_TEST_LOCK`'s own doc.
+    let _skip_env_guard = pull_subrepo::test_support::SKIP_ENV_TEST_LOCK.lock().unwrap();
     let saved = std::env::var_os("SKIP");
     unsafe { std::env::remove_var("SKIP") };
     let actual = pull_subrepo::skip_check_vendoring_integrity();

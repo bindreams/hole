@@ -4,6 +4,23 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Mutex;
+
+/// Guards the `SKIP` env var against a cross-test race: `skuld` runs every
+/// `#[skuld::test]` in this crate's process concurrently, and
+/// `pull_subrepo::skip_check_vendoring_integrity_matches_prek_toml_hook_id`
+/// briefly clears process-global `SKIP` to observe its default value. If
+/// that window overlaps a `check_vendoring_integrity_tests.rs`
+/// `always_run_hazard_end_to_end_*` test — the only tests that install a
+/// *real*, unconditionally-failing `check-vendoring-integrity` pre-commit
+/// hook and depend on every internal commit actually carrying
+/// `SKIP=check-vendoring-integrity` — that commit could lose the SKIP value
+/// mid-run and fail for a reason unrelated to whatever code change
+/// triggered it. Every test in that set acquires this lock for its entire
+/// body; every other test that merely calls `pull_subrepo::run`/
+/// `finish_vendor_bump::run` without installing a real failing hook has no
+/// pre-commit hook to trip either way and doesn't need to acquire it.
+pub(crate) static SKIP_ENV_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 /// Which upstream file(s) v2 changes, matched against what our local
 /// downstream patch also touches.
