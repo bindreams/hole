@@ -3,6 +3,7 @@
 // sanctioned-test-file exception.
 #![allow(clippy::disallowed_methods)]
 
+use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -10,7 +11,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::oneshot;
 
-use garter::{BinaryPlugin, ChainRunner, PluginEnv};
+use garter::{BinaryPlugin, ChainPlugin, ChainRunner, PluginEnv};
 use skuld::env;
 
 mod common;
@@ -841,6 +842,85 @@ async fn force_kill_reaps_descendant_tree() {
     }
 
     drop(echo_listener);
+}
+
+// Readiness finality ==================================================================================================
+
+/// Bind an ephemeral loopback port and release it: an address a plugin can be
+/// told to listen on.
+async fn free_loopback_addr() -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    drop(listener);
+    addr
+}
+
+/// Drive ONE plugin through `ChainPlugin::run` directly rather than through
+/// `ChainRunner`, so the test owns the readiness receiver and can inspect it the
+/// instant `run` returns. The shutdown token is never cancelled, so every test
+/// built on this exercises the child-exit arm.
+fn spawn_run(
+    plugin: BinaryPlugin,
+    local: SocketAddr,
+    remote: SocketAddr,
+) -> (
+    tokio::task::JoinHandle<garter::Result<()>>,
+    oneshot::Receiver<Result<garter::PluginReady, garter::StartError>>,
+) {
+    let (ready_tx, ready_rx) = oneshot::channel();
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    let handle = tokio::spawn(async move { Box::new(plugin).run(local, remote, shutdown, ready_tx).await });
+    (handle, ready_rx)
+}
+
+/// `run` must not return while a task that can still resolve readiness is alive.
+/// If it does, `record_exit` cancels the chain first and the outcome that task
+/// was about to produce — a typed `StartError` in the case this exists for — is
+/// lost.
+///
+/// The plugin spawns a grandchild that inherits its stdio and then exits after
+/// `hello` alone, so its stdout cannot EOF on the child's death: the reader
+/// resolves readiness only by dropping its sender at task end, which makes
+/// `Closed` (drained) and `Empty` (cut off mid-stream) distinguishable. This is
+/// also the hang proof — a drain waiting on an EOF the grandchild is withholding
+/// never returns.
+///
+/// `try_recv` needs no await guard: on skuld's current-thread runtime nothing can
+/// poll the reader task between the plugin task completing and this assertion.
+#[skuld::test]
+async fn run_drains_stdout_before_returning_with_a_pipe_holding_grandchild() {
+    let mock_path = mock_plugin_path();
+
+    // The grandchild dials here on startup, and mock-plugin blocks on its own
+    // rendezvous before exiting — so accepting proves the pipe holder is alive
+    // and the setup is not vacuous.
+    let control_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let control_addr = control_listener.local_addr().unwrap();
+
+    let local = free_loopback_addr().await;
+    let (handle, mut ready_rx) = spawn_run(
+        BinaryPlugin::new(&mock_path, None)
+            .readiness(garter::binary::ReadinessMode::ExpectSitrep)
+            .env("MOCK_PLUGIN_SPAWN_GRANDCHILD", control_addr.to_string())
+            .env("MOCK_PLUGIN_FAIL", "exit_silently"),
+        local,
+        "127.0.0.1:9".parse().unwrap(), // discard; never dialed
+    );
+
+    let _held = control_listener
+        .accept()
+        .await
+        .expect("grandchild should dial the control channel");
+
+    let run_result = handle.await.expect("plugin task panicked");
+    assert!(
+        matches!(run_result, Err(garter::Error::PluginExit { code: 1, .. })),
+        "the plugin exits 1 after hello; got {run_result:?}"
+    );
+    assert!(
+        matches!(ready_rx.try_recv(), Err(oneshot::error::TryRecvError::Closed)),
+        "run returned while the stdout reader still owned the readiness sender"
+    );
 }
 
 // Install the workspace test subscriber + panic hook. See
