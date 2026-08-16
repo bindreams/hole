@@ -1138,6 +1138,61 @@ async fn log_sink_receives_lines_drained_after_version_skew_fallback() {
     chain_task.abort();
 }
 
+/// Through the production sitrep reader rather than hand-built channels: a stub
+/// can pass while the reader ex-ray and galoshes actually use still loses the
+/// error.
+///
+/// Index 0 sleeps forever without ever printing, so the reader holds its
+/// readiness sender open indefinitely — what a yamux hop does while its own bind
+/// is pending. Index 1 emits `bind_conflict` and exits, which cancels the shared
+/// token. Awaiting in plugin order never looks at index 1 and reports the exit
+/// placeholder instead of the one retryable class.
+#[skuld::test]
+async fn a_later_plugins_bind_conflict_surfaces_while_an_earlier_plugin_hangs() {
+    let mock_path = mock_plugin_path();
+
+    let chain_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let chain_local = chain_listener.local_addr().unwrap();
+    drop(chain_listener);
+
+    let (ready_tx, ready_rx) = oneshot::channel();
+
+    let runner = ChainRunner::new()
+        .add(Box::new(
+            BinaryPlugin::new(&mock_path, None)
+                .readiness(garter::binary::ReadinessMode::ExpectSitrep)
+                .env("MOCK_PLUGIN_SLEEP", "1"),
+        ))
+        .add(Box::new(
+            BinaryPlugin::new(&mock_path, None)
+                .readiness(garter::binary::ReadinessMode::ExpectSitrep)
+                .env("MOCK_PLUGIN_FAIL", "bind_conflict"),
+        ))
+        .on_ready(ready_tx)
+        .drain_timeout(Duration::from_secs(3));
+
+    let env = PluginEnv {
+        local_host: chain_local.ip(),
+        local_port: chain_local.port(),
+        remote_host: "127.0.0.1".to_string(),
+        remote_port: 9,
+        plugin_options: None,
+    };
+
+    let chain_task = tokio::spawn(async move { runner.run(env).await });
+
+    let outcome = ready_rx.await.expect("aggregator should send");
+    match outcome {
+        Err(garter::StartError::BindConflict { errno, .. }) => {
+            assert_ne!(errno, 0, "bind_conflict errno should be the host-native value");
+        }
+        other => panic!("expected StartError::BindConflict, got {other:?}"),
+    }
+
+    chain_task.abort();
+    let _ = chain_task.await;
+}
+
 fn main() {
     skuld::run_all();
 }

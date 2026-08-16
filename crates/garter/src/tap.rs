@@ -270,21 +270,18 @@ async fn drain_inner(plugin_name: &str, inner_handle: tokio::task::JoinHandle<cr
     }
 }
 
-/// Probe-and-drop a free TCP port on `(ip, 0)`. Retries on
-/// `AddrInUse` / `PermissionDenied` / `AddrNotAvailable` (the Windows
-/// excluded-port-range flake) up to [`INNER_PORT_ALLOC_ATTEMPTS`] times.
+/// Probe-and-drop a free TCP port on `(ip, 0)`. Retries a
+/// [`crate::chain::is_bind_race`] error up to [`INNER_PORT_ALLOC_ATTEMPTS`] times.
 fn allocate_inner_port(ip: IpAddr) -> io::Result<SocketAddr> {
     let mut last_err: Option<io::Error> = None;
     for _ in 0..INNER_PORT_ALLOC_ATTEMPTS {
         match std::net::TcpListener::bind(SocketAddr::new(ip, 0)).and_then(|l| l.local_addr()) {
             Ok(addr) => return Ok(addr),
-            Err(e) => match e.kind() {
-                io::ErrorKind::AddrInUse | io::ErrorKind::PermissionDenied | io::ErrorKind::AddrNotAvailable => {
-                    last_err = Some(e);
-                    continue;
-                }
-                _ => return Err(e),
-            },
+            Err(e) if crate::chain::is_bind_race(&e) => {
+                last_err = Some(e);
+                continue;
+            }
+            Err(e) => return Err(e),
         }
     }
     // Reaching here means the loop ran its full `INNER_PORT_ALLOC_ATTEMPTS`
