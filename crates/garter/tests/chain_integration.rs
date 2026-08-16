@@ -873,6 +873,15 @@ fn spawn_run(
     (handle, ready_rx)
 }
 
+/// A listener the plugin's grandchild dials on startup. mock-plugin blocks on its
+/// own rendezvous before continuing, so accepting proves the pipe holder is alive
+/// and the test that uses it is not vacuous.
+async fn grandchild_control() -> (TcpListener, String) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    (listener, addr)
+}
+
 /// `run` must not return while a task that can still resolve readiness is alive.
 /// If it does, `record_exit` cancels the chain first and the outcome that task
 /// was about to produce — a typed `StartError` in the case this exists for — is
@@ -890,24 +899,19 @@ fn spawn_run(
 #[skuld::test]
 async fn run_drains_stdout_before_returning_with_a_pipe_holding_grandchild() {
     let mock_path = mock_plugin_path();
-
-    // The grandchild dials here on startup, and mock-plugin blocks on its own
-    // rendezvous before exiting — so accepting proves the pipe holder is alive
-    // and the setup is not vacuous.
-    let control_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let control_addr = control_listener.local_addr().unwrap();
+    let (control, control_addr) = grandchild_control().await;
 
     let local = free_loopback_addr().await;
     let (handle, mut ready_rx) = spawn_run(
         BinaryPlugin::new(&mock_path, None)
             .readiness(garter::binary::ReadinessMode::ExpectSitrep)
-            .env("MOCK_PLUGIN_SPAWN_GRANDCHILD", control_addr.to_string())
+            .env("MOCK_PLUGIN_SPAWN_GRANDCHILD", control_addr)
             .env("MOCK_PLUGIN_FAIL", "exit_silently"),
         local,
         "127.0.0.1:9".parse().unwrap(), // discard; never dialed
     );
 
-    let _held = control_listener
+    let _held = control
         .accept()
         .await
         .expect("grandchild should dial the control channel");
@@ -920,6 +924,122 @@ async fn run_drains_stdout_before_returning_with_a_pipe_holding_grandchild() {
     assert!(
         matches!(ready_rx.try_recv(), Err(oneshot::error::TryRecvError::Closed)),
         "run returned while the stdout reader still owned the readiness sender"
+    );
+}
+
+/// `Auto` runs a self-probe that CO-OWNS the readiness sender from the start, so
+/// draining the reader alone leaves the outcome unresolved: with the child gone
+/// the probe would poll a listener that will never exist, holding its half of the
+/// sender forever. `run` must stand it down and wait for it too.
+///
+/// `MOCK_PLUGIN_NO_SITREP` keeps the probe in play — a supported `hello` would
+/// have stood it down early and the co-ownership would go untested.
+#[skuld::test]
+async fn auto_readiness_is_final_when_run_returns() {
+    let mock_path = mock_plugin_path();
+    let (control, control_addr) = grandchild_control().await;
+
+    let local = free_loopback_addr().await;
+    let (handle, mut ready_rx) = spawn_run(
+        BinaryPlugin::new(&mock_path, None)
+            .readiness(garter::binary::ReadinessMode::Auto)
+            .env("MOCK_PLUGIN_SPAWN_GRANDCHILD", control_addr)
+            .env("MOCK_PLUGIN_NO_SITREP", "1")
+            .env("MOCK_PLUGIN_FAIL", "exit_silently"),
+        local,
+        "127.0.0.1:9".parse().unwrap(),
+    );
+
+    let _held = control
+        .accept()
+        .await
+        .expect("grandchild should dial the control channel");
+
+    let _ = handle.await.expect("plugin task panicked");
+    assert!(
+        matches!(ready_rx.try_recv(), Err(oneshot::error::TryRecvError::Closed)),
+        "run returned while the Auto self-probe still co-owned the readiness sender"
+    );
+}
+
+/// The other place a probe takes co-ownership: an unknown sitrep MAJOR hands
+/// readiness to a tier-2 probe mid-stream, and the reader continues as a pure log
+/// drain. Same requirement as `Auto`, reached by a different route.
+#[skuld::test]
+async fn tier2_fallback_readiness_is_final_when_run_returns() {
+    let mock_path = mock_plugin_path();
+    let (control, control_addr) = grandchild_control().await;
+
+    let local = free_loopback_addr().await;
+    let (handle, mut ready_rx) = spawn_run(
+        BinaryPlugin::new(&mock_path, None)
+            .readiness(garter::binary::ReadinessMode::ExpectSitrep)
+            .env("MOCK_PLUGIN_SPAWN_GRANDCHILD", control_addr)
+            .env("MOCK_PLUGIN_BAD_PROTOCOL", "1")
+            .env("MOCK_PLUGIN_FAIL", "exit_silently"),
+        local,
+        "127.0.0.1:9".parse().unwrap(),
+    );
+
+    let _held = control
+        .accept()
+        .await
+        .expect("grandchild should dial the control channel");
+
+    let _ = handle.await.expect("plugin task panicked");
+    assert!(
+        matches!(ready_rx.try_recv(), Err(oneshot::error::TryRecvError::Closed)),
+        "run returned while the tier-2 probe still co-owned the readiness sender"
+    );
+}
+
+/// The property #794/#795 rebuild on: the typed error a plugin emitted before
+/// dying is in its channel, and every line it wrote is in the sink, by the time
+/// `run` returns.
+///
+/// A guarantee pin, not a regression test — with no descendant holding the pipe
+/// the child's stdout EOFs immediately either way, so this passes against the
+/// bounded drain too. Coverage for the drain itself is the grandchild tests above.
+#[skuld::test]
+async fn typed_start_error_and_every_log_line_land_before_run_returns() {
+    let mock_path = mock_plugin_path();
+    let sunk: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink_lines = sunk.clone();
+    let sink: garter::LogSink = Arc::new(move |line: &str| sink_lines.lock().unwrap().push(line.to_string()));
+
+    let local = free_loopback_addr().await;
+    let (handle, mut ready_rx) = spawn_run(
+        BinaryPlugin::new(&mock_path, None)
+            .readiness(garter::binary::ReadinessMode::ExpectSitrep)
+            .env("MOCK_PLUGIN_FAIL", "bind_conflict")
+            .log_sink(sink),
+        local,
+        "127.0.0.1:9".parse().unwrap(),
+    );
+
+    let _ = handle.await.expect("plugin task panicked");
+    match ready_rx.try_recv() {
+        Ok(Err(garter::StartError::BindConflict { errno, addr })) => {
+            // Host-native errno (10048 / 98 / 48) — assert nonzero rather than a
+            // specific foreign constant.
+            assert_ne!(errno, 0, "bind_conflict errno should be the host-native value");
+            // mock-plugin reports the address the chain told it to bind, which in
+            // Client mode is what `run` was handed as `local`.
+            assert_eq!(
+                addr, local,
+                "bind_conflict should carry the plugin's own listen address"
+            );
+        }
+        other => panic!("expected a delivered BindConflict, got {other:?}"),
+    }
+    let sunk = sunk.lock().unwrap();
+    assert!(
+        sunk.iter().any(|l| l.contains(r#""event":"hello""#)),
+        "the sink must hold every line the child wrote; got {sunk:?}"
+    );
+    assert!(
+        sunk.iter().any(|l| l.contains(r#""event":"bind_conflict""#)),
+        "including the frame the sitrep parser consumed; got {sunk:?}"
     );
 }
 
