@@ -293,6 +293,244 @@ fn dispatch_connect_restricted_send_event_is_info() {
     );
 }
 
+// event_name ==========================================================================================================
+
+/// A handful of `(constant, symbol)` pairs cross-checked directly against
+/// `Microsoft-Windows-TCPIP.xml`'s `<event value=... symbol=...>` elements
+/// (fetched from
+/// <https://raw.githubusercontent.com/repnz/etw-providers-docs/master/Manifests-Win10-18990/Microsoft-Windows-TCPIP.xml>
+/// during review) rather than copied from [`TCPIP_EVENT_NAMES`] itself —
+/// this is a genuine spot check, not a restatement of the production
+/// table, so a transcription error shared by both would still be caught.
+/// Full ID-space coverage (every ID `dispatch` classifies has a name, and
+/// vice versa) comes from the two drift-guard tests below, which read
+/// [`TCPIP_EVENT_NAMES`] directly rather than duplicating it.
+const TCPIP_EVENT_NAME_SPOT_CHECK: &[(u16, &str)] = &[
+    (tcpip_events::TCB_CONNECT_REQUESTED, "TcpRequestConnect"),
+    (tcpip_events::CONNECT_COMPLETED, "TcpConnectTcbComplete"),
+    (tcpip_events::RETRANSMIT_TIMEOUT, "TcpDisconnectTcbRtoTimeout"),
+];
+
+#[skuld::test]
+fn event_name_maps_manifest_verified_tcpip_event_ids() {
+    for &(id, symbol) in TCPIP_EVENT_NAME_SPOT_CHECK {
+        assert_eq!(
+            event_name(tcpip_guid(), id),
+            Some(symbol),
+            "event_id={id} expected name {symbol:?}"
+        );
+    }
+}
+
+#[skuld::test]
+fn event_name_unknown_tcpip_id_is_none() {
+    assert_eq!(event_name(tcpip_guid(), 65500), None);
+}
+
+#[skuld::test]
+fn event_name_non_tcpip_provider_is_none_even_for_colliding_id() {
+    // AFD event-id 1004 collides with TCPIP TCB_SYN_SEND; event_name must
+    // gate on provider the same way dispatch's provider gate does.
+    assert_eq!(event_name(afd_guid(), tcpip_events::TCB_SYN_SEND), None);
+}
+
+#[skuld::test]
+fn event_name_table_entries_are_all_dispatch_classified() {
+    // Every ID TCPIP_EVENT_NAMES claims to name must actually be something
+    // dispatch classifies (Info/Warn), not silently fall through to
+    // Unknown — a stale table entry for an ID dispatch no longer
+    // recognizes would pass event_name's own lookup but be pointless in
+    // the emitted log. Reads the production table directly (not a test
+    // fixture copy of it) — this test's job is checking table-vs-dispatch
+    // agreement, not table-vs-manifest correctness (that's the spot check
+    // above).
+    for &(id, _) in TCPIP_EVENT_NAMES {
+        let got = dispatch(tcpip_guid(), id, BRIDGE_PID, BRIDGE_PID, &ParsedFields::default());
+        assert!(
+            !matches!(got, None | Some(Emission::Unknown)),
+            "event_id={id} is in TCPIP_EVENT_NAMES but dispatch does not classify it: {got:?}"
+        );
+    }
+}
+
+#[skuld::test]
+fn every_dispatch_classified_tcpip_id_has_a_name() {
+    // The real drift guard: enumerates the ID space independently of
+    // TCPIP_EVENT_NAMES (NOT derived from it), so a future event added only
+    // to dispatch's match — and never mirrored into the name table — fails
+    // this test instead of silently degrading to `name: ~` in bridge.log.
+    for id in 0u16..=u16::MAX {
+        let got = dispatch(tcpip_guid(), id, BRIDGE_PID, BRIDGE_PID, &ParsedFields::default());
+        if !matches!(got, None | Some(Emission::Unknown)) {
+            assert!(
+                event_name(tcpip_guid(), id).is_some(),
+                "dispatch classifies TCPIP event_id={id} as {got:?} but event_name has no entry for it"
+            );
+        }
+    }
+}
+
+// should_escalate =====================================================================================================
+
+#[skuld::test]
+fn should_escalate_true_on_first_nonzero_events_lost() {
+    let mut last = LastSeenLoss::default();
+    assert!(should_escalate(&mut last, 1, 0, 0));
+    assert_eq!(last.events_lost, 1);
+}
+
+#[skuld::test]
+fn should_escalate_false_on_unchanged_events_lost() {
+    let mut last = LastSeenLoss::default();
+    assert!(should_escalate(&mut last, 1, 0, 0));
+    assert!(
+        !should_escalate(&mut last, 1, 0, 0),
+        "an unchanged cumulative count must not re-escalate"
+    );
+}
+
+#[skuld::test]
+fn should_escalate_true_again_on_further_increase_in_events_lost() {
+    let mut last = LastSeenLoss::default();
+    assert!(should_escalate(&mut last, 1, 0, 0));
+    assert!(should_escalate(&mut last, 3, 0, 0));
+    assert_eq!(last.events_lost, 3);
+}
+
+#[skuld::test]
+fn should_escalate_true_on_first_nonzero_log_buffers_lost() {
+    let mut last = LastSeenLoss::default();
+    assert!(should_escalate(&mut last, 0, 7, 0));
+    assert_eq!(last.log_buffers_lost, 7);
+}
+
+#[skuld::test]
+fn should_escalate_false_on_unchanged_log_buffers_lost() {
+    let mut last = LastSeenLoss::default();
+    assert!(should_escalate(&mut last, 0, 7, 0));
+    assert!(
+        !should_escalate(&mut last, 0, 7, 0),
+        "log_buffers_lost gets the same delta treatment as events_lost — no re-escalation on an unchanged reading"
+    );
+}
+
+#[skuld::test]
+fn should_escalate_true_on_first_nonzero_real_time_buffers_lost() {
+    let mut last = LastSeenLoss::default();
+    assert!(should_escalate(&mut last, 0, 0, 5));
+    assert_eq!(last.real_time_buffers_lost, 5);
+}
+
+#[skuld::test]
+fn should_escalate_false_on_unchanged_real_time_buffers_lost() {
+    let mut last = LastSeenLoss::default();
+    assert!(should_escalate(&mut last, 0, 0, 5));
+    assert!(
+        !should_escalate(&mut last, 0, 0, 5),
+        "real_time_buffers_lost gets the same delta treatment as events_lost — no re-escalation on an unchanged reading"
+    );
+}
+
+#[skuld::test]
+fn should_escalate_true_on_wraparound_decrease() {
+    // A u32 counter wrapping past u32::MAX reads back as a SMALLER value
+    // than the last-seen high-water mark. `>` would silently treat this as
+    // "no increase"; `!=` (what should_escalate actually uses) still
+    // registers it as a change worth escalating.
+    let mut last = LastSeenLoss {
+        events_lost: 100,
+        log_buffers_lost: 0,
+        real_time_buffers_lost: 0,
+    };
+    assert!(should_escalate(&mut last, 5, 0, 0));
+    assert_eq!(last.events_lost, 5);
+}
+
+// run_periodic_stats_inner ============================================================================================
+
+#[skuld::test]
+fn periodic_stats_thread_exits_promptly_on_sender_drop_not_after_the_interval() {
+    let (tx, rx) = std::sync::mpsc::channel::<()>();
+    let handle = std::thread::spawn(move || {
+        run_periodic_stats_inner(
+            "nonexistent-session-for-timing-test".into(),
+            std::time::Duration::from_secs(3600),
+            rx,
+            |_tick_count| {},
+        );
+    });
+    // Wakes the blocked recv_timeout via Disconnected immediately -- if it
+    // instead waited out the 3600s interval, this test would hang, caught
+    // by the shell-level timeout on the test invocation, not by a timeout
+    // wrapped around the join itself.
+    drop(tx);
+    handle.join().expect("periodic stats thread panicked");
+}
+
+#[skuld::test]
+fn periodic_tick_throttles_repeated_query_failures_to_info() {
+    use crate::test_support::log_capture::VecWriter;
+    use garter::tracing_test::set_default_in_current_thread;
+    use tracing_subscriber::fmt;
+    use tracing_subscriber::layer::{Layer, SubscriberExt};
+
+    let writer = VecWriter::new();
+    // INFO, not DEBUG: matches the bridge's default file-sink level, so
+    // this test proves the throttled repeat actually reaches bridge.log —
+    // a DEBUG filter would pass even if the repeat were still logged at
+    // debug! (the bug this test exists to catch).
+    let subscriber = tracing_subscriber::registry().with(
+        fmt::layer()
+            .with_writer(writer.clone())
+            .with_ansi(false)
+            .with_filter(tracing_subscriber::filter::LevelFilter::INFO),
+    );
+    let _guard = set_default_in_current_thread(subscriber);
+
+    let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
+    let (tick_tx, tick_rx) = std::sync::mpsc::channel::<u32>();
+    // `set_default_in_current_thread` installs a thread-local dispatcher, so
+    // the spawned thread below (where run_periodic_stats_inner actually
+    // logs) needs it propagated explicitly -- a fresh std::thread does not
+    // inherit the spawning thread's tracing default.
+    let dispatch = tracing::dispatcher::get_default(tracing::Dispatch::clone);
+    let handle = std::thread::spawn(move || {
+        tracing::dispatcher::with_default(&dispatch, || {
+            run_periodic_stats_inner(
+                "hole-etw-nonexistent-session-for-tick-test".into(),
+                std::time::Duration::from_millis(5),
+                stop_rx,
+                move |n| {
+                    let _ = tick_tx.send(n);
+                },
+            );
+        });
+    });
+
+    // Block on real tick completions -- a genuine rendezvous on a channel
+    // the production loop itself writes into, not a sleep-then-check. Tick
+    // 1 is the immediate baseline tick run_periodic_stats_inner performs
+    // before its first recv_timeout wait; tick 2 is the first one driven by
+    // the real 5ms interval.
+    assert_eq!(tick_rx.recv().expect("first tick"), 1);
+    assert_eq!(tick_rx.recv().expect("second tick"), 2);
+
+    drop(stop_tx);
+    handle.join().expect("periodic stats thread panicked");
+
+    let output = writer.snapshot_string();
+    assert_eq!(
+        output.matches("etw: ControlTraceW(QUERY) failed").count(),
+        1,
+        "only the FIRST failed query should warn; got:\n{output}"
+    );
+    assert!(
+        output.contains("etw: ControlTraceW(QUERY) still failing"),
+        "the second failure should throttle to info (not silently to debug, which the bridge's \
+         default file-sink level would discard); got:\n{output}"
+    );
+}
+
 // parse_socket_address ================================================================================================
 
 #[skuld::test]
@@ -417,6 +655,7 @@ fn provider_name_known_afd_returns_microsoft_name() {
 fn event_view_dump_uses_kebab_case_keys_and_yaml_primitives() {
     let view = EventView {
         event_id: 1002,
+        name: Some("TcpRequestConnect"),
         opcode: 16,
         provider: "Microsoft-Windows-TCPIP",
         tcb: Some(0x1234_ABCD),
@@ -430,6 +669,7 @@ fn event_view_dump_uses_kebab_case_keys_and_yaml_primitives() {
         yaml,
         "\
 event-id: 1002
+name: TcpRequestConnect
 opcode: 16
 provider: Microsoft-Windows-TCPIP
 tcb: 305441741
@@ -444,6 +684,7 @@ rexmit-count: ~"
 fn event_view_dump_renders_all_none_endpoints_as_tilde() {
     let view = EventView {
         event_id: 1004,
+        name: Some("TcpTcbSynSend"),
         opcode: 1,
         provider: "Microsoft-Windows-TCPIP",
         tcb: Some(42),
@@ -463,6 +704,7 @@ fn event_view_dump_renders_all_none_endpoints_as_tilde() {
 fn event_view_dump_renders_socketaddr_inline_not_nested() {
     let view = EventView {
         event_id: 1033,
+        name: Some("TcpConnectTcbComplete"),
         opcode: 16,
         provider: "Microsoft-Windows-TCPIP",
         tcb: None,

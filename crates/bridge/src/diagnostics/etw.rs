@@ -44,15 +44,49 @@
 //!    translates the returned [`Emission`] into a real `tracing::event!`
 //!    invocation.
 //!
-//! 3. [`EtwGuard::drop`] reads session statistics via
-//!    `ControlTraceW(EVENT_TRACE_CONTROL_QUERY)`
-//!    ([`query_session_stats`]), then calls `UserTrace::stop` (which
-//!    signals the kernel to stop delivering events) and joins the
-//!    processing thread, guaranteeing the callback drains the pending
-//!    event queue before shutdown completes. The pre-stop query
-//!    surfaces `EventsLost` and `BuffersWritten` as a diagnostic
-//!    cross-check — nonzero `EventsLost` signals buffer overrun. See
+//! 3. A dedicated timer thread ([`run_periodic_stats_inner`]) ticks
+//!    [`query_session_stats`] once immediately and then every
+//!    [`LIVE_STATS_INTERVAL`] for as long as the session runs — not only at
+//!    shutdown — so a `bridge.log` collected from a still-running bridge
+//!    (the common case: users collect logs via Help → Collect Logs while
+//!    connected) always carries at least one completeness figure for the
+//!    session, from as early as the session start. Repeated query failures
+//!    (e.g. another bridge instance sweeping this session — see
+//!    [`sweep_stale_sessions`]) throttle to `info!` after the first `warn!`
+//!    — loud enough to survive log rotation as standing evidence the
+//!    session is gone, quiet enough not to re-flood at `warn!` forever.
+//!
+//! 4. [`EtwGuard::drop`] first stops the timer thread (closing its shutdown
+//!    channel wakes it immediately, not after the rest of the current
+//!    interval) and joins it, THEN reads session statistics one final time
+//!    via `ControlTraceW(EVENT_TRACE_CONTROL_QUERY)` ([`query_session_stats`])
+//!    before calling `UserTrace::stop` (which signals the kernel to stop
+//!    delivering events) and joining the processing thread, guaranteeing the
+//!    callback drains the pending event queue before shutdown completes.
+//!    Stopping the timer thread first is load-bearing, not incidental: it
+//!    guarantees no periodic tick can still be mid-query when `trace.stop()`
+//!    runs, so the two `query_session_stats` callers (periodic, drop-time)
+//!    never race the session teardown and no lock needs to serialize them.
+//!    Each stats query surfaces `EventsLost`, `BuffersWritten`,
+//!    `LogBuffersLost`, and `RealTimeBuffersLost` as a diagnostic
+//!    cross-check — nonzero loss in `EventsLost`, `LogBuffersLost`, or
+//!    `RealTimeBuffersLost` escalates to `warn!` (`BuffersWritten` is a
+//!    throughput count, not a loss counter, and never escalates);
+//!    delta-tracked on the periodic path via [`should_escalate`], so an
+//!    unchanging cumulative count doesn't re-warn every tick. See
 //!    [Drain on Drop](#drain-on-drop) below.
+//!
+//! # Drop's added wait
+//!
+//! Joining the timer thread in `Drop` adds a second, small, bounded
+//! blocking wait ahead of the pre-existing processing-thread join — bounded
+//! by however long one in-flight `ControlTraceW(QUERY)` call takes (a
+//! single synchronous Win32 call, not [`LIVE_STATS_INTERVAL`]), because
+//! closing the channel wakes a blocked `recv_timeout` immediately rather
+//! than waiting out the interval. This is the same shape of synchronous
+//! wait `Drop` already performs for the processing thread, not a new
+//! category of blocking risk; it is not solved with a timeout (this
+//! project does not paper over synchronization with timeouts).
 //!
 //! # Drain on Drop
 //!
@@ -108,7 +142,9 @@ use ferrisetw::trace::{TraceProperties, TraceTrait, UserTrace};
 use ferrisetw::{EventRecord, GUID};
 use std::borrow::Cow;
 use std::net::{IpAddr, SocketAddr};
+use std::sync::mpsc;
 use std::thread::JoinHandle;
+use std::time::Duration;
 use tracing::{debug, info, warn};
 
 // Provider GUIDs ======================================================================================================
@@ -182,6 +218,49 @@ mod tcpip_events {
     pub const SEND_RETRANSMIT_ROUND: u16 = 1077;
 }
 
+/// TCPIP event IDs from [`tcpip_events`] mapped to the Microsoft manifest's
+/// `symbol` attribute — the human-readable name `Get-WinEvent` and MSDN both
+/// use for these events. Sourced from `Microsoft-Windows-TCPIP.xml`'s
+/// `<event value=... symbol=...>` elements (both versions of an event share
+/// one symbol, so the base non-`_V1` form covers either). This is the single
+/// source of truth [`event_name`] reads from; keep it in sync with
+/// `dispatch`'s TCPIP match arms below — a unit test in `etw_tests.rs`
+/// enumerates the full `u16` ID space through `dispatch` and fails if an ID
+/// classified there has no entry here.
+const TCPIP_EVENT_NAMES: &[(u16, &str)] = &[
+    (tcpip_events::TCB_CONNECT_REQUESTED, "TcpRequestConnect"),
+    (tcpip_events::TCB_SYN_SEND, "TcpTcbSynSend"),
+    (tcpip_events::ACCEPT_COMPLETED, "TcpAcceptListenerComplete"),
+    (tcpip_events::CONNECT_RESTRICTED_SEND, "TcpConnectTcbProceeding"),
+    (tcpip_events::CONNECT_COMPLETED, "TcpConnectTcbComplete"),
+    (tcpip_events::CONNECT_ATTEMPT_FAILED, "TcpConnectTcbFailure"),
+    (tcpip_events::CLOSE_ISSUED, "TcpCloseTcbRequest"),
+    (tcpip_events::ABORT_ISSUED, "TcpAbortTcbRequest"),
+    (tcpip_events::ABORT_COMPLETED, "TcpAbortTcbComplete"),
+    (tcpip_events::DISCONNECT_COMPLETED, "TcpDisconnectTcbComplete"),
+    (tcpip_events::CONNECT_REQUEST_TIMEOUT, "TcpConnectTcbTimeout"),
+    (tcpip_events::RETRANSMIT_TIMEOUT, "TcpDisconnectTcbRtoTimeout"),
+    (tcpip_events::KEEPALIVE_TIMEOUT, "TcpDisconnectTcbKeepaliveTimeout"),
+    (tcpip_events::DISCONNECT_TIMEOUT, "TcpDisconnectTcbTimeout"),
+    (tcpip_events::SEND_RETRANSMIT_ROUND, "TcpDataTransferRetransmitRound"),
+];
+
+/// Look up the symbolic name for an event, gated on provider the same way
+/// [`dispatch`] gates TCPIP-specific classification — AFD and WFP recycle
+/// small event-id integers that collide with TCPIP's, so a bare `event_id`
+/// lookup without the provider check would misname them. Returns `None`
+/// (rendered `~` in `bridge.log`) for a non-TCPIP provider or a TCPIP
+/// `event_id` outside [`TCPIP_EVENT_NAMES`].
+pub(crate) fn event_name(provider: GUID, event_id: u16) -> Option<&'static str> {
+    if !is_tcpip_provider(provider) {
+        return None;
+    }
+    TCPIP_EVENT_NAMES
+        .iter()
+        .find(|(id, _)| *id == event_id)
+        .map(|(_, name)| *name)
+}
+
 /// TCPIP event IDs observed at high volume that are not individually
 /// useful — high-rate data-plane or internal-bookkeeping events.
 /// Dropped inside [`dispatch`] to keep `HOLE_BRIDGE_LOG=debug` output
@@ -201,13 +280,9 @@ const RETRANSMIT_WARN_THRESHOLD: u32 = 3;
 
 // Public types ========================================================================================================
 
-/// RAII guard holding the live ETW session + processing thread.
-///
-/// Drop sequence: `query_session_stats` (read EventsLost before the
-/// handle is consumed) → `UserTrace::stop` → `JoinHandle::join` → the
-/// processing thread exits once the kernel acknowledges STOP, which
-/// drains the in-flight event queue. See module doc
-/// [Drain on Drop](self#drain-on-drop).
+/// RAII guard holding the live ETW session, its processing thread, and the
+/// periodic live-stats timer thread. Drop order and rationale: see module
+/// doc [Drain on Drop](self#drain-on-drop) and [Drop's added wait](self#drops-added-wait).
 pub struct EtwGuard {
     // `Option<UserTrace>` so Drop can `take()` it and consume via
     // `UserTrace::stop(self)` (which takes `self` by value).
@@ -217,14 +292,40 @@ pub struct EtwGuard {
     /// `query_session_stats` can look it up in Drop without holding a
     /// reference into `trace`.
     session_name: String,
+    /// Dropping this closes the channel, waking the stats timer thread's
+    /// blocked `recv_timeout` immediately instead of waiting out the rest
+    /// of `LIVE_STATS_INTERVAL`.
+    stats_tx: Option<mpsc::Sender<()>>,
+    stats_thread: Option<JoinHandle<()>>,
 }
 
 impl Drop for EtwGuard {
     fn drop(&mut self) {
+        // Stop the periodic timer thread FIRST and join it, so no live-phase
+        // query can still be in flight when the stop-phase query and
+        // trace.stop() below run — see module doc "Drop's added wait".
+        drop(self.stats_tx.take());
+        if let Some(stats_thread) = self.stats_thread.take() {
+            if let Err(e) = stats_thread.join() {
+                warn!(panic = ?e, "etw: live-stats thread panicked during drop");
+            }
+        }
+
         // Query first, stop second. `UserTrace::stop` consumes the trace
-        // by value, so EventsLost can only be read while the session is
-        // still live.
-        query_session_stats(&self.session_name);
+        // by value, so the loss counters can only be read while the
+        // session is still live. One-shot call: unconditional warn on
+        // either a query failure or nonzero loss — there is no "previous
+        // tick" to throttle repeats against.
+        match query_session_stats(&self.session_name, "stop") {
+            Ok(stats) => {
+                if stats.events_lost > 0 || stats.log_buffers_lost > 0 || stats.real_time_buffers_lost > 0 {
+                    warn_loss("stop", &self.session_name, stats);
+                }
+            }
+            Err(code) => {
+                warn!(phase = "stop", code, session = %self.session_name, "etw: ControlTraceW(QUERY) failed");
+            }
+        }
 
         if let Some(trace) = self.trace.take() {
             if let Err(e) = trace.stop() {
@@ -265,6 +366,43 @@ pub fn start_consumer() -> Result<EtwGuard, EtwError> {
 
     sweep_stale_sessions();
 
+    start_consumer_named(session_name, LIVE_STATS_INTERVAL, |_tick_count| {})
+}
+
+/// Test-only entry point: builds a full [`EtwGuard`] — real session,
+/// processing thread, and stats timer — under a caller-chosen session name
+/// and stats interval, with an observer callback for each stats tick (the
+/// same test seam [`run_periodic_stats_inner`] exposes, threaded one level
+/// up so a privileged test can exercise the real [`EtwGuard::drop`] path
+/// rather than [`run_periodic_stats_inner`] in isolation). Does not sweep
+/// `hole-bridge-etw-*` — callers use their own private session-name prefix
+/// and sweep it themselves, matching `etw_live_privileged_tests`'
+/// convention.
+#[cfg(test)]
+fn start_consumer_for_test(
+    session_name: String,
+    interval: Duration,
+    on_tick: impl FnMut(u32) + Send + 'static,
+) -> Result<EtwGuard, EtwError> {
+    start_consumer_named(session_name, interval, on_tick)
+}
+
+fn start_consumer_named(
+    session_name: String,
+    interval: Duration,
+    on_tick: impl FnMut(u32) + Send + 'static,
+) -> Result<EtwGuard, EtwError> {
+    let bridge_pid = std::process::id();
+    // Captured once and propagated into both spawned threads below via
+    // `tracing::dispatcher::with_default`: `tracing::subscriber::set_default`
+    // (what `garter::tracing_test::set_default_in_current_thread` — and any
+    // caller relying on a non-global default — installs) is strictly
+    // thread-local, so without this, events logged from the processing or
+    // stats-timer threads would silently miss a caller's non-global
+    // subscriber. In production this is the already-active global default,
+    // so propagating it is a no-op.
+    let dispatch = tracing::dispatcher::get_default(tracing::Dispatch::clone);
+
     let tcpip = Provider::by_guid(TCPIP_PROVIDER)
         .any(TCPIP_KEYWORDS)
         .add_callback(move |record: &EventRecord, schema_locator: &SchemaLocator| {
@@ -292,8 +430,9 @@ pub fn start_consumer() -> Result<EtwGuard, EtwError> {
     // volume is high (SendPath included). Default `buffer_size` (32 KB
     // per-processor) risks ring-buffer overflow under IO load; widen to
     // 256 KB. `max_buffer = 0` tells Windows to choose a reasonable
-    // ceiling. EventsLost is queried on [`EtwGuard::drop`] so an overrun
-    // shows up as a nonzero count in bridge.log.
+    // ceiling. `query_session_stats` reads EventsLost periodically and once
+    // more at drop, so an overrun surfaces as a nonzero count in bridge.log
+    // well before shutdown.
     let trace_properties = TraceProperties {
         buffer_size: 256,
         ..Default::default()
@@ -307,40 +446,142 @@ pub fn start_consumer() -> Result<EtwGuard, EtwError> {
         .start()
         .map_err(EtwError::SessionStart)?;
 
+    let processor_dispatch = dispatch.clone();
     let thread = std::thread::Builder::new()
         .name("hole-bridge-etw-processor".into())
         .spawn(move || {
-            if let Err(e) = UserTrace::process_from_handle(handle) {
-                // `process_from_handle` returns when the kernel
-                // acknowledges STOP — which is the normal shutdown path,
-                // but may also carry an Err if the session was already
-                // dead. Log and exit; the guard's Drop handles user-
-                // visible cleanup.
-                debug!(error = ?e, "etw: processing thread exiting");
-            }
+            tracing::dispatcher::with_default(&processor_dispatch, || {
+                if let Err(e) = UserTrace::process_from_handle(handle) {
+                    // `process_from_handle` returns when the kernel
+                    // acknowledges STOP — which is the normal shutdown path,
+                    // but may also carry an Err if the session was already
+                    // dead. Log and exit; the guard's Drop handles user-
+                    // visible cleanup.
+                    debug!(error = ?e, "etw: processing thread exiting");
+                }
+            });
         })
         .map_err(EtwError::ThreadSpawn)?;
+
+    // Best-effort, unlike the session/processing-thread spawns above: by
+    // this point the processing thread is already live and consuming real
+    // events, so a fallible `?` here would tear the whole consumer down
+    // (dropping `trace` without joining `thread` — see the module's
+    // "Drain on Drop" contract) over the failure of a purely supplementary
+    // 60-second diagnostics timer. Missing live stats is a degraded
+    // diagnostic, not a reason to lose ETW event logging entirely.
+    let (stats_tx, stats_rx) = mpsc::channel::<()>();
+    let stats_session_name = session_name.clone();
+    let stats_thread_spawn = std::thread::Builder::new()
+        .name("hole-bridge-etw-live-stats".into())
+        .spawn(move || {
+            tracing::dispatcher::with_default(&dispatch, || {
+                run_periodic_stats_inner(stats_session_name, interval, stats_rx, on_tick);
+            });
+        });
+    let (stats_tx, stats_thread) = match stats_thread_spawn {
+        Ok(handle) => (Some(stats_tx), Some(handle)),
+        Err(e) => {
+            warn!(error = ?e, "etw: failed to spawn live-stats timer thread; continuing without periodic stats");
+            (None, None)
+        }
+    };
 
     info!(session = %session_name, "etw: consumer started");
     Ok(EtwGuard {
         trace: Some(trace),
         thread: Some(thread),
         session_name,
+        stats_tx,
+        stats_thread,
     })
 }
 
-/// Query the live ETW session via Win32 `ControlTraceW(QUERY)` and log
-/// `events_lost` / `buffers_written` at info level. Called from
-/// [`EtwGuard::drop`] before the session is stopped.
+/// Last-observed value of each cumulative loss counter
+/// [`EVENT_TRACE_PROPERTIES`] reports, so a caller ticking
+/// [`query_session_stats`] repeatedly can escalate only on a genuine
+/// change instead of re-warning forever once a counter goes nonzero.
+/// `buffers_written` is deliberately excluded — it's a throughput count,
+/// not a loss counter, and never escalates.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct LastSeenLoss {
+    events_lost: u32,
+    log_buffers_lost: u32,
+    real_time_buffers_lost: u32,
+}
+
+/// Decide whether a fresh stats reading is worth escalating to `warn!`,
+/// and advance `last` to the fresh reading either way.
 ///
-/// This is a cross-check for the [`TCPIP_KEYWORDS`] widening: if the
-/// widened subscription overruns the kernel ring buffer, the lost
-/// events count surfaces in bridge.log as diagnostic signal (and a
-/// prompt to raise `buffer_size` further).
+/// Compares by inequality (`!=`), not `>`: all three counters are monotonic
+/// cumulative counts for the life of the session, so a `current < last`
+/// reading can only mean a `u32` wraparound, and `>` would silently treat
+/// that as "no increase" — resetting the escalation baseline to a lower
+/// value and requiring loss to climb back above the pre-wrap high-water
+/// mark before warning again. `!=` still registers a post-wrap value as a
+/// change. All three counters get identical treatment; there is no reason
+/// for `log_buffers_lost` or `real_time_buffers_lost` to re-warn on every
+/// unchanged tick while `events_lost` does not.
+fn should_escalate(
+    last: &mut LastSeenLoss,
+    current_events_lost: u32,
+    current_log_buffers_lost: u32,
+    current_real_time_buffers_lost: u32,
+) -> bool {
+    let changed = current_events_lost != last.events_lost
+        || current_log_buffers_lost != last.log_buffers_lost
+        || current_real_time_buffers_lost != last.real_time_buffers_lost;
+    last.events_lost = current_events_lost;
+    last.log_buffers_lost = current_log_buffers_lost;
+    last.real_time_buffers_lost = current_real_time_buffers_lost;
+    changed
+}
+
+/// Shared `warn!` for a nonzero-loss reading, called from both the
+/// one-shot drop-time query and the throttled periodic tick so the two
+/// callers can never drift into differently-shaped log lines for the same
+/// event class.
+fn warn_loss(phase: &'static str, session_name: &str, stats: SessionStats) {
+    warn!(
+        phase,
+        session = %session_name,
+        events_lost = stats.events_lost,
+        log_buffers_lost = stats.log_buffers_lost,
+        real_time_buffers_lost = stats.real_time_buffers_lost,
+        "etw: kernel dropped events — consider raising TraceProperties.buffer_size"
+    );
+}
+
+/// Cadence for the periodic live-session stats query — see
+/// [`run_periodic_stats_inner`]. Matches the existing
+/// `dns::forwarder::SUMMARY_INTERVAL` precedent elsewhere in this crate.
+const LIVE_STATS_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Session statistics read by [`query_session_stats`]. All four fields are
+/// monotonic cumulative counters for the life of the session (never reset
+/// except by session recreation).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SessionStats {
+    events_lost: u32,
+    buffers_written: u32,
+    log_buffers_lost: u32,
+    real_time_buffers_lost: u32,
+}
+
+/// Query the live ETW session via Win32 `ControlTraceW(QUERY)` — works
+/// against a running session; MSDN does not gate `EVENT_TRACE_CONTROL_QUERY`
+/// on the session stopping. Called both from the periodic timer thread
+/// (`phase = "live"`) and once from [`EtwGuard::drop`] (`phase = "stop"`)
+/// before the session is actually stopped.
 ///
-/// Silently skips on query failure — the guard is in a drop path and
-/// double-panicking would hide the original error.
-fn query_session_stats(session_name: &str) {
+/// Logs nothing on failure — that decision belongs to the caller, since the
+/// one-shot drop-time caller and the repeating periodic caller need
+/// different failure-logging policies (the periodic caller throttles
+/// repeats; see [`live_stats_tick`]). Logs exactly one `info!` on success,
+/// with a phase-tagged message shared by both callers so a shipped line
+/// never claims a phase it isn't in (e.g. a "live" query does not carry an
+/// "at stop" message).
+fn query_session_stats(session_name: &str, phase: &'static str) -> Result<SessionStats, u32> {
     use windows::Win32::Foundation::ERROR_SUCCESS;
     use windows::Win32::System::Diagnostics::Etw::{
         ControlTraceW, CONTROLTRACE_HANDLE, EVENT_TRACE_CONTROL_QUERY, EVENT_TRACE_PROPERTIES, WNODE_FLAG_TRACED_GUID,
@@ -380,25 +621,99 @@ fn query_session_stats(session_name: &str) {
     };
 
     if err != ERROR_SUCCESS {
-        warn!(code = err.0, session = %session_name, "etw: ControlTraceW(QUERY) failed");
-        return;
+        return Err(err.0);
     }
 
     // SAFETY: `props` is a valid `EVENT_TRACE_PROPERTIES` Windows just
     // filled in with session statistics.
-    let (events_lost, buffers_written) = unsafe { ((*props).EventsLost, (*props).BuffersWritten) };
+    let stats = unsafe {
+        SessionStats {
+            events_lost: (*props).EventsLost,
+            buffers_written: (*props).BuffersWritten,
+            log_buffers_lost: (*props).LogBuffersLost,
+            real_time_buffers_lost: (*props).RealTimeBuffersLost,
+        }
+    };
     info!(
+        phase,
         session = %session_name,
-        events_lost,
-        buffers_written,
-        "etw: session stats at stop"
+        events_lost = stats.events_lost,
+        buffers_written = stats.buffers_written,
+        log_buffers_lost = stats.log_buffers_lost,
+        real_time_buffers_lost = stats.real_time_buffers_lost,
+        "etw: session stats"
     );
-    if events_lost > 0 {
-        warn!(
-            session = %session_name,
-            events_lost,
-            "etw: kernel dropped events — consider raising TraceProperties.buffer_size"
-        );
+    Ok(stats)
+}
+
+/// One tick of the periodic live-stats loop: query the live session and
+/// escalate per [`should_escalate`]. Query failures throttle to `info!`
+/// after the first `warn!` (via `last_query_failed`) — necessary because a
+/// session another bridge instance swept (see [`sweep_stale_sessions`])
+/// turns every subsequent tick into a permanent, expected failure for the
+/// rest of this process's life; the repeat stays at `info!` rather than
+/// dropping to `debug!` (below the bridge's default file-sink level) so a
+/// `bridge.log` rotated hours later still carries a recent, self-describing
+/// record that the session is gone — not silence indistinguishable from a
+/// healthy bridge that simply logs no ETW.
+fn live_stats_tick(session_name: &str, last_loss: &mut LastSeenLoss, last_query_failed: &mut bool) {
+    match query_session_stats(session_name, "live") {
+        Ok(stats) => {
+            *last_query_failed = false;
+            if should_escalate(
+                last_loss,
+                stats.events_lost,
+                stats.log_buffers_lost,
+                stats.real_time_buffers_lost,
+            ) {
+                warn_loss("live", session_name, stats);
+            }
+        }
+        Err(code) => {
+            if *last_query_failed {
+                info!(phase = "live", code, session = %session_name, "etw: ControlTraceW(QUERY) still failing");
+            } else {
+                warn!(phase = "live", code, session = %session_name, "etw: ControlTraceW(QUERY) failed");
+            }
+            *last_query_failed = true;
+        }
+    }
+}
+
+/// Drives [`live_stats_tick`] once immediately (so the session's baseline
+/// reading — and later deltas measured against it — are in `bridge.log`
+/// from the earliest moment a still-running bridge's log can be collected,
+/// not only after the first [`LIVE_STATS_INTERVAL`] elapses) and then on a
+/// real, cancellable interval: `stop_rx.recv_timeout(interval)` blocks
+/// until either `interval` elapses (a `Timeout` — tick) or the sender is
+/// dropped (a `Disconnected` — exit immediately, without waiting out the
+/// rest of the current interval). `on_tick` is a test seam: production
+/// (via [`start_consumer`]) passes a no-op; a test can observe real ticks
+/// — including the immediate baseline one, numbered `1` — by blocking on a
+/// channel this closure sends into, without sleeping.
+fn run_periodic_stats_inner(
+    session_name: String,
+    interval: Duration,
+    stop_rx: mpsc::Receiver<()>,
+    mut on_tick: impl FnMut(u32),
+) {
+    let mut last_loss = LastSeenLoss::default();
+    let mut last_query_failed = false;
+    let mut tick_count = 0u32;
+
+    live_stats_tick(&session_name, &mut last_loss, &mut last_query_failed);
+    tick_count += 1;
+    on_tick(tick_count);
+
+    loop {
+        match stop_rx.recv_timeout(interval) {
+            Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => return,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                live_stats_tick(&session_name, &mut last_loss, &mut last_query_failed);
+                tick_count += 1;
+                on_tick(tick_count);
+            }
+        }
     }
 }
 
@@ -442,16 +757,16 @@ pub(crate) unsafe fn read_wide_string(ptr: *const u16) -> String {
 /// Field coverage notes (per
 /// <https://github.com/repnz/etw-providers-docs/blob/master/Manifests-Win10-18990/Microsoft-Windows-TCPIP.xml>):
 ///
-/// - **1002 `TcbRequestConnect`**: `Tcb`, `LocalAddress`, `LocalPort`,
+/// - **1002 `TcpRequestConnect`**: `Tcb`, `LocalAddress`, `LocalPort`,
 ///   `RemoteAddress`, `RemotePort`, `NewState`, `RexmitCount`.
-/// - **1004 `TcbSynSend`**: `Tcb`, `Seq`, no address/port fields.
-/// - **1031 `ConnectRestrictedSend`**: `Tcb`, `LocalAddress`,
+/// - **1004 `TcpTcbSynSend`**: `Tcb`, `Seq`, no address/port fields.
+/// - **1031 `TcpConnectTcbProceeding`**: `Tcb`, `LocalAddress`,
 ///   `LocalPort`, `RemoteAddress`, `RemotePort`, `Status`.
-/// - **1033 `ConnectTcbComplete`**: `Tcb`, `LocalAddress`, `LocalPort`,
+/// - **1033 `TcpConnectTcbComplete`**: `Tcb`, `LocalAddress`, `LocalPort`,
 ///   `RemoteAddress`, `RemotePort`, `Status`.
-/// - **1045 `ConnectTcbTimeout`**: `Tcb`, `Seq`, `TcbState`.
-/// - **1046 `DisconnectTcbRtoTimeout`**: `Tcb`, `Seq`.
-/// - **1077 `SendRetransmitRound`**: `Tcb`, `SndUna`, `SndNxt`,
+/// - **1045 `TcpConnectTcbTimeout`**: `Tcb`, `Seq`, `TcbState`.
+/// - **1046 `TcpDisconnectTcbRtoTimeout`**: `Tcb`, `Seq`.
+/// - **1077 `TcpDataTransferRetransmitRound`**: `Tcb`, `SndUna`, `SndNxt`,
 ///   `SegmentSize`, `RexmitCount`.
 ///
 /// Every event in the "has address" group above ships its IP and port
@@ -675,6 +990,10 @@ fn socket_addr_field(parser: &Parser, field: &str) -> Option<SocketAddr> {
 #[dump(rename_all = "kebab-case")]
 pub(crate) struct EventView<'a> {
     pub event_id: u16,
+    /// Symbolic event name (e.g. `TcpConnectTcbComplete`), `~` when the
+    /// provider/event_id has no entry in [`TCPIP_EVENT_NAMES`]. See
+    /// [`event_name`].
+    pub name: Option<&'static str>,
     pub opcode: u8,
     pub provider: &'a str,
     /// Kernel TCB correlator — kept third (right after `provider`) so
@@ -694,8 +1013,10 @@ pub(crate) struct EventView<'a> {
 /// event message in human-readable form.
 fn emit(emission: Emission, record: &EventRecord, fields: &ParsedFields) {
     let provider = provider_name(record.provider_id());
+    let name = event_name(record.provider_id(), record.event_id());
     let view = EventView {
         event_id: record.event_id(),
+        name,
         opcode: record.opcode(),
         provider: &provider,
         tcb: fields.tcb,
@@ -758,3 +1079,7 @@ fn provider_name(provider: GUID) -> Cow<'static, str> {
 #[cfg(test)]
 #[path = "etw_tests.rs"]
 mod etw_tests;
+
+#[cfg(test)]
+#[path = "etw_live_privileged_tests.rs"]
+mod etw_live_privileged_tests;
