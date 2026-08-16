@@ -117,10 +117,8 @@ fn fixed_env_sets_gotraceback_crash() {
 
 #[skuld::test]
 fn fixed_env_sets_no_color() {
-    // NO_COLOR=1 / CLICOLOR=0 strip ANSI a plugin child's own logger may
-    // write to stderr — `tracing-subscriber` (galoshes) already honors
-    // NO_COLOR; ex-ray never colors, so both are a no-op there. See
-    // bindreams/hole#802.
+    // Regression pin: fixed_plugin_env must inject both NO_COLOR and
+    // CLICOLOR (see the doc comment on fixed_plugin_env for why).
     let pairs = crate::binary::fixed_plugin_env();
     assert!(
         pairs.iter().any(|(k, v)| *k == "NO_COLOR" && *v == "1"),

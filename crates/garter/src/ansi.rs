@@ -23,7 +23,13 @@ use std::sync::LazyLock;
 
 use regex::Regex;
 
-static SGR: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\x1b\[[0-9;]*m").expect("valid regex"));
+// Parameter bytes cover the full ECMA-48 CSI parameter range 0x30-0x3F
+// (digits, `;`, and `:` — the last for colon-separated sub-parameters, the
+// standard truecolor form `ESC [ 38:2:R:G:Bm`), not just `[0-9;]`: the
+// terminator `m` is what removes the ambiguity (see module doc), so
+// widening the parameter class costs nothing and covers a real SGR shape
+// this narrower set was missing.
+static SGR: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\x1b\[[0-9;:]*m").expect("valid regex"));
 
 /// Remove every complete SGR escape sequence from `line`; anything that is
 /// not a complete, `m`-terminated sequence (including a lone or incomplete

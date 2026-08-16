@@ -11,6 +11,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::oneshot;
 
 use garter::{BinaryPlugin, ChainRunner, PluginEnv};
+use skuld::env;
 
 mod common;
 use common::mock_plugin_path;
@@ -1161,11 +1162,11 @@ async fn log_sink_receives_lines_drained_after_version_skew_fallback() {
     chain_task.abort();
 }
 
-/// bindreams/hole#802: garter's own relay must strip ANSI SGR escapes even
-/// from a plugin that never checks `NO_COLOR` itself — the guarantee this
-/// codebase owns, not one that merely hopes a child cooperates.
-/// `MOCK_PLUGIN_FORCE_ANSI_STDERR` writes a colored line unconditionally,
-/// ignoring `NO_COLOR`/`CLICOLOR` entirely, to prove exactly that.
+/// Garter's own relay must strip ANSI SGR escapes even from a plugin that
+/// never checks `NO_COLOR` itself — the guarantee this codebase owns, not
+/// one that merely hopes a child cooperates. `MOCK_PLUGIN_FORCE_ANSI_STDERR`
+/// writes a colored line unconditionally, ignoring `NO_COLOR`/`CLICOLOR`
+/// entirely, to prove exactly that.
 #[skuld::test]
 async fn stderr_relay_strips_ansi_even_from_an_uncooperative_child() {
     let mock_path = mock_plugin_path();
@@ -1213,19 +1214,21 @@ async fn stderr_relay_strips_ansi_even_from_an_uncooperative_child() {
     chain_task.abort();
 }
 
-/// bindreams/hole#802: `NO_COLOR=1`/`CLICOLOR=0` (`fixed_plugin_env`) must
-/// reach the real child process env, not merely exist in the static array
-/// — the cheap first line of defense (`tracing-subscriber`, which galoshes
-/// uses, already honors `NO_COLOR`; the sibling test above proves garter's
-/// own strip as the backstop for a plugin that doesn't). Clears any
-/// ambient value from the TEST's own process first — nextest gives each
-/// test its own process (`.config/nextest.toml`), so this cannot
-/// cross-contaminate a sibling test — so the assertion can only pass via
-/// injection, never via inheritance from a CI/dev-shell env.
+/// `NO_COLOR=1`/`CLICOLOR=0` (`fixed_plugin_env`) must reach the real child
+/// process env, not merely exist in the static array — the cheap first
+/// line of defense (`tracing-subscriber`, which galoshes uses, already
+/// honors `NO_COLOR`; the sibling test above proves garter's own strip as
+/// the backstop for a plugin that doesn't). Clears any ambient value from
+/// the process first via the `env` fixture (`skuld::EnvGuard`, itself
+/// `serial` — environment variables are process-global, so this cannot
+/// run concurrently with a sibling test under a non-nextest, multi-threaded
+/// `cargo test` either) so the assertion can only pass via injection, never
+/// via inheritance from a CI/dev-shell env; the fixture reverts both vars
+/// on drop.
 #[skuld::test]
-async fn no_color_and_clicolor_reach_the_real_child() {
-    std::env::remove_var("NO_COLOR");
-    std::env::remove_var("CLICOLOR");
+async fn no_color_and_clicolor_reach_the_real_child(#[fixture] env: &skuld::EnvGuard) {
+    env.remove("NO_COLOR");
+    env.remove("CLICOLOR");
 
     let mock_path = mock_plugin_path();
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
@@ -1248,14 +1251,14 @@ async fn no_color_and_clicolor_reach_the_real_child() {
         .on_ready(ready_tx)
         .drain_timeout(Duration::from_secs(3));
 
-    let env = PluginEnv {
+    let plugin_env = PluginEnv {
         local_host: chain_local.ip(),
         local_port: chain_local.port(),
         remote_host: "127.0.0.1".to_string(),
         remote_port: 9,
         plugin_options: None,
     };
-    let chain_task = tokio::spawn(async move { runner.run(env).await });
+    let chain_task = tokio::spawn(async move { runner.run(plugin_env).await });
     ready_rx.await.expect("aggregator should send").expect("chain ready");
 
     // CLICOLOR is echoed AFTER NO_COLOR (see mock-plugin.rs), so waiting on
@@ -1273,8 +1276,8 @@ async fn no_color_and_clicolor_reach_the_real_child() {
     chain_task.abort();
 }
 
-/// bindreams/hole#802 (adversarial-hunt finding): `sitrep::parse_event`
-/// must see the UNTOUCHED line, never the ANSI-stripped display copy. A
+/// `sitrep::parse_event` must see the UNTOUCHED line, never the
+/// ANSI-stripped display copy. A
 /// raw, unescaped ESC byte inside a JSON string is illegal per RFC 8259 —
 /// `serde_json` (confirmed directly) rejects it, so this line must stay
 /// inert log passthrough and the chain must ready normally. The embedded
