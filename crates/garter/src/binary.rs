@@ -73,7 +73,10 @@ pub type PidSink = Arc<dyn Fn(u32) + Send + Sync>;
 /// Sink for a plugin's raw log lines, mirroring [`PidSink`]. Invoked for EVERY
 /// line the child writes to stdout or stderr — including lines the sitrep
 /// reader goes on to parse as protocol events — before any interpretation.
-/// Lines are handed over unparsed and unclassified.
+/// Lines are unparsed and unclassified, except that any ANSI SGR (color)
+/// escape sequences are already stripped (see `ansi::strip_sgr`) — the
+/// sink never sees what `sitrep::parse_event` sees, which is the untouched
+/// original.
 pub type LogSink = Arc<dyn Fn(&str) + Send + Sync>;
 
 /// A plugin backed by an external SIP003u binary.
@@ -160,9 +163,12 @@ impl BinaryPlugin {
 /// process, independent of SIP003 config. `GOTRACEBACK=crash` makes a Go
 /// plugin (ex-ray) dump full goroutine state to stderr on a native fault
 /// (the bridge relays that stderr through tracing). Harmless to Rust
-/// plugins, which ignore it. See bindreams/hole#438.
+/// plugins, which ignore it. See bindreams/hole#438. `NO_COLOR=1` /
+/// `CLICOLOR=0` strip ANSI a plugin child's logger may write to stderr —
+/// `tracing-subscriber` (galoshes) already honors `NO_COLOR`; ex-ray never
+/// colors, so both are a no-op there. See bindreams/hole#802.
 pub(crate) fn fixed_plugin_env() -> &'static [(&'static str, &'static str)] {
-    &[("GOTRACEBACK", "crash")]
+    &[("GOTRACEBACK", "crash"), ("NO_COLOR", "1"), ("CLICOLOR", "0")]
 }
 
 fn extract_name(path: &Path) -> String {
@@ -237,6 +243,7 @@ impl ChainPlugin for BinaryPlugin {
             loop {
                 match lines.next_line().await {
                     Ok(Some(line)) => {
+                        let line = crate::ansi::strip_sgr(&line);
                         if let Some(ref sink) = log_sink {
                             sink(&line);
                         }
@@ -269,6 +276,7 @@ impl ChainPlugin for BinaryPlugin {
                     loop {
                         match lines.next_line().await {
                             Ok(Some(line)) => {
+                                let line = crate::ansi::strip_sgr(&line);
                                 if let Some(ref sink) = log_sink {
                                     sink(&line);
                                 }
@@ -444,9 +452,13 @@ fn spawn_sitrep_stdout_reader(
                     // Sink BEFORE parsing: the arms below consume lines that
                     // would otherwise never reach a consumer — a post-ready
                     // `fatal` finds the readiness one-shot already taken and
-                    // falls through with no relay at all.
+                    // falls through with no relay at all. The sink gets the
+                    // ANSI-stripped display copy; `parse_event` below gets
+                    // the untouched original — never strip ahead of the
+                    // parser (see `ansi` module doc for why).
+                    let clean_line = crate::ansi::strip_sgr(&line);
                     if let Some(ref sink) = log_sink {
-                        sink(&line);
+                        sink(&clean_line);
                     }
                     match crate::sitrep::parse_event(&line) {
                         Ok(Some(SitrepEvent::Hello { protocol })) => {
@@ -508,7 +520,7 @@ fn spawn_sitrep_stdout_reader(
                             }
                         }
                         // log line / pre-handshake / unknown event → passthrough
-                        _ => tracing::info!(plugin = %plugin_name, "{line}"),
+                        _ => tracing::info!(plugin = %plugin_name, "{clean_line}"),
                     }
                 }
                 Ok(None) => break, // EOF
@@ -548,6 +560,7 @@ async fn drain_remaining_logs(
     log_sink: &Option<LogSink>,
 ) {
     while let Ok(Some(line)) = lines.next_line().await {
+        let line = crate::ansi::strip_sgr(&line);
         if let Some(sink) = log_sink {
             sink(&line);
         }

@@ -71,6 +71,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         if let Ok(opts) = std::env::var("SS_PLUGIN_OPTIONS") {
             eprintln!("mock-plugin: SS_PLUGIN_OPTIONS={opts}");
         }
+        // Echoed in this order (NO_COLOR then CLICOLOR) so a test waiting
+        // on the LAST line is guaranteed both have already been written —
+        // they land as two separate stderr lines / tracing events.
+        eprintln!("mock-plugin: NO_COLOR={:?}", std::env::var("NO_COLOR"));
+        eprintln!("mock-plugin: CLICOLOR={:?}", std::env::var("CLICOLOR"));
+    }
+
+    // Knob: MOCK_PLUGIN_FORCE_ANSI_STDERR — write one ANSI-colored stderr
+    // line unconditionally, ignoring NO_COLOR/CLICOLOR entirely. Simulates
+    // a plugin whose own logging library does NOT honor either convention,
+    // so a consumer test can prove garter's own relay strips ANSI
+    // regardless of the child's cooperation.
+    if std::env::var_os("MOCK_PLUGIN_FORCE_ANSI_STDERR").is_some() {
+        eprintln!("\x1b[31mmock-plugin: colored line\x1b[0m");
     }
 
     // Knob: MOCK_PLUGIN_NO_SITREP — suppress ALL stdout sitrep emits so the

@@ -1,3 +1,4 @@
+mod ansi;
 pub mod binary;
 pub mod chain;
 pub mod counting;
@@ -23,6 +24,8 @@ pub use sip003::{join_plugin_options, parse_plugin_options, split_plugin_options
 pub use sitrep::{PluginReady, ProtocolSupport, SitrepEvent, StartError, Transports, SITREP_PROTOCOL};
 pub use tap::TapPlugin;
 
+#[cfg(test)]
+mod ansi_tests;
 #[cfg(test)]
 mod binary_tests;
 #[cfg(test)]

@@ -5,7 +5,9 @@
 //! gives up, and diluted by everything in between.
 //!
 //! Lines are raw, exactly as the child wrote them, including the sitrep JSON
-//! frames garter parses. Nothing here classifies them.
+//! frames garter parses — except that garter's relay strips any ANSI SGR
+//! (color) escape sequences before this ring ever sees a line (see
+//! `garter::binary`'s `LogSink` doc). Nothing here classifies them.
 //!
 //! These are the plugin's own words and can name the server host, so they reach
 //! `bridge.log` ONLY. Nothing here may be folded into a `ProxyError`: that
