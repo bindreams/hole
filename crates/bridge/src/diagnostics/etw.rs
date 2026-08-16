@@ -44,15 +44,46 @@
 //!    translates the returned [`Emission`] into a real `tracing::event!`
 //!    invocation.
 //!
-//! 3. [`EtwGuard::drop`] reads session statistics via
-//!    `ControlTraceW(EVENT_TRACE_CONTROL_QUERY)`
-//!    ([`query_session_stats`]), then calls `UserTrace::stop` (which
-//!    signals the kernel to stop delivering events) and joins the
-//!    processing thread, guaranteeing the callback drains the pending
-//!    event queue before shutdown completes. The pre-stop query
-//!    surfaces `EventsLost` and `BuffersWritten` as a diagnostic
-//!    cross-check — nonzero `EventsLost` signals buffer overrun. See
-//!    [Drain on Drop](#drain-on-drop) below.
+//! 3. A dedicated timer thread ([`run_periodic_stats`]) ticks
+//!    [`query_session_stats`] every [`LIVE_STATS_INTERVAL`] for as long as
+//!    the session runs — not only at shutdown — so a `bridge.log`
+//!    collected from a still-running bridge (the common case: users collect
+//!    logs via Help → Collect Logs while connected) carries at least one
+//!    completeness figure for the session covering the moment of
+//!    collection. Repeated query failures (e.g. another bridge instance
+//!    sweeping this session — see [`sweep_stale_sessions`]) throttle to
+//!    `debug!` after the first `warn!` rather than repeating every tick
+//!    forever.
+//!
+//! 4. [`EtwGuard::drop`] first stops the timer thread (closing its shutdown
+//!    channel wakes it immediately, not after the rest of the current
+//!    interval) and joins it, THEN reads session statistics one final time
+//!    via `ControlTraceW(EVENT_TRACE_CONTROL_QUERY)` ([`query_session_stats`])
+//!    before calling `UserTrace::stop` (which signals the kernel to stop
+//!    delivering events) and joining the processing thread, guaranteeing the
+//!    callback drains the pending event queue before shutdown completes.
+//!    Stopping the timer thread first is load-bearing, not incidental: it
+//!    guarantees no periodic tick can still be mid-query when `trace.stop()`
+//!    runs, so the two `query_session_stats` callers (periodic, drop-time)
+//!    never race the session teardown and no lock needs to serialize them.
+//!    Each stats query surfaces `EventsLost`, `BuffersWritten`,
+//!    `LogBuffersLost`, and `RealTimeBuffersLost` as a diagnostic
+//!    cross-check — nonzero loss escalates to `warn!` (delta-tracked on the
+//!    periodic path via [`should_escalate`], so an unchanging cumulative
+//!    count doesn't re-warn every tick). See [Drain on Drop](#drain-on-drop)
+//!    below.
+//!
+//! # Drop's added wait
+//!
+//! Joining the timer thread in `Drop` adds a second, small, bounded
+//! blocking wait ahead of the pre-existing processing-thread join — bounded
+//! by however long one in-flight `ControlTraceW(QUERY)` call takes (a
+//! single synchronous Win32 call, not [`LIVE_STATS_INTERVAL`]), because
+//! closing the channel wakes a blocked `recv_timeout` immediately rather
+//! than waiting out the interval. This is the same shape of synchronous
+//! wait `Drop` already performs for the processing thread, not a new
+//! category of blocking risk; it is not solved with a timeout (this
+//! project does not paper over synchronization with timeouts).
 //!
 //! # Drain on Drop
 //!
@@ -108,7 +139,9 @@ use ferrisetw::trace::{TraceProperties, TraceTrait, UserTrace};
 use ferrisetw::{EventRecord, GUID};
 use std::borrow::Cow;
 use std::net::{IpAddr, SocketAddr};
+use std::sync::mpsc;
 use std::thread::JoinHandle;
+use std::time::Duration;
 use tracing::{debug, info, warn};
 
 // Provider GUIDs ======================================================================================================
@@ -244,13 +277,16 @@ const RETRANSMIT_WARN_THRESHOLD: u32 = 3;
 
 // Public types ========================================================================================================
 
-/// RAII guard holding the live ETW session + processing thread.
+/// RAII guard holding the live ETW session, its processing thread, and the
+/// periodic live-stats timer thread.
 ///
-/// Drop sequence: `query_session_stats` (read EventsLost before the
+/// Drop sequence: stop + join the stats timer thread FIRST (so no periodic
+/// tick can still be mid-query when the session is torn down below) →
+/// `query_session_stats` one last time (read loss counters before the
 /// handle is consumed) → `UserTrace::stop` → `JoinHandle::join` → the
 /// processing thread exits once the kernel acknowledges STOP, which
 /// drains the in-flight event queue. See module doc
-/// [Drain on Drop](self#drain-on-drop).
+/// [Drain on Drop](self#drain-on-drop) and [Drop's added wait](self#drops-added-wait).
 pub struct EtwGuard {
     // `Option<UserTrace>` so Drop can `take()` it and consume via
     // `UserTrace::stop(self)` (which takes `self` by value).
@@ -260,14 +296,46 @@ pub struct EtwGuard {
     /// `query_session_stats` can look it up in Drop without holding a
     /// reference into `trace`.
     session_name: String,
+    /// Dropping this closes the channel, waking the stats timer thread's
+    /// blocked `recv_timeout` immediately instead of waiting out the rest
+    /// of `LIVE_STATS_INTERVAL`.
+    stats_tx: Option<mpsc::Sender<()>>,
+    stats_thread: Option<JoinHandle<()>>,
 }
 
 impl Drop for EtwGuard {
     fn drop(&mut self) {
+        // Stop the periodic timer thread FIRST and join it, so no live-phase
+        // query can still be in flight when the stop-phase query and
+        // trace.stop() below run — see module doc "Drop's added wait".
+        drop(self.stats_tx.take());
+        if let Some(stats_thread) = self.stats_thread.take() {
+            if let Err(e) = stats_thread.join() {
+                warn!(panic = ?e, "etw: live-stats thread panicked during drop");
+            }
+        }
+
         // Query first, stop second. `UserTrace::stop` consumes the trace
-        // by value, so EventsLost can only be read while the session is
-        // still live.
-        query_session_stats(&self.session_name);
+        // by value, so the loss counters can only be read while the
+        // session is still live. One-shot call: unconditional warn on
+        // either a query failure or nonzero loss — there is no "previous
+        // tick" to throttle repeats against.
+        match query_session_stats(&self.session_name, "stop") {
+            Ok(stats) => {
+                if stats.events_lost > 0 || stats.real_time_buffers_lost > 0 {
+                    warn!(
+                        phase = "stop",
+                        session = %self.session_name,
+                        events_lost = stats.events_lost,
+                        real_time_buffers_lost = stats.real_time_buffers_lost,
+                        "etw: kernel dropped events — consider raising TraceProperties.buffer_size"
+                    );
+                }
+            }
+            Err(code) => {
+                warn!(phase = "stop", code, session = %self.session_name, "etw: ControlTraceW(QUERY) failed");
+            }
+        }
 
         if let Some(trace) = self.trace.take() {
             if let Err(e) = trace.stop() {
@@ -364,26 +432,85 @@ pub fn start_consumer() -> Result<EtwGuard, EtwError> {
         })
         .map_err(EtwError::ThreadSpawn)?;
 
+    let (stats_tx, stats_rx) = mpsc::channel::<()>();
+    let stats_session_name = session_name.clone();
+    let stats_thread = std::thread::Builder::new()
+        .name("hole-bridge-etw-live-stats".into())
+        .spawn(move || {
+            run_periodic_stats(stats_session_name, LIVE_STATS_INTERVAL, stats_rx);
+        })
+        .map_err(EtwError::ThreadSpawn)?;
+
     info!(session = %session_name, "etw: consumer started");
     Ok(EtwGuard {
         trace: Some(trace),
         thread: Some(thread),
         session_name,
+        stats_tx: Some(stats_tx),
+        stats_thread: Some(stats_thread),
     })
 }
 
-/// Query the live ETW session via Win32 `ControlTraceW(QUERY)` and log
-/// `events_lost` / `buffers_written` at info level. Called from
-/// [`EtwGuard::drop`] before the session is stopped.
+/// Last-observed value of each cumulative loss counter
+/// [`EVENT_TRACE_PROPERTIES`] reports, so a caller ticking
+/// [`query_session_stats`] repeatedly can escalate only on a genuine
+/// change instead of re-warning forever once a counter goes nonzero.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct LastSeenLoss {
+    events_lost: u32,
+    real_time_buffers_lost: u32,
+}
+
+/// Decide whether a fresh stats reading is worth escalating to `warn!`,
+/// and advance `last` to the fresh reading either way.
 ///
-/// This is a cross-check for the [`TCPIP_KEYWORDS`] widening: if the
-/// widened subscription overruns the kernel ring buffer, the lost
-/// events count surfaces in bridge.log as diagnostic signal (and a
-/// prompt to raise `buffer_size` further).
+/// Compares by inequality (`!=`), not `>`: both counters are monotonic
+/// cumulative counts for the life of the session, so a `current < last`
+/// reading can only mean a `u32` wraparound, and `>` would silently treat
+/// that as "no increase" — resetting the escalation baseline to a lower
+/// value and requiring loss to climb back above the pre-wrap high-water
+/// mark before warning again. `!=` still registers a post-wrap value as a
+/// change. Both counters get identical treatment; there is no reason for
+/// `real_time_buffers_lost` to re-warn on every unchanged tick while
+/// `events_lost` does not.
+fn should_escalate(last: &mut LastSeenLoss, current_events_lost: u32, current_real_time_buffers_lost: u32) -> bool {
+    let changed =
+        current_events_lost != last.events_lost || current_real_time_buffers_lost != last.real_time_buffers_lost;
+    last.events_lost = current_events_lost;
+    last.real_time_buffers_lost = current_real_time_buffers_lost;
+    changed
+}
+
+/// Cadence for the periodic live-session stats query — see
+/// [`run_periodic_stats`]. Matches the existing `dns::forwarder::SUMMARY_INTERVAL`
+/// precedent elsewhere in this crate.
+const LIVE_STATS_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Session statistics read by [`query_session_stats`]. All four fields are
+/// monotonic cumulative counters for the life of the session (never reset
+/// except by session recreation).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SessionStats {
+    events_lost: u32,
+    buffers_written: u32,
+    log_buffers_lost: u32,
+    real_time_buffers_lost: u32,
+}
+
+/// Query the live ETW session via Win32 `ControlTraceW(QUERY)` — works
+/// against a running session; MSDN does not gate `EVENT_TRACE_CONTROL_QUERY`
+/// on the session stopping. Called both from the periodic timer thread
+/// (`phase = "live"`) and once from [`EtwGuard::drop`] (`phase = "stop"`)
+/// before the session is actually stopped.
 ///
-/// Silently skips on query failure — the guard is in a drop path and
-/// double-panicking would hide the original error.
-fn query_session_stats(session_name: &str) {
+/// Logs nothing on failure — that decision belongs to the caller, since the
+/// one-shot drop-time caller and the repeating periodic caller need
+/// different failure-logging policies (the periodic caller throttles
+/// repeats; see [`live_stats_tick`]). Logs exactly one `info!` on success,
+/// with a phase-tagged message shared by both callers so a shipped line
+/// never claims a phase it isn't in (e.g. a "live" query does not carry an
+/// "at stop" message).
+fn query_session_stats(session_name: &str, phase: &'static str) -> Result<SessionStats, u32> {
     use windows::Win32::Foundation::ERROR_SUCCESS;
     use windows::Win32::System::Diagnostics::Etw::{
         ControlTraceW, CONTROLTRACE_HANDLE, EVENT_TRACE_CONTROL_QUERY, EVENT_TRACE_PROPERTIES, WNODE_FLAG_TRACED_GUID,
@@ -423,26 +550,96 @@ fn query_session_stats(session_name: &str) {
     };
 
     if err != ERROR_SUCCESS {
-        warn!(code = err.0, session = %session_name, "etw: ControlTraceW(QUERY) failed");
-        return;
+        return Err(err.0);
     }
 
     // SAFETY: `props` is a valid `EVENT_TRACE_PROPERTIES` Windows just
     // filled in with session statistics.
-    let (events_lost, buffers_written) = unsafe { ((*props).EventsLost, (*props).BuffersWritten) };
+    let stats = unsafe {
+        SessionStats {
+            events_lost: (*props).EventsLost,
+            buffers_written: (*props).BuffersWritten,
+            log_buffers_lost: (*props).LogBuffersLost,
+            real_time_buffers_lost: (*props).RealTimeBuffersLost,
+        }
+    };
     info!(
+        phase,
         session = %session_name,
-        events_lost,
-        buffers_written,
-        "etw: session stats at stop"
+        events_lost = stats.events_lost,
+        buffers_written = stats.buffers_written,
+        log_buffers_lost = stats.log_buffers_lost,
+        real_time_buffers_lost = stats.real_time_buffers_lost,
+        "etw: session stats"
     );
-    if events_lost > 0 {
-        warn!(
-            session = %session_name,
-            events_lost,
-            "etw: kernel dropped events — consider raising TraceProperties.buffer_size"
-        );
+    Ok(stats)
+}
+
+/// One tick of the periodic live-stats loop: query the live session and
+/// escalate per [`should_escalate`]. Query failures throttle to `debug!`
+/// after the first `warn!` (via `last_query_failed`) — necessary because a
+/// session another bridge instance swept (see [`sweep_stale_sessions`])
+/// turns every subsequent tick into a permanent, expected failure for the
+/// rest of this process's life; without the throttle that floods
+/// `bridge.log` with an identical warning every [`LIVE_STATS_INTERVAL`]
+/// forever.
+fn live_stats_tick(session_name: &str, last_loss: &mut LastSeenLoss, last_query_failed: &mut bool) {
+    match query_session_stats(session_name, "live") {
+        Ok(stats) => {
+            *last_query_failed = false;
+            if should_escalate(last_loss, stats.events_lost, stats.real_time_buffers_lost) {
+                warn!(
+                    phase = "live",
+                    session = %session_name,
+                    events_lost = stats.events_lost,
+                    real_time_buffers_lost = stats.real_time_buffers_lost,
+                    "etw: kernel dropped events — consider raising TraceProperties.buffer_size"
+                );
+            }
+        }
+        Err(code) => {
+            if *last_query_failed {
+                debug!(phase = "live", code, session = %session_name, "etw: ControlTraceW(QUERY) still failing");
+            } else {
+                warn!(phase = "live", code, session = %session_name, "etw: ControlTraceW(QUERY) failed");
+            }
+            *last_query_failed = true;
+        }
     }
+}
+
+/// Blocking loop driving [`live_stats_tick`] on a real, cancellable
+/// interval: `stop_rx.recv_timeout(interval)` blocks until either
+/// `interval` elapses (a `Timeout` — tick) or the sender is dropped (a
+/// `Disconnected` — exit immediately, without waiting out the rest of the
+/// current interval). `on_tick` is a test seam: production passes a no-op
+/// via [`run_periodic_stats`]; a test can observe real ticks by blocking on
+/// a channel this closure sends into, without sleeping.
+fn run_periodic_stats_inner(
+    session_name: String,
+    interval: Duration,
+    stop_rx: mpsc::Receiver<()>,
+    mut on_tick: impl FnMut(u32),
+) {
+    let mut last_loss = LastSeenLoss::default();
+    let mut last_query_failed = false;
+    let mut tick_count = 0u32;
+    loop {
+        match stop_rx.recv_timeout(interval) {
+            Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => return,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                live_stats_tick(&session_name, &mut last_loss, &mut last_query_failed);
+                tick_count += 1;
+                on_tick(tick_count);
+            }
+        }
+    }
+}
+
+/// Production entry point for the periodic live-stats timer thread. See
+/// module doc point 3 and [`run_periodic_stats_inner`].
+pub(crate) fn run_periodic_stats(session_name: String, interval: Duration, stop_rx: mpsc::Receiver<()>) {
+    run_periodic_stats_inner(session_name, interval, stop_rx, |_tick_count| {});
 }
 
 // Stale-session sweep =================================================================================================

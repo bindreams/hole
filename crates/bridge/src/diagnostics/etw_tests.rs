@@ -371,6 +371,140 @@ fn every_dispatch_classified_tcpip_id_has_a_name() {
     }
 }
 
+// should_escalate (bindreams/hole#801) ================================================================================
+
+#[skuld::test]
+fn should_escalate_true_on_first_nonzero_events_lost() {
+    let mut last = LastSeenLoss::default();
+    assert!(should_escalate(&mut last, 1, 0));
+    assert_eq!(last.events_lost, 1);
+}
+
+#[skuld::test]
+fn should_escalate_false_on_unchanged_events_lost() {
+    let mut last = LastSeenLoss::default();
+    assert!(should_escalate(&mut last, 1, 0));
+    assert!(
+        !should_escalate(&mut last, 1, 0),
+        "an unchanged cumulative count must not re-escalate"
+    );
+}
+
+#[skuld::test]
+fn should_escalate_true_again_on_further_increase_in_events_lost() {
+    let mut last = LastSeenLoss::default();
+    assert!(should_escalate(&mut last, 1, 0));
+    assert!(should_escalate(&mut last, 3, 0));
+    assert_eq!(last.events_lost, 3);
+}
+
+#[skuld::test]
+fn should_escalate_true_on_first_nonzero_real_time_buffers_lost() {
+    let mut last = LastSeenLoss::default();
+    assert!(should_escalate(&mut last, 0, 5));
+    assert_eq!(last.real_time_buffers_lost, 5);
+}
+
+#[skuld::test]
+fn should_escalate_false_on_unchanged_real_time_buffers_lost() {
+    let mut last = LastSeenLoss::default();
+    assert!(should_escalate(&mut last, 0, 5));
+    assert!(
+        !should_escalate(&mut last, 0, 5),
+        "real_time_buffers_lost gets the same delta treatment as events_lost — no re-escalation on an unchanged reading"
+    );
+}
+
+#[skuld::test]
+fn should_escalate_true_on_wraparound_decrease() {
+    // A u32 counter wrapping past u32::MAX reads back as a SMALLER value
+    // than the last-seen high-water mark. `>` would silently treat this as
+    // "no increase"; `!=` (what should_escalate actually uses) still
+    // registers it as a change worth escalating.
+    let mut last = LastSeenLoss {
+        events_lost: 100,
+        real_time_buffers_lost: 0,
+    };
+    assert!(should_escalate(&mut last, 5, 0));
+    assert_eq!(last.events_lost, 5);
+}
+
+// run_periodic_stats / run_periodic_stats_inner (bindreams/hole#801) ==================================================
+
+#[skuld::test]
+fn periodic_stats_thread_exits_promptly_on_sender_drop_not_after_the_interval() {
+    let (tx, rx) = std::sync::mpsc::channel::<()>();
+    let handle = std::thread::spawn(move || {
+        run_periodic_stats(
+            "nonexistent-session-for-timing-test".into(),
+            std::time::Duration::from_secs(3600),
+            rx,
+        );
+    });
+    // Wakes the blocked recv_timeout via Disconnected immediately -- if it
+    // instead waited out the 3600s interval, this test would hang, caught
+    // by the shell-level timeout on the test invocation, not by a timeout
+    // wrapped around the join itself.
+    drop(tx);
+    handle.join().expect("periodic stats thread panicked");
+}
+
+#[skuld::test]
+fn periodic_tick_throttles_repeated_query_failures_to_debug() {
+    use crate::test_support::log_capture::VecWriter;
+    use garter::tracing_test::set_default_in_current_thread;
+    use tracing_subscriber::fmt;
+    use tracing_subscriber::layer::{Layer, SubscriberExt};
+
+    let writer = VecWriter::new();
+    let subscriber = tracing_subscriber::registry().with(
+        fmt::layer()
+            .with_writer(writer.clone())
+            .with_ansi(false)
+            .with_filter(tracing_subscriber::filter::LevelFilter::DEBUG),
+    );
+    let _guard = set_default_in_current_thread(subscriber);
+
+    let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
+    let (tick_tx, tick_rx) = std::sync::mpsc::channel::<u32>();
+    // `set_default_in_current_thread` installs a thread-local dispatcher, so
+    // the spawned thread below (where run_periodic_stats_inner actually
+    // logs) needs it propagated explicitly -- a fresh std::thread does not
+    // inherit the spawning thread's tracing default.
+    let dispatch = tracing::dispatcher::get_default(tracing::Dispatch::clone);
+    let handle = std::thread::spawn(move || {
+        tracing::dispatcher::with_default(&dispatch, || {
+            run_periodic_stats_inner(
+                "hole-etw-nonexistent-session-for-tick-test".into(),
+                std::time::Duration::from_millis(5),
+                stop_rx,
+                move |n| {
+                    let _ = tick_tx.send(n);
+                },
+            );
+        });
+    });
+
+    // Block on real tick completions -- a genuine rendezvous on a channel
+    // the production loop itself writes into, not a sleep-then-check.
+    assert_eq!(tick_rx.recv().expect("first tick"), 1);
+    assert_eq!(tick_rx.recv().expect("second tick"), 2);
+
+    drop(stop_tx);
+    handle.join().expect("periodic stats thread panicked");
+
+    let output = writer.snapshot_string();
+    assert_eq!(
+        output.matches("etw: ControlTraceW(QUERY) failed").count(),
+        1,
+        "only the FIRST failed query should warn; got:\n{output}"
+    );
+    assert!(
+        output.contains("etw: ControlTraceW(QUERY) still failing"),
+        "the second failure should throttle to debug; got:\n{output}"
+    );
+}
+
 // parse_socket_address ================================================================================================
 
 #[skuld::test]
