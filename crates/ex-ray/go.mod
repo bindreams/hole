@@ -5,7 +5,7 @@ go 1.25.5
 require (
 	github.com/golang/protobuf v1.5.4
 	github.com/v2fly/v2ray-core/v5 v5.52.0
-	golang.org/x/sys v0.46.0
+	golang.org/x/sys v0.47.0
 	google.golang.org/protobuf v1.36.11
 )
 
@@ -24,6 +24,8 @@ require (
 	github.com/gorilla/websocket v1.5.3 // indirect
 	github.com/klauspost/compress v1.17.4 // indirect
 	github.com/miekg/dns v1.1.72 // indirect
+	github.com/mustafaturan/bus v1.0.2 // indirect
+	github.com/pelletier/go-toml v1.9.5 // indirect
 	github.com/pires/go-proxyproto v0.12.0 // indirect
 	github.com/quic-go/quic-go v0.59.1 // indirect
 	github.com/refraction-networking/utls v1.8.2 // indirect
