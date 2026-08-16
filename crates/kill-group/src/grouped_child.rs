@@ -390,15 +390,17 @@ mod imp {
     fn assign_to_kill_on_close_job(child: &Child) -> Option<HANDLE> {
         // Every failure here degrades tree-reaping to just the direct child
         // (`kill_on_drop`), which would re-orphan grandchildren — so log loudly.
+        // An orphan holding an inherited stdio pipe also blocks any caller that
+        // waits for that pipe to EOF, so the warning names that consequence too.
         let Some(raw) = child.raw_handle() else {
-            tracing::warn!("kill-group: child has no raw handle; process-tree reaping disabled");
+            tracing::warn!("kill-group: child has no raw handle; process-tree reaping disabled (a descendant can keep a pipe open, blocking a caller that waits for EOF)");
             return None;
         };
         unsafe {
             let job = match CreateJobObjectW(None, windows::core::PCWSTR::null()) {
                 Ok(j) => j,
                 Err(e) => {
-                    tracing::warn!(error = %e, "kill-group: CreateJobObjectW failed; process-tree reaping disabled");
+                    tracing::warn!(error = %e, "kill-group: CreateJobObjectW failed; process-tree reaping disabled (a descendant can keep a pipe open, blocking a caller that waits for EOF)");
                     return None;
                 }
             };
@@ -410,12 +412,12 @@ mod imp {
                 std::ptr::addr_of!(info).cast(),
                 std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
             ) {
-                tracing::warn!(error = %e, "kill-group: SetInformationJobObject failed; process-tree reaping disabled");
+                tracing::warn!(error = %e, "kill-group: SetInformationJobObject failed; process-tree reaping disabled (a descendant can keep a pipe open, blocking a caller that waits for EOF)");
                 let _ = CloseHandle(job);
                 return None;
             }
             if let Err(e) = AssignProcessToJobObject(job, HANDLE(raw)) {
-                tracing::warn!(error = %e, "kill-group: AssignProcessToJobObject failed; process-tree reaping disabled");
+                tracing::warn!(error = %e, "kill-group: AssignProcessToJobObject failed; process-tree reaping disabled (a descendant can keep a pipe open, blocking a caller that waits for EOF)");
                 let _ = CloseHandle(job);
                 return None;
             }
