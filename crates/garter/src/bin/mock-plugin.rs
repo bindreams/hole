@@ -71,6 +71,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         if let Ok(opts) = std::env::var("SS_PLUGIN_OPTIONS") {
             eprintln!("mock-plugin: SS_PLUGIN_OPTIONS={opts}");
         }
+        // Echoed in this order (NO_COLOR then CLICOLOR) so a test waiting
+        // on the LAST line is guaranteed both have already been written —
+        // they land as two separate stderr lines / tracing events.
+        eprintln!("mock-plugin: NO_COLOR={:?}", std::env::var("NO_COLOR"));
+        eprintln!("mock-plugin: CLICOLOR={:?}", std::env::var("CLICOLOR"));
+    }
+
+    // Knob: MOCK_PLUGIN_FORCE_ANSI_STDERR — write one ANSI-colored stderr
+    // line unconditionally, ignoring NO_COLOR/CLICOLOR entirely. Simulates
+    // a plugin whose own logging library does NOT honor either convention,
+    // so a consumer test can prove garter's own relay strips ANSI
+    // regardless of the child's cooperation.
+    if std::env::var_os("MOCK_PLUGIN_FORCE_ANSI_STDERR").is_some() {
+        eprintln!("\x1b[31mmock-plugin: colored line\x1b[0m");
     }
 
     // Knob: MOCK_PLUGIN_NO_SITREP — suppress ALL stdout sitrep emits so the
@@ -100,6 +114,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
         sitrep_enabled,
     );
+
+    // Knob: MOCK_PLUGIN_RAW_STDOUT_LINE — print this env var's value
+    // verbatim as one extra stdout line, right after `hello`, then
+    // continue normal startup (bind + `ready`). Lets a test hand-construct
+    // an exact byte sequence (e.g. a sitrep-shaped line with a raw,
+    // unescaped control byte inside a JSON string — illegal per RFC 8259)
+    // without teaching mock-plugin a new fault mode for every shape.
+    if let Ok(raw) = std::env::var("MOCK_PLUGIN_RAW_STDOUT_LINE") {
+        println!("{raw}");
+        use std::io::Write;
+        let _ = std::io::stdout().flush();
+    }
 
     // Fault-injection knob: MOCK_PLUGIN_FAIL=fatal | bind_conflict | bind_conflict_once
     let fail = std::env::var("MOCK_PLUGIN_FAIL").unwrap_or_default();

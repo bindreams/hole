@@ -114,3 +114,18 @@ fn fixed_env_sets_gotraceback_crash() {
         "GOTRACEBACK=crash must be injected: {pairs:?}"
     );
 }
+
+#[skuld::test]
+fn fixed_env_sets_no_color() {
+    // Regression pin: fixed_plugin_env must inject both NO_COLOR and
+    // CLICOLOR (see the doc comment on fixed_plugin_env for why).
+    let pairs = crate::binary::fixed_plugin_env();
+    assert!(
+        pairs.iter().any(|(k, v)| *k == "NO_COLOR" && *v == "1"),
+        "NO_COLOR=1 must be injected: {pairs:?}"
+    );
+    assert!(
+        pairs.iter().any(|(k, v)| *k == "CLICOLOR" && *v == "0"),
+        "CLICOLOR=0 must be injected: {pairs:?}"
+    );
+}

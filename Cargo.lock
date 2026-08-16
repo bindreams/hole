@@ -2482,6 +2482,7 @@ dependencies = [
  "hole-test-observability",
  "kill-group",
  "libc",
+ "regex",
  "semver",
  "serde",
  "serde_json",

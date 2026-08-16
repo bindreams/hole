@@ -11,6 +11,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::oneshot;
 
 use garter::{BinaryPlugin, ChainRunner, PluginEnv};
+use skuld::env;
 
 mod common;
 use common::mock_plugin_path;
@@ -980,6 +981,29 @@ async fn wait_for_sunk_line(
     .unwrap_or(false)
 }
 
+/// Like `wait_for_sunk_line`, but returns every line received up to and
+/// including the first one matching `pred` — for tests that need to assert
+/// on exact content (not just presence), or on more than one preceding
+/// line once the predicate's line is known to have arrived.
+async fn collect_sunk_lines_until(
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<String>,
+    pred: impl Fn(&str) -> bool,
+) -> Vec<String> {
+    tokio::time::timeout(Duration::from_secs(3), async {
+        let mut collected = Vec::new();
+        while let Some(line) = rx.recv().await {
+            let matched = pred(&line);
+            collected.push(line);
+            if matched {
+                return collected;
+            }
+        }
+        collected
+    })
+    .await
+    .unwrap_or_default()
+}
+
 /// Tier-2 `Probe` mode's stdout task is a pure passthrough that never parses
 /// a frame — unlike `ExpectSitrep`'s reader, it does not sink-then-parse in
 /// one step, so the sink call is the only thing distinguishing "relayed" from
@@ -1135,6 +1159,170 @@ async fn log_sink_receives_lines_drained_after_version_skew_fallback() {
     );
 
     echo_task.abort();
+    chain_task.abort();
+}
+
+/// Garter's own relay must strip ANSI SGR escapes even from a plugin that
+/// never checks `NO_COLOR` itself — the guarantee this codebase owns, not
+/// one that merely hopes a child cooperates. `MOCK_PLUGIN_FORCE_ANSI_STDERR`
+/// writes a colored line unconditionally, ignoring `NO_COLOR`/`CLICOLOR`
+/// entirely, to prove exactly that.
+#[skuld::test]
+async fn stderr_relay_strips_ansi_even_from_an_uncooperative_child() {
+    let mock_path = mock_plugin_path();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let sink: garter::LogSink = Arc::new(move |line: &str| {
+        let _ = tx.send(line.to_string());
+    });
+
+    let chain_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let chain_local = chain_listener.local_addr().unwrap();
+    drop(chain_listener);
+
+    let (ready_tx, ready_rx) = oneshot::channel();
+    let runner = ChainRunner::new()
+        .add(Box::new(
+            BinaryPlugin::new(&mock_path, None)
+                .readiness(garter::binary::ReadinessMode::ExpectSitrep)
+                .env("MOCK_PLUGIN_FORCE_ANSI_STDERR", "1")
+                .log_sink(sink),
+        ))
+        .on_ready(ready_tx)
+        .drain_timeout(Duration::from_secs(3));
+
+    let env = PluginEnv {
+        local_host: chain_local.ip(),
+        local_port: chain_local.port(),
+        remote_host: "127.0.0.1".to_string(),
+        remote_port: 9,
+        plugin_options: None,
+    };
+    let chain_task = tokio::spawn(async move { runner.run(env).await });
+    ready_rx.await.expect("aggregator should send").expect("chain ready");
+
+    let collected = collect_sunk_lines_until(&mut rx, |l| l.contains("colored line")).await;
+    let colored = collected
+        .iter()
+        .find(|l| l.contains("colored line"))
+        .unwrap_or_else(|| panic!("the forced-color line must reach the sink; got {collected:?}"));
+    assert_eq!(
+        colored, "mock-plugin: colored line",
+        "garter's relay must strip the ANSI SGR codes even though the child never checked NO_COLOR"
+    );
+    assert!(!colored.contains('\u{1b}'), "no raw ESC byte may remain: {colored:?}");
+
+    chain_task.abort();
+}
+
+/// `NO_COLOR=1`/`CLICOLOR=0` (`fixed_plugin_env`) must reach the real child
+/// process env, not merely exist in the static array — the cheap first
+/// line of defense (`tracing-subscriber`, which galoshes uses, already
+/// honors `NO_COLOR`; the sibling test above proves garter's own strip as
+/// the backstop for a plugin that doesn't). Clears any ambient value from
+/// the process first via the `env` fixture (`skuld::EnvGuard`, itself
+/// `serial` — environment variables are process-global, so this cannot
+/// run concurrently with a sibling test under a non-nextest, multi-threaded
+/// `cargo test` either) so the assertion can only pass via injection, never
+/// via inheritance from a CI/dev-shell env; the fixture reverts both vars
+/// on drop.
+#[skuld::test]
+async fn no_color_and_clicolor_reach_the_real_child(#[fixture] env: &skuld::EnvGuard) {
+    env.remove("NO_COLOR");
+    env.remove("CLICOLOR");
+
+    let mock_path = mock_plugin_path();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let sink: garter::LogSink = Arc::new(move |line: &str| {
+        let _ = tx.send(line.to_string());
+    });
+
+    let chain_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let chain_local = chain_listener.local_addr().unwrap();
+    drop(chain_listener);
+
+    let (ready_tx, ready_rx) = oneshot::channel();
+    let runner = ChainRunner::new()
+        .add(Box::new(
+            BinaryPlugin::new(&mock_path, None)
+                .readiness(garter::binary::ReadinessMode::ExpectSitrep)
+                .env("MOCK_PLUGIN_ECHO_ENV", "1")
+                .log_sink(sink),
+        ))
+        .on_ready(ready_tx)
+        .drain_timeout(Duration::from_secs(3));
+
+    let plugin_env = PluginEnv {
+        local_host: chain_local.ip(),
+        local_port: chain_local.port(),
+        remote_host: "127.0.0.1".to_string(),
+        remote_port: 9,
+        plugin_options: None,
+    };
+    let chain_task = tokio::spawn(async move { runner.run(plugin_env).await });
+    ready_rx.await.expect("aggregator should send").expect("chain ready");
+
+    // CLICOLOR is echoed AFTER NO_COLOR (see mock-plugin.rs), so waiting on
+    // it guarantees both lines have already been sunk.
+    let collected = collect_sunk_lines_until(&mut rx, |l| l.contains("mock-plugin: CLICOLOR=")).await;
+    assert!(
+        collected.iter().any(|l| l == r#"mock-plugin: NO_COLOR=Ok("1")"#),
+        "NO_COLOR must reach the child's real env; got {collected:?}"
+    );
+    assert!(
+        collected.iter().any(|l| l == r#"mock-plugin: CLICOLOR=Ok("0")"#),
+        "CLICOLOR must reach the child's real env; got {collected:?}"
+    );
+
+    chain_task.abort();
+}
+
+/// `sitrep::parse_event` must see the UNTOUCHED line, never the
+/// ANSI-stripped display copy. A
+/// raw, unescaped ESC byte inside a JSON string is illegal per RFC 8259 —
+/// `serde_json` (confirmed directly) rejects it, so this line must stay
+/// inert log passthrough and the chain must ready normally. The embedded
+/// `\x1b[31m` is a COMPLETE SGR sequence, so stripping it turns the line
+/// into syntactically valid JSON that WOULD parse as a real `Fatal` event
+/// (confirmed directly too) — if the strip ever ran ahead of the parser,
+/// this test's `ready_rx` would resolve to `Err(StartError::Fatal(..))`
+/// instead of readying, and the assertion below would fail.
+#[skuld::test]
+async fn sitrep_parser_sees_the_line_before_any_ansi_strip() {
+    let mock_path = mock_plugin_path();
+
+    let chain_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let chain_local = chain_listener.local_addr().unwrap();
+    drop(chain_listener);
+
+    let malformed = "{\"event\":\"fatal\",\"detail\":\"conn \x1b[31m failed: timeout\"}";
+
+    let (ready_tx, ready_rx) = oneshot::channel();
+    let runner = ChainRunner::new()
+        .add(Box::new(
+            BinaryPlugin::new(&mock_path, None)
+                .readiness(garter::binary::ReadinessMode::ExpectSitrep)
+                .env("MOCK_PLUGIN_RAW_STDOUT_LINE", malformed),
+        ))
+        .on_ready(ready_tx)
+        .drain_timeout(Duration::from_secs(3));
+
+    let env = PluginEnv {
+        local_host: chain_local.ip(),
+        local_port: chain_local.port(),
+        remote_host: "127.0.0.1".to_string(),
+        remote_port: 9,
+        plugin_options: None,
+    };
+    let chain_task = tokio::spawn(async move { runner.run(env).await });
+
+    let outcome = ready_rx.await.expect("aggregator should send");
+    assert!(
+        outcome.is_ok(),
+        "the malformed line must stay inert passthrough (parse_event must see the RAW line, \
+         not an ANSI-stripped one); got {outcome:?} — Err(Fatal) here means the strip ran \
+         ahead of the parser"
+    );
+
     chain_task.abort();
 }
 

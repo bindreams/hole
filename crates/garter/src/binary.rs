@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -73,7 +74,10 @@ pub type PidSink = Arc<dyn Fn(u32) + Send + Sync>;
 /// Sink for a plugin's raw log lines, mirroring [`PidSink`]. Invoked for EVERY
 /// line the child writes to stdout or stderr — including lines the sitrep
 /// reader goes on to parse as protocol events — before any interpretation.
-/// Lines are handed over unparsed and unclassified.
+/// Lines are unparsed and unclassified, except that any ANSI SGR (color)
+/// escape sequences are already stripped (see `ansi::strip_sgr`) — the
+/// sink never sees what `sitrep::parse_event` sees, which is the untouched
+/// original.
 pub type LogSink = Arc<dyn Fn(&str) + Send + Sync>;
 
 /// A plugin backed by an external SIP003u binary.
@@ -160,9 +164,12 @@ impl BinaryPlugin {
 /// process, independent of SIP003 config. `GOTRACEBACK=crash` makes a Go
 /// plugin (ex-ray) dump full goroutine state to stderr on a native fault
 /// (the bridge relays that stderr through tracing). Harmless to Rust
-/// plugins, which ignore it. See bindreams/hole#438.
+/// plugins, which ignore it. See bindreams/hole#438. `NO_COLOR=1` /
+/// `CLICOLOR=0` strip ANSI a plugin child's logger may write to stderr —
+/// `tracing-subscriber` (galoshes) already honors `NO_COLOR`; ex-ray never
+/// colors, so both are a no-op there.
 pub(crate) fn fixed_plugin_env() -> &'static [(&'static str, &'static str)] {
-    &[("GOTRACEBACK", "crash")]
+    &[("GOTRACEBACK", "crash"), ("NO_COLOR", "1"), ("CLICOLOR", "0")]
 }
 
 fn extract_name(path: &Path) -> String {
@@ -170,6 +177,21 @@ fn extract_name(path: &Path) -> String {
         .and_then(|s| s.to_str())
         .unwrap_or("unknown")
         .to_string()
+}
+
+/// The single choke point every stdout/stderr reader in [`BinaryPlugin::run`]
+/// and [`spawn_sitrep_stdout_reader`] goes through before a line reaches a
+/// [`LogSink`]: strip ANSI SGR escapes once, feed the result to `sink` (if
+/// any), and return it so the caller's own tracing macro — level and
+/// conditionality differ per reader, so that stays inline at each call site
+/// — relays the same ANSI-clean text. A reader that reaches `sink` any other
+/// way bypasses this guarantee; there is currently no such path.
+fn relay_to_sink<'a>(line: &'a str, sink: &Option<LogSink>) -> Cow<'a, str> {
+    let clean = crate::ansi::strip_sgr(line);
+    if let Some(sink) = sink {
+        sink(&clean);
+    }
+    clean
 }
 
 #[async_trait::async_trait]
@@ -237,9 +259,7 @@ impl ChainPlugin for BinaryPlugin {
             loop {
                 match lines.next_line().await {
                     Ok(Some(line)) => {
-                        if let Some(ref sink) = log_sink {
-                            sink(&line);
-                        }
+                        let line = relay_to_sink(&line, &log_sink);
                         tracing::warn!(plugin = %plugin_name, "{line}");
                     }
                     Ok(None) => break, // EOF
@@ -269,9 +289,7 @@ impl ChainPlugin for BinaryPlugin {
                     loop {
                         match lines.next_line().await {
                             Ok(Some(line)) => {
-                                if let Some(ref sink) = log_sink {
-                                    sink(&line);
-                                }
+                                let line = relay_to_sink(&line, &log_sink);
                                 tracing::info!(plugin = %plugin_name, "{line}");
                             }
                             Ok(None) => break, // EOF
@@ -444,10 +462,12 @@ fn spawn_sitrep_stdout_reader(
                     // Sink BEFORE parsing: the arms below consume lines that
                     // would otherwise never reach a consumer — a post-ready
                     // `fatal` finds the readiness one-shot already taken and
-                    // falls through with no relay at all.
-                    if let Some(ref sink) = log_sink {
-                        sink(&line);
-                    }
+                    // falls through with no relay at all. `relay_to_sink`
+                    // gives the sink the ANSI-stripped display copy;
+                    // `parse_event` below gets the untouched original —
+                    // never strip ahead of the parser (see `ansi` module
+                    // doc for why).
+                    let clean_line = relay_to_sink(&line, &log_sink);
                     match crate::sitrep::parse_event(&line) {
                         Ok(Some(SitrepEvent::Hello { protocol })) => {
                             match crate::sitrep::protocol_support(&protocol) {
@@ -508,7 +528,7 @@ fn spawn_sitrep_stdout_reader(
                             }
                         }
                         // log line / pre-handshake / unknown event → passthrough
-                        _ => tracing::info!(plugin = %plugin_name, "{line}"),
+                        _ => tracing::info!(plugin = %plugin_name, "{clean_line}"),
                     }
                 }
                 Ok(None) => break, // EOF
@@ -548,9 +568,7 @@ async fn drain_remaining_logs(
     log_sink: &Option<LogSink>,
 ) {
     while let Ok(Some(line)) = lines.next_line().await {
-        if let Some(sink) = log_sink {
-            sink(&line);
-        }
+        let line = relay_to_sink(&line, log_sink);
         tracing::info!(plugin = %plugin_name, "{line}");
     }
 }
