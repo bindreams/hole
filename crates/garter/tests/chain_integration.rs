@@ -927,6 +927,38 @@ async fn run_drains_stdout_before_returning_with_a_pipe_holding_grandchild() {
     );
 }
 
+/// `Probe` is the default mode and the bridge's mode for unknown plugins, and it
+/// is the one shape where the reader touches readiness not at all: the sender
+/// lives in the self-probe task outright. Draining the reader therefore proves
+/// nothing here — only waiting for the probe does.
+#[skuld::test]
+async fn probe_readiness_is_final_when_run_returns() {
+    let mock_path = mock_plugin_path();
+    let (control, control_addr) = grandchild_control().await;
+
+    let local = free_loopback_addr().await;
+    let (handle, mut ready_rx) = spawn_run(
+        // No `.readiness(..)`: `Probe` is the default, and asserting it here
+        // would hide a default change rather than exercise it.
+        BinaryPlugin::new(&mock_path, None)
+            .env("MOCK_PLUGIN_SPAWN_GRANDCHILD", control_addr)
+            .env("MOCK_PLUGIN_FAIL", "exit_silently"),
+        local,
+        "127.0.0.1:9".parse().unwrap(),
+    );
+
+    let _held = control
+        .accept()
+        .await
+        .expect("grandchild should dial the control channel");
+
+    let _ = handle.await.expect("plugin task panicked");
+    assert!(
+        matches!(ready_rx.try_recv(), Err(oneshot::error::TryRecvError::Closed)),
+        "run returned while the Probe-mode self-probe still owned the readiness sender"
+    );
+}
+
 /// `Auto` runs a self-probe that CO-OWNS the readiness sender from the start, so
 /// draining the reader alone leaves the outcome unresolved: with the child gone
 /// the probe would poll a listener that will never exist, holding its half of the
@@ -993,7 +1025,7 @@ async fn tier2_fallback_readiness_is_final_when_run_returns() {
     );
 }
 
-/// The property #794/#795 rebuild on: the typed error a plugin emitted before
+/// The property bindreams/hole#794 and #795 rebuild on: the typed error a plugin emitted before
 /// dying is in its channel, and every line it wrote is in the sink, by the time
 /// `run` returns.
 ///

@@ -136,8 +136,13 @@ impl GroupedChild {
         imp::signal_group_term(self)
     }
 
-    /// Hard-kill the whole tree and reap the direct child. Safe to call after
-    /// the child already exited.
+    /// Hard-kill the whole tree and reap the direct child. Callable after the
+    /// child already exited — with one Unix caveat it shares with
+    /// [`term_group`]: the group id IS the leader's pid, so once the leader has
+    /// been reaped AND no descendant is left in the group, the id is free for
+    /// reuse and `kill(-pgid)` could reach an unrelated group. While any
+    /// descendant remains — the only case where the group kill has anything to
+    /// do — the group is still alive and its id is still pinned.
     pub async fn kill_tree(&mut self) {
         // Errors ignored: the child may already be gone, which is the goal state.
         self.group.kill();

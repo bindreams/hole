@@ -194,6 +194,16 @@ fn relay_to_sink<'a>(line: &'a str, sink: &Option<LogSink>) -> Cow<'a, str> {
     clean
 }
 
+/// Fires a [`tokio::sync::Notify`] when dropped, so a task's completion signal
+/// survives the task unwinding or being aborted — not only returning normally.
+struct SignalOnDrop(Arc<tokio::sync::Notify>);
+
+impl Drop for SignalOnDrop {
+    fn drop(&mut self) {
+        self.0.notify_one();
+    }
+}
+
 #[async_trait::async_trait]
 impl ChainPlugin for BinaryPlugin {
     fn name(&self) -> &str {
@@ -251,8 +261,12 @@ impl ChainPlugin for BinaryPlugin {
         let plugin_name = self.name.clone();
         let log_sink = self.log_sink.clone();
         let stderr_done = Arc::new(tokio::sync::Notify::new());
-        let stderr_done_signal = Arc::clone(&stderr_done);
+        let stderr_done_signal = SignalOnDrop(Arc::clone(&stderr_done));
         let stderr_task = tokio::spawn(async move {
+            // Signalled on unwind and on abort too: the stdout reader waits on
+            // this with no bound, and `relay_to_sink` runs a consumer-supplied
+            // `LogSink` that garter cannot assume is panic-free.
+            let _stderr_done = stderr_done_signal;
             let reader = BufReader::new(stderr);
             let mut lines = reader.lines();
             loop {
@@ -268,7 +282,6 @@ impl ChainPlugin for BinaryPlugin {
                     }
                 }
             }
-            stderr_done_signal.notify_one();
         });
 
         // Every task that can still resolve readiness is owned HERE, not by the
@@ -347,9 +360,6 @@ impl ChainPlugin for BinaryPlugin {
                 probe_tx.clone(),
             ),
         };
-        // Drop `run`'s own sender: the reader is then the last holder, so the
-        // drain terminates once it has ended.
-        drop(probe_tx);
 
         // Wait for child exit or shutdown signal.
         //
@@ -364,8 +374,10 @@ impl ChainPlugin for BinaryPlugin {
         let drain_timeout = std::time::Duration::from_secs(5);
         tokio::select! {
             status = gc.child.wait() => {
-                let status = status?;
+                // Drain BEFORE inspecting `status`: readiness must be final on
+                // every exit from `run`, including a `wait()` that itself failed.
                 reap_and_drain(&mut gc, &probe_standdown, stdout_task, stderr_task, &mut probe_rx).await;
+                let status = status?;
                 if status.success() {
                     Ok(())
                 } else {
@@ -382,21 +394,25 @@ impl ChainPlugin for BinaryPlugin {
             }
             _ = shutdown.cancelled() => {
                 tracing::info!(plugin = %self.name, "shutting down");
-                // Force path force-kills the direct child; `gc` dropping at the
-                // end of `run` (or on task abort) reaps the whole tree.
-                shutdown::graceful_stop(&mut gc.child, drain_timeout).await?;
+                // Force path force-kills the direct child; `reap_and_drain` below
+                // takes the rest of the tree. Its result is held, not `?`-ed:
+                // readiness must be final on every exit from `run`, and
+                // `graceful_stop` is fallible (a Windows console-event error, an
+                // io error from wait/kill).
+                let stopped = shutdown::graceful_stop(&mut gc.child, drain_timeout).await;
                 reap_and_drain(&mut gc, &probe_standdown, stdout_task, stderr_task, &mut probe_rx).await;
-                Ok(())
+                stopped
             }
         }
     }
 }
 
 /// Reap the plugin's process tree, then wait for every task that can still
-/// resolve this plugin's readiness. Both `run` arms end here, so the guarantee
-/// — when `run` returns, the readiness outcome is FINAL — does not depend on
-/// which arm an already-dead child happened to be handled by (`select!` is
-/// unbiased).
+/// resolve this plugin's readiness. EVERY exit from `run` ends here — both
+/// `select!` arms and both their error paths — so the guarantee (when `run`
+/// returns, the readiness outcome is FINAL) depends neither on which arm an
+/// already-dead child was handled by (`select!` is unbiased) nor on the arm
+/// succeeding.
 ///
 /// **The reap is what makes the wait terminate.** A dead direct child does NOT
 /// close its stdout/stderr: any descendant that inherited its stdio holds a
@@ -423,7 +439,10 @@ async fn reap_and_drain(
     gc.kill_tree().await;
     probe_standdown.cancel();
     let _ = tokio::join!(stdout_task, stderr_task);
-    // Reachable only after the reader ended: it held the last sender.
+    // Close rather than rely on every sender having been dropped: the reader (the
+    // only task that spawns a probe mid-stream) has ended, so no send can still be
+    // coming, and `recv` then drains what is buffered and stops.
+    probes.close();
     while let Some(probe) = probes.recv().await {
         let _ = probe.await;
     }
@@ -475,8 +494,9 @@ fn spawn_shared_probe(
 /// a non-sitrep plugin (including one silent on stdout) is still readied by the
 /// probe. Non-event lines pass through to tracing as logs. On stdout EOF without
 /// ever sending, the sender drops unsent → the chain aggregator synthesizes a
-/// process-exit failure (the intended backstop) — bounded on `stderr_done` first
-/// (see its call site), so a crash whose last words land on stderr is not
+/// process-exit failure (the intended backstop) — waiting on `stderr_done` first
+/// (unbounded, on the same guarantor as this reader's own EOF: see
+/// [`reap_and_drain`]), so a crash whose last words land on stderr is not
 /// reported as if the plugin said nothing.
 #[allow(clippy::too_many_arguments)] // 9 args — bundling into a struct adds more noise than the warning.
 fn spawn_sitrep_stdout_reader(
