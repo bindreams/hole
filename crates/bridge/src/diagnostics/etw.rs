@@ -182,6 +182,49 @@ mod tcpip_events {
     pub const SEND_RETRANSMIT_ROUND: u16 = 1077;
 }
 
+/// TCPIP event IDs from [`tcpip_events`] mapped to the Microsoft manifest's
+/// `symbol` attribute — the human-readable name `Get-WinEvent` and MSDN both
+/// use for these events. Sourced from `Microsoft-Windows-TCPIP.xml`'s
+/// `<event value=... symbol=...>` elements (both versions of an event share
+/// one symbol, so the base non-`_V1` form covers either). This is the single
+/// source of truth [`event_name`] reads from; keep it in sync with
+/// `dispatch`'s TCPIP match arms below — a unit test in `etw_tests.rs`
+/// enumerates the full `u16` ID space through `dispatch` and fails if an ID
+/// classified there has no entry here.
+const TCPIP_EVENT_NAMES: &[(u16, &str)] = &[
+    (tcpip_events::TCB_CONNECT_REQUESTED, "TcpRequestConnect"),
+    (tcpip_events::TCB_SYN_SEND, "TcpTcbSynSend"),
+    (tcpip_events::ACCEPT_COMPLETED, "TcpAcceptListenerComplete"),
+    (tcpip_events::CONNECT_RESTRICTED_SEND, "TcpConnectTcbProceeding"),
+    (tcpip_events::CONNECT_COMPLETED, "TcpConnectTcbComplete"),
+    (tcpip_events::CONNECT_ATTEMPT_FAILED, "TcpConnectTcbFailure"),
+    (tcpip_events::CLOSE_ISSUED, "TcpCloseTcbRequest"),
+    (tcpip_events::ABORT_ISSUED, "TcpAbortTcbRequest"),
+    (tcpip_events::ABORT_COMPLETED, "TcpAbortTcbComplete"),
+    (tcpip_events::DISCONNECT_COMPLETED, "TcpDisconnectTcbComplete"),
+    (tcpip_events::CONNECT_REQUEST_TIMEOUT, "TcpConnectTcbTimeout"),
+    (tcpip_events::RETRANSMIT_TIMEOUT, "TcpDisconnectTcbRtoTimeout"),
+    (tcpip_events::KEEPALIVE_TIMEOUT, "TcpDisconnectTcbKeepaliveTimeout"),
+    (tcpip_events::DISCONNECT_TIMEOUT, "TcpDisconnectTcbTimeout"),
+    (tcpip_events::SEND_RETRANSMIT_ROUND, "TcpDataTransferRetransmitRound"),
+];
+
+/// Look up the symbolic name for an event, gated on provider the same way
+/// [`dispatch`] gates TCPIP-specific classification — AFD and WFP recycle
+/// small event-id integers that collide with TCPIP's, so a bare `event_id`
+/// lookup without the provider check would misname them. Returns `None`
+/// (rendered `~` in `bridge.log`) for a non-TCPIP provider or a TCPIP
+/// `event_id` outside [`TCPIP_EVENT_NAMES`].
+pub(crate) fn event_name(provider: GUID, event_id: u16) -> Option<&'static str> {
+    if !is_tcpip_provider(provider) {
+        return None;
+    }
+    TCPIP_EVENT_NAMES
+        .iter()
+        .find(|(id, _)| *id == event_id)
+        .map(|(_, name)| *name)
+}
+
 /// TCPIP event IDs observed at high volume that are not individually
 /// useful — high-rate data-plane or internal-bookkeeping events.
 /// Dropped inside [`dispatch`] to keep `HOLE_BRIDGE_LOG=debug` output
@@ -442,16 +485,16 @@ pub(crate) unsafe fn read_wide_string(ptr: *const u16) -> String {
 /// Field coverage notes (per
 /// <https://github.com/repnz/etw-providers-docs/blob/master/Manifests-Win10-18990/Microsoft-Windows-TCPIP.xml>):
 ///
-/// - **1002 `TcbRequestConnect`**: `Tcb`, `LocalAddress`, `LocalPort`,
+/// - **1002 `TcpRequestConnect`**: `Tcb`, `LocalAddress`, `LocalPort`,
 ///   `RemoteAddress`, `RemotePort`, `NewState`, `RexmitCount`.
-/// - **1004 `TcbSynSend`**: `Tcb`, `Seq`, no address/port fields.
-/// - **1031 `ConnectRestrictedSend`**: `Tcb`, `LocalAddress`,
+/// - **1004 `TcpTcbSynSend`**: `Tcb`, `Seq`, no address/port fields.
+/// - **1031 `TcpConnectTcbProceeding`**: `Tcb`, `LocalAddress`,
 ///   `LocalPort`, `RemoteAddress`, `RemotePort`, `Status`.
-/// - **1033 `ConnectTcbComplete`**: `Tcb`, `LocalAddress`, `LocalPort`,
+/// - **1033 `TcpConnectTcbComplete`**: `Tcb`, `LocalAddress`, `LocalPort`,
 ///   `RemoteAddress`, `RemotePort`, `Status`.
-/// - **1045 `ConnectTcbTimeout`**: `Tcb`, `Seq`, `TcbState`.
-/// - **1046 `DisconnectTcbRtoTimeout`**: `Tcb`, `Seq`.
-/// - **1077 `SendRetransmitRound`**: `Tcb`, `SndUna`, `SndNxt`,
+/// - **1045 `TcpConnectTcbTimeout`**: `Tcb`, `Seq`, `TcbState`.
+/// - **1046 `TcpDisconnectTcbRtoTimeout`**: `Tcb`, `Seq`.
+/// - **1077 `TcpDataTransferRetransmitRound`**: `Tcb`, `SndUna`, `SndNxt`,
 ///   `SegmentSize`, `RexmitCount`.
 ///
 /// Every event in the "has address" group above ships its IP and port
@@ -675,6 +718,10 @@ fn socket_addr_field(parser: &Parser, field: &str) -> Option<SocketAddr> {
 #[dump(rename_all = "kebab-case")]
 pub(crate) struct EventView<'a> {
     pub event_id: u16,
+    /// Symbolic event name (e.g. `TcpConnectTcbComplete`), `~` when the
+    /// provider/event_id has no entry in [`TCPIP_EVENT_NAMES`]. See
+    /// [`event_name`].
+    pub name: Option<&'static str>,
     pub opcode: u8,
     pub provider: &'a str,
     /// Kernel TCB correlator — kept third (right after `provider`) so
@@ -694,8 +741,10 @@ pub(crate) struct EventView<'a> {
 /// event message in human-readable form.
 fn emit(emission: Emission, record: &EventRecord, fields: &ParsedFields) {
     let provider = provider_name(record.provider_id());
+    let name = event_name(record.provider_id(), record.event_id());
     let view = EventView {
         event_id: record.event_id(),
+        name,
         opcode: record.opcode(),
         provider: &provider,
         tcb: fields.tcb,

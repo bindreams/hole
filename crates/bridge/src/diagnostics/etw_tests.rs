@@ -293,6 +293,84 @@ fn dispatch_connect_restricted_send_event_is_info() {
     );
 }
 
+// event_name (bindreams/hole#800) =====================================================================================
+
+/// Manifest-verified `(constant, symbol)` pairs, sourced independently from
+/// `Microsoft-Windows-TCPIP.xml`'s `<event value=... symbol=...>` elements —
+/// not from this file's own doc comments, and not from an implementation run.
+const TCPIP_EVENT_NAME_FIXTURES: &[(u16, &str)] = &[
+    (tcpip_events::TCB_CONNECT_REQUESTED, "TcpRequestConnect"),
+    (tcpip_events::TCB_SYN_SEND, "TcpTcbSynSend"),
+    (tcpip_events::ACCEPT_COMPLETED, "TcpAcceptListenerComplete"),
+    (tcpip_events::CONNECT_RESTRICTED_SEND, "TcpConnectTcbProceeding"),
+    (tcpip_events::CONNECT_COMPLETED, "TcpConnectTcbComplete"),
+    (tcpip_events::CONNECT_ATTEMPT_FAILED, "TcpConnectTcbFailure"),
+    (tcpip_events::CLOSE_ISSUED, "TcpCloseTcbRequest"),
+    (tcpip_events::ABORT_ISSUED, "TcpAbortTcbRequest"),
+    (tcpip_events::ABORT_COMPLETED, "TcpAbortTcbComplete"),
+    (tcpip_events::DISCONNECT_COMPLETED, "TcpDisconnectTcbComplete"),
+    (tcpip_events::CONNECT_REQUEST_TIMEOUT, "TcpConnectTcbTimeout"),
+    (tcpip_events::RETRANSMIT_TIMEOUT, "TcpDisconnectTcbRtoTimeout"),
+    (tcpip_events::KEEPALIVE_TIMEOUT, "TcpDisconnectTcbKeepaliveTimeout"),
+    (tcpip_events::DISCONNECT_TIMEOUT, "TcpDisconnectTcbTimeout"),
+    (tcpip_events::SEND_RETRANSMIT_ROUND, "TcpDataTransferRetransmitRound"),
+];
+
+#[skuld::test]
+fn event_name_maps_every_known_tcpip_event_id() {
+    for &(id, symbol) in TCPIP_EVENT_NAME_FIXTURES {
+        assert_eq!(
+            event_name(tcpip_guid(), id),
+            Some(symbol),
+            "event_id={id} expected name {symbol:?}"
+        );
+    }
+}
+
+#[skuld::test]
+fn event_name_unknown_tcpip_id_is_none() {
+    assert_eq!(event_name(tcpip_guid(), 65500), None);
+}
+
+#[skuld::test]
+fn event_name_non_tcpip_provider_is_none_even_for_colliding_id() {
+    // AFD event-id 1004 collides with TCPIP TCB_SYN_SEND; event_name must
+    // gate on provider the same way dispatch's provider gate does.
+    assert_eq!(event_name(afd_guid(), tcpip_events::TCB_SYN_SEND), None);
+}
+
+#[skuld::test]
+fn event_name_table_entries_are_all_dispatch_classified() {
+    // Every ID this file claims to name must actually be something dispatch
+    // classifies (Info/Warn), not silently fall through to Unknown — a
+    // stale table entry for an ID dispatch no longer recognizes would pass
+    // event_name's own lookup but be pointless in the emitted log.
+    for &(id, _) in TCPIP_EVENT_NAME_FIXTURES {
+        let got = dispatch(tcpip_guid(), id, BRIDGE_PID, BRIDGE_PID, &ParsedFields::default());
+        assert!(
+            !matches!(got, None | Some(Emission::Unknown)),
+            "event_id={id} is in TCPIP_EVENT_NAMES but dispatch does not classify it: {got:?}"
+        );
+    }
+}
+
+#[skuld::test]
+fn every_dispatch_classified_tcpip_id_has_a_name() {
+    // The real drift guard: enumerates the ID space independently of
+    // TCPIP_EVENT_NAMES (NOT derived from it), so a future event added only
+    // to dispatch's match — and never mirrored into the name table — fails
+    // this test instead of silently degrading to `name: ~` in bridge.log.
+    for id in 0u16..=u16::MAX {
+        let got = dispatch(tcpip_guid(), id, BRIDGE_PID, BRIDGE_PID, &ParsedFields::default());
+        if !matches!(got, None | Some(Emission::Unknown)) {
+            assert!(
+                event_name(tcpip_guid(), id).is_some(),
+                "dispatch classifies TCPIP event_id={id} as {got:?} but event_name has no entry for it"
+            );
+        }
+    }
+}
+
 // parse_socket_address ================================================================================================
 
 #[skuld::test]
@@ -417,6 +495,7 @@ fn provider_name_known_afd_returns_microsoft_name() {
 fn event_view_dump_uses_kebab_case_keys_and_yaml_primitives() {
     let view = EventView {
         event_id: 1002,
+        name: Some("TcpRequestConnect"),
         opcode: 16,
         provider: "Microsoft-Windows-TCPIP",
         tcb: Some(0x1234_ABCD),
@@ -430,6 +509,7 @@ fn event_view_dump_uses_kebab_case_keys_and_yaml_primitives() {
         yaml,
         "\
 event-id: 1002
+name: TcpRequestConnect
 opcode: 16
 provider: Microsoft-Windows-TCPIP
 tcb: 305441741
@@ -444,6 +524,7 @@ rexmit-count: ~"
 fn event_view_dump_renders_all_none_endpoints_as_tilde() {
     let view = EventView {
         event_id: 1004,
+        name: Some("TcpTcbSynSend"),
         opcode: 1,
         provider: "Microsoft-Windows-TCPIP",
         tcb: Some(42),
@@ -463,6 +544,7 @@ fn event_view_dump_renders_all_none_endpoints_as_tilde() {
 fn event_view_dump_renders_socketaddr_inline_not_nested() {
     let view = EventView {
         event_id: 1033,
+        name: Some("TcpConnectTcbComplete"),
         opcode: 16,
         provider: "Microsoft-Windows-TCPIP",
         tcb: None,
