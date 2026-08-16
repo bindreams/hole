@@ -1004,3 +1004,7 @@ fn provider_name(provider: GUID) -> Cow<'static, str> {
 #[cfg(test)]
 #[path = "etw_tests.rs"]
 mod etw_tests;
+
+#[cfg(test)]
+#[path = "etw_live_privileged_tests.rs"]
+mod etw_live_privileged_tests;
