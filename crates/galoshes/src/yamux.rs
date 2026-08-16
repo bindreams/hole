@@ -271,11 +271,50 @@ fn unspecified_for(target: SocketAddr) -> SocketAddr {
 pub(crate) fn bind_udp(addr: SocketAddr) -> std::io::Result<UdpSocket> {
     // Bind via std so the raw handle is available for the Windows ioctl before
     // the socket is registered with tokio's reactor.
-    let sock = std::net::UdpSocket::bind(addr)?;
+    prepare_udp(std::net::UdpSocket::bind(addr)?)
+}
+
+/// The non-bind half of [`bind_udp`], split out so a caller that classifies bind
+/// failures can route only a real `bind()` error through its classifier — these
+/// steps fail for reasons that have nothing to do with the address.
+pub(crate) fn prepare_udp(sock: std::net::UdpSocket) -> std::io::Result<UdpSocket> {
     sock.set_nonblocking(true)?;
     #[cfg(windows)]
     disable_udp_connreset(&sock)?;
     UdpSocket::from_std(sock)
+}
+
+/// Classify an error from a `bind()` on `addr` for the readiness channel.
+///
+/// A bind race becomes [`garter::StartError::BindConflict`], the only class the
+/// caller retries on a fresh port; everything else is terminal. Feed this only
+/// errors that a `bind()` itself produced — `local_addr()` and socket setup fail
+/// for unrelated reasons and must not be diagnosed as an address conflict.
+/// Report a failed `bind()` on the hop's start-gate channel, and hand the error
+/// back for the lifecycle channel. Both observers see the same failure, by
+/// design: one gates the start, the other drives teardown.
+fn report_bind_failure<A>(
+    bound_addr_tx: Option<oneshot::Sender<std::result::Result<A, garter::StartError>>>,
+    e: std::io::Error,
+    addr: SocketAddr,
+) -> anyhow::Error {
+    if let Some(tx) = bound_addr_tx {
+        let _ = tx.send(Err(bind_start_error(&e, addr)));
+    }
+    anyhow::Error::new(e)
+}
+
+pub(crate) fn bind_start_error(e: &std::io::Error, addr: SocketAddr) -> garter::StartError {
+    if garter::is_bind_race(e) {
+        return garter::StartError::BindConflict {
+            errno: e.raw_os_error().unwrap_or(0),
+            addr,
+        };
+    }
+    garter::StartError::Fatal {
+        detail: format!("could not bind {addr}: {e}"),
+        errno: e.raw_os_error(),
+    }
 }
 
 #[cfg(windows)]
@@ -858,7 +897,7 @@ pub(crate) async fn run_client(
     remote: SocketAddr,
     udp_timeout: Duration,
     shutdown: CancellationToken,
-    bound_addr_tx: Option<oneshot::Sender<ClientBoundAddrs>>,
+    bound_addr_tx: Option<oneshot::Sender<std::result::Result<ClientBoundAddrs, garter::StartError>>>,
     // Test seam (mirrors `bound_addr_tx`): each reconnect decision `(failures,
     // productive)` after a session ends. Production passes `None`.
     reconnect_events: Option<mpsc::UnboundedSender<(u32, bool)>>,
@@ -869,15 +908,38 @@ pub(crate) async fn run_client(
     // churns. Binding per-reconnect would race the previous connection's
     // detached association tasks (which hold `Arc<UdpSocket>` clones) for the
     // port and could fail the rebind, terminating the client.
-    let tcp_listener = TcpListener::bind(local).await.context("bind local TCP")?;
-    let udp_socket = Arc::new(bind_udp(local).context("bind local UDP")?);
+    //
+    // A bind failure is reported on `bound_addr_tx` before returning: it is the
+    // hop's start-gate, and an address conflict there is the one failure the
+    // caller can retry on a fresh port.
+    let tcp_listener = match TcpListener::bind(local).await {
+        Ok(l) => l,
+        Err(e) => return Err(report_bind_failure(bound_addr_tx, e, local).context("bind localTCP")),
+    };
+    let udp_std = match std::net::UdpSocket::bind(local) {
+        Ok(s) => s,
+        Err(e) => return Err(report_bind_failure(bound_addr_tx, e, local).context("bind localUDP")),
+    };
+    let udp_socket = Arc::new(prepare_udp(udp_std).context("prepare local UDP")?);
 
     // Readiness signal: both listeners are up, so the hop is serving.
     if let Some(tx) = bound_addr_tx {
-        let _ = tx.send(ClientBoundAddrs {
-            tcp: tcp_listener.local_addr().context("local tcp addr")?,
-            udp: udp_socket.local_addr().context("local udp addr")?,
-        });
+        let addrs = tcp_listener
+            .local_addr()
+            .and_then(|tcp| udp_socket.local_addr().map(|udp| ClientBoundAddrs { tcp, udp }));
+        match addrs {
+            Ok(addrs) => {
+                let _ = tx.send(Ok(addrs));
+            }
+            // The binds succeeded, so this is not an address conflict.
+            Err(e) => {
+                let _ = tx.send(Err(garter::StartError::Fatal {
+                    detail: format!("could not read the local address of {local}: {e}"),
+                    errno: e.raw_os_error(),
+                }));
+                return Err(anyhow::Error::new(e).context("local addr"));
+            }
+        }
     }
 
     let mut failures: u32 = 0;
@@ -946,7 +1008,7 @@ pub(crate) async fn run_server(
     local: SocketAddr,
     remote: SocketAddr,
     shutdown: CancellationToken,
-    bound_addr_tx: Option<oneshot::Sender<SocketAddr>>,
+    bound_addr_tx: Option<oneshot::Sender<std::result::Result<SocketAddr, garter::StartError>>>,
 ) -> Result<()> {
     run_server_with_connections(config, local, remote, shutdown, bound_addr_tx, serve_underlying).await
 }
@@ -958,22 +1020,39 @@ pub(crate) async fn run_server_with_connections<S, F>(
     local: SocketAddr,
     remote: SocketAddr,
     shutdown: CancellationToken,
-    bound_addr_tx: Option<oneshot::Sender<SocketAddr>>,
+    bound_addr_tx: Option<oneshot::Sender<std::result::Result<SocketAddr, garter::StartError>>>,
     serve: S,
 ) -> Result<()>
 where
     S: Fn(TcpStream, SocketAddr, yamux::Config, SocketAddr, CancellationToken) -> F,
     F: std::future::Future<Output = ()> + Send + 'static,
 {
-    let listener = TcpListener::bind(local)
-        .await
-        .with_context(|| format!("bind yamux server on {local}"))?;
+    // A bind failure is reported on `bound_addr_tx` before returning: it is the
+    // hop's start-gate, and an address conflict there is the one failure the
+    // caller can retry on a fresh port.
+    let listener = match TcpListener::bind(local).await {
+        Ok(l) => l,
+        Err(e) => {
+            return Err(report_bind_failure(bound_addr_tx, e, local).context(format!("bind yamux server on {local}")))
+        }
+    };
     tracing::info!(local = %local, "yamux server listening");
 
     // Readiness signal: the listener is up, so the hop is serving.
     if let Some(tx) = bound_addr_tx {
-        let addr = listener.local_addr().context("local tcp addr")?;
-        let _ = tx.send(addr);
+        match listener.local_addr() {
+            Ok(addr) => {
+                let _ = tx.send(Ok(addr));
+            }
+            // The bind succeeded, so this is not an address conflict.
+            Err(e) => {
+                let _ = tx.send(Err(garter::StartError::Fatal {
+                    detail: format!("could not read the local address of {local}: {e}"),
+                    errno: e.raw_os_error(),
+                }));
+                return Err(anyhow::Error::new(e).context("local tcp addr"));
+            }
+        }
     }
 
     // Every connection task is owned here, never detached: joining them is what
@@ -1252,11 +1331,11 @@ impl garter::ChainPlugin for YamuxPlugin {
         ready: tokio::sync::oneshot::Sender<std::result::Result<garter::PluginReady, garter::StartError>>,
     ) -> garter::Result<()> {
         // Readiness comes from the bind point itself, over the same channel the
-        // tests use: `run_server`/`run_client` send their bound address once
-        // their listeners are up, and a YAMUX plugin serves both TCP and UDP
-        // there. A failed bind drops `ready` unsent (RecvError). Startup is not
-        // gated on `shutdown` here — garter's readiness aggregator is `biased` on
-        // it and owns the "shutdown before ready" outcome for the whole chain.
+        // tests use: `run_server`/`run_client` report their bind outcome once
+        // their listeners are up (or have failed), and a YAMUX plugin serves both
+        // TCP and UDP there. Startup is not gated on `shutdown` here — garter's
+        // readiness aggregator is `biased` on it and owns the "shutdown before
+        // ready" outcome for the whole chain.
         //
         // This is galoshes' INTERNAL hop-readiness signal: it feeds galoshes'
         // OWN `ChainRunner` aggregator, which intersects it with the inner
@@ -1268,21 +1347,11 @@ impl garter::ChainPlugin for YamuxPlugin {
         let transports = garter::Transports::TCP | garter::Transports::UDP;
         let result = if self.is_server {
             let (bound_tx, bound_rx) = oneshot::channel();
-            tokio::spawn(async move {
-                let Ok(listen) = bound_rx.await else { return };
-                let _ = ready.send(Ok(garter::PluginReady { listen, transports }));
-            });
-            run_server(self.config, local, remote, shutdown, Some(bound_tx)).await
+            let run = run_server(self.config, local, remote, shutdown, Some(bound_tx));
+            relay_readiness(run, bound_rx, ready, |addr| *addr, transports).await
         } else {
-            let (bound_tx, bound_rx) = oneshot::channel::<ClientBoundAddrs>();
-            tokio::spawn(async move {
-                let Ok(addrs) = bound_rx.await else { return };
-                let _ = ready.send(Ok(garter::PluginReady {
-                    listen: addrs.tcp,
-                    transports,
-                }));
-            });
-            run_client(
+            let (bound_tx, bound_rx) = oneshot::channel();
+            let run = run_client(
                 self.config,
                 local,
                 remote,
@@ -1290,10 +1359,66 @@ impl garter::ChainPlugin for YamuxPlugin {
                 shutdown,
                 Some(bound_tx),
                 None,
-            )
-            .await
+            );
+            relay_readiness(run, bound_rx, ready, |addrs| addrs.tcp, transports).await
         };
 
         result.map_err(|e| garter::Error::Chain(e.to_string()))
+    }
+}
+
+/// Drive `run_fut`, relaying its bind outcome to `ready` on THIS task.
+///
+/// The relay cannot be detached. `run_fut` completing is what lets the chain
+/// observe this plugin's exit, which cancels the shared shutdown token and sends
+/// the aggregator looking for a readiness outcome; a relay that had merely been
+/// scheduled by then would lose that race and the typed error with it. Awaiting
+/// the runner here instead makes the send ordered: if `run_fut` is ready, the
+/// send it performed before returning has already happened, so `try_recv` sees
+/// it.
+async fn relay_readiness<A, F>(
+    run_fut: F,
+    mut bound_rx: oneshot::Receiver<std::result::Result<A, garter::StartError>>,
+    ready: oneshot::Sender<std::result::Result<garter::PluginReady, garter::StartError>>,
+    listen_of: fn(&A) -> SocketAddr,
+    transports: garter::Transports,
+) -> Result<()>
+where
+    F: std::future::Future<Output = Result<()>>,
+{
+    tokio::pin!(run_fut);
+
+    let mut early: Option<Result<()>> = None;
+    let mut bound = tokio::select! {
+        biased;
+        r = &mut bound_rx => r.ok(),
+        outcome = &mut run_fut => {
+            early = Some(outcome);
+            None
+        }
+    };
+    if early.is_some() {
+        bound = bound_rx.try_recv().ok();
+    }
+
+    match bound {
+        Some(Ok(addrs)) => {
+            let _ = ready.send(Ok(garter::PluginReady {
+                listen: listen_of(&addrs),
+                transports,
+            }));
+        }
+        Some(Err(start_err)) => {
+            let _ = ready.send(Err(start_err));
+        }
+        // Never reached the bind (a panic unwinding through `run_fut`). Dropping
+        // `ready` unsent leaves the chain's synthesized process-exit failure as
+        // the backstop.
+        None => {}
+    }
+
+    match early {
+        Some(outcome) => outcome,
+        None => run_fut.await,
     }
 }

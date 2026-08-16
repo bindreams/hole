@@ -108,6 +108,25 @@ pub fn allocate_ports(count: usize) -> crate::Result<Vec<SocketAddr>> {
     Ok(ports)
 }
 
+/// Whether a bind error is a transient port race rather than a real failure.
+///
+/// `AddrInUse` — another socket holds the port. `PermissionDenied` — Windows
+/// `WSAEACCES`: typically a shift in the TCP dynamic excluded-port range
+/// (Hyper-V / WSL2 / Docker Desktop reservations, visible via
+/// `netsh int ipv4 show excludedportrange`), or another socket claiming the
+/// port with `SO_EXCLUSIVEADDRUSE` on a wildcard interface. `AddrNotAvailable`
+/// — the same excluded-range class, distinct from `WSAEACCES` only in whether
+/// the kernel rejects at the address-reservation or the permission layer.
+///
+/// Retry these on a fresh ephemeral port; report a plugin's as
+/// [`crate::StartError::BindConflict`], the one class the caller retries.
+pub fn is_bind_race(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        std::io::ErrorKind::AddrInUse | std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::AddrNotAvailable
+    )
+}
+
 fn allocate_one_port() -> crate::Result<SocketAddr> {
     for attempt in 0..MAX_PORT_RETRIES {
         let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
@@ -122,24 +141,9 @@ fn allocate_one_port() -> crate::Result<SocketAddr> {
                 drop(l);
                 return Ok(addr);
             }
-            // `AddrInUse` — another socket grabbed the port between drop and rebind.
-            // `PermissionDenied` — Windows `WSAEACCES`: typically a shift in the
-            // TCP dynamic excluded-port range (Hyper-V / WSL2 / Docker Desktop
-            // reservations, visible via `netsh int ipv4 show excludedportrange`),
-            // or another socket claiming the port with `SO_EXCLUSIVEADDRUSE` on a
-            // wildcard interface.
-            // `AddrNotAvailable` — same excluded-port-range class; distinct from
-            // `WSAEACCES` only in whether the kernel rejects the bind at the
-            // address-reservation layer or the permission layer.
-            // All three are transient probe-races; retry on a fresh ephemeral port.
-            Err(e)
-                if matches!(
-                    e.kind(),
-                    std::io::ErrorKind::AddrInUse
-                        | std::io::ErrorKind::PermissionDenied
-                        | std::io::ErrorKind::AddrNotAvailable
-                ) =>
-            {
+            // A socket grabbed the port between drop and rebind, or the
+            // excluded-range tables shifted. Retry on a fresh ephemeral port.
+            Err(e) if is_bind_race(&e) => {
                 tracing::debug!(
                     attempt,
                     port = addr.port(),

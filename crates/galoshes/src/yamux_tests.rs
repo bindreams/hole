@@ -20,12 +20,12 @@ use garter::tracing_test::set_default_in_current_thread;
 
 use crate::yamux::keepalive::Cadence;
 use crate::yamux::{
-    bind_udp, connect_delay, connect_retrying, connection_task_fatal, deframe_udp_datagram, drive_connection,
-    driver_panicked, enable_keepalive, frame_udp_datagram, next_failures, parse_udp_timeout, run_client,
-    run_client_session, run_server, run_server_with_connections, saturating_deadline, serve_driven_connection,
-    session_reconnect_backoff, ClientBoundAddrs, FrameAccumulator, OpenStreamReply, SessionOutcome, SessionTransport,
-    StreamTag, TransportLivenessTap, DEFAULT_UDP_TIMEOUT, KEEPALIVE_NONCE_LEN, LOOPBACK_CONNECT_RETRY,
-    REMOTE_BACKOFF_BASE, REMOTE_BACKOFF_MAX,
+    bind_start_error, bind_udp, connect_delay, connect_retrying, connection_task_fatal, deframe_udp_datagram,
+    drive_connection, driver_panicked, enable_keepalive, frame_udp_datagram, next_failures, parse_udp_timeout,
+    run_client, run_client_session, run_server, run_server_with_connections, saturating_deadline,
+    serve_driven_connection, session_reconnect_backoff, ClientBoundAddrs, FrameAccumulator, OpenStreamReply,
+    SessionOutcome, SessionTransport, StreamTag, TransportLivenessTap, DEFAULT_UDP_TIMEOUT, KEEPALIVE_NONCE_LEN,
+    LOOPBACK_CONNECT_RETRY, REMOTE_BACKOFF_BASE, REMOTE_BACKOFF_MAX,
 };
 
 #[skuld::test]
@@ -279,7 +279,7 @@ async fn setup_relay_inner(upstream: SocketAddr, udp_timeout: Duration) -> (Clie
         shutdown.clone(),
         Some(srv_tx),
     ));
-    let server_addr = srv_rx.await.expect("server bound");
+    let server_addr = srv_rx.await.expect("server bound").expect("server bind succeeded");
 
     let (cli_tx, cli_rx) = oneshot::channel();
     tokio::spawn(run_client(
@@ -291,7 +291,7 @@ async fn setup_relay_inner(upstream: SocketAddr, udp_timeout: Duration) -> (Clie
         Some(cli_tx),
         None,
     ));
-    let addrs = cli_rx.await.expect("client bound");
+    let addrs = cli_rx.await.expect("client bound").expect("client bind succeeded");
 
     (addrs, shutdown)
 }
@@ -710,7 +710,7 @@ async fn spawn_yamux_server(upstream: SocketAddr, shutdown: CancellationToken) -
         shutdown,
         Some(srv_tx),
     ));
-    srv_rx.await.expect("server bound")
+    srv_rx.await.expect("server bound").expect("server bind succeeded")
 }
 
 /// Spawn a yamux client pointed at `remote`, with a typed reconnect observer.
@@ -731,7 +731,10 @@ async fn spawn_yamux_client(
         Some(cli_tx),
         Some(events_tx),
     ));
-    (cli_rx.await.expect("client bound"), events_rx)
+    (
+        cli_rx.await.expect("client bound").expect("client bind succeeded"),
+        events_rx,
+    )
 }
 
 /// One TCP request/response through the client's local listener.
@@ -956,7 +959,7 @@ async fn shutdown_during_backoff_exits_promptly() {
         Some(cli_tx),
         Some(events_tx),
     ));
-    let _ = cli_rx.await.unwrap();
+    let _ = cli_rx.await.unwrap().expect("client bind succeeded");
 
     // Rendezvous (not the assertion): the observer event means the client has
     // reached the reconnect decision and is entering the backoff sleep.
@@ -984,7 +987,7 @@ async fn server_shutdown_is_prompt_while_client_connected() {
         shutdown.clone(),
         Some(srv_tx),
     ));
-    let server_addr = srv_rx.await.expect("server bound");
+    let server_addr = srv_rx.await.expect("server bound").expect("server bind succeeded");
 
     let _conn = TcpStream::connect(server_addr).await.expect("connect server");
     wait_for_log(&writer, "accepted underlying connection").await;
@@ -1010,7 +1013,7 @@ async fn server_serves_a_client_while_an_idle_connection_is_open() {
         shutdown.clone(),
         Some(srv_tx),
     ));
-    let server_addr = srv_rx.await.expect("server bound");
+    let server_addr = srv_rx.await.expect("server bound").expect("server bind succeeded");
 
     // The idle connection. Held for the whole test; never writes a frame.
     let _idle = TcpStream::connect(server_addr).await.expect("connect idle");
@@ -1026,7 +1029,7 @@ async fn server_serves_a_client_while_an_idle_connection_is_open() {
         Some(cli_tx),
         None,
     ));
-    let addrs = cli_rx.await.expect("client bound");
+    let addrs = cli_rx.await.expect("client bound").expect("client bind succeeded");
 
     let mut app = TcpStream::connect(addrs.tcp).await.expect("connect client TCP");
     app.write_all(b"GET / HTTP/1.0\r\n\r\n").await.expect("write request");
@@ -1096,7 +1099,7 @@ async fn server_exits_on_a_panic_and_winds_down_its_other_connections() {
             }
         },
     ));
-    let server_addr = srv_rx.await.expect("server bound");
+    let server_addr = srv_rx.await.expect("server bound").expect("server bind succeeded");
 
     let _sibling = TcpStream::connect(server_addr).await.expect("connect sibling");
     serving_rx.recv().await.expect("sibling is being served");
@@ -1136,7 +1139,7 @@ async fn server_exits_when_the_yamux_driver_panics() {
             serve_driven_connection(peer, remote, shutdown, driver, inbound_rx)
         },
     ));
-    let server_addr = srv_rx.await.expect("server bound");
+    let server_addr = srv_rx.await.expect("server bound").expect("server bind succeeded");
 
     let _conn = TcpStream::connect(server_addr).await.expect("connect server");
 
@@ -1415,4 +1418,180 @@ async fn a_healthy_session_is_kept_alive_by_its_own_probe() {
         !writer.snapshot().contains("keepalive probe substream ended"),
         "the probe must have been answered by `echo_keepalive`, not rejected"
     );
+}
+
+// Bind-failure readiness (#795) =======================================================================================
+
+/// Run a yamux plugin whose bind is expected to fail, to completion.
+async fn run_yamux_plugin_expecting_failure(
+    is_server: bool,
+    local: SocketAddr,
+) -> (
+    garter::Result<()>,
+    oneshot::Receiver<Result<garter::PluginReady, garter::StartError>>,
+) {
+    let (ready_tx, ready_rx) = oneshot::channel();
+    let plugin = Box::new(crate::yamux::YamuxPlugin::new(is_server, DEFAULT_UDP_TIMEOUT));
+    let remote: SocketAddr = "127.0.0.1:9".parse().unwrap();
+    let result = garter::ChainPlugin::run(plugin, local, remote, CancellationToken::new(), ready_tx).await;
+    (result, ready_rx)
+}
+
+/// `try_recv` with no intervening await: the typed error must already be in the
+/// channel when `run` returns, because the plugin task completing is what fires
+/// `record_exit` -> `shutdown.cancel()` -> the aggregator's sweep. A relay that
+/// had merely been scheduled would lose that race.
+#[skuld::test]
+async fn a_yamux_server_reports_bind_conflict_before_run_returns() {
+    let squatter = TcpListener::bind("127.0.0.1:0").await.expect("squat a port");
+    let taken = squatter.local_addr().expect("squatted addr");
+
+    let (result, mut ready_rx) = run_yamux_plugin_expecting_failure(true, taken).await;
+
+    assert!(result.is_err(), "a failed bind must still fail the plugin's run()");
+    match ready_rx.try_recv() {
+        Ok(Err(garter::StartError::BindConflict { errno, addr })) => {
+            assert_eq!(addr, taken, "the conflict must name the address that failed to bind");
+            assert_ne!(errno, 0, "the host-native errno must be carried");
+        }
+        other => panic!("expected a delivered BindConflict, got {other:?}"),
+    }
+}
+
+/// Client mode, TCP listener contended.
+#[skuld::test]
+async fn a_yamux_client_reports_bind_conflict_before_run_returns() {
+    let squatter = TcpListener::bind("127.0.0.1:0").await.expect("squat a port");
+    let taken = squatter.local_addr().expect("squatted addr");
+
+    let (result, mut ready_rx) = run_yamux_plugin_expecting_failure(false, taken).await;
+
+    assert!(result.is_err(), "a failed bind must still fail the plugin's run()");
+    match ready_rx.try_recv() {
+        Ok(Err(garter::StartError::BindConflict { errno, addr })) => {
+            assert_eq!(addr, taken, "the conflict must name the address that failed to bind");
+            assert_ne!(errno, 0, "the host-native errno must be carried");
+        }
+        other => panic!("expected a delivered BindConflict, got {other:?}"),
+    }
+}
+
+/// NOT discriminating, and does not claim to be: nothing guarantees TCP on this
+/// port is free, and `BindConflict { errno, addr }` has no field naming which of
+/// the client's two binds produced it, so a TCP-side failure satisfies it
+/// identically. What it pins is that the UDP bind path reports AT ALL.
+#[skuld::test]
+async fn a_yamux_client_reports_bind_conflict_when_its_udp_port_is_taken() {
+    let squatter = UdpSocket::bind("127.0.0.1:0").await.expect("squat a udp port");
+    let taken = squatter.local_addr().expect("squatted addr");
+
+    let (result, mut ready_rx) = run_yamux_plugin_expecting_failure(false, taken).await;
+
+    assert!(result.is_err(), "a failed bind must still fail the plugin's run()");
+    match ready_rx.try_recv() {
+        Ok(Err(garter::StartError::BindConflict { addr, .. })) => {
+            assert_eq!(addr, taken, "the conflict must name the address that failed to bind");
+        }
+        other => panic!("expected a delivered BindConflict, got {other:?}"),
+    }
+}
+
+/// A contract test, not a red: a current-thread runtime plus the success path's
+/// await on `TcpStream::connect` gives a detached relay room to deliver too.
+#[skuld::test]
+async fn a_yamux_client_reports_ready_once_its_listeners_are_up() {
+    let probe = TcpListener::bind("127.0.0.1:0").await.expect("probe a free port");
+    let free = probe.local_addr().expect("probe addr");
+    drop(probe);
+
+    let (ready_tx, ready_rx) = oneshot::channel();
+    let shutdown = CancellationToken::new();
+    let plugin = Box::new(crate::yamux::YamuxPlugin::new(false, DEFAULT_UDP_TIMEOUT));
+    let remote: SocketAddr = "127.0.0.1:9".parse().unwrap();
+    let running = tokio::spawn(garter::ChainPlugin::run(
+        plugin,
+        free,
+        remote,
+        shutdown.clone(),
+        ready_tx,
+    ));
+
+    match ready_rx.await.expect("readiness must be reported, not dropped") {
+        Ok(garter::PluginReady { listen, transports }) => {
+            assert_eq!(listen, free, "readiness must report the bound TCP address");
+            assert_eq!(
+                transports,
+                garter::Transports::TCP | garter::Transports::UDP,
+                "a yamux hop serves both transports"
+            );
+        }
+        other => panic!("expected PluginReady, got {other:?}"),
+    }
+
+    shutdown.cancel();
+    let _ = running.await.expect("plugin task joined");
+}
+
+#[skuld::test]
+fn a_bind_error_that_is_not_a_conflict_is_fatal() {
+    let addr: SocketAddr = "127.0.0.1:1080".parse().unwrap();
+    let e = std::io::Error::from_raw_os_error(22); // EINVAL / WSAEINVAL
+    match bind_start_error(&e, addr) {
+        garter::StartError::Fatal { errno, .. } => {
+            assert_eq!(errno, Some(22), "the raw OS errno must be carried through");
+        }
+        other => panic!("expected Fatal, got {other:?}"),
+    }
+}
+
+/// The Windows excluded-port-range classes are conflicts too, not fatals: the
+/// port yamux binds came from an allocator that already retries exactly these.
+#[skuld::test]
+fn a_windows_excluded_port_bind_error_is_a_conflict() {
+    let addr: SocketAddr = "127.0.0.1:1080".parse().unwrap();
+    for kind in [
+        std::io::ErrorKind::PermissionDenied,
+        std::io::ErrorKind::AddrNotAvailable,
+        std::io::ErrorKind::AddrInUse,
+    ] {
+        let e = std::io::Error::new(kind, "injected");
+        assert!(
+            matches!(bind_start_error(&e, addr), garter::StartError::BindConflict { .. }),
+            "{kind:?} must classify as a retryable bind conflict"
+        );
+    }
+}
+
+/// End to end through a real `ChainRunner`: the aggregator must see the typed
+/// error rather than the synthesized process-exit placeholder. Pre-fix this is
+/// flaky rather than reliably red — that flakiness IS the defect.
+#[skuld::test]
+async fn a_yamux_bind_conflict_reaches_chain_on_ready() {
+    let squatter = TcpListener::bind("127.0.0.1:0").await.expect("squat a port");
+    let taken = squatter.local_addr().expect("squatted addr");
+
+    let (ready_tx, ready_rx) = oneshot::channel();
+    let runner = garter::ChainRunner::new()
+        .add(Box::new(crate::yamux::YamuxPlugin::new(false, DEFAULT_UDP_TIMEOUT)))
+        .on_ready(ready_tx)
+        .drain_timeout(Duration::from_secs(3));
+
+    let env = garter::PluginEnv {
+        local_host: taken.ip(),
+        local_port: taken.port(),
+        remote_host: "127.0.0.1".to_string(),
+        remote_port: 9,
+        plugin_options: None,
+    };
+    let chain = tokio::spawn(async move { runner.run(env).await });
+
+    match ready_rx.await.expect("the aggregator must report, not drop") {
+        Err(garter::StartError::BindConflict { addr, .. }) => {
+            assert_eq!(addr, taken, "the chain must surface the plugin's own conflict");
+        }
+        other => panic!("expected BindConflict at the chain level, got {other:?}"),
+    }
+
+    chain.abort();
+    let _ = chain.await;
 }

@@ -14,7 +14,7 @@ pub mod test_utils;
 pub mod tracing_test;
 
 pub use binary::{BinaryPlugin, LogSink, PidSink, ReadinessMode};
-pub use chain::{ChainReady, ChainRunner, Mode};
+pub use chain::{is_bind_race, ChainReady, ChainRunner, Mode};
 pub use counting::{ByteCounters, CountingStream, StreamCounters};
 pub use error::{Error, Result};
 pub use plugin::ChainPlugin;
