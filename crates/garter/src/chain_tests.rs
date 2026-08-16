@@ -1056,3 +1056,322 @@ async fn aggregator_drops_ready_tx_when_shutdown_preempts_a_closed_receiver() {
         "a sender dropped unsent must not become a synthesized Fatal in this arm"
     );
 }
+
+/// #794 itself: a typed error in a LATER plugin's channel must not wait on an
+/// earlier plugin that has neither reported nor dropped its sender. Pre-fix the
+/// aggregator parks on index 0 forever and this HANGS.
+#[skuld::test]
+async fn aggregator_reports_a_later_plugins_error_while_an_earlier_one_is_still_starting() {
+    let (_tx0, rx0) = oneshot::channel::<Result<PluginReady, StartError>>();
+    let (tx1, rx1) = oneshot::channel();
+    let (ready_tx, ready_rx) = oneshot::channel();
+    let shutdown = CancellationToken::new();
+
+    tx1.send(Err(StartError::BindConflict {
+        errno: 98,
+        addr: "127.0.0.1:1080".parse().unwrap(),
+    }))
+    .unwrap();
+
+    run_readiness_aggregator(
+        vec![(0, rx0), (1, rx1)],
+        2,
+        crate::chain::Mode::Client,
+        shutdown,
+        ready_tx,
+    )
+    .await;
+
+    match ready_rx.await.expect("a later plugin's error must be reported") {
+        Err(StartError::BindConflict { errno, .. }) => assert_eq!(errno, 98),
+        other => panic!("expected the later plugin's BindConflict, got {other:?}"),
+    }
+}
+
+/// A plugin exiting unsent must not bury a sibling's real failure under the
+/// generic placeholder. Both receivers are resolvable at the first poll, so the
+/// assertion holds under either completion order.
+#[skuld::test]
+async fn aggregator_prefers_a_delivered_error_over_a_siblings_exit() {
+    let (tx0, rx0) = oneshot::channel::<Result<PluginReady, StartError>>();
+    let (tx1, rx1) = oneshot::channel();
+    let (ready_tx, ready_rx) = oneshot::channel();
+    let shutdown = CancellationToken::new();
+
+    tx1.send(Err(StartError::BindConflict {
+        errno: 98,
+        addr: "127.0.0.1:1080".parse().unwrap(),
+    }))
+    .unwrap();
+    drop(tx0);
+
+    run_readiness_aggregator(
+        vec![(0, rx0), (1, rx1)],
+        2,
+        crate::chain::Mode::Client,
+        shutdown,
+        ready_tx,
+    )
+    .await;
+
+    match ready_rx.await.expect("a delivered error outranks a bare exit") {
+        Err(StartError::BindConflict { errno, .. }) => assert_eq!(errno, 98),
+        other => panic!("expected the sibling's BindConflict, got {other:?}"),
+    }
+}
+
+/// Shutdown preempting the scan must still find an error further down the
+/// chain, not just in the receiver that happened to be next.
+#[skuld::test]
+async fn aggregator_rescues_a_later_plugins_error_when_shutdown_won_the_race() {
+    let (tx0, rx0) = oneshot::channel::<Result<PluginReady, StartError>>();
+    let (tx1, rx1) = oneshot::channel();
+    let (ready_tx, ready_rx) = oneshot::channel();
+    let shutdown = CancellationToken::new();
+
+    tx1.send(Err(StartError::BindConflict {
+        errno: 98,
+        addr: "127.0.0.1:1080".parse().unwrap(),
+    }))
+    .unwrap();
+    drop(tx0);
+    shutdown.cancel();
+
+    run_readiness_aggregator(
+        vec![(0, rx0), (1, rx1)],
+        2,
+        crate::chain::Mode::Client,
+        shutdown,
+        ready_tx,
+    )
+    .await;
+
+    match ready_rx.await.expect("the scan must reach index 1") {
+        Err(StartError::BindConflict { errno, .. }) => assert_eq!(errno, 98),
+        other => panic!("expected the later plugin's BindConflict, got {other:?}"),
+    }
+}
+
+/// Two typed errors at once resolve to the lowest plugin index. Passes pre-fix
+/// too — it locks the rule against the rewrite rather than driving it.
+#[skuld::test]
+async fn aggregator_reports_the_lowest_index_error_when_two_plugins_both_fail() {
+    let (tx0, rx0) = oneshot::channel();
+    let (tx1, rx1) = oneshot::channel();
+    let (ready_tx, ready_rx) = oneshot::channel();
+    let shutdown = CancellationToken::new();
+
+    tx0.send(Err(StartError::Fatal {
+        detail: "first".into(),
+        errno: None,
+    }))
+    .unwrap();
+    tx1.send(Err(StartError::BindConflict {
+        errno: 98,
+        addr: "127.0.0.1:1080".parse().unwrap(),
+    }))
+    .unwrap();
+
+    run_readiness_aggregator(
+        vec![(0, rx0), (1, rx1)],
+        2,
+        crate::chain::Mode::Client,
+        shutdown,
+        ready_tx,
+    )
+    .await;
+
+    match ready_rx.await.expect("aggregator should send") {
+        Err(StartError::Fatal { detail, .. }) => assert_eq!(detail, "first"),
+        other => panic!("expected the lowest-index error, got {other:?}"),
+    }
+}
+
+/// The regression guard for deferral. A higher-index plugin's bare exit must not
+/// be reported while a lower-index plugin's sender is still alive — its typed
+/// error may be one poll behind, and reporting early destroys the only retryable
+/// class. `main` passes this by parking on index 0; a point-in-time sweep fails it.
+#[skuld::test]
+async fn aggregator_defers_an_exit_until_a_live_sibling_answers() {
+    let (tx0, rx0) = oneshot::channel();
+    let (tx1, rx1) = oneshot::channel::<Result<PluginReady, StartError>>();
+    let (ready_tx, ready_rx) = oneshot::channel();
+    let shutdown = CancellationToken::new();
+
+    // Index 1 exits unsent; index 0 answers only afterwards.
+    drop(tx1);
+    let sender = tokio::spawn(async move {
+        tx0.send(Err(StartError::BindConflict {
+            errno: 98,
+            addr: "127.0.0.1:1080".parse().unwrap(),
+        }))
+    });
+
+    run_readiness_aggregator(
+        vec![(0, rx0), (1, rx1)],
+        2,
+        crate::chain::Mode::Client,
+        shutdown,
+        ready_tx,
+    )
+    .await;
+    sender.await.expect("sender task joined").expect("index 0 sent");
+
+    match ready_rx.await.expect("aggregator should send") {
+        Err(StartError::BindConflict { errno, .. }) => assert_eq!(errno, 98),
+        other => panic!("a live sibling's typed error must outrank a bare exit, got {other:?}"),
+    }
+}
+
+/// Deferral must not swallow the failure: once every sibling has resolved with
+/// nothing typed, the synthesized exit is reported.
+#[skuld::test]
+async fn aggregator_reports_the_exit_once_every_sibling_has_resolved() {
+    let (tx0, rx0) = oneshot::channel::<Result<PluginReady, StartError>>();
+    let (tx1, rx1) = oneshot::channel();
+    let (ready_tx, ready_rx) = oneshot::channel();
+    let shutdown = CancellationToken::new();
+
+    drop(tx0);
+    tx1.send(Ok(PluginReady {
+        listen: "127.0.0.1:1081".parse().unwrap(),
+        transports: Transports::TCP,
+    }))
+    .unwrap();
+
+    run_readiness_aggregator(
+        vec![(0, rx0), (1, rx1)],
+        2,
+        crate::chain::Mode::Client,
+        shutdown,
+        ready_tx,
+    )
+    .await;
+
+    match ready_rx.await.expect("a deferred exit must still be reported") {
+        Err(StartError::Fatal { detail, .. }) => {
+            assert_eq!(detail, "plugin exited before becoming ready");
+        }
+        other => panic!("expected the synthesized exit failure, got {other:?}"),
+    }
+}
+
+/// The one case where the sweep must walk past — and consume — a delivered
+/// readiness to reach an error further down.
+#[skuld::test]
+async fn aggregator_finds_an_error_behind_an_already_ready_plugin_on_shutdown() {
+    let (tx0, rx0) = oneshot::channel();
+    let (_tx1, rx1) = oneshot::channel::<Result<PluginReady, StartError>>();
+    let (tx2, rx2) = oneshot::channel();
+    let (ready_tx, ready_rx) = oneshot::channel();
+    let shutdown = CancellationToken::new();
+
+    tx0.send(Ok(PluginReady {
+        listen: "127.0.0.1:1080".parse().unwrap(),
+        transports: Transports::TCP,
+    }))
+    .unwrap();
+    tx2.send(Err(StartError::BindConflict {
+        errno: 98,
+        addr: "127.0.0.1:1082".parse().unwrap(),
+    }))
+    .unwrap();
+    shutdown.cancel();
+
+    run_readiness_aggregator(
+        vec![(0, rx0), (1, rx1), (2, rx2)],
+        3,
+        crate::chain::Mode::Client,
+        shutdown,
+        ready_tx,
+    )
+    .await;
+
+    match ready_rx.await.expect("the scan must walk past a ready plugin") {
+        Err(StartError::BindConflict { errno, .. }) => assert_eq!(errno, 98),
+        other => panic!("expected the deeper BindConflict, got {other:?}"),
+    }
+}
+
+/// Deliberately NOT an ordering test: both assertions are order-independent and
+/// this passes pre- and post-fix alike. It exists to catch a rewrite that keys
+/// `plugin_listens` by position in the pending set instead of by plugin index.
+#[skuld::test]
+async fn aggregator_keys_listens_and_transports_by_plugin_index() {
+    let (tx0, rx0) = oneshot::channel();
+    let (tx1, rx1) = oneshot::channel();
+    let (tx2, rx2) = oneshot::channel();
+    let (ready_tx, ready_rx) = oneshot::channel();
+    let shutdown = CancellationToken::new();
+
+    tx2.send(Ok(PluginReady {
+        listen: "127.0.0.1:1082".parse().unwrap(),
+        transports: Transports::TCP | Transports::UDP,
+    }))
+    .unwrap();
+    tx0.send(Ok(PluginReady {
+        listen: "127.0.0.1:1080".parse().unwrap(),
+        transports: Transports::TCP | Transports::UDP,
+    }))
+    .unwrap();
+    tx1.send(Ok(PluginReady {
+        listen: "127.0.0.1:1081".parse().unwrap(),
+        transports: Transports::TCP,
+    }))
+    .unwrap();
+
+    run_readiness_aggregator(
+        vec![(0, rx0), (1, rx1), (2, rx2)],
+        3,
+        crate::chain::Mode::Client,
+        shutdown,
+        ready_tx,
+    )
+    .await;
+
+    let ready = ready_rx
+        .await
+        .expect("aggregator should send")
+        .expect("every plugin readied");
+    assert_eq!(
+        ready.listen,
+        "127.0.0.1:1080".parse::<std::net::SocketAddr>().unwrap(),
+        "Client mode reports position 0's listen address"
+    );
+    assert_eq!(
+        ready.transports,
+        Transports::TCP,
+        "the chain carries only what every hop serves"
+    );
+}
+
+/// #797's no-rescue rule, extended to the multi-plugin sweep: a LATER plugin's
+/// delivered readiness is no evidence the chain survived the cancel either.
+#[skuld::test]
+async fn aggregator_never_reports_ready_when_a_later_plugin_readied_before_shutdown() {
+    let (_tx0, rx0) = oneshot::channel::<Result<PluginReady, StartError>>();
+    let (tx1, rx1) = oneshot::channel();
+    let (ready_tx, ready_rx) = oneshot::channel();
+    let shutdown = CancellationToken::new();
+
+    tx1.send(Ok(PluginReady {
+        listen: "127.0.0.1:1081".parse().unwrap(),
+        transports: Transports::TCP,
+    }))
+    .unwrap();
+    shutdown.cancel();
+
+    run_readiness_aggregator(
+        vec![(0, rx0), (1, rx1)],
+        2,
+        crate::chain::Mode::Client,
+        shutdown,
+        ready_tx,
+    )
+    .await;
+
+    assert!(
+        ready_rx.await.is_err(),
+        "a chain cancelled mid-start must never be reported ready"
+    );
+}

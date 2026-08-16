@@ -223,11 +223,17 @@ impl ChainRunner {
     /// the `ready` channel passed to [`ChainPlugin::run`]; the aggregator
     /// collects the N per-plugin results into one chain-level outcome.
     ///
-    /// If shutdown fires before every plugin has readied, `tx` is dropped
-    /// and the receiver gets `RecvError` — unless the plugin currently being
-    /// awaited had already delivered a `StartError`, which is reported rather
-    /// than discarded. A `StartError` sitting in a LATER plugin's channel is
-    /// still discarded (bindreams/hole#794).
+    /// Outcomes are consumed in completion order, not plugin order, so a typed
+    /// failure is never held up behind a plugin that has neither reported nor
+    /// exited. A plugin that exits before readying does not immediately produce
+    /// the generic "exited before becoming ready": that is held while any other
+    /// plugin's sender is still alive, so a typed error one poll behind still
+    /// wins, and reported once every receiver has resolved. Among typed errors
+    /// available at once, the lowest plugin index wins.
+    ///
+    /// If shutdown fires before every plugin has readied, `tx` is dropped and the
+    /// receiver gets `RecvError` — unless some plugin had already delivered a
+    /// `StartError`, which is reported rather than discarded.
     pub fn on_ready(mut self, tx: oneshot::Sender<Result<ChainReady, StartError>>) -> Self {
         self.ready_tx = Some(tx);
         self
@@ -372,14 +378,19 @@ impl ChainRunner {
 
 // Helpers =============================================================================================================
 
+/// Readiness receivers still awaiting an outcome, in ASCENDING plugin-index
+/// order. Both the concurrent poll and the sweep scan this order, which is what
+/// makes "the lowest plugin index wins" true without any code saying so.
+type Pending = Vec<(usize, oneshot::Receiver<Result<PluginReady, StartError>>)>;
+
 /// Aggregate the N per-plugin readiness results into a single chain-level
 /// outcome on `ready_tx`.
 ///
-/// Awaits each plugin's `ready` receiver in turn, racing the shared
-/// `shutdown` token so a cancel during startup doesn't hang. The
-/// position-0 plugin's reported `listen` is the chain's public address in
-/// Client mode; in Server mode it is position N-1. The chain's transports
-/// are the intersection across all hops.
+/// Awaits every plugin's `ready` receiver concurrently and consumes them in
+/// completion order, racing the shared `shutdown` token so a cancel during
+/// startup doesn't hang. The position-0 plugin's reported `listen` is the
+/// chain's public address in Client mode; in Server mode it is position N-1.
+/// The chain's transports are the intersection across all hops.
 pub(crate) async fn run_readiness_aggregator(
     ready_rxs: Vec<(usize, oneshot::Receiver<Result<PluginReady, StartError>>)>,
     n: usize,
@@ -387,6 +398,13 @@ pub(crate) async fn run_readiness_aggregator(
     shutdown: CancellationToken,
     ready_tx: oneshot::Sender<Result<ChainReady, StartError>>,
 ) {
+    debug_assert_eq!(ready_rxs.len(), n, "one readiness receiver per plugin");
+    debug_assert!(ready_rxs.iter().all(|(i, _)| *i < n), "plugin index out of range");
+    debug_assert!(
+        ready_rxs.windows(2).all(|w| w[0].0 < w[1].0),
+        "readiness receivers must be in ascending plugin-index order"
+    );
+
     let mut plugin_listens: Vec<Option<SocketAddr>> = vec![None; n];
     // Intersection identity (the full transport set); each plugin's
     // reported transports narrow this. `all()` lives on the
@@ -396,22 +414,27 @@ pub(crate) async fn run_readiness_aggregator(
         Mode::Client => 0,
         Mode::Server => n - 1,
     };
-    for (i, mut rrx) in ready_rxs {
-        let outcome = tokio::select! {
+    let mut pending: Pending = ready_rxs;
+    // A plugin that exited before readying, held rather than reported. See the
+    // `Err(_recv)` arm.
+    let mut deferred_exit: Option<StartError> = None;
+
+    while !pending.is_empty() {
+        let resolved = tokio::select! {
             biased;
-            () = shutdown.cancelled() => match rrx.try_recv() {
-                // A plugin that reports a failure and exits cancels `shutdown`
-                // itself (`record_exit` cancels on every plugin exit), so this
-                // arm can win the race against a typed error already sitting
-                // in the channel. The error stands whoever cancelled.
-                Ok(Err(start_err)) => Ok(Err(start_err)),
-                // Anything else returns as before. A delivered `Ok(PluginReady)`
-                // is NOT rescued: `shutdown` is chain-wide and may have been
-                // cancelled by another plugin's exit or an external cancel, so
-                // nothing here shows the chain is still viable.
-                _ => return,
-            },
-            r = &mut rrx => r,
+            () = shutdown.cancelled() => None,
+            r = next_resolved(&mut pending) => Some(r),
+        };
+        let Some((i, outcome)) = resolved else {
+            // `shutdown` is chain-wide — this plugin's exit, another plugin's, or
+            // an external cancel all fire it — so a delivered `Ok(PluginReady)`
+            // is no evidence the chain is still viable and is not rescued. A
+            // delivered `StartError` needs no such evidence: that plugin failed
+            // whoever cancelled.
+            if let Some(start_err) = drain_available(&mut pending, &mut plugin_listens, &mut transports) {
+                let _ = ready_tx.send(Err(start_err));
+            }
+            return;
         };
         match outcome {
             Ok(Ok(pr)) => {
@@ -423,25 +446,102 @@ pub(crate) async fn run_readiness_aggregator(
                 return;
             }
             Err(_recv) => {
-                // Plugin dropped its sender unsent → it exited before
-                // readying. Synthesize a process-exit Fatal. This is the
-                // START-GATE channel; the SAME exit is independently
+                // Plugin dropped its sender unsent → it exited before readying.
+                // This is the START-GATE channel; the SAME exit is independently
                 // observed by the Phase-1 record_exit loop, which sets
                 // first_error + cancels — that is the LIFECYCLE channel that
                 // becomes run()'s return. The two are intentionally separate
-                // observers of one event (typed cause to on_ready AND
-                // lifecycle error to teardown). Do NOT try to reconcile them
-                // into one value.
-                let _ = ready_tx.send(Err(StartError::Fatal {
+                // observers of one event (typed cause to on_ready AND lifecycle
+                // error to teardown). Do NOT try to reconcile them into one value.
+                //
+                // A sibling's typed failure outranks this placeholder, and may be
+                // one poll behind rather than already delivered — reporting now
+                // would destroy a `BindConflict`, the only retryable class. So
+                // hold it while any sender is still alive. `record_exit` cancels
+                // `shutdown` on every plugin exit and the arm above stays first,
+                // so the wait is bounded without any timer.
+                if let Some(start_err) = drain_available(&mut pending, &mut plugin_listens, &mut transports) {
+                    let _ = ready_tx.send(Err(start_err));
+                    return;
+                }
+                deferred_exit.get_or_insert(StartError::Fatal {
                     detail: "plugin exited before becoming ready".into(),
                     errno: None,
-                }));
-                return;
+                });
             }
         }
     }
+
+    if let Some(start_err) = deferred_exit {
+        let _ = ready_tx.send(Err(start_err));
+        return;
+    }
     let listen = plugin_listens[public_index].expect("public plugin must have reported a listen address");
     let _ = ready_tx.send(Ok(ChainReady { listen, transports }));
+}
+
+/// Await every pending receiver at once; yield the first to resolve and remove
+/// it. Cancel-safe: an entry is removed only once its value is in hand, so
+/// dropping this future in a `select!` loses nothing.
+async fn next_resolved(
+    pending: &mut Pending,
+) -> (
+    usize,
+    Result<Result<PluginReady, StartError>, oneshot::error::RecvError>,
+) {
+    use std::future::Future as _;
+
+    debug_assert!(!pending.is_empty(), "next_resolved needs at least one receiver");
+    // Record the position and break rather than removing mid-scan, which would
+    // borrow `pending` twice.
+    let (pos, value) = std::future::poll_fn(|cx| {
+        for (pos, (_, rrx)) in pending.iter_mut().enumerate() {
+            if let std::task::Poll::Ready(value) = std::pin::Pin::new(rrx).poll(cx) {
+                return std::task::Poll::Ready((pos, value));
+            }
+        }
+        std::task::Poll::Pending
+    })
+    .await;
+    (pending.remove(pos).0, value)
+}
+
+/// Drain every pending receiver that already has an outcome, returning the
+/// lowest-index delivered `StartError` if there is one.
+///
+/// Readiness is RECORDED, not discarded: a plugin that readied before the scan
+/// reached it keeps its contribution to `listens`/`transports`, so this is safe
+/// to call from a caller that goes on looping. Receivers whose sender is merely
+/// still alive are left in `pending` — nothing here distinguishes "not yet" from
+/// "never".
+fn drain_available(
+    pending: &mut Pending,
+    listens: &mut [Option<SocketAddr>],
+    transports: &mut Transports,
+) -> Option<StartError> {
+    let mut resolved: Vec<usize> = Vec::new();
+    let mut delivered: Option<StartError> = None;
+
+    for (pos, (i, rrx)) in pending.iter_mut().enumerate() {
+        match rrx.try_recv() {
+            Ok(Ok(pr)) => {
+                listens[*i] = Some(pr.listen);
+                *transports &= pr.transports;
+                resolved.push(pos);
+            }
+            Ok(Err(start_err)) => {
+                delivered = Some(start_err);
+                break;
+            }
+            Err(oneshot::error::TryRecvError::Empty) => {}
+            // Exited unsent; the caller is already synthesizing that failure.
+            Err(oneshot::error::TryRecvError::Closed) => resolved.push(pos),
+        }
+    }
+    for pos in resolved.into_iter().rev() {
+        pending.remove(pos);
+    }
+    delivered
 }
 
 /// Shared handler for a single plugin-task exit result. Updates
