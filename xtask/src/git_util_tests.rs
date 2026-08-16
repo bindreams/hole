@@ -74,12 +74,7 @@ fn run_git_with_env_forwards_env_vars_to_the_git_subprocess() {
     // on (git-subrepo's own internal `git commit` inherits it the same way).
     let dir = tempfile::tempdir().unwrap();
     git(dir.path(), &["init", "--initial-branch=main", "--quiet"]);
-    // Fixtures never intend platform-dependent line-ending mutation —
-    // a checkout inside these tests (e.g. resolving an allowlisted
-    // conflict to upstream's content) must not silently smudge LF to
-    // CRLF on a Windows runner with a global `core.autocrlf=true`
-    // (GitHub's windows-latest default) and desync from what the test
-    // literally wrote/asserts.
+    // Same autocrlf-smudge rationale as above.
     git(dir.path(), &["config", "core.autocrlf", "false"]);
     git(dir.path(), &["config", "user.email", "fixture@example.com"]);
     git(dir.path(), &["config", "user.name", "fixture"]);
@@ -116,12 +111,7 @@ fn run_git_with_env_forwards_env_vars_to_the_git_subprocess() {
 fn run_git_with_env_bails_on_failure_like_run_git() {
     let dir = tempfile::tempdir().unwrap();
     git(dir.path(), &["init", "--initial-branch=main", "--quiet"]);
-    // Fixtures never intend platform-dependent line-ending mutation —
-    // a checkout inside these tests (e.g. resolving an allowlisted
-    // conflict to upstream's content) must not silently smudge LF to
-    // CRLF on a Windows runner with a global `core.autocrlf=true`
-    // (GitHub's windows-latest default) and desync from what the test
-    // literally wrote/asserts.
+    // Same autocrlf-smudge rationale as above.
     git(dir.path(), &["config", "core.autocrlf", "false"]);
     git(dir.path(), &["config", "user.email", "fixture@example.com"]);
     git(dir.path(), &["config", "user.name", "fixture"]);
@@ -169,12 +159,7 @@ fn merge_skip_value_unions_with_a_pre_existing_value_as_a_comma_join() {
 fn index_blob_hash_or_deleted_returns_the_staged_blob_hash_for_a_present_file() {
     let dir = tempfile::tempdir().unwrap();
     git(dir.path(), &["init", "--initial-branch=main", "--quiet"]);
-    // Fixtures never intend platform-dependent line-ending mutation —
-    // a checkout inside these tests (e.g. resolving an allowlisted
-    // conflict to upstream's content) must not silently smudge LF to
-    // CRLF on a Windows runner with a global `core.autocrlf=true`
-    // (GitHub's windows-latest default) and desync from what the test
-    // literally wrote/asserts.
+    // Same autocrlf-smudge rationale as above.
     git(dir.path(), &["config", "core.autocrlf", "false"]);
     std::fs::write(dir.path().join("f.txt"), "hello\n").unwrap();
     git(dir.path(), &["add", "f.txt"]);
@@ -194,12 +179,7 @@ fn index_blob_hash_or_deleted_returns_the_staged_blob_hash_for_a_present_file() 
 fn index_blob_hash_or_deleted_returns_deleted_sentinel_for_an_unstaged_file() {
     let dir = tempfile::tempdir().unwrap();
     git(dir.path(), &["init", "--initial-branch=main", "--quiet"]);
-    // Fixtures never intend platform-dependent line-ending mutation —
-    // a checkout inside these tests (e.g. resolving an allowlisted
-    // conflict to upstream's content) must not silently smudge LF to
-    // CRLF on a Windows runner with a global `core.autocrlf=true`
-    // (GitHub's windows-latest default) and desync from what the test
-    // literally wrote/asserts.
+    // Same autocrlf-smudge rationale as above.
     git(dir.path(), &["config", "core.autocrlf", "false"]);
     let actual = index_blob_hash_or_deleted(dir.path(), "missing.txt").unwrap();
     assert_eq!(actual, "<deleted>");
@@ -209,12 +189,7 @@ fn index_blob_hash_or_deleted_returns_deleted_sentinel_for_an_unstaged_file() {
 fn head_blob_hash_or_deleted_returns_the_committed_blob_hash_for_a_present_file() {
     let dir = tempfile::tempdir().unwrap();
     git(dir.path(), &["init", "--initial-branch=main", "--quiet"]);
-    // Fixtures never intend platform-dependent line-ending mutation —
-    // a checkout inside these tests (e.g. resolving an allowlisted
-    // conflict to upstream's content) must not silently smudge LF to
-    // CRLF on a Windows runner with a global `core.autocrlf=true`
-    // (GitHub's windows-latest default) and desync from what the test
-    // literally wrote/asserts.
+    // Same autocrlf-smudge rationale as above.
     git(dir.path(), &["config", "core.autocrlf", "false"]);
     git(dir.path(), &["config", "user.email", "fixture@example.com"]);
     git(dir.path(), &["config", "user.name", "fixture"]);
@@ -242,12 +217,7 @@ fn head_blob_hash_or_deleted_returns_the_committed_blob_hash_for_a_present_file(
 fn head_blob_hash_or_deleted_returns_deleted_sentinel_for_a_path_not_in_head() {
     let dir = tempfile::tempdir().unwrap();
     git(dir.path(), &["init", "--initial-branch=main", "--quiet"]);
-    // Fixtures never intend platform-dependent line-ending mutation —
-    // a checkout inside these tests (e.g. resolving an allowlisted
-    // conflict to upstream's content) must not silently smudge LF to
-    // CRLF on a Windows runner with a global `core.autocrlf=true`
-    // (GitHub's windows-latest default) and desync from what the test
-    // literally wrote/asserts.
+    // Same autocrlf-smudge rationale as above.
     git(dir.path(), &["config", "core.autocrlf", "false"]);
     git(dir.path(), &["config", "user.email", "fixture@example.com"]);
     git(dir.path(), &["config", "user.name", "fixture"]);
@@ -272,12 +242,7 @@ fn head_blob_hash_or_deleted_returns_deleted_sentinel_for_a_path_not_in_head() {
 fn index_blob_hash_or_deleted_is_immune_to_a_prior_checkouts_autocrlf_smudge() {
     let dir = tempfile::tempdir().unwrap();
     git(dir.path(), &["init", "--initial-branch=main", "--quiet"]);
-    // Fixtures never intend platform-dependent line-ending mutation —
-    // a checkout inside these tests (e.g. resolving an allowlisted
-    // conflict to upstream's content) must not silently smudge LF to
-    // CRLF on a Windows runner with a global `core.autocrlf=true`
-    // (GitHub's windows-latest default) and desync from what the test
-    // literally wrote/asserts.
+    // Same autocrlf-smudge rationale as above.
     git(dir.path(), &["config", "core.autocrlf", "false"]);
     git(dir.path(), &["config", "user.email", "fixture@example.com"]);
     git(dir.path(), &["config", "user.name", "fixture"]);

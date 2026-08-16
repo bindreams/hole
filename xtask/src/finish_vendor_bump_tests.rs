@@ -286,12 +286,7 @@ fn update_vendoring_note_fails_when_the_heading_is_malformed() {
     )
     .unwrap();
     git(dir.path(), &["init", "--initial-branch=main", "--quiet"]);
-    // Fixtures never intend platform-dependent line-ending mutation —
-    // a checkout inside these tests (e.g. resolving an allowlisted
-    // conflict to upstream's content) must not silently smudge LF to
-    // CRLF on a Windows runner with a global `core.autocrlf=true`
-    // (GitHub's windows-latest default) and desync from what the test
-    // literally wrote/asserts.
+    // Same autocrlf-smudge rationale as above.
     git(dir.path(), &["config", "core.autocrlf", "false"]);
     git(dir.path(), &["config", "user.email", "fixture@example.com"]);
     git(dir.path(), &["config", "user.name", "fixture"]);
@@ -324,12 +319,7 @@ fn update_vendoring_note_fails_when_the_heading_is_malformed_even_with_a_later_b
     )
     .unwrap();
     git(dir.path(), &["init", "--initial-branch=main", "--quiet"]);
-    // Fixtures never intend platform-dependent line-ending mutation —
-    // a checkout inside these tests (e.g. resolving an allowlisted
-    // conflict to upstream's content) must not silently smudge LF to
-    // CRLF on a Windows runner with a global `core.autocrlf=true`
-    // (GitHub's windows-latest default) and desync from what the test
-    // literally wrote/asserts.
+    // Same autocrlf-smudge rationale as above.
     git(dir.path(), &["config", "core.autocrlf", "false"]);
     git(dir.path(), &["config", "user.email", "fixture@example.com"]);
     git(dir.path(), &["config", "user.name", "fixture"]);

@@ -58,8 +58,7 @@ jobs:
       # apt/npm/go package — it's a bash-script tool installed by cloning
       # it and putting its lib/ dir (containing an executable named
       # `git-subrepo`) on PATH. Pinned to 0.4.9 to match the version this
-      # workflow's fixup logic targets — confirm this tag exists on first
-      # real run.
+      # workflow's fixup logic targets.
       - name: Install git-subrepo 0.4.9
         run: |
           git clone --branch 0.4.9 --depth 1 https://github.com/ingydotnet/git-subrepo "$RUNNER_TEMP/git-subrepo"
@@ -173,10 +172,9 @@ jobs:
       # None of these steps ever run if an earlier one (Push included)
       # failed: a step's own `if:` is implicitly ANDed with `success()`
       # unless the condition itself names `always()`/`cancelled()`/
-      # `failure()` (confirmed against GitHub's own docs — none of the
-      # conditions in this job do) — so a rejected Push (a real
-      # force-push race) already fails the job on its own account, with
-      # no separate disposition needed here.
+      # `failure()` (none of the conditions in this job do) — so a
+      # rejected Push (a real force-push race) already fails the job on
+      # its own account, with no separate disposition needed here.
       - name: Fail the job if the pull conflicted
         if: steps.pull.outputs.result == 'conflicted'
         run: |

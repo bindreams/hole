@@ -235,8 +235,7 @@ jobs:
       # job builds nothing itself (it runs the `build` job's prebuilt
       # artifact), so unlike jobs that use `./.github/actions/setup-build`,
       # `go` isn't otherwise provisioned here. Some runner images happen to
-      # ship a usable `go` anyway, which is why this gap surfaced only on
-      # one platform rather than failing everywhere from the start.
+      # ship a usable `go` anyway.
       - uses: actions/setup-go@v7
         with:
           go-version: stable
@@ -252,7 +251,7 @@ jobs:
         shell: bash
         run: uv tool install prek
 
-      # macOS runners ship only Apple's frozen Bash 3.2.57 (GPLv3 holdout) on
+      # macOS runners ship only Apple's frozen Bash 3.2.57 on
       # /usr/bin/bash, ahead of Homebrew's bash on PATH; git-subrepo's
       # `#!/usr/bin/env bash` shebang hard-requires Bash 4+ and refuses to run
       # under 3.2. `brew install bash` puts a 4+ build in /opt/homebrew/bin

@@ -23,9 +23,9 @@ pub enum IdentityCheckOutcome {
 
 pub fn run(repo_root: &Path, subdir: &str, dep_name: &str, new_tag: &str) -> Result<IdentityCheckOutcome> {
     // `dep_name` and `subdir` are two independent CLI/API arguments only
-    // because Task 8's workflow (and a human running this by hand) always
-    // computes both from the same `<name>` — this cross-check is what
-    // keeps a copy-paste/typo mismatch between them from being silently
+    // because every real caller (the CI workflow and a human running this by
+    // hand) always computes both from the same `<name>` — this cross-check is
+    // what keeps a copy-paste/typo mismatch between them from being silently
     // accepted rather than rejecting the whole point of having both.
     let expected_dep_name = Path::new(subdir)
         .file_name()
