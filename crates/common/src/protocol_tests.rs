@@ -150,6 +150,7 @@ fn bridge_response_status_json_roundtrip() {
         lockdown_enabled: false,
         lockdown_active: false,
         held_closed: false,
+        cover_state_unknown: false,
         blocked_until_connected: true,
     };
     let json = serde_json::to_vec(&resp).unwrap();
@@ -232,6 +233,7 @@ fn status_response_json_roundtrip() {
         lockdown_enabled: false,
         lockdown_active: false,
         held_closed: false,
+        cover_state_unknown: false,
         blocked_until_connected: false,
     };
     let json = serde_json::to_string(&resp).unwrap();
@@ -251,6 +253,7 @@ fn status_response_without_error() {
         lockdown_enabled: false,
         lockdown_active: false,
         held_closed: false,
+        cover_state_unknown: false,
         blocked_until_connected: false,
     };
     let json = serde_json::to_string(&resp).unwrap();

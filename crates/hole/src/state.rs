@@ -397,10 +397,13 @@ pub struct ProxySnapshot {
     /// Whether a lockdown cover is engaged, as the bridge probes the OS —
     /// true for a healthy protected session AND for a cover left by a crash.
     pub lockdown_active: bool,
-    /// Whether a lockdown cover is engaged that no running session owns: Hole is
-    /// holding the network closed with nothing carrying traffic through it. The
-    /// tray renders this with the action that ends it.
+    /// Whether a cover — standing or transient — is engaged that no in-process
+    /// guard owns: Hole is holding the network closed with nothing carrying
+    /// traffic through it. The tray renders this with the action that ends it.
     pub held_closed: bool,
+    /// Whether `held_closed` rests on an unanswerable probe rather than an
+    /// observed cover — a different claim, and the tray must not conflate them.
+    pub cover_state_unknown: bool,
     /// Whether a covered start (auto-connect) failed and left the host
     /// fail-closed (blocked, not leaked) while not running — a distinct blocked
     /// state (Retry / Disconnect), never silent Disconnected.
@@ -415,6 +418,7 @@ pub struct LockdownObservation {
     pub enabled: bool,
     pub active: bool,
     pub held_closed: bool,
+    pub cover_state_unknown: bool,
     pub blocked_until_connected: bool,
 }
 
@@ -438,6 +442,7 @@ impl ProxyStateCell {
             lockdown_enabled: false,
             lockdown_active: false,
             held_closed: false,
+            cover_state_unknown: false,
             blocked_until_connected: false,
         });
         Self { tx }
@@ -463,6 +468,7 @@ impl ProxyStateCell {
                 lockdown_enabled: snap.lockdown_enabled,
                 lockdown_active: snap.lockdown_active,
                 held_closed: snap.held_closed,
+                cover_state_unknown: snap.cover_state_unknown,
                 blocked_until_connected: false,
             };
             true
@@ -479,6 +485,7 @@ impl ProxyStateCell {
             enabled: lockdown_enabled,
             active: lockdown_active,
             held_closed,
+            cover_state_unknown,
             blocked_until_connected,
         } = lockdown;
         self.tx.send_if_modified(|snap| {
@@ -486,6 +493,7 @@ impl ProxyStateCell {
                 && snap.lockdown_enabled == lockdown_enabled
                 && snap.lockdown_active == lockdown_active
                 && snap.held_closed == held_closed
+                && snap.cover_state_unknown == cover_state_unknown
                 && snap.blocked_until_connected == blocked_until_connected
             {
                 return false;
@@ -497,6 +505,7 @@ impl ProxyStateCell {
                 lockdown_enabled,
                 lockdown_active,
                 held_closed,
+                cover_state_unknown,
                 blocked_until_connected,
             };
             true
@@ -515,11 +524,13 @@ impl ProxyStateCell {
                 enabled: le,
                 active: la,
                 held_closed: hc,
+                cover_state_unknown: unk,
                 blocked_until_connected: blk,
             } = lockdown.unwrap_or(LockdownObservation {
                 enabled: snap.lockdown_enabled,
                 active: snap.lockdown_active,
                 held_closed: snap.held_closed,
+                cover_state_unknown: snap.cover_state_unknown,
                 blocked_until_connected: snap.blocked_until_connected,
             });
             if !snap.running
@@ -527,6 +538,7 @@ impl ProxyStateCell {
                 && snap.lockdown_enabled == le
                 && snap.lockdown_active == la
                 && snap.held_closed == hc
+                && snap.cover_state_unknown == unk
                 && snap.blocked_until_connected == blk
             {
                 return false;
@@ -538,6 +550,7 @@ impl ProxyStateCell {
                 lockdown_enabled: le,
                 lockdown_active: la,
                 held_closed: hc,
+                cover_state_unknown: unk,
                 blocked_until_connected: blk,
             };
             true
@@ -718,12 +731,14 @@ pub(crate) fn observed_lockdown(result: &Result<BridgeResponse, ClientError>) ->
             lockdown_enabled,
             lockdown_active,
             held_closed,
+            cover_state_unknown,
             blocked_until_connected,
             ..
         }) => Some(LockdownObservation {
             enabled: *lockdown_enabled,
             active: *lockdown_active,
             held_closed: *held_closed,
+            cover_state_unknown: *cover_state_unknown,
             blocked_until_connected: *blocked_until_connected,
         }),
         _ => None,

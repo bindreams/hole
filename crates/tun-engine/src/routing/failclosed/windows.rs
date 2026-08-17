@@ -78,6 +78,11 @@ pub const FILTER_GUIDS: [GUID; 12] = [
     GUID::from_u128(0xa020f996_e73f_488c_b1c9_5fce3ea0b1eb), // resolver CONNECT V6
 ];
 
+/// Indices into [`FILTER_GUIDS`] for the TRANSIENT cover's block-all pair — the
+/// same evidence [`LOCKDOWN_BLOCK_GUID_INDICES`] names for the standing cover,
+/// over the disjoint transient key set.
+pub(crate) const TRANSIENT_BLOCK_GUID_INDICES: [usize; 2] = [4, 5]; // block-all V4, block-all V6
+
 /// IANA protocol number for TCP (RFC 790; never changes — not sourced from
 /// the `windows` crate's `WinSock::IPPROTO_TCP` to avoid an extra import for
 /// a value this stable).
@@ -1009,6 +1014,26 @@ pub fn lockdown_cover_state(_state_dir: &Path) -> CoverState {
     }
 }
 
+/// Whether the TRANSIENT cover's block-all filters are in force. Same mechanism
+/// as [`lockdown_cover_state`] over the disjoint transient key set; the two are
+/// probed separately because only the standing one is what `disengage_lockdown`
+/// verifies.
+pub fn transient_cover_state(_state_dir: &Path) -> CoverState {
+    unsafe {
+        let mut engine = HANDLE::default();
+        #[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
+        let rc = FwpmEngineOpen0(PCWSTR::null(), RPC_C_AUTHN_WINNT, None, None, &mut engine);
+        if rc != ERROR_SUCCESS.0 {
+            tracing::warn!(rc, "FWPM engine open failed; transient cover state is unknown");
+            return cover_state_from_lookups(false, Lookup::Failed, Lookup::Failed);
+        }
+        let [v4, v6] = TRANSIENT_BLOCK_GUID_INDICES.map(|i| lookup_filter(engine, &FILTER_GUIDS[i]));
+        #[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
+        let _ = FwpmEngineClose0(engine);
+        cover_state_from_lookups(true, v4, v6)
+    }
+}
+
 /// One `FwpmFilterGetByKey0`, freeing whatever it allocated. `FWP_E_FILTER_NOT_FOUND`
 /// is the only return that proves absence; every other error is `Failed`.
 ///
@@ -1083,7 +1108,7 @@ pub fn disengage_lockdown(state_dir: &Path) -> Result<(), RoutingError> {
 /// Only the FILTERS are checked. The sublayer and provider are shared with the
 /// standing lockdown cover, so their delete legitimately fails while lockdown
 /// filters still pin them — an orphaned empty sublayer blocks nothing.
-pub fn sweep_transient_verified(_state_dir: &Path) -> Result<(), RoutingError> {
+pub fn sweep_transient_verified(state_dir: &Path) -> Result<(), RoutingError> {
     unsafe {
         let mut engine = HANDLE::default();
         #[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
@@ -1114,7 +1139,9 @@ pub fn sweep_transient_verified(_state_dir: &Path) -> Result<(), RoutingError> {
             )));
         }
     }
-    Ok(())
+    // Verify the OUTCOME, not that the calls returned — the contract this whole
+    // change exists to make real.
+    super::verify_disengaged(transient_cover_state(state_dir))
 }
 
 pub fn recover_cover(_state_dir: &Path, adopting: bool) {

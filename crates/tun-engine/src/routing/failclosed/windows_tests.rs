@@ -720,17 +720,3 @@ fn block_guid_indices_name_the_block_all_pair() {
     }
     assert_eq!(LOCKDOWN_BLOCK_GUID_INDICES.len(), 2, "one block-all per family");
 }
-
-#[skuld::test]
-fn lockdown_cover_present_is_false_on_a_host_with_no_cover() {
-    // Pins the recovery input against a hardcoded constant: a `true` that ignores
-    // the host cannot tell an adopted cover from a clean one, which is what made
-    // the lockout invisible. The expected value is derived from the test's own
-    // setup — this dir engaged nothing, so nothing can be present. Runs
-    // unprivileged: the FWPM read path needs no elevation.
-    let dir = tempfile::tempdir().unwrap();
-    assert!(
-        !super::super::lockdown_cover_present(dir.path()),
-        "no cover was engaged, so the recovery input must report absent"
-    );
-}

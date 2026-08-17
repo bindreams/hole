@@ -94,10 +94,11 @@ pub fn recover_cover(state_dir: &Path, adopting: bool) {
     platform::recover_cover(state_dir, adopting);
 }
 
-/// Fail-loud transient sweep for the `bridge unlock` escape hatch: clears a
-/// block-until-connected cover a crash left behind and PROPAGATES failure, so the
-/// command cannot report success over a host it did not open. [`recover_cover`]
-/// stays best-effort — startup recovery has no caller to act on an error.
+/// Fail-loud transient sweep: clears a block-until-connected cover a crash left
+/// behind and PROPAGATES failure, so a caller cannot report success over a host
+/// it did not open. Verified by re-probing, like the standing disengage — the
+/// point is the outcome, not that the calls returned. [`recover_cover`] stays
+/// best-effort: startup recovery has no caller to act on an error.
 pub fn sweep_transient_verified(state_dir: &Path) -> Result<(), RoutingError> {
     platform::sweep_transient_verified(state_dir)
 }
@@ -177,16 +178,14 @@ pub enum CoverState {
 }
 
 impl CoverState {
-    /// Whether recovery should reconcile. `Unknown` reconciles: `Adopt` and
-    /// `Sweep` are both idempotent, so acting on a phantom costs nothing while
-    /// skipping a real cover would strand it.
+    /// Whether anything but a CONFIRMED absence was observed — the single
+    /// question both consumers ask, deliberately one method rather than two
+    /// synonyms: recovery must reconcile a cover it cannot rule out (`Adopt` and
+    /// `Sweep` are idempotent, so acting on a phantom is free while skipping a
+    /// real one strands it), and the status surface must offer the way out for
+    /// the same reason. Splitting them would let a change to what `Unknown`
+    /// means for one silently change it for the other.
     pub fn is_present(self) -> bool {
-        !matches!(self, CoverState::Absent)
-    }
-
-    /// Whether the status surface should report the host as held closed.
-    /// `Unknown` counts: the user must be offered the way out.
-    pub fn is_engaged_or_unknown(self) -> bool {
         !matches!(self, CoverState::Absent)
     }
 }
@@ -206,13 +205,34 @@ pub(crate) fn verify_disengaged(state: CoverState) -> Result<(), RoutingError> {
     }
 }
 
-/// Whether our lockdown cover is holding the host closed RIGHT NOW. Distinct
-/// from [`lockdown_cover_present`], which asks the reconciliation question
-/// ("is there prior-run state to act on?") and is deliberately more lenient on
-/// macOS. The two coincide on Windows: its filters are persistent, so anything
-/// present is in force.
+/// Whether our STANDING lockdown cover is holding the host closed RIGHT NOW.
+/// Distinct from [`lockdown_cover_present`], which asks the reconciliation
+/// question ("is there prior-run state to act on?") and is deliberately more
+/// lenient on macOS. The two coincide on Windows: its filters are persistent, so
+/// anything present is in force.
 pub fn lockdown_cover_state(state_dir: &Path) -> CoverState {
     platform::lockdown_cover_state(state_dir)
+}
+
+/// Whether the TRANSIENT block-until-connected cover is holding the host closed.
+///
+/// Probed for the same reason as the standing one: its filters are persistent
+/// too, so a crash mid-connect leaves them blocking with no guard anywhere in the
+/// next process. Without this, a host held closed by a stranded transient cover
+/// reports as plain "Disconnected" with no action offered — the same lockout the
+/// standing probe exists to end, one key set over.
+pub fn transient_cover_state(state_dir: &Path) -> CoverState {
+    platform::transient_cover_state(state_dir)
+}
+
+/// The strongest claim about whether HOLE is holding the host closed, from either
+/// cover. `Engaged` if either is; otherwise `Unknown` if either is; else `Absent`.
+pub fn any_cover_state(state_dir: &Path) -> CoverState {
+    match (lockdown_cover_state(state_dir), transient_cover_state(state_dir)) {
+        (CoverState::Engaged, _) | (_, CoverState::Engaged) => CoverState::Engaged,
+        (CoverState::Unknown, _) | (_, CoverState::Unknown) => CoverState::Unknown,
+        _ => CoverState::Absent,
+    }
 }
 
 /// Whether a standing lockdown cover from a prior run is present — the recovery

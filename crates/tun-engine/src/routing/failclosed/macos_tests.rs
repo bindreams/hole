@@ -428,10 +428,10 @@ fn macos_engaged_state_is_reachable_by_the_disengage_verifier() {
     // could never observe a ruleset still blocking — a check that cannot fail.
     // Pin the input the verifier must be able to see.
     assert_eq!(cover_state_from(true, Some(true), Some(true)), CoverState::Engaged);
-    assert!(super::verify_disengaged(CoverState::Engaged).is_err());
+    assert!(super::super::verify_disengaged(CoverState::Engaged).is_err());
     // ...and the vacuous one it would see if the file were gone first.
     assert_eq!(cover_state_from(false, None, None), CoverState::Absent);
-    assert!(super::verify_disengaged(CoverState::Absent).is_ok());
+    assert!(super::super::verify_disengaged(CoverState::Absent).is_ok());
 }
 
 #[skuld::test]

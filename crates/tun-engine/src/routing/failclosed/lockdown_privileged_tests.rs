@@ -581,6 +581,7 @@ fn lockdown_lockout_macos_cover_state_tracks_engage_and_disengage() {
 /// primitive on a real cover and cross-checks the claim against the probe —
 /// previously the Windows implementation discarded every delete result, so its
 /// Ok meant only that the FWPM engine had opened.
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 #[skuld::test(labels = [TUN], serial = TUN)]
 fn lockdown_lockout_disengage_ok_means_the_cover_is_gone() {
     let dir = tempfile::tempdir().unwrap();

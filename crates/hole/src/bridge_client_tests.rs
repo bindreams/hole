@@ -34,6 +34,7 @@ async fn spawn_mock_bridge(path: &std::path::Path) -> tokio::task::JoinHandle<()
                     lockdown_enabled: false,
                     lockdown_active: false,
                     held_closed: false,
+                    cover_state_unknown: false,
                     blocked_until_connected: false,
                 })
             }),
@@ -129,6 +130,7 @@ fn send_status_request_receives_response() {
                 lockdown_enabled: false,
                 lockdown_active: false,
                 held_closed: false,
+                cover_state_unknown: false,
                 blocked_until_connected: false,
             }
         );
@@ -458,6 +460,7 @@ async fn spawn_error_bridge(path: &std::path::Path) -> tokio::task::JoinHandle<(
                     lockdown_enabled: false,
                     lockdown_active: false,
                     held_closed: false,
+                    cover_state_unknown: false,
                     blocked_until_connected: false,
                 })
             }),
@@ -612,6 +615,7 @@ async fn spawn_status_mock(path: &std::path::Path, version: Option<&'static str>
                 lockdown_enabled: false,
                 lockdown_active: false,
                 held_closed: false,
+                cover_state_unknown: false,
                 blocked_until_connected: false,
             })
         }),

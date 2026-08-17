@@ -231,6 +231,14 @@ impl Routing for MockRouting {
         Ok(())
     }
 
+    fn transient_cover_state(&self) -> CoverState {
+        CoverState::Absent
+    }
+
+    fn sweep_transient(&self) -> Result<(), RoutingError> {
+        Ok(())
+    }
+
     fn install_lockdown(
         &self,
         _server_ip: IpAddr,
@@ -630,6 +638,7 @@ fn status_when_not_running_returns_false() {
                 lockdown_enabled: false,
                 lockdown_active: false,
                 held_closed: false,
+                cover_state_unknown: false,
                 blocked_until_connected: false,
             }
         );

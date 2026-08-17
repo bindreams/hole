@@ -43,6 +43,7 @@ fn cell_bumps_seq_only_on_change() {
             lockdown_enabled: false,
             lockdown_active: false,
             held_closed: false,
+            cover_state_unknown: false,
             blocked_until_connected: false
         }
     );
@@ -58,6 +59,7 @@ fn cell_bumps_seq_only_on_change() {
             lockdown_enabled: false,
             lockdown_active: false,
             held_closed: false,
+            cover_state_unknown: false,
             blocked_until_connected: false
         }
     );
@@ -71,6 +73,7 @@ fn cell_bumps_seq_only_on_change() {
             lockdown_enabled: false,
             lockdown_active: false,
             held_closed: false,
+            cover_state_unknown: false,
             blocked_until_connected: false
         }
     );
@@ -93,6 +96,7 @@ async fn cell_wakes_watchers_only_on_change() {
             lockdown_enabled: false,
             lockdown_active: false,
             held_closed: false,
+            cover_state_unknown: false,
             blocked_until_connected: false,
         }
     );
@@ -112,6 +116,7 @@ fn commit_status_carries_lockdown_fields() {
             enabled: true,
             active: false,
             held_closed: false,
+            cover_state_unknown: false,
             blocked_until_connected: false,
         },
     );
@@ -133,6 +138,7 @@ fn commit_preserves_lockdown_fields() {
             enabled: true,
             active: false,
             held_closed: false,
+            cover_state_unknown: false,
             blocked_until_connected: false,
         },
     ); // running + lockdown enabled, not active
@@ -164,6 +170,7 @@ fn commit_clears_blocked_on_a_settled_running_edge() {
             enabled: false,
             active: false,
             held_closed: false,
+            cover_state_unknown: false,
             blocked_until_connected: true,
         },
     ); // enter the blocked state
@@ -196,6 +203,7 @@ fn commit_status_carries_error_on_death() {
             enabled: false,
             active: false,
             held_closed: false,
+            cover_state_unknown: false,
             blocked_until_connected: false,
         },
     );
@@ -217,6 +225,7 @@ fn commit_clears_error_on_non_status_running_change() {
             enabled: false,
             active: false,
             held_closed: false,
+            cover_state_unknown: false,
             blocked_until_connected: false,
         },
     ); // running -> true with an error
@@ -236,6 +245,7 @@ fn reconnect_clears_death_error() {
             enabled: false,
             active: false,
             held_closed: false,
+            cover_state_unknown: false,
             blocked_until_connected: false,
         },
     );
@@ -254,6 +264,7 @@ fn proxy_snapshot_serializes_error() {
         lockdown_enabled: false,
         lockdown_active: false,
         held_closed: false,
+        cover_state_unknown: false,
         blocked_until_connected: false,
     })
     .unwrap();
@@ -265,6 +276,7 @@ fn proxy_snapshot_serializes_error() {
         lockdown_enabled: false,
         lockdown_active: false,
         held_closed: false,
+        cover_state_unknown: false,
         blocked_until_connected: false,
     })
     .unwrap();
@@ -286,6 +298,7 @@ fn observed_error_only_from_status_ok() {
         lockdown_enabled: false,
         lockdown_active: false,
         held_closed: false,
+        cover_state_unknown: false,
         blocked_until_connected: false,
     });
     assert_eq!(
@@ -309,6 +322,7 @@ fn status_resp(running: bool) -> BridgeResponse {
         lockdown_enabled: false,
         lockdown_active: false,
         held_closed: false,
+        cover_state_unknown: false,
         blocked_until_connected: false,
     }
 }
@@ -463,6 +477,7 @@ fn status_response(running: bool) -> StatusResponse {
         lockdown_enabled: false,
         lockdown_active: false,
         held_closed: false,
+        cover_state_unknown: false,
         blocked_until_connected: false,
     }
 }
@@ -579,6 +594,7 @@ async fn start_ack_commits_true() {
             lockdown_enabled: false,
             lockdown_active: false,
             held_closed: false,
+            cover_state_unknown: false,
             blocked_until_connected: false
         }
     );
@@ -633,6 +649,7 @@ async fn transport_error_commits_false() {
             lockdown_enabled: false,
             lockdown_active: false,
             held_closed: false,
+            cover_state_unknown: false,
             blocked_until_connected: false
         }
     );
@@ -659,6 +676,7 @@ async fn transport_error_holds_snapshot_while_marker_present() {
             lockdown_enabled: false,
             lockdown_active: false,
             held_closed: false,
+            cover_state_unknown: false,
             blocked_until_connected: false
         },
         "marker present => transport error holds the last snapshot"
@@ -880,6 +898,7 @@ fn commit_update_failed_applies_a_lockdown_change() {
             enabled: false,
             active: false,
             held_closed: false,
+            cover_state_unknown: false,
             blocked_until_connected: false,
         },
     ); // connected, no lockdown
@@ -889,6 +908,7 @@ fn commit_update_failed_applies_a_lockdown_change() {
             enabled: true,
             active: false,
             held_closed: false,
+            cover_state_unknown: false,
             blocked_until_connected: false,
         }),
     );
@@ -906,6 +926,7 @@ fn commit_update_failed_applies_a_lockdown_change() {
             enabled: true,
             active: false,
             held_closed: false,
+            cover_state_unknown: false,
             blocked_until_connected: false,
         }),
     );
@@ -917,6 +938,7 @@ fn commit_update_failed_applies_a_lockdown_change() {
             enabled: true,
             active: true,
             held_closed: false,
+            cover_state_unknown: false,
             blocked_until_connected: false,
         }),
     );
@@ -1010,6 +1032,7 @@ async fn oneshot_never_commits() {
             lockdown_enabled: false,
             lockdown_active: false,
             held_closed: false,
+            cover_state_unknown: false,
             blocked_until_connected: false
         }
     );
@@ -1044,6 +1067,7 @@ async fn untracked_requests_never_commit() {
             lockdown_enabled: false,
             lockdown_active: false,
             held_closed: false,
+            cover_state_unknown: false,
             blocked_until_connected: false
         }
     );
@@ -1108,6 +1132,7 @@ async fn concurrent_requests_commit_in_bridge_order() {
             lockdown_enabled: false,
             lockdown_active: false,
             held_closed: false,
+            cover_state_unknown: false,
             blocked_until_connected: false
         }
     );
@@ -1173,6 +1198,7 @@ async fn reload_if_running_reloads_when_running() {
             lockdown_enabled: false,
             lockdown_active: false,
             held_closed: false,
+            cover_state_unknown: false,
             blocked_until_connected: false
         }
     );
@@ -1218,6 +1244,7 @@ fn classify_lockdown_is_fail_closed_three_state() {
             lockdown_enabled,
             lockdown_active: lockdown_enabled,
             held_closed: false,
+            cover_state_unknown: false,
             blocked_until_connected: false,
         })
     };
@@ -1249,6 +1276,7 @@ fn classify_lockdown_is_fail_closed_three_state() {
             enabled: true,
             active: true,
             held_closed: false,
+            cover_state_unknown: false,
             blocked_until_connected: false
         })
     );

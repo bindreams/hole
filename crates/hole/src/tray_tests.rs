@@ -17,7 +17,7 @@ use std::sync::Mutex;
 fn tray_actions_blocked_offers_retry_and_go_offline() {
     // A covered start failed → host fail-closed while not running: a distinct
     // blocked state (never silent Disconnected), Retry (covered) + Go Offline.
-    let a = tray_actions(false, None, true, false);
+    let a = tray_actions(false, None, &flags(false, false, false, false, true));
     assert_eq!(a.status, "Blocked — connect failed");
     assert_eq!(a.action_id, ID_BLOCKED_RETRY);
     assert_eq!(a.action_text, "Retry");
@@ -28,20 +28,32 @@ fn tray_actions_blocked_offers_retry_and_go_offline() {
 fn tray_actions_running_and_transition_take_precedence_over_blocked() {
     // A live transition or a running proxy is never overridden by a stale blocked
     // flag (blocked applies only when not running and not mid-transition).
-    let running = tray_actions(true, None, true, false);
+    let running = tray_actions(true, None, &flags(false, false, false, false, true));
     assert_eq!(running.action_id, ID_DISCONNECT);
     assert!(!running.show_go_offline);
-    let connecting = tray_actions(false, Some(true), true, false);
+    let connecting = tray_actions(false, Some(true), &flags(false, false, false, false, true));
     assert_eq!(connecting.status, "Connecting...");
     assert!(!connecting.show_go_offline);
 }
 
 #[skuld::test]
 fn tray_actions_normal_states_unchanged() {
-    assert_eq!(tray_actions(false, None, false, false).action_id, ID_CONNECT);
-    assert_eq!(tray_actions(false, None, false, false).status, "Disconnected");
-    assert_eq!(tray_actions(true, None, false, false).action_id, ID_DISCONNECT);
-    assert_eq!(tray_actions(true, None, false, false).status, "Connected");
+    assert_eq!(
+        tray_actions(false, None, &flags(false, false, false, false, false)).action_id,
+        ID_CONNECT
+    );
+    assert_eq!(
+        tray_actions(false, None, &flags(false, false, false, false, false)).status,
+        "Disconnected"
+    );
+    assert_eq!(
+        tray_actions(true, None, &flags(false, false, false, false, false)).action_id,
+        ID_DISCONNECT
+    );
+    assert_eq!(
+        tray_actions(true, None, &flags(false, false, false, false, false)).status,
+        "Connected"
+    );
 }
 
 #[skuld::test]
@@ -172,7 +184,7 @@ fn persist_intended_enabled_writes_only_on_change(#[fixture(temp_dir)] dir: &Pat
 #[skuld::test]
 fn lockdown_enabled_but_inactive_renders_warning_label() {
     // enabled && !active must never render silent green — it is a warning.
-    let label = lockdown_menu_label(true, false, false);
+    let label = lockdown_menu_label(&flags(true, false, false, false, false));
     assert!(
         label.to_lowercase().contains("warning") || label.contains('!'),
         "enabled+inactive must signal a warning, got {label:?}"
@@ -181,13 +193,13 @@ fn lockdown_enabled_but_inactive_renders_warning_label() {
 
 #[skuld::test]
 fn lockdown_active_renders_on_label() {
-    let label = lockdown_menu_label(true, true, false);
+    let label = lockdown_menu_label(&flags(true, true, false, false, false));
     assert!(label.to_lowercase().contains("on") || label.to_lowercase().contains("lockdown"));
 }
 
 #[skuld::test]
 fn lockdown_off_renders_plain_label() {
-    let label = lockdown_menu_label(false, false, false);
+    let label = lockdown_menu_label(&flags(false, false, false, false, false));
     assert!(!label.to_lowercase().contains("warning"));
 }
 
@@ -220,6 +232,7 @@ fn status_resp(running: bool) -> BridgeResponse {
         lockdown_enabled: false,
         lockdown_active: false,
         held_closed: false,
+        cover_state_unknown: false,
         blocked_until_connected: false,
     }
 }
@@ -245,6 +258,7 @@ fn status_resp_blocked() -> BridgeResponse {
             lockdown_enabled,
             lockdown_active,
             held_closed: false,
+            cover_state_unknown: false,
             blocked_until_connected: true,
         },
         other => other,
@@ -357,11 +371,22 @@ fn external_bridge_denied_toast_is_actionable() {
     assert!(toast.contains("gui.log"), "{toast}");
 }
 
+/// Terse `LockdownFlags` for the pure tray tests, in menu-render order.
+fn flags(enabled: bool, active: bool, held_closed: bool, unknown: bool, blocked: bool) -> LockdownFlags {
+    LockdownFlags {
+        enabled,
+        active,
+        held_closed,
+        unknown,
+        blocked,
+    }
+}
+
 // Kill-switch lockout UX ==============================================================================================
 
 #[skuld::test]
 fn tray_actions_held_closed_offers_a_release() {
-    let a = tray_actions(false, None, false, true);
+    let a = tray_actions(false, None, &flags(false, false, true, false, false));
     assert_eq!(a.status, "Hole is holding your network closed");
     assert!(a.show_release_lockdown, "the way out must be on the menu");
     assert_eq!(a.action_id, ID_CONNECT, "connecting also restores service");
@@ -369,19 +394,24 @@ fn tray_actions_held_closed_offers_a_release() {
 
 #[skuld::test]
 fn tray_actions_held_closed_outranks_blocked() {
-    // Go Offline drops only the TRANSIENT cover, so offering it as the one way out
-    // of a standing cover would leave the user just as blocked.
-    let a = tray_actions(false, None, true, true);
+    // Go Offline drops only the TRANSIENT cover, so it cannot be the whole story
+    // when a standing cover is also up — but it is still the escape for the one
+    // this process holds, so both must be offered.
+    let a = tray_actions(false, None, &flags(false, false, true, false, true));
     assert_eq!(a.status, "Hole is holding your network closed");
+    assert_ne!(
+        a.action_id, ID_BLOCKED_RETRY,
+        "the held-closed arm owns the status line"
+    );
     assert!(a.show_release_lockdown);
-    assert!(!a.show_go_offline);
+    assert!(a.show_go_offline, "the transient cover keeps its own escape");
 }
 
 #[skuld::test]
 fn tray_actions_held_closed_shown_even_while_running() {
     // A session that owns no cover can be "running" over a host the stale
     // block-all is killing; rendering that as Connected offers no way out.
-    let a = tray_actions(true, None, false, true);
+    let a = tray_actions(true, None, &flags(false, false, true, false, false));
     assert_eq!(a.status, "Hole is holding your network closed");
     assert!(a.show_release_lockdown);
     assert_eq!(a.action_id, ID_DISCONNECT);
@@ -390,7 +420,7 @@ fn tray_actions_held_closed_shown_even_while_running() {
 #[skuld::test]
 fn tray_actions_held_closed_defers_to_a_transition() {
     for target in [true, false] {
-        let a = tray_actions(false, Some(target), false, true);
+        let a = tray_actions(false, Some(target), &flags(false, false, true, false, false));
         assert!(
             !a.show_release_lockdown,
             "a live transition owns the menu, same as the blocked state"
@@ -400,18 +430,24 @@ fn tray_actions_held_closed_defers_to_a_transition() {
 
 #[skuld::test]
 fn tray_actions_without_held_closed_are_unchanged() {
-    assert_eq!(tray_actions(false, None, false, false).status, "Disconnected");
-    assert_eq!(tray_actions(true, None, false, false).status, "Connected");
     assert_eq!(
-        tray_actions(false, None, true, false).status,
+        tray_actions(false, None, &flags(false, false, false, false, false)).status,
+        "Disconnected"
+    );
+    assert_eq!(
+        tray_actions(true, None, &flags(false, false, false, false, false)).status,
+        "Connected"
+    );
+    assert_eq!(
+        tray_actions(false, None, &flags(false, false, false, false, true)).status,
         "Blocked — connect failed"
     );
-    assert!(!tray_actions(false, None, true, false).show_release_lockdown);
+    assert!(!tray_actions(false, None, &flags(false, false, false, false, true)).show_release_lockdown);
 }
 
 #[skuld::test]
 fn lockdown_label_off_but_held_closed_points_at_the_release() {
-    let label = lockdown_menu_label(false, true, true);
+    let label = lockdown_menu_label(&flags(false, true, true, false, false));
     assert!(
         label.contains("Unblock Network"),
         "a blocked-state label must name the action that ends it: {label}"
@@ -422,26 +458,32 @@ fn lockdown_label_off_but_held_closed_points_at_the_release() {
 fn lockdown_label_off_but_session_owns_the_cover_says_on_reconnect() {
     // Traffic is flowing here — claiming the network is blocked would be a
     // false alarm. Settings apply on reconnect, so say that.
-    let label = lockdown_menu_label(false, true, false);
+    let label = lockdown_menu_label(&flags(false, true, false, false, false));
     assert!(label.contains("reconnect"), "{label}");
     assert!(!label.contains("blocking"), "{label}");
 }
 
 #[skuld::test]
 fn lockdown_label_arms_unaffected_by_held_closed_are_unchanged() {
-    assert_eq!(lockdown_menu_label(true, true, false), "Lockdown: On");
     assert_eq!(
-        lockdown_menu_label(true, false, false),
+        lockdown_menu_label(&flags(true, true, false, false, false)),
+        "Lockdown: On"
+    );
+    assert_eq!(
+        lockdown_menu_label(&flags(true, false, false, false, false)),
         "Lockdown: On (warning: not engaged)"
     );
-    assert_eq!(lockdown_menu_label(false, false, false), "Lockdown");
+    assert_eq!(
+        lockdown_menu_label(&flags(false, false, false, false, false)),
+        "Lockdown"
+    );
 }
 
 #[skuld::test]
 fn lockdown_click_intent_off_but_held_closed_releases() {
     // The arm whose label warns the network is blocked must not ARM the switch.
     assert!(
-        !lockdown_click_intent(false, true),
+        !lockdown_click_intent(&flags(false, false, true, false, false)),
         "clicking the still-blocking item must re-release, not arm"
     );
 }
@@ -452,16 +494,25 @@ fn lockdown_click_intent_off_while_a_session_owns_the_cover_re_arms() {
     // reconnect. Reading that as "still blocking" would make the switch
     // impossible to turn back on without disconnecting first.
     assert!(
-        lockdown_click_intent(false, false),
+        lockdown_click_intent(&flags(false, false, false, false, false)),
         "a session-owned cover is not a lockout; the click must re-arm"
     );
 }
 
 #[skuld::test]
 fn lockdown_click_intent_toggles_every_other_arm() {
-    assert!(lockdown_click_intent(false, false), "off + nothing held closed arms it");
-    assert!(!lockdown_click_intent(true, true), "on + held closed disarms it");
-    assert!(!lockdown_click_intent(true, false), "on + not held closed disarms it");
+    assert!(
+        lockdown_click_intent(&flags(false, false, false, false, false)),
+        "off + nothing held closed arms it"
+    );
+    assert!(
+        !lockdown_click_intent(&flags(true, false, true, false, false)),
+        "on + held closed disarms it"
+    );
+    assert!(
+        !lockdown_click_intent(&flags(true, false, false, false, false)),
+        "on + not held closed disarms it"
+    );
 }
 
 #[skuld::test]
@@ -473,5 +524,54 @@ fn release_failed_message_names_the_unlock_command() {
         assert!(m.contains("Administrator"), "{m}");
     } else {
         assert!(m.contains("sudo"), "{m}");
+    }
+}
+
+#[skuld::test]
+fn tray_actions_unknown_cover_does_not_claim_we_are_blocking() {
+    // A wedged firewall engine makes this state permanent on Windows. Asserting
+    // "Hole is holding your network closed" would be a claim never observed, over
+    // a host that is probably open — the original complaint, from a new cause.
+    let a = tray_actions(false, None, &flags(false, false, true, true, false));
+    assert_eq!(a.status, "Hole cannot tell whether it is blocking your network");
+    assert!(a.show_release_lockdown, "the way out must still be offered");
+}
+
+#[skuld::test]
+fn tray_actions_both_covers_offer_both_escapes() {
+    // Unblock Network clears only what no in-process guard owns; the live blocked
+    // start owns the other. One action alone would leave the user just as blocked.
+    let a = tray_actions(false, None, &flags(false, true, true, false, true));
+    assert!(a.show_release_lockdown);
+    assert!(a.show_go_offline, "the transient cover needs its own escape too");
+}
+
+#[skuld::test]
+fn lockdown_click_intent_unknown_probe_can_still_arm() {
+    // Otherwise a machine whose firewall engine is wedged could never arm the
+    // kill switch again — a permanent loss of the feature from an unobserved state.
+    assert!(
+        lockdown_click_intent(&flags(false, false, true, true, false)),
+        "an unconfirmed cover must not pin the switch off"
+    );
+}
+
+#[skuld::test]
+fn lockdown_label_unknown_cover_says_it_cannot_confirm() {
+    let label = lockdown_menu_label(&flags(false, true, true, true, false));
+    assert!(label.contains("cannot confirm"), "{label}");
+    assert!(label.contains("Unblock Network"), "{label}");
+}
+
+#[skuld::test]
+fn release_failed_message_has_no_stray_whitespace_runs() {
+    // User-visible dialog copy: a line-continuation in the source once left a
+    // ten-space gap mid-sentence.
+    let m = release_failed_message();
+    for line in m.lines() {
+        assert!(
+            !line.trim_start().contains("  "),
+            "whitespace run mid-line in user-facing copy: {line:?}"
+        );
     }
 }

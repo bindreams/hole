@@ -283,7 +283,7 @@ async fn handle_status<P: Proxy + 'static, R: Routing + 'static>(
     // One probe, so both flags describe the same instant: the firewall is not
     // under this lock, and a concurrent `hole bridge unlock` between two reads
     // would yield a pair no real state produces.
-    let (lockdown_active, held_closed) = pm.cover_status();
+    let cover = pm.cover_status();
     Json(StatusResponse {
         running: pm.state() == ProxyState::Running,
         uptime_secs: pm.uptime_secs(),
@@ -296,8 +296,9 @@ async fn handle_status<P: Proxy + 'static, R: Routing + 'static>(
         udp_proxy_available: pm.udp_proxy_available(),
         ipv6_bypass_available: pm.ipv6_bypass_available(),
         lockdown_enabled: pm.lockdown_enabled(),
-        lockdown_active,
-        held_closed,
+        lockdown_active: cover.lockdown_active,
+        held_closed: cover.held_closed,
+        cover_state_unknown: cover.cover_state_unknown,
         blocked_until_connected: pm.blocked_until_connected(),
     })
 }

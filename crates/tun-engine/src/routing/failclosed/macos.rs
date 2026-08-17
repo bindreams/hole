@@ -50,11 +50,12 @@ pub fn build_pf_ruleset(server_ip: IpAddr, resolver_ip: Option<IpAddr>) -> Strin
         .unwrap_or_default();
     format!(
         "set block-policy drop\n\
-         block out all\n\
+         {block}\n\
          pass out quick on lo0 all\n\
          pass in quick on lo0 all\n\
          pass out quick from any to {server_ip}\n\
-         {resolver_pass}"
+         {resolver_pass}",
+        block = TRANSIENT_BLOCK_RULE,
     )
 }
 
@@ -282,6 +283,24 @@ fn disengage(token: &str, state_dir: &Path, adopting: bool) {
     }
 }
 
+/// The transient ruleset's fail-closed base, distinct from
+/// [`LOCKDOWN_BLOCK_RULE`]. Named once so [`build_pf_ruleset`] and the probe
+/// cannot drift apart.
+pub const TRANSIENT_BLOCK_RULE: &str = "block out all";
+
+/// Whether the TRANSIENT cover is holding the host closed. Same shape as
+/// [`lockdown_cover_state`]: no state file short-circuits to `Absent` with no
+/// subprocess, an unreadable `pfctl` is `Unknown`, and pf must be enabled with
+/// our own ruleset loaded to read `Engaged`.
+pub fn transient_cover_state(state_dir: &Path) -> CoverState {
+    if state::load(state_dir).is_none() {
+        return cover_state_from(false, None, None);
+    }
+    let enabled = read_pf(&["-s", "info"]).map(|out| parse_pf_enabled(&out));
+    let carries = read_pf(&["-sr"]).map(|out| out.contains(TRANSIENT_BLOCK_RULE));
+    cover_state_from(true, enabled, carries)
+}
+
 /// Fail-loud transient sweep for `bridge unlock`. Unlike [`recover_cover`],
 /// which is best-effort because startup recovery has no caller to act on a
 /// failure, this PROPAGATES: `unlock` promises the user that a success means
@@ -305,6 +324,10 @@ pub fn sweep_transient_verified(state_dir: &Path) -> Result<(), RoutingError> {
             String::from_utf8_lossy(&xout.stderr).trim()
         )));
     }
+    // Verify BEFORE clearing, for the same reason `disengage_lockdown` does: the
+    // state file is this cover's only evidence, so clearing it first would make
+    // the probe read `Absent` and the check vacuous.
+    super::verify_disengaged(transient_cover_state(state_dir))?;
     state::clear(state_dir).map_err(|e| RoutingError::RouteSetup(format!("failclosed-state clear failed: {e}")))
 }
 
@@ -470,16 +493,20 @@ pub fn disengage_lockdown(state_dir: &Path) -> Result<(), RoutingError> {
             String::from_utf8_lossy(&xout.stderr).trim()
         )));
     }
-    // Probe BEFORE clearing: `lockdown_cover_state` short-circuits to `Absent`
-    // on a missing state file, so verifying afterwards would assert a tautology
-    // and never observe a ruleset that is still blocking.
-    let observed = lockdown_cover_state(state_dir);
-    // State cleared only after a confirmed restore — a failed clear is the only
-    // remaining best-effort step (the cover is already down).
+    // Probe BEFORE clearing: `lockdown_cover_state` short-circuits to `Absent` on
+    // a missing state file, so verifying afterwards would assert a tautology and
+    // never observe a ruleset that is still blocking.
+    super::verify_disengaged(lockdown_cover_state(state_dir))?;
+    // Clear ONLY once the probe confirms the host is open. The state file is the
+    // sole evidence this cover exists: deleting it under a live ruleset makes the
+    // probe read `Absent`, so every escape then reports success and does nothing
+    // — and the next `FreshEnable` would snapshot our own blocking ruleset as
+    // "the host". A failed clear over an already-open host is the one remaining
+    // best-effort step.
     if let Err(e) = lockdown_state::clear(state_dir) {
         tracing::warn!(error = %e, "lockdown-pf-state clear failed after disengage");
     }
-    super::verify_disengaged(observed)
+    Ok(())
 }
 
 /// Map the two pf reads to a [`CoverState`]. `None` means that `pfctl`

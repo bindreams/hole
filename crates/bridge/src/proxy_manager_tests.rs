@@ -203,6 +203,11 @@ struct MockRoutingState {
     /// How many times `disengage_lockdown` was called, and what it returns.
     standing_disengage_calls: AtomicU32,
     fail_standing_disengage: AtomicBool,
+    /// The transient cover's OS-truth probe, and its sweep's call count/result.
+    transient_state: std::sync::Mutex<CoverState>,
+    transient_state_calls: AtomicU32,
+    transient_sweep_calls: AtomicU32,
+    fail_transient_sweep: AtomicBool,
 }
 
 impl Default for MockRoutingState {
@@ -222,6 +227,10 @@ impl Default for MockRoutingState {
             cover_state_calls: AtomicU32::new(0),
             standing_disengage_calls: AtomicU32::new(0),
             fail_standing_disengage: AtomicBool::new(false),
+            transient_state: std::sync::Mutex::new(CoverState::Absent),
+            transient_state_calls: AtomicU32::new(0),
+            transient_sweep_calls: AtomicU32::new(0),
+            fail_transient_sweep: AtomicBool::new(false),
             teardown_order: std::sync::Mutex::new(Vec::new()),
             last_install_server_ip: std::sync::Mutex::new(None),
             last_cover_server_ip: std::sync::Mutex::new(None),
@@ -381,6 +390,20 @@ impl Routing for MockRouting {
             return Err(RoutingError::RouteSetup("mock disengage failure".into()));
         }
         *self.state.cover_state.lock().unwrap() = CoverState::Absent;
+        Ok(())
+    }
+
+    fn transient_cover_state(&self) -> CoverState {
+        self.state.transient_state_calls.fetch_add(1, Ordering::SeqCst);
+        *self.state.transient_state.lock().unwrap()
+    }
+
+    fn sweep_transient(&self) -> Result<(), RoutingError> {
+        self.state.transient_sweep_calls.fetch_add(1, Ordering::SeqCst);
+        if self.state.fail_transient_sweep.load(Ordering::SeqCst) {
+            return Err(RoutingError::RouteSetup("mock transient sweep failure".into()));
+        }
+        *self.state.transient_state.lock().unwrap() = CoverState::Absent;
         Ok(())
     }
 }
@@ -2214,12 +2237,108 @@ async fn cover_status_probes_the_os_once() {
     let (pm, state, _dir) = lockout_manager(CoverState::Engaged, true);
     state.cover_state_calls.store(0, Ordering::SeqCst);
 
-    let (active, held) = pm.cover_status();
-    assert!(active && held);
+    let cover = pm.cover_status();
+    assert!(cover.lockdown_active && cover.held_closed);
+    assert!(!cover.cover_state_unknown, "an observed cover is not an unknown one");
     assert_eq!(
         state.cover_state_calls.load(Ordering::SeqCst),
         1,
-        "one status read must cost exactly one OS probe"
+        "one status read must cost exactly one probe of the standing cover"
+    );
+    assert_eq!(
+        state.transient_state_calls.load(Ordering::SeqCst),
+        1,
+        "and exactly one of the transient cover"
+    );
+}
+
+#[skuld::test]
+async fn held_closed_true_for_a_stranded_transient_cover() {
+    // A crash mid-connect leaves the transient cover's persistent filters holding
+    // the host, with no guard in the new process and no lockdown state at all.
+    // Without probing its keys the tray renders plain "Disconnected" over a dead
+    // host and offers nothing.
+    let (pm, state, _dir) = lockout_manager(CoverState::Absent, false);
+    *state.transient_state.lock().unwrap() = CoverState::Engaged;
+
+    assert!(!pm.lockdown_active(), "no standing cover is engaged");
+    assert!(pm.held_closed(), "but the host is still held closed");
+}
+
+#[skuld::test]
+async fn lockdown_off_sweeps_a_stranded_transient_cover() {
+    let (pm, state, _dir) = lockout_manager(CoverState::Absent, false);
+    *state.transient_state.lock().unwrap() = CoverState::Engaged;
+
+    pm.set_lockdown_intent(false).expect("release clears both covers");
+    assert_eq!(state.transient_sweep_calls.load(Ordering::SeqCst), 1);
+    assert!(!pm.held_closed(), "and the host is open again");
+}
+
+#[skuld::test]
+async fn lockdown_off_keeps_intent_on_when_the_transient_sweep_fails() {
+    let (pm, state, dir) = lockout_manager(CoverState::Absent, true);
+    *state.transient_state.lock().unwrap() = CoverState::Engaged;
+    state.fail_transient_sweep.store(true, Ordering::SeqCst);
+
+    assert!(
+        pm.set_lockdown_intent(false).is_err(),
+        "an observed cover that would not clear must fail loud"
+    );
+    assert!(
+        lockdown_state::load_enabled(dir.path()),
+        "intent must stay ON while any cover is still holding the host"
+    );
+}
+
+#[skuld::test]
+async fn lockdown_off_leaves_a_transient_cover_this_process_holds() {
+    // `self.blocked` IS that cover, `stop_with` owns it, and on macOS the standing
+    // restore reloads a whole ruleset — running it here would tear the live cover
+    // down and open the host.
+    let dir = tempfile::tempdir().unwrap();
+    let routing = MockRouting::new(dir.path().to_path_buf());
+    let state = routing.state();
+    *state.cover_state.lock().unwrap() = CoverState::Engaged;
+    let (mut pm, dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, false);
+    let mut cfg = test_config();
+    cfg.server.server = "127.0.0.1".into();
+    // A covered start that fails leaves the transient cover held in-process.
+    let _ = pm.start_cancellable(&cfg, true, CancellationToken::new()).await;
+    if pm.blocked_until_connected() {
+        pm.set_lockdown_intent(false).expect("persist only");
+        assert_eq!(
+            state.standing_disengage_calls.load(Ordering::SeqCst),
+            0,
+            "a cover this process owns is the stop path's to release"
+        );
+        assert_eq!(state.transient_sweep_calls.load(Ordering::SeqCst), 0);
+    }
+    let _ = dir;
+}
+
+#[skuld::test]
+async fn cover_status_marks_an_unknown_probe_as_unknown() {
+    let (pm, _state, _dir) = lockout_manager(CoverState::Unknown, true);
+    let cover = pm.cover_status();
+    assert!(cover.held_closed, "an unanswerable probe still offers the escape");
+    assert!(
+        cover.cover_state_unknown,
+        "but must not be reported as an observed cover"
+    );
+}
+
+#[skuld::test]
+async fn cover_status_skips_the_transient_probe_while_this_process_owns_it() {
+    // `blocked_until_connected` already surfaces that cover; probing would only
+    // duplicate it and cost an OS call on every poll.
+    let (pm, state, _dir) = lockout_manager(CoverState::Absent, false);
+    state.transient_state_calls.store(0, Ordering::SeqCst);
+    let _ = pm.cover_status();
+    assert_eq!(
+        state.transient_state_calls.load(Ordering::SeqCst),
+        1,
+        "no in-process transient guard, so the probe runs"
     );
 }
 

@@ -323,20 +323,29 @@ components:
           type: boolean
           default: false
           description: >-
-            Whether a lockdown cover is engaged, as the OS reports it —
-            independent of whether a session is running, since a cover adopted
-            from a crashed run is owned by no process. A probe that cannot reach
-            the firewall reports true rather than claiming an all-clear it did
-            not observe.
+            Whether a standing lockdown cover is engaged. Read from the OS unless
+            a running session already holds the guard, which answers it without a
+            probe. Never derived from whether a session is running: a cover
+            adopted from a crashed run is owned by no process. A probe that cannot
+            reach the firewall reports true rather than claiming an all-clear it
+            did not observe.
         held_closed:
           type: boolean
           default: false
           description: >-
-            Whether a lockdown cover is engaged that no running session owns, so
-            the host has no working egress and no tunnel carrying traffic through
-            the block. Distinct from `lockdown_active`, which is also true for a
-            healthy protected session. serde-default false so older clients keep
-            today's behavior.
+            Whether a cover — standing OR transient — is engaged that no
+            in-process guard owns, so the host has no working egress and nothing
+            carrying traffic through the block. Distinct from `lockdown_active`,
+            which is also true for a healthy protected session. serde-default
+            false so older clients keep today's behavior.
+        cover_state_unknown:
+          type: boolean
+          default: false
+          description: >-
+            Whether the evidence behind `held_closed` is a probe that could not
+            reach the firewall rather than an observed cover. Telling a user Hole
+            is blocking them is a different claim from telling them Hole cannot
+            tell. serde-default false so older clients keep today's behavior.
         blocked_until_connected:
           type: boolean
           default: false

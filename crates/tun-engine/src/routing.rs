@@ -461,11 +461,25 @@ pub trait Routing: Send + Sync {
     /// not treat it as an open host.
     fn lockdown_cover_state(&self) -> failclosed::CoverState;
 
+    /// Whether the TRANSIENT block-until-connected cover is holding the host
+    /// closed, as the OS sees it. Separate from
+    /// [`lockdown_cover_state`](Self::lockdown_cover_state) because only the
+    /// standing cover's keys are what a lockdown disengage verifies — but a
+    /// crash strands this one just as persistently, and a host it holds would
+    /// otherwise report as plain "Disconnected" with no action offered.
+    fn transient_cover_state(&self) -> failclosed::CoverState;
+
+    /// Sweep a transient cover this process does not own, FAIL-LOUD and verified
+    /// by re-probing. An absent cover is `Ok`.
+    fn sweep_transient(&self) -> Result<(), RoutingError>;
+
     /// Disengage a standing lockdown cover, FAIL-LOUD. `Ok` means the OS confirms
-    /// the host is open — the implementation re-probes rather than trusting the
-    /// return of whatever it called. An absent cover is `Ok` (nothing to do); an
-    /// `Err` means egress may still be blocked, so a caller must not record the
-    /// kill switch as off.
+    /// OUR STANDING COVER is gone — the implementation re-probes rather than
+    /// trusting the return of whatever it called. It says nothing about a
+    /// transient cover, which has its own keys and its own
+    /// [`sweep_transient`](Self::sweep_transient); the host can still be blocked
+    /// by that one. An absent cover is `Ok`; an `Err` means the standing cover may
+    /// still be in force, so a caller must not record the kill switch as off.
     fn disengage_lockdown(&self) -> Result<(), RoutingError>;
 }
 
@@ -561,6 +575,14 @@ impl Routing for SystemRouting {
 
     fn disengage_lockdown(&self) -> Result<(), RoutingError> {
         failclosed::disengage_lockdown(&self.state_dir)
+    }
+
+    fn transient_cover_state(&self) -> failclosed::CoverState {
+        failclosed::transient_cover_state(&self.state_dir)
+    }
+
+    fn sweep_transient(&self) -> Result<(), RoutingError> {
+        failclosed::sweep_transient_verified(&self.state_dir)
     }
 }
 

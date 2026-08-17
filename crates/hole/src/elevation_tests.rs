@@ -290,6 +290,7 @@ fn classify_unexpected_ok_is_success() {
         lockdown_enabled: false,
         lockdown_active: false,
         held_closed: false,
+        cover_state_unknown: false,
         blocked_until_connected: false,
     });
     assert_eq!(classify_elevated_send(&r), ElevatedOutcome::Success);

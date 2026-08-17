@@ -156,6 +156,14 @@ impl Routing for StubRouting {
     fn disengage_lockdown(&self) -> Result<(), RoutingError> {
         Ok(())
     }
+
+    fn transient_cover_state(&self) -> tun_engine::routing::failclosed::CoverState {
+        tun_engine::routing::failclosed::CoverState::Absent
+    }
+
+    fn sweep_transient(&self) -> Result<(), RoutingError> {
+        Ok(())
+    }
 }
 
 struct StubRoutes {

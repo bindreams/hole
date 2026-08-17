@@ -263,10 +263,14 @@ const ID_RELEASE_LOCKDOWN: &str = "release_lockdown";
 /// pair means opposite things to a user: a cover no session owns is a lockout and
 /// must point at the release, while a live session's own cover is simply a
 /// setting that has not taken effect yet.
-fn lockdown_menu_label(enabled: bool, active: bool, held_closed: bool) -> String {
-    match (enabled, active, held_closed) {
+fn lockdown_menu_label(f: &LockdownFlags) -> String {
+    match (f.enabled, f.active, f.held_closed) {
         (true, true, _) => "Lockdown: On".into(),
         (true, false, _) => "Lockdown: On (warning: not engaged)".into(),
+        // Two very different states behind one pair: a cover nothing owns is a
+        // lockout and must name the way out, while a live session's own cover is
+        // just a setting waiting for the next reconnect.
+        (false, true, true) if f.unknown => "Lockdown: Off (cannot confirm — use Unblock Network)".into(),
         (false, true, true) => "Lockdown: Off (still blocking — use Unblock Network)".into(),
         (false, true, false) => "Lockdown: Off (applies on reconnect)".into(),
         (false, false, _) => "Lockdown".into(),
@@ -285,28 +289,41 @@ fn lockdown_menu_label(enabled: bool, active: bool, held_closed: bool) -> String
 /// is a live session holding its own cover, where the setting is simply waiting
 /// for the next reconnect. Treating that one as a re-release would make the kill
 /// switch impossible to re-arm without disconnecting first.
-fn lockdown_click_intent(enabled: bool, held_closed: bool) -> bool {
-    if !enabled && held_closed {
+///
+/// An UNKNOWN probe re-arms too. On Windows a wedged firewall engine makes
+/// `held_closed` permanently true without a cover ever being observed, and
+/// treating that as a standing re-release would leave the kill switch impossible
+/// to arm on that machine for good.
+fn lockdown_click_intent(f: &LockdownFlags) -> bool {
+    if !f.enabled && f.held_closed && !f.unknown {
         return false;
     }
-    !enabled
+    !f.enabled
 }
 
 /// Failure text for a release that did not open the host, naming the escape that
 /// works with no bridge and no GUI. An escape nobody can discover is not one.
 fn release_failed_message() -> &'static str {
     if cfg!(target_os = "windows") {
-        "Hole could not unblock your network.
+        concat!(
+            "Hole could not unblock your network.
 
-Your network is still being held closed by Hole.          To clear it, open a terminal as Administrator and run:
+",
+            "Your network may still be held closed by Hole. To clear it, open a terminal ",
+            "as Administrator and run:
 
     hole bridge unlock"
+        )
     } else {
-        "Hole could not unblock your network.
+        concat!(
+            "Hole could not unblock your network.
 
-Your network is still being held closed by Hole.          To clear it, open Terminal and run:
+",
+            "Your network may still be held closed by Hole. To clear it, open Terminal ",
+            "and run:
 
     sudo hole bridge unlock"
+        )
     }
 }
 
@@ -325,19 +342,29 @@ struct TrayActions {
     show_release_lockdown: bool,
 }
 
-fn tray_actions(running: bool, transition: Option<bool>, blocked: bool, held_closed: bool) -> TrayActions {
-    if held_closed && transition.is_none() {
+fn tray_actions(running: bool, transition: Option<bool>, f: &LockdownFlags) -> TrayActions {
+    if f.held_closed && transition.is_none() {
         // Deliberately not gated on `!running`: a session that owns no cover can
         // be "running" over a host the stale block-all is killing.
         return TrayActions {
-            status: "Hole is holding your network closed",
+            // "We are blocking you" and "we cannot tell whether we are" are
+            // different claims, and only one of them has been observed.
+            status: if f.unknown {
+                "Hole cannot tell whether it is blocking your network"
+            } else {
+                "Hole is holding your network closed"
+            },
             action_id: if running { ID_DISCONNECT } else { ID_CONNECT },
             action_text: if running { "Disconnect" } else { "Connect" },
-            show_go_offline: false,
+            // Both covers can hold the host at once, and Unblock Network clears
+            // only the ones no in-process guard owns — so when a live blocked
+            // start holds the other, offer its escape too or the single action
+            // leaves the user exactly as blocked.
+            show_go_offline: f.blocked && !running,
             show_release_lockdown: true,
         };
     }
-    if blocked && !running && transition.is_none() {
+    if f.blocked && !running && transition.is_none() {
         return TrayActions {
             status: "Blocked — connect failed",
             action_id: ID_BLOCKED_RETRY,
@@ -374,12 +401,16 @@ fn tray_actions(running: bool, transition: Option<bool>, blocked: bool, held_clo
 /// with the action item disabled. `lockdown_enabled`/`lockdown_active` render
 /// the standing kill-switch toggle (#527).
 /// The cover/kill-switch flags a menu renders, straight off the snapshot. A
-/// struct so the menu builder stays readable as the state space grows.
-struct LockdownFlags {
-    enabled: bool,
-    active: bool,
-    held_closed: bool,
-    blocked: bool,
+/// struct so the menu builder stays readable as the state space grows, and so
+/// five same-typed `bool`s are never threaded positionally.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LockdownFlags {
+    pub enabled: bool,
+    pub active: bool,
+    pub held_closed: bool,
+    /// `held_closed` rests on an unanswerable probe, not an observed cover.
+    pub unknown: bool,
+    pub blocked: bool,
 }
 
 impl LockdownFlags {
@@ -388,6 +419,7 @@ impl LockdownFlags {
             enabled: snap.lockdown_enabled,
             active: snap.lockdown_active,
             held_closed: snap.held_closed,
+            unknown: snap.cover_state_unknown,
             blocked: snap.blocked_until_connected,
         }
     }
@@ -402,13 +434,11 @@ fn build_tray_menu(
 ) -> Result<tauri::menu::Menu<tauri::Wry>, tauri::Error> {
     let LockdownFlags {
         enabled: lockdown_enabled,
-        active: lockdown_active,
-        held_closed,
-        blocked,
+        ..
     } = flags;
     // The action item carries the intent its label displays: a click dispatches
     // on the item ID, with no state read at click time (#462).
-    let acts = tray_actions(running, transition, blocked, held_closed);
+    let acts = tray_actions(running, transition, &flags);
 
     let status = MenuItem::with_id(app, ID_STATUS, acts.status, false, None::<&str>)?;
     let connect = MenuItem::with_id(
@@ -443,7 +473,7 @@ fn build_tray_menu(
     let lockdown = CheckMenuItem::with_id(
         app,
         ID_LOCKDOWN,
-        lockdown_menu_label(lockdown_enabled, lockdown_active, held_closed),
+        lockdown_menu_label(&flags),
         true,
         lockdown_enabled,
         None::<&str>,
@@ -948,7 +978,7 @@ fn handle_tray_event(app: &AppHandle, event: MenuEvent) {
             // the authority (last-writer-wins); send intent, re-fetch Status (which
             // commits the new lockdown fields), then rebuild from the reply.
             let snap = app.state::<AppState>().proxy_snapshot();
-            let desired = lockdown_click_intent(snap.lockdown_enabled, snap.held_closed);
+            let desired = lockdown_click_intent(&LockdownFlags::from_snapshot(&snap));
             info!(desired, "tray: lockdown toggled");
             let app_handle = app.clone();
             tauri::async_runtime::spawn(async move { send_lockdown_intent(app_handle, desired).await });
@@ -976,7 +1006,15 @@ async fn send_lockdown_intent(app: AppHandle, enabled: bool) {
     let _ = state.bridge_send(BridgeRequest::Status).await; // commits new snapshot
     rebuild_tray_menu(&app);
 
+    let still_held = app.state::<AppState>().proxy_snapshot().held_closed;
     let failed = match outcome {
+        Ok(BridgeResponse::Ack) if !enabled && still_held => {
+            // The bridge records the intent when it could not confirm a cover
+            // (see `release_unowned_cover`), so an Ack is not proof the host is
+            // open. Silence here would be the original complaint verbatim: the
+            // one remedy offered, clicked, and nothing visibly happens.
+            Some("intent recorded but the host is still reported held closed".to_string())
+        }
         Ok(BridgeResponse::Ack) => None,
         Ok(other) => Some(format!("unexpected reply: {other:?}")),
         Err(e) => Some(e.to_string()),

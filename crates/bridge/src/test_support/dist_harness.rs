@@ -566,6 +566,7 @@ impl BridgeIpcClient {
                         lockdown_enabled: status.lockdown_enabled,
                         lockdown_active: status.lockdown_active,
                         held_closed: status.held_closed,
+                        cover_state_unknown: status.cover_state_unknown,
                         blocked_until_connected: status.blocked_until_connected,
                     })
                 } else {
