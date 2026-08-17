@@ -574,13 +574,14 @@ pub(crate) enum CutoverDecision {
 /// mask commits nothing for either a transport error or a reachable
 /// `running: false`, and the only things that end it are a bridge start
 /// sweeping the marker — which never happens in the wedge the marker exists to
-/// catch — and confirming a driver this build could not identify. The report
-/// self-retracts for `Unreadable` specifically, because that state means the
-/// existence probe SUCCEEDED — a reachable directory holding a file this build
-/// cannot open or parse — and `clear` is remove-by-path and version-agnostic,
-/// so the first bridge to bind removes it with no user action. `Indeterminate`
-/// gets no such exit: nothing could even probe the path, and `clear` is an io
-/// call on that same path, so a report raised from it would be permanent.
+/// catch — and confirming a driver this build could not identify.
+///
+/// `Unreadable` leaves the retraction path OPEN, which is why it may report: the
+/// existence probe succeeded, so `clear` — remove-by-path and version-agnostic —
+/// addresses a reachable path, and the next bridge start ends the report with no
+/// user action. `Indeterminate` closes that path: nothing could even probe it,
+/// and `clear` is an io call on the same path that fails for the same reason, so
+/// a report raised here would be permanent. Hence PassThrough.
 pub(crate) fn cutover_decision(
     marker: &hole_common::update_marker::Marker,
     driver: cosca::identity::Liveness,
