@@ -53,11 +53,9 @@ fn clear_marker_on_failure_clears_only_on_err() {
     let dir = tempfile::tempdir().unwrap();
     let m = hole_common::update_marker::MarkerInfo {
         version: hole_common::update_marker::MARKER_VERSION,
-        from_version: "0.2.0".into(),
-        to_version: "0.3.0".into(),
-        driver_pid: 1,
-        started_at_unix: 0,
-        driver_start_unix_ms: 0,
+        driver: cosca::identity::ProcessId::current()
+            .to_record()
+            .expect("persist this process's identity"),
     };
     hole_common::update_marker::write(dir.path(), &m, None).unwrap();
     clear_marker_on_cutover_failure(&Ok(()), dir.path());

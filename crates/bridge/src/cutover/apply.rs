@@ -91,7 +91,7 @@ pub fn spawn_actor(
         // never ran.
         let mut child = windows::spawn_suspended_child(&staged, target_version)?;
         let pid = child.id();
-        let record = windows::record_spawned_driver(log_dir, pid, hole_common::process::process_start_time(pid));
+        let record = windows::record_spawned_driver(log_dir, cosca::Process::from_pid(pid));
         windows::record_resume_or_kill(&mut child, record, || windows::resume_main_thread(pid))?;
         // Dropping `child` closes our handle without killing the now-running process.
         Ok(())
@@ -144,23 +144,20 @@ mod windows {
     use super::breakaway_decision;
     use crate::cutover::extract::ExtractedImages;
 
-    /// Overwrite the marker's driver identity with the freshly-spawned child's
-    /// PID + start time. A real Windows creation FILETIME is never 0; a stamped
-    /// `0` is the poisoned sentinel the GUI reads as unassessed (a permanent mask
-    /// on a dead driver), so treat `Some(0)` (and `None`) as a failure — the
-    /// caller then kills the child and clears the marker rather than stamping a
-    /// poisoned identity.
+    /// Overwrite the marker's driver identity with the freshly-spawned child's.
+    /// A child that does not resolve — gone, or a query the OS refused — cannot
+    /// be named at all, so this fails and the caller kills the still-suspended
+    /// child and clears the marker rather than claiming an identity nothing can
+    /// verify.
     pub(super) fn record_spawned_driver(
         log_dir: &std::path::Path,
-        child_pid: u32,
-        start: Option<u64>,
+        child: cosca::identity::Resolved<cosca::Process>,
     ) -> std::io::Result<()> {
-        match start {
-            Some(s) if s != 0 => hole_common::update_marker::stamp_driver(log_dir, child_pid, s),
-            _ => Err(std::io::Error::other(
-                "could not record a valid cutover child start time",
-            )),
-        }
+        let cosca::identity::Resolved::Found(child) = child else {
+            return Err(std::io::Error::other("could not resolve the cutover child's identity"));
+        };
+        let record = child.id().to_record().map_err(std::io::Error::other)?;
+        hole_common::update_marker::stamp_driver(log_dir, &record)
     }
 
     /// Post-spawn composition for the suspended cutover child: apply `record`

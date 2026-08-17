@@ -1,5 +1,21 @@
 use super::*;
 
+/// A marker naming a chosen pid. Synthetic, so a test can pick the pid it
+/// discriminates on; inert data, so a `Windows` record builds on every host.
+fn info(pid: u32) -> MarkerInfo {
+    MarkerInfo {
+        version: MARKER_VERSION,
+        driver: cosca::identity::ProcessIdRecord {
+            version: cosca::identity::RECORD_VERSION,
+            platform: cosca::identity::Platform::Windows,
+            pid,
+            token: 133_700_000_000_000_000,
+            boot_id: None,
+            pid_ns: None,
+        },
+    }
+}
+
 /// The marker's payload, or a failure naming which arm answered instead.
 fn present(dir: &std::path::Path) -> MarkerInfo {
     match read(dir) {
@@ -18,14 +34,7 @@ fn absent_reads_as_absent() {
 #[skuld::test]
 fn valid_reads_as_present() {
     let dir = tempfile::tempdir().unwrap();
-    let info = MarkerInfo {
-        version: MARKER_VERSION,
-        from_version: "0.2.0".into(),
-        to_version: "0.3.0".into(),
-        driver_pid: 4242,
-        started_at_unix: 1_700_000_000,
-        driver_start_unix_ms: 0,
-    };
+    let info = info(4242);
     write(dir.path(), &info, None).unwrap();
 
     let Marker::Present(got) = read(dir.path()) else {
@@ -64,11 +73,7 @@ fn an_unknown_version_marker_reads_as_unreadable() {
     // refused by `deny_unknown_fields` first and would test nothing.
     let future = serde_json::json!({
         "version": 99,
-        "from_version": "0.3.0",
-        "to_version": "0.4.0",
-        "driver_pid": 7,
-        "started_at_unix": 1,
-        "driver_start_unix_ms": 0,
+        "driver": {"v": 1, "platform": "windows", "pid": 7, "token": "133700000000000000"},
     });
     std::fs::write(dir.path().join(MARKER_FILE), serde_json::to_vec(&future).unwrap()).unwrap();
     assert!(matches!(read(dir.path()), Marker::Unreadable));
@@ -83,15 +88,7 @@ fn an_unknown_version_marker_reads_as_unreadable() {
 fn marker_mode_is_world_readable() {
     use std::os::unix::fs::PermissionsExt;
     let dir = tempfile::tempdir().unwrap();
-    let info = MarkerInfo {
-        version: MARKER_VERSION,
-        from_version: "a".into(),
-        to_version: "b".into(),
-        driver_pid: 1,
-        started_at_unix: 0,
-        driver_start_unix_ms: 0,
-    };
-    write(dir.path(), &info, None).unwrap();
+    write(dir.path(), &info(1), None).unwrap();
     let mode = std::fs::metadata(dir.path().join(MARKER_FILE))
         .unwrap()
         .permissions()
@@ -102,27 +99,17 @@ fn marker_mode_is_world_readable() {
 #[skuld::test]
 fn write_new_is_an_atomic_single_occupancy_claim() {
     let dir = tempfile::tempdir().unwrap();
-    let info = MarkerInfo {
-        version: MARKER_VERSION,
-        from_version: "0.2.0".into(),
-        to_version: "0.3.0".into(),
-        driver_pid: 1,
-        started_at_unix: 0,
-        driver_start_unix_ms: 0,
-    };
+    let first = info(1);
     // First claim wins and the full content is readable (never a partial file).
-    write_new(dir.path(), &info, None).unwrap();
-    assert_eq!(present(dir.path()), info);
+    write_new(dir.path(), &first, None).unwrap();
+    assert_eq!(present(dir.path()), first);
 
     // A second claim loses with AlreadyExists (the race-free 409 guard) and does
     // not overwrite the first claim's content.
-    let other = MarkerInfo {
-        to_version: "9.9.9".into(),
-        ..info.clone()
-    };
+    let other = info(9999);
     let err = write_new(dir.path(), &other, None).unwrap_err();
     assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
-    assert_eq!(present(dir.path()).to_version, "0.3.0");
+    assert_eq!(present(dir.path()).driver.pid, 1);
 
     // No leftover temp file from either the win or the lost claim.
     let leftover = std::fs::read_dir(dir.path())
@@ -134,7 +121,7 @@ fn write_new_is_an_atomic_single_occupancy_claim() {
     // After a clear, the claim is available again.
     clear(dir.path()).unwrap();
     write_new(dir.path(), &other, None).unwrap();
-    assert_eq!(present(dir.path()).to_version, "9.9.9");
+    assert_eq!(present(dir.path()).driver.pid, 9999);
 }
 
 #[cfg(unix)]
@@ -142,15 +129,7 @@ fn write_new_is_an_atomic_single_occupancy_claim() {
 fn write_new_marker_mode_is_world_readable() {
     use std::os::unix::fs::PermissionsExt;
     let dir = tempfile::tempdir().unwrap();
-    let info = MarkerInfo {
-        version: MARKER_VERSION,
-        from_version: "a".into(),
-        to_version: "b".into(),
-        driver_pid: 1,
-        started_at_unix: 0,
-        driver_start_unix_ms: 0,
-    };
-    write_new(dir.path(), &info, None).unwrap();
+    write_new(dir.path(), &info(1), None).unwrap();
     let mode = std::fs::metadata(dir.path().join(MARKER_FILE))
         .unwrap()
         .permissions()
@@ -165,30 +144,51 @@ fn write_new_marker_mode_is_world_readable() {
 // `crates/hole/tests/elevated_ownership_privileged.rs`.
 
 #[skuld::test]
-fn stamp_driver_overwrites_only_driver_fields() {
+fn stamp_driver_replaces_the_driver_and_leaves_a_readable_marker() {
+    // "the version was preserved" is not asserted: with two fields left and
+    // every other version unreadable, `version == MARKER_VERSION` is the only
+    // value the file can carry, so it cannot distinguish preserved from
+    // recomputed. Re-readability can: a stamp that wrote a wrong version or a
+    // malformed body reads `Unreadable`.
     let dir = tempfile::tempdir().unwrap();
-    write(
-        dir.path(),
-        &MarkerInfo {
-            version: MARKER_VERSION,
-            from_version: "0.2.0".into(),
-            to_version: "0.3.0".into(),
-            driver_pid: 111,
-            started_at_unix: 1_700_000_000,
-            driver_start_unix_ms: 0,
-        },
-        None,
-    )
-    .unwrap();
-    stamp_driver(dir.path(), 222, 1_700_000_123_456).unwrap();
+    write(dir.path(), &info(111), None).unwrap();
+
+    let stamped = info(222).driver;
+    stamp_driver(dir.path(), &stamped).unwrap();
+
     let Marker::Present(got) = read(dir.path()) else {
         panic!("a stamped marker must stay readable");
     };
-    assert_eq!((got.driver_pid, got.driver_start_unix_ms), (222, 1_700_000_123_456));
+    assert_eq!(got.driver, stamped);
+}
+
+#[skuld::test]
+fn wire_form_v3() {
+    // This file crosses a privilege boundary and a version boundary; its bytes
+    // are a contract. `staged_marker` writes compact JSON, so the file's bytes
+    // and this string are the same thing.
     assert_eq!(
-        (got.from_version.as_str(), got.started_at_unix),
-        ("0.2.0", 1_700_000_000)
+        serde_json::to_string(&info(4242)).unwrap(),
+        r#"{"version":3,"driver":{"v":1,"platform":"windows","pid":4242,"token":"133700000000000000"}}"#
     );
+}
+
+#[skuld::test]
+fn a_v2_marker_reads_as_unreadable() {
+    // Rejected through the `deny_unknown_fields` PARSE arm, not the version
+    // guard: the v2 field set is unknown to the v3 shape. The guard keeps its
+    // own test, `an_unknown_version_marker_reads_as_unreadable`.
+    let dir = tempfile::tempdir().unwrap();
+    let v2 = serde_json::json!({
+        "version": 2,
+        "from_version": "0.4.0",
+        "to_version": "0.5.0",
+        "driver_pid": 7,
+        "started_at_unix": 1,
+        "driver_start_unix_ms": 1_700_000_000_123u64,
+    });
+    std::fs::write(dir.path().join(MARKER_FILE), serde_json::to_vec(&v2).unwrap()).unwrap();
+    assert!(matches!(read(dir.path()), Marker::Unreadable));
 }
 
 #[skuld::test]
@@ -197,7 +197,7 @@ fn stamp_driver_errs_when_the_marker_is_absent() {
     // which the cutover then stops — so the GUI resolves that identity as dead
     // and reports a failed update on a successful one.
     let dir = tempfile::tempdir().unwrap();
-    let result = stamp_driver(dir.path(), 1, 1);
+    let result = stamp_driver(dir.path(), &info(1).driver);
     assert!(
         result.is_err(),
         "a marker that could not be read must fail the stamp, not be warned past"

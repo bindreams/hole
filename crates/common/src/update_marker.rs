@@ -23,7 +23,7 @@ pub const MARKER_FILE: &str = "update-in-progress.json";
 /// Schema version. Bump on a breaking shape change; `read` answers
 /// [`Marker::Unreadable`] for an unknown version, but `clear` is remove-by-path
 /// and ignores the schema entirely.
-pub const MARKER_VERSION: u32 = 2;
+pub const MARKER_VERSION: u32 = 3;
 
 /// What [`read`] found. Unlike `plugin_state::Loaded`'s sibling variant,
 /// `Unreadable` carries no reason: every reader treats "present but
@@ -41,16 +41,11 @@ pub enum Marker {
 #[serde(deny_unknown_fields)]
 pub struct MarkerInfo {
     pub version: u32,
-    pub from_version: String,
-    pub to_version: String,
-    /// PID of the cutover DRIVER — the process whose death means the cutover is
-    /// abandoned (the detached child on Windows; the inline actor on macOS).
-    pub driver_pid: u32,
-    /// Wall-clock Unix seconds when the cutover was claimed.
-    pub started_at_unix: u64,
-    /// OS creation time of `driver_pid`, Unix ms. PID-reuse guard by exact
-    /// equality; a stored `0` is a failed-probe sentinel treated as unassessed.
-    pub driver_start_unix_ms: u64,
+    /// The cutover DRIVER's persisted identity — the process whose death means
+    /// the cutover is abandoned (the detached child on Windows; the inline actor
+    /// on macOS). `(pid, raw kernel start token)`, so a recycled pid never
+    /// restores to it and there is no failed-probe value to special-case.
+    pub driver: cosca::identity::ProcessIdRecord,
 }
 
 /// The SERVICE log directory (where the privileged bridge writes its logs and
@@ -187,23 +182,22 @@ pub fn clear(log_dir: &Path) -> io::Result<()> {
     }
 }
 
-/// Overwrite the marker's `driver_pid` + `driver_start_unix_ms` in place,
-/// preserving the rest. The Windows cutover initiator stamps the frozen child's
-/// identity here so the marker names the driver, not the initiator.
+/// Overwrite the marker's driver identity in place. The Windows cutover
+/// initiator stamps the frozen child's identity here so the marker names the
+/// driver, not the initiator.
 ///
 /// Anything but [`Marker::Present`] is an `Err`. Succeeding would leave the
 /// marker naming the INITIATOR, which the cutover then stops — and the GUI
 /// resolves that identity as dead and reports a failed update on a successful
 /// one. Failing costs nothing: the caller kills the still-suspended child and
 /// clears the marker, so no cutover is claimed.
-pub fn stamp_driver(log_dir: &Path, driver_pid: u32, driver_start_unix_ms: u64) -> io::Result<()> {
+pub fn stamp_driver(log_dir: &Path, driver: &cosca::identity::ProcessIdRecord) -> io::Result<()> {
     let Marker::Present(mut info) = read(log_dir) else {
         return Err(io::Error::other(
             "no readable update marker to stamp the cutover driver into",
         ));
     };
-    info.driver_pid = driver_pid;
-    info.driver_start_unix_ms = driver_start_unix_ms;
+    info.driver = driver.clone();
     write(log_dir, &info, None)
 }
 

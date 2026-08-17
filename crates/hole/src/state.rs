@@ -155,16 +155,15 @@ fn production_driver_liveness() -> DriverLiveness {
     #[cfg(target_os = "windows")]
     {
         std::sync::Arc::new(|m: &hole_common::update_marker::MarkerInfo| {
-            hole_common::process::process_matches_and_alive(m.driver_pid, m.driver_start_unix_ms).map_or(
-                cosca::identity::Liveness::Unknown,
-                |alive| {
-                    if alive {
-                        cosca::identity::Liveness::Alive
-                    } else {
-                        cosca::identity::Liveness::Dead
-                    }
-                },
-            )
+            match cosca::identity::ProcessId::try_from(&m.driver) {
+                Ok(id) => cosca::Process::from_id(id).is_alive(),
+                // A refusal, not a magic value: an identity that cannot be
+                // restored here names nothing to assess.
+                Err(e) => {
+                    tracing::warn!(error = %e, "cutover driver identity could not be restored");
+                    cosca::identity::Liveness::Unknown
+                }
+            }
         })
     }
     #[cfg(not(target_os = "windows"))]

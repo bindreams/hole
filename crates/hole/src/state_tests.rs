@@ -4,13 +4,17 @@ use hole_common::protocol::{BridgeResponse, StartError};
 use hole_common::update_marker::{Marker, MarkerInfo, MARKER_VERSION};
 
 fn sample_marker() -> MarkerInfo {
+    marker_naming(
+        cosca::identity::ProcessId::current()
+            .to_record()
+            .expect("persist this process's identity"),
+    )
+}
+
+fn marker_naming(driver: cosca::identity::ProcessIdRecord) -> MarkerInfo {
     MarkerInfo {
         version: MARKER_VERSION,
-        from_version: "0.2.0".into(),
-        to_version: "0.3.0".into(),
-        driver_pid: 4242,
-        started_at_unix: 0,
-        driver_start_unix_ms: 0,
+        driver,
     }
 }
 
@@ -898,19 +902,8 @@ fn commit_update_failed_applies_a_lockdown_change() {
 #[cfg(target_os = "windows")]
 #[skuld::test]
 async fn real_live_driver_holds_via_send() {
-    let me = std::process::id();
-    let start = hole_common::process::process_start_time(me).unwrap();
     let dir = tempfile::tempdir().unwrap();
-    hole_common::update_marker::write(
-        dir.path(),
-        &MarkerInfo {
-            driver_pid: me,
-            driver_start_unix_ms: start,
-            ..sample_marker()
-        },
-        None,
-    )
-    .unwrap();
+    hole_common::update_marker::write(dir.path(), &sample_marker(), None).unwrap();
     let link = super::BridgeLink::with_service_log_dir_and_liveness(
         "/nonexistent/socket".into(),
         dir.path().to_path_buf(),
@@ -928,20 +921,15 @@ async fn real_live_driver_holds_via_send() {
 #[skuld::test]
 async fn real_dead_driver_unmasks_once() {
     let mut child = std::process::Command::new("cmd").args(["/c", "exit"]).spawn().unwrap();
-    let pid = child.id();
-    let start = hole_common::process::process_start_time(pid).unwrap();
+    // Resolve BEFORE reaping: a record can only be built from a resolvable
+    // identity, and the retained handle is what keeps it resolvable afterwards.
+    let cosca::identity::Resolved::Found(id) = cosca::identity::ProcessId::of(child.id()) else {
+        panic!("the child must resolve while it is alive");
+    };
+    let record = id.to_record().expect("persist the child's identity");
     child.wait().unwrap(); // dead; `child` (handle) kept in scope below → zombie
     let dir = tempfile::tempdir().unwrap();
-    hole_common::update_marker::write(
-        dir.path(),
-        &MarkerInfo {
-            driver_pid: pid,
-            driver_start_unix_ms: start,
-            ..sample_marker()
-        },
-        None,
-    )
-    .unwrap();
+    hole_common::update_marker::write(dir.path(), &marker_naming(record), None).unwrap();
     let link = super::BridgeLink::with_service_log_dir_and_liveness(
         "/nonexistent/socket".into(),
         dir.path().to_path_buf(),
@@ -1269,5 +1257,38 @@ async fn a_swept_marker_retracts_the_failed_update() {
     assert!(
         link.cell().snapshot().error.is_none(),
         "a swept marker retracts the failure with no user action"
+    );
+}
+
+// The driver-liveness resolver's refusals =============================================================================
+
+#[cfg(target_os = "windows")]
+#[skuld::test]
+fn a_driver_record_from_a_foreign_platform_is_unassessed() {
+    // Restorable-looking, but refused by `ProcessId::try_from` — so the probe
+    // has nothing to assess. A fallback to the record's bare pid would answer
+    // Alive or Dead. This is where the deleted `0` sentinel's job now lives.
+    let mut driver = cosca::identity::ProcessId::current()
+        .to_record()
+        .expect("persist this process's identity");
+    driver.platform = cosca::identity::Platform::Other("plan9".into());
+
+    assert_eq!(
+        (super::production_driver_liveness())(&marker_naming(driver)),
+        cosca::identity::Liveness::Unknown
+    );
+}
+
+#[cfg(not(target_os = "windows"))]
+#[skuld::test]
+fn off_windows_the_driver_is_always_unassessed() {
+    // The fixture genuinely restores and names a certainly-alive process, which
+    // is what makes this falsifiable: drop the `cfg` and the resolver answers
+    // Alive. The cfg must stay — on macOS the cutover driver IS the bridge
+    // process, which SIGTERMs itself, so a working probe would raise
+    // UPDATE_FAILED on every healthy update.
+    assert_eq!(
+        (super::production_driver_liveness())(&sample_marker()),
+        cosca::identity::Liveness::Unknown
     );
 }
