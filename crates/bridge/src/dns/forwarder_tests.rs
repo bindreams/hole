@@ -429,17 +429,17 @@ fn a_pending_connect_survives_a_higher_ranked_failure_in_the_same_walk() {
         .build()
         .unwrap()
         .block_on(async {
-            // Server #2 answers the TCP connect and then closes without a TLS
-            // reply, so a DoT walk fails there at the TLS layer.
-            let (tls_dead, _h) = start_tcp_stub(Vec::new()).await;
             tokio::time::pause();
+            // Server #1 hangs its connect. Server #2 connects and then serves
+            // bytes that are not a TLS record, so a DoT walk fails there at the
+            // TLS layer — a cause that outranks the pending connect.
             let s1 = dead_addr(0);
-            let hang_target = SocketAddr::new(s1.ip(), s1.port());
+            let s2 = dead_addr(1);
             let fwd = DnsForwarder::new_with_ports(
-                build_cfg(DnsProtocol::Tls, vec![s1.ip(), tls_dead.ip()]),
-                HangThenAnswer::new(vec![hang_target], &[]),
+                build_cfg(DnsProtocol::Tls, vec![s1.ip(), s2.ip()]),
+                HangThenAnswer::new(vec![s1], &[]),
                 true,
-                vec![s1.port(), tls_dead.port()],
+                vec![s1.port(), s2.port()],
             );
             let before = fwd.upstream_activity();
             let result = fwd.try_forward(&sample_query(0x0004), GENEROUS_BUDGET).await;

@@ -260,6 +260,7 @@ pub(crate) async fn run_forwarder_self_test(
             let reason = match reason {
                 SelfTestReason::NoConnection => "no connection into the tunnel was opened",
                 SelfTestReason::TunnelSilent => "nothing came back through the tunnel",
+                SelfTestReason::TunnelSetupPending => "the tunnel was still being set up when the attempt ran out",
                 SelfTestReason::InconclusiveTransport(s) | SelfTestReason::Other(s) => s.as_str(),
             };
             info!(
@@ -287,12 +288,22 @@ pub(crate) async fn run_forwarder_self_test(
 /// Why the self-test failed, in the terms its report is allowed to claim.
 #[derive(Debug)]
 pub(crate) enum SelfTestReason {
-    /// Not one connection into the tunnel was opened — see
-    /// [`ProxyError::NoTunnelConnection`].
+    /// Not one connection into the tunnel was opened, AND every attempt to
+    /// open one failed definitely — see [`ProxyError::NoTunnelConnection`].
+    /// The second half is load-bearing: an attempt still outstanding when its
+    /// budget fired is [`Self::TunnelSetupPending`], not this.
     NoConnection,
     /// A connection carried the query and nothing came back — see
     /// [`ProxyError::TunnelSilent`].
     TunnelSilent,
+    /// Nothing was established, and at least one attempt's budget fired with
+    /// its connect STILL OUTSTANDING — see [`ProxyError::TunnelSetupIncomplete`].
+    /// Distinct from `NoConnection`, which needs every connect failure to have
+    /// been definite: a SOCKS5 CONNECT is not acknowledged until the plugin's
+    /// own outer connection is up, so an outstanding one is the tunnel still
+    /// being set up, not the local proxy turning us away. The plugin is not
+    /// exonerated, so the report still quotes it.
+    TunnelSetupPending,
     /// A UDP ASSOCIATE completed — the local SOCKS5 listener did accept
     /// something — but nothing came back. Weaker evidence than
     /// `TunnelSilent` (an ASSOCIATE never reaches the plugin, so it proves
@@ -348,12 +359,15 @@ pub(crate) fn describe_upstream_failure(cause: crate::dns::forwarder::UpstreamCa
 /// both apply, checked independently rather than off one collapsed value:
 ///
 /// - The self-test's OWN reading implicates the transport —
-///   `NoConnection`/`TunnelSilent`, or `InconclusiveTransport` (a UDP
-///   ASSOCIATE that reached the local listener but proved nothing about the
-///   plugin either way). `Other` means the transport is proven healthy (a
-///   reply arrived and was rejected) or was never exercised (nothing
-///   dialled) — quoting the plugin there would blame it for a failure that
-///   is not its own.
+///   `NoConnection`/`TunnelSilent`/`TunnelSetupPending`, or
+///   `InconclusiveTransport` (a UDP ASSOCIATE that reached the local listener
+///   but proved nothing about the plugin either way). `TunnelSetupPending` is
+///   in that set because a connect still outstanding when its budget fired is
+///   precisely the plugin's own outer connection not being up yet — the case
+///   where the plugin's log IS the answer. `Other` means the transport is
+///   proven healthy (a reply arrived and was rejected) or was never exercised
+///   (nothing dialled) — quoting the plugin there would blame it for a failure
+///   that is not its own.
 /// - The out-of-band probe hasn't already reattributed the failure to the
 ///   network path. `self_test_error_for` lets a `Blocked`/`TcpRefused`/
 ///   `TcpTimeout` verdict replace the self-test's own reading entirely
@@ -370,7 +384,10 @@ pub(crate) fn implicates_plugin_transport(
     use crate::reachability::ReachabilityVerdict::*;
     let reason_implicates = matches!(
         reason,
-        SelfTestReason::NoConnection | SelfTestReason::TunnelSilent | SelfTestReason::InconclusiveTransport(_)
+        SelfTestReason::NoConnection
+            | SelfTestReason::TunnelSilent
+            | SelfTestReason::TunnelSetupPending
+            | SelfTestReason::InconclusiveTransport(_)
     );
     let verdict_overrides = matches!(verdict, Some(Blocked | TcpRefused | TcpTimeout));
     reason_implicates && !verdict_overrides
@@ -421,6 +438,13 @@ pub(crate) fn classify_failure(observed: Observed, last_err: String) -> SelfTest
         SelfTestReason::TunnelSilent
     } else if observed.moved.associates > 0 {
         SelfTestReason::InconclusiveTransport(last_err)
+    } else if observed.moved.connect_timeouts > 0 {
+        // Sits BELOW the byte/connect/associate arms on purpose: those are
+        // positive evidence that something was established, and an outstanding
+        // connect is the absence of it. Above `NoConnection`, because that
+        // variant's claim — nothing was opened and every failure was definite —
+        // is false once an attempt was still in flight when its budget fired.
+        SelfTestReason::TunnelSetupPending
     } else {
         SelfTestReason::NoConnection
     }
@@ -472,6 +496,7 @@ pub(crate) fn self_test_error_for(
         _ => match reason {
             SelfTestReason::NoConnection => ProxyError::NoTunnelConnection { attempts, elapsed_ms },
             SelfTestReason::TunnelSilent => ProxyError::TunnelSilent { attempts, elapsed_ms },
+            SelfTestReason::TunnelSetupPending => ProxyError::TunnelSetupIncomplete { attempts, elapsed_ms },
             SelfTestReason::InconclusiveTransport(reason) | SelfTestReason::Other(reason) => {
                 ProxyError::ForwarderSelfTestFailed {
                     attempts,

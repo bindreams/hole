@@ -108,6 +108,15 @@ fn classify_failure_covers_every_branch() {
         associates: 1,
         connect_timeouts: 0,
     };
+    // Nothing established, and an attempt was still outstanding when its
+    // budget fired.
+    let pending_connect = UpstreamActivity {
+        read: 0,
+        written: 0,
+        connects: 0,
+        associates: 0,
+        connect_timeouts: 1,
+    };
     let case = |answered, dialled, moved| {
         classify_failure(
             Observed {
@@ -127,10 +136,17 @@ fn classify_failure_covers_every_branch() {
         case(false, true, connected_only),
         SelfTestReason::TunnelSilent
     ));
-    // No connection was ever established: the local hop, not the tunnel.
-    // Covers both a refused connect and one that hung until the budget
-    // fired — the cause codes differ, the reading does not.
+    // No connection was established and every connect failure was DEFINITE.
+    // The readings for "refused" and "still outstanding when the budget fired"
+    // deliberately differ now — that conflation is what #771 was about — so
+    // this fixture carries no `connect_timeouts` and the next case carries one.
     assert!(matches!(case(false, true, no_connection), SelfTestReason::NoConnection));
+    // Nothing established, but an attempt was still in flight when its budget
+    // fired: the tunnel was coming up, not refusing us.
+    assert!(matches!(
+        case(false, true, pending_connect),
+        SelfTestReason::TunnelSetupPending
+    ));
     // A UDP ASSOCIATE completed but nothing came back: disproves
     // NoConnection (the local listener DID accept something) without
     // being TunnelSilent-grade evidence about the plugin, so neither
@@ -145,6 +161,131 @@ fn classify_failure_covers_every_branch() {
     assert!(matches!(case(false, true, both), SelfTestReason::Other(_)));
     // Nothing was dialled: a config fault, not a reading of the tunnel.
     assert!(matches!(case(false, false, no_connection), SelfTestReason::Other(_)));
+}
+
+/// The load-bearing reading for #771. A transport that never completed its
+/// connect must not be reported as a local proxy refusing connections: the
+/// SOCKS5 CONNECT is not acknowledged until the plugin's own outer connection
+/// is up, so an outstanding one means the tunnel was still coming up.
+#[skuld::test]
+fn a_pending_connect_is_not_reported_as_no_connection() {
+    let reason = classify_failure(
+        Observed {
+            answered: false,
+            dialled: true,
+            moved: UpstreamActivity {
+                read: 0,
+                written: 0,
+                connects: 0,
+                associates: 0,
+                connect_timeouts: 1,
+            },
+        },
+        "reason".to_string(),
+    );
+    assert!(matches!(reason, SelfTestReason::TunnelSetupPending), "got {reason:?}");
+}
+
+/// The other half of the split, which must stay true: with every connect
+/// failure DEFINITE, the reading is still `NoConnection`.
+#[skuld::test]
+fn a_definite_connect_failure_is_still_reported_as_no_connection() {
+    let reason = classify_failure(
+        Observed {
+            answered: false,
+            dialled: true,
+            moved: UpstreamActivity::default(),
+        },
+        "reason".to_string(),
+    );
+    assert!(matches!(reason, SelfTestReason::NoConnection), "got {reason:?}");
+}
+
+/// Positive evidence still wins. A completed CONNECT proves something was
+/// established, so a pending connect elsewhere in the same run must not
+/// downgrade the reading away from `TunnelSilent`.
+#[skuld::test]
+fn positive_byte_evidence_still_outranks_a_pending_connect() {
+    let reason = classify_failure(
+        Observed {
+            answered: false,
+            dialled: true,
+            moved: UpstreamActivity {
+                read: 0,
+                written: 44,
+                connects: 1,
+                associates: 0,
+                connect_timeouts: 1,
+            },
+        },
+        "reason".to_string(),
+    );
+    assert!(matches!(reason, SelfTestReason::TunnelSilent), "got {reason:?}");
+}
+
+/// A pending connect does NOT exonerate the plugin, so the report still quotes
+/// its output — unless the out-of-band probe has already attributed the failure
+/// to the network, which outranks anything the gate could conclude.
+#[skuld::test]
+fn a_pending_connect_still_implicates_the_plugin_transport() {
+    assert!(implicates_plugin_transport(&SelfTestReason::TunnelSetupPending, None));
+    for verdict in [
+        ReachabilityVerdict::Blocked,
+        ReachabilityVerdict::TcpRefused,
+        ReachabilityVerdict::TcpTimeout,
+    ] {
+        assert!(
+            !implicates_plugin_transport(&SelfTestReason::TunnelSetupPending, Some(verdict)),
+            "{verdict:?} attributes the failure elsewhere, so the plugin must not be quoted"
+        );
+    }
+}
+
+/// The reading maps to its own error, and a damning probe verdict still
+/// outranks it.
+#[skuld::test]
+fn tunnel_setup_incomplete_maps_to_its_own_error() {
+    let err = self_test_error_for(None, 3, 20_000, SelfTestReason::TunnelSetupPending);
+    assert!(
+        matches!(
+            err,
+            ProxyError::TunnelSetupIncomplete {
+                attempts: 3,
+                elapsed_ms: 20_000
+            }
+        ),
+        "got {err:?}"
+    );
+    let blocked = self_test_error_for(
+        Some(ReachabilityVerdict::Blocked),
+        3,
+        20_000,
+        SelfTestReason::TunnelSetupPending,
+    );
+    assert!(matches!(blocked, ProxyError::NetworkBlocked), "got {blocked:?}");
+}
+
+/// The sentence names a slow server AND an unreachable one and picks neither —
+/// a pending connect is equally consistent with both, and telling a censored
+/// user to wait would be the same class of misattribution this variant removes.
+/// Only integers are interpolated, so nothing host-shaped can reach a toast.
+#[skuld::test]
+fn tunnel_setup_incomplete_message_is_pii_free_and_names_both_causes() {
+    let err = ProxyError::TunnelSetupIncomplete {
+        attempts: 3,
+        elapsed_ms: 20_000,
+    };
+    let text = err.to_string();
+    assert!(text.contains("slow"), "got: {text}");
+    assert!(text.contains("unreachable"), "got: {text}");
+    assert!(
+        !text.contains('/') && !text.contains('\\'),
+        "no path may appear: {text}"
+    );
+    assert!(
+        !text.contains("127.0.0.1") && !text.contains("1.1.1.1"),
+        "no address may appear: {text}"
+    );
 }
 
 /// Regression: a peer that replies partially then resets (e.g. `Io`) counts
@@ -249,7 +390,7 @@ fn an_earlier_servfail_answer_is_not_clobbered_by_a_later_failed_attempt() {
     }
 }
 
-/// A plugin that dies mid-run: attempt 1 carries the query, attempt 2 cannot
+/// An earlier upstream in the walk carried the query; a later one could not
 /// connect. The reading is cumulative, so the bytes that reached the tunnel
 /// still decide — reporting the local hop here would contradict the counters.
 #[skuld::test]
@@ -339,8 +480,13 @@ fn a_refused_local_hop_is_reported_as_no_connection() {
         err.to_string(),
         format!(
             "Could not open a connection into the tunnel ({attempts} attempts in 4517ms). \
-             The local proxy or its plugin is not accepting connections."
+             Every attempt to open one failed outright."
         )
+    );
+    assert!(
+        !err.to_string().contains("local proxy"),
+        "the Connect layer flattens a local refusal and a SOCKS5 error reply about the \
+         REMOTE hop into one io::Error, so this sentence must attribute no side; got: {err}"
     );
 }
 

@@ -92,8 +92,12 @@ upgrade.
 **Start-time gate (load-bearing).** A forwarder self-test runs inside
 [`start_inner`](crates/bridge/src/proxy_manager.rs) **before**
 `Dispatcher::new` / `routing.install` / `apply_dns_settings`; on failure it
-returns `ProxyError::ForwarderSelfTestFailed` and the RAII guards unwind without
-touching routes, system DNS, or the wintun adapter. Guarded by
+returns whichever `ProxyError` the run's evidence supports — `NoTunnelConnection`
+(every connect failed outright), `TunnelSetupIncomplete` (one was still
+outstanding when its budget fired), `TunnelSilent`, or the generic
+`ForwarderSelfTestFailed` — and the RAII guards unwind without touching routes,
+system DNS, or the wintun adapter. `classify_failure` picks between them from
+counted evidence, never from a cause code. Guarded by
 `start_blocks_on_forwarder_self_test_failure`.
 
 **Hard errors:** `dns.enabled = true` with `servers = []` is a config error.

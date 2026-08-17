@@ -2299,8 +2299,19 @@ mod self_test {
                 .start_cancellable(&cfg, false, CancellationToken::new())
                 .await
                 .unwrap_err();
+            // Either reading is admissible: a closed loopback port is REFUSED on
+            // some platforms and black-holed on others (see
+            // `refusing_connector.rs`), and after #771 those classify as
+            // `NoTunnelConnection` and `TunnelSetupIncomplete` respectively.
+            // This test is about the probe being suppressed so the gate's OWN
+            // reading survives, not about which of the two it is — the variants
+            // are pinned against stub connectors in
+            // `classify_failure_covers_every_branch`.
             assert!(
-                matches!(err, ProxyError::NoTunnelConnection { .. }),
+                matches!(
+                    err,
+                    ProxyError::NoTunnelConnection { .. } | ProxyError::TunnelSetupIncomplete { .. }
+                ),
                 "lockdown-on must skip the probe and keep the self-test's own reading, got {err:?}"
             );
         });
@@ -4432,8 +4443,15 @@ mod self_test {
                 .start_cancellable(&cfg, true, CancellationToken::new())
                 .await
                 .unwrap_err();
+            // Same platform split as `lockdown_on_skips_probe_keeps_original_reason`:
+            // the closed loopback port is refused on some platforms and
+            // black-holed on others, so both post-#771 readings are admissible.
+            // What this test pins is that the gate's own reading survives.
             assert!(
-                matches!(err, ProxyError::NoTunnelConnection { .. }),
+                matches!(
+                    err,
+                    ProxyError::NoTunnelConnection { .. } | ProxyError::TunnelSetupIncomplete { .. }
+                ),
                 "a covered start engages a cover, so the probe is skipped and the self-test's own \
                  reading (not one byte written) surfaces, got {err:?}"
             );
