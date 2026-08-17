@@ -83,6 +83,7 @@ fn classify_failure_covers_every_branch() {
         written: 44,
         connects: 1,
         associates: 0,
+        connect_timeouts: 0,
     };
     // Connected, then reset before the first write.
     let connected_only = UpstreamActivity {
@@ -90,12 +91,14 @@ fn classify_failure_covers_every_branch() {
         written: 0,
         connects: 1,
         associates: 0,
+        connect_timeouts: 0,
     };
     let both = UpstreamActivity {
         read: 91,
         written: 44,
         connects: 1,
         associates: 0,
+        connect_timeouts: 0,
     };
     // A completed UDP ASSOCIATE, but no reply — weaker than a CONNECT.
     let associated_only = UpstreamActivity {
@@ -103,6 +106,7 @@ fn classify_failure_covers_every_branch() {
         written: 44,
         connects: 0,
         associates: 1,
+        connect_timeouts: 0,
     };
     let case = |answered, dialled, moved| {
         classify_failure(
@@ -156,6 +160,7 @@ fn read_without_answered_overrides_a_stale_no_resolver_answered_message() {
         written: 12,
         connects: 1,
         associates: 0,
+        connect_timeouts: 0,
     };
     let reason = classify_failure(
         Observed {
@@ -258,6 +263,7 @@ fn bytes_from_an_earlier_attempt_still_decide() {
                 written: 44,
                 connects: 1,
                 associates: 0,
+                connect_timeouts: 0,
             },
         },
         "no resolver answered through the tunnel (unreachable)".into(),
@@ -443,13 +449,29 @@ fn describe_upstream_failure_does_not_claim_silence_for_a_cause_that_answered() 
             "{cause} implies a peer responded; got: {msg}"
         );
     }
-    for cause in [UpstreamCause::Unreachable, UpstreamCause::Io, UpstreamCause::Timeout] {
+    for cause in [
+        UpstreamCause::Unreachable,
+        UpstreamCause::Io,
+        UpstreamCause::ExchangeTimeout,
+    ] {
         let msg = super::describe_upstream_failure(cause);
         assert!(
             msg.contains("no resolver answered"),
             "{cause} is a genuine silence; got: {msg}"
         );
     }
+    // A connect that never completed is NOT silence from a resolver: no
+    // connection to one was ever opened, so claiming we asked and got nothing
+    // back would overstate how far the attempt got.
+    let msg = super::describe_upstream_failure(UpstreamCause::ConnectTimeout);
+    assert!(
+        !msg.contains("no resolver answered"),
+        "a pending connect never reached a resolver; got: {msg}"
+    );
+    assert!(
+        msg.contains("no connection"),
+        "the wording must name the connection, not the resolver; got: {msg}"
+    );
 }
 
 /// The reason must never be a `Debug`-formatted internal enum: the toast is
@@ -459,7 +481,7 @@ fn describe_upstream_failure_does_not_claim_silence_for_a_cause_that_answered() 
 /// formatting is caught here.
 #[skuld::test]
 fn the_reason_never_carries_a_debug_formatted_enum() {
-    let msg = super::describe_upstream_failure(UpstreamCause::Timeout);
+    let msg = super::describe_upstream_failure(UpstreamCause::ExchangeTimeout);
     let err = self_test_error_for(None, 3, 4517, SelfTestReason::Other(msg));
     assert!(!err.to_string().contains("Upstream("), "got: {err}");
     assert!(err.to_string().contains("timeout"), "got: {err}");

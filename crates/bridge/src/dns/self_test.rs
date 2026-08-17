@@ -332,7 +332,13 @@ pub(crate) fn describe_upstream_failure(cause: crate::dns::forwarder::UpstreamCa
         UpstreamCause::BadResponse | UpstreamCause::CertificateRejected | UpstreamCause::TlsFailed => {
             format!("a resolver responded, but the exchange failed ({cause})")
         }
-        UpstreamCause::Unreachable | UpstreamCause::Io | UpstreamCause::Timeout => {
+        // A connect that never completed is not silence FROM a resolver — no
+        // connection to one was ever opened. Saying "no resolver answered"
+        // would claim we got as far as asking.
+        UpstreamCause::ConnectTimeout => {
+            format!("no connection to a resolver could be opened through the tunnel ({cause})")
+        }
+        UpstreamCause::Unreachable | UpstreamCause::Io | UpstreamCause::ExchangeTimeout => {
             format!("no resolver answered through the tunnel ({cause})")
         }
     }
@@ -381,8 +387,8 @@ pub(crate) fn report_plugin_output(log: Option<&crate::proxy::plugin_log::Plugin
 
 /// Turn a reading into the claim the report may make. Every claim rests on a
 /// positive observation, never on a cause code: a local hop that HANGS never
-/// reaches `UpstreamLayer::Connect`, so its cause is `Timeout`, and splitting on
-/// `Unreachable` would file it under the tunnel sentence.
+/// reaches `UpstreamLayer::Connect`, so its cause is `ConnectTimeout`, and
+/// splitting on `Unreachable` would file it under the tunnel sentence.
 ///
 /// The local-hop claim keys on `connects`, not on `written` — see
 /// [`crate::dns::forwarder::UpstreamActivity`] for why a reset before the first

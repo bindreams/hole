@@ -62,6 +62,96 @@ impl UpstreamConnector for HangingConnector {
     }
 }
 
+/// Hangs `connect_tcp` for the listed targets and answers one length-prefixed
+/// DNS reply from memory for every other target — the shape a failover test
+/// needs: a primary that consumes its whole budget, then a secondary that
+/// answers.
+///
+/// Socket-free on BOTH sides on purpose. `tokio::time::pause()` auto-advances
+/// the clock whenever the runtime has nothing to run, so a stub backed by a
+/// real loopback socket would race its own I/O against virtual time and could
+/// see the secondary's budget fire before its reply arrived. Answering
+/// in-process removes the race rather than narrowing it.
+#[derive(Debug)]
+pub(crate) struct HangThenAnswer {
+    hang: Vec<SocketAddr>,
+    /// `[len:2][reply]`, ready to hand to a fresh [`CannedReplyStream`].
+    framed: Vec<u8>,
+}
+
+impl HangThenAnswer {
+    /// `reply` is the wire-format DNS reply the non-hanging targets answer.
+    pub(crate) fn new(hang: Vec<SocketAddr>, reply: &[u8]) -> std::sync::Arc<Self> {
+        let mut framed = Vec::with_capacity(2 + reply.len());
+        framed.extend_from_slice(&(reply.len() as u16).to_be_bytes());
+        framed.extend_from_slice(reply);
+        std::sync::Arc::new(Self { hang, framed })
+    }
+}
+
+#[async_trait::async_trait]
+impl UpstreamConnector for HangThenAnswer {
+    async fn connect_tcp(&self, target: SocketAddr) -> io::Result<ConnectedStream> {
+        if self.hang.contains(&target) {
+            std::future::pending::<()>().await;
+        }
+        let counting = CountingStream::new(CannedReplyStream {
+            remaining: self.framed.clone(),
+        });
+        let counters = counting.counters();
+        Ok(ConnectedStream {
+            stream: Box::new(counting),
+            counters,
+        })
+    }
+
+    async fn connect_udp(&self, _target: SocketAddr) -> io::Result<Box<dyn UpstreamUdp>> {
+        std::future::pending().await
+    }
+}
+
+/// Accepts every write; serves `remaining` to successive reads, then stays
+/// pending. `exchange_tcp_framed` reads the 2-byte length and then the body, so
+/// draining one buffer across two reads is exactly what it expects.
+struct CannedReplyStream {
+    remaining: Vec<u8>,
+}
+
+impl tokio::io::AsyncRead for CannedReplyStream {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        if self.remaining.is_empty() {
+            return std::task::Poll::Pending;
+        }
+        let n = self.remaining.len().min(buf.remaining());
+        let chunk: Vec<u8> = self.remaining.drain(..n).collect();
+        buf.put_slice(&chunk);
+        std::task::Poll::Ready(Ok(()))
+    }
+}
+
+impl tokio::io::AsyncWrite for CannedReplyStream {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<io::Result<usize>> {
+        std::task::Poll::Ready(Ok(buf.len()))
+    }
+    fn poll_flush(self: std::pin::Pin<&mut Self>, _cx: &mut std::task::Context<'_>) -> std::task::Poll<io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+}
+
 #[async_trait::async_trait]
 impl UpstreamConnector for RefusingConnector {
     async fn connect_tcp(&self, target: SocketAddr) -> io::Result<ConnectedStream> {

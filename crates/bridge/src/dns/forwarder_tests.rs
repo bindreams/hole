@@ -8,7 +8,18 @@ use tokio::net::{TcpListener, UdpSocket};
 
 use super::*;
 use crate::dns::connector::DirectConnector;
-use crate::test_support::refusing_connector::{RefusingConnector, SilentConnector};
+use crate::test_support::refusing_connector::{HangThenAnswer, HangingConnector, RefusingConnector, SilentConnector};
+
+/// A budget larger than the test that passes it needs. Distinct from
+/// [`DIRECT_UPSTREAM_TIMEOUT`], which means "the bootstrap's direct hop": these
+/// tests exercise the TUNNEL walk and only want a bound they will not hit, so
+/// borrowing the bootstrap's constant would put a false label on them.
+const GENEROUS_BUDGET: Duration = Duration::from_secs(3);
+
+/// tokio rounds every timer deadline UP to a whole millisecond, and a walk arms
+/// at most one timer per resolver, so allow exactly that much overshoot when
+/// asserting a virtual-time total.
+const TIMER_QUANTIZATION: Duration = Duration::from_millis(2);
 
 // Helpers =============================================================================================================
 
@@ -235,28 +246,227 @@ async fn try_forward_reports_unreachable_when_every_server_refuses() {
         vec![s1.port(), s2.port()],
     );
     assert_eq!(
-        fwd.try_forward(&q, UPSTREAM_TIMEOUT).await,
+        fwd.try_forward(&q, GENEROUS_BUDGET).await,
         Err(ForwardFailure::Upstream(UpstreamCause::Unreachable))
     );
 }
 
+// The tunnel bound ====================================================================================================
+
+/// The tunnel bound is handed to `forward_one` UNMODIFIED, once per resolver:
+/// two dead resolvers cost exactly two bounds. A divided total would cost one,
+/// and a per-walk take-all would starve the second resolver entirely.
+///
+/// Virtual time on a CURRENT-THREAD runtime — `tokio::time::pause()` panics on
+/// a multi-thread one — and `HangingConnector` opens no socket, so no real I/O
+/// races the clock.
 #[skuld::test]
-fn attempted_upstreams_counts_only_the_servers_a_walk_will_dial() {
-    // A caller sizing a per-upstream budget from a total must divide by the
-    // width the walk ACTUALLY dials. Counting skipped IPv6 entries would shrink
-    // every surviving upstream's budget and leave part of the total unused.
-    let v4: IpAddr = "1.1.1.1".parse().unwrap();
-    let v6: IpAddr = "2606:4700:4700::1111".parse().unwrap();
+fn forward_gives_every_resolver_the_full_tunnel_bound() {
+    let (reply, elapsed) = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            tokio::time::pause();
+            let s1 = dead_addr(0);
+            let s2 = dead_addr(1);
+            let fwd = DnsForwarder::new_with_ports(
+                build_cfg(DnsProtocol::PlainTcp, vec![s1.ip(), s2.ip()]),
+                Arc::new(HangingConnector),
+                true,
+                vec![s1.port(), s2.port()],
+            );
+            let t0 = tokio::time::Instant::now();
+            let reply = fwd.forward(&sample_query(0x0001)).await;
+            (reply, t0.elapsed())
+        });
 
-    let cfg = |servers: Vec<IpAddr>| build_cfg(DnsProtocol::Https, servers);
-    let width = |servers: Vec<IpAddr>, v6_ok: bool| {
-        DnsForwarder::new(cfg(servers), RefusingConnector::all(), v6_ok).attempted_upstreams()
-    };
+    assert_eq!(reply[3] & 0x0F, 2, "a walk where nothing answered synthesizes SERVFAIL");
+    assert!(
+        elapsed >= 2 * TUNNEL_QUERY_TIMEOUT && elapsed <= 2 * TUNNEL_QUERY_TIMEOUT + TIMER_QUANTIZATION,
+        "two resolvers must cost two full bounds, not a divided total; took {elapsed:?}"
+    );
+}
 
-    assert_eq!(width(vec![v4, v6], false), 1, "the IPv6 entry is skipped");
-    assert_eq!(width(vec![v4, v6], true), 2, "with a bypass both are dialled");
-    assert_eq!(width(vec![v6], false), 0, "an all-IPv6 config dials nothing");
-    assert_eq!(width(vec![v4, v4], false), 2, "duplicates are separate attempts");
+/// Regression: a primary that HANGS must not strand the secondary.
+/// `DnsConfig`'s own doc makes failover a contract — "subsequent entries are
+/// tried on failure" — and every take-all or full-budget-or-no-dial scheme
+/// breaks it precisely here, where the primary consumes the whole bound before
+/// failing. Same virtual-time and socket-free reasoning as the test above.
+#[skuld::test]
+fn a_hung_primary_still_lets_the_secondary_be_dialled() {
+    let query = sample_query(0x0002);
+    let expected = sample_reply(&query);
+    let (reply, elapsed) = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on({
+            let expected = expected.clone();
+            async move {
+                tokio::time::pause();
+                let s1 = dead_addr(0);
+                let s2 = dead_addr(1);
+                let fwd = DnsForwarder::new_with_ports(
+                    build_cfg(DnsProtocol::PlainTcp, vec![s1.ip(), s2.ip()]),
+                    HangThenAnswer::new(vec![s1], &expected),
+                    true,
+                    vec![s1.port(), s2.port()],
+                );
+                let t0 = tokio::time::Instant::now();
+                let reply = fwd.forward(&query).await;
+                (reply, t0.elapsed())
+            }
+        });
+
+    assert_eq!(
+        reply, expected,
+        "the secondary's answer must be returned, not a SERVFAIL"
+    );
+    assert!(
+        elapsed >= TUNNEL_QUERY_TIMEOUT && elapsed <= TUNNEL_QUERY_TIMEOUT + TIMER_QUANTIZATION,
+        "the primary spends one full bound, then the secondary answers; took {elapsed:?}"
+    );
+}
+
+// Pending-connect evidence ============================================================================================
+
+/// A budget that fires with the connect still outstanding is COUNTED, not
+/// inferred later from a cause code. Virtual time on a current-thread runtime;
+/// `HangingConnector` opens no socket.
+#[skuld::test]
+fn a_pending_connect_increments_connect_timeouts() {
+    let moved = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            tokio::time::pause();
+            let s = dead_addr(0);
+            let fwd = DnsForwarder::new_with_ports(
+                build_cfg(DnsProtocol::PlainTcp, vec![s.ip()]),
+                Arc::new(HangingConnector),
+                true,
+                vec![s.port()],
+            );
+            let before = fwd.upstream_activity();
+            let _ = fwd.try_forward(&sample_query(0x0001), GENEROUS_BUDGET).await;
+            fwd.upstream_activity().since(before)
+        });
+
+    assert_eq!(moved.connect_timeouts, 1, "the pending connect must be counted");
+    assert_eq!(moved.connects, 0, "nothing was established");
+}
+
+/// A DEFINITE connect failure is not a pending one. Keeping these apart is what
+/// lets the gate stop calling a hang "the local proxy is not accepting
+/// connections".
+#[skuld::test]
+async fn a_refused_connect_does_not_increment_connect_timeouts() {
+    let s = dead_addr(0);
+    let fwd = DnsForwarder::new_with_ports(
+        build_cfg(DnsProtocol::PlainTcp, vec![s.ip()]),
+        RefusingConnector::all(),
+        true,
+        vec![s.port()],
+    );
+    let before = fwd.upstream_activity();
+    let _ = fwd.try_forward(&sample_query(0x0002), GENEROUS_BUDGET).await;
+    let moved = fwd.upstream_activity().since(before);
+
+    assert_eq!(moved.connect_timeouts, 0, "a refusal is definite, not pending");
+    assert_eq!(moved.connects, 0);
+}
+
+/// An established transport that then goes quiet is an EXCHANGE timeout, so the
+/// pending-connect counter must stay clear even though a budget did fire.
+#[skuld::test]
+fn an_established_but_silent_upstream_does_not_increment_connect_timeouts() {
+    let moved = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            let (connector, connected_rx) = SilentConnector::new();
+            let s = dead_addr(0);
+            let fwd = Arc::new(DnsForwarder::new_with_ports(
+                build_cfg(DnsProtocol::PlainTcp, vec![s.ip()]),
+                connector,
+                true,
+                vec![s.port()],
+            ));
+            let before = fwd.upstream_activity();
+            let run = tokio::spawn({
+                let fwd = Arc::clone(&fwd);
+                async move { fwd.try_forward(&sample_query(0x0003), GENEROUS_BUDGET).await }
+            });
+            // Rendezvous first: pause the clock only once the connect has
+            // completed, so the budget cannot fire before the transport is
+            // published. Inserting any `await` between these two lines
+            // reintroduces the race this ordering removes.
+            connected_rx.await.expect("the stub connector completed a connect");
+            tokio::time::pause();
+            let _ = run.await.unwrap();
+            fwd.upstream_activity().since(before)
+        });
+
+    assert_eq!(moved.connects, 1, "the transport was established");
+    assert_eq!(
+        moved.connect_timeouts, 0,
+        "a budget that fires AFTER a transport exists is an exchange timeout"
+    );
+}
+
+/// Regression: the observation must survive a higher-ranked failure elsewhere
+/// in the same walk. `try_forward` folds per-upstream causes by rank and keeps
+/// only the highest, so a pending connect (rank 1) co-occurring with a TLS
+/// failure (rank 5) is invisible in the returned `ForwardFailure` — which is
+/// exactly why this is a counter on the forwarder and not a cause code.
+#[skuld::test]
+fn a_pending_connect_survives_a_higher_ranked_failure_in_the_same_walk() {
+    let (result, moved) = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            // Server #2 answers the TCP connect and then closes without a TLS
+            // reply, so a DoT walk fails there at the TLS layer.
+            let (tls_dead, _h) = start_tcp_stub(Vec::new()).await;
+            tokio::time::pause();
+            let s1 = dead_addr(0);
+            let hang_target = SocketAddr::new(s1.ip(), s1.port());
+            let fwd = DnsForwarder::new_with_ports(
+                build_cfg(DnsProtocol::Tls, vec![s1.ip(), tls_dead.ip()]),
+                HangThenAnswer::new(vec![hang_target], &[]),
+                true,
+                vec![s1.port(), tls_dead.port()],
+            );
+            let before = fwd.upstream_activity();
+            let result = fwd.try_forward(&sample_query(0x0004), GENEROUS_BUDGET).await;
+            (result, fwd.upstream_activity().since(before))
+        });
+
+    assert_eq!(
+        result,
+        Err(ForwardFailure::Upstream(UpstreamCause::TlsFailed)),
+        "the walk reports its highest-ranked cause"
+    );
+    assert_eq!(
+        moved.connect_timeouts, 1,
+        "and the pending connect is still counted underneath it"
+    );
+}
+
+/// The two bounds price different questions — nine round trips through a tunnel
+/// versus three on a direct hop — so the tunnel's must be the larger. A weak
+/// test (two literals, one file), kept only because it catches an accidental
+/// equalisation, which would silently re-price the bootstrap as a tunnel walk.
+#[skuld::test]
+fn the_direct_bootstrap_bound_is_smaller_than_the_tunnel_bound() {
+    assert!(
+        DIRECT_UPSTREAM_TIMEOUT < TUNNEL_QUERY_TIMEOUT,
+        "the bootstrap's direct hop must stay cheaper than a tunnel walk"
+    );
 }
 
 #[skuld::test]
@@ -269,7 +479,7 @@ async fn try_forward_reports_malformed_query_and_no_upstream() {
         vec![addr.port()],
     );
     assert_eq!(
-        fwd.try_forward(b"abc", UPSTREAM_TIMEOUT).await,
+        fwd.try_forward(b"abc", GENEROUS_BUDGET).await,
         Err(ForwardFailure::MalformedQuery)
     );
 
@@ -283,7 +493,7 @@ async fn try_forward_reports_malformed_query_and_no_upstream() {
         vec![0],
     );
     assert_eq!(
-        none.try_forward(&sample_query(1), UPSTREAM_TIMEOUT).await,
+        none.try_forward(&sample_query(1), GENEROUS_BUDGET).await,
         Err(ForwardFailure::NoUpstream)
     );
 }
@@ -307,7 +517,7 @@ async fn try_forward_reports_tls_failed_when_the_peer_closes_mid_handshake() {
         vec![addr.port()],
     );
     assert_eq!(
-        fwd.try_forward(&sample_query(0x0009), UPSTREAM_TIMEOUT).await,
+        fwd.try_forward(&sample_query(0x0009), GENEROUS_BUDGET).await,
         Err(ForwardFailure::Upstream(UpstreamCause::TlsFailed))
     );
 }
@@ -340,7 +550,7 @@ async fn try_forward_reports_timeout_when_an_established_peer_stays_silent() {
     ));
     let call = tokio::spawn({
         let fwd = Arc::clone(&fwd);
-        async move { fwd.try_forward(&sample_query(0x000A), UPSTREAM_TIMEOUT).await }
+        async move { fwd.try_forward(&sample_query(0x000A), GENEROUS_BUDGET).await }
     });
 
     accepted_rx.await.expect("stub accepted the connection");
@@ -348,7 +558,7 @@ async fn try_forward_reports_timeout_when_an_established_peer_stays_silent() {
 
     assert_eq!(
         call.await.unwrap(),
-        Err(ForwardFailure::Upstream(UpstreamCause::Timeout))
+        Err(ForwardFailure::Upstream(UpstreamCause::ExchangeTimeout))
     );
 }
 
@@ -545,11 +755,16 @@ fn cause_of_non_tls_layers_follows_the_layer_tag() {
         io::Error::from(io::ErrorKind::ConnectionRefused),
     );
     assert_eq!(refused.cause(), UpstreamCause::Unreachable);
-    let timed_out = UpstreamErr::new(
+    // The Timeout layer is the one tag that is not self-sufficient: its cause
+    // depends on whether the attempt probe had published a transport, so it
+    // must be built through the decorating constructor. `Some(_)` here means
+    // one had been.
+    let timed_out = UpstreamErr::decorated_for_test(
         UpstreamLayer::Timeout,
         io::Error::new(io::ErrorKind::TimedOut, "upstream timeout"),
+        Some(7),
     );
-    assert_eq!(timed_out.cause(), UpstreamCause::Timeout);
+    assert_eq!(timed_out.cause(), UpstreamCause::ExchangeTimeout);
     let http = UpstreamErr::new(UpstreamLayer::Http, io::Error::other("non-200 DoH response"));
     assert_eq!(http.cause(), UpstreamCause::BadResponse);
     let io_err = UpstreamErr::new(UpstreamLayer::Io, io::Error::from(io::ErrorKind::BrokenPipe));
@@ -561,7 +776,8 @@ fn upstream_cause_ranking_is_total_and_ordered() {
     // Pins the total order `rank` promises across every UpstreamCause variant.
     let order = [
         UpstreamCause::Unreachable,
-        UpstreamCause::Timeout,
+        UpstreamCause::ConnectTimeout,
+        UpstreamCause::ExchangeTimeout,
         UpstreamCause::Io,
         UpstreamCause::BadResponse,
         UpstreamCause::TlsFailed,
@@ -575,6 +791,68 @@ fn upstream_cause_ranking_is_total_and_ordered() {
             pair[0]
         );
     }
+}
+
+/// The `Timeout` layer's two causes, told apart by whether a transport had been
+/// published when the budget fired. This is the observation #771 needs: a
+/// SOCKS5 CONNECT is not acknowledged until the plugin's outer connection is
+/// up, so "budget fired, nothing established" means the tunnel was still being
+/// set up — not that the local proxy refused anything.
+#[skuld::test]
+fn cause_of_a_timeout_with_no_transport_established_is_connect_timeout() {
+    let e = UpstreamErr::decorated_for_test(
+        UpstreamLayer::Timeout,
+        io::Error::new(io::ErrorKind::TimedOut, "upstream timeout"),
+        None,
+    );
+    assert_eq!(e.cause(), UpstreamCause::ConnectTimeout);
+}
+
+#[skuld::test]
+fn cause_of_a_timeout_after_a_stream_opened_is_exchange_timeout() {
+    let e = UpstreamErr::decorated_for_test(
+        UpstreamLayer::Timeout,
+        io::Error::new(io::ErrorKind::TimedOut, "upstream timeout"),
+        Some(12),
+    );
+    assert_eq!(e.cause(), UpstreamCause::ExchangeTimeout);
+}
+
+/// A UDP association counts as an established transport too: `udp_sent` is the
+/// datagram path's equivalent of `socks5_ms`, published the instant the
+/// connector hands the socket back.
+#[skuld::test]
+fn cause_of_a_timeout_after_a_udp_association_is_exchange_timeout() {
+    let mut e = UpstreamErr::decorated_for_test(
+        UpstreamLayer::Timeout,
+        io::Error::new(io::ErrorKind::TimedOut, "upstream timeout"),
+        None,
+    );
+    e.udp_sent = Some(0);
+    assert_eq!(
+        e.cause(),
+        UpstreamCause::ExchangeTimeout,
+        "a completed ASSOCIATE is a published transport, even with zero bytes sent"
+    );
+}
+
+/// The decoration contract, tested POSITIVELY rather than by `#[should_panic]`
+/// on the `debug_assert!`: that would pass only in debug profiles and would
+/// silently stop testing anything under `--release`. This drives the real
+/// `AttemptProbe::apply` and asserts the flag it is responsible for setting.
+#[skuld::test]
+fn attempt_probe_apply_marks_the_error_decorated() {
+    let probe = AttemptProbe::default();
+    let mut e = UpstreamErr::new(
+        UpstreamLayer::Timeout,
+        io::Error::new(io::ErrorKind::TimedOut, "upstream timeout"),
+    );
+    assert!(!e.is_decorated(), "a fresh error carries no probe fields");
+    probe.apply(&mut e);
+    assert!(
+        e.is_decorated(),
+        "apply() must mark the error decorated; cause()'s Timeout split reads the fields it fills"
+    );
 }
 
 // Short-query safety ==================================================================================================
@@ -776,6 +1054,42 @@ mod typed_error_logs {
         assert!(output.contains("elapsed_ms"), "expected 'elapsed_ms'; got:\n{output}");
     }
 
+    /// `budget_ms` on the WARN is the tunnel bound VERBATIM. `forward` hands the
+    /// constant to `forward_one` unmodified, so any arithmetic that crept in
+    /// between — a divided total, or a remaining-time residual that truncates
+    /// to 9999 — shows up here as a different number. Asserted against the
+    /// constant, never a re-pasted literal, so the two cannot desync.
+    ///
+    /// A refused connect reaches `forward_one` and returns immediately, so this
+    /// pins the budget without spending any of it.
+    #[skuld::test]
+    async fn forward_stamps_the_tunnel_bound_on_every_attempt() {
+        let writer = VecWriter::new();
+        let subscriber = tracing_subscriber::registry().with(
+            fmt::layer()
+                .with_writer(writer.clone())
+                .with_ansi(false)
+                .with_filter(tracing_subscriber::filter::LevelFilter::WARN),
+        );
+        let _guard = set_default_in_current_thread(subscriber);
+
+        let dead = dead_addr(0);
+        let fwd = DnsForwarder::new_with_ports(
+            build_cfg(DnsProtocol::PlainTcp, vec![dead.ip()]),
+            RefusingConnector::all(),
+            true,
+            vec![dead.port()],
+        );
+        let _ = fwd.forward(&sample_query(0x0001)).await;
+
+        let output = writer.snapshot_string();
+        let expected = format!("budget_ms={}", TUNNEL_QUERY_TIMEOUT.as_millis());
+        assert!(
+            output.contains(&expected),
+            "expected '{expected}' on the upstream-failure WARN; got:\n{output}"
+        );
+    }
+
     /// The `caused_by` field must surface `std::error::Error::source()` so
     /// Phase 2 sees the underlying error kind (e.g. `ConnectionRefused`)
     /// not just the outer display message.
@@ -878,7 +1192,7 @@ mod typed_error_logs {
         // The same input through `try_forward` DOES warn: a caller that
         // consumes the typed error is our own code, and a caller bug there
         // should be visible.
-        let _ = fwd.try_forward(b"abc", UPSTREAM_TIMEOUT).await;
+        let _ = fwd.try_forward(b"abc", GENEROUS_BUDGET).await;
         assert!(
             writer.snapshot_string().contains("shorter than the header"),
             "try_forward must warn; got:\n{}",
@@ -904,7 +1218,10 @@ mod typed_error_logs {
         let _guard = set_default_in_current_thread(subscriber);
 
         const CALLER_BUDGET: Duration = Duration::from_millis(1500);
-        assert!(CALLER_BUDGET < UPSTREAM_TIMEOUT, "the budget must be the tighter one");
+        assert!(
+            CALLER_BUDGET < TUNNEL_QUERY_TIMEOUT,
+            "the budget must be the tighter one"
+        );
 
         let (addr, accepted_rx) = super::silent_tcp_peer().await;
         let fwd = Arc::new(DnsForwarder::new_with_ports(
@@ -921,7 +1238,7 @@ mod typed_error_logs {
         tokio::time::pause();
         let result = call.await.unwrap();
 
-        assert_eq!(result, Err(ForwardFailure::Upstream(UpstreamCause::Timeout)));
+        assert_eq!(result, Err(ForwardFailure::Upstream(UpstreamCause::ExchangeTimeout)));
         let output = writer.snapshot_string();
         assert!(
             output.contains("upstream failed"),
@@ -968,13 +1285,13 @@ mod typed_error_logs {
         ));
         let call = tokio::spawn({
             let fwd = Arc::clone(&fwd);
-            async move { fwd.try_forward(&sample_query(0x000D), UPSTREAM_TIMEOUT).await }
+            async move { fwd.try_forward(&sample_query(0x000D), GENEROUS_BUDGET).await }
         });
         connected_rx.await.expect("the stub connector completed a connect");
         tokio::time::pause();
         assert_eq!(
             call.await.unwrap(),
-            Err(ForwardFailure::Upstream(UpstreamCause::Timeout))
+            Err(ForwardFailure::Upstream(UpstreamCause::ExchangeTimeout))
         );
 
         let output = writer.snapshot_string();
@@ -1011,13 +1328,13 @@ mod typed_error_logs {
         ));
         let call = tokio::spawn({
             let fwd = Arc::clone(&fwd);
-            async move { fwd.try_forward(&sample_query(0x000F), UPSTREAM_TIMEOUT).await }
+            async move { fwd.try_forward(&sample_query(0x000F), GENEROUS_BUDGET).await }
         });
         connected_rx.await.expect("the stub connector completed a connect");
         tokio::time::pause();
         assert_eq!(
             call.await.unwrap(),
-            Err(ForwardFailure::Upstream(UpstreamCause::Timeout))
+            Err(ForwardFailure::Upstream(UpstreamCause::ExchangeTimeout))
         );
 
         let output = writer.snapshot_string();
@@ -1047,13 +1364,13 @@ mod typed_error_logs {
         ));
         let call = tokio::spawn({
             let fwd = Arc::clone(&fwd);
-            async move { fwd.try_forward(&sample_query(0x0010), UPSTREAM_TIMEOUT).await }
+            async move { fwd.try_forward(&sample_query(0x0010), GENEROUS_BUDGET).await }
         });
         connected_rx.await.expect("the stub connector completed a connect");
         tokio::time::pause();
         assert_eq!(
             call.await.unwrap(),
-            Err(ForwardFailure::Upstream(UpstreamCause::Timeout))
+            Err(ForwardFailure::Upstream(UpstreamCause::ExchangeTimeout))
         );
 
         let output = writer.snapshot_string();
@@ -1087,13 +1404,13 @@ async fn upstream_activity_accumulates_across_a_timed_out_walk() {
 
     let call = tokio::spawn({
         let fwd = Arc::clone(&fwd);
-        async move { fwd.try_forward(&sample_query(0x000E), UPSTREAM_TIMEOUT).await }
+        async move { fwd.try_forward(&sample_query(0x000E), GENEROUS_BUDGET).await }
     });
     connected_rx.await.expect("the stub connector completed a connect");
     tokio::time::pause();
     assert_eq!(
         call.await.unwrap(),
-        Err(ForwardFailure::Upstream(UpstreamCause::Timeout))
+        Err(ForwardFailure::Upstream(UpstreamCause::ExchangeTimeout))
     );
 
     let moved = fwd.upstream_activity().since(before);
@@ -1125,7 +1442,7 @@ async fn a_connection_reset_before_the_first_write_still_counts_as_established()
         vec![addr.port()],
     );
     let before = fwd.upstream_activity();
-    let _ = fwd.try_forward(&sample_query(0x0011), UPSTREAM_TIMEOUT).await;
+    let _ = fwd.try_forward(&sample_query(0x0011), GENEROUS_BUDGET).await;
     let moved = fwd.upstream_activity().since(before);
     assert_eq!(moved.connects, 1, "the connect completed; got {moved:?}");
     assert_eq!(moved.read, 0, "the peer sent nothing; got {moved:?}");
@@ -1144,7 +1461,7 @@ async fn upstream_activity_counts_udp_datagrams() {
         vec![addr.port()],
     );
     let before = fwd.upstream_activity();
-    fwd.try_forward(&q, UPSTREAM_TIMEOUT).await.expect("the stub replies");
+    fwd.try_forward(&q, GENEROUS_BUDGET).await.expect("the stub replies");
     let moved = fwd.upstream_activity().since(before);
     assert_eq!(moved.written, q.len() as u64, "got {moved:?}");
     assert!(moved.read > 0, "the stub's reply must be counted; got {moved:?}");
@@ -1164,7 +1481,7 @@ async fn upstream_activity_counts_a_udp_associate_separately_from_connects() {
     let before = fwd.upstream_activity();
     let call = tokio::spawn({
         let fwd = Arc::clone(&fwd);
-        async move { fwd.try_forward(&sample_query(0x0022), UPSTREAM_TIMEOUT).await }
+        async move { fwd.try_forward(&sample_query(0x0022), GENEROUS_BUDGET).await }
     });
     connected_rx.await.expect("the stub connector completed a connect");
     tokio::time::pause();
