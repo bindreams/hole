@@ -11,8 +11,7 @@
 //!
 //! A socket rather than a stdio pipe: skuld runs every test of a binary in one
 //! process, and a sibling test's `CreateProcess(bInheritHandles=TRUE)` can
-//! inherit a pipe's write end and defer its EOF indefinitely (hole#197's
-//! class).
+//! inherit a pipe's write end and defer its EOF indefinitely.
 
 use std::io::{BufRead as _, BufReader, Read as _, Write as _};
 use std::net::{TcpListener, TcpStream};

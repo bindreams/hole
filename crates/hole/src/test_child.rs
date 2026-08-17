@@ -10,7 +10,7 @@
 //!
 //! A socket rather than a stdio pipe: skuld runs every test of a binary in one
 //! process, and a sibling test's spawn can inherit a pipe's write end and defer
-//! its EOF indefinitely (hole#197's class).
+//! its EOF indefinitely.
 
 use std::io::{Read as _, Write as _};
 use std::net::{TcpListener, TcpStream};

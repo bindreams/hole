@@ -95,13 +95,11 @@ pub fn await_predecessor() -> std::io::Result<()> {
 /// is an INPUT, so there is no way to reach the `READY` print without having
 /// resolved first — the pid-reuse ordering guard is structural.
 ///
-/// An unassessable predecessor proceeds rather than failing. The old Windows arm
-/// did the same (any `OpenProcess` failure became a no-op wait); the old macOS
-/// arm returned `Err` BEFORE printing `READY`, so the predecessor's `read_line`
-/// never saw the line and `spawn_successor` reported a broken handshake while
-/// the successor launched anyway. Unifying on the Windows arm removes that
-/// failed-handshake case: both processes agree on the handover, and the fallback
-/// is the pre-existing single-instance forward-and-exit.
+/// An unassessable predecessor proceeds rather than failing: an `Err` here
+/// returns before `READY` is printed, so the predecessor's `read_line` reports a
+/// broken handshake while the successor launches anyway. Proceeding keeps both
+/// processes agreed on the handover, with the single-instance forward-and-exit
+/// as the fallback.
 fn handshake_then_wait<W: std::io::Write>(
     pid: cosca::identity::RawPid,
     predecessor: cosca::identity::Resolved<cosca::Process>,
