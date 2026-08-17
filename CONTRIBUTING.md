@@ -751,11 +751,13 @@ returns `ClientError::VersionMismatch`; [`BridgeLink`](crates/hole/src/state.rs)
 fires an injected self-heal hook ([selfheal.rs](crates/hole/src/selfheal.rs))
 which, by `same_file` file-identity (startup image vs. the file at that path
 now), either relaunches the updated image — via the cross-platform exit-wait
-primitive [relaunch.rs](crates/hole/src/relaunch.rs) (Windows
-`WaitForSingleObject`, macOS `kqueue`/`NOTE_EXIT`) — or, if it *is* the
-installed image, shows a path-free reinstall dialog. The only `#[cfg]` live in
-the `ArmedWait`/identity seams; `decide` and the wiring are platform-agnostic
-and table-tested. Inert until an update produces a mismatch, and gated off for
+primitive [relaunch.rs](crates/hole/src/relaunch.rs), which watches the
+predecessor through `cosca::Process::wait` — or, if it *is* the installed image,
+shows a path-free reinstall dialog. The successor still has to read the
+predecessor's identity while the `READY` handshake holds it alive: `wait` takes
+an identity as input and re-verifies it, so the ordering plus the start token is
+what closes the pid-reuse window. `relaunch.rs` carries no `#[cfg]` at all;
+`decide` and the wiring are platform-agnostic and table-tested. Inert until an update produces a mismatch, and gated off for
 dev/snapshot builds.
 
 **One-time caveat:** a GUI built *before* this feature has no self-heal logic,

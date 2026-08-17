@@ -1,20 +1,46 @@
 use super::*;
 
-#[skuld::test]
-fn armed_wait_returns_after_child_exits() {
-    // Spawn a real, short-lived child and arm a wait on it; whether we arm
-    // before or after it exits, `wait()` must return (a live handle blocks
-    // until exit; an already-gone PID is a no-op). Waiting on an external
-    // process's exit is the sanctioned timing exception.
-    #[cfg(windows)]
-    let mut child = std::process::Command::new("cmd").args(["/c", "exit"]).spawn().unwrap();
-    #[cfg(unix)]
-    let mut child = std::process::Command::new("true").spawn().unwrap();
+use cosca::identity::Resolved;
 
-    let pid = child.id();
-    let armed = ArmedWait::arm(pid).unwrap();
-    child.wait().unwrap();
-    armed.wait();
+#[skuld::test]
+fn the_death_watch_returns_when_a_live_predecessor_exits() {
+    // Waiting on an external process's exit is the sanctioned timing exception.
+    // The residual: a `wait` broken in the "never returns" direction hangs, and
+    // no assertion can convert that into a clean failure without a timeout. The
+    // PASS case is prompt — the child exits as soon as the control socket
+    // closes.
+    let mut child = crate::test_child::HoldChild::spawn();
+    let pid = child.pid();
+
+    // The precondition the whole pid-reuse duty rests on, asserted rather than
+    // assumed: a child that died early would otherwise steer this into the
+    // vacuous `Gone` arm.
+    let Resolved::Found(predecessor) = cosca::Process::from_pid(pid) else {
+        panic!("the predecessor must be alive when its identity is read");
+    };
+    child.release();
+
+    let mut out = Vec::new();
+    handshake_then_wait(pid, Resolved::Found(predecessor), &mut out).expect("the death watch must return Ok");
+    assert_eq!(out, b"READY\n");
+}
+
+#[skuld::test]
+fn a_gone_predecessor_still_completes_the_handshake() {
+    let mut out = Vec::new();
+    handshake_then_wait(4242, Resolved::Gone, &mut out).expect("a gone predecessor is nothing to wait for");
+    assert_eq!(out, b"READY\n");
+}
+
+#[skuld::test]
+fn an_unassessable_predecessor_still_completes_the_handshake() {
+    // Treating this as an error would never print READY, so the predecessor's
+    // `read_line` would never return and the handoff would break. Treating it
+    // as `Found` is not even expressible — `Unknown` carries no `Process`.
+    let mut out = Vec::new();
+    handshake_then_wait(4242, Resolved::Unknown, &mut out)
+        .expect("an unassessable predecessor must not fail the handoff");
+    assert_eq!(out, b"READY\n");
 }
 
 // Successor handoff: a relaunch reproduces the predecessor's window state using

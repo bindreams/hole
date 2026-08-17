@@ -33,7 +33,13 @@ pub mod version;
 hole_test_observability::register!();
 
 #[cfg(test)]
+mod test_child;
+
+#[cfg(test)]
 fn main() {
+    // Subprocess re-exec for the death-watch test. Dispatches BEFORE skuld
+    // initializes, so libtest's arg parsing is bypassed for the child.
+    test_child::maybe_run();
     skuld::run_all();
 }
 
