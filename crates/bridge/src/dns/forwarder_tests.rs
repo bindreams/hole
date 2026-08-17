@@ -1248,9 +1248,12 @@ mod typed_error_logs {
             output.contains("layer=timeout"),
             "expected 'layer=timeout'; got:\n{output}"
         );
+        // The peer accepted the connection and then went quiet, so the budget
+        // fired with a transport already published — an EXCHANGE timeout. The
+        // layer tag stays `timeout`; only the cause distinguishes the two.
         assert!(
-            output.contains("cause=timeout"),
-            "expected 'cause=timeout'; got:\n{output}"
+            output.contains("cause=exchange-timeout"),
+            "expected 'cause=exchange-timeout'; got:\n{output}"
         );
         assert!(
             output.contains("budget_ms=1500"),

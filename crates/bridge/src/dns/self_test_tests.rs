@@ -809,11 +809,14 @@ fn self_test_respects_the_overall_deadline_and_reports_the_real_failure() {
     );
     match outcome {
         SelfTestOutcome::Failed { reason, attempts, .. } => {
-            // The connect never completes, so the cause code is `Timeout`
-            // while nothing at all left the process. This is the case that
-            // makes the positive-evidence split load-bearing: a cause-code
-            // split would file it under the tunnel sentence.
-            assert!(matches!(reason, SelfTestReason::NoConnection), "got {reason:?}");
+            // Every connect stays outstanding until its budget fires, so the
+            // run is `TunnelSetupPending` — NOT `NoConnection`. That swap is
+            // the whole of #771: this shape used to be reported as "the local
+            // proxy or its plugin is not accepting connections", which is a
+            // claim about a refusal that never happened. `NoConnection` is now
+            // reserved for connects that failed outright, pinned by
+            // `a_definite_connect_failure_is_still_reported_as_no_connection`.
+            assert!(matches!(reason, SelfTestReason::TunnelSetupPending), "got {reason:?}");
             assert!(
                 (1..=3).contains(&attempts),
                 "attempts must count what actually ran; got {attempts}"
