@@ -1,5 +1,5 @@
-//! Privileged-lane proof that a kill-switch lockout is escapable end to end
-//! (bindreams/hole#825). Real WFP/pf cover + real egress probes, driven through
+//! Privileged-lane proof that a kill-switch lockout is escapable end to end.
+//! Real WFP/pf cover + real egress probes, driven through
 //! the production `ProxyManager` + `SystemRouting` so the user's actual remedy —
 //! turning the kill switch off — is on the tested path.
 //!
@@ -101,7 +101,7 @@ fn lockdown_lockout_survives_unclean_exit_and_release_opens_the_host() {
     // 3. The unclean exit: the guard is forgotten, so nothing disengages.
     CoverGuard::disarm(cover);
 
-    // 4. The lockout. This is the state #825 reported as "not engaged".
+    // 4. The lockout: the cover survives the crash and is holding the host closed.
     assert_eq!(
         lockdown_cover_state(dir.path()),
         CoverState::Engaged,

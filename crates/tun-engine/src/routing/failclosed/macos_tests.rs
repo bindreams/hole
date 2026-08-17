@@ -366,7 +366,7 @@ fn restore_empty_nat_has_no_blank_line() {
     assert!(!r.contains("\n\n"), "empty nat must not produce a blank line:\n{r}");
 }
 
-// Cover-state probe (#825) ============================================================================================
+// Cover-state probe ===================================================================================================
 
 #[skuld::test]
 fn macos_cover_state_maps_pf_reads() {
@@ -383,7 +383,7 @@ fn macos_cover_state_maps_pf_reads() {
     assert_eq!(cover_state_from(true, Some(true), None), Unknown);
 
     // pf disabled: the ruleset is inert, the host is open. The ordinary
-    // post-reboot state (#827) — reporting Engaged here would be a false alarm.
+    // post-reboot state — reporting Engaged here would be a false alarm.
     assert_eq!(cover_state_from(true, Some(false), Some(true)), Absent);
     assert_eq!(cover_state_from(true, Some(false), Some(false)), Absent);
 
@@ -419,6 +419,19 @@ fn macos_pf_read_failures_are_not_answers() {
         None,
         "a spawn failure is not an answer"
     );
+}
+
+#[skuld::test]
+fn macos_engaged_state_is_reachable_by_the_disengage_verifier() {
+    // `disengage_lockdown` probes BEFORE clearing the state file. If it cleared
+    // first, `lockdown_cover_state` would short-circuit to Absent and the verify
+    // could never observe a ruleset still blocking — a check that cannot fail.
+    // Pin the input the verifier must be able to see.
+    assert_eq!(cover_state_from(true, Some(true), Some(true)), CoverState::Engaged);
+    assert!(super::verify_disengaged(CoverState::Engaged).is_err());
+    // ...and the vacuous one it would see if the file were gone first.
+    assert_eq!(cover_state_from(false, None, None), CoverState::Absent);
+    assert!(super::verify_disengaged(CoverState::Absent).is_ok());
 }
 
 #[skuld::test]

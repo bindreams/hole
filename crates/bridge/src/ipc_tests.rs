@@ -144,7 +144,7 @@ impl Drop for MockRunning {
 struct MockRouting {
     state_dir: PathBuf,
     fail_gateway: AtomicBool,
-    /// OS-truth lockdown cover probe (#825): what `lockdown_cover_state` reports.
+    /// OS-truth lockdown cover probe: what `lockdown_cover_state` reports.
     cover_state: std::sync::Mutex<CoverState>,
     /// Make `disengage_lockdown` fail, so a test can drive the fail-loud path
     /// where the kill switch must NOT be recorded as off.
@@ -735,7 +735,7 @@ fn mock_proxy_with_stuck_cover() -> Arc<Mutex<ProxyManager<MockProxy, MockRoutin
 
 #[skuld::test]
 fn status_reports_held_closed_for_a_cover_no_session_owns() {
-    // The tray input that used to read "not engaged" over a blocked host (#825).
+    // The tray must see this as engaged even with nothing running.
     rt().block_on(async {
         let path = test_socket_path("held-closed-status");
         let state_dir = tempfile::tempdir().unwrap().keep();

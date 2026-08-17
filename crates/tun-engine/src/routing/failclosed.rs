@@ -94,6 +94,14 @@ pub fn recover_cover(state_dir: &Path, adopting: bool) {
     platform::recover_cover(state_dir, adopting);
 }
 
+/// Fail-loud transient sweep for the `bridge unlock` escape hatch: clears a
+/// block-until-connected cover a crash left behind and PROPAGATES failure, so the
+/// command cannot report success over a host it did not open. [`recover_cover`]
+/// stays best-effort — startup recovery has no caller to act on an error.
+pub fn sweep_transient_verified(state_dir: &Path) -> Result<(), RoutingError> {
+    platform::sweep_transient_verified(state_dir)
+}
+
 /// Engage the standing lockdown cover (loopback + TUN + onward-server + —on
 /// Windows— plugin/bridge App-IDs permitted, all else blocked). Returns the
 /// SAME [`Cover`] wrapper the transient `engage` returns — the platform guard

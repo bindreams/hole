@@ -501,11 +501,10 @@ fn macos_failclosed_permits_resolver_blocks_other_egress() {
     );
 }
 
-// Cover-state probe against the real OS (#825) ========================================================================
+// Cover-state probe against the real OS ===============================================================================
 
-/// The probe must track the REAL cover through its whole life. The clean-host
-/// `Absent` is the assertion the old Windows facade — an unconditional `true` —
-/// could not make, and it is what let #825 report a live cover as "not engaged".
+/// The probe must track the REAL cover through its whole life, including the
+/// clean-host `Absent` case an unconditional `true` cannot express.
 #[cfg(target_os = "windows")]
 #[skuld::test(labels = [TUN], serial = TUN)]
 fn lockdown_lockout_windows_cover_state_tracks_engage_and_disengage() {
@@ -547,7 +546,7 @@ fn lockdown_lockout_windows_cover_state_tracks_engage_and_disengage() {
 
 /// macOS counterpart. pf state is the ruleset + the enable token, so the probe
 /// reads both rather than trusting `bridge-lockdown-pf.json` — a reboot leaves
-/// that file over a flushed, disabled pf (#827).
+/// that file over a flushed, disabled pf.
 #[cfg(target_os = "macos")]
 #[skuld::test(labels = [TUN], serial = TUN)]
 fn lockdown_lockout_macos_cover_state_tracks_engage_and_disengage() {

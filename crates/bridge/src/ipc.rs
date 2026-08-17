@@ -280,6 +280,10 @@ async fn handle_status<P: Proxy + 'static, R: Routing + 'static>(
 ) -> Json<StatusResponse> {
     let mut pm = state.proxy.lock().await;
     pm.check_health();
+    // One probe, so both flags describe the same instant: the firewall is not
+    // under this lock, and a concurrent `hole bridge unlock` between two reads
+    // would yield a pair no real state produces.
+    let (lockdown_active, held_closed) = pm.cover_status();
     Json(StatusResponse {
         running: pm.state() == ProxyState::Running,
         uptime_secs: pm.uptime_secs(),
@@ -292,8 +296,8 @@ async fn handle_status<P: Proxy + 'static, R: Routing + 'static>(
         udp_proxy_available: pm.udp_proxy_available(),
         ipv6_bypass_available: pm.ipv6_bypass_available(),
         lockdown_enabled: pm.lockdown_enabled(),
-        lockdown_active: pm.lockdown_active(),
-        held_closed: pm.held_closed(),
+        lockdown_active,
+        held_closed,
         blocked_until_connected: pm.blocked_until_connected(),
     })
 }
@@ -424,6 +428,13 @@ async fn handle_cancel<P: Proxy + 'static, R: Routing + 'static>(
     Json(EmptyResponse {})
 }
 
+/// PII-free client-facing failure for `POST /v1/lockdown`. Covers both halves —
+/// a cover that would not release and an intent that would not persist — because
+/// the user's next move is the same either way, and the distinguishing detail is
+/// exactly the part that carries paths.
+pub(crate) const LOCKDOWN_SET_FAILED: &str =
+    "Hole could not change the kill switch. If your network is blocked, run `hole bridge unlock` as an administrator.";
+
 /// Set the standing kill switch intent (last-writer-wins absolute set). Any
 /// authorized caller may toggle it. The bridge is the authority; the GUI only
 /// sends intent.
@@ -433,13 +444,6 @@ async fn handle_cancel<P: Proxy + 'static, R: Routing + 'static>(
 /// the next bridge start. A cover a live session owns is left to `stop_with`:
 /// settings apply on reconnect. A 500 means the host may STILL be blocked — the
 /// intent is deliberately not recorded as off in that case.
-/// PII-free client-facing failure for `POST /v1/lockdown`. Covers both halves —
-/// a cover that would not release and an intent that would not persist — because
-/// the user's next move is the same either way, and the distinguishing detail is
-/// exactly the part that carries paths.
-pub(crate) const LOCKDOWN_SET_FAILED: &str =
-    "Hole could not change the kill switch. If your network is blocked, run `hole bridge unlock` as an administrator.";
-
 async fn handle_lockdown<P: Proxy + 'static, R: Routing + 'static>(
     State(state): State<Arc<IpcState<P, R>>>,
     Json(req): Json<LockdownRequest>,

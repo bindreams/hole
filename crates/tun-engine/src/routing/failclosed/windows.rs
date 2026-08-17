@@ -903,10 +903,17 @@ impl Drop for Cover {
                 CoverKind::Transient => delete_all(self.engine),
                 // Lockdown: delete only the lockdown + App-ID filters; the
                 // shared sublayer/provider are owned by the transient sweep.
-                #[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
+                // Deletes are CHECKED and logged: this is the ordinary
+                // user-disconnect path, and a silent failure here leaves the host
+                // blocked with no trace of why. Drop has no caller to propagate
+                // to, so a warn is the whole signal (macOS logs the same way).
                 CoverKind::Lockdown => {
                     for g in swept_lockdown_guids() {
-                        let _ = FwpmFilterDeleteByKey0(self.engine, &g);
+                        #[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
+                        let rc = FwpmFilterDeleteByKey0(self.engine, &g);
+                        if rc != ERROR_SUCCESS.0 && rc != FWP_E_FILTER_NOT_FOUND.0 as u32 {
+                            tracing::warn!(rc, guid = ?g, "lockdown filter delete failed during Drop; host may stay blocked");
+                        }
                     }
                 }
             }
@@ -1065,6 +1072,49 @@ pub fn disengage_lockdown(state_dir: &Path) -> Result<(), RoutingError> {
         }
     }
     super::verify_disengaged(lockdown_cover_state(state_dir))
+}
+
+/// Fail-loud transient sweep for `bridge unlock`. Unlike [`recover_cover`],
+/// which is best-effort because startup recovery has no caller to act on a
+/// failure, this PROPAGATES: `unlock` promises the user that a success means
+/// their network is open, and a cover it silently failed to clear would break
+/// that promise on the one command they have left.
+///
+/// Only the FILTERS are checked. The sublayer and provider are shared with the
+/// standing lockdown cover, so their delete legitimately fails while lockdown
+/// filters still pin them — an orphaned empty sublayer blocks nothing.
+pub fn sweep_transient_verified(_state_dir: &Path) -> Result<(), RoutingError> {
+    unsafe {
+        let mut engine = HANDLE::default();
+        #[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
+        let rc = FwpmEngineOpen0(PCWSTR::null(), RPC_C_AUTHN_WINNT, None, None, &mut engine);
+        if rc != ERROR_SUCCESS.0 {
+            return Err(RoutingError::RouteSetup(format!(
+                "FwpmEngineOpen0 failed ({rc}); cannot sweep the transient cover"
+            )));
+        }
+        let mut failed: Option<u32> = None;
+        for g in swept_transient_guids() {
+            #[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
+            let rc = FwpmFilterDeleteByKey0(engine, &g);
+            if rc != ERROR_SUCCESS.0 && rc != FWP_E_FILTER_NOT_FOUND.0 as u32 {
+                tracing::warn!(rc, guid = ?g, "transient filter delete failed");
+                failed.get_or_insert(rc);
+            }
+        }
+        #[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
+        let _ = FwpmSubLayerDeleteByKey0(engine, &SUBLAYER_GUID);
+        #[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
+        let _ = FwpmProviderDeleteByKey0(engine, &PROVIDER_GUID);
+        #[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
+        let _ = FwpmEngineClose0(engine);
+        if let Some(rc) = failed {
+            return Err(RoutingError::RouteSetup(format!(
+                "FwpmFilterDeleteByKey0 failed ({rc}); the transient cover may still be engaged"
+            )));
+        }
+    }
+    Ok(())
 }
 
 pub fn recover_cover(_state_dir: &Path, adopting: bool) {

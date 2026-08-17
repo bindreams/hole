@@ -357,7 +357,7 @@ fn external_bridge_denied_toast_is_actionable() {
     assert!(toast.contains("gui.log"), "{toast}");
 }
 
-// Kill-switch lockout UX (#825) =======================================================================================
+// Kill-switch lockout UX ==============================================================================================
 
 #[skuld::test]
 fn tray_actions_held_closed_offers_a_release() {
@@ -438,7 +438,7 @@ fn lockdown_label_arms_unaffected_by_held_closed_are_unchanged() {
 }
 
 #[skuld::test]
-fn lockdown_click_intent_off_but_engaged_releases() {
+fn lockdown_click_intent_off_but_held_closed_releases() {
     // The arm whose label warns the network is blocked must not ARM the switch.
     assert!(
         !lockdown_click_intent(false, true),
@@ -447,10 +447,21 @@ fn lockdown_click_intent_off_but_engaged_releases() {
 }
 
 #[skuld::test]
+fn lockdown_click_intent_off_while_a_session_owns_the_cover_re_arms() {
+    // Turning the switch off mid-session leaves the cover engaged until the next
+    // reconnect. Reading that as "still blocking" would make the switch
+    // impossible to turn back on without disconnecting first.
+    assert!(
+        lockdown_click_intent(false, false),
+        "a session-owned cover is not a lockout; the click must re-arm"
+    );
+}
+
+#[skuld::test]
 fn lockdown_click_intent_toggles_every_other_arm() {
-    assert!(lockdown_click_intent(false, false), "off + nothing engaged arms it");
-    assert!(!lockdown_click_intent(true, true), "on + engaged disarms it");
-    assert!(!lockdown_click_intent(true, false), "on + not engaged disarms it");
+    assert!(lockdown_click_intent(false, false), "off + nothing held closed arms it");
+    assert!(!lockdown_click_intent(true, true), "on + held closed disarms it");
+    assert!(!lockdown_click_intent(true, false), "on + not held closed disarms it");
 }
 
 #[skuld::test]

@@ -665,7 +665,7 @@ fn adopt_does_not_delete_the_address_range_loopback_floor() {
     assert_eq!(adopt.len(), 4, "adopt_delete_guids unchanged: TUN V4/V6 + server V4/V6");
 }
 
-// Cover-state probe (#825) ============================================================================================
+// Cover-state probe ===================================================================================================
 
 #[skuld::test]
 fn windows_cover_state_maps_probe_outcomes() {
@@ -673,7 +673,7 @@ fn windows_cover_state_maps_probe_outcomes() {
 
     // A probe that could not open the engine knows nothing. Collapsing this into
     // `Absent` would report "no cover" over a host our filters still hold closed
-    // — #825's symptom from a new cause — and would hide the release affordance,
+    // — the same symptom from a new cause — and would hide the release affordance,
     // which keys on the same signal.
     for v4 in [Found, NotFound, Failed] {
         for v6 in [Found, NotFound, Failed] {
@@ -722,15 +722,15 @@ fn block_guid_indices_name_the_block_all_pair() {
 }
 
 #[skuld::test]
-fn lockdown_cover_present_delegates_to_the_probe() {
-    // The recovery input used to be a hardcoded `true` on Windows, which is why
-    // #825 could not tell an adopted cover from a clean host. Structural pin
-    // against a constant creeping back: whatever the environment, the two facades
-    // must agree. Runs unprivileged — the FWPM read path needs no elevation.
+fn lockdown_cover_present_is_false_on_a_host_with_no_cover() {
+    // Pins the recovery input against a hardcoded constant: a `true` that ignores
+    // the host cannot tell an adopted cover from a clean one, which is what made
+    // the lockout invisible. The expected value is derived from the test's own
+    // setup — this dir engaged nothing, so nothing can be present. Runs
+    // unprivileged: the FWPM read path needs no elevation.
     let dir = tempfile::tempdir().unwrap();
-    assert_eq!(
-        super::super::lockdown_cover_present(dir.path()),
-        super::super::lockdown_cover_state(dir.path()).is_present(),
-        "lockdown_cover_present must derive from the probe, not a constant"
+    assert!(
+        !super::super::lockdown_cover_present(dir.path()),
+        "no cover was engaged, so the recovery input must report absent"
     );
 }

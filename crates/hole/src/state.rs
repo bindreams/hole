@@ -252,9 +252,7 @@ impl BridgeLink {
         // A resolved observation retracts any stale wedge failure.
         self.cell.clear_update_failed(UPDATE_FAILED);
         match observed_lockdown(result) {
-            Some((le, la, hc, blk)) => self
-                .cell
-                .commit_status(running, observed_error(result), le, la, hc, blk),
+            Some(lockdown) => self.cell.commit_status(running, observed_error(result), lockdown),
             None => self.cell.commit(running),
         }
     }
@@ -409,6 +407,17 @@ pub struct ProxySnapshot {
     pub blocked_until_connected: bool,
 }
 
+/// The kill-switch/cover flags a Status observation carries. A named struct, not
+/// four positional `bool`s: they are same-typed and adjacent, so a transposition
+/// at any call site would compile silently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LockdownObservation {
+    pub enabled: bool,
+    pub active: bool,
+    pub held_closed: bool,
+    pub blocked_until_connected: bool,
+}
+
 /// Single owner of the GUI's view of "is the proxy running" (#462).
 pub struct ProxyStateCell {
     tx: tokio::sync::watch::Sender<ProxySnapshot>,
@@ -465,15 +474,13 @@ impl ProxyStateCell {
     /// by the `Status` arm so all commit atomically under the one client lock.
     /// `error` rides the same write — it is meaningful only alongside a running
     /// edge (a death), so it is not part of the change check.
-    pub fn commit_status(
-        &self,
-        running: bool,
-        error: Option<String>,
-        lockdown_enabled: bool,
-        lockdown_active: bool,
-        held_closed: bool,
-        blocked_until_connected: bool,
-    ) {
+    pub fn commit_status(&self, running: bool, error: Option<String>, lockdown: LockdownObservation) {
+        let LockdownObservation {
+            enabled: lockdown_enabled,
+            active: lockdown_active,
+            held_closed,
+            blocked_until_connected,
+        } = lockdown;
         self.tx.send_if_modified(|snap| {
             if snap.running == running
                 && snap.lockdown_enabled == lockdown_enabled
@@ -502,14 +509,19 @@ impl ProxyStateCell {
     /// (preserve prior).
     /// Idempotent — bumps `seq` only when running, error, or one of those flags
     /// actually changes.
-    pub fn commit_update_failed(&self, reason: &'static str, lockdown: Option<(bool, bool, bool, bool)>) {
+    pub fn commit_update_failed(&self, reason: &'static str, lockdown: Option<LockdownObservation>) {
         self.tx.send_if_modified(|snap| {
-            let (le, la, hc, blk) = lockdown.unwrap_or((
-                snap.lockdown_enabled,
-                snap.lockdown_active,
-                snap.held_closed,
-                snap.blocked_until_connected,
-            ));
+            let LockdownObservation {
+                enabled: le,
+                active: la,
+                held_closed: hc,
+                blocked_until_connected: blk,
+            } = lockdown.unwrap_or(LockdownObservation {
+                enabled: snap.lockdown_enabled,
+                active: snap.lockdown_active,
+                held_closed: snap.held_closed,
+                blocked_until_connected: snap.blocked_until_connected,
+            });
             if !snap.running
                 && snap.error.as_deref() == Some(reason)
                 && snap.lockdown_enabled == le
@@ -700,7 +712,7 @@ pub fn classify_lockdown(result: &Result<BridgeResponse, ClientError>) -> Lockdo
 /// The lockdown (enabled, active, held_closed) + blocked-until-connected flags a
 /// Status exchange revealed, if any. Only a `Status` Ok carries them; every other
 /// exchange yields None (leave the snapshot's prior fields untouched).
-pub(crate) fn observed_lockdown(result: &Result<BridgeResponse, ClientError>) -> Option<(bool, bool, bool, bool)> {
+pub(crate) fn observed_lockdown(result: &Result<BridgeResponse, ClientError>) -> Option<LockdownObservation> {
     match result {
         Ok(BridgeResponse::Status {
             lockdown_enabled,
@@ -708,12 +720,12 @@ pub(crate) fn observed_lockdown(result: &Result<BridgeResponse, ClientError>) ->
             held_closed,
             blocked_until_connected,
             ..
-        }) => Some((
-            *lockdown_enabled,
-            *lockdown_active,
-            *held_closed,
-            *blocked_until_connected,
-        )),
+        }) => Some(LockdownObservation {
+            enabled: *lockdown_enabled,
+            active: *lockdown_active,
+            held_closed: *held_closed,
+            blocked_until_connected: *blocked_until_connected,
+        }),
         _ => None,
     }
 }

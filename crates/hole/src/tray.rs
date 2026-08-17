@@ -276,12 +276,17 @@ fn lockdown_menu_label(enabled: bool, active: bool, held_closed: bool) -> String
 /// The intent a click on the lockdown item should send, derived from the arm the
 /// label RENDERED rather than from the persisted intent alone.
 ///
-/// The old `!lockdown_enabled` inverted the wrong thing: in the
-/// intent-off-but-still-blocking arm it computes `true`, so clicking the item
-/// warning that the network is blocked would ARM the kill switch. That arm must
-/// re-send `false` — a second release attempt, the same thing Unblock Network does.
-fn lockdown_click_intent(enabled: bool, active: bool) -> bool {
-    if !enabled && active {
+/// A plain `!enabled` inverts the wrong thing in the intent-off-but-still-blocking
+/// arm: it computes `true`, so clicking the item that warns the network is blocked
+/// would ARM the kill switch. That arm must re-send `false` — a second release
+/// attempt, the same thing Unblock Network does.
+///
+/// Keyed on `held_closed`, NOT on `active`: the other intent-off-and-engaged arm
+/// is a live session holding its own cover, where the setting is simply waiting
+/// for the next reconnect. Treating that one as a re-release would make the kill
+/// switch impossible to re-arm without disconnecting first.
+fn lockdown_click_intent(enabled: bool, held_closed: bool) -> bool {
+    if !enabled && held_closed {
         return false;
     }
     !enabled
@@ -943,7 +948,7 @@ fn handle_tray_event(app: &AppHandle, event: MenuEvent) {
             // the authority (last-writer-wins); send intent, re-fetch Status (which
             // commits the new lockdown fields), then rebuild from the reply.
             let snap = app.state::<AppState>().proxy_snapshot();
-            let desired = lockdown_click_intent(snap.lockdown_enabled, snap.lockdown_active);
+            let desired = lockdown_click_intent(snap.lockdown_enabled, snap.held_closed);
             info!(desired, "tray: lockdown toggled");
             let app_handle = app.clone();
             tauri::async_runtime::spawn(async move { send_lockdown_intent(app_handle, desired).await });
@@ -959,9 +964,10 @@ fn handle_tray_event(app: &AppHandle, event: MenuEvent) {
 
 /// Send a lockdown intent and repaint from the authoritative reply.
 ///
-/// A failed release used to be logged and dropped, so the one remedy a locked-out
-/// user is likely to try appeared to do nothing — the failure #825 is about. On
-/// `Err` the user gets the escape that works with no bridge at all; the Status
+/// A failed release must not be silently dropped: it is the one remedy a
+/// locked-out user is likely to try, and a click that visibly does nothing is the
+/// whole complaint. On `Err` the user gets the escape that works with no bridge
+/// at all; the Status
 /// re-fetch then repaints the true state, which the bridge deliberately still
 /// reports as engaged because the intent did not flip.
 async fn send_lockdown_intent(app: AppHandle, enabled: bool) {

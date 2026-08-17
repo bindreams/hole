@@ -455,7 +455,7 @@ pub trait Routing: Send + Sync {
     /// as the OS sees it — independent of whether this process engaged it or is
     /// running a session at all. That independence is the point: a cover adopted
     /// from a crashed run has no guard anywhere in this process, and deriving
-    /// "engaged" from a live session reports it as absent (bindreams/hole#825).
+    /// "engaged" from a live session reports it as absent.
     ///
     /// [`CoverState::Unknown`] means the probe could not answer; a caller must
     /// not treat it as an open host.

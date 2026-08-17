@@ -457,33 +457,49 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         self.running.as_ref().is_some_and(|r| r.lockdown.is_some())
     }
 
-    /// Whether a standing lockdown cover is engaged (the `active` signal).
-    /// Distinct from the persisted intent (`enabled`).
+    /// The `(lockdown_active, held_closed)` pair from ONE probe of the OS.
     ///
-    /// The OS is the authority; the session guard is only a short-circuit that
-    /// skips the probe when we already hold the answer. Deriving this from the
-    /// running session alone is bindreams/hole#825: a cover adopted from a
-    /// crashed run has no guard in this process, so it read `false` while it was
-    /// blocking every packet.
+    /// Both together, because they must describe the same instant: the firewall
+    /// is not under the `ProxyManager` lock, so two sequential probes can be torn
+    /// by a concurrent `hole bridge unlock` and yield `active && !held_closed` —
+    /// which the tray reads as "a session owns the cover" over a host where
+    /// nothing is running. One probe per status also halves the OS cost of an
+    /// idle disconnected poll.
     ///
-    /// A probe that cannot answer ([`CoverState::Unknown`]) counts as active —
-    /// the escape affordance keys on this field, and hiding it over an
-    /// unanswerable probe is the same lockout by another route.
-    pub fn lockdown_active(&self) -> bool {
-        self.session_owns_cover() || self.routing.lockdown_cover_state().is_engaged_or_unknown()
+    /// `active`: the OS is the authority; the session guard is only a
+    /// short-circuit that skips the probe when we already hold the answer.
+    /// Deriving it from the running session alone is wrong: a cover adopted from
+    /// a crashed run has no guard in this process, so it would read `false` while
+    /// blocking every packet. A probe that cannot answer
+    /// ([`CoverState::Unknown`]) counts as active: the escape affordance keys on
+    /// this field, and hiding it over an unanswerable probe is the same lockout
+    /// by another route.
+    ///
+    /// `held_closed`: a cover engaged that no running session owns — the host is
+    /// held closed with nothing carrying the user's traffic through it.
+    /// Deliberately not `active && !running`. Intent OFF plus a leftover cover
+    /// whose startup `Sweep` failed, then a connect: `start_inner` skips
+    /// `install_lockdown` because the intent is off, so `running` is true while
+    /// the stale block-all and its dead TUN permit kill every packet.
+    pub fn cover_status(&self) -> (bool, bool) {
+        if self.session_owns_cover() {
+            return (true, false);
+        }
+        let engaged = self.routing.lockdown_cover_state().is_engaged_or_unknown();
+        (engaged, engaged)
     }
 
-    /// Whether a lockdown cover is engaged that NO running session owns — the
-    /// host is being held closed with nothing carrying the user's traffic
-    /// through it. The state the tray must surface with a way out.
-    ///
-    /// Deliberately not `lockdown_active && !running`. Intent OFF plus a
-    /// leftover cover whose startup `Sweep` failed, then a connect: `start_inner`
-    /// skips `install_lockdown` because the intent is off, so `running` is true
-    /// while the stale block-all and its dead TUN permit kill every packet. An
-    /// `!running` test would render that as an ordinary connected session.
+    /// Whether a standing lockdown cover is engaged. Prefer
+    /// [`cover_status`](Self::cover_status) when both flags are wanted, so they
+    /// share one probe.
+    pub fn lockdown_active(&self) -> bool {
+        self.cover_status().0
+    }
+
+    /// Whether a cover no running session owns is holding the host closed. See
+    /// [`cover_status`](Self::cover_status).
     pub fn held_closed(&self) -> bool {
-        !self.session_owns_cover() && self.routing.lockdown_cover_state().is_engaged_or_unknown()
+        self.cover_status().1
     }
 
     /// Whether a covered start failed and left the host fail-closed (blocked, not
@@ -514,10 +530,9 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
     ///
     /// Turning it OFF also RELEASES a cover no live session owns, rather than
     /// leaving it for the next `recover_routes` — the user's one obvious remedy
-    /// used to do nothing at all (bindreams/hole#825). Ordering is
-    /// `cutover::unlock_with`'s: disengage FIRST, persist `false` only on a
-    /// confirmed success, so the setting can never read "off" over a blocked
-    /// host.
+    /// must not do nothing at all. Ordering is `cutover::unlock_with`'s:
+    /// disengage FIRST, persist `false` only on a confirmed success, so the
+    /// setting can never read "off" over a host we KNOW is blocked.
     ///
     /// A cover a live session DOES own is left alone: settings apply on
     /// reconnect, and `stop_with` already disengages it. A lockout is not a
@@ -543,20 +558,41 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
     /// Disengage a standing cover no live session owns. A no-op when the probe
     /// confirms none is engaged, or when the running session owns it.
     ///
+    /// Refuses ONLY when the probe OBSERVED a cover and the release then failed —
+    /// the one case where we know the host is still blocked and the setting must
+    /// not read "off". An `Unknown` probe whose release also failed is the
+    /// correlated pair on Windows (both go through `FwpmEngineOpen0`), and
+    /// refusing there would leave the switch permanently un-disarmable while we
+    /// never established that anything was blocking. The uncertainty is not
+    /// swallowed: `held_closed` still counts `Unknown` as held, so the tray keeps
+    /// showing the state and its release action.
+    ///
     /// Cannot clobber a transient block-until-connected cover: that one is only
     /// ever engaged on a lockdown-OFF covered start, where no lockdown state
     /// exists — and both platform disengages key on lockdown state alone (macOS
     /// returns early with no `pfctl` when `bridge-lockdown-pf.json` is absent;
     /// Windows deletes lockdown GUIDs, which are disjoint from the transient set).
     fn release_unowned_cover(&self) -> Result<(), ProxyError> {
+        use tun_engine::routing::failclosed::CoverState;
         if self.session_owns_cover() {
             return Ok(());
         }
-        if self.routing.lockdown_cover_state() == tun_engine::routing::failclosed::CoverState::Absent {
+        let observed = self.routing.lockdown_cover_state();
+        if observed == CoverState::Absent {
             return Ok(());
         }
-        info!("lockdown intent off: releasing the standing cover no session owns");
-        self.routing.disengage_lockdown().map_err(ProxyError::from)
+        info!(
+            ?observed,
+            "lockdown intent off: releasing the standing cover no session owns"
+        );
+        match self.routing.disengage_lockdown() {
+            Ok(()) => Ok(()),
+            Err(e) if observed == CoverState::Engaged => Err(ProxyError::from(e)),
+            Err(e) => {
+                warn!(error = %e, "could not release a cover never confirmed engaged; recording the intent off anyway");
+                Ok(())
+            }
+        }
     }
 
     /// Non-cancellable convenience wrapper around

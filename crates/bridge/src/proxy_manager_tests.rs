@@ -195,7 +195,7 @@ struct MockRoutingState {
     /// `fail_cover` (always-fail) is unaffected and takes priority.
     fail_cover_for_resolvers: std::sync::Mutex<std::collections::HashSet<Option<IpAddr>>>,
     /// What `lockdown_cover_state` reports — the OS-truth probe a test drives to
-    /// stand in for a cover adopted from a crashed run (#825).
+    /// stand in for a cover adopted from a crashed run.
     cover_state: std::sync::Mutex<CoverState>,
     /// How many times the probe was asked. Lets a test assert the short-circuit
     /// (a session that owns the cover must not pay for an OS call).
@@ -2023,7 +2023,7 @@ fn full_start_fails_closed_when_doh_cannot_resolve() {
 // guards unwind without ever hijacking the user's system DNS into a
 // dead tunnel.
 
-// Kill-switch lockout: state + release (#825) =========================================================================
+// Kill-switch lockout: state + release ================================================================================
 
 /// A manager + its routing mock's shared state, both pointed at one `dir`, with
 /// the OS-truth cover probe seeded to `cover`. Stands in for a bridge that has
@@ -2172,6 +2172,54 @@ async fn lockdown_off_attempts_the_release_when_the_probe_is_unknown() {
         state.standing_disengage_calls.load(Ordering::SeqCst),
         1,
         "an unanswerable probe must not be read as nothing-to-release"
+    );
+}
+
+#[skuld::test]
+async fn lockdown_off_disarms_when_an_unknown_probe_and_a_failed_release_correlate() {
+    // On Windows the probe and the release both go through `FwpmEngineOpen0`, so
+    // an unreachable firewall makes the probe Unknown AND the release fail. If
+    // that refused, the switch could never be turned off — a lockout built out of
+    // the fix for one. We never observed a cover, so record the intent and let
+    // `held_closed` keep surfacing the uncertainty.
+    let (pm, state, dir) = lockout_manager(CoverState::Unknown, true);
+    state.fail_standing_disengage.store(true, Ordering::SeqCst);
+
+    pm.set_lockdown_intent(false)
+        .expect("an unconfirmed cover must not strand the setting");
+    assert_eq!(state.standing_disengage_calls.load(Ordering::SeqCst), 1);
+    assert!(!lockdown_state::load_enabled(dir.path()), "intent recorded off");
+    assert!(
+        pm.held_closed(),
+        "and the uncertainty is still surfaced, so the escape stays on the menu"
+    );
+}
+
+#[skuld::test]
+async fn lockdown_off_refuses_only_when_a_cover_was_actually_observed() {
+    // The mirror of the case above: Engaged is an observation, so a failed
+    // release means we KNOW the host is blocked and the setting must not lie.
+    let (pm, state, dir) = lockout_manager(CoverState::Engaged, true);
+    state.fail_standing_disengage.store(true, Ordering::SeqCst);
+
+    assert!(pm.set_lockdown_intent(false).is_err());
+    assert!(lockdown_state::load_enabled(dir.path()), "intent stays ON");
+}
+
+#[skuld::test]
+async fn cover_status_probes_the_os_once() {
+    // The two flags must describe the same instant: the firewall is not under the
+    // ProxyManager lock, so a torn pair can claim a session owns a cover that a
+    // concurrent `hole bridge unlock` just cleared.
+    let (pm, state, _dir) = lockout_manager(CoverState::Engaged, true);
+    state.cover_state_calls.store(0, Ordering::SeqCst);
+
+    let (active, held) = pm.cover_status();
+    assert!(active && held);
+    assert_eq!(
+        state.cover_state_calls.load(Ordering::SeqCst),
+        1,
+        "one status read must cost exactly one OS probe"
     );
 }
 

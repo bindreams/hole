@@ -1,5 +1,5 @@
 //! Platform-neutral tests for the cover-state vocabulary shared by both
-//! platform probes (#825).
+//! platform probes.
 
 use super::*;
 
@@ -26,7 +26,7 @@ fn unknown_counts_as_present_for_recovery() {
 #[skuld::test]
 fn unknown_counts_as_engaged_for_the_status_surface() {
     // The escape affordance keys on this. Reporting "not engaged" for a probe
-    // that failed would hide a genuinely blocked host — #825's symptom.
+    // that failed would hide a genuinely blocked host.
     assert!(CoverState::Engaged.is_engaged_or_unknown());
     assert!(CoverState::Unknown.is_engaged_or_unknown());
     assert!(!CoverState::Absent.is_engaged_or_unknown());

@@ -24,7 +24,7 @@ nextest-version = "0.9.130"
 #     crates/tun-engine/src/routing/failclosed/lockdown_privileged_tests.rs
 #   - `failclosed_permits_` (transient block-until-connected cover real engage):
 #     crates/tun-engine/src/routing/failclosed/lockdown_privileged_tests.rs
-#   - `lockdown_lockout_` prefix (#825 kill-switch lockout escape):
+#   - `lockdown_lockout_` prefix (kill-switch lockout: crash -> probe -> release):
 #     crates/tun-engine/src/routing/failclosed/lockdown_privileged_tests.rs
 #     crates/bridge/tests/lockout_privileged.rs (crash -> probe -> release e2e)
 #   - `cutover_global_net_state_` prefix:
