@@ -182,10 +182,10 @@ fn save_creates_missing_dir() {
 /// with `IsADirectory` on Unix and `PermissionDenied` on Windows, neither of
 /// which is `NotFound`, so the arm is reached on every platform with no
 /// permission games and no race.
-fn unreadable_fixture(dir: &std::path::Path) -> std::io::ErrorKind {
+fn unreadable_fixture(dir: &std::path::Path) {
     let path = dir.join(STATE_FILE_NAME);
     std::fs::create_dir_all(&path).unwrap();
-    std::fs::read(&path).expect_err("reading a directory must fail").kind()
+    std::fs::read(&path).expect_err("reading a directory must fail");
 }
 
 #[skuld::test]
@@ -202,14 +202,35 @@ fn a_present_but_unreadable_file_loads_as_unreadable() {
 fn an_unreadable_append_writes_nothing_and_reports_the_error() {
     // A transient failure on the second plugin's append must not rewrite the
     // file with one record and leave the first untracked.
+    //
+    // Both assertions read values that move: over a healthy, writable file,
+    // folding `Unreadable` into the fresh-state arm answers `Ok` and rewrites
+    // the file to `second` alone. The error's message, not its `ErrorKind` —
+    // reading a directory and renaming onto one report the same kind, so a kind
+    // comparison cannot separate the read's error from a downstream write's.
     let dir = tempfile::tempdir().unwrap();
-    let read_kind = unreadable_fixture(dir.path());
+    let first = synthetic(1, 1);
+    let second = synthetic(2, 2);
+    append_record(dir.path(), first.clone(), None).unwrap();
 
-    let err = append_record(dir.path(), synthetic(1, 1), None).expect_err("append must report the read failure");
+    let err = append_loaded(
+        Loaded::Unreadable(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "injected")),
+        dir.path(),
+        second,
+        None,
+    )
+    .expect_err("append must report the read failure");
 
+    assert!(
+        err.to_string().contains("injected"),
+        "the append must surface the READ's error, not a downstream write's; got: {err}"
+    );
+    let Loaded::State(loaded) = load(dir.path()) else {
+        panic!("the seeded state file must still load as State");
+    };
     assert_eq!(
-        err.kind(),
-        read_kind,
-        "the append must surface the READ's error, not a downstream write's"
+        loaded.plugins,
+        vec![first],
+        "a failed read must write nothing: the prior record was dropped"
     );
 }

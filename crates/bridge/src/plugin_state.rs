@@ -72,18 +72,30 @@ pub fn save(state_dir: &Path, state: &PluginState, owner: Option<(u32, u32)>) ->
 
 /// Append a single record to the state file. Creates the file if missing.
 /// Reads existing records, merges, atomically writes the result.
+pub fn append_record(
+    state_dir: &Path,
+    record: cosca::identity::ProcessIdRecord,
+    owner: Option<(u32, u32)>,
+) -> std::io::Result<()> {
+    append_loaded(load(state_dir), state_dir, record, owner)
+}
+
+/// The append's dispositions, over an already-loaded state. Taking `Loaded` by
+/// value makes every arm drivable from a test without a fixture that has to
+/// defeat a real `fs::read`.
 ///
 /// Called at plugin spawn, where a file that will not parse is already dead
 /// weight, so `Absent` and `Unusable` both start a fresh state. A file that
 /// could not be *read* is not dead weight: rewriting it with a single record
 /// would drop the previously-tracked plugins permanently, so the read error is
 /// returned and nothing is written.
-pub fn append_record(
+pub(crate) fn append_loaded(
+    loaded: Loaded,
     state_dir: &Path,
     record: cosca::identity::ProcessIdRecord,
     owner: Option<(u32, u32)>,
 ) -> std::io::Result<()> {
-    let mut state = match load(state_dir) {
+    let mut state = match loaded {
         Loaded::State(state) => state,
         Loaded::Unreadable(e) => return Err(e),
         Loaded::Absent | Loaded::Unusable => PluginState {
