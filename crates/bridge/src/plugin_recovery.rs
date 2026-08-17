@@ -31,15 +31,22 @@ pub fn reap_recorded_plugins(state_dir: &Path) {
 /// value makes every arm drivable from a test without a fixture that has to
 /// defeat a real `fs::read`.
 pub(crate) fn reap_loaded(loaded: Loaded, state_dir: &Path) {
-    reap_loaded_with(loaded, state_dir, |id| cosca::Process::from_id(id).kill());
+    reap_loaded_with(
+        loaded,
+        state_dir,
+        |record| ProcessId::try_from(record),
+        |id| cosca::Process::from_id(id).kill(),
+    );
 }
 
-/// [`reap_loaded`] with the per-record kill injected. cosca returns `Err` only
-/// for a target it could not open or assess, which a test cannot manufacture
-/// for its own child, so the accounting rule's failure leg needs this seam.
+/// [`reap_loaded`] with the per-record restore and kill injected. Both fail only
+/// on states this host cannot be made to produce — a restore refused by the
+/// host's own unreadable boot session, a kill on a target cosca could not open
+/// or assess — so the accounting rule's failure legs need these seams.
 pub(crate) fn reap_loaded_with(
     loaded: Loaded,
     state_dir: &Path,
+    restore: impl Fn(&cosca::identity::ProcessIdRecord) -> Result<ProcessId, cosca::error::Error>,
     kill: impl Fn(ProcessId) -> Result<(), cosca::error::Error>,
 ) {
     let state = match loaded {
@@ -67,15 +74,27 @@ pub(crate) fn reap_loaded_with(
     // killed, provably gone, or provably unrestorable on this host.
     let mut all_accounted = true;
     for record in &state.plugins {
-        let id = match ProcessId::try_from(record) {
-            // Accounted: a foreign-platform / foreign-boot-session record can
-            // never name a killable process on this host, so keeping the file
-            // for it would litter forever.
-            Err(e) => {
+        let id = match restore(record) {
+            Err(e) if settles_the_record(&e) => {
+                // Accounted: a foreign-platform / foreign-boot-session record can
+                // never name a killable process on this host, so keeping the file
+                // for it would litter forever.
                 tracing::error!(
                     pid = record.pid,
                     error = %e,
                     "recorded plugin identity cannot be restored on this host; nothing here can name it"
+                );
+                continue;
+            }
+            Err(e) => {
+                // Unaccounted: the refusal is about THIS HOST, not the record, so
+                // the record may still name a live plugin holding a server
+                // connection and a local port.
+                all_accounted = false;
+                tracing::warn!(
+                    pid = record.pid,
+                    error = %e,
+                    "recorded plugin identity could not be checked on this host; keeping the file so the next start retries"
                 );
                 continue;
             }
@@ -117,6 +136,34 @@ pub(crate) fn reap_loaded_with(
             path = %state_dir.join(plugin_state::STATE_FILE_NAME).display(),
             "keeping the plugin state file: a record could not be accounted for"
         );
+    }
+}
+
+/// Whether a failed restore SETTLES the record: the refusal is about the
+/// record's own contents, so no later start on this host could restore it and
+/// keeping the file for it would litter forever.
+///
+/// `ScopeUnreadable` is the one record error that is not about the contents —
+/// this host's boot session momentarily could not be read, raised before the
+/// record is validated at all — so an otherwise perfectly restorable record
+/// lands here. It, and any error that is not a record error, leave the record
+/// unsettled. Both `Error` and `RecordErrorKind` are `#[non_exhaustive]`; a kind
+/// cosca adds later reads as unsettled, which keeps the file rather than
+/// forgetting a live plugin.
+fn settles_the_record(e: &cosca::error::Error) -> bool {
+    use cosca::error::RecordErrorKind as K;
+    match e {
+        cosca::error::Error::IdentityRecord { kind, .. } => matches!(
+            kind,
+            K::UnknownVersion
+                | K::ForeignPlatform
+                | K::InvalidPid
+                | K::ForeignBootSession
+                | K::MissingBootSession
+                | K::ForeignPidNamespace
+                | K::MissingPidNamespace
+        ),
+        _ => false,
     }
 }
 

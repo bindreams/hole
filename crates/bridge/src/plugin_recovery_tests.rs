@@ -150,6 +150,26 @@ fn an_absent_state_file_leaves_the_directory_untouched() {
     );
 }
 
+/// The real restore, for the tests that only inject the kill.
+fn real_restore(record: &cosca::identity::ProcessIdRecord) -> Result<cosca::identity::ProcessId, cosca::error::Error> {
+    cosca::identity::ProcessId::try_from(record)
+}
+
+fn unassessable() -> cosca::error::Error {
+    cosca::error::Error::Unassessable {
+        detail: "injected".into(),
+        source: None,
+    }
+}
+
+fn record_error(kind: cosca::error::RecordErrorKind) -> cosca::error::Error {
+    cosca::error::Error::IdentityRecord {
+        kind,
+        detail: "injected".into(),
+        source: None,
+    }
+}
+
 #[skuld::test]
 fn a_failed_kill_keeps_the_file() {
     // cosca returns `Err` only for a target it could not open or assess — i.e.
@@ -162,15 +182,86 @@ fn a_failed_kill_keeps_the_file() {
         plugins: vec![record],
     };
 
-    reap_loaded_with(plugin_state::Loaded::State(state), dir.path(), |_| {
-        Err(cosca::error::Error::Unassessable {
-            detail: "injected".into(),
-            source: None,
-        })
+    reap_loaded_with(plugin_state::Loaded::State(state), dir.path(), real_restore, |_| {
+        Err(unassessable())
     });
 
     assert!(
         state_file_exists(dir.path()),
         "a record whose kill failed is not accounted for, so the file must be kept"
+    );
+}
+
+#[skuld::test]
+fn an_unreadable_boot_session_keeps_the_file_where_a_foreign_record_clears_it() {
+    // `ScopeUnreadable` is the one record error that is not about the record's
+    // contents: this host's own boot session could not be read, and cosca raises
+    // it BEFORE validating the record, so a perfectly restorable record lands
+    // here. Folding it in with the permanently-foreign kinds deletes the file and
+    // leaks a live plugin untraceably. Only Linux can raise it for real, so the
+    // restore is injected; the foreign-platform kind is the control.
+    for (kind, keep) in [
+        (cosca::error::RecordErrorKind::ScopeUnreadable, true),
+        (cosca::error::RecordErrorKind::ForeignPlatform, false),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let record = seed_state_file(dir.path());
+        let state = plugin_state::PluginState {
+            version: plugin_state::SCHEMA_VERSION,
+            plugins: vec![record],
+        };
+
+        reap_loaded_with(
+            plugin_state::Loaded::State(state),
+            dir.path(),
+            |_| Err(record_error(kind)),
+            |_| panic!("a record that did not restore must never reach the kill"),
+        );
+
+        assert_eq!(
+            state_file_exists(dir.path()),
+            keep,
+            "{kind:?} must {} the state file",
+            if keep { "keep" } else { "clear" }
+        );
+    }
+}
+
+#[skuld::test]
+fn an_accounted_record_after_an_unaccounted_one_still_keeps_the_file() {
+    // The flag accumulates across the whole loop. Tracking only the LAST
+    // record's outcome passes every single-record test while silently dropping
+    // the guarantee for a multi-plugin chain — so the unaccounted record comes
+    // FIRST and the accounted one after it.
+    let dir = tempfile::tempdir().unwrap();
+    let template = seed_state_file(dir.path());
+    let unaccounted = cosca::identity::ProcessIdRecord { pid: 4242, ..template };
+    let accounted = cosca::identity::ProcessIdRecord {
+        pid: 4243,
+        ..unaccounted.clone()
+    };
+    let state = plugin_state::PluginState {
+        version: plugin_state::SCHEMA_VERSION,
+        plugins: vec![unaccounted, accounted],
+    };
+
+    let killed = std::sync::Mutex::new(Vec::new());
+    reap_loaded_with(plugin_state::Loaded::State(state), dir.path(), real_restore, |id| {
+        killed.lock().unwrap().push(id.pid());
+        if id.pid() == 4242 {
+            Err(unassessable())
+        } else {
+            Ok(())
+        }
+    });
+
+    assert_eq!(
+        *killed.lock().unwrap(),
+        vec![4242, 4243],
+        "every record must be processed, not just up to the first failure"
+    );
+    assert!(
+        state_file_exists(dir.path()),
+        "one unaccounted record keeps the file however many accounted ones follow it"
     );
 }
