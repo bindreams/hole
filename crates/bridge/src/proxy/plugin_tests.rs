@@ -206,3 +206,36 @@ mod identity {
         );
     }
 }
+
+/// A failed append is the only trace a lost spawn record leaves. Without it a
+/// plugin becomes unrecoverable on the next crash with nothing in the log.
+#[skuld::test]
+fn pid_sink_warns_when_the_append_fails() {
+    use tracing_subscriber::layer::{Layer, SubscriberExt};
+
+    let dir = tempfile::tempdir().unwrap();
+    // A state dir whose parent path component is a file, so `create_dir_all`
+    // cannot succeed and no write can land.
+    let blocker = dir.path().join("blocker");
+    std::fs::write(&blocker, b"not a directory").unwrap();
+    let state_dir = blocker.join("state");
+
+    let writer = crate::test_support::log_capture::VecWriter::new();
+    let subscriber = tracing_subscriber::registry().with(
+        tracing_subscriber::fmt::layer()
+            .with_writer(writer.clone())
+            .with_ansi(false)
+            .with_filter(tracing_subscriber::filter::LevelFilter::WARN),
+    );
+    let pid = std::process::id();
+    {
+        let _guard = garter::tracing_test::set_default_in_current_thread(subscriber);
+        super::record_plugin_pid(&state_dir, pid, None);
+    }
+
+    let output = writer.snapshot_string();
+    assert!(
+        output.contains(&pid.to_string()) && output.to_lowercase().contains("persist"),
+        "a lost spawn record must name the pid and the failure; got:\n{output}"
+    );
+}

@@ -175,3 +175,41 @@ fn save_creates_missing_dir() {
     save(&nested, &state, None).unwrap();
     assert!(nested.join(STATE_FILE_NAME).exists());
 }
+
+// A present file that could not be read ===============================================================================
+
+/// A directory at the state-file path. `std::fs::read` of a directory fails
+/// with `IsADirectory` on Unix and `PermissionDenied` on Windows, neither of
+/// which is `NotFound`, so the arm is reached on every platform with no
+/// permission games and no race.
+fn unreadable_fixture(dir: &std::path::Path) -> std::io::ErrorKind {
+    let path = dir.join(STATE_FILE_NAME);
+    std::fs::create_dir_all(&path).unwrap();
+    std::fs::read(&path).expect_err("reading a directory must fail").kind()
+}
+
+#[skuld::test]
+fn a_present_but_unreadable_file_loads_as_unreadable() {
+    // This fixture proves the classification only. It must not be reused for a
+    // "the file survived" assertion: `clear` is `remove_file`, which fails on
+    // a directory anyway, so that would hold in both worlds.
+    let dir = tempfile::tempdir().unwrap();
+    unreadable_fixture(dir.path());
+    assert!(matches!(load(dir.path()), Loaded::Unreadable(_)));
+}
+
+#[skuld::test]
+fn an_unreadable_append_writes_nothing_and_reports_the_error() {
+    // A transient failure on the second plugin's append must not rewrite the
+    // file with one record and leave the first untracked.
+    let dir = tempfile::tempdir().unwrap();
+    let read_kind = unreadable_fixture(dir.path());
+
+    let err = append_record(dir.path(), synthetic(1, 1), None).expect_err("append must report the read failure");
+
+    assert_eq!(
+        err.kind(),
+        read_kind,
+        "the append must surface the READ's error, not a downstream write's"
+    );
+}

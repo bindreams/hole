@@ -31,15 +31,46 @@ pub fn reap_recorded_plugins(state_dir: &Path) {
 /// value makes every arm drivable from a test without a fixture that has to
 /// defeat a real `fs::read`.
 pub(crate) fn reap_loaded(loaded: Loaded, state_dir: &Path) {
+    reap_loaded_with(loaded, state_dir, |id| cosca::Process::from_id(id).kill());
+}
+
+/// [`reap_loaded`] with the per-record kill injected. cosca returns `Err` only
+/// for a target it could not open or assess, which a test cannot manufacture
+/// for its own child, so the accounting rule's failure leg needs this seam.
+pub(crate) fn reap_loaded_with(
+    loaded: Loaded,
+    state_dir: &Path,
+    kill: impl Fn(ProcessId) -> Result<(), cosca::error::Error>,
+) {
     let state = match loaded {
         Loaded::Absent => return,
-        Loaded::Unusable => return,
+        Loaded::Unreadable(e) => {
+            tracing::error!(
+                error = %e,
+                path = %state_dir.join(plugin_state::STATE_FILE_NAME).display(),
+                "plugin state file could not be read; keeping it so the next start retries"
+            );
+            return;
+        }
+        Loaded::Unusable => {
+            tracing::error!(
+                path = %state_dir.join(plugin_state::STATE_FILE_NAME).display(),
+                "plugin state file is not usable at this schema; discarding it and accepting a one-time orphan leak"
+            );
+            clear_or_log(state_dir);
+            return;
+        }
         Loaded::State(state) => state,
     };
 
+    // The file may be deleted only once every record in it is accounted for:
+    // killed, provably gone, or provably unrestorable on this host.
+    let mut all_accounted = true;
     for record in &state.plugins {
         let id = match ProcessId::try_from(record) {
-            Ok(id) => id,
+            // Accounted: a foreign-platform / foreign-boot-session record can
+            // never name a killable process on this host, so keeping the file
+            // for it would litter forever.
             Err(e) => {
                 tracing::error!(
                     pid = record.pid,
@@ -48,6 +79,7 @@ pub(crate) fn reap_loaded(loaded: Loaded, state_dir: &Path) {
                 );
                 continue;
             }
+            Ok(id) => id,
         };
 
         // Diagnostic only. `Process::kill` answers `Ok` for a killed process,
@@ -56,23 +88,41 @@ pub(crate) fn reap_loaded(loaded: Loaded, state_dir: &Path) {
         // between this read and the kill can mislabel a log line and can never
         // misroute a kill — the kill is cosca's own identity-checked call.
         let observation = observe(id);
-        match cosca::Process::from_id(id).kill() {
+        match kill(id) {
             Ok(()) => tracing::info!(
                 pid = record.pid,
                 token = record.token,
                 observation,
                 "reaped recorded plugin"
             ),
-            Err(e) => tracing::warn!(
-                pid = record.pid,
-                token = record.token,
-                observation,
-                error = %e,
-                "failed to kill recorded plugin"
-            ),
+            // Unaccounted: cosca fails a kill only for a target it could not
+            // open or assess, i.e. exactly when it may still be running.
+            Err(e) => {
+                all_accounted = false;
+                tracing::warn!(
+                    pid = record.pid,
+                    token = record.token,
+                    observation,
+                    error = %e,
+                    "failed to kill recorded plugin"
+                );
+            }
         }
     }
 
+    if all_accounted {
+        clear_or_log(state_dir);
+    } else {
+        tracing::warn!(
+            path = %state_dir.join(plugin_state::STATE_FILE_NAME).display(),
+            "keeping the plugin state file: a record could not be accounted for"
+        );
+    }
+}
+
+/// A dropped `clear` failure leaves the file in place forever, which is the
+/// same litter bug one layer down — so state the disposition at every call.
+fn clear_or_log(state_dir: &Path) {
     if let Err(e) = plugin_state::clear(state_dir) {
         tracing::warn!(error = %e, "failed to clear plugin state file");
     }

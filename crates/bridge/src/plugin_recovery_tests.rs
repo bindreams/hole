@@ -95,3 +95,82 @@ fn an_unrestorable_record_is_not_killed() {
         "the rejected record must be reported for pid {pid}; got:\n{log}"
     );
 }
+
+// Dispositions: only a reap that accounted for every record may delete the file =======================================
+
+/// A normal, deletable state file, so a "kept vs cleared" assertion
+/// discriminates. Returns the record it holds.
+fn seed_state_file(dir: &Path) -> cosca::identity::ProcessIdRecord {
+    let record = cosca::identity::ProcessId::current()
+        .to_record()
+        .expect("persist this process's identity");
+    plugin_state::append_record(dir, record.clone(), None).unwrap();
+    assert!(state_file_exists(dir), "the fixture must start with a state file");
+    record
+}
+
+#[skuld::test]
+fn an_unreadable_state_file_is_kept_for_the_next_start() {
+    let dir = tempfile::tempdir().unwrap();
+    seed_state_file(dir.path());
+
+    reap_loaded(
+        plugin_state::Loaded::Unreadable(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+        dir.path(),
+    );
+
+    assert!(
+        state_file_exists(dir.path()),
+        "an unreadable state file must survive for the next start"
+    );
+}
+
+#[skuld::test]
+fn an_unusable_state_file_is_cleared() {
+    let dir = tempfile::tempdir().unwrap();
+    seed_state_file(dir.path());
+
+    reap_loaded(plugin_state::Loaded::Unusable, dir.path());
+
+    assert!(
+        !state_file_exists(dir.path()),
+        "an unusable state file must be cleared: nothing in it can name a process"
+    );
+}
+
+#[skuld::test]
+fn an_absent_state_file_leaves_the_directory_untouched() {
+    let dir = tempfile::tempdir().unwrap();
+
+    reap_loaded(plugin_state::Loaded::Absent, dir.path());
+
+    assert!(
+        !state_file_exists(dir.path()),
+        "the Absent arm must not write a state file"
+    );
+}
+
+#[skuld::test]
+fn a_failed_kill_keeps_the_file() {
+    // cosca returns `Err` only for a target it could not open or assess — i.e.
+    // exactly when it may still be running — which a test cannot manufacture
+    // for its own child, so the kill is injected.
+    let dir = tempfile::tempdir().unwrap();
+    let record = seed_state_file(dir.path());
+    let state = plugin_state::PluginState {
+        version: plugin_state::SCHEMA_VERSION,
+        plugins: vec![record],
+    };
+
+    reap_loaded_with(plugin_state::Loaded::State(state), dir.path(), |_| {
+        Err(cosca::error::Error::Unassessable {
+            detail: "injected".into(),
+            source: None,
+        })
+    });
+
+    assert!(
+        state_file_exists(dir.path()),
+        "a record whose kill failed is not accounted for, so the file must be kept"
+    );
+}
