@@ -664,3 +664,73 @@ fn adopt_does_not_delete_the_address_range_loopback_floor() {
     // Adopt still drops exactly the four volatile permits — unchanged by this fix.
     assert_eq!(adopt.len(), 4, "adopt_delete_guids unchanged: TUN V4/V6 + server V4/V6");
 }
+
+// Cover-state probe (#825) ============================================================================================
+
+#[skuld::test]
+fn windows_cover_state_maps_probe_outcomes() {
+    use Lookup::*;
+
+    // A probe that could not open the engine knows nothing. Collapsing this into
+    // `Absent` would report "no cover" over a host our filters still hold closed
+    // — #825's symptom from a new cause — and would hide the release affordance,
+    // which keys on the same signal.
+    for v4 in [Found, NotFound, Failed] {
+        for v6 in [Found, NotFound, Failed] {
+            assert_eq!(
+                cover_state_from_lookups(false, v4, v6),
+                CoverState::Unknown,
+                "engine-open failure is Unknown regardless of lookups ({v4:?}, {v6:?})"
+            );
+        }
+    }
+
+    // Either family's block-all present means the host is being held closed.
+    assert_eq!(cover_state_from_lookups(true, Found, NotFound), CoverState::Engaged);
+    assert_eq!(cover_state_from_lookups(true, NotFound, Found), CoverState::Engaged);
+    assert_eq!(cover_state_from_lookups(true, Found, Failed), CoverState::Engaged);
+    assert_eq!(cover_state_from_lookups(true, Found, Found), CoverState::Engaged);
+
+    // Both families confirmed missing is the only way to conclude "absent".
+    assert_eq!(cover_state_from_lookups(true, NotFound, NotFound), CoverState::Absent);
+
+    // A lookup that errored is not a confirmed absence.
+    assert_eq!(cover_state_from_lookups(true, Failed, NotFound), CoverState::Unknown);
+    assert_eq!(cover_state_from_lookups(true, NotFound, Failed), CoverState::Unknown);
+    assert_eq!(cover_state_from_lookups(true, Failed, Failed), CoverState::Unknown);
+}
+
+#[skuld::test]
+fn block_guid_indices_name_the_block_all_pair() {
+    // Presence is keyed on block-all, not on any permit: Adopt keeps block-all and
+    // drops the volatile permits, so a leftover permit cannot hold the host closed.
+    // Pins the index pair against a reordering of LOCKDOWN_FILTER_GUIDS.
+    let spec = build_lockdown_spec(v4(), luid(), &[]);
+    let blocks: std::collections::HashSet<GUID> = spec
+        .filters
+        .iter()
+        .filter(|f| f.action == Action::Block)
+        .map(|f| f.guid)
+        .collect();
+    for &i in &LOCKDOWN_BLOCK_GUID_INDICES {
+        assert!(
+            blocks.contains(&LOCKDOWN_FILTER_GUIDS[i]),
+            "LOCKDOWN_BLOCK_GUID_INDICES[{i}] must name a block filter"
+        );
+    }
+    assert_eq!(LOCKDOWN_BLOCK_GUID_INDICES.len(), 2, "one block-all per family");
+}
+
+#[skuld::test]
+fn lockdown_cover_present_delegates_to_the_probe() {
+    // The recovery input used to be a hardcoded `true` on Windows, which is why
+    // #825 could not tell an adopted cover from a clean host. Structural pin
+    // against a constant creeping back: whatever the environment, the two facades
+    // must agree. Runs unprivileged — the FWPM read path needs no elevation.
+    let dir = tempfile::tempdir().unwrap();
+    assert_eq!(
+        super::super::lockdown_cover_present(dir.path()),
+        super::super::lockdown_cover_state(dir.path()).is_present(),
+        "lockdown_cover_present must derive from the probe, not a constant"
+    );
+}

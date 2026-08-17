@@ -154,12 +154,68 @@ pub fn disengage_lockdown(state_dir: &Path) -> Result<(), RoutingError> {
     platform::disengage_lockdown(state_dir)
 }
 
+/// What a probe of the standing lockdown cover found. Three states, not a bool:
+/// a probe that cannot reach the OS knows nothing, and folding that into "no
+/// cover" would report an all-clear over a host our own filters are still
+/// holding closed — and hide the escape, which keys on the same signal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CoverState {
+    /// Our lockdown cover is in force: the host has no egress but the permits.
+    Engaged,
+    /// Confirmed absent — no cover of ours is holding the host.
+    Absent,
+    /// The probe could not answer (WFP engine open failed, `pfctl` unreadable).
+    Unknown,
+}
+
+impl CoverState {
+    /// Whether recovery should reconcile. `Unknown` reconciles: `Adopt` and
+    /// `Sweep` are both idempotent, so acting on a phantom costs nothing while
+    /// skipping a real cover would strand it.
+    pub fn is_present(self) -> bool {
+        !matches!(self, CoverState::Absent)
+    }
+
+    /// Whether the status surface should report the host as held closed.
+    /// `Unknown` counts: the user must be offered the way out.
+    pub fn is_engaged_or_unknown(self) -> bool {
+        !matches!(self, CoverState::Absent)
+    }
+}
+
+/// Gate a disengage on a post-disengage probe. `Ok` means the OS confirms the
+/// cover is gone — not that a call returned. Shared by both platforms so
+/// `disengage_lockdown`'s fail-loud contract is one rule, not two.
+pub(crate) fn verify_disengaged(state: CoverState) -> Result<(), RoutingError> {
+    match state {
+        CoverState::Absent => Ok(()),
+        CoverState::Engaged => Err(RoutingError::RouteSetup(
+            "the lockdown cover is still engaged after disengaging; the host remains blocked".into(),
+        )),
+        CoverState::Unknown => Err(RoutingError::RouteSetup(
+            "could not confirm the lockdown cover was disengaged; the host may remain blocked".into(),
+        )),
+    }
+}
+
+/// Whether our lockdown cover is holding the host closed RIGHT NOW. Distinct
+/// from [`lockdown_cover_present`], which asks the reconciliation question
+/// ("is there prior-run state to act on?") and is deliberately more lenient on
+/// macOS. The two coincide on Windows: its filters are persistent, so anything
+/// present is in force.
+pub fn lockdown_cover_state(state_dir: &Path) -> CoverState {
+    platform::lockdown_cover_state(state_dir)
+}
+
 /// Whether a standing lockdown cover from a prior run is present — the recovery
 /// decision's `prior_present` signal, keyed on the cover's OWN evidence (NOT
-/// `bridge-routes.json`). macOS: the `bridge-lockdown-pf.json` state file
-/// exists. Windows: always `true` — delete-by-GUID reconciliation is idempotent
-/// (a no-op when no filters exist), so probing would only add a redundant WFP
-/// enumeration; a `Sweep`/`Adopt` on a clean host does nothing.
+/// `bridge-routes.json`).
+///
+/// macOS stays lenient: the `bridge-lockdown-pf.json` state file existing is
+/// enough. pf is disabled and its ruleset flushed across a reboot while that
+/// file survives, so a stricter test would make `Sweep` skip the very file it
+/// exists to clear. Windows probes for real — [`CoverState::is_present`] treats
+/// an unanswerable probe as present so reconciliation still runs.
 pub fn lockdown_cover_present(state_dir: &Path) -> bool {
     #[cfg(target_os = "macos")]
     {
@@ -167,8 +223,7 @@ pub fn lockdown_cover_present(state_dir: &Path) -> bool {
     }
     #[cfg(target_os = "windows")]
     {
-        let _ = state_dir;
-        true
+        platform::lockdown_cover_state(state_dir).is_present()
     }
 }
 
@@ -190,6 +245,10 @@ pub(crate) fn build_lockdown_spec_for_test(
 #[cfg(all(test, target_os = "windows"))]
 #[path = "failclosed/facade_tests.rs"]
 mod facade_tests;
+
+#[cfg(test)]
+#[path = "failclosed/cover_state_tests.rs"]
+mod cover_state_tests;
 
 // Privileged-lane real-engage verification (#527): engages the REAL OS cover and
 // asserts it blocks egress. Gated to the elevated `hole-tests` TUN lane by the
