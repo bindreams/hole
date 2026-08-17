@@ -194,6 +194,16 @@ fn relay_to_sink<'a>(line: &'a str, sink: &Option<LogSink>) -> Cow<'a, str> {
     clean
 }
 
+/// Fires a [`tokio::sync::Notify`] when dropped, so a task's completion signal
+/// survives the task unwinding or being aborted — not only returning normally.
+struct SignalOnDrop(Arc<tokio::sync::Notify>);
+
+impl Drop for SignalOnDrop {
+    fn drop(&mut self) {
+        self.0.notify_one();
+    }
+}
+
 #[async_trait::async_trait]
 impl ChainPlugin for BinaryPlugin {
     fn name(&self) -> &str {
@@ -242,18 +252,21 @@ impl ChainPlugin for BinaryPlugin {
         }
 
         // Capture stderr FIRST: the sitrep stdout reader's readiness-FAILURE
-        // path (child exited before ever readying) joins `stderr_done` —
-        // bounded, not indefinite — before reporting that failure, so a
-        // plugin whose crash lands on stderr (the common shape for a Go
-        // panic under `GOTRACEBACK=crash`) isn't reported as if it said
-        // nothing. `Notify` (not the `JoinHandle` itself) so this task's
-        // handle stays free for the unconditional drain below too.
+        // path (child exited before ever readying) joins `stderr_done` before
+        // reporting that failure, so a plugin whose crash lands on stderr (the
+        // common shape for a Go panic under `GOTRACEBACK=crash`) isn't reported
+        // as if it said nothing. `Notify` (not the `JoinHandle` itself) so this
+        // task's handle stays free for the unconditional drain below too.
         let stderr = gc.child.stderr.take().expect("stderr was piped");
         let plugin_name = self.name.clone();
         let log_sink = self.log_sink.clone();
         let stderr_done = Arc::new(tokio::sync::Notify::new());
-        let stderr_done_signal = Arc::clone(&stderr_done);
+        let stderr_done_signal = SignalOnDrop(Arc::clone(&stderr_done));
         let stderr_task = tokio::spawn(async move {
+            // Signalled on unwind and on abort too: the stdout reader waits on
+            // this with no bound, and `relay_to_sink` runs a consumer-supplied
+            // `LogSink` that garter cannot assume is panic-free.
+            let _stderr_done = stderr_done_signal;
             let reader = BufReader::new(stderr);
             let mut lines = reader.lines();
             loop {
@@ -269,8 +282,15 @@ impl ChainPlugin for BinaryPlugin {
                     }
                 }
             }
-            stderr_done_signal.notify_one();
         });
+
+        // Every task that can still resolve readiness is owned HERE, not by the
+        // reader: in `Probe` the sender lives in a self-probe task outright, and
+        // in `Auto` / the tier-2 fallback a probe CO-owns it through
+        // `SharedReady`. `run` therefore holds their standdown token and their
+        // handles, so `reap_and_drain` can end them and wait for them.
+        let probe_standdown = shutdown.child_token();
+        let (probe_tx, mut probe_rx) = tokio::sync::mpsc::unbounded_channel::<tokio::task::JoinHandle<()>>();
 
         // Stdout consumer: in Probe mode it forwards lines to tracing and
         // readiness comes from a separate self-probe task; in ExpectSitrep
@@ -302,18 +322,18 @@ impl ChainPlugin for BinaryPlugin {
                 });
 
                 // Self-probe readiness. On a successful connect, report TCP
-                // readiness; on shutdown-first, drop `ready` unsent (the
+                // readiness; on standdown-first, drop `ready` unsent (the
                 // receiver gets RecvError: shutdown happened before readiness).
                 let probe_local = local;
-                let probe_shutdown = shutdown.clone();
-                tokio::spawn(async move {
-                    if let Some(addr) = crate::chain::poll_ready(probe_local, probe_shutdown).await {
+                let probe_standdown = probe_standdown.clone();
+                let _ = probe_tx.send(tokio::spawn(async move {
+                    if let Some(addr) = crate::chain::poll_ready(probe_local, probe_standdown).await {
                         let _ = ready.send(Ok(PluginReady {
                             listen: addr,
                             transports: crate::sitrep::Transports::TCP,
                         }));
                     }
-                });
+                }));
 
                 log_task
             }
@@ -321,21 +341,23 @@ impl ChainPlugin for BinaryPlugin {
                 stdout,
                 self.name.clone(),
                 local,
-                shutdown.clone(),
+                probe_standdown.clone(),
                 ready,
                 false,
                 self.log_sink.clone(),
                 stderr_done,
+                probe_tx.clone(),
             ),
             ReadinessMode::Auto => spawn_sitrep_stdout_reader(
                 stdout,
                 self.name.clone(),
                 local,
-                shutdown.clone(),
+                probe_standdown.clone(),
                 ready,
                 true,
                 self.log_sink.clone(),
                 stderr_done,
+                probe_tx.clone(),
             ),
         };
 
@@ -352,12 +374,10 @@ impl ChainPlugin for BinaryPlugin {
         let drain_timeout = std::time::Duration::from_secs(5);
         tokio::select! {
             status = gc.child.wait() => {
+                // Drain BEFORE inspecting `status`: readiness must be final on
+                // every exit from `run`, including a `wait()` that itself failed.
+                reap_and_drain(&mut gc, &probe_standdown, stdout_task, stderr_task, &mut probe_rx).await;
                 let status = status?;
-                // Drain remaining log lines (tasks will EOF when child's pipes close)
-                let _ = tokio::time::timeout(
-                    std::time::Duration::from_millis(100),
-                    async { let _ = tokio::join!(stdout_task, stderr_task); }
-                ).await;
                 if status.success() {
                     Ok(())
                 } else {
@@ -374,17 +394,57 @@ impl ChainPlugin for BinaryPlugin {
             }
             _ = shutdown.cancelled() => {
                 tracing::info!(plugin = %self.name, "shutting down");
-                // Force path force-kills the direct child; `gc` dropping at the
-                // end of `run` (or on task abort) reaps the whole tree.
-                shutdown::graceful_stop(&mut gc.child, drain_timeout).await?;
-                // Drain remaining log lines (tasks will EOF when child's pipes close)
-                let _ = tokio::time::timeout(
-                    std::time::Duration::from_millis(100),
-                    async { let _ = tokio::join!(stdout_task, stderr_task); }
-                ).await;
-                Ok(())
+                // Force path force-kills the direct child; `reap_and_drain` below
+                // takes the rest of the tree. Its result is held, not `?`-ed:
+                // readiness must be final on every exit from `run`, and
+                // `graceful_stop` is fallible (a Windows console-event error, an
+                // io error from wait/kill).
+                let stopped = shutdown::graceful_stop(&mut gc.child, drain_timeout).await;
+                reap_and_drain(&mut gc, &probe_standdown, stdout_task, stderr_task, &mut probe_rx).await;
+                stopped
             }
         }
+    }
+}
+
+/// Reap the plugin's process tree, then wait for every task that can still
+/// resolve this plugin's readiness. EVERY exit from `run` ends here — both
+/// `select!` arms and both their error paths — so the guarantee (when `run`
+/// returns, the readiness outcome is FINAL) depends neither on which arm an
+/// already-dead child was handled by (`select!` is unbiased) nor on the arm
+/// succeeding.
+///
+/// **The reap is what makes the wait terminate.** A dead direct child does NOT
+/// close its stdout/stderr: any descendant that inherited its stdio holds a
+/// duplicate of the write end, so the readers reach EOF only once the whole tree
+/// is gone (bindreams/hole#197). `GroupedChild::Drop` reaps that tree either way
+/// when `run` returns; this only orders the reap ahead of the drain instead of
+/// after it. Standing the probes down is the same argument for the other
+/// readiness owner: the child is gone, so no probe can still report a real
+/// listener.
+///
+/// RESIDUAL: the reap covers only processes inside THIS spawn's kill-group. A
+/// nested spawn (no group of its own), a Windows job kill-group already logged
+/// as degraded, or a descendant that `setsid()`s out of the process group can
+/// still hold a write end, and this wait would then block. Closing that needs a
+/// "what containment did I actually achieve" answer from the spawn itself, which
+/// bindreams/hole#816 tracks.
+async fn reap_and_drain(
+    gc: &mut kill_group::GroupedChild,
+    probe_standdown: &CancellationToken,
+    stdout_task: tokio::task::JoinHandle<()>,
+    stderr_task: tokio::task::JoinHandle<()>,
+    probes: &mut tokio::sync::mpsc::UnboundedReceiver<tokio::task::JoinHandle<()>>,
+) {
+    gc.kill_tree().await;
+    probe_standdown.cancel();
+    let _ = tokio::join!(stdout_task, stderr_task);
+    // Close rather than rely on every sender having been dropped: the reader (the
+    // only task that spawns a probe mid-stream) has ended, so no send can still be
+    // coming, and `recv` then drains what is buffered and stops.
+    probes.close();
+    while let Some(probe) = probes.recv().await {
+        let _ = probe.await;
     }
 }
 
@@ -402,8 +462,17 @@ type SharedReady = Arc<tokio::sync::Mutex<Option<oneshot::Sender<Result<PluginRe
 /// reports `PluginReady` (TCP-only) through the shared send-once sender.
 /// Shared by `ExpectSitrep`'s unknown-major fallback and `Auto`'s concurrent
 /// probe. `standdown` ends the probe early (without sending) when cancelled.
-fn spawn_shared_probe(local: SocketAddr, standdown: CancellationToken, shared: SharedReady) {
-    tokio::spawn(async move {
+///
+/// The handle goes to `probes` because this task CO-OWNS the readiness sender:
+/// `run` must be able to wait for it, not just for the reader (see
+/// [`reap_and_drain`]).
+fn spawn_shared_probe(
+    local: SocketAddr,
+    standdown: CancellationToken,
+    shared: SharedReady,
+    probes: &tokio::sync::mpsc::UnboundedSender<tokio::task::JoinHandle<()>>,
+) {
+    let _ = probes.send(tokio::spawn(async move {
         if let Some(addr) = crate::chain::poll_ready(local, standdown).await {
             if let Some(tx) = shared.lock().await.take() {
                 let _ = tx.send(Ok(PluginReady {
@@ -412,7 +481,7 @@ fn spawn_shared_probe(local: SocketAddr, standdown: CancellationToken, shared: S
                 }));
             }
         }
-    });
+    }));
 }
 
 /// Spawn the sitrep stdout reader.
@@ -425,19 +494,21 @@ fn spawn_shared_probe(local: SocketAddr, standdown: CancellationToken, shared: S
 /// a non-sitrep plugin (including one silent on stdout) is still readied by the
 /// probe. Non-event lines pass through to tracing as logs. On stdout EOF without
 /// ever sending, the sender drops unsent → the chain aggregator synthesizes a
-/// process-exit failure (the intended backstop) — bounded on `stderr_done` first
-/// (see its call site), so a crash whose last words land on stderr is not
+/// process-exit failure (the intended backstop) — waiting on `stderr_done` first
+/// (unbounded, on the same guarantor as this reader's own EOF: see
+/// [`reap_and_drain`]), so a crash whose last words land on stderr is not
 /// reported as if the plugin said nothing.
-#[allow(clippy::too_many_arguments)] // 8 args — bundling into a struct adds more noise than the warning.
+#[allow(clippy::too_many_arguments)] // 9 args — bundling into a struct adds more noise than the warning.
 fn spawn_sitrep_stdout_reader(
     stdout: tokio::process::ChildStdout,
     plugin_name: String,
     local: SocketAddr,
-    shutdown: CancellationToken,
+    probe_standdown: CancellationToken,
     ready: oneshot::Sender<Result<PluginReady, StartError>>,
     auto: bool,
     log_sink: Option<LogSink>,
     stderr_done: Arc<tokio::sync::Notify>,
+    probes: tokio::sync::mpsc::UnboundedSender<tokio::task::JoinHandle<()>>,
 ) -> tokio::task::JoinHandle<()> {
     use crate::sitrep::{ProtocolSupport, SitrepEvent};
 
@@ -448,10 +519,10 @@ fn spawn_sitrep_stdout_reader(
         // `hello` cancels `probe_standdown` so the probe defers to sitrep;
         // otherwise the probe readies the plugin (handles a non-sitrep plugin
         // that is silent on stdout — there is no first line to classify on).
-        // `probe_standdown` is a child of `shutdown`, so chain shutdown stops it.
-        let probe_standdown = shutdown.child_token();
+        // `probe_standdown` is a child of the plugin's `shutdown` token and is
+        // owned by `run`, so both chain shutdown and child exit stop the probe.
         if auto {
-            spawn_shared_probe(local, probe_standdown.clone(), shared.clone());
+            spawn_shared_probe(local, probe_standdown.clone(), shared.clone(), &probes);
         }
         let reader = BufReader::new(stdout);
         let mut lines = reader.lines();
@@ -492,7 +563,7 @@ fn spawn_sitrep_stdout_reader(
                                     // start it now. The reader continues only as a log
                                     // passthrough (it never sends readiness again).
                                     if !auto {
-                                        spawn_shared_probe(local, shutdown.clone(), shared.clone());
+                                        spawn_shared_probe(local, probe_standdown.clone(), shared.clone(), &probes);
                                     }
                                     // Drain the rest of stdout as logs so the
                                     // child's pipe never blocks; the probe task
@@ -538,16 +609,16 @@ fn spawn_sitrep_stdout_reader(
                 }
             }
         }
-        // If the child closed stdout without ever sending readiness, give the
-        // stderr reader a bounded chance to catch up before dropping the
-        // shared sender below signals process-exit to the aggregator — a
-        // crash lands on stderr more often than stdout (e.g. a Go panic
-        // under `GOTRACEBACK=crash`), and the two pipes are read by
-        // independent tasks with no ordering between them otherwise. Bounded
-        // on the child's own exit (stdout just EOF'd, so stderr is expected
-        // to follow shortly), not an arbitrary wait: this mirrors the
-        // existing drain timeout in `run`'s own shutdown paths.
-        let _ = tokio::time::timeout(std::time::Duration::from_millis(100), stderr_done.notified()).await;
+        // If the child closed stdout without ever sending readiness, wait for the
+        // stderr reader before dropping the shared sender signals process-exit to
+        // the aggregator — a crash lands on stderr more often than stdout (e.g. a
+        // Go panic under `GOTRACEBACK=crash`), and the two pipes are read by
+        // independent tasks with no ordering between them otherwise. Unbounded on
+        // the same guarantor as this reader's own EOF (the tree is reaped, so both
+        // pipes close), rather than a budget a large panic dump can overrun. A
+        // plugin that closes stdout while still ALIVE parks here instead of
+        // reporting an exit it has not made.
+        stderr_done.notified().await;
     })
 }
 
