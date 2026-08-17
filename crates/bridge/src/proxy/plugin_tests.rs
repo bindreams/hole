@@ -100,3 +100,109 @@ fn cancelled_is_not_a_bind_race() {
         "ProxyError::Cancelled must NOT classify as a bind race"
     );
 }
+
+// Plugin identity: spawn-time record, stop-time reap ==================================================================
+
+mod identity {
+    use super::super::{record_plugin_pid, PluginChain};
+    use crate::plugin_state::{self, Loaded, STATE_FILE_NAME};
+    use crate::test_support::reap_child::EchoChild;
+    use tokio_util::sync::CancellationToken;
+
+    fn synthetic_record() -> cosca::identity::ProcessIdRecord {
+        cosca::identity::ProcessIdRecord {
+            version: cosca::identity::RECORD_VERSION,
+            platform: cosca::identity::Platform::Windows,
+            pid: 4242,
+            token: 133_700_000_000_000_000,
+            boot_id: None,
+            pid_ns: None,
+        }
+    }
+
+    fn chain_over(dir: &std::path::Path) -> PluginChain {
+        PluginChain::for_test(
+            crate::proxy::plugin_log::PluginLog::new(),
+            CancellationToken::new(),
+            Some(dir.to_path_buf()),
+        )
+    }
+
+    #[skuld::test]
+    fn pid_sink_appends_a_resolved_childs_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let child = EchoChild::spawn();
+
+        record_plugin_pid(dir.path(), child.pid(), None);
+
+        let Loaded::State(state) = plugin_state::load(dir.path()) else {
+            panic!("the sink must have written a loadable state file");
+        };
+        assert_eq!(state.plugins.len(), 1, "one spawn, one record");
+        let restored = cosca::identity::ProcessId::try_from(&state.plugins[0]).expect("the record must restore");
+        assert_eq!(
+            restored,
+            child.identity(),
+            "the record must be built from the child's resolved identity"
+        );
+    }
+
+    #[skuld::test]
+    fn pid_sink_appends_nothing_for_an_unresolvable_pid() {
+        let dir = tempfile::tempdir().unwrap();
+
+        record_plugin_pid(dir.path(), 999_999_999, None);
+
+        assert!(
+            !dir.path().join(STATE_FILE_NAME).exists(),
+            "a pid that names nothing must not be recorded"
+        );
+    }
+
+    #[skuld::test]
+    async fn kill_tracked_kills_by_exact_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut child = EchoChild::spawn();
+        plugin_state::append_record(dir.path(), child.record(), None).unwrap();
+
+        chain_over(dir.path()).kill_tracked();
+
+        assert!(
+            !child.echoes(),
+            "the tracked process must not answer after kill_tracked"
+        );
+        assert!(
+            !dir.path().join(STATE_FILE_NAME).exists(),
+            "a reap that accounted for every record must clear the state file"
+        );
+    }
+
+    #[skuld::test]
+    async fn kill_tracked_spares_a_token_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut child = EchoChild::spawn();
+        let mut record = child.record();
+        record.token ^= 1;
+        plugin_state::append_record(dir.path(), record, None).unwrap();
+
+        chain_over(dir.path()).kill_tracked();
+
+        assert!(
+            child.echoes(),
+            "a recycled pid must survive kill_tracked: the child stopped answering"
+        );
+    }
+
+    #[skuld::test]
+    async fn dropping_a_chain_does_not_delete_the_state_file() {
+        let dir = tempfile::tempdir().unwrap();
+        plugin_state::append_record(dir.path(), synthetic_record(), None).unwrap();
+
+        drop(chain_over(dir.path()));
+
+        assert!(
+            dir.path().join(STATE_FILE_NAME).exists(),
+            "Drop never accounted for these records, so it must not delete them"
+        );
+    }
+}

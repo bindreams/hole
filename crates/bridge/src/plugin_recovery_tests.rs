@@ -1,143 +1,97 @@
 use super::*;
 
-#[skuld::test]
-fn kill_pid_on_live_process() {
-    let mut child = std::process::Command::new(if cfg!(windows) { "timeout" } else { "sleep" })
-        .args(if cfg!(windows) {
-            &["/t", "60", "/nobreak"][..]
-        } else {
-            &["60"][..]
-        })
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .expect("spawn sleeper");
+use tracing_subscriber::layer::{Layer, SubscriberExt};
 
-    let pid = child.id();
-    let r1 = kill_pid(pid);
-    assert!(r1.is_ok(), "first kill failed: {r1:?}");
+use crate::test_support::log_capture::VecWriter;
+use crate::test_support::reap_child::EchoChild;
 
-    let _ = child.wait();
-
-    let r2 = kill_pid(pid);
-    assert!(r2.is_ok(), "second kill should be idempotent, got: {r2:?}");
-}
-
-#[skuld::test]
-fn kill_pid_nonexistent_is_ok() {
-    let result = kill_pid(999_999_999);
-    assert!(
-        result.is_ok(),
-        "killing a nonexistent PID should succeed, got: {result:?}"
+/// Capture this crate's log records at `INFO` and above for the duration of
+/// `body`. The reap's per-record line is the only place the four-state
+/// observation is visible, so it has to be read, not inferred.
+fn captured(body: impl FnOnce()) -> String {
+    let writer = VecWriter::new();
+    let subscriber = tracing_subscriber::registry().with(
+        tracing_subscriber::fmt::layer()
+            .with_writer(writer.clone())
+            .with_ansi(false)
+            .with_filter(tracing_subscriber::filter::LevelFilter::INFO),
     );
+    {
+        let _guard = garter::tracing_test::set_default_in_current_thread(subscriber);
+        body();
+    }
+    writer.snapshot_string()
+}
+
+fn state_file_exists(dir: &Path) -> bool {
+    dir.join(plugin_state::STATE_FILE_NAME).exists()
 }
 
 #[skuld::test]
-fn process_start_time_of_self() {
-    let pid = std::process::id();
-    let start = process_start_time(pid);
-    assert!(start.is_some(), "should be able to read own start time");
-
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as u64;
-
-    let start_ms = start.unwrap();
-    assert!(start_ms < now_ms, "start time {start_ms} should be before now {now_ms}");
-    assert!(
-        now_ms - start_ms < 600_000,
-        "start time should be within 10 minutes of now (test just started)"
-    );
-}
-
-#[skuld::test]
-fn process_start_time_nonexistent() {
-    assert!(process_start_time(999_999_999).is_none());
-}
-
-#[skuld::test]
-fn recover_plugins_kills_tracked_process() {
+fn the_reap_kills_the_recorded_process() {
     let dir = tempfile::tempdir().unwrap();
+    let mut child = EchoChild::spawn();
+    plugin_state::append_record(dir.path(), child.record(), None).unwrap();
 
-    let mut child = std::process::Command::new(if cfg!(windows) { "timeout" } else { "sleep" })
-        .args(if cfg!(windows) {
-            &["/t", "60", "/nobreak"][..]
-        } else {
-            &["60"][..]
-        })
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .expect("spawn sleeper");
+    reap_recorded_plugins(dir.path());
 
-    let pid = child.id();
-    let start_ms = process_start_time(pid).expect("read child start time");
-
-    plugin_state::append_record(
-        dir.path(),
-        plugin_state::PluginRecord {
-            pid,
-            start_time_unix_ms: start_ms,
-        },
-        None,
-    )
-    .unwrap();
-
-    recover_plugins(dir.path());
-
-    // Verify the child is dead by waiting on it.
-    let status = child.wait().expect("wait on killed child");
-    assert!(!status.success(), "process should have been killed (non-zero exit)");
-
+    assert!(!child.echoes(), "the recorded process must not answer after the reap");
     assert!(
-        plugin_state::load(dir.path()).is_none(),
-        "state file should be cleared after recovery"
+        !state_file_exists(dir.path()),
+        "a reap that accounted for every record must clear the state file"
+    );
+    let status = child.release_and_wait();
+    assert!(
+        !status.success(),
+        "the child's clean path is exactly exit(0), so a non-success status is reachable only by the kill; got {status:?}"
     );
 }
 
 #[skuld::test]
-fn recover_plugins_skips_reused_pid() {
+fn the_reap_spares_a_recycled_pid() {
+    // A genuinely recycled pid is "same pid, different start token", and the
+    // OS cannot be made to hand one back without a timing bet or an unbounded
+    // spawn loop. Flipping one bit of the token is that state exactly.
     let dir = tempfile::tempdir().unwrap();
+    let mut child = EchoChild::spawn();
+    let mut record = child.record();
+    record.token ^= 1;
+    plugin_state::append_record(dir.path(), record, None).unwrap();
 
-    let child = std::process::Command::new(if cfg!(windows) { "timeout" } else { "sleep" })
-        .args(if cfg!(windows) {
-            &["/t", "60", "/nobreak"][..]
-        } else {
-            &["60"][..]
-        })
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .expect("spawn sleeper");
+    let log = captured(|| reap_recorded_plugins(dir.path()));
 
-    let pid = child.id();
-
-    // Record a wildly wrong start time to simulate PID reuse.
-    plugin_state::append_record(
-        dir.path(),
-        plugin_state::PluginRecord {
-            pid,
-            start_time_unix_ms: 1, // epoch start — definitely wrong
-        },
-        None,
-    )
-    .unwrap();
-
-    recover_plugins(dir.path());
-
-    // Process should still be alive — recovery skipped it because start
-    // time didn't match.
     assert!(
-        process_start_time(pid).is_some(),
-        "process should NOT have been killed (PID reuse detected)"
+        child.echoes(),
+        "a recycled pid must survive the reap: the child stopped answering"
     );
+    assert!(
+        !state_file_exists(dir.path()),
+        "a reap that accounted for every record must clear the state file"
+    );
+    let pid = child.pid();
+    assert!(
+        log.contains("observation=\"recycled\"") && log.contains(&pid.to_string()),
+        "the reap must record the recycled observation for pid {pid}; got:\n{log}"
+    );
+}
 
-    // Clean up.
-    let mut child = child;
-    kill_pid(pid).ok();
-    let _ = child.wait();
+#[skuld::test]
+fn an_unrestorable_record_is_not_killed() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut child = EchoChild::spawn();
+    let mut record = child.record();
+    record.platform = cosca::identity::Platform::Other("plan9".into());
+    plugin_state::append_record(dir.path(), record, None).unwrap();
+
+    let log = captured(|| reap_recorded_plugins(dir.path()));
+
+    assert!(
+        child.echoes(),
+        "a record that does not restore names no killable process: the child stopped answering"
+    );
+    let pid = child.pid();
+    assert!(
+        log.contains("plan9") && log.contains(&pid.to_string()),
+        "the rejected record must be reported for pid {pid}; got:\n{log}"
+    );
 }

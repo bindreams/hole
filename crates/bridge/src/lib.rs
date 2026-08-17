@@ -48,6 +48,7 @@ fn main() {
         std::process::exit(0);
     }
     foreground_child_hook::maybe_run();
+    test_support::reap_child::maybe_run();
     skuld::run_all();
 }
 

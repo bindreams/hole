@@ -25,8 +25,10 @@ const READINESS_TIMEOUT: Duration = Duration::from_secs(30);
 /// CTRL_BREAK on Windows, 5s drain timeout) and aborts the task as a
 /// safety net.
 ///
-/// If `state_dir` is set, `Drop` clears the plugin state file — this is
-/// the clean-shutdown path that makes the startup reaper a no-op.
+/// `Drop` does not touch the plugin state file. It aborts the chain's task
+/// without knowing whether garter's teardown finished, so the plugins it
+/// records may outlive it; only [`PluginChain::kill_tracked`]'s reap, which
+/// accounts for every record, may delete it.
 pub struct PluginChain {
     handle: tokio::task::JoinHandle<garter::Result<()>>,
     cancel: CancellationToken,
@@ -74,29 +76,27 @@ impl PluginChain {
     /// carry the sanctioned module-level allow; this constructor does not
     /// need to).
     #[cfg(test)]
-    pub(crate) fn for_test(log: Arc<crate::proxy::plugin_log::PluginLog>, cancel: CancellationToken) -> Self {
+    pub(crate) fn for_test(
+        log: Arc<crate::proxy::plugin_log::PluginLog>,
+        cancel: CancellationToken,
+        state_dir: Option<PathBuf>,
+    ) -> Self {
         Self {
             handle: tokio::spawn(async { Ok(()) }),
             cancel,
             local_addr: SocketAddr::from(([127, 0, 0, 1], 1)),
             transports: garter::Transports::TCP,
-            state_dir: None,
+            state_dir,
             log,
         }
     }
 
-    /// Explicitly kill all tracked plugin PIDs and clear the state file.
-    /// Called from `ProxyManager::stop` before dropping the chain, so the
-    /// stop path doesn't race with the OS reaping.
+    /// Reap every tracked plugin process and clear the state file. Called
+    /// from `ProxyManager::stop` before dropping the chain, so the stop path
+    /// doesn't race with the OS reaping.
     pub fn kill_tracked(&self) {
         let Some(ref dir) = self.state_dir else { return };
-        if let Some(state) = crate::plugin_state::load(dir) {
-            for record in &state.plugins {
-                if let Err(e) = crate::plugin_recovery::kill_pid(record.pid) {
-                    tracing::warn!(pid = record.pid, error = %e, "failed to kill tracked plugin on stop");
-                }
-            }
-        }
+        crate::plugin_recovery::reap_recorded_plugins(dir);
     }
 }
 
@@ -104,11 +104,6 @@ impl Drop for PluginChain {
     fn drop(&mut self) {
         self.cancel.cancel();
         self.handle.abort();
-        if let Some(ref dir) = self.state_dir {
-            if let Err(e) = crate::plugin_state::clear(dir) {
-                tracing::warn!(error = %e, "failed to clear plugin state file on drop");
-            }
-        }
     }
 }
 
@@ -221,6 +216,31 @@ pub async fn start_plugin_chain(
     })
 }
 
+/// Persist a freshly spawned plugin child's identity, so a crashed bridge's
+/// next start can reap it. garter's `PidSink` hands out a bare pid, so the
+/// identity is resolved here by a second read.
+///
+/// Every branch is loud: a record naming a process that could not be resolved
+/// would be skipped by the reap in silence, and the plugin would then be
+/// unrecoverable with no trail.
+fn record_plugin_pid(state_dir: &Path, pid: u32, owner: Option<(u32, u32)>) {
+    match cosca::identity::ProcessId::of(pid) {
+        cosca::identity::Resolved::Found(id) => match id.to_record() {
+            Ok(record) => {
+                if let Err(e) = crate::plugin_state::append_record(state_dir, record, owner) {
+                    tracing::warn!(pid, error = %e, "failed to persist plugin PID to state file");
+                }
+            }
+            Err(e) => tracing::warn!(pid, error = %e, "plugin identity is not persistable; it will not be recoverable"),
+        },
+        // The child died before we could look; there is nothing to recover.
+        cosca::identity::Resolved::Gone => tracing::debug!(pid, "plugin exited before its identity could be read"),
+        cosca::identity::Resolved::Unknown => {
+            tracing::warn!(pid, "plugin process could not be assessed; it will not be recoverable")
+        }
+    }
+}
+
 /// Sourced gate for the plugin tap. The IPC config flag is the primary
 /// knob (reaches service mode); the env var stays as the dev-shell
 /// fallback for dev-console / hand-run `hole bridge run`.
@@ -293,19 +313,7 @@ async fn spawn_plugin_runner_at(
 
     if let Some(dir) = state_dir {
         let dir = dir.to_path_buf();
-        let sink: garter::PidSink = Arc::new(move |pid| {
-            let start_time = crate::plugin_recovery::process_start_time(pid).unwrap_or(0);
-            if let Err(e) = crate::plugin_state::append_record(
-                &dir,
-                crate::plugin_state::PluginRecord {
-                    pid,
-                    start_time_unix_ms: start_time,
-                },
-                owner,
-            ) {
-                tracing::warn!(pid, error = %e, "failed to persist plugin PID to state file");
-            }
-        });
+        let sink: garter::PidSink = Arc::new(move |pid| record_plugin_pid(&dir, pid, owner));
         plugin = plugin.pid_sink(sink);
     }
 

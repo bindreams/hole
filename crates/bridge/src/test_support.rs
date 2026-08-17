@@ -24,6 +24,7 @@ pub(crate) mod http_target;
 pub(crate) mod log_capture;
 pub(crate) mod net_discovery;
 pub(crate) mod port_alloc;
+pub(crate) mod reap_child;
 pub(crate) mod refusing_connector;
 pub(crate) mod skuld_fixtures;
 pub(crate) mod socks5_client;

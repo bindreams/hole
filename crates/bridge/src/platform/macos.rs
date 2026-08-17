@@ -253,9 +253,9 @@ pub fn run(
         }
         let state_dir_plugins = state_dir.to_path_buf();
         if let Err(e) =
-            tokio::task::spawn_blocking(move || crate::plugin_recovery::recover_plugins(&state_dir_plugins)).await
+            tokio::task::spawn_blocking(move || crate::plugin_recovery::reap_recorded_plugins(&state_dir_plugins)).await
         {
-            tracing::warn!(error = %e, "recover_plugins task panicked");
+            tracing::warn!(error = %e, "reap_recorded_plugins task panicked");
         }
         // Native-crash observability (bindreams/hole#438): sweep crash
         // markers left by a previously-crashed bridge. Offloaded to a

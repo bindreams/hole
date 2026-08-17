@@ -2083,6 +2083,7 @@ mod self_test {
         let plugin_chain = Some(crate::proxy::plugin::PluginChain::for_test(
             log,
             CancellationToken::new(),
+            None,
         ));
 
         let writer = VecWriter::new();

@@ -1,49 +1,75 @@
-// Plugin process crash recovery.
+// The plugin reap.
 //
-// Reads `bridge-plugins.json` (written by `plugin_state`) and kills any
-// tracked plugin processes that are still alive. Called at bridge startup
-// and from the test harness on teardown.
+// Reads `bridge-plugins.json` (written by `plugin_state`) and kills every
+// process it records, by exact cosca identity — `(pid, raw kernel start
+// token)` compared exactly, so a recycled pid is never mistaken for the
+// recorded process.
 //
-// Each kill is targeted at a specific PID + start-time pair recorded by
-// the bridge that spawned the process. PID reuse is guarded by verifying
-// the process's actual start time matches the recorded one within a
-// tolerance window.
+// One function, three callers: bridge startup (after the IPC socket binds,
+// same ordering as `routing::recover_routes`), plugin-chain stop
+// (`PluginChain::kill_tracked`), and the test harness's teardown.
+//
+// The invariant this exists to hold: the state file may be deleted only by a
+// component that has just accounted for every record it contains. Deleting it
+// after a failed load would forget plugins that are still running, and they
+// hold a server connection and a local port forever.
+//
+// Best-effort — errors are logged, nothing unwinds. `Drop` in the test harness
+// calls this, and a panic there while a test is already unwinding would abort
+// the whole test binary.
 
-use crate::plugin_state;
+use crate::plugin_state::{self, Loaded};
+use cosca::identity::{ProcessId, Resolved};
 use std::path::Path;
 
-const START_TIME_TOLERANCE_MS: u64 = 2000;
+/// Kill every plugin process recorded under `state_dir`, then clear the record.
+pub fn reap_recorded_plugins(state_dir: &Path) {
+    reap_loaded(plugin_state::load(state_dir), state_dir);
+}
 
-/// Clean up plugin processes left behind by a previous bridge run.
-///
-/// Called at bridge startup AFTER the IPC socket bind succeeds (same
-/// ordering as `routing::recover_routes`). Best-effort — errors logged
-/// at `warn`, returns `()`.
-pub fn recover_plugins(state_dir: &Path) {
-    let Some(state) = plugin_state::load(state_dir) else {
-        return;
+/// The reap's dispositions, over an already-loaded state. Taking `Loaded` by
+/// value makes every arm drivable from a test without a fixture that has to
+/// defeat a real `fs::read`.
+pub(crate) fn reap_loaded(loaded: Loaded, state_dir: &Path) {
+    let state = match loaded {
+        Loaded::Absent => return,
+        Loaded::Unusable => return,
+        Loaded::State(state) => state,
     };
 
     for record in &state.plugins {
-        let Some(actual_start) = process_start_time(record.pid) else {
-            tracing::debug!(pid = record.pid, "plugin process no longer exists, skipping");
-            continue;
+        let id = match ProcessId::try_from(record) {
+            Ok(id) => id,
+            Err(e) => {
+                tracing::error!(
+                    pid = record.pid,
+                    error = %e,
+                    "recorded plugin identity cannot be restored on this host; nothing here can name it"
+                );
+                continue;
+            }
         };
 
-        let diff = actual_start.abs_diff(record.start_time_unix_ms);
-        if diff > START_TIME_TOLERANCE_MS {
-            tracing::info!(
+        // Diagnostic only. `Process::kill` answers `Ok` for a killed process,
+        // for a recycled pid it deliberately spared, and for one already gone,
+        // so the return value alone collapses three outcomes into one. A race
+        // between this read and the kill can mislabel a log line and can never
+        // misroute a kill — the kill is cosca's own identity-checked call.
+        let observation = observe(id);
+        match cosca::Process::from_id(id).kill() {
+            Ok(()) => tracing::info!(
                 pid = record.pid,
-                recorded_ms = record.start_time_unix_ms,
-                actual_ms = actual_start,
-                "PID reused by a different process, skipping"
-            );
-            continue;
-        }
-
-        match kill_pid(record.pid) {
-            Ok(()) => tracing::info!(pid = record.pid, "reaped leaked plugin process"),
-            Err(e) => tracing::warn!(pid = record.pid, error = %e, "failed to kill leaked plugin"),
+                token = record.token,
+                observation,
+                "reaped recorded plugin"
+            ),
+            Err(e) => tracing::warn!(
+                pid = record.pid,
+                token = record.token,
+                observation,
+                error = %e,
+                "failed to kill recorded plugin"
+            ),
         }
     }
 
@@ -52,93 +78,13 @@ pub fn recover_plugins(state_dir: &Path) {
     }
 }
 
-// Platform helpers ====================================================================================================
-
-/// Kill a process by PID. Best-effort: ESRCH / "not found" is treated as
-/// success (process already exited). EPERM is treated as an error.
-pub fn kill_pid(pid: u32) -> std::io::Result<()> {
-    platform::kill_pid_impl(pid)
-}
-
-/// Read the start time of a process as Unix milliseconds. Returns `None`
-/// if the process doesn't exist. Shared with the GUI via `hole_common::process`.
-pub use hole_common::process::process_start_time;
-
-#[cfg(target_os = "windows")]
-mod platform {
-    use std::io;
-
-    pub fn kill_pid_impl(pid: u32) -> io::Result<()> {
-        use windows::Win32::Foundation::CloseHandle;
-        use windows::Win32::System::Threading::{OpenProcess, TerminateProcess, PROCESS_TERMINATE};
-
-        // ERROR_INVALID_PARAMETER (87) — PID 0 or invalid
-        // ERROR_ACCESS_DENIED (5) — insufficient privileges
-        // 0x80070057 (E_INVALIDARG) — non-existent PID on some Windows versions
-        let handle = match unsafe { OpenProcess(PROCESS_TERMINATE, false, pid) } {
-            Ok(h) => h,
-            Err(e) => {
-                let code = e.code().0 as u32;
-                // Treat "not found" as success (process already dead).
-                if code == 0x80070057 || code == 87 {
-                    return Ok(());
-                }
-                return Err(io::Error::from(e));
-            }
-        };
-
-        let result = unsafe { TerminateProcess(handle, 1) };
-        let _ = unsafe { CloseHandle(handle) };
-        match result {
-            Ok(()) => Ok(()),
-            Err(e) => {
-                // TerminateProcess on an already-terminated process returns
-                // E_ACCESSDENIED (0x80070005). Treat as success.
-                let code = e.code().0 as u32;
-                if code == 0x80070005 {
-                    return Ok(());
-                }
-                Err(io::Error::from(e))
-            }
-        }
-    }
-}
-
-#[cfg(target_os = "macos")]
-mod platform {
-    use std::io;
-
-    pub fn kill_pid_impl(pid: u32) -> io::Result<()> {
-        let pid = i32::try_from(pid).map_err(|_| io::Error::other("PID out of i32 range"))?;
-        let ret = unsafe { libc::kill(pid, libc::SIGKILL) };
-        if ret == 0 {
-            return Ok(());
-        }
-        let err = io::Error::last_os_error();
-        if err.raw_os_error() == Some(libc::ESRCH) {
-            Ok(())
-        } else {
-            Err(err)
-        }
-    }
-}
-
-#[cfg(target_os = "linux")]
-mod platform {
-    use std::io;
-
-    pub fn kill_pid_impl(pid: u32) -> io::Result<()> {
-        let pid = i32::try_from(pid).map_err(|_| io::Error::other("PID out of i32 range"))?;
-        let ret = unsafe { libc::kill(pid, libc::SIGKILL) };
-        if ret == 0 {
-            return Ok(());
-        }
-        let err = io::Error::last_os_error();
-        if err.raw_os_error() == Some(libc::ESRCH) {
-            Ok(())
-        } else {
-            Err(err)
-        }
+/// What the pid names right now, relative to the record.
+fn observe(id: ProcessId) -> &'static str {
+    match ProcessId::of(id.pid()) {
+        Resolved::Found(live) if live == id => "match",
+        Resolved::Found(_) => "recycled",
+        Resolved::Gone => "gone",
+        Resolved::Unknown => "unassessable",
     }
 }
 
