@@ -235,8 +235,11 @@ leaves working DNS + broken routes, not the inverse):
   engaged fail-closed cover; `routing::failclosed::recover_cover` restores
   `/etc/pf.conf` and drops the refcount. Windows keys its cover by fixed WFP
   GUIDs and needs no file. See [Fail-closed cover](#fail-closed-cover).
-- **`bridge-plugins.json`** — plugin PIDs + start times;
-  `plugin_recovery::recover_plugins` kills survivors (PID-reuse-safe).
+- **`bridge-plugins.json`** — persisted cosca process identities;
+  `plugin_recovery::reap_recorded_plugins` kills survivors by exact identity —
+  no tolerance window — and deletes the file only after accounting for every
+  record it named. The same reap runs at bridge start, at chain stop, and in the
+  test harness's teardown.
 - **`bridge-dns.json`** — prior system DNS; `dns::recovery::recover_dns_config`
   restores it.
 - **ETW sessions** (Windows) — `hole-bridge-etw-<pid>`;
