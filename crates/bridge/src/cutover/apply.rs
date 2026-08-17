@@ -28,7 +28,7 @@ pub fn consent_gate(lockdown_on: bool, consent: bool) -> Result<(), ConsentError
 /// Single-occupancy: a present marker means a cutover is already in flight, so a
 /// second apply is a 409.
 pub fn cutover_in_progress(log_dir: &Path) -> bool {
-    hole_common::update_marker::read(log_dir).is_some()
+    hole_common::update_marker::is_present(log_dir)
 }
 
 /// macOS pre-flight: validate the GUI-supplied `.app` swap target is a genuine

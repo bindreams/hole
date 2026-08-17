@@ -720,7 +720,7 @@ fn update_apply_lockdown_off_without_consent_is_refused() {
         );
         let _ = resp.into_body().collect().await;
         // No marker was written (the refusal preceded the marker write).
-        assert!(hole_common::update_marker::read(&log_dir).is_none());
+        assert!(!hole_common::update_marker::is_present(&log_dir));
 
         drop(client);
         handle.abort();
@@ -830,7 +830,7 @@ fn update_apply_unverifiable_payload_is_422_and_clears_the_marker() {
         // The marker is claimed then cleared on the verify failure — no cutover
         // is left in progress.
         assert!(
-            hole_common::update_marker::read(&log_dir).is_none(),
+            !hole_common::update_marker::is_present(&log_dir),
             "a verify failure must clear the marker it claimed"
         );
 
@@ -881,7 +881,7 @@ fn update_apply_staging_io_failure_clears_the_marker() {
         assert_eq!(resp.status(), 500, "a staging I/O failure is a server fault");
         let _ = resp.into_body().collect().await;
         assert!(
-            hole_common::update_marker::read(&log_dir).is_none(),
+            !hole_common::update_marker::is_present(&log_dir),
             "a post-marker staging failure must clear the marker it claimed"
         );
 
@@ -937,7 +937,7 @@ fn update_apply_spoofed_app_dest_is_400_no_marker() {
         assert_eq!(resp.status(), 400, "a spoofed bundle identity must be refused with 400");
         let _ = resp.into_body().collect().await;
         assert!(
-            hole_common::update_marker::read(&log_dir).is_none(),
+            !hole_common::update_marker::is_present(&log_dir),
             "a destination rejection must not write a marker"
         );
 

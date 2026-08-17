@@ -27,7 +27,7 @@ fn post_bind_sweep_clears_marker() {
     let dir = tempfile::tempdir().unwrap();
     hole_common::update_marker::write(dir.path(), &super::test_marker(), None).unwrap();
     sweep_marker(dir.path());
-    assert!(hole_common::update_marker::read(dir.path()).is_none());
+    assert!(!hole_common::update_marker::is_present(dir.path()));
     sweep_marker(dir.path()); // idempotent: absent marker is a no-op
 }
 
@@ -37,7 +37,7 @@ fn sweep_marker_then_ready_sweeps_before_reporting() {
     hole_common::update_marker::write(dir.path(), &super::test_marker(), None).unwrap();
     let marker_gone_when_reported = std::cell::Cell::new(false);
     super::sweep_marker_then_ready(dir.path(), || {
-        marker_gone_when_reported.set(hole_common::update_marker::read(dir.path()).is_none());
+        marker_gone_when_reported.set(!hole_common::update_marker::is_present(dir.path()));
         Ok(())
     })
     .unwrap();
@@ -96,4 +96,26 @@ fn sweep_old_binaries_removes_old_suffixed_and_spares_live() {
     assert!(live.exists(), "the live binary must be spared");
     assert!(other.exists(), "unrelated files must be spared");
     sweep_old_binaries(dir.path()); // idempotent on a clean dir
+}
+
+#[skuld::test]
+fn sweep_recheck_uses_presence_not_schema() {
+    // The re-check exists to catch an external holder keeping the marker open.
+    // Deriving presence from a successful parse fails OPEN on exactly that case.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join(hole_common::update_marker::MARKER_FILE), b"not json").unwrap();
+    let reported = std::cell::Cell::new(false);
+    let out = super::sweep_marker_then_ready_with(
+        || {}, // no-op sweep: the marker is NOT removed
+        dir.path(),
+        || {
+            reported.set(true);
+            Ok(())
+        },
+    );
+    assert!(out.is_err(), "the marker survived the sweep; Running must be refused");
+    assert!(
+        !reported.get(),
+        "Running must not be reported while a marker is present"
+    );
 }

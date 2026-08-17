@@ -61,9 +61,9 @@ fn clear_marker_on_failure_clears_only_on_err() {
     };
     hole_common::update_marker::write(dir.path(), &m, None).unwrap();
     clear_marker_on_cutover_failure(&Ok(()), dir.path());
-    assert!(hole_common::update_marker::read(dir.path()).is_some());
+    assert!(hole_common::update_marker::is_present(dir.path()));
     clear_marker_on_cutover_failure(&Err(std::io::Error::other("boom")), dir.path());
-    assert!(hole_common::update_marker::read(dir.path()).is_none());
+    assert!(!hole_common::update_marker::is_present(dir.path()));
 }
 
 #[cfg(target_os = "windows")]

@@ -1,10 +1,15 @@
 //! Cross-privilege update-in-progress marker. Written by the privileged bridge
 //! to the SERVICE log dir (GUI-readable across the privilege boundary, the
 //! tombstone precedent) at cutover start; cleared unconditionally by the next
-//! bridge's post-bind sweep. Does triple duty: (1) GUI no-surprise-Disconnected
-//! (`observed_running` holds the last snapshot while it is set), (2) the bridge
-//! shutdown disarms the lockdown guard while it is set (cover persists), (3) the
-//! GUI banner source.
+//! bridge's post-bind sweep. Does double duty: (1) GUI no-surprise-Disconnected
+//! for a READABLE marker (`observed_running` holds the last snapshot while one
+//! is set; a marker naming no identifiable driver reports the failed update
+//! instead), (2) the bridge shutdown disarms the lockdown guard while it is set
+//! (cover persists).
+//!
+//! Only one reader needs the payload — the GUI resolving the driver's liveness.
+//! Every other reader asks [`is_present`], so a marker it cannot parse still
+//! counts as a cutover claim.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -15,10 +20,22 @@ use serde::{Deserialize, Serialize};
 /// finds it by this constant, not by enumeration.
 pub const MARKER_FILE: &str = "update-in-progress.json";
 
-/// Schema version. Bump on a breaking shape change; `read` returns None on an
-/// unknown version (load-None-on-mismatch), but `clear` is remove-by-path and
-/// ignores the schema entirely.
+/// Schema version. Bump on a breaking shape change; `read` answers
+/// [`Marker::Unreadable`] for an unknown version, but `clear` is remove-by-path
+/// and ignores the schema entirely.
 pub const MARKER_VERSION: u32 = 2;
+
+/// What [`read`] found. Unlike `plugin_state::Loaded`'s sibling variant,
+/// `Unreadable` carries no reason: every reader treats "present but
+/// unidentifiable" the same way, so the reason is logged where it is detected.
+#[derive(Debug)]
+pub enum Marker {
+    Absent,
+    /// Present, but its driver cannot be identified — an unreadable file, an
+    /// unparseable body, or a version this build does not know.
+    Unreadable,
+    Present(MarkerInfo),
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -123,12 +140,41 @@ fn staged_marker(log_dir: &Path, info: &MarkerInfo, owner: Option<(u32, u32)>) -
     Ok(path)
 }
 
-/// Read the marker if present and the schema matches. Absent or unparsable or
-/// unknown-version => None.
-pub fn read(log_dir: &Path) -> Option<MarkerInfo> {
-    let bytes = std::fs::read(log_dir.join(MARKER_FILE)).ok()?;
-    let info: MarkerInfo = serde_json::from_slice(&bytes).ok()?;
-    (info.version == MARKER_VERSION).then_some(info)
+/// Read the marker, distinguishing "no cutover was claimed" from "a cutover was
+/// claimed by a driver this build cannot identify".
+pub fn read(log_dir: &Path) -> Marker {
+    let bytes = match std::fs::read(log_dir.join(MARKER_FILE)) {
+        Ok(b) => b,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Marker::Absent,
+        Err(e) => {
+            tracing::warn!(error = %e, "update marker could not be read");
+            return Marker::Unreadable;
+        }
+    };
+    let info: MarkerInfo = match serde_json::from_slice(&bytes) {
+        Ok(info) => info,
+        Err(e) => {
+            tracing::warn!(error = %e, "update marker could not be parsed");
+            return Marker::Unreadable;
+        }
+    };
+    if info.version != MARKER_VERSION {
+        tracing::warn!(
+            got = info.version,
+            want = MARKER_VERSION,
+            "update marker schema mismatch"
+        );
+        return Marker::Unreadable;
+    }
+    Marker::Present(info)
+}
+
+/// Whether a cutover has been claimed, whatever shape the claim is in. Derived
+/// from [`read`] rather than a second `stat`, so a marker that exists but
+/// cannot be opened — a Windows sharing violation, the exact case the post-sweep
+/// re-check guards — counts as present.
+pub fn is_present(log_dir: &Path) -> bool {
+    !matches!(read(log_dir), Marker::Absent)
 }
 
 /// Unconditionally remove the marker by known path. NOT parse-then-clear: a
@@ -143,14 +189,18 @@ pub fn clear(log_dir: &Path) -> io::Result<()> {
 
 /// Overwrite the marker's `driver_pid` + `driver_start_unix_ms` in place,
 /// preserving the rest. The Windows cutover initiator stamps the frozen child's
-/// identity here so the marker names the driver, not the initiator. An absent
-/// marker is a no-op (`Ok`).
+/// identity here so the marker names the driver, not the initiator.
+///
+/// Anything but [`Marker::Present`] is an `Err`. Succeeding would leave the
+/// marker naming the INITIATOR, which the cutover then stops — and the GUI
+/// resolves that identity as dead and reports a failed update on a successful
+/// one. Failing costs nothing: the caller kills the still-suspended child and
+/// clears the marker, so no cutover is claimed.
 pub fn stamp_driver(log_dir: &Path, driver_pid: u32, driver_start_unix_ms: u64) -> io::Result<()> {
-    let Some(mut info) = read(log_dir) else {
-        // Unreachable in the normal sequence (the initiator wrote the marker
-        // before stamping); a warn surfaces the anomaly rather than swallowing it.
-        tracing::warn!(driver_pid, "stamp_driver: no marker present to stamp");
-        return Ok(());
+    let Marker::Present(mut info) = read(log_dir) else {
+        return Err(io::Error::other(
+            "no readable update marker to stamp the cutover driver into",
+        ));
     };
     info.driver_pid = driver_pid;
     info.driver_start_unix_ms = driver_start_unix_ms;

@@ -72,7 +72,7 @@ fn macos_actor_failure_clears_the_injected_log_dir() {
     hole_common::update_marker::write(dir.path(), &sample_marker(), None).unwrap();
     macos::clear_marker_on_actor_failure(Err(std::io::Error::other("swap failed")), dir.path());
     assert!(
-        hole_common::update_marker::read(dir.path()).is_none(),
+        !hole_common::update_marker::is_present(dir.path()),
         "the injected log_dir's marker must be cleared on actor failure"
     );
 }
@@ -97,7 +97,9 @@ fn record_spawned_driver_stamps_when_alive() {
     let dir = tempfile::tempdir().unwrap();
     hole_common::update_marker::write(dir.path(), &sample_marker(), None).unwrap();
     windows::record_spawned_driver(dir.path(), 4242, Some(1_700_000_000_123)).unwrap();
-    let got = hole_common::update_marker::read(dir.path()).unwrap();
+    let hole_common::update_marker::Marker::Present(got) = hole_common::update_marker::read(dir.path()) else {
+        panic!("the stamped marker must be readable");
+    };
     assert_eq!((got.driver_pid, got.driver_start_unix_ms), (4242, 1_700_000_000_123));
 }
 

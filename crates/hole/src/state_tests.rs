@@ -1,7 +1,7 @@
 use super::*;
 use crate::bridge_client::ClientError;
 use hole_common::protocol::{BridgeResponse, StartError};
-use hole_common::update_marker::{MarkerInfo, MARKER_VERSION};
+use hole_common::update_marker::{Marker, MarkerInfo, MARKER_VERSION};
 
 fn sample_marker() -> MarkerInfo {
     MarkerInfo {
@@ -16,16 +16,57 @@ fn sample_marker() -> MarkerInfo {
 
 // CutoverDecision =====================================================================================================
 
+fn present() -> Marker {
+    Marker::Present(sample_marker())
+}
+
 #[skuld::test]
-fn cutover_decision_truth_table() {
-    use super::CutoverDecision::*;
-    let m = sample_marker();
-    assert_eq!(super::cutover_decision(None, None), PassThrough);
-    assert_eq!(super::cutover_decision(None, Some(false)), PassThrough);
-    assert_eq!(super::cutover_decision(None, Some(true)), PassThrough);
-    assert_eq!(super::cutover_decision(Some(&m), Some(true)), Mask);
-    assert_eq!(super::cutover_decision(Some(&m), None), Mask);
-    assert_eq!(super::cutover_decision(Some(&m), Some(false)), UnmaskFailed);
+fn an_absent_marker_passes_through() {
+    use cosca::identity::Liveness::*;
+    for driver in [Alive, Dead, Unknown] {
+        assert_eq!(
+            super::cutover_decision(&Marker::Absent, driver),
+            super::CutoverDecision::PassThrough,
+            "no cutover in flight, whatever the driver probe says"
+        );
+    }
+}
+
+#[skuld::test]
+fn a_present_marker_with_a_live_driver_masks() {
+    assert_eq!(
+        super::cutover_decision(&present(), cosca::identity::Liveness::Alive),
+        super::CutoverDecision::Mask
+    );
+}
+
+#[skuld::test]
+fn a_present_marker_with_an_unknown_driver_masks() {
+    assert_eq!(
+        super::cutover_decision(&present(), cosca::identity::Liveness::Unknown),
+        super::CutoverDecision::Mask
+    );
+}
+
+#[skuld::test]
+fn a_present_marker_with_a_dead_driver_unmasks_failed() {
+    assert_eq!(
+        super::cutover_decision(&present(), cosca::identity::Liveness::Dead),
+        super::CutoverDecision::UnmaskFailed
+    );
+}
+
+#[skuld::test]
+fn an_unreadable_marker_unmasks_failed() {
+    // A marker whose driver cannot be identified is a claim that cannot be
+    // verified. Masking it is a state with no exit: the mask suppresses both a
+    // transport error and a reachable running:false, and only a bridge start
+    // sweeping the marker ends it — which never happens in the wedge the marker
+    // exists to catch.
+    assert_eq!(
+        super::cutover_decision(&Marker::Unreadable, cosca::identity::Liveness::Unknown),
+        super::CutoverDecision::UnmaskFailed
+    );
 }
 
 // ProxyStateCell ======================================================================================================
@@ -435,13 +476,13 @@ fn test_link(socket_path: PathBuf, self_heal: SelfHealHook) -> BridgeLink {
     BridgeLink::with_service_log_dir(socket_path, marker_dir, self_heal)
 }
 
-/// A driver-liveness stub reporting a fixed `Option<bool>` regardless of the marker.
-fn liveness_stub(a: Option<bool>) -> DriverLiveness {
+/// A driver-liveness stub reporting a fixed `Liveness` regardless of the marker.
+fn liveness_stub(a: cosca::identity::Liveness) -> DriverLiveness {
     std::sync::Arc::new(move |_m: &MarkerInfo| a)
 }
 
 /// A `BridgeLink` with an explicit service-log dir AND a stubbed driver liveness.
-fn link_with(path: PathBuf, dir: &std::path::Path, a: Option<bool>) -> BridgeLink {
+fn link_with(path: PathBuf, dir: &std::path::Path, a: cosca::identity::Liveness) -> BridgeLink {
     BridgeLink::with_service_log_dir_and_liveness(path, dir.to_path_buf(), noop_hook(), liveness_stub(a))
 }
 
@@ -456,7 +497,7 @@ fn marker_in(dir: &std::path::Path) {
 fn sweeping_dead_stub(dir: PathBuf) -> DriverLiveness {
     std::sync::Arc::new(move |_m| {
         let _ = hole_common::update_marker::clear(&dir);
-        Some(false)
+        cosca::identity::Liveness::Dead
     })
 }
 
@@ -593,7 +634,7 @@ async fn transport_error_holds_snapshot_while_marker_present() {
     let _ = std::fs::remove_file(&path);
     let marker_dir = tempfile::tempdir().unwrap();
     marker_in(marker_dir.path());
-    let link = link_with(path, marker_dir.path(), Some(true));
+    let link = link_with(path, marker_dir.path(), cosca::identity::Liveness::Alive);
     link.cell().commit(true); // believed running before the cutover gap
     let _ = link.send(BridgeRequest::Status).await.unwrap_err();
     assert_eq!(
@@ -620,7 +661,7 @@ async fn cutover_marker_suppresses_then_resumes_disconnected_flash() {
     let path = test_socket_path("cutover-flash");
     let _ = std::fs::remove_file(&path); // dead socket: every send is a transport error
     let marker_dir = tempfile::tempdir().unwrap();
-    let link = link_with(path, marker_dir.path(), Some(true));
+    let link = link_with(path, marker_dir.path(), cosca::identity::Liveness::Alive);
     link.cell().commit(true); // believed Connected before the cutover
     let seq_connected = link.cell().snapshot().seq;
 
@@ -653,7 +694,11 @@ async fn cutover_marker_suppresses_then_resumes_disconnected_flash() {
 async fn wedge_transport_error_surfaces_failure() {
     let dir = tempfile::tempdir().unwrap();
     marker_in(dir.path());
-    let link = link_with("/nonexistent/socket".into(), dir.path(), Some(false));
+    let link = link_with(
+        "/nonexistent/socket".into(),
+        dir.path(),
+        cosca::identity::Liveness::Dead,
+    );
     link.cell().commit(true);
     let _ = link.send(BridgeRequest::Status).await;
     let s = link.cell().snapshot();
@@ -671,7 +716,7 @@ async fn wedge_reachable_not_running_surfaces_failure() {
     .await;
     let dir = tempfile::tempdir().unwrap();
     marker_in(dir.path());
-    let link = link_with(path, dir.path(), Some(false));
+    let link = link_with(path, dir.path(), cosca::identity::Liveness::Dead);
     link.cell().commit(true);
     let _ = link.send(BridgeRequest::Status).await;
     let s = link.cell().snapshot();
@@ -700,7 +745,7 @@ async fn wedge_reachable_carries_lockdown_change() {
     .await;
     let dir = tempfile::tempdir().unwrap();
     marker_in(dir.path());
-    let link = link_with(path, dir.path(), Some(false));
+    let link = link_with(path, dir.path(), cosca::identity::Liveness::Dead);
     link.cell().commit(true);
     let _ = link.send(BridgeRequest::Status).await;
     let s = link.cell().snapshot();
@@ -747,7 +792,7 @@ async fn reachable_not_running_during_cutover_holds() {
     .await;
     let dir = tempfile::tempdir().unwrap();
     marker_in(dir.path());
-    let link = link_with(path, dir.path(), Some(true));
+    let link = link_with(path, dir.path(), cosca::identity::Liveness::Alive);
     link.cell().commit(true);
     let before = link.cell().snapshot().seq;
     let _ = link.send(BridgeRequest::Status).await;
@@ -763,7 +808,11 @@ async fn reachable_not_running_during_cutover_holds() {
 async fn healthy_gap_holds_snapshot() {
     let dir = tempfile::tempdir().unwrap();
     marker_in(dir.path());
-    let link = link_with("/nonexistent/socket".into(), dir.path(), Some(true));
+    let link = link_with(
+        "/nonexistent/socket".into(),
+        dir.path(),
+        cosca::identity::Liveness::Alive,
+    );
     link.cell().commit(true);
     let before = link.cell().snapshot().seq;
     let _ = link.send(BridgeRequest::Status).await;
@@ -781,7 +830,12 @@ async fn update_failed_clears_when_marker_gone() {
     .await;
     let swept = std::env::temp_dir().join(format!("hole-616-clears-nonexistent-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&swept);
-    let link = super::BridgeLink::with_service_log_dir_and_liveness(path, swept, noop_hook(), liveness_stub(None));
+    let link = super::BridgeLink::with_service_log_dir_and_liveness(
+        path,
+        swept,
+        noop_hook(),
+        liveness_stub(cosca::identity::Liveness::Unknown),
+    );
     link.cell().commit_update_failed(super::UPDATE_FAILED, None); // seed a prior wedge
     let _ = link.send(BridgeRequest::Status).await;
     assert!(
@@ -795,7 +849,11 @@ async fn update_failed_clears_when_marker_gone() {
 async fn wedge_via_reload_surfaces_failure() {
     let dir = tempfile::tempdir().unwrap();
     marker_in(dir.path());
-    let link = link_with("/nonexistent/socket".into(), dir.path(), Some(false));
+    let link = link_with(
+        "/nonexistent/socket".into(),
+        dir.path(),
+        cosca::identity::Liveness::Dead,
+    );
     link.cell().commit(true);
     let _ = link.reload_if_running(test_proxy_config()).await;
     let s = link.cell().snapshot();
@@ -1153,4 +1211,63 @@ fn classify_lockdown_is_fail_closed_three_state() {
     assert_eq!(super::observed_lockdown(&status(true)), Some((true, true, false)));
     assert_eq!(super::observed_lockdown(&Ok(BridgeResponse::Ack)), None);
     assert_eq!(super::observed_lockdown(&Err(ClientError::PermissionDenied)), None);
+}
+
+// An unreadable marker: the wedge that must not be masked =============================================================
+
+/// Garbage at the marker path — present, but naming no identifiable driver.
+fn unreadable_marker_in(dir: &std::path::Path) {
+    std::fs::write(dir.join(hole_common::update_marker::MARKER_FILE), b"not json").unwrap();
+}
+
+#[skuld::test]
+async fn an_unreadable_marker_reports_the_failed_update_through_send() {
+    // Under masking this snapshot would still read running:true / error:None —
+    // and nothing would ever end the mask, because in a wedge nothing is
+    // reachable and no bridge start ever sweeps the marker.
+    let dir = tempfile::tempdir().unwrap();
+    unreadable_marker_in(dir.path());
+    let link = link_with(
+        "/nonexistent/socket".into(),
+        dir.path(),
+        cosca::identity::Liveness::Unknown,
+    );
+    link.cell().commit(true);
+
+    let _ = link.send(BridgeRequest::Status).await;
+
+    let s = link.cell().snapshot();
+    assert!(
+        !s.running && s.error.as_deref() == Some(super::UPDATE_FAILED),
+        "an unverifiable cutover claim must surface the failed update; got {s:?}"
+    );
+}
+
+#[skuld::test]
+async fn a_swept_marker_retracts_the_failed_update() {
+    // The self-retraction the decision rests on: `clear` is remove-by-path and
+    // version-agnostic, so the first bridge to bind ends the report with no
+    // user action.
+    let dir = tempfile::tempdir().unwrap();
+    unreadable_marker_in(dir.path());
+    let link = link_with(
+        "/nonexistent/socket".into(),
+        dir.path(),
+        cosca::identity::Liveness::Unknown,
+    );
+    link.cell().commit(true);
+    let _ = link.send(BridgeRequest::Status).await;
+    assert_eq!(
+        link.cell().snapshot().error.as_deref(),
+        Some(super::UPDATE_FAILED),
+        "precondition: the failed update is reported"
+    );
+
+    hole_common::update_marker::clear(dir.path()).unwrap();
+    let _ = link.send(BridgeRequest::Status).await;
+
+    assert!(
+        link.cell().snapshot().error.is_none(),
+        "a swept marker retracts the failure with no user action"
+    );
 }

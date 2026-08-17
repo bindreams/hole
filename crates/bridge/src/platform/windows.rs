@@ -214,7 +214,7 @@ fn run_service() -> Result<(), Box<dyn std::error::Error>> {
         // (marker present) disarms the standing cover so the persistent WFP
         // filters survive the restart; an ordinary stop disengages it.
         let mut pm = proxy_shutdown.lock().await;
-        let reason = shutdown_reason(hole_common::update_marker::read(&log_dir).is_some());
+        let reason = shutdown_reason(hole_common::update_marker::is_present(&log_dir));
         if let Err(e) = pm.stop_with(reason).await {
             error!(error = %e, "error stopping proxy during shutdown");
         }
@@ -288,7 +288,7 @@ fn sweep_marker_then_ready_with<S: FnOnce(), R: FnOnce() -> std::io::Result<()>>
     report_running: R,
 ) -> std::io::Result<()> {
     sweep();
-    if hole_common::update_marker::read(log_dir).is_some() {
+    if hole_common::update_marker::is_present(log_dir) {
         return Err(std::io::Error::other(
             "cutover marker still present after sweep; refusing to report Running",
         ));

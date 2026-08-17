@@ -280,7 +280,7 @@ pub fn run(
         // (marker present) disarms the standing cover so the persistent pf
         // ruleset survives the restart; an ordinary stop disengages it.
         let mut pm = proxy_shutdown.lock().await;
-        let reason = shutdown_reason(hole_common::update_marker::read(log_dir).is_some());
+        let reason = shutdown_reason(hole_common::update_marker::is_present(log_dir));
         if let Err(e) = pm.stop_with(reason).await {
             tracing::error!(error = %e, "error stopping proxy during shutdown");
         }
