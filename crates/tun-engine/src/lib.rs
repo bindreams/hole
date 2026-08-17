@@ -49,5 +49,5 @@ pub use engine::{
     DnsInterceptor, Engine, EngineConfig, MutEngineConfig, Router, TcpFlow, TcpMeta, UdpFlow, UdpMeta, UdpSender,
 };
 pub use error::{DeviceError, EngineError, RoutingError};
-pub use gateway::{get_default_gateway_info, GatewayInfo};
+pub use gateway::{get_default_gateway_info, GatewayError, GatewayInfo, HopDetail};
 pub use routing::{Routing, SystemRoutes, SystemRouting};
