@@ -174,8 +174,10 @@ pub fn read(log_dir: &Path) -> Marker {
 /// Classify a marker that could not be OPENED. Presence comes from an existence
 /// probe, never from the open's error: a failed open is not evidence a file is
 /// there. A claim requires a regular FILE — anything else at that path is not a
-/// marker and asserts nothing about a cutover. `symlink_metadata`, so a dangling
-/// symlink reads as that anomaly rather than as a definitive absence.
+/// marker and asserts nothing about a cutover. `symlink_metadata` does not follow
+/// the link, so a symlink is classified as the anomaly it is instead of being
+/// resolved to whatever it points at; the marker is only ever published by rename
+/// or hard link, so hole never creates one.
 fn unopened(path: &Path, open_error: &io::Error) -> Marker {
     match std::fs::symlink_metadata(path) {
         Ok(meta) if meta.file_type().is_file() => {
