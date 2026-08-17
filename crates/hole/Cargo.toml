@@ -37,6 +37,7 @@ path = "src/main.rs"
 harness = false
 
 [dependencies]
+cosca = { workspace = true }
 hole-common = { path = "../common" }
 tombstone = { path = "../tombstone" }
 hole-bridge = { path = "../bridge" }

@@ -13,6 +13,9 @@ edition = "2021"
 
 [workspace.dependencies]
 skuld = { version = "0.2", features = ["tokio"] }
+# Process identity: `(pid, raw kernel start token)` compared exactly, plus the
+# versioned `ProcessIdRecord` the bridge persists across a restart.
+cosca = { version = "0.2", features = ["serde"] }
 # Pre-main init for the test-observability subscriber install. See
 # crates/test-observability and bindreams/hole#301.
 #
