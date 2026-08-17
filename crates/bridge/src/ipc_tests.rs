@@ -14,7 +14,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
-use tun_engine::gateway::GatewayInfo;
+use tun_engine::gateway::{GatewayError, GatewayInfo, HopDetail};
 use tun_engine::routing::{state as route_state, Routing};
 use tun_engine::RoutingError;
 
@@ -189,7 +189,13 @@ impl Routing for MockRouting {
 
     fn default_gateway(&self) -> Result<GatewayInfo, RoutingError> {
         if self.fail_gateway.load(Ordering::SeqCst) {
-            return Err(RoutingError::Gateway("mock gateway failure".into()));
+            return Err(RoutingError::Gateway(GatewayError::NoUsableGateway {
+                detail: HopDetail {
+                    interface_alias: "MockVpnTun".into(),
+                    interface_index: 99,
+                    next_hop: std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+                },
+            }));
         }
         Ok(GatewayInfo {
             gateway_ip: IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)),

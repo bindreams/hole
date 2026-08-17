@@ -4,12 +4,18 @@ use std::path::PathBuf;
 
 use thiserror::Error;
 
+use crate::gateway::GatewayError;
+
 /// Errors surfaced by the `routing` module: gateway discovery and route
 /// table manipulation.
 #[derive(Debug, Error)]
 pub enum RoutingError {
-    #[error("gateway detection failed: {0}")]
-    Gateway(String),
+    /// Transparent: [`GatewayError`]'s `Display` is already the finished,
+    /// PII-free user sentence, and its `Debug` carries the adapter detail. A
+    /// prefix here would be a second one inside `tray.rs`'s `Bridge error: {..}`,
+    /// and re-stringifying would destroy the detail at this boundary.
+    #[error(transparent)]
+    Gateway(#[from] GatewayError),
     #[error("route setup failed: {0}")]
     RouteSetup(String),
 }

@@ -1143,7 +1143,15 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         tun_engine::device::wintun::ensure_loaded()?;
 
         // Query the OS default gateway via the routing provider.
-        let gw_info = routing.default_gateway()?;
+        //
+        // `error = ?e` (Debug, not Display) is load-bearing: the user-facing
+        // sentence tells them to look the adapter up in bridge.log, and the
+        // adapter lives in `GatewayError`'s Debug precisely so it can never
+        // reach the toast. Display here would log the sentence and drop the
+        // one fact the sentence promises.
+        let gw_info = routing.default_gateway().inspect_err(|e| {
+            warn!(error = ?e, "gateway detection failed");
+        })?;
 
         // Compile filter rules.
         let ruleset = crate::filter::rules::RuleSet::from_user_rules(&config.filters);
