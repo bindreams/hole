@@ -367,6 +367,8 @@ fn status_snap(seq: u64, running: bool, error: Option<&str>) -> crate::state::Pr
         error: error.map(Into::into),
         lockdown_enabled: false,
         lockdown_active: false,
+        held_closed: false,
+        cover_state_unknown: false,
         blocked_until_connected: false,
     }
 }
@@ -387,6 +389,8 @@ fn map_status_emits_full_shape_on_status_ok() {
         ipv6_bypass_available: true,
         lockdown_enabled: false,
         lockdown_active: false,
+        held_closed: false,
+        cover_state_unknown: false,
         blocked_until_connected: false,
     });
     let j = map_status_response(resp, status_snap(7, true, None));
@@ -423,6 +427,8 @@ fn map_status_sources_running_seq_error_from_snap() {
         ipv6_bypass_available: true,
         lockdown_enabled: false,
         lockdown_active: false,
+        held_closed: false,
+        cover_state_unknown: false,
         blocked_until_connected: false,
     });
     let j = map_status_response(resp, status_snap(9, false, Some("proxy task exited unexpectedly")));
@@ -477,6 +483,8 @@ fn map_status_death_error_is_the_sentinel_only() {
         ipv6_bypass_available: true,
         lockdown_enabled: false,
         lockdown_active: false,
+        held_closed: false,
+        cover_state_unknown: false,
         blocked_until_connected: false,
     });
     let j = map_status_response(resp, status_snap(4, false, Some("proxy task exited unexpectedly")));

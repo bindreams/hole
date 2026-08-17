@@ -15,6 +15,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tun_engine::gateway::GatewayInfo;
+use tun_engine::routing::failclosed::CoverState;
 use tun_engine::routing::{state as route_state, Routing};
 use tun_engine::RoutingError;
 
@@ -143,6 +144,11 @@ impl Drop for MockRunning {
 struct MockRouting {
     state_dir: PathBuf,
     fail_gateway: AtomicBool,
+    /// OS-truth lockdown cover probe: what `lockdown_cover_state` reports.
+    cover_state: std::sync::Mutex<CoverState>,
+    /// Make `disengage_lockdown` fail, so a test can drive the fail-loud path
+    /// where the kill switch must NOT be recorded as off.
+    fail_standing_disengage: AtomicBool,
 }
 
 impl MockRouting {
@@ -150,6 +156,8 @@ impl MockRouting {
         Self {
             state_dir,
             fail_gateway: AtomicBool::new(false),
+            cover_state: std::sync::Mutex::new(CoverState::Absent),
+            fail_standing_disengage: AtomicBool::new(false),
         }
     }
 
@@ -157,6 +165,8 @@ impl MockRouting {
         Self {
             state_dir,
             fail_gateway: AtomicBool::new(true),
+            cover_state: std::sync::Mutex::new(CoverState::Absent),
+            fail_standing_disengage: AtomicBool::new(false),
         }
     }
 }
@@ -207,6 +217,26 @@ impl Routing for MockRouting {
         _resolver_ip: Option<IpAddr>,
     ) -> Result<MockCover, RoutingError> {
         Ok(MockCover)
+    }
+
+    fn lockdown_cover_state(&self) -> CoverState {
+        *self.cover_state.lock().unwrap()
+    }
+
+    fn disengage_lockdown(&self) -> Result<(), RoutingError> {
+        if self.fail_standing_disengage.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(RoutingError::RouteSetup("mock disengage failure".into()));
+        }
+        *self.cover_state.lock().unwrap() = CoverState::Absent;
+        Ok(())
+    }
+
+    fn transient_cover_state(&self) -> CoverState {
+        CoverState::Absent
+    }
+
+    fn sweep_transient(&self) -> Result<(), RoutingError> {
+        Ok(())
     }
 
     fn install_lockdown(
@@ -607,6 +637,8 @@ fn status_when_not_running_returns_false() {
                 ipv6_bypass_available: true,
                 lockdown_enabled: false,
                 lockdown_active: false,
+                held_closed: false,
+                cover_state_unknown: false,
                 blocked_until_connected: false,
             }
         );
@@ -690,6 +722,87 @@ fn lockdown_post_errors_without_state_dir() {
             "lockdown POST without a state_dir must error, not silently succeed"
         );
         let _ = resp.into_body().collect().await;
+
+        drop(client);
+        handle.abort();
+        let _ = handle.await;
+    });
+}
+
+/// `mock_proxy_with_state_dir` whose routing reports an engaged cover it refuses
+/// to release — the state a user is stuck in when the firewall will not budge.
+fn mock_proxy_with_stuck_cover() -> Arc<Mutex<ProxyManager<MockProxy, MockRouting>>> {
+    let state_dir = tempfile::tempdir().unwrap().keep();
+    let routing = MockRouting::new(state_dir.clone());
+    *routing.cover_state.lock().unwrap() = CoverState::Engaged;
+    routing
+        .fail_standing_disengage
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let pm = ProxyManager::new(MockProxy::new(), routing).with_state_dir(state_dir);
+    Arc::new(Mutex::new(pm))
+}
+
+#[skuld::test]
+fn status_reports_held_closed_for_a_cover_no_session_owns() {
+    // The tray must see this as engaged even with nothing running.
+    rt().block_on(async {
+        let path = test_socket_path("held-closed-status");
+        let state_dir = tempfile::tempdir().unwrap().keep();
+        let routing = MockRouting::new(state_dir.clone());
+        *routing.cover_state.lock().unwrap() = CoverState::Engaged;
+        let pm = ProxyManager::new(MockProxy::new(), routing).with_state_dir(state_dir);
+        let server = IpcServer::bind(&path, Arc::new(Mutex::new(pm)), "test").unwrap();
+        let handle = tokio::spawn(async move {
+            server.run_once().await.unwrap();
+        });
+
+        let mut client = TestClient::connect(&path).await;
+        let status = get_status(&mut client).await;
+        assert!(!status.running, "precondition: nothing is running");
+        assert!(status.lockdown_active, "an adopted cover IS engaged");
+        assert!(status.held_closed, "and no session owns it");
+
+        drop(client);
+        handle.abort();
+        let _ = handle.await;
+    });
+}
+
+#[skuld::test]
+fn lockdown_off_returns_500_with_a_path_free_message() {
+    // A release that cannot open the host must fail loud, and the message that
+    // reaches a GUI toast must carry no path (#470) while still telling the user
+    // what to do.
+    rt().block_on(async {
+        let path = test_socket_path("lockdown-stuck-cover");
+        let server = IpcServer::bind(&path, mock_proxy_with_stuck_cover(), "test").unwrap();
+        let handle = tokio::spawn(async move {
+            server.run_once().await.unwrap();
+        });
+
+        let mut client = TestClient::connect(&path).await;
+        let resp = post_lockdown(&mut client, false).await;
+        assert_eq!(resp.status(), 500, "a cover that will not release must fail loud");
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let err: ErrorResponse = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(err.message, crate::ipc::LOCKDOWN_SET_FAILED);
+        assert!(
+            err.message.contains("hole bridge unlock"),
+            "the message must carry the escape that works with no bridge: {}",
+            err.message
+        );
+        for needle in ['/', '\\'] {
+            assert!(
+                !err.message.contains(needle),
+                "an IPC message reaches a toast verbatim and must carry no path: {}",
+                err.message
+            );
+        }
+
+        // And the intent is NOT recorded off while the host is still blocked.
+        let status = get_status(&mut client).await;
+        assert!(status.held_closed, "the host is still held closed");
 
         drop(client);
         handle.abort();

@@ -113,24 +113,40 @@ pub fn run_detached(_payload: &Path, _target_version: &str) -> std::io::Result<(
     ))
 }
 
-/// Disengage a standing lockdown cover and clear the persisted intent, with no
-/// running bridge required. The escape hatch must actually disengage or FAIL
-/// LOUD: it disengages FIRST and only flips the intent off after a confirmed
-/// success. A swallowed failure (e.g. run unprivileged) would leave the cover
-/// engaged — egress still blocked — while the intent reads "off", misleading the
-/// user.
+/// Disengage EVERY cover capable of holding the host closed and clear the
+/// persisted intent, with no running bridge required. The escape hatch must
+/// actually disengage or FAIL LOUD: it disengages FIRST and only flips the intent
+/// off after a confirmed success. A swallowed failure (e.g. a delete the firewall
+/// refused) would leave the cover engaged — egress still blocked — while the
+/// intent reads "off", misleading the user.
+///
+/// Both covers, not just the standing one: a crash can also strand the TRANSIENT
+/// block-until-connected cover, and while the next bridge start sweeps it, this
+/// command exists precisely for the case where no bridge starts. Clearing a
+/// subset of what can block the host would leave a user with no way out at all.
+/// BOTH sweeps are fail-loud — a silently-failed transient sweep would let this
+/// exit 0 over a still-blocked host, which is exactly the promise it must not
+/// break.
 pub fn unlock() -> std::io::Result<()> {
     let state_dir = service_state_dir();
-    unlock_with(&state_dir, || {
-        tun_engine::routing::failclosed::disengage_lockdown(&state_dir).map_err(std::io::Error::other)
-    })
+    unlock_with(
+        &state_dir,
+        || tun_engine::routing::failclosed::disengage_lockdown(&state_dir).map_err(std::io::Error::other),
+        || tun_engine::routing::failclosed::sweep_transient_verified(&state_dir).map_err(std::io::Error::other),
+    )
 }
 
-/// `unlock`'s ordering, with the disengage step injected so tests can drive the
-/// cannot-disengage path without touching the host firewall. Disengage → flip;
-/// the intent flips off ONLY after the disengage confirms success.
-fn unlock_with(state_dir: &Path, disengage: impl FnOnce() -> std::io::Result<()>) -> std::io::Result<()> {
+/// `unlock`'s ordering, with both effects injected so tests can drive the
+/// cannot-clear paths without touching the host firewall. Standing disengage →
+/// transient sweep → flip; the intent flips off ONLY after BOTH confirm success,
+/// so it can never read "off" over a cover either step failed to clear.
+fn unlock_with(
+    state_dir: &Path,
+    disengage: impl FnOnce() -> std::io::Result<()>,
+    sweep_transient: impl FnOnce() -> std::io::Result<()>,
+) -> std::io::Result<()> {
     disengage()?;
+    sweep_transient()?;
     tun_engine::routing::failclosed::lockdown_state::set_enabled(state_dir, false, None)
 }
 

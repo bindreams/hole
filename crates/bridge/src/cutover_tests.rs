@@ -22,14 +22,45 @@ fn unlock_failing_disengage_does_not_flip_intent() {
     let dir = tempfile::tempdir().unwrap();
     lockdown_state::set_enabled(dir.path(), true, None).unwrap();
 
-    let result = unlock_with(dir.path(), || {
-        Err(std::io::Error::other("cannot disengage / not elevated"))
-    });
+    let mut swept = false;
+    let result = unlock_with(
+        dir.path(),
+        || Err(std::io::Error::other("cannot disengage / not elevated")),
+        || {
+            swept = true;
+            Ok(())
+        },
+    );
 
     assert!(result.is_err(), "unlock must fail loud when it cannot disengage");
     assert!(
+        !swept,
+        "a standing disengage that failed must short-circuit before anything claims success"
+    );
+    assert!(
         lockdown_state::load_enabled(dir.path()),
         "intent must stay ON when the cover could not be disengaged"
+    );
+}
+
+#[skuld::test]
+fn unlock_failing_transient_sweep_does_not_flip_intent() {
+    // `unlock` promises the user that success means their network is open. A
+    // transient cover it could not clear must fail the command, not exit 0 over a
+    // still-blocked host — this is their last remedy.
+    let dir = tempfile::tempdir().unwrap();
+    lockdown_state::set_enabled(dir.path(), true, None).unwrap();
+
+    let result = unlock_with(
+        dir.path(),
+        || Ok(()),
+        || Err(std::io::Error::other("transient cover still engaged")),
+    );
+
+    assert!(result.is_err(), "a transient sweep that failed must fail the command");
+    assert!(
+        lockdown_state::load_enabled(dir.path()),
+        "intent must stay ON while any cover may still be holding the host"
     );
 }
 
@@ -38,9 +69,21 @@ fn unlock_successful_disengage_flips_intent_off() {
     let dir = tempfile::tempdir().unwrap();
     lockdown_state::set_enabled(dir.path(), true, None).unwrap();
 
-    let result = unlock_with(dir.path(), || Ok(()));
+    let mut swept = false;
+    let result = unlock_with(
+        dir.path(),
+        || Ok(()),
+        || {
+            swept = true;
+            Ok(())
+        },
+    );
 
     assert!(result.is_ok());
+    assert!(
+        swept,
+        "unlock must also sweep a leftover transient cover: it is the only escape when no bridge starts"
+    );
     assert!(
         !lockdown_state::load_enabled(dir.path()),
         "intent flips off only after a confirmed disengage"

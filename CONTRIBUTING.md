@@ -601,12 +601,57 @@ pre-lockdown pf snapshot in `bridge-lockdown-pf.json` so Sweep restores the host
 without `-Fa`. The LUID is **never persisted** (a teardown mints a new one) —
 re-resolved every engage via `LuidResolver`.
 
-`hole bridge unlock` is the elevated escape hatch to disengage a standing cover
-when no bridge is alive (`cutover::unlock`). Unlike the best-effort startup
-Sweep, it is **fail-loud**: it disengages via `failclosed::disengage_lockdown`
-FIRST and flips the intent off only on confirmed success, returning a non-zero
-exit otherwise (e.g. run unprivileged). A swallowed failure would leave the
-cover engaged — egress still blocked — while the intent read "off".
+#### Cover state is an OS fact
+
+`lockdown_active` is `failclosed::lockdown_cover_state`, a three-state probe of
+the OS (`Engaged` / `Absent` / `Unknown`), never derived from a running session —
+a cover adopted from a crashed run is owned by no process, so a session-derived
+signal reports it as absent while it drops every packet. A session that owns the
+cover short-circuits the probe; nothing else does. `Unknown` (WFP engine open
+failed, `pfctl` unreadable) counts as engaged: the escape affordance keys on this
+field, and an all-clear we did not observe is the same lockout by another route.
+
+Two questions, two functions. `lockdown_cover_present` feeds the recovery
+decision — "is there prior-run state to reconcile?" — and stays lenient on macOS
+(the state file alone), because pf is disabled and flushed across a reboot while
+`bridge-lockdown-pf.json` survives, and a stricter test would make `Sweep` skip
+the file it exists to clear. `lockdown_cover_state` answers "is the host held
+closed right now?" and reads pf for real. On Windows the two coincide: persistent
+filters, so anything present is in force.
+
+`held_closed` (`StatusResponse`) is a cover engaged that **no running session
+owns** — deliberately not `lockdown_active && !running`. Intent off plus a cover
+a failed startup `Sweep` left behind, then a connect: `start_inner` skips
+`install_lockdown`, so `running` is true while the stale block-all kills every
+packet.
+
+#### Releasing a stuck cover
+
+Turning the intent off releases a cover no live session owns, immediately —
+`recover_routes` at the next startup is too late for a user whose network is
+already dead. Ordering mirrors `cutover::unlock_with`: disengage FIRST, persist
+`false` only on confirmed success, so the setting can never read "off" over a
+blocked host. `disengage_lockdown`'s `Ok` is itself backed by a **re-probe**, not
+by a return code: the Windows path used to discard every `FwpmFilterDeleteByKey0`
+result, and the FWPM engine opens without elevation, so an unprivileged unlock
+reported success while deleting nothing.
+
+The release is skipped when the probe confirms `Absent`. Doing it unconditionally
+would make disarming the switch on a clean host fail whenever the firewall is
+unreachable — a fresh way into the lockout. A cover a live session owns is left
+to `stop_with`: settings apply on reconnect.
+
+Escape ladder, in order: the tray's **Unblock Network**, Connect, then
+`hole bridge unlock`.
+
+`hole bridge unlock` is the elevated escape hatch to clear a cover when no bridge
+is alive (`cutover::unlock`). Unlike the best-effort startup Sweep, it is
+**fail-loud**: it disengages via `failclosed::disengage_lockdown` FIRST and flips
+the intent off only on confirmed success, returning a non-zero exit otherwise. A
+swallowed failure would leave the cover engaged — egress still blocked — while
+the intent read "off". It sweeps the **transient** cover too: a crash can strand
+that one as well, and this command exists for the case where no bridge starts to
+sweep it, so clearing a subset would leave the user with no way out at all.
 
 ### Update cutover
 

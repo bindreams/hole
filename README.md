@@ -49,6 +49,22 @@ The GUI is the primary interface; these CLI commands are also available:
 | `hole version`                       | Print version information                        |
 | `hole upgrade`                       | Check for updates and install the latest version |
 | `hole path add` / `hole path remove` | Add / remove `hole` from the system PATH         |
+| `hole bridge unlock`                 | Unblock the network if the kill switch is stuck  |
+
+### If your network is blocked
+
+Hole's kill switch deliberately keeps blocking after a crash — that is the moment
+a leak matters most. Normally the tray offers **Unblock Network**, or connecting
+again restores service. If Hole will not start at all, clear the block from an
+elevated terminal:
+
+```sh
+hole bridge unlock          # Windows: run the terminal as Administrator
+sudo hole bridge unlock     # macOS
+```
+
+It fails loudly rather than pretending: if it reports success, your network is
+open.
 
 ## Distributions
 

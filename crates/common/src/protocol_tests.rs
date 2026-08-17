@@ -149,6 +149,8 @@ fn bridge_response_status_json_roundtrip() {
         ipv6_bypass_available: false,
         lockdown_enabled: false,
         lockdown_active: false,
+        held_closed: false,
+        cover_state_unknown: false,
         blocked_until_connected: true,
     };
     let json = serde_json::to_vec(&resp).unwrap();
@@ -230,6 +232,8 @@ fn status_response_json_roundtrip() {
         ipv6_bypass_available: true,
         lockdown_enabled: false,
         lockdown_active: false,
+        held_closed: false,
+        cover_state_unknown: false,
         blocked_until_connected: false,
     };
     let json = serde_json::to_string(&resp).unwrap();
@@ -248,6 +252,8 @@ fn status_response_without_error() {
         ipv6_bypass_available: true,
         lockdown_enabled: false,
         lockdown_active: false,
+        held_closed: false,
+        cover_state_unknown: false,
         blocked_until_connected: false,
     };
     let json = serde_json::to_string(&resp).unwrap();
@@ -302,12 +308,14 @@ fn route_lockdown_path_is_stable() {
 #[skuld::test]
 fn status_response_lockdown_fields_default_false_for_old_clients() {
     use crate::protocol::StatusResponse;
-    // An old client sends a StatusResponse JSON without the lockdown fields;
+    // An old client sends a StatusResponse JSON without the lockdown/cover fields;
     // serde-default must fill them as false (matching udp/ipv6 fields).
     let json = r#"{"running":true,"uptime_secs":0}"#;
     let s: StatusResponse = serde_json::from_str(json).unwrap();
     assert!(!s.lockdown_enabled);
     assert!(!s.lockdown_active);
+    assert!(!s.held_closed);
+    assert!(!s.blocked_until_connected);
 }
 
 #[skuld::test]

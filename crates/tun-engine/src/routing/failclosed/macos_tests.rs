@@ -365,3 +365,108 @@ fn restore_empty_nat_has_no_blank_line() {
     let r = build_lockdown_restore_ruleset("", FILTER_SNAP);
     assert!(!r.contains("\n\n"), "empty nat must not produce a blank line:\n{r}");
 }
+
+// Cover-state probe ===================================================================================================
+
+#[skuld::test]
+fn macos_cover_state_maps_pf_reads() {
+    use CoverState::*;
+
+    // No state file: nothing of ours was ever recorded, and no subprocess runs.
+    assert_eq!(cover_state_from(false, None, None), Absent);
+    assert_eq!(cover_state_from(false, Some(true), Some(true)), Absent);
+
+    // Read failures are the rows a boolean signature would have collapsed into
+    // "no cover" — hiding a blocked host and its escape along with it.
+    assert_eq!(cover_state_from(true, None, Some(true)), Unknown);
+    assert_eq!(cover_state_from(true, None, None), Unknown);
+    assert_eq!(cover_state_from(true, Some(true), None), Unknown);
+
+    // pf disabled: the ruleset is inert, the host is open. The ordinary
+    // post-reboot state — reporting Engaged here would be a false alarm.
+    assert_eq!(cover_state_from(true, Some(false), Some(true)), Absent);
+    assert_eq!(cover_state_from(true, Some(false), Some(false)), Absent);
+
+    // pf up, but our ruleset is not the loaded policy.
+    assert_eq!(cover_state_from(true, Some(true), Some(false)), Absent);
+
+    // The one engaged combination.
+    assert_eq!(cover_state_from(true, Some(true), Some(true)), Engaged);
+}
+
+#[skuld::test]
+fn macos_pf_read_failures_are_not_answers() {
+    use std::os::unix::process::ExitStatusExt;
+    use std::process::{ExitStatus, Output};
+
+    let out = |code: i32, stdout: &str| Output {
+        status: ExitStatus::from_raw(code),
+        stdout: stdout.as_bytes().to_vec(),
+        stderr: Vec::new(),
+    };
+
+    assert_eq!(
+        read_outcome(Ok(out(0, "Status: Enabled"))).as_deref(),
+        Some("Status: Enabled")
+    );
+    assert_eq!(
+        read_outcome(Ok(out(256, "partial"))),
+        None,
+        "a non-zero exit is not an answer, even with stdout"
+    );
+    assert_eq!(
+        read_outcome(Err(RoutingError::RouteSetup("pfctl not found".into()))),
+        None,
+        "a spawn failure is not an answer"
+    );
+}
+
+#[skuld::test]
+fn macos_engaged_state_is_reachable_by_the_disengage_verifier() {
+    // `disengage_lockdown` probes BEFORE clearing the state file. If it cleared
+    // first, `lockdown_cover_state` would short-circuit to Absent and the verify
+    // could never observe a ruleset still blocking — a check that cannot fail.
+    // Pin the input the verifier must be able to see.
+    assert_eq!(cover_state_from(true, Some(true), Some(true)), CoverState::Engaged);
+    assert!(super::super::verify_disengaged(CoverState::Engaged).is_err());
+    // ...and the vacuous one it would see if the file were gone first.
+    assert_eq!(cover_state_from(false, None, None), CoverState::Absent);
+    assert!(super::super::verify_disengaged(CoverState::Absent).is_ok());
+}
+
+#[skuld::test]
+fn macos_transient_ruleset_carries_the_probed_block_rule() {
+    // The probe greps `pfctl -sr` output for TRANSIENT_BLOCK_RULE, so the constant
+    // has to be spelled the way pfctl PRINTS a rule, not the way one may be
+    // written: pfctl reprints parsed rules and emits the policy word for a
+    // PF_DROP rule, so `block out all` reads back as `block drop out all`. Under
+    // `set block-policy drop` they are the same rule, so emitting the printed
+    // form costs nothing and makes the two agree. Live proof is
+    // `lockdown_lockout_macos_transient_cover_state_tracks_engage_and_disengage`.
+    // Expected value derived from pfctl's own behaviour, not from our constant:
+    // `pfctl -sr` output is re-parseable by design — `build_lockdown_restore_ruleset`
+    // feeds a captured `-sr` snapshot straight back through `pfctl -f -` — so the
+    // printed form is both what a probe reads and what a ruleset may contain.
+    const PRINTED: &str = "block drop out all";
+    assert_eq!(
+        TRANSIENT_BLOCK_RULE, PRINTED,
+        "the probe greps pfctl output, so the constant must be pfctl's printed form"
+    );
+    let ruleset = build_pf_ruleset("203.0.113.7".parse().unwrap(), None);
+    assert!(
+        ruleset.contains(PRINTED),
+        "the emitted ruleset must already be in the form it reads back as:\n{ruleset}"
+    );
+}
+
+#[skuld::test]
+fn macos_lockdown_ruleset_carries_the_probed_block_rule() {
+    // The probe greps the live ruleset for LOCKDOWN_BLOCK_RULE. If the builder
+    // stopped emitting it, the probe would report Absent over a blocked host —
+    // so pin that the two agree by construction.
+    let ruleset = build_lockdown_main_ruleset("utun4", "203.0.113.7".parse().unwrap(), "");
+    assert!(
+        ruleset.contains(LOCKDOWN_BLOCK_RULE),
+        "the lockdown ruleset must carry the rule the probe looks for:\n{ruleset}"
+    );
+}

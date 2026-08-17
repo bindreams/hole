@@ -500,3 +500,171 @@ fn macos_failclosed_permits_resolver_blocks_other_egress() {
         rpo.err().map(|e| e.kind()),
     );
 }
+
+// Cover-state probe against the real OS ===============================================================================
+
+/// The probe must track the REAL cover through its whole life, including the
+/// clean-host `Absent` case an unconditional `true` cannot express.
+#[cfg(target_os = "windows")]
+#[skuld::test(labels = [TUN], serial = TUN)]
+fn lockdown_lockout_windows_cover_state_tracks_engage_and_disengage() {
+    let dir = tempfile::tempdir().unwrap();
+    let resolver = SystemLuidResolver;
+    let server_ip: std::net::IpAddr = "1.1.1.1".parse().unwrap();
+
+    assert_eq!(
+        lockdown_cover_state(dir.path()),
+        CoverState::Absent,
+        "a host with no cover engaged must probe Absent"
+    );
+
+    // "Loopback Pseudo-Interface 1" is an always-present alias used only as a LUID
+    // source to exercise the real resolve + `LocalInterface` filter path.
+    let cover = engage_lockdown(
+        server_ip,
+        "Loopback Pseudo-Interface 1",
+        &resolver,
+        &[],
+        dir.path(),
+        None,
+    )
+    .expect("engage real WFP lockdown cover");
+
+    assert_eq!(
+        lockdown_cover_state(dir.path()),
+        CoverState::Engaged,
+        "a live cover must probe Engaged"
+    );
+
+    drop(cover);
+    assert_eq!(
+        lockdown_cover_state(dir.path()),
+        CoverState::Absent,
+        "a disengaged cover must probe Absent again"
+    );
+}
+
+/// macOS counterpart. pf state is the ruleset + the enable token, so the probe
+/// reads both rather than trusting `bridge-lockdown-pf.json` — a reboot leaves
+/// that file over a flushed, disabled pf.
+#[cfg(target_os = "macos")]
+#[skuld::test(labels = [TUN], serial = TUN)]
+fn lockdown_lockout_macos_cover_state_tracks_engage_and_disengage() {
+    let dir = tempfile::tempdir().unwrap();
+    let resolver = SystemLuidResolver;
+    let server_ip: std::net::IpAddr = "1.1.1.1".parse().unwrap();
+
+    assert_eq!(
+        lockdown_cover_state(dir.path()),
+        CoverState::Absent,
+        "a host with no cover engaged must probe Absent"
+    );
+
+    let cover = engage_lockdown(server_ip, "utun-absent", &resolver, &[], dir.path(), None)
+        .expect("engage real pf lockdown cover");
+
+    assert_eq!(
+        lockdown_cover_state(dir.path()),
+        CoverState::Engaged,
+        "a live cover must probe Engaged"
+    );
+
+    drop(cover);
+    assert_eq!(
+        lockdown_cover_state(dir.path()),
+        CoverState::Absent,
+        "a disengaged cover must probe Absent again"
+    );
+}
+
+/// The TRANSIENT probe against the real pf, mirroring its standing-cover twin.
+///
+/// This is the only place that can prove `TRANSIENT_BLOCK_RULE` is spelled the
+/// way `pfctl -sr` prints it: a constant in written form parses fine, loads fine
+/// and reads back differently, so the probe silently reports `Absent` over a live
+/// cover — the fail-open this test exists to catch. Nothing off-host can observe
+/// it.
+#[cfg(target_os = "macos")]
+#[skuld::test(labels = [TUN], serial = TUN)]
+fn lockdown_lockout_macos_transient_cover_state_tracks_engage_and_disengage() {
+    let dir = tempfile::tempdir().unwrap();
+    let server_ip: std::net::IpAddr = "1.1.1.1".parse().unwrap();
+
+    assert_eq!(
+        transient_cover_state(dir.path()),
+        CoverState::Absent,
+        "a host with no transient cover engaged must probe Absent"
+    );
+
+    let cover = engage(server_ip, None, dir.path(), None).expect("engage the real pf transient cover");
+    assert_eq!(
+        transient_cover_state(dir.path()),
+        CoverState::Engaged,
+        "a live transient cover must probe Engaged — a written-form constant reads Absent here"
+    );
+
+    drop(cover);
+    assert_eq!(
+        transient_cover_state(dir.path()),
+        CoverState::Absent,
+        "a disengaged transient cover must probe Absent again"
+    );
+}
+
+/// The transient sweep's `Ok` must mean the cover is gone, on the real pf. With a
+/// probe that can never match, this passes vacuously — which is why it engages a
+/// real cover first rather than sweeping a clean host.
+#[cfg(target_os = "macos")]
+#[skuld::test(labels = [TUN], serial = TUN)]
+fn lockdown_lockout_macos_transient_sweep_verifies_the_cover_is_gone() {
+    let dir = tempfile::tempdir().unwrap();
+    let server_ip: std::net::IpAddr = "1.1.1.1".parse().unwrap();
+
+    let cover = engage(server_ip, None, dir.path(), None).expect("engage the real pf transient cover");
+    // The unclean exit: forget the guard so its Drop never runs.
+    crate::routing::CoverGuard::disarm(cover);
+    assert_eq!(transient_cover_state(dir.path()), CoverState::Engaged);
+
+    sweep_transient_verified(dir.path()).expect("sweep a real transient cover");
+    assert_eq!(
+        transient_cover_state(dir.path()),
+        CoverState::Absent,
+        "the sweep reported Ok, so the probe must confirm the cover is gone"
+    );
+}
+
+/// `disengage_lockdown`'s Ok must mean the host is open. Drives the real
+/// primitive on a real cover and cross-checks the claim against the probe —
+/// previously the Windows implementation discarded every delete result, so its
+/// Ok meant only that the FWPM engine had opened.
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+#[skuld::test(labels = [TUN], serial = TUN)]
+fn lockdown_lockout_disengage_ok_means_the_cover_is_gone() {
+    let dir = tempfile::tempdir().unwrap();
+    let resolver = SystemLuidResolver;
+    let server_ip: std::net::IpAddr = "1.1.1.1".parse().unwrap();
+
+    // A clean host has nothing to remove; the verified contract still holds.
+    disengage_lockdown(dir.path()).expect("disengage on a clean host is Ok");
+
+    let cover = engage_lockdown(server_ip, LOCKOUT_TEST_TUN, &resolver, &[], dir.path(), None)
+        .expect("engage real lockdown cover");
+    // The unclean exit: `disarm` forgets the guard, so its Drop never runs and the
+    // OS keeps exactly what a crash leaves behind.
+    crate::routing::CoverGuard::disarm(cover);
+    assert_eq!(lockdown_cover_state(dir.path()), CoverState::Engaged);
+
+    disengage_lockdown(dir.path()).expect("disengage a real cover");
+    assert_eq!(
+        lockdown_cover_state(dir.path()),
+        CoverState::Absent,
+        "disengage returned Ok, so the probe must confirm the cover is gone"
+    );
+}
+
+/// A LUID/interface source that exists on the running host, used only to drive
+/// the real resolve path — the assertions never depend on it.
+#[cfg(target_os = "windows")]
+const LOCKOUT_TEST_TUN: &str = "Loopback Pseudo-Interface 1";
+#[cfg(target_os = "macos")]
+const LOCKOUT_TEST_TUN: &str = "utun-absent";

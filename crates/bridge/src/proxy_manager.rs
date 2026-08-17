@@ -189,6 +189,15 @@ pub struct TrafficMetrics {
     pub speed_out_bps: u64,
 }
 
+/// What the OS says about Hole's covers, from one probe of each. Named fields,
+/// not a bool tuple: the three are same-typed and easy to transpose.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CoverStatus {
+    pub lockdown_active: bool,
+    pub held_closed: bool,
+    pub cover_state_unknown: bool,
+}
+
 // ProxyManager ========================================================================================================
 
 /// The one reason an out-of-band death is reported to the GUI. A `&'static str`
@@ -449,10 +458,90 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         self.ipv6_bypass_available
     }
 
-    /// Whether a standing lockdown cover is currently engaged (the `active`
-    /// signal). Distinct from the persisted intent (`enabled`).
+    /// Whether the running session owns a standing lockdown cover — the cheap,
+    /// in-process half of [`lockdown_active`](Self::lockdown_active), and the
+    /// thing that distinguishes "protected and carrying traffic" from
+    /// "blocked with nothing running".
+    fn session_owns_cover(&self) -> bool {
+        self.running.as_ref().is_some_and(|r| r.lockdown.is_some())
+    }
+
+    /// The `(lockdown_active, held_closed)` pair from ONE probe of the OS.
+    ///
+    /// Both together, because they must describe the same instant: the firewall
+    /// is not under the `ProxyManager` lock, so two sequential probes can be torn
+    /// by a concurrent `hole bridge unlock` and yield `active && !held_closed` —
+    /// which the tray reads as "a session owns the cover" over a host where
+    /// nothing is running. One probe per status also halves the OS cost of an
+    /// idle disconnected poll.
+    ///
+    /// `active`: the OS is the authority; the session guard is only a
+    /// short-circuit that skips the probe when we already hold the answer.
+    /// Deriving it from the running session alone is wrong: a cover adopted from
+    /// a crashed run has no guard in this process, so it would read `false` while
+    /// blocking every packet. A probe that cannot answer
+    /// ([`CoverState::Unknown`]) counts as active: the escape affordance keys on
+    /// this field, and hiding it over an unanswerable probe is the same lockout
+    /// by another route.
+    ///
+    /// `held_closed`: EITHER cover engaged with no in-process guard owning it —
+    /// the host is held closed with nothing carrying the user's traffic through
+    /// it. Deliberately not `active && !running`: intent OFF plus a leftover
+    /// cover whose startup `Sweep` failed, then a connect, leaves `running` true
+    /// while the stale block-all kills every packet. It counts the TRANSIENT
+    /// cover too — a crash mid-connect strands those filters just as
+    /// persistently, and they would otherwise render as plain "Disconnected"
+    /// with no action offered at all.
+    ///
+    /// `cover_state_unknown`: the evidence behind `held_closed` is an
+    /// unanswerable probe rather than an observed cover. Kept distinct because
+    /// telling a user we are blocking them is a different claim from telling them
+    /// we cannot tell — and on Windows a wedged BFE makes the latter permanent.
+    pub fn cover_status(&self) -> CoverStatus {
+        use tun_engine::routing::failclosed::CoverState;
+
+        // Each cover is probed at most once, and only when no in-process guard
+        // already answers for it.
+        let session_owns = self.session_owns_cover();
+        let standing = if session_owns {
+            CoverState::Engaged
+        } else {
+            self.routing.lockdown_cover_state()
+        };
+        // Skipped whenever something in this process already answers for that
+        // cover: a held `blocked` guard IS the transient cover and has its own
+        // surface (`blocked_until_connected`), and a running session's own start
+        // path owns the transient cover's lifetime, so a stranded one is not
+        // reachable there. Both are cost guards as much as correctness ones — this
+        // runs on every status poll while the proxy mutex is held.
+        let transient = if self.blocked.is_some() || self.running.is_some() {
+            CoverState::Absent
+        } else {
+            self.routing.transient_cover_state()
+        };
+
+        // The strongest evidence from either cover that nothing in this process
+        // owns.
+        let evidence = if session_owns { CoverState::Absent } else { standing }.strongest(transient);
+
+        CoverStatus {
+            lockdown_active: session_owns || standing.is_present(),
+            held_closed: evidence.is_present(),
+            cover_state_unknown: evidence == CoverState::Unknown,
+        }
+    }
+
+    /// Whether a standing lockdown cover is engaged. Prefer
+    /// [`cover_status`](Self::cover_status) when several flags are wanted, so
+    /// they share one probe.
     pub fn lockdown_active(&self) -> bool {
-        self.running.as_ref().map(|r| r.lockdown.is_some()).unwrap_or(false)
+        self.cover_status().lockdown_active
+    }
+
+    /// Whether a cover no in-process guard owns is holding the host closed. See
+    /// [`cover_status`](Self::cover_status).
+    pub fn held_closed(&self) -> bool {
+        self.cover_status().held_closed
     }
 
     /// Whether a covered start failed and left the host fail-closed (blocked, not
@@ -480,14 +569,94 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
     /// cannot honor a kill switch it cannot persist (a silent `Ok(())` would be
     /// a fail-open footgun — the GUI would believe lockdown is armed when
     /// nothing was written).
+    ///
+    /// Turning it OFF also RELEASES a cover no live session owns, rather than
+    /// leaving it for the next `recover_routes` — the user's one obvious remedy
+    /// must not do nothing at all. Ordering is `cutover::unlock_with`'s:
+    /// disengage FIRST, persist `false` only on a confirmed success, so the
+    /// setting can never read "off" over a host we KNOW is blocked.
+    ///
+    /// A cover a live session DOES own is left alone: settings apply on
+    /// reconnect, and `stop_with` already disengages it. A lockout is not a
+    /// setting, which is why the unowned case is released immediately.
+    ///
+    /// The release is skipped entirely when the probe confirms `Absent`. Doing
+    /// it unconditionally would make disarming the switch on a clean host fail
+    /// whenever the firewall is unreachable — a fresh way to strand the user in
+    /// the state this exists to prevent.
     pub fn set_lockdown_intent(&self, enabled: bool) -> Result<(), ProxyError> {
         let dir = self.state_dir.as_deref().ok_or_else(|| {
             ProxyError::Runtime(std::io::Error::other(
                 "cannot set lockdown intent: bridge has no state_dir to persist it",
             ))
         })?;
+        if !enabled {
+            self.release_unowned_cover()?;
+        }
         lockdown_state::set_enabled(dir, enabled, self.state_owner)
             .map_err(|e| ProxyError::Runtime(std::io::Error::other(format!("lockdown persist: {e}"))))
+    }
+
+    /// Disengage a standing cover no live session owns. A no-op when the probe
+    /// confirms none is engaged, or when the running session owns it.
+    ///
+    /// Clears BOTH covers, because both can strand a host and this is the only
+    /// action the user is offered. A transient cover this process still holds is
+    /// left alone — `stop_with` owns that one.
+    ///
+    /// Refuses ONLY when a probe OBSERVED a cover and its release then failed —
+    /// the one case where we know the host is still blocked and the setting must
+    /// not read "off". An `Unknown` probe whose release also failed is the
+    /// correlated pair on Windows (both go through `FwpmEngineOpen0`), and
+    /// refusing there would leave the switch permanently un-disarmable while we
+    /// never established that anything was blocking. The uncertainty is not
+    /// swallowed: `held_closed` stays true and `cover_state_unknown` says which
+    /// claim we are making, so the tray keeps showing the state and its action.
+    fn release_unowned_cover(&self) -> Result<(), ProxyError> {
+        use tun_engine::routing::failclosed::CoverState;
+
+        // A transient cover THIS process holds is not stranded — `stop_with`
+        // owns it, and on macOS the standing restore reloads a whole ruleset, so
+        // running it here would tear that live cover down and open the host.
+        if self.blocked.is_some() {
+            info!("lockdown intent off while holding a transient cover: leaving both to the stop path");
+            return Ok(());
+        }
+
+        // Standing cover.
+        if !self.session_owns_cover() {
+            let observed = self.routing.lockdown_cover_state();
+            if observed != CoverState::Absent {
+                info!(
+                    ?observed,
+                    "lockdown intent off: releasing the standing cover no session owns"
+                );
+                match self.routing.disengage_lockdown() {
+                    Ok(()) => {}
+                    Err(e) if observed == CoverState::Engaged => return Err(ProxyError::from(e)),
+                    Err(e) => {
+                        warn!(error = %e, "could not release a standing cover never confirmed engaged; recording the intent off anyway")
+                    }
+                }
+            }
+        }
+
+        // Transient cover stranded by a crash: nothing in this process owns it,
+        // and no other control surface can clear it, so the one action the user
+        // is offered has to.
+        let transient = self.routing.transient_cover_state();
+        if transient == CoverState::Absent {
+            return Ok(());
+        }
+        info!(?transient, "releasing a stranded transient cover");
+        match self.routing.sweep_transient() {
+            Ok(()) => Ok(()),
+            Err(e) if transient == CoverState::Engaged => Err(ProxyError::from(e)),
+            Err(e) => {
+                warn!(error = %e, "could not sweep a transient cover never confirmed engaged; recording the intent off anyway");
+                Ok(())
+            }
+        }
     }
 
     /// Non-cancellable convenience wrapper around

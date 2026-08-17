@@ -76,7 +76,8 @@ before editing; the sections linked below are the authoritative source.
   (auto-connect) start whose lockdown intent is OFF; a lockdown-on covered
   start uses the standing cover instead and releases any held transient one.
   Both are persistent WFP filters (Win) / self-contained pf ruleset (mac), swept
-  by `recover_routes` on next start. →
+  by `recover_routes` on next start. Whether a cover is engaged is an OS probe,
+  never derived from a running session. →
   [CONTRIBUTING.md#fail-closed-cover](CONTRIBUTING.md#fail-closed-cover)
 - **Logging & plugin diagnostics.** Log destinations, the WebView2/console-relay
   tee, `HOLE_BRIDGE_LOG` directives, and the plugin tap. →

@@ -17,7 +17,7 @@ use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tun_engine::gateway::GatewayInfo;
-use tun_engine::routing::failclosed::lockdown_state;
+use tun_engine::routing::failclosed::{lockdown_state, CoverState};
 use tun_engine::routing::{self, state as route_state, Routing};
 use tun_engine::RoutingError;
 
@@ -194,6 +194,20 @@ struct MockRoutingState {
     /// (a set containing both values) for the double-failure fail-open path.
     /// `fail_cover` (always-fail) is unaffected and takes priority.
     fail_cover_for_resolvers: std::sync::Mutex<std::collections::HashSet<Option<IpAddr>>>,
+    /// What `lockdown_cover_state` reports — the OS-truth probe a test drives to
+    /// stand in for a cover adopted from a crashed run.
+    cover_state: std::sync::Mutex<CoverState>,
+    /// How many times the probe was asked. Lets a test assert the short-circuit
+    /// (a session that owns the cover must not pay for an OS call).
+    cover_state_calls: AtomicU32,
+    /// How many times `disengage_lockdown` was called, and what it returns.
+    standing_disengage_calls: AtomicU32,
+    fail_standing_disengage: AtomicBool,
+    /// The transient cover's OS-truth probe, and its sweep's call count/result.
+    transient_state: std::sync::Mutex<CoverState>,
+    transient_state_calls: AtomicU32,
+    transient_sweep_calls: AtomicU32,
+    fail_transient_sweep: AtomicBool,
 }
 
 impl Default for MockRoutingState {
@@ -209,6 +223,14 @@ impl Default for MockRoutingState {
             lockdown_disengage_calls: AtomicU32::new(0),
             fail_lockdown: AtomicBool::new(false),
             fail_cover: AtomicBool::new(false),
+            cover_state: std::sync::Mutex::new(CoverState::Absent),
+            cover_state_calls: AtomicU32::new(0),
+            standing_disengage_calls: AtomicU32::new(0),
+            fail_standing_disengage: AtomicBool::new(false),
+            transient_state: std::sync::Mutex::new(CoverState::Absent),
+            transient_state_calls: AtomicU32::new(0),
+            transient_sweep_calls: AtomicU32::new(0),
+            fail_transient_sweep: AtomicBool::new(false),
             teardown_order: std::sync::Mutex::new(Vec::new()),
             last_install_server_ip: std::sync::Mutex::new(None),
             last_cover_server_ip: std::sync::Mutex::new(None),
@@ -353,6 +375,36 @@ impl Routing for MockRouting {
             state: Arc::clone(&self.state),
             lockdown: true,
         })
+    }
+
+    fn lockdown_cover_state(&self) -> CoverState {
+        self.state.cover_state_calls.fetch_add(1, Ordering::SeqCst);
+        *self.state.cover_state.lock().unwrap()
+    }
+
+    fn disengage_lockdown(&self) -> Result<(), RoutingError> {
+        self.state.standing_disengage_calls.fetch_add(1, Ordering::SeqCst);
+        if self.state.fail_standing_disengage.load(Ordering::SeqCst) {
+            // Mirrors the real fail-loud contract: a failed disengage leaves the
+            // cover engaged, so the mock's state must NOT flip.
+            return Err(RoutingError::RouteSetup("mock disengage failure".into()));
+        }
+        *self.state.cover_state.lock().unwrap() = CoverState::Absent;
+        Ok(())
+    }
+
+    fn transient_cover_state(&self) -> CoverState {
+        self.state.transient_state_calls.fetch_add(1, Ordering::SeqCst);
+        *self.state.transient_state.lock().unwrap()
+    }
+
+    fn sweep_transient(&self) -> Result<(), RoutingError> {
+        self.state.transient_sweep_calls.fetch_add(1, Ordering::SeqCst);
+        if self.state.fail_transient_sweep.load(Ordering::SeqCst) {
+            return Err(RoutingError::RouteSetup("mock transient sweep failure".into()));
+        }
+        *self.state.transient_state.lock().unwrap() = CoverState::Absent;
+        Ok(())
     }
 }
 
@@ -1994,6 +2046,324 @@ fn full_start_fails_closed_when_doh_cannot_resolve() {
 // guards unwind without ever hijacking the user's system DNS into a
 // dead tunnel.
 
+// Kill-switch lockout: state + release ================================================================================
+
+/// A manager + its routing mock's shared state, both pointed at one `dir`, with
+/// the OS-truth cover probe seeded to `cover`. Stands in for a bridge that has
+/// just adopted a cover from a crashed run: no guard anywhere in this process,
+/// but the host is blocked.
+fn lockout_manager(
+    cover: CoverState,
+    intent: bool,
+) -> (
+    ProxyManager<MockProxy, MockRouting>,
+    Arc<MockRoutingState>,
+    tempfile::TempDir,
+) {
+    let dir = tempfile::tempdir().unwrap();
+    lockdown_state::set_enabled(dir.path(), intent, None).unwrap();
+    let routing = MockRouting::new(dir.path().to_path_buf());
+    let state = routing.state();
+    *state.cover_state.lock().unwrap() = cover;
+    let pm = ProxyManager::new(MockProxy::new(), routing).with_state_dir(dir.path().to_path_buf());
+    (pm, state, dir)
+}
+
+#[skuld::test]
+async fn lockdown_active_true_for_adopted_cover_with_no_session() {
+    // The tray was told "not engaged" while every packet was being dropped,
+    // because this read the running session instead of the OS.
+    let (pm, _state, _dir) = lockout_manager(CoverState::Engaged, true);
+    assert!(pm.lockdown_active(), "an adopted cover with no session IS engaged");
+    assert!(pm.held_closed(), "and nothing is carrying traffic through it");
+}
+
+#[skuld::test]
+async fn lockdown_active_true_when_probe_is_unknown() {
+    // An unanswerable probe must not read as all-clear: that hides the block and
+    // the escape that keys on it.
+    let (pm, _state, _dir) = lockout_manager(CoverState::Unknown, true);
+    assert!(pm.lockdown_active());
+    assert!(pm.held_closed());
+}
+
+#[skuld::test]
+async fn lockdown_active_false_when_absent_and_not_running() {
+    let (pm, _state, _dir) = lockout_manager(CoverState::Absent, true);
+    assert!(!pm.lockdown_active());
+    assert!(!pm.held_closed());
+}
+
+#[skuld::test]
+async fn lockdown_active_skips_the_probe_when_the_session_owns_a_cover() {
+    // The short-circuit is behaviour, not an optimisation: reordering it would
+    // put an FWPM/pfctl call on every 5s status poll of a healthy session.
+    let dir = tempfile::tempdir().unwrap();
+    let routing = MockRouting::new(dir.path().to_path_buf());
+    let state = routing.state();
+    let (mut pm, _dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, true);
+    pm.start(&test_config()).await.expect("start with lockdown on");
+    state.cover_state_calls.store(0, Ordering::SeqCst);
+
+    state.transient_state_calls.store(0, Ordering::SeqCst);
+
+    assert!(pm.lockdown_active(), "a session that owns the cover is active");
+    assert_eq!(
+        state.cover_state_calls.load(Ordering::SeqCst),
+        0,
+        "the in-process guard already answers; no standing probe may run"
+    );
+    assert_eq!(
+        state.transient_state_calls.load(Ordering::SeqCst),
+        0,
+        "and a running session must not pay a transient probe on every status poll"
+    );
+}
+
+#[skuld::test]
+async fn held_closed_true_for_running_session_that_owns_no_cover() {
+    // Intent OFF plus a leftover cover a failed startup Sweep left behind, then a
+    // connect. `running` is true, but the stale block-all is killing every
+    // packet — the state a `lockdown_active && !running` derivation renders as an
+    // ordinary connected session, with no escape offered.
+    let dir = tempfile::tempdir().unwrap();
+    let routing = MockRouting::new(dir.path().to_path_buf());
+    let state = routing.state();
+    let (mut pm, _dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, false);
+    pm.start(&test_config()).await.expect("start with lockdown off");
+    *state.cover_state.lock().unwrap() = CoverState::Engaged;
+
+    assert_eq!(pm.state(), ProxyState::Running, "precondition: a session is running");
+    assert!(pm.held_closed(), "a cover no session owns holds the host closed");
+}
+
+#[skuld::test]
+async fn held_closed_false_while_session_owns_the_cover() {
+    let dir = tempfile::tempdir().unwrap();
+    let routing = MockRouting::new(dir.path().to_path_buf());
+    let state = routing.state();
+    let (mut pm, _dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, true);
+    pm.start(&test_config()).await.expect("start with lockdown on");
+    *state.cover_state.lock().unwrap() = CoverState::Engaged;
+
+    assert!(pm.lockdown_active());
+    assert!(!pm.held_closed(), "protected and carrying traffic is not a lockout");
+}
+
+#[skuld::test]
+async fn lockdown_off_disengages_the_adopted_cover() {
+    let (pm, state, dir) = lockout_manager(CoverState::Engaged, true);
+    pm.set_lockdown_intent(false).expect("release + persist");
+
+    assert_eq!(state.standing_disengage_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(*state.cover_state.lock().unwrap(), CoverState::Absent);
+    assert!(!lockdown_state::load_enabled(dir.path()), "intent recorded off");
+    assert!(!pm.held_closed(), "and the host is no longer held closed");
+}
+
+#[skuld::test]
+async fn lockdown_off_keeps_intent_on_when_disengage_fails() {
+    // The switch must never read "off" over a host that is still blocked: that is
+    // precisely the state the user cannot reason their way out of.
+    let (pm, state, dir) = lockout_manager(CoverState::Engaged, true);
+    state.fail_standing_disengage.store(true, Ordering::SeqCst);
+
+    let err = pm.set_lockdown_intent(false).expect_err("must fail loud");
+    assert_eq!(state.standing_disengage_calls.load(Ordering::SeqCst), 1);
+    assert!(
+        lockdown_state::load_enabled(dir.path()),
+        "intent must stay ON while the cover is still engaged: {err}"
+    );
+    assert!(pm.held_closed(), "and the tray keeps reporting the truth");
+}
+
+#[skuld::test]
+async fn lockdown_off_persists_without_a_firewall_call_when_no_cover_is_engaged() {
+    // Releasing unconditionally would make disarming the switch on a CLEAN host
+    // fail whenever the firewall is unreachable — a new way into the lockout.
+    let (pm, state, dir) = lockout_manager(CoverState::Absent, true);
+    state.fail_standing_disengage.store(true, Ordering::SeqCst);
+
+    pm.set_lockdown_intent(false).expect("a clean host always disarms");
+    assert_eq!(
+        state.standing_disengage_calls.load(Ordering::SeqCst),
+        0,
+        "no cover engaged, so no firewall call that could fail"
+    );
+    assert!(!lockdown_state::load_enabled(dir.path()));
+}
+
+#[skuld::test]
+async fn lockdown_off_attempts_the_release_when_the_probe_is_unknown() {
+    let (pm, state, _dir) = lockout_manager(CoverState::Unknown, true);
+    pm.set_lockdown_intent(false)
+        .expect("release attempted and reported Ok");
+    assert_eq!(
+        state.standing_disengage_calls.load(Ordering::SeqCst),
+        1,
+        "an unanswerable probe must not be read as nothing-to-release"
+    );
+}
+
+#[skuld::test]
+async fn lockdown_off_disarms_when_an_unknown_probe_and_a_failed_release_correlate() {
+    // On Windows the probe and the release both go through `FwpmEngineOpen0`, so
+    // an unreachable firewall makes the probe Unknown AND the release fail. If
+    // that refused, the switch could never be turned off — a lockout built out of
+    // the fix for one. We never observed a cover, so record the intent and let
+    // `held_closed` keep surfacing the uncertainty.
+    let (pm, state, dir) = lockout_manager(CoverState::Unknown, true);
+    state.fail_standing_disengage.store(true, Ordering::SeqCst);
+
+    pm.set_lockdown_intent(false)
+        .expect("an unconfirmed cover must not strand the setting");
+    assert_eq!(state.standing_disengage_calls.load(Ordering::SeqCst), 1);
+    assert!(!lockdown_state::load_enabled(dir.path()), "intent recorded off");
+    assert!(
+        pm.held_closed(),
+        "and the uncertainty is still surfaced, so the escape stays on the menu"
+    );
+}
+
+#[skuld::test]
+async fn lockdown_off_refuses_only_when_a_cover_was_actually_observed() {
+    // The mirror of the case above: Engaged is an observation, so a failed
+    // release means we KNOW the host is blocked and the setting must not lie.
+    let (pm, state, dir) = lockout_manager(CoverState::Engaged, true);
+    state.fail_standing_disengage.store(true, Ordering::SeqCst);
+
+    assert!(pm.set_lockdown_intent(false).is_err());
+    assert!(lockdown_state::load_enabled(dir.path()), "intent stays ON");
+}
+
+#[skuld::test]
+async fn cover_status_probes_the_os_once() {
+    // The two flags must describe the same instant: the firewall is not under the
+    // ProxyManager lock, so a torn pair can claim a session owns a cover that a
+    // concurrent `hole bridge unlock` just cleared.
+    let (pm, state, _dir) = lockout_manager(CoverState::Engaged, true);
+    state.cover_state_calls.store(0, Ordering::SeqCst);
+
+    let cover = pm.cover_status();
+    assert!(cover.lockdown_active && cover.held_closed);
+    assert!(!cover.cover_state_unknown, "an observed cover is not an unknown one");
+    assert_eq!(
+        state.cover_state_calls.load(Ordering::SeqCst),
+        1,
+        "one status read must cost exactly one probe of the standing cover"
+    );
+    assert_eq!(
+        state.transient_state_calls.load(Ordering::SeqCst),
+        1,
+        "and exactly one of the transient cover"
+    );
+}
+
+#[skuld::test]
+async fn held_closed_true_for_a_stranded_transient_cover() {
+    // A crash mid-connect leaves the transient cover's persistent filters holding
+    // the host, with no guard in the new process and no lockdown state at all.
+    // Without probing its keys the tray renders plain "Disconnected" over a dead
+    // host and offers nothing.
+    let (pm, state, _dir) = lockout_manager(CoverState::Absent, false);
+    *state.transient_state.lock().unwrap() = CoverState::Engaged;
+
+    assert!(!pm.lockdown_active(), "no standing cover is engaged");
+    assert!(pm.held_closed(), "but the host is still held closed");
+}
+
+#[skuld::test]
+async fn lockdown_off_sweeps_a_stranded_transient_cover() {
+    let (pm, state, _dir) = lockout_manager(CoverState::Absent, false);
+    *state.transient_state.lock().unwrap() = CoverState::Engaged;
+
+    pm.set_lockdown_intent(false).expect("release clears both covers");
+    assert_eq!(state.transient_sweep_calls.load(Ordering::SeqCst), 1);
+    assert!(!pm.held_closed(), "and the host is open again");
+}
+
+#[skuld::test]
+async fn lockdown_off_keeps_intent_on_when_the_transient_sweep_fails() {
+    let (pm, state, dir) = lockout_manager(CoverState::Absent, true);
+    *state.transient_state.lock().unwrap() = CoverState::Engaged;
+    state.fail_transient_sweep.store(true, Ordering::SeqCst);
+
+    assert!(
+        pm.set_lockdown_intent(false).is_err(),
+        "an observed cover that would not clear must fail loud"
+    );
+    assert!(
+        lockdown_state::load_enabled(dir.path()),
+        "intent must stay ON while any cover is still holding the host"
+    );
+}
+
+#[skuld::test]
+async fn cover_status_marks_an_unknown_probe_as_unknown() {
+    let (pm, _state, _dir) = lockout_manager(CoverState::Unknown, true);
+    let cover = pm.cover_status();
+    assert!(cover.held_closed, "an unanswerable probe still offers the escape");
+    assert!(
+        cover.cover_state_unknown,
+        "but must not be reported as an observed cover"
+    );
+}
+
+#[skuld::test]
+async fn cover_status_skips_the_transient_probe_while_this_process_owns_it() {
+    // `blocked_until_connected` already surfaces that cover; probing would only
+    // duplicate it and cost an OS call on every poll.
+    let (pm, state, _dir) = lockout_manager(CoverState::Absent, false);
+    state.transient_state_calls.store(0, Ordering::SeqCst);
+    let _ = pm.cover_status();
+    assert_eq!(
+        state.transient_state_calls.load(Ordering::SeqCst),
+        1,
+        "no in-process transient guard, so the probe runs"
+    );
+}
+
+#[skuld::test]
+async fn lockdown_off_releases_a_cover_a_running_session_does_not_own() {
+    let dir = tempfile::tempdir().unwrap();
+    let routing = MockRouting::new(dir.path().to_path_buf());
+    let state = routing.state();
+    let (mut pm, dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, false);
+    pm.start(&test_config()).await.expect("start with lockdown off");
+    *state.cover_state.lock().unwrap() = CoverState::Engaged;
+
+    pm.set_lockdown_intent(false).expect("release the unowned cover");
+    assert_eq!(
+        state.standing_disengage_calls.load(Ordering::SeqCst),
+        1,
+        "a running session that owns no cover must not shield a lockout"
+    );
+    assert!(!lockdown_state::load_enabled(dir.path()));
+}
+
+#[skuld::test]
+async fn lockdown_off_leaves_a_session_owned_cover_alone() {
+    // Settings apply on reconnect. `stop_with` already disengages this one;
+    // releasing mid-session would change when the kill switch lifts.
+    let dir = tempfile::tempdir().unwrap();
+    let routing = MockRouting::new(dir.path().to_path_buf());
+    let state = routing.state();
+    let (mut pm, dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, true);
+    pm.start(&test_config()).await.expect("start with lockdown on");
+
+    pm.set_lockdown_intent(false).expect("persist only");
+    assert_eq!(state.standing_disengage_calls.load(Ordering::SeqCst), 0);
+    assert!(!lockdown_state::load_enabled(dir.path()), "intent still records off");
+}
+
+#[skuld::test]
+async fn lockdown_on_persists_without_touching_the_cover() {
+    let (pm, state, dir) = lockout_manager(CoverState::Engaged, false);
+    pm.set_lockdown_intent(true).expect("persist");
+    assert_eq!(state.standing_disengage_calls.load(Ordering::SeqCst), 0);
+    assert!(lockdown_state::load_enabled(dir.path()));
+}
+
 #[cfg(test)]
 mod self_test {
     use super::*;
@@ -2366,6 +2736,58 @@ mod self_test {
         cfg.dns.enabled = true;
         cfg.dns.servers = vec!["127.0.0.1".parse().unwrap()];
         (pm, cfg, st, dir)
+    }
+
+    /// A cover THIS process holds must survive an off-intent: `stop_with` owns it,
+    /// and on macOS the standing release reloads a whole ruleset, so running it
+    /// here would tear a live cover down and open the host mid-block.
+    #[skuld::test]
+    fn lockdown_off_leaves_a_transient_cover_this_process_holds() {
+        rt().block_on(async {
+            let (mut pm, cfg, st, dir) = covered_gate_setup(false);
+            let _ = pm
+                .start_cancellable(&cfg, true, CancellationToken::new())
+                .await
+                .unwrap_err();
+            assert!(
+                pm.blocked_until_connected(),
+                "fixture precondition: the failed covered start must hold the cover"
+            );
+
+            pm.set_lockdown_intent(false).expect("persist only");
+            assert_eq!(
+                st.standing_disengage_calls.load(Ordering::SeqCst),
+                0,
+                "a cover this process owns is the stop path's to release"
+            );
+            assert_eq!(st.transient_sweep_calls.load(Ordering::SeqCst), 0);
+            assert!(
+                !lockdown_state::load_enabled(dir.path()),
+                "the intent still records off"
+            );
+        });
+    }
+
+    /// The held guard already answers for that cover, so the OS must not be asked
+    /// — a correctness guard and a per-poll cost guard both.
+    #[skuld::test]
+    fn cover_status_skips_the_transient_probe_while_this_process_owns_it() {
+        rt().block_on(async {
+            let (mut pm, cfg, st, _dir) = covered_gate_setup(false);
+            let _ = pm
+                .start_cancellable(&cfg, true, CancellationToken::new())
+                .await
+                .unwrap_err();
+            assert!(pm.blocked_until_connected(), "fixture precondition");
+            st.transient_state_calls.store(0, Ordering::SeqCst);
+
+            let _ = pm.cover_status();
+            assert_eq!(
+                st.transient_state_calls.load(Ordering::SeqCst),
+                0,
+                "the in-process guard answers; no OS probe may run"
+            );
+        });
     }
 
     #[skuld::test]

@@ -139,6 +139,14 @@ pub enum BridgeResponse {
         ipv6_bypass_available: bool,
         lockdown_enabled: bool,
         lockdown_active: bool,
+        /// Whether a cover — standing OR transient — is engaged that no in-process
+        /// guard owns: Hole is holding the network closed with nothing carrying
+        /// traffic through it. Drives the tray's held-closed state and its release.
+        held_closed: bool,
+        /// Whether `held_closed` rests on an unanswerable probe rather than an
+        /// observed cover. "We are blocking you" and "we cannot tell" are
+        /// different claims and the tray must not conflate them.
+        cover_state_unknown: bool,
         /// Whether a covered start failed and left the host fail-closed (blocked,
         /// not leaked) while not running. Drives the GUI's distinct blocked state
         /// (Retry / Disconnect).

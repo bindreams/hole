@@ -450,6 +450,37 @@ pub trait Routing: Send + Sync {
         tun_name: &str,
         app_ids: &[PathBuf],
     ) -> Result<Self::Cover, RoutingError>;
+
+    /// Whether a STANDING lockdown cover is holding the host closed right now,
+    /// as the OS sees it — independent of whether this process engaged it or is
+    /// running a session at all. That independence is the point: a cover adopted
+    /// from a crashed run has no guard anywhere in this process, and deriving
+    /// "engaged" from a live session reports it as absent.
+    ///
+    /// [`CoverState::Unknown`] means the probe could not answer; a caller must
+    /// not treat it as an open host.
+    fn lockdown_cover_state(&self) -> failclosed::CoverState;
+
+    /// Whether the TRANSIENT block-until-connected cover is holding the host
+    /// closed, as the OS sees it. Separate from
+    /// [`lockdown_cover_state`](Self::lockdown_cover_state) because only the
+    /// standing cover's keys are what a lockdown disengage verifies — but a
+    /// crash strands this one just as persistently, and a host it holds would
+    /// otherwise report as plain "Disconnected" with no action offered.
+    fn transient_cover_state(&self) -> failclosed::CoverState;
+
+    /// Sweep a transient cover this process does not own, FAIL-LOUD and verified
+    /// by re-probing. An absent cover is `Ok`.
+    fn sweep_transient(&self) -> Result<(), RoutingError>;
+
+    /// Disengage a standing lockdown cover, FAIL-LOUD. `Ok` means the OS confirms
+    /// OUR STANDING COVER is gone — the implementation re-probes rather than
+    /// trusting the return of whatever it called. It says nothing about a
+    /// transient cover, which has its own keys and its own
+    /// [`sweep_transient`](Self::sweep_transient); the host can still be blocked
+    /// by that one. An absent cover is `Ok`; an `Err` means the standing cover may
+    /// still be in force, so a caller must not record the kill switch as off.
+    fn disengage_lockdown(&self) -> Result<(), RoutingError>;
 }
 
 // System (production) routing =========================================================================================
@@ -536,6 +567,22 @@ impl Routing for SystemRouting {
     ) -> Result<Self::Cover, RoutingError> {
         let resolver = failclosed::SystemLuidResolver;
         failclosed::engage_lockdown(server_ip, tun_name, &resolver, app_ids, &self.state_dir, self.owner)
+    }
+
+    fn lockdown_cover_state(&self) -> failclosed::CoverState {
+        failclosed::lockdown_cover_state(&self.state_dir)
+    }
+
+    fn disengage_lockdown(&self) -> Result<(), RoutingError> {
+        failclosed::disengage_lockdown(&self.state_dir)
+    }
+
+    fn transient_cover_state(&self) -> failclosed::CoverState {
+        failclosed::transient_cover_state(&self.state_dir)
+    }
+
+    fn sweep_transient(&self) -> Result<(), RoutingError> {
+        failclosed::sweep_transient_verified(&self.state_dir)
     }
 }
 
