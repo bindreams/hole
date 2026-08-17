@@ -73,6 +73,21 @@ fn an_unreadable_marker_unmasks_failed() {
     );
 }
 
+#[skuld::test]
+fn an_indeterminate_marker_passes_through() {
+    // Nothing established that a marker is there, so there is no cutover to
+    // report — and a report would be permanent: the same io failure that
+    // defeated the read defeats `clear`, so no sweep could ever retract it.
+    use cosca::identity::Liveness::*;
+    for driver in [Alive, Dead, Unknown] {
+        assert_eq!(
+            super::cutover_decision(&Marker::Indeterminate, driver),
+            super::CutoverDecision::PassThrough,
+            "an undetermined presence is not a cutover claim"
+        );
+    }
+}
+
 // ProxyStateCell ======================================================================================================
 
 #[skuld::test]

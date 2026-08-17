@@ -98,6 +98,51 @@ fn sweep_old_binaries_removes_old_suffixed_and_spares_live() {
     sweep_old_binaries(dir.path()); // idempotent on a clean dir
 }
 
+/// A log dir whose marker path can be neither opened nor probed: `*` is not a
+/// legal Windows path character, so both calls fail ERROR_INVALID_NAME rather
+/// than ERROR_FILE_NOT_FOUND. No ACL surgery, so it is deterministic and not
+/// defeated by running as SYSTEM.
+fn unprobeable_log_dir(base: &Path) -> std::path::PathBuf {
+    base.join("in*valid")
+}
+
+#[skuld::test]
+fn sweep_recheck_admits_an_indeterminate_marker_path() {
+    // The re-check must fail CLOSED only on a marker it established EXISTS.
+    // An undetermined presence refuses every start forever: the sweep's own
+    // `clear` fails on the same path for the same reason, so nothing ends it.
+    let base = tempfile::tempdir().unwrap();
+    let dir = unprobeable_log_dir(base.path());
+    let reported = std::cell::Cell::new(false);
+    super::sweep_marker_then_ready_with(
+        || {}, // the real sweep cannot clear this path either
+        &dir,
+        || {
+            reported.set(true);
+            Ok(())
+        },
+    )
+    .expect("an undetermined marker presence must not fail the start");
+    assert!(
+        reported.get(),
+        "Running must be reported: no marker was ever established"
+    );
+}
+
+#[skuld::test]
+fn shutdown_reason_treats_an_indeterminate_marker_as_an_ordinary_stop() {
+    // Reporting Cutover here disarms the standing lockdown cover and leaves it
+    // armed with no bridge running to release it — a kill switch the user
+    // cannot turn off.
+    use crate::proxy_manager::StopReason;
+    let base = tempfile::tempdir().unwrap();
+    let dir = unprobeable_log_dir(base.path());
+    assert_eq!(
+        shutdown_reason(hole_common::update_marker::is_present(&dir)),
+        StopReason::UserStop
+    );
+}
+
 #[skuld::test]
 fn sweep_recheck_uses_presence_not_schema() {
     // The re-check exists to catch an external holder keeping the marker open.

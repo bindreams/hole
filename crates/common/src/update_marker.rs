@@ -9,7 +9,8 @@
 //!
 //! Only one reader needs the payload — the GUI resolving the driver's liveness.
 //! Every other reader asks [`is_present`], so a marker it cannot parse still
-//! counts as a cutover claim.
+//! counts as a cutover claim — but a read that could not establish whether a
+//! marker exists at all does not, since it carries no evidence of one.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -31,9 +32,15 @@ pub const MARKER_VERSION: u32 = 3;
 #[derive(Debug)]
 pub enum Marker {
     Absent,
-    /// Present, but its driver cannot be identified — an unreadable file, an
-    /// unparseable body, or a version this build does not know.
+    /// A marker EXISTS but its driver cannot be identified — a file that could
+    /// not be opened, an unparseable body, or a version this build does not
+    /// know. A cutover claim either way.
     Unreadable,
+    /// Whether a marker exists could not be established: the open failed and
+    /// the existence probe failed too. NOT a claim — a failed read is no
+    /// evidence a marker is there — so readers pass it through rather than
+    /// report a cutover, which they could never retract.
+    Indeterminate,
     Present(MarkerInfo),
 }
 
@@ -136,15 +143,14 @@ fn staged_marker(log_dir: &Path, info: &MarkerInfo, owner: Option<(u32, u32)>) -
 }
 
 /// Read the marker, distinguishing "no cutover was claimed" from "a cutover was
-/// claimed by a driver this build cannot identify".
+/// claimed by a driver this build cannot identify" from "whether one was claimed
+/// could not be established".
 pub fn read(log_dir: &Path) -> Marker {
-    let bytes = match std::fs::read(log_dir.join(MARKER_FILE)) {
+    let path = log_dir.join(MARKER_FILE);
+    let bytes = match std::fs::read(&path) {
         Ok(b) => b,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Marker::Absent,
-        Err(e) => {
-            tracing::warn!(error = %e, "update marker could not be read");
-            return Marker::Unreadable;
-        }
+        Err(e) => return unopened(&path, &e),
     };
     let info: MarkerInfo = match serde_json::from_slice(&bytes) {
         Ok(info) => info,
@@ -164,12 +170,36 @@ pub fn read(log_dir: &Path) -> Marker {
     Marker::Present(info)
 }
 
-/// Whether a cutover has been claimed, whatever shape the claim is in. Derived
-/// from [`read`] rather than a second `stat`, so a marker that exists but
-/// cannot be opened — a Windows sharing violation, the exact case the post-sweep
-/// re-check guards — counts as present.
+/// Classify a marker that could not be OPENED. Presence comes from an existence
+/// probe, never from the open's error: a failed open is not evidence a file is
+/// there. `symlink_metadata`, so a dangling symlink at the marker path still
+/// reads as a claim rather than as an absence.
+fn unopened(path: &Path, open_error: &io::Error) -> Marker {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => {
+            tracing::warn!(error = %open_error, "update marker exists but could not be read");
+            Marker::Unreadable
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Marker::Absent,
+        Err(e) => {
+            tracing::warn!(
+                open_error = %open_error,
+                probe_error = %e,
+                "whether an update marker exists could not be determined"
+            );
+            Marker::Indeterminate
+        }
+    }
+}
+
+/// Whether a cutover has been CLAIMED, whatever shape the claim is in. A marker
+/// that exists but cannot be opened — a Windows sharing violation, the exact
+/// case the post-sweep re-check guards — counts as present.
+/// [`Marker::Indeterminate`] does not: nothing established that a marker is
+/// there, and answering `true` would make the re-check refuse every start
+/// forever with no way for the sweep to end it.
 pub fn is_present(log_dir: &Path) -> bool {
-    !matches!(read(log_dir), Marker::Absent)
+    matches!(read(log_dir), Marker::Unreadable | Marker::Present(_))
 }
 
 /// Unconditionally remove the marker by known path. NOT parse-then-clear: a

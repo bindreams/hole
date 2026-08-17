@@ -65,6 +65,45 @@ fn is_present_is_true_for_an_unreadable_marker() {
     assert!(is_present(dir.path()));
 }
 
+/// A log dir whose marker path can be neither opened nor probed for existence.
+/// Chosen so the OS refuses to resolve the path at all — no permission surgery,
+/// so it is deterministic and not defeated by running as root.
+fn unprobeable_log_dir(base: &std::path::Path) -> std::path::PathBuf {
+    #[cfg(windows)]
+    {
+        // `*` is not a legal Windows path character: both calls fail
+        // ERROR_INVALID_NAME, never ERROR_FILE_NOT_FOUND.
+        base.join("in*valid")
+    }
+    #[cfg(not(windows))]
+    {
+        // A regular file standing in for the marker's parent dir: ENOTDIR.
+        let file = base.join("not-a-dir");
+        std::fs::write(&file, b"x").unwrap();
+        file
+    }
+}
+
+#[skuld::test]
+fn a_marker_path_that_cannot_be_probed_reads_as_indeterminate() {
+    let base = tempfile::tempdir().unwrap();
+    let dir = unprobeable_log_dir(base.path());
+    assert!(
+        matches!(read(&dir), Marker::Indeterminate),
+        "a failed read is not evidence a marker exists"
+    );
+}
+
+#[skuld::test]
+fn is_present_is_false_for_an_indeterminate_marker() {
+    // Answering `true` here is permanently unretractable: `clear` is an io call
+    // on the same path and fails under the same condition, so the claim would
+    // outlive every sweep.
+    let base = tempfile::tempdir().unwrap();
+    let dir = unprobeable_log_dir(base.path());
+    assert!(!is_present(&dir));
+}
+
 #[skuld::test]
 fn an_unknown_version_marker_reads_as_unreadable() {
     let dir = tempfile::tempdir().unwrap();
@@ -193,9 +232,7 @@ fn a_v2_marker_reads_as_unreadable() {
 
 #[skuld::test]
 fn stamp_driver_errs_when_the_marker_is_absent() {
-    // A stamp that warns and succeeds leaves the marker naming the INITIATOR,
-    // which the cutover then stops — so the GUI resolves that identity as dead
-    // and reports a failed update on a successful one.
+    // Pins [`stamp_driver`]'s contract: nothing but `Present` may be stamped.
     let dir = tempfile::tempdir().unwrap();
     let result = stamp_driver(dir.path(), &info(1).driver);
     assert!(

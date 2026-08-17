@@ -567,22 +567,27 @@ pub(crate) enum CutoverDecision {
 }
 
 /// Single source of truth for the cutover masking decision. No marker ⇒
-/// PassThrough regardless of liveness.
+/// PassThrough regardless of liveness, and so does an INDETERMINATE read: it is
+/// no evidence a cutover was ever claimed.
 ///
 /// An UNREADABLE marker unmasks. Masking it would be a state with no exit: the
 /// mask commits nothing for either a transport error or a reachable
 /// `running: false`, and the only things that end it are a bridge start
 /// sweeping the marker — which never happens in the wedge the marker exists to
-/// catch — and confirming a driver this build could not identify. It
-/// self-retracts, because `clear` is remove-by-path and version-agnostic, so
-/// the first bridge to bind ends the report with no user action.
+/// catch — and confirming a driver this build could not identify. The report
+/// self-retracts for `Unreadable` specifically, because that state means the
+/// existence probe SUCCEEDED — a reachable directory holding a file this build
+/// cannot open or parse — and `clear` is remove-by-path and version-agnostic,
+/// so the first bridge to bind removes it with no user action. `Indeterminate`
+/// gets no such exit: nothing could even probe the path, and `clear` is an io
+/// call on that same path, so a report raised from it would be permanent.
 pub(crate) fn cutover_decision(
     marker: &hole_common::update_marker::Marker,
     driver: cosca::identity::Liveness,
 ) -> CutoverDecision {
     use hole_common::update_marker::Marker;
     match (marker, driver) {
-        (Marker::Absent, _) => CutoverDecision::PassThrough,
+        (Marker::Absent | Marker::Indeterminate, _) => CutoverDecision::PassThrough,
         (Marker::Unreadable, _) => CutoverDecision::UnmaskFailed,
         (Marker::Present(_), cosca::identity::Liveness::Dead) => CutoverDecision::UnmaskFailed,
         (Marker::Present(_), _) => CutoverDecision::Mask,
