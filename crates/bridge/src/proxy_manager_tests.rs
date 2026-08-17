@@ -2105,11 +2105,18 @@ async fn lockdown_active_skips_the_probe_when_the_session_owns_a_cover() {
     pm.start(&test_config()).await.expect("start with lockdown on");
     state.cover_state_calls.store(0, Ordering::SeqCst);
 
+    state.transient_state_calls.store(0, Ordering::SeqCst);
+
     assert!(pm.lockdown_active(), "a session that owns the cover is active");
     assert_eq!(
         state.cover_state_calls.load(Ordering::SeqCst),
         0,
-        "the in-process guard already answers; no OS probe may run"
+        "the in-process guard already answers; no standing probe may run"
+    );
+    assert_eq!(
+        state.transient_state_calls.load(Ordering::SeqCst),
+        0,
+        "and a running session must not pay a transient probe on every status poll"
     );
 }
 
@@ -2289,32 +2296,6 @@ async fn lockdown_off_keeps_intent_on_when_the_transient_sweep_fails() {
         lockdown_state::load_enabled(dir.path()),
         "intent must stay ON while any cover is still holding the host"
     );
-}
-
-#[skuld::test]
-async fn lockdown_off_leaves_a_transient_cover_this_process_holds() {
-    // `self.blocked` IS that cover, `stop_with` owns it, and on macOS the standing
-    // restore reloads a whole ruleset — running it here would tear the live cover
-    // down and open the host.
-    let dir = tempfile::tempdir().unwrap();
-    let routing = MockRouting::new(dir.path().to_path_buf());
-    let state = routing.state();
-    *state.cover_state.lock().unwrap() = CoverState::Engaged;
-    let (mut pm, dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, false);
-    let mut cfg = test_config();
-    cfg.server.server = "127.0.0.1".into();
-    // A covered start that fails leaves the transient cover held in-process.
-    let _ = pm.start_cancellable(&cfg, true, CancellationToken::new()).await;
-    if pm.blocked_until_connected() {
-        pm.set_lockdown_intent(false).expect("persist only");
-        assert_eq!(
-            state.standing_disengage_calls.load(Ordering::SeqCst),
-            0,
-            "a cover this process owns is the stop path's to release"
-        );
-        assert_eq!(state.transient_sweep_calls.load(Ordering::SeqCst), 0);
-    }
-    let _ = dir;
 }
 
 #[skuld::test]
@@ -2755,6 +2736,58 @@ mod self_test {
         cfg.dns.enabled = true;
         cfg.dns.servers = vec!["127.0.0.1".parse().unwrap()];
         (pm, cfg, st, dir)
+    }
+
+    /// A cover THIS process holds must survive an off-intent: `stop_with` owns it,
+    /// and on macOS the standing release reloads a whole ruleset, so running it
+    /// here would tear a live cover down and open the host mid-block.
+    #[skuld::test]
+    fn lockdown_off_leaves_a_transient_cover_this_process_holds() {
+        rt().block_on(async {
+            let (mut pm, cfg, st, dir) = covered_gate_setup(false);
+            let _ = pm
+                .start_cancellable(&cfg, true, CancellationToken::new())
+                .await
+                .unwrap_err();
+            assert!(
+                pm.blocked_until_connected(),
+                "fixture precondition: the failed covered start must hold the cover"
+            );
+
+            pm.set_lockdown_intent(false).expect("persist only");
+            assert_eq!(
+                st.standing_disengage_calls.load(Ordering::SeqCst),
+                0,
+                "a cover this process owns is the stop path's to release"
+            );
+            assert_eq!(st.transient_sweep_calls.load(Ordering::SeqCst), 0);
+            assert!(
+                !lockdown_state::load_enabled(dir.path()),
+                "the intent still records off"
+            );
+        });
+    }
+
+    /// The held guard already answers for that cover, so the OS must not be asked
+    /// — a correctness guard and a per-poll cost guard both.
+    #[skuld::test]
+    fn cover_status_skips_the_transient_probe_while_this_process_owns_it() {
+        rt().block_on(async {
+            let (mut pm, cfg, st, _dir) = covered_gate_setup(false);
+            let _ = pm
+                .start_cancellable(&cfg, true, CancellationToken::new())
+                .await
+                .unwrap_err();
+            assert!(pm.blocked_until_connected(), "fixture precondition");
+            st.transient_state_calls.store(0, Ordering::SeqCst);
+
+            let _ = pm.cover_status();
+            assert_eq!(
+                st.transient_state_calls.load(Ordering::SeqCst),
+                0,
+                "the in-process guard answers; no OS probe may run"
+            );
+        });
     }
 
     #[skuld::test]

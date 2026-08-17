@@ -270,13 +270,43 @@ impl Drop for Cover {
 /// wipe the standing lockdown ruleset (which is the live main ruleset) before
 /// Adopt. Best-effort; logs on failure. Shared by `Drop` and `recover_cover`.
 fn disengage(token: &str, state_dir: &Path, adopting: bool) {
+    // `pfctl()` only `Err`s on a SPAWN failure: a non-zero exit — `/etc/pf.conf`
+    // missing or unparseable, and it is user-editable and other VPN clients
+    // rewrite it — comes back `Ok(output)`. Both count as "the restore did not
+    // happen", and the state file is this cover's only evidence: clearing it over
+    // a live ruleset makes the probe read `Absent`, after which every escape
+    // reports success and does nothing.
+    let mut restored = true;
     if adopting {
         tracing::info!("standing lockdown cover being adopted; skipping /etc/pf.conf reload during transient sweep");
-    } else if let Err(e) = pfctl(&["-f", PFCONF], None, PHASE_RECOVER_COVER) {
-        tracing::warn!(error = %e, "pf ruleset restore failed during cover disengage");
+    } else {
+        match pfctl(&["-f", PFCONF], None, PHASE_RECOVER_COVER) {
+            Ok(out) if out.status.success() => {}
+            Ok(out) => {
+                restored = false;
+                tracing::warn!(status = ?out.status, stderr = %String::from_utf8_lossy(&out.stderr).trim(),
+                               "pf ruleset restore exited non-zero during cover disengage");
+            }
+            Err(e) => {
+                restored = false;
+                tracing::warn!(error = %e, "pf ruleset restore failed during cover disengage");
+            }
+        }
     }
-    if let Err(e) = pfctl(&["-X", token], None, PHASE_RECOVER_COVER) {
-        tracing::warn!(error = %e, "pfctl -X failed during cover disengage");
+    match pfctl(&["-X", token], None, PHASE_RECOVER_COVER) {
+        Ok(out) if out.status.success() => {}
+        Ok(out) => {
+            restored = false;
+            tracing::warn!(status = ?out.status, "pfctl -X exited non-zero during cover disengage");
+        }
+        Err(e) => {
+            restored = false;
+            tracing::warn!(error = %e, "pfctl -X failed during cover disengage");
+        }
+    }
+    if !restored {
+        tracing::warn!("keeping failclosed-state: the cover may still be in force and must stay discoverable");
+        return;
     }
     if let Err(e) = state::clear(state_dir) {
         tracing::warn!(error = %e, "failclosed-state clear failed during cover disengage");
@@ -285,8 +315,18 @@ fn disengage(token: &str, state_dir: &Path, adopting: bool) {
 
 /// The transient ruleset's fail-closed base, distinct from
 /// [`LOCKDOWN_BLOCK_RULE`]. Named once so [`build_pf_ruleset`] and the probe
-/// cannot drift apart.
-pub const TRANSIENT_BLOCK_RULE: &str = "block out all";
+/// cannot drift apart — and spelled the way `pfctl -sr` PRINTS it, not the way a
+/// ruleset may be written.
+///
+/// `pfctl` reprints parsed rules, emitting the policy word for a `PF_DROP` rule,
+/// so a rule written `block out all` reads back as `block drop out all`; an exact
+/// match on the written form could never hit and the probe would report `Absent`
+/// over a live cover. [`LOCKDOWN_BLOCK_RULE`] is already in printed form for the
+/// same reason, and the transient cover's own privileged test matches loosely
+/// precisely because the written form does not round-trip. Under
+/// `set block-policy drop` both spellings are the same rule, so emitting the
+/// printed form changes nothing but makes source and output agree.
+pub const TRANSIENT_BLOCK_RULE: &str = "block drop out all";
 
 /// Whether the TRANSIENT cover is holding the host closed. Same shape as
 /// [`lockdown_cover_state`]: no state file short-circuits to `Absent` with no

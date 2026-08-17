@@ -435,6 +435,31 @@ fn macos_engaged_state_is_reachable_by_the_disengage_verifier() {
 }
 
 #[skuld::test]
+fn macos_transient_ruleset_carries_the_probed_block_rule() {
+    // The probe greps `pfctl -sr` output for TRANSIENT_BLOCK_RULE, so the constant
+    // has to be spelled the way pfctl PRINTS a rule, not the way one may be
+    // written: pfctl reprints parsed rules and emits the policy word for a
+    // PF_DROP rule, so `block out all` reads back as `block drop out all`. Under
+    // `set block-policy drop` they are the same rule, so emitting the printed
+    // form costs nothing and makes the two agree. Live proof is
+    // `lockdown_lockout_macos_transient_cover_state_tracks_engage_and_disengage`.
+    // Expected value derived from pfctl's own behaviour, not from our constant:
+    // `pfctl -sr` output is re-parseable by design — `build_lockdown_restore_ruleset`
+    // feeds a captured `-sr` snapshot straight back through `pfctl -f -` — so the
+    // printed form is both what a probe reads and what a ruleset may contain.
+    const PRINTED: &str = "block drop out all";
+    assert_eq!(
+        TRANSIENT_BLOCK_RULE, PRINTED,
+        "the probe greps pfctl output, so the constant must be pfctl's printed form"
+    );
+    let ruleset = build_pf_ruleset("203.0.113.7".parse().unwrap(), None);
+    assert!(
+        ruleset.contains(PRINTED),
+        "the emitted ruleset must already be in the form it reads back as:\n{ruleset}"
+    );
+}
+
+#[skuld::test]
 fn macos_lockdown_ruleset_carries_the_probed_block_rule() {
     // The probe greps the live ruleset for LOCKDOWN_BLOCK_RULE. If the builder
     // stopped emitting it, the probe would report Absent over a blocked host —

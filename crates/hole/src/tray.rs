@@ -264,16 +264,20 @@ const ID_RELEASE_LOCKDOWN: &str = "release_lockdown";
 /// must point at the release, while a live session's own cover is simply a
 /// setting that has not taken effect yet.
 fn lockdown_menu_label(f: &LockdownFlags) -> String {
+    // The off-intent arms key on `held_closed`, the SAME flag
+    // `lockdown_click_intent` keys on. Matching one of them on `active` (the
+    // standing cover alone) would leave a transient-only cover rendering as a
+    // plain "Lockdown" checkbox whose click then disarms — two functions
+    // disagreeing about what "a cover is holding you" means.
     match (f.enabled, f.active, f.held_closed) {
         (true, true, _) => "Lockdown: On".into(),
         (true, false, _) => "Lockdown: On (warning: not engaged)".into(),
-        // Two very different states behind one pair: a cover nothing owns is a
-        // lockout and must name the way out, while a live session's own cover is
-        // just a setting waiting for the next reconnect.
-        (false, true, true) if f.unknown => "Lockdown: Off (cannot confirm — use Unblock Network)".into(),
-        (false, true, true) => "Lockdown: Off (still blocking — use Unblock Network)".into(),
+        // A cover nothing owns is a lockout and must name the way out; a live
+        // session's own cover is just a setting waiting for the next reconnect.
+        (false, _, true) if f.unknown => "Lockdown: Off (cannot confirm — use Unblock Network)".into(),
+        (false, _, true) => "Lockdown: Off (still blocking — use Unblock Network)".into(),
         (false, true, false) => "Lockdown: Off (applies on reconnect)".into(),
-        (false, false, _) => "Lockdown".into(),
+        (false, false, false) => "Lockdown".into(),
     }
 }
 
@@ -303,6 +307,14 @@ fn lockdown_click_intent(f: &LockdownFlags) -> bool {
 
 /// Failure text for a release that did not open the host, naming the escape that
 /// works with no bridge and no GUI. An escape nobody can discover is not one.
+fn release_blocked_by_owned_cover_message() -> &'static str {
+    concat!(
+        "Hole is still blocking your network.\n\n",
+        "A connection attempt left the block in place, and the kill switch setting ",
+        "does not clear that one. Use \"Go Offline (unblock)\" to restore your network."
+    )
+}
+
 fn release_failed_message() -> &'static str {
     if cfg!(target_os = "windows") {
         concat!(
@@ -1006,7 +1018,8 @@ async fn send_lockdown_intent(app: AppHandle, enabled: bool) {
     let _ = state.bridge_send(BridgeRequest::Status).await; // commits new snapshot
     rebuild_tray_menu(&app);
 
-    let still_held = app.state::<AppState>().proxy_snapshot().held_closed;
+    let snap = app.state::<AppState>().proxy_snapshot();
+    let still_held = snap.held_closed || snap.blocked_until_connected;
     let failed = match outcome {
         Ok(BridgeResponse::Ack) if !enabled && still_held => {
             // The bridge records the intent when it could not confirm a cover
@@ -1026,7 +1039,15 @@ async fn send_lockdown_intent(app: AppHandle, enabled: bool) {
     if enabled {
         return; // Arming the switch failing is not a lockout; the label already shows it.
     }
-    let message = release_failed_message();
+    // The standing release deliberately leaves a cover this process still holds
+    // to the stop path, so pointing at `hole bridge unlock` here would send the
+    // user at the wrong remedy — and on macOS running it would delete the state
+    // file out from under the live guard.
+    let message = if snap.blocked_until_connected {
+        release_blocked_by_owned_cover_message()
+    } else {
+        release_failed_message()
+    };
     // spawn_blocking: blocking_show must not run on the main thread and would
     // park a core async worker if spawned.
     tauri::async_runtime::spawn_blocking(move || {

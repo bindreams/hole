@@ -280,9 +280,10 @@ async fn handle_status<P: Proxy + 'static, R: Routing + 'static>(
 ) -> Json<StatusResponse> {
     let mut pm = state.proxy.lock().await;
     pm.check_health();
-    // One probe, so both flags describe the same instant: the firewall is not
-    // under this lock, and a concurrent `hole bridge unlock` between two reads
-    // would yield a pair no real state produces.
+    // One call, so every cover flag in a reply comes from the same pass: each
+    // cover is probed at most once and the flags are derived together. The
+    // firewall is not under this lock, so reading them independently would let a
+    // concurrent `hole bridge unlock` produce a pair no real state produces.
     let cover = pm.cover_status();
     Json(StatusResponse {
         running: pm.state() == ProxyState::Running,

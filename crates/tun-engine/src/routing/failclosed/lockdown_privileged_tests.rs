@@ -577,6 +577,62 @@ fn lockdown_lockout_macos_cover_state_tracks_engage_and_disengage() {
     );
 }
 
+/// The TRANSIENT probe against the real pf, mirroring its standing-cover twin.
+///
+/// This is the only place that can prove `TRANSIENT_BLOCK_RULE` is spelled the
+/// way `pfctl -sr` prints it: a constant in written form parses fine, loads fine
+/// and reads back differently, so the probe silently reports `Absent` over a live
+/// cover — the fail-open this test exists to catch. Nothing off-host can observe
+/// it.
+#[cfg(target_os = "macos")]
+#[skuld::test(labels = [TUN], serial = TUN)]
+fn lockdown_lockout_macos_transient_cover_state_tracks_engage_and_disengage() {
+    let dir = tempfile::tempdir().unwrap();
+    let server_ip: std::net::IpAddr = "1.1.1.1".parse().unwrap();
+
+    assert_eq!(
+        transient_cover_state(dir.path()),
+        CoverState::Absent,
+        "a host with no transient cover engaged must probe Absent"
+    );
+
+    let cover = engage(server_ip, None, dir.path(), None).expect("engage the real pf transient cover");
+    assert_eq!(
+        transient_cover_state(dir.path()),
+        CoverState::Engaged,
+        "a live transient cover must probe Engaged — a written-form constant reads Absent here"
+    );
+
+    drop(cover);
+    assert_eq!(
+        transient_cover_state(dir.path()),
+        CoverState::Absent,
+        "a disengaged transient cover must probe Absent again"
+    );
+}
+
+/// The transient sweep's `Ok` must mean the cover is gone, on the real pf. With a
+/// probe that can never match, this passes vacuously — which is why it engages a
+/// real cover first rather than sweeping a clean host.
+#[cfg(target_os = "macos")]
+#[skuld::test(labels = [TUN], serial = TUN)]
+fn lockdown_lockout_macos_transient_sweep_verifies_the_cover_is_gone() {
+    let dir = tempfile::tempdir().unwrap();
+    let server_ip: std::net::IpAddr = "1.1.1.1".parse().unwrap();
+
+    let cover = engage(server_ip, None, dir.path(), None).expect("engage the real pf transient cover");
+    // The unclean exit: forget the guard so its Drop never runs.
+    crate::routing::CoverGuard::disarm(cover);
+    assert_eq!(transient_cover_state(dir.path()), CoverState::Engaged);
+
+    sweep_transient_verified(dir.path()).expect("sweep a real transient cover");
+    assert_eq!(
+        transient_cover_state(dir.path()),
+        CoverState::Absent,
+        "the sweep reported Ok, so the probe must confirm the cover is gone"
+    );
+}
+
 /// `disengage_lockdown`'s Ok must mean the host is open. Drives the real
 /// primitive on a real cover and cross-checks the claim against the probe —
 /// previously the Windows implementation discarded every delete result, so its

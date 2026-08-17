@@ -188,6 +188,17 @@ impl CoverState {
     pub fn is_present(self) -> bool {
         !matches!(self, CoverState::Absent)
     }
+
+    /// The stronger of two observations: `Engaged` beats `Unknown` beats
+    /// `Absent`. Lets a caller combine per-cover probes without restating the
+    /// lattice — a second copy would be free to disagree with this one.
+    pub fn strongest(self, other: CoverState) -> CoverState {
+        match (self, other) {
+            (CoverState::Engaged, _) | (_, CoverState::Engaged) => CoverState::Engaged,
+            (CoverState::Unknown, _) | (_, CoverState::Unknown) => CoverState::Unknown,
+            _ => CoverState::Absent,
+        }
+    }
 }
 
 /// Gate a disengage on a post-disengage probe. `Ok` means the OS confirms the
@@ -223,16 +234,6 @@ pub fn lockdown_cover_state(state_dir: &Path) -> CoverState {
 /// standing probe exists to end, one key set over.
 pub fn transient_cover_state(state_dir: &Path) -> CoverState {
     platform::transient_cover_state(state_dir)
-}
-
-/// The strongest claim about whether HOLE is holding the host closed, from either
-/// cover. `Engaged` if either is; otherwise `Unknown` if either is; else `Absent`.
-pub fn any_cover_state(state_dir: &Path) -> CoverState {
-    match (lockdown_cover_state(state_dir), transient_cover_state(state_dir)) {
-        (CoverState::Engaged, _) | (_, CoverState::Engaged) => CoverState::Engaged,
-        (CoverState::Unknown, _) | (_, CoverState::Unknown) => CoverState::Unknown,
-        _ => CoverState::Absent,
-    }
 }
 
 /// Whether a standing lockdown cover from a prior run is present — the recovery

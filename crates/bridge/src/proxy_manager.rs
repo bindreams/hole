@@ -508,24 +508,21 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         } else {
             self.routing.lockdown_cover_state()
         };
-        // A held `blocked` guard IS the transient cover, and it has its own
-        // surface (`blocked_until_connected`), so probing would only duplicate it.
-        let transient = if self.blocked.is_some() {
+        // Skipped whenever something in this process already answers for that
+        // cover: a held `blocked` guard IS the transient cover and has its own
+        // surface (`blocked_until_connected`), and a running session's own start
+        // path owns the transient cover's lifetime, so a stranded one is not
+        // reachable there. Both are cost guards as much as correctness ones — this
+        // runs on every status poll while the proxy mutex is held.
+        let transient = if self.blocked.is_some() || self.running.is_some() {
             CoverState::Absent
         } else {
             self.routing.transient_cover_state()
         };
 
         // The strongest evidence from either cover that nothing in this process
-        // owns. `Engaged` beats `Unknown` beats `Absent`.
-        let unowned = [if session_owns { CoverState::Absent } else { standing }, transient];
-        let evidence = if unowned.contains(&CoverState::Engaged) {
-            CoverState::Engaged
-        } else if unowned.contains(&CoverState::Unknown) {
-            CoverState::Unknown
-        } else {
-            CoverState::Absent
-        };
+        // owns.
+        let evidence = if session_owns { CoverState::Absent } else { standing }.strongest(transient);
 
         CoverStatus {
             lockdown_active: session_owns || standing.is_present(),
