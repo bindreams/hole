@@ -32,14 +32,15 @@ pub const MARKER_VERSION: u32 = 3;
 #[derive(Debug)]
 pub enum Marker {
     Absent,
-    /// A marker EXISTS but its driver cannot be identified — a file that could
-    /// not be opened, an unparseable body, or a version this build does not
-    /// know. A cutover claim either way.
+    /// A marker file EXISTS but its driver cannot be identified — a regular file
+    /// that could not be opened, an unparseable body, or a version this build
+    /// does not know. A cutover claim either way.
     Unreadable,
-    /// Whether a marker exists could not be established: the open failed and
-    /// the existence probe failed too. NOT a claim — a failed read is no
-    /// evidence a marker is there — so readers pass it through rather than
-    /// report a cutover, which they could never retract.
+    /// Whether a marker exists could not be established: the existence probe
+    /// failed, or it found something that is not a regular file. NOT a claim —
+    /// neither a failed read nor a directory is evidence a marker is there — so
+    /// readers pass it through rather than report a cutover they could never
+    /// retract.
     Indeterminate,
     Present(MarkerInfo),
 }
@@ -172,13 +173,25 @@ pub fn read(log_dir: &Path) -> Marker {
 
 /// Classify a marker that could not be OPENED. Presence comes from an existence
 /// probe, never from the open's error: a failed open is not evidence a file is
-/// there. `symlink_metadata`, so a dangling symlink at the marker path still
-/// reads as a claim rather than as an absence.
+/// there. A claim requires a regular FILE — anything else at that path is not a
+/// marker and asserts nothing about a cutover. `symlink_metadata`, so a dangling
+/// symlink reads as that anomaly rather than as a definitive absence.
 fn unopened(path: &Path, open_error: &io::Error) -> Marker {
     match std::fs::symlink_metadata(path) {
-        Ok(_) => {
+        Ok(meta) if meta.file_type().is_file() => {
             tracing::warn!(error = %open_error, "update marker exists but could not be read");
             Marker::Unreadable
+        }
+        // `error!`, not `warn!`: unlike a failed probe this is not an environmental
+        // io failure, it is a path nothing in hole can produce.
+        Ok(meta) => {
+            tracing::error!(
+                file_type = ?meta.file_type(),
+                open_error = %open_error,
+                "the update marker path holds something that is not a regular file; \
+                 it claims no cutover"
+            );
+            Marker::Indeterminate
         }
         Err(e) if e.kind() == io::ErrorKind::NotFound => Marker::Absent,
         Err(e) => {
@@ -193,8 +206,8 @@ fn unopened(path: &Path, open_error: &io::Error) -> Marker {
 }
 
 /// Whether a cutover has been CLAIMED, whatever shape the claim is in. A marker
-/// that exists but cannot be opened — a Windows sharing violation, the exact
-/// case the post-sweep re-check guards — counts as present.
+/// file that exists but cannot be opened — a Windows sharing violation, the
+/// exact case the post-sweep re-check guards — counts as present.
 /// [`Marker::Indeterminate`] does not: nothing established that a marker is
 /// there, and answering `true` would make the re-check refuse every start
 /// forever with no way for the sweep to end it.

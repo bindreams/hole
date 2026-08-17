@@ -65,6 +65,42 @@ fn is_present_is_true_for_an_unreadable_marker() {
     assert!(is_present(dir.path()));
 }
 
+#[cfg(windows)]
+#[skuld::test]
+fn a_marker_held_open_against_readers_reads_as_unreadable() {
+    // The case the post-sweep refusal exists for: a holder keeps the marker open
+    // denying read, so the open fails while the file is plainly there. Windows-only
+    // — the unix equivalent is a permission denial, which root defeats.
+    use std::os::windows::fs::OpenOptionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    write(dir.path(), &info(7), None).unwrap();
+    let _held = std::fs::OpenOptions::new()
+        .read(true)
+        // Deny every other opener, this process included.
+        .share_mode(0)
+        .open(dir.path().join(MARKER_FILE))
+        .unwrap();
+    assert!(
+        matches!(read(dir.path()), Marker::Unreadable),
+        "a regular file that exists but cannot be opened is still a claim"
+    );
+    assert!(is_present(dir.path()));
+}
+
+#[skuld::test]
+fn a_directory_at_the_marker_path_reads_as_indeterminate() {
+    // A directory is not a marker: it claims no cutover, so reporting one asserts
+    // something never observed — and permanently, since `clear`'s remove_file fails
+    // on a directory every time, leaving no sweep able to retract it.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join(MARKER_FILE)).unwrap();
+    assert!(
+        matches!(read(dir.path()), Marker::Indeterminate),
+        "a non-file at the marker path is not a cutover claim"
+    );
+    assert!(!is_present(dir.path()));
+}
+
 /// A log dir whose marker path can be neither opened nor probed for existence.
 /// Chosen so the OS refuses to resolve the path at all — no permission surgery,
 /// so it is deterministic and not defeated by running as root.

@@ -577,11 +577,12 @@ pub(crate) enum CutoverDecision {
 /// catch — and confirming a driver this build could not identify.
 ///
 /// `Unreadable` leaves the retraction path OPEN, which is why it may report: the
-/// existence probe succeeded, so `clear` — remove-by-path and version-agnostic —
-/// addresses a reachable path, and the next bridge start ends the report with no
-/// user action. `Indeterminate` closes that path: nothing could even probe it,
-/// and `clear` is an io call on the same path that fails for the same reason, so
-/// a report raised here would be permanent. Hence PassThrough.
+/// probe found a regular FILE, so `clear` — remove-by-path and version-agnostic —
+/// addresses a reachable target, and the next bridge start ends the report with
+/// no user action. `Indeterminate` closes that path: the probe either failed
+/// outright or found a non-file, and `clear`'s remove_file fails on both for the
+/// same reason every time, so a report raised here would be permanent. Hence
+/// PassThrough.
 pub(crate) fn cutover_decision(
     marker: &hole_common::update_marker::Marker,
     driver: cosca::identity::Liveness,
