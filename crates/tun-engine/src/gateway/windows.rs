@@ -61,7 +61,7 @@ pub(crate) fn map_query_error(code: u32) -> Option<GatewayError> {
 /// Does **not** judge the next hop — an on-link answer is legitimate for a caller
 /// asking about a specific destination. Classification is
 /// [`super::classify_hop`]'s job.
-pub(crate) fn best_route(dest: IpAddr) -> Result<Option<RouteHop>, GatewayError> {
+pub fn best_route(dest: IpAddr) -> Result<Option<RouteHop>, GatewayError> {
     let dest_sa = to_sockaddr_inet(dest);
     let mut row = MIB_IPFORWARD_ROW2::default();
     let mut best_source = SOCKADDR_INET::default();
@@ -158,3 +158,7 @@ fn from_sockaddr_inet(sa: &SOCKADDR_INET) -> IpAddr {
 #[cfg(test)]
 #[path = "windows_tests.rs"]
 mod windows_tests;
+
+#[cfg(test)]
+#[path = "nextest_group_tests.rs"]
+mod nextest_group_tests;

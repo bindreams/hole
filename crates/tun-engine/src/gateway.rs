@@ -15,6 +15,12 @@ mod platform;
 
 pub use error::{GatewayError, HopDetail};
 
+/// The raw upstream-route lookup. Public so the privileged integration test can
+/// drive it against a real wintun adapter, which is the only proof that this
+/// path does not have `default-net`'s interface-type blind spot.
+#[cfg(target_os = "windows")]
+pub use platform::best_route;
+
 use std::net::IpAddr;
 
 use tracing::warn;
@@ -43,7 +49,7 @@ pub struct GatewayInfo {
 /// Lives here rather than in the platform module so [`classify_hop`] has one
 /// body for every platform.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct RouteHop {
+pub struct RouteHop {
     /// Next hop the route names. Unspecified (`0.0.0.0` / `::`) means the route
     /// is **on-link** — there is no gateway address to point a bypass route at.
     pub next_hop: IpAddr,
