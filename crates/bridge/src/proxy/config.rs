@@ -28,8 +28,13 @@ pub enum ProxyError {
     InvalidPluginName(String),
     #[error("proxy runtime error: {0}")]
     Runtime(#[from] std::io::Error),
-    #[error("gateway detection failed: {0}")]
-    Gateway(String),
+    /// Upstream-route detection failed. Transparent: the wrapped
+    /// [`tun_engine::GatewayError`] already Displays as the finished, PII-free
+    /// user sentence and carries the adapter in `Debug` for `bridge.log`. Typed
+    /// rather than stringly so that guarantee is compiler-checked — a `String`
+    /// payload would let any future producer put arbitrary text in a toast.
+    #[error(transparent)]
+    Gateway(tun_engine::GatewayError),
     /// Private DoH bootstrap could not resolve the proxy server's hostname and
     /// `dns.allow_insecure_bootstrap` is off. PII-free `Display` (the wrapped
     /// error names neither host nor path) so it is safe to surface verbatim to

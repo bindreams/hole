@@ -16,7 +16,7 @@ use std::time::Duration;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
-use tun_engine::gateway::GatewayInfo;
+use tun_engine::gateway::{GatewayError, GatewayInfo, HopDetail};
 use tun_engine::routing::failclosed::lockdown_state;
 use tun_engine::routing::{self, state as route_state, Routing};
 use tun_engine::RoutingError;
@@ -248,7 +248,22 @@ impl MockRouting {
         m.state.fail_gateway.store(true, Ordering::SeqCst);
         m
     }
+}
 
+/// The gateway failure the mock raises: a REAL `GatewayError`, not a stand-in
+/// string, so the tests below assert against production copy and production
+/// `Debug` rather than against a fixture that could drift from either.
+fn mock_gateway_error() -> GatewayError {
+    GatewayError::NoUsableGateway {
+        detail: HopDetail {
+            interface_alias: "MockVpnTun".into(),
+            interface_index: 99,
+            next_hop: std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+        },
+    }
+}
+
+impl MockRouting {
     fn failing_lockdown(state_dir: PathBuf) -> Self {
         let m = Self::new(state_dir);
         m.state.fail_lockdown.store(true, Ordering::SeqCst);
@@ -301,7 +316,7 @@ impl Routing for MockRouting {
 
     fn default_gateway(&self) -> Result<GatewayInfo, RoutingError> {
         if self.state.fail_gateway.load(Ordering::SeqCst) {
-            return Err(RoutingError::Gateway("mock gateway failure".into()));
+            return Err(RoutingError::Gateway(mock_gateway_error()));
         }
         Ok(GatewayInfo {
             gateway_ip: self.gateway,
@@ -1266,7 +1281,57 @@ fn gateway_failure_sets_last_error() {
         assert!(matches!(err, ProxyError::Gateway(_)));
         assert_eq!(pm.state(), ProxyState::Stopped);
         assert!(pm.last_error().is_some(), "default_gateway failure must set last_error");
-        assert!(pm.last_error().unwrap().contains("mock gateway failure"));
+        assert_eq!(pm.last_error().unwrap(), mock_gateway_error().to_string());
+    });
+}
+
+/// The refusal a user reads. `MockRouting::failing_gateway` returns the real
+/// `GatewayError`, so this pins the whole chain — `RoutingError::Gateway` ->
+/// `ProxyError::Gateway` -> `StartError::Failed` — against re-acquiring a
+/// library-shaped prefix. `tray.rs` still wraps this as `Bridge error: {message}`;
+/// what must not come back is a SECOND prefix inside it.
+#[skuld::test]
+fn gateway_failure_message_reaches_start_error_verbatim() {
+    rt().block_on(async {
+        let proxy = MockProxy::new();
+        let dir = tempfile::tempdir().unwrap();
+        let routing = MockRouting::failing_gateway(dir.path().to_path_buf());
+        let (mut pm, _dir) = new_manager_with_routing(proxy, routing, dir);
+
+        let err = pm.start(&test_config()).await.unwrap_err();
+        let start_error = hole_common::protocol::StartError::from(&err);
+        let hole_common::protocol::StartError::Failed { message } = start_error else {
+            panic!("gateway failure must classify as StartError::Failed, got {start_error:?}");
+        };
+        assert_eq!(message, mock_gateway_error().to_string());
+        assert!(
+            !message.contains("gateway detection failed"),
+            "the sentence re-acquired a library prefix: {message}"
+        );
+    });
+}
+
+/// The copy tells the user to look the adapter up in `bridge.log`. That is only
+/// true if the detail survives the `tun-engine` -> `bridge` boundary, which a
+/// `String` payload would destroy at `SystemRouting::default_gateway`.
+#[skuld::test]
+fn gateway_failure_detail_survives_to_the_bridge() {
+    rt().block_on(async {
+        let proxy = MockProxy::new();
+        let dir = tempfile::tempdir().unwrap();
+        let routing = MockRouting::failing_gateway(dir.path().to_path_buf());
+        let (mut pm, _dir) = new_manager_with_routing(proxy, routing, dir);
+
+        let err = pm.start(&test_config()).await.unwrap_err();
+        let logged = format!("{err:?}");
+        assert!(
+            logged.contains("MockVpnTun"),
+            "the adapter must reach the bridge for `warn!(error = ?e)` to log it: {logged}"
+        );
+        assert!(
+            !err.to_string().contains("MockVpnTun"),
+            "...and must NOT reach the toast: {err}"
+        );
     });
 }
 

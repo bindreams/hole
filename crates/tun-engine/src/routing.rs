@@ -517,7 +517,7 @@ impl Routing for SystemRouting {
     }
 
     fn default_gateway(&self) -> Result<GatewayInfo, RoutingError> {
-        get_default_gateway_info().map_err(|e| RoutingError::Gateway(e.to_string()))
+        get_default_gateway_info().map_err(RoutingError::Gateway)
     }
 
     fn install_failclosed_cover(
