@@ -139,6 +139,10 @@ pub enum BridgeResponse {
         ipv6_bypass_available: bool,
         lockdown_enabled: bool,
         lockdown_active: bool,
+        /// Whether a lockdown cover is engaged that no running session owns — Hole
+        /// is holding the network closed with nothing carrying traffic through it.
+        /// Drives the tray's held-closed state and its release action.
+        held_closed: bool,
         /// Whether a covered start failed and left the host fail-closed (blocked,
         /// not leaked) while not running. Drives the GUI's distinct blocked state
         /// (Retry / Disconnect).

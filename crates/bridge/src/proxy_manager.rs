@@ -449,10 +449,41 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         self.ipv6_bypass_available
     }
 
-    /// Whether a standing lockdown cover is currently engaged (the `active`
-    /// signal). Distinct from the persisted intent (`enabled`).
+    /// Whether the running session owns a standing lockdown cover — the cheap,
+    /// in-process half of [`lockdown_active`](Self::lockdown_active), and the
+    /// thing that distinguishes "protected and carrying traffic" from
+    /// "blocked with nothing running".
+    fn session_owns_cover(&self) -> bool {
+        self.running.as_ref().is_some_and(|r| r.lockdown.is_some())
+    }
+
+    /// Whether a standing lockdown cover is engaged (the `active` signal).
+    /// Distinct from the persisted intent (`enabled`).
+    ///
+    /// The OS is the authority; the session guard is only a short-circuit that
+    /// skips the probe when we already hold the answer. Deriving this from the
+    /// running session alone is bindreams/hole#825: a cover adopted from a
+    /// crashed run has no guard in this process, so it read `false` while it was
+    /// blocking every packet.
+    ///
+    /// A probe that cannot answer ([`CoverState::Unknown`]) counts as active —
+    /// the escape affordance keys on this field, and hiding it over an
+    /// unanswerable probe is the same lockout by another route.
     pub fn lockdown_active(&self) -> bool {
-        self.running.as_ref().map(|r| r.lockdown.is_some()).unwrap_or(false)
+        self.session_owns_cover() || self.routing.lockdown_cover_state().is_engaged_or_unknown()
+    }
+
+    /// Whether a lockdown cover is engaged that NO running session owns — the
+    /// host is being held closed with nothing carrying the user's traffic
+    /// through it. The state the tray must surface with a way out.
+    ///
+    /// Deliberately not `lockdown_active && !running`. Intent OFF plus a
+    /// leftover cover whose startup `Sweep` failed, then a connect: `start_inner`
+    /// skips `install_lockdown` because the intent is off, so `running` is true
+    /// while the stale block-all and its dead TUN permit kill every packet. An
+    /// `!running` test would render that as an ordinary connected session.
+    pub fn held_closed(&self) -> bool {
+        !self.session_owns_cover() && self.routing.lockdown_cover_state().is_engaged_or_unknown()
     }
 
     /// Whether a covered start failed and left the host fail-closed (blocked, not
@@ -480,14 +511,52 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
     /// cannot honor a kill switch it cannot persist (a silent `Ok(())` would be
     /// a fail-open footgun — the GUI would believe lockdown is armed when
     /// nothing was written).
+    ///
+    /// Turning it OFF also RELEASES a cover no live session owns, rather than
+    /// leaving it for the next `recover_routes` — the user's one obvious remedy
+    /// used to do nothing at all (bindreams/hole#825). Ordering is
+    /// `cutover::unlock_with`'s: disengage FIRST, persist `false` only on a
+    /// confirmed success, so the setting can never read "off" over a blocked
+    /// host.
+    ///
+    /// A cover a live session DOES own is left alone: settings apply on
+    /// reconnect, and `stop_with` already disengages it. A lockout is not a
+    /// setting, which is why the unowned case is released immediately.
+    ///
+    /// The release is skipped entirely when the probe confirms `Absent`. Doing
+    /// it unconditionally would make disarming the switch on a clean host fail
+    /// whenever the firewall is unreachable — a fresh way to strand the user in
+    /// the state this exists to prevent.
     pub fn set_lockdown_intent(&self, enabled: bool) -> Result<(), ProxyError> {
         let dir = self.state_dir.as_deref().ok_or_else(|| {
             ProxyError::Runtime(std::io::Error::other(
                 "cannot set lockdown intent: bridge has no state_dir to persist it",
             ))
         })?;
+        if !enabled {
+            self.release_unowned_cover()?;
+        }
         lockdown_state::set_enabled(dir, enabled, self.state_owner)
             .map_err(|e| ProxyError::Runtime(std::io::Error::other(format!("lockdown persist: {e}"))))
+    }
+
+    /// Disengage a standing cover no live session owns. A no-op when the probe
+    /// confirms none is engaged, or when the running session owns it.
+    ///
+    /// Cannot clobber a transient block-until-connected cover: that one is only
+    /// ever engaged on a lockdown-OFF covered start, where no lockdown state
+    /// exists — and both platform disengages key on lockdown state alone (macOS
+    /// returns early with no `pfctl` when `bridge-lockdown-pf.json` is absent;
+    /// Windows deletes lockdown GUIDs, which are disjoint from the transient set).
+    fn release_unowned_cover(&self) -> Result<(), ProxyError> {
+        if self.session_owns_cover() {
+            return Ok(());
+        }
+        if self.routing.lockdown_cover_state() == tun_engine::routing::failclosed::CoverState::Absent {
+            return Ok(());
+        }
+        info!("lockdown intent off: releasing the standing cover no session owns");
+        self.routing.disengage_lockdown().map_err(ProxyError::from)
     }
 
     /// Non-cancellable convenience wrapper around

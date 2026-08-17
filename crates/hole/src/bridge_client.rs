@@ -131,6 +131,7 @@ impl BridgeClient {
                         ipv6_bypass_available: status.ipv6_bypass_available,
                         lockdown_enabled: status.lockdown_enabled,
                         lockdown_active: status.lockdown_active,
+                        held_closed: status.held_closed,
                         blocked_until_connected: status.blocked_until_connected,
                     })
                 } else {

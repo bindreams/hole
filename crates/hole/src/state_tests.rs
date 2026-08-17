@@ -41,6 +41,7 @@ fn cell_bumps_seq_only_on_change() {
             error: None,
             lockdown_enabled: false,
             lockdown_active: false,
+            held_closed: false,
             blocked_until_connected: false
         }
     );
@@ -55,6 +56,7 @@ fn cell_bumps_seq_only_on_change() {
             error: None,
             lockdown_enabled: false,
             lockdown_active: false,
+            held_closed: false,
             blocked_until_connected: false
         }
     );
@@ -67,6 +69,7 @@ fn cell_bumps_seq_only_on_change() {
             error: None,
             lockdown_enabled: false,
             lockdown_active: false,
+            held_closed: false,
             blocked_until_connected: false
         }
     );
@@ -88,6 +91,7 @@ async fn cell_wakes_watchers_only_on_change() {
             error: None,
             lockdown_enabled: false,
             lockdown_active: false,
+            held_closed: false,
             blocked_until_connected: false,
         }
     );
@@ -100,7 +104,7 @@ fn commit_status_carries_lockdown_fields() {
     let s0 = cell.snapshot();
     assert!(!s0.lockdown_enabled && !s0.lockdown_active);
     // A Status commit threads both lockdown bools alongside `running`.
-    cell.commit_status(true, None, true, false, false);
+    cell.commit_status(true, None, true, false, false, false);
     let s1 = cell.snapshot();
     assert!(s1.running && s1.lockdown_enabled && !s1.lockdown_active);
     assert_eq!(s1.seq, 1, "seq bumped on change");
@@ -112,7 +116,7 @@ fn commit_preserves_lockdown_fields() {
     // `commit_status`); its `..*snap` must NOT clobber the lockdown warning state
     // a prior Status established (`enabled && !active` is the tray warning state).
     let cell = ProxyStateCell::new();
-    cell.commit_status(true, None, true, false, false); // running + lockdown enabled, not active
+    cell.commit_status(true, None, true, false, false, false); // running + lockdown enabled, not active
     let before = cell.snapshot();
     assert!(before.lockdown_enabled && !before.lockdown_active);
 
@@ -134,7 +138,7 @@ fn commit_clears_blocked_on_a_settled_running_edge() {
     // the next Status poll. A settled running edge resolves the transient blocked
     // sub-state, so commit clears the flag AND bumps seq to repaint immediately.
     let cell = ProxyStateCell::new();
-    cell.commit_status(false, None, false, false, true); // enter the blocked state
+    cell.commit_status(false, None, false, false, false, true); // enter the blocked state
     let before = cell.snapshot();
     assert!(before.blocked_until_connected, "precondition: blocked");
 
@@ -163,6 +167,7 @@ fn commit_status_carries_error_on_death() {
         false,
         false,
         false,
+        false,
     );
     let snap = cell.snapshot();
     assert!(!snap.running);
@@ -175,7 +180,7 @@ fn commit_clears_error_on_non_status_running_change() {
     // A non-Status running edge (Start/Stop/Cancel) is user-initiated and
     // carries no death reason — `commit` must clear any prior error.
     let cell = ProxyStateCell::new();
-    cell.commit_status(true, Some("synthetic".into()), false, false, false); // running -> true with an error
+    cell.commit_status(true, Some("synthetic".into()), false, false, false, false); // running -> true with an error
     assert_eq!(cell.snapshot().error.as_deref(), Some("synthetic"));
     cell.commit(false); // clean stop via the non-Status path
     assert_eq!(cell.snapshot().error, None, "non-Status commit must clear error");
@@ -188,6 +193,7 @@ fn reconnect_clears_death_error() {
     cell.commit_status(
         false,
         Some("proxy task exited unexpectedly".into()),
+        false,
         false,
         false,
         false,
@@ -206,6 +212,7 @@ fn proxy_snapshot_serializes_error() {
         error: Some("boom".into()),
         lockdown_enabled: false,
         lockdown_active: false,
+        held_closed: false,
         blocked_until_connected: false,
     })
     .unwrap();
@@ -216,6 +223,7 @@ fn proxy_snapshot_serializes_error() {
         error: None,
         lockdown_enabled: false,
         lockdown_active: false,
+        held_closed: false,
         blocked_until_connected: false,
     })
     .unwrap();
@@ -236,6 +244,7 @@ fn observed_error_only_from_status_ok() {
         ipv6_bypass_available: true,
         lockdown_enabled: false,
         lockdown_active: false,
+        held_closed: false,
         blocked_until_connected: false,
     });
     assert_eq!(
@@ -258,6 +267,7 @@ fn status_resp(running: bool) -> BridgeResponse {
         ipv6_bypass_available: true,
         lockdown_enabled: false,
         lockdown_active: false,
+        held_closed: false,
         blocked_until_connected: false,
     }
 }
@@ -411,6 +421,7 @@ fn status_response(running: bool) -> StatusResponse {
         ipv6_bypass_available: true,
         lockdown_enabled: false,
         lockdown_active: false,
+        held_closed: false,
         blocked_until_connected: false,
     }
 }
@@ -526,6 +537,7 @@ async fn start_ack_commits_true() {
             error: None,
             lockdown_enabled: false,
             lockdown_active: false,
+            held_closed: false,
             blocked_until_connected: false
         }
     );
@@ -579,6 +591,7 @@ async fn transport_error_commits_false() {
             error: None,
             lockdown_enabled: false,
             lockdown_active: false,
+            held_closed: false,
             blocked_until_connected: false
         }
     );
@@ -604,6 +617,7 @@ async fn transport_error_holds_snapshot_while_marker_present() {
             error: None,
             lockdown_enabled: false,
             lockdown_active: false,
+            held_closed: false,
             blocked_until_connected: false
         },
         "marker present => transport error holds the last snapshot"
@@ -818,8 +832,8 @@ fn commit_update_failed_applies_a_lockdown_change() {
     // A wedge whose Status carried a lockdown change must surface UPDATE_FAILED
     // AND the new lockdown fields — not preserve the stale prior ones.
     let cell = super::ProxyStateCell::new();
-    cell.commit_status(true, None, false, false, false); // connected, no lockdown
-    cell.commit_update_failed(super::UPDATE_FAILED, Some((true, false, false)));
+    cell.commit_status(true, None, false, false, false, false); // connected, no lockdown
+    cell.commit_update_failed(super::UPDATE_FAILED, Some((true, false, false, false)));
     let s = cell.snapshot();
     assert!(!s.running && s.error.as_deref() == Some(super::UPDATE_FAILED));
     assert!(
@@ -828,10 +842,10 @@ fn commit_update_failed_applies_a_lockdown_change() {
     );
     // Re-committing the same wedge + lockdown is idempotent.
     let seq = s.seq;
-    cell.commit_update_failed(super::UPDATE_FAILED, Some((true, false, false)));
+    cell.commit_update_failed(super::UPDATE_FAILED, Some((true, false, false, false)));
     assert_eq!(cell.snapshot().seq, seq);
     // A lockdown change bumps seq even though running/error are unchanged.
-    cell.commit_update_failed(super::UPDATE_FAILED, Some((true, true, false)));
+    cell.commit_update_failed(super::UPDATE_FAILED, Some((true, true, false, false)));
     let s2 = cell.snapshot();
     assert!(s2.lockdown_active && s2.seq == seq + 1);
 }
@@ -921,6 +935,7 @@ async fn oneshot_never_commits() {
             error: None,
             lockdown_enabled: false,
             lockdown_active: false,
+            held_closed: false,
             blocked_until_connected: false
         }
     );
@@ -954,6 +969,7 @@ async fn untracked_requests_never_commit() {
             error: None,
             lockdown_enabled: false,
             lockdown_active: false,
+            held_closed: false,
             blocked_until_connected: false
         }
     );
@@ -1017,6 +1033,7 @@ async fn concurrent_requests_commit_in_bridge_order() {
             error: None,
             lockdown_enabled: false,
             lockdown_active: false,
+            held_closed: false,
             blocked_until_connected: false
         }
     );
@@ -1081,6 +1098,7 @@ async fn reload_if_running_reloads_when_running() {
             error: None,
             lockdown_enabled: false,
             lockdown_active: false,
+            held_closed: false,
             blocked_until_connected: false
         }
     );
@@ -1125,6 +1143,7 @@ fn classify_lockdown_is_fail_closed_three_state() {
             ipv6_bypass_available: true,
             lockdown_enabled,
             lockdown_active: lockdown_enabled,
+            held_closed: false,
             blocked_until_connected: false,
         })
     };
@@ -1150,7 +1169,10 @@ fn classify_lockdown_is_fail_closed_three_state() {
         super::classify_lockdown(&Err(ClientError::PermissionDenied)),
         super::LockdownRead::Unreadable
     );
-    assert_eq!(super::observed_lockdown(&status(true)), Some((true, true, false)));
+    assert_eq!(
+        super::observed_lockdown(&status(true)),
+        Some((true, true, false, false))
+    );
     assert_eq!(super::observed_lockdown(&Ok(BridgeResponse::Ack)), None);
     assert_eq!(super::observed_lockdown(&Err(ClientError::PermissionDenied)), None);
 }

@@ -293,6 +293,7 @@ async fn handle_status<P: Proxy + 'static, R: Routing + 'static>(
         ipv6_bypass_available: pm.ipv6_bypass_available(),
         lockdown_enabled: pm.lockdown_enabled(),
         lockdown_active: pm.lockdown_active(),
+        held_closed: pm.held_closed(),
         blocked_until_connected: pm.blocked_until_connected(),
     })
 }
@@ -425,8 +426,20 @@ async fn handle_cancel<P: Proxy + 'static, R: Routing + 'static>(
 
 /// Set the standing kill switch intent (last-writer-wins absolute set). Any
 /// authorized caller may toggle it. The bridge is the authority; the GUI only
-/// sends intent. The intent takes effect on the next start/stop — this handler
-/// does NOT engage/disengage a live cover.
+/// sends intent.
+///
+/// An OFF intent also RELEASES a standing cover no live session owns, so a user
+/// held offline by a cover adopted from a crashed run is not told to wait for
+/// the next bridge start. A cover a live session owns is left to `stop_with`:
+/// settings apply on reconnect. A 500 means the host may STILL be blocked — the
+/// intent is deliberately not recorded as off in that case.
+/// PII-free client-facing failure for `POST /v1/lockdown`. Covers both halves —
+/// a cover that would not release and an intent that would not persist — because
+/// the user's next move is the same either way, and the distinguishing detail is
+/// exactly the part that carries paths.
+pub(crate) const LOCKDOWN_SET_FAILED: &str =
+    "Hole could not change the kill switch. If your network is blocked, run `hole bridge unlock` as an administrator.";
+
 async fn handle_lockdown<P: Proxy + 'static, R: Routing + 'static>(
     State(state): State<Arc<IpcState<P, R>>>,
     Json(req): Json<LockdownRequest>,
@@ -438,10 +451,15 @@ async fn handle_lockdown<P: Proxy + 'static, R: Routing + 'static>(
             Ok(Json(EmptyResponse {}))
         }
         Err(e) => {
+            // The detail can name the state file or a pfctl invocation, and an IPC
+            // message reaches a GUI toast verbatim (#470) — log it, send a
+            // path-free sentence the user can act on.
             error!(error = %e, "failed to set lockdown intent");
             Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse { message: e.to_string() }),
+                Json(ErrorResponse {
+                    message: LOCKDOWN_SET_FAILED.to_string(),
+                }),
             ))
         }
     }

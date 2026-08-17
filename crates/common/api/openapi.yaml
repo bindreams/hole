@@ -323,8 +323,20 @@ components:
           type: boolean
           default: false
           description: >-
-            Whether a lockdown cover is currently engaged. `lockdown_enabled &&
-            !lockdown_active` is a tray warning state — never silent green.
+            Whether a lockdown cover is engaged, as the OS reports it —
+            independent of whether a session is running, since a cover adopted
+            from a crashed run is owned by no process. A probe that cannot reach
+            the firewall reports true rather than claiming an all-clear it did
+            not observe.
+        held_closed:
+          type: boolean
+          default: false
+          description: >-
+            Whether a lockdown cover is engaged that no running session owns, so
+            the host has no working egress and no tunnel carrying traffic through
+            the block. Distinct from `lockdown_active`, which is also true for a
+            healthy protected session. serde-default false so older clients keep
+            today's behavior.
         blocked_until_connected:
           type: boolean
           default: false

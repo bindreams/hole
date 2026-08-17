@@ -33,6 +33,7 @@ async fn spawn_mock_bridge(path: &std::path::Path) -> tokio::task::JoinHandle<()
                     ipv6_bypass_available: true,
                     lockdown_enabled: false,
                     lockdown_active: false,
+                    held_closed: false,
                     blocked_until_connected: false,
                 })
             }),
@@ -127,6 +128,7 @@ fn send_status_request_receives_response() {
                 ipv6_bypass_available: true,
                 lockdown_enabled: false,
                 lockdown_active: false,
+                held_closed: false,
                 blocked_until_connected: false,
             }
         );
@@ -455,6 +457,7 @@ async fn spawn_error_bridge(path: &std::path::Path) -> tokio::task::JoinHandle<(
                     ipv6_bypass_available: true,
                     lockdown_enabled: false,
                     lockdown_active: false,
+                    held_closed: false,
                     blocked_until_connected: false,
                 })
             }),
@@ -608,6 +611,7 @@ async fn spawn_status_mock(path: &std::path::Path, version: Option<&'static str>
                 ipv6_bypass_available: true,
                 lockdown_enabled: false,
                 lockdown_active: false,
+                held_closed: false,
                 blocked_until_connected: false,
             })
         }),

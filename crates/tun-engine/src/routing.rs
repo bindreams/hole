@@ -450,6 +450,23 @@ pub trait Routing: Send + Sync {
         tun_name: &str,
         app_ids: &[PathBuf],
     ) -> Result<Self::Cover, RoutingError>;
+
+    /// Whether a STANDING lockdown cover is holding the host closed right now,
+    /// as the OS sees it — independent of whether this process engaged it or is
+    /// running a session at all. That independence is the point: a cover adopted
+    /// from a crashed run has no guard anywhere in this process, and deriving
+    /// "engaged" from a live session reports it as absent (bindreams/hole#825).
+    ///
+    /// [`CoverState::Unknown`] means the probe could not answer; a caller must
+    /// not treat it as an open host.
+    fn lockdown_cover_state(&self) -> failclosed::CoverState;
+
+    /// Disengage a standing lockdown cover, FAIL-LOUD. `Ok` means the OS confirms
+    /// the host is open — the implementation re-probes rather than trusting the
+    /// return of whatever it called. An absent cover is `Ok` (nothing to do); an
+    /// `Err` means egress may still be blocked, so a caller must not record the
+    /// kill switch as off.
+    fn disengage_lockdown(&self) -> Result<(), RoutingError>;
 }
 
 // System (production) routing =========================================================================================
@@ -536,6 +553,14 @@ impl Routing for SystemRouting {
     ) -> Result<Self::Cover, RoutingError> {
         let resolver = failclosed::SystemLuidResolver;
         failclosed::engage_lockdown(server_ip, tun_name, &resolver, app_ids, &self.state_dir, self.owner)
+    }
+
+    fn lockdown_cover_state(&self) -> failclosed::CoverState {
+        failclosed::lockdown_cover_state(&self.state_dir)
+    }
+
+    fn disengage_lockdown(&self) -> Result<(), RoutingError> {
+        failclosed::disengage_lockdown(&self.state_dir)
     }
 }
 

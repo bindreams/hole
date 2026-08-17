@@ -204,6 +204,11 @@ harness = false
 # Privileged-lane cutover LEAK proofs (real WFP/pf engage + egress probes:
 # Mullvad-#8470 fail-open, both-covers recovery).
 [[test]]
+name = "lockout_privileged"
+path = "tests/lockout_privileged.rs"
+harness = false
+
+[[test]]
 name = "cutover_leak_privileged"
 path = "tests/cutover_leak_privileged.rs"
 harness = false

@@ -252,7 +252,9 @@ impl BridgeLink {
         // A resolved observation retracts any stale wedge failure.
         self.cell.clear_update_failed(UPDATE_FAILED);
         match observed_lockdown(result) {
-            Some((le, la, blk)) => self.cell.commit_status(running, observed_error(result), le, la, blk),
+            Some((le, la, hc, blk)) => self
+                .cell
+                .commit_status(running, observed_error(result), le, la, hc, blk),
             None => self.cell.commit(running),
         }
     }
@@ -394,9 +396,13 @@ pub struct ProxySnapshot {
     pub error: Option<String>,
     /// Standing kill-switch intent (#527), from the bridge's StatusResponse.
     pub lockdown_enabled: bool,
-    /// Whether a lockdown cover is engaged. `enabled && !active` is a tray
-    /// warning state — never silent green.
+    /// Whether a lockdown cover is engaged, as the bridge probes the OS —
+    /// true for a healthy protected session AND for a cover left by a crash.
     pub lockdown_active: bool,
+    /// Whether a lockdown cover is engaged that no running session owns: Hole is
+    /// holding the network closed with nothing carrying traffic through it. The
+    /// tray renders this with the action that ends it.
+    pub held_closed: bool,
     /// Whether a covered start (auto-connect) failed and left the host
     /// fail-closed (blocked, not leaked) while not running — a distinct blocked
     /// state (Retry / Disconnect), never silent Disconnected.
@@ -422,6 +428,7 @@ impl ProxyStateCell {
             error: None,
             lockdown_enabled: false,
             lockdown_active: false,
+            held_closed: false,
             blocked_until_connected: false,
         });
         Self { tx }
@@ -446,6 +453,7 @@ impl ProxyStateCell {
                 error: None,
                 lockdown_enabled: snap.lockdown_enabled,
                 lockdown_active: snap.lockdown_active,
+                held_closed: snap.held_closed,
                 blocked_until_connected: false,
             };
             true
@@ -463,12 +471,14 @@ impl ProxyStateCell {
         error: Option<String>,
         lockdown_enabled: bool,
         lockdown_active: bool,
+        held_closed: bool,
         blocked_until_connected: bool,
     ) {
         self.tx.send_if_modified(|snap| {
             if snap.running == running
                 && snap.lockdown_enabled == lockdown_enabled
                 && snap.lockdown_active == lockdown_active
+                && snap.held_closed == held_closed
                 && snap.blocked_until_connected == blocked_until_connected
             {
                 return false;
@@ -479,6 +489,7 @@ impl ProxyStateCell {
                 error,
                 lockdown_enabled,
                 lockdown_active,
+                held_closed,
                 blocked_until_connected,
             };
             true
@@ -486,21 +497,24 @@ impl ProxyStateCell {
     }
 
     /// Commit a wedged-cutover failure: Disconnected + the path-free reason.
-    /// `lockdown` is `Some((enabled, active, blocked))` when the triggering Status
-    /// carried fresh flags (apply them) and `None` otherwise (preserve prior).
+    /// `lockdown` is `Some((enabled, active, held_closed, blocked))` when the
+    /// triggering Status carried fresh flags (apply them) and `None` otherwise
+    /// (preserve prior).
     /// Idempotent — bumps `seq` only when running, error, or one of those flags
     /// actually changes.
-    pub fn commit_update_failed(&self, reason: &'static str, lockdown: Option<(bool, bool, bool)>) {
+    pub fn commit_update_failed(&self, reason: &'static str, lockdown: Option<(bool, bool, bool, bool)>) {
         self.tx.send_if_modified(|snap| {
-            let (le, la, blk) = lockdown.unwrap_or((
+            let (le, la, hc, blk) = lockdown.unwrap_or((
                 snap.lockdown_enabled,
                 snap.lockdown_active,
+                snap.held_closed,
                 snap.blocked_until_connected,
             ));
             if !snap.running
                 && snap.error.as_deref() == Some(reason)
                 && snap.lockdown_enabled == le
                 && snap.lockdown_active == la
+                && snap.held_closed == hc
                 && snap.blocked_until_connected == blk
             {
                 return false;
@@ -511,6 +525,7 @@ impl ProxyStateCell {
                 error: Some(reason.to_string()),
                 lockdown_enabled: le,
                 lockdown_active: la,
+                held_closed: hc,
                 blocked_until_connected: blk,
             };
             true
@@ -682,17 +697,23 @@ pub fn classify_lockdown(result: &Result<BridgeResponse, ClientError>) -> Lockdo
     }
 }
 
-/// The lockdown (enabled, active) + blocked-until-connected flags a Status
-/// exchange revealed, if any. Only a `Status` Ok carries them; every other
+/// The lockdown (enabled, active, held_closed) + blocked-until-connected flags a
+/// Status exchange revealed, if any. Only a `Status` Ok carries them; every other
 /// exchange yields None (leave the snapshot's prior fields untouched).
-pub(crate) fn observed_lockdown(result: &Result<BridgeResponse, ClientError>) -> Option<(bool, bool, bool)> {
+pub(crate) fn observed_lockdown(result: &Result<BridgeResponse, ClientError>) -> Option<(bool, bool, bool, bool)> {
     match result {
         Ok(BridgeResponse::Status {
             lockdown_enabled,
             lockdown_active,
+            held_closed,
             blocked_until_connected,
             ..
-        }) => Some((*lockdown_enabled, *lockdown_active, *blocked_until_connected)),
+        }) => Some((
+            *lockdown_enabled,
+            *lockdown_active,
+            *held_closed,
+            *blocked_until_connected,
+        )),
         _ => None,
     }
 }

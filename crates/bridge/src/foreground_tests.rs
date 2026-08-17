@@ -148,6 +148,14 @@ impl Routing for StubRouting {
     fn install_lockdown(&self, _: IpAddr, _: &str, _: &[PathBuf]) -> Result<StubCover, RoutingError> {
         Ok(StubCover)
     }
+
+    fn lockdown_cover_state(&self) -> tun_engine::routing::failclosed::CoverState {
+        tun_engine::routing::failclosed::CoverState::Absent
+    }
+
+    fn disengage_lockdown(&self) -> Result<(), RoutingError> {
+        Ok(())
+    }
 }
 
 struct StubRoutes {
