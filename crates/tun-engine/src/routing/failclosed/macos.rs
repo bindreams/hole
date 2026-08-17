@@ -30,7 +30,7 @@ use crate::error::RoutingError;
 // `failclosed` module and `failclosed_state` is its sibling child.
 use super::failclosed_state as state;
 use super::lockdown_pf_state as lockdown_state;
-use super::RESOLVER_PERMIT_PORT;
+use super::{CoverState, RESOLVER_PERMIT_PORT};
 
 /// Build the self-contained pf ruleset (loaded via `pfctl -f -`).
 ///
@@ -69,6 +69,10 @@ pub fn ensure_trailing_nl(s: &str) -> String {
     }
 }
 
+/// The lockdown ruleset's fail-closed base. Named once so the builder, the
+/// [`lockdown_cover_state`] probe and the privileged tests cannot drift apart.
+pub const LOCKDOWN_BLOCK_RULE: &str = "block drop out quick all";
+
 /// Build the self-contained MAIN ruleset for the standing lockdown, loaded via
 /// `pfctl -f -` (NO `-Fa`). It IS the host's egress policy while engaged:
 /// `block drop out quick all` is the fail-closed base, with earlier `quick`
@@ -89,7 +93,8 @@ pub fn build_lockdown_main_ruleset(tun_name: &str, server_ip: IpAddr, nat_snapsh
          pass out quick proto {proto} from any to {ip}\n\
          pass out quick on {tun} all\n\
          block drop out quick inet6 all\n\
-         block drop out quick all\n",
+         {block}\n",
+        block = LOCKDOWN_BLOCK_RULE,
         nat = ensure_trailing_nl(nat_snapshot),
         proto = proto,
         ip = server_ip,
@@ -444,7 +449,72 @@ pub fn disengage_lockdown(state_dir: &Path) -> Result<(), RoutingError> {
     if let Err(e) = lockdown_state::clear(state_dir) {
         tracing::warn!(error = %e, "lockdown-pf-state clear failed after disengage");
     }
-    Ok(())
+    super::verify_disengaged(lockdown_cover_state(state_dir))
+}
+
+/// Map the two pf reads to a [`CoverState`]. `None` means that `pfctl`
+/// invocation failed. Pure so the read-failure rows — the ones a live test
+/// cannot produce on a healthy host — are table-testable.
+///
+/// A failed read is `Unknown`, NOT `Absent`. The Windows justification for
+/// folding an unanswerable probe into "absent" ("we could not have disengaged
+/// anything either") does not carry here: `disengage_lockdown` drives
+/// `pfctl -f -` and `pfctl -X`, which are independent of whether `-s info` and
+/// `-sr` could be read. So a read failure says nothing about whether the release
+/// would work, and reporting "not engaged" would hide a blocked host along with
+/// its way out.
+pub(crate) fn cover_state_from(has_state: bool, pf_enabled: Option<bool>, carries_block: Option<bool>) -> CoverState {
+    if !has_state {
+        return CoverState::Absent;
+    }
+    match (pf_enabled, carries_block) {
+        (None, _) | (Some(true), None) => CoverState::Unknown,
+        // pf disabled: the ruleset is inert and the host is open. This is the
+        // ordinary post-reboot state (pf and its refcount reset at boot while the
+        // state file survives) — see #827.
+        (Some(false), _) => CoverState::Absent,
+        (Some(true), Some(true)) => CoverState::Engaged,
+        // pf is up but someone reloaded over us; our ruleset is not the policy.
+        (Some(true), Some(false)) => CoverState::Absent,
+    }
+}
+
+/// Whether our lockdown ruleset is actually holding the host closed. Reads pf
+/// rather than trusting `bridge-lockdown-pf.json`, which outlives the ruleset it
+/// describes across a reboot.
+///
+/// Short-circuits on the state file so the ordinary path spawns no subprocess:
+/// `pfctl` runs only when a cover is recorded, i.e. in the lockout state or the
+/// post-reboot inert state.
+pub fn lockdown_cover_state(state_dir: &Path) -> CoverState {
+    if lockdown_state::load(state_dir).is_none() {
+        return cover_state_from(false, None, None);
+    }
+    let enabled = read_pf(&["-s", "info"]).map(|out| parse_pf_enabled(&out));
+    let carries = read_pf(&["-sr"]).map(|out| out.contains(LOCKDOWN_BLOCK_RULE));
+    cover_state_from(true, enabled, carries)
+}
+
+/// One read-only `pfctl`, as stdout.
+fn read_pf(args: &[&str]) -> Option<String> {
+    read_outcome(pfctl(args, None, PHASE_RECOVER_COVER))
+}
+
+/// Interpret a `pfctl` invocation. `None` on a spawn failure OR a non-zero exit —
+/// neither is an answer, and the caller must not read one as "no cover". Split
+/// from [`read_pf`] so both failure shapes are testable without a live `pfctl`.
+pub(crate) fn read_outcome(result: Result<std::process::Output, RoutingError>) -> Option<String> {
+    match result {
+        Ok(out) if out.status.success() => Some(String::from_utf8_lossy(&out.stdout).into_owned()),
+        Ok(out) => {
+            tracing::warn!(status = ?out.status, "pfctl read exited non-zero; cover state is unknown");
+            None
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "pfctl read could not run; cover state is unknown");
+            None
+        }
+    }
 }
 
 /// Best-effort wrapper for `Drop` (user-stop): disengage and swallow. Drop has

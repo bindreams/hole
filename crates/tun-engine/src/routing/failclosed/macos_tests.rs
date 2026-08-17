@@ -365,3 +365,70 @@ fn restore_empty_nat_has_no_blank_line() {
     let r = build_lockdown_restore_ruleset("", FILTER_SNAP);
     assert!(!r.contains("\n\n"), "empty nat must not produce a blank line:\n{r}");
 }
+
+// Cover-state probe (#825) ============================================================================================
+
+#[skuld::test]
+fn macos_cover_state_maps_pf_reads() {
+    use CoverState::*;
+
+    // No state file: nothing of ours was ever recorded, and no subprocess runs.
+    assert_eq!(cover_state_from(false, None, None), Absent);
+    assert_eq!(cover_state_from(false, Some(true), Some(true)), Absent);
+
+    // Read failures are the rows a boolean signature would have collapsed into
+    // "no cover" — hiding a blocked host and its escape along with it.
+    assert_eq!(cover_state_from(true, None, Some(true)), Unknown);
+    assert_eq!(cover_state_from(true, None, None), Unknown);
+    assert_eq!(cover_state_from(true, Some(true), None), Unknown);
+
+    // pf disabled: the ruleset is inert, the host is open. The ordinary
+    // post-reboot state (#827) — reporting Engaged here would be a false alarm.
+    assert_eq!(cover_state_from(true, Some(false), Some(true)), Absent);
+    assert_eq!(cover_state_from(true, Some(false), Some(false)), Absent);
+
+    // pf up, but our ruleset is not the loaded policy.
+    assert_eq!(cover_state_from(true, Some(true), Some(false)), Absent);
+
+    // The one engaged combination.
+    assert_eq!(cover_state_from(true, Some(true), Some(true)), Engaged);
+}
+
+#[skuld::test]
+fn macos_pf_read_failures_are_not_answers() {
+    use std::os::unix::process::ExitStatusExt;
+    use std::process::{ExitStatus, Output};
+
+    let out = |code: i32, stdout: &str| Output {
+        status: ExitStatus::from_raw(code),
+        stdout: stdout.as_bytes().to_vec(),
+        stderr: Vec::new(),
+    };
+
+    assert_eq!(
+        read_outcome(Ok(out(0, "Status: Enabled"))).as_deref(),
+        Some("Status: Enabled")
+    );
+    assert_eq!(
+        read_outcome(Ok(out(256, "partial"))),
+        None,
+        "a non-zero exit is not an answer, even with stdout"
+    );
+    assert_eq!(
+        read_outcome(Err(RoutingError::RouteSetup("pfctl not found".into()))),
+        None,
+        "a spawn failure is not an answer"
+    );
+}
+
+#[skuld::test]
+fn macos_lockdown_ruleset_carries_the_probed_block_rule() {
+    // The probe greps the live ruleset for LOCKDOWN_BLOCK_RULE. If the builder
+    // stopped emitting it, the probe would report Absent over a blocked host —
+    // so pin that the two agree by construction.
+    let ruleset = build_lockdown_main_ruleset("utun4", "203.0.113.7".parse().unwrap(), "");
+    assert!(
+        ruleset.contains(LOCKDOWN_BLOCK_RULE),
+        "the lockdown ruleset must carry the rule the probe looks for:\n{ruleset}"
+    );
+}
