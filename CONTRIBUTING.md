@@ -611,6 +611,52 @@ FIRST and flips the intent off only on confirmed success, returning a non-zero
 exit otherwise (e.g. run unprivileged). A swallowed failure would leave the
 cover engaged — egress still blocked — while the intent read "off".
 
+#### The unconditional escape from a stranded cover
+
+An unclean exit with the kill switch on can leave the host fail-closed with no
+bridge running to release it. `failclosed::release_all` is the unconditional
+clear: it clears both cover kinds (the standing lockdown cover and the
+transient block-until-connected cover) without ever asking whether either is
+present, never short-circuits (every clear is attempted before any failure is
+examined), never reports success over a host it left closed, and never erases
+a cover's state file after a restore that did not confirm — a corrupt or
+version-skewed file is treated as a cover to clear, not as absence.
+`ProxyManager::turn_lockdown_off` wraps it with the feature's only condition —
+whether a session is running — and is called by both the tray's Unblock item
+and the Lockdown-off toggle, so turning the kill switch off now releases
+immediately rather than waiting for the next bridge start.
+
+`POST /v1/unblock` and `hole bridge unlock` are two doors with deliberately
+different scopes. The transient cover's authority inside a live bridge is the
+in-process `ProxyManager::blocked` guard: `start_cancellable` reads
+`self.blocked.is_some()` as proof the host is covered, skipping re-engagement
+on a covered retry and suppressing the censorship self-test on that basis. An
+out-of-process command that deleted the transient filters would leave that
+guard claiming a cover that no longer exists, and the next retry would run
+uncovered while believing itself protected — so `cutover::unlock` keeps
+clearing only the standing cover. The transient cover therefore has exactly
+two escapes, both in-process: the tray's Go Offline action while the bridge
+holds it, and `recover_routes`' unconditional sweep at the next bridge start
+when it does not.
+
+Disclosed residuals:
+
+1. The `Lockdown: On (warning: not engaged)` tray label can still be wrong in
+   this window — it derives from the running session, not an OS probe of the
+   cover.
+1. On macOS a state file that cannot be read costs the host its captured
+   pre-cover pf rules (the release falls back to the default ruleset) and
+   leaks a pf enable refcount until reboot.
+1. `lockdown_state::load_enabled` reads a corrupt or unreadable
+   `bridge-lockdown.json` as **off**, which hides the tray's Unblock item;
+   `hole bridge unlock` still works there because it never reads the intent to
+   decide.
+1. `failclosed::lockdown_cover_present` still infers presence from a file on
+   macOS and returns an unconditional `true` on Windows. It feeds
+   `decide_cover_recovery`, so widening it changes Adopt/Sweep/Noop at
+   unattended startup — the recovery decision, which belongs with the
+   ownership work, not here.
+
 ### Update cutover
 
 `POST /v1/update-apply` ([`cutover/apply.rs`](crates/bridge/src/cutover/apply.rs))
