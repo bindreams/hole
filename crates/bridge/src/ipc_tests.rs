@@ -15,6 +15,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tun_engine::gateway::GatewayInfo;
+use tun_engine::routing::failclosed::lockdown_state;
 use tun_engine::routing::{state as route_state, Routing};
 use tun_engine::RoutingError;
 
@@ -282,6 +283,25 @@ fn mock_proxy_with_state_dir() -> Arc<Mutex<ProxyManager<MockProxy, MockRouting>
     Arc::new(Mutex::new(pm))
 }
 
+/// `mock_proxy_with_state_dir` variant that also hands back the mock
+/// routing's `release_all_calls` / `fail_release` handles (cloned out BEFORE
+/// `routing` moves into the manager, mirroring `mock_proxy_with_traffic`), so
+/// a test can assert the unconditional escape fired and drive a failure.
+#[allow(clippy::type_complexity)]
+fn mock_proxy_with_release_state() -> (
+    Arc<Mutex<ProxyManager<MockProxy, MockRouting>>>,
+    Arc<AtomicU32>,
+    Arc<AtomicBool>,
+    PathBuf,
+) {
+    let state_dir = tempfile::tempdir().unwrap().keep();
+    let routing = MockRouting::new(state_dir.clone());
+    let release_all_calls = Arc::clone(&routing.release_all_calls);
+    let fail_release = Arc::clone(&routing.fail_release);
+    let pm = ProxyManager::new(MockProxy::new(), routing).with_state_dir(state_dir.clone());
+    (Arc::new(Mutex::new(pm)), release_all_calls, fail_release, state_dir)
+}
+
 /// `mock_proxy` variant that also hands back the mock's traffic counters
 /// so tests can simulate tunnel bytes.
 fn mock_proxy_with_traffic() -> (Arc<Mutex<ProxyManager<MockProxy, MockRouting>>>, Arc<MockTraffic>) {
@@ -461,6 +481,16 @@ async fn post_lockdown(client: &mut TestClient, enabled: bool) -> http::Response
         .header("host", "localhost")
         .header("content-type", "application/json")
         .body(Full::new(Bytes::from(body)))
+        .unwrap();
+    client.send(req).await
+}
+
+async fn post_unblock(client: &mut TestClient) -> http::Response<hyper::body::Incoming> {
+    let req = http::Request::builder()
+        .method("POST")
+        .uri(ROUTE_UNBLOCK)
+        .header("host", "localhost")
+        .body(Full::new(Bytes::new()))
         .unwrap();
     client.send(req).await
 }
@@ -709,6 +739,175 @@ fn lockdown_post_errors_without_state_dir() {
             "lockdown POST without a state_dir must error, not silently succeed"
         );
         let _ = resp.into_body().collect().await;
+
+        drop(client);
+        handle.abort();
+        let _ = handle.await;
+    });
+}
+
+// POST /v1/unblock ====================================================================================================
+
+async fn parse_error_body(resp: http::Response<hyper::body::Incoming>) -> hole_common::protocol::ErrorResponse {
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    serde_json::from_slice(&body).unwrap()
+}
+
+#[skuld::test]
+fn unblock_clears_covers_and_returns_ok() {
+    rt().block_on(async {
+        let path = test_socket_path("unblock-ok");
+        let (proxy, release_all_calls, _fail_release, _dir) = mock_proxy_with_release_state();
+        let server = IpcServer::bind(&path, proxy, "test").unwrap();
+        let handle = tokio::spawn(async move {
+            server.run_once().await.unwrap();
+        });
+
+        let mut client = TestClient::connect(&path).await;
+        let resp = post_unblock(&mut client).await;
+        assert_eq!(resp.status(), 200, "unblock on a clean, idle manager must 200");
+        let _ = resp.into_body().collect().await;
+        assert_eq!(release_all_calls.load(Ordering::SeqCst), 1);
+
+        drop(client);
+        handle.abort();
+        let _ = handle.await;
+    });
+}
+
+#[skuld::test]
+fn unblock_while_running_returns_conflict() {
+    rt().block_on(async {
+        let path = test_socket_path("unblock-running");
+        let (proxy, release_all_calls, _fail_release, dir) = mock_proxy_with_release_state();
+        let server = IpcServer::bind(&path, proxy, "test").unwrap();
+        let handle = tokio::spawn(async move {
+            server.run_once().await.unwrap();
+        });
+
+        let mut client = TestClient::connect(&path).await;
+        let start_resp = post_start(&mut client, &sample_config(), "attempt-1").await;
+        assert_eq!(consume(start_resp).await, 200, "setup: the session must start");
+
+        let resp = post_unblock(&mut client).await;
+        assert_eq!(
+            resp.status(),
+            409,
+            "a running session must be reported, not silently overridden"
+        );
+        let _ = resp.into_body().collect().await;
+        assert_eq!(
+            release_all_calls.load(Ordering::SeqCst),
+            0,
+            "the escape must not fire under a live session"
+        );
+        assert!(
+            !lockdown_state::load_enabled(&dir),
+            "the intent must still be recorded as off, even though there was no cover to clear"
+        );
+
+        drop(client);
+        handle.abort();
+        let _ = handle.await;
+    });
+}
+
+#[skuld::test]
+fn unblock_reports_a_failed_release() {
+    rt().block_on(async {
+        let path = test_socket_path("unblock-fail");
+        let (proxy, _release_all_calls, fail_release, _dir) = mock_proxy_with_release_state();
+        fail_release.store(true, Ordering::SeqCst);
+        let server = IpcServer::bind(&path, proxy, "test").unwrap();
+        let handle = tokio::spawn(async move {
+            server.run_once().await.unwrap();
+        });
+
+        let mut client = TestClient::connect(&path).await;
+        let resp = post_unblock(&mut client).await;
+        assert_eq!(
+            resp.status(),
+            500,
+            "a failed release must be reported, not silently swallowed as 200"
+        );
+        let _ = resp.into_body().collect().await;
+
+        drop(client);
+        handle.abort();
+        let _ = handle.await;
+    });
+}
+
+#[skuld::test]
+fn unblock_error_bodies_carry_no_filesystem_path() {
+    fn assert_no_path(message: &str) {
+        assert!(
+            !message.contains('\\') && !message.contains('/'),
+            "error body reaching a GUI toast must carry no filesystem path: {message:?}"
+        );
+    }
+
+    rt().block_on(async {
+        // The 409 (session running) case.
+        let path = test_socket_path("unblock-nopath-409");
+        let (proxy, _calls, _fail, _dir) = mock_proxy_with_release_state();
+        let server = IpcServer::bind(&path, proxy, "test").unwrap();
+        let handle = tokio::spawn(async move {
+            server.run_once().await.unwrap();
+        });
+        let mut client = TestClient::connect(&path).await;
+        assert_eq!(
+            consume(post_start(&mut client, &sample_config(), "a1").await).await,
+            200
+        );
+        let resp = post_unblock(&mut client).await;
+        assert_eq!(resp.status(), 409);
+        assert_no_path(&parse_error_body(resp).await.message);
+        drop(client);
+        handle.abort();
+        let _ = handle.await;
+
+        // The 500 (failed release) case.
+        let path = test_socket_path("unblock-nopath-500");
+        let (proxy, _calls, fail_release, _dir) = mock_proxy_with_release_state();
+        fail_release.store(true, Ordering::SeqCst);
+        let server = IpcServer::bind(&path, proxy, "test").unwrap();
+        let handle = tokio::spawn(async move {
+            server.run_once().await.unwrap();
+        });
+        let mut client = TestClient::connect(&path).await;
+        let resp = post_unblock(&mut client).await;
+        assert_eq!(resp.status(), 500);
+        assert_no_path(&parse_error_body(resp).await.message);
+        drop(client);
+        handle.abort();
+        let _ = handle.await;
+    });
+}
+
+#[skuld::test]
+fn lockdown_off_releases_covers_through_the_same_path() {
+    rt().block_on(async {
+        let path = test_socket_path("lockdown-off-releases");
+        let (proxy, release_all_calls, _fail_release, _dir) = mock_proxy_with_release_state();
+        let server = IpcServer::bind(&path, proxy, "test").unwrap();
+        let handle = tokio::spawn(async move {
+            server.run_once().await.unwrap();
+        });
+
+        let mut client = TestClient::connect(&path).await;
+        let resp = post_lockdown(&mut client, false).await;
+        assert_eq!(
+            resp.status(),
+            200,
+            "turning the toggle off with nothing running must 200"
+        );
+        let _ = resp.into_body().collect().await;
+        assert_eq!(
+            release_all_calls.load(Ordering::SeqCst),
+            1,
+            "the toggle must release through the SAME path unblock uses, not just persist the intent"
+        );
 
         drop(client);
         handle.abort();

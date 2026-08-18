@@ -75,6 +75,10 @@ pub enum BridgeRequest {
     SetLockdown {
         enabled: bool,
     },
+    /// Unconditionally clear every fail-closed cover no running session owns
+    /// and turn the kill-switch intent off. Maps to `POST /v1/unblock` — the
+    /// tray's escape from a cover stranded by an unclean exit.
+    Unblock,
     /// Apply a verified update via the service-manager cutover. Maps to
     /// `POST /v1/update-apply`. `consent` is the informed-consent seam: REQUIRED
     /// true for a lockdown-off update (the standing cover holds the gap under
