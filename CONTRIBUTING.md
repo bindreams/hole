@@ -656,6 +656,15 @@ Disclosed residuals:
    `decide_cover_recovery`, so widening it changes Adopt/Sweep/Noop at
    unattended startup — the recovery decision, which belongs with the
    ownership work, not here.
+1. On macOS, `release_all` treats a MISSING (not merely unreadable) state
+   file as "no cover of this kind" — `StateFile::Absent`, indistinguishable
+   from "never engaged." pf has no query for "who is holding this ruleset,"
+   so if a cover's state file is lost while the cover is still genuinely live
+   in pf (e.g. an external wipe of `state_dir`), `release_all` reports `Ok`
+   without touching pf and the host stays blocked. Closing this gap would
+   mean probing the live pf ruleset for Hole's own signature independent of
+   the state file — the cover-state probe this stage's constraints defer to
+   the ownership work.
 
 ### Update cutover
 

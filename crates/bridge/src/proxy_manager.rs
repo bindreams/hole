@@ -519,8 +519,15 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         // off" can mean while connected (matches the toggle's existing
         // mid-session behavior).
         if self.running.is_some() {
-            self.set_lockdown_intent(false)?;
-            return Ok(LockdownOffOutcome::SessionRunning);
+            // Mapped to the same `LockdownIntentNotPersisted` a failed persist
+            // in step 4 uses (not propagated raw via `?`): both name the one
+            // fact the caller can act on — the setting did not save — rather
+            // than an opaque `ProxyError::Runtime` the IPC layer's generic
+            // 500 path can't distinguish from a release failure.
+            return match self.set_lockdown_intent(false) {
+                Ok(()) => Ok(LockdownOffOutcome::SessionRunning),
+                Err(_) => Err(ProxyError::LockdownIntentNotPersisted),
+            };
         }
 
         // 2. Drop any held transient guard's in-process authority first. Not

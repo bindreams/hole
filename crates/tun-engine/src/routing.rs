@@ -454,11 +454,9 @@ pub trait Routing: Send + Sync {
     /// Clear every fail-closed cover this provider can install — both the
     /// transient block-until-connected cover and the standing lockdown cover
     /// — without asking whether either is present. See
-    /// [`failclosed::release_all`] for the full contract: unconditional,
-    /// total, never short-circuits, and never reports a false success. This
-    /// is the escape from a stranded cover; a required method (no default)
-    /// so every `Routing` implementation, including every test mock, commits
-    /// to one.
+    /// [`failclosed::release_all`] for the full contract. This is the escape
+    /// from a stranded cover; a required method (no default) so every
+    /// `Routing` implementation, including every test mock, commits to one.
     fn release_all_covers(&self) -> Result<(), RoutingError>;
 }
 

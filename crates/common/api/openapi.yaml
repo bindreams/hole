@@ -144,7 +144,10 @@ paths:
               schema:
                 $ref: "#/components/schemas/EmptyResponse"
         "500":
-          description: Failed to persist lockdown intent
+          description: >-
+            Turning the intent on: failed to persist it. Turning the intent
+            off: either the release failed and the intent is still on, or the
+            release succeeded and only the setting could not be saved
           content:
             application/json:
               schema:

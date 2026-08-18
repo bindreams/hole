@@ -75,6 +75,35 @@ fn turn_lockdown_off_records_the_intent_without_clearing_while_a_session_runs() 
 }
 
 #[skuld::test]
+fn turn_lockdown_off_reports_an_unsaved_intent_while_a_session_runs() {
+    rt().block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        let routing = MockRouting::new(dir.path().to_path_buf());
+        let st = routing.state();
+        // No `.with_state_dir(..)`: the persist fails even though a session
+        // is running (there is no cover to clear either way).
+        let mut pm = ProxyManager::new(MockProxy::new(), routing);
+        pm.start(&test_config()).await.unwrap();
+
+        let err = pm
+            .turn_lockdown_off()
+            .expect_err("an unpersistable intent must still be reported");
+        assert!(
+            matches!(err, ProxyError::LockdownIntentNotPersisted),
+            "must be the SAME distinguishable error the Cleared branch uses, not an opaque \
+             ProxyError::Runtime the IPC layer's generic 500 path can't tell apart from a failed release: {err:?}"
+        );
+        assert_eq!(
+            st.release_all_calls.load(Ordering::SeqCst),
+            0,
+            "a running session owns its own cover; release_all_covers must not fire"
+        );
+
+        pm.stop().await.unwrap();
+    });
+}
+
+#[skuld::test]
 fn turn_lockdown_off_clears_covers_then_turns_the_intent_off() {
     rt().block_on(async {
         let dir = tempfile::tempdir().unwrap();

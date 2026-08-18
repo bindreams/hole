@@ -545,9 +545,7 @@ pub(crate) trait PfOps {
 
 /// The unconditional two-cover clear, factored as a pure sequencer over an
 /// injected [`PfOps`] so it is table-tested without touching pf. See
-/// `failclosed::release_all`'s doc for the contract this implements: total
-/// (both covers), no short-circuit (every clear attempted before any failure
-/// is examined), and a state-file clear only on a confirmed replacement.
+/// `failclosed::release_all`'s doc for the contract this implements.
 ///
 /// One `first_err` accumulator, two blocks, no `?` — a `?` would short-circuit
 /// the block that had not run yet.
@@ -568,7 +566,9 @@ pub(crate) fn release_all_with(
             let _ = ops.drop_token(&st.pf_token);
             match reload {
                 Ok(()) => {
-                    let _ = ops.clear_transient();
+                    if let Err(e) = ops.clear_transient() {
+                        tracing::warn!(error = %e, "failclosed-state clear failed during release_all");
+                    }
                 }
                 Err(e) => first_err = Some(e),
             }
@@ -581,7 +581,9 @@ pub(crate) fn release_all_with(
             );
             match ops.reload_default() {
                 Ok(()) => {
-                    let _ = ops.clear_transient();
+                    if let Err(e) = ops.clear_transient() {
+                        tracing::warn!(error = %e, "failclosed-state clear failed during release_all");
+                    }
                 }
                 Err(e) => first_err = Some(e),
             }
@@ -613,7 +615,9 @@ pub(crate) fn release_all_with(
             let _ = ops.drop_token(&st.pf_token);
             match outcome {
                 Ok(()) => {
-                    let _ = ops.clear_standing();
+                    if let Err(e) = ops.clear_standing() {
+                        tracing::warn!(error = %e, "lockdown-pf-state clear failed during release_all");
+                    }
                 }
                 Err(e) => {
                     if first_err.is_none() {
@@ -629,7 +633,9 @@ pub(crate) fn release_all_with(
             );
             match ops.reload_default() {
                 Ok(()) => {
-                    let _ = ops.clear_standing();
+                    if let Err(e) = ops.clear_standing() {
+                        tracing::warn!(error = %e, "lockdown-pf-state clear failed during release_all");
+                    }
                 }
                 Err(e) => {
                     if first_err.is_none() {

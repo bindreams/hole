@@ -780,6 +780,12 @@ fn unblock_while_running_returns_conflict() {
     rt().block_on(async {
         let path = test_socket_path("unblock-running");
         let (proxy, release_all_calls, _fail_release, dir) = mock_proxy_with_release_state();
+        // Seed the intent ON so the post-unblock "still off" assertion below
+        // actually exercises the persist — a fresh tempdir with no
+        // bridge-lockdown.json already reads `false`, which would let that
+        // assertion pass vacuously regardless of whether the handler wrote
+        // anything.
+        lockdown_state::set_enabled(&dir, true, None).unwrap();
         let server = IpcServer::bind(&path, proxy, "test").unwrap();
         let handle = tokio::spawn(async move {
             server.run_once().await.unwrap();

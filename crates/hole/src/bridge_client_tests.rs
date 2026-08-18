@@ -735,6 +735,20 @@ async fn stop_against_status(
     client.send(BridgeRequest::Stop).await
 }
 
+/// Drive POST /v1/unblock against a mock — the `Unblock` arm has its own
+/// bespoke 409 mapping (`ClientError::SessionRunning`) ahead of the generic
+/// `parse_generic_error` fallback, mirroring `Start`'s 409 handling rather
+/// than `Stop`'s.
+async fn unblock_against_status(
+    path: &std::path::Path,
+    status: axum::http::StatusCode,
+    message: &'static str,
+) -> Result<BridgeResponse, ClientError> {
+    let _mock = spawn_route_error_bridge(path, hole_common::protocol::ROUTE_UNBLOCK, status, message).await;
+    let mut client = BridgeClient::connect(path).await.unwrap();
+    client.send(BridgeRequest::Unblock).await
+}
+
 #[skuld::test]
 fn forbidden_maps_to_consent_required() {
     rt().block_on(async {
@@ -842,6 +856,47 @@ fn generic_route_4xx_maps_to_protocol() {
         // A non-Start, non-update route must NOT inherit the update 4xx mappings.
         let result = stop_against_status(&test_socket_path("stop409"), axum::http::StatusCode::CONFLICT, "nope").await;
         assert!(matches!(result, Err(ClientError::Protocol(_))), "got {result:?}");
+    });
+}
+
+#[skuld::test]
+fn unblock_200_maps_to_ack() {
+    rt().block_on(async {
+        let result = unblock_against_status(&test_socket_path("unblock200"), axum::http::StatusCode::OK, "").await;
+        assert!(matches!(result, Ok(BridgeResponse::Ack)), "got {result:?}");
+    });
+}
+
+#[skuld::test]
+fn unblock_409_maps_to_session_running() {
+    rt().block_on(async {
+        // Unlike `Stop`'s CONFLICT (which falls through to the generic
+        // Protocol-error mapping), Unblock's 409 must map to the typed
+        // variant the tray keys its distinct, cover-safe messaging on.
+        let result = unblock_against_status(
+            &test_socket_path("unblock409"),
+            axum::http::StatusCode::CONFLICT,
+            "a session is running",
+        )
+        .await;
+        assert!(matches!(result, Err(ClientError::SessionRunning)), "got {result:?}");
+    });
+}
+
+#[skuld::test]
+fn unblock_500_maps_to_error() {
+    rt().block_on(async {
+        let result = unblock_against_status(
+            &test_socket_path("unblock500"),
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            "unblock boom",
+        )
+        .await
+        .unwrap();
+        match result {
+            BridgeResponse::Error { message } => assert!(message.contains("unblock boom"), "got {message}"),
+            other => panic!("expected Error, got {other:?}"),
+        }
     });
 }
 

@@ -200,19 +200,29 @@ pub fn lockdown_cover_present(state_dir: &Path) -> bool {
 ///
 /// Contract, load-bearing for every caller:
 ///
-/// 1. **Unconditional.** Never probes presence to decide whether to act.
-///    Idempotent — a clean host returns `Ok`.
+/// 1. **Unconditional.** Never probes the LIVE cover (the WFP/pf objects
+///    themselves) to decide whether to act. Idempotent — a clean host
+///    returns `Ok`. On macOS, "clean host" is read from Hole's own state
+///    file — `StateFile::Absent` — because pf has no query for "who is
+///    holding this ruleset"; the file is the only record. A state file lost
+///    out from under a genuinely live cover (not corrupt — entirely absent,
+///    e.g. an external wipe of `state_dir`) is therefore indistinguishable
+///    from a clean host and `release_all` reports `Ok` without touching pf.
+///    See CONTRIBUTING.md's disclosed residuals.
 /// 2. **Total.** Clears BOTH cover kinds. Clearing only one would leave a
 ///    user with no way out at all.
 /// 3. **No short-circuit.** Every clear is attempted before any failure is
 ///    examined. The only early return is a Windows engine-open failure, where
 ///    nothing could have been issued in the first place.
-/// 4. **Never a false success.** `Ok` means nothing Hole installed is still
-///    holding egress closed. The converse does not hold — the function may
-///    report `Err` over a host that is in fact open. That asymmetry is
-///    deliberate: a false `Err` keeps the escape on the tray menu and the
-///    intent armed, while a false `Ok` is the lockout this function exists to
-///    remove.
+/// 4. **Never a false success from anything `release_all` can observe.** `Ok`
+///    means every cover this call could detect is cleared. The converse does
+///    not hold — the function may report `Err` over a host that is in fact
+///    open. That asymmetry is deliberate: a false `Err` keeps the escape on
+///    the tray menu and the intent armed, while a false `Ok` over a
+///    *detected* cover is the lockout this function exists to remove. Item 1
+///    is the one case where `Ok` can be reported over a still-blocked host —
+///    it is not a violation of this clause, since the cover left no evidence
+///    to detect.
 /// 5. **Bookkeeping is best-effort, except the state-file clear.** The macOS
 ///    `pfctl -X` refcount drop and the Windows sublayer/provider delete log a
 ///    warning on failure and do not fail the call. A cover's state-file clear

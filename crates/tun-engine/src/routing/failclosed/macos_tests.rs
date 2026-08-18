@@ -411,6 +411,8 @@ struct RecordingPfOps {
     log: Vec<&'static str>,
     fail_reload_default: bool,
     fail_load_ruleset: bool,
+    fail_clear_transient: bool,
+    fail_clear_standing: bool,
 }
 
 impl PfOps for RecordingPfOps {
@@ -439,12 +441,20 @@ impl PfOps for RecordingPfOps {
 
     fn clear_transient(&mut self) -> Result<(), RoutingError> {
         self.log.push("clear_transient");
-        Ok(())
+        if self.fail_clear_transient {
+            Err(RoutingError::RouteSetup("mock clear_transient failure".into()))
+        } else {
+            Ok(())
+        }
     }
 
     fn clear_standing(&mut self) -> Result<(), RoutingError> {
         self.log.push("clear_standing");
-        Ok(())
+        if self.fail_clear_standing {
+            Err(RoutingError::RouteSetup("mock clear_standing failure".into()))
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -553,4 +563,87 @@ fn release_all_touches_nothing_when_both_state_files_are_absent() {
     let result = release_all_with(StateFile::Absent, StateFile::Absent, &mut ops);
     assert!(ops.log.is_empty(), "must touch nothing on a clean host: {:?}", ops.log);
     assert!(result.is_ok());
+}
+
+#[skuld::test]
+fn release_all_treats_an_unusable_transient_state_file_as_a_cover_to_clear() {
+    // The transient-side Unusable arm is separately coded (its own warn!
+    // wording about a leaked pf enable refcount, and it unconditionally
+    // reloads the default ruleset rather than trying a restore first) — the
+    // standing-side counterpart above does not exercise it.
+    let mut ops = RecordingPfOps::default();
+    let result = release_all_with(StateFile::Unusable, StateFile::Absent, &mut ops);
+    assert!(
+        ops.log.contains(&"reload_default"),
+        "an Unusable transient state must still trigger the default-ruleset reload: {:?}",
+        ops.log
+    );
+    assert!(
+        ops.log.contains(&"clear_transient"),
+        "a confirmed reload must still clear the state file: {:?}",
+        ops.log
+    );
+    assert!(result.is_ok());
+}
+
+#[skuld::test]
+fn release_all_clears_both_covers_end_to_end_on_a_clean_run() {
+    // The most common real case release_all exists to handle — both covers
+    // stranded, nothing fails — asserted at the sequencer level (not just the
+    // slow, real-firewall privileged test), pinning the full call sequence.
+    let mut ops = RecordingPfOps::default();
+    let result = release_all_with(
+        StateFile::Present(transient_state()),
+        StateFile::Present(standing_state()),
+        &mut ops,
+    );
+    assert!(result.is_ok(), "everything succeeded: {result:?}");
+    assert_eq!(
+        ops.log,
+        vec![
+            "reload_default",
+            "drop_token",
+            "clear_transient",
+            "load_ruleset",
+            "drop_token",
+            "clear_standing",
+        ],
+        "the full transient-then-standing sequence must run in order: {:?}",
+        ops.log
+    );
+}
+
+#[skuld::test]
+fn release_all_logs_a_swallowed_transient_clear_failure_but_still_reports_ok() {
+    // clear_transient/clear_standing are best-effort (contract item 5): a
+    // failure there must not fail the call, but it also must not vanish
+    // silently — every sibling caller of the same underlying clear
+    // (`disengage`, `disengage_lockdown`) logs on failure.
+    let mut ops = RecordingPfOps {
+        fail_clear_transient: true,
+        ..Default::default()
+    };
+    let result = release_all_with(StateFile::Present(transient_state()), StateFile::Absent, &mut ops);
+    assert!(
+        result.is_ok(),
+        "a failed state-file clear must not fail the call: {result:?}"
+    );
+    assert!(
+        ops.log.contains(&"clear_transient"),
+        "the clear must still be attempted"
+    );
+}
+
+#[skuld::test]
+fn release_all_logs_a_swallowed_standing_clear_failure_but_still_reports_ok() {
+    let mut ops = RecordingPfOps {
+        fail_clear_standing: true,
+        ..Default::default()
+    };
+    let result = release_all_with(StateFile::Absent, StateFile::Present(standing_state()), &mut ops);
+    assert!(
+        result.is_ok(),
+        "a failed state-file clear must not fail the call: {result:?}"
+    );
+    assert!(ops.log.contains(&"clear_standing"), "the clear must still be attempted");
 }
