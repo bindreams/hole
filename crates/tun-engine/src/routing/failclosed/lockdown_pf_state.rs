@@ -47,30 +47,48 @@ pub fn save(state_dir: &Path, state: &LockdownPfState, owner: Option<(u32, u32)>
     Ok(())
 }
 
-pub fn load(state_dir: &Path) -> Option<LockdownPfState> {
+/// Trichotomy read distinguishing "no cover was ever engaged" (`Absent`) from
+/// "a cover's evidence exists but we cannot read it" (`Unusable`) — a corrupt,
+/// unparseable, or version-skewed file. Collapsing `Unusable` into `Absent`
+/// would make a release read a live, blocking cover as nothing to clear (see
+/// `release_all`'s doc). `Absent` is ONLY `ErrorKind::NotFound`; every other
+/// read/parse/version failure is `Unusable` (keeps the existing `warn!` lines).
+pub fn load_presence(state_dir: &Path) -> super::StateFile<LockdownPfState> {
+    use super::StateFile;
     let path = state_file(state_dir);
     let bytes = match std::fs::read(&path) {
         Ok(b) => b,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return StateFile::Absent,
         Err(e) => {
             tracing::warn!(error = %e, path = %path.display(), "lockdown-pf-state read failed");
-            return None;
+            return StateFile::Unusable;
         }
     };
     match serde_json::from_slice::<LockdownPfState>(&bytes) {
-        Ok(s) if s.version == SCHEMA_VERSION => Some(s),
+        Ok(s) if s.version == SCHEMA_VERSION => StateFile::Present(s),
         Ok(other) => {
             tracing::warn!(
                 got = other.version,
                 want = SCHEMA_VERSION,
                 "lockdown-pf-state schema mismatch, discarding"
             );
-            None
+            StateFile::Unusable
         }
         Err(e) => {
             tracing::warn!(error = %e, path = %path.display(), "lockdown-pf-state parse failed");
-            None
+            StateFile::Unusable
         }
+    }
+}
+
+/// Load the state file, or `None` on any error (absent / corrupt / unknown
+/// field / version mismatch). Thin wrapper over [`load_presence`], collapsing
+/// `Unusable` into `None` alongside `Absent` — every existing caller treats
+/// the two identically.
+pub fn load(state_dir: &Path) -> Option<LockdownPfState> {
+    match load_presence(state_dir) {
+        super::StateFile::Present(s) => Some(s),
+        super::StateFile::Absent | super::StateFile::Unusable => None,
     }
 }
 

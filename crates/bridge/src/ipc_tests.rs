@@ -11,7 +11,7 @@ use hyper_util::rt::TokioIo;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tun_engine::gateway::GatewayInfo;
@@ -143,6 +143,13 @@ impl Drop for MockRunning {
 struct MockRouting {
     state_dir: PathBuf,
     fail_gateway: AtomicBool,
+    /// Number of `release_all_covers` calls, so a test can assert the
+    /// unconditional escape fired exactly once (or not at all). `Arc`-shared
+    /// (mirroring `MockProxy::traffic`) so a test can clone it out BEFORE
+    /// `routing` moves into the `ProxyManager`.
+    release_all_calls: Arc<AtomicU32>,
+    /// `release_all_covers` returns `RoutingError::RouteSetup` when set.
+    fail_release: Arc<AtomicBool>,
 }
 
 impl MockRouting {
@@ -150,6 +157,8 @@ impl MockRouting {
         Self {
             state_dir,
             fail_gateway: AtomicBool::new(false),
+            release_all_calls: Arc::new(AtomicU32::new(0)),
+            fail_release: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -157,6 +166,8 @@ impl MockRouting {
         Self {
             state_dir,
             fail_gateway: AtomicBool::new(true),
+            release_all_calls: Arc::new(AtomicU32::new(0)),
+            fail_release: Arc::new(AtomicBool::new(false)),
         }
     }
 }
@@ -216,6 +227,14 @@ impl Routing for MockRouting {
         _app_ids: &[PathBuf],
     ) -> Result<MockCover, RoutingError> {
         Ok(MockCover)
+    }
+
+    fn release_all_covers(&self) -> Result<(), RoutingError> {
+        self.release_all_calls.fetch_add(1, Ordering::SeqCst);
+        if self.fail_release.load(Ordering::SeqCst) {
+            return Err(RoutingError::RouteSetup("mock release_all_covers failure".into()));
+        }
+        Ok(())
     }
 }
 

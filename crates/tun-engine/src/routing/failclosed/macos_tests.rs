@@ -365,3 +365,192 @@ fn restore_empty_nat_has_no_blank_line() {
     let r = build_lockdown_restore_ruleset("", FILTER_SNAP);
     assert!(!r.contains("\n\n"), "empty nat must not produce a blank line:\n{r}");
 }
+
+// restore_confirmed ===================================================================================================
+
+fn exit_status(code: i32) -> std::process::ExitStatus {
+    use std::os::unix::process::ExitStatusExt;
+    std::process::ExitStatus::from_raw(code)
+}
+
+fn output_with_status(code: i32) -> Result<std::process::Output, RoutingError> {
+    Ok(std::process::Output {
+        status: exit_status(code),
+        stdout: Vec::new(),
+        stderr: Vec::new(),
+    })
+}
+
+#[skuld::test]
+fn release_all_restore_confirmed_requires_a_successful_exit_status() {
+    // adopting=true short-circuits to true regardless of `out` — nothing was
+    // attempted, so nothing can have failed to confirm.
+    assert!(restore_confirmed(true, &output_with_status(0)));
+    assert!(restore_confirmed(true, &Err(RoutingError::RouteSetup("unused".into()))));
+
+    // adopting=false: only a successful spawn AND a zero exit status confirms.
+    assert!(restore_confirmed(false, &output_with_status(0)));
+    assert!(
+        !restore_confirmed(false, &output_with_status(1)),
+        "a non-zero pfctl exit must NOT be mistaken for confirmation"
+    );
+    assert!(!restore_confirmed(
+        false,
+        &Err(RoutingError::RouteSetup("spawn failed".into()))
+    ));
+}
+
+// release_all_with ====================================================================================================
+
+/// `PfOps` test double: records every call (by method name) and returns a
+/// per-method injectable result, so the sequencer's ordering, the
+/// no-short-circuit property, and the clear-only-on-confirm rule are
+/// table-tested without shelling out to `pfctl`.
+#[derive(Default)]
+struct RecordingPfOps {
+    log: Vec<&'static str>,
+    fail_reload_default: bool,
+    fail_load_ruleset: bool,
+}
+
+impl PfOps for RecordingPfOps {
+    fn reload_default(&mut self) -> Result<(), RoutingError> {
+        self.log.push("reload_default");
+        if self.fail_reload_default {
+            Err(RoutingError::RouteSetup("mock reload_default failure".into()))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn load_ruleset(&mut self, _text: &str) -> Result<(), RoutingError> {
+        self.log.push("load_ruleset");
+        if self.fail_load_ruleset {
+            Err(RoutingError::RouteSetup("mock load_ruleset failure".into()))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn drop_token(&mut self, _token: &str) -> Result<(), RoutingError> {
+        self.log.push("drop_token");
+        Ok(())
+    }
+
+    fn clear_transient(&mut self) -> Result<(), RoutingError> {
+        self.log.push("clear_transient");
+        Ok(())
+    }
+
+    fn clear_standing(&mut self) -> Result<(), RoutingError> {
+        self.log.push("clear_standing");
+        Ok(())
+    }
+}
+
+fn transient_state() -> state::FailClosedState {
+    state::FailClosedState {
+        version: state::SCHEMA_VERSION,
+        pf_token: "111".into(),
+        pf_was_enabled: false,
+    }
+}
+
+fn standing_state() -> lockdown_state::LockdownPfState {
+    lockdown_state::LockdownPfState {
+        version: lockdown_state::SCHEMA_VERSION,
+        pf_token: "222".into(),
+        main_snapshot: String::new(),
+        nat_snapshot: String::new(),
+    }
+}
+
+#[skuld::test]
+fn release_all_attempts_the_standing_cover_after_a_transient_failure() {
+    // The short-circuit that would strand the standing cover — the cover that
+    // blocks indefinitely — must not exist.
+    let mut ops = RecordingPfOps {
+        fail_reload_default: true,
+        ..Default::default()
+    };
+    let result = release_all_with(
+        StateFile::Present(transient_state()),
+        StateFile::Present(standing_state()),
+        &mut ops,
+    );
+    assert!(
+        ops.log.contains(&"load_ruleset"),
+        "the standing cover must still be attempted: {:?}",
+        ops.log
+    );
+    assert!(result.is_err());
+}
+
+#[skuld::test]
+fn release_all_keeps_the_transient_state_file_when_the_restore_fails() {
+    // Erasing the cover's only record here would make the NEXT call return Ok
+    // over a still-blocked host — a permanent lockout.
+    let mut ops = RecordingPfOps {
+        fail_reload_default: true,
+        ..Default::default()
+    };
+    let _ = release_all_with(StateFile::Present(transient_state()), StateFile::Absent, &mut ops);
+    assert!(
+        !ops.log.contains(&"clear_transient"),
+        "must not clear the state file over an unconfirmed restore: {:?}",
+        ops.log
+    );
+}
+
+#[skuld::test]
+fn release_all_keeps_the_standing_state_file_when_restore_and_fallback_both_fail() {
+    let mut ops = RecordingPfOps {
+        fail_load_ruleset: true,
+        fail_reload_default: true,
+        ..Default::default()
+    };
+    let result = release_all_with(StateFile::Absent, StateFile::Present(standing_state()), &mut ops);
+    assert!(
+        !ops.log.contains(&"clear_standing"),
+        "must not clear the state file when both the snapshot restore and the fallback failed: {:?}",
+        ops.log
+    );
+    assert!(result.is_err());
+}
+
+#[skuld::test]
+fn release_all_falls_back_to_the_default_ruleset_when_the_snapshot_will_not_load() {
+    let mut ops = RecordingPfOps {
+        fail_load_ruleset: true,
+        ..Default::default()
+    };
+    let result = release_all_with(StateFile::Absent, StateFile::Present(standing_state()), &mut ops);
+    assert!(result.is_ok(), "a successful fallback is not an error: {result:?}");
+    assert!(
+        ops.log.contains(&"clear_standing"),
+        "a confirmed fallback must still clear the state file: {:?}",
+        ops.log
+    );
+}
+
+#[skuld::test]
+fn release_all_treats_an_unusable_state_file_as_a_cover_to_clear() {
+    // A corrupt or version-skewed file must never be read as "nothing to clear".
+    let mut ops = RecordingPfOps::default();
+    let _ = release_all_with(StateFile::Absent, StateFile::Unusable, &mut ops);
+    assert!(
+        ops.log.contains(&"reload_default"),
+        "an Unusable standing state must still trigger the default-ruleset fallback: {:?}",
+        ops.log
+    );
+}
+
+#[skuld::test]
+fn release_all_touches_nothing_when_both_state_files_are_absent() {
+    // A blanket /etc/pf.conf reload here would destroy a healthy host's live
+    // third-party ruleset.
+    let mut ops = RecordingPfOps::default();
+    let result = release_all_with(StateFile::Absent, StateFile::Absent, &mut ops);
+    assert!(ops.log.is_empty(), "must touch nothing on a clean host: {:?}", ops.log);
+    assert!(result.is_ok());
+}

@@ -45,7 +45,7 @@ struct MockProxyState {
     bytes_out: AtomicU64,
 }
 
-struct MockProxy {
+pub(super) struct MockProxy {
     state: Arc<MockProxyState>,
     /// If Some, `start` awaits this gate before returning — used to park
     /// start mid-flight so cancellation tests can fire the cancel token
@@ -59,7 +59,7 @@ struct MockProxy {
 }
 
 impl MockProxy {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         Self {
             state: Arc::new(MockProxyState::default()),
             start_gate: None,
@@ -122,7 +122,7 @@ impl Proxy for MockProxy {
     }
 }
 
-struct MockRunning {
+pub(super) struct MockRunning {
     state: Arc<MockProxyState>,
     handle: Option<JoinHandle<io::Result<()>>>,
 }
@@ -162,17 +162,22 @@ impl Drop for MockRunning {
 
 // MockRouting =========================================================================================================
 
-struct MockRoutingState {
+pub(super) struct MockRoutingState {
     install_calls: AtomicU32,
     teardown_calls: AtomicU32,
     fail_install: AtomicBool,
     fail_gateway: AtomicBool,
     cover_engage_calls: AtomicU32,
-    cover_disengage_calls: AtomicU32,
+    pub(super) cover_disengage_calls: AtomicU32,
     lockdown_engage_calls: AtomicU32,
     lockdown_disengage_calls: AtomicU32,
     fail_lockdown: AtomicBool,
     fail_cover: AtomicBool,
+    /// Number of `release_all_covers` calls, so a test can assert the
+    /// unconditional escape fired exactly once (or not at all).
+    pub(super) release_all_calls: AtomicU32,
+    /// `release_all_covers` returns `RoutingError::RouteSetup` when set.
+    pub(super) fail_release: AtomicBool,
     /// Ordered record of teardown events ("routes" / "lockdown") so a test can
     /// observe the unwind teardown sequence. Shared via the `Arc<MockRoutingState>`
     /// both `MockRoutes` and `MockCover` clone.
@@ -209,6 +214,8 @@ impl Default for MockRoutingState {
             lockdown_disengage_calls: AtomicU32::new(0),
             fail_lockdown: AtomicBool::new(false),
             fail_cover: AtomicBool::new(false),
+            release_all_calls: AtomicU32::new(0),
+            fail_release: AtomicBool::new(false),
             teardown_order: std::sync::Mutex::new(Vec::new()),
             last_install_server_ip: std::sync::Mutex::new(None),
             last_cover_server_ip: std::sync::Mutex::new(None),
@@ -218,7 +225,7 @@ impl Default for MockRoutingState {
     }
 }
 
-struct MockRouting {
+pub(super) struct MockRouting {
     state: Arc<MockRoutingState>,
     /// Directory where the crash-recovery state file is written. Each
     /// `MockRouting` owns its own `state_dir` — in production,
@@ -229,7 +236,7 @@ struct MockRouting {
 }
 
 impl MockRouting {
-    fn new(state_dir: PathBuf) -> Self {
+    pub(super) fn new(state_dir: PathBuf) -> Self {
         Self {
             state: Arc::new(MockRoutingState::default()),
             state_dir,
@@ -255,7 +262,7 @@ impl MockRouting {
         m
     }
 
-    fn state(&self) -> Arc<MockRoutingState> {
+    pub(super) fn state(&self) -> Arc<MockRoutingState> {
         Arc::clone(&self.state)
     }
 }
@@ -354,9 +361,17 @@ impl Routing for MockRouting {
             lockdown: true,
         })
     }
+
+    fn release_all_covers(&self) -> Result<(), RoutingError> {
+        self.state.release_all_calls.fetch_add(1, Ordering::SeqCst);
+        if self.state.fail_release.load(Ordering::SeqCst) {
+            return Err(RoutingError::RouteSetup("mock release_all_covers failure".into()));
+        }
+        Ok(())
+    }
 }
 
-struct MockRoutes {
+pub(super) struct MockRoutes {
     state: Arc<MockRoutingState>,
     state_dir: PathBuf,
 }
@@ -369,7 +384,7 @@ impl Drop for MockRoutes {
     }
 }
 
-struct MockCover {
+pub(super) struct MockCover {
     state: Arc<MockRoutingState>,
     /// Whether this guard holds the standing lockdown cover (vs the transient
     /// fail-closed cover) — selects which disengage counter Drop bumps, mirroring
@@ -435,7 +450,7 @@ fn mock_failing_lockdown_returns_err_without_recording() {
 
 // Helpers =============================================================================================================
 
-fn rt() -> tokio::runtime::Runtime {
+pub(super) fn rt() -> tokio::runtime::Runtime {
     tokio::runtime::Runtime::new().unwrap()
 }
 
@@ -492,7 +507,7 @@ fn new_manager_with_lockdown(
     (pm, dir)
 }
 
-fn test_config() -> ProxyConfig {
+pub(super) fn test_config() -> ProxyConfig {
     ProxyConfig {
         server: ServerEntry {
             id: "test-id".into(),

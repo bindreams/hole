@@ -24,6 +24,25 @@ use crate::error::RoutingError;
 /// the boundary too.
 pub const RESOLVER_PERMIT_PORT: u16 = 443;
 
+/// A cover's on-disk state-file read, distinguishing "never engaged" from "the
+/// evidence exists but cannot be read". Collapsing the latter into the former
+/// would make [`release_all`] treat a corrupt or version-skewed file as
+/// nothing to clear over a host its cover may still be holding closed — see
+/// `release_all`'s doc for why that distinction is load-bearing. Generic and
+/// declared here (not per-platform) so both macOS state modules share one
+/// reader shape.
+#[derive(Debug)]
+pub enum StateFile<T> {
+    /// No file — no cover of this kind was ever engaged (or a prior release
+    /// already cleared it).
+    Absent,
+    /// A file exists but could not be read, parsed, or matched the expected
+    /// schema version. Treated as a cover to clear, never as absence.
+    Unusable,
+    /// A file exists and parsed at the current schema version.
+    Present(T),
+}
+
 // macOS persists its pf enable token; Windows recovers WFP filters by fixed
 // GUID and needs no state.
 #[cfg(target_os = "macos")]
@@ -172,6 +191,43 @@ pub fn lockdown_cover_present(state_dir: &Path) -> bool {
     }
 }
 
+/// Clear every fail-closed cover this platform can install — both the
+/// transient block-until-connected cover and the standing lockdown cover —
+/// without ever asking whether either is present. This is the escape from a
+/// stranded cover: the tray's Unblock item and turning the kill switch off
+/// both reach the host through this one function, and nothing else in this
+/// crate clears a cover conditionally on its presence.
+///
+/// Contract, load-bearing for every caller:
+///
+/// 1. **Unconditional.** Never probes presence to decide whether to act.
+///    Idempotent — a clean host returns `Ok`.
+/// 2. **Total.** Clears BOTH cover kinds. Clearing only one would leave a
+///    user with no way out at all.
+/// 3. **No short-circuit.** Every clear is attempted before any failure is
+///    examined. The only early return is a Windows engine-open failure, where
+///    nothing could have been issued in the first place.
+/// 4. **Never a false success.** `Ok` means nothing Hole installed is still
+///    holding egress closed. The converse does not hold — the function may
+///    report `Err` over a host that is in fact open. That asymmetry is
+///    deliberate: a false `Err` keeps the escape on the tray menu and the
+///    intent armed, while a false `Ok` is the lockout this function exists to
+///    remove.
+/// 5. **Bookkeeping is best-effort, except the state-file clear.** The macOS
+///    `pfctl -X` refcount drop and the Windows sublayer/provider delete log a
+///    warning on failure and do not fail the call. A cover's state-file clear
+///    is different: it is *skipped* whenever that cover's replacement ruleset
+///    did not confirm, because the file is the cover's only record — clearing
+///    it after an unconfirmed restore would make the next call read a clean
+///    host while the block persists (a manufactured, permanent lockout).
+///
+/// Windows keeps no cover state file at all: the filter set is compiled-in
+/// fixed GUIDs, so there is no bookkeeping that can be corrupt or
+/// version-skewed and nothing to erase — only GUID sweeps run there.
+pub fn release_all(state_dir: &Path) -> Result<(), RoutingError> {
+    platform::release_all(state_dir)
+}
+
 /// Windows-only test helper: resolve the LUID then build the spec, exercising
 /// the exact resolve-then-build ordering `engage_lockdown` uses, without FWPM.
 #[cfg(all(test, target_os = "windows"))]
@@ -197,3 +253,10 @@ mod facade_tests;
 #[cfg(test)]
 #[path = "failclosed/lockdown_privileged_tests.rs"]
 mod lockdown_privileged_tests;
+
+// Privileged-lane real-firewall proof that `release_all` really clears both
+// cover kinds and never a clean host's live ruleset. Gated identically to
+// `lockdown_privileged_tests` above — see that module's doc.
+#[cfg(test)]
+#[path = "failclosed/release_privileged_tests.rs"]
+mod release_privileged_tests;

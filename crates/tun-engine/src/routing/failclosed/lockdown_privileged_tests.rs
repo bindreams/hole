@@ -46,7 +46,7 @@
 use super::*;
 
 #[skuld::label]
-const TUN: skuld::Label;
+pub(super) const TUN: skuld::Label;
 
 // Two routable anycast hosts on :443 (the runner has outbound internet). IP
 // literals only — the cover blocks DNS, so a hostname connect would fail for the

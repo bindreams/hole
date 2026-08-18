@@ -643,6 +643,37 @@ fn new_loopbacknet_guids_are_in_their_sweep_floors_and_distinct() {
     }
 }
 
+// release_all =========================================================================================================
+
+#[skuld::test]
+fn release_all_first_delete_failure_reports_the_first_real_error_and_inspects_every_code() {
+    // Not-found is benign (a clean host or an already-swept filter); the fold
+    // must skip it and report the FIRST genuine failure, not stop at it —
+    // every code in the slice must have been issued already by the caller.
+    let codes = [
+        ("a", ERROR_SUCCESS.0),
+        ("b", FWP_E_FILTER_NOT_FOUND_DWORD),
+        ("c", 0x1234_5678),
+        ("d", 0x9abc_def0),
+    ];
+    let err = first_delete_failure(&codes).expect("a genuine failure must be reported");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("0x12345678"),
+        "must name the FIRST genuine failure's code: {msg}"
+    );
+    assert!(
+        !msg.contains("0x9abcdef0"),
+        "must not report the second failure's code: {msg}"
+    );
+
+    let clean = [("a", ERROR_SUCCESS.0), ("b", FWP_E_FILTER_NOT_FOUND_DWORD)];
+    assert!(
+        first_delete_failure(&clean).is_none(),
+        "success and not-found must never be treated as an error"
+    );
+}
+
 #[skuld::test]
 fn adopt_does_not_delete_the_address_range_loopback_floor() {
     // The address-range loopback permits are floor, not volatile: Adopt must keep

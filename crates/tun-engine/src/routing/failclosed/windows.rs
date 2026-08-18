@@ -461,6 +461,29 @@ fn block(guid: GUID, layer: Layer) -> FilterSpec {
 /// our own object is benign idempotency, not an error.
 const FWP_E_ALREADY_EXISTS_DWORD: u32 = 0x8032_0009;
 
+/// `FWP_E_FILTER_NOT_FOUND` as the Win32 DWORD `FwpmFilterDeleteByKey0`
+/// returns (the `windows` crate exposes the constant only as an `HRESULT`, and
+/// these FWPM functions return a bare `u32` — see [`FWP_E_ALREADY_EXISTS_DWORD`]'s
+/// doc for why that mismatch matters). A delete that finds nothing is benign:
+/// the filter was never installed (a clean host) or a prior release already
+/// removed it — never treated as an error.
+const FWP_E_FILTER_NOT_FOUND_DWORD: u32 = 0x8032_0003;
+
+/// Walk every `(what, code)` pair and return the first GENUINE failure — a
+/// code that is neither `ERROR_SUCCESS` nor "filter not found". Pure and total
+/// over the slice: it never stops at the first failure to decide whether to
+/// keep going, so a caller that issues every delete before calling this gets
+/// a structurally short-circuit-free fold.
+fn first_delete_failure(codes: &[(&'static str, u32)]) -> Option<RoutingError> {
+    codes.iter().find_map(|&(what, code)| {
+        if code == ERROR_SUCCESS.0 || code == FWP_E_FILTER_NOT_FOUND_DWORD {
+            None
+        } else {
+            Some(RoutingError::RouteSetup(format!("{what} delete failed: 0x{code:08x}")))
+        }
+    })
+}
+
 /// Which cover a [`Cover`] guard owns — selects the GUID set its Drop deletes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CoverKind {
@@ -999,6 +1022,55 @@ unsafe fn delete_all(engine: HANDLE) {
     }
     let _ = FwpmSubLayerDeleteByKey0(engine, &SUBLAYER_GUID);
     let _ = FwpmProviderDeleteByKey0(engine, &PROVIDER_GUID);
+}
+
+/// Clear every fail-closed cover Windows can install — both the lockdown
+/// (standing) and transient filter sets — without asking whether either is
+/// present. See `failclosed::release_all` for the full contract; this is its
+/// Windows body. Windows keeps no cover state file: the filter set is
+/// compiled-in fixed GUIDs, so there is no bookkeeping that can be corrupt or
+/// version-skewed and nothing to erase — only the GUID sweeps below run.
+///
+/// Opens the FWPM engine once. A failed open means the firewall could not be
+/// reached at all, so nothing could have been deleted — the ONLY early
+/// return; it does not mean "not elevated" (FWPM opens without elevation).
+/// Every delete is ISSUED before any code is inspected — a short-circuit is
+/// structurally impossible — then the codes are folded by
+/// `first_delete_failure`. The sublayer/provider delete is best-effort
+/// (ignored): an orphaned empty sublayer/provider holds no traffic, matching
+/// `delete_all`.
+pub fn release_all(_state_dir: &Path) -> Result<(), RoutingError> {
+    unsafe {
+        let mut engine = HANDLE::default();
+        #[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
+        let rc = FwpmEngineOpen0(PCWSTR::null(), RPC_C_AUTHN_WINNT, None, None, &mut engine);
+        if rc != ERROR_SUCCESS.0 {
+            return Err(RoutingError::RouteSetup(format!(
+                "FwpmEngineOpen0 failed (0x{rc:08x}): the firewall could not be reached, so nothing could have been deleted"
+            )));
+        }
+
+        let mut codes: Vec<(&'static str, u32)> = Vec::new();
+        #[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
+        for g in swept_lockdown_guids() {
+            codes.push(("lockdown filter", FwpmFilterDeleteByKey0(engine, &g)));
+        }
+        #[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
+        for g in swept_transient_guids() {
+            codes.push(("transient filter", FwpmFilterDeleteByKey0(engine, &g)));
+        }
+        #[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
+        let _ = FwpmSubLayerDeleteByKey0(engine, &SUBLAYER_GUID);
+        #[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
+        let _ = FwpmProviderDeleteByKey0(engine, &PROVIDER_GUID);
+        #[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
+        let _ = FwpmEngineClose0(engine);
+
+        match first_delete_failure(&codes) {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
 }
 
 #[cfg(test)]
