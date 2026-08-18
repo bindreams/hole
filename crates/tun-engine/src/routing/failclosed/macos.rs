@@ -30,6 +30,7 @@ use crate::error::RoutingError;
 // `failclosed` module and `failclosed_state` is its sibling child.
 use super::failclosed_state as state;
 use super::lockdown_pf_state as lockdown_state;
+use super::StateFile;
 use super::RESOLVER_PERMIT_PORT;
 
 /// Build the self-contained pf ruleset (loaded via `pfctl -f -`).
@@ -257,23 +258,60 @@ impl Drop for Cover {
     }
 }
 
+/// The single rule for "did the ruleset that replaces a cover actually load".
+/// `true` when `adopting` — the reload is deliberately SKIPPED because a
+/// standing cover is holding the host, so nothing was attempted and nothing
+/// failed. Otherwise `out` must be `Ok` AND its exit status a success: a
+/// spawn-result check alone is blind to `pfctl` failing on its exit status,
+/// and that is exactly the case that would erase a cover's only evidence out
+/// from under a still-blocking ruleset. Shared by `disengage` and
+/// `release_all_with` so there is one answer to this question, not two that
+/// can drift apart.
+fn restore_confirmed(adopting: bool, out: &Result<std::process::Output, RoutingError>) -> bool {
+    if adopting {
+        return true;
+    }
+    matches!(out, Ok(o) if o.status.success())
+}
+
 /// Drop the transient enable refcount + clear the file. When `adopting` is
 /// false, also restore the canonical ruleset (the transient engage did `-Fa`,
 /// flushing host rules, so the restore is mandatory to undo the flush). When a
 /// standing cover is being adopted, skip the `/etc/pf.conf` reload — it would
 /// wipe the standing lockdown ruleset (which is the live main ruleset) before
-/// Adopt. Best-effort; logs on failure. Shared by `Drop` and `recover_cover`.
+/// Adopt. The `-X` drop is best-effort regardless; the state-file clear is
+/// NOT — it runs only when [`restore_confirmed`] says the replacement ruleset
+/// actually loaded, so a failed (but not adopting) restore leaves the file in
+/// place rather than erasing the cover's only record over a still-blocked
+/// host. Shared by `Drop` and `recover_cover`.
 fn disengage(token: &str, state_dir: &Path, adopting: bool) {
-    if adopting {
+    // The placeholder `Err` in the `adopting` branch is never read:
+    // `restore_confirmed(true, _)` returns `true` unconditionally, since
+    // nothing was attempted to confirm.
+    let reload: Result<std::process::Output, RoutingError> = if adopting {
         tracing::info!("standing lockdown cover being adopted; skipping /etc/pf.conf reload during transient sweep");
-    } else if let Err(e) = pfctl(&["-f", PFCONF], None, PHASE_RECOVER_COVER) {
-        tracing::warn!(error = %e, "pf ruleset restore failed during cover disengage");
-    }
+        Err(RoutingError::RouteSetup(
+            "reload skipped: standing cover is being adopted".into(),
+        ))
+    } else {
+        let out = pfctl(&["-f", PFCONF], None, PHASE_RECOVER_COVER);
+        if let Err(ref e) = out {
+            tracing::warn!(error = %e, "pf ruleset restore failed during cover disengage");
+        }
+        out
+    };
     if let Err(e) = pfctl(&["-X", token], None, PHASE_RECOVER_COVER) {
         tracing::warn!(error = %e, "pfctl -X failed during cover disengage");
     }
-    if let Err(e) = state::clear(state_dir) {
-        tracing::warn!(error = %e, "failclosed-state clear failed during cover disengage");
+    if restore_confirmed(adopting, &reload) {
+        if let Err(e) = state::clear(state_dir) {
+            tracing::warn!(error = %e, "failclosed-state clear failed during cover disengage");
+        }
+    } else {
+        tracing::warn!(
+            "leaving failclosed-state file in place: the /etc/pf.conf restore did not confirm — clearing it \
+             now would make the next sweep read a clean host while the block persists"
+        );
     }
 }
 
@@ -482,6 +520,195 @@ pub fn recover_lockdown(decision: crate::routing::CoverRecovery, state_dir: &Pat
             lockdown_disengage(state_dir);
         }
     }
+}
+
+// release_all =========================================================================================================
+
+/// Seam over the pf operations `release_all_with` needs, so the ordering, the
+/// no-short-circuit property, and the clear-only-on-confirm rule are
+/// table-tested without shelling out to `pfctl`. A non-success `pfctl` exit
+/// status is ALREADY folded into `Err` by the implementation (`RealPfOps`),
+/// so `release_all_with` itself never inspects an exit code.
+pub(crate) trait PfOps {
+    /// `pfctl -f /etc/pf.conf`: reload the host's canonical ruleset.
+    fn reload_default(&mut self) -> Result<(), RoutingError>;
+    /// `pfctl -f -` with `text` on stdin: load a specific ruleset.
+    fn load_ruleset(&mut self, text: &str) -> Result<(), RoutingError>;
+    /// `pfctl -X <token>`: drop a pf enable refcount. Always best-effort at
+    /// the call site — its `Err` is never propagated.
+    fn drop_token(&mut self, token: &str) -> Result<(), RoutingError>;
+    /// Delete the transient cover's state file.
+    fn clear_transient(&mut self) -> Result<(), RoutingError>;
+    /// Delete the standing lockdown cover's state file.
+    fn clear_standing(&mut self) -> Result<(), RoutingError>;
+}
+
+/// The unconditional two-cover clear, factored as a pure sequencer over an
+/// injected [`PfOps`] so it is table-tested without touching pf. See
+/// `failclosed::release_all`'s doc for the contract this implements.
+///
+/// One `first_err` accumulator, two blocks, no `?` — a `?` would short-circuit
+/// the block that had not run yet.
+pub(crate) fn release_all_with(
+    transient: StateFile<state::FailClosedState>,
+    standing: StateFile<lockdown_state::LockdownPfState>,
+    ops: &mut dyn PfOps,
+) -> Result<(), RoutingError> {
+    let mut first_err: Option<RoutingError> = None;
+
+    // Block 1 — transient cover. A reload failure is recorded but does NOT
+    // stop block 2: the standing cover is the one that blocks indefinitely
+    // and must be attempted regardless.
+    match transient {
+        StateFile::Absent => {}
+        StateFile::Present(st) => {
+            let reload = ops.reload_default();
+            let _ = ops.drop_token(&st.pf_token);
+            match reload {
+                Ok(()) => {
+                    if let Err(e) = ops.clear_transient() {
+                        tracing::warn!(error = %e, "failclosed-state clear failed during release_all");
+                    }
+                }
+                Err(e) => first_err = Some(e),
+            }
+        }
+        StateFile::Unusable => {
+            tracing::warn!(
+                "transient failclosed-state file is unusable; no pf token to drop — a pf enable \
+                 refcount may be leaked (pf then stays enabled over the canonical /etc/pf.conf, \
+                 which blocks nothing, and a reboot resets it)"
+            );
+            match ops.reload_default() {
+                Ok(()) => {
+                    if let Err(e) = ops.clear_transient() {
+                        tracing::warn!(error = %e, "failclosed-state clear failed during release_all");
+                    }
+                }
+                Err(e) => first_err = Some(e),
+            }
+        }
+    }
+
+    // Block 2 — standing cover.
+    match standing {
+        StateFile::Absent => {}
+        StateFile::Present(st) => {
+            let restore = build_lockdown_restore_ruleset(&st.nat_snapshot, &st.main_snapshot);
+            let outcome = match ops.load_ruleset(&restore) {
+                Ok(()) => Ok(()),
+                Err(snapshot_err) => match ops.reload_default() {
+                    Ok(()) => {
+                        tracing::warn!(
+                            error = %snapshot_err,
+                            "captured pf snapshot could not load; fell back to the default ruleset — \
+                             the host's captured pf rules could not be restored"
+                        );
+                        Ok(())
+                    }
+                    Err(fallback_err) => Err(RoutingError::RouteSetup(format!(
+                        "snapshot restore failed ({snapshot_err}); default-ruleset fallback also failed \
+                         ({fallback_err})"
+                    ))),
+                },
+            };
+            let _ = ops.drop_token(&st.pf_token);
+            match outcome {
+                Ok(()) => {
+                    if let Err(e) = ops.clear_standing() {
+                        tracing::warn!(error = %e, "lockdown-pf-state clear failed during release_all");
+                    }
+                }
+                Err(e) => {
+                    if first_err.is_none() {
+                        first_err = Some(e);
+                    }
+                }
+            }
+        }
+        StateFile::Unusable => {
+            tracing::warn!(
+                "standing lockdown-pf-state file is unusable; no snapshot to restore, falling back to \
+                 the default ruleset"
+            );
+            match ops.reload_default() {
+                Ok(()) => {
+                    if let Err(e) = ops.clear_standing() {
+                        tracing::warn!(error = %e, "lockdown-pf-state clear failed during release_all");
+                    }
+                }
+                Err(e) => {
+                    if first_err.is_none() {
+                        first_err = Some(e);
+                    }
+                }
+            }
+        }
+    }
+
+    match first_err {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
+}
+
+/// Production [`PfOps`]: maps each method onto the existing `pfctl` helper,
+/// converting a non-success exit status into `Err`.
+struct RealPfOps<'a> {
+    state_dir: &'a Path,
+}
+
+fn pfctl_status(out: Result<std::process::Output, RoutingError>, what: &str) -> Result<(), RoutingError> {
+    let out = out?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(RoutingError::RouteSetup(format!(
+            "{what} failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )))
+    }
+}
+
+impl PfOps for RealPfOps<'_> {
+    fn reload_default(&mut self) -> Result<(), RoutingError> {
+        pfctl_status(
+            pfctl(&["-f", PFCONF], None, PHASE_RECOVER_COVER),
+            "pf default-ruleset reload",
+        )
+    }
+
+    fn load_ruleset(&mut self, text: &str) -> Result<(), RoutingError> {
+        pfctl_status(
+            pfctl(&["-f", "-"], Some(text.as_bytes()), PHASE_RECOVER_COVER),
+            "pf ruleset load",
+        )
+    }
+
+    fn drop_token(&mut self, token: &str) -> Result<(), RoutingError> {
+        pfctl_status(pfctl(&["-X", token], None, PHASE_RECOVER_COVER), "pfctl -X")
+    }
+
+    fn clear_transient(&mut self) -> Result<(), RoutingError> {
+        state::clear(self.state_dir)
+            .map_err(|e| RoutingError::RouteSetup(format!("failclosed-state clear failed: {e}")))
+    }
+
+    fn clear_standing(&mut self) -> Result<(), RoutingError> {
+        lockdown_state::clear(self.state_dir)
+            .map_err(|e| RoutingError::RouteSetup(format!("lockdown-pf-state clear failed: {e}")))
+    }
+}
+
+/// Clear every fail-closed cover macOS can install — both the transient
+/// block-until-connected cover and the standing lockdown cover — without
+/// asking whether either is present. See `failclosed::release_all` for the
+/// full contract; this loads both state-file presences and delegates the
+/// sequencing to [`release_all_with`].
+pub fn release_all(state_dir: &Path) -> Result<(), RoutingError> {
+    let transient = state::load_presence(state_dir);
+    let standing = lockdown_state::load_presence(state_dir);
+    release_all_with(transient, standing, &mut RealPfOps { state_dir })
 }
 
 #[cfg(test)]

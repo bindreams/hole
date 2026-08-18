@@ -450,6 +450,14 @@ pub trait Routing: Send + Sync {
         tun_name: &str,
         app_ids: &[PathBuf],
     ) -> Result<Self::Cover, RoutingError>;
+
+    /// Clear every fail-closed cover this provider can install — both the
+    /// transient block-until-connected cover and the standing lockdown cover
+    /// — without asking whether either is present. See
+    /// [`failclosed::release_all`] for the full contract. This is the escape
+    /// from a stranded cover; a required method (no default) so every
+    /// `Routing` implementation, including every test mock, commits to one.
+    fn release_all_covers(&self) -> Result<(), RoutingError>;
 }
 
 // System (production) routing =========================================================================================
@@ -536,6 +544,10 @@ impl Routing for SystemRouting {
     ) -> Result<Self::Cover, RoutingError> {
         let resolver = failclosed::SystemLuidResolver;
         failclosed::engage_lockdown(server_ip, tun_name, &resolver, app_ids, &self.state_dir, self.owner)
+    }
+
+    fn release_all_covers(&self) -> Result<(), RoutingError> {
+        failclosed::release_all(&self.state_dir)
     }
 }
 

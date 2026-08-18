@@ -300,6 +300,12 @@ fn route_lockdown_path_is_stable() {
 }
 
 #[skuld::test]
+fn route_unblock_matches_the_spec_path() {
+    use crate::protocol::ROUTE_UNBLOCK;
+    assert_eq!(ROUTE_UNBLOCK, "/v1/unblock");
+}
+
+#[skuld::test]
 fn status_response_lockdown_fields_default_false_for_old_clients() {
     use crate::protocol::StatusResponse;
     // An old client sends a StatusResponse JSON without the lockdown fields;

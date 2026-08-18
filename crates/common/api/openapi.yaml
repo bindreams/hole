@@ -125,7 +125,10 @@ paths:
       description: |
         Last-writer-wins absolute set of the bridge-owned, system-wide
         lockdown intent. Any authorized caller may toggle it freely. Returns
-        200 with EmptyResponse on success.
+        200 with EmptyResponse on success. Turning the intent OFF also
+        releases any fail-closed cover no running session owns, immediately —
+        the same unconditional release `POST /v1/unblock` performs — rather
+        than deferring that release to the next start.
       operationId: setLockdown
       requestBody:
         required: true
@@ -141,7 +144,46 @@ paths:
               schema:
                 $ref: "#/components/schemas/EmptyResponse"
         "500":
-          description: Failed to persist lockdown intent
+          description: >-
+            Turning the intent on: failed to persist it. Turning the intent
+            off: either the release failed and the intent is still on, or the
+            release succeeded and only the setting could not be saved
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /v1/unblock:
+    post:
+      summary: Unconditionally clear every fail-closed cover no running session owns, and turn the kill switch off
+      description: |
+        Clears every fail-closed cover Hole can install (the standing
+        lockdown cover and the transient block-until-connected cover) without
+        asking whether either is present, then turns the kill-switch intent
+        off. This is the escape from a stranded cover left behind by an
+        unclean exit — it never inspects cover state, only whether a session
+        is currently running.
+      operationId: unblockNetwork
+      responses:
+        "200":
+          description: Every cover Hole can install has been cleared and the intent is off
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/EmptyResponse"
+        "409":
+          description: >-
+            A session is running, so there was no unowned cover to clear; the
+            intent is now off and the caller should disconnect to release the
+            session's own cover
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "500":
+          description: >-
+            Either the release failed and the host may still be held closed,
+            or the network is open but the setting could not be saved
           content:
             application/json:
               schema:

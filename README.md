@@ -43,12 +43,13 @@ app is notarized.
 
 The GUI is the primary interface; these CLI commands are also available:
 
-| Command                              | Description                                      |
-| ------------------------------------ | ------------------------------------------------ |
-| `hole [--no-show-dashboard]`         | Launch the GUI (default); opens the dashboard    |
-| `hole version`                       | Print version information                        |
-| `hole upgrade`                       | Check for updates and install the latest version |
-| `hole path add` / `hole path remove` | Add / remove `hole` from the system PATH         |
+| Command                              | Description                                                                                         |
+| ------------------------------------ | --------------------------------------------------------------------------------------------------- |
+| `hole [--no-show-dashboard]`         | Launch the GUI (default); opens the dashboard                                                       |
+| `hole version`                       | Print version information                                                                           |
+| `hole upgrade`                       | Check for updates and install the latest version                                                    |
+| `hole path add` / `hole path remove` | Add / remove `hole` from the system PATH                                                            |
+| `hole bridge unlock`                 | Turn off the kill switch and clear the block it left behind (run as administrator; `sudo` on macOS) |
 
 ## Distributions
 

@@ -191,6 +191,105 @@ fn lockdown_off_renders_plain_label() {
     assert!(!label.to_lowercase().contains("warning"));
 }
 
+// escape_items ========================================================================================================
+
+#[skuld::test]
+fn escape_items_offers_unblock_and_go_offline_independently() {
+    // Exhaustive over all eight (lockdown_enabled, running, blocked_offers_go_offline)
+    // rows. The two escapes are independent: `unblock` is exactly
+    // `lockdown_enabled && !running`; `go_offline` is exactly
+    // `blocked_offers_go_offline`. Both can be true at once — rendering both is the
+    // point (rule #0 favours more escapes over fewer). There is no probe input to
+    // fail — this table is the whole decision.
+    let table = [
+        // (lockdown_enabled, running, blocked_offers_go_offline, expect_go_offline, expect_unblock)
+        (true, false, true, true, true),
+        (true, false, false, false, true),
+        (true, true, true, true, false),
+        (true, true, false, false, false),
+        (false, false, true, true, false),
+        (false, false, false, false, false),
+        (false, true, true, true, false),
+        (false, true, false, false, false),
+    ];
+    for (lockdown_enabled, running, blocked_offers_go_offline, expect_go_offline, expect_unblock) in table {
+        let escapes = escape_items(lockdown_enabled, running, blocked_offers_go_offline);
+        assert_eq!(
+            escapes,
+            EscapeItems {
+                go_offline: expect_go_offline,
+                unblock: expect_unblock,
+            },
+            "lockdown_enabled={lockdown_enabled} running={running} blocked_offers_go_offline={blocked_offers_go_offline}"
+        );
+    }
+}
+
+#[skuld::test]
+fn unblock_unreachable_message_names_the_command_and_the_disconnect_caveat() {
+    assert!(UNBLOCK_UNREACHABLE_MESSAGE.contains("hole bridge unlock"));
+    assert!(
+        UNBLOCK_UNREACHABLE_MESSAGE.to_lowercase().contains("disconnect"),
+        "must caution the user to disconnect first: {UNBLOCK_UNREACHABLE_MESSAGE:?}"
+    );
+    assert!(
+        !UNBLOCK_UNREACHABLE_MESSAGE.contains('\\') && !UNBLOCK_UNREACHABLE_MESSAGE.contains('/'),
+        "must carry no filesystem path: {UNBLOCK_UNREACHABLE_MESSAGE:?}"
+    );
+}
+
+#[skuld::test]
+fn unblock_session_running_message_does_not_name_the_cli() {
+    assert!(
+        UNBLOCK_SESSION_RUNNING_MESSAGE.to_lowercase().contains("disconnect"),
+        "must point the user at Disconnect: {UNBLOCK_SESSION_RUNNING_MESSAGE:?}"
+    );
+    assert!(
+        !UNBLOCK_SESSION_RUNNING_MESSAGE.contains("bridge unlock"),
+        "must NOT talk a user into an out-of-process clear over a live tunnel: {UNBLOCK_SESSION_RUNNING_MESSAGE:?}"
+    );
+}
+
+#[skuld::test]
+fn unblock_dialog_message_maps_each_response_distinctly() {
+    use crate::bridge_client::ClientError;
+
+    // Ack: silent success, no dialog.
+    assert_eq!(unblock_dialog_message(&Ok(BridgeResponse::Ack)), None);
+
+    // SessionRunning: the disconnect-safe message — a swapped arm here would
+    // show UNBLOCK_UNREACHABLE_MESSAGE instead, which names the CLI command
+    // and would strip a cover out from under a live tunnel.
+    assert_eq!(
+        unblock_dialog_message(&Err(ClientError::SessionRunning)).as_deref(),
+        Some(UNBLOCK_SESSION_RUNNING_MESSAGE)
+    );
+
+    // A bridge-authored failure: shown verbatim, not replaced by a fixed string.
+    assert_eq!(unblock_dialog_message(&Ok(err_resp("boom"))).as_deref(), Some("boom"));
+
+    // Any transport/protocol error: the CLI-naming unreachable message.
+    assert_eq!(
+        unblock_dialog_message(&Err(transport_err())).as_deref(),
+        Some(UNBLOCK_UNREACHABLE_MESSAGE)
+    );
+
+    // An unexpected Ok shape (a same-build contract breach): never silent —
+    // falls back to the same unreachable message.
+    let unexpected = Ok(BridgeResponse::Metrics {
+        bytes_in: 0,
+        bytes_out: 0,
+        speed_in_bps: 0,
+        speed_out_bps: 0,
+        uptime_secs: 0,
+        filter: None,
+    });
+    assert_eq!(
+        unblock_dialog_message(&unexpected).as_deref(),
+        Some(UNBLOCK_UNREACHABLE_MESSAGE)
+    );
+}
+
 // startup_should_connect ==============================================================================================
 
 #[skuld::test]

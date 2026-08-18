@@ -34,7 +34,7 @@ use hole_common::protocol::{
     BridgeRequest, BridgeResponse, DiagnosticsResponse, ErrorResponse, LockdownRequest, MetricsResponse,
     StatusResponse, TestServerRequest, TestServerResponse, UpdateApplyRequest, ROUTE_CANCEL, ROUTE_DIAGNOSTICS,
     ROUTE_LOCKDOWN, ROUTE_METRICS, ROUTE_RELOAD, ROUTE_START, ROUTE_STATUS, ROUTE_STOP, ROUTE_TEST_SERVER,
-    ROUTE_UPDATE_APPLY,
+    ROUTE_UNBLOCK, ROUTE_UPDATE_APPLY,
 };
 use http_body_util::{BodyExt, Full};
 use hyper::client::conn::http1;
@@ -663,6 +663,16 @@ impl BridgeIpcClient {
                 let resp = self.http_post(ROUTE_LOCKDOWN, body, &[]).await?;
                 if resp.status().is_success() {
                     Ok(BridgeResponse::Ack)
+                } else {
+                    parse_bridge_error(resp).await
+                }
+            }
+            BridgeRequest::Unblock => {
+                let resp = self.http_post(ROUTE_UNBLOCK, Vec::new(), &[]).await?;
+                if resp.status().is_success() {
+                    Ok(BridgeResponse::Ack)
+                } else if resp.status() == http::StatusCode::CONFLICT {
+                    Err(HarnessError("a session is running".to_string()))
                 } else {
                     parse_bridge_error(resp).await
                 }

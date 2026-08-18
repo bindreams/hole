@@ -129,6 +129,11 @@ pub enum ProxyError {
     /// ([`hole_common::protocol::NETWORK_BLOCKED_MESSAGE`]).
     #[error("{}", hole_common::protocol::NETWORK_BLOCKED_MESSAGE)]
     NetworkBlocked,
+    /// `turn_lockdown_off` cleared every unowned cover but could not persist
+    /// the intent afterward. PII-free by construction (no path, no detail) —
+    /// an IPC message reaches a GUI toast verbatim.
+    #[error("the network was unblocked, but the kill-switch setting could not be saved")]
+    LockdownIntentNotPersisted,
 }
 
 impl From<&ProxyError> for hole_common::protocol::StartError {
@@ -158,7 +163,8 @@ impl From<&ProxyError> for hole_common::protocol::StartError {
             | ProxyError::InvalidListenerPort { .. }
             | ProxyError::ForwarderSelfTestFailed { .. }
             | ProxyError::TunnelSilent { .. }
-            | ProxyError::NoTunnelConnection { .. } => StartError::Failed { message: e.to_string() },
+            | ProxyError::NoTunnelConnection { .. }
+            | ProxyError::LockdownIntentNotPersisted => StartError::Failed { message: e.to_string() },
         }
     }
 }

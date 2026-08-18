@@ -3,7 +3,7 @@
 use tun_engine::routing::Routing;
 
 use crate::proxy::{Proxy, ProxyError};
-use crate::proxy_manager::{ProxyManager, ProxyState};
+use crate::proxy_manager::{LockdownOffOutcome, ProxyManager, ProxyState};
 use crate::server_test::{run_server_test, TestConfig};
 use crate::socket::LocalListener;
 use axum::extract::State;
@@ -13,7 +13,7 @@ use hole_common::protocol::{
     DiagnosticsResponse, EmptyResponse, ErrorResponse, LockdownRequest, MetricsResponse, ProxyConfig, StartError,
     StatusResponse, TestServerRequest, TestServerResponse, UpdateApplyRequest, VersionResponse, ROUTE_CANCEL,
     ROUTE_DIAGNOSTICS, ROUTE_LOCKDOWN, ROUTE_METRICS, ROUTE_RELOAD, ROUTE_START, ROUTE_STATUS, ROUTE_STOP,
-    ROUTE_TEST_SERVER, ROUTE_UPDATE_APPLY, ROUTE_VERSION,
+    ROUTE_TEST_SERVER, ROUTE_UNBLOCK, ROUTE_UPDATE_APPLY, ROUTE_VERSION,
 };
 use hyper::body::Incoming;
 use hyper_util::rt::TokioIo;
@@ -259,6 +259,7 @@ fn build_router<P: Proxy + 'static, R: Routing + 'static>(state: Arc<IpcState<P,
         .route(ROUTE_TEST_SERVER, axum::routing::post(handle_test_server::<P, R>))
         .route(ROUTE_VERSION, axum::routing::get(handle_version::<P, R>))
         .route(ROUTE_LOCKDOWN, axum::routing::post(handle_lockdown::<P, R>))
+        .route(ROUTE_UNBLOCK, axum::routing::post(handle_unblock::<P, R>))
         .route(ROUTE_UPDATE_APPLY, axum::routing::post(handle_update_apply::<P, R>))
         .layer(axum::extract::DefaultBodyLimit::max(1024 * 1024))
         .layer(axum::middleware::map_response(
@@ -425,16 +426,40 @@ async fn handle_cancel<P: Proxy + 'static, R: Routing + 'static>(
 
 /// Set the standing kill switch intent (last-writer-wins absolute set). Any
 /// authorized caller may toggle it. The bridge is the authority; the GUI only
-/// sends intent. The intent takes effect on the next start/stop — this handler
-/// does NOT engage/disengage a live cover.
+/// sends intent.
+///
+/// Turning the intent OFF reroutes through [`ProxyManager::turn_lockdown_off`]
+/// — the same unconditional release `POST /v1/unblock` performs — so the
+/// effect is immediate rather than deferred to the next start; both outcomes
+/// it can return mean the intent is now off, so both map to 200. This is a
+/// branch on the REQUEST's own payload (`enabled`), not on inspected proxy
+/// state — the `running` condition stays exactly where `turn_lockdown_off`
+/// put it. Turning the intent ON is unchanged: it only persists.
 async fn handle_lockdown<P: Proxy + 'static, R: Routing + 'static>(
     State(state): State<Arc<IpcState<P, R>>>,
     Json(req): Json<LockdownRequest>,
 ) -> Result<Json<EmptyResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let pm = state.proxy.lock().await;
-    match pm.set_lockdown_intent(req.enabled) {
+    let mut pm = state.proxy.lock().await;
+    if !req.enabled {
+        return match pm.turn_lockdown_off() {
+            Ok(_) => {
+                info!("lockdown intent set to off; released any cover no running session owns");
+                Ok(Json(EmptyResponse {}))
+            }
+            Err(e) => {
+                error!(error = %e, "failed to turn the kill switch off");
+                Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorResponse {
+                        message: unblock_error_message(&e),
+                    }),
+                ))
+            }
+        };
+    }
+    match pm.set_lockdown_intent(true) {
         Ok(()) => {
-            info!(enabled = req.enabled, "lockdown intent set");
+            info!(enabled = true, "lockdown intent set");
             Ok(Json(EmptyResponse {}))
         }
         Err(e) => {
@@ -444,6 +469,58 @@ async fn handle_lockdown<P: Proxy + 'static, R: Routing + 'static>(
                 Json(ErrorResponse { message: e.to_string() }),
             ))
         }
+    }
+}
+
+/// The tray's escape from a fail-closed cover stranded by an unclean exit:
+/// unconditionally clear every cover Hole can install, then turn the kill
+/// switch off. `turn_lockdown_off`'s one condition — whether a session is
+/// running — maps to 409 (the intent is still off; the caller should
+/// disconnect to release the session's own cover); any other failure is 500.
+/// The OS calls run inline under the lock, exactly as `handle_stop`'s cover
+/// teardown already does — a one-shot user action, not a status poll.
+async fn handle_unblock<P: Proxy + 'static, R: Routing + 'static>(
+    State(state): State<Arc<IpcState<P, R>>>,
+) -> Result<Json<EmptyResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let mut pm = state.proxy.lock().await;
+    match pm.turn_lockdown_off() {
+        Ok(LockdownOffOutcome::Cleared) => {
+            info!("unblock: every cover cleared, kill switch off");
+            Ok(Json(EmptyResponse {}))
+        }
+        Ok(LockdownOffOutcome::SessionRunning) => {
+            info!("unblock: a session is running, so there was no unowned cover to clear");
+            Err((
+                StatusCode::CONFLICT,
+                Json(ErrorResponse {
+                    message: "a session is running; disconnect to release its own cover".into(),
+                }),
+            ))
+        }
+        Err(e) => {
+            error!(error = %e, "unblock failed");
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    message: unblock_error_message(&e),
+                }),
+            ))
+        }
+    }
+}
+
+/// PII-free 500 body for a failed `turn_lockdown_off`. Never formats the
+/// underlying error verbatim — a `RoutingError::RouteSetup` converted into
+/// `ProxyError` can embed a state-file path, and an IPC message reaches a GUI
+/// toast verbatim. `LockdownIntentNotPersisted`'s `Display` is already a
+/// fixed, PII-free sentence (see its doc), so that one case is reused as-is;
+/// every other failure means the release itself did not confirm, which gets
+/// its own fixed sentence.
+fn unblock_error_message(e: &ProxyError) -> String {
+    if matches!(e, ProxyError::LockdownIntentNotPersisted) {
+        e.to_string()
+    } else {
+        "the network could not be fully unblocked".into()
     }
 }
 
