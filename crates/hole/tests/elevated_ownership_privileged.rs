@@ -56,13 +56,11 @@ fn cutover_marker_is_chowned_to_owner_under_root() {
     use hole_common::update_marker::{self, MarkerInfo, MARKER_FILE, MARKER_VERSION};
     use std::os::unix::fs::MetadataExt;
 
-    let info = |to: &str| MarkerInfo {
+    let info = || MarkerInfo {
         version: MARKER_VERSION,
-        from_version: "0.2.0".into(),
-        to_version: to.into(),
-        driver_pid: std::process::id(),
-        started_at_unix: 0,
-        driver_start_unix_ms: 0,
+        driver: cosca::identity::ProcessId::current()
+            .to_record()
+            .expect("persist this process's identity"),
     };
     let root = unsafe { libc::geteuid() } == 0;
     let (nuid, ngid) = nobody();
@@ -70,7 +68,7 @@ fn cutover_marker_is_chowned_to_owner_under_root() {
 
     // write (rename publish).
     let d = tempfile::tempdir().unwrap();
-    update_marker::write(d.path(), &info("0.3.0"), Some((nuid, ngid))).unwrap();
+    update_marker::write(d.path(), &info(), Some((nuid, ngid))).unwrap();
     let owner = std::fs::metadata(d.path().join(MARKER_FILE)).unwrap().uid();
     if root {
         assert_eq!(owner, nuid, "root: write must chown the published marker to owner");
@@ -83,7 +81,7 @@ fn cutover_marker_is_chowned_to_owner_under_root() {
 
     // write_new (hard_link publish), via a fresh dir so the claim is unclaimed.
     let d = tempfile::tempdir().unwrap();
-    update_marker::write_new(d.path(), &info("0.3.0"), Some((nuid, ngid))).unwrap();
+    update_marker::write_new(d.path(), &info(), Some((nuid, ngid))).unwrap();
     let owner = std::fs::metadata(d.path().join(MARKER_FILE)).unwrap().uid();
     if root {
         assert_eq!(owner, nuid, "root: write_new must chown the claimed marker to owner");

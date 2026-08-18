@@ -27,7 +27,7 @@ fn post_bind_sweep_clears_marker() {
     let dir = tempfile::tempdir().unwrap();
     hole_common::update_marker::write(dir.path(), &super::test_marker(), None).unwrap();
     sweep_marker(dir.path());
-    assert!(hole_common::update_marker::read(dir.path()).is_none());
+    assert!(!hole_common::update_marker::is_present(dir.path()));
     sweep_marker(dir.path()); // idempotent: absent marker is a no-op
 }
 
@@ -37,7 +37,7 @@ fn sweep_marker_then_ready_sweeps_before_reporting() {
     hole_common::update_marker::write(dir.path(), &super::test_marker(), None).unwrap();
     let marker_gone_when_reported = std::cell::Cell::new(false);
     super::sweep_marker_then_ready(dir.path(), || {
-        marker_gone_when_reported.set(hole_common::update_marker::read(dir.path()).is_none());
+        marker_gone_when_reported.set(!hole_common::update_marker::is_present(dir.path()));
         Ok(())
     })
     .unwrap();
@@ -96,4 +96,71 @@ fn sweep_old_binaries_removes_old_suffixed_and_spares_live() {
     assert!(live.exists(), "the live binary must be spared");
     assert!(other.exists(), "unrelated files must be spared");
     sweep_old_binaries(dir.path()); // idempotent on a clean dir
+}
+
+/// A log dir whose marker path can be neither opened nor probed: `*` is not a
+/// legal Windows path character, so both calls fail ERROR_INVALID_NAME rather
+/// than ERROR_FILE_NOT_FOUND. No ACL surgery, so it is deterministic and not
+/// defeated by running as SYSTEM.
+fn unprobeable_log_dir(base: &Path) -> std::path::PathBuf {
+    base.join("in*valid")
+}
+
+#[skuld::test]
+fn sweep_recheck_admits_an_indeterminate_marker_path() {
+    // The re-check must fail CLOSED only on a marker it established EXISTS.
+    // An undetermined presence refuses every start forever: the sweep's own
+    // `clear` fails on the same path for the same reason, so nothing ends it.
+    let base = tempfile::tempdir().unwrap();
+    let dir = unprobeable_log_dir(base.path());
+    let reported = std::cell::Cell::new(false);
+    super::sweep_marker_then_ready_with(
+        || {}, // the real sweep cannot clear this path either
+        &dir,
+        || {
+            reported.set(true);
+            Ok(())
+        },
+    )
+    .expect("an undetermined marker presence must not fail the start");
+    assert!(
+        reported.get(),
+        "Running must be reported: no marker was ever established"
+    );
+}
+
+#[skuld::test]
+fn shutdown_reason_treats_an_indeterminate_marker_as_an_ordinary_stop() {
+    // Reporting Cutover here disarms the standing lockdown cover and leaves it
+    // armed with no bridge running to release it — a kill switch the user
+    // cannot turn off.
+    use crate::proxy_manager::StopReason;
+    let base = tempfile::tempdir().unwrap();
+    let dir = unprobeable_log_dir(base.path());
+    assert_eq!(
+        shutdown_reason(hole_common::update_marker::is_present(&dir)),
+        StopReason::UserStop
+    );
+}
+
+#[skuld::test]
+fn sweep_recheck_uses_presence_not_schema() {
+    // The re-check exists to catch an external holder keeping the marker open.
+    // Deriving presence from a successful parse fails OPEN on exactly that case.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join(hole_common::update_marker::MARKER_FILE), b"not json").unwrap();
+    let reported = std::cell::Cell::new(false);
+    let out = super::sweep_marker_then_ready_with(
+        || {}, // no-op sweep: the marker is NOT removed
+        dir.path(),
+        || {
+            reported.set(true);
+            Ok(())
+        },
+    );
+    assert!(out.is_err(), "the marker survived the sweep; Running must be refused");
+    assert!(
+        !reported.get(),
+        "Running must not be reported while a marker is present"
+    );
 }

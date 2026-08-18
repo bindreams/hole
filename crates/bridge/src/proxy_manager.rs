@@ -1488,8 +1488,12 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
             d.shutdown().await;
         }
 
-        // 2. Stop plugin chain: kill tracked PIDs explicitly, then drop
-        // (which cancels the chain and clears the state file).
+        // 2. Stop plugin chain: reap the tracked identities explicitly — the
+        // reap is the ONLY thing allowed to delete the state file, and only
+        // once it has accounted for every record — then drop, which just
+        // cancels the chain's token and aborts its task. Drop must not touch
+        // the file: the abort cannot know whether teardown finished, so a
+        // clear there would forget still-live plugins.
         if let Some(ref chain) = plugin_chain {
             chain.kill_tracked();
         }

@@ -162,9 +162,10 @@ fn run_service() -> Result<(), Box<dyn std::error::Error>> {
         }
         let state_dir_for_plugins = state_dir.clone();
         if let Err(e) =
-            tokio::task::spawn_blocking(move || crate::plugin_recovery::recover_plugins(&state_dir_for_plugins)).await
+            tokio::task::spawn_blocking(move || crate::plugin_recovery::reap_recorded_plugins(&state_dir_for_plugins))
+                .await
         {
-            tracing::warn!(error = %e, "recover_plugins task panicked");
+            tracing::warn!(error = %e, "reap_recorded_plugins task panicked");
         }
         // Native-crash observability (bindreams/hole#438): sweep crash
         // markers left by a previously-crashed service bridge. Markers land
@@ -213,7 +214,7 @@ fn run_service() -> Result<(), Box<dyn std::error::Error>> {
         // (marker present) disarms the standing cover so the persistent WFP
         // filters survive the restart; an ordinary stop disengages it.
         let mut pm = proxy_shutdown.lock().await;
-        let reason = shutdown_reason(hole_common::update_marker::read(&log_dir).is_some());
+        let reason = shutdown_reason(hole_common::update_marker::is_present(&log_dir));
         if let Err(e) = pm.stop_with(reason).await {
             error!(error = %e, "error stopping proxy during shutdown");
         }
@@ -287,7 +288,7 @@ fn sweep_marker_then_ready_with<S: FnOnce(), R: FnOnce() -> std::io::Result<()>>
     report_running: R,
 ) -> std::io::Result<()> {
     sweep();
-    if hole_common::update_marker::read(log_dir).is_some() {
+    if hole_common::update_marker::is_present(log_dir) {
         return Err(std::io::Error::other(
             "cutover marker still present after sweep; refusing to report Running",
         ));
@@ -522,11 +523,9 @@ pub fn is_running() -> bool {
 fn test_marker() -> hole_common::update_marker::MarkerInfo {
     hole_common::update_marker::MarkerInfo {
         version: hole_common::update_marker::MARKER_VERSION,
-        from_version: "0.2.0".into(),
-        to_version: "0.3.0".into(),
-        driver_pid: 1,
-        started_at_unix: 0,
-        driver_start_unix_ms: 0,
+        driver: cosca::identity::ProcessId::current()
+            .to_record()
+            .expect("persist this process's identity"),
     }
 }
 

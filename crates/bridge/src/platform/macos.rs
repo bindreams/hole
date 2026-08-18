@@ -253,9 +253,9 @@ pub fn run(
         }
         let state_dir_plugins = state_dir.to_path_buf();
         if let Err(e) =
-            tokio::task::spawn_blocking(move || crate::plugin_recovery::recover_plugins(&state_dir_plugins)).await
+            tokio::task::spawn_blocking(move || crate::plugin_recovery::reap_recorded_plugins(&state_dir_plugins)).await
         {
-            tracing::warn!(error = %e, "recover_plugins task panicked");
+            tracing::warn!(error = %e, "reap_recorded_plugins task panicked");
         }
         // Native-crash observability (bindreams/hole#438): sweep crash
         // markers left by a previously-crashed bridge. Offloaded to a
@@ -280,7 +280,7 @@ pub fn run(
         // (marker present) disarms the standing cover so the persistent pf
         // ruleset survives the restart; an ordinary stop disengages it.
         let mut pm = proxy_shutdown.lock().await;
-        let reason = shutdown_reason(hole_common::update_marker::read(log_dir).is_some());
+        let reason = shutdown_reason(hole_common::update_marker::is_present(log_dir));
         if let Err(e) = pm.stop_with(reason).await {
             tracing::error!(error = %e, "error stopping proxy during shutdown");
         }
@@ -335,11 +335,9 @@ pub(crate) async fn serve_until_signal(
 fn test_marker() -> hole_common::update_marker::MarkerInfo {
     hole_common::update_marker::MarkerInfo {
         version: hole_common::update_marker::MARKER_VERSION,
-        from_version: "0.2.0".into(),
-        to_version: "0.3.0".into(),
-        driver_pid: 1,
-        started_at_unix: 0,
-        driver_start_unix_ms: 0,
+        driver: cosca::identity::ProcessId::current()
+            .to_record()
+            .expect("persist this process's identity"),
     }
 }
 

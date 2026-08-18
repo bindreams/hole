@@ -39,6 +39,7 @@ test = false
 doctest = false
 
 [dependencies]
+cosca = { workspace = true }
 hole-common = { path = "../common" }
 tombstone = { path = "../tombstone" }
 util = { path = "../util" }

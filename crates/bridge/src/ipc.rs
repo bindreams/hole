@@ -520,28 +520,22 @@ async fn handle_update_apply<P: Proxy + 'static, R: Routing + 'static>(
     // dir — otherwise its `stage_payload` (which clears+rewrites the fixed dir)
     // could clobber the winner's already-verified copy mid-extract, reopening the
     // verify/use TOCTOU via a privileged write on the loser's behalf.
-    let self_pid = std::process::id();
-    // A None self-probe is a contract-level surprise (a process can always read
-    // its own creation time), so warn; the stored 0 is treated downstream as an
-    // unassessed identity, never confirmed-dead.
-    let driver_start_unix_ms = hole_common::process::process_start_time(self_pid).unwrap_or_else(|| {
-        tracing::warn!(
-            pid = self_pid,
-            "could not read own process start time for the cutover marker"
-        );
-        0
-    });
-    let started_at_unix = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    let marker = build_cutover_marker(
-        state.version.clone(),
-        req.target_version.clone(),
-        self_pid,
-        started_at_unix,
-        driver_start_unix_ms,
-    );
+    // `current()` is infallible; only PERSISTING it can fail, and only where
+    // this host cannot describe its own boot session (Linux with /proc
+    // unmounted). Fail BEFORE `write_new`, so a failure leaves no claimed
+    // cutover.
+    let driver = match cosca::identity::ProcessId::current().to_record() {
+        Ok(record) => record,
+        Err(e) => {
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    message: format!("cutover marker write failed: {e}"),
+                }),
+            ));
+        }
+    };
+    let marker = build_cutover_marker(driver);
     if let Err(e) = hole_common::update_marker::write_new(log_dir, &marker, state.owner) {
         let (code, message) = if e.kind() == std::io::ErrorKind::AlreadyExists {
             (StatusCode::CONFLICT, "a cutover is already in progress".to_string())
@@ -1149,22 +1143,12 @@ fn apply_socket_permissions(path: &Path) {
     }
 }
 
-/// Build the cutover marker; extracted so the driver-identity field mapping is
+/// Build the cutover marker; extracted so the driver-identity mapping is
 /// unit-testable.
-fn build_cutover_marker(
-    from_version: String,
-    to_version: String,
-    self_pid: u32,
-    started_at_unix: u64,
-    driver_start_unix_ms: u64,
-) -> hole_common::update_marker::MarkerInfo {
+fn build_cutover_marker(driver: cosca::identity::ProcessIdRecord) -> hole_common::update_marker::MarkerInfo {
     hole_common::update_marker::MarkerInfo {
         version: hole_common::update_marker::MARKER_VERSION,
-        from_version,
-        to_version,
-        driver_pid: self_pid,
-        started_at_unix,
-        driver_start_unix_ms,
+        driver,
     }
 }
 

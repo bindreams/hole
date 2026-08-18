@@ -22,7 +22,7 @@ fn sweep_wiring_reports_and_deletes_bridge_marker() {
     // context. It does NOT assert that foreground.rs / macos.rs / windows.rs
     // actually CALL sweep at the right point in the startup sequence — that
     // PLACEMENT is verified by code review, exactly as the sibling
-    // recover_routes / recover_plugins / recover_dns_config call placements
+    // recover_routes / reap_recorded_plugins / recover_dns_config call placements
     // are likewise untested (the entry-point bodies block on server.run()).
     use garter::test_utils::WaitableWriter;
     use garter::tracing_test::set_default_in_current_thread;
@@ -59,16 +59,14 @@ fn post_bind_sweep_clears_marker() {
     // service-path `platform::{macos,windows}::sweep_marker` post-bind clear.
     let marker = hole_common::update_marker::MarkerInfo {
         version: hole_common::update_marker::MARKER_VERSION,
-        from_version: "0.2.0".into(),
-        to_version: "0.3.0".into(),
-        driver_pid: 1,
-        started_at_unix: 0,
-        driver_start_unix_ms: 0,
+        driver: cosca::identity::ProcessId::current()
+            .to_record()
+            .expect("persist this process's identity"),
     };
     let dir = tempfile::tempdir().unwrap();
     hole_common::update_marker::write(dir.path(), &marker, None).unwrap();
     super::sweep_marker(dir.path());
-    assert!(hole_common::update_marker::read(dir.path()).is_none());
+    assert!(!hole_common::update_marker::is_present(dir.path()));
     super::sweep_marker(dir.path()); // idempotent: absent marker is a no-op
 }
 

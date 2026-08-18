@@ -139,29 +139,36 @@ pub type SelfHealHook = std::sync::Arc<dyn Fn(Option<String>) + Send + Sync>;
 /// leak PII.
 pub(crate) const UPDATE_FAILED: &str = "The update didn't finish and the connection was lost.";
 
-/// Resolves the cutover DRIVER's liveness from its marker identity: `Some(true)`
-/// alive, `Some(false)` confirmed dead, `None` unassessed. Injected so `BridgeLink`
-/// stays testable and the masking decision stays `#[cfg]`-free.
-pub type DriverLiveness = std::sync::Arc<dyn Fn(&hole_common::update_marker::MarkerInfo) -> Option<bool> + Send + Sync>;
+/// Resolves the cutover DRIVER's liveness from its marker identity. Injected so
+/// `BridgeLink` stays testable and the masking decision stays `#[cfg]`-free.
+pub type DriverLiveness =
+    std::sync::Arc<dyn Fn(&hole_common::update_marker::MarkerInfo) -> cosca::identity::Liveness + Send + Sync>;
 
-/// Windows: the driver is alive iff its PID is a running process whose creation
-/// time matches (exit-state + exact-equality); an access-denied/transient probe
-/// failure is `None` (unassessed, never confirmed-dead). A stored `0` is a
-/// poisoned/absent identity → `None`. Off Windows there is no trackable
-/// persistent driver → `None`.
+/// Windows: the driver is alive iff the recorded identity names a running
+/// process; a refused or ambiguous probe is `Unknown`, never confirmed-dead.
+///
+/// **Off Windows this stays unassessed, deliberately.** cosca's probe works on
+/// all three platforms, so dropping the `cfg` is tempting — do not. On macOS the
+/// cutover driver IS the bridge process, which SIGTERMs itself mid-cutover, so a
+/// working probe would raise UPDATE_FAILED on every healthy macOS update.
 fn production_driver_liveness() -> DriverLiveness {
     #[cfg(target_os = "windows")]
     {
         std::sync::Arc::new(|m: &hole_common::update_marker::MarkerInfo| {
-            if m.driver_start_unix_ms == 0 {
-                return None;
+            match cosca::identity::ProcessId::try_from(&m.driver) {
+                Ok(id) => cosca::Process::from_id(id).is_alive(),
+                // A refusal, not a magic value: an identity that cannot be
+                // restored here names nothing to assess.
+                Err(e) => {
+                    tracing::warn!(error = %e, "cutover driver identity could not be restored");
+                    cosca::identity::Liveness::Unknown
+                }
             }
-            hole_common::process::process_matches_and_alive(m.driver_pid, m.driver_start_unix_ms)
         })
     }
     #[cfg(not(target_os = "windows"))]
     {
-        std::sync::Arc::new(|_m| None)
+        std::sync::Arc::new(|_m| cosca::identity::Liveness::Unknown)
     }
 }
 
@@ -215,10 +222,15 @@ impl BridgeLink {
 
     /// Read the cutover marker and (if present) resolve its driver's liveness,
     /// fresh per exchange so the masking window opens and closes with the marker.
-    fn cutover_state(&self) -> (Option<hole_common::update_marker::MarkerInfo>, Option<bool>) {
+    fn cutover_state(&self) -> (hole_common::update_marker::Marker, cosca::identity::Liveness) {
         let marker = hole_common::update_marker::read(&self.service_log_dir);
-        let driver_alive = marker.as_ref().and_then(|m| (self.driver_liveness)(m));
-        (marker, driver_alive)
+        // Only `Present` has a driver to name. Asking for a liveness with no
+        // payload to resolve is the shape the `0` sentinel used to fill.
+        let driver = match &marker {
+            hole_common::update_marker::Marker::Present(m) => (self.driver_liveness)(m),
+            _ => cosca::identity::Liveness::Unknown,
+        };
+        (marker, driver)
     }
 
     /// Commit an exchange's observation under the current cutover decision. On a
@@ -233,15 +245,10 @@ impl BridgeLink {
         result: &Result<BridgeResponse, ClientError>,
     ) {
         if !running && decision == CutoverDecision::UnmaskFailed {
-            // "Successor won" ⇒ the marker FILE is gone. A presence check, not
-            // `read()`: the wedge test is "did a cutover complete", which is the
-            // file's existence, not a parseable schema — robust across a from->to
-            // version bump mid-cutover (matching `clear`'s remove-by-path).
-            if self
-                .service_log_dir
-                .join(hole_common::update_marker::MARKER_FILE)
-                .exists()
-            {
+            // "Successor won" ⇒ the marker is gone. Presence, not a parse: the
+            // wedge test is "did a cutover complete", which is the claim's
+            // existence, not a schema this build can read.
+            if hole_common::update_marker::is_present(&self.service_log_dir) {
                 // Carry any lockdown fields the triggering Status revealed so a
                 // reachable running:false wedge does not drop a fresh lockdown edge.
                 self.cell.commit_update_failed(UPDATE_FAILED, observed_lockdown(result));
@@ -271,8 +278,8 @@ impl BridgeLink {
     pub async fn send(&self, req: BridgeRequest) -> Result<BridgeResponse, ClientError> {
         let kind = ReqKind::of(&req);
         let mut guard = self.client.lock().await;
-        let (marker, driver_alive) = self.cutover_state();
-        let decision = cutover_decision(marker.as_ref(), driver_alive);
+        let (marker, driver) = self.cutover_state();
+        let decision = cutover_decision(&marker, driver);
         let result = Self::send_locked(&mut guard, &self.socket_path, req).await;
         if let Some(running) = observed_running(kind, &result, matches!(decision, CutoverDecision::Mask)) {
             self.commit_observation(decision, running, &result);
@@ -352,8 +359,8 @@ impl BridgeLink {
     /// successful reload.
     pub async fn reload_if_running(&self, config: hole_common::protocol::ProxyConfig) -> Result<bool, String> {
         let mut guard = self.client.lock().await;
-        let (marker, driver_alive) = self.cutover_state();
-        let decision = cutover_decision(marker.as_ref(), driver_alive);
+        let (marker, driver) = self.cutover_state();
+        let decision = cutover_decision(&marker, driver);
         let status = Self::send_locked(&mut guard, &self.socket_path, BridgeRequest::Status).await;
         self.note_mismatch(&status);
         if let Some(running) = observed_running(ReqKind::Status, &status, matches!(decision, CutoverDecision::Mask)) {
@@ -559,17 +566,33 @@ pub(crate) enum CutoverDecision {
     UnmaskFailed,
 }
 
-/// Single source of truth for the cutover masking decision. `driver_alive`:
-/// `Some(true)` alive, `Some(false)` confirmed dead, `None` unassessed (macOS or
-/// a poisoned/absent identity). No marker ⇒ PassThrough regardless of liveness.
+/// Single source of truth for the cutover masking decision. No marker ⇒
+/// PassThrough regardless of liveness, and so does an INDETERMINATE read: it is
+/// no evidence a cutover was ever claimed.
+///
+/// An UNREADABLE marker unmasks. Masking it would be a state with no exit: the
+/// mask commits nothing for either a transport error or a reachable
+/// `running: false`, and the only things that end it are a bridge start
+/// sweeping the marker — which never happens in the wedge the marker exists to
+/// catch — and confirming a driver this build could not identify.
+///
+/// `Unreadable` leaves the retraction path OPEN, which is why it may report: the
+/// probe found a regular FILE, so `clear` — remove-by-path and version-agnostic —
+/// addresses a reachable target, and the next bridge start ends the report with
+/// no user action. `Indeterminate` closes that path: the probe either failed
+/// outright or found a non-file, and `clear`'s remove_file fails on both for the
+/// same reason every time, so a report raised here would be permanent. Hence
+/// PassThrough.
 pub(crate) fn cutover_decision(
-    marker: Option<&hole_common::update_marker::MarkerInfo>,
-    driver_alive: Option<bool>,
+    marker: &hole_common::update_marker::Marker,
+    driver: cosca::identity::Liveness,
 ) -> CutoverDecision {
-    match (marker, driver_alive) {
-        (None, _) => CutoverDecision::PassThrough,
-        (Some(_), Some(false)) => CutoverDecision::UnmaskFailed,
-        (Some(_), _) => CutoverDecision::Mask,
+    use hole_common::update_marker::Marker;
+    match (marker, driver) {
+        (Marker::Absent | Marker::Indeterminate, _) => CutoverDecision::PassThrough,
+        (Marker::Unreadable, _) => CutoverDecision::UnmaskFailed,
+        (Marker::Present(_), cosca::identity::Liveness::Dead) => CutoverDecision::UnmaskFailed,
+        (Marker::Present(_), _) => CutoverDecision::Mask,
     }
 }
 

@@ -3,11 +3,9 @@ use super::*;
 fn sample_marker() -> hole_common::update_marker::MarkerInfo {
     hole_common::update_marker::MarkerInfo {
         version: hole_common::update_marker::MARKER_VERSION,
-        from_version: "0.2.0".into(),
-        to_version: "0.3.0".into(),
-        driver_pid: 4242,
-        started_at_unix: 1_700_000_000,
-        driver_start_unix_ms: 0,
+        driver: cosca::identity::ProcessId::current()
+            .to_record()
+            .expect("persist this process's identity"),
     }
 }
 
@@ -72,7 +70,7 @@ fn macos_actor_failure_clears_the_injected_log_dir() {
     hole_common::update_marker::write(dir.path(), &sample_marker(), None).unwrap();
     macos::clear_marker_on_actor_failure(Err(std::io::Error::other("swap failed")), dir.path());
     assert!(
-        hole_common::update_marker::read(dir.path()).is_none(),
+        !hole_common::update_marker::is_present(dir.path()),
         "the injected log_dir's marker must be cleared on actor failure"
     );
 }
@@ -93,24 +91,48 @@ fn breakaway_only_when_in_job_and_job_permits() {
 
 #[cfg(target_os = "windows")]
 #[skuld::test]
-fn record_spawned_driver_stamps_when_alive() {
+fn record_spawned_driver_stamps_a_resolved_child() {
     let dir = tempfile::tempdir().unwrap();
     hole_common::update_marker::write(dir.path(), &sample_marker(), None).unwrap();
-    windows::record_spawned_driver(dir.path(), 4242, Some(1_700_000_000_123)).unwrap();
-    let got = hole_common::update_marker::read(dir.path()).unwrap();
-    assert_eq!((got.driver_pid, got.driver_start_unix_ms), (4242, 1_700_000_000_123));
+    let me = cosca::identity::ProcessId::current();
+
+    windows::record_spawned_driver(
+        dir.path(),
+        cosca::identity::Resolved::Found(cosca::Process::from_id(me)),
+    )
+    .unwrap();
+
+    let hole_common::update_marker::Marker::Present(got) = hole_common::update_marker::read(dir.path()) else {
+        panic!("the stamped marker must be readable");
+    };
+    assert_eq!(
+        cosca::identity::ProcessId::try_from(&got.driver).expect("the stamped driver must restore"),
+        me
+    );
 }
 
 #[cfg(target_os = "windows")]
 #[skuld::test]
-fn record_spawned_driver_fails_when_child_vanished_or_zero() {
+fn record_spawned_driver_refuses_an_unresolvable_child() {
+    // A child that cannot be named at all must not be stamped; the caller then
+    // kills the still-suspended child rather than claiming an unverifiable
+    // identity.
     let dir = tempfile::tempdir().unwrap();
     hole_common::update_marker::write(dir.path(), &sample_marker(), None).unwrap();
-    assert!(windows::record_spawned_driver(dir.path(), 4242, None).is_err());
-    assert!(
-        windows::record_spawned_driver(dir.path(), 4242, Some(0)).is_err(),
-        "a poisoned 0 start time is rejected"
-    );
+    assert!(windows::record_spawned_driver(dir.path(), cosca::identity::Resolved::Gone).is_err());
+    assert!(windows::record_spawned_driver(dir.path(), cosca::identity::Resolved::Unknown).is_err());
+}
+
+#[cfg(target_os = "windows")]
+#[skuld::test]
+fn record_spawned_driver_refuses_when_the_marker_is_unreadable() {
+    // Under warn-and-succeed the child is resumed and the marker keeps naming
+    // the INITIATOR — the state that reports a failed update on a successful one.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join(hole_common::update_marker::MARKER_FILE), b"not json").unwrap();
+    let me = cosca::Process::from_id(cosca::identity::ProcessId::current());
+
+    assert!(windows::record_spawned_driver(dir.path(), cosca::identity::Resolved::Found(me)).is_err());
 }
 
 // The post-spawn composition (record->resume, kill-on-any-failure): an injected

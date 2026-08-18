@@ -1,144 +1,187 @@
-// Plugin process crash recovery.
+// The plugin reap.
 //
-// Reads `bridge-plugins.json` (written by `plugin_state`) and kills any
-// tracked plugin processes that are still alive. Called at bridge startup
-// and from the test harness on teardown.
+// Reads `bridge-plugins.json` (written by `plugin_state`) and kills every
+// process it records, by exact cosca identity — `(pid, raw kernel start
+// token)` compared exactly, so a recycled pid is never mistaken for the
+// recorded process.
 //
-// Each kill is targeted at a specific PID + start-time pair recorded by
-// the bridge that spawned the process. PID reuse is guarded by verifying
-// the process's actual start time matches the recorded one within a
-// tolerance window.
+// One function, three callers: bridge startup (after the IPC socket binds,
+// same ordering as `routing::recover_routes`), plugin-chain stop
+// (`PluginChain::kill_tracked`), and the test harness's teardown.
+//
+// The invariant this exists to hold: the state file may be deleted only by a
+// component that has just accounted for every record it contains. Deleting it
+// after a failed load would forget plugins that are still running, and they
+// hold a server connection and a local port forever.
+//
+// Best-effort — errors are logged, nothing unwinds. `Drop` in the test harness
+// calls this, and a panic there while a test is already unwinding would abort
+// the whole test binary.
 
-use crate::plugin_state;
+use crate::plugin_state::{self, Loaded};
+use cosca::identity::{ProcessId, Resolved};
 use std::path::Path;
 
-const START_TIME_TOLERANCE_MS: u64 = 2000;
+/// Kill every plugin process recorded under `state_dir`, then clear the record.
+pub fn reap_recorded_plugins(state_dir: &Path) {
+    reap_loaded(plugin_state::load(state_dir), state_dir);
+}
 
-/// Clean up plugin processes left behind by a previous bridge run.
-///
-/// Called at bridge startup AFTER the IPC socket bind succeeds (same
-/// ordering as `routing::recover_routes`). Best-effort — errors logged
-/// at `warn`, returns `()`.
-pub fn recover_plugins(state_dir: &Path) {
-    let Some(state) = plugin_state::load(state_dir) else {
-        return;
+/// The reap's dispositions, over an already-loaded state. Taking `Loaded` by
+/// value makes every arm drivable from a test without a fixture that has to
+/// defeat a real `fs::read`.
+pub(crate) fn reap_loaded(loaded: Loaded, state_dir: &Path) {
+    reap_loaded_with(
+        loaded,
+        state_dir,
+        |record| ProcessId::try_from(record),
+        |id| cosca::Process::from_id(id).kill(),
+    );
+}
+
+/// [`reap_loaded`] with the per-record restore and kill injected. Both fail only
+/// on states this host cannot be made to produce — a restore refused by the
+/// host's own unreadable boot session, a kill on a target cosca could not open
+/// or assess — so the accounting rule's failure legs need these seams.
+pub(crate) fn reap_loaded_with(
+    loaded: Loaded,
+    state_dir: &Path,
+    restore: impl Fn(&cosca::identity::ProcessIdRecord) -> Result<ProcessId, cosca::error::Error>,
+    kill: impl Fn(ProcessId) -> Result<(), cosca::error::Error>,
+) {
+    let state = match loaded {
+        Loaded::Absent => return,
+        Loaded::Unreadable(e) => {
+            tracing::error!(
+                error = %e,
+                path = %state_dir.join(plugin_state::STATE_FILE_NAME).display(),
+                "plugin state file could not be read; keeping it so the next start retries"
+            );
+            return;
+        }
+        Loaded::Unusable => {
+            tracing::error!(
+                path = %state_dir.join(plugin_state::STATE_FILE_NAME).display(),
+                "plugin state file is not usable at this schema; discarding it and accepting a one-time orphan leak"
+            );
+            clear_or_log(state_dir);
+            return;
+        }
+        Loaded::State(state) => state,
     };
 
+    // The file may be deleted only once every record in it is accounted for:
+    // killed, provably gone, or provably unrestorable on this host.
+    let mut all_accounted = true;
     for record in &state.plugins {
-        let Some(actual_start) = process_start_time(record.pid) else {
-            tracing::debug!(pid = record.pid, "plugin process no longer exists, skipping");
-            continue;
+        let id = match restore(record) {
+            Err(e) if settles_the_record(&e) => {
+                // Accounted: a foreign-platform / foreign-boot-session record can
+                // never name a killable process on this host, so keeping the file
+                // for it would litter forever.
+                tracing::error!(
+                    pid = record.pid,
+                    error = %e,
+                    "recorded plugin identity cannot be restored on this host; nothing here can name it"
+                );
+                continue;
+            }
+            Err(e) => {
+                // Unaccounted: the refusal is about THIS HOST, not the record, so
+                // the record may still name a live plugin holding a server
+                // connection and a local port.
+                all_accounted = false;
+                tracing::warn!(
+                    pid = record.pid,
+                    error = %e,
+                    "recorded plugin identity could not be checked on this host; keeping the file so the next start retries"
+                );
+                continue;
+            }
+            Ok(id) => id,
         };
 
-        let diff = actual_start.abs_diff(record.start_time_unix_ms);
-        if diff > START_TIME_TOLERANCE_MS {
-            tracing::info!(
+        // Diagnostic only. `Process::kill` answers `Ok` for a killed process,
+        // for a recycled pid it deliberately spared, and for one already gone,
+        // so the return value alone collapses three outcomes into one. A race
+        // between this read and the kill can mislabel a log line and can never
+        // misroute a kill — the kill is cosca's own identity-checked call.
+        let observation = observe(id);
+        match kill(id) {
+            Ok(()) => tracing::info!(
                 pid = record.pid,
-                recorded_ms = record.start_time_unix_ms,
-                actual_ms = actual_start,
-                "PID reused by a different process, skipping"
-            );
-            continue;
-        }
-
-        match kill_pid(record.pid) {
-            Ok(()) => tracing::info!(pid = record.pid, "reaped leaked plugin process"),
-            Err(e) => tracing::warn!(pid = record.pid, error = %e, "failed to kill leaked plugin"),
+                token = record.token,
+                observation,
+                "reaped recorded plugin"
+            ),
+            // Unaccounted: cosca fails a kill only for a target it could not
+            // open or assess, i.e. exactly when it may still be running.
+            Err(e) => {
+                all_accounted = false;
+                tracing::warn!(
+                    pid = record.pid,
+                    token = record.token,
+                    observation,
+                    error = %e,
+                    "failed to kill recorded plugin"
+                );
+            }
         }
     }
 
+    if all_accounted {
+        clear_or_log(state_dir);
+    } else {
+        tracing::warn!(
+            path = %state_dir.join(plugin_state::STATE_FILE_NAME).display(),
+            "keeping the plugin state file: a record could not be accounted for"
+        );
+    }
+}
+
+/// Whether a failed restore SETTLES the record: the refusal is about the
+/// record's own contents, so no later start on this host could restore it and
+/// keeping the file for it would litter forever.
+///
+/// `ScopeUnreadable` is the one record error that is not about the contents —
+/// this host's boot session momentarily could not be read, raised before the
+/// record is validated at all — so an otherwise perfectly restorable record
+/// lands here. It, and any error that is not a record error, leave the record
+/// unsettled. Both `Error` and `RecordErrorKind` are `#[non_exhaustive]`; a kind
+/// cosca adds later reads as unsettled, which keeps the file rather than
+/// forgetting a live plugin.
+fn settles_the_record(e: &cosca::error::Error) -> bool {
+    use cosca::error::RecordErrorKind as K;
+    match e {
+        cosca::error::Error::IdentityRecord { kind, .. } => matches!(
+            kind,
+            K::UnknownVersion
+                | K::ForeignPlatform
+                | K::InvalidPid
+                | K::ForeignBootSession
+                | K::MissingBootSession
+                | K::ForeignPidNamespace
+                | K::MissingPidNamespace
+        ),
+        _ => false,
+    }
+}
+
+/// A dropped `clear` failure leaves the file in place forever, which is the
+/// same litter bug one layer down — so state the disposition at every call.
+fn clear_or_log(state_dir: &Path) {
     if let Err(e) = plugin_state::clear(state_dir) {
         tracing::warn!(error = %e, "failed to clear plugin state file");
     }
 }
 
-// Platform helpers ====================================================================================================
-
-/// Kill a process by PID. Best-effort: ESRCH / "not found" is treated as
-/// success (process already exited). EPERM is treated as an error.
-pub fn kill_pid(pid: u32) -> std::io::Result<()> {
-    platform::kill_pid_impl(pid)
-}
-
-/// Read the start time of a process as Unix milliseconds. Returns `None`
-/// if the process doesn't exist. Shared with the GUI via `hole_common::process`.
-pub use hole_common::process::process_start_time;
-
-#[cfg(target_os = "windows")]
-mod platform {
-    use std::io;
-
-    pub fn kill_pid_impl(pid: u32) -> io::Result<()> {
-        use windows::Win32::Foundation::CloseHandle;
-        use windows::Win32::System::Threading::{OpenProcess, TerminateProcess, PROCESS_TERMINATE};
-
-        // ERROR_INVALID_PARAMETER (87) — PID 0 or invalid
-        // ERROR_ACCESS_DENIED (5) — insufficient privileges
-        // 0x80070057 (E_INVALIDARG) — non-existent PID on some Windows versions
-        let handle = match unsafe { OpenProcess(PROCESS_TERMINATE, false, pid) } {
-            Ok(h) => h,
-            Err(e) => {
-                let code = e.code().0 as u32;
-                // Treat "not found" as success (process already dead).
-                if code == 0x80070057 || code == 87 {
-                    return Ok(());
-                }
-                return Err(io::Error::from(e));
-            }
-        };
-
-        let result = unsafe { TerminateProcess(handle, 1) };
-        let _ = unsafe { CloseHandle(handle) };
-        match result {
-            Ok(()) => Ok(()),
-            Err(e) => {
-                // TerminateProcess on an already-terminated process returns
-                // E_ACCESSDENIED (0x80070005). Treat as success.
-                let code = e.code().0 as u32;
-                if code == 0x80070005 {
-                    return Ok(());
-                }
-                Err(io::Error::from(e))
-            }
-        }
-    }
-}
-
-#[cfg(target_os = "macos")]
-mod platform {
-    use std::io;
-
-    pub fn kill_pid_impl(pid: u32) -> io::Result<()> {
-        let pid = i32::try_from(pid).map_err(|_| io::Error::other("PID out of i32 range"))?;
-        let ret = unsafe { libc::kill(pid, libc::SIGKILL) };
-        if ret == 0 {
-            return Ok(());
-        }
-        let err = io::Error::last_os_error();
-        if err.raw_os_error() == Some(libc::ESRCH) {
-            Ok(())
-        } else {
-            Err(err)
-        }
-    }
-}
-
-#[cfg(target_os = "linux")]
-mod platform {
-    use std::io;
-
-    pub fn kill_pid_impl(pid: u32) -> io::Result<()> {
-        let pid = i32::try_from(pid).map_err(|_| io::Error::other("PID out of i32 range"))?;
-        let ret = unsafe { libc::kill(pid, libc::SIGKILL) };
-        if ret == 0 {
-            return Ok(());
-        }
-        let err = io::Error::last_os_error();
-        if err.raw_os_error() == Some(libc::ESRCH) {
-            Ok(())
-        } else {
-            Err(err)
-        }
+/// What the pid names right now, relative to the record.
+fn observe(id: ProcessId) -> &'static str {
+    match ProcessId::of(id.pid()) {
+        Resolved::Found(live) if live == id => "match",
+        Resolved::Found(_) => "recycled",
+        Resolved::Gone => "gone",
+        Resolved::Unknown => "unassessable",
     }
 }
 

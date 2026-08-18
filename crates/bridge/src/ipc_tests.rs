@@ -720,7 +720,7 @@ fn update_apply_lockdown_off_without_consent_is_refused() {
         );
         let _ = resp.into_body().collect().await;
         // No marker was written (the refusal preceded the marker write).
-        assert!(hole_common::update_marker::read(&log_dir).is_none());
+        assert!(!hole_common::update_marker::is_present(&log_dir));
 
         drop(client);
         handle.abort();
@@ -738,11 +738,9 @@ fn update_apply_with_existing_marker_is_409() {
             &log_dir,
             &hole_common::update_marker::MarkerInfo {
                 version: hole_common::update_marker::MARKER_VERSION,
-                from_version: "0.2.0".into(),
-                to_version: "0.3.0".into(),
-                driver_pid: 1,
-                started_at_unix: 0,
-                driver_start_unix_ms: 0,
+                driver: cosca::identity::ProcessId::current()
+                    .to_record()
+                    .expect("persist this process's identity"),
             },
             None,
         )
@@ -830,7 +828,7 @@ fn update_apply_unverifiable_payload_is_422_and_clears_the_marker() {
         // The marker is claimed then cleared on the verify failure — no cutover
         // is left in progress.
         assert!(
-            hole_common::update_marker::read(&log_dir).is_none(),
+            !hole_common::update_marker::is_present(&log_dir),
             "a verify failure must clear the marker it claimed"
         );
 
@@ -881,7 +879,7 @@ fn update_apply_staging_io_failure_clears_the_marker() {
         assert_eq!(resp.status(), 500, "a staging I/O failure is a server fault");
         let _ = resp.into_body().collect().await;
         assert!(
-            hole_common::update_marker::read(&log_dir).is_none(),
+            !hole_common::update_marker::is_present(&log_dir),
             "a post-marker staging failure must clear the marker it claimed"
         );
 
@@ -937,7 +935,7 @@ fn update_apply_spoofed_app_dest_is_400_no_marker() {
         assert_eq!(resp.status(), 400, "a spoofed bundle identity must be refused with 400");
         let _ = resp.into_body().collect().await;
         assert!(
-            hole_common::update_marker::read(&log_dir).is_none(),
+            !hole_common::update_marker::is_present(&log_dir),
             "a destination rejection must not write a marker"
         );
 
@@ -2061,19 +2059,15 @@ fn socket_removed_on_drop() {
 }
 
 #[skuld::test]
-fn build_cutover_marker_maps_driver_identity() {
-    let m = super::build_cutover_marker("0.2.0".into(), "0.3.0".into(), 4242, 1_700_000_000, 1_700_000_000_123);
+fn build_cutover_marker_carries_this_processs_identity() {
+    let me = cosca::identity::ProcessId::current();
+    let m = super::build_cutover_marker(me.to_record().expect("persist this process's identity"));
+    assert_eq!(m.version, hole_common::update_marker::MARKER_VERSION);
     assert_eq!(
-        (m.driver_pid, m.driver_start_unix_ms, m.version),
-        (4242, 1_700_000_000_123, hole_common::update_marker::MARKER_VERSION)
+        cosca::identity::ProcessId::try_from(&m.driver).expect("the marker's driver must restore"),
+        me,
+        "the marker must name the writing process, not a synthesized record"
     );
-    assert_eq!((m.from_version.as_str(), m.to_version.as_str()), ("0.2.0", "0.3.0"));
-}
-
-#[skuld::test]
-fn own_process_start_time_is_nonzero() {
-    // The fallback-to-0 poison sentinel must not be hit for a live self-probe.
-    assert_ne!(hole_common::process::process_start_time(std::process::id()), Some(0));
 }
 
 #[skuld::test]
