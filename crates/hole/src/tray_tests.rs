@@ -191,6 +191,60 @@ fn lockdown_off_renders_plain_label() {
     assert!(!label.to_lowercase().contains("warning"));
 }
 
+// escape_item =========================================================================================================
+
+#[skuld::test]
+fn escape_item_offers_unblock_exactly_when_the_intent_is_on_and_nothing_runs() {
+    // Exhaustive over all eight (lockdown_enabled, running, blocked_offers_go_offline)
+    // rows. Unblock wins whenever the intent is on and nothing runs, regardless of
+    // blocked_offers_go_offline (a strict superset); otherwise GoOffline shows
+    // whenever it applies; otherwise None. There is no probe input to fail — this
+    // table is the whole decision.
+    let table = [
+        // (lockdown_enabled, running, blocked_offers_go_offline, expected)
+        (true, false, true, EscapeItem::Unblock),
+        (true, false, false, EscapeItem::Unblock),
+        (true, true, true, EscapeItem::GoOffline),
+        (true, true, false, EscapeItem::None),
+        (false, false, true, EscapeItem::GoOffline),
+        (false, false, false, EscapeItem::None),
+        (false, true, true, EscapeItem::GoOffline),
+        (false, true, false, EscapeItem::None),
+    ];
+    for (lockdown_enabled, running, blocked_offers_go_offline, expected) in table {
+        assert_eq!(
+            escape_item(lockdown_enabled, running, blocked_offers_go_offline),
+            expected,
+            "lockdown_enabled={lockdown_enabled} running={running} blocked_offers_go_offline={blocked_offers_go_offline}"
+        );
+    }
+}
+
+#[skuld::test]
+fn unblock_unreachable_message_names_the_command_and_the_disconnect_caveat() {
+    assert!(UNBLOCK_UNREACHABLE_MESSAGE.contains("hole bridge unlock"));
+    assert!(
+        UNBLOCK_UNREACHABLE_MESSAGE.to_lowercase().contains("disconnect"),
+        "must caution the user to disconnect first: {UNBLOCK_UNREACHABLE_MESSAGE:?}"
+    );
+    assert!(
+        !UNBLOCK_UNREACHABLE_MESSAGE.contains('\\') && !UNBLOCK_UNREACHABLE_MESSAGE.contains('/'),
+        "must carry no filesystem path: {UNBLOCK_UNREACHABLE_MESSAGE:?}"
+    );
+}
+
+#[skuld::test]
+fn unblock_session_running_message_does_not_name_the_cli() {
+    assert!(
+        UNBLOCK_SESSION_RUNNING_MESSAGE.to_lowercase().contains("disconnect"),
+        "must point the user at Disconnect: {UNBLOCK_SESSION_RUNNING_MESSAGE:?}"
+    );
+    assert!(
+        !UNBLOCK_SESSION_RUNNING_MESSAGE.contains("bridge unlock"),
+        "must NOT talk a user into an out-of-process clear over a live tunnel: {UNBLOCK_SESSION_RUNNING_MESSAGE:?}"
+    );
+}
+
 // startup_should_connect ==============================================================================================
 
 #[skuld::test]

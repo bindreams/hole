@@ -252,6 +252,27 @@ const ID_EXIT: &str = "exit";
 const ID_INSTALL_UPDATE: &str = "install_update";
 const ID_LOCKDOWN: &str = "lockdown";
 const ID_BLOCKED_RETRY: &str = "blocked_retry";
+const ID_UNBLOCK: &str = "unblock";
+
+const UNBLOCK_ITEM_LABEL: &str = "Unblock Network (turns Lockdown off)";
+
+/// Shown when `BridgeRequest::Unblock` could not be reached or answered
+/// unintelligibly — the case the CLI door exists for. Must name the CLI
+/// command AND the disconnect caveat: "the bridge did not answer" is fully
+/// compatible with "a session is running" (a cutover restart, a dropped
+/// socket), and the CLI has no running-session check of its own — stripping
+/// the cover from under a live tunnel if the user runs it while connected.
+const UNBLOCK_UNREACHABLE_MESSAGE: &str =
+    "Could not reach the Hole bridge. If you are currently connected, disconnect first, then run \
+     \"hole bridge unlock\" as an administrator (use sudo on macOS).";
+
+/// Shown when the bridge answered `Err(ClientError::SessionRunning)`: a
+/// session is running, so there was no unowned cover to clear, but the kill
+/// switch is now off. Must NOT name `hole bridge unlock` — that command
+/// performs no running-session check, so directing a user there in this
+/// state would strip the cover from under a live tunnel.
+const UNBLOCK_SESSION_RUNNING_MESSAGE: &str =
+    "A session is running, so there was nothing to unblock. The kill switch is now off — Disconnect to release its cover.";
 
 // Tray creation =======================================================================================================
 
@@ -305,6 +326,35 @@ fn tray_actions(running: bool, transition: Option<bool>, blocked: bool) -> TrayA
     }
 }
 
+/// Which escape from a fail-closed cover the menu should render, if any.
+/// There are two, and they overlap: `GoOffline` (the existing blocked-state
+/// item) sends Disconnect to release the held transient cover; `Unblock`
+/// clears that same cover *and* the standing one *and* disarms the intent.
+/// Rendering both would put two items reading "unblock" side by side doing
+/// different things.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EscapeItem {
+    None,
+    GoOffline,
+    Unblock,
+}
+
+/// Resolve which escape item to show. `Unblock` wins whenever it applies —
+/// it is a strict superset of `GoOffline`'s effect — so the two are never
+/// rendered together. There is no probe input here to fail: the intent is on
+/// and nothing is running is the whole condition, pinned by the exhaustive
+/// table test over all eight `(lockdown_enabled, running,
+/// blocked_offers_go_offline)` rows.
+fn escape_item(lockdown_enabled: bool, running: bool, blocked_offers_go_offline: bool) -> EscapeItem {
+    if lockdown_enabled && !running {
+        EscapeItem::Unblock
+    } else if blocked_offers_go_offline {
+        EscapeItem::GoOffline
+    } else {
+        EscapeItem::None
+    }
+}
+
 /// Build the tray menu, optionally including an "Install Update" item.
 ///
 /// `running` is the bridge's actual state (from the `ProxyStateCell`,
@@ -333,15 +383,20 @@ fn build_tray_menu(
         transition.is_none(),
         None::<&str>,
     )?;
-    // Shown only in the blocked state: releases the fail-closed cover and goes
-    // offline (unprotected) — the deliberate escape from a stay-blocked host.
+    // Shown only in the blocked state: releases the held transient cover and
+    // goes offline (unprotected) — the deliberate escape from a stay-blocked
+    // host. The label names what it does NOT do (turn Lockdown off) so it
+    // reads distinctly from Unblock when both could apply.
     let go_offline = MenuItem::with_id(
         app,
         ID_DISCONNECT,
-        "Go Offline (unblock)",
+        "Go Offline (keeps Lockdown armed)",
         transition.is_none(),
         None::<&str>,
     )?;
+    // Shown whenever the kill-switch intent is on and nothing is running —
+    // unconditionally, independent of whether a cover is actually stranded.
+    let unblock = MenuItem::with_id(app, ID_UNBLOCK, UNBLOCK_ITEM_LABEL, transition.is_none(), None::<&str>)?;
     let autostart = CheckMenuItem::with_id(app, ID_AUTOSTART, "Start at Login", true, false, None::<&str>)?;
     // Checked tracks intent; the warning label covers the enabled-but-inactive
     // state since a checkmark alone can't signal "armed but not engaged".
@@ -370,8 +425,10 @@ fn build_tray_menu(
     };
 
     let mut items: Vec<&dyn tauri::menu::IsMenuItem<tauri::Wry>> = vec![&status, &connect];
-    if acts.show_go_offline {
-        items.push(&go_offline);
+    match escape_item(lockdown_enabled, running, acts.show_go_offline) {
+        EscapeItem::Unblock => items.push(&unblock),
+        EscapeItem::GoOffline => items.push(&go_offline),
+        EscapeItem::None => {}
     }
     items.extend([
         &sep1 as &dyn tauri::menu::IsMenuItem<tauri::Wry>,
@@ -845,6 +902,50 @@ fn handle_tray_event(app: &AppHandle, event: MenuEvent) {
             let app_handle = app.clone();
             tauri::async_runtime::spawn(async move {
                 handle_install_update_from_tray(app_handle, None).await;
+            });
+        }
+        ID_UNBLOCK => {
+            info!("tray: unblock clicked");
+            let app_handle = app.clone();
+            tauri::async_runtime::spawn(async move {
+                let state = app_handle.state::<AppState>();
+                let response = state.bridge_send(BridgeRequest::Unblock).await;
+                let dialog_message = match &response {
+                    Ok(BridgeResponse::Ack) => {
+                        info!("tray: unblock succeeded");
+                        None
+                    }
+                    Err(crate::bridge_client::ClientError::SessionRunning) => {
+                        info!("tray: unblock found a session running");
+                        Some(UNBLOCK_SESSION_RUNNING_MESSAGE.to_string())
+                    }
+                    Ok(BridgeResponse::Error { message }) => {
+                        error!(%message, "tray: unblock reported a failure");
+                        Some(message.clone())
+                    }
+                    Err(e) => {
+                        error!(error = %e, "tray: unblock could not reach or understand the bridge");
+                        Some(UNBLOCK_UNREACHABLE_MESSAGE.to_string())
+                    }
+                    Ok(other) => {
+                        error!(?other, "tray: unblock got an unexpected response shape");
+                        Some(UNBLOCK_UNREACHABLE_MESSAGE.to_string())
+                    }
+                };
+                // Re-fetch Status and rebuild on every branch so the escape
+                // stays available for a retry.
+                let _ = state.bridge_send(BridgeRequest::Status).await;
+                rebuild_tray_menu(&app_handle);
+                if let Some(message) = dialog_message {
+                    tauri::async_runtime::spawn_blocking(move || {
+                        use tauri_plugin_dialog::DialogExt;
+                        app_handle
+                            .dialog()
+                            .message(message)
+                            .title("Unblock Network")
+                            .blocking_show();
+                    });
+                }
             });
         }
         ID_LOCKDOWN => {
