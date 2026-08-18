@@ -264,6 +264,16 @@ struct BlockedStart<C> {
     resolver_permit: Option<IpAddr>,
 }
 
+/// Result of [`ProxyManager::turn_lockdown_off`]. `Cleared` means every
+/// unowned cover Hole can install has been released and the intent is off;
+/// `SessionRunning` means a live session owns its own cover instead — the
+/// intent was still recorded, but there was no unowned cover here to clear.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LockdownOffOutcome {
+    Cleared,
+    SessionRunning,
+}
+
 impl<P: Proxy, R: Routing> ProxyManager<P, R, SystemDns> {
     pub fn new(proxy: P, routing: R) -> Self {
         Self::new_with_dns(proxy, routing, SystemDns::default())
@@ -488,6 +498,49 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         })?;
         lockdown_state::set_enabled(dir, enabled, self.state_owner)
             .map_err(|e| ProxyError::Runtime(std::io::Error::other(format!("lockdown persist: {e}"))))
+    }
+
+    /// Turn the kill-switch intent off, releasing any cover no running
+    /// session owns. This is the feature's only stateful decision: both the
+    /// tray's Unblock item and the Lockdown-off toggle call it and map the
+    /// returned outcome to their own reply; neither inspects `running`
+    /// itself — `self.running.is_some()` is the ONLY condition anywhere in
+    /// this path.
+    ///
+    /// The step-3-before-step-4 ordering (release, THEN persist) is
+    /// load-bearing: the tray offers this escape while the intent is on, so
+    /// flipping the intent off after a FAILED release would delete the
+    /// user's only retry affordance while the host is still held closed. The
+    /// intent moves only after the clear confirms.
+    pub fn turn_lockdown_off(&mut self) -> Result<LockdownOffOutcome, ProxyError> {
+        // 1. The only condition. A running session owns its own standing
+        // cover and `stop_with` releases it — there is no unowned cover to
+        // clear here, so recording the intent is the whole of what "turn it
+        // off" can mean while connected (matches the toggle's existing
+        // mid-session behavior).
+        if self.running.is_some() {
+            self.set_lockdown_intent(false)?;
+            return Ok(LockdownOffOutcome::SessionRunning);
+        }
+
+        // 2. Drop any held transient guard's in-process authority first. Not
+        // a condition — `take` on `None` is a no-op — it exists so no live
+        // guard outlives the OS objects `release_all_covers` is about to
+        // delete out from under it.
+        self.blocked.take();
+
+        // 3. The unconditional clear. On error, return WITHOUT touching the
+        // intent — see the ordering note above.
+        self.routing.release_all_covers()?;
+
+        // 4. Only now move the intent. The covers are already gone and the
+        // host is open; a persist failure here means only the SETTING did
+        // not save, which the caller must be able to say distinctly from a
+        // failed release.
+        match self.set_lockdown_intent(false) {
+            Ok(()) => Ok(LockdownOffOutcome::Cleared),
+            Err(_) => Err(ProxyError::LockdownIntentNotPersisted),
+        }
     }
 
     /// Non-cancellable convenience wrapper around
@@ -1677,6 +1730,10 @@ fn lockdown_app_ids(config: &ProxyConfig) -> Vec<std::path::PathBuf> {
 #[cfg(test)]
 #[path = "proxy_manager_tests.rs"]
 mod proxy_manager_tests;
+
+#[cfg(test)]
+#[path = "proxy_manager_release_tests.rs"]
+mod proxy_manager_release_tests;
 
 // E2E test platform policy:
 //
