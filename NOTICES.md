@@ -88,13 +88,6 @@ compatibility. The ex-Galoshes crates remain individually available under
 Apache-2.0 for any downstream consumer who pulls them out of this
 monorepo.
 
-## kill-group (`crates/kill-group`)
-
-`crates/kill-group` is a first-party process-tree kill-group primitive,
-extracted from garter. Licensed under the Apache License, Version 2.0.
-
-Copyright © 2026 Anna Zhukova.
-
 ## stepstool (`crates/stepstool`)
 
 `crates/stepstool` is a first-party elevation-primitives crate (sudo

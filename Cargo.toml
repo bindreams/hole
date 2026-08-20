@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/common", "crates/bridge", "crates/dev-console", "crates/dump", "crates/dump-macros", "crates/galoshes", "crates/garter", "crates/garter-bin", "crates/handle-holders", "crates/hole", "crates/kill-group", "crates/payload-archive", "crates/plugin-e2e", "crates/stepstool", "crates/test-observability", "crates/tombstone", "crates/tun-engine", "crates/tun-engine-macros", "crates/util", "xtask", "xtask-lib"]
+members = ["crates/common", "crates/bridge", "crates/dev-console", "crates/dump", "crates/dump-macros", "crates/galoshes", "crates/garter", "crates/garter-bin", "crates/handle-holders", "crates/hole", "crates/payload-archive", "crates/plugin-e2e", "crates/stepstool", "crates/test-observability", "crates/tombstone", "crates/tun-engine", "crates/tun-engine-macros", "crates/util", "xtask", "xtask-lib"]
 resolver = "2"
 
 [workspace.package]
@@ -15,7 +15,7 @@ edition = "2021"
 skuld = { version = "0.2", features = ["tokio"] }
 # Process identity: `(pid, raw kernel start token)` compared exactly, plus the
 # versioned `ProcessIdRecord` the bridge persists across a restart; and, with the
-# `tokio` feature, the containment that replaced `crates/kill-group`.
+# `tokio` feature, process-tree containment and the graceful teardown signals.
 #
 # No `version` key, deliberately: with one, `cargo package` silently rewrites this
 # to the registry version and drops the git source (measured), publishing a garter

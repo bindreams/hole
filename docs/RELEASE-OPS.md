@@ -1,6 +1,6 @@
 # Release operations runbook
 
-Per-product release procedure: see [CONTRIBUTING.md § Releases](../CONTRIBUTING.md#releases). This file is the runbook for the off-happy-path operations — rollback, minisign key rotation, the crates.io dry-run staleness gap — plus the manual kill-group publish.
+Per-product release procedure: see [CONTRIBUTING.md § Releases](../CONTRIBUTING.md#releases). This file is the runbook for the off-happy-path operations — rollback, minisign key rotation, and the crates.io dry-run staleness gap.
 
 ## Rollback procedure
 
@@ -25,7 +25,7 @@ Use when a release is published but later determined defective (broken binary, r
 
 For a **draft** release (e.g. a failed `garter` publish), `gh release delete` destroys the release AND the tag together (drafts hold tags in release metadata, not as real git refs). The `git tag -d` step will fail with "tag not found" — expected.
 
-### crates.io tracks (`garter`, `kill-group`) — yank
+### crates.io tracks (`garter`) — yank
 
 After completing the all-tracks steps above, yank the crates.io version:
 
@@ -96,22 +96,6 @@ On publish failure:
    - **Persistent issue** (yanked dep, breaking registry change): the draft is salvageable only after the underlying `Cargo.toml` is patched. Pin around the issue (e.g. `tokio = "=1.41.0"` to lock to the previous-good version), bump garter's version per the group rules, abandon the existing draft (`gh release delete` per the rollback procedure above), and cut a new draft against the patched commit.
 
 The publish workflow's idempotency check (`already_published` query) protects against **double-publishing** the same version, NOT against repeated-failure publishes — a yanked-dep failure will reproduce on every re-run until the upstream resolution lands.
-
-## kill-group (manual publish)
-
-`kill-group` has no draft/publish workflow pair: the reusable publish workflow ([reusable-publish-release.yaml](../.github/workflows/reusable-publish-release.yaml)) requires a pre-existing draft release with binary assets, and a crates.io-only lib has none. Add a workflow pair if kill-group ever grows binary artifacts.
-
-To release:
-
-```bash
-git tag releases/kill-group/v<X.Y.Z>
-git push origin releases/kill-group/v<X.Y.Z>
-cargo publish -p kill-group
-```
-
-Re-running `cargo publish` on an already-published version fails harmlessly — the same property the garter publish workflow's idempotency check relies on.
-
-**Ordering (load-bearing):** kill-group must be on crates.io at the version garter's `Cargo.toml` names **before** any garter publish — `cargo publish -p garter` fails otherwise.
 
 ## Track interactions
 
