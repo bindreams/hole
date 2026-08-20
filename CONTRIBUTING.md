@@ -884,9 +884,16 @@ on a client path (the vendored tree is lint-excluded): re-verify on every re-mer
 
 ## Prerequisites
 
-- Rust toolchain
-- Go toolchain (for ex-ray; built by `cargo xtask deps`)
+- Rust toolchain (pinned via [rust-toolchain.toml](rust-toolchain.toml); rustup
+  installs it on the first `cargo` call in the repo)
+- Go toolchain (for ex-ray; built by `cargo xtask deps`) — pinned via
+  [.go-version](.go-version), which CI feeds to `actions/setup-go`
 - Node.js ≥24 (pinned via `engines.node` in [package.json](package.json))
+
+CI installs exactly these versions, so a toolchain release cannot turn `main`
+red on its own. Bumping either pin is a deliberate change that carries any new
+lint fallout with it — clippy gains lints between releases, and golangci-lint
+must be new enough to typecheck the Go standard library it is pointed at.
 
 ### npm dependency management
 

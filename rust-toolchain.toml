@@ -1,0 +1,12 @@
+# The single source of truth for the Rust version, in CI and locally.
+#
+# CI used to install `stable` at job time, so a rustc release landed in every
+# job the day it shipped: 1.98.0 turned `main` red on unchanged code, because
+# `result_large_err` started seeing through `async fn` and
+# `chunks_exact_to_as_chunks` was new. See #854.
+#
+# `.github/actions/setup-build` reads `channel` from this file, so bumping it
+# here moves CI too — deliberately, with any lint fallout in the same change.
+[toolchain]
+channel = "1.98.0"
+components = ["clippy", "rustfmt"]
