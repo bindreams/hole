@@ -117,6 +117,21 @@
       "matchManagers": ["gomod"],
       "matchDepNames": ["github.com/v2fly/v2ray-core/v5", "github.com/refraction-networking/utls"],
       "enabled": false
+    },
+    {
+      "description": "The `go` directive in crates/ex-ray/go.mod is CI's Go pin (go-version-file). Move it alone so a human reads the bump, and so a version past what golangci-lint supports turns Lint red on that PR instead of arriving batched under the automerged \"Go modules\" group above.",
+      "matchManagers": ["gomod"],
+      "matchDepNames": ["go"],
+      "matchDepTypes": ["golang"],
+      "rangeStrategy": "bump",
+      "groupName": null,
+      "automerge": false
+    },
+    {
+      "description": "rust-toolchain.toml is the compiler CI and contributors both use, so a new stable's lints land in their own reviewable PR instead of on main.",
+      "matchManagers": ["rust-toolchain"],
+      "groupName": null,
+      "automerge": false
     }
   ]
 }
