@@ -30,6 +30,29 @@ fn first_failure_for_sentinel() -> bool {
     }
 }
 
+/// Absorb the cooperative shutdown signal, so only a force-kill can end this process.
+#[cfg(unix)]
+fn ignore_cooperative_signal() {
+    // SAFETY: setting SIG_IGN runs no handler code; it only changes a process-wide disposition.
+    unsafe {
+        libc::signal(libc::SIGTERM, libc::SIG_IGN);
+    }
+}
+
+#[cfg(windows)]
+fn ignore_cooperative_signal() {
+    use windows::Win32::System::Console::SetConsoleCtrlHandler;
+
+    // Returning TRUE claims the event as handled, so the default disposition
+    // (STATUS_CONTROL_C_EXIT) never runs.
+    unsafe extern "system" fn absorb(_ctrl_type: u32) -> windows::core::BOOL {
+        windows::Win32::Foundation::TRUE
+    }
+
+    // SAFETY: `absorb` is a valid handler with the required ABI and no state of its own.
+    unsafe { SetConsoleCtrlHandler(Some(absorb), true) }.expect("install a console control handler");
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Knob: MOCK_PLUGIN_SLEEP — "grandchild" mode (a garter process-tree-reaping
@@ -45,6 +68,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // TCP connection) and needs no sleep. We never write to the socket — closing
     // it is purely an exit signal.
     if std::env::var_os("MOCK_PLUGIN_SLEEP").is_some() {
+        // Knob: MOCK_PLUGIN_IGNORE_SIGNALS — absorb the cooperative shutdown signal
+        // (SIGTERM / CTRL_BREAK) so only a force-kill can end this process. Installed
+        // before the callback dial, so a test that has observed readiness is past it.
+        if std::env::var_os("MOCK_PLUGIN_IGNORE_SIGNALS").is_some() {
+            ignore_cooperative_signal();
+        }
         let _callback = match std::env::var_os("MOCK_PLUGIN_GRANDCHILD_CALLBACK") {
             Some(addr) => {
                 let addr = addr.to_str().expect("MOCK_PLUGIN_GRANDCHILD_CALLBACK is valid utf-8");
