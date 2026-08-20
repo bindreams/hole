@@ -49,7 +49,7 @@ jobs:
       - name: Ensure origin/main is available
         run: git fetch origin main --quiet
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: ./.github/actions/setup-rust
       - uses: actions/setup-go@v7
         with:
           go-version: stable

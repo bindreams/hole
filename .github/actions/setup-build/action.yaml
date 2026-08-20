@@ -11,10 +11,8 @@ runs:
         echo "SCCACHE_GHA_ENABLED=true" >> "$GITHUB_ENV"
         echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
 
-    - uses: dtolnay/rust-toolchain@stable
+    - uses: ./.github/actions/setup-rust
       id: rust-toolchain
-      with:
-        components: clippy, rustfmt
 
     - uses: actions/setup-go@v7
       with:

@@ -126,8 +126,13 @@ jobs:
 
   # Three per-project test jobs, all consuming the `build-<os>-<arch>` artifact
   # and running `cargo nextest run --archive-file`. They install the nextest
-  # binary via taiki-e/install-action (no Rust toolchain needed) and skip the
-  # `setup-build` composite action entirely.
+  # binary via taiki-e/install-action and skip the `setup-build` composite
+  # action entirely. test-garter and test-galoshes genuinely need no Rust
+  # toolchain — they invoke `cargo-nextest` directly against a prebuilt
+  # archive. test-tooling does need one: part of its `package(xtask)` run
+  # shells out to `cargo metadata` (ci_coverage_tests.rs's
+  # `every_workspace_crate_runs_in_ci`), so it carries its own `setup-rust`
+  # step below.
   test-garter:
     name: Test garter (${{ matrix.os }}/${{ matrix.arch }})
     needs: build
@@ -223,6 +228,12 @@ jobs:
           - { os: windows, arch: arm64, runner: windows-11-arm }
     steps:
       - uses: actions/checkout@v7
+
+      # `ci_coverage_tests.rs`'s `every_workspace_crate_runs_in_ci` (part of
+      # `package(xtask)`, run by this job) shells out to `cargo metadata` at
+      # runtime — the only reason this job, unlike test-garter/test-galoshes,
+      # needs a Rust toolchain at all.
+      - uses: ./.github/actions/setup-rust
 
       - uses: actions/setup-python@v7
         with:
@@ -789,7 +800,7 @@ jobs:
           node-version-file: package.json
           cache: npm
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: ./.github/actions/setup-rust
         id: rust-toolchain
 
       - uses: actions/cache@v6
