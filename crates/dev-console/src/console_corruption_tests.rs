@@ -38,19 +38,23 @@ impl Drop for ConsoleModeGuard {
 /// against a child that never initialized its console handlers — and Vite's
 /// output format changing must break this test, not silently pass it).
 /// The marker wait is a class-2 bound (third-party child; per-test timeout).
-async fn run_vite_and_measure(stdin: std::process::Stdio) -> u32 {
+async fn run_vite_and_measure(stdin: cosca::Stdio) -> u32 {
     let npm = which::which("npm").expect("npm on PATH");
-    let mut cmd = tokio::process::Command::new(npm);
+    let mut cmd = cosca::tokio::Command::new();
+    cmd.executable(&npm);
+    cmd.arg(&npm);
     cmd.args(["run", "dev"]);
     // package.json lives at the workspace root; nextest's cwd is the crate
     // dir (the Python original ran from the repo root).
     cmd.current_dir(xtask_lib::repo_root::repo_root().expect("workspace root"));
-    cmd.stdin(stdin)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
-    cmd.kill_on_drop(true);
-    let mut gc = kill_group::GroupedChild::spawn(&mut cmd, kill_group::Nesting::Mark).unwrap();
-    let stdout = gc.child.stdout.take().unwrap();
+    cmd.stdin(stdin).unwrap();
+    cmd.stdout(cosca::Stdio::pipe()).unwrap();
+    cmd.stderr(cosca::Stdio::pipe()).unwrap();
+    cmd.kill_on_drop(true)
+        .contain()
+        .nesting(cosca::containment::Nesting::Mark);
+    let mut child = cmd.spawn().unwrap();
+    let stdout = child.stdout().unwrap();
     use tokio::io::AsyncBufReadExt as _;
     let mut lines = tokio::io::BufReader::new(stdout).lines();
     loop {
@@ -64,7 +68,10 @@ async fn run_vite_and_measure(stdin: std::process::Stdio) -> u32 {
             break;
         }
     }
-    gc.kill_tree().await;
+    // `kill_tree` is signal-only, so the wait is what makes the mode read
+    // below happen after the tree has actually died.
+    child.kill_tree().unwrap();
+    child.wait().await.unwrap();
     console_input_mode().expect("console mode after")
 }
 
@@ -80,7 +87,7 @@ async fn null_stdin_child_cannot_corrupt_console_mode() {
     let _restore = ConsoleModeGuard(before);
 
     // Leg 1: inherited stdin MUST corrupt (the bug repro / vacuity guard).
-    let corrupted = run_vite_and_measure(std::process::Stdio::inherit()).await;
+    let corrupted = run_vite_and_measure(cosca::Stdio::inherit()).await;
     assert_ne!(
         before, corrupted,
         "bug did NOT reproduce: an inherited-stdin Vite no longer alters the console mode \
@@ -90,7 +97,7 @@ async fn null_stdin_child_cannot_corrupt_console_mode() {
     drop(ConsoleModeGuard(before));
 
     // Leg 2: null stdin must preserve the mode (the dev-console discipline).
-    let after = run_vite_and_measure(std::process::Stdio::null()).await;
+    let after = run_vite_and_measure(cosca::Stdio::null()).await;
     assert_eq!(
         before, after,
         "a stdin=null child must not change the console input mode"

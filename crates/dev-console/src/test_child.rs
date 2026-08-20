@@ -1,9 +1,9 @@
 //! Self-reinvoke child modes for dev-console's own tests.
 //!
 //! The test binary doubles as the spawned child: when `DEV_CONSOLE_TEST_CHILD`
-//! is set, `maybe_run` takes over the process and never returns. Adapted from
-//! kill-group's `test_child` under dev-console's own env names — two test
-//! binaries must not react to each other's vars. Modes:
+//! is set, `maybe_run` takes over the process and never returns. The env names
+//! are dev-console's own — two test binaries must not react to each other's
+//! vars. Modes:
 //!
 //! - `sleep` — connect to `DEV_CONSOLE_TEST_CONTROL` (TCP), hold the
 //!   connection open, sleep forever. The held connection is the liveness
@@ -11,7 +11,7 @@
 //!   reuse-immune, sleep-free pattern from garter's
 //!   `force_kill_reaps_descendant_tree`).
 //! - `spawn-grandchild` — spawn this same binary in `sleep` mode as a plain
-//!   child (NOT a kill-group; it must be reaped via the tree, not directly),
+//!   child (NOT contained; it must be reaped via the tree, not directly),
 //!   then sleep forever itself; the intermediate parent never dials the
 //!   control listener; only the grandchild's `sleep` mode does — the accepted
 //!   connection is the GRANDCHILD's death-watch.
