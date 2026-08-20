@@ -726,6 +726,19 @@ fn question_end_rejects_truncated() {
     assert!(question_end(q).is_none());
 }
 
+/// clippy's `result_large_err` flags a `Result<_, E>` whose `E` exceeds 128
+/// bytes, because it travels by value on every `Ok` return too. `UpstreamErr`
+/// rides the `Result` on every forward attempt, so keep it under the
+/// threshold.
+#[skuld::test]
+fn upstream_err_stays_small_on_the_result_path() {
+    assert!(
+        std::mem::size_of::<UpstreamErr>() <= 128,
+        "UpstreamErr is {} bytes; clippy::result_large_err fires above 128",
+        std::mem::size_of::<UpstreamErr>()
+    );
+}
+
 // Typed upstream errors + source-chain logging ========================================================================
 //
 // These tests assert the `layer=...`, `elapsed_ms=...`, `caused_by=...`

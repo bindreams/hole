@@ -138,14 +138,11 @@ pub enum ForwardFailure {
     Upstream(UpstreamCause),
 }
 
-/// Tagged upstream failure: `{ layer, source, elapsed_ms }` plus optional
-/// diagnostic context captured at the point of failure. `io::Error` is
-/// `!Clone`, so `UpstreamErr` cannot be `Clone` — consumed once on the
-/// log path.
-#[derive(Debug)]
-pub struct UpstreamErr {
-    pub layer: UpstreamLayer,
-    pub source: io::Error,
+/// Timing and byte-count diagnostics for an [`UpstreamErr`], read only by the
+/// failure WARN. Boxed on `UpstreamErr` because it is cold: the `Result` path
+/// only inspects `layer`/`source`/`os_errno`.
+#[derive(Debug, Default)]
+pub struct UpstreamMetrics {
     /// Wall-clock from `forward_one`'s `Instant::now()` to error emission.
     /// Bounded above by the `budget` passed to `forward_one`.
     pub elapsed_ms: u64,
@@ -172,11 +169,22 @@ pub struct UpstreamErr {
     /// and report `tcp_*` instead.
     pub udp_sent: Option<u64>,
     pub udp_received: Option<u64>,
+}
+
+/// Tagged upstream failure: `{ layer, source, elapsed_ms }` plus optional
+/// diagnostic context captured at the point of failure. `io::Error` is
+/// `!Clone`, so `UpstreamErr` cannot be `Clone` — consumed once on the
+/// log path.
+#[derive(Debug)]
+pub struct UpstreamErr {
+    pub layer: UpstreamLayer,
+    pub source: io::Error,
     /// First `io::Error::raw_os_error()` found walking
     /// `std::error::Error::source()` from `source`. Distinguishes FIN
     /// (graceful close, `None` on Windows since FIN surfaces as `Ok(0)`
     /// with no errno) from RST (`WSAECONNRESET=10054`) and friends.
     pub os_errno: Option<i32>,
+    pub metrics: Box<UpstreamMetrics>,
 }
 
 impl UpstreamErr {
@@ -185,15 +193,8 @@ impl UpstreamErr {
         Self {
             layer,
             source,
-            elapsed_ms: 0,
-            budget_ms: 0,
-            socks5_ms: None,
-            tls_ms: None,
-            tcp_wrote: None,
-            tcp_read: None,
-            udp_sent: None,
-            udp_received: None,
             os_errno,
+            metrics: Box::default(),
         }
     }
 
@@ -346,17 +347,17 @@ impl AttemptProbe {
     /// datagram transport that sent nothing.
     fn apply(&self, e: &mut UpstreamErr) {
         let s = self.state.lock().expect("poisoned");
-        e.socks5_ms = s.socks5_ms;
-        e.tls_ms = s
+        e.metrics.socks5_ms = s.socks5_ms;
+        e.metrics.tls_ms = s
             .tls_ms
             .or_else(|| s.tls_started_at.map(|t| t.elapsed().as_millis() as u64));
         if let Some(c) = s.stream.as_ref() {
-            e.tcp_read = Some(c.read());
-            e.tcp_wrote = Some(c.written());
+            e.metrics.tcp_read = Some(c.read());
+            e.metrics.tcp_wrote = Some(c.written());
         }
         if let Some(c) = s.datagram.as_ref() {
-            e.udp_sent = Some(c.written());
-            e.udp_received = Some(c.read());
+            e.metrics.udp_sent = Some(c.written());
+            e.metrics.udp_received = Some(c.read());
         }
     }
 }
@@ -719,8 +720,8 @@ impl DnsForwarder {
         self.upstream_associates
             .fetch_add(u64::from(probe.datagram_established()), Ordering::Relaxed);
         result.map_err(|mut e| {
-            e.elapsed_ms = started.elapsed().as_millis() as u64;
-            e.budget_ms = budget.as_millis() as u64;
+            e.metrics.elapsed_ms = started.elapsed().as_millis() as u64;
+            e.metrics.budget_ms = budget.as_millis() as u64;
             probe.apply(&mut e);
             e
         })
@@ -778,14 +779,14 @@ impl DnsForwarder {
                     protocol = ?self.config.protocol,
                     layer = %e.layer,
                     cause = %e.cause(),
-                    elapsed_ms = e.elapsed_ms,
-                    budget_ms = e.budget_ms,
-                    socks5_ms = ?e.socks5_ms,
-                    tls_ms = ?e.tls_ms,
-                    tcp_wrote = ?e.tcp_wrote,
-                    tcp_read = ?e.tcp_read,
-                    udp_sent = ?e.udp_sent,
-                    udp_received = ?e.udp_received,
+                    elapsed_ms = e.metrics.elapsed_ms,
+                    budget_ms = e.metrics.budget_ms,
+                    socks5_ms = ?e.metrics.socks5_ms,
+                    tls_ms = ?e.metrics.tls_ms,
+                    tcp_wrote = ?e.metrics.tcp_wrote,
+                    tcp_read = ?e.metrics.tcp_read,
+                    udp_sent = ?e.metrics.udp_sent,
+                    udp_received = ?e.metrics.udp_received,
                     os_errno = ?e.os_errno,
                     caused_by = %format_error_chain(&e.source),
                     "upstream failed"
