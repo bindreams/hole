@@ -238,6 +238,15 @@ impl ChainPlugin for BinaryPlugin {
         // `Nesting::Mark` keeps the root-only group rule: a nested garter (e.g.
         // galoshes inside the bridge's chain) joins this tree instead of creating
         // one Unix pgids could escape from.
+        //
+        // Only ONE marker name is recognised. The ancestor and the descendant
+        // must therefore agree on it, and within hole they always do: galoshes
+        // takes garter by path, so a galoshes binary and the garter inside it are
+        // always the same commit, and hole's release builds galoshes from its own
+        // checkout and resolves plugins to the sidecar beside its executable. The
+        // pairing that can skew is a separately-released `garter-bin` driving a
+        // separately-released `galoshes` — mixed pre-1.0 binaries, which this
+        // project does not support and does not bridge.
         cmd.contain();
         cmd.nesting(cosca::containment::Nesting::Mark);
         let mut child = cmd

@@ -129,6 +129,19 @@ pub fn grace_timeout_action(role: ChildRole, os: Os) -> GraceTimeoutAction {
     }
 }
 
+/// Whether the bridge may be force-killed at all on `os` — the second layer
+/// under [`grace_timeout_action`], which already declines it on POSIX.
+///
+/// Two layers because the consequence is destructive and asymmetric: on POSIX
+/// the bridge is wrapped in `sudo`, so a tree SIGKILL kills the relay and
+/// leaves the root-owned bridge ORPHANED, holding live routes and DNS with
+/// nothing supervising it. A `debug_assert` alone only *reports* a regression
+/// in `grace_timeout_action`; it compiles out of the build that ships, and the
+/// caller would then fall straight through to the kill. This is what refuses.
+pub fn bridge_hard_kill_permitted(os: Os) -> bool {
+    !matches!(os, Os::Posix)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ExitCause {
     /// A supervised child exited with a FAILURE status (Delta 1: non-zero).

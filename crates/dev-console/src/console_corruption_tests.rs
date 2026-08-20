@@ -39,11 +39,10 @@ impl Drop for ConsoleModeGuard {
 /// output format changing must break this test, not silently pass it).
 /// The marker wait is a class-2 bound (third-party child; per-test timeout).
 async fn run_vite_and_measure(stdin: cosca::Stdio) -> u32 {
-    let npm = which::which("npm").expect("npm on PATH");
+    let npm = crate::steps::resolve_npm().expect("npm on PATH");
     let mut cmd = cosca::tokio::Command::new();
-    cmd.executable(&npm);
-    cmd.arg(&npm);
-    cmd.args(["run", "dev"]);
+    cmd.executable(npm.program());
+    cmd.args(npm.argv(&["run", "dev"]));
     // package.json lives at the workspace root; nextest's cwd is the crate
     // dir (the Python original ran from the repo root).
     cmd.current_dir(xtask_lib::repo_root::repo_root().expect("workspace root"));
@@ -68,9 +67,24 @@ async fn run_vite_and_measure(stdin: cosca::Stdio) -> u32 {
             break;
         }
     }
-    // `kill_tree` is signal-only, so the wait is what makes the mode read
-    // below happen after the tree has actually died.
-    child.kill_tree().unwrap();
+    // The process that mutates the console mode is node/esbuild — a DESCENDANT,
+    // which the root's own `wait` says nothing about, and conhost keeps changing
+    // console state while a member is still being torn down. `wait_tree` is the
+    // job object's kernel-owned process-count edge, so it is what orders the
+    // mode read below against every member having FINISHED exiting.
+    //
+    // Cooperative, not `kill_tree`: that closes the job handle, which IS the
+    // drain edge, so a drain check after it answers `Unassessable`. The whole
+    // npm/node tree shares this child's console group, so CTRL_BREAK reaches
+    // all of it. Class-2 bound on a third-party child; a Vite that stops
+    // honouring the signal must fail here rather than be escalated past.
+    child.terminate_tree().unwrap();
+    let drain = child.wait_tree_timeout(crate::supervise::GRACE_TIMEOUT).await.unwrap();
+    assert_eq!(
+        drain,
+        cosca::containment::TreeDrain::AllMembersExited,
+        "the vite tree did not drain within the grace window; the mode read below would be unordered"
+    );
     child.wait().await.unwrap();
     console_input_mode().expect("console mode after")
 }

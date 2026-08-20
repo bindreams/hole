@@ -15,15 +15,15 @@ use crate::banner::{startup_banner, webview_debug_hint, CDP_PORT, VITE_PORT};
 use crate::interrupts::Interrupts;
 use crate::mux::{pump, Entry, StreamMode};
 use crate::policy::{
-    bridge_argv, elevation_action, grace_timeout_action, grant_access_argv, supervision_exit_code, ChildRole,
-    ElevationAction, ExitCause, GraceTimeoutAction, Os, NETWORK_RESET_WARNING,
+    bridge_argv, bridge_hard_kill_permitted, elevation_action, grace_timeout_action, grant_access_argv,
+    supervision_exit_code, ChildRole, ElevationAction, ExitCause, GraceTimeoutAction, Os, NETWORK_RESET_WARNING,
 };
 use crate::ready::{port_in_use, wait_for_port, ReadyListener};
 use crate::steps;
 
 const SOCKET_READY_TIMEOUT: Duration = Duration::from_secs(15);
 const VITE_READY_TIMEOUT: Duration = Duration::from_secs(30);
-const GRACE_TIMEOUT: Duration = Duration::from_secs(10);
+pub(crate) const GRACE_TIMEOUT: Duration = Duration::from_secs(10);
 /// dev.py joined its prefix threads with timeout=5 (dev.py:352-354) for the
 /// same reason: the WarnRecovery bridge keeps its pipes open forever.
 const PRINTER_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
@@ -148,7 +148,7 @@ async fn run(interrupts: &mut Interrupts) -> Result<ExitCode> {
 
     // 2. Tools + preflight steps (interrupt-aware; see steps.rs) ======================================================
     let cargo = steps::resolve_tool("cargo")?;
-    let npm = steps::resolve_tool("npm")?;
+    let npm = steps::resolve_npm()?;
     steps::ensure_node_modules(&npm, interrupts).await?;
     // No workspace build here: dev-console supervises only (#564). The xtask
     // cascade built everything; a standalone run reuses the existing build,
@@ -243,7 +243,7 @@ async fn run(interrupts: &mut Interrupts) -> Result<ExitCode> {
 /// (dev.py's `finally`), then the printer is drained (bounded).
 async fn supervise_children(
     interrupts: &mut Interrupts,
-    npm: &Path,
+    npm: &steps::NpmLaunch,
     bridge_bin: &Path,
     gui_bin: &Path,
     socket_path: &Path,
@@ -323,7 +323,7 @@ async fn supervise_children(
 #[allow(clippy::too_many_arguments)] // private seam; the funnel needs the slots
 async fn startup_and_supervise(
     interrupts: &mut Interrupts,
-    npm: &Path,
+    npm: &steps::NpmLaunch,
     bridge_bin: &Path,
     gui_bin: &Path,
     socket_path: &Path,
@@ -394,9 +394,8 @@ async fn startup_and_supervise(
     // Vite (after the bridge). FORCE_COLOR=1 restores the colors a piped
     // child disables (Delta 3).
     let mut cmd = Command::new();
-    cmd.executable(npm);
-    cmd.arg(npm);
-    cmd.args(["run", "dev"]);
+    cmd.executable(npm.program());
+    cmd.args(npm.argv(&["run", "dev"]));
     cmd.env("FORCE_COLOR", "1");
     cmd.stdin(Stdio::null())?;
     cmd.stdout(Stdio::pipe())?;
@@ -509,17 +508,24 @@ async fn shutdown(bridge: Option<&mut Child>, vite: Option<&mut Child>, gui: Opt
             if tokio::time::timeout(GRACE_TIMEOUT, bridge.wait()).await.is_err() {
                 match grace_timeout_action(ChildRole::Bridge, Os::host()) {
                     GraceTimeoutAction::WarnRecovery => enote!("{NETWORK_RESET_WARNING}"),
-                    GraceTimeoutAction::HardKill => {
-                        debug_assert_ne!(
-                            Os::host(),
-                            Os::Posix,
-                            "policy regression: grace_timeout_action routed the POSIX bridge to a hard kill; \
-                             killing through the sudo relay kills sudo and orphans the root bridge"
-                        );
+                    GraceTimeoutAction::HardKill if bridge_hard_kill_permitted(Os::host()) => {
                         if let Err(e) = bridge.kill_tree() {
                             enote!("{YELLOW}bridge tree kill: {e}{RESET}");
                         }
                         let _ = bridge.wait().await;
+                    }
+                    // Unreachable while the policy is correct — which is the
+                    // point. The assert reports a regression in debug; this arm
+                    // is what still refuses it in release, where the assert is
+                    // gone. Falling through would SIGKILL the sudo relay and
+                    // orphan the root-owned bridge.
+                    GraceTimeoutAction::HardKill => {
+                        debug_assert!(
+                            bridge_hard_kill_permitted(Os::host()),
+                            "policy regression: grace_timeout_action routed the POSIX bridge to a hard kill; \
+                             killing through the sudo relay kills sudo and orphans the root bridge"
+                        );
+                        enote!("{NETWORK_RESET_WARNING}");
                     }
                 }
             }
