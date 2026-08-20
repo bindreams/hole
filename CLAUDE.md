@@ -120,4 +120,4 @@ before editing; the sections linked below are the authoritative source.
   [testing](CONTRIBUTING.md#testing) ·
   [releases](CONTRIBUTING.md#releases))
 - Release ops (rollback, minisign key rotation) →
-  [docs/RELEASE-OPS.md](docs/RELEASE-OPS.md)
+  [RELEASE-OPS.md](RELEASE-OPS.md)

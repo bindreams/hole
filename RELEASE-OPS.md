@@ -1,6 +1,6 @@
 # Release operations runbook
 
-Per-product release procedure: see [CONTRIBUTING.md § Releases](../CONTRIBUTING.md#releases). This file is the runbook for the off-happy-path operations — rollback, minisign key rotation, and the crates.io dry-run staleness gap.
+Per-product release procedure: see [CONTRIBUTING.md § Releases](CONTRIBUTING.md#releases). This file is the runbook for the off-happy-path operations — rollback, minisign key rotation, and the crates.io dry-run staleness gap.
 
 ## Rollback procedure
 
@@ -42,7 +42,7 @@ What yank does and doesn't do:
 
 ### `hole` track only — auto-updater consideration
 
-`hole` releases are auto-pulled by the upgrade flow (`hole upgrade`, periodic check via `start_update_checker`). The auto-updater is **forward-only**: [`candidate_tags`](../crates/hole/src/update/check.rs) keeps only tags with `ver > current` (strict greater-than for non-snapshot installs).
+`hole` releases are auto-pulled by the upgrade flow (`hole upgrade`, periodic check via `start_update_checker`). The auto-updater is **forward-only**: [`candidate_tags`](crates/hole/src/update/check.rs) keeps only tags with `ver > current` (strict greater-than for non-snapshot installs).
 
 What this means for rollback:
 
@@ -55,10 +55,10 @@ What this means for rollback:
 
 Hole's release `SHA256SUMS` is signed with a long-lived minisign key. **Two embedded copies of the public key must stay in sync**:
 
-- Server-side (release verification): embedded in the `Verify signature` step of [`.github/workflows/publish-release-hole.yaml`](../.github/workflows/publish-release-hole.yaml) as the `-P '...'` argument to `minisign -Vm`.
-- Client-side (auto-update verification): `MINISIGN_PUBLIC_KEY` constant in [`crates/hole/src/update/verify.rs`](../crates/hole/src/update/verify.rs).
+- Server-side (release verification): embedded in the `Verify signature` step of [`.github/workflows/publish-release-hole.yaml`](.github/workflows/publish-release-hole.yaml) as the `-P '...'` argument to `minisign -Vm`.
+- Client-side (auto-update verification): `MINISIGN_PUBLIC_KEY` constant in [`crates/hole/src/update/verify.rs`](crates/hole/src/update/verify.rs).
 
-The private key lives on the maintainer's machine at minisign's default location (`~/.minisign/minisign.key`). [`scripts/sign-release.py`](../scripts/sign-release.py) calls `minisign -Sm` without `-s`, so the default path is what gets used unless `--secret-key` is passed.
+The private key lives on the maintainer's machine at minisign's default location (`~/.minisign/minisign.key`). [`scripts/sign-release.py`](scripts/sign-release.py) calls `minisign -Sm` without `-s`, so the default path is what gets used unless `--secret-key` is passed.
 
 Rotation steps (key compromise, lost key, scheduled rotation):
 
@@ -108,4 +108,4 @@ CLAUDE.md notes galoshes is "shipped alongside hole.exe AND released standalone.
 
 ### ex-ray rollback
 
-The `ex-ray` track uses plain `X.Y.Z` semver (first-party; no upstream-lineage tracking). Its version lives in [`crates/ex-ray/version.toml`](../crates/ex-ray/version.toml) and is validated by [`xtask-lib/src/ex_ray_version.rs`](../xtask-lib/src/ex_ray_version.rs). Rollback follows the standard non-crates.io track procedure (delete the tag + release; re-cut against a patched commit). Because galoshes embeds ex-ray and hole bundles galoshes, a defective ex-ray that has already shipped inside a hole release also requires the bundled-galoshes rollback above (re-cut hole with a fixed galoshes that embeds the fixed ex-ray).
+The `ex-ray` track uses plain `X.Y.Z` semver (first-party; no upstream-lineage tracking). Its version lives in [`crates/ex-ray/version.toml`](crates/ex-ray/version.toml) and is validated by [`xtask-lib/src/ex_ray_version.rs`](xtask-lib/src/ex_ray_version.rs). Rollback follows the standard non-crates.io track procedure (delete the tag + release; re-cut against a patched commit). Because galoshes embeds ex-ray and hole bundles galoshes, a defective ex-ray that has already shipped inside a hole release also requires the bundled-galoshes rollback above (re-cut hole with a fixed galoshes that embeds the fixed ex-ray).
