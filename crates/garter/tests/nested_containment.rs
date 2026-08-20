@@ -22,6 +22,7 @@ async fn nested_contained_child_is_delegated_and_dies_to_the_cooperative_signal(
     // environment and the spawn it makes in turn is the nested one under test.
     let mut cmd = Command::new();
     cmd.executable(mock_plugin_path())
+        .arg(mock_plugin_path())
         .env("MOCK_PLUGIN_NEST_PROBE", control_addr.to_string())
         .kill_on_drop(true)
         .contain()

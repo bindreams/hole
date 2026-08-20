@@ -209,6 +209,9 @@ impl ChainPlugin for BinaryPlugin {
         let env = self.sip003_env(local, remote)?;
         let mut cmd = Command::new();
         cmd.executable(&self.path);
+        // argv[0]: `executable()` only OVERRIDES which file is loaded; the argv is
+        // still what names the program, and a command with none is refused.
+        cmd.arg(&self.path);
         cmd.env("SS_LOCAL_HOST", env.ss_local_host);
         cmd.env("SS_LOCAL_PORT", env.ss_local_port.to_string());
         cmd.env("SS_REMOTE_HOST", env.ss_remote_host);

@@ -39,6 +39,7 @@ async fn spawn_sleeper(ignore_signals: bool) -> Sleeper {
 
     let mut cmd = Command::new();
     cmd.executable(mock_plugin_path())
+        .arg(mock_plugin_path())
         .env("MOCK_PLUGIN_SLEEP", "1")
         .env("MOCK_PLUGIN_GRANDCHILD_CALLBACK", control_addr.to_string())
         .kill_on_drop(true)

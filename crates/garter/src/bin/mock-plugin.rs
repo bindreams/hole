@@ -72,6 +72,7 @@ async fn run_nest_probe(control_addr: std::ffi::OsString) -> Result<(), Box<dyn 
 
     let mut cmd = cosca::tokio::Command::new();
     cmd.executable(std::env::current_exe()?)
+        .arg(std::env::current_exe()?)
         .env("MOCK_PLUGIN_NEST_GRANDCHILD", &control_addr)
         .env_remove("MOCK_PLUGIN_NEST_PROBE")
         .kill_on_drop(true)
@@ -145,6 +146,7 @@ async fn run_hygiene_probe(control_addr: std::ffi::OsString) -> Result<(), Box<d
 
     let mut cmd = cosca::tokio::Command::new();
     cmd.executable(std::env::current_exe()?)
+        .arg(std::env::current_exe()?)
         .env("MOCK_PLUGIN_HYGIENE_SENTINEL", &sentinel)
         .env("MOCK_PLUGIN_HYGIENE_PROBE", &control_addr)
         .env_remove("MOCK_PLUGIN_HYGIENE_NEST")

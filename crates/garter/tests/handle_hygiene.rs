@@ -50,6 +50,7 @@ async fn start_leg(nest: &str) -> (Child, Lines<BufReader<TcpStream>>, ChildStdo
 
     let mut cmd = Command::new();
     cmd.executable(mock_plugin_path())
+        .arg(mock_plugin_path())
         .env("MOCK_PLUGIN_HYGIENE_PROBE", control_addr.to_string())
         .env("MOCK_PLUGIN_HYGIENE_NEST", nest)
         .kill_on_drop(true)
