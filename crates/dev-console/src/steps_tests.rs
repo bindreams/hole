@@ -1,5 +1,8 @@
 use crate::steps::{resolve_tool, stage_dir_path, StageDirGuard};
 
+use tokio::io::AsyncReadExt as _;
+use tokio::net::TcpListener;
+
 #[skuld::test]
 fn stage_dir_is_per_pid_under_temp() {
     let p = stage_dir_path(1234);
@@ -75,7 +78,7 @@ fn npm_launch_leaves_a_real_image_alone() {
     let launch = crate::steps::npm_launch_for(npm.clone()).unwrap();
     assert_eq!(launch.program(), npm);
     assert_eq!(
-        launch.argv(&["run", "dev"]),
+        launch.full_argv(&["run", "dev"]),
         [npm.as_os_str(), "run".as_ref(), "dev".as_ref()]
     );
 }
@@ -89,7 +92,7 @@ fn npm_launch_routes_a_batch_wrapper_through_node() {
     let launch = crate::steps::npm_launch_for(npm_cmd).unwrap();
     assert_eq!(launch.program(), dir.path().join("node.exe"));
     assert_eq!(
-        launch.argv(&["run", "dev"]),
+        launch.full_argv(&["run", "dev"]),
         [
             dir.path().join("node.exe").as_os_str(),
             dir.path()
@@ -140,7 +143,7 @@ async fn resolved_npm_launch_spawns_where_the_batch_wrapper_is_refused() {
     // Leg 2 — the resolution. `node` here is a copy of this test binary, so it
     // reports the argv it actually received.
     let launch = crate::steps::npm_launch_for(npm_cmd).unwrap();
-    let argv = launch.argv(&["run", "dev"]);
+    let argv = launch.full_argv(&["run", "dev"]);
     let mut cmd = cosca::tokio::Command::new();
     cmd.executable(launch.program());
     cmd.args(&argv);
@@ -161,4 +164,106 @@ async fn resolved_npm_launch_spawns_where_the_batch_wrapper_is_refused() {
     child.wait().await.unwrap();
     assert_eq!(received, argv);
     drop(dir);
+}
+
+/// A batch wrapper with NO sibling node — a layout that puts the wrapper and
+/// the Node runtime in different directories — falls back to `node` on PATH.
+/// Every other test writes a sibling, so without this the fallback branch is
+/// dead code to the suite. The PATH lookup is injected rather than performed,
+/// so the test says what PATH answers instead of mutating it.
+#[cfg(windows)]
+#[skuld::test]
+fn npm_launch_falls_back_to_node_on_path_without_a_sibling() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let npm_cmd = root.join("npm.cmd");
+    std::fs::write(&npm_cmd, b"@ECHO OFF\r\n").unwrap();
+    let bin = root.join("node_modules").join("npm").join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::write(bin.join("npm-cli.js"), b"// npm\n").unwrap();
+    // Deliberately no node.exe beside the wrapper.
+    assert!(!root.join("node.exe").exists());
+
+    let on_path = std::path::PathBuf::from(r"C:\elsewhere\node.exe");
+    let stub = on_path.clone();
+    let launch = crate::steps::npm_launch_with(npm_cmd, move || Ok(stub)).unwrap();
+
+    assert_eq!(launch.program(), on_path);
+    assert_eq!(
+        launch.full_argv(&["install"]),
+        [
+            on_path.as_os_str(),
+            bin.join("npm-cli.js").as_os_str(),
+            "install".as_ref()
+        ]
+    );
+}
+
+/// The fallback surfaces a missing `node` rather than swallowing it: without a
+/// sibling AND without one on PATH there is nothing to run.
+#[cfg(windows)]
+#[skuld::test]
+fn npm_launch_reports_a_missing_node_on_path() {
+    let (dir, npm_cmd) = fake_node_install();
+    std::fs::remove_file(dir.path().join("node.exe")).unwrap();
+    let err = crate::steps::npm_launch_with(npm_cmd, || anyhow::bail!("node not found on PATH"))
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("node not found on PATH"),
+        "must surface the lookup error: {err}"
+    );
+}
+
+/// The preflight children (`npm install`, `cargo xtask stage`) are the ones the
+/// containment migration originally skipped. npm shells out for native-module
+/// builds and `cargo xtask stage` runs a nested cargo and rustc, so a lone kill
+/// on the interrupt path orphans all of them — hole#197 in the one place it was
+/// left. The module doc used to justify that by the terminal broadcasting
+/// Ctrl+C to the child's group, which covers neither descendants nor a
+/// programmatic SIGTERM.
+///
+/// Two assertions: the mechanism exists (deterministic, and the one an
+/// uncontained spawn loses), and the tree teardown really reaches a grandchild.
+#[skuld::test]
+async fn preflight_children_are_contained_and_reap_their_descendants() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut cmd = cosca::tokio::Command::new();
+    cmd.executable(std::env::current_exe().unwrap());
+    cmd.arg(std::env::current_exe().unwrap());
+    cmd.env(crate::test_child::MODE_ENV, "spawn-grandchild");
+    cmd.env(
+        crate::test_child::CONTROL_ENV,
+        listener.local_addr().unwrap().to_string(),
+    );
+    cmd.stdin(cosca::Stdio::null()).unwrap();
+    let mut child = crate::steps::contain_preflight(&mut cmd).spawn().unwrap();
+
+    assert_ne!(
+        child.containment(),
+        cosca::containment::Containment::None,
+        "a preflight child must be the root of a real tree, or its descendants outlive the interrupt"
+    );
+
+    let (mut conn, _) = listener.accept().await.unwrap();
+    let mut byte = [0u8; 1];
+    conn.read_exact(&mut byte).await.unwrap(); // grandchild readiness
+
+    // The interrupt arm's teardown, verbatim.
+    child.kill_tree().unwrap();
+    child.wait().await.unwrap();
+
+    // Only the grandchild's own process can hold this connection.
+    let mut buf = [0u8; 1];
+    match conn.read(&mut buf).await {
+        Ok(0) => {}
+        Ok(n) => panic!("grandchild sent {n} unexpected byte(s); the tree teardown missed it"),
+        Err(e) => assert!(
+            matches!(
+                e.kind(),
+                std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted
+            ),
+            "the tree teardown must reach the grandchild; got: {e:?}"
+        ),
+    }
 }

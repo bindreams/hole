@@ -42,7 +42,7 @@ async fn run_vite_and_measure(stdin: cosca::Stdio) -> u32 {
     let npm = crate::steps::resolve_npm().expect("npm on PATH");
     let mut cmd = cosca::tokio::Command::new();
     cmd.executable(npm.program());
-    cmd.args(npm.argv(&["run", "dev"]));
+    cmd.args(npm.full_argv(&["run", "dev"]));
     // package.json lives at the workspace root; nextest's cwd is the crate
     // dir (the Python original ran from the repo root).
     cmd.current_dir(xtask_lib::repo_root::repo_root().expect("workspace root"));

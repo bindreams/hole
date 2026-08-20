@@ -97,9 +97,7 @@ async fn nested_contained_child_is_delegated_and_dies_to_the_cooperative_signal(
 /// `Nesting::Opaque`: the root contains itself but does NOT mark its
 /// descendants, so the spawn made inside the child is a ROOT of its own tree,
 /// not a delegated member of this one. dev-console spawns the bridge this way
-/// precisely so the bridge's own garter keeps containing its plugin chains —
-/// the deleted kill-group suite pinned it as `opaque_root_does_not_mark_descendants`,
-/// and nothing else here exercises `Opaque` at all.
+/// precisely so the bridge's own garter keeps containing its plugin chains.
 #[skuld::test]
 async fn opaque_root_child_creates_its_own_containment() {
     let control = TcpListener::bind("127.0.0.1:0").await.unwrap();

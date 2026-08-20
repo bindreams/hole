@@ -74,7 +74,7 @@ async fn exited_children_are_not_signalled() {
     let mut child = cmd.spawn().unwrap();
     let (_conn, _) = listener.accept().await.unwrap();
     assert!(!has_exited(&mut child), "live child has not exited");
-    // Signal-only since the cosca migration: the wait is what reaps.
+    // Signal-only: the wait is what reaps.
     child.kill_tree().unwrap();
     child.wait().await.unwrap();
     assert!(has_exited(&mut child), "kill_tree + wait ends the direct child");

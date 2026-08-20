@@ -1,10 +1,13 @@
 //! Preflight steps: tool resolution, npm install, per-pid staging. Children
-//! here run with INHERITED stdio (the user watches
-//! cargo/npm output directly) and are not process-grouped — terminal Ctrl+C
-//! reaches the step child via the console group AND resolves our interrupt
-//! watcher: we reap the child and unwind with `Interrupted`, so guards Drop
-//! (dev.py's atexit-on-KeyboardInterrupt equivalent, Delta 2 extends it to
-//! SIGTERM).
+//! here run with INHERITED stdio (the user watches cargo/npm output directly)
+//! and are contained, so an interrupt tears down the whole tree rather than the
+//! one process we hold: `run_step`'s watcher reaps and unwinds with
+//! `Interrupted`, so guards Drop (dev.py's atexit-on-KeyboardInterrupt
+//! equivalent, Delta 2 extends it to SIGTERM).
+//!
+//! Containment makes that watcher the SINGLE teardown path for both interrupt
+//! kinds. Relying on the terminal to broadcast Ctrl+C to the child's group
+//! instead would cover neither descendants nor a programmatic SIGTERM.
 
 use std::path::{Path, PathBuf};
 
@@ -80,10 +83,12 @@ impl NpmLaunch {
         &self.program
     }
 
-    /// The full argv for `npm <args>`: `argv[0]`, the entry script if any, then
-    /// `args`. cosca's argv includes `argv[0]`; `executable()` only overrides
-    /// which file loads.
-    pub fn argv<S: AsRef<std::ffi::OsStr>>(&self, args: &[S]) -> Vec<std::ffi::OsString> {
+    /// The **whole** argv for `npm <args>`: `argv[0]`, the entry script if any,
+    /// then `args` — the form `cosca::tokio::Command::args` takes, because
+    /// cosca's argv IS the argv and `executable()` only overrides which file
+    /// loads. Named for that: a `std::process::Command`, which supplies
+    /// `argv[0]` from the program itself, must not be handed this whole.
+    pub fn full_argv<S: AsRef<std::ffi::OsStr>>(&self, args: &[S]) -> Vec<std::ffi::OsString> {
         let mut argv = Vec::with_capacity(1 + self.leading.len() + args.len());
         argv.push(self.program.clone().into_os_string());
         argv.extend(self.leading.iter().map(|p| p.clone().into_os_string()));
@@ -100,6 +105,13 @@ pub fn resolve_npm() -> Result<NpmLaunch> {
 /// Split out for tests, which build a synthetic Node layout rather than
 /// depending on the host having npm installed.
 pub(crate) fn npm_launch_for(npm: PathBuf) -> Result<NpmLaunch> {
+    npm_launch_with(npm, || resolve_tool("node"))
+}
+
+/// `node_on_path` is a seam: the sibling-`node` branch is what every real
+/// layout takes, so the PATH fallback is only reachable in a test that can say
+/// what PATH would answer.
+pub(crate) fn npm_launch_with(npm: PathBuf, node_on_path: impl FnOnce() -> Result<PathBuf>) -> Result<NpmLaunch> {
     if !is_batch(&npm) {
         return Ok(NpmLaunch {
             program: npm,
@@ -112,7 +124,9 @@ pub(crate) fn npm_launch_for(npm: PathBuf) -> Result<NpmLaunch> {
     let cli = dir.join("node_modules").join("npm").join("bin").join("npm-cli.js");
     if !cli.is_file() {
         anyhow::bail!(
-            "{YELLOW}npm resolved to the batch wrapper {} and its Node entry script is not at {}.              A batch file cannot be spawned safely (CVE-2024-24576). Install Node so that npm              ships beside it (the official installer, fnm and nvm all do).{RESET}",
+            "{YELLOW}npm resolved to the batch wrapper {} and its Node entry script is not at {}. \
+             A batch file cannot be spawned safely (CVE-2024-24576). Install Node so that npm \
+             ships beside it (the official installer, fnm and nvm all do).{RESET}",
             npm.display(),
             cli.display()
         );
@@ -120,11 +134,7 @@ pub(crate) fn npm_launch_for(npm: PathBuf) -> Result<NpmLaunch> {
     // Sibling node first, exactly as npm.cmd does: under fnm/nvm it is the
     // Node build this npm belongs to, which a PATH lookup need not find.
     let sibling = dir.join(if cfg!(windows) { "node.exe" } else { "node" });
-    let node = if sibling.is_file() {
-        sibling
-    } else {
-        resolve_tool("node")?
-    };
+    let node = if sibling.is_file() { sibling } else { node_on_path()? };
     Ok(NpmLaunch {
         program: node,
         leading: vec![cli],
@@ -141,19 +151,49 @@ fn is_batch(p: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// The containment discipline every preflight child gets, named so it can be
+/// pinned: without it, `kill_tree` has no mechanism to act through and neither
+/// the interrupt path nor the `Drop` backstop can reach a descendant.
+pub(crate) fn contain_preflight(cmd: &mut cosca::tokio::Command) -> &mut cosca::tokio::Command {
+    cmd.kill_on_drop(true)
+        .contain()
+        .nesting(cosca::containment::Nesting::Mark)
+}
+
+/// Spawn a preflight child as the root of a contained tree and run it to
+/// completion, tearing the whole tree down on an interrupt.
+///
+/// Containment is what makes the teardown reach descendants — npm shells out to
+/// native-module builds and `cargo xtask stage` runs a nested cargo and rustc,
+/// and a lone kill leaves all of them orphaned (bindreams/hole#197). It also
+/// takes the child out of our console/process group, so the terminal's own
+/// Ctrl+C no longer reaches it: this watcher is now the single teardown path,
+/// which is the point. A programmatic SIGTERM never reached the child that way
+/// in the first place.
+///
+/// Stdio is left unconfigured, which cosca inherits for slots 0/1/2 exactly as
+/// std does — the user watches cargo/npm progress directly.
 async fn run_step(
-    mut cmd: tokio::process::Command,
+    cmd: &mut cosca::tokio::Command,
     what: &'static str,
     message_on_failure: bool,
     interrupts: &mut Interrupts,
 ) -> Result<()> {
-    let mut child = cmd.spawn().with_context(|| format!("spawning {what}"))?;
+    let mut child = contain_preflight(cmd)
+        .spawn()
+        .with_context(|| format!("spawning {what}"))?;
     // biased: if the interrupt and the (interrupt-induced) child exit race,
     // report Interrupted — the exit code of a SIGINT-killed cargo is noise.
     tokio::select! {
         biased;
         _ = interrupts.recv() => {
-            let _ = child.kill().await;
+            // Signal-only, so the wait below is what reaps; a refusal is
+            // reported rather than dropped, because it means the tree is still
+            // running and this process could not bring it down.
+            if let Err(e) = child.kill_tree() {
+                enote!("{YELLOW}{what}: tree kill did not reach every member: {e}{RESET}");
+            }
+            let _ = child.wait().await;
             Err(Interrupted.into())
         }
         status = child.wait() => {
@@ -174,10 +214,10 @@ async fn run_step(
 /// resolve the import; ~1s on a healthy tree (dev.py §5.12).
 pub async fn ensure_node_modules(npm: &NpmLaunch, interrupts: &mut Interrupts) -> Result<()> {
     note!("{BOLD}Syncing npm dependencies...{RESET}");
-    let mut cmd = tokio::process::Command::new(npm.program());
-    // std sets argv[0] from the program itself, so pass the rest.
-    cmd.args(&npm.argv(&["install", "--no-audit", "--no-fund"])[1..]);
-    run_step(cmd, "npm install", false, interrupts).await
+    let mut cmd = cosca::tokio::Command::new();
+    cmd.executable(npm.program());
+    cmd.args(npm.full_argv(&["install", "--no-audit", "--no-fund"]));
+    run_step(&mut cmd, "npm install", false, interrupts).await
 }
 
 /// `$TMPDIR/hole-dev-<pid>` — per-pid so concurrent runs don't collide and
@@ -215,10 +255,12 @@ impl Drop for StageDirGuard {
 /// contents/naming are owned by xtask (`xtask/src/bindir.rs`, #143). The
 /// only preflight step with a failure message (dev.py:467).
 pub async fn stage_bindir(cargo: &Path, out_dir: &Path, interrupts: &mut Interrupts) -> Result<()> {
-    let mut cmd = tokio::process::Command::new(cargo);
+    let mut cmd = cosca::tokio::Command::new();
+    cmd.executable(cargo);
+    cmd.arg(cargo);
     cmd.args(["xtask", "stage", "--profile", "debug", "--out-dir"]);
     cmd.arg(out_dir);
-    run_step(cmd, "cargo xtask stage", true, interrupts).await
+    run_step(&mut cmd, "cargo xtask stage", true, interrupts).await
 }
 
 #[cfg(test)]

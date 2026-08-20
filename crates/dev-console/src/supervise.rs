@@ -29,17 +29,17 @@ pub(crate) const GRACE_TIMEOUT: Duration = Duration::from_secs(10);
 const PRINTER_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// dev.py:306-307 parity (`terminate_tree`: `if proc.poll() is not None:
-/// return`). Two distinct hazards ride on this one guard, so it must not be
-/// deleted as redundant with anything cosca does internally:
+/// return`). The guard must not be deleted as redundant with anything cosca
+/// does internally: `terminate_tree`'s `killpg` takes an **unpinned pgid**
+/// (bindreams/cosca#54), so signalling an exited child's group can land on an
+/// unrelated one. The lone `terminate()` is identity-bound and needs no such
+/// guard — which is exactly what makes this one look droppable.
 ///
-/// 1. **pgid reuse.** `terminate_tree`'s `killpg` takes an unpinned pgid
-///    (bindreams/cosca#54), so signalling an exited child's group can land on
-///    an unrelated one. The lone `terminate()` is identity-bound and needs no
-///    such guard — which is exactly what makes this one look droppable.
-/// 2. **The Windows post-exit refusal.** Once an exit is *reported*, cosca's
-///    async backend releases the process handle, and both graceful ops then
-///    answer `Unassessable` rather than fire at a possibly-reissued pid.
-///    Skipping the signal is what keeps a no-op teardown a success.
+/// cosca also refuses a graceful op on Windows once an exit has been *reported*,
+/// because its async backend can release the process handle and stop pinning
+/// the pid. That is **not** live here: every spawn in this crate sets
+/// `executable()` and so takes the raw backend, which owns its handle for the
+/// child's whole life. An argv-only spawn added later would re-open it.
 pub(crate) fn has_exited(child: &mut Child) -> bool {
     matches!(child.try_wait(), Ok(Some(_)))
 }
@@ -70,9 +70,9 @@ pub async fn main() -> ExitCode {
         Ok(code) => code,
         Err(e) => {
             if e.downcast_ref::<steps::Interrupted>().is_some() {
-                // Interrupt during preflight: children got the console
-                // signal, guards Drop on return. Same exit code as a
-                // steady-state interrupt.
+                // Interrupt during preflight: `run_step` already tore the
+                // child's tree down, guards Drop on return. Same exit code as
+                // a steady-state interrupt.
                 return ExitCode::from(supervision_exit_code(ExitCause::Interrupted));
             }
             if let Some(step) = e.downcast_ref::<steps::StepFailed>() {
@@ -395,7 +395,7 @@ async fn startup_and_supervise(
     // child disables (Delta 3).
     let mut cmd = Command::new();
     cmd.executable(npm.program());
-    cmd.args(npm.argv(&["run", "dev"]));
+    cmd.args(npm.full_argv(&["run", "dev"]));
     cmd.env("FORCE_COLOR", "1");
     cmd.stdin(Stdio::null())?;
     cmd.stdout(Stdio::pipe())?;
@@ -550,7 +550,12 @@ pub(crate) async fn teardown_grouped(child: &mut Child, role: ChildRole) {
     // on SIGTERM without forwarding it — a lone signal would satisfy the grace
     // wait while node and esbuild survived to be SIGKILLed by the Drop
     // backstop, silently downgrading a graceful teardown to a hard kill.
-    let _ = child.terminate_tree();
+    if let Err(e) = child.terminate_tree() {
+        // Every error from this call means NO signal went out and the tree is
+        // still running, so the grace wait below is about to look like a stall
+        // with no cause. Say which it was.
+        enote!("{YELLOW}{role:?} did not receive the cooperative signal: {e}{RESET}");
+    }
     // Class-2 bound: out-of-process exit that may never come (10s).
     if tokio::time::timeout(GRACE_TIMEOUT, child.wait()).await.is_err() {
         debug_assert_eq!(grace_timeout_action(role, Os::host()), GraceTimeoutAction::HardKill);
