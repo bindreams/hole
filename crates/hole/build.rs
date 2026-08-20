@@ -252,7 +252,7 @@ fn parse_svg(svg_path: &Path) -> resvg::usvg::Tree {
 
 /// Convert premultiplied RGBA to straight RGBA.
 fn unpremultiply_rgba(rgba: &mut [u8]) {
-    for pixel in rgba.chunks_exact_mut(4) {
+    for pixel in rgba.as_chunks_mut::<4>().0 {
         let a = pixel[3] as u32;
         if a == 0 {
             pixel[0] = 0;
@@ -272,7 +272,7 @@ fn unpremultiply_rgba(rgba: &mut [u8]) {
 /// Convert straight RGBA to a macOS template image: alpha = BT.601 luminance × original alpha.
 fn luminance_to_alpha(rgba: &[u8]) -> Vec<u8> {
     let mut out = vec![0u8; rgba.len()];
-    for (dst, src) in out.chunks_exact_mut(4).zip(rgba.chunks_exact(4)) {
+    for (dst, src) in out.as_chunks_mut::<4>().0.iter_mut().zip(rgba.as_chunks::<4>().0) {
         let r = src[0] as u32;
         let g = src[1] as u32;
         let b = src[2] as u32;
