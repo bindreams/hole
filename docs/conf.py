@@ -1,31 +1,17 @@
 """https://www.sphinx-doc.org/en/master/usage/configuration.html"""
-import tomllib
+import sys
 from datetime import date
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).parent.parent
 
-
-def manifest_version(manifest: Path, *tables: str) -> str:
-    """Read a release-group version. Raises rather than rendering a blank version."""
-    with manifest.open("rb") as f:
-        data = tomllib.load(f)
-    for table in tables:
-        data = data[table]
-
-    version = data["version"]
-    if not isinstance(version, str):
-        raise TypeError(f"{manifest}: version is {type(version).__name__}, not str -- it needs quoting")
-    return version
-
-
-def cargo_version(crate: str) -> str:
-    return manifest_version(REPO_ROOT / "crates" / crate / "Cargo.toml", "package")
-
+sys.path.insert(0, str(Path(__file__).parent))
+from _versions import manifest_versions  # noqa: E402
 
 project = "Hole"
 author = "Anna Zhukova"
-release = cargo_version("hole")
+versions = manifest_versions(REPO_ROOT)
+release = versions["hole_version"]
 
 year = date.today().year
 copyright = f"2026, {author}" if year == 2026 else f"2026-{year}, {author}"
@@ -40,13 +26,7 @@ extensions = [
 # docs use backtick-fenced directives exclusively.
 myst_enable_extensions = ["substitution"]
 myst_heading_anchors = 3
-myst_substitutions = {
-    "hole_version": release,
-    "galoshes_version": cargo_version("galoshes"),
-    "garter_version": cargo_version("garter"),
-    # ex-ray is a Go crate with no Cargo manifest; its version sits at the top level.
-    "exray_version": manifest_version(REPO_ROOT / "crates" / "ex-ray" / "version.toml"),
-}
+myst_substitutions = versions
 
 exclude_patterns = ["_build"]
 

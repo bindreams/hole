@@ -208,7 +208,6 @@ hooks = [
 # Two mdformat envs: gfm escapes MyST footnote definitions (`[^1]:` -> `\[^1\]:`),
 # so the docs tree gets the myst plugin instead. Both are no-ops on today's
 # placeholder pages -- this is insurance for the content the docs grow.
-# The myst plugin escapes colon fences, hence backtick-fenced directives only.
 [[repos]]
 repo = "https://github.com/hukkin/mdformat"
 rev = "1.0.0"
