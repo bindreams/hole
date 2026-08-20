@@ -1,17 +1,16 @@
 use std::borrow::Cow;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::sync::Arc;
 
+use cosca::tokio::Command;
+use cosca::Stdio;
 use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::process::Command;
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
 use crate::chain::Mode;
 use crate::plugin::ChainPlugin;
-use crate::shutdown;
 use crate::sitrep::{PluginReady, StartError};
 
 /// How a [`BinaryPlugin`] learns it is ready.
@@ -208,7 +207,8 @@ impl ChainPlugin for BinaryPlugin {
         ready: oneshot::Sender<Result<PluginReady, StartError>>,
     ) -> crate::Result<()> {
         let env = self.sip003_env(local, remote)?;
-        let mut cmd = Command::new(&self.path);
+        let mut cmd = Command::new();
+        cmd.executable(&self.path);
         cmd.env("SS_LOCAL_HOST", env.ss_local_host);
         cmd.env("SS_LOCAL_PORT", env.ss_local_port.to_string());
         cmd.env("SS_REMOTE_HOST", env.ss_remote_host);
@@ -222,23 +222,27 @@ impl ChainPlugin for BinaryPlugin {
         for (k, v) in &self.extra_env {
             cmd.env(k, v);
         }
-        cmd.stdout(Stdio::piped());
-        cmd.stderr(Stdio::piped());
+        cmd.stdout(Stdio::pipe())?;
+        cmd.stderr(Stdio::pipe())?;
         cmd.kill_on_drop(true);
 
-        // Spawn as the root of a process-tree kill-group (Windows job object /
-        // Unix process group) with stdio handle hygiene, so a force-kill reaps the
-        // plugin's whole descendant tree and an orphaned grandchild can never hold
-        // the host's pipe handles (bindreams/hole#197). CREATE_NEW_PROCESS_GROUP
-        // (for graceful_stop's CTRL_BREAK) is set inside `GroupedChild::spawn`.
-        // Nesting::Mark keeps the root-only group rule: a nested garter (e.g.
-        // galoshes inside the bridge's chain) joins this group instead of
-        // creating one Unix pgids could escape from.
-        let mut gc = kill_group::GroupedChild::spawn(&mut cmd, kill_group::Nesting::Mark)
+        // Spawn as the root of a contained process tree (Windows job object /
+        // Linux cgroup / Unix process group), with stdio handle hygiene, so a
+        // force-kill reaps the plugin's whole descendant tree and an orphaned
+        // grandchild can never hold the host's pipe handles (bindreams/hole#197).
+        // Containment is also what gives the child its own console process group
+        // on Windows, which is what `graceful_shutdown`'s CTRL_BREAK addresses.
+        // `Nesting::Mark` keeps the root-only group rule: a nested garter (e.g.
+        // galoshes inside the bridge's chain) joins this tree instead of creating
+        // one Unix pgids could escape from.
+        cmd.contain();
+        cmd.nesting(cosca::containment::Nesting::Mark);
+        let mut child = cmd
+            .spawn()
             .map_err(|e| crate::Error::Chain(format!("failed to spawn '{}': {e}", self.path.display())))?;
 
-        if let (Some(sink), Some(pid)) = (&self.pid_sink, gc.child.id()) {
-            sink(pid);
+        if let Some(sink) = &self.pid_sink {
+            sink(child.id().pid());
         }
 
         // Capture stderr FIRST: the sitrep stdout reader's readiness-FAILURE
@@ -248,7 +252,7 @@ impl ChainPlugin for BinaryPlugin {
         // panic under `GOTRACEBACK=crash`) isn't reported as if it said
         // nothing. `Notify` (not the `JoinHandle` itself) so this task's
         // handle stays free for the unconditional drain below too.
-        let stderr = gc.child.stderr.take().expect("stderr was piped");
+        let stderr = child.stderr().expect("stderr was piped");
         let plugin_name = self.name.clone();
         let log_sink = self.log_sink.clone();
         let stderr_done = Arc::new(tokio::sync::Notify::new());
@@ -276,7 +280,7 @@ impl ChainPlugin for BinaryPlugin {
         // readiness comes from a separate self-probe task; in ExpectSitrep
         // mode it parses sitrep events and IS the readiness source. Build
         // the right one per `self.readiness`.
-        let stdout = gc.child.stdout.take().expect("stdout was piped");
+        let stdout = child.stdout().expect("stdout was piped");
         let stdout_task = match self.readiness {
             ReadinessMode::Probe => {
                 // Tier-2: the stdout reader is a pure log passthrough; a
@@ -351,7 +355,7 @@ impl ChainPlugin for BinaryPlugin {
         // full two-channel rationale.
         let drain_timeout = std::time::Duration::from_secs(5);
         tokio::select! {
-            status = gc.child.wait() => {
+            status = child.wait() => {
                 let status = status?;
                 // Drain remaining log lines (tasks will EOF when child's pipes close)
                 let _ = tokio::time::timeout(
@@ -374,9 +378,9 @@ impl ChainPlugin for BinaryPlugin {
             }
             _ = shutdown.cancelled() => {
                 tracing::info!(plugin = %self.name, "shutting down");
-                // Force path force-kills the direct child; `gc` dropping at the
-                // end of `run` (or on task abort) reaps the whole tree.
-                shutdown::graceful_stop(&mut gc.child, drain_timeout).await?;
+                // The escalation force-kills the direct child; `child` dropping at
+                // the end of `run` (or on task abort) reaps the whole tree.
+                child.graceful_shutdown(drain_timeout).await?;
                 // Drain remaining log lines (tasks will EOF when child's pipes close)
                 let _ = tokio::time::timeout(
                     std::time::Duration::from_millis(100),
@@ -430,7 +434,7 @@ fn spawn_shared_probe(local: SocketAddr, standdown: CancellationToken, shared: S
 /// reported as if the plugin said nothing.
 #[allow(clippy::too_many_arguments)] // 8 args — bundling into a struct adds more noise than the warning.
 fn spawn_sitrep_stdout_reader(
-    stdout: tokio::process::ChildStdout,
+    stdout: impl tokio::io::AsyncRead + Unpin + Send + 'static,
     plugin_name: String,
     local: SocketAddr,
     shutdown: CancellationToken,
@@ -563,7 +567,7 @@ fn spawn_sitrep_stdout_reader(
 /// `tokio::spawn`, runtime drop aborts it at the await point rather than
 /// blocking on it.
 async fn drain_remaining_logs(
-    lines: &mut tokio::io::Lines<BufReader<tokio::process::ChildStdout>>,
+    lines: &mut tokio::io::Lines<BufReader<impl tokio::io::AsyncRead + Unpin>>,
     plugin_name: &str,
     log_sink: &Option<LogSink>,
 ) {

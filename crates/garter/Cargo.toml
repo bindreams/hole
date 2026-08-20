@@ -32,7 +32,6 @@ test-utils = ["dep:tracing-subscriber"]
 [dependencies]
 bitflags = { workspace = true }
 cosca = { workspace = true, features = ["tokio"] }
-kill-group = { version = "0.1", path = "../kill-group" }
 semver = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
@@ -81,16 +80,17 @@ name = "shutdown"
 path = "tests/shutdown.rs"
 harness = false
 
+# Both target blocks below exist for `src/bin/mock-plugin.rs`, the test fixture.
+# The published crate excludes `src/bin/`, so neither reaches a consumer's build.
 [target.'cfg(unix)'.dependencies]
-# shutdown.rs: kill(pid, SIGTERM). mock-plugin: signal(SIGTERM, SIG_IGN).
+# mock-plugin: signal(SIGTERM, SIG_IGN), for MOCK_PLUGIN_IGNORE_SIGNALS.
 libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
-# Job-object / handle-hygiene features moved to the `kill-group` crate.
+# Containment and handle hygiene are cosca's; these are the fixture's own calls.
 windows = { version = "0.62", features = [
-    "Win32_Foundation",     # mock-plugin: TRUE, from the console control handler
-    "Win32_System_Console", # shutdown.rs: GenerateConsoleCtrlEvent (CTRL_BREAK);
-                            # mock-plugin: SetConsoleCtrlHandler
+    "Win32_Foundation",     # TRUE, returned from the console control handler
+    "Win32_System_Console", # SetConsoleCtrlHandler
 ] }
 
 [target.'cfg(windows)'.dev-dependencies]
