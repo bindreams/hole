@@ -27,6 +27,10 @@ CLAUDE.local.md
 # Vite build output
 ui/dist/
 
+# Sphinx build output from a hand-run `sphinx-build docs docs/_build`
+# (scripts/validate-docs.py builds into .tmp/ instead).
+docs/_build/
+
 # Python
 __pycache__/
 .venv/
