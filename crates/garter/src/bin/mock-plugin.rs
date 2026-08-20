@@ -53,6 +53,63 @@ fn ignore_cooperative_signal() {
     unsafe { SetConsoleCtrlHandler(Some(absorb), true) }.expect("install a console control handler");
 }
 
+/// One readiness byte on stdout, flushed. The reader's `read_exact` of it is the
+/// happens-before edge for "this process is executing its own code" — which the
+/// Windows leg needs, because a child is not registered with any console at the
+/// instant its spawn returns.
+fn report_ready() {
+    use std::io::Write;
+    let mut out = std::io::stdout();
+    out.write_all(b"R").expect("write the readiness byte");
+    out.flush().expect("flush the readiness byte");
+}
+
+/// Middle level of the nesting probe: spawn a nested contained copy of ourselves,
+/// then report two lines on stdout — the grandchild's achieved containment, and how
+/// its cooperative shutdown ended.
+async fn run_nest_probe(control_addr: std::ffi::OsString) -> Result<(), Box<dyn std::error::Error>> {
+    use tokio::io::AsyncReadExt;
+
+    let mut cmd = cosca::tokio::Command::new();
+    cmd.executable(std::env::current_exe()?)
+        .env("MOCK_PLUGIN_NEST_GRANDCHILD", &control_addr)
+        .env_remove("MOCK_PLUGIN_NEST_PROBE")
+        .kill_on_drop(true)
+        .contain();
+    cmd.stdin(cosca::Stdio::null())?;
+    cmd.stdout(cosca::Stdio::pipe())?;
+    cmd.stderr(cosca::Stdio::null())?;
+    let mut grandchild = cmd.spawn()?;
+
+    let mut stdout = grandchild.stdout().expect("the grandchild's stdout was piped");
+    let mut ready = [0u8; 1];
+    stdout.read_exact(&mut ready).await?;
+
+    println!("{}", grandchild.containment());
+    println!("{}", describe_shutdown(&mut grandchild).await);
+    use std::io::Write;
+    std::io::stdout().flush()?;
+    Ok(())
+}
+
+/// Shut the grandchild down cooperatively and render the outcome as one line:
+/// `error=<e>`, or the exit status the escalation-capable call returned.
+async fn describe_shutdown(grandchild: &mut cosca::tokio::Child) -> String {
+    let status = match grandchild.graceful_shutdown(std::time::Duration::from_secs(5)).await {
+        Ok(status) => status,
+        Err(e) => return format!("error={e}"),
+    };
+    let code = status.code().map_or_else(|| "none".to_string(), |c| c.to_string());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        let signal = status.signal().map_or_else(|| "none".to_string(), |s| s.to_string());
+        format!("code={code} signal={signal}")
+    }
+    #[cfg(not(unix))]
+    format!("code={code}")
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Knob: MOCK_PLUGIN_SLEEP — "grandchild" mode (a garter process-tree-reaping
@@ -86,6 +143,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             None => None,
         };
         std::future::pending::<()>().await;
+    }
+
+    // Knob: MOCK_PLUGIN_NEST_GRANDCHILD=<control addr> — the innermost level of the
+    // nesting probe. Dial the control address and hold it (the test accepts it to
+    // observe liveness, and reads it to observe death), report readiness on stdout,
+    // then park. NO signal handler: the cooperative signal must end this process by
+    // its default disposition, which is what distinguishes it from an escalation.
+    if let Some(addr) = std::env::var_os("MOCK_PLUGIN_NEST_GRANDCHILD") {
+        let addr = addr.to_str().expect("MOCK_PLUGIN_NEST_GRANDCHILD is valid utf-8");
+        let _control = TcpStream::connect(addr)
+            .await
+            .expect("grandchild dials the control channel");
+        report_ready();
+        std::future::pending::<()>().await;
+    }
+
+    // Knob: MOCK_PLUGIN_NEST_PROBE=<control addr> — the middle level. Spawn a
+    // contained copy of ourselves (nested, because our own environment carries the
+    // containment marker) and report, on stdout, what containment it achieved and
+    // how the cooperative signal ended it.
+    if let Some(addr) = std::env::var_os("MOCK_PLUGIN_NEST_PROBE") {
+        return run_nest_probe(addr).await;
     }
 
     let local_host = std::env::var("SS_LOCAL_HOST")?;

@@ -80,6 +80,11 @@ name = "shutdown"
 path = "tests/shutdown.rs"
 harness = false
 
+[[test]]
+name = "nested_containment"
+path = "tests/nested_containment.rs"
+harness = false
+
 # Both target blocks below exist for `src/bin/mock-plugin.rs`, the test fixture.
 # The published crate excludes `src/bin/`, so neither reaches a consumer's build.
 [target.'cfg(unix)'.dependencies]
