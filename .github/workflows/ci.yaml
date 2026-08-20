@@ -210,7 +210,12 @@ jobs:
     name: Test tooling (${{ matrix.os }}/${{ matrix.arch }})
     needs: build
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 10
+    # windows/arm64 sets the requirement and had almost no margin at 10: it ran
+    # 8m52s green, then 10m18s (killed) on an unchanged test set. The other legs
+    # are nowhere near — linux ~1m, windows/amd64 ~5m30s. Pinning Go (#854) adds
+    # a toolchain download on images that ship a different one, worth ~1min on
+    # this runner and enough to matter at 10.
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
