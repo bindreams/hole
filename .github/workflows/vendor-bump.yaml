@@ -52,7 +52,7 @@ jobs:
       - uses: ./.github/actions/setup-rust
       - uses: actions/setup-go@v7
         with:
-          go-version: stable
+          go-version-file: crates/ex-ray/go.mod
 
       # git-subrepo isn't part of the ubuntu-latest image or any
       # apt/npm/go package — it's a bash-script tool installed by cloning

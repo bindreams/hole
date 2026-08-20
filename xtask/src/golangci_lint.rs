@@ -29,6 +29,13 @@ use anyhow::{anyhow, bail, Context, Result};
 /// `go 1.25.5` directive. Bump this const AND every per-platform SHA256 in
 /// [`asset_for`] together; the `.verified` sentinel invalidates the cache on
 /// a version dir change.
+///
+/// Coupled to `crates/ex-ray/go.mod`'s `go` directive (CI's Go pin — see
+/// `.github/actions/setup-build/action.yaml`'s `go-version-file`): bump this
+/// by hand whenever that directive moves past the Go release this version was
+/// built with. Falling behind surfaces as a `typechecking error` naming a
+/// file under the Go SDK's own `src/`, not as a message that points at this
+/// constant.
 const VERSION: &str = "2.12.2";
 
 /// One release archive: its download URL filename and the SHA256 pinned from

@@ -14,9 +14,12 @@ runs:
     - uses: ./.github/actions/setup-rust
       id: rust-toolchain
 
+    # The Go version CI targets is crates/ex-ray/go.mod's own `go` directive —
+    # the only Go module this repo's tooling touches — so lint/build never
+    # run against a toolchain the module doesn't target.
     - uses: actions/setup-go@v7
       with:
-        go-version: stable
+        go-version-file: crates/ex-ray/go.mod
 
     # Node.js is required by the `frontend-build` xtask target, which is now
     # on `hole-msi.depends`. Without `npm`, Windows runners can't produce

@@ -249,7 +249,7 @@ jobs:
       # ship a usable `go` anyway.
       - uses: actions/setup-go@v7
         with:
-          go-version: stable
+          go-version-file: crates/ex-ray/go.mod
 
       # `check_vendoring_integrity_tests`'s `always_run_hazard_end_to_end_*`
       # tests (part of `package(xtask)`, run by this job) install a real
