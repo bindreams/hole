@@ -896,6 +896,20 @@ which fails on inconsistency. **If you edit `package.json`, commit the resulting
 `package-lock.json` in the same commit, or CI rejects the PR.** Renovate handles
 routine updates ([renovate.json](.github/renovate.json)).
 
+### Toolchain pins
+
+[`rust-toolchain.toml`](rust-toolchain.toml) pins the exact Rust compiler CI and
+local `cargo`/`rustup` both use — it auto-installs on first invocation in this
+repo. CI's Go compiler comes from `crates/ex-ray/go.mod`'s own `go` directive
+(`go-version-file`), so lint/build never target a version the module doesn't.
+Both move only via a Renovate-authored pull request; `xtask/src/ci_toolchain_pins.rs`'s
+`toolchain_pin_*` conformance tests fail CI if a workflow reintroduces a float
+instead. `golangci-lint`'s pin (`xtask/src/golangci_lint.rs`) is bumped by hand
+whenever the `go` directive outruns the Go release it was built with.
+
+This covers the Rust and Go compilers only. Runner images (`windows-latest` and
+friends), `python-version: "3.x"`, and the unpinned tool installs (`uv tool install prek`, `taiki-e/install-action`, `brew install bash`) still float.
+
 ## Build
 
 Requires the toolchains above. `build.yaml` is the single source of truth for the
