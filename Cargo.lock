@@ -1232,10 +1232,10 @@ dependencies = [
 [[package]]
 name = "cosca"
 version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4282a5bdea4d4046610229d6f904151de204b6f901af907ed44e588854b7abb1"
+source = "git+https://github.com/bindreams/cosca?rev=3ebbebb4dd6316764cad8c19d7c4ac13c769fadb#3ebbebb4dd6316764cad8c19d7c4ac13c769fadb"
 dependencies = [
  "command-fds",
+ "crossbeam-channel",
  "getrandom 0.4.2",
  "libc",
  "log",
@@ -1244,6 +1244,7 @@ dependencies = [
  "serde",
  "shared_child",
  "thiserror 2.0.18",
+ "tokio",
  "windows 0.62.2",
  "zeroize",
 ]
@@ -2508,6 +2509,7 @@ dependencies = [
  "async-trait",
  "bitflags 2.13.0",
  "contracts",
+ "cosca",
  "hole-test-observability",
  "kill-group",
  "libc",

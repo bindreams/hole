@@ -14,8 +14,16 @@ edition = "2021"
 [workspace.dependencies]
 skuld = { version = "0.2", features = ["tokio"] }
 # Process identity: `(pid, raw kernel start token)` compared exactly, plus the
-# versioned `ProcessIdRecord` the bridge persists across a restart.
-cosca = { version = "0.2", features = ["serde"] }
+# versioned `ProcessIdRecord` the bridge persists across a restart; and, with the
+# `tokio` feature, the containment that replaced `crates/kill-group`.
+#
+# No `version` key, deliberately: with one, `cargo package` silently rewrites this
+# to the registry version and drops the git source (measured), publishing a garter
+# built against a cosca that lacks the graceful-signal work. Without one, publish
+# fails loudly until the epic's final registry flip. See bindreams/hole#816.
+cosca = { git = "https://github.com/bindreams/cosca", rev = "3ebbebb4dd6316764cad8c19d7c4ac13c769fadb", features = [
+    "serde",
+] }
 # Pre-main init for the test-observability subscriber install. See
 # crates/test-observability and bindreams/hole#301.
 #

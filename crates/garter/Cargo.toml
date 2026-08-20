@@ -31,6 +31,7 @@ test-utils = ["dep:tracing-subscriber"]
 
 [dependencies]
 bitflags = { workspace = true }
+cosca = { workspace = true, features = ["tokio"] }
 kill-group = { version = "0.1", path = "../kill-group" }
 semver = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
