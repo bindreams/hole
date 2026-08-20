@@ -100,13 +100,17 @@ fn render_typst_dims_transparency_ink_and_alpha() {
     assert_eq!(px(&rgba1, w1, 2, 2)[3], 0, "corner transparent");
     assert!(
         rgba1
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .any(|p| p[3] >= 200 && near([p[0], p[1], p[2], p[3]], 0x1d, 0x1d, 0x1f)),
         "no dark ink"
     );
     assert!(
         rgba1
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .any(|p| p[0] > 230 && p[1] < 40 && p[2] < 40 && (110..=150).contains(&p[3])),
         "red not straight-alpha"
     );
@@ -211,8 +215,13 @@ fn clean_icons_are_glyphs_not_white_boxes() {
         let images = vec![(format!("./{file}"), svg.into_bytes())];
         let src = format!("#set page(width: 660pt, height: 560pt, margin: 0pt, fill: none)\n#place(top + left, box(image(\"./{file}\", height: 200pt)))");
         let (rgba, _w, _h) = render_typst(&src, &font, &images, 1, &[]).unwrap();
-        let opaque = rgba.chunks_exact(4).filter(|p| p[3] == 255).count();
-        let white = rgba.chunks_exact(4).filter(|p| *p == [255, 255, 255, 255]).count();
+        let opaque = rgba.as_chunks::<4>().0.iter().filter(|p| p[3] == 255).count();
+        let white = rgba
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .filter(|p| **p == [255, 255, 255, 255])
+            .count();
         assert!(opaque > 0, "{file}: nothing rendered");
         // Measured: clean ≈0.21–0.24, raw white-box ≈0.94.
         assert!(
@@ -220,7 +229,9 @@ fn clean_icons_are_glyphs_not_white_boxes() {
             "{file}: mostly opaque white — wireframe box?"
         );
         assert!(
-            rgba.chunks_exact(4)
+            rgba.as_chunks::<4>()
+                .0
+                .iter()
                 .any(|p| p[3] == 255 && near([p[0], p[1], p[2], p[3]], r, g, b)),
             "{file}: missing self-color"
         );
@@ -303,7 +314,9 @@ fn real_background_has_substantial_dark_ink() {
     // guard: empty render = 0 dark px; the real copy = thousands.
     let (rgba, _w, _h) = render_real_background();
     let dark = rgba
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .filter(|p| p[3] > 40 && near([p[0], p[1], p[2], p[3]], 0x1d, 0x1d, 0x1f))
         .count();
     assert!(dark > 1000, "only {dark} dark-ink px — text may be blank/tofu");
@@ -313,7 +326,9 @@ fn real_background_has_substantial_dark_ink() {
 fn real_background_recolored_quote_rule_and_icons() {
     let (rgba, w, _h) = render_real_background();
     assert!(
-        rgba.chunks_exact(4)
+        rgba.as_chunks::<4>()
+            .0
+            .iter()
             .any(|p| p[3] > 200 && near([p[0], p[1], p[2], p[3]], 0x3a, 0x3a, 0x3c)),
         "quote #3a3a3c missing"
     );
@@ -323,7 +338,7 @@ fn real_background_recolored_quote_rule_and_icons() {
     // survives layout tuning (unlike a hardcoded x-cutoff) and can't alias with the
     // hand (whose tallest column is ≤ the 18pt icon height).
     let mut blue_per_col = vec![0u32; w as usize];
-    for (i, p) in rgba.chunks_exact(4).enumerate() {
+    for (i, p) in rgba.as_chunks::<4>().0.iter().enumerate() {
         if p[3] > 200 && near([p[0], p[1], p[2], p[3]], 0x0a, 0x84, 0xff) {
             blue_per_col[(i as u32 % w) as usize] += 1;
         }
@@ -334,12 +349,16 @@ fn real_background_recolored_quote_rule_and_icons() {
         blue_per_col.iter().max().copied().unwrap_or(0)
     );
     assert!(
-        rgba.chunks_exact(4)
+        rgba.as_chunks::<4>()
+            .0
+            .iter()
             .any(|p| p[3] == 255 && near([p[0], p[1], p[2], p[3]], 0x8E, 0x8E, 0x93)),
         "gear missing"
     );
     assert!(
-        rgba.chunks_exact(4)
+        rgba.as_chunks::<4>()
+            .0
+            .iter()
             .any(|p| p[3] == 255 && near([p[0], p[1], p[2], p[3]], 0x0A, 0x84, 0xFF)),
         "hand missing"
     );
@@ -354,7 +373,7 @@ fn drag_arrow_centroid_at_icon_midpoint() {
     let midpoint = (g.app_pos[0] + g.appfolder_pos[0]) / 2;
     let row = g.app_pos[1];
     let (mut sum_x, mut n) = (0u64, 0u64);
-    for (i, p) in rgba.chunks_exact(4).enumerate() {
+    for (i, p) in rgba.as_chunks::<4>().0.iter().enumerate() {
         let (x, y) = ((i as u32) % w, (i as u32) / w);
         if p[3] == 255
             && near([p[0], p[1], p[2], p[3]], 0x86, 0x86, 0x8b)
