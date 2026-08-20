@@ -1182,6 +1182,29 @@ fn lockdown_engage_failure_tears_down_routes_only() {
 }
 
 #[skuld::test]
+fn user_stop_tears_down_routes_before_disengaging_the_lockdown_cover() {
+    // Characterization test, pinned against unmodified code: the clean-stop
+    // path tears down routes before disengaging the standing cover. The
+    // standing cover's persistent filters must outlive the routes they cover.
+    rt().block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        let routing = MockRouting::new(dir.path().to_path_buf());
+        let st = routing.state();
+        let (mut pm, _dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, true);
+        pm.start(&test_config()).await.unwrap();
+
+        pm.stop_with(StopReason::UserStop).await.unwrap();
+
+        let order = st.teardown_order.lock().unwrap().clone();
+        assert_eq!(
+            order,
+            vec!["routes", "lockdown"],
+            "the standing cover's persistent filters must outlive the routes they cover"
+        );
+    });
+}
+
+#[skuld::test]
 fn stop_with_cutover_disarms_lockdown_but_user_stop_disengages() {
     rt().block_on(async {
         // UserStop: the cover Drop disengages (opens the host).
