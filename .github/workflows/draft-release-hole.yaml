@@ -72,7 +72,7 @@ jobs:
 
       # Required by both bundle builds — hole-msi (Windows) and hole-dmg
       # (Darwin dmg-installer) — so it must run on every matrix target.
-      - uses: astral-sh/setup-uv@v10.0.0
+      - uses: astral-sh/setup-uv@v10.0.1
 
       - uses: ./.github/actions/setup-build
 
@@ -172,7 +172,7 @@ jobs:
           # `path: source` so we don't clobber the downloaded artifacts in $GITHUB_WORKSPACE.
           path: source
 
-      - uses: astral-sh/setup-uv@v10.0.0
+      - uses: astral-sh/setup-uv@v10.0.1
 
       - name: Generate per-track release notes
         run: |
