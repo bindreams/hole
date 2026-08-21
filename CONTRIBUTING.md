@@ -628,9 +628,10 @@ immediately rather than waiting for the next bridge start.
 
 `POST /v1/unblock` and `hole bridge unlock` are two doors with deliberately
 different scopes. The transient cover's authority inside a live bridge is the
-in-process `ProxyManager::blocked` guard: `start_cancellable` reads
-`self.blocked.is_some()` as proof the host is covered, skipping re-engagement
-on a covered retry and suppressing the censorship self-test on that basis. An
+in-process `ProxyManager` posture's `PendingStart` state ([Cover
+ownership](#cover-ownership)): `start_cancellable` reads it as proof the host
+is covered, skipping re-engagement on a covered retry and suppressing the
+censorship self-test on that basis. An
 out-of-process command that deleted the transient filters would leave that
 guard claiming a cover that no longer exists, and the next retry would run
 uncovered while believing itself protected — so `cutover::unlock` keeps
@@ -665,6 +666,30 @@ Disclosed residuals:
    mean probing the live pf ruleset for Hole's own signature independent of
    the state file — the cover-state probe this stage's constraints defer to
    the ownership work.
+
+#### Cover ownership
+
+`ProxyManager` answers "who, inside this process, holds a fail-closed cover"
+in exactly one place: one field (`posture: Posture<P, R, D>`, replacing what
+were two independently mutable `Option` fields), three states (`Idle` / a
+pending covered start / a live session), one derivation
+(`Posture::cover_holder`, producing a `CoverHolder`) that every other site
+asks rather than recomputes. `CoverHolder::Nobody` is a claim about *this
+process* and never about the host — a cover stranded by an unclean exit, or
+adopted at startup, is `Nobody` here and can still block every packet.
+Answering "is the host held closed right now" needs an OS probe this model
+does not have; that probe is later work, and this model is the vocabulary it
+composes into, not a substitute for it.
+
+"That every other site asks rather than recomputes" is enforced by a
+structural test (`the_standing_cover_field_has_exactly_one_reader`,
+`proxy_manager/cover_tests.rs`), not proven by the type system — it counts
+`.field`-access reads of the session's standing-cover field and asserts
+there is exactly one, in `Posture::cover_holder`. It is blind to an added
+accessor under a different name and to a pattern-destructuring read (the
+shape `stop_with` itself already uses, to consume rather than derive
+ownership from, this same field); see the guard's own doc for the full
+disclosed gap.
 
 ### Update cutover
 

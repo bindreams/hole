@@ -20,12 +20,13 @@
 // sync FFI is on a tokio worker the future can't be preempted. RAII Drop
 // is retained as the catastrophic / panic teardown safety net only.
 //
-// A cycle's transient state lives in `Option<RunningState<P, R>>`. When
-// `stop()` takes the state, the proxy handle is explicitly
+// A cycle's transient state lives in `self.posture`, one of `Idle` /
+// `PendingStart` / `Session(RunningState<P, R>)` — see the `Posture` section
+// below. When `stop()` takes the state, the proxy handle is explicitly
 // `stop().await`ed (so errors are reported), then the routes guard drops
 // (tearing down). On a successful `start`, the full `RunningState` is
-// committed to `self.running` strictly after `start_inner` returns
-// `Ok(state)`; the cooperative-cancel path returns `Err(Cancelled)`
+// committed via `Posture::commit_session` strictly after `start_inner`
+// returns `Ok(state)`; the cooperative-cancel path returns `Err(Cancelled)`
 // before reaching the commit.
 //
 // There are deliberately no getters for `proxy` or `routing` — test access
@@ -52,6 +53,9 @@ use crate::dns::system::{Dns, DnsApplied, DnsError, SystemDns};
 use crate::proxy::{
     build_ss_config, Proxy, ProxyError, RunningProxy, ShadowsocksProxy, TrafficTotals, TUN_DEVICE_NAME,
 };
+
+mod cover;
+use cover::CoverHolder;
 
 /// Non-secret diagnostic view of a proxy-start event — suitable for
 /// YAML-shaped logging via `dump!`. Deliberately excludes password /
@@ -145,10 +149,15 @@ struct RunningState<P: Proxy, R: Routing, D: Dns> {
     #[allow(dead_code)]
     routes: Option<R::Installed>,
     /// Standing lockdown cover, engaged only when intent is on. `None` when
-    /// lockdown is off — then behavior is byte-identical to today. Read by
-    /// `lockdown_active()`; on stop a `UserStop` disengages it and a `Cutover`
-    /// disarms it (the persistent filters survive), both after routes tear down
-    /// (its Drop is the catastrophic safety net).
+    /// lockdown is off — then behavior is byte-identical to today. The
+    /// session's standing cover: `Posture::cover_holder` is the sole
+    /// deriver of cover OWNERSHIP from it (a regex-based structural guard
+    /// in `cover_tests.rs` catches a second `.field` access, but is blind
+    /// to a destructuring read — see that guard's own doc). `stop_with`
+    /// separately CONSUMES this field to decide the cover's fate at
+    /// teardown, not to derive ownership: a `UserStop` disengages it and a
+    /// `Cutover` disarms it (the persistent filters survive), both after
+    /// routes tear down (its Drop is the catastrophic safety net).
     lockdown: Option<R::Cover>,
     /// Handle on the running proxy. Drop aborts the task (best-effort);
     /// supported graceful shutdown is via `stop().await` from
@@ -201,15 +210,16 @@ pub struct ProxyManager<P: Proxy = ShadowsocksProxy, R: Routing = SystemRouting,
     proxy: P,
     routing: R,
     dns: D,
-    running: Option<RunningState<P, R, D>>,
-    /// The single transient fail-closed cover, held when a covered (auto-connect)
-    /// start failed: the host stays blocked, not leaked, while `running` is `None`.
-    /// The live guard is held here (its `Drop` still runs) — released on a user
-    /// stop/cancel or the next successful start. The transient cover is a global
-    /// singleton, so a retry reuses this guard rather than engaging a second. It
-    /// carries the server identity it permits so a same-server retry reuses the
-    /// resolved IP instead of re-resolving under the cover (which it would block).
-    blocked: Option<BlockedStart<R::Cover>>,
+    /// See the `Posture` section below. The pending-start case holds the
+    /// single transient fail-closed cover, engaged when a covered
+    /// (auto-connect) start failed: the host stays blocked, not leaked,
+    /// while no session is running. The live guard is held here (its `Drop`
+    /// still runs) — released on a user stop/cancel or the next successful
+    /// start. The transient cover is a global singleton, so a retry reuses
+    /// this guard rather than engaging a second. It carries the server
+    /// identity it permits so a same-server retry reuses the resolved IP
+    /// instead of re-resolving under the cover (which it would block).
+    posture: Posture<P, R, D>,
     last_error: Option<String>,
     /// The out-of-band death reason surfaced to the GUI status/toast, distinct
     /// from `last_error` (which keeps the rich, possibly-PII operation detail
@@ -241,7 +251,8 @@ pub struct ProxyManager<P: Proxy = ShadowsocksProxy, R: Routing = SystemRouting,
     last_ech_doh: Option<String>,
 }
 
-/// A held block-until-connected cover plus the server identity it permits.
+/// A held block-until-connected cover plus the server identity it permits —
+/// the payload of `Posture::PendingStart`.
 /// `resolver_permit` is what was ACTUALLY passed to `install_failclosed_cover`
 /// at the engage that produced `cover` — ground truth for what the LIVE OS
 /// cover permits, frozen until the next fresh engage. A covered retry against
@@ -262,6 +273,105 @@ struct BlockedStart<C> {
     /// not — it describes the live OS cover, not the current config. See the
     /// struct doc for what it means.
     resolver_permit: Option<IpAddr>,
+}
+
+// Posture =============================================================================================================
+
+/// Who owns `ProxyManager`'s per-cycle state right now: nobody, a pending
+/// covered start, or a live session. Collapses what were two independently
+/// mutable `Option` fields (`running`, `blocked`) into one, so a session and
+/// a pending start both holding covers stops being representable.
+enum Posture<P: Proxy, R: Routing, D: Dns> {
+    Idle,
+    PendingStart(BlockedStart<R::Cover>),
+    Session(RunningState<P, R, D>),
+}
+
+impl<P: Proxy, R: Routing, D: Dns> Posture<P, R, D> {
+    /// The single derivation of [`CoverHolder`] — no other site may recompute
+    /// who holds a fail-closed cover from session state.
+    fn cover_holder(&self) -> CoverHolder {
+        match self {
+            Posture::Idle => CoverHolder::Nobody,
+            Posture::PendingStart(_) => CoverHolder::PendingStart,
+            Posture::Session(s) => CoverHolder::Session {
+                standing: s.lockdown.is_some(),
+            },
+        }
+    }
+
+    fn session(&self) -> Option<&RunningState<P, R, D>> {
+        match self {
+            Posture::Session(s) => Some(s),
+            _ => None,
+        }
+    }
+
+    fn session_mut(&mut self) -> Option<&mut RunningState<P, R, D>> {
+        match self {
+            Posture::Session(s) => Some(s),
+            _ => None,
+        }
+    }
+
+    fn pending(&self) -> Option<&BlockedStart<R::Cover>> {
+        match self {
+            Posture::PendingStart(b) => Some(b),
+            _ => None,
+        }
+    }
+
+    /// Take the pending-start payload, leaving `Idle`. `None`, and the
+    /// posture left untouched, on any other variant — in particular this
+    /// must not disturb a live session.
+    fn take_pending(&mut self) -> Option<BlockedStart<R::Cover>> {
+        if !matches!(self, Posture::PendingStart(_)) {
+            return None;
+        }
+        match std::mem::replace(self, Posture::Idle) {
+            Posture::PendingStart(b) => Some(b),
+            _ => unreachable!("just matched PendingStart above"),
+        }
+    }
+
+    /// Take the session payload, leaving `Idle`. `None`, and the posture left
+    /// untouched, on any other variant — in particular this must not disturb
+    /// a held pending start.
+    fn take_session(&mut self) -> Option<RunningState<P, R, D>> {
+        if !matches!(self, Posture::Session(_)) {
+            return None;
+        }
+        match std::mem::replace(self, Posture::Idle) {
+            Posture::Session(s) => Some(s),
+            _ => unreachable!("just matched Session above"),
+        }
+    }
+
+    /// Contract: the posture is `Idle`. Provers: `start_cancellable`'s
+    /// `AlreadyRunning` guard rules out `Session`; the caller's own
+    /// `self.posture.pending().is_none()` check, immediately before this
+    /// call, rules out an existing `PendingStart`.
+    fn hold_pending(&mut self, held: BlockedStart<R::Cover>) {
+        debug_assert!(
+            matches!(self, Posture::Idle),
+            "hold_pending: posture must be Idle — AlreadyRunning already ruled out a session, \
+             and the caller's own pending().is_none() check ruled out an existing pending start"
+        );
+        *self = Posture::PendingStart(held);
+    }
+
+    /// Contract: the posture is `Idle`. Provers: `start_cancellable`'s
+    /// `AlreadyRunning` guard rules out `Session`; the caller's own
+    /// `take_pending()` call, immediately before this call, rules out a
+    /// `PendingStart`.
+    fn commit_session(&mut self, session: RunningState<P, R, D>) {
+        debug_assert!(
+            matches!(self, Posture::Idle),
+            "commit_session: posture must be Idle — AlreadyRunning already ruled out a session, \
+             and the caller's own take_pending() call ruled out a pending start"
+        );
+        *self = Posture::Session(session);
+    }
 }
 
 /// Result of [`ProxyManager::turn_lockdown_off`]. `Cleared` means every
@@ -291,8 +401,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
             proxy,
             routing,
             dns,
-            running: None,
-            blocked: None,
+            posture: Posture::Idle,
             last_error: None,
             death_reason: None,
             active_config: None,
@@ -330,7 +439,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
     pub fn state(&self) -> ProxyState {
         // ProxyState is retained (Stopped/Running) to preserve the IPC
         // `StatusResponse.running` field semantics unchanged for the GUI.
-        if self.running.is_some() {
+        if self.posture.session().is_some() {
             ProxyState::Running
         } else {
             ProxyState::Stopped
@@ -338,8 +447,8 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
     }
 
     pub fn uptime_secs(&self) -> u64 {
-        self.running
-            .as_ref()
+        self.posture
+            .session()
             .map(|r| r.started_at.elapsed().as_secs())
             .unwrap_or(0)
     }
@@ -350,7 +459,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
     /// See bindreams/hole#383.
     #[cfg(test)]
     pub fn shift_started_at_for_test(&mut self, by: std::time::Duration) {
-        if let Some(r) = self.running.as_mut() {
+        if let Some(r) = self.posture.session_mut() {
             r.started_at = r
                 .started_at
                 .checked_sub(by)
@@ -363,7 +472,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
     /// window — the IPC metrics poll is the sampling event. `None` when
     /// stopped; the first sample after a start reports 0 bps.
     pub fn sample_traffic(&mut self) -> Option<TrafficMetrics> {
-        let running = self.running.as_mut()?;
+        let running = self.posture.session_mut()?;
         let totals = running.proxy.traffic_totals();
         let now = tokio::time::Instant::now();
         let (speed_in_bps, speed_out_bps) = match &running.traffic_window {
@@ -412,7 +521,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
     /// No-op when not running or before the first sample.
     #[cfg(test)]
     pub fn shift_traffic_window_for_test(&mut self, by: std::time::Duration) {
-        if let Some(w) = self.running.as_mut().and_then(|r| r.traffic_window.as_mut()) {
+        if let Some(w) = self.posture.session_mut().and_then(|r| r.traffic_window.as_mut()) {
             w.sampled_at = w
                 .sampled_at
                 .checked_sub(by)
@@ -442,8 +551,8 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
 
     /// Get the list of invalid (dropped) filter rules from the current ruleset.
     pub fn invalid_filters(&self) -> Vec<hole_common::protocol::InvalidFilter> {
-        self.running
-            .as_ref()
+        self.posture
+            .session()
             .and_then(|r| r.dispatcher.as_ref())
             .map(|d| d.invalid_filters())
             .unwrap_or_default()
@@ -462,13 +571,13 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
     /// Whether a standing lockdown cover is currently engaged (the `active`
     /// signal). Distinct from the persisted intent (`enabled`).
     pub fn lockdown_active(&self) -> bool {
-        self.running.as_ref().map(|r| r.lockdown.is_some()).unwrap_or(false)
+        self.posture.cover_holder().standing_engaged()
     }
 
     /// Whether a covered start failed and left the host fail-closed (blocked, not
     /// leaked) while not running — the GUI's distinct blocked state.
     pub fn blocked_until_connected(&self) -> bool {
-        self.blocked.is_some()
+        self.posture.cover_holder().transient_engaged()
     }
 
     #[cfg(test)]
@@ -503,9 +612,10 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
     /// Turn the kill-switch intent off, releasing any cover no running
     /// session owns. This is the feature's only stateful decision: both the
     /// tray's Unblock item and the Lockdown-off toggle call it and map the
-    /// returned outcome to their own reply; neither inspects `running`
-    /// itself — `self.running.is_some()` is the ONLY condition anywhere in
-    /// this path.
+    /// returned outcome to their own reply; neither inspects the posture
+    /// itself — the condition is now an arm of an exhaustive match over
+    /// [`Posture::cover_holder`], so a future scope error shows up as a
+    /// missing or merged arm rather than as a new boolean.
     ///
     /// The step-3-before-step-4 ordering (release, THEN persist) is
     /// load-bearing: the tray offers this escape while the intent is on, so
@@ -513,40 +623,46 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
     /// user's only retry affordance while the host is still held closed. The
     /// intent moves only after the clear confirms.
     pub fn turn_lockdown_off(&mut self) -> Result<LockdownOffOutcome, ProxyError> {
-        // 1. The only condition. A running session owns its own standing
-        // cover and `stop_with` releases it — there is no unowned cover to
-        // clear here, so recording the intent is the whole of what "turn it
-        // off" can mean while connected (matches the toggle's existing
-        // mid-session behavior).
-        if self.running.is_some() {
-            // Mapped to the same `LockdownIntentNotPersisted` a failed persist
-            // in step 4 uses (not propagated raw via `?`): both name the one
-            // fact the caller can act on — the setting did not save — rather
-            // than an opaque `ProxyError::Runtime` the IPC layer's generic
-            // 500 path can't distinguish from a release failure.
-            return match self.set_lockdown_intent(false) {
-                Ok(()) => Ok(LockdownOffOutcome::SessionRunning),
-                Err(_) => Err(ProxyError::LockdownIntentNotPersisted),
-            };
-        }
+        match self.posture.cover_holder() {
+            // 1. A live session owns the host's posture whether or not it
+            // installed a standing cover — `stop_with` decides that cover's
+            // fate, and nothing else may release it, so recording the intent
+            // is the whole of what "turn it off" can mean while connected
+            // (matches the toggle's existing mid-session behavior). Keying
+            // this on `standing_engaged()` instead would be a behaviour
+            // change: a session with no standing cover would then let the
+            // clear below proceed.
+            CoverHolder::Session { .. } => {
+                // Mapped to the same `LockdownIntentNotPersisted` a failed persist
+                // in step 4 uses (not propagated raw via `?`): both name the one
+                // fact the caller can act on — the setting did not save — rather
+                // than an opaque `ProxyError::Runtime` the IPC layer's generic
+                // 500 path can't distinguish from a release failure.
+                match self.set_lockdown_intent(false) {
+                    Ok(()) => Ok(LockdownOffOutcome::SessionRunning),
+                    Err(_) => Err(ProxyError::LockdownIntentNotPersisted),
+                }
+            }
+            CoverHolder::Nobody | CoverHolder::PendingStart => {
+                // 2. Drop any held transient guard's in-process authority first.
+                // Not a condition — a no-op on `Nobody` — it exists so no live
+                // guard outlives the OS objects `release_all_covers` is about to
+                // delete out from under it.
+                self.posture.take_pending();
 
-        // 2. Drop any held transient guard's in-process authority first. Not
-        // a condition — `take` on `None` is a no-op — it exists so no live
-        // guard outlives the OS objects `release_all_covers` is about to
-        // delete out from under it.
-        self.blocked.take();
+                // 3. The unconditional clear. On error, return WITHOUT touching
+                // the intent — see the ordering note above.
+                self.routing.release_all_covers()?;
 
-        // 3. The unconditional clear. On error, return WITHOUT touching the
-        // intent — see the ordering note above.
-        self.routing.release_all_covers()?;
-
-        // 4. Only now move the intent. The covers are already gone and the
-        // host is open; a persist failure here means only the SETTING did
-        // not save, which the caller must be able to say distinctly from a
-        // failed release.
-        match self.set_lockdown_intent(false) {
-            Ok(()) => Ok(LockdownOffOutcome::Cleared),
-            Err(_) => Err(ProxyError::LockdownIntentNotPersisted),
+                // 4. Only now move the intent. The covers are already gone and
+                // the host is open; a persist failure here means only the
+                // SETTING did not save, which the caller must be able to say
+                // distinctly from a failed release.
+                match self.set_lockdown_intent(false) {
+                    Ok(()) => Ok(LockdownOffOutcome::Cleared),
+                    Err(_) => Err(ProxyError::LockdownIntentNotPersisted),
+                }
+            }
         }
     }
 
@@ -602,7 +718,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
             server_port = config.server.server_port,
             "ProxyManager::start_cancellable entered"
         );
-        if self.running.is_some() {
+        if self.posture.session().is_some() {
             return Err(ProxyError::AlreadyRunning);
         }
 
@@ -619,16 +735,16 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         // guaranteed to land on the resolver already baked into the held cover
         // (see `BlockedStart`'s doc) — so a start for a different server must
         // release the held cover BEFORE resolving.
-        let stale = self.blocked.as_ref().is_some_and(|b| b.host != config.server.server);
+        let stale = self.posture.pending().is_some_and(|b| b.host != config.server.server);
         if stale {
-            debug_assert!(self.blocked.is_some(), "stale implies a held cover");
-            self.blocked.take();
+            debug_assert!(self.posture.pending().is_some(), "stale implies a held cover");
+            self.posture.take_pending();
             warn!("start for a different server while blocked: releasing the held cover before re-resolving");
         }
 
         // Resolve the server IP over private DoH. A same-server retry under the
         // held cover reuses the cached IP and pin.
-        let (server_ip, pin) = match self.blocked.as_ref().filter(|b| b.host == config.server.server) {
+        let (server_ip, pin) = match self.posture.pending().filter(|b| b.host == config.server.server) {
             Some(b) => (b.server_ip, crate::dns::ech::revalidate(b.pin, &config.dns.servers)),
             None => match Self::resolve_server_ip(config, &bootstrap_querier, &cancel).await {
                 Ok(b) => (b.server_ip, b.via),
@@ -741,15 +857,15 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         // attempt's release-to-reengage window is bounded to this one
         // (user-paced) retry either way — see the restore fallback below.
         let repair_fallback: Option<(Option<IpAddr>, crate::dns::ech::PinSource)> = if covered && !lockdown_on {
-            self.blocked
-                .as_mut()
+            self.posture
+                .pending()
                 .filter(|b| b.host == config.server.server && b.resolver_permit != ech_resolver_permit)
                 .map(|b| (b.resolver_permit, b.pin))
         } else {
             None
         };
         if repair_fallback.is_some() {
-            self.blocked.take();
+            self.posture.take_pending();
             warn!(
                 "covered retry: this attempt's resolver permit differs from the held cover's; \
                  releasing it so a fresh engage can correct it — egress is briefly OPEN until \
@@ -768,9 +884,9 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
             // (the `Err(e2)` arm below), not one — never impossible, just
             // narrowed from the ordinary single-engage failure case. On that
             // double failure this attempt proceeds open, same as the
-            // non-repair case; the NEXT retry finds `self.blocked` is `None`
-            // and re-engages fresh from scratch.
-            if self.blocked.is_none() {
+            // non-repair case; the NEXT retry finds the posture holds no
+            // pending start and re-engages fresh from scratch.
+            if self.posture.pending().is_none() {
                 // A repair's corrected engage still carries forward the
                 // ORIGINAL cover's `pin`, not this attempt's locally
                 // revalidated `pin`: `pin` (the struct field) records when
@@ -785,7 +901,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
                 let engaged_pin = repair_fallback.map_or(pin, |(_, original_pin)| original_pin);
                 match self.routing.install_failclosed_cover(server_ip, ech_resolver_permit) {
                     Ok(cover) => {
-                        self.blocked = Some(BlockedStart {
+                        self.posture.hold_pending(BlockedStart {
                             cover,
                             host: config.server.server.clone(),
                             server_ip,
@@ -797,7 +913,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
                         if let Some((old_permit, original_pin)) = repair_fallback {
                             match self.routing.install_failclosed_cover(server_ip, old_permit) {
                                 Ok(cover) => {
-                                    self.blocked = Some(BlockedStart {
+                                    self.posture.hold_pending(BlockedStart {
                                         cover,
                                         host: config.server.server.clone(),
                                         server_ip,
@@ -852,19 +968,19 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
             // Covered retry after the user enabled lockdown mid-blocked-state:
             // release the held cover. This opens egress until the standing lockdown
             // cover engages at routing.install — a brief, disclosed open window.
-            if self.blocked.take().is_some() {
+            if self.posture.take_pending().is_some() {
                 warn!(
                     "covered retry with lockdown newly enabled: releasing the held cover; the host is briefly \
                      uncovered until the standing lockdown cover engages at connect"
                 );
             }
-        } else if self.blocked.take().is_some() {
+        } else if self.posture.take_pending().is_some() {
             // Manual (uncovered) connect or reload-while-blocked: fail-open by
             // design. Releasing the held cover opens egress — logged so the fail-open
             // has a visible disposition, never a silent drop.
             warn!("uncovered start while blocked: releasing the held cover (host fail-open by design)");
         }
-        let blocking_engaged = self.blocked.is_some();
+        let holder = self.posture.cover_holder();
 
         // Disclosed residual (see CONTRIBUTING.md's "Transient cutover
         // cover" section) gated on `effective_ech_doh`, the value that will
@@ -876,10 +992,9 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         // repair's restore can still leave the LIVE permit WIDER than this
         // attempt needs — the opposite residual direction, a kill-switch
         // widening rather than a stall risk.
-        if blocking_engaged {
+        if let Some(live_permit) = self.posture.pending().map(|b| b.resolver_permit) {
             match &effective_ech_doh {
                 crate::proxy::plugin::EffectiveEchDoh::None => {
-                    let live_permit = self.blocked.as_ref().and_then(|b| b.resolver_permit);
                     if live_permit.is_some() {
                         warn!(
                             ?pin,
@@ -891,7 +1006,6 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
                     }
                 }
                 crate::proxy::plugin::EffectiveEchDoh::Holes => {
-                    let live_permit = self.blocked.as_ref().and_then(|b| b.resolver_permit);
                     if live_permit != ech_resolver_permit {
                         warn!(
                             ?pin,
@@ -922,7 +1036,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
             config,
             server_ip,
             ech_doh,
-            blocking_engaged,
+            holder,
             self.state_dir.as_deref(),
             self.state_owner,
             cancel,
@@ -930,20 +1044,20 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         .await;
 
         // Commit (or record the error) in the outer function, so the
-        // only path that mutates `self.running = Some(..)` is strictly
-        // after start_inner has completed successfully.
+        // only path that commits a session via `Posture::commit_session` is
+        // strictly after start_inner has completed successfully.
         match result {
             Ok(state) => {
                 // Tunnel is up: release the block-until-connected cover (drop →
                 // disengage; already None when lockdown subsumed it — the standing
                 // lockdown cover holds instead).
-                self.blocked = None;
+                drop(self.posture.take_pending());
                 let server_ip = state.server_ip;
                 self.udp_proxy_available = state.udp_proxy_available;
                 self.ipv6_bypass_available = state.ipv6_bypass_available;
                 let udp_proxy_available = self.udp_proxy_available;
                 let ipv6_bypass_available = self.ipv6_bypass_available;
-                self.running = Some(state);
+                self.posture.commit_session(state);
                 self.active_config = Some(config.clone());
                 self.last_error = None;
                 let diag = ProxyStartedDiag {
@@ -961,15 +1075,16 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
             Err(ProxyError::Cancelled) => {
                 // User asked to cancel: release the cover (same trust as a user
                 // disconnect). Do NOT set last_error on cancel.
-                self.blocked = None;
+                drop(self.posture.take_pending());
                 info!("proxy start cancelled");
                 Err(ProxyError::Cancelled)
             }
             Err(e) => {
-                // Covered start failed: RETAIN the held cover (`self.blocked` keeps
-                // it, so its Drop does NOT run) — the host stays blocked, not leaked,
-                // until a later successful start, a user stop/cancel, or a bridge
-                // restart. A retry reuses this single held guard and its resolved IP.
+                // Covered start failed: RETAIN the held cover (the posture keeps
+                // it as `PendingStart`, so its Drop does NOT run) — the host stays
+                // blocked, not leaked, until a later successful start, a user
+                // stop/cancel, or a bridge restart. A retry reuses this single held
+                // guard and its resolved IP.
                 self.last_error = Some(e.to_string());
                 Err(e)
             }
@@ -1057,7 +1172,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         config: &ProxyConfig,
         server_ip: IpAddr,
         ech_doh: Option<crate::dns::ech::EchDoh>,
-        blocking_engaged: bool,
+        holder: CoverHolder,
         state_dir: Option<&std::path::Path>,
         owner: Option<(u32, u32)>,
         cancel: CancellationToken,
@@ -1071,8 +1186,8 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         // `server_ip` is resolved by the caller (`start_cancellable`) via private
         // DoH BEFORE this fn, so the fail-closed cover can be owned in the outer
         // scope — un-leakable by construction: `start_inner`'s many `?` exits
-        // cannot drop a cover they never hold. `blocking_engaged` is whether that
-        // outer cover is live for this start.
+        // cannot drop a cover they never hold. `holder` is that outer
+        // `Posture::cover_holder()` snapshot, taken before this call.
         let server_host = crate::dns::bootstrap::handoff_host(server_ip);
 
         // Phase 1: start plugin chain via Garter if a plugin is configured.
@@ -1299,7 +1414,10 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
             // connected cover) OR a pre-existing/adopted standing lockdown — either
             // means Hole's OWN cover would classify the probe's egress as blocked,
             // so suppress it to avoid misreporting our cover as censorship.
-            let cover_active = blocking_engaged || state_dir.map(lockdown_state::load_enabled).unwrap_or(false);
+            // `holder`'s `standing_engaged()` disjunct is provably dead here — a
+            // session can never reach `start_inner` — but the method stays total.
+            let cover_active =
+                holder.suppresses_reachability_probe(|| state_dir.map(lockdown_state::load_enabled).unwrap_or(false));
             let probe = (!cover_active).then(|| {
                 // The DoH-resolved IP, never the proxy domain: the reachability
                 // probe must not OS-resolve the hostname (that would reopen the
@@ -1499,102 +1617,110 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
     /// [`StopReason::Cutover`] disarms it so the persistent filters survive the
     /// restart and the new bridge re-adopts them. Routes/DNS/proxy/plugin tear
     /// down identically either way.
+    ///
+    /// One exhaustive match over the posture taken from `self`, replacing it
+    /// with `Idle` up front: `Idle` is a no-op; `PendingStart` decides the
+    /// held transient cover's fate by `reason` and returns; `Session` runs
+    /// the full teardown below. A user Disconnect DISENGAGES a cover — a user
+    /// stop means "open the host". A cutover DISARMS it instead: the
+    /// persistent filters survive the restart gap fail-closed (the new bridge
+    /// sweeps them in recover_cover, then re-engages on its covered
+    /// reconnect); dropping them here would open the host across the whole
+    /// gap.
     pub async fn stop_with(&mut self, reason: StopReason) -> Result<(), ProxyError> {
-        // Fate of a block-until-connected cover a failed covered start left engaged
-        // (the blocked state is precisely `running == None`, so this must run
-        // BEFORE the `running.take()` early-return below). A user Disconnect
-        // DISENGAGES it — a user stop means "open the host". A cutover DISARMS it
-        // instead: the persistent filters survive the restart gap fail-closed (the
-        // new bridge sweeps them in recover_cover, then re-engages on its covered
-        // reconnect); dropping them here would open the host across the whole gap.
-        // Either way clear the stale error/death so a Disconnect-from-blocked lands
-        // the same clean state a normal stop does.
-        if let Some(b) = self.blocked.take() {
-            match reason {
-                StopReason::UserStop => drop(b.cover),
-                StopReason::Cutover => b.cover.disarm(),
+        match std::mem::replace(&mut self.posture, Posture::Idle) {
+            Posture::Idle => Ok(()),
+            Posture::PendingStart(b) => {
+                // Fate of a block-until-connected cover a failed covered start
+                // left engaged. Clear the stale error/death so a
+                // Disconnect-from-blocked lands the same clean state a normal
+                // stop does.
+                match reason {
+                    StopReason::UserStop => drop(b.cover),
+                    StopReason::Cutover => b.cover.disarm(),
+                }
+                self.last_error = None;
+                self.death_reason = None;
+                Ok(())
             }
-            self.last_error = None;
-            self.death_reason = None;
+            Posture::Session(state) => {
+                let RunningState {
+                    dns,
+                    dispatcher,
+                    plugin_chain,
+                    proxy,
+                    routes,
+                    lockdown,
+                    server_ip: _,
+                    started_at: _,
+                    udp_proxy_available: _,
+                    ipv6_bypass_available: _,
+                    traffic_window: _,
+                } = state;
+
+                // 0. Restore system DNS FIRST (while routes + SS are still live
+                // so any in-flight OS queries egress via the restored resolver).
+                // Async shutdown — defuses the `DebugDropBomb` in `SystemDnsApplied`
+                // before the field drops. Skipping the await would panic in debug
+                // builds (catching missed-shutdown bugs at first test run).
+                if let Some(mut d) = dns {
+                    d.shutdown().await;
+                }
+
+                // 1. Shut down dispatcher (closes TUN, cancels all handlers).
+                if let Some(mut d) = dispatcher {
+                    d.shutdown().await;
+                }
+
+                // 2. Stop plugin chain: reap the tracked identities explicitly — the
+                // reap is the ONLY thing allowed to delete the state file, and only
+                // once it has accounted for every record — then drop, which just
+                // cancels the chain's token and aborts its task. Drop must not touch
+                // the file: the abort cannot know whether teardown finished, so a
+                // clear there would forget still-live plugins.
+                if let Some(ref chain) = plugin_chain {
+                    chain.kill_tracked();
+                }
+                drop(plugin_chain);
+
+                // 3. Graceful proxy shutdown (stops SS SOCKS5).
+                let res = proxy.stop().await;
+
+                // 4. Routes tear down via RAII Drop.
+                drop(routes);
+
+                // 5. Standing lockdown cover. A user stop disengages it (dropping the
+                // guard opens the host: Windows deletes the WFP filters, macOS restores
+                // pf). A cutover disarms it instead — the persistent filters survive the
+                // restart and the new bridge re-adopts them (decide_cover_recovery ==
+                // Adopt). Disarming a `None` cover is a no-op.
+                match (reason, lockdown) {
+                    (StopReason::UserStop, lk) => drop(lk),
+                    (StopReason::Cutover, Some(lk)) => lk.disarm(),
+                    (StopReason::Cutover, None) => {}
+                }
+
+                // Snapshot WFP + NDIS post-teardown. Emits warn when wintun-
+                // related references remain in either layer. Cheap and
+                // log-visible on user machines so bug reports carry the verdict
+                // without needing debug mode. Bridge owns the diagnostics
+                // module; tun-engine's SystemRoutes::drop can't call these.
+                #[cfg(target_os = "windows")]
+                {
+                    crate::diagnostics::wfp::log_snapshot("post-teardown");
+                    crate::diagnostics::ndis::log_snapshot("post-teardown");
+                }
+
+                // Clear any error from a previous failed start. See issue #142.
+                self.last_error = None;
+                self.death_reason = None;
+                self.active_config = None;
+                self.udp_proxy_available = true;
+                self.ipv6_bypass_available = true;
+                info!("proxy stopped");
+                res
+            }
         }
-        let Some(state) = self.running.take() else {
-            return Ok(());
-        };
-        let RunningState {
-            dns,
-            dispatcher,
-            plugin_chain,
-            proxy,
-            routes,
-            lockdown,
-            server_ip: _,
-            started_at: _,
-            udp_proxy_available: _,
-            ipv6_bypass_available: _,
-            traffic_window: _,
-        } = state;
-
-        // 0. Restore system DNS FIRST (while routes + SS are still live
-        // so any in-flight OS queries egress via the restored resolver).
-        // Async shutdown — defuses the `DebugDropBomb` in `SystemDnsApplied`
-        // before the field drops. Skipping the await would panic in debug
-        // builds (catching missed-shutdown bugs at first test run).
-        if let Some(mut d) = dns {
-            d.shutdown().await;
-        }
-
-        // 1. Shut down dispatcher (closes TUN, cancels all handlers).
-        if let Some(mut d) = dispatcher {
-            d.shutdown().await;
-        }
-
-        // 2. Stop plugin chain: reap the tracked identities explicitly — the
-        // reap is the ONLY thing allowed to delete the state file, and only
-        // once it has accounted for every record — then drop, which just
-        // cancels the chain's token and aborts its task. Drop must not touch
-        // the file: the abort cannot know whether teardown finished, so a
-        // clear there would forget still-live plugins.
-        if let Some(ref chain) = plugin_chain {
-            chain.kill_tracked();
-        }
-        drop(plugin_chain);
-
-        // 3. Graceful proxy shutdown (stops SS SOCKS5).
-        let res = proxy.stop().await;
-
-        // 4. Routes tear down via RAII Drop.
-        drop(routes);
-
-        // 5. Standing lockdown cover. A user stop disengages it (dropping the
-        // guard opens the host: Windows deletes the WFP filters, macOS restores
-        // pf). A cutover disarms it instead — the persistent filters survive the
-        // restart and the new bridge re-adopts them (decide_cover_recovery ==
-        // Adopt). Disarming a `None` cover is a no-op.
-        match (reason, lockdown) {
-            (StopReason::UserStop, lk) => drop(lk),
-            (StopReason::Cutover, Some(lk)) => lk.disarm(),
-            (StopReason::Cutover, None) => {}
-        }
-
-        // Snapshot WFP + NDIS post-teardown. Emits warn when wintun-
-        // related references remain in either layer. Cheap and
-        // log-visible on user machines so bug reports carry the verdict
-        // without needing debug mode. Bridge owns the diagnostics
-        // module; tun-engine's SystemRoutes::drop can't call these.
-        #[cfg(target_os = "windows")]
-        {
-            crate::diagnostics::wfp::log_snapshot("post-teardown");
-            crate::diagnostics::ndis::log_snapshot("post-teardown");
-        }
-
-        // Clear any error from a previous failed start. See issue #142.
-        self.last_error = None;
-        self.death_reason = None;
-        self.active_config = None;
-        self.udp_proxy_available = true;
-        self.ipv6_bypass_available = true;
-        info!("proxy stopped");
-        res
     }
 
     pub async fn reload(&mut self, config: &ProxyConfig) -> Result<(), ProxyError> {
@@ -1627,7 +1753,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         if structural_same {
             // Fast path: hot-swap filter rules without restart.
             let new_ruleset = crate::filter::rules::RuleSet::from_user_rules(&config.filters);
-            if let Some(ref state) = self.running {
+            if let Some(state) = self.posture.session() {
                 if let Some(ref dispatcher) = state.dispatcher {
                     dispatcher.swap_rules(new_ruleset);
                 }
@@ -1651,13 +1777,13 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
     /// instead. Not made async because every caller would then have to
     /// be made async too.
     pub fn check_health(&mut self) {
-        if let Some(state) = &self.running {
+        if let Some(state) = self.posture.session() {
             if !state.proxy.is_alive() {
                 error!("proxy task exited unexpectedly");
                 self.last_error = Some(DEATH_REASON.into());
                 // Path-free death reason for the GUI status/toast (#470).
                 self.death_reason = Some(DEATH_REASON);
-                self.running = None; // Drop tears down routes + clears state file
+                drop(self.posture.take_session()); // Drop tears down routes + clears state file
                 self.active_config = None;
                 self.udp_proxy_available = true;
                 self.ipv6_bypass_available = true;

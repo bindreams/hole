@@ -79,7 +79,9 @@ before editing; the sections linked below are the authoritative source.
   by `recover_routes` on next start. The escape from a stranded cover
   (`failclosed::release_all`) is unconditional and knows nothing about cover
   state; its only condition is whether a session is running, and turning the
-  kill switch off takes the same path. →
+  kill switch off takes the same path. Who holds a cover has exactly one
+  answer, derived once from `ProxyManager`'s single `posture` field
+  (`Posture::cover_holder`); no site recomputes it from session state. →
   [CONTRIBUTING.md#fail-closed-cover](CONTRIBUTING.md#fail-closed-cover)
 - **Logging & plugin diagnostics.** Log destinations, the WebView2/console-relay
   tee, `HOLE_BRIDGE_LOG` directives, and the plugin tap. →
