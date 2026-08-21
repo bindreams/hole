@@ -473,8 +473,11 @@ stale permit surviving, not a leaked block. Disclosed as a source comment on
 It is **name-agnostic** — it does *not* permit the TUN interface. The new
 bridge's start-time DNS-forwarder self-test runs over loopback to the SS client
 and out to the server IP, so loopback + server-IP permits suffice; app traffic
-into the (briefly absent) tunnel being blocked for the sub-second cover window is
-the accepted fail-closed cost.
+into the (briefly absent) tunnel being blocked for the cover window is the
+accepted fail-closed cost. That window is no longer sub-second: the gate's own
+bound is `TUNNEL_QUERY_TIMEOUT` per configured resolver (see "DNS forwarder"
+above), so a slow-but-live tunnel can hold the cover for seconds, not
+milliseconds.
 
 - **Windows** ([`routing/failclosed/windows.rs`](crates/tun-engine/src/routing/failclosed/windows.rs)):
   a persistent provider + sublayer + filter set installed in one FWPM

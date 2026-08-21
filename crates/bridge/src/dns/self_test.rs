@@ -82,45 +82,24 @@ pub(crate) const TAP_ENABLED_HINT: &str =
 pub(crate) const TAP_DISABLED_HINT: &str =
     "DNS self-test failed; the 'upstream failed' lines above carry the layer, cause and byte counts for every attempt. For per-connection byte flow through a plugin chain, set diagnostic_plugin_tap=true in AppConfig and restart the bridge";
 
-/// Per-upstream budget for one attempt, before dividing across a walk's
-/// width — see [`attempt_budget`].
-const PER_ATTEMPT: std::time::Duration = std::time::Duration::from_millis(1500);
-
-/// Per-upstream budget for a walk of `width` upstreams with `remaining` time
-/// left on the outer deadline, or `None` if there is not enough left for a
-/// real attempt.
-///
-/// `width == 0` needs no check: a zero-width walk dials nothing and returns
-/// immediately regardless of how much time is left, so its budget is
-/// irrelevant. Otherwise, checking the DERIVED per-upstream budget rather
-/// than `remaining` directly is what makes `remaining == 0` (deadline
-/// already passed) return `None` rather than a same-instant, zero-budget
-/// "attempt" per upstream in the walk — one that would still count toward
-/// `attempts` and log a `budget_ms=0` timeout with no dial behind it.
-/// `Duration`'s division is nanosecond-precise, so this only ever rounds a
-/// genuinely nonzero `remaining` down to zero when it's under `width`
-/// nanoseconds — in practice indistinguishable from the deadline having
-/// already passed.
-fn attempt_budget(remaining: std::time::Duration, width: usize) -> Option<std::time::Duration> {
-    if width == 0 {
-        return Some(PER_ATTEMPT);
-    }
-    let per_upstream = PER_ATTEMPT.min(remaining / width as u32);
-    (!per_upstream.is_zero()).then_some(per_upstream)
-}
-
-/// Run the forwarder self-test inline. Returns `SelfTestOutcome::Ok` when any
-/// well-formed non-SERVFAIL reply comes back within the 3×1500ms / 5s budget,
+/// Run the forwarder self-test inline: one walk, giving every configured
+/// resolver [`crate::dns::forwarder::TUNNEL_QUERY_TIMEOUT`] — the identical
+/// call [`crate::dns::forwarder::DnsForwarder::forward`] makes, so the gate
+/// can never be looser than what the runtime forwarder will then do. Returns
+/// `SelfTestOutcome::Ok` when any well-formed non-SERVFAIL reply comes back,
 /// else `Failed`.
 ///
-/// `PER_ATTEMPT` is handed to `try_forward` as the PER-UPSTREAM budget, shrunk
-/// so that a whole attempt (one walk of N resolvers) still fits inside what is
-/// left of `OUTER_BUDGET`. `ATTEMPTS` is therefore a maximum: the loop stops
-/// early rather than overrun. Also writes the canonical `"forwarder self-test
-/// ok"` / `"forwarder self-test failed"` log line at `info!`. On failure,
-/// additionally emits a `warn!` correlation breadcrumb pointing the reader to
-/// the plugin tap (depending on whether it was enabled this run — see
-/// `TAP_ENABLED_HINT` / `TAP_DISABLED_HINT`).
+/// No retry: at the shipped default of two-or-more resolvers, a single walk
+/// already contains one independent dial per resolver, so a retry's only
+/// unique contribution is at a single-resolver config — while its cost would
+/// fall on tunnels that are slow but working, which is the cohort this gate
+/// exists to stop mis-reporting. See the PR body for the full accounting.
+///
+/// Also writes the canonical `"forwarder self-test ok"` / `"forwarder
+/// self-test failed"` log line at `info!`. On failure, additionally emits a
+/// `warn!` correlation breadcrumb pointing the reader to the plugin tap
+/// (depending on whether it was enabled this run — see `TAP_ENABLED_HINT` /
+/// `TAP_DISABLED_HINT`).
 ///
 /// A blocking gate: called from `start_inner` BEFORE `Dispatcher::new` /
 /// `routing.install` / `Dns::apply`. A failure short-circuits the start;
@@ -132,16 +111,17 @@ pub(crate) async fn run_forwarder_self_test(
     diagnostic_tap_enabled: bool,
     cancel: CancellationToken,
 ) -> SelfTestOutcome {
-    const OUTER_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
-    const ATTEMPTS: u32 = 3;
-
     let Some(&first_server) = servers.first() else {
         info!("forwarder self-test skipped: no servers configured");
         return SelfTestOutcome::Ok { attempts: 0 };
     };
 
     let query = sample_self_test_query();
-    let started = std::time::Instant::now();
+    // A `tokio::time::Instant`, not `std::time::Instant`: `try_forward`'s own
+    // budget below is virtual-time, and mixing clocks made `elapsed_ms`
+    // unmeasurable under `tokio::time::pause()` in tests without affecting
+    // production.
+    let started = tokio::time::Instant::now();
     let before = forwarder.upstream_activity();
     // The gate is the forwarder's first user: `build_local_dns` constructs it
     // for this start, and the `Dispatcher` that drives the in-TUN endpoint is
@@ -151,67 +131,48 @@ pub(crate) async fn run_forwarder_self_test(
         crate::dns::forwarder::UpstreamActivity::default(),
         "the self-test gate must be the forwarder's first user"
     );
-    // The overall bound is a DEADLINE the loop respects, not a `timeout` around
-    // it. A wrapping timeout would cancel — i.e. drop — whichever `forward_one`
-    // was in flight, and a dropped future produces no `UpstreamErr`, so that
-    // upstream's failure would never be classified or logged. Bounding each
-    // attempt by what remains instead means every attempt runs to completion
-    // and nothing is discarded.
-    let deadline = tokio::time::Instant::now() + OUTER_BUDGET;
+    // Both latch: the reading spans the whole run, not just the walk's result.
     let mut last_err: Option<String> = None;
-    // Both latch: the reading spans the whole run, not the last attempt.
     let mut answered = false;
     let mut dialled = false;
-    let mut completed: u32 = 0;
+    let mut attempts: u32 = 0;
     let mut outcome = None;
 
-    for attempt in 1..=ATTEMPTS {
-        // Cooperative cancel check between retry attempts.
-        if cancel.is_cancelled() {
+    // The budget goes down into the forwarder so `forward_one`'s own deadline
+    // fires first, producing a classified `UpstreamErr` that
+    // `log_upstream_failure` can log. Cancel stays a `select!` arm:
+    // drop-on-cancel is the documented single exception in this module, since
+    // the forwarder's only in-flight resource is a socket that closes on
+    // Drop. No wrapping `timeout` around the whole call either, for the same
+    // reason: it would drop whichever `forward_one` was in flight, and a
+    // dropped future produces no `UpstreamErr`.
+    let result = tokio::select! {
+        biased;
+        _ = cancel.cancelled() => {
             outcome = Some(SelfTestOutcome::Cancelled);
-            break;
+            None
         }
-        // The width comes from the forwarder, not from `servers.len()`: it
-        // skips IPv6 entries without an IPv6 bypass, and counting those would
-        // shrink every surviving upstream's budget while leaving part of the
-        // deadline unused. `attempt_budget` stops the walk once there isn't
-        // enough of the deadline left for a real attempt.
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        let width = forwarder.attempted_upstreams();
-        let Some(per_upstream) = attempt_budget(remaining, width) else {
-            break;
-        };
-        // The budget goes down into the forwarder so `forward_one`'s own
-        // deadline fires first, producing a classified `UpstreamErr` that
-        // `log_upstream_failure` can log. Cancel stays a `select!` arm:
-        // drop-on-cancel is the documented single exception in this module,
-        // since the forwarder's only in-flight resource is a socket that
-        // closes on Drop.
-        let result = tokio::select! {
-            biased;
-            _ = cancel.cancelled() => {
-                outcome = Some(SelfTestOutcome::Cancelled);
-                break;
-            }
-            r = forwarder.try_forward(&query, per_upstream) => r,
-        };
-        completed = attempt;
+        r = forwarder.try_forward(&query, crate::dns::forwarder::TUNNEL_QUERY_TIMEOUT) => Some(r),
+    };
+
+    if let Some(result) = result {
+        attempts = 1;
         match result {
             Ok(reply) => {
                 dialled = true;
                 if is_dns_reply_ok(&reply) {
-                    outcome = Some(SelfTestOutcome::Ok { attempts: attempt });
-                    break;
-                }
-                // `is_dns_reply_ok` rejects on two independent grounds; say
-                // which, so a truncated answer is not reported as a resolver
-                // that returned SERVFAIL.
-                answered = true;
-                last_err = Some(if reply.len() < 12 {
-                    format!("a resolver answered with a malformed reply ({} bytes)", reply.len())
+                    outcome = Some(SelfTestOutcome::Ok { attempts });
                 } else {
-                    "a resolver answered with SERVFAIL".to_string()
-                });
+                    // `is_dns_reply_ok` rejects on two independent grounds;
+                    // say which, so a truncated answer is not reported as a
+                    // resolver that returned SERVFAIL.
+                    answered = true;
+                    last_err = Some(if reply.len() < 12 {
+                        format!("a resolver answered with a malformed reply ({} bytes)", reply.len())
+                    } else {
+                        "a resolver answered with SERVFAIL".to_string()
+                    });
+                }
             }
             Err(failure) => {
                 let msg = match failure {
@@ -224,12 +185,10 @@ pub(crate) async fn run_forwarder_self_test(
                         describe_upstream_failure(cause)
                     }
                 };
-                // Once a resolver has answered (even a rejected reply), that
-                // is the more informative, positive fact. A later attempt's
-                // unrelated failure must not clobber it — `classify_failure`
-                // forwards `last_err` verbatim whenever `answered` is set, so
-                // letting it drift to "no resolver answered" here would
-                // contradict the very reply already observed.
+                // `answered` can only be set in the `Ok` arm above, mutually
+                // exclusive with this one, so the guard is unconditionally
+                // true for a single walk — kept structural, not collapsed,
+                // because it must reactivate the instant a retry returns.
                 if !answered {
                     last_err = Some(msg);
                 }
@@ -239,8 +198,15 @@ pub(crate) async fn run_forwarder_self_test(
 
     let moved = forwarder.upstream_activity().since(before);
     let elapsed_ms = started.elapsed().as_millis() as u64;
+    // Reaching `Failed` with no `last_err` would mean the walk above neither
+    // succeeded nor classified a failure — every arm sets one or the other,
+    // so this is a contract check, not a real fallback.
+    debug_assert!(
+        outcome.is_some() || last_err.is_some(),
+        "a walk that ran must have classified an answer or a failure"
+    );
     let outcome = outcome.unwrap_or_else(|| SelfTestOutcome::Failed {
-        attempts: completed,
+        attempts,
         elapsed_ms,
         reason: classify_failure(
             Observed {
@@ -248,7 +214,7 @@ pub(crate) async fn run_forwarder_self_test(
                 dialled,
                 moved,
             },
-            last_err.unwrap_or_else(|| format!("no attempt completed within {OUTER_BUDGET:?}")),
+            last_err.unwrap_or_else(|| "no attempt completed".to_string()),
         ),
     });
 
@@ -326,8 +292,10 @@ pub(crate) struct Observed {
     /// A reply arrived at some point and was rejected (SERVFAIL, or too short
     /// to be a reply).
     pub(crate) answered: bool,
-    /// At least one upstream was dialled. `false` for a config whose every
-    /// server is skipped, or a run with no budget left to start an attempt.
+    /// At least one upstream was dialled. `false` only for a config whose
+    /// every server is skipped (all-IPv6 with no bypass) — a cancel fires
+    /// before the walk starts and short-circuits to `Cancelled` instead of
+    /// reaching `classify_failure` at all.
     pub(crate) dialled: bool,
     /// What the forwarder did during the run.
     pub(crate) moved: crate::dns::forwarder::UpstreamActivity,

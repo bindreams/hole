@@ -737,22 +737,6 @@ impl DnsForwarder {
             .unwrap_or_else(|_| synthesize_servfail(query))
     }
 
-    /// How many configured upstreams a walk will ACTUALLY attempt. IPv6 entries
-    /// are skipped without an IPv6 bypass, so this can be less than
-    /// `servers.len()` — and zero, for an all-IPv6 config on an IPv4-only host,
-    /// where a walk returns `NoUpstream` without dialling anything.
-    ///
-    /// A caller that owns a total budget divides by this to size the
-    /// `per_upstream` it passes to [`Self::try_forward`]. The skip rule lives
-    /// here, next to the loop that applies it, so a caller cannot drift from it.
-    pub fn attempted_upstreams(&self) -> usize {
-        self.config
-            .servers
-            .iter()
-            .filter(|s| !s.is_ipv6() || self.ipv6_bypass_available)
-            .count()
-    }
-
     /// [`Self::forward`] without the SERVFAIL synthesis: reports *why* no
     /// upstream answered. Per-server failures are logged by the same throttle
     /// either way; the returned cause is the highest-ranked one observed

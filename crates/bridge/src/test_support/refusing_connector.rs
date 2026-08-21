@@ -169,6 +169,81 @@ impl UpstreamConnector for RefusingConnector {
     }
 }
 
+// Gated ===============================================================================================================
+
+/// Publishes a signal the instant `connect_tcp` is entered, blocks until
+/// released, then answers one length-prefixed DNS reply from memory and stays
+/// pending — the shape a "slow but alive" gate test needs: rendezvous on the
+/// connect having started, advance virtual time under that rendezvous (not a
+/// timer), then release and observe the reply arrive.
+///
+/// Socket-free, like [`HangThenAnswer`] / [`SilentConnector`] — see their docs
+/// for why: a real loopback socket would race its own I/O readiness against
+/// `tokio::time::pause()`'s auto-advance.
+#[derive(Debug)]
+pub(crate) struct GatedConnector {
+    connect_requested: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    release: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+    reply: Vec<u8>,
+}
+
+impl GatedConnector {
+    /// `(connector, connect_requested, release)` — publishes on
+    /// `connect_requested` the moment `connect_tcp` is entered, blocks until
+    /// `release` is sent, then answers one length-prefixed DNS query with
+    /// `reply`, entirely in memory.
+    pub(crate) fn new(
+        reply: Vec<u8>,
+    ) -> (
+        std::sync::Arc<Self>,
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (requested_tx, requested_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        (
+            std::sync::Arc::new(Self {
+                connect_requested: Mutex::new(Some(requested_tx)),
+                release: Mutex::new(Some(release_rx)),
+                reply,
+            }),
+            requested_rx,
+            release_tx,
+        )
+    }
+}
+
+#[async_trait::async_trait]
+impl UpstreamConnector for GatedConnector {
+    async fn connect_tcp(&self, _target: SocketAddr) -> io::Result<ConnectedStream> {
+        if let Some(tx) = self.connect_requested.lock().expect("poisoned").take() {
+            let _ = tx.send(());
+        }
+        let release = self
+            .release
+            .lock()
+            .expect("poisoned")
+            .take()
+            .expect("GatedConnector::connect_tcp called more than once");
+        let _ = release.await;
+
+        let mut framed = Vec::with_capacity(2 + self.reply.len());
+        framed.extend_from_slice(&(self.reply.len() as u16).to_be_bytes());
+        framed.extend_from_slice(&self.reply);
+
+        let counting = CountingStream::new(CannedReplyStream { remaining: framed });
+        let counters = counting.counters();
+        Ok(ConnectedStream {
+            stream: Box::new(counting),
+            counters,
+        })
+    }
+
+    async fn connect_udp(&self, _target: SocketAddr) -> io::Result<Box<dyn UpstreamUdp>> {
+        std::future::pending().await
+    }
+}
+
 // Silent ==============================================================================================================
 
 /// Connects, accepts writes, and never delivers a byte back — the shape of a

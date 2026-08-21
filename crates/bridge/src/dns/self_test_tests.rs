@@ -7,45 +7,13 @@ use super::*;
 use crate::dns::forwarder::{DnsForwarder, UpstreamActivity, UpstreamCause};
 use crate::reachability::ReachabilityVerdict;
 use crate::test_support::log_capture::VecWriter;
-use crate::test_support::refusing_connector::{HangingConnector, RefusingConnector, SilentConnector};
+use crate::test_support::refusing_connector::{
+    GatedConnector, HangThenAnswer, HangingConnector, RefusingConnector, SilentConnector,
+};
 use hole_common::config::{DnsConfig, DnsProtocol};
 use std::sync::Arc as SArc;
 use tracing_subscriber::fmt;
 use tracing_subscriber::layer::{Layer, SubscriberExt};
-
-/// Regression: a nonzero `remaining` too small to divide evenly across
-/// `width` must stop the walk, not fire a same-instant, zero-budget
-/// "attempt" per upstream — see `attempt_budget`'s own doc. `Duration`
-/// divides at nanosecond precision, so the rounds-to-zero case needs
-/// `remaining` under `width` NANOSECONDS, not milliseconds.
-#[skuld::test]
-fn attempt_budget_stops_before_a_zero_length_attempt() {
-    assert_eq!(super::attempt_budget(std::time::Duration::from_nanos(1), 2), None);
-    assert_eq!(super::attempt_budget(std::time::Duration::ZERO, 1), None);
-}
-
-#[skuld::test]
-fn attempt_budget_divides_remaining_across_the_walk_width() {
-    assert_eq!(
-        super::attempt_budget(std::time::Duration::from_millis(3000), 2),
-        Some(std::time::Duration::from_millis(1500))
-    );
-    // Capped at PER_ATTEMPT even with plenty of time left.
-    assert_eq!(
-        super::attempt_budget(std::time::Duration::from_secs(10), 1),
-        Some(std::time::Duration::from_millis(1500))
-    );
-}
-
-/// `width == 0` dials nothing, so it needs no time budget at all — not even
-/// when `remaining` is already exhausted.
-#[skuld::test]
-fn attempt_budget_ignores_remaining_when_width_is_zero() {
-    assert_eq!(
-        super::attempt_budget(std::time::Duration::ZERO, 0),
-        Some(std::time::Duration::from_millis(1500))
-    );
-}
 
 fn test_dns_cfg() -> DnsConfig {
     DnsConfig {
@@ -315,76 +283,6 @@ fn read_without_answered_overrides_a_stale_no_resolver_answered_message() {
         SelfTestReason::Other(s) => assert!(
             !s.contains("no resolver answered"),
             "47 bytes came back; the message must not claim silence, got: {s}"
-        ),
-        other => panic!("expected Other, got {other:?}"),
-    }
-}
-
-/// A connector that answers exactly once through a real stub, then refuses —
-/// models a resolver that replies SERVFAIL and then goes dark on later
-/// self-test attempts.
-struct AnswersOnceThenRefuses {
-    inner: SArc<dyn crate::dns::connector::UpstreamConnector>,
-    calls: std::sync::atomic::AtomicU32,
-}
-
-#[async_trait::async_trait]
-impl crate::dns::connector::UpstreamConnector for AnswersOnceThenRefuses {
-    async fn connect_tcp(
-        &self,
-        target: std::net::SocketAddr,
-    ) -> std::io::Result<crate::dns::connector::ConnectedStream> {
-        self.inner.connect_tcp(target).await
-    }
-
-    async fn connect_udp(
-        &self,
-        target: std::net::SocketAddr,
-    ) -> std::io::Result<Box<dyn crate::dns::connector::UpstreamUdp>> {
-        if self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
-            self.inner.connect_udp(target).await
-        } else {
-            Err(std::io::Error::new(
-                std::io::ErrorKind::ConnectionRefused,
-                "refuses every attempt after the first",
-            ))
-        }
-    }
-}
-
-/// Regression: attempt 1 gets a real SERVFAIL reply (latching `answered`
-/// with an informative message); attempts 2 and 3 can't even connect. The
-/// informative message must survive — a later, unrelated attempt's failure
-/// must not overwrite it with a "no resolver answered" claim that
-/// contradicts the reply already observed.
-#[skuld::test]
-fn an_earlier_servfail_answer_is_not_clobbered_by_a_later_failed_attempt() {
-    let outcome = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap()
-        .block_on(async {
-            let (addr, _stub) = servfail_udp_stub().await;
-            let cfg = DnsConfig {
-                servers: vec![addr.ip()],
-                protocol: DnsProtocol::PlainUdp,
-                ..test_dns_cfg()
-            };
-            let connector = SArc::new(AnswersOnceThenRefuses {
-                inner: SArc::new(crate::dns::connector::DirectConnector),
-                calls: std::sync::atomic::AtomicU32::new(0),
-            });
-            let forwarder = SArc::new(DnsForwarder::new_with_ports(cfg, connector, true, vec![addr.port()]));
-            run_forwarder_self_test(forwarder, vec![addr.ip()], false, CancellationToken::new()).await
-        });
-
-    let SelfTestOutcome::Failed { reason, .. } = outcome else {
-        panic!("expected Failed, got {outcome:?}");
-    };
-    match reason {
-        SelfTestReason::Other(s) => assert!(
-            s.contains("SERVFAIL"),
-            "the earlier answer must survive later attempts' failures; got: {s}"
         ),
         other => panic!("expected Other, got {other:?}"),
     }
@@ -764,18 +662,22 @@ fn self_test_failure_logs_the_typed_upstream_cause() {
         "expected 'cause=unreachable'; got:\n{output}"
     );
     assert!(
-        output.contains("budget_ms=1500"),
+        output.contains(&format!(
+            "budget_ms={}",
+            crate::dns::forwarder::TUNNEL_QUERY_TIMEOUT.as_millis()
+        )),
         "the WARN must report the SELF-TEST's budget, proving it reached forward_one; got:\n{output}"
     );
 }
 
-/// The overall budget is a deadline the loop respects, so a self-test whose
-/// upstreams all hang stops ON TIME, reports the real typed failure, and
-/// counts only the attempts that ran. Virtual time: the connector never
+/// A walk gives EVERY resolver the full per-resolver bound and nothing
+/// shared: two hanging upstreams cost exactly `2 × TUNNEL_QUERY_TIMEOUT`, not
+/// a deadline divided between them (there is no deadline any more — no
+/// retry, so nothing to divide it across). Virtual time: the connector never
 /// completes, so every `forward_one` budget expires via auto-advance and no
 /// wall-clock is consumed.
 #[skuld::test]
-fn self_test_respects_the_overall_deadline_and_reports_the_real_failure() {
+fn self_test_gives_every_hanging_resolver_the_full_bound() {
     let (outcome, elapsed) = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -793,19 +695,14 @@ fn self_test_respects_the_overall_deadline_and_reports_the_real_failure() {
             (outcome, t0.elapsed())
         });
 
-    // Unbounded, this would cost ATTEMPTS × servers × PER_ATTEMPT = 9s; the
-    // deadline must cut it near 5s. tokio rounds every timer deadline UP to
-    // a whole millisecond and the loop arms at most one per upstream per
-    // attempt, so allow exactly that many milliseconds of overshoot.
-    const UNBOUNDED: std::time::Duration = std::time::Duration::from_secs(9);
-    let quantization = std::time::Duration::from_millis(3 * 2);
+    // tokio rounds every timer deadline UP to a whole millisecond and the
+    // walk arms one timeout per upstream, so allow that many milliseconds of
+    // overshoot across the two.
+    let quantization = std::time::Duration::from_millis(2);
+    let expected = 2 * crate::dns::forwarder::TUNNEL_QUERY_TIMEOUT;
     assert!(
-        elapsed < UNBOUNDED,
-        "the deadline must truncate the retry sequence; took {elapsed:?}"
-    );
-    assert!(
-        elapsed <= std::time::Duration::from_secs(5) + quantization,
-        "the loop must stop at the overall deadline; took {elapsed:?}"
+        elapsed >= expected && elapsed <= expected + quantization,
+        "a walk of two hanging resolvers must cost exactly 2 x TUNNEL_QUERY_TIMEOUT; took {elapsed:?}, expected ~{expected:?}"
     );
     match outcome {
         SelfTestOutcome::Failed { reason, attempts, .. } => {
@@ -817,13 +714,174 @@ fn self_test_respects_the_overall_deadline_and_reports_the_real_failure() {
             // reserved for connects that failed outright, pinned by
             // `a_definite_connect_failure_is_still_reported_as_no_connection`.
             assert!(matches!(reason, SelfTestReason::TunnelSetupPending), "got {reason:?}");
+            assert_eq!(attempts, 1, "one walk, so exactly one attempt is counted");
+        }
+        other => panic!("expected Failed, got {other:?}"),
+    }
+}
+
+fn noerror_reply() -> Vec<u8> {
+    let mut reply = vec![0u8; 12];
+    reply[3] = 0x00; // RCODE = 0 (NoError)
+    reply
+}
+
+/// **Load-bearing regression for #771.** A transport that is alive but slow —
+/// 5s into establishing, well past the deleted 1500ms attempt budget and the
+/// deleted 3000ms outer budget, but under the 10s `TUNNEL_QUERY_TIMEOUT` —
+/// must pass the gate rather than being refused as dead.
+#[skuld::test]
+fn a_slow_but_alive_transport_passes_the_gate() {
+    // Current-thread runtime with `tokio::time::pause()`: the whole test runs
+    // on virtual time, so a 5s establishment costs no real wall-clock time.
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            tokio::time::pause();
+            let t0 = tokio::time::Instant::now();
+            let (connector, connect_requested, release) = GatedConnector::new(noerror_reply());
+            let cfg = DnsConfig {
+                protocol: DnsProtocol::PlainTcp,
+                ..test_dns_cfg()
+            };
+            let forwarder = SArc::new(DnsForwarder::new(cfg, connector, false));
+            let run = tokio::spawn(run_forwarder_self_test(
+                forwarder,
+                vec!["127.0.0.1".parse().unwrap()],
+                false,
+                CancellationToken::new(),
+            ));
+
+            // Rendezvous on the connect having genuinely started, not a timer.
+            connect_requested.await.expect("connect_tcp was entered");
+            assert_eq!(
+                t0.elapsed(),
+                std::time::Duration::ZERO,
+                "no virtual time may pass before the connect is even in flight"
+            );
+            // The rendezvous-then-advance ordering with no `.await` between
+            // them is what makes this deterministic: inserting one would let
+            // `tokio::time::pause()`'s auto-advance race ahead to the 10s
+            // deadline before this deliberate 5s step runs.
+            tokio::time::advance(std::time::Duration::from_secs(5)).await;
+            let _ = release.send(());
+
+            let outcome = run.await.unwrap();
             assert!(
-                (1..=3).contains(&attempts),
-                "attempts must count what actually ran; got {attempts}"
+                matches!(outcome, SelfTestOutcome::Ok { attempts: 1 }),
+                "got {outcome:?}"
+            );
+        });
+}
+
+/// finding-11 guard at the gate: a hung primary must not strand the
+/// secondary. `HangThenAnswer` hangs `connect_tcp` for the primary and
+/// answers the secondary in-process, so the walk's own failover (not a
+/// retry) is what passes the gate.
+#[skuld::test]
+fn a_slow_first_resolver_falls_through_to_a_healthy_second() {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            tokio::time::pause();
+            let servers: Vec<std::net::IpAddr> = vec!["127.0.0.1".parse().unwrap(), "127.0.0.2".parse().unwrap()];
+            let ports = vec![11000u16, 11001u16];
+            let cfg = DnsConfig {
+                servers: servers.clone(),
+                protocol: DnsProtocol::PlainTcp,
+                ..test_dns_cfg()
+            };
+            let hang = vec![std::net::SocketAddr::new(servers[0], ports[0])];
+            let connector = HangThenAnswer::new(hang, &noerror_reply());
+            let forwarder = SArc::new(DnsForwarder::new_with_ports(cfg, connector, false, ports));
+            let outcome = run_forwarder_self_test(forwarder, servers, false, CancellationToken::new()).await;
+            assert!(
+                matches!(outcome, SelfTestOutcome::Ok { attempts: 1 }),
+                "got {outcome:?}"
+            );
+        });
+}
+
+/// Pins the classification AND the reported duration for a single hanging
+/// resolver — distinct from `self_test_gives_every_hanging_resolver_the_full_bound`,
+/// which pins the WALL elapsed of the whole call across two resolvers.
+#[skuld::test]
+fn a_transport_that_never_establishes_is_reported_as_pending_setup() {
+    let outcome = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            tokio::time::pause();
+            let forwarder = SArc::new(DnsForwarder::new(test_dns_cfg(), SArc::new(HangingConnector), false));
+            run_forwarder_self_test(
+                forwarder,
+                vec!["127.0.0.1".parse().unwrap()],
+                false,
+                CancellationToken::new(),
+            )
+            .await
+        });
+    match outcome {
+        SelfTestOutcome::Failed {
+            reason,
+            attempts,
+            elapsed_ms,
+        } => {
+            assert!(matches!(reason, SelfTestReason::TunnelSetupPending), "got {reason:?}");
+            assert_eq!(attempts, 1);
+            // tokio rounds every timer deadline UP to a whole millisecond.
+            let bound_ms = crate::dns::forwarder::TUNNEL_QUERY_TIMEOUT.as_millis() as u64;
+            assert!(
+                (bound_ms..=bound_ms + 1).contains(&elapsed_ms),
+                "expected elapsed_ms in [{bound_ms}, {}], got {elapsed_ms}",
+                bound_ms + 1
             );
         }
         other => panic!("expected Failed, got {other:?}"),
     }
+}
+
+/// A cancel that fires while the connect is still establishing must report
+/// `Cancelled` immediately — not after waiting out `TUNNEL_QUERY_TIMEOUT`.
+#[skuld::test]
+fn a_cancel_during_establishment_reports_cancelled_without_waiting_out_the_bound() {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            tokio::time::pause();
+            let t0 = tokio::time::Instant::now();
+            let (connector, connect_requested, _release) = GatedConnector::new(noerror_reply());
+            let cfg = DnsConfig {
+                protocol: DnsProtocol::PlainTcp,
+                ..test_dns_cfg()
+            };
+            let forwarder = SArc::new(DnsForwarder::new(cfg, connector, false));
+            let cancel = CancellationToken::new();
+            let run = tokio::spawn(run_forwarder_self_test(
+                forwarder,
+                vec!["127.0.0.1".parse().unwrap()],
+                false,
+                cancel.clone(),
+            ));
+
+            connect_requested.await.expect("connect_tcp was entered");
+            cancel.cancel();
+            let outcome = run.await.unwrap();
+
+            assert!(matches!(outcome, SelfTestOutcome::Cancelled), "got {outcome:?}");
+            assert_eq!(
+                t0.elapsed(),
+                std::time::Duration::ZERO,
+                "cancelling mid-establishment must not wait out any bound"
+            );
+        });
 }
 
 /// Empty servers → `run_forwarder_self_test` logs `skipped` and
@@ -861,7 +919,7 @@ fn self_test_empty_servers_returns_ok_zero() {
 }
 
 /// Dead upstream → `run_forwarder_self_test` returns
-/// `SelfTestOutcome::Failed { attempts: 3, .. }` and logs `forwarder
+/// `SelfTestOutcome::Failed { attempts: 1, .. }` and logs `forwarder
 /// self-test failed` at INFO. `into_result` then maps that to
 /// `ProxyError::ForwarderSelfTestFailed`.
 #[skuld::test]
@@ -892,13 +950,13 @@ fn self_test_dead_upstream_returns_failed() {
             let SelfTestOutcome::Failed { attempts, reason, .. } = outcome else {
                 panic!("expected Failed");
             };
-            assert_eq!(attempts, 3);
+            assert_eq!(attempts, 1);
             assert!(matches!(reason, SelfTestReason::NoConnection), "got {reason:?}");
             let err = self_test_error_for(None, attempts, 4500, reason);
             assert!(matches!(
                 err,
                 ProxyError::NoTunnelConnection {
-                    attempts: 3,
+                    attempts: 1,
                     elapsed_ms: 4500
                 }
             ));
