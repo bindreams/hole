@@ -11,10 +11,10 @@ nextest-version = "0.9.130"
 # `windows_lockdown_permits_server_ip_and_blocks_other_egress` test holds a
 # system-wide block-all WFP cover, so without this they race on global state.
 # `max-threads = 1` makes nextest run the whole group on one thread across
-# binaries. On macOS the bridge TUN e2es are `cfg(windows)` so there is no
-# macOS bridge partner today; the `macos_lockdown_permits_server_ip_...` pf test
-# still joins the group for free (and is auto-grouped against any future macOS
-# bridge TUN e2e).
+# binaries. On macOS the bridge TUN e2es are `cfg(windows)`, but the bridge's
+# `dispatcher_opens_tun_device_the_os_accepts` creates a real device on every
+# platform, so it is the macOS partner for the `macos_lockdown_permits_server_ip_...`
+# pf test.
 #
 # COUPLED NAMES — the filter below matches tests BY NAME SUBSTRING. These names
 # are load-bearing and must change in lockstep with the filter:
@@ -30,6 +30,8 @@ nextest-version = "0.9.130"
 #     crates/tun-engine/src/routing/failclosed/release_privileged_tests.rs
 #     crates/tun-engine/src/routing/failclosed/macos_tests.rs
 #     crates/tun-engine/src/routing/failclosed/windows_tests.rs
+#   - `dispatcher_opens_tun_` prefix (real TUN device create/destroy):
+#     crates/bridge/src/dispatcher_privileged_tests.rs
 #   - `cutover_global_net_state_` prefix:
 #     crates/bridge/tests/cutover_privileged.rs (real cutover swap + SCM restart)
 #     crates/bridge/tests/cutover_leak_privileged.rs (fail-open + both-covers)
@@ -42,5 +44,5 @@ nextest-version = "0.9.130"
 max-threads = 1
 
 [[profile.default.overrides]]
-filter = 'test(/_full_tunnel_roundtrip$/) + test(/windows_lockdown_permits_server_ip_/) + test(/macos_lockdown_permits_server_ip_/) + test(/failclosed_permits_/) + test(/release_all_/) + test(/cutover_global_net_state_/)'
+filter = 'test(/_full_tunnel_roundtrip$/) + test(/windows_lockdown_permits_server_ip_/) + test(/macos_lockdown_permits_server_ip_/) + test(/failclosed_permits_/) + test(/release_all_/) + test(/dispatcher_opens_tun_/) + test(/cutover_global_net_state_/)'
 test-group = 'global-net-state'

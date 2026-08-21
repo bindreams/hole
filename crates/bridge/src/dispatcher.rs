@@ -192,3 +192,7 @@ impl Drop for Dispatcher {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "dispatcher_privileged_tests.rs"]
+mod dispatcher_privileged_tests;
