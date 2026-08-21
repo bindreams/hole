@@ -143,11 +143,15 @@ pub enum ForwardFailure {
 /// `!Clone`, so `UpstreamErr` cannot be `Clone` — consumed once on the
 /// log path.
 ///
-/// At 136 bytes it travels as `Box<UpstreamErr>`: the transports return it
-/// through five nested `async fn` frames, so unboxed it would widen every
-/// future on the DNS path to carry a failure that is almost never taken.
-/// `?` boxes on its own via `impl<T> From<T> for Box<T>`; only the tail
-/// expressions wrap explicitly.
+/// At 136 bytes it travels as [`ForwardResult`]'s boxed `Err`: the
+/// transports return it through five nested `async fn` frames, so unboxed
+/// it would widen every future on the DNS path to carry a failure that is
+/// almost never taken. `?` boxes on its own via `impl<T> From<T> for
+/// Box<T>`; only the tail expressions wrap explicitly. Boxing is also why
+/// growing this struct no longer trips `clippy::result_large_err` —
+/// [`ForwardResult`]'s own size assertion is the guard that actually
+/// matters; the assertion below is a secondary budget so growth here stays
+/// deliberate.
 #[derive(Debug)]
 pub struct UpstreamErr {
     pub layer: UpstreamLayer,
@@ -219,6 +223,30 @@ impl UpstreamErr {
         }
     }
 }
+
+/// `UpstreamErr` once travelled unboxed in a `Result` and crept past
+/// `clippy::result_large_err`'s 128-byte default on some target platforms
+/// but not others, so whether CI went red depended only on which toolchain
+/// happened to run — see [`ForwardResult`] for the actual fix. This struct
+/// itself was left at its size rather than shrunk, so this budget exists
+/// purely to keep further growth deliberate: nothing else will catch it now.
+/// Box a new field into its own allocation to keep this flat, or raise the
+/// number if the growth is intentional.
+const _: () = assert!(
+    std::mem::size_of::<UpstreamErr>() <= 136,
+    "UpstreamErr grew past its 136-byte budget — see the doc comment above"
+);
+
+/// The `Result` every DNS-forward transport (`forward_one` and its four
+/// per-protocol callees) returns. Boxing the error here, not shrinking
+/// `UpstreamErr`, is what keeps `clippy::result_large_err` from firing
+/// again; this assertion enforces that structurally on every compile,
+/// rather than leaving it to whichever clippy a contributor happens to run.
+pub(crate) type ForwardResult = Result<Vec<u8>, Box<UpstreamErr>>;
+const _: () = assert!(
+    std::mem::size_of::<ForwardResult>() <= 128,
+    "ForwardResult's Err came unboxed again — box it, don't just widen this budget"
+);
 
 /// What a forwarder has done upstream, cumulative over its lifetime and counted
 /// whether the attempt succeeded, failed or was cancelled by its budget.
@@ -699,12 +727,7 @@ impl DnsForwarder {
     /// [`AttemptProbe`], so the diagnostic fields mean the same thing on every
     /// layer. The bytes the attempt moved fold into the forwarder's cumulative
     /// totals whether it succeeded or not.
-    async fn forward_one(
-        &self,
-        target: SocketAddr,
-        query: &[u8],
-        budget: Duration,
-    ) -> Result<Vec<u8>, Box<UpstreamErr>> {
+    async fn forward_one(&self, target: SocketAddr, query: &[u8], budget: Duration) -> ForwardResult {
         let started = Instant::now();
         let probe = AttemptProbe::default();
         let fut = async {
@@ -832,12 +855,7 @@ fn default_port(protocol: DnsProtocol) -> u16 {
 // Transport: plain UDP ================================================================================================
 
 impl DnsForwarder {
-    async fn forward_udp(
-        &self,
-        target: SocketAddr,
-        query: &[u8],
-        probe: &AttemptProbe,
-    ) -> Result<Vec<u8>, Box<UpstreamErr>> {
+    async fn forward_udp(&self, target: SocketAddr, query: &[u8], probe: &AttemptProbe) -> ForwardResult {
         let socket = self
             .connector
             .connect_udp(target)
@@ -863,12 +881,7 @@ impl DnsForwarder {
 // Transport: plain TCP ================================================================================================
 
 impl DnsForwarder {
-    async fn forward_tcp(
-        &self,
-        target: SocketAddr,
-        query: &[u8],
-        probe: &AttemptProbe,
-    ) -> Result<Vec<u8>, Box<UpstreamErr>> {
+    async fn forward_tcp(&self, target: SocketAddr, query: &[u8], probe: &AttemptProbe) -> ForwardResult {
         let socks5_start = Instant::now();
         let connected = self
             .connector
@@ -886,12 +899,7 @@ impl DnsForwarder {
 // Transport: DoT (TLS over TCP) =======================================================================================
 
 impl DnsForwarder {
-    async fn forward_tls(
-        &self,
-        target: SocketAddr,
-        query: &[u8],
-        probe: &AttemptProbe,
-    ) -> Result<Vec<u8>, Box<UpstreamErr>> {
+    async fn forward_tls(&self, target: SocketAddr, query: &[u8], probe: &AttemptProbe) -> ForwardResult {
         let socks5_start = Instant::now();
         let connected = self
             .connector
@@ -919,12 +927,7 @@ impl DnsForwarder {
 // Transport: DoH (HTTP/1.1 over TLS) ==================================================================================
 
 impl DnsForwarder {
-    async fn forward_https(
-        &self,
-        target: SocketAddr,
-        query: &[u8],
-        probe: &AttemptProbe,
-    ) -> Result<Vec<u8>, Box<UpstreamErr>> {
+    async fn forward_https(&self, target: SocketAddr, query: &[u8], probe: &AttemptProbe) -> ForwardResult {
         let (server_name, path_and_host) =
             https_target_for(target.ip()).map_err(|e| UpstreamErr::new(UpstreamLayer::Http, e))?;
 
