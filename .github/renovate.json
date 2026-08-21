@@ -117,6 +117,27 @@
       "matchManagers": ["gomod"],
       "matchDepNames": ["github.com/v2fly/v2ray-core/v5", "github.com/refraction-networking/utls"],
       "enabled": false
+    },
+    {
+      "description": "Rust compiler: its own reviewable PR, never automerged. A compiler bump lands new default-on clippy lints across the whole workspace at once (#855), so it must not ride in a batch. `groupName: null` un-groups it; `automerge: false` overrides the major-updates rule above, which matches every manager including this one. Last rule wins — these compiler rules must stay LAST in this array.",
+      "matchManagers": ["rust-toolchain"],
+      "matchDepNames": ["rust"],
+      "groupName": null,
+      "automerge": false
+    },
+    {
+      "description": "Go compiler: `crates/ex-ray/go.mod`'s `toolchain` directive (what actions/setup-go installs) and its `go` directive (the language level) move in ONE PR. Split across two PRs they can transiently land as `go` > `toolchain`, which the Go tool rejects and `gomodTidy` then fails on. Never automerged, same reason as Rust.",
+      "matchManagers": ["gomod"],
+      "matchDepNames": ["go"],
+      "groupName": "Go toolchain",
+      "automerge": false
+    },
+    {
+      "description": "The `go` directive is a range under `go-mod-directive` versioning, so the default `replace` strategy yields no update — `bump` is the documented opt-in. Scoped to depType `golang`; the `toolchain` directive is an exact semver and needs no strategy override.",
+      "matchManagers": ["gomod"],
+      "matchDepNames": ["go"],
+      "matchDepTypes": ["golang"],
+      "rangeStrategy": "bump"
     }
   ]
 }

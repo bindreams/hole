@@ -5,9 +5,12 @@ go 1.25.5
 // The Go pin, for every consumer at once: `go` itself honours this locally, so
 // a bare `go build` cannot silently use whatever is first on PATH, and
 // `actions/setup-go` prefers it over the `go` directive above, so CI and the
-// released binary are built by the same release. `go 1.25.5` stays the language
-// level. Note setup-go only reads this while `GOTOOLCHAIN` is unset — presetting
-// it to `local` in a workflow would silently drop CI back to 1.25.5.
+// released binary are built by the same release. Renovate tracks both
+// directives (depName `go`, gomod manager) and bumps them together in the "Go
+// toolchain" group, never automerged — see .github/renovate.json. Note
+// setup-go only reads this while `GOTOOLCHAIN` is unset — presetting it to
+// `local` in a workflow would silently drop CI back to the `go` directive's
+// version.
 toolchain go1.26.6
 
 require (
