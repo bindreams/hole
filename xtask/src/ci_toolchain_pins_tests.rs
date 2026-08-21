@@ -71,22 +71,93 @@ fn reader_matching_its_checkout_if_is_clean() {
     assert_eq!(audit_checkout_gating("f.yaml", yaml, &BTreeMap::new()).unwrap(), vec![]);
 }
 
-/// This is #859 verbatim: a checkout gated on a condition, followed by an
-/// unconditional read of a file that checkout produces.
+/// A checkout gated on a condition, followed by an unconditional read of a
+/// file that checkout produces.
 #[skuld::test]
 fn ungated_reader_after_conditional_checkout_is_flagged() {
     let yaml = "jobs:\n  a:\n    steps:\n      - uses: actions/checkout@v7\n        if: ${{ inputs.x }}\n      - name: read\n        id: rust-version\n        run: sed rust-toolchain.toml >> \"$GITHUB_OUTPUT\"\n";
     let found = audit_checkout_gating("f.yaml", yaml, &BTreeMap::new()).unwrap();
     assert_eq!(found.len(), 1, "{found:?}");
     assert_eq!(found[0].step, "rust-version");
-    assert_eq!(found[0].checkout_if.as_deref(), Some("${{ inputs.x }}"));
+    assert_eq!(found[0].depends_on_if.as_deref(), Some("${{ inputs.x }}"));
     assert_eq!(found[0].step_if, None);
 }
 
+/// A job with no `actions/checkout` step at all has an empty workspace, so a
+/// root-relative read there is a guaranteed failure — not an exemption.
 #[skuld::test]
-fn reader_with_no_preceding_checkout_is_skipped() {
+fn reader_with_no_preceding_checkout_in_a_job_is_flagged() {
     let yaml =
         "jobs:\n  a:\n    steps:\n      - name: read\n        run: sed rust-toolchain.toml >> \"$GITHUB_OUTPUT\"\n";
+    let found = audit_checkout_gating("f.yaml", yaml, &BTreeMap::new()).unwrap();
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!(found[0].depends_on_if, None);
+}
+
+/// The likeliest way to reintroduce #859's shape: a reader placed above the
+/// checkout it was meant to follow. At the point the reader runs, no
+/// checkout has happened yet in this job, regardless of what comes later.
+#[skuld::test]
+fn reader_placed_before_its_checkout_is_flagged() {
+    let yaml = "jobs:\n  a:\n    steps:\n      - name: read\n        run: sed rust-toolchain.toml >> \"$GITHUB_OUTPUT\"\n      - uses: actions/checkout@v7\n";
+    let found = audit_checkout_gating("f.yaml", yaml, &BTreeMap::new()).unwrap();
+    assert_eq!(found.len(), 1, "{found:?}");
+}
+
+/// A checkout that relocates the tree (`path:`) doesn't satisfy a
+/// root-relative read — it must not become the baseline.
+#[skuld::test]
+fn checkout_with_path_does_not_satisfy_a_root_relative_read() {
+    let yaml = "jobs:\n  a:\n    steps:\n      - uses: actions/checkout@v7\n        if: ${{ inputs.x }}\n        with:\n          path: source\n      - name: read\n        run: sed rust-toolchain.toml >> \"$GITHUB_OUTPUT\"\n";
+    let found = audit_checkout_gating("f.yaml", yaml, &BTreeMap::new()).unwrap();
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!(found[0].depends_on_if, None);
+}
+
+#[skuld::test]
+fn go_version_file_input_is_a_direct_reader() {
+    let yaml = "jobs:\n  a:\n    steps:\n      - uses: actions/checkout@v7\n        if: ${{ inputs.x }}\n      - uses: actions/setup-go@v7\n        with:\n          go-version-file: crates/ex-ray/go.mod\n";
+    let found = audit_checkout_gating("f.yaml", yaml, &BTreeMap::new()).unwrap();
+    assert_eq!(found.len(), 1, "{found:?}");
+}
+
+#[skuld::test]
+fn node_version_file_input_is_a_direct_reader() {
+    let yaml = "jobs:\n  a:\n    steps:\n      - uses: actions/checkout@v7\n        if: ${{ inputs.x }}\n      - uses: actions/setup-node@v7\n        with:\n          node-version-file: package.json\n";
+    let found = audit_checkout_gating("f.yaml", yaml, &BTreeMap::new()).unwrap();
+    assert_eq!(found.len(), 1, "{found:?}");
+}
+
+/// An install step consuming a read step's output, gated differently from
+/// that read step, is #859's second broken pairing — independent of any
+/// checkout, and present even inside a single composite action's own steps.
+#[skuld::test]
+fn consumer_of_a_readers_output_gated_differently_is_flagged() {
+    let yaml = "runs:\n  using: composite\n  steps:\n    - id: rust-version\n      if: ${{ inputs.x }}\n      run: sed rust-toolchain.toml >> \"$GITHUB_OUTPUT\"\n    - uses: dtolnay/rust-toolchain@master\n      if: ${{ inputs.y }}\n      with:\n        toolchain: ${{ steps.rust-version.outputs.toolchain }}\n";
+    let found = audit_checkout_gating("action.yaml", yaml, &BTreeMap::new()).unwrap();
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!(found[0].depends_on_if.as_deref(), Some("${{ inputs.x }}"));
+    assert_eq!(found[0].step_if.as_deref(), Some("${{ inputs.y }}"));
+}
+
+#[skuld::test]
+fn consumer_matching_the_readers_condition_is_clean() {
+    let yaml = "runs:\n  using: composite\n  steps:\n    - id: rust-version\n      if: ${{ inputs.x }}\n      run: sed rust-toolchain.toml >> \"$GITHUB_OUTPUT\"\n    - uses: dtolnay/rust-toolchain@master\n      if: ${{ inputs.x }}\n      with:\n        toolchain: ${{ steps.rust-version.outputs.toolchain }}\n";
+    assert_eq!(
+        audit_checkout_gating("action.yaml", yaml, &BTreeMap::new()).unwrap(),
+        vec![]
+    );
+}
+
+#[skuld::test]
+fn bare_if_and_wrapped_if_are_the_same_condition() {
+    let yaml = "jobs:\n  a:\n    steps:\n      - uses: actions/checkout@v7\n        if: inputs.x\n      - name: read\n        if: ${{ inputs.x }}\n        run: sed rust-toolchain.toml >> \"$GITHUB_OUTPUT\"\n";
+    assert_eq!(audit_checkout_gating("f.yaml", yaml, &BTreeMap::new()).unwrap(), vec![]);
+}
+
+#[skuld::test]
+fn whitespace_variance_in_if_is_the_same_condition() {
+    let yaml = "jobs:\n  a:\n    steps:\n      - uses: actions/checkout@v7\n        if: ${{ inputs.x  &&  inputs.y }}\n      - name: read\n        if: ${{ inputs.x && inputs.y }}\n        run: sed rust-toolchain.toml >> \"$GITHUB_OUTPUT\"\n";
     assert_eq!(audit_checkout_gating("f.yaml", yaml, &BTreeMap::new()).unwrap(), vec![]);
 }
 
@@ -235,9 +306,7 @@ fn collect_github_docs() -> Vec<(String, String)> {
 
 /// Extends the pin-naming test above: a step (or a local composite action
 /// that reads it) must not run under a condition weaker than the checkout it
-/// depends on. #859 broke exactly this in `reusable-publish-release.yaml`:
-/// the pin read had no `if:` while its checkout did, so every non-dry-run
-/// publish read a workspace that had never been checked out.
+/// depends on.
 #[skuld::test]
 fn ci_toolchain_reads_are_checkout_gated() {
     let docs = collect_github_docs();
@@ -267,8 +336,8 @@ fn ci_toolchain_reads_are_checkout_gated() {
         ungated
             .iter()
             .map(|u| format!(
-                "  {} job `{}` step `{}`: if={:?}, checkout if={:?}",
-                u.file, u.job, u.step, u.step_if, u.checkout_if
+                "  {} job `{}` step `{}`: if={:?}, depends on if={:?}",
+                u.file, u.job, u.step, u.step_if, u.depends_on_if
             ))
             .collect::<Vec<_>>()
             .join("\n")

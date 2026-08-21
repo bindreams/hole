@@ -1,6 +1,6 @@
 # The single source of truth for the Rust version, in CI and locally.
 #
-# `.github/actions/setup-build` reads `channel` from this file, so bumping it
+# `.github/actions/setup-rust` reads `channel` from this file, so bumping it
 # here moves CI too. Do that deliberately: clippy gains lints between releases,
 # and under `-D warnings` they arrive as build failures across the workspace at
 # once, on code that never changed.
