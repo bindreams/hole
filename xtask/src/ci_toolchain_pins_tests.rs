@@ -1,9 +1,11 @@
 //! Unit tests for [`crate::ci_toolchain_pins`] plus the
-//! `ci_toolchain_steps_name_the_pin` structural conformance test.
+//! `ci_toolchain_steps_name_the_pin` and `ci_toolchain_reads_are_checkout_gated`
+//! structural conformance tests.
 
+use std::collections::BTreeMap;
 use std::fs;
 
-use crate::ci_toolchain_pins::{audit_document, GO_VERSION_FILE};
+use crate::ci_toolchain_pins::{audit_checkout_gating, audit_document, resolve_local_pin_readers, GO_VERSION_FILE};
 
 #[skuld::test]
 fn setup_go_naming_the_pinned_go_mod_is_clean() {
@@ -61,37 +63,104 @@ fn unrelated_actions_are_ignored() {
     assert_eq!(audit_document("f.yaml", yaml).unwrap(), vec![]);
 }
 
+// Checkout-gating =====================================================================================================
+
+#[skuld::test]
+fn reader_matching_its_checkout_if_is_clean() {
+    let yaml = "jobs:\n  a:\n    steps:\n      - uses: actions/checkout@v7\n        if: ${{ inputs.x }}\n      - name: read\n        if: ${{ inputs.x }}\n        run: sed rust-toolchain.toml >> \"$GITHUB_OUTPUT\"\n";
+    assert_eq!(audit_checkout_gating("f.yaml", yaml, &BTreeMap::new()).unwrap(), vec![]);
+}
+
+/// This is #859 verbatim: a checkout gated on a condition, followed by an
+/// unconditional read of a file that checkout produces.
+#[skuld::test]
+fn ungated_reader_after_conditional_checkout_is_flagged() {
+    let yaml = "jobs:\n  a:\n    steps:\n      - uses: actions/checkout@v7\n        if: ${{ inputs.x }}\n      - name: read\n        id: rust-version\n        run: sed rust-toolchain.toml >> \"$GITHUB_OUTPUT\"\n";
+    let found = audit_checkout_gating("f.yaml", yaml, &BTreeMap::new()).unwrap();
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!(found[0].step, "rust-version");
+    assert_eq!(found[0].checkout_if.as_deref(), Some("${{ inputs.x }}"));
+    assert_eq!(found[0].step_if, None);
+}
+
+#[skuld::test]
+fn reader_with_no_preceding_checkout_is_skipped() {
+    let yaml =
+        "jobs:\n  a:\n    steps:\n      - name: read\n        run: sed rust-toolchain.toml >> \"$GITHUB_OUTPUT\"\n";
+    assert_eq!(audit_checkout_gating("f.yaml", yaml, &BTreeMap::new()).unwrap(), vec![]);
+}
+
+#[skuld::test]
+fn unconditional_checkout_requires_unconditional_reader() {
+    let yaml = "jobs:\n  a:\n    steps:\n      - uses: actions/checkout@v7\n      - name: read\n        if: ${{ inputs.x }}\n        run: sed rust-toolchain.toml >> \"$GITHUB_OUTPUT\"\n";
+    let found = audit_checkout_gating("f.yaml", yaml, &BTreeMap::new()).unwrap();
+    assert_eq!(found.len(), 1, "{found:?}");
+}
+
+/// A step calling a local composite action known (via the reader graph) to
+/// read the pin is treated the same as reading it directly.
+#[skuld::test]
+fn local_action_call_is_treated_as_a_reader() {
+    let yaml = "jobs:\n  a:\n    steps:\n      - uses: actions/checkout@v7\n        if: ${{ inputs.x }}\n      - uses: ./.github/actions/setup-rust\n";
+    let mut readers = BTreeMap::new();
+    readers.insert("./.github/actions/setup-rust".to_owned(), true);
+    let found = audit_checkout_gating("f.yaml", yaml, &readers).unwrap();
+    assert_eq!(found.len(), 1, "{found:?}");
+}
+
+#[skuld::test]
+fn local_action_not_known_to_read_the_pin_is_ignored() {
+    let yaml = "jobs:\n  a:\n    steps:\n      - uses: actions/checkout@v7\n        if: ${{ inputs.x }}\n      - uses: ./.github/actions/mint-nathan-token\n";
+    let mut readers = BTreeMap::new();
+    readers.insert("./.github/actions/setup-rust".to_owned(), true);
+    assert_eq!(audit_checkout_gating("f.yaml", yaml, &readers).unwrap(), vec![]);
+}
+
+#[skuld::test]
+fn composite_actions_own_steps_have_no_checkout_to_compare() {
+    let yaml = "runs:\n  using: composite\n  steps:\n    - name: read\n      run: sed rust-toolchain.toml >> \"$GITHUB_OUTPUT\"\n";
+    assert_eq!(
+        audit_checkout_gating("action.yaml", yaml, &BTreeMap::new()).unwrap(),
+        vec![]
+    );
+}
+
+#[skuld::test]
+fn resolve_local_pin_readers_finds_direct_readers() {
+    let mut actions = BTreeMap::new();
+    actions.insert(
+        "./.github/actions/setup-rust".to_owned(),
+        "runs:\n  using: composite\n  steps:\n    - run: sed rust-toolchain.toml >> \"$GITHUB_OUTPUT\"\n".to_owned(),
+    );
+    let readers = resolve_local_pin_readers(&actions).unwrap();
+    assert_eq!(readers.get("./.github/actions/setup-rust"), Some(&true));
+}
+
+/// `setup-build` doesn't read the pin itself post-refactor; it calls
+/// `setup-rust`, which does. The graph has to follow that call to still
+/// treat `setup-build`'s own callers as reading the pin transitively.
+#[skuld::test]
+fn resolve_local_pin_readers_follows_transitive_local_calls() {
+    let mut actions = BTreeMap::new();
+    actions.insert(
+        "./.github/actions/setup-rust".to_owned(),
+        "runs:\n  using: composite\n  steps:\n    - run: sed rust-toolchain.toml >> \"$GITHUB_OUTPUT\"\n".to_owned(),
+    );
+    actions.insert(
+        "./.github/actions/setup-build".to_owned(),
+        "runs:\n  using: composite\n  steps:\n    - uses: ./.github/actions/setup-rust\n".to_owned(),
+    );
+    let readers = resolve_local_pin_readers(&actions).unwrap();
+    assert_eq!(readers.get("./.github/actions/setup-build"), Some(&true));
+}
+
 /// Every `.github/` workflow and composite action, audited for real. This is
 /// the test that closes the class: a new job that installs a toolchain without
 /// naming the pin fails here at commit time rather than on the day the next
 /// release ships.
 #[skuld::test]
 fn ci_toolchain_steps_name_the_pin() {
-    let root = crate::repo_root().expect("repo root");
-
-    let mut docs: Vec<(String, String)> = Vec::new();
-    let workflows = root.join(".github/workflows");
-    for entry in fs::read_dir(&workflows).expect("read .github/workflows") {
-        let path = entry.expect("dir entry").path();
-        if path.extension().is_some_and(|e| e == "yaml" || e == "yml") {
-            let rel = format!(".github/workflows/{}", path.file_name().unwrap().to_string_lossy());
-            docs.push((rel, fs::read_to_string(&path).expect("read workflow")));
-        }
-    }
-    for entry in fs::read_dir(root.join(".github/actions")).expect("read .github/actions") {
-        let dir = entry.expect("dir entry").path();
-        for name in ["action.yaml", "action.yml"] {
-            let path = dir.join(name);
-            if path.is_file() {
-                let rel = format!(".github/actions/{}/{name}", dir.file_name().unwrap().to_string_lossy());
-                docs.push((rel, fs::read_to_string(&path).expect("read action")));
-            }
-        }
-    }
-
-    // A silent zero-file walk would pass vacuously; the workflow dir is large
-    // and the action dir is not empty.
-    assert!(docs.len() > 5, "found only {} .github documents", docs.len());
+    let docs = collect_github_docs();
 
     let mut unpinned = Vec::new();
     for (file, contents) in &docs {
@@ -131,4 +200,77 @@ fn ci_toolchain_steps_name_the_pin() {
              is not extracting `channel` and will install an empty toolchain"
         );
     }
+}
+
+/// Every `.github/` workflow and composite-action document, read from disk.
+/// Shared by the structural conformance tests below.
+fn collect_github_docs() -> Vec<(String, String)> {
+    let root = crate::repo_root().expect("repo root");
+
+    let mut docs: Vec<(String, String)> = Vec::new();
+    let workflows = root.join(".github/workflows");
+    for entry in fs::read_dir(&workflows).expect("read .github/workflows") {
+        let path = entry.expect("dir entry").path();
+        if path.extension().is_some_and(|e| e == "yaml" || e == "yml") {
+            let rel = format!(".github/workflows/{}", path.file_name().unwrap().to_string_lossy());
+            docs.push((rel, fs::read_to_string(&path).expect("read workflow")));
+        }
+    }
+    for entry in fs::read_dir(root.join(".github/actions")).expect("read .github/actions") {
+        let dir = entry.expect("dir entry").path();
+        for name in ["action.yaml", "action.yml"] {
+            let path = dir.join(name);
+            if path.is_file() {
+                let rel = format!(".github/actions/{}/{name}", dir.file_name().unwrap().to_string_lossy());
+                docs.push((rel, fs::read_to_string(&path).expect("read action")));
+            }
+        }
+    }
+
+    // A silent zero-file walk would pass vacuously; the workflow dir is large
+    // and the action dir is not empty.
+    assert!(docs.len() > 5, "found only {} .github documents", docs.len());
+    docs
+}
+
+/// Extends the pin-naming test above: a step (or a local composite action
+/// that reads it) must not run under a condition weaker than the checkout it
+/// depends on. #859 broke exactly this in `reusable-publish-release.yaml`:
+/// the pin read had no `if:` while its checkout did, so every non-dry-run
+/// publish read a workspace that had never been checked out.
+#[skuld::test]
+fn ci_toolchain_reads_are_checkout_gated() {
+    let docs = collect_github_docs();
+
+    let local_actions: BTreeMap<String, String> = docs
+        .iter()
+        .filter_map(|(file, contents)| {
+            let rest = file.strip_prefix(".github/actions/")?;
+            let dir = rest
+                .strip_suffix("/action.yaml")
+                .or_else(|| rest.strip_suffix("/action.yml"))?;
+            Some((format!("./.github/actions/{dir}"), contents.clone()))
+        })
+        .collect();
+    let local_pin_readers = resolve_local_pin_readers(&local_actions).expect("resolve local pin readers");
+
+    let mut ungated = Vec::new();
+    for (file, contents) in &docs {
+        ungated.extend(audit_checkout_gating(file, contents, &local_pin_readers).expect("audit"));
+    }
+
+    assert!(
+        ungated.is_empty(),
+        "these steps read a repository file under a condition weaker than (or merely \
+         different from) the checkout they depend on, so they can run against a workspace \
+         that was never checked out:\n{}",
+        ungated
+            .iter()
+            .map(|u| format!(
+                "  {} job `{}` step `{}`: if={:?}, checkout if={:?}",
+                u.file, u.job, u.step, u.step_if, u.checkout_if
+            ))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
 }

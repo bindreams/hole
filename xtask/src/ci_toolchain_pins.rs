@@ -18,6 +18,12 @@
 //! This checks that a step *reads* the pin, not that it reads a particular
 //! version: the version itself lives in one file per language, so agreement
 //! is by construction once the step points at it.
+//!
+//! Backs `ci_toolchain_reads_are_checkout_gated` too: naming the pin only
+//! matters if the file it names is actually there, so that test additionally
+//! checks that a step reading a repository file never runs under a weaker
+//! condition than the checkout it depends on (see the "Checkout-gating"
+//! section below — this is what closed #859).
 
 use std::collections::BTreeMap;
 
@@ -54,7 +60,13 @@ struct Steps {
 #[derive(Deserialize)]
 struct Step {
     #[serde(default)]
+    id: Option<String>,
+    #[serde(default, rename = "if")]
+    if_: Option<String>,
+    #[serde(default)]
     uses: Option<String>,
+    #[serde(default)]
+    run: Option<String>,
     /// Left as raw values: `toolchain:` is usually a `${{ }}` expression, and
     /// we only care that it is present and non-empty.
     #[serde(default)]
@@ -118,5 +130,186 @@ pub fn audit_document(file: &str, contents: &str) -> Result<Vec<Unpinned>> {
             });
         }
     }
+    Ok(out)
+}
+
+// Checkout-gating =====================================================================================================
+//
+// A step naming the pin (above) is only half the invariant: the file it
+// reads has to actually be on disk when the step runs. #859 was exactly
+// this — a step reading `rust-toolchain.toml` with no `if:` at all, sitting
+// right after an `actions/checkout` that *did* have one, so on every run
+// where the checkout was skipped the step read a workspace with no
+// `rust-toolchain.toml` in it and failed.
+//
+// The rule: within one job (or one composite action's `runs.steps`), a step
+// that reads a repository file must run under the exact same condition as
+// the nearest preceding `actions/checkout` step.
+//
+// What this does not catch --------------------------------------------------------------------------------------------
+//
+// "Reads a repository file" is not something a shell script declares — it's
+// inferred, and the inference has real edges:
+//
+// - Direct detection is a literal-text match for `rust-toolchain.toml`
+//   inside a step's `run:` (the same heuristic the byte-equal-readers check
+//   in the test file already relies on). A step that reaches the file
+//   through a variable, a wrapper script, or any file other than the one
+//   pin this module tracks is invisible to it.
+// - Indirect detection follows local composite actions (`uses: ./...`)
+//   transitively: if a local action's own steps (directly or through
+//   further local actions it calls) read the pin, every call site is
+//   treated as a reader too. Only *local* actions are followed — a
+//   third-party or `workflow_call` boundary that reads the file internally
+//   is invisible to it.
+// - The comparison is exact-text equality of the `if:` strings (after
+//   trimming), not logical implication. This is deliberately conservative:
+//   it accepts only the one shape this repo's call sites actually use (a
+//   reader immediately gated on its checkout's own condition, verbatim),
+//   and it will false-positive on a reader whose condition is a strictly
+//   narrower — but differently worded — subset of its checkout's condition.
+//   No such case exists in this repo today; if one shows up, loosen this
+//   then, with a test proving the new shape is actually safe.
+// - A job with no preceding `actions/checkout` step at all is skipped:
+//   there's nothing to compare against, which is correct for a composite
+//   action's own `runs.steps` (it always executes inside the caller's
+//   already-checked-out workspace).
+
+/// One step that reads (directly or via a local composite action) a
+/// repository file under a condition weaker than — or merely different
+/// from — the checkout that must produce it.
+#[derive(Debug, PartialEq, Eq)]
+pub struct UngatedRead {
+    pub file: String,
+    pub job: String,
+    /// The step's `id:`, or failing that its `uses:`, for reporting.
+    pub step: String,
+    pub step_if: Option<String>,
+    pub checkout_if: Option<String>,
+}
+
+/// Does this step, by itself, read `rust-toolchain.toml`?
+fn step_reads_pin_file_directly(step: &Step) -> bool {
+    step.run.as_deref().is_some_and(|r| r.contains("rust-toolchain.toml"))
+}
+
+/// Is this step an `actions/checkout` call?
+fn is_checkout(step: &Step) -> bool {
+    step.uses
+        .as_deref()
+        .is_some_and(|u| action_repo(u) == "actions/checkout")
+}
+
+/// Normalizes a local composite-action `uses:` reference (e.g.
+/// `./.github/actions/setup-rust`) to the key used to look it up in the
+/// reader graph. Returns `None` for anything that isn't a local path —
+/// third-party actions are out of scope (see module doc).
+fn local_action_path(uses: &str) -> Option<String> {
+    uses.starts_with("./")
+        .then(|| uses.split('@').next().unwrap_or(uses).trim_end_matches('/').to_owned())
+}
+
+/// Resolves which local composite actions read the Rust toolchain pin file,
+/// directly or transitively through calls to other local composite actions.
+///
+/// `actions` maps each local action's `uses:` key (e.g.
+/// `./.github/actions/setup-rust`) to that action's own `action.yaml`
+/// contents.
+pub fn resolve_local_pin_readers(actions: &BTreeMap<String, String>) -> Result<BTreeMap<String, bool>> {
+    let mut graph: BTreeMap<String, (bool, Vec<String>)> = BTreeMap::new();
+    for (key, contents) in actions {
+        let doc: StepBearing = serde_yml::from_str(contents).with_context(|| format!("parse {key}"))?;
+        let steps = doc.runs.map(|s| s.steps).unwrap_or_default();
+
+        let mut direct = false;
+        let mut calls = Vec::new();
+        for step in &steps {
+            if step_reads_pin_file_directly(step) {
+                direct = true;
+            }
+            if let Some(callee) = step.uses.as_deref().and_then(local_action_path) {
+                calls.push(callee);
+            }
+        }
+        graph.insert(key.clone(), (direct, calls));
+    }
+
+    let mut reads: BTreeMap<String, bool> = graph.iter().map(|(k, (direct, _))| (k.clone(), *direct)).collect();
+
+    // Fixpoint over the local-action call graph. Bounded by the graph's own
+    // size (the number of local actions in the repo), not an arbitrary
+    // retry budget — each pass either flips at least one more entry to
+    // `true` or the loop breaks, so this always converges in at most
+    // `graph.len()` passes.
+    for _ in 0..graph.len() {
+        let mut changed = false;
+        for (key, (_, calls)) in &graph {
+            if reads[key] {
+                continue;
+            }
+            if calls.iter().any(|callee| reads.get(callee).copied().unwrap_or(false)) {
+                reads.insert(key.clone(), true);
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    Ok(reads)
+}
+
+/// Audits one `.github/` YAML document for reads gated more weakly than the
+/// checkout they depend on. `local_pin_readers` is the graph built by
+/// [`resolve_local_pin_readers`] — pass an empty map to only check direct
+/// reads.
+pub fn audit_checkout_gating(
+    file: &str,
+    contents: &str,
+    local_pin_readers: &BTreeMap<String, bool>,
+) -> Result<Vec<UngatedRead>> {
+    let doc: StepBearing = serde_yml::from_str(contents).with_context(|| format!("parse {file}"))?;
+
+    let jobs = doc.jobs.iter().map(|(name, steps)| (name.as_str(), steps));
+    let composite = doc.runs.iter().map(|steps| ("<composite action>", steps));
+
+    let mut out = Vec::new();
+    for (job_name, steps) in jobs.chain(composite) {
+        let mut last_checkout_if: Option<Option<String>> = None;
+
+        for step in &steps.steps {
+            if is_checkout(step) {
+                last_checkout_if = Some(step.if_.as_deref().map(str::trim).map(str::to_owned));
+                continue;
+            }
+
+            let reads_pin = step_reads_pin_file_directly(step)
+                || step
+                    .uses
+                    .as_deref()
+                    .and_then(local_action_path)
+                    .is_some_and(|callee| local_pin_readers.get(&callee).copied().unwrap_or(false));
+            if !reads_pin {
+                continue;
+            }
+
+            let Some(checkout_if) = &last_checkout_if else {
+                continue;
+            };
+
+            let step_if = step.if_.as_deref().map(str::trim).map(str::to_owned);
+            if &step_if != checkout_if {
+                out.push(UngatedRead {
+                    file: file.to_owned(),
+                    job: job_name.to_owned(),
+                    step: step.id.clone().or_else(|| step.uses.clone()).unwrap_or_default(),
+                    step_if,
+                    checkout_if: checkout_if.clone(),
+                });
+            }
+        }
+    }
+
     Ok(out)
 }

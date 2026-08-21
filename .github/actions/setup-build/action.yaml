@@ -11,20 +11,9 @@ runs:
         echo "SCCACHE_GHA_ENABLED=true" >> "$GITHUB_ENV"
         echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
 
-    # `rust-toolchain.toml` is the single source of truth. It already governs
-    # every `cargo` call through rustup's directory override; feeding `channel`
-    # to the action too means the toolchain is installed up front, with
-    # components, and `cachekey` tracks the pinned rustc rather than whatever
-    # `stable` resolved to that morning.
-    - name: Read pinned Rust toolchain
-      id: rust-version
-      shell: bash
-      run: sed -n 's/^channel = "\(.*\)"$/toolchain=\1/p' rust-toolchain.toml >> "$GITHUB_OUTPUT"
-
-    - uses: dtolnay/rust-toolchain@master
-      id: rust-toolchain
+    - uses: ./.github/actions/setup-rust
+      id: setup-rust
       with:
-        toolchain: ${{ steps.rust-version.outputs.toolchain }}
         components: clippy, rustfmt
 
     # The Go pin lives in the module's own `toolchain` directive, so a bare
@@ -48,8 +37,8 @@ runs:
         path: |
           ~/.cargo/registry
           ~/.cargo/git
-        key: cargo-${{ runner.os }}-${{ steps.rust-toolchain.outputs.cachekey }}-${{ hashFiles('Cargo.lock') }}
-        restore-keys: cargo-${{ runner.os }}-${{ steps.rust-toolchain.outputs.cachekey }}-
+        key: cargo-${{ runner.os }}-${{ steps.setup-rust.outputs.cachekey }}-${{ hashFiles('Cargo.lock') }}
+        restore-keys: cargo-${{ runner.os }}-${{ steps.setup-rust.outputs.cachekey }}-
 
     - uses: mozilla-actions/sccache-action@v0.0.11
 
