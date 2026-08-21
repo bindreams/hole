@@ -31,7 +31,7 @@ test-utils = ["dep:tracing-subscriber"]
 
 [dependencies]
 bitflags = { workspace = true }
-kill-group = { version = "0.1", path = "../kill-group" }
+cosca = { workspace = true, features = ["tokio"] }
 semver = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
@@ -71,13 +71,37 @@ harness = false
 # Pulls in `WaitableWriter` via the `test-utils` feature.
 required-features = ["test-utils"]
 
+# The shutdown pins live in an integration target because they spawn the
+# `mock-plugin` fixture, and `CARGO_BIN_EXE_*` is defined only for integration
+# tests and benches (tests/common/mod.rs). No `required-features`: the fixture
+# and its path helper are both ungated.
+[[test]]
+name = "shutdown"
+path = "tests/shutdown.rs"
+harness = false
+
+[[test]]
+name = "nested_containment"
+path = "tests/nested_containment.rs"
+harness = false
+
+[[test]]
+name = "handle_hygiene"
+path = "tests/handle_hygiene.rs"
+harness = false
+
+# Both target blocks below exist for `src/bin/mock-plugin.rs`, the test fixture.
+# The published crate excludes `src/bin/`, so neither reaches a consumer's build.
 [target.'cfg(unix)'.dependencies]
+# mock-plugin: signal(SIGTERM, SIG_IGN), for MOCK_PLUGIN_IGNORE_SIGNALS.
 libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
-# Job-object / handle-hygiene features moved to the `kill-group` crate.
+# Containment and handle hygiene are cosca's; these are the fixture's own calls.
 windows = { version = "0.62", features = [
-    "Win32_System_Console", # shutdown.rs: GenerateConsoleCtrlEvent (CTRL_BREAK)
+    "Win32_Foundation",           # TRUE, and the raw HANDLE the hygiene probe carries
+    "Win32_Storage_FileSystem",   # GetFileType, classifying an inherited handle
+    "Win32_System_Console",       # SetConsoleCtrlHandler, GetStdHandle
 ] }
 
 [target.'cfg(windows)'.dev-dependencies]
@@ -85,6 +109,4 @@ windows = { version = "0.62", features = [
 # for the test build):
 # - Win32_Networking_WinSock: chain_tests.rs binds 0.0.0.0:port with
 #   SO_EXCLUSIVEADDRUSE to exercise the Winsock wildcard-exclusion race.
-# - Win32_System_Threading: shutdown_tests.rs spawns with
-#   CREATE_NEW_PROCESS_GROUP to exercise graceful_stop's CTRL_BREAK.
-windows = { version = "0.62", features = ["Win32_Networking_WinSock", "Win32_System_Threading"] }
+windows = { version = "0.62", features = ["Win32_Networking_WinSock"] }

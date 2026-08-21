@@ -211,3 +211,29 @@ fn dev_run_subdir_name_is_filesystem_safe() {
         .unwrap();
     assert_eq!(super::dev_run_subdir_name(dt), "2026-06-20_15-30-45");
 }
+
+/// The POSIX bridge must never be force-killed, and the refusal has to survive
+/// a release build — a `debug_assert` alone compiles out and lets the caller
+/// fall through to a SIGKILL that kills `sudo` and orphans the root bridge.
+/// Table-driven so a future `grace_timeout_action` change cannot quietly
+/// re-enable it on POSIX.
+#[skuld::test]
+fn bridge_hard_kill_is_refused_on_posix() {
+    assert!(!bridge_hard_kill_permitted(Os::Posix));
+    assert!(bridge_hard_kill_permitted(Os::Windows));
+}
+
+/// The two layers agree today: the policy declines the hard kill on exactly the
+/// platform the refusal below it also declines. A regression in either alone is
+/// caught here.
+#[skuld::test]
+fn grace_policy_and_hard_kill_refusal_agree_for_the_bridge() {
+    for os in [Os::Posix, Os::Windows] {
+        let policy_kills = grace_timeout_action(ChildRole::Bridge, os) == GraceTimeoutAction::HardKill;
+        assert_eq!(
+            policy_kills,
+            bridge_hard_kill_permitted(os),
+            "the bridge grace policy and the hard-kill refusal disagree on {os:?}"
+        );
+    }
+}

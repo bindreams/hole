@@ -38,19 +38,22 @@ impl Drop for ConsoleModeGuard {
 /// against a child that never initialized its console handlers — and Vite's
 /// output format changing must break this test, not silently pass it).
 /// The marker wait is a class-2 bound (third-party child; per-test timeout).
-async fn run_vite_and_measure(stdin: std::process::Stdio) -> u32 {
-    let npm = which::which("npm").expect("npm on PATH");
-    let mut cmd = tokio::process::Command::new(npm);
-    cmd.args(["run", "dev"]);
+async fn run_vite_and_measure(stdin: cosca::Stdio) -> u32 {
+    let npm = crate::steps::resolve_npm().expect("npm on PATH");
+    let mut cmd = cosca::tokio::Command::new();
+    cmd.executable(npm.program());
+    cmd.args(npm.full_argv(&["run", "dev"]));
     // package.json lives at the workspace root; nextest's cwd is the crate
     // dir (the Python original ran from the repo root).
     cmd.current_dir(xtask_lib::repo_root::repo_root().expect("workspace root"));
-    cmd.stdin(stdin)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
-    cmd.kill_on_drop(true);
-    let mut gc = kill_group::GroupedChild::spawn(&mut cmd, kill_group::Nesting::Mark).unwrap();
-    let stdout = gc.child.stdout.take().unwrap();
+    cmd.stdin(stdin).unwrap();
+    cmd.stdout(cosca::Stdio::pipe()).unwrap();
+    cmd.stderr(cosca::Stdio::pipe()).unwrap();
+    cmd.kill_on_drop(true)
+        .contain()
+        .nesting(cosca::containment::Nesting::Mark);
+    let mut child = cmd.spawn().unwrap();
+    let stdout = child.stdout().unwrap();
     use tokio::io::AsyncBufReadExt as _;
     let mut lines = tokio::io::BufReader::new(stdout).lines();
     loop {
@@ -64,7 +67,25 @@ async fn run_vite_and_measure(stdin: std::process::Stdio) -> u32 {
             break;
         }
     }
-    gc.kill_tree().await;
+    // The process that mutates the console mode is node/esbuild — a DESCENDANT,
+    // which the root's own `wait` says nothing about, and conhost keeps changing
+    // console state while a member is still being torn down. `wait_tree` is the
+    // job object's kernel-owned process-count edge, so it is what orders the
+    // mode read below against every member having FINISHED exiting.
+    //
+    // Cooperative, not `kill_tree`: that closes the job handle, which IS the
+    // drain edge, so a drain check after it answers `Unassessable`. The whole
+    // npm/node tree shares this child's console group, so CTRL_BREAK reaches
+    // all of it. Class-2 bound on a third-party child; a Vite that stops
+    // honouring the signal must fail here rather than be escalated past.
+    child.terminate_tree().unwrap();
+    let drain = child.wait_tree_timeout(crate::supervise::GRACE_TIMEOUT).await.unwrap();
+    assert_eq!(
+        drain,
+        cosca::containment::TreeDrain::AllMembersExited,
+        "the vite tree did not drain within the grace window; the mode read below would be unordered"
+    );
+    child.wait().await.unwrap();
     console_input_mode().expect("console mode after")
 }
 
@@ -80,7 +101,7 @@ async fn null_stdin_child_cannot_corrupt_console_mode() {
     let _restore = ConsoleModeGuard(before);
 
     // Leg 1: inherited stdin MUST corrupt (the bug repro / vacuity guard).
-    let corrupted = run_vite_and_measure(std::process::Stdio::inherit()).await;
+    let corrupted = run_vite_and_measure(cosca::Stdio::inherit()).await;
     assert_ne!(
         before, corrupted,
         "bug did NOT reproduce: an inherited-stdin Vite no longer alters the console mode \
@@ -90,7 +111,7 @@ async fn null_stdin_child_cannot_corrupt_console_mode() {
     drop(ConsoleModeGuard(before));
 
     // Leg 2: null stdin must preserve the mode (the dev-console discipline).
-    let after = run_vite_and_measure(std::process::Stdio::null()).await;
+    let after = run_vite_and_measure(cosca::Stdio::null()).await;
     assert_eq!(
         before, after,
         "a stdin=null child must not change the console input mode"

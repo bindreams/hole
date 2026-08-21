@@ -17,6 +17,13 @@ pub enum Error {
 
     #[error("malformed SS_PLUGIN_OPTIONS: {0}")]
     MalformedOptions(#[from] crate::sip003::MalformedOptions),
+
+    /// Subprocess management — spawning a plugin under containment, signalling it,
+    /// tearing its tree down. Transparent rather than flattened into
+    /// [`Error::Chain`]: a caller that needs the distinction should read the type,
+    /// not parse a message back into one.
+    #[error(transparent)]
+    Cosca(#[from] cosca::error::Error),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

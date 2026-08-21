@@ -1,12 +1,13 @@
 //! The supervision sequence (dev.py main(), with the spec's Deltas).
 
 use std::path::Path;
-use std::process::{ExitCode, Stdio};
+use std::process::ExitCode;
 use std::time::Duration;
 
 use anyhow::{Context as _, Result};
-use kill_group::{GroupedChild, Nesting};
-use tokio::process::{Child, Command};
+use cosca::containment::Nesting;
+use cosca::tokio::{Child, Command};
+use cosca::{ContainMode, Stdio};
 use tokio::sync::mpsc;
 
 use crate::ansi::{BOLD, RESET, YELLOW};
@@ -14,44 +15,33 @@ use crate::banner::{startup_banner, webview_debug_hint, CDP_PORT, VITE_PORT};
 use crate::interrupts::Interrupts;
 use crate::mux::{pump, Entry, StreamMode};
 use crate::policy::{
-    bridge_argv, elevation_action, grace_timeout_action, grant_access_argv, supervision_exit_code, ChildRole,
-    ElevationAction, ExitCause, GraceTimeoutAction, Os, NETWORK_RESET_WARNING,
+    bridge_argv, bridge_hard_kill_permitted, elevation_action, grace_timeout_action, grant_access_argv,
+    supervision_exit_code, ChildRole, ElevationAction, ExitCause, GraceTimeoutAction, Os, NETWORK_RESET_WARNING,
 };
 use crate::ready::{port_in_use, wait_for_port, ReadyListener};
 use crate::steps;
 
 const SOCKET_READY_TIMEOUT: Duration = Duration::from_secs(15);
 const VITE_READY_TIMEOUT: Duration = Duration::from_secs(30);
-const GRACE_TIMEOUT: Duration = Duration::from_secs(10);
+pub(crate) const GRACE_TIMEOUT: Duration = Duration::from_secs(10);
 /// dev.py joined its prefix threads with timeout=5 (dev.py:352-354) for the
 /// same reason: the WarnRecovery bridge keeps its pipes open forever.
 const PRINTER_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// The bridge child differs per platform — see the spec's spawn table.
-enum BridgeChild {
-    /// POSIX: sudo-wrapped, own SESSION (setsid — controlling-TTY detach is
-    /// the sudo-prompt scar fix; also makes it a pgid leader for the
-    /// graceful killpg). NOT a kill-group: Drop's SIGKILL would kill sudo
-    /// and silently ORPHAN the root bridge; and the nesting mark would stop
-    /// the bridge's garter from creating plugin kill-groups.
-    /// `pgid` is captured at spawn (child.id() goes None after reaping, but
-    /// the group may still need signalling).
-    #[cfg(unix)]
-    Posix { child: Child, pgid: u32 },
-    /// Windows: kill-on-close job, Nesting::Opaque (the bridge's own garter
-    /// keeps creating plugin groups, which nest inside this job). A crashed
-    /// supervisor can no longer leak a routing-active bridge (Delta 6).
-    #[cfg(windows)]
-    Windows(GroupedChild),
-}
-
 /// dev.py:306-307 parity (`terminate_tree`: `if proc.poll() is not None:
-/// return`): a reaped child's pid — and therefore its pgid — may already
-/// have been recycled by the OS, so signalling it can land on an unrelated
-/// process group. `term_group`'s contract requires holding an un-reaped
-/// leader. tokio's `wait()` fuses: after reaping, `id()` is `None`.
-pub(crate) fn is_reaped(child: &Child) -> bool {
-    child.id().is_none()
+/// return`). The guard must not be deleted as redundant with anything cosca
+/// does internally: `terminate_tree`'s `killpg` takes an **unpinned pgid**
+/// (bindreams/cosca#54), so signalling an exited child's group can land on an
+/// unrelated one. The lone `terminate()` is identity-bound and needs no such
+/// guard — which is exactly what makes this one look droppable.
+///
+/// cosca also refuses a graceful op on Windows once an exit has been *reported*,
+/// because its async backend can release the process handle and stop pinning
+/// the pid. That is **not** live here: every spawn in this crate sets
+/// `executable()` and so takes the raw backend, which owns its handle for the
+/// child's whole life. An argv-only spawn added later would re-open it.
+pub(crate) fn has_exited(child: &mut Child) -> bool {
+    matches!(child.try_wait(), Ok(Some(_)))
 }
 
 /// Create the per-run dir `<parent>/<name>`. On a same-second collision (the
@@ -71,49 +61,6 @@ pub(crate) fn create_run_dir(parent: &Path, name: &str, pid: u32) -> std::io::Re
     }
 }
 
-impl BridgeChild {
-    fn child_mut(&mut self) -> &mut Child {
-        match self {
-            #[cfg(unix)]
-            Self::Posix { child, .. } => child,
-            #[cfg(windows)]
-            Self::Windows(gc) => &mut gc.child,
-        }
-    }
-
-    fn signal_term(&mut self) {
-        match self {
-            #[cfg(unix)]
-            Self::Posix { pgid, .. } => {
-                // killpg(SIGTERM) with kill-group's ESRCH/EPERM semantics
-                // (EPERM → direct-to-sudo fallback; sudo relays SIGTERM to
-                // the bridge whose handler runs route/DNS teardown).
-                let _ = kill_group::term_group(*pgid);
-            }
-            #[cfg(windows)]
-            Self::Windows(gc) => {
-                let _ = gc.signal_group_term();
-            }
-        }
-    }
-
-    async fn hard_kill(&mut self) {
-        match self {
-            #[cfg(unix)]
-            Self::Posix { .. } => {
-                // Policy (grace_timeout_action) routes the POSIX bridge to
-                // WarnRecovery, never here; a no-op (not a panic) keeps a
-                // policy bug from also breaking teardown.
-                debug_assert!(false, "policy: POSIX bridge is never force-killed");
-            }
-            #[cfg(windows)]
-            Self::Windows(gc) => {
-                gc.kill_tree().await;
-            }
-        }
-    }
-}
-
 pub async fn main() -> ExitCode {
     // FIRST: interrupt ownership (the dev.py try/finally equivalent). From
     // here on Ctrl+C/SIGTERM never kills us by default disposition — every
@@ -123,9 +70,9 @@ pub async fn main() -> ExitCode {
         Ok(code) => code,
         Err(e) => {
             if e.downcast_ref::<steps::Interrupted>().is_some() {
-                // Interrupt during preflight: children got the console
-                // signal, guards Drop on return. Same exit code as a
-                // steady-state interrupt.
+                // Interrupt during preflight: `run_step` already tore the
+                // child's tree down, guards Drop on return. Same exit code as
+                // a steady-state interrupt.
                 return ExitCode::from(supervision_exit_code(ExitCause::Interrupted));
             }
             if let Some(step) = e.downcast_ref::<steps::StepFailed>() {
@@ -201,7 +148,7 @@ async fn run(interrupts: &mut Interrupts) -> Result<ExitCode> {
 
     // 2. Tools + preflight steps (interrupt-aware; see steps.rs) ======================================================
     let cargo = steps::resolve_tool("cargo")?;
-    let npm = steps::resolve_tool("npm")?;
+    let npm = steps::resolve_npm()?;
     steps::ensure_node_modules(&npm, interrupts).await?;
     // No workspace build here: dev-console supervises only (#564). The xtask
     // cascade built everything; a standalone run reuses the existing build,
@@ -240,7 +187,8 @@ async fn run(interrupts: &mut Interrupts) -> Result<ExitCode> {
     // 6. grant-access via the production path (dev.py §5.15) ==========================================================
     note!("{BOLD}Granting IPC access (creates hole group, adds user)...{RESET}");
     let ga = grant_access_argv(Os::host(), &bridge_bin.to_string_lossy());
-    let mut cmd = Command::new(&ga[0]);
+    // Not a supervised child: it runs to completion here and owns no tree.
+    let mut cmd = tokio::process::Command::new(&ga[0]);
     cmd.args(&ga[1..]);
     let status = cmd.status().await.context("spawning bridge grant-access")?;
     if !status.success() {
@@ -295,7 +243,7 @@ async fn run(interrupts: &mut Interrupts) -> Result<ExitCode> {
 /// (dev.py's `finally`), then the printer is drained (bounded).
 async fn supervise_children(
     interrupts: &mut Interrupts,
-    npm: &Path,
+    npm: &steps::NpmLaunch,
     bridge_bin: &Path,
     gui_bin: &Path,
     socket_path: &Path,
@@ -313,9 +261,9 @@ async fn supervise_children(
         finalize_rx,
     ));
 
-    let mut bridge: Option<BridgeChild> = None;
-    let mut vite: Option<GroupedChild> = None;
-    let mut gui: Option<GroupedChild> = None;
+    let mut bridge: Option<Child> = None;
+    let mut vite: Option<Child> = None;
+    let mut gui: Option<Child> = None;
 
     use futures_util::FutureExt as _;
     // The startup+steady body. Early returns are FINE here — the funnel
@@ -375,16 +323,16 @@ async fn supervise_children(
 #[allow(clippy::too_many_arguments)] // private seam; the funnel needs the slots
 async fn startup_and_supervise(
     interrupts: &mut Interrupts,
-    npm: &Path,
+    npm: &steps::NpmLaunch,
     bridge_bin: &Path,
     gui_bin: &Path,
     socket_path: &Path,
     state_dir: &Path,
     run_dir: &Path,
     tx: &mpsc::Sender<Entry>,
-    bridge_slot: &mut Option<BridgeChild>,
-    vite_slot: &mut Option<GroupedChild>,
-    gui_slot: &mut Option<GroupedChild>,
+    bridge_slot: &mut Option<Child>,
+    vite_slot: &mut Option<Child>,
+    gui_slot: &mut Option<Child>,
 ) -> Result<ExitCause> {
     // Bridge FIRST: the sudo spawns stay back-to-back behind the preflight
     // cache; Vite's readiness wait can't straddle it (dev.py §5.8).
@@ -396,20 +344,23 @@ async fn startup_and_supervise(
         &state_dir.to_string_lossy(),
         &ready.notify_arg(),
     );
-    let mut cmd = Command::new(&argv[0]);
-    cmd.args(&argv[1..]);
+    let mut cmd = Command::new();
+    cmd.executable(&argv[0]);
+    cmd.args(&argv);
     // Per-sink dev logging: file=trace into the run dir, stderr=info to the
     // terminal. These ride the sudo boundary via SUDO_PRESERVE_ENV.
     for (k, v) in crate::policy::dev_run_child_env(run_dir, crate::policy::DEV_RUN_STDERR_BRIDGE) {
         cmd.env(k, v);
     }
     // stdin=null: an expired sudo timestamp gets EOF and exits non-zero
-    // instead of hanging on an invisible prompt (with the setsid TTY detach
-    // in spawn_bridge); also the console-corruption discipline every child
-    // gets (dev.py §5.3).
-    cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    // instead of hanging on an invisible prompt (with the session detach in
+    // spawn_bridge); also the console-corruption discipline every child gets
+    // (dev.py §5.3).
+    cmd.stdin(Stdio::null())?;
+    cmd.stdout(Stdio::pipe())?;
+    cmd.stderr(Stdio::pipe())?;
     let bridge = bridge_slot.insert(spawn_bridge(cmd).context("spawning the bridge")?);
-    pump_child_output(bridge.child_mut(), ChildRole::Bridge, StreamMode::EntryBuffered, tx);
+    pump_child_output(bridge, ChildRole::Bridge, StreamMode::EntryBuffered, tx);
 
     // Ready rendezvous: bridge-exit checked before the token (dev.py polls
     // proc death first); interrupt anywhere tears down via the funnel. The
@@ -417,7 +368,7 @@ async fn startup_and_supervise(
     // that might never succeed.
     tokio::select! {
         biased;
-        status = bridge.child_mut().wait() => {
+        status = bridge.wait() => {
             let status = status?;
             // Supervisor status lines print directly (not via the mux
             // printer) — dev.py parity: its prints didn't take the print
@@ -442,20 +393,23 @@ async fn startup_and_supervise(
 
     // Vite (after the bridge). FORCE_COLOR=1 restores the colors a piped
     // child disables (Delta 3).
-    let mut cmd = Command::new(npm);
-    cmd.args(["run", "dev"]);
+    let mut cmd = Command::new();
+    cmd.executable(npm.program());
+    cmd.args(npm.full_argv(&["run", "dev"]));
     cmd.env("FORCE_COLOR", "1");
-    cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
-    cmd.kill_on_drop(true);
-    let vite = vite_slot.insert(GroupedChild::spawn(&mut cmd, Nesting::Mark).context("spawning vite (npm run dev)")?);
-    pump_child_output(&mut vite.child, ChildRole::Vite, StreamMode::PerLine, tx);
+    cmd.stdin(Stdio::null())?;
+    cmd.stdout(Stdio::pipe())?;
+    cmd.stderr(Stdio::pipe())?;
+    cmd.kill_on_drop(true).contain().nesting(Nesting::Mark);
+    let vite = vite_slot.insert(cmd.spawn().context("spawning vite (npm run dev)")?);
+    pump_child_output(vite, ChildRole::Vite, StreamMode::PerLine, tx);
 
     // biased + exit-arm-first: a dead Vite is reported as such, never as a
     // false "port up" from an unrelated listener (dev.py:246-248 checks
     // poll() before each probe round).
     tokio::select! {
         biased;
-        status = vite.child.wait() => {
+        status = vite.wait() => {
             note!("{YELLOW}Vite exited with code {}{RESET}", status?.code().unwrap_or(-1));
             return Ok(ExitCause::StartupFailed);
         }
@@ -480,23 +434,27 @@ async fn startup_and_supervise(
     if !webview_debug_hint().is_empty() {
         note!("{}", webview_debug_hint());
     }
-    let mut cmd = Command::new(gui_bin);
+    let mut cmd = Command::new();
+    cmd.executable(gui_bin);
+    cmd.arg(gui_bin);
     cmd.env("HOLE_BRIDGE_SOCKET", socket_path);
     cmd.env("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS", webview_args);
     for (k, v) in crate::policy::dev_run_child_env(run_dir, crate::policy::DEV_RUN_STDERR_GUI) {
         cmd.env(k, v);
     }
-    cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
-    cmd.kill_on_drop(true);
-    let gui = gui_slot.insert(GroupedChild::spawn(&mut cmd, Nesting::Mark).context("spawning the GUI")?);
-    pump_child_output(&mut gui.child, ChildRole::Gui, StreamMode::EntryBuffered, tx);
+    cmd.stdin(Stdio::null())?;
+    cmd.stdout(Stdio::pipe())?;
+    cmd.stderr(Stdio::pipe())?;
+    cmd.kill_on_drop(true).contain().nesting(Nesting::Mark);
+    let gui = gui_slot.insert(cmd.spawn().context("spawning the GUI")?);
+    pump_child_output(gui, ChildRole::Gui, StreamMode::EntryBuffered, tx);
 
     // Steady state: first exit / Ctrl+C / SIGTERM wins (replaces dev.py's
     // done.wait(0.5) poll loop and reaper threads — tokio makes them events).
     Ok(tokio::select! {
-        status = bridge.child_mut().wait() => exited("bridge", status),
-        status = vite.child.wait() => exited("vite", status),
-        status = gui.child.wait() => exited("client", status),
+        status = bridge.wait() => exited("bridge", status),
+        status = vite.wait() => exited("vite", status),
+        status = gui.wait() => exited("client", status),
         _ = interrupts.recv() => ExitCause::Interrupted,
     })
 }
@@ -504,7 +462,7 @@ async fn startup_and_supervise(
 /// Steady-state child exit → cause. A CLEAN exit (e.g. the user quit the
 /// GUI from the tray) ends the session with code 0, dev.py parity; a failed
 /// exit is Delta 1's non-zero path.
-fn exited(name: &str, status: std::io::Result<std::process::ExitStatus>) -> ExitCause {
+fn exited(name: &str, status: Result<std::process::ExitStatus, cosca::error::Error>) -> ExitCause {
     match status {
         Ok(s) if s.success() => {
             note!("{YELLOW}{name} exited; shutting down{RESET}");
@@ -523,26 +481,52 @@ fn exited(name: &str, status: std::io::Result<std::process::ExitStatus>) -> Exit
 
 /// Graceful → bounded wait → policy action, per child (dev.py shutdown(),
 /// §5.7). Tolerates partially-started runs (None slots).
-async fn shutdown(bridge: Option<&mut BridgeChild>, vite: Option<&mut GroupedChild>, gui: Option<&mut GroupedChild>) {
+async fn shutdown(bridge: Option<&mut Child>, vite: Option<&mut Child>, gui: Option<&mut Child>) {
     if bridge.is_none() && vite.is_none() && gui.is_none() {
         return;
     }
     note!("\n{BOLD}Shutting down...{RESET}");
     if let Some(bridge) = bridge {
-        // dev.py poll() guard (see is_reaped): a reaped bridge means a
-        // possibly-recycled pgid — never signal it, and there is nothing
-        // left to grace-wait for.
-        if !is_reaped(bridge.child_mut()) {
-            bridge.signal_term();
+        // See has_exited: an exited bridge means a possibly-recycled pgid and,
+        // on Windows, a released handle — never signal it, and there is
+        // nothing left to grace-wait for.
+        if !has_exited(bridge) {
+            // The group signal, not the lone one: on POSIX the bridge is a
+            // sudo wrapper that relays SIGTERM to the root bridge whose
+            // handler runs route/DNS teardown. A member this process may not
+            // signal is expected there (the root-owned bridge behind sudo),
+            // and is non-fatal — but it is logged rather than discarded.
+            if let Err(e) = bridge.terminate_tree() {
+                // Transcript only, not the terminal: expected on POSIX, where
+                // the root-owned bridge behind sudo cannot be probed. Dropping
+                // the typed error silently is what this avoids.
+                crate::transcript::global()
+                    .write_line(&format!("bridge group SIGTERM did not reach every member: {e}"));
+            }
             // Class-2 bound: an out-of-process exit that might never come
             // (10s, dev.py parity).
-            if tokio::time::timeout(GRACE_TIMEOUT, bridge.child_mut().wait())
-                .await
-                .is_err()
-            {
+            if tokio::time::timeout(GRACE_TIMEOUT, bridge.wait()).await.is_err() {
                 match grace_timeout_action(ChildRole::Bridge, Os::host()) {
                     GraceTimeoutAction::WarnRecovery => enote!("{NETWORK_RESET_WARNING}"),
-                    GraceTimeoutAction::HardKill => bridge.hard_kill().await,
+                    GraceTimeoutAction::HardKill if bridge_hard_kill_permitted(Os::host()) => {
+                        if let Err(e) = bridge.kill_tree() {
+                            enote!("{YELLOW}bridge tree kill: {e}{RESET}");
+                        }
+                        let _ = bridge.wait().await;
+                    }
+                    // Unreachable while the policy is correct — which is the
+                    // point. The assert reports a regression in debug; this arm
+                    // is what still refuses it in release, where the assert is
+                    // gone. Falling through would SIGKILL the sudo relay and
+                    // orphan the root-owned bridge.
+                    GraceTimeoutAction::HardKill => {
+                        debug_assert!(
+                            bridge_hard_kill_permitted(Os::host()),
+                            "policy regression: grace_timeout_action routed the POSIX bridge to a hard kill; \
+                             killing through the sudo relay kills sudo and orphans the root bridge"
+                        );
+                        enote!("{NETWORK_RESET_WARNING}");
+                    }
                 }
             }
         }
@@ -556,51 +540,54 @@ async fn shutdown(bridge: Option<&mut BridgeChild>, vite: Option<&mut GroupedChi
 
 /// Graceful group signal → bounded wait → hard tree-kill. Shared by
 /// shutdown() and the grandchild-reap integration test.
-pub(crate) async fn teardown_grouped(gc: &mut GroupedChild, role: ChildRole) {
-    // dev.py poll() parity: a reaped leader means a possibly-recycled pgid —
-    // never signal it. Lingering group members (if any) are reaped by the
-    // Drop backstop's group kill, accepting kill-group's documented
-    // stored-pgid semantics there (garter parity).
-    if is_reaped(&gc.child) {
+pub(crate) async fn teardown_grouped(child: &mut Child, role: ChildRole) {
+    // See has_exited. Lingering group members (if any) are reaped by the Drop
+    // backstop's tree kill.
+    if has_exited(child) {
         return;
     }
-    let _ = gc.signal_group_term();
+    // The group signal, not the lone one: Vite is `npm run dev`, and npm exits
+    // on SIGTERM without forwarding it — a lone signal would satisfy the grace
+    // wait while node and esbuild survived to be SIGKILLed by the Drop
+    // backstop, silently downgrading a graceful teardown to a hard kill.
+    if let Err(e) = child.terminate_tree() {
+        // Every error from this call means NO signal went out and the tree is
+        // still running, so the grace wait below is about to look like a stall
+        // with no cause. Say which it was.
+        enote!("{YELLOW}{role:?} did not receive the cooperative signal: {e}{RESET}");
+    }
     // Class-2 bound: out-of-process exit that may never come (10s).
-    if tokio::time::timeout(GRACE_TIMEOUT, gc.child.wait()).await.is_err() {
+    if tokio::time::timeout(GRACE_TIMEOUT, child.wait()).await.is_err() {
         debug_assert_eq!(grace_timeout_action(role, Os::host()), GraceTimeoutAction::HardKill);
-        gc.kill_tree().await;
+        // Signal-only: the wait below is what reaps, and it must run even if
+        // the tree teardown reported a refusal — that report is what tells us
+        // whether the root actually died.
+        if let Err(e) = child.kill_tree() {
+            enote!("{YELLOW}{role:?} tree kill did not reach every member: {e}{RESET}");
+        }
+        let _ = child.wait().await;
     }
 }
 
-fn spawn_bridge(mut cmd: Command) -> std::io::Result<BridgeChild> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt as _;
-        // Full new session (dev.py start_new_session parity, dev.py:296):
-        // detaches the controlling TTY so an expired-timestamp sudo cannot
-        // prompt on /dev/tty (it EOFs on the null stdin instead), and makes
-        // the child a process-group leader for the graceful killpg.
-        // SAFETY: setsid is async-signal-safe and the closure does nothing
-        // else (last_os_error only reads errno).
-        unsafe {
-            cmd.as_std_mut().pre_exec(|| {
-                // A failed setsid would silently break the pgid==pid leader
-                // assumption killpg relies on; failing the spawn surfaces it.
-                if libc::setsid() == -1 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
-        let child = cmd.spawn()?;
-        let pgid = child.id().expect("freshly spawned child has a pid");
-        Ok(BridgeChild::Posix { child, pgid })
-    }
-    #[cfg(windows)]
-    {
-        cmd.kill_on_drop(true);
-        Ok(BridgeChild::Windows(GroupedChild::spawn(&mut cmd, Nesting::Opaque)?))
-    }
+/// `ContainMode::Session` is the dev.py `start_new_session` parity (dev.py:296):
+/// on POSIX it is `setsid`, detaching the controlling TTY so an expired-timestamp
+/// sudo cannot prompt on /dev/tty (it EOFs on the null stdin instead) and making
+/// the child a group leader for the graceful killpg; on Windows it takes the same
+/// root flags as `Strongest`, so the bridge is its own console group inside a
+/// kill-on-close job (a crashed supervisor can no longer leak a routing-active
+/// bridge, Delta 6).
+///
+/// `Nesting::Opaque` on both platforms: the mark would stop the bridge's own
+/// garter from containing its plugin chains, which must nest inside this tree.
+fn spawn_bridge(mut cmd: Command) -> Result<Child, cosca::error::Error> {
+    // Drop-kill exactly when the policy would force-kill this child anyway. One
+    // owner for both decisions, so they cannot drift: on POSIX a SIGKILL through
+    // the sudo relay kills sudo and silently ORPHANS the root bridge.
+    let kill_on_drop = grace_timeout_action(ChildRole::Bridge, Os::host()) == GraceTimeoutAction::HardKill;
+    cmd.kill_on_drop(kill_on_drop)
+        .contain_with(ContainMode::Session)
+        .nesting(Nesting::Opaque);
+    cmd.spawn()
 }
 
 /// Two pumps per child — a DECIDED divergence from dev.py's OS-level
@@ -610,10 +597,10 @@ fn spawn_bridge(mut cmd: Command) -> std::io::Result<BridgeChild> {
 /// panic output land on stderr only (crates/common/src/logging.rs), so
 /// multi-line entries never split across the two pipes today.
 fn pump_child_output(child: &mut Child, role: ChildRole, mode: StreamMode, tx: &mpsc::Sender<Entry>) {
-    if let Some(stdout) = child.stdout.take() {
+    if let Some(stdout) = child.stdout() {
         tokio::spawn(pump(stdout, mode, role.prefix(), tx.clone()));
     }
-    if let Some(stderr) = child.stderr.take() {
+    if let Some(stderr) = child.stderr() {
         tokio::spawn(pump(stderr, mode, role.prefix(), tx.clone()));
     }
 }

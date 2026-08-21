@@ -30,6 +30,185 @@ fn first_failure_for_sentinel() -> bool {
     }
 }
 
+/// Absorb the cooperative shutdown signal, so only a force-kill can end this process.
+#[cfg(unix)]
+fn ignore_cooperative_signal() {
+    // SAFETY: setting SIG_IGN runs no handler code; it only changes a process-wide disposition.
+    unsafe {
+        libc::signal(libc::SIGTERM, libc::SIG_IGN);
+    }
+}
+
+#[cfg(windows)]
+fn ignore_cooperative_signal() {
+    use windows::Win32::System::Console::SetConsoleCtrlHandler;
+
+    // Returning TRUE claims the event as handled, so the default disposition
+    // (STATUS_CONTROL_C_EXIT) never runs.
+    unsafe extern "system" fn absorb(_ctrl_type: u32) -> windows::core::BOOL {
+        windows::Win32::Foundation::TRUE
+    }
+
+    // SAFETY: `absorb` is a valid handler with the required ABI and no state of its own.
+    unsafe { SetConsoleCtrlHandler(Some(absorb), true) }.expect("install a console control handler");
+}
+
+/// One readiness byte on stdout, flushed. The reader's `read_exact` of it is the
+/// happens-before edge for "this process is executing its own code" — which the
+/// Windows leg needs, because a child is not registered with any console at the
+/// instant its spawn returns.
+fn report_ready() {
+    use std::io::Write;
+    let mut out = std::io::stdout();
+    out.write_all(b"R").expect("write the readiness byte");
+    out.flush().expect("flush the readiness byte");
+}
+
+/// Middle level of the nesting probe: spawn a nested contained copy of ourselves,
+/// then report two lines on stdout — the grandchild's achieved containment, and how
+/// its cooperative shutdown ended.
+async fn run_nest_probe(control_addr: std::ffi::OsString) -> Result<(), Box<dyn std::error::Error>> {
+    use tokio::io::AsyncReadExt;
+
+    let mut cmd = cosca::tokio::Command::new();
+    cmd.executable(std::env::current_exe()?)
+        .arg(std::env::current_exe()?)
+        .env("MOCK_PLUGIN_NEST_GRANDCHILD", &control_addr)
+        .env_remove("MOCK_PLUGIN_NEST_PROBE")
+        .kill_on_drop(true)
+        .contain();
+    cmd.stdin(cosca::Stdio::null())?;
+    cmd.stdout(cosca::Stdio::pipe())?;
+    cmd.stderr(cosca::Stdio::null())?;
+    let mut grandchild = cmd.spawn()?;
+
+    let mut stdout = grandchild.stdout().expect("the grandchild's stdout was piped");
+    let mut ready = [0u8; 1];
+    stdout.read_exact(&mut ready).await?;
+
+    println!("{}", grandchild.containment());
+    println!("{}", describe_shutdown(&mut grandchild).await);
+    use std::io::Write;
+    std::io::stdout().flush()?;
+    Ok(())
+}
+
+/// Shut the grandchild down cooperatively and render the outcome as one line:
+/// `error=<e>`, or the exit status the escalation-capable call returned.
+async fn describe_shutdown(grandchild: &mut cosca::tokio::Child) -> String {
+    let status = match grandchild.graceful_shutdown(std::time::Duration::from_secs(5)).await {
+        Ok(status) => status,
+        Err(e) => return format!("error={e}"),
+    };
+    let code = status.code().map_or_else(|| "none".to_string(), |c| c.to_string());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        let signal = status.signal().map_or_else(|| "none".to_string(), |s| s.to_string());
+        format!("code={code} signal={signal}")
+    }
+    #[cfg(not(unix))]
+    format!("code={code}")
+}
+
+/// Middle level of the std-handle hygiene probe (bindreams/hole#197): spawn a copy
+/// of ourselves with every stdio slot redirected to null, handing it the numeric
+/// value of OUR stdout handle, then exit at once — so the only process that can
+/// still be holding the host's pipe is the grandchild.
+///
+/// `MOCK_PLUGIN_HYGIENE_NEST` picks the spawn route, which is the whole experiment:
+/// `"std"` is the positive control, a `std::process::Command` that scopes nothing,
+/// and `"contain"` is the real leg, a nested contained cosca spawn.
+#[cfg(windows)]
+async fn run_hygiene_probe(control_addr: std::ffi::OsString) -> Result<(), Box<dyn std::error::Error>> {
+    use windows::Win32::System::Console::{GetStdHandle, STD_OUTPUT_HANDLE};
+
+    // SAFETY: a plain query of this process's own standard-handle table.
+    let stdout_handle = unsafe { GetStdHandle(STD_OUTPUT_HANDLE) }?;
+    let sentinel = (stdout_handle.0 as usize).to_string();
+    let via_std = std::env::var_os("MOCK_PLUGIN_HYGIENE_NEST").is_some_and(|v| v == "std");
+
+    // Positive control: `std::process::Command` passes `bInheritHandles = TRUE` with
+    // no handle list, so the grandchild receives every handle this process has marked
+    // inheritable — including the stdout pipe it was never given as stdio.
+    if via_std {
+        let mut cmd = std::process::Command::new(std::env::current_exe()?);
+        cmd.env("MOCK_PLUGIN_HYGIENE_SENTINEL", &sentinel)
+            .env("MOCK_PLUGIN_HYGIENE_PROBE", &control_addr)
+            .env_remove("MOCK_PLUGIN_HYGIENE_NEST")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        // std's `Child` is not kill-on-drop, so the grandchild outlives this process.
+        cmd.spawn()?;
+        return Ok(());
+    }
+
+    let mut cmd = cosca::tokio::Command::new();
+    cmd.executable(std::env::current_exe()?)
+        .arg(std::env::current_exe()?)
+        .env("MOCK_PLUGIN_HYGIENE_SENTINEL", &sentinel)
+        .env("MOCK_PLUGIN_HYGIENE_PROBE", &control_addr)
+        .env_remove("MOCK_PLUGIN_HYGIENE_NEST")
+        // The grandchild must outlive this process: it is the subject under test.
+        .kill_on_drop(false)
+        .contain();
+    cmd.stdin(cosca::Stdio::null())?;
+    cmd.stdout(cosca::Stdio::null())?;
+    cmd.stderr(cosca::Stdio::null())?;
+    cmd.spawn()?;
+    Ok(())
+}
+
+/// Innermost level of the hygiene probe. Answer whether the handle value we were
+/// handed is a pipe in THIS process — inherited handles keep their numeric value —
+/// and report the verdict on the control channel.
+#[cfg(windows)]
+async fn run_hygiene_grandchild(
+    sentinel: std::ffi::OsString,
+    control_addr: std::ffi::OsString,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use std::io::Write;
+    use std::os::windows::io::FromRawHandle;
+    use tokio::io::AsyncWriteExt;
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::Storage::FileSystem::{GetFileType, FILE_TYPE_PIPE};
+
+    let raw: usize = sentinel
+        .to_str()
+        .expect("MOCK_PLUGIN_HYGIENE_SENTINEL is valid utf-8")
+        .parse()?;
+    let handle = HANDLE(raw as *mut std::ffi::c_void);
+
+    // Probe BEFORE dialling: a Windows socket also answers FILE_TYPE_PIPE, so a
+    // socket opened first would widen the numeric-collision window for no benefit.
+    // The handle value is fixed at process start; opening a socket cannot change it.
+    // SAFETY: `GetFileType` reads a handle value and answers FILE_TYPE_UNKNOWN for
+    // one this process does not own — it never dereferences anything.
+    let is_pipe = unsafe { GetFileType(handle) } == FILE_TYPE_PIPE;
+
+    let addr = control_addr.to_str().expect("MOCK_PLUGIN_HYGIENE_PROBE is valid utf-8");
+    let mut control = TcpStream::connect(addr).await?;
+
+    let verdict = if is_pipe {
+        // Exactly the #197 leak: a grandchild writing down the host's stdout pipe,
+        // whose reader would never see EOF while this process lives. `ManuallyDrop`
+        // keeps holding it, so the test's EOF assertion is about this process's death.
+        let mut host_pipe = std::mem::ManuallyDrop::new(unsafe {
+            std::fs::File::from_raw_handle(handle.0 as std::os::windows::raw::HANDLE)
+        });
+        host_pipe.write_all(b"HYGIENE\n")?;
+        host_pipe.flush()?;
+        "held"
+    } else {
+        "clear"
+    };
+    control.write_all(format!("{verdict}\n").as_bytes()).await?;
+    control.flush().await?;
+    std::future::pending::<()>().await;
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Knob: MOCK_PLUGIN_SLEEP — "grandchild" mode (a garter process-tree-reaping
@@ -45,6 +224,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // TCP connection) and needs no sleep. We never write to the socket — closing
     // it is purely an exit signal.
     if std::env::var_os("MOCK_PLUGIN_SLEEP").is_some() {
+        // Knob: MOCK_PLUGIN_IGNORE_SIGNALS — absorb the cooperative shutdown signal
+        // (SIGTERM / CTRL_BREAK) so only a force-kill can end this process. Installed
+        // before the callback dial, so a test that has observed readiness is past it.
+        if std::env::var_os("MOCK_PLUGIN_IGNORE_SIGNALS").is_some() {
+            ignore_cooperative_signal();
+        }
         let _callback = match std::env::var_os("MOCK_PLUGIN_GRANDCHILD_CALLBACK") {
             Some(addr) => {
                 let addr = addr.to_str().expect("MOCK_PLUGIN_GRANDCHILD_CALLBACK is valid utf-8");
@@ -57,6 +242,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             None => None,
         };
         std::future::pending::<()>().await;
+    }
+
+    // Knob: MOCK_PLUGIN_NEST_GRANDCHILD=<control addr> — the innermost level of the
+    // nesting probe. Dial the control address and hold it (the test accepts it to
+    // observe liveness, and reads it to observe death), report readiness on stdout,
+    // then park. NO signal handler: the cooperative signal must end this process by
+    // its default disposition, which is what distinguishes it from an escalation.
+    if let Some(addr) = std::env::var_os("MOCK_PLUGIN_NEST_GRANDCHILD") {
+        let addr = addr.to_str().expect("MOCK_PLUGIN_NEST_GRANDCHILD is valid utf-8");
+        let _control = TcpStream::connect(addr)
+            .await
+            .expect("grandchild dials the control channel");
+        report_ready();
+        std::future::pending::<()>().await;
+    }
+
+    // Knob: MOCK_PLUGIN_NEST_PROBE=<control addr> — the middle level. Spawn a
+    // contained copy of ourselves (nested, because our own environment carries the
+    // containment marker) and report, on stdout, what containment it achieved and
+    // how the cooperative signal ended it.
+    if let Some(addr) = std::env::var_os("MOCK_PLUGIN_NEST_PROBE") {
+        return run_nest_probe(addr).await;
+    }
+
+    // Knobs: MOCK_PLUGIN_HYGIENE_{PROBE,NEST,SENTINEL} — the Windows std-handle
+    // hygiene probe. SENTINEL is checked first: it is what makes a process the
+    // grandchild, and both levels carry PROBE.
+    #[cfg(windows)]
+    if let Some(addr) = std::env::var_os("MOCK_PLUGIN_HYGIENE_PROBE") {
+        return match std::env::var_os("MOCK_PLUGIN_HYGIENE_SENTINEL") {
+            Some(sentinel) => run_hygiene_grandchild(sentinel, addr).await,
+            None => run_hygiene_probe(addr).await,
+        };
     }
 
     let local_host = std::env::var("SS_LOCAL_HOST")?;

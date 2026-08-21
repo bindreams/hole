@@ -285,26 +285,29 @@ fn ready_notify_tolerates_malformed_spec_and_dead_listener() {
 
 /// CTRL_BREAK must resolve shutdown_signal (the Windows analog of the
 /// sigterm_resolves_shutdown_signal test below it). Runs the bridge test
-/// binary as a kill-group child (=> CREATE_NEW_PROCESS_GROUP) and delivers
+/// binary as a contained child (=> CREATE_NEW_PROCESS_GROUP) and delivers
 /// the real console signal.
 #[cfg(windows)]
 #[skuld::test]
 fn ctrl_break_resolves_shutdown_signal() {
     let rt = tokio::runtime::Runtime::new().unwrap();
     rt.block_on(async {
-        let exe = std::env::current_exe().unwrap();
-        let mut cmd = tokio::process::Command::new(exe);
+        let mut cmd = cosca::tokio::Command::new();
+        cmd.executable(std::env::current_exe().unwrap());
+        cmd.arg(std::env::current_exe().unwrap());
         cmd.env(crate::foreground_child_hook::MODE_ENV, "1");
-        cmd.stdin(std::process::Stdio::null());
-        cmd.stdout(std::process::Stdio::piped());
-        cmd.kill_on_drop(true);
-        let mut gc = kill_group::GroupedChild::spawn(&mut cmd, kill_group::Nesting::Mark).unwrap();
-        let stdout = gc.child.stdout.take().unwrap();
+        cmd.stdin(cosca::Stdio::null()).unwrap();
+        cmd.stdout(cosca::Stdio::pipe()).unwrap();
+        cmd.kill_on_drop(true)
+            .contain()
+            .nesting(cosca::containment::Nesting::Mark);
+        let mut child = cmd.spawn().unwrap();
+        let stdout = child.stdout().unwrap();
         let mut lines = tokio::io::BufReader::new(stdout).lines();
         // Rendezvous: the child prints only after handlers are installed.
         assert_eq!(lines.next_line().await.unwrap().as_deref(), Some("HANDLER-READY"));
-        gc.signal_group_term().unwrap();
-        let status = gc.child.wait().await.unwrap();
+        child.terminate_tree().unwrap();
+        let status = child.wait().await.unwrap();
         assert!(
             status.success(),
             "CTRL_BREAK must resolve shutdown_signal; got {status:?}"
