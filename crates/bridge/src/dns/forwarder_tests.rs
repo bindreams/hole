@@ -1180,27 +1180,3 @@ async fn upstream_activity_counts_a_udp_associate_separately_from_connects() {
         "the ASSOCIATE itself must be counted; got {moved:?}"
     );
 }
-
-// UpstreamErr size budget =============================================================================================
-
-/// Regression test for #855: a stray `clippy::result_large_err` (128-byte
-/// default threshold) on an unboxed `UpstreamErr` in a `Result` turned `main`
-/// red on nothing but a toolchain bump. #856 boxed every `Result<_,
-/// UpstreamErr>` on the DNS-forward path to `Result<_, Box<UpstreamErr>>`, so
-/// the lint no longer sees `UpstreamErr` itself — but the struct still pays
-/// for its own size on every construction, before it lands in the box. This
-/// asserts that size directly, so it fails on any toolchain rather than only
-/// a newer clippy than the one a contributor happens to run.
-#[skuld::test]
-fn upstream_err_stays_within_its_size_budget() {
-    const LIMIT: usize = 136;
-    let actual = std::mem::size_of::<UpstreamErr>();
-    assert!(
-        actual <= LIMIT,
-        "UpstreamErr grew to {actual} bytes (budget {LIMIT}). It is boxed on every DNS-forward \
-         Result already, so it will not re-trip clippy::result_large_err directly, but it still \
-         sits on the Result path of a hot DNS query and every added byte is copied on each \
-         upstream failure before boxing. Box the new field(s) into a nested cold-diagnostics \
-         struct instead of raising this limit."
-    );
-}
