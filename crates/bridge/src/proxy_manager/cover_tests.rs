@@ -67,12 +67,17 @@ fn cover_holder_probe_suppression_does_not_read_the_intent_when_a_cover_is_held(
     }
 }
 
-/// Structural guard, not a proof: it asserts there is exactly one syntactic
-/// reader (`\.lockdown\b`) of the session's standing-cover field in non-test
-/// bridge sources, and that the one reader is `Posture::cover_holder`. An
-/// added accessor that reads the field under a different name routes around
-/// this guard, and value-agreement tests cannot close that gap either — see
-/// this plan's "structural guard" section.
+/// Structural guard, not a proof: it asserts there is exactly one `.field`-
+/// access reader (`\.lockdown\b`) of the session's standing-cover field in
+/// non-test bridge sources, and that the one reader is `Posture::cover_
+/// holder`. Two evasions it does NOT catch: an added accessor that reads
+/// the field under a different name, and a pattern-destructuring read
+/// (`let RunningState { lockdown, .. } = state;` — the exact shape
+/// `stop_with` already uses to CONSUME, not derive ownership from, this
+/// same field) — neither has a leading `.` before `lockdown`, so the regex
+/// is blind to both. Value-agreement tests cannot close either gap: a
+/// second, independent derivation that agrees at every state they visit
+/// still passes them.
 #[skuld::test]
 fn the_standing_cover_field_has_exactly_one_reader() {
     let pattern = regex::Regex::new(r"\.lockdown\b").unwrap();
@@ -118,7 +123,9 @@ fn the_standing_cover_field_has_exactly_one_reader() {
             "A failure here means one of two things: either a second, independent derivation of \
              cover ownership was added somewhere (the real defect — the one sanctioned reader is \
              Posture::cover_holder), or a comment/doc string in a walked file now quotes the \
-             pattern, which is a false positive and should be reworded.",
+             pattern, which is a false positive and should be reworded. This regex only catches \
+             `.field` access — a pattern-destructuring read (`let RunningState { lockdown, .. } \
+             = ...;`) is invisible to it and would evade this guard entirely.",
         );
         msg
     };

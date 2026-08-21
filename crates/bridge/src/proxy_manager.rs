@@ -150,11 +150,14 @@ struct RunningState<P: Proxy, R: Routing, D: Dns> {
     routes: Option<R::Installed>,
     /// Standing lockdown cover, engaged only when intent is on. `None` when
     /// lockdown is off — then behavior is byte-identical to today. The
-    /// session's standing cover: `Posture::cover_holder` is its sole reader
-    /// (structurally enforced — see `cover_tests.rs`); on stop a `UserStop`
-    /// disengages it and a `Cutover` disarms it (the persistent filters
-    /// survive), both after routes tear down (its Drop is the catastrophic
-    /// safety net).
+    /// session's standing cover: `Posture::cover_holder` is the sole
+    /// deriver of cover OWNERSHIP from it (a regex-based structural guard
+    /// in `cover_tests.rs` catches a second `.field` access, but is blind
+    /// to a destructuring read — see that guard's own doc). `stop_with`
+    /// separately CONSUMES this field to decide the cover's fate at
+    /// teardown, not to derive ownership: a `UserStop` disengages it and a
+    /// `Cutover` disarms it (the persistent filters survive), both after
+    /// routes tear down (its Drop is the catastrophic safety net).
     lockdown: Option<R::Cover>,
     /// Handle on the running proxy. Drop aborts the task (best-effort);
     /// supported graceful shutdown is via `stop().await` from
@@ -207,16 +210,15 @@ pub struct ProxyManager<P: Proxy = ShadowsocksProxy, R: Routing = SystemRouting,
     proxy: P,
     routing: R,
     dns: D,
-    /// Who owns the per-cycle state right now — idle, a pending covered start,
-    /// or a live session. See the `Posture` section above. The pending-start
-    /// case holds the single transient fail-closed cover, engaged when a
-    /// covered (auto-connect) start failed: the host stays blocked, not
-    /// leaked, while no session is running. The live guard is held here (its
-    /// `Drop` still runs) — released on a user stop/cancel or the next
-    /// successful start. The transient cover is a global singleton, so a
-    /// retry reuses this guard rather than engaging a second. It carries the
-    /// server identity it permits so a same-server retry reuses the resolved
-    /// IP instead of re-resolving under the cover (which it would block).
+    /// See the `Posture` section below. The pending-start case holds the
+    /// single transient fail-closed cover, engaged when a covered
+    /// (auto-connect) start failed: the host stays blocked, not leaked,
+    /// while no session is running. The live guard is held here (its `Drop`
+    /// still runs) — released on a user stop/cancel or the next successful
+    /// start. The transient cover is a global singleton, so a retry reuses
+    /// this guard rather than engaging a second. It carries the server
+    /// identity it permits so a same-server retry reuses the resolved IP
+    /// instead of re-resolving under the cover (which it would block).
     posture: Posture<P, R, D>,
     last_error: Option<String>,
     /// The out-of-band death reason surfaced to the GUI status/toast, distinct

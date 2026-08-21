@@ -7,9 +7,8 @@
 // is `Nobody` here and can still block every packet. Do not let a future
 // site treat "nobody holds it" as "nothing is blocking".
 
-/// Who, inside this process, holds a fail-closed cover. Derived once from
-/// [`super::Posture`] by [`super::Posture::cover_holder`] — no other site may
-/// recompute it.
+/// Derived once from [`super::Posture`] by [`super::Posture::cover_holder`]
+/// — no other site may recompute it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum CoverHolder {
     Nobody,

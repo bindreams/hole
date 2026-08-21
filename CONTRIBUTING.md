@@ -681,6 +681,16 @@ Answering "is the host held closed right now" needs an OS probe this model
 does not have; that probe is later work, and this model is the vocabulary it
 composes into, not a substitute for it.
 
+"That every other site asks rather than recomputes" is enforced by a
+structural test (`the_standing_cover_field_has_exactly_one_reader`,
+`proxy_manager/cover_tests.rs`), not proven by the type system — it counts
+`.field`-access reads of the session's standing-cover field and asserts
+there is exactly one, in `Posture::cover_holder`. It is blind to an added
+accessor under a different name and to a pattern-destructuring read (the
+shape `stop_with` itself already uses, to consume rather than derive
+ownership from, this same field); see the guard's own doc for the full
+disclosed gap.
+
 ### Update cutover
 
 `POST /v1/update-apply` ([`cutover/apply.rs`](crates/bridge/src/cutover/apply.rs))

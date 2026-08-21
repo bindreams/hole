@@ -4496,7 +4496,7 @@ mod self_test {
         });
     }
 
-    // Cover ownership model (#825 stage 2) ============================================================================
+    // Cover ownership model ===========================================================================================
     //
     // These next two tests assert VALUE AGREEMENT: the two public predicates
     // (`lockdown_active`, `blocked_until_connected`) never disagree with
@@ -4507,12 +4507,19 @@ mod self_test {
     // written directly into `lockdown_active`, bypassing `cover_holder`) that
     // happens to agree at every state visited here would still pass both.
     // `the_standing_cover_field_has_exactly_one_reader` (`cover_tests.rs`) is
-    // what covers that shape; this file is skipped by its walk (it ends in
-    // `_tests.rs`), so naming the anti-pattern here in prose cannot trip it.
+    // a PARTIAL backstop for `lockdown_active`'s half of this shape (itself
+    // blind to a destructuring read — see that guard's own doc); this file
+    // is skipped by its walk (it ends in `_tests.rs`), so naming the
+    // anti-pattern here in prose cannot trip it. `blocked_until_connected` —
+    // the transient half — has NO structural backstop at all: a
+    // recomputation like `self.posture.pending().is_some()` would agree with
+    // it at every state below and pass undetected.
 
-    /// Fails against a `lockdown_active()` that reads anything other than the
-    /// holder, and against a posture that leaves a session behind after
-    /// `stop()`. Does NOT prove a cover stranded by a previous process is
+    /// Pins value agreement between `lockdown_active()` and the holder at
+    /// each observed state in a session's lifecycle, and that a posture
+    /// leaves no session behind after `stop()`. Does NOT prove
+    /// `lockdown_active()` derives from the holder (see the preamble above),
+    /// and does NOT prove a cover stranded by a previous process is
     /// invisible to all of this — there is no probe for that in this stage.
     #[skuld::test]
     fn posture_reports_one_cover_holder_across_a_session_lifecycle() {
@@ -4547,11 +4554,13 @@ mod self_test {
         });
     }
 
-    /// Fails against any implementation where a held transient cover can
-    /// coexist with a session, and against a `blocked_until_connected()`
-    /// sourced from anything but the holder. Does NOT prove a cover stranded
-    /// by a previous process is invisible to all of this — there is no probe
-    /// for that in this stage.
+    /// Pins value agreement between `blocked_until_connected()` and the
+    /// holder after a failed covered start, and that the holder is
+    /// `PendingStart` — not `Session`, not `Nobody`. Does NOT prove
+    /// `blocked_until_connected()` derives from the holder — this predicate
+    /// has NO structural backstop at all (see the preamble above) — and does
+    /// NOT prove a cover stranded by a previous process is invisible to all
+    /// of this — there is no probe for that in this stage.
     #[skuld::test]
     fn posture_reports_a_pending_start_after_a_failed_covered_start() {
         rt().block_on(async {
@@ -4610,10 +4619,43 @@ mod self_test {
         });
     }
 
-    /// `commit_session`'s `debug_assert!` stays unexercised, and that is a
-    /// disclosed gap, not an oversight: reaching it needs a second
+    /// `hold_pending`'s contract ("posture must be Idle") is exercised
+    /// against both of its invalid inputs: a live `Session` (below — the
+    /// silent-overwrite scenario the PR body's "what the collapse costs"
+    /// section describes, dropping a live `RunningState` without
+    /// `stop_with`'s ordered teardown) and an existing `PendingStart`
+    /// (`posture_hold_pending_rejects_a_posture_that_already_holds_one`,
+    /// next). `commit_session`'s `debug_assert!` stays unexercised, and that
+    /// IS a disclosed gap, not an oversight: reaching it needs a second
     /// `RunningState`, which cannot be built without a live `P::Running` and
     /// a hand-rolled fixture whose cost exceeds what the assert is worth.
+    #[skuld::test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "hold_pending: posture must be Idle")]
+    fn posture_hold_pending_rejects_a_running_session() {
+        rt().block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let routing = MockRouting::new(dir.path().to_path_buf());
+            let (mut pm, dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, false);
+            let cfg = test_config();
+            pm.start(&cfg).await.unwrap();
+            assert_eq!(pm.state(), ProxyState::Running, "setup must leave a live session");
+
+            let server_ip: IpAddr = cfg.server.server.parse().unwrap();
+            let second_routing = MockRouting::new(dir.path().to_path_buf());
+            let cover = second_routing.install_failclosed_cover(server_ip, None).unwrap();
+            pm.posture.hold_pending(BlockedStart {
+                cover,
+                host: cfg.server.server.clone(),
+                server_ip,
+                pin: crate::dns::ech::PinSource::NoQueryNeeded,
+                resolver_permit: None,
+            });
+        });
+    }
+
+    /// The other of `hold_pending`'s two invalid inputs — an existing
+    /// `PendingStart`. See the comment above.
     #[skuld::test]
     #[cfg(debug_assertions)]
     #[should_panic(expected = "hold_pending: posture must be Idle")]
