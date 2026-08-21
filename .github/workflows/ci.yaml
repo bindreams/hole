@@ -794,23 +794,16 @@ jobs:
           node-version-file: package.json
           cache: npm
 
-      # Pinned from `rust-toolchain.toml`, as in `setup-build`.
-      - name: Read pinned Rust toolchain
-        id: rust-version
-        run: sed -n 's/^channel = "\(.*\)"$/toolchain=\1/p' rust-toolchain.toml >> "$GITHUB_OUTPUT"
-
-      - uses: dtolnay/rust-toolchain@master
-        id: rust-toolchain
-        with:
-          toolchain: ${{ steps.rust-version.outputs.toolchain }}
+      - uses: ./.github/actions/setup-rust
+        id: setup-rust
 
       - uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-          key: cargo-${{ runner.os }}-${{ steps.rust-toolchain.outputs.cachekey }}-${{ hashFiles('Cargo.lock') }}
-          restore-keys: cargo-${{ runner.os }}-${{ steps.rust-toolchain.outputs.cachekey }}-
+          key: cargo-${{ runner.os }}-${{ steps.setup-rust.outputs.cachekey }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-${{ runner.os }}-${{ steps.setup-rust.outputs.cachekey }}-
 
       - name: Build frontend
         run: cargo xtask build frontend-build

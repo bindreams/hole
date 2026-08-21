@@ -1,0 +1,41 @@
+name: Setup Rust
+description: Read the pinned Rust toolchain channel and install it
+
+# `rust-toolchain.toml` is the single source of truth. It already governs
+# every `cargo` call through rustup's directory override; feeding `channel`
+# to the action too means the toolchain is installed up front, with
+# components, and `cachekey` tracks the pinned rustc rather than whatever
+# `stable` resolved to that morning.
+#
+# This is the one place that reads `rust-toolchain.toml` — every call site
+# gets it for free by calling this action instead of duplicating the read.
+# A call site still owns its own `if:`; this action just guarantees that
+# whichever condition gates the call, the read and the install share it.
+
+inputs:
+  components:
+    description: "Comma-separated rustup components to install (see dtolnay/rust-toolchain)"
+    required: false
+    default: ""
+
+outputs:
+  toolchain:
+    description: "The pinned toolchain channel, e.g. 1.90.0"
+    value: ${{ steps.rust-version.outputs.toolchain }}
+  cachekey:
+    description: "Cache-key fragment from dtolnay/rust-toolchain, for cache action keys"
+    value: ${{ steps.rust-toolchain.outputs.cachekey }}
+
+runs:
+  using: composite
+  steps:
+    - name: Read pinned Rust toolchain
+      id: rust-version
+      shell: bash
+      run: sed -n 's/^channel = "\(.*\)"$/toolchain=\1/p' rust-toolchain.toml >> "$GITHUB_OUTPUT"
+
+    - uses: dtolnay/rust-toolchain@master
+      id: rust-toolchain
+      with:
+        toolchain: ${{ steps.rust-version.outputs.toolchain }}
+        components: ${{ inputs.components }}
