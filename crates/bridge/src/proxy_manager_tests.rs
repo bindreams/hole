@@ -4495,4 +4495,147 @@ mod self_test {
             }
         });
     }
+
+    // Cover ownership model (#825 stage 2) ============================================================================
+    //
+    // These next two tests assert VALUE AGREEMENT: the two public predicates
+    // (`lockdown_active`, `blocked_until_connected`) never disagree with
+    // `Posture::cover_holder`, and the holder is exactly one thing at each
+    // observed point. They do NOT prove single derivation — a second,
+    // independent recomputation (e.g. a hypothetical
+    // `self.posture.session().map(|r| r.lockdown.is_some()).unwrap_or(false)`
+    // written directly into `lockdown_active`, bypassing `cover_holder`) that
+    // happens to agree at every state visited here would still pass both.
+    // `the_standing_cover_field_has_exactly_one_reader` (`cover_tests.rs`) is
+    // what covers that shape; this file is skipped by its walk (it ends in
+    // `_tests.rs`), so naming the anti-pattern here in prose cannot trip it.
+
+    /// Fails against a `lockdown_active()` that reads anything other than the
+    /// holder, and against a posture that leaves a session behind after
+    /// `stop()`. Does NOT prove a cover stranded by a previous process is
+    /// invisible to all of this — there is no probe for that in this stage.
+    #[skuld::test]
+    fn posture_reports_one_cover_holder_across_a_session_lifecycle() {
+        rt().block_on(async {
+            // Lockdown-on: Idle -> Session { standing: true } -> Idle.
+            let dir = tempfile::tempdir().unwrap();
+            let routing = MockRouting::new(dir.path().to_path_buf());
+            let (mut pm, _dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, true);
+
+            assert_eq!(pm.posture.cover_holder(), CoverHolder::Nobody);
+            assert!(!pm.lockdown_active());
+            assert!(!pm.blocked_until_connected());
+
+            pm.start(&test_config()).await.unwrap();
+            assert_eq!(pm.posture.cover_holder(), CoverHolder::Session { standing: true });
+            assert!(pm.lockdown_active());
+            assert!(!pm.blocked_until_connected());
+
+            pm.stop().await.unwrap();
+            assert_eq!(pm.posture.cover_holder(), CoverHolder::Nobody);
+            assert!(!pm.lockdown_active());
+            assert!(!pm.blocked_until_connected());
+
+            // Same shape, intent off: Session { standing: false }.
+            let dir = tempfile::tempdir().unwrap();
+            let routing = MockRouting::new(dir.path().to_path_buf());
+            let (mut pm, _dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, false);
+            pm.start(&test_config()).await.unwrap();
+            assert_eq!(pm.posture.cover_holder(), CoverHolder::Session { standing: false });
+            assert!(!pm.lockdown_active());
+            assert!(!pm.blocked_until_connected());
+        });
+    }
+
+    /// Fails against any implementation where a held transient cover can
+    /// coexist with a session, and against a `blocked_until_connected()`
+    /// sourced from anything but the holder. Does NOT prove a cover stranded
+    /// by a previous process is invisible to all of this — there is no probe
+    /// for that in this stage.
+    #[skuld::test]
+    fn posture_reports_a_pending_start_after_a_failed_covered_start() {
+        rt().block_on(async {
+            let (mut pm, cfg, _st, _dir) = covered_gate_setup(false);
+            let _ = pm
+                .start_cancellable(&cfg, true, CancellationToken::new())
+                .await
+                .unwrap_err();
+
+            assert_eq!(pm.posture.cover_holder(), CoverHolder::PendingStart);
+            assert!(pm.blocked_until_connected());
+            assert!(!pm.lockdown_active());
+        });
+    }
+
+    // The next three exercise `Posture`'s method contracts directly,
+    // independent of any call site, so a future call site that violates one
+    // fails a test instead of silently drifting — `CoverHolder` gets an
+    // exhaustive truth table (`cover_tests.rs`); before this, `Posture` got
+    // nothing but prose and reasoning about the present call graph, the same
+    // unenforced-invariant shape this stage exists to remove.
+
+    /// Fails against a `take_pending` written as
+    /// `std::mem::replace(self, Idle)` without restoring a non-`PendingStart`
+    /// variant, which would silently destroy a live session and leak every
+    /// guard it owns.
+    #[skuld::test]
+    fn posture_take_pending_leaves_a_session_untouched() {
+        rt().block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let routing = MockRouting::new(dir.path().to_path_buf());
+            let (mut pm, _dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, true);
+            pm.start(&test_config()).await.unwrap();
+
+            assert!(pm.posture.take_pending().is_none());
+            assert_eq!(pm.state(), ProxyState::Running);
+            assert!(pm.lockdown_active());
+
+            pm.stop().await.unwrap();
+        });
+    }
+
+    /// Mirrors [`posture_take_pending_leaves_a_session_untouched`]: fails
+    /// against a `take_session` that disturbs an unrelated `PendingStart`.
+    #[skuld::test]
+    fn posture_take_session_leaves_a_pending_start_untouched() {
+        rt().block_on(async {
+            let (mut pm, cfg, _st, _dir) = covered_gate_setup(false);
+            let _ = pm
+                .start_cancellable(&cfg, true, CancellationToken::new())
+                .await
+                .unwrap_err();
+
+            assert!(pm.posture.take_session().is_none());
+            assert!(pm.blocked_until_connected());
+        });
+    }
+
+    /// `commit_session`'s `debug_assert!` stays unexercised, and that is a
+    /// disclosed gap, not an oversight: reaching it needs a second
+    /// `RunningState`, which cannot be built without a live `P::Running` and
+    /// a hand-rolled fixture whose cost exceeds what the assert is worth.
+    #[skuld::test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "hold_pending: posture must be Idle")]
+    fn posture_hold_pending_rejects_a_posture_that_already_holds_one() {
+        rt().block_on(async {
+            let (mut pm, cfg, _st, dir) = covered_gate_setup(false);
+            let _ = pm
+                .start_cancellable(&cfg, true, CancellationToken::new())
+                .await
+                .unwrap_err();
+            assert!(pm.blocked_until_connected(), "setup must leave a pending start held");
+
+            let server_ip: IpAddr = cfg.server.server.parse().unwrap();
+            let second_routing = MockRouting::new(dir.path().to_path_buf());
+            let cover = second_routing.install_failclosed_cover(server_ip, None).unwrap();
+            pm.posture.hold_pending(BlockedStart {
+                cover,
+                host: cfg.server.server.clone(),
+                server_ip,
+                pin: crate::dns::ech::PinSource::NoQueryNeeded,
+                resolver_permit: None,
+            });
+        });
+    }
 }
