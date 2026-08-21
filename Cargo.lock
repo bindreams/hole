@@ -3453,6 +3453,7 @@ dependencies = [
  "tun-engine",
  "url",
  "util",
+ "walkdir",
  "webpki-roots",
  "windows 0.62.2",
  "windows-service",

@@ -186,6 +186,9 @@ same-file = "1"
 # moves, compilation breaks immediately with a clear error rather than
 # silently drifting.
 xtask = { path = "../../xtask" }
+# Source-tree walk for the structural single-reader guard on the session's
+# standing-cover field (`the_standing_cover_field_has_exactly_one_reader`).
+walkdir = "2"
 
 # What `start_plugin_chain` hands a real child, and what its output does. Binds
 # only an ephemeral loopback port, so it needs no `global-net-state` group.
