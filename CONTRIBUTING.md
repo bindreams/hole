@@ -886,14 +886,23 @@ on a client path (the vendored tree is lint-excluded): re-verify on every re-mer
 
 - Rust toolchain (pinned via [rust-toolchain.toml](rust-toolchain.toml); rustup
   installs it on the first `cargo` call in the repo)
-- Go toolchain (for ex-ray; built by `cargo xtask deps`) — pinned via
-  [.go-version](.go-version), which CI feeds to `actions/setup-go`
-- Node.js ≥24 (pinned via `engines.node` in [package.json](package.json))
+- Go toolchain (for ex-ray; built by `cargo xtask deps`) — pinned by the
+  `toolchain` directive in [crates/ex-ray/go.mod](crates/ex-ray/go.mod), which
+  `go` enforces on a bare `go build` and CI feeds to `actions/setup-go`
+- Node.js ≥24 — a *range* (`engines.node` in [package.json](package.json)),
+  resolved at job time
 
-CI installs exactly these versions, so a toolchain release cannot turn `main`
-red on its own. Bumping either pin is a deliberate change that carries any new
-lint fallout with it — clippy gains lints between releases, and golangci-lint
-must be new enough to typecheck the Go standard library it is pointed at.
+Rust and Go are exact pins, so a release of either cannot turn `main` red on its
+own. Bump them deliberately: clippy gains lints between releases, and
+golangci-lint must be new enough to typecheck the Go standard library it is
+pointed at.
+
+Nothing else is pinned, and the claim stops there. Node floats within `24.x`,
+and `prek`, `nextest`, Python and `uv` are all installed unversioned in jobs
+that gate `main`. `prek` and `nextest` are the sharpest of those — a linter and
+a test runner, the same class of tool that gains behaviour between releases. If
+the same commit passes one day and fails the next, check those before assuming
+the code moved.
 
 ### npm dependency management
 

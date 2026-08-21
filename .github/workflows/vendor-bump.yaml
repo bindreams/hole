@@ -49,11 +49,17 @@ jobs:
       - name: Ensure origin/main is available
         run: git fetch origin main --quiet
 
-      # Rust comes from `rust-toolchain.toml` via rustup's directory override.
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Read pinned Rust toolchain
+        run: sed -n 's/^channel = "\(.*\)"$/toolchain=\1/p' rust-toolchain.toml >> "$GITHUB_OUTPUT"
+        id: rust-version
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.rust-version.outputs.toolchain }}
+
       - uses: actions/setup-go@v7
         with:
-          go-version-file: .go-version
+          go-version-file: crates/ex-ray/go.mod
 
       # git-subrepo isn't part of the ubuntu-latest image or any
       # apt/npm/go package — it's a bash-script tool installed by cloning

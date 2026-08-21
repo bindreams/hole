@@ -11,11 +11,11 @@ runs:
         echo "SCCACHE_GHA_ENABLED=true" >> "$GITHUB_ENV"
         echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
 
-    # `rust-toolchain.toml` is the single source of truth (#854). It already
-    # governs every `cargo` call through rustup's directory override; feeding
-    # `channel` to the action too means the toolchain is installed up front,
-    # with components, and `cachekey` tracks the pinned rustc rather than
-    # whatever `stable` resolved to that morning.
+    # `rust-toolchain.toml` is the single source of truth. It already governs
+    # every `cargo` call through rustup's directory override; feeding `channel`
+    # to the action too means the toolchain is installed up front, with
+    # components, and `cachekey` tracks the pinned rustc rather than whatever
+    # `stable` resolved to that morning.
     - name: Read pinned Rust toolchain
       id: rust-version
       shell: bash
@@ -27,12 +27,11 @@ runs:
         toolchain: ${{ steps.rust-version.outputs.toolchain }}
         components: clippy, rustfmt
 
-    # Pinned via `.go-version`: golangci-lint embeds `go/types` from the Go
-    # release it was built with, so a Go upgrade the pinned linter predates
-    # makes it fail to typecheck the standard library (#854).
+    # The Go pin lives in the module's own `toolchain` directive, so a bare
+    # `go` on PATH and CI resolve the same release.
     - uses: actions/setup-go@v7
       with:
-        go-version-file: .go-version
+        go-version-file: crates/ex-ray/go.mod
 
     # Node.js is required by the `frontend-build` xtask target, which is now
     # on `hole-msi.depends`. Without `npm`, Windows runners can't produce

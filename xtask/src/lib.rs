@@ -18,6 +18,7 @@ pub mod check_vendoring_integrity;
 pub mod ci_coverage;
 pub mod ci_nextest_parity;
 pub mod ci_timeouts;
+pub mod ci_toolchain_pins;
 // macOS-only: renders with the system font via the Typst library (a macOS-only
 // dependency — the DMG background is a darwin feature).
 #[cfg(target_os = "macos")]
@@ -55,6 +56,9 @@ mod ci_nextest_parity_tests;
 #[cfg(test)]
 #[path = "ci_timeouts_tests.rs"]
 mod ci_timeouts_tests;
+#[cfg(test)]
+#[path = "ci_toolchain_pins_tests.rs"]
+mod ci_toolchain_pins_tests;
 // These tests render with the macOS system font (/System/Library/Fonts/SFNS.ttf);
 // the DMG background is a darwin-only feature, so gate them to macOS. They fail
 // loudly on macOS if the font is missing — other platforms simply lack the feature.
