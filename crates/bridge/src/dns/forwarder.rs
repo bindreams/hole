@@ -147,7 +147,8 @@ pub enum ForwardFailure {
 /// through five nested `async fn` frames, so unboxed it would widen every
 /// future on the DNS path to carry a failure that is almost never taken.
 /// `?` boxes on its own via `impl<T> From<T> for Box<T>`; only the tail
-/// expressions wrap explicitly.
+/// expressions wrap explicitly. Its own size is guarded by a
+/// `forwarder_tests.rs` test, not just `clippy::result_large_err` (#855).
 #[derive(Debug)]
 pub struct UpstreamErr {
     pub layer: UpstreamLayer,
