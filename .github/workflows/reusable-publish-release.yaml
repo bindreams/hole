@@ -85,8 +85,14 @@ jobs:
         with:
           fetch-depth: 0
 
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Read pinned Rust toolchain
+        id: rust-version
+        run: sed -n 's/^channel = "\(.*\)"$/toolchain=\1/p' rust-toolchain.toml >> "$GITHUB_OUTPUT"
+
+      - uses: dtolnay/rust-toolchain@master
         if: ${{ inputs.dry-run && inputs.crates-publish }}
+        with:
+          toolchain: ${{ steps.rust-version.outputs.toolchain }}
 
       - name: Run cargo publish --dry-run
         if: ${{ inputs.dry-run && inputs.crates-publish }}
@@ -155,8 +161,10 @@ jobs:
         with:
           fetch-depth: 0
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
         if: ${{ !inputs.dry-run && inputs.crates-publish && steps.crates_check.outputs.already_published == 'false' }}
+        with:
+          toolchain: ${{ steps.rust-version.outputs.toolchain }}
 
       - name: Publish to crates.io
         if: ${{ !inputs.dry-run && inputs.crates-publish && steps.crates_check.outputs.already_published == 'false' }}

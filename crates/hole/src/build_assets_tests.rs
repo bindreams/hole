@@ -32,7 +32,7 @@ fn app_icns_has_required_resolutions() {
         .expect("128px present")
         .convert_to(icns::PixelFormat::RGBA);
     assert!(
-        rgba.data().chunks_exact(4).any(|px| px[3] != 0),
+        rgba.data().as_chunks::<4>().0.iter().any(|px| px[3] != 0),
         "icon.icns 128px is fully transparent"
     );
 }
@@ -55,7 +55,11 @@ fn app_icon_png_is_square_hi_res() {
     let mut buf = vec![0u8; reader.output_buffer_size().expect("app-icon.png buffer size")];
     let frame = reader.next_frame(&mut buf).expect("decode app-icon.png frame");
     assert!(
-        buf[..frame.buffer_size()].chunks_exact(4).any(|px| px[3] != 0),
+        buf[..frame.buffer_size()]
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .any(|px| px[3] != 0),
         "app-icon.png is fully transparent"
     );
 }

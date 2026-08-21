@@ -142,6 +142,12 @@ pub enum ForwardFailure {
 /// diagnostic context captured at the point of failure. `io::Error` is
 /// `!Clone`, so `UpstreamErr` cannot be `Clone` — consumed once on the
 /// log path.
+///
+/// At 136 bytes it travels as `Box<UpstreamErr>`: the transports return it
+/// through five nested `async fn` frames, so unboxed it would widen every
+/// future on the DNS path to carry a failure that is almost never taken.
+/// `?` boxes on its own via `impl<T> From<T> for Box<T>`; only the tail
+/// expressions wrap explicitly.
 #[derive(Debug)]
 pub struct UpstreamErr {
     pub layer: UpstreamLayer,
@@ -693,7 +699,12 @@ impl DnsForwarder {
     /// [`AttemptProbe`], so the diagnostic fields mean the same thing on every
     /// layer. The bytes the attempt moved fold into the forwarder's cumulative
     /// totals whether it succeeded or not.
-    async fn forward_one(&self, target: SocketAddr, query: &[u8], budget: Duration) -> Result<Vec<u8>, UpstreamErr> {
+    async fn forward_one(
+        &self,
+        target: SocketAddr,
+        query: &[u8],
+        budget: Duration,
+    ) -> Result<Vec<u8>, Box<UpstreamErr>> {
         let started = Instant::now();
         let probe = AttemptProbe::default();
         let fut = async {
@@ -706,10 +717,10 @@ impl DnsForwarder {
         };
         let result = match timeout(budget, fut).await {
             Ok(res) => res,
-            Err(_) => Err(UpstreamErr::new(
+            Err(_) => Err(Box::new(UpstreamErr::new(
                 UpstreamLayer::Timeout,
                 io::Error::new(io::ErrorKind::TimedOut, "upstream timeout"),
-            )),
+            ))),
         };
         let (read, written) = probe.bytes();
         self.upstream_read.fetch_add(read, Ordering::Relaxed);
@@ -826,7 +837,7 @@ impl DnsForwarder {
         target: SocketAddr,
         query: &[u8],
         probe: &AttemptProbe,
-    ) -> Result<Vec<u8>, UpstreamErr> {
+    ) -> Result<Vec<u8>, Box<UpstreamErr>> {
         let socket = self
             .connector
             .connect_udp(target)
@@ -857,7 +868,7 @@ impl DnsForwarder {
         target: SocketAddr,
         query: &[u8],
         probe: &AttemptProbe,
-    ) -> Result<Vec<u8>, UpstreamErr> {
+    ) -> Result<Vec<u8>, Box<UpstreamErr>> {
         let socks5_start = Instant::now();
         let connected = self
             .connector
@@ -868,7 +879,7 @@ impl DnsForwarder {
         probe.connected(socks5_start.elapsed().as_millis() as u64, &counters);
         exchange_tcp_framed(stream, query)
             .await
-            .map_err(|e| UpstreamErr::new(UpstreamLayer::Io, e))
+            .map_err(|e| Box::new(UpstreamErr::new(UpstreamLayer::Io, e)))
     }
 }
 
@@ -880,7 +891,7 @@ impl DnsForwarder {
         target: SocketAddr,
         query: &[u8],
         probe: &AttemptProbe,
-    ) -> Result<Vec<u8>, UpstreamErr> {
+    ) -> Result<Vec<u8>, Box<UpstreamErr>> {
         let socks5_start = Instant::now();
         let connected = self
             .connector
@@ -901,7 +912,7 @@ impl DnsForwarder {
         probe.tls_done(tls_start.elapsed().as_millis() as u64);
         exchange_tcp_framed(tls, query)
             .await
-            .map_err(|e| UpstreamErr::new(UpstreamLayer::Io, e))
+            .map_err(|e| Box::new(UpstreamErr::new(UpstreamLayer::Io, e)))
     }
 }
 
@@ -913,7 +924,7 @@ impl DnsForwarder {
         target: SocketAddr,
         query: &[u8],
         probe: &AttemptProbe,
-    ) -> Result<Vec<u8>, UpstreamErr> {
+    ) -> Result<Vec<u8>, Box<UpstreamErr>> {
         let (server_name, path_and_host) =
             https_target_for(target.ip()).map_err(|e| UpstreamErr::new(UpstreamLayer::Http, e))?;
 
@@ -962,7 +973,7 @@ impl DnsForwarder {
             .await
             .map_err(io_err)?;
 
-        parse_http_dns_response(&resp).map_err(|e| UpstreamErr::new(UpstreamLayer::Http, e))
+        parse_http_dns_response(&resp).map_err(|e| Box::new(UpstreamErr::new(UpstreamLayer::Http, e)))
     }
 }
 
