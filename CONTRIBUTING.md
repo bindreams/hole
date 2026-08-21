@@ -898,14 +898,16 @@ pointed at. Renovate tracks both compilers but never automerges either — a
 compiler bump always arrives as its own reviewable pull request
 ([renovate.json](.github/renovate.json)). `actions/setup-go` prefers
 `toolchain` over `go` when both are present, so `toolchain` is what CI
-actually installs; the two directives are grouped into one Renovate PR because
-a transient `go` > `toolchain` state breaks the Go tool.
+installs. The `go` directive keeps Renovate's default range strategy, a no-op
+while its range already covers the latest release, so routine Go releases only
+move `toolchain`; both directives share one never-automerged rule so a Go
+major (which would move `go`) can't slip through either.
 
-| Pin                             | Renovate manager                            |
-| ------------------------------- | ------------------------------------------- |
-| `rust-toolchain.toml` `channel` | `rust-toolchain` (depName `rust`)           |
-| `go.mod` `toolchain` directive  | `gomod` (depName `go`, depType `toolchain`) |
-| `go.mod` `go` directive         | `gomod` (depName `go`, depType `golang`)    |
+| Pin                                                | Renovate manager                            |
+| -------------------------------------------------- | ------------------------------------------- |
+| `rust-toolchain.toml` `channel`                    | `rust-toolchain` (depName `rust`)           |
+| `go.mod` `toolchain` directive                     | `gomod` (depName `go`, depType `toolchain`) |
+| `go.mod` `go` directive (rarely moves — see above) | `gomod` (depName `go`, depType `golang`)    |
 
 Nothing else is pinned, and the claim stops there. Node floats within `24.x`,
 and `prek`, `nextest`, Python and `uv` are all installed unversioned in jobs
