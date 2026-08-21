@@ -6,6 +6,10 @@
 # Windows CI runner.
 python-platform = "all"
 
+# `docs/conf.py` and `scripts/validate-docs.py` both import `docs/_versions.py`
+# after a sys.path insert, which ty cannot see.
+extra-paths = ["docs"]
+
 [rules]
 # PEP 723 inline script dependencies are not visible to ty's module resolver.
 unresolved-import = "ignore"

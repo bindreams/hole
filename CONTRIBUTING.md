@@ -1334,7 +1334,7 @@ Asset naming is `<product>-<version>-<os>-<arch>[.ext]`.
   `v0.1.0` tag predates the scheme and is ignored.
 
 Rollback, minisign key rotation, and the crates.io dry-run TOCTOU note are in
-[docs/RELEASE-OPS.md](docs/RELEASE-OPS.md).
+[RELEASE-OPS.md](RELEASE-OPS.md).
 
 ## Icons
 
