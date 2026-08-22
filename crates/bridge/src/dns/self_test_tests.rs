@@ -106,8 +106,8 @@ fn classify_failure_covers_every_branch() {
     ));
     // No connection was established and every connect failure was DEFINITE.
     // The readings for "refused" and "still outstanding when the budget fired"
-    // deliberately differ now — that conflation is what #771 was about — so
-    // this fixture carries no `connect_timeouts` and the next case carries one.
+    // deliberately differ — so this fixture carries no `connect_timeouts` and
+    // the next case carries one.
     assert!(matches!(case(false, true, no_connection), SelfTestReason::NoConnection));
     // Nothing established, but an attempt was still in flight when its budget
     // fired: the tunnel was coming up, not refusing us.
@@ -131,10 +131,10 @@ fn classify_failure_covers_every_branch() {
     assert!(matches!(case(false, false, no_connection), SelfTestReason::Other(_)));
 }
 
-/// The load-bearing reading for #771. A transport that never completed its
-/// connect must not be reported as a local proxy refusing connections: the
-/// SOCKS5 CONNECT is not acknowledged until the plugin's own outer connection
-/// is up, so an outstanding one means the tunnel was still coming up.
+/// A transport that never completed its connect must not be reported as a
+/// local proxy refusing connections: the SOCKS5 CONNECT is not acknowledged
+/// until the plugin's own outer connection is up, so an outstanding one means
+/// the tunnel was still coming up.
 #[skuld::test]
 fn a_pending_connect_is_not_reported_as_no_connection() {
     let reason = classify_failure(
@@ -341,11 +341,9 @@ fn a_silent_tunnel_is_reported_as_a_silent_tunnel() {
     let err = self_test_error_for(Some(ReachabilityVerdict::Reachable), attempts, 4517, reason);
     assert_eq!(
         err.to_string(),
-        format!(
-            "Nothing came back through the tunnel ({attempts} attempts in 4517ms). \
-             Either the proxy connection could not be established, \
-             or the server cannot reach your DNS resolver."
-        )
+        "Nothing came back through the tunnel (4517ms). \
+         Either the proxy connection could not be established, \
+         or the server cannot reach your DNS resolver."
     );
     // Only integers are interpolated, so nothing host-shaped can reach a toast.
     assert!(!err.to_string().contains("127.0.0.1"), "got: {err}");
@@ -376,10 +374,8 @@ fn a_refused_local_hop_is_reported_as_no_connection() {
     let err = self_test_error_for(None, attempts, 4517, reason);
     assert_eq!(
         err.to_string(),
-        format!(
-            "Could not open a connection into the tunnel ({attempts} attempts in 4517ms). \
-             Every attempt to open one failed outright."
-        )
+        "Could not open a connection into the tunnel (4517ms). \
+         Every attempt to open one failed outright."
     );
     assert!(
         !err.to_string().contains("local proxy"),
@@ -707,11 +703,11 @@ fn self_test_gives_every_hanging_resolver_the_full_bound() {
     match outcome {
         SelfTestOutcome::Failed { reason, attempts, .. } => {
             // Every connect stays outstanding until its budget fires, so the
-            // run is `TunnelSetupPending` — NOT `NoConnection`. That swap is
-            // the whole of #771: this shape used to be reported as "the local
-            // proxy or its plugin is not accepting connections", which is a
-            // claim about a refusal that never happened. `NoConnection` is now
-            // reserved for connects that failed outright, pinned by
+            // run is `TunnelSetupPending` — NOT `NoConnection`. This shape
+            // used to be reported as "the local proxy or its plugin is not
+            // accepting connections", a claim about a refusal that never
+            // happened. `NoConnection` is now reserved for connects that
+            // failed outright, pinned by
             // `a_definite_connect_failure_is_still_reported_as_no_connection`.
             assert!(matches!(reason, SelfTestReason::TunnelSetupPending), "got {reason:?}");
             assert_eq!(attempts, 1, "one walk, so exactly one attempt is counted");
@@ -726,10 +722,12 @@ fn noerror_reply() -> Vec<u8> {
     reply
 }
 
-/// **Load-bearing regression for #771.** A transport that is alive but slow —
-/// 5s into establishing, well past the deleted 1500ms attempt budget and the
-/// deleted 3000ms outer budget, but under the 10s `TUNNEL_QUERY_TIMEOUT` —
-/// must pass the gate rather than being refused as dead.
+/// **Load-bearing regression.** A transport that is alive but slow —
+/// 5s into establishing, well past the deleted 1500ms `PER_ATTEMPT` budget
+/// (the deleted 5s `OUTER_BUDGET` gave no extra margin at this point — it
+/// would have expired at the same 5s), but under the 10s
+/// `TUNNEL_QUERY_TIMEOUT` — must pass the gate rather than being refused as
+/// dead.
 #[skuld::test]
 fn a_slow_but_alive_transport_passes_the_gate() {
     // Current-thread runtime with `tokio::time::pause()`: the whole test runs

@@ -206,9 +206,7 @@ async fn resolve_maps_every_upstream_cause_to_its_bootstrap_error() {
     let cases = [
         (UpstreamCause::CertificateRejected, BootstrapError::CertificateRejected),
         (UpstreamCause::Unreachable, BootstrapError::Unreachable),
-        // Both timeout causes collapse here on purpose: this seam reports
-        // whether a resolver answered and cannot act on where in the attempt
-        // the budget fired.
+        // Both timeout causes collapse here on purpose — see `classify`.
         (UpstreamCause::ExchangeTimeout, BootstrapError::Timeout),
         (UpstreamCause::ConnectTimeout, BootstrapError::Timeout),
         (UpstreamCause::TlsFailed, BootstrapError::Transport),

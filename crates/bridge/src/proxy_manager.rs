@@ -1142,8 +1142,10 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
     ///   forwarder synchronously; the outer `tokio::select!` against
     ///   cancel re-emits Cancelled canonically.
     /// - **Phase 4 (forwarder self-test)**: cooperative — the token is
-    ///   threaded into `run_forwarder_self_test` which checks it
-    ///   between retry attempts and races the per-attempt forward.
+    ///   threaded into `run_forwarder_self_test`, which races its one walk
+    ///   against cancel in a `biased` `select!` (cancel checked first on
+    ///   every poll) and drops the in-flight walk on cancel rather than
+    ///   waiting for it.
     /// - **Phases 5–6 (Dispatcher::new, routing.install)**: sync; cancel
     ///   observed at phase boundary only (`if cancel.is_cancelled()`).
     ///   These calls are millisecond-scale; mid-call preemption isn't
@@ -1400,8 +1402,8 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         // On Err, the locally-owned `running_proxy` Drop aborts the SS
         // task and `plugin_chain` (further up the stack) Drop SIGTERMs
         // the chain. System state is untouched. `run_forwarder_self_test`
-        // observes cancel cooperatively between retry attempts and races
-        // each per-attempt forward against it (#397).
+        // observes cancel cooperatively: its one walk races cancel in a
+        // biased `select!`, checked before every poll of the walk (#397).
         if let Some(fwd) = forwarder.as_ref() {
             // Race an out-of-band reachability probe against the self-test so it
             // adds NO latency. Skip it under an active fail-closed cover: a

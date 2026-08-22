@@ -794,7 +794,7 @@ fn upstream_cause_ranking_is_total_and_ordered() {
 }
 
 /// The `Timeout` layer's two causes, told apart by whether a transport had been
-/// published when the budget fired. This is the observation #771 needs: a
+/// published when the budget fired. The distinction matters because a
 /// SOCKS5 CONNECT is not acknowledged until the plugin's outer connection is
 /// up, so "budget fired, nothing established" means the tunnel was still being
 /// set up — not that the local proxy refused anything.

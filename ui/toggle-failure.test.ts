@@ -9,7 +9,7 @@ import { type ToggleFailure, toggleFailureToast } from "./toggle-failure";
 describe("toggleFailureToast", () => {
   it("string rejection surfaces the bridge error verbatim", () => {
     // Production wire format: ProxyError::ForwarderSelfTestFailed.Display.
-    const msg = "forwarder self-test failed after 3 attempts in 4520ms: attempt 3 timed out after 1.5s";
+    const msg = "forwarder self-test failed after 4520ms: no resolver answered through the tunnel (unreachable)";
     expect(toggleFailureToast({ error: msg })).toEqual({
       message: msg,
       kind: "error",

@@ -223,9 +223,9 @@ impl UpstreamErr {
         }
     }
 
-    /// Has [`AttemptProbe::apply`] decorated this error yet? Only the `Timeout`
-    /// arm of [`Self::cause`] depends on it, and only a test needs to observe
-    /// it — production reads the flag through that assertion, not this getter.
+    /// Test-only accessor: only the `Timeout` arm of [`Self::cause`] depends
+    /// on whether [`AttemptProbe::apply`] has run — production reads that
+    /// flag through the assertion there, not through this getter.
     #[cfg(test)]
     pub(crate) fn is_decorated(&self) -> bool {
         self.decorated
@@ -580,7 +580,7 @@ const DNS_PORT_HTTPS: u16 = 443;
 /// A considered constant, not a derivation: one attempt on the shipped
 /// DoH-with-ECH configuration is nine serialized round trips, measured at
 /// ~1.05s on the link this was sized for, so 10s admits a link roughly nine
-/// times slower. See the #771 PR for the measurement.
+/// times slower.
 pub(crate) const TUNNEL_QUERY_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The bound on one DoH exchange over a DIRECT connector — the bootstrap's
