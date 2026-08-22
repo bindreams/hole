@@ -55,7 +55,7 @@ clap = { version = "4", features = ["derive"] }
 tracing = "0.1"
 thiserror = "2"
 tempfile = "3"
-base64 = "0.22"
+base64 = "0.23"
 uuid = { version = "1", features = ["v4"] }
 contracts = "0.6"
 dirs = "6"
@@ -126,7 +126,7 @@ harness = false
 [build-dependencies]
 tauri-build = "2"
 xtask-lib = { path = "../../xtask-lib", features = ["version"] }
-resvg = "0.47"
+resvg = "0.48"
 png = "0.18"
 ico = "0.5"
 icns = "0.4"
