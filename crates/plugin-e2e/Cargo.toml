@@ -24,7 +24,7 @@ tracing = "0.1"
 rcgen = "0.14"
 tempfile = "3"
 rand = "0.10"
-base64 = "0.22"
+base64 = "0.23"
 hex = "0.4"
 
 [dev-dependencies]
