@@ -454,6 +454,17 @@ pub(super) fn rt() -> tokio::runtime::Runtime {
     tokio::runtime::Runtime::new().unwrap()
 }
 
+/// Current-thread, unlike `rt()`: `tokio::time::pause()` panics on a
+/// multi-thread runtime. For tests that drive the DNS self-test gate against
+/// a closed/black-holed real socket, where the gate's own bound is seconds,
+/// not milliseconds, and this box's `rt()` tests must not grow by it.
+fn current_thread_rt() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+}
+
 /// Build a `ProxyManager` backed by a fresh `TempDir`. Caller must hold
 /// the returned `TempDir` for the scope of the manager so its contents
 /// (any written `bridge-routes.json`) live until drop.
@@ -525,9 +536,9 @@ pub(super) fn test_config() -> ProxyConfig {
         filters: Vec::new(),
         // dns.enabled = false avoids the #388 forwarder self-test gate in
         // happy-path tests — MockProxy doesn't bind a real TCP listener,
-        // so the forwarder's Socks5Connector to `127.0.0.1:1080` would
-        // time out after 4.5s on every test. Tests that exercise the
-        // gate enable DNS explicitly (see the self_test mod).
+        // so the forwarder's Socks5Connector to `127.0.0.1:1080` would cost
+        // up to TUNNEL_QUERY_TIMEOUT (10s) on every test. Tests that
+        // exercise the gate enable DNS explicitly (see the self_test mod).
         dns: hole_common::config::DnsConfig {
             enabled: false,
             ..hole_common::config::DnsConfig::default()
@@ -2097,6 +2108,14 @@ mod self_test {
                     protocol: DnsProtocol::PlainTcp,
                     allow_insecure_bootstrap: false,
                 };
+                // Paused AFTER the listener is bound: the gate's own
+                // TUNNEL_QUERY_TIMEOUT now bounds this hung handshake, and
+                // on real wall clock that would cost a full
+                // resolver bound in a suite CLAUDE.md flags as hang-prone.
+                // The socket never becomes ready, so the runtime idles and
+                // auto-advance drives the budget deterministically instead —
+                // faster than before, not slower.
+                tokio::time::pause();
                 pm.start(&cfg).await.expect_err("the gate must fail with no listener");
             });
         let output = writer.snapshot_string();
@@ -2151,11 +2170,13 @@ mod self_test {
     ///
     /// Test plumbing: `MockProxy::new()` does not bind a real TCP listener
     /// on `127.0.0.1:1080`, so the forwarder's `Socks5Connector` connection
-    /// fails with ECONNREFUSED on every attempt (the 3×1500ms loop closes
-    /// fast on each refused connect, well under the 5s outer budget).
+    /// fails — refused fast on most platforms, black-holed on others (see
+    /// `refusing_connector.rs`), so the gate's own bound (`TUNNEL_QUERY_TIMEOUT`,
+    /// seconds not milliseconds) can be on the critical path; paused virtual
+    /// time keeps this test fast regardless.
     #[skuld::test]
     fn start_blocks_on_forwarder_self_test_failure() {
-        rt().block_on(async {
+        current_thread_rt().block_on(async {
             let dir = tempfile::tempdir().unwrap();
             let routing = MockRouting::new(dir.path().to_path_buf());
             let routing_state = routing.state();
@@ -2170,6 +2191,7 @@ mod self_test {
             cfg.dns.enabled = true;
             cfg.dns.servers = vec!["127.0.0.1".parse().unwrap()];
 
+            tokio::time::pause();
             let err = pm
                 .start_cancellable(&cfg, false, CancellationToken::new())
                 .await
@@ -2209,7 +2231,10 @@ mod self_test {
     /// connector dial has completed before the assertion runs.)
     #[skuld::test]
     fn pure_vpn_start_never_dials_the_configured_port() {
-        rt().block_on(async {
+        // Current-thread + paused, same reason as
+        // `start_blocks_on_forwarder_self_test_failure`: the gate dials a
+        // real, never-bound port and that bound is seconds.
+        current_thread_rt().block_on(async {
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             listener.set_nonblocking(true).unwrap();
             let configured_port = listener.local_addr().unwrap().port();
@@ -2222,6 +2247,7 @@ mod self_test {
             cfg.dns.enabled = true;
             cfg.dns.servers = vec!["127.0.0.1".parse().unwrap()];
 
+            tokio::time::pause();
             let err = pm
                 .start_cancellable(&cfg, false, CancellationToken::new())
                 .await
@@ -2293,14 +2319,29 @@ mod self_test {
     /// byte was ever written, so it is the typed `NoTunnelConnection`.
     #[skuld::test]
     fn lockdown_on_skips_probe_keeps_original_reason() {
-        rt().block_on(async {
+        // Current-thread + paused: the gate's own bound is seconds, not
+        // milliseconds, against a closed port that some platforms
+        // black-hole rather than refuse (see `gate_failure_setup`'s doc).
+        current_thread_rt().block_on(async {
             let (mut pm, cfg, _dir) = gate_failure_setup(true);
+            tokio::time::pause();
             let err = pm
                 .start_cancellable(&cfg, false, CancellationToken::new())
                 .await
                 .unwrap_err();
+            // Either reading is admissible: a closed loopback port is REFUSED on
+            // some platforms and black-holed on others (see
+            // `refusing_connector.rs`), and those classify as
+            // `NoTunnelConnection` and `TunnelSetupIncomplete` respectively.
+            // This test is about the probe being suppressed so the gate's OWN
+            // reading survives, not about which of the two it is — the variants
+            // are pinned against stub connectors in
+            // `classify_failure_covers_every_branch`.
             assert!(
-                matches!(err, ProxyError::NoTunnelConnection { .. }),
+                matches!(
+                    err,
+                    ProxyError::NoTunnelConnection { .. } | ProxyError::TunnelSetupIncomplete { .. }
+                ),
                 "lockdown-on must skip the probe and keep the self-test's own reading, got {err:?}"
             );
         });
@@ -4426,14 +4467,24 @@ mod self_test {
     /// runs).
     #[skuld::test]
     fn covered_start_without_lockdown_suppresses_probe() {
-        rt().block_on(async {
+        // Current-thread + paused: same platform-latency reason as
+        // `lockdown_on_skips_probe_keeps_original_reason`.
+        current_thread_rt().block_on(async {
             let (mut pm, cfg, _st, _dir) = covered_gate_setup(false);
+            tokio::time::pause();
             let err = pm
                 .start_cancellable(&cfg, true, CancellationToken::new())
                 .await
                 .unwrap_err();
+            // Same platform split as `lockdown_on_skips_probe_keeps_original_reason`:
+            // the closed loopback port is refused on some platforms and
+            // black-holed on others, so both readings are admissible. What
+            // this test pins is that the gate's own reading survives.
             assert!(
-                matches!(err, ProxyError::NoTunnelConnection { .. }),
+                matches!(
+                    err,
+                    ProxyError::NoTunnelConnection { .. } | ProxyError::TunnelSetupIncomplete { .. }
+                ),
                 "a covered start engages a cover, so the probe is skipped and the self-test's own \
                  reading (not one byte written) surfaces, got {err:?}"
             );

@@ -92,8 +92,12 @@ upgrade.
 **Start-time gate (load-bearing).** A forwarder self-test runs inside
 [`start_inner`](crates/bridge/src/proxy_manager.rs) **before**
 `Dispatcher::new` / `routing.install` / `apply_dns_settings`; on failure it
-returns `ProxyError::ForwarderSelfTestFailed` and the RAII guards unwind without
-touching routes, system DNS, or the wintun adapter. Guarded by
+returns whichever `ProxyError` the run's evidence supports — `NoTunnelConnection`
+(every connect failed outright), `TunnelSetupIncomplete` (one was still
+outstanding when its budget fired), `TunnelSilent`, or the generic
+`ForwarderSelfTestFailed` — and the RAII guards unwind without touching routes,
+system DNS, or the wintun adapter. `classify_failure` picks between them from
+counted evidence, never from a cause code. Guarded by
 `start_blocks_on_forwarder_self_test_failure`.
 
 **Hard errors:** `dns.enabled = true` with `servers = []` is a config error.
@@ -469,8 +473,11 @@ stale permit surviving, not a leaked block. Disclosed as a source comment on
 It is **name-agnostic** — it does *not* permit the TUN interface. The new
 bridge's start-time DNS-forwarder self-test runs over loopback to the SS client
 and out to the server IP, so loopback + server-IP permits suffice; app traffic
-into the (briefly absent) tunnel being blocked for the sub-second cover window is
-the accepted fail-closed cost.
+into the (briefly absent) tunnel being blocked for the cover window is the
+accepted fail-closed cost. That window is no longer sub-second: the gate's own
+bound is `TUNNEL_QUERY_TIMEOUT` per configured resolver (see "DNS forwarder"
+above), so a slow-but-live tunnel can hold the cover for seconds, not
+milliseconds.
 
 - **Windows** ([`routing/failclosed/windows.rs`](crates/tun-engine/src/routing/failclosed/windows.rs)):
   a persistent provider + sublayer + filter set installed in one FWPM

@@ -84,7 +84,10 @@ fn classify(cause: UpstreamCause) -> BootstrapError {
     match cause {
         UpstreamCause::CertificateRejected => BootstrapError::CertificateRejected,
         UpstreamCause::Unreachable => BootstrapError::Unreachable,
-        UpstreamCause::Timeout => BootstrapError::Timeout,
+        // Both timeout causes are one finding here: this seam reports whether a
+        // resolver answered, and it has no way to act on where in the attempt
+        // the budget fired.
+        UpstreamCause::ConnectTimeout | UpstreamCause::ExchangeTimeout => BootstrapError::Timeout,
         UpstreamCause::TlsFailed | UpstreamCause::BadResponse | UpstreamCause::Io => BootstrapError::Transport,
     }
 }
@@ -189,7 +192,10 @@ fn single_resolver_cfg(server: IpAddr) -> DnsConfig {
 /// is the entry point rather than `forward` because `forward`'s SERVFAIL
 /// synthesis would erase which resolver failed and why.
 async fn single_round_trip(fwd: &DnsForwarder, wire: &[u8]) -> Result<Vec<u8>, UpstreamCause> {
-    match fwd.try_forward(wire, crate::dns::forwarder::UPSTREAM_TIMEOUT).await {
+    match fwd
+        .try_forward(wire, crate::dns::forwarder::DIRECT_UPSTREAM_TIMEOUT)
+        .await
+    {
         Ok(reply) => Ok(reply),
         Err(ForwardFailure::Upstream(cause)) => Err(cause),
         // `single_resolver_cfg` supplies exactly one never-skipped server and
