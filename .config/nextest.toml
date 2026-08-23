@@ -42,5 +42,12 @@ nextest-version = "0.9.130"
 max-threads = 1
 
 [[profile.default.overrides]]
-filter = 'test(/_full_tunnel_roundtrip$/) + test(/windows_lockdown_permits_server_ip_/) + test(/macos_lockdown_permits_server_ip_/) + test(/failclosed_permits_/) + test(/release_all_/) + test(/cutover_global_net_state_/)'
+filter = 'test(/_full_tunnel_roundtrip$/) + test(/windows_lockdown_permits_server_ip_/) + test(/macos_lockdown_permits_server_ip_/) + test(/failclosed_permits_/) + test(/release_all_/) + test(/cutover_global_net_state_/) + test(/macos_dns_spike_/)'
 test-group = 'global-net-state'
+
+# SPIKE (#868) — throwaway, not for merge. The spike's deliverable IS the log
+# (scutil --dns, the applied key, the routing table), and nextest hides a
+# passing test's output by default, so a PASS would answer nothing.
+[[profile.default.overrides]]
+filter = 'test(/macos_dns_spike_/)'
+success-output = 'immediate'

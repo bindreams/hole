@@ -67,3 +67,22 @@ wintun-bindings = "0.7"
 [dev-dependencies]
 skuld = { workspace = true }
 hole-test-observability = { path = "../test-observability" }
+
+# SPIKE (#868) — throwaway, not for merge. Only the
+# `macos_dns_supplemental_spike` test target uses these. `tun` and `libc` are
+# already normal deps of the lib, but an integration test links the lib plus
+# dev-deps only, so they must be repeated here.
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+libc = "0.2"
+tun = { version = "0.8", features = ["async"] }
+# `system-configuration` 0.7 is built against `core-foundation` 0.9, so the
+# spike must use 0.9 too or the CF types will not unify.
+system-configuration = "0.7"
+core-foundation = "0.9"
+
+# SPIKE (#868) — throwaway, not for merge. `harness = false` because the
+# workspace's test runner is skuld, not libtest.
+[[test]]
+name = "macos_dns_supplemental_spike"
+path = "tests/macos_dns_supplemental_spike.rs"
+harness = false
