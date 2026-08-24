@@ -150,6 +150,7 @@ async fn malformed_options_probe_is_inconclusive() {
         probe_server_reachability(
             &a.ip().to_string(),
             a.port(),
+            "<server:00000000>",
             Some("galoshes"),
             Some(r"path=/a\"),
             &CancellationToken::new()
@@ -195,6 +196,7 @@ async fn plain_ws_reset_is_blocked() {
         probe_server_reachability(
             &a.ip().to_string(),
             a.port(),
+            "<server:00000000>",
             Some("galoshes"),
             Some("path=/x"),
             &CancellationToken::new()
@@ -210,6 +212,7 @@ async fn plain_ws_answered_is_reachable() {
         probe_server_reachability(
             &a.ip().to_string(),
             a.port(),
+            "<server:00000000>",
             Some("galoshes"),
             Some("path=/x"),
             &CancellationToken::new()
@@ -225,6 +228,7 @@ async fn tls_ws_bytes_back_is_reachable() {
         probe_server_reachability(
             &a.ip().to_string(),
             a.port(),
+            "<server:00000000>",
             Some("galoshes"),
             Some("tls;host=h"),
             &CancellationToken::new()
@@ -240,6 +244,7 @@ async fn tls_ws_reset_is_blocked() {
         probe_server_reachability(
             &a.ip().to_string(),
             a.port(),
+            "<server:00000000>",
             Some("galoshes"),
             Some("tls;host=h"),
             &CancellationToken::new()
@@ -253,7 +258,15 @@ async fn closed_port_is_refused_or_timeout() {
     let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let a = l.local_addr().unwrap();
     drop(l);
-    let v = probe_server_reachability(&a.ip().to_string(), a.port(), None, None, &CancellationToken::new()).await;
+    let v = probe_server_reachability(
+        &a.ip().to_string(),
+        a.port(),
+        "<server:00000000>",
+        None,
+        None,
+        &CancellationToken::new(),
+    )
+    .await;
     // Non-Windows kernels RST a closed port (TcpRefused); Windows GitHub runners
     // drop inbound SYNs to closed ephemeral loopback ports → TcpTimeout. Both are
     // correct "port is closed" verdicts.
@@ -272,7 +285,15 @@ async fn closed_port_is_refused_or_timeout() {
 #[skuld::test(name = "reachability_tests::bogus_host_is_dns_failed")]
 async fn bogus_host_is_dns_failed() {
     assert_eq!(
-        probe_server_reachability("no-such-host.invalid", 443, None, None, &CancellationToken::new()).await,
+        probe_server_reachability(
+            "no-such-host.invalid",
+            443,
+            "<server:00000000>",
+            None,
+            None,
+            &CancellationToken::new()
+        )
+        .await,
         ReachabilityVerdict::DnsFailed
     );
 }
@@ -330,6 +351,7 @@ async fn quic_silent_udp_is_blocked() {
         probe_server_reachability(
             &a.ip().to_string(),
             a.port(),
+            "<server:00000000>",
             Some("galoshes"),
             Some("mode=quic;host=h"),
             &CancellationToken::new()
@@ -345,6 +367,7 @@ async fn quic_server_is_reachable() {
         probe_server_reachability(
             &a.ip().to_string(),
             a.port(),
+            "<server:00000000>",
             Some("galoshes"),
             Some("mode=quic;host=localhost"),
             &CancellationToken::new()
@@ -360,6 +383,7 @@ async fn quic_server_v6_is_reachable() {
         probe_server_reachability(
             &a.ip().to_string(),
             a.port(),
+            "<server:00000000>",
             Some("galoshes"),
             Some("mode=quic;host=localhost"),
             &CancellationToken::new()
@@ -381,6 +405,7 @@ async fn cancel_against_silent_endpoint_is_inconclusive() {
         probe_server_reachability(
             &a.ip().to_string(),
             a.port(),
+            "<server:00000000>",
             Some("galoshes"),
             Some("mode=quic;host=h"),
             &cancel

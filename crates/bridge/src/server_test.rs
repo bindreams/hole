@@ -118,7 +118,12 @@ pub async fn run_server_test(entry: &ServerEntry, cfg: &TestConfig) -> ServerTes
     let bootstrapped = match resolved {
         Ok(b) => b,
         Err(e) => {
-            tracing::warn!(error = %e, "server_test: DoH bootstrap failed");
+            tracing::warn!(
+                server = %hole_common::logging::redact_arm::token_for(&entry.id),
+                server_kind = hole_common::logging::redact_arm::server_kind(entry.server.expose()),
+                error = %e,
+                "server_test: DoH bootstrap failed"
+            );
             return ServerTestOutcome::DnsFailed;
         }
     };
@@ -198,6 +203,7 @@ pub async fn run_server_test(entry: &ServerEntry, cfg: &TestConfig) -> ServerTes
         // must not OS-resolve the hostname (that would reopen the DNS leak).
         &server_ip.to_string(),
         entry.server_port,
+        &hole_common::logging::redact_arm::token_for(&entry.id),
         entry.plugin.as_deref(),
         entry.plugin_opts.as_deref(),
         // One-shot probe; no caller-side cancel exists in run_server_test.
@@ -229,13 +235,14 @@ async fn reclassify_blocked(
     tunnel_outcome: ServerTestOutcome,
     host: &str,
     port: u16,
+    token: &str,
     plugin: Option<&str>,
     plugin_opts: Option<&str>,
     cancel: &CancellationToken,
 ) -> ServerTestOutcome {
     match tunnel_outcome {
         ServerTestOutcome::TunnelHandshakeFailed | ServerTestOutcome::ServerCannotReachInternet => {
-            if crate::reachability::probe_server_reachability(host, port, plugin, plugin_opts, cancel).await
+            if crate::reachability::probe_server_reachability(host, port, token, plugin, plugin_opts, cancel).await
                 == crate::reachability::ReachabilityVerdict::Blocked
             {
                 ServerTestOutcome::NetworkBlocked

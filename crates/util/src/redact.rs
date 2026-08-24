@@ -205,6 +205,40 @@ pub fn ip_is_armable(ip: IpAddr) -> bool {
     !ip.is_loopback() && !ip.is_unspecified()
 }
 
+/// `"ipv4"` or `"ipv6"` — one of the fields that replaces a redacted
+/// address in a log line.
+pub fn ip_family(ip: IpAddr) -> &'static str {
+    match ip {
+        IpAddr::V4(_) => "ipv4",
+        IpAddr::V6(_) => "ipv6",
+    }
+}
+
+/// `"global"`, `"private"`, `"loopback"` or `"link_local"` — the axis this
+/// repo's actual diagnoses turned on (#541 loopback bypass, #770 handshake).
+pub fn ip_scope(ip: IpAddr) -> &'static str {
+    match ip {
+        IpAddr::V4(v4) if v4.is_loopback() => "loopback",
+        IpAddr::V4(v4) if v4.is_link_local() => "link_local",
+        IpAddr::V4(v4) if v4.is_private() => "private",
+        IpAddr::V4(_) => "global",
+        IpAddr::V6(v6) if v6.is_loopback() => "loopback",
+        IpAddr::V6(v6) if is_v6_link_local(v6) => "link_local",
+        IpAddr::V6(v6) if is_v6_unique_local(v6) => "private",
+        IpAddr::V6(_) => "global",
+    }
+}
+
+/// IPv6 link-local `fe80::/10`. `Ipv6Addr::is_unicast_link_local` is unstable.
+fn is_v6_link_local(v6: std::net::Ipv6Addr) -> bool {
+    (v6.segments()[0] & 0xffc0) == 0xfe80
+}
+
+/// IPv6 unique-local `fc00::/7`.
+fn is_v6_unique_local(v6: std::net::Ipv6Addr) -> bool {
+    (v6.segments()[0] & 0xfe00) == 0xfc00
+}
+
 /// The first [`COLLISION_CORPUS`] entry `literal` would mangle, if any.
 ///
 /// The test is "`literal` is an ASCII-case-insensitive substring of a corpus

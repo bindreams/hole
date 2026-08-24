@@ -5,9 +5,13 @@
 //! that mints a token, derives the textual forms an address can take, and
 //! decides which of them are safe to arm.
 
-use std::net::{IpAddr, Ipv6Addr};
+use std::net::IpAddr;
 
 use crate::config::ServerEntry;
+
+// The classifiers live beside `arm_ip` in `util` because `tun-engine`'s
+// crash-recovery path needs them and cannot reach `hole-common`.
+pub use util::redact::{ip_family, ip_scope};
 
 /// Token for the crash-recovery path, which replays a prior run's routes
 /// before any config exists and so has no entry in hand. Last-wins arming
@@ -79,29 +83,6 @@ pub fn server_kind(configured: &str) -> &'static str {
     }
 }
 
-/// `"ipv4"` or `"ipv6"`.
-pub fn ip_family(ip: IpAddr) -> &'static str {
-    match ip {
-        IpAddr::V4(_) => "ipv4",
-        IpAddr::V6(_) => "ipv6",
-    }
-}
-
-/// `"global"`, `"private"`, `"loopback"` or `"link_local"` — the axis the
-/// repo's actual diagnoses (#541 loopback bypass, #770 handshake) turned on.
-pub fn ip_scope(ip: IpAddr) -> &'static str {
-    match ip {
-        IpAddr::V4(v4) if v4.is_loopback() => "loopback",
-        IpAddr::V4(v4) if v4.is_link_local() => "link_local",
-        IpAddr::V4(v4) if v4.is_private() => "private",
-        IpAddr::V4(_) => "global",
-        IpAddr::V6(v6) if v6.is_loopback() => "loopback",
-        IpAddr::V6(v6) if is_v6_link_local(v6) => "link_local",
-        IpAddr::V6(v6) if is_v6_unique_local(v6) => "private",
-        IpAddr::V6(_) => "global",
-    }
-}
-
 /// Strip one surrounding `[`/`]` pair, as in `handoff_host`'s IPv6 form.
 fn unbracket(value: &str) -> &str {
     value
@@ -131,17 +112,6 @@ fn may_arm(candidate: &str) -> bool {
         // derived here.
         Err(_) => true,
     }
-}
-
-/// IPv6 link-local: `fe80::/10`. `Ipv6Addr::is_unicast_link_local` is
-/// unstable.
-fn is_v6_link_local(v6: Ipv6Addr) -> bool {
-    (v6.segments()[0] & 0xffc0) == 0xfe80
-}
-
-/// IPv6 unique-local: `fc00::/7`.
-fn is_v6_unique_local(v6: Ipv6Addr) -> bool {
-    (v6.segments()[0] & 0xfe00) == 0xfc00
 }
 
 #[cfg(test)]

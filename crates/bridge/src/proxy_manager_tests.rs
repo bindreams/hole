@@ -4732,3 +4732,35 @@ mod self_test {
         });
     }
 }
+
+// Start-diagnostic redaction ==========================================================================================
+
+/// `ProxyStartedDiag` is the richest Hole-authored line on the start path.
+/// Its shape is the guarantee: there is no field an address can occupy.
+#[skuld::test]
+fn proxy_start_diag_carries_no_address() {
+    use hole_common::logging::redact_arm::token_for;
+
+    const ENTRY_ID: &str = "8f2a1c04-0000-0000-0000-000000000000";
+    const HOSTNAME: &str = "vpn.example.invalid";
+    const ADDR: &str = "203.0.113.7";
+    let ip: std::net::IpAddr = ADDR.parse().expect("literal");
+
+    let diag = super::ProxyStartedDiag {
+        server: token_for(ENTRY_ID),
+        server_kind: hole_common::logging::redact_arm::server_kind(HOSTNAME),
+        server_family: Some(hole_common::logging::redact_arm::ip_family(ip)),
+        server_scope: Some(hole_common::logging::redact_arm::ip_scope(ip)),
+        server_port: 8388,
+        local_port: 4073,
+        tunnel_mode: "full",
+        udp_proxy_available: true,
+        ipv6_bypass_available: false,
+    };
+    let rendered = dump::dump!(&diag).to_string();
+    assert!(rendered.contains(&token_for(ENTRY_ID)), "{rendered}");
+    assert!(!rendered.contains(HOSTNAME), "{rendered}");
+    assert!(!rendered.contains(ADDR), "{rendered}");
+    assert!(rendered.contains("global"), "the scope must survive: {rendered}");
+    assert!(rendered.contains("domain"), "the kind must survive: {rendered}");
+}

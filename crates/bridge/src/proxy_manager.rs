@@ -38,6 +38,7 @@ use std::time::Instant;
 use util::port_alloc;
 
 use dump::{dump, DeriveDump};
+use hole_common::logging::redact_arm::{ip_family, ip_scope, server_kind, token_for};
 use hole_common::protocol::{ProxyConfig, TunnelMode};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
@@ -58,13 +59,19 @@ mod cover;
 use cover::CoverHolder;
 
 /// Non-secret diagnostic view of a proxy-start event — suitable for
-/// YAML-shaped logging via `dump!`. Deliberately excludes password /
-/// PSK fields; `ServerEntry` itself is not `Dump` so it cannot be
-/// dropped into a log by mistake.
+/// YAML-shaped logging via `dump!`.
+///
+/// There is no field an address can occupy. `server` is the entry's opaque
+/// token; the shape questions this repo's actual diagnoses turned on (#248,
+/// #541, #655, #770, #694) are answered by `server_kind` / `server_family` /
+/// `server_scope` instead. `server_family` and `server_scope` are `None`
+/// only where no address was resolved.
 #[derive(DeriveDump)]
 struct ProxyStartedDiag<'a> {
-    server_ip: Option<IpAddr>,
-    server_host: &'a str,
+    server: String,
+    server_kind: &'static str,
+    server_family: Option<&'static str>,
+    server_scope: Option<&'static str>,
     server_port: u16,
     local_port: u16,
     tunnel_mode: &'a str,
@@ -714,6 +721,8 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
             local_port = config.local_port,
             tunnel_mode = ?config.tunnel_mode,
             plugin = ?config.server.plugin,
+            server = %token_for(&config.server.id),
+            server_kind = server_kind(config.server.server.expose()),
             server_port = config.server.server_port,
             "ProxyManager::start_cancellable entered"
         );
@@ -1067,8 +1076,10 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
                 self.active_config = Some(config.clone());
                 self.last_error = None;
                 let diag = ProxyStartedDiag {
-                    server_ip,
-                    server_host: config.server.server.expose(),
+                    server: token_for(&config.server.id),
+                    server_kind: server_kind(config.server.server.expose()),
+                    server_family: server_ip.map(ip_family),
+                    server_scope: server_ip.map(ip_scope),
                     server_port: config.server.server_port,
                     local_port: config.local_port,
                     tunnel_mode: tunnel_mode_label(&config.tunnel_mode),
@@ -1116,7 +1127,14 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
             }
             None => crate::dns::bootstrap::resolve_via_doh(config.server.server.expose(), &config.dns).await,
         };
-        Ok(res.inspect_err(|e| warn!(error = %e, "DoH bootstrap resolution failed"))?)
+        Ok(res.inspect_err(|e| {
+            warn!(
+                server = %token_for(&config.server.id),
+                server_kind = server_kind(config.server.server.expose()),
+                error = %e,
+                "DoH bootstrap resolution failed"
+            )
+        })?)
     }
 
     /// Produce a [`RunningState`] without touching `self`.
@@ -1433,6 +1451,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
                 // probe must not OS-resolve the hostname (that would reopen the
                 // DNS leak this feature closes).
                 let host = server_ip.to_string();
+                let token = token_for(&config.server.id);
                 let port = config.server.server_port;
                 let plugin = config.server.plugin.clone();
                 let opts = config.server.plugin_opts.clone();
@@ -1441,8 +1460,15 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
                 // that don't await its verdict.
                 let stop = pc.clone();
                 let handle = tokio::spawn(async move {
-                    crate::reachability::probe_server_reachability(&host, port, plugin.as_deref(), opts.as_deref(), &pc)
-                        .await
+                    crate::reachability::probe_server_reachability(
+                        &host,
+                        port,
+                        &token,
+                        plugin.as_deref(),
+                        opts.as_deref(),
+                        &pc,
+                    )
+                    .await
                 });
                 (handle, stop)
             });
