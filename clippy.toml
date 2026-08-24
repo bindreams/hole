@@ -269,3 +269,8 @@ allow-invalid = true
 path = "windows::Win32::NetworkManagement::WindowsFilteringPlatform::FwpmFreeMemory0"
 reason = "Lockdown cover App-ID blob free must go through `routing::failclosed`. Only `failclosed/windows.rs` may call FWPM. See #527."
 allow-invalid = true
+
+[[disallowed-methods]]
+path = "windows::Win32::NetworkManagement::WindowsFilteringPlatform::FwpmFilterGetByKey0"
+reason = "Lockdown cover presence probe must go through `routing::failclosed::lockdown_cover_presence`. Only `failclosed/windows.rs` may call FWPM. See #881."
+allow-invalid = true

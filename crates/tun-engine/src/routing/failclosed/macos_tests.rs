@@ -647,3 +647,52 @@ fn release_all_logs_a_swallowed_standing_clear_failure_but_still_reports_ok() {
     );
     assert!(ops.log.contains(&"clear_standing"), "the clear must still be attempted");
 }
+
+// Cover presence ======================================================================================================
+
+use crate::routing::CoverPresence;
+
+#[skuld::test]
+fn presence_fold_is_closed_over_the_probe_and_the_state_file() {
+    // (pf label answer, state file, expected)
+    let cases: [(Option<bool>, StateFile<lockdown_state::LockdownPfState>, CoverPresence); 9] = [
+        (Some(true), StateFile::Absent, CoverPresence::Live),
+        (Some(true), StateFile::Present(standing_state()), CoverPresence::Live),
+        (Some(true), StateFile::Unusable, CoverPresence::Live),
+        (Some(false), StateFile::Absent, CoverPresence::Absent),
+        (
+            Some(false),
+            StateFile::Present(standing_state()),
+            CoverPresence::Recorded,
+        ),
+        (Some(false), StateFile::Unusable, CoverPresence::Recorded),
+        (None, StateFile::Absent, CoverPresence::Unreachable),
+        (None, StateFile::Present(standing_state()), CoverPresence::Recorded),
+        (None, StateFile::Unusable, CoverPresence::Recorded),
+    ];
+    for (label, file, expected) in cases {
+        assert_eq!(
+            fold_presence(label, &file),
+            expected,
+            "pf_label={label:?} file={file:?} must fold to {expected:?}"
+        );
+    }
+}
+
+#[skuld::test]
+fn file_only_presence_never_reports_live() {
+    // Pins the file-only body that ships before the pf probe lands: with no pf
+    // answer the fold cannot reach `Live`, so it cannot trigger an intent
+    // repair write off a state file alone.
+    for file in [
+        StateFile::Absent,
+        StateFile::Present(standing_state()),
+        StateFile::Unusable,
+    ] {
+        assert_ne!(
+            fold_presence(None, &file),
+            CoverPresence::Live,
+            "a file-only answer must never claim the OS confirmed a cover"
+        );
+    }
+}

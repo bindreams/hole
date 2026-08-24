@@ -191,6 +191,22 @@ pub fn lockdown_cover_present(state_dir: &Path) -> bool {
     }
 }
 
+/// Ask the OS whether a standing lockdown cover from a prior run is present,
+/// keyed on the cover's OWN evidence (NOT `bridge-routes.json` — the cover's
+/// lifetime is independent of routes).
+///
+/// - **Windows**: query every lockdown filter GUID with `FwpmFilterGetByKey0`.
+/// - **macOS**: read our own ruleset label back from `pfctl -s labels`, falling back to `bridge-lockdown-pf.json`.
+///
+/// [`CoverPresence::Indeterminate`](crate::routing::CoverPresence::Indeterminate)
+/// means the OS was asked and its answer was unusable;
+/// [`CoverPresence::Unreachable`](crate::routing::CoverPresence::Unreachable)
+/// means it could not be asked at all. Neither ever authorises removing
+/// protection on its own — see [`crate::routing::decide_cover_recovery`].
+pub fn lockdown_cover_presence(state_dir: &Path) -> crate::routing::CoverPresence {
+    platform::lockdown_cover_presence(state_dir)
+}
+
 /// Clear every fail-closed cover this platform can install — both the
 /// transient block-until-connected cover and the standing lockdown cover —
 /// without ever asking whether either is present. This is the escape from a

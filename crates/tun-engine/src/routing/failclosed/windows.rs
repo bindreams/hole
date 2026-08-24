@@ -964,6 +964,79 @@ pub fn recover_lockdown(decision: crate::routing::CoverRecovery, _state_dir: &Pa
     }
 }
 
+/// Classify a presence probe's outcome. Pure and total over its inputs, so the
+/// rule is table-tested without an engine.
+///
+/// `engine_opened` false is [`CoverPresence::Unreachable`] — the firewall could
+/// not be asked, so nothing at all is known. Otherwise: any `ERROR_SUCCESS`
+/// means at least one lockdown filter is installed
+/// ([`CoverPresence::Live`](crate::routing::CoverPresence::Live) is "any
+/// residue", see its doc); every code being the literal
+/// [`FWP_E_FILTER_NOT_FOUND_DWORD`] means a clean host; anything else is
+/// [`CoverPresence::Indeterminate`].
+///
+/// **Only that one literal code produces `Absent`.** That is the structural
+/// guarantee that a DACL-denied read can never be mistaken for a clean host,
+/// and it is what makes the unelevated behaviour of `FwpmFilterGetByKey0` a
+/// documentation question rather than a correctness dependency.
+pub(crate) fn classify_presence(engine_opened: bool, codes: &[u32]) -> crate::routing::CoverPresence {
+    use crate::routing::CoverPresence;
+    if !engine_opened {
+        return CoverPresence::Unreachable;
+    }
+    if codes.contains(&ERROR_SUCCESS.0) {
+        return CoverPresence::Live;
+    }
+    if codes.iter().all(|&c| c == FWP_E_FILTER_NOT_FOUND_DWORD) {
+        return CoverPresence::Absent;
+    }
+    CoverPresence::Indeterminate
+}
+
+/// Ask WFP whether a standing lockdown cover — or any residue of one — is
+/// installed, by querying every GUID in [`swept_lockdown_guids`] with
+/// `FwpmFilterGetByKey0`. `state_dir` is unused: the lockdown GUIDs are
+/// compile-time constants, so this answers "is a Hole lockdown cover present",
+/// never "is it mine" (see CONTRIBUTING.md's disclosed residual).
+///
+/// A failed engine open means the Base Filtering Engine could not be reached
+/// (BFE not yet running, or an RPC failure) — NOT "not elevated"; FWPM opens
+/// without elevation, as `release_all`'s doc records.
+#[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
+pub fn lockdown_cover_presence(_state_dir: &Path) -> crate::routing::CoverPresence {
+    unsafe {
+        let mut engine = HANDLE::default();
+        let rc = FwpmEngineOpen0(PCWSTR::null(), RPC_C_AUTHN_WINNT, None, None, &mut engine);
+        if rc != ERROR_SUCCESS.0 {
+            tracing::warn!(
+                code = format!("0x{rc:08x}"),
+                "FwpmEngineOpen0 failed: the firewall could not be asked whether a lockdown cover is present"
+            );
+            return classify_presence(false, &[]);
+        }
+
+        let mut codes: Vec<u32> = Vec::new();
+        for g in swept_lockdown_guids() {
+            let mut out: *mut FWPM_FILTER0 = std::ptr::null_mut();
+            codes.push(FwpmFilterGetByKey0(engine, &g, &mut out));
+            if !out.is_null() {
+                let mut p = out as *mut core::ffi::c_void;
+                FwpmFreeMemory0(&mut p);
+            }
+        }
+        let _ = FwpmEngineClose0(engine);
+
+        let presence = classify_presence(true, &codes);
+        if presence == crate::routing::CoverPresence::Indeterminate {
+            tracing::warn!(
+                codes = ?codes.iter().map(|c| format!("0x{c:08x}")).collect::<Vec<_>>(),
+                "lockdown presence probe returned an unusable answer"
+            );
+        }
+        presence
+    }
+}
+
 /// Fail-loud disengage for the `bridge unlock` escape hatch. Deletes all
 /// lockdown + App-ID filters by their fixed GUIDs (idempotent — a "not found"
 /// delete is a no-op, so a clean host returns `Ok`). The failure that means

@@ -485,6 +485,37 @@ pub fn disengage_lockdown(state_dir: &Path) -> Result<(), RoutingError> {
     Ok(())
 }
 
+/// Fold the two independent presence sources into one answer. `pf_label` is
+/// what pf said (`Some(true)`: our own rule label is loaded; `Some(false)`: it
+/// is not; `None`: pf could not be asked); `file` is Hole's own
+/// `bridge-lockdown-pf.json`.
+///
+/// pf's own confirmation wins outright. Failing that, a state file — readable
+/// or not — is Hole's unreconciled record that a cover was engaged and never
+/// confirmed released, which is [`CoverPresence::Recorded`]. Only a pf that
+/// answered "no" with nothing on disk contradicting it is `Absent`; a pf that
+/// could not answer at all, with no file either, is `Unreachable`.
+pub(crate) fn fold_presence(
+    pf_label: Option<bool>,
+    file: &super::StateFile<lockdown_state::LockdownPfState>,
+) -> crate::routing::CoverPresence {
+    use crate::routing::CoverPresence;
+    match (pf_label, file) {
+        (Some(true), _) => CoverPresence::Live,
+        (_, StateFile::Present(_) | StateFile::Unusable) => CoverPresence::Recorded,
+        (Some(false), StateFile::Absent) => CoverPresence::Absent,
+        (None, StateFile::Absent) => CoverPresence::Unreachable,
+    }
+}
+
+/// Whether a standing lockdown cover is present, per pf and per Hole's own
+/// state file. **File-only for now** — the `pf_label` source is supplied by the
+/// ruleset-label probe in the next step; until then this cannot return
+/// [`CoverPresence::Live`], and therefore cannot trigger an intent repair.
+pub fn lockdown_cover_presence(state_dir: &Path) -> crate::routing::CoverPresence {
+    fold_presence(None, &lockdown_state::load_presence(state_dir))
+}
+
 /// Best-effort wrapper for `Drop` (user-stop): disengage and swallow. Drop has
 /// no caller to surface an error to.
 fn lockdown_disengage(state_dir: &Path) {

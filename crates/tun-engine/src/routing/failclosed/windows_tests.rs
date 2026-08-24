@@ -695,3 +695,96 @@ fn adopt_does_not_delete_the_address_range_loopback_floor() {
     // Adopt still drops exactly the four volatile permits — unchanged by this fix.
     assert_eq!(adopt.len(), 4, "adopt_delete_guids unchanged: TUN V4/V6 + server V4/V6");
 }
+
+// Cover presence ======================================================================================================
+
+use crate::routing::CoverPresence;
+
+/// `ERROR_ACCESS_DENIED` as the Win32 DWORD a DACL-denied FWPM read returns.
+const ERROR_ACCESS_DENIED_DWORD: u32 = 5;
+
+#[skuld::test]
+fn classify_presence_is_closed_over_its_inputs() {
+    let nf = FWP_E_FILTER_NOT_FOUND_DWORD;
+    let ok = ERROR_SUCCESS.0;
+    let cases: [(bool, &[u32], CoverPresence); 6] = [
+        (false, &[], CoverPresence::Unreachable),
+        (false, &[ok], CoverPresence::Unreachable),
+        (true, &[nf, nf, nf], CoverPresence::Absent),
+        (true, &[nf, ok, nf], CoverPresence::Live),
+        (true, &[nf, 0x8032_0001, nf], CoverPresence::Indeterminate),
+        (true, &[0x8032_0001, ok], CoverPresence::Live),
+    ];
+    for (opened, codes, expected) in cases {
+        assert_eq!(
+            classify_presence(opened, codes),
+            expected,
+            "engine_opened={opened} codes={codes:x?} must classify as {expected:?}"
+        );
+    }
+    assert_eq!(
+        classify_presence(true, &[]),
+        CoverPresence::Absent,
+        "an open engine with nothing to report found no cover"
+    );
+}
+
+#[skuld::test]
+fn an_access_denied_code_is_never_absent() {
+    // The structural guarantee that makes the unelevated-read question a
+    // documentation matter, not a correctness dependency: ONLY the literal
+    // FWP_E_FILTER_NOT_FOUND produces `Absent`, so a denied read can never be
+    // mistaken for a clean host.
+    let nf = FWP_E_FILTER_NOT_FOUND_DWORD;
+    assert_eq!(
+        classify_presence(true, &[nf, ERROR_ACCESS_DENIED_DWORD, nf]),
+        CoverPresence::Indeterminate,
+        "a DACL-denied read must be Indeterminate, never Absent"
+    );
+}
+
+#[skuld::test]
+fn an_interrupted_sweep_still_reads_as_live() {
+    // The sweeps loop delete-by-key with every return code discarded, so a
+    // sweep killed part-way (say after index 6, leaving block-all V6) survives
+    // a reboot as a PARTIAL cover. One found GUID is enough to report Live —
+    // otherwise that partial cover would answer Absent forever.
+    let nf = FWP_E_FILTER_NOT_FOUND_DWORD;
+    let mut codes = vec![nf; swept_lockdown_guids().len()];
+    for i in 0..codes.len() {
+        let mut one = codes.clone();
+        one[i] = ERROR_SUCCESS.0;
+        assert_eq!(
+            classify_presence(true, &one),
+            CoverPresence::Live,
+            "a single surviving filter at index {i} must read as Live"
+        );
+    }
+    codes[0] = ERROR_SUCCESS.0;
+    assert_eq!(classify_presence(true, &codes), CoverPresence::Live);
+}
+
+#[skuld::test]
+fn presence_probes_every_swept_lockdown_guid() {
+    // `lockdown_cover_presence` iterates exactly `swept_lockdown_guids()` — the
+    // same set the sweeps delete — so no residue the sweep would remove can
+    // hide from the probe.
+    let probed = swept_lockdown_guids();
+    assert_eq!(
+        probed.len(),
+        LOCKDOWN_FILTER_GUIDS.len() + MAX_APPID_BINARIES * 2,
+        "the probe must cover the fixed lockdown GUIDs plus every App-ID slot"
+    );
+    assert!(
+        probed.contains(&LOCKDOWN_FILTER_GUIDS[6]),
+        "block-all V4 must be probed"
+    );
+    assert!(
+        probed.contains(&LOCKDOWN_FILTER_GUIDS[7]),
+        "block-all V6 must be probed"
+    );
+    for i in 0..MAX_APPID_BINARIES {
+        assert!(probed.contains(&appid_filter_guid(i, false)), "App-ID slot {i} V4");
+        assert!(probed.contains(&appid_filter_guid(i, true)), "App-ID slot {i} V6");
+    }
+}
