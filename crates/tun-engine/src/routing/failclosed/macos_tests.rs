@@ -472,6 +472,7 @@ fn standing_state() -> lockdown_state::LockdownPfState {
         pf_token: "222".into(),
         main_snapshot: String::new(),
         nat_snapshot: String::new(),
+        main_snapshot_captured: true,
     }
 }
 
@@ -772,4 +773,88 @@ fn pf_label_answer_maps_a_failed_pfctl_to_none() {
     let mut clean = output_with_status(0).unwrap();
     clean.stdout = b"com.apple.something 0 0\n".to_vec();
     assert_eq!(pf_label_answer(Ok(clean)), Some(false));
+}
+
+// Self-capture guard ==================================================================================================
+
+#[skuld::test]
+fn self_capture_persists_no_baseline_but_keeps_the_nat_rules() {
+    // Presence Live at capture time means the ruleset `pfctl -sr` would return
+    // is OUR OWN cover, so there is no host baseline to record. The NAT rules
+    // are a different matter: they are the host's own translation rules, fed
+    // verbatim into the ruleset engage loads, so zeroing them would flush a
+    // live host NAT (Internet Sharing, a VM bridge) the moment the cover
+    // engages, with nothing on disk to restore it from.
+    let tmp = tempfile::tempdir().unwrap();
+    let nat = "nat on en0 from any to any -> (en0)\n";
+    let returned = persist_baseline(
+        "tok",
+        tmp.path(),
+        None,
+        CoverPresence::Live,
+        "block drop out quick all label \"hole-lockdown\"\n".into(),
+        nat.into(),
+    )
+    .expect("the persist must succeed");
+
+    assert_eq!(
+        returned, nat,
+        "the nat snapshot must reach the ruleset builder unchanged"
+    );
+    let st = lockdown_state::load(tmp.path()).expect("state must be persisted");
+    assert!(!st.main_snapshot_captured, "no host baseline was captured");
+    assert!(st.main_snapshot.is_empty(), "our own ruleset must not be recorded");
+    assert_eq!(st.nat_snapshot, nat, "the host NAT rules must be persisted verbatim");
+}
+
+#[skuld::test]
+fn a_measured_clean_host_captures_its_baseline() {
+    let tmp = tempfile::tempdir().unwrap();
+    let main = "scrub-anchor \"com.apple/*\" all fragment reassemble\n";
+    let nat = "nat-anchor \"com.apple/*\" all\n";
+    persist_baseline("tok", tmp.path(), None, CoverPresence::Absent, main.into(), nat.into()).unwrap();
+
+    let st = lockdown_state::load(tmp.path()).unwrap();
+    assert!(st.main_snapshot_captured);
+    assert_eq!(st.main_snapshot, main);
+    assert_eq!(st.nat_snapshot, nat);
+}
+
+#[skuld::test]
+fn an_uncaptured_baseline_restores_the_default_ruleset() {
+    let mut st = standing_state();
+    st.main_snapshot_captured = false;
+    st.main_snapshot = String::new();
+    let mut ops = RecordingPfOps::default();
+    release_all_with(StateFile::Absent, StateFile::Present(st), &mut ops).unwrap();
+
+    assert!(
+        ops.log.contains(&"reload_default"),
+        "with no captured baseline, /etc/pf.conf IS the restore target: {:?}",
+        ops.log
+    );
+    assert!(
+        !ops.log.contains(&"load_ruleset"),
+        "an empty snapshot must never be loaded as a ruleset — that is a pass-all host: {:?}",
+        ops.log
+    );
+    assert!(ops.log.contains(&"clear_standing"));
+}
+
+#[skuld::test]
+fn an_empty_but_captured_baseline_still_restores_the_snapshot() {
+    // The discriminating case for the bool sentinel: a host really can have an
+    // empty filter ruleset, and that IS its policy. Keying on `main_snapshot
+    // .is_empty()` instead of the flag would silently reload /etc/pf.conf over it.
+    let mut st = standing_state();
+    st.main_snapshot = String::new();
+    assert!(st.main_snapshot_captured, "sample state is a captured baseline");
+    let mut ops = RecordingPfOps::default();
+    release_all_with(StateFile::Absent, StateFile::Present(st), &mut ops).unwrap();
+
+    assert!(
+        ops.log.contains(&"load_ruleset"),
+        "a captured baseline is restored from the snapshot even when empty: {:?}",
+        ops.log
+    );
 }

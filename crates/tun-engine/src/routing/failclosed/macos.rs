@@ -368,19 +368,55 @@ pub fn recover_cover(state_dir: &Path, adopting: bool) {
 /// them with `token` (persist-before-mutate). Returns the nat snapshot for the
 /// engage ruleset. Separated so its `?`-error path can be unwound (drop the pf
 /// refcount) by the caller without leaking the `-E` enable.
+///
+/// The presence probe leads: if OUR OWN cover is already the loaded ruleset,
+/// `pfctl -sr` would hand back our block-all as if it were the host's policy.
+/// Detection asks [`lockdown_cover_presence`] rather than parsing rule text, so
+/// it depends on no claim about `pfctl -sr`'s print format.
 fn capture_and_persist(token: &str, state_dir: &Path, owner: Option<(u32, u32)>) -> Result<String, RoutingError> {
+    let presence = lockdown_cover_presence(state_dir);
     let sr = pfctl(&["-sr"], None, PHASE_COVER)?;
     let main_snapshot = String::from_utf8_lossy(&sr.stdout).into_owned();
     let sn = pfctl(&["-sn"], None, PHASE_COVER)?;
     let nat_snapshot = String::from_utf8_lossy(&sn.stdout).into_owned();
+    persist_baseline(token, state_dir, owner, presence, main_snapshot, nat_snapshot)
+}
 
+/// Persist the engage-time baseline. Pure over its inputs — the snapshots and
+/// the measured `presence` come from the caller — so the self-capture guard is
+/// table-tested without touching pf. Returns the nat snapshot for the engage
+/// ruleset.
+///
+/// When `presence` is [`CoverPresence::Live`](crate::routing::CoverPresence::Live)
+/// this does exactly three things differently: it persists `main_snapshot`
+/// empty, it persists `main_snapshot_captured: false`, and it warns. It
+/// persists `nat_snapshot` exactly as `pfctl -sn` returned it and returns that
+/// same value — those are the HOST's translation rules, carried forward
+/// verbatim into the ruleset engage loads, so zeroing them would flush a live
+/// host NAT the moment the cover engages, with nothing on disk to restore from.
+fn persist_baseline(
+    token: &str,
+    state_dir: &Path,
+    owner: Option<(u32, u32)>,
+    presence: crate::routing::CoverPresence,
+    main_snapshot: String,
+    nat_snapshot: String,
+) -> Result<String, RoutingError> {
+    let captured = presence != crate::routing::CoverPresence::Live;
+    if !captured {
+        tracing::warn!(
+            "a lockdown cover is already loaded, so there is no pre-lockdown host ruleset to capture; \
+             recording no baseline (a restore will reload /etc/pf.conf)"
+        );
+    }
     lockdown_state::save(
         state_dir,
         &lockdown_state::LockdownPfState {
             version: lockdown_state::SCHEMA_VERSION,
             pf_token: token.to_owned(),
-            main_snapshot,
+            main_snapshot: if captured { main_snapshot } else { String::new() },
             nat_snapshot: nat_snapshot.clone(),
+            main_snapshot_captured: captured,
         },
         owner,
     )
@@ -435,6 +471,10 @@ pub fn engage_lockdown(
                 pf_token: token.clone(),
                 main_snapshot: st.main_snapshot,
                 nat_snapshot: st.nat_snapshot.clone(),
+                // Carried, not re-asserted: this re-persists the SAME baseline
+                // under a fresh token, so claiming a capture that never
+                // happened would restore an empty pass-all ruleset.
+                main_snapshot_captured: st.main_snapshot_captured,
             };
             if let Err(e) = lockdown_state::save(state_dir, &fresh, owner) {
                 if let Err(xe) = pfctl(&["-X", &token], None, PHASE_COVER) {
@@ -497,8 +537,15 @@ pub fn disengage_lockdown(state_dir: &Path) -> Result<(), RoutingError> {
     let Some(st) = lockdown_state::load(state_dir) else {
         return Ok(()); // No cover engaged — nothing to disengage.
     };
-    let restore = build_lockdown_restore_ruleset(&st.nat_snapshot, &st.main_snapshot);
-    let out = pfctl(&["-f", "-"], Some(restore.as_bytes()), PHASE_RECOVER_COVER)?;
+    // No captured baseline means our own cover was the loaded ruleset at engage
+    // time, so `/etc/pf.conf` IS the restore target — see
+    // `LockdownPfState::main_snapshot_captured`.
+    let out = if st.main_snapshot_captured {
+        let restore = build_lockdown_restore_ruleset(&st.nat_snapshot, &st.main_snapshot);
+        pfctl(&["-f", "-"], Some(restore.as_bytes()), PHASE_RECOVER_COVER)?
+    } else {
+        pfctl(&["-f", PFCONF], None, PHASE_RECOVER_COVER)?
+    };
     if !out.status.success() {
         return Err(RoutingError::RouteSetup(format!(
             "pfctl lockdown restore failed: {}",
@@ -630,6 +677,25 @@ pub(crate) fn release_all_with(
     // Block 2 — standing cover.
     match standing {
         StateFile::Absent => {}
+        StateFile::Present(st) if !st.main_snapshot_captured => {
+            // No baseline was captured, so there is no snapshot to load — see
+            // `LockdownPfState::main_snapshot_captured`. Loading the empty one
+            // would leave a pass-all host.
+            let outcome = ops.reload_default();
+            let _ = ops.drop_token(&st.pf_token);
+            match outcome {
+                Ok(()) => {
+                    if let Err(e) = ops.clear_standing() {
+                        tracing::warn!(error = %e, "lockdown-pf-state clear failed during release_all");
+                    }
+                }
+                Err(e) => {
+                    if first_err.is_none() {
+                        first_err = Some(e);
+                    }
+                }
+            }
+        }
         StateFile::Present(st) => {
             let restore = build_lockdown_restore_ruleset(&st.nat_snapshot, &st.main_snapshot);
             let outcome = match ops.load_ruleset(&restore) {

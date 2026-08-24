@@ -28,6 +28,29 @@ pub struct LockdownPfState {
     /// `main_snapshot`. Carried forward into the lockdown ruleset (so the
     /// session does not flush NAT) and re-loaded on Sweep for restore.
     pub nat_snapshot: String,
+    /// `false` when the host's filter ruleset at engage time was our OWN cover,
+    /// so there was no pre-lockdown baseline to capture; a restore then reloads
+    /// `/etc/pf.conf` instead of `main_snapshot`. Read by `disengage_lockdown`
+    /// and by `release_all_with`'s standing `Present` arm.
+    ///
+    /// A bool, not `main_snapshot.is_empty()`: a host really can have an empty
+    /// filter ruleset, and that IS its policy — keying on emptiness would
+    /// silently reload `/etc/pf.conf` over it.
+    ///
+    /// Defaults `true` (NO schema bump) so a file written before this field
+    /// existed reads as the captured baseline it was. Bumping
+    /// [`SCHEMA_VERSION`] instead would make every existing file `Unusable`,
+    /// which [`load`] collapses to `None`, which makes `disengage_lockdown`
+    /// early-return `Ok(())` over a still-blocked host — silently breaking
+    /// `hole bridge unlock` and the tray's Unblock item on the ordinary macOS
+    /// upgrade path. `deny_unknown_fields` rejects EXTRA fields, not missing
+    /// ones, so the default applies cleanly.
+    #[serde(default = "default_true")]
+    pub main_snapshot_captured: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 fn state_file(state_dir: &Path) -> PathBuf {
