@@ -334,12 +334,33 @@ fn open_windows_device(name: &str, addr: &str, netmask: &str) -> tun::AsyncDevic
     tun::create_as_async(&cfg).unwrap_or_else(|e| panic!("HARNESS: create_as_async({name}) failed: {e}"))
 }
 
+/// Render a completed process's exit status AND both streams. `netsh`
+/// writes its diagnostics to STDOUT, not stderr — a stderr-only capture
+/// silently drops the one line that explains a failure, turning "failed:"
+/// into an empty, undiagnosable message. Every command this file shells out
+/// to reports through this so a HARNESS failure is diagnosable from the
+/// first CI run, not the second.
+fn describe_output(out: &std::process::Output) -> String {
+    format!(
+        "exit={:?} stdout={:?} stderr={:?}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    )
+}
+
 #[cfg(target_os = "windows")]
 fn ps_output(script: &str) -> String {
     let out = Command::new("powershell")
         .args(["-NoProfile", "-Command", script])
         .output()
         .unwrap_or_else(|e| panic!("HARNESS: failed to spawn powershell: {e}"));
+    if !out.status.success() {
+        panic!(
+            "HARNESS: powershell -Command {script:?} failed: {}",
+            describe_output(&out)
+        );
+    }
     String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
@@ -355,6 +376,14 @@ fn windows_add_probe_route(name: &str) {
         panic!("HARNESS: a pre-existing route to {PROBE_NET} already exists — refusing to add a second:\n{existing}");
     }
 
+    // NOTE: no manual quotes around the interface value — `Command::args`
+    // already escapes each element as ONE argv token for the standard
+    // Windows argv parser netsh's own C runtime startup uses; wrapping the
+    // value in literal `"` characters here makes THEM part of the delivered
+    // value (`"name"`, quotes included) instead of delimiting it. These
+    // device names never contain spaces, but the bug is real regardless of
+    // that — confirmed empirically against a runner interface name that
+    // does (bindreams/hole#886 review).
     let out = Command::new("netsh")
         .args([
             "interface",
@@ -362,15 +391,15 @@ fn windows_add_probe_route(name: &str) {
             "add",
             "route",
             &format!("prefix={PROBE_NET}"),
-            &format!("interface=\"{name}\""),
+            &format!("interface={name}"),
             "store=active",
         ])
         .output()
         .unwrap_or_else(|e| panic!("HARNESS: failed to spawn netsh add route: {e}"));
     if !out.status.success() {
         panic!(
-            "HARNESS: netsh add route prefix={PROBE_NET} interface=\"{name}\" failed: {}",
-            String::from_utf8_lossy(&out.stderr)
+            "HARNESS: netsh add route prefix={PROBE_NET} interface={name} failed: {}",
+            describe_output(&out)
         );
     }
 
@@ -389,6 +418,7 @@ fn windows_add_probe_route(name: &str) {
 
 #[cfg(target_os = "windows")]
 fn windows_remove_probe_route(name: &str) {
+    // See `windows_add_probe_route`'s note: no manual quoting.
     let out = Command::new("netsh")
         .args([
             "interface",
@@ -396,15 +426,15 @@ fn windows_remove_probe_route(name: &str) {
             "delete",
             "route",
             &format!("prefix={PROBE_NET}"),
-            &format!("interface=\"{name}\""),
+            &format!("interface={name}"),
             "store=active",
         ])
         .output();
     match out {
         Ok(o) if o.status.success() => {}
         Ok(o) => eprintln!(
-            "HARNESS: netsh delete route prefix={PROBE_NET} interface=\"{name}\" failed: {}",
-            String::from_utf8_lossy(&o.stderr)
+            "HARNESS: netsh delete route prefix={PROBE_NET} interface={name} failed: {}",
+            describe_output(&o)
         ),
         Err(e) => eprintln!("HARNESS: failed to spawn netsh delete route for {name}: {e}"),
     }
@@ -492,10 +522,7 @@ impl TapIfconfig for tun::AsyncDevice {
             .output()
             .unwrap_or_else(|e| panic!("HARNESS: failed to spawn ifconfig {name}: {e}"));
         if !out.status.success() {
-            panic!(
-                "HARNESS: ifconfig {name} failed: {}",
-                String::from_utf8_lossy(&out.stderr)
-            );
+            panic!("HARNESS: ifconfig {name} failed: {}", describe_output(&out));
         }
         self
     }
@@ -531,7 +558,7 @@ fn macos_add_probe_route(name: &str) {
     if !out.status.success() {
         panic!(
             "HARNESS: route -n add -net {PROBE_NET} -interface {name} failed: {}",
-            String::from_utf8_lossy(&out.stderr)
+            describe_output(&out)
         );
     }
 
@@ -541,6 +568,9 @@ fn macos_add_probe_route(name: &str) {
         .args(["-n", "get", &PROBE_IP.to_string()])
         .output()
         .unwrap_or_else(|e| panic!("HARNESS: failed to spawn route get: {e}"));
+    if !out.status.success() {
+        panic!("HARNESS: route -n get {PROBE_IP} failed: {}", describe_output(&out));
+    }
     let text = String::from_utf8_lossy(&out.stdout).into_owned();
     let winner = text
         .lines()
@@ -564,7 +594,7 @@ fn macos_remove_probe_route(name: &str) {
         Ok(o) if o.status.success() => {}
         Ok(o) => eprintln!(
             "HARNESS: route -n delete -net {PROBE_NET} -interface {name} failed: {}",
-            String::from_utf8_lossy(&o.stderr)
+            describe_output(&o)
         ),
         Err(e) => eprintln!("HARNESS: failed to spawn route delete for {name}: {e}"),
     }

@@ -115,11 +115,32 @@ fn probe_tunnel() -> ProbeOutcome {
 
 // Bypass route (F6/F9) ================================================================================================
 
+/// Render a completed process's exit status AND both streams. `netsh`
+/// writes its diagnostics to STDOUT, not stderr — a stderr-only capture
+/// silently drops the one line that explains a failure, turning "failed:"
+/// into an empty, undiagnosable message. Every command this file shells out
+/// to reports through this so a HARNESS failure is diagnosable from the
+/// first CI run, not the second.
+fn describe_output(out: &std::process::Output) -> String {
+    format!(
+        "exit={:?} stdout={:?} stderr={:?}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    )
+}
+
 fn ps_output(script: &str) -> String {
     let out = Command::new("powershell")
         .args(["-NoProfile", "-Command", script])
         .output()
         .unwrap_or_else(|e| panic!("HARNESS: failed to spawn powershell: {e}"));
+    if !out.status.success() {
+        panic!(
+            "HARNESS: powershell -Command {script:?} failed: {}",
+            describe_output(&out)
+        );
+    }
     String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
@@ -141,6 +162,15 @@ impl BypassRoute {
             panic!("HARNESS: a pre-existing route to {prefix} already exists — refusing to add a second:\n{existing}");
         }
 
+        // NOTE: no manual quotes around the interface value. `Command::args`
+        // already escapes each element as ONE argv token for the standard
+        // Windows argv parser netsh's own C runtime startup uses; wrapping
+        // the value in literal `"` characters here makes THEM part of the
+        // delivered value (`"Ethernet 3"`, quotes included) instead of
+        // delimiting it, and netsh then fails to resolve a nonexistent
+        // adapter literally named with quote marks — confirmed empirically
+        // (a Windows runner whose interface name contains a space, e.g.
+        // "Ethernet 3", made the add fail; see bindreams/hole#886 review).
         let out = Command::new("netsh")
             .args([
                 "interface",
@@ -148,7 +178,7 @@ impl BypassRoute {
                 "add",
                 "route",
                 &format!("prefix={prefix}"),
-                &format!("interface=\"{}\"", gw.interface_name),
+                &format!("interface={}", gw.interface_name),
                 &format!("nexthop={}", gw.gateway_ip),
                 "store=active",
             ])
@@ -156,10 +186,10 @@ impl BypassRoute {
             .unwrap_or_else(|e| panic!("HARNESS: failed to spawn netsh add route: {e}"));
         if !out.status.success() {
             panic!(
-                "HARNESS: netsh add route prefix={prefix} interface=\"{}\" nexthop={} failed: {}",
+                "HARNESS: netsh add route prefix={prefix} interface={} nexthop={} failed: {}",
                 gw.interface_name,
                 gw.gateway_ip,
-                String::from_utf8_lossy(&out.stderr)
+                describe_output(&out)
             );
         }
 
@@ -186,6 +216,7 @@ impl BypassRoute {
 impl Drop for BypassRoute {
     fn drop(&mut self) {
         let prefix = format!("{NO_LEAK_TARGET_IP}/32");
+        // See `install`'s note: no manual quoting around the interface value.
         let out = Command::new("netsh")
             .args([
                 "interface",
@@ -193,16 +224,16 @@ impl Drop for BypassRoute {
                 "delete",
                 "route",
                 &format!("prefix={prefix}"),
-                &format!("interface=\"{}\"", self.interface_name),
+                &format!("interface={}", self.interface_name),
                 "store=active",
             ])
             .output();
         match out {
             Ok(o) if o.status.success() => {}
             Ok(o) => eprintln!(
-                "HARNESS: netsh delete route prefix={prefix} interface=\"{}\" failed: {}",
+                "HARNESS: netsh delete route prefix={prefix} interface={} failed: {}",
                 self.interface_name,
-                String::from_utf8_lossy(&o.stderr)
+                describe_output(&o)
             ),
             Err(e) => eprintln!("HARNESS: failed to spawn netsh delete route: {e}"),
         }
