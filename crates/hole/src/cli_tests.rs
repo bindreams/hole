@@ -827,3 +827,79 @@ fn grant_access_rejects_result_file_with_then_send() {
     ])
     .is_err());
 }
+
+// Redaction arming ====================================================================================================
+//
+// The CLI writes a fourth log file (`gui-cli.log`) and executes no GUI arming
+// site, so without these the wrapped writers are inert for its whole life.
+
+#[skuld::test]
+fn cli_proxy_start_arms_the_config_file_entry() {
+    use hole_common::logging::redact_arm::token_for;
+    use hole_common::protocol::{BridgeRequest, ProxyConfig};
+
+    const ENTRY_ID: &str = "55555555-0000-4000-8000-000000000000";
+    let mut entry = hole_common::config::ServerEntry::default_placeholder();
+    entry.id = ENTRY_ID.to_string();
+    entry.server = "203.0.113.7".into();
+
+    super::arm_request_redaction(&BridgeRequest::Start {
+        config: ProxyConfig {
+            server: entry,
+            ..ProxyConfig::default()
+        },
+        attempt_id: "attempt".to_string(),
+        covered: false,
+    });
+
+    assert_eq!(util::redact::redact_str("203.0.113.7"), token_for(ENTRY_ID));
+}
+
+#[skuld::test]
+fn cli_test_server_arms_the_config_file_entry() {
+    use hole_common::logging::redact_arm::token_for;
+    use hole_common::protocol::BridgeRequest;
+
+    const ENTRY_ID: &str = "66666666-0000-4000-8000-000000000000";
+    let mut entry = hole_common::config::ServerEntry::default_placeholder();
+    entry.id = ENTRY_ID.to_string();
+    entry.server = "203.0.113.9".into();
+
+    super::arm_request_redaction(&BridgeRequest::TestServer {
+        entry,
+        dns: Default::default(),
+    });
+
+    assert_eq!(util::redact::redact_str("203.0.113.9"), token_for(ENTRY_ID));
+}
+
+/// The elevation flow re-enters this binary as
+/// `hole bridge ipc-send --request-file`, carrying the address and the
+/// password. It is the CLI path that matters most and the one with no GUI
+/// arming site anywhere upstream of it.
+#[skuld::test]
+fn cli_ipc_send_arms_a_start_request(#[fixture(temp_dir)] dir: &Path) {
+    use hole_common::logging::redact_arm::token_for;
+    use hole_common::protocol::{BridgeRequest, ProxyConfig};
+
+    const ENTRY_ID: &str = "77777777-0000-4000-8000-000000000000";
+    let mut entry = hole_common::config::ServerEntry::default_placeholder();
+    entry.id = ENTRY_ID.to_string();
+    entry.server = "203.0.113.11".into();
+    let request = BridgeRequest::Start {
+        config: ProxyConfig {
+            server: entry,
+            ..ProxyConfig::default()
+        },
+        attempt_id: "attempt".to_string(),
+        covered: false,
+    };
+
+    let path = dir.join("request.json");
+    std::fs::write(&path, serde_json::to_string(&request).unwrap()).unwrap();
+    let decoded = crate::elevation::read_request_file(&path).expect("decode the request file");
+
+    super::arm_request_redaction(&decoded);
+
+    assert_eq!(util::redact::redact_str("203.0.113.11"), token_for(ENTRY_ID));
+}

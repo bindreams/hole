@@ -738,7 +738,10 @@ fn handle_bridge(action: BridgeAction) -> i32 {
         } => match (base64, request_file) {
             (Some(b64), _) => handle_ipc_send_b64(&b64),
             (_, Some(path)) => match crate::elevation::read_request_file(&path) {
-                Ok(request) => send_bridge_request(request, result_file.as_deref()),
+                Ok(request) => {
+                    arm_request_redaction(&request);
+                    send_bridge_request(request, result_file.as_deref())
+                }
                 Err(e) => {
                     cli_log!(error, "{e}");
                     1
@@ -1019,6 +1022,7 @@ fn handle_ipc_send_b64(base64_request: &str) -> i32 {
         }
     };
 
+    arm_request_redaction(&request);
     send_bridge_request(request, None)
 }
 
@@ -1078,6 +1082,23 @@ fn send_bridge_request(request: hole_common::protocol::BridgeRequest, result_fil
 /// Underlying request driver. Returns the parsed `BridgeResponse` or the typed
 /// `ClientError` (kept typed so the elevated classifier can distinguish a
 /// control-plane `ConcurrentStart` from a transport failure).
+/// Arm log redaction from a request the CLI is about to send.
+///
+/// The CLI writes its own log file (`gui-cli.log`) and executes none of the
+/// GUI's arming sites, so without this its wrapped writers are inert for the
+/// whole process lifetime. Covers the elevation flow, which re-enters this
+/// binary as `hole bridge ipc-send --request-file` carrying the address and
+/// the password.
+pub(crate) fn arm_request_redaction(request: &hole_common::protocol::BridgeRequest) {
+    use hole_common::logging::redact_arm::arm_server;
+    use hole_common::protocol::BridgeRequest;
+    match request {
+        BridgeRequest::Start { config, .. } => arm_server(&config.server),
+        BridgeRequest::TestServer { entry, .. } => arm_server(entry),
+        _ => {}
+    }
+}
+
 fn send_bridge_request_inner(
     request: hole_common::protocol::BridgeRequest,
 ) -> Result<hole_common::protocol::BridgeResponse, crate::bridge_client::ClientError> {
@@ -1118,6 +1139,7 @@ fn handle_proxy(action: ProxyAction) -> i32 {
                     return 1;
                 }
             };
+            hole_common::logging::redact_arm::arm_server(&entry);
             let request = BridgeRequest::Start {
                 config: ProxyConfig {
                     server: entry,
@@ -1190,6 +1212,7 @@ fn handle_proxy(action: ProxyAction) -> i32 {
                     return 1;
                 }
             };
+            hole_common::logging::redact_arm::arm_server(&entry);
             // The dev/admin CLI reads only a ServerEntry file — no AppConfig in
             // hand — so it bootstraps over the default DoH resolver.
             let dns = hole_common::config::DnsConfig::default();

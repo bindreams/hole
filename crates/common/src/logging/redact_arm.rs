@@ -64,6 +64,15 @@ pub fn arm_server(entry: &ServerEntry) {
     arm_candidates(&token_for(&entry.id), candidates);
 }
 
+/// Arm **every** entry, not only the selected one: any of them can reach a
+/// log (the auto-test loop walks the whole list), and the support-bundle
+/// collector scrubs with this same registry.
+pub fn arm_config(config: &crate::config::AppConfig) {
+    for entry in &config.servers {
+        arm_server(entry);
+    }
+}
+
 /// Arm the DoH-resolved address for `entry_id`, in both the bare and the
 /// bracketed form `handoff_host` hands to the plugin chain.
 pub fn arm_resolved_ip(entry_id: &str, ip: IpAddr) {
