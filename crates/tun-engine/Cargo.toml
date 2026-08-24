@@ -16,6 +16,14 @@ group = "hole"
 [lints]
 workspace = true
 
+[features]
+# Exposes the `sim` module — in-memory doubles for engine-owned types
+# that have no constructor outside this crate. Off by default — enabled
+# by this crate's own tests and by downstream crates that need to drive
+# the router without an OS device (`hole-bridge`, via a dev-dependency).
+# Production builds do NOT enable it, so `sim` is not compiled into them.
+test-utils = []
+
 [lib]
 harness = false
 

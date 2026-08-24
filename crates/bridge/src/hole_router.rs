@@ -321,3 +321,7 @@ impl HoleRouter {
 #[cfg(test)]
 #[path = "hole_router_tests.rs"]
 mod hole_router_tests;
+
+#[cfg(test)]
+#[path = "hole_router_dispatch_tests.rs"]
+mod hole_router_dispatch_tests;

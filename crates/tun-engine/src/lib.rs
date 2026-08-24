@@ -43,6 +43,9 @@ pub mod gateway;
 pub mod helpers;
 pub mod net;
 pub mod routing;
+#[cfg(any(test, feature = "test-utils"))]
+#[doc(hidden)]
+pub mod sim;
 
 pub use device::{Device, DeviceConfig, MutDeviceConfig};
 pub use engine::{

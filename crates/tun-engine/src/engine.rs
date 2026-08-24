@@ -23,7 +23,7 @@ mod dns;
 mod driver;
 mod router;
 mod tcp_flow;
-mod udp_flow;
+pub(crate) mod udp_flow;
 mod virtual_device;
 
 use std::sync::Arc;
