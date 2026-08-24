@@ -380,6 +380,16 @@ jobs:
         shell: bash
         run: cargo xtask verify-skuld-label-coverage --job test-hole
 
+      # A rename applied to only one of the two places that must agree — the
+      # `.config/nextest.toml` name-substring filter and the skuld label
+      # attached at a test's definition site — silently drops it from the
+      # `global_net_state` cross-binary serialization group. That reads as an
+      # intermittent flake, not the rename that caused it — see
+      # bindreams/hole#894.
+      - name: Verify global_net_state label matches the nextest.toml filter
+        shell: bash
+        run: cargo xtask verify-global-net-state-labels --job test-hole
+
       # `--no-default-features` mirrors the `hole-tests` xtask target. Without
       # it Cargo recompiles `hole` with `tauri/custom-protocol` ON (different
       # feature set → different fingerprint → fresh build), which expands

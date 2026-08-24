@@ -334,6 +334,16 @@ pub enum Command {
         #[arg(long, default_value = "test-hole")]
         job: String,
     },
+    /// Verify that `.config/nextest.toml`'s `global_net_state` test-group
+    /// name-substring filter and the `global_net_state` skuld label select
+    /// the exact same live tests, and that the group's `max-threads` is
+    /// still `1` — see `xtask::global_net_state_conformance` (bindreams/hole#894).
+    VerifyGlobalNetStateLabels {
+        /// ci.yaml job id to check (its steps must include exactly one
+        /// test-running nextest command shape).
+        #[arg(long, default_value = "test-hole")]
+        job: String,
+    },
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum, PartialEq, Eq)]
@@ -415,6 +425,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             Ok(())
         }
         Command::VerifySkuldLabelCoverage { job } => skuld_label_coverage::verify(&repo_root()?, &job),
+        Command::VerifyGlobalNetStateLabels { job } => global_net_state_conformance::verify(&repo_root()?, &job),
     }
 }
 
