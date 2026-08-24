@@ -16,6 +16,10 @@ harness = false
 bitflags = { workspace = true }
 tokio = { version = "1", features = ["rt", "macros", "time", "net"] }
 tracing = "0.1"
+# Redaction registry: lock-free snapshot reads so no logging call can block
+# behind a concurrent arm, and multi-needle leftmost-longest byte search.
+arc-swap = "1"
+aho-corasick = "1"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
@@ -23,6 +27,12 @@ libc = "0.2"
 [dev-dependencies]
 skuld = { workspace = true }
 hole-test-observability = { path = "../test-observability" }
+# `redact_tests` asserts on what `arm` itself logs: `WaitableWriter` as the
+# capture target (garter's `test-utils` feature) and the mandated
+# current-thread subscriber installer. garter does not depend on `util`, so
+# this is not a cycle.
+garter = { path = "../garter", features = ["test-utils"] }
+tracing-subscriber = { version = "0.3", features = ["fmt"] }
 # `retry_tests` uses `tokio::time::pause()` to auto-advance the mock clock
 # instead of burning wall-clock seconds on exponential backoff.
 tokio = { version = "1", features = ["test-util"] }

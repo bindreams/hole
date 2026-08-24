@@ -3,6 +3,8 @@
 //! - [`ownership`] — generic `chown(2)` primitive (macOS; a no-op elsewhere).
 //! - [`port_alloc`] — ephemeral port allocation with multi-transport
 //!   verification and retry around Windows bind races.
+//! - [`redact`] — process-global registry of literals that must never reach
+//!   a log, plus the byte-level writer that enforces it.
 //! - [`retry`] — exponential-backoff retry helpers + transient-error
 //!   predicates (`is_bind_race` / `is_file_contention`).
 //!
@@ -13,6 +15,7 @@
 
 pub mod ownership;
 pub mod port_alloc;
+pub mod redact;
 pub mod retry;
 
 // Install the workspace test subscriber + panic hook. The dev-dep is gated on
