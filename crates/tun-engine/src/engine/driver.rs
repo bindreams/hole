@@ -6,17 +6,14 @@
 //! the optional [`DnsInterceptor`](super::DnsInterceptor).
 
 use std::collections::{HashMap, HashSet};
-use std::net::{IpAddr, SocketAddr};
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Instant as StdInstant;
 
 use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
-use smoltcp::phy::ChecksumCapabilities;
 use smoltcp::socket::tcp;
 use smoltcp::time::Instant as SmoltcpInstant;
-use smoltcp::wire::{
-    HardwareAddress, IpAddress, IpCidr, IpProtocol, Ipv4Packet, Ipv4Repr, Ipv6Packet, Ipv6Repr, UdpPacket, UdpRepr,
-};
+use smoltcp::wire::{HardwareAddress, IpCidr};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, Semaphore};
 use tokio_util::sync::CancellationToken;
@@ -24,6 +21,8 @@ use tracing::{debug, trace, warn};
 
 use super::config::EngineConfig;
 use super::dns::DnsInterceptor;
+use super::emit::{build_udp_packet, smoltcp_to_std_ip};
+use super::parse::{parse_ip_dst, parse_ip_packet_full, IpProto};
 use super::router::{Router, TcpMeta, UdpMeta};
 use super::tcp_flow::TcpFlow;
 use super::udp_flow::{FlowKey, FlowTable, UdpReply};
@@ -481,243 +480,5 @@ impl Driver {
                 break;
             }
         }
-    }
-}
-
-// Packet parsing ======================================================================================================
-
-fn parse_ip_dst(packet: &[u8]) -> Option<(u16, IpProto)> {
-    if packet.is_empty() {
-        return None;
-    }
-    let version = packet[0] >> 4;
-    match version {
-        4 => parse_ipv4_dst(packet),
-        6 => parse_ipv6_dst(packet),
-        _ => None,
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum IpProto {
-    Tcp,
-    Udp,
-}
-
-fn parse_ipv4_dst(packet: &[u8]) -> Option<(u16, IpProto)> {
-    if packet.len() < 20 {
-        return None;
-    }
-    let ihl = ((packet[0] & 0x0f) as usize) * 4;
-    let protocol = packet[9];
-    if packet.len() < ihl + 4 {
-        return None;
-    }
-    let dst_port = u16::from_be_bytes([packet[ihl + 2], packet[ihl + 3]]);
-    match protocol {
-        6 => Some((dst_port, IpProto::Tcp)),
-        17 => Some((dst_port, IpProto::Udp)),
-        _ => None,
-    }
-}
-
-fn parse_ipv6_dst(packet: &[u8]) -> Option<(u16, IpProto)> {
-    if packet.len() < 40 + 4 {
-        return None;
-    }
-    let next_header = packet[6];
-    let dst_port = u16::from_be_bytes([packet[42], packet[43]]);
-    match next_header {
-        6 => Some((dst_port, IpProto::Tcp)),
-        17 => Some((dst_port, IpProto::Udp)),
-        _ => None,
-    }
-}
-
-struct ParsedPacket {
-    src: SocketAddr,
-    dst: SocketAddr,
-    proto: IpProto,
-    payload_offset: usize,
-    payload_len: usize,
-}
-
-fn parse_ip_packet_full(packet: &[u8]) -> Option<ParsedPacket> {
-    if packet.is_empty() {
-        return None;
-    }
-    let version = packet[0] >> 4;
-    match version {
-        4 => parse_ipv4_full(packet),
-        6 => parse_ipv6_full(packet),
-        _ => None,
-    }
-}
-
-fn parse_ipv4_full(packet: &[u8]) -> Option<ParsedPacket> {
-    if packet.len() < 20 {
-        return None;
-    }
-    let ihl = ((packet[0] & 0x0f) as usize) * 4;
-    let protocol = packet[9];
-    let total_len = u16::from_be_bytes([packet[2], packet[3]]) as usize;
-
-    if packet.len() < ihl + 8 || total_len < ihl + 8 {
-        return None;
-    }
-
-    let proto = match protocol {
-        6 => IpProto::Tcp,
-        17 => IpProto::Udp,
-        _ => return None,
-    };
-
-    let src_ip = IpAddr::V4(std::net::Ipv4Addr::new(packet[12], packet[13], packet[14], packet[15]));
-    let dst_ip = IpAddr::V4(std::net::Ipv4Addr::new(packet[16], packet[17], packet[18], packet[19]));
-    let src_port = u16::from_be_bytes([packet[ihl], packet[ihl + 1]]);
-    let dst_port = u16::from_be_bytes([packet[ihl + 2], packet[ihl + 3]]);
-
-    let (payload_offset, payload_len) = if proto == IpProto::Udp {
-        let udp_len = u16::from_be_bytes([packet[ihl + 4], packet[ihl + 5]]) as usize;
-        let hdr = 8;
-        (ihl + hdr, udp_len.saturating_sub(hdr))
-    } else {
-        let data_offset = ((packet[ihl + 12] >> 4) as usize) * 4;
-        let tcp_payload = total_len.saturating_sub(ihl + data_offset);
-        (ihl + data_offset, tcp_payload)
-    };
-
-    Some(ParsedPacket {
-        src: SocketAddr::new(src_ip, src_port),
-        dst: SocketAddr::new(dst_ip, dst_port),
-        proto,
-        payload_offset,
-        payload_len,
-    })
-}
-
-fn parse_ipv6_full(packet: &[u8]) -> Option<ParsedPacket> {
-    if packet.len() < 48 {
-        return None;
-    }
-    let next_header = packet[6];
-    let payload_length = u16::from_be_bytes([packet[4], packet[5]]) as usize;
-
-    let proto = match next_header {
-        6 => IpProto::Tcp,
-        17 => IpProto::Udp,
-        _ => return None,
-    };
-
-    let mut src_octets = [0u8; 16];
-    src_octets.copy_from_slice(&packet[8..24]);
-    let mut dst_octets = [0u8; 16];
-    dst_octets.copy_from_slice(&packet[24..40]);
-
-    let src_ip = IpAddr::V6(std::net::Ipv6Addr::from(src_octets));
-    let dst_ip = IpAddr::V6(std::net::Ipv6Addr::from(dst_octets));
-
-    let l4_start = 40;
-    let src_port = u16::from_be_bytes([packet[l4_start], packet[l4_start + 1]]);
-    let dst_port = u16::from_be_bytes([packet[l4_start + 2], packet[l4_start + 3]]);
-
-    let (payload_offset, payload_len) = if proto == IpProto::Udp {
-        let udp_len = u16::from_be_bytes([packet[l4_start + 4], packet[l4_start + 5]]) as usize;
-        let hdr = 8;
-        (l4_start + hdr, udp_len.saturating_sub(hdr))
-    } else {
-        let data_offset = ((packet[l4_start + 12] >> 4) as usize) * 4;
-        let tcp_payload = payload_length.saturating_sub(data_offset);
-        (l4_start + data_offset, tcp_payload)
-    };
-
-    Some(ParsedPacket {
-        src: SocketAddr::new(src_ip, src_port),
-        dst: SocketAddr::new(dst_ip, dst_port),
-        proto,
-        payload_offset,
-        payload_len,
-    })
-}
-
-// Reply packet construction ===========================================================================================
-
-/// Build a raw IP+UDP packet from the given fields, with correct checksums.
-fn build_udp_packet(src: SocketAddr, dst: SocketAddr, payload: &[u8]) -> Vec<u8> {
-    debug_assert!(src.is_ipv4() == dst.is_ipv4(), "src/dst IP family mismatch");
-
-    let udp_len = 8 + payload.len();
-    let checksums = ChecksumCapabilities::default();
-    let src_port = src.port();
-    let dst_port = dst.port();
-
-    match (src.ip(), dst.ip()) {
-        (IpAddr::V4(src), IpAddr::V4(dst)) => {
-            let ip_repr = Ipv4Repr {
-                src_addr: src,
-                dst_addr: dst,
-                next_header: IpProtocol::Udp,
-                payload_len: udp_len,
-                hop_limit: 64,
-            };
-            let total = ip_repr.buffer_len() + udp_len;
-            let mut buf = vec![0u8; total];
-
-            let mut ip_pkt = Ipv4Packet::new_unchecked(&mut buf);
-            ip_repr.emit(&mut ip_pkt, &checksums);
-
-            let ip_hdr_len = ip_repr.buffer_len();
-            let mut udp_pkt = UdpPacket::new_unchecked(&mut buf[ip_hdr_len..]);
-            let udp_repr = UdpRepr { src_port, dst_port };
-            udp_repr.emit(
-                &mut udp_pkt,
-                &IpAddress::Ipv4(src),
-                &IpAddress::Ipv4(dst),
-                payload.len(),
-                |buf| buf.copy_from_slice(payload),
-                &checksums,
-            );
-
-            buf
-        }
-        (IpAddr::V6(src), IpAddr::V6(dst)) => {
-            let ip_repr = Ipv6Repr {
-                src_addr: src,
-                dst_addr: dst,
-                next_header: IpProtocol::Udp,
-                payload_len: udp_len,
-                hop_limit: 64,
-            };
-            let total = ip_repr.buffer_len() + udp_len;
-            let mut buf = vec![0u8; total];
-
-            let mut ip_pkt = Ipv6Packet::new_unchecked(&mut buf);
-            ip_repr.emit(&mut ip_pkt);
-
-            let ip_hdr_len = ip_repr.buffer_len();
-            let mut udp_pkt = UdpPacket::new_unchecked(&mut buf[ip_hdr_len..]);
-            let udp_repr = UdpRepr { src_port, dst_port };
-            udp_repr.emit(
-                &mut udp_pkt,
-                &IpAddress::Ipv6(src),
-                &IpAddress::Ipv6(dst),
-                payload.len(),
-                |buf| buf.copy_from_slice(payload),
-                &checksums,
-            );
-
-            buf
-        }
-        _ => {
-            debug!("mismatched IP versions in UDP reply");
-            Vec::new()
-        }
-    }
-}
-
-fn smoltcp_to_std_ip(addr: IpAddress) -> IpAddr {
-    match addr {
-        IpAddress::Ipv4(v4) => IpAddr::V4(v4),
-        IpAddress::Ipv6(v6) => IpAddr::V6(v6),
     }
 }
