@@ -26,16 +26,15 @@ use util::port_alloc::Protocols;
 async fn drop_does_not_panic_when_handle_alive() {
     // A task that pends forever stands in for a freshly-spawned
     // shadowsocks server: it is unambiguously not finished by the
-    // time we drop the wrapper.
-    let handle = tokio::spawn(std::future::pending::<io::Result<()>>());
-    let running = ShadowsocksRunning::from_handle(handle);
+    // time we drop the wrapper. Spawned on the `SsRuntime`'s own handle —
+    // not the ambient test runtime — so this exercises the real pairing.
+    let running = ShadowsocksRunning::from_task(|handle| handle.spawn(std::future::pending::<io::Result<()>>()));
     drop(running); // must not panic
 }
 
 #[skuld::test]
 async fn stop_then_drop_is_no_op() {
-    let handle = tokio::spawn(async { Ok::<(), io::Error>(()) });
-    let running = ShadowsocksRunning::from_handle(handle);
+    let running = ShadowsocksRunning::from_task(|handle| handle.spawn(async { Ok::<(), io::Error>(()) }));
     let res: Result<(), ProxyError> = running.stop().await;
     res.expect("stop returns Ok on a clean exit");
     // `stop` consumed `running`; nothing to assert beyond "didn't
