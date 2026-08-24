@@ -611,6 +611,21 @@ pre-lockdown pf snapshot in `bridge-lockdown-pf.json` so Sweep restores the host
 without `-Fa`. The LUID is **never persisted** (a teardown mints a new one) —
 re-resolved every engage via `LuidResolver`.
 
+The TUN-interface permit is proven against two real, live TUN devices
+(`crates/tun-engine/src/routing/failclosed/live_tun_permit_privileged_tests.rs`,
+both platforms): it passes traffic on the interface it names and is blocked
+when re-engaged naming a different live interface. On Windows, a session-level
+composition guard additionally proves an armed kill switch does not block its
+own session's tunnel traffic while blocking an off-tunnel probe
+(`crates/bridge/src/proxy_manager_live_tun_permit_e2e_tests.rs`); it is not a
+falsification test — the dispatcher's TUN name and the one passed to
+`install_lockdown` share one constant, so they cannot disagree — and its macOS
+counterpart, where the name is runtime-discovered, is a deliverable of #850.
+No test carries a packet to the internet through the tunnel: the in-process
+test server dials the client's own route table, so a tunnel-routed destination
+loops back and pf has no per-process matching to exempt the local server's own
+egress from the block.
+
 `hole bridge unlock` is the elevated escape hatch to disengage a standing cover
 when no bridge is alive (`cutover::unlock`). Unlike the best-effort startup
 Sweep, it is **fail-loud**: it disengages via `failclosed::disengage_lockdown`
