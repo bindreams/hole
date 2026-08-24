@@ -290,6 +290,33 @@ fn setup_with_spaced_interface_name_includes_full_name() {
 // the trait, not the free function") is covered in bridge by
 // `proxy_manager_tests::stop_runs_mock_teardown_not_real_netsh`.
 
+// Command execution failure policy ====================================================================================
+//
+// These drive the real subprocess path, so the exit code is the OS's, not a
+// mock's. They spawn a shell that only sets an exit code — never a `route` /
+// `netsh` command — so the #165 isolation contract holds: no host routing
+// state is touched.
+
+/// A command that always exits with `code`. `cfg!` is a runtime branch, so
+/// both arms compile on every target.
+fn always_exits(code: i32) -> Vec<String> {
+    if cfg!(windows) {
+        vec!["cmd".into(), "/c".into(), format!("exit {code}")]
+    } else {
+        vec!["sh".into(), "-c".into(), format!("exit {code}")]
+    }
+}
+
+#[skuld::test]
+fn a_failed_setup_command_is_an_error() {
+    assert!(
+        run_commands(&[always_exits(3)], PHASE_SETUP).is_err(),
+        "a non-zero exit during route setup must surface as an error — returning Ok \
+         reports split routes that were never installed, and traffic egresses outside \
+         the tunnel while the UI says it is protected (#901)"
+    );
+}
+
 // Phase classifier ====================================================================================================
 //
 // `is_recovery_phase` decides whether `run_commands` logs failures at debug
