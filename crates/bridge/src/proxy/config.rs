@@ -94,7 +94,7 @@ pub enum ProxyError {
     /// system DNS is untouched. Used by the start-time self-test gate so the
     /// GUI never reports "Running" while a dead plugin chain would hijack all
     /// DNS into the tunnel.
-    #[error("forwarder self-test failed after {attempts} attempts in {elapsed_ms}ms: {reason}")]
+    #[error("forwarder self-test failed after {elapsed_ms}ms: {reason}")]
     ForwarderSelfTestFailed {
         reason: String,
         attempts: u32,
@@ -102,27 +102,58 @@ pub enum ProxyError {
     },
     /// The start-time DNS self-test opened a connection into the tunnel and not
     /// one byte came back. Two causes produce this and the bridge cannot tell
-    /// them apart: `shadowsocks-service`'s SOCKS5 answers `Succeeded` as soon as
-    /// it reaches the plugin's local port, so a plugin whose transport is dead
-    /// is indistinguishable here from a live tunnel whose exit cannot reach the
-    /// configured resolvers. The message names both rather than picking one and
-    /// being confidently wrong. `Display` interpolates only integers, so it is
-    /// PII-free by construction.
-    #[error("Nothing came back through the tunnel ({attempts} attempts in {elapsed_ms}ms). Either the proxy connection could not be established, or the server cannot reach your DNS resolver.")]
+    /// them apart: a plugin whose transport is dead is indistinguishable here
+    /// from a live tunnel whose exit cannot reach the configured resolvers. The
+    /// message names both rather than picking one and being confidently wrong.
+    /// `Display` interpolates only integers, so it is PII-free by construction.
+    ///
+    /// Do not claim `shadowsocks-service` answers the SOCKS5 CONNECT as soon as
+    /// it reaches the plugin's local port — the field captures disprove it.
+    /// Sixteen of seventeen archived `upstream failed` lines show
+    /// `socks5_ms: None` against `budget_ms: 3000`, i.e. no acknowledgement
+    /// after three seconds. What is observed is only that the acknowledgement
+    /// can stay outstanding for seconds; that case is
+    /// [`Self::TunnelSetupIncomplete`], not this one.
+    #[error("Nothing came back through the tunnel ({elapsed_ms}ms). Either the proxy connection could not be established, or the server cannot reach your DNS resolver.")]
     TunnelSilent { attempts: u32, elapsed_ms: u64 },
-    /// The DNS self-test never established a connection into the tunnel. That
-    /// is the LOCAL hop — the shadowsocks SOCKS5 listener refusing outright,
-    /// or (for a TCP-based DNS transport) a SOCKS5 CONNECT that never reached
-    /// the plugin's local port — and distinct from [`Self::TunnelSilent`],
-    /// whose first cause is the plugin's own outward connection. A UDP DNS
-    /// transport's ASSOCIATE completing DOES disprove this variant (the local
-    /// SOCKS5 listener demonstrably accepted something) without being strong
-    /// enough evidence for `TunnelSilent` either, since `shadowsocks-service`
-    /// answers ASSOCIATE without touching the plugin — that reading falls
-    /// through to the generic self-test failure instead. `Display`
-    /// interpolates only integers.
-    #[error("Could not open a connection into the tunnel ({attempts} attempts in {elapsed_ms}ms). The local proxy or its plugin is not accepting connections.")]
+    /// The DNS self-test never established a connection into the tunnel, and
+    /// every attempt to open one failed OUTRIGHT — a refusal, an unreachable
+    /// address, or a hard socket error. Distinct from [`Self::TunnelSilent`],
+    /// whose first cause is the plugin's own outward connection, and from
+    /// [`Self::TunnelSetupIncomplete`], where an attempt was still in flight
+    /// when its budget fired.
+    ///
+    /// The message names no side, deliberately. `Socks5Connector::connect_tcp`
+    /// flattens every failure into one `io::Error` at `UpstreamLayer::Connect`,
+    /// so a genuine refusal by the local listener and a SOCKS5 error reply
+    /// caused by shadowsocks' own outbound to the plugin failing — a fact about
+    /// the REMOTE hop — arrive here indistinguishable. Naming the local proxy
+    /// would be a guess, and guessing wrong is exactly what this variant
+    /// exists to avoid.
+    ///
+    /// A UDP DNS transport's ASSOCIATE completing DOES disprove this variant
+    /// (the local SOCKS5 listener demonstrably accepted something) without
+    /// being strong enough evidence for `TunnelSilent` either, since
+    /// `shadowsocks-service` answers ASSOCIATE without touching the plugin —
+    /// that reading falls through to the generic self-test failure instead.
+    /// `Display` interpolates only integers.
+    #[error(
+        "Could not open a connection into the tunnel ({elapsed_ms}ms). Every attempt to open one failed outright."
+    )]
     NoTunnelConnection { attempts: u32, elapsed_ms: u64 },
+    /// Nothing was established, and at least one attempt's budget fired with
+    /// its connect STILL OUTSTANDING. Split out of [`Self::NoTunnelConnection`]
+    /// because that variant's claim — every attempt failed outright — is false
+    /// here: a SOCKS5 CONNECT is not acknowledged until the plugin's own outer
+    /// connection is up, so an outstanding one means the tunnel was still
+    /// coming up, not that anything refused us.
+    ///
+    /// The message names a slow server AND an unreachable one, and picks
+    /// neither: a pending connect is equally consistent with both, and telling
+    /// a censored user to wait would be the same class of misattribution this
+    /// variant exists to remove. `Display` interpolates only integers.
+    #[error("The tunnel did not finish connecting ({elapsed_ms}ms). The connection to the server was still being set up when the attempt ran out — the server may be slow, or unreachable from your network.")]
+    TunnelSetupIncomplete { attempts: u32, elapsed_ms: u64 },
     /// The start-time reachability probe found the network is resetting/dropping
     /// the server handshake (DPI / censorship), distinct from a credential/config
     /// failure. `Display` is the host-free censorship sentence
@@ -163,6 +194,7 @@ impl From<&ProxyError> for hole_common::protocol::StartError {
             | ProxyError::InvalidListenerPort { .. }
             | ProxyError::ForwarderSelfTestFailed { .. }
             | ProxyError::TunnelSilent { .. }
+            | ProxyError::TunnelSetupIncomplete { .. }
             | ProxyError::NoTunnelConnection { .. }
             | ProxyError::LockdownIntentNotPersisted => StartError::Failed { message: e.to_string() },
         }

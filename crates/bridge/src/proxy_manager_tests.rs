@@ -454,6 +454,17 @@ pub(super) fn rt() -> tokio::runtime::Runtime {
     tokio::runtime::Runtime::new().unwrap()
 }
 
+/// Current-thread, unlike `rt()`: `tokio::time::pause()` panics on a
+/// multi-thread runtime. For tests that drive the DNS self-test gate against
+/// a closed/black-holed real socket, where the gate's own bound is seconds,
+/// not milliseconds, and this box's `rt()` tests must not grow by it.
+fn current_thread_rt() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+}
+
 /// Build a `ProxyManager` backed by a fresh `TempDir`. Caller must hold
 /// the returned `TempDir` for the scope of the manager so its contents
 /// (any written `bridge-routes.json`) live until drop.
@@ -525,9 +536,9 @@ pub(super) fn test_config() -> ProxyConfig {
         filters: Vec::new(),
         // dns.enabled = false avoids the #388 forwarder self-test gate in
         // happy-path tests — MockProxy doesn't bind a real TCP listener,
-        // so the forwarder's Socks5Connector to `127.0.0.1:1080` would
-        // time out after 4.5s on every test. Tests that exercise the
-        // gate enable DNS explicitly (see the self_test mod).
+        // so the forwarder's Socks5Connector to `127.0.0.1:1080` would cost
+        // up to TUNNEL_QUERY_TIMEOUT (10s) on every test. Tests that
+        // exercise the gate enable DNS explicitly (see the self_test mod).
         dns: hole_common::config::DnsConfig {
             enabled: false,
             ..hole_common::config::DnsConfig::default()
@@ -1178,6 +1189,29 @@ fn lockdown_engage_failure_tears_down_routes_only() {
             "engage failure tears down routes only; no cover was created"
         );
         assert_eq!(st.lockdown_disengage_calls.load(Ordering::SeqCst), 0);
+    });
+}
+
+#[skuld::test]
+fn user_stop_tears_down_routes_before_disengaging_the_lockdown_cover() {
+    // Characterization test, pinned against unmodified code: the clean-stop
+    // path tears down routes before disengaging the standing cover. The
+    // standing cover's persistent filters must outlive the routes they cover.
+    rt().block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        let routing = MockRouting::new(dir.path().to_path_buf());
+        let st = routing.state();
+        let (mut pm, _dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, true);
+        pm.start(&test_config()).await.unwrap();
+
+        pm.stop_with(StopReason::UserStop).await.unwrap();
+
+        let order = st.teardown_order.lock().unwrap().clone();
+        assert_eq!(
+            order,
+            vec!["routes", "lockdown"],
+            "the standing cover's persistent filters must outlive the routes they cover"
+        );
     });
 }
 
@@ -2074,6 +2108,14 @@ mod self_test {
                     protocol: DnsProtocol::PlainTcp,
                     allow_insecure_bootstrap: false,
                 };
+                // Paused AFTER the listener is bound: the gate's own
+                // TUNNEL_QUERY_TIMEOUT now bounds this hung handshake, and
+                // on real wall clock that would cost a full
+                // resolver bound in a suite CLAUDE.md flags as hang-prone.
+                // The socket never becomes ready, so the runtime idles and
+                // auto-advance drives the budget deterministically instead —
+                // faster than before, not slower.
+                tokio::time::pause();
                 pm.start(&cfg).await.expect_err("the gate must fail with no listener");
             });
         let output = writer.snapshot_string();
@@ -2128,11 +2170,13 @@ mod self_test {
     ///
     /// Test plumbing: `MockProxy::new()` does not bind a real TCP listener
     /// on `127.0.0.1:1080`, so the forwarder's `Socks5Connector` connection
-    /// fails with ECONNREFUSED on every attempt (the 3×1500ms loop closes
-    /// fast on each refused connect, well under the 5s outer budget).
+    /// fails — refused fast on most platforms, black-holed on others (see
+    /// `refusing_connector.rs`), so the gate's own bound (`TUNNEL_QUERY_TIMEOUT`,
+    /// seconds not milliseconds) can be on the critical path; paused virtual
+    /// time keeps this test fast regardless.
     #[skuld::test]
     fn start_blocks_on_forwarder_self_test_failure() {
-        rt().block_on(async {
+        current_thread_rt().block_on(async {
             let dir = tempfile::tempdir().unwrap();
             let routing = MockRouting::new(dir.path().to_path_buf());
             let routing_state = routing.state();
@@ -2147,6 +2191,7 @@ mod self_test {
             cfg.dns.enabled = true;
             cfg.dns.servers = vec!["127.0.0.1".parse().unwrap()];
 
+            tokio::time::pause();
             let err = pm
                 .start_cancellable(&cfg, false, CancellationToken::new())
                 .await
@@ -2186,7 +2231,10 @@ mod self_test {
     /// connector dial has completed before the assertion runs.)
     #[skuld::test]
     fn pure_vpn_start_never_dials_the_configured_port() {
-        rt().block_on(async {
+        // Current-thread + paused, same reason as
+        // `start_blocks_on_forwarder_self_test_failure`: the gate dials a
+        // real, never-bound port and that bound is seconds.
+        current_thread_rt().block_on(async {
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             listener.set_nonblocking(true).unwrap();
             let configured_port = listener.local_addr().unwrap().port();
@@ -2199,6 +2247,7 @@ mod self_test {
             cfg.dns.enabled = true;
             cfg.dns.servers = vec!["127.0.0.1".parse().unwrap()];
 
+            tokio::time::pause();
             let err = pm
                 .start_cancellable(&cfg, false, CancellationToken::new())
                 .await
@@ -2270,14 +2319,29 @@ mod self_test {
     /// byte was ever written, so it is the typed `NoTunnelConnection`.
     #[skuld::test]
     fn lockdown_on_skips_probe_keeps_original_reason() {
-        rt().block_on(async {
+        // Current-thread + paused: the gate's own bound is seconds, not
+        // milliseconds, against a closed port that some platforms
+        // black-hole rather than refuse (see `gate_failure_setup`'s doc).
+        current_thread_rt().block_on(async {
             let (mut pm, cfg, _dir) = gate_failure_setup(true);
+            tokio::time::pause();
             let err = pm
                 .start_cancellable(&cfg, false, CancellationToken::new())
                 .await
                 .unwrap_err();
+            // Either reading is admissible: a closed loopback port is REFUSED on
+            // some platforms and black-holed on others (see
+            // `refusing_connector.rs`), and those classify as
+            // `NoTunnelConnection` and `TunnelSetupIncomplete` respectively.
+            // This test is about the probe being suppressed so the gate's OWN
+            // reading survives, not about which of the two it is — the variants
+            // are pinned against stub connectors in
+            // `classify_failure_covers_every_branch`.
             assert!(
-                matches!(err, ProxyError::NoTunnelConnection { .. }),
+                matches!(
+                    err,
+                    ProxyError::NoTunnelConnection { .. } | ProxyError::TunnelSetupIncomplete { .. }
+                ),
                 "lockdown-on must skip the probe and keep the self-test's own reading, got {err:?}"
             );
         });
@@ -4396,14 +4460,24 @@ mod self_test {
     /// runs).
     #[skuld::test]
     fn covered_start_without_lockdown_suppresses_probe() {
-        rt().block_on(async {
+        // Current-thread + paused: same platform-latency reason as
+        // `lockdown_on_skips_probe_keeps_original_reason`.
+        current_thread_rt().block_on(async {
             let (mut pm, cfg, _st, _dir) = covered_gate_setup(false);
+            tokio::time::pause();
             let err = pm
                 .start_cancellable(&cfg, true, CancellationToken::new())
                 .await
                 .unwrap_err();
+            // Same platform split as `lockdown_on_skips_probe_keeps_original_reason`:
+            // the closed loopback port is refused on some platforms and
+            // black-holed on others, so both readings are admissible. What
+            // this test pins is that the gate's own reading survives.
             assert!(
-                matches!(err, ProxyError::NoTunnelConnection { .. }),
+                matches!(
+                    err,
+                    ProxyError::NoTunnelConnection { .. } | ProxyError::TunnelSetupIncomplete { .. }
+                ),
                 "a covered start engages a cover, so the probe is skipped and the self-test's own \
                  reading (not one byte written) surfaces, got {err:?}"
             );
@@ -4463,6 +4537,191 @@ mod self_test {
                 }
                 other => panic!("expected ForwarderSelfTestFailed, got {other:?}"),
             }
+        });
+    }
+
+    // Cover ownership model ===========================================================================================
+    //
+    // These next two tests assert VALUE AGREEMENT: the two public predicates
+    // (`lockdown_active`, `blocked_until_connected`) never disagree with
+    // `Posture::cover_holder`, and the holder is exactly one thing at each
+    // observed point. They do NOT prove single derivation — a second,
+    // independent recomputation (e.g. a hypothetical
+    // `self.posture.session().map(|r| r.lockdown.is_some()).unwrap_or(false)`
+    // written directly into `lockdown_active`, bypassing `cover_holder`) that
+    // happens to agree at every state visited here would still pass both.
+    // `the_standing_cover_field_has_exactly_one_reader` (`cover_tests.rs`) is
+    // a PARTIAL backstop for `lockdown_active`'s half of this shape (itself
+    // blind to a destructuring read — see that guard's own doc); this file
+    // is skipped by its walk (it ends in `_tests.rs`), so naming the
+    // anti-pattern here in prose cannot trip it. `blocked_until_connected` —
+    // the transient half — has NO structural backstop at all: a
+    // recomputation like `self.posture.pending().is_some()` would agree with
+    // it at every state below and pass undetected.
+
+    /// Pins value agreement between `lockdown_active()` and the holder at
+    /// each observed state in a session's lifecycle, and that a posture
+    /// leaves no session behind after `stop()`. Does NOT prove
+    /// `lockdown_active()` derives from the holder (see the preamble above),
+    /// and does NOT prove a cover stranded by a previous process is
+    /// invisible to all of this — there is no probe for that in this stage.
+    #[skuld::test]
+    fn posture_reports_one_cover_holder_across_a_session_lifecycle() {
+        rt().block_on(async {
+            // Lockdown-on: Idle -> Session { standing: true } -> Idle.
+            let dir = tempfile::tempdir().unwrap();
+            let routing = MockRouting::new(dir.path().to_path_buf());
+            let (mut pm, _dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, true);
+
+            assert_eq!(pm.posture.cover_holder(), CoverHolder::Nobody);
+            assert!(!pm.lockdown_active());
+            assert!(!pm.blocked_until_connected());
+
+            pm.start(&test_config()).await.unwrap();
+            assert_eq!(pm.posture.cover_holder(), CoverHolder::Session { standing: true });
+            assert!(pm.lockdown_active());
+            assert!(!pm.blocked_until_connected());
+
+            pm.stop().await.unwrap();
+            assert_eq!(pm.posture.cover_holder(), CoverHolder::Nobody);
+            assert!(!pm.lockdown_active());
+            assert!(!pm.blocked_until_connected());
+
+            // Same shape, intent off: Session { standing: false }.
+            let dir = tempfile::tempdir().unwrap();
+            let routing = MockRouting::new(dir.path().to_path_buf());
+            let (mut pm, _dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, false);
+            pm.start(&test_config()).await.unwrap();
+            assert_eq!(pm.posture.cover_holder(), CoverHolder::Session { standing: false });
+            assert!(!pm.lockdown_active());
+            assert!(!pm.blocked_until_connected());
+        });
+    }
+
+    /// Pins value agreement between `blocked_until_connected()` and the
+    /// holder after a failed covered start, and that the holder is
+    /// `PendingStart` — not `Session`, not `Nobody`. Does NOT prove
+    /// `blocked_until_connected()` derives from the holder — this predicate
+    /// has NO structural backstop at all (see the preamble above) — and does
+    /// NOT prove a cover stranded by a previous process is invisible to all
+    /// of this — there is no probe for that in this stage.
+    #[skuld::test]
+    fn posture_reports_a_pending_start_after_a_failed_covered_start() {
+        rt().block_on(async {
+            let (mut pm, cfg, _st, _dir) = covered_gate_setup(false);
+            let _ = pm
+                .start_cancellable(&cfg, true, CancellationToken::new())
+                .await
+                .unwrap_err();
+
+            assert_eq!(pm.posture.cover_holder(), CoverHolder::PendingStart);
+            assert!(pm.blocked_until_connected());
+            assert!(!pm.lockdown_active());
+        });
+    }
+
+    // The next three exercise `Posture`'s method contracts directly,
+    // independent of any call site, so a future call site that violates one
+    // fails a test instead of silently drifting — `CoverHolder` gets an
+    // exhaustive truth table (`cover_tests.rs`); before this, `Posture` got
+    // nothing but prose and reasoning about the present call graph, the same
+    // unenforced-invariant shape this stage exists to remove.
+
+    /// Fails against a `take_pending` written as
+    /// `std::mem::replace(self, Idle)` without restoring a non-`PendingStart`
+    /// variant, which would silently destroy a live session and leak every
+    /// guard it owns.
+    #[skuld::test]
+    fn posture_take_pending_leaves_a_session_untouched() {
+        rt().block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let routing = MockRouting::new(dir.path().to_path_buf());
+            let (mut pm, _dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, true);
+            pm.start(&test_config()).await.unwrap();
+
+            assert!(pm.posture.take_pending().is_none());
+            assert_eq!(pm.state(), ProxyState::Running);
+            assert!(pm.lockdown_active());
+
+            pm.stop().await.unwrap();
+        });
+    }
+
+    /// Mirrors [`posture_take_pending_leaves_a_session_untouched`]: fails
+    /// against a `take_session` that disturbs an unrelated `PendingStart`.
+    #[skuld::test]
+    fn posture_take_session_leaves_a_pending_start_untouched() {
+        rt().block_on(async {
+            let (mut pm, cfg, _st, _dir) = covered_gate_setup(false);
+            let _ = pm
+                .start_cancellable(&cfg, true, CancellationToken::new())
+                .await
+                .unwrap_err();
+
+            assert!(pm.posture.take_session().is_none());
+            assert!(pm.blocked_until_connected());
+        });
+    }
+
+    /// `hold_pending`'s contract ("posture must be Idle") is exercised
+    /// against both of its invalid inputs: a live `Session` (below — the
+    /// silent-overwrite scenario the PR body's "what the collapse costs"
+    /// section describes, dropping a live `RunningState` without
+    /// `stop_with`'s ordered teardown) and an existing `PendingStart`
+    /// (`posture_hold_pending_rejects_a_posture_that_already_holds_one`,
+    /// next). `commit_session`'s `debug_assert!` stays unexercised, and that
+    /// IS a disclosed gap, not an oversight: reaching it needs a second
+    /// `RunningState`, which cannot be built without a live `P::Running` and
+    /// a hand-rolled fixture whose cost exceeds what the assert is worth.
+    #[skuld::test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "hold_pending: posture must be Idle")]
+    fn posture_hold_pending_rejects_a_running_session() {
+        rt().block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let routing = MockRouting::new(dir.path().to_path_buf());
+            let (mut pm, dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, false);
+            let cfg = test_config();
+            pm.start(&cfg).await.unwrap();
+            assert_eq!(pm.state(), ProxyState::Running, "setup must leave a live session");
+
+            let server_ip: IpAddr = cfg.server.server.parse().unwrap();
+            let second_routing = MockRouting::new(dir.path().to_path_buf());
+            let cover = second_routing.install_failclosed_cover(server_ip, None).unwrap();
+            pm.posture.hold_pending(BlockedStart {
+                cover,
+                host: cfg.server.server.clone(),
+                server_ip,
+                pin: crate::dns::ech::PinSource::NoQueryNeeded,
+                resolver_permit: None,
+            });
+        });
+    }
+
+    /// The other of `hold_pending`'s two invalid inputs — an existing
+    /// `PendingStart`. See the comment above.
+    #[skuld::test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "hold_pending: posture must be Idle")]
+    fn posture_hold_pending_rejects_a_posture_that_already_holds_one() {
+        rt().block_on(async {
+            let (mut pm, cfg, _st, dir) = covered_gate_setup(false);
+            let _ = pm
+                .start_cancellable(&cfg, true, CancellationToken::new())
+                .await
+                .unwrap_err();
+            assert!(pm.blocked_until_connected(), "setup must leave a pending start held");
+
+            let server_ip: IpAddr = cfg.server.server.parse().unwrap();
+            let second_routing = MockRouting::new(dir.path().to_path_buf());
+            let cover = second_routing.install_failclosed_cover(server_ip, None).unwrap();
+            pm.posture.hold_pending(BlockedStart {
+                cover,
+                host: cfg.server.server.clone(),
+                server_ip,
+                pin: crate::dns::ech::PinSource::NoQueryNeeded,
+                resolver_permit: None,
+            });
         });
     }
 }

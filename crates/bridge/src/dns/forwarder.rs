@@ -88,8 +88,15 @@ pub enum UpstreamCause {
     BadResponse,
     /// Post-handshake read/write failure on the upstream stream.
     Io,
-    /// The per-upstream budget fired before the attempt completed.
-    Timeout,
+    /// The budget fired with the connect still OUTSTANDING — nothing was ever
+    /// established. Distinct from [`Self::ExchangeTimeout`] because a SOCKS5
+    /// CONNECT is not acknowledged until the plugin's own outer connection is
+    /// up, so this is evidence about the tunnel still being set up, not about
+    /// the local proxy refusing anything.
+    ConnectTimeout,
+    /// The budget fired AFTER a transport was established — the stream (or UDP
+    /// association) existed and the peer went quiet.
+    ExchangeTimeout,
 }
 
 impl UpstreamCause {
@@ -100,21 +107,25 @@ impl UpstreamCause {
             Self::TlsFailed => "tls-failed",
             Self::BadResponse => "bad-response",
             Self::Io => "io",
-            Self::Timeout => "timeout",
+            Self::ConnectTimeout => "connect-timeout",
+            Self::ExchangeTimeout => "exchange-timeout",
         }
     }
 
     /// Report priority when several upstreams fail differently — highest wins,
     /// ties keep the first observed. Ordered by how much each cause tells the
     /// user: a rejected certificate names a third party on the path, a failed
-    /// connect says only that the path is broken.
+    /// connect says only that the path is broken. An exchange timeout says the
+    /// stream opened and the peer went quiet, which tells the reader more than
+    /// a connect that never opened, which in turn tells more than a refusal.
     pub fn rank(self) -> u8 {
         match self {
-            Self::CertificateRejected => 5,
-            Self::TlsFailed => 4,
-            Self::BadResponse => 3,
-            Self::Io => 2,
-            Self::Timeout => 1,
+            Self::CertificateRejected => 6,
+            Self::TlsFailed => 5,
+            Self::BadResponse => 4,
+            Self::Io => 3,
+            Self::ExchangeTimeout => 2,
+            Self::ConnectTimeout => 1,
             Self::Unreachable => 0,
         }
     }
@@ -143,11 +154,15 @@ pub enum ForwardFailure {
 /// `!Clone`, so `UpstreamErr` cannot be `Clone` — consumed once on the
 /// log path.
 ///
-/// At 136 bytes it travels as `Box<UpstreamErr>`: the transports return it
-/// through five nested `async fn` frames, so unboxed it would widen every
-/// future on the DNS path to carry a failure that is almost never taken.
-/// `?` boxes on its own via `impl<T> From<T> for Box<T>`; only the tail
-/// expressions wrap explicitly.
+/// At 136 bytes it travels as [`ForwardResult`]'s boxed `Err`: the
+/// transports return it through five nested `async fn` frames, so unboxed
+/// it would widen every future on the DNS path to carry a failure that is
+/// almost never taken. `?` boxes on its own via `impl<T> From<T> for
+/// Box<T>`; only the tail expressions wrap explicitly. Boxing is also why
+/// growing this struct no longer trips `clippy::result_large_err` —
+/// [`ForwardResult`]'s own size assertion is the guard that actually
+/// matters; the assertion below is a secondary budget so growth here stays
+/// deliberate.
 #[derive(Debug)]
 pub struct UpstreamErr {
     pub layer: UpstreamLayer,
@@ -183,12 +198,17 @@ pub struct UpstreamErr {
     /// (graceful close, `None` on Windows since FIN surfaces as `Ok(0)`
     /// with no errno) from RST (`WSAECONNRESET=10054`) and friends.
     pub os_errno: Option<i32>,
+    /// Whether [`AttemptProbe::apply`] has run. `cause()`'s `Timeout` arm reads
+    /// the probe's published fields, which are only meaningful afterwards —
+    /// see the `debug_assert!` there.
+    decorated: bool,
 }
 
 impl UpstreamErr {
     pub fn new(layer: UpstreamLayer, source: io::Error) -> Self {
         let os_errno = first_os_errno(&source);
         Self {
+            decorated: false,
             layer,
             source,
             elapsed_ms: 0,
@@ -203,13 +223,41 @@ impl UpstreamErr {
         }
     }
 
-    /// Classify this failure for reporting. Only the `Tls` layer needs the
-    /// error chain — it splits on whether `first_rustls_error` found a
-    /// TRUST-CHAIN rejection (see [`is_trust_chain_rejection`]).
+    /// Test-only accessor: only the `Timeout` arm of [`Self::cause`] depends
+    /// on whether [`AttemptProbe::apply`] has run — production reads that
+    /// flag through the assertion there, not through this getter.
+    #[cfg(test)]
+    pub(crate) fn is_decorated(&self) -> bool {
+        self.decorated
+    }
+
+    /// Classify this failure for reporting. Two layers need more than the tag:
+    ///
+    /// - `Tls` splits on whether `first_rustls_error` found a TRUST-CHAIN
+    ///   rejection (see [`is_trust_chain_rejection`]).
+    /// - `Timeout` splits on whether a transport had been PUBLISHED when the
+    ///   budget fired. `socks5_ms` is set by `AttemptProbe::connected` and
+    ///   `udp_sent` by `AttemptProbe::associated`, both the instant the
+    ///   connector hands the resource back and before a byte moves, so their
+    ///   presence is exactly "a transport existed". Both are filled in by
+    ///   `AttemptProbe::apply`, so reading them before that would silently
+    ///   report `ConnectTimeout` for an established transport — hence the
+    ///   contract assertion.
     pub fn cause(&self) -> UpstreamCause {
+        debug_assert!(
+            self.decorated || self.layer != UpstreamLayer::Timeout,
+            "cause() read a Timeout-layer error before AttemptProbe::apply decorated it; \
+             the ConnectTimeout/ExchangeTimeout split would be a coin flip"
+        );
         match self.layer {
             UpstreamLayer::Connect => UpstreamCause::Unreachable,
-            UpstreamLayer::Timeout => UpstreamCause::Timeout,
+            UpstreamLayer::Timeout => {
+                if self.socks5_ms.is_some() || self.udp_sent.is_some() {
+                    UpstreamCause::ExchangeTimeout
+                } else {
+                    UpstreamCause::ConnectTimeout
+                }
+            }
             UpstreamLayer::Http => UpstreamCause::BadResponse,
             UpstreamLayer::Io => UpstreamCause::Io,
             UpstreamLayer::Tls => match first_rustls_error(&self.source) {
@@ -218,7 +266,42 @@ impl UpstreamErr {
             },
         }
     }
+
+    /// Test-only: an error decorated as if a transport had (`socks5_ms =
+    /// Some`) or had not (`None`) been published, so the `Timeout` split can be
+    /// exercised without standing up a whole `forward_one`.
+    #[cfg(test)]
+    pub(crate) fn decorated_for_test(layer: UpstreamLayer, source: io::Error, socks5_ms: Option<u64>) -> Self {
+        let mut e = Self::new(layer, source);
+        e.socks5_ms = socks5_ms;
+        e.decorated = true;
+        e
+    }
 }
+
+/// `UpstreamErr` once travelled unboxed in a `Result` and crept past
+/// `clippy::result_large_err`'s 128-byte default on some target platforms
+/// but not others, so whether CI went red depended only on which toolchain
+/// happened to run — see [`ForwardResult`] for the actual fix. This struct
+/// itself was left at its size rather than shrunk, so this budget exists
+/// purely to keep further growth deliberate: nothing else will catch it now.
+/// Box a new field into its own allocation to keep this flat, or raise the
+/// number if the growth is intentional.
+const _: () = assert!(
+    std::mem::size_of::<UpstreamErr>() <= 136,
+    "UpstreamErr grew past its 136-byte budget — see the doc comment above"
+);
+
+/// The `Result` every DNS-forward transport (`forward_one` and its four
+/// per-protocol callees) returns. Boxing the error here, not shrinking
+/// `UpstreamErr`, is what keeps `clippy::result_large_err` from firing
+/// again; this assertion enforces that structurally on every compile,
+/// rather than leaving it to whichever clippy a contributor happens to run.
+pub(crate) type ForwardResult = Result<Vec<u8>, Box<UpstreamErr>>;
+const _: () = assert!(
+    std::mem::size_of::<ForwardResult>() <= 128,
+    "ForwardResult's Err came unboxed again — box it, don't just widen this budget"
+);
 
 /// What a forwarder has done upstream, cumulative over its lifetime and counted
 /// whether the attempt succeeded, failed or was cancelled by its budget.
@@ -240,6 +323,13 @@ impl UpstreamErr {
 ///   locally, without touching the plugin at all. It disproves "the local
 ///   proxy refused a connection" but is NOT comparable to a CONNECT: it must
 ///   never be counted toward `connects`.
+///
+/// `connect_timeouts` sits at the other end of the same ladder: it is the
+/// absence of a connection PLUS the reason that absence is not yet a verdict.
+/// It is a counter here rather than a cause code on the returned
+/// [`ForwardFailure`] because a walk folds per-upstream causes by rank and
+/// keeps only the highest, so a pending connect on one resolver co-occurring
+/// with a TLS failure on another would vanish.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct UpstreamActivity {
     pub read: u64,
@@ -250,6 +340,10 @@ pub struct UpstreamActivity {
     /// A completed UDP ASSOCIATE. See the struct doc for why this is not
     /// interchangeable with `connects`.
     pub associates: u64,
+    /// An attempt whose budget fired with the connect still OUTSTANDING —
+    /// nothing established, and no definite failure either. See the struct doc
+    /// for why this is counted rather than inferred from the returned cause.
+    pub connect_timeouts: u64,
 }
 
 impl UpstreamActivity {
@@ -259,7 +353,8 @@ impl UpstreamActivity {
             self.read >= earlier.read
                 && self.written >= earlier.written
                 && self.connects >= earlier.connects
-                && self.associates >= earlier.associates,
+                && self.associates >= earlier.associates
+                && self.connect_timeouts >= earlier.connect_timeouts,
             "upstream counters only increase; snapshots were passed out of order"
         );
         Self {
@@ -267,6 +362,7 @@ impl UpstreamActivity {
             written: self.written.saturating_sub(earlier.written),
             connects: self.connects.saturating_sub(earlier.connects),
             associates: self.associates.saturating_sub(earlier.associates),
+            connect_timeouts: self.connect_timeouts.saturating_sub(earlier.connect_timeouts),
         }
     }
 }
@@ -352,6 +448,7 @@ impl AttemptProbe {
     /// datagram transport that sent nothing.
     fn apply(&self, e: &mut UpstreamErr) {
         let s = self.state.lock().expect("poisoned");
+        e.decorated = true;
         e.socks5_ms = s.socks5_ms;
         e.tls_ms = s
             .tls_ms
@@ -472,10 +569,32 @@ const DNS_PORT_TLS: u16 = 853;
 /// DoH typically runs on 443 (RFC 8484 §3).
 const DNS_PORT_HTTPS: u16 = 443;
 
-/// Default per-upstream attempt budget, used by [`DnsForwarder::forward`].
-/// Shorter than the OS default TCP timeout so a dead server doesn't stall the
-/// whole forward loop.
-pub(crate) const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(3);
+/// The bound on one resolver attempt THROUGH THE TUNNEL, used by
+/// [`DnsForwarder::forward`] (the in-TUN runtime path) and by
+/// `run_forwarder_self_test` (the start-time gate). The same question, so the
+/// same number — and handed to [`DnsForwarder::forward_one`] unmodified in
+/// both, because any division or remaining-time arithmetic would make the gate
+/// stricter than the runtime for some resolver and let a tunnel pass the gate
+/// that then fails every query.
+///
+/// A considered constant, not a derivation: one attempt on the shipped
+/// DoH-with-ECH configuration is nine serialized round trips, measured at
+/// ~1.05s on the link this was sized for, so 10s admits a link roughly nine
+/// times slower.
+pub(crate) const TUNNEL_QUERY_TIMEOUT: Duration = Duration::from_secs(10);
+
+// Also a floor: a budget under the refusal cost cannot report a refusal at
+// all. `forward_one`'s timer would fire first and type a refused upstream
+// `Timeout` / `ConnectTimeout` — "the tunnel is still coming up" — instead of
+// `Connect` / `Unreachable`, which is what `TAP_DISABLED_HINT` sends the
+// reader to read. `DIRECT_UPSTREAM_TIMEOUT` clears it too, at 3s.
+const _: () = assert!(TUNNEL_QUERY_TIMEOUT.as_millis() > util::syn_budget::REFUSAL_COST.as_millis());
+
+/// The bound on one DoH exchange over a DIRECT connector — the bootstrap's
+/// per-resolver hop, before any tunnel exists. A different question against a
+/// different peer (three round trips, no plugin), so it keeps its own,
+/// narrower value.
+pub(crate) const DIRECT_UPSTREAM_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Maximum reply size we'll buffer (bytes). DNS messages cap around 65535
 /// but we cap even tighter — DoH servers never return more than ~8KB in
@@ -562,6 +681,9 @@ pub struct DnsForwarder {
     upstream_written: AtomicU64,
     upstream_connects: AtomicU64,
     upstream_associates: AtomicU64,
+    /// Attempts whose budget fired with the connect still outstanding — see
+    /// [`UpstreamActivity::connect_timeouts`].
+    upstream_connect_timeouts: AtomicU64,
     /// Test-only per-server upstream-port override, indexed against
     /// `config.servers`, so tests can target ephemeral listeners without
     /// binding privileged 53/853/443. Behind `#[cfg(test)]` so production
@@ -587,6 +709,7 @@ impl DnsForwarder {
             upstream_written: AtomicU64::new(0),
             upstream_connects: AtomicU64::new(0),
             upstream_associates: AtomicU64::new(0),
+            upstream_connect_timeouts: AtomicU64::new(0),
             #[cfg(test)]
             forced_ports: None,
         }
@@ -598,6 +721,7 @@ impl DnsForwarder {
             written: self.upstream_written.load(Ordering::Relaxed),
             connects: self.upstream_connects.load(Ordering::Relaxed),
             associates: self.upstream_associates.load(Ordering::Relaxed),
+            connect_timeouts: self.upstream_connect_timeouts.load(Ordering::Relaxed),
         }
     }
 
@@ -611,25 +735,13 @@ impl DnsForwarder {
         if query.len() < 12 {
             return synthesize_servfail(query);
         }
-        self.try_forward(query, UPSTREAM_TIMEOUT)
+        // The constant goes down unmodified: `try_forward` gives EVERY resolver
+        // this bound, so a walk costs `servers × TUNNEL_QUERY_TIMEOUT` and the
+        // start-time gate — which makes the identical call — can never be the
+        // stricter of the two.
+        self.try_forward(query, TUNNEL_QUERY_TIMEOUT)
             .await
             .unwrap_or_else(|_| synthesize_servfail(query))
-    }
-
-    /// How many configured upstreams a walk will ACTUALLY attempt. IPv6 entries
-    /// are skipped without an IPv6 bypass, so this can be less than
-    /// `servers.len()` — and zero, for an all-IPv6 config on an IPv4-only host,
-    /// where a walk returns `NoUpstream` without dialling anything.
-    ///
-    /// A caller that owns a total budget divides by this to size the
-    /// `per_upstream` it passes to [`Self::try_forward`]. The skip rule lives
-    /// here, next to the loop that applies it, so a caller cannot drift from it.
-    pub fn attempted_upstreams(&self) -> usize {
-        self.config
-            .servers
-            .iter()
-            .filter(|s| !s.is_ipv6() || self.ipv6_bypass_available)
-            .count()
     }
 
     /// [`Self::forward`] without the SERVFAIL synthesis: reports *why* no
@@ -643,7 +755,7 @@ impl DnsForwarder {
     /// pass this rather than wrapping the call in its own `timeout`: an outer
     /// timer that fires first drops the future before `forward_one`'s deadline,
     /// so nothing is classified and nothing is logged.
-    pub async fn try_forward(&self, query: &[u8], per_upstream: Duration) -> Result<Vec<u8>, ForwardFailure> {
+    pub(crate) async fn try_forward(&self, query: &[u8], per_upstream: Duration) -> Result<Vec<u8>, ForwardFailure> {
         if query.len() < 12 {
             // A caller bug, and the one failure with no per-upstream WARN
             // behind it — log at the point of detection or it is invisible to
@@ -699,12 +811,7 @@ impl DnsForwarder {
     /// [`AttemptProbe`], so the diagnostic fields mean the same thing on every
     /// layer. The bytes the attempt moved fold into the forwarder's cumulative
     /// totals whether it succeeded or not.
-    async fn forward_one(
-        &self,
-        target: SocketAddr,
-        query: &[u8],
-        budget: Duration,
-    ) -> Result<Vec<u8>, Box<UpstreamErr>> {
+    async fn forward_one(&self, target: SocketAddr, query: &[u8], budget: Duration) -> ForwardResult {
         let started = Instant::now();
         let probe = AttemptProbe::default();
         let fut = async {
@@ -733,6 +840,13 @@ impl DnsForwarder {
             e.elapsed_ms = started.elapsed().as_millis() as u64;
             e.budget_ms = budget.as_millis() as u64;
             probe.apply(&mut e);
+            // Counted off `cause()` itself, after decoration, rather than off a
+            // parallel predicate over the same probe fields: the counter and
+            // the classification are then the same decision by construction and
+            // cannot drift apart.
+            if e.cause() == UpstreamCause::ConnectTimeout {
+                self.upstream_connect_timeouts.fetch_add(1, Ordering::Relaxed);
+            }
             e
         })
     }
@@ -832,12 +946,7 @@ fn default_port(protocol: DnsProtocol) -> u16 {
 // Transport: plain UDP ================================================================================================
 
 impl DnsForwarder {
-    async fn forward_udp(
-        &self,
-        target: SocketAddr,
-        query: &[u8],
-        probe: &AttemptProbe,
-    ) -> Result<Vec<u8>, Box<UpstreamErr>> {
+    async fn forward_udp(&self, target: SocketAddr, query: &[u8], probe: &AttemptProbe) -> ForwardResult {
         let socket = self
             .connector
             .connect_udp(target)
@@ -863,12 +972,7 @@ impl DnsForwarder {
 // Transport: plain TCP ================================================================================================
 
 impl DnsForwarder {
-    async fn forward_tcp(
-        &self,
-        target: SocketAddr,
-        query: &[u8],
-        probe: &AttemptProbe,
-    ) -> Result<Vec<u8>, Box<UpstreamErr>> {
+    async fn forward_tcp(&self, target: SocketAddr, query: &[u8], probe: &AttemptProbe) -> ForwardResult {
         let socks5_start = Instant::now();
         let connected = self
             .connector
@@ -886,12 +990,7 @@ impl DnsForwarder {
 // Transport: DoT (TLS over TCP) =======================================================================================
 
 impl DnsForwarder {
-    async fn forward_tls(
-        &self,
-        target: SocketAddr,
-        query: &[u8],
-        probe: &AttemptProbe,
-    ) -> Result<Vec<u8>, Box<UpstreamErr>> {
+    async fn forward_tls(&self, target: SocketAddr, query: &[u8], probe: &AttemptProbe) -> ForwardResult {
         let socks5_start = Instant::now();
         let connected = self
             .connector
@@ -919,12 +1018,7 @@ impl DnsForwarder {
 // Transport: DoH (HTTP/1.1 over TLS) ==================================================================================
 
 impl DnsForwarder {
-    async fn forward_https(
-        &self,
-        target: SocketAddr,
-        query: &[u8],
-        probe: &AttemptProbe,
-    ) -> Result<Vec<u8>, Box<UpstreamErr>> {
+    async fn forward_https(&self, target: SocketAddr, query: &[u8], probe: &AttemptProbe) -> ForwardResult {
         let (server_name, path_and_host) =
             https_target_for(target.ip()).map_err(|e| UpstreamErr::new(UpstreamLayer::Http, e))?;
 

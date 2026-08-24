@@ -206,7 +206,9 @@ async fn resolve_maps_every_upstream_cause_to_its_bootstrap_error() {
     let cases = [
         (UpstreamCause::CertificateRejected, BootstrapError::CertificateRejected),
         (UpstreamCause::Unreachable, BootstrapError::Unreachable),
-        (UpstreamCause::Timeout, BootstrapError::Timeout),
+        // Both timeout causes collapse here on purpose — see `classify`.
+        (UpstreamCause::ExchangeTimeout, BootstrapError::Timeout),
+        (UpstreamCause::ConnectTimeout, BootstrapError::Timeout),
         (UpstreamCause::TlsFailed, BootstrapError::Transport),
         (UpstreamCause::BadResponse, BootstrapError::Transport),
         (UpstreamCause::Io, BootstrapError::Transport),
@@ -312,7 +314,7 @@ async fn an_a_query_without_ipv4_does_not_mask_a_transport_failure() {
                 reply.add_query(q.queries[0].clone());
                 return Ok(reply.to_vec().unwrap());
             }
-            Err(UpstreamCause::Timeout)
+            Err(UpstreamCause::ExchangeTimeout)
         }
     }
     let err = resolve_via_doh_with(
@@ -337,7 +339,7 @@ async fn an_aaaa_query_without_ipv6_does_not_mask_a_transport_failure() {
         async fn query(&self, _server: IpAddr, wire: &[u8]) -> Result<Vec<u8>, UpstreamCause> {
             let q = Message::from_vec(wire).unwrap();
             if q.queries[0].query_type() == RecordType::A {
-                return Err(UpstreamCause::Timeout);
+                return Err(UpstreamCause::ExchangeTimeout);
             }
             let mut reply = Message::new(0, MessageType::Response, OpCode::Query);
             reply.add_query(q.queries[0].clone());
@@ -371,7 +373,7 @@ async fn an_nxdomain_from_one_leg_reports_no_answer() {
                 reply.add_query(q.queries[0].clone());
                 return Ok(reply.to_vec().unwrap());
             }
-            Err(UpstreamCause::Timeout)
+            Err(UpstreamCause::ExchangeTimeout)
         }
     }
     let err = resolve_via_doh_with(
@@ -445,7 +447,7 @@ async fn bootstrap_error_display_never_leaks_the_hostname() {
     let queriers: Vec<Arc<StubQuerier>> = vec![
         stub_failing(HashMap::new(), UpstreamCause::CertificateRejected),
         stub_failing(HashMap::new(), UpstreamCause::Unreachable),
-        stub_failing(HashMap::new(), UpstreamCause::Timeout),
+        stub_failing(HashMap::new(), UpstreamCause::ExchangeTimeout),
         stub_failing(HashMap::new(), UpstreamCause::TlsFailed),
         answered(empty.to_vec().unwrap()),    // -> NoAnswer
         answered(b"not dns at all".to_vec()), // -> MalformedReply

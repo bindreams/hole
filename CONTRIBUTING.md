@@ -92,8 +92,12 @@ upgrade.
 **Start-time gate (load-bearing).** A forwarder self-test runs inside
 [`start_inner`](crates/bridge/src/proxy_manager.rs) **before**
 `Dispatcher::new` / `routing.install` / `apply_dns_settings`; on failure it
-returns `ProxyError::ForwarderSelfTestFailed` and the RAII guards unwind without
-touching routes, system DNS, or the wintun adapter. Guarded by
+returns whichever `ProxyError` the run's evidence supports — `NoTunnelConnection`
+(every connect failed outright), `TunnelSetupIncomplete` (one was still
+outstanding when its budget fired), `TunnelSilent`, or the generic
+`ForwarderSelfTestFailed` — and the RAII guards unwind without touching routes,
+system DNS, or the wintun adapter. `classify_failure` picks between them from
+counted evidence, never from a cause code. Guarded by
 `start_blocks_on_forwarder_self_test_failure`.
 
 **Hard errors:** `dns.enabled = true` with `servers = []` is a config error.
@@ -469,8 +473,11 @@ stale permit surviving, not a leaked block. Disclosed as a source comment on
 It is **name-agnostic** — it does *not* permit the TUN interface. The new
 bridge's start-time DNS-forwarder self-test runs over loopback to the SS client
 and out to the server IP, so loopback + server-IP permits suffice; app traffic
-into the (briefly absent) tunnel being blocked for the sub-second cover window is
-the accepted fail-closed cost.
+into the (briefly absent) tunnel being blocked for the cover window is the
+accepted fail-closed cost. That window is no longer sub-second: the gate's own
+bound is `TUNNEL_QUERY_TIMEOUT` per configured resolver (see "DNS forwarder"
+above), so a slow-but-live tunnel can hold the cover for seconds, not
+milliseconds.
 
 - **Windows** ([`routing/failclosed/windows.rs`](crates/tun-engine/src/routing/failclosed/windows.rs)):
   a persistent provider + sublayer + filter set installed in one FWPM
@@ -628,9 +635,10 @@ immediately rather than waiting for the next bridge start.
 
 `POST /v1/unblock` and `hole bridge unlock` are two doors with deliberately
 different scopes. The transient cover's authority inside a live bridge is the
-in-process `ProxyManager::blocked` guard: `start_cancellable` reads
-`self.blocked.is_some()` as proof the host is covered, skipping re-engagement
-on a covered retry and suppressing the censorship self-test on that basis. An
+in-process `ProxyManager` posture's `PendingStart` state ([Cover
+ownership](#cover-ownership)): `start_cancellable` reads it as proof the host
+is covered, skipping re-engagement on a covered retry and suppressing the
+censorship self-test on that basis. An
 out-of-process command that deleted the transient filters would leave that
 guard claiming a cover that no longer exists, and the next retry would run
 uncovered while believing itself protected — so `cutover::unlock` keeps
@@ -665,6 +673,30 @@ Disclosed residuals:
    mean probing the live pf ruleset for Hole's own signature independent of
    the state file — the cover-state probe this stage's constraints defer to
    the ownership work.
+
+#### Cover ownership
+
+`ProxyManager` answers "who, inside this process, holds a fail-closed cover"
+in exactly one place: one field (`posture: Posture<P, R, D>`, replacing what
+were two independently mutable `Option` fields), three states (`Idle` / a
+pending covered start / a live session), one derivation
+(`Posture::cover_holder`, producing a `CoverHolder`) that every other site
+asks rather than recomputes. `CoverHolder::Nobody` is a claim about *this
+process* and never about the host — a cover stranded by an unclean exit, or
+adopted at startup, is `Nobody` here and can still block every packet.
+Answering "is the host held closed right now" needs an OS probe this model
+does not have; that probe is later work, and this model is the vocabulary it
+composes into, not a substitute for it.
+
+"That every other site asks rather than recomputes" is enforced by a
+structural test (`the_standing_cover_field_has_exactly_one_reader`,
+`proxy_manager/cover_tests.rs`), not proven by the type system — it counts
+`.field`-access reads of the session's standing-cover field and asserts
+there is exactly one, in `Posture::cover_holder`. It is blind to an added
+accessor under a different name and to a pattern-destructuring read (the
+shape `stop_with` itself already uses, to consume rather than derive
+ownership from, this same field); see the guard's own doc for the full
+disclosed gap.
 
 ### Update cutover
 
@@ -894,7 +926,20 @@ on a client path (the vendored tree is lint-excluded): re-verify on every re-mer
 Rust and Go are exact pins, so a release of either cannot turn `main` red on its
 own. Bump them deliberately: clippy gains lints between releases, and
 golangci-lint must be new enough to typecheck the Go standard library it is
-pointed at.
+pointed at. Renovate tracks both compilers but never automerges either — a
+compiler bump always arrives as its own reviewable pull request
+([renovate.json](.github/renovate.json)). `actions/setup-go` prefers
+`toolchain` over `go` when both are present, so `toolchain` is what CI
+installs. The `go` directive keeps Renovate's default range strategy, a no-op
+while its range already covers the latest release, so routine Go releases only
+move `toolchain`; both directives share one never-automerged rule so a Go
+major (which would move `go`) can't slip through either.
+
+| Pin                                                | Renovate manager                            |
+| -------------------------------------------------- | ------------------------------------------- |
+| `rust-toolchain.toml` `channel`                    | `rust-toolchain` (depName `rust`)           |
+| `go.mod` `toolchain` directive                     | `gomod` (depName `go`, depType `toolchain`) |
+| `go.mod` `go` directive (rarely moves — see above) | `gomod` (depName `go`, depType `golang`)    |
 
 Nothing else is pinned, and the claim stops there. Node floats within `24.x`,
 and `prek`, `nextest`, Python and `uv` are all installed unversioned in jobs
