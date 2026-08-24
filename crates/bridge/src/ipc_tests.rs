@@ -339,7 +339,7 @@ fn sample_config() -> ProxyConfig {
         server: ServerEntry {
             id: "test-id".to_string(),
             name: "Test".to_string(),
-            server: "127.0.0.1".to_string(),
+            server: "127.0.0.1".into(),
             server_port: 8388,
             method: "aes-256-gcm".to_string(),
             password: "pw".to_string(),

@@ -44,6 +44,10 @@ nu-ansi-term = "0.50"
 tempfile = "3"
 tombstone = { path = "../tombstone" }
 util = { path = "../util" }
+# `Dump` impls for the config containers: the `dump!` ladder resolves per
+# top-level expression, so a container without one falls to `Serialize` and
+# renders the address and the password in clear.
+dump = { path = "../dump" }
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62", features = [

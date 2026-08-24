@@ -368,7 +368,7 @@ fn run_test_returns_internal_error_for_unsupported_cipher() {
         let preflight_addr = listener.local_addr().unwrap();
         // Hold the listener — drop at end of scope cleans up.
         let mut entry_with_real_addr = entry;
-        entry_with_real_addr.server = preflight_addr.ip().to_string();
+        entry_with_real_addr.server = preflight_addr.ip().to_string().into();
         entry_with_real_addr.server_port = preflight_addr.port();
 
         let outcome = run_server_test(&entry_with_real_addr, &cfg).await;

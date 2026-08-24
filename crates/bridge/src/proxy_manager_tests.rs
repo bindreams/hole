@@ -2304,7 +2304,7 @@ mod self_test {
         let (pm, dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, lockdown);
 
         let mut cfg = test_config();
-        cfg.server.server = closed.ip().to_string();
+        cfg.server.server = closed.ip().to_string().into();
         cfg.server.server_port = closed.port();
         cfg.dns.enabled = true;
         cfg.dns.servers = vec!["127.0.0.1".parse().unwrap()];
@@ -2441,7 +2441,7 @@ mod self_test {
         let st = routing.state();
         let (pm, dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, lockdown);
         let mut cfg = test_config();
-        cfg.server.server = closed.ip().to_string();
+        cfg.server.server = closed.ip().to_string().into();
         cfg.server.server_port = closed.port();
         cfg.dns.enabled = true;
         cfg.dns.servers = vec!["127.0.0.1".parse().unwrap()];
@@ -4692,12 +4692,12 @@ mod self_test {
             pm.start(&cfg).await.unwrap();
             assert_eq!(pm.state(), ProxyState::Running, "setup must leave a live session");
 
-            let server_ip: IpAddr = cfg.server.server.parse().unwrap();
+            let server_ip: IpAddr = cfg.server.server.expose().parse().unwrap();
             let second_routing = MockRouting::new(dir.path().to_path_buf());
             let cover = second_routing.install_failclosed_cover(server_ip, None).unwrap();
             pm.posture.hold_pending(BlockedStart {
                 cover,
-                host: cfg.server.server.clone(),
+                host: cfg.server.server.expose().to_string(),
                 server_ip,
                 pin: crate::dns::ech::PinSource::NoQueryNeeded,
                 resolver_permit: None,
@@ -4719,12 +4719,12 @@ mod self_test {
                 .unwrap_err();
             assert!(pm.blocked_until_connected(), "setup must leave a pending start held");
 
-            let server_ip: IpAddr = cfg.server.server.parse().unwrap();
+            let server_ip: IpAddr = cfg.server.server.expose().parse().unwrap();
             let second_routing = MockRouting::new(dir.path().to_path_buf());
             let cover = second_routing.install_failclosed_cover(server_ip, None).unwrap();
             pm.posture.hold_pending(BlockedStart {
                 cover,
-                host: cfg.server.server.clone(),
+                host: cfg.server.server.expose().to_string(),
                 server_ip,
                 pin: crate::dns::ech::PinSource::NoQueryNeeded,
                 resolver_permit: None,

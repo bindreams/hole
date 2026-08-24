@@ -5,7 +5,7 @@ fn sample_server() -> ServerEntry {
     ServerEntry {
         id: "test-id".to_string(),
         name: "Test".to_string(),
-        server: "1.2.3.4".to_string(),
+        server: "1.2.3.4".into(),
         server_port: 8388,
         method: "aes-256-gcm".to_string(),
         password: "pw".to_string(),
@@ -626,4 +626,40 @@ fn proxy_config_defaults_on_deserialize() {
     assert!(cfg.proxy_socks5);
     assert!(!cfg.proxy_http);
     assert_eq!(cfg.local_port_http, 4074);
+}
+
+// Server-address redaction ============================================================================================
+
+const SECRET_ADDR: &str = "203.0.113.7";
+const SECRET_PW: &str = "super-secret-do-not-leak";
+
+fn secret_config() -> ProxyConfig {
+    let mut config = ProxyConfig {
+        server: sample_server(),
+        ..ProxyConfig::default()
+    };
+    config.server.server = SECRET_ADDR.into();
+    config.server.password = SECRET_PW.to_string();
+    config
+}
+
+/// `ProxyConfig` is what `handle_start` holds and dumps, and it has the same
+/// ladder shape as `ServerEntry`: `Serialize` derived, no `Dump`, so the
+/// nested transparent newtype serializes as its inner string.
+#[skuld::test]
+fn proxy_config_dump_omits_the_address() {
+    let rendered = dump::dump!(&secret_config()).to_string();
+    assert!(
+        !rendered.contains(SECRET_ADDR),
+        "dump! must not carry the server address: {rendered}"
+    );
+    assert!(!rendered.contains(SECRET_PW), "nor the password: {rendered}");
+}
+
+#[skuld::test]
+fn proxy_config_json_round_trips_the_exact_address() {
+    let json = serde_json::to_string(&secret_config()).expect("serialize");
+    assert!(json.contains(SECRET_ADDR), "the IPC wire must carry the real address");
+    let back: ProxyConfig = serde_json::from_str(&json).expect("deserialize");
+    assert_eq!(back.server.server.expose(), SECRET_ADDR);
 }

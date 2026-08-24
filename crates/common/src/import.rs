@@ -141,7 +141,7 @@ fn parse_server_value(value: &serde_json::Value) -> Result<ServerEntry, ImportEr
     Ok(ServerEntry {
         id: Uuid::new_v4().to_string(),
         name,
-        server: server.to_string(),
+        server: server.into(),
         server_port,
         method: method.to_string(),
         password: password.to_string(),

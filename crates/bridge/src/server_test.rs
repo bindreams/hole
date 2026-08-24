@@ -104,19 +104,21 @@ pub async fn run_server_test(entry: &ServerEntry, cfg: &TestConfig) -> ServerTes
         #[cfg(test)]
         {
             match &cfg.bootstrap_querier {
-                Some(q) => crate::dns::bootstrap::resolve_via_doh_with(&entry.server, &cfg.dns, q.clone()).await,
-                None => crate::dns::bootstrap::resolve_via_doh(&entry.server, &cfg.dns).await,
+                Some(q) => {
+                    crate::dns::bootstrap::resolve_via_doh_with(entry.server.expose(), &cfg.dns, q.clone()).await
+                }
+                None => crate::dns::bootstrap::resolve_via_doh(entry.server.expose(), &cfg.dns).await,
             }
         }
         #[cfg(not(test))]
         {
-            crate::dns::bootstrap::resolve_via_doh(&entry.server, &cfg.dns).await
+            crate::dns::bootstrap::resolve_via_doh(entry.server.expose(), &cfg.dns).await
         }
     };
     let bootstrapped = match resolved {
         Ok(b) => b,
         Err(e) => {
-            tracing::warn!(host = %entry.server, error = %e, "server_test: DoH bootstrap failed");
+            tracing::warn!(error = %e, "server_test: DoH bootstrap failed");
             return ServerTestOutcome::DnsFailed;
         }
     };
@@ -264,8 +266,11 @@ async fn reclassify_blocked(
 /// TCP connect can't distinguish "genuinely TCP" from "unclassifiable" to
 /// make that guess safely.
 fn server_endpoint_is_udp(entry: &ServerEntry) -> bool {
-    match crate::reachability::classify_transport(entry.plugin.as_deref(), entry.plugin_opts.as_deref(), &entry.server)
-    {
+    match crate::reachability::classify_transport(
+        entry.plugin.as_deref(),
+        entry.plugin_opts.as_deref(),
+        entry.server.expose(),
+    ) {
         Ok(crate::reachability::ProbeTransport::Quic { .. }) => true,
         Ok(_) => false,
         Err(e) => {

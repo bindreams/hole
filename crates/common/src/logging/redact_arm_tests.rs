@@ -13,7 +13,7 @@ use crate::config::ServerEntry;
 fn entry(id: &str, server: &str) -> ServerEntry {
     ServerEntry {
         id: id.to_string(),
-        server: server.to_string(),
+        server: server.into(),
         ..ServerEntry::default_placeholder()
     }
 }

@@ -8,7 +8,7 @@ fn test_entry(id: &str) -> ServerEntry {
     ServerEntry {
         id: id.to_string(),
         name: format!("Server {id}"),
-        server: "1.2.3.4".to_string(),
+        server: "1.2.3.4".into(),
         server_port: 8388,
         method: "aes-256-gcm".to_string(),
         password: "pw".to_string(),
@@ -675,7 +675,7 @@ fn entry(id: &str, server: &str, port: u16) -> ServerEntry {
     ServerEntry {
         id: id.to_string(),
         name: format!("Server {id}"),
-        server: server.to_string(),
+        server: server.into(),
         server_port: port,
         method: "aes-256-gcm".to_string(),
         password: "pw".to_string(),
@@ -745,7 +745,7 @@ fn apply_import_deduplicates_against_existing() {
     ];
     let (appended, deduped) = apply_import(&mut config, parsed);
     assert_eq!(appended.len(), 1);
-    assert_eq!(appended[0].server, "10.0.0.2");
+    assert_eq!(appended[0].server.expose(), "10.0.0.2");
     assert_eq!(deduped, 1);
     assert_eq!(config.servers.len(), 2);
 }

@@ -714,7 +714,6 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
             local_port = config.local_port,
             tunnel_mode = ?config.tunnel_mode,
             plugin = ?config.server.plugin,
-            server_host = %config.server.server,
             server_port = config.server.server_port,
             "ProxyManager::start_cancellable entered"
         );
@@ -735,7 +734,10 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         // guaranteed to land on the resolver already baked into the held cover
         // (see `BlockedStart`'s doc) — so a start for a different server must
         // release the held cover BEFORE resolving.
-        let stale = self.posture.pending().is_some_and(|b| b.host != config.server.server);
+        let stale = self
+            .posture
+            .pending()
+            .is_some_and(|b| b.host != config.server.server.expose());
         if stale {
             debug_assert!(self.posture.pending().is_some(), "stale implies a held cover");
             self.posture.take_pending();
@@ -744,7 +746,11 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
 
         // Resolve the server IP over private DoH. A same-server retry under the
         // held cover reuses the cached IP and pin.
-        let (server_ip, pin) = match self.posture.pending().filter(|b| b.host == config.server.server) {
+        let (server_ip, pin) = match self
+            .posture
+            .pending()
+            .filter(|b| b.host == config.server.server.expose())
+        {
             Some(b) => (b.server_ip, crate::dns::ech::revalidate(b.pin, &config.dns.servers)),
             None => match Self::resolve_server_ip(config, &bootstrap_querier, &cancel).await {
                 Ok(b) => (b.server_ip, b.via),
@@ -859,7 +865,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         let repair_fallback: Option<(Option<IpAddr>, crate::dns::ech::PinSource)> = if covered && !lockdown_on {
             self.posture
                 .pending()
-                .filter(|b| b.host == config.server.server && b.resolver_permit != ech_resolver_permit)
+                .filter(|b| b.host == config.server.server.expose() && b.resolver_permit != ech_resolver_permit)
                 .map(|b| (b.resolver_permit, b.pin))
         } else {
             None
@@ -903,7 +909,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
                     Ok(cover) => {
                         self.posture.hold_pending(BlockedStart {
                             cover,
-                            host: config.server.server.clone(),
+                            host: config.server.server.expose().to_string(),
                             server_ip,
                             pin: engaged_pin,
                             resolver_permit: ech_resolver_permit,
@@ -915,7 +921,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
                                 Ok(cover) => {
                                     self.posture.hold_pending(BlockedStart {
                                         cover,
-                                        host: config.server.server.clone(),
+                                        host: config.server.server.expose().to_string(),
                                         server_ip,
                                         pin: original_pin,
                                         resolver_permit: old_permit,
@@ -1062,7 +1068,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
                 self.last_error = None;
                 let diag = ProxyStartedDiag {
                     server_ip,
-                    server_host: &config.server.server,
+                    server_host: config.server.server.expose(),
                     server_port: config.server.server_port,
                     local_port: config.local_port,
                     tunnel_mode: tunnel_mode_label(&config.tunnel_mode),
@@ -1105,10 +1111,12 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
             return Err(ProxyError::Cancelled);
         }
         let res = match bootstrap_querier {
-            Some(q) => crate::dns::bootstrap::resolve_via_doh_with(&config.server.server, &config.dns, q.clone()).await,
-            None => crate::dns::bootstrap::resolve_via_doh(&config.server.server, &config.dns).await,
+            Some(q) => {
+                crate::dns::bootstrap::resolve_via_doh_with(config.server.server.expose(), &config.dns, q.clone()).await
+            }
+            None => crate::dns::bootstrap::resolve_via_doh(config.server.server.expose(), &config.dns).await,
         };
-        Ok(res.inspect_err(|e| warn!(host = %config.server.server, error = %e, "DoH bootstrap resolution failed"))?)
+        Ok(res.inspect_err(|e| warn!(error = %e, "DoH bootstrap resolution failed"))?)
     }
 
     /// Produce a [`RunningState`] without touching `self`.

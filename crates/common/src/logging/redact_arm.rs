@@ -44,7 +44,7 @@ const TOKEN_HEX_LEN: usize = 8;
 /// value is arbitrary text. A candidate that cannot be derived is dropped;
 /// the others are still armed.
 pub fn arm_server(entry: &ServerEntry) {
-    let configured = entry.server.as_str();
+    let configured = entry.server.expose();
     let mut candidates = vec![configured.to_string()];
     if let Some(stripped) = configured.strip_suffix('.') {
         candidates.push(stripped.to_string());

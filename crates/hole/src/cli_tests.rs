@@ -459,7 +459,7 @@ fn read_server_entry_file_parses_valid_json(#[fixture(temp_dir)] dir: &Path) {
     )
     .unwrap();
     let entry = super::read_server_entry_file(&path).expect("parse entry");
-    assert_eq!(entry.server, "127.0.0.1");
+    assert_eq!(entry.server.expose(), "127.0.0.1");
     assert_eq!(entry.server_port, 8388);
 }
 

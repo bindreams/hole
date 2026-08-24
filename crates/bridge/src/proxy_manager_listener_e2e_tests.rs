@@ -34,7 +34,7 @@ fn entry_from(ss: &SsServerHandle) -> ServerEntry {
     ServerEntry {
         id: "listener-e2e".into(),
         name: "listener-e2e".into(),
-        server: ss.addr.ip().to_string(),
+        server: ss.addr.ip().to_string().into(),
         server_port: ss.addr.port(),
         method: ss.method.into(),
         password: ss.password.clone(),
