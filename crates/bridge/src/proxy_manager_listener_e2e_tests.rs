@@ -90,12 +90,37 @@ async fn start_expect_error(harness: &mut DistHarness, config: ProxyConfig) -> S
     }
 }
 
+/// Which branch [`assert_port_unbound`] used to conclude the port is
+/// unbound. Surfaced so a test can see which branch actually fired,
+/// rather than the function silently swallowing that evidence.
+#[derive(Debug, PartialEq, Eq)]
+enum UnboundEvidence {
+    /// The connect attempt observed a refusal directly.
+    Refused,
+    /// The connect attempt timed out, but we could bind the port
+    /// ourselves — the real stealth-drop shape this fallback exists for.
+    Bound,
+}
+
 /// Assert that nothing is listening on `addr` — either by observing a
-/// refused connect or, on Windows where the firewall can silently drop
-/// SYNs to unbound ports, by successfully binding the port ourselves
-/// (proving nothing else already holds it).
-async fn assert_port_unbound(addr: SocketAddr) {
-    let connect = tokio::time::timeout(Duration::from_secs(1), tokio::net::TcpStream::connect(addr)).await;
+/// refused connect or, where a firewall can silently drop SYNs to unbound
+/// ports, by successfully binding the port ourselves (proving nothing else
+/// already holds it).
+///
+/// Each connect attempt pins [`util::syn_budget::SynBudget::NoRetransmit`]:
+/// this is a probe inside a loop that re-issues on any failure (the retry
+/// is the whole function, not just the connect), so a refusal is observed
+/// in ~0.1 ms instead of paying Windows' ~2.05 s stock SYN-retransmission
+/// budget. Before this pin, a 1 s cap always lost that race on Windows and
+/// the bind-fallback branch below was the only one Windows ever took —
+/// nothing was stealth-dropping SYNs; the budget was just losing to a real
+/// refusal.
+async fn assert_port_unbound(addr: SocketAddr) -> UnboundEvidence {
+    let connect = tokio::time::timeout(
+        Duration::from_secs(1),
+        util::syn_budget::connect(addr, util::syn_budget::SynBudget::NoRetransmit),
+    )
+    .await;
     match connect {
         Ok(Ok(_stream)) => panic!("expected {addr} unbound; connection succeeded"),
         Ok(Err(e)) => {
@@ -107,13 +132,17 @@ async fn assert_port_unbound(addr: SocketAddr) {
                 ),
                 "expected {addr} unbound; got io error kind {kind:?}: {e}"
             );
+            UnboundEvidence::Refused
         }
         Err(_) => {
-            // Windows Firewall stealth-drops SYNs to unbound localhost
-            // ports in some configurations. Fall back to a positive
-            // check: if we can bind the port, it's free.
+            // A firewall stealth-dropping SYNs to unbound localhost ports
+            // is a real, if rare, shape on some hosts. Fall back to a
+            // positive check: if we can bind the port, it's free.
             match tokio::net::TcpListener::bind(addr).await {
-                Ok(listener) => drop(listener),
+                Ok(listener) => {
+                    drop(listener);
+                    UnboundEvidence::Bound
+                }
                 Err(e) => panic!(
                     "expected {addr} unbound; connect timed out and bind failed with {e} — \
                      something is holding the port"
@@ -141,6 +170,17 @@ async fn roundtrip_http_connect(proxy: SocketAddr, target: SocketAddr) {
         .expect("HTTP CONNECT roundtrip");
     let body = http_response_body(&response).expect("response has header terminator");
     assert_eq!(body, crate::test_support::http_target::SENTINEL_BODY);
+}
+
+#[skuld::test]
+async fn assert_port_unbound_observes_a_refusal() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0".parse::<SocketAddr>().unwrap())
+        .await
+        .expect("bind ephemeral loopback port");
+    let addr = listener.local_addr().expect("local_addr");
+    drop(listener);
+
+    assert_eq!(assert_port_unbound(addr).await, UnboundEvidence::Refused);
 }
 
 // TCP listener selection ==============================================================================================
