@@ -190,3 +190,163 @@ fn stop_releases_the_udp_port_with_a_live_association(#[fixture(ssserver_none)] 
         assert_ports_free(local_port);
     });
 }
+
+// Drop-path port release ==============================================================================================
+
+/// Exercises `join_runtime`'s `block_in_place` arm: dropping (not
+/// `stop()`ping) a started proxy on a multi-thread runtime must still
+/// release both ports before `drop` returns.
+///
+/// Deterministic only on the fixed code, because `Drop` joins the
+/// runtime. On unmodified code this is a genuine race (whichever poll
+/// happens to run first), so this is not a red-on-main guard the way
+/// the `stop()` tests above are.
+#[skuld::test(labels = [PORT_ALLOC], serial = PORT_ALLOC)]
+fn drop_releases_the_listener_ports_on_a_multi_thread_runtime() {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("build multi-thread runtime");
+    rt.block_on(async {
+        let local_port = allocate_ephemeral_port(Protocols::TCP | Protocols::UDP).await;
+        let server: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let config = socks_only_config(server, local_port);
+
+        let running = ShadowsocksProxy::new().start(config).await.expect("proxy starts");
+        socks5_method_negotiate(local_port).await;
+
+        drop(running);
+
+        assert_ports_free(local_port);
+    });
+}
+
+/// Same claim as above, on a current-thread runtime — the `join()` (not
+/// `block_in_place`) arm of `join_runtime`.
+///
+/// A *stronger* claim than the multi-thread test: `join_runtime` joins
+/// on every flavour, so this must hold here too, and stops a future edit
+/// from quietly reintroducing a non-joining fallback for this arm.
+#[skuld::test(labels = [PORT_ALLOC], serial = PORT_ALLOC)]
+fn drop_releases_the_listener_ports_on_a_current_thread_runtime() {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build current-thread runtime");
+    rt.block_on(async {
+        let local_port = allocate_ephemeral_port(Protocols::TCP | Protocols::UDP).await;
+        let server: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let config = socks_only_config(server, local_port);
+
+        let running = ShadowsocksProxy::new().start(config).await.expect("proxy starts");
+        socks5_method_negotiate(local_port).await;
+
+        drop(running);
+
+        assert_ports_free(local_port);
+    });
+}
+
+// Upstream assumption guard ===========================================================================================
+
+/// Guards the one property this change relies on that no behavioural test
+/// can see: `drop(Runtime)` waits for *running* blocking-pool tasks, and
+/// `shadowsocks-service` 1.24.0 has none on Hole's local-server path today
+/// (confirmed by reading its source, not merely assumed). A version bump
+/// could reintroduce one with no other test going red — this walks the
+/// dependency's source tree and asserts it stays that way.
+///
+/// If `cargo metadata` is not resolvable in the test environment, this test
+/// cannot be expressed; see CONTRIBUTING.md#proxy-shutdown-contract before
+/// weakening the assertion.
+#[skuld::test]
+fn upstream_has_no_blocking_calls_on_the_shutdown_path() {
+    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+    let output = std::process::Command::new(cargo)
+        .args(["metadata", "--format-version", "1"])
+        .output()
+        .expect("run `cargo metadata`");
+    assert!(
+        output.status.success(),
+        "cargo metadata failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let metadata: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("parse `cargo metadata` JSON output");
+    let packages = metadata["packages"].as_array().expect("metadata packages array");
+
+    for pkg_name in ["shadowsocks-service", "shadowsocks"] {
+        let pkg = packages
+            .iter()
+            .find(|p| p["name"] == pkg_name)
+            .unwrap_or_else(|| panic!("`{pkg_name}` not found in `cargo metadata` packages"));
+        let manifest_path = pkg["manifest_path"].as_str().expect("manifest_path is a string");
+        let src_dir = std::path::Path::new(manifest_path)
+            .parent()
+            .expect("manifest_path has a parent directory")
+            .join("src");
+
+        let mut spawn_blocking_count = 0usize;
+        let mut lookup_host_count = 0usize;
+        let mut lookup_host_sites = Vec::new();
+        for entry in walk_rs_files(&src_dir) {
+            let contents = std::fs::read_to_string(&entry).unwrap_or_else(|e| panic!("read {entry:?}: {e}"));
+            spawn_blocking_count += contents.matches("spawn_blocking").count();
+            // Call-syntax only ("lookup_host(") — the bare identifier also
+            // matches the `use tokio::net::lookup_host;` import line, which
+            // isn't a call site.
+            let hits = contents.matches("lookup_host(").count();
+            if hits > 0 {
+                lookup_host_count += hits;
+                lookup_host_sites.push((entry, hits));
+            }
+        }
+
+        assert_eq!(
+            spawn_blocking_count, 0,
+            "`{pkg_name}` {src_dir:?} now calls `spawn_blocking` ({spawn_blocking_count} occurrence(s)) — \
+             the no-hang property of `ShadowsocksRunning::stop` assumed upstream does no blocking work on the \
+             local-server path; this bump breaks that assumption. Re-audit whether Hole's config reaches the \
+             new call site, then update this test's expectation or the shutdown contract. \
+             See CONTRIBUTING.md#proxy-shutdown-contract."
+        );
+
+        if pkg_name == "shadowsocks" {
+            // The one known site: `dns_resolver/resolver.rs`'s
+            // `DnsResolver::System` branch, live but unreached by Hole's
+            // config (see CONTRIBUTING.md#proxy-shutdown-contract). A count
+            // other than 1, or a hit outside that file, means the call site
+            // moved or multiplied and needs the same re-audit as above.
+            assert_eq!(
+                lookup_host_count, 1,
+                "`{pkg_name}` {src_dir:?} calls `lookup_host` {lookup_host_count} time(s) at {lookup_host_sites:?}, \
+                 expected exactly 1 (dns_resolver/resolver.rs's DnsResolver::System branch) — the call site moved \
+                 or multiplied. Re-audit whether Hole's config now reaches it. See CONTRIBUTING.md#proxy-shutdown-contract."
+            );
+            assert!(
+                lookup_host_sites.iter().all(|(path, _)| path
+                    .to_string_lossy()
+                    .replace('\\', "/")
+                    .ends_with("dns_resolver/resolver.rs")),
+                "`{pkg_name}` `lookup_host` call site(s) {lookup_host_sites:?} are not where expected \
+                 (dns_resolver/resolver.rs). See CONTRIBUTING.md#proxy-shutdown-contract."
+            );
+        }
+    }
+}
+
+fn walk_rs_files(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).unwrap_or_else(|e| panic!("read_dir {dir:?}: {e}")) {
+            let entry = entry.expect("read_dir entry").path();
+            if entry.is_dir() {
+                stack.push(entry);
+            } else if entry.extension().is_some_and(|ext| ext == "rs") {
+                out.push(entry);
+            }
+        }
+    }
+    out
+}
