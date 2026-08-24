@@ -25,7 +25,10 @@ use crate::engine::config::MutEngineConfig;
 
 /// One segment drained from the virtual device, owned.
 struct Segment {
+    src: SocketAddr,
+    dst: SocketAddr,
     control: TcpControl,
+    seq: TcpSeqNumber,
     ack: Option<TcpSeqNumber>,
     payload: Vec<u8>,
 }
@@ -53,6 +56,11 @@ fn stack() -> SocketStack {
 
 fn t(ms: i64) -> SmoltcpInstant {
     SmoltcpInstant::from_millis(ms)
+}
+
+/// The sequence number one past `seq`, in the wire form the builders take.
+fn after(seq: TcpSeqNumber) -> u32 {
+    (seq.0 as u32).wrapping_add(1)
 }
 
 fn segment(src: SocketAddr, dst: SocketAddr, control: TcpControl, seq: u32, ack: Option<u32>) -> Vec<u8> {
@@ -100,6 +108,10 @@ fn syn(src: SocketAddr, dst: SocketAddr, seq: u32) -> Vec<u8> {
     segment(src, dst, TcpControl::Syn, seq, None)
 }
 
+fn ack(src: SocketAddr, dst: SocketAddr, seq: u32, ack: u32) -> Vec<u8> {
+    segment(src, dst, TcpControl::None, seq, Some(ack))
+}
+
 /// Drain and parse everything the stack has queued for the TUN.
 fn tcp_out(stack: &mut SocketStack) -> Vec<Segment> {
     stack.dequeue_tx().iter().map(|packet| parse_segment(packet)).collect()
@@ -119,7 +131,10 @@ fn parse_segment(packet: &[u8]) -> Segment {
     .expect("egress TCP header parses");
 
     Segment {
+        src: SocketAddr::new(IpAddr::V4(ip_repr.src_addr), tcp_repr.src_port),
+        dst: SocketAddr::new(IpAddr::V4(ip_repr.dst_addr), tcp_repr.dst_port),
         control: tcp_repr.control,
+        seq: tcp_repr.seq_number,
         ack: tcp_repr.ack_number,
         payload: tcp_repr.payload.to_vec(),
     }
@@ -136,6 +151,7 @@ fn one_pending(handshakes: Vec<Handshake>) -> (SocketHandle, u16, SocketAddr, So
 
 /// Drive a listener on port 80 to `SynReceived` and return its handle. The tx
 /// queue is left untouched — the caller decides what it should hold.
+/// A listener is created paused, so nothing has been emitted yet.
 fn half_open(stack: &mut SocketStack, isn: u32) -> SocketHandle {
     stack.ensure_listener(80);
     stack.enqueue_rx(syn(client(), dest(), isn));
@@ -156,11 +172,13 @@ fn ensure_listener_is_idempotent_per_port() {
 }
 
 #[skuld::test]
-fn syn_produces_a_synack_on_the_first_poll() {
+fn a_listener_holds_the_synack_until_admitted() {
     let mut stack = stack();
-    stack.ensure_listener(80);
-    stack.enqueue_rx(syn(client(), dest(), 1000));
-    stack.poll(t(0));
+    let handle = half_open(&mut stack, 1000);
+    assert!(tcp_out(&mut stack).is_empty());
+
+    stack.admit(handle, 80);
+    stack.poll(t(1));
 
     let out = tcp_out(&mut stack);
     assert_eq!(out.len(), 1);
@@ -190,32 +208,132 @@ fn take_handshakes_is_empty_without_a_syn() {
     assert!(stack.take_handshakes().is_empty());
 }
 
-/// States the defect: the socket leaves the set before smoltcp can dispatch its
-/// RST, so the client's SYN is answered with a SYN|ACK and then silence.
 #[skuld::test]
-fn reject_emits_no_packet_and_removes_the_socket() {
+fn refuse_emits_an_rst() {
     let mut stack = stack();
     let handle = half_open(&mut stack, 1000);
+    assert!(tcp_out(&mut stack).is_empty());
 
-    let setup = tcp_out(&mut stack);
-    assert_eq!(setup.len(), 1);
-    assert_eq!(setup[0].control, TcpControl::Syn);
-    assert!(setup[0].ack.is_some());
-
-    stack.reject(handle, 80);
+    stack.refuse(handle, 80);
     stack.poll(t(1));
 
-    assert!(tcp_out(&mut stack).is_empty());
-    assert_eq!(stack.sockets.iter().count(), 1);
+    let out = tcp_out(&mut stack);
+    assert_eq!(out.len(), 1);
+    assert_eq!(out[0].control, TcpControl::Rst);
+    assert!(out[0].payload.is_empty());
 }
 
 #[skuld::test]
-fn reject_rearms_the_listener() {
+fn the_refusal_rst_acknowledges_the_clients_syn() {
+    let isn = 1000u32;
+    let mut stack = stack();
+    let handle = half_open(&mut stack, isn);
+
+    stack.refuse(handle, 80);
+    stack.poll(t(1));
+
+    let out = tcp_out(&mut stack);
+    assert_eq!(out.len(), 1);
+    assert_eq!(out[0].ack, Some(TcpSeqNumber(isn as i32 + 1)));
+}
+
+#[skuld::test]
+fn the_refusal_rst_is_addressed_from_the_original_destination() {
     let mut stack = stack();
     let handle = half_open(&mut stack, 1000);
-    let _ = tcp_out(&mut stack);
 
-    stack.reject(handle, 80);
+    stack.refuse(handle, 80);
+    stack.poll(t(1));
+
+    let out = tcp_out(&mut stack);
+    assert_eq!(out.len(), 1);
+    assert_eq!(out[0].src, dest());
+    assert_eq!(out[0].dst, client());
+}
+
+#[skuld::test]
+fn a_refused_socket_is_reaped_only_after_its_rst_is_sent() {
+    let mut stack = stack();
+    let handle = half_open(&mut stack, 1000);
+
+    stack.refuse(handle, 80);
+    assert_eq!(stack.sockets.iter().count(), 2);
+    assert_eq!(stack.retiring, vec![handle]);
+
+    stack.poll(t(1));
+    assert_eq!(stack.sockets.iter().count(), 1);
+    assert!(stack.retiring.is_empty());
+}
+
+/// Distinguishes reaping on smoltcp's completion signal from an unconditional
+/// end-of-poll drain: this socket is parked but its peer is still live.
+#[skuld::test]
+fn a_parked_socket_with_a_live_peer_is_not_reaped() {
+    let isn = 1000u32;
+    let mut stack = stack();
+    let handle = half_open(&mut stack, isn);
+    stack.admit(handle, 80);
+    stack.poll(t(1));
+
+    let synack = tcp_out(&mut stack);
+    assert_eq!(synack.len(), 1);
+    stack.enqueue_rx(ack(client(), dest(), isn + 1, after(synack[0].seq)));
+    stack.poll(t(2));
+    assert_eq!(stack.socket(handle).state(), tcp::State::Established);
+
+    stack.retire(handle);
+    stack.poll(t(3));
+
+    assert!(stack.sockets.iter().any(|(h, _)| h == handle));
+    assert_eq!(stack.retiring, vec![handle]);
+}
+
+#[skuld::test]
+fn a_refused_socket_does_not_intercept_a_retry() {
+    let mut stack = stack();
+    let refused = half_open(&mut stack, 1000);
+    stack.refuse(refused, 80);
+
+    // The refused socket outranks the re-armed listener in slot order, so the
+    // interface reaches it first and its `Closed` early return is what keeps
+    // the port serving.
+    let order: Vec<SocketHandle> = stack.sockets.iter().map(|(handle, _)| handle).collect();
+    assert_eq!(order.len(), 2);
+    assert_eq!(order[0], refused);
+
+    stack.enqueue_rx(syn(client(), dest(), 1000));
+    stack.poll(t(1));
+
+    let (handle, port, src, dst) = one_pending(stack.take_handshakes());
+    assert_ne!(handle, refused);
+    assert_eq!((port, src, dst), (80, client(), dest()));
+}
+
+/// Guards that pausing the SYN|ACK did not break the accepted path.
+#[skuld::test]
+fn an_admitted_connection_reaches_established() {
+    let isn = 1000u32;
+    let mut stack = stack();
+    let handle = half_open(&mut stack, isn);
+    stack.admit(handle, 80);
+    stack.poll(t(1));
+
+    let synack = tcp_out(&mut stack);
+    assert_eq!(synack.len(), 1);
+    assert_eq!(synack[0].control, TcpControl::Syn);
+
+    stack.enqueue_rx(ack(client(), dest(), isn + 1, after(synack[0].seq)));
+    stack.poll(t(2));
+
+    assert_eq!(stack.socket(handle).state(), tcp::State::Established);
+}
+
+#[skuld::test]
+fn refuse_rearms_the_listener() {
+    let mut stack = stack();
+    let handle = half_open(&mut stack, 1000);
+
+    stack.refuse(handle, 80);
     stack.poll(t(1));
     let _ = tcp_out(&mut stack);
 

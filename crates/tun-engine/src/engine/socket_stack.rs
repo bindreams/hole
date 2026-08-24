@@ -4,6 +4,11 @@
 //! Owns no tokio, no TUN handle, and no clock: packets arrive and leave through
 //! plain queues, and [`poll`](SocketStack::poll) takes the current time as a
 //! parameter.
+//!
+//! Listeners are created with their SYN-ACK paused, so the accept verdict is
+//! reached while the socket is still in `SynReceived` and nothing has left the
+//! interface. [`admit`](SocketStack::admit) releases the SYN-ACK;
+//! [`refuse`](SocketStack::refuse) turns the same socket into an RST.
 
 use std::collections::HashSet;
 use std::net::{IpAddr, SocketAddr};
@@ -43,6 +48,9 @@ pub(crate) struct SocketStack {
     sockets: SocketSet<'static>,
     listeners: Vec<TcpListener>,
     listened_ports: HashSet<u16>,
+    /// Sockets the datapath is done with, held in the set until smoltcp is
+    /// finished with their peer.
+    retiring: Vec<SocketHandle>,
     tcp_rx_buf_size: usize,
     tcp_tx_buf_size: usize,
 }
@@ -69,6 +77,7 @@ impl SocketStack {
             sockets: SocketSet::new(vec![]),
             listeners: Vec::new(),
             listened_ports: HashSet::new(),
+            retiring: Vec::new(),
             tcp_rx_buf_size: config.tcp_rx_buf_size,
             tcp_tx_buf_size: config.tcp_tx_buf_size,
         }
@@ -84,8 +93,23 @@ impl SocketStack {
         self.device.dequeue_tx()
     }
 
+    /// Drive smoltcp, then reap every retired socket smoltcp has finished with.
+    ///
+    /// `remote_endpoint()` going `None` is that signal: `dispatch` clears the
+    /// 4-tuple only once it has emitted the socket's last packet. A retired
+    /// socket whose peer is still live stays in the set.
     pub(crate) fn poll(&mut self, now: SmoltcpInstant) {
         self.iface.poll(now, &mut self.device, &mut self.sockets);
+
+        let mut retiring = std::mem::take(&mut self.retiring);
+        retiring.retain(|&handle| {
+            if self.sockets.get::<tcp::Socket>(handle).remote_endpoint().is_some() {
+                return true;
+            }
+            self.sockets.remove(handle);
+            false
+        });
+        self.retiring = retiring;
     }
 
     pub(crate) fn ensure_listener(&mut self, port: u16) {
@@ -99,6 +123,7 @@ impl SocketStack {
             warn!("failed to listen on port {port}: {e:?}");
             return;
         }
+        socket.pause_synack(true);
         let handle = self.sockets.add(socket);
         self.listeners.push(TcpListener { handle, port });
         self.listened_ports.insert(port);
@@ -133,10 +158,24 @@ impl SocketStack {
         handshakes
     }
 
-    pub(crate) fn reject(&mut self, handle: SocketHandle, port: u16) {
-        self.sockets.get_mut::<tcp::Socket>(handle).abort();
-        self.sockets.remove(handle);
+    /// Release the socket's held SYN-ACK and re-arm the port.
+    pub(crate) fn admit(&mut self, handle: SocketHandle, port: u16) {
+        self.sockets.get_mut::<tcp::Socket>(handle).pause_synack(false);
         self.ensure_listener(port);
+    }
+
+    /// Answer the socket's peer with an RST instead of a SYN-ACK, and re-arm
+    /// the port. The RST leaves on the next [`poll`](Self::poll).
+    pub(crate) fn refuse(&mut self, handle: SocketHandle, port: u16) {
+        self.sockets.get_mut::<tcp::Socket>(handle).abort();
+        self.retire(handle);
+        self.ensure_listener(port);
+    }
+
+    /// Park a socket the datapath is done with. It stays in the set until
+    /// [`poll`](Self::poll) sees smoltcp finish with its peer.
+    pub(crate) fn retire(&mut self, handle: SocketHandle) {
+        self.retiring.push(handle);
     }
 
     pub(crate) fn socket(&self, handle: SocketHandle) -> &tcp::Socket<'static> {

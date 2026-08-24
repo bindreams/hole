@@ -13,9 +13,9 @@ use super::dns::DnsInterceptor;
 /// Override via the `Engine::build(..., |c| { c.field = ... })` closure.
 #[freeze]
 pub struct EngineConfig {
-    /// Maximum concurrent TCP connections. Additional connections are
-    /// accepted at the smoltcp layer and then aborted until an existing
-    /// connection drops.
+    /// Maximum concurrent TCP connections. Connections past the limit are
+    /// refused with a TCP reset before the handshake completes, until an
+    /// existing connection drops.
     pub max_connections: usize,
 
     /// Maximum concurrent calls to [`TcpFlow::peek`](super::TcpFlow::peek)

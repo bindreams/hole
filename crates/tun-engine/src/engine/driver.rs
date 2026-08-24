@@ -192,7 +192,7 @@ impl Driver {
                 Handshake::Pending { handle, port, src, dst } => (handle, port, src, dst),
                 Handshake::Stale { handle, port } => {
                     warn!("accepted TCP connection with no endpoint on port {port}");
-                    self.stack.reject(handle, port);
+                    self.stack.refuse(handle, port);
                     continue;
                 }
             };
@@ -202,7 +202,7 @@ impl Driver {
                 Ok(p) => p,
                 Err(_) => {
                     warn!("connection limit reached, rejecting {dst_ip}:{dst_port}");
-                    self.stack.reject(handle, port);
+                    self.stack.refuse(handle, port);
                     continue;
                 }
             };
@@ -233,7 +233,7 @@ impl Driver {
                 drop(permit);
             });
 
-            self.stack.ensure_listener(port);
+            self.stack.admit(handle, port);
         }
     }
 
