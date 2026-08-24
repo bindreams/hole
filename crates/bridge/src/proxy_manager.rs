@@ -1885,6 +1885,14 @@ mod proxy_manager_release_tests;
 #[path = "proxy_manager_e2e_tests.rs"]
 mod proxy_manager_e2e_tests;
 
+// Session-level composition guard (#874, Windows half): a real Full-mode
+// session started through the production path with the kill switch armed
+// still carries its own tunnel traffic while an off-tunnel probe is blocked.
+// See that module's doc for what it does and does not establish.
+#[cfg(test)]
+#[path = "proxy_manager_live_tun_permit_e2e_tests.rs"]
+mod proxy_manager_live_tun_permit_e2e_tests;
+
 #[cfg(test)]
 #[path = "proxy_manager_listener_e2e_tests.rs"]
 mod proxy_manager_listener_e2e_tests;
