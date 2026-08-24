@@ -994,6 +994,13 @@ pub(crate) fn classify_presence(engine_opened: bool, codes: &[u32]) -> crate::ro
 /// A failed engine open means the Base Filtering Engine could not be reached
 /// (BFE not yet running, or an RPC failure) — NOT "not elevated"; FWPM opens
 /// without elevation, as `release_all`'s doc records.
+///
+/// Measured unelevated on a clean host: the open succeeds and every by-key
+/// query returns `FWP_E_FILTER_NOT_FOUND`, so this answers `Absent` — the read
+/// needs no elevation (only the write transaction does). Whether reading an
+/// EXISTING filter's DACL is permitted unelevated is not established by that
+/// measurement, and does not need to be: `classify_presence` yields `Absent`
+/// for no code but the literal not-found, so a denied read is `Indeterminate`.
 #[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
 pub fn lockdown_cover_presence(_state_dir: &Path) -> crate::routing::CoverPresence {
     unsafe {

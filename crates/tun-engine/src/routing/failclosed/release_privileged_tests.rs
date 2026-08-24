@@ -308,6 +308,11 @@ fn windows_release_all_on_a_clean_host_is_ok() {
         "a clean host's reachability must be unaffected: {NON_PERMITTED}={:?}",
         connect(NON_PERMITTED).err().map(|e| e.kind()),
     );
+    assert_eq!(
+        super::lockdown_cover_presence(dir.path()),
+        crate::routing::CoverPresence::Absent,
+        "the firewall must report no lockdown cover after a clean-host release"
+    );
 }
 
 #[cfg(target_os = "macos")]
@@ -335,6 +340,11 @@ fn macos_release_all_on_a_clean_host_is_ok() {
     let info_after = Command::new("pfctl").args(["-s", "info"]).output().unwrap().stdout;
     let enabled_after = super::platform::parse_pf_enabled(&String::from_utf8_lossy(&info_after));
 
+    assert_eq!(
+        super::lockdown_cover_presence(dir.path()),
+        crate::routing::CoverPresence::Absent,
+        "pf must report no lockdown cover after a clean-host release"
+    );
     assert_eq!(
         sr_before, sr_after,
         "a clean host's live filter ruleset must be byte-identical afterward"
