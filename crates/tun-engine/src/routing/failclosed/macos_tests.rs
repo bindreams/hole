@@ -696,3 +696,80 @@ fn file_only_presence_never_reports_live() {
         );
     }
 }
+
+// pf ruleset label ====================================================================================================
+
+#[skuld::test]
+fn lockdown_ruleset_labels_its_block_all_rule() {
+    let r = build_lockdown_main_ruleset("utun4", v4(), "");
+    let labelled: Vec<&str> = r.lines().filter(|l| l.contains("label")).collect();
+    assert_eq!(
+        labelled.len(),
+        1,
+        "exactly one rule may carry our label, got {labelled:?}"
+    );
+    let line = labelled[0];
+    assert!(
+        line.trim() == format!("block drop out quick all label \"{LOCKDOWN_PF_LABEL}\""),
+        "the label must sit on the block-all base rule, got: {line}"
+    );
+    assert_eq!(
+        r.lines().filter(|l| !l.trim().is_empty()).next_back().map(str::trim),
+        Some(line.trim()),
+        "the labelled block-all must stay the LAST rule:\n{r}"
+    );
+}
+
+#[skuld::test]
+fn lockdown_restore_ruleset_never_carries_our_label() {
+    // The restore reloads the HOST's captured rules. Our label appearing there
+    // would make a restored host read back as a live Hole cover forever.
+    let r = build_lockdown_restore_ruleset("nat-anchor \"com.apple/*\" all\n", "pass out all\n");
+    assert!(
+        !r.contains(LOCKDOWN_PF_LABEL),
+        "the restore ruleset must not carry our label:\n{r}"
+    );
+}
+
+#[skuld::test]
+fn labels_listing_matcher_is_anchored_to_the_first_field() {
+    assert!(labels_listing_carries_our_label(&format!(
+        "{LOCKDOWN_PF_LABEL} 0 0 0 0 0 0 0 0\n"
+    )));
+    assert!(
+        !labels_listing_carries_our_label(""),
+        "an empty listing carries nothing"
+    );
+    assert!(
+        !labels_listing_carries_our_label("com.apple.internet-sharing 0 0 0 0\n"),
+        "another rule's label is not ours"
+    );
+    assert!(
+        !labels_listing_carries_our_label(&format!("{LOCKDOWN_PF_LABEL}-staging 0 0 0 0\n")),
+        "a label that merely CONTAINS ours is not ours"
+    );
+    assert!(
+        !labels_listing_carries_our_label(&format!("someone-else {LOCKDOWN_PF_LABEL} 0 0\n")),
+        "the label is the FIRST field; a counter column that happens to match is not it"
+    );
+}
+
+#[skuld::test]
+fn pf_label_answer_maps_a_failed_pfctl_to_none() {
+    // The wiring a fold table cannot reach: mapping a spawn failure or a
+    // non-success exit to `Some(false)` would collapse the two-source design to
+    // file-only and let a live cover read as absent.
+    assert_eq!(
+        pf_label_answer(Err(RoutingError::RouteSetup("pfctl spawn failed".into()))),
+        None
+    );
+    assert_eq!(pf_label_answer(output_with_status(1)), None, "a non-success exit");
+
+    let mut ok = output_with_status(0).unwrap();
+    ok.stdout = format!("{LOCKDOWN_PF_LABEL} 0 0 0 0\n").into_bytes();
+    assert_eq!(pf_label_answer(Ok(ok)), Some(true));
+
+    let mut clean = output_with_status(0).unwrap();
+    clean.stdout = b"com.apple.something 0 0\n".to_vec();
+    assert_eq!(pf_label_answer(Ok(clean)), Some(false));
+}

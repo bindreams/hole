@@ -70,6 +70,10 @@ pub fn ensure_trailing_nl(s: &str) -> String {
     }
 }
 
+/// The pf rule label our block-all base carries, and the name
+/// [`lockdown_cover_presence`] reads back out of `pfctl -s labels`.
+pub const LOCKDOWN_PF_LABEL: &str = "hole-lockdown";
+
 /// Build the self-contained MAIN ruleset for the standing lockdown, loaded via
 /// `pfctl -f -` (NO `-Fa`). It IS the host's egress policy while engaged:
 /// `block drop out quick all` is the fail-closed base, with earlier `quick`
@@ -81,6 +85,12 @@ pub fn ensure_trailing_nl(s: &str) -> String {
 /// `require-order`-enforced: Options -> Translation (nat) -> Filter. The server
 /// permit precedes `block drop out quick inet6 all` so a v6 server is not
 /// killed. pf has no per-process matching, so the server permit is IP-based.
+///
+/// The base rule's [`LOCKDOWN_PF_LABEL`] is **load-bearing**, not decoration:
+/// it is the only evidence [`lockdown_cover_presence`] has that does not come
+/// from `state_dir`. Dropping it returns macOS to file-only presence, which
+/// cannot produce `Live` and therefore can neither repair an intent file nor
+/// detect that we are about to snapshot our own cover as the host baseline.
 pub fn build_lockdown_main_ruleset(tun_name: &str, server_ip: IpAddr, nat_snapshot: &str) -> String {
     let proto = "tcp"; // +udp once a UDP-transport plugin lands; egress is TCP-only today.
     format!(
@@ -90,12 +100,37 @@ pub fn build_lockdown_main_ruleset(tun_name: &str, server_ip: IpAddr, nat_snapsh
          pass out quick proto {proto} from any to {ip}\n\
          pass out quick on {tun} all\n\
          block drop out quick inet6 all\n\
-         block drop out quick all\n",
+         block drop out quick all label \"{label}\"\n",
         nat = ensure_trailing_nl(nat_snapshot),
         proto = proto,
         ip = server_ip,
         tun = tun_name,
+        label = LOCKDOWN_PF_LABEL,
     )
+}
+
+/// Whether a `pfctl -s labels` listing names our rule label. The label is the
+/// FIRST whitespace-delimited field of a line (the rest are counters), so the
+/// match is anchored there — a host label that merely contains ours as a
+/// substring is not ours.
+pub fn labels_listing_carries_our_label(labels_output: &str) -> bool {
+    labels_output
+        .lines()
+        .any(|l| l.split_whitespace().next() == Some(LOCKDOWN_PF_LABEL))
+}
+
+/// Fold a `pfctl -s labels` invocation into pf's answer about our label:
+/// `Some(true)` it is loaded, `Some(false)` it is not, `None` pf could not be
+/// asked (spawn failure or a non-success exit).
+///
+/// `None` — not `Some(false)` — is what keeps the two-source design honest: a
+/// pfctl that could not run is no evidence the cover is gone.
+pub(crate) fn pf_label_answer(out: Result<std::process::Output, RoutingError>) -> Option<bool> {
+    let out = out.ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    Some(labels_listing_carries_our_label(&String::from_utf8_lossy(&out.stdout)))
 }
 
 /// Build the ruleset that restores the host's pre-lockdown policy on Sweep,
@@ -509,11 +544,11 @@ pub(crate) fn fold_presence(
 }
 
 /// Whether a standing lockdown cover is present, per pf and per Hole's own
-/// state file. **File-only for now** — the `pf_label` source is supplied by the
-/// ruleset-label probe in the next step; until then this cannot return
-/// [`CoverPresence::Live`], and therefore cannot trigger an intent repair.
+/// state file. The pf half asks `pfctl -s labels` for [`LOCKDOWN_PF_LABEL`],
+/// which is the only evidence here independent of `state_dir`.
 pub fn lockdown_cover_presence(state_dir: &Path) -> crate::routing::CoverPresence {
-    fold_presence(None, &lockdown_state::load_presence(state_dir))
+    let pf_label = pf_label_answer(pfctl(&["-s", "labels"], None, PHASE_RECOVER_COVER));
+    fold_presence(pf_label, &lockdown_state::load_presence(state_dir))
 }
 
 /// Best-effort wrapper for `Drop` (user-stop): disengage and swallow. Drop has
