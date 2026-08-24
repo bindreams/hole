@@ -172,6 +172,19 @@ impl SocketStack {
         self.ensure_listener(port);
     }
 
+    /// Drop a handshake with no peer left to answer, and re-arm the port.
+    /// smoltcp has already cleared the 4-tuple, so there is no address to
+    /// answer and nothing pending — the socket goes straight out of the set.
+    pub(crate) fn discard(&mut self, handle: SocketHandle, port: u16) {
+        debug_assert_eq!(
+            self.sockets.get::<tcp::Socket>(handle).state(),
+            tcp::State::Closed,
+            "every path that clears a non-listening socket's tuple leaves it Closed",
+        );
+        self.sockets.remove(handle);
+        self.ensure_listener(port);
+    }
+
     /// Park a socket the datapath is done with. It stays in the set until
     /// [`poll`](Self::poll) sees smoltcp finish with its peer.
     pub(crate) fn retire(&mut self, handle: SocketHandle) {

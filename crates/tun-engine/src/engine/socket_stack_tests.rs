@@ -149,6 +149,28 @@ fn one_pending(handshakes: Vec<Handshake>) -> (SocketHandle, u16, SocketAddr, So
     }
 }
 
+/// The one `Stale` handshake in `handshakes`, destructured.
+fn one_stale(handshakes: Vec<Handshake>) -> (SocketHandle, u16) {
+    assert_eq!(handshakes.len(), 1, "expected exactly one handshake");
+    match handshakes.into_iter().next().unwrap() {
+        Handshake::Stale { handle, port } => (handle, port),
+        Handshake::Pending { port, .. } => panic!("expected a stale handshake on port {port}, got a pending one"),
+    }
+}
+
+/// Manufacture a socket that left `Listen` with no peer left to answer: a SYN,
+/// then a direct `abort()` that no driver path performs, then the poll on which
+/// smoltcp sends its RST and clears the 4-tuple. The RST is left undrained.
+fn peerless(stack: &mut SocketStack) -> SocketHandle {
+    stack.ensure_listener(80);
+    stack.enqueue_rx(syn(client(), dest(), 1000));
+    stack.poll(t(0));
+    let handle = stack.listeners[0].handle;
+    stack.socket_mut(handle).abort();
+    stack.poll(t(1));
+    handle
+}
+
 /// Drive a listener on port 80 to `SynReceived` and return its handle. The tx
 /// queue is left untouched — the caller decides what it should hold.
 /// A listener is created paused, so nothing has been emitted yet.
@@ -342,4 +364,45 @@ fn refuse_rearms_the_listener() {
 
     let (_, port, src, dst) = one_pending(stack.take_handshakes());
     assert_eq!((port, src, dst), (80, client(), dest()));
+}
+
+#[skuld::test]
+fn a_stale_handshake_is_discarded_without_a_packet() {
+    let mut stack = stack();
+    let handle = peerless(&mut stack);
+
+    let out = tcp_out(&mut stack);
+    assert_eq!(out.len(), 1);
+    assert_eq!(out[0].control, TcpControl::Rst);
+
+    assert_eq!(one_stale(stack.take_handshakes()), (handle, 80));
+
+    stack.discard(handle, 80);
+    stack.poll(t(2));
+    assert!(tcp_out(&mut stack).is_empty());
+}
+
+#[skuld::test]
+fn a_stale_handshake_rearms_the_listener() {
+    let mut stack = stack();
+    let handle = peerless(&mut stack);
+    let _ = tcp_out(&mut stack);
+    let (_, port) = one_stale(stack.take_handshakes());
+
+    stack.discard(handle, port);
+    stack.poll(t(2));
+    let _ = tcp_out(&mut stack);
+
+    stack.enqueue_rx(syn(client(), dest(), 2000));
+    stack.poll(t(3));
+
+    let (_, port, src, dst) = one_pending(stack.take_handshakes());
+    assert_eq!((port, src, dst), (80, client(), dest()));
+}
+
+#[skuld::test]
+fn take_handshakes_classifies_a_tupleless_socket_as_stale() {
+    let mut stack = stack();
+    let handle = peerless(&mut stack);
+    assert_eq!(one_stale(stack.take_handshakes()), (handle, 80));
 }

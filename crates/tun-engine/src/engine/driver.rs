@@ -190,9 +190,11 @@ impl Driver {
         for handshake in self.stack.take_handshakes() {
             let (handle, port, src, dst) = match handshake {
                 Handshake::Pending { handle, port, src, dst } => (handle, port, src, dst),
+                // A contract branch: `take_handshakes` classifies on an Option pair
+                // the type system does not narrow.
                 Handshake::Stale { handle, port } => {
                     warn!("accepted TCP connection with no endpoint on port {port}");
-                    self.stack.refuse(handle, port);
+                    self.stack.discard(handle, port);
                     continue;
                 }
             };
