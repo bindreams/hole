@@ -10,8 +10,12 @@
 //! 3. **Reachability** — `FilterAction::Bypass` + IPv6 destination +
 //!    upstream interface has no IPv6. This is just "we can't deliver it."
 //!
-//! The [`Endpoint`] impl drops the flow (smoltcp emits RST for TCP, the
-//! UDP flow's idle sweep evicts for UDP). Diagnostic logging is exposed
+//! The [`Endpoint`] impl drops the flow (the driver closes the TCP socket
+//! with a graceful FIN, the UDP flow's idle sweep evicts for UDP).
+//!
+//! Reason 1 does **not** reach this file: `resolve_endpoint` maps
+//! `FilterAction::Block` to `Dispatch::Drop`, which the router carries out
+//! inline. Diagnostic logging is exposed
 //! via dedicated methods ([`BlockEndpoint::log_rule_block_tcp`],
 //! [`BlockEndpoint::log_rule_block_udp`],
 //! [`BlockEndpoint::log_udp_proxy_unavailable`],
@@ -110,10 +114,11 @@ impl Default for BlockEndpoint {
 #[async_trait]
 impl Endpoint for BlockEndpoint {
     async fn serve_tcp(&self, _flow: &mut TcpFlow, _dst: SocketAddr) -> io::Result<()> {
-        // Drop — smoltcp sends RST as `flow` goes out of scope up the
-        // call chain. Logging happens on the router side via the
-        // `log_*` methods above, because the router has the decision
-        // context (rule_index, reason).
+        // Drop. As `flow` goes out of scope up the call chain the handler
+        // channel closes and the driver's `Disconnected` arm calls
+        // `socket.close()` — a graceful FIN, not an RST. Logging happens on
+        // the router side via the `log_*` methods above, because the router
+        // has the decision context (rule_index, reason).
         Ok(())
     }
 

@@ -22,6 +22,17 @@
 //! `cfg(target_os = "windows")` + `labels = [TUN]` because macOS CI does
 //! not run elevated and spawning an elevated child from an unelevated
 //! test binary would fail on both OSes.
+//!
+//! Two of the Full-mode tests prove tunnel *transit* — they dial
+//! [`crate::test_support::net_discovery::UNOWNED_DST`], which nothing but the
+//! in-TUN smoltcp stack can answer. The `_local_networking_intact` pair does
+//! not: it dials an address the host holds, reached over the host's own
+//! on-link `/32`, so the packet never enters `hole-tun`.
+//!
+//! None of these are vacuous for the `cfg(not(test))` dispatcher
+//! substitution's sake: `DistHarness` runs `hole bridge run` as a real
+//! subprocess from a staged dist directory, an ordinary non-`cfg(test)` build
+//! where driver, device and dispatcher are all compiled in.
 
 use crate::test_support::dist_fixture::*;
 use crate::test_support::dist_harness::DistHarness;
@@ -495,15 +506,17 @@ fn e2e_socks_only_leaves_unowned_destination_unreachable(
 
 // TUN matrix (Windows admin only) =====================================================================================
 
+/// COUPLED NAMES: every test in here must be named `e2e_…full_tunnel…`.
+/// `.config/nextest.toml`'s `global-net-state` filter selects them by that
+/// shape — skuld gives libtest the bare function name, so there is no module
+/// path to anchor on. A member that drops the shape silently leaves the group
+/// and races the tun-engine WFP tests on global OS state.
 #[cfg(target_os = "windows")]
 mod tun {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    /// TUN tests exercise the bridge's transparent-proxy path: the test
-    /// connects directly to the HTTP target's primary non-loopback IPv4
-    /// address, and the TUN split routes catch that traffic and tunnel it
-    /// through the shadowsocks server.
+    /// Fetch the sentinel over a plain TCP connect, with no proxy configured.
     ///
     /// Loopback stays reachable throughout: the test's shadowsocks server is
     /// loopback-bound, and the bridge installs no gateway bypass for a loopback
@@ -520,13 +533,23 @@ mod tun {
         response
     }
 
-    async fn run_full_tunnel_e2e(dist: &Path, ss: &SsServerHandle, http: &HttpTarget) {
+    /// Start a bridge in Full mode and prove the host's own primary IPv4 is
+    /// still reachable, with the sentinel body coming back over that path.
+    ///
+    /// Not transit coverage. The host holds that address and reaches it over
+    /// its own on-link `/32`, which beats the bridge's `0.0.0.0/1` split on
+    /// longest-prefix match, so the packet never reaches `hole-tun` — which is
+    /// also why the catch-all Block rules below cannot fire on it, and why no
+    /// companion `Bypass` rule is added (a rule that can never match would only
+    /// mislead). For transit see
+    /// [`e2e_none_full_tunnel_captures_unowned_destination`].
+    async fn run_full_tunnel_local_networking_e2e(dist: &Path, ss: &SsServerHandle, http: &HttpTarget) {
         let local_port = allocate_ephemeral_port(Protocols::TCP | Protocols::UDP).await;
         let config = ProxyConfig {
             server: entry_from(ss),
             local_port,
             tunnel_mode: TunnelMode::Full,
-            filters: vec![],
+            filters: block_every_in_tun_flow(),
             dns: hole_common::config::DnsConfig {
                 enabled: false,
                 ..hole_common::config::DnsConfig::default()
@@ -548,10 +571,8 @@ mod tun {
             .expect("send Start");
         assert!(matches!(resp, BridgeResponse::Ack), "expected Ack, got {resp:?}");
 
-        // Direct TCP to `http.addr` (the primary non-loopback IPv4) —
-        // traffic caught by the TUN split routes, tunneled through
-        // shadowsocks, and delivered to the HTTP target. This
-        // exercises the transparent-proxy path.
+        // Direct TCP to `http.addr`, the host's own primary non-loopback
+        // IPv4. Delivered locally by the host stack, not through the tunnel.
         let response = direct_http_get(http.addr).await;
         let body = http_response_body(&response).expect("HTTP response has header terminator");
         assert_eq!(
@@ -564,40 +585,41 @@ mod tun {
         assert!(matches!(resp, BridgeResponse::Ack), "expected Ack, got {resp:?}");
     }
 
-    /// Test 5: Full mode (TUN + routing), no plugin. Requires Windows
-    /// admin. TUN tests are serial because they all bind the hardcoded
-    /// `hole-tun` device name.
+    /// Test 5: Full mode (TUN + routing), no plugin. Requires Windows admin.
     ///
-    /// COUPLED NAME: the `_full_tunnel_roundtrip` suffix is the literal substring
-    /// `.config/nextest.toml`'s `global-net-state` filter matches to serialize
-    /// this live-egress e2e against tun-engine's system-wide WFP lockdown test
-    /// across binaries. Renaming the suffix without updating that filter drops
-    /// this test from the group → cross-binary data race.
+    /// Proves exactly three things: Full mode starts under elevation; the
+    /// host's own primary IPv4 stays reachable throughout; the sentinel body
+    /// comes back over that local path. It is not transit coverage — see
+    /// [`run_full_tunnel_local_networking_e2e`].
+    ///
+    /// Serial because every TUN test binds the hardcoded `hole-tun` device
+    /// name. Cross-binary thread budget comes from `.config/nextest.toml`'s
+    /// `global-net-state` group — see the note on this module.
     #[skuld::test(labels = [DIST_BIN, TUN], serial = TUN)]
-    fn e2e_none_full_tunnel_roundtrip(
+    fn e2e_none_full_tunnel_local_networking_intact(
         #[fixture(dist_dir)] dist: &Path,
         #[fixture(ssserver_none)] ss: &SsServerHandle,
         #[fixture(http_target_ipv4)] http: &HttpTarget,
     ) {
-        rt().block_on(run_full_tunnel_e2e(dist, ss, http));
+        rt().block_on(run_full_tunnel_local_networking_e2e(dist, ss, http));
     }
 
-    /// Test 6: Full mode with galoshes (websocket). Windows-admin only — the
-    /// enclosing `mod tun` is `cfg(target_os = "windows")` and TUN needs elevation.
+    /// Test 6: the same local-networking proof with a galoshes (websocket)
+    /// chain configured. Windows-admin only — the enclosing `mod tun` is
+    /// `cfg(target_os = "windows")` and TUN needs elevation.
     ///
-    /// Regression for bindreams/hole#541: this used to hang only when run after
-    /// `e2e_none_full_tunnel_roundtrip`. That test's loopback-bound server made
-    /// the prior bridge install a `127.0.0.1/32 → gateway` bypass route, which
-    /// hijacked all loopback to the gateway and black-holed this test's
-    /// galoshes-server fixture readiness self-probe (a loopback connect). Fixed
-    /// by never bypassing a loopback server (`tun_engine::routing`).
+    /// This runs after its `_none_` sibling, and that ordering is why the
+    /// bridge must never bypass a loopback server: the sibling's
+    /// loopback-bound server would leave a `127.0.0.1/32 → gateway` route
+    /// behind, hijacking all loopback and black-holing this test's
+    /// galoshes-server readiness self-probe.
     #[skuld::test(labels = [DIST_BIN, PORT_ALLOC, TUN], serial = TUN)]
-    fn e2e_ws_full_tunnel_roundtrip(
+    fn e2e_ws_full_tunnel_local_networking_intact(
         #[fixture(dist_dir)] dist: &Path,
         #[fixture(ssserver_ws)] ss: &SsServerHandle,
         #[fixture(http_target_ipv4)] http: &HttpTarget,
     ) {
-        rt().block_on(run_full_tunnel_e2e(dist, ss, http));
+        rt().block_on(run_full_tunnel_local_networking_e2e(dist, ss, http));
     }
 
     /// Full mode, no plugin: a SYN to a destination this host does not hold
