@@ -733,13 +733,26 @@ impl Drop for EscapeGuard {
 
 // The four-phase test =================================================================================================
 
-fn run_live_tun_permit_core(dev1: LiveTun, dev2: LiveTun) {
+// `open_pair` is taken as a parameter, not called directly, so this function
+// (unlike its callers below) stays free of any `#[cfg(target_os = ...)]` —
+// `open_pair` itself only exists under `windows`/`macos`, and this module is
+// gated only by `#[cfg(test)]` (see `failclosed.rs`), so it's typechecked on
+// every platform including the unsupported ones.
+fn run_live_tun_permit_core(open_pair: impl FnOnce() -> (LiveTun, LiveTun)) {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .expect("HARNESS: build tokio runtime");
 
     rt.block_on(async move {
+        // `open_pair` must run inside this `block_on`: on Unix, `tun`'s
+        // `AsyncDevice` registers its fd with whatever reactor is entered at
+        // construction, and panics ("no reactor running") with none entered.
+        // Calling it here also keeps device construction on the SAME runtime
+        // instance that later drives `.recv()` — a different runtime's
+        // reactor wouldn't be the one polling these fds.
+        let (dev1, dev2) = open_pair();
+
         // Escape guard + recovery record BEFORE anything is engaged (F8).
         let guard = EscapeGuard::new();
         let resolver = SystemLuidResolver;
@@ -903,8 +916,7 @@ fn run_live_tun_permit_core(dev1: LiveTun, dev2: LiveTun) {
 #[cfg(target_os = "windows")]
 #[skuld::test(labels = [TUN], serial = TUN)]
 fn windows_live_tun_permit_passes_traffic_on_the_interface_it_names() {
-    let (dev1, dev2) = open_pair();
-    run_live_tun_permit_core(dev1, dev2);
+    run_live_tun_permit_core(open_pair);
 }
 
 /// macOS: see the module doc for the four-phase shape and the anti-vacuity
@@ -916,6 +928,5 @@ fn windows_live_tun_permit_passes_traffic_on_the_interface_it_names() {
 #[cfg(target_os = "macos")]
 #[skuld::test(labels = [TUN], serial = TUN)]
 fn macos_live_tun_permit_passes_traffic_on_the_interface_it_names() {
-    let (dev1, dev2) = open_pair();
-    run_live_tun_permit_core(dev1, dev2);
+    run_live_tun_permit_core(open_pair);
 }
