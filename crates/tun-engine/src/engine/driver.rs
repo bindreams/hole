@@ -394,9 +394,7 @@ impl Driver {
             _ => return false,
         };
 
-        let payload_start = parsed.payload_offset.min(packet.len());
-        let payload_end = (parsed.payload_offset + parsed.payload_len).min(packet.len());
-        let payload = &packet[payload_start..payload_end];
+        let payload = parsed.payload;
 
         // Port-53 DNS interception.
         if parsed.dst.port() == 53 {
@@ -437,6 +435,7 @@ impl Driver {
             src: parsed.src,
             dst: parsed.dst,
         };
+        let dst = parsed.dst;
         let router = Arc::clone(&self.router);
         let cancel = self.cancel.clone();
         tokio::spawn(async move {
@@ -446,7 +445,7 @@ impl Driver {
                 r = router.route_udp(meta, flow) => r,
             };
             if let Err(e) = result {
-                debug!("UDP Router error for {}: {e}", parsed.dst);
+                debug!("UDP Router error for {}: {e}", dst);
             }
         });
 

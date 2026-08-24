@@ -2,10 +2,21 @@
 //!
 //! Every packet the TUN delivers passes through here before the driver
 //! loop does anything else with it, so these functions are hostile-input
-//! surface: an out-of-bounds read panics the driver task and silently
-//! stops the tunnel.
+//! surface. Header fields are read through smoltcp's checked wire types
+//! (`Ipv4Packet::new_checked` and friends), which reject a packet whose
+//! declared lengths don't fit the buffer before any accessor is allowed to
+//! run — so `ParsedPacket::payload` is bounded by construction, not by a
+//! check a caller has to remember to add.
 
 use std::net::{IpAddr, SocketAddr};
+
+use smoltcp::wire::{IpProtocol, Ipv4Packet, Ipv6Packet, TcpPacket, UdpPacket};
+
+/// Minimum IPv4 header length, and the minimum legal value of the IHL field
+/// scaled to bytes. A smaller IHL puts the L4 header inside the IP header.
+const IPV4_MIN_HEADER: usize = 20;
+/// Fixed IPv6 header length; extension headers are not walked.
+const IPV6_HEADER: usize = 40;
 
 pub(crate) fn parse_ip_dst(packet: &[u8]) -> Option<(u16, IpProto)> {
     if packet.is_empty() {
@@ -26,10 +37,13 @@ pub(crate) enum IpProto {
 }
 
 fn parse_ipv4_dst(packet: &[u8]) -> Option<(u16, IpProto)> {
-    if packet.len() < 20 {
+    if packet.len() < IPV4_MIN_HEADER {
         return None;
     }
     let ihl = ((packet[0] & 0x0f) as usize) * 4;
+    if ihl < IPV4_MIN_HEADER {
+        return None;
+    }
     let protocol = packet[9];
     if packet.len() < ihl + 4 {
         return None;
@@ -43,7 +57,7 @@ fn parse_ipv4_dst(packet: &[u8]) -> Option<(u16, IpProto)> {
 }
 
 fn parse_ipv6_dst(packet: &[u8]) -> Option<(u16, IpProto)> {
-    if packet.len() < 40 + 4 {
+    if packet.len() < IPV6_HEADER + 4 {
         return None;
     }
     let next_header = packet[6];
@@ -55,15 +69,19 @@ fn parse_ipv6_dst(packet: &[u8]) -> Option<(u16, IpProto)> {
     }
 }
 
-pub(crate) struct ParsedPacket {
+/// A parsed packet's flow key and L4 payload.
+///
+/// `payload` is sliced from the buffer given to `parse_ip_packet_full` by
+/// smoltcp's checked wire types, so `payload.len() + payload's start offset`
+/// is always within that buffer — callers need no clamp of their own.
+pub(crate) struct ParsedPacket<'a> {
     pub(crate) src: SocketAddr,
     pub(crate) dst: SocketAddr,
     pub(crate) proto: IpProto,
-    pub(crate) payload_offset: usize,
-    pub(crate) payload_len: usize,
+    pub(crate) payload: &'a [u8],
 }
 
-pub(crate) fn parse_ip_packet_full(packet: &[u8]) -> Option<ParsedPacket> {
+pub(crate) fn parse_ip_packet_full(packet: &[u8]) -> Option<ParsedPacket<'_>> {
     if packet.is_empty() {
         return None;
     }
@@ -75,88 +93,45 @@ pub(crate) fn parse_ip_packet_full(packet: &[u8]) -> Option<ParsedPacket> {
     }
 }
 
-fn parse_ipv4_full(packet: &[u8]) -> Option<ParsedPacket> {
-    if packet.len() < 20 {
-        return None;
-    }
-    let ihl = ((packet[0] & 0x0f) as usize) * 4;
-    let protocol = packet[9];
-    let total_len = u16::from_be_bytes([packet[2], packet[3]]) as usize;
+fn parse_ipv4_full(packet: &[u8]) -> Option<ParsedPacket<'_>> {
+    let ip = Ipv4Packet::new_checked(packet).ok()?;
+    let src_ip = IpAddr::V4(ip.src_addr());
+    let dst_ip = IpAddr::V4(ip.dst_addr());
+    let proto = ip.next_header();
+    parse_l4(proto, src_ip, dst_ip, ip.payload())
+}
 
-    if packet.len() < ihl + 8 || total_len < ihl + 8 {
-        return None;
-    }
+fn parse_ipv6_full(packet: &[u8]) -> Option<ParsedPacket<'_>> {
+    let ip = Ipv6Packet::new_checked(packet).ok()?;
+    let src_ip = IpAddr::V6(ip.src_addr());
+    let dst_ip = IpAddr::V6(ip.dst_addr());
+    let proto = ip.next_header();
+    parse_l4(proto, src_ip, dst_ip, ip.payload())
+}
 
-    let proto = match protocol {
-        6 => IpProto::Tcp,
-        17 => IpProto::Udp,
+/// Parse the TCP/UDP header out of an IP payload already bounded to the IP
+/// header's own declared length (`Ipv4Packet`/`Ipv6Packet::payload()`).
+fn parse_l4(proto: IpProtocol, src_ip: IpAddr, dst_ip: IpAddr, l4: &[u8]) -> Option<ParsedPacket<'_>> {
+    let (proto, src_port, dst_port, payload) = match proto {
+        IpProtocol::Tcp => {
+            let tcp = TcpPacket::new_checked(l4).ok()?;
+            (IpProto::Tcp, tcp.src_port(), tcp.dst_port(), tcp.payload())
+        }
+        IpProtocol::Udp => {
+            let udp = UdpPacket::new_checked(l4).ok()?;
+            (IpProto::Udp, udp.src_port(), udp.dst_port(), udp.payload())
+        }
         _ => return None,
-    };
-
-    let src_ip = IpAddr::V4(std::net::Ipv4Addr::new(packet[12], packet[13], packet[14], packet[15]));
-    let dst_ip = IpAddr::V4(std::net::Ipv4Addr::new(packet[16], packet[17], packet[18], packet[19]));
-    let src_port = u16::from_be_bytes([packet[ihl], packet[ihl + 1]]);
-    let dst_port = u16::from_be_bytes([packet[ihl + 2], packet[ihl + 3]]);
-
-    let (payload_offset, payload_len) = if proto == IpProto::Udp {
-        let udp_len = u16::from_be_bytes([packet[ihl + 4], packet[ihl + 5]]) as usize;
-        let hdr = 8;
-        (ihl + hdr, udp_len.saturating_sub(hdr))
-    } else {
-        let data_offset = ((packet[ihl + 12] >> 4) as usize) * 4;
-        let tcp_payload = total_len.saturating_sub(ihl + data_offset);
-        (ihl + data_offset, tcp_payload)
     };
 
     Some(ParsedPacket {
         src: SocketAddr::new(src_ip, src_port),
         dst: SocketAddr::new(dst_ip, dst_port),
         proto,
-        payload_offset,
-        payload_len,
+        payload,
     })
 }
 
-fn parse_ipv6_full(packet: &[u8]) -> Option<ParsedPacket> {
-    if packet.len() < 48 {
-        return None;
-    }
-    let next_header = packet[6];
-    let payload_length = u16::from_be_bytes([packet[4], packet[5]]) as usize;
-
-    let proto = match next_header {
-        6 => IpProto::Tcp,
-        17 => IpProto::Udp,
-        _ => return None,
-    };
-
-    let mut src_octets = [0u8; 16];
-    src_octets.copy_from_slice(&packet[8..24]);
-    let mut dst_octets = [0u8; 16];
-    dst_octets.copy_from_slice(&packet[24..40]);
-
-    let src_ip = IpAddr::V6(std::net::Ipv6Addr::from(src_octets));
-    let dst_ip = IpAddr::V6(std::net::Ipv6Addr::from(dst_octets));
-
-    let l4_start = 40;
-    let src_port = u16::from_be_bytes([packet[l4_start], packet[l4_start + 1]]);
-    let dst_port = u16::from_be_bytes([packet[l4_start + 2], packet[l4_start + 3]]);
-
-    let (payload_offset, payload_len) = if proto == IpProto::Udp {
-        let udp_len = u16::from_be_bytes([packet[l4_start + 4], packet[l4_start + 5]]) as usize;
-        let hdr = 8;
-        (l4_start + hdr, udp_len.saturating_sub(hdr))
-    } else {
-        let data_offset = ((packet[l4_start + 12] >> 4) as usize) * 4;
-        let tcp_payload = payload_length.saturating_sub(data_offset);
-        (l4_start + data_offset, tcp_payload)
-    };
-
-    Some(ParsedPacket {
-        src: SocketAddr::new(src_ip, src_port),
-        dst: SocketAddr::new(dst_ip, dst_port),
-        proto,
-        payload_offset,
-        payload_len,
-    })
-}
+#[cfg(test)]
+#[path = "parse_tests.rs"]
+mod parse_tests;
