@@ -14,7 +14,6 @@ use std::time::Instant as StdInstant;
 
 use smoltcp::iface::SocketHandle;
 use smoltcp::phy::ChecksumCapabilities;
-use smoltcp::socket::tcp;
 use smoltcp::time::Instant as SmoltcpInstant;
 use smoltcp::wire::{IpAddress, IpProtocol, Ipv4Packet, Ipv4Repr, Ipv6Packet, Ipv6Repr, UdpPacket, UdpRepr};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -26,7 +25,7 @@ use super::admission::{decide_admission, Admission};
 use super::config::EngineConfig;
 use super::dns::DnsInterceptor;
 use super::router::{Router, TcpMeta, UdpMeta};
-use super::socket_stack::{Handshake, SocketStack};
+use super::socket_stack::{is_finished, Handshake, SocketStack};
 use super::tcp_flow::TcpFlow;
 use super::udp_flow::{FlowKey, FlowTable, UdpReply};
 use crate::device::DeviceConfig;
@@ -308,17 +307,14 @@ impl Driver {
             .connections
             .keys()
             .copied()
-            .filter(|&handle| {
-                matches!(
-                    self.stack.socket(handle).state(),
-                    tcp::State::Closed | tcp::State::TimeWait
-                )
-            })
+            .filter(|&handle| is_finished(self.stack.socket(handle).state()))
             .collect();
 
         for handle in finished {
+            // Dropping the entry closes the channels, which ends the router
+            // task and releases its permit.
             self.connections.remove(&handle);
-            self.stack.remove(handle);
+            self.stack.retire(handle);
         }
     }
 

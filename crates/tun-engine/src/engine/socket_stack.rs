@@ -186,10 +186,17 @@ impl SocketStack {
     pub(crate) fn socket_mut(&mut self, handle: SocketHandle) -> &mut tcp::Socket<'static> {
         self.sockets.get_mut::<tcp::Socket>(handle)
     }
+}
 
-    pub(crate) fn remove(&mut self, handle: SocketHandle) {
-        self.sockets.remove(handle);
-    }
+/// Whether smoltcp has no further use for a socket the datapath owns.
+///
+/// `Listen` belongs here because a socket in the connection map reaches it by
+/// exactly one route: the client answered our SYN-ACK with an RST, and smoltcp
+/// flipped it back without clearing the listen endpoint that would otherwise
+/// hijack every later SYN on that port. An `Established` socket that receives
+/// an RST goes to `Closed` instead, so `Listen` here is unambiguous.
+pub(crate) fn is_finished(state: tcp::State) -> bool {
+    matches!(state, tcp::State::Closed | tcp::State::TimeWait | tcp::State::Listen)
 }
 
 fn smoltcp_to_std_ip(addr: IpAddress) -> IpAddr {

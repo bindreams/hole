@@ -38,6 +38,11 @@ fn client() -> SocketAddr {
     SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5)), 40000)
 }
 
+/// A second client dialling the same destination.
+fn other_client() -> SocketAddr {
+    SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 9)), 41000)
+}
+
 /// The address the client dialled, outside the tunnel's own subnet.
 fn dest() -> SocketAddr {
     SocketAddr::new(IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)), 80)
@@ -112,6 +117,10 @@ fn ack(src: SocketAddr, dst: SocketAddr, seq: u32, ack: u32) -> Vec<u8> {
     segment(src, dst, TcpControl::None, seq, Some(ack))
 }
 
+fn rst(src: SocketAddr, dst: SocketAddr, seq: u32, ack: u32) -> Vec<u8> {
+    segment(src, dst, TcpControl::Rst, seq, Some(ack))
+}
+
 /// Drain and parse everything the stack has queued for the TUN.
 fn tcp_out(stack: &mut SocketStack) -> Vec<Segment> {
     stack.dequeue_tx().iter().map(|packet| parse_segment(packet)).collect()
@@ -180,6 +189,24 @@ fn half_open(stack: &mut SocketStack, isn: u32) -> SocketHandle {
     stack.poll(t(0));
     let (handle, port, src, dst) = one_pending(stack.take_handshakes());
     assert_eq!((port, src, dst), (80, client(), dest()));
+    handle
+}
+
+/// Drive an admitted connection to the zombie state: the client answers the
+/// SYN|ACK with an RST, and smoltcp flips the socket back to `Listen` without
+/// clearing the listen endpoint that makes it accept on port alone.
+fn revert_to_listen(stack: &mut SocketStack) -> SocketHandle {
+    let isn = 1000u32;
+    let handle = half_open(stack, isn);
+    stack.admit(handle, 80);
+    stack.poll(t(1));
+
+    let synack = tcp_out(stack);
+    assert_eq!(synack.len(), 1);
+    assert_eq!(synack[0].control, TcpControl::Syn);
+
+    stack.enqueue_rx(rst(client(), dest(), isn + 1, after(synack[0].seq)));
+    stack.poll(t(2));
     handle
 }
 
@@ -405,4 +432,65 @@ fn take_handshakes_classifies_a_tupleless_socket_as_stale() {
     let mut stack = stack();
     let handle = peerless(&mut stack);
     assert_eq!(one_stale(stack.take_handshakes()), (handle, 80));
+}
+
+#[skuld::test]
+fn a_client_rst_after_the_synack_reverts_the_socket_to_listen() {
+    let mut stack = stack();
+    let handle = revert_to_listen(&mut stack);
+
+    assert_eq!(stack.socket(handle).state(), tcp::State::Listen);
+    assert!(stack.socket(handle).remote_endpoint().is_none());
+}
+
+/// The defect, stated as a test: the reverted socket outranks the re-armed
+/// listener and swallows the next client's SYN, which no accept path can see.
+#[skuld::test]
+fn a_reverted_socket_would_hijack_a_later_syn() {
+    let mut stack = stack();
+    let reverted = revert_to_listen(&mut stack);
+
+    let order: Vec<SocketHandle> = stack.sockets.iter().map(|(handle, _)| handle).collect();
+    assert_eq!(order.len(), 2);
+    assert_eq!(order[0], reverted);
+
+    stack.enqueue_rx(syn(other_client(), dest(), 5000));
+    stack.poll(t(3));
+
+    assert!(stack.take_handshakes().is_empty());
+}
+
+#[skuld::test]
+fn a_reverted_socket_is_retired_and_stops_hijacking() {
+    let mut stack = stack();
+    let reverted = revert_to_listen(&mut stack);
+
+    stack.retire(reverted);
+    stack.poll(t(3));
+    assert!(!stack.sockets.iter().any(|(handle, _)| handle == reverted));
+
+    stack.enqueue_rx(syn(other_client(), dest(), 5000));
+    stack.poll(t(4));
+
+    let (_, port, src, dst) = one_pending(stack.take_handshakes());
+    assert_eq!((port, src, dst), (80, other_client(), dest()));
+}
+
+#[skuld::test]
+fn is_finished_covers_closed_timewait_and_listen() {
+    for state in [tcp::State::Closed, tcp::State::TimeWait, tcp::State::Listen] {
+        assert!(is_finished(state), "{state} is finished with its peer");
+    }
+    for state in [
+        tcp::State::SynSent,
+        tcp::State::SynReceived,
+        tcp::State::Established,
+        tcp::State::FinWait1,
+        tcp::State::FinWait2,
+        tcp::State::Closing,
+        tcp::State::CloseWait,
+        tcp::State::LastAck,
+    ] {
+        assert!(!is_finished(state), "{state} still has a peer");
+    }
 }
