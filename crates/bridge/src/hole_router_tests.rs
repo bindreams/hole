@@ -104,9 +104,15 @@ enum DnsExpectedEndpoint {
 fn classify(d: Dispatch<'_>, router: &HoleRouter) -> ExpectedEndpoint {
     match d {
         Dispatch::Endpoint(e) => {
-            if std::ptr::eq(e as *const _ as *const (), &router.proxy as *const _ as *const ()) {
+            if std::ptr::eq(
+                e as *const _ as *const (),
+                router.proxy.as_ref() as *const _ as *const (),
+            ) {
                 ExpectedEndpoint::Proxy
-            } else if std::ptr::eq(e as *const _ as *const (), &router.bypass as *const _ as *const ()) {
+            } else if std::ptr::eq(
+                e as *const _ as *const (),
+                router.bypass.as_ref() as *const _ as *const (),
+            ) {
                 ExpectedEndpoint::Bypass
             } else {
                 panic!("resolve_endpoint returned an unknown &dyn Endpoint")
@@ -126,9 +132,15 @@ fn classify(d: Dispatch<'_>, router: &HoleRouter) -> ExpectedEndpoint {
 fn classify_with_dns(d: Dispatch<'_>, router: &HoleRouter) -> DnsExpectedEndpoint {
     match d {
         Dispatch::Endpoint(e) => {
-            if std::ptr::eq(e as *const _ as *const (), &router.proxy as *const _ as *const ()) {
+            if std::ptr::eq(
+                e as *const _ as *const (),
+                router.proxy.as_ref() as *const _ as *const (),
+            ) {
                 DnsExpectedEndpoint::Proxy
-            } else if std::ptr::eq(e as *const _ as *const (), &router.bypass as *const _ as *const ()) {
+            } else if std::ptr::eq(
+                e as *const _ as *const (),
+                router.bypass.as_ref() as *const _ as *const (),
+            ) {
                 DnsExpectedEndpoint::Bypass
             } else {
                 DnsExpectedEndpoint::LocalDns

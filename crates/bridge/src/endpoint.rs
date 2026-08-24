@@ -11,6 +11,12 @@
 //! flow is served by nothing and only recorded, on
 //! [`crate::drop_sink::DropSink`].
 //!
+//! Tests wire any mechanism to any slot through
+//! [`HoleRouter::with_endpoints`](crate::hole_router::HoleRouter::with_endpoints),
+//! substituting `mock::MockEndpoint` for the served slots and
+//! `crate::drop_sink::recording::RecordingDropSink` for the drop slot.
+//! Both are `cfg(test)`, so neither is linked into a production build.
+//!
 //! ## UDP-drop privacy invariant
 //!
 //! UDP flows that resolve to `Proxy` but can't be proxied (TCP-only
@@ -19,6 +25,8 @@
 
 pub mod interface;
 pub mod local_dns;
+#[cfg(test)]
+pub mod mock;
 pub mod socks5;
 
 use std::io;
@@ -66,4 +74,12 @@ pub trait Endpoint: Send + Sync {
     /// `"interface(#5)"`). Backed by the endpoint's own storage — no
     /// allocation per call.
     fn name(&self) -> &str;
+
+    /// Name of the plugin backing this mechanism, when one is configured.
+    /// The router reads it off the proxy slot for the `plugin` field of
+    /// the UDP-proxy-unavailable drop record. Mechanisms that have no
+    /// plugin keep the default.
+    fn plugin_name(&self) -> Option<&str> {
+        None
+    }
 }

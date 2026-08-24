@@ -20,6 +20,8 @@
 
 pub mod block_log;
 pub mod logging;
+#[cfg(test)]
+pub mod recording;
 
 use std::net::SocketAddr;
 

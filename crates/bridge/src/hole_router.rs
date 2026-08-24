@@ -64,25 +64,19 @@ const PEEK_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(100);
 // HoleRouter ==========================================================================================================
 
 pub struct HoleRouter {
-    proxy: Socks5Endpoint,
-    bypass: InterfaceEndpoint,
+    proxy: Box<dyn Endpoint>,
+    bypass: Box<dyn Endpoint>,
     drops: Box<dyn DropSink>,
     /// Optional in-tunnel DNS interceptor. When `Some`, the cascade diverts
     /// UDP/53 flows to this endpoint instead of the proxy; `is_some()` is the
     /// sole gate. `None` disables interception (DNS disabled or SocksOnly mode).
-    local_dns: Option<LocalDnsEndpoint>,
+    local_dns: Option<Box<dyn Endpoint>>,
     rules: Arc<ArcSwap<RuleSet>>,
 }
 
 impl HoleRouter {
     pub fn new(proxy: Socks5Endpoint, bypass: InterfaceEndpoint, drops: LoggingDropSink, rules: RuleSet) -> Self {
-        Self {
-            proxy,
-            bypass,
-            drops: Box::new(drops),
-            local_dns: None,
-            rules: Arc::new(ArcSwap::from_pointee(rules)),
-        }
+        Self::with_endpoints(Box::new(proxy), Box::new(bypass), Box::new(drops), None, rules)
     }
 
     /// Construct with an in-tunnel DNS interceptor attached. When
@@ -95,10 +89,31 @@ impl HoleRouter {
         local_dns: Option<LocalDnsEndpoint>,
         rules: RuleSet,
     ) -> Self {
+        Self::with_endpoints(
+            Box::new(proxy),
+            Box::new(bypass),
+            Box::new(drops),
+            local_dns.map(|e| Box::new(e) as Box<dyn Endpoint>),
+            rules,
+        )
+    }
+
+    /// Construct over the slots directly, so a caller can put any
+    /// mechanism in any slot. The production constructors above are thin
+    /// wrappers; this is the seam tests use to substitute doubles for
+    /// `Socks5Endpoint` and `InterfaceEndpoint`, both of which dial real
+    /// sockets, and for `LoggingDropSink`, whose only output is a log line.
+    pub fn with_endpoints(
+        proxy: Box<dyn Endpoint>,
+        bypass: Box<dyn Endpoint>,
+        drops: Box<dyn DropSink>,
+        local_dns: Option<Box<dyn Endpoint>>,
+        rules: RuleSet,
+    ) -> Self {
         Self {
             proxy,
             bypass,
-            drops: Box::new(drops),
+            drops,
             local_dns,
             rules: Arc::new(ArcSwap::from_pointee(rules)),
         }
@@ -155,7 +170,7 @@ impl HoleRouter {
         // Block/Bypass/Proxy (e.g. a user rule `Block 8.8.8.8` still sends
         // Chrome's hardcoded-DoH DNS through the local forwarder).
         if l4 == L4Proto::Udp && dst.port() == 53 {
-            if let Some(local) = self.local_dns.as_ref() {
+            if let Some(local) = self.local_dns.as_deref() {
                 return Dispatch::Endpoint(local);
             }
         }
@@ -166,13 +181,13 @@ impl HoleRouter {
                 if l4 == L4Proto::Udp && !self.proxy.supports_udp() {
                     return Dispatch::Drop(DropReason::UdpProxyUnavailable { rule_index });
                 }
-                Dispatch::Endpoint(&self.proxy)
+                Dispatch::Endpoint(self.proxy.as_ref())
             }
             FilterAction::Bypass => {
                 if dst.is_ipv6() && !self.bypass.supports_ipv6_dst() {
                     return Dispatch::Drop(DropReason::Ipv6BypassUnreachable { rule_index });
                 }
-                Dispatch::Endpoint(&self.bypass)
+                Dispatch::Endpoint(self.bypass.as_ref())
             }
             FilterAction::Block => Dispatch::Drop(DropReason::RuleBlock { rule_index }),
         }
