@@ -131,3 +131,7 @@ fn set_no_syn_retransmissions(socket: &tokio::net::TcpSocket) -> io::Result<()> 
 #[cfg(test)]
 #[path = "syn_budget_tests.rs"]
 mod syn_budget_tests;
+
+#[cfg(all(test, target_os = "windows"))]
+#[path = "syn_budget_windows_tests.rs"]
+mod syn_budget_windows_tests;
