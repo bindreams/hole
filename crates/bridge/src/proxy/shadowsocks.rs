@@ -22,6 +22,14 @@ use super::{Proxy, ProxyError, RunningProxy, TrafficTotals};
 /// a multi-thread worker, `block_in_place` releases the core first so the
 /// join does not starve the ambient runtime. See
 /// CONTRIBUTING.md#proxy-shutdown-contract for the full derivation.
+///
+/// Accepted exception to the no-failure-path guarantee: the scratch-thread
+/// `std::thread::spawn` itself can panic if the OS refuses to create a new
+/// thread (resource exhaustion). That is a whole-process condition no
+/// `Result` plumbing here would meaningfully recover from — `SsRuntime::new`
+/// just created four more OS threads moments earlier via the same
+/// allocator — and it is scoped to exactly this one syscall, not to the
+/// `drop(Runtime)` legality predicate this function exists to satisfy.
 fn join_runtime(rt: tokio::runtime::Runtime) {
     let join = move || {
         std::thread::spawn(move || drop(rt))
@@ -36,6 +44,19 @@ fn join_runtime(rt: tokio::runtime::Runtime) {
     }
 }
 
+// One dispatcher guard per `SsRuntime` worker thread, installed in
+// `on_thread_start` and cleared in `on_thread_stop` — never `mem::forget`.
+// `tracing_core::dispatcher::DefaultGuard`'s `Drop` is the only site that
+// decrements the process-global scoped-dispatcher counter; forgetting it
+// would permanently push every thread in the process onto tracing's slower,
+// thread-local-lookup path after the first proxy session, for the rest of
+// the process's life.
+#[cfg(test)]
+thread_local! {
+    static SS_TEST_TRACING_GUARD: std::cell::RefCell<Option<tracing::dispatcher::DefaultGuard>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 /// Owns the dedicated runtime a single shadowsocks server runs on.
 ///
 /// `worker_threads(4)` is a reduction from the ambient runtime's
@@ -46,25 +67,33 @@ struct SsRuntime(Option<tokio::runtime::Runtime>);
 
 impl SsRuntime {
     fn new() -> io::Result<Self> {
-        // Re-install the constructing thread's dispatcher on every worker:
-        // `set_default_in_current_thread`'s current-thread assertion can't
-        // see across this runtime boundary, so without this hand-off the ss
-        // task's tracing events would be silently dropped in tests (not in
-        // production, which installs a subscriber globally).
-        let dispatcher = tracing::dispatcher::get_default(|d| d.clone());
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .thread_name("hole-ss")
-            .worker_threads(4)
-            .on_thread_start(move || {
-                #[allow(
-                    clippy::disallowed_methods,
-                    reason = "hands the constructing thread's global dispatcher to an SsRuntime worker; not the per-test assertion target #302 guards against, see CONTRIBUTING.md#proxy-shutdown-contract"
-                )]
-                let guard = tracing::dispatcher::set_default(&dispatcher);
-                std::mem::forget(guard); // one guard per worker; the runtime owns the thread's whole life
-            })
-            .build()?;
+        let mut builder = tokio::runtime::Builder::new_multi_thread();
+        builder.enable_all().thread_name("hole-ss").worker_threads(4);
+
+        // Test-only: re-install the constructing thread's dispatcher on every
+        // worker, cleared on thread stop. `set_default_in_current_thread`'s
+        // current-thread assertion can't see across this runtime boundary,
+        // so without this hand-off the ss task's tracing events would be
+        // silently dropped in tests. Production installs a subscriber
+        // globally (`crates/common/src/logging.rs`) and needs no hand-off.
+        #[cfg(test)]
+        {
+            let dispatcher = tracing::dispatcher::get_default(|d| d.clone());
+            builder
+                .on_thread_start(move || {
+                    #[allow(
+                        clippy::disallowed_methods,
+                        reason = "hands the constructing thread's global dispatcher to an SsRuntime test worker; not the per-test assertion target #302 guards against, see CONTRIBUTING.md#proxy-shutdown-contract"
+                    )]
+                    let guard = tracing::dispatcher::set_default(&dispatcher);
+                    SS_TEST_TRACING_GUARD.with_borrow_mut(|cell| *cell = Some(guard));
+                })
+                .on_thread_stop(|| {
+                    SS_TEST_TRACING_GUARD.with_borrow_mut(|cell| cell.take());
+                });
+        }
+
+        let rt = builder.build()?;
         Ok(Self(Some(rt)))
     }
 
@@ -161,9 +190,17 @@ impl Proxy for ShadowsocksProxy {
             Ok(Ok(flow_stat)) => flow_stat,
             Ok(Err(e)) => return Err(ProxyError::Runtime(e)),
             Err(_) => {
-                return Err(ProxyError::Runtime(io::Error::other(
-                    "shadowsocks server task ended before reporting its startup result",
-                )));
+                // `tx` was dropped without sending, which only happens if the
+                // spawned task ended (almost certainly panicked) before
+                // either send point. Recover the real reason from the still-
+                // owned `handle` instead of returning a content-free message.
+                let detail = match handle.await {
+                    Ok(Ok(())) => "task returned Ok without reporting a startup result".to_string(),
+                    Ok(Err(e)) => format!("task exited with an error before reporting a startup result: {e}"),
+                    Err(e) if e.is_panic() => format!("task panicked before reporting a startup result: {e}"),
+                    Err(e) => format!("task ended before reporting a startup result: {e}"),
+                };
+                return Err(ProxyError::Runtime(io::Error::other(detail)));
             }
         };
 
