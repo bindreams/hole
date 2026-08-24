@@ -14,7 +14,7 @@ use crate::error::{CommandFailure, RouteCommandError, RoutingError};
 use crate::gateway::{get_default_gateway_info, GatewayInfo};
 
 /// Total number of routing subprocess spawns this process has performed.
-/// Incremented once per command in [`exec_one`]. Exposed so
+/// Incremented once per command executed. Exposed so
 /// `diagnostics` handlers and tests can assert the no-routing-subprocess
 /// invariant. The one-instruction `fetch_add` has negligible production
 /// cost — far below the millisecond-scale subprocess itself.
@@ -142,7 +142,8 @@ fn is_recovery_phase(phase: &str) -> bool {
 pub struct CleanupReport {
     /// Commands issued — always the full list the phase was handed.
     pub attempted: usize,
-    /// How many did not exit zero. Routinely non-zero; see [`is_recovery_phase`].
+    /// How many did not exit zero. Routinely non-zero: a cleanup phase deletes
+    /// routes that a healthy system never had.
     pub failed: usize,
 }
 
