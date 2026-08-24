@@ -28,6 +28,7 @@ pub mod finish_vendor_bump;
 pub mod galoshes;
 pub mod gen_ui_constants;
 pub mod git_util;
+pub mod global_net_state_conformance;
 pub mod golangci_lint;
 pub mod interrupt;
 pub mod manifest;
@@ -78,6 +79,9 @@ mod gen_ui_constants_tests;
 #[cfg(test)]
 #[path = "git_util_tests.rs"]
 mod git_util_tests;
+#[cfg(test)]
+#[path = "global_net_state_conformance_tests.rs"]
+mod global_net_state_conformance_tests;
 #[cfg(test)]
 #[path = "manifest_tests.rs"]
 mod manifest_tests;
