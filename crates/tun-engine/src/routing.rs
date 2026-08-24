@@ -192,19 +192,22 @@ pub(crate) fn run_capturing(
 /// instance can't damage the first's routing state). Removes the fixed-CIDR
 /// split routes (idempotent — harmless if absent); if a [`state::RouteState`]
 /// file is present in `state_dir`, also removes the server bypass route
-/// described by it; finally deletes the state file. Best-effort — all errors
-/// are logged at `warn` level and the function returns `()` (there is no
-/// meaningful caller recovery).
-pub fn recover_routes(state_dir: &Path) {
-    let intent = failclosed::lockdown_state::load_enabled(state_dir);
+/// described by it; finally deletes the state file. Route errors are
+/// best-effort and logged at `warn`.
+///
+/// Returns the standing-lockdown [`Recovery`] so the caller can record
+/// "a standing cover is live this run" — the claim that keeps the escape
+/// visible when the intent file cannot be read or repaired.
+pub fn recover_routes(state_dir: &Path) -> Recovery {
+    let intent = failclosed::lockdown_state::load_intent(state_dir);
     recover_routes_with(
         state_dir,
         run_commands,
         failclosed::recover_cover,
         intent,
-        || failclosed::lockdown_cover_present(state_dir),
+        || failclosed::lockdown_cover_presence(state_dir),
         |decision| failclosed::recover_lockdown(decision, state_dir),
-    );
+    )
 }
 
 /// What crash-recovery should do with a possibly-present standing lockdown
@@ -336,43 +339,25 @@ pub fn decide_cover_recovery(intent: failclosed::lockdown_state::Intent, presenc
     }
 }
 
-/// TEMPORARY: map today's two bools onto the new axes so `recover_routes_with`
-/// keeps compiling before the real probes land. Deleted, with
-/// `the_interim_adapter_can_never_record_an_intent`, once
-/// [`failclosed::lockdown_cover_presence`] is wired in.
-///
-/// Safe only because it can produce nothing but `On`/`Off` and `Live`/`Absent`,
-/// so `record_intent_on` is unreachable through it.
-fn interim_axes(intent: bool, present: bool) -> (failclosed::lockdown_state::Intent, CoverPresence) {
-    use failclosed::lockdown_state::Intent as I;
-    (
-        if intent { I::On } else { I::Off },
-        if present {
-            CoverPresence::Live
-        } else {
-            CoverPresence::Absent
-        },
-    )
-}
-
 /// Test seam for [`recover_routes`]: accepts an injected command runner, an
 /// injected transient-cover sweep, and the standing-lockdown reconciliation
 /// inputs (intent + presence probe + recover action) so unit tests can assert
 /// behavior without shelling out to `netsh`/`route` or touching the host
 /// firewall. Production passes `run_commands`, [`failclosed::recover_cover`],
-/// the persisted lockdown intent, [`failclosed::lockdown_cover_present`], and
+/// the classified lockdown intent, [`failclosed::lockdown_cover_presence`], and
 /// [`failclosed::recover_lockdown`].
 pub(crate) fn recover_routes_with<R, S, P, L>(
     state_dir: &Path,
     runner: R,
     sweep_cover: S,
-    lockdown_intent: bool,
+    lockdown_intent: failclosed::lockdown_state::Intent,
     lockdown_present: P,
     lockdown_recover: L,
-) where
+) -> Recovery
+where
     R: Fn(&[Vec<String>], &str) -> std::io::Result<()>,
     S: FnOnce(&Path, bool),
-    P: FnOnce() -> bool,
+    P: FnOnce() -> CoverPresence,
     L: FnOnce(CoverRecovery),
 {
     info!(state_dir = %state_dir.display(), "starting route recovery");
@@ -420,17 +405,26 @@ pub(crate) fn recover_routes_with<R, S, P, L>(
         debug!("no route-state file found, nothing to recover");
     }
 
-    // Reconcile the standing lockdown cover FIRST. `standing_held` is the
+    // Reconcile the standing lockdown cover FIRST. The presence is the
     // lockdown cover's OWN evidence (injected probe), NOT the route-state file,
     // whose lifetime is independent of the cover. Deciding/adopting before the
     // transient sweep means the subsequent sweep can be told a standing cover is
     // held and must not clobber it. The recover action keeps the host fail-closed
     // (Adopt) or disengages (Sweep).
-    let standing_held = lockdown_present();
-    let (intent, presence) = interim_axes(lockdown_intent, standing_held);
-    let decision = decide_cover_recovery(intent, presence).action;
-    let adopt = matches!(decision, CoverRecovery::Adopt);
-    lockdown_recover(decision);
+    let presence = lockdown_present();
+    let decision = decide_cover_recovery(lockdown_intent, presence);
+    // Repair BEFORE acting, so a crash in between leaves an intent that reads
+    // armed rather than one the next start would sweep on. A failed write costs
+    // the persisted preference, never the action or the escape: this run's
+    // adopted-cover claim carries the escape, and the next start re-derives the
+    // same measurement and repairs again.
+    if decision.record_intent_on {
+        if let Err(e) = failclosed::lockdown_state::set_enabled(state_dir, true, None) {
+            warn!(error = %e, "could not repair the lockdown intent over a measured live cover");
+        }
+    }
+    let adopt = matches!(decision.action, CoverRecovery::Adopt);
+    lockdown_recover(decision.action);
 
     // Sweep any transient fail-closed cover left by a crashed update cutover.
     // Runs UNCONDITIONALLY (outside the route-state guard above): a crash can
@@ -440,10 +434,12 @@ pub(crate) fn recover_routes_with<R, S, P, L>(
     // — and the sweep is idempotent when no cover is present. When a standing
     // lockdown cover is being adopted, the sweep must leave the lockdown ruleset
     // untouched (macOS: skip the `pfctl -f /etc/pf.conf` reload that would wipe
-    // it) — passed as `adopt`. Note this is `adopt`, NOT `standing_held`: on a
+    // it) — passed as `adopt`. Note this is `adopt`, NOT the raw presence: on a
     // Sweep (intent off, cover present) the standing ruleset is being torn down,
     // so the transient restore SHOULD run.
     sweep_cover(state_dir, adopt);
+
+    decision
 }
 
 // Routing trait =======================================================================================================

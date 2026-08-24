@@ -4732,3 +4732,145 @@ mod self_test {
         });
     }
 }
+
+// Adopted-cover claim (#881) ==========================================================================================
+//
+// Startup recovery can find a standing cover live while `bridge-lockdown.json`
+// is missing or unreadable. `set_standing_cover_adopted` carries that measured
+// fact through the run so neither the tray's escape nor the connect path
+// depends on the file.
+
+#[skuld::test]
+fn lockdown_enabled_reports_armed_when_the_intent_file_is_unreadable() {
+    // Losing the record is not the user telling us to disarm, so the tray keeps
+    // rendering Lockdown: On and keeps the Unblock item on the menu.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join(lockdown_state::STATE_FILE_NAME), b"{corrupt").unwrap();
+    let routing = MockRouting::new(dir.path().to_path_buf());
+    let pm = ProxyManager::new(MockProxy::new(), routing).with_state_dir(dir.path().to_path_buf());
+
+    assert!(pm.lockdown_enabled(), "a corrupt intent must read as ARMED");
+    assert!(
+        !pm.standing_cover_expected(),
+        "but it must NOT be taken as authority to install a standing cover"
+    );
+}
+
+#[skuld::test]
+fn a_corrupt_intent_file_still_engages_the_transient_cover() {
+    // The fail-safe direction: block early rather than skip the transient cover
+    // for a standing cover that only arrives after routing.install.
+    rt().block_on(async {
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let closed = probe.local_addr().unwrap();
+        drop(probe);
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(lockdown_state::STATE_FILE_NAME), b"{corrupt").unwrap();
+        let routing = MockRouting::new(dir.path().to_path_buf());
+        let st = routing.state();
+        let mut pm = ProxyManager::new(MockProxy::new(), routing).with_state_dir(dir.path().to_path_buf());
+        let mut cfg = test_config();
+        cfg.server.server = closed.ip().to_string();
+        cfg.server.server_port = closed.port();
+        cfg.dns.enabled = true;
+        cfg.dns.servers = vec!["127.0.0.1".parse().unwrap()];
+
+        pm.start_cancellable(&cfg, true, CancellationToken::new())
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            st.cover_engage_calls.load(Ordering::SeqCst),
+            1,
+            "a covered start over a corrupt intent must engage the transient cover"
+        );
+        assert_eq!(
+            st.lockdown_engage_calls.load(Ordering::SeqCst),
+            0,
+            "and must not install a standing cover off an unreadable record"
+        );
+        assert!(pm.blocked_until_connected());
+        assert!(pm.lockdown_enabled(), "the escape stays offered throughout");
+    });
+}
+
+#[skuld::test]
+fn an_adopted_cover_makes_the_connect_path_expect_a_standing_cover() {
+    // The otherwise-stranded cell: an EMPTY state dir (no intent at all) plus a
+    // cover recovery adopted. An inert Adopt still names the previous run's TUN
+    // and server IP, so this connect must re-engage through install_lockdown or
+    // it comes up connected with no traffic.
+    rt().block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        let routing = MockRouting::new(dir.path().to_path_buf());
+        let st = routing.state();
+        let mut pm = ProxyManager::new(MockProxy::new(), routing).with_state_dir(dir.path().to_path_buf());
+
+        assert!(
+            !pm.standing_cover_expected(),
+            "baseline: an empty state dir expects none"
+        );
+        pm.set_standing_cover_adopted(true);
+        assert!(pm.standing_cover_expected());
+        assert!(pm.lockdown_enabled(), "and the tray reports armed");
+
+        pm.start(&test_config()).await.unwrap();
+        assert_eq!(
+            st.lockdown_engage_calls.load(Ordering::SeqCst),
+            1,
+            "the adopted cover must be refreshed by this start's install_lockdown"
+        );
+        pm.stop().await.unwrap();
+    });
+}
+
+#[skuld::test]
+fn a_user_stop_that_dropped_a_standing_cover_clears_the_claim() {
+    rt().block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        let routing = MockRouting::new(dir.path().to_path_buf());
+        let st = routing.state();
+        let mut pm = ProxyManager::new(MockProxy::new(), routing).with_state_dir(dir.path().to_path_buf());
+        pm.set_standing_cover_adopted(true);
+        pm.start(&test_config()).await.unwrap();
+
+        pm.stop_with(StopReason::UserStop).await.unwrap();
+        assert_eq!(
+            st.lockdown_disengage_calls.load(Ordering::SeqCst),
+            1,
+            "the user stop opened the host"
+        );
+        assert!(
+            !pm.lockdown_enabled(),
+            "the claim must clear: reporting Lockdown On over an open host is the Rule #0 failure"
+        );
+        assert!(!pm.standing_cover_expected());
+    });
+}
+
+#[skuld::test]
+fn a_cutover_stop_keeps_the_claim() {
+    // A cutover DISARMS the cover: the filters survive the restart, so the host
+    // is still held closed and the escape must still be offered.
+    rt().block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        let routing = MockRouting::new(dir.path().to_path_buf());
+        let st = routing.state();
+        let mut pm = ProxyManager::new(MockProxy::new(), routing).with_state_dir(dir.path().to_path_buf());
+        pm.set_standing_cover_adopted(true);
+        pm.start(&test_config()).await.unwrap();
+
+        pm.stop_with(StopReason::Cutover).await.unwrap();
+        assert_eq!(
+            st.lockdown_disengage_calls.load(Ordering::SeqCst),
+            0,
+            "a cutover disarms rather than disengages"
+        );
+        assert!(
+            pm.lockdown_enabled(),
+            "the cover still holds the host, so the claim stands"
+        );
+        assert!(pm.standing_cover_expected());
+    });
+}

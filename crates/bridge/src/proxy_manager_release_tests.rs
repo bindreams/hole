@@ -206,3 +206,49 @@ fn turn_lockdown_off_on_a_clean_manager_is_ok() {
         assert!(!lockdown_state::load_enabled(dir.path()));
     });
 }
+
+#[skuld::test]
+fn unblock_clears_the_adopted_cover_claim() {
+    // The claim is NOT a latch. Once `release_all_covers` confirms, the host is
+    // open — continuing to report armed would leave the tray offering an escape
+    // from a cover that is already gone, over a host that is already open.
+    rt().block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        let routing = MockRouting::new(dir.path().to_path_buf());
+        let st = routing.state();
+        let mut pm = ProxyManager::new(MockProxy::new(), routing).with_state_dir(dir.path().to_path_buf());
+        pm.set_standing_cover_adopted(true);
+        assert!(pm.lockdown_enabled());
+
+        let outcome = pm.turn_lockdown_off().expect("an idle manager must not error");
+        assert!(matches!(outcome, LockdownOffOutcome::Cleared));
+        assert_eq!(st.release_all_calls.load(Ordering::SeqCst), 1);
+        assert!(!pm.lockdown_enabled(), "the claim must clear on a confirmed release");
+        assert!(!pm.standing_cover_expected());
+    });
+}
+
+#[skuld::test]
+fn a_failed_release_keeps_the_adopted_cover_claim() {
+    // The host may still be held closed, so the escape must stay on the menu
+    // for a retry — the same reason the intent is not flipped on this path.
+    rt().block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        let routing = MockRouting::new(dir.path().to_path_buf());
+        let st = routing.state();
+        st.fail_release.store(true, Ordering::SeqCst);
+        let mut pm = ProxyManager::new(MockProxy::new(), routing).with_state_dir(dir.path().to_path_buf());
+        pm.set_standing_cover_adopted(true);
+
+        pm.turn_lockdown_off().expect_err("a failed release must be reported");
+        assert_eq!(
+            lockdown_state::load_intent(dir.path()),
+            lockdown_state::Intent::Unset,
+            "the intent must be untouched by a failed release"
+        );
+        assert!(
+            pm.lockdown_enabled(),
+            "the escape must stay on the menu while the cover may still hold"
+        );
+    });
+}

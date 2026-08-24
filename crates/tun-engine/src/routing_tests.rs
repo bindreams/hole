@@ -359,7 +359,14 @@ fn recover_without_state_file_is_a_noop() {
     // bridge.
     let tmp = tempfile::tempdir().unwrap();
     let log: RefCell<Captured> = RefCell::new(Vec::new());
-    recover_routes_with(tmp.path(), capturing_runner(&log), |_, _| {}, false, || false, |_| {});
+    recover_routes_with(
+        tmp.path(),
+        capturing_runner(&log),
+        |_, _| {},
+        Intent::Off,
+        || Absent,
+        |_| {},
+    );
 
     let log = log.into_inner();
     assert!(log.is_empty(), "expected no commands with no state file, got {log:?}");
@@ -378,7 +385,14 @@ fn recover_with_state_file_runs_split_then_bypass_then_clears() {
     state::save(tmp.path(), &persisted_state, None).unwrap();
 
     let log: RefCell<Captured> = RefCell::new(Vec::new());
-    recover_routes_with(tmp.path(), capturing_runner(&log), |_, _| {}, false, || false, |_| {});
+    recover_routes_with(
+        tmp.path(),
+        capturing_runner(&log),
+        |_, _| {},
+        Intent::Off,
+        || Absent,
+        |_| {},
+    );
 
     let log = log.into_inner();
     assert_eq!(log.len(), 2, "expected split + bypass phases, got {log:?}");
@@ -406,7 +420,14 @@ fn recover_with_loopback_server_skips_bypass() {
     state::save(tmp.path(), &persisted_state, None).unwrap();
 
     let log: RefCell<Captured> = RefCell::new(Vec::new());
-    recover_routes_with(tmp.path(), capturing_runner(&log), |_, _| {}, false, || false, |_| {});
+    recover_routes_with(
+        tmp.path(),
+        capturing_runner(&log),
+        |_, _| {},
+        Intent::Off,
+        || Absent,
+        |_| {},
+    );
 
     let log = log.into_inner();
     assert_eq!(log[1].0, PHASE_RECOVER_BYPASS);
@@ -436,7 +457,7 @@ fn recover_clears_state_file_even_when_runner_errors() {
 
     let failing =
         |_: &[Vec<String>], _: &str| -> std::io::Result<()> { Err(std::io::Error::other("simulated runner failure")) };
-    recover_routes_with(tmp.path(), failing, |_, _| {}, false, || false, |_| {});
+    recover_routes_with(tmp.path(), failing, |_, _| {}, Intent::Off, || Absent, |_| {});
 
     assert!(
         !tmp.path().join(STATE_FILE_NAME).exists(),
@@ -455,8 +476,8 @@ fn recover_invokes_cover_sweep_even_without_route_state() {
         tmp.path(),
         capturing_runner(&log),
         |_, _| swept.set(true),
-        false,
-        || false,
+        Intent::Off,
+        || Absent,
         |_| {},
     );
 
@@ -477,8 +498,8 @@ fn recover_sweeps_lockdown_when_intent_off_and_present() {
         tmp.path(),
         capturing_runner(&log),
         |_, _| {},
-        false,
-        || true,
+        Intent::Off,
+        || Live,
         |decision| decided.set(Some(decision)),
     );
     assert_eq!(decided.get(), Some(CoverRecovery::Sweep));
@@ -493,8 +514,8 @@ fn recover_adopts_lockdown_when_intent_on_and_present() {
         tmp.path(),
         capturing_runner(&log),
         |_, _| {},
-        true,
-        || true,
+        Intent::On,
+        || Live,
         |d| decided.set(Some(d)),
     );
     assert_eq!(decided.get(), Some(CoverRecovery::Adopt));
@@ -510,8 +531,8 @@ fn recover_lockdown_noop_when_cover_absent() {
         tmp.path(),
         capturing_runner(&log),
         |_, _| {},
-        true,
-        || false,
+        Intent::On,
+        || Absent,
         |d| decided.set(Some(d)),
     );
     assert_eq!(decided.get(), Some(CoverRecovery::Noop), "absent cover => Noop");
@@ -532,8 +553,8 @@ fn recover_orders_lockdown_before_transient_sweep_and_passes_adopting() {
             order.borrow_mut().push("sweep_cover");
             *adopting_seen.borrow_mut() = Some(adopting);
         },
-        /* lockdown_intent = */ true,
-        /* lockdown_present = */ || true, // standing cover present
+        /* lockdown_intent = */ Intent::On,
+        /* lockdown_present = */ || Live, // standing cover present
         |decision| {
             order.borrow_mut().push("lockdown_recover");
             assert_eq!(decision, CoverRecovery::Adopt);
@@ -554,19 +575,15 @@ fn recover_orders_lockdown_before_transient_sweep_and_passes_adopting() {
 
 #[skuld::test]
 fn recover_passes_adopting_only_on_adopt() {
-    // The value handed to `sweep_cover` is `adopt` (Adopt decision), NOT mere
-    // cover presence. The discriminating case is Sweep (intent off + cover
-    // present): a standing cover IS present, yet the transient restore must run
-    // (false) because the standing ruleset is being torn down — so passing
-    // "present" instead of "adopting" would wrongly skip the restore.
-    // (intent, present, expected `adopting` passed to sweep_cover)
-    let table = [
-        (true, true, true),    // Adopt -> skip restore
-        (false, true, false),  // Sweep -> restore MUST run despite cover present
-        (true, false, false),  // Noop (absent) -> nothing to adopt
-        (false, false, false), // Noop (absent)
-    ];
-    for (intent, present, expected) in table {
+    // The value handed to `sweep_cover` is `adopt` (the Adopt decision), NOT
+    // mere cover presence. The discriminating case is Sweep (recorded off +
+    // cover present): a standing cover IS present, yet the transient restore
+    // must run (false) because the standing ruleset is being torn down — so
+    // passing "present" instead of "adopting" would wrongly skip the restore.
+    // Walked over the whole decision table so a new cell cannot be added
+    // without deciding what the transient sweep is told.
+    for (intent, presence, action, _) in RECOVERY_TABLE {
+        let expected = action == Adopt;
         let dir = tempfile::tempdir().unwrap();
         let adopting_seen: RefCell<Option<bool>> = RefCell::new(None);
         recover_routes_with(
@@ -574,13 +591,13 @@ fn recover_passes_adopting_only_on_adopt() {
             |_c, _p| Ok(()),
             |_d, adopting| *adopting_seen.borrow_mut() = Some(adopting),
             intent,
-            || present,
+            || presence,
             |_decision| {},
         );
         assert_eq!(
             *adopting_seen.borrow(),
             Some(expected),
-            "intent={intent} present={present} => sweep_cover adopting must be {expected}"
+            "intent={intent:?} presence={presence:?} => sweep_cover adopting must be {expected}"
         );
     }
 }
@@ -703,22 +720,6 @@ fn cover_recovery_is_inert_when_the_os_is_unreachable_or_clean() {
     }
 }
 
-#[skuld::test]
-fn the_interim_adapter_can_never_record_an_intent() {
-    // The Task 2 adapter maps today's two bools onto the new axes, so it can
-    // only reach (On|Off) x (Live|Absent) — four cells, none of which writes.
-    // Deleted along with `interim_axes` when the real probes land.
-    for intent in [true, false] {
-        for present in [true, false] {
-            let (i, p) = interim_axes(intent, present);
-            assert!(
-                !decide_cover_recovery(i, p).record_intent_on,
-                "the interim adapter reached ({i:?}, {p:?}), which writes an intent file"
-            );
-        }
-    }
-}
-
 // Recovery dispatch ===================================================================================================
 
 #[skuld::test]
@@ -761,5 +762,139 @@ fn only_an_explicit_off_intent_reaches_the_os() {
                 "({intent:?}, {presence:?}) reached the OS without an explicit recorded off"
             );
         }
+    }
+}
+
+// Intent repair =======================================================================================================
+
+/// Drive `recover_routes_with` over `dir` with an injected presence, deriving
+/// the intent from `dir` exactly as production does.
+fn recover_over(dir: &Path, presence: CoverPresence) -> (Recovery, Option<CoverRecovery>) {
+    let acted: std::cell::Cell<Option<CoverRecovery>> = std::cell::Cell::new(None);
+    let decision = recover_routes_with(
+        dir,
+        |_c, _p| Ok(()),
+        |_d, _a| {},
+        failclosed::lockdown_state::load_intent(dir),
+        || presence,
+        |action| acted.set(Some(action)),
+    );
+    (decision, acted.get())
+}
+
+#[skuld::test]
+fn recover_records_the_intent_when_a_live_cover_has_none() {
+    // #881: a wiped or recreated state dir over a LIVE cover. Before the fix
+    // the intent read `false`, the action was Sweep, and the kill switch was
+    // silently disengaged. Now the measured truth is written back and the cover
+    // is adopted.
+    let dir = tempfile::tempdir().unwrap();
+    let (decision, acted) = recover_over(dir.path(), Live);
+
+    assert_eq!(
+        acted,
+        Some(Adopt),
+        "a live cover with no recorded intent must be adopted"
+    );
+    assert_eq!(decision.action, Adopt);
+    assert!(decision.record_intent_on);
+    assert_eq!(
+        failclosed::lockdown_state::load_intent(dir.path()),
+        Intent::On,
+        "the repaired intent must be on disk so the tray keeps offering the escape"
+    );
+}
+
+#[skuld::test]
+fn recover_records_the_intent_before_acting_on_it() {
+    // Ordering, not just outcome: the write lands before the recover action, so
+    // a crash between them leaves an intent that reads armed rather than one
+    // that would sweep on the next start.
+    let dir = tempfile::tempdir().unwrap();
+    let observed: std::cell::Cell<Option<Intent>> = std::cell::Cell::new(None);
+    recover_routes_with(
+        dir.path(),
+        |_c, _p| Ok(()),
+        |_d, _a| {},
+        failclosed::lockdown_state::load_intent(dir.path()),
+        || Live,
+        |_action| observed.set(Some(failclosed::lockdown_state::load_intent(dir.path()))),
+    );
+    assert_eq!(
+        observed.get(),
+        Some(Intent::On),
+        "the intent file must already read On when the recover action runs"
+    );
+}
+
+#[skuld::test]
+fn recover_repairs_an_unreadable_intent_over_a_live_cover() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join(failclosed::lockdown_state::STATE_FILE_NAME),
+        b"{corrupt",
+    )
+    .unwrap();
+    let (decision, acted) = recover_over(dir.path(), Live);
+
+    assert_eq!(acted, Some(Adopt));
+    assert!(decision.record_intent_on);
+    assert_eq!(failclosed::lockdown_state::load_intent(dir.path()), Intent::On);
+}
+
+#[skuld::test]
+fn recover_writes_no_intent_file_when_the_host_is_clean() {
+    // Every fresh install takes this path. Manufacturing an `enabled: true`
+    // here would arm the kill switch on a host that never had a cover.
+    let dir = tempfile::tempdir().unwrap();
+    let (decision, acted) = recover_over(dir.path(), Absent);
+
+    assert_eq!(acted, Some(Noop));
+    assert!(!decision.record_intent_on);
+    assert!(
+        !dir.path().join(failclosed::lockdown_state::STATE_FILE_NAME).exists(),
+        "a clean host must leave no intent file behind"
+    );
+}
+
+#[skuld::test]
+fn recover_adopts_but_writes_nothing_from_a_recorded_only_cover() {
+    // macOS: a reboot flushes pf while the state file survives, so pf answers
+    // "no label" and the file says a cover was engaged. Both halves matter — no
+    // manufactured preference on disk, and an Adopt the bridge carries into
+    // `standing_cover_expected` so the stale ruleset gets refreshed.
+    let dir = tempfile::tempdir().unwrap();
+    let (decision, acted) = recover_over(dir.path(), Recorded);
+
+    assert_eq!(acted, Some(Adopt));
+    assert!(!decision.record_intent_on);
+    assert!(
+        !dir.path().join(failclosed::lockdown_state::STATE_FILE_NAME).exists(),
+        "an unconfirmed record is not grounds to write a preference"
+    );
+}
+
+#[skuld::test]
+fn recover_returns_its_decision() {
+    // The bridge records the returned action as "a standing cover is live this
+    // run", which is what keeps the escape visible independently of the file.
+    for (intent, presence, action, record_intent_on) in RECOVERY_TABLE {
+        let dir = tempfile::tempdir().unwrap();
+        let returned = recover_routes_with(
+            dir.path(),
+            |_c, _p| Ok(()),
+            |_d, _a| {},
+            intent,
+            || presence,
+            |_action| {},
+        );
+        assert_eq!(
+            returned,
+            Recovery {
+                action,
+                record_intent_on
+            },
+            "recover_routes_with must return the decision for ({intent:?}, {presence:?})"
+        );
     }
 }

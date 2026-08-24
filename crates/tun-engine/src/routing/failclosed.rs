@@ -213,24 +213,6 @@ pub fn disengage_lockdown(state_dir: &Path) -> Result<(), RoutingError> {
     platform::disengage_lockdown(state_dir)
 }
 
-/// Whether a standing lockdown cover from a prior run is present — the recovery
-/// decision's `prior_present` signal, keyed on the cover's OWN evidence (NOT
-/// `bridge-routes.json`). macOS: the `bridge-lockdown-pf.json` state file
-/// exists. Windows: always `true` — delete-by-GUID reconciliation is idempotent
-/// (a no-op when no filters exist), so probing would only add a redundant WFP
-/// enumeration; a `Sweep`/`Adopt` on a clean host does nothing.
-pub fn lockdown_cover_present(state_dir: &Path) -> bool {
-    #[cfg(target_os = "macos")]
-    {
-        lockdown_pf_state::load(state_dir).is_some()
-    }
-    #[cfg(target_os = "windows")]
-    {
-        let _ = state_dir;
-        true
-    }
-}
-
 /// Ask the OS whether a standing lockdown cover from a prior run is present,
 /// keyed on the cover's OWN evidence (NOT `bridge-routes.json` — the cover's
 /// lifetime is independent of routes).
