@@ -96,7 +96,7 @@ impl Drop for SsRuntime {
 ///
 /// `ShadowsocksProxy` itself is stateless (zero-sized) — per-session state
 /// (the dedicated runtime, the spawned task, the traffic counters) lives in
-/// the returned [`ShadowsocksRunning`]'s [`SsRuntime`], not here. Keeping it
+/// the returned [`ShadowsocksRunning`]'s `SsRuntime`, not here. Keeping it
 /// as a named type — rather than a free function or an associated constant —
 /// gives [`crate::proxy_manager::ProxyManager`] a generic type parameter
 /// `P: Proxy` that can be substituted for a mock in tests.
@@ -178,7 +178,7 @@ impl Proxy for ShadowsocksProxy {
 /// RAII handle on a running shadowsocks tunnel.
 ///
 /// Both cleanup paths close every socket the proxy bound: each owns an
-/// [`SsRuntime`], whose `Drop` joins the dedicated runtime the tunnel runs
+/// `SsRuntime`, whose `Drop` joins the dedicated runtime the tunnel runs
 /// on — the join is what actually releases the listeners. They differ only
 /// in whether the outer task's own exit is observed:
 ///

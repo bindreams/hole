@@ -224,6 +224,84 @@ tables** (Hyper-V/WSL/Docker reservations); an OS-picked port for one transport
 may be reserved for the other. There is no "right" budget — a saturated runner
 needs many retries, a healthy machine one. See #285, #300, #304.
 
+### Proxy shutdown contract
+
+`ShadowsocksRunning::stop()` / `Drop` (`crates/bridge/src/proxy/shadowsocks.rs`)
+must close every socket the shadowsocks local server bound before returning —
+otherwise an immediate rebind of the same fixed port fails with
+`AddrInUse` (#876).
+
+**Three abort layers, not one.** Upstream (`shadowsocks-service` 1.24.0) tears
+`local::Server::run()` down through nested `Drop` → `abort()`, none of which
+Hole can join because the handles are private:
+
+| Layer | Who aborts                                                | What the aborted task still owns                                                             |
+| ----- | --------------------------------------------------------- | -------------------------------------------------------------------------------------------- |
+| 1     | `ShadowsocksRunning::stop` aborts the `server.run()` task | nothing directly; its drop triggers layer 2                                                  |
+| 2     | `utils::ServerHandle::drop` → `abort()`                   | the `Socks`/`Http` accept loops — the TCP listener and the bound UDP socket                  |
+| 3     | `UdpAssociation::drop` → `abort()`                        | an `Arc` clone of the inbound SOCKS5 UDP listener, held by every live UDP association's task |
+
+Holding the layer-2 sub-handles ourselves (the obvious fix) still leaves layer
+3 open: `UdpAssociationManager` never surfaces its handles, so a live UDP
+association keeps the port bound until its task is dropped. `Server::run(self)`
+consumes the server and exposes no shutdown signal either — the fix is a
+runtime-level join, a strict superset of anything an upstream API could offer.
+
+**The fix: each proxy gets its own tokio runtime** (`SsRuntime`), and
+`stop()`/`Drop` shut it down and block until every task on it has dropped —
+that join is what closes the descriptors.
+
+**Where `drop(Runtime)` is legal.** `Runtime::drop` panics unless
+`try_enter_blocking_region()` returns `Some`, which holds **iff the calling
+thread is not inside any runtime** — flavour is irrelevant to the predicate,
+it only decides whether `block_in_place` is available. Three ways to satisfy
+it: outside any runtime, inside a `spawn_blocking` closure, or inside
+`block_in_place` on a multi-thread worker (which temporarily exits the
+runtime for the closure's duration). A fresh `std::thread` is unconditionally
+outside any runtime, so hopping to one always works.
+
+`spawn_blocking` is tempting but unsound as the hop: when the target pool is
+shutting down, `Spawner::spawn_task` drops the closure **inline on the
+calling thread** instead of running it — if that thread is an entered
+worker, dropping the captured `Runtime` there panics, and the runtime is left
+half torn down with nothing left to join it. `join_runtime` therefore always
+hops via `std::thread::spawn(..).join()`, and uses `block_in_place` only to
+release a multi-thread worker's core first (mirroring `Dispatcher::drop`) —
+never as the hop itself. This mechanism has no failure path, so
+`stop()`'s port-release guarantee is unqualified: no `Err` arm, no
+flavour-specific fallback, no shutdown-race carve-out.
+
+**`stop()`'s ordering is load-bearing.** It classifies the task's own exit
+(await the aborted `JoinHandle`, distinguishing panic from cancellation)
+*before* joining the runtime — joining first would make every outcome look
+like a plain cancellation.
+
+**`worker_threads(4)`** on `SsRuntime` is a reduction from the ambient
+runtime's `available_parallelism()` (what the proxy used to run on).
+Unmeasured — falsified by a sustained single-tunnel throughput measurement on
+a >4-core box that saturates all four workers, or a CPU profile showing the
+`hole-ss` threads pinned during a large transfer. The local server is
+expected to be I/O-bound (loopback accept, SOCKS5 framing, a copy loop), with
+the remote server and plugin chain as the practical ceiling — but this has
+not been measured.
+
+**Tracing hand-off.** `garter::tracing_test::set_default_in_current_thread`
+asserts the *ambient* runtime is current-thread; it cannot see that a task
+now runs on `SsRuntime`'s own workers instead, so without help their tracing
+events land with no subscriber and are silently dropped in tests (production
+installs a subscriber globally and is unaffected). `SsRuntime::new` captures
+the constructing thread's dispatcher and re-installs it on every worker via
+`Builder::on_thread_start`, holding the guard for the worker's whole life.
+
+**The no-hang property depends on a pinned dependency version.** `drop(Runtime)`
+waits for currently-*running* blocking-pool tasks; `shadowsocks-service`
+1.24.0 has none on Hole's local-server path (Windows' `DnsResolver::System`
+branch calls a blocking `lookup_host`, but Hole's config never selects it — no
+ACL, all `ServerAddr::SocketAddr`). A dependency bump could reintroduce one
+with no other test going red — `upstream_has_no_blocking_calls_on_the_shutdown_path`
+(`crates/bridge/src/proxy/shadowsocks_tests.rs`) walks the dependency's source
+tree and fails the build if it does.
+
 ### Crash recovery
 
 While a proxy is active the bridge persists small state files in `<state_dir>/`,
