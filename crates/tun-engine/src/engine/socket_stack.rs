@@ -19,6 +19,7 @@ use smoltcp::time::Instant as SmoltcpInstant;
 use smoltcp::wire::{HardwareAddress, IpAddress, IpCidr};
 use tracing::warn;
 
+pub(crate) use super::admission::Handshake;
 use super::config::EngineConfig;
 use super::virtual_device::VirtualTunDevice;
 use crate::device::DeviceConfig;
@@ -27,19 +28,6 @@ use crate::device::DeviceConfig;
 struct TcpListener {
     handle: SocketHandle,
     port: u16,
-}
-
-/// A listener socket that has left `State::Listen` and awaits a verdict.
-pub(crate) enum Handshake {
-    /// The socket has a peer: `src` is the client, `dst` the address it dialled.
-    Pending {
-        handle: SocketHandle,
-        port: u16,
-        src: SocketAddr,
-        dst: SocketAddr,
-    },
-    /// The socket has no peer left to answer.
-    Stale { handle: SocketHandle, port: u16 },
 }
 
 pub(crate) struct SocketStack {

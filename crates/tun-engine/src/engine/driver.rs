@@ -22,6 +22,7 @@ use tokio::sync::{mpsc, Semaphore};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, trace, warn};
 
+use super::admission::{decide_admission, Admission};
 use super::config::EngineConfig;
 use super::dns::DnsInterceptor;
 use super::router::{Router, TcpMeta, UdpMeta};
@@ -188,26 +189,32 @@ impl Driver {
 
     fn accept_tcp_connections(&mut self) {
         for handshake in self.stack.take_handshakes() {
-            let (handle, port, src, dst) = match handshake {
-                Handshake::Pending { handle, port, src, dst } => (handle, port, src, dst),
-                // A contract branch: `take_handshakes` classifies on an Option pair
-                // the type system does not narrow.
-                Handshake::Stale { handle, port } => {
+            let semaphore = Arc::clone(&self.conn_semaphore);
+            let verdict = decide_admission(&handshake, move || semaphore.try_acquire_owned().ok());
+
+            let (handle, port, peer) = match handshake {
+                Handshake::Pending { handle, port, src, dst } => (handle, port, Some((src, dst))),
+                // A contract branch: `take_handshakes` classifies on an Option
+                // pair the type system does not narrow.
+                Handshake::Stale { handle, port } => (handle, port, None),
+            };
+
+            let permit = match verdict {
+                Admission::Discard => {
                     warn!("accepted TCP connection with no endpoint on port {port}");
                     self.stack.discard(handle, port);
                     continue;
                 }
-            };
-            let (dst_ip, dst_port) = (dst.ip(), dst.port());
-
-            let permit = match self.conn_semaphore.clone().try_acquire_owned() {
-                Ok(p) => p,
-                Err(_) => {
-                    warn!("connection limit reached, rejecting {dst_ip}:{dst_port}");
+                Admission::Refuse => {
+                    let (_, dst) = peer.expect("decide_admission refuses only a handshake with a peer");
+                    warn!("connection limit reached, rejecting {}:{}", dst.ip(), dst.port());
                     self.stack.refuse(handle, port);
                     continue;
                 }
+                Admission::Admit(permit) => permit,
             };
+            let (src, dst) = peer.expect("decide_admission admits only a handshake with a peer");
+            let (dst_ip, dst_port) = (dst.ip(), dst.port());
 
             let (flow, to_handler, from_handler) = TcpFlow::new(Arc::clone(&self.sniffer_semaphore));
 

@@ -18,6 +18,7 @@
 //! engine.run(cancel_token).await;
 //! ```
 
+mod admission;
 mod config;
 mod dns;
 mod driver;
