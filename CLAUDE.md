@@ -26,6 +26,14 @@ before editing; the sections linked below are the authoritative source.
   tunnel); enforced structurally in `HoleRouter::resolve_endpoint`. UDP/53 is
   diverted to the DNS forwarder before the cascade. →
   [CONTRIBUTING.md#udp-policy](CONTRIBUTING.md#udp-policy)
+- **TCP accept refusal.** The accept verdict lands while the listener is still
+  in `SynReceived` with its SYN-ACK paused, so a declined connection is refused
+  with a pre-handshake RST instead of black-holing behind a SYN-ACK; the verdict
+  is the pure `decide_admission`. A socket the datapath is done with is
+  *retired*, not removed, and reaped once smoltcp clears its 4-tuple —
+  including one that reverted to `Listen`, which would otherwise hijack its
+  port. →
+  [CONTRIBUTING.md#tcp-accept-refusal](CONTRIBUTING.md#tcp-accept-refusal)
 - **DNS forwarder.** Carries DNS over the TCP tunnel for TCP-only plugins; OS
   adapter DNS is advertised the configured resolver IPs, which route into
   `hole-tun` and are intercepted by the in-TUN `LocalDnsEndpoint`; a start-time

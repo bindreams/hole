@@ -61,6 +61,24 @@ methods.
 cascade reads the filter decision, so DNS works even on a TCP-only plugin. See
 [DNS forwarder](#dns-forwarder).
 
+### TCP accept refusal
+
+The accept verdict is reached while the listener socket is still in
+`SynReceived` with its SYN-ACK paused (smoltcp's `socket-tcp-pause-synack`), so
+a declined connection is refused with a pre-handshake RST and never with a reset
+of a connection the client believes it opened. The verdict itself is
+[`decide_admission`](crates/tun-engine/src/engine/admission.rs) — a pure
+function over the handshake plus a permit-acquiring closure — and the driver arm
+is a mechanical dispatch over its three outcomes. A socket the datapath is done
+with is *retired*, not removed:
+[`SocketStack::poll`](crates/tun-engine/src/engine/socket_stack.rs) reaps it
+once `remote_endpoint()` goes `None`, smoltcp's signal that it has emitted the
+socket's last packet. A handshake with no peer left is discarded without a
+packet, because smoltcp has already cleared the 4-tuple and has no address to
+answer. A connection socket that reverts to `Listen` — the client answered the
+SYN-ACK with an RST — is retired through that same list, so it cannot shadow the
+live listener on its port.
+
 ### DNS forwarder
 
 On TCP-only plugins, full-tunnel DNS would have no path (UDP/53 is dropped for
