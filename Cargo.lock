@@ -3470,6 +3470,7 @@ dependencies = [
  "file-rotate",
  "garter",
  "hole-test-observability",
+ "idna",
  "libc",
  "log",
  "minisign-verify",

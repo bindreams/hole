@@ -18,6 +18,7 @@
 
 use std::borrow::Cow;
 use std::io;
+use std::net::IpAddr;
 use std::sync::{Arc, OnceLock};
 
 use aho_corasick::{AhoCorasick, AhoCorasickBuilder, MatchKind};
@@ -177,6 +178,31 @@ pub fn arm(token: &str, literals: impl IntoIterator<Item = String>) {
     for old in superseded {
         tracing::info!(target: "hole::redact", "redaction: {old} and {token} are the same endpoint");
     }
+}
+
+/// The one token minted without a server entry in hand: the crash-recovery
+/// sweep replays a prior run's routes before any config exists. Last-wins
+/// arming re-points those literals at the real entry's token on the
+/// following connect, and announces the join.
+pub const RECOVERED_TOKEN: &str = "<server:recovered>";
+
+/// Arm both textual forms a resolved address takes in a log — bare, and the
+/// bracketed `[…]` form a `host:port` join uses for IPv6.
+pub fn arm_ip(token: &str, ip: IpAddr) {
+    if !ip_is_armable(ip) {
+        return;
+    }
+    arm(token, [ip.to_string(), format!("[{ip}]")]);
+}
+
+/// Whether an address may be armed at all.
+///
+/// Loopback and the unspecified address are excluded: they are not the
+/// server, they are Hole's own listeners, the DNS forwarder, the plugin
+/// handoff and the `localaddr=` of a firewall dump. Arming either turns
+/// every one of those mentions into a token and destroys the log.
+pub fn ip_is_armable(ip: IpAddr) -> bool {
+    !ip.is_loopback() && !ip.is_unspecified()
 }
 
 /// The first [`COLLISION_CORPUS`] entry `literal` would mangle, if any.
