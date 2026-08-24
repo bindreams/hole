@@ -10,11 +10,11 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use tracing::{debug, info, warn};
 
-use crate::error::RoutingError;
+use crate::error::{CommandFailure, RouteCommandError, RoutingError};
 use crate::gateway::{get_default_gateway_info, GatewayInfo};
 
 /// Total number of routing subprocess spawns this process has performed.
-/// Incremented once per command in [`run_commands`]. Exposed so
+/// Incremented once per command in [`exec_one`]. Exposed so
 /// `diagnostics` handlers and tests can assert the no-routing-subprocess
 /// invariant. The one-instruction `fetch_add` has negligible production
 /// cost — far below the millisecond-scale subprocess itself.
@@ -55,6 +55,16 @@ pub fn build_teardown_commands(tun_name: &str, server_ip: IpAddr, interface_name
 }
 
 // Execution ===========================================================================================================
+//
+// Two phase runners, and the difference between them is the point. Install is
+// FATAL: a failed command aborts the phase and is returned, because reporting
+// routes that were never installed sends traffic outside the tunnel while the
+// UI says "protected". Cleanup is BEST-EFFORT: it issues every command it was
+// handed and has NO error channel to abort through, because stopping at the
+// first failure would strand routes and leave the user worse off than if Hole
+// had never run. The asymmetry lives in the return types — a caller cannot
+// `?` its way out of a cleanup phase, and cannot build a routes guard without
+// discharging the install phase's `Result`.
 
 // Phase tags used for structured logging and to classify expected failures.
 // `is_recovery_phase` is the single source of truth for which phases are
@@ -72,21 +82,26 @@ pub(crate) const PHASE_RECOVER_COVER: &str = "recover-cover";
 #[cfg(target_os = "macos")]
 pub(crate) const PHASE_COVER: &str = "cover-engage";
 
-/// Execute route setup commands. Logs each command and its result.
+/// Execute route setup commands — the FATAL phase. Stops at the first command
+/// that does not exit zero and returns it; the caller must not treat the split
+/// routes as installed.
 pub fn setup_routes(
     tun_name: &str,
     server_ip: IpAddr,
     original_gateway: IpAddr,
     interface_name: &str,
-) -> std::io::Result<()> {
+) -> Result<(), RouteCommandError> {
     let commands = build_setup_commands(tun_name, server_ip, original_gateway, interface_name);
-    run_commands(&commands, PHASE_SETUP)
+    run_setup_commands(&commands, PHASE_SETUP)
 }
 
-/// Execute route teardown commands. Idempotent — safe to call even if routes don't exist.
-pub fn teardown_routes(tun_name: &str, server_ip: IpAddr, interface_name: &str) -> std::io::Result<()> {
+/// Execute route teardown commands — the BEST-EFFORT phase. Idempotent, and
+/// safe to call even if routes don't exist: every command is issued, and a
+/// failure (routinely, "route not found") neither stops the rest nor is
+/// returned.
+pub fn teardown_routes(tun_name: &str, server_ip: IpAddr, interface_name: &str) -> CleanupReport {
     let commands = build_teardown_commands(tun_name, server_ip, interface_name);
-    run_commands(&commands, PHASE_TEARDOWN)
+    run_cleanup_commands(&commands, PHASE_TEARDOWN)
 }
 
 pub(crate) fn build_split_route_teardown_commands(tun_name: &str) -> Vec<Vec<String>> {
@@ -94,7 +109,9 @@ pub(crate) fn build_split_route_teardown_commands(tun_name: &str) -> Vec<Vec<Str
 }
 
 /// Returns true if route command failures during this phase are *expected*
-/// idempotent-cleanup behavior and should be logged at debug, not warn.
+/// idempotent-cleanup behavior. Two things key off it: the log level (debug,
+/// not warn) and — via the `debug_assert`s in the two phase runners — which
+/// runner a phase is allowed to go through.
 ///
 /// **Recovery** is best-effort: every clean startup tries to delete the four
 /// fixed split routes, and on a healthy system all four of those calls fail
@@ -118,42 +135,121 @@ fn is_recovery_phase(phase: &str) -> bool {
     )
 }
 
-fn run_commands(commands: &[Vec<String>], phase: &str) -> std::io::Result<()> {
-    let recovery = is_recovery_phase(phase);
-    for cmd in commands {
-        debug_assert!(!cmd.is_empty(), "route command must not be empty");
-        ROUTING_SUBPROCESS_SPAWN_COUNT.fetch_add(1, Ordering::SeqCst);
-        info!(phase, cmd = cmd.join(" "), "running route command");
-        let output = Command::new(&cmd[0]).args(&cmd[1..]).output()?;
-        let exit_code = output.status.code().unwrap_or(-1);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        if output.status.success() {
-            // Success log at debug level. Kept out of info to avoid
-            // drowning the per-run log in route noise, but visible when
-            // an investigation turns on hole_bridge=debug.
-            // stdout/stderr included because netsh sometimes prints a
-            // non-empty stdout on success (e.g. "Ok.") that is still
-            // worth having in the trace.
-            debug!(phase, cmd = cmd.join(" "), exit_code,
-                   stdout = %stdout.trim(), stderr = %stderr.trim(),
-                   "route command succeeded");
-        } else if recovery {
-            // Recovery and teardown phases — see is_recovery_phase
-            // doc-comment. Non-zero exits here are the unavoidable consequence
-            // of non-transactional install + best-effort cleanup; warning would
-            // drown legitimate signal.
-            debug!(phase, cmd = cmd.join(" "), exit_code, stderr = %stderr,
-                   "best-effort command failed (expected if route absent)");
-        } else {
-            // PHASE_SETUP only. A non-zero exit during initial route install
-            // IS a real anomaly — investigate.
-            warn!(phase, cmd = cmd.join(" "), exit_code,
-                  stdout = %stdout.trim(), stderr = %stderr.trim(),
-                  "route command failed — investigate (setup phase only)");
+/// What a best-effort phase did. Deliberately NOT a `Result`: cleanup has no
+/// error channel, so no caller can `?` one command's failure into skipping the
+/// deletions after it. The counts are for logging and tests.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CleanupReport {
+    /// Commands issued — always the full list the phase was handed.
+    pub attempted: usize,
+    /// How many did not exit zero. Routinely non-zero; see [`is_recovery_phase`].
+    pub failed: usize,
+}
+
+/// Spawn one command, log it, and report whether it exited zero. The unit both
+/// phase runners are built from; injected in tests so each loop's failure
+/// policy is assertable without spawning.
+fn exec_one(cmd: &[String], phase: &str) -> Result<(), CommandFailure> {
+    debug_assert!(!cmd.is_empty(), "route command must not be empty");
+    ROUTING_SUBPROCESS_SPAWN_COUNT.fetch_add(1, Ordering::SeqCst);
+    info!(phase, cmd = cmd.join(" "), "running route command");
+
+    let output = match Command::new(&cmd[0]).args(&cmd[1..]).output() {
+        Ok(output) => output,
+        Err(e) => {
+            // A missing `netsh`/`route` is never expected, in any phase.
+            warn!(phase, cmd = cmd.join(" "), error = %e, "route command failed to spawn");
+            return Err(CommandFailure::Spawn(e));
         }
+    };
+    let exit_code = output.status.code().unwrap_or(-1);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    if output.status.success() {
+        // Success log at debug level. Kept out of info to avoid drowning the
+        // per-run log in route noise, but visible when an investigation turns
+        // on hole_bridge=debug. stdout/stderr included because netsh sometimes
+        // prints a non-empty stdout on success (e.g. "Ok.") that is still
+        // worth having in the trace.
+        debug!(phase, cmd = cmd.join(" "), exit_code,
+               stdout = %stdout.trim(), stderr = %stderr.trim(),
+               "route command succeeded");
+        return Ok(());
+    }
+
+    if is_recovery_phase(phase) {
+        // Non-zero exits here are the unavoidable consequence of
+        // non-transactional install + best-effort cleanup; warning would drown
+        // legitimate signal.
+        debug!(phase, cmd = cmd.join(" "), exit_code, stderr = %stderr,
+               "best-effort command failed (expected if route absent)");
+    } else {
+        // A non-zero exit during initial route install IS a real anomaly, and
+        // aborts the start. The full argv and child output land here because
+        // the returned error's `Display` is deliberately PII-free.
+        warn!(phase, cmd = cmd.join(" "), exit_code,
+              stdout = %stdout.trim(), stderr = %stderr.trim(),
+              "route command failed — aborting route setup");
+    }
+    Err(CommandFailure::Exit(exit_code))
+}
+
+/// FATAL phase runner. Stops at the first command that does not exit zero, so
+/// no further route mutation is issued after a failure, and returns it.
+fn run_setup_commands(commands: &[Vec<String>], phase: &str) -> Result<(), RouteCommandError> {
+    run_setup_with(commands, phase, exec_one)
+}
+
+/// BEST-EFFORT phase runner. Issues EVERY command it is handed; a failure
+/// neither short-circuits the rest nor is returned.
+fn run_cleanup_commands(commands: &[Vec<String>], phase: &str) -> CleanupReport {
+    run_cleanup_with(commands, phase, exec_one)
+}
+
+/// Test seam for [`run_setup_commands`] — injectable per-command executor.
+fn run_setup_with<F>(commands: &[Vec<String>], phase: &str, mut exec: F) -> Result<(), RouteCommandError>
+where
+    F: FnMut(&[String], &str) -> Result<(), CommandFailure>,
+{
+    debug_assert!(
+        !is_recovery_phase(phase),
+        "{phase} is a best-effort phase and must not abort on the first failure"
+    );
+    for (index, cmd) in commands.iter().enumerate() {
+        exec(cmd, phase).map_err(|failure| RouteCommandError {
+            program: cmd.first().cloned().unwrap_or_default(),
+            index,
+            total: commands.len(),
+            failure,
+        })?;
     }
     Ok(())
+}
+
+/// Test seam for [`run_cleanup_commands`] — injectable per-command executor.
+fn run_cleanup_with<F>(commands: &[Vec<String>], phase: &str, mut exec: F) -> CleanupReport
+where
+    F: FnMut(&[String], &str) -> Result<(), CommandFailure>,
+{
+    debug_assert!(
+        is_recovery_phase(phase),
+        "{phase} is a fatal phase and must not have its failures dropped"
+    );
+    let mut report = CleanupReport::default();
+    for cmd in commands {
+        report.attempted += 1;
+        if exec(cmd, phase).is_err() {
+            report.failed += 1;
+        }
+    }
+    debug!(
+        phase,
+        attempted = report.attempted,
+        failed = report.failed,
+        "best-effort phase complete"
+    );
+    report
 }
 
 /// Run a single command, feeding `stdin` if present and returning the full
@@ -199,7 +295,7 @@ pub fn recover_routes(state_dir: &Path) {
     let intent = failclosed::lockdown_state::load_enabled(state_dir);
     recover_routes_with(
         state_dir,
-        run_commands,
+        run_cleanup_commands,
         failclosed::recover_cover,
         intent,
         || failclosed::lockdown_cover_present(state_dir),
@@ -246,7 +342,7 @@ pub fn decide_cover_recovery(intent: bool, prior_present: bool) -> CoverRecovery
 /// injected transient-cover sweep, and the standing-lockdown reconciliation
 /// inputs (intent + presence probe + recover action) so unit tests can assert
 /// behavior without shelling out to `netsh`/`route` or touching the host
-/// firewall. Production passes `run_commands`, [`failclosed::recover_cover`],
+/// firewall. Production passes [`run_cleanup_commands`], [`failclosed::recover_cover`],
 /// the persisted lockdown intent, [`failclosed::lockdown_cover_present`], and
 /// [`failclosed::recover_lockdown`].
 pub(crate) fn recover_routes_with<R, S, P, L>(
@@ -257,7 +353,7 @@ pub(crate) fn recover_routes_with<R, S, P, L>(
     lockdown_present: P,
     lockdown_recover: L,
 ) where
-    R: Fn(&[Vec<String>], &str) -> std::io::Result<()>,
+    R: Fn(&[Vec<String>], &str) -> CleanupReport,
     S: FnOnce(&Path, bool),
     P: FnOnce() -> bool,
     L: FnOnce(CoverRecovery),
@@ -287,15 +383,12 @@ pub(crate) fn recover_routes_with<R, S, P, L>(
         //    name persisted in the state file (the caller controls this —
         //    tun-engine has no opinion on naming).
         let split_cmds = build_split_route_teardown_commands(&st.tun_name);
-        if let Err(e) = runner(&split_cmds, PHASE_RECOVER_SPLIT) {
-            warn!(error = %e, "split-route teardown failed during recovery");
-        }
+        let split = runner(&split_cmds, PHASE_RECOVER_SPLIT);
 
         // 2. Per-server bypass route recorded in the state file.
         let bypass_cmds = build_teardown_commands(&st.tun_name, st.server_ip, &st.interface_name);
-        if let Err(e) = runner(&bypass_cmds, PHASE_RECOVER_BYPASS) {
-            warn!(error = %e, "bypass-route teardown failed during recovery");
-        }
+        let bypass = runner(&bypass_cmds, PHASE_RECOVER_BYPASS);
+        info!(?split, ?bypass, "route recovery command phases complete");
 
         // 3. Delete the state file regardless of command outcomes. Next
         //    startup re-runs the idempotent teardown if anything leaked
@@ -476,21 +569,42 @@ impl SystemRouting {
     pub fn new(state_dir: PathBuf, owner: Option<(u32, u32)>) -> Self {
         Self { state_dir, owner }
     }
-}
 
-impl Routing for SystemRouting {
-    type Installed = SystemRoutes;
-    type Cover = failclosed::Cover;
-
-    fn install(
+    /// Test seam for [`Routing::install`]: injectable setup and teardown so unit
+    /// tests can drive the failure path without issuing real route commands
+    /// (#165). Production passes [`setup_routes`] / [`teardown_routes`].
+    ///
+    /// # What the failure path does
+    ///
+    /// A partially-installed route set is a real state — `setup` is not
+    /// transactional. When it reports a failed command this does exactly four
+    /// things, and nothing else:
+    ///
+    /// 1. issues no further setup commands (`setup` already stopped at the
+    ///    first failure, so route mutation ends there);
+    /// 2. runs the COMPLETE teardown command set, every command attempted
+    ///    regardless of the others' outcomes, deleting whatever did install —
+    ///    most of those deletes are expected to exit non-zero, because the
+    ///    route they name was never added;
+    /// 3. clears the persisted route-state file, so the next start's
+    ///    crash-recovery sweep is not handed a run that left nothing behind;
+    /// 4. returns `Err(RoutingError::RouteSetup)`. No [`SystemRoutes`] guard is
+    ///    constructed, so no caller can report the tunnel up.
+    fn install_with<S, T>(
         &self,
         tun_name: &str,
         server_ip: IpAddr,
         gateway: IpAddr,
         interface_name: &str,
-    ) -> Result<Self::Installed, RoutingError> {
+        setup: S,
+        teardown: T,
+    ) -> Result<SystemRoutes, RoutingError>
+    where
+        S: FnOnce(&str, IpAddr, IpAddr, &str) -> Result<(), RouteCommandError>,
+        T: FnOnce(&str, IpAddr, &str) -> CleanupReport,
+    {
         // CRITICAL ORDERING: persist the route-recovery state BEFORE any
-        // routing mutation. A panic or SIGKILL between `setup_routes` and
+        // routing mutation. A panic or SIGKILL between the setup phase and
         // `SystemRoutes` construction would otherwise leak routes with no
         // on-disk record, defeating crash recovery on next startup.
         let persisted = state::RouteState {
@@ -502,17 +616,13 @@ impl Routing for SystemRouting {
         state::save(&self.state_dir, &persisted, self.owner)
             .map_err(|e| RoutingError::RouteSetup(format!("failed to persist route-state: {e}")))?;
 
-        // Install the routes. On failure, defensively tear down whatever
-        // may have been partially installed and clear the stale state
-        // file before returning. Defensive rollback: `run_commands`
-        // currently returns `Err` only on process-spawn failure, but a
-        // future early-exit-on-non-zero change would otherwise leak
-        // partial routes.
-        #[allow(clippy::disallowed_methods)] // we ARE the Routing impl
-        if let Err(e) = setup_routes(tun_name, server_ip, gateway, interface_name) {
-            #[allow(clippy::disallowed_methods)] // defensive rollback inside install
-            let _ = teardown_routes(tun_name, server_ip, interface_name);
-            let _ = state::clear(&self.state_dir);
+        if let Err(e) = setup(tun_name, server_ip, gateway, interface_name) {
+            warn!(error = %e, "route setup failed — rolling back");
+            let rollback = teardown(tun_name, server_ip, interface_name);
+            if let Err(ce) = state::clear(&self.state_dir) {
+                warn!(error = %ce, "state-file clear failed during setup rollback");
+            }
+            info!(?rollback, "route setup rolled back — reporting the tunnel DOWN");
             return Err(RoutingError::RouteSetup(e.to_string()));
         }
 
@@ -522,6 +632,31 @@ impl Routing for SystemRouting {
             interface_name: interface_name.to_owned(),
             state_dir: self.state_dir.clone(),
         })
+    }
+}
+
+impl Routing for SystemRouting {
+    type Installed = SystemRoutes;
+    type Cover = failclosed::Cover;
+
+    // `setup_routes`/`teardown_routes` are handed to `install_with` as the
+    // production runners: this IS the `Routing` impl (#165).
+    #[allow(clippy::disallowed_methods)]
+    fn install(
+        &self,
+        tun_name: &str,
+        server_ip: IpAddr,
+        gateway: IpAddr,
+        interface_name: &str,
+    ) -> Result<Self::Installed, RoutingError> {
+        self.install_with(
+            tun_name,
+            server_ip,
+            gateway,
+            interface_name,
+            setup_routes,
+            teardown_routes,
+        )
     }
 
     fn default_gateway(&self) -> Result<GatewayInfo, RoutingError> {
@@ -573,9 +708,8 @@ impl Drop for SystemRoutes {
             "SystemRoutes::drop entered — tearing down routes"
         );
         #[allow(clippy::disallowed_methods)] // SystemRoutes IS Routing::Installed
-        if let Err(e) = teardown_routes(&self.tun_name, self.server_ip, &self.interface_name) {
-            warn!(error = %e, "route teardown failed in SystemRoutes::drop");
-        }
+        let report = teardown_routes(&self.tun_name, self.server_ip, &self.interface_name);
+        info!(?report, "route teardown complete");
         // Always clear the state file — we only need it for *crash*
         // recovery, and reaching Drop means we took the normal shutdown
         // path. Per-command failures above are already logged; a stale

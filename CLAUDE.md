@@ -46,6 +46,14 @@ before editing; the sections linked below are the authoritative source.
 - **Native-crash observability.** The `tombstone` crate writes a signal-safe
   crash marker; the next start of the same kind sweeps it. →
   [CONTRIBUTING.md#native-crash-observability-tombstone](CONTRIBUTING.md#native-crash-observability-tombstone)
+- **Route-command failure policy.** Install is **fatal** — the first `netsh`/
+  `route` command that does not exit zero aborts the phase, rolls back, and
+  hands back no `SystemRoutes` guard, because reporting routes that were never
+  installed leaks traffic outside the tunnel. Teardown and crash recovery are
+  **best-effort** — every command is issued, and the runner returns a
+  `CleanupReport` with no error channel to `?` out of, because stopping early
+  strands routes. →
+  [CONTRIBUTING.md#route-command-failure-policy](CONTRIBUTING.md#route-command-failure-policy)
 - **Crash-recovery sweep.** `bridge-{routes,plugins,dns}.json` + ETW sessions are
   replayed/cleaned on next startup after the IPC socket binds. →
   [CONTRIBUTING.md#crash-recovery](CONTRIBUTING.md#crash-recovery)

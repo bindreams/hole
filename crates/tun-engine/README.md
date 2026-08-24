@@ -95,8 +95,22 @@ lint-disallowed outside the crate's own internals (see workspace
 the lint; consumers that only use `SystemRouting` get the guard-rail for
 free. Motivation: see [bindreams/hole#165][issue-165].
 
+## Route-command failure policy
+
+`setup_routes` is **fatal**: the first `netsh`/`route` command that does not
+exit zero aborts the phase and returns a `RouteCommandError`, and
+`SystemRouting::install` rolls back and hands back no guard. Reporting routes
+that were never installed sends traffic outside the tunnel.
+
+`teardown_routes` and `recover_routes` are **best-effort**: every command is
+issued and none can abort the rest. They return a `CleanupReport` (counts) —
+not a `Result` — so there is no error channel to short-circuit through, because
+stopping early would strand routes on the user's machine. See
+[bindreams/hole#901][issue-901].
+
 ## License
 
 GPL-3.0-or-later. See [LICENSE.md](../../LICENSE.md).
 
 [issue-165]: https://github.com/bindreams/hole/issues/165
+[issue-901]: https://github.com/bindreams/hole/issues/901

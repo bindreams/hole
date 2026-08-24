@@ -224,6 +224,37 @@ tables** (Hyper-V/WSL/Docker reservations); an OS-picked port for one transport
 may be reserved for the other. There is no "right" budget — a saturated runner
 needs many retries, a healthy machine one. See #285, #300, #304.
 
+### Route-command failure policy
+
+`netsh`/`route` subprocesses run through one of two phase runners in
+[routing.rs](crates/tun-engine/src/routing.rs), and which one a phase gets is a
+security decision, not a style one:
+
+- **Fatal — install only** (`run_setup_commands`, via `setup_routes`). The first
+  command that does not exit zero aborts the phase and is returned as a
+  `RouteCommandError`. `SystemRouting::install` then rolls back and returns
+  `Err`, so no `SystemRoutes` guard exists. Reporting split routes that were
+  never installed is a **leak**: traffic egresses outside the tunnel while the UI
+  says "protected" (#901).
+- **Best-effort — teardown and crash recovery** (`run_cleanup_commands`, via
+  `teardown_routes` / `recover_routes`). Every command is issued; a failure
+  neither short-circuits the rest nor is returned. Stopping at the first failure
+  would strand routes and leave the user worse off than if Hole had never run.
+
+The asymmetry is in the return types: cleanup returns a `CleanupReport` (counts,
+for logging and tests) and has **no error channel to `?` out of**, so no future
+edit can turn stranded-route cleanup into an early return. `is_recovery_phase`
+stays the single source of truth for which phase is which — it picks the log
+level (debug for expected cleanup failures, warn for an install anomaly) and
+back-stops the pairing via a `debug_assert` in each runner.
+
+`RouteCommandError`'s `Display` is PII-free by construction (program name,
+position in the phase, exit code): it reaches a GUI toast verbatim through
+`StartError::Failed`. The argv and the child's stdout/stderr go to `bridge.log`.
+
+A failed install's rollback does exactly four things — see
+`SystemRouting::install_with`'s doc comment, which is the source of truth.
+
 ### Crash recovery
 
 While a proxy is active the bridge persists small state files in `<state_dir>/`,
@@ -516,7 +547,7 @@ milliseconds.
 Each platform splits a pure, unit-tested rule/spec builder (transient:
 `build_cover_spec` / `build_pf_ruleset`; lockdown: `build_lockdown_spec` /
 `build_lockdown_main_ruleset`) from the thin engage layer — mirroring
-`build_setup_commands` vs `run_commands`. Under the
+`build_setup_commands` vs the phase runners. Under the
 [#165](#bridge-test-isolation-contract) isolation contract the builders are the
 only thing unit-tested; the kernel-level engage is exercised in production and,
 for the lockdown cover, by the privileged-lane real-engage tests (#527) — both

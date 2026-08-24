@@ -292,10 +292,11 @@ fn setup_with_spaced_interface_name_includes_full_name() {
 
 // Command execution failure policy ====================================================================================
 //
-// These drive the real subprocess path, so the exit code is the OS's, not a
-// mock's. They spawn a shell that only sets an exit code — never a `route` /
-// `netsh` command — so the #165 isolation contract holds: no host routing
-// state is touched.
+// The first group drives the real subprocess path, so the exit code is the
+// OS's, not a mock's. They spawn a shell that only sets an exit code — never a
+// `route` / `netsh` command — so the #165 isolation contract holds: no host
+// routing state is touched. The second group injects a recording executor to
+// assert each loop's failure policy (fatal aborts, best-effort does not).
 
 /// A command that always exits with `code`. `cfg!` is a runtime branch, so
 /// both arms compile on every target.
@@ -310,16 +311,252 @@ fn always_exits(code: i32) -> Vec<String> {
 #[skuld::test]
 fn a_failed_setup_command_is_an_error() {
     assert!(
-        run_commands(&[always_exits(3)], PHASE_SETUP).is_err(),
+        run_setup_commands(&[always_exits(3)], PHASE_SETUP).is_err(),
         "a non-zero exit during route setup must surface as an error — returning Ok \
          reports split routes that were never installed, and traffic egresses outside \
          the tunnel while the UI says it is protected (#901)"
     );
 }
 
+#[skuld::test]
+fn a_successful_setup_command_is_ok() {
+    assert!(run_setup_commands(&[always_exits(0)], PHASE_SETUP).is_ok());
+}
+
+#[skuld::test]
+fn setup_error_carries_the_exit_code_and_position() {
+    let err = run_setup_commands(&[always_exits(0), always_exits(3)], PHASE_SETUP).unwrap_err();
+    let rendered = err.to_string();
+    assert!(rendered.contains("exited with code 3"), "got {rendered}");
+    assert!(rendered.contains("command 2 of 2"), "got {rendered}");
+}
+
+/// The message reaches a GUI toast verbatim (`StartError::Failed`), so it must
+/// not carry the argv — the server IP and the upstream interface name live
+/// there. They stay in the `warn` log instead.
+#[skuld::test]
+fn setup_error_does_not_leak_the_command_arguments() {
+    let cmds = build_setup_commands("hole-tun", ipv4_server(), ipv4_gateway(), "en0");
+    let err = RouteCommandError {
+        program: cmds[4][0].clone(),
+        index: 4,
+        total: cmds.len(),
+        failure: CommandFailure::Exit(1),
+    };
+    let rendered = err.to_string();
+    assert!(!rendered.contains("1.2.3.4"), "server IP leaked into: {rendered}");
+    assert!(!rendered.contains("192.168.1.1"), "gateway leaked into: {rendered}");
+    assert!(!rendered.contains("en0"), "interface name leaked into: {rendered}");
+}
+
+#[skuld::test]
+fn a_failed_cleanup_command_is_reported_but_not_returned() {
+    // The return type has no error channel at all; the count is the only signal.
+    let report = run_cleanup_commands(&[always_exits(3), always_exits(0)], PHASE_TEARDOWN);
+    assert_eq!(
+        report,
+        CleanupReport {
+            attempted: 2,
+            failed: 1
+        }
+    );
+}
+
+/// Records every command the loop hands it and fails the ones whose index is
+/// in `fail_at`.
+fn recording_exec<'a>(
+    seen: &'a RefCell<Vec<String>>,
+    fail_at: &'a [usize],
+) -> impl FnMut(&[String], &str) -> Result<(), CommandFailure> + 'a {
+    move |cmd: &[String], _phase: &str| {
+        let index = seen.borrow().len();
+        seen.borrow_mut().push(cmd.join(" "));
+        if fail_at.contains(&index) {
+            return Err(CommandFailure::Exit(1));
+        }
+        Ok(())
+    }
+}
+
+fn numbered_commands(count: usize) -> Vec<Vec<String>> {
+    (0..count).map(|i| vec!["route".into(), format!("cmd{i}")]).collect()
+}
+
+#[skuld::test]
+fn setup_stops_at_the_first_failing_command() {
+    // Fatal phase: keeping on mutating the route table after a failure would
+    // build a route set nobody can reason about.
+    let seen: RefCell<Vec<String>> = RefCell::new(Vec::new());
+    let err = run_setup_with(&numbered_commands(5), PHASE_SETUP, recording_exec(&seen, &[1])).unwrap_err();
+
+    assert_eq!(err.index, 1);
+    assert_eq!(
+        *seen.borrow(),
+        vec!["route cmd0", "route cmd1"],
+        "no command after the failure may be issued"
+    );
+}
+
+#[skuld::test]
+fn cleanup_issues_every_command_even_when_all_of_them_fail() {
+    // Best-effort phase: stopping early would strand the routes the remaining
+    // deletes name, leaving the user worse off than if Hole had never run.
+    let seen: RefCell<Vec<String>> = RefCell::new(Vec::new());
+    let report = run_cleanup_with(
+        &numbered_commands(5),
+        PHASE_TEARDOWN,
+        recording_exec(&seen, &[0, 1, 2, 3, 4]),
+    );
+
+    assert_eq!(
+        report,
+        CleanupReport {
+            attempted: 5,
+            failed: 5
+        }
+    );
+    assert_eq!(seen.borrow().len(), 5, "every cleanup command must be issued");
+}
+
+#[skuld::test]
+fn cleanup_survives_a_spawn_failure_and_keeps_going() {
+    // A spawn failure used to `?` out of the loop, skipping every remaining
+    // delete. It is now just another failed command.
+    let seen: RefCell<Vec<String>> = RefCell::new(Vec::new());
+    let report = run_cleanup_with(&numbered_commands(3), PHASE_RECOVER_SPLIT, |cmd, _| {
+        seen.borrow_mut().push(cmd.join(" "));
+        Err(CommandFailure::Spawn(std::io::Error::other("no such program")))
+    });
+
+    assert_eq!(
+        report,
+        CleanupReport {
+            attempted: 3,
+            failed: 3
+        }
+    );
+    assert_eq!(seen.borrow().len(), 3);
+}
+
+// SystemRouting::install failure path =================================================================================
+//
+// `install_with` injects the two phases, so these drive the real
+// state-file/rollback logic without issuing a route command (#165).
+
+fn failed_setup(_: &str, _: IpAddr, _: IpAddr, _: &str) -> Result<(), RouteCommandError> {
+    Err(RouteCommandError {
+        program: "route".into(),
+        index: 0,
+        total: 5,
+        failure: CommandFailure::Exit(1),
+    })
+}
+
+#[skuld::test]
+fn install_hands_back_no_guard_when_a_setup_command_fails() {
+    let tmp = tempfile::tempdir().unwrap();
+    let routing = SystemRouting::new(tmp.path().to_path_buf(), None);
+
+    let result = routing.install_with(
+        "hole-tun",
+        ipv4_server(),
+        ipv4_gateway(),
+        "en0",
+        failed_setup,
+        |_, _, _| CleanupReport::default(),
+    );
+
+    assert!(
+        result.is_err(),
+        "a failed route install must not return a guard — the guard IS the bridge's \
+         evidence that the tunnel carries traffic (#901)"
+    );
+}
+
+#[skuld::test]
+fn install_rolls_back_and_clears_state_when_a_setup_command_fails() {
+    let tmp = tempfile::tempdir().unwrap();
+    let routing = SystemRouting::new(tmp.path().to_path_buf(), None);
+    let torn_down: RefCell<Vec<(String, IpAddr, String)>> = RefCell::new(Vec::new());
+
+    let result = routing.install_with(
+        "hole-tun",
+        ipv4_server(),
+        ipv4_gateway(),
+        "en0",
+        failed_setup,
+        |tun, ip, iface| {
+            torn_down.borrow_mut().push((tun.into(), ip, iface.into()));
+            CleanupReport {
+                attempted: 5,
+                failed: 4,
+            }
+        },
+    );
+
+    assert!(result.is_err());
+    assert_eq!(
+        *torn_down.borrow(),
+        vec![("hole-tun".to_string(), ipv4_server(), "en0".to_string())],
+        "the half-installed route set must be torn down with the same identity it was installed under"
+    );
+    assert!(
+        !tmp.path().join(STATE_FILE_NAME).exists(),
+        "a rolled-back install must leave no route-state file for the next start to replay"
+    );
+}
+
+#[skuld::test]
+fn install_persists_state_before_the_setup_phase_runs() {
+    // A SIGKILL between the two would otherwise leak routes with no on-disk
+    // record, defeating crash recovery.
+    let tmp = tempfile::tempdir().unwrap();
+    let routing = SystemRouting::new(tmp.path().to_path_buf(), None);
+    let state_seen = std::cell::Cell::new(false);
+
+    let _ = routing.install_with(
+        "hole-tun",
+        ipv4_server(),
+        ipv4_gateway(),
+        "en0",
+        |_, _, _, _| {
+            state_seen.set(tmp.path().join(STATE_FILE_NAME).exists());
+            failed_setup("", ipv4_server(), ipv4_gateway(), "")
+        },
+        |_, _, _| CleanupReport::default(),
+    );
+
+    assert!(
+        state_seen.get(),
+        "route-state must be on disk before any route mutation"
+    );
+}
+
+#[skuld::test]
+fn install_returns_a_guard_when_every_setup_command_succeeds() {
+    let tmp = tempfile::tempdir().unwrap();
+    let routing = SystemRouting::new(tmp.path().to_path_buf(), None);
+
+    let routes = routing
+        .install_with(
+            "hole-tun",
+            ipv4_server(),
+            ipv4_gateway(),
+            "en0",
+            |_, _, _, _| Ok(()),
+            |_, _, _| unreachable!("a successful install must not roll back"),
+        )
+        .expect("install must succeed when the setup phase does");
+
+    assert!(tmp.path().join(STATE_FILE_NAME).exists());
+    // `SystemRoutes::drop` issues REAL netsh/route commands and a
+    // `Remove-NetAdapter`; the #165 contract forbids that from a unit test.
+    std::mem::forget(routes);
+}
+
 // Phase classifier ====================================================================================================
 //
-// `is_recovery_phase` decides whether `run_commands` logs failures at debug
+// `is_recovery_phase` decides whether a failed command logs at debug
 // (idempotent best-effort cleanup) or warn (a real error). These tests are
 // regressions against accidental modification of the matcher itself —
 // they reference the same `PHASE_*` constants used by `recover_routes_with`,
@@ -369,10 +606,13 @@ fn cover_engage_phase_is_not_recovery() {
 
 type Captured = Vec<(String, Vec<Vec<String>>)>;
 
-fn capturing_runner(log: &RefCell<Captured>) -> impl Fn(&[Vec<String>], &str) -> std::io::Result<()> + '_ {
+fn capturing_runner(log: &RefCell<Captured>) -> impl Fn(&[Vec<String>], &str) -> CleanupReport + '_ {
     |cmds: &[Vec<String>], phase: &str| {
         log.borrow_mut().push((phase.into(), cmds.to_vec()));
-        Ok(())
+        CleanupReport {
+            attempted: cmds.len(),
+            failed: 0,
+        }
     }
 }
 
@@ -451,7 +691,7 @@ fn recover_with_loopback_server_skips_bypass() {
 }
 
 #[skuld::test]
-fn recover_clears_state_file_even_when_runner_errors() {
+fn recover_clears_state_file_even_when_every_command_fails() {
     let tmp = tempfile::tempdir().unwrap();
     let persisted_state = RouteState {
         version: state::SCHEMA_VERSION,
@@ -461,13 +701,15 @@ fn recover_clears_state_file_even_when_runner_errors() {
     };
     state::save(tmp.path(), &persisted_state, None).unwrap();
 
-    let failing =
-        |_: &[Vec<String>], _: &str| -> std::io::Result<()> { Err(std::io::Error::other("simulated runner failure")) };
+    let failing = |cmds: &[Vec<String>], _: &str| CleanupReport {
+        attempted: cmds.len(),
+        failed: cmds.len(),
+    };
     recover_routes_with(tmp.path(), failing, |_, _| {}, false, || false, |_| {});
 
     assert!(
         !tmp.path().join(STATE_FILE_NAME).exists(),
-        "state file should be cleared even when runner returns Err"
+        "state file should be cleared even when every recovery command failed"
     );
 }
 
@@ -554,7 +796,7 @@ fn recover_orders_lockdown_before_transient_sweep_and_passes_adopting() {
 
     recover_routes_with(
         dir.path(),
-        |_cmds, _phase| Ok(()),
+        |_cmds, _phase| CleanupReport::default(),
         |_state_dir, adopting| {
             order.borrow_mut().push("sweep_cover");
             *adopting_seen.borrow_mut() = Some(adopting);
@@ -598,7 +840,7 @@ fn recover_passes_adopting_only_on_adopt() {
         let adopting_seen: RefCell<Option<bool>> = RefCell::new(None);
         recover_routes_with(
             dir.path(),
-            |_c, _p| Ok(()),
+            |_c, _p| CleanupReport::default(),
             |_d, adopting| *adopting_seen.borrow_mut() = Some(adopting),
             intent,
             || present,
