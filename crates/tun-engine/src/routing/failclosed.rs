@@ -271,7 +271,7 @@ mod lockdown_privileged_tests;
 #[path = "failclosed/release_privileged_tests.rs"]
 mod release_privileged_tests;
 
-// Privileged-lane falsification (#874): engages the REAL standing lockdown
+// Privileged-lane falsification: engages the REAL standing lockdown
 // cover against two REAL, live TUN devices and proves the tunnel-permit rule
 // is sensitive to the interface it names, not merely present. Gated
 // identically to `lockdown_privileged_tests` above — see that module's doc.

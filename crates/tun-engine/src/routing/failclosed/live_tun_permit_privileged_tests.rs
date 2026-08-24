@@ -1,13 +1,13 @@
 //! Live-interface falsification for the standing lockdown cover's
-//! tunnel-permit rule (#874).
+//! tunnel-permit rule.
 //!
 //! `lockdown_privileged_tests.rs` proves the cover is selective (permit beats
 //! block-all, a non-permitted host is dropped) but engages against an
 //! interface picked only to exercise the resolve path — macOS uses a name
 //! that matches nothing at all, Windows a live-but-irrelevant loopback alias.
 //! Neither proves the permit is sensitive to the interface it names. A rule
-//! naming the wrong live interface — the realistic failure after #850 makes
-//! the macOS TUN name kernel-assigned, or a stale/duplicate Windows adapter —
+//! naming the wrong live interface — the realistic failure once the macOS TUN
+//! name becomes kernel-assigned, or with a stale/duplicate Windows adapter —
 //! produces a kill switch that blocks everything while the UI reports it
 //! armed and the real tunnel Running.
 //!
@@ -53,9 +53,8 @@
 //! (macOS `engage_pf_action`'s `FreshEnable` snapshots whatever is LIVE when
 //! it sees no persisted state) capture a PRIOR cover's block-everything
 //! ruleset as "the host" — and every later restore, including the escape
-//! guard itself, would then reload block-everything as the host and erase
-//! the evidence. See the plan's F7/F8 for the full argument; do not
-//! reintroduce a directory-per-phase habit here.
+//! guard itself, would then reload block-everything as the host and erase the
+//! evidence. Do not reintroduce a directory-per-phase habit here.
 //!
 //! ## What a real run does to the machine
 //!
@@ -63,13 +62,12 @@
 //! running it, for a few seconds, more than once.** It is not `#[ignore]`d
 //! and a plain `cargo nextest run` on an unelevated box fails loud (the
 //! privilege check), but on an elevated box it WILL arm the kill switch. If
-//! interrupted, [`EscapeGuard::new`] has already written the recovery text to
-//! `%TEMP%\hole-live-tun-permit-RECOVERY.txt` (or `/dev/tty`'s mirror on
-//! macOS) naming the platform command to clear it by hand.
+//! interrupted, the recovery record written before the first engage names the
+//! platform command to clear it by hand.
 
-use std::io::{self, Write as _};
+use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream, UdpSocket};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
 use std::time::Duration;
 
@@ -77,14 +75,13 @@ use std::time::Duration;
 use tun::AbstractDevice;
 
 use super::lockdown_privileged_tests::TUN;
-use super::{engage_lockdown, release_all, SystemLuidResolver};
+use super::{engage_lockdown, SystemLuidResolver};
+use crate::test_utils::{classify, EscapeGuard, OwnedRoute, RecordSpec};
 
 // Constants ===========================================================================================================
 
 /// TEST-NET-2 (RFC 5737) — never routable on the real internet, so its only
-/// route is the one this test installs. A prefix distinct from the other
-/// probe addresses used across this crate's privileged tests keeps a
-/// stranded route attributable to this test alone.
+/// route is the one this test installs.
 const PROBE_NET: &str = "198.51.100.0/24";
 /// UDP probe destination inside [`PROBE_NET`].
 const PROBE_IP: Ipv4Addr = Ipv4Addr::new(198, 51, 100, 53);
@@ -105,6 +102,12 @@ const NON_PERMITTED: &str = "8.8.8.8:443";
 /// ordinary link noise (multicast, NDP, ...) without any state beyond the
 /// frame itself.
 const PROBE_MARKER: &[u8; 16] = b"hole-tun-permit!";
+
+/// The escape record this test writes before its first engage.
+const RECORD: RecordSpec = RecordSpec {
+    file_name: "hole-live-tun-permit-RECOVERY.txt",
+    what: "hole live-tun-permit test",
+};
 
 fn server_ip() -> IpAddr {
     SERVER_IP.parse().expect("literal")
@@ -251,8 +254,8 @@ fn seen_has_tcp_syn(seen: &[String], dst: Ipv4Addr, port: u16) -> bool {
 
 /// One UDP datagram to `PROBE_IP:53` carrying [`PROBE_MARKER`] plus `nonce`,
 /// from a freshly bound ephemeral socket. Callers keep the `Result`: whether
-/// the send itself left the process is a classification input in phase 3
-/// (a bind-class failure must never read as a firewall block).
+/// the send reached the network stack is a classification input in phases 2
+/// and 3 (a bind-class failure must never read as a firewall verdict).
 fn send_udp_probe(nonce: u32) -> io::Result<()> {
     let sock = UdpSocket::bind("0.0.0.0:0")?;
     let mut payload = PROBE_MARKER.to_vec();
@@ -263,16 +266,12 @@ fn send_udp_probe(nonce: u32) -> io::Result<()> {
 
 // LiveTun =============================================================================================================
 
-/// One opened TUN device, its discovered/assigned interface name, and
-/// (device 1 only) ownership of the probe route this test installed. `Drop`
-/// removes only a route it confirmed creating (F9) and never panics —
-/// failures are `eprintln!`ed so a developer whose box is left modified
-/// finds out, without risking a double panic during an unwind that would
-/// skip the release guards downstream.
+/// One opened TUN device and its discovered/assigned interface name. The
+/// probe route is owned separately (by an [`OwnedRoute`] the opener returns)
+/// so it is removed while both devices are still up.
 struct LiveTun {
     device: tun::AsyncDevice,
     name: String,
-    owns_probe_route: bool,
 }
 
 impl LiveTun {
@@ -313,18 +312,6 @@ impl LiveTun {
     }
 }
 
-impl Drop for LiveTun {
-    fn drop(&mut self) {
-        if !self.owns_probe_route {
-            return;
-        }
-        #[cfg(target_os = "windows")]
-        windows_remove_probe_route(&self.name);
-        #[cfg(target_os = "macos")]
-        macos_remove_probe_route(&self.name);
-    }
-}
-
 // Platform device + route setup =======================================================================================
 
 #[cfg(target_os = "windows")]
@@ -332,112 +319,6 @@ fn open_windows_device(name: &str, addr: &str, netmask: &str) -> tun::AsyncDevic
     let mut cfg = tun::Configuration::default();
     cfg.tun_name(name).mtu(1500).up().address(addr).netmask(netmask);
     tun::create_as_async(&cfg).unwrap_or_else(|e| panic!("HARNESS: create_as_async({name}) failed: {e}"))
-}
-
-/// Render a completed process's exit status AND both streams. `netsh`
-/// writes its diagnostics to STDOUT, not stderr — a stderr-only capture
-/// silently drops the one line that explains a failure, turning "failed:"
-/// into an empty, undiagnosable message. Every command this file shells out
-/// to reports through this so a HARNESS failure is diagnosable from the
-/// first CI run, not the second.
-fn describe_output(out: &std::process::Output) -> String {
-    format!(
-        "exit={:?} stdout={:?} stderr={:?}",
-        out.status.code(),
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr),
-    )
-}
-
-#[cfg(target_os = "windows")]
-fn ps_output(script: &str) -> String {
-    let out = Command::new("powershell")
-        .args(["-NoProfile", "-Command", script])
-        .output()
-        .unwrap_or_else(|e| panic!("HARNESS: failed to spawn powershell: {e}"));
-    if !out.status.success() {
-        panic!(
-            "HARNESS: powershell -Command {script:?} failed: {}",
-            describe_output(&out)
-        );
-    }
-    String::from_utf8_lossy(&out.stdout).trim().to_string()
-}
-
-#[cfg(target_os = "windows")]
-fn windows_add_probe_route(name: &str) {
-    // F9: own only what we install. A pre-existing route to PROBE_NET on any
-    // interface must not be silently doubled up or later deleted out from
-    // under something this test never created.
-    let existing = ps_output(&format!(
-        "(Get-NetRoute -DestinationPrefix '{PROBE_NET}' -ErrorAction SilentlyContinue | Format-Table -AutoSize | Out-String).Trim()"
-    ));
-    if !existing.is_empty() {
-        panic!("HARNESS: a pre-existing route to {PROBE_NET} already exists — refusing to add a second:\n{existing}");
-    }
-
-    // NOTE: no manual quotes around the interface value — `Command::args`
-    // already escapes each element as ONE argv token for the standard
-    // Windows argv parser netsh's own C runtime startup uses; wrapping the
-    // value in literal `"` characters here makes THEM part of the delivered
-    // value (`"name"`, quotes included) instead of delimiting it. These
-    // device names never contain spaces, but the bug is real regardless of
-    // that — confirmed empirically against a runner interface name that
-    // does (bindreams/hole#886 review).
-    let out = Command::new("netsh")
-        .args([
-            "interface",
-            "ipv4",
-            "add",
-            "route",
-            &format!("prefix={PROBE_NET}"),
-            &format!("interface={name}"),
-            "store=active",
-        ])
-        .output()
-        .unwrap_or_else(|e| panic!("HARNESS: failed to spawn netsh add route: {e}"));
-    if !out.status.success() {
-        panic!(
-            "HARNESS: netsh add route prefix={PROBE_NET} interface={name} failed: {}",
-            describe_output(&out)
-        );
-    }
-
-    // Read the table back: the ADD can succeed while a pre-existing
-    // same-length prefix on another interface still wins the lookup (F9).
-    let winner = ps_output(&format!(
-        "(Find-NetRoute -RemoteIPAddress '{PROBE_IP}' -ErrorAction Stop | Select-Object -First 1 -ExpandProperty InterfaceAlias)"
-    ));
-    if winner != name {
-        panic!(
-            "HARNESS: after adding the probe route, traffic to {PROBE_IP} would actually leave via \
-             '{winner}', not device 1 ('{name}') — a pre-existing route may be winning a metric tiebreak"
-        );
-    }
-}
-
-#[cfg(target_os = "windows")]
-fn windows_remove_probe_route(name: &str) {
-    // See `windows_add_probe_route`'s note: no manual quoting.
-    let out = Command::new("netsh")
-        .args([
-            "interface",
-            "ipv4",
-            "delete",
-            "route",
-            &format!("prefix={PROBE_NET}"),
-            &format!("interface={name}"),
-            "store=active",
-        ])
-        .output();
-    match out {
-        Ok(o) if o.status.success() => {}
-        Ok(o) => eprintln!(
-            "HARNESS: netsh delete route prefix={PROBE_NET} interface={name} failed: {}",
-            describe_output(&o)
-        ),
-        Err(e) => eprintln!("HARNESS: failed to spawn netsh delete route for {name}: {e}"),
-    }
 }
 
 #[cfg(target_os = "windows")]
@@ -459,7 +340,7 @@ fn print_diagnostics(name1: &str, name2: &str) {
 /// live adapter out from under this test on any bridge teardown running
 /// concurrently on the box.
 #[cfg(target_os = "windows")]
-fn open_pair() -> (LiveTun, LiveTun) {
+fn open_pair() -> (LiveTun, LiveTun, OwnedRoute) {
     crate::device::wintun::ensure_loaded().expect("HARNESS: ensure_loaded (wintun.dll)");
 
     let name1 = "permit-test-tun-a".to_string();
@@ -468,26 +349,30 @@ fn open_pair() -> (LiveTun, LiveTun) {
     let dev2 = open_windows_device(&name2, "10.255.252.1", "255.255.255.0");
 
     print_diagnostics(&name1, &name2);
-    windows_add_probe_route(&name1);
+    // Ownership BEFORE verification: `assert_wins_for` panics on a
+    // pre-existing route winning the lookup, and this route must unwind with
+    // it (see `OwnedRoute`).
+    let route = OwnedRoute::add(PROBE_NET, &name1, None);
+    route.assert_wins_for(PROBE_IP.into());
 
     (
         LiveTun {
             device: dev1,
             name: name1,
-            owns_probe_route: true,
         },
         LiveTun {
             device: dev2,
             name: name2,
-            owns_probe_route: false,
         },
+        route,
     )
 }
 
 #[cfg(target_os = "macos")]
 fn open_macos_device(addr: &str, dest: &str) -> tun::AsyncDevice {
     // Name is NOT requested — XNU assigns utunN, read back below. This is
-    // the same discovery shape #850 must thread into production.
+    // the same discovery shape production must thread through once macOS
+    // stops naming its TUN with a compile-time constant.
     let cfg = tun::Configuration::default();
     tun::create_as_async(&cfg)
         .unwrap_or_else(|e| panic!("HARNESS: create_as_async (empty config) failed: {e}"))
@@ -522,81 +407,12 @@ impl TapIfconfig for tun::AsyncDevice {
             .output()
             .unwrap_or_else(|e| panic!("HARNESS: failed to spawn ifconfig {name}: {e}"));
         if !out.status.success() {
-            panic!("HARNESS: ifconfig {name} failed: {}", describe_output(&out));
+            panic!(
+                "HARNESS: ifconfig {name} failed: {}",
+                crate::test_utils::describe_output(&out)
+            );
         }
         self
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn macos_existing_probe_route() -> Option<String> {
-    let out = Command::new("netstat").args(["-rn", "-f", "inet"]).output().ok()?;
-    let text = String::from_utf8_lossy(&out.stdout).into_owned();
-    text.lines()
-        .find(|l| {
-            l.split_whitespace()
-                .next()
-                .map(|dest| dest.starts_with("198.51.100"))
-                .unwrap_or(false)
-        })
-        .map(|s| s.to_string())
-}
-
-#[cfg(target_os = "macos")]
-fn macos_add_probe_route(name: &str) {
-    // F9: own only what we install.
-    if let Some(existing) = macos_existing_probe_route() {
-        panic!(
-            "HARNESS: a pre-existing route touching {PROBE_NET} already exists — refusing to add a second:\n{existing}"
-        );
-    }
-
-    let out = Command::new("route")
-        .args(["-n", "add", "-net", PROBE_NET, "-interface", name])
-        .output()
-        .unwrap_or_else(|e| panic!("HARNESS: failed to spawn route add: {e}"));
-    if !out.status.success() {
-        panic!(
-            "HARNESS: route -n add -net {PROBE_NET} -interface {name} failed: {}",
-            describe_output(&out)
-        );
-    }
-
-    // Read the table back via the kernel's own lookup for PROBE_IP, not a
-    // static prefix-match re-implementation (F9).
-    let out = Command::new("route")
-        .args(["-n", "get", &PROBE_IP.to_string()])
-        .output()
-        .unwrap_or_else(|e| panic!("HARNESS: failed to spawn route get: {e}"));
-    if !out.status.success() {
-        panic!("HARNESS: route -n get {PROBE_IP} failed: {}", describe_output(&out));
-    }
-    let text = String::from_utf8_lossy(&out.stdout).into_owned();
-    let winner = text
-        .lines()
-        .find_map(|l| l.trim().strip_prefix("interface:").map(|s| s.trim().to_string()));
-    match winner {
-        Some(w) if w == name => {}
-        Some(w) => panic!(
-            "HARNESS: after adding the probe route, traffic to {PROBE_IP} would actually leave via \
-             '{w}', not device 1 ('{name}') — a pre-existing route may be winning:\n{text}"
-        ),
-        None => panic!("HARNESS: could not parse `route -n get {PROBE_IP}` output:\n{text}"),
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn macos_remove_probe_route(name: &str) {
-    let out = Command::new("route")
-        .args(["-n", "delete", "-net", PROBE_NET, "-interface", name])
-        .output();
-    match out {
-        Ok(o) if o.status.success() => {}
-        Ok(o) => eprintln!(
-            "HARNESS: route -n delete -net {PROBE_NET} -interface {name} failed: {}",
-            describe_output(&o)
-        ),
-        Err(e) => eprintln!("HARNESS: failed to spawn route delete for {name}: {e}"),
     }
 }
 
@@ -612,7 +428,7 @@ fn print_diagnostics(name1: &str, name2: &str) {
 }
 
 #[cfg(target_os = "macos")]
-fn open_pair() -> (LiveTun, LiveTun) {
+fn open_pair() -> (LiveTun, LiveTun, OwnedRoute) {
     let dev1 = open_macos_device("10.255.253.1", "10.255.253.2");
     let name1 = dev1
         .tun_name()
@@ -623,122 +439,34 @@ fn open_pair() -> (LiveTun, LiveTun) {
         .unwrap_or_else(|e| panic!("HARNESS: tun_name() (device 2) failed: {e}"));
 
     print_diagnostics(&name1, &name2);
-    macos_add_probe_route(&name1);
+    // Ownership BEFORE verification — see the Windows opener's note.
+    let route = OwnedRoute::add(PROBE_NET, &name1, None);
+    route.assert_wins_for(PROBE_IP.into());
 
     (
         LiveTun {
             device: dev1,
             name: name1,
-            owns_probe_route: true,
         },
         LiveTun {
             device: dev2,
             name: name2,
-            owns_probe_route: false,
         },
+        route,
     )
-}
-
-// Recovery record =====================================================================================================
-
-#[cfg(target_os = "windows")]
-fn recovery_command() -> &'static str {
-    "hole bridge unlock"
-}
-
-#[cfg(target_os = "macos")]
-fn recovery_command() -> &'static str {
-    // NEVER `hole bridge unlock` here (#882): that resolves the fixed
-    // production `service_state_dir()`, not this test's tempdir, and would
-    // report success while the real cover (engaged into OUR state dir)
-    // stays live.
-    "sudo pfctl -f /etc/pf.conf"
-}
-
-#[cfg(target_os = "windows")]
-fn open_controlling_terminal() -> io::Result<std::fs::File> {
-    std::fs::OpenOptions::new().write(true).open("CONOUT$")
-}
-
-#[cfg(target_os = "macos")]
-fn open_controlling_terminal() -> io::Result<std::fs::File> {
-    std::fs::OpenOptions::new().write(true).open("/dev/tty")
-}
-
-/// Write the escape-from-a-stranded-cover record BEFORE the first engage —
-/// never from a `Drop`, which is exactly as absent as the banner it replaces
-/// on any path that skips destructors (SIGINT, a double-panic abort). Writes
-/// a fixed, predictable file AND the controlling terminal (best-effort — no
-/// terminal in CI is not an error): the terminal write is the one an
-/// interactive developer actually sees, since nextest's captured-stdout pipe
-/// is rendered only on completion of the test, never on an abort mid-run.
-fn write_recovery_record(state_dir: &Path) -> io::Result<PathBuf> {
-    let path = std::env::temp_dir().join("hole-live-tun-permit-RECOVERY.txt");
-    let text = format!(
-        "hole live-tun-permit test: a real system-wide fail-closed cover may be engaged.\n\
-         State directory: {}\n\
-         If this file still exists and the test process is gone, the host may be stranded\n\
-         fail-closed. Recover with:\n\
-         \n    {}\n\n",
-        state_dir.display(),
-        recovery_command(),
-    );
-    std::fs::write(&path, &text)?;
-    if let Ok(mut tty) = open_controlling_terminal() {
-        let _ = tty.write_all(text.as_bytes());
-    }
-    Ok(path)
-}
-
-/// Unconditional escape, alive from before the first engage to the end of
-/// the test. Owns the single state directory (F7): `release_all` reads that
-/// directory's state file to decide what to clear, and an ABSENT file reads
-/// as a clean host — so this guard owning the `TempDir` itself (not just its
-/// path) guarantees `release_all` never runs against a directory some other
-/// cleanup already deleted, which would silently report success over a live
-/// cover.
-struct EscapeGuard {
-    dir: tempfile::TempDir,
-    record_path: PathBuf,
-}
-
-impl EscapeGuard {
-    fn new() -> Self {
-        let dir = tempfile::tempdir().expect("HARNESS: create state tempdir");
-        let record_path = write_recovery_record(dir.path()).expect("HARNESS: write recovery record");
-        Self { dir, record_path }
-    }
-
-    fn state_dir(&self) -> &Path {
-        self.dir.path()
-    }
-}
-
-impl Drop for EscapeGuard {
-    fn drop(&mut self) {
-        // Must not panic: this may run during an unwind.
-        if let Err(e) = release_all(self.dir.path()) {
-            eprintln!(
-                "HARNESS: release_all failed during EscapeGuard::drop over {:?}: {e} — host may still be \
-                 fail-closed; see {:?}",
-                self.dir.path(),
-                self.record_path
-            );
-        }
-        if let Err(e) = std::fs::remove_file(&self.record_path) {
-            eprintln!("HARNESS: failed to remove recovery record {:?}: {e}", self.record_path);
-        }
-    }
 }
 
 // The four-phase test =================================================================================================
 
-// `open_pair` is taken as a parameter, not called directly, so this function
-// (unlike its callers below) stays free of any `#[cfg(target_os = ...)]` —
-// `open_pair` itself only exists under `windows`/`macos`, and this module is
-// gated only by `#[cfg(test)]` (see `failclosed.rs`), so it's typechecked on
-// every platform including the unsupported ones.
-fn run_live_tun_permit_core(open_pair: impl FnOnce() -> (LiveTun, LiveTun)) {
+// `open_pair` and `platform_pin` are taken as parameters, not called
+// directly, so this function (unlike its callers below) carries no
+// `#[cfg(target_os = ...)]` at all: it is one body, typechecked on every
+// platform, and a change that breaks one platform's phases cannot hide until
+// that platform's lane runs.
+fn run_live_tun_permit_core(
+    open_pair: impl FnOnce() -> (LiveTun, LiveTun, OwnedRoute),
+    platform_pin: impl FnOnce(&Path),
+) {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -750,11 +478,13 @@ fn run_live_tun_permit_core(open_pair: impl FnOnce() -> (LiveTun, LiveTun)) {
         // construction, and panics ("no reactor running") with none entered.
         // Calling it here also keeps device construction on the SAME runtime
         // instance that later drives `.recv()` — a different runtime's
-        // reactor wouldn't be the one polling these fds.
-        let (dev1, dev2) = open_pair();
+        // reactor wouldn't be the one polling these fds. The route is dropped
+        // before either device (reverse declaration order), so it is removed
+        // while the interface carrying it is still up.
+        let (dev1, dev2, _probe_route) = open_pair();
 
-        // Escape guard + recovery record BEFORE anything is engaged (F8).
-        let guard = EscapeGuard::new();
+        // Escape guard + recovery record BEFORE anything is engaged.
+        let guard = EscapeGuard::with_temp_dir(&RECORD);
         let resolver = SystemLuidResolver;
 
         // Phase 1 — control, no cover engaged.
@@ -796,17 +526,18 @@ fn run_live_tun_permit_core(open_pair: impl FnOnce() -> (LiveTun, LiveTun)) {
         drop(cover);
 
         // Assert only after the cover is released, in the mandated order.
-        let send2_left_process = send2.is_ok();
-        let tcp2_consistent = matches!(
-            tcp2.as_ref().map_err(|e| e.kind()),
-            Err(io::ErrorKind::TimedOut) | Err(io::ErrorKind::ConnectionRefused) | Err(io::ErrorKind::ConnectionReset)
-        );
+        // The harness gate asks ONLY whether each probe reached the network
+        // stack: a probe the stack rejected — including the
+        // `PermissionDenied` a Windows WFP deny at `ALE_AUTH_CONNECT`
+        // produces — IS a cover verdict, and belongs to the product assert
+        // below, not here. Both phases classify through the same function so
+        // the two can't drift into disjoint notions of "blocked".
+        let send2_fate = classify(&send2);
+        let tcp2_fate = classify(&tcp2);
         assert!(
-            send2_left_process && tcp2_consistent,
-            "HARNESS: a phase-2 probe did not reach the network stack for a reason unrelated to the cover \
-             (send2={:?}, tcp2={:?}) — this says nothing about the cover, fix the harness first",
-            send2.as_ref().err().map(|e| e.kind()),
-            tcp2.as_ref().err().map(|e| e.kind()),
+            send2_fate.is_verdict() && tcp2_fate.is_verdict(),
+            "HARNESS: a phase-2 probe never reached the network stack (send2={send2_fate:?}, tcp2={tcp2_fate:?}) \
+             — this says nothing about the cover, fix the harness first",
         );
         assert!(
             cover_blocking,
@@ -820,8 +551,8 @@ fn run_live_tun_permit_core(open_pair: impl FnOnce() -> (LiveTun, LiveTun)) {
         assert!(
             permit_seen && permit_seen_tcp,
             "PRODUCT BUG, not a test bug: the tunnel-permit rule did not match the interface it names \
-             (device 1, '{}') — UDP permit_seen={permit_seen} (seen={seen2_udp:?}) TCP permit_seen_tcp={permit_seen_tcp} \
-             (seen={seen2_tcp:?})",
+             (device 1, '{}') — UDP permit_seen={permit_seen} (seen={seen2_udp:?}, send2={send2_fate:?}) \
+             TCP permit_seen_tcp={permit_seen_tcp} (seen={seen2_tcp:?}, tcp2={tcp2_fate:?})",
             dev1.tun_name(),
         );
 
@@ -848,18 +579,12 @@ fn run_live_tun_permit_core(open_pair: impl FnOnce() -> (LiveTun, LiveTun)) {
 
         // 1. Classify send3/tcp3: absence from `seen3` is only a firewall
         //    verdict if the probe actually reached the stack.
-        let send3_consistent = matches!(send3, Ok(())) || matches!(&send3, Err(e) if e.kind() == io::ErrorKind::PermissionDenied);
-        let tcp3_consistent = tcp3.is_ok()
-            || matches!(
-                tcp3.as_ref().map_err(|e| e.kind()),
-                Err(io::ErrorKind::PermissionDenied) | Err(io::ErrorKind::TimedOut)
-            );
+        let send3_fate = classify(&send3);
+        let tcp3_fate = classify(&tcp3);
         assert!(
-            send3_consistent && tcp3_consistent,
-            "HARNESS: a mutation-phase probe failed for a reason unrelated to firewall blocking \
-             (send3={:?}, tcp3={:?}) — cannot judge the mutation from these; seen={seen3:?}",
-            send3.as_ref().err().map(|e| e.kind()),
-            tcp3.as_ref().err().map(|e| e.kind()),
+            send3_fate.is_verdict() && tcp3_fate.is_verdict(),
+            "HARNESS: a mutation-phase probe never reached the network stack (send3={send3_fate:?}, \
+             tcp3={tcp3_fate:?}) — cannot judge the mutation from these; seen={seen3:?}",
         );
         // 2. The tail arrived — device/send path alive, ordering argument holds.
         assert!(
@@ -887,27 +612,32 @@ fn run_live_tun_permit_core(open_pair: impl FnOnce() -> (LiveTun, LiveTun)) {
             "restore: {NON_PERMITTED} must be reachable again — the box was left open"
         );
 
-        // Windows-only, cheap: pins F5 (Windows fails loud on an unknown
-        // alias; macOS's silent-accept is exactly the dangerous asymmetry
-        // this whole module exists to catch by naming a LIVE wrong
-        // interface instead).
-        #[cfg(target_os = "windows")]
-        {
-            let bad = engage_lockdown(
-                server_ip(),
-                "hole-live-tun-permit-does-not-exist",
-                &resolver,
-                &[],
-                guard.state_dir(),
-                None,
-            );
-            let is_err = bad.is_err();
-            drop(bad); // release immediately if it somehow engaged
-            assert!(is_err, "ConvertInterfaceAliasToLuid must fail loud on an unknown alias (F5)");
-        }
+        platform_pin(guard.state_dir());
 
         drop(guard);
     });
+}
+
+/// F5: Windows fails loud on an unknown interface alias. macOS's
+/// silent-accept is exactly the dangerous asymmetry this whole module exists
+/// to catch by naming a LIVE wrong interface instead, so it has no
+/// counterpart there.
+#[cfg(target_os = "windows")]
+fn windows_unknown_alias_pin(state_dir: &Path) {
+    let bad = engage_lockdown(
+        server_ip(),
+        "hole-live-tun-permit-does-not-exist",
+        &SystemLuidResolver,
+        &[],
+        state_dir,
+        None,
+    );
+    let is_err = bad.is_err();
+    drop(bad); // release immediately if it somehow engaged
+    assert!(
+        is_err,
+        "ConvertInterfaceAliasToLuid must fail loud on an unknown alias (F5)"
+    );
 }
 
 /// Windows: see the module doc for the four-phase shape and the anti-vacuity
@@ -916,7 +646,7 @@ fn run_live_tun_permit_core(open_pair: impl FnOnce() -> (LiveTun, LiveTun)) {
 #[cfg(target_os = "windows")]
 #[skuld::test(labels = [TUN], serial = TUN)]
 fn windows_live_tun_permit_passes_traffic_on_the_interface_it_names() {
-    run_live_tun_permit_core(open_pair);
+    run_live_tun_permit_core(open_pair, windows_unknown_alias_pin);
 }
 
 /// macOS: see the module doc for the four-phase shape and the anti-vacuity
@@ -928,5 +658,5 @@ fn windows_live_tun_permit_passes_traffic_on_the_interface_it_names() {
 #[cfg(target_os = "macos")]
 #[skuld::test(labels = [TUN], serial = TUN)]
 fn macos_live_tun_permit_passes_traffic_on_the_interface_it_names() {
-    run_live_tun_permit_core(open_pair);
+    run_live_tun_permit_core(open_pair, |_| {});
 }

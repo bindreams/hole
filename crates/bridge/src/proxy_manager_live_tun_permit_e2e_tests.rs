@@ -1,5 +1,5 @@
-//! Session-level composition guard for the standing lockdown cover (#874),
-//! Windows half.
+//! Session-level composition guard for the standing lockdown cover, Windows
+//! half.
 //!
 //! `tun_engine`'s `live_tun_permit_privileged_tests` (crates/tun-engine)
 //! falsifies the cover's tunnel-permit rule directly: it opens two real TUN
@@ -24,17 +24,17 @@
 //!    `proxy_manager.rs` passes that SAME constant to `install_lockdown`, so
 //!    the two names cannot disagree by construction, and this test induces
 //!    no mutation. It is a composition guard, not a falsification test — the
-//!    interface-liveness falsification lives in `tun-engine`'s test, and the
-//!    macOS half of THIS test (where the TUN name is discovered at runtime
-//!    rather than shared as a compile-time constant, so production CAN name
-//!    the wrong interface) is a required deliverable of #850, which also
-//!    makes `Dispatcher::new` reachable on macOS in the first place.
+//!    interface-liveness falsification lives in `tun-engine`'s test. The
+//!    macOS half of THIS test, where the TUN name is discovered at runtime
+//!    rather than shared as a compile-time constant (so production CAN name
+//!    the wrong interface), does not exist yet: `Dispatcher::new` is not
+//!    reachable on macOS at all until macOS TUN naming becomes
+//!    runtime-discovered.
 //!
 //! Gate: `cfg(target_os = "windows")` — `Dispatcher::new` sets
 //! `c.tun_name = TUN_DEVICE_NAME` unconditionally and the pinned `tun` crate
 //! rejects any macOS name not starting with `utun`, so a macOS Full-mode
 //! start dies before routes, before DNS, and before `install_lockdown` today.
-//! Widens to `any(windows, macos)` once #850 lands.
 //!
 //! COUPLED NAME: the test name below contains the literal substring
 //! `live_tun_permit_`, which `.config/nextest.toml`'s `global-net-state`
@@ -43,10 +43,8 @@
 //! `serial = TUN` reuses `crate::test_support::skuld_fixtures::TUN` — the
 //! same label `e2e_none_full_tunnel_roundtrip` carries — never redeclared.
 
-use std::io;
-use std::net::TcpStream;
-use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::net::{IpAddr, SocketAddr, TcpStream};
+use std::path::Path;
 use std::time::Duration;
 
 use crate::test_support::dist_fixture::*;
@@ -56,16 +54,51 @@ use crate::test_support::rt;
 use crate::test_support::skuld_fixtures::*;
 use hole_common::config::{DnsConfig, FilterAction, FilterRule, MatchType, ServerEntry};
 use hole_common::protocol::{BridgeRequest, BridgeResponse, ProxyConfig, TunnelMode};
+use tun_engine::test_utils::{classify, EscapeGuard, OwnedRoute, ProbeFate, RecordSpec};
 use tun_engine::GatewayInfo;
 use util::port_alloc::Protocols;
 
-/// TEST-NET-2 (RFC 5737) — never routable on the real internet. Distinct
-/// prefix from `tun-engine`'s own probe net so a stranded route or filter is
-/// attributable to whichever test left it.
-const TUNNEL_PROBE: &str = "198.51.100.0/24";
-const TUNNEL_PROBE_ADDR: &str = "198.51.100.7:80";
+/// TEST-NET-3 (RFC 5737) — never routable on the real internet. A different
+/// block from `tun-engine`'s own probe net (TEST-NET-2), so a route or filter
+/// stranded on the box is attributable to whichever test left it, and neither
+/// test's residue can out-compete the other's split by longest-prefix match.
+const TUNNEL_PROBE: &str = "203.0.113.0/24";
+/// Host `.7` inside [`TUNNEL_PROBE`]. Both addresses below are DERIVED from
+/// the constant they must sit inside: a second literal would silently drift
+/// out of its net (or off its bypass route) and the probe would then measure
+/// a different path than the one the test set up, with nothing failing.
+const TUNNEL_PROBE_HOST: u8 = 7;
 const NO_LEAK_TARGET_IP: &str = "8.8.8.8";
-const NO_LEAK_TARGET_ADDR: &str = "8.8.8.8:443";
+const NO_LEAK_TARGET_PORT: u16 = 443;
+const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
+fn tunnel_probe_addr() -> SocketAddr {
+    let net: IpAddr = TUNNEL_PROBE
+        .split('/')
+        .next()
+        .expect("literal")
+        .parse()
+        .expect("literal");
+    let IpAddr::V4(net) = net else {
+        panic!("HARNESS: {TUNNEL_PROBE} must be IPv4")
+    };
+    let [a, b, c, _] = net.octets();
+    SocketAddr::from(([a, b, c, TUNNEL_PROBE_HOST], 80))
+}
+
+fn no_leak_target_ip() -> IpAddr {
+    NO_LEAK_TARGET_IP.parse().expect("literal")
+}
+
+fn no_leak_target_addr() -> SocketAddr {
+    SocketAddr::new(no_leak_target_ip(), NO_LEAK_TARGET_PORT)
+}
+
+/// The escape record this test writes before it arms anything.
+const RECORD: RecordSpec = RecordSpec {
+    file_name: "hole-live-tun-permit-e2e-RECOVERY.txt",
+    what: "hole live-tun-permit session e2e",
+};
 
 fn entry_from(ss: &SsServerHandle) -> ServerEntry {
     ServerEntry {
@@ -81,232 +114,43 @@ fn entry_from(ss: &SsServerHandle) -> ServerEntry {
     }
 }
 
-/// The only outcomes a TCP connect to a TEST-NET-2 host under a session with
-/// no listener there can produce. `Connected` is the one outcome a firewall
-/// drop provably cannot manufacture — a completed three-way handshake means
-/// something (smoltcp's `ensure_listener`, per `driver.rs`) answered locally.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ProbeOutcome {
-    Connected,
-    ResetOrRefused,
-    TimedOut,
-    PermissionDenied,
-    Other,
+fn connect(addr: SocketAddr) -> ProbeFate {
+    classify(&TcpStream::connect_timeout(&addr, PROBE_TIMEOUT))
 }
 
-fn classify(r: io::Result<TcpStream>) -> ProbeOutcome {
-    match r {
-        Ok(_) => ProbeOutcome::Connected,
-        Err(e) => match e.kind() {
-            io::ErrorKind::ConnectionRefused | io::ErrorKind::ConnectionReset => ProbeOutcome::ResetOrRefused,
-            io::ErrorKind::TimedOut => ProbeOutcome::TimedOut,
-            io::ErrorKind::PermissionDenied => ProbeOutcome::PermissionDenied,
-            _ => ProbeOutcome::Other,
-        },
-    }
+/// A TCP connect to a TEST-NET host under a session with no listener there.
+/// `Delivered` — a completed three-way handshake — is the one outcome a
+/// firewall drop provably cannot manufacture: something (smoltcp's
+/// `ensure_listener`, per `driver.rs`) answered locally.
+fn probe_tunnel() -> ProbeFate {
+    connect(tunnel_probe_addr())
 }
 
-fn probe_tunnel() -> ProbeOutcome {
-    classify(TcpStream::connect_timeout(
-        &TUNNEL_PROBE_ADDR.parse().expect("literal"),
-        Duration::from_secs(5),
-    ))
-}
+// Bypass route ========================================================================================================
 
-// Bypass route (F6/F9) ================================================================================================
-
-/// Render a completed process's exit status AND both streams. `netsh`
-/// writes its diagnostics to STDOUT, not stderr — a stderr-only capture
-/// silently drops the one line that explains a failure, turning "failed:"
-/// into an empty, undiagnosable message. Every command this file shells out
-/// to reports through this so a HARNESS failure is diagnosable from the
-/// first CI run, not the second.
-fn describe_output(out: &std::process::Output) -> String {
-    format!(
-        "exit={:?} stdout={:?} stderr={:?}",
-        out.status.code(),
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr),
-    )
-}
-
-fn ps_output(script: &str) -> String {
-    let out = Command::new("powershell")
-        .args(["-NoProfile", "-Command", script])
-        .output()
-        .unwrap_or_else(|e| panic!("HARNESS: failed to spawn powershell: {e}"));
-    if !out.status.success() {
-        panic!(
-            "HARNESS: powershell -Command {script:?} failed: {}",
-            describe_output(&out)
-        );
-    }
-    String::from_utf8_lossy(&out.stdout).trim().to_string()
-}
-
-/// Own only what we installed (F9). Without this route, `8.8.8.8` is a
-/// TUNNEL destination under a Full-mode session (the `0.0.0.0/1` split), so
-/// the interface permit would correctly permit it — see F6. Longest-prefix
-/// match puts this `/32` ahead of the `/1` split once installed.
-struct BypassRoute {
-    interface_name: String,
-}
-
-impl BypassRoute {
-    fn install(gw: &GatewayInfo) -> Self {
-        let prefix = format!("{NO_LEAK_TARGET_IP}/32");
-        let existing = ps_output(&format!(
-            "(Get-NetRoute -DestinationPrefix '{prefix}' -ErrorAction SilentlyContinue | Format-Table -AutoSize | Out-String).Trim()"
-        ));
-        if !existing.is_empty() {
-            panic!("HARNESS: a pre-existing route to {prefix} already exists — refusing to add a second:\n{existing}");
-        }
-
-        // NOTE: no manual quotes around the interface value. `Command::args`
-        // already escapes each element as ONE argv token for the standard
-        // Windows argv parser netsh's own C runtime startup uses; wrapping
-        // the value in literal `"` characters here makes THEM part of the
-        // delivered value (`"Ethernet 3"`, quotes included) instead of
-        // delimiting it, and netsh then fails to resolve a nonexistent
-        // adapter literally named with quote marks — confirmed empirically
-        // (a Windows runner whose interface name contains a space, e.g.
-        // "Ethernet 3", made the add fail; see bindreams/hole#886 review).
-        let out = Command::new("netsh")
-            .args([
-                "interface",
-                "ipv4",
-                "add",
-                "route",
-                &format!("prefix={prefix}"),
-                &format!("interface={}", gw.interface_name),
-                &format!("nexthop={}", gw.gateway_ip),
-                "store=active",
-            ])
-            .output()
-            .unwrap_or_else(|e| panic!("HARNESS: failed to spawn netsh add route: {e}"));
-        if !out.status.success() {
-            panic!(
-                "HARNESS: netsh add route prefix={prefix} interface={} nexthop={} failed: {}",
-                gw.interface_name,
-                gw.gateway_ip,
-                describe_output(&out)
-            );
-        }
-
-        // Read the table back via the kernel's own lookup for the real
-        // destination — distinguishes "add failed" from "add succeeded but
-        // another route still wins a metric tiebreak" (F9).
-        let winner = ps_output(&format!(
-            "(Find-NetRoute -RemoteIPAddress '{NO_LEAK_TARGET_IP}' -ErrorAction Stop | Select-Object -First 1 -ExpandProperty InterfaceAlias)"
-        ));
-        if winner != gw.interface_name {
-            panic!(
-                "HARNESS: after adding the bypass route, traffic to {NO_LEAK_TARGET_IP} would actually leave \
-                 via '{winner}', not the default gateway interface ('{}')",
-                gw.interface_name
-            );
-        }
-
-        Self {
-            interface_name: gw.interface_name.clone(),
-        }
-    }
-}
-
-impl Drop for BypassRoute {
-    fn drop(&mut self) {
-        let prefix = format!("{NO_LEAK_TARGET_IP}/32");
-        // See `install`'s note: no manual quoting around the interface value.
-        let out = Command::new("netsh")
-            .args([
-                "interface",
-                "ipv4",
-                "delete",
-                "route",
-                &format!("prefix={prefix}"),
-                &format!("interface={}", self.interface_name),
-                "store=active",
-            ])
-            .output();
-        match out {
-            Ok(o) if o.status.success() => {}
-            Ok(o) => eprintln!(
-                "HARNESS: netsh delete route prefix={prefix} interface={} failed: {}",
-                self.interface_name,
-                describe_output(&o)
-            ),
-            Err(e) => eprintln!("HARNESS: failed to spawn netsh delete route: {e}"),
-        }
-    }
-}
-
-// Recovery record (F8) — same recipe as tun-engine's Task 1 Step 2, a local
-// copy because it is test-private code on the other side of a crate
-// boundary. ===========================================================================================================
-
-fn open_controlling_terminal() -> io::Result<std::fs::File> {
-    std::fs::OpenOptions::new().write(true).open("CONOUT$")
-}
-
-fn write_recovery_record(state_dir: &Path) -> io::Result<PathBuf> {
-    use std::io::Write as _;
-
-    let path = std::env::temp_dir().join("hole-live-tun-permit-e2e-RECOVERY.txt");
-    let text = format!(
-        "hole live-tun-permit session e2e: a real system-wide fail-closed cover may be engaged.\n\
-         State directory: {}\n\
-         If this file still exists and the test process is gone, the host may be stranded\n\
-         fail-closed. Recover with:\n\
-         \n    hole bridge unlock\n\n",
-        state_dir.display(),
+/// Own only what we installed. Without this route, `8.8.8.8` is a TUNNEL
+/// destination under a Full-mode session (the `0.0.0.0/1` split), so the
+/// interface permit would correctly permit it. Longest-prefix match puts this
+/// `/32` ahead of the `/1` split once installed.
+fn install_bypass_route(gw: &GatewayInfo) -> OwnedRoute {
+    let route = OwnedRoute::add(
+        &format!("{NO_LEAK_TARGET_IP}/32"),
+        &gw.interface_name,
+        Some(gw.gateway_ip),
     );
-    std::fs::write(&path, &text)?;
-    if let Ok(mut tty) = open_controlling_terminal() {
-        let _ = tty.write_all(text.as_bytes());
-    }
-    Ok(path)
-}
-
-/// Unconditional escape (F7/F8-equivalent): calls `release_all` over the
-/// harness's OWN state directory. Created right after the harness spawns —
-/// BEFORE anything can be armed — and lives until the explicit `drop(guard)`
-/// at the release step, so a panic ANYWHERE in between (including one this
-/// module does not anticipate) still releases the cover during unwind. This
-/// is a second, redundant layer under the "no assertion while covered"
-/// discipline below, not a substitute for it: deferring every assert until
-/// after release means the guard's unwind path is normally never exercised
-/// at all.
-///
-/// Must be dropped (or must still be alive) only while `harness` — and its
-/// `TempDir` — has not yet been removed; a directory already deleted would
-/// make `release_all` read a clean host over a possibly-live cover, the
-/// manufactured lockout F7 warns against. Declaring it after `harness` and
-/// dropping it explicitly before `harness` goes out of scope satisfies that.
-struct SessionEscapeGuard {
-    dir: PathBuf,
-    record_path: PathBuf,
-}
-
-impl Drop for SessionEscapeGuard {
-    fn drop(&mut self) {
-        if let Err(e) = tun_engine::routing::failclosed::release_all(&self.dir) {
-            eprintln!(
-                "HARNESS: release_all failed during SessionEscapeGuard::drop over {:?}: {e} — host may still be \
-                 fail-closed; see {:?}",
-                self.dir, self.record_path
-            );
-        }
-        if let Err(e) = std::fs::remove_file(&self.record_path) {
-            eprintln!("HARNESS: failed to remove recovery record {:?}: {e}", self.record_path);
-        }
-    }
+    // Read the table back via the kernel's own lookup for the real
+    // destination — distinguishes "add failed" from "add succeeded but
+    // another route still wins a metric tiebreak". The route is already
+    // owned, so a panic here still removes it on the way out.
+    route.assert_wins_for(no_leak_target_ip());
+    route
 }
 
 // The session-level test ==============================================================================================
 
 async fn run_live_tun_permit_session(dist: &Path, ss: &SsServerHandle) {
     let gw = tun_engine::get_default_gateway_info().expect("HARNESS: get_default_gateway_info");
-    let _bypass = BypassRoute::install(&gw);
+    let bypass = install_bypass_route(&gw);
 
     let local_port = allocate_ephemeral_port(Protocols::TCP | Protocols::UDP).await;
     let config = ProxyConfig {
@@ -330,15 +174,21 @@ async fn run_live_tun_permit_session(dist: &Path, ss: &SsServerHandle) {
 
     let mut harness = DistHarness::spawn(dist).await.expect("HARNESS: spawn DistHarness");
 
-    // Recovery record + escape guard BEFORE anything is armed (F7/F8) —
-    // written/created once the harness's state directory exists, well
-    // before the SetLockdown{true} call below. From here on the function is
-    // unwind-safe even though Phase B additionally defers its own asserts.
-    let record_path = write_recovery_record(harness.state_dir.path()).expect("HARNESS: write recovery record");
-    let guard = SessionEscapeGuard {
-        dir: harness.state_dir.path().to_path_buf(),
-        record_path,
-    };
+    // Recovery record + escape guard BEFORE anything is armed — written once
+    // the harness's state directory exists, well before the SetLockdown{true}
+    // call below. From here on the function is unwind-safe even though Phase
+    // B additionally defers its own asserts.
+    //
+    // The guard must be dropped (or still be alive) only while `harness` —
+    // and its `TempDir` — has not yet been removed; a directory already
+    // deleted would make `release_all` read a clean host over a possibly-live
+    // cover, a manufactured lockout. Declaring it after `harness` and
+    // dropping it explicitly before `harness` goes out of scope satisfies
+    // that. It is a second, redundant layer under the "no assertion while
+    // covered" discipline below, not a substitute for it: deferring every
+    // assert until after release means the guard's unwind path is normally
+    // never exercised at all.
+    let guard = EscapeGuard::over(&RECORD, harness.state_dir.path());
 
     // Phase A — harness control, cover OFF. A completed three-way handshake
     // to a nonexistent TEST-NET host is the only outcome a firewall drop
@@ -360,23 +210,23 @@ async fn run_live_tun_permit_session(dist: &Path, ss: &SsServerHandle) {
     let control_outcome = probe_tunnel();
     assert_eq!(
         control_outcome,
-        ProbeOutcome::Connected,
+        ProbeFate::Delivered,
         "HARNESS/CONTROL FAILED (says nothing about the cover — no cover is engaged in phase A): expected a \
-         completed handshake to {TUNNEL_PROBE_ADDR}, got {control_outcome:?}"
+         completed handshake to {}, got {control_outcome:?}",
+        tunnel_probe_addr()
     );
 
     // Reachability baseline for phase B's no-leak assertion. Note: this does
     // NOT verify the bypass route — with a Full-mode session up this would
     // return Ok either way, since smoltcp answers the SYN locally for a
-    // TUNNEL destination too. The route-table read-back inside
-    // `BypassRoute::install` is the only thing that verifies the route.
-    let baseline_no_leak =
-        TcpStream::connect_timeout(&NO_LEAK_TARGET_ADDR.parse().expect("literal"), Duration::from_secs(5));
-    assert!(
-        baseline_no_leak.is_ok(),
-        "HARNESS/CONTROL FAILED: baseline reachability to {NO_LEAK_TARGET_ADDR} (over the bypass route) failed: \
-         {:?}",
-        baseline_no_leak.err().map(|e| e.kind())
+    // TUNNEL destination too. The route-table read-back in
+    // `install_bypass_route` is the only thing that verifies the route.
+    let baseline_no_leak = connect(no_leak_target_addr());
+    assert_eq!(
+        baseline_no_leak,
+        ProbeFate::Delivered,
+        "HARNESS/CONTROL FAILED: baseline reachability to {} (over the bypass route) failed: {baseline_no_leak:?}",
+        no_leak_target_addr()
     );
 
     let resp = harness
@@ -390,10 +240,10 @@ async fn run_live_tun_permit_session(dist: &Path, ss: &SsServerHandle) {
 
     // Phase B — cover ON. From here until the explicit `drop(guard)` below,
     // NO assertion/expect/unwrap that could plausibly fail runs: every
-    // outcome — including a failed Start or a failed IPC call — is folded
-    // into a local `Option`/`bool` and judged only after release. A failure
-    // to even Ack the Start is itself asserted after release, not before.
-    let _ = harness.send(BridgeRequest::SetLockdown { enabled: true }).await;
+    // outcome — including a failed arm, a failed Start, or a failed IPC call
+    // — is folded into a local `Option`/`bool` and judged only after release.
+    let arm = harness.send(BridgeRequest::SetLockdown { enabled: true }).await;
+    let armed = matches!(arm, Ok(BridgeResponse::Ack));
 
     let start_b = harness
         .send(BridgeRequest::Start {
@@ -412,14 +262,25 @@ async fn run_live_tun_permit_session(dist: &Path, ss: &SsServerHandle) {
     } else {
         None
     };
-    let tun_outcome = if start_b_acked { Some(probe_tunnel()) } else { None };
-    let cover_blocking = if start_b_acked {
-        Some(
-            TcpStream::connect_timeout(&NO_LEAK_TARGET_ADDR.parse().expect("literal"), Duration::from_secs(5)).is_err(),
-        )
-    } else {
-        None
-    };
+    let tun_outcome = start_b_acked.then(probe_tunnel);
+    // The no-leak probe and its two same-instant cross-checks. Taken here,
+    // together, because a `cover_blocking` read on its own is vacuous: a
+    // transient blip on the way to the no-leak target also reads as
+    // "blocked", and the test would then PASS over a leaking kill switch.
+    // `tun_outcome` cannot serve as the cross-check — it targets a TEST-NET
+    // host smoltcp answers locally, so it says nothing about the real path.
+    //
+    // - `no_leak` classifies rather than collapsing to `is_err()`, so a
+    //   vanished route (`NeverLeft`) is a harness failure, not a block.
+    // - `permitted_reachable` connects to the one destination the cover must
+    //   NOT block, the session's own server IP: a cover that blocks
+    //   everything, or a dead stack, fails here too.
+    // - `path_to_no_leak` asks the kernel whether the bypass route still
+    //   wins for the no-leak target, so an interface that went down during
+    //   the window is named rather than mistaken for the cover working.
+    let no_leak = start_b_acked.then(|| connect(no_leak_target_addr()));
+    let permitted_reachable = start_b_acked.then(|| connect(ss.addr));
+    let path_to_no_leak = start_b_acked.then(|| bypass.winner_for(no_leak_target_ip()));
 
     // Release (best-effort — the guard below is the real backstop), THEN assert.
     let _ = harness.send(BridgeRequest::Stop).await;
@@ -432,8 +293,34 @@ async fn run_live_tun_permit_session(dist: &Path, ss: &SsServerHandle) {
     drop(guard);
 
     assert!(
+        armed,
+        "HARNESS: SetLockdown(true) did not Ack, so the kill switch was never armed and nothing below is a \
+         verdict about a cover: {arm:?}"
+    );
+    assert!(
         start_b_acked,
         "HARNESS: phase B Start did not Ack (with the kill switch armed): {start_b:?}"
+    );
+    assert_eq!(
+        permitted_reachable,
+        Some(ProbeFate::Delivered),
+        "HARNESS: the cover's own permitted server IP ({}) was unreachable while covered — the block is not \
+         selective, or this host's stack is down; either way the no-leak result below says nothing about a \
+         leak; got {permitted_reachable:?}",
+        ss.addr
+    );
+    assert!(
+        matches!(&path_to_no_leak, Some(Ok(iface)) if iface == bypass.interface()),
+        "HARNESS: the bypass route to {NO_LEAK_TARGET_IP} no longer won the kernel's lookup while covered \
+         (expected '{}'), so a failed probe there is a routing change, not a block; got {path_to_no_leak:?}",
+        bypass.interface()
+    );
+    assert!(
+        matches!(no_leak, Some(ProbeFate::Rejected(_))),
+        "the armed kill switch must block a probe routed off the tunnel ({}) — the stack must have rejected it \
+         (a `NeverLeft` outcome is a harness fault, `Delivered` is a LEAK); if the block did not hold, nothing \
+         downstream (including tun_outcome) means anything; got {no_leak:?}",
+        no_leak_target_addr()
     );
     assert_eq!(
         intent_active,
@@ -442,18 +329,12 @@ async fn run_live_tun_permit_session(dist: &Path, ss: &SsServerHandle) {
          necessary but not sufficient on its own; got {intent_active:?}"
     );
     assert_eq!(
-        cover_blocking,
-        Some(true),
-        "the armed kill switch must block a probe routed off the tunnel ({NO_LEAK_TARGET_ADDR}) — if the block \
-         did not hold, nothing downstream (including tun_outcome) means anything; got {cover_blocking:?}"
-    );
-    assert_eq!(
         tun_outcome,
-        Some(ProbeOutcome::Connected),
+        Some(ProbeFate::Delivered),
         "PRODUCT BUG, not a test bug: the armed kill switch blocked the session's own tunnel traffic (expected \
-         Some(Connected) matching phase A's control, got {tun_outcome:?}); a firewall block yields TimedOut or \
-         PermissionDenied, never a completed handshake. Recover with `hole bridge unlock`; recovery record was \
-         at the path this test wrote before arming."
+         Some(Delivered) matching phase A's control, got {tun_outcome:?}); a firewall block yields a `Rejected` \
+         outcome, never a completed handshake. Recover with `hole bridge unlock`; recovery record was at the \
+         path this test wrote before arming."
     );
 }
 

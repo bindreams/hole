@@ -172,9 +172,10 @@ fn windows_lockdown_permits_server_ip_and_blocks_other_egress() {
 ///
 /// No live utun is needed: `pass out quick on <tun-absent>` simply never matches,
 /// so the block rule governs the probed egress. Whether the permit is
-/// sensitive to the interface it names — the realistic post-#850 failure
-/// mode, where the named interface exists but is the WRONG one — is
-/// falsified separately, against two real, live `utunN` devices, in
+/// sensitive to the interface it names — the realistic failure mode once the
+/// TUN name is kernel-assigned, where the named interface exists but is the
+/// WRONG one — is falsified separately, against two real, live `utunN`
+/// devices, in
 /// `live_tun_permit_privileged_tests.rs`. `serial = TUN` + the
 /// `global-net-state` test-group serialize the process-global pf state:
 /// `pfctl -E`/`-X` is refcounted and the main ruleset is host-wide, so a

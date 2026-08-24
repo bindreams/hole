@@ -620,7 +620,7 @@ own session's tunnel traffic while blocking an off-tunnel probe
 (`crates/bridge/src/proxy_manager_live_tun_permit_e2e_tests.rs`); it is not a
 falsification test — the dispatcher's TUN name and the one passed to
 `install_lockdown` share one constant, so they cannot disagree — and its macOS
-counterpart, where the name is runtime-discovered, is a deliverable of #850.
+counterpart, where the name is runtime-discovered, does not exist yet.
 No test carries a packet to the internet through the tunnel: the in-process
 test server dials the client's own route table, so a tunnel-routed destination
 loops back and pf has no per-process matching to exempt the local server's own
