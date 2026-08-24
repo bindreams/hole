@@ -15,7 +15,8 @@ use std::sync::Arc;
 
 use crate::dns::connector::DirectConnector;
 use crate::dns::forwarder::DnsForwarder;
-use crate::endpoint::{BlockEndpoint, InterfaceEndpoint, LocalDnsEndpoint, Socks5Endpoint};
+use crate::drop_sink::LoggingDropSink;
+use crate::endpoint::{InterfaceEndpoint, LocalDnsEndpoint, Socks5Endpoint};
 use crate::filter::rules::RuleSet;
 use hole_common::config::{DnsConfig, DnsProtocol, FilterAction};
 
@@ -30,8 +31,8 @@ fn v6(s: &str, port: u16) -> SocketAddr {
 fn router_with(proxy_udp: bool, bypass_v6: bool) -> HoleRouter {
     let proxy = Socks5Endpoint::new(v4("127.0.0.1", 1080), Some("test-plugin".into()), proxy_udp);
     let bypass = InterfaceEndpoint::new(1, bypass_v6);
-    let block = BlockEndpoint::new();
-    HoleRouter::new(proxy, bypass, block, RuleSet::default())
+    let drops = LoggingDropSink::new();
+    HoleRouter::new(proxy, bypass, drops, RuleSet::default())
 }
 
 // Lifecycle smoke =====================================================================================================
@@ -74,15 +75,6 @@ fn interface_endpoint_capabilities_reflect_constructor() {
     let without_v6 = InterfaceEndpoint::new(5, false);
     assert!(without_v6.supports_udp());
     assert!(!without_v6.supports_ipv6_dst());
-}
-
-#[skuld::test]
-fn block_endpoint_has_uniform_capabilities() {
-    let block = BlockEndpoint::new();
-    // Block doesn't care about the flow's protocol or addressing; it drops.
-    assert!(block.supports_udp());
-    assert!(block.supports_ipv6_dst());
-    assert_eq!(block.name(), "block");
 }
 
 // Cascade table =======================================================================================================
@@ -165,10 +157,10 @@ fn sample_dns_cfg() -> DnsConfig {
 fn router_with_local_dns(proxy_udp: bool, bypass_v6: bool) -> HoleRouter {
     let proxy = Socks5Endpoint::new(v4("127.0.0.1", 1080), Some("test-plugin".into()), proxy_udp);
     let bypass = InterfaceEndpoint::new(1, bypass_v6);
-    let block = BlockEndpoint::new();
+    let drops = LoggingDropSink::new();
     let fwd = Arc::new(DnsForwarder::new(sample_dns_cfg(), Arc::new(DirectConnector), true));
     let local_dns = LocalDnsEndpoint::new(fwd);
-    HoleRouter::with_local_dns(proxy, bypass, block, Some(local_dns), RuleSet::default())
+    HoleRouter::with_local_dns(proxy, bypass, drops, Some(local_dns), RuleSet::default())
 }
 
 #[skuld::test]
@@ -356,7 +348,7 @@ fn udp_non53_not_intercepted_by_local_dns() {
     assert_eq!(got, DnsExpectedEndpoint::Proxy);
 }
 
-// BlockEndpoint log-methods — rate-limit and one-shot behavior ========================================================
+// LoggingDropSink — rate-limit and one-shot behavior ==================================================================
 
 #[skuld::test]
 fn ipv6_bypass_unreachable_warn_is_one_shot() {
@@ -364,24 +356,24 @@ fn ipv6_bypass_unreachable_warn_is_one_shot() {
     // the AtomicBool transition, then the subsequent call finds it already
     // set. Logging is side-effect-free for the test (tracing is not
     // subscribed).
-    let block = BlockEndpoint::new();
+    let drops = LoggingDropSink::new();
     let dst = v6("2001:db8::1", 443);
-    block.log_ipv6_bypass_unreachable(0, dst, "tcp");
-    block.log_ipv6_bypass_unreachable(0, dst, "tcp"); // second call — one-shot warn no-ops
+    drops.ipv6_bypass_unreachable(0, dst, "tcp");
+    drops.ipv6_bypass_unreachable(0, dst, "tcp"); // second call — one-shot warn no-ops
 }
 
 #[skuld::test]
-fn block_endpoint_rate_limits_rule_block_logs() {
+fn logging_drop_sink_rate_limits_rule_block_logs() {
     // Per-flow dedup: BlockLog's `should_log(rule_index, dst)` suppresses
     // duplicate calls within its TTL window.
-    let block = BlockEndpoint::new();
+    let drops = LoggingDropSink::new();
     let dst = v4("1.2.3.4", 80);
     // First N calls for the same key cost nothing to emit (at most one log
     // line). This is a smoke check; tracing capture is not wired in the
     // test harness.
     for _ in 0..8 {
-        block.log_rule_block_tcp(7, dst, Some("example.com"));
+        drops.rule_block_tcp(7, dst, Some("example.com"));
     }
-    block.log_rule_block_udp(7, dst);
-    block.log_udp_proxy_unavailable(7, dst, Some("v2ray-plugin"));
+    drops.rule_block_udp(7, dst);
+    drops.udp_proxy_unavailable(7, dst, Some("v2ray-plugin"));
 }

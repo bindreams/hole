@@ -1,14 +1,15 @@
 //! `HoleRouter` — hole's [`tun_engine::Router`] impl.
 //!
-//! Wires three [`Endpoint`](crate::endpoint::Endpoint) mechanisms into
-//! the filter engine and TUN dispatch shape of `tun-engine`:
+//! Wires two [`Endpoint`](crate::endpoint::Endpoint) mechanisms plus a
+//! [`DropSink`](crate::drop_sink::DropSink) into the filter engine and
+//! TUN dispatch shape of `tun-engine`:
 //!
 //! - `proxy`: [`Socks5Endpoint`](crate::endpoint::Socks5Endpoint) —
 //!   flows that should go through the SS tunnel.
 //! - `bypass`: [`InterfaceEndpoint`](crate::endpoint::InterfaceEndpoint) —
 //!   flows that should egress via the real upstream interface.
-//! - `block`: [`BlockEndpoint`](crate::endpoint::BlockEndpoint) —
-//!   flows that should be dropped.
+//! - `drops`: [`LoggingDropSink`](crate::drop_sink::LoggingDropSink) —
+//!   records flows the cascade refused to carry. Nothing serves them.
 //!
 //! ## Role vs. mechanism
 //!
@@ -24,21 +25,18 @@
 //!    equivalent and always matches on IP.
 //! 2. Build a [`ConnInfo`] and run [`crate::filter::engine::decide`].
 //! 3. Cascade the `FilterAction` + flow shape to a concrete endpoint via
-//!    [`HoleRouter::resolve_endpoint`], logging any drop reason via the
-//!    `BlockEndpoint`'s dedicated log methods.
+//!    [`HoleRouter::resolve_endpoint`], recording any drop reason on the
+//!    [`DropSink`](crate::drop_sink::DropSink).
 //! 4. Call `endpoint.serve_tcp` or `endpoint.serve_udp`.
 //!
 //! ## UDP-drop privacy invariant
 //!
-//! `FilterAction::Proxy` + UDP + `!proxy.supports_udp()` resolves to
-//! `&self.block`, **not** `&self.bypass`. This is deliberate: falling
-//! back to the clear-text bypass would leak UDP outside the encrypted
-//! tunnel, violating the user's VPN expectation. Users who need
-//! tunneled UDP should configure a UDP-capable plugin (galoshes). See
-//! [`BlockEndpoint`](crate::endpoint::BlockEndpoint) for the drop
-//! logging.
-
-pub mod block_log;
+//! `FilterAction::Proxy` + UDP + `!proxy.supports_udp()` resolves to a
+//! drop, **not** to `&self.bypass`. This is deliberate: falling back to
+//! the clear-text bypass would leak UDP outside the encrypted tunnel,
+//! violating the user's VPN expectation. Users who need tunneled UDP
+//! should configure a UDP-capable plugin (galoshes). The drop is
+//! recorded on the [`DropSink`](crate::drop_sink::DropSink).
 
 use std::io;
 use std::net::SocketAddr;
@@ -48,7 +46,8 @@ use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use tun_engine::{Router, TcpFlow, TcpMeta, UdpFlow, UdpMeta};
 
-use crate::endpoint::{BlockEndpoint, Endpoint, InterfaceEndpoint, LocalDnsEndpoint, Socks5Endpoint};
+use crate::drop_sink::{DropSink, LoggingDropSink};
+use crate::endpoint::{Endpoint, InterfaceEndpoint, LocalDnsEndpoint, Socks5Endpoint};
 use crate::filter;
 use crate::filter::engine::{decide, ConnInfo, L4Proto};
 use crate::filter::rules::RuleSet;
@@ -67,7 +66,7 @@ const PEEK_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(100);
 pub struct HoleRouter {
     proxy: Socks5Endpoint,
     bypass: InterfaceEndpoint,
-    block: BlockEndpoint,
+    drops: Box<dyn DropSink>,
     /// Optional in-tunnel DNS interceptor. When `Some`, the cascade diverts
     /// UDP/53 flows to this endpoint instead of the proxy; `is_some()` is the
     /// sole gate. `None` disables interception (DNS disabled or SocksOnly mode).
@@ -76,11 +75,11 @@ pub struct HoleRouter {
 }
 
 impl HoleRouter {
-    pub fn new(proxy: Socks5Endpoint, bypass: InterfaceEndpoint, block: BlockEndpoint, rules: RuleSet) -> Self {
+    pub fn new(proxy: Socks5Endpoint, bypass: InterfaceEndpoint, drops: LoggingDropSink, rules: RuleSet) -> Self {
         Self {
             proxy,
             bypass,
-            block,
+            drops: Box::new(drops),
             local_dns: None,
             rules: Arc::new(ArcSwap::from_pointee(rules)),
         }
@@ -92,14 +91,14 @@ impl HoleRouter {
     pub fn with_local_dns(
         proxy: Socks5Endpoint,
         bypass: InterfaceEndpoint,
-        block: BlockEndpoint,
+        drops: LoggingDropSink,
         local_dns: Option<LocalDnsEndpoint>,
         rules: RuleSet,
     ) -> Self {
         Self {
             proxy,
             bypass,
-            block,
+            drops: Box::new(drops),
             local_dns,
             rules: Arc::new(ArcSwap::from_pointee(rules)),
         }
@@ -179,20 +178,20 @@ impl HoleRouter {
         }
     }
 
-    /// Log a drop reason before the flow is released. Uses per-reason
-    /// methods on `BlockEndpoint` so the log wording distinguishes
+    /// Record a drop reason before the flow is released. Uses per-reason
+    /// methods on the [`DropSink`] so the sink can distinguish
     /// explicit-rule from privacy from reachability drops.
     fn log_drop(&self, reason: DropReason, dst: SocketAddr, domain: Option<&str>, l4: L4Proto) {
         match (reason, l4) {
             (DropReason::RuleBlock { rule_index }, L4Proto::Tcp) => {
-                self.block.log_rule_block_tcp(rule_index, dst, domain);
+                self.drops.rule_block_tcp(rule_index, dst, domain);
             }
             (DropReason::RuleBlock { rule_index }, L4Proto::Udp) => {
-                self.block.log_rule_block_udp(rule_index, dst);
+                self.drops.rule_block_udp(rule_index, dst);
             }
             (DropReason::UdpProxyUnavailable { rule_index }, L4Proto::Udp) => {
-                self.block
-                    .log_udp_proxy_unavailable(rule_index, dst, self.proxy.plugin_name());
+                self.drops
+                    .udp_proxy_unavailable(rule_index, dst, self.proxy.plugin_name());
             }
             (DropReason::UdpProxyUnavailable { .. }, L4Proto::Tcp) => {
                 // Unreachable: UdpProxyUnavailable is UDP-only. debug_assert
@@ -204,7 +203,7 @@ impl HoleRouter {
                     L4Proto::Tcp => "tcp",
                     L4Proto::Udp => "udp",
                 };
-                self.block.log_ipv6_bypass_unreachable(rule_index, dst, l4_label);
+                self.drops.ipv6_bypass_unreachable(rule_index, dst, l4_label);
             }
         }
     }
