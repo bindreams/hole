@@ -715,7 +715,7 @@ fn lockdown_ruleset_labels_its_block_all_rule() {
         "the label must sit on the block-all base rule, got: {line}"
     );
     assert_eq!(
-        r.lines().filter(|l| !l.trim().is_empty()).next_back().map(str::trim),
+        r.lines().rfind(|l| !l.trim().is_empty()).map(str::trim),
         Some(line.trim()),
         "the labelled block-all must stay the LAST rule:\n{r}"
     );
