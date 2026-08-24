@@ -371,6 +371,15 @@ jobs:
         shell: bash
         run: cargo xtask build hole-tests
 
+      # A typo'd or renamed SKULD_LABELS value can select zero tests from one
+      # package while the other nine still contribute some, so the whole step
+      # stays green — see bindreams/hole#891. This verifies the "!tun"/"tun"
+      # step pair below actually partitions every compiled-in test between
+      # them, before either one runs.
+      - name: Verify SKULD_LABELS TUN/non-TUN partition
+        shell: bash
+        run: cargo xtask verify-skuld-label-coverage --job test-hole
+
       # `--no-default-features` mirrors the `hole-tests` xtask target. Without
       # it Cargo recompiles `hole` with `tauri/custom-protocol` ON (different
       # feature set → different fingerprint → fresh build), which expands
