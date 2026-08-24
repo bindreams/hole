@@ -48,6 +48,14 @@ use super::*;
 #[skuld::label]
 pub(super) const TUN: skuld::Label;
 
+/// Cross-binary serialization for tests that mutate GLOBAL OS network state —
+/// the `.config/nextest.toml` `global_net_state` test-group's `max-threads = 1`
+/// gate. skuld's own `serial = TUN` only serializes within this one binary;
+/// this label is what `cargo xtask verify-global-net-state-labels` binds to
+/// that group's name-substring filter (bindreams/hole#894).
+#[skuld::label]
+pub(super) const GLOBAL_NET_STATE: skuld::Label;
+
 // Two routable anycast hosts on :443 (the runner has outbound internet). IP
 // literals only — the cover blocks DNS, so a hostname connect would fail for the
 // wrong reason. PERMITTED is engaged as the server IP; NON_PERMITTED proves the
@@ -93,7 +101,7 @@ const NON_PERMITTED: &str = "8.8.8.8:443";
 /// cross-binary race with the bridge's real-egress e2e is handled by the
 /// `global-net-state` test-group (`.config/nextest.toml`).
 #[cfg(target_os = "windows")]
-#[skuld::test(labels = [TUN], serial = TUN)]
+#[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
 fn windows_lockdown_permits_server_ip_and_blocks_other_egress() {
     use std::net::TcpStream;
     use std::time::Duration;
@@ -171,7 +179,7 @@ fn windows_lockdown_permits_server_ip_and_blocks_other_egress() {
 /// `pfctl -E`/`-X` is refcounted and the main ruleset is host-wide, so a
 /// concurrent cover test would race the snapshot restore.
 #[cfg(target_os = "macos")]
-#[skuld::test(labels = [TUN], serial = TUN)]
+#[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
 fn macos_lockdown_permits_server_ip_blocks_other_egress_and_restores() {
     use std::net::TcpStream;
     use std::process::Command;
@@ -245,7 +253,7 @@ fn macos_lockdown_permits_server_ip_blocks_other_egress_and_restores() {
 /// beats block-all — catches the block-everything arbitration bug) while a
 /// non-permitted host is blocked (no leak). Drop restores egress.
 #[cfg(target_os = "windows")]
-#[skuld::test(labels = [TUN], serial = TUN)]
+#[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
 fn windows_failclosed_permits_server_blocks_other_egress() {
     use std::net::TcpStream;
     use std::time::Duration;
@@ -296,7 +304,7 @@ fn windows_failclosed_permits_server_blocks_other_egress() {
 /// proves the permit is scoped to TCP/443, not the whole resolver IP: the
 /// SAME resolver on a different port stays blocked.
 #[cfg(target_os = "windows")]
-#[skuld::test(labels = [TUN], serial = TUN)]
+#[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
 fn windows_failclosed_permits_resolver_blocks_other_egress() {
     use std::net::TcpStream;
     use std::time::Duration;
@@ -370,7 +378,7 @@ fn windows_failclosed_permits_resolver_blocks_other_egress() {
 /// loopback and the server IP), proves (a) the live ruleset carries our block,
 /// (b) it is SELECTIVE, and (c) Drop restores `/etc/pf.conf`.
 #[cfg(target_os = "macos")]
-#[skuld::test(labels = [TUN], serial = TUN)]
+#[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
 fn macos_failclosed_permits_server_blocks_other_egress() {
     use std::net::TcpStream;
     use std::process::Command;
@@ -424,7 +432,7 @@ fn macos_failclosed_permits_server_blocks_other_egress() {
 /// Also proves the permit is scoped to TCP/443, not the whole resolver IP: the
 /// SAME resolver on a different port stays blocked.
 #[cfg(target_os = "macos")]
-#[skuld::test(labels = [TUN], serial = TUN)]
+#[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
 fn macos_failclosed_permits_resolver_blocks_other_egress() {
     use std::net::TcpStream;
     use std::process::Command;

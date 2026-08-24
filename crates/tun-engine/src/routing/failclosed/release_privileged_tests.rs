@@ -33,7 +33,7 @@ use crate::routing::{CoverGuard, Routing, SystemRouting};
 // `tun-engine` test binary, so this reuses that module's `TUN` label rather
 // than redeclaring it (a second `#[skuld::label] const TUN` in one binary
 // panics at test-runner startup with "label declared multiple times").
-use super::lockdown_privileged_tests::TUN;
+use super::lockdown_privileged_tests::{GLOBAL_NET_STATE, TUN};
 
 // Two routable anycast hosts on :443 (the runner has outbound internet), as
 // `lockdown_privileged_tests` uses — see that module's doc for why these two
@@ -75,7 +75,7 @@ fn assert_baseline_reachable() {
 // windows_release_all_clears_a_stranded_lockdown_cover / macos counterpart ============================================
 
 #[cfg(target_os = "windows")]
-#[skuld::test(labels = [TUN], serial = TUN)]
+#[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
 fn windows_release_all_clears_a_stranded_lockdown_cover() {
     let dir = tempfile::tempdir().unwrap();
     let _release_guard = ReleaseOnDrop(dir.path().to_path_buf());
@@ -106,7 +106,7 @@ fn windows_release_all_clears_a_stranded_lockdown_cover() {
 }
 
 #[cfg(target_os = "macos")]
-#[skuld::test(labels = [TUN], serial = TUN)]
+#[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
 fn macos_release_all_clears_a_stranded_lockdown_cover() {
     use std::process::Command;
 
@@ -150,7 +150,7 @@ fn macos_release_all_clears_a_stranded_lockdown_cover() {
 // windows_release_all_clears_a_stranded_transient_cover / macos counterpart ===========================================
 
 #[cfg(target_os = "windows")]
-#[skuld::test(labels = [TUN], serial = TUN)]
+#[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
 fn windows_release_all_clears_a_stranded_transient_cover() {
     let dir = tempfile::tempdir().unwrap();
     let _release_guard = ReleaseOnDrop(dir.path().to_path_buf());
@@ -181,7 +181,7 @@ fn windows_release_all_clears_a_stranded_transient_cover() {
 }
 
 #[cfg(target_os = "macos")]
-#[skuld::test(labels = [TUN], serial = TUN)]
+#[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
 fn macos_release_all_clears_a_stranded_transient_cover() {
     let dir = tempfile::tempdir().unwrap();
     let _release_guard = ReleaseOnDrop(dir.path().to_path_buf());
@@ -218,7 +218,7 @@ fn macos_release_all_clears_a_stranded_transient_cover() {
 // windows_release_all_clears_both_stranded_covers / macos counterpart =================================================
 
 #[cfg(target_os = "windows")]
-#[skuld::test(labels = [TUN], serial = TUN)]
+#[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
 fn windows_release_all_clears_both_stranded_covers() {
     let dir = tempfile::tempdir().unwrap();
     let _release_guard = ReleaseOnDrop(dir.path().to_path_buf());
@@ -253,7 +253,7 @@ fn windows_release_all_clears_both_stranded_covers() {
 }
 
 #[cfg(target_os = "macos")]
-#[skuld::test(labels = [TUN], serial = TUN)]
+#[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
 fn macos_release_all_clears_both_stranded_covers() {
     let dir = tempfile::tempdir().unwrap();
     let _release_guard = ReleaseOnDrop(dir.path().to_path_buf());
@@ -292,7 +292,7 @@ fn macos_release_all_clears_both_stranded_covers() {
 // windows_release_all_on_a_clean_host_is_ok / macos counterpart =======================================================
 
 #[cfg(target_os = "windows")]
-#[skuld::test(labels = [TUN], serial = TUN)]
+#[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
 fn windows_release_all_on_a_clean_host_is_ok() {
     let dir = tempfile::tempdir().unwrap();
     let routing = SystemRouting::new(dir.path().to_path_buf(), None);
@@ -311,7 +311,7 @@ fn windows_release_all_on_a_clean_host_is_ok() {
 }
 
 #[cfg(target_os = "macos")]
-#[skuld::test(labels = [TUN], serial = TUN)]
+#[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
 fn macos_release_all_on_a_clean_host_is_ok() {
     use std::process::Command;
 
@@ -357,7 +357,7 @@ fn macos_release_all_on_a_clean_host_is_ok() {
 // macOS-only fault injections through Hole's own state file, touching no system file ==================================
 
 #[cfg(target_os = "macos")]
-#[skuld::test(labels = [TUN], serial = TUN)]
+#[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
 fn macos_release_all_clears_a_cover_whose_state_file_is_unreadable() {
     let dir = tempfile::tempdir().unwrap();
     let _release_guard = ReleaseOnDrop(dir.path().to_path_buf());
@@ -387,7 +387,7 @@ fn macos_release_all_clears_a_cover_whose_state_file_is_unreadable() {
 }
 
 #[cfg(target_os = "macos")]
-#[skuld::test(labels = [TUN], serial = TUN)]
+#[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
 fn macos_release_all_falls_back_when_the_snapshot_will_not_load() {
     let dir = tempfile::tempdir().unwrap();
     let _release_guard = ReleaseOnDrop(dir.path().to_path_buf());

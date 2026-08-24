@@ -34,6 +34,13 @@ fn main() {
 #[skuld::label]
 const TUN: skuld::Label;
 
+/// Cross-binary serialization for tests that mutate GLOBAL OS network state —
+/// the `.config/nextest.toml` `global_net_state` test-group's `max-threads = 1`
+/// gate. This is a separate compiled binary, not part of `hole-bridge`'s lib
+/// target, so it needs its own declaration (bindreams/hole#894).
+#[skuld::label]
+const GLOBAL_NET_STATE: skuld::Label;
+
 #[cfg(target_os = "windows")]
 use std::net::{IpAddr, SocketAddr};
 #[cfg(target_os = "windows")]
@@ -168,7 +175,7 @@ fn nonce() -> [u8; 16] {
 /// the `global-net-state` nextest group (cross-binary serialization of the
 /// system-wide WFP state). `serial = TUN` serializes it within this binary.
 #[cfg(target_os = "windows")]
-#[skuld::test(labels = [TUN], serial = TUN)]
+#[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
 fn cutover_global_net_state_nic_capture_no_udp_leak() {
     use tun_engine::gateway::get_default_gateway_info;
     use tun_engine::helpers::bypass::create_bypass_udp;

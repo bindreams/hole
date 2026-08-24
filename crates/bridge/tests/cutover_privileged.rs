@@ -34,6 +34,13 @@ fn main() {
 #[skuld::label]
 const TUN: skuld::Label;
 
+/// Cross-binary serialization for tests that mutate GLOBAL OS network state —
+/// the `.config/nextest.toml` `global_net_state` test-group's `max-threads = 1`
+/// gate. This is a separate compiled binary, not part of `hole-bridge`'s lib
+/// target, so it needs its own declaration (bindreams/hole#894).
+#[skuld::label]
+const GLOBAL_NET_STATE: skuld::Label;
+
 /// The on-disk image identity must FLIP across a rename-away-then-move-in swap
 /// (the GUI self-heal precondition: `same_file::Handle` inequality is what makes
 /// `decide_self_heal` return Relaunch), and the swap must succeed WHILE the image
@@ -44,7 +51,7 @@ const TUN: skuld::Label;
 /// Spawns a COPY of the idle helper in a tempdir — never the cargo target bin,
 /// whose path cargo's macOS uplift removes+recreates on every no-op build.
 #[cfg(target_os = "windows")]
-#[skuld::test(labels = [TUN], serial = TUN)]
+#[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
 fn cutover_global_net_state_running_exe_rename_flips_handle_identity() {
     let dir = tempfile::tempdir().unwrap();
     let idle = std::path::Path::new(env!("CARGO_BIN_EXE_test_idle"));
@@ -165,7 +172,7 @@ impl Drop for ProvisionedService {
 /// separately against a fake `ScmActor`; this is the real-service integration
 /// half, NOT a full-bridge cutover e2e (no `images`, so the swap never runs).
 #[cfg(target_os = "windows")]
-#[skuld::test(labels = [TUN], serial = TUN)]
+#[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
 fn cutover_global_net_state_real_scm_restart_gates_on_running_callback() {
     use hole_bridge::cutover::os::windows::WindowsCutoverOs;
     use hole_bridge::cutover::os::CutoverOs;
@@ -196,7 +203,7 @@ fn cutover_global_net_state_real_scm_restart_gates_on_running_callback() {
 /// under `sudo` on the TUN lane. The all-or-nothing rollback ordering is unit-
 /// proven cfg-free in `platform::swap_tests`; this proves the real primitive.
 #[cfg(target_os = "macos")]
-#[skuld::test(labels = [TUN], serial = TUN)]
+#[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
 fn cutover_global_net_state_swap_running_helper_preserves_identity() {
     use hole_bridge::platform::swap::{execute_swap, plan_swap, volume_supports_rename_swap, RenameSwapSupport};
 

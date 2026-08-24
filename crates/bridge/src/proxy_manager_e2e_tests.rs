@@ -406,7 +406,7 @@ mod tun {
     /// this live-egress e2e against tun-engine's system-wide WFP lockdown test
     /// across binaries. Renaming the suffix without updating that filter drops
     /// this test from the group → cross-binary data race.
-    #[skuld::test(labels = [DIST_BIN, TUN], serial = TUN)]
+    #[skuld::test(labels = [DIST_BIN, TUN, GLOBAL_NET_STATE], serial = TUN)]
     fn e2e_none_full_tunnel_roundtrip(
         #[fixture(dist_dir)] dist: &Path,
         #[fixture(ssserver_none)] ss: &SsServerHandle,
@@ -424,7 +424,7 @@ mod tun {
     /// hijacked all loopback to the gateway and black-holed this test's
     /// galoshes-server fixture readiness self-probe (a loopback connect). Fixed
     /// by never bypassing a loopback server (`tun_engine::routing`).
-    #[skuld::test(labels = [DIST_BIN, PORT_ALLOC, TUN], serial = TUN)]
+    #[skuld::test(labels = [DIST_BIN, PORT_ALLOC, TUN, GLOBAL_NET_STATE], serial = TUN)]
     fn e2e_ws_full_tunnel_roundtrip(
         #[fixture(dist_dir)] dist: &Path,
         #[fixture(ssserver_ws)] ss: &SsServerHandle,

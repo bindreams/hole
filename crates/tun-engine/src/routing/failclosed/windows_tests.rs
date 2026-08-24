@@ -1,6 +1,8 @@
 use super::*;
 use std::net::IpAddr;
 
+use crate::routing::failclosed::lockdown_privileged_tests::GLOBAL_NET_STATE;
+
 fn v4() -> IpAddr {
     "203.0.113.7".parse().unwrap()
 }
@@ -645,7 +647,12 @@ fn new_loopbacknet_guids_are_in_their_sweep_floors_and_distinct() {
 
 // release_all =========================================================================================================
 
-#[skuld::test]
+// Not a privileged real-engage test — a bare mocked unit test that the
+// `.config/nextest.toml` `global_net_state` filter's `release_all_` name
+// substring incidentally sweeps in (Option B, bindreams/hole#894): labeled to
+// preserve its existing group membership exactly, not because it mutates
+// real OS state.
+#[skuld::test(labels = [GLOBAL_NET_STATE])]
 fn release_all_first_delete_failure_reports_the_first_real_error_and_inspects_every_code() {
     // Not-found is benign (a clean host or an already-swept filter); the fold
     // must skip it and report the FIRST genuine failure, not stop at it —
