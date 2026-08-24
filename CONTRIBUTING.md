@@ -69,11 +69,13 @@ a declined connection is refused with a pre-handshake RST and never with a reset
 of a connection the client believes it opened. The verdict itself is
 [`decide_admission`](crates/tun-engine/src/engine/admission.rs) — a pure
 function over the handshake plus a permit-acquiring closure — and the driver arm
-is a mechanical dispatch over its three outcomes. A socket the datapath is done
-with is *retired*, not removed:
+is a mechanical dispatch over its three outcomes. A socket with a packet still to
+emit is *retired* rather than removed:
 [`SocketStack::poll`](crates/tun-engine/src/engine/socket_stack.rs) reaps it
 once `remote_endpoint()` goes `None`, smoltcp's signal that it has emitted the
-socket's last packet. A handshake with no peer left is discarded without a
+socket's last packet. `decide_disposal` picks the path per state — `Closed` and
+`Listen` retire, while `TimeWait` is dropped at once, since retiring it would
+hold the socket and both its buffers for smoltcp's 10 s `CLOSE_DELAY`. A handshake with no peer left is discarded without a
 packet, because smoltcp has already cleared the 4-tuple and has no address to
 answer. A connection socket that reverts to `Listen` — the client answered the
 SYN-ACK with an RST — is retired through that same list, so it cannot shadow the

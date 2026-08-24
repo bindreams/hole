@@ -25,7 +25,7 @@ use super::admission::{decide_admission, Admission};
 use super::config::EngineConfig;
 use super::dns::DnsInterceptor;
 use super::router::{Router, TcpMeta, UdpMeta};
-use super::socket_stack::{is_finished, Handshake, SocketStack};
+use super::socket_stack::{decide_disposal, Disposal, Handshake, SocketStack};
 use super::tcp_flow::TcpFlow;
 use super::udp_flow::{FlowKey, FlowTable, UdpReply};
 use crate::device::DeviceConfig;
@@ -303,18 +303,21 @@ impl Driver {
     }
 
     fn cleanup_finished_connections(&mut self) {
-        let finished: Vec<SocketHandle> = self
+        let finished: Vec<(SocketHandle, Disposal)> = self
             .connections
             .keys()
             .copied()
-            .filter(|&handle| is_finished(self.stack.socket(handle).state()))
+            .filter_map(|handle| Some((handle, decide_disposal(self.stack.socket(handle).state())?)))
             .collect();
 
-        for handle in finished {
+        for (handle, disposal) in finished {
             // Dropping the entry closes the channels, which ends the router
             // task and releases its permit.
             self.connections.remove(&handle);
-            self.stack.retire(handle);
+            match disposal {
+                Disposal::Retire => self.stack.retire(handle),
+                Disposal::Remove => self.stack.remove(handle),
+            }
         }
     }
 

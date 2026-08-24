@@ -29,10 +29,10 @@ before editing; the sections linked below are the authoritative source.
 - **TCP accept refusal.** The accept verdict lands while the listener is still
   in `SynReceived` with its SYN-ACK paused, so a declined connection is refused
   with a pre-handshake RST instead of black-holing behind a SYN-ACK; the verdict
-  is the pure `decide_admission`. A socket the datapath is done with is
-  *retired*, not removed, and reaped once smoltcp clears its 4-tuple —
+  is the pure `decide_admission`. A socket with a packet still to emit is
+  *retired* rather than removed, and reaped once smoltcp clears its 4-tuple —
   including one that reverted to `Listen`, which would otherwise hijack its
-  port. →
+  port. `TimeWait` stays on immediate removal. →
   [CONTRIBUTING.md#tcp-accept-refusal](CONTRIBUTING.md#tcp-accept-refusal)
 - **DNS forwarder.** Carries DNS over the TCP tunnel for TCP-only plugins; OS
   adapter DNS is advertised the configured resolver IPs, which route into

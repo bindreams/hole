@@ -175,8 +175,18 @@ impl SocketStack {
 
     /// Park a socket the datapath is done with. It stays in the set until
     /// [`poll`](Self::poll) sees smoltcp finish with its peer.
+    ///
+    /// A handle must not be retired twice — the second reap would call
+    /// `SocketSet::remove` on an empty slot and panic. Every caller retires a
+    /// handle it has just taken out of the map that owned it, so the list
+    /// cannot come to hold a duplicate.
     pub(crate) fn retire(&mut self, handle: SocketHandle) {
         self.retiring.push(handle);
+    }
+
+    /// Drop a socket now, without waiting for smoltcp to finish with its peer.
+    pub(crate) fn remove(&mut self, handle: SocketHandle) {
+        self.sockets.remove(handle);
     }
 
     pub(crate) fn socket(&self, handle: SocketHandle) -> &tcp::Socket<'static> {
@@ -188,15 +198,36 @@ impl SocketStack {
     }
 }
 
-/// Whether smoltcp has no further use for a socket the datapath owns.
+/// How a connection socket leaves the set once the datapath is done with it.
+#[derive(Debug, PartialEq)]
+pub(crate) enum Disposal {
+    /// Hold it until smoltcp finishes with its peer.
+    Retire,
+    /// Drop it now.
+    Remove,
+}
+
+/// How to dispose of a connection socket in `state`, or `None` while it is
+/// still live.
 ///
-/// `Listen` belongs here because a socket in the connection map reaches it by
-/// exactly one route: the client answered our SYN-ACK with an RST, and smoltcp
-/// flipped it back without clearing the listen endpoint that would otherwise
-/// hijack every later SYN on that port. An `Established` socket that receives
-/// an RST goes to `Closed` instead, so `Listen` here is unambiguous.
-pub(crate) fn is_finished(state: tcp::State) -> bool {
-    matches!(state, tcp::State::Closed | tcp::State::TimeWait | tcp::State::Listen)
+/// `Listen` is a finished state because a socket in the connection map reaches
+/// it by exactly one route: the client answered our SYN-ACK with an RST, and
+/// smoltcp flipped it back without clearing the listen endpoint that would
+/// otherwise hijack every later SYN on that port. An `Established` socket that
+/// receives an RST goes to `Closed` instead, so `Listen` here is unambiguous.
+/// Both it and `Closed` retire, which costs at most one poll: their tuple is
+/// either already clear or clears as soon as the last packet is out.
+///
+/// `TimeWait` is removed at once instead. Retiring it would hold the socket,
+/// and both its buffers, for smoltcp's 10 s `CLOSE_DELAY` — the tuple survives
+/// until the close timer fires. Trading that retention for the ACK the socket
+/// still owes its peer is bindreams/hole#909, and is not decided here.
+pub(crate) fn decide_disposal(state: tcp::State) -> Option<Disposal> {
+    match state {
+        tcp::State::Closed | tcp::State::Listen => Some(Disposal::Retire),
+        tcp::State::TimeWait => Some(Disposal::Remove),
+        _ => None,
+    }
 }
 
 fn smoltcp_to_std_ip(addr: IpAddress) -> IpAddr {

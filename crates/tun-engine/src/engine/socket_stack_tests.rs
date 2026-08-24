@@ -121,6 +121,10 @@ fn rst(src: SocketAddr, dst: SocketAddr, seq: u32, ack: u32) -> Vec<u8> {
     segment(src, dst, TcpControl::Rst, seq, Some(ack))
 }
 
+fn fin(src: SocketAddr, dst: SocketAddr, seq: u32, ack: u32) -> Vec<u8> {
+    segment(src, dst, TcpControl::Fin, seq, Some(ack))
+}
+
 /// Drain and parse everything the stack has queued for the TUN.
 fn tcp_out(stack: &mut SocketStack) -> Vec<Segment> {
     stack.dequeue_tx().iter().map(|packet| parse_segment(packet)).collect()
@@ -207,6 +211,37 @@ fn revert_to_listen(stack: &mut SocketStack) -> SocketHandle {
 
     stack.enqueue_rx(rst(client(), dest(), isn + 1, after(synack[0].seq)));
     stack.poll(t(2));
+    handle
+}
+
+/// Drive an admitted connection through a clean close to `TimeWait`: we send
+/// the FIN, the client acknowledges it and sends its own.
+fn time_wait(stack: &mut SocketStack) -> SocketHandle {
+    let isn = 1000u32;
+    let handle = half_open(stack, isn);
+    stack.admit(handle, 80);
+    stack.poll(t(1));
+
+    let synack = tcp_out(stack);
+    assert_eq!(synack.len(), 1);
+    stack.enqueue_rx(ack(client(), dest(), isn + 1, after(synack[0].seq)));
+    stack.poll(t(2));
+    assert_eq!(stack.socket(handle).state(), tcp::State::Established);
+
+    stack.socket_mut(handle).close();
+    stack.poll(t(3));
+    let our_fin = tcp_out(stack);
+    assert_eq!(our_fin.len(), 1);
+    assert_eq!(our_fin[0].control, TcpControl::Fin);
+
+    stack.enqueue_rx(ack(client(), dest(), isn + 1, after(our_fin[0].seq)));
+    stack.poll(t(4));
+    assert_eq!(stack.socket(handle).state(), tcp::State::FinWait2);
+
+    stack.enqueue_rx(fin(client(), dest(), isn + 1, after(our_fin[0].seq)));
+    stack.poll(t(5));
+    assert_eq!(stack.socket(handle).state(), tcp::State::TimeWait);
+    let _ = tcp_out(stack);
     handle
 }
 
@@ -477,10 +512,11 @@ fn a_reverted_socket_is_retired_and_stops_hijacking() {
 }
 
 #[skuld::test]
-fn is_finished_covers_closed_timewait_and_listen() {
-    for state in [tcp::State::Closed, tcp::State::TimeWait, tcp::State::Listen] {
-        assert!(is_finished(state), "{state} is finished with its peer");
-    }
+fn decide_disposal_retires_closed_and_listen_but_removes_timewait() {
+    assert_eq!(decide_disposal(tcp::State::Closed), Some(Disposal::Retire));
+    assert_eq!(decide_disposal(tcp::State::Listen), Some(Disposal::Retire));
+    assert_eq!(decide_disposal(tcp::State::TimeWait), Some(Disposal::Remove));
+
     for state in [
         tcp::State::SynSent,
         tcp::State::SynReceived,
@@ -491,6 +527,28 @@ fn is_finished_covers_closed_timewait_and_listen() {
         tcp::State::CloseWait,
         tcp::State::LastAck,
     ] {
-        assert!(!is_finished(state), "{state} still has a peer");
+        assert_eq!(decide_disposal(state), None, "{state} still has a peer");
     }
+}
+
+/// Why `TimeWait` is the one finished state that is removed rather than
+/// retired: its tuple lives on for smoltcp's `CLOSE_DELAY`, so retiring it
+/// would park the socket and both its buffers for that whole window.
+#[skuld::test]
+fn retiring_a_timewait_socket_would_hold_it_but_removing_does_not() {
+    let mut parked = stack();
+    let handle = time_wait(&mut parked);
+    assert!(parked.socket(handle).remote_endpoint().is_some());
+
+    parked.retire(handle);
+    parked.poll(t(6));
+    assert!(
+        parked.sockets.iter().any(|(h, _)| h == handle),
+        "retiring parks a TIME-WAIT socket instead of freeing it"
+    );
+
+    let mut dropped = stack();
+    let handle = time_wait(&mut dropped);
+    dropped.remove(handle);
+    assert!(!dropped.sockets.iter().any(|(h, _)| h == handle));
 }
