@@ -115,7 +115,6 @@ fn probe_tunnel() -> ProbeOutcome {
 
 // Bypass route (F6/F9) ================================================================================================
 
-#[cfg(target_os = "windows")]
 fn ps_output(script: &str) -> String {
     let out = Command::new("powershell")
         .args(["-NoProfile", "-Command", script])
@@ -128,12 +127,10 @@ fn ps_output(script: &str) -> String {
 /// TUNNEL destination under a Full-mode session (the `0.0.0.0/1` split), so
 /// the interface permit would correctly permit it — see F6. Longest-prefix
 /// match puts this `/32` ahead of the `/1` split once installed.
-#[cfg(target_os = "windows")]
 struct BypassRoute {
     interface_name: String,
 }
 
-#[cfg(target_os = "windows")]
 impl BypassRoute {
     fn install(gw: &GatewayInfo) -> Self {
         let prefix = format!("{NO_LEAK_TARGET_IP}/32");
@@ -186,7 +183,6 @@ impl BypassRoute {
     }
 }
 
-#[cfg(target_os = "windows")]
 impl Drop for BypassRoute {
     fn drop(&mut self) {
         let prefix = format!("{NO_LEAK_TARGET_IP}/32");
@@ -217,12 +213,10 @@ impl Drop for BypassRoute {
 // copy because it is test-private code on the other side of a crate
 // boundary. ===========================================================================================================
 
-#[cfg(target_os = "windows")]
 fn open_controlling_terminal() -> io::Result<std::fs::File> {
     std::fs::OpenOptions::new().write(true).open("CONOUT$")
 }
 
-#[cfg(target_os = "windows")]
 fn write_recovery_record(state_dir: &Path) -> io::Result<PathBuf> {
     use std::io::Write as _;
 
@@ -257,13 +251,11 @@ fn write_recovery_record(state_dir: &Path) -> io::Result<PathBuf> {
 /// make `release_all` read a clean host over a possibly-live cover, the
 /// manufactured lockout F7 warns against. Declaring it after `harness` and
 /// dropping it explicitly before `harness` goes out of scope satisfies that.
-#[cfg(target_os = "windows")]
 struct SessionEscapeGuard {
     dir: PathBuf,
     record_path: PathBuf,
 }
 
-#[cfg(target_os = "windows")]
 impl Drop for SessionEscapeGuard {
     fn drop(&mut self) {
         if let Err(e) = tun_engine::routing::failclosed::release_all(&self.dir) {
@@ -281,7 +273,6 @@ impl Drop for SessionEscapeGuard {
 
 // The session-level test ==============================================================================================
 
-#[cfg(target_os = "windows")]
 async fn run_live_tun_permit_session(dist: &Path, ss: &SsServerHandle) {
     let gw = tun_engine::get_default_gateway_info().expect("HARNESS: get_default_gateway_info");
     let _bypass = BypassRoute::install(&gw);
@@ -436,7 +427,6 @@ async fn run_live_tun_permit_session(dist: &Path, ss: &SsServerHandle) {
 }
 
 /// See the module doc for what this test does and does not establish.
-#[cfg(target_os = "windows")]
 #[skuld::test(labels = [DIST_BIN, TUN], serial = TUN)]
 fn live_tun_permit_holds_for_a_real_session_with_the_kill_switch_armed(
     #[fixture(dist_dir)] dist: &Path,
