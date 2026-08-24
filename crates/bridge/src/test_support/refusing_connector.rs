@@ -15,8 +15,11 @@ use crate::dns::connector::{
 /// nothing is listening on" has no portable failure shape, so it cannot pin an
 /// exact failure layer: macOS black-holes connects to a bound-but-unlistened
 /// socket (the attempt runs to the full budget and reports `layer=timeout`
-/// rather than `layer=connect`), and GitHub's Windows runners drop SYNs to
-/// closed ephemeral loopback ports (see `server_test_tests.rs`). A released
+/// rather than `layer=connect`). Windows instead *refuses* that same shape —
+/// it is not a black hole there — but only after paying its own
+/// SYN-retransmission budget (`util::syn_budget`), so whether a real closed
+/// socket reports a connect-layer or a timeout-layer cause on Windows depends
+/// on whether the test's own budget happens to exceed the host's. A released
 /// ephemeral port is also re-bindable by a concurrent test.
 ///
 /// `UpstreamConnector` is the codebase's seam for exactly this: the OS socket
