@@ -1,22 +1,22 @@
 //! Driver — the smoltcp-backed packet loop.
 //!
-//! Owns the real TUN device, the smoltcp `Interface`, socket set, and
-//! UDP flow table. Reads packets, dispatches TCP accepts + UDP flows to
-//! the caller-supplied [`Router`](super::Router), handles port-53 UDP via
-//! the optional [`DnsInterceptor`](super::DnsInterceptor).
+//! Owns the real TUN device, the wall clock, the connection map, and the
+//! UDP flow table; the smoltcp layer lives in
+//! [`SocketStack`](super::socket_stack::SocketStack). Reads packets,
+//! dispatches TCP accepts + UDP flows to the caller-supplied
+//! [`Router`](super::Router), handles port-53 UDP via the optional
+//! [`DnsInterceptor`](super::DnsInterceptor).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Instant as StdInstant;
 
-use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
+use smoltcp::iface::SocketHandle;
 use smoltcp::phy::ChecksumCapabilities;
 use smoltcp::socket::tcp;
 use smoltcp::time::Instant as SmoltcpInstant;
-use smoltcp::wire::{
-    HardwareAddress, IpAddress, IpCidr, IpProtocol, Ipv4Packet, Ipv4Repr, Ipv6Packet, Ipv6Repr, UdpPacket, UdpRepr,
-};
+use smoltcp::wire::{IpAddress, IpProtocol, Ipv4Packet, Ipv4Repr, Ipv6Packet, Ipv6Repr, UdpPacket, UdpRepr};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, Semaphore};
 use tokio_util::sync::CancellationToken;
@@ -25,9 +25,9 @@ use tracing::{debug, trace, warn};
 use super::config::EngineConfig;
 use super::dns::DnsInterceptor;
 use super::router::{Router, TcpMeta, UdpMeta};
+use super::socket_stack::{Handshake, SocketStack};
 use super::tcp_flow::TcpFlow;
 use super::udp_flow::{FlowKey, FlowTable, UdpReply};
-use super::virtual_device::VirtualTunDevice;
 use crate::device::DeviceConfig;
 
 // Internal state ======================================================================================================
@@ -44,21 +44,11 @@ struct TcpConn {
     pending_send: Vec<u8>,
 }
 
-/// Tracks a TCP listener socket in smoltcp waiting for incoming SYN packets.
-struct TcpListener {
-    handle: SocketHandle,
-    port: u16,
-}
-
 pub(crate) struct Driver {
     tun: tun::AsyncDevice,
-    device: VirtualTunDevice,
-    iface: Interface,
-    sockets: SocketSet<'static>,
+    stack: SocketStack,
     dns_interceptor: Option<Arc<dyn DnsInterceptor>>,
-    listeners: Vec<TcpListener>,
     connections: HashMap<SocketHandle, TcpConn>,
-    listened_ports: HashSet<u16>,
     cancel: CancellationToken,
     conn_semaphore: Arc<Semaphore>,
     sniffer_semaphore: Arc<Semaphore>,
@@ -87,36 +77,15 @@ impl Driver {
         config: Arc<EngineConfig>,
         cancel: CancellationToken,
     ) -> Self {
-        let mtu = device_config.mtu as usize;
-        let mut device = VirtualTunDevice::new(mtu);
-
-        let iface_config = Config::new(HardwareAddress::Ip);
+        let stack = SocketStack::new(&device_config, &config);
         let epoch = StdInstant::now();
-        let now = SmoltcpInstant::from_millis(0);
-        let mut iface = Interface::new(iface_config, &mut device, now);
-        iface.set_any_ip(true);
-        iface.update_ip_addrs(|addrs| {
-            if let Some(v4) = device_config.ipv4 {
-                addrs.push(IpCidr::Ipv4(v4)).unwrap();
-            }
-            if let Some(v6) = device_config.ipv6 {
-                addrs.push(IpCidr::Ipv6(v6)).unwrap();
-            }
-        });
-
-        let sockets = SocketSet::new(vec![]);
-
         let (reply_tx, reply_rx) = mpsc::channel(1024);
 
         Self {
             tun,
-            device,
-            iface,
-            sockets,
+            stack,
             dns_interceptor: config.dns_interceptor.clone(),
-            listeners: Vec::new(),
             connections: HashMap::new(),
-            listened_ports: HashSet::new(),
             cancel,
             conn_semaphore: Arc::new(Semaphore::new(config.max_connections)),
             sniffer_semaphore: Arc::new(Semaphore::new(config.max_sniffers)),
@@ -164,10 +133,10 @@ impl Driver {
                         if !consumed {
                             if let Some((dst_port, proto)) = parse_ip_dst(packet) {
                                 if proto == IpProto::Tcp {
-                                    self.ensure_listener(dst_port);
+                                    self.stack.ensure_listener(dst_port);
                                 }
                             }
-                            self.device.enqueue_rx(packet.to_vec());
+                            self.stack.enqueue_rx(packet.to_vec());
                         }
                     }
                     Err(e) => {
@@ -212,66 +181,28 @@ impl Driver {
 
     fn poll_smoltcp(&mut self) {
         let now = self.smoltcp_now();
-        self.iface.poll(now, &mut self.device, &mut self.sockets);
+        self.stack.poll(now);
     }
 
     // TCP =============================================================================================================
 
-    fn ensure_listener(&mut self, port: u16) {
-        if self.listened_ports.contains(&port) {
-            return;
-        }
-        let rx_buf = tcp::SocketBuffer::new(vec![0u8; self.config.tcp_rx_buf_size]);
-        let tx_buf = tcp::SocketBuffer::new(vec![0u8; self.config.tcp_tx_buf_size]);
-        let mut socket = tcp::Socket::new(rx_buf, tx_buf);
-        if let Err(e) = socket.listen(port) {
-            warn!("failed to listen on port {port}: {e:?}");
-            return;
-        }
-        let handle = self.sockets.add(socket);
-        self.listeners.push(TcpListener { handle, port });
-        self.listened_ports.insert(port);
-    }
-
     fn accept_tcp_connections(&mut self) {
-        let mut accepted = Vec::new();
-        for listener in &self.listeners {
-            let socket = self.sockets.get::<tcp::Socket>(listener.handle);
-            if socket.state() != tcp::State::Listen {
-                accepted.push((listener.handle, listener.port));
-            }
-        }
-
-        for (handle, port) in accepted {
-            self.listeners.retain(|l| l.handle != handle);
-            self.listened_ports.remove(&port);
-
-            let socket = self.sockets.get::<tcp::Socket>(handle);
-            let (dst_ip, dst_port, src_ip, src_port) = match (socket.local_endpoint(), socket.remote_endpoint()) {
-                (Some(local), Some(remote)) => (
-                    smoltcp_to_std_ip(local.addr),
-                    local.port,
-                    smoltcp_to_std_ip(remote.addr),
-                    remote.port,
-                ),
-                _ => {
+        for handshake in self.stack.take_handshakes() {
+            let (handle, port, src, dst) = match handshake {
+                Handshake::Pending { handle, port, src, dst } => (handle, port, src, dst),
+                Handshake::Stale { handle, port } => {
                     warn!("accepted TCP connection with no endpoint on port {port}");
-                    let socket = self.sockets.get_mut::<tcp::Socket>(handle);
-                    socket.abort();
-                    self.sockets.remove(handle);
-                    self.ensure_listener(port);
+                    self.stack.reject(handle, port);
                     continue;
                 }
             };
+            let (dst_ip, dst_port) = (dst.ip(), dst.port());
 
             let permit = match self.conn_semaphore.clone().try_acquire_owned() {
                 Ok(p) => p,
                 Err(_) => {
                     warn!("connection limit reached, rejecting {dst_ip}:{dst_port}");
-                    let socket = self.sockets.get_mut::<tcp::Socket>(handle);
-                    socket.abort();
-                    self.sockets.remove(handle);
-                    self.ensure_listener(port);
+                    self.stack.reject(handle, port);
                     continue;
                 }
             };
@@ -287,10 +218,7 @@ impl Driver {
                 },
             );
 
-            let meta = TcpMeta {
-                src: SocketAddr::new(src_ip, src_port),
-                dst: SocketAddr::new(dst_ip, dst_port),
-            };
+            let meta = TcpMeta { src, dst };
             let router = Arc::clone(&self.router);
             let cancel = self.cancel.clone();
             tokio::spawn(async move {
@@ -305,7 +233,7 @@ impl Driver {
                 drop(permit);
             });
 
-            self.ensure_listener(port);
+            self.stack.ensure_listener(port);
         }
     }
 
@@ -317,7 +245,7 @@ impl Driver {
                 Some(c) => c,
                 None => continue,
             };
-            let socket = self.sockets.get_mut::<tcp::Socket>(handle);
+            let socket = self.stack.socket_mut(handle);
 
             // Direction: smoltcp → Router.
             if socket.may_recv() {
@@ -372,14 +300,16 @@ impl Driver {
             .keys()
             .copied()
             .filter(|&handle| {
-                let socket = self.sockets.get::<tcp::Socket>(handle);
-                matches!(socket.state(), tcp::State::Closed | tcp::State::TimeWait)
+                matches!(
+                    self.stack.socket(handle).state(),
+                    tcp::State::Closed | tcp::State::TimeWait
+                )
             })
             .collect();
 
         for handle in finished {
             self.connections.remove(&handle);
-            self.sockets.remove(handle);
+            self.stack.remove(handle);
         }
     }
 
@@ -467,7 +397,7 @@ impl Driver {
 
     async fn flush_to_tun(&mut self) {
         // smoltcp output (TCP).
-        let packets = self.device.dequeue_tx();
+        let packets = self.stack.dequeue_tx();
         for pkt in packets {
             if let Err(e) = self.tun.write_all(&pkt).await {
                 trace!("TUN write error: {e}");
@@ -712,12 +642,5 @@ fn build_udp_packet(src: SocketAddr, dst: SocketAddr, payload: &[u8]) -> Vec<u8>
             debug!("mismatched IP versions in UDP reply");
             Vec::new()
         }
-    }
-}
-
-fn smoltcp_to_std_ip(addr: IpAddress) -> IpAddr {
-    match addr {
-        IpAddress::Ipv4(v4) => IpAddr::V4(v4),
-        IpAddress::Ipv6(v6) => IpAddr::V6(v6),
     }
 }

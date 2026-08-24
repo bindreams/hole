@@ -22,6 +22,7 @@ mod config;
 mod dns;
 mod driver;
 mod router;
+mod socket_stack;
 mod tcp_flow;
 mod udp_flow;
 mod virtual_device;
