@@ -778,6 +778,13 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
             },
         };
 
+        // At the JOIN, not on `resolve_server_ip`'s success path: the
+        // held-cover reuse branch above takes `b.server_ip` and resolves
+        // nothing. Arming only the resolve path would be correct today
+        // solely because `BlockedStart` is in-memory and the registry is
+        // grow-only — an undocumented invariant one refactor from false.
+        hole_common::logging::redact_arm::arm_resolved_ip(&config.server.id, server_ip);
+
         // `ech_doh` (what ex-ray is TOLD to fetch) and `ech_resolver_permit`
         // (what THIS ATTEMPT would permit it to reach) both read the same
         // plugin-presence + pin inputs — computed ONCE here so the two cannot

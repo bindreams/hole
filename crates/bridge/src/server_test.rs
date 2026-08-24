@@ -128,6 +128,7 @@ pub async fn run_server_test(entry: &ServerEntry, cfg: &TestConfig) -> ServerTes
         }
     };
     let server_ip = bootstrapped.server_ip;
+    hole_common::logging::redact_arm::arm_resolved_ip(&entry.id, server_ip);
     let server_host = crate::dns::bootstrap::handoff_host(server_ip);
 
     // Phase 1: pre-flight DNS + TCP probe. Skipped for a QUIC server: its
