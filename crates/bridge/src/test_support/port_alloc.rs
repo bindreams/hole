@@ -64,19 +64,18 @@ pub(crate) struct WaitForPortFailure {
 /// `timeout` elapses. Returns `Err` with a per-attempt error histogram
 /// otherwise.
 ///
-/// Each connect attempt pins [`util::syn_budget::SynBudget::NoRetransmit`]
-/// — this is a probe inside a loop that re-issues on any failure, exactly
-/// the shape the budget is for. A closed port is refused in ~0.1 ms
-/// instead of paying Windows' ~2.05 s stock SYN-retransmission budget, so
-/// the refusal's errno survives instead of being swallowed by the
-/// per-attempt timeout below.
+/// Each attempt goes through [`util::syn_budget::probe`] pinning
+/// [`util::syn_budget::SynBudget::NoRetransmit`] — this is a probe inside a
+/// loop that re-issues on any failure, exactly the shape the budget is for.
+/// A closed port is refused in ~0.1 ms instead of paying Windows' ~2.05 s
+/// stock SYN-retransmission budget, so the refusal's errno reaches the
+/// histogram instead of being cut off by the per-attempt cap.
 ///
-/// The per-attempt `tokio::time::timeout` **stays** — it is what bounds a
-/// genuine black hole (measured 1015 ms pinned, vs. 21037 ms unpinned for
-/// an unrouted address), a shape `NoRetransmit` does not affect. Without
-/// it, a black-holed port would spend the OS connect-timer (~21 s
-/// default) per attempt, leaving room for only 1–2 attempts in a 10 s
-/// budget.
+/// The per-attempt cap **stays** — it is what bounds a genuine black hole
+/// (measured 1015 ms pinned, vs. 21037 ms unpinned for an unrouted
+/// address), a shape `NoRetransmit` does not affect. Without it, a
+/// black-holed port would spend the OS connect-timer (~21 s default) per
+/// attempt, leaving room for only 1–2 attempts in a 10 s budget.
 ///
 /// Diagnostics use `eprintln!` (not tracing) because this connect-failure
 /// histogram is intentionally always-on and must not be droppable by a
@@ -92,20 +91,21 @@ pub(crate) async fn try_wait_for_port(addr: SocketAddr, timeout: Duration) -> Re
     while start.elapsed() < timeout {
         attempts += 1;
         let attempt_start = Instant::now();
-        let outcome = tokio::time::timeout(
+        let outcome = util::syn_budget::probe(
+            addr,
             Duration::from_millis(500),
-            util::syn_budget::connect(addr, util::syn_budget::SynBudget::NoRetransmit),
+            util::syn_budget::SynBudget::NoRetransmit,
         )
         .await;
         match outcome {
-            Ok(Ok(_stream)) => {
+            util::syn_budget::ProbeOutcome::Listening(_stream) => {
                 eprintln!(
                     "[wait_for_port] connect OK to {addr} after {attempts} attempts, {}ms total",
                     start.elapsed().as_millis()
                 );
                 return Ok(());
             }
-            Ok(Err(e)) => {
+            util::syn_budget::ProbeOutcome::Refused(e) | util::syn_budget::ProbeOutcome::NoVerdict(Some(e)) => {
                 let code = e.raw_os_error();
                 let pair = (code, e.to_string());
                 eprintln!(
@@ -121,7 +121,7 @@ pub(crate) async fn try_wait_for_port(addr: SocketAddr, timeout: Duration) -> Re
                 }
                 last_err = Some(pair);
             }
-            Err(_) => {
+            util::syn_budget::ProbeOutcome::NoVerdict(None) => {
                 let pair = (None, "per-attempt 500ms timeout".to_string());
                 eprintln!("[wait_for_port] attempt {attempts} to {addr} hit per-attempt 500ms timeout");
                 *error_counts.entry(None).or_default() += 1;

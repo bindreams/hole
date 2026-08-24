@@ -84,7 +84,14 @@ pub(crate) const TAP_DISABLED_HINT: &str =
 
 /// Per-upstream budget for one attempt, before dividing across a walk's
 /// width — see [`attempt_budget`].
-const PER_ATTEMPT: std::time::Duration = std::time::Duration::from_millis(1500);
+const PER_ATTEMPT: std::time::Duration = std::time::Duration::from_millis(2500);
+
+// A budget under the refusal cost cannot report a refusal: `forward_one`'s
+// timer fires first and a refused upstream is typed `UpstreamLayer::Timeout`
+// instead of `Connect` / `ConnectionRefused` — the very fields
+// `TAP_DISABLED_HINT` sends the reader to. `OUTER_BUDGET` is unchanged, so
+// the gate's worst case is unchanged; only the split of it moves.
+const _: () = assert!(PER_ATTEMPT.as_millis() > util::syn_budget::REFUSAL_COST.as_millis());
 
 /// Per-upstream budget for a walk of `width` upstreams with `remaining` time
 /// left on the outer deadline, or `None` if there is not enough left for a
@@ -110,7 +117,7 @@ fn attempt_budget(remaining: std::time::Duration, width: usize) -> Option<std::t
 }
 
 /// Run the forwarder self-test inline. Returns `SelfTestOutcome::Ok` when any
-/// well-formed non-SERVFAIL reply comes back within the 3×1500ms / 5s budget,
+/// well-formed non-SERVFAIL reply comes back within the 3×2500ms / 5s budget,
 /// else `Failed`.
 ///
 /// `PER_ATTEMPT` is handed to `try_forward` as the PER-UPSTREAM budget, shrunk

@@ -33,7 +33,7 @@ fn attempt_budget_divides_remaining_across_the_walk_width() {
     // Capped at PER_ATTEMPT even with plenty of time left.
     assert_eq!(
         super::attempt_budget(std::time::Duration::from_secs(10), 1),
-        Some(std::time::Duration::from_millis(1500))
+        Some(super::PER_ATTEMPT)
     );
 }
 
@@ -43,7 +43,7 @@ fn attempt_budget_divides_remaining_across_the_walk_width() {
 fn attempt_budget_ignores_remaining_when_width_is_zero() {
     assert_eq!(
         super::attempt_budget(std::time::Duration::ZERO, 0),
-        Some(std::time::Duration::from_millis(1500))
+        Some(super::PER_ATTEMPT)
     );
 }
 
@@ -595,9 +595,10 @@ fn self_test_failure_logs_the_typed_upstream_cause() {
         output.contains("cause=unreachable"),
         "expected 'cause=unreachable'; got:\n{output}"
     );
+    let expected_budget = format!("budget_ms={}", super::PER_ATTEMPT.as_millis());
     assert!(
-        output.contains("budget_ms=1500"),
-        "the WARN must report the SELF-TEST's budget, proving it reached forward_one; got:\n{output}"
+        output.contains(&expected_budget),
+        "the WARN must report the SELF-TEST's budget ({expected_budget}), proving it reached forward_one; got:\n{output}"
     );
 }
 
@@ -625,11 +626,11 @@ fn self_test_respects_the_overall_deadline_and_reports_the_real_failure() {
             (outcome, t0.elapsed())
         });
 
-    // Unbounded, this would cost ATTEMPTS × servers × PER_ATTEMPT = 9s; the
+    // Unbounded, this would cost ATTEMPTS × servers × PER_ATTEMPT = 15s; the
     // deadline must cut it near 5s. tokio rounds every timer deadline UP to
     // a whole millisecond and the loop arms at most one per upstream per
     // attempt, so allow exactly that many milliseconds of overshoot.
-    const UNBOUNDED: std::time::Duration = std::time::Duration::from_secs(9);
+    const UNBOUNDED: std::time::Duration = std::time::Duration::from_secs(15);
     let quantization = std::time::Duration::from_millis(3 * 2);
     assert!(
         elapsed < UNBOUNDED,
