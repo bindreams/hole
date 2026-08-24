@@ -14,7 +14,7 @@ use std::net::IpAddr;
 use std::time::Duration;
 
 use tokio::io::AsyncBufReadExt as _;
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpListener;
 
 pub struct ReadyListener {
     listener: TcpListener,
@@ -72,6 +72,43 @@ impl ReadyListener {
     }
 }
 
+/// The result of one connect attempt in [`probe_once`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProbeOutcome {
+    /// Something accepted the connection.
+    Listening,
+    /// The connect was refused — nothing is listening (yet).
+    Refused,
+    /// The per-attempt cap elapsed without a verdict — a real class-2 remote
+    /// endpoint (see the `hosts`-file note below) that may never answer.
+    NoVerdict,
+}
+
+/// One connect attempt against `addr`, capped at `cap`.
+///
+/// Pins [`util::syn_budget::SynBudget::NoRetransmit`]: both callers below
+/// are probes inside a loop that re-issues on any outcome other than
+/// `Listening`, exactly the shape the budget is for. On Windows a refused
+/// loopback port is reported in ~0.1 ms instead of paying the ~2.05 s stock
+/// SYN-retransmission budget — under the old plain connect, that cost
+/// consistently exceeded `cap` and every refusal on Windows surfaced as
+/// `NoVerdict`, indistinguishable from a genuinely unresponsive remote
+/// endpoint. The cap still matters: it bounds a `hosts` file mapping
+/// `localhost` off-box to a class-2 remote endpoint that may never answer,
+/// which `NoRetransmit` does not affect.
+async fn probe_once(addr: std::net::SocketAddr, cap: Duration) -> ProbeOutcome {
+    match tokio::time::timeout(
+        cap,
+        util::syn_budget::connect(addr, util::syn_budget::SynBudget::NoRetransmit),
+    )
+    .await
+    {
+        Ok(Ok(_conn)) => ProbeOutcome::Listening,
+        Ok(Err(_)) => ProbeOutcome::Refused,
+        Err(_) => ProbeOutcome::NoVerdict,
+    }
+}
+
 /// One probe round (NOT a wait): is something already listening on `port`?
 /// Used by the Delta-7 leaked-vite preflight — a clean startup must not pay
 /// a polling budget for a port that is supposed to be free.
@@ -85,7 +122,7 @@ pub async fn port_in_use(port: u16) -> bool {
     };
     for addr in &addrs {
         // Same per-attempt cap as wait_for_port (see its comment).
-        if let Ok(Ok(_conn)) = tokio::time::timeout(Duration::from_millis(500), TcpStream::connect(addr)).await {
+        if probe_once(*addr, Duration::from_millis(500)).await == ProbeOutcome::Listening {
             return true;
         }
     }
@@ -111,10 +148,7 @@ pub async fn wait_for_port(port: u16, budget: Duration) -> bool {
     while tokio::time::Instant::now() < deadline {
         for addr in &addrs {
             // 500ms per-attempt cap — dev.py:251 parity (sock.settimeout(0.5)).
-            // Pure-loopback connects refuse instantly; the cap matters when a
-            // hosts file maps `localhost` to a non-loopback address (class-2:
-            // remote endpoint that may never answer).
-            if let Ok(Ok(_conn)) = tokio::time::timeout(Duration::from_millis(500), TcpStream::connect(addr)).await {
+            if probe_once(*addr, Duration::from_millis(500)).await == ProbeOutcome::Listening {
                 return true;
             }
         }

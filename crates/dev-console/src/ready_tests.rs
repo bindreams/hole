@@ -88,6 +88,17 @@ async fn port_probe_times_out_when_nothing_listens() {
 }
 
 #[skuld::test]
+async fn probe_once_classifies_a_closed_port_as_refused() {
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = l.local_addr().unwrap();
+    drop(l);
+    assert_eq!(
+        crate::ready::probe_once(addr, std::time::Duration::from_millis(500)).await,
+        crate::ready::ProbeOutcome::Refused
+    );
+}
+
+#[skuld::test]
 async fn port_in_use_is_a_single_probe_round() {
     let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port = l.local_addr().unwrap().port();
