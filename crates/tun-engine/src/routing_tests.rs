@@ -718,3 +718,48 @@ fn the_interim_adapter_can_never_record_an_intent() {
         }
     }
 }
+
+// Recovery dispatch ===================================================================================================
+
+#[skuld::test]
+fn adopt_deletes_nothing() {
+    // #881: with a wiped state dir, `Unset` x `Live` decides Adopt — and Adopt
+    // must not touch a cover that may belong to a RUNNING first bridge. After
+    // the volatile-permit refresh moved into `engage_lockdown`, `Sweep` is the
+    // only decision that reaches the OS on either platform.
+    use failclosed::RecoveryDispatch;
+    assert_eq!(
+        failclosed::recovery_dispatch(Adopt),
+        RecoveryDispatch::Inert,
+        "Adopt must issue no OS call at all"
+    );
+    assert_eq!(
+        failclosed::recovery_dispatch(Noop),
+        RecoveryDispatch::Inert,
+        "Noop must issue no OS call at all"
+    );
+    assert_eq!(
+        failclosed::recovery_dispatch(Sweep),
+        RecoveryDispatch::Disengage,
+        "Sweep is the sole OS-mutating decision"
+    );
+}
+
+#[skuld::test]
+fn only_an_explicit_off_intent_reaches_the_os() {
+    // The end-to-end statement #881 makes: walk the whole decision table and
+    // confirm the only cells that dispatch an OS mutation are the recorded-off
+    // ones. A regression that made a wiped state dir sweep again would show up
+    // here as an extra dispatching cell.
+    use failclosed::RecoveryDispatch;
+    for (intent, presence, _, _) in RECOVERY_TABLE {
+        let action = decide_cover_recovery(intent, presence).action;
+        if failclosed::recovery_dispatch(action) == RecoveryDispatch::Disengage {
+            assert_eq!(
+                intent,
+                Intent::Off,
+                "({intent:?}, {presence:?}) reached the OS without an explicit recorded off"
+            );
+        }
+    }
+}

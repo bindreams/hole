@@ -788,3 +788,65 @@ fn presence_probes_every_swept_lockdown_guid() {
         assert!(probed.contains(&appid_filter_guid(i, true)), "App-ID slot {i} V6");
     }
 }
+
+// engage-time volatile-permit refresh =================================================================================
+
+#[skuld::test]
+fn engage_lockdown_refreshes_the_volatile_permits() {
+    // The refresh lives at ENGAGE, not at recovery: `ok_or_exists` treats a
+    // re-add of a fixed-key filter as success, so without a delete first the
+    // stale TUN LUID and the previous server IP would survive a reconnect.
+    let spec = build_lockdown_spec(v4(), luid(), &[plugin_path(), bridge_path()]);
+    assert_eq!(
+        spec.pre_delete,
+        adopt_delete_guids(),
+        "engage must drop exactly the volatile permits — the TUN pair and BOTH server-family \
+         permits — before adding anything"
+    );
+
+    // Every deleted key is either re-added with this attempt's fresh values
+    // (the TUN pair, and the server permit for THIS family) or deliberately
+    // left deleted (the other family's stale server permit).
+    let added: std::collections::HashSet<GUID> = spec.filters.iter().map(|f| f.guid).collect();
+    for &i in &LOCKDOWN_TUN_GUID_INDICES {
+        assert!(
+            added.contains(&LOCKDOWN_FILTER_GUIDS[i]),
+            "the TUN permit at index {i} must be re-added fresh after the delete"
+        );
+    }
+    assert!(
+        added.contains(&LOCKDOWN_FILTER_GUIDS[4]),
+        "a v4 server must have its v4 permit re-added"
+    );
+    assert!(
+        !added.contains(&LOCKDOWN_FILTER_GUIDS[5]),
+        "the other family's server permit stays deleted, not re-added stale"
+    );
+
+    // The fail-closed floor is never dropped by an engage either.
+    for guid in [
+        LOCKDOWN_FILTER_GUIDS[6],
+        LOCKDOWN_FILTER_GUIDS[7],
+        LOCKDOWN_FILTER_GUIDS[0],
+        LOCKDOWN_FILTER_GUIDS[1],
+        LOCKDOWN_FILTER_GUIDS[8],
+        LOCKDOWN_FILTER_GUIDS[9],
+    ] {
+        assert!(
+            !spec.pre_delete.contains(&guid),
+            "engage must not delete the fail-closed floor {guid:?}"
+        );
+    }
+    for i in 0..MAX_APPID_BINARIES {
+        assert!(!spec.pre_delete.contains(&appid_filter_guid(i, false)));
+        assert!(!spec.pre_delete.contains(&appid_filter_guid(i, true)));
+    }
+}
+
+#[skuld::test]
+fn the_transient_cover_deletes_nothing_at_engage() {
+    // Only the lockdown cover has fixed-key volatile permits to refresh; the
+    // transient cover is engaged once per attempt over a swept host.
+    assert!(build_cover_spec(v4(), None).pre_delete.is_empty());
+    assert!(build_cover_spec(v6(), Some(resolver_v4())).pre_delete.is_empty());
+}

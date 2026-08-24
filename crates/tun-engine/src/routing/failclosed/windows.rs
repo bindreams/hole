@@ -83,10 +83,10 @@ pub const FILTER_GUIDS: [GUID; 12] = [
 /// a value this stable).
 const IPPROTO_TCP: u8 = 6;
 
-// Lockdown-cover filter GUIDs — disjoint from FILTER_GUIDS. Recovery sweeps
-// these (Sweep) or deletes the volatile TUN + server pairs (Adopt) — see
-// `recover_lockdown` / `swept_lockdown_guids`. A crash that leaves the cover
-// engaged is reconciled on the next start.
+// Lockdown-cover filter GUIDs — disjoint from FILTER_GUIDS. A Sweep deletes
+// all of these (`swept_lockdown_guids`); an engage refreshes the volatile
+// subset (`adopt_delete_guids`). A crash that leaves the cover engaged is
+// reconciled on the next start.
 // Layout: [loopback CONNECT V4, loopback CONNECT V6, TUN V4, TUN V6,
 //          server V4, server V6, block-all V4, block-all V6,
 //          loopback RECV_ACCEPT V4, loopback RECV_ACCEPT V6,
@@ -110,11 +110,11 @@ pub const LOCKDOWN_FILTER_GUIDS: [GUID; 12] = [
 ];
 
 /// Indices into [`LOCKDOWN_FILTER_GUIDS`] for the TUN-interface (LUID) permit
-/// pair — one of the two volatile permits Adopt drops (see
+/// pair — one of the two volatile permits an engage refreshes (see
 /// [`adopt_delete_guids`]).
 const LOCKDOWN_TUN_GUID_INDICES: [usize; 2] = [2, 3]; // TUN V4, TUN V6
 /// Indices into [`LOCKDOWN_FILTER_GUIDS`] for the server-IP permit pair — the
-/// other volatile permit Adopt drops (see [`adopt_delete_guids`]).
+/// other volatile permit an engage refreshes (see [`adopt_delete_guids`]).
 const LOCKDOWN_SERVER_GUID_INDICES: [usize; 2] = [4, 5]; // server V4, server V6
 
 /// Derive a deterministic App-ID filter GUID per (binary index, layer) so a
@@ -151,12 +151,16 @@ fn swept_lockdown_guids() -> Vec<GUID> {
     guids
 }
 
-/// The GUIDs Adopt deletes: the VOLATILE permits — the TUN-LUID pair (dies with
-/// the TUN) and the server-IP pair (changes with the server). They carry fixed
-/// keys, so engage's `ok_or_exists` would silently keep a stale one; deleting
-/// them lets the next connect re-add both fresh with current values. The floor
-/// (block-all, loopback, App-ID) is left in force so the host stays fail-closed
-/// across the restart.
+/// The VOLATILE lockdown permits — the TUN-LUID pair (dies with the TUN) and
+/// the server-IP pair (changes with the server). They carry fixed keys, so
+/// engage's `ok_or_exists` would silently keep a stale one; [`engage_lockdown`]
+/// deletes them inside its transaction before the adds, so every engage lands
+/// current values. The floor (block-all, loopback, App-ID) is never in this set
+/// — it stays in force so the host is never opened by a refresh.
+///
+/// Reached through `CoverSpec::pre_delete`, so recovery cannot issue it: a
+/// recovery-time delete would drop a RUNNING bridge's server permit whenever a
+/// second bridge with a fresh state dir adopted the cover.
 fn adopt_delete_guids() -> Vec<GUID> {
     LOCKDOWN_TUN_GUID_INDICES
         .iter()
@@ -232,6 +236,10 @@ pub struct FilterSpec {
 pub struct CoverSpec {
     pub provider: GUID,
     pub sublayer: GUID,
+    /// Filter keys the engage deletes inside its transaction BEFORE adding
+    /// anything. Non-empty only for the lockdown cover, whose volatile permits
+    /// carry fixed keys — see [`adopt_delete_guids`].
+    pub pre_delete: Vec<GUID>,
     pub filters: Vec<FilterSpec>,
 }
 
@@ -342,6 +350,9 @@ pub fn build_cover_spec(server_ip: IpAddr, resolver_ip: Option<IpAddr>) -> Cover
     CoverSpec {
         provider: PROVIDER_GUID,
         sublayer: SUBLAYER_GUID,
+        // The transient cover is engaged over a swept host and has no
+        // fixed-key volatile permit to refresh.
+        pre_delete: Vec::new(),
         filters,
     }
 }
@@ -430,6 +441,7 @@ pub fn build_lockdown_spec(server_ip: IpAddr, tun_luid: u64, app_ids: &[std::pat
     CoverSpec {
         provider: PROVIDER_GUID,
         sublayer: SUBLAYER_GUID,
+        pre_delete: adopt_delete_guids(),
         filters,
     }
 }
@@ -556,6 +568,10 @@ pub fn engage(
 
         // Wrap the mutating steps so any failure aborts the transaction and
         // closes the engine before returning.
+        debug_assert!(
+            spec.pre_delete.is_empty(),
+            "the transient cover has no volatile permit to refresh; this engage honors no pre_delete"
+        );
         let result = (|| -> Result<(), RoutingError> {
             wfp_check(FwpmTransactionBegin0(engine, 0), "FwpmTransactionBegin0")?;
             add_provider(engine, spec.provider)?;
@@ -595,11 +611,18 @@ pub fn engage_lockdown(
         )?;
         let result = (|| -> Result<(), RoutingError> {
             wfp_check(FwpmTransactionBegin0(engine, 0), "FwpmTransactionBegin0")?;
+            // Refresh the volatile permits: delete their fixed keys before the
+            // adds, in this same transaction, so a re-engage over an adopted
+            // cover lands the CURRENT TUN LUID and server IP instead of hitting
+            // `ok_or_exists` on a stale filter. Return codes are ignored for
+            // the same reason every other sweep ignores them — a delete that
+            // finds nothing (the ordinary first engage) is not an error.
+            for g in &spec.pre_delete {
+                let _ = FwpmFilterDeleteByKey0(engine, g);
+            }
             // Idempotent over an unswept cover: add_provider/add_sublayer use
-            // ok_or_exists, and the filter keys are fixed — a re-engage after
-            // an Adopt re-adds the TUN + server permits fresh (their keys were
-            // deleted by `recover_lockdown`, so the new server IP takes effect);
-            // the kept floor (block-all + loopback + App-ID) is a benign re-add.
+            // ok_or_exists, and the kept floor (block-all + loopback + App-ID)
+            // is a benign re-add.
             add_provider(engine, spec.provider)?;
             add_sublayer(engine, spec.sublayer, spec.provider)?;
             for f in &spec.filters {
@@ -929,37 +952,6 @@ impl Drop for Cover {
             }
             #[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
             let _ = FwpmEngineClose0(self.engine);
-        }
-    }
-}
-
-/// Reconcile a possibly-present standing lockdown cover with the persisted
-/// intent. Opens the engine; `Adopt` deletes the volatile permits — the dead
-/// TUN-LUID pair and the server-IP pair — keeping the fail-closed floor
-/// (block-all + loopback + App-ID) so the host stays blocked across the restart
-/// and the next connect re-adds TUN + server fresh; `Sweep` deletes all
-/// lockdown + App-ID filters,
-/// then the sublayer/provider IFF the transient cover isn't also using them
-/// (they share PROVIDER_GUID/SUBLAYER_GUID, so leave them — the transient
-/// `delete_all` owns their removal, and an orphaned empty sublayer is benign).
-/// `Noop`: nothing. Idempotent — a "not found" delete is ignored.
-pub fn recover_lockdown(decision: crate::routing::CoverRecovery, _state_dir: &Path) {
-    use crate::routing::CoverRecovery::*;
-    let guids: Vec<GUID> = match decision {
-        Noop => return,
-        Adopt => adopt_delete_guids(),
-        Sweep => swept_lockdown_guids(),
-    };
-    unsafe {
-        let mut engine = HANDLE::default();
-        #[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
-        if FwpmEngineOpen0(PCWSTR::null(), RPC_C_AUTHN_WINNT, None, None, &mut engine) == ERROR_SUCCESS.0 {
-            #[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
-            for g in guids {
-                let _ = FwpmFilterDeleteByKey0(engine, &g);
-            }
-            #[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
-            let _ = FwpmEngineClose0(engine);
         }
     }
 }

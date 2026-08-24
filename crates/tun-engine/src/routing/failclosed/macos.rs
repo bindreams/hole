@@ -559,35 +559,6 @@ fn lockdown_disengage(state_dir: &Path) {
     }
 }
 
-/// Act on a recovery decision for the lockdown cover (the facade routes `Sweep`
-/// through the fail-loud `disengage_lockdown`; this best-effort path remains
-/// correct if called directly). `Adopt` (intent ON): KEEP the host fail-closed —
-/// leave the lockdown ruleset + state file in force. The dead utun name in the
-/// `pass out quick on <tun>` line is harmless (matches no live interface); the
-/// next connect's `engage_lockdown` reuses the persisted snapshot and reloads
-/// with the fresh utun name. `Sweep` (intent OFF): best-effort restore. `Noop`:
-/// nothing.
-pub fn recover_lockdown(decision: crate::routing::CoverRecovery, state_dir: &Path) {
-    use crate::routing::CoverRecovery::*;
-    match decision {
-        Noop => {}
-        Adopt => {
-            tracing::info!("lockdown recovery: adopting persistent cover (host stays fail-closed)");
-            // Intentionally NOTHING removed: the block must survive the
-            // restart (this IS the crash-leak fix). macOS pf rules + enable
-            // state do NOT survive a reboot, but the persisted state file does:
-            // the next reconnect's `engage_lockdown` idempotently re-enables pf
-            // and reloads a live ruleset (so a connected session no longer fails
-            // open). Residual: the boot->first-connect interval is unprotected
-            // (no early-boot block) until that first reconnect re-arms the host.
-        }
-        Sweep => {
-            tracing::info!("lockdown recovery: sweeping leftover cover (intent off)");
-            lockdown_disengage(state_dir);
-        }
-    }
-}
-
 // release_all =========================================================================================================
 
 /// Seam over the pf operations `release_all_with` needs, so the ordering, the

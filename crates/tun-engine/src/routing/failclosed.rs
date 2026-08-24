@@ -145,17 +145,57 @@ pub fn engage_lockdown(
     }
 }
 
-/// Act on a [`CoverRecovery`] decision for the standing lockdown cover at
-/// startup. Dispatches to the platform reconciler: `Adopt` keeps the host
-/// fail-closed, refreshing the volatile TUN + server permits; `Sweep` fully
-/// disengages; `Noop` does nothing. cfg-free for `routing::recover_routes`.
-/// Best-effort: a `Sweep` that cannot disengage is logged, not propagated —
-/// startup recovery has no caller to act on it.
-pub fn recover_lockdown(decision: crate::routing::CoverRecovery, state_dir: &Path) {
+/// What startup recovery does to the OS for a given decision. There are only
+/// two answers, and only one of them touches the host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RecoveryDispatch {
+    /// No OS call at all.
+    Inert,
+    /// Disengage the standing cover.
+    Disengage,
+}
+
+/// Classify a [`CoverRecovery`] into what it does to the OS. Pure, exhaustive,
+/// and platform-free, so "`Adopt` is inert on both platforms" is a testable
+/// statement rather than a claim about two bodies of code.
+///
+/// `Adopt` is inert because the volatile-permit refresh it used to perform
+/// moved into `engage_lockdown`: a recovery-time delete would drop a RUNNING
+/// first bridge's server permit whenever a second bridge with a fresh state dir
+/// adopted the cover, hard-blocking a host whose GUI still said Connected.
+/// `Noop` is inert by definition. Only an explicit recorded-off `Sweep`
+/// reaches the firewall.
+pub(crate) fn recovery_dispatch(decision: crate::routing::CoverRecovery) -> RecoveryDispatch {
     use crate::routing::CoverRecovery::*;
     match decision {
-        Noop | Adopt => platform::recover_lockdown(decision, state_dir),
-        Sweep => {
+        Noop | Adopt => RecoveryDispatch::Inert,
+        Sweep => RecoveryDispatch::Disengage,
+    }
+}
+
+/// Act on a [`CoverRecovery`] decision for the standing lockdown cover at
+/// startup. cfg-free for `routing::recover_routes`. Best-effort: a `Sweep` that
+/// cannot disengage is logged, not propagated — startup recovery has no caller
+/// to act on it.
+///
+/// The single OS call sits behind [`RecoveryDispatch::Disengage`], so an
+/// `Adopt` cannot grow a side effect without that classification changing
+/// first.
+pub fn recover_lockdown(decision: crate::routing::CoverRecovery, state_dir: &Path) {
+    match recovery_dispatch(decision) {
+        RecoveryDispatch::Inert => {
+            // Nothing is removed: an adopted cover must survive the restart
+            // (this IS the crash-leak fix), and it may not even be ours. On
+            // macOS the dead utun name in the `pass out quick on <tun>` line is
+            // harmless (it matches no live interface); pf rules and enable
+            // state do not survive a reboot, but the state file does, so the
+            // next connect's `engage_lockdown` re-enables pf and reloads a live
+            // ruleset. Residual: the boot->first-connect interval is
+            // unprotected until that first reconnect re-arms the host.
+            tracing::info!(?decision, "lockdown recovery: no OS action");
+        }
+        RecoveryDispatch::Disengage => {
+            tracing::info!("lockdown recovery: sweeping leftover cover (intent off)");
             if let Err(e) = disengage_lockdown(state_dir) {
                 tracing::warn!(error = %e, "lockdown sweep could not disengage the cover");
             }
