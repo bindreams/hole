@@ -75,9 +75,13 @@ before editing; the sections linked below are the authoritative source.
   scoped to TCP/443) is a bounded-window RAII guard engaged by every covered
   (auto-connect) start whose lockdown intent is OFF; a lockdown-on covered
   start uses the standing cover instead and releases any held transient one.
-  Both are persistent WFP filters (Win) / self-contained pf ruleset (mac), swept
-  by `recover_routes` on next start. The escape from a stranded cover
-  (`failclosed::release_all`) is unconditional and knows nothing about cover
+  Both are persistent WFP filters (Win) / self-contained pf ruleset (mac). The
+  transient one is swept unconditionally by `recover_routes` on next start; the
+  standing one is reconciled by a 20-cell intent x presence table
+  (`decide_cover_recovery`) over a MEASURED OS probe, and is swept only on an
+  explicit recorded off intent — a missing or unreadable intent file adopts
+  instead, and `Adopt` is inert on both platforms. The escape from a stranded
+  cover (`failclosed::release_all`) is unconditional and knows nothing about cover
   state; its only condition is whether a session is running, and turning the
   kill switch off takes the same path. Who holds a cover has exactly one
   answer, derived once from `ProxyManager`'s single `posture` field

@@ -178,7 +178,7 @@ pub(crate) fn recovery_dispatch(decision: crate::routing::CoverRecovery) -> Reco
 /// cannot disengage is logged, not propagated — startup recovery has no caller
 /// to act on it.
 ///
-/// The single OS call sits behind [`RecoveryDispatch::Disengage`], so an
+/// The single OS call sits behind `RecoveryDispatch::Disengage`, so an
 /// `Adopt` cannot grow a side effect without that classification changing
 /// first.
 pub fn recover_lockdown(decision: crate::routing::CoverRecovery, state_dir: &Path) {

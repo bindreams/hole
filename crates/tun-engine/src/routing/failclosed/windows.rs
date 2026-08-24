@@ -1039,9 +1039,11 @@ pub fn lockdown_cover_presence(_state_dir: &Path) -> crate::routing::CoverPresen
 /// Fail-loud disengage for the `bridge unlock` escape hatch. Deletes all
 /// lockdown + App-ID filters by their fixed GUIDs (idempotent — a "not found"
 /// delete is a no-op, so a clean host returns `Ok`). The failure that means
-/// "cannot disengage" is the ENGINE OPEN: it fails when the process is not
-/// elevated, in which case we could not have torn anything down → `Err`. There
-/// is no persisted Windows state to key absence on (delete-by-GUID is
+/// "cannot disengage" is the ENGINE OPEN: the Base Filtering Engine could not
+/// be reached, so nothing could have been issued → `Err`. That is NOT "not
+/// elevated" — FWPM opens without elevation (`release_all`'s doc records the
+/// same measurement); a failed open means BFE is not running or RPC failed.
+/// There is no persisted Windows state to key absence on (delete-by-GUID is
 /// idempotent), so a successful open always reports `Ok`.
 pub fn disengage_lockdown(_state_dir: &Path) -> Result<(), RoutingError> {
     unsafe {
@@ -1050,7 +1052,8 @@ pub fn disengage_lockdown(_state_dir: &Path) -> Result<(), RoutingError> {
         let rc = FwpmEngineOpen0(PCWSTR::null(), RPC_C_AUTHN_WINNT, None, None, &mut engine);
         if rc != ERROR_SUCCESS.0 {
             return Err(RoutingError::RouteSetup(format!(
-                "FwpmEngineOpen0 failed ({rc}); not elevated? cannot disengage the lockdown cover"
+                "FwpmEngineOpen0 failed (0x{rc:08x}): the firewall could not be reached, so the lockdown \
+                 cover could not be disengaged"
             )));
         }
         #[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
@@ -1072,8 +1075,9 @@ pub fn recover_cover(_state_dir: &Path, adopting: bool) {
     unsafe {
         let mut engine = HANDLE::default();
         // FwpmEngineOpen0 returns u32 — compare to ERROR_SUCCESS.0, NOT `.is_ok()`.
-        // Open can fail when the bridge isn't elevated; that's a benign no-op
-        // (nothing to sweep that we could reach anyway).
+        // A failed open means the Base Filtering Engine could not be reached
+        // (not "not elevated" — FWPM opens without elevation), so nothing could
+        // have been swept anyway; skipping is a benign no-op.
         #[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
         if FwpmEngineOpen0(PCWSTR::null(), RPC_C_AUTHN_WINNT, None, None, &mut engine) == ERROR_SUCCESS.0 {
             delete_all(engine);
