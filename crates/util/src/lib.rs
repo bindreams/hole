@@ -5,6 +5,9 @@
 //!   verification and retry around Windows bind races.
 //! - [`retry`] — exponential-backoff retry helpers + transient-error
 //!   predicates (`is_bind_race` / `is_file_contention`).
+//! - [`syn_budget`] — a TCP connect whose SYN-retransmission budget is
+//!   chosen deliberately, so a refusal-vs-timeout verdict is observable on
+//!   Windows without racing the OS's own ~2 s refusal cost.
 //!
 //! Apache-2.0 (unlike Hole's own GPL crates) so the Apache plugin world
 //! (`garter`/`galoshes`/`plugin-e2e`) can depend on it alongside Hole's GPL
@@ -14,6 +17,7 @@
 pub mod ownership;
 pub mod port_alloc;
 pub mod retry;
+pub mod syn_budget;
 
 // Install the workspace test subscriber + panic hook. The dev-dep is gated on
 // cfg(test) because it isn't linked in non-test builds.
