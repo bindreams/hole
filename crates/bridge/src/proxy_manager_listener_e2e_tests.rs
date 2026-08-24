@@ -8,10 +8,11 @@
 //! listener combination, then asserts what binds on each port.
 //!
 //! * TCP tests use `TunnelMode::SocksOnly` (no elevation required).
-//! * The UDP ASSOCIATE test uses `TunnelMode::Full` and is Windows-admin
+//! * The `mod tun` UDP test uses `TunnelMode::Full` and is Windows-admin
 //!   only, mirroring the existing `mod tun` pattern in
 //!   `proxy_manager_e2e_tests.rs`. `windows-latest` GitHub Actions runs
-//!   as `RUNNERADMIN` so CI does exercise it.
+//!   as `RUNNERADMIN` so CI does exercise it. Full mode is what that test
+//!   brings up, not what carries its datagram — see the note on `mod tun`.
 
 use crate::test_support::dist_fixture::*;
 use crate::test_support::dist_harness::DistHarness;
@@ -324,36 +325,44 @@ fn e2e_start_rejects_full_mode_without_socks5(
     });
 }
 
-// UDP via TUN (Windows admin only) ====================================================================================
+// UDP under a live TUN (Windows admin only) ===========================================================================
 //
-// End-to-end exercise of the SOCKS5 UDP ASSOCIATE path inside the bridge:
-// the test sends a UDP datagram directly to the echo server's primary
-// non-loopback IPv4, the TUN split routes capture it, the dispatcher's
-// `Socks5Endpoint::serve_udp` opens a SOCKS5 UDP ASSOCIATE to the
-// `ss-server`, and the reply comes back via the same tunnel.
+// What this proves, in full: Full mode starts under elevation, and a
+// host-local UDP round trip still works while it is up.
+//
+// What it does not prove: in-TUN UDP transit. The datagram goes to the echo
+// server's primary non-loopback IPv4 — an address the host holds — so the
+// kernel's on-link `/32` beats the `0.0.0.0/1` split and it is delivered
+// locally to a `0.0.0.0`-bound socket. `Socks5Endpoint::serve_udp` is never
+// invoked.
+//
+// There is no single-host oracle for the transit version: UDP has no
+// handshake, so nothing in the TUN answers; the catch-all Block that makes
+// the TCP oracle safe would drop the flow outright; and letting it reach the
+// proxy re-enters via the ss-server without the `conn_semaphore` ceiling that
+// bounds the TCP case. The TCP transit proof lives in
+// `proxy_manager_e2e_tests.rs::tun::e2e_*_full_tunnel_captures_unowned_destination`;
+// a UDP equivalent is carried as follow-up work, not closed here.
 //
 // Gated to Windows for the same reason as the existing `mod tun` in
 // `proxy_manager_e2e_tests.rs`: `TunnelMode::Full` needs elevation, and
 // `windows-latest` CI runs as `RUNNERADMIN`. The SocksOnly UDP path is
 // covered by `mod socks_only_udp` below — it runs in the non-TUN pass on
 // every Hole platform (Win+mac), both the no-plugin and galoshes variants.
-//
-// The test asserts a client-facing UDP round-trip, which covers the
-// entire TUN→dispatcher→Socks5Endpoint→shadowsocks-service UDP stack
-// end-to-end — including the `Mode::TcpAndUdp` flag flowing through
-// `build_ss_config`. Using 127.0.0.1 for either the client or the
-// echo server would hit the bridge's loopback bypass route and bypass
-// the TUN, defeating the point of the test — see the caveat at
-// `proxy_manager_e2e_tests.rs:184-192`.
 
+/// COUPLED NAME: this test must stay named `e2e_…full_tunnel…` so
+/// `.config/nextest.toml`'s `global-net-state` filter keeps selecting it —
+/// skuld gives libtest the bare function name, so there is no module path to
+/// anchor on. See the note on `proxy_manager_e2e_tests.rs`'s `mod tun`.
 #[cfg(target_os = "windows")]
 mod tun {
     use super::*;
     use crate::test_support::udp_echo::UdpEchoServer;
+    use hole_common::config::{FilterAction, FilterRule, MatchType};
     use tokio::net::UdpSocket;
 
     #[skuld::test(labels = [DIST_BIN, TUN], serial = TUN)]
-    fn e2e_socks5_udp_associate_roundtrip(
+    fn e2e_full_tunnel_local_udp_intact(
         #[fixture(dist_dir)] dist: &Path,
         #[fixture(ssserver_none)] ss: &SsServerHandle,
     ) {
@@ -363,13 +372,31 @@ mod tun {
             let http_port = allocate_ephemeral_port(Protocols::TCP).await;
             let mut config = base_config(ss, socks_port, http_port);
             config.tunnel_mode = TunnelMode::Full;
+            // Resolve every in-TUN flow to a drop, for the reason spelled out
+            // on `proxy_manager_e2e_tests.rs`'s `block_every_in_tun_flow`: the
+            // ss-server's onward dial would otherwise re-enter the TUN and
+            // burst to the engine's connection ceiling. The echo round trip is
+            // unaffected — that datagram never reaches the router. Host UDP/53
+            // is now dropped silently for the window instead of proxied, so a
+            // host process resolving a name hangs for its own resolver timeout.
+            config.filters = vec![
+                FilterRule {
+                    address: "0.0.0.0/0".into(),
+                    matching: MatchType::Subnet,
+                    action: FilterAction::Block,
+                },
+                FilterRule {
+                    address: "::/0".into(),
+                    matching: MatchType::Subnet,
+                    action: FilterAction::Block,
+                },
+            ];
 
             let mut harness = DistHarness::spawn(dist).await.expect("spawn DistHarness");
             start_expect_ack(&mut harness, config).await;
 
-            // Direct UDP send to the echo server's primary IPv4 — the
-            // bridge's TUN routes capture this and tunnel it through the
-            // ss-server via SOCKS5 UDP ASSOCIATE.
+            // Direct UDP send to the echo server's primary IPv4. Delivered
+            // locally by the host stack, not through the tunnel.
             let client = UdpSocket::bind("0.0.0.0:0").await.expect("bind UDP client");
             let payload = b"HOLE-UDP-ASSOCIATE";
             client.send_to(payload, echo.addr).await.expect("send UDP");

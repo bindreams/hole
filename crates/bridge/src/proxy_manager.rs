@@ -1878,9 +1878,14 @@ mod proxy_manager_release_tests;
 //   `ChainRunner` launcher (`plugin_e2e::ssserver`), which the `SsServerHandle`
 //   fixture keeps alive for the test's lifetime. The socks-only WS/IPv6
 //   roundtrips run on **Win+mac**; WS-TLS and QUIC are macOS-only (Windows
-//   custom-cert limit), and the full-tunnel TUN variants are Windows-only
+//   custom-cert limit), and the Full-mode `mod tun` variants are Windows-only
 //   (`mod tun` is `cfg(target_os = "windows")` and needs elevation). Broader
 //   galoshes transport coverage on Windows lives in the `plugin-e2e` crate.
+// - Within `mod tun`, only the `_captures_unowned_destination` pair proves
+//   tunnel transit. The `_local_networking_intact` pair and the listener
+//   file's UDP test dial addresses the host holds, which never reach
+//   `hole-tun`; they prove Full mode starts without breaking host-local
+//   networking.
 #[cfg(test)]
 #[path = "proxy_manager_e2e_tests.rs"]
 mod proxy_manager_e2e_tests;
