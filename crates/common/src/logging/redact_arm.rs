@@ -1,4 +1,4 @@
-//! Arming the redaction registry from a [`ServerEntry`], and the
+//! Arming the redaction registry from a [`crate::config::ServerEntry`], and the
 //! classification fields that replace the address in a log line.
 //!
 //! [`util::redact`] knows nothing about server entries; this is the layer
