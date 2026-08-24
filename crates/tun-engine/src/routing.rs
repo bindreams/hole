@@ -208,38 +208,151 @@ pub fn recover_routes(state_dir: &Path) {
 }
 
 /// What crash-recovery should do with a possibly-present standing lockdown
-/// cover, given the persisted lockdown intent and whether a cover is present.
+/// cover, given the recorded intent and what the OS says is installed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CoverRecovery {
-    /// Intent ON + cover present: KEEP the host fail-closed across the restart.
-    /// The fail-closed floor (block-all + loopback + App-ID) stays in force; the
-    /// volatile permits — the stale TUN-interface permit (dead LUID/utun after
-    /// teardown) and the server-IP permit (the server may change before the next
-    /// connect) — are refreshed by the next connect's `install_lockdown`. Windows
-    /// drops the volatile GUIDs at recovery so the re-add isn't a fixed-key
-    /// no-op; macOS reloads the whole pf ruleset, refreshing them implicitly.
-    /// This is the crash-leak fix: a crash never runs `stop()`, so the persistent
-    /// cover survives and Adopt holds it.
+    /// A standing cover is live and nothing recorded says to remove it: KEEP
+    /// the host fail-closed across the restart. Performs **no OS call on
+    /// either platform** — its whole effect is that the bridge records "a
+    /// standing cover is live this run", so the next connect re-engages
+    /// through `install_lockdown`, which refreshes the volatile permits (the
+    /// dead TUN LUID/utun and the possibly-changed server IP) itself.
+    ///
+    /// Disclosed cost of that inertness: between an adopted cover and the next
+    /// connect the stale TUN-LUID and server-IP permits stay installed rather
+    /// than being dropped immediately. Both are *permits* on an idle cover, and
+    /// the App-ID permit already grants the bridge and plugin binaries
+    /// unrestricted egress in that same window, so the added surface is one
+    /// previously-configured server IP for other processes while nothing is
+    /// connected. The alternative — deleting at recovery time — would let a
+    /// second bridge with a fresh state dir delete a RUNNING first bridge's
+    /// server permit while block-all stayed in force.
+    ///
+    /// This is also the crash-leak fix: a crash never runs `stop()`, so the
+    /// persistent cover survives and Adopt holds it.
     Adopt,
-    /// Intent OFF + cover present: fully disengage the leftover cover (Windows:
-    /// delete all lockdown GUIDs; macOS: restore the pre-lockdown snapshot +
-    /// drop the pf token).
+    /// [`Intent::Off`](failclosed::lockdown_state::Intent::Off) with an
+    /// actionable presence: fully disengage the leftover cover (Windows: delete
+    /// all lockdown GUIDs; macOS: restore the pre-lockdown snapshot + drop the
+    /// pf token). The only action that removes protection, and the only one
+    /// that mutates the OS at all.
     Sweep,
-    /// No cover present: nothing to do.
+    /// Nothing to do.
     Noop,
 }
 
-/// Pure recovery decision. `intent` is the persisted lockdown-enabled bool
-/// (`bridge-lockdown.json`); `prior_present` is whether a lockdown cover from a
-/// prior run is present, keyed on the cover's OWN evidence (NOT
-/// `bridge-routes.json` — the cover's lifetime is independent of routes). See
-/// `recover_routes_with` for how `prior_present` is derived per platform.
-pub fn decide_cover_recovery(intent: bool, prior_present: bool) -> CoverRecovery {
-    match (intent, prior_present) {
-        (_, false) => CoverRecovery::Noop,
-        (true, true) => CoverRecovery::Adopt,
-        (false, true) => CoverRecovery::Sweep,
+/// What the OS says about a standing lockdown cover — the presence axis of
+/// [`decide_cover_recovery`]. Closed, because a bool made "the OS says no" and
+/// "the OS could not answer" the same answer, and the second must never
+/// authorise removing protection.
+///
+/// Each platform produces a strict subset:
+///
+/// - **Windows** produces `Live`, `Absent`, `Indeterminate`, `Unreachable`. It keeps no lockdown state file, so `Recorded` has no source there.
+/// - **macOS** produces `Live`, `Recorded`, `Absent`, `Unreachable`. A `pfctl` that runs and prints a labels listing always yields a usable answer, so `Indeterminate` has no source there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CoverPresence {
+    /// The OS confirmed Hole's own standing-lockdown cover, **or a residue of
+    /// it**, is installed right now.
+    ///
+    /// "Any residue", not "the whole cover", is deliberate: the Windows sweeps
+    /// loop delete-by-key over every lockdown GUID with no transaction and
+    /// every return code discarded, over PERSISTENT filters. A sweep
+    /// interrupted mid-loop survives a reboot as a partial cover, so probing
+    /// one GUID would let that partial cover answer `Absent` forever. The probe
+    /// asks about every swept GUID and `Live` means at least one was found.
+    Live,
+    /// The OS did not confirm one, but Hole's own state file says a cover was
+    /// engaged and never confirmed released.
+    Recorded,
+    /// The OS was asked, answered no, and no local record contradicts it.
+    Absent,
+    /// The OS was reachable but its answer was unusable (Windows: a by-key
+    /// query returned a code that is neither success nor "filter not found",
+    /// e.g. a DACL-denied read).
+    Indeterminate,
+    /// The OS could not be asked at all (Windows: the Base Filtering Engine
+    /// could not be reached; macOS: `pfctl` missing or non-executable with no
+    /// state file to fall back on).
+    Unreachable,
+}
+
+/// The outcome of [`decide_cover_recovery`]: one action, plus whether the
+/// measured truth should be written back to the intent file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Recovery {
+    pub action: CoverRecovery,
+    /// Repair the intent file to `enabled: true` before acting. Grounded in a
+    /// positive OS measurement only — see rule 4.
+    pub record_intent_on: bool,
+}
+
+/// Pure recovery decision over the two measured axes. Performs **no I/O**: it
+/// picks one [`CoverRecovery`], sets `record_intent_on`, and returns.
+///
+/// The four rules the table below encodes:
+///
+/// 1. [`CoverPresence::Absent`] and [`CoverPresence::Unreachable`] always yield `Noop` with `record_intent_on = false`.
+/// 2. `Sweep` requires [`Intent::Off`](failclosed::lockdown_state::Intent::Off) and an actionable presence (`Live | Recorded | Indeterminate`). It is the only action that removes protection, and the only one that mutates the OS at all.
+/// 3. `Adopt` requires an actionable presence and an intent of `On`, `Unreadable`, or `Unset` — with `Unset` additionally requiring positive evidence (`Live | Recorded`), because an unknown intent plus an unusable OS answer is no evidence in any direction.
+/// 4. `record_intent_on` requires `Presence::Live` and an intent of `Unset` or `Unreadable`. The write is grounded in a positive OS measurement, never inferred.
+///
+/// The match is exhaustive on both axes with no wildcard, so a new variant of
+/// either is a compile error rather than a silently inherited answer.
+pub fn decide_cover_recovery(intent: failclosed::lockdown_state::Intent, presence: CoverPresence) -> Recovery {
+    use failclosed::lockdown_state::Intent as I;
+    use CoverPresence as P;
+    use CoverRecovery::{Adopt, Noop, Sweep};
+
+    let (action, record_intent_on) = match (intent, presence) {
+        (I::On, P::Live) => (Adopt, false),
+        (I::On, P::Recorded) => (Adopt, false),
+        (I::On, P::Indeterminate) => (Adopt, false),
+        (I::On, P::Absent) => (Noop, false),
+        (I::On, P::Unreachable) => (Noop, false),
+
+        (I::Off, P::Live) => (Sweep, false),
+        (I::Off, P::Recorded) => (Sweep, false),
+        (I::Off, P::Indeterminate) => (Sweep, false),
+        (I::Off, P::Absent) => (Noop, false),
+        (I::Off, P::Unreachable) => (Noop, false),
+
+        (I::Unset, P::Live) => (Adopt, true),
+        (I::Unset, P::Recorded) => (Adopt, false),
+        // No intent AND no usable OS answer is no evidence in any direction.
+        (I::Unset, P::Indeterminate) => (Noop, false),
+        (I::Unset, P::Absent) => (Noop, false),
+        (I::Unset, P::Unreachable) => (Noop, false),
+
+        (I::Unreadable, P::Live) => (Adopt, true),
+        (I::Unreadable, P::Recorded) => (Adopt, false),
+        (I::Unreadable, P::Indeterminate) => (Adopt, false),
+        (I::Unreadable, P::Absent) => (Noop, false),
+        (I::Unreadable, P::Unreachable) => (Noop, false),
+    };
+    Recovery {
+        action,
+        record_intent_on,
     }
+}
+
+/// TEMPORARY: map today's two bools onto the new axes so `recover_routes_with`
+/// keeps compiling before the real probes land. Deleted, with
+/// `the_interim_adapter_can_never_record_an_intent`, once
+/// [`failclosed::lockdown_cover_presence`] is wired in.
+///
+/// Safe only because it can produce nothing but `On`/`Off` and `Live`/`Absent`,
+/// so `record_intent_on` is unreachable through it.
+fn interim_axes(intent: bool, present: bool) -> (failclosed::lockdown_state::Intent, CoverPresence) {
+    use failclosed::lockdown_state::Intent as I;
+    (
+        if intent { I::On } else { I::Off },
+        if present {
+            CoverPresence::Live
+        } else {
+            CoverPresence::Absent
+        },
+    )
 }
 
 /// Test seam for [`recover_routes`]: accepts an injected command runner, an
@@ -314,7 +427,8 @@ pub(crate) fn recover_routes_with<R, S, P, L>(
     // held and must not clobber it. The recover action keeps the host fail-closed
     // (Adopt) or disengages (Sweep).
     let standing_held = lockdown_present();
-    let decision = decide_cover_recovery(lockdown_intent, standing_held);
+    let (intent, presence) = interim_axes(lockdown_intent, standing_held);
+    let decision = decide_cover_recovery(intent, presence).action;
     let adopt = matches!(decision, CoverRecovery::Adopt);
     lockdown_recover(decision);
 

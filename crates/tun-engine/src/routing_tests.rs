@@ -587,18 +587,134 @@ fn recover_passes_adopting_only_on_adopt() {
 
 // decide_cover_recovery ===============================================================================================
 
+use failclosed::lockdown_state::Intent;
+use CoverPresence::{Absent, Indeterminate, Live, Recorded, Unreachable};
+use CoverRecovery::{Adopt, Noop, Sweep};
+
 #[skuld::test]
 fn cover_recovery_on_and_present_adopts() {
-    assert_eq!(decide_cover_recovery(true, true), CoverRecovery::Adopt);
+    assert_eq!(decide_cover_recovery(Intent::On, Live).action, Adopt);
 }
 
 #[skuld::test]
 fn cover_recovery_off_and_present_sweeps() {
-    assert_eq!(decide_cover_recovery(false, true), CoverRecovery::Sweep);
+    assert_eq!(decide_cover_recovery(Intent::Off, Live).action, Sweep);
 }
 
 #[skuld::test]
 fn cover_recovery_absent_is_noop_regardless_of_intent() {
-    assert_eq!(decide_cover_recovery(true, false), CoverRecovery::Noop);
-    assert_eq!(decide_cover_recovery(false, false), CoverRecovery::Noop);
+    assert_eq!(decide_cover_recovery(Intent::On, Absent).action, Noop);
+    assert_eq!(decide_cover_recovery(Intent::Off, Absent).action, Noop);
+}
+
+/// Every cell of the intent x presence table, spelled out. A wildcard here
+/// would let a new variant of either axis silently inherit a neighbour's
+/// answer; the point of the table is that each cell was decided.
+const RECOVERY_TABLE: [(Intent, CoverPresence, CoverRecovery, bool); 20] = [
+    (Intent::On, Live, Adopt, false),
+    (Intent::On, Recorded, Adopt, false),
+    (Intent::On, Indeterminate, Adopt, false),
+    (Intent::On, Absent, Noop, false),
+    (Intent::On, Unreachable, Noop, false),
+    (Intent::Off, Live, Sweep, false),
+    (Intent::Off, Recorded, Sweep, false),
+    (Intent::Off, Indeterminate, Sweep, false),
+    (Intent::Off, Absent, Noop, false),
+    (Intent::Off, Unreachable, Noop, false),
+    (Intent::Unset, Live, Adopt, true),
+    (Intent::Unset, Recorded, Adopt, false),
+    (Intent::Unset, Indeterminate, Noop, false),
+    (Intent::Unset, Absent, Noop, false),
+    (Intent::Unset, Unreachable, Noop, false),
+    (Intent::Unreadable, Live, Adopt, true),
+    (Intent::Unreadable, Recorded, Adopt, false),
+    (Intent::Unreadable, Indeterminate, Adopt, false),
+    (Intent::Unreadable, Absent, Noop, false),
+    (Intent::Unreadable, Unreachable, Noop, false),
+];
+
+#[skuld::test]
+fn cover_recovery_is_closed_over_intent_and_presence() {
+    for (intent, presence, action, record_intent_on) in RECOVERY_TABLE {
+        assert_eq!(
+            decide_cover_recovery(intent, presence),
+            Recovery {
+                action,
+                record_intent_on
+            },
+            "cell ({intent:?}, {presence:?}) must be {action:?} with record_intent_on={record_intent_on}"
+        );
+    }
+}
+
+#[skuld::test]
+fn cover_recovery_sweeps_only_on_an_explicit_off_intent() {
+    // Sweep is the only action that removes protection. #881: a missing or
+    // unreadable intent file is not an "off" and must never reach it.
+    for (intent, presence, action, _) in RECOVERY_TABLE {
+        if action == Sweep {
+            assert_eq!(
+                intent,
+                Intent::Off,
+                "only an explicit recorded off may sweep, not {intent:?} ({presence:?})"
+            );
+        }
+    }
+    for presence in [Live, Recorded, Indeterminate, Absent, Unreachable] {
+        for intent in [Intent::On, Intent::Unset, Intent::Unreadable] {
+            assert_ne!(
+                decide_cover_recovery(intent, presence).action,
+                Sweep,
+                "({intent:?}, {presence:?}) must not sweep"
+            );
+        }
+    }
+}
+
+#[skuld::test]
+fn cover_recovery_records_intent_only_on_a_live_cover() {
+    // The repair write is grounded in a positive OS measurement, never
+    // inferred from a state file or from an unusable answer.
+    for intent in [Intent::On, Intent::Off, Intent::Unset, Intent::Unreadable] {
+        for presence in [Live, Recorded, Indeterminate, Absent, Unreachable] {
+            let expected = presence == Live && matches!(intent, Intent::Unset | Intent::Unreadable);
+            assert_eq!(
+                decide_cover_recovery(intent, presence).record_intent_on,
+                expected,
+                "({intent:?}, {presence:?}) record_intent_on must be {expected}"
+            );
+        }
+    }
+}
+
+#[skuld::test]
+fn cover_recovery_is_inert_when_the_os_is_unreachable_or_clean() {
+    for presence in [Absent, Unreachable] {
+        for intent in [Intent::On, Intent::Off, Intent::Unset, Intent::Unreadable] {
+            assert_eq!(
+                decide_cover_recovery(intent, presence),
+                Recovery {
+                    action: Noop,
+                    record_intent_on: false,
+                },
+                "({intent:?}, {presence:?}) must be wholly inert"
+            );
+        }
+    }
+}
+
+#[skuld::test]
+fn the_interim_adapter_can_never_record_an_intent() {
+    // The Task 2 adapter maps today's two bools onto the new axes, so it can
+    // only reach (On|Off) x (Live|Absent) — four cells, none of which writes.
+    // Deleted along with `interim_axes` when the real probes land.
+    for intent in [true, false] {
+        for present in [true, false] {
+            let (i, p) = interim_axes(intent, present);
+            assert!(
+                !decide_cover_recovery(i, p).record_intent_on,
+                "the interim adapter reached ({i:?}, {p:?}), which writes an intent file"
+            );
+        }
+    }
 }
