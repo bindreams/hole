@@ -10,6 +10,11 @@
 //! ## What this module models
 //!
 //! - A [`UdpFlow`](crate::UdpFlow) held open by a peer the caller owns.
+//! - An in-memory TUN device ([`SimTun`]/[`SimWire`]) an [`Engine`](crate::Engine)
+//!   can be driven over via [`Engine::from_io`](crate::Engine::from_io),
+//!   plus the packet builders ([`udp_packet`], [`tcp_syn`]) to inject
+//!   traffic onto it and a [`Router`](crate::Router) double
+//!   ([`recording_router`]) to observe what the engine dispatched.
 //!
 //! ## What proves the rest
 //!
@@ -26,5 +31,11 @@
 //! 5. Real egress from a consumer's proxy and bypass mechanisms.
 
 pub mod flow;
+pub mod packet;
+pub mod router;
+pub mod wire;
 
 pub use flow::{udp_flow, UdpFlowPeer};
+pub use packet::{tcp_syn, udp_packet};
+pub use router::{recording_router, Dispatch};
+pub use wire::{packet_pair, Direction, SimTun, SimWire, WireTap};
