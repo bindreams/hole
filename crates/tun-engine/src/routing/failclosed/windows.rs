@@ -943,15 +943,28 @@ impl Drop for Cover {
                 CoverKind::Transient => delete_all(self.engine),
                 // Lockdown: delete only the lockdown + App-ID filters; the
                 // shared sublayer/provider are owned by the transient sweep.
+                // A user stop RELIES on this Drop to open the host, and Drop
+                // cannot return an error, so a code that is neither success nor
+                // not-found is warned: silence there is indistinguishable from
+                // a clean release.
                 #[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
                 CoverKind::Lockdown => {
-                    for g in swept_lockdown_guids() {
-                        let _ = FwpmFilterDeleteByKey0(self.engine, &g);
+                    let codes: Vec<(&'static str, u32)> = swept_lockdown_guids()
+                        .into_iter()
+                        .map(|g| ("lockdown filter", FwpmFilterDeleteByKey0(self.engine, &g)))
+                        .collect();
+                    if let Some(e) = first_delete_failure(&codes) {
+                        tracing::warn!(error = %e, "lockdown cover release left a filter installed; egress may still be blocked");
                     }
                 }
             }
             #[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
-            let _ = FwpmEngineClose0(self.engine);
+            let rc = FwpmEngineClose0(self.engine);
+            if rc != ERROR_SUCCESS.0 {
+                // Leaks the handle for the life of the process; the deletes
+                // above already committed, so the host's posture is unaffected.
+                tracing::warn!("FwpmEngineClose0 failed: 0x{rc:08x}");
+            }
         }
     }
 }
@@ -1090,11 +1103,19 @@ pub fn recover_cover(_state_dir: &Path, adopting: bool) {
 /// Delete filters (by their fixed GUIDs), then the sublayer, then the
 /// provider. Order matters: a sublayer/provider delete fails while filters
 /// still reference it. Each delete is idempotent — a "not found" return is
-/// ignored (recovery runs even when no cover is present).
+/// ignored (recovery runs even when no cover is present) — but a code that is
+/// neither success nor not-found is a filter still blocking egress, and the
+/// callers (`Cover::drop`, `recover_cover`) can return nothing, so it is
+/// warned here. The sublayer/provider deletes stay best-effort: an orphaned
+/// empty sublayer holds no traffic.
 #[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
 unsafe fn delete_all(engine: HANDLE) {
-    for g in swept_transient_guids() {
-        let _ = FwpmFilterDeleteByKey0(engine, &g);
+    let codes: Vec<(&'static str, u32)> = swept_transient_guids()
+        .into_iter()
+        .map(|g| ("transient filter", FwpmFilterDeleteByKey0(engine, &g)))
+        .collect();
+    if let Some(e) = first_delete_failure(&codes) {
+        tracing::warn!(error = %e, "transient cover sweep left a filter installed; egress may still be blocked");
     }
     let _ = FwpmSubLayerDeleteByKey0(engine, &SUBLAYER_GUID);
     let _ = FwpmProviderDeleteByKey0(engine, &PROVIDER_GUID);
