@@ -724,3 +724,7 @@ fn smoltcp_to_std_ip(addr: IpAddress) -> IpAddr {
         IpAddress::Ipv6(v6) => IpAddr::V6(v6),
     }
 }
+
+#[cfg(test)]
+#[path = "driver_udp_tests.rs"]
+mod driver_udp_tests;
