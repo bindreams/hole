@@ -75,9 +75,26 @@ pub(super) enum CreateVerdict {
 
 pub(super) fn assign(if_index: u32, cidr: Ipv6Cidr) -> Result<Assigned, DeviceError> {
     let luid = luid_for(if_index)?;
-    let row = unicast_row(if_index, cidr);
+    assign_with(
+        if_index,
+        cidr,
+        || wait_for_ipv6_interface(luid, IPV6_INTERFACE_BUDGET),
+        // SAFETY: `row` is fully initialized by `unicast_row` and read-only here.
+        |row| unsafe { CreateUnicastIpAddressEntry(row) },
+    )
+}
 
-    match wait_for_ipv6_interface(luid, IPV6_INTERFACE_BUDGET) {
+/// The decision the assignment makes, with the two OS calls behind closures.
+///
+/// An interface with IPv6 unbound is not a state a test can create, so the
+/// verdict is injected rather than provoked — the same reason the `Routing` and
+/// `Dns` traits exist.
+pub(super) fn assign_with<W, C>(if_index: u32, cidr: Ipv6Cidr, wait: W, create_addr: C) -> Result<Assigned, DeviceError>
+where
+    W: FnOnce() -> Appearance,
+    C: FnOnce(&MIB_UNICASTIPADDRESS_ROW) -> WIN32_ERROR,
+{
+    match wait() {
         Appearance::NeverAppeared => return Ok(Assigned::Ipv6StackAbsent),
         Appearance::Failed(code) => {
             return Err(assign_error(if_index, "waiting for the IPv6 interface", code));
@@ -85,8 +102,7 @@ pub(super) fn assign(if_index: u32, cidr: Ipv6Cidr) -> Result<Assigned, DeviceEr
         Appearance::Appeared => {}
     }
 
-    // SAFETY: `row` is fully initialized by `unicast_row` and read-only here.
-    match classify_create(unsafe { CreateUnicastIpAddressEntry(&row) }) {
+    match classify_create(create_addr(&unicast_row(if_index, cidr))) {
         CreateVerdict::Created => Ok(Assigned::Address),
         CreateVerdict::StackAbsent => Ok(Assigned::Ipv6StackAbsent),
         CreateVerdict::Failed(code) => Err(assign_error(if_index, "CreateUnicastIpAddressEntry", code)),
