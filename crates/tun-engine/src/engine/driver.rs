@@ -23,7 +23,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, trace, warn};
 
 use super::config::EngineConfig;
-use super::dns::DnsInterceptor;
+use super::dns::{self, DnsInterceptor};
 use super::router::{Router, TcpMeta, UdpMeta};
 use super::tcp_flow::TcpFlow;
 use super::udp_flow::{FlowKey, FlowTable, UdpReply};
@@ -402,15 +402,23 @@ impl Driver {
         // Port-53 DNS interception.
         if parsed.dst.port() == 53 {
             if let Some(interceptor) = self.dns_interceptor.clone() {
-                if let Some(reply) = interceptor.intercept(payload).await {
-                    // Construct reply packet with swapped 5-tuple.
-                    let pkt = build_udp_packet(parsed.dst, parsed.src, &reply);
-                    if !pkt.is_empty() {
-                        self.pending_tun_writes.push(pkt);
+                match dns::intercept(interceptor.as_ref(), payload, &self.cancel).await {
+                    dns::Intercepted::Reply(reply) => {
+                        // Construct reply packet with swapped 5-tuple.
+                        let pkt = build_udp_packet(parsed.dst, parsed.src, &reply);
+                        if !pkt.is_empty() {
+                            self.pending_tun_writes.push(pkt);
+                        }
+                        return true;
                     }
-                    return true;
+                    dns::Intercepted::Declined => {
+                        // Fall through to Router dispatch.
+                    }
+                    dns::Intercepted::Cancelled => {
+                        // The driver is tearing its TUN down; drop the datagram.
+                        return true;
+                    }
                 }
-                // Interceptor returned None — fall through to Router dispatch.
             }
         }
 
