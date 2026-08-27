@@ -113,54 +113,82 @@ pub async fn run_roundtrip(
 ) -> Roundtrip {
     let started = Instant::now();
 
-    // SS_LOCAL: reserved TCP+UDP, not because SS_LOCAL is universally
-    // TCP+UDP, but because this driver is generic over `client_plugin_path`
-    // and its consumer set includes galoshes, whose yamux client binds both
-    // there. Over-reserving UDP for a TCP-only client (e.g. ex-ray) is free.
-    let local = match ports::reserve_ss_local().await {
-        Ok(addr) => addr,
-        Err(e) => return Roundtrip::ChainFailed(format!("reserve SS_LOCAL: {e}")),
-    };
+    // Reserve SS_LOCAL, spawn the client chain, and await its readiness.
+    // Retried, unboundedly, only on `StartError::BindConflict` — real
+    // ephemeral-port saturation (per #300, no budget should mask it). Every
+    // other outcome (ready, a non-conflict `StartError`, a dropped sender, or
+    // the per-attempt `cfg.ready_timeout` firing) ends the loop, so an
+    // ambiguous or wedged child cannot spin. The outer bound is
+    // `ci.yaml`'s 45-minute job timeout, which reports as `cancelled` rather
+    // than a failure; the milestone logging below leaves evidence in the
+    // captured log if that fires.
+    let mut attempt: u64 = 1;
+    let (listen, cancel, handle) = loop {
+        // SS_LOCAL: reserved TCP+UDP, not because SS_LOCAL is universally
+        // TCP+UDP, but because this driver is generic over
+        // `client_plugin_path` and its consumer set includes galoshes, whose
+        // yamux client binds both there. Over-reserving UDP for a TCP-only
+        // client (e.g. ex-ray) is free.
+        let local = match ports::reserve_ss_local().await {
+            Ok(addr) => addr,
+            Err(e) => return Roundtrip::ChainFailed(format!("reserve SS_LOCAL: {e}")),
+        };
 
-    // Sanctioned: this crate is outside the bridge cancel chain (clippy.toml
-    // `CancellationToken::new` rule); the chain owns this token's whole life.
-    #[allow(clippy::disallowed_methods)]
-    let cancel = CancellationToken::new();
-    let (ready_tx, ready_rx) = oneshot::channel();
-    let plugin = garter::BinaryPlugin::new(client_plugin_path, client_opts);
-    let runner = garter::ChainRunner::new()
-        .add(Box::new(plugin))
-        .cancel_token(cancel.clone())
-        .on_ready(ready_tx);
+        // Sanctioned: this crate is outside the bridge cancel chain
+        // (clippy.toml `CancellationToken::new` rule); the chain owns this
+        // token's whole life.
+        #[allow(clippy::disallowed_methods)]
+        let cancel = CancellationToken::new();
+        let (ready_tx, ready_rx) = oneshot::channel();
+        let plugin = garter::BinaryPlugin::new(client_plugin_path, client_opts);
+        let runner = garter::ChainRunner::new()
+            .add(Box::new(plugin))
+            .cancel_token(cancel.clone())
+            .on_ready(ready_tx);
 
-    let env = garter::PluginEnv {
-        local_host: local.ip(),
-        local_port: local.port(),
-        remote_host: server_host.to_string(),
-        remote_port: server_port,
-        // `ChainRunner::run` ignores this field for a `BinaryPlugin` chain —
-        // the child's `SS_PLUGIN_OPTIONS` is set from `BinaryPlugin::new`'s
-        // `options` (see garter/src/binary.rs). Setting it here would be dead.
-        plugin_options: None,
-    };
-    let handle = tokio::spawn(async move { runner.run(env).await });
+        let env = garter::PluginEnv {
+            local_host: local.ip(),
+            local_port: local.port(),
+            remote_host: server_host.to_string(),
+            remote_port: server_port,
+            // `ChainRunner::run` ignores this field for a `BinaryPlugin`
+            // chain — the child's `SS_PLUGIN_OPTIONS` is set from
+            // `BinaryPlugin::new`'s `options` (see garter/src/binary.rs).
+            // Setting it here would be dead.
+            plugin_options: None,
+        };
+        let handle = tokio::spawn(async move { runner.run(env).await });
 
-    let listen = match timeout(cfg.ready_timeout, ready_rx).await {
-        Ok(Ok(Ok(chain_ready))) => chain_ready.listen,
-        Ok(Ok(Err(start_err))) => {
-            cancel.cancel();
-            let _ = handle.await;
-            return Roundtrip::ChainFailed(format!("{start_err:?}"));
-        }
-        Ok(Err(_recv)) => {
-            cancel.cancel();
-            let _ = handle.await;
-            return Roundtrip::ChainFailed("client plugin exited before becoming ready".into());
-        }
-        Err(_timeout) => {
-            cancel.cancel();
-            handle.abort();
-            return Roundtrip::ChainFailed("client plugin did not become ready within budget".into());
+        match timeout(cfg.ready_timeout, ready_rx).await {
+            Ok(Ok(Ok(chain_ready))) => break (chain_ready.listen, cancel, handle),
+            Ok(Ok(Err(garter::StartError::BindConflict { addr, errno }))) => {
+                if attempt == 1 || attempt.is_multiple_of(10) {
+                    tracing::info!(
+                        attempt,
+                        %addr,
+                        errno,
+                        "client plugin SS_LOCAL bind conflict; retrying with a fresh port"
+                    );
+                }
+                cancel.cancel();
+                let _ = handle.await;
+                attempt = attempt.saturating_add(1);
+            }
+            Ok(Ok(Err(start_err))) => {
+                cancel.cancel();
+                let _ = handle.await;
+                return Roundtrip::ChainFailed(format!("{start_err:?}"));
+            }
+            Ok(Err(_recv)) => {
+                cancel.cancel();
+                let _ = handle.await;
+                return Roundtrip::ChainFailed("client plugin exited before becoming ready".into());
+            }
+            Err(_timeout) => {
+                cancel.cancel();
+                handle.abort();
+                return Roundtrip::ChainFailed("client plugin did not become ready within budget".into());
+            }
         }
     };
 
