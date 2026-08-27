@@ -8,6 +8,7 @@
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
+use std::time::Instant;
 
 use tokio::task::{AbortHandle, JoinHandle};
 use tokio_util::sync::CancellationToken;
@@ -19,15 +20,49 @@ use crate::filter::rules::RuleSet;
 use crate::hole_router::HoleRouter;
 use crate::proxy::{TUN_DEVICE_NAME, TUN_SUBNET};
 
+/// How the spawned driver task ended, reported by `drain`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DriverExit {
+    /// The task returned normally — the TUN device (and kernel adapter
+    /// handle) it owned is dropped.
+    Drained,
+    /// The task was aborted before it returned.
+    Aborted,
+    /// The task panicked.
+    Panicked,
+    /// `shutdown()` was called again after already draining the driver.
+    AlreadyDrained,
+}
+
+/// Awaits `handle` in place and classifies how the driver task ended. No
+/// bound: `Driver::run` observes its cancellation token at every await
+/// (see `tun_engine::engine::{dns, egress}`), so this can only hang if
+/// that guarantee is broken.
+pub(crate) async fn drain(handle: &mut JoinHandle<()>) -> DriverExit {
+    match handle.await {
+        Ok(()) => DriverExit::Drained,
+        Err(e) if e.is_cancelled() => DriverExit::Aborted,
+        Err(e) if e.is_panic() => DriverExit::Panicked,
+        Err(e) => {
+            warn!("Dispatcher driver join error: {e}");
+            DriverExit::Panicked
+        }
+    }
+}
+
 /// The main dispatcher — owns the TUN device (via the engine driver)
 /// and coordinates per-connection filter decisions (via `HoleRouter`).
 pub struct Dispatcher {
     router: Arc<HoleRouter>,
     cancel: CancellationToken,
-    /// `Option` so `shutdown()` can take it for graceful await. `Drop`
-    /// aborts via `driver_abort` as a safety net.
+    /// Cleared only once a [`DriverExit`] exists for it — a `shutdown()`
+    /// future dropped mid-drain leaves this `Some` so `Drop` can still
+    /// drain the task rather than detaching it.
     driver_handle: Option<JoinHandle<()>>,
     driver_abort: AbortHandle,
+    /// Panics in debug builds if dropped without an awaited `shutdown()`.
+    /// See `SystemDnsApplied` for the same discipline.
+    bomb: drop_bomb::DebugDropBomb,
 }
 
 impl Dispatcher {
@@ -107,6 +142,9 @@ impl Dispatcher {
             cancel,
             driver_handle: Some(driver_handle),
             driver_abort,
+            bomb: drop_bomb::DebugDropBomb::new(
+                "Dispatcher dropped without shutdown().await — the wintun adapter handle may leak",
+            ),
         })
     }
 
@@ -120,67 +158,88 @@ impl Dispatcher {
         self.router.swap_rules(new_rules);
     }
 
-    /// Graceful shutdown. Cancels the driver, waits up to 2s, then aborts
-    /// if needed. Idempotent — safe to call multiple times or after Drop
-    /// has already aborted.
-    pub async fn shutdown(&mut self) {
+    /// Graceful shutdown. Cancels the driver, then joins its task with no
+    /// bound — sound because `Driver::run` observes the same token at
+    /// every await (`tun_engine::engine::{dns, egress}`), so the task is
+    /// guaranteed to return once cancelled. Awaits through `&mut` rather
+    /// than taking the handle, so a caller that drops this future mid-drain
+    /// leaves `driver_handle` in place for `Drop` to finish draining
+    /// instead of detaching the task. Idempotent — a second call reports
+    /// [`DriverExit::AlreadyDrained`].
+    ///
+    /// What this actually waits for, on Windows: `Driver::run` returning
+    /// drops the `tun::AsyncDevice`, which runs the synchronous
+    /// `WintunCloseAdapter` call (plus a registry subtree delete) in its
+    /// `Drop`. That call is finite and uninterruptible — the reason a
+    /// bound here would leak the adapter rather than merely being
+    /// unnecessary.
+    pub async fn shutdown(&mut self) -> DriverExit {
         debug!("Dispatcher shutting down");
         self.cancel.cancel();
 
-        if let Some(handle) = self.driver_handle.take() {
-            match tokio::time::timeout(std::time::Duration::from_secs(2), handle).await {
-                Ok(Ok(())) => debug!("Dispatcher driver exited cleanly"),
-                Ok(Err(e)) if e.is_cancelled() => debug!("Dispatcher driver was aborted"),
-                Ok(Err(e)) => warn!("Dispatcher driver panicked: {e}"),
-                Err(_) => {
-                    warn!("Dispatcher driver did not exit in 2s, aborting");
-                    self.driver_abort.abort();
-                }
+        let exit = match self.driver_handle.as_mut() {
+            None => DriverExit::AlreadyDrained,
+            Some(handle) => {
+                let started = Instant::now();
+                debug!("Dispatcher draining driver");
+                let exit = drain(handle).await;
+                debug!(
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    ?exit,
+                    "Dispatcher driver drained"
+                );
+                self.driver_handle = None;
+                exit
             }
-        }
+        };
 
+        self.bomb.defuse();
         debug!("Dispatcher shutdown complete");
+        exit
     }
 }
 
-/// Cancel the driver and synchronously drain the spawned task so the
-/// wintun adapter handle (owned by the future) is dropped before this
-/// method returns. `shutdown()` is preferred for graceful teardown; the
-/// `Drop` provides a safety net for non-graceful paths (panic, cancel
-/// mid-`start_inner`, `start_inner` Err that drops the local dispatcher).
+/// Safety net for non-graceful paths (panic, cancel mid-`start_inner`, a
+/// dropped future that owned this `Dispatcher`) — `shutdown()` is the
+/// preferred, graceful teardown and clears `driver_handle` once it has
+/// drained the task, so the normal stop path only runs the no-op `None`
+/// arm below.
 ///
-/// The spawned task owns the `tun::AsyncDevice` (and therefore the
-/// kernel wintun adapter handle); an abort-only path can let runtime
-/// shutdown precede the task being polled to completion, leaking the
-/// kernel adapter until reboot or `scripts/network-reset.py`. `block_on`
-/// inside Drop works on the multi-thread runtime the bridge uses in
-/// production. Current-thread runtimes (skuld tests) take the abort-only
-/// fallback path, with the PowerShell `Remove-NetAdapter` shell-out in
-/// `SystemRoutes::drop` as the belt-and-suspenders second layer.
-///
-/// On the normal stop path `shutdown()` has already drained the handle,
-/// so `Drop` only runs the no-op abort fallback.
+/// On the bridge's multi-thread runtime this always takes the
+/// `MultiThread` arm and blocks — for as long as the driver task takes to
+/// observe cancellation and return, plus the WintunCloseAdapter call in
+/// its `Drop` — before this method returns. **Dropping a future that owns
+/// a `Dispatcher` does not cancel that wait; it converts it into a
+/// synchronous block on the dropping thread.** No caller may drop such a
+/// future as a way to bound anything.
 impl Drop for Dispatcher {
     fn drop(&mut self) {
         self.cancel.cancel();
 
-        let Some(handle) = self.driver_handle.take() else {
-            // shutdown() already awaited; nothing to drain.
+        let Some(handle) = self.driver_handle.as_mut() else {
+            // shutdown() already drained it; nothing to do.
             self.driver_abort.abort();
             return;
         };
 
         match tokio::runtime::Handle::try_current() {
             Ok(rt) if matches!(rt.runtime_flavor(), tokio::runtime::RuntimeFlavor::MultiThread) => {
-                // CRITICAL: use `rt.block_on`, NOT `futures::executor::block_on`.
-                // The `timeout` future needs the tokio reactor; an external
-                // executor would panic with "no reactor running."
-                // `block_in_place` keeps the worker thread available for
-                // other tasks. It panics on a current-thread runtime —
-                // that's why we gated on `MultiThread` above.
-                tokio::task::block_in_place(|| {
-                    let _ = rt.block_on(tokio::time::timeout(std::time::Duration::from_secs(2), handle));
-                });
+                // `block_in_place` releases this worker thread so the driver
+                // task can be polled to completion on another one — the
+                // `MultiThread` gate above is what makes that legal.
+                // `rt.block_on` then blocks on that same runtime from
+                // inside the released region.
+                let exit = tokio::task::block_in_place(|| rt.block_on(drain(handle)));
+                self.driver_handle = None;
+                self.bomb.defuse();
+                match exit {
+                    DriverExit::Drained => debug!("Dispatcher driver drained"),
+                    DriverExit::Aborted => warn!("Dispatcher driver was aborted"),
+                    DriverExit::Panicked => warn!("Dispatcher driver panicked"),
+                    DriverExit::AlreadyDrained => {
+                        unreachable!("handle was Some; drain() cannot report AlreadyDrained")
+                    }
+                }
             }
             _ => {
                 // Current-thread runtime (skuld tests) or no runtime —
@@ -192,3 +251,7 @@ impl Drop for Dispatcher {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "dispatcher_tests.rs"]
+mod dispatcher_tests;

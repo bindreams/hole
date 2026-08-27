@@ -1510,7 +1510,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         // Start the dispatcher (owns TUN device + smoltcp). Skipped
         // under #[cfg(test)] because creating a TUN requires elevation.
         #[cfg(not(test))]
-        let dispatcher = {
+        let mut dispatcher = {
             let d = crate::dispatcher::Dispatcher::new(
                 socks5_port,
                 gw_info.interface_index,
@@ -1523,7 +1523,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
             Some(d)
         };
         #[cfg(test)]
-        let dispatcher: Option<crate::dispatcher::Dispatcher> = {
+        let mut dispatcher: Option<crate::dispatcher::Dispatcher> = {
             let _ = ruleset; // suppress unused warning
             let _ = local_dns_endpoint;
             None
@@ -1533,10 +1533,21 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         // call preemption isn't structurally possible — netsh/route
         // shell-outs are uninterruptible from our process).
         if cancel.is_cancelled() {
+            if let Some(mut d) = dispatcher.take() {
+                d.shutdown().await;
+            }
             return Err(ProxyError::Cancelled);
         }
         // Install the routes — NOW traffic starts flowing to the TUN.
-        let routes = routing.install(TUN_DEVICE_NAME, server_ip, gw_info.gateway_ip, &gw_info.interface_name)?;
+        let routes = match routing.install(TUN_DEVICE_NAME, server_ip, gw_info.gateway_ip, &gw_info.interface_name) {
+            Ok(routes) => routes,
+            Err(e) => {
+                if let Some(mut d) = dispatcher.take() {
+                    d.shutdown().await;
+                }
+                return Err(e.into());
+            }
+        };
 
         // Standing lockdown cover (#527). Engaged only when intent is on; when
         // off this whole block is a no-op and the start is byte-identical to
@@ -1548,7 +1559,15 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         // fail-open. Committed only on the Ok path (the field below).
         let lockdown = if state_dir.map(lockdown_state::load_enabled).unwrap_or(false) {
             let app_ids = lockdown_app_ids(config);
-            Some(routing.install_lockdown(server_ip, TUN_DEVICE_NAME, &app_ids)?)
+            match routing.install_lockdown(server_ip, TUN_DEVICE_NAME, &app_ids) {
+                Ok(cover) => Some(cover),
+                Err(e) => {
+                    if let Some(mut d) = dispatcher.take() {
+                        d.shutdown().await;
+                    }
+                    return Err(e.into());
+                }
+            }
         } else {
             None
         };
@@ -1584,7 +1603,12 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
                 .await
             {
                 Ok(a) => Some(a),
-                Err(DnsError::Cancelled) => return Err(ProxyError::Cancelled),
+                Err(DnsError::Cancelled) => {
+                    if let Some(mut d) = dispatcher.take() {
+                        d.shutdown().await;
+                    }
+                    return Err(ProxyError::Cancelled);
+                }
                 Err(DnsError::Io(e)) => {
                     warn!(error = %e, "system DNS apply failed; in-tunnel DNS unreachable by OS clients");
                     None
@@ -1671,7 +1695,13 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
 
                 // 1. Shut down dispatcher (closes TUN, cancels all handlers).
                 if let Some(mut d) = dispatcher {
-                    d.shutdown().await;
+                    match d.shutdown().await {
+                        exit @ (crate::dispatcher::DriverExit::Drained
+                        | crate::dispatcher::DriverExit::AlreadyDrained) => {
+                            debug!(?exit, "dispatcher driver exited");
+                        }
+                        exit => warn!(?exit, "dispatcher driver did not exit cleanly"),
+                    }
                 }
 
                 // 2. Stop plugin chain: reap the tracked identities explicitly — the
