@@ -6,7 +6,9 @@
 //! the configured server IP and blocks all other egress, then restores on
 //! disengage. That catches the block-everything arbitration class of bug (the
 //! permit must beat block-all) AND proves no-leak (a non-permitted host is
-//! blocked).
+//! blocked). It does NOT prove the tunnel-permit rule is sensitive to the
+//! interface it names — `live_tun_permit_privileged_tests.rs` (this
+//! directory) does, against two real, live TUN devices.
 //!
 //! The probe is OUTBOUND egress, not inbound loopback: an egress kill switch
 //! governs outbound flows, and the GitHub Actions Windows runner's firewall
@@ -89,9 +91,12 @@ const NON_PERMITTED: &str = "8.8.8.8:443";
 /// real `ConvertInterfaceAliasToLuid` + `LocalInterface` filter path; the
 /// block/permit assertions don't depend on it (the `LocalInterface` permit
 /// matches that interface's traffic, not the egress probed here), nor on a live
-/// `hole-tun`. `serial = TUN` serializes against other in-binary TUN tests; the
-/// cross-binary race with the bridge's real-egress e2e is handled by the
-/// `global-net-state` test-group (`.config/nextest.toml`).
+/// `hole-tun`. Whether the permit is sensitive to the interface it names is
+/// falsified separately, against two real, live TUN devices, in
+/// `live_tun_permit_privileged_tests.rs`. `serial = TUN` serializes against
+/// other in-binary TUN tests; the cross-binary race with the bridge's
+/// real-egress e2e is handled by the `global-net-state` test-group
+/// (`.config/nextest.toml`).
 #[cfg(target_os = "windows")]
 #[skuld::test(labels = [TUN], serial = TUN)]
 fn windows_lockdown_permits_server_ip_and_blocks_other_egress() {
@@ -186,7 +191,12 @@ fn windows_lockdown_permits_server_ip_and_blocks_other_egress() {
 /// restores the pre-lockdown snapshot.
 ///
 /// No live utun is needed: `pass out quick on <tun-absent>` simply never matches,
-/// so the block rule governs the probed egress. `serial = TUN` + the
+/// so the block rule governs the probed egress. Whether the permit is
+/// sensitive to the interface it names — the realistic failure mode once the
+/// TUN name is kernel-assigned, where the named interface exists but is the
+/// WRONG one — is falsified separately, against two real, live `utunN`
+/// devices, in
+/// `live_tun_permit_privileged_tests.rs`. `serial = TUN` + the
 /// `global-net-state` test-group serialize the process-global pf state:
 /// `pfctl -E`/`-X` is refcounted and the main ruleset is host-wide, so a
 /// concurrent cover test would race the snapshot restore.
