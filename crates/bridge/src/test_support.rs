@@ -22,12 +22,14 @@ pub(crate) mod dist_harness_panic_hook_tests;
 pub(crate) mod http_connect_client;
 pub(crate) mod http_target;
 pub(crate) mod log_capture;
+pub(crate) mod mock_dns;
 pub(crate) mod net_discovery;
 pub(crate) mod port_alloc;
 pub(crate) mod reap_child;
 pub(crate) mod refusing_connector;
 pub(crate) mod skuld_fixtures;
 pub(crate) mod socks5_client;
+pub(crate) mod socks5_dns_upstream;
 pub(crate) mod udp_echo;
 
 /// Build a fresh tokio runtime for one test. Mirrors `ipc_tests::rt()`.

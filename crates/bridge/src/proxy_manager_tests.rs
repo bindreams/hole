@@ -518,6 +518,22 @@ fn new_manager_with_lockdown(
     (pm, dir)
 }
 
+/// `new_manager_with_routing` variant that also substitutes `MockDns` for
+/// `SystemDns`, so a unit test can reach Phase 7 (`Dns::apply`) and inspect
+/// what it was called with, without touching the host's real OS DNS.
+fn new_manager_with_dns(
+    proxy: MockProxy,
+    routing: MockRouting,
+    dns: crate::test_support::mock_dns::MockDns,
+    dir: tempfile::TempDir,
+) -> (
+    ProxyManager<MockProxy, MockRouting, crate::test_support::mock_dns::MockDns>,
+    tempfile::TempDir,
+) {
+    let pm = ProxyManager::new_with_dns(proxy, routing, dns);
+    (pm, dir)
+}
+
 pub(super) fn test_config() -> ProxyConfig {
     ProxyConfig {
         server: ServerEntry {
@@ -565,6 +581,38 @@ pub(super) fn test_config() -> ProxyConfig {
 const ECH_CAPABLE_OPTS: &str = "tls;host=cdn.example";
 
 // Tests ===============================================================================================================
+
+/// Scaffolding for #846: no unit test reaches `Dns::apply` through
+/// `start_inner` before this — the Phase-4 forwarder self-test gate fails
+/// first because `MockProxy` binds nothing. Wiring `Socks5DnsUpstream` in
+/// as the real listener at `config.local_port`, plus `MockDns` standing in
+/// for `SystemDns`, lets a Full-mode start clear the gate and reach Phase 7.
+#[skuld::test]
+fn start_reaches_dns_apply_when_the_forwarder_answers() {
+    rt().block_on(async {
+        let upstream = crate::test_support::socks5_dns_upstream::Socks5DnsUpstream::bind()
+            .await
+            .unwrap();
+        let dns = crate::test_support::mock_dns::MockDns::new();
+        let dns_state = dns.state_handle();
+
+        let dir = tempfile::tempdir().unwrap();
+        let routing = MockRouting::new(dir.path().to_path_buf());
+        let (mut pm, _dir) = new_manager_with_dns(MockProxy::new(), routing, dns, dir);
+
+        let mut config = test_config();
+        config.local_port = upstream.port();
+        config.dns.enabled = true;
+        config.dns.protocol = hole_common::config::DnsProtocol::PlainTcp;
+        config.dns.servers = vec![IpAddr::V4(Ipv4Addr::new(198, 51, 100, 53))];
+
+        pm.start(&config).await.unwrap();
+
+        assert_eq!(dns_state.calls().len(), 1, "Dns::apply must be called exactly once");
+
+        pm.stop().await.unwrap();
+    });
+}
 
 #[skuld::test]
 fn start_transitions_to_running() {
