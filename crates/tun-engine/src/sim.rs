@@ -9,9 +9,7 @@
 //!
 //! ## What this module models
 //!
-//! - A [`UdpFlow`](crate::UdpFlow) with both of its channel ends in the
-//!   caller's hands: inbound datagrams can be delivered to it, and
-//!   replies the router injects can be read back.
+//! - A [`UdpFlow`](crate::UdpFlow) held open by a peer the caller owns.
 //!
 //! ## What proves the rest
 //!
@@ -26,16 +24,7 @@
 //! 4. Adapter-handle lifetime, including the wintun drain on teardown and
 //!    `adapter_cleanup`'s sweep.
 //! 5. Real egress from a consumer's proxy and bypass mechanisms.
-//!
-//! CONTRIBUTING.md's "Datapath coverage: which lane proves what" section
-//! carries the full split. See bindreams/hole#892.
-
-// Under `cfg(test)` this crate's lib target is a binary (`harness = false`
-// plus a `main`), which makes even `pub` items dead-code-checked. The
-// doubles are consumed by downstream crates, so that check cannot see
-// their callers.
-#![allow(dead_code)]
 
 pub mod flow;
 
-pub use flow::{udp_flow, Reply, UdpFlowPeer};
+pub use flow::{udp_flow, UdpFlowPeer};
