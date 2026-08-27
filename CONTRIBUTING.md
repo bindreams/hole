@@ -78,12 +78,20 @@ privacy). The bridge carries DNS over the TCP tunnel:
   forwarder's upstream through the SS SOCKS5 listener so user `Block` rules can't
   strand the resolver (TCP via `tokio-socks`; UDP via hand-rolled UDP ASSOCIATE,
   RFC 1928).
-- [`SystemDnsConfig`](crates/bridge/src/dns/system.rs) — Windows `netsh`, macOS
-  `networksetup`. Apply advertises the resolver IPs to the TUN **and** upstream
-  adapters (on Windows both v4 and v6 families, each set from its own configured
-  resolvers; a family with none is left untouched); capture runs on the upstream
-  only (the TUN is freshly created). Prior config persists to `bridge-dns.json`;
-  the post-apply cache flush is fire-and-forget.
+- [`SystemDns`](crates/bridge/src/dns/system.rs) — Hole writes DNS to no
+  adapter but `hole-tun`, the one it created (both v4 and v6 families, each
+  set from its own configured resolvers; a family with none is left
+  untouched). On Windows, egress on UDP+TCP port 53 is additionally confined
+  to that adapter by a WFP filter set
+  ([`tun_engine::dns_confine`](crates/tun-engine/src/dns_confine.rs)) — a
+  process-scoped dynamic FWPM session, not a persistent one, so it dies with
+  the bridge and needs no crash-recovery state. There is nothing to capture
+  and nothing to restore; the post-apply cache flush is fire-and-forget. See
+  [Crash recovery](#crash-recovery) for the one remaining, read-only use of
+  `bridge-dns.json`. Two residuals, disclosed rather than silently accepted:
+  DNS-over-HTTPS to an on-link resolver is indistinguishable from ordinary
+  HTTPS to that host, and DNS-over-TLS (port 853) is not confined — only
+  port 53 is.
 
 `DnsConfig::default()` is `enabled: true`, `Https`, `[1.1.1.1, 1.0.0.1]` — and
 `AppConfig` is `#[serde(default)]`, so the forwarder enables silently on
@@ -363,8 +371,20 @@ leaves working DNS + broken routes, not the inverse):
   no tolerance window — and deletes the file only after accounting for every
   record it named. The same reap runs at bridge start, at chain stop, and in the
   test harness's teardown.
-- **`bridge-dns.json`** — prior system DNS; `dns::recovery::recover_dns_config`
-  restores it.
+- **`bridge-dns.json`** — read-only now. The bridge stopped writing this file
+  (DNS confinement is process-scoped WFP state, not a file — see
+  [DNS forwarder](#dns-forwarder)); what's left is the evidence-gated upgrade
+  sweep that undoes a *pre-#846* build's own crashed-run rewrite:
+  `dns::recovery::recover_dns_config` restores each recorded adapter/family
+  only when its LIVE setting still equals what that old build advertised, and
+  evaluates any given file at most once — on full success it deletes the
+  file, otherwise it renames it to `bridge-dns.superseded.json` and never
+  reads that name again. `scripts/network-reset.py` reads both names, so the
+  escape survives the rename. A DNS confinement held by a **live but
+  unreachable** bridge (a #936 symptom, since the IPC socket bind does not
+  fully guarantee single-instance today) has no file-based release path —
+  the confinement dies only with its owning process, and `network-reset.py`
+  killing that process is the escape.
 - **ETW sessions** (Windows) — `hole-bridge-etw-<pid>`;
   `diagnostics::etw::sweep_stale_sessions` (`QueryAllTracesW`) stops stale ones by
   name prefix.
@@ -464,6 +484,17 @@ the **transient cutover cover** below and the **standing lockdown cover**
 ([next section](#lockdown-mode)). Both are RAII guards permitting a curated
 egress set and blocking everything else; they differ in lifetime and which set
 they permit.
+
+Both are deliberately **persistent** WFP filters, surviving an update-cutover
+restart on purpose. The Windows DNS-egress confinement
+([`tun_engine::dns_confine`](crates/tun-engine/src/dns_confine.rs), see
+[DNS forwarder](#dns-forwarder)) is the opposite: a **dynamic**, process-scoped
+FWPM session that dies with the engine handle, including on an abnormal exit —
+no state file, no `recover_routes` sweep, nothing for `release_all` or
+`hole bridge unlock` to clear. Do not "helpfully" unify the two lifetimes: a
+lockdown cover outliving the bridge is the user's *intent* (the kill switch
+stays armed across the cutover gap); a DNS block outliving the bridge is pure
+harm, with no bridge left alive to release it.
 
 #### Transient cutover cover
 
