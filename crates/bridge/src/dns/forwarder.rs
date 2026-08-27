@@ -583,6 +583,13 @@ const DNS_PORT_HTTPS: u16 = 443;
 /// times slower.
 pub(crate) const TUNNEL_QUERY_TIMEOUT: Duration = Duration::from_secs(10);
 
+// Also a floor: a budget under the refusal cost cannot report a refusal at
+// all. `forward_one`'s timer would fire first and type a refused upstream
+// `Timeout` / `ConnectTimeout` — "the tunnel is still coming up" — instead of
+// `Connect` / `Unreachable`, which is what `TAP_DISABLED_HINT` sends the
+// reader to read. `DIRECT_UPSTREAM_TIMEOUT` clears it too, at 3s.
+const _: () = assert!(TUNNEL_QUERY_TIMEOUT.as_millis() > util::syn_budget::REFUSAL_COST.as_millis());
+
 /// The bound on one DoH exchange over a DIRECT connector — the bootstrap's
 /// per-resolver hop, before any tunnel exists. A different question against a
 /// different peer (three round trips, no plugin), so it keeps its own,

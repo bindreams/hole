@@ -14,7 +14,7 @@ use std::net::IpAddr;
 use std::time::Duration;
 
 use tokio::io::AsyncBufReadExt as _;
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpListener;
 
 pub struct ReadyListener {
     listener: TcpListener,
@@ -72,9 +72,63 @@ impl ReadyListener {
     }
 }
 
+/// The result of one connect attempt in [`probe_once`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProbeOutcome {
+    /// Something accepted the connection.
+    Listening,
+    /// The peer refused — authoritative: nothing is listening (yet).
+    Refused,
+    /// No answer, so nothing authoritative about the port: the cap elapsed
+    /// (a real class-2 remote endpoint — see the `hosts`-file note below —
+    /// that may never answer), or the connect failed without refusing.
+    NoVerdict,
+}
+
+/// One connect attempt against `addr`, capped at `cap`.
+///
+/// Pins [`util::syn_budget::SynBudget::NoRetransmit`], which requires that a
+/// `NoVerdict` never be taken as an answer. [`wait_for_port`] re-issues; the
+/// single-round [`port_in_use`] settles it by binding the address instead.
+/// On Windows a refused loopback port is then reported in ~0.1 ms instead of
+/// paying the ~2.05 s stock SYN-retransmission budget. The cap still
+/// matters: it bounds a `hosts` file mapping `localhost` off-box to a
+/// class-2 remote endpoint that may never answer, which `NoRetransmit` does
+/// not affect.
+async fn probe_once(addr: std::net::SocketAddr, cap: Duration) -> ProbeOutcome {
+    match util::syn_budget::probe(addr, cap, util::syn_budget::SynBudget::NoRetransmit).await {
+        util::syn_budget::ProbeOutcome::Listening(_conn) => ProbeOutcome::Listening,
+        util::syn_budget::ProbeOutcome::Refused(_) => ProbeOutcome::Refused,
+        util::syn_budget::ProbeOutcome::NoVerdict(None) => ProbeOutcome::NoVerdict,
+        util::syn_budget::ProbeOutcome::NoVerdict(Some(e)) => {
+            // Not a port verdict but a real signal — an unreachable network,
+            // or the `SIO_TCP_INITIAL_RTO` ioctl failing before any SYN was
+            // sent. Silence here is what would turn that into a bogus "Vite
+            // never came up" after the whole budget.
+            enote!(
+                "[ready] probe of {addr} failed without a verdict: kind={:?} {e}",
+                e.kind()
+            );
+            ProbeOutcome::NoVerdict
+        }
+    }
+}
+
+/// Can anyone else still bind `addr`? A bind involves no SYN, so this
+/// answers where a probe could not. Any bind error counts as held: an
+/// exclusive owner refuses with `WSAEACCES` rather than `EADDRINUSE`.
+pub(crate) async fn is_port_held(addr: std::net::SocketAddr) -> bool {
+    TcpListener::bind(addr).await.is_err()
+}
+
 /// One probe round (NOT a wait): is something already listening on `port`?
 /// Used by the Delta-7 leaked-vite preflight — a clean startup must not pay
 /// a polling budget for a port that is supposed to be free.
+///
+/// A `NoVerdict` is settled by binding the same address: a bind needs no
+/// SYN, so a leaked Vite whose SYN was dropped still shows up as a bind
+/// failure rather than as a silent "port free". Only the refused path — the
+/// common one, and instant on every platform — costs nothing.
 pub async fn port_in_use(port: u16) -> bool {
     let addrs: Vec<std::net::SocketAddr> = match tokio::net::lookup_host(("localhost", port)).await {
         Ok(a) => a.collect(),
@@ -85,8 +139,11 @@ pub async fn port_in_use(port: u16) -> bool {
     };
     for addr in &addrs {
         // Same per-attempt cap as wait_for_port (see its comment).
-        if let Ok(Ok(_conn)) = tokio::time::timeout(Duration::from_millis(500), TcpStream::connect(addr)).await {
-            return true;
+        match probe_once(*addr, Duration::from_millis(500)).await {
+            ProbeOutcome::Listening => return true,
+            ProbeOutcome::Refused => {}
+            ProbeOutcome::NoVerdict if is_port_held(*addr).await => return true,
+            ProbeOutcome::NoVerdict => {}
         }
     }
     false
@@ -111,10 +168,7 @@ pub async fn wait_for_port(port: u16, budget: Duration) -> bool {
     while tokio::time::Instant::now() < deadline {
         for addr in &addrs {
             // 500ms per-attempt cap — dev.py:251 parity (sock.settimeout(0.5)).
-            // Pure-loopback connects refuse instantly; the cap matters when a
-            // hosts file maps `localhost` to a non-loopback address (class-2:
-            // remote endpoint that may never answer).
-            if let Ok(Ok(_conn)) = tokio::time::timeout(Duration::from_millis(500), TcpStream::connect(addr)).await {
+            if probe_once(*addr, Duration::from_millis(500)).await == ProbeOutcome::Listening {
                 return true;
             }
         }
