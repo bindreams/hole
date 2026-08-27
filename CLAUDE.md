@@ -26,6 +26,15 @@ before editing; the sections linked below are the authoritative source.
   tunnel); enforced structurally in `HoleRouter::resolve_endpoint`. UDP/53 is
   diverted to the DNS forwarder before the cascade. →
   [CONTRIBUTING.md#udp-policy](CONTRIBUTING.md#udp-policy)
+- **IPv6 in the tunnel.** IPv6 is meant to traverse the tunnel: the `::/1` +
+  `8000::/1` split pair captures it, and `hole-tun` holds `TUN_SUBNET6` on the
+  **OS interface** as well as in smoltcp, so a host with no global IPv6 still
+  has a source address for those routes. The ULA's global ID is generated per
+  RFC 4193, not `fd00::`. Windows waits for the interface's IPv6 half itself
+  (`tun` waits only for the IPv4 one) and creates the address
+  `IpDadStatePreferred`; assignment is fatal on Windows, warn-only on macOS,
+  and `Dispatcher::ipv6_assigned()` is what route-install fatality must read. →
+  [CONTRIBUTING.md#ipv6-in-the-tunnel](CONTRIBUTING.md#ipv6-in-the-tunnel)
 - **DNS forwarder.** Carries DNS over the TCP tunnel for TCP-only plugins; OS
   adapter DNS is advertised the configured resolver IPs, which route into
   `hole-tun` and are intercepted by the in-TUN `LocalDnsEndpoint`; a start-time
