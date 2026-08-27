@@ -13,6 +13,8 @@ use smoltcp::wire::Ipv6Cidr;
 
 use crate::error::DeviceError;
 
+#[cfg(target_os = "macos")]
+mod macos;
 #[cfg(target_os = "windows")]
 mod windows;
 
@@ -35,8 +37,20 @@ pub(crate) fn assign(if_index: u32, cidr: Ipv6Cidr) -> Result<Assigned, DeviceEr
 }
 
 /// Assign `cidr` to the OS interface identified by `if_index`.
-#[cfg(not(target_os = "windows"))]
+#[cfg(target_os = "macos")]
 pub(crate) fn assign(if_index: u32, cidr: Ipv6Cidr) -> Result<Assigned, DeviceError> {
-    let _ = (if_index, cidr);
-    Ok(Assigned::Ipv6StackAbsent)
+    macos::assign(if_index, cidr)
+}
+
+/// Assign `cidr` to the OS interface identified by `if_index`.
+///
+/// Windows and macOS are the platforms this crate opens a TUN on, and the only
+/// two with an assignment path. Refusing beats reporting `Ipv6StackAbsent`,
+/// which would claim something about the interface that was never asked.
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+pub(crate) fn assign(if_index: u32, _cidr: Ipv6Cidr) -> Result<Assigned, DeviceError> {
+    Err(DeviceError::Ipv6Assign {
+        index: if_index,
+        message: "this platform has no IPv6 address assignment path".into(),
+    })
 }
