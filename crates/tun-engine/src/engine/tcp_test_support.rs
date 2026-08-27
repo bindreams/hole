@@ -1,9 +1,9 @@
 //! Segment builders and egress parsing shared by the packet-level tests.
 //!
 //! Registered from `engine.rs` under `#[cfg(test)]` instead of as a `*_tests.rs`
-//! sibling: it has no business-logic counterpart, and its consumers drive a real
-//! smoltcp `Interface` over a
-//! [`VirtualTunDevice`](super::virtual_device::VirtualTunDevice).
+//! sibling: it has no business-logic counterpart, and both
+//! `socket_stack_tests.rs` and `driver_tests.rs` drive a real smoltcp
+//! `Interface` over a [`VirtualTunDevice`](super::virtual_device::VirtualTunDevice).
 //!
 //! Four properties are load-bearing:
 //!

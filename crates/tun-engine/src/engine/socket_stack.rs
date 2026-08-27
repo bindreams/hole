@@ -248,6 +248,23 @@ impl SocketStack {
     }
 }
 
+/// Read-only lookups for tests in sibling modules, which lack the handles
+/// production callers keep.
+#[cfg(test)]
+impl SocketStack {
+    /// The listener armed on `port`, if any.
+    pub(crate) fn listener(&self, port: u16) -> Option<SocketHandle> {
+        self.listeners.iter().find(|l| l.port == port).map(|l| l.handle)
+    }
+
+    /// Whether `handle` still names a socket in the set. A reaped or removed
+    /// slot can be refilled, so this answers about the slot, not the socket
+    /// that was in it.
+    pub(crate) fn holds(&self, handle: SocketHandle) -> bool {
+        self.sockets.iter().any(|(h, _)| h == handle)
+    }
+}
+
 /// How a connection socket leaves the set once the datapath is done with it.
 #[derive(Debug, PartialEq)]
 pub(crate) enum Disposal {

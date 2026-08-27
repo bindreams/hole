@@ -16,7 +16,7 @@ use smoltcp::iface::SocketHandle;
 use smoltcp::phy::ChecksumCapabilities;
 use smoltcp::time::Instant as SmoltcpInstant;
 use smoltcp::wire::{IpAddress, IpProtocol, Ipv4Packet, Ipv4Repr, Ipv6Packet, Ipv6Repr, UdpPacket, UdpRepr};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{mpsc, Semaphore};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, trace, warn};
@@ -44,8 +44,11 @@ struct TcpConn {
     pending_send: Vec<u8>,
 }
 
-pub(crate) struct Driver {
-    tun: tun::AsyncDevice,
+/// `T` is the TUN device. It is a parameter, not `tun::AsyncDevice` outright,
+/// so a test can drive the accept and disposal dispatch over an in-memory pipe
+/// — opening a real TUN needs elevation.
+pub(crate) struct Driver<T = tun::AsyncDevice> {
+    tun: T,
     stack: SocketStack,
     dns_interceptor: Option<Arc<dyn DnsInterceptor>>,
     connections: HashMap<SocketHandle, TcpConn>,
@@ -69,9 +72,9 @@ pub(crate) struct Driver {
     last_sweep: StdInstant,
 }
 
-impl Driver {
+impl<T: AsyncRead + AsyncWrite + Unpin> Driver<T> {
     pub(crate) fn new(
-        tun: tun::AsyncDevice,
+        tun: T,
         device_config: DeviceConfig,
         router: Arc<dyn Router>,
         config: Arc<EngineConfig>,
@@ -658,3 +661,7 @@ fn build_udp_packet(src: SocketAddr, dst: SocketAddr, payload: &[u8]) -> Vec<u8>
         }
     }
 }
+
+#[cfg(test)]
+#[path = "driver_tests.rs"]
+mod driver_tests;
