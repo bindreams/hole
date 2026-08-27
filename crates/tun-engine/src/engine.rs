@@ -20,7 +20,11 @@
 
 mod config;
 mod dns;
-mod driver;
+// Widened so `sim::packet` (a sibling of `engine`, not a descendant) can
+// reach `driver::build_udp_packet` — there is no dedicated emitter module in
+// this tree yet (bindreams/hole#900 is unmerged), so the packet-builder the
+// simulator needs to share still lives on `Driver`'s own module.
+pub(crate) mod driver;
 mod router;
 mod tcp_flow;
 pub(crate) mod udp_flow;

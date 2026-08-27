@@ -405,9 +405,7 @@ impl Driver {
                 if let Some(reply) = interceptor.intercept(payload).await {
                     // Construct reply packet with swapped 5-tuple.
                     let pkt = build_udp_packet(parsed.dst, parsed.src, &reply);
-                    if !pkt.is_empty() {
-                        self.pending_tun_writes.push(pkt);
-                    }
+                    self.pending_tun_writes.push(pkt);
                     return true;
                 }
                 // Interceptor returned None — fall through to Router dispatch.
@@ -457,9 +455,7 @@ impl Driver {
     fn process_udp_replies(&mut self) {
         while let Ok(reply) = self.reply_rx.try_recv() {
             let pkt = build_udp_packet(reply.src, reply.dst, &reply.payload);
-            if !pkt.is_empty() {
-                self.pending_tun_writes.push(pkt);
-            }
+            self.pending_tun_writes.push(pkt);
         }
     }
 
@@ -643,7 +639,7 @@ fn parse_ipv6_full(packet: &[u8]) -> Option<ParsedPacket> {
 // Reply packet construction ===========================================================================================
 
 /// Build a raw IP+UDP packet from the given fields, with correct checksums.
-fn build_udp_packet(src: SocketAddr, dst: SocketAddr, payload: &[u8]) -> Vec<u8> {
+pub(crate) fn build_udp_packet(src: SocketAddr, dst: SocketAddr, payload: &[u8]) -> Vec<u8> {
     debug_assert!(src.is_ipv4() == dst.is_ipv4(), "src/dst IP family mismatch");
 
     let udp_len = 8 + payload.len();
@@ -708,10 +704,12 @@ fn build_udp_packet(src: SocketAddr, dst: SocketAddr, payload: &[u8]) -> Vec<u8>
 
             buf
         }
-        _ => {
-            debug!("mismatched IP versions in UDP reply");
-            Vec::new()
-        }
+        // Both call sites build `src`/`dst` from a single parsed packet's
+        // 5-tuple, so the families are structurally equal; the
+        // `debug_assert!` above already catches a violation in debug/test
+        // builds. This is the release-mode enforcement of that same
+        // contract.
+        _ => unreachable!("build_udp_packet: src/dst IP family mismatch ({src} / {dst})"),
     }
 }
 
