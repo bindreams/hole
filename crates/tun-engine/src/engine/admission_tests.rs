@@ -22,6 +22,13 @@ fn stale() -> Handshake {
     }
 }
 
+fn duplicate() -> Handshake {
+    Handshake::Duplicate {
+        handle: SocketHandle::default(),
+        port: 80,
+    }
+}
+
 #[skuld::test]
 fn a_stale_handshake_is_discarded() {
     assert_eq!(decide_admission(&stale(), || Some(())), Admission::Discard);
@@ -66,4 +73,19 @@ fn an_exhausted_semaphore_refuses() {
 
     assert!(matches!(verdict, Admission::Refuse));
     assert_eq!(semaphore.available_permits(), 0);
+}
+
+#[skuld::test]
+fn a_duplicate_handshake_is_dropped() {
+    assert_eq!(decide_admission(&duplicate(), || Some(())), Admission::Duplicate);
+}
+
+#[skuld::test]
+fn a_duplicate_handshake_does_not_consume_a_permit() {
+    let acquired = Cell::new(false);
+    decide_admission(&duplicate(), || {
+        acquired.set(true);
+        Some(())
+    });
+    assert!(!acquired.get());
 }

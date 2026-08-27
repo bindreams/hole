@@ -75,11 +75,33 @@ emit is *retired* rather than removed:
 once `remote_endpoint()` goes `None`, smoltcp's signal that it has emitted the
 socket's last packet. `decide_disposal` picks the path per state — `Closed` and
 `Listen` retire, while `TimeWait` is dropped at once, since retiring it would
-hold the socket and both its buffers for smoltcp's 10 s `CLOSE_DELAY`. A handshake with no peer left is discarded without a
-packet, because smoltcp has already cleared the 4-tuple and has no address to
-answer. A connection socket that reverts to `Listen` — the client answered the
-SYN-ACK with an RST — is retired through that same list, so it cannot shadow the
-live listener on its port.
+hold the socket and both its buffers for smoltcp's 10 s `CLOSE_DELAY`. A
+handshake with no peer left is discarded without a packet, because smoltcp has
+already cleared the 4-tuple and has no address to answer. A connection socket
+that reverts to `Listen` — the client answered the SYN-ACK with an RST — is
+retired through that same list, so it cannot shadow the live listener on its
+port.
+
+Ownership of a 4-tuple is exclusive, and `take_handshakes` enforces it. Re-arming
+a port hands the listener whichever socket slot is lowest and free, which can put
+it *below* the connection it was just re-armed for; smoltcp gives a packet to the
+first socket that accepts it, and a `Listen` socket accepts a bare SYN on the
+local port alone. A client's retransmitted SYN can therefore land on the
+replacement listener rather than on its own connection. That handshake is
+classified `Duplicate` and its socket dropped without a segment — no second
+permit, no second router task. It leaves silently on purpose: an RST from it
+acknowledges the client's SYN, which a client in SYN-SENT must accept, and would
+kill the very connection it is retransmitting for.
+
+An admitted connection also gets a keep-alive interval and a timeout
+(`tcp_keep_alive_interval`, `tcp_peer_timeout`). They bound an external event —
+a client process that may never speak again — not anything inside the engine.
+Without them a connection stalled in `SynReceived`, `FinWait2` or `CloseWait`
+never reaches a state `decide_disposal` has a verdict for, and holds its entry,
+both buffers and its connection slot for the life of the process;
+`max_connections` of those wedge the tunnel for all new TCP. The probe is what
+keeps the bound off a client that is merely quiet: only silence in reply to it
+resets the socket to `Closed`, where the disposal path already runs.
 
 ### DNS forwarder
 

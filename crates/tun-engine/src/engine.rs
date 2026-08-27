@@ -25,6 +25,10 @@ mod driver;
 mod router;
 mod socket_stack;
 mod tcp_flow;
+// Packet-level test infrastructure with no business-logic counterpart; see the
+// module docs.
+#[cfg(test)]
+mod tcp_test_support;
 mod udp_flow;
 mod virtual_device;
 

@@ -194,14 +194,20 @@ impl Driver {
             let (handle, port, peer) = match handshake {
                 Handshake::Pending { handle, port, src, dst } => (handle, port, Some((src, dst))),
                 // A contract branch: `take_handshakes` classifies on an Option
-                // pair the type system does not narrow.
-                Handshake::Stale { handle, port } => (handle, port, None),
+                // pair the type system does not narrow. Neither verdict answers
+                // its socket, so neither needs an address.
+                Handshake::Stale { handle, port } | Handshake::Duplicate { handle, port } => (handle, port, None),
             };
 
             let permit = match verdict {
                 Admission::Discard => {
                     warn!("accepted TCP connection with no endpoint on port {port}");
                     self.stack.discard(handle, port);
+                    continue;
+                }
+                Admission::Duplicate => {
+                    debug!("retransmitted SYN for a connection already owned on port {port}");
+                    self.stack.drop_duplicate(handle, port);
                     continue;
                 }
                 Admission::Refuse => {

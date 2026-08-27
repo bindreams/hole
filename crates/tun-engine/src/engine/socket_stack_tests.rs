@@ -1,173 +1,81 @@
 //! Packet-level tests over a real smoltcp `Interface` + `VirtualTunDevice`.
 //!
-//! Four properties of the helpers below are load-bearing:
-//!
-//! 1. [`stack`] supplies a real MTU. `MutDeviceConfig::default()` leaves `mtu`
-//!    at 0, and smoltcp computes `ip_mtu() - ip_header_len - TCP_HEADER_LEN`,
-//!    which underflows and panics on the first poll after any SYN.
-//! 2. [`tcp_out`] owns its bytes. `TcpRepr` borrows its payload, so [`Segment`]
-//!    copies out every field a test asserts on, payload included.
-//! 3. [`tcp_out`] is destructive — `dequeue_tx` is the only thing that empties
-//!    the queue, so every tx assertion is relative to the last drain.
-//! 4. Sequence numbers are randomised by smoltcp. Assert relations to the
-//!    client's own ISN, never absolute values.
+//! The segment builders and egress parsing live in
+//! [`tcp_test_support`](super::super::tcp_test_support), which documents the
+//! properties of theirs that tests here depend on.
 
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use smoltcp::wire::{TcpControl, TcpSeqNumber};
 
-use smoltcp::phy::ChecksumCapabilities;
-use smoltcp::wire::{IpProtocol, Ipv4Cidr, Ipv4Packet, Ipv4Repr, TcpControl, TcpPacket, TcpRepr, TcpSeqNumber};
-
+use super::super::tcp_test_support::*;
 use super::*;
-use crate::device::MutDeviceConfig;
 use crate::engine::config::MutEngineConfig;
 
 // Helpers =============================================================================================================
 
-/// One segment drained from the virtual device, owned.
-struct Segment {
-    src: SocketAddr,
-    dst: SocketAddr,
-    control: TcpControl,
-    seq: TcpSeqNumber,
-    ack: Option<TcpSeqNumber>,
-    payload: Vec<u8>,
-}
-
-/// The client dialling through the tunnel.
-fn client() -> SocketAddr {
-    SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5)), 40000)
-}
-
-/// A second client dialling the same destination.
-fn other_client() -> SocketAddr {
-    SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 9)), 41000)
-}
-
-/// The address the client dialled, outside the tunnel's own subnet.
-fn dest() -> SocketAddr {
-    SocketAddr::new(IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)), 80)
-}
-
 fn stack() -> SocketStack {
-    let device_config = MutDeviceConfig {
-        tun_name: "hole-test".into(),
-        mtu: 1400,
-        ipv4: Some(Ipv4Cidr::new(Ipv4Addr::new(10, 255, 0, 1), 24)),
-        ipv6: None,
-    }
-    .freeze();
-    SocketStack::new(&device_config, &MutEngineConfig::default().freeze())
+    SocketStack::new(&device_config(), &MutEngineConfig::default().freeze())
 }
 
-fn t(ms: i64) -> SmoltcpInstant {
-    SmoltcpInstant::from_millis(ms)
+/// Milliseconds from a `MutEngineConfig` field. The timeout tests are about the
+/// shipped bounds, so they read them rather than restate them.
+fn config_ms(field: impl FnOnce(&MutEngineConfig) -> std::time::Duration) -> i64 {
+    field(&MutEngineConfig::default()).as_millis() as i64
 }
 
-/// The sequence number one past `seq`, in the wire form the builders take.
-fn after(seq: TcpSeqNumber) -> u32 {
-    (seq.0 as u32).wrapping_add(1)
+/// Every socket in the set holding the 4-tuple `src` -> `dst`. The invariant
+/// the duplicate check exists to keep is that this is never longer than one.
+fn owners_of(stack: &SocketStack, src: SocketAddr, dst: SocketAddr) -> Vec<SocketHandle> {
+    stack
+        .sockets
+        .iter()
+        .filter_map(|(handle, socket)| {
+            let smoltcp::socket::Socket::Tcp(socket) = socket else {
+                return None;
+            };
+            let local = socket.local_endpoint()?;
+            let remote = socket.remote_endpoint()?;
+            let holds = SocketAddr::new(smoltcp_to_std_ip(remote.addr), remote.port) == src
+                && SocketAddr::new(smoltcp_to_std_ip(local.addr), local.port) == dst;
+            holds.then_some(handle)
+        })
+        .collect()
 }
 
-fn segment(src: SocketAddr, dst: SocketAddr, control: TcpControl, seq: u32, ack: Option<u32>) -> Vec<u8> {
-    let (src_v4, dst_v4) = match (src.ip(), dst.ip()) {
-        (IpAddr::V4(s), IpAddr::V4(d)) => (s, d),
-        _ => panic!("these helpers build IPv4 segments only"),
-    };
-    let checksums = ChecksumCapabilities::default();
-
-    let tcp_repr = TcpRepr {
-        src_port: src.port(),
-        dst_port: dst.port(),
-        control,
-        seq_number: TcpSeqNumber(seq as i32),
-        ack_number: ack.map(|a| TcpSeqNumber(a as i32)),
-        window_len: 65535,
-        window_scale: None,
-        max_seg_size: None,
-        sack_permitted: false,
-        sack_ranges: [None, None, None],
-        timestamp: None,
-        payload: &[],
-    };
-    let ip_repr = Ipv4Repr {
-        src_addr: src_v4,
-        dst_addr: dst_v4,
-        next_header: IpProtocol::Tcp,
-        payload_len: tcp_repr.buffer_len(),
-        hop_limit: 64,
-    };
-
-    let header_len = ip_repr.buffer_len();
-    let mut buf = vec![0u8; header_len + tcp_repr.buffer_len()];
-    ip_repr.emit(&mut Ipv4Packet::new_unchecked(&mut buf), &checksums);
-    tcp_repr.emit(
-        &mut TcpPacket::new_unchecked(&mut buf[header_len..]),
-        &IpAddress::Ipv4(src_v4),
-        &IpAddress::Ipv4(dst_v4),
-        &checksums,
-    );
-    buf
+/// The one handshake in `handshakes`.
+fn one(handshakes: Vec<Handshake>) -> Handshake {
+    assert_eq!(handshakes.len(), 1, "expected exactly one handshake");
+    handshakes.into_iter().next().unwrap()
 }
 
-fn syn(src: SocketAddr, dst: SocketAddr, seq: u32) -> Vec<u8> {
-    segment(src, dst, TcpControl::Syn, seq, None)
-}
-
-fn ack(src: SocketAddr, dst: SocketAddr, seq: u32, ack: u32) -> Vec<u8> {
-    segment(src, dst, TcpControl::None, seq, Some(ack))
-}
-
-fn rst(src: SocketAddr, dst: SocketAddr, seq: u32, ack: u32) -> Vec<u8> {
-    segment(src, dst, TcpControl::Rst, seq, Some(ack))
-}
-
-fn fin(src: SocketAddr, dst: SocketAddr, seq: u32, ack: u32) -> Vec<u8> {
-    segment(src, dst, TcpControl::Fin, seq, Some(ack))
-}
-
-/// Drain and parse everything the stack has queued for the TUN.
-fn tcp_out(stack: &mut SocketStack) -> Vec<Segment> {
-    stack.dequeue_tx().iter().map(|packet| parse_segment(packet)).collect()
-}
-
-fn parse_segment(packet: &[u8]) -> Segment {
-    let checksums = ChecksumCapabilities::default();
-    let ip_packet = Ipv4Packet::new_checked(packet).expect("egress packet is IPv4");
-    let ip_repr = Ipv4Repr::parse(&ip_packet, &checksums).expect("egress IPv4 header parses");
-    let tcp_packet = TcpPacket::new_checked(ip_packet.payload()).expect("egress payload is TCP");
-    let tcp_repr = TcpRepr::parse(
-        &tcp_packet,
-        &IpAddress::Ipv4(ip_repr.src_addr),
-        &IpAddress::Ipv4(ip_repr.dst_addr),
-        &checksums,
-    )
-    .expect("egress TCP header parses");
-
-    Segment {
-        src: SocketAddr::new(IpAddr::V4(ip_repr.src_addr), tcp_repr.src_port),
-        dst: SocketAddr::new(IpAddr::V4(ip_repr.dst_addr), tcp_repr.dst_port),
-        control: tcp_repr.control,
-        seq: tcp_repr.seq_number,
-        ack: tcp_repr.ack_number,
-        payload: tcp_repr.payload.to_vec(),
+fn kind(handshake: &Handshake) -> &'static str {
+    match handshake {
+        Handshake::Pending { .. } => "pending",
+        Handshake::Stale { .. } => "stale",
+        Handshake::Duplicate { .. } => "duplicate",
     }
 }
 
 /// The one `Pending` handshake in `handshakes`, destructured.
 fn one_pending(handshakes: Vec<Handshake>) -> (SocketHandle, u16, SocketAddr, SocketAddr) {
-    assert_eq!(handshakes.len(), 1, "expected exactly one handshake");
-    match handshakes.into_iter().next().unwrap() {
+    match one(handshakes) {
         Handshake::Pending { handle, port, src, dst } => (handle, port, src, dst),
-        Handshake::Stale { port, .. } => panic!("expected a pending handshake on port {port}, got a stale one"),
+        other => panic!("expected a pending handshake, got a {} one", kind(&other)),
     }
 }
 
 /// The one `Stale` handshake in `handshakes`, destructured.
 fn one_stale(handshakes: Vec<Handshake>) -> (SocketHandle, u16) {
-    assert_eq!(handshakes.len(), 1, "expected exactly one handshake");
-    match handshakes.into_iter().next().unwrap() {
+    match one(handshakes) {
         Handshake::Stale { handle, port } => (handle, port),
-        Handshake::Pending { port, .. } => panic!("expected a stale handshake on port {port}, got a pending one"),
+        other => panic!("expected a stale handshake, got a {} one", kind(&other)),
+    }
+}
+
+/// The one `Duplicate` handshake in `handshakes`, destructured.
+fn one_duplicate(handshakes: Vec<Handshake>) -> (SocketHandle, u16) {
+    match one(handshakes) {
+        Handshake::Duplicate { handle, port } => (handle, port),
+        other => panic!("expected a duplicate handshake, got a {} one", kind(&other)),
     }
 }
 
@@ -214,19 +122,32 @@ fn revert_to_listen(stack: &mut SocketStack) -> SocketHandle {
     handle
 }
 
-/// Drive an admitted connection through a clean close to `TimeWait`: we send
-/// the FIN, the client acknowledges it and sends its own.
-fn time_wait(stack: &mut SocketStack) -> SocketHandle {
-    let isn = 1000u32;
+/// The instant of the client's ACK in [`established`] — the last thing the
+/// client says, and so where its silence starts being measured.
+const ESTABLISHED_AT: i64 = 2;
+
+/// Drive a listener on port 80 through `admit` and the client's ACK to
+/// `Established`. Returns the connection's handle and the sequence number the
+/// client last acknowledged, which every later client segment must carry.
+fn established(stack: &mut SocketStack, isn: u32) -> (SocketHandle, u32) {
     let handle = half_open(stack, isn);
     stack.admit(handle, 80);
     stack.poll(t(1));
 
     let synack = tcp_out(stack);
     assert_eq!(synack.len(), 1);
+    assert_eq!(synack[0].control, TcpControl::Syn);
     stack.enqueue_rx(ack(client(), dest(), isn + 1, after(synack[0].seq)));
     stack.poll(t(2));
     assert_eq!(stack.socket(handle).state(), tcp::State::Established);
+    (handle, after(synack[0].seq))
+}
+
+/// Drive an admitted connection through a clean close to `TimeWait`: we send
+/// the FIN, the client acknowledges it and sends its own.
+fn time_wait(stack: &mut SocketStack) -> SocketHandle {
+    let isn = 1000u32;
+    let (handle, _) = established(stack, isn);
 
     stack.socket_mut(handle).close();
     stack.poll(t(3));
@@ -242,6 +163,59 @@ fn time_wait(stack: &mut SocketStack) -> SocketHandle {
     stack.poll(t(5));
     assert_eq!(stack.socket(handle).state(), tcp::State::TimeWait);
     let _ = tcp_out(stack);
+    handle
+}
+
+/// Reproduce the slot-ordering steal. `SocketSet::add` fills the lowest free
+/// slot, so the listener `admit` re-arms the port with can land *below* its own
+/// connection; smoltcp hands a packet to the first socket that `accepts()` it,
+/// and a `Listen` socket accepts a bare SYN on port alone. The client's
+/// retransmitted SYN therefore lands on the replacement listener instead of on
+/// the connection it belongs to. Returns the connection's handle.
+fn steal_a_retransmitted_syn(stack: &mut SocketStack) -> SocketHandle {
+    let isn = 1000u32;
+
+    // Occupy the lowest slot with a connection on another port, then free it:
+    // the replacement listener needs a slot below the port-80 connection.
+    stack.ensure_listener(other_dest().port());
+    stack.ensure_listener(dest().port());
+    stack.enqueue_rx(syn(client(), other_dest(), 7000));
+    stack.poll(t(0));
+    let (spare, spare_port, ..) = one_pending(stack.take_handshakes());
+    stack.refuse(spare, spare_port);
+    stack.poll(t(1));
+    let _ = tcp_out(stack);
+    assert!(!stack.sockets.iter().any(|(h, _)| h == spare), "the low slot is free");
+
+    // The connection this reproduction is about.
+    stack.enqueue_rx(syn(client(), dest(), isn));
+    stack.poll(t(2));
+    let (handle, port, ..) = one_pending(stack.take_handshakes());
+    stack.admit(handle, port);
+    stack.poll(t(3));
+    let synack = tcp_out(stack);
+    assert_eq!(synack.len(), 1);
+    assert_eq!(synack[0].control, TcpControl::Syn);
+
+    let slot = |target: SocketHandle| stack.sockets.iter().position(|(h, _)| h == target).unwrap();
+    let listener = stack.listeners.iter().find(|l| l.port == dest().port()).unwrap().handle;
+    assert!(
+        slot(listener) < slot(handle),
+        "the replacement listener must outrank the connection for this to reproduce",
+    );
+
+    stack.enqueue_rx(syn(client(), dest(), isn));
+    stack.poll(t(4));
+    assert_eq!(
+        stack.socket(listener).state(),
+        tcp::State::SynReceived,
+        "the replacement listener took the retransmitted SYN",
+    );
+    assert_eq!(
+        owners_of(stack, client(), dest()).len(),
+        2,
+        "two sockets now hold one client's 4-tuple",
+    );
     handle
 }
 
@@ -551,4 +525,100 @@ fn retiring_a_timewait_socket_would_hold_it_but_removing_does_not() {
     let handle = time_wait(&mut dropped);
     dropped.remove(handle);
     assert!(!dropped.sockets.iter().any(|(h, _)| h == handle));
+}
+
+/// The defect, stated as a test: the stolen SYN belongs to a connection the
+/// driver already owns, so offering it as a new one would buy a second permit,
+/// a second connection entry and a second upstream dial for one client socket.
+#[skuld::test]
+fn a_stolen_retransmit_is_not_offered_as_a_new_connection() {
+    let mut stack = stack();
+    let connection = steal_a_retransmitted_syn(&mut stack);
+
+    let (handle, port) = one_duplicate(stack.take_handshakes());
+
+    assert_eq!(port, dest().port());
+    assert_ne!(handle, connection, "the owner of the tuple is untouched");
+    assert_eq!(stack.socket(connection).state(), tcp::State::SynReceived);
+}
+
+#[skuld::test]
+fn a_dropped_duplicate_answers_nothing_and_leaves_its_port_armed() {
+    let mut stack = stack();
+    let connection = steal_a_retransmitted_syn(&mut stack);
+    let _ = tcp_out(&mut stack);
+    let (handle, port) = one_duplicate(stack.take_handshakes());
+
+    stack.drop_duplicate(handle, port);
+    stack.poll(t(5));
+
+    assert!(
+        tcp_out(&mut stack).is_empty(),
+        "the client is waiting on the tuple's owner"
+    );
+    assert_eq!(owners_of(&stack, client(), dest()), vec![connection]);
+    assert_eq!(stack.socket(connection).state(), tcp::State::SynReceived);
+
+    stack.enqueue_rx(syn(other_client(), dest(), 5000));
+    stack.poll(t(6));
+    let (_, _, src, dst) = one_pending(stack.take_handshakes());
+    assert_eq!((src, dst), (other_client(), dest()));
+}
+
+#[skuld::test]
+fn an_admitted_connection_whose_client_never_answers_is_closed() {
+    let mut stack = stack();
+    let handle = half_open(&mut stack, 1000);
+    stack.admit(handle, 80);
+    stack.poll(t(1));
+    let _ = tcp_out(&mut stack);
+
+    stack.poll(t(config_ms(|c| c.tcp_peer_timeout) + 1));
+
+    assert_eq!(stack.socket(handle).state(), tcp::State::Closed);
+}
+
+#[skuld::test]
+fn an_idle_connection_probes_its_client() {
+    let mut stack = stack();
+    let (handle, _) = established(&mut stack, 1000);
+    let _ = tcp_out(&mut stack);
+
+    stack.poll(t(120_000));
+
+    let out = tcp_out(&mut stack);
+    assert_eq!(out.len(), 1);
+    assert_eq!(
+        out[0].payload, b"\0",
+        "a keep-alive carries one garbage octet (RFC 1122)"
+    );
+    assert_eq!(stack.socket(handle).state(), tcp::State::Established);
+}
+
+#[skuld::test]
+fn an_idle_connection_whose_client_answers_the_probe_outlives_the_peer_timeout() {
+    let mut stack = stack();
+    let (handle, server_seq) = established(&mut stack, 1000);
+    let _ = tcp_out(&mut stack);
+
+    let probed_at = 2 * config_ms(|c| c.tcp_keep_alive_interval);
+    stack.poll(t(probed_at));
+    assert_eq!(tcp_out(&mut stack).len(), 1, "the idle connection is probed");
+    stack.enqueue_rx(ack(client(), dest(), 1001, server_seq));
+    stack.poll(t(probed_at + 1));
+
+    // Past the bound measured from admission, but not from the answered probe.
+    stack.poll(t(config_ms(|c| c.tcp_peer_timeout) + 2));
+
+    assert_eq!(stack.socket(handle).state(), tcp::State::Established);
+}
+
+#[skuld::test]
+fn an_idle_connection_whose_client_stops_answering_is_closed() {
+    let mut stack = stack();
+    let (handle, _) = established(&mut stack, 1000);
+
+    stack.poll(t(ESTABLISHED_AT + config_ms(|c| c.tcp_peer_timeout)));
+
+    assert_eq!(stack.socket(handle).state(), tcp::State::Closed);
 }

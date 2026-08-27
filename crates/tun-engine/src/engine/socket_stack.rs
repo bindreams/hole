@@ -9,14 +9,19 @@
 //! reached while the socket is still in `SynReceived` and nothing has left the
 //! interface. [`admit`](SocketStack::admit) releases the SYN-ACK;
 //! [`refuse`](SocketStack::refuse) turns the same socket into an RST.
+//!
+//! A 4-tuple has one owner. Slot order can put a re-armed listener below its own
+//! connection, where it takes that client's retransmitted SYN, so
+//! [`take_handshakes`](SocketStack::take_handshakes) reports the second socket
+//! for a tuple as `Duplicate` rather than as a new connection.
 
 use std::collections::HashSet;
 use std::net::{IpAddr, SocketAddr};
 
 use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
 use smoltcp::socket::tcp;
-use smoltcp::time::Instant as SmoltcpInstant;
-use smoltcp::wire::{HardwareAddress, IpAddress, IpCidr};
+use smoltcp::time::{Duration as SmoltcpDuration, Instant as SmoltcpInstant};
+use smoltcp::wire::{HardwareAddress, IpAddress, IpCidr, IpEndpoint};
 use tracing::warn;
 
 pub(crate) use super::admission::Handshake;
@@ -41,6 +46,8 @@ pub(crate) struct SocketStack {
     retiring: Vec<SocketHandle>,
     tcp_rx_buf_size: usize,
     tcp_tx_buf_size: usize,
+    keep_alive_interval: SmoltcpDuration,
+    peer_timeout: SmoltcpDuration,
 }
 
 impl SocketStack {
@@ -68,6 +75,8 @@ impl SocketStack {
             retiring: Vec::new(),
             tcp_rx_buf_size: config.tcp_rx_buf_size,
             tcp_tx_buf_size: config.tcp_tx_buf_size,
+            keep_alive_interval: SmoltcpDuration::from(config.tcp_keep_alive_interval),
+            peer_timeout: SmoltcpDuration::from(config.tcp_peer_timeout),
         }
     }
 
@@ -117,6 +126,22 @@ impl SocketStack {
         self.listened_ports.insert(port);
     }
 
+    /// Whether a socket other than `handle` already holds the 4-tuple
+    /// `local`/`remote`.
+    ///
+    /// Only a listener can pick up a packet whose tuple is already taken:
+    /// smoltcp matches a connected socket on the full 4-tuple, but a `Listen`
+    /// socket matches a bare SYN on the local port alone, and it is reached
+    /// first whenever it sits in a lower slot.
+    fn tuple_is_taken(&self, handle: SocketHandle, local: IpEndpoint, remote: IpEndpoint) -> bool {
+        self.sockets.iter().any(|(other, socket)| {
+            let smoltcp::socket::Socket::Tcp(socket) = socket else {
+                return false;
+            };
+            other != handle && socket.local_endpoint() == Some(local) && socket.remote_endpoint() == Some(remote)
+        })
+    }
+
     /// Listener sockets that have left `State::Listen`. Each is dropped from
     /// the listener bookkeeping, so a handshake is reported exactly once.
     pub(crate) fn take_handshakes(&mut self) -> Vec<Handshake> {
@@ -134,6 +159,9 @@ impl SocketStack {
 
             let socket = self.sockets.get::<tcp::Socket>(handle);
             handshakes.push(match (socket.local_endpoint(), socket.remote_endpoint()) {
+                (Some(local), Some(remote)) if self.tuple_is_taken(handle, local, remote) => {
+                    Handshake::Duplicate { handle, port }
+                }
                 (Some(local), Some(remote)) => Handshake::Pending {
                     handle,
                     port,
@@ -146,9 +174,19 @@ impl SocketStack {
         handshakes
     }
 
-    /// Release the socket's held SYN-ACK and re-arm the port.
+    /// Release the socket's held SYN-ACK, bound its client's silence, and
+    /// re-arm the port.
+    ///
+    /// The bound is the only thing that reclaims a connection whose client
+    /// vanishes mid-flight: smoltcp's retransmit backs off forever, and
+    /// `decide_disposal` has no verdict for `SynReceived`, `FinWait2` or
+    /// `CloseWait`. On the timeout smoltcp resets the socket to `Closed`, where
+    /// it has one.
     pub(crate) fn admit(&mut self, handle: SocketHandle, port: u16) {
-        self.sockets.get_mut::<tcp::Socket>(handle).pause_synack(false);
+        let socket = self.sockets.get_mut::<tcp::Socket>(handle);
+        socket.set_keep_alive(Some(self.keep_alive_interval));
+        socket.set_timeout(Some(self.peer_timeout));
+        socket.pause_synack(false);
         self.ensure_listener(port);
     }
 
@@ -169,6 +207,18 @@ impl SocketStack {
             tcp::State::Closed,
             "every path that clears a non-listening socket's tuple leaves it Closed",
         );
+        self.sockets.remove(handle);
+        self.ensure_listener(port);
+    }
+
+    /// Drop a second socket for a 4-tuple another socket already owns, and
+    /// re-arm the port.
+    ///
+    /// It leaves without a packet, and that is the point: any segment from here
+    /// reaches a client that is transacting with the *other* socket. An RST
+    /// acknowledging the client's SYN is one it must accept while in SYN-SENT,
+    /// so answering would kill the connection this SYN is retransmitting for.
+    pub(crate) fn drop_duplicate(&mut self, handle: SocketHandle, port: u16) {
         self.sockets.remove(handle);
         self.ensure_listener(port);
     }

@@ -32,7 +32,13 @@ before editing; the sections linked below are the authoritative source.
   is the pure `decide_admission`. A socket with a packet still to emit is
   *retired* rather than removed, and reaped once smoltcp clears its 4-tuple —
   including one that reverted to `Listen`, which would otherwise hijack its
-  port. `TimeWait` stays on immediate removal. →
+  port. `TimeWait` stays on immediate removal. A 4-tuple has one owner: a
+  re-armed listener can outrank its own connection in slot order and steal that
+  client's retransmitted SYN, so such a handshake is `Duplicate` and its socket
+  is dropped without a segment. An admitted connection carries a keep-alive plus
+  a timeout, the sanctioned bound on a client that may never speak again —
+  without it a stall in `SynReceived`/`FinWait2`/`CloseWait` holds its slot
+  forever. →
   [CONTRIBUTING.md#tcp-accept-refusal](CONTRIBUTING.md#tcp-accept-refusal)
 - **DNS forwarder.** Carries DNS over the TCP tunnel for TCP-only plugins; OS
   adapter DNS is advertised the configured resolver IPs, which route into
