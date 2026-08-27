@@ -318,7 +318,9 @@ fn setup_with_spaced_interface_name_includes_full_name() {
 #[skuld::test]
 fn ipv6_splits_are_not_fatal_without_reachable_ipv6() {
     let cmds = build_setup_commands("hole-tun", ipv4_server(), &gateway_info(ipv4_gateway(), "en0", false));
-    for cmd in cmds.iter().filter(|c| is_ipv6_split(c)) {
+    let v6: Vec<_> = cmds.iter().filter(|c| is_ipv6_split(c)).collect();
+    assert_eq!(v6.len(), 2, "expected the ::/1 and 8000::/1 adds, got {v6:?}");
+    for cmd in v6 {
         assert!(!cmd.fatal, "IPv6 split must not abort a host with no IPv6: {cmd:?}");
     }
 }

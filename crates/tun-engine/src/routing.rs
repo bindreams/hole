@@ -285,10 +285,9 @@ where
             continue;
         };
         if !cmd.fatal {
+            // `exec` already logged the exit code and child output.
             warn!(
-                phase = phase.name(),
                 cmd = cmd.argv.join(" "),
-                %failure,
                 "route command failed but is not fatal on this host — continuing"
             );
             continue;
