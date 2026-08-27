@@ -88,10 +88,34 @@ async fn port_probe_times_out_when_nothing_listens() {
 }
 
 #[skuld::test]
+async fn probe_once_classifies_a_closed_port_as_refused() {
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = l.local_addr().unwrap();
+    drop(l);
+    assert_eq!(
+        crate::ready::probe_once(addr, std::time::Duration::from_millis(500)).await,
+        crate::ready::ProbeOutcome::Refused
+    );
+}
+
+#[skuld::test]
 async fn port_in_use_is_a_single_probe_round() {
     let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port = l.local_addr().unwrap().port();
     assert!(crate::ready::port_in_use(port).await);
     // Port 0: nothing can listen there — one round, returns false fast.
     assert!(!crate::ready::port_in_use(0).await);
+}
+
+/// The fallback that makes `NoRetransmit` sound in the single-round
+/// `port_in_use`: a bind needs no SYN, so it answers where a dropped SYN
+/// left no verdict.
+#[skuld::test]
+async fn is_port_held_reads_the_holder_not_a_probe() {
+    let held = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = held.local_addr().unwrap();
+    assert!(crate::ready::is_port_held(addr).await, "a live listener holds its port");
+
+    drop(held);
+    assert!(!crate::ready::is_port_held(addr).await, "a released port is not held");
 }

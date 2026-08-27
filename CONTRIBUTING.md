@@ -255,6 +255,125 @@ position in the phase, exit code): it reaches a GUI toast verbatim through
 A failed install's rollback does exactly four things — see
 `SystemRouting::install_with`'s doc comment, which is the source of truth.
 
+### Proxy shutdown contract
+
+`ShadowsocksRunning::stop()` / `Drop` (`crates/bridge/src/proxy/shadowsocks.rs`)
+must close every socket the shadowsocks local server bound before returning —
+otherwise an immediate rebind of the same fixed port fails with
+`AddrInUse` (#876).
+
+**Three abort layers, not one.** Upstream (`shadowsocks-service` 1.24.0) tears
+`local::Server::run()` down through nested `Drop` → `abort()`, none of which
+Hole can join because the handles are private:
+
+| Layer | Who aborts                                                | What the aborted task still owns                                                             |
+| ----- | --------------------------------------------------------- | -------------------------------------------------------------------------------------------- |
+| 1     | `ShadowsocksRunning::stop` aborts the `server.run()` task | nothing directly; its drop triggers layer 2                                                  |
+| 2     | `utils::ServerHandle::drop` → `abort()`                   | the `Socks`/`Http` accept loops — the TCP listener and the bound UDP socket                  |
+| 3     | `UdpAssociation::drop` → `abort()`                        | an `Arc` clone of the inbound SOCKS5 UDP listener, held by every live UDP association's task |
+
+Holding the layer-2 sub-handles ourselves (the obvious fix) still leaves layer
+3 open: `UdpAssociationManager` never surfaces its handles, so a live UDP
+association keeps the port bound until its task is dropped. `Server::run(self)`
+consumes the server and exposes no shutdown signal either — the fix is a
+runtime-level join, a strict superset of anything an upstream API could offer.
+
+**The fix: each proxy gets its own tokio runtime** (`SsRuntime`), and
+`stop()`/`Drop` shut it down and block until every task on it has dropped —
+that join is what closes the descriptors.
+
+**Where `drop(Runtime)` is legal.** `Runtime::drop` panics unless
+`try_enter_blocking_region()` returns `Some`, which holds **iff the calling
+thread is not inside any runtime** — flavour is irrelevant to the predicate,
+it only decides whether `block_in_place` is available. Three ways to satisfy
+it: outside any runtime, inside a `spawn_blocking` closure, or inside
+`block_in_place` on a multi-thread worker (which temporarily exits the
+runtime for the closure's duration). A fresh `std::thread` is unconditionally
+outside any runtime, so hopping to one always works.
+
+`spawn_blocking` is tempting but unsound as the hop: when the target pool is
+shutting down, `Spawner::spawn_task` drops the closure **inline on the
+calling thread** instead of running it — if that thread is an entered
+worker, dropping the captured `Runtime` there panics, and the runtime is left
+half torn down with nothing left to join it. `join_runtime` therefore always
+hops via `std::thread::spawn(..).join()`, and uses `block_in_place` only to
+release a multi-thread worker's core first (mirroring `Dispatcher::drop`) —
+never as the hop itself. This mechanism has no failure path with respect to
+the `drop(Runtime)` legality predicate above, so `stop()`'s port-release
+guarantee is unqualified against *that*: no `Err` arm, no flavour-specific
+fallback, no shutdown-race carve-out. It carries exactly one accepted,
+orthogonal exception: `std::thread::spawn` itself panics if the OS refuses to
+create a new thread (resource exhaustion) — a whole-process condition no
+`Result` plumbing in `join_runtime` would meaningfully recover from, and
+distinct from the legality predicate this function exists to satisfy.
+
+**No error arm, deliberately.** Recovering from that OS-thread-creation
+failure would need `std::thread::Builder::spawn` plus a channel to hand `rt`
+to the scratch thread only *after* confirming it spawned — the closure
+passed to `spawn` cannot simply own `rt` and fall back to `mem::forget` on
+`Err`, because a failed spawn has already dropped the closure (and therefore
+`rt`, inline, on the calling thread) by the time `Err` is observed, which is
+the exact hazard this function exists to avoid. That channel-based version is
+possible but is not worth the added surface for a condition this rare, right
+after `SsRuntime::new` just created four more OS threads via the same
+allocator. Accepting the panic is the chosen resolution.
+
+**`stop()`'s ordering is load-bearing.** It classifies the task's own exit
+(await the aborted `JoinHandle`, distinguishing panic from cancellation)
+*before* joining the runtime — joining first would make every outcome look
+like a plain cancellation.
+
+**`worker_threads(4)`** on `SsRuntime` is a reduction from the ambient
+runtime's `available_parallelism()` (what the proxy used to run on).
+Unmeasured — falsified by a sustained single-tunnel throughput measurement on
+a >4-core box that saturates all four workers, or a CPU profile showing the
+`hole-ss` threads pinned during a large transfer. The local server is
+expected to be I/O-bound (loopback accept, SOCKS5 framing, a copy loop), with
+the remote server and plugin chain as the practical ceiling — but this has
+not been measured.
+
+**Tracing hand-off, test-only.** `garter::tracing_test::set_default_in_current_thread`
+asserts the *ambient* runtime is current-thread; it cannot see that a task
+now runs on `SsRuntime`'s own workers instead, so without help their tracing
+events land with no subscriber and are silently dropped in tests. Production
+installs a subscriber globally (`crates/common/src/logging.rs`) and needs no
+hand-off, so `SsRuntime::new` gates the whole mechanism behind `#[cfg(test)]`:
+it captures the constructing thread's dispatcher and re-installs it on every
+worker via `Builder::on_thread_start`, and — this is the part that is easy to
+get wrong — **clears it in a matching `on_thread_stop`, never `mem::forget`s
+it**. `tracing-core`'s `DefaultGuard::drop` is the only site that decrements
+the process-global scoped-dispatcher counter; forgetting the guard leaks that
+counter permanently non-zero after the first proxy session, silently forcing
+*every* thread in the process onto tracing's slower thread-local-lookup path
+(and, past thread teardown, silently dropping events) for the rest of the
+process's life — for the remainder of the test binary, since this is
+test-only, but the failure mode is exactly the kind of silent event loss the
+hand-off exists to prevent, so the guard discipline matters as much as the
+hand-off itself.
+
+**The no-hang property depends on a pinned dependency version.** `drop(Runtime)`
+waits for currently-*running* blocking-pool tasks. Nothing reachable on
+Hole's local-server path has one today:
+
+- `shadowsocks` 1.24.0: Windows' `DnsResolver::System` branch calls a
+  blocking `lookup_host`, but Hole's config never selects it — no ACL, all
+  `ServerAddr::SocketAddr`.
+- `hickory-resolver` / `hickory-proto` (pulled in transitively —
+  `shadowsocks-service`'s default `hickory-dns` feature is on, and
+  `crates/bridge/Cargo.toml` never disables default features): on unix,
+  `local::Server::new` unconditionally constructs a hickory system resolver
+  (`DnsConfig::System` is the default and Hole never overrides it), so this
+  code *does* run on `SsRuntime` on Linux/macOS even though Hole never asks
+  it to resolve anything. Neither crate has a `spawn_blocking` call today.
+
+A dependency bump could reintroduce one with no other test going red —
+`upstream_has_no_blocking_calls_on_the_shutdown_path`
+(`crates/bridge/src/proxy/shadowsocks_tests.rs`) walks all four dependencies'
+source trees and fails the build if it does. It is a textual, not semantic,
+scan (exact-substring match on the literal identifiers, not scoped to
+call-graph reachability) — a best-effort tripwire against an accidental
+upstream reintroduction, not a proof against a determined rename/alias.
+
 ### Crash recovery
 
 While a proxy is active the bridge persists small state files in `<state_dir>/`,
