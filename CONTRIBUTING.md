@@ -231,7 +231,7 @@ needs many retries, a healthy machine one. See #285, #300, #304.
 security decision, not a style one:
 
 - **Fatal — install only** (`run_setup_commands`, via `setup_routes`). The first
-  command that does not exit zero aborts the phase and is returned as a
+  fatal command that does not exit zero aborts the phase and is returned as a
   `RouteCommandError`. `SystemRouting::install` then rolls back and returns
   `Err`, so no `SystemRoutes` guard exists. Reporting split routes that were
   never installed is a **leak**: traffic egresses outside the tunnel while the UI
@@ -262,9 +262,9 @@ when IPv6 *is* reachable, stays fatal. The two commands are still *issued*, only
 their failure tolerated: `probe_ipv6` also reports false for a working IPv6 stack
 with no upstream route, and there the adds succeed and blackhole IPv6 inside the
 TUN — omitting them would push that traffic out the physical NIC instead.
-`Routing::install` takes the whole
-`GatewayInfo` rather than destructured fields, because destructuring it at the
-call site is how `ipv6_available` got dropped on this path to begin with.
+`Routing::install` takes the whole `GatewayInfo` rather than destructured fields,
+because destructuring it at the call site is how `ipv6_available` got dropped on
+this path to begin with.
 
 **Accepted trade: a false start-failure is preferred to a silent leak.** No test
 exercises `setup_routes` against a real elevated `netsh`/`route` under an
