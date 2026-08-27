@@ -333,6 +333,48 @@ async fn a_dropped_router_leaves_the_clients_final_bytes_undelivered() {
     assert_eq!(out[0].ack, Some(TcpSeqNumber(1001 + 100 + 1)));
 }
 
+/// Reaches Task 2's conclusion through `Driver`'s own methods instead of
+/// `SocketStack`'s. The phase sequence below is a copy of
+/// `Driver::run`'s (`driver.rs:153-159`), substituting `stack.poll(t(..))`
+/// for `poll_smoltcp()` because the fixture drives time explicitly — it is
+/// not a read of that order, and no assertion here would catch it changing.
+/// Its RED sibling is Task 2's
+/// `a_fin_carrying_data_is_acknowledged_before_the_socket_can_be_removed`,
+/// which fails without the fix at the layer the fix lives in.
+#[skuld::test]
+async fn the_last_ack_reaches_the_wire_before_the_connection_is_reaped() {
+    let mut d = driver(4);
+    let (handle, synack_seq) = admit_one(&mut d, client(), dest(), 1000, 0);
+    d.stack.enqueue_rx(ack(client(), dest(), 1001, synack_seq));
+    d.stack.poll(t(2));
+    assert_eq!(d.stack.socket(handle).state(), tcp::State::Established);
+
+    d.stack.socket_mut(handle).close();
+    d.stack.poll(t(3));
+    let our_fin = tcp_out(&mut d.stack);
+    assert_eq!(our_fin.len(), 1);
+
+    d.stack.enqueue_rx(ack(client(), dest(), 1001, after(our_fin[0].seq)));
+    d.stack.poll(t(4));
+    assert_eq!(d.stack.socket(handle).state(), tcp::State::FinWait2);
+
+    let payload = vec![7u8; 100];
+    d.stack
+        .enqueue_rx(data_fin(client(), dest(), 1001, after(our_fin[0].seq), &payload));
+
+    d.stack.poll(t(5));
+    d.accept_tcp_connections();
+    d.relay_tcp_data();
+    d.cleanup_finished_connections();
+    d.process_udp_replies();
+    d.stack.poll(t(6));
+
+    let out = tcp_out(&mut d.stack);
+    assert_eq!(out.len(), 1);
+    assert_eq!(out[0].ack, Some(TcpSeqNumber(1001 + 100 + 1)));
+    assert!(!d.connections.contains_key(&handle));
+}
+
 #[skuld::test]
 async fn a_connection_whose_client_never_answers_is_reclaimed() {
     let mut d = driver(1);
