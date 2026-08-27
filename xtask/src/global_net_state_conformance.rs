@@ -1,4 +1,4 @@
-//! Guard 2: binds `.config/nextest.toml`'s `global-net-state` test-group's
+//! Guard 2: binds `.config/nextest.toml`'s `global_net_state` test-group's
 //! *name-substring* membership to the `global_net_state` skuld label attached
 //! at each test's own definition site (bindreams/hole#894).
 //!
@@ -37,7 +37,7 @@ const LABEL_NAME: &str = "global_net_state";
 
 // group_config ========================================================================================================
 
-/// The `global-net-state` group's two load-bearing axes read live from
+/// The `global_net_state` group's two load-bearing axes read live from
 /// `.config/nextest.toml`: the name-substring `filter` its
 /// `[[profile.default.overrides]]` entry matches on, and the `max-threads`
 /// value that makes the group's cross-binary serialization real.

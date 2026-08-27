@@ -402,7 +402,7 @@ mod tun {
     /// `hole-tun` device name.
     ///
     /// COUPLED NAME: the `_full_tunnel_roundtrip` suffix is the literal substring
-    /// `.config/nextest.toml`'s `global-net-state` filter matches to serialize
+    /// `.config/nextest.toml`'s `global_net_state` filter matches to serialize
     /// this live-egress e2e against tun-engine's system-wide WFP lockdown test
     /// across binaries. Renaming the suffix without updating that filter drops
     /// this test from the group → cross-binary data race.

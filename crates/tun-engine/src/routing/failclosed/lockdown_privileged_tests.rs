@@ -23,7 +23,7 @@
 //! `!tun` filter, and CI provisions the elevation.
 //!
 //! Cross-binary serialization for the global WFP/pf/TUN state these touch lives
-//! in `.config/nextest.toml` (`global-net-state` test-group) — skuld's
+//! in `.config/nextest.toml` (`global_net_state` test-group) — skuld's
 //! `serial = TUN` only serializes within one binary.
 //!
 //! COUPLED NAMES: that group's filter matches these tests by the name substrings
@@ -99,7 +99,7 @@ const NON_PERMITTED: &str = "8.8.8.8:443";
 /// matches that interface's traffic, not the egress probed here), nor on a live
 /// `hole-tun`. `serial = TUN` serializes against other in-binary TUN tests; the
 /// cross-binary race with the bridge's real-egress e2e is handled by the
-/// `global-net-state` test-group (`.config/nextest.toml`).
+/// `global_net_state` test-group (`.config/nextest.toml`).
 #[cfg(target_os = "windows")]
 #[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
 fn windows_lockdown_permits_server_ip_and_blocks_other_egress() {
@@ -175,7 +175,7 @@ fn windows_lockdown_permits_server_ip_and_blocks_other_egress() {
 ///
 /// No live utun is needed: `pass out quick on <tun-absent>` simply never matches,
 /// so the block rule governs the probed egress. `serial = TUN` + the
-/// `global-net-state` test-group serialize the process-global pf state:
+/// `global_net_state` test-group serialize the process-global pf state:
 /// `pfctl -E`/`-X` is refcounted and the main ruleset is host-wide, so a
 /// concurrent cover test would race the snapshot restore.
 #[cfg(target_os = "macos")]

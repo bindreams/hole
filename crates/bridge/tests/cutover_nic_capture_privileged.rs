@@ -20,7 +20,7 @@
 //! Local verification is COMPILE + clippy only.
 //!
 //! Cross-binary serialization of the global WFP/pf/TUN state lives in
-//! `.config/nextest.toml` (`global-net-state` test-group). COUPLED NAMES: that
+//! `.config/nextest.toml` (`global_net_state` test-group). COUPLED NAMES: that
 //! group's filter matches by the `cutover_global_net_state_` prefix — renaming
 //! it WITHOUT updating the filter drops the test from the group (a silent
 //! cross-binary race). Change both together.
@@ -172,7 +172,7 @@ fn nonce() -> [u8; 16] {
 /// leak).
 ///
 /// The name carries the `cutover_global_net_state_` substring so it auto-joins
-/// the `global-net-state` nextest group (cross-binary serialization of the
+/// the `global_net_state` nextest group (cross-binary serialization of the
 /// system-wide WFP state). `serial = TUN` serializes it within this binary.
 #[cfg(target_os = "windows")]
 #[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]

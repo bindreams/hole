@@ -17,13 +17,13 @@
 //! `disarm` installs [`ReleaseOnDrop`] FIRST, so a panic (or an early return
 //! from a failed assertion) during an unwind still clears the host.
 //!
-//! These tests share the `global-net-state` test-group with the bridge's
+//! These tests share the `global_net_state` test-group with the bridge's
 //! live-egress e2e and with `lockdown_privileged_tests`
 //! (`.config/nextest.toml`) — a poisoned runner takes the rest of the job
 //! down and reads as an unrelated network flake.
 //!
 //! COUPLED NAMES: every test name here contains the substring `release_all_`;
-//! `.config/nextest.toml`'s `global-net-state` filter matches on it. Renaming
+//! `.config/nextest.toml`'s `global_net_state` filter matches on it. Renaming
 //! a test WITHOUT updating that filter silently drops it from the group.
 
 use crate::routing::{CoverGuard, Routing, SystemRouting};

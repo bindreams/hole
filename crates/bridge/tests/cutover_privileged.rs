@@ -16,7 +16,7 @@
 //! `CARGO_BIN_EXE_test_idle` (a lib unit-test target gets neither).
 //!
 //! Cross-binary serialization of the global WFP/pf/TUN state these touch lives in
-//! `.config/nextest.toml` (`global-net-state` test-group) — skuld's `serial = TUN`
+//! `.config/nextest.toml` (`global_net_state` test-group) — skuld's `serial = TUN`
 //! only serializes within one binary, and this is a third binary alongside the
 //! bridge + tun-engine lib-test binaries.
 //!

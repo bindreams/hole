@@ -11,7 +11,7 @@
 //! connect would fail for the wrong reason.
 //!
 //! Cross-binary serialization of the global WFP/pf/TUN state lives in
-//! `.config/nextest.toml` (`global-net-state` test-group). COUPLED NAMES: that
+//! `.config/nextest.toml` (`global_net_state` test-group). COUPLED NAMES: that
 //! group's filter matches by the `cutover_global_net_state_` prefix -- renaming a
 //! prefix WITHOUT updating the filter drops the test from the group (a silent
 //! cross-binary race). Change both together.
