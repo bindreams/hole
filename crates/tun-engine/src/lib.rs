@@ -37,6 +37,7 @@ fn main() {
 
 pub mod adapter_cleanup;
 pub mod device;
+pub mod dns_confine;
 pub mod engine;
 pub mod error;
 pub mod gateway;
