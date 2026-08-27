@@ -103,7 +103,11 @@ impl HoleRouter {
     /// wrappers; this is the seam tests use to substitute doubles for
     /// `Socks5Endpoint` and `InterfaceEndpoint`, both of which dial real
     /// sockets, and for `LoggingDropSink`, whose only output is a log line.
-    pub fn with_endpoints(
+    ///
+    /// Crate-private: outside the crate, `new` and `with_local_dns` are
+    /// the only ways to build a router, so the three-mechanism wiring
+    /// cannot be sidestepped in a production build.
+    pub(crate) fn with_endpoints(
         proxy: Box<dyn Endpoint>,
         bypass: Box<dyn Endpoint>,
         drops: Box<dyn DropSink>,

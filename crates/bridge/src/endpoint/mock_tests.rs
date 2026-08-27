@@ -35,9 +35,7 @@ async fn a_mock_endpoint_reports_what_it_served() {
 
 #[skuld::test]
 fn mock_capability_flags_are_stable() {
-    // The `Endpoint` doc requires the capability accessors to be pure and
-    // stable for the endpoint's lifetime — the cascade's drop gates read
-    // them once per flow and a varying answer would leak flows past.
+    // Pins the Endpoint::supports_* purity contract (see the trait doc).
     let (endpoint, _served) = MockEndpoint::new("tcp-only", false, true);
     assert!(!endpoint.supports_udp());
     assert!(endpoint.supports_ipv6_dst());

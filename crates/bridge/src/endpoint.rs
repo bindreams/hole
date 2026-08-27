@@ -11,11 +11,11 @@
 //! flow is served by nothing and only recorded, on
 //! [`crate::drop_sink::DropSink`].
 //!
-//! Tests wire any mechanism to any slot through
-//! [`HoleRouter::with_endpoints`](crate::hole_router::HoleRouter::with_endpoints),
-//! substituting `mock::MockEndpoint` for the served slots and
-//! `crate::drop_sink::recording::RecordingDropSink` for the drop slot.
-//! Both are `cfg(test)`, so neither is linked into a production build.
+//! Tests wire any mechanism to any slot through the crate-private
+//! `HoleRouter::with_endpoints`, substituting `mock::MockEndpoint` for
+//! the served slots and `crate::drop_sink::recording::RecordingDropSink`
+//! for the drop slot. Both are `cfg(test)`, so neither is linked into a
+//! production build.
 //!
 //! ## UDP-drop privacy invariant
 //!

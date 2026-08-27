@@ -12,6 +12,11 @@
 //! **to completion**. No real socket is opened, and nothing here needs an
 //! engine, a TUN device or a packet.
 //!
+//! **Only wired slots are asserted on.** An unwired mock's sender dies
+//! with `wire`, so its receiver reports `Disconnected` whatever the router
+//! did — a negative that cannot fail. [`Wired`] therefore holds the
+//! local-dns receiver only when that slot exists.
+//!
 //! **The ordering edge is the completed call.** Each `route_*` reports on
 //! its slot before returning, so an awaited call orders every report
 //! ahead of the reads below. That is what makes the negatives — "the
@@ -61,13 +66,14 @@ fn rules(specs: &[(&str, MatchType, FilterAction)]) -> RuleSet {
     set
 }
 
-/// The router under test plus every double's receiver, so each test reads
-/// all four slots rather than only the one it expects to fire.
+/// The router under test plus every wired double's receiver, so each test
+/// reads all its slots rather than only the one it expects to fire.
 struct Wired {
     router: HoleRouter,
     proxy: UnboundedReceiver<Served>,
     bypass: UnboundedReceiver<Served>,
-    local_dns: UnboundedReceiver<Served>,
+    /// `Some` iff the router was given a local-dns slot.
+    local_dns: Option<UnboundedReceiver<Served>>,
     drops: UnboundedReceiver<Dropped>,
 }
 
@@ -95,12 +101,14 @@ fn wire(slots: Slots, rules: RuleSet) -> Wired {
         None => MockEndpoint::new("proxy", slots.proxy_supports_udp, true),
     };
     let (bypass, bypass_rx) = MockEndpoint::new("bypass", true, slots.bypass_supports_ipv6);
-    // Always built, so a test can assert the local-dns slot received
-    // nothing even when the router was given no local-dns slot at all.
-    let (local_dns, local_dns_rx) = MockEndpoint::new("local-dns", true, true);
     let (drops, drops_rx) = RecordingDropSink::new();
 
-    let local_dns_slot = slots.with_local_dns.then(|| Box::new(local_dns) as Box<dyn Endpoint>);
+    let (local_dns_slot, local_dns_rx) = if slots.with_local_dns {
+        let (local_dns, rx) = MockEndpoint::new("local-dns", true, true);
+        (Some(Box::new(local_dns) as Box<dyn Endpoint>), Some(rx))
+    } else {
+        (None, None)
+    };
     let router = HoleRouter::with_endpoints(
         Box::new(proxy),
         Box::new(bypass),
@@ -119,14 +127,14 @@ fn wire(slots: Slots, rules: RuleSet) -> Wired {
 }
 
 impl Wired {
-    /// Every served-slot channel, in a fixed order, for the "no slot was
-    /// served" assertions.
-    fn endpoint_slots(&mut self) -> [(&'static str, &mut UnboundedReceiver<Served>); 3] {
-        [
-            ("proxy", &mut self.proxy),
-            ("bypass", &mut self.bypass),
-            ("local-dns", &mut self.local_dns),
-        ]
+    /// Every wired served-slot channel, in a fixed order, for the "no slot
+    /// was served" assertions.
+    fn endpoint_slots(&mut self) -> Vec<(&'static str, &mut UnboundedReceiver<Served>)> {
+        let mut slots = vec![("proxy", &mut self.proxy), ("bypass", &mut self.bypass)];
+        if let Some(local_dns) = self.local_dns.as_mut() {
+            slots.push(("local-dns", local_dns));
+        }
+        slots
     }
 
     fn assert_no_slot_served(&mut self) {
@@ -240,7 +248,7 @@ async fn udp_53_is_served_by_the_local_dns_slot() {
 
     w.router.route_udp(meta, flow).await.unwrap();
 
-    assert_eq!(w.local_dns.try_recv(), Ok(Served::Udp(dst)));
+    assert_eq!(w.local_dns.as_mut().unwrap().try_recv(), Ok(Served::Udp(dst)));
     assert!(w.proxy.try_recv().is_err(), "proxy served a diverted DNS flow");
     assert_eq!(w.drained_drops(), vec![]);
 }
@@ -261,7 +269,7 @@ async fn udp_53_without_a_local_dns_slot_follows_the_cascade() {
     w.router.route_udp(meta, flow).await.unwrap();
 
     assert_eq!(w.proxy.try_recv(), Ok(Served::Udp(dst)));
-    assert!(w.local_dns.try_recv().is_err(), "an absent slot served a flow");
+    assert!(w.bypass.try_recv().is_err(), "bypass served a proxied DNS flow");
     assert_eq!(w.drained_drops(), vec![]);
 }
 

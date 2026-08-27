@@ -13,11 +13,17 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use std::sync::Arc;
 
+use garter::tracing_test::set_default_in_current_thread;
+use tracing_subscriber::filter::LevelFilter;
+use tracing_subscriber::fmt;
+use tracing_subscriber::layer::{Layer, SubscriberExt};
+
 use crate::dns::connector::DirectConnector;
 use crate::dns::forwarder::DnsForwarder;
 use crate::drop_sink::LoggingDropSink;
 use crate::endpoint::{InterfaceEndpoint, LocalDnsEndpoint, Socks5Endpoint};
 use crate::filter::rules::RuleSet;
+use crate::test_support::log_capture::VecWriter;
 use hole_common::config::{DnsConfig, DnsProtocol, FilterAction};
 
 fn v4(s: &str, port: u16) -> SocketAddr {
@@ -361,31 +367,71 @@ fn udp_non53_not_intercepted_by_local_dns() {
 }
 
 // LoggingDropSink — rate-limit and one-shot behavior ==================================================================
+//
+// Both limits are observable only as log lines, so both tests capture a
+// subscriber and count. Anything less passes with the limit removed.
+
+/// Collect every event at or above `level`. Bind the guard — it uninstalls
+/// the subscriber on drop, and a `_` binding drops it immediately.
+fn capture(level: LevelFilter) -> (VecWriter, tracing::subscriber::DefaultGuard) {
+    let writer = VecWriter::new();
+    let subscriber = tracing_subscriber::registry().with(
+        fmt::layer()
+            .with_writer(writer.clone())
+            .with_ansi(false)
+            .with_filter(level),
+    );
+    (writer, set_default_in_current_thread(subscriber))
+}
 
 #[skuld::test]
 fn ipv6_bypass_unreachable_warn_is_one_shot() {
-    // Simply smoke-check the one-shot flag — we can call twice and see
-    // the AtomicBool transition, then the subsequent call finds it already
-    // set. Logging is side-effect-free for the test (tracing is not
-    // subscribed).
+    let (log, _guard) = capture(LevelFilter::WARN);
     let drops = LoggingDropSink::new();
-    let dst = v6("2001:db8::1", 443);
-    drops.ipv6_bypass_unreachable(0, dst, "tcp");
-    drops.ipv6_bypass_unreachable(0, dst, "tcp"); // second call — one-shot warn no-ops
+
+    drops.ipv6_bypass_unreachable(0, v6("2001:db8::1", 443), "tcp");
+    // A different (rule_index, dst), so BlockLog's per-flow dedup is not
+    // what holds the second warn back — only the one-shot flag can be.
+    drops.ipv6_bypass_unreachable(1, v6("2001:db8::2", 443), "udp");
+
+    let log = log.snapshot_string();
+    assert_eq!(
+        log.matches("upstream interface has no IPv6 connectivity").count(),
+        1,
+        "the interface-level warn describes the NIC, not a flow, so it fires once:\n{log}"
+    );
 }
 
 #[skuld::test]
 fn logging_drop_sink_rate_limits_rule_block_logs() {
-    // Per-flow dedup: BlockLog's `should_log(rule_index, dst)` suppresses
-    // duplicate calls within its TTL window.
+    // One BlockLog window, keyed on (rule_index, dst), covers all three
+    // reasons — so a repeat of any of them under the same key is silent.
+    let (log, _guard) = capture(LevelFilter::DEBUG);
     let drops = LoggingDropSink::new();
     let dst = v4("1.2.3.4", 80);
-    // First N calls for the same key cost nothing to emit (at most one log
-    // line). This is a smoke check; tracing capture is not wired in the
-    // test harness.
+
     for _ in 0..8 {
         drops.rule_block_tcp(7, dst, Some("example.com"));
     }
     drops.rule_block_udp(7, dst);
     drops.udp_proxy_unavailable(7, dst, Some("v2ray-plugin"));
+    // A different rule index is a different key, so this one still lands.
+    drops.rule_block_udp(8, dst);
+
+    let log = log.snapshot_string();
+    assert_eq!(
+        log.matches("blocked example.com").count(),
+        1,
+        "eight identical blocks, one line:\n{log}"
+    );
+    assert_eq!(
+        log.matches("UDP proxy unavailable").count(),
+        0,
+        "the privacy drop shares rule 7's window:\n{log}"
+    );
+    assert_eq!(
+        log.matches("blocked UDP flow").count(),
+        1,
+        "rule 7 suppressed, rule 8 logged:\n{log}"
+    );
 }
