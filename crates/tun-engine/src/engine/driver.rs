@@ -17,13 +17,14 @@ use smoltcp::time::Instant as SmoltcpInstant;
 use smoltcp::wire::{
     HardwareAddress, IpAddress, IpCidr, IpProtocol, Ipv4Packet, Ipv4Repr, Ipv6Packet, Ipv6Repr, UdpPacket, UdpRepr,
 };
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncReadExt;
 use tokio::sync::{mpsc, Semaphore};
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, trace, warn};
+use tracing::{debug, warn};
 
 use super::config::EngineConfig;
 use super::dns::{self, DnsInterceptor};
+use super::egress::{self, Flush};
 use super::router::{Router, TcpMeta, UdpMeta};
 use super::tcp_flow::TcpFlow;
 use super::udp_flow::{FlowKey, FlowTable, UdpReply};
@@ -184,7 +185,10 @@ impl Driver {
             self.cleanup_finished_connections();
             self.process_udp_replies();
             self.poll_smoltcp();
-            self.flush_to_tun().await;
+            match self.flush_to_tun().await {
+                Flush::Cancelled => break,
+                Flush::Failed(_) | Flush::Drained => {}
+            }
 
             if self.last_sweep.elapsed() >= self.config.idle_sweep_interval {
                 let evicted = self.flow_table.sweep(self.config.udp_flow_idle_timeout);
@@ -473,22 +477,10 @@ impl Driver {
 
     // TUN I/O =========================================================================================================
 
-    async fn flush_to_tun(&mut self) {
-        // smoltcp output (TCP).
-        let packets = self.device.dequeue_tx();
-        for pkt in packets {
-            if let Err(e) = self.tun.write_all(&pkt).await {
-                trace!("TUN write error: {e}");
-                break;
-            }
-        }
-        // UDP replies + DNS intercepts.
-        for pkt in self.pending_tun_writes.drain(..) {
-            if let Err(e) = self.tun.write_all(&pkt).await {
-                trace!("TUN write error (UDP reply): {e}");
-                break;
-            }
-        }
+    async fn flush_to_tun(&mut self) -> Flush {
+        let tx_queue = self.device.dequeue_tx();
+        let replies = std::mem::take(&mut self.pending_tun_writes);
+        egress::flush_all(&mut self.tun, tx_queue, replies, &self.cancel).await
     }
 }
 

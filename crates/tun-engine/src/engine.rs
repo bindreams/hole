@@ -21,6 +21,7 @@
 mod config;
 mod dns;
 mod driver;
+mod egress;
 mod router;
 mod tcp_flow;
 mod udp_flow;
