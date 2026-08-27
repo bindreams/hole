@@ -165,6 +165,13 @@ pub enum ProxyError {
     /// an IPC message reaches a GUI toast verbatim.
     #[error("the network was unblocked, but the kill-switch setting could not be saved")]
     LockdownIntentNotPersisted,
+    /// A pre-existing `hole-tun` adapter does not carry Hole's own adapter
+    /// GUID (bindreams/hole#846) — most often a build of Hole itself that
+    /// crashed before it could tear the adapter down. PII-free by
+    /// construction: `alias` is a network-adapter friendly name, never a
+    /// filesystem path.
+    #[error("{}", tun_engine::DeviceError::ForeignAdapter { alias: alias.clone() })]
+    ForeignAdapter { alias: String },
 }
 
 impl From<&ProxyError> for hole_common::protocol::StartError {
@@ -196,7 +203,8 @@ impl From<&ProxyError> for hole_common::protocol::StartError {
             | ProxyError::TunnelSilent { .. }
             | ProxyError::TunnelSetupIncomplete { .. }
             | ProxyError::NoTunnelConnection { .. }
-            | ProxyError::LockdownIntentNotPersisted => StartError::Failed { message: e.to_string() },
+            | ProxyError::LockdownIntentNotPersisted
+            | ProxyError::ForeignAdapter { .. } => StartError::Failed { message: e.to_string() },
         }
     }
 }
@@ -225,6 +233,7 @@ impl From<tun_engine::DeviceError> for ProxyError {
             tun_engine::DeviceError::WintunLoad { path, message } => ProxyError::WintunLoad { path, message },
             tun_engine::DeviceError::TunOpen(err) => ProxyError::Runtime(err),
             tun_engine::DeviceError::InvalidConfig(msg) => ProxyError::RouteSetup(format!("device config: {msg}")),
+            tun_engine::DeviceError::ForeignAdapter { alias } => ProxyError::ForeignAdapter { alias },
         }
     }
 }

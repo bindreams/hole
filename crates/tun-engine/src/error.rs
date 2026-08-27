@@ -26,6 +26,13 @@ pub enum DeviceError {
     WintunMissing { tried: Vec<PathBuf> },
     #[error("wintun.dll load failed at {}: {message}", .path.display())]
     WintunLoad { path: PathBuf, message: String },
+    /// A pre-existing adapter named `alias` does not carry Hole's own
+    /// adapter GUID — it belongs to something else (most often a build of
+    /// Hole itself that crashed before it could tear the adapter down; see
+    /// `crates/tun-engine/src/device/identity.rs`). PII-free and
+    /// actionable: names no filesystem path, and points at the escape.
+    #[error("an existing '{alias}' adapter does not belong to Hole; run scripts/network-reset.py to remove it")]
+    ForeignAdapter { alias: String },
 }
 
 /// Errors surfaced by the `engine` module.

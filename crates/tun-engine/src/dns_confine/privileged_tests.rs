@@ -39,12 +39,12 @@
 //! (`SKULD_LABELS="tun"`) and fails loud, un-elevated, under the default
 //! unprivileged pass.
 //!
-//! `dns_confine_global_net_state_adapter_reports_back_its_requested_guid` —
-//! the create→read-back ship gate for Task 6's adapter identity — is added
-//! alongside `device::identity`, once that module exists, rather than here:
-//! it tests the adapter GUID mechanism, not the confinement, and belongs in
-//! the same file only because the `dns_confine_global_net_state_` name
-//! prefix is what the nextest group matches on.
+//! `dns_confine_global_net_state_adapter_reports_back_its_requested_guid` at
+//! the bottom of this file is the create→read-back ship gate for the
+//! adapter-GUID identity in `device::identity` — it tests THAT mechanism,
+//! not the confinement, and lives here only because the
+//! `dns_confine_global_net_state_` name prefix is what the nextest group
+//! matches on.
 
 #![cfg(target_os = "windows")]
 
@@ -213,5 +213,38 @@ fn dns_confine_global_net_state_permits_the_server_on_port_53() {
         classify(&result),
         ProbeFate::Delivered,
         "the server IP must stay reachable on port 53 even though it is not the tunnel LUID: {result:?}"
+    );
+}
+
+/// SHIP GATE (Task 6, #846 plan). The vendor header calls the
+/// `RequestedGUID` API "completely undocumented, and so there could be
+/// minor interesting complications with its usage"
+/// (`wintun-bindings-0.7.39/wintun/include/wintun.h:50-53`), and
+/// `wintun-bindings` ships a live GUID-mismatch handler — so this is not a
+/// formality. Creates a real adapter through the PRODUCTION path
+/// (`Device::build`, which requests `HOLE_ADAPTER_GUID`), drops it, then
+/// re-opens by NAME (not by handle) and reads the GUID back via
+/// `probe_incumbent` — the exact ADOPT-path read `Device::build` itself
+/// performs on its next start. If this fails, the ownership gate is
+/// worthless as designed: **stop and raise it, do not weaken this test.**
+#[skuld::test(labels = [TUN], serial = TUN)]
+fn dns_confine_global_net_state_adapter_reports_back_its_requested_guid() {
+    let name = "dns-confine-test-tun-guid";
+    let device = crate::Device::build(|c| {
+        c.tun_name = name.into();
+        c.mtu = 1400;
+        c.ipv4 = Some("10.255.243.1/24".parse().expect("literal"));
+    })
+    .unwrap_or_else(|e| panic!("HARNESS: Device::build({name}) failed: {e}"));
+    drop(device);
+
+    let incumbent = crate::device::identity::probe_incumbent(name, crate::device::identity::HOLE_ADAPTER_GUID)
+        .unwrap_or_else(|e| panic!("HARNESS: probe_incumbent({name}) failed: {e}"));
+
+    assert_eq!(
+        incumbent,
+        crate::device::identity::Incumbent::Ours,
+        "SHIP GATE: a re-opened adapter must report back the GUID Hole requested at create time \
+         (RequestedGUID is vendor-undocumented — do not weaken this assertion, raise it instead)"
     );
 }

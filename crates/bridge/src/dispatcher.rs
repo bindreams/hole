@@ -12,7 +12,7 @@ use std::sync::Arc;
 use tokio::task::{AbortHandle, JoinHandle};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
-use tun_engine::{Device, Engine, MutDeviceConfig};
+use tun_engine::{Device, Engine, MutDeviceConfig, TunIdentity};
 
 use crate::endpoint::{BlockEndpoint, InterfaceEndpoint, LocalDnsEndpoint, Socks5Endpoint};
 use crate::filter::rules::RuleSet;
@@ -28,6 +28,11 @@ pub struct Dispatcher {
     /// aborts via `driver_abort` as a safety net.
     driver_handle: Option<JoinHandle<()>>,
     driver_abort: AbortHandle,
+    /// The identity of the TUN device this dispatcher opened. Captured
+    /// before the device is consumed by `Engine::build`; threaded to
+    /// `Dns::apply` (bindreams/hole#846) so DNS is confined to the adapter
+    /// this process actually opened, never a name lookup.
+    identity: TunIdentity,
 }
 
 impl Dispatcher {
@@ -81,7 +86,7 @@ impl Dispatcher {
         #[cfg(target_os = "windows")]
         {
             use tun_engine::net::metric::{set_interface_metric, Family, MetricOutcome, TUNNEL_INTERFACE_METRIC};
-            let luid = device.tun_luid();
+            let luid = device.identity().luid();
             match set_interface_metric(luid, TUNNEL_INTERFACE_METRIC, Family::V4) {
                 Ok(MetricOutcome::Applied) => {}
                 Ok(MetricOutcome::NoInterfaceRow) => {
@@ -107,6 +112,11 @@ impl Dispatcher {
                 }
             }
         }
+
+        // Captured BEFORE `Engine::build` consumes `device` below — this is
+        // the identity of the concrete OS object this call opened, never a
+        // name lookup (bindreams/hole#846).
+        let identity = device.identity().clone();
 
         // Build the three endpoints and the HoleRouter.
         let proxy_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), local_port);
@@ -145,6 +155,7 @@ impl Dispatcher {
             cancel,
             driver_handle: Some(driver_handle),
             driver_abort,
+            identity,
         })
     }
 
@@ -156,6 +167,13 @@ impl Dispatcher {
     /// Hot-swap the filter rules without restarting the dispatcher.
     pub fn swap_rules(&self, new_rules: RuleSet) {
         self.router.swap_rules(new_rules);
+    }
+
+    /// The identity of the TUN device this dispatcher opened — the LUID and
+    /// alias of the concrete OS object, not a name lookup. See
+    /// `crate::proxy_manager::start_inner`'s Phase 7.
+    pub fn identity(&self) -> &TunIdentity {
+        &self.identity
     }
 
     /// Graceful shutdown. Cancels the driver, waits up to 2s, then aborts
