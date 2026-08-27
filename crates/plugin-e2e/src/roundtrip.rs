@@ -23,6 +23,8 @@ use tokio::sync::oneshot;
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 
+use crate::ports;
+
 const HEAD_REQUEST: &[u8] = b"HEAD / HTTP/1.0\r\nHost: 1.1.1.1\r\nConnection: close\r\n\r\n";
 
 /// Why a tunnel roundtrip did not reach the sentinel. Classified at each failure
@@ -111,11 +113,13 @@ pub async fn run_roundtrip(
 ) -> Roundtrip {
     let started = Instant::now();
 
-    // Local port for the client plugin to listen on. garter's allocator
-    // absorbs Windows WSAEACCES excluded-range probe races.
-    let local = match garter::chain::allocate_ports(1) {
-        Ok(mut v) => v.remove(0),
-        Err(e) => return Roundtrip::ChainFailed(format!("allocate local port: {e}")),
+    // SS_LOCAL: reserved TCP+UDP, not because SS_LOCAL is universally
+    // TCP+UDP, but because this driver is generic over `client_plugin_path`
+    // and its consumer set includes galoshes, whose yamux client binds both
+    // there. Over-reserving UDP for a TCP-only client (e.g. ex-ray) is free.
+    let local = match ports::reserve_ss_local().await {
+        Ok(addr) => addr,
+        Err(e) => return Roundtrip::ChainFailed(format!("reserve SS_LOCAL: {e}")),
     };
 
     // Sanctioned: this crate is outside the bridge cancel chain (clippy.toml
