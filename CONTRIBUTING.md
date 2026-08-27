@@ -851,15 +851,26 @@ Disclosed residuals:
    `hole bridge unlock` would also fail, so the honest escape is the next
    start once BFE answers, which adopts the cover and restores the menu item.
 
-1. A failed repair write at `Unset`/`Live` loses the persisted preference,
-   not the escape. The next start re-derives the same measurement and repairs
-   again; within the current run the adopted-cover claim
-   (`ProxyManager::set_standing_cover_adopted`, recorded by
-   `route_recovery::recover_and_record`) is what keeps `lockdown_enabled`
-   reporting armed. That claim is **not a latch** — it clears wherever a
-   release confirms: a successful `release_all_covers()` in
-   `turn_lockdown_off`, and a `UserStop` teardown that actually dropped a
-   standing cover guard.
+1. An adopted cover records **two** facts, kept in two places. The
+   adopted-cover claim (`ProxyManager::set_standing_cover_adopted`, recorded
+   by `route_recovery::recover_and_record`) says only "a standing cover is
+   live right now and this process has not released it". The armed kill
+   switch is `bridge-lockdown.json`, written by `promote_adopted_claim` the
+   moment a start honours the claim with a real `install_lockdown`. Holding
+   both in the claim is what let an ordinary config edit disarm the switch:
+   `reload`'s slow path is `stop()` then `start()`, the `UserStop` teardown
+   cleared the claim along with the cover, and the next start re-derived
+   `false`. Re-deriving on a later start is not a fallback — once the cover is
+   torn down the measurement reads `Absent` and the decision is `Noop`. A
+   failed repair write at `Unset`/`Live` therefore costs the preference only
+   until the next connect retries it, and never the escape: within the run the
+   claim is what keeps `lockdown_enabled` reporting armed.
+
+   The claim is **not a latch** — it clears wherever a release confirms: a
+   successful `release_all_covers()` in `turn_lockdown_off`, and a `UserStop`
+   teardown that actually dropped a standing cover guard. Only
+   `turn_lockdown_off` clears the persisted arm, so the escape still disarms
+   the switch for good.
 
 1. Startup still mutates global WFP state **unconditionally** via the
    transient cover sweep, which runs outside every presence branch and

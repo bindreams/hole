@@ -252,3 +252,39 @@ fn a_failed_release_keeps_the_adopted_cover_claim() {
         );
     });
 }
+
+#[skuld::test]
+fn unblock_during_a_session_disarms_a_promoted_adopted_switch() {
+    // Rule #0 in the other direction: making the claim durable must not make
+    // the kill switch unreleasable. Turning it off mid-session records the off,
+    // and nothing re-promotes it once the session's cover is dropped.
+    rt().block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        let routing = MockRouting::new(dir.path().to_path_buf());
+        let st = routing.state();
+        let mut pm = ProxyManager::new(MockProxy::new(), routing).with_state_dir(dir.path().to_path_buf());
+        pm.set_standing_cover_adopted(true);
+        pm.start(&test_config()).await.unwrap();
+        assert_eq!(
+            lockdown_state::load_intent(dir.path()),
+            lockdown_state::Intent::On,
+            "setup: honouring the claim made it durable"
+        );
+
+        let outcome = pm.turn_lockdown_off().expect("a running session must not error");
+        assert!(matches!(outcome, LockdownOffOutcome::SessionRunning));
+        pm.stop().await.unwrap();
+
+        assert!(
+            !pm.standing_cover_expected(),
+            "the switch is off, so the next start must install nothing"
+        );
+        pm.start(&test_config()).await.unwrap();
+        assert_eq!(
+            st.lockdown_engage_calls.load(Ordering::SeqCst),
+            1,
+            "no standing cover may come back after the escape"
+        );
+        pm.stop().await.unwrap();
+    });
+}

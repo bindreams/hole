@@ -84,7 +84,10 @@ before editing; the sections linked below are the authoritative source.
   standing one is reconciled by a 20-cell intent x presence table
   (`decide_cover_recovery`) over a MEASURED OS probe, and is swept only on an
   explicit recorded off intent — a missing or unreadable intent file adopts
-  instead, and `Adopt` is inert on both platforms. The escape from a stranded
+  instead, and `Adopt` is inert on both platforms. An adopted cover's ARMED half
+  is promoted into `bridge-lockdown.json` at the first real engage, so a
+  disconnect (`reload`'s slow path is stop + start) cannot disarm the switch;
+  only `turn_lockdown_off` clears it. The escape from a stranded
   cover (`failclosed::release_all`) is unconditional and knows nothing about cover
   state; its only condition is whether a session is running, and turning the
   kill switch off takes the same path. Who holds a cover has exactly one

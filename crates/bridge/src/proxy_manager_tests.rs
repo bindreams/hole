@@ -169,7 +169,7 @@ pub(super) struct MockRoutingState {
     fail_gateway: AtomicBool,
     cover_engage_calls: AtomicU32,
     pub(super) cover_disengage_calls: AtomicU32,
-    lockdown_engage_calls: AtomicU32,
+    pub(super) lockdown_engage_calls: AtomicU32,
     lockdown_disengage_calls: AtomicU32,
     fail_lockdown: AtomicBool,
     fail_cover: AtomicBool,
@@ -4726,12 +4726,9 @@ mod self_test {
     }
 }
 
-// Adopted-cover claim (#881) ==========================================================================================
+// Adopted-cover claim =================================================================================================
 //
-// Startup recovery can find a standing cover live while `bridge-lockdown.json`
-// is missing or unreadable. `set_standing_cover_adopted` carries that measured
-// fact through the run so neither the tray's escape nor the connect path
-// depends on the file.
+// See `ProxyManager::adopted_standing_cover` for the two facts these split.
 
 #[skuld::test]
 fn lockdown_enabled_reports_armed_when_the_intent_file_is_unreadable() {
@@ -4819,7 +4816,7 @@ fn an_adopted_cover_makes_the_connect_path_expect_a_standing_cover() {
 }
 
 #[skuld::test]
-fn a_user_stop_that_dropped_a_standing_cover_clears_the_claim() {
+fn a_user_stop_that_dropped_a_standing_cover_clears_only_the_live_half() {
     rt().block_on(async {
         let dir = tempfile::tempdir().unwrap();
         let routing = MockRouting::new(dir.path().to_path_buf());
@@ -4835,10 +4832,16 @@ fn a_user_stop_that_dropped_a_standing_cover_clears_the_claim() {
             "the user stop opened the host"
         );
         assert!(
-            !pm.lockdown_enabled(),
-            "the claim must clear: reporting Lockdown On over an open host is the Rule #0 failure"
+            !pm.standing_cover_adopted(),
+            "no cover is live any more, so the claim itself must clear"
         );
-        assert!(!pm.standing_cover_expected());
+        assert_eq!(
+            lockdown_state::load_intent(dir.path()),
+            lockdown_state::Intent::On,
+            "but the armed half is durable: only turn_lockdown_off may clear it"
+        );
+        assert!(pm.lockdown_enabled(), "so the tray still reports the switch armed");
+        assert!(pm.standing_cover_expected(), "and the next start re-engages");
     });
 }
 
@@ -4865,5 +4868,97 @@ fn a_cutover_stop_keeps_the_claim() {
             "the cover still holds the host, so the claim stands"
         );
         assert!(pm.standing_cover_expected());
+    });
+}
+
+#[skuld::test]
+fn an_adopted_kill_switch_survives_a_stop_and_start() {
+    // The claim that startup recovery measured is the ONLY record of an armed
+    // kill switch in the Adopt cells that record no intent. If a stop is
+    // allowed to destroy it, the next start re-derives `false` and installs
+    // nothing — a disconnect silently disarms the kill switch.
+    rt().block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        let routing = MockRouting::new(dir.path().to_path_buf());
+        let st = routing.state();
+        let mut pm = ProxyManager::new(MockProxy::new(), routing).with_state_dir(dir.path().to_path_buf());
+        pm.set_standing_cover_adopted(true);
+
+        pm.start(&test_config()).await.unwrap();
+        assert_eq!(st.lockdown_engage_calls.load(Ordering::SeqCst), 1);
+        pm.stop().await.unwrap();
+
+        assert!(
+            pm.standing_cover_expected(),
+            "a stop opens the host but must not disarm the kill switch"
+        );
+        pm.start(&test_config()).await.unwrap();
+        assert_eq!(
+            st.lockdown_engage_calls.load(Ordering::SeqCst),
+            2,
+            "the second start must install the standing cover again"
+        );
+        pm.stop().await.unwrap();
+    });
+}
+
+#[skuld::test]
+fn a_config_edit_does_not_disarm_an_adopted_kill_switch() {
+    // The realistic trigger: `reload`'s slow path is `stop()` then `start()`,
+    // so any structural config edit runs the full teardown. Editing a server
+    // address is not a request to turn the kill switch off.
+    rt().block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        let routing = MockRouting::new(dir.path().to_path_buf());
+        let st = routing.state();
+        let mut pm = ProxyManager::new(MockProxy::new(), routing).with_state_dir(dir.path().to_path_buf());
+        pm.set_standing_cover_adopted(true);
+        pm.start(&test_config()).await.unwrap();
+
+        let mut edited = test_config();
+        edited.server.server = "10.0.0.1".into();
+        pm.reload(&edited).await.unwrap();
+
+        assert_eq!(
+            st.lockdown_engage_calls.load(Ordering::SeqCst),
+            2,
+            "the restarted session must come up under a standing cover"
+        );
+        assert!(pm.lockdown_enabled(), "and the tray must still read armed");
+        pm.stop().await.unwrap();
+    });
+}
+
+#[skuld::test]
+fn an_unexpected_session_death_retires_the_claim_too() {
+    // `check_health` drops the same standing-cover guard `stop_with`'s UserStop
+    // arm does, so it must retire the claim on the same terms. Left set, it
+    // would outlive every cover this process can release.
+    rt().block_on(async {
+        let proxy = MockProxy::new();
+        let proxy_state = proxy.state_handle();
+        let dir = tempfile::tempdir().unwrap();
+        let routing = MockRouting::new(dir.path().to_path_buf());
+        let st = routing.state();
+        let mut pm = ProxyManager::new(proxy, routing).with_state_dir(dir.path().to_path_buf());
+        pm.set_standing_cover_adopted(true);
+        pm.start(&test_config()).await.unwrap();
+
+        proxy_state.crashed.store(true, Ordering::SeqCst);
+        pm.check_health();
+
+        assert_eq!(
+            st.lockdown_disengage_calls.load(Ordering::SeqCst),
+            1,
+            "the teardown dropped the standing cover"
+        );
+        assert!(
+            !pm.standing_cover_adopted(),
+            "so the live-cover half of the claim must go with it"
+        );
+        assert!(
+            pm.lockdown_enabled(),
+            "the armed half is durable, so the tray still offers the escape"
+        );
     });
 }
