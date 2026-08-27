@@ -24,10 +24,11 @@
 //! test binary would fail on both OSes.
 //!
 //! Two of the Full-mode tests prove tunnel *transit* — they dial
-//! [`crate::test_support::net_discovery::UNOWNED_DST`], which nothing but the
-//! in-TUN smoltcp stack can answer. The `_local_networking_intact` pair does
-//! not: it dials an address the host holds, reached over the host's own
-//! on-link `/32`, so the packet never enters `hole-tun`.
+//! [`crate::test_support::net_discovery::UNOWNED_DSTS`], which nothing but the
+//! in-TUN smoltcp stack can answer, once per address family. The
+//! `_local_networking_intact` pair does not: it dials an address the host
+//! holds, reached over the host's own on-link `/32`, so the packet never
+//! enters `hole-tun`.
 //!
 //! None of these are vacuous for the `cfg(not(test))` dispatcher
 //! substitution's sake: `DistHarness` runs `hole bridge run` as a real
@@ -38,13 +39,13 @@ use crate::test_support::dist_fixture::*;
 use crate::test_support::dist_harness::DistHarness;
 use crate::test_support::http_target::HttpTarget;
 use crate::test_support::net_discovery::{
-    assert_host_does_not_own, probe_tcp, ProbeOutcome, CAPTURE_PROBE_BUDGET, DARK_PROBE_BUDGET, UNOWNED_DST,
+    assert_host_does_not_own, block_every_in_tun_flow, probe_tcp, ProbeOutcome, PROBE_BUDGET, UNOWNED_DSTS,
 };
 use crate::test_support::port_alloc::{allocate_ephemeral_port, wait_for_port};
 use crate::test_support::rt;
 use crate::test_support::skuld_fixtures::*;
 use crate::test_support::socks5_client::{http_get_request, http_response_body, socks5_request};
-use hole_common::config::{FilterAction, FilterRule, MatchType, ServerEntry};
+use hole_common::config::ServerEntry;
 use hole_common::protocol::{BridgeRequest, BridgeResponse, ProxyConfig, TunnelMode};
 use plugin_e2e::ssserver::random_password_for;
 use shadowsocks::crypto::CipherKind;
@@ -342,63 +343,57 @@ fn e2e_quic_socks_only_roundtrip(
 
 // Unowned-destination capture =========================================================================================
 
-/// Resolve every in-TUN flow to a drop.
+/// Probe every [`UNOWNED_DSTS`] entry, one blocking connect per address
+/// family, concurrently.
 ///
-/// Load-bearing in any `TunnelMode::Full` test, not decoration. Without it
-/// the in-process ss-server's onward dial to the client's destination leaves
-/// via the same routing table, matches the same `0.0.0.0/1` split, re-enters
-/// `hole-tun`, and is proxied again — a self-limiting burst up to the
-/// engine's `max_connections` ceiling, but 4096 needless sockets on a runner
-/// shared with the serialized WFP tests.
-///
-/// `MatchType::Subnet` matches on the flow's destination IP, so these two
-/// rules cover every flow the router sees.
-///
-/// Side effect worth naming: with `dns.enabled = false` the router has no
-/// `local_dns`, so host UDP/53 falls through the cascade and is dropped
-/// silently. A host process resolving a name during the window hangs for its
-/// own resolver timeout instead of being proxied. That is a bounded drop
-/// replacing a bounded burst, but it is a different failure shape.
-fn block_every_in_tun_flow() -> Vec<FilterRule> {
-    vec![
-        FilterRule {
-            address: "0.0.0.0/0".into(),
-            matching: MatchType::Subnet,
-            action: FilterAction::Block,
-        },
-        FilterRule {
-            address: "::/0".into(),
-            matching: MatchType::Subnet,
-            action: FilterAction::Block,
-        },
-    ]
+/// Concurrent because the families are independent and each probe pays the
+/// full [`PROBE_BUDGET`] when its destination is dark; serialising them would
+/// double that for no signal. `spawn_blocking` because `probe_tcp` is a
+/// blocking connect and must not sit on a runtime worker.
+async fn probe_unowned_destinations() -> Vec<(SocketAddr, ProbeOutcome)> {
+    let probes: Vec<_> = UNOWNED_DSTS
+        .into_iter()
+        .map(|dst| tokio::task::spawn_blocking(move || (dst, probe_tcp(dst))))
+        .collect();
+    let mut outcomes = Vec::with_capacity(probes.len());
+    for probe in probes {
+        outcomes.push(probe.await.expect("probe task"));
+    }
+    outcomes
 }
 
 /// Drive one arm of the capture proof: start a bridge in `mode` and probe
-/// [`UNOWNED_DST`], a destination this host does not hold and nothing routes.
+/// [`UNOWNED_DSTS`], destinations this host does not hold and nothing routes.
 ///
-/// Under `TunnelMode::Full` the bridge's `0.0.0.0/1` split captures the SYN
-/// and the engine's smoltcp stack answers it — `set_any_ip(true)` makes it
-/// answer for an arbitrary destination — so a connect that gets *any* answer
-/// is proof the packet crossed `hole-tun`. Under `SocksOnly` no routes are
-/// installed and the destination stays dark.
+/// Under `TunnelMode::Full` the covering half of the bridge's `/1` split pair
+/// captures the SYN — `128.0.0.0/1` for TEST-NET-3, `::/1` for the IPv6
+/// destination — and the engine's smoltcp stack answers it, `set_any_ip(true)`
+/// making it answer for an arbitrary destination, so a connect that gets *any*
+/// answer is proof the packet crossed `hole-tun`. Under `SocksOnly` no routes
+/// are installed and the destinations stay dark.
 ///
 /// Both arms come from this one function on purpose: they cannot drift, and a
-/// change that breaks capture flips exactly one of them.
+/// change that breaks capture flips exactly one of them. Every probe here —
+/// precondition, capture and teardown alike — uses the one [`PROBE_BUDGET`],
+/// so the two arms observe over the same window; see that constant for what
+/// asymmetric budgets cost.
 ///
 /// Takes no `HttpTarget` — there is no listener to reach, and taking one would
 /// invite a reader to think there is. This proves capture-and-answer at the
 /// device, not payload delivery to a far side; the latter needs a second host.
 async fn run_unowned_destination_e2e(dist: &Path, ss: &SsServerHandle, mode: TunnelMode) {
-    assert_host_does_not_own(UNOWNED_DST.ip());
+    for dst in UNOWNED_DSTS {
+        assert_host_does_not_own(dst.ip());
+    }
 
-    let before = probe_tcp(UNOWNED_DST, DARK_PROBE_BUDGET);
-    assert_eq!(
-        before,
-        ProbeOutcome::NoAnswer,
-        "ENVIRONMENT problem (not the bridge): {UNOWNED_DST} must be dark before Start. \
-         Something on this host or network answers TEST-NET-3, which voids the oracle."
-    );
+    for (dst, before) in probe_unowned_destinations().await {
+        assert_eq!(
+            before,
+            ProbeOutcome::NoAnswer,
+            "ENVIRONMENT problem (not the bridge): {dst} must be dark before Start, got {before:?}. \
+             Something on this host or network answers documentation address space, which voids the oracle."
+        );
+    }
 
     let local_port = allocate_ephemeral_port(Protocols::TCP | Protocols::UDP).await;
     let config = ProxyConfig {
@@ -448,54 +443,55 @@ async fn run_unowned_destination_e2e(dist: &Path, ss: &SsServerHandle, mode: Tun
         "the catch-all Block rules must compile, got {invalid_filters:?}"
     );
 
-    match mode {
-        TunnelMode::Full => {
-            let outcome = probe_tcp(UNOWNED_DST, CAPTURE_PROBE_BUDGET);
-            assert!(
+    for (dst, outcome) in probe_unowned_destinations().await {
+        match mode {
+            TunnelMode::Full => assert!(
                 matches!(
                     outcome,
                     ProbeOutcome::Answered | ProbeOutcome::Refused | ProbeOutcome::Reset
                 ),
-                "Full mode must capture {UNOWNED_DST} and answer its SYN from inside hole-tun, got {outcome:?}. \
-                 Either the split routes no longer capture the flow (a real regression), or the runner is starved \
-                 and the handshake did not complete within {CAPTURE_PROBE_BUDGET:?}."
-            );
-        }
-        TunnelMode::SocksOnly => {
-            let outcome = probe_tcp(UNOWNED_DST, DARK_PROBE_BUDGET);
-            assert_eq!(
+                "Full mode must capture {dst} and answer its SYN from inside hole-tun, got {outcome:?}. \
+                 Either the split routes no longer capture the flow (a real regression), or the host had no \
+                 source address for this family to send into hole-tun (`fd00::ff00:1/64` reaches smoltcp's \
+                 address list only — nothing assigns an IPv6 address to the adapter), or the runner is starved \
+                 and the handshake did not complete within {PROBE_BUDGET:?}."
+            ),
+            TunnelMode::SocksOnly => assert_eq!(
                 outcome,
                 ProbeOutcome::NoAnswer,
-                "SocksOnly installs no routes, so {UNOWNED_DST} must stay dark, got {outcome:?}. \
+                "SocksOnly installs no routes, so {dst} must stay dark, got {outcome:?}. \
                  An answer here means something other than this bridge captured the SYN — a concurrently \
-                 running Full-mode test, or a host/network that answers TEST-NET-3."
-            );
+                 running Full-mode test, or a host/network that answers documentation address space."
+            ),
         }
     }
 
     let resp = harness.send(BridgeRequest::Stop).await.expect("send Stop");
     assert!(matches!(resp, BridgeResponse::Ack), "expected Ack, got {resp:?}");
 
-    let after = probe_tcp(UNOWNED_DST, DARK_PROBE_BUDGET);
-    assert_eq!(
-        after,
-        ProbeOutcome::NoAnswer,
-        "{UNOWNED_DST} must be dark again after Stop; a leftover answer means the split routes survived teardown"
-    );
+    for (dst, after) in probe_unowned_destinations().await {
+        assert_eq!(
+            after,
+            ProbeOutcome::NoAnswer,
+            "{dst} must be dark again after Stop, got {after:?}; a leftover answer means the split routes \
+             survived teardown"
+        );
+    }
 }
 
 /// The falsifier for the two capture tests, run unprivileged on every lane
-/// they never reach: the same helper, the same probe, the same constant, with
+/// they never reach: the same helper, the same probes, the same budget, with
 /// only `tunnel_mode` changed. `SocksOnly` installs no routes, so the
-/// destination must stay dark.
+/// destinations must stay dark.
 ///
 /// `serial = TUN` without `labels = [TUN]` is deliberate. The capture tests
-/// install host-wide splits that make `UNOWNED_DST` answer for every process
+/// install host-wide splits that make [`UNOWNED_DSTS`] answer for every process
 /// on the box; run concurrently, this test would observe those routes and
-/// report "the environment answers TEST-NET-3" — the most expensive possible
-/// misdiagnosis. skuld evaluates `serial` independently of selection, so this
-/// stays unlabelled for filtering (it runs on the unprivileged `!tun` lane)
-/// while being mutually excluded from every `TUN` test in the binary.
+/// report "the environment answers documentation address space" — the most
+/// expensive possible misdiagnosis. skuld evaluates `serial` independently of
+/// selection, so this stays unlabelled for filtering (it runs on the
+/// unprivileged `!tun` lane) while being mutually excluded from every `TUN`
+/// test in the binary.
 #[skuld::test(labels = [DIST_BIN], serial = TUN)]
 fn e2e_socks_only_leaves_unowned_destination_unreachable(
     #[fixture(dist_dir)] dist: &Path,
@@ -509,8 +505,13 @@ fn e2e_socks_only_leaves_unowned_destination_unreachable(
 /// COUPLED NAMES: every test in here must be named `e2e_…full_tunnel…`.
 /// `.config/nextest.toml`'s `global-net-state` filter selects them by that
 /// shape — skuld gives libtest the bare function name, so there is no module
-/// path to anchor on. A member that drops the shape silently leaves the group
-/// and races the tun-engine WFP tests on global OS state.
+/// path to anchor on.
+///
+/// What the group buys is nextest's cross-binary thread budget, not mutual
+/// exclusion: what keeps these off the tun-engine WFP tests is `serial = TUN`
+/// on every member, which skuld enforces through a workspace-shared DB.
+/// Dropping the name shape loses the thread budget; dropping `serial = TUN` is
+/// what races global OS state, and `max-threads = 1` will not save it.
 #[cfg(target_os = "windows")]
 mod tun {
     use super::*;
@@ -537,11 +538,11 @@ mod tun {
     /// still reachable, with the sentinel body coming back over that path.
     ///
     /// Not transit coverage. The host holds that address and reaches it over
-    /// its own on-link `/32`, which beats the bridge's `0.0.0.0/1` split on
-    /// longest-prefix match, so the packet never reaches `hole-tun` — which is
-    /// also why the catch-all Block rules below cannot fire on it, and why no
-    /// companion `Bypass` rule is added (a rule that can never match would only
-    /// mislead). For transit see
+    /// its own on-link `/32`, which beats whichever half of the bridge's `/1`
+    /// split pair covers it on longest-prefix match, so the packet never
+    /// reaches `hole-tun` — which is also why the catch-all Block rules below
+    /// cannot fire on it, and why no companion `Bypass` rule is added (a rule
+    /// that can never match would only mislead). For transit see
     /// [`e2e_none_full_tunnel_captures_unowned_destination`].
     async fn run_full_tunnel_local_networking_e2e(dist: &Path, ss: &SsServerHandle, http: &HttpTarget) {
         let local_port = allocate_ephemeral_port(Protocols::TCP | Protocols::UDP).await;
@@ -623,8 +624,8 @@ mod tun {
     }
 
     /// Full mode, no plugin: a SYN to a destination this host does not hold
-    /// and nothing routes is captured by the split routes and answered from
-    /// inside `hole-tun`. Requires Windows admin.
+    /// and nothing routes — one per address family — is captured by the split
+    /// routes and answered from inside `hole-tun`. Requires Windows admin.
     ///
     /// Falsified from the other side by
     /// [`super::e2e_socks_only_leaves_unowned_destination_unreachable`],
@@ -639,11 +640,8 @@ mod tun {
 
     /// The same capture proof with a galoshes (websocket) chain configured.
     ///
-    /// This runs after its `_none_` sibling, and that ordering is why the
-    /// bridge must never bypass a loopback server: the sibling's
-    /// loopback-bound server would leave a `127.0.0.1/32 → gateway` route
-    /// behind, hijacking all loopback and black-holing this test's
-    /// galoshes-server readiness self-probe.
+    /// This runs after its `_none_` sibling, for the same loopback-bypass
+    /// reason documented on `e2e_ws_full_tunnel_local_networking_intact`.
     #[skuld::test(labels = [DIST_BIN, PORT_ALLOC, TUN], serial = TUN)]
     fn e2e_ws_full_tunnel_captures_unowned_destination(
         #[fixture(dist_dir)] dist: &Path,

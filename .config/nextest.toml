@@ -24,13 +24,17 @@ nextest-version = "0.9.130"
 # lockstep with the filter:
 #   - `^e2e_…full_tunnel…` — EVERY test in either of the bridge's two `mod tun`
 #     blocks. Both set `TunnelMode::Full` and install real split routes, and
-#     every member must carry this naming shape or it silently leaves the group:
+#     every member must carry this naming shape or it silently leaves the group
+#     and loses the thread budget (mutual exclusion comes from `serial = TUN`
+#     on every member, not from group membership):
 #     crates/bridge/src/proxy_manager_e2e_tests.rs (4: the `_captures_
 #       unowned_destination` pair and the `_local_networking_intact` pair)
 #     crates/bridge/src/proxy_manager_listener_e2e_tests.rs (1:
 #       e2e_full_tunnel_local_udp_intact)
 #     The `^e2e_` anchor is what keeps the unlabelled in-process unit test
-#     `forward_gives_every_resolver_the_full_tunnel_bound` out of the group.
+#     `forward_gives_every_resolver_the_full_tunnel_bound`
+#     (crates/bridge/src/dns/forwarder_tests.rs — same binary, name carries
+#     `full_tunnel`, no `e2e_` prefix) out of the group.
 #   - `windows_lockdown_permits_server_ip_` / `macos_lockdown_permits_server_ip_`:
 #     crates/tun-engine/src/routing/failclosed/lockdown_privileged_tests.rs
 #   - `failclosed_permits_` (transient block-until-connected cover real engage):
@@ -47,8 +51,9 @@ nextest-version = "0.9.130"
 #     crates/bridge/tests/cutover_nic_capture_privileged.rs (Windows pktmon NIC
 #       wire-capture no-UDP-leak proof)
 # Renaming any of them WITHOUT updating this filter silently drops it from the
-# group → cross-binary data race. Verify with `cargo nextest show-config
-# test-groups`. Add any new real-engage/real-TUN test (and its substring) here.
+# group → the whole Windows TUN lane runs at nextest's normal thread budget
+# again. Verify with `cargo nextest show-config test-groups`. Add any new
+# real-engage/real-TUN test (and its substring) here.
 [test-groups.global-net-state]
 max-threads = 1
 

@@ -332,17 +332,22 @@ fn e2e_start_rejects_full_mode_without_socks5(
 //
 // What it does not prove: in-TUN UDP transit. The datagram goes to the echo
 // server's primary non-loopback IPv4 — an address the host holds — so the
-// kernel's on-link `/32` beats the `0.0.0.0/1` split and it is delivered
-// locally to a `0.0.0.0`-bound socket. `Socks5Endpoint::serve_udp` is never
-// invoked.
+// kernel's on-link `/32` beats whichever half of the `/1` split pair covers it
+// and it is delivered locally to a `0.0.0.0`-bound socket.
+// `Socks5Endpoint::serve_udp` is never invoked.
 //
 // There is no single-host oracle for the transit version: UDP has no
 // handshake, so nothing in the TUN answers; the catch-all Block that makes
 // the TCP oracle safe would drop the flow outright; and letting it reach the
 // proxy re-enters via the ss-server without the `conn_semaphore` ceiling that
 // bounds the TCP case. The TCP transit proof lives in
-// `proxy_manager_e2e_tests.rs::tun::e2e_*_full_tunnel_captures_unowned_destination`;
-// a UDP equivalent is carried as follow-up work, not closed here.
+// `proxy_manager_e2e_tests.rs::tun::e2e_*_full_tunnel_captures_unowned_destination`.
+//
+// OPEN GAP, tracked as a follow-up to #880, not closed by this test: in-TUN
+// UDP transit has no coverage anywhere in this suite. Building the oracle
+// needs something that answers a datagram from inside the TUN, which the TCP
+// oracle gets for free from the handshake. Do not read this test as covering
+// it, and do not delete this note without landing that oracle.
 //
 // Gated to Windows for the same reason as the existing `mod tun` in
 // `proxy_manager_e2e_tests.rs`: `TunnelMode::Full` needs elevation, and
@@ -353,12 +358,14 @@ fn e2e_start_rejects_full_mode_without_socks5(
 /// COUPLED NAME: this test must stay named `e2e_…full_tunnel…` so
 /// `.config/nextest.toml`'s `global-net-state` filter keeps selecting it —
 /// skuld gives libtest the bare function name, so there is no module path to
-/// anchor on. See the note on `proxy_manager_e2e_tests.rs`'s `mod tun`.
+/// anchor on. That selection buys nextest's cross-binary thread budget; what
+/// keeps this test off the tun-engine WFP tests is its `serial = TUN`. See the
+/// note on `proxy_manager_e2e_tests.rs`'s `mod tun`.
 #[cfg(target_os = "windows")]
 mod tun {
     use super::*;
+    use crate::test_support::net_discovery::block_every_in_tun_flow;
     use crate::test_support::udp_echo::UdpEchoServer;
-    use hole_common::config::{FilterAction, FilterRule, MatchType};
     use tokio::net::UdpSocket;
 
     #[skuld::test(labels = [DIST_BIN, TUN], serial = TUN)]
@@ -372,25 +379,10 @@ mod tun {
             let http_port = allocate_ephemeral_port(Protocols::TCP).await;
             let mut config = base_config(ss, socks_port, http_port);
             config.tunnel_mode = TunnelMode::Full;
-            // Resolve every in-TUN flow to a drop, for the reason spelled out
-            // on `proxy_manager_e2e_tests.rs`'s `block_every_in_tun_flow`: the
-            // ss-server's onward dial would otherwise re-enter the TUN and
-            // burst to the engine's connection ceiling. The echo round trip is
-            // unaffected — that datagram never reaches the router. Host UDP/53
-            // is now dropped silently for the window instead of proxied, so a
-            // host process resolving a name hangs for its own resolver timeout.
-            config.filters = vec![
-                FilterRule {
-                    address: "0.0.0.0/0".into(),
-                    matching: MatchType::Subnet,
-                    action: FilterAction::Block,
-                },
-                FilterRule {
-                    address: "::/0".into(),
-                    matching: MatchType::Subnet,
-                    action: FilterAction::Block,
-                },
-            ];
+            // See `block_every_in_tun_flow` for why (re-entry burst) and the
+            // UDP/53 caveat. The echo round trip is unaffected: that datagram
+            // never reaches the router.
+            config.filters = block_every_in_tun_flow();
 
             let mut harness = DistHarness::spawn(dist).await.expect("spawn DistHarness");
             start_expect_ack(&mut harness, config).await;
