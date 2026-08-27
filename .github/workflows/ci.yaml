@@ -371,11 +371,12 @@ jobs:
         shell: bash
         run: cargo xtask build hole-tests
 
-      # A typo'd or renamed SKULD_LABELS value can select zero tests from one
-      # package while the other nine still contribute some, so the whole step
-      # stays green — see bindreams/hole#891. This verifies the "!tun"/"tun"
-      # step pair below actually partitions every compiled-in test between
-      # them, before either one runs.
+      # A SKULD_LABELS value that stops matching anything leaves its step a
+      # silent no-op: the complementary one absorbs the whole suite and both
+      # stay green. This asserts, before either runs, that the "!tun"/"tun"
+      # pair below parses as exact complements and that each side still
+      # selects at least one compiled-in test. Per-package contribution is
+      # NOT checked — see `xtask::skuld_label_coverage` for why it can't be.
       - name: Verify SKULD_LABELS TUN/non-TUN partition
         shell: bash
         run: cargo xtask verify-skuld-label-coverage --job test-hole

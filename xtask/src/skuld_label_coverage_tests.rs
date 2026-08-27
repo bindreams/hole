@@ -1,11 +1,12 @@
-//! Unit tests for the skuld-label conservation guard (bindreams/hole#891):
-//! [`extract_lane_candidates`], [`pick_complementary_pair`],
-//! [`matching_test_names`], and [`stranded_tests`].
+//! Unit tests for the skuld-label lane guard: [`extract_lane_candidates`],
+//! [`pick_complementary_pair`], [`matching_test_names`], [`selects_nothing`],
+//! and [`stranded_tests`].
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::skuld_label_coverage::{
-    extract_lane_candidates, matching_test_names, pick_complementary_pair, stranded_tests, LaneCandidate,
+    extract_lane_candidates, matching_test_names, pick_complementary_pair, selects_nothing, stranded_tests,
+    LaneCandidate,
 };
 
 fn set(items: &[&str]) -> BTreeSet<String> {
@@ -84,6 +85,46 @@ jobs:
     assert_eq!(macos_tun.list_command, expected_list_command);
 }
 
+/// The archive lanes invoke `cargo-nextest nextest run --archive-file ...`,
+/// which has no `cargo` token at all — the launcher prefix must be found by
+/// the `nextest run` pair, not by anchoring on a hardcoded program name.
+#[skuld::test]
+fn recognizes_the_archive_lane_invocation_shape() {
+    let ci = r#"
+jobs:
+  test-garter:
+    steps:
+      - name: Run tests
+        env:
+          SKULD_LABELS: "!tun"
+        run: |
+          mkdir -p target/debug
+          cargo-nextest nextest run \
+            --archive-file ci-artifacts/tests.tar.zst \
+            --workspace-remap "/w" \
+            -E 'package(garter) + package(garter-bin)'
+"#;
+    let candidates = extract_lane_candidates(ci, "test-garter").expect("extract");
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(candidates[0].packages, set(&["garter", "garter-bin"]));
+    assert_eq!(
+        candidates[0].list_command,
+        argv(&[
+            "cargo-nextest",
+            "nextest",
+            "list",
+            "--message-format",
+            "json",
+            "--archive-file",
+            "ci-artifacts/tests.tar.zst",
+            "--workspace-remap",
+            "/w",
+            "-E",
+            "package(garter) + package(garter-bin)",
+        ])
+    );
+}
+
 #[skuld::test]
 fn ignores_non_nextest_and_no_run_steps() {
     let ci = r#"
@@ -133,7 +174,8 @@ fn pairs_exact_negations_over_the_same_packages() {
 }
 
 /// Windows and macOS TUN steps both declare `SKULD_LABELS: "tun"` over the
-/// same packages — the duplicate must not register as a second pair.
+/// same packages — the duplicate must not register as a second pair. Only a
+/// fully identical duplicate collapses; divergence is the case below.
 #[skuld::test]
 fn duplicate_on_candidates_collapse_before_pairing() {
     let off = candidate("!tun", &["a"], &["list off"]);
@@ -146,12 +188,67 @@ fn duplicate_on_candidates_collapse_before_pairing() {
     assert_eq!(*found_on, on_windows);
 }
 
+/// Only the first of a collapsed group is ever listed. Two steps agreeing on
+/// label value and packages but differing in features (ci.yaml's TUN steps
+/// have diverged that way before) must therefore be rejected, not silently
+/// reduced to one — reporting success for a lane half of which was checked is
+/// this guard's own failure mode.
+#[skuld::test]
+fn duplicates_that_would_list_different_commands_are_an_error() {
+    let off = candidate("!tun", &["a"], &["list", "off"]);
+    let on_windows = candidate("tun", &["a"], &["list", "on", "--features", "x"]);
+    let on_macos = candidate("tun", &["a"], &["list", "on"]);
+    let err = pick_complementary_pair(&[off, on_windows, on_macos]).expect_err("should error");
+    assert!(err.to_string().contains("would list different commands"), "{err}");
+}
+
 #[skuld::test]
 fn values_that_are_not_exact_negations_are_an_error() {
     let a = candidate("tun", &["a"], &["list a"]);
     let b = candidate("other", &["a"], &["list b"]);
     let err = pick_complementary_pair(&[a, b]).expect_err("should error");
     assert!(err.to_string().contains("not exact negations"), "{err}");
+}
+
+/// skuld binds `!` tighter than `|`, so `"!tun | slow"` is `(!tun) | slow`,
+/// NOT the negation of `"tun | slow"` — a test carrying both labels would be
+/// selected by both steps. Textual `"!" + on` comparison accepts this pair;
+/// comparing parsed filters rejects it.
+#[skuld::test]
+fn a_compound_pair_that_only_looks_negated_is_an_error() {
+    let a = candidate("tun | slow", &["a"], &["list a"]);
+    let b = candidate("!tun | slow", &["a"], &["list b"]);
+    let err = pick_complementary_pair(&[a, b]).expect_err("should error");
+    assert!(err.to_string().contains("not exact negations"), "{err}");
+}
+
+/// The correctly-parenthesized compound pair does pair, and orients on the
+/// `!`-leading side.
+#[skuld::test]
+fn a_parenthesized_compound_negation_pairs() {
+    let on = candidate("tun | slow", &["a"], &["list on"]);
+    let off = candidate("!(tun | slow)", &["a"], &["list off"]);
+    let candidates = vec![on.clone(), off.clone()];
+    let (found_off, found_on) = pick_complementary_pair(&candidates).expect("pair");
+    assert_eq!(*found_off, off);
+    assert_eq!(*found_on, on);
+}
+
+#[skuld::test]
+fn an_unparseable_label_value_is_an_error() {
+    let a = candidate("tun &", &["a"], &["list a"]);
+    let b = candidate("!tun", &["a"], &["list b"]);
+    let err = pick_complementary_pair(&[a, b]).expect_err("should error");
+    assert!(err.to_string().contains("not a valid label filter"), "{err}");
+}
+
+/// Reachable via `--job`: a job whose steps include no `cargo nextest run`
+/// with both `SKULD_LABELS` and packages yields an empty candidate list, which
+/// must say so rather than report "0 different package sets".
+#[skuld::test]
+fn no_candidates_is_a_clear_error() {
+    let err = pick_complementary_pair(&[]).expect_err("should error");
+    assert!(err.to_string().contains("no label partition to check"), "{err}");
 }
 
 /// A negation over a DIFFERENT package set must not pair — that would compare
@@ -164,12 +261,9 @@ fn negation_over_different_packages_does_not_pair() {
     assert!(err.to_string().contains("different package sets"), "{err}");
 }
 
-/// The scenario this guard exists to catch at the extraction layer: the
-/// Windows and macOS TUN steps both declare `SKULD_LABELS` over the same
-/// packages, but only one of them drifted (typo'd `"tun"` to `"tnu"`). A
-/// search for *some* matching `"!X"`/`"X"` pair would find the still-correct
-/// macOS candidate and silently ignore the Windows one — this must instead
-/// reject the whole group: a third, unpaired value is itself the bug.
+/// Only one of the two TUN steps drifted (typo'd `"tun"` to `"tnu"`). The
+/// still-correct one must not stand in for it: a third, unpaired value over
+/// the same packages is itself the bug.
 #[skuld::test]
 fn a_third_unpaired_value_for_the_same_package_set_is_an_error() {
     let off = candidate("!tun", &["a"], &["list off"]);
@@ -242,15 +336,34 @@ fn non_matching_status_is_excluded() {
     assert_eq!(parsed["pkg"], names(&["kept"]));
 }
 
-// ===== stranded_tests ================================================================================================
+// ===== selects_nothing ===============================================================================================
 
 fn binmap(entries: &[(&str, &[&str])]) -> BTreeMap<String, BTreeSet<String>> {
     entries.iter().map(|(k, v)| (k.to_string(), names(v))).collect()
 }
 
-/// The common, EXPECTED shape for most `test-hole` packages: zero `tun`
-/// tests, all of them landing in the non-TUN side. Requirement #2 — must NOT
-/// be flagged.
+/// The drift signature: a typo'd or renamed value that still forms a valid
+/// complement but matches nothing, so every binary lists zero tests under it.
+#[skuld::test]
+fn a_side_selecting_no_test_in_any_binary_selects_nothing() {
+    assert!(selects_nothing(&BTreeMap::new()));
+    assert!(selects_nothing(&binmap(&[("hole", &[]), ("tun-engine", &[])])));
+}
+
+/// One test in one binary out of many is enough — most packages legitimately
+/// contribute nothing to the `tun` side.
+#[skuld::test]
+fn one_selected_test_anywhere_is_not_nothing() {
+    assert!(!selects_nothing(&binmap(&[
+        ("hole", &[]),
+        ("tun-engine", &["windows_lockdown_ok"])
+    ])));
+}
+
+// ===== stranded_tests ================================================================================================
+
+/// The expected shape for most `test-hole` packages: zero `tun` tests, all of
+/// them landing on the non-TUN side.
 #[skuld::test]
 fn fully_conserved_by_the_off_side_alone_is_not_stranded() {
     let baseline = binmap(&[("dump", &["a", "b", "c"])]);

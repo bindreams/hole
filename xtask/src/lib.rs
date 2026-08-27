@@ -322,8 +322,8 @@ pub enum Command {
     /// publish name and the download name cannot drift.
     AssetSuffix,
     /// Verify that a ci.yaml job's complementary `SKULD_LABELS` step pair
-    /// (`"!tun"` / `"tun"`) together select every test compiled into their
-    /// shared package set — see `xtask::skuld_label_coverage` (bindreams/hole#891).
+    /// (`"!tun"` / `"tun"`) parses as exact complements and that each side
+    /// still selects something — see `xtask::skuld_label_coverage`.
     VerifySkuldLabelCoverage {
         /// ci.yaml job id to check (its steps must include exactly one
         /// complementary `SKULD_LABELS` pair).

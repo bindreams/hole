@@ -1,45 +1,54 @@
-//! Guards against a `SKULD_LABELS` value in `.github/workflows/ci.yaml` going
-//! stale (bindreams/hole#891).
+//! Guards `.github/workflows/ci.yaml`'s complementary `SKULD_LABELS` step
+//! pair against going stale (bindreams/hole#891).
 //!
-//! `test-hole`'s TUN lane runs two complementary `cargo nextest run` steps —
-//! one with `SKULD_LABELS: "!tun"`, one with `SKULD_LABELS: "tun"` — over the
-//! same package set. skuld drops label-filtered-out tests *before* libtest
-//! ever sees them (`collect_inventory_tests` in skuld itself), so a test
-//! excluded from both steps produces no signal anywhere: no `filtered out`
-//! count (skuld already removed it), and nextest only refuses a *whole run*
-//! that selects zero tests — with ten packages named, one package (or one
-//! test) silently contributing nothing to a step stays invisible.
+//! `test-hole` splits ten packages across two `cargo nextest run` steps —
+//! `SKULD_LABELS: "!tun"`, then `SKULD_LABELS: "tun"` last for #200 — and
+//! skuld drops label-filtered-out tests before libtest ever sees them. A value
+//! that selects nothing therefore produces no signal: no `filtered out` count,
+//! and nextest only refuses a run selecting zero tests *in total*, which the
+//! other nine packages hide.
 //!
-//! There is no way to tell, from a single step in isolation, whether a
-//! package's zero count under one label is a bug or by design — most of the
-//! ten `test-hole` packages never carry the `tun` label at all, and that is
-//! correct (platform gating also legitimately zeroes out privileged tests on
-//! platforms where they are `#[cfg]`'d away entirely). The one thing that
-//! *is* structurally checkable, independent of any hardcoded list: `"!tun"`
-//! and `"tun"` are exact logical complements, so every test compiled into a
-//! binary must be selected by exactly one of the two steps. A test selected
-//! by *neither* fell through — the two ci.yaml values stopped being real
-//! complements of each other (a typo in one, or a rename applied to only
-//! one), which is exactly the failure mode described above. A test that
-//! belongs to neither the TUN nor the non-TUN world doesn't exist; if it's
-//! compiled in, it's one or the other.
+//! [`verify`] asserts three properties. Two are static, read out of ci.yaml
+//! itself (via `extract_lane_candidates`) so this guard cannot drift from
+//! the steps it checks:
 //!
-//! [`verify`] computes that conservation check per binary and fails loudly on
-//! any shortfall: it lists (via three `cargo nextest list
-//! --message-format json` calls — SKULD_LABELS unset, `!tun`, `tun`) the
-//! tests each step would actually select, and asserts the two label-filtered
-//! sets union back to the unfiltered baseline. The label values and package
-//! set are read from ci.yaml itself (via [`extract_lane_candidates`]), not
-//! duplicated here, so the guard cannot itself drift from the steps it
-//! checks.
+//! - the job's nextest-run steps agree on one package set and declare exactly
+//!   two `SKULD_LABELS` values over it, which **parse** to exact logical
+//!   complements. Parsed, not textual: skuld binds `!` tighter than `&`/`|`,
+//!   so comparing `off` against `"!"` + `on` accepts `"tun | slow"` /
+//!   `"!tun | slow"` — and a test carrying both labels then runs in *both*
+//!   steps, the #200 ordering hazard the split exists to prevent.
+//! - duplicate steps declaring the same lane (Windows and macOS both run
+//!   `"tun"`) must be identical, since only one of them is listed.
+//!
+//! The third runs against the compiled binaries and is what catches a label
+//! renamed on one side of the ci.yaml/source boundary only: **each side must
+//! still select at least one compiled-in test**. `"!tnu"` / `"tnu"` is a
+//! perfectly good complement that matches nothing at all — an absent terminal
+//! evaluates to `false`, so `"!tnu"` absorbs the whole suite and the
+//! privileged lane runs nothing.
+//!
+//! `stranded_tests` additionally asserts nothing compiled in is selected by
+//! neither side. Given a parsed complement that is implied — it cross-checks
+//! skuld's runtime filter evaluation against the parse, and is not itself a
+//! drift detector.
+//!
+//! Not checked: which *packages* contribute. Most of the ten carry no `tun`
+//! test, and platform gating zeroes out the rest (on darwin every
+//! `tun`-labelled test in `hole-bridge`'s lib binary is
+//! `cfg(target_os = "windows")`), so "this package contributed nothing" is
+//! indistinguishable from correct. Pinning which ones must contribute needs a
+//! hardcoded list — the thing reading ci.yaml exists to avoid — and could not
+//! catch a rename anyway, since the scan for the label moves along with it.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::process::Command;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use indexmap::IndexMap;
 use serde::Deserialize;
+use skuld::LabelFilter;
 
 use crate::ci_coverage::{is_nextest_run, join_line_continuations, package_tokens, split_commands, unquote};
 
@@ -174,19 +183,35 @@ fn shell_tokenize(s: &str) -> Vec<String> {
     out
 }
 
-/// Rewrite a `cargo nextest run ...` command into the argv for the equivalent
-/// `cargo nextest list --message-format json ...`, dropping any launcher
-/// prefix (`sudo`, `env`, bare `VAR=value` tokens) before the `cargo` token —
-/// listing tests takes no root and needs none of that.
+/// A launcher-prefix token: `sudo`, `env`, or an inline `VAR=value`. Anything
+/// else immediately before `nextest` is the program that runs it.
+fn is_launcher_token(tok: &str) -> bool {
+    tok == "sudo" || tok == "env" || tok.contains('=')
+}
+
+/// Rewrite a nextest-run command into the argv for the equivalent `nextest
+/// list --message-format json`, dropping any launcher prefix (`sudo`, `env`,
+/// bare `VAR=value` tokens) — listing tests takes no root and needs none of
+/// that.
+///
+/// Anchors on the same `nextest`,`run` token pair [`is_nextest_run`] matches,
+/// so both launcher shapes in ci.yaml survive: `cargo nextest run`, and the
+/// archive lanes' `cargo-nextest nextest run --archive-file ...`, which has no
+/// `cargo` token at all. The program is whatever token precedes `nextest`,
+/// unless that is itself a launcher token — then nextest is invoked directly.
 fn to_list_command(cmd: &str) -> Result<Vec<String>> {
     let toks = shell_tokenize(cmd);
-    let cargo_idx = toks
-        .iter()
-        .position(|t| t == "cargo")
-        .with_context(|| format!("nextest run command has no `cargo` token: {cmd:?}"))?;
+    let nextest_idx = toks
+        .windows(2)
+        .position(|w| w[0] == "nextest" && w[1] == "run")
+        .with_context(|| format!("command has no `nextest run` token pair: {cmd:?}"))?;
+    let start = match nextest_idx.checked_sub(1) {
+        Some(prev) if !is_launcher_token(&toks[prev]) => prev,
+        _ => nextest_idx,
+    };
 
     let mut out: Vec<String> = Vec::new();
-    let mut i = cargo_idx;
+    let mut i = start;
     while i < toks.len() {
         if toks[i] == "nextest" && toks.get(i + 1).map(String::as_str) == Some("run") {
             out.extend(["nextest", "list", "--message-format", "json"].map(String::from));
@@ -203,25 +228,39 @@ fn to_list_command(cmd: &str) -> Result<Vec<String>> {
 
 /// Find `job_id`'s complementary `SKULD_LABELS` pair: exactly one package set
 /// shared by all its nextest-run steps, and exactly two distinct label values
-/// over it, one the exact negation of the other (`"!tun"` / `"tun"`).
+/// over it that parse to exact logical complements.
 ///
-/// Grouping by package set first — rather than searching for any matching
-/// `"!X"`/`"X"` pair among all candidates — matters: the real ci.yaml has
-/// *two* steps declaring `"tun"` (Windows and macOS TUN), both over the same
-/// packages. If only one of them drifted (say the Windows step typo'd to
-/// `"tnu"`), a search that just looks for *some* matching pair would find the
-/// macOS step's still-correct `"tun"` and silently report success — the
-/// Windows step's own drift would never surface. Requiring *exactly two*
-/// distinct values for the one package set catches that: a third, unpaired
-/// value in the same group is the error, not a candidate to skip past.
+/// Grouping by package set first — rather than searching for any complementary
+/// pair among all candidates — matters: the real ci.yaml has *two* steps
+/// declaring `"tun"` (Windows and macOS TUN), both over the same packages. If
+/// only one of them drifted (say the Windows step typo'd to `"tnu"`), a search
+/// for *some* complementary pair would find the macOS step's still-correct
+/// `"tun"` and silently report success. Requiring *exactly two* distinct
+/// values for the one package set catches that: a third, unpaired value in the
+/// same group is the error, not a candidate to skip past.
+///
+/// The returned order is presentational: skuld's canonical filter form has no
+/// inherent polarity, so the `!`-leading side is reported first.
 pub(crate) fn pick_complementary_pair(candidates: &[LaneCandidate]) -> Result<(&LaneCandidate, &LaneCandidate)> {
+    // Collapse steps declaring the same lane. Ones that agree on label value
+    // and packages but would list different commands are rejected, not
+    // silently collapsed: only the first is ever listed, so the rest would go
+    // unchecked — this guard's own failure mode, one level up.
     let mut distinct: Vec<&LaneCandidate> = Vec::new();
     for c in candidates {
-        if !distinct
+        match distinct
             .iter()
-            .any(|d| d.label_value == c.label_value && d.packages == c.packages)
+            .find(|d| d.label_value == c.label_value && d.packages == c.packages)
         {
-            distinct.push(c);
+            Some(prev) if **prev != *c => bail!(
+                "two nextest-run steps run SKULD_LABELS={:?} over the same packages but would list \
+                 different commands, so checking one leaves the other unverified:\n  {:?}\n  {:?}",
+                c.label_value,
+                prev.list_command,
+                c.list_command
+            ),
+            Some(_) => {}
+            None => distinct.push(c),
         }
     }
 
@@ -234,6 +273,10 @@ pub(crate) fn pick_complementary_pair(candidates: &[LaneCandidate]) -> Result<(&
     }
 
     let group = match groups.len() {
+        0 => bail!(
+            "the job has no `cargo nextest run` step that both sets SKULD_LABELS and selects \
+             packages, so there is no label partition to check"
+        ),
         1 => groups.remove(0).1,
         n => bail!(
             "the job's nextest-run steps declare {n} different package sets, expected exactly one \
@@ -242,7 +285,7 @@ pub(crate) fn pick_complementary_pair(candidates: &[LaneCandidate]) -> Result<(&
         ),
     };
 
-    let (off, on) = match group.len() {
+    let (a, b) = match group.len() {
         2 => (group[0], group[1]),
         n => bail!(
             "the shared package set has {n} distinct SKULD_LABELS values among its nextest-run \
@@ -251,18 +294,26 @@ pub(crate) fn pick_complementary_pair(candidates: &[LaneCandidate]) -> Result<(&
         ),
     };
 
-    if off.label_value == format!("!{}", on.label_value) {
-        Ok((off, on))
-    } else if on.label_value == format!("!{}", off.label_value) {
-        Ok((on, off))
-    } else {
+    if parse_filter(&a.label_value)? != !parse_filter(&b.label_value)? {
         bail!(
             "the shared package set's two SKULD_LABELS values, {:?} and {:?}, are not exact \
              negations of each other",
-            off.label_value,
-            on.label_value
-        )
+            a.label_value,
+            b.label_value
+        );
     }
+
+    if b.label_value.starts_with('!') {
+        Ok((b, a))
+    } else {
+        Ok((a, b))
+    }
+}
+
+/// Parse a `SKULD_LABELS` value with skuld's own parser, so comparisons run on
+/// the canonical (BDD-normalized) form rather than the source text.
+fn parse_filter(value: &str) -> Result<LabelFilter> {
+    LabelFilter::parse(value).map_err(|e| anyhow!("SKULD_LABELS={value:?} is not a valid label filter: {e}"))
 }
 
 // `cargo nextest list --message-format json` parsing ==================================================================
@@ -313,7 +364,14 @@ pub(crate) fn matching_test_names(list_json: &str) -> Result<BTreeMap<String, BT
         .collect())
 }
 
-// Conservation check ==================================================================================================
+// Selection checks ====================================================================================================
+
+/// Whether one side of the pair selected no test at all, in any binary — the
+/// drift signature: a still-complementary pair whose values name nothing the
+/// source declares, so the other side absorbs the whole suite.
+pub(crate) fn selects_nothing(side: &BTreeMap<String, BTreeSet<String>>) -> bool {
+    side.values().all(BTreeSet::is_empty)
+}
 
 /// Per test binary, the tests `baseline` (SKULD_LABELS unset — every
 /// compiled-in test) lists that neither `off` nor `on` selects. Empty when
@@ -377,9 +435,10 @@ fn run_nextest_list(
     matching_test_names(&String::from_utf8_lossy(&output.stdout))
 }
 
-/// Run the guard for `job_id`'s TUN lane: read ci.yaml, find the
+/// Run the guard for `job_id`'s label lane: read ci.yaml, find the
 /// complementary `SKULD_LABELS` step pair, list each side plus an unfiltered
-/// baseline, and fail if any compiled-in test is selected by neither side.
+/// baseline, and fail if either side selects nothing or any compiled-in test
+/// is selected by neither.
 pub fn verify(repo_root: &Path, job_id: &str) -> Result<()> {
     let ci_yaml = std::fs::read_to_string(repo_root.join(".github/workflows/ci.yaml")).context("read ci.yaml")?;
     let candidates = extract_lane_candidates(&ci_yaml, job_id)?;
@@ -389,27 +448,40 @@ pub fn verify(repo_root: &Path, job_id: &str) -> Result<()> {
     let off_names = run_nextest_list(repo_root, &off.list_command, Some(&off.label_value))?;
     let on_names = run_nextest_list(repo_root, &on.list_command, Some(&on.label_value))?;
 
-    let stranded = stranded_tests(&baseline, &off_names, &on_names);
-    if stranded.is_empty() {
-        println!(
-            "xtask: skuld label partition OK for job {job_id:?} — every compiled test in {:?} is \
-             selected by SKULD_LABELS={:?} or SKULD_LABELS={:?}",
-            off.packages, off.label_value, on.label_value
-        );
-        return Ok(());
-    }
-
-    let mut msg = format!(
-        "SKULD_LABELS={:?} and SKULD_LABELS={:?} together select NEITHER of these tests, even though \
-         they are compiled into the binary for job {job_id:?} — the two ci.yaml SKULD_LABELS values \
-         have drifted apart (a typo in one, or a rename applied to only one):\n",
-        off.label_value, on.label_value
-    );
-    for (binary_id, names) in &stranded {
-        msg.push_str(&format!("  {binary_id}:\n"));
-        for name in names {
-            msg.push_str(&format!("    {name}\n"));
+    for (value, side) in [(&off.label_value, &off_names), (&on.label_value, &on_names)] {
+        if selects_nothing(side) {
+            bail!(
+                "SKULD_LABELS={value:?} selects NO test compiled into job {job_id:?}'s packages \
+                 {:?}, so that step is a no-op and the other one absorbs the entire suite. The two \
+                 values are still exact complements, so this is a value that no longer names \
+                 anything the source declares — a label renamed or typo'd on one side of the \
+                 ci.yaml/source boundary only, or its tests moved out of the package set.",
+                off.packages
+            );
         }
     }
-    bail!(msg)
+
+    let stranded = stranded_tests(&baseline, &off_names, &on_names);
+    if !stranded.is_empty() {
+        let mut msg = format!(
+            "SKULD_LABELS={:?} and SKULD_LABELS={:?} together select NEITHER of these tests, even \
+             though they are compiled into the binary for job {job_id:?} — skuld's runtime filter \
+             evaluation disagrees with parsing the two values as exact complements:\n",
+            off.label_value, on.label_value
+        );
+        for (binary_id, names) in &stranded {
+            msg.push_str(&format!("  {binary_id}:\n"));
+            for name in names {
+                msg.push_str(&format!("    {name}\n"));
+            }
+        }
+        bail!(msg);
+    }
+
+    println!(
+        "xtask: skuld label partition OK for job {job_id:?} — SKULD_LABELS={:?} and \
+         SKULD_LABELS={:?} each select some test in {:?}, and between them every compiled test",
+        off.label_value, on.label_value, off.packages
+    );
+    Ok(())
 }
