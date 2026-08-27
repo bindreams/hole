@@ -43,6 +43,10 @@ nextest-version = "0.9.130"
 #     never run beside each other):
 #     crates/tun-engine/src/routing/failclosed/live_tun_permit_privileged_tests.rs
 #     crates/bridge/src/proxy_manager_live_tun_permit_e2e_tests.rs
+#   - `dns_confine_global_net_state_` prefix (#846 — real wintun devices + a
+#     real, process-scoped WFP DNS-egress confinement, reusing the
+#     `routing::failclosed::TUN` serial token; see that module's doc):
+#     crates/tun-engine/src/dns_confine/privileged_tests.rs
 #   - `e2e_socks5_udp_associate_roundtrip` (pre-existing, made reachable by
 #     #874): `labels = [DIST_BIN, TUN], serial = TUN` in
 #     crates/bridge/src/proxy_manager_listener_e2e_tests.rs, but it lives in a
@@ -61,5 +65,5 @@ nextest-version = "0.9.130"
 max-threads = 1
 
 [[profile.default.overrides]]
-filter = 'test(/_full_tunnel_roundtrip$/) + test(/windows_lockdown_permits_server_ip_/) + test(/macos_lockdown_permits_server_ip_/) + test(/failclosed_permits_/) + test(/release_all_/) + test(/cutover_global_net_state_/) + test(/live_tun_permit_/) + test(/e2e_socks5_udp_associate_roundtrip/)'
+filter = 'test(/_full_tunnel_roundtrip$/) + test(/windows_lockdown_permits_server_ip_/) + test(/macos_lockdown_permits_server_ip_/) + test(/failclosed_permits_/) + test(/release_all_/) + test(/cutover_global_net_state_/) + test(/live_tun_permit_/) + test(/e2e_socks5_udp_associate_roundtrip/) + test(/dns_confine_global_net_state_/)'
 test-group = 'global-net-state'

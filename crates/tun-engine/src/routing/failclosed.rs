@@ -270,6 +270,15 @@ mod facade_tests;
 #[path = "failclosed/lockdown_privileged_tests.rs"]
 mod lockdown_privileged_tests;
 
+// Re-exported crate-wide (not just within this module's subtree) so #846's
+// `dns_confine::privileged_tests` — a sibling module outside this file's own
+// subtree — can reuse the SAME serial token instead of minting a second
+// `#[skuld::label] const TUN`, which would race the cover tests this module
+// declares. See `lockdown_privileged_tests`'s doc for why a second
+// declaration is wrong.
+#[cfg(test)]
+pub(crate) use lockdown_privileged_tests::TUN;
+
 // Privileged-lane real-firewall proof that `release_all` really clears both
 // cover kinds and never a clean host's live ruleset. Gated identically to
 // `lockdown_privileged_tests` above — see that module's doc.

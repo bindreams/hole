@@ -47,8 +47,13 @@
 
 use super::*;
 
+// `pub(crate)` (not `pub(super)`): #846's `dns_confine::privileged_tests` — a
+// sibling module outside this file's own subtree — reuses this exact token
+// (via `routing::failclosed::TUN`, re-exported below) rather than minting a
+// second `#[skuld::label] const TUN`, which would race the cover tests this
+// label excludes.
 #[skuld::label]
-pub(super) const TUN: skuld::Label;
+pub(crate) const TUN: skuld::Label;
 
 // Two routable anycast hosts on :443 (the runner has outbound internet). IP
 // literals only — the cover blocks DNS, so a hostname connect would fail for the
