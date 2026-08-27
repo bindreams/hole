@@ -17,7 +17,7 @@ use smoltcp::time::Instant as SmoltcpInstant;
 use smoltcp::wire::{
     HardwareAddress, IpAddress, IpCidr, IpProtocol, Ipv4Packet, Ipv4Repr, Ipv6Packet, Ipv6Repr, UdpPacket, UdpRepr,
 };
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{mpsc, Semaphore};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, trace, warn};
@@ -50,8 +50,13 @@ struct TcpListener {
     port: u16,
 }
 
-pub(crate) struct Driver {
-    tun: tun::AsyncDevice,
+/// `T` is the packet I/O — `tun::AsyncDevice` by default. A test drives the
+/// same accept/dispatch/reply logic over `sim::SimTun`, an in-memory pipe,
+/// since opening a real TUN needs elevation. See
+/// [`Engine::from_io`](super::Engine::from_io) for the framing contract `T`
+/// must uphold.
+pub(crate) struct Driver<T = tun::AsyncDevice> {
+    tun: T,
     device: VirtualTunDevice,
     iface: Interface,
     sockets: SocketSet<'static>,
@@ -79,9 +84,9 @@ pub(crate) struct Driver {
     last_sweep: StdInstant,
 }
 
-impl Driver {
+impl<T: AsyncRead + AsyncWrite + Unpin> Driver<T> {
     pub(crate) fn new(
-        tun: tun::AsyncDevice,
+        tun: T,
         device_config: DeviceConfig,
         router: Arc<dyn Router>,
         config: Arc<EngineConfig>,
