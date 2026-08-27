@@ -33,6 +33,11 @@ pub static ROUTING_SUBPROCESS_SPAWN_COUNT: AtomicU32 = AtomicU32::new(0);
 /// that unbinds IPv6), and a host with no IPv6 stack emits no IPv6 traffic to
 /// leak. Where IPv6 IS reachable every command is fatal, because there a
 /// missing `::/1` route is exactly the #901 leak.
+///
+/// Non-fatal means *issued and tolerated*, never omitted:
+/// [`GatewayInfo::ipv6_available`] is also false for a working IPv6 stack with
+/// no upstream route, where these adds succeed and blackhole IPv6 inside the
+/// TUN. Dropping them would push that traffic out the physical NIC instead.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SetupCommand {
     /// Program plus arguments.

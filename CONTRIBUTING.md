@@ -258,7 +258,11 @@ whose IPv6 stack is unbound from the adapter (`DisabledComponents`, or an EDR
 policy that unbinds IPv6 from new adapters) `netsh interface ipv6 add route ::/1`
 cannot succeed, and such a host emits no IPv6 traffic to leak — aborting there
 would lose the whole tunnel and avoid nothing. Everything else, and every command
-when IPv6 *is* reachable, stays fatal. `Routing::install` takes the whole
+when IPv6 *is* reachable, stays fatal. The two commands are still *issued*, only
+their failure tolerated: `probe_ipv6` also reports false for a working IPv6 stack
+with no upstream route, and there the adds succeed and blackhole IPv6 inside the
+TUN — omitting them would push that traffic out the physical NIC instead.
+`Routing::install` takes the whole
 `GatewayInfo` rather than destructured fields, because destructuring it at the
 call site is how `ipv6_available` got dropped on this path to begin with.
 
@@ -267,10 +271,11 @@ exercises `setup_routes` against a real elevated `netsh`/`route` under an
 already-installed route, so it is not measured whether a healthy install can
 legitimately exit non-zero. One path could produce it: `SystemRoutes::drop`
 clears the state file even when teardown failed, and `recover_routes` only
-deletes split routes under that file's guard, so a leftover route can outlive its
-record. Measuring it would change nothing — tolerating an "already exists" exit
-code is the exists-tolerance heuristic #899/#910 forbids, and the fatal exit
-surfaces the stranded route to the user instead of tunnelling around it.
+deletes split routes under that file's guard, so a stale route can outlive its
+record. If that ever bites, the fix is upstream — make the pre-install split
+sweep unconditional — never tolerating an "already exists" exit code here, which
+is the exists-tolerance heuristic #899/#910 forbids. Until then a hard start
+failure surfaces the stranded route instead of routing around it.
 
 `RouteCommandError`'s `Display` is PII-free by construction (program name,
 position in the phase, exit code): it reaches a GUI toast verbatim through
