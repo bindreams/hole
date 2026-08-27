@@ -11,12 +11,16 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use super::{planned_routes, RouteId};
+
 // Types ===============================================================================================================
 
 /// Schema version for [`RouteState`]. Bump when the struct changes in a
-/// backwards-incompatible way; [`load`] rejects mismatched versions to force
-/// a fresh run rather than corrupt recovery.
-pub const SCHEMA_VERSION: u32 = 1;
+/// backwards-incompatible way, and give [`load`] an arm that migrates the old
+/// shape. Discarding an old file instead is not an option here: the file is
+/// the only record of what a crashed run leaked, so dropping it strands the
+/// host on routes pointing at a dead TUN.
+pub const SCHEMA_VERSION: u32 = 2;
 
 /// Filename of the persisted state file under `state_dir`. Exported so
 /// external tooling (notably `scripts/network-reset.py`) can reference the
@@ -34,6 +38,43 @@ pub struct RouteState {
     pub tun_name: String,
     pub server_ip: IpAddr,
     pub interface_name: String,
+    /// The routes that run got into the table. Recovery deletes these and
+    /// nothing else — see [`RouteId`] for why nothing about the delete command
+    /// itself can express "only if it is ours".
+    pub installed: Vec<RouteId>,
+}
+
+/// Schema 1: no `installed` field. Its teardown deleted every route an install
+/// for `server_ip` would have created, whether or not that install succeeded.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RouteStateV1 {
+    version: u32,
+    tun_name: String,
+    server_ip: IpAddr,
+    interface_name: String,
+}
+
+impl From<RouteStateV1> for RouteState {
+    /// Reproduce v1's delete set exactly. A v1 file is written by a bridge
+    /// that has already crashed, so its leak is whatever that run planned;
+    /// assuming the full set cleans up at least as much as the old code did.
+    fn from(old: RouteStateV1) -> Self {
+        debug_assert_eq!(old.version, 1, "only load's version-1 arm may build this");
+        Self {
+            version: SCHEMA_VERSION,
+            tun_name: old.tun_name,
+            installed: planned_routes(old.server_ip),
+            server_ip: old.server_ip,
+            interface_name: old.interface_name,
+        }
+    }
+}
+
+/// Reads only the discriminant, tolerating fields from any schema.
+#[derive(Deserialize)]
+struct VersionProbe {
+    version: u32,
 }
 
 fn state_file(state_dir: &Path) -> PathBuf {
@@ -67,9 +108,10 @@ pub fn save(state_dir: &Path, state: &RouteState, owner: Option<(u32, u32)>) -> 
     Ok(())
 }
 
-/// Load the state file. Returns `None` for any error — missing file,
-/// corrupted JSON, unknown fields, version mismatch — and logs at `warn`
-/// level. Crash recovery is best-effort and should never fail the caller.
+/// Load the state file, migrating a schema-1 file forward. Returns `None` for
+/// any error — missing file, corrupted JSON, unknown fields, a version with no
+/// migration — and logs at `warn` level. Crash recovery is best-effort and
+/// should never fail the caller.
 pub fn load(state_dir: &Path) -> Option<RouteState> {
     let path = state_file(state_dir);
     let bytes = match std::fs::read(&path) {
@@ -80,16 +122,28 @@ pub fn load(state_dir: &Path) -> Option<RouteState> {
             return None;
         }
     };
-    match serde_json::from_slice::<RouteState>(&bytes) {
-        Ok(state) if state.version == SCHEMA_VERSION => Some(state),
-        Ok(other) => {
-            tracing::warn!(
-                got = other.version,
-                want = SCHEMA_VERSION,
-                "route-state schema mismatch, discarding"
-            );
-            None
+    let version = match serde_json::from_slice::<VersionProbe>(&bytes) {
+        Ok(probe) => probe.version,
+        Err(e) => {
+            tracing::warn!(error = %e, path = %path.display(), "route-state parse failed");
+            return None;
         }
+    };
+    let parsed = if version == SCHEMA_VERSION {
+        serde_json::from_slice::<RouteState>(&bytes)
+    } else if version == 1 {
+        tracing::info!(got = version, want = SCHEMA_VERSION, "migrating route-state forward");
+        serde_json::from_slice::<RouteStateV1>(&bytes).map(RouteState::from)
+    } else {
+        tracing::warn!(
+            got = version,
+            want = SCHEMA_VERSION,
+            "route-state schema mismatch, discarding"
+        );
+        return None;
+    };
+    match parsed {
+        Ok(state) => Some(state),
         Err(e) => {
             tracing::warn!(error = %e, path = %path.display(), "route-state parse failed");
             None

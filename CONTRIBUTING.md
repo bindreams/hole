@@ -224,6 +224,45 @@ tables** (Hyper-V/WSL/Docker reservations); an OS-picked port for one transport
 may be reserved for the other. There is no "right" budget — a saturated runner
 needs many retries, a healthy machine one. See #285, #300, #304.
 
+### Route ownership
+
+Teardown and crash recovery delete **only** the routes the run recorded in
+`bridge-routes.json`'s `installed` list — the `RouteId`s whose `route add` /
+`netsh add route` exited zero. Nothing about the delete command itself can
+express "only if it is ours":
+
+- macOS `route delete` resolves its victim from the destination key and netmask
+  alone. xnu's `rtrequest_common_locked` reaches `RTM_DELETE` via
+  `rnh_deladdr(dst, netmask)` (`in_deleteroute` → `rn_delete`) and never reads
+  the gateway, so `-interface <name>` — which `route(8)` turns into an
+  `AF_LINK` gateway, `case K_IFACE` in `network_cmds/route.tproj/route.c` —
+  scopes nothing. Worse, with that flag set and a name that no longer resolves,
+  `getaddr` exits before `rtmsg()` writes to the routing socket, so the delete
+  never happens at all.
+- `-ifscope` is the real scoping flag and is equally unusable: a route carrying
+  `RTF_IFSCOPE` is skipped by unscoped lookups (xnu `rt_lookup_common` searches
+  the unscoped table first and retries only under the *primary* interface's
+  scope), so scoping the install would leave the tunnel capturing nothing.
+- Reading the table back first — `route get` then `route delete` — is
+  check-then-act: it only narrows the window in which the other route is
+  destroyed.
+
+Provenance is the one handle that outlives the interface, which matters because
+the utun is always already gone by teardown: `RunningState` closes the TUN at
+step 1 and drops the routes guard at step 4, and a crashed run's utun died with
+its control-socket fd.
+
+The consequence a co-resident VPN cares about: if another VPN already holds
+`0.0.0.0/1` when Hole starts, Hole's `route add` fails, the route is never
+recorded, and Hole's Stop leaves it alone. **Residual:** a VPN that takes
+the prefix over *mid-session* — necessarily by deleting Hole's entry first — is
+still torn down by Hole's Stop. macOS exposes no compare-and-delete, so closing
+that needs a different mechanism (a routing socket that acts and then repairs
+from `RTM_DELETE`'s reply), not a different flag.
+
+`scripts/network-reset.py` deliberately does not honour the record: it is the
+unconditional escape hatch, in the same spirit as `failclosed::release_all`.
+
 ### Crash recovery
 
 While a proxy is active the bridge persists small state files in `<state_dir>/`,
@@ -231,10 +270,13 @@ cleared on clean shutdown and replayed on next startup (all *after* the IPC
 socket binds; DNS recovery runs before route recovery so a mid-recovery crash
 leaves working DNS + broken routes, not the inverse):
 
-- **`bridge-routes.json`** — TUN name, server IP, upstream interface;
-  `routing::recover_routes` tears down leaked routes. The same call also sweeps a
-  stale [fail-closed cover](#fail-closed-cover) (Windows by fixed WFP GUID,
-  macOS via `bridge-failclosed.json`).
+- **`bridge-routes.json`** — TUN name, server IP, upstream interface, and the
+  `installed` list of [`RouteId`](crates/tun-engine/src/routing.rs)s;
+  `routing::recover_routes` tears down leaked routes. Teardown and recovery
+  delete **only** the routes in `installed` — see
+  [Route ownership](#route-ownership). The same call also sweeps a stale
+  [fail-closed cover](#fail-closed-cover) (Windows by fixed WFP GUID, macOS via
+  `bridge-failclosed.json`).
 - **`bridge-failclosed.json`** (macOS only) — the `pfctl -E` enable token of an
   engaged fail-closed cover; `routing::failclosed::recover_cover` restores
   `/etc/pf.conf` and drops the refcount. Windows keys its cover by fixed WFP

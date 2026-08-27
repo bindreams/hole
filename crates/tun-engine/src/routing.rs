@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU32, Ordering};
 
+use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
 use crate::error::RoutingError;
@@ -19,6 +20,84 @@ use crate::gateway::{get_default_gateway_info, GatewayInfo};
 /// invariant. The one-instruction `fetch_add` has negligible production
 /// cost — far below the millisecond-scale subprocess itself.
 pub static ROUTING_SUBPROCESS_SPAWN_COUNT: AtomicU32 = AtomicU32::new(0);
+
+// Route identity ======================================================================================================
+
+/// One of the routes an install creates. Recorded in [`state::RouteState`] so
+/// teardown and crash recovery delete only the routes this run actually
+/// installed.
+///
+/// This record is the only handle macOS leaves us. `route delete` picks its
+/// victim from the destination key and netmask alone — xnu's
+/// `rtrequest_common_locked` reaches `RTM_DELETE` via
+/// `rnh_deladdr(dst, netmask)`, and never reads the gateway — so an
+/// unqualified `route delete -net 0.0.0.0/1` removes whichever route holds
+/// that prefix right now, another VPN's included. The one key discriminator,
+/// `-ifscope`, cannot be used: a route carrying `RTF_IFSCOPE` is invisible to
+/// unbound traffic (xnu's `rt_lookup_common` searches the unscoped table
+/// first and only ever retries under the *primary* interface's scope), so
+/// scoping the install would leave the tunnel capturing nothing. Provenance
+/// also outlives the interface, which neither `-interface <name>` nor
+/// `-ifscope <name>` does: both resolve the name in `route(8)`, which exits
+/// before writing to the routing socket once the utun is gone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RouteId {
+    /// `0.0.0.0/1` via the TUN — first half of IPv4 space.
+    SplitV4Low,
+    /// `128.0.0.0/1` via the TUN — second half of IPv4 space.
+    SplitV4High,
+    /// `::/1` via the TUN — first half of IPv6 space.
+    SplitV6Low,
+    /// `8000::/1` via the TUN — second half of IPv6 space.
+    SplitV6High,
+    /// Host route reaching the proxy server outside the tunnel.
+    ServerBypass,
+}
+
+/// The four fixed split routes, in install order.
+pub const SPLIT_ROUTES: [RouteId; 4] = [
+    RouteId::SplitV4Low,
+    RouteId::SplitV4High,
+    RouteId::SplitV6Low,
+    RouteId::SplitV6High,
+];
+
+/// The routes an install for `server_ip` attempts, in command order. The
+/// server bypass is omitted for a loopback server — see
+/// [`build_setup_commands`].
+pub fn planned_routes(server_ip: IpAddr) -> Vec<RouteId> {
+    let mut ids = SPLIT_ROUTES.to_vec();
+    if !server_ip.to_canonical().is_loopback() {
+        ids.push(RouteId::ServerBypass);
+    }
+    ids
+}
+
+/// A route command tagged with the route it acts on, so a setup command's
+/// exit status can be recorded against the teardown command that undoes it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RouteCommand {
+    pub id: RouteId,
+    pub argv: Vec<String>,
+}
+
+impl RouteCommand {
+    fn new(id: RouteId, argv: Vec<String>) -> Self {
+        Self { id, argv }
+    }
+}
+
+/// Drop the commands for routes absent from `installed` and hand back bare
+/// argv. Deleting a route this run did not install is never cleanup: the
+/// routing table holds one entry per key, so if the entry is not ours, ours
+/// is already gone and the delete can only remove someone else's.
+fn retain_installed(cmds: Vec<RouteCommand>, installed: &[RouteId]) -> Vec<Vec<String>> {
+    cmds.into_iter()
+        .filter(|c| installed.contains(&c.id))
+        .map(|c| c.argv)
+        .collect()
+}
 
 // Command builders ====================================================================================================
 
@@ -45,13 +124,48 @@ pub fn build_setup_commands(
     server_ip: IpAddr,
     original_gateway: IpAddr,
     interface_name: &str,
-) -> Vec<Vec<String>> {
-    platform_setup_commands(tun_name, server_ip, original_gateway, interface_name)
+) -> Vec<RouteCommand> {
+    let cmds = platform_setup_commands(tun_name, server_ip, original_gateway, interface_name);
+    debug_assert_eq!(
+        cmds.iter().map(|c| c.id).collect::<Vec<_>>(),
+        planned_routes(server_ip),
+        "setup commands must match planned_routes — the state file records the latter before the former runs"
+    );
+    cmds
 }
 
-/// Build the shell commands to tear down split routing (IPv4 + IPv6 splits and server bypass).
-pub fn build_teardown_commands(tun_name: &str, server_ip: IpAddr, interface_name: &str) -> Vec<Vec<String>> {
-    platform_teardown_commands(tun_name, server_ip, interface_name)
+/// Build the shell commands to tear down split routing (IPv4 + IPv6 splits and
+/// server bypass), for the subset of routes `installed` says this run created.
+pub fn build_teardown_commands(
+    tun_name: &str,
+    server_ip: IpAddr,
+    interface_name: &str,
+    installed: &[RouteId],
+) -> Vec<Vec<String>> {
+    let mut cmds = platform_split_teardown_commands(tun_name);
+    cmds.extend(platform_bypass_teardown_command(server_ip, interface_name));
+    retain_installed(cmds, installed)
+}
+
+/// The split-route half of [`build_teardown_commands`] — crash recovery runs
+/// it separately from the bypass so the two get distinct phase tags.
+pub(crate) fn build_split_route_teardown_commands(tun_name: &str, installed: &[RouteId]) -> Vec<Vec<String>> {
+    retain_installed(platform_split_teardown_commands(tun_name), installed)
+}
+
+/// The server-bypass half of [`build_teardown_commands`]. Empty when the
+/// bypass was never installed (loopback server, or the install failed).
+pub(crate) fn build_bypass_teardown_commands(
+    server_ip: IpAddr,
+    interface_name: &str,
+    installed: &[RouteId],
+) -> Vec<Vec<String>> {
+    retain_installed(
+        platform_bypass_teardown_command(server_ip, interface_name)
+            .into_iter()
+            .collect(),
+        installed,
+    )
 }
 
 // Execution ===========================================================================================================
@@ -73,24 +187,32 @@ pub(crate) const PHASE_RECOVER_COVER: &str = "recover-cover";
 pub(crate) const PHASE_COVER: &str = "cover-engage";
 
 /// Execute route setup commands. Logs each command and its result.
+///
+/// Every route whose command exits 0 is pushed onto `installed`, including on
+/// the `Err` path (a spawn failure mid-run still leaves the earlier routes in
+/// the table), so the caller can persist and later tear down exactly what went
+/// in.
 pub fn setup_routes(
     tun_name: &str,
     server_ip: IpAddr,
     original_gateway: IpAddr,
     interface_name: &str,
+    installed: &mut Vec<RouteId>,
 ) -> std::io::Result<()> {
     let commands = build_setup_commands(tun_name, server_ip, original_gateway, interface_name);
-    run_commands(&commands, PHASE_SETUP)
+    run_route_commands(&commands, PHASE_SETUP, installed)
 }
 
-/// Execute route teardown commands. Idempotent — safe to call even if routes don't exist.
-pub fn teardown_routes(tun_name: &str, server_ip: IpAddr, interface_name: &str) -> std::io::Result<()> {
-    let commands = build_teardown_commands(tun_name, server_ip, interface_name);
+/// Execute route teardown commands for the routes `installed` records.
+/// Idempotent — safe to call even if those routes are already gone.
+pub fn teardown_routes(
+    tun_name: &str,
+    server_ip: IpAddr,
+    interface_name: &str,
+    installed: &[RouteId],
+) -> std::io::Result<()> {
+    let commands = build_teardown_commands(tun_name, server_ip, interface_name, installed);
     run_commands(&commands, PHASE_TEARDOWN)
-}
-
-pub(crate) fn build_split_route_teardown_commands(tun_name: &str) -> Vec<Vec<String>> {
-    platform_split_route_teardown_commands(tun_name)
 }
 
 /// Returns true if route command failures during this phase are *expected*
@@ -121,39 +243,60 @@ fn is_recovery_phase(phase: &str) -> bool {
 fn run_commands(commands: &[Vec<String>], phase: &str) -> std::io::Result<()> {
     let recovery = is_recovery_phase(phase);
     for cmd in commands {
-        debug_assert!(!cmd.is_empty(), "route command must not be empty");
-        ROUTING_SUBPROCESS_SPAWN_COUNT.fetch_add(1, Ordering::SeqCst);
-        info!(phase, cmd = cmd.join(" "), "running route command");
-        let output = Command::new(&cmd[0]).args(&cmd[1..]).output()?;
-        let exit_code = output.status.code().unwrap_or(-1);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        if output.status.success() {
-            // Success log at debug level. Kept out of info to avoid
-            // drowning the per-run log in route noise, but visible when
-            // an investigation turns on hole_bridge=debug.
-            // stdout/stderr included because netsh sometimes prints a
-            // non-empty stdout on success (e.g. "Ok.") that is still
-            // worth having in the trace.
-            debug!(phase, cmd = cmd.join(" "), exit_code,
-                   stdout = %stdout.trim(), stderr = %stderr.trim(),
-                   "route command succeeded");
-        } else if recovery {
-            // Recovery and teardown phases — see is_recovery_phase
-            // doc-comment. Non-zero exits here are the unavoidable consequence
-            // of non-transactional install + best-effort cleanup; warning would
-            // drown legitimate signal.
-            debug!(phase, cmd = cmd.join(" "), exit_code, stderr = %stderr,
-                   "best-effort command failed (expected if route absent)");
-        } else {
-            // PHASE_SETUP only. A non-zero exit during initial route install
-            // IS a real anomaly — investigate.
-            warn!(phase, cmd = cmd.join(" "), exit_code,
-                  stdout = %stdout.trim(), stderr = %stderr.trim(),
-                  "route command failed — investigate (setup phase only)");
+        run_one(cmd, phase, recovery)?;
+    }
+    Ok(())
+}
+
+/// [`run_commands`] that records which routes went in: every command whose
+/// child exits 0 appends its [`RouteId`] to `installed`. Appending as it goes
+/// (rather than returning a list) keeps the record accurate when a later
+/// command fails to spawn at all.
+fn run_route_commands(commands: &[RouteCommand], phase: &str, installed: &mut Vec<RouteId>) -> std::io::Result<()> {
+    let recovery = is_recovery_phase(phase);
+    for cmd in commands {
+        if run_one(&cmd.argv, phase, recovery)? {
+            installed.push(cmd.id);
         }
     }
     Ok(())
+}
+
+/// Spawn one route command, log its outcome, and report whether it exited 0.
+/// `recovery` selects the failure log level — see [`is_recovery_phase`].
+fn run_one(cmd: &[String], phase: &str, recovery: bool) -> std::io::Result<bool> {
+    debug_assert!(!cmd.is_empty(), "route command must not be empty");
+    ROUTING_SUBPROCESS_SPAWN_COUNT.fetch_add(1, Ordering::SeqCst);
+    info!(phase, cmd = cmd.join(" "), "running route command");
+    let output = Command::new(&cmd[0]).args(&cmd[1..]).output()?;
+    let exit_code = output.status.code().unwrap_or(-1);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    if output.status.success() {
+        // Success log at debug level. Kept out of info to avoid
+        // drowning the per-run log in route noise, but visible when
+        // an investigation turns on hole_bridge=debug.
+        // stdout/stderr included because netsh sometimes prints a
+        // non-empty stdout on success (e.g. "Ok.") that is still
+        // worth having in the trace.
+        debug!(phase, cmd = cmd.join(" "), exit_code,
+               stdout = %stdout.trim(), stderr = %stderr.trim(),
+               "route command succeeded");
+    } else if recovery {
+        // Recovery and teardown phases — see is_recovery_phase
+        // doc-comment. Non-zero exits here are the unavoidable consequence
+        // of non-transactional install + best-effort cleanup; warning would
+        // drown legitimate signal.
+        debug!(phase, cmd = cmd.join(" "), exit_code, stderr = %stderr,
+               "best-effort command failed (expected if route absent)");
+    } else {
+        // PHASE_SETUP only. A non-zero exit during initial route install
+        // IS a real anomaly — investigate.
+        warn!(phase, cmd = cmd.join(" "), exit_code,
+              stdout = %stdout.trim(), stderr = %stderr.trim(),
+              "route command failed — investigate (setup phase only)");
+    }
+    Ok(output.status.success())
 }
 
 /// Run a single command, feeding `stdin` if present and returning the full
@@ -278,21 +421,26 @@ pub(crate) fn recover_routes_with<R, S, P, L>(
             tun = %st.tun_name,
             server_ip = %st.server_ip,
             iface = %st.interface_name,
+            installed = ?st.installed,
             "recovering routes from crashed run"
         );
 
         // 1. Split routes (IPv4 + IPv6 halves). Idempotent — harmless if
         //    absent. Runs under state-file guard so this only fires when we
-        //    have positive evidence of a prior route install. Uses the TUN
-        //    name persisted in the state file (the caller controls this —
+        //    have positive evidence of a prior route install, and only for
+        //    the routes that run recorded as installed. Uses the TUN name
+        //    persisted in the state file (the caller controls this —
         //    tun-engine has no opinion on naming).
-        let split_cmds = build_split_route_teardown_commands(&st.tun_name);
+        let split_cmds = build_split_route_teardown_commands(&st.tun_name, &st.installed);
         if let Err(e) = runner(&split_cmds, PHASE_RECOVER_SPLIT) {
             warn!(error = %e, "split-route teardown failed during recovery");
         }
 
-        // 2. Per-server bypass route recorded in the state file.
-        let bypass_cmds = build_teardown_commands(&st.tun_name, st.server_ip, &st.interface_name);
+        // 2. Per-server bypass route recorded in the state file. The splits
+        //    are NOT re-issued here: step 1 already deleted them, and a second
+        //    delete of a now-free prefix could take out whatever claimed it in
+        //    between.
+        let bypass_cmds = build_bypass_teardown_commands(st.server_ip, &st.interface_name, &st.installed);
         if let Err(e) = runner(&bypass_cmds, PHASE_RECOVER_BYPASS) {
             warn!(error = %e, "bypass-route teardown failed during recovery");
         }
@@ -382,7 +530,10 @@ pub trait Routing: Send + Sync {
     /// gateway. On success, returns an RAII guard whose Drop tears down
     /// the routes and clears the recovery state file. On failure, the
     /// implementation must leave the host in the pre-install state
-    /// (no stale state file, no partially-installed routes).
+    /// (no stale state file, no partially-installed routes) — unless it
+    /// could not run the rollback commands at all, in which case it keeps a
+    /// state file naming exactly the routes it did install, so the next
+    /// start's recovery removes them.
     fn install(
         &self,
         tun_name: &str,
@@ -492,28 +643,53 @@ impl Routing for SystemRouting {
         // CRITICAL ORDERING: persist the route-recovery state BEFORE any
         // routing mutation. A panic or SIGKILL between `setup_routes` and
         // `SystemRoutes` construction would otherwise leak routes with no
-        // on-disk record, defeating crash recovery on next startup.
-        let persisted = state::RouteState {
+        // on-disk record, defeating crash recovery on next startup. Nothing
+        // is installed yet, so the record starts at the full planned set: a
+        // crash mid-setup must clean up a superset rather than miss a route
+        // and strand the host on a dead TUN.
+        let mut persisted = state::RouteState {
             version: state::SCHEMA_VERSION,
             tun_name: tun_name.to_owned(),
             server_ip,
             interface_name: interface_name.to_owned(),
+            installed: planned_routes(server_ip),
         };
         state::save(&self.state_dir, &persisted, self.owner)
             .map_err(|e| RoutingError::RouteSetup(format!("failed to persist route-state: {e}")))?;
 
         // Install the routes. On failure, defensively tear down whatever
-        // may have been partially installed and clear the stale state
-        // file before returning. Defensive rollback: `run_commands`
-        // currently returns `Err` only on process-spawn failure, but a
-        // future early-exit-on-non-zero change would otherwise leak
-        // partial routes.
+        // was installed and clear the stale state file before returning.
+        // Defensive rollback: `run_commands` currently returns `Err` only on
+        // process-spawn failure, but a future early-exit-on-non-zero change
+        // would otherwise leak partial routes.
+        let mut installed = Vec::new();
         #[allow(clippy::disallowed_methods)] // we ARE the Routing impl
-        if let Err(e) = setup_routes(tun_name, server_ip, gateway, interface_name) {
+        if let Err(e) = setup_routes(tun_name, server_ip, gateway, interface_name, &mut installed) {
             #[allow(clippy::disallowed_methods)] // defensive rollback inside install
-            let _ = teardown_routes(tun_name, server_ip, interface_name);
-            let _ = state::clear(&self.state_dir);
+            let rolled_back = teardown_routes(tun_name, server_ip, interface_name, &installed);
+            // Same rule as `SystemRoutes::drop`: the record goes only once the
+            // deletes have run. Narrowed to what this attempt created, so
+            // recovery does not chase routes it never installed.
+            if rolled_back.is_err() && !installed.is_empty() {
+                persisted.installed = installed;
+                let _ = state::save(&self.state_dir, &persisted, self.owner);
+            } else {
+                let _ = state::clear(&self.state_dir);
+            }
             return Err(RoutingError::RouteSetup(e.to_string()));
+        }
+
+        // Narrow the record to what actually went in. A route whose `add`
+        // failed is held by someone else — another VPN's `0.0.0.0/1`, most
+        // likely — and deleting it later would take theirs down, never ours.
+        // If this write fails the wider pre-install record stands, which
+        // deletes a superset: worse for a co-resident VPN, but it is the only
+        // direction that cannot strand our own host without a route.
+        if persisted.installed != installed {
+            persisted.installed = installed.clone();
+            if let Err(e) = state::save(&self.state_dir, &persisted, self.owner) {
+                warn!(error = %e, "failed to narrow route-state to the installed set");
+            }
         }
 
         Ok(SystemRoutes {
@@ -521,6 +697,7 @@ impl Routing for SystemRouting {
             server_ip,
             interface_name: interface_name.to_owned(),
             state_dir: self.state_dir.clone(),
+            installed,
         })
     }
 
@@ -560,6 +737,8 @@ pub struct SystemRoutes {
     server_ip: IpAddr,
     interface_name: String,
     state_dir: PathBuf,
+    /// The routes `install` got into the table — the only ones Drop may delete.
+    installed: Vec<RouteId>,
 }
 
 impl Drop for SystemRoutes {
@@ -570,19 +749,27 @@ impl Drop for SystemRoutes {
             tun = %self.tun_name,
             server_ip = %self.server_ip,
             iface = %self.interface_name,
+            installed = ?self.installed,
             "SystemRoutes::drop entered — tearing down routes"
         );
         #[allow(clippy::disallowed_methods)] // SystemRoutes IS Routing::Installed
-        if let Err(e) = teardown_routes(&self.tun_name, self.server_ip, &self.interface_name) {
+        let ran = teardown_routes(&self.tun_name, self.server_ip, &self.interface_name, &self.installed);
+        if let Err(e) = &ran {
             warn!(error = %e, "route teardown failed in SystemRoutes::drop");
         }
-        // Always clear the state file — we only need it for *crash*
-        // recovery, and reaching Drop means we took the normal shutdown
-        // path. Per-command failures above are already logged; a stale
-        // state file on the next run would just trigger an idempotent
-        // no-op teardown during recover_routes, so clearing is safe.
-        if let Err(e) = state::clear(&self.state_dir) {
-            warn!(error = %e, "state-file clear failed in SystemRoutes::drop");
+        // Clear the state file only once the delete commands have actually
+        // run. `Err` here means one failed to spawn, so the routes it named
+        // may still be installed and the record of them is the only thing
+        // that will get them deleted: the next start's `recover_routes`
+        // replays it. A non-zero *exit* is not the same thing — the command
+        // ran, and `route`/`netsh` exit non-zero for a route that is already
+        // gone — so it still clears.
+        if ran.is_ok() {
+            if let Err(e) = state::clear(&self.state_dir) {
+                warn!(error = %e, "state-file clear failed in SystemRoutes::drop");
+            }
+        } else {
+            warn!("keeping route-state for the next start's recovery — teardown commands did not run");
         }
         // Belt-and-suspenders post-teardown wintun adapter cleanup.
         // `bridge::Dispatcher::drop` synchronously drains the engine task
@@ -600,6 +787,11 @@ impl Drop for SystemRoutes {
 }
 
 // Platform-specific command builders ==================================================================================
+//
+// Each platform contributes three builders: the setup commands, the four
+// split-route deletes, and the optional server-bypass delete. Teardown is
+// built from the same tagged commands as setup so the two can never drift
+// apart on which route is which.
 
 #[cfg(target_os = "windows")]
 fn platform_setup_commands(
@@ -607,130 +799,160 @@ fn platform_setup_commands(
     server_ip: IpAddr,
     original_gateway: IpAddr,
     interface_name: &str,
-) -> Vec<Vec<String>> {
+) -> Vec<RouteCommand> {
     let mut cmds = vec![
-        // IPv4 low half: 0.0.0.0/1 via TUN
-        vec![
-            "netsh".into(),
-            "interface".into(),
-            "ip".into(),
-            "add".into(),
-            "route".into(),
-            "0.0.0.0/1".into(),
-            tun_name.into(),
-        ],
-        // IPv4 high half: 128.0.0.0/1 via TUN
-        vec![
-            "netsh".into(),
-            "interface".into(),
-            "ip".into(),
-            "add".into(),
-            "route".into(),
-            "128.0.0.0/1".into(),
-            tun_name.into(),
-        ],
-        // IPv6 low half: ::/1 via TUN
-        vec![
-            "netsh".into(),
-            "interface".into(),
-            "ipv6".into(),
-            "add".into(),
-            "route".into(),
-            "::/1".into(),
-            tun_name.into(),
-        ],
-        // IPv6 high half: 8000::/1 via TUN
-        vec![
-            "netsh".into(),
-            "interface".into(),
-            "ipv6".into(),
-            "add".into(),
-            "route".into(),
-            "8000::/1".into(),
-            tun_name.into(),
-        ],
+        RouteCommand::new(
+            RouteId::SplitV4Low,
+            vec![
+                "netsh".into(),
+                "interface".into(),
+                "ip".into(),
+                "add".into(),
+                "route".into(),
+                "0.0.0.0/1".into(),
+                tun_name.into(),
+            ],
+        ),
+        RouteCommand::new(
+            RouteId::SplitV4High,
+            vec![
+                "netsh".into(),
+                "interface".into(),
+                "ip".into(),
+                "add".into(),
+                "route".into(),
+                "128.0.0.0/1".into(),
+                tun_name.into(),
+            ],
+        ),
+        RouteCommand::new(
+            RouteId::SplitV6Low,
+            vec![
+                "netsh".into(),
+                "interface".into(),
+                "ipv6".into(),
+                "add".into(),
+                "route".into(),
+                "::/1".into(),
+                tun_name.into(),
+            ],
+        ),
+        RouteCommand::new(
+            RouteId::SplitV6High,
+            vec![
+                "netsh".into(),
+                "interface".into(),
+                "ipv6".into(),
+                "add".into(),
+                "route".into(),
+                "8000::/1".into(),
+                tun_name.into(),
+            ],
+        ),
     ];
 
     // Bypass: server IP via original gateway/interface. Skipped for loopback —
     // see `build_setup_commands` (loopback is on-link, a gateway bypass would
     // hijack it).
     if !server_ip.to_canonical().is_loopback() {
-        match server_ip {
-            IpAddr::V4(_) => cmds.push(vec![
-                "route".into(),
-                "add".into(),
-                format!("{server_ip}"),
-                "mask".into(),
-                "255.255.255.255".into(),
-                format!("{original_gateway}"),
-            ]),
-            IpAddr::V6(_) => cmds.push(vec![
-                "netsh".into(),
-                "interface".into(),
-                "ipv6".into(),
-                "add".into(),
-                "route".into(),
-                format!("{server_ip}/128"),
-                interface_name.into(),
-            ]),
-        }
+        cmds.push(RouteCommand::new(
+            RouteId::ServerBypass,
+            match server_ip {
+                IpAddr::V4(_) => vec![
+                    "route".into(),
+                    "add".into(),
+                    format!("{server_ip}"),
+                    "mask".into(),
+                    "255.255.255.255".into(),
+                    format!("{original_gateway}"),
+                ],
+                IpAddr::V6(_) => vec![
+                    "netsh".into(),
+                    "interface".into(),
+                    "ipv6".into(),
+                    "add".into(),
+                    "route".into(),
+                    format!("{server_ip}/128"),
+                    interface_name.into(),
+                ],
+            },
+        ));
     }
 
     cmds
 }
 
 #[cfg(target_os = "windows")]
-fn platform_teardown_commands(tun_name: &str, server_ip: IpAddr, interface_name: &str) -> Vec<Vec<String>> {
-    let mut cmds = vec![
-        vec![
-            "netsh".into(),
-            "interface".into(),
-            "ip".into(),
-            "delete".into(),
-            "route".into(),
-            "0.0.0.0/1".into(),
-            tun_name.into(),
-        ],
-        vec![
-            "netsh".into(),
-            "interface".into(),
-            "ip".into(),
-            "delete".into(),
-            "route".into(),
-            "128.0.0.0/1".into(),
-            tun_name.into(),
-        ],
-        vec![
-            "netsh".into(),
-            "interface".into(),
-            "ipv6".into(),
-            "delete".into(),
-            "route".into(),
-            "::/1".into(),
-            tun_name.into(),
-        ],
-        vec![
-            "netsh".into(),
-            "interface".into(),
-            "ipv6".into(),
-            "delete".into(),
-            "route".into(),
-            "8000::/1".into(),
-            tun_name.into(),
-        ],
-    ];
+fn platform_split_teardown_commands(tun_name: &str) -> Vec<RouteCommand> {
+    vec![
+        RouteCommand::new(
+            RouteId::SplitV4Low,
+            vec![
+                "netsh".into(),
+                "interface".into(),
+                "ip".into(),
+                "delete".into(),
+                "route".into(),
+                "0.0.0.0/1".into(),
+                tun_name.into(),
+            ],
+        ),
+        RouteCommand::new(
+            RouteId::SplitV4High,
+            vec![
+                "netsh".into(),
+                "interface".into(),
+                "ip".into(),
+                "delete".into(),
+                "route".into(),
+                "128.0.0.0/1".into(),
+                tun_name.into(),
+            ],
+        ),
+        RouteCommand::new(
+            RouteId::SplitV6Low,
+            vec![
+                "netsh".into(),
+                "interface".into(),
+                "ipv6".into(),
+                "delete".into(),
+                "route".into(),
+                "::/1".into(),
+                tun_name.into(),
+            ],
+        ),
+        RouteCommand::new(
+            RouteId::SplitV6High,
+            vec![
+                "netsh".into(),
+                "interface".into(),
+                "ipv6".into(),
+                "delete".into(),
+                "route".into(),
+                "8000::/1".into(),
+                tun_name.into(),
+            ],
+        ),
+    ]
+}
 
+#[cfg(target_os = "windows")]
+fn platform_bypass_teardown_command(server_ip: IpAddr, interface_name: &str) -> Option<RouteCommand> {
     // No bypass was installed for a loopback server, so none to delete.
-    if !server_ip.to_canonical().is_loopback() {
+    if server_ip.to_canonical().is_loopback() {
+        return None;
+    }
+    Some(RouteCommand::new(
+        RouteId::ServerBypass,
         match server_ip {
-            IpAddr::V4(_) => cmds.push(vec![
+            IpAddr::V4(_) => vec![
                 "route".into(),
                 "delete".into(),
                 format!("{server_ip}"),
                 "mask".into(),
                 "255.255.255.255".into(),
-            ]),
-            IpAddr::V6(_) => cmds.push(vec![
+            ],
+            IpAddr::V6(_) => vec![
                 "netsh".into(),
                 "interface".into(),
                 "ipv6".into(),
@@ -738,11 +960,9 @@ fn platform_teardown_commands(tun_name: &str, server_ip: IpAddr, interface_name:
                 "route".into(),
                 format!("{server_ip}/128"),
                 interface_name.into(),
-            ]),
-        }
-    }
-
-    cmds
+            ],
+        },
+    ))
 }
 
 #[cfg(target_os = "macos")]
@@ -751,210 +971,189 @@ fn platform_setup_commands(
     server_ip: IpAddr,
     original_gateway: IpAddr,
     interface_name: &str,
-) -> Vec<Vec<String>> {
+) -> Vec<RouteCommand> {
     let mut cmds = vec![
-        // IPv4 low half: 0.0.0.0/1 via TUN
-        vec![
-            "route".into(),
-            "-n".into(),
-            "add".into(),
-            "-net".into(),
-            "0.0.0.0/1".into(),
-            "-interface".into(),
-            tun_name.into(),
-        ],
-        // IPv4 high half: 128.0.0.0/1 via TUN
-        vec![
-            "route".into(),
-            "-n".into(),
-            "add".into(),
-            "-net".into(),
-            "128.0.0.0/1".into(),
-            "-interface".into(),
-            tun_name.into(),
-        ],
-        // IPv6 low half: ::/1 via TUN
-        vec![
-            "route".into(),
-            "-n".into(),
-            "add".into(),
-            "-inet6".into(),
-            "::/1".into(),
-            "-interface".into(),
-            tun_name.into(),
-        ],
-        // IPv6 high half: 8000::/1 via TUN
-        vec![
-            "route".into(),
-            "-n".into(),
-            "add".into(),
-            "-inet6".into(),
-            "8000::/1".into(),
-            "-interface".into(),
-            tun_name.into(),
-        ],
-    ];
-
-    // Bypass: server IP via original gateway/interface. Skipped for loopback —
-    // see `build_setup_commands` (loopback is on-link, a gateway bypass would
-    // hijack it).
-    if !server_ip.to_canonical().is_loopback() {
-        match server_ip {
-            IpAddr::V4(_) => cmds.push(vec![
+        RouteCommand::new(
+            RouteId::SplitV4Low,
+            vec![
                 "route".into(),
                 "-n".into(),
                 "add".into(),
-                "-host".into(),
-                format!("{server_ip}"),
-                format!("{original_gateway}"),
-            ]),
-            IpAddr::V6(_) => cmds.push(vec![
-                "route".into(),
-                "-n".into(),
-                "add".into(),
-                "-inet6".into(),
-                "-host".into(),
-                format!("{server_ip}"),
+                "-net".into(),
+                "0.0.0.0/1".into(),
                 "-interface".into(),
-                interface_name.into(),
-            ]),
-        }
+                tun_name.into(),
+            ],
+        ),
+        RouteCommand::new(
+            RouteId::SplitV4High,
+            vec![
+                "route".into(),
+                "-n".into(),
+                "add".into(),
+                "-net".into(),
+                "128.0.0.0/1".into(),
+                "-interface".into(),
+                tun_name.into(),
+            ],
+        ),
+        RouteCommand::new(
+            RouteId::SplitV6Low,
+            vec![
+                "route".into(),
+                "-n".into(),
+                "add".into(),
+                "-inet6".into(),
+                "::/1".into(),
+                "-interface".into(),
+                tun_name.into(),
+            ],
+        ),
+        RouteCommand::new(
+            RouteId::SplitV6High,
+            vec![
+                "route".into(),
+                "-n".into(),
+                "add".into(),
+                "-inet6".into(),
+                "8000::/1".into(),
+                "-interface".into(),
+                tun_name.into(),
+            ],
+        ),
+    ];
+
+    // Bypass: server IP via original gateway/interface. Skipped for loopback —
+    // see `build_setup_commands` (loopback is on-link, a gateway bypass would
+    // hijack it).
+    if !server_ip.to_canonical().is_loopback() {
+        cmds.push(RouteCommand::new(
+            RouteId::ServerBypass,
+            match server_ip {
+                IpAddr::V4(_) => vec![
+                    "route".into(),
+                    "-n".into(),
+                    "add".into(),
+                    "-host".into(),
+                    format!("{server_ip}"),
+                    format!("{original_gateway}"),
+                ],
+                IpAddr::V6(_) => vec![
+                    "route".into(),
+                    "-n".into(),
+                    "add".into(),
+                    "-inet6".into(),
+                    "-host".into(),
+                    format!("{server_ip}"),
+                    "-interface".into(),
+                    interface_name.into(),
+                ],
+            },
+        ));
     }
 
     cmds
 }
 
+/// The macOS deletes name no interface, unlike their `add` counterparts.
+///
+/// Two independent reasons, both from Apple's sources:
+///
+/// 1. It would scope nothing. `route(8)`'s `-interface` sets only `iflag`
+///    (`network_cmds/route.tproj/route.c`, `case K_IFACE: case K_INTERFACE:`),
+///    which suppresses `RTF_GATEWAY` and turns the next positional argument
+///    into an `AF_LINK` gateway. The kernel then ignores it: xnu's
+///    `rtrequest_common_locked` resolves an `RTM_DELETE` with
+///    `rnh_deladdr(dst, netmask)` — `in_deleteroute`/`in6_deleteroute` over
+///    `rn_delete` — and never reads the gateway.
+/// 2. It would break the delete outright once the interface is gone. With
+///    `iflag` set and no matching `getifaddrs` entry, `getaddr` falls through
+///    to `gethostbyname`/`getaddrinfo` and exits before `rtmsg()` ever writes
+///    to the routing socket. The utun dies with the process, so that is the
+///    normal case for crash recovery — and for the ordinary Stop path too,
+///    which closes the TUN before dropping the routes guard.
+///
+/// `-ifscope` is the real scoping flag, and it is not an option either: it
+/// resolves its name through `if_nametoindex` (same death on a dead utun), and
+/// a route carrying `RTF_IFSCOPE` is skipped by unscoped lookups, so scoping
+/// the install would leave the tunnel capturing nothing. Selectivity comes
+/// from [`RouteId`] provenance instead.
 #[cfg(target_os = "macos")]
-fn platform_teardown_commands(_tun_name: &str, server_ip: IpAddr, _interface_name: &str) -> Vec<Vec<String>> {
-    let mut cmds = vec![
-        vec![
-            "route".into(),
-            "-n".into(),
-            "delete".into(),
-            "-net".into(),
-            "0.0.0.0/1".into(),
-        ],
-        vec![
-            "route".into(),
-            "-n".into(),
-            "delete".into(),
-            "-net".into(),
-            "128.0.0.0/1".into(),
-        ],
-        vec![
-            "route".into(),
-            "-n".into(),
-            "delete".into(),
-            "-inet6".into(),
-            "::/1".into(),
-        ],
-        vec![
-            "route".into(),
-            "-n".into(),
-            "delete".into(),
-            "-inet6".into(),
-            "8000::/1".into(),
-        ],
-    ];
+fn platform_split_teardown_commands(_tun_name: &str) -> Vec<RouteCommand> {
+    vec![
+        RouteCommand::new(
+            RouteId::SplitV4Low,
+            vec![
+                "route".into(),
+                "-n".into(),
+                "delete".into(),
+                "-net".into(),
+                "0.0.0.0/1".into(),
+            ],
+        ),
+        RouteCommand::new(
+            RouteId::SplitV4High,
+            vec![
+                "route".into(),
+                "-n".into(),
+                "delete".into(),
+                "-net".into(),
+                "128.0.0.0/1".into(),
+            ],
+        ),
+        RouteCommand::new(
+            RouteId::SplitV6Low,
+            vec![
+                "route".into(),
+                "-n".into(),
+                "delete".into(),
+                "-inet6".into(),
+                "::/1".into(),
+            ],
+        ),
+        RouteCommand::new(
+            RouteId::SplitV6High,
+            vec![
+                "route".into(),
+                "-n".into(),
+                "delete".into(),
+                "-inet6".into(),
+                "8000::/1".into(),
+            ],
+        ),
+    ]
+}
 
+/// Names no interface, for the reasons in [`platform_split_teardown_commands`].
+/// The uplink outlives the tunnel, but it can still be renamed away — a
+/// Wi-Fi-to-Ethernet switch between connect and stop — and `route(8)` would
+/// abort on the stale name rather than delete the bypass.
+#[cfg(target_os = "macos")]
+fn platform_bypass_teardown_command(server_ip: IpAddr, _interface_name: &str) -> Option<RouteCommand> {
     // No bypass was installed for a loopback server, so none to delete.
-    if !server_ip.to_canonical().is_loopback() {
+    if server_ip.to_canonical().is_loopback() {
+        return None;
+    }
+    Some(RouteCommand::new(
+        RouteId::ServerBypass,
         match server_ip {
-            IpAddr::V4(_) => cmds.push(vec![
+            IpAddr::V4(_) => vec![
                 "route".into(),
                 "-n".into(),
                 "delete".into(),
                 "-host".into(),
                 format!("{server_ip}"),
-            ]),
-            IpAddr::V6(_) => cmds.push(vec![
+            ],
+            IpAddr::V6(_) => vec![
                 "route".into(),
                 "-n".into(),
                 "delete".into(),
                 "-inet6".into(),
                 "-host".into(),
                 format!("{server_ip}"),
-            ]),
-        }
-    }
-
-    cmds
-}
-
-#[cfg(target_os = "windows")]
-fn platform_split_route_teardown_commands(tun_name: &str) -> Vec<Vec<String>> {
-    vec![
-        vec![
-            "netsh".into(),
-            "interface".into(),
-            "ip".into(),
-            "delete".into(),
-            "route".into(),
-            "0.0.0.0/1".into(),
-            tun_name.into(),
-        ],
-        vec![
-            "netsh".into(),
-            "interface".into(),
-            "ip".into(),
-            "delete".into(),
-            "route".into(),
-            "128.0.0.0/1".into(),
-            tun_name.into(),
-        ],
-        vec![
-            "netsh".into(),
-            "interface".into(),
-            "ipv6".into(),
-            "delete".into(),
-            "route".into(),
-            "::/1".into(),
-            tun_name.into(),
-        ],
-        vec![
-            "netsh".into(),
-            "interface".into(),
-            "ipv6".into(),
-            "delete".into(),
-            "route".into(),
-            "8000::/1".into(),
-            tun_name.into(),
-        ],
-    ]
-}
-
-#[cfg(target_os = "macos")]
-fn platform_split_route_teardown_commands(_tun_name: &str) -> Vec<Vec<String>> {
-    vec![
-        vec![
-            "route".into(),
-            "-n".into(),
-            "delete".into(),
-            "-net".into(),
-            "0.0.0.0/1".into(),
-        ],
-        vec![
-            "route".into(),
-            "-n".into(),
-            "delete".into(),
-            "-net".into(),
-            "128.0.0.0/1".into(),
-        ],
-        vec![
-            "route".into(),
-            "-n".into(),
-            "delete".into(),
-            "-inet6".into(),
-            "::/1".into(),
-        ],
-        vec![
-            "route".into(),
-            "-n".into(),
-            "delete".into(),
-            "-inet6".into(),
-            "8000::/1".into(),
-        ],
-    ]
+            ],
+        },
+    ))
 }
 
 #[cfg(test)]

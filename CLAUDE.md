@@ -46,6 +46,12 @@ before editing; the sections linked below are the authoritative source.
 - **Native-crash observability.** The `tombstone` crate writes a signal-safe
   crash marker; the next start of the same kind sweeps it. →
   [CONTRIBUTING.md#native-crash-observability-tombstone](CONTRIBUTING.md#native-crash-observability-tombstone)
+- **Route ownership.** Teardown and recovery delete only the `RouteId`s
+  `bridge-routes.json` records as installed. No delete-side qualifier can
+  substitute: macOS matches `RTM_DELETE` on destination + netmask only, and the
+  one key discriminator (`-ifscope`) would hide the splits from unbound
+  traffic. →
+  [CONTRIBUTING.md#route-ownership](CONTRIBUTING.md#route-ownership)
 - **Crash-recovery sweep.** `bridge-{routes,plugins,dns}.json` + ETW sessions are
   replayed/cleaned on next startup after the IPC socket binds. →
   [CONTRIBUTING.md#crash-recovery](CONTRIBUTING.md#crash-recovery)
@@ -98,6 +104,9 @@ before editing; the sections linked below are the authoritative source.
 - **Cooperative cancel tokens only** — no fresh `CancellationToken::new()` in
   `crates/bridge/src/` (clippy-enforced).
   [→](CONTRIBUTING.md#bridge-cancellation-contract)
+- **Delete only recorded routes** — a route whose install failed belongs to
+  whoever holds it now; deleting it takes down another VPN's tunnel.
+  [→](CONTRIBUTING.md#route-ownership)
 - **Ephemeral ports via `bind_ephemeral`, never raw `free_port`** — the retry is
   unbounded by design, no budget (clippy-enforced).
   [→](CONTRIBUTING.md#port-allocation)
