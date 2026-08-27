@@ -95,7 +95,9 @@ fn fixture_starts_real_ss_server() {
 fn preflight_only_config() -> TestConfig {
     let bogus: SocketAddr = "127.0.0.1:1".parse().unwrap();
     TestConfig {
-        preflight_timeout: Duration::from_millis(500),
+        // The production budget: below it, a refusal cannot be typed as one
+        // on Windows, which is the whole subject of these tests.
+        preflight_timeout: crate::server_test::PREFLIGHT_TIMEOUT,
         ss_connect_timeout: Duration::from_millis(500),
         sentinel_read_timeout: Duration::from_millis(500),
         sentinels: [bogus.to_string(), bogus.to_string()],
@@ -167,30 +169,22 @@ fn run_test_returns_dns_failed_for_unresolvable_host() {
 
 /// Test 3: TCP connection refused for a closed loopback port.
 ///
-/// `127.0.0.1:1` is reliably closed on Linux/macOS — the kernel sends RST.
-/// On Windows, GitHub Actions `windows-latest` drops inbound SYNs to closed
-/// ephemeral loopback ports, so the result is `TcpTimeout`, not `TcpRefused`.
-/// Both are correct outcomes for "this port is closed"; accept either on
-/// Windows. (Per the project's "fail loudly" rule: this is a documented
-/// platform difference, not a silent skip — both branches assert something
-/// concrete.)
+/// Every supported platform refuses `127.0.0.1:1` — the kernel sends RST.
+/// Windows just bills the connecting socket for its own SYN-retransmission
+/// budget (~2.05 s) before reporting it, which `preflight_timeout` clears
+/// (`server_test::PREFLIGHT_TIMEOUT`); see `util::syn_budget`. So the
+/// verdict is `TcpRefused` everywhere: a branch accepting `TcpTimeout` too
+/// would assert nothing about the classifier under test.
 #[skuld::test]
 fn run_test_returns_tcp_refused_for_closed_port() {
     rt().block_on(async {
         let entry = entry("127.0.0.1", 1, TEST_METHOD_STR, TEST_PASSWORD);
         let cfg = preflight_only_config();
         let outcome = run_server_test(&entry, &cfg).await;
-        if cfg!(target_os = "windows") {
-            assert!(
-                matches!(outcome, ServerTestOutcome::TcpRefused | ServerTestOutcome::TcpTimeout),
-                "expected TcpRefused or TcpTimeout on Windows, got {outcome:?}"
-            );
-        } else {
-            assert!(
-                matches!(outcome, ServerTestOutcome::TcpRefused),
-                "expected TcpRefused, got {outcome:?}"
-            );
-        }
+        assert!(
+            matches!(outcome, ServerTestOutcome::TcpRefused),
+            "expected TcpRefused, got {outcome:?}"
+        );
     });
 }
 
@@ -452,8 +446,8 @@ fn run_test_with_v2ray_plugin_happy_path() {
 /// Test 4: TCP connection timeout for an unroutable address.
 ///
 /// `192.0.2.1` is in TEST-NET-1 (RFC 5737), guaranteed unroutable on the
-/// public internet. The pre-flight TCP connect must time out within
-/// `preflight_timeout` (500 ms here).
+/// public internet. Nothing answers the SYN, so the pre-flight connect
+/// reaches `preflight_timeout` — the one case that really is a timeout.
 #[skuld::test]
 fn run_test_returns_tcp_timeout_for_blackhole() {
     rt().block_on(async {

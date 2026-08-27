@@ -86,18 +86,19 @@ fn preflight_connects_to_raw_ipv6_socketaddr() {
     });
 }
 
+/// A closed port is refused on every supported platform; Windows just bills
+/// the connecting socket for its SYN-retransmission budget first, which
+/// `PREFLIGHT_TIMEOUT` clears. Accepting `TcpTimeout` here as well would
+/// leave `preflight`'s refusal arm unasserted — it was dead on Windows for
+/// exactly that reason.
 #[skuld::test]
-fn preflight_reports_tcp_failure_for_closed_ipv6_port() {
+fn preflight_reports_tcp_refused_for_closed_ipv6_port() {
     rt().block_on(async {
-        // [::1]:1 is a closed IPv6 loopback port — refused or timed out, never DnsFailed.
         let addr: SocketAddr = "[::1]:1".parse().unwrap();
-        let res = preflight(addr, Duration::from_millis(500)).await;
+        let res = preflight(addr, super::PREFLIGHT_TIMEOUT).await;
         assert!(
-            matches!(
-                res,
-                Err(ServerTestOutcome::TcpRefused) | Err(ServerTestOutcome::TcpTimeout)
-            ),
-            "closed IPv6 port must surface a TCP failure, got {res:?}"
+            matches!(res, Err(ServerTestOutcome::TcpRefused)),
+            "closed IPv6 port must surface a refusal, got {res:?}"
         );
     });
 }

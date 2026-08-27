@@ -50,22 +50,38 @@ pub(crate) async fn allocate_ephemeral_port(protocols: Protocols) -> u16 {
         .expect("allocate ephemeral port")
 }
 
+/// The per-attempt histogram [`try_wait_for_port`] returns on failure.
+/// Typed so callers (and tests) can assert on the shape directly instead
+/// of parsing it back out of a panic message.
+pub(crate) struct WaitForPortFailure {
+    pub attempts: u32,
+    pub error_counts: BTreeMap<Option<i32>, u32>,
+    pub first_err: Option<(Option<i32>, String)>,
+    pub last_err: Option<(Option<i32>, String)>,
+}
+
 /// Poll-connect to `addr` until either a TCP connection succeeds or
-/// `timeout` elapses. Used by tests that spawn a child process which binds
-/// asynchronously after the parent function returns. Panics on timeout
-/// with a per-attempt error histogram for diagnostics.
+/// `timeout` elapses. Returns `Err` with a per-attempt error histogram
+/// otherwise.
 ///
-/// Each connect attempt is wrapped in a 500 ms `tokio::time::timeout`. On
-/// Windows, `TcpStream::connect` to a port that fails to SYN-ACK can block
-/// for the OS connect-timer (~21 s default), which would let only 1–2
-/// attempts fit in a 10 s budget. The wrapper forces fast retries so the
-/// histogram reflects the actual attempt distribution.
+/// Each attempt goes through [`util::syn_budget::probe`] pinning
+/// [`util::syn_budget::SynBudget::NoRetransmit`] — this is a probe inside a
+/// loop that re-issues on any failure, exactly the shape the budget is for.
+/// A closed port is refused in ~0.1 ms instead of paying Windows' ~2.05 s
+/// stock SYN-retransmission budget, so the refusal's errno reaches the
+/// histogram instead of being cut off by the per-attempt cap.
+///
+/// The per-attempt cap **stays** — it is what bounds a genuine black hole
+/// (measured 1015 ms pinned, vs. 21037 ms unpinned for an unrouted
+/// address), a shape `NoRetransmit` does not affect. Without it, a
+/// black-holed port would spend the OS connect-timer (~21 s default) per
+/// attempt, leaving room for only 1–2 attempts in a 10 s budget.
 ///
 /// Diagnostics use `eprintln!` (not tracing) because this connect-failure
 /// histogram is intentionally always-on and must not be droppable by a
 /// log filter — it's load-bearing for understanding TCP-connect failure
 /// shapes on the runner.
-pub(crate) async fn wait_for_port(addr: SocketAddr, timeout: Duration) {
+pub(crate) async fn try_wait_for_port(addr: SocketAddr, timeout: Duration) -> Result<(), WaitForPortFailure> {
     let start = Instant::now();
     let mut attempts: u32 = 0;
     let mut first_err: Option<(Option<i32>, String)> = None;
@@ -75,16 +91,21 @@ pub(crate) async fn wait_for_port(addr: SocketAddr, timeout: Duration) {
     while start.elapsed() < timeout {
         attempts += 1;
         let attempt_start = Instant::now();
-        let outcome = tokio::time::timeout(Duration::from_millis(500), tokio::net::TcpStream::connect(addr)).await;
+        let outcome = util::syn_budget::probe(
+            addr,
+            Duration::from_millis(500),
+            util::syn_budget::SynBudget::NoRetransmit,
+        )
+        .await;
         match outcome {
-            Ok(Ok(_stream)) => {
+            util::syn_budget::ProbeOutcome::Listening(_stream) => {
                 eprintln!(
                     "[wait_for_port] connect OK to {addr} after {attempts} attempts, {}ms total",
                     start.elapsed().as_millis()
                 );
-                return;
+                return Ok(());
             }
-            Ok(Err(e)) => {
+            util::syn_budget::ProbeOutcome::Refused(e) | util::syn_budget::ProbeOutcome::NoVerdict(Some(e)) => {
                 let code = e.raw_os_error();
                 let pair = (code, e.to_string());
                 eprintln!(
@@ -100,7 +121,7 @@ pub(crate) async fn wait_for_port(addr: SocketAddr, timeout: Duration) {
                 }
                 last_err = Some(pair);
             }
-            Err(_) => {
+            util::syn_budget::ProbeOutcome::NoVerdict(None) => {
                 let pair = (None, "per-attempt 500ms timeout".to_string());
                 eprintln!("[wait_for_port] attempt {attempts} to {addr} hit per-attempt 500ms timeout");
                 *error_counts.entry(None).or_default() += 1;
@@ -112,6 +133,29 @@ pub(crate) async fn wait_for_port(addr: SocketAddr, timeout: Duration) {
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+
+    Err(WaitForPortFailure {
+        attempts,
+        error_counts,
+        first_err,
+        last_err,
+    })
+}
+
+/// Poll-connect to `addr` until either a TCP connection succeeds or
+/// `timeout` elapses. Used by tests that spawn a child process which binds
+/// asynchronously after the parent function returns. Panics on timeout
+/// with a per-attempt error histogram for diagnostics.
+pub(crate) async fn wait_for_port(addr: SocketAddr, timeout: Duration) {
+    let Err(failure) = try_wait_for_port(addr, timeout).await else {
+        return;
+    };
+    let WaitForPortFailure {
+        attempts,
+        error_counts,
+        first_err,
+        last_err,
+    } = failure;
 
     eprintln!(
         "[wait_for_port] TIMEOUT on {addr} after {}s, {attempts} attempts, error_counts={error_counts:?}, first={first_err:?}, last={last_err:?}",
@@ -299,3 +343,7 @@ fn capture_windows_tcp_state(port: u16) {
         Err(e) => eprintln!("[wait_for_port] UDP probe: bind 127.0.0.1:0 failed: {e}"),
     }
 }
+
+#[cfg(test)]
+#[path = "port_alloc_tests.rs"]
+mod port_alloc_tests;

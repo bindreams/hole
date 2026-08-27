@@ -253,8 +253,12 @@ async fn tls_ws_reset_is_blocked() {
         ReachabilityVerdict::Blocked
     );
 }
-#[skuld::test(name = "reachability_tests::closed_port_is_refused_or_timeout")]
-async fn closed_port_is_refused_or_timeout() {
+/// Every supported kernel RSTs a closed port. Windows bills the connecting
+/// socket for its own SYN-retransmission budget (~2.05 s) first, which
+/// `CONNECT_DEADLINE` clears — see `util::syn_budget`. Accepting `TcpTimeout`
+/// here as well would assert nothing about the classifier.
+#[skuld::test(name = "reachability_tests::closed_port_is_refused")]
+async fn closed_port_is_refused() {
     let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let a = l.local_addr().unwrap();
     drop(l);
@@ -267,20 +271,10 @@ async fn closed_port_is_refused_or_timeout() {
         &CancellationToken::new(),
     )
     .await;
-    // Non-Windows kernels RST a closed port (TcpRefused); Windows GitHub runners
-    // drop inbound SYNs to closed ephemeral loopback ports → TcpTimeout. Both are
-    // correct "port is closed" verdicts.
-    if cfg!(target_os = "windows") {
-        assert!(
-            matches!(v, ReachabilityVerdict::TcpRefused | ReachabilityVerdict::TcpTimeout),
-            "expected TcpRefused or TcpTimeout on Windows, got {v:?}"
-        );
-    } else {
-        assert!(
-            matches!(v, ReachabilityVerdict::TcpRefused),
-            "expected TcpRefused, got {v:?}"
-        );
-    }
+    assert!(
+        matches!(v, ReachabilityVerdict::TcpRefused),
+        "expected TcpRefused, got {v:?}"
+    );
 }
 #[skuld::test(name = "reachability_tests::bogus_host_is_dns_failed")]
 async fn bogus_host_is_dns_failed() {

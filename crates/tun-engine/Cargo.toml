@@ -16,6 +16,15 @@ group = "hole"
 [lints]
 workspace = true
 
+[features]
+# Exposes the `test_utils` module — the harness the privileged (elevated) test
+# lanes share: shelled-out command diagnostics, a probe route owned by an RAII
+# guard, and the escape from a fail-closed cover. Off by default, so no
+# production binary links it; this crate's own tests get it via `cfg(test)`
+# and `hole-bridge` enables it from its `[dev-dependencies]`. Same shape as
+# garter's `test-utils`.
+test-utils = []
+
 [lib]
 harness = false
 

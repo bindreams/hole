@@ -2288,10 +2288,10 @@ mod self_test {
     // else keeps the original self-test reason. No real TUN / bridge start needed.
 
     /// A server config whose `server` points at a closed loopback port, so the
-    /// out-of-band probe (no plugin → Raw transport) terminates fast with a
-    /// closed-port verdict (`TcpRefused`, or `TcpTimeout` on a Windows runner
-    /// that SYN-drops) and the self-test gate fails (MockProxy binds no listener
-    /// for the forwarder). Returns the (manager, config) ready to drive the gate.
+    /// out-of-band probe (no plugin → Raw transport) terminates with a
+    /// closed-port verdict (`TcpRefused`) and the self-test gate fails (MockProxy
+    /// binds no listener for the forwarder). Returns the (manager, config) ready
+    /// to drive the gate.
     fn gate_failure_setup(lockdown: bool) -> (ProxyManager<MockProxy, MockRouting>, ProxyConfig, tempfile::TempDir) {
         // A bound-then-dropped listener yields a port that is closed for the test's
         // duration, so a connect there is refused, not accepted.
@@ -2386,10 +2386,8 @@ mod self_test {
 
     /// Control: with lockdown OFF the probe DOES run, so the same closed-port
     /// server rewrites the reason to the probe's verdict — proving the
-    /// lockdown-on skip above is load-bearing, not vacuous. The closed port is
-    /// refused on most kernels (`TcpRefused`) but SYN-dropped on Windows GitHub
-    /// runners (`TcpTimeout` → "did not respond"); either rewrite proves the
-    /// probe ran.
+    /// lockdown-on skip above is load-bearing, not vacuous. Every supported
+    /// kernel refuses a closed port, so the rewrite says "refused".
     #[skuld::test]
     fn lockdown_off_runs_probe_rewrites_reason() {
         rt().block_on(async {
@@ -2400,13 +2398,8 @@ mod self_test {
                 .unwrap_err();
             match err {
                 ProxyError::ForwarderSelfTestFailed { reason, .. } => {
-                    let rewritten = if cfg!(target_os = "windows") {
-                        reason.contains("refused") || reason.contains("did not respond")
-                    } else {
-                        reason.contains("refused")
-                    };
                     assert!(
-                        rewritten,
+                        reason.contains("refused"),
                         "lockdown-off must run the probe and rewrite the reason, got {reason:?}"
                     );
                 }
@@ -4495,7 +4488,7 @@ mod self_test {
     /// DoH-resolved IP, never OS-resolve the proxy domain. The server is a
     /// non-resolvable domain that ONLY the DoH stub maps — to the closed loopback
     /// port — and lockdown is OFF so the probe runs. Probing the resolved IP hits
-    /// the closed port → `TcpRefused`/`TcpTimeout` → the gate reason is rewritten.
+    /// the closed port → `TcpRefused` → the gate reason is rewritten.
     /// If the probe regressed to OS-resolving the domain, the lookup would fail →
     /// `DnsFailed` verdict → `self_test_error_for` keeps the ORIGINAL reason, so
     /// the rewrite assertion fails.
@@ -4503,7 +4496,7 @@ mod self_test {
     fn probe_connects_to_doh_resolved_ip_not_hostname() {
         rt().block_on(async {
             // A bound-then-dropped listener: a port closed for the test's duration,
-            // so a connect there is refused (or SYN-dropped → timeout on Windows).
+            // so a connect there is refused.
             let probe_l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             let closed = probe_l.local_addr().unwrap();
             drop(probe_l);

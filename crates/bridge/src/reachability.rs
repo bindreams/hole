@@ -13,10 +13,14 @@ use tokio_util::sync::CancellationToken;
 use tracing::debug;
 
 // Per-phase budgets bound the total while preserving the connect-vs-first-flight
-// verdict split: a connect timeout stays `TcpTimeout` (a closed-port SYN-drop),
-// a first-flight no-response stays `Blocked` (a real block). One outer timeout
-// would conflate them. Non-QUIC worst case ≈ CONNECT_DEADLINE + FIRSTFLIGHT_DEADLINE = 6s.
+// verdict split: a connect timeout stays `TcpTimeout` (nothing answered the SYN
+// at all), a first-flight no-response stays `Blocked` (a real block). One outer
+// timeout would conflate them. A closed port is NOT this case — it refuses, and
+// CONNECT_DEADLINE is above `util::syn_budget::REFUSAL_COST` so that refusal is
+// reported as `TcpRefused`. Non-QUIC worst case ≈ CONNECT_DEADLINE +
+// FIRSTFLIGHT_DEADLINE = 6s.
 const CONNECT_DEADLINE: Duration = Duration::from_secs(3); // TCP connect (DNS resolve precedes it)
+const _: () = assert!(CONNECT_DEADLINE.as_millis() > util::syn_budget::REFUSAL_COST.as_millis());
 const FIRSTFLIGHT_DEADLINE: Duration = Duration::from_secs(3); // TLS/HTTP first-flight read
 const QUIC_DEADLINE: Duration = Duration::from_secs(6); // whole quinn connect
 
