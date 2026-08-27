@@ -728,3 +728,7 @@ fn smoltcp_to_std_ip(addr: IpAddress) -> IpAddr {
 #[cfg(test)]
 #[path = "driver_udp_tests.rs"]
 mod driver_udp_tests;
+
+#[cfg(test)]
+#[path = "driver_dns_tests.rs"]
+mod driver_dns_tests;
