@@ -35,6 +35,25 @@ nextest-version = "0.9.130"
 #     crates/bridge/tests/cutover_leak_privileged.rs (fail-open + both-covers)
 #     crates/bridge/tests/cutover_nic_capture_privileged.rs (Windows pktmon NIC
 #       wire-capture no-UDP-leak proof)
+#   - `live_tun_permit_` substring (#874 — two real TUN devices + the real
+#     standing lockdown cover, proving the tunnel-permit rule is sensitive to
+#     the interface it names, not merely present; and the session-level
+#     composition guard, which starts a real Full-mode session with the kill
+#     switch armed — each engages a system-wide block-all cover, so they must
+#     never run beside each other):
+#     crates/tun-engine/src/routing/failclosed/live_tun_permit_privileged_tests.rs
+#     crates/bridge/src/proxy_manager_live_tun_permit_e2e_tests.rs
+#   - `e2e_socks5_udp_associate_roundtrip` (pre-existing, made reachable by
+#     #874): `labels = [DIST_BIN, TUN], serial = TUN` in
+#     crates/bridge/src/proxy_manager_listener_e2e_tests.rs, but it lives in a
+#     DIFFERENT test binary from the tun-engine tests above, so skuld's
+#     per-binary `serial = TUN` alone never serialized it against them; it
+#     drives live UDP through a real TUN adapter (the `hole-tun*` wildcard
+#     teardown sweep included), so a system-wide block-all beside it breaks it.
+#     NOT added: the three ETW tests in
+#     crates/bridge/src/diagnostics/etw_live_privileged_tests.rs — that
+#     module's TUN label means "the elevated Windows lane", not "touches a
+#     TUN adapter"; they query ETW sessions and mutate no network state.
 # Renaming any of them WITHOUT updating this filter silently drops it from the
 # group → cross-binary data race. Verify with `cargo nextest show-config
 # test-groups`. Add any new real-engage/real-TUN test (and its substring) here.
@@ -52,5 +71,5 @@ nextest-version = "0.9.130"
 max-threads = 1
 
 [[profile.default.overrides]]
-filter = 'test(/_full_tunnel_roundtrip$/) + test(/windows_lockdown_permits_server_ip_/) + test(/macos_lockdown_permits_server_ip_/) + test(/failclosed_permits_/) + test(/release_all_/) + test(/cutover_global_net_state_/)'
+filter = 'test(/_full_tunnel_roundtrip$/) + test(/windows_lockdown_permits_server_ip_/) + test(/macos_lockdown_permits_server_ip_/) + test(/failclosed_permits_/) + test(/release_all_/) + test(/cutover_global_net_state_/) + test(/live_tun_permit_/) + test(/e2e_socks5_udp_associate_roundtrip/)'
 test-group = 'global_net_state'

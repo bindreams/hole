@@ -67,18 +67,20 @@ pub trait Proxy: Send + Sync {
     type Running: RunningProxy + Send;
 
     /// Spawn a new proxy tunnel from `config`. On success returns an
-    /// owned [`Self::Running`] handle whose `Drop` aborts the spawned
-    /// task if it is dropped without an explicit `stop().await`.
+    /// owned [`Self::Running`] handle whose `Drop` releases the proxy's
+    /// bound sockets if it is dropped without an explicit `stop().await`.
     fn start(&self, config: Config) -> impl std::future::Future<Output = Result<Self::Running, ProxyError>> + Send;
 }
 
 /// Handle on a running proxy tunnel returned from [`Proxy::start`].
 ///
-/// Single-use: [`stop`](Self::stop) consumes `self`. Drop aborts the
-/// underlying task best-effort. A type implementing `RunningProxy` MUST
-/// also implement `Drop` such that the spawned task is aborted on drop —
-/// this is the cancellation-safety primitive that
-/// [`crate::proxy_manager::ProxyManager::start_inner`] relies on.
+/// Single-use: [`stop`](Self::stop) consumes `self`. A type implementing
+/// `RunningProxy` MUST also implement `Drop` such that every socket the
+/// proxy bound is released — this is the cancellation-safety primitive that
+/// [`crate::proxy_manager::ProxyManager::start_inner`] relies on. Aborting
+/// the spawned task is necessary but not sufficient: see
+/// CONTRIBUTING.md#proxy-shutdown-contract for why the production
+/// implementation also joins a dedicated runtime.
 pub trait RunningProxy: Send + Sync {
     /// Cheap, synchronous check: is the underlying task still running?
     fn is_alive(&self) -> bool;
@@ -88,8 +90,10 @@ pub trait RunningProxy: Send + Sync {
     fn traffic_totals(&self) -> TrafficTotals;
 
     /// Graceful shutdown: abort the task and await its result so errors
-    /// can be reported to the caller. Idempotent with respect to
-    /// subsequent `Drop` because `stop` consumes `self`.
+    /// can be reported to the caller. When this returns, every socket the
+    /// proxy bound is closed — see CONTRIBUTING.md#proxy-shutdown-contract.
+    /// Idempotent with respect to subsequent `Drop` because `stop` consumes
+    /// `self`.
     fn stop(self) -> impl std::future::Future<Output = Result<(), ProxyError>> + Send;
 }
 
