@@ -27,6 +27,15 @@ use tracing::debug;
 
 const HEAD_REQUEST: &[u8] = b"HEAD / HTTP/1.0\r\nHost: 1.1.1.1\r\nConnection: close\r\n\r\n";
 
+/// Budget for [`preflight`]'s raw TCP connect. Matches
+/// `reachability::CONNECT_DEADLINE`, so the two classifiers give a closed
+/// port the same verdict.
+const PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(3);
+
+// A budget under the refusal cost cannot report a refusal: the timer fires
+// first and every refused server is reported as "did not respond".
+const _: () = assert!(PREFLIGHT_TIMEOUT.as_millis() > util::syn_budget::REFUSAL_COST.as_millis());
+
 /// Tunable parameters. Production code constructs [`TestConfig::production`].
 /// Tests construct a custom one with shorter timeouts and dynamic sentinels.
 #[derive(Clone)]
@@ -67,7 +76,7 @@ impl std::fmt::Debug for TestConfig {
 impl TestConfig {
     pub fn production() -> Self {
         Self {
-            preflight_timeout: Duration::from_secs(2),
+            preflight_timeout: PREFLIGHT_TIMEOUT,
             ss_connect_timeout: Duration::from_secs(5),
             sentinel_read_timeout: Duration::from_secs(5),
             sentinels: ["1.1.1.1:80".to_string(), "1.0.0.1:80".to_string()],

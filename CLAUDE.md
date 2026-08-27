@@ -54,6 +54,10 @@ before editing; the sections linked below are the authoritative source.
 - **Bridge trait seam.** All OS-mutating bridge I/O routes through the `Proxy`,
   `Routing`, and `Dns` traits so tests can mock it. →
   [CONTRIBUTING.md#bridge-test-isolation-contract](CONTRIBUTING.md#bridge-test-isolation-contract)
+- **Proxy shutdown contract.** `stop()` returns only once the listener sockets
+  are closed; the proxy owns its own runtime because upstream's teardown is
+  three layers of bare `abort()`. →
+  [CONTRIBUTING.md#proxy-shutdown-contract](CONTRIBUTING.md#proxy-shutdown-contract)
 - **Cooperative-cancel model.** Cancellation propagates via tokens from the IPC
   `handle_start` handler; no future-drop cancellation. →
   [CONTRIBUTING.md#bridge-cancellation-contract](CONTRIBUTING.md#bridge-cancellation-contract)
