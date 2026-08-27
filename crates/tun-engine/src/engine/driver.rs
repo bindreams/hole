@@ -732,3 +732,7 @@ mod driver_udp_tests;
 #[cfg(test)]
 #[path = "driver_dns_tests.rs"]
 mod driver_dns_tests;
+
+#[cfg(test)]
+#[path = "driver_lifecycle_tests.rs"]
+mod driver_lifecycle_tests;
