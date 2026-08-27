@@ -351,3 +351,23 @@ fn proxy_error_converts_to_start_error() {
         other => panic!("expected Failed, got {other:?}"),
     }
 }
+
+/// The tunnel's ULA must carry a *generated* RFC 4193 §3.2.2 global ID, not
+/// the hand-typed `fd00::` (global ID zero) that WireGuard examples, Docker,
+/// Proxmox and NAS defaults hand out. `hole-tun` holds this prefix as a real
+/// on-link route, so a zero global ID would let the tunnel swallow a user's
+/// own ULA network — `fc00::/7` alone does not rule that out.
+#[skuld::test]
+fn tun_subnet6_is_a_generated_unique_local_64() {
+    let cidr: smoltcp::wire::Ipv6Cidr = TUN_SUBNET6.parse().expect("TUN_SUBNET6 parses as an IPv6 CIDR");
+    assert_eq!(cidr.prefix_len(), 64, "the TUN's v6 prefix is a /64");
+
+    let octets = cidr.address().octets();
+    assert_eq!(octets[0] & 0xfe, 0xfc, "the address is inside fc00::/7");
+
+    let global_id = &octets[1..6];
+    assert!(
+        global_id.iter().any(|b| *b != 0),
+        "the 40-bit global ID must be generated, not zero (fd00::); got {global_id:02x?}"
+    );
+}

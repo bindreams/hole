@@ -28,12 +28,7 @@
 
 use crate::routing::{CoverGuard, Routing, SystemRouting};
 
-// `skuld` requires each label to be declared exactly once per test binary;
-// both this module and `lockdown_privileged_tests` compile into the SAME
-// `tun-engine` test binary, so this reuses that module's `TUN` label rather
-// than redeclaring it (a second `#[skuld::label] const TUN` in one binary
-// panics at test-runner startup with "label declared multiple times").
-use super::lockdown_privileged_tests::TUN;
+use crate::TUN;
 
 // Two routable anycast hosts on :443 (the runner has outbound internet), as
 // `lockdown_privileged_tests` uses — see that module's doc for why these two

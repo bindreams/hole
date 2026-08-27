@@ -35,6 +35,15 @@ fn main() {
     skuld::run_all();
 }
 
+/// The elevated-lane label (→ skuld filter name `tun`). skuld requires each
+/// label to be declared exactly once per test binary, and every module under
+/// this crate compiles into the SAME binary, so this is the crate's only
+/// declaration — a second `#[skuld::label] const TUN` anywhere would mint a
+/// different serial token and panic the runner at startup.
+#[cfg(test)]
+#[skuld::label]
+pub(crate) const TUN: skuld::Label;
+
 pub mod adapter_cleanup;
 pub mod device;
 pub mod engine;

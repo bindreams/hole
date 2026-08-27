@@ -28,7 +28,7 @@ impl Device {
     ///     c.tun_name = "hole-tun".into();
     ///     c.mtu = 1400;
     ///     c.ipv4 = Some("10.255.0.1/24".parse().unwrap());
-    ///     c.ipv6 = Some("fd00::ff00:1/64".parse().unwrap());
+    ///     c.ipv6 = Some("fdf8:f6d5:536e::1/64".parse().unwrap());
     /// })?;
     /// ```
     pub fn build<F>(init: F) -> Result<Self, DeviceError>

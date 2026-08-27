@@ -17,7 +17,7 @@ use tun_engine::{Device, Engine, MutDeviceConfig};
 use crate::endpoint::{BlockEndpoint, InterfaceEndpoint, LocalDnsEndpoint, Socks5Endpoint};
 use crate::filter::rules::RuleSet;
 use crate::hole_router::HoleRouter;
-use crate::proxy::{TUN_DEVICE_NAME, TUN_SUBNET};
+use crate::proxy::{TUN_DEVICE_NAME, TUN_SUBNET, TUN_SUBNET6};
 
 /// The main dispatcher — owns the TUN device (via the engine driver)
 /// and coordinates per-connection filter decisions (via `HoleRouter`).
@@ -60,7 +60,9 @@ impl Dispatcher {
         let v4_cidr = TUN_SUBNET
             .parse()
             .expect("TUN_SUBNET is a hard-coded valid CIDR string");
-        let v6_cidr: smoltcp::wire::Ipv6Cidr = "fd00::ff00:1/64".parse().expect("hard-coded IPv6 CIDR is valid");
+        let v6_cidr: smoltcp::wire::Ipv6Cidr = TUN_SUBNET6
+            .parse()
+            .expect("TUN_SUBNET6 is a hard-coded valid CIDR string");
 
         let device = Device::build(|c: &mut MutDeviceConfig| {
             c.tun_name = TUN_DEVICE_NAME.into();
