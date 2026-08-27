@@ -809,10 +809,13 @@ async fn resolve_reports_certificate_rejection_through_a_real_tls_handshake() {
 
 // The `Unreachable` branch is deliberately NOT driven through a real closed
 // socket here: "connect to a port nothing is listening on" has no portable
-// failure shape (macOS black-holes it, GitHub's Windows runners drop SYNs to
-// closed ephemeral loopback ports), so it cannot pin an exact cause. It is
-// covered deterministically by `resolve_maps_every_upstream_cause_to_its_bootstrap_error`
-// and, at the forwarder layer, by `try_forward_reports_unreachable_when_every_server_refuses`.
+// failure shape (macOS black-holes it; Windows refuses it, but only after
+// paying its own SYN-retransmission budget — see `util::syn_budget` — so
+// whether that reports as a connect-layer or a timeout-layer cause depends
+// on whether the test's own budget happens to exceed the host's), so it
+// cannot pin an exact cause. It is covered deterministically by
+// `resolve_maps_every_upstream_cause_to_its_bootstrap_error` and, at the
+// forwarder layer, by `try_forward_reports_unreachable_when_every_server_refuses`.
 
 #[skuld::test]
 async fn resolve_reports_no_answer_through_a_real_trusted_resolver_with_no_records() {
