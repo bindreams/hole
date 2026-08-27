@@ -146,15 +146,11 @@ pub(crate) fn fin(src: SocketAddr, dst: SocketAddr, seq: u32, ack: u32) -> Vec<u
 }
 
 /// A segment carrying `payload`, without `FIN`.
-// Consumed starting with the next commit.
-#[allow(dead_code)]
 pub(crate) fn data(src: SocketAddr, dst: SocketAddr, seq: u32, ack: u32, payload: &[u8]) -> Vec<u8> {
     segment(src, dst, TcpControl::None, seq, Some(ack), payload)
 }
 
 /// A segment carrying `payload` and `FIN` together, in one packet.
-// Consumed starting with the next commit.
-#[allow(dead_code)]
 pub(crate) fn data_fin(src: SocketAddr, dst: SocketAddr, seq: u32, ack: u32, payload: &[u8]) -> Vec<u8> {
     segment(src, dst, TcpControl::Fin, seq, Some(ack), payload)
 }

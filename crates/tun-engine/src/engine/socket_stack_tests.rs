@@ -527,6 +527,157 @@ fn retiring_a_timewait_socket_would_hold_it_but_removing_does_not() {
     assert!(!dropped.sockets.iter().any(|(h, _)| h == handle));
 }
 
+/// The defect, stated as a test (F2, row 2): a FIN that also carries data
+/// stays unacknowledged past the poll that ingests it, because arming the
+/// delayed-ACK timer happens before the ingress ACK check ever runs.
+#[skuld::test]
+fn a_fin_carrying_data_is_acknowledged_before_the_socket_can_be_removed() {
+    let isn = 1000u32;
+    let mut stack = stack();
+    let (handle, _) = established(&mut stack, isn);
+
+    stack.socket_mut(handle).close();
+    stack.poll(t(3));
+    let our_fin = tcp_out(&mut stack);
+    assert_eq!(our_fin.len(), 1);
+    assert_eq!(our_fin[0].control, TcpControl::Fin);
+
+    stack.enqueue_rx(ack(client(), dest(), isn + 1, after(our_fin[0].seq)));
+    stack.poll(t(4));
+    assert_eq!(stack.socket(handle).state(), tcp::State::FinWait2);
+
+    let payload = vec![7u8; 100];
+    stack.enqueue_rx(data_fin(client(), dest(), isn + 1, after(our_fin[0].seq), &payload));
+    stack.poll(t(5));
+    assert_eq!(stack.socket(handle).state(), tcp::State::TimeWait);
+
+    let out = tcp_out(&mut stack);
+    assert_eq!(
+        out.len(),
+        1,
+        "the ACK covering the payload and the FIN leaves on the poll that ingests them"
+    );
+    assert_eq!(
+        out[0].ack,
+        Some(TcpSeqNumber((isn + 1 + payload.len() as u32 + 1) as i32))
+    );
+}
+
+/// The defect, stated as a test (F2, row 3): a bare FIN one millisecond after
+/// its data strands both the data's ACK and the FIN's.
+#[skuld::test]
+fn a_fin_within_the_ack_delay_of_its_data_is_still_acknowledged() {
+    let isn = 1000u32;
+    let mut stack = stack();
+    let (handle, _) = established(&mut stack, isn);
+
+    stack.socket_mut(handle).close();
+    stack.poll(t(3));
+    let our_fin = tcp_out(&mut stack);
+    assert_eq!(our_fin.len(), 1);
+
+    stack.enqueue_rx(ack(client(), dest(), isn + 1, after(our_fin[0].seq)));
+    stack.poll(t(4));
+    assert_eq!(stack.socket(handle).state(), tcp::State::FinWait2);
+
+    let payload = vec![7u8; 100];
+    stack.enqueue_rx(data(client(), dest(), isn + 1, after(our_fin[0].seq), &payload));
+    stack.poll(t(5));
+
+    stack.enqueue_rx(fin(
+        client(),
+        dest(),
+        isn + 1 + payload.len() as u32,
+        after(our_fin[0].seq),
+    ));
+    stack.poll(t(6));
+    assert_eq!(stack.socket(handle).state(), tcp::State::TimeWait);
+
+    let out = tcp_out(&mut stack);
+    let last = out
+        .last()
+        .expect("the client's data and FIN are acknowledged before TIME-WAIT is reached");
+    assert_eq!(
+        last.ack,
+        Some(TcpSeqNumber((isn + 1 + payload.len() as u32 + 1) as i32))
+    );
+}
+
+/// States the order this issue depends on: the ACK for the peer's last
+/// segment is on the wire before the socket is removed, and removal itself
+/// emits nothing. The pre-removal half is what makes this non-vacuous — a
+/// removed handle produces no egress in the buggy tree either.
+#[skuld::test]
+fn a_timewait_socket_acknowledges_before_removal_and_nothing_follows() {
+    let isn = 1000u32;
+    let mut stack = stack();
+    let (handle, _) = established(&mut stack, isn);
+
+    stack.socket_mut(handle).close();
+    stack.poll(t(3));
+    let our_fin = tcp_out(&mut stack);
+    assert_eq!(our_fin.len(), 1);
+
+    stack.enqueue_rx(ack(client(), dest(), isn + 1, after(our_fin[0].seq)));
+    stack.poll(t(4));
+    assert_eq!(stack.socket(handle).state(), tcp::State::FinWait2);
+
+    let payload = vec![7u8; 100];
+    stack.enqueue_rx(data_fin(client(), dest(), isn + 1, after(our_fin[0].seq), &payload));
+    stack.poll(t(5));
+    assert_eq!(stack.socket(handle).state(), tcp::State::TimeWait);
+
+    let out = tcp_out(&mut stack);
+    assert_eq!(
+        out.len(),
+        1,
+        "the ACK for the peer's last segment is on the wire before removal"
+    );
+    assert_eq!(
+        out[0].ack,
+        Some(TcpSeqNumber((isn + 1 + payload.len() as u32 + 1) as i32))
+    );
+
+    stack.remove(handle);
+    stack.poll(t(6));
+    assert!(tcp_out(&mut stack).is_empty(), "a removed socket emits nothing further");
+}
+
+/// The invariant at its source, not per-path: a socket in this stack never
+/// defers an ACK, from the moment it is created through every state a
+/// connection socket passes through. `sockets.add` appears exactly once
+/// (`ensure_listener`), so every socket is that one object at each of these
+/// points — there is no second construction path for a divergence to hide in.
+#[skuld::test]
+fn a_socket_acknowledges_immediately_from_the_moment_it_is_created() {
+    let isn = 1000u32;
+    let mut stack = stack();
+    let handle = half_open(&mut stack, isn);
+    assert_eq!(stack.socket(handle).ack_delay(), None);
+
+    stack.admit(handle, 80);
+    stack.poll(t(1));
+    assert_eq!(stack.socket(handle).ack_delay(), None);
+
+    let synack = tcp_out(&mut stack);
+    assert_eq!(synack.len(), 1);
+    stack.enqueue_rx(ack(client(), dest(), isn + 1, after(synack[0].seq)));
+    stack.poll(t(2));
+    assert_eq!(stack.socket(handle).state(), tcp::State::Established);
+    assert_eq!(stack.socket(handle).ack_delay(), None);
+
+    stack.socket_mut(handle).close();
+    stack.poll(t(3));
+    let our_fin = tcp_out(&mut stack);
+    assert_eq!(our_fin.len(), 1);
+    stack.enqueue_rx(ack(client(), dest(), isn + 1, after(our_fin[0].seq)));
+    stack.poll(t(4));
+    stack.enqueue_rx(fin(client(), dest(), isn + 1, after(our_fin[0].seq)));
+    stack.poll(t(5));
+    assert_eq!(stack.socket(handle).state(), tcp::State::TimeWait);
+    assert_eq!(stack.socket(handle).ack_delay(), None);
+}
+
 /// The defect, stated as a test: the stolen SYN belongs to a connection the
 /// driver already owns, so offering it as a new one would buy a second permit,
 /// a second connection entry and a second upstream dial for one client socket.
