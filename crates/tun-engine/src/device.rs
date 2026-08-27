@@ -9,6 +9,9 @@ pub mod wintun;
 #[path = "device_tests.rs"]
 mod device_tests;
 
+#[cfg(all(test, target_os = "windows"))]
+mod ipv6_addr_privileged_tests;
+
 pub use config::{DeviceConfig, MutDeviceConfig};
 pub use ipv6_addr::Assigned;
 

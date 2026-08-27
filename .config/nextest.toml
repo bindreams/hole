@@ -43,6 +43,10 @@ nextest-version = "0.9.130"
 #     never run beside each other):
 #     crates/tun-engine/src/routing/failclosed/live_tun_permit_privileged_tests.rs
 #     crates/bridge/src/proxy_manager_live_tun_permit_e2e_tests.rs
+#   - `tun_device_ipv6_` substring (creates a real wintun adapter and reads the
+#     host's whole AF_INET6 unicast address table, so a concurrent bridge e2e's
+#     TUN would both perturb it and be perturbed by it):
+#     crates/tun-engine/src/device/ipv6_addr_privileged_tests.rs
 #   - `e2e_socks5_udp_associate_roundtrip` (pre-existing, made reachable by
 #     #874): `labels = [DIST_BIN, TUN], serial = TUN` in
 #     crates/bridge/src/proxy_manager_listener_e2e_tests.rs, but it lives in a
@@ -61,5 +65,5 @@ nextest-version = "0.9.130"
 max-threads = 1
 
 [[profile.default.overrides]]
-filter = 'test(/_full_tunnel_roundtrip$/) + test(/windows_lockdown_permits_server_ip_/) + test(/macos_lockdown_permits_server_ip_/) + test(/failclosed_permits_/) + test(/release_all_/) + test(/cutover_global_net_state_/) + test(/live_tun_permit_/) + test(/e2e_socks5_udp_associate_roundtrip/)'
+filter = 'test(/_full_tunnel_roundtrip$/) + test(/windows_lockdown_permits_server_ip_/) + test(/macos_lockdown_permits_server_ip_/) + test(/failclosed_permits_/) + test(/release_all_/) + test(/cutover_global_net_state_/) + test(/live_tun_permit_/) + test(/tun_device_ipv6_/) + test(/e2e_socks5_udp_associate_roundtrip/)'
 test-group = 'global-net-state'
