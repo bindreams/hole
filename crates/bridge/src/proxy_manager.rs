@@ -1529,6 +1529,26 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
             None
         };
 
+        // The identity of the TUN device this start opened — the LUID and
+        // alias of the concrete OS object, never a name lookup
+        // (bindreams/hole#846). Threaded to `Dns::apply` below.
+        //
+        // Under `#[cfg(test)]` the dispatcher is stubbed out (creating a
+        // real TUN needs elevation), so no `hole-tun` exists on a clean
+        // machine — a synthetic identity stands in instead. This is what
+        // makes Phase 7 reachable and observable from a unit test on any
+        // machine, not just one with a leftover `hole-tun`; see Q3 in the
+        // #846 plan for why the alternative (resolving the alias via a raw
+        // OS call here) is wrong on both safety and testability grounds.
+        #[cfg(not(test))]
+        let tun_identity = dispatcher
+            .as_ref()
+            .expect("dispatcher is always Some on the production (#[cfg(not(test))]) path")
+            .identity()
+            .clone();
+        #[cfg(test)]
+        let tun_identity = tun_engine::TunIdentity::synthetic(0xFEED, TUN_DEVICE_NAME);
+
         // Phase 6: cancel checkpoint before routing.install (sync; mid-
         // call preemption isn't structurally possible — netsh/route
         // shell-outs are uninterruptible from our process).
@@ -1537,6 +1557,13 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         }
         // Install the routes — NOW traffic starts flowing to the TUN.
         let routes = routing.install(TUN_DEVICE_NAME, server_ip, gw_info.gateway_ip, &gw_info.interface_name)?;
+
+        // Process image paths for App-ID permits — the standing lockdown
+        // cover's own permit AND (bindreams/hole#846) the DNS confinement's:
+        // required, not optional (Q9) — without it, a plugin re-resolving a
+        // hostname during the galoshes yamux self-heal can only reach DNS
+        // through the tunnel it is trying to rebuild.
+        let app_ids = lockdown_app_ids(config);
 
         // Standing lockdown cover (#527). Engaged only when intent is on; when
         // off this whole block is a no-op and the start is byte-identical to
@@ -1547,48 +1574,41 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         // unwind, tearing down — the opposite of the transient cover's
         // fail-open. Committed only on the Ok path (the field below).
         let lockdown = if state_dir.map(lockdown_state::load_enabled).unwrap_or(false) {
-            let app_ids = lockdown_app_ids(config);
             Some(routing.install_lockdown(server_ip, TUN_DEVICE_NAME, &app_ids)?)
         } else {
             None
         };
 
-        // Phase 7: apply system DNS AFTER routes install so the OS
+        // Phase 7: confine DNS egress to hole-tun and advertise the
+        // configured resolver IPs on it, AFTER routes install so the OS
         // "best-route to DNS server" lookup resolves through the TUN.
-        // We advertise the configured upstream resolver IPs — OS UDP/53 to
-        // them routes into hole-tun and is intercepted by the in-TUN
-        // LocalDnsEndpoint; OS TCP/53 falls through the proxy cascade to the
-        // real resolver over the tunnel. (No loopback :53 server.)
-        // Pass the FULL list, not a v4 filter: `set_servers` advertises both
-        // the v4 and v6 families from their own entries (an unconfigured
-        // family is left untouched), so a mixed or v6 resolver list is carried
-        // end-to-end on both platforms. Persist + apply are cancel-aware inside
-        // `Dns::apply`. Non-cancel Io failures → warn! + None.
+        // OS UDP/53 to those IPs routes into hole-tun and is intercepted by
+        // the in-TUN LocalDnsEndpoint; OS TCP/53 falls through the proxy
+        // cascade to the real resolver over the tunnel. (No loopback :53
+        // server.) Pass the FULL list, not a v4 filter: `set_servers`
+        // advertises both the v4 and v6 families from their own entries (an
+        // unconfigured family is left untouched), so a mixed or v6 resolver
+        // list is carried end-to-end on both platforms.
+        //
+        // FAIL-FATAL on both error shapes (Q5): after #846 removed the
+        // upstream-adapter rewrite, the WFP confinement (Windows) is the
+        // ONLY thing standing between OS DNS and the LAN resolver — a
+        // degraded-but-running session here would be a silent leak on a
+        // session the UI reports as connected. `Cancelled` and every other
+        // `DnsError` unwind the locally-owned `lockdown` / `routes` guards.
         let dns_applied = if forwarder.is_some() {
             let advertise_ips: Vec<IpAddr> = config.dns.servers.clone();
-            // Capture runs on upstream only; the TUN was created by
-            // `routing.install` above so its prior is definitionally
-            // "defaults". Apply runs on both so the OS's best-route-to-DNS
-            // lookup lands on a TUN-routed resolver IP.
-            let capture_aliases = vec![gw_info.interface_name.clone()];
-            let apply_aliases = vec![TUN_DEVICE_NAME.into(), gw_info.interface_name.clone()];
             match dns
-                .apply(
-                    advertise_ips,
-                    capture_aliases,
-                    apply_aliases,
-                    state_dir.map(std::path::Path::to_path_buf),
-                    owner,
-                    cancel.clone(),
-                )
+                .apply(advertise_ips, tun_identity, server_ip, app_ids, cancel.clone())
                 .await
             {
                 Ok(a) => Some(a),
                 Err(DnsError::Cancelled) => return Err(ProxyError::Cancelled),
-                Err(DnsError::Io(e)) => {
-                    warn!(error = %e, "system DNS apply failed; in-tunnel DNS unreachable by OS clients");
-                    None
+                #[cfg(target_os = "windows")]
+                Err(DnsError::Confine(e)) => {
+                    return Err(ProxyError::DnsConfinementFailed { reason: e.to_string() });
                 }
+                Err(DnsError::Io(e)) => return Err(ProxyError::Runtime(e)),
             }
         } else {
             None

@@ -172,6 +172,15 @@ pub enum ProxyError {
     /// filesystem path.
     #[error("{}", tun_engine::DeviceError::ForeignAdapter { alias: alias.clone() })]
     ForeignAdapter { alias: String },
+    /// The DNS-egress confinement (bindreams/hole#846, Windows-only) could
+    /// not be engaged. Fail-fatal (Q5 in the #846 plan): after #846 removed
+    /// the upstream-adapter DNS rewrite, the confinement is the only thing
+    /// standing between OS DNS and the LAN resolver, so a session that
+    /// could not confine it must not go live. PII-free by construction —
+    /// `reason` is the confinement error's own `Display`, which names no
+    /// path.
+    #[error("could not confine DNS to the tunnel: {reason}")]
+    DnsConfinementFailed { reason: String },
 }
 
 impl From<&ProxyError> for hole_common::protocol::StartError {
@@ -204,7 +213,8 @@ impl From<&ProxyError> for hole_common::protocol::StartError {
             | ProxyError::TunnelSetupIncomplete { .. }
             | ProxyError::NoTunnelConnection { .. }
             | ProxyError::LockdownIntentNotPersisted
-            | ProxyError::ForeignAdapter { .. } => StartError::Failed { message: e.to_string() },
+            | ProxyError::ForeignAdapter { .. }
+            | ProxyError::DnsConfinementFailed { .. } => StartError::Failed { message: e.to_string() },
         }
     }
 }

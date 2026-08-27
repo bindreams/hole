@@ -11,15 +11,17 @@ use tokio_util::sync::CancellationToken;
 
 use crate::dns::system::{Dns, DnsApplied, DnsError};
 
-/// One recorded [`Dns::apply`] call. `targets` is named generically —
-/// not `apply_aliases` — because bindreams/hole#846 replaces the
-/// alias-list argument with a single `TunIdentity` target; keeping the
-/// field name stable across that signature change means tests written
-/// against it don't need touching twice.
+/// One recorded [`Dns::apply`] call. `targets` is named generically — not
+/// `apply_aliases` — because it now carries the single `TunIdentity`'s
+/// alias wrapped in a one-element `Vec`, matching what the field held
+/// before bindreams/hole#846's signature change; tests written against the
+/// field name don't need touching twice.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct DnsApplyCall {
     pub(crate) advertise_ips: Vec<IpAddr>,
     pub(crate) targets: Vec<String>,
+    pub(crate) server_ip: IpAddr,
+    pub(crate) app_ids: Vec<PathBuf>,
 }
 
 /// Instrumentation shared between `MockDns` and the handle a test clones
@@ -27,10 +29,22 @@ pub(crate) struct DnsApplyCall {
 #[derive(Default)]
 pub(crate) struct MockDnsState {
     calls: Mutex<Vec<DnsApplyCall>>,
-    /// Set once `MockDnsApplied::shutdown` has run. Not yet read by any
-    /// test in this task; a later #846 task asserts on it directly.
-    #[allow(dead_code)]
     shutdown_called: std::sync::atomic::AtomicBool,
+    /// When `Some`, `apply` returns this error instead of recording a call
+    /// or succeeding. Lets a test simulate a `DnsError::Confine` /
+    /// `DnsError::Cancelled` / `DnsError::Io` failure without a real
+    /// confinement or backend.
+    fail_with: Mutex<Option<FailKind>>,
+}
+
+/// Which [`DnsError`] variant [`MockDns::apply`] should return, chosen by a
+/// test via [`MockDns::fail_with`]. A plain enum (not the error itself) —
+/// `DnsError` isn't `Clone`, and a test only ever needs to select a shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FailKind {
+    Cancelled,
+    #[cfg(target_os = "windows")]
+    Confine,
 }
 
 impl MockDnsState {
@@ -38,7 +52,6 @@ impl MockDnsState {
         self.calls.lock().unwrap().clone()
     }
 
-    #[allow(dead_code)]
     pub(crate) fn shutdown_called(&self) -> bool {
         self.shutdown_called.load(std::sync::atomic::Ordering::SeqCst)
     }
@@ -58,6 +71,13 @@ impl MockDns {
     pub(crate) fn state_handle(&self) -> Arc<MockDnsState> {
         Arc::clone(&self.state)
     }
+
+    /// Make every subsequent `apply` call return the given error kind
+    /// instead of recording a call.
+    pub(crate) fn fail_with(self, kind: FailKind) -> Self {
+        *self.state.fail_with.lock().unwrap() = Some(kind);
+        self
+    }
 }
 
 impl Dns for MockDns {
@@ -66,19 +86,25 @@ impl Dns for MockDns {
     async fn apply(
         &self,
         advertise_ips: Vec<IpAddr>,
-        capture_aliases: Vec<String>,
-        apply_aliases: Vec<String>,
-        _state_dir: Option<PathBuf>,
-        _owner: Option<(u32, u32)>,
+        tun: tun_engine::TunIdentity,
+        server_ip: IpAddr,
+        app_ids: Vec<PathBuf>,
         _cancel: CancellationToken,
     ) -> Result<Self::Applied, DnsError> {
-        // Pre-#846 signature still carries a separate capture list; the
-        // targets this mock records are the apply side, which is what
-        // #846's guard tests care about.
-        let _ = capture_aliases;
+        if let Some(kind) = *self.state.fail_with.lock().unwrap() {
+            return Err(match kind {
+                FailKind::Cancelled => DnsError::Cancelled,
+                #[cfg(target_os = "windows")]
+                FailKind::Confine => DnsError::Confine(tun_engine::dns_confine::DnsConfineError::EngineOpen(
+                    std::io::Error::other("mock confine failure"),
+                )),
+            });
+        }
         self.state.calls.lock().unwrap().push(DnsApplyCall {
             advertise_ips,
-            targets: apply_aliases,
+            targets: vec![tun.alias().to_string()],
+            server_ip,
+            app_ids,
         });
         Ok(MockDnsApplied {
             state: Arc::clone(&self.state),

@@ -1,25 +1,111 @@
+use std::net::{IpAddr, Ipv4Addr};
+use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+use std::sync::Mutex;
+
 use super::*;
+use crate::dns_state::{DnsPrior, DnsPriorAdapter, DnsState, SCHEMA_VERSION};
+
+fn write_state(dir: &std::path::Path, state: &DnsState) {
+    let json = serde_json::to_vec_pretty(state).unwrap();
+    std::fs::write(dir.join(dns_state::STATE_FILE_NAME), json).unwrap();
+}
+
+// MockBackend (Windows) ===============================================================================================
+
+#[cfg(target_os = "windows")]
+mod win {
+    use super::*;
+    use crate::dns::system::windows::WinDnsBackend;
+
+    /// A recording, fully-controllable `WinDnsBackend` for the upgrade
+    /// sweep. `get_settings` returns whatever `live` says for the alias;
+    /// `restore_family` records the call and can be told to fail.
+    pub(super) struct MockBackend {
+        pub(super) live: Mutex<std::collections::HashMap<String, DnsPriorAdapter>>,
+        pub(super) restore_family_calls: AtomicUsize,
+        pub(super) get_settings_calls: AtomicUsize,
+        pub(super) fail_restore: std::sync::atomic::AtomicBool,
+    }
+
+    impl MockBackend {
+        pub(super) fn new() -> Self {
+            Self {
+                live: Mutex::new(std::collections::HashMap::new()),
+                restore_family_calls: AtomicUsize::new(0),
+                get_settings_calls: AtomicUsize::new(0),
+                fail_restore: std::sync::atomic::AtomicBool::new(false),
+            }
+        }
+
+        pub(super) fn seed(&self, alias: &str, adapter: DnsPriorAdapter) {
+            self.live.lock().unwrap().insert(alias.to_string(), adapter);
+        }
+    }
+
+    impl WinDnsBackend for MockBackend {
+        fn get_settings(&self, alias: &str) -> std::io::Result<Option<DnsPriorAdapter>> {
+            self.get_settings_calls.fetch_add(1, SeqCst);
+            Ok(self.live.lock().unwrap().get(alias).cloned())
+        }
+
+        fn set_servers(&self, _alias: &str, _servers: &[IpAddr]) -> std::io::Result<()> {
+            unreachable!("the upgrade sweep never calls set_servers")
+        }
+
+        fn restore(&self, _adapter: &DnsPriorAdapter) -> std::io::Result<()> {
+            unreachable!("the upgrade sweep restores per-family, never both at once")
+        }
+
+        fn restore_family(&self, alias: &str, ipv6: bool, prior: &DnsPrior) -> std::io::Result<()> {
+            self.restore_family_calls.fetch_add(1, SeqCst);
+            if self.fail_restore.load(SeqCst) {
+                return Err(std::io::Error::other("mock restore_family failure"));
+            }
+            let mut live = self.live.lock().unwrap();
+            if let Some(adapter) = live.get_mut(alias) {
+                if ipv6 {
+                    adapter.v6 = prior.clone();
+                } else {
+                    adapter.v4 = prior.clone();
+                }
+            }
+            Ok(())
+        }
+
+        fn flush(&self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+use win::MockBackend;
+
+fn v4(ip: (u8, u8, u8, u8)) -> IpAddr {
+    IpAddr::V4(Ipv4Addr::new(ip.0, ip.1, ip.2, ip.3))
+}
+
+// Tests ===============================================================================================================
 
 #[skuld::test]
 fn recover_when_no_state_file_is_noop() {
     let dir = tempfile::tempdir().unwrap();
-    // Should not panic, should not create any files.
     recover_dns_config(dir.path());
     assert!(!dir.path().join(dns_state::STATE_FILE_NAME).exists());
+    assert!(!dir.path().join(dns_state::SUPERSEDED_FILE_NAME).exists());
 }
 
 #[skuld::test]
-fn recover_clears_state_file_after_restore() {
+fn recover_clears_state_file_with_no_adapters() {
+    // Empty adapters list is vacuously "every adapter settled" — matches
+    // the pre-#846 behavior of clearing on a no-op restore.
     let dir = tempfile::tempdir().unwrap();
-    let state = dns_state::DnsState {
-        version: dns_state::SCHEMA_VERSION,
-        advertised: vec![std::net::IpAddr::V4(std::net::Ipv4Addr::new(1, 1, 1, 1))],
-        // Empty adapters list — restore_all is a no-op so no platform
-        // commands get invoked (safe in CI).
+    let state = DnsState {
+        version: SCHEMA_VERSION,
+        advertised: vec![v4((1, 1, 1, 1))],
         adapters: Vec::new(),
     };
-    dns_state::save(dir.path(), &state, None).unwrap();
-    assert!(dir.path().join(dns_state::STATE_FILE_NAME).exists());
+    write_state(dir.path(), &state);
     recover_dns_config(dir.path());
     assert!(!dir.path().join(dns_state::STATE_FILE_NAME).exists());
 }
@@ -38,103 +124,264 @@ fn recover_wrong_version_leaves_state_file_alone() {
     assert!(dir.path().join(dns_state::STATE_FILE_NAME).exists());
 }
 
-/// Backward-compat: a `bridge-dns.json` persisted by a pre-Phase-4 binary
-/// could contain a TUN adapter entry (old code captured both TUN and
-/// upstream; Phase 4 captures upstream only). On recovery after an upgrade,
-/// the TUN adapter from the crashed run no longer exists — `restore_all`
-/// must log-and-continue per-adapter rather than crashing. This test pins
-/// that behavior so a future refactor doesn't regress it.
-#[cfg(any(target_os = "windows", target_os = "macos"))]
+#[cfg(target_os = "windows")]
 #[skuld::test]
-fn recover_tolerates_legacy_state_file_with_tun_entry() {
-    use crate::dns_state::{AdapterId, DnsPrior, DnsPriorAdapter, DnsState, SCHEMA_VERSION};
-
+fn recover_dns_config_restores_a_pre_846_file() {
     let dir = tempfile::tempdir().unwrap();
-
-    // Adapter id uses the platform shape. `hole-tun` on Windows,
-    // `hole-tun-service` stand-in on macOS — the test only exercises
-    // the "load + iterate + log-continue" shape, not the platform
-    // restore payload itself.
-    #[cfg(target_os = "windows")]
-    let tun_id = AdapterId::WindowsAlias {
-        value: "hole-tun".into(),
+    let advertised = vec![v4((1, 1, 1, 1)), v4((1, 0, 0, 1))];
+    let prior = DnsPriorAdapter {
+        id: AdapterId::WindowsAlias {
+            value: "Ethernet".into(),
+        },
+        name_at_capture: "Ethernet".into(),
+        v4: DnsPrior::Dhcp,
+        v6: DnsPrior::None,
     };
-    #[cfg(target_os = "macos")]
-    let tun_id = AdapterId::MacosServiceName {
-        value: "hole-tun-service".into(),
-    };
-
-    let legacy_state = DnsState {
+    let state = DnsState {
         version: SCHEMA_VERSION,
-        advertised: vec![std::net::IpAddr::V4(std::net::Ipv4Addr::new(1, 1, 1, 1))],
-        adapters: vec![DnsPriorAdapter {
-            id: tun_id,
-            name_at_capture: "hole-tun".into(),
-            v4: DnsPrior::None,
-            v6: DnsPrior::None,
-        }],
+        advertised: advertised.clone(),
+        adapters: vec![prior.clone()],
     };
-    dns_state::save(dir.path(), &legacy_state, None).unwrap();
+    write_state(dir.path(), &state);
 
-    // Should not panic; should clear the file regardless of whether the
-    // TUN restore succeeded (it won't — there's no TUN adapter to
-    // restore onto, but `restore_all` logs-and-continues).
-    recover_dns_config(dir.path());
+    let backend = MockBackend::new();
+    // Live v4 still equals `advertised` — the setting is still Hole's.
+    backend.seed(
+        "Ethernet",
+        DnsPriorAdapter {
+            id: prior.id.clone(),
+            name_at_capture: "Ethernet".into(),
+            v4: DnsPrior::Static { servers: advertised },
+            v6: DnsPrior::None,
+        },
+    );
 
+    recover_dns_config_with(dir.path(), &backend);
+
+    assert_eq!(
+        backend.restore_family_calls.load(SeqCst),
+        1,
+        "v4 must be restored once (v6 was already None == None, AlreadyCorrect, no write)"
+    );
     assert!(
         !dir.path().join(dns_state::STATE_FILE_NAME).exists(),
-        "state file should be cleared even when TUN restore fails"
+        "a fully-confirmed restore must delete the file"
     );
+    assert!(!dir.path().join(dns_state::SUPERSEDED_FILE_NAME).exists());
 }
 
-/// crash+upgrade recovery: a `bridge-dns.json` left by a crashed older
-/// binary uses the OLD shape (`version: 1`, scalar `chosen_loopback`,
-/// no `advertised`). The new binary MUST still load it and restore
-/// the user's OS DNS from `adapters` — otherwise the user is stranded with
-/// OS DNS stuck at a dead `127.0.0.1`. This pins that `DnsState` stays
-/// version 1 + tolerant (no `deny_unknown_fields`, `advertised` defaults),
-/// so a naive version bump that rejects the v1 file is caught here.
-#[cfg(any(target_os = "windows", target_os = "macos"))]
+#[cfg(target_os = "windows")]
 #[skuld::test]
-fn recover_v1_state_file_restores_adapters_after_upgrade() {
+fn recover_dns_config_skips_an_adapter_that_moved_on() {
     let dir = tempfile::tempdir().unwrap();
+    let advertised = vec![v4((1, 1, 1, 1))];
+    let prior = DnsPriorAdapter {
+        id: AdapterId::WindowsAlias {
+            value: "Ethernet".into(),
+        },
+        name_at_capture: "Ethernet".into(),
+        v4: DnsPrior::Static {
+            servers: vec![v4((10, 0, 0, 1))],
+        },
+        v6: DnsPrior::None,
+    };
+    let state = DnsState {
+        version: SCHEMA_VERSION,
+        advertised: advertised.clone(),
+        adapters: vec![prior.clone()],
+    };
+    write_state(dir.path(), &state);
 
-    // Platform-shaped adapter id, mirroring
-    // `recover_tolerates_legacy_state_file_with_tun_entry`. The adapter
-    // won't exist on the CI host, so `restore_all` log-and-continues — the
-    // test exercises "load v1 file + iterate adapters + clear file", not a
-    // real OS restore payload.
-    #[cfg(target_os = "windows")]
-    let id = serde_json::json!({ "kind": "windows_alias", "value": "hole-recover-test-xyz" });
-    #[cfg(target_os = "macos")]
-    let id = serde_json::json!({ "kind": "macos_service_name", "value": "hole-recover-test-xyz" });
+    let backend = MockBackend::new();
+    // Live v4 is neither `advertised` nor the recorded prior — a
+    // different network entirely. Must not be touched.
+    backend.seed(
+        "Ethernet",
+        DnsPriorAdapter {
+            id: prior.id.clone(),
+            name_at_capture: "Ethernet".into(),
+            v4: DnsPrior::Static {
+                servers: vec![v4((192, 168, 50, 1))],
+            },
+            v6: DnsPrior::None,
+        },
+    );
 
-    // OLD v1 on-disk shape — what an older binary wrote.
-    let v1_json = serde_json::json!({
-        "version": 1,
-        "chosen_loopback": "127.0.0.1:53",
+    recover_dns_config_with(dir.path(), &backend);
+
+    assert_eq!(
+        backend.restore_family_calls.load(SeqCst),
+        0,
+        "an adapter that moved on must never be written to"
+    );
+    assert!(
+        dir.path().join(dns_state::STATE_FILE_NAME).exists()
+            || dir.path().join(dns_state::SUPERSEDED_FILE_NAME).exists(),
+        "the file must survive one way or the other — it is network-reset.py's only input"
+    );
+    assert!(
+        !dir.path().join(dns_state::STATE_FILE_NAME).exists(),
+        "an unconfirmed restore must not leave the un-suffixed name — it would be re-evaluated"
+    );
+    assert!(dir.path().join(dns_state::SUPERSEDED_FILE_NAME).exists());
+}
+
+#[cfg(target_os = "windows")]
+#[skuld::test]
+fn recover_dns_config_preserves_a_file_with_no_advertised_evidence() {
+    let dir = tempfile::tempdir().unwrap();
+    // A file with NO `advertised` key loads as `[]` — no sound evidence.
+    let json = serde_json::json!({
+        "version": SCHEMA_VERSION,
         "adapters": [{
-            "id": id,
-            "name_at_capture": "hole-recover-test-xyz",
+            "id": { "kind": "windows_alias", "value": "Ethernet" },
+            "name_at_capture": "Ethernet",
             "v4": { "kind": "dhcp" },
             "v6": { "kind": "none" },
         }],
     });
-    std::fs::write(dir.path().join(dns_state::STATE_FILE_NAME), v1_json.to_string()).unwrap();
+    std::fs::write(dir.path().join(dns_state::STATE_FILE_NAME), json.to_string()).unwrap();
 
-    // Sanity: the v1 file loads despite the obsolete `chosen_loopback` key
-    // and missing `advertised`, with `adapters` intact (recovery's input).
-    let loaded = dns_state::load(dir.path()).expect("v1 file must load post-upgrade");
-    assert!(
-        loaded.advertised.is_empty(),
-        "advertised defaults to empty for a v1 file"
+    let backend = MockBackend::new();
+    backend.seed(
+        "Ethernet",
+        DnsPriorAdapter {
+            id: AdapterId::WindowsAlias {
+                value: "Ethernet".into(),
+            },
+            name_at_capture: "Ethernet".into(),
+            v4: DnsPrior::Static {
+                servers: vec![v4((1, 1, 1, 1))],
+            },
+            v6: DnsPrior::None,
+        },
     );
-    assert_eq!(loaded.adapters.len(), 1, "the adapter to restore must survive the load");
 
-    // Recovery restores from `adapters` and clears the file on success.
-    recover_dns_config(dir.path());
+    recover_dns_config_with(dir.path(), &backend);
+
+    assert_eq!(
+        backend.restore_family_calls.load(SeqCst),
+        0,
+        "no evidence means no write, regardless of what the live setting happens to be"
+    );
     assert!(
         !dir.path().join(dns_state::STATE_FILE_NAME).exists(),
-        "v1 leaked state must be recovered (loaded + restored + cleared), not discarded"
+        "must not leave the un-suffixed name — R0-2: the inverted gate manufactured a lockout here"
+    );
+    assert!(
+        dir.path().join(dns_state::SUPERSEDED_FILE_NAME).exists(),
+        "must preserve the file (renamed) — it is still network-reset.py's only input"
+    );
+}
+
+#[cfg(target_os = "windows")]
+#[skuld::test]
+fn recover_dns_config_never_evaluates_the_same_file_twice() {
+    let dir = tempfile::tempdir().unwrap();
+    let advertised = vec![v4((1, 1, 1, 1))];
+    let prior = DnsPriorAdapter {
+        id: AdapterId::WindowsAlias {
+            value: "Ethernet".into(),
+        },
+        name_at_capture: "Ethernet".into(),
+        v4: DnsPrior::Dhcp,
+        v6: DnsPrior::None,
+    };
+    let state = DnsState {
+        version: SCHEMA_VERSION,
+        advertised: advertised.clone(),
+        adapters: vec![prior],
+    };
+    write_state(dir.path(), &state);
+
+    let backend = MockBackend::new();
+    // Live v4 does NOT match `advertised` — first run preserves the file
+    // (superseded), second run must not touch it again at all.
+    backend.seed(
+        "Ethernet",
+        DnsPriorAdapter {
+            id: AdapterId::WindowsAlias {
+                value: "Ethernet".into(),
+            },
+            name_at_capture: "Ethernet".into(),
+            v4: DnsPrior::Static {
+                servers: vec![v4((8, 8, 8, 8))],
+            },
+            v6: DnsPrior::None,
+        },
+    );
+
+    recover_dns_config_with(dir.path(), &backend);
+    let get_calls_after_first = backend.get_settings_calls.load(SeqCst);
+    assert!(get_calls_after_first > 0);
+
+    // Second run: the un-suffixed name is gone, so `load` (which only ever
+    // reads that name) must see nothing.
+    recover_dns_config_with(dir.path(), &backend);
+    assert_eq!(
+        backend.get_settings_calls.load(SeqCst),
+        get_calls_after_first,
+        "a second run must not re-read the foreign adapter at all — the file was already evaluated once"
+    );
+}
+
+#[cfg(target_os = "windows")]
+#[skuld::test]
+fn restore_gate_is_per_family() {
+    // v4 matches the evidence and must restore; v6 holds the user's own
+    // (never-Hole's) resolvers and must be left alone — and must not veto
+    // the v4 restore.
+    let dir = tempfile::tempdir().unwrap();
+    let advertised = vec![v4((1, 1, 1, 1))]; // v4-only advertised (the shipped default shape)
+    let prior = DnsPriorAdapter {
+        id: AdapterId::WindowsAlias {
+            value: "Ethernet".into(),
+        },
+        name_at_capture: "Ethernet".into(),
+        v4: DnsPrior::Dhcp,
+        v6: DnsPrior::Static {
+            servers: vec!["2001:db8::1".parse().unwrap()],
+        },
+    };
+    let state = DnsState {
+        version: SCHEMA_VERSION,
+        advertised,
+        adapters: vec![prior.clone()],
+    };
+    write_state(dir.path(), &state);
+
+    let backend = MockBackend::new();
+    backend.seed(
+        "Ethernet",
+        DnsPriorAdapter {
+            id: prior.id.clone(),
+            name_at_capture: "Ethernet".into(),
+            v4: DnsPrior::Static {
+                servers: vec![v4((1, 1, 1, 1))],
+            },
+            // The user's OWN v6 resolver — Hole never advertised any v6,
+            // so this family has no evidence and must not be touched.
+            v6: DnsPrior::Static {
+                servers: vec!["2001:db8::dead".parse().unwrap()],
+            },
+        },
+    );
+
+    recover_dns_config_with(dir.path(), &backend);
+
+    assert_eq!(
+        backend.restore_family_calls.load(SeqCst),
+        1,
+        "exactly the v4 family must be restored"
+    );
+    let live = backend.live.lock().unwrap();
+    let adapter = live.get("Ethernet").unwrap();
+    assert_eq!(adapter.v4, DnsPrior::Dhcp, "v4 must be restored to its recorded prior");
+    assert_eq!(
+        adapter.v6,
+        DnsPrior::Static {
+            servers: vec!["2001:db8::dead".parse().unwrap()]
+        },
+        "v6 (no evidence) must be left exactly as it was — never overwritten by the v4 verdict"
     );
 }

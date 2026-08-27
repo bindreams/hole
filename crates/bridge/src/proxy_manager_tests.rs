@@ -233,6 +233,11 @@ pub(super) struct MockRouting {
     /// routing a `TempDir` (see `new_manager`) to keep writes isolated.
     state_dir: PathBuf,
     gateway: IpAddr,
+    /// `GatewayInfo::interface_name` returned by `default_gateway`. Default
+    /// "MockEthernet"; a test can override it via
+    /// [`Self::with_gateway_interface_name`] to stand in for a foreign VPN
+    /// adapter (bindreams/hole#846's `dns_apply_targets_only_the_hole_tun`).
+    gateway_interface_name: String,
 }
 
 impl MockRouting {
@@ -241,7 +246,13 @@ impl MockRouting {
             state: Arc::new(MockRoutingState::default()),
             state_dir,
             gateway: IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)),
+            gateway_interface_name: "MockEthernet".into(),
         }
+    }
+
+    fn with_gateway_interface_name(mut self, name: &str) -> Self {
+        self.gateway_interface_name = name.into();
+        self
     }
 
     fn failing_install(state_dir: PathBuf) -> Self {
@@ -312,7 +323,7 @@ impl Routing for MockRouting {
         }
         Ok(GatewayInfo {
             gateway_ip: self.gateway,
-            interface_name: "MockEthernet".into(),
+            interface_name: self.gateway_interface_name.clone(),
             interface_index: 1,
             ipv6_available: false,
         })
@@ -1676,24 +1687,71 @@ fn reload_when_not_running_starts() {
         pm.stop().await.unwrap();
     });
 }
-
 // DNS-apply instrumentation tests =====================================================================================
+//
+// `dns_apply_skips_tun_from_capture_keeps_in_apply` (pre-#846) pinned the
+// old capture-upstream/apply-both asymmetry — meaningless once #846 deleted
+// capture and both this crate and the confinement carry exactly one target
+// (`hole-tun`). It is deleted with the mechanism it pinned; the ONE
+// production target is now pinned by `dns_apply_targets_only_the_hole_tun`
+// below, which drives `start_inner`, not a hand-built `SystemDns::apply`
+// call.
 
 /// Smoke-test: `apply_dns_settings` must emit an INFO log
-/// `"apply_dns_settings done"` with an `elapsed_ms` field so the ~10s
-/// stall is diagnosable without raising the log level.
-///
-/// Uses a nonexistent upstream interface name so the underlying `netsh` /
-/// `networksetup` calls fail fast (adapter not found), but the wrapping
-/// instrumentation still emits the diagnostic.
+/// `"apply_dns_settings done"` with an `elapsed_ms` field so a slow apply
+/// is diagnosable without raising the log level. Uses mock backend +
+/// confiner (both succeeding) — post-#846 `apply` is fail-fatal on a real
+/// failure (Q5), so a real-but-nonexistent alias can no longer be used to
+/// force a fast no-op path the way the pre-#846 version of this test did.
+#[cfg(target_os = "windows")]
 #[skuld::test]
 fn dns_apply_emits_done_info_log() {
-    use crate::dns::system::{Dns, SystemDns};
+    use crate::dns::system::windows::{DnsConfiner, WinDnsBackend};
+    use crate::dns::system::{Dns, DnsApplied, SystemDns};
+    use crate::dns_state::{AdapterId, DnsPrior, DnsPriorAdapter};
     use crate::test_support::log_capture::VecWriter;
     use std::net::{IpAddr, Ipv4Addr};
+    use std::sync::Arc;
     use tokio_util::sync::CancellationToken;
     use tracing_subscriber::fmt;
     use tracing_subscriber::layer::{Layer, SubscriberExt};
+
+    struct OkBackend;
+    impl WinDnsBackend for OkBackend {
+        fn get_settings(&self, alias: &str) -> std::io::Result<Option<DnsPriorAdapter>> {
+            Ok(Some(DnsPriorAdapter {
+                id: AdapterId::WindowsAlias {
+                    value: alias.to_string(),
+                },
+                name_at_capture: alias.to_string(),
+                v4: DnsPrior::None,
+                v6: DnsPrior::None,
+            }))
+        }
+        fn set_servers(&self, _alias: &str, _servers: &[IpAddr]) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn restore(&self, _adapter: &DnsPriorAdapter) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn restore_family(&self, _alias: &str, _ipv6: bool, _prior: &DnsPrior) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn flush(&self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    struct OkConfiner;
+    impl DnsConfiner for OkConfiner {
+        fn engage(
+            &self,
+            _tun_luid: u64,
+            _server_ip: IpAddr,
+            _app_ids: &[std::path::PathBuf],
+        ) -> Result<Box<dyn std::any::Any + Send>, tun_engine::dns_confine::DnsConfineError> {
+            Ok(Box::new(()))
+        }
+    }
 
     // Current-thread runtime so `tokio::spawn` in `SystemDns::apply`
     // (or anything downstream) stays on the test thread. The helper
@@ -1712,21 +1770,17 @@ fn dns_apply_emits_done_info_log() {
             );
             let _guard = garter::tracing_test::set_default_in_current_thread(subscriber);
 
-            let dns = SystemDns::default();
-            // Adapter doesn't exist — `Win32Real::get_settings` returns
-            // `Ok(None)` so nothing is captured and apply also no-ops, but
-            // the surrounding `apply_dns_settings done` INFO log still fires.
+            let dns = SystemDns::new_with_backend(Arc::new(OkBackend), Arc::new(OkConfiner));
             let mut applied = dns
                 .apply(
                     vec![IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))],
-                    vec!["hole-test-nonexistent-iface-xyz".into()],
-                    vec![],
-                    None,
-                    None,
+                    tun_engine::TunIdentity::synthetic(0xFEED, "hole-tun"),
+                    IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7)),
+                    Vec::new(),
                     CancellationToken::new(),
                 )
                 .await
-                .expect("apply ok with missing adapter");
+                .expect("apply ok");
             applied.shutdown().await;
 
             let output = writer.snapshot_string();
@@ -1742,121 +1796,198 @@ fn dns_apply_emits_done_info_log() {
         });
 }
 
-// TUN skipped from capture, kept in apply =============================================================================
-//
-// The TUN adapter is created by `routing.install` immediately before
-// `apply_dns_settings` runs. Its prior DNS is whatever Windows defaults a
-// brand-new adapter to — unknowable and uninteresting. Calling
-// `netsh show dnsservers` against a freshly-created adapter is also the
-// slowest case on Windows. So capture runs on upstream only; apply still
-// runs on both.
-//
-// Test strategy: DEBUG-level log capture, assert the per-alias lines from
-// `dns::system::windows` show the expected asymmetry.
+// Phase 7 target + fail-fatal tests (bindreams/hole#846) ==============================================================
 
+/// The RED test for #846 and for #837's held side effect: `Dns::apply` must
+/// be reachable only with `hole-tun` — never the foreign gateway interface
+/// name `MockRouting::default_gateway` reports. Drives the REAL
+/// `start_inner` wiring (not a hand-built `MockDns::apply` call), so this
+/// catches a second target being reintroduced; it cannot catch the identity
+/// itself being wrong — `TunIdentity` having no production constructor
+/// reachable from a `GatewayInfo` is what rules that out (F8).
+#[skuld::test]
+fn dns_apply_targets_only_the_hole_tun() {
+    rt().block_on(async {
+        let upstream = crate::test_support::socks5_dns_upstream::Socks5DnsUpstream::bind()
+            .await
+            .unwrap();
+        let dns = crate::test_support::mock_dns::MockDns::new();
+        let dns_state = dns.state_handle();
+
+        let dir = tempfile::tempdir().unwrap();
+        let routing = MockRouting::new(dir.path().to_path_buf()).with_gateway_interface_name("PretendForeignVpnTun");
+        let (mut pm, _dir) = new_manager_with_dns(MockProxy::new(), routing, dns, dir);
+
+        let mut config = test_config();
+        config.local_port = upstream.port();
+        config.dns.enabled = true;
+        config.dns.protocol = hole_common::config::DnsProtocol::PlainTcp;
+        config.dns.servers = vec![IpAddr::V4(Ipv4Addr::new(198, 51, 100, 53))];
+
+        pm.start(&config).await.unwrap();
+
+        let calls = dns_state.calls();
+        assert_eq!(calls.len(), 1, "Dns::apply must be called exactly once");
+        assert_eq!(
+            calls[0].targets,
+            vec!["hole-tun".to_string()],
+            "Dns::apply must target only hole-tun"
+        );
+        assert!(
+            !calls[0].targets.iter().any(|t| t == "PretendForeignVpnTun"),
+            "the foreign gateway interface name must never appear in the recorded call: {:?}",
+            calls[0].targets
+        );
+
+        pm.stop().await.unwrap();
+    });
+}
+
+/// Q5's deliberate fail-open→fail-fatal change on Windows, pinned through
+/// `start_inner` with a REAL `SystemDns` (a failing `WinDnsBackend` mock +
+/// an always-succeeding confiner mock) — `confinement_failure_aborts_the_start`
+/// below pins a DIFFERENT arm (`DnsError::Confine`) and cannot stand in for
+/// this one.
 #[cfg(target_os = "windows")]
 #[skuld::test]
-fn dns_apply_skips_tun_from_capture_keeps_in_apply() {
-    use crate::dns::system::{Dns, SystemDns};
-    use crate::proxy::TUN_DEVICE_NAME;
-    use crate::test_support::log_capture::VecWriter;
-    use std::net::{IpAddr, Ipv4Addr};
-    use tokio_util::sync::CancellationToken;
-    use tracing_subscriber::fmt;
-    use tracing_subscriber::layer::{Layer, SubscriberExt};
+fn windows_set_servers_failure_aborts_the_start() {
+    use crate::dns::system::windows::{DnsConfiner, WinDnsBackend};
+    use crate::dns::system::SystemDns;
+    use crate::dns_state::{DnsPrior, DnsPriorAdapter};
 
-    // Current-thread runtime — see `dns_apply_emits_done_info_log`
-    // for why the multi-thread `rt()` is unsafe with `set_default`.
-    // bindreams/hole#302.
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap()
-        .block_on(async {
-            let writer = VecWriter::new();
-            let subscriber = tracing_subscriber::registry().with(
-                fmt::layer()
-                    .with_writer(writer.clone())
-                    .with_ansi(false)
-                    .with_filter(tracing_subscriber::filter::LevelFilter::DEBUG),
-            );
-            let _guard = garter::tracing_test::set_default_in_current_thread(subscriber);
+    struct FailingSetBackend;
+    impl WinDnsBackend for FailingSetBackend {
+        fn get_settings(&self, _alias: &str) -> std::io::Result<Option<DnsPriorAdapter>> {
+            unreachable!("apply never calls get_settings")
+        }
+        fn set_servers(&self, _alias: &str, _servers: &[IpAddr]) -> std::io::Result<()> {
+            Err(std::io::Error::other("mock set_servers failure"))
+        }
+        fn restore(&self, _adapter: &DnsPriorAdapter) -> std::io::Result<()> {
+            unreachable!("apply never calls restore")
+        }
+        fn restore_family(&self, _alias: &str, _ipv6: bool, _prior: &DnsPrior) -> std::io::Result<()> {
+            unreachable!("apply never calls restore_family")
+        }
+        fn flush(&self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    struct OkConfiner;
+    impl DnsConfiner for OkConfiner {
+        fn engage(
+            &self,
+            _tun_luid: u64,
+            _server_ip: IpAddr,
+            _app_ids: &[std::path::PathBuf],
+        ) -> Result<Box<dyn std::any::Any + Send>, tun_engine::dns_confine::DnsConfineError> {
+            Ok(Box::new(()))
+        }
+    }
 
-            // Upstream alias uses a distinctive name so we can grep for it.
-            // Mirrors `start_inner`'s phase 7 wiring: capture_aliases=
-            // [upstream] (TUN skipped), apply_aliases=
-            // [TUN, upstream].
-            let dns = SystemDns::default();
-            let mut applied = dns
-                .apply(
-                    vec![IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))],
-                    vec!["hole-p4-test-upstream-xyz".into()],
-                    vec![TUN_DEVICE_NAME.into(), "hole-p4-test-upstream-xyz".into()],
-                    None,
-                    None,
-                    CancellationToken::new(),
-                )
-                .await
-                .expect("apply ok");
-            applied.shutdown().await;
+    rt().block_on(async {
+        let upstream = crate::test_support::socks5_dns_upstream::Socks5DnsUpstream::bind()
+            .await
+            .unwrap();
+        let dns = SystemDns::new_with_backend(std::sync::Arc::new(FailingSetBackend), std::sync::Arc::new(OkConfiner));
 
-            let output = writer.snapshot_string();
+        let dir = tempfile::tempdir().unwrap();
+        let routing = MockRouting::new(dir.path().to_path_buf());
+        let mut pm = ProxyManager::new_with_dns(MockProxy::new(), routing, dns);
 
-            // The per-FFI lines from `Win32Real` are emitted on the
-            // blocking pool thread (the `apply_windows` loop dispatches
-            // each backend call via `spawn_blocking`) so the test's
-            // thread-local subscriber never sees them. We assert on the
-            // wrapper lines from `apply_windows` instead — those run on
-            // the test thread.
-            //
-            // Both fake aliases are missing from the system: capture
-            // surfaces `"DNS capture: adapter not found; skipping
-            // alias=..."` (debug); apply surfaces `"DNS apply failed;
-            // continuing alias=..."` (warn). Capture must NEVER carry
-            // the TUN alias; apply MUST carry both.
+        let mut config = test_config();
+        config.local_port = upstream.port();
+        config.dns.enabled = true;
+        config.dns.protocol = hole_common::config::DnsProtocol::PlainTcp;
+        config.dns.servers = vec![IpAddr::V4(Ipv4Addr::new(198, 51, 100, 53))];
 
-            // CAPTURE side: only the upstream alias appears.
-            let capture_lines: Vec<&str> = output
-                .lines()
-                .filter(|l| l.contains("DNS capture: adapter not found"))
-                .collect();
-            assert!(
-                !capture_lines.is_empty(),
-                "expected at least one capture-side DEBUG line; got:\n{output}"
-            );
-            for line in &capture_lines {
-                assert!(
-                    !line.contains(&format!("alias={TUN_DEVICE_NAME}")),
-                    "capture ran on TUN — expected to be skipped. line: {line}"
-                );
-            }
-            assert!(
-                capture_lines
-                    .iter()
-                    .any(|l| l.contains("alias=hole-p4-test-upstream-xyz")),
-                "capture should have run on upstream alias; got:\n{output}"
-            );
+        let result = pm.start(&config).await;
+        assert!(result.is_err(), "start must fail when set_servers fails: {result:?}");
+        assert_eq!(pm.state(), ProxyState::Stopped, "no session may be left running");
+    });
+}
 
-            // APPLY side: the TUN alias DOES appear — we still set
-            // loopback DNS on the TUN so the OS's best-route-to-DNS
-            // lookup lands on 127.x.
-            let apply_lines: Vec<&str> = output
-                .lines()
-                .filter(|l| l.contains("DNS apply failed; continuing"))
-                .collect();
-            assert!(
-                apply_lines
-                    .iter()
-                    .any(|l| l.contains(&format!("alias={TUN_DEVICE_NAME}"))),
-                "apply should have run on TUN alias; got:\n{output}"
-            );
-            assert!(
-                apply_lines
-                    .iter()
-                    .any(|l| l.contains("alias=hole-p4-test-upstream-xyz")),
-                "apply should have run on upstream alias; got:\n{output}"
-            );
-        });
+/// `confinement_failure_aborts_the_start` — an earlier draft asserted only
+/// `state() == Stopped`, which passes vacuously for ANY early failure
+/// (including the LUID resolve Q3 removed). Asserting the SPECIFIC variant
+/// is what actually pins the Confine arm, and the paired negative below
+/// keeps this from passing because the start failed for unrelated reasons.
+/// Windows-only: `DnsError::Confine` / `ProxyError::DnsConfinementFailed`
+/// only exist on Windows (`dns_confine` is Windows-gated entirely; F5 —
+/// macOS has no confinement to fail).
+#[cfg(target_os = "windows")]
+#[skuld::test]
+fn confinement_failure_aborts_the_start() {
+    rt().block_on(async {
+        let upstream = crate::test_support::socks5_dns_upstream::Socks5DnsUpstream::bind()
+            .await
+            .unwrap();
+        let dns =
+            crate::test_support::mock_dns::MockDns::new().fail_with(crate::test_support::mock_dns::FailKind::Confine);
+
+        let dir = tempfile::tempdir().unwrap();
+        let routing = MockRouting::new(dir.path().to_path_buf());
+        let (mut pm, _dir) = new_manager_with_dns(MockProxy::new(), routing, dns, dir);
+
+        let mut config = test_config();
+        config.local_port = upstream.port();
+        config.dns.enabled = true;
+        config.dns.protocol = hole_common::config::DnsProtocol::PlainTcp;
+        config.dns.servers = vec![IpAddr::V4(Ipv4Addr::new(198, 51, 100, 53))];
+
+        let result = pm.start(&config).await;
+        match result {
+            Err(ProxyError::DnsConfinementFailed { .. }) => {}
+            other => panic!(
+                "expected Err(DnsConfinementFailed), got {}",
+                describe_start_result(&other)
+            ),
+        }
+        assert_eq!(pm.state(), ProxyState::Stopped);
+    });
+}
+
+/// The paired negative for [`confinement_failure_aborts_the_start`]: a
+/// successful confinement must NOT abort the start. Without this, the
+/// failure test could pass vacuously if `start` always failed on this
+/// config for some unrelated reason.
+#[skuld::test]
+fn successful_confinement_does_not_abort_the_start() {
+    rt().block_on(async {
+        let upstream = crate::test_support::socks5_dns_upstream::Socks5DnsUpstream::bind()
+            .await
+            .unwrap();
+        let dns = crate::test_support::mock_dns::MockDns::new();
+
+        let dir = tempfile::tempdir().unwrap();
+        let routing = MockRouting::new(dir.path().to_path_buf());
+        let (mut pm, _dir) = new_manager_with_dns(MockProxy::new(), routing, dns, dir);
+
+        let mut config = test_config();
+        config.local_port = upstream.port();
+        config.dns.enabled = true;
+        config.dns.protocol = hole_common::config::DnsProtocol::PlainTcp;
+        config.dns.servers = vec![IpAddr::V4(Ipv4Addr::new(198, 51, 100, 53))];
+
+        pm.start(&config)
+            .await
+            .expect("start must succeed with a successful confinement");
+        assert_eq!(pm.state(), ProxyState::Running);
+
+        pm.stop().await.unwrap();
+    });
+}
+
+/// PII-free-ish debug helper: `ProxyError` doesn't need to hide anything in
+/// tests, but `Result<(), ProxyError>` isn't `Debug` when the `Ok` payload
+/// doesn't matter — this just renders the two cases we care about. Used
+/// only by `confinement_failure_aborts_the_start` (Windows-only).
+#[cfg(target_os = "windows")]
+fn describe_start_result(result: &Result<(), ProxyError>) -> String {
+    match result {
+        Ok(()) => "Ok(())".to_string(),
+        Err(e) => format!("Err({e})"),
+    }
 }
 
 // Transports-driven UDP-drop policy ===================================================================================
