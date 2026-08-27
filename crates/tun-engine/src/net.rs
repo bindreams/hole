@@ -4,8 +4,14 @@
 //! (`IP_UNICAST_IF` / `IPV6_UNICAST_IF` on Windows, `IP_BOUND_IF` /
 //! `IPV6_BOUND_IF` on macOS). Kept here rather than in `device` because
 //! gateway discovery needs them but has no other device coupling.
+//!
+//! The `metric` submodule (Windows-only — see its module doc) sets
+//! `hole-tun`'s interface metric, the #846 positive half.
 
 use socket2::Socket;
+
+#[cfg(target_os = "windows")]
+pub mod metric;
 
 // Windows =============================================================================================================
 

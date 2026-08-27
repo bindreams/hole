@@ -71,6 +71,16 @@ impl Device {
         &self.config
     }
 
+    /// The opened adapter's interface LUID. Used by `Dispatcher::new` to set
+    /// the tunnel's interface metric (#846's positive half) — the LUID
+    /// belongs to the concrete OS object this call opened, not a name
+    /// lookup, so it cannot name a different, foreign adapter.
+    #[cfg(target_os = "windows")]
+    pub fn tun_luid(&self) -> u64 {
+        use tun::AbstractDeviceExt;
+        self.tun.tun_luid()
+    }
+
     /// Consume and return the underlying async TUN device. Used by the
     /// engine to drive its packet loop.
     #[doc(hidden)]

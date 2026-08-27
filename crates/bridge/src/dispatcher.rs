@@ -70,6 +70,44 @@ impl Dispatcher {
         })
         .map_err(|e| std::io::Error::other(format!("failed to create TUN device: {e}")))?;
 
+        // Give hole-tun the lowest possible interface metric so Windows
+        // prefers whatever resolver Hole advertises over the physical
+        // adapter's (#846's positive half; the negative half is
+        // `tun_engine::dns_confine`). IPv4 absence is fatal — a v4 row must
+        // exist for an adapter that was just created. IPv6 absence is
+        // logged and accepted: the host may have IPv6 off, or the v6 row
+        // may not have appeared yet — see `tun_engine::net::metric`'s
+        // module doc for why that race is reported, not asserted away.
+        #[cfg(target_os = "windows")]
+        {
+            use tun_engine::net::metric::{set_interface_metric, Family, MetricOutcome, TUNNEL_INTERFACE_METRIC};
+            let luid = device.tun_luid();
+            match set_interface_metric(luid, TUNNEL_INTERFACE_METRIC, Family::V4) {
+                Ok(MetricOutcome::Applied) => {}
+                Ok(MetricOutcome::NoInterfaceRow) => {
+                    return Err(std::io::Error::other(
+                        "hole-tun has no IPv4 interface row immediately after creation",
+                    ));
+                }
+                Err(e) => {
+                    return Err(std::io::Error::other(format!(
+                        "failed to set hole-tun's IPv4 interface metric: {e}"
+                    )));
+                }
+            }
+            match set_interface_metric(luid, TUNNEL_INTERFACE_METRIC, Family::V6) {
+                Ok(MetricOutcome::Applied) => {}
+                Ok(MetricOutcome::NoInterfaceRow) => {
+                    warn!("hole-tun has no IPv6 interface row yet; IPv6 metric not set (host may lack IPv6, or the row has not appeared)");
+                }
+                Err(e) => {
+                    return Err(std::io::Error::other(format!(
+                        "failed to set hole-tun's IPv6 interface metric: {e}"
+                    )));
+                }
+            }
+        }
+
         // Build the three endpoints and the HoleRouter.
         let proxy_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), local_port);
         let proxy = Socks5Endpoint::new(proxy_addr, plugin_name, plugin_supports_udp);
