@@ -45,7 +45,9 @@ before editing; the sections linked below are the authoritative source.
   three layers of bare `abort()`. →
   [CONTRIBUTING.md#proxy-shutdown-contract](CONTRIBUTING.md#proxy-shutdown-contract)
 - **Cooperative-cancel model.** Cancellation propagates via tokens from the IPC
-  `handle_start` handler; no future-drop cancellation. →
+  `handle_start` handler; no future-drop cancellation. The engine driver
+  observes the token at every await, so the dispatcher's join of it carries no
+  bound. →
   [CONTRIBUTING.md#bridge-cancellation-contract](CONTRIBUTING.md#bridge-cancellation-contract)
 - **Native-crash observability.** The `tombstone` crate writes a signal-safe
   crash marker; the next start of the same kind sweeps it. →
