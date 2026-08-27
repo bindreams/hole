@@ -7,8 +7,9 @@
 //!   flows that should go through the SS tunnel.
 //! - `bypass`: [`InterfaceEndpoint`](crate::endpoint::InterfaceEndpoint) —
 //!   flows that should egress via the real upstream interface.
-//! - `block`: [`BlockEndpoint`](crate::endpoint::BlockEndpoint) —
-//!   flows that should be dropped.
+//! - `block`: [`BlockEndpoint`](crate::endpoint::BlockEndpoint) — the
+//!   log voice for flows that should be dropped. Not a transport: the
+//!   router releases a dropped flow inline.
 //!
 //! ## Role vs. mechanism
 //!
@@ -31,7 +32,7 @@
 //! ## UDP-drop privacy invariant
 //!
 //! `FilterAction::Proxy` + UDP + `!proxy.supports_udp()` resolves to
-//! `&self.block`, **not** `&self.bypass`. This is deliberate: falling
+//! `Dispatch::Drop`, **not** `&self.bypass`. This is deliberate: falling
 //! back to the clear-text bypass would leak UDP outside the encrypted
 //! tunnel, violating the user's VPN expectation. Users who need
 //! tunneled UDP should configure a UDP-capable plugin (galoshes). See
