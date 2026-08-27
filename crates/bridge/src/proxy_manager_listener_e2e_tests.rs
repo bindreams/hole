@@ -91,37 +91,65 @@ async fn start_expect_error(harness: &mut DistHarness, config: ProxyConfig) -> S
     }
 }
 
+/// Which branch [`assert_port_unbound`] used to conclude the port is
+/// unbound. Surfaced so a test can see which branch actually fired,
+/// rather than the function silently swallowing that evidence.
+#[derive(Debug, PartialEq, Eq)]
+#[must_use = "which branch concluded the port is unbound is the evidence — record it"]
+enum UnboundEvidence {
+    /// The connect attempt observed a refusal directly.
+    Refused,
+    /// The probe returned no verdict, but we could bind the port
+    /// ourselves — the real stealth-drop shape this fallback exists for.
+    Bound,
+}
+
 /// Assert that nothing is listening on `addr` — either by observing a
-/// refused connect or, on Windows where the firewall can silently drop
-/// SYNs to unbound ports, by successfully binding the port ourselves
-/// (proving nothing else already holds it).
-async fn assert_port_unbound(addr: SocketAddr) {
-    let connect = tokio::time::timeout(Duration::from_secs(1), tokio::net::TcpStream::connect(addr)).await;
-    match connect {
-        Ok(Ok(_stream)) => panic!("expected {addr} unbound; connection succeeded"),
-        Ok(Err(e)) => {
-            let kind = e.kind();
-            assert!(
-                matches!(
-                    kind,
-                    std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::ConnectionReset
-                ),
-                "expected {addr} unbound; got io error kind {kind:?}: {e}"
-            );
-        }
-        Err(_) => {
-            // Windows Firewall stealth-drops SYNs to unbound localhost
-            // ports in some configurations. Fall back to a positive
-            // check: if we can bind the port, it's free.
+/// refused connect or, where a firewall can silently drop SYNs to unbound
+/// ports, by successfully binding the port ourselves (proving nothing else
+/// already holds it).
+///
+/// The probe pins [`util::syn_budget::SynBudget::NoRetransmit`]: a refusal
+/// is observed in ~0.1 ms instead of paying Windows' ~2.05 s stock
+/// SYN-retransmission budget, and the budget's contract holds because a
+/// `NoVerdict` is never taken as an answer — it is settled by the bind
+/// below, which involves no SYN at all.
+async fn assert_port_unbound(addr: SocketAddr) -> UnboundEvidence {
+    // Coarse backstop on the OS's connect state machine (an external event);
+    // it is well clear of the pinned connect's own ~1.02 s give-up, so it
+    // never decides the verdict — `probe` reads that from the error.
+    const BACKSTOP: Duration = Duration::from_secs(5);
+
+    match util::syn_budget::probe(addr, BACKSTOP, util::syn_budget::SynBudget::NoRetransmit).await {
+        util::syn_budget::ProbeOutcome::Listening(_) => panic!("expected {addr} unbound; connection succeeded"),
+        util::syn_budget::ProbeOutcome::Refused(_) => UnboundEvidence::Refused,
+        util::syn_budget::ProbeOutcome::NoVerdict(cause) => {
+            // No answer says nothing about the port — a firewall
+            // stealth-dropping SYNs to unbound localhost ports is a real, if
+            // rare, shape. Fall back to a positive check: if we can bind the
+            // port, it's free.
             match tokio::net::TcpListener::bind(addr).await {
-                Ok(listener) => drop(listener),
+                Ok(listener) => {
+                    drop(listener);
+                    UnboundEvidence::Bound
+                }
                 Err(e) => panic!(
-                    "expected {addr} unbound; connect timed out and bind failed with {e} — \
-                     something is holding the port"
+                    "expected {addr} unbound; probe gave no verdict ({cause:?}) and bind failed \
+                     with {e} — something is holding the port"
                 ),
             }
         }
     }
+}
+
+/// [`assert_port_unbound`] for the e2e sites, which pin no expected branch
+/// (the bind fallback exists for hosts that stealth-drop SYNs, so demanding
+/// `Refused` would defeat it). Recording keeps a run that took the fallback
+/// visible instead of indistinguishable from a refusal. `eprintln!` for the
+/// same reason as `test_support::port_alloc`: not droppable by a log filter.
+async fn assert_port_unbound_recorded(what: &str, addr: SocketAddr) {
+    let evidence = assert_port_unbound(addr).await;
+    eprintln!("[listener-e2e] {what} port {addr} is unbound; evidence: {evidence:?}");
 }
 
 async fn roundtrip_socks5(proxy: SocketAddr, target: SocketAddr) {
@@ -144,6 +172,17 @@ async fn roundtrip_http_connect(proxy: SocketAddr, target: SocketAddr) {
     assert_eq!(body, crate::test_support::http_target::SENTINEL_BODY);
 }
 
+#[skuld::test]
+async fn assert_port_unbound_observes_a_refusal() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0".parse::<SocketAddr>().unwrap())
+        .await
+        .expect("bind ephemeral loopback port");
+    let addr = listener.local_addr().expect("local_addr");
+    drop(listener);
+
+    assert_eq!(assert_port_unbound(addr).await, UnboundEvidence::Refused);
+}
+
 // TCP listener selection ==============================================================================================
 
 #[skuld::test(labels = [DIST_BIN])]
@@ -164,7 +203,7 @@ fn e2e_socks5_only_http_port_unbound(
         let http_addr: SocketAddr = format!("127.0.0.1:{http_port}").parse().unwrap();
 
         roundtrip_socks5(socks_addr, http.addr).await;
-        assert_port_unbound(http_addr).await;
+        assert_port_unbound_recorded("http", http_addr).await;
 
         harness.send(BridgeRequest::Stop).await.expect("send Stop");
     });
@@ -190,7 +229,7 @@ fn e2e_http_only_socks_port_unbound(
         let http_addr: SocketAddr = format!("127.0.0.1:{http_port}").parse().unwrap();
 
         roundtrip_http_connect(http_addr, http.addr).await;
-        assert_port_unbound(socks_addr).await;
+        assert_port_unbound_recorded("socks5", socks_addr).await;
 
         harness.send(BridgeRequest::Stop).await.expect("send Stop");
     });
@@ -242,7 +281,7 @@ fn e2e_reload_toggling_http_listener_rebinds(
         start_expect_ack(&mut harness, config.clone()).await;
 
         let http_addr: SocketAddr = format!("127.0.0.1:{http_port}").parse().unwrap();
-        assert_port_unbound(http_addr).await;
+        assert_port_unbound_recorded("http", http_addr).await;
 
         // Flip HTTP on, keep every other structural field identical so
         // the pre-#242 check would have short-circuited.
