@@ -241,12 +241,36 @@ security decision, not a style one:
   neither short-circuits the rest nor is returned. Stopping at the first failure
   would strand routes and leave the user worse off than if Hole had never run.
 
-The asymmetry is in the return types: cleanup returns a `CleanupReport` (counts,
-for logging and tests) and has **no error channel to `?` out of**, so no future
-edit can turn stranded-route cleanup into an early return. `is_recovery_phase`
-stays the single source of truth for which phase is which — it picks the log
-level (debug for expected cleanup failures, warn for an install anomaly) and
-back-stops the pairing via a `debug_assert` in each runner.
+No future edit can turn stranded-route cleanup into an early return: a
+`CleanupReport` is counts, not a `Result`, so there is nothing to `?` out of.
+
+**The pairing is a compile error, not a convention.** A phase is a value of
+`FatalPhase` or `BestEffortPhase` (sealed `Phase` trait, `BEST_EFFORT` const per
+type — it also picks the log level), and each runner accepts only its own type;
+the command types differ too (`SetupCommand` vs `Vec<String>`). Wiring a
+teardown phase into the fatal runner does not compile. This replaces a
+`debug_assert` pairing check, which compiled out in release — the same
+silently-absorbed-failure class this policy exists to close.
+
+**Fatality is per command, not per phase** (`SetupCommand::fatal`). The two IPv6
+split routes are non-fatal when `GatewayInfo::ipv6_available` is false: on a host
+whose IPv6 stack is unbound from the adapter (`DisabledComponents`, or an EDR
+policy that unbinds IPv6 from new adapters) `netsh interface ipv6 add route ::/1`
+cannot succeed, and such a host emits no IPv6 traffic to leak — aborting there
+would lose the whole tunnel and avoid nothing. Everything else, and every command
+when IPv6 *is* reachable, stays fatal. `Routing::install` takes the whole
+`GatewayInfo` rather than destructured fields, because destructuring it at the
+call site is how `ipv6_available` got dropped on this path to begin with.
+
+**Accepted trade: a false start-failure is preferred to a silent leak.** No test
+exercises `setup_routes` against a real elevated `netsh`/`route` under an
+already-installed route, so it is not measured whether a healthy install can
+legitimately exit non-zero. One path could produce it: `SystemRoutes::drop`
+clears the state file even when teardown failed, and `recover_routes` only
+deletes split routes under that file's guard, so a leftover route can outlive its
+record. Measuring it would change nothing — tolerating an "already exists" exit
+code is the exists-tolerance heuristic #899/#910 forbids, and the fatal exit
+surfaces the stranded route to the user instead of tunnelling around it.
 
 `RouteCommandError`'s `Display` is PII-free by construction (program name,
 position in the phase, exit code): it reaches a GUI toast verbatim through

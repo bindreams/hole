@@ -56,7 +56,10 @@ before editing; the sections linked below are the authoritative source.
   installed leaks traffic outside the tunnel. Teardown and crash recovery are
   **best-effort** — every command is issued, and the runner returns a
   `CleanupReport` with no error channel to `?` out of, because stopping early
-  strands routes. →
+  strands routes. Which runner a phase gets is enforced by the type system
+  (`FatalPhase` / `BestEffortPhase`), and fatality is decided **per command**:
+  the IPv6 splits are non-fatal when the host has no reachable IPv6, since
+  they cannot succeed there and there is no IPv6 traffic to leak. →
   [CONTRIBUTING.md#route-command-failure-policy](CONTRIBUTING.md#route-command-failure-policy)
 - **Crash-recovery sweep.** `bridge-{routes,plugins,dns}.json` + ETW sessions are
   replayed/cleaned on next startup after the IPC socket binds. →

@@ -22,6 +22,32 @@ pub static ROUTING_SUBPROCESS_SPAWN_COUNT: AtomicU32 = AtomicU32::new(0);
 
 // Command builders ====================================================================================================
 
+/// One route-install command plus whether its failure aborts the install.
+///
+/// Fatality is per command, not per phase. The IPv4 splits and the server
+/// bypass are always fatal — a missing one of those sends traffic outside the
+/// tunnel. The two IPv6 splits are fatal only when the upstream interface can
+/// actually reach IPv6 ([`GatewayInfo::ipv6_available`]): where it cannot,
+/// `netsh interface ipv6 add route` / `route add -inet6` can outright fail
+/// (the adapter has no IPv6 binding — `DisabledComponents`, or an EDR policy
+/// that unbinds IPv6), and a host with no IPv6 stack emits no IPv6 traffic to
+/// leak. Where IPv6 IS reachable every command is fatal, because there a
+/// missing `::/1` route is exactly the #901 leak.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SetupCommand {
+    /// Program plus arguments.
+    pub argv: Vec<String>,
+    /// `false` means a non-zero exit is logged and the phase continues.
+    pub fatal: bool,
+}
+
+impl SetupCommand {
+    /// A command whose failure aborts the install.
+    fn fatal(argv: Vec<String>) -> Self {
+        Self { argv, fatal: true }
+    }
+}
+
 /// Build the shell commands to set up split routing.
 ///
 /// Creates four or five routes:
@@ -29,7 +55,11 @@ pub static ROUTING_SUBPROCESS_SPAWN_COUNT: AtomicU32 = AtomicU32::new(0);
 /// 2. `128.0.0.0/1` via TUN — captures second half of IPv4 space
 /// 3. `::/1` via TUN — captures first half of IPv6 space
 /// 4. `8000::/1` via TUN — captures second half of IPv6 space
-/// 5. Server bypass — `<server_ip>` via `original_gateway` (IPv4 server) or `interface_name` (IPv6 server)
+/// 5. Server bypass — `<server_ip>` via `gateway.gateway_ip` (IPv4 server) or
+///    `gateway.interface_name` (IPv6 server)
+///
+/// Routes 3 and 4 are non-fatal when `gateway.ipv6_available` is false — see
+/// [`SetupCommand`].
 ///
 /// The server bypass (#5) is omitted when `server_ip` is loopback (checked in
 /// canonical form, so an IPv4-mapped `::ffff:127.0.0.1` counts too): a loopback
@@ -38,15 +68,11 @@ pub static ROUTING_SUBPROCESS_SPAWN_COUNT: AtomicU32 = AtomicU32::new(0);
 /// `/128`) gateway bypass for loopback would hijack all loopback traffic to a
 /// gateway that cannot reach it.
 ///
-/// When `server_ip` is IPv6, `original_gateway` is unused — the bypass route is interface-based
-/// because reliable IPv6 gateway detection is not available on all platforms.
-pub fn build_setup_commands(
-    tun_name: &str,
-    server_ip: IpAddr,
-    original_gateway: IpAddr,
-    interface_name: &str,
-) -> Vec<Vec<String>> {
-    platform_setup_commands(tun_name, server_ip, original_gateway, interface_name)
+/// When `server_ip` is IPv6, `gateway.gateway_ip` is unused — the bypass route is
+/// interface-based because reliable IPv6 gateway detection is not available on all
+/// platforms.
+pub fn build_setup_commands(tun_name: &str, server_ip: IpAddr, gateway: &GatewayInfo) -> Vec<SetupCommand> {
+    platform_setup_commands(tun_name, server_ip, gateway)
 }
 
 /// Build the shell commands to tear down split routing (IPv4 + IPv6 splits and server bypass).
@@ -56,43 +82,104 @@ pub fn build_teardown_commands(tun_name: &str, server_ip: IpAddr, interface_name
 
 // Execution ===========================================================================================================
 //
-// Two phase runners, and the difference between them is the point. Install is
-// FATAL: a failed command aborts the phase and is returned, because reporting
-// routes that were never installed sends traffic outside the tunnel while the
-// UI says "protected". Cleanup is BEST-EFFORT: it issues every command it was
-// handed and has NO error channel to abort through, because stopping at the
-// first failure would strand routes and leave the user worse off than if Hole
-// had never run. The asymmetry lives in the return types — a caller cannot
-// `?` its way out of a cleanup phase, and cannot build a routes guard without
-// discharging the install phase's `Result`.
+// Two phase runners with different return types: `setup_routes` below can fail
+// install outright; `teardown_routes`/`recover_routes` cannot — see their doc
+// comments.
 
-// Phase tags used for structured logging and to classify expected failures.
-// `is_recovery_phase` is the single source of truth for which phases are
-// best-effort cleanup; adding a new `PHASE_RECOVER_*` here MUST be paired
-// with a matching arm in `is_recovery_phase`.
-pub(crate) const PHASE_SETUP: &str = "setup";
-pub(crate) const PHASE_TEARDOWN: &str = "teardown";
-pub(crate) const PHASE_RECOVER_SPLIT: &str = "recover-split";
-pub(crate) const PHASE_RECOVER_BYPASS: &str = "recover-bypass";
-pub(crate) const PHASE_RECOVER_COVER: &str = "recover-cover";
-// macOS-only: the pf cover engages via `pfctl` subprocesses (Windows engages
-// via FWPM FFI — no subprocess phase). Gated so it is not dead code on a
-// non-test Windows lib build under `-D warnings`. `PHASE_RECOVER_COVER` stays
-// all-targets because `is_recovery_phase` references it on every platform.
-#[cfg(target_os = "macos")]
-pub(crate) const PHASE_COVER: &str = "cover-engage";
+mod phase_sealed {
+    pub trait Sealed {}
+}
+
+/// A route-command phase. Classification is a property of the phase **type**,
+/// and each runner accepts only its own type, so pairing a phase with the wrong
+/// runner is a compile error rather than a convention. Sealed: the two families
+/// below are the only ones.
+pub(crate) trait Phase: phase_sealed::Sealed + Copy {
+    /// Whether a non-zero exit in this phase is expected behavior rather than
+    /// an anomaly. Picks the log level.
+    const BEST_EFFORT: bool;
+    /// Phase tag for structured logging.
+    fn name(self) -> &'static str;
+}
+
+/// Phases whose command failures are ANOMALIES. Only [`run_setup_with`] takes
+/// one; a failure aborts (unless the individual [`SetupCommand`] says
+/// otherwise), because reporting routes that were never installed sends traffic
+/// outside the tunnel while the UI says "protected".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FatalPhase {
+    /// Initial split-route install.
+    Setup,
+    /// macOS pf cover engage. Runs through [`run_capturing`], not a route-command
+    /// runner (Windows engages via FWPM FFI — no subprocess phase); gated so it is
+    /// not dead code on a non-test Windows lib build under `-D warnings`.
+    #[cfg(target_os = "macos")]
+    CoverEngage,
+}
+
+/// Phases whose command failures are EXPECTED. Only [`run_cleanup_with`] takes
+/// one; every command is issued and none can abort the rest, because stopping
+/// at the first failure would strand routes and leave the user worse off than
+/// if Hole had never run.
+///
+/// **Teardown** is here — not just crash recovery — because [`setup_routes`] is
+/// NOT transactional: when a setup command fails midway, the defensive
+/// [`teardown_routes`] call deletes routes that were never installed
+/// (empirically `netsh interface ip delete route 0.0.0.0/1 <adapter>` exits
+/// non-zero when the route is absent, and the bare `route delete <ip>` does the
+/// same). Real teardown failures (e.g. "adapter unavailable") surface via the
+/// bridge's post-teardown `Remove-NetAdapter` reporting and via state-file
+/// persistence failures.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BestEffortPhase {
+    Teardown,
+    RecoverSplit,
+    RecoverBypass,
+    /// macOS-only, for the same reason as [`FatalPhase::CoverEngage`].
+    #[cfg(target_os = "macos")]
+    RecoverCover,
+}
+
+impl phase_sealed::Sealed for FatalPhase {}
+impl Phase for FatalPhase {
+    const BEST_EFFORT: bool = false;
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Setup => "setup",
+            #[cfg(target_os = "macos")]
+            Self::CoverEngage => "cover-engage",
+        }
+    }
+}
+
+impl phase_sealed::Sealed for BestEffortPhase {}
+impl Phase for BestEffortPhase {
+    const BEST_EFFORT: bool = true;
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Teardown => "teardown",
+            Self::RecoverSplit => "recover-split",
+            Self::RecoverBypass => "recover-bypass",
+            #[cfg(target_os = "macos")]
+            Self::RecoverCover => "recover-cover",
+        }
+    }
+}
+
+// Classification is fixed per type, so a runtime test of it would be vacuous.
+// Pinned here instead, which also stops a copy-paste of one `impl` block onto
+// the other from landing.
+const _: () = assert!(!<FatalPhase as Phase>::BEST_EFFORT);
+const _: () = assert!(<BestEffortPhase as Phase>::BEST_EFFORT);
 
 /// Execute route setup commands — the FATAL phase. Stops at the first command
-/// that does not exit zero and returns it; the caller must not treat the split
-/// routes as installed.
-pub fn setup_routes(
-    tun_name: &str,
-    server_ip: IpAddr,
-    original_gateway: IpAddr,
-    interface_name: &str,
-) -> Result<(), RouteCommandError> {
-    let commands = build_setup_commands(tun_name, server_ip, original_gateway, interface_name);
-    run_setup_commands(&commands, PHASE_SETUP)
+/// that does not exit zero and is marked fatal, and returns it; the caller must
+/// not treat the split routes as installed.
+pub fn setup_routes(tun_name: &str, server_ip: IpAddr, gateway: &GatewayInfo) -> Result<(), RouteCommandError> {
+    let commands = build_setup_commands(tun_name, server_ip, gateway);
+    run_setup_commands(&commands, FatalPhase::Setup)
 }
 
 /// Execute route teardown commands — the BEST-EFFORT phase. Idempotent, and
@@ -101,38 +188,11 @@ pub fn setup_routes(
 /// returned.
 pub fn teardown_routes(tun_name: &str, server_ip: IpAddr, interface_name: &str) -> CleanupReport {
     let commands = build_teardown_commands(tun_name, server_ip, interface_name);
-    run_cleanup_commands(&commands, PHASE_TEARDOWN)
+    run_cleanup_commands(&commands, BestEffortPhase::Teardown)
 }
 
 pub(crate) fn build_split_route_teardown_commands(tun_name: &str) -> Vec<Vec<String>> {
     platform_split_route_teardown_commands(tun_name)
-}
-
-/// Returns true if route command failures during this phase are *expected*
-/// idempotent-cleanup behavior. Two things key off it: the log level (debug,
-/// not warn) and — via the `debug_assert`s in the two phase runners — which
-/// runner a phase is allowed to go through.
-///
-/// **Recovery** is best-effort: every clean startup tries to delete the four
-/// fixed split routes, and on a healthy system all four of those calls fail
-/// because nothing leaked.
-///
-/// **Teardown** is *also* best-effort because [`setup_routes`] is NOT
-/// transactional — when a setup command fails midway, the defensive
-/// [`teardown_routes`] call deletes routes that were never installed
-/// (empirically `netsh interface ip delete route 0.0.0.0/1 <adapter>`
-/// exits non-zero when the route is absent, and the bare `route delete
-/// <ip>` does the same). Real teardown failures (e.g. "adapter
-/// unavailable") surface via the bridge's post-teardown
-/// `Remove-NetAdapter` reporting and via state-file persistence failures.
-///
-/// Adding a new `PHASE_*` constant that should silently tolerate non-zero
-/// exit codes MUST be paired with a matching arm here.
-fn is_recovery_phase(phase: &str) -> bool {
-    matches!(
-        phase,
-        PHASE_RECOVER_SPLIT | PHASE_RECOVER_BYPASS | PHASE_TEARDOWN | PHASE_RECOVER_COVER
-    )
 }
 
 /// What a best-effort phase did. Deliberately NOT a `Result`: cleanup has no
@@ -150,8 +210,9 @@ pub struct CleanupReport {
 /// Spawn one command, log it, and report whether it exited zero. The unit both
 /// phase runners are built from; injected in tests so each loop's failure
 /// policy is assertable without spawning.
-fn exec_one(cmd: &[String], phase: &str) -> Result<(), CommandFailure> {
+fn exec_one<P: Phase>(cmd: &[String], phase: P) -> Result<(), CommandFailure> {
     debug_assert!(!cmd.is_empty(), "route command must not be empty");
+    let phase = phase.name();
     ROUTING_SUBPROCESS_SPAWN_COUNT.fetch_add(1, Ordering::SeqCst);
     info!(phase, cmd = cmd.join(" "), "running route command");
 
@@ -179,64 +240,69 @@ fn exec_one(cmd: &[String], phase: &str) -> Result<(), CommandFailure> {
         return Ok(());
     }
 
-    if is_recovery_phase(phase) {
+    if P::BEST_EFFORT {
         // Non-zero exits here are the unavoidable consequence of
         // non-transactional install + best-effort cleanup; warning would drown
         // legitimate signal.
         debug!(phase, cmd = cmd.join(" "), exit_code, stderr = %stderr,
                "best-effort command failed (expected if route absent)");
     } else {
-        // A non-zero exit during initial route install IS a real anomaly, and
-        // aborts the start. The full argv and child output land here because
-        // the returned error's `Display` is deliberately PII-free.
+        // A non-zero exit during initial route install IS a real anomaly. The
+        // full argv and child output land here because the returned error's
+        // `Display` is deliberately PII-free. Whether it aborts the start is
+        // the caller's per-command call (`SetupCommand::fatal`).
         warn!(phase, cmd = cmd.join(" "), exit_code,
               stdout = %stdout.trim(), stderr = %stderr.trim(),
-              "route command failed — aborting route setup");
+              "route command failed");
     }
     Err(CommandFailure::Exit(exit_code))
 }
 
-/// FATAL phase runner. Stops at the first command that does not exit zero, so
-/// no further route mutation is issued after a failure, and returns it.
-fn run_setup_commands(commands: &[Vec<String>], phase: &str) -> Result<(), RouteCommandError> {
-    run_setup_with(commands, phase, exec_one)
+/// FATAL phase runner. Stops at the first fatal command that does not exit
+/// zero, so no further route mutation is issued after it, and returns it.
+fn run_setup_commands(commands: &[SetupCommand], phase: FatalPhase) -> Result<(), RouteCommandError> {
+    run_setup_with(commands, phase, exec_one::<FatalPhase>)
 }
 
 /// BEST-EFFORT phase runner. Issues EVERY command it is handed; a failure
 /// neither short-circuits the rest nor is returned.
-fn run_cleanup_commands(commands: &[Vec<String>], phase: &str) -> CleanupReport {
-    run_cleanup_with(commands, phase, exec_one)
+fn run_cleanup_commands(commands: &[Vec<String>], phase: BestEffortPhase) -> CleanupReport {
+    run_cleanup_with(commands, phase, exec_one::<BestEffortPhase>)
 }
 
 /// Test seam for [`run_setup_commands`] — injectable per-command executor.
-fn run_setup_with<F>(commands: &[Vec<String>], phase: &str, mut exec: F) -> Result<(), RouteCommandError>
+fn run_setup_with<F>(commands: &[SetupCommand], phase: FatalPhase, mut exec: F) -> Result<(), RouteCommandError>
 where
-    F: FnMut(&[String], &str) -> Result<(), CommandFailure>,
+    F: FnMut(&[String], FatalPhase) -> Result<(), CommandFailure>,
 {
-    debug_assert!(
-        !is_recovery_phase(phase),
-        "{phase} is a best-effort phase and must not abort on the first failure"
-    );
     for (index, cmd) in commands.iter().enumerate() {
-        exec(cmd, phase).map_err(|failure| RouteCommandError {
-            program: cmd.first().cloned().unwrap_or_default(),
+        let Err(failure) = exec(&cmd.argv, phase) else {
+            continue;
+        };
+        if !cmd.fatal {
+            warn!(
+                phase = phase.name(),
+                cmd = cmd.argv.join(" "),
+                %failure,
+                "route command failed but is not fatal on this host — continuing"
+            );
+            continue;
+        }
+        return Err(RouteCommandError {
+            program: cmd.argv.first().cloned().unwrap_or_default(),
             index,
             total: commands.len(),
             failure,
-        })?;
+        });
     }
     Ok(())
 }
 
 /// Test seam for [`run_cleanup_commands`] — injectable per-command executor.
-fn run_cleanup_with<F>(commands: &[Vec<String>], phase: &str, mut exec: F) -> CleanupReport
+fn run_cleanup_with<F>(commands: &[Vec<String>], phase: BestEffortPhase, mut exec: F) -> CleanupReport
 where
-    F: FnMut(&[String], &str) -> Result<(), CommandFailure>,
+    F: FnMut(&[String], BestEffortPhase) -> Result<(), CommandFailure>,
 {
-    debug_assert!(
-        is_recovery_phase(phase),
-        "{phase} is a fatal phase and must not have its failures dropped"
-    );
     let mut report = CleanupReport::default();
     for cmd in commands {
         report.attempted += 1;
@@ -245,7 +311,7 @@ where
         }
     }
     debug!(
-        phase,
+        phase = phase.name(),
         attempted = report.attempted,
         failed = report.failed,
         "best-effort phase complete"
@@ -258,16 +324,16 @@ where
 /// [`ROUTING_SUBPROCESS_SPAWN_COUNT`] (the no-spawn invariant covers cover
 /// engage too). Used by the macOS pf cover; not for route commands.
 #[cfg(target_os = "macos")]
-pub(crate) fn run_capturing(
+pub(crate) fn run_capturing<P: Phase>(
     cmd: &[String],
     stdin: Option<&[u8]>,
-    phase: &str,
+    phase: P,
 ) -> std::io::Result<std::process::Output> {
     use std::io::Write;
     use std::process::Stdio;
     debug_assert!(!cmd.is_empty(), "command must not be empty");
     ROUTING_SUBPROCESS_SPAWN_COUNT.fetch_add(1, Ordering::SeqCst);
-    info!(phase, cmd = cmd.join(" "), "running cover command");
+    info!(phase = phase.name(), cmd = cmd.join(" "), "running cover command");
     let mut child = Command::new(&cmd[0])
         .args(&cmd[1..])
         .stdin(if stdin.is_some() { Stdio::piped() } else { Stdio::null() })
@@ -354,7 +420,7 @@ pub(crate) fn recover_routes_with<R, S, P, L>(
     lockdown_present: P,
     lockdown_recover: L,
 ) where
-    R: Fn(&[Vec<String>], &str) -> CleanupReport,
+    R: Fn(&[Vec<String>], BestEffortPhase) -> CleanupReport,
     S: FnOnce(&Path, bool),
     P: FnOnce() -> bool,
     L: FnOnce(CoverRecovery),
@@ -384,11 +450,11 @@ pub(crate) fn recover_routes_with<R, S, P, L>(
         //    name persisted in the state file (the caller controls this —
         //    tun-engine has no opinion on naming).
         let split_cmds = build_split_route_teardown_commands(&st.tun_name);
-        let split = runner(&split_cmds, PHASE_RECOVER_SPLIT);
+        let split = runner(&split_cmds, BestEffortPhase::RecoverSplit);
 
         // 2. Per-server bypass route recorded in the state file.
         let bypass_cmds = build_teardown_commands(&st.tun_name, st.server_ip, &st.interface_name);
-        let bypass = runner(&bypass_cmds, PHASE_RECOVER_BYPASS);
+        let bypass = runner(&bypass_cmds, BestEffortPhase::RecoverBypass);
         info!(?split, ?bypass, "route recovery command phases complete");
 
         // 3. Delete the state file regardless of command outcomes. Next
@@ -477,12 +543,16 @@ pub trait Routing: Send + Sync {
     /// the routes and clears the recovery state file. On failure, the
     /// implementation must leave the host in the pre-install state
     /// (no stale state file, no partially-installed routes).
+    ///
+    /// Takes the whole [`GatewayInfo`] that [`default_gateway`](Self::default_gateway)
+    /// returned rather than destructured fields: `ipv6_available` decides which
+    /// setup commands are fatal (see [`SetupCommand`]), and splitting the struct
+    /// at the call site is how it got dropped on this path in the first place.
     fn install(
         &self,
         tun_name: &str,
         server_ip: IpAddr,
-        gateway: IpAddr,
-        interface_name: &str,
+        gateway: &GatewayInfo,
     ) -> Result<Self::Installed, RoutingError>;
 
     /// Returns the current default gateway that the *next* call to
@@ -595,15 +665,15 @@ impl SystemRouting {
         &self,
         tun_name: &str,
         server_ip: IpAddr,
-        gateway: IpAddr,
-        interface_name: &str,
+        gateway: &GatewayInfo,
         setup: S,
         teardown: T,
     ) -> Result<SystemRoutes, RoutingError>
     where
-        S: FnOnce(&str, IpAddr, IpAddr, &str) -> Result<(), RouteCommandError>,
+        S: FnOnce(&str, IpAddr, &GatewayInfo) -> Result<(), RouteCommandError>,
         T: FnOnce(&str, IpAddr, &str) -> CleanupReport,
     {
+        let interface_name = gateway.interface_name.as_str();
         // CRITICAL ORDERING: persist the route-recovery state BEFORE any
         // routing mutation. A panic or SIGKILL between the setup phase and
         // `SystemRoutes` construction would otherwise leak routes with no
@@ -617,7 +687,7 @@ impl SystemRouting {
         state::save(&self.state_dir, &persisted, self.owner)
             .map_err(|e| RoutingError::RouteSetup(format!("failed to persist route-state: {e}")))?;
 
-        if let Err(e) = setup(tun_name, server_ip, gateway, interface_name) {
+        if let Err(e) = setup(tun_name, server_ip, gateway) {
             warn!(error = %e, "route setup failed — rolling back");
             let rollback = teardown(tun_name, server_ip, interface_name);
             if let Err(ce) = state::clear(&self.state_dir) {
@@ -647,17 +717,9 @@ impl Routing for SystemRouting {
         &self,
         tun_name: &str,
         server_ip: IpAddr,
-        gateway: IpAddr,
-        interface_name: &str,
+        gateway: &GatewayInfo,
     ) -> Result<Self::Installed, RoutingError> {
-        self.install_with(
-            tun_name,
-            server_ip,
-            gateway,
-            interface_name,
-            setup_routes,
-            teardown_routes,
-        )
+        self.install_with(tun_name, server_ip, gateway, setup_routes, teardown_routes)
     }
 
     fn default_gateway(&self) -> Result<GatewayInfo, RoutingError> {
@@ -737,15 +799,11 @@ impl Drop for SystemRoutes {
 // Platform-specific command builders ==================================================================================
 
 #[cfg(target_os = "windows")]
-fn platform_setup_commands(
-    tun_name: &str,
-    server_ip: IpAddr,
-    original_gateway: IpAddr,
-    interface_name: &str,
-) -> Vec<Vec<String>> {
+fn platform_setup_commands(tun_name: &str, server_ip: IpAddr, gateway: &GatewayInfo) -> Vec<SetupCommand> {
+    let ipv6 = gateway.ipv6_available;
     let mut cmds = vec![
         // IPv4 low half: 0.0.0.0/1 via TUN
-        vec![
+        SetupCommand::fatal(vec![
             "netsh".into(),
             "interface".into(),
             "ip".into(),
@@ -753,9 +811,9 @@ fn platform_setup_commands(
             "route".into(),
             "0.0.0.0/1".into(),
             tun_name.into(),
-        ],
+        ]),
         // IPv4 high half: 128.0.0.0/1 via TUN
-        vec![
+        SetupCommand::fatal(vec![
             "netsh".into(),
             "interface".into(),
             "ip".into(),
@@ -763,51 +821,58 @@ fn platform_setup_commands(
             "route".into(),
             "128.0.0.0/1".into(),
             tun_name.into(),
-        ],
+        ]),
         // IPv6 low half: ::/1 via TUN
-        vec![
-            "netsh".into(),
-            "interface".into(),
-            "ipv6".into(),
-            "add".into(),
-            "route".into(),
-            "::/1".into(),
-            tun_name.into(),
-        ],
+        SetupCommand {
+            argv: vec![
+                "netsh".into(),
+                "interface".into(),
+                "ipv6".into(),
+                "add".into(),
+                "route".into(),
+                "::/1".into(),
+                tun_name.into(),
+            ],
+            fatal: ipv6,
+        },
         // IPv6 high half: 8000::/1 via TUN
-        vec![
-            "netsh".into(),
-            "interface".into(),
-            "ipv6".into(),
-            "add".into(),
-            "route".into(),
-            "8000::/1".into(),
-            tun_name.into(),
-        ],
+        SetupCommand {
+            argv: vec![
+                "netsh".into(),
+                "interface".into(),
+                "ipv6".into(),
+                "add".into(),
+                "route".into(),
+                "8000::/1".into(),
+                tun_name.into(),
+            ],
+            fatal: ipv6,
+        },
     ];
 
     // Bypass: server IP via original gateway/interface. Skipped for loopback —
     // see `build_setup_commands` (loopback is on-link, a gateway bypass would
     // hijack it).
     if !server_ip.to_canonical().is_loopback() {
+        let original_gateway = gateway.gateway_ip;
         match server_ip {
-            IpAddr::V4(_) => cmds.push(vec![
+            IpAddr::V4(_) => cmds.push(SetupCommand::fatal(vec![
                 "route".into(),
                 "add".into(),
                 format!("{server_ip}"),
                 "mask".into(),
                 "255.255.255.255".into(),
                 format!("{original_gateway}"),
-            ]),
-            IpAddr::V6(_) => cmds.push(vec![
+            ])),
+            IpAddr::V6(_) => cmds.push(SetupCommand::fatal(vec![
                 "netsh".into(),
                 "interface".into(),
                 "ipv6".into(),
                 "add".into(),
                 "route".into(),
                 format!("{server_ip}/128"),
-                interface_name.into(),
-            ]),
+                gateway.interface_name.clone(),
+            ])),
         }
     }
 
@@ -881,15 +946,11 @@ fn platform_teardown_commands(tun_name: &str, server_ip: IpAddr, interface_name:
 }
 
 #[cfg(target_os = "macos")]
-fn platform_setup_commands(
-    tun_name: &str,
-    server_ip: IpAddr,
-    original_gateway: IpAddr,
-    interface_name: &str,
-) -> Vec<Vec<String>> {
+fn platform_setup_commands(tun_name: &str, server_ip: IpAddr, gateway: &GatewayInfo) -> Vec<SetupCommand> {
+    let ipv6 = gateway.ipv6_available;
     let mut cmds = vec![
         // IPv4 low half: 0.0.0.0/1 via TUN
-        vec![
+        SetupCommand::fatal(vec![
             "route".into(),
             "-n".into(),
             "add".into(),
@@ -897,9 +958,9 @@ fn platform_setup_commands(
             "0.0.0.0/1".into(),
             "-interface".into(),
             tun_name.into(),
-        ],
+        ]),
         // IPv4 high half: 128.0.0.0/1 via TUN
-        vec![
+        SetupCommand::fatal(vec![
             "route".into(),
             "-n".into(),
             "add".into(),
@@ -907,43 +968,50 @@ fn platform_setup_commands(
             "128.0.0.0/1".into(),
             "-interface".into(),
             tun_name.into(),
-        ],
+        ]),
         // IPv6 low half: ::/1 via TUN
-        vec![
-            "route".into(),
-            "-n".into(),
-            "add".into(),
-            "-inet6".into(),
-            "::/1".into(),
-            "-interface".into(),
-            tun_name.into(),
-        ],
+        SetupCommand {
+            argv: vec![
+                "route".into(),
+                "-n".into(),
+                "add".into(),
+                "-inet6".into(),
+                "::/1".into(),
+                "-interface".into(),
+                tun_name.into(),
+            ],
+            fatal: ipv6,
+        },
         // IPv6 high half: 8000::/1 via TUN
-        vec![
-            "route".into(),
-            "-n".into(),
-            "add".into(),
-            "-inet6".into(),
-            "8000::/1".into(),
-            "-interface".into(),
-            tun_name.into(),
-        ],
+        SetupCommand {
+            argv: vec![
+                "route".into(),
+                "-n".into(),
+                "add".into(),
+                "-inet6".into(),
+                "8000::/1".into(),
+                "-interface".into(),
+                tun_name.into(),
+            ],
+            fatal: ipv6,
+        },
     ];
 
     // Bypass: server IP via original gateway/interface. Skipped for loopback —
     // see `build_setup_commands` (loopback is on-link, a gateway bypass would
     // hijack it).
     if !server_ip.to_canonical().is_loopback() {
+        let original_gateway = gateway.gateway_ip;
         match server_ip {
-            IpAddr::V4(_) => cmds.push(vec![
+            IpAddr::V4(_) => cmds.push(SetupCommand::fatal(vec![
                 "route".into(),
                 "-n".into(),
                 "add".into(),
                 "-host".into(),
                 format!("{server_ip}"),
                 format!("{original_gateway}"),
-            ]),
-            IpAddr::V6(_) => cmds.push(vec![
+            ])),
+            IpAddr::V6(_) => cmds.push(SetupCommand::fatal(vec![
                 "route".into(),
                 "-n".into(),
                 "add".into(),
@@ -951,8 +1019,8 @@ fn platform_setup_commands(
                 "-host".into(),
                 format!("{server_ip}"),
                 "-interface".into(),
-                interface_name.into(),
-            ]),
+                gateway.interface_name.clone(),
+            ])),
         }
     }
 

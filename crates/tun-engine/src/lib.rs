@@ -27,11 +27,12 @@
 //! ## Route-command failure policy
 //!
 //! Install is fatal ([`routing::setup_routes`] returns `Err` on the first
-//! command that does not exit zero); teardown and crash recovery are
-//! best-effort ([`routing::teardown_routes`] returns a
-//! [`routing::CleanupReport`] and has no error channel at all). See the
-//! "Execution" section of [`routing`]. Reporting routes that were never
-//! installed is a leak; stopping cleanup at the first failure strands routes.
+//! command that does not exit zero and is marked fatal — see
+//! [`routing::SetupCommand`]); teardown and crash recovery are best-effort
+//! ([`routing::teardown_routes`] returns a [`routing::CleanupReport`] and has
+//! no error channel at all). See the "Execution" section of [`routing`].
+//! Reporting routes that were never installed is a leak; stopping cleanup at
+//! the first failure strands routes.
 
 // Install the workspace test subscriber + panic hook. The dev-dep
 // is gated on cfg(test) because it isn't linked in non-test builds.

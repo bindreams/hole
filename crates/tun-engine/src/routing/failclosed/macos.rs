@@ -24,7 +24,7 @@
 use std::net::IpAddr;
 use std::path::Path;
 
-use super::super::{run_capturing, PHASE_COVER, PHASE_RECOVER_COVER};
+use super::super::{run_capturing, BestEffortPhase, FatalPhase, Phase};
 use crate::error::RoutingError;
 // `macos.rs` is mounted as `mod platform` under `failclosed`, so `super` is the
 // `failclosed` module and `failclosed_state` is its sibling child.
@@ -162,7 +162,7 @@ fn engage_pf_action(pf_enabled: bool, has_persisted: bool) -> PfEngageAction {
 
 const PFCONF: &str = "/etc/pf.conf";
 
-fn pfctl(args: &[&str], stdin: Option<&[u8]>, phase: &str) -> Result<std::process::Output, RoutingError> {
+fn pfctl<P: Phase>(args: &[&str], stdin: Option<&[u8]>, phase: P) -> Result<std::process::Output, RoutingError> {
     let cmd: Vec<String> = std::iter::once("pfctl")
         .chain(args.iter().copied())
         .map(str::to_owned)
@@ -173,7 +173,7 @@ fn pfctl(args: &[&str], stdin: Option<&[u8]>, phase: &str) -> Result<std::proces
 /// `pfctl -E` (refcounted enable) + parse the enable token from its output. The
 /// token prints to stderr (or stdout on some hosts), so try both.
 fn enable_pf_capture_token() -> Result<String, RoutingError> {
-    let en = pfctl(&["-E"], None, PHASE_COVER)?;
+    let en = pfctl(&["-E"], None, FatalPhase::CoverEngage)?;
     parse_enable_token(&String::from_utf8_lossy(&en.stderr))
         .or_else(|| parse_enable_token(&String::from_utf8_lossy(&en.stdout)))
         .ok_or_else(|| RoutingError::RouteSetup("pfctl -E returned no token".into()))
@@ -201,7 +201,7 @@ pub fn engage(
     owner: Option<(u32, u32)>,
 ) -> Result<Cover, RoutingError> {
     // 1. Read current enabled-state (read-only).
-    let info = pfctl(&["-s", "info"], None, PHASE_COVER)?;
+    let info = pfctl(&["-s", "info"], None, FatalPhase::CoverEngage)?;
     let was_enabled = parse_pf_enabled(&String::from_utf8_lossy(&info.stdout));
 
     // 2. Enable pf (refcounted) and capture the token.
@@ -222,7 +222,7 @@ pub fn engage(
 
     // 4. Flush all + load our self-contained blocking ruleset from stdin.
     let ruleset = build_pf_ruleset(server_ip, resolver_ip);
-    let out = pfctl(&["-Fa", "-f", "-"], Some(ruleset.as_bytes()), PHASE_COVER)?;
+    let out = pfctl(&["-Fa", "-f", "-"], Some(ruleset.as_bytes()), FatalPhase::CoverEngage)?;
     if !out.status.success() {
         // A *failed engage* is the sole place this module fails OPEN on its own
         // error: we must not leave a half-loaded ruleset blocking traffic. Note
@@ -294,13 +294,13 @@ fn disengage(token: &str, state_dir: &Path, adopting: bool) {
             "reload skipped: standing cover is being adopted".into(),
         ))
     } else {
-        let out = pfctl(&["-f", PFCONF], None, PHASE_RECOVER_COVER);
+        let out = pfctl(&["-f", PFCONF], None, BestEffortPhase::RecoverCover);
         if let Err(ref e) = out {
             tracing::warn!(error = %e, "pf ruleset restore failed during cover disengage");
         }
         out
     };
-    if let Err(e) = pfctl(&["-X", token], None, PHASE_RECOVER_COVER) {
+    if let Err(e) = pfctl(&["-X", token], None, BestEffortPhase::RecoverCover) {
         tracing::warn!(error = %e, "pfctl -X failed during cover disengage");
     }
     if restore_confirmed(adopting, &reload) {
@@ -334,9 +334,9 @@ pub fn recover_cover(state_dir: &Path, adopting: bool) {
 /// engage ruleset. Separated so its `?`-error path can be unwound (drop the pf
 /// refcount) by the caller without leaking the `-E` enable.
 fn capture_and_persist(token: &str, state_dir: &Path, owner: Option<(u32, u32)>) -> Result<String, RoutingError> {
-    let sr = pfctl(&["-sr"], None, PHASE_COVER)?;
+    let sr = pfctl(&["-sr"], None, FatalPhase::CoverEngage)?;
     let main_snapshot = String::from_utf8_lossy(&sr.stdout).into_owned();
-    let sn = pfctl(&["-sn"], None, PHASE_COVER)?;
+    let sn = pfctl(&["-sn"], None, FatalPhase::CoverEngage)?;
     let nat_snapshot = String::from_utf8_lossy(&sn.stdout).into_owned();
 
     lockdown_state::save(
@@ -375,7 +375,7 @@ pub fn engage_lockdown(
 ) -> Result<Cover, RoutingError> {
     // The `pfctl -s info` read is decision-only — `LockdownPfState` records no
     // `pf_was_enabled` bit (unlike the transient `FailClosedState`).
-    let info = pfctl(&["-s", "info"], None, PHASE_COVER)?;
+    let info = pfctl(&["-s", "info"], None, FatalPhase::CoverEngage)?;
     let pf_enabled = parse_pf_enabled(&String::from_utf8_lossy(&info.stdout));
     let persisted = lockdown_state::load(state_dir);
 
@@ -402,7 +402,7 @@ pub fn engage_lockdown(
                 nat_snapshot: st.nat_snapshot.clone(),
             };
             if let Err(e) = lockdown_state::save(state_dir, &fresh, owner) {
-                if let Err(xe) = pfctl(&["-X", &token], None, PHASE_COVER) {
+                if let Err(xe) = pfctl(&["-X", &token], None, FatalPhase::CoverEngage) {
                     tracing::warn!(error = %xe, "pfctl -X failed unwinding a failed lockdown re-enable");
                 }
                 return Err(RoutingError::RouteSetup(format!(
@@ -420,7 +420,7 @@ pub fn engage_lockdown(
             match capture_and_persist(&token, state_dir, owner) {
                 Ok(nat_snapshot) => (token, nat_snapshot),
                 Err(e) => {
-                    if let Err(xe) = pfctl(&["-X", &token], None, PHASE_COVER) {
+                    if let Err(xe) = pfctl(&["-X", &token], None, FatalPhase::CoverEngage) {
                         tracing::warn!(error = %xe, "pfctl -X failed unwinding a failed lockdown engage");
                     }
                     return Err(e);
@@ -430,7 +430,7 @@ pub fn engage_lockdown(
     };
 
     let main = build_lockdown_main_ruleset(tun_name, server_ip, &nat_snapshot);
-    let out = pfctl(&["-f", "-"], Some(main.as_bytes()), PHASE_COVER)?;
+    let out = pfctl(&["-f", "-"], Some(main.as_bytes()), FatalPhase::CoverEngage)?;
     if !out.status.success() {
         // Restore the host (snapshot reload + drop refcount) before failing, so
         // a partially-loaded ruleset never strands the host.
@@ -463,14 +463,14 @@ pub fn disengage_lockdown(state_dir: &Path) -> Result<(), RoutingError> {
         return Ok(()); // No cover engaged — nothing to disengage.
     };
     let restore = build_lockdown_restore_ruleset(&st.nat_snapshot, &st.main_snapshot);
-    let out = pfctl(&["-f", "-"], Some(restore.as_bytes()), PHASE_RECOVER_COVER)?;
+    let out = pfctl(&["-f", "-"], Some(restore.as_bytes()), BestEffortPhase::RecoverCover)?;
     if !out.status.success() {
         return Err(RoutingError::RouteSetup(format!(
             "pfctl lockdown restore failed: {}",
             String::from_utf8_lossy(&out.stderr).trim()
         )));
     }
-    let xout = pfctl(&["-X", &st.pf_token], None, PHASE_RECOVER_COVER)?;
+    let xout = pfctl(&["-X", &st.pf_token], None, BestEffortPhase::RecoverCover)?;
     if !xout.status.success() {
         return Err(RoutingError::RouteSetup(format!(
             "pfctl -X (drop pf refcount) failed: {}",
@@ -673,20 +673,20 @@ fn pfctl_status(out: Result<std::process::Output, RoutingError>, what: &str) -> 
 impl PfOps for RealPfOps<'_> {
     fn reload_default(&mut self) -> Result<(), RoutingError> {
         pfctl_status(
-            pfctl(&["-f", PFCONF], None, PHASE_RECOVER_COVER),
+            pfctl(&["-f", PFCONF], None, BestEffortPhase::RecoverCover),
             "pf default-ruleset reload",
         )
     }
 
     fn load_ruleset(&mut self, text: &str) -> Result<(), RoutingError> {
         pfctl_status(
-            pfctl(&["-f", "-"], Some(text.as_bytes()), PHASE_RECOVER_COVER),
+            pfctl(&["-f", "-"], Some(text.as_bytes()), BestEffortPhase::RecoverCover),
             "pf ruleset load",
         )
     }
 
     fn drop_token(&mut self, token: &str) -> Result<(), RoutingError> {
-        pfctl_status(pfctl(&["-X", token], None, PHASE_RECOVER_COVER), "pfctl -X")
+        pfctl_status(pfctl(&["-X", token], None, BestEffortPhase::RecoverCover), "pfctl -X")
     }
 
     fn clear_transient(&mut self) -> Result<(), RoutingError> {

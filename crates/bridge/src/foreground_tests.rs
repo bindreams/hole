@@ -127,7 +127,7 @@ impl StubRouting {
 impl Routing for StubRouting {
     type Installed = StubRoutes;
     type Cover = StubCover;
-    fn install(&self, _: &str, _: IpAddr, _: IpAddr, _: &str) -> Result<StubRoutes, RoutingError> {
+    fn install(&self, _: &str, _: IpAddr, _: &GatewayInfo) -> Result<StubRoutes, RoutingError> {
         Ok(StubRoutes {
             _state_dir: self.state_dir.clone(),
         })

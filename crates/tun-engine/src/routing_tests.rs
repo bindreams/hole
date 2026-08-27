@@ -18,9 +18,32 @@ fn ipv4_gateway() -> IpAddr {
     "192.168.1.1".parse().unwrap()
 }
 
-fn setup_cmds_joined(server_ip: IpAddr, gateway: IpAddr) -> String {
-    let cmds = build_setup_commands("utun7", server_ip, gateway, "en0");
-    cmds.iter().map(|c| c.join(" ")).collect::<Vec<_>>().join("\n")
+fn gateway_info(gateway_ip: IpAddr, interface_name: &str, ipv6_available: bool) -> GatewayInfo {
+    GatewayInfo {
+        gateway_ip,
+        interface_name: interface_name.into(),
+        interface_index: 1,
+        ipv6_available,
+    }
+}
+
+/// The ordinary upstream: IPv4 gateway, `en0`, IPv6 reachable — so every setup
+/// command is fatal.
+fn ipv4_gw() -> GatewayInfo {
+    gateway_info(ipv4_gateway(), "en0", true)
+}
+
+fn argvs(cmds: &[SetupCommand]) -> Vec<Vec<String>> {
+    cmds.iter().map(|c| c.argv.clone()).collect()
+}
+
+fn is_ipv6_split(cmd: &SetupCommand) -> bool {
+    cmd.argv.iter().any(|arg| arg == "::/1" || arg == "8000::/1")
+}
+
+fn setup_cmds_joined(server_ip: IpAddr, gateway: &GatewayInfo) -> String {
+    let cmds = build_setup_commands("utun7", server_ip, gateway);
+    cmds.iter().map(|c| c.argv.join(" ")).collect::<Vec<_>>().join("\n")
 }
 
 /// True if any command has an argument that *is* the address (or its `/128`
@@ -40,31 +63,31 @@ fn teardown_cmds_joined(server_ip: IpAddr) -> String {
 
 #[skuld::test]
 fn setup_generates_five_commands() {
-    let cmds = build_setup_commands("utun7", ipv4_server(), ipv4_gateway(), "en0");
+    let cmds = build_setup_commands("utun7", ipv4_server(), &ipv4_gw());
     assert_eq!(cmds.len(), 5);
 }
 
 #[skuld::test]
 fn setup_includes_low_half_route() {
-    let joined = setup_cmds_joined(ipv4_server(), ipv4_gateway());
+    let joined = setup_cmds_joined(ipv4_server(), &ipv4_gw());
     assert!(joined.contains("0.0.0.0/1"), "missing low-half route in:\n{joined}");
 }
 
 #[skuld::test]
 fn setup_includes_high_half_route() {
-    let joined = setup_cmds_joined(ipv4_server(), ipv4_gateway());
+    let joined = setup_cmds_joined(ipv4_server(), &ipv4_gw());
     assert!(joined.contains("128.0.0.0/1"), "missing high-half route in:\n{joined}");
 }
 
 #[skuld::test]
 fn setup_includes_ipv6_low_half_route() {
-    let joined = setup_cmds_joined(ipv4_server(), ipv4_gateway());
+    let joined = setup_cmds_joined(ipv4_server(), &ipv4_gw());
     assert!(joined.contains("::/1"), "missing IPv6 low-half route in:\n{joined}");
 }
 
 #[skuld::test]
 fn setup_includes_ipv6_high_half_route() {
-    let joined = setup_cmds_joined(ipv4_server(), ipv4_gateway());
+    let joined = setup_cmds_joined(ipv4_server(), &ipv4_gw());
     assert!(
         joined.contains("8000::/1"),
         "missing IPv6 high-half route in:\n{joined}"
@@ -74,15 +97,15 @@ fn setup_includes_ipv6_high_half_route() {
 #[skuld::test]
 fn setup_includes_server_bypass_route() {
     let server_ip: IpAddr = "5.6.7.8".parse().unwrap();
-    let joined = setup_cmds_joined(server_ip, ipv4_gateway());
+    let joined = setup_cmds_joined(server_ip, &ipv4_gw());
     assert!(joined.contains("5.6.7.8"), "missing server bypass route in:\n{joined}");
 }
 
 #[skuld::test]
 fn setup_bypass_uses_original_gateway() {
     let server_ip: IpAddr = "5.6.7.8".parse().unwrap();
-    let gateway: IpAddr = "10.0.0.1".parse().unwrap();
-    let joined = setup_cmds_joined(server_ip, gateway);
+    let gateway = gateway_info("10.0.0.1".parse().unwrap(), "en0", true);
+    let joined = setup_cmds_joined(server_ip, &gateway);
     assert!(
         joined.contains("10.0.0.1"),
         "missing gateway in bypass route:\n{joined}"
@@ -97,14 +120,14 @@ fn setup_bypass_uses_original_gateway() {
 fn setup_with_loopback_server_has_no_bypass() {
     for ip in ["127.0.0.1", "::1", "::ffff:127.0.0.1"] {
         let server_ip: IpAddr = ip.parse().unwrap();
-        let cmds = build_setup_commands("utun7", server_ip, ipv4_gateway(), "en0");
+        let cmds = build_setup_commands("utun7", server_ip, &ipv4_gw());
         assert_eq!(
             cmds.len(),
             4,
             "loopback {ip}: expected only 4 split routes, got {cmds:?}"
         );
         assert!(
-            !mentions_addr(&cmds, ip),
+            !mentions_addr(&argvs(&cmds), ip),
             "loopback {ip}: no command should reference the server address, got {cmds:?}"
         );
     }
@@ -114,15 +137,15 @@ fn setup_with_loopback_server_has_no_bypass() {
 
 #[skuld::test]
 fn setup_with_ipv6_server_generates_five_commands() {
-    let cmds = build_setup_commands("utun7", ipv6_server(), ipv4_gateway(), "en0");
+    let cmds = build_setup_commands("utun7", ipv6_server(), &ipv4_gw());
     assert_eq!(cmds.len(), 5);
 }
 
 #[skuld::test]
 fn setup_with_ipv6_server_includes_ipv6_bypass() {
-    let cmds = build_setup_commands("utun7", ipv6_server(), ipv4_gateway(), "en0");
+    let cmds = build_setup_commands("utun7", ipv6_server(), &ipv4_gw());
     // The bypass is the last command (index 4)
-    let bypass = cmds[4].join(" ");
+    let bypass = cmds[4].argv.join(" ");
     assert!(
         bypass.contains("2001:db8::1"),
         "missing IPv6 server address in bypass command:\n{bypass}"
@@ -135,7 +158,7 @@ fn setup_with_ipv6_server_includes_ipv6_bypass() {
 
 #[skuld::test]
 fn setup_with_ipv6_server_has_no_ipv4_bypass() {
-    let joined = setup_cmds_joined(ipv6_server(), ipv4_gateway());
+    let joined = setup_cmds_joined(ipv6_server(), &ipv4_gw());
     assert!(
         !joined.contains("mask 255.255.255.255"),
         "IPv6 server should not have IPv4 bypass:\n{joined}"
@@ -275,12 +298,90 @@ fn split_teardown_includes_ipv6_high_half() {
 
 #[skuld::test]
 fn setup_with_spaced_interface_name_includes_full_name() {
-    let cmds = build_setup_commands("utun7", ipv6_server(), ipv4_gateway(), "Wi-Fi Direct");
-    let bypass = cmds[4].join(" ");
+    let gateway = gateway_info(ipv4_gateway(), "Wi-Fi Direct", true);
+    let cmds = build_setup_commands("utun7", ipv6_server(), &gateway);
+    let bypass = cmds[4].argv.join(" ");
     assert!(
         bypass.contains("Wi-Fi Direct"),
         "interface name with spaces should be preserved:\n{bypass}"
     );
+}
+
+// Per-command fatality ================================================================================================
+//
+// The fatal install policy must not brick a host whose IPv6 stack is unbound
+// from the adapter (`DisabledComponents`, or an EDR policy that unbinds IPv6
+// from new adapters): there `netsh interface ipv6 add route ::/1 <adapter>`
+// cannot succeed, and the host emits no IPv6 traffic to leak. Where IPv6 IS
+// reachable the same failure is exactly the #901 leak and must abort.
+
+#[skuld::test]
+fn ipv6_splits_are_not_fatal_without_reachable_ipv6() {
+    let cmds = build_setup_commands("hole-tun", ipv4_server(), &gateway_info(ipv4_gateway(), "en0", false));
+    for cmd in cmds.iter().filter(|c| is_ipv6_split(c)) {
+        assert!(!cmd.fatal, "IPv6 split must not abort a host with no IPv6: {cmd:?}");
+    }
+}
+
+#[skuld::test]
+fn every_setup_command_is_fatal_with_reachable_ipv6() {
+    let cmds = build_setup_commands("hole-tun", ipv4_server(), &ipv4_gw());
+    for cmd in &cmds {
+        assert!(cmd.fatal, "every command is fatal when IPv6 is reachable: {cmd:?}");
+    }
+}
+
+/// The IPv4 splits and the server bypass carry the whole tunnel; nothing about
+/// the host's IPv6 stack may downgrade them.
+#[skuld::test]
+fn ipv4_splits_and_bypass_stay_fatal_without_ipv6() {
+    let cmds = build_setup_commands("hole-tun", ipv4_server(), &gateway_info(ipv4_gateway(), "en0", false));
+    let non_v6: Vec<_> = cmds.iter().filter(|c| !is_ipv6_split(c)).collect();
+    assert_eq!(non_v6.len(), 3, "expected 2 IPv4 splits + bypass, got {non_v6:?}");
+    for cmd in non_v6 {
+        assert!(cmd.fatal, "{cmd:?} must stay fatal");
+    }
+}
+
+/// Fails exactly the two IPv6 adds, as an IPv6-unbound adapter does.
+fn fail_ipv6_splits(
+    seen: &RefCell<Vec<String>>,
+) -> impl FnMut(&[String], FatalPhase) -> Result<(), CommandFailure> + '_ {
+    |argv: &[String], _| {
+        seen.borrow_mut().push(argv.join(" "));
+        if argv.iter().any(|arg| arg == "::/1" || arg == "8000::/1") {
+            return Err(CommandFailure::Exit(1));
+        }
+        Ok(())
+    }
+}
+
+#[skuld::test]
+fn a_host_without_ipv6_installs_even_when_both_ipv6_adds_fail() {
+    let cmds = build_setup_commands("hole-tun", ipv4_server(), &gateway_info(ipv4_gateway(), "en0", false));
+    let seen: RefCell<Vec<String>> = RefCell::new(Vec::new());
+    let result = run_setup_with(&cmds, FatalPhase::Setup, fail_ipv6_splits(&seen));
+
+    assert!(
+        result.is_ok(),
+        "a host with no IPv6 stack has no IPv6 traffic to leak — aborting the start \
+         here loses the whole tunnel and avoids nothing, got {result:?}"
+    );
+    assert_eq!(
+        seen.borrow().len(),
+        cmds.len(),
+        "a non-fatal failure must not short-circuit the rest of the phase"
+    );
+}
+
+#[skuld::test]
+fn a_host_with_ipv6_aborts_when_an_ipv6_add_fails() {
+    let cmds = build_setup_commands("hole-tun", ipv4_server(), &ipv4_gw());
+    let seen: RefCell<Vec<String>> = RefCell::new(Vec::new());
+    let err = run_setup_with(&cmds, FatalPhase::Setup, fail_ipv6_splits(&seen)).unwrap_err();
+
+    assert_eq!(err.index, 2, "the ::/1 add is command 3 of the phase");
+    assert_eq!(seen.borrow().len(), 3, "no command after a fatal failure may be issued");
 }
 
 // `SystemRoutes` has private fields and no pub constructor — it is
@@ -308,10 +409,17 @@ fn always_exits(code: i32) -> Vec<String> {
     }
 }
 
+fn fatal_exits(code: i32) -> SetupCommand {
+    SetupCommand {
+        argv: always_exits(code),
+        fatal: true,
+    }
+}
+
 #[skuld::test]
 fn a_failed_setup_command_is_an_error() {
     assert!(
-        run_setup_commands(&[always_exits(3)], PHASE_SETUP).is_err(),
+        run_setup_commands(&[fatal_exits(3)], FatalPhase::Setup).is_err(),
         "a non-zero exit during route setup must surface as an error — returning Ok \
          reports split routes that were never installed, and traffic egresses outside \
          the tunnel while the UI says it is protected (#901)"
@@ -320,15 +428,31 @@ fn a_failed_setup_command_is_an_error() {
 
 #[skuld::test]
 fn a_successful_setup_command_is_ok() {
-    assert!(run_setup_commands(&[always_exits(0)], PHASE_SETUP).is_ok());
+    assert!(run_setup_commands(&[fatal_exits(0)], FatalPhase::Setup).is_ok());
 }
 
 #[skuld::test]
 fn setup_error_carries_the_exit_code_and_position() {
-    let err = run_setup_commands(&[always_exits(0), always_exits(3)], PHASE_SETUP).unwrap_err();
+    let err = run_setup_commands(&[fatal_exits(0), fatal_exits(3)], FatalPhase::Setup).unwrap_err();
     let rendered = err.to_string();
     assert!(rendered.contains("exited with code 3"), "got {rendered}");
     assert!(rendered.contains("command 2 of 2"), "got {rendered}");
+}
+
+/// Tolerating a non-fatal command must not soften the phase around it: a later
+/// fatal failure still aborts, and is the one reported.
+#[skuld::test]
+fn a_non_fatal_failure_does_not_mask_a_later_fatal_one() {
+    let cmds = vec![
+        SetupCommand {
+            argv: always_exits(1),
+            fatal: false,
+        },
+        fatal_exits(7),
+    ];
+    let err = run_setup_commands(&cmds, FatalPhase::Setup).unwrap_err();
+    assert_eq!(err.index, 1);
+    assert!(err.to_string().contains("exited with code 7"), "got {err}");
 }
 
 /// The message reaches a GUI toast verbatim (`StartError::Failed`), so it must
@@ -336,9 +460,9 @@ fn setup_error_carries_the_exit_code_and_position() {
 /// there. They stay in the `warn` log instead.
 #[skuld::test]
 fn setup_error_does_not_leak_the_command_arguments() {
-    let cmds = build_setup_commands("hole-tun", ipv4_server(), ipv4_gateway(), "en0");
+    let cmds = build_setup_commands("hole-tun", ipv4_server(), &ipv4_gw());
     let err = RouteCommandError {
-        program: cmds[4][0].clone(),
+        program: cmds[4].argv[0].clone(),
         index: 4,
         total: cmds.len(),
         failure: CommandFailure::Exit(1),
@@ -352,7 +476,7 @@ fn setup_error_does_not_leak_the_command_arguments() {
 #[skuld::test]
 fn a_failed_cleanup_command_is_reported_but_not_returned() {
     // The return type has no error channel at all; the count is the only signal.
-    let report = run_cleanup_commands(&[always_exits(3), always_exits(0)], PHASE_TEARDOWN);
+    let report = run_cleanup_commands(&[always_exits(3), always_exits(0)], BestEffortPhase::Teardown);
     assert_eq!(
         report,
         CleanupReport {
@@ -364,11 +488,11 @@ fn a_failed_cleanup_command_is_reported_but_not_returned() {
 
 /// Records every command the loop hands it and fails the ones whose index is
 /// in `fail_at`.
-fn recording_exec<'a>(
+fn recording_exec<'a, P>(
     seen: &'a RefCell<Vec<String>>,
     fail_at: &'a [usize],
-) -> impl FnMut(&[String], &str) -> Result<(), CommandFailure> + 'a {
-    move |cmd: &[String], _phase: &str| {
+) -> impl FnMut(&[String], P) -> Result<(), CommandFailure> + 'a {
+    move |cmd: &[String], _phase: P| {
         let index = seen.borrow().len();
         seen.borrow_mut().push(cmd.join(" "));
         if fail_at.contains(&index) {
@@ -382,12 +506,21 @@ fn numbered_commands(count: usize) -> Vec<Vec<String>> {
     (0..count).map(|i| vec!["route".into(), format!("cmd{i}")]).collect()
 }
 
+fn numbered_setup_commands(count: usize) -> Vec<SetupCommand> {
+    numbered_commands(count).into_iter().map(SetupCommand::fatal).collect()
+}
+
 #[skuld::test]
 fn setup_stops_at_the_first_failing_command() {
     // Fatal phase: keeping on mutating the route table after a failure would
     // build a route set nobody can reason about.
     let seen: RefCell<Vec<String>> = RefCell::new(Vec::new());
-    let err = run_setup_with(&numbered_commands(5), PHASE_SETUP, recording_exec(&seen, &[1])).unwrap_err();
+    let err = run_setup_with(
+        &numbered_setup_commands(5),
+        FatalPhase::Setup,
+        recording_exec(&seen, &[1]),
+    )
+    .unwrap_err();
 
     assert_eq!(err.index, 1);
     assert_eq!(
@@ -404,7 +537,7 @@ fn cleanup_issues_every_command_even_when_all_of_them_fail() {
     let seen: RefCell<Vec<String>> = RefCell::new(Vec::new());
     let report = run_cleanup_with(
         &numbered_commands(5),
-        PHASE_TEARDOWN,
+        BestEffortPhase::Teardown,
         recording_exec(&seen, &[0, 1, 2, 3, 4]),
     );
 
@@ -423,7 +556,7 @@ fn cleanup_survives_a_spawn_failure_and_keeps_going() {
     // A spawn failure used to `?` out of the loop, skipping every remaining
     // delete. It is now just another failed command.
     let seen: RefCell<Vec<String>> = RefCell::new(Vec::new());
-    let report = run_cleanup_with(&numbered_commands(3), PHASE_RECOVER_SPLIT, |cmd, _| {
+    let report = run_cleanup_with(&numbered_commands(3), BestEffortPhase::RecoverSplit, |cmd, _| {
         seen.borrow_mut().push(cmd.join(" "));
         Err(CommandFailure::Spawn(std::io::Error::other("no such program")))
     });
@@ -443,7 +576,7 @@ fn cleanup_survives_a_spawn_failure_and_keeps_going() {
 // `install_with` injects the two phases, so these drive the real
 // state-file/rollback logic without issuing a route command (#165).
 
-fn failed_setup(_: &str, _: IpAddr, _: IpAddr, _: &str) -> Result<(), RouteCommandError> {
+fn failed_setup(_: &str, _: IpAddr, _: &GatewayInfo) -> Result<(), RouteCommandError> {
     Err(RouteCommandError {
         program: "route".into(),
         index: 0,
@@ -457,14 +590,9 @@ fn install_hands_back_no_guard_when_a_setup_command_fails() {
     let tmp = tempfile::tempdir().unwrap();
     let routing = SystemRouting::new(tmp.path().to_path_buf(), None);
 
-    let result = routing.install_with(
-        "hole-tun",
-        ipv4_server(),
-        ipv4_gateway(),
-        "en0",
-        failed_setup,
-        |_, _, _| CleanupReport::default(),
-    );
+    let result = routing.install_with("hole-tun", ipv4_server(), &ipv4_gw(), failed_setup, |_, _, _| {
+        CleanupReport::default()
+    });
 
     assert!(
         result.is_err(),
@@ -479,20 +607,13 @@ fn install_rolls_back_and_clears_state_when_a_setup_command_fails() {
     let routing = SystemRouting::new(tmp.path().to_path_buf(), None);
     let torn_down: RefCell<Vec<(String, IpAddr, String)>> = RefCell::new(Vec::new());
 
-    let result = routing.install_with(
-        "hole-tun",
-        ipv4_server(),
-        ipv4_gateway(),
-        "en0",
-        failed_setup,
-        |tun, ip, iface| {
-            torn_down.borrow_mut().push((tun.into(), ip, iface.into()));
-            CleanupReport {
-                attempted: 5,
-                failed: 4,
-            }
-        },
-    );
+    let result = routing.install_with("hole-tun", ipv4_server(), &ipv4_gw(), failed_setup, |tun, ip, iface| {
+        torn_down.borrow_mut().push((tun.into(), ip, iface.into()));
+        CleanupReport {
+            attempted: 5,
+            failed: 4,
+        }
+    });
 
     assert!(result.is_err());
     assert_eq!(
@@ -517,11 +638,10 @@ fn install_persists_state_before_the_setup_phase_runs() {
     let _ = routing.install_with(
         "hole-tun",
         ipv4_server(),
-        ipv4_gateway(),
-        "en0",
-        |_, _, _, _| {
+        &ipv4_gw(),
+        |_, _, gw| {
             state_seen.set(tmp.path().join(STATE_FILE_NAME).exists());
-            failed_setup("", ipv4_server(), ipv4_gateway(), "")
+            failed_setup("", ipv4_server(), gw)
         },
         |_, _, _| CleanupReport::default(),
     );
@@ -541,9 +661,8 @@ fn install_returns_a_guard_when_every_setup_command_succeeds() {
         .install_with(
             "hole-tun",
             ipv4_server(),
-            ipv4_gateway(),
-            "en0",
-            |_, _, _, _| Ok(()),
+            &ipv4_gw(),
+            |_, _, _| Ok(()),
             |_, _, _| unreachable!("a successful install must not roll back"),
         )
         .expect("install must succeed when the setup phase does");
@@ -554,61 +673,24 @@ fn install_returns_a_guard_when_every_setup_command_succeeds() {
     std::mem::forget(routes);
 }
 
-// Phase classifier ====================================================================================================
+// Phase classification ================================================================================================
 //
-// `is_recovery_phase` decides whether a failed command logs at debug
-// (idempotent best-effort cleanup) or warn (a real error). These tests are
-// regressions against accidental modification of the matcher itself —
-// they reference the same `PHASE_*` constants used by `recover_routes_with`,
-// so the literal phase strings live in exactly one place.
-
-#[skuld::test]
-fn recover_phases_are_classified_as_expected_failures() {
-    assert!(is_recovery_phase(PHASE_RECOVER_SPLIT));
-    assert!(is_recovery_phase(PHASE_RECOVER_BYPASS));
-}
-
-/// `PHASE_TEARDOWN` is best-effort: `netsh interface ip delete route
-/// 0.0.0.0/1 <adapter>` and the bare `route delete <ip>` both exit
-/// non-zero when the route is absent, and `setup_routes` is NOT
-/// transactional — a failed mid-install leaves an arbitrary subset of
-/// routes present, so teardown must tolerate missing routes silently.
-/// Real teardown failures surface elsewhere (post-teardown
-/// `Remove-NetAdapter` reporting, state-file persistence errors).
-#[skuld::test]
-fn teardown_phase_is_classified_as_expected_failures() {
-    assert!(is_recovery_phase(PHASE_TEARDOWN));
-}
-
-#[skuld::test]
-fn setup_phase_is_not_recovery() {
-    // PHASE_SETUP is the only path that should warn on non-zero exit:
-    // initial route install IS expected to succeed.
-    assert!(!is_recovery_phase(PHASE_SETUP));
-}
-
-#[skuld::test]
-fn recover_cover_phase_is_classified_as_expected_failures() {
-    assert!(is_recovery_phase(PHASE_RECOVER_COVER));
-}
-
-// `PHASE_COVER` is macOS-only (the engage subprocess phase), so this
-// assertion is too. Engage failures are real anomalies that abort the cutover.
-#[cfg(target_os = "macos")]
-#[skuld::test]
-fn cover_engage_phase_is_not_recovery() {
-    assert!(!is_recovery_phase(PHASE_COVER));
-}
+// Nothing to test at runtime. Each runner accepts only its own phase type, and
+// the command types differ too (`SetupCommand` vs `Vec<String>`), so
+// `run_cleanup_commands(cmds, FatalPhase::Setup)` — the misuse the old
+// `debug_assert` back-stopped — no longer compiles. Which family is which is a
+// `const` pinned by the `const _: () = assert!(..)` pair in routing.rs; a
+// `#[skuld::test]` over it would be vacuous (clippy::assertions_on_constants).
 
 // recover_routes_with tests ===========================================================================================
 //
 // These use an injectable command runner so the test doesn't shell out.
 
-type Captured = Vec<(String, Vec<Vec<String>>)>;
+type Captured = Vec<(BestEffortPhase, Vec<Vec<String>>)>;
 
-fn capturing_runner(log: &RefCell<Captured>) -> impl Fn(&[Vec<String>], &str) -> CleanupReport + '_ {
-    |cmds: &[Vec<String>], phase: &str| {
-        log.borrow_mut().push((phase.into(), cmds.to_vec()));
+fn capturing_runner(log: &RefCell<Captured>) -> impl Fn(&[Vec<String>], BestEffortPhase) -> CleanupReport + '_ {
+    |cmds: &[Vec<String>], phase: BestEffortPhase| {
+        log.borrow_mut().push((phase, cmds.to_vec()));
         CleanupReport {
             attempted: cmds.len(),
             failed: 0,
@@ -649,8 +731,8 @@ fn recover_with_state_file_runs_split_then_bypass_then_clears() {
 
     let log = log.into_inner();
     assert_eq!(log.len(), 2, "expected split + bypass phases, got {log:?}");
-    assert_eq!(log[0].0, PHASE_RECOVER_SPLIT);
-    assert_eq!(log[1].0, PHASE_RECOVER_BYPASS);
+    assert_eq!(log[0].0, BestEffortPhase::RecoverSplit);
+    assert_eq!(log[1].0, BestEffortPhase::RecoverBypass);
     assert!(
         !tmp.path().join(STATE_FILE_NAME).exists(),
         "state file should be cleared after recovery"
@@ -676,7 +758,7 @@ fn recover_with_loopback_server_skips_bypass() {
     recover_routes_with(tmp.path(), capturing_runner(&log), |_, _| {}, false, || false, |_| {});
 
     let log = log.into_inner();
-    assert_eq!(log[1].0, PHASE_RECOVER_BYPASS);
+    assert_eq!(log[1].0, BestEffortPhase::RecoverBypass);
     assert_eq!(
         log[1].1.len(),
         4,
@@ -701,7 +783,7 @@ fn recover_clears_state_file_even_when_every_command_fails() {
     };
     state::save(tmp.path(), &persisted_state, None).unwrap();
 
-    let failing = |cmds: &[Vec<String>], _: &str| CleanupReport {
+    let failing = |cmds: &[Vec<String>], _: BestEffortPhase| CleanupReport {
         attempted: cmds.len(),
         failed: cmds.len(),
     };

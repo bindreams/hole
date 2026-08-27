@@ -1536,7 +1536,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
             return Err(ProxyError::Cancelled);
         }
         // Install the routes — NOW traffic starts flowing to the TUN.
-        let routes = routing.install(TUN_DEVICE_NAME, server_ip, gw_info.gateway_ip, &gw_info.interface_name)?;
+        let routes = routing.install(TUN_DEVICE_NAME, server_ip, &gw_info)?;
 
         // Standing lockdown cover (#527). Engaged only when intent is on; when
         // off this whole block is a no-op and the start is byte-identical to

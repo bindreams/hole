@@ -102,6 +102,11 @@ exit zero aborts the phase and returns a `RouteCommandError`, and
 `SystemRouting::install` rolls back and hands back no guard. Reporting routes
 that were never installed sends traffic outside the tunnel.
 
+Fatality is decided per command, not per phase (`SetupCommand::fatal`). The two
+IPv6 split routes are non-fatal when the upstream interface cannot reach IPv6:
+there the `add route` cannot succeed, and a host with no IPv6 stack has no IPv6
+traffic to leak.
+
 `teardown_routes` and `recover_routes` are **best-effort**: every command is
 issued and none can abort the rest. They return a `CleanupReport` (counts) —
 not a `Result` — so there is no error channel to short-circuit through, because
