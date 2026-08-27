@@ -21,3 +21,10 @@ pub mod spec;
 pub use spec::{
     build_spec, Action, Condition, ConfineSpec, FilterSpec, Guid, Layer, BLOCK_WEIGHT, DNS_PORT, L4, PERMIT_WEIGHT,
 };
+
+#[cfg(target_os = "windows")]
+#[path = "dns_confine/windows.rs"]
+mod platform;
+
+#[cfg(target_os = "windows")]
+pub use platform::{engage, DnsConfineError, DnsConfinement};
