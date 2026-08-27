@@ -40,6 +40,11 @@ before editing; the sections linked below are the authoritative source.
 - **Bridge trait seam.** All OS-mutating bridge I/O routes through the `Proxy`,
   `Routing`, and `Dns` traits so tests can mock it. →
   [CONTRIBUTING.md#bridge-test-isolation-contract](CONTRIBUTING.md#bridge-test-isolation-contract)
+- **Datapath test seams.** The router seam splits the drop path off `Endpoint`
+  so the cascade's consequence is assertable without an engine; the datapath
+  seam generifies `Engine`/`Driver` over their packet I/O so the TUN loop is
+  drivable from memory. →
+  [CONTRIBUTING.md#datapath-coverage-which-lane-proves-what](CONTRIBUTING.md#datapath-coverage-which-lane-proves-what)
 - **Proxy shutdown contract.** `stop()` returns only once the listener sockets
   are closed; the proxy owns its own runtime because upstream's teardown is
   three layers of bare `abort()`. →
