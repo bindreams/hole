@@ -32,7 +32,8 @@ before editing; the sections linked below are the authoritative source.
   is the pure `decide_admission`. A socket with a packet still to emit is
   *retired* rather than removed, and reaped once smoltcp clears its 4-tuple —
   including one that reverted to `Listen`, which would otherwise hijack its
-  port. `TimeWait` stays on immediate removal. A 4-tuple has one owner: a
+  port. No socket in the stack defers an ACK, so `TimeWait` strands nothing on
+  immediate removal. A 4-tuple has one owner: a
   re-armed listener can outrank its own connection in slot order and steal that
   client's retransmitted SYN, so such a handshake is `Duplicate` and its socket
   is dropped without a segment. An admitted connection carries a keep-alive plus
