@@ -656,7 +656,7 @@ fn windows_live_tun_permit_passes_traffic_on_the_interface_it_names() {
 /// first test that would fail if `pass out quick on <tun>` matched any live
 /// interface rather than the one it names.
 #[cfg(target_os = "macos")]
-#[skuld::test(labels = [TUN], serial = TUN)]
+#[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
 fn macos_live_tun_permit_passes_traffic_on_the_interface_it_names() {
     run_live_tun_permit_core(open_pair, |_| {});
 }
