@@ -47,6 +47,11 @@ pub mod routing;
 #[doc(hidden)]
 pub mod sim;
 
+// Dev-only; see the module doc. `cfg(test)` so this crate's own privileged
+// tests get it without the feature.
+#[cfg(any(test, feature = "test-utils"))]
+pub mod test_utils;
+
 pub use device::{Device, DeviceConfig, MutDeviceConfig};
 pub use engine::{
     DnsInterceptor, Engine, EngineConfig, MutEngineConfig, Router, TcpFlow, TcpMeta, UdpFlow, UdpMeta, UdpSender,
