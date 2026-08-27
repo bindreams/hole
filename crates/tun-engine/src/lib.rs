@@ -58,7 +58,7 @@ pub mod routing;
 #[cfg(any(test, feature = "test-utils"))]
 pub mod test_utils;
 
-pub use device::{Device, DeviceConfig, MutDeviceConfig};
+pub use device::{Assigned, Device, DeviceConfig, MutDeviceConfig};
 pub use engine::{
     DnsInterceptor, Engine, EngineConfig, MutEngineConfig, Router, TcpFlow, TcpMeta, UdpFlow, UdpMeta, UdpSender,
 };

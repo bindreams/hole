@@ -225,6 +225,9 @@ impl From<tun_engine::DeviceError> for ProxyError {
             tun_engine::DeviceError::WintunLoad { path, message } => ProxyError::WintunLoad { path, message },
             tun_engine::DeviceError::TunOpen(err) => ProxyError::Runtime(err),
             tun_engine::DeviceError::InvalidConfig(msg) => ProxyError::RouteSetup(format!("device config: {msg}")),
+            tun_engine::DeviceError::Ipv6Assign { index, message } => {
+                ProxyError::RouteSetup(format!("TUN IPv6 address on interface {index}: {message}"))
+            }
         }
     }
 }
