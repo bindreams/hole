@@ -78,7 +78,17 @@ pub(crate) fn after(seq: TcpSeqNumber) -> u32 {
     (seq.0 as u32).wrapping_add(1)
 }
 
-pub(crate) fn segment(src: SocketAddr, dst: SocketAddr, control: TcpControl, seq: u32, ack: Option<u32>) -> Vec<u8> {
+/// 1400 MTU - 20 (IPv4) - 20 (TCP), the MSS a real client advertises here.
+pub(crate) const CLIENT_MSS: u16 = 1360;
+
+pub(crate) fn segment(
+    src: SocketAddr,
+    dst: SocketAddr,
+    control: TcpControl,
+    seq: u32,
+    ack: Option<u32>,
+    payload: &[u8],
+) -> Vec<u8> {
     let (src_v4, dst_v4) = match (src.ip(), dst.ip()) {
         (IpAddr::V4(s), IpAddr::V4(d)) => (s, d),
         _ => panic!("these helpers build IPv4 segments only"),
@@ -93,11 +103,11 @@ pub(crate) fn segment(src: SocketAddr, dst: SocketAddr, control: TcpControl, seq
         ack_number: ack.map(|a| TcpSeqNumber(a as i32)),
         window_len: 65535,
         window_scale: None,
-        max_seg_size: None,
+        max_seg_size: (control == TcpControl::Syn).then_some(CLIENT_MSS),
         sack_permitted: false,
         sack_ranges: [None, None, None],
         timestamp: None,
-        payload: &[],
+        payload,
     };
     let ip_repr = Ipv4Repr {
         src_addr: src_v4,
@@ -120,19 +130,33 @@ pub(crate) fn segment(src: SocketAddr, dst: SocketAddr, control: TcpControl, seq
 }
 
 pub(crate) fn syn(src: SocketAddr, dst: SocketAddr, seq: u32) -> Vec<u8> {
-    segment(src, dst, TcpControl::Syn, seq, None)
+    segment(src, dst, TcpControl::Syn, seq, None, &[])
 }
 
 pub(crate) fn ack(src: SocketAddr, dst: SocketAddr, seq: u32, ack: u32) -> Vec<u8> {
-    segment(src, dst, TcpControl::None, seq, Some(ack))
+    segment(src, dst, TcpControl::None, seq, Some(ack), &[])
 }
 
 pub(crate) fn rst(src: SocketAddr, dst: SocketAddr, seq: u32, ack: u32) -> Vec<u8> {
-    segment(src, dst, TcpControl::Rst, seq, Some(ack))
+    segment(src, dst, TcpControl::Rst, seq, Some(ack), &[])
 }
 
 pub(crate) fn fin(src: SocketAddr, dst: SocketAddr, seq: u32, ack: u32) -> Vec<u8> {
-    segment(src, dst, TcpControl::Fin, seq, Some(ack))
+    segment(src, dst, TcpControl::Fin, seq, Some(ack), &[])
+}
+
+/// A segment carrying `payload`, without `FIN`.
+// Consumed starting with the next commit.
+#[allow(dead_code)]
+pub(crate) fn data(src: SocketAddr, dst: SocketAddr, seq: u32, ack: u32, payload: &[u8]) -> Vec<u8> {
+    segment(src, dst, TcpControl::None, seq, Some(ack), payload)
+}
+
+/// A segment carrying `payload` and `FIN` together, in one packet.
+// Consumed starting with the next commit.
+#[allow(dead_code)]
+pub(crate) fn data_fin(src: SocketAddr, dst: SocketAddr, seq: u32, ack: u32, payload: &[u8]) -> Vec<u8> {
+    segment(src, dst, TcpControl::Fin, seq, Some(ack), payload)
 }
 
 /// Drain and parse everything the stack has queued for the TUN.
