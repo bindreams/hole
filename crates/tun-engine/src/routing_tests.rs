@@ -361,6 +361,7 @@ fn recover_without_state_file_is_a_noop() {
     let log: RefCell<Captured> = RefCell::new(Vec::new());
     recover_routes_with(
         tmp.path(),
+        None,
         capturing_runner(&log),
         |_, _| {},
         Intent::Off,
@@ -387,6 +388,7 @@ fn recover_with_state_file_runs_split_then_bypass_then_clears() {
     let log: RefCell<Captured> = RefCell::new(Vec::new());
     recover_routes_with(
         tmp.path(),
+        None,
         capturing_runner(&log),
         |_, _| {},
         Intent::Off,
@@ -422,6 +424,7 @@ fn recover_with_loopback_server_skips_bypass() {
     let log: RefCell<Captured> = RefCell::new(Vec::new());
     recover_routes_with(
         tmp.path(),
+        None,
         capturing_runner(&log),
         |_, _| {},
         Intent::Off,
@@ -457,7 +460,7 @@ fn recover_clears_state_file_even_when_runner_errors() {
 
     let failing =
         |_: &[Vec<String>], _: &str| -> std::io::Result<()> { Err(std::io::Error::other("simulated runner failure")) };
-    recover_routes_with(tmp.path(), failing, |_, _| {}, Intent::Off, || Absent, |_| {});
+    recover_routes_with(tmp.path(), None, failing, |_, _| {}, Intent::Off, || Absent, |_| {});
 
     assert!(
         !tmp.path().join(STATE_FILE_NAME).exists(),
@@ -474,6 +477,7 @@ fn recover_invokes_cover_sweep_even_without_route_state() {
     let swept = std::cell::Cell::new(false);
     recover_routes_with(
         tmp.path(),
+        None,
         capturing_runner(&log),
         |_, _| swept.set(true),
         Intent::Off,
@@ -496,6 +500,7 @@ fn recover_sweeps_lockdown_when_intent_off_and_present() {
     let decided: std::cell::Cell<Option<CoverRecovery>> = std::cell::Cell::new(None);
     recover_routes_with(
         tmp.path(),
+        None,
         capturing_runner(&log),
         |_, _| {},
         Intent::Off,
@@ -512,6 +517,7 @@ fn recover_adopts_lockdown_when_intent_on_and_present() {
     let decided: std::cell::Cell<Option<CoverRecovery>> = std::cell::Cell::new(None);
     recover_routes_with(
         tmp.path(),
+        None,
         capturing_runner(&log),
         |_, _| {},
         Intent::On,
@@ -529,6 +535,7 @@ fn recover_lockdown_noop_when_cover_absent() {
     // Probe says no cover present => Noop regardless of intent.
     recover_routes_with(
         tmp.path(),
+        None,
         capturing_runner(&log),
         |_, _| {},
         Intent::On,
@@ -548,6 +555,7 @@ fn recover_orders_lockdown_before_transient_sweep_and_passes_adopting() {
 
     recover_routes_with(
         dir.path(),
+        None,
         |_cmds, _phase| Ok(()),
         |_state_dir, adopting| {
             order.borrow_mut().push("sweep_cover");
@@ -588,6 +596,7 @@ fn recover_passes_adopting_only_on_adopt() {
         let adopting_seen: RefCell<Option<bool>> = RefCell::new(None);
         recover_routes_with(
             dir.path(),
+            None,
             |_c, _p| Ok(()),
             |_d, adopting| *adopting_seen.borrow_mut() = Some(adopting),
             intent,
@@ -666,8 +675,8 @@ fn cover_recovery_is_closed_over_intent_and_presence() {
 
 #[skuld::test]
 fn cover_recovery_sweeps_only_on_an_explicit_off_intent() {
-    // Sweep is the only action that removes protection. #881: a missing or
-    // unreadable intent file is not an "off" and must never reach it.
+    // Sweep is the only action that removes protection, and a missing or
+    // unreadable intent file is not an "off".
     for (intent, presence, action, _) in RECOVERY_TABLE {
         if action == Sweep {
             assert_eq!(
@@ -724,8 +733,8 @@ fn cover_recovery_is_inert_when_the_os_is_unreachable_or_clean() {
 
 #[skuld::test]
 fn adopt_deletes_nothing() {
-    // #881: with a wiped state dir, `Unset` x `Live` decides Adopt — and Adopt
-    // must not touch a cover that may belong to a RUNNING first bridge. After
+    // With a wiped state dir, `Unset` x `Live` decides Adopt — and Adopt must
+    // not touch a cover that may belong to a RUNNING first bridge. After
     // the volatile-permit refresh moved into `engage_lockdown`, `Sweep` is the
     // only decision that reaches the OS on either platform.
     use failclosed::RecoveryDispatch;
@@ -748,10 +757,9 @@ fn adopt_deletes_nothing() {
 
 #[skuld::test]
 fn only_an_explicit_off_intent_reaches_the_os() {
-    // The end-to-end statement #881 makes: walk the whole decision table and
-    // confirm the only cells that dispatch an OS mutation are the recorded-off
-    // ones. A regression that made a wiped state dir sweep again would show up
-    // here as an extra dispatching cell.
+    // Walk the whole decision table and confirm the only cells that dispatch an
+    // OS mutation are the recorded-off ones. A regression that made a wiped
+    // state dir sweep again shows up here as an extra dispatching cell.
     use failclosed::RecoveryDispatch;
     for (intent, presence, _, _) in RECOVERY_TABLE {
         let action = decide_cover_recovery(intent, presence).action;
@@ -766,6 +774,12 @@ fn only_an_explicit_off_intent_reaches_the_os() {
 }
 
 // Intent repair =======================================================================================================
+//
+// The repair's `owner` is not asserted here. `chown_path` is a no-op off macOS,
+// and a self-chown is vacuous (the temp dir is already self-owned), so only a
+// macOS root lane chowning to a FIXED foreign uid could discriminate it — the
+// same reason `hole_common::update_marker`'s owner proof rides
+// `crates/hole/tests/elevated_ownership_privileged.rs`.
 
 /// Drive `recover_routes_with` over `dir` with an injected presence, deriving
 /// the intent from `dir` exactly as production does.
@@ -773,6 +787,7 @@ fn recover_over(dir: &Path, presence: CoverPresence) -> (Recovery, Option<CoverR
     let acted: std::cell::Cell<Option<CoverRecovery>> = std::cell::Cell::new(None);
     let decision = recover_routes_with(
         dir,
+        None,
         |_c, _p| Ok(()),
         |_d, _a| {},
         failclosed::lockdown_state::load_intent(dir),
@@ -784,10 +799,8 @@ fn recover_over(dir: &Path, presence: CoverPresence) -> (Recovery, Option<CoverR
 
 #[skuld::test]
 fn recover_records_the_intent_when_a_live_cover_has_none() {
-    // #881: a wiped or recreated state dir over a LIVE cover. Before the fix
-    // the intent read `false`, the action was Sweep, and the kill switch was
-    // silently disengaged. Now the measured truth is written back and the cover
-    // is adopted.
+    // A wiped or recreated state dir over a LIVE cover: the measured truth is
+    // written back and the cover is adopted, not swept.
     let dir = tempfile::tempdir().unwrap();
     let (decision, acted) = recover_over(dir.path(), Live);
 
@@ -814,6 +827,7 @@ fn recover_records_the_intent_before_acting_on_it() {
     let observed: std::cell::Cell<Option<Intent>> = std::cell::Cell::new(None);
     recover_routes_with(
         dir.path(),
+        None,
         |_c, _p| Ok(()),
         |_d, _a| {},
         failclosed::lockdown_state::load_intent(dir.path()),
@@ -882,6 +896,7 @@ fn recover_returns_its_decision() {
         let dir = tempfile::tempdir().unwrap();
         let returned = recover_routes_with(
             dir.path(),
+            None,
             |_c, _p| Ok(()),
             |_d, _a| {},
             intent,

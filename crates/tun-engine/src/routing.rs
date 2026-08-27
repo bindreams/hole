@@ -198,10 +198,18 @@ pub(crate) fn run_capturing(
 /// Returns the standing-lockdown [`Recovery`] so the caller can record
 /// "a standing cover is live this run" — the claim that keeps the escape
 /// visible when the intent file cannot be read or repaired.
-pub fn recover_routes(state_dir: &Path) -> Recovery {
+///
+/// `owner` is the uid/gid every other bridge write into `state_dir` threads
+/// (`SystemRouting::new`, `ProxyManager::set_lockdown_intent`). Recovery's
+/// intent repair may CREATE both the directory and `bridge-lockdown.json` — a
+/// wiped state dir is exactly the condition that produces the `Unset` intent —
+/// so without it a user-scoped macOS bridge drops root-owned files into
+/// `~/Library/Application Support/hole`.
+pub fn recover_routes(state_dir: &Path, owner: Option<(u32, u32)>) -> Recovery {
     let intent = failclosed::lockdown_state::load_intent(state_dir);
     recover_routes_with(
         state_dir,
+        owner,
         run_commands,
         failclosed::recover_cover,
         intent,
@@ -345,9 +353,11 @@ pub fn decide_cover_recovery(intent: failclosed::lockdown_state::Intent, presenc
 /// behavior without shelling out to `netsh`/`route` or touching the host
 /// firewall. Production passes `run_commands`, [`failclosed::recover_cover`],
 /// the classified lockdown intent, [`failclosed::lockdown_cover_presence`], and
-/// [`failclosed::recover_lockdown`].
+/// [`failclosed::recover_lockdown`]. `owner` is passed straight through to the
+/// intent repair — see [`recover_routes`].
 pub(crate) fn recover_routes_with<R, S, P, L>(
     state_dir: &Path,
+    owner: Option<(u32, u32)>,
     runner: R,
     sweep_cover: S,
     lockdown_intent: failclosed::lockdown_state::Intent,
@@ -416,10 +426,12 @@ where
     // Repair BEFORE acting, so a crash in between leaves an intent that reads
     // armed rather than one the next start would sweep on. A failed write costs
     // the persisted preference, never the action or the escape: this run's
-    // adopted-cover claim carries the escape, and the next start re-derives the
-    // same measurement and repairs again.
+    // adopted-cover claim carries the escape, and the bridge retries the write
+    // the moment it honours that claim with a real cover install (see
+    // `promote_adopted_claim`). Re-deriving it on a LATER start is not a
+    // fallback — once the cover is torn down the measurement reads `Absent`.
     if decision.record_intent_on {
-        if let Err(e) = failclosed::lockdown_state::set_enabled(state_dir, true, None) {
+        if let Err(e) = failclosed::lockdown_state::set_enabled(state_dir, true, owner) {
             warn!(error = %e, "could not repair the lockdown intent over a measured live cover");
         }
     }

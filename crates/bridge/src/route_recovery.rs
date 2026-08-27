@@ -33,7 +33,10 @@ where
     D: Dns,
 {
     let dir = state_dir.to_path_buf();
-    match tokio::task::spawn_blocking(move || tun_engine::routing::recover_routes(&dir)).await {
+    // Taken from the manager rather than re-derived, so recovery's intent
+    // repair cannot chown to a different owner than the manager's own writes.
+    let owner = proxy.lock().await.state_owner();
+    match tokio::task::spawn_blocking(move || tun_engine::routing::recover_routes(&dir, owner)).await {
         Ok(recovery) => {
             proxy
                 .lock()
