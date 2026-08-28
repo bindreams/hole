@@ -116,6 +116,12 @@ before editing; the sections linked below are the authoritative source.
   redacted before reaching a toast; the detail still lands in `gui.log`.
   [→](CONTRIBUTING.md#logging--diagnostics)
 
+## macOS CI is the scarce resource
+
+~9 darwin jobs per PR against a small shared pool; the Windows and Linux legs finish long
+before them. Queue depth scales with the number of concurrent branches, not their size. Land
+what is open before starting more.
+
 ## Pointers
 
 - Product, install, user-facing CLI, distributions → [README.md](README.md)
