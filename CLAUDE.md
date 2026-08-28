@@ -79,14 +79,10 @@ before editing; the sections linked below are the authoritative source.
   scoped to TCP/443) is a bounded-window RAII guard engaged by every covered
   (auto-connect) start whose lockdown intent is OFF; a lockdown-on covered
   start uses the standing cover instead and releases any held transient one.
-  Both are persistent WFP filters (Win) / self-contained pf ruleset (mac). The
-  transient one is swept unconditionally by `recover_routes` on next start; the
-  standing one is reconciled by a 20-cell intent x presence table
-  (`decide_cover_recovery`) over a MEASURED OS probe, and is swept only on an
-  explicit recorded off intent — a missing or unreadable intent file adopts
-  instead, and `Adopt` never disengages the cover on either platform (Windows
-  additionally reclaims a stale TUN permit — see CONTRIBUTING.md's disclosed
-  residuals for what recovery-time adoption does NOT close). An adopted cover's ARMED half
+  Both are persistent WFP filters (Win) / self-contained pf ruleset (mac); the
+  transient one is swept unconditionally on next start, the standing one only
+  on an explicit recorded off — full reconciliation table (`decide_cover_recovery`)
+  and disclosed residuals in CONTRIBUTING.md. An adopted cover's ARMED half
   is promoted into `bridge-lockdown.json` at the first real engage, so a
   disconnect (`reload`'s slow path is stop + start) cannot disarm the switch;
   only `turn_lockdown_off` clears it. The escape from a stranded

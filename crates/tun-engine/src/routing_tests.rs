@@ -362,6 +362,7 @@ fn recover_without_state_file_is_a_noop() {
     recover_routes_with(
         tmp.path(),
         None,
+        "hole-tun",
         capturing_runner(&log),
         |_, _| {},
         Intent::Off,
@@ -389,6 +390,7 @@ fn recover_with_state_file_runs_split_then_bypass_then_clears() {
     recover_routes_with(
         tmp.path(),
         None,
+        "hole-tun",
         capturing_runner(&log),
         |_, _| {},
         Intent::Off,
@@ -425,6 +427,7 @@ fn recover_with_loopback_server_skips_bypass() {
     recover_routes_with(
         tmp.path(),
         None,
+        "hole-tun",
         capturing_runner(&log),
         |_, _| {},
         Intent::Off,
@@ -460,7 +463,16 @@ fn recover_clears_state_file_even_when_runner_errors() {
 
     let failing =
         |_: &[Vec<String>], _: &str| -> std::io::Result<()> { Err(std::io::Error::other("simulated runner failure")) };
-    recover_routes_with(tmp.path(), None, failing, |_, _| {}, Intent::Off, || Absent, |_, _| {});
+    recover_routes_with(
+        tmp.path(),
+        None,
+        "hole-tun",
+        failing,
+        |_, _| {},
+        Intent::Off,
+        || Absent,
+        |_, _| {},
+    );
 
     assert!(
         !tmp.path().join(STATE_FILE_NAME).exists(),
@@ -478,6 +490,7 @@ fn recover_invokes_cover_sweep_even_without_route_state() {
     recover_routes_with(
         tmp.path(),
         None,
+        "hole-tun",
         capturing_runner(&log),
         |_, _| swept.set(true),
         Intent::Off,
@@ -501,6 +514,7 @@ fn recover_sweeps_lockdown_when_intent_off_and_present() {
     recover_routes_with(
         tmp.path(),
         None,
+        "hole-tun",
         capturing_runner(&log),
         |_, _| {},
         Intent::Off,
@@ -518,6 +532,7 @@ fn recover_adopts_lockdown_when_intent_on_and_present() {
     recover_routes_with(
         tmp.path(),
         None,
+        "hole-tun",
         capturing_runner(&log),
         |_, _| {},
         Intent::On,
@@ -536,6 +551,7 @@ fn recover_lockdown_noop_when_cover_absent() {
     recover_routes_with(
         tmp.path(),
         None,
+        "hole-tun",
         capturing_runner(&log),
         |_, _| {},
         Intent::On,
@@ -556,6 +572,7 @@ fn recover_orders_lockdown_before_transient_sweep_and_passes_adopting() {
     recover_routes_with(
         dir.path(),
         None,
+        "hole-tun",
         |_cmds, _phase| Ok(()),
         |_state_dir, adopting| {
             order.borrow_mut().push("sweep_cover");
@@ -597,6 +614,7 @@ fn recover_passes_adopting_only_on_adopt() {
         recover_routes_with(
             dir.path(),
             None,
+            "hole-tun",
             |_c, _p| Ok(()),
             |_d, adopting| *adopting_seen.borrow_mut() = Some(adopting),
             intent,
@@ -792,6 +810,7 @@ fn recover_over(dir: &Path, presence: CoverPresence) -> (Recovery, Option<CoverR
     let decision = recover_routes_with(
         dir,
         None,
+        "hole-tun",
         |_c, _p| Ok(()),
         |_d, _a| {},
         failclosed::lockdown_state::load_intent(dir),
@@ -832,6 +851,7 @@ fn recover_records_the_intent_before_acting_on_it() {
     recover_routes_with(
         dir.path(),
         None,
+        "hole-tun",
         |_c, _p| Ok(()),
         |_d, _a| {},
         failclosed::lockdown_state::load_intent(dir.path()),
@@ -893,15 +913,15 @@ fn recover_adopts_but_writes_nothing_from_a_recorded_only_cover() {
 }
 
 #[skuld::test]
-fn recover_passes_its_own_route_state_tun_name_to_lockdown_recover() {
-    // The TUN-permit reclaim (#881 finding 2) needs to know which device THIS
-    // bridge's own prior run used — sourced from its own bridge-routes.json,
-    // not a global constant, so a different install's cover (no route-state
-    // file here) correctly gets `None` rather than a guessed name.
+fn recover_prefers_its_own_route_state_tun_name_over_the_fallback() {
+    // The TUN-permit reclaim (#881 finding 2) prefers THIS bridge's own prior
+    // run's device — sourced from its own bridge-routes.json — over the
+    // caller-supplied fallback, using a DIFFERENT name for each so the
+    // precedence is actually exercised, not merely consistent with either.
     let dir = tempfile::tempdir().unwrap();
     let persisted_state = RouteState {
         version: state::SCHEMA_VERSION,
-        tun_name: "hole-tun".into(),
+        tun_name: "hole-tun-from-state".into(),
         server_ip: ipv4_server(),
         interface_name: "en0".into(),
     };
@@ -911,6 +931,7 @@ fn recover_passes_its_own_route_state_tun_name_to_lockdown_recover() {
     recover_routes_with(
         dir.path(),
         None,
+        "hole-tun-fallback",
         |_c, _p| Ok(()),
         |_d, _a| {},
         Intent::On,
@@ -919,18 +940,26 @@ fn recover_passes_its_own_route_state_tun_name_to_lockdown_recover() {
     );
     assert_eq!(
         seen.into_inner(),
-        Some(Some("hole-tun".to_owned())),
-        "lockdown_recover must see this run's own persisted TUN name"
+        Some(Some("hole-tun-from-state".to_owned())),
+        "lockdown_recover must see this run's own persisted TUN name, not the fallback"
     );
 }
 
 #[skuld::test]
-fn recover_passes_no_tun_name_when_no_route_state_exists() {
+fn recover_falls_back_to_the_given_tun_name_when_no_route_state_exists() {
+    // Finding 3 (#898 rework): `bridge-routes.json`'s lifetime is
+    // anti-correlated with the condition the reclaim needs — a clean
+    // `Cutover` teardown (the canonical Adopt path, kill switch armed) drops
+    // the file via `SystemRoutes::drop` before recovery ever runs, and a
+    // crashed run's file is deleted by THIS SAME startup's recovery before
+    // reaching this call. Passing `None` here skipped the reclaim outright on
+    // both; the caller-supplied name must be used instead.
     let dir = tempfile::tempdir().unwrap();
     let seen: RefCell<Option<Option<String>>> = RefCell::new(None);
     recover_routes_with(
         dir.path(),
         None,
+        "hole-tun-fallback",
         |_c, _p| Ok(()),
         |_d, _a| {},
         Intent::On,
@@ -939,8 +968,8 @@ fn recover_passes_no_tun_name_when_no_route_state_exists() {
     );
     assert_eq!(
         seen.into_inner(),
-        Some(None),
-        "with no route-state file, lockdown_recover must see None, not a guessed name"
+        Some(Some("hole-tun-fallback".to_owned())),
+        "with no route-state file, lockdown_recover must still see the caller's own device name"
     );
 }
 
@@ -953,6 +982,7 @@ fn recover_returns_its_decision() {
         let returned = recover_routes_with(
             dir.path(),
             None,
+            "hole-tun",
             |_c, _p| Ok(()),
             |_d, _a| {},
             intent,

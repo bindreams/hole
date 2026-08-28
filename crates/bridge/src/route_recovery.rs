@@ -40,7 +40,10 @@ where
     // Taken from the manager rather than re-derived, so recovery's intent
     // repair cannot chown to a different owner than the manager's own writes.
     let owner = proxy.lock().await.state_owner();
-    let outcome = tokio::task::spawn_blocking(move || tun_engine::routing::recover_routes(&dir, owner)).await;
+    let outcome = tokio::task::spawn_blocking(move || {
+        tun_engine::routing::recover_routes(&dir, owner, crate::proxy::TUN_DEVICE_NAME)
+    })
+    .await;
     record_recovery_outcome(outcome, proxy).await;
 }
 

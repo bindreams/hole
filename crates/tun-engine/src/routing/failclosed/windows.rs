@@ -981,7 +981,11 @@ pub(crate) fn should_reclaim_tun_permit(resolved: bool) -> bool {
 /// Delete the volatile TUN-interface permit pair (`LOCKDOWN_TUN_GUID_INDICES`)
 /// when `resolver` cannot resolve `tun_name` — see
 /// [`should_reclaim_tun_permit`]. Idempotent: a delete that finds nothing is
-/// not an error.
+/// not an error, but a code that is neither success nor not-found means a
+/// filter is STILL installed — the exact staleness this reclaim exists to
+/// close — so it is folded through [`first_delete_failure`] and warned, same
+/// as `Cover::drop`'s Lockdown arm and [`delete_all`]: a DACL-denied delete
+/// must not read as a successful reclaim.
 #[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
 pub fn reclaim_stale_tun_permit(resolver: &dyn super::LuidResolver, tun_name: &str) {
     if !should_reclaim_tun_permit(resolver.resolve(tun_name).is_ok()) {
@@ -999,8 +1003,17 @@ pub fn reclaim_stale_tun_permit(resolver: &dyn super::LuidResolver, tun_name: &s
             );
             return;
         }
-        for &i in &LOCKDOWN_TUN_GUID_INDICES {
-            let _ = FwpmFilterDeleteByKey0(engine, &LOCKDOWN_FILTER_GUIDS[i]);
+        let codes: Vec<(&'static str, u32)> = LOCKDOWN_TUN_GUID_INDICES
+            .iter()
+            .map(|&i| {
+                (
+                    "TUN-LUID permit",
+                    FwpmFilterDeleteByKey0(engine, &LOCKDOWN_FILTER_GUIDS[i]),
+                )
+            })
+            .collect();
+        if let Some(e) = first_delete_failure(&codes) {
+            tracing::warn!(error = %e, "stale TUN permit reclaim left a filter installed; a later adapter reusing this LUID would inherit unconditional egress");
         }
         let _ = FwpmEngineClose0(engine);
     }

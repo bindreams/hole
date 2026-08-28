@@ -205,11 +205,18 @@ pub(crate) fn run_capturing(
 /// wiped state dir is exactly the condition that produces the `Unset` intent —
 /// so without it a user-scoped macOS bridge drops root-owned files into
 /// `~/Library/Application Support/hole`.
-pub fn recover_routes(state_dir: &Path, owner: Option<(u32, u32)>) -> Recovery {
+///
+/// `tun_name` is the caller's own configured TUN device name (the bridge's
+/// `TUN_DEVICE_NAME` constant) — the fallback the TUN-permit reclaim uses when
+/// no `bridge-routes.json` survived this startup to name one. See
+/// [`recover_routes_with`]'s doc for why the file alone cannot be the only
+/// source.
+pub fn recover_routes(state_dir: &Path, owner: Option<(u32, u32)>, tun_name: &str) -> Recovery {
     let intent = failclosed::lockdown_state::load_intent(state_dir);
     recover_routes_with(
         state_dir,
         owner,
+        tun_name,
         run_commands,
         failclosed::recover_cover,
         intent,
@@ -372,9 +379,22 @@ pub fn decide_cover_recovery(intent: failclosed::lockdown_state::Intent, presenc
 /// the classified lockdown intent, [`failclosed::lockdown_cover_presence`], and
 /// [`failclosed::recover_lockdown`]. `owner` is passed straight through to the
 /// intent repair — see [`recover_routes`].
+///
+/// `tun_name` is the fallback TUN-permit-reclaim hint: `bridge-routes.json`'s
+/// own `tun_name` wins when a route-state file was recovered THIS startup, but
+/// that file's lifetime is anti-correlated with the condition the reclaim
+/// needs — `SystemRoutes::drop` clears it on every CLEAN teardown, including
+/// the `Cutover` stop that precedes the canonical Adopt path, so the file is
+/// present exactly when the adapter probably still resolves and absent
+/// exactly when it definitely does not. Falling back to the caller's own
+/// configured name keeps the reclaim reachable on that path too; the resolve
+/// check inside `should_reclaim_tun_permit` is what makes deleting on a
+/// guessed name safe — a live `hole-tun` still blocks it.
+#[allow(clippy::too_many_arguments)] // private test seam — bundling into a struct adds more noise than the warning.
 pub(crate) fn recover_routes_with<R, S, P, L>(
     state_dir: &Path,
     owner: Option<(u32, u32)>,
+    tun_name: &str,
     runner: R,
     sweep_cover: S,
     lockdown_intent: failclosed::lockdown_state::Intent,
@@ -435,7 +455,7 @@ where
     } else {
         debug!("no route-state file found, nothing to recover");
     }
-    let tun_name_hint = route_state.map(|st| st.tun_name);
+    let tun_name_hint = route_state.map(|st| st.tun_name).unwrap_or_else(|| tun_name.to_owned());
 
     // Reconcile the standing lockdown cover FIRST. The presence is the
     // lockdown cover's OWN evidence (injected probe), NOT the route-state file,
@@ -458,12 +478,15 @@ where
         }
     }
     let adopt = matches!(decision.action, CoverRecovery::Adopt);
-    // `tun_name_hint` is THIS bridge's own last-known TUN device (from its own
-    // `bridge-routes.json`), not a global constant — a different install's
-    // cover leaves no record here, so the reclaim below simply does not run
-    // for it (see CONTRIBUTING.md's disclosed residual on cross-install
-    // identity, #878).
-    lockdown_recover(decision.action, tun_name_hint.as_deref());
+    // `tun_name_hint` prefers THIS bridge's own last-known TUN device (from its
+    // own `bridge-routes.json`) and falls back to the caller-supplied
+    // `tun_name` otherwise — see this function's doc for why the file alone
+    // is not a safe gate. `TUN_DEVICE_NAME` is a compile-time constant shared
+    // by every install, so the fallback names the same device a different
+    // install's cover would too; only the reclaim's server-IP counterpart is
+    // scoped by the per-install identity gap CONTRIBUTING.md discloses
+    // (#878), and this reclaim never touches that permit.
+    lockdown_recover(decision.action, Some(tun_name_hint.as_str()));
 
     // Sweep any transient fail-closed cover left by a crashed update cutover.
     // Runs UNCONDITIONALLY (outside the route-state guard above): a crash can

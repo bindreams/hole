@@ -899,3 +899,51 @@ fn reclaim_stale_tun_permit_resolves_the_given_name() {
         "reclaim must resolve the exact alias it was given"
     );
 }
+
+#[skuld::test]
+fn first_delete_failure_treats_access_denied_as_a_genuine_failure() {
+    // Mirrors `an_access_denied_code_is_never_absent`: the code class Finding
+    // 4 (#898 rework) is about — a DACL-denied delete must never be folded
+    // away as though the reclaim succeeded.
+    let codes = [("TUN-LUID permit", ERROR_ACCESS_DENIED_DWORD)];
+    let err = first_delete_failure(&codes).expect("an access-denied delete must be a genuine failure");
+    assert!(
+        err.to_string().contains("TUN-LUID permit"),
+        "must name what failed: {err}"
+    );
+}
+
+#[skuld::test]
+fn reclaim_stale_tun_permit_does_not_discard_delete_codes() {
+    // Structural guard, not a proof (mirrors
+    // `route_recovery::recover_routes_has_exactly_one_bridge_caller` in the
+    // bridge crate): Finding 4 (#898 rework) was
+    // `let _ = FwpmFilterDeleteByKey0(...)`, silently discarding the exact
+    // return code that means a filter is STILL blocking egress. Assert the
+    // source routes the TUN-permit deletes through the same
+    // `first_delete_failure` fold `Cover::drop`'s Lockdown arm and
+    // `delete_all` use, rather than re-running the real FWPM call under an
+    // access-denied DACL to observe it (this file has no such fixture).
+    let src = include_str!("windows.rs");
+    let start = src
+        .find("pub fn reclaim_stale_tun_permit(")
+        .expect("reclaim_stale_tun_permit must exist in windows.rs");
+    let after = &src[start..];
+    let next_pub_fn = after[1..].find("\npub fn ").map(|i| i + 1);
+    let next_pub_crate_fn = after[1..].find("\npub(crate) fn ").map(|i| i + 1);
+    let end = [next_pub_fn, next_pub_crate_fn]
+        .into_iter()
+        .flatten()
+        .min()
+        .unwrap_or(after.len());
+    let body = &after[..end];
+
+    assert!(
+        !body.contains("let _ = FwpmFilterDeleteByKey0"),
+        "reclaim_stale_tun_permit must not discard a TUN-permit delete's return code:\n{body}"
+    );
+    assert!(
+        body.contains("first_delete_failure"),
+        "reclaim_stale_tun_permit must fold its delete codes through first_delete_failure:\n{body}"
+    );
+}

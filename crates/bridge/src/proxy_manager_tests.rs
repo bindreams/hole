@@ -5055,3 +5055,70 @@ fn turning_lockdown_off_mid_session_clears_a_stale_adopted_claim() {
         pm.stop().await.unwrap();
     });
 }
+
+#[skuld::test]
+fn lockdown_reads_honor_an_out_of_process_off_over_a_stale_claim() {
+    // `hole bridge unlock` (cutover::unlock_with) writes `enabled: false`
+    // straight into the running bridge's bridge-lockdown.json — it never goes
+    // through `turn_lockdown_off`, so `adopted_standing_cover` stays set.
+    // Simulated here the same way: writing the state file directly, not via
+    // any ProxyManager setter.
+    let dir = tempfile::tempdir().unwrap();
+    let routing = MockRouting::new(dir.path().to_path_buf());
+    let mut pm = ProxyManager::new(MockProxy::new(), routing).with_state_dir(dir.path().to_path_buf());
+    pm.set_standing_cover_adopted(true);
+
+    lockdown_state::set_enabled(dir.path(), false, None).unwrap();
+
+    assert!(
+        !pm.lockdown_enabled(),
+        "an explicitly recorded off must win over a stale adopted claim"
+    );
+    assert!(
+        !pm.standing_cover_expected(),
+        "and the next start must not re-engage the standing cover"
+    );
+}
+
+#[skuld::test]
+fn an_out_of_process_unlock_prevents_the_next_start_from_re_engaging_the_cover() {
+    // Reintroduction proof: with the pre-fix `adopted_standing_cover ||
+    // intent.reads_armed()` fold, this start re-installs the cover the user
+    // just escaped via `hole bridge unlock`.
+    rt().block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        let routing = MockRouting::new(dir.path().to_path_buf());
+        let st = routing.state();
+        let mut pm = ProxyManager::new(MockProxy::new(), routing).with_state_dir(dir.path().to_path_buf());
+        pm.set_standing_cover_adopted(true);
+
+        lockdown_state::set_enabled(dir.path(), false, None).unwrap();
+
+        pm.start(&test_config()).await.unwrap();
+        assert_eq!(
+            st.lockdown_engage_calls.load(Ordering::SeqCst),
+            0,
+            "a fixed re-read must not re-arm the cover the user just escaped"
+        );
+        pm.stop().await.unwrap();
+    });
+}
+
+#[skuld::test]
+fn promote_adopted_claim_does_not_clobber_a_recorded_off() {
+    // Simulates the out-of-process race window between start_inner's
+    // `standing_cover_expected()` snapshot and this call: `hole bridge
+    // unlock` records Off directly in bridge-lockdown.json, the same
+    // `lockdown_state::set_enabled` call `cutover::unlock_with` makes on the
+    // running bridge's state_dir, bypassing every in-process setter.
+    let dir = tempfile::tempdir().unwrap();
+    lockdown_state::set_enabled(dir.path(), false, None).unwrap();
+
+    promote_adopted_claim(Some(dir.path()), None);
+
+    assert_eq!(
+        lockdown_state::load_intent(dir.path()),
+        lockdown_state::Intent::Off,
+        "a cover this start just installed must not overwrite an explicitly recorded off"
+    );
+}

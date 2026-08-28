@@ -637,13 +637,18 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
     /// The `|| adopted` disjunct is what keeps the Unblock item on the menu
     /// when the intent file is gone and the repair write itself failed — the
     /// escape must not depend on the file this change made stickier.
+    ///
+    /// An explicit recorded `Off` wins over the claim outright: the claim is
+    /// only ever cleared by in-process paths, so an out-of-process writer
+    /// (`hole bridge unlock`, on the bridge's own state_dir) can record `Off`
+    /// while the claim from a still-running bridge's earlier recovery stays
+    /// set. Without this, that unlock is invisible to the tray and the next
+    /// connect re-engages the cover it just escaped.
     pub fn lockdown_enabled(&self) -> bool {
-        self.adopted_standing_cover
-            || self
-                .state_dir
-                .as_deref()
-                .map(|d| lockdown_state::load_intent(d).reads_armed())
-                .unwrap_or(false)
+        let Some(intent) = self.state_dir.as_deref().map(lockdown_state::load_intent) else {
+            return self.adopted_standing_cover;
+        };
+        !matches!(intent, lockdown_state::Intent::Off) && (self.adopted_standing_cover || intent.reads_armed())
     }
 
     /// **Connect path + update-consent gate.** Whether a standing cover holds,
@@ -661,13 +666,17 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
     /// adopted cover is inert, so it still names the PREVIOUS run's TUN and
     /// server IP. A connect that did not re-engage would bring up a new TUN the
     /// live cover blocks — connected, with no traffic.
+    ///
+    /// An explicit recorded `Off` wins over the claim outright — see
+    /// [`Self::lockdown_enabled`]'s doc for why: without it, the next connect
+    /// after an out-of-process `hole bridge unlock` re-installs the cover the
+    /// user just escaped.
     pub fn standing_cover_expected(&self) -> bool {
-        self.adopted_standing_cover
-            || self
-                .state_dir
-                .as_deref()
-                .map(|d| lockdown_state::load_intent(d).installs_standing_cover())
-                .unwrap_or(false)
+        let Some(intent) = self.state_dir.as_deref().map(lockdown_state::load_intent) else {
+            return self.adopted_standing_cover;
+        };
+        !matches!(intent, lockdown_state::Intent::Off)
+            && (self.adopted_standing_cover || intent.installs_standing_cover())
     }
 
     /// Last-writer-wins absolute set of the lockdown intent. Persists to
@@ -1801,11 +1810,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
                         // the live-cover half of the claim only on a CONFIRMED
                         // open host: a false clear here is Rule #0 territory,
                         // the Unblock item disappearing exactly when it is
-                        // still needed. The armed half is in
-                        // `bridge-lockdown.json` (`promote_adopted_claim` wrote
-                        // it at engage) and only `turn_lockdown_off` clears
-                        // that, so this stop cannot disarm the switch either
-                        // way.
+                        // still needed.
                         match self.routing.release_all_covers() {
                             Ok(()) => self.set_standing_cover_adopted(false),
                             Err(e) => tracing::warn!(
@@ -1968,19 +1973,15 @@ fn tunnel_mode_label(mode: &TunnelMode) -> &'static str {
 }
 
 /// Write the armed state to `bridge-lockdown.json` the moment an adopted claim
-/// is first honoured by a real `install_lockdown`.
+/// is first honoured by a real `install_lockdown`. A cover this bridge just
+/// installed is first-hand evidence, stronger than the startup measurement
+/// `decide_cover_recovery` grounds its own repair write in.
 ///
-/// Called only from the `standing_cover_expected` branch, so an intent that is
-/// not already `On` there means the branch was taken on the adopted claim
-/// alone: this writes exactly the promotion, never a switch nobody asked for.
-/// A cover this bridge just installed is first-hand evidence, stronger than the
-/// startup measurement `decide_cover_recovery` grounds its own repair write in.
-///
-/// Without it, `ProxyManager::adopted_standing_cover` is the only record of the
-/// armed switch in the `Adopt` cells that record no intent, and the `UserStop`
-/// teardown destroys that record along with the cover — so the next start (a
-/// `reload`'s slow path is `stop` then `start`) re-derives "off" and a config
-/// edit disarms the kill switch.
+/// Promotes only over `Unset`/`Unreadable` — an intent already `On` needs no
+/// write, and an explicit recorded `Off` must never be clobbered: it can race
+/// this same start (an out-of-process `hole bridge unlock` writing `Off`
+/// between `standing_cover_expected`'s snapshot and this call), and a claim is
+/// never proof the intent is still unset.
 ///
 /// Best-effort: the write only makes the preference durable, and failing the
 /// connect over a bookkeeping error would be the worse trade.
@@ -1989,7 +1990,10 @@ fn promote_adopted_claim(state_dir: Option<&std::path::Path>, owner: Option<(u32
         warn!("lockdown: standing cover installed with no state_dir; the kill switch cannot be persisted");
         return;
     };
-    if lockdown_state::load_intent(dir).installs_standing_cover() {
+    if matches!(
+        lockdown_state::load_intent(dir),
+        lockdown_state::Intent::On | lockdown_state::Intent::Off
+    ) {
         return;
     }
     if let Err(e) = lockdown_state::set_enabled(dir, true, owner) {

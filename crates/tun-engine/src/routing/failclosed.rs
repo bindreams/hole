@@ -183,11 +183,12 @@ pub(crate) fn recovery_dispatch(decision: crate::routing::CoverRecovery) -> Reco
 /// cannot disengage is logged, not propagated — startup recovery has no caller
 /// to act on it.
 ///
-/// `tun_name` is THIS bridge's own last-known TUN device, from its own
-/// `bridge-routes.json` (`None` when that file had nothing to recover — see
-/// `routing::recover_routes_with`). On `Adopt` it gates a narrow reclaim (see
-/// [`reclaim_stale_tun_permit`]); the rest of the decision's OS behaviour is
-/// unaffected by it.
+/// `tun_name` is THIS bridge's own TUN device: its own last-known name from
+/// `bridge-routes.json` when that file had something to recover, else the
+/// caller's own configured device name (see `routing::recover_routes_with`'s
+/// doc — the file's absence is not evidence the reclaim is unneeded). On
+/// `Adopt` it gates a narrow reclaim (see [`reclaim_stale_tun_permit`]); the
+/// rest of the decision's OS behaviour is unaffected by it.
 pub fn recover_lockdown(decision: crate::routing::CoverRecovery, state_dir: &Path, tun_name: Option<&str>) {
     match recovery_dispatch(decision) {
         RecoveryDispatch::Inert => {
