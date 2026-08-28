@@ -151,6 +151,35 @@ fn truncated_ipv6_tcp_header_is_rejected() {
 }
 
 #[skuld::test]
+fn ipv4_non_first_fragment_is_rejected() {
+    // Reproduces the field bug: a non-first fragment (MF=0, frag offset raw
+    // 185) whose data happens to look like a UDP header at offset 0. Without
+    // a fragment guard, this parses as a bogus flow to port 22136 built out
+    // of user data, and `parse_ip_dst` leaks the same bogus port.
+    let mut body = vec![0u8; 40];
+    body[0..6].copy_from_slice(&[0x12, 0x34, 0x56, 0x78, 0x00, 0x28]);
+    let mut packet = ipv4_header(17, IPV4_MIN_HEADER, IPV4_MIN_HEADER + body.len());
+    packet[6..8].copy_from_slice(&185u16.to_be_bytes());
+    packet.extend_from_slice(&body);
+
+    assert!(parse_ip_packet_full(&packet).is_none());
+    assert!(parse_ip_dst(&packet).is_none());
+}
+
+#[skuld::test]
+fn ipv4_first_fragment_is_rejected() {
+    // MF=1, frag offset 0: a first fragment carrying a real TCP header. The
+    // header alone parses fine, so this is NOT already caught by a length
+    // mismatch the way a UDP first fragment is — the fragment guard is what
+    // must reject it.
+    let mut packet = ipv4_tcp(20);
+    packet[6..8].copy_from_slice(&0x2000u16.to_be_bytes());
+
+    assert!(parse_ip_packet_full(&packet).is_none());
+    assert!(parse_ip_dst(&packet).is_none());
+}
+
+#[skuld::test]
 fn ipv4_header_length_below_the_minimum_is_rejected() {
     // Version/IHL byte 0x40 claims a zero-length IPv4 header, which would put
     // the L4 header on top of the IP header's own version and TOS bytes.
@@ -162,17 +191,17 @@ fn ipv4_header_length_below_the_minimum_is_rejected() {
 
 #[skuld::test]
 fn a_partial_tcp_header_is_rejected() {
-    // Reaching the data-offset byte takes 13 bytes of TCP header; the parser
-    // requires the full 20, so every partial header is rejected outright.
-    let v4 = ipv4_tcp(20);
+    // The IP header's own declared length matches the truncated L4 bytes
+    // exactly, so the IP layer accepts the packet and it is `TcpPacket`'s
+    // 20-byte minimum that must reject it.
     for l4_bytes in 0..TCP_MIN_HEADER {
-        let len = IPV4_MIN_HEADER + l4_bytes;
-        assert!(parse_ip_packet_full(&v4[..len]).is_none(), "ipv4 length {len}");
-    }
-    let v6 = ipv6_tcp();
-    for l4_bytes in 0..TCP_MIN_HEADER {
-        let len = IPV6_HEADER + l4_bytes;
-        assert!(parse_ip_packet_full(&v6[..len]).is_none(), "ipv6 length {len}");
+        let mut v4 = ipv4_header(6, IPV4_MIN_HEADER, IPV4_MIN_HEADER + l4_bytes);
+        v4.extend_from_slice(&vec![0u8; l4_bytes]);
+        assert!(parse_ip_packet_full(&v4).is_none(), "ipv4 l4_bytes {l4_bytes}");
+
+        let mut v6 = ipv6_header(6, l4_bytes);
+        v6.extend_from_slice(&vec![0u8; l4_bytes]);
+        assert!(parse_ip_packet_full(&v6).is_none(), "ipv6 l4_bytes {l4_bytes}");
     }
 }
 
@@ -220,6 +249,37 @@ fn total_len_smaller_than_the_l4_header_is_rejected() {
     let mut v4 = ipv4_tcp(20);
     v4[2..4].copy_from_slice(&30u16.to_be_bytes());
     assert!(parse_ip_packet_full(&v4).is_none());
+}
+
+#[skuld::test]
+fn unknown_l4_protocol_is_rejected() {
+    const ICMP: u8 = 1;
+    // A body shaped like a valid 20-byte TCP header, so a mutant that
+    // mistakes the unknown protocol for TCP would otherwise parse cleanly.
+    let body = tcp_header(TCP_MIN_HEADER);
+
+    let mut v4 = ipv4_header(ICMP, IPV4_MIN_HEADER, IPV4_MIN_HEADER + body.len());
+    v4.extend_from_slice(&body);
+    assert!(parse_ip_packet_full(&v4).is_none());
+    assert!(parse_ip_dst(&v4).is_none());
+
+    let mut v6 = ipv6_header(ICMP, body.len());
+    v6.extend_from_slice(&body);
+    assert!(parse_ip_packet_full(&v6).is_none());
+    assert!(parse_ip_dst(&v6).is_none());
+}
+
+#[skuld::test]
+fn non_4_6_ip_version_is_rejected() {
+    let mut v4 = ipv4_tcp(20);
+    v4[0] &= 0x0f; // version 0, IHL unchanged
+    assert!(parse_ip_packet_full(&v4).is_none());
+    assert!(parse_ip_dst(&v4).is_none());
+
+    let mut v6 = ipv6_tcp();
+    v6[0] = 0x50; // version 5
+    assert!(parse_ip_packet_full(&v6).is_none());
+    assert!(parse_ip_dst(&v6).is_none());
 }
 
 // Field fidelity ======================================================================================================

@@ -1,4 +1,4 @@
-//! Packet parsing — flow keys and payload extents from a raw IP packet.
+//! Packet parsing — flow keys and payload from a raw IP packet.
 //!
 //! Every packet the TUN delivers passes through here before the driver
 //! loop does anything else with it, so these functions are hostile-input
@@ -44,6 +44,12 @@ fn parse_ipv4_dst(packet: &[u8]) -> Option<(u16, IpProto)> {
     if ihl < IPV4_MIN_HEADER {
         return None;
     }
+    let flags_frag_offset = u16::from_be_bytes([packet[6], packet[7]]);
+    let more_frags = flags_frag_offset & 0x2000 != 0;
+    let frag_offset = flags_frag_offset & 0x1fff;
+    if more_frags || frag_offset != 0 {
+        return None;
+    }
     let protocol = packet[9];
     if packet.len() < ihl + 4 {
         return None;
@@ -70,10 +76,6 @@ fn parse_ipv6_dst(packet: &[u8]) -> Option<(u16, IpProto)> {
 }
 
 /// A parsed packet's flow key and L4 payload.
-///
-/// `payload` is sliced from the buffer given to `parse_ip_packet_full` by
-/// smoltcp's checked wire types, so `payload.len() + payload's start offset`
-/// is always within that buffer — callers need no clamp of their own.
 pub(crate) struct ParsedPacket<'a> {
     pub(crate) src: SocketAddr,
     pub(crate) dst: SocketAddr,
@@ -95,6 +97,14 @@ pub(crate) fn parse_ip_packet_full(packet: &[u8]) -> Option<ParsedPacket<'_>> {
 
 fn parse_ipv4_full(packet: &[u8]) -> Option<ParsedPacket<'_>> {
     let ip = Ipv4Packet::new_checked(packet).ok()?;
+    // `new_checked` bounds-checks lengths but does not inspect fragmentation;
+    // an L4 header is only present in the first fragment, and this driver
+    // does not reassemble, so any fragment must be rejected rather than
+    // parsed as if its bytes were an L4 header (or L4 payload mistaken for
+    // one). See issue #951 for reassembly.
+    if ip.more_frags() || ip.frag_offset() != 0 {
+        return None;
+    }
     let src_ip = IpAddr::V4(ip.src_addr());
     let dst_ip = IpAddr::V4(ip.dst_addr());
     let proto = ip.next_header();
