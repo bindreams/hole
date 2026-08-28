@@ -32,6 +32,7 @@ use tracing::warn;
 
 pub(crate) use super::admission::Handshake;
 use super::config::EngineConfig;
+use super::emit::smoltcp_to_std_ip;
 use super::virtual_device::VirtualTunDevice;
 use crate::device::DeviceConfig;
 
@@ -369,13 +370,6 @@ pub(crate) fn decide_disposal(state: tcp::State) -> Option<Disposal> {
         tcp::State::Closed | tcp::State::Listen => Some(Disposal::Retire),
         tcp::State::TimeWait => Some(Disposal::Remove),
         _ => None,
-    }
-}
-
-fn smoltcp_to_std_ip(addr: IpAddress) -> IpAddr {
-    match addr {
-        IpAddress::Ipv4(v4) => IpAddr::V4(v4),
-        IpAddress::Ipv6(v6) => IpAddr::V6(v6),
     }
 }
 

@@ -15,6 +15,7 @@
 #![allow(clippy::disallowed_methods)]
 
 use std::io;
+use std::net::SocketAddr;
 
 use smoltcp::socket::tcp;
 use smoltcp::wire::TcpControl;

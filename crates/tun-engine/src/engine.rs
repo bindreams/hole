@@ -22,6 +22,8 @@ mod admission;
 mod config;
 mod dns;
 mod driver;
+mod emit;
+mod parse;
 mod router;
 mod socket_stack;
 mod tcp_flow;
