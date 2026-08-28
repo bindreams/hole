@@ -204,8 +204,10 @@ pub(super) struct MockRoutingState {
     /// VPN already holds that prefix), analogous to `fail_cover_for_resolvers`.
     fail_routes_for: std::sync::Mutex<std::collections::HashSet<RouteId>>,
     /// The `installed` set `MockRoutes::drop` saw — the routes a test's mock
-    /// teardown "tore down" — so a test can assert teardown covers only the
-    /// narrowed subset `install` actually produced.
+    /// teardown "tore down". Under the fail-closed contract, a successful
+    /// install's `installed` is always the full planned set, so this is
+    /// currently only exercised to prove no teardown ran at all (`is_none()`
+    /// in `partial_route_failure_fails_closed_and_clears_state`).
     pub(super) last_teardown_installed: std::sync::Mutex<Option<Vec<RouteId>>>,
 }
 
@@ -339,7 +341,11 @@ impl Routing for MockRouting {
             // Mirror `SystemRouting::install`'s fail-closed contract: a
             // narrowed `installed` is never returned as `Ok` — a degraded
             // tunnel is worse than no tunnel (Rule #0). Roll back (clear the
-            // file we just wrote) and fail closed instead.
+            // file we just wrote) and fail closed instead. Unlike
+            // `rollback_and_record`, this unconditionally clears rather than
+            // consulting `persisted.stale` — stale-group interaction with
+            // fail-closed rollback is untested at this layer and is covered
+            // only by the tun-engine unit tests in routing_tests.rs.
             let _ = route_state::clear(&self.state_dir);
             return Err(RoutingError::RouteSetup(format!(
                 "route install incomplete: {}/{} routes confirmed",

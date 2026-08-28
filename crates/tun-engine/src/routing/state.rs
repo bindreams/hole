@@ -139,6 +139,59 @@ fn state_file(state_dir: &Path) -> PathBuf {
     state_dir.join(STATE_FILE_NAME)
 }
 
+// Canonical form ======================================================================================================
+
+/// Reduce a list of route-provenance groups to canonical form: groups
+/// sharing an identity — `tun_name`, `server_ip`, `interface_name`,
+/// `original_gateway`, the tuple that determines the teardown argv a group
+/// emits — merge into one whose `installed` is the union, each surviving
+/// group's `installed` is sanitized against `planned_routes(server_ip)` (an
+/// id with no possible teardown command can never drain, so it would pin the
+/// group non-empty forever), and a group left with an empty `installed` is
+/// dropped. Two groups with the same identity would otherwise emit
+/// byte-identical teardown commands: the second is either never confirmed
+/// (permanently stuck bookkeeping) or, on macOS's unscoped split-route
+/// deletes, removes whatever a third party claimed after the first delete
+/// freed the prefix. The sole shared entry point for every path that folds a
+/// group into a persisted `stale`/`installed` set — sweep and crash
+/// recovery alike — so they cannot drift apart on this discipline.
+pub fn coalesce(groups: Vec<StaleRecord>) -> Vec<StaleRecord> {
+    let mut merged: Vec<StaleRecord> = Vec::new();
+    for g in groups {
+        match merged.iter_mut().find(|m| {
+            m.tun_name == g.tun_name
+                && m.server_ip == g.server_ip
+                && m.interface_name == g.interface_name
+                && m.original_gateway == g.original_gateway
+        }) {
+            Some(existing) => {
+                for id in g.installed {
+                    if !existing.installed.contains(&id) {
+                        existing.installed.push(id);
+                    }
+                }
+            }
+            None => merged.push(g),
+        }
+    }
+
+    for g in &mut merged {
+        let plannable = planned_routes(g.server_ip);
+        let before = g.installed.len();
+        g.installed.retain(|id| plannable.contains(id));
+        if g.installed.len() != before {
+            tracing::warn!(
+                tun = %g.tun_name,
+                server_ip = %g.server_ip,
+                "route-provenance group names a route with no possible teardown command — dropping it"
+            );
+        }
+    }
+
+    merged.retain(|g| !g.installed.is_empty());
+    merged
+}
+
 // I/O =================================================================================================================
 
 /// Write `state` to `<state_dir>/bridge-routes.json` atomically via a

@@ -1213,8 +1213,8 @@ fn recover_keeps_the_file_when_only_the_stale_group_fails_to_confirm_gone() {
 // list, teardown deletes only what it names. These validate the PRODUCER
 // half — the code that builds that list one command at a time — by driving
 // `setup_routes`/`run_teardown_commands` directly with a scripted runner
-// (never the real `netsh`/`route`, matching the #165 test-isolation
-// contract every other test in this file already relies on).
+// (never the real `netsh`/`route`, matching the test-isolation contract
+// every other test in this file already relies on).
 
 #[skuld::test]
 fn setup_routes_pops_a_route_the_runner_reports_not_installed() {
@@ -1680,7 +1680,15 @@ fn install_rollback_clears_the_file_when_a_checkpoint_write_failure_leaves_nothi
         "an id whose checkpoint write never durably landed must not be classified uncertain: {uncertain:?}"
     );
 
-    routing.rollback_and_record("utun7", ipv4_server(), "en0", &confirmed, persisted, uncertain);
+    routing.rollback_and_record(
+        "utun7",
+        ipv4_server(),
+        "en0",
+        &confirmed,
+        persisted,
+        uncertain,
+        run_one_teardown,
+    );
 
     assert!(
         state::load(tmp.path()).is_none(),
@@ -1910,4 +1918,342 @@ fn install_sweep_also_retries_debt_carried_by_an_earlier_sweep() {
     );
     assert!(server_ips.contains(&"9.9.9.9".parse().unwrap()));
     assert!(server_ips.contains(&"5.5.5.5".parse().unwrap()));
+}
+
+// Canonical-form discipline (troyka round 4) ==========================================================================
+//
+// `sweep_leftover_before_install` and `recover_routes_with` must route every
+// group they fold into a persisted set through `state::coalesce` — never
+// construct or append a group without it.
+
+/// The everyday case: a prior run's leftover primary record and an
+/// already-carried-forward stale group share IDENTITY (same `tun_name` —
+/// fixed in production — plus the same `server_ip`/`interface_name`/
+/// `original_gateway`, i.e. a reconnect to the same server). Without
+/// coalescing, the sweep issues the identical delete command once per group.
+#[skuld::test]
+fn install_sweep_coalesces_a_stale_group_identical_to_the_leftover_primary() {
+    let tmp = tempfile::tempdir().unwrap();
+    state::save(
+        tmp.path(),
+        &RouteState {
+            version: state::SCHEMA_VERSION,
+            tun_name: "hole-tun".into(),
+            server_ip: "9.9.9.9".parse().unwrap(),
+            interface_name: "en0".into(),
+            original_gateway: Some(ipv4_gateway()),
+            installed: vec![RouteId::SplitV4Low],
+            stale: vec![state::StaleRecord {
+                tun_name: "hole-tun".into(),
+                server_ip: "9.9.9.9".parse().unwrap(),
+                interface_name: "en0".into(),
+                original_gateway: Some(ipv4_gateway()),
+                installed: vec![RouteId::SplitV4Low],
+            }],
+        },
+        None,
+    )
+    .unwrap();
+
+    let mut persisted = RouteState {
+        version: state::SCHEMA_VERSION,
+        tun_name: "hole-tun".into(),
+        server_ip: "1.1.1.1".parse().unwrap(),
+        interface_name: "en0".into(),
+        original_gateway: Some(ipv4_gateway()),
+        installed: Vec::new(),
+        stale: Vec::new(),
+    };
+
+    let log: RefCell<Captured> = RefCell::new(Vec::new());
+    sweep_leftover_before_install(tmp.path(), None, &mut persisted, capturing_runner(&log));
+
+    let log = log.into_inner();
+    let split_v4_low_deletes: Vec<_> = log
+        .iter()
+        .filter(|(_, cmd)| cmd.iter().any(|a| a == "0.0.0.0/1"))
+        .collect();
+    assert_eq!(
+        split_v4_low_deletes.len(),
+        1,
+        "identical-identity groups must coalesce into one delete command, got {log:?}"
+    );
+}
+
+/// N consecutive failed install attempts to the same server each leave their
+/// own unconfirmed leftover. Without merge-on-append, sweep #2 folds the
+/// immediately-prior attempt's leftover in as a brand-new `StaleRecord`
+/// alongside the one sweep #1 already carried forward, so `stale` grows by
+/// one entry per failed attempt instead of staying at one retried entry.
+#[skuld::test]
+fn install_sweep_merges_a_new_leftover_into_an_existing_stale_group_of_the_same_identity() {
+    let tmp = tempfile::tempdir().unwrap();
+    // The file on disk right before sweep #2 runs: sweep #1's carried-forward
+    // debt in `stale`, plus THIS install attempt's own leftover primary
+    // record for the same server.
+    state::save(
+        tmp.path(),
+        &RouteState {
+            version: state::SCHEMA_VERSION,
+            tun_name: "hole-tun".into(),
+            server_ip: "9.9.9.9".parse().unwrap(),
+            interface_name: "en0".into(),
+            original_gateway: Some(ipv4_gateway()),
+            installed: vec![RouteId::ServerBypass],
+            stale: vec![state::StaleRecord {
+                tun_name: "hole-tun".into(),
+                server_ip: "9.9.9.9".parse().unwrap(),
+                interface_name: "en0".into(),
+                original_gateway: Some(ipv4_gateway()),
+                installed: vec![RouteId::ServerBypass],
+            }],
+        },
+        None,
+    )
+    .unwrap();
+
+    let mut persisted = RouteState {
+        version: state::SCHEMA_VERSION,
+        tun_name: "hole-tun".into(),
+        server_ip: "1.1.1.1".parse().unwrap(),
+        interface_name: "en0".into(),
+        original_gateway: Some(ipv4_gateway()),
+        installed: Vec::new(),
+        stale: Vec::new(),
+    };
+
+    // Never confirms gone — both records must fold into ONE retried entry.
+    sweep_leftover_before_install(tmp.path(), None, &mut persisted, |_argv, _phase| Ok(false));
+
+    assert_eq!(
+        persisted.stale.len(),
+        1,
+        "a new leftover sharing identity with an existing stale group must merge into it, not \
+         grow the list: {:?}",
+        persisted.stale
+    );
+
+    let on_disk = state::load(tmp.path()).unwrap();
+    assert_eq!(
+        on_disk.stale.len(),
+        1,
+        "the merge must land on disk, not just in memory: {:?}",
+        on_disk.stale
+    );
+}
+
+/// A `stale` group naming only an id with no possible teardown command for
+/// its own `server_ip` (a `ServerBypass` against a loopback address) must
+/// never survive the sweep — it can never drain, so it would pin
+/// `persisted.stale` non-empty forever.
+#[skuld::test]
+fn install_sweep_drops_an_unplannable_stale_group() {
+    let tmp = tempfile::tempdir().unwrap();
+    let loopback: IpAddr = "127.0.0.1".parse().unwrap();
+    state::save(
+        tmp.path(),
+        &RouteState {
+            version: state::SCHEMA_VERSION,
+            tun_name: "hole-tun".into(),
+            server_ip: "1.1.1.1".parse().unwrap(),
+            interface_name: "en0".into(),
+            original_gateway: Some(ipv4_gateway()),
+            installed: Vec::new(),
+            stale: vec![state::StaleRecord {
+                tun_name: "hole-tun".into(),
+                server_ip: loopback,
+                interface_name: "en0".into(),
+                original_gateway: Some(ipv4_gateway()),
+                installed: vec![RouteId::ServerBypass],
+            }],
+        },
+        None,
+    )
+    .unwrap();
+
+    let mut persisted = RouteState {
+        version: state::SCHEMA_VERSION,
+        tun_name: "hole-tun".into(),
+        server_ip: "2.2.2.2".parse().unwrap(),
+        interface_name: "en0".into(),
+        original_gateway: Some(ipv4_gateway()),
+        installed: Vec::new(),
+        stale: Vec::new(),
+    };
+
+    let log: RefCell<Captured> = RefCell::new(Vec::new());
+    sweep_leftover_before_install(tmp.path(), None, &mut persisted, capturing_runner(&log));
+
+    assert!(
+        persisted.stale.is_empty(),
+        "an unplannable-only stale group must not pin the sweep's carried-forward list open: {:?}",
+        persisted.stale
+    );
+    assert!(
+        log.into_inner().is_empty(),
+        "an id with no possible teardown command must never reach the runner"
+    );
+}
+
+/// Two groups sharing `tun_name` (fixed in production) but a DIFFERENT
+/// `server_ip` are not coalesced by identity — yet a split-route delete
+/// command depends only on `tun_name`, so both groups would otherwise
+/// re-issue the identical delete. The second occurrence would remove
+/// whatever claimed the freed prefix in between (see CONTRIBUTING's Route
+/// ownership section).
+#[skuld::test]
+fn recovery_never_issues_the_same_split_delete_twice_across_groups() {
+    let tmp = tempfile::tempdir().unwrap();
+    state::save(
+        tmp.path(),
+        &RouteState {
+            version: state::SCHEMA_VERSION,
+            tun_name: "hole-tun".into(),
+            server_ip: ipv4_server(),
+            interface_name: "en0".into(),
+            original_gateway: Some(ipv4_gateway()),
+            installed: vec![RouteId::SplitV4Low],
+            stale: vec![state::StaleRecord {
+                tun_name: "hole-tun".into(),
+                server_ip: "9.9.9.9".parse().unwrap(),
+                interface_name: "en1".into(),
+                original_gateway: Some("9.9.9.1".parse().unwrap()),
+                installed: vec![RouteId::SplitV4Low],
+            }],
+        },
+        None,
+    )
+    .unwrap();
+
+    let log: RefCell<Captured> = RefCell::new(Vec::new());
+    recover_routes_with(
+        tmp.path(),
+        None,
+        capturing_runner(&log),
+        |_, _| {},
+        false,
+        || false,
+        |_| {},
+    );
+
+    let log = log.into_inner();
+    let split_v4_low_deletes: Vec<_> = commands_in_phase(&log, PHASE_RECOVER_SPLIT)
+        .into_iter()
+        .filter(|cmd| cmd.iter().any(|a| a == "0.0.0.0/1"))
+        .collect();
+    assert_eq!(
+        split_v4_low_deletes.len(),
+        1,
+        "the same tun-scoped split delete must run once across the whole recovery, not once per \
+         group: {log:?}"
+    );
+}
+
+/// macOS's split-route delete argv ignores `tun_name` entirely (see
+/// `platform_split_teardown_commands`), so two groups with DIFFERENT
+/// `tun_name` — which Windows would treat as genuinely distinct routes on
+/// different adapters — still target the identical kernel route on macOS.
+/// The second delete must not run. Not executable on this box: gated to the
+/// platform whose command-building this depends on.
+#[cfg(target_os = "macos")]
+#[skuld::test]
+fn recovery_never_issues_the_same_macos_split_delete_twice_across_different_tun_names() {
+    let tmp = tempfile::tempdir().unwrap();
+    state::save(
+        tmp.path(),
+        &RouteState {
+            version: state::SCHEMA_VERSION,
+            tun_name: "utun7".into(),
+            server_ip: ipv4_server(),
+            interface_name: "en0".into(),
+            original_gateway: Some(ipv4_gateway()),
+            installed: vec![RouteId::SplitV4Low],
+            stale: vec![state::StaleRecord {
+                tun_name: "utun9".into(),
+                server_ip: "9.9.9.9".parse().unwrap(),
+                interface_name: "en1".into(),
+                original_gateway: Some("9.9.9.1".parse().unwrap()),
+                installed: vec![RouteId::SplitV4Low],
+            }],
+        },
+        None,
+    )
+    .unwrap();
+
+    let log: RefCell<Captured> = RefCell::new(Vec::new());
+    recover_routes_with(
+        tmp.path(),
+        None,
+        capturing_runner(&log),
+        |_, _| {},
+        false,
+        || false,
+        |_| {},
+    );
+
+    let log = log.into_inner();
+    let split_v4_low_deletes: Vec<_> = commands_in_phase(&log, PHASE_RECOVER_SPLIT)
+        .into_iter()
+        .filter(|cmd| cmd.iter().any(|a| a == "0.0.0.0/1"))
+        .collect();
+    assert_eq!(
+        split_v4_low_deletes.len(),
+        1,
+        "macOS ignores tun_name in the delete argv, so two differently-named groups must still \
+         dedupe to one command: {log:?}"
+    );
+}
+
+/// `extra_unconfirmed` — ids whose install outcome is genuinely unknown —
+/// must never be absent from the on-disk record at any point during
+/// rollback, not just at the end. Uses two `confirmed` ids so there is a
+/// real mid-loop instant to observe.
+#[skuld::test]
+fn rollback_never_erases_extra_unconfirmed_mid_loop() {
+    let tmp = tempfile::tempdir().unwrap();
+    let routing = SystemRouting::new(tmp.path().to_path_buf(), None);
+
+    let persisted = RouteState {
+        version: state::SCHEMA_VERSION,
+        tun_name: "utun7".into(),
+        server_ip: ipv4_server(),
+        interface_name: "en0".into(),
+        original_gateway: Some(ipv4_gateway()),
+        installed: vec![RouteId::SplitV4Low, RouteId::SplitV4High, RouteId::ServerBypass],
+        stale: Vec::new(),
+    };
+
+    let confirmed = [RouteId::SplitV4Low, RouteId::SplitV4High];
+    let extra_unconfirmed = vec![RouteId::ServerBypass];
+
+    // Model the file `setup_routes`'s own last checkpoint would have left on
+    // disk before this rollback runs.
+    state::save(tmp.path(), &persisted, None).unwrap();
+
+    let checked_mid_loop = std::cell::Cell::new(false);
+    let runner = |_argv: &[String], _phase: &str| -> std::io::Result<bool> {
+        let on_disk = state::load(tmp.path()).expect("record must exist mid-rollback");
+        assert!(
+            on_disk.installed.contains(&RouteId::ServerBypass),
+            "extra_unconfirmed must never be absent from the on-disk record mid-rollback: {:?}",
+            on_disk.installed
+        );
+        checked_mid_loop.set(true);
+        Ok(true)
+    };
+
+    routing.rollback_and_record(
+        "utun7",
+        ipv4_server(),
+        "en0",
+        &confirmed,
+        persisted,
+        extra_unconfirmed,
+        runner,
+    );
+
+    assert!(
+        checked_mid_loop.get(),
+        "the runner must have actually run to exercise the mid-loop check"
+    );
 }

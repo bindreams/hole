@@ -441,6 +441,26 @@ so a leak from an earlier session survives being overwritten by a later one;
 `recover_routes` attempts every `stale` group in addition to the primary
 record, and the state file is cleared only once both are empty.
 
+**Groups are reduced to canonical form before anything runs.**
+`routing::state::coalesce` is the one place that folds a group into `stale`:
+groups sharing an identity (`tun_name`, `server_ip`, `interface_name`,
+`original_gateway` — the tuple that determines the argv a group's commands
+emit) merge into one whose `installed` is the union, each survivor is
+sanitized against `planned_routes(server_ip)` (an id with no possible
+teardown command — e.g. a `ServerBypass` against a loopback `server_ip` —
+can never drain, so it would pin `stale` non-empty forever), and an empty
+survivor is dropped. Without this, a reconnect to the same server — which
+shares `tun_name` (a fixed constant) and often `server_ip` with an
+already-carried-forward group — would re-emit a byte-identical delete: on
+Windows the second occurrence is never confirmed, permanently stranding the
+group; on macOS the split-route deletes are fully unscoped, so the second
+occurrence removes whatever a third party claimed after the first freed the
+prefix — the exact harm this section exists to prevent. `recover_groups`
+additionally runs every group's split deletes before any group's bypass
+delete, deduping by argv across groups (not just within one): a split
+delete's argv depends on `tun_name` alone, so two groups with different
+`server_ip` but the same `tun_name` would otherwise still collide.
+
 **Residual (macOS only):** a VPN that takes the prefix over *mid-session* —
 necessarily by deleting Hole's entry first — is still torn down by Hole's
 Stop. macOS exposes no compare-and-delete, so closing that needs a different

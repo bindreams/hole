@@ -244,6 +244,107 @@ fn load_v1_with_unknown_field_returns_none() {
     assert!(load(dir.path()).is_none());
 }
 
+// Canonical form ======================================================================================================
+//
+// `coalesce` is the shared primitive every group-consuming path (sweep,
+// crash recovery) must route through: groups sharing an identity — the
+// tuple that determines the teardown argv they'd each emit — merge into one,
+// each survivor is sanitized against `planned_routes(server_ip)`, and an
+// empty survivor is dropped. See CONTRIBUTING's Route ownership section.
+
+fn group(server_ip: IpAddr, installed: Vec<RouteId>) -> StaleRecord {
+    StaleRecord {
+        tun_name: "hole-tun".into(),
+        server_ip,
+        interface_name: "en0".into(),
+        original_gateway: Some(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1))),
+        installed,
+    }
+}
+
+#[skuld::test]
+fn coalesce_merges_two_groups_with_identical_identity() {
+    let server_ip = IpAddr::V4(Ipv4Addr::new(9, 9, 9, 9));
+    let a = group(server_ip, vec![RouteId::SplitV4Low]);
+    let b = group(server_ip, vec![RouteId::SplitV4High]);
+
+    let merged = coalesce(vec![a, b]);
+
+    assert_eq!(merged.len(), 1, "identical-identity groups must become one: {merged:?}");
+    assert_eq!(merged[0].installed, vec![RouteId::SplitV4Low, RouteId::SplitV4High]);
+}
+
+#[skuld::test]
+fn coalesce_merges_more_than_two_duplicate_entries() {
+    // Simulates N consecutive failed install attempts to the same server,
+    // each leaving its own unconfirmed leftover — they must fold into one
+    // retried entry, not accumulate one per attempt.
+    let server_ip = IpAddr::V4(Ipv4Addr::new(9, 9, 9, 9));
+    let groups = vec![
+        group(server_ip, vec![RouteId::ServerBypass]),
+        group(server_ip, vec![RouteId::ServerBypass]),
+        group(server_ip, vec![RouteId::ServerBypass]),
+    ];
+
+    let merged = coalesce(groups);
+
+    assert_eq!(
+        merged.len(),
+        1,
+        "repeated failed attempts must not each grow the stale list: {merged:?}"
+    );
+    assert_eq!(merged[0].installed, vec![RouteId::ServerBypass]);
+}
+
+#[skuld::test]
+fn coalesce_keeps_distinct_identities_separate() {
+    let a = group(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)), vec![RouteId::SplitV4Low]);
+    let b = group(IpAddr::V4(Ipv4Addr::new(2, 2, 2, 2)), vec![RouteId::SplitV4Low]);
+
+    let merged = coalesce(vec![a.clone(), b.clone()]);
+
+    assert_eq!(
+        merged.len(),
+        2,
+        "different server_ip means different identity: {merged:?}"
+    );
+    assert!(merged.contains(&a));
+    assert!(merged.contains(&b));
+}
+
+#[skuld::test]
+fn coalesce_drops_an_id_with_no_possible_teardown_command() {
+    let loopback = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+    // ServerBypass against a loopback server_ip can never produce a
+    // teardown command (see `platform_bypass_teardown_command`), so it can
+    // never drain from `still_installed` — must be sanitized away here,
+    // the same defense `recover_routes_with` already applies to its own
+    // two record kinds.
+    let unplannable = group(loopback, vec![RouteId::ServerBypass]);
+
+    let merged = coalesce(vec![unplannable]);
+
+    assert!(
+        merged.is_empty(),
+        "an unplannable-only group must be dropped, not pin stale open forever: {merged:?}"
+    );
+}
+
+#[skuld::test]
+fn coalesce_sanitizes_a_plannable_id_alongside_an_unplannable_one() {
+    let loopback = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+    let mixed = group(loopback, vec![RouteId::SplitV4Low, RouteId::ServerBypass]);
+
+    let merged = coalesce(vec![mixed]);
+
+    assert_eq!(merged.len(), 1);
+    assert_eq!(
+        merged[0].installed,
+        vec![RouteId::SplitV4Low],
+        "the plannable id must survive even though its sibling was dropped"
+    );
+}
+
 /// Pin `installed`'s wire names: they are the persisted schema-2 format a
 /// newer binary must read back from an older run's crash-leftover file, so
 /// renaming a `RouteId` variant is a schema break needing a `SCHEMA_VERSION`

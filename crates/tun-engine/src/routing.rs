@@ -55,6 +55,20 @@ pub const SPLIT_ROUTES: [RouteId; 4] = [
     RouteId::SplitV6High,
 ];
 
+/// `a` with every id from `b` not already present appended, preserving `a`'s
+/// order. Used to keep a persisted `installed` set naming the union of "safe
+/// to attempt deleting" and "fate unknown, must stay recorded" ids at every
+/// checkpoint — see `rollback_and_record`.
+fn union_ids(a: &[RouteId], b: &[RouteId]) -> Vec<RouteId> {
+    let mut v = a.to_vec();
+    for id in b {
+        if !v.contains(id) {
+            v.push(*id);
+        }
+    }
+    v
+}
+
 /// The routes an install for `server_ip` attempts, in command order. The
 /// server bypass is omitted for a loopback server — see
 /// [`build_setup_commands`].
@@ -348,9 +362,10 @@ fn run_one_teardown(cmd: &[String], phase: &str) -> std::io::Result<bool> {
 
 /// Execute route setup commands one at a time via `runner` (production:
 /// [`run_one`]; tests inject a scripted closure so they can simulate a
-/// specific command failing without touching the host — see #165 in
-/// [`Routing`]'s doc). `installed` accumulates the [`RouteId`]s confirmed in
-/// the table; `checkpoint` is called with it before AND after every command.
+/// specific command failing without touching the host, matching
+/// [`Routing`]'s test-isolation contract). `installed` accumulates the
+/// [`RouteId`]s confirmed in the table; `checkpoint` is called with it
+/// before AND after every command.
 ///
 /// A pre-command checkpoint failure aborts immediately (mirrors the
 /// write-before-mutate ordering contract: this codebase must not run a
@@ -404,17 +419,45 @@ where
     Ok(())
 }
 
+/// Run one teardown/recovery command via `runner` and report whether the
+/// route is now confirmed gone, logging the outcome either way. Shared by
+/// [`run_teardown_commands`] (single-group narrowing) and [`recover_groups`]
+/// (multi-group narrowing, which needs to apply one command's outcome to
+/// more than one group at once and so cannot use `run_teardown_commands`'s
+/// own single-`Vec` narrowing).
+fn run_teardown_command<R>(cmd: &RouteCommand, phase: &str, runner: &R) -> bool
+where
+    R: Fn(&[String], &str) -> std::io::Result<bool>,
+{
+    match runner(&cmd.argv, phase) {
+        Ok(true) => true,
+        Ok(false) => {
+            warn!(
+                phase,
+                id = ?cmd.id,
+                "route-teardown command did not confirm the route is gone — keeping it recorded"
+            );
+            false
+        }
+        Err(e) => {
+            warn!(phase, id = ?cmd.id, error = %e, "route-teardown command failed to spawn — route may still be installed");
+            false
+        }
+    }
+}
+
 /// Execute route teardown/recovery commands one at a time via `runner`
-/// (production: [`run_one_teardown`]; tests inject a scripted closure — same
-/// #165 rationale as [`setup_routes`]). `still_installed` starts as the ids
-/// believed installed and is narrowed as each command confirms its route
-/// gone; `checkpoint` is called with the narrowed value after every command.
-/// Best-effort per #907: every command in `cmds` is attempted regardless of
-/// an earlier one's outcome — there is no error channel to abort through. An
-/// empty `cmds` is a plain no-op — `runner` (the real subprocess spawner in
-/// production) is never called with a synthetic empty argv to signal that;
-/// doing so previously panicked on the unconditional `Command::new(&cmd[0])`
-/// index, reachable from crash recovery on every loopback-server deployment.
+/// (production: [`run_one_teardown`]; tests inject a scripted closure —
+/// same test-isolation rationale as [`setup_routes`]). `still_installed`
+/// starts as the ids believed installed and is narrowed as each command
+/// confirms its route gone; `checkpoint` is called with the narrowed value
+/// after every command. Best-effort: every command in `cmds` is attempted
+/// regardless of an earlier one's outcome — there is no error channel to
+/// abort through. An empty `cmds` is a plain no-op — `runner` (the real
+/// subprocess spawner in production) is never called with a synthetic empty
+/// argv to signal that; doing so previously panicked on the unconditional
+/// `Command::new(&cmd[0])` index, reachable from crash recovery on every
+/// loopback-server deployment.
 fn run_teardown_commands<R>(
     cmds: &[RouteCommand],
     phase: &str,
@@ -425,18 +468,8 @@ fn run_teardown_commands<R>(
     R: Fn(&[String], &str) -> std::io::Result<bool>,
 {
     for cmd in cmds {
-        match runner(&cmd.argv, phase) {
-            Ok(true) => still_installed.retain(|id| *id != cmd.id),
-            Ok(false) => {
-                warn!(
-                    phase,
-                    id = ?cmd.id,
-                    "route-teardown command did not confirm the route is gone — keeping it recorded"
-                );
-            }
-            Err(e) => {
-                warn!(phase, id = ?cmd.id, error = %e, "route-teardown command failed to spawn — route may still be installed");
-            }
+        if run_teardown_command(cmd, phase, &runner) {
+            still_installed.retain(|id| *id != cmd.id);
         }
         checkpoint(still_installed);
     }
@@ -444,9 +477,10 @@ fn run_teardown_commands<R>(
 
 /// Execute route teardown commands for the routes `installed` records via
 /// `runner` (production: [`run_one_teardown`]; tests inject a scripted
-/// closure — same #165 rationale as [`setup_routes`]), checkpointing the
-/// persisted record after every command through `checkpoint`. Idempotent —
-/// safe to call even if those routes are already gone. `original_gateway`
+/// closure — same test-isolation rationale as [`setup_routes`]),
+/// checkpointing the persisted record after every command through
+/// `checkpoint`. Idempotent — safe to call even if those routes are already
+/// gone. `original_gateway`
 /// scopes the Windows IPv4 bypass delete to the gateway it was installed
 /// under (`None` for a record migrated from schema 1/2, which never
 /// persisted it — falls back to the old unscoped delete). Returns the ids
@@ -476,50 +510,73 @@ where
     still_installed
 }
 
-/// Tear down one route-provenance group's split + bypass routes,
-/// checkpointing the narrowed remainder after every command. Shared by
-/// [`recover_routes_with`]'s primary record and its `stale` list, and by
-/// [`SystemRouting::install`]'s pre-install sweep — all three are the same
-/// `{tun_name, server_ip, interface_name, original_gateway, installed}`
-/// shape, just persisted at a different slot in the state file.
-fn recover_group<R>(
-    tun_name: &str,
-    server_ip: IpAddr,
-    interface_name: &str,
-    original_gateway: Option<IpAddr>,
-    installed: Vec<RouteId>,
+/// Tear down every route-provenance group in `groups` — already reduced to
+/// canonical form by [`state::coalesce`] — running every group's split
+/// deletes before any group's bypass delete. A split-route delete command's
+/// argv is a function of `tun_name` alone, not a group's full identity, so
+/// two distinct groups (e.g. carrying different `server_ip`s from different
+/// sessions) can legitimately name the identical command; issuing it twice
+/// would re-delete whatever claimed the freed prefix in the interim (see
+/// CONTRIBUTING's Route ownership section), so each distinct split argv runs
+/// at most once here and its confirmation narrows every group that named it.
+/// Bypass commands embed `server_ip`, so no analogous collision is possible
+/// there. `checkpoint` receives the full narrowed group list after every
+/// command. Shared by [`recover_routes_with`] (primary record + `stale`) and
+/// [`sweep_leftover_before_install`] (`stale` alone) — the sole place either
+/// path actually spawns/scripts a teardown command.
+fn recover_groups<R>(
+    mut groups: Vec<state::StaleRecord>,
     runner: &R,
-    mut checkpoint: impl FnMut(&[RouteId]),
-) -> Vec<RouteId>
+    mut checkpoint: impl FnMut(&[state::StaleRecord]),
+) -> Vec<state::StaleRecord>
 where
     R: Fn(&[String], &str) -> std::io::Result<bool>,
 {
-    let mut still_installed = installed;
-    let split_cmds: Vec<RouteCommand> = platform_split_teardown_commands(tun_name)
-        .into_iter()
-        .filter(|c| still_installed.contains(&c.id))
-        .collect();
-    run_teardown_commands(
-        &split_cmds,
-        PHASE_RECOVER_SPLIT,
-        &mut still_installed,
-        runner,
-        &mut checkpoint,
-    );
+    let mut issued_split_argv: Vec<Vec<String>> = Vec::new();
+    for i in 0..groups.len() {
+        let cmds: Vec<RouteCommand> = platform_split_teardown_commands(&groups[i].tun_name)
+            .into_iter()
+            .filter(|c| groups[i].installed.contains(&c.id) && !issued_split_argv.contains(&c.argv))
+            .collect();
+        for cmd in cmds {
+            issued_split_argv.push(cmd.argv.clone());
+            if run_teardown_command(&cmd, PHASE_RECOVER_SPLIT, runner) {
+                // The command's argv is keyed on tun_name alone, so narrow
+                // every group whose own split command for this id would be
+                // the identical argv — not just group `i`.
+                for g in &mut groups {
+                    if g.installed.contains(&cmd.id) {
+                        let same_route = platform_split_teardown_commands(&g.tun_name)
+                            .into_iter()
+                            .any(|c| c.id == cmd.id && c.argv == cmd.argv);
+                        if same_route {
+                            g.installed.retain(|id| *id != cmd.id);
+                        }
+                    }
+                }
+            }
+            checkpoint(&groups);
+        }
+    }
 
-    let bypass_cmds: Vec<RouteCommand> = platform_bypass_teardown_command(server_ip, interface_name, original_gateway)
+    for i in 0..groups.len() {
+        let cmds: Vec<RouteCommand> = platform_bypass_teardown_command(
+            groups[i].server_ip,
+            &groups[i].interface_name,
+            groups[i].original_gateway,
+        )
         .into_iter()
-        .filter(|c| still_installed.contains(&c.id))
+        .filter(|c| groups[i].installed.contains(&c.id))
         .collect();
-    run_teardown_commands(
-        &bypass_cmds,
-        PHASE_RECOVER_BYPASS,
-        &mut still_installed,
-        runner,
-        &mut checkpoint,
-    );
+        for cmd in cmds {
+            if run_teardown_command(&cmd, PHASE_RECOVER_BYPASS, runner) {
+                groups[i].installed.retain(|id| *id != cmd.id);
+            }
+            checkpoint(&groups);
+        }
+    }
 
-    still_installed
+    groups
 }
 
 /// Sweep every not-yet-confirmed-gone route left by a prior `install` in
@@ -529,7 +586,11 @@ where
 /// fresh record `install` is about to write. `persisted` must already be
 /// the new session's own template (`installed: Vec::new()`, `stale:
 /// Vec::new()`) — this function only ever appends to/narrows `.stale`,
-/// never touches `.installed`. See CONTRIBUTING's Route ownership section.
+/// never touches `.installed`. Every group is routed through
+/// [`state::coalesce`] before anything is swept, so a leftover sharing
+/// identity with an already-carried-forward group merges into it instead of
+/// growing the list, and an unplannable-only group never reaches the runner.
+/// See CONTRIBUTING's Route ownership section.
 fn sweep_leftover_before_install<R>(
     state_dir: &Path,
     owner: Option<(u32, u32)>,
@@ -551,6 +612,7 @@ fn sweep_leftover_before_install<R>(
             installed: leftover.installed,
         });
     }
+    let groups = state::coalesce(groups);
     if groups.is_empty() {
         return;
     }
@@ -562,30 +624,14 @@ fn sweep_leftover_before_install<R>(
     if let Err(e) = state::save(state_dir, persisted, owner) {
         warn!(error = %e, "failed to checkpoint carried-forward stale route state before install");
     }
+    warn!(groups = ?persisted.stale, "sweeping route records retained from a prior run before this install");
 
-    for i in 0..persisted.stale.len() {
-        let group = persisted.stale[i].clone();
-        warn!(
-            installed = ?group.installed,
-            tun = %group.tun_name,
-            "sweeping a route record retained from a prior run before this install"
-        );
-        let remaining = recover_group(
-            &group.tun_name,
-            group.server_ip,
-            &group.interface_name,
-            group.original_gateway,
-            group.installed,
-            &runner,
-            |ids| {
-                persisted.stale[i].installed = ids.to_vec();
-                if let Err(e) = state::save(state_dir, persisted, owner) {
-                    warn!(error = %e, "failed to checkpoint stale-route sweep");
-                }
-            },
-        );
-        persisted.stale[i].installed = remaining;
-    }
+    persisted.stale = recover_groups(std::mem::take(&mut persisted.stale), &runner, |updated| {
+        persisted.stale = updated.to_vec();
+        if let Err(e) = state::save(state_dir, persisted, owner) {
+            warn!(error = %e, "failed to checkpoint stale-route sweep");
+        }
+    });
     persisted.stale.retain(|g| !g.installed.is_empty());
     if let Err(e) = state::save(state_dir, persisted, owner) {
         warn!(error = %e, "failed to checkpoint stale-route sweep result");
@@ -736,121 +782,78 @@ pub(crate) fn recover_routes_with<R, S, P, L>(
         let interface_name = loaded.interface_name;
         let original_gateway = loaded.original_gateway;
 
-        // Defensive: an id with no possible teardown command (e.g. a
-        // `ServerBypass` recorded against a now-loopback `server_ip` — only
-        // reachable via a hand-edited or foreign-schema file, since every
-        // production writer keeps `installed` a subset of
-        // `planned_routes(server_ip)`) can never be attempted, so it can
-        // never drain from `still_installed` below. Drop it up front instead
-        // of leaving the state file stuck non-empty forever. The same defense
-        // applies per `stale` group below — each carries its own `server_ip`.
-        let plannable = planned_routes(server_ip);
-        let sanitized: Vec<RouteId> = loaded
-            .installed
-            .iter()
-            .copied()
-            .filter(|id| plannable.contains(id))
-            .collect();
-        if sanitized.len() != loaded.installed.len() {
-            warn!(
-                recorded = ?loaded.installed,
-                plannable = ?plannable,
-                "route-state names a route with no possible teardown command for this server_ip — dropping it"
-            );
-        }
-        let mut stale = loaded.stale;
-        for group in &mut stale {
-            let plannable = planned_routes(group.server_ip);
-            let before = group.installed.len();
-            group.installed.retain(|id| plannable.contains(id));
-            if group.installed.len() != before {
-                warn!(
-                    tun = %group.tun_name,
-                    server_ip = %group.server_ip,
-                    "stale route-state names a route with no possible teardown command — dropping it"
-                );
-            }
-        }
+        // Merge the primary record and every carried-forward `stale` group
+        // into one canonical set before anything runs. `state::coalesce`
+        // merges groups sharing an identity (so a stale group matching the
+        // primary's own emits no duplicate command), sanitizes each against
+        // `planned_routes(server_ip)` (an id with no possible teardown
+        // command can never drain, so it would pin the state file open
+        // forever), and drops an empty survivor.
+        let primary_group = state::StaleRecord {
+            tun_name: tun_name.clone(),
+            server_ip,
+            interface_name: interface_name.clone(),
+            original_gateway,
+            installed: loaded.installed,
+        };
+        let mut all_groups = loaded.stale;
+        all_groups.push(primary_group);
+        let canonical = state::coalesce(all_groups);
 
         info!(
             tun = %tun_name,
             %server_ip,
             iface = %interface_name,
-            installed = ?sanitized,
-            stale = ?stale,
+            groups = ?canonical,
             "recovering routes from crashed run"
         );
 
-        // `persisted` is a fresh checkpoint template, independent of
-        // `tun_name`/`server_ip`/`interface_name` above (which stay free for
-        // building the command lists below) — only `checkpoint`'s own copy
-        // of those fields is mutated.
+        // A canonical group's `installed` is written back to
+        // `persisted.installed` (the schema's fixed primary slot) if its
+        // identity matches the record's own top-level fields, else to
+        // `persisted.stale` — merging can only ever produce one canonical
+        // group per identity, so at most one group ever matches.
+        let is_primary = |g: &state::StaleRecord| {
+            g.tun_name == tun_name
+                && g.server_ip == server_ip
+                && g.interface_name == interface_name
+                && g.original_gateway == original_gateway
+        };
+
         let mut persisted = state::RouteState {
             version: state::SCHEMA_VERSION,
             tun_name: tun_name.clone(),
             server_ip,
             interface_name: interface_name.clone(),
             original_gateway,
-            installed: sanitized.clone(),
-            stale,
-        };
-        // 1+2. Split routes (IPv4 + IPv6 halves, idempotent — harmless if
-        //    absent) then the per-server bypass, for the primary record.
-        //    Runs under state-file guard so this only fires when we have
-        //    positive evidence of a prior route install. Uses the TUN name
-        //    persisted in the state file (the caller controls this —
-        //    tun-engine has no opinion on naming). Splits run before bypass
-        //    so a second delete of a now-free split prefix can never take
-        //    out whatever claimed it in the interim. Scoped to a block so
-        //    the checkpoint closure's mutable borrow of `persisted` ends
-        //    before the `stale`-group loop below needs its own.
-        let still_installed = {
-            let mut checkpoint = |ids: &[RouteId]| {
-                persisted.installed = ids.to_vec();
-                if let Err(e) = state::save(state_dir, &persisted, owner) {
-                    warn!(error = %e, "failed to checkpoint route-state during recovery — recorded routes may be stale if this process now crashes");
-                }
-            };
-            recover_group(
-                &tun_name,
-                server_ip,
-                &interface_name,
-                original_gateway,
-                sanitized,
-                &runner,
-                &mut checkpoint,
-            )
+            installed: Vec::new(),
+            stale: Vec::new(),
         };
 
-        // 3. Every group carried forward in `stale` — leftovers an earlier
-        //    `install`'s own sweep (see `sweep_leftover_before_install`)
-        //    could not confirm gone, possibly under a different
-        //    `tun_name`/`server_ip`/gateway than the primary record above.
-        for i in 0..persisted.stale.len() {
-            let group = persisted.stale[i].clone();
-            let remaining = recover_group(
-                &group.tun_name,
-                group.server_ip,
-                &group.interface_name,
-                group.original_gateway,
-                group.installed,
-                &runner,
-                |ids| {
-                    persisted.stale[i].installed = ids.to_vec();
-                    if let Err(e) = state::save(state_dir, &persisted, owner) {
-                        warn!(error = %e, "failed to checkpoint stale route-state during recovery");
-                    }
-                },
-            );
-            persisted.stale[i].installed = remaining;
-        }
-        persisted.stale.retain(|g| !g.installed.is_empty());
+        // `recover_groups` runs every group's split deletes before any
+        // group's bypass delete, deduping a split command that two distinct
+        // groups would otherwise both emit (splits are keyed on `tun_name`
+        // alone) — see `recover_groups`'s own doc.
+        let final_groups = recover_groups(canonical, &runner, |groups| {
+            let (primary, stale): (Vec<_>, Vec<_>) = groups.iter().cloned().partition(is_primary);
+            persisted.installed = primary.into_iter().next().map(|g| g.installed).unwrap_or_default();
+            persisted.stale = stale;
+            if let Err(e) = state::save(state_dir, &persisted, owner) {
+                warn!(error = %e, "failed to checkpoint route-state during recovery — recorded routes may be stale if this process now crashes");
+            }
+        });
 
-        // 4. Clear the state file once nothing remains unaccounted for,
-        //    primary record and every stale group alike. The checkpoints
-        //    above already persisted the narrowed values after every
-        //    command, so a non-empty remainder is already recorded — the
-        //    next startup's recovery will retry exactly those ids.
+        let (primary, mut stale): (Vec<_>, Vec<_>) = final_groups.into_iter().partition(is_primary);
+        let still_installed = primary.into_iter().next().map(|g| g.installed).unwrap_or_default();
+        stale.retain(|g| !g.installed.is_empty());
+        persisted.installed = still_installed.clone();
+        persisted.stale = stale;
+
+        // Clear the state file once nothing remains unaccounted for,
+        // primary record and every stale group alike. The checkpoints
+        // above already persisted the narrowed values after every
+        // command, so a non-empty remainder is already recorded — the
+        // next startup's recovery will retry exactly those ids.
         if still_installed.is_empty() && persisted.stale.is_empty() {
             if let Err(e) = state::clear(state_dir) {
                 warn!(error = %e, "failed to clear route-state file during recovery");
@@ -1048,11 +1051,17 @@ impl SystemRouting {
     /// teardown could not confirm gone, unioned with `extra_unconfirmed` (ids
     /// whose install outcome is simply unknown — e.g. a spawn failure
     /// mid-command — which must stay recorded even though deleting them is
-    /// not safe). Only ever touches `persisted.installed` — `persisted.stale`
-    /// (leftovers from an earlier `install` in this process) passes through
-    /// untouched, so clearing checks both. Clears the state file only once
-    /// nothing remains either way.
-    fn rollback_and_record(
+    /// not safe). The union is seeded on disk BEFORE the first delete runs,
+    /// and every checkpoint during the loop re-applies it — `extra_unconfirmed`
+    /// must never be absent from the record at any instant (see
+    /// `teardown_routes`'s own write-ordering contract). Only ever touches
+    /// `persisted.installed` — `persisted.stale` (leftovers from an earlier
+    /// `install` in this process) passes through untouched, so clearing
+    /// checks both. Clears the state file only once nothing remains either
+    /// way. `runner` production: [`run_one_teardown`]; test-injectable so a
+    /// test can observe the on-disk record between delete commands.
+    #[allow(clippy::too_many_arguments)] // rollback is inherently multi-identity + multi-outcome; a struct would only rename these
+    fn rollback_and_record<R>(
         &self,
         tun_name: &str,
         server_ip: IpAddr,
@@ -1060,28 +1069,31 @@ impl SystemRouting {
         confirmed: &[RouteId],
         mut persisted: state::RouteState,
         extra_unconfirmed: Vec<RouteId>,
-    ) {
-        #[allow(clippy::disallowed_methods)] // defensive rollback inside install
+        runner: R,
+    ) where
+        R: Fn(&[String], &str) -> std::io::Result<bool>,
+    {
+        persisted.installed = union_ids(confirmed, &extra_unconfirmed);
+        if let Err(e) = state::save(&self.state_dir, &persisted, self.owner) {
+            warn!(error = %e, "failed to checkpoint route-state before install rollback — recorded routes may be stale if this process now crashes");
+        }
+
+        #[allow(clippy::disallowed_methods)] // defensive rollback inside install — we ARE the Routing impl
         let remaining = teardown_routes(
             tun_name,
             server_ip,
             interface_name,
             persisted.original_gateway,
             confirmed,
-            run_one_teardown,
+            runner,
             |ids| {
-                persisted.installed = ids.to_vec();
+                persisted.installed = union_ids(ids, &extra_unconfirmed);
                 if let Err(e) = state::save(&self.state_dir, &persisted, self.owner) {
                     warn!(error = %e, "failed to checkpoint route-state during install rollback — recorded routes may be stale if this process now crashes");
                 }
             },
         );
-        let mut final_remaining = remaining;
-        for id in extra_unconfirmed {
-            if !final_remaining.contains(&id) {
-                final_remaining.push(id);
-            }
-        }
+        let final_remaining = union_ids(&remaining, &extra_unconfirmed);
         // Clearing needs BOTH this attempt's own remainder AND any
         // carried-forward `stale` groups (leftovers from an earlier
         // `install` in this process, untouched by this function) drained —
@@ -1169,7 +1181,16 @@ impl Routing for SystemRouting {
             .collect();
 
         if let Err(e) = setup_result {
-            self.rollback_and_record(tun_name, server_ip, interface_name, &installed, persisted, uncertain);
+            #[allow(clippy::disallowed_methods)] // we ARE the Routing impl
+            self.rollback_and_record(
+                tun_name,
+                server_ip,
+                interface_name,
+                &installed,
+                persisted,
+                uncertain,
+                run_one_teardown,
+            );
             return Err(RoutingError::RouteSetup(e.to_string()));
         }
 
@@ -1184,7 +1205,16 @@ impl Routing for SystemRouting {
         if installed.len() != planned.len() {
             let missing: Vec<RouteId> = planned.iter().copied().filter(|id| !installed.contains(id)).collect();
             warn!(missing = ?missing, "route install incomplete — rolling back and failing closed");
-            self.rollback_and_record(tun_name, server_ip, interface_name, &installed, persisted, uncertain);
+            #[allow(clippy::disallowed_methods)] // we ARE the Routing impl
+            self.rollback_and_record(
+                tun_name,
+                server_ip,
+                interface_name,
+                &installed,
+                persisted,
+                uncertain,
+                run_one_teardown,
+            );
             return Err(RoutingError::RouteSetup(format!(
                 "route install incomplete: {}/{} routes confirmed (another process may hold a conflicting route): missing {missing:?}",
                 installed.len(),
