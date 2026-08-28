@@ -9,7 +9,7 @@ go 1.25.5
 // this directive — see .github/renovate.json. setup-go reads this unless
 // `GOTOOLCHAIN` is set to exactly `local` — presetting it to `local` in a
 // workflow would silently drop CI back to the `go` directive's version.
-toolchain go1.26.6
+toolchain go1.27.0
 
 require (
 	github.com/golang/protobuf v1.5.4
