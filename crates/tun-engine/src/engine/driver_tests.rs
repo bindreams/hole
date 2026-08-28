@@ -63,10 +63,12 @@ fn driver(max_connections: usize) -> TestDriver {
 }
 
 /// Offer one client SYN to the accept dispatch, and return the verdict's
-/// effect on the wire.
+/// effect on the wire. Checksumless, like every real inbound SYN — this suite
+/// drives `Driver::settle_packet`, the real production entry point, and
+/// [`checksumless_syn`] is the shape it actually receives.
 fn offer_syn(d: &mut TestDriver, src: SocketAddr, dst: SocketAddr, isn: u32, now: i64) -> (SocketHandle, Vec<Segment>) {
     d.stack.ensure_listener(dst.port());
-    d.stack.enqueue_rx(syn(src, dst, isn));
+    d.stack.enqueue_rx(checksumless_syn(src, dst, isn));
     d.stack.poll(t(now));
     let handle = d.stack.listener(dst.port()).expect("a listener took the SYN");
 
@@ -287,7 +289,7 @@ async fn a_reverting_rst_and_a_later_syn_never_straddle_one_settle() {
     let (handle, synack_seq) = admit_one(&mut d, client(), dest(), 1000, 0);
 
     d.settle_packet(Some(&rst(client(), dest(), 1001, synack_seq)), t(2));
-    d.settle_packet(Some(&syn(other_client(), dest(), 5000)), t(3));
+    d.settle_packet(Some(&checksumless_syn(other_client(), dest(), 5000)), t(3));
 
     assert!(!d.connections.contains_key(&handle), "the reverted connection is gone");
     assert_eq!(

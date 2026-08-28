@@ -21,12 +21,12 @@ use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 
 use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
-use smoltcp::phy::{ChecksumCapabilities, Device};
+use smoltcp::phy::ChecksumCapabilities;
 use smoltcp::socket::tcp;
 use smoltcp::time::{Duration as SmoltcpDuration, Instant as SmoltcpInstant};
 use smoltcp::wire::{
-    HardwareAddress, IpAddress, IpCidr, IpEndpoint, IpProtocol, Ipv4Packet, Ipv4Repr, Ipv6Packet, Ipv6Repr, TcpControl,
-    TcpPacket, TcpRepr,
+    HardwareAddress, IpCidr, IpEndpoint, IpProtocol, Ipv4Packet, Ipv4Repr, Ipv6ExtHeader, Ipv6ExtHeaderRepr,
+    Ipv6Packet, Ipv6Repr, TcpPacket,
 };
 use tracing::warn;
 
@@ -56,9 +56,9 @@ pub(crate) struct SocketStack {
     /// ISN against to tell a retransmit from a new connection.
     owner_isn: HashMap<SocketHandle, u32>,
     /// The 4-tuple and ISN of the SYN most recently handed to
-    /// [`enqueue_rx`](Self::enqueue_rx), if it was one. Consulted by the
-    /// `poll` that immediately follows — never stale, because a caller never
-    /// enqueues a second packet before that poll (`Driver::settle_packet`).
+    /// [`enqueue_rx`](Self::enqueue_rx), if it was one. Read and cleared by
+    /// the next [`take_handshakes`](Self::take_handshakes) call, so it can
+    /// never be read stale by the one after that.
     pending_syn: Option<(SocketAddr, SocketAddr, u32)>,
     tcp_rx_buf_size: usize,
     tcp_tx_buf_size: usize,
@@ -103,14 +103,8 @@ impl SocketStack {
     /// If the packet is a SYN, its 4-tuple and ISN are captured here — off the
     /// wire, since smoltcp exposes no ISN accessor — for the `take_handshakes`
     /// call that follows the next `poll`.
-    ///
-    /// Parsed with the device's own checksum capabilities, the same ones
-    /// `Interface::poll` uses to receive this same packet — never
-    /// `ChecksumCapabilities::default()`, which verifies a checksum a real TUN
-    /// packet does not carry (see [`VirtualTunDevice::capabilities`]) and so
-    /// would reject every genuine SYN.
     pub(crate) fn enqueue_rx(&mut self, packet: Vec<u8>) {
-        self.pending_syn = parse_syn(&packet, &self.device.capabilities().checksum);
+        self.pending_syn = parse_syn(&packet);
         self.device.enqueue_rx(packet);
     }
 
@@ -184,6 +178,10 @@ impl SocketStack {
             .map(|l| (l.handle, l.port))
             .collect();
 
+        // Taken once, up front: cleared here so it can never be read a second
+        // time by a later call, however many handshakes this one reports.
+        let pending_syn = self.pending_syn.take();
+
         let mut handshakes = Vec::with_capacity(started.len());
         for (handle, port) in started {
             self.listeners.retain(|l| l.handle != handle);
@@ -202,8 +200,7 @@ impl SocketStack {
             let dst = SocketAddr::new(smoltcp_to_std_ip(local.addr), local.port);
 
             let owner = self.tuple_owner(handle, local, remote);
-            let observed_isn = self
-                .pending_syn
+            let observed_isn = pending_syn
                 .filter(|&(s, d, _)| (s, d) == (src, dst))
                 .map(|(.., isn)| isn);
 
@@ -300,6 +297,7 @@ impl SocketStack {
     /// handle it has just taken out of the map that owned it, so the list
     /// cannot come to hold a duplicate.
     pub(crate) fn retire(&mut self, handle: SocketHandle) {
+        debug_assert!(!self.retiring.contains(&handle), "handle retired twice");
         self.retiring.push(handle);
     }
 
@@ -374,59 +372,63 @@ pub(crate) fn decide_disposal(state: tcp::State) -> Option<Disposal> {
 }
 
 /// The 4-tuple and ISN of `packet`, if it is a bare SYN (no ACK) directly over
-/// IP — i.e. `next_header`/`IpProtocol::Tcp`, never a TCP-shaped payload
-/// carried under another protocol, which smoltcp would never hand to the TCP
-/// layer.
+/// IP — i.e. `IpProtocol::Tcp` immediately, or after a single Hop-by-Hop
+/// extension header on IPv6, never a TCP-shaped payload carried under any
+/// other protocol, which smoltcp would never hand to the TCP layer.
 ///
-/// Parsed with smoltcp's own wire types and `checksums` — the same parser and
-/// capabilities `Interface::poll` uses internally — so a packet this
-/// recognizes as a SYN is exactly a packet smoltcp recognizes as one, and a
-/// checksum or structural mismatch that would make smoltcp reject the packet
-/// makes this return `None` too, rather than disagreeing with it.
-fn parse_syn(packet: &[u8], checksums: &ChecksumCapabilities) -> Option<(SocketAddr, SocketAddr, u32)> {
-    let (src_ip, dst_ip, tcp_repr) = match packet.first()? >> 4 {
+/// IPv6's Hop-by-Hop header is the one extension header smoltcp itself
+/// strips before dispatching on what follows (`Interface::poll`'s private
+/// `process_hopbyhop`); anything else between the fixed header and TCP is, on
+/// both IP versions, a protocol smoltcp would reject just as this does.
+///
+/// Reads `TcpPacket`'s raw field accessors, never `TcpRepr::parse`: that
+/// additionally verifies the checksum and walks TCP options end to end,
+/// neither of which bears on whether a segment is a bare SYN, and both of
+/// which can `Err` on an option-parsing detail unrelated to that question. A
+/// real inbound packet's checksum is never verified on receipt (see
+/// `VirtualTunDevice::capabilities`), so this asks nothing of it either.
+fn parse_syn(packet: &[u8]) -> Option<(SocketAddr, SocketAddr, u32)> {
+    let (src_ip, dst_ip, tcp_payload) = match packet.first()? >> 4 {
         4 => {
             let ip_packet = Ipv4Packet::new_checked(packet).ok()?;
-            let ip_repr = Ipv4Repr::parse(&ip_packet, checksums).ok()?;
+            let ip_repr = Ipv4Repr::parse(&ip_packet, &ChecksumCapabilities::ignored()).ok()?;
             if ip_repr.next_header != IpProtocol::Tcp {
                 return None;
             }
-            let tcp_packet = TcpPacket::new_checked(ip_packet.payload()).ok()?;
-            let tcp_repr = TcpRepr::parse(
-                &tcp_packet,
-                &IpAddress::Ipv4(ip_repr.src_addr),
-                &IpAddress::Ipv4(ip_repr.dst_addr),
-                checksums,
+            (
+                IpAddr::V4(ip_repr.src_addr),
+                IpAddr::V4(ip_repr.dst_addr),
+                ip_packet.payload(),
             )
-            .ok()?;
-            (IpAddr::V4(ip_repr.src_addr), IpAddr::V4(ip_repr.dst_addr), tcp_repr)
         }
         6 => {
             let ip_packet = Ipv6Packet::new_checked(packet).ok()?;
             let ip_repr = Ipv6Repr::parse(&ip_packet).ok()?;
-            if ip_repr.next_header != IpProtocol::Tcp {
+
+            let (next_header, tcp_payload) = if ip_repr.next_header == IpProtocol::HopByHop {
+                let ext_header = Ipv6ExtHeader::new_checked(ip_packet.payload()).ok()?;
+                let ext_repr = Ipv6ExtHeaderRepr::parse(&ext_header).ok()?;
+                let skip = ext_repr.header_len() + ext_repr.data.len();
+                (ext_repr.next_header, &ip_packet.payload()[skip..])
+            } else {
+                (ip_repr.next_header, ip_packet.payload())
+            };
+            if next_header != IpProtocol::Tcp {
                 return None;
             }
-            let tcp_packet = TcpPacket::new_checked(ip_packet.payload()).ok()?;
-            let tcp_repr = TcpRepr::parse(
-                &tcp_packet,
-                &IpAddress::Ipv6(ip_repr.src_addr),
-                &IpAddress::Ipv6(ip_repr.dst_addr),
-                checksums,
-            )
-            .ok()?;
-            (IpAddr::V6(ip_repr.src_addr), IpAddr::V6(ip_repr.dst_addr), tcp_repr)
+            (IpAddr::V6(ip_repr.src_addr), IpAddr::V6(ip_repr.dst_addr), tcp_payload)
         }
         _ => return None,
     };
 
-    if tcp_repr.control != TcpControl::Syn || tcp_repr.ack_number.is_some() {
+    let tcp_packet = TcpPacket::new_checked(tcp_payload).ok()?;
+    if !tcp_packet.syn() || tcp_packet.ack() {
         return None;
     }
     Some((
-        SocketAddr::new(src_ip, tcp_repr.src_port),
-        SocketAddr::new(dst_ip, tcp_repr.dst_port),
-        tcp_repr.seq_number.0 as u32,
+        SocketAddr::new(src_ip, tcp_packet.src_port()),
+        SocketAddr::new(dst_ip, tcp_packet.dst_port()),
+        tcp_packet.seq_number().0 as u32,
     ))
 }
 

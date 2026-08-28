@@ -5,28 +5,33 @@
 //! `socket_stack_tests.rs` and `driver_tests.rs` drive a real smoltcp
 //! `Interface` over a [`VirtualTunDevice`](super::virtual_device::VirtualTunDevice).
 //!
-//! Four properties are load-bearing:
+//! Load-bearing properties:
 //!
-//! 1. [`device_config`] supplies a real MTU. `MutDeviceConfig::default()` leaves
-//!    `mtu` at 0, and smoltcp computes `ip_mtu() - ip_header_len -
-//!    TCP_HEADER_LEN`, which underflows and panics on the first poll after any
-//!    SYN.
-//! 2. [`tcp_out`] owns its bytes. `TcpRepr` borrows its payload, so [`Segment`]
-//!    copies out every field a test asserts on, payload included.
-//! 3. [`tcp_out`] is destructive — `dequeue_tx` is the only thing that empties
-//!    the queue, so every tx assertion is relative to the last drain.
-//! 4. Sequence numbers are randomised by smoltcp. Assert relations to the
-//!    client's own ISN, never absolute values.
-//! 5. [`syn`] emits a valid checksum — a property no real inbound packet has
-//!    (see [`checksumless_syn`]). A test that only ever drives production code
-//!    with [`syn`] can pass while the code rejects every genuine SYN.
+//! - [`device_config`] supplies a real MTU. `MutDeviceConfig::default()` leaves
+//!   `mtu` at 0, and smoltcp computes `ip_mtu() - ip_header_len -
+//!   TCP_HEADER_LEN`, which underflows and panics on the first poll after any
+//!   SYN.
+//! - [`tcp_out`] owns its bytes. `TcpRepr` borrows its payload, so [`Segment`]
+//!   copies out every field a test asserts on, payload included.
+//! - [`tcp_out`] is destructive — `dequeue_tx` is the only thing that empties
+//!   the queue, so every tx assertion is relative to the last drain.
+//! - Sequence numbers are randomised by smoltcp. Assert relations to the
+//!   client's own ISN, never absolute values.
+//! - [`syn`] emits a valid checksum — a property no real inbound packet has
+//!   (see [`checksumless_syn`]). Nothing on the production path verifies a
+//!   checksum on receipt today (`VirtualTunDevice::capabilities` disables rx
+//!   verification structurally), but a test that only ever drives that path
+//!   with [`syn`] could never catch it if that ever changed; prefer
+//!   [`checksumless_syn`] wherever a test exercises production code
+//!   end to end.
 
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use smoltcp::phy::ChecksumCapabilities;
 use smoltcp::time::Instant as SmoltcpInstant;
 use smoltcp::wire::{
-    IpAddress, IpProtocol, Ipv4Cidr, Ipv4Packet, Ipv4Repr, TcpControl, TcpPacket, TcpRepr, TcpSeqNumber,
+    IpAddress, IpProtocol, Ipv4Cidr, Ipv4Packet, Ipv4Repr, Ipv6ExtHeader, Ipv6Option, Ipv6OptionRepr, Ipv6Packet,
+    Ipv6Repr, TcpControl, TcpPacket, TcpRepr, TcpSeqNumber,
 };
 
 use super::socket_stack::SocketStack;
@@ -60,6 +65,16 @@ pub(crate) fn dest() -> SocketAddr {
 /// A second destination, on another port.
 pub(crate) fn other_dest() -> SocketAddr {
     SocketAddr::new(IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)), 53)
+}
+
+/// The client dialling through an IPv6 tunnel.
+pub(crate) fn client_v6() -> SocketAddr {
+    SocketAddr::new(IpAddr::V6(Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 5)), 40000)
+}
+
+/// The address an IPv6 client dialled, outside the tunnel's own subnet.
+pub(crate) fn dest_v6() -> SocketAddr {
+    SocketAddr::new(IpAddr::V6(Ipv6Addr::new(0x2606, 0x2800, 0x0220, 0, 0, 0, 0, 0x10)), 80)
 }
 
 pub(crate) fn device_config() -> DeviceConfig {
@@ -179,6 +194,91 @@ pub(crate) fn syn_shaped_payload_under(next_header: IpProtocol, src: SocketAddr,
         next_header,
         &ChecksumCapabilities::default(),
     )
+}
+
+/// Build an IPv6 bare SYN, checksumless like every real inbound SYN (see
+/// [`checksumless_syn`]). `outer_next_header` is what the fixed IPv6 header
+/// declares; when it is [`IpProtocol::HopByHop`], an 8-byte Hop-by-Hop
+/// extension header (one `PadN(4)` option) is spliced in ahead of the TCP
+/// segment, with its own `next_header` set to `IpProtocol::Tcp` — the one
+/// extension header smoltcp's `Interface::poll` strips (`process_hopbyhop`)
+/// before dispatching on whatever follows it. Any other `outer_next_header`
+/// is carried directly, the same as [`segment_ex`] does for IPv4.
+fn segment_ex_v6(src: SocketAddr, dst: SocketAddr, seq: u32, outer_next_header: IpProtocol) -> Vec<u8> {
+    let (src_v6, dst_v6) = match (src.ip(), dst.ip()) {
+        (IpAddr::V6(s), IpAddr::V6(d)) => (s, d),
+        _ => panic!("these helpers build IPv6 segments only"),
+    };
+    let checksums = ChecksumCapabilities::ignored();
+
+    let tcp_repr = TcpRepr {
+        src_port: src.port(),
+        dst_port: dst.port(),
+        control: TcpControl::Syn,
+        seq_number: TcpSeqNumber(seq as i32),
+        ack_number: None,
+        window_len: 65535,
+        window_scale: None,
+        max_seg_size: None,
+        sack_permitted: false,
+        sack_ranges: [None, None, None],
+        timestamp: None,
+        payload: &[],
+    };
+    let tcp_len = tcp_repr.buffer_len();
+
+    let ext_len = if outer_next_header == IpProtocol::HopByHop {
+        8
+    } else {
+        0
+    };
+    let ip_repr = Ipv6Repr {
+        src_addr: src_v6,
+        dst_addr: dst_v6,
+        next_header: outer_next_header,
+        payload_len: ext_len + tcp_len,
+        hop_limit: 64,
+    };
+
+    let ip_hdr_len = ip_repr.buffer_len();
+    let tcp_offset = ip_hdr_len + ext_len;
+    let mut buf = vec![0u8; tcp_offset + tcp_len];
+    ip_repr.emit(&mut Ipv6Packet::new_unchecked(&mut buf));
+
+    if ext_len > 0 {
+        let mut ext_header = Ipv6ExtHeader::new_unchecked(&mut buf[ip_hdr_len..tcp_offset]);
+        ext_header.set_next_header(IpProtocol::Tcp);
+        ext_header.set_header_len(0); // (8 total bytes - 8) / 8 = zero extra 8-octet units
+        Ipv6OptionRepr::PadN(4).emit(&mut Ipv6Option::new_unchecked(&mut buf[ip_hdr_len + 2..tcp_offset]));
+    }
+
+    tcp_repr.emit(
+        &mut TcpPacket::new_unchecked(&mut buf[tcp_offset..]),
+        &IpAddress::Ipv6(src_v6),
+        &IpAddress::Ipv6(dst_v6),
+        &checksums,
+    );
+    buf
+}
+
+pub(crate) fn syn_v6(src: SocketAddr, dst: SocketAddr, seq: u32) -> Vec<u8> {
+    segment_ex_v6(src, dst, seq, IpProtocol::Tcp)
+}
+
+/// [`syn_shaped_payload_under`]'s IPv6 counterpart.
+pub(crate) fn syn_shaped_payload_under_v6(
+    next_header: IpProtocol,
+    src: SocketAddr,
+    dst: SocketAddr,
+    seq: u32,
+) -> Vec<u8> {
+    segment_ex_v6(src, dst, seq, next_header)
+}
+
+/// [`syn_v6`], preceded by a Hop-by-Hop extension header — see
+/// [`segment_ex_v6`] for the shape and why it matters.
+pub(crate) fn syn_under_hop_by_hop_v6(src: SocketAddr, dst: SocketAddr, seq: u32) -> Vec<u8> {
+    segment_ex_v6(src, dst, seq, IpProtocol::HopByHop)
 }
 
 pub(crate) fn ack(src: SocketAddr, dst: SocketAddr, seq: u32, ack: u32) -> Vec<u8> {

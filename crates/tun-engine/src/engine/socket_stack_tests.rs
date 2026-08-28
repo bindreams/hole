@@ -174,13 +174,6 @@ fn time_wait(stack: &mut SocketStack) -> SocketHandle {
     handle
 }
 
-/// Reproduce the slot-ordering steal, then feed a second SYN — with ISN
-/// `second_isn` — onto the same tuple. `SocketSet::add` fills the lowest free
-/// slot, so the listener `admit` re-arms the port with can land *below* its own
-/// connection; smoltcp hands a packet to the first socket that `accepts()` it,
-/// and a `Listen` socket accepts a bare SYN on port alone. The second SYN
-/// therefore lands on the replacement listener instead of on the connection it
-/// would otherwise belong to. Returns the connection's handle.
 /// Occupy the lowest socket slot with a connection on another port, then free
 /// it: the listener `admit` re-arms `dest()` with lands *below* whatever
 /// connection a test builds next on that port.
@@ -296,6 +289,25 @@ fn take_handshakes_is_empty_without_a_syn() {
     assert!(stack.take_handshakes().is_empty());
 }
 
+/// The doc's claim that `pending_syn` "can never be read stale": checked
+/// directly on the field, not inferred from a handshake's ISN, so a
+/// regression that stops clearing it fails here even when no later handshake
+/// happens to reuse the tuple.
+#[skuld::test]
+fn take_handshakes_clears_pending_syn() {
+    let mut stack = stack();
+    stack.ensure_listener(80);
+    stack.enqueue_rx(syn(client(), dest(), 1000));
+    stack.poll(t(0));
+
+    let _ = stack.take_handshakes();
+
+    assert!(
+        stack.pending_syn.is_none(),
+        "a read pending_syn must not survive to the next call"
+    );
+}
+
 #[skuld::test]
 fn refuse_emits_an_rst() {
     let mut stack = stack();
@@ -351,6 +363,22 @@ fn a_refused_socket_is_reaped_only_after_its_rst_is_sent() {
     stack.poll(t(1));
     assert_eq!(stack.sockets.iter().count(), 1);
     assert!(stack.retiring.is_empty());
+}
+
+/// The documented contract: retiring a handle twice would make the next
+/// `poll`'s reap loop call `SocketSet::remove` on an already-empty slot and
+/// panic. The `debug_assert!` in `retire` catches the violation one step
+/// earlier, in debug builds — release builds have no such guard and still hit
+/// that panic on the next `poll`.
+#[skuld::test]
+#[cfg(debug_assertions)]
+#[should_panic(expected = "handle retired twice")]
+fn retiring_a_handle_twice_panics_in_debug() {
+    let mut stack = stack();
+    let handle = half_open(&mut stack, 1000);
+
+    stack.retire(handle);
+    stack.retire(handle);
 }
 
 /// Distinguishes reaping on smoltcp's completion signal from an unconditional
@@ -631,8 +659,9 @@ fn an_unreadable_isn_falls_back_to_duplicate_rather_than_superseding() {
 
 /// The headline defect: `parse_syn` used to verify a checksum no real inbound
 /// SYN carries (#903), so `pending_syn` was always `None` on the production
-/// path and `owner_isn` was never populated at all. Threading the device's own
-/// (rx-unverified) checksum capabilities into `parse_syn` fixes it.
+/// path and `owner_isn` was never populated at all. `parse_syn` reads
+/// `TcpPacket`'s raw fields directly and verifies no checksum at all, so this
+/// holds regardless of what the SYN's checksum claims.
 #[skuld::test]
 fn a_checksumless_syns_isn_is_still_captured_for_owner_isn() {
     let mut stack = stack();
@@ -674,7 +703,53 @@ fn a_checksumless_first_syn_still_lets_a_later_syn_supersede_it() {
 fn parse_syn_rejects_a_syn_shaped_payload_under_a_non_tcp_protocol() {
     let packet = syn_shaped_payload_under(IpProtocol::Icmp, client(), dest(), 1000);
 
-    assert!(parse_syn(&packet, &ChecksumCapabilities::default()).is_none());
+    assert!(parse_syn(&packet).is_none());
+}
+
+/// The IPv6 counterpart to the test above: the same guard exists in the IPv6
+/// branch of `parse_syn`, and every builder above this point in the file can
+/// only build IPv4, so it had no coverage at all.
+#[skuld::test]
+fn parse_syn_rejects_a_syn_shaped_payload_under_a_non_tcp_protocol_over_ipv6() {
+    let packet = syn_shaped_payload_under_v6(IpProtocol::Icmpv6, client_v6(), dest_v6(), 1000);
+
+    assert!(parse_syn(&packet).is_none());
+}
+
+/// `take_handshakes_reports_the_peer_tuple`'s IPv6 counterpart: the ordinary,
+/// non-Hop-by-Hop shape of `parse_syn`'s IPv6 branch.
+#[skuld::test]
+fn take_handshakes_reports_the_peer_tuple_over_ipv6() {
+    let mut stack = stack();
+    stack.ensure_listener(80);
+    stack.enqueue_rx(syn_v6(client_v6(), dest_v6(), 1000));
+    stack.poll(t(0));
+
+    let (_, port, src, dst) = one_pending(stack.take_handshakes());
+    assert_eq!(port, 80);
+    assert_eq!(src, client_v6());
+    assert_eq!(dst, dest_v6());
+}
+
+/// The negative-space twin of
+/// `a_checksumless_syns_isn_is_still_captured_for_owner_isn`: smoltcp's
+/// `Interface::poll` strips a Hop-by-Hop extension header before dispatching
+/// on whatever follows it (`process_hopbyhop`), so a SYN carrying one still
+/// reaches the TCP layer and creates a handshake. `parse_syn`'s IPv6 branch
+/// used to check only the fixed header's `next_header`, so it missed this
+/// entirely: the connection was admitted with no `owner_isn` entry, silently
+/// black-holing the tuple for the owner socket's whole life the moment any
+/// later SYN reused it (#913).
+#[skuld::test]
+fn syn_under_hop_by_hop() {
+    let mut stack = stack();
+    stack.ensure_listener(80);
+    stack.enqueue_rx(syn_under_hop_by_hop_v6(client_v6(), dest_v6(), 1000));
+    stack.poll(t(0));
+
+    let (handle, ..) = one_pending(stack.take_handshakes());
+
+    assert_eq!(stack.owner_isn.get(&handle), Some(&1000));
 }
 
 /// The third defect: the `Duplicate` guard's fallback is one-sided. A
