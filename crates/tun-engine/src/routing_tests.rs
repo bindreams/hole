@@ -54,14 +54,11 @@ fn mentions_addr(cmds: &[Vec<String>], ip: &str) -> bool {
 
 // Success oracle ======================================================================================================
 //
-// macOS `route(8)` exits 0 unconditionally for add/delete/change once
-// `newroute()` returns at all — verified against Apple's current
-// `network_cmds/route.tproj/route.c` (K_ADD/K_DELETE/K_CHANGE dispatch to
-// `newroute(); exit(0)`). `rtmsg()`'s only failure path is the routing-socket
-// `write()` returning < 0, reported via `warnx("writing to routing socket:
-// %s", route_strerror(errno))` on stderr — the literal text these tests
-// assert on. Not gated to macOS (see the functions' own `#[cfg(any(target_os
-// = "macos", test, feature = "test-utils"))]`), so these run on every host.
+// route(8) exits 0 unconditionally on macOS even on failure — see
+// `macos_route_command_succeeded`/`macos_route_confirmed_absent`'s docs for
+// the mechanism these tests assert against. Not gated to macOS (see the
+// functions' own `#[cfg(any(target_os = "macos", test, feature =
+// "test-utils"))]`), so these run on every host.
 
 fn output_with(success: bool, stdout: &str, stderr: &str) -> std::process::Output {
     #[cfg(windows)]
@@ -87,11 +84,10 @@ fn macos_route_command_succeeded_true_on_clean_success() {
     assert!(macos_route_command_succeeded(&out));
 }
 
-/// The #902 regression itself: `route add` on a prefix another VPN already
-/// holds exits 0 (route(8)'s unconditional exit), but prints the routing
-/// socket write failure on stderr. Checking `status.success()` alone — what
-/// PR #904 shipped — reads this as success: the exact bug that let Hole
-/// record, and later delete, another VPN's route.
+/// `route add` on a prefix another VPN already holds exits 0 (route(8)'s
+/// unconditional exit), but prints the routing socket write failure on
+/// stderr — that stderr text is the only signal that distinguishes this from
+/// a real success.
 #[skuld::test]
 fn macos_route_command_succeeded_false_on_eexist_despite_exit_zero() {
     let out = output_with(
@@ -101,7 +97,7 @@ fn macos_route_command_succeeded_false_on_eexist_despite_exit_zero() {
     );
     assert!(
         !macos_route_command_succeeded(&out),
-        "an exit-0 EEXIST must not read as success — this is the #902 regression itself"
+        "an exit-0 EEXIST must not read as success"
     );
 }
 
@@ -134,9 +130,7 @@ fn macos_route_confirmed_absent_true_on_not_in_table() {
 
 /// A genuine in-kernel delete failure (`EBUSY`, printed as "entry in use")
 /// must NOT be treated as "already gone" — doing so would drop the route
-/// from the persisted record while it is still installed, exactly the
-/// finding the review panel raised against the first version of this
-/// redesign (teardown discarding the same oracle install now uses).
+/// from the persisted record while it is still installed.
 #[skuld::test]
 fn macos_route_confirmed_absent_false_on_a_real_delete_failure() {
     let out = output_with(
@@ -145,6 +139,21 @@ fn macos_route_confirmed_absent_false_on_a_real_delete_failure() {
         "route: writing to routing socket: entry in use\n",
     );
     assert!(!macos_route_confirmed_absent(&out));
+}
+
+/// Windows has no text oracle — `route_confirmed_absent`'s non-macOS arm
+/// must key on exit status alone, not unconditionally return `true`. A
+/// route delete that genuinely failed (e.g. "requires elevation", measured
+/// as exit 1 with no distinguishing text) must NOT be treated as gone.
+#[cfg(not(target_os = "macos"))]
+#[skuld::test]
+fn route_confirmed_absent_keys_on_exit_status_when_not_macos() {
+    assert!(route_confirmed_absent(&output_with(true, "", "")));
+    assert!(!route_confirmed_absent(&output_with(
+        false,
+        "",
+        "The requested operation requires elevation.\n"
+    )));
 }
 
 // Setup tests — IPv4 server ===========================================================================================
@@ -464,18 +473,12 @@ fn capturing_runner(log: &RefCell<Captured>) -> impl Fn(&[String], &str) -> std:
     }
 }
 
-/// Real per-command entries for `phase` — excludes the phase-entered-empty
-/// sentinel.
+/// Real per-command entries for `phase`.
 fn commands_in_phase(log: &Captured, phase: &str) -> Vec<Vec<String>> {
     log.iter()
         .filter(|(p, cmd)| p == phase && !cmd.is_empty())
         .map(|(_, cmd)| cmd.clone())
         .collect()
-}
-
-/// Whether `phase` was entered at all (a real command or the empty sentinel).
-fn phase_entered(log: &Captured, phase: &str) -> bool {
-    log.iter().any(|(p, _)| p == phase)
 }
 
 #[skuld::test]
@@ -580,10 +583,6 @@ fn recover_with_loopback_server_skips_bypass() {
     );
 
     let log = log.into_inner();
-    assert!(
-        phase_entered(&log, PHASE_RECOVER_BYPASS),
-        "the bypass phase must still run (and signal it has nothing to do), got {log:?}"
-    );
     assert!(
         commands_in_phase(&log, PHASE_RECOVER_BYPASS).is_empty(),
         "a loopback server installs no bypass, so its recovery phase has nothing to delete, got {log:?}"
@@ -1084,11 +1083,9 @@ fn setup_routes_pops_a_route_the_runner_reports_not_installed() {
     assert_eq!(installed.len(), 4, "the other 4 routes still install: {installed:?}");
 }
 
-/// Proves the fix for the rollback hazard the panel found in the first
-/// version of this redesign: a command whose spawn failed must not be
-/// rolled back (nothing to roll back — it never ran), while the on-disk
-/// checkpoint from just before the failed spawn is left naming it anyway —
-/// the accepted superset-of-one.
+/// A command whose spawn failed must not be rolled back — it never ran —
+/// while the on-disk checkpoint from just before the failed spawn is left
+/// naming it anyway (the accepted superset-of-one).
 #[skuld::test]
 fn setup_routes_excludes_a_spawn_failure_from_installed_but_not_from_the_last_checkpoint() {
     let mut installed = Vec::new();
@@ -1167,6 +1164,46 @@ fn setup_routes_aborts_when_a_pre_command_checkpoint_fails() {
     );
 }
 
+/// The asymmetric counterpart: a POST-command checkpoint failure (the write
+/// that narrows the record after a route already confirmed installed) must
+/// NOT abort — setup continues, and later commands still accumulate into
+/// `installed`. Only the pre-command checkpoint is load-bearing enough to stop
+/// the loop.
+#[skuld::test]
+fn setup_routes_continues_when_a_post_command_checkpoint_fails() {
+    let mut installed = Vec::new();
+    let mut checkpoint_calls = 0u32;
+    #[allow(clippy::disallowed_methods)]
+    // exercising the checkpoint loop directly, with a scripted runner — no real netsh/route
+    let result = setup_routes(
+        "utun7",
+        ipv4_server(),
+        ipv4_gateway(),
+        "en0",
+        &mut installed,
+        |_argv| Ok(true),
+        |_ids| {
+            checkpoint_calls += 1;
+            // Fail the post-command checkpoint of the 1st command (call
+            // sequence: cmd1 pre = 1, cmd1 post = 2, cmd2 pre = 3, ...).
+            if checkpoint_calls == 2 {
+                Err(std::io::Error::other("simulated checkpoint failure"))
+            } else {
+                Ok(())
+            }
+        },
+    );
+    assert!(
+        result.is_ok(),
+        "a post-command checkpoint failure must not abort setup: {result:?}"
+    );
+    assert_eq!(
+        installed,
+        planned_routes(ipv4_server()),
+        "every command still ran despite the one failed post-command checkpoint write: {installed:?}"
+    );
+}
+
 #[skuld::test]
 fn run_teardown_commands_keeps_an_id_whose_delete_fails_to_spawn() {
     let cmds = platform_split_teardown_commands("utun7");
@@ -1193,8 +1230,7 @@ fn run_teardown_commands_keeps_an_id_whose_delete_fails_to_spawn() {
 
 /// A command that spawns but reports the route is NOT confirmed gone (a
 /// genuine macOS in-kernel delete failure, not "already absent") must also
-/// stay recorded — the finding the panel raised against the first version of
-/// this redesign, which discarded that oracle in teardown.
+/// stay recorded.
 #[skuld::test]
 fn run_teardown_commands_keeps_an_id_the_runner_says_is_not_confirmed_gone() {
     let cmds = platform_split_teardown_commands("utun7");
@@ -1231,6 +1267,120 @@ fn run_teardown_commands_checkpoints_after_every_command() {
         checkpoints.last(),
         Some(&Vec::new()),
         "the last checkpoint must reflect every command having drained, got {checkpoints:?}"
+    );
+}
+
+// teardown_routes — the composed function SystemRoutes::drop/install's rollback actually call =========================
+//
+// `run_teardown_commands` tests above cover the per-command loop in
+// isolation; these cover the SPECIFIC composition `teardown_routes` performs
+// on top of it — building the combined split+bypass command list from
+// `installed`, threading one `still_installed` accumulator through both
+// halves, and returning the final remainder.
+
+/// An empty `installed` (e.g. an install where every planned route failed to
+/// go in, or a fully-drained recovery) must be a safe no-op — not a panic.
+/// The production runner (`run_one_teardown`) unconditionally indexes
+/// `cmd[0]`; a prior version of this code synthesized an empty-argv "phase
+/// entered, nothing to do" signal through that same runner and crashed on
+/// every loopback-server crash recovery.
+#[skuld::test]
+fn teardown_routes_with_nothing_installed_does_not_panic() {
+    #[allow(clippy::disallowed_methods)]
+    // exercising teardown_routes directly, with a scripted runner — no real netsh/route
+    let remaining = teardown_routes(
+        "utun7",
+        ipv4_server(),
+        "en0",
+        &[],
+        |argv, _phase| panic!("no command should run for an empty installed set: {argv:?}"),
+        |_ids| {},
+    );
+    assert!(remaining.is_empty());
+}
+
+/// Same as above but through the REAL production runner (`run_one_teardown`,
+/// which spawns real subprocesses for a non-empty argv) — proves the empty
+/// case never reaches it at all, closing the gap a scripted-runner-only test
+/// can't: the panic this guards was in `run_one_output`'s own indexing, not
+/// in anything a mock could stand in for.
+#[skuld::test]
+fn teardown_routes_with_nothing_installed_never_calls_the_real_runner() {
+    #[allow(clippy::disallowed_methods)] // exercising teardown_routes directly with the real per-command runner
+    let remaining = teardown_routes("utun7", ipv4_server(), "en0", &[], run_one_teardown, |_ids| {});
+    assert!(remaining.is_empty());
+}
+
+#[skuld::test]
+fn teardown_routes_deletes_everything_on_full_success() {
+    #[allow(clippy::disallowed_methods)]
+    // exercising teardown_routes directly, with a scripted runner — no real netsh/route
+    let remaining = teardown_routes(
+        "utun7",
+        ipv4_server(),
+        "en0",
+        &planned_routes(ipv4_server()),
+        |_argv, _phase| Ok(true),
+        |_ids| {},
+    );
+    assert!(
+        remaining.is_empty(),
+        "a fully successful teardown leaves nothing recorded: {remaining:?}"
+    );
+}
+
+#[skuld::test]
+fn teardown_routes_only_attempts_the_recorded_subset() {
+    let attempted: RefCell<Vec<RouteId>> = RefCell::new(Vec::new());
+    #[allow(clippy::disallowed_methods)]
+    // exercising teardown_routes directly, with a scripted runner — no real netsh/route
+    let remaining = teardown_routes(
+        "utun7",
+        ipv4_server(),
+        "en0",
+        &[RouteId::SplitV4High, RouteId::ServerBypass],
+        |argv, _phase| {
+            if argv.iter().any(|a| a == "128.0.0.0/1") {
+                attempted.borrow_mut().push(RouteId::SplitV4High);
+            } else if argv.iter().any(|a| a == "1.2.3.4") {
+                attempted.borrow_mut().push(RouteId::ServerBypass);
+            } else {
+                panic!("teardown_routes attempted a route outside the recorded subset: {argv:?}");
+            }
+            Ok(true)
+        },
+        |_ids| {},
+    );
+    assert_eq!(
+        attempted.into_inner(),
+        vec![RouteId::SplitV4High, RouteId::ServerBypass],
+        "only the two recorded ids should have been attempted"
+    );
+    assert!(remaining.is_empty());
+}
+
+#[skuld::test]
+fn teardown_routes_keeps_the_id_whose_delete_fails_to_spawn() {
+    #[allow(clippy::disallowed_methods)]
+    // exercising teardown_routes directly, with a scripted runner — no real netsh/route
+    let remaining = teardown_routes(
+        "utun7",
+        ipv4_server(),
+        "en0",
+        &planned_routes(ipv4_server()),
+        |argv, _phase| {
+            if argv.iter().any(|a| a == "1.2.3.4") {
+                Err(std::io::Error::other("simulated spawn failure"))
+            } else {
+                Ok(true)
+            }
+        },
+        |_ids| {},
+    );
+    assert_eq!(
+        remaining,
+        vec![RouteId::ServerBypass],
+        "only the bypass, whose delete failed to spawn, should remain: {remaining:?}"
     );
 }
 

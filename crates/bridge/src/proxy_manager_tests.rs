@@ -274,7 +274,7 @@ impl MockRouting {
 
     /// `install` succeeds but excludes `ids` from the persisted/returned
     /// `installed` set — simulating a partial route failure (e.g. another
-    /// VPN already holding one of the split prefixes, bindreams/hole#902).
+    /// VPN already holding one of the split prefixes).
     fn failing_routes(state_dir: PathBuf, ids: impl IntoIterator<Item = RouteId>) -> Self {
         let m = Self::new(state_dir);
         m.state.fail_routes_for.lock().unwrap().extend(ids);
@@ -1420,9 +1420,9 @@ fn route_failure_clears_stale_state_file() {
     });
 }
 
-/// A partial route failure (bindreams/hole#902: another VPN already holds
-/// one of the split prefixes) must both persist and later tear down only
-/// the narrowed subset — never the full planned set, and never the failed
+/// A partial route failure (another VPN already holds one of the split
+/// prefixes) must both persist and later tear down only the narrowed
+/// subset — never the full planned set, and never the failed
 /// id. Exercises `ProxyManager`'s consumption of `Routing::install`'s
 /// narrowed `installed`, via `MockRouting::failing_routes`.
 #[skuld::test]

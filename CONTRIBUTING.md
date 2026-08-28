@@ -379,9 +379,23 @@ etc.) ever produces is the literal text `rtmsg()` prints to stderr via
 parses that text for installs, and `routing::macos_route_confirmed_absent` for
 deletes (distinguishing `ESRCH`/"not in table", meaning already gone, from
 every other errno, meaning still installed). Windows' `route.exe`/`netsh`
-exit non-zero on a genuine failure, so no parsing is needed there. Parsing a
-CLI's diagnostic text is a narrower and more fragile answer than a routing
-socket would be — see the Residual paragraph below.
+exit non-zero on a genuine `add` failure, so no parsing is needed for
+installs — but for *deletes*, a non-zero exit does NOT unambiguously mean
+"already gone" (verified empirically: an absent route and one requiring
+elevation both exit 1, no distinguishing text), so `route_confirmed_absent`
+only trusts exit 0; a Windows delete that fails for any reason stays
+recorded rather than risk silently dropping a route that is still there — a
+disclosed residual on top of the one below. Parsing a CLI's diagnostic text
+is a narrower and more fragile answer than a routing socket would be — see
+the Residual paragraph below.
+
+**A route command that ran but didn't confirm going in is a fail-closed
+condition, not a degraded connect.** If any planned route's command spawns
+but the oracle above says it did not go in (macOS: a real `rtmsg()` failure;
+either platform: the runner itself reporting `false`), `install` rolls back
+whatever did go in and returns `Err` rather than a partial tunnel — a user
+who believes traffic is captured when some of it is not is worse off than
+one who is told Hole failed to connect (Rule #0).
 
 The consequence a co-resident VPN cares about: if another VPN already holds
 `0.0.0.0/1` when Hole starts, Hole's `route add` fails, the route is never
@@ -396,7 +410,12 @@ per-command checkpointing on the way out: a command that spawns is dropped from
 the record only once its outcome is confirmed (deleted, or already absent);
 one that fails to spawn stays recorded so the next start retries it, and nothing
 downstream of it in the same run is skipped — teardown has no error channel to
-abort through.
+abort through. "Next start" means the next `install`, not only the next
+process start: `recover_routes` runs once per bridge process, but a
+long-lived process can `install` multiple times (reconnect, server switch),
+so `install` itself sweeps any record left retained by a prior `install` in
+the same process before starting a new one — otherwise its first checkpoint
+would silently overwrite that record.
 
 **Residual:** a VPN that takes the prefix over *mid-session* — necessarily by
 deleting Hole's entry first — is still torn down by Hole's Stop. macOS exposes

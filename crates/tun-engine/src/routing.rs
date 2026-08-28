@@ -193,21 +193,10 @@ fn is_recovery_phase(phase: &str) -> bool {
 
 // Success oracle ======================================================================================================
 //
-// route(8) on macOS exits 0 unconditionally for K_ADD/K_DELETE/K_CHANGE once
-// `newroute()` returns at all (`network_cmds/route.tproj/route.c`'s dispatch
-// in `main()`) — `output.status.success()` cannot tell "this route is now
-// installed/gone" from "route(8) ran and printed a failure". The one
-// deterministic signal is textual: `rtmsg()`'s only failure path is the
-// routing-socket `write()` returning < 0, reported via
-// `warnx("writing to routing socket: %s", route_strerror(errno))` on stderr
-// — verified against Apple's current sources. `route_strerror` maps `ESRCH`
-// (no such route) to the literal string "not in table"; every other errno
-// (EEXIST, EBUSY, ENOBUFS, ...) means the routing table still disagrees with
-// what we asked for. `getaddr()`'s own `errx`/`exit` aborts (unresolvable
-// name) happen before `rtmsg()` runs and DO surface as a non-zero exit, so
-// both signals are checked. Windows' `route.exe`/`netsh` exit non-zero on
-// failure (verified empirically for add and delete), so no parsing is needed
-// there.
+// route(8) exits 0 unconditionally even on a routing-socket failure; the
+// only reliable signal is the stderr text `rtmsg()` prints. See CONTRIBUTING's
+// Route ownership section for the verified mechanism. Windows' `route.exe`/
+// `netsh` exit non-zero on failure, so no parsing is needed there.
 
 /// True if macOS `route(8)`'s own text confirms the mutation went through —
 /// used by [`run_one`] to decide whether a route actually went into the
@@ -260,26 +249,41 @@ fn route_command_installed(output: &std::process::Output) -> bool {
 fn route_confirmed_absent(output: &std::process::Output) -> bool {
     macos_route_confirmed_absent(output)
 }
-// A non-zero exit on Windows already means "already gone" — see
-// `is_recovery_phase`'s doc — so no separate text parsing is needed there.
+/// Windows has no text-based oracle: `route.exe`/`netsh` give no signal
+/// beyond the exit code, and unlike macOS, a non-zero exit does NOT
+/// unambiguously mean "already gone" — verified empirically on this box,
+/// `netsh ... delete route` on an absent route and on a route requiring
+/// elevation both exit 1 with no distinguishing text. Only exit 0 (a
+/// definite, successful delete) confirms the route gone; a non-zero exit
+/// conservatively keeps it recorded rather than risk silently dropping a
+/// route that is still there — a disclosed residual, see CONTRIBUTING's
+/// Route ownership section.
 #[cfg(not(target_os = "macos"))]
-fn route_confirmed_absent(_output: &std::process::Output) -> bool {
-    true
+fn route_confirmed_absent(output: &std::process::Output) -> bool {
+    output.status.success()
 }
 
-/// Spawn one route command and log its outcome, handing back the raw
-/// `Output` so [`run_one`] and [`run_one_teardown`] can each apply their own
-/// success predicate to it. `recovery` selects the failure log level — see
-/// [`is_recovery_phase`].
-fn run_one_output(cmd: &[String], phase: &str, recovery: bool) -> std::io::Result<std::process::Output> {
+/// Spawn one route command, handing back the raw `Output` so [`run_one`] and
+/// [`run_one_teardown`] can each apply their own success predicate to it and
+/// log accordingly — logging here would key severity to the raw exit status,
+/// which is exactly the signal the Success-oracle section exists to not
+/// trust.
+fn run_one_output(cmd: &[String], phase: &str) -> std::io::Result<std::process::Output> {
     debug_assert!(!cmd.is_empty(), "route command must not be empty");
     ROUTING_SUBPROCESS_SPAWN_COUNT.fetch_add(1, Ordering::SeqCst);
     info!(phase, cmd = cmd.join(" "), "running route command");
-    let output = Command::new(&cmd[0]).args(&cmd[1..]).output()?;
+    Command::new(&cmd[0]).args(&cmd[1..]).output()
+}
+
+/// Log a route command's outcome, keyed to `confirmed` — the verdict of the
+/// caller's own oracle ([`route_command_installed`]/[`route_confirmed_absent`]),
+/// never the raw exit status alone (see the Success-oracle section above).
+/// `recovery` selects the failure log level — see [`is_recovery_phase`].
+fn log_route_outcome(cmd: &[String], phase: &str, recovery: bool, output: &std::process::Output, confirmed: bool) {
     let exit_code = output.status.code().unwrap_or(-1);
     let stderr = String::from_utf8_lossy(&output.stderr);
     let stdout = String::from_utf8_lossy(&output.stdout);
-    if output.status.success() {
+    if confirmed {
         // Success log at debug level. Kept out of info to avoid
         // drowning the per-run log in route noise, but visible when
         // an investigation turns on hole_bridge=debug.
@@ -288,28 +292,30 @@ fn run_one_output(cmd: &[String], phase: &str, recovery: bool) -> std::io::Resul
         // worth having in the trace.
         debug!(phase, cmd = cmd.join(" "), exit_code,
                stdout = %stdout.trim(), stderr = %stderr.trim(),
-               "route command succeeded");
+               "route command confirmed");
     } else if recovery {
         // Recovery and teardown phases — see is_recovery_phase
-        // doc-comment. Non-zero exits here are the unavoidable consequence
-        // of non-transactional install + best-effort cleanup; warning would
-        // drown legitimate signal.
+        // doc-comment. An unconfirmed outcome here is the unavoidable
+        // consequence of non-transactional install + best-effort cleanup;
+        // warning would drown legitimate signal.
         debug!(phase, cmd = cmd.join(" "), exit_code, stderr = %stderr,
-               "best-effort command failed (expected if route absent)");
+               "best-effort command not confirmed (expected if route absent)");
     } else {
-        // PHASE_SETUP only. A non-zero exit during initial route install
-        // IS a real anomaly — investigate.
+        // PHASE_SETUP only. An unconfirmed outcome during initial route
+        // install IS a real anomaly — investigate.
         warn!(phase, cmd = cmd.join(" "), exit_code,
               stdout = %stdout.trim(), stderr = %stderr.trim(),
-              "route command failed — investigate (setup phase only)");
+              "route command not confirmed — investigate (setup phase only)");
     }
-    Ok(output)
 }
 
 /// Spawn one route command and report whether it actually went into the
 /// table — see the Success-oracle section above. Used by the install loop.
 fn run_one(cmd: &[String], phase: &str, recovery: bool) -> std::io::Result<bool> {
-    run_one_output(cmd, phase, recovery).map(|o| route_command_installed(&o))
+    let output = run_one_output(cmd, phase)?;
+    let confirmed = route_command_installed(&output);
+    log_route_outcome(cmd, phase, recovery, &output, confirmed);
+    Ok(confirmed)
 }
 
 /// Spawn one teardown/recovery command and report whether the route is now
@@ -317,7 +323,10 @@ fn run_one(cmd: &[String], phase: &str, recovery: bool) -> std::io::Result<bool>
 /// [`macos_route_confirmed_absent`]. Used by [`run_teardown_commands`].
 fn run_one_teardown(cmd: &[String], phase: &str) -> std::io::Result<bool> {
     let recovery = is_recovery_phase(phase);
-    run_one_output(cmd, phase, recovery).map(|o| route_confirmed_absent(&o))
+    let output = run_one_output(cmd, phase)?;
+    let confirmed = route_confirmed_absent(&output);
+    log_route_outcome(cmd, phase, recovery, &output, confirmed);
+    Ok(confirmed)
 }
 
 // Execute (checkpointed) ==============================================================================================
@@ -394,11 +403,11 @@ where
 /// believed installed and is narrowed as each command confirms its route
 /// gone; `checkpoint` is called with the narrowed value after every command.
 /// Best-effort per #907: every command in `cmds` is attempted regardless of
-/// an earlier one's outcome — there is no error channel to abort through.
-///
-/// When `cmds` is empty, `runner` is still called once with an empty argv —
-/// a "phase entered, nothing to do" signal tests can observe, distinguishing
-/// it from the phase never running at all.
+/// an earlier one's outcome — there is no error channel to abort through. An
+/// empty `cmds` is a plain no-op — `runner` (the real subprocess spawner in
+/// production) is never called with a synthetic empty argv to signal that;
+/// doing so previously panicked on the unconditional `Command::new(&cmd[0])`
+/// index, reachable from crash recovery on every loopback-server deployment.
 fn run_teardown_commands<R>(
     cmds: &[RouteCommand],
     phase: &str,
@@ -408,10 +417,6 @@ fn run_teardown_commands<R>(
 ) where
     R: Fn(&[String], &str) -> std::io::Result<bool>,
 {
-    if cmds.is_empty() {
-        let _ = runner(&[], phase);
-        return;
-    }
     for cmd in cmds {
         match runner(&cmd.argv, phase) {
             Ok(true) => still_installed.retain(|id| *id != cmd.id),
@@ -431,29 +436,28 @@ fn run_teardown_commands<R>(
 }
 
 /// Execute route teardown commands for the routes `installed` records via
-/// [`run_one_teardown`], checkpointing the persisted record after every
-/// command through `checkpoint`. Idempotent — safe to call even if those
-/// routes are already gone. Returns the ids still believed installed when
-/// done (empty on full success) — the caller decides whether to clear or
-/// keep the state file from that.
-pub fn teardown_routes(
+/// `runner` (production: [`run_one_teardown`]; tests inject a scripted
+/// closure — same #165 rationale as [`setup_routes`]), checkpointing the
+/// persisted record after every command through `checkpoint`. Idempotent —
+/// safe to call even if those routes are already gone. Returns the ids
+/// still believed installed when done (empty on full success) — the caller
+/// decides whether to clear or keep the state file from that.
+pub fn teardown_routes<R>(
     tun_name: &str,
     server_ip: IpAddr,
     interface_name: &str,
     installed: &[RouteId],
+    runner: R,
     checkpoint: impl FnMut(&[RouteId]),
-) -> Vec<RouteId> {
+) -> Vec<RouteId>
+where
+    R: Fn(&[String], &str) -> std::io::Result<bool>,
+{
     let mut cmds = platform_split_teardown_commands(tun_name);
     cmds.extend(platform_bypass_teardown_command(server_ip, interface_name));
     let cmds: Vec<RouteCommand> = cmds.into_iter().filter(|c| installed.contains(&c.id)).collect();
     let mut still_installed = installed.to_vec();
-    run_teardown_commands(
-        &cmds,
-        PHASE_TEARDOWN,
-        &mut still_installed,
-        run_one_teardown,
-        checkpoint,
-    );
+    run_teardown_commands(&cmds, PHASE_TEARDOWN, &mut still_installed, runner, checkpoint);
     still_installed
 }
 
@@ -855,6 +859,58 @@ impl SystemRouting {
     pub fn new(state_dir: PathBuf, owner: Option<(u32, u32)>) -> Self {
         Self { state_dir, owner }
     }
+
+    /// Best-effort delete of `confirmed` (the only ids ever safe to attempt —
+    /// never an unconfirmed/speculative one, which might belong to someone
+    /// else) via [`teardown_routes`], then persist the leftover: whatever
+    /// teardown could not confirm gone, unioned with `extra_unconfirmed` (ids
+    /// whose install outcome is simply unknown — e.g. a spawn failure
+    /// mid-command — which must stay recorded even though deleting them is
+    /// not safe). Clears the state file only once nothing remains either way.
+    fn rollback_and_record(
+        &self,
+        tun_name: &str,
+        server_ip: IpAddr,
+        interface_name: &str,
+        confirmed: &[RouteId],
+        mut persisted: state::RouteState,
+        extra_unconfirmed: Vec<RouteId>,
+    ) {
+        #[allow(clippy::disallowed_methods)] // defensive rollback inside install
+        let remaining = teardown_routes(
+            tun_name,
+            server_ip,
+            interface_name,
+            confirmed,
+            run_one_teardown,
+            |ids| {
+                persisted.installed = ids.to_vec();
+                if let Err(e) = state::save(&self.state_dir, &persisted, self.owner) {
+                    warn!(error = %e, "failed to checkpoint route-state during install rollback — recorded routes may be stale if this process now crashes");
+                }
+            },
+        );
+        let mut final_remaining = remaining;
+        for id in extra_unconfirmed {
+            if !final_remaining.contains(&id) {
+                final_remaining.push(id);
+            }
+        }
+        if final_remaining.is_empty() {
+            if let Err(e) = state::clear(&self.state_dir) {
+                warn!(error = %e, "failed to clear route-state after rollback — a stale record will trigger a redundant idempotent teardown next start");
+            }
+        } else {
+            persisted.installed = final_remaining.clone();
+            if let Err(e) = state::save(&self.state_dir, &persisted, self.owner) {
+                warn!(error = %e, "failed to record the retained route-state after rollback — routes may leak untracked");
+            }
+            warn!(
+                remaining = ?final_remaining,
+                "routes may be leaked; left recorded for the next start's recovery"
+            );
+        }
+    }
 }
 
 impl Routing for SystemRouting {
@@ -868,6 +924,34 @@ impl Routing for SystemRouting {
         gateway: IpAddr,
         interface_name: &str,
     ) -> Result<Self::Installed, RoutingError> {
+        // Sweep any record a PRIOR run in THIS SAME PROCESS left retained
+        // (an unconfirmed teardown/rollback). `recover_routes` only runs once
+        // per process start, not once per tunnel start — a long-lived bridge
+        // process reconnecting would otherwise have this install's first
+        // checkpoint silently overwrite that record, orphaning the leak
+        // until the process itself restarts.
+        if let Some(leftover) = state::load(&self.state_dir) {
+            warn!(
+                installed = ?leftover.installed,
+                tun = %leftover.tun_name,
+                "sweeping a route record retained from a prior run before this install"
+            );
+            let (leftover_tun, leftover_server_ip, leftover_iface, ids) = (
+                leftover.tun_name.clone(),
+                leftover.server_ip,
+                leftover.interface_name.clone(),
+                leftover.installed.clone(),
+            );
+            self.rollback_and_record(
+                &leftover_tun,
+                leftover_server_ip,
+                &leftover_iface,
+                &ids,
+                leftover,
+                Vec::new(),
+            );
+        }
+
         // Checkpoint template: `setup_routes` calls `checkpoint(ids)` before
         // AND after every route command, so `persisted.installed` — and the
         // on-disk file it writes — is never a prediction. At any instant it
@@ -895,31 +979,40 @@ impl Routing for SystemRouting {
                 state::save(&self.state_dir, &persisted, self.owner)
             },
         );
+        // Whatever the last checkpoint wrote but `installed` no longer names
+        // (popped after a checkpoint- or runner-failure — see `setup_routes`'s
+        // doc): an id whose fate is genuinely unknown, not merely "not
+        // installed". Must stay recorded even though it's not safe to attempt
+        // deleting (see `rollback_and_record`).
+        let uncertain: Vec<RouteId> = persisted
+            .installed
+            .iter()
+            .copied()
+            .filter(|id| !installed.contains(id))
+            .collect();
 
         if let Err(e) = setup_result {
-            // Roll back whatever went in. `installed` already excludes the
-            // command that failed to spawn (see `setup_routes`'s doc) — the
-            // in-flight route's on-disk checkpoint is left as-is
-            // (deliberately not corrected here), which is the accepted
-            // superset-of-one for this failure mode.
-            #[allow(clippy::disallowed_methods)] // defensive rollback inside install
-            let remaining = teardown_routes(tun_name, server_ip, interface_name, &installed, |ids| {
-                persisted.installed = ids.to_vec();
-                if let Err(e) = state::save(&self.state_dir, &persisted, self.owner) {
-                    warn!(error = %e, "failed to checkpoint route-state during install rollback — recorded routes may be stale if this process now crashes");
-                }
-            });
-            if remaining.is_empty() {
-                if let Err(e) = state::clear(&self.state_dir) {
-                    warn!(error = %e, "failed to clear route-state after rollback — a stale record will trigger a redundant idempotent teardown next start");
-                }
-            } else {
-                warn!(
-                    remaining = ?remaining,
-                    "routes may be leaked; left recorded for the next start's recovery"
-                );
-            }
+            self.rollback_and_record(tun_name, server_ip, interface_name, &installed, persisted, uncertain);
             return Err(RoutingError::RouteSetup(e.to_string()));
+        }
+
+        // A route whose command ran but did not confirm going in (e.g.
+        // another process holds that prefix) is popped from `installed` by
+        // `setup_routes`, so setup_result can be `Ok` with `installed` a
+        // strict subset of what was planned. A degraded tunnel is worse than
+        // no tunnel (Rule #0): the user believes traffic is captured when
+        // some of it is not. Roll back and fail closed rather than return a
+        // partial connect as success.
+        let planned = planned_routes(server_ip);
+        if installed.len() != planned.len() {
+            let missing: Vec<RouteId> = planned.iter().copied().filter(|id| !installed.contains(id)).collect();
+            warn!(missing = ?missing, "route install incomplete — rolling back and failing closed");
+            self.rollback_and_record(tun_name, server_ip, interface_name, &installed, persisted, uncertain);
+            return Err(RoutingError::RouteSetup(format!(
+                "route install incomplete: {}/{} routes confirmed (another process may hold a conflicting route): missing {missing:?}",
+                installed.len(),
+                planned.len()
+            )));
         }
 
         // `persisted.installed` already equals `installed` here — every
@@ -1002,6 +1095,7 @@ impl Drop for SystemRoutes {
             self.server_ip,
             &self.interface_name,
             &self.installed,
+            run_one_teardown,
             |ids| {
                 persisted.installed = ids.to_vec();
                 if let Err(e) = state::save(&self.state_dir, &persisted, self.owner) {
