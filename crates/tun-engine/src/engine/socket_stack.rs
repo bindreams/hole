@@ -21,12 +21,12 @@ use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 
 use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
-use smoltcp::phy::ChecksumCapabilities;
+use smoltcp::phy::{ChecksumCapabilities, Device};
 use smoltcp::socket::tcp;
 use smoltcp::time::{Duration as SmoltcpDuration, Instant as SmoltcpInstant};
 use smoltcp::wire::{
-    HardwareAddress, IpAddress, IpCidr, IpEndpoint, Ipv4Packet, Ipv4Repr, Ipv6Packet, Ipv6Repr, TcpControl, TcpPacket,
-    TcpRepr,
+    HardwareAddress, IpAddress, IpCidr, IpEndpoint, IpProtocol, Ipv4Packet, Ipv4Repr, Ipv6Packet, Ipv6Repr, TcpControl,
+    TcpPacket, TcpRepr,
 };
 use tracing::warn;
 
@@ -102,8 +102,14 @@ impl SocketStack {
     /// If the packet is a SYN, its 4-tuple and ISN are captured here — off the
     /// wire, since smoltcp exposes no ISN accessor — for the `take_handshakes`
     /// call that follows the next `poll`.
+    ///
+    /// Parsed with the device's own checksum capabilities, the same ones
+    /// `Interface::poll` uses to receive this same packet — never
+    /// `ChecksumCapabilities::default()`, which verifies a checksum a real TUN
+    /// packet does not carry (see [`VirtualTunDevice::capabilities`]) and so
+    /// would reject every genuine SYN.
     pub(crate) fn enqueue_rx(&mut self, packet: Vec<u8>) {
-        self.pending_syn = parse_syn(&packet);
+        self.pending_syn = parse_syn(&packet, &self.device.capabilities().checksum);
         self.device.enqueue_rx(packet);
     }
 
@@ -201,23 +207,35 @@ impl SocketStack {
                 .map(|(.., isn)| isn);
 
             handshakes.push(match owner {
-                // A tuple's owner is duplicated whenever this SYN's ISN cannot
-                // be told apart from the owner's — either it genuinely matches,
-                // or it could not be read off the wire, in which case falling
-                // back to the historically-safe `Duplicate` means a parsing gap
-                // can never mint a spurious connection.
-                Some(owner) if observed_isn.is_none() || observed_isn == self.owner_isn.get(&owner).copied() => {
-                    Handshake::Duplicate { handle, port }
-                }
                 Some(owner) => {
-                    self.owner_isn
-                        .insert(handle, observed_isn.expect("the guard above rules out None"));
-                    Handshake::Pending {
-                        handle,
-                        port,
-                        src,
-                        dst,
-                        supersedes: Some(owner),
+                    let owners_isn = self.owner_isn.get(&owner).copied();
+                    // A tuple's owner is duplicated whenever this SYN's ISN
+                    // cannot be told apart from the owner's. That needs both
+                    // sides readable and equal — if either this SYN's ISN or
+                    // the ISN its owner was admitted with could not be read
+                    // off the wire, falling back to the historically-safe
+                    // `Duplicate` means a parsing gap on either side can
+                    // never mint a spurious connection, nor tear down a live
+                    // one on its own harmless retransmit.
+                    let is_retransmit = match (observed_isn, owners_isn) {
+                        (Some(a), Some(b)) => a == b,
+                        _ => true,
+                    };
+                    if is_retransmit {
+                        Handshake::Duplicate { handle, port }
+                    } else {
+                        self.owner_isn.insert(
+                            handle,
+                            observed_isn
+                                .expect("is_retransmit is false only when both ISNs are Some, per the match above"),
+                        );
+                        Handshake::Pending {
+                            handle,
+                            port,
+                            src,
+                            dst,
+                            supersedes: Some(owner),
+                        }
                     }
                 }
                 None => {
@@ -285,9 +303,15 @@ impl SocketStack {
     }
 
     /// Drop a socket now, without waiting for smoltcp to finish with its peer.
+    ///
+    /// Also drops `handle` from `retiring`: a socket a caller is removing may
+    /// already be parked there (superseding a stale owner mid-teardown, not
+    /// yet reaped) and `poll`'s reap loop panics on a handle whose slot is
+    /// already gone.
     pub(crate) fn remove(&mut self, handle: SocketHandle) {
         self.sockets.remove(handle);
         self.owner_isn.remove(&handle);
+        self.retiring.retain(|&h| h != handle);
     }
 
     pub(crate) fn socket(&self, handle: SocketHandle) -> &tcp::Socket<'static> {
@@ -355,25 +379,30 @@ fn smoltcp_to_std_ip(addr: IpAddress) -> IpAddr {
     }
 }
 
-/// The 4-tuple and ISN of `packet`, if it is a bare SYN (no ACK).
+/// The 4-tuple and ISN of `packet`, if it is a bare SYN (no ACK) directly over
+/// IP — i.e. `next_header`/`IpProtocol::Tcp`, never a TCP-shaped payload
+/// carried under another protocol, which smoltcp would never hand to the TCP
+/// layer.
 ///
-/// Parsed with smoltcp's own wire types — the same parser `Interface::poll`
-/// uses internally — so a packet this recognizes as a SYN is exactly a packet
-/// smoltcp recognizes as one, and a checksum or structural mismatch that would
-/// make smoltcp reject the packet makes this return `None` too, rather than
-/// disagreeing with it.
-fn parse_syn(packet: &[u8]) -> Option<(SocketAddr, SocketAddr, u32)> {
-    let checksums = ChecksumCapabilities::default();
+/// Parsed with smoltcp's own wire types and `checksums` — the same parser and
+/// capabilities `Interface::poll` uses internally — so a packet this
+/// recognizes as a SYN is exactly a packet smoltcp recognizes as one, and a
+/// checksum or structural mismatch that would make smoltcp reject the packet
+/// makes this return `None` too, rather than disagreeing with it.
+fn parse_syn(packet: &[u8], checksums: &ChecksumCapabilities) -> Option<(SocketAddr, SocketAddr, u32)> {
     let (src_ip, dst_ip, tcp_repr) = match packet.first()? >> 4 {
         4 => {
             let ip_packet = Ipv4Packet::new_checked(packet).ok()?;
-            let ip_repr = Ipv4Repr::parse(&ip_packet, &checksums).ok()?;
+            let ip_repr = Ipv4Repr::parse(&ip_packet, checksums).ok()?;
+            if ip_repr.next_header != IpProtocol::Tcp {
+                return None;
+            }
             let tcp_packet = TcpPacket::new_checked(ip_packet.payload()).ok()?;
             let tcp_repr = TcpRepr::parse(
                 &tcp_packet,
                 &IpAddress::Ipv4(ip_repr.src_addr),
                 &IpAddress::Ipv4(ip_repr.dst_addr),
-                &checksums,
+                checksums,
             )
             .ok()?;
             (IpAddr::V4(ip_repr.src_addr), IpAddr::V4(ip_repr.dst_addr), tcp_repr)
@@ -381,12 +410,15 @@ fn parse_syn(packet: &[u8]) -> Option<(SocketAddr, SocketAddr, u32)> {
         6 => {
             let ip_packet = Ipv6Packet::new_checked(packet).ok()?;
             let ip_repr = Ipv6Repr::parse(&ip_packet).ok()?;
+            if ip_repr.next_header != IpProtocol::Tcp {
+                return None;
+            }
             let tcp_packet = TcpPacket::new_checked(ip_packet.payload()).ok()?;
             let tcp_repr = TcpRepr::parse(
                 &tcp_packet,
                 &IpAddress::Ipv6(ip_repr.src_addr),
                 &IpAddress::Ipv6(ip_repr.dst_addr),
-                &checksums,
+                checksums,
             )
             .ok()?;
             (IpAddr::V6(ip_repr.src_addr), IpAddr::V6(ip_repr.dst_addr), tcp_repr)

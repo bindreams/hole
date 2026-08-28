@@ -17,6 +17,9 @@
 //!    the queue, so every tx assertion is relative to the last drain.
 //! 4. Sequence numbers are randomised by smoltcp. Assert relations to the
 //!    client's own ISN, never absolute values.
+//! 5. [`syn`] emits a valid checksum — a property no real inbound packet has
+//!    (see [`checksumless_syn`]). A test that only ever drives production code
+//!    with [`syn`] can pass while the code rejects every genuine SYN.
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
@@ -78,12 +81,22 @@ pub(crate) fn after(seq: TcpSeqNumber) -> u32 {
     (seq.0 as u32).wrapping_add(1)
 }
 
-pub(crate) fn segment(src: SocketAddr, dst: SocketAddr, control: TcpControl, seq: u32, ack: Option<u32>) -> Vec<u8> {
+/// Build a segment, choosing what the outer IP header claims as its protocol
+/// and what checksum behavior to emit with. Every other builder in this module
+/// is a thin wrapper over this with `IpProtocol::Tcp` and a valid checksum.
+fn segment_ex(
+    src: SocketAddr,
+    dst: SocketAddr,
+    control: TcpControl,
+    seq: u32,
+    ack: Option<u32>,
+    next_header: IpProtocol,
+    checksums: &ChecksumCapabilities,
+) -> Vec<u8> {
     let (src_v4, dst_v4) = match (src.ip(), dst.ip()) {
         (IpAddr::V4(s), IpAddr::V4(d)) => (s, d),
         _ => panic!("these helpers build IPv4 segments only"),
     };
-    let checksums = ChecksumCapabilities::default();
 
     let tcp_repr = TcpRepr {
         src_port: src.port(),
@@ -102,25 +115,70 @@ pub(crate) fn segment(src: SocketAddr, dst: SocketAddr, control: TcpControl, seq
     let ip_repr = Ipv4Repr {
         src_addr: src_v4,
         dst_addr: dst_v4,
-        next_header: IpProtocol::Tcp,
+        next_header,
         payload_len: tcp_repr.buffer_len(),
         hop_limit: 64,
     };
 
     let header_len = ip_repr.buffer_len();
     let mut buf = vec![0u8; header_len + tcp_repr.buffer_len()];
-    ip_repr.emit(&mut Ipv4Packet::new_unchecked(&mut buf), &checksums);
+    ip_repr.emit(&mut Ipv4Packet::new_unchecked(&mut buf), checksums);
     tcp_repr.emit(
         &mut TcpPacket::new_unchecked(&mut buf[header_len..]),
         &IpAddress::Ipv4(src_v4),
         &IpAddress::Ipv4(dst_v4),
-        &checksums,
+        checksums,
     );
     buf
 }
 
+pub(crate) fn segment(src: SocketAddr, dst: SocketAddr, control: TcpControl, seq: u32, ack: Option<u32>) -> Vec<u8> {
+    segment_ex(
+        src,
+        dst,
+        control,
+        seq,
+        ack,
+        IpProtocol::Tcp,
+        &ChecksumCapabilities::default(),
+    )
+}
+
 pub(crate) fn syn(src: SocketAddr, dst: SocketAddr, seq: u32) -> Vec<u8> {
     segment(src, dst, TcpControl::Syn, seq, None)
+}
+
+/// A bare SYN with a zeroed IP and TCP checksum — what a TUN adapter (wintun,
+/// utun) actually delivers, since the OS relies on NIC hardware offloading a
+/// virtual adapter lacks. Every real inbound SYN looks like this, not like
+/// [`syn`]'s valid-checksum one.
+pub(crate) fn checksumless_syn(src: SocketAddr, dst: SocketAddr, seq: u32) -> Vec<u8> {
+    segment_ex(
+        src,
+        dst,
+        TcpControl::Syn,
+        seq,
+        None,
+        IpProtocol::Tcp,
+        &ChecksumCapabilities::ignored(),
+    )
+}
+
+/// A bare SYN — valid TCP checksum included — carried under an IP header that
+/// claims `next_header`, not TCP. Structurally identical to what `syn` builds
+/// on the wire below the IP header; only the protocol byte differs. smoltcp
+/// dispatches on `next_header` and would never hand this payload to the TCP
+/// layer.
+pub(crate) fn syn_shaped_payload_under(next_header: IpProtocol, src: SocketAddr, dst: SocketAddr, seq: u32) -> Vec<u8> {
+    segment_ex(
+        src,
+        dst,
+        TcpControl::Syn,
+        seq,
+        None,
+        next_header,
+        &ChecksumCapabilities::default(),
+    )
 }
 
 pub(crate) fn ack(src: SocketAddr, dst: SocketAddr, seq: u32, ack: u32) -> Vec<u8> {

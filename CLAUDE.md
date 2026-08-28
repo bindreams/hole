@@ -27,24 +27,12 @@ before editing; the sections linked below are the authoritative source.
   diverted to the DNS forwarder before the cascade. →
   [CONTRIBUTING.md#udp-policy](CONTRIBUTING.md#udp-policy)
 - **TCP accept refusal.** The accept verdict lands while the listener is still
-  in `SynReceived` with its SYN-ACK paused, so a declined connection is refused
-  with a pre-handshake RST instead of black-holing behind a SYN-ACK; the verdict
-  is the pure `decide_admission`. A socket with a packet still to emit is
-  *retired* rather than removed, and reaped once smoltcp clears its 4-tuple —
-  including one that reverted to `Listen`, which would otherwise hijack its
-  port; `Driver::settle_packet` enqueues, polls, dispatches admission and reaps
-  retirement as one call per packet, so a socket mid-retirement can never
-  intercept the next SYN regardless of how many packets a `run()` iteration
-  reads. `TimeWait` stays on immediate removal. A 4-tuple has one owner: a
-  re-armed listener can outrank its own connection in slot order and take a SYN
-  meant for it. That SYN's ISN — read off the wire, since smoltcp exposes none —
-  tells a retransmit from a new connection reusing the tuple (RFC 9293
-  §3.10.7.4): the same ISN as the tuple's owner is `Duplicate` and dropped
-  without a segment, a different ISN `supersedes` the stale owner, which is
-  torn down before the new SYN is admitted or refused. An admitted connection
-  carries a keep-alive plus a timeout, the sanctioned bound on a client that
-  may never speak again — without it a stall in
-  `SynReceived`/`FinWait2`/`CloseWait` holds its slot forever. →
+  in `SynReceived` with its SYN-ACK paused, so a declined connection gets a
+  pre-handshake RST, never a black hole. A 4-tuple has one owner: a same-tuple
+  SYN's ISN, read off the wire, tells a retransmit from a new connection
+  reusing it (RFC 9293 §3.10.7.4), and `Driver::settle_packet` bundles
+  admission and retirement into one call per packet so a socket mid-teardown
+  can never intercept the next SYN. →
   [CONTRIBUTING.md#tcp-accept-refusal](CONTRIBUTING.md#tcp-accept-refusal)
 - **DNS forwarder.** Carries DNS over the TCP tunnel for TCP-only plugins; OS
   adapter DNS is advertised the configured resolver IPs, which route into
