@@ -135,6 +135,44 @@ fn disengage_lockdown_absent_cover_is_ok() {
     assert!(disengage_lockdown(dir.path()).is_ok());
 }
 
+// pfctl_stdout (non-zero exit must not read as an empty success) ======================================================
+//
+// A failed `pfctl -sr`/`-sn` used to be read via `.stdout` with no status
+// check, persisting an empty snapshot as the host's pre-lockdown policy
+// (#901's bug class, surviving in this file). `pfctl_stdout` is the fix: the
+// single place every status-bearing read goes through.
+
+fn exit_output(code: i32, stdout: &str, stderr: &str) -> std::process::Output {
+    use std::os::unix::process::ExitStatusExt;
+    std::process::Output {
+        status: std::process::ExitStatus::from_raw(if code == 0 { 0 } else { code << 8 }),
+        stdout: stdout.as_bytes().to_vec(),
+        stderr: stderr.as_bytes().to_vec(),
+    }
+}
+
+#[skuld::test]
+fn pfctl_stdout_returns_stdout_on_success() {
+    let out = pfctl_stdout(Ok(exit_output(0, "block out all\n", "")), "pfctl -sr");
+    assert_eq!(out.unwrap(), "block out all\n");
+}
+
+#[skuld::test]
+fn pfctl_stdout_errs_on_nonzero_exit() {
+    let err = pfctl_stdout(Ok(exit_output(1, "", "pfctl: permission denied\n")), "pfctl -sr").unwrap_err();
+    let rendered = err.to_string();
+    assert!(rendered.contains("pfctl -sr"), "got {rendered}");
+    assert!(rendered.contains("permission denied"), "got {rendered}");
+}
+
+#[skuld::test]
+fn pfctl_stdout_does_not_surface_stdout_text_from_a_failed_run() {
+    // The regression this guards: a non-zero exit must never be read as if it
+    // were a (possibly empty) successful snapshot.
+    let out = pfctl_stdout(Ok(exit_output(1, "stale snapshot text", "")), "pfctl -sn");
+    assert!(out.is_err(), "a failed pfctl run must not report Ok, got {out:?}");
+}
+
 // engage_pf_action (idempotent-enable decision) =======================================================================
 
 #[skuld::test]

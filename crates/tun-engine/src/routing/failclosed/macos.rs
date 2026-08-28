@@ -201,8 +201,8 @@ pub fn engage(
     owner: Option<(u32, u32)>,
 ) -> Result<Cover, RoutingError> {
     // 1. Read current enabled-state (read-only).
-    let info = pfctl(&["-s", "info"], None, FatalPhase::CoverEngage)?;
-    let was_enabled = parse_pf_enabled(&String::from_utf8_lossy(&info.stdout));
+    let info = pfctl_stdout(pfctl(&["-s", "info"], None, FatalPhase::CoverEngage), "pfctl -s info")?;
+    let was_enabled = parse_pf_enabled(&info);
 
     // 2. Enable pf (refcounted) and capture the token.
     let token = enable_pf_capture_token()?;
@@ -334,10 +334,8 @@ pub fn recover_cover(state_dir: &Path, adopting: bool) {
 /// engage ruleset. Separated so its `?`-error path can be unwound (drop the pf
 /// refcount) by the caller without leaking the `-E` enable.
 fn capture_and_persist(token: &str, state_dir: &Path, owner: Option<(u32, u32)>) -> Result<String, RoutingError> {
-    let sr = pfctl(&["-sr"], None, FatalPhase::CoverEngage)?;
-    let main_snapshot = String::from_utf8_lossy(&sr.stdout).into_owned();
-    let sn = pfctl(&["-sn"], None, FatalPhase::CoverEngage)?;
-    let nat_snapshot = String::from_utf8_lossy(&sn.stdout).into_owned();
+    let main_snapshot = pfctl_stdout(pfctl(&["-sr"], None, FatalPhase::CoverEngage), "pfctl -sr")?;
+    let nat_snapshot = pfctl_stdout(pfctl(&["-sn"], None, FatalPhase::CoverEngage), "pfctl -sn")?;
 
     lockdown_state::save(
         state_dir,
@@ -375,8 +373,8 @@ pub fn engage_lockdown(
 ) -> Result<Cover, RoutingError> {
     // The `pfctl -s info` read is decision-only — `LockdownPfState` records no
     // `pf_was_enabled` bit (unlike the transient `FailClosedState`).
-    let info = pfctl(&["-s", "info"], None, FatalPhase::CoverEngage)?;
-    let pf_enabled = parse_pf_enabled(&String::from_utf8_lossy(&info.stdout));
+    let info = pfctl_stdout(pfctl(&["-s", "info"], None, FatalPhase::CoverEngage), "pfctl -s info")?;
+    let pf_enabled = parse_pf_enabled(&info);
     let persisted = lockdown_state::load(state_dir);
 
     let (token, nat_snapshot) = match engage_pf_action(pf_enabled, persisted.is_some()) {
@@ -658,16 +656,26 @@ struct RealPfOps<'a> {
     state_dir: &'a Path,
 }
 
-fn pfctl_status(out: Result<std::process::Output, RoutingError>, what: &str) -> Result<(), RoutingError> {
+/// A `pfctl` output's stdout on success, or `Err` naming `what` + stderr on a
+/// non-zero exit. Every read of a `pfctl` snapshot or status line must go
+/// through this: reading `.stdout` off an `Ok(Output)` without checking
+/// `status.success()` treats a failed `pfctl` run as an empty answer instead
+/// of a failure — an empty filter/nat snapshot then persists and later loads
+/// verbatim as the "restore", silently discarding the host's real pf policy.
+fn pfctl_stdout(out: Result<std::process::Output, RoutingError>, what: &str) -> Result<String, RoutingError> {
     let out = out?;
     if out.status.success() {
-        Ok(())
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
     } else {
         Err(RoutingError::RouteSetup(format!(
             "{what} failed: {}",
             String::from_utf8_lossy(&out.stderr).trim()
         )))
     }
+}
+
+fn pfctl_status(out: Result<std::process::Output, RoutingError>, what: &str) -> Result<(), RoutingError> {
+    pfctl_stdout(out, what).map(|_| ())
 }
 
 impl PfOps for RealPfOps<'_> {
