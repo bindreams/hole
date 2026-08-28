@@ -713,10 +713,11 @@ three axes:
   would block all browsing.
 - **Lifetime.** Lockdown is authoritative and standing — it persists across a
   crash or restart and is reconciled on the next start via
-  `decide_cover_recovery` (Adopt keeps the host fail-closed and is otherwise a
-  no-op — the volatile TUN + server permits are refreshed by the next
-  connect's own `engage_lockdown`; Sweep disengages, and only on an explicit
-  recorded off). The transient cover is a non-standing,
+  `decide_cover_recovery` (Adopt never disengages the cover, and on Windows
+  additionally reclaims the volatile TUN permit if `hole-tun` no longer
+  resolves — see "Disclosed residuals" below; the server permit stays
+  deferred to the next connect's own `engage_lockdown`; Sweep disengages, and
+  only on an explicit recorded off). The transient cover is a non-standing,
   bounded-window RAII guard engaged only for the duration of one covered
   (auto-connect) start attempt, and swept by `recover_routes` like every other
   cover state on the next start.
@@ -826,16 +827,30 @@ Disclosed residuals:
    a sweep interrupted mid-loop survives a reboot as a partial cover that a
    single-GUID probe would call `Absent` forever.
 
-   `Adopt` is a **pure no-op on both platforms**. The volatile-permit refresh
-   it used to perform moved into `engage_lockdown`, which deletes the TUN and
-   server permits inside its own transaction before the adds. Keeping the
-   delete at recovery time meant a second bridge with a fresh state dir
-   (`Unset` x `Live` -> Adopt) would delete a *running* first bridge's
-   server-IP permit while block-all stayed in force. The disclosed cost: an
-   adopted cover keeps its stale TUN-LUID and server-IP permits until the
-   next connect re-engages — both are permits on an idle cover, and the
-   App-ID permit already grants the bridge and plugin binaries unrestricted
-   egress in that window.
+   `Adopt` never disengages the cover, on either platform. The server-permit
+   volatile-refresh it used to perform moved into `engage_lockdown`, which
+   deletes the TUN and server permits inside its own transaction before the
+   adds. Keeping that delete at recovery time meant a second bridge with a
+   fresh state dir (`Unset` x `Live` -> Adopt) would delete a *running* first
+   bridge's server-IP permit while block-all stayed in force. The disclosed
+   cost: an adopted cover keeps its stale server-IP permit until the next
+   connect re-engages — a permit on an idle cover, and the App-ID permit
+   already grants the bridge and plugin binaries unrestricted egress in that
+   window.
+
+   The TUN-LUID permit is the one exception: `Adopt` additionally calls
+   `failclosed::reclaim_stale_tun_permit` (Windows only), which deletes it
+   when `hole-tun` no longer resolves. Unlike the server IP, a resolving
+   `hole-tun` is itself proof some bridge may be relying on the permit, so
+   this can never touch a running bridge's cover — it only fires once the
+   name is provably gone (e.g. after a crash). Without it, a `NET_LUID`
+   (`IfType<<48 | NetLuidIndex<<24`) whose freed index NDIS later reassigns to
+   an unrelated wintun-based adapter would inherit unconditional egress from
+   the stale permit, armed but silently open, until the next connect. The
+   reclaim is keyed on THIS bridge's own last-known TUN name (from its own
+   `bridge-routes.json`, not a global constant): a different install's cover
+   leaves no such record, so the reclaim does not run for it — the same
+   per-install identity gap #878 tracks.
 
 1. On macOS, `release_all` still treats a MISSING (not merely unreadable)
    state file as "no cover of this kind" — `StateFile::Absent`,
@@ -856,9 +871,26 @@ Disclosed residuals:
    sweeps a first bridge's live cover while that GUI reports Running. What
    #881 closed is the three routes where the second state dir has *no
    readable intent* — a wipe, a reinstall, a fresh `--state-dir` — which now
-   Adopt instead of Sweep. The remaining route needs per-install cover
-   identity or the machine-wide lock, and is
+   Adopt instead of Sweep AT RECOVERY TIME. The remaining route needs
+   per-install cover identity or the machine-wide lock, and is
    [#878](https://github.com/bindreams/hole/issues/878)'s.
+
+   **The `Unset` x `Live` -> Adopt route is not fully closed — it is
+   deferred, not removed.** Recovery no longer clobbers a running first
+   bridge directly, but an adopted second bridge's OWN NEXT CONNECT still
+   can: `decide_cover_recovery(Unset, Live)` sets `record_intent_on = true`,
+   which persists `enabled: true` into the second bridge's own state dir and
+   sets its adopted claim, so `standing_cover_expected()` reads true on its
+   very next start. That start's `install_lockdown` -> `engage_lockdown`
+   deletes the TUN-LUID and server-IP permits by the SAME compile-time-constant
+   GUIDs (`LOCKDOWN_FILTER_GUIDS`, shared across every install) and re-adds
+   them keyed to the second bridge's own LUID and server IP, inside the same
+   transaction as its own block-all — while the first bridge is still
+   running. On Windows this breaks the first bridge's tunnel the moment the
+   second bridge connects; on macOS `engage_lockdown`'s `FreshEnable` reloads
+   the ENTIRE main pf ruleset via `pfctl -f -`, so the second bridge's connect
+   wholly overwrites the first bridge's lockdown ruleset. The fix needs the
+   same per-install cover identity as the bullet above — [#878](https://github.com/bindreams/hole/issues/878).
 
 1. `Unset` intent with `Unreachable` presence over a live cover leaves the
    Unblock item hidden. The routes in are the Base Filtering Engine not
@@ -869,23 +901,35 @@ Disclosed residuals:
 1. An adopted cover records **two** facts, kept in two places. The
    adopted-cover claim (`ProxyManager::set_standing_cover_adopted`, recorded
    by `route_recovery::recover_and_record`) says only "a standing cover is
-   live right now and this process has not released it". The armed kill
-   switch is `bridge-lockdown.json`, written by `promote_adopted_claim` the
-   moment a start honours the claim with a real `install_lockdown`. Holding
-   both in the claim is what let an ordinary config edit disarm the switch:
-   `reload`'s slow path is `stop()` then `start()`, the `UserStop` teardown
-   cleared the claim along with the cover, and the next start re-derived
-   `false`. Re-deriving on a later start is not a fallback — once the cover is
-   torn down the measurement reads `Absent` and the decision is `Noop`. A
-   failed repair write at `Unset`/`Live` therefore costs the preference only
-   until the next connect retries it, and never the escape: within the run the
-   claim is what keeps `lockdown_enabled` reporting armed.
+   live right now and this process has not released it" — and is set only on
+   a MEASURED `CoverPresence::Live`, not merely `action == Adopt`: `Adopt` also
+   covers `Recorded` and `Indeterminate`, whose own docs say the OS did NOT
+   confirm one, so asserting liveness there would tell the connect path and
+   the update-consent gate no cover holds the update gap when none was
+   confirmed. The armed kill switch is `bridge-lockdown.json`, written by
+   `promote_adopted_claim` the moment a start honours the claim with a real
+   `install_lockdown`. Holding both in the claim is what let an ordinary
+   config edit disarm the switch: `reload`'s slow path is `stop()` then
+   `start()`, the `UserStop` teardown cleared the claim along with the cover,
+   and the next start re-derived `false`. Re-deriving on a later start is not
+   a fallback — once the cover is torn down the measurement reads `Absent` and
+   the decision is `Noop`. A failed repair write at `Unset`/`Live` therefore
+   costs the preference only until the next connect retries it, and never the
+   escape: within the run the claim is what keeps `lockdown_enabled` reporting
+   armed.
 
-   The claim is **not a latch** — it clears wherever a release confirms: a
-   successful `release_all_covers()` in `turn_lockdown_off`, and a `UserStop`
-   teardown that actually dropped a standing cover guard. Only
-   `turn_lockdown_off` clears the persisted arm, so the escape still disarms
-   the switch for good.
+   The claim is **not a latch** — it clears at four sites, three of which
+   release the cover and clear only on a CONFIRMED `release_all_covers()`
+   result, never on the guard's own silent `Drop`: `turn_lockdown_off`'s idle
+   arm, a `UserStop` teardown, and `check_health` tearing down a dead session.
+   An unconfirmed release at any of the three leaves the claim — and the
+   Unblock item — in place, on the theory that a false "released" is worse
+   than a stale "still armed". The fourth site, `turn_lockdown_off`'s
+   mid-session arm, releases nothing (the session's own cover is `stop_with`'s
+   to decide) and clears only because the user's newly-persisted explicit off
+   must not keep being overridden by a stale claim from before this session, or
+   from this session's own now-superseded adoption. Only `turn_lockdown_off`
+   clears the persisted arm, so the escape still disarms the switch for good.
 
 1. Startup still mutates global WFP state **unconditionally** via the
    transient cover sweep, which runs outside every presence branch and

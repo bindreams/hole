@@ -214,7 +214,7 @@ pub fn recover_routes(state_dir: &Path, owner: Option<(u32, u32)>) -> Recovery {
         failclosed::recover_cover,
         intent,
         || failclosed::lockdown_cover_presence(state_dir),
-        |decision| failclosed::recover_lockdown(decision, state_dir),
+        |decision, tun_name| failclosed::recover_lockdown(decision, state_dir, tun_name),
     )
 }
 
@@ -223,21 +223,30 @@ pub fn recover_routes(state_dir: &Path, owner: Option<(u32, u32)>) -> Recovery {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CoverRecovery {
     /// A standing cover is live and nothing recorded says to remove it: KEEP
-    /// the host fail-closed across the restart. Performs **no OS call on
-    /// either platform** — its whole effect is that the bridge records "a
-    /// standing cover is live this run", so the next connect re-engages
-    /// through `install_lockdown`, which refreshes the volatile permits (the
-    /// dead TUN LUID/utun and the possibly-changed server IP) itself.
+    /// the host fail-closed across the restart. Performs **no OS call that
+    /// could clobber a RUNNING first bridge's cover** — its whole effect is
+    /// that the bridge records "a standing cover is live this run", so the
+    /// next connect re-engages through `install_lockdown`, which refreshes
+    /// the volatile permits (the dead TUN LUID/utun and the possibly-changed
+    /// server IP) itself.
     ///
-    /// Disclosed cost of that inertness: between an adopted cover and the next
-    /// connect the stale TUN-LUID and server-IP permits stay installed rather
-    /// than being dropped immediately. Both are *permits* on an idle cover, and
-    /// the App-ID permit already grants the bridge and plugin binaries
-    /// unrestricted egress in that same window, so the added surface is one
+    /// The one exception, Windows only: it also reclaims the volatile
+    /// TUN-LUID permit pair when `hole-tun` no longer resolves — see
+    /// `failclosed::reclaim_stale_tun_permit`. That is safe where deleting the
+    /// server permit here is not: a genuinely running bridge's own `hole-tun`
+    /// resolves successfully, so the reclaim can never touch a live bridge's
+    /// permit, whereas the server IP has no equivalent liveness check.
+    ///
+    /// Disclosed cost of the remaining inertness: between an adopted cover and
+    /// the next connect the stale server-IP permit stays installed rather than
+    /// being dropped immediately (and, until `hole-tun` is confirmed gone, so
+    /// does the TUN-LUID permit). Both are *permits* on an idle cover, and the
+    /// App-ID permit already grants the bridge and plugin binaries unrestricted
+    /// egress in that same window, so the added surface is one
     /// previously-configured server IP for other processes while nothing is
-    /// connected. The alternative — deleting at recovery time — would let a
-    /// second bridge with a fresh state dir delete a RUNNING first bridge's
-    /// server permit while block-all stayed in force.
+    /// connected. The alternative — deleting the server permit at recovery
+    /// time — would let a second bridge with a fresh state dir delete a
+    /// RUNNING first bridge's server permit while block-all stayed in force.
     ///
     /// This is also the crash-leak fix: a crash never runs `stop()`, so the
     /// persistent cover survives and Adopt holds it.
@@ -296,6 +305,13 @@ pub struct Recovery {
     /// Repair the intent file to `enabled: true` before acting. Grounded in a
     /// positive OS measurement only — see rule 4.
     pub record_intent_on: bool,
+    /// Echoes the `presence` this decision was made from. `action == Adopt`
+    /// alone is not evidence the OS confirmed a live cover — it also covers
+    /// [`CoverPresence::Recorded`] and [`CoverPresence::Indeterminate`], whose
+    /// own docs say the OS did NOT confirm one. A caller recording "this run
+    /// holds a live cover" (`route_recovery::recover_and_record`) must gate on
+    /// `presence == CoverPresence::Live`, not on the action alone.
+    pub presence: CoverPresence,
 }
 
 /// Pure recovery decision over the two measured axes. Performs **no I/O**: it
@@ -344,6 +360,7 @@ pub fn decide_cover_recovery(intent: failclosed::lockdown_state::Intent, presenc
     Recovery {
         action,
         record_intent_on,
+        presence,
     }
 }
 
@@ -368,20 +385,24 @@ where
     R: Fn(&[Vec<String>], &str) -> std::io::Result<()>,
     S: FnOnce(&Path, bool),
     P: FnOnce() -> CoverPresence,
-    L: FnOnce(CoverRecovery),
+    L: FnOnce(CoverRecovery, Option<&str>),
 {
     info!(state_dir = %state_dir.display(), "starting route recovery");
 
     // Route recovery is guarded by the route-state file. Its absence means the
     // previous run installed no routes (the write-ordering contract persists
-    // state BEFORE any route mutation), so we skip route teardown.
+    // state BEFORE any route mutation), so we skip route teardown. Loaded once
+    // and kept: its `tun_name` (when present) is also this bridge's own record
+    // of which TUN device the standing lockdown cover, if any, was built for —
+    // see the reclaim call below.
     //
     // State-file-driven recovery (not unconditional split-route teardown)
     // is required so concurrent bridge subprocesses don't rip routes out
     // from under each other: a SOCKS5-only bridge unconditionally issuing
     // `netsh delete route ... hole-tun` on startup would tear down the
     // routes of a concurrent TUN bridge mid-flight.
-    if let Some(st) = state::load(state_dir) {
+    let route_state = state::load(state_dir);
+    if let Some(st) = &route_state {
         info!(
             tun = %st.tun_name,
             server_ip = %st.server_ip,
@@ -414,6 +435,7 @@ where
     } else {
         debug!("no route-state file found, nothing to recover");
     }
+    let tun_name_hint = route_state.map(|st| st.tun_name);
 
     // Reconcile the standing lockdown cover FIRST. The presence is the
     // lockdown cover's OWN evidence (injected probe), NOT the route-state file,
@@ -436,7 +458,12 @@ where
         }
     }
     let adopt = matches!(decision.action, CoverRecovery::Adopt);
-    lockdown_recover(decision.action);
+    // `tun_name_hint` is THIS bridge's own last-known TUN device (from its own
+    // `bridge-routes.json`), not a global constant — a different install's
+    // cover leaves no record here, so the reclaim below simply does not run
+    // for it (see CONTRIBUTING.md's disclosed residual on cross-install
+    // identity, #878).
+    lockdown_recover(decision.action, tun_name_hint.as_deref());
 
     // Sweep any transient fail-closed cover left by a crashed update cutover.
     // Runs UNCONDITIONALLY (outside the route-state guard above): a crash can

@@ -240,11 +240,8 @@ pub struct ProxyManager<P: Proxy = ShadowsocksProxy, R: Routing = SystemRouting,
     /// user-scoped run so the real user owns the files; `None` (the
     /// default, and the `--service` daemon) leaves ownership as-is.
     state_owner: Option<(u32, u32)>,
-    /// "Startup recovery found a standing cover live this run, and this process
-    /// has not released it." Set from `recover_routes`'s `Adopt`; cleared where
-    /// a release CONFIRMS — see [`Self::set_standing_cover_adopted`]. Not a
-    /// latch: without the clears, clicking Unblock would open the host while
-    /// the tray kept rendering `Lockdown: On` for the life of the process.
+    /// "Startup recovery found a standing cover live this run" — see
+    /// [`Self::set_standing_cover_adopted`] for the full contract.
     ///
     /// The LIVE-COVER half only. The armed half — "the user wants the kill
     /// switch" — is `bridge-lockdown.json`, written by `promote_adopted_claim`
@@ -607,13 +604,20 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
     /// Record or clear the claim "a standing cover is live this run and this
     /// process has not released it".
     ///
-    /// Set from startup recovery's `Adopt` (see `crate::route_recovery`).
-    /// Cleared at exactly three sites, each of which has released the cover:
-    /// `turn_lockdown_off`'s idle arm after `release_all_covers` returns `Ok`,
-    /// a `UserStop` teardown that dropped a standing cover guard, and
-    /// `check_health` tearing down a dead session that held one. A `Cutover`
-    /// stop and the mid-session arm of `turn_lockdown_off` deliberately leave
-    /// it set — neither opens the host.
+    /// Set from startup recovery's `Adopt`, gated additionally on a MEASURED
+    /// `CoverPresence::Live` (see `crate::route_recovery`) — `Adopt` alone also
+    /// covers `Recorded`/`Indeterminate`, which the OS did not confirm.
+    ///
+    /// Cleared at four sites. Three release the cover and clear only on
+    /// CONFIRMED success — never on the guard's own `Drop`, which can only warn
+    /// on failure, not report it: `turn_lockdown_off`'s idle arm, a `UserStop`
+    /// teardown, and `check_health` tearing down a dead session, each after its
+    /// own `release_all_covers` call returns `Ok`. The fourth,
+    /// `turn_lockdown_off`'s mid-session arm, releases nothing — the session's
+    /// own cover is untouched, `stop_with` alone decides its fate — and clears
+    /// only because the user's newly-persisted explicit off must not keep
+    /// being overridden by a stale claim. A `Cutover` stop deliberately leaves
+    /// it set — it does not open the host.
     pub fn set_standing_cover_adopted(&mut self, adopted: bool) {
         self.adopted_standing_cover = adopted;
     }
@@ -710,7 +714,19 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
                 // fact the caller can act on — the setting did not save — rather
                 // than an opaque `ProxyError::Runtime` the IPC layer's generic
                 // 500 path can't distinguish from a release failure.
-                match self.set_lockdown_intent(false) {
+                let persisted = self.set_lockdown_intent(false);
+                if persisted.is_ok() {
+                    // The recorded off is the user's decision. A startup-recovery
+                    // claim from BEFORE this session started (or from a since-
+                    // superseded adoption this session's own fresh
+                    // `install_lockdown` already replaced) must not keep
+                    // overriding it: without this, `lockdown_enabled` still ORs
+                    // in the stale claim and reports armed right after the
+                    // caller was told the setting saved. The session's OWN cover,
+                    // if any, is untouched — `stop_with` alone decides its fate.
+                    self.set_standing_cover_adopted(false);
+                }
+                match persisted {
                     Ok(()) => Ok(LockdownOffOutcome::SessionRunning),
                     Err(_) => Err(ProxyError::LockdownIntentNotPersisted),
                 }
@@ -1776,13 +1792,28 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
                 // Adopt). Disarming a `None` cover is a no-op.
                 match (reason, lockdown) {
                     (StopReason::UserStop, Some(lk)) => {
+                        // The guard's own Drop can only WARN on a genuine OS
+                        // failure — Drop cannot return a value, and silence
+                        // there is indistinguishable from a clean release (see
+                        // `failclosed::Cover`'s Drop doc). Release via the
+                        // fallible, confirmable path FIRST — the same one the
+                        // `Nobody` arm of `turn_lockdown_off` uses — and clear
+                        // the live-cover half of the claim only on a CONFIRMED
+                        // open host: a false clear here is Rule #0 territory,
+                        // the Unblock item disappearing exactly when it is
+                        // still needed. The armed half is in
+                        // `bridge-lockdown.json` (`promote_adopted_claim` wrote
+                        // it at engage) and only `turn_lockdown_off` clears
+                        // that, so this stop cannot disarm the switch either
+                        // way.
+                        match self.routing.release_all_covers() {
+                            Ok(()) => self.set_standing_cover_adopted(false),
+                            Err(e) => tracing::warn!(
+                                error = %e,
+                                "lockdown cover release could not be confirmed on user stop; keeping the escape visible"
+                            ),
+                        }
                         drop(lk);
-                        // The guard's Drop opened the host, so the live-cover
-                        // half of the claim is gone with it. The armed half is
-                        // in `bridge-lockdown.json` (`promote_adopted_claim`
-                        // wrote it at engage) and only `turn_lockdown_off`
-                        // clears that, so this stop cannot disarm the switch.
-                        self.set_standing_cover_adopted(false);
                     }
                     (StopReason::UserStop, None) => {}
                     (StopReason::Cutover, Some(lk)) => lk.disarm(),
@@ -1874,14 +1905,21 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
                 self.death_reason = Some(DEATH_REASON);
                 // Via the one sanctioned derivation, never the field.
                 let had_standing_cover = self.posture.cover_holder().standing_engaged();
-                drop(self.posture.take_session()); // Drop tears down routes + clears state file
                 if had_standing_cover {
-                    // Same release the `UserStop` arm of `stop_with` performs,
-                    // by the same guard's Drop — so it must retire the claim
-                    // the same way, or the tray renders `Lockdown: On` over an
-                    // open host for the life of the process.
-                    self.set_standing_cover_adopted(false);
+                    // Same confirmable pattern the `UserStop` arm of
+                    // `stop_with` uses (see its comment): release via the
+                    // fallible path FIRST and clear the claim only on a
+                    // CONFIRMED open host, before the session's own guard Drop
+                    // — which can only warn, never report failure — runs below.
+                    match self.routing.release_all_covers() {
+                        Ok(()) => self.set_standing_cover_adopted(false),
+                        Err(e) => tracing::warn!(
+                            error = %e,
+                            "lockdown cover release could not be confirmed during health-check teardown; keeping the escape visible"
+                        ),
+                    }
                 }
+                drop(self.posture.take_session()); // Drop tears down routes + clears state file
                 self.active_config = None;
                 self.udp_proxy_available = true;
                 self.ipv6_bypass_available = true;

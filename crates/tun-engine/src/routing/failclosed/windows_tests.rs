@@ -850,3 +850,52 @@ fn the_transient_cover_deletes_nothing_at_engage() {
     assert!(build_cover_spec(v4(), None).pre_delete.is_empty());
     assert!(build_cover_spec(v6(), Some(resolver_v4())).pre_delete.is_empty());
 }
+
+// Recovery-time TUN-permit reclaim ====================================================================================
+
+#[skuld::test]
+fn should_reclaim_tun_permit_only_when_unresolved() {
+    // A resolving hole-tun means some bridge may be relying on the permit —
+    // never reclaim it. Only a provably-gone name is safe to delete.
+    assert!(
+        !should_reclaim_tun_permit(true),
+        "a resolving hole-tun must never be reclaimed"
+    );
+    assert!(
+        should_reclaim_tun_permit(false),
+        "an unresolvable hole-tun must be reclaimed"
+    );
+}
+
+struct StubResolver {
+    result: std::sync::Mutex<Option<Result<u64, RoutingError>>>,
+    called_with: std::sync::Mutex<Option<String>>,
+}
+
+impl crate::routing::failclosed::LuidResolver for StubResolver {
+    fn resolve(&self, alias: &str) -> Result<u64, RoutingError> {
+        *self.called_with.lock().unwrap() = Some(alias.to_owned());
+        self.result
+            .lock()
+            .unwrap()
+            .take()
+            .expect("resolve called more than once in this test")
+    }
+}
+
+#[skuld::test]
+fn reclaim_stale_tun_permit_resolves_the_given_name() {
+    // Reintroduction proof for a hardcoded-alias regression: the resolver
+    // must see the SAME name the caller passed, not a literal baked into this
+    // function.
+    let resolver = StubResolver {
+        result: std::sync::Mutex::new(Some(Ok(0x1234))),
+        called_with: std::sync::Mutex::new(None),
+    };
+    reclaim_stale_tun_permit(&resolver, "some-other-tun");
+    assert_eq!(
+        resolver.called_with.into_inner().unwrap().as_deref(),
+        Some("some-other-tun"),
+        "reclaim must resolve the exact alias it was given"
+    );
+}

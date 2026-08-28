@@ -366,7 +366,7 @@ fn recover_without_state_file_is_a_noop() {
         |_, _| {},
         Intent::Off,
         || Absent,
-        |_| {},
+        |_, _| {},
     );
 
     let log = log.into_inner();
@@ -393,7 +393,7 @@ fn recover_with_state_file_runs_split_then_bypass_then_clears() {
         |_, _| {},
         Intent::Off,
         || Absent,
-        |_| {},
+        |_, _| {},
     );
 
     let log = log.into_inner();
@@ -429,7 +429,7 @@ fn recover_with_loopback_server_skips_bypass() {
         |_, _| {},
         Intent::Off,
         || Absent,
-        |_| {},
+        |_, _| {},
     );
 
     let log = log.into_inner();
@@ -460,7 +460,7 @@ fn recover_clears_state_file_even_when_runner_errors() {
 
     let failing =
         |_: &[Vec<String>], _: &str| -> std::io::Result<()> { Err(std::io::Error::other("simulated runner failure")) };
-    recover_routes_with(tmp.path(), None, failing, |_, _| {}, Intent::Off, || Absent, |_| {});
+    recover_routes_with(tmp.path(), None, failing, |_, _| {}, Intent::Off, || Absent, |_, _| {});
 
     assert!(
         !tmp.path().join(STATE_FILE_NAME).exists(),
@@ -482,7 +482,7 @@ fn recover_invokes_cover_sweep_even_without_route_state() {
         |_, _| swept.set(true),
         Intent::Off,
         || Absent,
-        |_| {},
+        |_, _| {},
     );
 
     assert!(log.into_inner().is_empty(), "no route-state file => no route commands");
@@ -505,7 +505,7 @@ fn recover_sweeps_lockdown_when_intent_off_and_present() {
         |_, _| {},
         Intent::Off,
         || Live,
-        |decision| decided.set(Some(decision)),
+        |decision, _| decided.set(Some(decision)),
     );
     assert_eq!(decided.get(), Some(CoverRecovery::Sweep));
 }
@@ -522,7 +522,7 @@ fn recover_adopts_lockdown_when_intent_on_and_present() {
         |_, _| {},
         Intent::On,
         || Live,
-        |d| decided.set(Some(d)),
+        |d, _| decided.set(Some(d)),
     );
     assert_eq!(decided.get(), Some(CoverRecovery::Adopt));
 }
@@ -540,7 +540,7 @@ fn recover_lockdown_noop_when_cover_absent() {
         |_, _| {},
         Intent::On,
         || Absent,
-        |d| decided.set(Some(d)),
+        |d, _| decided.set(Some(d)),
     );
     assert_eq!(decided.get(), Some(CoverRecovery::Noop), "absent cover => Noop");
 }
@@ -563,7 +563,7 @@ fn recover_orders_lockdown_before_transient_sweep_and_passes_adopting() {
         },
         /* lockdown_intent = */ Intent::On,
         /* lockdown_present = */ || Live, // standing cover present
-        |decision| {
+        |decision, _tun_name| {
             order.borrow_mut().push("lockdown_recover");
             assert_eq!(decision, CoverRecovery::Adopt);
         },
@@ -601,7 +601,7 @@ fn recover_passes_adopting_only_on_adopt() {
             |_d, adopting| *adopting_seen.borrow_mut() = Some(adopting),
             intent,
             || presence,
-            |_decision| {},
+            |_decision, _tun_name| {},
         );
         assert_eq!(
             *adopting_seen.borrow(),
@@ -666,7 +666,8 @@ fn cover_recovery_is_closed_over_intent_and_presence() {
             decide_cover_recovery(intent, presence),
             Recovery {
                 action,
-                record_intent_on
+                record_intent_on,
+                presence,
             },
             "cell ({intent:?}, {presence:?}) must be {action:?} with record_intent_on={record_intent_on}"
         );
@@ -722,6 +723,7 @@ fn cover_recovery_is_inert_when_the_os_is_unreachable_or_clean() {
                 Recovery {
                     action: Noop,
                     record_intent_on: false,
+                    presence,
                 },
                 "({intent:?}, {presence:?}) must be wholly inert"
             );
@@ -734,24 +736,26 @@ fn cover_recovery_is_inert_when_the_os_is_unreachable_or_clean() {
 #[skuld::test]
 fn adopt_deletes_nothing() {
     // With a wiped state dir, `Unset` x `Live` decides Adopt — and Adopt must
-    // not touch a cover that may belong to a RUNNING first bridge. After
+    // not disengage a cover that may belong to a RUNNING first bridge. After
     // the volatile-permit refresh moved into `engage_lockdown`, `Sweep` is the
-    // only decision that reaches the OS on either platform.
+    // only decision that can disengage the standing cover on either platform.
+    // (`Adopt` separately runs a narrow, provably-safe TUN-permit reclaim —
+    // see `recover_lockdown` — which is not part of this classification.)
     use failclosed::RecoveryDispatch;
     assert_eq!(
         failclosed::recovery_dispatch(Adopt),
         RecoveryDispatch::Inert,
-        "Adopt must issue no OS call at all"
+        "Adopt must not disengage the standing cover"
     );
     assert_eq!(
         failclosed::recovery_dispatch(Noop),
         RecoveryDispatch::Inert,
-        "Noop must issue no OS call at all"
+        "Noop must not disengage the standing cover"
     );
     assert_eq!(
         failclosed::recovery_dispatch(Sweep),
         RecoveryDispatch::Disengage,
-        "Sweep is the sole OS-mutating decision"
+        "Sweep is the sole cover-disengaging decision"
     );
 }
 
@@ -792,7 +796,7 @@ fn recover_over(dir: &Path, presence: CoverPresence) -> (Recovery, Option<CoverR
         |_d, _a| {},
         failclosed::lockdown_state::load_intent(dir),
         || presence,
-        |action| acted.set(Some(action)),
+        |action, _tun_name| acted.set(Some(action)),
     );
     (decision, acted.get())
 }
@@ -832,7 +836,7 @@ fn recover_records_the_intent_before_acting_on_it() {
         |_d, _a| {},
         failclosed::lockdown_state::load_intent(dir.path()),
         || Live,
-        |_action| observed.set(Some(failclosed::lockdown_state::load_intent(dir.path()))),
+        |_action, _tun_name| observed.set(Some(failclosed::lockdown_state::load_intent(dir.path()))),
     );
     assert_eq!(
         observed.get(),
@@ -889,6 +893,58 @@ fn recover_adopts_but_writes_nothing_from_a_recorded_only_cover() {
 }
 
 #[skuld::test]
+fn recover_passes_its_own_route_state_tun_name_to_lockdown_recover() {
+    // The TUN-permit reclaim (#881 finding 2) needs to know which device THIS
+    // bridge's own prior run used — sourced from its own bridge-routes.json,
+    // not a global constant, so a different install's cover (no route-state
+    // file here) correctly gets `None` rather than a guessed name.
+    let dir = tempfile::tempdir().unwrap();
+    let persisted_state = RouteState {
+        version: state::SCHEMA_VERSION,
+        tun_name: "hole-tun".into(),
+        server_ip: ipv4_server(),
+        interface_name: "en0".into(),
+    };
+    state::save(dir.path(), &persisted_state, None).unwrap();
+
+    let seen: RefCell<Option<Option<String>>> = RefCell::new(None);
+    recover_routes_with(
+        dir.path(),
+        None,
+        |_c, _p| Ok(()),
+        |_d, _a| {},
+        Intent::On,
+        || Live,
+        |_decision, tun_name| *seen.borrow_mut() = Some(tun_name.map(str::to_owned)),
+    );
+    assert_eq!(
+        seen.into_inner(),
+        Some(Some("hole-tun".to_owned())),
+        "lockdown_recover must see this run's own persisted TUN name"
+    );
+}
+
+#[skuld::test]
+fn recover_passes_no_tun_name_when_no_route_state_exists() {
+    let dir = tempfile::tempdir().unwrap();
+    let seen: RefCell<Option<Option<String>>> = RefCell::new(None);
+    recover_routes_with(
+        dir.path(),
+        None,
+        |_c, _p| Ok(()),
+        |_d, _a| {},
+        Intent::On,
+        || Live,
+        |_decision, tun_name| *seen.borrow_mut() = Some(tun_name.map(str::to_owned)),
+    );
+    assert_eq!(
+        seen.into_inner(),
+        Some(None),
+        "with no route-state file, lockdown_recover must see None, not a guessed name"
+    );
+}
+
+#[skuld::test]
 fn recover_returns_its_decision() {
     // The bridge records the returned action as "a standing cover is live this
     // run", which is what keeps the escape visible independently of the file.
@@ -901,13 +957,14 @@ fn recover_returns_its_decision() {
             |_d, _a| {},
             intent,
             || presence,
-            |_action| {},
+            |_action, _tun_name| {},
         );
         assert_eq!(
             returned,
             Recovery {
                 action,
-                record_intent_on
+                record_intent_on,
+                presence,
             },
             "recover_routes_with must return the decision for ({intent:?}, {presence:?})"
         );

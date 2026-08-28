@@ -84,7 +84,9 @@ before editing; the sections linked below are the authoritative source.
   standing one is reconciled by a 20-cell intent x presence table
   (`decide_cover_recovery`) over a MEASURED OS probe, and is swept only on an
   explicit recorded off intent — a missing or unreadable intent file adopts
-  instead, and `Adopt` is inert on both platforms. An adopted cover's ARMED half
+  instead, and `Adopt` never disengages the cover on either platform (Windows
+  additionally reclaims a stale TUN permit — see CONTRIBUTING.md's disclosed
+  residuals for what recovery-time adoption does NOT close). An adopted cover's ARMED half
   is promoted into `bridge-lockdown.json` at the first real engage, so a
   disconnect (`reload`'s slow path is stop + start) cannot disarm the switch;
   only `turn_lockdown_off` clears it. The escape from a stranded

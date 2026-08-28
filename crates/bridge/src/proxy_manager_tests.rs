@@ -4962,3 +4962,96 @@ fn an_unexpected_session_death_retires_the_claim_too() {
         );
     });
 }
+
+#[skuld::test]
+fn a_user_stop_whose_release_does_not_confirm_keeps_the_claim_and_the_escape() {
+    // Reintroduction proof for finding 5 (#898 rework): an unconditional
+    // `set_standing_cover_adopted(false)` right after the guard's silent Drop
+    // would clear the claim even when the OS-level release did not confirm —
+    // the Unblock item disappearing exactly in the failure case it exists to
+    // cover (Rule #0).
+    rt().block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        let routing = MockRouting::new(dir.path().to_path_buf());
+        let st = routing.state();
+        let mut pm = ProxyManager::new(MockProxy::new(), routing).with_state_dir(dir.path().to_path_buf());
+        pm.set_standing_cover_adopted(true);
+        pm.start(&test_config()).await.unwrap();
+
+        st.fail_release.store(true, Ordering::SeqCst);
+        pm.stop_with(StopReason::UserStop).await.unwrap();
+
+        assert_eq!(
+            st.release_all_calls.load(Ordering::SeqCst),
+            1,
+            "the confirmable release path must be tried"
+        );
+        assert!(
+            pm.standing_cover_adopted(),
+            "an unconfirmed release must leave the live-cover claim set"
+        );
+        assert!(
+            pm.lockdown_enabled(),
+            "the escape must stay on the tray when the release did not confirm"
+        );
+    });
+}
+
+#[skuld::test]
+fn a_crashed_session_whose_release_does_not_confirm_keeps_the_claim() {
+    // Same proof as above, over `check_health`'s teardown of a dead session.
+    rt().block_on(async {
+        let proxy = MockProxy::new();
+        let proxy_state = proxy.state_handle();
+        let dir = tempfile::tempdir().unwrap();
+        let routing = MockRouting::new(dir.path().to_path_buf());
+        let st = routing.state();
+        let mut pm = ProxyManager::new(proxy, routing).with_state_dir(dir.path().to_path_buf());
+        pm.set_standing_cover_adopted(true);
+        pm.start(&test_config()).await.unwrap();
+
+        st.fail_release.store(true, Ordering::SeqCst);
+        proxy_state.crashed.store(true, Ordering::SeqCst);
+        pm.check_health();
+
+        assert_eq!(
+            st.release_all_calls.load(Ordering::SeqCst),
+            1,
+            "the confirmable release path must be tried"
+        );
+        assert!(
+            pm.standing_cover_adopted(),
+            "an unconfirmed release during health-check teardown must leave the claim set"
+        );
+        assert!(pm.lockdown_enabled());
+    });
+}
+
+#[skuld::test]
+fn turning_lockdown_off_mid_session_clears_a_stale_adopted_claim() {
+    // Finding 4 (#898 rework): a claim carried in from startup recovery (or
+    // from this session's own now-superseded adoption) must not keep
+    // overriding an explicit off the user just persisted mid-session — or the
+    // toggle springs back to "on" and a second Unblock click reports success
+    // while changing nothing observable.
+    rt().block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        let routing = MockRouting::new(dir.path().to_path_buf());
+        let mut pm = ProxyManager::new(MockProxy::new(), routing).with_state_dir(dir.path().to_path_buf());
+        pm.set_standing_cover_adopted(true);
+        pm.start(&test_config()).await.unwrap();
+
+        let outcome = pm.turn_lockdown_off().expect("a running session must not error");
+        assert!(matches!(outcome, LockdownOffOutcome::SessionRunning));
+        assert!(
+            !lockdown_state::load_intent(dir.path()).reads_armed(),
+            "the intent must be recorded off"
+        );
+        assert!(
+            !pm.lockdown_enabled(),
+            "a stale adopted claim must not keep the tray reporting armed over a recorded off"
+        );
+
+        pm.stop().await.unwrap();
+    });
+}

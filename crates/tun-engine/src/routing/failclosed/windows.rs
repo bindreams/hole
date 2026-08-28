@@ -969,6 +969,43 @@ impl Drop for Cover {
     }
 }
 
+/// Pure: whether the volatile TUN permit should be reclaimed, given whether
+/// `tun_name` resolved to a live `NET_LUID`. Total and side-effect-free, so
+/// the decision is table-tested without FWPM — see
+/// `failclosed::reclaim_stale_tun_permit`'s doc for the staleness scenario
+/// this guards and why a resolving `hole-tun` must never be reclaimed.
+pub(crate) fn should_reclaim_tun_permit(resolved: bool) -> bool {
+    !resolved
+}
+
+/// Delete the volatile TUN-interface permit pair (`LOCKDOWN_TUN_GUID_INDICES`)
+/// when `resolver` cannot resolve `tun_name` — see
+/// [`should_reclaim_tun_permit`]. Idempotent: a delete that finds nothing is
+/// not an error.
+#[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
+pub fn reclaim_stale_tun_permit(resolver: &dyn super::LuidResolver, tun_name: &str) {
+    if !should_reclaim_tun_permit(resolver.resolve(tun_name).is_ok()) {
+        // A live `hole-tun` exists — some bridge may be relying on this
+        // permit. Never delete it out from under a running bridge.
+        return;
+    }
+    unsafe {
+        let mut engine = HANDLE::default();
+        let rc = FwpmEngineOpen0(PCWSTR::null(), RPC_C_AUTHN_WINNT, None, None, &mut engine);
+        if rc != ERROR_SUCCESS.0 {
+            tracing::warn!(
+                code = format!("0x{rc:08x}"),
+                "FwpmEngineOpen0 failed: could not reclaim a stale TUN permit"
+            );
+            return;
+        }
+        for &i in &LOCKDOWN_TUN_GUID_INDICES {
+            let _ = FwpmFilterDeleteByKey0(engine, &LOCKDOWN_FILTER_GUIDS[i]);
+        }
+        let _ = FwpmEngineClose0(engine);
+    }
+}
+
 /// Classify a presence probe's outcome. Pure and total over its inputs, so the
 /// rule is table-tested without an engine.
 ///
