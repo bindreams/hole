@@ -247,7 +247,7 @@ pub fn run(
         }
         let state_dir_routes = state_dir.to_path_buf();
         if let Err(e) =
-            tokio::task::spawn_blocking(move || tun_engine::routing::recover_routes(&state_dir_routes)).await
+            tokio::task::spawn_blocking(move || tun_engine::routing::recover_routes(&state_dir_routes, None)).await
         {
             tracing::warn!(error = %e, "recover_routes task panicked");
         }

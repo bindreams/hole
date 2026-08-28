@@ -167,7 +167,10 @@ fn load_v1_with_unknown_field_returns_none() {
     assert!(load(dir.path()).is_none());
 }
 
-/// The wire names are read by `scripts/network-reset.py` as well, so pin them.
+/// Pin `installed`'s wire names: they are the persisted schema-2 format a
+/// newer binary must read back from an older run's crash-leftover file, so
+/// renaming a `RouteId` variant is a schema break needing a `SCHEMA_VERSION`
+/// bump and a migration arm, same as the v1 migration below.
 #[skuld::test]
 fn installed_routes_serialize_as_kebab_case() {
     let dir = tempfile::tempdir().unwrap();

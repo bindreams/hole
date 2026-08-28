@@ -18,7 +18,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tun_engine::gateway::GatewayInfo;
 use tun_engine::routing::failclosed::lockdown_state;
-use tun_engine::routing::{self, state as route_state, Routing};
+use tun_engine::routing::{self, state as route_state, RouteId, Routing};
 use tun_engine::RoutingError;
 
 // MockProxy ===========================================================================================================
@@ -199,6 +199,14 @@ pub(super) struct MockRoutingState {
     /// (a set containing both values) for the double-failure fail-open path.
     /// `fail_cover` (always-fail) is unaffected and takes priority.
     fail_cover_for_resolvers: std::sync::Mutex<std::collections::HashSet<Option<IpAddr>>>,
+    /// `install` excludes any [`RouteId`] in this set from the persisted
+    /// `installed` list — simulates a route whose `add` failed (e.g. another
+    /// VPN already holds that prefix), analogous to `fail_cover_for_resolvers`.
+    fail_routes_for: std::sync::Mutex<std::collections::HashSet<RouteId>>,
+    /// The `installed` set `MockRoutes::drop` saw — the routes a test's mock
+    /// teardown "tore down" — so a test can assert teardown covers only the
+    /// narrowed subset `install` actually produced.
+    pub(super) last_teardown_installed: std::sync::Mutex<Option<Vec<RouteId>>>,
 }
 
 impl Default for MockRoutingState {
@@ -221,6 +229,8 @@ impl Default for MockRoutingState {
             last_cover_server_ip: std::sync::Mutex::new(None),
             last_cover_resolver_ip: std::sync::Mutex::new(None),
             fail_cover_for_resolvers: std::sync::Mutex::new(std::collections::HashSet::new()),
+            fail_routes_for: std::sync::Mutex::new(std::collections::HashSet::new()),
+            last_teardown_installed: std::sync::Mutex::new(None),
         }
     }
 }
@@ -262,6 +272,15 @@ impl MockRouting {
         m
     }
 
+    /// `install` succeeds but excludes `ids` from the persisted/returned
+    /// `installed` set — simulating a partial route failure (e.g. another
+    /// VPN already holding one of the split prefixes, bindreams/hole#902).
+    fn failing_routes(state_dir: PathBuf, ids: impl IntoIterator<Item = RouteId>) -> Self {
+        let m = Self::new(state_dir);
+        m.state.fail_routes_for.lock().unwrap().extend(ids);
+        m
+    }
+
     pub(super) fn state(&self) -> Arc<MockRoutingState> {
         Arc::clone(&self.state)
     }
@@ -280,6 +299,17 @@ impl Routing for MockRouting {
         self.state.install_calls.fetch_add(1, Ordering::SeqCst);
         *self.state.last_install_server_ip.lock().unwrap() = Some(server_ip);
 
+        // Narrowed by `fail_routes_for` — a real partial install (e.g.
+        // another VPN already holding one of the split prefixes) never
+        // records the failed id, matching `SystemRouting::install`'s
+        // per-command checkpointing.
+        let fail_routes_for = self.state.fail_routes_for.lock().unwrap();
+        let installed: Vec<RouteId> = routing::planned_routes(server_ip)
+            .into_iter()
+            .filter(|id| !fail_routes_for.contains(id))
+            .collect();
+        drop(fail_routes_for);
+
         // Match `SystemRouting::install`'s critical ordering: write the
         // state file BEFORE any route mutation (or in this case, before
         // the fail flag is checked). This keeps the file-lifecycle tests
@@ -289,7 +319,7 @@ impl Routing for MockRouting {
             tun_name: tun_name.to_owned(),
             server_ip,
             interface_name: interface_name.to_owned(),
-            installed: routing::planned_routes(server_ip),
+            installed: installed.clone(),
         };
         route_state::save(&self.state_dir, &persisted, None)
             .map_err(|e| RoutingError::RouteSetup(format!("mock persist failed: {e}")))?;
@@ -304,6 +334,7 @@ impl Routing for MockRouting {
         Ok(MockRoutes {
             state: Arc::clone(&self.state),
             state_dir: self.state_dir.clone(),
+            installed,
         })
     }
 
@@ -375,12 +406,15 @@ impl Routing for MockRouting {
 pub(super) struct MockRoutes {
     state: Arc<MockRoutingState>,
     state_dir: PathBuf,
+    /// The routes `install` actually recorded — mirrors `SystemRoutes.installed`.
+    installed: Vec<RouteId>,
 }
 
 impl Drop for MockRoutes {
     fn drop(&mut self) {
         self.state.teardown_calls.fetch_add(1, Ordering::SeqCst);
         self.state.teardown_order.lock().unwrap().push("routes");
+        *self.state.last_teardown_installed.lock().unwrap() = Some(self.installed.clone());
         let _ = route_state::clear(&self.state_dir);
     }
 }
@@ -1382,6 +1416,59 @@ fn route_failure_clears_stale_state_file() {
         assert!(
             !state_path.exists(),
             "state file must be cleared on routing.install failure"
+        );
+    });
+}
+
+/// A partial route failure (bindreams/hole#902: another VPN already holds
+/// one of the split prefixes) must both persist and later tear down only
+/// the narrowed subset — never the full planned set, and never the failed
+/// id. Exercises `ProxyManager`'s consumption of `Routing::install`'s
+/// narrowed `installed`, via `MockRouting::failing_routes`.
+#[skuld::test]
+fn partial_route_failure_narrows_teardown_to_the_installed_subset() {
+    rt().block_on(async {
+        let proxy = MockProxy::new();
+        let dir = tempfile::tempdir().unwrap();
+        let routing = MockRouting::failing_routes(dir.path().to_path_buf(), [routing::RouteId::SplitV4Low]);
+        let routing_state = routing.state();
+
+        let (mut pm, test_dir) = new_manager_with_routing(proxy, routing, dir);
+        // A non-loopback server so `planned_routes` includes the bypass —
+        // `test_config()`'s default `127.0.0.1` would not.
+        let mut config = test_config();
+        config.server.server = "9.9.9.9".into();
+        pm.start(&config).await.unwrap();
+
+        let persisted = route_state::load(test_dir.path()).expect("install must persist a state file while running");
+        assert!(
+            !persisted.installed.contains(&RouteId::SplitV4Low),
+            "the failed route must not be recorded as installed: {:?}",
+            persisted.installed
+        );
+        assert_eq!(
+            persisted.installed.len(),
+            4,
+            "the other 3 splits plus the bypass still install: {:?}",
+            persisted.installed
+        );
+
+        pm.stop().await.unwrap();
+
+        let torn_down = routing_state
+            .last_teardown_installed
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("MockRoutes::drop must run on stop");
+        assert!(
+            !torn_down.contains(&RouteId::SplitV4Low),
+            "teardown must never target a route that was never installed: {torn_down:?}"
+        );
+        assert_eq!(
+            torn_down.len(),
+            4,
+            "teardown must cover exactly the narrowed subset: {torn_down:?}"
         );
     });
 }

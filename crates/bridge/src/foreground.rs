@@ -168,7 +168,7 @@ async fn run_inner(
     // command cannot wedge the runtime while the IPC socket is bound but
     // not yet serving.
     let state_dir_routes = state_dir.to_path_buf();
-    if let Err(e) = tokio::task::spawn_blocking(move || routing::recover_routes(&state_dir_routes)).await {
+    if let Err(e) = tokio::task::spawn_blocking(move || routing::recover_routes(&state_dir_routes, owner)).await {
         tracing::warn!(error = %e, "recover_routes task panicked");
     }
     let state_dir_plugins = state_dir.to_path_buf();

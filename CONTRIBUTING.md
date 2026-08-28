@@ -346,9 +346,8 @@ upstream reintroduction, not a proof against a determined rename/alias.
 ### Route ownership
 
 Teardown and crash recovery delete **only** the routes the run recorded in
-`bridge-routes.json`'s `installed` list — the `RouteId`s whose `route add` /
-`netsh add route` exited zero. Nothing about the delete command itself can
-express "only if it is ours":
+`bridge-routes.json`'s `installed` list. Nothing about the delete command
+itself can express "only if it is ours":
 
 - macOS `route delete` resolves its victim from the destination key and netmask
   alone. xnu's `rtrequest_common_locked` reaches `RTM_DELETE` via
@@ -371,13 +370,41 @@ the utun is always already gone by teardown: `RunningState` closes the TUN at
 step 1 and drops the routes guard at step 4, and a crashed run's utun died with
 its control-socket fd.
 
+**Determining "ours" needs more than an exit code.** `route(8)` on macOS exits
+0 unconditionally for `add`/`delete`/`change` once it dispatches at all
+(`network_cmds/route.tproj/route.c`'s `K_ADD`/`K_DELETE`/`K_CHANGE` case runs
+`newroute(); exit(0)`); the only signal a real routing-socket failure (EEXIST,
+etc.) ever produces is the literal text `rtmsg()` prints to stderr via
+`warnx("writing to routing socket: %s", ...)`. `routing::macos_route_command_succeeded`
+parses that text for installs, and `routing::macos_route_confirmed_absent` for
+deletes (distinguishing `ESRCH`/"not in table", meaning already gone, from
+every other errno, meaning still installed). Windows' `route.exe`/`netsh`
+exit non-zero on a genuine failure, so no parsing is needed there. Parsing a
+CLI's diagnostic text is a narrower and more fragile answer than a routing
+socket would be — see the Residual paragraph below.
+
 The consequence a co-resident VPN cares about: if another VPN already holds
 `0.0.0.0/1` when Hole starts, Hole's `route add` fails, the route is never
-recorded, and Hole's Stop leaves it alone. **Residual:** a VPN that takes
-the prefix over *mid-session* — necessarily by deleting Hole's entry first — is
-still torn down by Hole's Stop. macOS exposes no compare-and-delete, so closing
-that needs a different mechanism (a routing socket that acts and then repairs
-from `RTM_DELETE`'s reply), not a different flag.
+recorded, and Hole's Stop leaves it alone.
+
+**Persistence is checkpointed per command, not per phase.** `bridge-routes.json`
+is rewritten before AND after every single route command — not once before the
+whole install, not once after — so at any instant, including mid-crash, its
+`installed` list names at most one route beyond what is actually confirmed in
+the table (the one command in flight). Teardown and recovery apply the same
+per-command checkpointing on the way out: a command that spawns is dropped from
+the record only once its outcome is confirmed (deleted, or already absent);
+one that fails to spawn stays recorded so the next start retries it, and nothing
+downstream of it in the same run is skipped — teardown has no error channel to
+abort through.
+
+**Residual:** a VPN that takes the prefix over *mid-session* — necessarily by
+deleting Hole's entry first — is still torn down by Hole's Stop. macOS exposes
+no compare-and-delete, so closing that needs a different mechanism (a routing
+socket that acts and then repairs from `RTM_DELETE`'s reply), not a different
+flag. The same routing-socket mechanism would also replace the stderr-text
+parsing above with a structured `rtm_errno` — tracked separately, since it
+cannot be verified without a macOS dev box.
 
 `scripts/network-reset.py` deliberately does not honour the record: it is the
 unconditional escape hatch, in the same spirit as `failclosed::release_all`.

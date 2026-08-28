@@ -15,7 +15,7 @@ use crate::error::RoutingError;
 use crate::gateway::{get_default_gateway_info, GatewayInfo};
 
 /// Total number of routing subprocess spawns this process has performed.
-/// Incremented once per command in [`run_commands`]. Exposed so
+/// Incremented once per command in [`run_one_output`]. Exposed so
 /// `diagnostics` handlers and tests can assert the no-routing-subprocess
 /// invariant. The one-instruction `fetch_add` has negligible production
 /// cost — far below the millisecond-scale subprocess itself.
@@ -25,22 +25,12 @@ pub static ROUTING_SUBPROCESS_SPAWN_COUNT: AtomicU32 = AtomicU32::new(0);
 
 /// One of the routes an install creates. Recorded in [`state::RouteState`] so
 /// teardown and crash recovery delete only the routes this run actually
-/// installed.
-///
-/// This record is the only handle macOS leaves us. `route delete` picks its
-/// victim from the destination key and netmask alone — xnu's
-/// `rtrequest_common_locked` reaches `RTM_DELETE` via
-/// `rnh_deladdr(dst, netmask)`, and never reads the gateway — so an
-/// unqualified `route delete -net 0.0.0.0/1` removes whichever route holds
-/// that prefix right now, another VPN's included. The one key discriminator,
-/// `-ifscope`, cannot be used: a route carrying `RTF_IFSCOPE` is invisible to
-/// unbound traffic (xnu's `rt_lookup_common` searches the unscoped table
-/// first and only ever retries under the *primary* interface's scope), so
-/// scoping the install would leave the tunnel capturing nothing. Provenance
-/// also outlives the interface, which neither `-interface <name>` nor
-/// `-ifscope <name>` does: both resolve the name in `route(8)`, which exits
-/// before writing to the routing socket once the utun is gone.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// installed — the only selectivity handle available, since no delete-side
+/// qualifier can express "only if it is ours" (see CONTRIBUTING's
+/// [Route ownership](../../../CONTRIBUTING.md#route-ownership) section) and
+/// provenance is also the only handle that outlives the interface a crashed
+/// or stopped run's utun took with it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum RouteId {
     /// `0.0.0.0/1` via the TUN — first half of IPv4 space.
@@ -91,7 +81,10 @@ impl RouteCommand {
 /// Drop the commands for routes absent from `installed` and hand back bare
 /// argv. Deleting a route this run did not install is never cleanup: the
 /// routing table holds one entry per key, so if the entry is not ours, ours
-/// is already gone and the delete can only remove someone else's.
+/// is already gone and the delete can only remove someone else's. Test-only:
+/// production builds the same filter inline (see `teardown_routes`,
+/// `recover_routes_with`) so it can keep the [`RouteId`] tag for checkpointing.
+#[cfg(test)]
 fn retain_installed(cmds: Vec<RouteCommand>, installed: &[RouteId]) -> Vec<Vec<String>> {
     cmds.into_iter()
         .filter(|c| installed.contains(&c.id))
@@ -136,7 +129,9 @@ pub fn build_setup_commands(
 
 /// Build the shell commands to tear down split routing (IPv4 + IPv6 splits and
 /// server bypass), for the subset of routes `installed` says this run created.
-pub fn build_teardown_commands(
+/// Test-only argv-shape helper — see [`retain_installed`].
+#[cfg(test)]
+pub(crate) fn build_teardown_commands(
     tun_name: &str,
     server_ip: IpAddr,
     interface_name: &str,
@@ -149,23 +144,10 @@ pub fn build_teardown_commands(
 
 /// The split-route half of [`build_teardown_commands`] — crash recovery runs
 /// it separately from the bypass so the two get distinct phase tags.
+/// Test-only argv-shape helper — see [`retain_installed`].
+#[cfg(test)]
 pub(crate) fn build_split_route_teardown_commands(tun_name: &str, installed: &[RouteId]) -> Vec<Vec<String>> {
     retain_installed(platform_split_teardown_commands(tun_name), installed)
-}
-
-/// The server-bypass half of [`build_teardown_commands`]. Empty when the
-/// bypass was never installed (loopback server, or the install failed).
-pub(crate) fn build_bypass_teardown_commands(
-    server_ip: IpAddr,
-    interface_name: &str,
-    installed: &[RouteId],
-) -> Vec<Vec<String>> {
-    retain_installed(
-        platform_bypass_teardown_command(server_ip, interface_name)
-            .into_iter()
-            .collect(),
-        installed,
-    )
 }
 
 // Execution ===========================================================================================================
@@ -186,35 +168,6 @@ pub(crate) const PHASE_RECOVER_COVER: &str = "recover-cover";
 #[cfg(target_os = "macos")]
 pub(crate) const PHASE_COVER: &str = "cover-engage";
 
-/// Execute route setup commands. Logs each command and its result.
-///
-/// Every route whose command exits 0 is pushed onto `installed`, including on
-/// the `Err` path (a spawn failure mid-run still leaves the earlier routes in
-/// the table), so the caller can persist and later tear down exactly what went
-/// in.
-pub fn setup_routes(
-    tun_name: &str,
-    server_ip: IpAddr,
-    original_gateway: IpAddr,
-    interface_name: &str,
-    installed: &mut Vec<RouteId>,
-) -> std::io::Result<()> {
-    let commands = build_setup_commands(tun_name, server_ip, original_gateway, interface_name);
-    run_route_commands(&commands, PHASE_SETUP, installed)
-}
-
-/// Execute route teardown commands for the routes `installed` records.
-/// Idempotent — safe to call even if those routes are already gone.
-pub fn teardown_routes(
-    tun_name: &str,
-    server_ip: IpAddr,
-    interface_name: &str,
-    installed: &[RouteId],
-) -> std::io::Result<()> {
-    let commands = build_teardown_commands(tun_name, server_ip, interface_name, installed);
-    run_commands(&commands, PHASE_TEARDOWN)
-}
-
 /// Returns true if route command failures during this phase are *expected*
 /// idempotent-cleanup behavior and should be logged at debug, not warn.
 ///
@@ -222,14 +175,12 @@ pub fn teardown_routes(
 /// fixed split routes, and on a healthy system all four of those calls fail
 /// because nothing leaked.
 ///
-/// **Teardown** is *also* best-effort because [`setup_routes`] is NOT
-/// transactional — when a setup command fails midway, the defensive
-/// [`teardown_routes`] call deletes routes that were never installed
-/// (empirically `netsh interface ip delete route 0.0.0.0/1 <adapter>`
-/// exits non-zero when the route is absent, and the bare `route delete
-/// <ip>` does the same). Real teardown failures (e.g. "adapter
-/// unavailable") surface via the bridge's post-teardown
-/// `Remove-NetAdapter` reporting and via state-file persistence failures.
+/// **Teardown** is also best-effort: a delete this run's own provenance
+/// record says should succeed can still race a concurrent actor (see
+/// CONTRIBUTING's [Route ownership](../../../CONTRIBUTING.md#route-ownership)
+/// section), and `run_teardown_commands` already narrows what it deletes to
+/// the recorded [`RouteId`]s, so a non-zero exit here is cleanup noise, not
+/// investigation material.
 ///
 /// Adding a new `PHASE_*` constant that should silently tolerate non-zero
 /// exit codes MUST be paired with a matching arm here.
@@ -240,31 +191,87 @@ fn is_recovery_phase(phase: &str) -> bool {
     )
 }
 
-fn run_commands(commands: &[Vec<String>], phase: &str) -> std::io::Result<()> {
-    let recovery = is_recovery_phase(phase);
-    for cmd in commands {
-        run_one(cmd, phase, recovery)?;
-    }
-    Ok(())
+// Success oracle ======================================================================================================
+//
+// route(8) on macOS exits 0 unconditionally for K_ADD/K_DELETE/K_CHANGE once
+// `newroute()` returns at all (`network_cmds/route.tproj/route.c`'s dispatch
+// in `main()`) — `output.status.success()` cannot tell "this route is now
+// installed/gone" from "route(8) ran and printed a failure". The one
+// deterministic signal is textual: `rtmsg()`'s only failure path is the
+// routing-socket `write()` returning < 0, reported via
+// `warnx("writing to routing socket: %s", route_strerror(errno))` on stderr
+// — verified against Apple's current sources. `route_strerror` maps `ESRCH`
+// (no such route) to the literal string "not in table"; every other errno
+// (EEXIST, EBUSY, ENOBUFS, ...) means the routing table still disagrees with
+// what we asked for. `getaddr()`'s own `errx`/`exit` aborts (unresolvable
+// name) happen before `rtmsg()` runs and DO surface as a non-zero exit, so
+// both signals are checked. Windows' `route.exe`/`netsh` exit non-zero on
+// failure (verified empirically for add and delete), so no parsing is needed
+// there.
+
+/// True if macOS `route(8)`'s own text confirms the mutation went through —
+/// used by [`run_one`] to decide whether a route actually went into the
+/// table, and by `test_utils::route::OwnedRoute` (same route(8) exit-0
+/// problem applies to the test harness's own probe routes). Compiled outside
+/// macOS too — under `cfg(test)` so the parsing logic is unit-testable on
+/// every host, and under `feature = "test-utils"` for `OwnedRoute`'s
+/// cross-platform `cfg!()` branch — not only where it is actually wired up.
+#[cfg(any(target_os = "macos", test, feature = "test-utils"))]
+pub(crate) fn macos_route_command_succeeded(output: &std::process::Output) -> bool {
+    output.status.success() && !String::from_utf8_lossy(&output.stderr).contains("writing to routing socket")
 }
 
-/// [`run_commands`] that records which routes went in: every command whose
-/// child exits 0 appends its [`RouteId`] to `installed`. Appending as it goes
-/// (rather than returning a list) keeps the record accurate when a later
-/// command fails to spawn at all.
-fn run_route_commands(commands: &[RouteCommand], phase: &str, installed: &mut Vec<RouteId>) -> std::io::Result<()> {
-    let recovery = is_recovery_phase(phase);
-    for cmd in commands {
-        if run_one(&cmd.argv, phase, recovery)? {
-            installed.push(cmd.id);
-        }
+/// True if macOS `route(8)`'s own text confirms the route is now gone — used
+/// by [`run_one_teardown`] to decide whether a delete may be dropped from the
+/// persisted record, and by `test_utils::route::OwnedRoute`'s `Drop`.
+/// Distinct from [`macos_route_command_succeeded`]: a delete that failed
+/// because there was nothing to delete (`ESRCH`, printed as `"not in
+/// table"`) still means the route is gone and may be dropped: any OTHER
+/// failure text means the route is still there and must stay recorded.
+///
+/// `status.success()` is checked but NOT used to short-circuit to `true`:
+/// route(8) exits 0 for K_DELETE whenever `newroute()` returns at all
+/// (`rtmsg()`'s failure text still prints), so treating a bare exit-0 as
+/// proof of absence would defeat the whole point of this function.
+#[cfg(any(target_os = "macos", test, feature = "test-utils"))]
+pub(crate) fn macos_route_confirmed_absent(output: &std::process::Output) -> bool {
+    if !output.status.success() {
+        // getaddr() aborted before rtmsg() ever ran — the command never
+        // reached the kernel, so the route's fate is unchanged.
+        return false;
     }
-    Ok(())
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if !stderr.contains("writing to routing socket") {
+        return true; // no failure signal at all -> genuinely deleted
+    }
+    stderr.contains("writing to routing socket: not in table")
 }
 
-/// Spawn one route command, log its outcome, and report whether it exited 0.
-/// `recovery` selects the failure log level — see [`is_recovery_phase`].
-fn run_one(cmd: &[String], phase: &str, recovery: bool) -> std::io::Result<bool> {
+#[cfg(target_os = "macos")]
+fn route_command_installed(output: &std::process::Output) -> bool {
+    macos_route_command_succeeded(output)
+}
+#[cfg(not(target_os = "macos"))]
+fn route_command_installed(output: &std::process::Output) -> bool {
+    output.status.success()
+}
+
+#[cfg(target_os = "macos")]
+fn route_confirmed_absent(output: &std::process::Output) -> bool {
+    macos_route_confirmed_absent(output)
+}
+// A non-zero exit on Windows already means "already gone" — see
+// `is_recovery_phase`'s doc — so no separate text parsing is needed there.
+#[cfg(not(target_os = "macos"))]
+fn route_confirmed_absent(_output: &std::process::Output) -> bool {
+    true
+}
+
+/// Spawn one route command and log its outcome, handing back the raw
+/// `Output` so [`run_one`] and [`run_one_teardown`] can each apply their own
+/// success predicate to it. `recovery` selects the failure log level — see
+/// [`is_recovery_phase`].
+fn run_one_output(cmd: &[String], phase: &str, recovery: bool) -> std::io::Result<std::process::Output> {
     debug_assert!(!cmd.is_empty(), "route command must not be empty");
     ROUTING_SUBPROCESS_SPAWN_COUNT.fetch_add(1, Ordering::SeqCst);
     info!(phase, cmd = cmd.join(" "), "running route command");
@@ -296,7 +303,158 @@ fn run_one(cmd: &[String], phase: &str, recovery: bool) -> std::io::Result<bool>
               stdout = %stdout.trim(), stderr = %stderr.trim(),
               "route command failed — investigate (setup phase only)");
     }
-    Ok(output.status.success())
+    Ok(output)
+}
+
+/// Spawn one route command and report whether it actually went into the
+/// table — see the Success-oracle section above. Used by the install loop.
+fn run_one(cmd: &[String], phase: &str, recovery: bool) -> std::io::Result<bool> {
+    run_one_output(cmd, phase, recovery).map(|o| route_command_installed(&o))
+}
+
+/// Spawn one teardown/recovery command and report whether the route is now
+/// confirmed gone — see the Success-oracle section above and
+/// [`macos_route_confirmed_absent`]. Used by [`run_teardown_commands`].
+fn run_one_teardown(cmd: &[String], phase: &str) -> std::io::Result<bool> {
+    let recovery = is_recovery_phase(phase);
+    run_one_output(cmd, phase, recovery).map(|o| route_confirmed_absent(&o))
+}
+
+// Execute (checkpointed) ==============================================================================================
+//
+// Both loops below persist `installed`/`still_installed` after EVERY command,
+// not once per phase or once per install — see CONTRIBUTING's
+// [Route ownership](../../../CONTRIBUTING.md#route-ownership) section. The
+// on-disk record is therefore never a prediction (superset or otherwise): at
+// any instant, including mid-loop, it names exactly what the accumulator in
+// memory names, so a crash or a later command's spawn failure narrows the
+// leak window to at most the single command in flight.
+
+/// Execute route setup commands one at a time via `runner` (production:
+/// [`run_one`]; tests inject a scripted closure so they can simulate a
+/// specific command failing without touching the host — see #165 in
+/// [`Routing`]'s doc). `installed` accumulates the [`RouteId`]s confirmed in
+/// the table; `checkpoint` is called with it before AND after every command.
+///
+/// A pre-command checkpoint failure aborts immediately (mirrors the
+/// write-before-mutate ordering contract: this codebase must not run a
+/// mutation it failed to record first) and its `Err` propagates; the id is
+/// popped back out first — the write never durably happened, so the command
+/// is treated exactly like one that never ran. A post-command checkpoint
+/// failure does not abort — the record it failed to write is a narrowing,
+/// and the last successful checkpoint (naming a superset of at most one
+/// extra route) still stands — so the caller is expected to log it.
+///
+/// On a runner `Err` (spawn failure), the in-flight command's id is likewise
+/// popped back out of `installed` before the error propagates: the caller
+/// uses `installed` to decide what to roll back, and a command that never
+/// spawned must not be rolled back (that would delete whoever holds the
+/// route now). The ON-DISK checkpoint from just before the failed spawn is
+/// deliberately NOT corrected to match — it still names the speculative id,
+/// which is the safe superset-of-one this design accepts (see CONTRIBUTING).
+pub fn setup_routes<R>(
+    tun_name: &str,
+    server_ip: IpAddr,
+    original_gateway: IpAddr,
+    interface_name: &str,
+    installed: &mut Vec<RouteId>,
+    runner: R,
+    mut checkpoint: impl FnMut(&[RouteId]) -> std::io::Result<()>,
+) -> std::io::Result<()>
+where
+    R: Fn(&[String]) -> std::io::Result<bool>,
+{
+    let commands = build_setup_commands(tun_name, server_ip, original_gateway, interface_name);
+    for cmd in &commands {
+        installed.push(cmd.id);
+        if let Err(e) = checkpoint(installed) {
+            installed.pop();
+            return Err(e);
+        }
+        match runner(&cmd.argv) {
+            Ok(true) => {}
+            Ok(false) => {
+                installed.pop();
+            }
+            Err(e) => {
+                installed.pop();
+                return Err(e);
+            }
+        }
+        if let Err(e) = checkpoint(installed) {
+            warn!(error = %e, id = ?cmd.id, "failed to checkpoint route-state after install command");
+        }
+    }
+    Ok(())
+}
+
+/// Execute route teardown/recovery commands one at a time via `runner`
+/// (production: [`run_one_teardown`]; tests inject a scripted closure — same
+/// #165 rationale as [`setup_routes`]). `still_installed` starts as the ids
+/// believed installed and is narrowed as each command confirms its route
+/// gone; `checkpoint` is called with the narrowed value after every command.
+/// Best-effort per #907: every command in `cmds` is attempted regardless of
+/// an earlier one's outcome — there is no error channel to abort through.
+///
+/// When `cmds` is empty, `runner` is still called once with an empty argv —
+/// a "phase entered, nothing to do" signal tests can observe, distinguishing
+/// it from the phase never running at all.
+fn run_teardown_commands<R>(
+    cmds: &[RouteCommand],
+    phase: &str,
+    still_installed: &mut Vec<RouteId>,
+    runner: R,
+    mut checkpoint: impl FnMut(&[RouteId]),
+) where
+    R: Fn(&[String], &str) -> std::io::Result<bool>,
+{
+    if cmds.is_empty() {
+        let _ = runner(&[], phase);
+        return;
+    }
+    for cmd in cmds {
+        match runner(&cmd.argv, phase) {
+            Ok(true) => still_installed.retain(|id| *id != cmd.id),
+            Ok(false) => {
+                warn!(
+                    phase,
+                    id = ?cmd.id,
+                    "route-teardown command did not confirm the route is gone — keeping it recorded"
+                );
+            }
+            Err(e) => {
+                warn!(phase, id = ?cmd.id, error = %e, "route-teardown command failed to spawn — route may still be installed");
+            }
+        }
+        checkpoint(still_installed);
+    }
+}
+
+/// Execute route teardown commands for the routes `installed` records via
+/// [`run_one_teardown`], checkpointing the persisted record after every
+/// command through `checkpoint`. Idempotent — safe to call even if those
+/// routes are already gone. Returns the ids still believed installed when
+/// done (empty on full success) — the caller decides whether to clear or
+/// keep the state file from that.
+pub fn teardown_routes(
+    tun_name: &str,
+    server_ip: IpAddr,
+    interface_name: &str,
+    installed: &[RouteId],
+    checkpoint: impl FnMut(&[RouteId]),
+) -> Vec<RouteId> {
+    let mut cmds = platform_split_teardown_commands(tun_name);
+    cmds.extend(platform_bypass_teardown_command(server_ip, interface_name));
+    let cmds: Vec<RouteCommand> = cmds.into_iter().filter(|c| installed.contains(&c.id)).collect();
+    let mut still_installed = installed.to_vec();
+    run_teardown_commands(
+        &cmds,
+        PHASE_TEARDOWN,
+        &mut still_installed,
+        run_one_teardown,
+        checkpoint,
+    );
+    still_installed
 }
 
 /// Run a single command, feeding `stdin` if present and returning the full
@@ -337,12 +495,14 @@ pub(crate) fn run_capturing(
 /// file is present in `state_dir`, also removes the server bypass route
 /// described by it; finally deletes the state file. Best-effort — all errors
 /// are logged at `warn` level and the function returns `()` (there is no
-/// meaningful caller recovery).
-pub fn recover_routes(state_dir: &Path) {
+/// meaningful caller recovery). `owner` is forwarded to the mid-recovery
+/// checkpoint writes (same uid/gid-chown contract as [`SystemRouting::new`]).
+pub fn recover_routes(state_dir: &Path, owner: Option<(u32, u32)>) {
     let intent = failclosed::lockdown_state::load_enabled(state_dir);
     recover_routes_with(
         state_dir,
-        run_commands,
+        owner,
+        run_one_teardown,
         failclosed::recover_cover,
         intent,
         || failclosed::lockdown_cover_present(state_dir),
@@ -385,22 +545,23 @@ pub fn decide_cover_recovery(intent: bool, prior_present: bool) -> CoverRecovery
     }
 }
 
-/// Test seam for [`recover_routes`]: accepts an injected command runner, an
-/// injected transient-cover sweep, and the standing-lockdown reconciliation
-/// inputs (intent + presence probe + recover action) so unit tests can assert
-/// behavior without shelling out to `netsh`/`route` or touching the host
-/// firewall. Production passes `run_commands`, [`failclosed::recover_cover`],
-/// the persisted lockdown intent, [`failclosed::lockdown_cover_present`], and
-/// [`failclosed::recover_lockdown`].
+/// Test seam for [`recover_routes`]: accepts an injected per-command route
+/// runner, an injected transient-cover sweep, and the standing-lockdown
+/// reconciliation inputs (intent + presence probe + recover action) so unit
+/// tests can assert behavior without shelling out to `netsh`/`route` or
+/// touching the host firewall. Production passes [`run_one_teardown`],
+/// [`failclosed::recover_cover`], the persisted lockdown intent,
+/// [`failclosed::lockdown_cover_present`], and [`failclosed::recover_lockdown`].
 pub(crate) fn recover_routes_with<R, S, P, L>(
     state_dir: &Path,
+    owner: Option<(u32, u32)>,
     runner: R,
     sweep_cover: S,
     lockdown_intent: bool,
     lockdown_present: P,
     lockdown_recover: L,
 ) where
-    R: Fn(&[Vec<String>], &str) -> std::io::Result<()>,
+    R: Fn(&[String], &str) -> std::io::Result<bool>,
     S: FnOnce(&Path, bool),
     P: FnOnce() -> bool,
     L: FnOnce(CoverRecovery),
@@ -416,14 +577,59 @@ pub(crate) fn recover_routes_with<R, S, P, L>(
     // from under each other: a SOCKS5-only bridge unconditionally issuing
     // `netsh delete route ... hole-tun` on startup would tear down the
     // routes of a concurrent TUN bridge mid-flight.
-    if let Some(st) = state::load(state_dir) {
+    if let Some(loaded) = state::load(state_dir) {
+        let tun_name = loaded.tun_name;
+        let server_ip = loaded.server_ip;
+        let interface_name = loaded.interface_name;
+
+        // Defensive: an id with no possible teardown command (e.g. a
+        // `ServerBypass` recorded against a now-loopback `server_ip` — only
+        // reachable via a hand-edited or foreign-schema file, since every
+        // production writer keeps `installed` a subset of
+        // `planned_routes(server_ip)`) can never be attempted, so it can
+        // never drain from `still_installed` below. Drop it up front instead
+        // of leaving the state file stuck non-empty forever.
+        let plannable = planned_routes(server_ip);
+        let sanitized: Vec<RouteId> = loaded
+            .installed
+            .iter()
+            .copied()
+            .filter(|id| plannable.contains(id))
+            .collect();
+        if sanitized.len() != loaded.installed.len() {
+            warn!(
+                recorded = ?loaded.installed,
+                plannable = ?plannable,
+                "route-state names a route with no possible teardown command for this server_ip — dropping it"
+            );
+        }
+
         info!(
-            tun = %st.tun_name,
-            server_ip = %st.server_ip,
-            iface = %st.interface_name,
-            installed = ?st.installed,
+            tun = %tun_name,
+            %server_ip,
+            iface = %interface_name,
+            installed = ?sanitized,
             "recovering routes from crashed run"
         );
+
+        // `persisted` is a fresh checkpoint template, independent of
+        // `tun_name`/`server_ip`/`interface_name` above (which stay free for
+        // building the command lists below) — only `checkpoint`'s own copy
+        // of those fields is mutated.
+        let mut persisted = state::RouteState {
+            version: state::SCHEMA_VERSION,
+            tun_name: tun_name.clone(),
+            server_ip,
+            interface_name: interface_name.clone(),
+            installed: sanitized.clone(),
+        };
+        let mut still_installed = sanitized;
+        let mut checkpoint = |ids: &[RouteId]| {
+            persisted.installed = ids.to_vec();
+            if let Err(e) = state::save(state_dir, &persisted, owner) {
+                warn!(error = %e, "failed to checkpoint route-state during recovery — recorded routes may be stale if this process now crashes");
+            }
+        };
 
         // 1. Split routes (IPv4 + IPv6 halves). Idempotent — harmless if
         //    absent. Runs under state-file guard so this only fires when we
@@ -431,25 +637,47 @@ pub(crate) fn recover_routes_with<R, S, P, L>(
         //    the routes that run recorded as installed. Uses the TUN name
         //    persisted in the state file (the caller controls this —
         //    tun-engine has no opinion on naming).
-        let split_cmds = build_split_route_teardown_commands(&st.tun_name, &st.installed);
-        if let Err(e) = runner(&split_cmds, PHASE_RECOVER_SPLIT) {
-            warn!(error = %e, "split-route teardown failed during recovery");
-        }
+        let split_cmds: Vec<RouteCommand> = platform_split_teardown_commands(&tun_name)
+            .into_iter()
+            .filter(|c| still_installed.contains(&c.id))
+            .collect();
+        run_teardown_commands(
+            &split_cmds,
+            PHASE_RECOVER_SPLIT,
+            &mut still_installed,
+            &runner,
+            &mut checkpoint,
+        );
 
         // 2. Per-server bypass route recorded in the state file. The splits
         //    are NOT re-issued here: step 1 already deleted them, and a second
         //    delete of a now-free prefix could take out whatever claimed it in
         //    between.
-        let bypass_cmds = build_bypass_teardown_commands(st.server_ip, &st.interface_name, &st.installed);
-        if let Err(e) = runner(&bypass_cmds, PHASE_RECOVER_BYPASS) {
-            warn!(error = %e, "bypass-route teardown failed during recovery");
-        }
+        let bypass_cmds: Vec<RouteCommand> = platform_bypass_teardown_command(server_ip, &interface_name)
+            .into_iter()
+            .filter(|c| still_installed.contains(&c.id))
+            .collect();
+        run_teardown_commands(
+            &bypass_cmds,
+            PHASE_RECOVER_BYPASS,
+            &mut still_installed,
+            &runner,
+            &mut checkpoint,
+        );
 
-        // 3. Delete the state file regardless of command outcomes. Next
-        //    startup re-runs the idempotent teardown if anything leaked
-        //    past a failure.
-        if let Err(e) = state::clear(state_dir) {
-            warn!(error = %e, "failed to clear route-state file during recovery");
+        // 3. Clear the state file once nothing remains unaccounted for.
+        //    `checkpoint` already persisted `still_installed` after every
+        //    command above, so a non-empty remainder is already recorded —
+        //    the next startup's recovery will retry exactly those ids.
+        if still_installed.is_empty() {
+            if let Err(e) = state::clear(state_dir) {
+                warn!(error = %e, "failed to clear route-state file during recovery");
+            }
+        } else {
+            warn!(
+                remaining = ?still_installed,
+                "routes may still be leaked; left recorded for the next start's recovery"
+            );
         }
     } else {
         debug!("no route-state file found, nothing to recover");
@@ -640,63 +868,69 @@ impl Routing for SystemRouting {
         gateway: IpAddr,
         interface_name: &str,
     ) -> Result<Self::Installed, RoutingError> {
-        // CRITICAL ORDERING: persist the route-recovery state BEFORE any
-        // routing mutation. A panic or SIGKILL between `setup_routes` and
-        // `SystemRoutes` construction would otherwise leak routes with no
-        // on-disk record, defeating crash recovery on next startup. Nothing
-        // is installed yet, so the record starts at the full planned set: a
-        // crash mid-setup must clean up a superset rather than miss a route
-        // and strand the host on a dead TUN.
+        // Checkpoint template: `setup_routes` calls `checkpoint(ids)` before
+        // AND after every route command, so `persisted.installed` — and the
+        // on-disk file it writes — is never a prediction. At any instant it
+        // names exactly what `installed` below names, so a crash narrows the
+        // leak window to at most the single command in flight. See
+        // CONTRIBUTING's Route ownership section.
         let mut persisted = state::RouteState {
             version: state::SCHEMA_VERSION,
             tun_name: tun_name.to_owned(),
             server_ip,
             interface_name: interface_name.to_owned(),
-            installed: planned_routes(server_ip),
+            installed: Vec::new(),
         };
-        state::save(&self.state_dir, &persisted, self.owner)
-            .map_err(|e| RoutingError::RouteSetup(format!("failed to persist route-state: {e}")))?;
-
-        // Install the routes. On failure, defensively tear down whatever
-        // was installed and clear the stale state file before returning.
-        // Defensive rollback: `run_commands` currently returns `Err` only on
-        // process-spawn failure, but a future early-exit-on-non-zero change
-        // would otherwise leak partial routes.
         let mut installed = Vec::new();
         #[allow(clippy::disallowed_methods)] // we ARE the Routing impl
-        if let Err(e) = setup_routes(tun_name, server_ip, gateway, interface_name, &mut installed) {
+        let setup_result = setup_routes(
+            tun_name,
+            server_ip,
+            gateway,
+            interface_name,
+            &mut installed,
+            |argv| run_one(argv, PHASE_SETUP, false),
+            |ids| {
+                persisted.installed = ids.to_vec();
+                state::save(&self.state_dir, &persisted, self.owner)
+            },
+        );
+
+        if let Err(e) = setup_result {
+            // Roll back whatever went in. `installed` already excludes the
+            // command that failed to spawn (see `setup_routes`'s doc) — the
+            // in-flight route's on-disk checkpoint is left as-is
+            // (deliberately not corrected here), which is the accepted
+            // superset-of-one for this failure mode.
             #[allow(clippy::disallowed_methods)] // defensive rollback inside install
-            let rolled_back = teardown_routes(tun_name, server_ip, interface_name, &installed);
-            // Same rule as `SystemRoutes::drop`: the record goes only once the
-            // deletes have run. Narrowed to what this attempt created, so
-            // recovery does not chase routes it never installed.
-            if rolled_back.is_err() && !installed.is_empty() {
-                persisted.installed = installed;
-                let _ = state::save(&self.state_dir, &persisted, self.owner);
+            let remaining = teardown_routes(tun_name, server_ip, interface_name, &installed, |ids| {
+                persisted.installed = ids.to_vec();
+                if let Err(e) = state::save(&self.state_dir, &persisted, self.owner) {
+                    warn!(error = %e, "failed to checkpoint route-state during install rollback — recorded routes may be stale if this process now crashes");
+                }
+            });
+            if remaining.is_empty() {
+                if let Err(e) = state::clear(&self.state_dir) {
+                    warn!(error = %e, "failed to clear route-state after rollback — a stale record will trigger a redundant idempotent teardown next start");
+                }
             } else {
-                let _ = state::clear(&self.state_dir);
+                warn!(
+                    remaining = ?remaining,
+                    "routes may be leaked; left recorded for the next start's recovery"
+                );
             }
             return Err(RoutingError::RouteSetup(e.to_string()));
         }
 
-        // Narrow the record to what actually went in. A route whose `add`
-        // failed is held by someone else — another VPN's `0.0.0.0/1`, most
-        // likely — and deleting it later would take theirs down, never ours.
-        // If this write fails the wider pre-install record stands, which
-        // deletes a superset: worse for a co-resident VPN, but it is the only
-        // direction that cannot strand our own host without a route.
-        if persisted.installed != installed {
-            persisted.installed = installed.clone();
-            if let Err(e) = state::save(&self.state_dir, &persisted, self.owner) {
-                warn!(error = %e, "failed to narrow route-state to the installed set");
-            }
-        }
-
+        // `persisted.installed` already equals `installed` here — every
+        // command's post-run checkpoint above kept it current — so there is
+        // no separate narrowing write.
         Ok(SystemRoutes {
             tun_name: tun_name.to_owned(),
             server_ip,
             interface_name: interface_name.to_owned(),
             state_dir: self.state_dir.clone(),
+            owner: self.owner,
             installed,
         })
     }
@@ -737,6 +971,9 @@ pub struct SystemRoutes {
     server_ip: IpAddr,
     interface_name: String,
     state_dir: PathBuf,
+    /// Forwarded to every checkpoint `state::save` in `Drop` — same
+    /// uid/gid-chown contract as `SystemRouting.owner`.
+    owner: Option<(u32, u32)>,
     /// The routes `install` got into the table — the only ones Drop may delete.
     installed: Vec<RouteId>,
 }
@@ -752,24 +989,39 @@ impl Drop for SystemRoutes {
             installed = ?self.installed,
             "SystemRoutes::drop entered — tearing down routes"
         );
+        let mut persisted = state::RouteState {
+            version: state::SCHEMA_VERSION,
+            tun_name: self.tun_name.clone(),
+            server_ip: self.server_ip,
+            interface_name: self.interface_name.clone(),
+            installed: self.installed.clone(),
+        };
         #[allow(clippy::disallowed_methods)] // SystemRoutes IS Routing::Installed
-        let ran = teardown_routes(&self.tun_name, self.server_ip, &self.interface_name, &self.installed);
-        if let Err(e) = &ran {
-            warn!(error = %e, "route teardown failed in SystemRoutes::drop");
-        }
-        // Clear the state file only once the delete commands have actually
-        // run. `Err` here means one failed to spawn, so the routes it named
-        // may still be installed and the record of them is the only thing
-        // that will get them deleted: the next start's `recover_routes`
-        // replays it. A non-zero *exit* is not the same thing — the command
-        // ran, and `route`/`netsh` exit non-zero for a route that is already
-        // gone — so it still clears.
-        if ran.is_ok() {
+        let remaining = teardown_routes(
+            &self.tun_name,
+            self.server_ip,
+            &self.interface_name,
+            &self.installed,
+            |ids| {
+                persisted.installed = ids.to_vec();
+                if let Err(e) = state::save(&self.state_dir, &persisted, self.owner) {
+                    warn!(error = %e, "failed to checkpoint route-state during teardown — recorded routes may be stale if this process now crashes");
+                }
+            },
+        );
+        // Clear the state file only once nothing remains unaccounted for.
+        // The checkpoint above already persisted `remaining` after every
+        // command, so a non-empty remainder is already recorded — the next
+        // start's `recover_routes` will retry exactly those ids.
+        if remaining.is_empty() {
             if let Err(e) = state::clear(&self.state_dir) {
                 warn!(error = %e, "state-file clear failed in SystemRoutes::drop");
             }
         } else {
-            warn!("keeping route-state for the next start's recovery — teardown commands did not run");
+            warn!(
+                remaining = ?remaining,
+                "keeping route-state for the next start's recovery — some teardown commands did not confirm their route is gone"
+            );
         }
         // Belt-and-suspenders post-teardown wintun adapter cleanup.
         // `bridge::Dispatcher::drop` synchronously drains the engine task
@@ -1055,29 +1307,11 @@ fn platform_setup_commands(
     cmds
 }
 
-/// The macOS deletes name no interface, unlike their `add` counterparts.
-///
-/// Two independent reasons, both from Apple's sources:
-///
-/// 1. It would scope nothing. `route(8)`'s `-interface` sets only `iflag`
-///    (`network_cmds/route.tproj/route.c`, `case K_IFACE: case K_INTERFACE:`),
-///    which suppresses `RTF_GATEWAY` and turns the next positional argument
-///    into an `AF_LINK` gateway. The kernel then ignores it: xnu's
-///    `rtrequest_common_locked` resolves an `RTM_DELETE` with
-///    `rnh_deladdr(dst, netmask)` — `in_deleteroute`/`in6_deleteroute` over
-///    `rn_delete` — and never reads the gateway.
-/// 2. It would break the delete outright once the interface is gone. With
-///    `iflag` set and no matching `getifaddrs` entry, `getaddr` falls through
-///    to `gethostbyname`/`getaddrinfo` and exits before `rtmsg()` ever writes
-///    to the routing socket. The utun dies with the process, so that is the
-///    normal case for crash recovery — and for the ordinary Stop path too,
-///    which closes the TUN before dropping the routes guard.
-///
-/// `-ifscope` is the real scoping flag, and it is not an option either: it
-/// resolves its name through `if_nametoindex` (same death on a dead utun), and
-/// a route carrying `RTF_IFSCOPE` is skipped by unscoped lookups, so scoping
-/// the install would leave the tunnel capturing nothing. Selectivity comes
-/// from [`RouteId`] provenance instead.
+/// The macOS deletes name no interface, unlike their `add` counterparts:
+/// `-interface`/`-ifscope` are settled-and-rejected qualifiers (see
+/// [`RouteId`]'s doc and CONTRIBUTING's
+/// [Route ownership](../../../CONTRIBUTING.md#route-ownership) section for
+/// why). Selectivity comes from [`RouteId`] provenance instead.
 #[cfg(target_os = "macos")]
 fn platform_split_teardown_commands(_tun_name: &str) -> Vec<RouteCommand> {
     vec![

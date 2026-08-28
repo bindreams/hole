@@ -156,7 +156,7 @@ fn run_service() -> Result<(), Box<dyn std::error::Error>> {
         }
         let state_dir_for_recover = state_dir.clone();
         if let Err(e) =
-            tokio::task::spawn_blocking(move || tun_engine::routing::recover_routes(&state_dir_for_recover)).await
+            tokio::task::spawn_blocking(move || tun_engine::routing::recover_routes(&state_dir_for_recover, None)).await
         {
             tracing::warn!(error = %e, "recover_routes task panicked");
         }

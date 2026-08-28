@@ -52,6 +52,101 @@ fn mentions_addr(cmds: &[Vec<String>], ip: &str) -> bool {
     cmds.iter().flatten().any(|arg| arg == ip || arg == &slash128)
 }
 
+// Success oracle ======================================================================================================
+//
+// macOS `route(8)` exits 0 unconditionally for add/delete/change once
+// `newroute()` returns at all — verified against Apple's current
+// `network_cmds/route.tproj/route.c` (K_ADD/K_DELETE/K_CHANGE dispatch to
+// `newroute(); exit(0)`). `rtmsg()`'s only failure path is the routing-socket
+// `write()` returning < 0, reported via `warnx("writing to routing socket:
+// %s", route_strerror(errno))` on stderr — the literal text these tests
+// assert on. Not gated to macOS (see the functions' own `#[cfg(any(target_os
+// = "macos", test, feature = "test-utils"))]`), so these run on every host.
+
+fn output_with(success: bool, stdout: &str, stderr: &str) -> std::process::Output {
+    #[cfg(windows)]
+    let status = {
+        use std::os::windows::process::ExitStatusExt;
+        std::process::ExitStatus::from_raw(u32::from(!success))
+    };
+    #[cfg(not(windows))]
+    let status = {
+        use std::os::unix::process::ExitStatusExt;
+        std::process::ExitStatus::from_raw(if success { 0 } else { 1 << 8 })
+    };
+    std::process::Output {
+        status,
+        stdout: stdout.as_bytes().to_vec(),
+        stderr: stderr.as_bytes().to_vec(),
+    }
+}
+
+#[skuld::test]
+fn macos_route_command_succeeded_true_on_clean_success() {
+    let out = output_with(true, "add net 0.0.0.0/1: gateway utun7\n", "");
+    assert!(macos_route_command_succeeded(&out));
+}
+
+/// The #902 regression itself: `route add` on a prefix another VPN already
+/// holds exits 0 (route(8)'s unconditional exit), but prints the routing
+/// socket write failure on stderr. Checking `status.success()` alone — what
+/// PR #904 shipped — reads this as success: the exact bug that let Hole
+/// record, and later delete, another VPN's route.
+#[skuld::test]
+fn macos_route_command_succeeded_false_on_eexist_despite_exit_zero() {
+    let out = output_with(
+        true, // route(8) exits 0 regardless
+        "add net 0.0.0.0/1: gateway utun7: File exists\n",
+        "route: writing to routing socket: File exists\n",
+    );
+    assert!(
+        !macos_route_command_succeeded(&out),
+        "an exit-0 EEXIST must not read as success — this is the #902 regression itself"
+    );
+}
+
+#[skuld::test]
+fn macos_route_command_succeeded_false_on_nonzero_exit() {
+    // getaddr()'s errx()/exit() aborts (e.g. an unresolvable name) DO surface
+    // as a non-zero exit, ahead of rtmsg() ever running.
+    let out = output_with(false, "", "route: bad address: nonsense\n");
+    assert!(!macos_route_command_succeeded(&out));
+}
+
+#[skuld::test]
+fn macos_route_confirmed_absent_true_on_success() {
+    let out = output_with(true, "delete net 0.0.0.0/1\n", "");
+    assert!(macos_route_confirmed_absent(&out));
+}
+
+#[skuld::test]
+fn macos_route_confirmed_absent_true_on_not_in_table() {
+    let out = output_with(
+        true,
+        "delete net 0.0.0.0/1: not in table\n",
+        "route: writing to routing socket: not in table\n",
+    );
+    assert!(
+        macos_route_confirmed_absent(&out),
+        "ESRCH (\"not in table\") means the route is already gone"
+    );
+}
+
+/// A genuine in-kernel delete failure (`EBUSY`, printed as "entry in use")
+/// must NOT be treated as "already gone" — doing so would drop the route
+/// from the persisted record while it is still installed, exactly the
+/// finding the review panel raised against the first version of this
+/// redesign (teardown discarding the same oracle install now uses).
+#[skuld::test]
+fn macos_route_confirmed_absent_false_on_a_real_delete_failure() {
+    let out = output_with(
+        true,
+        "delete net 0.0.0.0/1: entry in use\n",
+        "route: writing to routing socket: entry in use\n",
+    );
+    assert!(!macos_route_confirmed_absent(&out));
+}
+
 // Setup tests — IPv4 server ===========================================================================================
 
 #[skuld::test]
@@ -308,7 +403,7 @@ fn setup_with_spaced_interface_name_includes_full_name() {
 
 // Phase classifier ====================================================================================================
 //
-// `is_recovery_phase` decides whether `run_commands` logs failures at debug
+// `is_recovery_phase` decides whether `run_one_output` logs failures at debug
 // (idempotent best-effort cleanup) or warn (a real error). These tests are
 // regressions against accidental modification of the matcher itself —
 // they reference the same `PHASE_*` constants used by `recover_routes_with`,
@@ -354,15 +449,33 @@ fn cover_engage_phase_is_not_recovery() {
 
 // recover_routes_with tests ===========================================================================================
 //
-// These use an injectable command runner so the test doesn't shell out.
+// These use an injectable per-command runner so the test doesn't shell out.
 
-type Captured = Vec<(String, Vec<Vec<String>>)>;
+type Captured = Vec<(String, Vec<String>)>;
 
-fn capturing_runner(log: &RefCell<Captured>) -> impl Fn(&[Vec<String>], &str) -> std::io::Result<()> + '_ {
-    |cmds: &[Vec<String>], phase: &str| {
-        log.borrow_mut().push((phase.into(), cmds.to_vec()));
-        Ok(())
+/// Records every runner call — one entry per command, or a single
+/// empty-argv entry when a phase has nothing to do (`run_teardown_commands`'s
+/// phase-entered-empty signal). Every command "succeeds" (route confirmed
+/// gone) by default.
+fn capturing_runner(log: &RefCell<Captured>) -> impl Fn(&[String], &str) -> std::io::Result<bool> + '_ {
+    |cmd: &[String], phase: &str| {
+        log.borrow_mut().push((phase.into(), cmd.to_vec()));
+        Ok(true)
     }
+}
+
+/// Real per-command entries for `phase` — excludes the phase-entered-empty
+/// sentinel.
+fn commands_in_phase(log: &Captured, phase: &str) -> Vec<Vec<String>> {
+    log.iter()
+        .filter(|(p, cmd)| p == phase && !cmd.is_empty())
+        .map(|(_, cmd)| cmd.clone())
+        .collect()
+}
+
+/// Whether `phase` was entered at all (a real command or the empty sentinel).
+fn phase_entered(log: &Captured, phase: &str) -> bool {
+    log.iter().any(|(p, _)| p == phase)
 }
 
 #[skuld::test]
@@ -375,7 +488,15 @@ fn recover_without_state_file_is_a_noop() {
     // bridge.
     let tmp = tempfile::tempdir().unwrap();
     let log: RefCell<Captured> = RefCell::new(Vec::new());
-    recover_routes_with(tmp.path(), capturing_runner(&log), |_, _| {}, false, || false, |_| {});
+    recover_routes_with(
+        tmp.path(),
+        None,
+        capturing_runner(&log),
+        |_, _| {},
+        false,
+        || false,
+        |_| {},
+    );
 
     let log = log.into_inner();
     assert!(log.is_empty(), "expected no commands with no state file, got {log:?}");
@@ -395,12 +516,35 @@ fn recover_with_state_file_runs_split_then_bypass_then_clears() {
     state::save(tmp.path(), &persisted_state, None).unwrap();
 
     let log: RefCell<Captured> = RefCell::new(Vec::new());
-    recover_routes_with(tmp.path(), capturing_runner(&log), |_, _| {}, false, || false, |_| {});
+    recover_routes_with(
+        tmp.path(),
+        None,
+        capturing_runner(&log),
+        |_, _| {},
+        false,
+        || false,
+        |_| {},
+    );
 
     let log = log.into_inner();
-    assert_eq!(log.len(), 2, "expected split + bypass phases, got {log:?}");
-    assert_eq!(log[0].0, PHASE_RECOVER_SPLIT);
-    assert_eq!(log[1].0, PHASE_RECOVER_BYPASS);
+    assert_eq!(
+        commands_in_phase(&log, PHASE_RECOVER_SPLIT).len(),
+        4,
+        "expected the 4 split deletes, got {log:?}"
+    );
+    assert_eq!(
+        commands_in_phase(&log, PHASE_RECOVER_BYPASS).len(),
+        1,
+        "expected the bypass delete, got {log:?}"
+    );
+    let first_bypass = log
+        .iter()
+        .position(|(p, _)| p == PHASE_RECOVER_BYPASS)
+        .expect("bypass phase must run");
+    assert!(
+        log[..first_bypass].iter().all(|(p, _)| p == PHASE_RECOVER_SPLIT),
+        "split phase must run before bypass phase, got {log:?}"
+    );
     assert!(
         !tmp.path().join(STATE_FILE_NAME).exists(),
         "state file should be cleared after recovery"
@@ -425,24 +569,38 @@ fn recover_with_loopback_server_skips_bypass() {
     state::save(tmp.path(), &persisted_state, None).unwrap();
 
     let log: RefCell<Captured> = RefCell::new(Vec::new());
-    recover_routes_with(tmp.path(), capturing_runner(&log), |_, _| {}, false, || false, |_| {});
+    recover_routes_with(
+        tmp.path(),
+        None,
+        capturing_runner(&log),
+        |_, _| {},
+        false,
+        || false,
+        |_| {},
+    );
 
     let log = log.into_inner();
-    assert_eq!(log[1].0, PHASE_RECOVER_BYPASS);
     assert!(
-        log[1].1.is_empty(),
-        "a loopback server installs no bypass, so its recovery phase has nothing to delete, got {:?}",
-        log[1].1
+        phase_entered(&log, PHASE_RECOVER_BYPASS),
+        "the bypass phase must still run (and signal it has nothing to do), got {log:?}"
     );
     assert!(
-        !mentions_addr(&log[1].1, "127.0.0.1"),
-        "loopback recovery must not reference the server address, got {:?}",
-        log[1].1
+        commands_in_phase(&log, PHASE_RECOVER_BYPASS).is_empty(),
+        "a loopback server installs no bypass, so its recovery phase has nothing to delete, got {log:?}"
+    );
+    assert!(
+        !mentions_addr(&commands_in_phase(&log, PHASE_RECOVER_SPLIT), "127.0.0.1"),
+        "loopback recovery must not reference the server address, got {log:?}"
     );
 }
 
+// Deliberate design change from the old "always clear regardless of runner
+// outcome" contract: a command that fails to spawn means its route may still
+// be installed, so it must stay recorded for the next start to retry — never
+// silently discarded. See CONTRIBUTING's Route ownership section.
+
 #[skuld::test]
-fn recover_clears_state_file_even_when_runner_errors() {
+fn recover_keeps_state_file_when_every_command_fails_to_spawn() {
     let tmp = tempfile::tempdir().unwrap();
     let persisted_state = RouteState {
         version: state::SCHEMA_VERSION,
@@ -453,13 +611,82 @@ fn recover_clears_state_file_even_when_runner_errors() {
     };
     state::save(tmp.path(), &persisted_state, None).unwrap();
 
-    let failing =
-        |_: &[Vec<String>], _: &str| -> std::io::Result<()> { Err(std::io::Error::other("simulated runner failure")) };
-    recover_routes_with(tmp.path(), failing, |_, _| {}, false, || false, |_| {});
+    let failing = |_cmd: &[String], _phase: &str| -> std::io::Result<bool> {
+        Err(std::io::Error::other("simulated runner failure"))
+    };
+    recover_routes_with(tmp.path(), None, failing, |_, _| {}, false, || false, |_| {});
+
+    let remaining = state::load(tmp.path()).expect("a spawn failure on every command must keep the state file");
+    assert_eq!(
+        remaining.installed,
+        planned_routes(ipv4_server()),
+        "nothing could be confirmed gone, so every recorded route stays recorded"
+    );
+}
+
+#[skuld::test]
+fn recover_narrows_the_state_file_to_the_command_that_failed_to_spawn() {
+    let tmp = tempfile::tempdir().unwrap();
+    let persisted_state = RouteState {
+        version: state::SCHEMA_VERSION,
+        tun_name: "hole-tun".into(),
+        server_ip: ipv4_server(),
+        interface_name: "en0".into(),
+        installed: planned_routes(ipv4_server()),
+    };
+    state::save(tmp.path(), &persisted_state, None).unwrap();
+
+    let failing_one = |cmd: &[String], _phase: &str| -> std::io::Result<bool> {
+        if cmd.iter().any(|a| a == "::/1") {
+            Err(std::io::Error::other("simulated runner failure"))
+        } else {
+            Ok(true)
+        }
+    };
+    recover_routes_with(tmp.path(), None, failing_one, |_, _| {}, false, || false, |_| {});
+
+    let remaining = state::load(tmp.path()).expect("the unconfirmed route must stay recorded");
+    assert_eq!(
+        remaining.installed,
+        vec![RouteId::SplitV6Low],
+        "only the route whose delete failed to spawn should remain, got {:?}",
+        remaining.installed
+    );
+}
+
+/// Defensive: an `installed` id with no possible teardown command for the
+/// recorded `server_ip` (unreachable from any production writer — every
+/// writer keeps `installed` a subset of `planned_routes(server_ip)` — but
+/// reachable via a hand-edited file) can never be attempted, so it can never
+/// drain from `still_installed`. It must be dropped up front instead of
+/// pinning the state file open forever.
+#[skuld::test]
+fn recover_drops_an_unplannable_id_instead_of_looping_forever() {
+    let tmp = tempfile::tempdir().unwrap();
+    let loopback: IpAddr = "127.0.0.1".parse().unwrap();
+    let persisted_state = RouteState {
+        version: state::SCHEMA_VERSION,
+        tun_name: "hole-tun".into(),
+        server_ip: loopback,
+        interface_name: "en0".into(),
+        installed: vec![RouteId::ServerBypass], // unplannable: loopback never installs a bypass
+    };
+    state::save(tmp.path(), &persisted_state, None).unwrap();
+
+    let log: RefCell<Captured> = RefCell::new(Vec::new());
+    recover_routes_with(
+        tmp.path(),
+        None,
+        capturing_runner(&log),
+        |_, _| {},
+        false,
+        || false,
+        |_| {},
+    );
 
     assert!(
         !tmp.path().join(STATE_FILE_NAME).exists(),
-        "state file should be cleared even when runner returns Err"
+        "an unplannable id must not permanently pin the state file open"
     );
 }
 
@@ -472,6 +699,7 @@ fn recover_invokes_cover_sweep_even_without_route_state() {
     let swept = std::cell::Cell::new(false);
     recover_routes_with(
         tmp.path(),
+        None,
         capturing_runner(&log),
         |_, _| swept.set(true),
         false,
@@ -494,6 +722,7 @@ fn recover_sweeps_lockdown_when_intent_off_and_present() {
     let decided: std::cell::Cell<Option<CoverRecovery>> = std::cell::Cell::new(None);
     recover_routes_with(
         tmp.path(),
+        None,
         capturing_runner(&log),
         |_, _| {},
         false,
@@ -510,6 +739,7 @@ fn recover_adopts_lockdown_when_intent_on_and_present() {
     let decided: std::cell::Cell<Option<CoverRecovery>> = std::cell::Cell::new(None);
     recover_routes_with(
         tmp.path(),
+        None,
         capturing_runner(&log),
         |_, _| {},
         true,
@@ -527,6 +757,7 @@ fn recover_lockdown_noop_when_cover_absent() {
     // Probe says no cover present => Noop regardless of intent.
     recover_routes_with(
         tmp.path(),
+        None,
         capturing_runner(&log),
         |_, _| {},
         true,
@@ -546,7 +777,8 @@ fn recover_orders_lockdown_before_transient_sweep_and_passes_adopting() {
 
     recover_routes_with(
         dir.path(),
-        |_cmds, _phase| Ok(()),
+        None,
+        |_cmd, _phase| Ok(true),
         |_state_dir, adopting| {
             order.borrow_mut().push("sweep_cover");
             *adopting_seen.borrow_mut() = Some(adopting);
@@ -590,7 +822,8 @@ fn recover_passes_adopting_only_on_adopt() {
         let adopting_seen: RefCell<Option<bool>> = RefCell::new(None);
         recover_routes_with(
             dir.path(),
-            |_c, _p| Ok(()),
+            None,
+            |_c, _p| Ok(true),
             |_d, adopting| *adopting_seen.borrow_mut() = Some(adopting),
             intent,
             || present,
@@ -607,18 +840,11 @@ fn recover_passes_adopting_only_on_adopt() {
 // macOS teardown names no interface ===================================================================================
 //
 // Named for what is checked: the macOS delete argv carries no interface
-// operand at all. It is not that a qualifier is present and correct — no
-// qualifier CAN be correct. route(8)'s `-interface` sets only `iflag`
-// (`network_cmds/route.tproj/route.c`), and xnu resolves an `RTM_DELETE` from
-// the destination key and netmask alone, so the flag scopes nothing; worse,
-// with `iflag` set and a name that no longer resolves, `getaddr` exits before
-// `rtmsg()` writes to the routing socket, silently dropping the delete. The
-// utun is gone by the time either teardown path runs, so that is the ordinary
-// case, not an edge one.
-//
-// These assertions cannot show that a delete is scoped — nothing at this layer
-// can, since the argv never reaches route(8) here. Selectivity is asserted
-// where it actually lives, in the provenance tests below.
+// operand — no qualifier can be correct here, see [`RouteId`]'s doc and
+// CONTRIBUTING's Route ownership section. These assertions cannot show a
+// delete is SCOPED — nothing at this layer can, since the argv never reaches
+// route(8) here — only that it carries no such operand; selectivity is
+// asserted where it actually lives, in the provenance tests below.
 #[cfg(target_os = "macos")]
 mod macos_teardown_names_no_interface {
     use super::*;
@@ -766,22 +992,23 @@ fn recovery_deletes_only_the_recorded_routes() {
     .unwrap();
 
     let log: RefCell<Captured> = RefCell::new(Vec::new());
-    recover_routes_with(tmp.path(), capturing_runner(&log), |_, _| {}, false, || false, |_| {});
+    recover_routes_with(
+        tmp.path(),
+        None,
+        capturing_runner(&log),
+        |_, _| {},
+        false,
+        || false,
+        |_| {},
+    );
 
     let log = log.into_inner();
-    assert_eq!(log[0].0, PHASE_RECOVER_SPLIT);
-    assert_eq!(
-        log[0].1.len(),
-        1,
-        "expected one recorded split delete, got {:?}",
-        log[0].1
-    );
-    assert!(log[0].1[0].iter().any(|a| a == "::/1"), "wrong route: {:?}", log[0].1);
-    assert_eq!(
-        log[1].1.len(),
-        0,
-        "the bypass was never installed, so there is nothing to delete, got {:?}",
-        log[1].1
+    let split = commands_in_phase(&log, PHASE_RECOVER_SPLIT);
+    assert_eq!(split.len(), 1, "expected one recorded split delete, got {log:?}");
+    assert!(split[0].iter().any(|a| a == "::/1"), "wrong route: {split:?}");
+    assert!(
+        commands_in_phase(&log, PHASE_RECOVER_BYPASS).is_empty(),
+        "the bypass was never installed, so there is nothing to delete, got {log:?}"
     );
 }
 
@@ -804,22 +1031,207 @@ fn recovery_bypass_phase_does_not_repeat_the_split_deletes() {
     .unwrap();
 
     let log: RefCell<Captured> = RefCell::new(Vec::new());
-    recover_routes_with(tmp.path(), capturing_runner(&log), |_, _| {}, false, || false, |_| {});
+    recover_routes_with(
+        tmp.path(),
+        None,
+        capturing_runner(&log),
+        |_, _| {},
+        false,
+        || false,
+        |_| {},
+    );
 
     let log = log.into_inner();
+    let split = commands_in_phase(&log, PHASE_RECOVER_SPLIT);
+    let bypass = commands_in_phase(&log, PHASE_RECOVER_BYPASS);
+    assert_eq!(split.len(), 4, "split phase deletes the 4 splits, got {log:?}");
     assert_eq!(
-        log[0].1.len(),
-        4,
-        "split phase deletes the 4 splits, got {:?}",
-        log[0].1
-    );
-    assert_eq!(
-        log[1].1.len(),
+        bypass.len(),
         1,
-        "bypass phase deletes the bypass and nothing else, got {:?}",
-        log[1].1
+        "bypass phase deletes the bypass and nothing else, got {log:?}"
     );
-    assert!(mentions_addr(&log[1].1, "1.2.3.4"), "got {:?}", log[1].1);
+    assert!(mentions_addr(&bypass, "1.2.3.4"), "got {bypass:?}");
+}
+
+// Per-command checkpoint producer =====================================================================================
+//
+// The tests above validate the CONSUMER half: handed a finished `installed`
+// list, teardown deletes only what it names. These validate the PRODUCER
+// half — the code that builds that list one command at a time — by driving
+// `setup_routes`/`run_teardown_commands` directly with a scripted runner
+// (never the real `netsh`/`route`, matching the #165 test-isolation
+// contract every other test in this file already relies on).
+
+#[skuld::test]
+fn setup_routes_pops_a_route_the_runner_reports_not_installed() {
+    let mut installed = Vec::new();
+    #[allow(clippy::disallowed_methods)]
+    // exercising the checkpoint loop directly, with a scripted runner — no real netsh/route
+    let result = setup_routes(
+        "utun7",
+        ipv4_server(),
+        ipv4_gateway(),
+        "en0",
+        &mut installed,
+        |argv| Ok(!argv.iter().any(|a| a == "128.0.0.0/1")),
+        |_ids| Ok(()),
+    );
+    assert!(result.is_ok());
+    assert!(
+        !installed.contains(&RouteId::SplitV4High),
+        "a route the runner reported not-installed must not be recorded: {installed:?}"
+    );
+    assert_eq!(installed.len(), 4, "the other 4 routes still install: {installed:?}");
+}
+
+/// Proves the fix for the rollback hazard the panel found in the first
+/// version of this redesign: a command whose spawn failed must not be
+/// rolled back (nothing to roll back — it never ran), while the on-disk
+/// checkpoint from just before the failed spawn is left naming it anyway —
+/// the accepted superset-of-one.
+#[skuld::test]
+fn setup_routes_excludes_a_spawn_failure_from_installed_but_not_from_the_last_checkpoint() {
+    let mut installed = Vec::new();
+    let checkpoints: RefCell<Vec<Vec<RouteId>>> = RefCell::new(Vec::new());
+    #[allow(clippy::disallowed_methods)]
+    // exercising the checkpoint loop directly, with a scripted runner — no real netsh/route
+    let result = setup_routes(
+        "utun7",
+        ipv4_server(),
+        ipv4_gateway(),
+        "en0",
+        &mut installed,
+        |argv| {
+            if argv.iter().any(|a| a == "::/1") {
+                Err(std::io::Error::other("simulated spawn failure"))
+            } else {
+                Ok(true)
+            }
+        },
+        |ids| {
+            checkpoints.borrow_mut().push(ids.to_vec());
+            Ok(())
+        },
+    );
+    assert!(result.is_err());
+    assert_eq!(
+        installed,
+        vec![RouteId::SplitV4Low, RouteId::SplitV4High],
+        "a command that never spawned must not be rolled back: {installed:?}"
+    );
+    let last_checkpoint = checkpoints.into_inner().pop().unwrap();
+    assert_eq!(
+        last_checkpoint,
+        vec![RouteId::SplitV4Low, RouteId::SplitV4High, RouteId::SplitV6Low],
+        "the on-disk checkpoint from just before the failed spawn must still name the \
+         speculative id — that's the accepted superset-of-one, got {last_checkpoint:?}"
+    );
+}
+
+/// A pre-command checkpoint failure must abort setup — this codebase must
+/// not run a mutation it failed to record first — and the never-durably-
+/// recorded id must not be rolled back either, same as a runner spawn
+/// failure.
+#[skuld::test]
+fn setup_routes_aborts_when_a_pre_command_checkpoint_fails() {
+    let mut installed = Vec::new();
+    let mut checkpoint_calls = 0u32;
+    #[allow(clippy::disallowed_methods)]
+    // exercising the checkpoint loop directly, with a scripted runner — no real netsh/route
+    let result = setup_routes(
+        "utun7",
+        ipv4_server(),
+        ipv4_gateway(),
+        "en0",
+        &mut installed,
+        |_argv| Ok(true),
+        |_ids| {
+            checkpoint_calls += 1;
+            // Fail the pre-command checkpoint of the 2nd command (call
+            // sequence: cmd1 pre, cmd1 post, cmd2 pre, ...).
+            if checkpoint_calls == 3 {
+                Err(std::io::Error::other("simulated checkpoint failure"))
+            } else {
+                Ok(())
+            }
+        },
+    );
+    assert!(
+        result.is_err(),
+        "a pre-command checkpoint failure must abort setup, not be swallowed"
+    );
+    assert_eq!(
+        installed,
+        vec![RouteId::SplitV4Low],
+        "only the first route's runner ran before the abort: {installed:?}"
+    );
+}
+
+#[skuld::test]
+fn run_teardown_commands_keeps_an_id_whose_delete_fails_to_spawn() {
+    let cmds = platform_split_teardown_commands("utun7");
+    let mut still_installed = SPLIT_ROUTES.to_vec();
+    run_teardown_commands(
+        &cmds,
+        PHASE_TEARDOWN,
+        &mut still_installed,
+        |argv, _phase| {
+            if argv.iter().any(|a| a == "::/1") {
+                Err(std::io::Error::other("simulated spawn failure"))
+            } else {
+                Ok(true)
+            }
+        },
+        |_ids| {},
+    );
+    assert_eq!(
+        still_installed,
+        vec![RouteId::SplitV6Low],
+        "only the id whose delete failed to spawn should remain, got {still_installed:?}"
+    );
+}
+
+/// A command that spawns but reports the route is NOT confirmed gone (a
+/// genuine macOS in-kernel delete failure, not "already absent") must also
+/// stay recorded — the finding the panel raised against the first version of
+/// this redesign, which discarded that oracle in teardown.
+#[skuld::test]
+fn run_teardown_commands_keeps_an_id_the_runner_says_is_not_confirmed_gone() {
+    let cmds = platform_split_teardown_commands("utun7");
+    let mut still_installed = SPLIT_ROUTES.to_vec();
+    run_teardown_commands(
+        &cmds,
+        PHASE_TEARDOWN,
+        &mut still_installed,
+        |argv, _phase| Ok(!argv.iter().any(|a| a == "0.0.0.0/1")),
+        |_ids| {},
+    );
+    assert_eq!(
+        still_installed,
+        vec![RouteId::SplitV4Low],
+        "a delete the runner did not confirm gone must stay recorded, got {still_installed:?}"
+    );
+}
+
+#[skuld::test]
+fn run_teardown_commands_checkpoints_after_every_command() {
+    let cmds = platform_split_teardown_commands("utun7");
+    let mut still_installed = SPLIT_ROUTES.to_vec();
+    let checkpoints: RefCell<Vec<Vec<RouteId>>> = RefCell::new(Vec::new());
+    run_teardown_commands(
+        &cmds,
+        PHASE_TEARDOWN,
+        &mut still_installed,
+        |_argv, _phase| Ok(true),
+        |ids| checkpoints.borrow_mut().push(ids.to_vec()),
+    );
+    let checkpoints = checkpoints.into_inner();
+    assert_eq!(checkpoints.len(), 4, "one checkpoint per command, got {checkpoints:?}");
+    assert_eq!(
+        checkpoints.last(),
+        Some(&Vec::new()),
+        "the last checkpoint must reflect every command having drained, got {checkpoints:?}"
+    );
 }
 
 // decide_cover_recovery ===============================================================================================
