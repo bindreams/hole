@@ -21,6 +21,8 @@
 mod config;
 mod dns;
 mod driver;
+mod emit;
+mod parse;
 mod router;
 mod tcp_flow;
 mod udp_flow;
