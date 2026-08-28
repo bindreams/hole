@@ -11,17 +11,23 @@
 //! [`refuse`](SocketStack::refuse) turns the same socket into an RST.
 //!
 //! A 4-tuple has one owner. Slot order can put a re-armed listener below its own
-//! connection, where it takes that client's retransmitted SYN, so
-//! [`take_handshakes`](SocketStack::take_handshakes) reports the second socket
-//! for a tuple as `Duplicate` rather than as a new connection.
+//! connection, where it takes that client's retransmitted SYN;
+//! [`take_handshakes`](SocketStack::take_handshakes) tells that retransmit apart
+//! from a *new* connection reusing the tuple (RFC 9293 §3.10.7.4) by ISN: same
+//! ISN as the owner reports `Duplicate` and is dropped silently, a different
+//! ISN reports `Pending` with `supersedes` set to the stale owner.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 
 use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
+use smoltcp::phy::ChecksumCapabilities;
 use smoltcp::socket::tcp;
 use smoltcp::time::{Duration as SmoltcpDuration, Instant as SmoltcpInstant};
-use smoltcp::wire::{HardwareAddress, IpAddress, IpCidr, IpEndpoint};
+use smoltcp::wire::{
+    HardwareAddress, IpAddress, IpCidr, IpEndpoint, Ipv4Packet, Ipv4Repr, Ipv6Packet, Ipv6Repr, TcpControl, TcpPacket,
+    TcpRepr,
+};
 use tracing::warn;
 
 pub(crate) use super::admission::Handshake;
@@ -44,6 +50,15 @@ pub(crate) struct SocketStack {
     /// Sockets the datapath is done with, held in the set until smoltcp is
     /// finished with their peer.
     retiring: Vec<SocketHandle>,
+    /// The ISN each live connection was admitted with, keyed by handle. What
+    /// [`take_handshakes`](Self::take_handshakes) compares a same-tuple SYN's
+    /// ISN against to tell a retransmit from a new connection.
+    owner_isn: HashMap<SocketHandle, u32>,
+    /// The 4-tuple and ISN of the SYN most recently handed to
+    /// [`enqueue_rx`](Self::enqueue_rx), if it was one. Consulted by the
+    /// `poll` that immediately follows — never stale, because a caller never
+    /// enqueues a second packet before that poll (`Driver::settle_packet`).
+    pending_syn: Option<(SocketAddr, SocketAddr, u32)>,
     tcp_rx_buf_size: usize,
     tcp_tx_buf_size: usize,
     keep_alive_interval: SmoltcpDuration,
@@ -73,6 +88,8 @@ impl SocketStack {
             listeners: Vec::new(),
             listened_ports: HashSet::new(),
             retiring: Vec::new(),
+            owner_isn: HashMap::new(),
+            pending_syn: None,
             tcp_rx_buf_size: config.tcp_rx_buf_size,
             tcp_tx_buf_size: config.tcp_tx_buf_size,
             keep_alive_interval: SmoltcpDuration::from(config.tcp_keep_alive_interval),
@@ -81,7 +98,12 @@ impl SocketStack {
     }
 
     /// Hand smoltcp a packet read from the real TUN device.
+    ///
+    /// If the packet is a SYN, its 4-tuple and ISN are captured here — off the
+    /// wire, since smoltcp exposes no ISN accessor — for the `take_handshakes`
+    /// call that follows the next `poll`.
     pub(crate) fn enqueue_rx(&mut self, packet: Vec<u8>) {
+        self.pending_syn = parse_syn(&packet);
         self.device.enqueue_rx(packet);
     }
 
@@ -104,6 +126,7 @@ impl SocketStack {
                 return true;
             }
             self.sockets.remove(handle);
+            self.owner_isn.remove(&handle);
             false
         });
         self.retiring = retiring;
@@ -126,19 +149,21 @@ impl SocketStack {
         self.listened_ports.insert(port);
     }
 
-    /// Whether a socket other than `handle` already holds the 4-tuple
-    /// `local`/`remote`.
+    /// The handle of a socket other than `handle` that already holds the
+    /// 4-tuple `local`/`remote`, if any.
     ///
     /// Only a listener can pick up a packet whose tuple is already taken:
     /// smoltcp matches a connected socket on the full 4-tuple, but a `Listen`
     /// socket matches a bare SYN on the local port alone, and it is reached
     /// first whenever it sits in a lower slot.
-    fn tuple_is_taken(&self, handle: SocketHandle, local: IpEndpoint, remote: IpEndpoint) -> bool {
-        self.sockets.iter().any(|(other, socket)| {
+    fn tuple_owner(&self, handle: SocketHandle, local: IpEndpoint, remote: IpEndpoint) -> Option<SocketHandle> {
+        self.sockets.iter().find_map(|(other, socket)| {
             let smoltcp::socket::Socket::Tcp(socket) = socket else {
-                return false;
+                return None;
             };
-            other != handle && socket.local_endpoint() == Some(local) && socket.remote_endpoint() == Some(remote)
+            let holds =
+                other != handle && socket.local_endpoint() == Some(local) && socket.remote_endpoint() == Some(remote);
+            holds.then_some(other)
         })
     }
 
@@ -158,17 +183,55 @@ impl SocketStack {
             self.listened_ports.remove(&port);
 
             let socket = self.sockets.get::<tcp::Socket>(handle);
-            handshakes.push(match (socket.local_endpoint(), socket.remote_endpoint()) {
-                (Some(local), Some(remote)) if self.tuple_is_taken(handle, local, remote) => {
+            let (local, remote) = (
+                socket
+                    .local_endpoint()
+                    .expect("a SYN that left Listen always sets a tuple (smoltcp sets it in the same match arm)"),
+                socket
+                    .remote_endpoint()
+                    .expect("a SYN that left Listen always sets a tuple (smoltcp sets it in the same match arm)"),
+            );
+            let src = SocketAddr::new(smoltcp_to_std_ip(remote.addr), remote.port);
+            let dst = SocketAddr::new(smoltcp_to_std_ip(local.addr), local.port);
+
+            let owner = self.tuple_owner(handle, local, remote);
+            let observed_isn = self
+                .pending_syn
+                .filter(|&(s, d, _)| (s, d) == (src, dst))
+                .map(|(.., isn)| isn);
+
+            handshakes.push(match owner {
+                // A tuple's owner is duplicated whenever this SYN's ISN cannot
+                // be told apart from the owner's — either it genuinely matches,
+                // or it could not be read off the wire, in which case falling
+                // back to the historically-safe `Duplicate` means a parsing gap
+                // can never mint a spurious connection.
+                Some(owner) if observed_isn.is_none() || observed_isn == self.owner_isn.get(&owner).copied() => {
                     Handshake::Duplicate { handle, port }
                 }
-                (Some(local), Some(remote)) => Handshake::Pending {
-                    handle,
-                    port,
-                    src: SocketAddr::new(smoltcp_to_std_ip(remote.addr), remote.port),
-                    dst: SocketAddr::new(smoltcp_to_std_ip(local.addr), local.port),
-                },
-                _ => Handshake::Stale { handle, port },
+                Some(owner) => {
+                    self.owner_isn
+                        .insert(handle, observed_isn.expect("the guard above rules out None"));
+                    Handshake::Pending {
+                        handle,
+                        port,
+                        src,
+                        dst,
+                        supersedes: Some(owner),
+                    }
+                }
+                None => {
+                    if let Some(isn) = observed_isn {
+                        self.owner_isn.insert(handle, isn);
+                    }
+                    Handshake::Pending {
+                        handle,
+                        port,
+                        src,
+                        dst,
+                        supersedes: None,
+                    }
+                }
             });
         }
         handshakes
@@ -198,19 +261,6 @@ impl SocketStack {
         self.ensure_listener(port);
     }
 
-    /// Drop a handshake with no peer left to answer, and re-arm the port.
-    /// smoltcp has already cleared the 4-tuple, so there is no address to
-    /// answer and nothing pending — the socket goes straight out of the set.
-    pub(crate) fn discard(&mut self, handle: SocketHandle, port: u16) {
-        debug_assert_eq!(
-            self.sockets.get::<tcp::Socket>(handle).state(),
-            tcp::State::Closed,
-            "every path that clears a non-listening socket's tuple leaves it Closed",
-        );
-        self.sockets.remove(handle);
-        self.ensure_listener(port);
-    }
-
     /// Drop a second socket for a 4-tuple another socket already owns, and
     /// re-arm the port.
     ///
@@ -237,6 +287,7 @@ impl SocketStack {
     /// Drop a socket now, without waiting for smoltcp to finish with its peer.
     pub(crate) fn remove(&mut self, handle: SocketHandle) {
         self.sockets.remove(handle);
+        self.owner_isn.remove(&handle);
     }
 
     pub(crate) fn socket(&self, handle: SocketHandle) -> &tcp::Socket<'static> {
@@ -288,7 +339,7 @@ pub(crate) enum Disposal {
 /// `TimeWait` is removed at once instead. Retiring it would hold the socket,
 /// and both its buffers, for smoltcp's 10 s `CLOSE_DELAY` — the tuple survives
 /// until the close timer fires. Trading that retention for the ACK the socket
-/// still owes its peer is bindreams/hole#909, and is not decided here.
+/// still owes its peer is not decided here.
 pub(crate) fn decide_disposal(state: tcp::State) -> Option<Disposal> {
     match state {
         tcp::State::Closed | tcp::State::Listen => Some(Disposal::Retire),
@@ -302,6 +353,55 @@ fn smoltcp_to_std_ip(addr: IpAddress) -> IpAddr {
         IpAddress::Ipv4(v4) => IpAddr::V4(v4),
         IpAddress::Ipv6(v6) => IpAddr::V6(v6),
     }
+}
+
+/// The 4-tuple and ISN of `packet`, if it is a bare SYN (no ACK).
+///
+/// Parsed with smoltcp's own wire types — the same parser `Interface::poll`
+/// uses internally — so a packet this recognizes as a SYN is exactly a packet
+/// smoltcp recognizes as one, and a checksum or structural mismatch that would
+/// make smoltcp reject the packet makes this return `None` too, rather than
+/// disagreeing with it.
+fn parse_syn(packet: &[u8]) -> Option<(SocketAddr, SocketAddr, u32)> {
+    let checksums = ChecksumCapabilities::default();
+    let (src_ip, dst_ip, tcp_repr) = match packet.first()? >> 4 {
+        4 => {
+            let ip_packet = Ipv4Packet::new_checked(packet).ok()?;
+            let ip_repr = Ipv4Repr::parse(&ip_packet, &checksums).ok()?;
+            let tcp_packet = TcpPacket::new_checked(ip_packet.payload()).ok()?;
+            let tcp_repr = TcpRepr::parse(
+                &tcp_packet,
+                &IpAddress::Ipv4(ip_repr.src_addr),
+                &IpAddress::Ipv4(ip_repr.dst_addr),
+                &checksums,
+            )
+            .ok()?;
+            (IpAddr::V4(ip_repr.src_addr), IpAddr::V4(ip_repr.dst_addr), tcp_repr)
+        }
+        6 => {
+            let ip_packet = Ipv6Packet::new_checked(packet).ok()?;
+            let ip_repr = Ipv6Repr::parse(&ip_packet).ok()?;
+            let tcp_packet = TcpPacket::new_checked(ip_packet.payload()).ok()?;
+            let tcp_repr = TcpRepr::parse(
+                &tcp_packet,
+                &IpAddress::Ipv6(ip_repr.src_addr),
+                &IpAddress::Ipv6(ip_repr.dst_addr),
+                &checksums,
+            )
+            .ok()?;
+            (IpAddr::V6(ip_repr.src_addr), IpAddr::V6(ip_repr.dst_addr), tcp_repr)
+        }
+        _ => return None,
+    };
+
+    if tcp_repr.control != TcpControl::Syn || tcp_repr.ack_number.is_some() {
+        return None;
+    }
+    Some((
+        SocketAddr::new(src_ip, tcp_repr.src_port),
+        SocketAddr::new(dst_ip, tcp_repr.dst_port),
+        tcp_repr.seq_number.0 as u32,
+    ))
 }
 
 #[cfg(test)]

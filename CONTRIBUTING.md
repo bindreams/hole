@@ -76,22 +76,38 @@ once `remote_endpoint()` goes `None`, smoltcp's signal that it has emitted the
 socket's last packet. `decide_disposal` picks the path per state — `Closed` and
 `Listen` retire, while `TimeWait` is dropped at once, since retiring it would
 hold the socket and both its buffers for smoltcp's 10 s `CLOSE_DELAY`. A
-handshake with no peer left is discarded without a packet, because smoltcp has
-already cleared the 4-tuple and has no address to answer. A connection socket
-that reverts to `Listen` — the client answered the SYN-ACK with an RST — is
-retired through that same list, so it cannot shadow the live listener on its
-port.
+connection socket that reverts to `Listen` — the client answered the SYN-ACK
+with an RST — is retired through that same list, so it cannot shadow the live
+listener on its port.
+
+Retiring a socket only marks it; reaping — the `SocketSet::remove` that actually
+frees its slot — happens inside the next `poll`. A socket marked but not yet
+reaped is still live and still bound to its port, so a SYN that arrives before
+that `poll` can be handed to it instead of to the real listener, and no accept
+path is watching it (bindreams/hole#911).
+[`Driver::settle_packet`](crates/tun-engine/src/engine/driver.rs) is the one
+production entry point for a TUN packet and closes that gap structurally rather
+than by convention: enqueue, both polls, admission dispatch and retirement all
+happen inside one call, so two packets' verdicts can never straddle a `poll` no
+matter how `run()`'s TUN-read cadence changes.
 
 Ownership of a 4-tuple is exclusive, and `take_handshakes` enforces it. Re-arming
 a port hands the listener whichever socket slot is lowest and free, which can put
 it *below* the connection it was just re-armed for; smoltcp gives a packet to the
 first socket that accepts it, and a `Listen` socket accepts a bare SYN on the
-local port alone. A client's retransmitted SYN can therefore land on the
-replacement listener rather than on its own connection. That handshake is
-classified `Duplicate` and its socket dropped without a segment — no second
-permit, no second router task. It leaves silently on purpose: an RST from it
-acknowledges the client's SYN, which a client in SYN-SENT must accept, and would
-kill the very connection it is retransmitting for.
+local port alone. A SYN can therefore land on the replacement listener rather
+than on its own connection — and tuple equality alone does not say whether it is
+that connection's retransmit or a new connection reusing the tuple (a client
+that lost its own TCP state while the datapath's persists: reboot, sleep-resume,
+a recycled ephemeral port). `take_handshakes` tells them apart by ISN, read off
+the wire since smoltcp exposes none: the same ISN as the tuple's owner is
+`Duplicate` and its socket is dropped without a segment — no second permit, no
+second router task, and no RST, since one would acknowledge the client's SYN,
+which it must accept while in SYN-SENT, and so would kill the very connection it
+is retransmitting for. A different ISN reports `Pending` with `supersedes` set
+to the stale owner (RFC 9293 §3.10.7.4); the driver tears that owner down —
+closing its channels, removing its socket — before admitting or refusing the new
+SYN in its place.
 
 An admitted connection also gets a keep-alive interval and a timeout
 (`tcp_keep_alive_interval`, `tcp_peer_timeout`). They bound an external event —

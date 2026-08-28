@@ -123,6 +123,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Driver<T> {
                 _ = poll_interval.tick() => None,
             };
 
+            let mut settle: Option<Vec<u8>> = None;
             if let Some(read_result) = read_result {
                 match read_result {
                     Ok(0) => {
@@ -134,12 +135,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Driver<T> {
                         let consumed = self.handle_udp_packet(packet).await;
 
                         if !consumed {
-                            if let Some((dst_port, proto)) = parse_ip_dst(packet) {
-                                if proto == IpProto::Tcp {
-                                    self.stack.ensure_listener(dst_port);
-                                }
-                            }
-                            self.stack.enqueue_rx(packet.to_vec());
+                            settle = Some(packet.to_vec());
                         }
                     }
                     Err(e) => {
@@ -149,13 +145,10 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Driver<T> {
                 }
             }
 
-            // Phase 2: poll smoltcp.
-            self.poll_smoltcp();
-            self.accept_tcp_connections();
-            self.relay_tcp_data();
-            self.cleanup_finished_connections();
+            // Phase 2: settle the packet (if any) and flush what it produced.
+            let now = self.smoltcp_now();
+            self.settle_packet(settle.as_deref(), now);
             self.process_udp_replies();
-            self.poll_smoltcp();
             self.flush_to_tun().await;
 
             if self.last_sweep.elapsed() >= self.config.idle_sweep_interval {
@@ -182,8 +175,27 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Driver<T> {
         SmoltcpInstant::from_millis(elapsed.as_millis() as i64)
     }
 
-    fn poll_smoltcp(&mut self) {
-        let now = self.smoltcp_now();
+    /// Feed at most one packet through smoltcp and settle every consequence of
+    /// it — TCP admission, data relay, and retirement — before returning.
+    ///
+    /// Two packets' verdicts must never straddle one `poll()`: a socket
+    /// mid-retirement, still bound to its port, would intercept the next SYN
+    /// with no accept path able to see it
+    /// (`a_reverted_socket_would_hijack_a_later_syn`). Bundling enqueue, both
+    /// polls, admission, relay and retirement into one call with no seam
+    /// between them makes that impossible regardless of how many packets a
+    /// future `run()` reads per iteration.
+    fn settle_packet(&mut self, packet: Option<&[u8]>, now: SmoltcpInstant) {
+        if let Some(packet) = packet {
+            if let Some((dst_port, IpProto::Tcp)) = parse_ip_dst(packet) {
+                self.stack.ensure_listener(dst_port);
+            }
+            self.stack.enqueue_rx(packet.to_vec());
+        }
+        self.stack.poll(now);
+        self.accept_tcp_connections();
+        self.relay_tcp_data();
+        self.cleanup_finished_connections();
         self.stack.poll(now);
     }
 
@@ -194,20 +206,25 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Driver<T> {
             let semaphore = Arc::clone(&self.conn_semaphore);
             let verdict = decide_admission(&handshake, move || semaphore.try_acquire_owned().ok());
 
-            let (handle, port, peer) = match handshake {
-                Handshake::Pending { handle, port, src, dst } => (handle, port, Some((src, dst))),
-                // A contract branch: `take_handshakes` classifies on an Option
-                // pair the type system does not narrow. Neither verdict answers
-                // its socket, so neither needs an address.
-                Handshake::Stale { handle, port } | Handshake::Duplicate { handle, port } => (handle, port, None),
+            let (handle, port, peer, supersedes) = match handshake {
+                Handshake::Pending {
+                    handle,
+                    port,
+                    src,
+                    dst,
+                    supersedes,
+                } => (handle, port, Some((src, dst)), supersedes),
+                // A duplicate answers no socket, so it needs no address.
+                Handshake::Duplicate { handle, port } => (handle, port, None, None),
             };
 
+            if let Some(stale) = supersedes {
+                warn!("new SYN on port {port} carries an ISN its tuple's owner never sent; the stale connection is torn down");
+                self.connections.remove(&stale);
+                self.stack.remove(stale);
+            }
+
             let permit = match verdict {
-                Admission::Discard => {
-                    warn!("accepted TCP connection with no endpoint on port {port}");
-                    self.stack.discard(handle, port);
-                    continue;
-                }
                 Admission::Duplicate => {
                     debug!("retransmitted SYN for a connection already owned on port {port}");
                     self.stack.drop_duplicate(handle, port);
