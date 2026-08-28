@@ -293,7 +293,7 @@ impl Routing for MockRouting {
         &self,
         tun_name: &str,
         server_ip: IpAddr,
-        _gateway: IpAddr,
+        gateway: IpAddr,
         interface_name: &str,
     ) -> Result<MockRoutes, RoutingError> {
         self.state.install_calls.fetch_add(1, Ordering::SeqCst);
@@ -304,8 +304,10 @@ impl Routing for MockRouting {
         // records the failed id, matching `SystemRouting::install`'s
         // per-command checkpointing.
         let fail_routes_for = self.state.fail_routes_for.lock().unwrap();
-        let installed: Vec<RouteId> = routing::planned_routes(server_ip)
-            .into_iter()
+        let planned = routing::planned_routes(server_ip);
+        let installed: Vec<RouteId> = planned
+            .iter()
+            .copied()
             .filter(|id| !fail_routes_for.contains(id))
             .collect();
         drop(fail_routes_for);
@@ -319,7 +321,9 @@ impl Routing for MockRouting {
             tun_name: tun_name.to_owned(),
             server_ip,
             interface_name: interface_name.to_owned(),
+            original_gateway: Some(gateway),
             installed: installed.clone(),
+            stale: Vec::new(),
         };
         route_state::save(&self.state_dir, &persisted, None)
             .map_err(|e| RoutingError::RouteSetup(format!("mock persist failed: {e}")))?;
@@ -329,6 +333,19 @@ impl Routing for MockRouting {
             // clear the stale file we just wrote.
             let _ = route_state::clear(&self.state_dir);
             return Err(RoutingError::RouteSetup("mock install failure".into()));
+        }
+
+        if installed.len() != planned.len() {
+            // Mirror `SystemRouting::install`'s fail-closed contract: a
+            // narrowed `installed` is never returned as `Ok` — a degraded
+            // tunnel is worse than no tunnel (Rule #0). Roll back (clear the
+            // file we just wrote) and fail closed instead.
+            let _ = route_state::clear(&self.state_dir);
+            return Err(RoutingError::RouteSetup(format!(
+                "route install incomplete: {}/{} routes confirmed",
+                installed.len(),
+                planned.len()
+            )));
         }
 
         Ok(MockRoutes {
@@ -1421,54 +1438,41 @@ fn route_failure_clears_stale_state_file() {
 }
 
 /// A partial route failure (another VPN already holds one of the split
-/// prefixes) must both persist and later tear down only the narrowed
-/// subset — never the full planned set, and never the failed
-/// id. Exercises `ProxyManager`'s consumption of `Routing::install`'s
-/// narrowed `installed`, via `MockRouting::failing_routes`.
+/// prefixes) must fail the whole `start` closed, not return a degraded
+/// tunnel — `SystemRouting::install` treats a narrowed `installed` as a
+/// hard error and rolls back (Rule #0: a user who believes traffic is
+/// captured when some of it is not is worse off than one told Hole failed
+/// to connect). `MockRouting::failing_routes` mirrors that contract.
 #[skuld::test]
-fn partial_route_failure_narrows_teardown_to_the_installed_subset() {
+fn partial_route_failure_fails_closed_and_clears_state() {
     rt().block_on(async {
         let proxy = MockProxy::new();
         let dir = tempfile::tempdir().unwrap();
+        let state_path = dir.path().join(route_state::STATE_FILE_NAME);
         let routing = MockRouting::failing_routes(dir.path().to_path_buf(), [routing::RouteId::SplitV4Low]);
         let routing_state = routing.state();
 
-        let (mut pm, test_dir) = new_manager_with_routing(proxy, routing, dir);
+        let (mut pm, _dir) = new_manager_with_routing(proxy, routing, dir);
         // A non-loopback server so `planned_routes` includes the bypass —
         // `test_config()`'s default `127.0.0.1` would not.
         let mut config = test_config();
         config.server.server = "9.9.9.9".into();
-        pm.start(&config).await.unwrap();
 
-        let persisted = route_state::load(test_dir.path()).expect("install must persist a state file while running");
-        assert!(
-            !persisted.installed.contains(&RouteId::SplitV4Low),
-            "the failed route must not be recorded as installed: {:?}",
-            persisted.installed
-        );
+        let err = pm.start(&config).await.unwrap_err();
+        assert!(err.to_string().contains("route install incomplete"), "got: {err}");
+
         assert_eq!(
-            persisted.installed.len(),
-            4,
-            "the other 3 splits plus the bypass still install: {:?}",
-            persisted.installed
+            pm.state(),
+            ProxyState::Stopped,
+            "a failed-closed install must leave the manager idle, not holding a degraded guard"
         );
-
-        pm.stop().await.unwrap();
-
-        let torn_down = routing_state
-            .last_teardown_installed
-            .lock()
-            .unwrap()
-            .clone()
-            .expect("MockRoutes::drop must run on stop");
         assert!(
-            !torn_down.contains(&RouteId::SplitV4Low),
-            "teardown must never target a route that was never installed: {torn_down:?}"
+            !state_path.exists(),
+            "a partial install must roll back and clear the state file, not leak a narrowed record"
         );
-        assert_eq!(
-            torn_down.len(),
-            4,
-            "teardown must cover exactly the narrowed subset: {torn_down:?}"
+        assert!(
+            routing_state.last_teardown_installed.lock().unwrap().is_none(),
+            "no guard was ever handed out, so MockRoutes::drop must never have run"
         );
     });
 }

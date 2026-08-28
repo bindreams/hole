@@ -180,7 +180,7 @@ impl Routing for MockRouting {
         &self,
         tun_name: &str,
         server_ip: IpAddr,
-        _gateway: IpAddr,
+        gateway: IpAddr,
         interface_name: &str,
     ) -> Result<MockRoutes, RoutingError> {
         // Match SystemRouting ordering: write the state file BEFORE
@@ -191,7 +191,9 @@ impl Routing for MockRouting {
             tun_name: tun_name.to_owned(),
             server_ip,
             interface_name: interface_name.to_owned(),
+            original_gateway: Some(gateway),
             installed: routing::planned_routes(server_ip),
+            stale: Vec::new(),
         };
         route_state::save(&self.state_dir, &persisted, None)
             .map_err(|e| RoutingError::RouteSetup(format!("mock persist failed: {e}")))?;

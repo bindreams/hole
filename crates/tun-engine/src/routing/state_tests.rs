@@ -9,7 +9,9 @@ fn sample_ipv4() -> RouteState {
         tun_name: "hole-tun".into(),
         server_ip,
         interface_name: "en0".into(),
+        original_gateway: Some(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1))),
         installed: planned_routes(server_ip),
+        stale: Vec::new(),
     }
 }
 
@@ -20,7 +22,26 @@ fn sample_ipv6() -> RouteState {
         tun_name: "hole-tun".into(),
         server_ip,
         interface_name: "Wi-Fi".into(),
+        original_gateway: None,
         installed: vec![RouteId::SplitV6Low],
+        stale: Vec::new(),
+    }
+}
+
+/// A record carrying a stale group from an earlier, still-unswept session —
+/// the schema-3 shape [`load_v1_migrates_to_the_full_planned_set`] and
+/// friends never exercise.
+fn sample_ipv4_with_stale() -> RouteState {
+    let stale_server_ip = IpAddr::V4(Ipv4Addr::new(9, 9, 9, 9));
+    RouteState {
+        stale: vec![StaleRecord {
+            tun_name: "hole-tun".into(),
+            server_ip: stale_server_ip,
+            interface_name: "en1".into(),
+            original_gateway: Some(IpAddr::V4(Ipv4Addr::new(9, 9, 9, 1))),
+            installed: vec![RouteId::ServerBypass],
+        }],
+        ..sample_ipv4()
     }
 }
 
@@ -37,6 +58,15 @@ fn save_then_load_roundtrip_ipv4() {
 fn save_then_load_roundtrip_ipv6() {
     let dir = tempfile::tempdir().unwrap();
     let state = sample_ipv6();
+    save(dir.path(), &state, None).unwrap();
+    let loaded = load(dir.path()).unwrap();
+    assert_eq!(loaded, state);
+}
+
+#[skuld::test]
+fn save_then_load_roundtrip_with_stale_groups() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = sample_ipv4_with_stale();
     save(dir.path(), &state, None).unwrap();
     let loaded = load(dir.path()).unwrap();
     assert_eq!(loaded, state);
@@ -76,7 +106,9 @@ fn load_unknown_field_returns_none() {
         "tun_name": "hole-tun",
         "server_ip": "203.0.113.1",
         "interface_name": "en0",
+        "original_gateway": null,
         "installed": ["split-v4-low"],
+        "stale": [],
         "extra_field": "should be rejected",
     });
     std::fs::write(dir.path().join(STATE_FILE_NAME), json.to_string()).unwrap();
@@ -132,6 +164,51 @@ fn load_v1_migrates_to_the_full_planned_set() {
         planned_routes(loaded.server_ip),
         "v1 had no provenance and deleted every planned route; the migration must delete the same set"
     );
+    assert_eq!(loaded.original_gateway, None, "v1 never persisted a gateway");
+    assert_eq!(loaded.stale, Vec::new(), "v1 had no stale-group concept");
+}
+
+#[skuld::test]
+fn load_v2_migrates_preserving_installed_and_leaving_gateway_unknown() {
+    let dir = tempfile::tempdir().unwrap();
+    let json = serde_json::json!({
+        "version": 2,
+        "tun_name": "hole-tun",
+        "server_ip": "203.0.113.1",
+        "interface_name": "en0",
+        "installed": ["split-v4-low", "server-bypass"],
+    });
+    std::fs::write(dir.path().join(STATE_FILE_NAME), json.to_string()).unwrap();
+
+    let loaded = load(dir.path()).expect("a v2 file must still drive recovery, not be discarded");
+    assert_eq!(loaded.version, SCHEMA_VERSION);
+    assert_eq!(loaded.tun_name, "hole-tun");
+    assert_eq!(loaded.interface_name, "en0");
+    assert_eq!(
+        loaded.installed,
+        vec![RouteId::SplitV4Low, RouteId::ServerBypass],
+        "v2 DID have provenance — unlike v1, the migration must preserve it exactly, not widen to the full planned set"
+    );
+    assert_eq!(
+        loaded.original_gateway, None,
+        "v2 never persisted a gateway — the migrated record falls back to an unscoped delete"
+    );
+    assert_eq!(loaded.stale, Vec::new(), "v2 had no stale-group concept");
+}
+
+#[skuld::test]
+fn load_v2_with_unknown_field_returns_none() {
+    let dir = tempfile::tempdir().unwrap();
+    let json = serde_json::json!({
+        "version": 2,
+        "tun_name": "hole-tun",
+        "server_ip": "203.0.113.1",
+        "interface_name": "en0",
+        "installed": ["split-v4-low"],
+        "extra_field": "should be rejected",
+    });
+    std::fs::write(dir.path().join(STATE_FILE_NAME), json.to_string()).unwrap();
+    assert!(load(dir.path()).is_none());
 }
 
 #[skuld::test]

@@ -51,10 +51,12 @@ before editing; the sections linked below are the authoritative source.
   crash marker; the next start of the same kind sweeps it. →
   [CONTRIBUTING.md#native-crash-observability-tombstone](CONTRIBUTING.md#native-crash-observability-tombstone)
 - **Route ownership.** Teardown and recovery delete only the `RouteId`s
-  `bridge-routes.json` records as installed. No delete-side qualifier can
-  substitute: macOS matches `RTM_DELETE` on destination + netmask only, and the
+  `bridge-routes.json` records as installed. On macOS no delete-side qualifier
+  can substitute: `RTM_DELETE` matches on destination + netmask only, and the
   one key discriminator (`-ifscope`) would hide the splits from unbound
-  traffic. →
+  traffic. Windows' bypass delete can additionally be scoped by the
+  install-time gateway, carried in `original_gateway`. Leftovers a sweep
+  can't confirm gone are carried forward in `stale`, never dropped. →
   [CONTRIBUTING.md#route-ownership](CONTRIBUTING.md#route-ownership)
 - **Crash-recovery sweep.** `bridge-{routes,plugins,dns}.json` + ETW sessions are
   replayed/cleaned on next startup after the IPC socket binds. →

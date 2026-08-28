@@ -29,7 +29,13 @@ fn setup_argv(tun_name: &str, server_ip: IpAddr, gateway: IpAddr, interface_name
 /// Teardown for a run that installed everything it planned — the shape every
 /// assertion that is not itself about provenance wants.
 fn teardown_argv(tun_name: &str, server_ip: IpAddr, interface_name: &str) -> Vec<Vec<String>> {
-    build_teardown_commands(tun_name, server_ip, interface_name, &planned_routes(server_ip))
+    build_teardown_commands(
+        tun_name,
+        server_ip,
+        interface_name,
+        &planned_routes(server_ip),
+        Some(ipv4_gateway()),
+    )
 }
 
 fn joined(cmds: &[Vec<String>]) -> String {
@@ -514,7 +520,9 @@ fn recover_with_state_file_runs_split_then_bypass_then_clears() {
         tun_name: "hole-tun".into(),
         server_ip: ipv4_server(),
         interface_name: "en0".into(),
+        original_gateway: Some(ipv4_gateway()),
         installed: planned_routes(ipv4_server()),
+        stale: Vec::new(),
     };
     state::save(tmp.path(), &persisted_state, None).unwrap();
 
@@ -567,7 +575,9 @@ fn recover_with_loopback_server_skips_bypass() {
         tun_name: "hole-tun".into(),
         server_ip: loopback,
         interface_name: "en0".into(),
+        original_gateway: Some(ipv4_gateway()),
         installed: planned_routes(loopback),
+        stale: Vec::new(),
     };
     state::save(tmp.path(), &persisted_state, None).unwrap();
 
@@ -606,7 +616,9 @@ fn recover_keeps_state_file_when_every_command_fails_to_spawn() {
         tun_name: "hole-tun".into(),
         server_ip: ipv4_server(),
         interface_name: "en0".into(),
+        original_gateway: Some(ipv4_gateway()),
         installed: planned_routes(ipv4_server()),
+        stale: Vec::new(),
     };
     state::save(tmp.path(), &persisted_state, None).unwrap();
 
@@ -631,7 +643,9 @@ fn recover_narrows_the_state_file_to_the_command_that_failed_to_spawn() {
         tun_name: "hole-tun".into(),
         server_ip: ipv4_server(),
         interface_name: "en0".into(),
+        original_gateway: Some(ipv4_gateway()),
         installed: planned_routes(ipv4_server()),
+        stale: Vec::new(),
     };
     state::save(tmp.path(), &persisted_state, None).unwrap();
 
@@ -668,7 +682,9 @@ fn recover_drops_an_unplannable_id_instead_of_looping_forever() {
         tun_name: "hole-tun".into(),
         server_ip: loopback,
         interface_name: "en0".into(),
+        original_gateway: Some(ipv4_gateway()),
         installed: vec![RouteId::ServerBypass], // unplannable: loopback never installs a bypass
+        stale: Vec::new(),
     };
     state::save(tmp.path(), &persisted_state, None).unwrap();
 
@@ -858,7 +874,13 @@ mod macos_teardown_names_no_interface {
 
     #[skuld::test]
     fn split_deletes_carry_no_interface_operand() {
-        let cmds = build_teardown_commands("utun7", ipv4_server(), "en0", &planned_routes(ipv4_server()));
+        let cmds = build_teardown_commands(
+            "utun7",
+            ipv4_server(),
+            "en0",
+            &planned_routes(ipv4_server()),
+            Some(ipv4_gateway()),
+        );
         for cmd in &cmds {
             assert!(
                 !names_an_interface(cmd),
@@ -909,8 +931,14 @@ mod macos_teardown_names_no_interface {
 #[skuld::test]
 fn teardown_emits_the_same_deletes_for_an_interface_that_no_longer_exists() {
     let planned = planned_routes(ipv4_server());
-    let live = build_teardown_commands("hole-tun", ipv4_server(), "en0", &planned);
-    let dead = build_teardown_commands("hole-tun-gone-99", ipv4_server(), "en-gone-99", &planned);
+    let live = build_teardown_commands("hole-tun", ipv4_server(), "en0", &planned, Some(ipv4_gateway()));
+    let dead = build_teardown_commands(
+        "hole-tun-gone-99",
+        ipv4_server(),
+        "en-gone-99",
+        &planned,
+        Some(ipv4_gateway()),
+    );
     assert!(!live.is_empty(), "teardown must emit deletes at all");
     assert_eq!(
         dead.len(),
@@ -944,7 +972,7 @@ fn crash_recovery_split_teardown_survives_a_dead_tun_name() {
 
 #[skuld::test]
 fn teardown_deletes_nothing_when_nothing_was_installed() {
-    let cmds = build_teardown_commands("hole-tun", ipv4_server(), "en0", &[]);
+    let cmds = build_teardown_commands("hole-tun", ipv4_server(), "en0", &[], Some(ipv4_gateway()));
     assert!(
         cmds.is_empty(),
         "a run that installed no routes must issue no deletes, got {cmds:?}"
@@ -953,7 +981,13 @@ fn teardown_deletes_nothing_when_nothing_was_installed() {
 
 #[skuld::test]
 fn teardown_deletes_only_the_recorded_routes() {
-    let cmds = build_teardown_commands("hole-tun", ipv4_server(), "en0", &[RouteId::SplitV4High]);
+    let cmds = build_teardown_commands(
+        "hole-tun",
+        ipv4_server(),
+        "en0",
+        &[RouteId::SplitV4High],
+        Some(ipv4_gateway()),
+    );
     assert_eq!(cmds.len(), 1, "expected exactly the recorded delete, got {cmds:?}");
     assert!(
         cmds[0].iter().any(|a| a == "128.0.0.0/1"),
@@ -967,7 +1001,7 @@ fn teardown_deletes_only_the_recorded_routes() {
 
 #[skuld::test]
 fn teardown_omits_the_bypass_when_it_was_not_installed() {
-    let cmds = build_teardown_commands("hole-tun", ipv4_server(), "en0", &SPLIT_ROUTES);
+    let cmds = build_teardown_commands("hole-tun", ipv4_server(), "en0", &SPLIT_ROUTES, Some(ipv4_gateway()));
     assert!(
         !mentions_addr(&cmds, "1.2.3.4"),
         "a bypass absent from the record must not be deleted, got {cmds:?}"
@@ -984,7 +1018,9 @@ fn recovery_deletes_only_the_recorded_routes() {
             tun_name: "hole-tun".into(),
             server_ip: ipv4_server(),
             interface_name: "en0".into(),
+            original_gateway: Some(ipv4_gateway()),
             installed: vec![RouteId::SplitV6Low],
+            stale: Vec::new(),
         },
         None,
     )
@@ -1023,7 +1059,9 @@ fn recovery_bypass_phase_does_not_repeat_the_split_deletes() {
             tun_name: "hole-tun".into(),
             server_ip: ipv4_server(),
             interface_name: "en0".into(),
+            original_gateway: Some(ipv4_gateway()),
             installed: planned_routes(ipv4_server()),
+            stale: Vec::new(),
         },
         None,
     )
@@ -1050,6 +1088,123 @@ fn recovery_bypass_phase_does_not_repeat_the_split_deletes() {
         "bypass phase deletes the bypass and nothing else, got {log:?}"
     );
     assert!(mentions_addr(&bypass, "1.2.3.4"), "got {bypass:?}");
+}
+
+/// A `stale` group carried forward by an earlier `install`'s own sweep
+/// (see `sweep_leftover_before_install`) must also be attempted by crash
+/// recovery, not just the primary record — the whole point of carrying it
+/// forward is that SOMETHING keeps retrying it. Uses a distinct
+/// `tun_name`/`server_ip` for the stale group to prove recovery used ITS
+/// OWN provenance, not the primary record's.
+#[skuld::test]
+fn recover_attempts_a_stale_group_and_clears_the_file_once_everything_drains() {
+    let tmp = tempfile::tempdir().unwrap();
+    state::save(
+        tmp.path(),
+        &RouteState {
+            version: state::SCHEMA_VERSION,
+            tun_name: "hole-tun".into(),
+            server_ip: ipv4_server(),
+            interface_name: "en0".into(),
+            original_gateway: Some(ipv4_gateway()),
+            installed: vec![RouteId::SplitV6Low],
+            stale: vec![state::StaleRecord {
+                tun_name: "hole-tun-old".into(),
+                server_ip: "9.9.9.9".parse().unwrap(),
+                interface_name: "en1".into(),
+                original_gateway: Some("9.9.9.1".parse().unwrap()),
+                installed: vec![RouteId::ServerBypass],
+            }],
+        },
+        None,
+    )
+    .unwrap();
+
+    let log: RefCell<Captured> = RefCell::new(Vec::new());
+    recover_routes_with(
+        tmp.path(),
+        None,
+        capturing_runner(&log),
+        |_, _| {},
+        false,
+        || false,
+        |_| {},
+    );
+
+    let log = log.into_inner();
+    assert!(
+        mentions_addr(&commands_in_phase(&log, PHASE_RECOVER_BYPASS), "9.9.9.9"),
+        "the stale group's own bypass delete must be attempted, got {log:?}"
+    );
+    assert!(
+        !tmp.path().join(STATE_FILE_NAME).exists(),
+        "the state file must be cleared once BOTH the primary record and the stale group drain"
+    );
+}
+
+/// The narrower case: only the stale group fails to confirm gone — the
+/// state file must stay recorded (not cleared), even though the primary
+/// record fully drained.
+#[skuld::test]
+fn recover_keeps_the_file_when_only_the_stale_group_fails_to_confirm_gone() {
+    let tmp = tempfile::tempdir().unwrap();
+    state::save(
+        tmp.path(),
+        &RouteState {
+            version: state::SCHEMA_VERSION,
+            tun_name: "hole-tun".into(),
+            server_ip: ipv4_server(),
+            interface_name: "en0".into(),
+            original_gateway: Some(ipv4_gateway()),
+            installed: vec![RouteId::SplitV6Low],
+            stale: vec![state::StaleRecord {
+                tun_name: "hole-tun-old".into(),
+                server_ip: "9.9.9.9".parse().unwrap(),
+                interface_name: "en1".into(),
+                original_gateway: Some("9.9.9.1".parse().unwrap()),
+                installed: vec![RouteId::ServerBypass],
+            }],
+        },
+        None,
+    )
+    .unwrap();
+
+    // The primary record's own command confirms gone; the stale group's
+    // does not.
+    let stale_attempted = std::cell::Cell::new(false);
+    let runner = |argv: &[String], _phase: &str| -> std::io::Result<bool> {
+        if argv.iter().any(|a| a == "9.9.9.9") {
+            stale_attempted.set(true);
+            return Ok(false);
+        }
+        Ok(true)
+    };
+    recover_routes_with(tmp.path(), None, runner, |_, _| {}, false, || false, |_| {});
+
+    assert!(
+        stale_attempted.get(),
+        "the stale group's own bypass delete must actually be attempted, not just left recorded"
+    );
+
+    let remaining =
+        state::load(tmp.path()).expect("the stale group's unconfirmed route must keep the state file recorded");
+    assert!(
+        remaining.installed.is_empty(),
+        "the primary record fully drained: {:?}",
+        remaining.installed
+    );
+    assert_eq!(
+        remaining.stale,
+        vec![state::StaleRecord {
+            tun_name: "hole-tun-old".into(),
+            server_ip: "9.9.9.9".parse().unwrap(),
+            interface_name: "en1".into(),
+            original_gateway: Some("9.9.9.1".parse().unwrap()),
+            installed: vec![RouteId::ServerBypass],
+        }],
+        "the stale group must survive with its own provenance intact: {:?}",
+        remaining.stale
+    );
 }
 
 // Per-command checkpoint producer =====================================================================================
@@ -1292,6 +1447,7 @@ fn teardown_routes_with_nothing_installed_does_not_panic() {
         "utun7",
         ipv4_server(),
         "en0",
+        Some(ipv4_gateway()),
         &[],
         |argv, _phase| panic!("no command should run for an empty installed set: {argv:?}"),
         |_ids| {},
@@ -1307,7 +1463,15 @@ fn teardown_routes_with_nothing_installed_does_not_panic() {
 #[skuld::test]
 fn teardown_routes_with_nothing_installed_never_calls_the_real_runner() {
     #[allow(clippy::disallowed_methods)] // exercising teardown_routes directly with the real per-command runner
-    let remaining = teardown_routes("utun7", ipv4_server(), "en0", &[], run_one_teardown, |_ids| {});
+    let remaining = teardown_routes(
+        "utun7",
+        ipv4_server(),
+        "en0",
+        Some(ipv4_gateway()),
+        &[],
+        run_one_teardown,
+        |_ids| {},
+    );
     assert!(remaining.is_empty());
 }
 
@@ -1319,6 +1483,7 @@ fn teardown_routes_deletes_everything_on_full_success() {
         "utun7",
         ipv4_server(),
         "en0",
+        Some(ipv4_gateway()),
         &planned_routes(ipv4_server()),
         |_argv, _phase| Ok(true),
         |_ids| {},
@@ -1338,6 +1503,7 @@ fn teardown_routes_only_attempts_the_recorded_subset() {
         "utun7",
         ipv4_server(),
         "en0",
+        Some(ipv4_gateway()),
         &[RouteId::SplitV4High, RouteId::ServerBypass],
         |argv, _phase| {
             if argv.iter().any(|a| a == "128.0.0.0/1") {
@@ -1367,6 +1533,7 @@ fn teardown_routes_keeps_the_id_whose_delete_fails_to_spawn() {
         "utun7",
         ipv4_server(),
         "en0",
+        Some(ipv4_gateway()),
         &planned_routes(ipv4_server()),
         |argv, _phase| {
             if argv.iter().any(|a| a == "1.2.3.4") {
@@ -1400,4 +1567,347 @@ fn cover_recovery_off_and_present_sweeps() {
 fn cover_recovery_absent_is_noop_regardless_of_intent() {
     assert_eq!(decide_cover_recovery(true, false), CoverRecovery::Noop);
     assert_eq!(decide_cover_recovery(false, false), CoverRecovery::Noop);
+}
+
+// checkpoint_installed — install's own advance-on-success-only checkpoint =============================================
+//
+// A pre-command checkpoint write that fails (ENOSPC, a transient AV/
+// MoveFileEx denial, ...) must not leave `persisted.installed` naming the
+// id it failed to durably record — `install`'s `uncertain` set is derived
+// by diffing `persisted.installed` against the runtime accumulator, so a
+// write that never landed must not read as "durably recorded, fate
+// unknown." See bindreams/hole#904's root cause 2.
+
+/// Forces the NEXT `state::save` against `state_dir` to fail deterministically
+/// by holding the persisted file open without delete-sharing, so the
+/// `NamedTempFile::persist` rename cannot land — a real, structural I/O
+/// failure, not a timing-dependent one.
+struct BlockedSave {
+    _file: std::fs::File,
+}
+
+impl BlockedSave {
+    fn engage(state_dir: &Path) -> Self {
+        let file = std::fs::File::open(state_dir.join(STATE_FILE_NAME))
+            .expect("a prior successful save must have created the file to block");
+        Self { _file: file }
+    }
+}
+
+#[skuld::test]
+fn checkpoint_installed_rolls_back_in_memory_on_save_failure() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut persisted = RouteState {
+        version: state::SCHEMA_VERSION,
+        tun_name: "utun7".into(),
+        server_ip: ipv4_server(),
+        interface_name: "en0".into(),
+        original_gateway: Some(ipv4_gateway()),
+        installed: Vec::new(),
+        stale: Vec::new(),
+    };
+
+    // First checkpoint succeeds and lands on disk.
+    checkpoint_installed(&mut persisted, tmp.path(), None, &[RouteId::SplitV4Low]).unwrap();
+    assert_eq!(persisted.installed, vec![RouteId::SplitV4Low]);
+
+    // The next save is forced to fail deterministically.
+    let block = BlockedSave::engage(tmp.path());
+    let result = checkpoint_installed(
+        &mut persisted,
+        tmp.path(),
+        None,
+        &[RouteId::SplitV4Low, RouteId::SplitV4High],
+    );
+    assert!(result.is_err(), "save must fail while the file is held open");
+    drop(block);
+
+    assert_eq!(
+        persisted.installed,
+        vec![RouteId::SplitV4Low],
+        "a failed write must not advance the in-memory value install()'s `uncertain` calc reads from"
+    );
+}
+
+/// The end-to-end form of the test above: drives the real
+/// `SystemRouting::rollback_and_record` (the same call `install` makes on a
+/// `setup_routes` error) with the `uncertain` set `install` would have
+/// derived, and observes the FILE it leaves behind — not just an in-memory
+/// struct. `confirmed` is empty throughout, so `teardown_routes` inside
+/// `rollback_and_record` issues no commands and never reaches the real
+/// subprocess runner (see `teardown_routes_with_nothing_installed_never_calls_the_real_runner`) —
+/// safe to call for real here.
+#[skuld::test]
+fn install_rollback_clears_the_file_when_a_checkpoint_write_failure_leaves_nothing_confirmed_or_uncertain() {
+    let tmp = tempfile::tempdir().unwrap();
+    let routing = SystemRouting::new(tmp.path().to_path_buf(), None);
+
+    let mut persisted = RouteState {
+        version: state::SCHEMA_VERSION,
+        tun_name: "utun7".into(),
+        server_ip: ipv4_server(),
+        interface_name: "en0".into(),
+        original_gateway: Some(ipv4_gateway()),
+        installed: Vec::new(),
+        stale: Vec::new(),
+    };
+
+    // Occupy the exact destination filename with a directory so the very
+    // first pre-command checkpoint's write fails deterministically (the
+    // finding's ENOSPC scenario) — `NamedTempFile::persist` cannot rename a
+    // file onto an existing directory.
+    let state_file_path = tmp.path().join(STATE_FILE_NAME);
+    std::fs::create_dir(&state_file_path).unwrap();
+    let write_result = checkpoint_installed(&mut persisted, tmp.path(), None, &[RouteId::SplitV4Low]);
+    assert!(
+        write_result.is_err(),
+        "the write must fail while a directory occupies its destination"
+    );
+    std::fs::remove_dir(&state_file_path).unwrap();
+
+    // The command this checkpoint would have gated never spawns, so
+    // `setup_routes`'s own accumulator (mirrored here by `confirmed`, since
+    // it's what `install` would pass to `rollback_and_record`) stays empty.
+    let confirmed: Vec<RouteId> = Vec::new();
+    let uncertain: Vec<RouteId> = persisted
+        .installed
+        .iter()
+        .copied()
+        .filter(|id| !confirmed.contains(id))
+        .collect();
+    assert!(
+        uncertain.is_empty(),
+        "an id whose checkpoint write never durably landed must not be classified uncertain: {uncertain:?}"
+    );
+
+    routing.rollback_and_record("utun7", ipv4_server(), "en0", &confirmed, persisted, uncertain);
+
+    assert!(
+        state::load(tmp.path()).is_none(),
+        "nothing was confirmed installed and nothing is uncertain, so rollback must clear the \
+         state file, not leave a phantom `installed: [SplitV4Low]` record for the next start's \
+         recovery to act on"
+    );
+}
+
+// Windows bypass-delete gateway scoping (root cause 3) ================================================================
+//
+// `route.exe`'s own help confirms DELETE's gateway operand is optional but
+// accepted; when supplied it scopes which entry is deleted — unlike macOS,
+// where the gateway is never read (see CONTRIBUTING's Route ownership
+// section). An unscoped delete can take out a co-resident VPN's route to
+// the same destination.
+
+#[cfg(target_os = "windows")]
+mod windows_bypass_teardown_scoping {
+    use super::*;
+
+    #[skuld::test]
+    fn bypass_delete_is_scoped_by_the_install_time_gateway() {
+        let server_ip = ipv4_server();
+        let gateway = ipv4_gateway();
+        let cmds = build_teardown_commands("utun7", server_ip, "en0", &planned_routes(server_ip), Some(gateway));
+        let cmd = cmds
+            .iter()
+            .find(|c| c.iter().any(|a| a == "1.2.3.4"))
+            .expect("bypass delete must be present");
+        assert!(
+            cmd.iter().any(|a| a == "192.168.1.1"),
+            "the delete must be scoped by the install-time gateway so it cannot take out \
+             a co-resident VPN's route to the same destination, got {cmd:?}"
+        );
+    }
+
+    /// A record migrated from schema 1/2 never persisted a gateway — the
+    /// delete must still be attempted (the old unscoped shape, a disclosed
+    /// residual), not silently skipped.
+    #[skuld::test]
+    fn bypass_delete_falls_back_to_unscoped_when_gateway_is_unknown() {
+        let server_ip = ipv4_server();
+        let cmds = build_teardown_commands("utun7", server_ip, "en0", &planned_routes(server_ip), None);
+        let cmd = cmds
+            .iter()
+            .find(|c| c.iter().any(|a| a == "1.2.3.4"))
+            .expect("bypass delete must still be attempted without a known gateway");
+        assert!(
+            !cmd.iter().any(|a| a == "192.168.1.1"),
+            "no gateway known => no gateway operand, got {cmd:?}"
+        );
+    }
+}
+
+// SystemRouting::install pre-install sweep (root cause 1) =============================================================
+//
+// `install`'s pre-install sweep of a record retained by a prior run/attempt
+// in this SAME PROCESS must carry forward whatever it still cannot confirm
+// gone — never discard it under the fresh record the new session is about
+// to write. A record is only ever retained because its own teardown could
+// not confirm the route gone, so the usual outcome of re-sweeping it is
+// failing the same way again.
+
+#[skuld::test]
+fn install_sweep_carries_forward_a_still_unconfirmed_leftover_instead_of_losing_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    // Prior run's retained record: teardown could not confirm ServerBypass gone.
+    state::save(
+        tmp.path(),
+        &RouteState {
+            version: state::SCHEMA_VERSION,
+            tun_name: "hole-tun".into(),
+            server_ip: "9.9.9.9".parse().unwrap(),
+            interface_name: "en0".into(),
+            original_gateway: Some(ipv4_gateway()),
+            installed: vec![RouteId::ServerBypass],
+            stale: Vec::new(),
+        },
+        None,
+    )
+    .unwrap();
+
+    // The new session's own template, as `install` builds it before sweeping.
+    let mut persisted = RouteState {
+        version: state::SCHEMA_VERSION,
+        tun_name: "hole-tun".into(),
+        server_ip: "1.1.1.1".parse().unwrap(),
+        interface_name: "en0".into(),
+        original_gateway: Some(ipv4_gateway()),
+        installed: Vec::new(),
+        stale: Vec::new(),
+    };
+
+    // The sweep's delete fails the same way it did before — never confirmed
+    // gone — the exact scenario the sweep exists for.
+    sweep_leftover_before_install(tmp.path(), None, &mut persisted, |_argv, _phase| Ok(false));
+
+    let expected_stale = vec![state::StaleRecord {
+        tun_name: "hole-tun".into(),
+        server_ip: "9.9.9.9".parse().unwrap(),
+        interface_name: "en0".into(),
+        original_gateway: Some(ipv4_gateway()),
+        installed: vec![RouteId::ServerBypass],
+    }];
+    assert_eq!(
+        persisted.stale, expected_stale,
+        "an unconfirmed leftover must be carried into the new session's stale list, not dropped"
+    );
+    assert!(
+        persisted.installed.is_empty(),
+        "the sweep must never touch this session's own `installed`"
+    );
+
+    // The file on disk must ALSO carry it forward — not just the in-memory
+    // value — proving the write landed, not merely the struct in memory.
+    let on_disk = state::load(tmp.path()).unwrap();
+    assert_eq!(on_disk.stale, expected_stale);
+}
+
+/// The mirror case: when the sweep fully confirms the leftover gone, nothing
+/// is carried forward — `stale` must not become a permanent residue that
+/// accumulates even after a route is actually cleared.
+#[skuld::test]
+fn install_sweep_drops_a_fully_confirmed_leftover() {
+    let tmp = tempfile::tempdir().unwrap();
+    state::save(
+        tmp.path(),
+        &RouteState {
+            version: state::SCHEMA_VERSION,
+            tun_name: "hole-tun".into(),
+            server_ip: "9.9.9.9".parse().unwrap(),
+            interface_name: "en0".into(),
+            original_gateway: Some(ipv4_gateway()),
+            installed: vec![RouteId::ServerBypass],
+            stale: Vec::new(),
+        },
+        None,
+    )
+    .unwrap();
+
+    let mut persisted = RouteState {
+        version: state::SCHEMA_VERSION,
+        tun_name: "hole-tun".into(),
+        server_ip: "1.1.1.1".parse().unwrap(),
+        interface_name: "en0".into(),
+        original_gateway: Some(ipv4_gateway()),
+        installed: Vec::new(),
+        stale: Vec::new(),
+    };
+
+    sweep_leftover_before_install(tmp.path(), None, &mut persisted, |_argv, _phase| Ok(true));
+
+    assert!(
+        persisted.stale.is_empty(),
+        "a fully confirmed sweep must not leave a stale residue: {:?}",
+        persisted.stale
+    );
+}
+
+/// Debt already carried forward by an EARLIER sweep (this call's own
+/// `leftover.stale`, from a session before the immediately-prior one) must
+/// also be re-attempted, not just the immediately-prior session's own
+/// primary record — otherwise a route stuck since session N-2 stops being
+/// retried the moment session N-1 also fails to confirm it gone.
+#[skuld::test]
+fn install_sweep_also_retries_debt_carried_by_an_earlier_sweep() {
+    let tmp = tempfile::tempdir().unwrap();
+    state::save(
+        tmp.path(),
+        &RouteState {
+            version: state::SCHEMA_VERSION,
+            tun_name: "hole-tun".into(),
+            server_ip: "5.5.5.5".parse().unwrap(),
+            interface_name: "en0".into(),
+            original_gateway: Some(ipv4_gateway()),
+            installed: vec![RouteId::ServerBypass],
+            stale: vec![state::StaleRecord {
+                tun_name: "hole-tun".into(),
+                server_ip: "9.9.9.9".parse().unwrap(),
+                interface_name: "en0".into(),
+                original_gateway: Some(ipv4_gateway()),
+                installed: vec![RouteId::ServerBypass],
+            }],
+        },
+        None,
+    )
+    .unwrap();
+
+    let mut persisted = RouteState {
+        version: state::SCHEMA_VERSION,
+        tun_name: "hole-tun".into(),
+        server_ip: "1.1.1.1".parse().unwrap(),
+        interface_name: "en0".into(),
+        original_gateway: Some(ipv4_gateway()),
+        installed: Vec::new(),
+        stale: Vec::new(),
+    };
+
+    let attempted: RefCell<Vec<String>> = RefCell::new(Vec::new());
+    sweep_leftover_before_install(tmp.path(), None, &mut persisted, |argv, _phase| {
+        if argv.iter().any(|a| a == "9.9.9.9") {
+            attempted.borrow_mut().push("9.9.9.9".into());
+        }
+        if argv.iter().any(|a| a == "5.5.5.5") {
+            attempted.borrow_mut().push("5.5.5.5".into());
+        }
+        Ok(false) // nothing confirms gone — both groups must still be attempted
+    });
+
+    // Both the immediately-prior session's own record AND the older debt it
+    // was carrying must have driven a real teardown command — not just be
+    // copied into `persisted.stale` unattempted.
+    assert_eq!(
+        attempted.into_inner(),
+        vec!["9.9.9.9", "5.5.5.5"],
+        "both the older carried-forward debt and the immediately-prior record must be attempted"
+    );
+
+    let server_ips: Vec<IpAddr> = persisted.stale.iter().map(|g| g.server_ip).collect();
+    assert_eq!(
+        server_ips.len(),
+        2,
+        "both the immediately-prior record and the older carried-forward debt must survive \
+         since the runner never confirmed either gone: {:?}",
+        persisted.stale
+    );
+    assert!(server_ips.contains(&"9.9.9.9".parse().unwrap()));
+    assert!(server_ips.contains(&"5.5.5.5".parse().unwrap()));
 }

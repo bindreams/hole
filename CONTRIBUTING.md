@@ -346,8 +346,10 @@ upstream reintroduction, not a proof against a determined rename/alias.
 ### Route ownership
 
 Teardown and crash recovery delete **only** the routes the run recorded in
-`bridge-routes.json`'s `installed` list. Nothing about the delete command
-itself can express "only if it is ours":
+`bridge-routes.json`'s `installed` list.
+
+**On macOS, nothing about the delete command itself can express "only if it is
+ours"**:
 
 - macOS `route delete` resolves its victim from the destination key and netmask
   alone. xnu's `rtrequest_common_locked` reaches `RTM_DELETE` via
@@ -364,6 +366,19 @@ itself can express "only if it is ours":
 - Reading the table back first — `route get` then `route delete` — is
   check-then-act: it only narrows the window in which the other route is
   destroyed.
+
+**On Windows, the delete command CAN express it, via the gateway.**
+`ROUTE DELETE destination [MASK netmask] [gateway] ...` — `route.exe`'s own
+help confirms the gateway argument is optional but accepted for DELETE, and
+unlike macOS it scopes which entry is deleted. `install` already knows the
+gateway (`platform_setup_commands` passes it to the matching `route add`), so
+the server-bypass teardown carries it forward as `RouteState.original_gateway`
+and emits `route delete <server_ip> mask 255.255.255.255 <gateway>` instead of
+the unscoped form. This is `None` — falling back to the old unscoped delete, a
+disclosed residual — only for a record migrated from schema 1/2, which never
+persisted a gateway. The split-route deletes stay unscoped on both platforms
+(`RouteId` provenance is their only handle); only the single-destination
+bypass delete can carry a gateway at all.
 
 Provenance is the one handle that outlives the interface, which matters because
 the utun is always already gone by teardown: `RunningState` closes the TUN at
@@ -414,16 +429,29 @@ abort through. "Next start" means the next `install`, not only the next
 process start: `recover_routes` runs once per bridge process, but a
 long-lived process can `install` multiple times (reconnect, server switch),
 so `install` itself sweeps any record left retained by a prior `install` in
-the same process before starting a new one — otherwise its first checkpoint
-would silently overwrite that record.
+the same process before starting a new one. A record is only ever retained
+because its own teardown could not confirm the route gone, so the sweep
+commonly fails the identical way again — whatever it still cannot confirm
+gone is carried forward into `RouteState.stale` (a list of
+`{tun_name, server_ip, interface_name, original_gateway, installed}` groups,
+each with its own provenance since a later sweep or `recover_routes` may run
+under a different `tun_name`/`server_ip`/gateway than the new session's own).
+The new session's own checkpoints only ever touch `installed`, never `stale`,
+so a leak from an earlier session survives being overwritten by a later one;
+`recover_routes` attempts every `stale` group in addition to the primary
+record, and the state file is cleared only once both are empty.
 
-**Residual:** a VPN that takes the prefix over *mid-session* — necessarily by
-deleting Hole's entry first — is still torn down by Hole's Stop. macOS exposes
-no compare-and-delete, so closing that needs a different mechanism (a routing
-socket that acts and then repairs from `RTM_DELETE`'s reply), not a different
-flag. The same routing-socket mechanism would also replace the stderr-text
-parsing above with a structured `rtm_errno` — tracked separately, since it
-cannot be verified without a macOS dev box.
+**Residual (macOS only):** a VPN that takes the prefix over *mid-session* —
+necessarily by deleting Hole's entry first — is still torn down by Hole's
+Stop. macOS exposes no compare-and-delete, so closing that needs a different
+mechanism (a routing socket that acts and then repairs from `RTM_DELETE`'s
+reply), not a different flag. The same routing-socket mechanism would also
+replace the stderr-text parsing above with a structured `rtm_errno` — tracked
+separately, since it cannot be verified without a macOS dev box. Windows has
+no equivalent residual here: a takeover VPN's route to the same destination
+has a different gateway, so Hole's gateway-scoped delete simply fails to
+match it (a safe no-op) rather than deleting the wrong entry — the failure
+mode a check-then-act race would otherwise produce.
 
 `scripts/network-reset.py` deliberately does not honour the record: it is the
 unconditional escape hatch, in the same spirit as `failclosed::release_all`.
