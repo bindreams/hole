@@ -253,18 +253,19 @@ teardown phase into the fatal runner does not compile. This replaces a
 silently-absorbed-failure class this policy exists to close.
 
 **Fatality is per command, not per phase** (`SetupCommand::fatal`). The two IPv6
-split routes are non-fatal when `GatewayInfo::ipv6_available` is false: on a host
-whose IPv6 stack is unbound from the adapter (`DisabledComponents`, or an EDR
-policy that unbinds IPv6 from new adapters) `netsh interface ipv6 add route ::/1`
-cannot succeed, and such a host emits no IPv6 traffic to leak — aborting there
-would lose the whole tunnel and avoid nothing. Everything else, and every command
-when IPv6 *is* reachable, stays fatal. The two commands are still *issued*, only
-their failure tolerated: `probe_ipv6` also reports false for a working IPv6 stack
-with no upstream route, and there the adds succeed and blackhole IPv6 inside the
-TUN — omitting them would push that traffic out the physical NIC instead.
-`Routing::install` takes the whole `GatewayInfo` rather than destructured fields,
-because destructuring it at the call site is how `ipv6_available` got dropped on
-this path to begin with.
+split routes are non-fatal when `gateway::tun_ipv6_available(tun_name)` is false:
+on a host whose IPv6 stack is unbound from the TUN adapter itself
+(`DisabledComponents`, or an EDR policy that unbinds IPv6 from new adapters)
+`netsh interface ipv6 add route ::/1 <tun>` cannot succeed, and such a host emits
+no IPv6 traffic to leak — aborting there would lose the whole tunnel and avoid
+nothing. Everything else, and every command when the TUN's IPv6 IS bound, stays
+fatal. The probe targets the TUN, not the upstream interface
+`GatewayInfo::ipv6_available` measures: it is the TUN's name the `::/1`/`8000::/1`
+commands carry, and `setup_routes` runs after `Dispatcher::new` has created it, so
+the adapter already exists to probe. The two commands are still *issued*, only
+their failure tolerated — the TUN is a virtual device, so a bound-but-otherwise-
+unreachable adapter still accepts the route; only a genuinely unbound TUN can
+make the add itself fail.
 
 **Accepted trade: a false start-failure is preferred to a silent leak.** No test
 exercises `setup_routes` against a real elevated `netsh`/`route` under an

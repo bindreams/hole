@@ -50,16 +50,10 @@ before editing; the sections linked below are the authoritative source.
 - **Native-crash observability.** The `tombstone` crate writes a signal-safe
   crash marker; the next start of the same kind sweeps it. →
   [CONTRIBUTING.md#native-crash-observability-tombstone](CONTRIBUTING.md#native-crash-observability-tombstone)
-- **Route-command failure policy.** Install is **fatal** — the first `netsh`/
-  `route` command that does not exit zero aborts the phase, rolls back, and
-  hands back no `SystemRoutes` guard, because reporting routes that were never
-  installed leaks traffic outside the tunnel. Teardown and crash recovery are
-  **best-effort** — every command is issued, and the runner returns a
-  `CleanupReport` with no error channel to `?` out of, because stopping early
-  strands routes. Which runner a phase gets is enforced by the type system
-  (`FatalPhase` / `BestEffortPhase`), and fatality is decided **per command**:
-  the IPv6 splits are non-fatal when the host has no reachable IPv6, since
-  they cannot succeed there and there is no IPv6 traffic to leak. →
+- **Route-command failure policy.** Install is fatal, teardown/crash recovery
+  are best-effort — the type system (`FatalPhase`/`BestEffortPhase`) enforces
+  which runner a phase gets, and per-command fatality tolerates the IPv6
+  splits failing on a TUN with no IPv6 binding. →
   [CONTRIBUTING.md#route-command-failure-policy](CONTRIBUTING.md#route-command-failure-policy)
 - **Crash-recovery sweep.** `bridge-{routes,plugins,dns}.json` + ETW sessions are
   replayed/cleaned on next startup after the IPC socket binds. →

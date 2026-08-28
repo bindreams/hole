@@ -42,7 +42,10 @@ fn is_ipv6_split(cmd: &SetupCommand) -> bool {
 }
 
 fn setup_cmds_joined(server_ip: IpAddr, gateway: &GatewayInfo) -> String {
-    let cmds = build_setup_commands("utun7", server_ip, gateway);
+    // These callers aren't testing IPv6 fatality — hold the TUN's own IPv6
+    // binding fixed at "available" (see the dedicated fatality tests below
+    // for `false`).
+    let cmds = build_setup_commands("utun7", server_ip, gateway, true);
     cmds.iter().map(|c| c.argv.join(" ")).collect::<Vec<_>>().join("\n")
 }
 
@@ -63,7 +66,7 @@ fn teardown_cmds_joined(server_ip: IpAddr) -> String {
 
 #[skuld::test]
 fn setup_generates_five_commands() {
-    let cmds = build_setup_commands("utun7", ipv4_server(), &ipv4_gw());
+    let cmds = build_setup_commands("utun7", ipv4_server(), &ipv4_gw(), true);
     assert_eq!(cmds.len(), 5);
 }
 
@@ -120,7 +123,7 @@ fn setup_bypass_uses_original_gateway() {
 fn setup_with_loopback_server_has_no_bypass() {
     for ip in ["127.0.0.1", "::1", "::ffff:127.0.0.1"] {
         let server_ip: IpAddr = ip.parse().unwrap();
-        let cmds = build_setup_commands("utun7", server_ip, &ipv4_gw());
+        let cmds = build_setup_commands("utun7", server_ip, &ipv4_gw(), true);
         assert_eq!(
             cmds.len(),
             4,
@@ -137,13 +140,13 @@ fn setup_with_loopback_server_has_no_bypass() {
 
 #[skuld::test]
 fn setup_with_ipv6_server_generates_five_commands() {
-    let cmds = build_setup_commands("utun7", ipv6_server(), &ipv4_gw());
+    let cmds = build_setup_commands("utun7", ipv6_server(), &ipv4_gw(), true);
     assert_eq!(cmds.len(), 5);
 }
 
 #[skuld::test]
 fn setup_with_ipv6_server_includes_ipv6_bypass() {
-    let cmds = build_setup_commands("utun7", ipv6_server(), &ipv4_gw());
+    let cmds = build_setup_commands("utun7", ipv6_server(), &ipv4_gw(), true);
     // The bypass is the last command (index 4)
     let bypass = cmds[4].argv.join(" ");
     assert!(
@@ -299,7 +302,7 @@ fn split_teardown_includes_ipv6_high_half() {
 #[skuld::test]
 fn setup_with_spaced_interface_name_includes_full_name() {
     let gateway = gateway_info(ipv4_gateway(), "Wi-Fi Direct", true);
-    let cmds = build_setup_commands("utun7", ipv6_server(), &gateway);
+    let cmds = build_setup_commands("utun7", ipv6_server(), &gateway, true);
     let bypass = cmds[4].argv.join(" ");
     assert!(
         bypass.contains("Wi-Fi Direct"),
@@ -307,37 +310,43 @@ fn setup_with_spaced_interface_name_includes_full_name() {
     );
 }
 
-// Per-command fatality ================================================================================================
-//
-// The fatal install policy must not brick a host whose IPv6 stack is unbound
-// from the adapter (`DisabledComponents`, or an EDR policy that unbinds IPv6
-// from new adapters): there `netsh interface ipv6 add route ::/1 <adapter>`
-// cannot succeed, and the host emits no IPv6 traffic to leak. Where IPv6 IS
-// reachable the same failure is exactly the #901 leak and must abort.
+// Per-command fatality — see `SetupCommand`'s doc for the contract these pin. =========================================
 
 #[skuld::test]
-fn ipv6_splits_are_not_fatal_without_reachable_ipv6() {
-    let cmds = build_setup_commands("hole-tun", ipv4_server(), &gateway_info(ipv4_gateway(), "en0", false));
+fn ipv6_splits_are_not_fatal_when_the_tun_has_no_ipv6() {
+    // Gateway (upstream) says IPv6 IS reachable — proves fatality is decided
+    // from `tun_ipv6_available`, not `GatewayInfo::ipv6_available`.
+    let cmds = build_setup_commands("hole-tun", ipv4_server(), &ipv4_gw(), false);
     let v6: Vec<_> = cmds.iter().filter(|c| is_ipv6_split(c)).collect();
     assert_eq!(v6.len(), 2, "expected the ::/1 and 8000::/1 adds, got {v6:?}");
     for cmd in v6 {
-        assert!(!cmd.fatal, "IPv6 split must not abort a host with no IPv6: {cmd:?}");
+        assert!(
+            !cmd.fatal,
+            "IPv6 split must not abort a TUN with no IPv6 binding: {cmd:?}"
+        );
     }
 }
 
 #[skuld::test]
-fn every_setup_command_is_fatal_with_reachable_ipv6() {
-    let cmds = build_setup_commands("hole-tun", ipv4_server(), &ipv4_gw());
+fn every_setup_command_is_fatal_when_the_tun_has_ipv6() {
+    // Gateway (upstream) says IPv6 is UNREACHABLE — proves the TUN's own
+    // binding is what matters, not upstream reachability.
+    let cmds = build_setup_commands(
+        "hole-tun",
+        ipv4_server(),
+        &gateway_info(ipv4_gateway(), "en0", false),
+        true,
+    );
     for cmd in &cmds {
-        assert!(cmd.fatal, "every command is fatal when IPv6 is reachable: {cmd:?}");
+        assert!(cmd.fatal, "every command is fatal when the TUN has IPv6 bound: {cmd:?}");
     }
 }
 
 /// The IPv4 splits and the server bypass carry the whole tunnel; nothing about
-/// the host's IPv6 stack may downgrade them.
+/// the TUN's IPv6 binding may downgrade them.
 #[skuld::test]
-fn ipv4_splits_and_bypass_stay_fatal_without_ipv6() {
-    let cmds = build_setup_commands("hole-tun", ipv4_server(), &gateway_info(ipv4_gateway(), "en0", false));
+fn ipv4_splits_and_bypass_stay_fatal_without_tun_ipv6() {
+    let cmds = build_setup_commands("hole-tun", ipv4_server(), &ipv4_gw(), false);
     let non_v6: Vec<_> = cmds.iter().filter(|c| !is_ipv6_split(c)).collect();
     assert_eq!(non_v6.len(), 3, "expected 2 IPv4 splits + bypass, got {non_v6:?}");
     for cmd in non_v6 {
@@ -360,7 +369,7 @@ fn fail_ipv6_splits(
 
 #[skuld::test]
 fn a_host_without_ipv6_installs_even_when_both_ipv6_adds_fail() {
-    let cmds = build_setup_commands("hole-tun", ipv4_server(), &gateway_info(ipv4_gateway(), "en0", false));
+    let cmds = build_setup_commands("hole-tun", ipv4_server(), &ipv4_gw(), false);
     let seen: RefCell<Vec<String>> = RefCell::new(Vec::new());
     let result = run_setup_with(&cmds, FatalPhase::Setup, fail_ipv6_splits(&seen));
 
@@ -378,7 +387,7 @@ fn a_host_without_ipv6_installs_even_when_both_ipv6_adds_fail() {
 
 #[skuld::test]
 fn a_host_with_ipv6_aborts_when_an_ipv6_add_fails() {
-    let cmds = build_setup_commands("hole-tun", ipv4_server(), &ipv4_gw());
+    let cmds = build_setup_commands("hole-tun", ipv4_server(), &ipv4_gw(), true);
     let seen: RefCell<Vec<String>> = RefCell::new(Vec::new());
     let err = run_setup_with(&cmds, FatalPhase::Setup, fail_ipv6_splits(&seen)).unwrap_err();
 
@@ -462,7 +471,7 @@ fn a_non_fatal_failure_does_not_mask_a_later_fatal_one() {
 /// there. They stay in the `warn` log instead.
 #[skuld::test]
 fn setup_error_does_not_leak_the_command_arguments() {
-    let cmds = build_setup_commands("hole-tun", ipv4_server(), &ipv4_gw());
+    let cmds = build_setup_commands("hole-tun", ipv4_server(), &ipv4_gw(), true);
     let err = RouteCommandError {
         program: cmds[4].argv[0].clone(),
         index: 4,

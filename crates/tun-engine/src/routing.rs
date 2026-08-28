@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use tracing::{debug, info, warn};
 
 use crate::error::{CommandFailure, RouteCommandError, RoutingError};
-use crate::gateway::{get_default_gateway_info, GatewayInfo};
+use crate::gateway::{get_default_gateway_info, tun_ipv6_available, GatewayInfo};
 
 /// Total number of routing subprocess spawns this process has performed.
 /// Incremented once per command executed. Exposed so
@@ -26,18 +26,17 @@ pub static ROUTING_SUBPROCESS_SPAWN_COUNT: AtomicU32 = AtomicU32::new(0);
 ///
 /// Fatality is per command, not per phase. The IPv4 splits and the server
 /// bypass are always fatal — a missing one of those sends traffic outside the
-/// tunnel. The two IPv6 splits are fatal only when the upstream interface can
-/// actually reach IPv6 ([`GatewayInfo::ipv6_available`]): where it cannot,
-/// `netsh interface ipv6 add route` / `route add -inet6` can outright fail
-/// (the adapter has no IPv6 binding — `DisabledComponents`, or an EDR policy
-/// that unbinds IPv6), and a host with no IPv6 stack emits no IPv6 traffic to
-/// leak. Where IPv6 IS reachable every command is fatal, because there a
-/// missing `::/1` route is exactly the #901 leak.
+/// tunnel. The two IPv6 splits are fatal only when the TUN interface they
+/// target has an IPv6 binding ([`tun_ipv6_available`]):
+/// where it does not, `netsh interface ipv6 add route` / `route add -inet6`
+/// on the TUN can outright fail (`DisabledComponents`, or an EDR policy that
+/// unbinds IPv6 from new adapters), and a host with no IPv6 stack emits no
+/// IPv6 traffic to leak. Where the TUN's IPv6 IS bound every command is
+/// fatal, because there a missing `::/1` route is exactly the #901 leak.
 ///
-/// Non-fatal means *issued and tolerated*, never omitted:
-/// [`GatewayInfo::ipv6_available`] is also false for a working IPv6 stack with
-/// no upstream route, where these adds succeed and blackhole IPv6 inside the
-/// TUN. Dropping them would push that traffic out the physical NIC instead.
+/// Non-fatal means *issued and tolerated*, never omitted. A bound TUN always
+/// accepts the route regardless of upstream connectivity (it is a virtual
+/// device), so an unbound TUN is the only case where the command can fail.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SetupCommand {
     /// Program plus arguments.
@@ -63,7 +62,7 @@ impl SetupCommand {
 /// 5. Server bypass — `<server_ip>` via `gateway.gateway_ip` (IPv4 server) or
 ///    `gateway.interface_name` (IPv6 server)
 ///
-/// Routes 3 and 4 are non-fatal when `gateway.ipv6_available` is false — see
+/// Routes 3 and 4 are non-fatal when `tun_ipv6_available` is false — see
 /// [`SetupCommand`].
 ///
 /// The server bypass (#5) is omitted when `server_ip` is loopback (checked in
@@ -76,8 +75,13 @@ impl SetupCommand {
 /// When `server_ip` is IPv6, `gateway.gateway_ip` is unused — the bypass route is
 /// interface-based because reliable IPv6 gateway detection is not available on all
 /// platforms.
-pub fn build_setup_commands(tun_name: &str, server_ip: IpAddr, gateway: &GatewayInfo) -> Vec<SetupCommand> {
-    platform_setup_commands(tun_name, server_ip, gateway)
+pub fn build_setup_commands(
+    tun_name: &str,
+    server_ip: IpAddr,
+    gateway: &GatewayInfo,
+    tun_ipv6_available: bool,
+) -> Vec<SetupCommand> {
+    platform_setup_commands(tun_name, server_ip, gateway, tun_ipv6_available)
 }
 
 /// Build the shell commands to tear down split routing (IPv4 + IPv6 splits and server bypass).
@@ -183,7 +187,12 @@ const _: () = assert!(<BestEffortPhase as Phase>::BEST_EFFORT);
 /// that does not exit zero and is marked fatal, and returns it; the caller must
 /// not treat the split routes as installed.
 pub fn setup_routes(tun_name: &str, server_ip: IpAddr, gateway: &GatewayInfo) -> Result<(), RouteCommandError> {
-    let commands = build_setup_commands(tun_name, server_ip, gateway);
+    // Probed HERE, not read off `gateway`: the IPv6 splits target the TUN
+    // (`tun_name`), which by this point already exists (`install` runs after
+    // `Dispatcher::new`) — `gateway.ipv6_available` measures the UPSTREAM
+    // interface instead, which the commands never name. See `SetupCommand`.
+    let tun_ipv6 = tun_ipv6_available(tun_name);
+    let commands = build_setup_commands(tun_name, server_ip, gateway, tun_ipv6);
     run_setup_commands(&commands, FatalPhase::Setup)
 }
 
@@ -549,9 +558,10 @@ pub trait Routing: Send + Sync {
     /// (no stale state file, no partially-installed routes).
     ///
     /// Takes the whole [`GatewayInfo`] that [`default_gateway`](Self::default_gateway)
-    /// returned rather than destructured fields: `ipv6_available` decides which
-    /// setup commands are fatal (see [`SetupCommand`]), and splitting the struct
-    /// at the call site is how it got dropped on this path in the first place.
+    /// returned (not destructured fields): `gateway_ip`/`interface_name` build
+    /// the server bypass route. IPv6 split-route fatality is decided
+    /// separately, from the TUN's own IPv6 binding, not from anything on this
+    /// struct — see [`SetupCommand`].
     fn install(
         &self,
         tun_name: &str,
@@ -803,8 +813,13 @@ impl Drop for SystemRoutes {
 // Platform-specific command builders ==================================================================================
 
 #[cfg(target_os = "windows")]
-fn platform_setup_commands(tun_name: &str, server_ip: IpAddr, gateway: &GatewayInfo) -> Vec<SetupCommand> {
-    let ipv6 = gateway.ipv6_available;
+fn platform_setup_commands(
+    tun_name: &str,
+    server_ip: IpAddr,
+    gateway: &GatewayInfo,
+    tun_ipv6_available: bool,
+) -> Vec<SetupCommand> {
+    let ipv6 = tun_ipv6_available;
     let mut cmds = vec![
         // IPv4 low half: 0.0.0.0/1 via TUN
         SetupCommand::fatal(vec![
@@ -950,8 +965,13 @@ fn platform_teardown_commands(tun_name: &str, server_ip: IpAddr, interface_name:
 }
 
 #[cfg(target_os = "macos")]
-fn platform_setup_commands(tun_name: &str, server_ip: IpAddr, gateway: &GatewayInfo) -> Vec<SetupCommand> {
-    let ipv6 = gateway.ipv6_available;
+fn platform_setup_commands(
+    tun_name: &str,
+    server_ip: IpAddr,
+    gateway: &GatewayInfo,
+    tun_ipv6_available: bool,
+) -> Vec<SetupCommand> {
+    let ipv6 = tun_ipv6_available;
     let mut cmds = vec![
         // IPv4 low half: 0.0.0.0/1 via TUN
         SetupCommand::fatal(vec![
