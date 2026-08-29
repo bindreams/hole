@@ -2368,19 +2368,14 @@ fn teardown_routes_keeps_the_id_whose_delete_fails_to_spawn() {
 // unknown." See bindreams/hole#904's root cause 2.
 
 /// Forces the NEXT `state::save` against `state_dir` to fail deterministically
-/// by holding the persisted file open without delete-sharing, so the
-/// `NamedTempFile::persist` rename cannot land — a real, structural I/O
-/// failure, not a timing-dependent one.
-struct BlockedSave {
-    _file: std::fs::File,
-}
-
-impl BlockedSave {
-    fn engage(state_dir: &Path) -> Self {
-        let file = std::fs::File::open(state_dir.join(STATE_FILE_NAME))
-            .expect("a prior successful save must have created the file to block");
-        Self { _file: file }
-    }
+/// on every platform by occupying the destination filename with a directory:
+/// `NamedTempFile::persist` cannot rename a file onto one. Holding the file
+/// open instead would only block the rename on Windows — POSIX renames over an
+/// open file succeed.
+fn block_next_save(state_dir: &Path) {
+    let path = state_dir.join(STATE_FILE_NAME);
+    std::fs::remove_file(&path).expect("a prior successful save must have created the file to block");
+    std::fs::create_dir(&path).expect("a directory at the destination blocks the persist rename");
 }
 
 #[skuld::test]
@@ -2401,15 +2396,17 @@ fn checkpoint_installed_rolls_back_in_memory_on_save_failure() {
     assert_eq!(persisted.installed, vec![RouteId::SplitV4Low]);
 
     // The next save is forced to fail deterministically.
-    let block = BlockedSave::engage(tmp.path());
+    block_next_save(tmp.path());
     let result = checkpoint_installed(
         &mut persisted,
         tmp.path(),
         None,
         &[RouteId::SplitV4Low, RouteId::SplitV4High],
     );
-    assert!(result.is_err(), "save must fail while the file is held open");
-    drop(block);
+    assert!(
+        result.is_err(),
+        "save must fail while a directory occupies its destination"
+    );
 
     assert_eq!(
         persisted.installed,
