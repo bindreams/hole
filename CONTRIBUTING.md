@@ -61,6 +61,64 @@ methods.
 cascade reads the filter decision, so DNS works even on a TCP-only plugin. See
 [DNS forwarder](#dns-forwarder).
 
+### TCP accept refusal
+
+The accept verdict is reached while the listener socket is still in
+`SynReceived` with its SYN-ACK paused (smoltcp's `socket-tcp-pause-synack`), so
+a declined connection is refused with a pre-handshake RST and never with a reset
+of a connection the client believes it opened. The verdict itself is
+[`decide_admission`](crates/tun-engine/src/engine/admission.rs) — a pure
+function over the handshake plus a permit-acquiring closure — and the driver arm
+is a mechanical dispatch over its three outcomes. A socket with a packet still to
+emit is *retired* rather than removed:
+[`SocketStack::poll`](crates/tun-engine/src/engine/socket_stack.rs) reaps it
+once `remote_endpoint()` goes `None`, smoltcp's signal that it has emitted the
+socket's last packet. `decide_disposal` picks the path per state — `Closed` and
+`Listen` retire, while `TimeWait` is dropped at once, since retiring it would
+hold the socket and both its buffers for smoltcp's 10 s `CLOSE_DELAY`. A
+connection socket that reverts to `Listen` — the client answered the SYN-ACK
+with an RST — is retired through that same list, so it cannot shadow the live
+listener on its port.
+
+Retiring a socket only marks it; reaping — the `SocketSet::remove` that actually
+frees its slot — happens inside the next `poll`. A socket marked but not yet
+reaped is still live and still bound to its port, so a SYN that arrives before
+that `poll` can be handed to it instead of to the real listener, and no accept
+path is watching it (bindreams/hole#911).
+[`Driver::settle_packet`](crates/tun-engine/src/engine/driver.rs) is the one
+production entry point for a TUN packet and closes that gap structurally rather
+than by convention: enqueue, both polls, admission dispatch and retirement all
+happen inside one call, so two packets' verdicts can never straddle a `poll` no
+matter how `run()`'s TUN-read cadence changes.
+
+Ownership of a 4-tuple is exclusive, and `take_handshakes` enforces it. Re-arming
+a port hands the listener whichever socket slot is lowest and free, which can put
+it *below* the connection it was just re-armed for; smoltcp gives a packet to the
+first socket that accepts it, and a `Listen` socket accepts a bare SYN on the
+local port alone. A SYN can therefore land on the replacement listener rather
+than on its own connection — and tuple equality alone does not say whether it is
+that connection's retransmit or a new connection reusing the tuple (a client
+that lost its own TCP state while the datapath's persists: reboot, sleep-resume,
+a recycled ephemeral port). `take_handshakes` tells them apart by ISN, read off
+the wire since smoltcp exposes none: the same ISN as the tuple's owner is
+`Duplicate` and its socket is dropped without a segment — no second permit, no
+second router task, and no RST, since one would acknowledge the client's SYN,
+which it must accept while in SYN-SENT, and so would kill the very connection it
+is retransmitting for. A different ISN reports `Pending` with `supersedes` set
+to the stale owner (RFC 9293 §3.10.7.4); the driver tears that owner down —
+closing its channels, removing its socket — before admitting or refusing the new
+SYN in its place.
+
+An admitted connection also gets a keep-alive interval and a timeout
+(`tcp_keep_alive_interval`, `tcp_peer_timeout`). They bound an external event —
+a client process that may never speak again — not anything inside the engine.
+Without them a connection stalled in `SynReceived`, `FinWait2` or `CloseWait`
+never reaches a state `decide_disposal` has a verdict for, and holds its entry,
+both buffers and its connection slot for the life of the process;
+`max_connections` of those wedge the tunnel for all new TCP. The probe is what
+keeps the bound off a client that is merely quiet: only silence in reply to it
+resets the socket to `Closed`, where the disposal path already runs.
+
 ### DNS forwarder
 
 On TCP-only plugins, full-tunnel DNS would have no path (UDP/53 is dropped for

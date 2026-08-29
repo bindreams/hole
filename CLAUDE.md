@@ -26,6 +26,14 @@ before editing; the sections linked below are the authoritative source.
   tunnel); enforced structurally in `HoleRouter::resolve_endpoint`. UDP/53 is
   diverted to the DNS forwarder before the cascade. →
   [CONTRIBUTING.md#udp-policy](CONTRIBUTING.md#udp-policy)
+- **TCP accept refusal.** The accept verdict lands while the listener is still
+  in `SynReceived` with its SYN-ACK paused, so a declined connection gets a
+  pre-handshake RST, never a black hole. A 4-tuple has one owner: a same-tuple
+  SYN's ISN, read off the wire, tells a retransmit from a new connection
+  reusing it (RFC 9293 §3.10.7.4), and `Driver::settle_packet` bundles
+  admission and retirement into one call per packet so a socket mid-teardown
+  can never intercept the next SYN. →
+  [CONTRIBUTING.md#tcp-accept-refusal](CONTRIBUTING.md#tcp-accept-refusal)
 - **DNS forwarder.** Carries DNS over the TCP tunnel for TCP-only plugins; OS
   adapter DNS is advertised the configured resolver IPs, which route into
   `hole-tun` and are intercepted by the in-TUN `LocalDnsEndpoint`; a start-time
