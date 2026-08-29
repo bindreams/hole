@@ -13,6 +13,7 @@
 //! must be kept alive for the duration of the test that uses it.
 
 use crate::certs::TestCerts;
+use crate::ports;
 use base64::Engine as _;
 use garter::{BinaryPlugin, ChainRunner, Mode, PluginEnv, ReadinessMode, StartError};
 use shadowsocks::config::{Mode as SsMode, ServerConfig};
@@ -93,7 +94,8 @@ pub const WS_SERVER_OPTS: &str = "server;host=cloudfront.com;path=/";
 
 /// Front a held ss-server with a SERVER-mode plugin (websocket, no TLS) and
 /// return the public address external clients connect to. The public port is
-/// allocated for `Protocols::TCP` only — WS is TCP per RFC 6455.
+/// reserved for `Protocols::TCP` only — ex-ray's WS server binds a single TCP
+/// listener there, nothing else.
 pub async fn start_real_ss_server_with_plugin_ws(
     method: CipherKind,
     password: &str,
@@ -115,7 +117,8 @@ pub async fn start_real_ss_server_with_plugin_ws_opts(
 
 /// Front a held ss-server with a SERVER-mode plugin (websocket + TLS). Same
 /// shape as [`start_real_ss_server_with_plugin_ws`] but with TLS enabled and the
-/// cert+key from `certs` mounted on the server side.
+/// cert+key from `certs` mounted on the server side. TLS wraps the same single
+/// TCP listener, so the public port is still `Protocols::TCP` only.
 pub async fn start_real_ss_server_with_plugin_ws_tls(
     method: CipherKind,
     password: &str,
@@ -130,7 +133,8 @@ pub async fn start_real_ss_server_with_plugin_ws_tls(
 /// auto-enables TLS in `generateConfig`
 /// ([crates/ex-ray/config.go](../../ex-ray/config.go), the `case "quic"` arm
 /// sets `*tlsEnabled = true`), so the cert+key pair must still be supplied. The
-/// public port is allocated for `Protocols::UDP` because QUIC runs over UDP.
+/// public port is reserved for `Protocols::UDP` only — ex-ray's QUIC server
+/// binds a single UDP socket there, nothing else.
 ///
 /// Works with either the **galoshes** binary (which drives its embedded ex-ray)
 /// or a bare **ex-ray** binary: since bindreams/hole#421, ex-ray UDP-probes its
@@ -178,16 +182,19 @@ impl Drop for PluginServer {
 ///
 /// The public port is PRE-ALLOCATED. ex-ray rejects port 0 (v2ray-core does not
 /// expose an OS-assigned bound port — see crates/ex-ray/main.go), so an ephemeral
-/// public listener is impossible. The narrow window between `free_port` releasing
-/// the probe socket and the plugin subprocess binding the port is closed by
-/// retrying on the in-band `StartError::BindConflict` signal with a fresh port —
-/// the same unbounded "no budget" discipline as `port_alloc::bind_ephemeral`
-/// (terminates only on ready or a non-race error; the nextest per-test timeout is
-/// the failure-to-human bound).
+/// public listener is impossible. `public_bind_protocols` names what the plugin
+/// SUBPROCESS binds there — TCP for WS/WS-TLS, UDP for QUIC — not a property of
+/// the wire transport. The narrow window between the reservation releasing its
+/// probe socket and the plugin subprocess binding the port is closed by retrying
+/// on the in-band `StartError::BindConflict` signal with a fresh port — the same
+/// unbounded "no budget" discipline as `port_alloc::bind_ephemeral` (terminates
+/// only on ready or a non-race error; the failure-to-human bound is `ci.yaml`'s
+/// 45-minute job timeout, which reports as `cancelled`, not a test failure — the
+/// milestone logging below leaves evidence if that fires).
 async fn spawn_ss_with_plugin(
     method: CipherKind,
     password: &str,
-    protocols: Protocols,
+    public_bind_protocols: Protocols,
     plugin_path: &str,
     plugin_opts: &str,
 ) -> (SocketAddr, PluginServer) {
@@ -200,14 +207,13 @@ async fn spawn_ss_with_plugin(
     loop {
         attempt += 1;
 
-        // Pre-allocate the public port. `free_port` (not `bind_ephemeral`)
-        // because the port must be returned to us so the plugin SUBPROCESS can
-        // bind it out-of-process — the documented exception to the bind_ephemeral
-        // rule (CONTRIBUTING.md#port-allocation / clippy.toml).
-        #[allow(clippy::disallowed_methods)]
-        let public_port = port_alloc::free_port(IpAddr::V4(Ipv4Addr::LOCALHOST), protocols)
+        // Pre-allocate the public port through the crate's reservation seam —
+        // the port must be returned to us so the plugin SUBPROCESS can bind it
+        // out-of-process.
+        let public_port = ports::reserve_public(public_bind_protocols)
             .await
-            .expect("spawn_ss_with_plugin: allocate public port");
+            .expect("spawn_ss_with_plugin: allocate public port")
+            .port();
 
         // Sanctioned: plugin-e2e is outside the bridge cancel chain (clippy.toml
         // `CancellationToken::new` rule); this token owns the chain's whole life

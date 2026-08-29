@@ -20,6 +20,16 @@ fn main() {
     skuld::run_all();
 }
 
+// A skuld label is declared exactly once per binary; every module in this
+// file that gates a test on ephemeral-port contention names this one.
+#[skuld::label]
+const PORT_ALLOC: skuld::Label;
+
+/// Class-2 subprocess failure bound, matching `spawn_ss_with_plugin`'s. If a
+/// guard this file relies on regresses and a spawned galoshes runs forever,
+/// this names that instead of hanging the suite with no captured output.
+const EXIT_BUDGET: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// Focused launcher smoke check (all platforms): the garter-based fixture
 /// returns a LIVE, bound loopback public TCP address for a galoshes WS server —
 /// no `PluginConfig`, no `wait_for_port`. Isolates "did the launcher come up"
@@ -55,43 +65,24 @@ mod launcher_smoke {
 /// galoshes' own framing. The bridge relays this stderr into its own log.
 mod malformed_options {
     use plugin_e2e::locators::locate_built_galoshes;
+    use plugin_e2e::ports;
     use plugin_e2e::util::{require_binary, rt};
-    use std::net::{IpAddr, Ipv4Addr};
-    use std::time::Duration;
-    use tokio::net::TcpListener;
     use tokio::process::Command;
-    use util::port_alloc::{self, Protocols};
 
-    const LOOPBACK: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
-
-    /// Class-2 subprocess failure bound, matching `spawn_ss_with_plugin`'s. If the
-    /// guard regresses galoshes binds and runs forever; this names that instead of
-    /// hanging the suite with no captured output.
-    const EXIT_BUDGET: Duration = Duration::from_secs(60);
-
-    /// A port that was free a moment ago. The refused path never binds — the guard
-    /// runs before the chain starts — so this only has to be plausible; it exists
-    /// so an occupied port cannot masquerade as the guard firing.
-    async fn free_tcp_port() -> u16 {
-        let (port, _listener) = port_alloc::bind_ephemeral(LOOPBACK, Protocols::TCP, |p| async move {
-            TcpListener::bind((Ipv4Addr::LOCALHOST, p)).await
-        })
-        .await
-        .expect("allocate a loopback tcp port");
-        port
-    }
+    use super::EXIT_BUDGET;
 
     #[skuld::test]
     fn a_dangling_escape_stops_galoshes_with_a_named_reason() {
         let g = locate_built_galoshes();
         require_binary(&g, "run `cargo xtask ex-ray && cargo xtask galoshes`");
         rt().block_on(async {
-            let (local, remote) = (free_tcp_port().await, free_tcp_port().await);
+            let local = ports::reserve_ss_local().await.expect("reserve SS_LOCAL");
+            let remote = ports::reserve_unbound().await.expect("reserve SS_REMOTE");
             let child = Command::new(&g)
                 .env("SS_LOCAL_HOST", "127.0.0.1")
-                .env("SS_LOCAL_PORT", local.to_string())
+                .env("SS_LOCAL_PORT", local.port().to_string())
                 .env("SS_REMOTE_HOST", "127.0.0.1")
-                .env("SS_REMOTE_PORT", remote.to_string())
+                .env("SS_REMOTE_PORT", remote.port().to_string())
                 .env("SS_PLUGIN_OPTIONS", "host=cloudfront.com;path=/a\\")
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped())
@@ -135,8 +126,7 @@ mod roundtrips {
     #[cfg(not(target_os = "windows"))]
     use plugin_e2e::ssserver::{start_real_ss_server_with_plugin_quic, start_real_ss_server_with_plugin_ws_tls};
 
-    #[skuld::label]
-    const PORT_ALLOC: skuld::Label;
+    use super::PORT_ALLOC;
 
     fn require_galoshes() -> String {
         let p = locate_built_galoshes();
@@ -420,6 +410,99 @@ mod roundtrips {
                 matches!(outcome, Roundtrip::Reachable { .. }),
                 "quic ech=auto control: {outcome:?}"
             );
+        });
+    }
+}
+
+/// Pin the premise that makes SS_LOCAL's TCP+UDP reservation necessary: a
+/// galoshes client really does bind UDP there, unconditionally. This is not a
+/// RED test for bindreams/hole#931's fix — it passes both before and after —
+/// it is a deterministic pin on the premise. It fails loudly the day galoshes
+/// stops binding UDP on SS_LOCAL, which is the day the reservation could be
+/// narrowed.
+mod ss_local {
+    use std::net::{Ipv4Addr, SocketAddr};
+
+    use plugin_e2e::locators::locate_built_galoshes;
+    use plugin_e2e::ports;
+    use plugin_e2e::util::{require_binary, rt};
+    use tokio::net::UdpSocket;
+    use tokio::process::Command;
+    use util::port_alloc::{self, Protocols};
+
+    use super::{EXIT_BUDGET, PORT_ALLOC};
+
+    /// galoshes' yamux client (`run_client`) binds UDP after TCP, wrapped in
+    /// `.context("bind local UDP")`. The anyhow context string is the only
+    /// observable that separates a UDP-half bind failure from a TCP-half one.
+    const UDP_BIND_PHRASE: &str = "bind local UDP";
+    /// The TCP-half counterpart, `.context("bind local TCP")` around
+    /// `run_client`'s `TcpListener::bind`. Used as a negative check, so a
+    /// UDP-phrase match can't be a coincidental substring of a TCP failure.
+    const TCP_BIND_PHRASE: &str = "bind local TCP";
+
+    #[skuld::test(labels = [PORT_ALLOC], serial = PORT_ALLOC)]
+    fn galoshes_client_fails_when_ss_local_is_taken_on_udp() {
+        let g = locate_built_galoshes();
+        require_binary(&g, "run `cargo xtask ex-ray && cargo xtask galoshes`");
+        let g = g.to_str().expect("galoshes path is valid utf-8").to_string();
+
+        rt().block_on(async {
+            loop {
+                // Probe TCP free, verify UDP free, then bind-and-HOLD the UDP
+                // half for the whole galoshes run below — the TCP half stays
+                // free, so a real regression can't hide behind a TCP failure
+                // instead.
+                let (port, _udp_occupier) = port_alloc::bind_ephemeral(
+                    Ipv4Addr::LOCALHOST.into(),
+                    Protocols::TCP | Protocols::UDP,
+                    |p| async move { UdpSocket::bind((Ipv4Addr::LOCALHOST, p)).await },
+                )
+                .await
+                .expect("allocate a loopback port with the UDP half held");
+                let local: SocketAddr = (Ipv4Addr::LOCALHOST, port).into();
+
+                let remote = ports::reserve_unbound().await.expect("reserve SS_REMOTE");
+
+                let child = Command::new(&g)
+                    .env("SS_LOCAL_HOST", "127.0.0.1")
+                    .env("SS_LOCAL_PORT", port.to_string())
+                    .env("SS_REMOTE_HOST", remote.ip().to_string())
+                    .env("SS_REMOTE_PORT", remote.port().to_string())
+                    .env("SS_PLUGIN_OPTIONS", "host=cloudfront.com;path=/")
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped())
+                    .kill_on_drop(true)
+                    .spawn()
+                    .expect("galoshes must be spawnable");
+
+                let out = tokio::time::timeout(EXIT_BUDGET, child.wait_with_output())
+                    .await
+                    .expect("galoshes did not exit within the budget — the SS_LOCAL UDP-bind guard did not fire")
+                    .expect("galoshes output");
+
+                assert!(!out.status.success(), "galoshes must refuse to start: {:?}", out.status);
+                let stderr = String::from_utf8_lossy(&out.stderr);
+
+                if stderr.contains(UDP_BIND_PHRASE) && !stderr.contains(TCP_BIND_PHRASE) {
+                    break;
+                }
+
+                // The child didn't name the UDP bind. Distinguish a spurious
+                // TCP-half race (another allocator in the workspace took the
+                // TCP half in the window between our probe and galoshes'
+                // bind) from a real regression, by evidence, not by a string:
+                // retry only if TCP is observably NOT free right now.
+                drop(_udp_occupier);
+                match port_alloc::ensure_port_free(local, Protocols::TCP).await {
+                    Err(_) => continue,
+                    Ok(()) => panic!(
+                        "galoshes did not name the UDP bind as its failure reason, and TCP was free \
+                         the whole time (so this isn't the probe-vs-child TCP race) — this is a real \
+                         regression in galoshes' SS_LOCAL UDP bind. stderr:\n{stderr}"
+                    ),
+                }
+            }
         });
     }
 }

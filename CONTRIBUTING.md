@@ -215,14 +215,26 @@ crate so both Hole's GPL crates and the Apache plugin world can depend on it.
 - `free_port` — primitive that returns a verified-free port divorced from a bound
   socket. **Direct callers are clippy-`disallowed_methods`** — use
   `bind_ephemeral`, or `#[allow]` + comment when the port must reach a subprocess
-  before the bind (`test_support::port_alloc::allocate_ephemeral_port` is the
-  sanctioned exception).
+  before the bind. Two sanctioned exceptions:
+  `test_support::port_alloc::allocate_ephemeral_port` and `plugin_e2e::ports`.
 - `ensure_port_free` — pure probe without allocation.
 
 The retry exists because Windows keeps **independent TCP/UDP excluded-port-range
 tables** (Hyper-V/WSL/Docker reservations); an OS-picked port for one transport
 may be reserved for the other. There is no "right" budget — a saturated runner
 needs many retries, a healthy machine one. See #285, #300, #304.
+
+**Reserve for the protocols the consumer will bind.** Where the consumer is
+known at reservation time, name it exactly —
+`hole_common::plugin::plugin_alloc_protocols` keys SS_LOCAL by binary (galoshes
+TCP+UDP, everything else TCP). Where the reservation happens before the
+consumer is known, reserve the union over the possible consumers:
+`plugin_e2e::ports::reserve_ss_local` is generic over which client plugin will
+run, and that set includes galoshes, so it always reserves TCP+UDP —
+over-reserving UDP for a TCP-only plugin costs a retry, under-reserving it for
+galoshes costs a race. `garter::chain::allocate_ports` verifies TCP only and is
+clippy-banned outside garter's own chain-internal use, which carries a per-site
+allow.
 
 ### Proxy shutdown contract
 
