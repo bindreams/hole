@@ -33,7 +33,7 @@ async fn covered_start_holding_the_cover(
     lockdown_state::set_enabled(dir.path(), false, None).unwrap();
     let mut pm = ProxyManager::new(MockProxy::new(), routing).with_state_dir(dir.path().to_path_buf());
     let mut cfg = test_config();
-    cfg.server.server = closed.ip().to_string();
+    cfg.server.server = closed.ip().to_string().into();
     cfg.server.server_port = closed.port();
     cfg.dns.enabled = true;
     cfg.dns.servers = vec!["127.0.0.1".parse().unwrap()];

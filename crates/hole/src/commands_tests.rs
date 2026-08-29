@@ -8,7 +8,7 @@ fn test_entry(id: &str) -> ServerEntry {
     ServerEntry {
         id: id.to_string(),
         name: format!("Server {id}"),
-        server: "1.2.3.4".to_string(),
+        server: "1.2.3.4".into(),
         server_port: 8388,
         method: "aes-256-gcm".to_string(),
         password: "pw".to_string(),
@@ -675,7 +675,7 @@ fn entry(id: &str, server: &str, port: u16) -> ServerEntry {
     ServerEntry {
         id: id.to_string(),
         name: format!("Server {id}"),
-        server: server.to_string(),
+        server: server.into(),
         server_port: port,
         method: "aes-256-gcm".to_string(),
         password: "pw".to_string(),
@@ -745,7 +745,7 @@ fn apply_import_deduplicates_against_existing() {
     ];
     let (appended, deduped) = apply_import(&mut config, parsed);
     assert_eq!(appended.len(), 1);
-    assert_eq!(appended[0].server, "10.0.0.2");
+    assert_eq!(appended[0].server.expose(), "10.0.0.2");
     assert_eq!(deduped, 1);
     assert_eq!(config.servers.len(), 2);
 }
@@ -1076,4 +1076,67 @@ fn evaluate_filter_serializes_with_expected_wire_shape() {
     assert_eq!(json["action"], "block");
     assert_eq!(json["rule_index"], 1);
     assert_eq!(json["matched_address"], "blocked.com");
+}
+
+// Redaction arming ====================================================================================================
+
+/// Every mutation that can put an address the process has not seen into the
+/// config arms it. The address is UI-owned and editable, so a save can
+/// introduce one without any import happening.
+#[skuld::test]
+fn saving_a_config_arms_a_newly_added_entry() {
+    use hole_common::logging::redact_arm::token_for;
+
+    const EDITED_ID: &str = "33333333-0000-4000-8000-000000000000";
+    let mut config = AppConfig {
+        servers: vec![test_entry(EDITED_ID)],
+        ..Default::default()
+    };
+    let settings = crate::ui_settings::UiSettings {
+        servers: vec![crate::ui_settings::UiServerEntry {
+            id: EDITED_ID.to_string(),
+            name: "Test".to_string(),
+            server: "203.0.113.7".to_string(),
+            server_port: 8388,
+            method: "aes-256-gcm".to_string(),
+            password: "pw".to_string(),
+            plugin: None,
+            plugin_opts: None,
+        }],
+        selected_server: Some(EDITED_ID.to_string()),
+        local_port: 4073,
+        filters: Vec::new(),
+        on_startup: Default::default(),
+        theme: Default::default(),
+        proxy_server_enabled: true,
+        proxy_socks5: true,
+        proxy_http: false,
+        dns: Default::default(),
+        local_port_http: 4074,
+        diagnostic_plugin_tap: false,
+    };
+
+    apply_ui_settings(&mut config, settings);
+    assert_eq!(
+        config.servers[0].server.expose(),
+        "203.0.113.7",
+        "setup: the edit applied"
+    );
+
+    assert_eq!(util::redact::redact_str("203.0.113.7"), token_for(EDITED_ID));
+}
+
+#[skuld::test]
+fn importing_a_file_arms_the_appended_entries() {
+    use hole_common::logging::redact_arm::token_for;
+
+    const IMPORTED_ID: &str = "44444444-0000-4000-8000-000000000000";
+    let mut config = AppConfig::default();
+    let mut imported = test_entry(IMPORTED_ID);
+    imported.server = "203.0.113.9".into();
+
+    let (appended, _) = apply_import(&mut config, vec![imported]);
+    assert_eq!(appended.len(), 1, "setup: the entry must actually be appended");
+
+    assert_eq!(util::redact::redact_str("203.0.113.9"), token_for(IMPORTED_ID));
 }

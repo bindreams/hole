@@ -37,11 +37,11 @@
 //! `serial = TUN` (reusing `lockdown_privileged_tests`'s label — a second
 //! `#[skuld::label] const TUN` in this binary would mint a DIFFERENT serial
 //! token and race the very cover tests this must exclude) plus the
-//! `global-net-state` nextest test-group serialize this across the whole
+//! `global_net_state` nextest test-group serialize this across the whole
 //! elevated lane; see `.config/nextest.toml`.
 //!
 //! COUPLED NAMES: both test names below contain the literal substring
-//! `live_tun_permit_`, which `.config/nextest.toml`'s `global-net-state`
+//! `live_tun_permit_`, which `.config/nextest.toml`'s `global_net_state`
 //! filter matches. Renaming either without updating that filter silently
 //! drops it from the group.
 //!
@@ -642,7 +642,7 @@ fn windows_unknown_alias_pin(state_dir: &Path) {
 
 /// Windows: see the module doc for the four-phase shape and the anti-vacuity
 /// argument. `serial = TUN` (reusing `lockdown_privileged_tests`'s label) +
-/// the `global-net-state` test-group serialize this across the elevated lane.
+/// the `global_net_state` test-group serialize this across the elevated lane.
 #[cfg(target_os = "windows")]
 #[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
 fn windows_live_tun_permit_passes_traffic_on_the_interface_it_names() {

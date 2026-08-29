@@ -249,6 +249,31 @@ pub struct ProxyConfig {
     pub diagnostic_plugin_tap: bool,
 }
 
+/// Same ladder trap as [`crate::config::ServerEntry`]'s, one level up:
+/// `ProxyConfig` derives `Serialize` and holds a `ServerEntry`, so without
+/// this impl `dump!(&config)` — which is what `handle_start` holds — renders
+/// the address and the password in clear.
+impl dump::Dump for ProxyConfig {
+    fn dump(&self) -> dump::DumpValue {
+        use dump::DumpValue;
+        let key = |k: &str| DumpValue::String(k.to_string());
+        DumpValue::Map(vec![
+            (key("server"), self.server.dump()),
+            (key("local_port"), dump::from_serialize(&self.local_port)),
+            (key("tunnel_mode"), dump::from_serialize(&self.tunnel_mode)),
+            (key("filters"), dump::from_serialize(&self.filters)),
+            (key("dns"), dump::from_serialize(&self.dns)),
+            (key("proxy_socks5"), dump::from_serialize(&self.proxy_socks5)),
+            (key("proxy_http"), dump::from_serialize(&self.proxy_http)),
+            (key("local_port_http"), dump::from_serialize(&self.local_port_http)),
+            (
+                key("diagnostic_plugin_tap"),
+                dump::from_serialize(&self.diagnostic_plugin_tap),
+            ),
+        ])
+    }
+}
+
 mod proxy_config_defaults {
     pub(super) fn proxy_socks5() -> bool {
         true

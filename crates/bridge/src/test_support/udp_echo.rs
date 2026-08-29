@@ -3,13 +3,13 @@
 //! Two binding shapes:
 //!
 //! * [`UdpEchoServer::start`] — binds `0.0.0.0:0` and reports the host's
-//!   primary non-loopback IPv4. Required for TUN-mode tests because the
-//!   bridge's `route add 127.0.0.1 ...` bypass redirects loopback
-//!   traffic around the TUN adapter (see
-//!   `proxy_manager_e2e_tests.rs` `run_full_tunnel_e2e` caveat).
+//!   primary non-loopback IPv4. Like the TCP sentinel, that address is one
+//!   the host holds, so datagrams to it are delivered locally and never
+//!   reach `hole-tun` (see
+//!   `proxy_manager_e2e_tests.rs::tun::run_full_tunnel_local_networking_e2e`).
 //! * [`UdpEchoServer::start_loopback`] — binds and reports
-//!   `127.0.0.1:0`. For SocksOnly-mode tests, where there is no TUN
-//!   and therefore no loopback bypass; loopback delivery is direct.
+//!   `127.0.0.1:0`. For SocksOnly-mode tests, where there is no TUN;
+//!   loopback delivery is direct.
 //!
 //! `Drop` aborts the echo task.
 
@@ -35,7 +35,7 @@ impl UdpEchoServer {
         Ok(Self::spawn(sock, reported))
     }
 
-    /// Bind and report `127.0.0.1:0`. For tests that don't go through TUN.
+    /// Bind and report `127.0.0.1:0`. For tests with no TUN in the picture.
     pub async fn start_loopback() -> std::io::Result<Self> {
         let sock = UdpSocket::bind("127.0.0.1:0").await?;
         let reported = sock.local_addr()?;

@@ -362,7 +362,7 @@ fn run_test_returns_internal_error_for_unsupported_cipher() {
         let preflight_addr = listener.local_addr().unwrap();
         // Hold the listener — drop at end of scope cleans up.
         let mut entry_with_real_addr = entry;
-        entry_with_real_addr.server = preflight_addr.ip().to_string();
+        entry_with_real_addr.server = preflight_addr.ip().to_string().into();
         entry_with_real_addr.server_port = preflight_addr.port();
 
         let outcome = run_server_test(&entry_with_real_addr, &cfg).await;
@@ -588,6 +588,7 @@ fn run_test_reclassify_handshake_failed_reset_is_network_blocked() {
             ServerTestOutcome::TunnelHandshakeFailed,
             &addr.ip().to_string(),
             addr.port(),
+            "<server:00000000>",
             Some("galoshes"),
             Some("tls;host=h"),
             &CancellationToken::new(),
@@ -719,6 +720,7 @@ fn run_test_reclassify_handshake_failed_answered_stays_handshake_failed() {
             ServerTestOutcome::TunnelHandshakeFailed,
             &addr.ip().to_string(),
             addr.port(),
+            "<server:00000000>",
             Some("galoshes"),
             Some("tls;host=h"),
             &CancellationToken::new(),
@@ -811,6 +813,7 @@ fn run_test_reclassify_cannot_reach_reset_is_network_blocked() {
             ServerTestOutcome::ServerCannotReachInternet,
             &addr.ip().to_string(),
             addr.port(),
+            "<server:00000000>",
             Some("galoshes"),
             Some("tls;host=h"),
             &CancellationToken::new(),
@@ -860,6 +863,7 @@ fn run_test_reclassify_reachable_passes_through() {
             ServerTestOutcome::Reachable { latency_ms: 5 },
             &addr.ip().to_string(),
             addr.port(),
+            "<server:00000000>",
             Some("galoshes"),
             Some("tls;host=h"),
             &CancellationToken::new(),
@@ -881,6 +885,7 @@ fn run_test_reclassify_plugin_start_failed_passes_through() {
             ServerTestOutcome::PluginStartFailed { detail: "x".into() },
             &addr.ip().to_string(),
             addr.port(),
+            "<server:00000000>",
             Some("galoshes"),
             Some("tls;host=h"),
             &CancellationToken::new(),

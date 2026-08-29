@@ -54,7 +54,7 @@ fn socks_only_config(server: SocketAddr, local_port: u16) -> shadowsocks_service
     let entry = ServerEntry {
         id: "shadowsocks-shutdown-test".into(),
         name: "shadowsocks-shutdown-test".into(),
-        server: server.ip().to_string(),
+        server: server.ip().to_string().into(),
         server_port: server.port(),
         method: TEST_METHOD_STR.into(),
         password: TEST_PASSWORD.into(),
@@ -86,7 +86,7 @@ fn http_only_config(server: SocketAddr, local_port_http: u16) -> shadowsocks_ser
     let entry = ServerEntry {
         id: "shadowsocks-shutdown-test".into(),
         name: "shadowsocks-shutdown-test".into(),
-        server: server.ip().to_string(),
+        server: server.ip().to_string().into(),
         server_port: server.port(),
         method: TEST_METHOD_STR.into(),
         password: TEST_PASSWORD.into(),

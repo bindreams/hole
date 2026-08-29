@@ -1,6 +1,6 @@
-//! `BlockEndpoint` — drops flows instead of carrying them.
+//! `BlockEndpoint` — the diagnostic voice of the router's drop path.
 //!
-//! Terminal of the router's dispatch cascade for three distinct reasons:
+//! The cascade drops a flow for three distinct reasons:
 //!
 //! 1. `FilterAction::Block` — the user's rules explicitly asked to block.
 //! 2. **Privacy invariant** — `FilterAction::Proxy` + UDP + the plugin
@@ -10,14 +10,21 @@
 //! 3. **Reachability** — `FilterAction::Bypass` + IPv6 destination +
 //!    upstream interface has no IPv6. This is just "we can't deliver it."
 //!
-//! The [`Endpoint`] impl drops the flow (smoltcp emits RST for TCP, the
-//! UDP flow's idle sweep evicts for UDP). Diagnostic logging is exposed
-//! via dedicated methods ([`BlockEndpoint::log_rule_block_tcp`],
+//! **None of the three reaches the [`Endpoint`] impl below.** All three
+//! resolve to `Dispatch::Drop` in `resolve_endpoint`, and the router carries
+//! the drop out inline — releasing the flow, which makes the driver close the
+//! TCP socket with a graceful FIN and lets the UDP flow's idle sweep evict the
+//! entry. What the router calls here are the four log methods
+//! ([`BlockEndpoint::log_rule_block_tcp`],
 //! [`BlockEndpoint::log_rule_block_udp`],
 //! [`BlockEndpoint::log_udp_proxy_unavailable`],
-//! [`BlockEndpoint::log_ipv6_bypass_unreachable`]) that the router calls
-//! before `serve_*` so the log message can distinguish the three drop
-//! reasons.
+//! [`BlockEndpoint::log_ipv6_bypass_unreachable`]), which is how a log line
+//! distinguishes the three reasons.
+//!
+//! The [`Endpoint`] impl is retained but unreachable from the cascade: it
+//! keeps `BlockEndpoint` substitutable into an `Endpoint` slot, and
+//! `block_endpoint_has_uniform_capabilities` pins its answers. Do not read it
+//! as the mechanism behind a dropped flow — the router's inline release is.
 
 use std::io;
 use std::net::SocketAddr;
@@ -50,7 +57,7 @@ impl BlockEndpoint {
     }
 
     /// Log a rule-caused TCP block. Called from the router's dispatch
-    /// loop before [`BlockEndpoint::serve_tcp`] drops the flow.
+    /// loop, which then releases the flow inline.
     pub fn log_rule_block_tcp(&self, rule_index: u32, dst: SocketAddr, domain: Option<&str>) {
         let should_log = self.block_log.lock().unwrap().should_log(rule_index, dst);
         if should_log {
@@ -107,19 +114,15 @@ impl Default for BlockEndpoint {
     }
 }
 
+// Unreachable from the cascade — see the module doc. Retained so `BlockEndpoint`
+// stays substitutable into an `Endpoint` slot.
 #[async_trait]
 impl Endpoint for BlockEndpoint {
     async fn serve_tcp(&self, _flow: &mut TcpFlow, _dst: SocketAddr) -> io::Result<()> {
-        // Drop — smoltcp sends RST as `flow` goes out of scope up the
-        // call chain. Logging happens on the router side via the
-        // `log_*` methods above, because the router has the decision
-        // context (rule_index, reason).
         Ok(())
     }
 
     async fn serve_udp(&self, _flow: UdpFlow, _dst: SocketAddr) -> io::Result<()> {
-        // Drop — the UDP flow's idle sweep evicts the 5-tuple entry
-        // from the engine once no more datagrams arrive.
         Ok(())
     }
 
