@@ -52,6 +52,9 @@ pub mod gateway;
 pub mod helpers;
 pub mod net;
 pub mod routing;
+#[cfg(any(test, feature = "test-utils"))]
+#[doc(hidden)]
+pub mod sim;
 
 // Dev-only; see the module doc. `cfg(test)` so this crate's own privileged
 // tests get it without the feature.

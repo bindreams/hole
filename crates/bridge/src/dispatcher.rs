@@ -14,7 +14,8 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 use tun_engine::{Assigned, Device, Engine, MutDeviceConfig};
 
-use crate::endpoint::{BlockEndpoint, InterfaceEndpoint, LocalDnsEndpoint, Socks5Endpoint};
+use crate::drop_sink::LoggingDropSink;
+use crate::endpoint::{InterfaceEndpoint, LocalDnsEndpoint, Socks5Endpoint};
 use crate::filter::rules::RuleSet;
 use crate::hole_router::HoleRouter;
 use crate::proxy::{TUN_DEVICE_NAME, TUN_SUBNET, TUN_SUBNET6};
@@ -95,15 +96,15 @@ impl Dispatcher {
         // frozen config, so no later read is possible.
         let ipv6_assigned = device.ipv6_assigned();
 
-        // Build the three endpoints and the HoleRouter.
+        // Build the two endpoints, the drop sink, and the HoleRouter.
         let proxy_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), local_port);
         let proxy = Socks5Endpoint::new(proxy_addr, plugin_name, plugin_supports_udp);
         let bypass = InterfaceEndpoint::new(iface_index, ipv6_available);
-        let block = BlockEndpoint::new();
+        let drops = LoggingDropSink::new();
         let router = Arc::new(HoleRouter::with_local_dns(
             proxy,
             bypass,
-            block,
+            drops,
             local_dns_endpoint,
             rules,
         ));

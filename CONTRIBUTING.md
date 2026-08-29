@@ -50,11 +50,13 @@ Hole is a VPN. UDP flows whose filter decision resolves to `Proxy` are
 v2ray-plugin is TCP-only) — bypassing to the clear-text upstream would leak the
 flow outside the tunnel. The invariant is structurally enforced by the cascade
 in [`HoleRouter::resolve_endpoint`](crates/bridge/src/hole_router.rs):
-`Proxy` + UDP + `!supports_udp()` resolves to `&self.block`, never
+`Proxy` + UDP + `!supports_udp()` resolves to a drop, never to
 `&self.bypass`. UDP-capable plugins (galoshes, via YAMUX) tunnel UDP normally.
-The three drop reasons (rule block, UDP-proxy-unavailable, IPv6-bypass-unreachable)
-each log through dedicated [`BlockEndpoint`](crates/bridge/src/endpoint/block.rs)
-methods.
+A drop is not a dispatch — nothing serves the flow. The three drop reasons
+(rule block, UDP-proxy-unavailable, IPv6-bypass-unreachable) each get their own
+method on [`DropSink`](crates/bridge/src/drop_sink.rs), whose production impl
+logs them; tests substitute a recording sink, which is what makes this invariant
+assertable.
 
 **UDP/53 exception.** When DNS is enabled, UDP/53 is diverted to
 [`LocalDnsEndpoint`](crates/bridge/src/endpoint/local_dns.rs) *before* the

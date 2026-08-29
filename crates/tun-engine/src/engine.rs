@@ -31,7 +31,7 @@ mod tcp_flow;
 // by `socket_stack_tests.rs` and `driver_tests.rs`; see the module docs.
 #[cfg(test)]
 mod tcp_test_support;
-mod udp_flow;
+pub(crate) mod udp_flow;
 mod virtual_device;
 
 use std::sync::Arc;

@@ -3,6 +3,7 @@ pub mod diagnostics;
 pub mod dispatcher;
 pub mod dns;
 pub mod dns_state;
+pub mod drop_sink;
 pub mod endpoint;
 pub mod filter;
 pub mod foreground;
