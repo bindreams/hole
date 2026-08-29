@@ -113,23 +113,31 @@ pub async fn run_server_test(entry: &ServerEntry, cfg: &TestConfig) -> ServerTes
         #[cfg(test)]
         {
             match &cfg.bootstrap_querier {
-                Some(q) => crate::dns::bootstrap::resolve_via_doh_with(&entry.server, &cfg.dns, q.clone()).await,
-                None => crate::dns::bootstrap::resolve_via_doh(&entry.server, &cfg.dns).await,
+                Some(q) => {
+                    crate::dns::bootstrap::resolve_via_doh_with(entry.server.expose(), &cfg.dns, q.clone()).await
+                }
+                None => crate::dns::bootstrap::resolve_via_doh(entry.server.expose(), &cfg.dns).await,
             }
         }
         #[cfg(not(test))]
         {
-            crate::dns::bootstrap::resolve_via_doh(&entry.server, &cfg.dns).await
+            crate::dns::bootstrap::resolve_via_doh(entry.server.expose(), &cfg.dns).await
         }
     };
     let bootstrapped = match resolved {
         Ok(b) => b,
         Err(e) => {
-            tracing::warn!(host = %entry.server, error = %e, "server_test: DoH bootstrap failed");
+            tracing::warn!(
+                server = %hole_common::logging::redact_arm::token_for(&entry.id),
+                server_kind = hole_common::logging::redact_arm::server_kind(entry.server.expose()),
+                error = %e,
+                "server_test: DoH bootstrap failed"
+            );
             return ServerTestOutcome::DnsFailed;
         }
     };
     let server_ip = bootstrapped.server_ip;
+    hole_common::logging::redact_arm::arm_resolved_ip(&entry.id, server_ip);
     let server_host = crate::dns::bootstrap::handoff_host(server_ip);
 
     // Phase 1: pre-flight DNS + TCP probe. Skipped for a QUIC server: its
@@ -205,6 +213,7 @@ pub async fn run_server_test(entry: &ServerEntry, cfg: &TestConfig) -> ServerTes
         // must not OS-resolve the hostname (that would reopen the DNS leak).
         &server_ip.to_string(),
         entry.server_port,
+        &hole_common::logging::redact_arm::token_for(&entry.id),
         entry.plugin.as_deref(),
         entry.plugin_opts.as_deref(),
         // One-shot probe; no caller-side cancel exists in run_server_test.
@@ -236,13 +245,14 @@ async fn reclassify_blocked(
     tunnel_outcome: ServerTestOutcome,
     host: &str,
     port: u16,
+    token: &str,
     plugin: Option<&str>,
     plugin_opts: Option<&str>,
     cancel: &CancellationToken,
 ) -> ServerTestOutcome {
     match tunnel_outcome {
         ServerTestOutcome::TunnelHandshakeFailed | ServerTestOutcome::ServerCannotReachInternet => {
-            if crate::reachability::probe_server_reachability(host, port, plugin, plugin_opts, cancel).await
+            if crate::reachability::probe_server_reachability(host, port, token, plugin, plugin_opts, cancel).await
                 == crate::reachability::ReachabilityVerdict::Blocked
             {
                 ServerTestOutcome::NetworkBlocked
@@ -273,8 +283,11 @@ async fn reclassify_blocked(
 /// TCP connect can't distinguish "genuinely TCP" from "unclassifiable" to
 /// make that guess safely.
 fn server_endpoint_is_udp(entry: &ServerEntry) -> bool {
-    match crate::reachability::classify_transport(entry.plugin.as_deref(), entry.plugin_opts.as_deref(), &entry.server)
-    {
+    match crate::reachability::classify_transport(
+        entry.plugin.as_deref(),
+        entry.plugin_opts.as_deref(),
+        entry.server.expose(),
+    ) {
         Ok(crate::reachability::ProbeTransport::Quic { .. }) => true,
         Ok(_) => false,
         Err(e) => {

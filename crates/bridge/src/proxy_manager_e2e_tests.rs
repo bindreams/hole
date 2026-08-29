@@ -61,7 +61,7 @@ fn entry_from(ss: &SsServerHandle) -> ServerEntry {
     ServerEntry {
         id: "e2e-test".into(),
         name: "e2e-test".into(),
-        server: ss.addr.ip().to_string(),
+        server: ss.addr.ip().to_string().into(),
         server_port: ss.addr.port(),
         method: ss.method.into(),
         password: ss.password.clone(),
@@ -843,7 +843,7 @@ fn cipher_chacha20_ietf_poly1305_roundtrip(
             server: ServerEntry {
                 id: "cipher-test".into(),
                 name: "cipher-test".into(),
-                server: ss_addr.ip().to_string(),
+                server: ss_addr.ip().to_string().into(),
                 server_port: ss_addr.port(),
                 method: "chacha20-ietf-poly1305".into(),
                 password,
@@ -899,7 +899,7 @@ fn cipher_2022_blake3_aes_256_gcm_roundtrip(
             server: ServerEntry {
                 id: "cipher-test".into(),
                 name: "cipher-test".into(),
-                server: ss_addr.ip().to_string(),
+                server: ss_addr.ip().to_string().into(),
                 server_port: ss_addr.port(),
                 method: "2022-blake3-aes-256-gcm".into(),
                 password,

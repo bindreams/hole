@@ -1409,7 +1409,87 @@ line/column — never the raw `serde_json` message (which can echo a password).
 `warn!` and shows the path-free message in the toast. **(2) A detail-free
 structured wire variant + `warn!`** when the detail itself could carry
 content/PII: `import_servers_from_file` returns `ImportFailure::SaveFailed` /
-`CorruptedJson` (no fields) and logs the full error.
+`CorruptedJson` (no fields) and logs the full error. **(3) The redaction
+registry** ([below](#server-address-redaction)) for the configured server
+address, which no per-site rule can cover.
+
+### Server-address redaction
+
+The configured server address — hostname, DoH-resolved IP, and every textual
+form of either — is replaced by an opaque token before it reaches a log file,
+the dev console, a toast, or the support bundle. For a censorship-circumvention
+VPN it is the most sensitive value on the machine, and the default log filter is
+a **global `info`** (`build_filter` seeds `info` and *then* adds
+`hole_bridge=info`), so every crate in the process — third-party ones included —
+can write one. That set is not enumerable in advance, which is why the sink
+layer carries the weight.
+
+**What is covered.** [`util::redact`](crates/util/src/redact.rs) holds a
+process-global registry of armed literals behind an `ArcSwap` (lock-free reads,
+so no logging call can block behind a concurrent arm) and an `aho-corasick`
+automaton (`LeftmostLongest`, ASCII-case-insensitive). `RedactingWriter` wraps
+four non-blocking writers in `init_dual`, and **exactly one of them is a log
+file**: the `UserOwnedRotate` appender. Wrapping that one closes the file leak;
+the other three (the stderr layer's writer and the two stdio-relay tees) are the
+developer's terminal and cannot reopen it either way.
+
+**What is armed.** `arm_server` derives, from `entry.server`: the value as
+configured, its trailing-dot-stripped form, its `idna::domain_to_ascii` A-label,
+and — when it parses as an IP — that address's canonical text. `arm_resolved_ip`
+derives the bare and bracketed `[…]` forms (`handoff_host`'s IPv6 shape). **Each
+candidate is then filtered individually**, not the input string:
+`server = "127.0.0.1."` does not parse as an `IpAddr`, so a value-level carve-out
+passes it through and the trailing-dot strip arms the bare loopback address —
+turning every loopback mention in the process into a token. A candidate is armed
+unless it is empty, matches `localhost` case-insensitively, or (after stripping
+one `[`/`]` pair) parses to a loopback or unspecified address.
+
+**Tokens.** `<server:XXXXXXXX>` — the first 8 hex characters of the entry's
+random v4 UUID, never derived from the address — plus `<server:recovered>`, the
+one token minted without an entry in hand (crash recovery replays a prior run's
+routes before any config exists). Arming is keyed by literal, **last wins**: a
+re-arm re-points the literal in place and emits one `info!` naming both tokens
+and neither address, which is what joins the recovery lines to the session lines
+in a collected bundle. Replaced in place, never appended, so the automaton stays
+bounded however many times a long-running service arms.
+
+**Collisions.** Nothing validates a configured host, so `server: "hole"` is
+reachable, and arming it would rewrite `hole-tun`, `hole_bridge::proxy_manager`
+and the log-directory path throughout the file. There is no non-arbitrary
+threshold separating "too short" from "fine", so `arm` does not guess: it tests
+the candidate against `COLLISION_CORPUS`, **arms it anyway** — privacy does not
+yield — and emits one `warn!` naming the token and the collision, so the mangled
+log explains itself. The corpus's only job is that warning, so its
+incompleteness can weaken a diagnostic message and can never weaken redaction.
+
+**Prevention.** `ServerAddress` ([`config.rs`](crates/common/src/config.rs))
+implements neither `Display` nor `Deref`, so `server_host = %config.server.server`
+is a compile error and `format!("{}", *addr)` cannot reopen it. `expose()` is
+the single named exit, so grepping for it enumerates every real read site.
+
+**What replaces the address in a Hole-authored line.** `server` (the token),
+`server_kind` (`domain`/`ipv4`/`ipv6`), `server_family`, `server_scope`
+(`global`/`private`/`loopback`/`link_local`), and the unchanged `server_port`.
+Checked against the diagnoses this repo has actually needed (#248, #541, #655,
+#770, #694): none required the address. The joined `route`/`netsh` argv
+(`routing.rs`'s `log_route_command`), the ETW `remote` field, `netsh` stdout and
+garter's plugin relay deliberately get **no** per-site edit — the sink covers
+them, and hand-redaction there would rot.
+
+**Two limits, so this is not read as a total guarantee.** First, `dump!`'s
+ladder resolves per top-level expression, not per field: any `Serialize` type
+transitively holding a `ServerAddress` needs its own `Dump` impl, or the serde
+tree renders the inner string and `ServerAddress::dump` is never reached.
+`ServerEntry` and `ProxyConfig` have one; that is convention backed by
+per-container tests, not a compiler guarantee, with the sink as the backstop.
+Second, an address written in a form no armed literal is a byte-substring of —
+a percent- or punycode-escaped form from a third-party process, a non-canonical
+IPv6 text form from a peer that is not `std` — is not redacted.
+
+**Existing artifacts.** Files already on disk are not rewritten: a SYSTEM bridge
+rewriting files in a user-writable directory is an attack surface. The support
+bundle is scrubbed on collection instead, and its `REDACTION.txt` states the
+three residuals plainly.
 
 ### Logging directives (HOLE_BRIDGE_LOG)
 

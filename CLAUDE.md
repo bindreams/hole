@@ -87,6 +87,16 @@ before editing; the sections linked below are the authoritative source.
   answer, derived once from `ProxyManager`'s single `posture` field
   (`Posture::cover_holder`); no site recomputes it from session state. →
   [CONTRIBUTING.md#fail-closed-cover](CONTRIBUTING.md#fail-closed-cover)
+- **Server-address redaction.** The configured address — hostname, resolved IP,
+  every textual form — is replaced by a `<server:XXXXXXXX>` token before it
+  reaches a log, the dev console, a toast, or the support bundle. A byte-level
+  `RedactingWriter` under the **one** log-file writer (plus the three console
+  writers) provides coverage, because the default filter is a global `info` and
+  the set of crates that can write an address is not enumerable; a `Display`-less
+  `ServerAddress` newtype provides prevention. Arming is last-wins, so the
+  crash-recovery `<server:recovered>` token joins to the session token on the
+  next connect. →
+  [CONTRIBUTING.md#server-address-redaction](CONTRIBUTING.md#server-address-redaction)
 - **Logging & plugin diagnostics.** Log destinations, the WebView2/console-relay
   tee, `HOLE_BRIDGE_LOG` directives, and the plugin tap. →
   [CONTRIBUTING.md#logging--diagnostics](CONTRIBUTING.md#logging--diagnostics)
@@ -113,8 +123,13 @@ before editing; the sections linked below are the authoritative source.
   `tracing_subscriber::fmt().init()` (clippy-enforced).
   [→](CONTRIBUTING.md#test-invariants)
 - **PII redaction** — errors carrying filesystem paths or other PII must be
-  redacted before reaching a toast; the detail still lands in `gui.log`.
+  redacted before reaching any log, toast, or bundle; a path's detail still
+  lands in `gui.log`, but the server address never does.
   [→](CONTRIBUTING.md#logging--diagnostics)
+- **The server address is never logged** — no `Display` on `ServerAddress`
+  (compiler-enforced), `.expose()` is its only exit, and every `Serialize` type
+  transitively holding one needs its own `Dump` impl.
+  [→](CONTRIBUTING.md#server-address-redaction)
 
 ## macOS CI is the scarce resource
 
