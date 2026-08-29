@@ -2,8 +2,12 @@
 //!
 //! [`HttpTarget`] owns its own tokio runtime and acts as "the public internet"
 //! for the `DistHarness`-backed bridge tests. It binds either the host's
-//! primary IPv4 (so TUN routing actually catches the traffic) or `[::1]` (for
-//! the IPv6 axis).
+//! primary IPv4 or `[::1]` (for the IPv6 axis).
+//!
+//! Neither address reaches `hole-tun`. A target here is what proves host-local
+//! networking survives while Full mode is up; for tunnel transit the
+//! destination has to be one the host does not hold — see
+//! [`crate::test_support::net_discovery::UNOWNED_DSTS`].
 //!
 //! The single-shot [`plugin_e2e::sentinel::start_fake_sentinel`] is the
 //! plugin-side counterpart (used by `server_test_tests` and the relocated
@@ -18,9 +22,10 @@ use tokio::sync::oneshot;
 
 /// What address family / interface the [`HttpTarget`] binds to.
 pub(crate) enum TargetBind {
-    /// Host's primary non-loopback IPv4 address (discovered via
-    /// `default_net` + UDP-connect fallback). Required for TUN tests because
-    /// loopback short-circuits routing on both Windows and macOS.
+    /// Host's primary non-loopback IPv4 address (the source the kernel picks
+    /// for off-link traffic). The address that stays reachable while Full mode
+    /// is up — see `net_discovery`'s module doc for why. Loopback
+    /// short-circuits routing the same way.
     Ipv4Primary,
     /// `[::1]` IPv6 loopback. IPv6 axis test only.
     Ipv6Loopback,
