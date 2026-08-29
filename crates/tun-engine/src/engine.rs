@@ -22,6 +22,7 @@ mod admission;
 mod config;
 mod dns;
 mod driver;
+mod egress;
 mod emit;
 mod parse;
 mod router;

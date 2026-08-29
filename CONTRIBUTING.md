@@ -307,6 +307,27 @@ Three invariants:
 1. **`select!` arms must not drop work mid-cleanup** — restructure so cleanup is
    awaited after the select returns; see the apply loop in `SystemDns::apply`.
 
+**The engine driver's join carries no bound.** Every await in
+[`Driver::run`](crates/tun-engine/src/engine/driver.rs) is raced against the
+driver's cancellation token, including the DNS interceptor call
+(`tun_engine::engine::dns::intercept`) and the TUN write
+(`tun_engine::engine::egress::flush`) — the loop's only await a unix `AsyncFd`
+can hold `Pending` on indefinitely. Because of that,
+[`Dispatcher::shutdown`](crates/bridge/src/dispatcher.rs) joins the driver task
+with no bound, awaiting through `&mut JoinHandle` so a cancelled caller cannot
+detach it, and returns a `DriverExit`. What it actually waits for on Windows is
+the synchronous `WintunCloseAdapter` call (plus a registry subtree delete),
+which runs in the future's `Drop` once `Driver::run` returns — finite and
+uninterruptible (tokio **1.52.3**: a task's future is dropped before its join
+waker fires, `runtime/task/harness.rs:549` via `runtime/task/core.rs:403-408`),
+which is why a bound at the join would leak the adapter rather than merely
+being unnecessary. Consequence: on the bridge's multi-thread runtime,
+`Dispatcher::drop` blocks unboundedly the same way, so **dropping a future
+that owns a `Dispatcher` does not cancel that wait — it converts it into a
+synchronous block on the dropping thread.** No caller may drop such a future
+as a way to bound anything — this is what rules out a `TimeoutLayer` on the
+IPC router. See #905.
+
 [`SystemDnsApplied`](crates/bridge/src/dns/system.rs) owns a `DebugDropBomb`
 defused by `shutdown()` and is constructed only in the `Ok` branch of
 `Dns::apply`. **Known follow-up:** `SystemRoutes::Drop` still tears down routing

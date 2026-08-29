@@ -13,14 +13,15 @@ use std::time::Instant as StdInstant;
 
 use smoltcp::iface::SocketHandle;
 use smoltcp::time::Instant as SmoltcpInstant;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 use tokio::sync::{mpsc, Semaphore};
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, trace, warn};
+use tracing::{debug, warn};
 
 use super::admission::{decide_admission, Admission};
 use super::config::EngineConfig;
-use super::dns::DnsInterceptor;
+use super::dns::{self, DnsInterceptor};
+use super::egress::{self, Flush};
 use super::emit::build_udp_packet;
 use super::parse::{parse_ip_dst, parse_ip_packet_full, IpProto};
 use super::router::{Router, TcpMeta, UdpMeta};
@@ -148,7 +149,10 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Driver<T> {
             let now = self.smoltcp_now();
             self.settle_packet(settle.as_deref(), now);
             self.process_udp_replies();
-            self.flush_to_tun().await;
+            match self.flush_to_tun().await {
+                Flush::Cancelled => break,
+                Flush::Failed(_) | Flush::Drained => {}
+            }
 
             if self.last_sweep.elapsed() >= self.config.idle_sweep_interval {
                 let evicted = self.flow_table.sweep(self.config.udp_flow_idle_timeout);
@@ -363,15 +367,23 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Driver<T> {
         // Port-53 DNS interception.
         if parsed.dst.port() == 53 {
             if let Some(interceptor) = self.dns_interceptor.clone() {
-                if let Some(reply) = interceptor.intercept(payload).await {
-                    // Construct reply packet with swapped 5-tuple.
-                    let pkt = build_udp_packet(parsed.dst, parsed.src, &reply);
-                    if !pkt.is_empty() {
-                        self.pending_tun_writes.push(pkt);
+                match dns::intercept(interceptor.as_ref(), payload, &self.cancel).await {
+                    dns::Intercepted::Reply(reply) => {
+                        // Construct reply packet with swapped 5-tuple.
+                        let pkt = build_udp_packet(parsed.dst, parsed.src, &reply);
+                        if !pkt.is_empty() {
+                            self.pending_tun_writes.push(pkt);
+                        }
+                        return true;
                     }
-                    return true;
+                    dns::Intercepted::Declined => {
+                        // Fall through to Router dispatch.
+                    }
+                    dns::Intercepted::Cancelled => {
+                        // The driver is tearing its TUN down; drop the datagram.
+                        return true;
+                    }
                 }
-                // Interceptor returned None — fall through to Router dispatch.
             }
         }
 
@@ -427,22 +439,10 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Driver<T> {
 
     // TUN I/O =========================================================================================================
 
-    async fn flush_to_tun(&mut self) {
-        // smoltcp output (TCP).
-        let packets = self.stack.dequeue_tx();
-        for pkt in packets {
-            if let Err(e) = self.tun.write_all(&pkt).await {
-                trace!("TUN write error: {e}");
-                break;
-            }
-        }
-        // UDP replies + DNS intercepts.
-        for pkt in self.pending_tun_writes.drain(..) {
-            if let Err(e) = self.tun.write_all(&pkt).await {
-                trace!("TUN write error (UDP reply): {e}");
-                break;
-            }
-        }
+    async fn flush_to_tun(&mut self) -> Flush {
+        let tx_queue = self.stack.dequeue_tx();
+        let replies = std::mem::take(&mut self.pending_tun_writes);
+        egress::flush_all(&mut self.tun, tx_queue, replies, &self.cancel).await
     }
 }
 

@@ -1689,9 +1689,9 @@ impl Drop for SystemRoutes {
         // Belt-and-suspenders post-teardown wintun adapter cleanup.
         // `bridge::Dispatcher::drop` synchronously drains the engine task
         // so wintun's own Drop runs; this is the safety net for paths that
-        // bypass it (panic, current-thread runtime tests, Drop 2s-timeout
-        // fallback). PowerShell `Remove-NetAdapter` is idempotent on
-        // missing adapters. See adapter_cleanup docs.
+        // bypass it (panic, current-thread runtime tests). PowerShell
+        // `Remove-NetAdapter` is idempotent on missing adapters. See
+        // adapter_cleanup docs.
         crate::adapter_cleanup::remove_adapter(&self.tun_name);
         // Note: WFP/NDIS post-teardown snapshots live in bridge's Stop
         // path, not here — tun-engine can't depend on the bridge's
