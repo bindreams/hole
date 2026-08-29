@@ -33,6 +33,7 @@ pub mod interrupt;
 pub mod manifest;
 pub mod orchestrate;
 pub mod pull_subrepo;
+pub mod skuld_label_coverage;
 pub mod stage;
 pub mod target;
 pub mod tauri_pairs;
@@ -86,6 +87,9 @@ mod orchestrate_tests;
 #[cfg(test)]
 #[path = "pull_subrepo_tests.rs"]
 mod pull_subrepo_tests;
+#[cfg(test)]
+#[path = "skuld_label_coverage_tests.rs"]
+mod skuld_label_coverage_tests;
 #[cfg(test)]
 #[path = "stage_tests.rs"]
 mod stage_tests;
@@ -317,6 +321,15 @@ pub enum Command {
     /// single source (`xtask_lib::asset`) is shared with the updater so the
     /// publish name and the download name cannot drift.
     AssetSuffix,
+    /// Verify that a ci.yaml job's complementary `SKULD_LABELS` step pair
+    /// (`"!tun"` / `"tun"`) parses as exact complements and that each side
+    /// still selects something — see `xtask::skuld_label_coverage`.
+    VerifySkuldLabelCoverage {
+        /// ci.yaml job id to check (its steps must include exactly one
+        /// complementary `SKULD_LABELS` pair).
+        #[arg(long, default_value = "test-hole")]
+        job: String,
+    },
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum, PartialEq, Eq)]
@@ -397,6 +410,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             println!("{}", xtask_lib::asset::host_update_asset_suffix());
             Ok(())
         }
+        Command::VerifySkuldLabelCoverage { job } => skuld_label_coverage::verify(&repo_root()?, &job),
     }
 }
 

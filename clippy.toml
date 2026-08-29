@@ -31,7 +31,11 @@ reason = "Route teardown must go through `Routing::Installed`'s Drop. Only `Syst
 
 [[disallowed-methods]]
 path = "util::port_alloc::free_port"
-reason = "Use `port_alloc::bind_ephemeral` instead — it folds the caller's bind into the same unbounded retry loop, eliminating the divorced-port-number TOCTOU window. Suppress with `#[allow(clippy::disallowed_methods)]` + comment when the port must be returned to the caller before the bind happens (e.g. `test_support::port_alloc::allocate_ephemeral_port`). See bindreams/hole#285 and #300."
+reason = "Use `port_alloc::bind_ephemeral` instead — it folds the caller's bind into the same unbounded retry loop, eliminating the divorced-port-number TOCTOU window. Suppress with `#[allow(clippy::disallowed_methods)]` + comment when the port must be returned to the caller before the bind happens. The two sanctioned exceptions are `test_support::port_alloc::allocate_ephemeral_port` and `plugin_e2e::ports`. See bindreams/hole#285 and #300."
+
+[[disallowed-methods]]
+path = "garter::chain::allocate_ports"
+reason = "Verifies TCP only and returns a bare port number, so a port handed to a plugin that also binds UDP on it (e.g. galoshes' SS_LOCAL) is unreserved on the UDP half. Use `plugin_e2e::ports` for a port a child will bind, or `util::port_alloc::bind_ephemeral` for an in-process bind. garter's own chain-internal use carries a per-site allow. See bindreams/hole#931."
 
 # tracing subscriber test invariant ------------------------------------------------------------------------------------
 #

@@ -1299,6 +1299,7 @@ async fn reset_endpoint_maps_to_network_blocked() {
     let verdict = crate::reachability::probe_server_reachability(
         &a.ip().to_string(),
         a.port(),
+        "<server:00000000>",
         Some("galoshes"),
         Some("tls;host=h"),
         &CancellationToken::new(),

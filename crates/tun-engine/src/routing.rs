@@ -221,6 +221,16 @@ pub struct CleanupReport {
     pub failed: usize,
 }
 
+/// The one site that logs a route command's argv.
+///
+/// Deliberately **not** hand-redacted: the argv carries the server IP and the
+/// redacting log sink covers it, along with every other producer this crate
+/// does not author. Extracted so recovery tests can drive the real log site
+/// without spawning a subprocess.
+pub(crate) fn log_route_command(phase: &str, cmd: &[String]) {
+    info!(phase, cmd = cmd.join(" "), "running route command");
+}
+
 /// Spawn one command, log it, and report whether it exited zero. The unit both
 /// phase runners are built from; injected in tests so each loop's failure
 /// policy is assertable without spawning.
@@ -228,7 +238,7 @@ fn exec_one<P: Phase>(cmd: &[String], phase: P) -> Result<(), CommandFailure> {
     debug_assert!(!cmd.is_empty(), "route command must not be empty");
     let phase = phase.name();
     ROUTING_SUBPROCESS_SPAWN_COUNT.fetch_add(1, Ordering::SeqCst);
-    info!(phase, cmd = cmd.join(" "), "running route command");
+    log_route_command(phase, cmd);
 
     let output = match Command::new(&cmd[0]).args(&cmd[1..]).output() {
         Ok(output) => output,
@@ -450,9 +460,18 @@ pub(crate) fn recover_routes_with<R, S, P, L>(
     // `netsh delete route ... hole-tun` on startup would tear down the
     // routes of a concurrent TUN bridge mid-flight.
     if let Some(st) = state::load(state_dir) {
+        // Before the first `runner(...)`: the teardown argv carries the prior
+        // run's server IP and `log_route_command` writes it out. Recovery has
+        // no entry in hand, so the literal is armed under the fixed
+        // `RECOVERED_TOKEN`; when the user reconnects to that same server,
+        // last-wins arming re-points it at the entry's token and announces
+        // the join, so a bundle reader can still join the two.
+        util::redact::arm_ip(util::redact::RECOVERED_TOKEN, st.server_ip);
         info!(
             tun = %st.tun_name,
-            server_ip = %st.server_ip,
+            server = util::redact::RECOVERED_TOKEN,
+            server_family = util::redact::ip_family(st.server_ip),
+            server_scope = util::redact::ip_scope(st.server_ip),
             iface = %st.interface_name,
             "recovering routes from crashed run"
         );
@@ -780,7 +799,8 @@ impl Drop for SystemRoutes {
         // actually ran on Stop (teardown-skipped diagnosis).
         info!(
             tun = %self.tun_name,
-            server_ip = %self.server_ip,
+            server_family = util::redact::ip_family(self.server_ip),
+            server_scope = util::redact::ip_scope(self.server_ip),
             iface = %self.interface_name,
             "SystemRoutes::drop entered — tearing down routes"
         );

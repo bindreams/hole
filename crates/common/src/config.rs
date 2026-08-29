@@ -216,11 +216,59 @@ impl Default for AppConfig {
     }
 }
 
+/// A configured server address — hostname or IP literal, exactly as the user
+/// entered it.
+///
+/// Implements **neither `Display` nor `Deref`**, on purpose: without
+/// `Display`, `server_host = %config.server.server` is a compile error, and
+/// without `Deref<Target = str>`, `format!("{}", *addr)` cannot reopen it.
+/// [`expose`](Self::expose) is the single named exit, so `rg '\.expose\(\)'`
+/// enumerates every site that reads the real value.
+#[derive(Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ServerAddress(String);
+
+impl ServerAddress {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    /// The address in clear. Every caller is a site that genuinely needs to
+    /// dial, compare, or persist it — never a log field.
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<&str> for ServerAddress {
+    fn from(value: &str) -> Self {
+        Self::new(value)
+    }
+}
+
+impl From<String> for ServerAddress {
+    fn from(value: String) -> Self {
+        Self::new(value)
+    }
+}
+
+impl std::fmt::Debug for ServerAddress {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ServerAddress(<redacted>)")
+    }
+}
+
+impl dump::Dump for ServerAddress {
+    fn dump(&self) -> dump::DumpValue {
+        dump::DumpValue::tagged(dump::tag::SECRET, dump::DumpValue::String(self.0.clone()))
+    }
+}
+
 #[derive(Clone, Serialize, Deserialize, PartialEq)]
 pub struct ServerEntry {
     pub id: String,
     pub name: String,
-    pub server: String,
+    pub server: ServerAddress,
     pub server_port: u16,
     pub method: String,
     pub password: String,
@@ -246,7 +294,7 @@ impl ServerEntry {
         Self {
             id: "placeholder".into(),
             name: "placeholder".into(),
-            server: "127.0.0.1".into(),
+            server: ServerAddress::new("127.0.0.1"),
             server_port: 0,
             method: "aes-256-gcm".into(),
             password: String::new(),
@@ -270,6 +318,39 @@ impl std::fmt::Debug for ServerEntry {
             .field("plugin_opts", &self.plugin_opts)
             .field("validation", &self.validation)
             .finish()
+    }
+}
+
+/// The load-bearing half of the newtype.
+///
+/// `dump!`'s ladder resolves per top-level expression, not per field:
+/// `ServerEntry` derives `Serialize`, so without this impl `dump!(&entry)`
+/// renders the whole serde tree and the transparent newtype serializes as
+/// its inner string — `ServerAddress::dump` is never reached. The same
+/// bypass already printed the **password** in clear past the hand-written
+/// `Debug` above.
+///
+/// Any `Serialize` type transitively holding a `ServerAddress` needs its own
+/// `Dump` impl. That is convention backed by per-container tests, not a
+/// compiler guarantee; the redacting sink is the backstop.
+impl dump::Dump for ServerEntry {
+    fn dump(&self) -> dump::DumpValue {
+        use dump::{tag, DumpValue};
+        let key = |k: &str| DumpValue::String(k.to_string());
+        DumpValue::Map(vec![
+            (key("id"), dump::from_serialize(&self.id)),
+            (key("name"), dump::from_serialize(&self.name)),
+            (key("server"), self.server.dump()),
+            (key("server_port"), dump::from_serialize(&self.server_port)),
+            (key("method"), dump::from_serialize(&self.method)),
+            (
+                key("password"),
+                DumpValue::tagged(tag::SECRET, DumpValue::String(self.password.clone())),
+            ),
+            (key("plugin"), dump::from_serialize(&self.plugin)),
+            (key("plugin_opts"), dump::from_serialize(&self.plugin_opts)),
+            (key("validation"), dump::from_serialize(&self.validation)),
+        ])
     }
 }
 

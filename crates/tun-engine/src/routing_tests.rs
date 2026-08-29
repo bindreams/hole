@@ -964,3 +964,132 @@ fn cover_recovery_absent_is_noop_regardless_of_intent() {
     assert_eq!(decide_cover_recovery(true, false), CoverRecovery::Noop);
     assert_eq!(decide_cover_recovery(false, false), CoverRecovery::Noop);
 }
+
+// Recovery-path redaction =============================================================================================
+//
+// `203.0.113.7` is RFC 5737 documentation space and appears in no other
+// fixture. The registry is process-global and grow-only; these run under
+// `cargo nextest`, one process per test.
+
+const RECOVERED_ADDR: &str = "203.0.113.7";
+
+/// A subscriber whose file-shaped sink is wrapped exactly as production
+/// wraps the log-file writer, so the assertions are about the bytes that
+/// would land on disk.
+fn redacting_capture() -> (
+    impl tracing::Subscriber + Send + Sync,
+    garter::test_utils::WaitableWriter,
+) {
+    let writer = garter::test_utils::WaitableWriter::new();
+    let sink = writer.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(move || util::redact::RedactingWriter::new(sink.clone()))
+        .with_ansi(false)
+        .with_max_level(tracing::Level::DEBUG)
+        .finish();
+    (subscriber, writer)
+}
+
+/// Drives the production argv log site for every command, without spawning.
+fn logging_runner(log: &RefCell<Captured>) -> impl Fn(&[Vec<String>], BestEffortPhase) -> CleanupReport + '_ {
+    |cmds: &[Vec<String>], phase: BestEffortPhase| {
+        for cmd in cmds {
+            log_route_command(phase.name(), cmd);
+        }
+        log.borrow_mut().push((phase, cmds.to_vec()));
+        CleanupReport {
+            attempted: cmds.len(),
+            failed: 0,
+        }
+    }
+}
+
+fn recovery_state(server_ip: &str) -> RouteState {
+    RouteState {
+        version: state::SCHEMA_VERSION,
+        tun_name: "hole-tun".into(),
+        server_ip: server_ip.parse().unwrap(),
+        interface_name: "en0".into(),
+    }
+}
+
+#[skuld::test]
+fn recovery_reports_scope_and_redacts_its_argv() {
+    let tmp = tempfile::tempdir().unwrap();
+    state::save(tmp.path(), &recovery_state(RECOVERED_ADDR), None).unwrap();
+
+    let (subscriber, writer) = redacting_capture();
+    let log: RefCell<Captured> = RefCell::new(Vec::new());
+    {
+        let _guard = garter::tracing_test::set_default_in_current_thread(subscriber);
+        recover_routes_with(tmp.path(), logging_runner(&log), |_, _| {}, false, || false, |_| {});
+    }
+
+    // The commands themselves still carry the address — recovery needs it.
+    let captured = log.into_inner();
+    assert!(
+        captured
+            .iter()
+            .any(|(phase, cmds)| *phase == BestEffortPhase::RecoverBypass && mentions_addr(cmds, RECOVERED_ADDR)),
+        "recovery must still tear down the real bypass route: {captured:?}"
+    );
+
+    let text = writer.snapshot();
+    assert!(
+        !text.contains(RECOVERED_ADDR),
+        "a prior run's server IP reached the log on every restart after a crash:\n{text}"
+    );
+    assert!(
+        text.contains("server_scope"),
+        "the recovery line must still say what kind of endpoint it was:\n{text}"
+    );
+}
+
+#[skuld::test]
+fn route_command_log_is_redacted_by_the_sink() {
+    // The guard against someone later hand-redacting `cmd`: the argv line is
+    // deliberately left alone, because the sink covers it.
+    util::redact::arm("<server:aaaaaaaa>", [RECOVERED_ADDR.to_string()]);
+    let (subscriber, writer) = redacting_capture();
+    {
+        let _guard = garter::tracing_test::set_default_in_current_thread(subscriber);
+        log_route_command(
+            BestEffortPhase::Teardown.name(),
+            &["route".to_string(), "delete".to_string(), RECOVERED_ADDR.to_string()],
+        );
+    }
+    let text = writer.snapshot();
+    assert!(!text.contains(RECOVERED_ADDR), "argv line leaked the address:\n{text}");
+    assert!(text.contains("<server:aaaaaaaa>"), "argv line lost its token:\n{text}");
+}
+
+#[skuld::test]
+fn recovery_then_start_links_the_two_tokens() {
+    // Crash, then reconnect to the same server: without last-wins arming and
+    // the join announcement, one endpoint reads as two unlinked tokens in the
+    // collected bundle — in the most common circumstance a bundle is taken.
+    const ENTRY_TOKEN: &str = "<server:8f2a1c04>";
+    let ip: std::net::IpAddr = RECOVERED_ADDR.parse().unwrap();
+
+    let (subscriber, writer) = redacting_capture();
+    {
+        let _guard = garter::tracing_test::set_default_in_current_thread(subscriber);
+        util::redact::arm_ip(util::redact::RECOVERED_TOKEN, ip);
+        util::redact::arm_ip(ENTRY_TOKEN, ip);
+    }
+
+    assert_eq!(
+        util::redact::redact_str("remote 203.0.113.7:8388"),
+        format!("remote {ENTRY_TOKEN}:8388"),
+        "the reconnect's token must supersede the recovery token"
+    );
+    let text = writer.snapshot();
+    assert!(
+        text.contains(util::redact::RECOVERED_TOKEN) && text.contains(ENTRY_TOKEN),
+        "the join announcement must name both tokens:\n{text}"
+    );
+    assert!(
+        !text.contains(RECOVERED_ADDR),
+        "the announcement named the address:\n{text}"
+    );
+}

@@ -97,6 +97,10 @@ pub fn get_config(state: State<AppState>) -> AppConfig {
 fn apply_ui_settings(config: &mut AppConfig, settings: crate::ui_settings::UiSettings) {
     settings.apply(config);
     auto_select_first_server(config);
+    // The address is UI-owned and editable, so a save can introduce one this
+    // process has never seen. Armed here rather than in `save_config` so the
+    // literal is covered even if the save that follows fails.
+    hole_common::logging::redact_arm::arm_config(config);
 }
 
 #[tauri::command]
@@ -161,6 +165,8 @@ fn validate_and_read_import(path: &Path) -> Result<Vec<ServerEntry>, ImportFailu
 /// Pure helper — no Tauri `State`, no `AppHandle`, no `Mutex` — so it is
 /// unit-testable without standing up a real Tauri app. [`import_file`] holds
 /// the lock and persists the resulting config; this helper does NOT save.
+/// Arms every resulting entry: this is the one seam both `import_file` and
+/// the import-dialog / dropped-file paths funnel through.
 fn apply_import(config: &mut AppConfig, parsed: Vec<ServerEntry>) -> (Vec<ServerEntry>, usize) {
     let parsed_count = parsed.len();
     let existing_count = config.servers.len();
@@ -178,6 +184,11 @@ fn apply_import(config: &mut AppConfig, parsed: Vec<ServerEntry>) -> (Vec<Server
             appended.push(server);
         }
     }
+    // Before the summary `info!` below, and before the caller's save: an
+    // imported entry the process has never seen must be covered from its
+    // first mention.
+    hole_common::logging::redact_arm::arm_config(config);
+
     let appended_count = appended.len();
     let deduped_count = parsed_count - appended_count;
 

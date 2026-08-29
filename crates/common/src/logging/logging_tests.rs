@@ -715,3 +715,71 @@ fn relay_events_go_to_file_not_stderr() {
         err.contents()
     );
 }
+
+// Tests: log redaction ================================================================================================
+
+use crate::logging::logging_test_helpers::{REDACT_ADDR, REDACT_TOKEN};
+
+/// The leak test. `init_dual` builds four non-blocking writers and exactly
+/// one of them is a log file; this covers that one.
+#[skuld::test]
+fn init_dual_writes_a_redacted_file(#[fixture(temp_dir)] dir: &Path) {
+    let log_dir = dir.join("redact-file-test");
+    std::fs::create_dir_all(&log_dir).expect("create log dir");
+    let exe = std::env::current_exe().expect("current_exe");
+    let status = Command::new(&exe)
+        .env("HOLE_LOGGING_TEST_KIND", "redact_file")
+        .env("HOLE_LOGGING_TEST_LOG_DIR", &log_dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .expect("spawn child");
+    assert!(status.success(), "redact_file child failed with status {status:?}");
+
+    let entries: Vec<_> = std::fs::read_dir(&log_dir)
+        .expect("read log dir")
+        .filter_map(|e| e.ok())
+        .collect();
+    let log_file = entries
+        .iter()
+        .find(|e| e.file_name().to_string_lossy().starts_with("test.log"))
+        .expect("log file");
+    let contents = std::fs::read_to_string(log_file.path()).expect("read log file");
+    assert!(
+        !contents.contains(REDACT_ADDR),
+        "the armed address reached the log file:\n{contents}"
+    );
+    assert!(
+        contents.contains(REDACT_TOKEN),
+        "the token is missing, so the line may simply not have been written:\n{contents}"
+    );
+}
+
+/// Pinned to the console tee target, not the file. The file is a different
+/// writer, so a change that wrapped only the appender would still pass an
+/// assertion made against the file.
+#[skuld::test]
+fn the_console_tee_target_is_redacted(#[fixture(temp_dir)] dir: &Path) {
+    let result = run_child("redact_tee", dir);
+    assert!(
+        !result.tee_stderr.contains(REDACT_ADDR),
+        "the armed address reached the stderr console tee: {:?}",
+        result.tee_stderr
+    );
+    assert!(
+        !result.tee_stdout.contains(REDACT_ADDR),
+        "the armed address reached the stdout console tee: {:?}",
+        result.tee_stdout
+    );
+    assert!(
+        result.tee_stderr.contains(REDACT_TOKEN),
+        "stderr tee received nothing recognizable: {:?}",
+        result.tee_stderr
+    );
+    assert!(
+        result.tee_stdout.contains(REDACT_TOKEN),
+        "stdout tee received nothing recognizable: {:?}",
+        result.tee_stdout
+    );
+}
