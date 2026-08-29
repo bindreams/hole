@@ -296,7 +296,9 @@ fn redirect_one(stream: Stream) -> io::Result<(JoinHandle<()>, WorkerGuard, Box<
 
     // Wrap the tee writer in a lossy non-blocking writer so a slow downstream
     // consumer of the saved-original cannot back up the relay reader thread.
-    let (tee_nb, tee_guard) = NonBlockingBuilder::default().lossy(true).finish(tee_target);
+    let (tee_nb, tee_guard) = NonBlockingBuilder::default()
+        .lossy(true)
+        .finish(util::redact::RedactingWriter::new(tee_target));
 
     let (read_end, write_end) = os_pipe::pipe()?;
 
@@ -462,7 +464,9 @@ fn redirect_one_with_writer(
     stream: Stream,
     tee_target: Box<dyn Write + Send>,
 ) -> io::Result<(JoinHandle<()>, WorkerGuard)> {
-    let (tee_nb, tee_guard) = NonBlockingBuilder::default().lossy(true).finish(tee_target);
+    let (tee_nb, tee_guard) = NonBlockingBuilder::default()
+        .lossy(true)
+        .finish(util::redact::RedactingWriter::new(tee_target));
 
     let (read_end, write_end) = os_pipe::pipe()?;
     redirect_fd(stream, &write_end)?;
@@ -739,8 +743,17 @@ pub fn init_dual(
         owner,
         |p: &std::path::Path, uid: u32, gid: u32| util::ownership::chown_path(p, uid, gid),
     );
-    let (file_nb, file_guard) = NonBlockingBuilder::default().lossy(false).finish(owned);
-    let (stderr_nb, stderr_guard) = NonBlockingBuilder::default().lossy(true).finish(original_stderr);
+    // The redaction wrap sits under the appender, so every formatted event
+    // passes through it whoever authored it — a Hole site, a dependency at
+    // the default global `info`, an OS command's argv, or a relayed plugin
+    // line. This is the writer that is a log file; wrapping it is what
+    // closes the leak.
+    let (file_nb, file_guard) = NonBlockingBuilder::default()
+        .lossy(false)
+        .finish(util::redact::RedactingWriter::new(owned));
+    let (stderr_nb, stderr_guard) = NonBlockingBuilder::default()
+        .lossy(true)
+        .finish(util::redact::RedactingWriter::new(original_stderr));
 
     use tracing_subscriber::util::SubscriberInitExt;
     // Sanctioned by clippy.toml `disallowed_methods` (see #301): the ONE
@@ -840,6 +853,9 @@ fn is_legacy_daily_suffix(candidate: &str, stem: &str) -> bool {
 }
 
 mod owned_rotate;
+
+/// Arming the redaction registry from a server entry.
+pub mod redact_arm;
 use owned_rotate::UserOwnedRotate;
 
 pub(crate) mod yaml_format;
