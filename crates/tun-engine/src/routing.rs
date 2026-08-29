@@ -202,53 +202,182 @@ pub(crate) fn run_capturing(
 /// instance can't damage the first's routing state). Removes the fixed-CIDR
 /// split routes (idempotent — harmless if absent); if a [`state::RouteState`]
 /// file is present in `state_dir`, also removes the server bypass route
-/// described by it; finally deletes the state file. Best-effort — all errors
-/// are logged at `warn` level and the function returns `()` (there is no
-/// meaningful caller recovery).
-pub fn recover_routes(state_dir: &Path) {
-    let intent = failclosed::lockdown_state::load_enabled(state_dir);
+/// described by it; finally deletes the state file. Route errors are
+/// best-effort and logged at `warn`.
+///
+/// Returns the standing-lockdown [`Recovery`] so the caller can record
+/// "a standing cover is live this run" — the claim that keeps the escape
+/// visible when the intent file cannot be read or repaired.
+///
+/// `owner` is the uid/gid every other bridge write into `state_dir` threads
+/// (`SystemRouting::new`, `ProxyManager::set_lockdown_intent`). Recovery's
+/// intent repair may CREATE both the directory and `bridge-lockdown.json` — a
+/// wiped state dir is exactly the condition that produces the `Unset` intent —
+/// so without it a user-scoped macOS bridge drops root-owned files into
+/// `~/Library/Application Support/hole`.
+///
+/// `tun_name` is the caller's own configured TUN device name (the bridge's
+/// `TUN_DEVICE_NAME` constant) — the fallback the TUN-permit reclaim uses when
+/// no `bridge-routes.json` survived this startup to name one. See
+/// [`recover_routes_with`]'s doc for why the file alone cannot be the only
+/// source.
+pub fn recover_routes(state_dir: &Path, owner: Option<(u32, u32)>, tun_name: &str) -> Recovery {
+    let intent = failclosed::lockdown_state::load_intent(state_dir);
     recover_routes_with(
         state_dir,
+        owner,
+        tun_name,
         run_commands,
         failclosed::recover_cover,
         intent,
-        || failclosed::lockdown_cover_present(state_dir),
-        |decision| failclosed::recover_lockdown(decision, state_dir),
-    );
+        || failclosed::lockdown_cover_presence(state_dir),
+        |decision, tun_name| failclosed::recover_lockdown(decision, state_dir, tun_name),
+    )
 }
 
 /// What crash-recovery should do with a possibly-present standing lockdown
-/// cover, given the persisted lockdown intent and whether a cover is present.
+/// cover, given the recorded intent and what the OS says is installed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CoverRecovery {
-    /// Intent ON + cover present: KEEP the host fail-closed across the restart.
-    /// The fail-closed floor (block-all + loopback + App-ID) stays in force; the
-    /// volatile permits — the stale TUN-interface permit (dead LUID/utun after
-    /// teardown) and the server-IP permit (the server may change before the next
-    /// connect) — are refreshed by the next connect's `install_lockdown`. Windows
-    /// drops the volatile GUIDs at recovery so the re-add isn't a fixed-key
-    /// no-op; macOS reloads the whole pf ruleset, refreshing them implicitly.
-    /// This is the crash-leak fix: a crash never runs `stop()`, so the persistent
-    /// cover survives and Adopt holds it.
+    /// A standing cover is live and nothing recorded says to remove it: KEEP
+    /// the host fail-closed across the restart. Performs **no OS call that
+    /// could clobber a RUNNING first bridge's cover** — its whole effect is
+    /// that the bridge records "a standing cover is live this run", so the
+    /// next connect re-engages through `install_lockdown`, which refreshes
+    /// the volatile permits (the dead TUN LUID/utun and the possibly-changed
+    /// server IP) itself.
+    ///
+    /// The one exception, Windows only: it also reclaims the volatile
+    /// TUN-LUID permit pair when `hole-tun` no longer resolves — see
+    /// `failclosed::reclaim_stale_tun_permit`. That is safe where deleting the
+    /// server permit here is not: a genuinely running bridge's own `hole-tun`
+    /// resolves successfully, so the reclaim can never touch a live bridge's
+    /// permit, whereas the server IP has no equivalent liveness check.
+    ///
+    /// Disclosed cost of the remaining inertness: between an adopted cover and
+    /// the next connect the stale server-IP permit stays installed rather than
+    /// being dropped immediately (and, until `hole-tun` is confirmed gone, so
+    /// does the TUN-LUID permit). Both are *permits* on an idle cover, and the
+    /// App-ID permit already grants the bridge and plugin binaries unrestricted
+    /// egress in that same window, so the added surface is one
+    /// previously-configured server IP for other processes while nothing is
+    /// connected. The alternative — deleting the server permit at recovery
+    /// time — would let a second bridge with a fresh state dir delete a
+    /// RUNNING first bridge's server permit while block-all stayed in force.
+    ///
+    /// This is also the crash-leak fix: a crash never runs `stop()`, so the
+    /// persistent cover survives and Adopt holds it.
     Adopt,
-    /// Intent OFF + cover present: fully disengage the leftover cover (Windows:
-    /// delete all lockdown GUIDs; macOS: restore the pre-lockdown snapshot +
-    /// drop the pf token).
+    /// [`Intent::Off`](failclosed::lockdown_state::Intent::Off) with an
+    /// actionable presence: fully disengage the leftover cover (Windows: delete
+    /// all lockdown GUIDs; macOS: restore the pre-lockdown snapshot + drop the
+    /// pf token). The only action that removes protection, and the only one
+    /// that mutates the OS at all.
     Sweep,
-    /// No cover present: nothing to do.
+    /// Nothing to do.
     Noop,
 }
 
-/// Pure recovery decision. `intent` is the persisted lockdown-enabled bool
-/// (`bridge-lockdown.json`); `prior_present` is whether a lockdown cover from a
-/// prior run is present, keyed on the cover's OWN evidence (NOT
-/// `bridge-routes.json` — the cover's lifetime is independent of routes). See
-/// `recover_routes_with` for how `prior_present` is derived per platform.
-pub fn decide_cover_recovery(intent: bool, prior_present: bool) -> CoverRecovery {
-    match (intent, prior_present) {
-        (_, false) => CoverRecovery::Noop,
-        (true, true) => CoverRecovery::Adopt,
-        (false, true) => CoverRecovery::Sweep,
+/// What the OS says about a standing lockdown cover — the presence axis of
+/// [`decide_cover_recovery`]. Closed, because a bool made "the OS says no" and
+/// "the OS could not answer" the same answer, and the second must never
+/// authorise removing protection.
+///
+/// Each platform produces a strict subset:
+///
+/// - **Windows** produces `Live`, `Absent`, `Indeterminate`, `Unreachable`. It keeps no lockdown state file, so `Recorded` has no source there.
+/// - **macOS** produces `Live`, `Recorded`, `Absent`, `Unreachable`. A `pfctl` that runs and prints a labels listing always yields a usable answer, so `Indeterminate` has no source there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CoverPresence {
+    /// The OS confirmed Hole's own standing-lockdown cover, **or a residue of
+    /// it**, is installed right now.
+    ///
+    /// "Any residue", not "the whole cover", is deliberate: the Windows sweeps
+    /// loop delete-by-key over every lockdown GUID with no transaction and
+    /// every return code discarded, over PERSISTENT filters. A sweep
+    /// interrupted mid-loop survives a reboot as a partial cover, so probing
+    /// one GUID would let that partial cover answer `Absent` forever. The probe
+    /// asks about every swept GUID and `Live` means at least one was found.
+    Live,
+    /// The OS did not confirm one, but Hole's own state file says a cover was
+    /// engaged and never confirmed released.
+    Recorded,
+    /// The OS was asked, answered no, and no local record contradicts it.
+    Absent,
+    /// The OS was reachable but its answer was unusable (Windows: a by-key
+    /// query returned a code that is neither success nor "filter not found",
+    /// e.g. a DACL-denied read).
+    Indeterminate,
+    /// The OS could not be asked at all (Windows: the Base Filtering Engine
+    /// could not be reached; macOS: `pfctl` missing or non-executable with no
+    /// state file to fall back on).
+    Unreachable,
+}
+
+/// The outcome of [`decide_cover_recovery`]: one action, plus whether the
+/// measured truth should be written back to the intent file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Recovery {
+    pub action: CoverRecovery,
+    /// Repair the intent file to `enabled: true` before acting. Grounded in a
+    /// positive OS measurement only — see rule 4.
+    pub record_intent_on: bool,
+    /// Echoes the `presence` this decision was made from. `action == Adopt`
+    /// alone is not evidence the OS confirmed a live cover — it also covers
+    /// [`CoverPresence::Recorded`] and [`CoverPresence::Indeterminate`], whose
+    /// own docs say the OS did NOT confirm one. A caller recording "this run
+    /// holds a live cover" (`route_recovery::recover_and_record`) must gate on
+    /// `presence == CoverPresence::Live`, not on the action alone.
+    pub presence: CoverPresence,
+}
+
+/// Pure recovery decision over the two measured axes. Performs **no I/O**: it
+/// picks one [`CoverRecovery`], sets `record_intent_on`, and returns.
+///
+/// The four rules the table below encodes:
+///
+/// 1. [`CoverPresence::Absent`] and [`CoverPresence::Unreachable`] always yield `Noop` with `record_intent_on = false`.
+/// 2. `Sweep` requires [`Intent::Off`](failclosed::lockdown_state::Intent::Off) and an actionable presence (`Live | Recorded | Indeterminate`). It is the only action that removes protection, and the only one that mutates the OS at all.
+/// 3. `Adopt` requires an actionable presence and an intent of `On`, `Unreadable`, or `Unset` — with `Unset` additionally requiring positive evidence (`Live | Recorded`), because an unknown intent plus an unusable OS answer is no evidence in any direction.
+/// 4. `record_intent_on` requires `Presence::Live` and an intent of `Unset` or `Unreadable`. The write is grounded in a positive OS measurement, never inferred.
+///
+/// The match is exhaustive on both axes with no wildcard, so a new variant of
+/// either is a compile error rather than a silently inherited answer.
+pub fn decide_cover_recovery(intent: failclosed::lockdown_state::Intent, presence: CoverPresence) -> Recovery {
+    use failclosed::lockdown_state::Intent as I;
+    use CoverPresence as P;
+    use CoverRecovery::{Adopt, Noop, Sweep};
+
+    let (action, record_intent_on) = match (intent, presence) {
+        (I::On, P::Live) => (Adopt, false),
+        (I::On, P::Recorded) => (Adopt, false),
+        (I::On, P::Indeterminate) => (Adopt, false),
+        (I::On, P::Absent) => (Noop, false),
+        (I::On, P::Unreachable) => (Noop, false),
+
+        (I::Off, P::Live) => (Sweep, false),
+        (I::Off, P::Recorded) => (Sweep, false),
+        (I::Off, P::Indeterminate) => (Sweep, false),
+        (I::Off, P::Absent) => (Noop, false),
+        (I::Off, P::Unreachable) => (Noop, false),
+
+        (I::Unset, P::Live) => (Adopt, true),
+        (I::Unset, P::Recorded) => (Adopt, false),
+        // No intent AND no usable OS answer is no evidence in any direction.
+        (I::Unset, P::Indeterminate) => (Noop, false),
+        (I::Unset, P::Absent) => (Noop, false),
+        (I::Unset, P::Unreachable) => (Noop, false),
+
+        (I::Unreadable, P::Live) => (Adopt, true),
+        (I::Unreadable, P::Recorded) => (Adopt, false),
+        (I::Unreadable, P::Indeterminate) => (Adopt, false),
+        (I::Unreadable, P::Absent) => (Noop, false),
+        (I::Unreadable, P::Unreachable) => (Noop, false),
+    };
+    Recovery {
+        action,
+        record_intent_on,
+        presence,
     }
 }
 
@@ -257,33 +386,53 @@ pub fn decide_cover_recovery(intent: bool, prior_present: bool) -> CoverRecovery
 /// inputs (intent + presence probe + recover action) so unit tests can assert
 /// behavior without shelling out to `netsh`/`route` or touching the host
 /// firewall. Production passes `run_commands`, [`failclosed::recover_cover`],
-/// the persisted lockdown intent, [`failclosed::lockdown_cover_present`], and
-/// [`failclosed::recover_lockdown`].
+/// the classified lockdown intent, [`failclosed::lockdown_cover_presence`], and
+/// [`failclosed::recover_lockdown`]. `owner` is passed straight through to the
+/// intent repair — see [`recover_routes`].
+///
+/// `tun_name` is the fallback TUN-permit-reclaim hint: `bridge-routes.json`'s
+/// own `tun_name` wins when a route-state file was recovered THIS startup, but
+/// that file's lifetime is anti-correlated with the condition the reclaim
+/// needs — `SystemRoutes::drop` clears it on every CLEAN teardown, including
+/// the `Cutover` stop that precedes the canonical Adopt path, so the file is
+/// present exactly when the adapter probably still resolves and absent
+/// exactly when it definitely does not. Falling back to the caller's own
+/// configured name keeps the reclaim reachable on that path too; the resolve
+/// check inside `should_reclaim_tun_permit` is what makes deleting on a
+/// guessed name safe — a live `hole-tun` still blocks it.
+#[allow(clippy::too_many_arguments)] // private test seam — bundling into a struct adds more noise than the warning.
 pub(crate) fn recover_routes_with<R, S, P, L>(
     state_dir: &Path,
+    owner: Option<(u32, u32)>,
+    tun_name: &str,
     runner: R,
     sweep_cover: S,
-    lockdown_intent: bool,
+    lockdown_intent: failclosed::lockdown_state::Intent,
     lockdown_present: P,
     lockdown_recover: L,
-) where
+) -> Recovery
+where
     R: Fn(&[Vec<String>], &str) -> std::io::Result<()>,
     S: FnOnce(&Path, bool),
-    P: FnOnce() -> bool,
-    L: FnOnce(CoverRecovery),
+    P: FnOnce() -> CoverPresence,
+    L: FnOnce(CoverRecovery, Option<&str>),
 {
     info!(state_dir = %state_dir.display(), "starting route recovery");
 
     // Route recovery is guarded by the route-state file. Its absence means the
     // previous run installed no routes (the write-ordering contract persists
-    // state BEFORE any route mutation), so we skip route teardown.
+    // state BEFORE any route mutation), so we skip route teardown. Loaded once
+    // and kept: its `tun_name` (when present) is also this bridge's own record
+    // of which TUN device the standing lockdown cover, if any, was built for —
+    // see the reclaim call below.
     //
     // State-file-driven recovery (not unconditional split-route teardown)
     // is required so concurrent bridge subprocesses don't rip routes out
     // from under each other: a SOCKS5-only bridge unconditionally issuing
     // `netsh delete route ... hole-tun` on startup would tear down the
     // routes of a concurrent TUN bridge mid-flight.
-    if let Some(st) = state::load(state_dir) {
+    let route_state = state::load(state_dir);
+    if let Some(st) = &route_state {
         // Before the first `runner(...)`: the teardown argv carries the prior
         // run's server IP and `log_route_command` writes it out. Recovery has
         // no entry in hand, so the literal is armed under the fixed
@@ -325,17 +474,38 @@ pub(crate) fn recover_routes_with<R, S, P, L>(
     } else {
         debug!("no route-state file found, nothing to recover");
     }
+    let tun_name_hint = route_state.map(|st| st.tun_name).unwrap_or_else(|| tun_name.to_owned());
 
-    // Reconcile the standing lockdown cover FIRST. `standing_held` is the
+    // Reconcile the standing lockdown cover FIRST. The presence is the
     // lockdown cover's OWN evidence (injected probe), NOT the route-state file,
     // whose lifetime is independent of the cover. Deciding/adopting before the
     // transient sweep means the subsequent sweep can be told a standing cover is
     // held and must not clobber it. The recover action keeps the host fail-closed
     // (Adopt) or disengages (Sweep).
-    let standing_held = lockdown_present();
-    let decision = decide_cover_recovery(lockdown_intent, standing_held);
-    let adopt = matches!(decision, CoverRecovery::Adopt);
-    lockdown_recover(decision);
+    let presence = lockdown_present();
+    let decision = decide_cover_recovery(lockdown_intent, presence);
+    // Repair BEFORE acting, so a crash in between leaves an intent that reads
+    // armed rather than one the next start would sweep on. A failed write costs
+    // the persisted preference, never the action or the escape: this run's
+    // adopted-cover claim carries the escape, and the bridge retries the write
+    // the moment it honours that claim with a real cover install (see
+    // `promote_adopted_claim`). Re-deriving it on a LATER start is not a
+    // fallback — once the cover is torn down the measurement reads `Absent`.
+    if decision.record_intent_on {
+        if let Err(e) = failclosed::lockdown_state::set_enabled(state_dir, true, owner) {
+            warn!(error = %e, "could not repair the lockdown intent over a measured live cover");
+        }
+    }
+    let adopt = matches!(decision.action, CoverRecovery::Adopt);
+    // `tun_name_hint` prefers THIS bridge's own last-known TUN device (from its
+    // own `bridge-routes.json`) and falls back to the caller-supplied
+    // `tun_name` otherwise — see this function's doc for why the file alone
+    // is not a safe gate. `TUN_DEVICE_NAME` is a compile-time constant shared
+    // by every install, so the fallback names the same device a different
+    // install's cover would too; only the reclaim's server-IP counterpart is
+    // scoped by the per-install identity gap CONTRIBUTING.md discloses
+    // (#878), and this reclaim never touches that permit.
+    lockdown_recover(decision.action, Some(tun_name_hint.as_str()));
 
     // Sweep any transient fail-closed cover left by a crashed update cutover.
     // Runs UNCONDITIONALLY (outside the route-state guard above): a crash can
@@ -345,10 +515,12 @@ pub(crate) fn recover_routes_with<R, S, P, L>(
     // — and the sweep is idempotent when no cover is present. When a standing
     // lockdown cover is being adopted, the sweep must leave the lockdown ruleset
     // untouched (macOS: skip the `pfctl -f /etc/pf.conf` reload that would wipe
-    // it) — passed as `adopt`. Note this is `adopt`, NOT `standing_held`: on a
+    // it) — passed as `adopt`. Note this is `adopt`, NOT the raw presence: on a
     // Sweep (intent off, cover present) the standing ruleset is being torn down,
     // so the transient restore SHOULD run.
     sweep_cover(state_dir, adopt);
+
+    decision
 }
 
 // Routing trait =======================================================================================================

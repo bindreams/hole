@@ -96,15 +96,20 @@ pub(crate) fn after(seq: TcpSeqNumber) -> u32 {
     (seq.0 as u32).wrapping_add(1)
 }
 
+/// 1400 MTU - 20 (IPv4) - 20 (TCP), the MSS a real client advertises here.
+pub(crate) const CLIENT_MSS: u16 = 1360;
+
 /// Build a segment, choosing what the outer IP header claims as its protocol
 /// and what checksum behavior to emit with. Every other builder in this module
 /// is a thin wrapper over this with `IpProtocol::Tcp` and a valid checksum.
+#[allow(clippy::too_many_arguments)] // 8 args — bundling into a struct adds more noise than the warning.
 fn segment_ex(
     src: SocketAddr,
     dst: SocketAddr,
     control: TcpControl,
     seq: u32,
     ack: Option<u32>,
+    payload: &[u8],
     next_header: IpProtocol,
     checksums: &ChecksumCapabilities,
 ) -> Vec<u8> {
@@ -121,11 +126,11 @@ fn segment_ex(
         ack_number: ack.map(|a| TcpSeqNumber(a as i32)),
         window_len: 65535,
         window_scale: None,
-        max_seg_size: None,
+        max_seg_size: (control == TcpControl::Syn).then_some(CLIENT_MSS),
         sack_permitted: false,
         sack_ranges: [None, None, None],
         timestamp: None,
-        payload: &[],
+        payload,
     };
     let ip_repr = Ipv4Repr {
         src_addr: src_v4,
@@ -147,20 +152,28 @@ fn segment_ex(
     buf
 }
 
-pub(crate) fn segment(src: SocketAddr, dst: SocketAddr, control: TcpControl, seq: u32, ack: Option<u32>) -> Vec<u8> {
+pub(crate) fn segment(
+    src: SocketAddr,
+    dst: SocketAddr,
+    control: TcpControl,
+    seq: u32,
+    ack: Option<u32>,
+    payload: &[u8],
+) -> Vec<u8> {
     segment_ex(
         src,
         dst,
         control,
         seq,
         ack,
+        payload,
         IpProtocol::Tcp,
         &ChecksumCapabilities::default(),
     )
 }
 
 pub(crate) fn syn(src: SocketAddr, dst: SocketAddr, seq: u32) -> Vec<u8> {
-    segment(src, dst, TcpControl::Syn, seq, None)
+    segment(src, dst, TcpControl::Syn, seq, None, &[])
 }
 
 /// A bare SYN with a zeroed IP and TCP checksum — what a TUN adapter (wintun,
@@ -174,6 +187,7 @@ pub(crate) fn checksumless_syn(src: SocketAddr, dst: SocketAddr, seq: u32) -> Ve
         TcpControl::Syn,
         seq,
         None,
+        &[],
         IpProtocol::Tcp,
         &ChecksumCapabilities::ignored(),
     )
@@ -191,6 +205,7 @@ pub(crate) fn syn_shaped_payload_under(next_header: IpProtocol, src: SocketAddr,
         TcpControl::Syn,
         seq,
         None,
+        &[],
         next_header,
         &ChecksumCapabilities::default(),
     )
@@ -282,15 +297,25 @@ pub(crate) fn syn_under_hop_by_hop_v6(src: SocketAddr, dst: SocketAddr, seq: u32
 }
 
 pub(crate) fn ack(src: SocketAddr, dst: SocketAddr, seq: u32, ack: u32) -> Vec<u8> {
-    segment(src, dst, TcpControl::None, seq, Some(ack))
+    segment(src, dst, TcpControl::None, seq, Some(ack), &[])
 }
 
 pub(crate) fn rst(src: SocketAddr, dst: SocketAddr, seq: u32, ack: u32) -> Vec<u8> {
-    segment(src, dst, TcpControl::Rst, seq, Some(ack))
+    segment(src, dst, TcpControl::Rst, seq, Some(ack), &[])
 }
 
 pub(crate) fn fin(src: SocketAddr, dst: SocketAddr, seq: u32, ack: u32) -> Vec<u8> {
-    segment(src, dst, TcpControl::Fin, seq, Some(ack))
+    segment(src, dst, TcpControl::Fin, seq, Some(ack), &[])
+}
+
+/// A segment carrying `payload`, without `FIN`.
+pub(crate) fn data(src: SocketAddr, dst: SocketAddr, seq: u32, ack: u32, payload: &[u8]) -> Vec<u8> {
+    segment(src, dst, TcpControl::None, seq, Some(ack), payload)
+}
+
+/// A segment carrying `payload` and `FIN` together, in one packet.
+pub(crate) fn data_fin(src: SocketAddr, dst: SocketAddr, seq: u32, ack: u32, payload: &[u8]) -> Vec<u8> {
+    segment(src, dst, TcpControl::Fin, seq, Some(ack), payload)
 }
 
 /// Drain and parse everything the stack has queued for the TUN.

@@ -83,10 +83,10 @@ pub const FILTER_GUIDS: [GUID; 12] = [
 /// a value this stable).
 const IPPROTO_TCP: u8 = 6;
 
-// Lockdown-cover filter GUIDs — disjoint from FILTER_GUIDS. Recovery sweeps
-// these (Sweep) or deletes the volatile TUN + server pairs (Adopt) — see
-// `recover_lockdown` / `swept_lockdown_guids`. A crash that leaves the cover
-// engaged is reconciled on the next start.
+// Lockdown-cover filter GUIDs — disjoint from FILTER_GUIDS. A Sweep deletes
+// all of these (`swept_lockdown_guids`); an engage refreshes the volatile
+// subset (`adopt_delete_guids`). A crash that leaves the cover engaged is
+// reconciled on the next start.
 // Layout: [loopback CONNECT V4, loopback CONNECT V6, TUN V4, TUN V6,
 //          server V4, server V6, block-all V4, block-all V6,
 //          loopback RECV_ACCEPT V4, loopback RECV_ACCEPT V6,
@@ -110,11 +110,11 @@ pub const LOCKDOWN_FILTER_GUIDS: [GUID; 12] = [
 ];
 
 /// Indices into [`LOCKDOWN_FILTER_GUIDS`] for the TUN-interface (LUID) permit
-/// pair — one of the two volatile permits Adopt drops (see
+/// pair — one of the two volatile permits an engage refreshes (see
 /// [`adopt_delete_guids`]).
 const LOCKDOWN_TUN_GUID_INDICES: [usize; 2] = [2, 3]; // TUN V4, TUN V6
 /// Indices into [`LOCKDOWN_FILTER_GUIDS`] for the server-IP permit pair — the
-/// other volatile permit Adopt drops (see [`adopt_delete_guids`]).
+/// other volatile permit an engage refreshes (see [`adopt_delete_guids`]).
 const LOCKDOWN_SERVER_GUID_INDICES: [usize; 2] = [4, 5]; // server V4, server V6
 
 /// Derive a deterministic App-ID filter GUID per (binary index, layer) so a
@@ -151,12 +151,16 @@ fn swept_lockdown_guids() -> Vec<GUID> {
     guids
 }
 
-/// The GUIDs Adopt deletes: the VOLATILE permits — the TUN-LUID pair (dies with
-/// the TUN) and the server-IP pair (changes with the server). They carry fixed
-/// keys, so engage's `ok_or_exists` would silently keep a stale one; deleting
-/// them lets the next connect re-add both fresh with current values. The floor
-/// (block-all, loopback, App-ID) is left in force so the host stays fail-closed
-/// across the restart.
+/// The VOLATILE lockdown permits — the TUN-LUID pair (dies with the TUN) and
+/// the server-IP pair (changes with the server). They carry fixed keys, so
+/// engage's `ok_or_exists` would silently keep a stale one; [`engage_lockdown`]
+/// deletes them inside its transaction before the adds, so every engage lands
+/// current values. The floor (block-all, loopback, App-ID) is never in this set
+/// — it stays in force so the host is never opened by a refresh.
+///
+/// Reached through `CoverSpec::pre_delete`, so recovery cannot issue it: a
+/// recovery-time delete would drop a RUNNING bridge's server permit whenever a
+/// second bridge with a fresh state dir adopted the cover.
 fn adopt_delete_guids() -> Vec<GUID> {
     LOCKDOWN_TUN_GUID_INDICES
         .iter()
@@ -232,6 +236,10 @@ pub struct FilterSpec {
 pub struct CoverSpec {
     pub provider: GUID,
     pub sublayer: GUID,
+    /// Filter keys the engage deletes inside its transaction BEFORE adding
+    /// anything. Non-empty only for the lockdown cover, whose volatile permits
+    /// carry fixed keys — see [`adopt_delete_guids`].
+    pub pre_delete: Vec<GUID>,
     pub filters: Vec<FilterSpec>,
 }
 
@@ -342,6 +350,9 @@ pub fn build_cover_spec(server_ip: IpAddr, resolver_ip: Option<IpAddr>) -> Cover
     CoverSpec {
         provider: PROVIDER_GUID,
         sublayer: SUBLAYER_GUID,
+        // The transient cover is engaged over a swept host and has no
+        // fixed-key volatile permit to refresh.
+        pre_delete: Vec::new(),
         filters,
     }
 }
@@ -430,6 +441,7 @@ pub fn build_lockdown_spec(server_ip: IpAddr, tun_luid: u64, app_ids: &[std::pat
     CoverSpec {
         provider: PROVIDER_GUID,
         sublayer: SUBLAYER_GUID,
+        pre_delete: adopt_delete_guids(),
         filters,
     }
 }
@@ -556,6 +568,10 @@ pub fn engage(
 
         // Wrap the mutating steps so any failure aborts the transaction and
         // closes the engine before returning.
+        debug_assert!(
+            spec.pre_delete.is_empty(),
+            "the transient cover has no volatile permit to refresh; this engage honors no pre_delete"
+        );
         let result = (|| -> Result<(), RoutingError> {
             wfp_check(FwpmTransactionBegin0(engine, 0), "FwpmTransactionBegin0")?;
             add_provider(engine, spec.provider)?;
@@ -595,11 +611,18 @@ pub fn engage_lockdown(
         )?;
         let result = (|| -> Result<(), RoutingError> {
             wfp_check(FwpmTransactionBegin0(engine, 0), "FwpmTransactionBegin0")?;
+            // Refresh the volatile permits: delete their fixed keys before the
+            // adds, in this same transaction, so a re-engage over an adopted
+            // cover lands the CURRENT TUN LUID and server IP instead of hitting
+            // `ok_or_exists` on a stale filter. Return codes are ignored for
+            // the same reason every other sweep ignores them — a delete that
+            // finds nothing (the ordinary first engage) is not an error.
+            for g in &spec.pre_delete {
+                let _ = FwpmFilterDeleteByKey0(engine, g);
+            }
             // Idempotent over an unswept cover: add_provider/add_sublayer use
-            // ok_or_exists, and the filter keys are fixed — a re-engage after
-            // an Adopt re-adds the TUN + server permits fresh (their keys were
-            // deleted by `recover_lockdown`, so the new server IP takes effect);
-            // the kept floor (block-all + loopback + App-ID) is a benign re-add.
+            // ok_or_exists, and the kept floor (block-all + loopback + App-ID)
+            // is a benign re-add.
             add_provider(engine, spec.provider)?;
             add_sublayer(engine, spec.sublayer, spec.provider)?;
             for f in &spec.filters {
@@ -920,56 +943,170 @@ impl Drop for Cover {
                 CoverKind::Transient => delete_all(self.engine),
                 // Lockdown: delete only the lockdown + App-ID filters; the
                 // shared sublayer/provider are owned by the transient sweep.
+                // A user stop RELIES on this Drop to open the host, and Drop
+                // cannot return an error, so a code that is neither success nor
+                // not-found is warned: silence there is indistinguishable from
+                // a clean release.
                 #[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
                 CoverKind::Lockdown => {
-                    for g in swept_lockdown_guids() {
-                        let _ = FwpmFilterDeleteByKey0(self.engine, &g);
+                    let codes: Vec<(&'static str, u32)> = swept_lockdown_guids()
+                        .into_iter()
+                        .map(|g| ("lockdown filter", FwpmFilterDeleteByKey0(self.engine, &g)))
+                        .collect();
+                    if let Some(e) = first_delete_failure(&codes) {
+                        tracing::warn!(error = %e, "lockdown cover release left a filter installed; egress may still be blocked");
                     }
                 }
             }
             #[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
-            let _ = FwpmEngineClose0(self.engine);
+            let rc = FwpmEngineClose0(self.engine);
+            if rc != ERROR_SUCCESS.0 {
+                // Leaks the handle for the life of the process; the deletes
+                // above already committed, so the host's posture is unaffected.
+                tracing::warn!("FwpmEngineClose0 failed: 0x{rc:08x}");
+            }
         }
     }
 }
 
-/// Reconcile a possibly-present standing lockdown cover with the persisted
-/// intent. Opens the engine; `Adopt` deletes the volatile permits — the dead
-/// TUN-LUID pair and the server-IP pair — keeping the fail-closed floor
-/// (block-all + loopback + App-ID) so the host stays blocked across the restart
-/// and the next connect re-adds TUN + server fresh; `Sweep` deletes all
-/// lockdown + App-ID filters,
-/// then the sublayer/provider IFF the transient cover isn't also using them
-/// (they share PROVIDER_GUID/SUBLAYER_GUID, so leave them — the transient
-/// `delete_all` owns their removal, and an orphaned empty sublayer is benign).
-/// `Noop`: nothing. Idempotent — a "not found" delete is ignored.
-pub fn recover_lockdown(decision: crate::routing::CoverRecovery, _state_dir: &Path) {
-    use crate::routing::CoverRecovery::*;
-    let guids: Vec<GUID> = match decision {
-        Noop => return,
-        Adopt => adopt_delete_guids(),
-        Sweep => swept_lockdown_guids(),
-    };
+/// Pure: whether the volatile TUN permit should be reclaimed, given whether
+/// `tun_name` resolved to a live `NET_LUID`. Total and side-effect-free, so
+/// the decision is table-tested without FWPM — see
+/// `failclosed::reclaim_stale_tun_permit`'s doc for the staleness scenario
+/// this guards and why a resolving `hole-tun` must never be reclaimed.
+pub(crate) fn should_reclaim_tun_permit(resolved: bool) -> bool {
+    !resolved
+}
+
+/// Delete the volatile TUN-interface permit pair (`LOCKDOWN_TUN_GUID_INDICES`)
+/// when `resolver` cannot resolve `tun_name` — see
+/// [`should_reclaim_tun_permit`]. Idempotent: a delete that finds nothing is
+/// not an error, but a code that is neither success nor not-found means a
+/// filter is STILL installed — the exact staleness this reclaim exists to
+/// close — so it is folded through [`first_delete_failure`] and warned, same
+/// as `Cover::drop`'s Lockdown arm and [`delete_all`]: a DACL-denied delete
+/// must not read as a successful reclaim.
+#[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
+pub fn reclaim_stale_tun_permit(resolver: &dyn super::LuidResolver, tun_name: &str) {
+    if !should_reclaim_tun_permit(resolver.resolve(tun_name).is_ok()) {
+        // A live `hole-tun` exists — some bridge may be relying on this
+        // permit. Never delete it out from under a running bridge.
+        return;
+    }
     unsafe {
         let mut engine = HANDLE::default();
-        #[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
-        if FwpmEngineOpen0(PCWSTR::null(), RPC_C_AUTHN_WINNT, None, None, &mut engine) == ERROR_SUCCESS.0 {
-            #[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
-            for g in guids {
-                let _ = FwpmFilterDeleteByKey0(engine, &g);
-            }
-            #[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
-            let _ = FwpmEngineClose0(engine);
+        let rc = FwpmEngineOpen0(PCWSTR::null(), RPC_C_AUTHN_WINNT, None, None, &mut engine);
+        if rc != ERROR_SUCCESS.0 {
+            tracing::warn!(
+                code = format!("0x{rc:08x}"),
+                "FwpmEngineOpen0 failed: could not reclaim a stale TUN permit"
+            );
+            return;
         }
+        let codes: Vec<(&'static str, u32)> = LOCKDOWN_TUN_GUID_INDICES
+            .iter()
+            .map(|&i| {
+                (
+                    "TUN-LUID permit",
+                    FwpmFilterDeleteByKey0(engine, &LOCKDOWN_FILTER_GUIDS[i]),
+                )
+            })
+            .collect();
+        if let Some(e) = first_delete_failure(&codes) {
+            tracing::warn!(error = %e, "stale TUN permit reclaim left a filter installed; a later adapter reusing this LUID would inherit unconditional egress");
+        }
+        let _ = FwpmEngineClose0(engine);
+    }
+}
+
+/// Classify a presence probe's outcome. Pure and total over its inputs, so the
+/// rule is table-tested without an engine.
+///
+/// `engine_opened` false is [`CoverPresence::Unreachable`] — the firewall could
+/// not be asked, so nothing at all is known. Otherwise: any `ERROR_SUCCESS`
+/// means at least one lockdown filter is installed
+/// ([`CoverPresence::Live`](crate::routing::CoverPresence::Live) is "any
+/// residue", see its doc); every code being the literal
+/// [`FWP_E_FILTER_NOT_FOUND_DWORD`] means a clean host; anything else is
+/// [`CoverPresence::Indeterminate`].
+///
+/// **Only that one literal code produces `Absent`.** That is the structural
+/// guarantee that a DACL-denied read can never be mistaken for a clean host,
+/// and it is what makes the unelevated behaviour of `FwpmFilterGetByKey0` a
+/// documentation question rather than a correctness dependency.
+pub(crate) fn classify_presence(engine_opened: bool, codes: &[u32]) -> crate::routing::CoverPresence {
+    use crate::routing::CoverPresence;
+    if !engine_opened {
+        return CoverPresence::Unreachable;
+    }
+    if codes.contains(&ERROR_SUCCESS.0) {
+        return CoverPresence::Live;
+    }
+    if codes.iter().all(|&c| c == FWP_E_FILTER_NOT_FOUND_DWORD) {
+        return CoverPresence::Absent;
+    }
+    CoverPresence::Indeterminate
+}
+
+/// Ask WFP whether a standing lockdown cover — or any residue of one — is
+/// installed, by querying every GUID in [`swept_lockdown_guids`] with
+/// `FwpmFilterGetByKey0`. `state_dir` is unused: the lockdown GUIDs are
+/// compile-time constants, so this answers "is a Hole lockdown cover present",
+/// never "is it mine" (see CONTRIBUTING.md's disclosed residual).
+///
+/// A failed engine open means the Base Filtering Engine could not be reached
+/// (BFE not yet running, or an RPC failure) — NOT "not elevated"; FWPM opens
+/// without elevation, as `release_all`'s doc records.
+///
+/// Measured unelevated on a clean host: the open succeeds and every by-key
+/// query returns `FWP_E_FILTER_NOT_FOUND`, so this answers `Absent` — the read
+/// needs no elevation (only the write transaction does). Whether reading an
+/// EXISTING filter's DACL is permitted unelevated is not established by that
+/// measurement, and does not need to be: `classify_presence` yields `Absent`
+/// for no code but the literal not-found, so a denied read is `Indeterminate`.
+#[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
+pub fn lockdown_cover_presence(_state_dir: &Path) -> crate::routing::CoverPresence {
+    unsafe {
+        let mut engine = HANDLE::default();
+        let rc = FwpmEngineOpen0(PCWSTR::null(), RPC_C_AUTHN_WINNT, None, None, &mut engine);
+        if rc != ERROR_SUCCESS.0 {
+            tracing::warn!(
+                code = format!("0x{rc:08x}"),
+                "FwpmEngineOpen0 failed: the firewall could not be asked whether a lockdown cover is present"
+            );
+            return classify_presence(false, &[]);
+        }
+
+        let mut codes: Vec<u32> = Vec::new();
+        for g in swept_lockdown_guids() {
+            let mut out: *mut FWPM_FILTER0 = std::ptr::null_mut();
+            codes.push(FwpmFilterGetByKey0(engine, &g, &mut out));
+            if !out.is_null() {
+                let mut p = out as *mut core::ffi::c_void;
+                FwpmFreeMemory0(&mut p);
+            }
+        }
+        let _ = FwpmEngineClose0(engine);
+
+        let presence = classify_presence(true, &codes);
+        if presence == crate::routing::CoverPresence::Indeterminate {
+            tracing::warn!(
+                codes = ?codes.iter().map(|c| format!("0x{c:08x}")).collect::<Vec<_>>(),
+                "lockdown presence probe returned an unusable answer"
+            );
+        }
+        presence
     }
 }
 
 /// Fail-loud disengage for the `bridge unlock` escape hatch. Deletes all
 /// lockdown + App-ID filters by their fixed GUIDs (idempotent — a "not found"
 /// delete is a no-op, so a clean host returns `Ok`). The failure that means
-/// "cannot disengage" is the ENGINE OPEN: it fails when the process is not
-/// elevated, in which case we could not have torn anything down → `Err`. There
-/// is no persisted Windows state to key absence on (delete-by-GUID is
+/// "cannot disengage" is the ENGINE OPEN: the Base Filtering Engine could not
+/// be reached, so nothing could have been issued → `Err`. That is NOT "not
+/// elevated" — FWPM opens without elevation (`release_all`'s doc records the
+/// same measurement); a failed open means BFE is not running or RPC failed.
+/// There is no persisted Windows state to key absence on (delete-by-GUID is
 /// idempotent), so a successful open always reports `Ok`.
 pub fn disengage_lockdown(_state_dir: &Path) -> Result<(), RoutingError> {
     unsafe {
@@ -978,7 +1115,8 @@ pub fn disengage_lockdown(_state_dir: &Path) -> Result<(), RoutingError> {
         let rc = FwpmEngineOpen0(PCWSTR::null(), RPC_C_AUTHN_WINNT, None, None, &mut engine);
         if rc != ERROR_SUCCESS.0 {
             return Err(RoutingError::RouteSetup(format!(
-                "FwpmEngineOpen0 failed ({rc}); not elevated? cannot disengage the lockdown cover"
+                "FwpmEngineOpen0 failed (0x{rc:08x}): the firewall could not be reached, so the lockdown \
+                 cover could not be disengaged"
             )));
         }
         #[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
@@ -1000,8 +1138,9 @@ pub fn recover_cover(_state_dir: &Path, adopting: bool) {
     unsafe {
         let mut engine = HANDLE::default();
         // FwpmEngineOpen0 returns u32 — compare to ERROR_SUCCESS.0, NOT `.is_ok()`.
-        // Open can fail when the bridge isn't elevated; that's a benign no-op
-        // (nothing to sweep that we could reach anyway).
+        // A failed open means the Base Filtering Engine could not be reached
+        // (not "not elevated" — FWPM opens without elevation), so nothing could
+        // have been swept anyway; skipping is a benign no-op.
         #[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
         if FwpmEngineOpen0(PCWSTR::null(), RPC_C_AUTHN_WINNT, None, None, &mut engine) == ERROR_SUCCESS.0 {
             delete_all(engine);
@@ -1014,11 +1153,19 @@ pub fn recover_cover(_state_dir: &Path, adopting: bool) {
 /// Delete filters (by their fixed GUIDs), then the sublayer, then the
 /// provider. Order matters: a sublayer/provider delete fails while filters
 /// still reference it. Each delete is idempotent — a "not found" return is
-/// ignored (recovery runs even when no cover is present).
+/// ignored (recovery runs even when no cover is present) — but a code that is
+/// neither success nor not-found is a filter still blocking egress, and the
+/// callers (`Cover::drop`, `recover_cover`) can return nothing, so it is
+/// warned here. The sublayer/provider deletes stay best-effort: an orphaned
+/// empty sublayer holds no traffic.
 #[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
 unsafe fn delete_all(engine: HANDLE) {
-    for g in swept_transient_guids() {
-        let _ = FwpmFilterDeleteByKey0(engine, &g);
+    let codes: Vec<(&'static str, u32)> = swept_transient_guids()
+        .into_iter()
+        .map(|g| ("transient filter", FwpmFilterDeleteByKey0(engine, &g)))
+        .collect();
+    if let Some(e) = first_delete_failure(&codes) {
+        tracing::warn!(error = %e, "transient cover sweep left a filter installed; egress may still be blocked");
     }
     let _ = FwpmSubLayerDeleteByKey0(engine, &SUBLAYER_GUID);
     let _ = FwpmProviderDeleteByKey0(engine, &PROVIDER_GUID);

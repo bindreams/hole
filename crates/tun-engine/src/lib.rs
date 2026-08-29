@@ -35,6 +35,27 @@ fn main() {
     skuld::run_all();
 }
 
+/// The elevated-lane label (→ skuld filter name `tun`). skuld requires each
+/// label to be declared exactly once per test binary, and every module under
+/// this crate compiles into the SAME binary, so this is the crate's only
+/// declaration — a second `#[skuld::label] const TUN` anywhere would mint a
+/// different serial token and panic the runner at startup.
+#[cfg(test)]
+#[skuld::label]
+pub(crate) const TUN: skuld::Label;
+
+/// Cross-binary serialization for tests that mutate GLOBAL OS network state —
+/// the `.config/nextest.toml` `global_net_state` test-group's `max-threads = 1`
+/// gate. skuld's own `serial = TUN` only serializes within this one binary;
+/// this label is what `cargo xtask verify-global-net-state-labels` binds to
+/// that group's name-substring filter (bindreams/hole#894). Declared here
+/// (not at any one call site) for the same reason as `TUN` above: every
+/// module under this crate compiles into the same binary, so this is the
+/// crate's only declaration.
+#[cfg(test)]
+#[skuld::label]
+pub(crate) const GLOBAL_NET_STATE: skuld::Label;
+
 pub mod adapter_cleanup;
 pub mod device;
 pub mod engine;
@@ -43,13 +64,16 @@ pub mod gateway;
 pub mod helpers;
 pub mod net;
 pub mod routing;
+#[cfg(any(test, feature = "test-utils"))]
+#[doc(hidden)]
+pub mod sim;
 
 // Dev-only; see the module doc. `cfg(test)` so this crate's own privileged
 // tests get it without the feature.
 #[cfg(any(test, feature = "test-utils"))]
 pub mod test_utils;
 
-pub use device::{Device, DeviceConfig, MutDeviceConfig};
+pub use device::{Assigned, Device, DeviceConfig, MutDeviceConfig};
 pub use engine::{
     DnsInterceptor, Engine, EngineConfig, MutEngineConfig, Router, TcpFlow, TcpMeta, UdpFlow, UdpMeta, UdpSender,
 };

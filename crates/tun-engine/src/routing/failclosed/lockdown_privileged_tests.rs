@@ -46,17 +46,7 @@
 //! when it could be a general outage instead.
 
 use super::*;
-
-#[skuld::label]
-pub(super) const TUN: skuld::Label;
-
-/// Cross-binary serialization for tests that mutate GLOBAL OS network state —
-/// the `.config/nextest.toml` `global_net_state` test-group's `max-threads = 1`
-/// gate. skuld's own `serial = TUN` only serializes within this one binary;
-/// this label is what `cargo xtask verify-global-net-state-labels` binds to
-/// that group's name-substring filter (bindreams/hole#894).
-#[skuld::label]
-pub(super) const GLOBAL_NET_STATE: skuld::Label;
+use crate::{GLOBAL_NET_STATE, TUN};
 
 // Two routable anycast hosts on :443 (the runner has outbound internet). IP
 // literals only — the cover blocks DNS, so a hostname connect would fail for the
@@ -132,6 +122,15 @@ fn windows_lockdown_permits_server_ip_and_blocks_other_egress() {
         base_non.err().map(|e| e.kind()),
     );
 
+    // Pre-engage, the OS must report a clean host. This is the assertion that
+    // would have caught `lockdown_cover_present`'s hardcoded `true` — the value
+    // that made a bridge with a wiped state dir sweep a live kill switch.
+    assert_eq!(
+        super::lockdown_cover_presence(dir.path()),
+        crate::routing::CoverPresence::Absent,
+        "pre-engage the firewall must report no lockdown cover"
+    );
+
     // "Loopback Pseudo-Interface 1" is an always-present alias used only as a LUID
     // source to exercise the real resolve + `LocalInterface` filter path.
     let cover = engage_lockdown(
@@ -143,6 +142,12 @@ fn windows_lockdown_permits_server_ip_and_blocks_other_egress() {
         None,
     )
     .expect("engage real WFP lockdown cover");
+
+    assert_eq!(
+        super::lockdown_cover_presence(dir.path()),
+        crate::routing::CoverPresence::Live,
+        "while the cover is held the firewall must report it present"
+    );
 
     let permitted = connect(PERMITTED);
     let non = connect(NON_PERMITTED);
@@ -167,6 +172,11 @@ fn windows_lockdown_permits_server_ip_and_blocks_other_egress() {
         connect(NON_PERMITTED).is_ok(),
         "disengage must restore egress to the previously-blocked host: {NON_PERMITTED}={:?}",
         connect(NON_PERMITTED).err().map(|e| e.kind()),
+    );
+    assert_eq!(
+        super::lockdown_cover_presence(dir.path()),
+        crate::routing::CoverPresence::Absent,
+        "after the guard drops the firewall must report the cover gone"
     );
 }
 
@@ -216,6 +226,12 @@ fn macos_lockdown_permits_server_ip_blocks_other_egress_and_restores() {
         base_non.err().map(|e| e.kind()),
     );
 
+    assert_eq!(
+        super::lockdown_cover_presence(dir.path()),
+        crate::routing::CoverPresence::Absent,
+        "pre-engage pf must report no lockdown cover"
+    );
+
     let cover = engage_lockdown(server_ip, "utun-absent", &resolver, &[], dir.path(), None)
         .expect("engage real pf lockdown cover");
 
@@ -225,6 +241,23 @@ fn macos_lockdown_permits_server_ip_blocks_other_egress_and_restores() {
     assert!(
         rules.contains("block drop out quick all"),
         "main ruleset must carry the lockdown block (else inert):\n{rules}"
+    );
+
+    // (a2) The label really loaded, and `pfctl -s labels` really lists it. Every
+    // macOS `Live` in this feature flows through this one measurement, so a
+    // failure here means the intent repair and the self-capture guard are dead
+    // code that still passes its unit tests — fix the ruleset, never relax this.
+    let labels = Command::new("pfctl").args(["-s", "labels"]).output().unwrap();
+    let labels = String::from_utf8_lossy(&labels.stdout);
+    assert!(
+        super::platform::labels_listing_carries_our_label(&labels),
+        "`pfctl -s labels` must list {:?} while the cover is held:\n{labels}",
+        super::platform::LOCKDOWN_PF_LABEL
+    );
+    assert_eq!(
+        super::lockdown_cover_presence(dir.path()),
+        crate::routing::CoverPresence::Live,
+        "while the cover is held pf must report it present"
     );
 
     let permitted = connect(PERMITTED);
@@ -254,6 +287,13 @@ fn macos_lockdown_permits_server_ip_blocks_other_egress_and_restores() {
         connect(NON_PERMITTED).is_ok(),
         "disengage must restore egress to the previously-blocked host: {NON_PERMITTED}={:?}",
         connect(NON_PERMITTED).err().map(|e| e.kind()),
+    );
+    // Exercises BOTH halves of the fold: the label is gone from pf AND
+    // `disengage_lockdown` cleared the state file.
+    assert_eq!(
+        super::lockdown_cover_presence(dir.path()),
+        crate::routing::CoverPresence::Absent,
+        "after the guard drops, neither pf nor the state file may report a cover"
     );
 }
 
