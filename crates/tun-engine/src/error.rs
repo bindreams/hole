@@ -56,6 +56,10 @@ pub enum DeviceError {
     WintunMissing { tried: Vec<PathBuf> },
     #[error("wintun.dll load failed at {}: {message}", .path.display())]
     WintunLoad { path: PathBuf, message: String },
+    /// The device exists; its IPv6 address does not. `index` is `0` — the
+    /// reserved sentinel — when no interface index could be derived at all.
+    #[error("IPv6 address assignment failed on interface {index}: {message}")]
+    Ipv6Assign { index: u32, message: String },
 }
 
 /// Errors surfaced by the `engine` module.

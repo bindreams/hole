@@ -20,8 +20,8 @@ pub struct Socks5Endpoint {
     addr: SocketAddr,
     /// Plugin name threaded through from [`crate::proxy::config`], used
     /// as a diagnostic in warn logs when the router drops UDP for a
-    /// TCP-only plugin. Read via [`Socks5Endpoint::plugin_name`]. `None`
-    /// when no plugin is configured.
+    /// TCP-only plugin. Read via [`Endpoint::plugin_name`]. `None` when
+    /// no plugin is configured.
     plugin_name: Option<String>,
     /// Whether the SS↔server chain can carry UDP. Not a property of
     /// SOCKS5 itself (SOCKS5 always supports UDP via ASSOCIATE) — this
@@ -50,12 +50,6 @@ impl Socks5Endpoint {
     /// SOCKS5 server address. Exposed for diagnostics.
     pub fn addr(&self) -> SocketAddr {
         self.addr
-    }
-
-    /// Plugin name (if configured). Used by `HoleRouter` to emit the
-    /// `plugin = %name` structured log field when dropping UDP.
-    pub fn plugin_name(&self) -> Option<&str> {
-        self.plugin_name.as_deref()
     }
 }
 
@@ -115,5 +109,9 @@ impl Endpoint for Socks5Endpoint {
 
     fn name(&self) -> &str {
         &self.label
+    }
+
+    fn plugin_name(&self) -> Option<&str> {
+        self.plugin_name.as_deref()
     }
 }

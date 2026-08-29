@@ -26,13 +26,32 @@ before editing; the sections linked below are the authoritative source.
   tunnel); enforced structurally in `HoleRouter::resolve_endpoint`. UDP/53 is
   diverted to the DNS forwarder before the cascade. →
   [CONTRIBUTING.md#udp-policy](CONTRIBUTING.md#udp-policy)
+- **IPv6 in the tunnel.** IPv6 is meant to traverse the tunnel: the `::/1` +
+  `8000::/1` split pair captures it, and `hole-tun` holds `TUN_SUBNET6` on the
+  **OS interface** as well as in smoltcp, so a host with no global IPv6 still
+  has a source address for those routes. The ULA's global ID is generated per
+  RFC 4193, not `fd00::`. Windows waits for the interface's IPv6 half itself
+  (`tun` waits only for the IPv4 one) and creates the address
+  `IpDadStatePreferred`; assignment is fatal on Windows, warn-only on macOS,
+  and `Dispatcher::ipv6_assigned()` is what route-install fatality must read. →
+  [CONTRIBUTING.md#ipv6-in-the-tunnel](CONTRIBUTING.md#ipv6-in-the-tunnel)
 - **TCP accept refusal.** The accept verdict lands while the listener is still
-  in `SynReceived` with its SYN-ACK paused, so a declined connection gets a
-  pre-handshake RST, never a black hole. A 4-tuple has one owner: a same-tuple
-  SYN's ISN, read off the wire, tells a retransmit from a new connection
-  reusing it (RFC 9293 §3.10.7.4), and `Driver::settle_packet` bundles
-  admission and retirement into one call per packet so a socket mid-teardown
-  can never intercept the next SYN. →
+  in `SynReceived` with its SYN-ACK paused, so a declined connection is refused
+  with a pre-handshake RST instead of black-holing behind a SYN-ACK; the verdict
+  is the pure `decide_admission`. A socket with a packet still to emit is
+  *retired* rather than removed, and reaped once smoltcp clears its 4-tuple —
+  including one that reverted to `Listen`, which would otherwise hijack its
+  port. No socket in the stack defers an ACK, so `TimeWait` strands nothing on
+  immediate removal. A 4-tuple has one owner: a same-tuple SYN's ISN, read off
+  the wire, tells a retransmit from a new connection reusing it (RFC 9293
+  §3.10.7.4), and a re-armed listener that outranks its own connection in slot
+  order and steals that client's retransmitted SYN is caught the same way — such
+  a handshake is `Duplicate` and its socket is dropped without a segment.
+  `Driver::settle_packet` bundles admission and retirement into one call per
+  packet so a socket mid-teardown can never intercept the next SYN. An admitted
+  connection carries a keep-alive plus a timeout, the sanctioned bound on a
+  client that may never speak again — without it a stall in
+  `SynReceived`/`FinWait2`/`CloseWait` holds its slot forever. →
   [CONTRIBUTING.md#tcp-accept-refusal](CONTRIBUTING.md#tcp-accept-refusal)
 - **DNS forwarder.** Carries DNS over the TCP tunnel for TCP-only plugins; OS
   adapter DNS is advertised the configured resolver IPs, which route into
@@ -92,9 +111,14 @@ before editing; the sections linked below are the authoritative source.
   scoped to TCP/443) is a bounded-window RAII guard engaged by every covered
   (auto-connect) start whose lockdown intent is OFF; a lockdown-on covered
   start uses the standing cover instead and releases any held transient one.
-  Both are persistent WFP filters (Win) / self-contained pf ruleset (mac), swept
-  by `recover_routes` on next start. The escape from a stranded cover
-  (`failclosed::release_all`) is unconditional and knows nothing about cover
+  Both are persistent WFP filters (Win) / self-contained pf ruleset (mac); the
+  transient one is swept unconditionally on next start, the standing one only
+  on an explicit recorded off — full reconciliation table (`decide_cover_recovery`)
+  and disclosed residuals in CONTRIBUTING.md. An adopted cover's ARMED half
+  is promoted into `bridge-lockdown.json` at the first real engage, so a
+  disconnect (`reload`'s slow path is stop + start) cannot disarm the switch;
+  only `turn_lockdown_off` clears it. The escape from a stranded
+  cover (`failclosed::release_all`) is unconditional and knows nothing about cover
   state; its only condition is whether a session is running, and turning the
   kill switch off takes the same path. Who holds a cover has exactly one
   answer, derived once from `ProxyManager`'s single `posture` field

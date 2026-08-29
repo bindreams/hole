@@ -7,19 +7,26 @@
 //!
 //! See [`crate::hole_router`] for the role→mechanism wiring (Proxy →
 //! [`Socks5Endpoint`], Bypass → [`InterfaceEndpoint`]) and the full
-//! cascade. A dropped flow has no mechanism — the router releases it
-//! inline and [`BlockEndpoint`] only names the reason in the log. Tests
-//! can wire any mechanism to any slot via `MockEndpoint`.
+//! cascade. Blocking is not a mechanism and has no `Endpoint`: the router
+//! releases a dropped flow inline, and the flow is only recorded, on
+//! [`crate::drop_sink::DropSink`].
+//!
+//! Tests wire any mechanism to any slot through the crate-private
+//! `HoleRouter::with_endpoints`, substituting `mock::MockEndpoint` for
+//! the served slots and `crate::drop_sink::recording::RecordingDropSink`
+//! for the drop slot. Both are `cfg(test)`, so neither is linked into a
+//! production build.
 //!
 //! ## UDP-drop privacy invariant
 //!
 //! UDP flows that resolve to `Proxy` but can't be proxied (TCP-only
 //! plugin, [`Endpoint::supports_udp`] is `false`) are dropped, not
-//! bypassed — see [`crate::hole_router`] and [`BlockEndpoint`].
+//! bypassed — see [`crate::hole_router`] and [`crate::drop_sink`].
 
-pub mod block;
 pub mod interface;
 pub mod local_dns;
+#[cfg(test)]
+pub mod mock;
 pub mod socks5;
 
 use std::io;
@@ -28,7 +35,6 @@ use std::net::SocketAddr;
 use async_trait::async_trait;
 use tun_engine::{TcpFlow, UdpFlow};
 
-pub use block::BlockEndpoint;
 pub use interface::InterfaceEndpoint;
 pub use local_dns::LocalDnsEndpoint;
 pub use socks5::Socks5Endpoint;
@@ -64,8 +70,16 @@ pub trait Endpoint: Send + Sync {
     /// SOCKS5 carries IPv6 addresses via ATYP.
     fn supports_ipv6_dst(&self) -> bool;
 
-    /// Short diagnostic label (e.g. `"socks5(ex-ray)"`, `"interface(#5)"`,
-    /// `"block"`). Backed by the endpoint's own storage — no allocation
-    /// per call.
+    /// Short diagnostic label (e.g. `"socks5(ex-ray)"`,
+    /// `"interface(#5)"`). Backed by the endpoint's own storage — no
+    /// allocation per call.
     fn name(&self) -> &str;
+
+    /// Name of the plugin backing this mechanism, when one is configured.
+    /// The router reads it off the proxy slot for the `plugin` field of
+    /// the UDP-proxy-unavailable drop record. Mechanisms that have no
+    /// plugin keep the default.
+    fn plugin_name(&self) -> Option<&str> {
+        None
+    }
 }

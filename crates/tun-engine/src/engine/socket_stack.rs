@@ -126,8 +126,7 @@ impl SocketStack {
             if self.sockets.get::<tcp::Socket>(handle).remote_endpoint().is_some() {
                 return true;
             }
-            self.sockets.remove(handle);
-            self.owner_isn.remove(&handle);
+            self.remove(handle);
             false
         });
         self.retiring = retiring;
@@ -145,6 +144,9 @@ impl SocketStack {
             return;
         }
         socket.pause_synack(true);
+        // An ACK smoltcp defers is an ACK a removed socket never sends —
+        // see `remove`'s assert.
+        socket.set_ack_delay(None);
         let handle = self.sockets.add(socket);
         self.listeners.push(TcpListener { handle, port });
         self.listened_ports.insert(port);
@@ -285,7 +287,7 @@ impl SocketStack {
     /// acknowledging the client's SYN is one it must accept while in SYN-SENT,
     /// so answering would kill the connection this SYN is retransmitting for.
     pub(crate) fn drop_duplicate(&mut self, handle: SocketHandle, port: u16) {
-        self.sockets.remove(handle);
+        self.remove(handle);
         self.ensure_listener(port);
     }
 
@@ -308,6 +310,10 @@ impl SocketStack {
     /// yet reaped) and `poll`'s reap loop panics on a handle whose slot is
     /// already gone.
     pub(crate) fn remove(&mut self, handle: SocketHandle) {
+        debug_assert!(
+            self.sockets.get::<tcp::Socket>(handle).ack_delay().is_none(),
+            "a socket that defers its ACK can still owe one when it is removed",
+        );
         self.sockets.remove(handle);
         self.owner_isn.remove(&handle);
         self.retiring.retain(|&h| h != handle);
@@ -361,8 +367,10 @@ pub(crate) enum Disposal {
 ///
 /// `TimeWait` is removed at once instead. Retiring it would hold the socket,
 /// and both its buffers, for smoltcp's 10 s `CLOSE_DELAY` — the tuple survives
-/// until the close timer fires. Trading that retention for the ACK the socket
-/// still owes its peer is not decided here.
+/// until the close timer fires. That retention buys nothing here: every
+/// socket this stack creates has its delayed ACK disabled, so it owes its
+/// peer nothing by the time it reaches `TimeWait`, and removing it strands no
+/// segment.
 pub(crate) fn decide_disposal(state: tcp::State) -> Option<Disposal> {
     match state {
         tcp::State::Closed | tcp::State::Listen => Some(Disposal::Retire),
