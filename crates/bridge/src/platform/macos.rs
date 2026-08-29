@@ -245,12 +245,7 @@ pub fn run(
         {
             tracing::warn!(error = %e, "recover_dns_config task panicked");
         }
-        let state_dir_routes = state_dir.to_path_buf();
-        if let Err(e) =
-            tokio::task::spawn_blocking(move || tun_engine::routing::recover_routes(&state_dir_routes)).await
-        {
-            tracing::warn!(error = %e, "recover_routes task panicked");
-        }
+        crate::route_recovery::recover_and_record(state_dir, &proxy_shutdown).await;
         let state_dir_plugins = state_dir.to_path_buf();
         if let Err(e) =
             tokio::task::spawn_blocking(move || crate::plugin_recovery::reap_recorded_plugins(&state_dir_plugins)).await

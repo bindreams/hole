@@ -44,38 +44,101 @@ pub fn save(state_dir: &Path, state: &LockdownState, owner: Option<(u32, u32)>) 
     Ok(())
 }
 
-/// Load the intent, or `None` on absent/corrupt/unknown-field/version
-/// mismatch (logs at `warn`). An absent file means "default-off".
-pub fn load(state_dir: &Path) -> Option<LockdownState> {
+/// What `bridge-lockdown.json` says about the standing kill switch. A closed
+/// classification rather than a bool, so "the user recorded off" and "we could
+/// not find out" stop being the same answer — conflating them is what let a
+/// bridge with a wiped state dir sweep a live cover.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Intent {
+    /// The file parsed at the current schema and records `enabled: true`.
+    On,
+    /// The file parsed at the current schema and records `enabled: false`.
+    Off,
+    /// No file at all (`ErrorKind::NotFound`): a fresh install, a wiped or
+    /// recreated state dir, or a second bridge's own `--state-dir`.
+    Unset,
+    /// A file exists but the read, the JSON parse, or the version check failed.
+    Unreadable,
+}
+
+impl Intent {
+    /// "Does the user believe the kill switch is armed?" — `On | Unreadable`.
+    /// An unreadable record is not consent to disarm, so it reports armed and
+    /// the tray's Unblock escape stays on the menu.
+    ///
+    /// Consumers, in full: `ProxyManager::lockdown_enabled`.
+    pub fn reads_armed(self) -> bool {
+        matches!(self, Intent::On | Intent::Unreadable)
+    }
+
+    /// "Should this start install the STANDING cover?" — `On` only.
+    ///
+    /// `Unreadable` answers **no**, and that is what keeps a corrupt-file start
+    /// engaging the transient block-until-connected cover instead of skipping
+    /// it for a standing cover that only arrives after `routing.install`: block
+    /// early, don't leak.
+    ///
+    /// Consumers, in full: the transient-vs-standing branch, the
+    /// reachability-probe suppression, the `install_lockdown` gate, and the
+    /// update-consent gate.
+    pub fn installs_standing_cover(self) -> bool {
+        matches!(self, Intent::On)
+    }
+}
+
+/// The one read+parse of the intent file. `Ok` is a file that parsed at the
+/// current schema; `Err` carries the [`Intent`] its failure classifies to, so
+/// [`load`] and [`load_intent`] share a single reader (and a single set of
+/// `warn!` lines) instead of drifting apart.
+fn read_state(state_dir: &Path) -> Result<LockdownState, Intent> {
     let path = state_file(state_dir);
     let bytes = match std::fs::read(&path) {
         Ok(b) => b,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(Intent::Unset),
         Err(e) => {
             tracing::warn!(error = %e, path = %path.display(), "lockdown-state read failed");
-            return None;
+            return Err(Intent::Unreadable);
         }
     };
     match serde_json::from_slice::<LockdownState>(&bytes) {
-        Ok(s) if s.version == SCHEMA_VERSION => Some(s),
+        Ok(s) if s.version == SCHEMA_VERSION => Ok(s),
         Ok(other) => {
             tracing::warn!(
                 got = other.version,
                 want = SCHEMA_VERSION,
                 "lockdown-state schema mismatch, discarding"
             );
-            None
+            Err(Intent::Unreadable)
         }
         Err(e) => {
             tracing::warn!(error = %e, path = %path.display(), "lockdown-state parse failed");
-            None
+            Err(Intent::Unreadable)
         }
     }
 }
 
-/// Convenience: the effective intent (absent file => false / default-off).
+/// Load the intent, or `None` on absent/corrupt/unknown-field/version
+/// mismatch (logs at `warn`). Use [`load_intent`] where the *reason* for a
+/// `None` matters.
+pub fn load(state_dir: &Path) -> Option<LockdownState> {
+    read_state(state_dir).ok()
+}
+
+/// Classify the intent file. Never collapses a failure into a recorded value —
+/// see [`Intent`] and its two folds.
+pub fn load_intent(state_dir: &Path) -> Intent {
+    match read_state(state_dir) {
+        Ok(s) if s.enabled => Intent::On,
+        Ok(_) => Intent::Off,
+        Err(i) => i,
+    }
+}
+
+/// Convenience: [`Intent::reads_armed`] over [`load_intent`]. An absent file is
+/// default-off; a corrupt one reads ARMED, because losing the record is not the
+/// user telling us to disarm.
 pub fn load_enabled(state_dir: &Path) -> bool {
-    load(state_dir).map(|s| s.enabled).unwrap_or(false)
+    load_intent(state_dir).reads_armed()
 }
 
 /// Last-writer-wins absolute set. Persists `enabled` under the current schema.

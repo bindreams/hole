@@ -70,6 +70,10 @@ pub fn ensure_trailing_nl(s: &str) -> String {
     }
 }
 
+/// The pf rule label our block-all base carries, and the name
+/// [`lockdown_cover_presence`] reads back out of `pfctl -s labels`.
+pub const LOCKDOWN_PF_LABEL: &str = "hole-lockdown";
+
 /// Build the self-contained MAIN ruleset for the standing lockdown, loaded via
 /// `pfctl -f -` (NO `-Fa`). It IS the host's egress policy while engaged:
 /// `block drop out quick all` is the fail-closed base, with earlier `quick`
@@ -81,6 +85,12 @@ pub fn ensure_trailing_nl(s: &str) -> String {
 /// `require-order`-enforced: Options -> Translation (nat) -> Filter. The server
 /// permit precedes `block drop out quick inet6 all` so a v6 server is not
 /// killed. pf has no per-process matching, so the server permit is IP-based.
+///
+/// The base rule's [`LOCKDOWN_PF_LABEL`] is **load-bearing**, not decoration:
+/// it is the only evidence [`lockdown_cover_presence`] has that does not come
+/// from `state_dir`. Dropping it returns macOS to file-only presence, which
+/// cannot produce `Live` and therefore can neither repair an intent file nor
+/// detect that we are about to snapshot our own cover as the host baseline.
 pub fn build_lockdown_main_ruleset(tun_name: &str, server_ip: IpAddr, nat_snapshot: &str) -> String {
     let proto = "tcp"; // +udp once a UDP-transport plugin lands; egress is TCP-only today.
     format!(
@@ -90,12 +100,37 @@ pub fn build_lockdown_main_ruleset(tun_name: &str, server_ip: IpAddr, nat_snapsh
          pass out quick proto {proto} from any to {ip}\n\
          pass out quick on {tun} all\n\
          block drop out quick inet6 all\n\
-         block drop out quick all\n",
+         block drop out quick all label \"{label}\"\n",
         nat = ensure_trailing_nl(nat_snapshot),
         proto = proto,
         ip = server_ip,
         tun = tun_name,
+        label = LOCKDOWN_PF_LABEL,
     )
+}
+
+/// Whether a `pfctl -s labels` listing names our rule label. The label is the
+/// FIRST whitespace-delimited field of a line (the rest are counters), so the
+/// match is anchored there — a host label that merely contains ours as a
+/// substring is not ours.
+pub fn labels_listing_carries_our_label(labels_output: &str) -> bool {
+    labels_output
+        .lines()
+        .any(|l| l.split_whitespace().next() == Some(LOCKDOWN_PF_LABEL))
+}
+
+/// Fold a `pfctl -s labels` invocation into pf's answer about our label:
+/// `Some(true)` it is loaded, `Some(false)` it is not, `None` pf could not be
+/// asked (spawn failure or a non-success exit).
+///
+/// `None` — not `Some(false)` — is what keeps the two-source design honest: a
+/// pfctl that could not run is no evidence the cover is gone.
+pub(crate) fn pf_label_answer(out: Result<std::process::Output, RoutingError>) -> Option<bool> {
+    let out = out.ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    Some(labels_listing_carries_our_label(&String::from_utf8_lossy(&out.stdout)))
 }
 
 /// Build the ruleset that restores the host's pre-lockdown policy on Sweep,
@@ -333,19 +368,55 @@ pub fn recover_cover(state_dir: &Path, adopting: bool) {
 /// them with `token` (persist-before-mutate). Returns the nat snapshot for the
 /// engage ruleset. Separated so its `?`-error path can be unwound (drop the pf
 /// refcount) by the caller without leaking the `-E` enable.
+///
+/// The presence probe leads: if OUR OWN cover is already the loaded ruleset,
+/// `pfctl -sr` would hand back our block-all as if it were the host's policy.
+/// Detection asks [`lockdown_cover_presence`] rather than parsing rule text, so
+/// it depends on no claim about `pfctl -sr`'s print format.
 fn capture_and_persist(token: &str, state_dir: &Path, owner: Option<(u32, u32)>) -> Result<String, RoutingError> {
+    let presence = lockdown_cover_presence(state_dir);
     let sr = pfctl(&["-sr"], None, PHASE_COVER)?;
     let main_snapshot = String::from_utf8_lossy(&sr.stdout).into_owned();
     let sn = pfctl(&["-sn"], None, PHASE_COVER)?;
     let nat_snapshot = String::from_utf8_lossy(&sn.stdout).into_owned();
+    persist_baseline(token, state_dir, owner, presence, main_snapshot, nat_snapshot)
+}
 
+/// Persist the engage-time baseline. Pure over its inputs — the snapshots and
+/// the measured `presence` come from the caller — so the self-capture guard is
+/// table-tested without touching pf. Returns the nat snapshot for the engage
+/// ruleset.
+///
+/// When `presence` is [`CoverPresence::Live`](crate::routing::CoverPresence::Live)
+/// this does exactly three things differently: it persists `main_snapshot`
+/// empty, it persists `main_snapshot_captured: false`, and it warns. It
+/// persists `nat_snapshot` exactly as `pfctl -sn` returned it and returns that
+/// same value — those are the HOST's translation rules, carried forward
+/// verbatim into the ruleset engage loads, so zeroing them would flush a live
+/// host NAT the moment the cover engages, with nothing on disk to restore from.
+fn persist_baseline(
+    token: &str,
+    state_dir: &Path,
+    owner: Option<(u32, u32)>,
+    presence: crate::routing::CoverPresence,
+    main_snapshot: String,
+    nat_snapshot: String,
+) -> Result<String, RoutingError> {
+    let captured = presence != crate::routing::CoverPresence::Live;
+    if !captured {
+        tracing::warn!(
+            "a lockdown cover is already loaded, so there is no pre-lockdown host ruleset to capture; \
+             recording no baseline (a restore will reload /etc/pf.conf)"
+        );
+    }
     lockdown_state::save(
         state_dir,
         &lockdown_state::LockdownPfState {
             version: lockdown_state::SCHEMA_VERSION,
             pf_token: token.to_owned(),
-            main_snapshot,
+            main_snapshot: if captured { main_snapshot } else { String::new() },
             nat_snapshot: nat_snapshot.clone(),
+            main_snapshot_captured: captured,
         },
         owner,
     )
@@ -400,6 +471,10 @@ pub fn engage_lockdown(
                 pf_token: token.clone(),
                 main_snapshot: st.main_snapshot,
                 nat_snapshot: st.nat_snapshot.clone(),
+                // Carried, not re-asserted: this re-persists the SAME baseline
+                // under a fresh token, so claiming a capture that never
+                // happened would restore an empty pass-all ruleset.
+                main_snapshot_captured: st.main_snapshot_captured,
             };
             if let Err(e) = lockdown_state::save(state_dir, &fresh, owner) {
                 if let Err(xe) = pfctl(&["-X", &token], None, PHASE_COVER) {
@@ -462,8 +537,15 @@ pub fn disengage_lockdown(state_dir: &Path) -> Result<(), RoutingError> {
     let Some(st) = lockdown_state::load(state_dir) else {
         return Ok(()); // No cover engaged — nothing to disengage.
     };
-    let restore = build_lockdown_restore_ruleset(&st.nat_snapshot, &st.main_snapshot);
-    let out = pfctl(&["-f", "-"], Some(restore.as_bytes()), PHASE_RECOVER_COVER)?;
+    // No captured baseline means our own cover was the loaded ruleset at engage
+    // time, so `/etc/pf.conf` IS the restore target — see
+    // `LockdownPfState::main_snapshot_captured`.
+    let out = if st.main_snapshot_captured {
+        let restore = build_lockdown_restore_ruleset(&st.nat_snapshot, &st.main_snapshot);
+        pfctl(&["-f", "-"], Some(restore.as_bytes()), PHASE_RECOVER_COVER)?
+    } else {
+        pfctl(&["-f", PFCONF], None, PHASE_RECOVER_COVER)?
+    };
     if !out.status.success() {
         return Err(RoutingError::RouteSetup(format!(
             "pfctl lockdown restore failed: {}",
@@ -485,40 +567,42 @@ pub fn disengage_lockdown(state_dir: &Path) -> Result<(), RoutingError> {
     Ok(())
 }
 
+/// Fold the two independent presence sources into one answer. `pf_label` is
+/// what pf said (`Some(true)`: our own rule label is loaded; `Some(false)`: it
+/// is not; `None`: pf could not be asked); `file` is Hole's own
+/// `bridge-lockdown-pf.json`.
+///
+/// pf's own confirmation wins outright. Failing that, a state file — readable
+/// or not — is Hole's unreconciled record that a cover was engaged and never
+/// confirmed released, which is [`CoverPresence::Recorded`]. Only a pf that
+/// answered "no" with nothing on disk contradicting it is `Absent`; a pf that
+/// could not answer at all, with no file either, is `Unreachable`.
+pub(crate) fn fold_presence(
+    pf_label: Option<bool>,
+    file: &super::StateFile<lockdown_state::LockdownPfState>,
+) -> crate::routing::CoverPresence {
+    use crate::routing::CoverPresence;
+    match (pf_label, file) {
+        (Some(true), _) => CoverPresence::Live,
+        (_, StateFile::Present(_) | StateFile::Unusable) => CoverPresence::Recorded,
+        (Some(false), StateFile::Absent) => CoverPresence::Absent,
+        (None, StateFile::Absent) => CoverPresence::Unreachable,
+    }
+}
+
+/// Whether a standing lockdown cover is present, per pf and per Hole's own
+/// state file. The pf half asks `pfctl -s labels` for [`LOCKDOWN_PF_LABEL`],
+/// which is the only evidence here independent of `state_dir`.
+pub fn lockdown_cover_presence(state_dir: &Path) -> crate::routing::CoverPresence {
+    let pf_label = pf_label_answer(pfctl(&["-s", "labels"], None, PHASE_RECOVER_COVER));
+    fold_presence(pf_label, &lockdown_state::load_presence(state_dir))
+}
+
 /// Best-effort wrapper for `Drop` (user-stop): disengage and swallow. Drop has
 /// no caller to surface an error to.
 fn lockdown_disengage(state_dir: &Path) {
     if let Err(e) = disengage_lockdown(state_dir) {
         tracing::warn!(error = %e, "lockdown disengage failed during Drop");
-    }
-}
-
-/// Act on a recovery decision for the lockdown cover (the facade routes `Sweep`
-/// through the fail-loud `disengage_lockdown`; this best-effort path remains
-/// correct if called directly). `Adopt` (intent ON): KEEP the host fail-closed —
-/// leave the lockdown ruleset + state file in force. The dead utun name in the
-/// `pass out quick on <tun>` line is harmless (matches no live interface); the
-/// next connect's `engage_lockdown` reuses the persisted snapshot and reloads
-/// with the fresh utun name. `Sweep` (intent OFF): best-effort restore. `Noop`:
-/// nothing.
-pub fn recover_lockdown(decision: crate::routing::CoverRecovery, state_dir: &Path) {
-    use crate::routing::CoverRecovery::*;
-    match decision {
-        Noop => {}
-        Adopt => {
-            tracing::info!("lockdown recovery: adopting persistent cover (host stays fail-closed)");
-            // Intentionally NOTHING removed: the block must survive the
-            // restart (this IS the crash-leak fix). macOS pf rules + enable
-            // state do NOT survive a reboot, but the persisted state file does:
-            // the next reconnect's `engage_lockdown` idempotently re-enables pf
-            // and reloads a live ruleset (so a connected session no longer fails
-            // open). Residual: the boot->first-connect interval is unprotected
-            // (no early-boot block) until that first reconnect re-arms the host.
-        }
-        Sweep => {
-            tracing::info!("lockdown recovery: sweeping leftover cover (intent off)");
-            lockdown_disengage(state_dir);
-        }
     }
 }
 
@@ -593,6 +677,25 @@ pub(crate) fn release_all_with(
     // Block 2 — standing cover.
     match standing {
         StateFile::Absent => {}
+        StateFile::Present(st) if !st.main_snapshot_captured => {
+            // No baseline was captured, so there is no snapshot to load — see
+            // `LockdownPfState::main_snapshot_captured`. Loading the empty one
+            // would leave a pass-all host.
+            let outcome = ops.reload_default();
+            let _ = ops.drop_token(&st.pf_token);
+            match outcome {
+                Ok(()) => {
+                    if let Err(e) = ops.clear_standing() {
+                        tracing::warn!(error = %e, "lockdown-pf-state clear failed during release_all");
+                    }
+                }
+                Err(e) => {
+                    if first_err.is_none() {
+                        first_err = Some(e);
+                    }
+                }
+            }
+        }
         StateFile::Present(st) => {
             let restore = build_lockdown_restore_ruleset(&st.nat_snapshot, &st.main_snapshot);
             let outcome = match ops.load_ruleset(&restore) {

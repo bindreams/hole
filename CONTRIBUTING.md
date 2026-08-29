@@ -783,9 +783,11 @@ three axes:
   would block all browsing.
 - **Lifetime.** Lockdown is authoritative and standing — it persists across a
   crash or restart and is reconciled on the next start via
-  `decide_cover_recovery` (Adopt keeps the host fail-closed, dropping the
-  volatile TUN + server permits so the next connect re-adds them fresh; Sweep
-  disengages when intent is off). The transient cover is a non-standing,
+  `decide_cover_recovery` (Adopt never disengages the cover, and on Windows
+  additionally reclaims the volatile TUN permit if `hole-tun` no longer
+  resolves — see "Disclosed residuals" below; the server permit stays
+  deferred to the next connect's own `engage_lockdown`; Sweep disengages, and
+  only on an explicit recorded off). The transient cover is a non-standing,
   bounded-window RAII guard engaged only for the duration of one covered
   (auto-connect) start attempt, and swept by `recover_routes` like every other
   cover state on the next start.
@@ -856,27 +858,155 @@ Disclosed residuals:
 1. The `Lockdown: On (warning: not engaged)` tray label can still be wrong in
    this window — it derives from the running session, not an OS probe of the
    cover.
+
 1. On macOS a state file that cannot be read costs the host its captured
    pre-cover pf rules (the release falls back to the default ruleset) and
    leaks a pf enable refcount until reboot.
-1. `lockdown_state::load_enabled` reads a corrupt or unreadable
-   `bridge-lockdown.json` as **off**, which hides the tray's Unblock item;
-   `hole bridge unlock` still works there because it never reads the intent to
-   decide.
-1. `failclosed::lockdown_cover_present` still infers presence from a file on
-   macOS and returns an unconditional `true` on Windows. It feeds
-   `decide_cover_recovery`, so widening it changes Adopt/Sweep/Noop at
-   unattended startup — the recovery decision, which belongs with the
-   ownership work, not here.
-1. On macOS, `release_all` treats a MISSING (not merely unreadable) state
-   file as "no cover of this kind" — `StateFile::Absent`, indistinguishable
-   from "never engaged." pf has no query for "who is holding this ruleset,"
-   so if a cover's state file is lost while the cover is still genuinely live
-   in pf (e.g. an external wipe of `state_dir`), `release_all` reports `Ok`
-   without touching pf and the host stays blocked. Closing this gap would
-   mean probing the live pf ruleset for Hole's own signature independent of
-   the state file — the cover-state probe this stage's constraints defer to
-   the ownership work.
+
+1. An unreadable `bridge-lockdown.json` is read through two named folds of
+   `lockdown_state::Intent`, not one bool, because the consumers want
+   different answers. `reads_armed` (`On | Unreadable`) drives the status
+   reply and the tray, so a corrupt record reads **armed** and keeps the
+   Unblock item on the menu — losing the record is not consent to disarm.
+   `installs_standing_cover` (`On` only) drives the connect path and the
+   update-consent gate, so the same corrupt record reads **not standing**: a
+   covered start keeps engaging the transient block-until-connected cover
+   (block early, do not leak) instead of skipping it for a standing cover
+   that only arrives after `routing.install`, and `consent_gate` still asks
+   for informed consent because no standing cover holds the update gap. The
+   tray can therefore read `Lockdown: On (warning: not engaged)` there, which
+   is the honest rendering.
+
+1. Startup reconciliation is a **20-cell table** over two measured axes, not
+   two bools — `decide_cover_recovery(Intent, CoverPresence)` in
+   `crates/tun-engine/src/routing.rs`. Intent is
+   `On | Off | Unset | Unreadable`; presence is
+   `Live | Recorded | Absent | Indeterminate | Unreachable`, measured by
+   `failclosed::lockdown_cover_presence` (Windows: `FwpmFilterGetByKey0` over
+   every lockdown GUID; macOS: our own `hole-lockdown` rule label read back
+   from `pfctl -s labels`, falling back to `bridge-lockdown-pf.json`). Four
+   rules: `Absent`/`Unreachable` are always `Noop`; `Sweep` requires
+   `Intent::Off` **and** an actionable presence; `Adopt` requires an
+   actionable presence with an intent of `On`/`Unreadable`/`Unset`, and
+   `Unset` additionally requires positive evidence; the intent file is
+   repaired to `enabled: true` only on `Presence::Live` with an `Unset` or
+   `Unreadable` intent, never inferred.
+
+   `Live` means **any residue**, not the whole cover: the Windows sweeps loop
+   delete-by-key with every return code discarded over persistent filters, so
+   a sweep interrupted mid-loop survives a reboot as a partial cover that a
+   single-GUID probe would call `Absent` forever.
+
+   `Adopt` never disengages the cover, on either platform. The server-permit
+   volatile-refresh it used to perform moved into `engage_lockdown`, which
+   deletes the TUN and server permits inside its own transaction before the
+   adds. Keeping that delete at recovery time meant a second bridge with a
+   fresh state dir (`Unset` x `Live` -> Adopt) would delete a *running* first
+   bridge's server-IP permit while block-all stayed in force. The disclosed
+   cost: an adopted cover keeps its stale server-IP permit until the next
+   connect re-engages — a permit on an idle cover, and the App-ID permit
+   already grants the bridge and plugin binaries unrestricted egress in that
+   window.
+
+   The TUN-LUID permit is the one exception: `Adopt` additionally calls
+   `failclosed::reclaim_stale_tun_permit` (Windows only), which deletes it
+   when `hole-tun` no longer resolves. Unlike the server IP, a resolving
+   `hole-tun` is itself proof some bridge may be relying on the permit, so
+   this can never touch a running bridge's cover — it only fires once the
+   name is provably gone (e.g. after a crash). Without it, a `NET_LUID`
+   (`IfType<<48 | NetLuidIndex<<24`) whose freed index NDIS later reassigns to
+   an unrelated wintun-based adapter would inherit unconditional egress from
+   the stale permit, armed but silently open, until the next connect. The
+   reclaim is keyed on THIS bridge's own last-known TUN name (from its own
+   `bridge-routes.json`, not a global constant): a different install's cover
+   leaves no such record, so the reclaim does not run for it — the same
+   per-install identity gap #878 tracks.
+
+1. On macOS, `release_all` still treats a MISSING (not merely unreadable)
+   state file as "no cover of this kind" — `StateFile::Absent`,
+   indistinguishable from "never engaged" — and still returns `Ok` over a
+   labelled-but-unrecorded cover, because it has no snapshot to restore.
+   Presence is no longer file-only, though: the pf rule label makes a live
+   cover with no state file detectable at **startup recovery**, which adopts
+   it, and the self-capture guard stops the next connect from recording that
+   cover as the host baseline (`main_snapshot_captured: false`, whose restore
+   target is `/etc/pf.conf`).
+
+1. A second bridge with an **explicit off intent** still sweeps machine-wide.
+   The Windows lockdown GUIDs are compile-time constants identical in every
+   build and install, and `lockdown_cover_presence` ignores `state_dir`, so
+   the probe answers "is a Hole lockdown cover present", never "is it mine".
+   `hole bridge run` takes independent `--socket-path`/`--state-dir`, so a
+   second bridge whose own `bridge-lockdown.json` says `enabled: false` still
+   sweeps a first bridge's live cover while that GUI reports Running. What
+   #881 closed is the three routes where the second state dir has *no
+   readable intent* — a wipe, a reinstall, a fresh `--state-dir` — which now
+   Adopt instead of Sweep AT RECOVERY TIME. The remaining route needs
+   per-install cover identity or the machine-wide lock, and is
+   [#878](https://github.com/bindreams/hole/issues/878)'s.
+
+   **The `Unset` x `Live` -> Adopt route is not fully closed — it is
+   deferred, not removed.** Recovery no longer clobbers a running first
+   bridge directly, but an adopted second bridge's OWN NEXT CONNECT still
+   can: `decide_cover_recovery(Unset, Live)` sets `record_intent_on = true`,
+   which persists `enabled: true` into the second bridge's own state dir and
+   sets its adopted claim, so `standing_cover_expected()` reads true on its
+   very next start. That start's `install_lockdown` -> `engage_lockdown`
+   deletes the TUN-LUID and server-IP permits by the SAME compile-time-constant
+   GUIDs (`LOCKDOWN_FILTER_GUIDS`, shared across every install) and re-adds
+   them keyed to the second bridge's own LUID and server IP, inside the same
+   transaction as its own block-all — while the first bridge is still
+   running. On Windows this breaks the first bridge's tunnel the moment the
+   second bridge connects; on macOS `engage_lockdown`'s `FreshEnable` reloads
+   the ENTIRE main pf ruleset via `pfctl -f -`, so the second bridge's connect
+   wholly overwrites the first bridge's lockdown ruleset. The fix needs the
+   same per-install cover identity as the bullet above — [#878](https://github.com/bindreams/hole/issues/878).
+
+1. `Unset` intent with `Unreachable` presence over a live cover leaves the
+   Unblock item hidden. The routes in are the Base Filtering Engine not
+   running or an RPC failure — both transient, and both states in which
+   `hole bridge unlock` would also fail, so the honest escape is the next
+   start once BFE answers, which adopts the cover and restores the menu item.
+
+1. An adopted cover records **two** facts, kept in two places. The
+   adopted-cover claim (`ProxyManager::set_standing_cover_adopted`, recorded
+   by `route_recovery::recover_and_record`) says only "a standing cover is
+   live right now and this process has not released it" — and is set only on
+   a MEASURED `CoverPresence::Live`, not merely `action == Adopt`: `Adopt` also
+   covers `Recorded` and `Indeterminate`, whose own docs say the OS did NOT
+   confirm one, so asserting liveness there would tell the connect path and
+   the update-consent gate no cover holds the update gap when none was
+   confirmed. The armed kill switch is `bridge-lockdown.json`, written by
+   `promote_adopted_claim` the moment a start honours the claim with a real
+   `install_lockdown`. Holding both in the claim is what let an ordinary
+   config edit disarm the switch: `reload`'s slow path is `stop()` then
+   `start()`, the `UserStop` teardown cleared the claim along with the cover,
+   and the next start re-derived `false`. Re-deriving on a later start is not
+   a fallback — once the cover is torn down the measurement reads `Absent` and
+   the decision is `Noop`. A failed repair write at `Unset`/`Live` therefore
+   costs the preference only until the next connect retries it, and never the
+   escape: within the run the claim is what keeps `lockdown_enabled` reporting
+   armed.
+
+   The claim is **not a latch** — it clears at four sites, three of which
+   release the cover and clear only on a CONFIRMED `release_all_covers()`
+   result, never on the guard's own silent `Drop`: `turn_lockdown_off`'s idle
+   arm, a `UserStop` teardown, and `check_health` tearing down a dead session.
+   An unconfirmed release at any of the three leaves the claim — and the
+   Unblock item — in place, on the theory that a false "released" is worse
+   than a stale "still armed". The fourth site, `turn_lockdown_off`'s
+   mid-session arm, releases nothing (the session's own cover is `stop_with`'s
+   to decide) and clears only because the user's newly-persisted explicit off
+   must not keep being overridden by a stale claim from before this session, or
+   from this session's own now-superseded adoption. Only `turn_lockdown_off`
+   clears the persisted arm, so the escape still disarms the switch for good.
+
+1. Startup still mutates global WFP state **unconditionally** via the
+   transient cover sweep, which runs outside every presence branch and
+   deletes the twelve transient GUIDs plus the shared sublayer and provider.
+   The standing kill switch is what #881 made conditional; the narrow true
+   claim is that it is never touched at startup without an explicit recorded
+   "off".
 
 #### Cover ownership
 

@@ -574,7 +574,12 @@ async fn handle_update_apply<P: Proxy + 'static, R: Routing + 'static>(
         ));
     }
 
-    let lockdown_on = { state.proxy.lock().await.lockdown_enabled() };
+    // `standing_cover_expected`, NOT the tray's `lockdown_enabled`: the gate
+    // asks whether a standing cover holds the update gap. An unreadable intent
+    // reads armed for the tray but installs no standing cover, and passing the
+    // tray's answer here would suppress the brief-leak disclosure exactly when
+    // the leak is real.
+    let lockdown_on = { state.proxy.lock().await.standing_cover_expected() };
 
     // Consent seam: a lockdown-off update without explicit consent is refused
     // with 403 — a client precondition failure (the caller must supply consent),
