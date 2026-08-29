@@ -9,9 +9,12 @@
 //! (color) escape sequences before this ring ever sees a line (see
 //! `garter::binary`'s `LogSink` doc). Nothing here classifies them.
 //!
-//! These are the plugin's own words and can name the server host, so they reach
-//! `bridge.log` ONLY. Nothing here may be folded into a `ProxyError`: that
-//! crosses IPC into `gui.log` and the toast.
+//! These are the plugin's own words and can name the server host. The
+//! redacting file writer rewrites it to the entry's token on the way to
+//! `bridge.log`, and the IPC response boundary redacts an outgoing error the
+//! same way, so neither surface carries the address — but nothing here may be
+//! folded into a `ProxyError` regardless: these lines can also carry a
+//! configuration detail no registry knows about.
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};

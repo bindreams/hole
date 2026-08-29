@@ -104,7 +104,7 @@ fn entry_from(ss: &SsServerHandle) -> ServerEntry {
     ServerEntry {
         id: "live-tun-permit-e2e".into(),
         name: "live-tun-permit-e2e".into(),
-        server: ss.addr.ip().to_string(),
+        server: ss.addr.ip().to_string().into(),
         server_port: ss.addr.port(),
         method: ss.method.into(),
         password: ss.password.clone(),

@@ -7,6 +7,11 @@ fn default_has_sensible_values() {
     assert_eq!(c.max_sniffers, 1024);
     assert_eq!(c.tcp_rx_buf_size, 65536);
     assert_eq!(c.tcp_tx_buf_size, 65536);
+    assert_eq!(
+        c.tcp_keep_alive_interval * 4,
+        c.tcp_peer_timeout,
+        "tcp_peer_timeout is documented as a quarter-interval bound on tcp_keep_alive_interval"
+    );
     assert_eq!(c.poll_interval, std::time::Duration::from_millis(1));
     assert_eq!(c.idle_sweep_interval, std::time::Duration::from_secs(5));
     assert_eq!(c.udp_flow_idle_timeout, std::time::Duration::from_secs(30));

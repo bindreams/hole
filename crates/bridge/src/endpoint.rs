@@ -6,9 +6,10 @@
 //! concerns (name recovery, policy) live in [`crate::hole_router`].
 //!
 //! See [`crate::hole_router`] for the role→mechanism wiring (Proxy →
-//! [`Socks5Endpoint`], Bypass → [`InterfaceEndpoint`], Block →
-//! [`BlockEndpoint`]) and the full cascade. Tests can wire any mechanism
-//! to any slot via `MockEndpoint`.
+//! [`Socks5Endpoint`], Bypass → [`InterfaceEndpoint`]) and the full
+//! cascade. A dropped flow has no mechanism — the router releases it
+//! inline and [`BlockEndpoint`] only names the reason in the log. Tests
+//! can wire any mechanism to any slot via `MockEndpoint`.
 //!
 //! ## UDP-drop privacy invariant
 //!
@@ -45,14 +46,11 @@ pub use socks5::Socks5Endpoint;
 #[async_trait]
 pub trait Endpoint: Send + Sync {
     /// Carry a TCP flow to `dst`. Returns when either end closes the
-    /// stream. Implementations that drop the flow (BlockEndpoint) return
-    /// `Ok(())` immediately — smoltcp emits an RST when the flow is
-    /// dropped.
+    /// stream.
     async fn serve_tcp(&self, flow: &mut TcpFlow, dst: SocketAddr) -> io::Result<()>;
 
     /// Carry a UDP flow to `dst`. Returns when the flow's idle sweep
-    /// evicts it or when the peer closes. Implementations that drop the
-    /// flow return `Ok(())` immediately.
+    /// evicts it or when the peer closes.
     async fn serve_udp(&self, flow: UdpFlow, dst: SocketAddr) -> io::Result<()>;
 
     /// Whether this endpoint can carry UDP end-to-end. Drives the router
