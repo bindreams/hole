@@ -256,6 +256,12 @@ impl ChainRunner {
             .ok_or_else(|| crate::Error::Chain(format!("failed to resolve {}:{}", env.remote_host, env.remote_port)))?;
 
         // Build address chain: [local, intermediate..., remote]
+        #[allow(clippy::disallowed_methods)]
+        // Sanctioned: every in-repo plugin at a non-zero chain position binds
+        // TCP only (ex-ray's dokodemo inbounds, yamux's server-mode TCP
+        // listener), so garter's own intermediate-port allocation is the
+        // sanctioned use of its TCP-only allocator. See hole's clippy.toml
+        // `garter::chain::allocate_ports` rule.
         let intermediate = allocate_ports(n.saturating_sub(1))?;
         let mut addrs = Vec::with_capacity(n + 1);
         addrs.push(env.local_addr());

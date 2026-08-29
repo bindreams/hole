@@ -28,6 +28,15 @@ pub fn to_yaml(value: &DumpValue) -> String {
     YamlFormatter::default().to_string(value)
 }
 
+/// Render a [`serde::Serialize`] value as a [`DumpValue`] — the same rung
+/// the `dump!` ladder picks when a type has `Serialize` but no [`Dump`].
+///
+/// For hand-written `Dump` impls that override one field and want the rest
+/// rendered exactly as before.
+pub fn from_serialize<T: serde::Serialize + ?Sized>(value: &T) -> DumpValue {
+    serde_bridge::to_dump_value(value)
+}
+
 #[doc(hidden)]
 pub mod __private {
     pub use crate::ladder::{DebugPick, DumpPick, SerializePick, Wrap};
