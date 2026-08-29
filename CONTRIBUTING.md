@@ -132,10 +132,14 @@ emit is *retired* rather than removed:
 once `remote_endpoint()` goes `None`, smoltcp's signal that it has emitted the
 socket's last packet. `decide_disposal` picks the path per state — `Closed` and
 `Listen` retire, while `TimeWait` is dropped at once, since retiring it would
-hold the socket and both its buffers for smoltcp's 10 s `CLOSE_DELAY`. A
-connection socket that reverts to `Listen` — the client answered the SYN-ACK
-with an RST — is retired through that same list, so it cannot shadow the live
-listener on its port.
+hold the socket and both its buffers for smoltcp's 10 s `CLOSE_DELAY`. The drop
+is safe because every socket the stack creates has its delayed ACK disabled
+(`set_ack_delay(None)`), so smoltcp emits any ACK it owes on the poll that
+ingests the segment and a socket removed at `TimeWait` is never holding one —
+without that, the peer's last data-plus-FIN would go unacknowledged and its
+retransmission would be answered with a reset. A connection socket that reverts
+to `Listen` — the client answered the SYN-ACK with an RST — is retired through
+that same list, so it cannot shadow the live listener on its port.
 
 Retiring a socket only marks it; reaping — the `SocketSet::remove` that actually
 frees its slot — happens inside the next `poll`. A socket marked but not yet
