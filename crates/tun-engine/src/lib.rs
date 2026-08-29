@@ -54,6 +54,18 @@ fn main() {
 #[skuld::label]
 pub(crate) const TUN: skuld::Label;
 
+/// Cross-binary serialization for tests that mutate GLOBAL OS network state —
+/// the `.config/nextest.toml` `global_net_state` test-group's `max-threads = 1`
+/// gate. skuld's own `serial = TUN` only serializes within this one binary;
+/// this label is what `cargo xtask verify-global-net-state-labels` binds to
+/// that group's name-substring filter (bindreams/hole#894). Declared here
+/// (not at any one call site) for the same reason as `TUN` above: every
+/// module under this crate compiles into the same binary, so this is the
+/// crate's only declaration.
+#[cfg(test)]
+#[skuld::label]
+pub(crate) const GLOBAL_NET_STATE: skuld::Label;
+
 pub mod adapter_cleanup;
 pub mod device;
 pub mod engine;

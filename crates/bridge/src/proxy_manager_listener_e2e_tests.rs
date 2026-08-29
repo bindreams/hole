@@ -395,7 +395,7 @@ fn e2e_start_rejects_full_mode_without_socks5(
 // every Hole platform (Win+mac), both the no-plugin and galoshes variants.
 
 /// COUPLED NAME: this test must stay named `e2e_…full_tunnel…` so
-/// `.config/nextest.toml`'s `global-net-state` filter keeps selecting it —
+/// `.config/nextest.toml`'s `global_net_state` filter keeps selecting it —
 /// skuld gives libtest the bare function name, so there is no module path to
 /// anchor on. That selection buys nextest's cross-binary thread budget; what
 /// keeps this test off the tun-engine WFP tests is its `serial = TUN`. See the
@@ -407,7 +407,7 @@ mod tun {
     use crate::test_support::udp_echo::UdpEchoServer;
     use tokio::net::UdpSocket;
 
-    #[skuld::test(labels = [DIST_BIN, TUN], serial = TUN)]
+    #[skuld::test(labels = [DIST_BIN, TUN, GLOBAL_NET_STATE], serial = TUN)]
     fn e2e_full_tunnel_local_udp_intact(
         #[fixture(dist_dir)] dist: &Path,
         #[fixture(ssserver_none)] ss: &SsServerHandle,

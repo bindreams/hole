@@ -75,12 +75,21 @@ nextest-version = "0.9.130"
 #     module's TUN label means "the elevated Windows lane", not "touches a
 #     TUN adapter"; they query ETW sessions and mutate no network state.
 # Renaming any of them WITHOUT updating this filter silently drops it from the
-# group → the whole Windows TUN lane runs at nextest's normal thread budget
-# again. Verify with `cargo nextest show-config test-groups`. Add any new
-# real-engage/real-TUN test (and its substring) here.
-[test-groups.global-net-state]
+# group → cross-binary data race. Verify with `cargo nextest show-config
+# test-groups`. Add any new real-engage/real-TUN test (and its substring) here.
+#
+# `cargo xtask verify-global-net-state-labels` (bindreams/hole#894) checks this
+# group's *membership* live, by binding it to the `global_net_state` skuld
+# label attached at each test's own definition site — a rename applied to a
+# test but not this filter (or vice versa) now fails loud, by exact test name,
+# instead of silently degrading into the cross-binary race described above.
+# It also asserts `max-threads` below stays `1`. It does NOT catch a
+# higher-precedence `[[profile.default.overrides]]` entry (inserted above this
+# one) that matches these same tests and steals them into a different group —
+# that residual is unverified; see the guard's own module doc.
+[test-groups.global_net_state]
 max-threads = 1
 
 [[profile.default.overrides]]
 filter = 'test(/^e2e_.*full_tunnel/) + test(/windows_lockdown_permits_server_ip_/) + test(/macos_lockdown_permits_server_ip_/) + test(/failclosed_permits_/) + test(/release_all_/) + test(/cutover_global_net_state_/) + test(/live_tun_permit_/) + test(/tun_device_ipv6_/)'
-test-group = 'global-net-state'
+test-group = 'global_net_state'

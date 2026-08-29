@@ -28,6 +28,7 @@ pub mod finish_vendor_bump;
 pub mod galoshes;
 pub mod gen_ui_constants;
 pub mod git_util;
+pub mod global_net_state_conformance;
 pub mod golangci_lint;
 pub mod interrupt;
 pub mod manifest;
@@ -78,6 +79,9 @@ mod gen_ui_constants_tests;
 #[cfg(test)]
 #[path = "git_util_tests.rs"]
 mod git_util_tests;
+#[cfg(test)]
+#[path = "global_net_state_conformance_tests.rs"]
+mod global_net_state_conformance_tests;
 #[cfg(test)]
 #[path = "manifest_tests.rs"]
 mod manifest_tests;
@@ -330,6 +334,16 @@ pub enum Command {
         #[arg(long, default_value = "test-hole")]
         job: String,
     },
+    /// Verify that `.config/nextest.toml`'s `global_net_state` test-group
+    /// name-substring filter and the `global_net_state` skuld label select
+    /// the exact same live tests, and that the group's `max-threads` is
+    /// still `1` — see `xtask::global_net_state_conformance` (bindreams/hole#894).
+    VerifyGlobalNetStateLabels {
+        /// ci.yaml job id to check (its steps must include exactly one
+        /// test-running nextest command shape).
+        #[arg(long, default_value = "test-hole")]
+        job: String,
+    },
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum, PartialEq, Eq)]
@@ -411,6 +425,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             Ok(())
         }
         Command::VerifySkuldLabelCoverage { job } => skuld_label_coverage::verify(&repo_root()?, &job),
+        Command::VerifyGlobalNetStateLabels { job } => global_net_state_conformance::verify(&repo_root()?, &job),
     }
 }
 

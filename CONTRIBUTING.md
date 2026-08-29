@@ -1691,7 +1691,26 @@ Spotlight "Hole" must reveal it.
   test ([`xtask/src/ci_coverage.rs`](xtask/src/ci_coverage.rs)) fails if a
   workspace crate's tests are run by no CI job (the recurring orphaned-test
   class). A new crate must join some CI test job's package filter, or — if it has
-  no runnable tests — get an `UNTESTED_IN_CI` entry with a reason. (#526)
+  no runnable tests — get an `UNTESTED_IN_CI` entry with a reason. (#526) A
+  general per-crate-per-platform version of this guard (asserting non-zero test
+  *counts*, not just presence) was found to be undetectable at package
+  granularity — every `test-hole` package already has ungated tests on every
+  platform it runs on — and was not built (#894). In its place,
+  `skuld_label_coverage::verify` asserts the `tun` skuld label's live listing
+  for `test-hole` is non-empty on the platform running it, catching the one
+  demonstrated regression class (a platform's whole privileged/TUN lane
+  silently going empty).
+- **`global_net_state` label conformance** — `.config/nextest.toml`'s
+  `global_net_state` test-group serializes cross-binary tests that mutate
+  global OS network state via a hand-maintained name-substring filter (see that
+  file's own comment). `cargo xtask verify-global-net-state-labels`
+  (`xtask/src/global_net_state_conformance.rs`) binds that filter to the
+  `global_net_state` skuld label attached at each test's own definition site,
+  checking live that both select the exact same tests and that the group's
+  `max-threads` is still `1` (#894). It does not catch a higher-precedence
+  `[[profile.default.overrides]]` entry stealing these tests into a different
+  group, and its universe is `test-hole`'s package set even though the
+  nextest.toml filter applies workspace-wide.
 
 ## Logging & diagnostics
 

@@ -1,12 +1,13 @@
 //! Unit tests for the skuld-label lane guard: [`extract_lane_candidates`],
 //! [`pick_complementary_pair`], [`matching_test_names`], [`selects_nothing`],
-//! and [`stranded_tests`].
+//! and [`stranded_tests`]. Also the guard 1 non-emptiness predicate,
+//! [`on_side_is_nonempty`] (bindreams/hole#894).
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::skuld_label_coverage::{
-    extract_lane_candidates, matching_test_names, pick_complementary_pair, selects_nothing, stranded_tests,
-    LaneCandidate,
+    extract_lane_candidates, matching_test_names, on_side_is_nonempty, pick_complementary_pair, selects_nothing,
+    stranded_tests, LaneCandidate,
 };
 
 fn set(items: &[&str]) -> BTreeSet<String> {
@@ -419,4 +420,21 @@ fn empty_baseline_binary_is_not_reported() {
     let on: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
 
     assert!(stranded_tests(&baseline, &off, &on).is_empty());
+}
+
+// ===== on_side_is_nonempty (guard 1, bindreams/hole#894) =============================================================
+
+#[skuld::test]
+fn on_side_is_nonempty_true_when_any_binary_has_a_test() {
+    let on = binmap(&[("tun-engine", &[]), ("hole-bridge", &["windows_lockdown_ok"])]);
+    assert!(on_side_is_nonempty(&on));
+}
+
+#[skuld::test]
+fn on_side_is_nonempty_false_when_every_binary_is_empty() {
+    let every_binary_empty = binmap(&[("tun-engine", &[]), ("hole-bridge", &[])]);
+    assert!(!on_side_is_nonempty(&every_binary_empty));
+
+    let no_binaries_at_all: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    assert!(!on_side_is_nonempty(&no_binaries_at_all));
 }

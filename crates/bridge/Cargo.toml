@@ -198,7 +198,7 @@ xtask = { path = "../../xtask" }
 walkdir = "2"
 
 # What `start_plugin_chain` hands a real child, and what its output does. Binds
-# only an ephemeral loopback port, so it needs no `global-net-state` group.
+# only an ephemeral loopback port, so it needs no `global_net_state` group.
 [[test]]
 name = "plugin_chain"
 path = "tests/plugin_chain.rs"

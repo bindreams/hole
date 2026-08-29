@@ -18,6 +18,10 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1"
+# Parses `.config/nextest.toml` for `global_net_state_conformance`
+# (bindreams/hole#894) — already vendored transitively via `xtask-lib`'s
+# `version` feature, adds no new crate to the graph.
+toml = "1.0"
 cargo_metadata = "0.23"
 clap = { version = "4", features = ["derive"] }
 ctrlc = "3" # transparent-launcher interrupt handling (#568): a handler (not SIG_IGN) resets to default across exec, so children stay interruptible while xtask survives Ctrl+C and propagates the child's exit status

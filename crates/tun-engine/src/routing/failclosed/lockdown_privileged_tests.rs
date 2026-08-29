@@ -25,7 +25,7 @@
 //! `!tun` filter, and CI provisions the elevation.
 //!
 //! Cross-binary serialization for the global WFP/pf/TUN state these touch lives
-//! in `.config/nextest.toml` (`global-net-state` test-group) — skuld serializes
+//! in `.config/nextest.toml` (`global_net_state` test-group) — skuld serializes
 //! across binaries too, but it does not own nextest's thread budget.
 //!
 //! COUPLED NAMES: that group's filter matches these tests by the name substrings
@@ -46,7 +46,7 @@
 //! when it could be a general outage instead.
 
 use super::*;
-use crate::TUN;
+use crate::{GLOBAL_NET_STATE, TUN};
 
 // Two routable anycast hosts on :443 (the runner has outbound internet). IP
 // literals only — the cover blocks DNS, so a hostname connect would fail for the
@@ -93,10 +93,10 @@ const NON_PERMITTED: &str = "8.8.8.8:443";
 /// falsified separately, against two real, live TUN devices, in
 /// `live_tun_permit_privileged_tests.rs`. `serial = TUN` serializes against
 /// other in-binary TUN tests; the cross-binary race with the bridge's
-/// real-egress e2e is handled by the `global-net-state` test-group
+/// real-egress e2e is handled by the `global_net_state` test-group
 /// (`.config/nextest.toml`).
 #[cfg(target_os = "windows")]
-#[skuld::test(labels = [TUN], serial = TUN)]
+#[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
 fn windows_lockdown_permits_server_ip_and_blocks_other_egress() {
     use std::net::TcpStream;
     use std::time::Duration;
@@ -195,11 +195,11 @@ fn windows_lockdown_permits_server_ip_and_blocks_other_egress() {
 /// WRONG one — is falsified separately, against two real, live `utunN`
 /// devices, in
 /// `live_tun_permit_privileged_tests.rs`. `serial = TUN` + the
-/// `global-net-state` test-group serialize the process-global pf state:
+/// `global_net_state` test-group serialize the process-global pf state:
 /// `pfctl -E`/`-X` is refcounted and the main ruleset is host-wide, so a
 /// concurrent cover test would race the snapshot restore.
 #[cfg(target_os = "macos")]
-#[skuld::test(labels = [TUN], serial = TUN)]
+#[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
 fn macos_lockdown_permits_server_ip_blocks_other_egress_and_restores() {
     use std::net::TcpStream;
     use std::process::Command;
@@ -303,7 +303,7 @@ fn macos_lockdown_permits_server_ip_blocks_other_egress_and_restores() {
 /// beats block-all — catches the block-everything arbitration bug) while a
 /// non-permitted host is blocked (no leak). Drop restores egress.
 #[cfg(target_os = "windows")]
-#[skuld::test(labels = [TUN], serial = TUN)]
+#[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
 fn windows_failclosed_permits_server_blocks_other_egress() {
     use std::net::TcpStream;
     use std::time::Duration;
@@ -354,7 +354,7 @@ fn windows_failclosed_permits_server_blocks_other_egress() {
 /// proves the permit is scoped to TCP/443, not the whole resolver IP: the
 /// SAME resolver on a different port stays blocked.
 #[cfg(target_os = "windows")]
-#[skuld::test(labels = [TUN], serial = TUN)]
+#[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
 fn windows_failclosed_permits_resolver_blocks_other_egress() {
     use std::net::TcpStream;
     use std::time::Duration;
@@ -428,7 +428,7 @@ fn windows_failclosed_permits_resolver_blocks_other_egress() {
 /// loopback and the server IP), proves (a) the live ruleset carries our block,
 /// (b) it is SELECTIVE, and (c) Drop restores `/etc/pf.conf`.
 #[cfg(target_os = "macos")]
-#[skuld::test(labels = [TUN], serial = TUN)]
+#[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
 fn macos_failclosed_permits_server_blocks_other_egress() {
     use std::net::TcpStream;
     use std::process::Command;
@@ -482,7 +482,7 @@ fn macos_failclosed_permits_server_blocks_other_egress() {
 /// Also proves the permit is scoped to TCP/443, not the whole resolver IP: the
 /// SAME resolver on a different port stays blocked.
 #[cfg(target_os = "macos")]
-#[skuld::test(labels = [TUN], serial = TUN)]
+#[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
 fn macos_failclosed_permits_resolver_blocks_other_egress() {
     use std::net::TcpStream;
     use std::process::Command;
