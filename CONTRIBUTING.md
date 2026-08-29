@@ -104,9 +104,11 @@ fixed and its only test is an argv-shape test, so a fatal failure there would
 first execute in a user's hands; it becomes fatal once it has run green on the
 darwin TUN lane. The tolerate predicate is **not** `ipv6_available`, which
 measures upstream reachability — an independent question. Route-install
-fatality must follow the same split: **the IPv6 route adds are non-fatal when
-the upstream has no IPv6 or the TUN interface has no IPv6 half**, with
-`Dispatcher::ipv6_assigned()` as the second operand.
+fatality follows the same rule: **the IPv6 route adds are non-fatal exactly
+when the TUN has no IPv6 half**, measured by `gateway::tun_ipv6_available` at
+install time. Upstream reachability is not an operand — a host whose EDR
+unbinds IPv6 from new adapters has a reachable upstream and an unusable
+tunnel, and reading upstream there refuses a connection that would work.
 
 Phase 5 of `start_inner` is cooperative because of this wait: `Dispatcher::new`
 runs `Device::build` on `spawn_blocking` raced against the start's cancel token
