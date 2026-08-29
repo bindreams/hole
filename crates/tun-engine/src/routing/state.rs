@@ -11,12 +11,16 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use super::{planned_routes, RouteId};
+
 // Types ===============================================================================================================
 
 /// Schema version for [`RouteState`]. Bump when the struct changes in a
-/// backwards-incompatible way; [`load`] rejects mismatched versions to force
-/// a fresh run rather than corrupt recovery.
-pub const SCHEMA_VERSION: u32 = 1;
+/// backwards-incompatible way, and give [`load`] an arm that migrates the old
+/// shape. Discarding an old file instead is not an option here: the file is
+/// the only record of what a crashed run leaked, so dropping it strands the
+/// host on routes pointing at a dead TUN.
+pub const SCHEMA_VERSION: u32 = 3;
 
 /// Filename of the persisted state file under `state_dir`. Exported so
 /// external tooling (notably `scripts/network-reset.py`) can reference the
@@ -34,10 +38,158 @@ pub struct RouteState {
     pub tun_name: String,
     pub server_ip: IpAddr,
     pub interface_name: String,
+    /// The gateway `install` bypassed the tunnel through when this record's
+    /// own routes went in. `None` only for a record migrated from schema 1
+    /// or 2, which never persisted it — those deletes fall back to the old
+    /// unscoped form (a disclosed residual; see CONTRIBUTING's Route
+    /// ownership section). A fresh schema-3 write always sets `Some`.
+    pub original_gateway: Option<IpAddr>,
+    /// The routes that run got into the table. Recovery deletes these and
+    /// nothing else — see [`RouteId`] for the delete-side selectivity this
+    /// provides on top of.
+    pub installed: Vec<RouteId>,
+    /// Route groups an earlier `install` in this same process retained
+    /// because their own teardown could not confirm the routes gone —
+    /// carried forward so a later `install`'s checkpoints layer on top
+    /// instead of silently overwriting the only record of that leak. Each
+    /// entry keeps its own provenance because it may belong to a different
+    /// `tun_name`/`server_ip`/gateway than the record's own fields above.
+    pub stale: Vec<StaleRecord>,
+}
+
+/// One retained-but-unswept group from a prior `install`/session — same
+/// shape as [`RouteState`]'s own identity + `installed` fields, kept
+/// separate because a `RouteState` can carry more than one such group
+/// (a sweep can itself fail to fully drain).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StaleRecord {
+    pub tun_name: String,
+    pub server_ip: IpAddr,
+    pub interface_name: String,
+    pub original_gateway: Option<IpAddr>,
+    pub installed: Vec<RouteId>,
+}
+
+/// Schema 1: no `installed` field. Its teardown deleted every route an install
+/// for `server_ip` would have created, whether or not that install succeeded.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RouteStateV1 {
+    version: u32,
+    tun_name: String,
+    server_ip: IpAddr,
+    interface_name: String,
+}
+
+impl From<RouteStateV1> for RouteState {
+    /// Reproduce v1's delete set exactly. A v1 file is written by a bridge
+    /// that has already crashed, so its leak is whatever that run planned;
+    /// assuming the full set cleans up at least as much as the old code did.
+    /// No gateway or stale-group provenance existed in v1 either.
+    fn from(old: RouteStateV1) -> Self {
+        debug_assert_eq!(old.version, 1, "only load's version-1 arm may build this");
+        Self {
+            version: SCHEMA_VERSION,
+            tun_name: old.tun_name,
+            installed: planned_routes(old.server_ip),
+            server_ip: old.server_ip,
+            interface_name: old.interface_name,
+            original_gateway: None,
+            stale: Vec::new(),
+        }
+    }
+}
+
+/// Schema 2: like [`RouteState`] but without `original_gateway`/`stale` — the
+/// gateway a v2 record's own routes used was never persisted, and v2 had no
+/// concept of carried-forward leftovers.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RouteStateV2 {
+    version: u32,
+    tun_name: String,
+    server_ip: IpAddr,
+    interface_name: String,
+    installed: Vec<RouteId>,
+}
+
+impl From<RouteStateV2> for RouteState {
+    fn from(old: RouteStateV2) -> Self {
+        debug_assert_eq!(old.version, 2, "only load's version-2 arm may build this");
+        Self {
+            version: SCHEMA_VERSION,
+            tun_name: old.tun_name,
+            server_ip: old.server_ip,
+            interface_name: old.interface_name,
+            installed: old.installed,
+            original_gateway: None,
+            stale: Vec::new(),
+        }
+    }
+}
+
+/// Reads only the discriminant, tolerating fields from any schema.
+#[derive(Deserialize)]
+struct VersionProbe {
+    version: u32,
 }
 
 fn state_file(state_dir: &Path) -> PathBuf {
     state_dir.join(STATE_FILE_NAME)
+}
+
+// Canonical form ======================================================================================================
+
+/// Reduce a list of route-provenance groups to canonical form: groups
+/// sharing an identity — `tun_name`, `server_ip`, `interface_name`,
+/// `original_gateway`, the tuple that determines the teardown argv a group
+/// emits — merge into one whose `installed` is the union, each surviving
+/// group's `installed` is sanitized against `planned_routes(server_ip)` (an
+/// id with no possible teardown command can never drain, so it would pin the
+/// group non-empty forever), and a group left with an empty `installed` is
+/// dropped. Two groups with the same identity would otherwise emit
+/// byte-identical teardown commands: the second is either never confirmed
+/// (permanently stuck bookkeeping) or, on macOS's unscoped split-route
+/// deletes, removes whatever a third party claimed after the first delete
+/// freed the prefix. The sole shared entry point for every path that folds a
+/// group into a persisted `stale`/`installed` set — sweep and crash
+/// recovery alike — so they cannot drift apart on this discipline.
+pub fn coalesce(groups: Vec<StaleRecord>) -> Vec<StaleRecord> {
+    let mut merged: Vec<StaleRecord> = Vec::new();
+    for g in groups {
+        match merged.iter_mut().find(|m| {
+            m.tun_name == g.tun_name
+                && m.server_ip == g.server_ip
+                && m.interface_name == g.interface_name
+                && m.original_gateway == g.original_gateway
+        }) {
+            Some(existing) => {
+                for id in g.installed {
+                    if !existing.installed.contains(&id) {
+                        existing.installed.push(id);
+                    }
+                }
+            }
+            None => merged.push(g),
+        }
+    }
+
+    for g in &mut merged {
+        let plannable = planned_routes(g.server_ip);
+        let before = g.installed.len();
+        g.installed.retain(|id| plannable.contains(id));
+        if g.installed.len() != before {
+            tracing::warn!(
+                tun = %g.tun_name,
+                server_ip = %g.server_ip,
+                "route-provenance group names a route with no possible teardown command — dropping it"
+            );
+        }
+    }
+
+    merged.retain(|g| !g.installed.is_empty());
+    merged
 }
 
 // I/O =================================================================================================================
@@ -67,9 +219,10 @@ pub fn save(state_dir: &Path, state: &RouteState, owner: Option<(u32, u32)>) -> 
     Ok(())
 }
 
-/// Load the state file. Returns `None` for any error — missing file,
-/// corrupted JSON, unknown fields, version mismatch — and logs at `warn`
-/// level. Crash recovery is best-effort and should never fail the caller.
+/// Load the state file, migrating a schema-1 file forward. Returns `None` for
+/// any error — missing file, corrupted JSON, unknown fields, a version with no
+/// migration — and logs at `warn` level. Crash recovery is best-effort and
+/// should never fail the caller.
 pub fn load(state_dir: &Path) -> Option<RouteState> {
     let path = state_file(state_dir);
     let bytes = match std::fs::read(&path) {
@@ -80,16 +233,31 @@ pub fn load(state_dir: &Path) -> Option<RouteState> {
             return None;
         }
     };
-    match serde_json::from_slice::<RouteState>(&bytes) {
-        Ok(state) if state.version == SCHEMA_VERSION => Some(state),
-        Ok(other) => {
-            tracing::warn!(
-                got = other.version,
-                want = SCHEMA_VERSION,
-                "route-state schema mismatch, discarding"
-            );
-            None
+    let version = match serde_json::from_slice::<VersionProbe>(&bytes) {
+        Ok(probe) => probe.version,
+        Err(e) => {
+            tracing::warn!(error = %e, path = %path.display(), "route-state parse failed");
+            return None;
         }
+    };
+    let parsed = if version == SCHEMA_VERSION {
+        serde_json::from_slice::<RouteState>(&bytes)
+    } else if version == 2 {
+        tracing::info!(got = version, want = SCHEMA_VERSION, "migrating route-state forward");
+        serde_json::from_slice::<RouteStateV2>(&bytes).map(RouteState::from)
+    } else if version == 1 {
+        tracing::info!(got = version, want = SCHEMA_VERSION, "migrating route-state forward");
+        serde_json::from_slice::<RouteStateV1>(&bytes).map(RouteState::from)
+    } else {
+        tracing::warn!(
+            got = version,
+            want = SCHEMA_VERSION,
+            "route-state schema mismatch, discarding"
+        );
+        return None;
+    };
+    match parsed {
+        Ok(state) => Some(state),
         Err(e) => {
             tracing::warn!(error = %e, path = %path.display(), "route-state parse failed");
             None

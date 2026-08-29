@@ -371,21 +371,26 @@ security decision, not a style one:
   `Err`, so no `SystemRoutes` guard exists. Reporting split routes that were
   never installed is a **leak**: traffic egresses outside the tunnel while the UI
   says "protected" (#901).
-- **Best-effort — teardown and crash recovery** (`run_cleanup_commands`, via
+- **Best-effort — teardown and crash recovery** (`run_teardown_commands`, via
   `teardown_routes` / `recover_routes`). Every command is issued; a failure
   neither short-circuits the rest nor is returned. Stopping at the first failure
   would strand routes and leave the user worse off than if Hole had never run.
 
 No future edit can turn stranded-route cleanup into an early return: a
-`CleanupReport` is counts, not a `Result`, so there is nothing to `?` out of.
+best-effort runner narrows a `Vec<RouteId>` accumulator, not a `Result`, so
+there is nothing to `?` out of — see
+[Route ownership](#route-ownership) for what that accumulator is and how it's
+checkpointed.
 
 **The pairing is a compile error, not a convention.** A phase is a value of
 `FatalPhase` or `BestEffortPhase` (sealed `Phase` trait, `BEST_EFFORT` const per
-type — it also picks the log level), and each runner accepts only its own type;
-the command types differ too (`SetupCommand` vs `Vec<String>`). Wiring a
-teardown phase into the fatal runner does not compile. This replaces a
-`debug_assert` pairing check, which compiled out in release — the same
-silently-absorbed-failure class this policy exists to close.
+type — it also picks the log level, and for `exec_one` which success oracle
+applies — see [Route ownership](#route-ownership)), and each runner accepts
+only its own type; the command types differ too (`SetupCommand` vs
+`RouteCommand`). Wiring a teardown phase into the fatal runner does not
+compile. This replaces a `debug_assert` pairing check, which compiled out in
+release — the same silently-absorbed-failure class this policy exists to
+close.
 
 **Fatality is per command, not per phase** (`SetupCommand::fatal`). The two IPv6
 split routes are non-fatal when `gateway::tun_ipv6_available(tun_name)` is false:
@@ -539,6 +544,139 @@ scan (exact-substring match on the literal identifiers, not scoped to
 call-graph reachability) — a best-effort tripwire against an accidental
 upstream reintroduction, not a proof against a determined rename/alias.
 
+### Route ownership
+
+Teardown and crash recovery delete **only** the routes the run recorded in
+`bridge-routes.json`'s `installed` list.
+
+**On macOS, nothing about the delete command itself can express "only if it is
+ours"**:
+
+- macOS `route delete` resolves its victim from the destination key and netmask
+  alone. xnu's `rtrequest_common_locked` reaches `RTM_DELETE` via
+  `rnh_deladdr(dst, netmask)` (`in_deleteroute` → `rn_delete`) and never reads
+  the gateway, so `-interface <name>` — which `route(8)` turns into an
+  `AF_LINK` gateway, `case K_IFACE` in `network_cmds/route.tproj/route.c` —
+  scopes nothing. Worse, with that flag set and a name that no longer resolves,
+  `getaddr` exits before `rtmsg()` writes to the routing socket, so the delete
+  never happens at all.
+- `-ifscope` is the real scoping flag and is equally unusable: a route carrying
+  `RTF_IFSCOPE` is skipped by unscoped lookups (xnu `rt_lookup_common` searches
+  the unscoped table first and retries only under the *primary* interface's
+  scope), so scoping the install would leave the tunnel capturing nothing.
+- Reading the table back first — `route get` then `route delete` — is
+  check-then-act: it only narrows the window in which the other route is
+  destroyed.
+
+**On Windows, the delete command CAN express it, via the gateway.**
+`ROUTE DELETE destination [MASK netmask] [gateway] ...` — `route.exe`'s own
+help confirms the gateway argument is optional but accepted for DELETE, and
+unlike macOS it scopes which entry is deleted. `install` already knows the
+gateway (`platform_setup_commands` passes it to the matching `route add`), so
+the server-bypass teardown carries it forward as `RouteState.original_gateway`
+and emits `route delete <server_ip> mask 255.255.255.255 <gateway>` instead of
+the unscoped form. This is `None` — falling back to the old unscoped delete, a
+disclosed residual — only for a record migrated from schema 1/2, which never
+persisted a gateway. The split-route deletes stay unscoped on both platforms
+(`RouteId` provenance is their only handle); only the single-destination
+bypass delete can carry a gateway at all.
+
+Provenance is the one handle that outlives the interface, which matters because
+the utun is always already gone by teardown: `RunningState` closes the TUN at
+step 1 and drops the routes guard at step 4, and a crashed run's utun died with
+its control-socket fd.
+
+**Determining "ours" needs more than an exit code.** `route(8)` on macOS exits
+0 unconditionally for `add`/`delete`/`change` once it dispatches at all
+(`network_cmds/route.tproj/route.c`'s `K_ADD`/`K_DELETE`/`K_CHANGE` case runs
+`newroute(); exit(0)`); the only signal a real routing-socket failure (EEXIST,
+etc.) ever produces is the literal text `rtmsg()` prints to stderr via
+`warnx("writing to routing socket: %s", ...)`. `routing::macos_route_command_succeeded`
+parses that text for installs, and `routing::macos_route_confirmed_absent` for
+deletes (distinguishing `ESRCH`/"not in table", meaning already gone, from
+every other errno, meaning still installed). Windows' `route.exe`/`netsh`
+exit non-zero on a genuine `add` failure, so no parsing is needed for
+installs — but for *deletes*, a non-zero exit does NOT unambiguously mean
+"already gone" (verified empirically: an absent route and one requiring
+elevation both exit 1, no distinguishing text), so `route_confirmed_absent`
+only trusts exit 0; a Windows delete that fails for any reason stays
+recorded rather than risk silently dropping a route that is still there — a
+disclosed residual on top of the one below. Parsing a CLI's diagnostic text
+is a narrower and more fragile answer than a routing socket would be — see
+the Residual paragraph below.
+
+**A route command that ran but didn't confirm going in is a fail-closed
+condition, not a degraded connect.** If any planned route's command spawns
+but the oracle above says it did not go in (macOS: a real `rtmsg()` failure;
+either platform: the runner itself reporting `false`), `install` rolls back
+whatever did go in and returns `Err` rather than a partial tunnel — a user
+who believes traffic is captured when some of it is not is worse off than
+one who is told Hole failed to connect (Rule #0).
+
+The consequence a co-resident VPN cares about: if another VPN already holds
+`0.0.0.0/1` when Hole starts, Hole's `route add` fails, the route is never
+recorded, and Hole's Stop leaves it alone.
+
+**Persistence is checkpointed per command, not per phase.** `bridge-routes.json`
+is rewritten before AND after every single route command — not once before the
+whole install, not once after — so at any instant, including mid-crash, its
+`installed` list names at most one route beyond what is actually confirmed in
+the table (the one command in flight). Teardown and recovery apply the same
+per-command checkpointing on the way out: a command that spawns is dropped from
+the record only once its outcome is confirmed (deleted, or already absent);
+one that fails to spawn stays recorded so the next start retries it, and nothing
+downstream of it in the same run is skipped — teardown has no error channel to
+abort through. "Next start" means the next `install`, not only the next
+process start: `recover_routes` runs once per bridge process, but a
+long-lived process can `install` multiple times (reconnect, server switch),
+so `install` itself sweeps any record left retained by a prior `install` in
+the same process before starting a new one. A record is only ever retained
+because its own teardown could not confirm the route gone, so the sweep
+commonly fails the identical way again — whatever it still cannot confirm
+gone is carried forward into `RouteState.stale` (a list of
+`{tun_name, server_ip, interface_name, original_gateway, installed}` groups,
+each with its own provenance since a later sweep or `recover_routes` may run
+under a different `tun_name`/`server_ip`/gateway than the new session's own).
+The new session's own checkpoints only ever touch `installed`, never `stale`,
+so a leak from an earlier session survives being overwritten by a later one;
+`recover_routes` attempts every `stale` group in addition to the primary
+record, and the state file is cleared only once both are empty.
+
+**Groups are reduced to canonical form before anything runs.**
+`routing::state::coalesce` is the one place that folds a group into `stale`:
+groups sharing an identity (`tun_name`, `server_ip`, `interface_name`,
+`original_gateway` — the tuple that determines the argv a group's commands
+emit) merge into one whose `installed` is the union, each survivor is
+sanitized against `planned_routes(server_ip)` (an id with no possible
+teardown command — e.g. a `ServerBypass` against a loopback `server_ip` —
+can never drain, so it would pin `stale` non-empty forever), and an empty
+survivor is dropped. Without this, a reconnect to the same server — which
+shares `tun_name` (a fixed constant) and often `server_ip` with an
+already-carried-forward group — would re-emit a byte-identical delete: on
+Windows the second occurrence is never confirmed, permanently stranding the
+group; on macOS the split-route deletes are fully unscoped, so the second
+occurrence removes whatever a third party claimed after the first freed the
+prefix — the exact harm this section exists to prevent. `recover_groups`
+additionally runs every group's split deletes before any group's bypass
+delete, deduping by argv across groups (not just within one): a split
+delete's argv depends on `tun_name` alone, so two groups with different
+`server_ip` but the same `tun_name` would otherwise still collide.
+
+**Residual (macOS only):** a VPN that takes the prefix over *mid-session* —
+necessarily by deleting Hole's entry first — is still torn down by Hole's
+Stop. macOS exposes no compare-and-delete, so closing that needs a different
+mechanism (a routing socket that acts and then repairs from `RTM_DELETE`'s
+reply), not a different flag. The same routing-socket mechanism would also
+replace the stderr-text parsing above with a structured `rtm_errno` — tracked
+separately, since it cannot be verified without a macOS dev box. Windows has
+no equivalent residual here: a takeover VPN's route to the same destination
+has a different gateway, so Hole's gateway-scoped delete simply fails to
+match it (a safe no-op) rather than deleting the wrong entry — the failure
+mode a check-then-act race would otherwise produce.
+
+`scripts/network-reset.py` deliberately does not honour the record: it is the
+unconditional escape hatch, in the same spirit as `failclosed::release_all`.
+
 ### Crash recovery
 
 While a proxy is active the bridge persists small state files in `<state_dir>/`,
@@ -546,10 +684,13 @@ cleared on clean shutdown and replayed on next startup (all *after* the IPC
 socket binds; DNS recovery runs before route recovery so a mid-recovery crash
 leaves working DNS + broken routes, not the inverse):
 
-- **`bridge-routes.json`** — TUN name, server IP, upstream interface;
-  `routing::recover_routes` tears down leaked routes. The same call also sweeps a
-  stale [fail-closed cover](#fail-closed-cover) (Windows by fixed WFP GUID,
-  macOS via `bridge-failclosed.json`).
+- **`bridge-routes.json`** — TUN name, server IP, upstream interface, and the
+  `installed` list of [`RouteId`](crates/tun-engine/src/routing.rs)s;
+  `routing::recover_routes` tears down leaked routes. Teardown and recovery
+  delete **only** the routes in `installed` — see
+  [Route ownership](#route-ownership). The same call also sweeps a stale
+  [fail-closed cover](#fail-closed-cover) (Windows by fixed WFP GUID, macOS via
+  `bridge-failclosed.json`).
 - **`bridge-failclosed.json`** (macOS only) — the `pfctl -E` enable token of an
   engaged fail-closed cover; `routing::failclosed::recover_cover` restores
   `/etc/pf.conf` and drops the refcount. Windows keys its cover by fixed WFP

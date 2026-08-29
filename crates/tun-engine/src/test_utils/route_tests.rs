@@ -1,4 +1,35 @@
 use super::netstat_dest;
+#[cfg(target_os = "windows")]
+use super::{route_added, route_removed};
+
+#[cfg(target_os = "windows")]
+fn output_with(success: bool, stderr: &str) -> std::process::Output {
+    use std::os::windows::process::ExitStatusExt;
+    std::process::Output {
+        status: std::process::ExitStatus::from_raw(u32::from(!success)),
+        stdout: Vec::new(),
+        stderr: stderr.as_bytes().to_vec(),
+    }
+}
+
+/// Windows never needs the macOS stderr-parsing path — a bare exit status is
+/// already a reliable oracle there (verified empirically against `netsh`).
+/// This guards against `route_added`/`route_removed` accidentally routing a
+/// Windows outcome through the macOS-specific predicate.
+#[cfg(target_os = "windows")]
+#[skuld::test]
+fn route_added_and_removed_use_bare_exit_status_on_windows() {
+    let success_with_failure_looking_stderr = output_with(true, "writing to routing socket: File exists");
+    assert!(
+        route_added(&success_with_failure_looking_stderr),
+        "Windows must not parse stderr — exit 0 is success regardless of stderr content"
+    );
+    assert!(route_removed(&success_with_failure_looking_stderr));
+
+    let failure = output_with(false, "");
+    assert!(!route_added(&failure));
+    assert!(!route_removed(&failure));
+}
 
 /// `netstat -rn` drops trailing zero octets, so the guard that searches its
 /// output must derive its needle from the prefix the test installs — a

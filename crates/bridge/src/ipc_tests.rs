@@ -16,7 +16,7 @@ use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tun_engine::gateway::GatewayInfo;
 use tun_engine::routing::failclosed::lockdown_state;
-use tun_engine::routing::{state as route_state, Routing};
+use tun_engine::routing::{self as routing, state as route_state, Routing};
 use tun_engine::RoutingError;
 
 // MockProxy ===========================================================================================================
@@ -199,6 +199,9 @@ impl Routing for MockRouting {
             tun_name: tun_name.to_owned(),
             server_ip,
             interface_name: interface_name.to_owned(),
+            original_gateway: Some(gateway.gateway_ip),
+            installed: routing::planned_routes(server_ip),
+            stale: Vec::new(),
         };
         route_state::save(&self.state_dir, &persisted, None)
             .map_err(|e| RoutingError::RouteSetup(format!("mock persist failed: {e}")))?;

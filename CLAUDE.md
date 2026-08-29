@@ -77,6 +77,14 @@ before editing; the sections linked below are the authoritative source.
 - **Native-crash observability.** The `tombstone` crate writes a signal-safe
   crash marker; the next start of the same kind sweeps it. →
   [CONTRIBUTING.md#native-crash-observability-tombstone](CONTRIBUTING.md#native-crash-observability-tombstone)
+- **Route ownership.** Teardown and recovery delete only the `RouteId`s
+  `bridge-routes.json` records as installed. On macOS no delete-side qualifier
+  can substitute: `RTM_DELETE` matches on destination + netmask only, and the
+  one key discriminator (`-ifscope`) would hide the splits from unbound
+  traffic. Windows' bypass delete can additionally be scoped by the
+  install-time gateway, carried in `original_gateway`. Leftovers a sweep
+  can't confirm gone are carried forward in `stale`, never dropped. →
+  [CONTRIBUTING.md#route-ownership](CONTRIBUTING.md#route-ownership)
 - **Route-command failure policy.** Install is fatal, teardown/crash recovery
   are best-effort — the type system (`FatalPhase`/`BestEffortPhase`) enforces
   which runner a phase gets, and per-command fatality tolerates the IPv6
@@ -149,6 +157,9 @@ before editing; the sections linked below are the authoritative source.
 - **Cooperative cancel tokens only** — no fresh `CancellationToken::new()` in
   `crates/bridge/src/` (clippy-enforced).
   [→](CONTRIBUTING.md#bridge-cancellation-contract)
+- **Delete only recorded routes** — a route whose install failed belongs to
+  whoever holds it now; deleting it takes down another VPN's tunnel.
+  [→](CONTRIBUTING.md#route-ownership)
 - **Ephemeral ports via `bind_ephemeral`, never raw `free_port`** — the retry is
   unbounded by design, no budget (clippy-enforced).
   [→](CONTRIBUTING.md#port-allocation)
