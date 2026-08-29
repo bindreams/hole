@@ -1,18 +1,12 @@
-use super::{netstat_dest, route_added, route_removed};
+use super::netstat_dest;
+#[cfg(target_os = "windows")]
+use super::{route_added, route_removed};
 
+#[cfg(target_os = "windows")]
 fn output_with(success: bool, stderr: &str) -> std::process::Output {
-    #[cfg(windows)]
-    let status = {
-        use std::os::windows::process::ExitStatusExt;
-        std::process::ExitStatus::from_raw(u32::from(!success))
-    };
-    #[cfg(not(windows))]
-    let status = {
-        use std::os::unix::process::ExitStatusExt;
-        std::process::ExitStatus::from_raw(if success { 0 } else { 1 << 8 })
-    };
+    use std::os::windows::process::ExitStatusExt;
     std::process::Output {
-        status,
+        status: std::process::ExitStatus::from_raw(u32::from(!success)),
         stdout: Vec::new(),
         stderr: stderr.as_bytes().to_vec(),
     }
