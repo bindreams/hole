@@ -13,9 +13,9 @@ use super::dns::DnsInterceptor;
 /// Override via the `Engine::build(..., |c| { c.field = ... })` closure.
 #[freeze]
 pub struct EngineConfig {
-    /// Maximum concurrent TCP connections. Additional connections are
-    /// accepted at the smoltcp layer and then aborted until an existing
-    /// connection drops.
+    /// Maximum concurrent TCP connections. Connections past the limit are
+    /// refused with a TCP reset before the handshake completes, until an
+    /// existing connection drops.
     pub max_connections: usize,
 
     /// Maximum concurrent calls to [`TcpFlow::peek`](super::TcpFlow::peek)
@@ -26,6 +26,28 @@ pub struct EngineConfig {
     pub tcp_rx_buf_size: usize,
     /// smoltcp TCP socket transmit buffer (per socket, bytes).
     pub tcp_tx_buf_size: usize,
+
+    /// How often an admitted TCP connection with nothing else to send probes
+    /// its client while idle.
+    ///
+    /// A quarter of [`tcp_peer_timeout`](Self::tcp_peer_timeout), so a client
+    /// that is merely quiet answers three probes before the bound is reached,
+    /// and only a client that has stopped answering altogether trips it.
+    pub tcp_keep_alive_interval: Duration,
+    /// How long an admitted TCP connection tolerates silence from its client
+    /// before it is reset and its slot reclaimed.
+    ///
+    /// This bounds an external event — a client process that may never speak
+    /// again — not anything inside the engine. Without it, a connection stalled
+    /// in `SynReceived`, `FinWait2` or `CloseWait` holds its entry, both buffers
+    /// and its connection slot for the life of the process, and
+    /// `max_connections` such connections wedge the tunnel for all new TCP.
+    ///
+    /// The default is RFC 5382 REQ-5's floor for a *transitory* connection —
+    /// one partially open or closing, exactly those states — below which a
+    /// stack may not abandon one. A quiet but live connection is not held to
+    /// it: the keep-alive probe answers on its behalf.
+    pub tcp_peer_timeout: Duration,
 
     /// Interval at which the driver polls smoltcp outside of TUN reads.
     /// Needed because handler-to-driver data arrives via mpsc and would
@@ -53,6 +75,8 @@ impl Default for MutEngineConfig {
             max_sniffers: 1024,
             tcp_rx_buf_size: 65536,
             tcp_tx_buf_size: 65536,
+            tcp_keep_alive_interval: Duration::from_secs(60),
+            tcp_peer_timeout: Duration::from_secs(240),
             poll_interval: Duration::from_millis(1),
             idle_sweep_interval: Duration::from_secs(5),
             udp_flow_idle_timeout: Duration::from_secs(30),

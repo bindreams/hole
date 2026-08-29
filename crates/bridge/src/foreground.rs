@@ -2,7 +2,7 @@
 
 use std::path::Path;
 
-use tun_engine::routing::{self, SystemRouting};
+use tun_engine::routing::SystemRouting;
 
 use crate::proxy::ShadowsocksProxy;
 use crate::proxy_manager::ProxyManager;
@@ -164,13 +164,7 @@ async fn run_inner(
         tracing::warn!(error = %e, "recover_dns_config task panicked");
     }
 
-    // Offload route recovery to a blocking thread so a hung netsh/route
-    // command cannot wedge the runtime while the IPC socket is bound but
-    // not yet serving.
-    let state_dir_routes = state_dir.to_path_buf();
-    if let Err(e) = tokio::task::spawn_blocking(move || routing::recover_routes(&state_dir_routes, owner)).await {
-        tracing::warn!(error = %e, "recover_routes task panicked");
-    }
+    crate::route_recovery::recover_and_record(state_dir, &proxy_shutdown).await;
     let state_dir_plugins = state_dir.to_path_buf();
     if let Err(e) =
         tokio::task::spawn_blocking(move || crate::plugin_recovery::reap_recorded_plugins(&state_dir_plugins)).await

@@ -27,6 +27,9 @@ thiserror = "2"
 sha2 = "0.11"
 minisign-verify = "0.2"
 uuid = { version = "1", features = ["v4", "serde"] }
+# A-label form of a configured IDN hostname, so redaction covers what a
+# third-party dialer logs rather than only what the user typed.
+idna = "1"
 dirs = "6"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "ansi"] }
@@ -41,6 +44,10 @@ nu-ansi-term = "0.50"
 tempfile = "3"
 tombstone = { path = "../tombstone" }
 util = { path = "../util" }
+# `Dump` impls for the config containers: the `dump!` ladder resolves per
+# top-level expression, so a container without one falls to `Serialize` and
+# renders the address and the password in clear.
+dump = { path = "../dump" }
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62", features = [

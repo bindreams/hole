@@ -37,11 +37,11 @@
 //! start dies before routes, before DNS, and before `install_lockdown` today.
 //!
 //! COUPLED NAME: the test name below contains the literal substring
-//! `live_tun_permit_`, which `.config/nextest.toml`'s `global-net-state`
+//! `live_tun_permit_`, which `.config/nextest.toml`'s `global_net_state`
 //! filter matches by substring.
 //!
 //! `serial = TUN` reuses `crate::test_support::skuld_fixtures::TUN` — the
-//! same label `e2e_none_full_tunnel_roundtrip` carries — never redeclared.
+//! same label `e2e_none_full_tunnel_local_networking_intact` carries — never redeclared.
 
 use std::net::{IpAddr, SocketAddr, TcpStream};
 use std::path::Path;
@@ -104,7 +104,7 @@ fn entry_from(ss: &SsServerHandle) -> ServerEntry {
     ServerEntry {
         id: "live-tun-permit-e2e".into(),
         name: "live-tun-permit-e2e".into(),
-        server: ss.addr.ip().to_string(),
+        server: ss.addr.ip().to_string().into(),
         server_port: ss.addr.port(),
         method: ss.method.into(),
         password: ss.password.clone(),
@@ -339,7 +339,7 @@ async fn run_live_tun_permit_session(dist: &Path, ss: &SsServerHandle) {
 }
 
 /// See the module doc for what this test does and does not establish.
-#[skuld::test(labels = [DIST_BIN, TUN], serial = TUN)]
+#[skuld::test(labels = [DIST_BIN, TUN, GLOBAL_NET_STATE], serial = TUN)]
 fn live_tun_permit_holds_for_a_real_session_with_the_kill_switch_armed(
     #[fixture(dist_dir)] dist: &Path,
     #[fixture(ssserver_none)] ss: &SsServerHandle,

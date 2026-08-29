@@ -17,12 +17,15 @@ group = "hole"
 workspace = true
 
 [features]
-# Exposes the `test_utils` module — the harness the privileged (elevated) test
-# lanes share: shelled-out command diagnostics, a probe route owned by an RAII
-# guard, and the escape from a fail-closed cover. Off by default, so no
-# production binary links it; this crate's own tests get it via `cfg(test)`
-# and `hole-bridge` enables it from its `[dev-dependencies]`. Same shape as
-# garter's `test-utils`.
+# Exposes the `sim` module — in-memory doubles for engine-owned types
+# that have no constructor outside this crate — and the `test_utils` module,
+# the harness the privileged (elevated) test lanes share: shelled-out command
+# diagnostics, a probe route owned by an RAII guard, and the escape from a
+# fail-closed cover. Off by default — enabled by this crate's own tests via
+# `cfg(test)` and by downstream crates that need to drive the router without an
+# OS device (`hole-bridge`, via a dev-dependency). Production builds do NOT
+# enable it, so neither module is compiled into them. Same shape as garter's
+# `test-utils`.
 test-utils = []
 
 [lib]
@@ -51,6 +54,8 @@ smoltcp = { version = "0.13", default-features = false, features = [
     "alloc",
     "medium-ip", "proto-ipv4", "proto-ipv6",
     "socket-tcp", "socket-udp",
+    # Hold a listener in SynReceived so the accept verdict precedes the SYN-ACK.
+    "socket-tcp-pause-synack",
 ] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
@@ -76,3 +81,9 @@ wintun-bindings = "0.7"
 [dev-dependencies]
 skuld = { workspace = true }
 hole-test-observability = { path = "../test-observability" }
+# Recovery-path redaction tests capture tracing output through a
+# `RedactingWriter`: `WaitableWriter` (garter's `test-utils` feature) as the
+# sink, plus the mandated current-thread subscriber installer. garter does
+# not depend on tun-engine, so this is not a cycle.
+garter = { path = "../garter", features = ["test-utils"] }
+tracing-subscriber = { version = "0.3", features = ["fmt"] }

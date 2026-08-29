@@ -100,17 +100,34 @@ pub fn ci_run_packages(ci_yaml: &str, manifest: &Manifest) -> Result<BTreeSet<St
     let ci: CiYaml = serde_yml::from_str(ci_yaml).context("parsing ci.yaml")?;
     let mut covered = BTreeSet::new();
 
-    for job in ci.jobs.values() {
-        for step in &job.steps {
-            let Some(run) = &step.run else { continue };
-            let joined = join_line_continuations(run);
-            for cmd in split_commands(&joined) {
-                collect_from_command(&cmd, manifest, &mut covered, &mut BTreeSet::new());
-            }
+    for job_id in ci.jobs.keys() {
+        for cmd in ci_run_commands_for_job(ci_yaml, manifest, job_id)? {
+            covered.extend(package_tokens(&cmd));
         }
     }
 
     Ok(covered)
+}
+
+/// The raw, fully xtask-run-target-resolved test-running command strings for
+/// one named `ci.yaml` job, in step order. Errs if `job_id` is not a job
+/// `ci.yaml` declares.
+pub(crate) fn ci_run_commands_for_job(ci_yaml: &str, manifest: &Manifest, job_id: &str) -> Result<Vec<String>> {
+    let ci: CiYaml = serde_yml::from_str(ci_yaml).context("parsing ci.yaml")?;
+    let job = ci
+        .jobs
+        .get(job_id)
+        .with_context(|| format!("ci.yaml declares no job {job_id:?}"))?;
+
+    let mut out = Vec::new();
+    for step in &job.steps {
+        let Some(run) = &step.run else { continue };
+        let joined = join_line_continuations(run);
+        for cmd in split_commands(&joined) {
+            collect_test_commands(&cmd, manifest, &mut out, &mut BTreeSet::new());
+        }
+    }
+    Ok(out)
 }
 
 /// Collapse shell backslash-newline line continuations into spaces, so a command
@@ -120,18 +137,13 @@ pub(crate) fn join_line_continuations(script: &str) -> String {
     script.replace("\\\r\n", " ").replace("\\\n", " ")
 }
 
-/// Credit `cmd`'s packages into `covered`. A test-running nextest invocation
-/// contributes its [`package_tokens`]; a `cargo xtask run <target>` resolves the
-/// target and recurses into its `run:`/`build:` commands. `visited` guards the
-/// (currently unused) run→run chain against an accidental manifest cycle.
-fn collect_from_command(
-    cmd: &str,
-    manifest: &Manifest,
-    covered: &mut BTreeSet<String>,
-    visited: &mut BTreeSet<String>,
-) {
+/// Push `cmd` into `out` if it's a test-running nextest invocation; a `cargo
+/// xtask run <target>` resolves the target and recurses into its `run:`/
+/// `build:` commands under the same rule. `visited` guards the run→run chain
+/// against an accidental manifest cycle.
+fn collect_test_commands(cmd: &str, manifest: &Manifest, out: &mut Vec<String>, visited: &mut BTreeSet<String>) {
     if is_nextest_run(cmd) {
-        covered.extend(package_tokens(cmd));
+        out.push(cmd.to_string());
     }
 
     if let Some(target) = xtask_run_target(cmd) {
@@ -140,7 +152,7 @@ fn collect_from_command(
                 for step in t.run.iter().chain(t.build.iter()) {
                     let joined = join_line_continuations(&step_command(step));
                     for inner in split_commands(&joined) {
-                        collect_from_command(&inner, manifest, covered, visited);
+                        collect_test_commands(&inner, manifest, out, visited);
                     }
                 }
             }
@@ -204,7 +216,7 @@ pub(crate) fn is_nextest_run(cmd: &str) -> bool {
 }
 
 /// The target of a `cargo xtask run <target>` command, if `cmd` is one.
-fn xtask_run_target(cmd: &str) -> Option<&str> {
+pub(crate) fn xtask_run_target(cmd: &str) -> Option<&str> {
     let toks: Vec<&str> = cmd.split_whitespace().collect();
     toks.windows(4)
         .find(|w| w[0] == "cargo" && w[1] == "xtask" && w[2] == "run")

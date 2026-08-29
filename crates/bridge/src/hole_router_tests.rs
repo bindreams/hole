@@ -13,10 +13,17 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use std::sync::Arc;
 
+use garter::tracing_test::set_default_in_current_thread;
+use tracing_subscriber::filter::LevelFilter;
+use tracing_subscriber::fmt;
+use tracing_subscriber::layer::{Layer, SubscriberExt};
+
 use crate::dns::connector::DirectConnector;
 use crate::dns::forwarder::DnsForwarder;
-use crate::endpoint::{BlockEndpoint, InterfaceEndpoint, LocalDnsEndpoint, Socks5Endpoint};
+use crate::drop_sink::LoggingDropSink;
+use crate::endpoint::{InterfaceEndpoint, LocalDnsEndpoint, Socks5Endpoint};
 use crate::filter::rules::RuleSet;
+use crate::test_support::log_capture::VecWriter;
 use hole_common::config::{DnsConfig, DnsProtocol, FilterAction};
 
 fn v4(s: &str, port: u16) -> SocketAddr {
@@ -30,8 +37,8 @@ fn v6(s: &str, port: u16) -> SocketAddr {
 fn router_with(proxy_udp: bool, bypass_v6: bool) -> HoleRouter {
     let proxy = Socks5Endpoint::new(v4("127.0.0.1", 1080), Some("test-plugin".into()), proxy_udp);
     let bypass = InterfaceEndpoint::new(1, bypass_v6);
-    let block = BlockEndpoint::new();
-    HoleRouter::new(proxy, bypass, block, RuleSet::default())
+    let drops = LoggingDropSink::new();
+    HoleRouter::new(proxy, bypass, drops, RuleSet::default())
 }
 
 // Lifecycle smoke =====================================================================================================
@@ -76,15 +83,6 @@ fn interface_endpoint_capabilities_reflect_constructor() {
     assert!(!without_v6.supports_ipv6_dst());
 }
 
-#[skuld::test]
-fn block_endpoint_has_uniform_capabilities() {
-    let block = BlockEndpoint::new();
-    // Block doesn't care about the flow's protocol or addressing; it drops.
-    assert!(block.supports_udp());
-    assert!(block.supports_ipv6_dst());
-    assert_eq!(block.name(), "block");
-}
-
 // Cascade table =======================================================================================================
 //
 // Drives `HoleRouter::resolve_endpoint` directly (the private method is
@@ -112,9 +110,15 @@ enum DnsExpectedEndpoint {
 fn classify(d: Dispatch<'_>, router: &HoleRouter) -> ExpectedEndpoint {
     match d {
         Dispatch::Endpoint(e) => {
-            if std::ptr::eq(e as *const _ as *const (), &router.proxy as *const _ as *const ()) {
+            if std::ptr::eq(
+                e as *const _ as *const (),
+                router.proxy.as_ref() as *const _ as *const (),
+            ) {
                 ExpectedEndpoint::Proxy
-            } else if std::ptr::eq(e as *const _ as *const (), &router.bypass as *const _ as *const ()) {
+            } else if std::ptr::eq(
+                e as *const _ as *const (),
+                router.bypass.as_ref() as *const _ as *const (),
+            ) {
                 ExpectedEndpoint::Bypass
             } else {
                 panic!("resolve_endpoint returned an unknown &dyn Endpoint")
@@ -134,9 +138,15 @@ fn classify(d: Dispatch<'_>, router: &HoleRouter) -> ExpectedEndpoint {
 fn classify_with_dns(d: Dispatch<'_>, router: &HoleRouter) -> DnsExpectedEndpoint {
     match d {
         Dispatch::Endpoint(e) => {
-            if std::ptr::eq(e as *const _ as *const (), &router.proxy as *const _ as *const ()) {
+            if std::ptr::eq(
+                e as *const _ as *const (),
+                router.proxy.as_ref() as *const _ as *const (),
+            ) {
                 DnsExpectedEndpoint::Proxy
-            } else if std::ptr::eq(e as *const _ as *const (), &router.bypass as *const _ as *const ()) {
+            } else if std::ptr::eq(
+                e as *const _ as *const (),
+                router.bypass.as_ref() as *const _ as *const (),
+            ) {
                 DnsExpectedEndpoint::Bypass
             } else {
                 DnsExpectedEndpoint::LocalDns
@@ -165,10 +175,10 @@ fn sample_dns_cfg() -> DnsConfig {
 fn router_with_local_dns(proxy_udp: bool, bypass_v6: bool) -> HoleRouter {
     let proxy = Socks5Endpoint::new(v4("127.0.0.1", 1080), Some("test-plugin".into()), proxy_udp);
     let bypass = InterfaceEndpoint::new(1, bypass_v6);
-    let block = BlockEndpoint::new();
+    let drops = LoggingDropSink::new();
     let fwd = Arc::new(DnsForwarder::new(sample_dns_cfg(), Arc::new(DirectConnector), true));
     let local_dns = LocalDnsEndpoint::new(fwd);
-    HoleRouter::with_local_dns(proxy, bypass, block, Some(local_dns), RuleSet::default())
+    HoleRouter::with_local_dns(proxy, bypass, drops, Some(local_dns), RuleSet::default())
 }
 
 #[skuld::test]
@@ -356,32 +366,72 @@ fn udp_non53_not_intercepted_by_local_dns() {
     assert_eq!(got, DnsExpectedEndpoint::Proxy);
 }
 
-// BlockEndpoint log-methods — rate-limit and one-shot behavior ========================================================
+// LoggingDropSink — rate-limit and one-shot behavior ==================================================================
+//
+// Both limits are observable only as log lines, so both tests capture a
+// subscriber and count. Anything less passes with the limit removed.
 
-#[skuld::test]
-fn ipv6_bypass_unreachable_warn_is_one_shot() {
-    // Simply smoke-check the one-shot flag — we can call twice and see
-    // the AtomicBool transition, then the subsequent call finds it already
-    // set. Logging is side-effect-free for the test (tracing is not
-    // subscribed).
-    let block = BlockEndpoint::new();
-    let dst = v6("2001:db8::1", 443);
-    block.log_ipv6_bypass_unreachable(0, dst, "tcp");
-    block.log_ipv6_bypass_unreachable(0, dst, "tcp"); // second call — one-shot warn no-ops
+/// Collect every event at or above `level`. Bind the guard — it uninstalls
+/// the subscriber on drop, and a `_` binding drops it immediately.
+fn capture(level: LevelFilter) -> (VecWriter, tracing::subscriber::DefaultGuard) {
+    let writer = VecWriter::new();
+    let subscriber = tracing_subscriber::registry().with(
+        fmt::layer()
+            .with_writer(writer.clone())
+            .with_ansi(false)
+            .with_filter(level),
+    );
+    (writer, set_default_in_current_thread(subscriber))
 }
 
 #[skuld::test]
-fn block_endpoint_rate_limits_rule_block_logs() {
-    // Per-flow dedup: BlockLog's `should_log(rule_index, dst)` suppresses
-    // duplicate calls within its TTL window.
-    let block = BlockEndpoint::new();
+fn ipv6_bypass_unreachable_warn_is_one_shot() {
+    let (log, _guard) = capture(LevelFilter::WARN);
+    let drops = LoggingDropSink::new();
+
+    drops.ipv6_bypass_unreachable(0, v6("2001:db8::1", 443), "tcp");
+    // A different (rule_index, dst), so BlockLog's per-flow dedup is not
+    // what holds the second warn back — only the one-shot flag can be.
+    drops.ipv6_bypass_unreachable(1, v6("2001:db8::2", 443), "udp");
+
+    let log = log.snapshot_string();
+    assert_eq!(
+        log.matches("upstream interface has no IPv6 connectivity").count(),
+        1,
+        "the interface-level warn describes the NIC, not a flow, so it fires once:\n{log}"
+    );
+}
+
+#[skuld::test]
+fn logging_drop_sink_rate_limits_rule_block_logs() {
+    // One BlockLog window, keyed on (rule_index, dst), covers all three
+    // reasons — so a repeat of any of them under the same key is silent.
+    let (log, _guard) = capture(LevelFilter::DEBUG);
+    let drops = LoggingDropSink::new();
     let dst = v4("1.2.3.4", 80);
-    // First N calls for the same key cost nothing to emit (at most one log
-    // line). This is a smoke check; tracing capture is not wired in the
-    // test harness.
+
     for _ in 0..8 {
-        block.log_rule_block_tcp(7, dst, Some("example.com"));
+        drops.rule_block_tcp(7, dst, Some("example.com"));
     }
-    block.log_rule_block_udp(7, dst);
-    block.log_udp_proxy_unavailable(7, dst, Some("v2ray-plugin"));
+    drops.rule_block_udp(7, dst);
+    drops.udp_proxy_unavailable(7, dst, Some("v2ray-plugin"));
+    // A different rule index is a different key, so this one still lands.
+    drops.rule_block_udp(8, dst);
+
+    let log = log.snapshot_string();
+    assert_eq!(
+        log.matches("blocked example.com").count(),
+        1,
+        "eight identical blocks, one line:\n{log}"
+    );
+    assert_eq!(
+        log.matches("UDP proxy unavailable").count(),
+        0,
+        "the privacy drop shares rule 7's window:\n{log}"
+    );
+    assert_eq!(
+        log.matches("blocked UDP flow").count(),
+        1,
+        "rule 7 suppressed, rule 8 logged:\n{log}"
+    );
 }

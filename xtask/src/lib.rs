@@ -28,11 +28,13 @@ pub mod finish_vendor_bump;
 pub mod galoshes;
 pub mod gen_ui_constants;
 pub mod git_util;
+pub mod global_net_state_conformance;
 pub mod golangci_lint;
 pub mod interrupt;
 pub mod manifest;
 pub mod orchestrate;
 pub mod pull_subrepo;
+pub mod skuld_label_coverage;
 pub mod stage;
 pub mod target;
 pub mod tauri_pairs;
@@ -78,6 +80,9 @@ mod gen_ui_constants_tests;
 #[path = "git_util_tests.rs"]
 mod git_util_tests;
 #[cfg(test)]
+#[path = "global_net_state_conformance_tests.rs"]
+mod global_net_state_conformance_tests;
+#[cfg(test)]
 #[path = "manifest_tests.rs"]
 mod manifest_tests;
 #[cfg(test)]
@@ -86,6 +91,9 @@ mod orchestrate_tests;
 #[cfg(test)]
 #[path = "pull_subrepo_tests.rs"]
 mod pull_subrepo_tests;
+#[cfg(test)]
+#[path = "skuld_label_coverage_tests.rs"]
+mod skuld_label_coverage_tests;
 #[cfg(test)]
 #[path = "stage_tests.rs"]
 mod stage_tests;
@@ -317,6 +325,25 @@ pub enum Command {
     /// single source (`xtask_lib::asset`) is shared with the updater so the
     /// publish name and the download name cannot drift.
     AssetSuffix,
+    /// Verify that a ci.yaml job's complementary `SKULD_LABELS` step pair
+    /// (`"!tun"` / `"tun"`) parses as exact complements and that each side
+    /// still selects something — see `xtask::skuld_label_coverage`.
+    VerifySkuldLabelCoverage {
+        /// ci.yaml job id to check (its steps must include exactly one
+        /// complementary `SKULD_LABELS` pair).
+        #[arg(long, default_value = "test-hole")]
+        job: String,
+    },
+    /// Verify that `.config/nextest.toml`'s `global_net_state` test-group
+    /// name-substring filter and the `global_net_state` skuld label select
+    /// the exact same live tests, and that the group's `max-threads` is
+    /// still `1` — see `xtask::global_net_state_conformance` (bindreams/hole#894).
+    VerifyGlobalNetStateLabels {
+        /// ci.yaml job id to check (its steps must include exactly one
+        /// test-running nextest command shape).
+        #[arg(long, default_value = "test-hole")]
+        job: String,
+    },
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum, PartialEq, Eq)]
@@ -397,6 +424,8 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             println!("{}", xtask_lib::asset::host_update_asset_suffix());
             Ok(())
         }
+        Command::VerifySkuldLabelCoverage { job } => skuld_label_coverage::verify(&repo_root()?, &job),
+        Command::VerifyGlobalNetStateLabels { job } => global_net_state_conformance::verify(&repo_root()?, &job),
     }
 }
 

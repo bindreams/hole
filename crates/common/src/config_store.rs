@@ -86,6 +86,11 @@ impl ConfigStore {
             }
         }
 
+        // Config load is the first site in any process that holds a server
+        // address, so arming here precedes every log line that could carry
+        // one — including the recovery `error!` above's successors.
+        crate::logging::redact_arm::arm_config(&config);
+
         let save_blocked = matches!(&recovery, Some(r) if r.backup.is_err());
         (Self { path, save_blocked }, config, recovery)
     }

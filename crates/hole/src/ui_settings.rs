@@ -71,7 +71,7 @@ impl UiSettings {
                 Some(ui) => ServerEntry {
                     id: c.id.clone(),
                     name: ui.name.clone(),
-                    server: ui.server.clone(),
+                    server: ui.server.clone().into(),
                     server_port: ui.server_port,
                     method: ui.method.clone(),
                     password: ui.password.clone(),
