@@ -34,9 +34,9 @@
 //! probe sent AFTER the drop — and confirmed to arrive — proves the earlier
 //! probes' fate was already sealed. No sleeps, no poll-until-true.
 //!
-//! `serial = TUN` (reusing `lockdown_privileged_tests`'s label — a second
-//! `#[skuld::label] const TUN` in this binary would mint a DIFFERENT serial
-//! token and race the very cover tests this must exclude) plus the
+//! `serial = TUN` (the crate-root label — a second `#[skuld::label] const
+//! TUN` in this binary would mint a DIFFERENT serial token and race the very
+//! cover tests this must exclude) plus the
 //! `global-net-state` nextest test-group serialize this across the whole
 //! elevated lane; see `.config/nextest.toml`.
 //!
@@ -74,9 +74,9 @@ use std::time::Duration;
 #[cfg(target_os = "macos")]
 use tun::AbstractDevice;
 
-use super::lockdown_privileged_tests::TUN;
 use super::{engage_lockdown, SystemLuidResolver};
 use crate::test_utils::{classify, EscapeGuard, OwnedRoute, RecordSpec};
+use crate::TUN;
 
 // Constants ===========================================================================================================
 
@@ -641,7 +641,7 @@ fn windows_unknown_alias_pin(state_dir: &Path) {
 }
 
 /// Windows: see the module doc for the four-phase shape and the anti-vacuity
-/// argument. `serial = TUN` (reusing `lockdown_privileged_tests`'s label) +
+/// argument. `serial = TUN` (the crate-root label) +
 /// the `global-net-state` test-group serialize this across the elevated lane.
 #[cfg(target_os = "windows")]
 #[skuld::test(labels = [TUN], serial = TUN)]

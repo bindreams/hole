@@ -1280,10 +1280,18 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
     ///   against cancel in a `biased` `select!` (cancel checked first on
     ///   every poll) and drops the in-flight walk on cancel rather than
     ///   waiting for it.
-    /// - **Phases 5–6 (Dispatcher::new, routing.install)**: sync; cancel
-    ///   observed at phase boundary only (`if cancel.is_cancelled()`).
-    ///   These calls are millisecond-scale; mid-call preemption isn't
-    ///   needed.
+    /// - **Phase 5 (Dispatcher::new)**: cooperative — the token is threaded
+    ///   in, and the device build runs on `spawn_blocking` raced against it
+    ///   in a `biased` `select!`. It is no longer millisecond-scale: the
+    ///   build waits for the TUN interface's IPv6 half to appear, and on a
+    ///   covered start a Cancel the phase could not observe would extend the
+    ///   window during which the host is fail-closed. On cancel the blocking
+    ///   task finishes and drops its own `Device`; nothing is
+    ///   future-drop-cancelled.
+    /// - **Phase 6 (routing.install)**: sync; cancel observed at the phase
+    ///   boundary only (`if cancel.is_cancelled()`). Mid-call preemption
+    ///   isn't structurally possible — the netsh/route shell-outs are
+    ///   uninterruptible from our process.
     /// - **Phase 7 (dns.apply)**: cooperative — the token is threaded
     ///   into [`Dns::apply`], which observes cancel between per-adapter
     ///   FFIs. A cancel arriving mid-apply triggers an inline-restore
@@ -1644,25 +1652,28 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
             }
         }
 
-        // Phase 5: cancel checkpoint before Dispatcher::new (sync, cannot
-        // be preempted mid-call once entered).
+        // Phase 5: cancel checkpoint before Dispatcher::new, which then
+        // observes the token cooperatively while the device is built.
         if cancel.is_cancelled() {
             return Err(ProxyError::Cancelled);
         }
         // Start the dispatcher (owns TUN device + smoltcp). Skipped
         // under #[cfg(test)] because creating a TUN requires elevation.
         #[cfg(not(test))]
-        let dispatcher = {
-            let d = crate::dispatcher::Dispatcher::new(
-                socks5_port,
-                gw_info.interface_index,
-                gw_info.ipv6_available,
-                config.server.plugin.clone(),
-                udp_proxy_available,
-                ruleset,
-                local_dns_endpoint,
-            )?;
-            Some(d)
+        let dispatcher = match crate::dispatcher::Dispatcher::new(
+            socks5_port,
+            gw_info.interface_index,
+            gw_info.ipv6_available,
+            config.server.plugin.clone(),
+            udp_proxy_available,
+            ruleset,
+            local_dns_endpoint,
+            &cancel,
+        )
+        .await?
+        {
+            Some(d) => Some(d),
+            None => return Err(ProxyError::Cancelled),
         };
         #[cfg(test)]
         let dispatcher: Option<crate::dispatcher::Dispatcher> = {
@@ -1670,6 +1681,13 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
             let _ = local_dns_endpoint;
             None
         };
+
+        // The TUN's IPv6 verdict, read here because `Engine::build` has
+        // already consumed the device by now. `Ipv6StackAbsent` is the second
+        // operand of the route-install fatality rule: the IPv6 route adds are
+        // non-fatal when the upstream has no IPv6 OR the TUN interface has no
+        // IPv6 half.
+        let tun_ipv6 = dispatcher.as_ref().and_then(|d| d.ipv6_assigned());
 
         // Phase 6: cancel checkpoint before routing.install (sync; mid-
         // call preemption isn't structurally possible — netsh/route
@@ -1679,6 +1697,11 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         }
         // Install the routes — NOW traffic starts flowing to the TUN.
         let routes = routing.install(TUN_DEVICE_NAME, server_ip, gw_info.gateway_ip, &gw_info.interface_name)?;
+        info!(
+            ?tun_ipv6,
+            ipv6_upstream = gw_info.ipv6_available,
+            "TUN routes installed"
+        );
 
         // Standing lockdown cover (#527). Engaged only when intent is on; when
         // off this whole block is a no-op and the start is byte-identical to

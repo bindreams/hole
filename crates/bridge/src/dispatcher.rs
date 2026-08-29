@@ -12,12 +12,16 @@ use std::sync::Arc;
 use tokio::task::{AbortHandle, JoinHandle};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
-use tun_engine::{Device, Engine, MutDeviceConfig};
+use tun_engine::{Assigned, Device, Engine, MutDeviceConfig};
 
 use crate::endpoint::{BlockEndpoint, InterfaceEndpoint, LocalDnsEndpoint, Socks5Endpoint};
 use crate::filter::rules::RuleSet;
 use crate::hole_router::HoleRouter;
-use crate::proxy::{TUN_DEVICE_NAME, TUN_SUBNET};
+use crate::proxy::{TUN_DEVICE_NAME, TUN_SUBNET, TUN_SUBNET6};
+
+#[cfg(test)]
+#[path = "dispatcher_tests.rs"]
+mod dispatcher_tests;
 
 /// The main dispatcher — owns the TUN device (via the engine driver)
 /// and coordinates per-connection filter decisions (via `HoleRouter`).
@@ -28,6 +32,7 @@ pub struct Dispatcher {
     /// aborts via `driver_abort` as a safety net.
     driver_handle: Option<JoinHandle<()>>,
     driver_abort: AbortHandle,
+    ipv6_assigned: Option<Assigned>,
 }
 
 impl Dispatcher {
@@ -47,7 +52,13 @@ impl Dispatcher {
     /// - `local_dns_endpoint`: optional in-tunnel DNS interceptor. When
     ///   `Some`, the router diverts UDP/53 flows to it. Callers pass
     ///   `Some` whenever DNS is enabled (and not SocksOnly mode).
-    pub fn new(
+    /// - `cancel`: the start's cancel token. `Ok(None)` means it fired while
+    ///   the device was being built; the half-built device is dropped on the
+    ///   blocking thread that owns it, releasing the adapter.
+    // Every parameter is an independent start-time input; bundling them into a
+    // struct adds more noise than the warning.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn new(
         local_port: u16,
         iface_index: u32,
         ipv6_available: bool,
@@ -55,20 +66,34 @@ impl Dispatcher {
         plugin_supports_udp: bool,
         rules: RuleSet,
         local_dns_endpoint: Option<LocalDnsEndpoint>,
-    ) -> std::io::Result<Self> {
+        cancel: &CancellationToken,
+    ) -> std::io::Result<Option<Self>> {
         // Open the TUN device.
         let v4_cidr = TUN_SUBNET
             .parse()
             .expect("TUN_SUBNET is a hard-coded valid CIDR string");
-        let v6_cidr: smoltcp::wire::Ipv6Cidr = "fd00::ff00:1/64".parse().expect("hard-coded IPv6 CIDR is valid");
+        let v6_cidr: smoltcp::wire::Ipv6Cidr = TUN_SUBNET6
+            .parse()
+            .expect("TUN_SUBNET6 is a hard-coded valid CIDR string");
 
-        let device = Device::build(|c: &mut MutDeviceConfig| {
-            c.tun_name = TUN_DEVICE_NAME.into();
-            c.mtu = 1400;
-            c.ipv4 = Some(v4_cidr);
-            c.ipv6 = Some(v6_cidr);
+        let built = build_or_cancel(cancel, move || {
+            Device::build(|c: &mut MutDeviceConfig| {
+                c.tun_name = TUN_DEVICE_NAME.into();
+                c.mtu = 1400;
+                c.ipv4 = Some(v4_cidr);
+                c.ipv6 = Some(v6_cidr);
+            })
         })
-        .map_err(|e| std::io::Error::other(format!("failed to create TUN device: {e}")))?;
+        .await;
+        let Some(device) = built else {
+            return Ok(None);
+        };
+        let device = device.map_err(device_error_to_io)?;
+
+        // Read BEFORE `Engine::build`: that consumes the device through
+        // `Device::into_inner`, which returns only the `AsyncDevice` and the
+        // frozen config, so no later read is possible.
+        let ipv6_assigned = device.ipv6_assigned();
 
         // Build the three endpoints and the HoleRouter.
         let proxy_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), local_port);
@@ -93,8 +118,8 @@ impl Dispatcher {
         // Cancellation token drives shutdown.
         #[allow(clippy::disallowed_methods)]
         // Dispatcher owns its own subsystem cancel scope (tied to its lifecycle, not the start-cancel). See clippy.toml CancellationToken::new rule.
-        let cancel = CancellationToken::new();
-        let cancel_for_driver = cancel.clone();
+        let subsystem_cancel = CancellationToken::new();
+        let cancel_for_driver = subsystem_cancel.clone();
         let driver_handle = tokio::spawn(async move {
             engine.run(cancel_for_driver).await;
         });
@@ -102,12 +127,22 @@ impl Dispatcher {
 
         debug!("Dispatcher started (local_port={local_port}, iface_index={iface_index})");
 
-        Ok(Self {
+        Ok(Some(Self {
             router,
-            cancel,
+            cancel: subsystem_cancel,
             driver_handle: Some(driver_handle),
             driver_abort,
-        })
+            ipv6_assigned,
+        }))
+    }
+
+    /// What the OS TUN interface ended up holding for [`TUN_SUBNET6`].
+    ///
+    /// `Ipv6StackAbsent` is the second operand of the route-install fatality
+    /// rule: the IPv6 route adds are non-fatal when the upstream has no IPv6
+    /// **or** the TUN interface has no IPv6 half.
+    pub fn ipv6_assigned(&self) -> Option<Assigned> {
+        self.ipv6_assigned
     }
 
     /// Get the list of invalid (dropped) filter rules from the current ruleset.
@@ -141,6 +176,39 @@ impl Dispatcher {
 
         debug!("Dispatcher shutdown complete");
     }
+}
+
+/// Run `build` on a blocking thread, racing it against `cancel`; `None` when
+/// the cancel won.
+///
+/// The device build can block on an OS interface-appearance notification, so
+/// it must neither occupy a tokio worker nor outlive a Cancel — on a covered
+/// (auto-connect) start the user's whole host stays fail-closed for exactly
+/// that window. Nothing is future-drop-cancelled: on cancel the blocking task
+/// runs to completion and drops its own `Device` there, releasing the wintun
+/// adapter.
+async fn build_or_cancel<T, F>(cancel: &CancellationToken, build: F) -> Option<T>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    let task = tokio::task::spawn_blocking(build);
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => None,
+        // The task is never aborted, so a `JoinError` is always a panic.
+        r = task => Some(r.unwrap_or_else(|e| std::panic::resume_unwind(e.into_panic()))),
+    }
+}
+
+/// The device was created; its IPv6 address was not. A user shown the
+/// create-failed sentence looks in the wrong place.
+fn device_error_to_io(e: tun_engine::DeviceError) -> std::io::Error {
+    let what = match e {
+        tun_engine::DeviceError::Ipv6Assign { .. } => "failed to assign the TUN device's IPv6 address",
+        _ => "failed to create TUN device",
+    };
+    std::io::Error::other(format!("{what}: {e}"))
 }
 
 /// Cancel the driver and synchronously drain the spawned task so the

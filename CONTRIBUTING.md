@@ -61,6 +61,63 @@ methods.
 cascade reads the filter decision, so DNS works even on a TCP-only plugin. See
 [DNS forwarder](#dns-forwarder).
 
+### IPv6 in the tunnel
+
+IPv6 traverses the tunnel. The `::/1` + `8000::/1` split pair captures it,
+[`Socks5Endpoint`](crates/bridge/src/endpoint/socks5.rs) carries any v6
+destination, and `Ipv6BypassUnreachable` is a **bypass**-only drop — a `Proxy`
+decision on a v6 flow goes to the proxy unconditionally.
+
+`hole-tun` holds `TUN_SUBNET6` twice: on the OS interface **and** in smoltcp's
+address list. Without the OS half a host with no global IPv6 anywhere has no
+source address for the `/1` routes, and every IPv6 flow fails instead of
+tunnelling. (A dual-stack host sources from the upstream adapter, which is why
+the gap is invisible there.)
+
+The ULA's 40-bit global ID is pseudo-randomly generated per RFC 4193 §3.2.2,
+not `fd00::`. That prefix is what WireGuard examples, Docker, Proxmox and NAS
+defaults hand out, and Hole's becomes a real on-link route on `hole-tun` — a
+collision would let the tunnel swallow the user's own ULA network.
+
+**The interface's IPv6 half does not exist when the device is created.** The
+`tun` crate waits for the IPv4 half and deliberately not the IPv6 one, so
+[`device::ipv6_addr`](crates/tun-engine/src/device/ipv6_addr.rs) waits itself:
+register the `NotifyIpInterfaceChange` callback, **then** check existence with
+`GetIpInterfaceEntry`, then block. Registering first is load-bearing —
+`MibInitialNotification` only confirms registration and carries a NULL row, so
+an interface the kernel published during the `tun` crate's own AF_INET wait
+emits no later `MibAddInstance`, and a register-and-block would burn the whole
+budget and report a live IPv6 half as absent. The budget bounds "it never
+appears", which is what IPv6 being unbound on the host looks like; it is a
+failure bound on an external event, not a synchronisation delay.
+
+The address row carries `DadState = IpDadStatePreferred`, so it is never
+tentative and no interface-wide state is touched — the same field the `tun`
+crate sets for the IPv4 address on every Full-mode start.
+
+**Assignment is fatal on Windows and warn-only on macOS.** A missing route is a
+leak; a missing address is a blackhole, and Windows is where the path is
+tested. The macOS path cannot run in production until the TUN naming issue is
+fixed and its only test is an argv-shape test, so a fatal failure there would
+first execute in a user's hands; it becomes fatal once it has run green on the
+darwin TUN lane. The tolerate predicate is **not** `ipv6_available`, which
+measures upstream reachability — an independent question. Route-install
+fatality must follow the same split: **the IPv6 route adds are non-fatal when
+the upstream has no IPv6 or the TUN interface has no IPv6 half**, with
+`Dispatcher::ipv6_assigned()` as the second operand.
+
+Phase 5 of `start_inner` is cooperative because of this wait: `Dispatcher::new`
+runs `Device::build` on `spawn_blocking` raced against the start's cancel token
+in a `biased` `select!`. The phase is no longer millisecond-scale, and on a
+covered start a Cancel it could not observe would extend the window during
+which the whole host is fail-closed.
+
+The Windows path uses IP Helper FFI rather than `netsh` because `netsh interface ipv6 add address` defaults to `store=persistent`: such an address is
+written to the registry keyed by the adapter GUID, which wintun derives from
+the adapter name, so a crash would leave it waiting to be re-applied to the
+next `hole-tun`. A `CreateUnicastIpAddressEntry` address is runtime-only and
+dies with the adapter — nothing for `recover_routes` to sweep.
+
 ### TCP accept refusal
 
 The accept verdict is reached while the listener socket is still in

@@ -46,9 +46,7 @@
 //! when it could be a general outage instead.
 
 use super::*;
-
-#[skuld::label]
-pub(super) const TUN: skuld::Label;
+use crate::TUN;
 
 // Two routable anycast hosts on :443 (the runner has outbound internet). IP
 // literals only — the cover blocks DNS, so a hostname connect would fail for the
