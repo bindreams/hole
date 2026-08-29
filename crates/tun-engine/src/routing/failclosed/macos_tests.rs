@@ -1,6 +1,8 @@
 use super::*;
 use std::net::IpAddr;
 
+use crate::GLOBAL_NET_STATE;
+
 fn v4() -> IpAddr {
     "203.0.113.7".parse().unwrap()
 }
@@ -133,6 +135,44 @@ fn disengage_lockdown_absent_cover_is_ok() {
     // host must succeed, not fail loud.
     let dir = tempfile::tempdir().unwrap();
     assert!(disengage_lockdown(dir.path()).is_ok());
+}
+
+// pfctl_stdout (non-zero exit must not read as an empty success) ======================================================
+//
+// A failed `pfctl -sr`/`-sn` used to be read via `.stdout` with no status
+// check, persisting an empty snapshot as the host's pre-lockdown policy
+// (#901's bug class, surviving in this file). `pfctl_stdout` is the fix: the
+// single place every status-bearing read goes through.
+
+fn exit_output(code: i32, stdout: &str, stderr: &str) -> std::process::Output {
+    use std::os::unix::process::ExitStatusExt;
+    std::process::Output {
+        status: std::process::ExitStatus::from_raw(if code == 0 { 0 } else { code << 8 }),
+        stdout: stdout.as_bytes().to_vec(),
+        stderr: stderr.as_bytes().to_vec(),
+    }
+}
+
+#[skuld::test]
+fn pfctl_stdout_returns_stdout_on_success() {
+    let out = pfctl_stdout(Ok(exit_output(0, "block out all\n", "")), "pfctl -sr");
+    assert_eq!(out.unwrap(), "block out all\n");
+}
+
+#[skuld::test]
+fn pfctl_stdout_errs_on_nonzero_exit() {
+    let err = pfctl_stdout(Ok(exit_output(1, "", "pfctl: permission denied\n")), "pfctl -sr").unwrap_err();
+    let rendered = err.to_string();
+    assert!(rendered.contains("pfctl -sr"), "got {rendered}");
+    assert!(rendered.contains("permission denied"), "got {rendered}");
+}
+
+#[skuld::test]
+fn pfctl_stdout_does_not_surface_stdout_text_from_a_failed_run() {
+    // The regression this guards: a non-zero exit must never be read as if it
+    // were a (possibly empty) successful snapshot.
+    let out = pfctl_stdout(Ok(exit_output(1, "stale snapshot text", "")), "pfctl -sn");
+    assert!(out.is_err(), "a failed pfctl run must not report Ok, got {out:?}");
 }
 
 // engage_pf_action (idempotent-enable decision) =======================================================================
@@ -381,7 +421,7 @@ fn output_with_status(code: i32) -> Result<std::process::Output, RoutingError> {
     })
 }
 
-#[skuld::test]
+#[skuld::test(labels = [GLOBAL_NET_STATE])]
 fn release_all_restore_confirmed_requires_a_successful_exit_status() {
     // adopting=true short-circuits to true regardless of `out` — nothing was
     // attempted, so nothing can have failed to confirm.
@@ -476,7 +516,7 @@ fn standing_state() -> lockdown_state::LockdownPfState {
     }
 }
 
-#[skuld::test]
+#[skuld::test(labels = [GLOBAL_NET_STATE])]
 fn release_all_attempts_the_standing_cover_after_a_transient_failure() {
     // The short-circuit that would strand the standing cover — the cover that
     // blocks indefinitely — must not exist.
@@ -497,7 +537,7 @@ fn release_all_attempts_the_standing_cover_after_a_transient_failure() {
     assert!(result.is_err());
 }
 
-#[skuld::test]
+#[skuld::test(labels = [GLOBAL_NET_STATE])]
 fn release_all_keeps_the_transient_state_file_when_the_restore_fails() {
     // Erasing the cover's only record here would make the NEXT call return Ok
     // over a still-blocked host — a permanent lockout.
@@ -513,7 +553,7 @@ fn release_all_keeps_the_transient_state_file_when_the_restore_fails() {
     );
 }
 
-#[skuld::test]
+#[skuld::test(labels = [GLOBAL_NET_STATE])]
 fn release_all_keeps_the_standing_state_file_when_restore_and_fallback_both_fail() {
     let mut ops = RecordingPfOps {
         fail_load_ruleset: true,
@@ -529,7 +569,7 @@ fn release_all_keeps_the_standing_state_file_when_restore_and_fallback_both_fail
     assert!(result.is_err());
 }
 
-#[skuld::test]
+#[skuld::test(labels = [GLOBAL_NET_STATE])]
 fn release_all_falls_back_to_the_default_ruleset_when_the_snapshot_will_not_load() {
     let mut ops = RecordingPfOps {
         fail_load_ruleset: true,
@@ -544,7 +584,7 @@ fn release_all_falls_back_to_the_default_ruleset_when_the_snapshot_will_not_load
     );
 }
 
-#[skuld::test]
+#[skuld::test(labels = [GLOBAL_NET_STATE])]
 fn release_all_treats_an_unusable_state_file_as_a_cover_to_clear() {
     // A corrupt or version-skewed file must never be read as "nothing to clear".
     let mut ops = RecordingPfOps::default();
@@ -556,7 +596,7 @@ fn release_all_treats_an_unusable_state_file_as_a_cover_to_clear() {
     );
 }
 
-#[skuld::test]
+#[skuld::test(labels = [GLOBAL_NET_STATE])]
 fn release_all_touches_nothing_when_both_state_files_are_absent() {
     // A blanket /etc/pf.conf reload here would destroy a healthy host's live
     // third-party ruleset.
@@ -566,7 +606,7 @@ fn release_all_touches_nothing_when_both_state_files_are_absent() {
     assert!(result.is_ok());
 }
 
-#[skuld::test]
+#[skuld::test(labels = [GLOBAL_NET_STATE])]
 fn release_all_treats_an_unusable_transient_state_file_as_a_cover_to_clear() {
     // The transient-side Unusable arm is separately coded (its own warn!
     // wording about a leaked pf enable refcount, and it unconditionally
@@ -587,7 +627,7 @@ fn release_all_treats_an_unusable_transient_state_file_as_a_cover_to_clear() {
     assert!(result.is_ok());
 }
 
-#[skuld::test]
+#[skuld::test(labels = [GLOBAL_NET_STATE])]
 fn release_all_clears_both_covers_end_to_end_on_a_clean_run() {
     // The most common real case release_all exists to handle — both covers
     // stranded, nothing fails — asserted at the sequencer level (not just the
@@ -614,7 +654,7 @@ fn release_all_clears_both_covers_end_to_end_on_a_clean_run() {
     );
 }
 
-#[skuld::test]
+#[skuld::test(labels = [GLOBAL_NET_STATE])]
 fn release_all_logs_a_swallowed_transient_clear_failure_but_still_reports_ok() {
     // clear_transient/clear_standing are best-effort (contract item 5): a
     // failure there must not fail the call, but it also must not vanish
@@ -635,7 +675,7 @@ fn release_all_logs_a_swallowed_transient_clear_failure_but_still_reports_ok() {
     );
 }
 
-#[skuld::test]
+#[skuld::test(labels = [GLOBAL_NET_STATE])]
 fn release_all_logs_a_swallowed_standing_clear_failure_but_still_reports_ok() {
     let mut ops = RecordingPfOps {
         fail_clear_standing: true,

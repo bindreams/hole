@@ -503,7 +503,7 @@ fn e2e_socks_only_leaves_unowned_destination_unreachable(
 // TUN matrix (Windows admin only) =====================================================================================
 
 /// COUPLED NAMES: every test in here must be named `e2e_…full_tunnel…`.
-/// `.config/nextest.toml`'s `global-net-state` filter selects them by that
+/// `.config/nextest.toml`'s `global_net_state` filter selects them by that
 /// shape — skuld gives libtest the bare function name, so there is no module
 /// path to anchor on.
 ///
@@ -595,8 +595,8 @@ mod tun {
     ///
     /// Serial because every TUN test binds the hardcoded `hole-tun` device
     /// name. Cross-binary thread budget comes from `.config/nextest.toml`'s
-    /// `global-net-state` group — see the note on this module.
-    #[skuld::test(labels = [DIST_BIN, TUN], serial = TUN)]
+    /// `global_net_state` group — see the note on this module.
+    #[skuld::test(labels = [DIST_BIN, TUN, GLOBAL_NET_STATE], serial = TUN)]
     fn e2e_none_full_tunnel_local_networking_intact(
         #[fixture(dist_dir)] dist: &Path,
         #[fixture(ssserver_none)] ss: &SsServerHandle,
@@ -614,7 +614,7 @@ mod tun {
     /// loopback-bound server would leave a `127.0.0.1/32 → gateway` route
     /// behind, hijacking all loopback and black-holing this test's
     /// galoshes-server readiness self-probe.
-    #[skuld::test(labels = [DIST_BIN, PORT_ALLOC, TUN], serial = TUN)]
+    #[skuld::test(labels = [DIST_BIN, PORT_ALLOC, TUN, GLOBAL_NET_STATE], serial = TUN)]
     fn e2e_ws_full_tunnel_local_networking_intact(
         #[fixture(dist_dir)] dist: &Path,
         #[fixture(ssserver_ws)] ss: &SsServerHandle,
@@ -630,7 +630,7 @@ mod tun {
     /// Falsified from the other side by
     /// [`super::e2e_socks_only_leaves_unowned_destination_unreachable`],
     /// which runs the same helper with `SocksOnly` and requires darkness.
-    #[skuld::test(labels = [DIST_BIN, TUN], serial = TUN)]
+    #[skuld::test(labels = [DIST_BIN, TUN, GLOBAL_NET_STATE], serial = TUN)]
     fn e2e_none_full_tunnel_captures_unowned_destination(
         #[fixture(dist_dir)] dist: &Path,
         #[fixture(ssserver_none)] ss: &SsServerHandle,
@@ -642,7 +642,7 @@ mod tun {
     ///
     /// This runs after its `_none_` sibling, for the same loopback-bypass
     /// reason documented on `e2e_ws_full_tunnel_local_networking_intact`.
-    #[skuld::test(labels = [DIST_BIN, PORT_ALLOC, TUN], serial = TUN)]
+    #[skuld::test(labels = [DIST_BIN, PORT_ALLOC, TUN, GLOBAL_NET_STATE], serial = TUN)]
     fn e2e_ws_full_tunnel_captures_unowned_destination(
         #[fixture(dist_dir)] dist: &Path,
         #[fixture(ssserver_ws)] ss: &SsServerHandle,

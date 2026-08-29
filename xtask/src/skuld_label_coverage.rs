@@ -45,7 +45,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::process::Command;
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{anyhow, bail, ensure, Context, Result};
 use indexmap::IndexMap;
 use serde::Deserialize;
 use skuld::LabelFilter;
@@ -199,7 +199,7 @@ fn is_launcher_token(tok: &str) -> bool {
 /// archive lanes' `cargo-nextest nextest run --archive-file ...`, which has no
 /// `cargo` token at all. The program is whatever token precedes `nextest`,
 /// unless that is itself a launcher token — then nextest is invoked directly.
-fn to_list_command(cmd: &str) -> Result<Vec<String>> {
+pub(crate) fn to_list_command(cmd: &str) -> Result<Vec<String>> {
     let toks = shell_tokenize(cmd);
     let nextest_idx = toks
         .windows(2)
@@ -401,9 +401,20 @@ pub(crate) fn stranded_tests(
     out
 }
 
+// Guard 1: TUN-lane non-emptiness (bindreams/hole#894) ================================================================
+
+/// `true` iff at least one binary's set in `on` is non-empty — i.e. at least
+/// one test, anywhere, was selected under the `on` side's `SKULD_LABELS`
+/// value on this leg. `false` for an entirely-empty map or one whose every
+/// binary maps to an empty set: the platform's whole privileged lane has
+/// gone empty (bindreams/hole#894, #865 audit finding 3).
+pub(crate) fn on_side_is_nonempty(on: &BTreeMap<String, BTreeSet<String>>) -> bool {
+    on.values().any(|names| !names.is_empty())
+}
+
 // Runtime driver ======================================================================================================
 
-fn run_nextest_list(
+pub(crate) fn run_nextest_list(
     repo_root: &Path,
     list_command: &[String],
     skuld_labels: Option<&str>,
@@ -447,6 +458,19 @@ pub fn verify(repo_root: &Path, job_id: &str) -> Result<()> {
     let baseline = run_nextest_list(repo_root, &off.list_command, None)?;
     let off_names = run_nextest_list(repo_root, &off.list_command, Some(&off.label_value))?;
     let on_names = run_nextest_list(repo_root, &on.list_command, Some(&on.label_value))?;
+
+    // Guard 1 (bindreams/hole#894): the `on` side's own listing — the
+    // platform's privileged/TUN lane — must select at least one test. An
+    // entirely-conserved-by-the-off-side result (every compiled test found
+    // by SKULD_LABELS=off) would pass the conservation check below while the
+    // TUN lane silently went empty on this platform; report that more
+    // specific, more actionable failure first.
+    ensure!(
+        on_side_is_nonempty(&on_names),
+        "SKULD_LABELS={:?} selected ZERO tests for job {job_id:?} on this leg — the tun-labeled \
+         lane has gone entirely empty on this platform (bindreams/hole#894)",
+        on.label_value
+    );
 
     for (value, side) in [(&off.label_value, &off_names), (&on.label_value, &on_names)] {
         if selects_nothing(side) {

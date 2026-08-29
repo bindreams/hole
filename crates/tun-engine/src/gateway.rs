@@ -59,16 +59,25 @@ fn platform_interface_name(iface: &default_net::Interface) -> std::io::Result<St
 
 #[cfg(target_os = "windows")]
 fn platform_interface_index(iface: &default_net::Interface) -> std::io::Result<u32> {
+    let friendly_name = iface
+        .friendly_name
+        .as_deref()
+        .ok_or_else(|| std::io::Error::other("default interface has no friendly name"))?;
+    interface_index_by_name(friendly_name)
+}
+
+/// Resolve an interface's OS index from its route-command name (Windows:
+/// friendly name/alias, e.g. `hole-tun`; macOS: BSD name, e.g. `utun7`).
+/// Shared by upstream-gateway lookup and [`tun_ipv6_available`], which needs
+/// the TUN's own index rather than the upstream one.
+#[cfg(target_os = "windows")]
+pub(crate) fn interface_index_by_name(name: &str) -> std::io::Result<u32> {
     use windows::core::HSTRING;
     use windows::Win32::Foundation::NO_ERROR;
     use windows::Win32::NetworkManagement::IpHelper::{ConvertInterfaceAliasToLuid, ConvertInterfaceLuidToIndex};
     use windows::Win32::NetworkManagement::Ndis::NET_LUID_LH;
 
-    let friendly_name = iface
-        .friendly_name
-        .as_deref()
-        .ok_or_else(|| std::io::Error::other("default interface has no friendly name"))?;
-    let alias = HSTRING::from(friendly_name);
+    let alias = HSTRING::from(name);
     let mut luid = NET_LUID_LH::default();
     let err = unsafe { ConvertInterfaceAliasToLuid(&alias, &mut luid) };
     if err != NO_ERROR {
@@ -88,36 +97,74 @@ fn platform_interface_index(iface: &default_net::Interface) -> std::io::Result<u
 
 #[cfg(target_os = "macos")]
 fn platform_interface_index(iface: &default_net::Interface) -> std::io::Result<u32> {
-    let c_name = std::ffi::CString::new(iface.name.as_str())
-        .map_err(|e| std::io::Error::other(format!("invalid interface name: {e}")))?;
+    interface_index_by_name(&iface.name)
+}
+
+/// Resolve an interface's OS index from its route-command name (Windows:
+/// friendly name/alias; macOS: BSD name, e.g. `utun7`). Shared by
+/// upstream-gateway lookup and [`tun_ipv6_available`], which needs the TUN's
+/// own index rather than the upstream one.
+#[cfg(target_os = "macos")]
+pub(crate) fn interface_index_by_name(name: &str) -> std::io::Result<u32> {
+    let c_name =
+        std::ffi::CString::new(name).map_err(|e| std::io::Error::other(format!("invalid interface name: {e}")))?;
     let idx = unsafe { libc::if_nametoindex(c_name.as_ptr()) };
     if idx == 0 {
-        return Err(std::io::Error::other(format!(
-            "if_nametoindex failed for '{}'",
-            iface.name
-        )));
+        return Err(std::io::Error::other(format!("if_nametoindex failed for '{name}'")));
     }
     Ok(idx)
 }
 
-// IPv6 availability probe =============================================================================================
+// IPv6 availability probes ============================================================================================
 
-fn probe_ipv6(interface_index: u32) -> bool {
-    let socket = match socket2::Socket::new(
+/// A fresh IPv6 UDP socket scoped to `interface_index`, or `None` if that
+/// interface has no IPv6 binding at all (e.g. `DisabledComponents`, or an EDR
+/// policy that unbinds IPv6 from the adapter) — the scoping call itself is
+/// what fails there, before any network I/O.
+fn bound_ipv6_socket(interface_index: u32) -> Option<socket2::Socket> {
+    let socket = socket2::Socket::new(
         socket2::Domain::IPV6,
         socket2::Type::DGRAM,
         Some(socket2::Protocol::UDP),
-    ) {
-        Ok(s) => s,
-        Err(_) => return false,
-    };
-    if bind_to_interface_v6(&socket, interface_index).is_err() {
+    )
+    .ok()?;
+    bind_to_interface_v6(&socket, interface_index).ok()?;
+    Some(socket)
+}
+
+/// Whether `interface_index` has an IPv6 binding, with no attempt to reach
+/// anywhere. Used where the question is "can a route command targeting this
+/// specific interface succeed", not "can this interface reach the internet"
+/// — see [`tun_ipv6_available`].
+fn probe_ipv6_bound(interface_index: u32) -> bool {
+    bound_ipv6_socket(interface_index).is_some()
+}
+
+/// Whether `interface_index` can reach a real IPv6 destination. Used for the
+/// upstream gateway, where "bound but no route to the internet" is a
+/// legitimate state — see [`GatewayInfo::ipv6_available`]'s doc.
+fn probe_ipv6(interface_index: u32) -> bool {
+    let Some(socket) = bound_ipv6_socket(interface_index) else {
         return false;
-    }
+    };
     let target: std::net::SocketAddrV6 = "[2606:4700:4700::1111]:443".parse().unwrap();
     socket
         .connect(&socket2::SockAddr::from(std::net::SocketAddr::V6(target)))
         .is_ok()
+}
+
+/// Whether the TUN device named `tun_name` has an IPv6 binding. Meant to be
+/// probed AFTER the OS creates the adapter, so it reflects the interface the
+/// IPv6 split-route commands (`SetupCommand`) actually target — unlike
+/// [`GatewayInfo::ipv6_available`], which measures the upstream interface the
+/// commands do NOT name. `false` on any resolution failure (including the
+/// adapter not existing yet): `SetupCommand::fatal` treats `false` as
+/// "tolerate this command failing", never as "skip issuing it".
+pub fn tun_ipv6_available(tun_name: &str) -> bool {
+    match interface_index_by_name(tun_name) {
+        Ok(index) => probe_ipv6_bound(index),
+        Err(_) => false,
+    }
 }
 
 #[cfg(test)]

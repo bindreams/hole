@@ -4,7 +4,7 @@
 use std::collections::BTreeSet;
 use std::fs;
 
-use crate::ci_coverage::{ci_run_packages, package_tokens};
+use crate::ci_coverage::{ci_run_commands_for_job, ci_run_packages, package_tokens};
 use crate::manifest::Manifest;
 
 fn set(items: &[&str]) -> BTreeSet<String> {
@@ -179,6 +179,43 @@ jobs:
         ci_run_packages(ci, &fixture_manifest()).unwrap(),
         set(&["direct", "bar", "bar-extra"])
     );
+}
+
+// ===== ci_run_commands_for_job =======================================================================================
+
+#[skuld::test]
+fn ci_run_commands_for_job_scopes_to_one_job() {
+    let ci = r"
+jobs:
+  one:
+    steps:
+      - run: cargo nextest run -p direct
+  two:
+    steps:
+      - run: cargo nextest run -p other
+";
+    let cmds = ci_run_commands_for_job(ci, &fixture_manifest(), "one").expect("scope to job one");
+    assert_eq!(cmds, vec!["cargo nextest run -p direct".to_string()]);
+}
+
+#[skuld::test]
+fn ci_run_commands_for_job_resolves_xtask_run_target() {
+    // `foo-tests`'s build names `foo-build-only` (a `--no-run` compile); only
+    // its `run:` command (`-p foo`) must come back.
+    let ci = r"
+jobs:
+  e2e:
+    steps:
+      - run: cargo xtask run foo-tests
+";
+    let cmds = ci_run_commands_for_job(ci, &fixture_manifest(), "e2e").expect("resolve xtask run target");
+    assert_eq!(cmds, vec!["cargo nextest run -p foo".to_string()]);
+}
+
+#[skuld::test]
+fn ci_run_commands_for_job_errors_on_unknown_job() {
+    let ci = "jobs:\n  other:\n    steps: []\n";
+    assert!(ci_run_commands_for_job(ci, &fixture_manifest(), "test-hole").is_err());
 }
 
 // ===== Structural conformance: every workspace crate runs in CI ======================================================

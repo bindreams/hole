@@ -104,9 +104,11 @@ fixed and its only test is an argv-shape test, so a fatal failure there would
 first execute in a user's hands; it becomes fatal once it has run green on the
 darwin TUN lane. The tolerate predicate is **not** `ipv6_available`, which
 measures upstream reachability — an independent question. Route-install
-fatality must follow the same split: **the IPv6 route adds are non-fatal when
-the upstream has no IPv6 or the TUN interface has no IPv6 half**, with
-`Dispatcher::ipv6_assigned()` as the second operand.
+fatality follows the same rule: **the IPv6 route adds are non-fatal exactly
+when the TUN has no IPv6 half**, measured by `gateway::tun_ipv6_available` at
+install time. Upstream reachability is not an operand — a host whose EDR
+unbinds IPv6 from new adapters has a reachable upstream and an unusable
+tunnel, and reading upstream there refuses a connection that would work.
 
 Phase 5 of `start_inner` is cooperative because of this wait: `Dispatcher::new`
 runs `Device::build` on `spawn_blocking` raced against the start's cancel token
@@ -377,6 +379,67 @@ over-reserving UDP for a TCP-only plugin costs a retry, under-reserving it for
 galoshes costs a race. `garter::chain::allocate_ports` verifies TCP only and is
 clippy-banned outside garter's own chain-internal use, which carries a per-site
 allow.
+
+### Route-command failure policy
+
+`netsh`/`route` subprocesses run through one of two phase runners in
+[routing.rs](crates/tun-engine/src/routing.rs), and which one a phase gets is a
+security decision, not a style one:
+
+- **Fatal — install only** (`run_setup_commands`, via `setup_routes`). The first
+  fatal command that does not exit zero aborts the phase and is returned as a
+  `RouteCommandError`. `SystemRouting::install` then rolls back and returns
+  `Err`, so no `SystemRoutes` guard exists. Reporting split routes that were
+  never installed is a **leak**: traffic egresses outside the tunnel while the UI
+  says "protected" (#901).
+- **Best-effort — teardown and crash recovery** (`run_cleanup_commands`, via
+  `teardown_routes` / `recover_routes`). Every command is issued; a failure
+  neither short-circuits the rest nor is returned. Stopping at the first failure
+  would strand routes and leave the user worse off than if Hole had never run.
+
+No future edit can turn stranded-route cleanup into an early return: a
+`CleanupReport` is counts, not a `Result`, so there is nothing to `?` out of.
+
+**The pairing is a compile error, not a convention.** A phase is a value of
+`FatalPhase` or `BestEffortPhase` (sealed `Phase` trait, `BEST_EFFORT` const per
+type — it also picks the log level), and each runner accepts only its own type;
+the command types differ too (`SetupCommand` vs `Vec<String>`). Wiring a
+teardown phase into the fatal runner does not compile. This replaces a
+`debug_assert` pairing check, which compiled out in release — the same
+silently-absorbed-failure class this policy exists to close.
+
+**Fatality is per command, not per phase** (`SetupCommand::fatal`). The two IPv6
+split routes are non-fatal when `gateway::tun_ipv6_available(tun_name)` is false:
+on a host whose IPv6 stack is unbound from the TUN adapter itself
+(`DisabledComponents`, or an EDR policy that unbinds IPv6 from new adapters)
+`netsh interface ipv6 add route ::/1 <tun>` cannot succeed, and such a host emits
+no IPv6 traffic to leak — aborting there would lose the whole tunnel and avoid
+nothing. Everything else, and every command when the TUN's IPv6 IS bound, stays
+fatal. The probe targets the TUN, not the upstream interface
+`GatewayInfo::ipv6_available` measures: it is the TUN's name the `::/1`/`8000::/1`
+commands carry, and `setup_routes` runs after `Dispatcher::new` has created it, so
+the adapter already exists to probe. The two commands are still *issued*, only
+their failure tolerated — the TUN is a virtual device, so a bound-but-otherwise-
+unreachable adapter still accepts the route; only a genuinely unbound TUN can
+make the add itself fail.
+
+**Accepted trade: a false start-failure is preferred to a silent leak.** No test
+exercises `setup_routes` against a real elevated `netsh`/`route` under an
+already-installed route, so it is not measured whether a healthy install can
+legitimately exit non-zero. One path could produce it: `SystemRoutes::drop`
+clears the state file even when teardown failed, and `recover_routes` only
+deletes split routes under that file's guard, so a stale route can outlive its
+record. If that ever bites, the fix is upstream — make the pre-install split
+sweep unconditional — never tolerating an "already exists" exit code here, which
+is the exists-tolerance heuristic #899/#910 forbids. Until then a hard start
+failure surfaces the stranded route instead of routing around it.
+
+`RouteCommandError`'s `Display` is PII-free by construction (program name,
+position in the phase, exit code): it reaches a GUI toast verbatim through
+`StartError::Failed`. The argv and the child's stdout/stderr go to `bridge.log`.
+
+A failed install's rollback does exactly four things — see
+`SystemRouting::install_with`'s doc comment, which is the source of truth.
 
 ### Proxy shutdown contract
 
@@ -789,7 +852,7 @@ milliseconds.
 Each platform splits a pure, unit-tested rule/spec builder (transient:
 `build_cover_spec` / `build_pf_ruleset`; lockdown: `build_lockdown_spec` /
 `build_lockdown_main_ruleset`) from the thin engage layer — mirroring
-`build_setup_commands` vs `run_commands`. Under the
+`build_setup_commands` vs the phase runners. Under the
 [#165](#bridge-test-isolation-contract) isolation contract the builders are the
 only thing unit-tested; the kernel-level engage is exercised in production and,
 for the lockdown cover, by the privileged-lane real-engage tests (#527) — both
@@ -1649,7 +1712,26 @@ Spotlight "Hole" must reveal it.
   test ([`xtask/src/ci_coverage.rs`](xtask/src/ci_coverage.rs)) fails if a
   workspace crate's tests are run by no CI job (the recurring orphaned-test
   class). A new crate must join some CI test job's package filter, or — if it has
-  no runnable tests — get an `UNTESTED_IN_CI` entry with a reason. (#526)
+  no runnable tests — get an `UNTESTED_IN_CI` entry with a reason. (#526) A
+  general per-crate-per-platform version of this guard (asserting non-zero test
+  *counts*, not just presence) was found to be undetectable at package
+  granularity — every `test-hole` package already has ungated tests on every
+  platform it runs on — and was not built (#894). In its place,
+  `skuld_label_coverage::verify` asserts the `tun` skuld label's live listing
+  for `test-hole` is non-empty on the platform running it, catching the one
+  demonstrated regression class (a platform's whole privileged/TUN lane
+  silently going empty).
+- **`global_net_state` label conformance** — `.config/nextest.toml`'s
+  `global_net_state` test-group serializes cross-binary tests that mutate
+  global OS network state via a hand-maintained name-substring filter (see that
+  file's own comment). `cargo xtask verify-global-net-state-labels`
+  (`xtask/src/global_net_state_conformance.rs`) binds that filter to the
+  `global_net_state` skuld label attached at each test's own definition site,
+  checking live that both select the exact same tests and that the group's
+  `max-threads` is still `1` (#894). It does not catch a higher-precedence
+  `[[profile.default.overrides]]` entry stealing these tests into a different
+  group, and its universe is `test-hole`'s package set even though the
+  nextest.toml filter applies workspace-wide.
 
 ## Logging & diagnostics
 

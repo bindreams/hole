@@ -270,13 +270,8 @@ impl MockRouting {
 impl Routing for MockRouting {
     type Installed = MockRoutes;
 
-    fn install(
-        &self,
-        tun_name: &str,
-        server_ip: IpAddr,
-        _gateway: IpAddr,
-        interface_name: &str,
-    ) -> Result<MockRoutes, RoutingError> {
+    fn install(&self, tun_name: &str, server_ip: IpAddr, gateway: &GatewayInfo) -> Result<MockRoutes, RoutingError> {
+        let interface_name = gateway.interface_name.as_str();
         self.state.install_calls.fetch_add(1, Ordering::SeqCst);
         *self.state.last_install_server_ip.lock().unwrap() = Some(server_ip);
 

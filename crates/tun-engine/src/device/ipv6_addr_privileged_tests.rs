@@ -15,7 +15,7 @@
 //! on missing privilege — opting out is the explicit `!tun` filter, and CI
 //! provisions the elevation.
 //!
-//! Isolation is `serial = TUN` plus `.config/nextest.toml`'s `global-net-state`
+//! Isolation is `serial = TUN` plus `.config/nextest.toml`'s `global_net_state`
 //! group, which serializes it across test binaries. The device NAME buys none
 //! of that: it is `ipv6t-hole` rather than anything under `hole-tun` only
 //! because `adapter_cleanup::remove_adapter` sweeps `hole-tun*`, so a
@@ -23,7 +23,7 @@
 //! from under it.
 //!
 //! COUPLED NAMES: the test name below contains the substring
-//! `tun_device_ipv6_`, which `.config/nextest.toml`'s `global-net-state` filter
+//! `tun_device_ipv6_`, which `.config/nextest.toml`'s `global_net_state` filter
 //! matches. Renaming it without updating that filter silently drops it from the
 //! group.
 //!
@@ -47,7 +47,7 @@ use windows::Win32::NetworkManagement::IpHelper::{
 use windows::Win32::Networking::WinSock::{IpDadStatePreferred, AF_INET6, SOCKADDR_INET};
 
 use super::{Assigned, Device, MutDeviceConfig};
-use crate::TUN;
+use crate::{GLOBAL_NET_STATE, TUN};
 
 /// Deliberately NOT `hole-tun*` — see the module doc.
 const DEVICE_NAME: &str = "ipv6t-hole";
@@ -127,7 +127,7 @@ fn source_for(dst: Ipv6Addr) -> std::io::Result<SocketAddr> {
     sock.local_addr()
 }
 
-#[skuld::test(labels = [TUN], serial = TUN)]
+#[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
 fn tun_device_ipv6_address_is_assigned_and_selectable() {
     let cidr: Ipv6Cidr = TEST_CIDR.parse().expect("TEST_CIDR is a valid IPv6 CIDR");
     let prefix = Ipv6Cidr::new(Ipv6Addr::new(0xfda6, 0x578a, 0x3ba8, 0, 0, 0, 0, 0), cidr.prefix_len());
