@@ -189,13 +189,8 @@ impl MockRouting {
 impl Routing for MockRouting {
     type Installed = MockRoutes;
 
-    fn install(
-        &self,
-        tun_name: &str,
-        server_ip: IpAddr,
-        _gateway: IpAddr,
-        interface_name: &str,
-    ) -> Result<MockRoutes, RoutingError> {
+    fn install(&self, tun_name: &str, server_ip: IpAddr, gateway: &GatewayInfo) -> Result<MockRoutes, RoutingError> {
+        let interface_name = gateway.interface_name.as_str();
         // Match SystemRouting ordering: write the state file BEFORE
         // any mutation, so tests that assert on `bridge-routes.json`
         // see the same write-then-clear lifecycle as production.

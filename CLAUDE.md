@@ -77,6 +77,11 @@ before editing; the sections linked below are the authoritative source.
 - **Native-crash observability.** The `tombstone` crate writes a signal-safe
   crash marker; the next start of the same kind sweeps it. →
   [CONTRIBUTING.md#native-crash-observability-tombstone](CONTRIBUTING.md#native-crash-observability-tombstone)
+- **Route-command failure policy.** Install is fatal, teardown/crash recovery
+  are best-effort — the type system (`FatalPhase`/`BestEffortPhase`) enforces
+  which runner a phase gets, and per-command fatality tolerates the IPv6
+  splits failing on a TUN with no IPv6 binding. →
+  [CONTRIBUTING.md#route-command-failure-policy](CONTRIBUTING.md#route-command-failure-policy)
 - **Crash-recovery sweep.** `bridge-{routes,plugins,dns}.json` + ETW sessions are
   replayed/cleaned on next startup after the IPC socket binds. →
   [CONTRIBUTING.md#crash-recovery](CONTRIBUTING.md#crash-recovery)

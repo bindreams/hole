@@ -1696,7 +1696,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
             return Err(ProxyError::Cancelled);
         }
         // Install the routes — NOW traffic starts flowing to the TUN.
-        let routes = routing.install(TUN_DEVICE_NAME, server_ip, gw_info.gateway_ip, &gw_info.interface_name)?;
+        let routes = routing.install(TUN_DEVICE_NAME, server_ip, &gw_info)?;
         info!(
             ?tun_ipv6,
             ipv6_upstream = gw_info.ipv6_available,
