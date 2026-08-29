@@ -371,6 +371,16 @@ jobs:
         shell: bash
         run: cargo xtask build hole-tests
 
+      # A SKULD_LABELS value that stops matching anything leaves its step a
+      # silent no-op: the complementary one absorbs the whole suite and both
+      # stay green. This asserts, before either runs, that the "!tun"/"tun"
+      # pair below parses as exact complements and that each side still
+      # selects at least one compiled-in test. Per-package contribution is
+      # NOT checked — see `xtask::skuld_label_coverage` for why it can't be.
+      - name: Verify SKULD_LABELS TUN/non-TUN partition
+        shell: bash
+        run: cargo xtask verify-skuld-label-coverage --job test-hole
+
       # `--no-default-features` mirrors the `hole-tests` xtask target. Without
       # it Cargo recompiles `hole` with `tauri/custom-protocol` ON (different
       # feature set → different fingerprint → fresh build), which expands

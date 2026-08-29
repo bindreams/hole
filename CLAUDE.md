@@ -33,13 +33,16 @@ before editing; the sections linked below are the authoritative source.
   *retired* rather than removed, and reaped once smoltcp clears its 4-tuple —
   including one that reverted to `Listen`, which would otherwise hijack its
   port. No socket in the stack defers an ACK, so `TimeWait` strands nothing on
-  immediate removal. A 4-tuple has one owner: a
-  re-armed listener can outrank its own connection in slot order and steal that
-  client's retransmitted SYN, so such a handshake is `Duplicate` and its socket
-  is dropped without a segment. An admitted connection carries a keep-alive plus
-  a timeout, the sanctioned bound on a client that may never speak again —
-  without it a stall in `SynReceived`/`FinWait2`/`CloseWait` holds its slot
-  forever. →
+  immediate removal. A 4-tuple has one owner: a same-tuple SYN's ISN, read off
+  the wire, tells a retransmit from a new connection reusing it (RFC 9293
+  §3.10.7.4), and a re-armed listener that outranks its own connection in slot
+  order and steals that client's retransmitted SYN is caught the same way — such
+  a handshake is `Duplicate` and its socket is dropped without a segment.
+  `Driver::settle_packet` bundles admission and retirement into one call per
+  packet so a socket mid-teardown can never intercept the next SYN. An admitted
+  connection carries a keep-alive plus a timeout, the sanctioned bound on a
+  client that may never speak again — without it a stall in
+  `SynReceived`/`FinWait2`/`CloseWait` holds its slot forever. →
   [CONTRIBUTING.md#tcp-accept-refusal](CONTRIBUTING.md#tcp-accept-refusal)
 - **DNS forwarder.** Carries DNS over the TCP tunnel for TCP-only plugins; OS
   adapter DNS is advertised the configured resolver IPs, which route into
@@ -102,6 +105,16 @@ before editing; the sections linked below are the authoritative source.
   answer, derived once from `ProxyManager`'s single `posture` field
   (`Posture::cover_holder`); no site recomputes it from session state. →
   [CONTRIBUTING.md#fail-closed-cover](CONTRIBUTING.md#fail-closed-cover)
+- **Server-address redaction.** The configured address — hostname, resolved IP,
+  every textual form — is replaced by a `<server:XXXXXXXX>` token before it
+  reaches a log, the dev console, a toast, or the support bundle. A byte-level
+  `RedactingWriter` under the **one** log-file writer (plus the three console
+  writers) provides coverage, because the default filter is a global `info` and
+  the set of crates that can write an address is not enumerable; a `Display`-less
+  `ServerAddress` newtype provides prevention. Arming is last-wins, so the
+  crash-recovery `<server:recovered>` token joins to the session token on the
+  next connect. →
+  [CONTRIBUTING.md#server-address-redaction](CONTRIBUTING.md#server-address-redaction)
 - **Logging & plugin diagnostics.** Log destinations, the WebView2/console-relay
   tee, `HOLE_BRIDGE_LOG` directives, and the plugin tap. →
   [CONTRIBUTING.md#logging--diagnostics](CONTRIBUTING.md#logging--diagnostics)
@@ -128,8 +141,19 @@ before editing; the sections linked below are the authoritative source.
   `tracing_subscriber::fmt().init()` (clippy-enforced).
   [→](CONTRIBUTING.md#test-invariants)
 - **PII redaction** — errors carrying filesystem paths or other PII must be
-  redacted before reaching a toast; the detail still lands in `gui.log`.
+  redacted before reaching any log, toast, or bundle; a path's detail still
+  lands in `gui.log`, but the server address never does.
   [→](CONTRIBUTING.md#logging--diagnostics)
+- **The server address is never logged** — no `Display` on `ServerAddress`
+  (compiler-enforced), `.expose()` is its only exit, and every `Serialize` type
+  transitively holding one needs its own `Dump` impl.
+  [→](CONTRIBUTING.md#server-address-redaction)
+
+## macOS CI is the scarce resource
+
+~9 darwin jobs per PR against a small shared pool; the Windows and Linux legs finish long
+before them. Queue depth scales with the number of concurrent branches, not their size. Land
+what is open before starting more.
 
 ## Pointers
 

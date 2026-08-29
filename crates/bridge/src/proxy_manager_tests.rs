@@ -2304,7 +2304,7 @@ mod self_test {
         let (pm, dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, lockdown);
 
         let mut cfg = test_config();
-        cfg.server.server = closed.ip().to_string();
+        cfg.server.server = closed.ip().to_string().into();
         cfg.server.server_port = closed.port();
         cfg.dns.enabled = true;
         cfg.dns.servers = vec!["127.0.0.1".parse().unwrap()];
@@ -2434,7 +2434,7 @@ mod self_test {
         let st = routing.state();
         let (pm, dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, lockdown);
         let mut cfg = test_config();
-        cfg.server.server = closed.ip().to_string();
+        cfg.server.server = closed.ip().to_string().into();
         cfg.server.server_port = closed.port();
         cfg.dns.enabled = true;
         cfg.dns.servers = vec!["127.0.0.1".parse().unwrap()];
@@ -4685,12 +4685,12 @@ mod self_test {
             pm.start(&cfg).await.unwrap();
             assert_eq!(pm.state(), ProxyState::Running, "setup must leave a live session");
 
-            let server_ip: IpAddr = cfg.server.server.parse().unwrap();
+            let server_ip: IpAddr = cfg.server.server.expose().parse().unwrap();
             let second_routing = MockRouting::new(dir.path().to_path_buf());
             let cover = second_routing.install_failclosed_cover(server_ip, None).unwrap();
             pm.posture.hold_pending(BlockedStart {
                 cover,
-                host: cfg.server.server.clone(),
+                host: cfg.server.server.expose().to_string(),
                 server_ip,
                 pin: crate::dns::ech::PinSource::NoQueryNeeded,
                 resolver_permit: None,
@@ -4712,16 +4712,48 @@ mod self_test {
                 .unwrap_err();
             assert!(pm.blocked_until_connected(), "setup must leave a pending start held");
 
-            let server_ip: IpAddr = cfg.server.server.parse().unwrap();
+            let server_ip: IpAddr = cfg.server.server.expose().parse().unwrap();
             let second_routing = MockRouting::new(dir.path().to_path_buf());
             let cover = second_routing.install_failclosed_cover(server_ip, None).unwrap();
             pm.posture.hold_pending(BlockedStart {
                 cover,
-                host: cfg.server.server.clone(),
+                host: cfg.server.server.expose().to_string(),
                 server_ip,
                 pin: crate::dns::ech::PinSource::NoQueryNeeded,
                 resolver_permit: None,
             });
         });
     }
+}
+
+// Start-diagnostic redaction ==========================================================================================
+
+/// `ProxyStartedDiag` is the richest Hole-authored line on the start path.
+/// Its shape is the guarantee: there is no field an address can occupy.
+#[skuld::test]
+fn proxy_start_diag_carries_no_address() {
+    use hole_common::logging::redact_arm::token_for;
+
+    const ENTRY_ID: &str = "8f2a1c04-0000-0000-0000-000000000000";
+    const HOSTNAME: &str = "vpn.example.invalid";
+    const ADDR: &str = "203.0.113.7";
+    let ip: std::net::IpAddr = ADDR.parse().expect("literal");
+
+    let diag = super::ProxyStartedDiag {
+        server: token_for(ENTRY_ID),
+        server_kind: hole_common::logging::redact_arm::server_kind(HOSTNAME),
+        server_family: Some(hole_common::logging::redact_arm::ip_family(ip)),
+        server_scope: Some(hole_common::logging::redact_arm::ip_scope(ip)),
+        server_port: 8388,
+        local_port: 4073,
+        tunnel_mode: "full",
+        udp_proxy_available: true,
+        ipv6_bypass_available: false,
+    };
+    let rendered = dump::dump!(&diag).to_string();
+    assert!(rendered.contains(&token_for(ENTRY_ID)), "{rendered}");
+    assert!(!rendered.contains(HOSTNAME), "{rendered}");
+    assert!(!rendered.contains(ADDR), "{rendered}");
+    assert!(rendered.contains("global"), "the scope must survive: {rendered}");
+    assert!(rendered.contains("domain"), "the kind must survive: {rendered}");
 }

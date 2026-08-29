@@ -78,3 +78,9 @@ wintun-bindings = "0.7"
 [dev-dependencies]
 skuld = { workspace = true }
 hole-test-observability = { path = "../test-observability" }
+# Recovery-path redaction tests capture tracing output through a
+# `RedactingWriter`: `WaitableWriter` (garter's `test-utils` feature) as the
+# sink, plus the mandated current-thread subscriber installer. garter does
+# not depend on tun-engine, so this is not a cycle.
+garter = { path = "../garter", features = ["test-utils"] }
+tracing-subscriber = { version = "0.3", features = ["fmt"] }

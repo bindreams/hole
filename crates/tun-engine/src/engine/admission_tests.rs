@@ -12,13 +12,7 @@ fn pending() -> Handshake {
         port: 80,
         src: "10.0.0.5:40000".parse().unwrap(),
         dst: "93.184.216.34:80".parse().unwrap(),
-    }
-}
-
-fn stale() -> Handshake {
-    Handshake::Stale {
-        handle: SocketHandle::default(),
-        port: 80,
+        supersedes: None,
     }
 }
 
@@ -27,21 +21,6 @@ fn duplicate() -> Handshake {
         handle: SocketHandle::default(),
         port: 80,
     }
-}
-
-#[skuld::test]
-fn a_stale_handshake_is_discarded() {
-    assert_eq!(decide_admission(&stale(), || Some(())), Admission::Discard);
-}
-
-#[skuld::test]
-fn a_stale_handshake_does_not_consume_a_permit() {
-    let acquired = Cell::new(false);
-    decide_admission(&stale(), || {
-        acquired.set(true);
-        Some(())
-    });
-    assert!(!acquired.get());
 }
 
 #[skuld::test]

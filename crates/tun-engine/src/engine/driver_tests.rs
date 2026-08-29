@@ -8,17 +8,19 @@
 //! driver keeps (a connection entry, a permit, a slot), never on the verdict.
 //!
 //! The stack is polled at explicit instants rather than through
-//! `poll_smoltcp`, so no assertion here depends on the wall clock.
+//! `Driver::smoltcp_now`, so no assertion here depends on the wall clock.
 
 // A driver test owns the whole cancellation chain it builds; there is no
 // caller-supplied token to propagate.
 #![allow(clippy::disallowed_methods)]
 
 use std::io;
+use std::net::SocketAddr;
 
 use smoltcp::socket::tcp;
 use smoltcp::wire::{TcpControl, TcpSeqNumber};
 use tokio::io::{Empty, Join, Sink};
+use tokio::sync::mpsc;
 
 use super::super::tcp_test_support::*;
 use super::super::udp_flow::UdpFlow;
@@ -62,10 +64,12 @@ fn driver(max_connections: usize) -> TestDriver {
 }
 
 /// Offer one client SYN to the accept dispatch, and return the verdict's
-/// effect on the wire.
+/// effect on the wire. Checksumless, like every real inbound SYN — this suite
+/// drives `Driver::settle_packet`, the real production entry point, and
+/// [`checksumless_syn`] is the shape it actually receives.
 fn offer_syn(d: &mut TestDriver, src: SocketAddr, dst: SocketAddr, isn: u32, now: i64) -> (SocketHandle, Vec<Segment>) {
     d.stack.ensure_listener(dst.port());
-    d.stack.enqueue_rx(syn(src, dst, isn));
+    d.stack.enqueue_rx(checksumless_syn(src, dst, isn));
     d.stack.poll(t(now));
     let handle = d.stack.listener(dst.port()).expect("a listener took the SYN");
 
@@ -129,28 +133,6 @@ async fn a_refused_port_still_serves_the_next_client() {
 }
 
 #[skuld::test]
-async fn a_peerless_handshake_is_discarded_without_a_packet() {
-    let mut d = driver(1);
-    d.stack.ensure_listener(dest().port());
-    d.stack.enqueue_rx(syn(client(), dest(), 1000));
-    d.stack.poll(t(0));
-
-    // The peer goes away before the verdict: smoltcp has cleared the 4-tuple
-    // and there is no address left to answer.
-    let handle = d.stack.listener(dest().port()).expect("a listener took the SYN");
-    d.stack.socket_mut(handle).abort();
-    d.stack.poll(t(1));
-    let _ = tcp_out(&mut d.stack);
-
-    d.accept_tcp_connections();
-    d.stack.poll(t(2));
-
-    assert!(tcp_out(&mut d.stack).is_empty());
-    assert!(d.connections.is_empty());
-    assert_eq!(d.conn_semaphore.available_permits(), 1, "no permit was spent");
-}
-
-#[skuld::test]
 async fn a_retransmitted_syn_buys_no_second_connection() {
     let mut d = driver(4);
     free_the_lowest_slot(&mut d);
@@ -171,6 +153,46 @@ async fn a_retransmitted_syn_buys_no_second_connection() {
     assert_eq!(d.connections.keys().copied().collect::<Vec<_>>(), vec![connection]);
     assert_eq!(d.conn_semaphore.available_permits(), permits);
     assert_eq!(d.stack.socket(connection).state(), tcp::State::SynReceived);
+}
+
+/// The correction to the steal (RFC 9293 §3.10.7.4): a second SYN on the same
+/// tuple with a *different* ISN is a new connection, not the client's own
+/// retransmit. The stale owner is torn down — its channels closed, its socket
+/// gone — and the new SYN is admitted in its place.
+#[skuld::test]
+async fn a_syn_with_a_different_isn_tears_down_the_stale_owner_and_admits_the_new_one() {
+    let mut d = driver(4);
+    free_the_lowest_slot(&mut d);
+    let (stale, _) = admit_one(&mut d, client(), dest(), 1000, 4);
+    let permits_before = d.conn_semaphore.available_permits();
+
+    // The replacement listener took the freed slot below the connection, so
+    // it is what smoltcp hands this second SYN.
+    d.stack.enqueue_rx(syn(client(), dest(), 2000));
+    d.stack.poll(t(6));
+    d.accept_tcp_connections();
+    d.stack.poll(t(7));
+
+    // Not `d.stack.holds(stale)`: `remove` frees the slot, and the fresh
+    // listener `admit` re-arms can refill it, so the slot being occupied
+    // again proves nothing about `stale`'s own socket.
+    assert_eq!(d.connections.len(), 1, "the new SYN takes the stale connection's place");
+    let new_handle = *d.connections.keys().next().unwrap();
+    assert_ne!(new_handle, stale, "a fresh socket admits the new connection");
+    assert_eq!(
+        d.conn_semaphore.available_permits(),
+        permits_before - 1,
+        "the new connection spent a fresh permit"
+    );
+    assert_eq!(d.stack.socket(new_handle).state(), tcp::State::SynReceived);
+
+    let out = tcp_out(&mut d.stack);
+    assert_eq!(out.len(), 1);
+    assert_eq!(
+        out[0].control,
+        TcpControl::Syn,
+        "the new connection is admitted, not refused"
+    );
 }
 
 // Disposal dispatch ===================================================================================================
@@ -390,4 +412,36 @@ async fn a_connection_whose_client_never_answers_is_reclaimed() {
     d.cleanup_finished_connections();
 
     assert!(!d.connections.contains_key(&handle), "the stalled connection is gone");
+}
+
+// settle_packet ordering ==============================================================================================
+
+/// The invariant behind #911's fix, proven against the call `Driver::run`
+/// actually makes — not a hand-sequenced stand-in for it. `settle_packet` is
+/// the one production entry point for a TUN packet; enqueue, both polls,
+/// admission and retirement never straddle two calls, so a socket
+/// mid-retirement can never intercept the next packet's SYN regardless of how
+/// many packets a future `run()` reads per iteration.
+///
+/// A hijacked SYN is not silent on the wire — the reverted socket kept the
+/// SYN-ACK unpaused from its earlier admission, so it answers anyway. The
+/// defect is that `take_handshakes` never sees the hijacking socket (it left
+/// `self.listeners` at its first admission), so `accept_tcp_connections` never
+/// runs for it: no `TcpConn`, no Router task, no permit — a connection that is
+/// alive on the wire and dead everywhere the driver would relay for it. That
+/// is what this test asserts on, not the wire.
+#[skuld::test]
+async fn a_reverting_rst_and_a_later_syn_never_straddle_one_settle() {
+    let mut d = driver(4);
+    let (handle, synack_seq) = admit_one(&mut d, client(), dest(), 1000, 0);
+
+    d.settle_packet(Some(&rst(client(), dest(), 1001, synack_seq)), t(2));
+    d.settle_packet(Some(&checksumless_syn(other_client(), dest(), 5000)), t(3));
+
+    assert!(!d.connections.contains_key(&handle), "the reverted connection is gone");
+    assert_eq!(
+        d.connections.len(),
+        1,
+        "the next client's SYN is admitted through the tracked accept path, not just answered on the wire"
+    );
 }

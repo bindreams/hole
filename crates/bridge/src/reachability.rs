@@ -118,6 +118,7 @@ pub(crate) fn classify_transport(
 pub async fn probe_server_reachability(
     host: &str,
     port: u16,
+    token: &str,
     plugin: Option<&str>,
     plugin_opts: Option<&str>,
     cancel: &CancellationToken,
@@ -139,7 +140,17 @@ pub async fn probe_server_reachability(
         _ = cancel.cancelled() => ReachabilityVerdict::Inconclusive,
         v = probe_inner(host, port, &transport) => v,
     };
-    debug!(host, port, ?v, "reachability probe");
+    // `host` is the DoH-resolved IP by design (see `classify_transport`), so
+    // it is logged as the entry's token plus its shape, never as itself.
+    let ip = host.parse::<std::net::IpAddr>().ok();
+    debug!(
+        server = token,
+        server_family = ip.map(hole_common::logging::redact_arm::ip_family),
+        server_scope = ip.map(hole_common::logging::redact_arm::ip_scope),
+        port,
+        ?v,
+        "reachability probe"
+    );
     v
 }
 

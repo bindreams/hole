@@ -38,6 +38,7 @@ use std::time::Instant;
 use util::port_alloc;
 
 use dump::{dump, DeriveDump};
+use hole_common::logging::redact_arm::{ip_family, ip_scope, server_kind, token_for};
 use hole_common::protocol::{ProxyConfig, TunnelMode};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
@@ -58,13 +59,19 @@ mod cover;
 use cover::CoverHolder;
 
 /// Non-secret diagnostic view of a proxy-start event — suitable for
-/// YAML-shaped logging via `dump!`. Deliberately excludes password /
-/// PSK fields; `ServerEntry` itself is not `Dump` so it cannot be
-/// dropped into a log by mistake.
+/// YAML-shaped logging via `dump!`.
+///
+/// There is no field an address can occupy. `server` is the entry's opaque
+/// token; the shape questions this repo's actual diagnoses turned on (#248,
+/// #541, #655, #770, #694) are answered by `server_kind` / `server_family` /
+/// `server_scope` instead. `server_family` and `server_scope` are `None`
+/// only where no address was resolved.
 #[derive(DeriveDump)]
 struct ProxyStartedDiag<'a> {
-    server_ip: Option<IpAddr>,
-    server_host: &'a str,
+    server: String,
+    server_kind: &'static str,
+    server_family: Option<&'static str>,
+    server_scope: Option<&'static str>,
     server_port: u16,
     local_port: u16,
     tunnel_mode: &'a str,
@@ -714,7 +721,8 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
             local_port = config.local_port,
             tunnel_mode = ?config.tunnel_mode,
             plugin = ?config.server.plugin,
-            server_host = %config.server.server,
+            server = %token_for(&config.server.id),
+            server_kind = server_kind(config.server.server.expose()),
             server_port = config.server.server_port,
             "ProxyManager::start_cancellable entered"
         );
@@ -735,7 +743,10 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         // guaranteed to land on the resolver already baked into the held cover
         // (see `BlockedStart`'s doc) — so a start for a different server must
         // release the held cover BEFORE resolving.
-        let stale = self.posture.pending().is_some_and(|b| b.host != config.server.server);
+        let stale = self
+            .posture
+            .pending()
+            .is_some_and(|b| b.host != config.server.server.expose());
         if stale {
             debug_assert!(self.posture.pending().is_some(), "stale implies a held cover");
             self.posture.take_pending();
@@ -744,7 +755,11 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
 
         // Resolve the server IP over private DoH. A same-server retry under the
         // held cover reuses the cached IP and pin.
-        let (server_ip, pin) = match self.posture.pending().filter(|b| b.host == config.server.server) {
+        let (server_ip, pin) = match self
+            .posture
+            .pending()
+            .filter(|b| b.host == config.server.server.expose())
+        {
             Some(b) => (b.server_ip, crate::dns::ech::revalidate(b.pin, &config.dns.servers)),
             None => match Self::resolve_server_ip(config, &bootstrap_querier, &cancel).await {
                 Ok(b) => (b.server_ip, b.via),
@@ -762,6 +777,13 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
                 }
             },
         };
+
+        // At the JOIN, not on `resolve_server_ip`'s success path: the
+        // held-cover reuse branch above takes `b.server_ip` and resolves
+        // nothing. Arming only the resolve path would be correct today
+        // solely because `BlockedStart` is in-memory and the registry is
+        // grow-only — an undocumented invariant one refactor from false.
+        hole_common::logging::redact_arm::arm_resolved_ip(&config.server.id, server_ip);
 
         // `ech_doh` (what ex-ray is TOLD to fetch) and `ech_resolver_permit`
         // (what THIS ATTEMPT would permit it to reach) both read the same
@@ -859,7 +881,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         let repair_fallback: Option<(Option<IpAddr>, crate::dns::ech::PinSource)> = if covered && !lockdown_on {
             self.posture
                 .pending()
-                .filter(|b| b.host == config.server.server && b.resolver_permit != ech_resolver_permit)
+                .filter(|b| b.host == config.server.server.expose() && b.resolver_permit != ech_resolver_permit)
                 .map(|b| (b.resolver_permit, b.pin))
         } else {
             None
@@ -903,7 +925,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
                     Ok(cover) => {
                         self.posture.hold_pending(BlockedStart {
                             cover,
-                            host: config.server.server.clone(),
+                            host: config.server.server.expose().to_string(),
                             server_ip,
                             pin: engaged_pin,
                             resolver_permit: ech_resolver_permit,
@@ -915,7 +937,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
                                 Ok(cover) => {
                                     self.posture.hold_pending(BlockedStart {
                                         cover,
-                                        host: config.server.server.clone(),
+                                        host: config.server.server.expose().to_string(),
                                         server_ip,
                                         pin: original_pin,
                                         resolver_permit: old_permit,
@@ -1061,8 +1083,10 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
                 self.active_config = Some(config.clone());
                 self.last_error = None;
                 let diag = ProxyStartedDiag {
-                    server_ip,
-                    server_host: &config.server.server,
+                    server: token_for(&config.server.id),
+                    server_kind: server_kind(config.server.server.expose()),
+                    server_family: server_ip.map(ip_family),
+                    server_scope: server_ip.map(ip_scope),
                     server_port: config.server.server_port,
                     local_port: config.local_port,
                     tunnel_mode: tunnel_mode_label(&config.tunnel_mode),
@@ -1105,10 +1129,19 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
             return Err(ProxyError::Cancelled);
         }
         let res = match bootstrap_querier {
-            Some(q) => crate::dns::bootstrap::resolve_via_doh_with(&config.server.server, &config.dns, q.clone()).await,
-            None => crate::dns::bootstrap::resolve_via_doh(&config.server.server, &config.dns).await,
+            Some(q) => {
+                crate::dns::bootstrap::resolve_via_doh_with(config.server.server.expose(), &config.dns, q.clone()).await
+            }
+            None => crate::dns::bootstrap::resolve_via_doh(config.server.server.expose(), &config.dns).await,
         };
-        Ok(res.inspect_err(|e| warn!(host = %config.server.server, error = %e, "DoH bootstrap resolution failed"))?)
+        Ok(res.inspect_err(|e| {
+            warn!(
+                server = %token_for(&config.server.id),
+                server_kind = server_kind(config.server.server.expose()),
+                error = %e,
+                "DoH bootstrap resolution failed"
+            )
+        })?)
     }
 
     /// Produce a [`RunningState`] without touching `self`.
@@ -1425,6 +1458,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
                 // probe must not OS-resolve the hostname (that would reopen the
                 // DNS leak this feature closes).
                 let host = server_ip.to_string();
+                let token = token_for(&config.server.id);
                 let port = config.server.server_port;
                 let plugin = config.server.plugin.clone();
                 let opts = config.server.plugin_opts.clone();
@@ -1433,8 +1467,15 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
                 // that don't await its verdict.
                 let stop = pc.clone();
                 let handle = tokio::spawn(async move {
-                    crate::reachability::probe_server_reachability(&host, port, plugin.as_deref(), opts.as_deref(), &pc)
-                        .await
+                    crate::reachability::probe_server_reachability(
+                        &host,
+                        port,
+                        &token,
+                        plugin.as_deref(),
+                        opts.as_deref(),
+                        &pc,
+                    )
+                    .await
                 });
                 (handle, stop)
             });
@@ -1878,9 +1919,14 @@ mod proxy_manager_release_tests;
 //   `ChainRunner` launcher (`plugin_e2e::ssserver`), which the `SsServerHandle`
 //   fixture keeps alive for the test's lifetime. The socks-only WS/IPv6
 //   roundtrips run on **Win+mac**; WS-TLS and QUIC are macOS-only (Windows
-//   custom-cert limit), and the full-tunnel TUN variants are Windows-only
+//   custom-cert limit), and the Full-mode `mod tun` variants are Windows-only
 //   (`mod tun` is `cfg(target_os = "windows")` and needs elevation). Broader
 //   galoshes transport coverage on Windows lives in the `plugin-e2e` crate.
+// - Within `mod tun`, only the `_captures_unowned_destination` pair proves
+//   tunnel transit. The `_local_networking_intact` pair and the listener
+//   file's UDP test dial addresses the host holds, which never reach
+//   `hole-tun`; they prove Full mode starts without breaking host-local
+//   networking.
 #[cfg(test)]
 #[path = "proxy_manager_e2e_tests.rs"]
 mod proxy_manager_e2e_tests;

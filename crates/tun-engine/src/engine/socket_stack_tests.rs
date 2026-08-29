@@ -50,24 +50,45 @@ fn one(handshakes: Vec<Handshake>) -> Handshake {
 fn kind(handshake: &Handshake) -> &'static str {
     match handshake {
         Handshake::Pending { .. } => "pending",
-        Handshake::Stale { .. } => "stale",
         Handshake::Duplicate { .. } => "duplicate",
     }
 }
 
-/// The one `Pending` handshake in `handshakes`, destructured.
+/// The one non-superseding `Pending` handshake in `handshakes`, destructured.
+/// Panics if it supersedes a stale owner — callers expecting that should use
+/// [`one_superseding_pending`] instead, which asserts the opposite.
 fn one_pending(handshakes: Vec<Handshake>) -> (SocketHandle, u16, SocketAddr, SocketAddr) {
     match one(handshakes) {
-        Handshake::Pending { handle, port, src, dst } => (handle, port, src, dst),
+        Handshake::Pending {
+            handle,
+            port,
+            src,
+            dst,
+            supersedes,
+        } => {
+            assert_eq!(
+                supersedes, None,
+                "expected a fresh handshake, not one superseding a stale owner"
+            );
+            (handle, port, src, dst)
+        }
         other => panic!("expected a pending handshake, got a {} one", kind(&other)),
     }
 }
 
-/// The one `Stale` handshake in `handshakes`, destructured.
-fn one_stale(handshakes: Vec<Handshake>) -> (SocketHandle, u16) {
+/// The one superseding `Pending` handshake in `handshakes`, destructured,
+/// including the stale owner it supersedes.
+fn one_superseding_pending(handshakes: Vec<Handshake>) -> (SocketHandle, u16, SocketAddr, SocketAddr, SocketHandle) {
     match one(handshakes) {
-        Handshake::Stale { handle, port } => (handle, port),
-        other => panic!("expected a stale handshake, got a {} one", kind(&other)),
+        Handshake::Pending {
+            handle,
+            port,
+            src,
+            dst,
+            supersedes: Some(owner),
+        } => (handle, port, src, dst, owner),
+        Handshake::Pending { supersedes: None, .. } => panic!("expected a superseding handshake, got a fresh one"),
+        other => panic!("expected a pending handshake, got a {} one", kind(&other)),
     }
 }
 
@@ -77,19 +98,6 @@ fn one_duplicate(handshakes: Vec<Handshake>) -> (SocketHandle, u16) {
         Handshake::Duplicate { handle, port } => (handle, port),
         other => panic!("expected a duplicate handshake, got a {} one", kind(&other)),
     }
-}
-
-/// Manufacture a socket that left `Listen` with no peer left to answer: a SYN,
-/// then a direct `abort()` that no driver path performs, then the poll on which
-/// smoltcp sends its RST and clears the 4-tuple. The RST is left undrained.
-fn peerless(stack: &mut SocketStack) -> SocketHandle {
-    stack.ensure_listener(80);
-    stack.enqueue_rx(syn(client(), dest(), 1000));
-    stack.poll(t(0));
-    let handle = stack.listeners[0].handle;
-    stack.socket_mut(handle).abort();
-    stack.poll(t(1));
-    handle
 }
 
 /// Drive a listener on port 80 to `SynReceived` and return its handle. The tx
@@ -166,17 +174,10 @@ fn time_wait(stack: &mut SocketStack) -> SocketHandle {
     handle
 }
 
-/// Reproduce the slot-ordering steal. `SocketSet::add` fills the lowest free
-/// slot, so the listener `admit` re-arms the port with can land *below* its own
-/// connection; smoltcp hands a packet to the first socket that `accepts()` it,
-/// and a `Listen` socket accepts a bare SYN on port alone. The client's
-/// retransmitted SYN therefore lands on the replacement listener instead of on
-/// the connection it belongs to. Returns the connection's handle.
-fn steal_a_retransmitted_syn(stack: &mut SocketStack) -> SocketHandle {
-    let isn = 1000u32;
-
-    // Occupy the lowest slot with a connection on another port, then free it:
-    // the replacement listener needs a slot below the port-80 connection.
+/// Occupy the lowest socket slot with a connection on another port, then free
+/// it: the listener `admit` re-arms `dest()` with lands *below* whatever
+/// connection a test builds next on that port.
+fn free_the_lowest_slot(stack: &mut SocketStack) {
     stack.ensure_listener(other_dest().port());
     stack.ensure_listener(dest().port());
     stack.enqueue_rx(syn(client(), other_dest(), 7000));
@@ -186,9 +187,15 @@ fn steal_a_retransmitted_syn(stack: &mut SocketStack) -> SocketHandle {
     stack.poll(t(1));
     let _ = tcp_out(stack);
     assert!(!stack.sockets.iter().any(|(h, _)| h == spare), "the low slot is free");
+}
+
+/// [`steal_a_syn`], generalized over the exact bytes of both SYNs so a test
+/// can drive the reproduction with a checksumless one.
+fn steal_a_syn_packets(stack: &mut SocketStack, first_syn: Vec<u8>, second_syn: Vec<u8>) -> SocketHandle {
+    free_the_lowest_slot(stack);
 
     // The connection this reproduction is about.
-    stack.enqueue_rx(syn(client(), dest(), isn));
+    stack.enqueue_rx(first_syn);
     stack.poll(t(2));
     let (handle, port, ..) = one_pending(stack.take_handshakes());
     stack.admit(handle, port);
@@ -204,12 +211,12 @@ fn steal_a_retransmitted_syn(stack: &mut SocketStack) -> SocketHandle {
         "the replacement listener must outrank the connection for this to reproduce",
     );
 
-    stack.enqueue_rx(syn(client(), dest(), isn));
+    stack.enqueue_rx(second_syn);
     stack.poll(t(4));
     assert_eq!(
         stack.socket(listener).state(),
         tcp::State::SynReceived,
-        "the replacement listener took the retransmitted SYN",
+        "the replacement listener took the second SYN",
     );
     assert_eq!(
         owners_of(stack, client(), dest()).len(),
@@ -217,6 +224,22 @@ fn steal_a_retransmitted_syn(stack: &mut SocketStack) -> SocketHandle {
         "two sockets now hold one client's 4-tuple",
     );
     handle
+}
+
+/// Reproduce the slot-ordering steal, then feed a second SYN — with ISN
+/// `second_isn` — onto the same tuple. `SocketSet::add` fills the lowest free
+/// slot, so the listener `admit` re-arms the port with can land *below* its own
+/// connection; smoltcp hands a packet to the first socket that `accepts()` it,
+/// and a `Listen` socket accepts a bare SYN on port alone. The second SYN
+/// therefore lands on the replacement listener instead of on the connection it
+/// would otherwise belong to. Returns the connection's handle.
+fn steal_a_syn(stack: &mut SocketStack, second_isn: u32) -> SocketHandle {
+    steal_a_syn_packets(stack, syn(client(), dest(), 1000), syn(client(), dest(), second_isn))
+}
+
+/// [`steal_a_syn`] with a genuine retransmit — the same ISN as the original.
+fn steal_a_retransmitted_syn(stack: &mut SocketStack) -> SocketHandle {
+    steal_a_syn(stack, 1000)
 }
 
 // Tests ===============================================================================================================
@@ -264,6 +287,25 @@ fn take_handshakes_is_empty_without_a_syn() {
     stack.ensure_listener(80);
     stack.poll(t(0));
     assert!(stack.take_handshakes().is_empty());
+}
+
+/// The doc's claim that `pending_syn` "can never be read stale": checked
+/// directly on the field, not inferred from a handshake's ISN, so a
+/// regression that stops clearing it fails here even when no later handshake
+/// happens to reuse the tuple.
+#[skuld::test]
+fn take_handshakes_clears_pending_syn() {
+    let mut stack = stack();
+    stack.ensure_listener(80);
+    stack.enqueue_rx(syn(client(), dest(), 1000));
+    stack.poll(t(0));
+
+    let _ = stack.take_handshakes();
+
+    assert!(
+        stack.pending_syn.is_none(),
+        "a read pending_syn must not survive to the next call"
+    );
 }
 
 #[skuld::test]
@@ -321,6 +363,22 @@ fn a_refused_socket_is_reaped_only_after_its_rst_is_sent() {
     stack.poll(t(1));
     assert_eq!(stack.sockets.iter().count(), 1);
     assert!(stack.retiring.is_empty());
+}
+
+/// The documented contract: retiring a handle twice would make the next
+/// `poll`'s reap loop call `SocketSet::remove` on an already-empty slot and
+/// panic. The `debug_assert!` in `retire` catches the violation one step
+/// earlier, in debug builds — release builds have no such guard and still hit
+/// that panic on the next `poll`.
+#[skuld::test]
+#[cfg(debug_assertions)]
+#[should_panic(expected = "handle retired twice")]
+fn retiring_a_handle_twice_panics_in_debug() {
+    let mut stack = stack();
+    let handle = half_open(&mut stack, 1000);
+
+    stack.retire(handle);
+    stack.retire(handle);
 }
 
 /// Distinguishes reaping on smoltcp's completion signal from an unconditional
@@ -400,47 +458,6 @@ fn refuse_rearms_the_listener() {
 
     let (_, port, src, dst) = one_pending(stack.take_handshakes());
     assert_eq!((port, src, dst), (80, client(), dest()));
-}
-
-#[skuld::test]
-fn a_stale_handshake_is_discarded_without_a_packet() {
-    let mut stack = stack();
-    let handle = peerless(&mut stack);
-
-    let out = tcp_out(&mut stack);
-    assert_eq!(out.len(), 1);
-    assert_eq!(out[0].control, TcpControl::Rst);
-
-    assert_eq!(one_stale(stack.take_handshakes()), (handle, 80));
-
-    stack.discard(handle, 80);
-    stack.poll(t(2));
-    assert!(tcp_out(&mut stack).is_empty());
-}
-
-#[skuld::test]
-fn a_stale_handshake_rearms_the_listener() {
-    let mut stack = stack();
-    let handle = peerless(&mut stack);
-    let _ = tcp_out(&mut stack);
-    let (_, port) = one_stale(stack.take_handshakes());
-
-    stack.discard(handle, port);
-    stack.poll(t(2));
-    let _ = tcp_out(&mut stack);
-
-    stack.enqueue_rx(syn(client(), dest(), 2000));
-    stack.poll(t(3));
-
-    let (_, port, src, dst) = one_pending(stack.take_handshakes());
-    assert_eq!((port, src, dst), (80, client(), dest()));
-}
-
-#[skuld::test]
-fn take_handshakes_classifies_a_tupleless_socket_as_stale() {
-    let mut stack = stack();
-    let handle = peerless(&mut stack);
-    assert_eq!(one_stale(stack.take_handshakes()), (handle, 80));
 }
 
 #[skuld::test]
@@ -714,6 +731,211 @@ fn a_dropped_duplicate_answers_nothing_and_leaves_its_port_armed() {
     stack.poll(t(6));
     let (_, _, src, dst) = one_pending(stack.take_handshakes());
     assert_eq!((src, dst), (other_client(), dest()));
+}
+
+/// The correction to the steal: a SYN carrying a *different* ISN on a tuple
+/// the datapath still owns is not a retransmit (RFC 9293 §3.10.7.4). It is
+/// classified `Pending` with `supersedes` naming the stale owner, not dropped
+/// as a `Duplicate`.
+#[skuld::test]
+fn a_syn_with_a_different_isn_supersedes_its_tuples_owner() {
+    let mut stack = stack();
+    let connection = steal_a_syn(&mut stack, 2000);
+
+    let (handle, port, src, dst, owner) = one_superseding_pending(stack.take_handshakes());
+
+    assert_eq!((port, src, dst), (dest().port(), client(), dest()));
+    assert_eq!(owner, connection);
+    assert_ne!(handle, connection);
+}
+
+/// Tearing down the superseded owner and admitting the new SYN leaves exactly
+/// one socket holding the tuple — the primitive composition the driver relies
+/// on when it acts on `supersedes`.
+#[skuld::test]
+fn superseding_and_removing_the_stale_owner_leaves_one_socket_on_the_tuple() {
+    let mut stack = stack();
+    let connection = steal_a_syn(&mut stack, 2000);
+    let (handle, port, ..) = one_superseding_pending(stack.take_handshakes());
+
+    stack.remove(connection);
+    stack.admit(handle, port);
+    stack.poll(t(5));
+
+    assert_eq!(owners_of(&stack, client(), dest()), vec![handle]);
+    assert_eq!(stack.socket(handle).state(), tcp::State::SynReceived);
+}
+
+/// The fourth defect: the driver's supersede teardown calls `remove` on
+/// whatever `tuple_owner` reports — which can already be sitting in
+/// `retiring` (refused, or cleaned up by a previous `settle_packet`, and not
+/// yet reaped because its peer is still live). `remove` used to leave it
+/// listed there; the next `poll`'s reap loop then calls `SocketSet::get` on a
+/// handle whose slot `remove` just freed, and smoltcp panics.
+#[skuld::test]
+fn removing_a_retiring_tuple_owner_does_not_leave_it_queued_for_reap() {
+    let mut stack = stack();
+    let connection = steal_a_syn(&mut stack, 2000);
+    let (handle, port, ..) = one_superseding_pending(stack.take_handshakes());
+
+    // The stale owner is already parked for reap when the supersede teardown
+    // removes it — the same state `refuse` or `cleanup_finished_connections`
+    // leaves a socket in before the next `poll` clears its tuple.
+    stack.retire(connection);
+    stack.remove(connection);
+
+    stack.poll(t(5)); // must not panic reaping a handle `remove` just freed
+    assert_eq!(owners_of(&stack, client(), dest()), vec![handle]);
+
+    // The new SYN admits normally, same as any other supersede.
+    stack.admit(handle, port);
+    stack.poll(t(6));
+    assert_eq!(stack.socket(handle).state(), tcp::State::SynReceived);
+}
+
+/// The defensive fallback: if this stack could not read the SYN's ISN off the
+/// wire, a same-tuple owner is never assumed superseded — the
+/// historically-safe `Duplicate` wins over guessing at a new connection.
+#[skuld::test]
+fn an_unreadable_isn_falls_back_to_duplicate_rather_than_superseding() {
+    let mut stack = stack();
+    let connection = steal_a_syn(&mut stack, 2000);
+    stack.pending_syn = None; // simulate an ISN this stack could not read off the wire
+
+    let (handle, port) = one_duplicate(stack.take_handshakes());
+
+    assert_ne!(handle, connection);
+    assert_eq!(port, dest().port());
+}
+
+/// The headline defect: `parse_syn` used to verify a checksum no real inbound
+/// SYN carries (#903), so `pending_syn` was always `None` on the production
+/// path and `owner_isn` was never populated at all. `parse_syn` reads
+/// `TcpPacket`'s raw fields directly and verifies no checksum at all, so this
+/// holds regardless of what the SYN's checksum claims.
+#[skuld::test]
+fn a_checksumless_syns_isn_is_still_captured_for_owner_isn() {
+    let mut stack = stack();
+    stack.ensure_listener(80);
+    stack.enqueue_rx(checksumless_syn(client(), dest(), 1000));
+    stack.poll(t(0));
+
+    let (handle, ..) = one_pending(stack.take_handshakes());
+
+    assert_eq!(stack.owner_isn.get(&handle), Some(&1000));
+}
+
+/// The end-to-end reproduction of the same defect: with the mechanism inert,
+/// every same-tuple SYN's ISN reads as unreadable, so the safety fallback
+/// (`an_unreadable_isn_falls_back_to_duplicate_rather_than_superseding`) fires
+/// on every one of them — a genuinely new connection is reported `Duplicate`
+/// and black-holed, never `Pending`.
+#[skuld::test]
+fn a_checksumless_first_syn_still_lets_a_later_syn_supersede_it() {
+    let mut stack = stack();
+    let connection = steal_a_syn_packets(
+        &mut stack,
+        checksumless_syn(client(), dest(), 1000),
+        checksumless_syn(client(), dest(), 2000),
+    );
+
+    let (handle, port, src, dst, owner) = one_superseding_pending(stack.take_handshakes());
+
+    assert_eq!((port, src, dst), (dest().port(), client(), dest()));
+    assert_eq!(owner, connection);
+    assert_ne!(handle, connection);
+}
+
+/// The second defect: nothing in `parse_syn` looks at the IP header's declared
+/// protocol, so a bare-SYN-shaped payload carried under ICMP (or anything
+/// else) parses as a TCP SYN — something smoltcp, which dispatches on
+/// `next_header`, would never do.
+#[skuld::test]
+fn parse_syn_rejects_a_syn_shaped_payload_under_a_non_tcp_protocol() {
+    let packet = syn_shaped_payload_under(IpProtocol::Icmp, client(), dest(), 1000);
+
+    assert!(parse_syn(&packet).is_none());
+}
+
+/// The IPv6 counterpart to the test above: the same guard exists in the IPv6
+/// branch of `parse_syn`, and every builder above this point in the file can
+/// only build IPv4, so it had no coverage at all.
+#[skuld::test]
+fn parse_syn_rejects_a_syn_shaped_payload_under_a_non_tcp_protocol_over_ipv6() {
+    let packet = syn_shaped_payload_under_v6(IpProtocol::Icmpv6, client_v6(), dest_v6(), 1000);
+
+    assert!(parse_syn(&packet).is_none());
+}
+
+/// `take_handshakes_reports_the_peer_tuple`'s IPv6 counterpart: the ordinary,
+/// non-Hop-by-Hop shape of `parse_syn`'s IPv6 branch.
+#[skuld::test]
+fn take_handshakes_reports_the_peer_tuple_over_ipv6() {
+    let mut stack = stack();
+    stack.ensure_listener(80);
+    stack.enqueue_rx(syn_v6(client_v6(), dest_v6(), 1000));
+    stack.poll(t(0));
+
+    let (_, port, src, dst) = one_pending(stack.take_handshakes());
+    assert_eq!(port, 80);
+    assert_eq!(src, client_v6());
+    assert_eq!(dst, dest_v6());
+}
+
+/// The negative-space twin of
+/// `a_checksumless_syns_isn_is_still_captured_for_owner_isn`: smoltcp's
+/// `Interface::poll` strips a Hop-by-Hop extension header before dispatching
+/// on whatever follows it (`process_hopbyhop`), so a SYN carrying one still
+/// reaches the TCP layer and creates a handshake. `parse_syn`'s IPv6 branch
+/// used to check only the fixed header's `next_header`, so it missed this
+/// entirely: the connection was admitted with no `owner_isn` entry, silently
+/// black-holing the tuple for the owner socket's whole life the moment any
+/// later SYN reused it (#913).
+#[skuld::test]
+fn syn_under_hop_by_hop() {
+    let mut stack = stack();
+    stack.ensure_listener(80);
+    stack.enqueue_rx(syn_under_hop_by_hop_v6(client_v6(), dest_v6(), 1000));
+    stack.poll(t(0));
+
+    let (handle, ..) = one_pending(stack.take_handshakes());
+
+    assert_eq!(stack.owner_isn.get(&handle), Some(&1000));
+}
+
+/// The third defect: the `Duplicate` guard's fallback is one-sided. A
+/// connection admitted from a SYN whose ISN could not be recorded has no
+/// `owner_isn` entry — and a *retransmit* of it, whose ISN this time is
+/// readable, does not match `None` and so is wrongly reported `Pending` with
+/// `supersedes`, tearing down the very connection it retransmitted for.
+#[skuld::test]
+fn a_missing_owner_isn_entry_falls_back_to_duplicate_rather_than_superseding() {
+    let mut stack = stack();
+    free_the_lowest_slot(&mut stack);
+
+    // The connection this reproduction is about — admitted from a SYN whose
+    // ISN this stack could not read off the wire.
+    stack.enqueue_rx(syn(client(), dest(), 1000));
+    stack.poll(t(2));
+    stack.pending_syn = None; // simulate an ISN this stack could not read off the wire
+    let (owner, port, ..) = one_pending(stack.take_handshakes());
+    assert!(
+        !stack.owner_isn.contains_key(&owner),
+        "the owner's ISN was never recorded"
+    );
+    stack.admit(owner, port);
+    stack.poll(t(3));
+    let _ = tcp_out(&mut stack);
+
+    // A retransmit of the same SYN — same ISN, and this time readable —
+    // lands on the replacement listener below it (the steal from
+    // `free_the_lowest_slot`), the same as any other same-tuple SYN would.
+    stack.enqueue_rx(syn(client(), dest(), 1000));
+    stack.poll(t(4));
+
+    let (handle, _) = one_duplicate(stack.take_handshakes());
+    assert_ne!(handle, owner, "the owner of the tuple is untouched");
+    assert_eq!(stack.socket(owner).state(), tcp::State::SynReceived);
 }
 
 #[skuld::test]

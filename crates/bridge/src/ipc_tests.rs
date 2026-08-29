@@ -46,6 +46,10 @@ struct MockProxy {
     /// is "spawn task A; await entered; act on the parked state."
     /// See bindreams/hole#383.
     start_entered: std::sync::Mutex<Option<oneshot::Sender<()>>>,
+    /// Message for the `fail_start` error. A plugin-chain failure can embed
+    /// the resolved server address (garter formats `remote_host` into its
+    /// chain errors), and that string reaches a GUI toast.
+    fail_message: String,
 }
 
 impl MockProxy {
@@ -55,12 +59,21 @@ impl MockProxy {
             traffic: Arc::new(MockTraffic::default()),
             start_gate: None,
             start_entered: std::sync::Mutex::new(None),
+            fail_message: "mock failure".to_string(),
         }
     }
 
     fn failing() -> Self {
         Self {
             fail_start: AtomicBool::new(true),
+            ..Self::new()
+        }
+    }
+
+    fn failing_with(message: &str) -> Self {
+        Self {
+            fail_start: AtomicBool::new(true),
+            fail_message: message.to_string(),
             ..Self::new()
         }
     }
@@ -91,7 +104,7 @@ impl Proxy for MockProxy {
             gate.notified().await;
         }
         if self.fail_start.load(Ordering::SeqCst) {
-            return Err(ProxyError::Runtime(io::Error::other("mock failure")));
+            return Err(ProxyError::Runtime(io::Error::other(self.fail_message.clone())));
         }
         // Fresh session ⇒ fresh counters (production: a new Server
         // creates a new FlowStat).
@@ -339,7 +352,7 @@ fn sample_config() -> ProxyConfig {
         server: ServerEntry {
             id: "test-id".to_string(),
             name: "Test".to_string(),
-            server: "127.0.0.1".to_string(),
+            server: "127.0.0.1".into(),
             server_port: 8388,
             method: "aes-256-gcm".to_string(),
             password: "pw".to_string(),
@@ -2324,4 +2337,141 @@ fn extraction_failure_omits_the_path() {
     // The path-bearing detail must still reach bridge.log for diagnosis.
     let log = writer.snapshot();
     assert!(log.contains("ProgramData"), "log must carry the redacted detail: {log}");
+}
+
+// Redaction arming and the IPC boundary ===============================================================================
+//
+// `203.0.113.7` is RFC 5737 documentation space and appears in no other
+// fixture. The registry is process-global and grow-only; these run under
+// `cargo nextest`, one process per test.
+
+const REDACT_ADDR: &str = "203.0.113.7";
+const REDACT_ENTRY_ID: &str = "8f2a1c04-0000-0000-0000-000000000000";
+
+/// A capture wrapped exactly as production wraps the log-file writer.
+fn redacting_capture() -> (
+    impl tracing::Subscriber + Send + Sync,
+    garter::test_utils::WaitableWriter,
+) {
+    let writer = garter::test_utils::WaitableWriter::new();
+    let sink = writer.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(move || util::redact::RedactingWriter::new(sink.clone()))
+        .with_ansi(false)
+        .with_max_level(tracing::Level::DEBUG)
+        .finish();
+    (subscriber, writer)
+}
+
+fn ipc_state(proxy: Arc<Mutex<ProxyManager<MockProxy, MockRouting>>>) -> Arc<IpcState<MockProxy, MockRouting>> {
+    let dir = tempfile::tempdir().unwrap().keep();
+    Arc::new(IpcState {
+        proxy,
+        start_cancel: Arc::new(std::sync::Mutex::new(StartCancelState::default())),
+        version: "test".to_string(),
+        log_dir: dir.clone(),
+        state_dir: dir,
+        owner: None,
+    })
+}
+
+fn redaction_config() -> ProxyConfig {
+    let mut config = sample_config();
+    config.server.id = REDACT_ENTRY_ID.to_string();
+    config.server.server = REDACT_ADDR.into();
+    config
+}
+
+/// Stands in for the open-ended set of producers the sink exists for: a
+/// dependency at the default global `info`, which no per-site edit reaches.
+fn emit_third_party_line() {
+    tracing::info!(target: "some_dependency::dialer", "creating connection to {REDACT_ADDR}:8388");
+}
+
+#[skuld::test]
+async fn start_request_arms_redaction_before_it_logs() {
+    let (subscriber, writer) = redacting_capture();
+    let token = hole_common::logging::redact_arm::token_for(REDACT_ENTRY_ID);
+    {
+        let _g = garter::tracing_test::set_default_in_current_thread(subscriber);
+        let _ = super::handle_start(
+            axum::extract::State(ipc_state(mock_proxy())),
+            axum::http::HeaderMap::new(),
+            Json(redaction_config()),
+        )
+        .await;
+        emit_third_party_line();
+    }
+
+    assert_eq!(
+        util::redact::redact_str(REDACT_ADDR),
+        token,
+        "the start handler must arm the configured address"
+    );
+    let log = writer.snapshot();
+    assert!(
+        log.contains("ProxyManager::start_cancellable entered"),
+        "the handler did not reach the start path at all: {log}"
+    );
+    assert!(!log.contains(REDACT_ADDR), "the address reached the log: {log}");
+    assert!(log.contains(&token), "the token is missing from the log: {log}");
+}
+
+#[skuld::test]
+async fn test_server_request_arms_redaction_before_it_logs() {
+    // A separate axum route with its own arming call: it would ship unarmed
+    // while `start_request_arms_redaction_before_it_logs` still passed.
+    let (subscriber, writer) = redacting_capture();
+    let token = hole_common::logging::redact_arm::token_for(REDACT_ENTRY_ID);
+    let mut entry = redaction_config().server;
+    entry.plugin = Some("definitely-not-a-real-plugin-binary".into());
+    {
+        let _g = garter::tracing_test::set_default_in_current_thread(subscriber);
+        let _ = super::handle_test_server(
+            axum::extract::State(ipc_state(mock_proxy())),
+            Json(hole_common::protocol::TestServerRequest {
+                entry,
+                dns: hole_common::config::DnsConfig::default(),
+            }),
+        )
+        .await;
+        emit_third_party_line();
+    }
+
+    assert_eq!(
+        util::redact::redact_str(REDACT_ADDR),
+        token,
+        "the test-server handler must arm the configured address"
+    );
+    let log = writer.snapshot();
+    assert!(!log.contains(REDACT_ADDR), "the address reached the log: {log}");
+}
+
+#[skuld::test]
+async fn an_outgoing_error_carrying_the_address_is_redacted() {
+    // Asserts on the **response**, not the log: `StartError::Failed`'s doc
+    // claims a PII-free message and nothing enforced it. The bridge's
+    // registry is armed by the same handler, so the claim becomes a property.
+    let token = hole_common::logging::redact_arm::token_for(REDACT_ENTRY_ID);
+    let proxy = Arc::new(Mutex::new(ProxyManager::new(
+        MockProxy::failing_with(&format!("creating connection to {REDACT_ADDR}:443 failed")),
+        MockRouting::new(tempfile::tempdir().unwrap().keep()),
+    )));
+
+    let result = super::handle_start(
+        axum::extract::State(ipc_state(proxy)),
+        axum::http::HeaderMap::new(),
+        Json(redaction_config()),
+    )
+    .await;
+
+    let Err(super::StartHandlerError::Failed(e)) = result else {
+        panic!("expected a typed start failure");
+    };
+    let wire = serde_json::to_string(&e).expect("serialize the outgoing error");
+    assert!(
+        !wire.contains(REDACT_ADDR),
+        "the toast would have carried the address: {wire}"
+    );
+    assert!(wire.contains(&token), "the outgoing error lost its token: {wire}");
 }
