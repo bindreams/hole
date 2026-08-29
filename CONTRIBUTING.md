@@ -61,6 +61,64 @@ methods.
 cascade reads the filter decision, so DNS works even on a TCP-only plugin. See
 [DNS forwarder](#dns-forwarder).
 
+### TCP accept refusal
+
+The accept verdict is reached while the listener socket is still in
+`SynReceived` with its SYN-ACK paused (smoltcp's `socket-tcp-pause-synack`), so
+a declined connection is refused with a pre-handshake RST and never with a reset
+of a connection the client believes it opened. The verdict itself is
+[`decide_admission`](crates/tun-engine/src/engine/admission.rs) — a pure
+function over the handshake plus a permit-acquiring closure — and the driver arm
+is a mechanical dispatch over its three outcomes. A socket with a packet still to
+emit is *retired* rather than removed:
+[`SocketStack::poll`](crates/tun-engine/src/engine/socket_stack.rs) reaps it
+once `remote_endpoint()` goes `None`, smoltcp's signal that it has emitted the
+socket's last packet. `decide_disposal` picks the path per state — `Closed` and
+`Listen` retire, while `TimeWait` is dropped at once, since retiring it would
+hold the socket and both its buffers for smoltcp's 10 s `CLOSE_DELAY`. A
+connection socket that reverts to `Listen` — the client answered the SYN-ACK
+with an RST — is retired through that same list, so it cannot shadow the live
+listener on its port.
+
+Retiring a socket only marks it; reaping — the `SocketSet::remove` that actually
+frees its slot — happens inside the next `poll`. A socket marked but not yet
+reaped is still live and still bound to its port, so a SYN that arrives before
+that `poll` can be handed to it instead of to the real listener, and no accept
+path is watching it (bindreams/hole#911).
+[`Driver::settle_packet`](crates/tun-engine/src/engine/driver.rs) is the one
+production entry point for a TUN packet and closes that gap structurally rather
+than by convention: enqueue, both polls, admission dispatch and retirement all
+happen inside one call, so two packets' verdicts can never straddle a `poll` no
+matter how `run()`'s TUN-read cadence changes.
+
+Ownership of a 4-tuple is exclusive, and `take_handshakes` enforces it. Re-arming
+a port hands the listener whichever socket slot is lowest and free, which can put
+it *below* the connection it was just re-armed for; smoltcp gives a packet to the
+first socket that accepts it, and a `Listen` socket accepts a bare SYN on the
+local port alone. A SYN can therefore land on the replacement listener rather
+than on its own connection — and tuple equality alone does not say whether it is
+that connection's retransmit or a new connection reusing the tuple (a client
+that lost its own TCP state while the datapath's persists: reboot, sleep-resume,
+a recycled ephemeral port). `take_handshakes` tells them apart by ISN, read off
+the wire since smoltcp exposes none: the same ISN as the tuple's owner is
+`Duplicate` and its socket is dropped without a segment — no second permit, no
+second router task, and no RST, since one would acknowledge the client's SYN,
+which it must accept while in SYN-SENT, and so would kill the very connection it
+is retransmitting for. A different ISN reports `Pending` with `supersedes` set
+to the stale owner (RFC 9293 §3.10.7.4); the driver tears that owner down —
+closing its channels, removing its socket — before admitting or refusing the new
+SYN in its place.
+
+An admitted connection also gets a keep-alive interval and a timeout
+(`tcp_keep_alive_interval`, `tcp_peer_timeout`). They bound an external event —
+a client process that may never speak again — not anything inside the engine.
+Without them a connection stalled in `SynReceived`, `FinWait2` or `CloseWait`
+never reaches a state `decide_disposal` has a verdict for, and holds its entry,
+both buffers and its connection slot for the life of the process;
+`max_connections` of those wedge the tunnel for all new TCP. The probe is what
+keeps the bound off a client that is merely quiet: only silence in reply to it
+resets the socket to `Closed`, where the disposal path already runs.
+
 ### DNS forwarder
 
 On TCP-only plugins, full-tunnel DNS would have no path (UDP/53 is dropped for
@@ -215,14 +273,26 @@ crate so both Hole's GPL crates and the Apache plugin world can depend on it.
 - `free_port` — primitive that returns a verified-free port divorced from a bound
   socket. **Direct callers are clippy-`disallowed_methods`** — use
   `bind_ephemeral`, or `#[allow]` + comment when the port must reach a subprocess
-  before the bind (`test_support::port_alloc::allocate_ephemeral_port` is the
-  sanctioned exception).
+  before the bind. Two sanctioned exceptions:
+  `test_support::port_alloc::allocate_ephemeral_port` and `plugin_e2e::ports`.
 - `ensure_port_free` — pure probe without allocation.
 
 The retry exists because Windows keeps **independent TCP/UDP excluded-port-range
 tables** (Hyper-V/WSL/Docker reservations); an OS-picked port for one transport
 may be reserved for the other. There is no "right" budget — a saturated runner
 needs many retries, a healthy machine one. See #285, #300, #304.
+
+**Reserve for the protocols the consumer will bind.** Where the consumer is
+known at reservation time, name it exactly —
+`hole_common::plugin::plugin_alloc_protocols` keys SS_LOCAL by binary (galoshes
+TCP+UDP, everything else TCP). Where the reservation happens before the
+consumer is known, reserve the union over the possible consumers:
+`plugin_e2e::ports::reserve_ss_local` is generic over which client plugin will
+run, and that set includes galoshes, so it always reserves TCP+UDP —
+over-reserving UDP for a TCP-only plugin costs a retry, under-reserving it for
+galoshes costs a race. `garter::chain::allocate_ports` verifies TCP only and is
+clippy-banned outside garter's own chain-internal use, which carries a per-site
+allow.
 
 ### Proxy shutdown contract
 
@@ -1539,7 +1609,87 @@ line/column — never the raw `serde_json` message (which can echo a password).
 `warn!` and shows the path-free message in the toast. **(2) A detail-free
 structured wire variant + `warn!`** when the detail itself could carry
 content/PII: `import_servers_from_file` returns `ImportFailure::SaveFailed` /
-`CorruptedJson` (no fields) and logs the full error.
+`CorruptedJson` (no fields) and logs the full error. **(3) The redaction
+registry** ([below](#server-address-redaction)) for the configured server
+address, which no per-site rule can cover.
+
+### Server-address redaction
+
+The configured server address — hostname, DoH-resolved IP, and every textual
+form of either — is replaced by an opaque token before it reaches a log file,
+the dev console, a toast, or the support bundle. For a censorship-circumvention
+VPN it is the most sensitive value on the machine, and the default log filter is
+a **global `info`** (`build_filter` seeds `info` and *then* adds
+`hole_bridge=info`), so every crate in the process — third-party ones included —
+can write one. That set is not enumerable in advance, which is why the sink
+layer carries the weight.
+
+**What is covered.** [`util::redact`](crates/util/src/redact.rs) holds a
+process-global registry of armed literals behind an `ArcSwap` (lock-free reads,
+so no logging call can block behind a concurrent arm) and an `aho-corasick`
+automaton (`LeftmostLongest`, ASCII-case-insensitive). `RedactingWriter` wraps
+four non-blocking writers in `init_dual`, and **exactly one of them is a log
+file**: the `UserOwnedRotate` appender. Wrapping that one closes the file leak;
+the other three (the stderr layer's writer and the two stdio-relay tees) are the
+developer's terminal and cannot reopen it either way.
+
+**What is armed.** `arm_server` derives, from `entry.server`: the value as
+configured, its trailing-dot-stripped form, its `idna::domain_to_ascii` A-label,
+and — when it parses as an IP — that address's canonical text. `arm_resolved_ip`
+derives the bare and bracketed `[…]` forms (`handoff_host`'s IPv6 shape). **Each
+candidate is then filtered individually**, not the input string:
+`server = "127.0.0.1."` does not parse as an `IpAddr`, so a value-level carve-out
+passes it through and the trailing-dot strip arms the bare loopback address —
+turning every loopback mention in the process into a token. A candidate is armed
+unless it is empty, matches `localhost` case-insensitively, or (after stripping
+one `[`/`]` pair) parses to a loopback or unspecified address.
+
+**Tokens.** `<server:XXXXXXXX>` — the first 8 hex characters of the entry's
+random v4 UUID, never derived from the address — plus `<server:recovered>`, the
+one token minted without an entry in hand (crash recovery replays a prior run's
+routes before any config exists). Arming is keyed by literal, **last wins**: a
+re-arm re-points the literal in place and emits one `info!` naming both tokens
+and neither address, which is what joins the recovery lines to the session lines
+in a collected bundle. Replaced in place, never appended, so the automaton stays
+bounded however many times a long-running service arms.
+
+**Collisions.** Nothing validates a configured host, so `server: "hole"` is
+reachable, and arming it would rewrite `hole-tun`, `hole_bridge::proxy_manager`
+and the log-directory path throughout the file. There is no non-arbitrary
+threshold separating "too short" from "fine", so `arm` does not guess: it tests
+the candidate against `COLLISION_CORPUS`, **arms it anyway** — privacy does not
+yield — and emits one `warn!` naming the token and the collision, so the mangled
+log explains itself. The corpus's only job is that warning, so its
+incompleteness can weaken a diagnostic message and can never weaken redaction.
+
+**Prevention.** `ServerAddress` ([`config.rs`](crates/common/src/config.rs))
+implements neither `Display` nor `Deref`, so `server_host = %config.server.server`
+is a compile error and `format!("{}", *addr)` cannot reopen it. `expose()` is
+the single named exit, so grepping for it enumerates every real read site.
+
+**What replaces the address in a Hole-authored line.** `server` (the token),
+`server_kind` (`domain`/`ipv4`/`ipv6`), `server_family`, `server_scope`
+(`global`/`private`/`loopback`/`link_local`), and the unchanged `server_port`.
+Checked against the diagnoses this repo has actually needed (#248, #541, #655,
+#770, #694): none required the address. The joined `route`/`netsh` argv
+(`routing.rs`'s `log_route_command`), the ETW `remote` field, `netsh` stdout and
+garter's plugin relay deliberately get **no** per-site edit — the sink covers
+them, and hand-redaction there would rot.
+
+**Two limits, so this is not read as a total guarantee.** First, `dump!`'s
+ladder resolves per top-level expression, not per field: any `Serialize` type
+transitively holding a `ServerAddress` needs its own `Dump` impl, or the serde
+tree renders the inner string and `ServerAddress::dump` is never reached.
+`ServerEntry` and `ProxyConfig` have one; that is convention backed by
+per-container tests, not a compiler guarantee, with the sink as the backstop.
+Second, an address written in a form no armed literal is a byte-substring of —
+a percent- or punycode-escaped form from a third-party process, a non-canonical
+IPv6 text form from a peer that is not `std` — is not redacted.
+
+**Existing artifacts.** Files already on disk are not rewritten: a SYSTEM bridge
+rewriting files in a user-writable directory is an attack surface. The support
+bundle is scrubbed on collection instead, and its `REDACTION.txt` states the
+three residuals plainly.
 
 ### Logging directives (HOLE_BRIDGE_LOG)
 

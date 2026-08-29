@@ -288,7 +288,10 @@ async fn handle_status<P: Proxy + 'static, R: Routing + 'static>(
         // carry a filesystem path/hostname from a failed start and must never
         // reach the GUI toast. The rich detail stays in `last_error` for
         // diagnostics (bridge="error") and the click-path start-error surface.
-        error: pm.death_reason().map(|s| s.to_string()),
+        // Redacted at the boundary alongside `StartError::Failed`, so "no
+        // outgoing error string carries the server address" holds for the
+        // whole response surface rather than for one variant.
+        error: pm.death_reason().map(|s| util::redact::redact_str(s).into_owned()),
         invalid_filters: pm.invalid_filters(),
         udp_proxy_available: pm.udp_proxy_available(),
         ipv6_bypass_available: pm.ipv6_bypass_available(),
@@ -296,6 +299,23 @@ async fn handle_status<P: Proxy + 'static, R: Routing + 'static>(
         lockdown_active: pm.lockdown_active(),
         blocked_until_connected: pm.blocked_until_connected(),
     })
+}
+
+/// Enforce [`StartError::Failed`]'s "PII-free message" claim at the response
+/// boundary, where it is one call rather than an audit of every producer.
+///
+/// The address can arrive from outside Hole: garter formats a chain's
+/// `remote_host` — the resolved server — into the error that becomes
+/// `ProxyError::Plugin`, and that string reaches a GUI toast. The registry is
+/// armed by `handle_start` before anything can fail, so a toast reading
+/// `<server:8f2a1c04>` is what the user sees instead.
+fn redact_outgoing(error: StartError) -> StartError {
+    match error {
+        StartError::Failed { message } => StartError::Failed {
+            message: util::redact::redact_str(&message).into_owned(),
+        },
+        other => other,
+    }
 }
 
 /// Error side of `handle_start`: a control-plane 409 carries a generic
@@ -325,6 +345,9 @@ async fn handle_start<P: Proxy + 'static, R: Routing + 'static>(
     headers: axum::http::HeaderMap,
     Json(config): Json<ProxyConfig>,
 ) -> Result<Json<EmptyResponse>, StartHandlerError> {
+    // Upstream of the first address-bearing line on this path, and of the
+    // response boundary's `redact_str`.
+    hole_common::logging::redact_arm::arm_server(&config.server);
     let attempt_id = attempt_id_from(&headers);
     // The `X-Hole-Covered` header marks an auto-connect intent, so the bridge
     // engages a fail-closed cover that stays blocked on failure.
@@ -389,7 +412,7 @@ async fn handle_start<P: Proxy + 'static, R: Routing + 'static>(
             if !matches!(e, ProxyError::Cancelled | ProxyError::AlreadyRunning) {
                 error!(error = %e, "proxy start failed");
             }
-            Err(StartHandlerError::Failed((&e).into()))
+            Err(StartHandlerError::Failed(redact_outgoing((&e).into())))
         }
     }
 }
@@ -884,6 +907,7 @@ async fn handle_test_server<P: Proxy + 'static, R: Routing + 'static>(
     State(_state): State<Arc<IpcState<P, R>>>,
     Json(req): Json<TestServerRequest>,
 ) -> Json<TestServerResponse> {
+    hole_common::logging::redact_arm::arm_server(&req.entry);
     let mut cfg = TestConfig::production();
     cfg.dns = req.dns;
     let outcome = run_server_test(&req.entry, &cfg).await;

@@ -16,6 +16,11 @@ use std::sync::{Arc, Mutex};
 use tracing_subscriber::fmt::MakeWriter;
 use tracing_subscriber::layer::SubscriberExt;
 
+/// Shared by the redaction scenarios and the parent tests that assert on
+/// their output.
+pub(crate) const REDACT_ADDR: &str = "203.0.113.7";
+pub(crate) const REDACT_TOKEN: &str = "<server:aaaaaaaa>";
+
 // In-memory writer that captures emitted bytes per layer ==============================================================
 
 #[derive(Clone)]
@@ -185,6 +190,8 @@ pub(crate) fn run_child(kind: &str) {
         "echo_stderr" => scenario_echo_stderr(),
         "echo_stdout" => scenario_echo_stdout(),
         "log_bridge_to_file" => scenario_log_bridge_to_file(),
+        "redact_file" => scenario_redact_file(),
+        "redact_tee" => scenario_redact_tee(),
         other => panic!("unknown HOLE_LOGGING_TEST_KIND: {other}"),
     }
 }
@@ -417,5 +424,68 @@ fn scenario_lossy_backpressure() {
         tee_stderr: WRITES.load(Ordering::SeqCst).to_string(),
         ..ChildResult::default()
     };
+    write_result(&result);
+}
+
+/// `init` builds the log file's writer; this scenario checks that an armed
+/// literal cannot reach it. Addresses come from the RFC 5737 documentation
+/// range so they appear in no other fixture.
+fn scenario_redact_file() {
+    let log_dir_str = std::env::var("HOLE_LOGGING_TEST_LOG_DIR").expect("HOLE_LOGGING_TEST_LOG_DIR var");
+    let log_dir = std::path::Path::new(&log_dir_str);
+    // The redirect would eat the libtest-mimic per-test result lines; we
+    // need its diagnostics if the child fails.
+    unsafe { std::env::set_var("HOLE_LOGGING_DISABLE_REDIRECT", "1") };
+    let guard = super::init(log_dir, "test", "test.log", "info", None);
+    util::redact::arm(REDACT_TOKEN, [REDACT_ADDR.to_string()]);
+    // A third-party-shaped line: no Hole site authored it, nothing about it
+    // is `ServerAddress`-typed, and it still must not reach the file.
+    tracing::info!(target: "some_dependency::dialer", "creating connection to {REDACT_ADDR}:8388");
+    // Drop the guard explicitly so the `tracing_appender::NonBlocking`
+    // worker thread flushes to disk before the child exits. No sleep — the
+    // WorkerGuard's Drop joins the worker.
+    drop(guard);
+}
+
+/// The three console writers are wrapped separately from the file writer.
+/// This scenario asserts on the **tee target** specifically: the file path
+/// is a different writer, so asserting on the file here would pass even if
+/// the console wrap were missing.
+fn scenario_redact_tee() {
+    use std::fs::OpenOptions;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let stderr_path = dir.path().join("tee-stderr.bin");
+    let stdout_path = dir.path().join("tee-stdout.bin");
+
+    let open = |p: &std::path::Path| {
+        OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .read(true)
+            .open(p)
+            .expect("open tee file")
+    };
+    let stderr_file = open(&stderr_path);
+    let stdout_file = open(&stdout_path);
+
+    let mut harness = install_child_subscriber();
+    util::redact::arm(REDACT_TOKEN, [REDACT_ADDR.to_string()]);
+    let relays = crate::logging::redirect_stdio_to_tracing_with_writers_for_tests(
+        Box::new(stderr_file.try_clone().unwrap()),
+        Box::new(stdout_file.try_clone().unwrap()),
+    )
+    .expect("redirect with custom writers");
+    harness.relays = Some(relays);
+
+    let _ = writeln!(std::io::stderr(), "tee-stderr-line {REDACT_ADDR}");
+    let _ = std::io::stderr().flush();
+    let _ = writeln!(std::io::stdout(), "tee-stdout-line {REDACT_ADDR}");
+    let _ = std::io::stdout().flush();
+
+    // `finish` drains the relay through its own rendezvous — no sleep.
+    let mut result = finish(&mut harness);
+    result.tee_stderr = std::fs::read_to_string(&stderr_path).unwrap_or_default();
+    result.tee_stdout = std::fs::read_to_string(&stdout_path).unwrap_or_default();
     write_result(&result);
 }
