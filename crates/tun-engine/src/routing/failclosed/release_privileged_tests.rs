@@ -28,12 +28,7 @@
 
 use crate::routing::{CoverGuard, Routing, SystemRouting};
 
-// `skuld` requires each label to be declared exactly once per test binary;
-// both this module and `lockdown_privileged_tests` compile into the SAME
-// `tun-engine` test binary, so this reuses that module's `TUN` label rather
-// than redeclaring it (a second `#[skuld::label] const TUN` in one binary
-// panics at test-runner startup with "label declared multiple times").
-use super::lockdown_privileged_tests::TUN;
+use crate::TUN;
 
 // Two routable anycast hosts on :443 (the runner has outbound internet), as
 // `lockdown_privileged_tests` uses — see that module's doc for why these two
@@ -308,6 +303,11 @@ fn windows_release_all_on_a_clean_host_is_ok() {
         "a clean host's reachability must be unaffected: {NON_PERMITTED}={:?}",
         connect(NON_PERMITTED).err().map(|e| e.kind()),
     );
+    assert_eq!(
+        super::lockdown_cover_presence(dir.path()),
+        crate::routing::CoverPresence::Absent,
+        "the firewall must report no lockdown cover after a clean-host release"
+    );
 }
 
 #[cfg(target_os = "macos")]
@@ -335,6 +335,11 @@ fn macos_release_all_on_a_clean_host_is_ok() {
     let info_after = Command::new("pfctl").args(["-s", "info"]).output().unwrap().stdout;
     let enabled_after = super::platform::parse_pf_enabled(&String::from_utf8_lossy(&info_after));
 
+    assert_eq!(
+        super::lockdown_cover_presence(dir.path()),
+        crate::routing::CoverPresence::Absent,
+        "pf must report no lockdown cover after a clean-host release"
+    );
     assert_eq!(
         sr_before, sr_after,
         "a clean host's live filter ruleset must be byte-identical afterward"
