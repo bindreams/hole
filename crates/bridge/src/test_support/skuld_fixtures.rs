@@ -56,6 +56,15 @@ pub(crate) const TUN: skuld::Label;
 #[skuld::label]
 pub(crate) const IPV6: skuld::Label;
 
+/// Cross-binary serialization for tests that mutate GLOBAL OS network state
+/// (real WFP filters / pf rules / TUN routes) — the `.config/nextest.toml`
+/// `global_net_state` test-group's `max-threads = 1` gate. skuld's own
+/// `serial = TUN` only serializes within this one binary; this label is what
+/// `cargo xtask verify-global-net-state-labels` binds to that group's
+/// name-substring filter (bindreams/hole#894).
+#[skuld::label]
+pub(crate) const GLOBAL_NET_STATE: skuld::Label;
+
 // Fixtures ============================================================================================================
 
 use crate::test_support::http_target::{start_http_target, HttpTarget, TargetBind};

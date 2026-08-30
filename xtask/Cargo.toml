@@ -18,6 +18,10 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1"
+# Parses `.config/nextest.toml` for `global_net_state_conformance`
+# (bindreams/hole#894) — already vendored transitively via `xtask-lib`'s
+# `version` feature, adds no new crate to the graph.
+toml = "1.0"
 cargo_metadata = "0.23"
 clap = { version = "4", features = ["derive"] }
 ctrlc = "3" # transparent-launcher interrupt handling (#568): a handler (not SIG_IGN) resets to default across exec, so children stay interruptible while xtask survives Ctrl+C and propagates the child's exit status
@@ -50,6 +54,12 @@ petgraph = "0.8"
 # dev-only.
 tempfile = "3"
 
+# `verify-skuld-label-coverage` compares two ci.yaml SKULD_LABELS values for
+# logical complementarity through skuld's own parser: `!` binds tighter than
+# `&`/`|`, so string comparison mis-accepts compound pairs. A normal (not
+# dev-) dependency because the check runs in the subcommand, not in tests.
+skuld = { workspace = true }
+
 # background.typ → transparent PNG via Typst. macOS-only: the DMG background is a
 # darwin feature and the Typst tree is heavy (~300 crates); compiling it on
 # windows/linux needlessly slowed every `cargo xtask` there (the MSI build hit its
@@ -64,7 +74,6 @@ typst-utils = "=0.15.1"
 png = "0.18"
 
 [dev-dependencies]
-skuld = { workspace = true }
 # `check_vendoring_integrity_tests`'s real-`prek`-hook e2e fixtures: `std::env::temp_dir()`
 # can return an 8.3 short-name path component (e.g. `BINDRE~1`) on some Windows machines,
 # which confuses prek's own git-root path comparison ("Workspace root ... is not under git

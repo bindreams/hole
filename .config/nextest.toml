@@ -4,22 +4,37 @@
 nextest-version = "0.9.130"
 
 # Cross-binary serialization for tests that mutate GLOBAL OS network state
-# (real WFP filters / pf rules / TUN routes). skuld's `serial = TUN` only
-# serializes within ONE test binary, but the Windows TUN lane runs the
-# `hole-bridge` and `tun-engine` binaries concurrently — the bridge's
-# `e2e_none_full_tunnel_roundtrip` e2e drives live egress while the tun-engine
+# (real WFP filters / pf rules / TUN routes). skuld's coordination DB is
+# workspace-shared, so `serial = TUN` does reach across binaries — but skuld
+# does not own nextest's thread budget, and the Windows TUN lane runs the
+# `hole-bridge` and `tun-engine` binaries concurrently. The bridge's `mod tun`
+# e2es drive live egress and install real split routes while the tun-engine
 # `windows_lockdown_permits_server_ip_and_blocks_other_egress` test holds a
-# system-wide block-all WFP cover, so without this they race on global state.
-# `max-threads = 1` makes nextest run the whole group on one thread across
-# binaries. On macOS the bridge TUN e2es are `cfg(windows)` so there is no
-# macOS bridge partner today; the `macos_lockdown_permits_server_ip_...` pf test
-# still joins the group for free (and is auto-grouped against any future macOS
-# bridge TUN e2e).
+# system-wide block-all WFP cover. `max-threads = 1` makes nextest run the
+# whole group on one thread across binaries. On macOS the bridge TUN e2es are
+# `cfg(windows)` so there is no macOS bridge partner today; the
+# `macos_lockdown_permits_server_ip_...` pf test still joins the group for free
+# (and is auto-grouped against any future macOS bridge TUN e2e).
 #
-# COUPLED NAMES — the filter below matches tests BY NAME SUBSTRING. These names
-# are load-bearing and must change in lockstep with the filter:
-#   - `_full_tunnel_roundtrip` suffix:
-#     crates/bridge/src/proxy_manager_e2e_tests.rs::e2e_none_full_tunnel_roundtrip
+# COUPLED NAMES — the filter below matches tests BY NAME ONLY. A module-path
+# anchor is not available: skuld hands libtest-mimic the bare function name
+# (`skuld::TestDef::name`), keeping `module_path!()` for `default_labels!`
+# matching alone, so no test in this workspace has a module-qualified name for
+# nextest to select on. These names are load-bearing and must change in
+# lockstep with the filter:
+#   - `^e2e_…full_tunnel…` — EVERY test in either of the bridge's two `mod tun`
+#     blocks. Both set `TunnelMode::Full` and install real split routes, and
+#     every member must carry this naming shape or it silently leaves the group
+#     and loses the thread budget (mutual exclusion comes from `serial = TUN`
+#     on every member, not from group membership):
+#     crates/bridge/src/proxy_manager_e2e_tests.rs (4: the `_captures_
+#       unowned_destination` pair and the `_local_networking_intact` pair)
+#     crates/bridge/src/proxy_manager_listener_e2e_tests.rs (1:
+#       e2e_full_tunnel_local_udp_intact)
+#     The `^e2e_` anchor is what keeps the unlabelled in-process unit test
+#     `forward_gives_every_resolver_the_full_tunnel_bound`
+#     (crates/bridge/src/dns/forwarder_tests.rs — same binary, name carries
+#     `full_tunnel`, no `e2e_` prefix) out of the group.
 #   - `windows_lockdown_permits_server_ip_` / `macos_lockdown_permits_server_ip_`:
 #     crates/tun-engine/src/routing/failclosed/lockdown_privileged_tests.rs
 #   - `failclosed_permits_` (transient block-until-connected cover real engage):
@@ -47,9 +62,14 @@ nextest-version = "0.9.130"
 #     real, process-scoped WFP DNS-egress confinement, reusing the
 #     `routing::failclosed::TUN` serial token; see that module's doc):
 #     crates/tun-engine/src/dns_confine/privileged_tests.rs
-#   - `e2e_socks5_udp_associate_roundtrip` (pre-existing, made reachable by
-#     #874): `labels = [DIST_BIN, TUN], serial = TUN` in
-#     crates/bridge/src/proxy_manager_listener_e2e_tests.rs, but it lives in a
+#   - `tun_device_ipv6_` substring (creates a real wintun adapter and reads the
+#     host's whole AF_INET6 unicast address table, so a concurrent bridge e2e's
+#     TUN would both perturb it and be perturbed by it):
+#     crates/tun-engine/src/device/ipv6_addr_privileged_tests.rs
+#   - `e2e_full_tunnel_local_udp_intact` — matched by the `^e2e_…full_tunnel…`
+#     anchor above, not by a term of its own. It carries
+#     `labels = [DIST_BIN, TUN], serial = TUN` in
+#     crates/bridge/src/proxy_manager_listener_e2e_tests.rs, but lives in a
 #     DIFFERENT test binary from the tun-engine tests above, so skuld's
 #     per-binary `serial = TUN` alone never serialized it against them; it
 #     drives live UDP through a real TUN adapter (the `hole-tun*` wildcard
@@ -61,9 +81,51 @@ nextest-version = "0.9.130"
 # Renaming any of them WITHOUT updating this filter silently drops it from the
 # group → cross-binary data race. Verify with `cargo nextest show-config
 # test-groups`. Add any new real-engage/real-TUN test (and its substring) here.
-[test-groups.global-net-state]
+#
+# `cargo xtask verify-global-net-state-labels` (bindreams/hole#894) checks this
+# group's *membership* live, by binding it to the `global_net_state` skuld
+# label attached at each test's own definition site — a rename applied to a
+# test but not this filter (or vice versa) now fails loud, by exact test name,
+# instead of silently degrading into the cross-binary race described above.
+# It also asserts `max-threads` below stays `1`. It does NOT catch a
+# higher-precedence `[[profile.default.overrides]]` entry (inserted above this
+# one) that matches these same tests and steals them into a different group —
+# that residual is unverified; see the guard's own module doc.
+[test-groups.global_net_state]
 max-threads = 1
 
 [[profile.default.overrides]]
-filter = 'test(/_full_tunnel_roundtrip$/) + test(/windows_lockdown_permits_server_ip_/) + test(/macos_lockdown_permits_server_ip_/) + test(/failclosed_permits_/) + test(/release_all_/) + test(/cutover_global_net_state_/) + test(/live_tun_permit_/) + test(/e2e_socks5_udp_associate_roundtrip/) + test(/dns_confine_global_net_state_/)'
-test-group = 'global-net-state'
+filter = 'test(/^e2e_.*full_tunnel/) + test(/windows_lockdown_permits_server_ip_/) + test(/macos_lockdown_permits_server_ip_/) + test(/failclosed_permits_/) + test(/release_all_/) + test(/cutover_global_net_state_/) + test(/live_tun_permit_/) + test(/tun_device_ipv6_/) + test(/dns_confine_global_net_state_/)'
+test-group = 'global_net_state'
+
+# `driver_dns_tests.rs` / `driver_udp_tests.rs` / `driver_lifecycle_tests.rs`
+# (crates/tun-engine/src/engine/) drive the whole engine over an in-memory
+# `sim::SimWire` — no real TUN device, no real network, no real timer besides
+# smoltcp's virtual clock. Several of their assertions have no
+# happens-before edge available (the driver's live behaviour, observed
+# before any cancellation) and so block on a plain channel `recv()` with
+# no other bound; a datapath regression there hangs instead of failing
+# (measured: a broken idle sweep hung one of these tests at 115s, a broken
+# first-datagram seed hung four of them at 84s each, both still running when
+# killed). `terminate-after` converts that hang into a failure carrying its
+# own test name instead of consuming the whole job budget and reading as
+# runner noise — the sanctioned "failure bound surfaced to a human" use of a
+# timeout, not synchronization.
+#
+# Scoped to these 17 test names, not `package(tun-engine)`: that package also
+# holds `global_net_state`-grouped privileged tests, serialized behind
+# bridge's `e2e_full_tunnel*` tests, which legitimately run 100-430s under
+# contention (see the group above) — a repo-wide or package-wide bound would
+# risk failing an honest slow run of those. These 17 have no such lane: the
+# full `tun-engine` suite (383 tests, including all of these) runs in ~7-8s
+# total here, so a 30s single-test period is over 30x that, and the loop
+# never terminates until `terminate-after` is hit — the first breach alone
+# never fails a test.
+#
+# COUPLED NAMES, same caveat as the group above: these are bare function
+# names (no module-path anchor available in this workspace's test names — see
+# `driver_dns_tests.rs`'s module doc). Add any new test to these three files
+# here too, or it hangs the job on a regression instead of failing fast.
+[[profile.default.overrides]]
+filter = 'test(/^(a_port_53_datagram_reaches_the_interceptor|an_intercepted_reply_is_written_to_the_tun_with_the_five_tuple_swapped|an_interceptor_returning_none_falls_through_to_the_router|a_non_53_datagram_never_reaches_the_interceptor|tcp_to_port_53_never_reaches_the_interceptor|an_ipv6_port_53_datagram_reaches_the_interceptor_and_its_reply_is_framed_correctly|an_ipv6_interceptor_returning_none_falls_through_to_the_router|a_udp_datagram_reaches_the_router_with_its_five_tuple|the_first_datagram_is_seeded_into_the_new_flow|a_second_datagram_on_the_same_five_tuple_reuses_the_flow|a_datagram_with_a_different_source_port_opens_a_second_flow|a_router_reply_is_written_to_the_tun_with_the_five_tuple_swapped|an_ipv6_udp_datagram_round_trips|cancelling_the_engine_ends_the_run_loop|cancelling_the_engine_closes_every_in_flight_flow|a_tun_read_error_ends_the_run_loop|the_driver_sweep_closes_a_flow_the_router_still_holds)$/)'
+slow-timeout = { period = "30s", terminate-after = 2 }

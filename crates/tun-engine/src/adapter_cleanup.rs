@@ -7,9 +7,6 @@
 //! - **Panic / SIGKILL** paths where Drops don't run at all.
 //! - **Current-thread runtime** test paths where `block_in_place` would
 //!   panic, so `Dispatcher::drop` takes the abort-only fallback.
-//! - **Drop timeout** (2s budget in `Dispatcher::drop`) — a wedged engine
-//!   future eventually surrenders the adapter on process exit; this layer
-//!   makes sure the next start finds a clean machine.
 //!
 //! Idempotent: no-op if the adapter is already gone. Requires admin
 //! privileges (the bridge runs elevated; in dev mode, dev-console requires

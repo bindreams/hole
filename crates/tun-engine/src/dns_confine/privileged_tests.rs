@@ -16,15 +16,17 @@
 //! reached the network stack at all (a harness fault) can never be
 //! misreported as a firewall verdict.
 //!
-//! **`serial = TUN` reuses `routing::failclosed::TUN`** — the SAME serial
-//! token `lockdown_privileged_tests` declares — rather than minting a second
+//! **`serial = TUN` reuses `crate::TUN`** — the crate-root serial token
+//! declared once for the whole binary — rather than minting a second
 //! `#[skuld::label] const TUN`, which would race the cover tests that label
-//! excludes. Plus the `global-net-state` nextest test-group
+//! excludes. Plus the `global_net_state` nextest test-group
 //! (`.config/nextest.toml`) for cross-binary serialization. COUPLED NAMES:
 //! every test below carries the literal substring
 //! `dns_confine_global_net_state_`, which that group's filter matches by
 //! substring — renaming one without updating `.config/nextest.toml` silently
-//! drops it from the group.
+//! drops it from the group. Each also carries the `GLOBAL_NET_STATE` skuld
+//! label so `cargo xtask verify-global-net-state-labels` can bind the
+//! filter's membership to the label's live membership.
 //!
 //! No `EscapeGuard` / recovery-record machinery here, unlike the fail-closed
 //! cover's privileged tests: the confinement persists NO state file by
@@ -54,8 +56,8 @@ use std::time::Duration;
 use tun::AbstractDeviceExt;
 
 use super::engage;
-use crate::routing::failclosed::TUN;
 use crate::test_utils::{classify, OwnedRoute, ProbeFate};
+use crate::{GLOBAL_NET_STATE, TUN};
 
 /// TEST-NET-2 (RFC 5737) — never routable on the real internet, so its only
 /// route is the one a test installs itself.
@@ -91,7 +93,7 @@ fn send_udp(dest: SocketAddr) -> std::io::Result<usize> {
 /// Control + positive case: with the confinement engaged naming the device
 /// carrying the only route to `PROBE_IP`, a UDP send to `PROBE_IP:53` must be
 /// permitted.
-#[skuld::test(labels = [TUN], serial = TUN)]
+#[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
 fn dns_confine_global_net_state_permits_dns_on_the_named_tun() {
     let name = "dns-confine-test-tun-a";
     let dev = open_device(name, "10.255.250.1", "255.255.255.0");
@@ -113,7 +115,7 @@ fn dns_confine_global_net_state_permits_dns_on_the_named_tun() {
 /// Negative case: a UDP send to a port-53 destination reached via the
 /// physical adapter (never the tunnel) must be blocked while the confinement
 /// is engaged.
-#[skuld::test(labels = [TUN], serial = TUN)]
+#[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
 fn dns_confine_global_net_state_blocks_dns_off_the_tun() {
     let dev = open_device("dns-confine-test-tun-b", "10.255.249.1", "255.255.255.0");
     let luid = dev.tun_luid();
@@ -131,7 +133,7 @@ fn dns_confine_global_net_state_blocks_dns_off_the_tun() {
 
 /// The confinement must not be a general egress block: the SAME off-tunnel
 /// host on a non-DNS port must stay reachable.
-#[skuld::test(labels = [TUN], serial = TUN)]
+#[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
 fn dns_confine_global_net_state_leaves_other_ports_alone() {
     let dev = open_device("dns-confine-test-tun-c", "10.255.248.1", "255.255.255.0");
     let luid = dev.tun_luid();
@@ -151,7 +153,7 @@ fn dns_confine_global_net_state_leaves_other_ports_alone() {
 /// permitted any live TUN-shaped interface would pass
 /// `permits_dns_on_the_named_tun` AND this test; only a permit genuinely
 /// keyed on the named LUID fails this one.
-#[skuld::test(labels = [TUN], serial = TUN)]
+#[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
 fn dns_confine_global_net_state_is_sensitive_to_the_interface_it_names() {
     let name_a = "dns-confine-test-tun-d";
     let name_b = "dns-confine-test-tun-e";
@@ -180,7 +182,7 @@ fn dns_confine_global_net_state_is_sensitive_to_the_interface_it_names() {
 /// Rule #0, asserted rather than assumed: dropping the guard must fully
 /// release the confinement — a dynamic session's filters vanish with the
 /// engine handle, with no by-key sweep and nothing left to strand a user.
-#[skuld::test(labels = [TUN], serial = TUN)]
+#[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
 fn dns_confine_global_net_state_filters_die_with_the_session() {
     let dev = open_device("dns-confine-test-tun-f", "10.255.245.1", "255.255.255.0");
     let luid = dev.tun_luid();
@@ -200,7 +202,7 @@ fn dns_confine_global_net_state_filters_die_with_the_session() {
 /// a server configured on port 53 (a standard censorship-evasion setup) must
 /// not be locked out of its own tunnel by the very confinement meant to
 /// protect it.
-#[skuld::test(labels = [TUN], serial = TUN)]
+#[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
 fn dns_confine_global_net_state_permits_the_server_on_port_53() {
     let dev = open_device("dns-confine-test-tun-g", "10.255.244.1", "255.255.255.0");
     let luid = dev.tun_luid();
@@ -227,7 +229,7 @@ fn dns_confine_global_net_state_permits_the_server_on_port_53() {
 /// `probe_incumbent` — the exact ADOPT-path read `Device::build` itself
 /// performs on its next start. If this fails, the ownership gate is
 /// worthless as designed: **stop and raise it, do not weaken this test.**
-#[skuld::test(labels = [TUN], serial = TUN)]
+#[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
 fn dns_confine_global_net_state_adapter_reports_back_its_requested_guid() {
     let name = "dns-confine-test-tun-guid";
     let device = crate::Device::build(|c| {

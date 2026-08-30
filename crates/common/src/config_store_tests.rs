@@ -278,3 +278,45 @@ fn backup_failure_blocks_saving(#[fixture(temp_dir)] dir: &Path) {
     // The corrupt original is untouched — neither quarantined nor overwritten.
     assert_eq!(std::fs::read_to_string(&path).unwrap(), GARBAGE);
 }
+
+// Redaction arming ====================================================================================================
+
+/// The GUI arms **every** entry, not only the selected one: `gui.log` can
+/// carry any of them (the auto-test loop walks the whole list) and the
+/// support-bundle collector reuses this registry.
+#[skuld::test]
+fn loading_a_config_arms_every_entry(#[fixture(temp_dir)] dir: &Path) {
+    use crate::logging::redact_arm::token_for;
+
+    let path = dir.join("config.json");
+    let mut config = AppConfig::default();
+    config
+        .servers
+        .push(entry_with("11111111-0000-4000-8000-000000000000", "203.0.113.7"));
+    config
+        .servers
+        .push(entry_with("22222222-0000-4000-8000-000000000000", "203.0.113.9"));
+    std::fs::write(&path, serde_json::to_string(&config).unwrap()).unwrap();
+
+    let (_store, loaded, recovery) = ConfigStore::load(path, NOW);
+    assert!(recovery.is_none(), "setup: the config must load cleanly");
+    assert_eq!(loaded.servers.len(), 2);
+
+    assert_eq!(
+        util::redact::redact_str("203.0.113.7"),
+        token_for("11111111-0000-4000-8000-000000000000")
+    );
+    assert_eq!(
+        util::redact::redact_str("203.0.113.9"),
+        token_for("22222222-0000-4000-8000-000000000000"),
+        "an unselected entry still reaches gui.log"
+    );
+}
+
+fn entry_with(id: &str, server: &str) -> crate::config::ServerEntry {
+    crate::config::ServerEntry {
+        id: id.to_string(),
+        server: server.into(),
+        ..crate::config::ServerEntry::default_placeholder()
+    }
+}

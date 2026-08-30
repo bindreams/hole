@@ -30,10 +30,9 @@ mod platform;
 pub use platform::{engage, DnsConfineError, DnsConfinement};
 
 // Privileged-lane live proof (#846): engages the REAL WFP confinement against
-// real wintun devices. Gated to the elevated `tun` lane by the `TUN` label
-// (reused from `routing::failclosed`, see that module's doc); excluded from
-// the unprivileged pass. Windows-only — this crate has no confinement
-// implementation on any other platform yet (Q1).
+// real wintun devices. Gated to the elevated `tun` lane by the crate-root
+// `TUN` label; excluded from the unprivileged pass. Windows-only — this crate
+// has no confinement implementation on any other platform yet (Q1).
 #[cfg(all(test, target_os = "windows"))]
 #[path = "dns_confine/privileged_tests.rs"]
 mod privileged_tests;

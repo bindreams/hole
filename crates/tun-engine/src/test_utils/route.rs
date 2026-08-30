@@ -5,6 +5,32 @@ use std::process::Command;
 
 use super::command::{describe_output, ps_capture, ps_output};
 
+/// Whether `out` confirms a `route add`/`netsh add route` actually went in.
+/// `netsh` exits non-zero on failure — verified empirically. macOS `route(8)`
+/// exits 0 unconditionally for `add`/`delete`/`change` once it dispatches at
+/// all, so `status.success()` alone cannot tell a real failure (e.g. a
+/// pre-existing conflicting route this harness's own `assert_no_pre_existing`
+/// guard did not catch) from success; see `routing::macos_route_command_succeeded`'s
+/// doc for the verified mechanism.
+fn route_added(out: &std::process::Output) -> bool {
+    if cfg!(target_os = "windows") {
+        out.status.success()
+    } else {
+        crate::routing::macos_route_command_succeeded(out)
+    }
+}
+
+/// Whether `out` confirms a `route delete`/`netsh delete route` left the
+/// route gone — same macOS exit-0 problem as [`route_added`], mirrored for
+/// deletes via `routing::macos_route_confirmed_absent`.
+fn route_removed(out: &std::process::Output) -> bool {
+    if cfg!(target_os = "windows") {
+        out.status.success()
+    } else {
+        crate::routing::macos_route_confirmed_absent(out)
+    }
+}
+
 /// The destination form `netstat -rn` prints for `prefix`: it drops trailing
 /// zero octets, so `198.51.100.0/24` appears as `198.51.100`. Derived from
 /// the prefix rather than written out, so the pre-existence guard cannot go
@@ -70,7 +96,7 @@ impl OwnedRoute {
                 .output()
         };
         let out = out.unwrap_or_else(|e| panic!("HARNESS: failed to spawn the route-add command: {e}"));
-        if !out.status.success() {
+        if !route_added(&out) {
             panic!(
                 "HARNESS: adding route {prefix} on '{interface}' failed: {}",
                 describe_output(&out)
@@ -148,7 +174,7 @@ impl Drop for OwnedRoute {
                 .output()
         };
         match out {
-            Ok(o) if o.status.success() => {}
+            Ok(o) if route_removed(&o) => {}
             Ok(o) => super::escape::announce(&format!(
                 "HARNESS: removing route {prefix} on '{interface}' failed: {} — the host is left modified",
                 describe_output(&o)

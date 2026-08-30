@@ -1,6 +1,7 @@
 // `CancellationToken::new` is the cancel-test harness root; module-level
 // allow per the hole workspace clippy.toml's "Bridge cancellation contract"
-// sanctioned-test-file exception.
+// sanctioned-test-file exception. Also covers this file's `allocate_ports`
+// calls, the TCP-only chain-port allocator under test here.
 #![allow(clippy::disallowed_methods)]
 
 use std::net::SocketAddr;

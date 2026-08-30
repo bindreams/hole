@@ -1,6 +1,8 @@
 use super::*;
 use std::net::IpAddr;
 
+use crate::GLOBAL_NET_STATE;
+
 fn v4() -> IpAddr {
     "203.0.113.7".parse().unwrap()
 }
@@ -133,6 +135,44 @@ fn disengage_lockdown_absent_cover_is_ok() {
     // host must succeed, not fail loud.
     let dir = tempfile::tempdir().unwrap();
     assert!(disengage_lockdown(dir.path()).is_ok());
+}
+
+// pfctl_stdout (non-zero exit must not read as an empty success) ======================================================
+//
+// A failed `pfctl -sr`/`-sn` used to be read via `.stdout` with no status
+// check, persisting an empty snapshot as the host's pre-lockdown policy
+// (#901's bug class, surviving in this file). `pfctl_stdout` is the fix: the
+// single place every status-bearing read goes through.
+
+fn exit_output(code: i32, stdout: &str, stderr: &str) -> std::process::Output {
+    use std::os::unix::process::ExitStatusExt;
+    std::process::Output {
+        status: std::process::ExitStatus::from_raw(if code == 0 { 0 } else { code << 8 }),
+        stdout: stdout.as_bytes().to_vec(),
+        stderr: stderr.as_bytes().to_vec(),
+    }
+}
+
+#[skuld::test]
+fn pfctl_stdout_returns_stdout_on_success() {
+    let out = pfctl_stdout(Ok(exit_output(0, "block out all\n", "")), "pfctl -sr");
+    assert_eq!(out.unwrap(), "block out all\n");
+}
+
+#[skuld::test]
+fn pfctl_stdout_errs_on_nonzero_exit() {
+    let err = pfctl_stdout(Ok(exit_output(1, "", "pfctl: permission denied\n")), "pfctl -sr").unwrap_err();
+    let rendered = err.to_string();
+    assert!(rendered.contains("pfctl -sr"), "got {rendered}");
+    assert!(rendered.contains("permission denied"), "got {rendered}");
+}
+
+#[skuld::test]
+fn pfctl_stdout_does_not_surface_stdout_text_from_a_failed_run() {
+    // The regression this guards: a non-zero exit must never be read as if it
+    // were a (possibly empty) successful snapshot.
+    let out = pfctl_stdout(Ok(exit_output(1, "stale snapshot text", "")), "pfctl -sn");
+    assert!(out.is_err(), "a failed pfctl run must not report Ok, got {out:?}");
 }
 
 // engage_pf_action (idempotent-enable decision) =======================================================================
@@ -381,7 +421,7 @@ fn output_with_status(code: i32) -> Result<std::process::Output, RoutingError> {
     })
 }
 
-#[skuld::test]
+#[skuld::test(labels = [GLOBAL_NET_STATE])]
 fn release_all_restore_confirmed_requires_a_successful_exit_status() {
     // adopting=true short-circuits to true regardless of `out` — nothing was
     // attempted, so nothing can have failed to confirm.
@@ -472,10 +512,11 @@ fn standing_state() -> lockdown_state::LockdownPfState {
         pf_token: "222".into(),
         main_snapshot: String::new(),
         nat_snapshot: String::new(),
+        main_snapshot_captured: true,
     }
 }
 
-#[skuld::test]
+#[skuld::test(labels = [GLOBAL_NET_STATE])]
 fn release_all_attempts_the_standing_cover_after_a_transient_failure() {
     // The short-circuit that would strand the standing cover — the cover that
     // blocks indefinitely — must not exist.
@@ -496,7 +537,7 @@ fn release_all_attempts_the_standing_cover_after_a_transient_failure() {
     assert!(result.is_err());
 }
 
-#[skuld::test]
+#[skuld::test(labels = [GLOBAL_NET_STATE])]
 fn release_all_keeps_the_transient_state_file_when_the_restore_fails() {
     // Erasing the cover's only record here would make the NEXT call return Ok
     // over a still-blocked host — a permanent lockout.
@@ -512,7 +553,7 @@ fn release_all_keeps_the_transient_state_file_when_the_restore_fails() {
     );
 }
 
-#[skuld::test]
+#[skuld::test(labels = [GLOBAL_NET_STATE])]
 fn release_all_keeps_the_standing_state_file_when_restore_and_fallback_both_fail() {
     let mut ops = RecordingPfOps {
         fail_load_ruleset: true,
@@ -528,7 +569,7 @@ fn release_all_keeps_the_standing_state_file_when_restore_and_fallback_both_fail
     assert!(result.is_err());
 }
 
-#[skuld::test]
+#[skuld::test(labels = [GLOBAL_NET_STATE])]
 fn release_all_falls_back_to_the_default_ruleset_when_the_snapshot_will_not_load() {
     let mut ops = RecordingPfOps {
         fail_load_ruleset: true,
@@ -543,7 +584,7 @@ fn release_all_falls_back_to_the_default_ruleset_when_the_snapshot_will_not_load
     );
 }
 
-#[skuld::test]
+#[skuld::test(labels = [GLOBAL_NET_STATE])]
 fn release_all_treats_an_unusable_state_file_as_a_cover_to_clear() {
     // A corrupt or version-skewed file must never be read as "nothing to clear".
     let mut ops = RecordingPfOps::default();
@@ -555,7 +596,7 @@ fn release_all_treats_an_unusable_state_file_as_a_cover_to_clear() {
     );
 }
 
-#[skuld::test]
+#[skuld::test(labels = [GLOBAL_NET_STATE])]
 fn release_all_touches_nothing_when_both_state_files_are_absent() {
     // A blanket /etc/pf.conf reload here would destroy a healthy host's live
     // third-party ruleset.
@@ -565,7 +606,7 @@ fn release_all_touches_nothing_when_both_state_files_are_absent() {
     assert!(result.is_ok());
 }
 
-#[skuld::test]
+#[skuld::test(labels = [GLOBAL_NET_STATE])]
 fn release_all_treats_an_unusable_transient_state_file_as_a_cover_to_clear() {
     // The transient-side Unusable arm is separately coded (its own warn!
     // wording about a leaked pf enable refcount, and it unconditionally
@@ -586,7 +627,7 @@ fn release_all_treats_an_unusable_transient_state_file_as_a_cover_to_clear() {
     assert!(result.is_ok());
 }
 
-#[skuld::test]
+#[skuld::test(labels = [GLOBAL_NET_STATE])]
 fn release_all_clears_both_covers_end_to_end_on_a_clean_run() {
     // The most common real case release_all exists to handle — both covers
     // stranded, nothing fails — asserted at the sequencer level (not just the
@@ -613,7 +654,7 @@ fn release_all_clears_both_covers_end_to_end_on_a_clean_run() {
     );
 }
 
-#[skuld::test]
+#[skuld::test(labels = [GLOBAL_NET_STATE])]
 fn release_all_logs_a_swallowed_transient_clear_failure_but_still_reports_ok() {
     // clear_transient/clear_standing are best-effort (contract item 5): a
     // failure there must not fail the call, but it also must not vanish
@@ -634,7 +675,7 @@ fn release_all_logs_a_swallowed_transient_clear_failure_but_still_reports_ok() {
     );
 }
 
-#[skuld::test]
+#[skuld::test(labels = [GLOBAL_NET_STATE])]
 fn release_all_logs_a_swallowed_standing_clear_failure_but_still_reports_ok() {
     let mut ops = RecordingPfOps {
         fail_clear_standing: true,
@@ -646,4 +687,214 @@ fn release_all_logs_a_swallowed_standing_clear_failure_but_still_reports_ok() {
         "a failed state-file clear must not fail the call: {result:?}"
     );
     assert!(ops.log.contains(&"clear_standing"), "the clear must still be attempted");
+}
+
+// Cover presence ======================================================================================================
+
+use crate::routing::CoverPresence;
+
+#[skuld::test]
+fn presence_fold_is_closed_over_the_probe_and_the_state_file() {
+    // (pf label answer, state file, expected)
+    let cases: [(Option<bool>, StateFile<lockdown_state::LockdownPfState>, CoverPresence); 9] = [
+        (Some(true), StateFile::Absent, CoverPresence::Live),
+        (Some(true), StateFile::Present(standing_state()), CoverPresence::Live),
+        (Some(true), StateFile::Unusable, CoverPresence::Live),
+        (Some(false), StateFile::Absent, CoverPresence::Absent),
+        (
+            Some(false),
+            StateFile::Present(standing_state()),
+            CoverPresence::Recorded,
+        ),
+        (Some(false), StateFile::Unusable, CoverPresence::Recorded),
+        (None, StateFile::Absent, CoverPresence::Unreachable),
+        (None, StateFile::Present(standing_state()), CoverPresence::Recorded),
+        (None, StateFile::Unusable, CoverPresence::Recorded),
+    ];
+    for (label, file, expected) in cases {
+        assert_eq!(
+            fold_presence(label, &file),
+            expected,
+            "pf_label={label:?} file={file:?} must fold to {expected:?}"
+        );
+    }
+}
+
+#[skuld::test]
+fn file_only_presence_never_reports_live() {
+    // Pins the file-only body that ships before the pf probe lands: with no pf
+    // answer the fold cannot reach `Live`, so it cannot trigger an intent
+    // repair write off a state file alone.
+    for file in [
+        StateFile::Absent,
+        StateFile::Present(standing_state()),
+        StateFile::Unusable,
+    ] {
+        assert_ne!(
+            fold_presence(None, &file),
+            CoverPresence::Live,
+            "a file-only answer must never claim the OS confirmed a cover"
+        );
+    }
+}
+
+// pf ruleset label ====================================================================================================
+
+#[skuld::test]
+fn lockdown_ruleset_labels_its_block_all_rule() {
+    let r = build_lockdown_main_ruleset("utun4", v4(), "");
+    let labelled: Vec<&str> = r.lines().filter(|l| l.contains("label")).collect();
+    assert_eq!(
+        labelled.len(),
+        1,
+        "exactly one rule may carry our label, got {labelled:?}"
+    );
+    let line = labelled[0];
+    assert!(
+        line.trim() == format!("block drop out quick all label \"{LOCKDOWN_PF_LABEL}\""),
+        "the label must sit on the block-all base rule, got: {line}"
+    );
+    assert_eq!(
+        r.lines().rfind(|l| !l.trim().is_empty()).map(str::trim),
+        Some(line.trim()),
+        "the labelled block-all must stay the LAST rule:\n{r}"
+    );
+}
+
+#[skuld::test]
+fn lockdown_restore_ruleset_never_carries_our_label() {
+    // The restore reloads the HOST's captured rules. Our label appearing there
+    // would make a restored host read back as a live Hole cover forever.
+    let r = build_lockdown_restore_ruleset("nat-anchor \"com.apple/*\" all\n", "pass out all\n");
+    assert!(
+        !r.contains(LOCKDOWN_PF_LABEL),
+        "the restore ruleset must not carry our label:\n{r}"
+    );
+}
+
+#[skuld::test]
+fn labels_listing_matcher_is_anchored_to_the_first_field() {
+    assert!(labels_listing_carries_our_label(&format!(
+        "{LOCKDOWN_PF_LABEL} 0 0 0 0 0 0 0 0\n"
+    )));
+    assert!(
+        !labels_listing_carries_our_label(""),
+        "an empty listing carries nothing"
+    );
+    assert!(
+        !labels_listing_carries_our_label("com.apple.internet-sharing 0 0 0 0\n"),
+        "another rule's label is not ours"
+    );
+    assert!(
+        !labels_listing_carries_our_label(&format!("{LOCKDOWN_PF_LABEL}-staging 0 0 0 0\n")),
+        "a label that merely CONTAINS ours is not ours"
+    );
+    assert!(
+        !labels_listing_carries_our_label(&format!("someone-else {LOCKDOWN_PF_LABEL} 0 0\n")),
+        "the label is the FIRST field; a counter column that happens to match is not it"
+    );
+}
+
+#[skuld::test]
+fn pf_label_answer_maps_a_failed_pfctl_to_none() {
+    // The wiring a fold table cannot reach: mapping a spawn failure or a
+    // non-success exit to `Some(false)` would collapse the two-source design to
+    // file-only and let a live cover read as absent.
+    assert_eq!(
+        pf_label_answer(Err(RoutingError::RouteSetup("pfctl spawn failed".into()))),
+        None
+    );
+    assert_eq!(pf_label_answer(output_with_status(1)), None, "a non-success exit");
+
+    let mut ok = output_with_status(0).unwrap();
+    ok.stdout = format!("{LOCKDOWN_PF_LABEL} 0 0 0 0\n").into_bytes();
+    assert_eq!(pf_label_answer(Ok(ok)), Some(true));
+
+    let mut clean = output_with_status(0).unwrap();
+    clean.stdout = b"com.apple.something 0 0\n".to_vec();
+    assert_eq!(pf_label_answer(Ok(clean)), Some(false));
+}
+
+// Self-capture guard ==================================================================================================
+
+#[skuld::test]
+fn self_capture_persists_no_baseline_but_keeps_the_nat_rules() {
+    // Presence Live at capture time means the ruleset `pfctl -sr` would return
+    // is OUR OWN cover, so there is no host baseline to record. The NAT rules
+    // are a different matter: they are the host's own translation rules, fed
+    // verbatim into the ruleset engage loads, so zeroing them would flush a
+    // live host NAT (Internet Sharing, a VM bridge) the moment the cover
+    // engages, with nothing on disk to restore it from.
+    let tmp = tempfile::tempdir().unwrap();
+    let nat = "nat on en0 from any to any -> (en0)\n";
+    let returned = persist_baseline(
+        "tok",
+        tmp.path(),
+        None,
+        CoverPresence::Live,
+        "block drop out quick all label \"hole-lockdown\"\n".into(),
+        nat.into(),
+    )
+    .expect("the persist must succeed");
+
+    assert_eq!(
+        returned, nat,
+        "the nat snapshot must reach the ruleset builder unchanged"
+    );
+    let st = lockdown_state::load(tmp.path()).expect("state must be persisted");
+    assert!(!st.main_snapshot_captured, "no host baseline was captured");
+    assert!(st.main_snapshot.is_empty(), "our own ruleset must not be recorded");
+    assert_eq!(st.nat_snapshot, nat, "the host NAT rules must be persisted verbatim");
+}
+
+#[skuld::test]
+fn a_measured_clean_host_captures_its_baseline() {
+    let tmp = tempfile::tempdir().unwrap();
+    let main = "scrub-anchor \"com.apple/*\" all fragment reassemble\n";
+    let nat = "nat-anchor \"com.apple/*\" all\n";
+    persist_baseline("tok", tmp.path(), None, CoverPresence::Absent, main.into(), nat.into()).unwrap();
+
+    let st = lockdown_state::load(tmp.path()).unwrap();
+    assert!(st.main_snapshot_captured);
+    assert_eq!(st.main_snapshot, main);
+    assert_eq!(st.nat_snapshot, nat);
+}
+
+#[skuld::test]
+fn an_uncaptured_baseline_restores_the_default_ruleset() {
+    let mut st = standing_state();
+    st.main_snapshot_captured = false;
+    st.main_snapshot = String::new();
+    let mut ops = RecordingPfOps::default();
+    release_all_with(StateFile::Absent, StateFile::Present(st), &mut ops).unwrap();
+
+    assert!(
+        ops.log.contains(&"reload_default"),
+        "with no captured baseline, /etc/pf.conf IS the restore target: {:?}",
+        ops.log
+    );
+    assert!(
+        !ops.log.contains(&"load_ruleset"),
+        "an empty snapshot must never be loaded as a ruleset — that is a pass-all host: {:?}",
+        ops.log
+    );
+    assert!(ops.log.contains(&"clear_standing"));
+}
+
+#[skuld::test]
+fn an_empty_but_captured_baseline_still_restores_the_snapshot() {
+    // The discriminating case for the bool sentinel: a host really can have an
+    // empty filter ruleset, and that IS its policy. Keying on `main_snapshot
+    // .is_empty()` instead of the flag would silently reload /etc/pf.conf over it.
+    let mut st = standing_state();
+    st.main_snapshot = String::new();
+    assert!(st.main_snapshot_captured, "sample state is a captured baseline");
+    let mut ops = RecordingPfOps::default();
+    release_all_with(StateFile::Absent, StateFile::Present(st), &mut ops).unwrap();
+
+    assert!(
+        ops.log.contains(&"load_ruleset"),
+        "a captured baseline is restored from the snapshot even when empty: {:?}",
+        ops.log
+    );
 }

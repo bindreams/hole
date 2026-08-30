@@ -33,7 +33,7 @@ async fn covered_start_holding_the_cover(
     lockdown_state::set_enabled(dir.path(), false, None).unwrap();
     let mut pm = ProxyManager::new(MockProxy::new(), routing).with_state_dir(dir.path().to_path_buf());
     let mut cfg = test_config();
-    cfg.server.server = closed.ip().to_string();
+    cfg.server.server = closed.ip().to_string().into();
     cfg.server.server_port = closed.port();
     cfg.dns.enabled = true;
     cfg.dns.servers = vec!["127.0.0.1".parse().unwrap()];
@@ -204,5 +204,87 @@ fn turn_lockdown_off_on_a_clean_manager_is_ok() {
             "no presence check may skip the clear"
         );
         assert!(!lockdown_state::load_enabled(dir.path()));
+    });
+}
+
+#[skuld::test]
+fn unblock_clears_the_adopted_cover_claim() {
+    // The claim is NOT a latch. Once `release_all_covers` confirms, the host is
+    // open — continuing to report armed would leave the tray offering an escape
+    // from a cover that is already gone, over a host that is already open.
+    rt().block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        let routing = MockRouting::new(dir.path().to_path_buf());
+        let st = routing.state();
+        let mut pm = ProxyManager::new(MockProxy::new(), routing).with_state_dir(dir.path().to_path_buf());
+        pm.set_standing_cover_adopted(true);
+        assert!(pm.lockdown_enabled());
+
+        let outcome = pm.turn_lockdown_off().expect("an idle manager must not error");
+        assert!(matches!(outcome, LockdownOffOutcome::Cleared));
+        assert_eq!(st.release_all_calls.load(Ordering::SeqCst), 1);
+        assert!(!pm.lockdown_enabled(), "the claim must clear on a confirmed release");
+        assert!(!pm.standing_cover_expected());
+    });
+}
+
+#[skuld::test]
+fn a_failed_release_keeps_the_adopted_cover_claim() {
+    // The host may still be held closed, so the escape must stay on the menu
+    // for a retry — the same reason the intent is not flipped on this path.
+    rt().block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        let routing = MockRouting::new(dir.path().to_path_buf());
+        let st = routing.state();
+        st.fail_release.store(true, Ordering::SeqCst);
+        let mut pm = ProxyManager::new(MockProxy::new(), routing).with_state_dir(dir.path().to_path_buf());
+        pm.set_standing_cover_adopted(true);
+
+        pm.turn_lockdown_off().expect_err("a failed release must be reported");
+        assert_eq!(
+            lockdown_state::load_intent(dir.path()),
+            lockdown_state::Intent::Unset,
+            "the intent must be untouched by a failed release"
+        );
+        assert!(
+            pm.lockdown_enabled(),
+            "the escape must stay on the menu while the cover may still hold"
+        );
+    });
+}
+
+#[skuld::test]
+fn unblock_during_a_session_disarms_a_promoted_adopted_switch() {
+    // Rule #0 in the other direction: making the claim durable must not make
+    // the kill switch unreleasable. Turning it off mid-session records the off,
+    // and nothing re-promotes it once the session's cover is dropped.
+    rt().block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        let routing = MockRouting::new(dir.path().to_path_buf());
+        let st = routing.state();
+        let mut pm = ProxyManager::new(MockProxy::new(), routing).with_state_dir(dir.path().to_path_buf());
+        pm.set_standing_cover_adopted(true);
+        pm.start(&test_config()).await.unwrap();
+        assert_eq!(
+            lockdown_state::load_intent(dir.path()),
+            lockdown_state::Intent::On,
+            "setup: honouring the claim made it durable"
+        );
+
+        let outcome = pm.turn_lockdown_off().expect("a running session must not error");
+        assert!(matches!(outcome, LockdownOffOutcome::SessionRunning));
+        pm.stop().await.unwrap();
+
+        assert!(
+            !pm.standing_cover_expected(),
+            "the switch is off, so the next start must install nothing"
+        );
+        pm.start(&test_config()).await.unwrap();
+        assert_eq!(
+            st.lockdown_engage_calls.load(Ordering::SeqCst),
+            1,
+            "no standing cover may come back after the escape"
+        );
+        pm.stop().await.unwrap();
     });
 }

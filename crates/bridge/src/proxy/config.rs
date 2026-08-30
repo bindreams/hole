@@ -244,6 +244,9 @@ impl From<tun_engine::DeviceError> for ProxyError {
             tun_engine::DeviceError::TunOpen(err) => ProxyError::Runtime(err),
             tun_engine::DeviceError::InvalidConfig(msg) => ProxyError::RouteSetup(format!("device config: {msg}")),
             tun_engine::DeviceError::ForeignAdapter { alias } => ProxyError::ForeignAdapter { alias },
+            tun_engine::DeviceError::Ipv6Assign { index, message } => {
+                ProxyError::RouteSetup(format!("TUN IPv6 address on interface {index}: {message}"))
+            }
         }
     }
 }
@@ -252,6 +255,18 @@ impl From<tun_engine::DeviceError> for ProxyError {
 
 /// TUN interface subnet (hardcoded, not configurable via IPC).
 pub const TUN_SUBNET: &str = "10.255.0.1/24";
+
+/// TUN interface IPv6 subnet (hardcoded, not configurable via IPC). Held both
+/// by the OS interface and by smoltcp's address list — without the OS half, a
+/// host with no global IPv6 has no source address for the `::/1` + `8000::/1`
+/// split routes.
+///
+/// The 40-bit global ID is pseudo-randomly generated per RFC 4193 §3.2.2
+/// rather than the hand-typed `fd00::`, which WireGuard examples, Docker,
+/// Proxmox and NAS defaults all hand out: this prefix becomes a real on-link
+/// route on `hole-tun`, and a collision would let the tunnel swallow a user's
+/// own ULA network.
+pub const TUN_SUBNET6: &str = "fdf8:f6d5:536e::1/64";
 
 /// TUN interface device name.
 pub const TUN_DEVICE_NAME: &str = "hole-tun";

@@ -31,7 +31,7 @@ fn load_valid_json_roundtrips(#[fixture(temp_dir)] dir: &Path) {
         servers: vec![ServerEntry {
             id: "abc-123".to_string(),
             name: "Test".to_string(),
-            server: "1.2.3.4".to_string(),
+            server: "1.2.3.4".into(),
             server_port: 8388,
             method: "aes-256-gcm".to_string(),
             password: "secret".to_string(),
@@ -164,7 +164,7 @@ fn selected_entry_with_unknown_uuid_returns_none() {
         servers: vec![ServerEntry {
             id: "abc".to_string(),
             name: "S".to_string(),
-            server: "1.2.3.4".to_string(),
+            server: "1.2.3.4".into(),
             server_port: 8388,
             method: "aes-256-gcm".to_string(),
             password: "pw".to_string(),
@@ -185,7 +185,7 @@ fn selected_entry_with_valid_uuid_returns_correct_entry() {
             ServerEntry {
                 id: "other-id".to_string(),
                 name: "Other".to_string(),
-                server: "1.1.1.1".to_string(),
+                server: "1.1.1.1".into(),
                 server_port: 1111,
                 method: "aes-256-gcm".to_string(),
                 password: "pw1".to_string(),
@@ -196,7 +196,7 @@ fn selected_entry_with_valid_uuid_returns_correct_entry() {
             ServerEntry {
                 id: "target-id".to_string(),
                 name: "Target".to_string(),
-                server: "2.2.2.2".to_string(),
+                server: "2.2.2.2".into(),
                 server_port: 2222,
                 method: "chacha20-ietf-poly1305".to_string(),
                 password: "pw2".to_string(),
@@ -209,7 +209,7 @@ fn selected_entry_with_valid_uuid_returns_correct_entry() {
     };
     let entry = config.selected_entry().unwrap();
     assert_eq!(entry.name, "Target");
-    assert_eq!(entry.server, "2.2.2.2");
+    assert_eq!(entry.server.expose(), "2.2.2.2");
 }
 
 #[skuld::test]
@@ -336,7 +336,7 @@ fn server_entry_debug_redacts_password() {
     let entry = ServerEntry {
         id: "test-id".to_string(),
         name: "Test".to_string(),
-        server: "1.2.3.4".to_string(),
+        server: "1.2.3.4".into(),
         server_port: 8388,
         method: "aes-256-gcm".to_string(),
         password: "super-secret-do-not-leak".to_string(),
@@ -360,7 +360,7 @@ fn server_entry_debug_shows_non_sensitive_fields() {
     let entry = ServerEntry {
         id: "unique-id-123".to_string(),
         name: "MyServer".to_string(),
-        server: "10.20.30.40".to_string(),
+        server: "10.20.30.40".into(),
         server_port: 9999,
         method: "chacha20-ietf-poly1305".to_string(),
         password: "do-not-show-this".to_string(),
@@ -371,7 +371,10 @@ fn server_entry_debug_shows_non_sensitive_fields() {
     let debug_output = format!("{:?}", entry);
     assert!(debug_output.contains("unique-id-123"), "should contain id");
     assert!(debug_output.contains("MyServer"), "should contain name");
-    assert!(debug_output.contains("10.20.30.40"), "should contain server");
+    assert!(
+        !debug_output.contains("10.20.30.40"),
+        "server is sensitive and must not appear"
+    );
     assert!(debug_output.contains("9999"), "should contain server_port");
     assert!(debug_output.contains("chacha20-ietf-poly1305"), "should contain method");
     assert!(debug_output.contains("v2ray-plugin"), "should contain plugin");
@@ -677,4 +680,70 @@ fn dns_config_round_trips_allow_insecure_bootstrap() {
     let back: DnsConfig = serde_json::from_str(&json).expect("deserialize");
     assert_eq!(dns, back);
     assert!(back.allow_insecure_bootstrap);
+}
+
+// Server-address redaction ============================================================================================
+//
+// The address is documentation-range (RFC 5737) so it appears in no other
+// fixture and reads unambiguously as the secret.
+
+const SECRET_ADDR: &str = "203.0.113.7";
+const SECRET_PW: &str = "super-secret-do-not-leak";
+
+fn secret_entry() -> ServerEntry {
+    ServerEntry {
+        id: "8f2a1c04-0000-0000-0000-000000000000".to_string(),
+        name: "Test".to_string(),
+        server: SECRET_ADDR.into(),
+        server_port: 8388,
+        method: "aes-256-gcm".to_string(),
+        password: SECRET_PW.to_string(),
+        plugin: None,
+        plugin_opts: None,
+        validation: None,
+    }
+}
+
+#[skuld::test]
+fn server_entry_debug_omits_the_address() {
+    let rendered = format!("{:?}", secret_entry());
+    assert!(
+        !rendered.contains(SECRET_ADDR),
+        "Debug must not carry the server address: {rendered}"
+    );
+}
+
+/// On the **container**, not the newtype. `dump!`'s ladder resolves per
+/// top-level expression: `ServerEntry` derives `Serialize`, so without its
+/// own `Dump` impl the whole serde tree is rendered and a transparent
+/// newtype serializes as its inner string — `ServerAddress::dump` is never
+/// reached. A test on the newtype alone proves nothing about this.
+#[skuld::test]
+fn server_entry_dump_omits_the_address() {
+    let rendered = dump::dump!(&secret_entry()).to_string();
+    assert!(
+        !rendered.contains(SECRET_ADDR),
+        "dump! must not carry the server address: {rendered}"
+    );
+    assert!(
+        !rendered.contains(SECRET_PW),
+        "the same ladder bypasses ServerEntry's password-redacting Debug: {rendered}"
+    );
+}
+
+#[skuld::test]
+fn server_address_dump_renders_as_a_secret() {
+    let addr = ServerAddress::new(SECRET_ADDR);
+    let rendered = dump::dump!(&addr).to_string();
+    assert!(!rendered.contains(SECRET_ADDR), "{rendered}");
+    assert!(rendered.contains("REDACTED"), "{rendered}");
+}
+
+#[skuld::test]
+fn server_entry_json_round_trips_the_exact_address() {
+    let entry = secret_entry();
+    let json = serde_json::to_string(&entry).expect("serialize");
+    assert!(json.contains(SECRET_ADDR), "config.json must keep the real address");
+    let back: ServerEntry = serde_json::from_str(&json).expect("deserialize");
+    assert_eq!(back.server.expose(), SECRET_ADDR);
 }

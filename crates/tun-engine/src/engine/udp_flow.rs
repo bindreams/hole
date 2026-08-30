@@ -64,6 +64,14 @@ impl UdpFlow {
         self.rx.recv().await
     }
 
+    /// Non-blocking form of [`Self::recv`], for asserting the flow is
+    /// closed or empty at a happens-after edge — e.g. after joining the
+    /// engine's task, when a still-open flow is a bug rather than a race.
+    #[cfg(test)]
+    pub(crate) fn try_recv(&mut self) -> Result<Vec<u8>, mpsc::error::TryRecvError> {
+        self.rx.try_recv()
+    }
+
     /// Inject a reply datagram back to the TUN side.
     ///
     /// The source/destination are auto-swapped from the flow's 5-tuple:
