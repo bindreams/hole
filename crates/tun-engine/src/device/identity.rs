@@ -71,6 +71,13 @@ pub enum Incumbent {
 /// `status` is `ConvertInterfaceAliasToLuid`'s own return code. `guid` is
 /// `Some` only when BOTH FFI reads (alias→LUID, then LUID→GUID) already
 /// succeeded; `None` whenever the alias didn't resolve at all.
+///
+/// `cfg`-gated to Windows-or-test rather than bare `windows`: production has
+/// exactly one caller, [`probe_incumbent`] (Windows-only), but the pure
+/// classification logic is also exercised directly by `identity_tests.rs` on
+/// every platform — without `test` in the gate this would be flagged dead
+/// code on a non-Windows, non-test build.
+#[cfg(any(target_os = "windows", test))]
 fn classify_incumbent(status: u32, guid: Option<u128>, expect: u128) -> std::io::Result<Incumbent> {
     // ERROR_INVALID_PARAMETER — what `ConvertInterfaceAliasToLuid` returns
     // when the alias doesn't match an installed adapter (matches the

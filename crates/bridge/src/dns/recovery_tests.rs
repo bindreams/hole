@@ -1,9 +1,13 @@
 use std::net::{IpAddr, Ipv4Addr};
+#[cfg(target_os = "windows")]
 use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+#[cfg(target_os = "windows")]
 use std::sync::Mutex;
 
 use super::*;
-use crate::dns_state::{DnsPrior, DnsPriorAdapter, DnsState, SCHEMA_VERSION};
+#[cfg(target_os = "windows")]
+use crate::dns_state::{DnsPrior, DnsPriorAdapter};
+use crate::dns_state::{DnsState, SCHEMA_VERSION};
 
 fn write_state(dir: &std::path::Path, state: &DnsState) {
     let json = serde_json::to_vec_pretty(state).unwrap();
