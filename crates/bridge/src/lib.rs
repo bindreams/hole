@@ -17,6 +17,7 @@ pub mod plugin_state;
 pub mod proxy;
 pub mod proxy_manager;
 pub mod reachability;
+pub mod route_recovery;
 pub mod server_test;
 pub mod socket;
 

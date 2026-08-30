@@ -7,8 +7,8 @@
 //!
 //! See [`crate::hole_router`] for the role→mechanism wiring (Proxy →
 //! [`Socks5Endpoint`], Bypass → [`InterfaceEndpoint`]) and the full
-//! cascade. Blocking is not a mechanism and has no `Endpoint`: a dropped
-//! flow is served by nothing and only recorded, on
+//! cascade. Blocking is not a mechanism and has no `Endpoint`: the router
+//! releases a dropped flow inline, and the flow is only recorded, on
 //! [`crate::drop_sink::DropSink`].
 //!
 //! Tests wire any mechanism to any slot through the crate-private

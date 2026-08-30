@@ -13,7 +13,7 @@ fn sample_server() -> ServerEntry {
     ServerEntry {
         id: "test-id".to_string(),
         name: "Test".to_string(),
-        server: "1.2.3.4".to_string(),
+        server: "1.2.3.4".into(),
         server_port: 8388,
         method: "aes-256-gcm".to_string(),
         password: "secret".to_string(),

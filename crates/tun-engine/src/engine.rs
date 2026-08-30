@@ -8,7 +8,7 @@
 //!     c.tun_name = "hole-tun".into();
 //!     c.mtu = 1400;
 //!     c.ipv4 = Some("10.255.0.1/24".parse().unwrap());
-//!     c.ipv6 = Some("fd00::ff00:1/64".parse().unwrap());
+//!     c.ipv6 = Some("fdf8:f6d5:536e::1/64".parse().unwrap());
 //! })?;
 //! let router = Arc::new(my_router);
 //! let engine = Engine::build(device, router, |c| {
@@ -18,15 +18,23 @@
 //! engine.run(cancel_token).await;
 //! ```
 
+mod admission;
 mod config;
 mod dns;
+mod driver;
+mod egress;
 // Widened so `sim::packet` (a sibling of `engine`, not a descendant) can
-// reach `driver::build_udp_packet` — there is no dedicated emitter module in
-// this tree yet (bindreams/hole#900 is unmerged), so the packet-builder the
-// simulator needs to share still lives on `Driver`'s own module.
-pub(crate) mod driver;
+// reach `build_udp_packet` — the simulator's UDP builder delegates to it so
+// it can never drift from what the engine itself emits for a reply.
+pub(crate) mod emit;
+mod parse;
 mod router;
+mod socket_stack;
 mod tcp_flow;
+// Packet-level test infrastructure with no business-logic counterpart, shared
+// by `socket_stack_tests.rs` and `driver_tests.rs`; see the module docs.
+#[cfg(test)]
+mod tcp_test_support;
 pub(crate) mod udp_flow;
 mod virtual_device;
 

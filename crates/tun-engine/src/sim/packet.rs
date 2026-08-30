@@ -7,9 +7,9 @@ use smoltcp::wire::{
     IpAddress, IpProtocol, Ipv4Packet, Ipv4Repr, Ipv6Packet, Ipv6Repr, TcpControl, TcpPacket, TcpRepr, TcpSeqNumber,
 };
 
-use crate::engine::driver::build_udp_packet;
+use crate::engine::emit::build_udp_packet;
 
-/// Build a raw IP+UDP packet. Delegates to the driver's own emitter so the
+/// Build a raw IP+UDP packet. Delegates to the engine's own emitter so the
 /// simulator can never drift from what the engine itself builds for a UDP
 /// reply.
 pub fn udp_packet(src: SocketAddr, dst: SocketAddr, payload: &[u8]) -> Vec<u8> {

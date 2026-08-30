@@ -282,7 +282,9 @@ impl HoleRouter {
             Dispatch::Endpoint(endpoint) => endpoint.serve_tcp(flow, dst).await,
             Dispatch::Drop(reason) => {
                 self.log_drop(reason, dst, domain.as_deref(), L4Proto::Tcp);
-                // Drop the flow — smoltcp sends RST.
+                // Drop the flow. Closing the handler channel makes the driver
+                // take its `Disconnected` arm — `socket.close()`, a graceful
+                // FIN, gated on `may_send()`. No RST is emitted here.
                 Ok(())
             }
         }

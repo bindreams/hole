@@ -11,7 +11,7 @@
 //! connect would fail for the wrong reason.
 //!
 //! Cross-binary serialization of the global WFP/pf/TUN state lives in
-//! `.config/nextest.toml` (`global-net-state` test-group). COUPLED NAMES: that
+//! `.config/nextest.toml` (`global_net_state` test-group). COUPLED NAMES: that
 //! group's filter matches by the `cutover_global_net_state_` prefix -- renaming a
 //! prefix WITHOUT updating the filter drops the test from the group (a silent
 //! cross-binary race). Change both together.
@@ -24,6 +24,13 @@ fn main() {
 
 #[skuld::label]
 const TUN: skuld::Label;
+
+/// Cross-binary serialization for tests that mutate GLOBAL OS network state —
+/// the `.config/nextest.toml` `global_net_state` test-group's `max-threads = 1`
+/// gate. This is a separate compiled binary, not part of `hole-bridge`'s lib
+/// target, so it needs its own declaration (bindreams/hole#894).
+#[skuld::label]
+const GLOBAL_NET_STATE: skuld::Label;
 
 #[cfg(any(target_os = "windows", target_os = "macos"))]
 use std::net::TcpStream;
@@ -84,7 +91,7 @@ fn connect(addr: &str) -> std::io::Result<TcpStream> {
 /// skips the `/etc/pf.conf` reload -- is proven at the unit level by
 /// `routing_tests::recover_orders_lockdown_before_transient_sweep_and_passes_adopting`.)
 #[cfg(any(target_os = "windows", target_os = "macos"))]
-#[skuld::test(labels = [TUN], serial = TUN)]
+#[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
 fn cutover_global_net_state_disarm_preserves_the_standing_egress_block() {
     use tun_engine::routing::failclosed::{disengage_lockdown, engage_lockdown, lockdown_state, SystemLuidResolver};
     use tun_engine::routing::CoverGuard;

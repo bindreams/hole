@@ -1,6 +1,8 @@
 use super::*;
 use std::net::IpAddr;
 
+use crate::GLOBAL_NET_STATE;
+
 fn v4() -> IpAddr {
     "203.0.113.7".parse().unwrap()
 }
@@ -645,7 +647,12 @@ fn new_loopbacknet_guids_are_in_their_sweep_floors_and_distinct() {
 
 // release_all =========================================================================================================
 
-#[skuld::test]
+// Not a privileged real-engage test — a bare mocked unit test that the
+// `.config/nextest.toml` `global_net_state` filter's `release_all_` name
+// substring incidentally sweeps in (Option B, bindreams/hole#894): labeled to
+// preserve its existing group membership exactly, not because it mutates
+// real OS state.
+#[skuld::test(labels = [GLOBAL_NET_STATE])]
 fn release_all_first_delete_failure_reports_the_first_real_error_and_inspects_every_code() {
     // Not-found is benign (a clean host or an already-swept filter); the fold
     // must skip it and report the FIRST genuine failure, not stop at it —
@@ -694,4 +701,256 @@ fn adopt_does_not_delete_the_address_range_loopback_floor() {
     }
     // Adopt still drops exactly the four volatile permits — unchanged by this fix.
     assert_eq!(adopt.len(), 4, "adopt_delete_guids unchanged: TUN V4/V6 + server V4/V6");
+}
+
+// Cover presence ======================================================================================================
+
+use crate::routing::CoverPresence;
+
+/// `ERROR_ACCESS_DENIED` as the Win32 DWORD a DACL-denied FWPM read returns.
+const ERROR_ACCESS_DENIED_DWORD: u32 = 5;
+
+#[skuld::test]
+fn classify_presence_is_closed_over_its_inputs() {
+    let nf = FWP_E_FILTER_NOT_FOUND_DWORD;
+    let ok = ERROR_SUCCESS.0;
+    let cases: [(bool, &[u32], CoverPresence); 6] = [
+        (false, &[], CoverPresence::Unreachable),
+        (false, &[ok], CoverPresence::Unreachable),
+        (true, &[nf, nf, nf], CoverPresence::Absent),
+        (true, &[nf, ok, nf], CoverPresence::Live),
+        (true, &[nf, 0x8032_0001, nf], CoverPresence::Indeterminate),
+        (true, &[0x8032_0001, ok], CoverPresence::Live),
+    ];
+    for (opened, codes, expected) in cases {
+        assert_eq!(
+            classify_presence(opened, codes),
+            expected,
+            "engine_opened={opened} codes={codes:x?} must classify as {expected:?}"
+        );
+    }
+    assert_eq!(
+        classify_presence(true, &[]),
+        CoverPresence::Absent,
+        "an open engine with nothing to report found no cover"
+    );
+}
+
+#[skuld::test]
+fn an_access_denied_code_is_never_absent() {
+    // The structural guarantee that makes the unelevated-read question a
+    // documentation matter, not a correctness dependency: ONLY the literal
+    // FWP_E_FILTER_NOT_FOUND produces `Absent`, so a denied read can never be
+    // mistaken for a clean host.
+    let nf = FWP_E_FILTER_NOT_FOUND_DWORD;
+    assert_eq!(
+        classify_presence(true, &[nf, ERROR_ACCESS_DENIED_DWORD, nf]),
+        CoverPresence::Indeterminate,
+        "a DACL-denied read must be Indeterminate, never Absent"
+    );
+}
+
+#[skuld::test]
+fn an_interrupted_sweep_still_reads_as_live() {
+    // The sweeps loop delete-by-key with every return code discarded, so a
+    // sweep killed part-way (say after index 6, leaving block-all V6) survives
+    // a reboot as a PARTIAL cover. One found GUID is enough to report Live —
+    // otherwise that partial cover would answer Absent forever.
+    let nf = FWP_E_FILTER_NOT_FOUND_DWORD;
+    let mut codes = vec![nf; swept_lockdown_guids().len()];
+    for i in 0..codes.len() {
+        let mut one = codes.clone();
+        one[i] = ERROR_SUCCESS.0;
+        assert_eq!(
+            classify_presence(true, &one),
+            CoverPresence::Live,
+            "a single surviving filter at index {i} must read as Live"
+        );
+    }
+    codes[0] = ERROR_SUCCESS.0;
+    assert_eq!(classify_presence(true, &codes), CoverPresence::Live);
+}
+
+#[skuld::test]
+fn presence_probes_every_swept_lockdown_guid() {
+    // `lockdown_cover_presence` iterates exactly `swept_lockdown_guids()` — the
+    // same set the sweeps delete — so no residue the sweep would remove can
+    // hide from the probe.
+    let probed = swept_lockdown_guids();
+    assert_eq!(
+        probed.len(),
+        LOCKDOWN_FILTER_GUIDS.len() + MAX_APPID_BINARIES * 2,
+        "the probe must cover the fixed lockdown GUIDs plus every App-ID slot"
+    );
+    assert!(
+        probed.contains(&LOCKDOWN_FILTER_GUIDS[6]),
+        "block-all V4 must be probed"
+    );
+    assert!(
+        probed.contains(&LOCKDOWN_FILTER_GUIDS[7]),
+        "block-all V6 must be probed"
+    );
+    for i in 0..MAX_APPID_BINARIES {
+        assert!(probed.contains(&appid_filter_guid(i, false)), "App-ID slot {i} V4");
+        assert!(probed.contains(&appid_filter_guid(i, true)), "App-ID slot {i} V6");
+    }
+}
+
+// engage-time volatile-permit refresh =================================================================================
+
+#[skuld::test]
+fn engage_lockdown_refreshes_the_volatile_permits() {
+    // The refresh lives at ENGAGE, not at recovery: `ok_or_exists` treats a
+    // re-add of a fixed-key filter as success, so without a delete first the
+    // stale TUN LUID and the previous server IP would survive a reconnect.
+    let spec = build_lockdown_spec(v4(), luid(), &[plugin_path(), bridge_path()]);
+    assert_eq!(
+        spec.pre_delete,
+        adopt_delete_guids(),
+        "engage must drop exactly the volatile permits — the TUN pair and BOTH server-family \
+         permits — before adding anything"
+    );
+
+    // Every deleted key is either re-added with this attempt's fresh values
+    // (the TUN pair, and the server permit for THIS family) or deliberately
+    // left deleted (the other family's stale server permit).
+    let added: std::collections::HashSet<GUID> = spec.filters.iter().map(|f| f.guid).collect();
+    for &i in &LOCKDOWN_TUN_GUID_INDICES {
+        assert!(
+            added.contains(&LOCKDOWN_FILTER_GUIDS[i]),
+            "the TUN permit at index {i} must be re-added fresh after the delete"
+        );
+    }
+    assert!(
+        added.contains(&LOCKDOWN_FILTER_GUIDS[4]),
+        "a v4 server must have its v4 permit re-added"
+    );
+    assert!(
+        !added.contains(&LOCKDOWN_FILTER_GUIDS[5]),
+        "the other family's server permit stays deleted, not re-added stale"
+    );
+
+    // The fail-closed floor is never dropped by an engage either.
+    for guid in [
+        LOCKDOWN_FILTER_GUIDS[6],
+        LOCKDOWN_FILTER_GUIDS[7],
+        LOCKDOWN_FILTER_GUIDS[0],
+        LOCKDOWN_FILTER_GUIDS[1],
+        LOCKDOWN_FILTER_GUIDS[8],
+        LOCKDOWN_FILTER_GUIDS[9],
+    ] {
+        assert!(
+            !spec.pre_delete.contains(&guid),
+            "engage must not delete the fail-closed floor {guid:?}"
+        );
+    }
+    for i in 0..MAX_APPID_BINARIES {
+        assert!(!spec.pre_delete.contains(&appid_filter_guid(i, false)));
+        assert!(!spec.pre_delete.contains(&appid_filter_guid(i, true)));
+    }
+}
+
+#[skuld::test]
+fn the_transient_cover_deletes_nothing_at_engage() {
+    // Only the lockdown cover has fixed-key volatile permits to refresh; the
+    // transient cover is engaged once per attempt over a swept host.
+    assert!(build_cover_spec(v4(), None).pre_delete.is_empty());
+    assert!(build_cover_spec(v6(), Some(resolver_v4())).pre_delete.is_empty());
+}
+
+// Recovery-time TUN-permit reclaim ====================================================================================
+
+#[skuld::test]
+fn should_reclaim_tun_permit_only_when_unresolved() {
+    // A resolving hole-tun means some bridge may be relying on the permit —
+    // never reclaim it. Only a provably-gone name is safe to delete.
+    assert!(
+        !should_reclaim_tun_permit(true),
+        "a resolving hole-tun must never be reclaimed"
+    );
+    assert!(
+        should_reclaim_tun_permit(false),
+        "an unresolvable hole-tun must be reclaimed"
+    );
+}
+
+struct StubResolver {
+    result: std::sync::Mutex<Option<Result<u64, RoutingError>>>,
+    called_with: std::sync::Mutex<Option<String>>,
+}
+
+impl crate::routing::failclosed::LuidResolver for StubResolver {
+    fn resolve(&self, alias: &str) -> Result<u64, RoutingError> {
+        *self.called_with.lock().unwrap() = Some(alias.to_owned());
+        self.result
+            .lock()
+            .unwrap()
+            .take()
+            .expect("resolve called more than once in this test")
+    }
+}
+
+#[skuld::test]
+fn reclaim_stale_tun_permit_resolves_the_given_name() {
+    // Reintroduction proof for a hardcoded-alias regression: the resolver
+    // must see the SAME name the caller passed, not a literal baked into this
+    // function.
+    let resolver = StubResolver {
+        result: std::sync::Mutex::new(Some(Ok(0x1234))),
+        called_with: std::sync::Mutex::new(None),
+    };
+    reclaim_stale_tun_permit(&resolver, "some-other-tun");
+    assert_eq!(
+        resolver.called_with.into_inner().unwrap().as_deref(),
+        Some("some-other-tun"),
+        "reclaim must resolve the exact alias it was given"
+    );
+}
+
+#[skuld::test]
+fn first_delete_failure_treats_access_denied_as_a_genuine_failure() {
+    // Mirrors `an_access_denied_code_is_never_absent`: the code class Finding
+    // 4 (#898 rework) is about — a DACL-denied delete must never be folded
+    // away as though the reclaim succeeded.
+    let codes = [("TUN-LUID permit", ERROR_ACCESS_DENIED_DWORD)];
+    let err = first_delete_failure(&codes).expect("an access-denied delete must be a genuine failure");
+    assert!(
+        err.to_string().contains("TUN-LUID permit"),
+        "must name what failed: {err}"
+    );
+}
+
+#[skuld::test]
+fn reclaim_stale_tun_permit_does_not_discard_delete_codes() {
+    // Structural guard, not a proof (mirrors
+    // `route_recovery::recover_routes_has_exactly_one_bridge_caller` in the
+    // bridge crate): Finding 4 (#898 rework) was
+    // `let _ = FwpmFilterDeleteByKey0(...)`, silently discarding the exact
+    // return code that means a filter is STILL blocking egress. Assert the
+    // source routes the TUN-permit deletes through the same
+    // `first_delete_failure` fold `Cover::drop`'s Lockdown arm and
+    // `delete_all` use, rather than re-running the real FWPM call under an
+    // access-denied DACL to observe it (this file has no such fixture).
+    let src = include_str!("windows.rs");
+    let start = src
+        .find("pub fn reclaim_stale_tun_permit(")
+        .expect("reclaim_stale_tun_permit must exist in windows.rs");
+    let after = &src[start..];
+    let next_pub_fn = after[1..].find("\npub fn ").map(|i| i + 1);
+    let next_pub_crate_fn = after[1..].find("\npub(crate) fn ").map(|i| i + 1);
+    let end = [next_pub_fn, next_pub_crate_fn]
+        .into_iter()
+        .flatten()
+        .min()
+        .unwrap_or(after.len());
+    let body = &after[..end];
+
+    assert!(
+        !body.contains("let _ = FwpmFilterDeleteByKey0"),
+        "reclaim_stale_tun_permit must not discard a TUN-permit delete's return code:\n{body}"
+    );
+    assert!(
+        body.contains("first_delete_failure"),
+        "reclaim_stale_tun_permit must fold its delete codes through first_delete_failure:\n{body}"
+    );
 }

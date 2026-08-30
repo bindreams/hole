@@ -54,6 +54,8 @@ smoltcp = { version = "0.13", default-features = false, features = [
     "alloc",
     "medium-ip", "proto-ipv4", "proto-ipv6",
     "socket-tcp", "socket-udp",
+    # Hold a listener in SynReceived so the accept verdict precedes the SYN-ACK.
+    "socket-tcp-pause-synack",
 ] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
@@ -79,3 +81,9 @@ wintun-bindings = "0.7"
 [dev-dependencies]
 skuld = { workspace = true }
 hole-test-observability = { path = "../test-observability" }
+# Recovery-path redaction tests capture tracing output through a
+# `RedactingWriter`: `WaitableWriter` (garter's `test-utils` feature) as the
+# sink, plus the mandated current-thread subscriber installer. garter does
+# not depend on tun-engine, so this is not a cycle.
+garter = { path = "../garter", features = ["test-utils"] }
+tracing-subscriber = { version = "0.3", features = ["fmt"] }
