@@ -1900,14 +1900,14 @@ lifetime, including `Dispatcher::Drop`'s wintun drain and `adapter_cleanup`'s
 sweep; and real egress from `InterfaceEndpoint` and `Socks5Endpoint`.
 
 **Proved by neither lane:** `cleanup_finished_connections`
-(`driver.rs:374-388`) — a resource-reclamation path with no external
+(`driver.rs:336-352`) — a resource-reclamation path with no external
 observable, whose absence is a leak rather than a behaviour change; the
-`Ok(0)` read arm (`driver.rs:161`), which `tun-0.8.14` never produces (pinned
+`Ok(0)` read arm (`driver.rs:131`), which `tun-0.8.14` never produces (pinned
 only as a simulator contract, in `sim/wire_tests.rs`); whether
 `Dispatcher::shutdown` drained or aborted the driver task (#905); the
 `max_sniffers` budget (#906); and that the `plugin_supports_udp` constructor
-argument reaches the cascade (`dispatcher.rs:56`) — covered by reading, plus
-the pure derivation tests at `proxy_manager_tests.rs:1816-1840`.
+argument reaches the cascade (`dispatcher.rs:98`) — covered by reading, plus
+the pure derivation tests at `proxy_manager_tests.rs:1907-1945`.
 
 Each of the third list's five needs a product change, not a cleverer test, to
 close. See #892 for the tracking issue, #880 for the full-tunnel e2e gap, and
