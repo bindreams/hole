@@ -1,5 +1,3 @@
-use std::net::{IpAddr, Ipv4Addr};
-
 use super::*;
 
 #[skuld::test]
@@ -9,25 +7,34 @@ fn guid_conversion_round_trips() {
     assert_eq!(win.to_u128(), g.0);
 }
 
-/// The one FFI path in this module that is reachable on an unelevated
-/// workstation. Measured empirically on this box: `FwpmEngineOpen0` for a
-/// *dynamic* session succeeds without elevation, but the first mutating
-/// call — `FwpmProviderAdd0`/`FwpmFilterAdd0` inside the transaction —
-/// fails with "Access is denied" (os error 5), which `classify` maps to
-/// `DnsConfineError::AddFilter`. `engage` must surface that as a typed
-/// error either way — never a panic, and never a silent `Ok` that would
-/// mean the confinement engaged nothing while `start_inner` believes DNS
-/// is confined. A box where even the engine open itself is blocked would
-/// legitimately report `EngineOpen` instead, so both variants are accepted
-/// here — what this test pins is "always a typed Err, never Ok, never a
-/// panic," not which specific stage fails on which machine.
+/// `engage` must surface a failed engine open as a typed error, never a
+/// silent `Ok` — an `Ok` here would mean the confinement engaged nothing
+/// while `start_inner` believes DNS is confined. Drives `engage_outcome`
+/// directly with a simulated failure so the property holds regardless of
+/// this process's real privilege.
 #[skuld::test]
-fn engage_without_elevation_returns_a_typed_error() {
-    let server_ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7));
-    let result = engage(0, server_ip, &[]);
+fn engage_returns_a_typed_error_when_the_engine_cannot_be_opened() {
+    let simulated_open_failure = Err(classify(Stage::EngineOpen, 5));
+    let result = engage_outcome(simulated_open_failure, |_engine| {
+        panic!("run_transaction must not run when the engine failed to open")
+    });
     match result {
-        Err(DnsConfineError::EngineOpen(_)) | Err(DnsConfineError::AddFilter(_)) => {}
-        Ok(_) => panic!("engage() succeeded without elevation — this box is unexpectedly elevated"),
+        Err(DnsConfineError::EngineOpen(_)) => {}
+        Err(e) => panic!("a failed engine open must surface as EngineOpen, got {e:?}"),
+        Ok(_) => panic!("a failed engine open must surface as a typed Err, got Ok"),
+    }
+}
+
+/// Same guarantee as above, for the other gating stage: a transaction
+/// failure (`AddFilter`/`Commit`) must also surface as a typed error, never
+/// a silent `Ok`.
+#[skuld::test]
+fn engage_returns_a_typed_error_when_the_transaction_fails() {
+    let result = engage_outcome(Ok(HANDLE::default()), |_engine| Err(classify(Stage::AddFilter, 5)));
+    match result {
+        Err(DnsConfineError::AddFilter(_)) => {}
+        Err(e) => panic!("a failed transaction must surface as AddFilter, got {e:?}"),
+        Ok(_) => panic!("a failed transaction must surface as a typed Err, got Ok"),
     }
 }
 

@@ -112,35 +112,53 @@ pub fn engage(
         };
         let mut engine = HANDLE::default();
         let rc = FwpmEngineOpen0(PCWSTR::null(), RPC_C_AUTHN_WINNT, None, Some(&session), &mut engine);
-        if rc != ERROR_SUCCESS.0 {
-            return Err(classify(Stage::EngineOpen, rc));
-        }
+        let engine_open = if rc != ERROR_SUCCESS.0 {
+            Err(classify(Stage::EngineOpen, rc))
+        } else {
+            Ok(engine)
+        };
 
-        let result = (|| -> Result<(), DnsConfineError> {
-            let rc = FwpmTransactionBegin0(engine, 0);
-            if rc != ERROR_SUCCESS.0 {
-                return Err(classify(Stage::AddFilter, rc));
-            }
-            add_provider(engine, built.provider)?;
-            add_sublayer(engine, built.sublayer, built.provider)?;
-            for f in &built.filters {
-                add_filter(engine, built.provider, built.sublayer, f)?;
-            }
-            let rc = FwpmTransactionCommit0(engine);
-            if rc != ERROR_SUCCESS.0 {
-                return Err(classify(Stage::Commit, rc));
-            }
-            Ok(())
-        })();
+        engage_outcome(engine_open, |engine| {
+            let result = (|| -> Result<(), DnsConfineError> {
+                let rc = FwpmTransactionBegin0(engine, 0);
+                if rc != ERROR_SUCCESS.0 {
+                    return Err(classify(Stage::AddFilter, rc));
+                }
+                add_provider(engine, built.provider)?;
+                add_sublayer(engine, built.sublayer, built.provider)?;
+                for f in &built.filters {
+                    add_filter(engine, built.provider, built.sublayer, f)?;
+                }
+                let rc = FwpmTransactionCommit0(engine);
+                if rc != ERROR_SUCCESS.0 {
+                    return Err(classify(Stage::Commit, rc));
+                }
+                Ok(())
+            })();
 
-        if let Err(e) = result {
-            let _ = FwpmTransactionAbort0(engine);
-            let _ = FwpmEngineClose0(engine);
-            return Err(e);
-        }
-
-        Ok(DnsConfinement { engine })
+            if result.is_err() {
+                let _ = FwpmTransactionAbort0(engine);
+                let _ = FwpmEngineClose0(engine);
+            }
+            result
+        })
     }
+}
+
+/// `engage`'s entire error-propagation decision, extracted from the FFI
+/// calls that produce its inputs: open the engine, then run the
+/// transaction, surfacing a typed `Err` from either stage and never a
+/// silent `Ok`. Kept separate so this is provable without a real FWPM call
+/// — `windows_tests.rs` drives it with simulated results directly, because
+/// CI's Windows runner is elevated on both its TUN and non-TUN lanes, so no
+/// lane there can produce a genuine unprivileged failure to assert against.
+fn engage_outcome(
+    engine_open: Result<HANDLE, DnsConfineError>,
+    run_transaction: impl FnOnce(HANDLE) -> Result<(), DnsConfineError>,
+) -> Result<DnsConfinement, DnsConfineError> {
+    let engine = engine_open?;
+    run_transaction(engine)?;
+    Ok(DnsConfinement { engine })
 }
 
 #[allow(
