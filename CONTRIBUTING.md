@@ -1874,6 +1874,47 @@ Spotlight "Hole" must reveal it.
   group, and its universe is `test-hole`'s package set even though the
   nextest.toml filter applies workspace-wide.
 
+### Datapath coverage: which lane proves what
+
+bindreams/hole#892 gives the TUN datapath's policy and packet paths headless
+coverage, via a router seam (Unit B) and a datapath seam (Units C–E). As of
+this section landing (end of Unit C), B and C are merged; the (D)/(E)-tagged
+entries below are the plan's target and not yet true on `main`.
+
+**Proved by the unprivileged lane** (`SKULD_LABELS=!tun`, all three CI legs):
+the drop cascade's consequence, including which mechanism served a flow and
+which recorded a drop (B); UDP dispatch identity, flow-table reuse and reply
+framing off the wire (C); the `DnsInterceptor` short-circuit and fall-through
+(C); cancellation teardown and read-error exit (C); TCP accept, 5-tuple
+fidelity and bidirectional relay including the partial-write drain (D, not
+yet landed); connection-permit release (D, not yet landed); and the
+dispatcher's shutdown/drop lifecycle (E, not yet landed).
+
+**Proved only by the elevated lane** (`SKULD_LABELS=tun`, plus the
+`hole bridge run` subprocess e2e): `Device::build` creating a real adapter
+with the requested name, MTU and address; the OS routing packets *into* that
+adapter (what #880 shows the current full-tunnel e2e does not prove); the OS
+*accepting* packets written out of it, which is what makes
+`VirtualTunDevice`'s `Checksum::Tx`-only choice load-bearing; adapter-handle
+lifetime, including `Dispatcher::Drop`'s wintun drain and `adapter_cleanup`'s
+sweep; and real egress from `InterfaceEndpoint` and `Socks5Endpoint`.
+
+**Proved by neither lane:** `cleanup_finished_connections`
+(`driver.rs:336-352`) — a resource-reclamation path with no external
+observable, whose absence is a leak rather than a behaviour change; the
+`Ok(0)` read arm (`driver.rs:131`), which `tun-0.8.13` never produces — the
+offset strip/prepend for macOS's utun header lives in the vendored `tun`
+crate's `platform/posix/split.rs` `Reader`/`Writer`, re-check there after the
+next bump (pinned only as a simulator contract, in `sim/wire_tests.rs`); whether
+`Dispatcher::shutdown` drained or aborted the driver task (#905); the
+`max_sniffers` budget (#906); and that the `plugin_supports_udp` constructor
+argument reaches the cascade (`dispatcher.rs:98`) — covered by reading, plus
+the pure derivation tests at `proxy_manager_tests.rs:1907-1945`.
+
+Each of the third list's five needs a product change, not a cleverer test, to
+close. See #892 for the tracking issue, #880 for the full-tunnel e2e gap, and
+#874 for the kill switch's own live-interface gap.
+
 ## Logging & diagnostics
 
 ### Log destinations

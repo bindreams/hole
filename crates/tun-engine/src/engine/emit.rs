@@ -4,7 +4,6 @@ use std::net::{IpAddr, SocketAddr};
 
 use smoltcp::phy::ChecksumCapabilities;
 use smoltcp::wire::{IpAddress, IpProtocol, Ipv4Packet, Ipv4Repr, Ipv6Packet, Ipv6Repr, UdpPacket, UdpRepr};
-use tracing::debug;
 
 /// Build a raw IP+UDP packet from the given fields, with correct checksums.
 pub(crate) fn build_udp_packet(src: SocketAddr, dst: SocketAddr, payload: &[u8]) -> Vec<u8> {
@@ -72,10 +71,12 @@ pub(crate) fn build_udp_packet(src: SocketAddr, dst: SocketAddr, payload: &[u8])
 
             buf
         }
-        _ => {
-            debug!("mismatched IP versions in UDP reply");
-            Vec::new()
-        }
+        // Both call sites build `src`/`dst` from a single parsed packet's
+        // 5-tuple, so the families are structurally equal; the
+        // `debug_assert!` above already catches a violation in debug/test
+        // builds. This is the release-mode enforcement of that same
+        // contract.
+        _ => unreachable!("build_udp_packet: src/dst IP family mismatch ({src} / {dst})"),
     }
 }
 

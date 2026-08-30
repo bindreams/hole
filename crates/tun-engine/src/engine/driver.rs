@@ -44,9 +44,11 @@ struct TcpConn {
     pending_send: Vec<u8>,
 }
 
-/// `T` is the TUN device. It is a parameter, not `tun::AsyncDevice` outright,
-/// so a test can drive the accept and disposal dispatch over an in-memory pipe
-/// — opening a real TUN needs elevation.
+/// `T` is the packet I/O — `tun::AsyncDevice` by default. A test drives the
+/// same accept/dispatch/reply logic over `sim::SimTun`, an in-memory pipe,
+/// since opening a real TUN needs elevation. See
+/// [`Engine::from_io`](super::Engine::from_io) for the framing contract `T`
+/// must uphold.
 pub(crate) struct Driver<T = tun::AsyncDevice> {
     tun: T,
     stack: SocketStack,
@@ -301,25 +303,31 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Driver<T> {
             // Direction: Router → smoltcp.
             if socket.may_send() {
                 if !conn.pending_send.is_empty() && socket.can_send() {
-                    if let Ok(sent) = socket.send_slice(&conn.pending_send) {
-                        if sent >= conn.pending_send.len() {
-                            conn.pending_send.clear();
-                        } else {
-                            conn.pending_send.drain(..sent);
-                        }
+                    let sent = socket.send_slice(&conn.pending_send).expect(
+                        "send_slice's only error is SendError::InvalidState (!may_send()); can_send() \
+                         was just checked and nothing between it and this call can change the socket's \
+                         state (no .await, no Interface::poll())",
+                    );
+                    if sent >= conn.pending_send.len() {
+                        conn.pending_send.clear();
+                    } else {
+                        conn.pending_send.drain(..sent);
                     }
                 }
 
                 while conn.pending_send.is_empty() && socket.can_send() {
                     match conn.from_handler.try_recv() {
-                        Ok(data) => match socket.send_slice(&data) {
-                            Ok(sent) if sent < data.len() => {
+                        Ok(data) => {
+                            let sent = socket.send_slice(&data).expect(
+                                "send_slice's only error is SendError::InvalidState (!may_send()); \
+                                 can_send() was just checked and nothing between it and this call can \
+                                 change the socket's state (no .await, no Interface::poll())",
+                            );
+                            if sent < data.len() {
                                 conn.pending_send = data[sent..].to_vec();
                                 break;
                             }
-                            Ok(_) => {}
-                            Err(_) => break,
-                        },
+                        }
                         Err(mpsc::error::TryRecvError::Empty) => break,
                         Err(mpsc::error::TryRecvError::Disconnected) => {
                             socket.close();
@@ -369,11 +377,8 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Driver<T> {
             if let Some(interceptor) = self.dns_interceptor.clone() {
                 match dns::intercept(interceptor.as_ref(), payload, &self.cancel).await {
                     dns::Intercepted::Reply(reply) => {
-                        // Construct reply packet with swapped 5-tuple.
                         let pkt = build_udp_packet(parsed.dst, parsed.src, &reply);
-                        if !pkt.is_empty() {
-                            self.pending_tun_writes.push(pkt);
-                        }
+                        self.pending_tun_writes.push(pkt);
                         return true;
                     }
                     dns::Intercepted::Declined => {
@@ -431,9 +436,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Driver<T> {
     fn process_udp_replies(&mut self) {
         while let Ok(reply) = self.reply_rx.try_recv() {
             let pkt = build_udp_packet(reply.src, reply.dst, &reply.payload);
-            if !pkt.is_empty() {
-                self.pending_tun_writes.push(pkt);
-            }
+            self.pending_tun_writes.push(pkt);
         }
     }
 
@@ -449,3 +452,15 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Driver<T> {
 #[cfg(test)]
 #[path = "driver_tests.rs"]
 mod driver_tests;
+
+#[cfg(test)]
+#[path = "driver_udp_tests.rs"]
+mod driver_udp_tests;
+
+#[cfg(test)]
+#[path = "driver_dns_tests.rs"]
+mod driver_dns_tests;
+
+#[cfg(test)]
+#[path = "driver_lifecycle_tests.rs"]
+mod driver_lifecycle_tests;
