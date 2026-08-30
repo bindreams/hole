@@ -355,6 +355,57 @@ async fn a_dropped_router_leaves_the_clients_final_bytes_undelivered() {
     assert_eq!(out[0].ack, Some(TcpSeqNumber(1001 + 100 + 1)));
 }
 
+/// `relay_tcp_data`'s `send_slice` calls are guarded by `can_send()`
+/// immediately beforehand with nothing in between that can change the
+/// socket's state, so `send_slice`'s only error (`InvalidState`) cannot
+/// fire — the calls `.expect()` that. This is the happy path both call
+/// sites guard: fresh data queued via the Router's channel reaches the
+/// wire intact through the `while` loop.
+#[skuld::test]
+async fn router_written_data_reaches_the_client_intact() {
+    let mut d = driver(4);
+    let (handle, synack_seq) = admit_one(&mut d, client(), dest(), 1000, 0);
+    d.stack.enqueue_rx(ack(client(), dest(), 1001, synack_seq));
+    d.stack.poll(t(2));
+    assert_eq!(d.stack.socket(handle).state(), tcp::State::Established);
+
+    let (tx, rx) = mpsc::channel(4);
+    d.connections.get_mut(&handle).unwrap().from_handler = rx;
+    tx.try_send(b"hello from router".to_vec()).unwrap();
+
+    d.relay_tcp_data();
+    d.stack.poll(t(3));
+
+    let out = tcp_out(&mut d.stack);
+    assert_eq!(out.len(), 1);
+    assert_eq!(out[0].payload, b"hello from router");
+}
+
+/// The other `send_slice` call site: a chunk left over from a prior partial
+/// send (`pending_send`) is drained first, ahead of anything new on the
+/// Router's channel.
+#[skuld::test]
+async fn a_partial_send_resumes_from_pending_send_on_the_next_relay_pass() {
+    let mut d = driver(4);
+    let (handle, synack_seq) = admit_one(&mut d, client(), dest(), 1000, 0);
+    d.stack.enqueue_rx(ack(client(), dest(), 1001, synack_seq));
+    d.stack.poll(t(2));
+    assert_eq!(d.stack.socket(handle).state(), tcp::State::Established);
+
+    d.connections.get_mut(&handle).unwrap().pending_send = b"leftover".to_vec();
+
+    d.relay_tcp_data();
+    d.stack.poll(t(3));
+
+    let out = tcp_out(&mut d.stack);
+    assert_eq!(out.len(), 1);
+    assert_eq!(out[0].payload, b"leftover");
+    assert!(
+        d.connections.get(&handle).unwrap().pending_send.is_empty(),
+        "pending_send was not fully drained"
+    );
+}
+
 /// Reaches Task 2's conclusion through `Driver`'s own methods instead of
 /// `SocketStack`'s. The phase sequence below is a copy of
 /// `Driver::run`'s (`driver.rs:153-159`), substituting `stack.poll(t(..))`

@@ -7,78 +7,14 @@
 //! `sim::recording_router` — no real socket, proxy or bypass mechanism is
 //! involved.
 
-#![allow(clippy::disallowed_methods)]
-// This file's `CancellationToken::new()` is the test's own root — an
-// unprivileged `Engine::run` driven directly has no cooperative-cancel chain
-// to shadow (that rule is about `crates/bridge/src/`). See clippy.toml.
-
-use std::net::SocketAddr;
-use std::time::Duration;
-
 use smoltcp::wire::{IpAddress, Ipv4Packet, Ipv6Packet, UdpPacket};
-use tokio::sync::mpsc;
-use tokio::task::JoinHandle;
-use tokio_util::sync::CancellationToken;
 
-use crate::device::MutDeviceConfig;
-use crate::sim::{packet_pair, recording_router, udp_packet, Dispatch, SimWire};
-use crate::{DeviceConfig, Engine, MutEngineConfig};
-
-fn device_config() -> DeviceConfig {
-    MutDeviceConfig {
-        tun_name: "sim0".into(),
-        mtu: 1400,
-        ipv4: Some("10.255.0.1/24".parse().unwrap()),
-        ipv6: Some("fd00::ff00:1/64".parse().unwrap()),
-    }
-    .freeze()
-}
-
-fn v4(s: &str, port: u16) -> SocketAddr {
-    format!("{s}:{port}").parse().unwrap()
-}
-
-fn v6(s: &str, port: u16) -> SocketAddr {
-    format!("[{s}]:{port}").parse().unwrap()
-}
-
-/// Every test's shape: an `Engine::from_io` over an in-memory wire and a
-/// recording router, run on its own task, with `udp_flow_idle_timeout` set
-/// to a day so the sweep can never structurally fire inside a test.
-struct Harness {
-    wire: SimWire,
-    dispatch: mpsc::Receiver<Dispatch>,
-    cancel: CancellationToken,
-    handle: JoinHandle<()>,
-}
-
-fn start() -> Harness {
-    let (tun, wire) = packet_pair(64);
-    let (router, dispatch) = recording_router();
-    let cancel = CancellationToken::new();
-    let engine = Engine::from_io(tun, device_config(), router, |c: &mut MutEngineConfig| {
-        c.udp_flow_idle_timeout = Duration::from_secs(24 * 3600);
-    })
-    .expect("from_io with a valid DeviceConfig never fails");
-    let handle = tokio::spawn(engine.run(cancel.clone()));
-    Harness {
-        wire,
-        dispatch,
-        cancel,
-        handle,
-    }
-}
-
-impl Harness {
-    async fn shutdown(self) {
-        self.cancel.cancel();
-        self.handle.await.expect("engine task panicked");
-    }
-}
+use super::super::driver_sim_test_support::{start, v4, v6};
+use crate::sim::{udp_packet, Dispatch};
 
 #[skuld::test]
 async fn a_udp_datagram_reaches_the_router_with_its_five_tuple() {
-    let mut h = start();
+    let mut h = start(|_| {});
     let src = v4("10.255.0.2", 51000);
     let dst = v4("8.8.8.8", 443);
 
@@ -96,7 +32,7 @@ async fn a_udp_datagram_reaches_the_router_with_its_five_tuple() {
 
 #[skuld::test]
 async fn the_first_datagram_is_seeded_into_the_new_flow() {
-    let mut h = start();
+    let mut h = start(|_| {});
     let src = v4("10.255.0.2", 51000);
     let dst = v4("8.8.8.8", 443);
 
@@ -112,7 +48,7 @@ async fn the_first_datagram_is_seeded_into_the_new_flow() {
 
 #[skuld::test]
 async fn a_second_datagram_on_the_same_five_tuple_reuses_the_flow() {
-    let mut h = start();
+    let mut h = start(|_| {});
     let src = v4("10.255.0.2", 51000);
     let dst = v4("8.8.8.8", 443);
 
@@ -123,20 +59,31 @@ async fn a_second_datagram_on_the_same_five_tuple_reuses_the_flow() {
     assert_eq!(flow.recv().await.as_deref(), Some(b"first".as_slice()));
 
     h.wire.inject(udp_packet(src, dst, b"second")).await;
-    // Edge: the second payload arriving on the same flow orders the negative
-    // below — a second `Dispatch` would only ever have preceded it.
     assert_eq!(flow.recv().await.as_deref(), Some(b"second".as_slice()));
+
+    // Rendezvous: a reply sent back through the same flow. The driver only
+    // writes it to the wire in `flush_to_tun`, called once `handle_udp_packet`
+    // has fully returned for "second" — i.e. strictly after any dispatch a
+    // duplicate-flow bug would have spawned while handling it. `flow.recv()`
+    // above does not give this: its wake fires from `try_send`, which
+    // precedes any such spawn in the same synchronous stretch, not after it.
+    flow.send(b"ack").await.expect("engine is still running");
+    h.wire.next_egress().await.expect("no reply reached the wire");
+
+    // Edge: joining the cancelled engine (see `Harness::shutdown`) is what
+    // orders this negative — the payload arriving on the reused flow does
+    // not, since a second `Dispatch` is decided by a separately spawned
+    // task racing this one, not by anything on `flow`'s channel.
+    let mut dispatch = h.shutdown().await;
     assert!(
-        h.dispatch.try_recv().is_err(),
+        dispatch.recv().await.is_none(),
         "a second flow was opened for the same 5-tuple"
     );
-
-    h.shutdown().await;
 }
 
 #[skuld::test]
 async fn a_datagram_with_a_different_source_port_opens_a_second_flow() {
-    let mut h = start();
+    let mut h = start(|_| {});
     let dst = v4("8.8.8.8", 443);
 
     h.wire.inject(udp_packet(v4("10.255.0.2", 51000), dst, b"a")).await;
@@ -156,7 +103,7 @@ async fn a_datagram_with_a_different_source_port_opens_a_second_flow() {
 
 #[skuld::test]
 async fn a_router_reply_is_written_to_the_tun_with_the_five_tuple_swapped() {
-    let mut h = start();
+    let mut h = start(|_| {});
     let src = v4("10.255.0.2", 51000);
     let dst = v4("8.8.8.8", 443);
 
@@ -184,7 +131,7 @@ async fn a_router_reply_is_written_to_the_tun_with_the_five_tuple_swapped() {
 
 #[skuld::test]
 async fn an_ipv6_udp_datagram_round_trips() {
-    let mut h = start();
+    let mut h = start(|_| {});
     let src = v6("fd00::ff00:2", 51000);
     let dst = v6("2001:db8::1", 443);
 

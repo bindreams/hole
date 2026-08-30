@@ -35,6 +35,10 @@ mod tcp_flow;
 // by `socket_stack_tests.rs` and `driver_tests.rs`; see the module docs.
 #[cfg(test)]
 mod tcp_test_support;
+// The `Engine::run`-over-`sim::SimWire` harness shared by `driver_dns_tests.rs`,
+// `driver_udp_tests.rs`, and `driver_lifecycle_tests.rs`; see the module docs.
+#[cfg(test)]
+mod driver_sim_test_support;
 pub(crate) mod udp_flow;
 mod virtual_device;
 
@@ -92,8 +96,9 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> Engine<T> {
     /// IP packet; one `write_all` writes exactly one IP packet. A real TUN
     /// device satisfies this (wintun and a character device each
     /// deliver/accept a whole packet per call, and macOS's 4-byte utun
-    /// protocol header is stripped/prepended inside `tun-0.8.14` before the
-    /// engine ever sees a buffer); `sim::SimTun` (test-only; not a doc link
+    /// protocol header is stripped/prepended inside `tun-0.8.13`'s
+    /// `platform/posix/split.rs` `Reader`/`Writer` before the engine ever
+    /// sees a buffer); `sim::SimTun` (test-only; not a doc link
     /// since `sim` is feature-gated out of a plain build) is the sanctioned
     /// in-memory implementation for tests.
     pub fn from_io<F>(io: T, device_config: DeviceConfig, router: Arc<dyn Router>, init: F) -> Result<Self, EngineError>

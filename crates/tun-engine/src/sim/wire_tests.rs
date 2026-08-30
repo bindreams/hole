@@ -68,6 +68,51 @@ async fn a_short_read_buffer_panics() {
     let _ = tun.read(&mut buf).await;
 }
 
+#[skuld::test(should_panic = "engine already exited")]
+async fn inject_after_the_engine_exited_names_the_engine_not_a_lifetime_bug() {
+    let (tun, wire) = packet_pair(4);
+    drop(tun); // ordinary post-teardown state, not a broken invariant
+
+    wire.inject(vec![1]).await;
+}
+
+#[skuld::test(should_panic = "engine already exited")]
+async fn fail_next_read_after_the_engine_exited_names_the_engine_not_capacity() {
+    let (tun, wire) = packet_pair(4);
+    drop(tun); // ordinary post-teardown state, not a full queue
+
+    wire.fail_next_read(io::ErrorKind::Other);
+}
+
+#[skuld::test(should_panic = "ingress queue full")]
+async fn fail_next_read_on_a_full_queue_names_capacity_not_the_engine() {
+    let (_tun, wire) = packet_pair(1);
+    wire.fail_next_read(io::ErrorKind::Other); // fills the one slot
+
+    wire.fail_next_read(io::ErrorKind::Other);
+}
+
+#[skuld::test]
+async fn a_tap_never_blocks_or_drops_past_the_old_64_slot_bound() {
+    // Regression: a bounded tap channel made `inject`/`next_egress` deadlock
+    // past 64 undrained records while `try_next_egress` silently dropped
+    // them instead — two inconsistent overflow policies on the same
+    // condition. The tap is unbounded, so 100 packets neither block nor
+    // drop.
+    let (_tun, mut wire) = packet_pair(200);
+    let mut tap = wire.tap();
+
+    for i in 0..100u8 {
+        wire.inject(vec![i]).await;
+    }
+
+    for i in 0..100u8 {
+        let (direction, packet) = tap.next().await.expect("tap dropped a record under load");
+        assert_eq!(direction, Direction::ToEngine);
+        assert_eq!(packet, vec![i]);
+    }
+}
+
 #[skuld::test]
 async fn a_tap_observes_both_directions() {
     let (mut tun, mut wire) = packet_pair(4);

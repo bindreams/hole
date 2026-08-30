@@ -93,3 +93,35 @@ max-threads = 1
 [[profile.default.overrides]]
 filter = 'test(/^e2e_.*full_tunnel/) + test(/windows_lockdown_permits_server_ip_/) + test(/macos_lockdown_permits_server_ip_/) + test(/failclosed_permits_/) + test(/release_all_/) + test(/cutover_global_net_state_/) + test(/live_tun_permit_/) + test(/tun_device_ipv6_/)'
 test-group = 'global_net_state'
+
+# `driver_dns_tests.rs` / `driver_udp_tests.rs` / `driver_lifecycle_tests.rs`
+# (crates/tun-engine/src/engine/) drive the whole engine over an in-memory
+# `sim::SimWire` — no real TUN device, no real network, no real timer besides
+# smoltcp's virtual clock. Several of their assertions have no
+# happens-before edge available (the driver's live behaviour, observed
+# before any cancellation) and so block on a plain channel `recv()` with
+# no other bound; a datapath regression there hangs instead of failing
+# (measured: a broken idle sweep hung one of these tests at 115s, a broken
+# first-datagram seed hung four of them at 84s each, both still running when
+# killed). `terminate-after` converts that hang into a failure carrying its
+# own test name instead of consuming the whole job budget and reading as
+# runner noise — the sanctioned "failure bound surfaced to a human" use of a
+# timeout, not synchronization.
+#
+# Scoped to these 17 test names, not `package(tun-engine)`: that package also
+# holds `global_net_state`-grouped privileged tests, serialized behind
+# bridge's `e2e_full_tunnel*` tests, which legitimately run 100-430s under
+# contention (see the group above) — a repo-wide or package-wide bound would
+# risk failing an honest slow run of those. These 17 have no such lane: the
+# full `tun-engine` suite (383 tests, including all of these) runs in ~7-8s
+# total here, so a 30s single-test period is over 30x that, and the loop
+# never terminates until `terminate-after` is hit — the first breach alone
+# never fails a test.
+#
+# COUPLED NAMES, same caveat as the group above: these are bare function
+# names (no module-path anchor available in this workspace's test names — see
+# `driver_dns_tests.rs`'s module doc). Add any new test to these three files
+# here too, or it hangs the job on a regression instead of failing fast.
+[[profile.default.overrides]]
+filter = 'test(/^(a_port_53_datagram_reaches_the_interceptor|an_intercepted_reply_is_written_to_the_tun_with_the_five_tuple_swapped|an_interceptor_returning_none_falls_through_to_the_router|a_non_53_datagram_never_reaches_the_interceptor|tcp_to_port_53_never_reaches_the_interceptor|an_ipv6_port_53_datagram_reaches_the_interceptor_and_its_reply_is_framed_correctly|an_ipv6_interceptor_returning_none_falls_through_to_the_router|a_udp_datagram_reaches_the_router_with_its_five_tuple|the_first_datagram_is_seeded_into_the_new_flow|a_second_datagram_on_the_same_five_tuple_reuses_the_flow|a_datagram_with_a_different_source_port_opens_a_second_flow|a_router_reply_is_written_to_the_tun_with_the_five_tuple_swapped|an_ipv6_udp_datagram_round_trips|cancelling_the_engine_ends_the_run_loop|cancelling_the_engine_closes_every_in_flight_flow|a_tun_read_error_ends_the_run_loop|the_driver_sweep_closes_a_flow_the_router_still_holds)$/)'
+slow-timeout = { period = "30s", terminate-after = 2 }

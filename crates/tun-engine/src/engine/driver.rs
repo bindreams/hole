@@ -303,25 +303,31 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Driver<T> {
             // Direction: Router → smoltcp.
             if socket.may_send() {
                 if !conn.pending_send.is_empty() && socket.can_send() {
-                    if let Ok(sent) = socket.send_slice(&conn.pending_send) {
-                        if sent >= conn.pending_send.len() {
-                            conn.pending_send.clear();
-                        } else {
-                            conn.pending_send.drain(..sent);
-                        }
+                    let sent = socket.send_slice(&conn.pending_send).expect(
+                        "send_slice's only error is SendError::InvalidState (!may_send()); can_send() \
+                         was just checked and nothing between it and this call can change the socket's \
+                         state (no .await, no Interface::poll())",
+                    );
+                    if sent >= conn.pending_send.len() {
+                        conn.pending_send.clear();
+                    } else {
+                        conn.pending_send.drain(..sent);
                     }
                 }
 
                 while conn.pending_send.is_empty() && socket.can_send() {
                     match conn.from_handler.try_recv() {
-                        Ok(data) => match socket.send_slice(&data) {
-                            Ok(sent) if sent < data.len() => {
+                        Ok(data) => {
+                            let sent = socket.send_slice(&data).expect(
+                                "send_slice's only error is SendError::InvalidState (!may_send()); \
+                                 can_send() was just checked and nothing between it and this call can \
+                                 change the socket's state (no .await, no Interface::poll())",
+                            );
+                            if sent < data.len() {
                                 conn.pending_send = data[sent..].to_vec();
                                 break;
                             }
-                            Ok(_) => {}
-                            Err(_) => break,
-                        },
+                        }
                         Err(mpsc::error::TryRecvError::Empty) => break,
                         Err(mpsc::error::TryRecvError::Disconnected) => {
                             socket.close();
@@ -371,7 +377,6 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Driver<T> {
             if let Some(interceptor) = self.dns_interceptor.clone() {
                 match dns::intercept(interceptor.as_ref(), payload, &self.cancel).await {
                     dns::Intercepted::Reply(reply) => {
-                        // Construct reply packet with swapped 5-tuple.
                         let pkt = build_udp_packet(parsed.dst, parsed.src, &reply);
                         self.pending_tun_writes.push(pkt);
                         return true;

@@ -108,7 +108,7 @@ impl AsyncWrite for SimTun {
 pub struct SimWire {
     ingress_tx: mpsc::Sender<Ingress>,
     egress_rx: mpsc::Receiver<Vec<u8>>,
-    tap: Option<mpsc::Sender<(Direction, Vec<u8>)>>,
+    tap: Option<mpsc::UnboundedSender<(Direction, Vec<u8>)>>,
 }
 
 impl SimWire {
@@ -116,19 +116,19 @@ impl SimWire {
     /// a real device once `capacity` packets are queued.
     pub async fn inject(&self, packet: Vec<u8>) {
         if let Some(tap) = &self.tap {
-            let _ = tap.send((Direction::ToEngine, packet.clone())).await;
+            let _ = tap.send((Direction::ToEngine, packet.clone()));
         }
         self.ingress_tx
             .send(Ingress::Packet(packet))
             .await
-            .expect("SimTun outlives every SimWire::inject call in a test");
+            .expect("SimWire::inject after the engine already exited: SimTun's ingress channel is closed");
     }
 
     /// Wait for the engine's next egress packet.
     pub async fn next_egress(&mut self) -> Option<Vec<u8>> {
         let pkt = self.egress_rx.recv().await;
         if let (Some(tap), Some(pkt)) = (&self.tap, &pkt) {
-            let _ = tap.send((Direction::FromEngine, pkt.clone())).await;
+            let _ = tap.send((Direction::FromEngine, pkt.clone()));
         }
         pkt
     }
@@ -138,7 +138,7 @@ impl SimWire {
     pub fn try_next_egress(&mut self) -> Option<Vec<u8>> {
         let pkt = self.egress_rx.try_recv().ok();
         if let (Some(tap), Some(pkt)) = (&self.tap, &pkt) {
-            let _ = tap.try_send((Direction::FromEngine, pkt.clone()));
+            let _ = tap.send((Direction::FromEngine, pkt.clone()));
         }
         pkt
     }
@@ -147,17 +147,24 @@ impl SimWire {
     /// anything injected after this call — what a real device surfaces on
     /// failure.
     pub fn fail_next_read(&self, kind: io::ErrorKind) {
-        self.ingress_tx
-            .try_send(Ingress::Err(kind))
-            .expect("fail_next_read: ingress queue full — grow packet_pair's capacity");
+        match self.ingress_tx.try_send(Ingress::Err(kind)) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                panic!("fail_next_read: ingress queue full — grow packet_pair's capacity")
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                panic!("fail_next_read after the engine already exited: SimTun's ingress channel is closed")
+            }
+        }
     }
 
     /// Observe every packet crossing the wire in either direction from this
     /// point on. Install before handing the wire to something that takes it
-    /// by value (e.g. `GuestStack::spawn` in Unit D) — that is the only way
-    /// to keep observing packets once ownership moves.
+    /// by value — that is the only way to keep observing packets once
+    /// ownership moves. Unbounded: a tap is a test double with no consumer
+    /// to backpressure, so a bound would only trade a hang for a silent drop.
     pub fn tap(&mut self) -> WireTap {
-        let (tx, rx) = mpsc::channel(64);
+        let (tx, rx) = mpsc::unbounded_channel();
         self.tap = Some(tx);
         WireTap { rx }
     }
@@ -166,7 +173,7 @@ impl SimWire {
 /// A cloned view of every packet crossing a [`SimWire`], installed via
 /// [`SimWire::tap`].
 pub struct WireTap {
-    rx: mpsc::Receiver<(Direction, Vec<u8>)>,
+    rx: mpsc::UnboundedReceiver<(Direction, Vec<u8>)>,
 }
 
 impl WireTap {

@@ -1902,8 +1902,10 @@ sweep; and real egress from `InterfaceEndpoint` and `Socks5Endpoint`.
 **Proved by neither lane:** `cleanup_finished_connections`
 (`driver.rs:336-352`) — a resource-reclamation path with no external
 observable, whose absence is a leak rather than a behaviour change; the
-`Ok(0)` read arm (`driver.rs:131`), which `tun-0.8.14` never produces (pinned
-only as a simulator contract, in `sim/wire_tests.rs`); whether
+`Ok(0)` read arm (`driver.rs:131`), which `tun-0.8.13` never produces — the
+offset strip/prepend for macOS's utun header lives in the vendored `tun`
+crate's `platform/posix/split.rs` `Reader`/`Writer`, re-check there after the
+next bump (pinned only as a simulator contract, in `sim/wire_tests.rs`); whether
 `Dispatcher::shutdown` drained or aborted the driver task (#905); the
 `max_sniffers` budget (#906); and that the `plugin_supports_udp` constructor
 argument reaches the cascade (`dispatcher.rs:98`) — covered by reading, plus
