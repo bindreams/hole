@@ -189,14 +189,20 @@ fn is_launcher_token(tok: &str) -> bool {
     tok == "sudo" || tok == "env" || tok.contains('=')
 }
 
-/// Boolean flags `cargo nextest run` accepts that `cargo nextest list` does
-/// not — copying one through verbatim makes `cargo nextest list` itself
-/// reject the argv as unrecognized, so [`to_list_command`] drops them. None
-/// of these narrow *which* tests a filter selects (that's `-E`'s job, always
-/// carried through), only how a `run` schedules/reports ones it already
-/// selected, so dropping them cannot change the test set [`to_list_command`]
-/// reports.
-const RUN_ONLY_FLAGS: [&str; 1] = ["--no-fail-fast"];
+/// Boolean flags `cargo nextest run` accepts that neither `cargo nextest
+/// list` nor `cargo nextest run --no-run` does — nextest rejects both
+/// combinations outright (bindreams/hole#961: `--no-run` + `--no-fail-fast`
+/// broke the `hole-tests` target's build step). None of these
+/// narrow *which* tests a filter selects (that's `-E`'s job, always carried
+/// through), only how a `run` that actually executes tests
+/// schedules/reports the ones it already selected — so dropping them can
+/// change neither the test set [`to_list_command`] reports nor which
+/// binaries a `--no-run` compile produces.
+///
+/// Shared with `manifest_tests.rs`'s `tests_targets_run_matches_build_minus_no_run`,
+/// which checks `build.yaml`'s own `*-tests` targets against this same set —
+/// one list, so a third run-only flag only ever needs adding once.
+pub(crate) const RUN_ONLY_FLAGS: [&str; 1] = ["--no-fail-fast"];
 
 /// Rewrite a nextest-run command into the argv for the equivalent `nextest
 /// list --message-format json`, dropping any launcher prefix (`sudo`, `env`,

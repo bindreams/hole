@@ -2,6 +2,7 @@ use std::collections::HashMap;
 
 use crate::manifest::*;
 use crate::orchestrate::Plan;
+use crate::skuld_label_coverage::RUN_ONLY_FLAGS;
 
 fn parse(yaml: &str) -> anyhow::Result<Manifest> {
     Manifest::parse(yaml)
@@ -750,15 +751,108 @@ fn hole_dmg_tests_builds_dmg_once() {
     );
 }
 
+/// [`tests_targets_run_matches_build_minus_no_run`]'s invariant, pulled out so
+/// it is directly testable against synthetic command lines rather than only
+/// through the production `build.yaml` (bindreams/hole#961: the inline-equality
+/// version this replaced could not be exercised against a case it got wrong).
+///
+/// `run` must equal `build` with `--no-run` removed and zero or more of
+/// [`RUN_ONLY_FLAGS`] added — not plain equality-minus-`--no-run`, because
+/// nextest rejects `--no-run` combined with a run-only flag outright, so
+/// `build:` can never carry one while `run:` legitimately may. Token-order
+/// preserving after removal, so a real drift (wrong package, moved `-E`,
+/// missing feature) still fails.
+fn build_run_symmetric(build_cmd: &str, run_cmd: &str) -> Result<(), String> {
+    let build_toks: Vec<&str> = build_cmd.split_whitespace().collect();
+    let run_toks: Vec<&str> = run_cmd.split_whitespace().collect();
+
+    if !build_toks.contains(&"--no-run") {
+        return Err("build command must contain --no-run".to_string());
+    }
+    if run_toks.contains(&"--no-run") {
+        return Err("run command must not contain --no-run".to_string());
+    }
+    for flag in RUN_ONLY_FLAGS {
+        if build_toks.contains(&flag) {
+            return Err(format!(
+                "build command must not contain run-only flag {flag:?} — nextest rejects it alongside --no-run"
+            ));
+        }
+    }
+
+    let build_minus_no_run: Vec<&str> = build_toks.into_iter().filter(|&t| t != "--no-run").collect();
+    let run_minus_run_only: Vec<&str> = run_toks.into_iter().filter(|&t| !RUN_ONLY_FLAGS.contains(&t)).collect();
+
+    if run_minus_run_only != build_minus_no_run {
+        return Err(format!(
+            "run command (minus RUN_ONLY_FLAGS) must equal build command minus --no-run.\n  \
+             build minus --no-run: {build_minus_no_run:?}\n  \
+             run minus RUN_ONLY_FLAGS: {run_minus_run_only:?}"
+        ));
+    }
+    Ok(())
+}
+
+#[skuld::test]
+fn build_run_symmetric_accepts_plain_no_run_removal() {
+    assert_eq!(
+        build_run_symmetric("cargo nextest run --no-run -p foo", "cargo nextest run -p foo"),
+        Ok(())
+    );
+}
+
+#[skuld::test]
+fn build_run_symmetric_accepts_a_run_only_flag_present_only_in_run() {
+    assert_eq!(
+        build_run_symmetric(
+            "cargo nextest run --no-run -p foo",
+            "cargo nextest run -p foo --no-fail-fast",
+        ),
+        Ok(())
+    );
+}
+
+#[skuld::test]
+fn build_run_symmetric_rejects_a_run_only_flag_leaking_into_build() {
+    let err = build_run_symmetric(
+        "cargo nextest run --no-run -p foo --no-fail-fast",
+        "cargo nextest run -p foo --no-fail-fast",
+    )
+    .expect_err("build must not be allowed to carry a run-only flag");
+    assert!(err.contains("--no-fail-fast"), "{err}");
+}
+
+#[skuld::test]
+fn build_run_symmetric_rejects_a_genuine_drift() {
+    let err = build_run_symmetric("cargo nextest run --no-run -p foo", "cargo nextest run -p bar")
+        .expect_err("a different package must still be caught as a drift");
+    assert!(err.contains("bar") && err.contains("foo"), "{err}");
+}
+
+#[skuld::test]
+fn build_run_symmetric_rejects_build_missing_no_run() {
+    let err = build_run_symmetric("cargo nextest run -p foo", "cargo nextest run -p foo")
+        .expect_err("build without --no-run must be rejected");
+    assert!(err.contains("--no-run"), "{err}");
+}
+
+#[skuld::test]
+fn build_run_symmetric_rejects_no_run_left_in_run() {
+    let err = build_run_symmetric("cargo nextest run --no-run -p foo", "cargo nextest run --no-run -p foo")
+        .expect_err("run must not still contain --no-run");
+    assert!(err.contains("--no-run"), "{err}");
+}
+
 #[skuld::test]
 fn tests_targets_run_matches_build_minus_no_run() {
     // Each `*-tests` target's `run:` is the canonical local nextest invocation
-    // — the same command line as its `build:` minus `--no-run`. CI doesn't
-    // exercise these `run:` blocks (test-hole / test-garter / test-galoshes
-    // use SKULD_LABELS / archive-based paths instead), so a typo in any of
-    // them would only surface when a developer runs `cargo xtask run X-tests`.
-    // Pin the symmetry here so a manifest edit that drifts run from build is
-    // caught at unit-test time.
+    // — the same command line as its `build:` minus `--no-run` (plus any
+    // RUN_ONLY_FLAGS — see `build_run_symmetric`). CI doesn't exercise these
+    // `run:` blocks (test-hole / test-garter / test-galoshes use SKULD_LABELS
+    // / archive-based paths instead), so a typo in any of them would only
+    // surface when a developer runs `cargo xtask run X-tests`. Pin the
+    // symmetry here so a manifest edit that drifts run from build is caught
+    // at unit-test time.
     let yaml = include_str!("../../build.yaml");
     let m = Manifest::parse(yaml).expect("production build.yaml must parse cleanly");
 
@@ -783,17 +877,12 @@ fn tests_targets_run_matches_build_minus_no_run() {
         // still differ by trailing whitespace from line continuations.
         let build_normalized: String = build_cmd.split_whitespace().collect::<Vec<_>>().join(" ");
         let run_normalized: String = run_cmd.split_whitespace().collect::<Vec<_>>().join(" ");
-        let expected_run = build_normalized.replace(" --no-run", "");
-        assert_eq!(
-            run_normalized, expected_run,
-            "{name:?}: run command must equal build command with `--no-run` removed.\n  \
-             build (normalized): {build_normalized:?}\n  \
-             expected run: {expected_run:?}\n  \
-             actual run (normalized): {run_normalized:?}"
-        );
-        // Sanity: build must contain --no-run, run must not.
-        assert!(build_cmd.contains("--no-run"), "{name:?} build must contain --no-run");
-        assert!(!run_cmd.contains("--no-run"), "{name:?} run must not contain --no-run");
+        if let Err(reason) = build_run_symmetric(&build_normalized, &run_normalized) {
+            panic!(
+                "{name:?}: {reason}\n  build (normalized): {build_normalized:?}\n  \
+                 run (normalized): {run_normalized:?}"
+            );
+        }
     }
 }
 
