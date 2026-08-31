@@ -1390,6 +1390,44 @@ fn gateway_failure_sets_last_error() {
     });
 }
 
+/// A COVERED start (auto-connect) that fails at the gateway step — the
+/// shape of "Hole's own fail-closed cover severed a third-party VPN the
+/// upstream route depended on": the cover engages successfully (it names
+/// only the server + resolver, not anything the third-party VPN needs), and
+/// `default_gateway` then fails. This task does not change that outcome —
+/// `Err(e) => { self.last_error = ...; Err(e) }` in `start_cancellable`
+/// already retains the cover unconditionally on any non-cancel failure — it
+/// establishes that the retained-cover state is LEGIBLE: `blocked_until_connected()`
+/// reads true, and the recorded reason is a gateway failure specifically,
+/// distinguishable from an ordinary unreachable-server failure (compare
+/// `RouteSetup`'s prefix) rather than a generic message that could be either.
+#[skuld::test]
+fn a_covered_start_that_fails_over_a_third_party_upstream_reports_blocked() {
+    rt().block_on(async {
+        let proxy = MockProxy::new();
+        let dir = tempfile::tempdir().unwrap();
+        let routing = MockRouting::failing_gateway(dir.path().to_path_buf());
+        let (mut pm, _dir) = new_manager_with_lockdown(proxy, routing, dir, false);
+
+        let err = pm
+            .start_cancellable(&test_config(), true, CancellationToken::new())
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, ProxyError::Gateway(_)), "got {err:?}");
+        assert!(
+            pm.blocked_until_connected(),
+            "a covered start's cover must be RETAINED on failure, never released"
+        );
+        let reason = pm.last_error().expect("a failed covered start must record a reason");
+        assert!(
+            reason.starts_with("gateway detection failed:"),
+            "the retained-cover reason must be legibly a gateway failure, not a generic \
+             unreachable-server message an operator could mistake for a DNS/connect problem: {reason:?}"
+        );
+    });
+}
+
 #[skuld::test]
 fn stop_clears_last_error() {
     rt().block_on(async {
