@@ -22,7 +22,7 @@ use ::windows::Win32::Foundation::{
 };
 use ::windows::Win32::NetworkManagement::IpHelper::{ConvertInterfaceLuidToAlias, GetBestRoute2, MIB_IPFORWARD_ROW2};
 use ::windows::Win32::NetworkManagement::Ndis::NET_LUID_LH;
-use ::windows::Win32::Networking::WinSock::{AF_INET, AF_INET6, SOCKADDR_INET};
+use ::windows::Win32::Networking::WinSock::{AF_INET, AF_INET6, AF_UNSPEC, SOCKADDR_INET};
 use tracing::{debug, warn};
 
 use super::{GatewayError, RouteHop};
@@ -112,6 +112,7 @@ fn interface_alias(luid: &NET_LUID_LH, interface_index: u32) -> Result<String, G
     // the binding passes its length, so the callee cannot overrun it.
     let status: WIN32_ERROR = unsafe { ConvertInterfaceLuidToAlias(luid, &mut buf) };
     if status != NO_ERROR {
+        warn!(interface_index, status = status.0, "ConvertInterfaceLuidToAlias failed");
         return Err(GatewayError::InterfaceNameUnavailable {
             interface_index,
             source: std::io::Error::from_raw_os_error(status.0 as i32),
@@ -150,7 +151,14 @@ fn from_sockaddr_inet(sa: &SOCKADDR_INET) -> IpAddr {
     // AF_INET, and AF_UNSPEC — which `GetBestRoute2` reports for an on-link
     // route with no next hop. Both read as the IPv4 address field, and
     // AF_UNSPEC's zeroed field is the unspecified address, which is exactly the
-    // on-link marker `classify_hop` keys on.
+    // on-link marker `classify_hop` keys on. Any OTHER family here would mean
+    // `GetBestRoute2` returned something this mapping was never told about;
+    // silently reading it as IPv4 would build a live route/bypass command
+    // from garbage bytes.
+    debug_assert!(
+        family == AF_INET || family == AF_UNSPEC,
+        "unexpected sockaddr family {family:?}, expected AF_INET or AF_UNSPEC"
+    );
     let raw = unsafe { sa.Ipv4.sin_addr.S_un.S_addr };
     IpAddr::V4(Ipv4Addr::from(raw.to_ne_bytes()))
 }

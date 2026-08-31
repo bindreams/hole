@@ -38,6 +38,10 @@ fn ipv4_gw() -> GatewayInfo {
 /// the unspecified address — same representation `classify_hop` produces —
 /// so a test asserting the on-link path is not silently keyed on a real
 /// address instead of `next_hop`.
+///
+/// `cfg(windows)`: its only caller is the interface-scoped-bypass test below,
+/// itself `cfg(windows)` — macOS has no on-link IPv4 bypass form to test.
+#[cfg(target_os = "windows")]
 fn on_link_gw() -> GatewayInfo {
     GatewayInfo {
         gateway_ip: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
@@ -3191,7 +3195,7 @@ fn rollback_never_erases_extra_unconfirmed_mid_loop() {
     assert!(checked_mid_loop.get(), "the runner must have actually run mid-loop");
 }
 
-// default_gateway's own-provenance guard (#798 PR1 Task 3) ============================================================
+// default_gateway's own-provenance guard ==============================================================================
 //
 // A `/32` host route is the longest prefix that exists, so `best_route(server)`
 // matches Hole's OWN bypass ahead of every other route once one is installed.

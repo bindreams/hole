@@ -1,4 +1,5 @@
 use super::*;
+use crate::GLOBAL_NET_STATE;
 use std::net::{IpAddr, Ipv4Addr};
 use windows::Win32::Foundation::{
     ERROR_ACCESS_DENIED, ERROR_HOST_UNREACHABLE, ERROR_INVALID_NETNAME, ERROR_INVALID_PARAMETER,
@@ -100,8 +101,23 @@ fn map_query_error_separates_reachability_from_query_failure() {
 /// Asserted for BOTH a routable address and `0.0.0.0` — the latter is the value
 /// production actually queries (`get_default_gateway_info`), so the load-bearing
 /// assumption is exercised rather than assumed.
-#[skuld::test]
-fn best_route_agrees_with_find_netroute() {
+///
+/// `gateway_global_net_state_` prefix + `GLOBAL_NET_STATE`: reads the REAL
+/// host routing table twice (once through `best_route`, once — after a
+/// `powershell` cold start — through `Find-NetRoute`), with nothing holding
+/// it still in between. Unserialized, a concurrent elevated-lane test in
+/// another binary that installs/removes `hole-tun`'s split routes could
+/// change the answer between the two reads and fail this test for a reason
+/// that has nothing to do with `best_route` itself.
+#[skuld::test(labels = [GLOBAL_NET_STATE])]
+fn gateway_global_net_state_best_route_agrees_with_find_netroute() {
+    // `find_net_route`'s script catches every PowerShell terminating error —
+    // "no route" (a real answer) alike with "Find-NetRoute unavailable" or
+    // any other cmdlet fault (not a real answer) — as the same `[]`. Both
+    // `1.1.1.1` and `0.0.0.0` resolve to a route on any healthy host, so if
+    // the oracle never once returns `Some` across both, that is the oracle
+    // failing to answer, not two hosts genuinely lacking any route.
+    let mut oracle_answered = 0usize;
     for dest_str in ["1.1.1.1", "0.0.0.0"] {
         let dest: IpAddr = dest_str.parse().unwrap();
         let ours = best_route(dest).expect("route lookup must not fail on a healthy host");
@@ -112,6 +128,7 @@ fn best_route_agrees_with_find_netroute() {
                 "oracle found no route to {dest_str} but best_route returned {ours:?}"
             ),
             Some(oracle) => {
+                oracle_answered += 1;
                 let hop = ours.unwrap_or_else(|| panic!("oracle found a route to {dest_str}, best_route did not"));
                 assert_eq!(
                     hop.interface_index, oracle.if_index,
@@ -125,15 +142,23 @@ fn best_route_agrees_with_find_netroute() {
             }
         }
     }
+    assert!(
+        oracle_answered > 0,
+        "Find-NetRoute never returned a real route for either destination — the oracle is broken, not this host"
+    );
 }
 
-/// The alias changes provenance in this commit (GAA `FriendlyName` ->
-/// `ConvertInterfaceLuidToAlias`), and it is not cosmetic: it is the adapter
-/// token in `netsh interface ip add route`, the alias the system-DNS capture
-/// keys on, and the value crash recovery replays out of `bridge-routes.json`.
-/// A silent change there breaks three subsystems at once.
-#[skuld::test]
-fn interface_alias_matches_get_netadapter_name() {
+/// The alias is not cosmetic: it is the adapter token in `netsh interface ip
+/// add route`, the alias the system-DNS capture keys on, and the value crash
+/// recovery replays out of `bridge-routes.json`. A silent change there breaks
+/// three subsystems at once.
+///
+/// `gateway_global_net_state_` prefix + `GLOBAL_NET_STATE`: reads the REAL
+/// host routing table, same race as
+/// `gateway_global_net_state_best_route_agrees_with_find_netroute` above —
+/// see that test's doc.
+#[skuld::test(labels = [GLOBAL_NET_STATE])]
+fn gateway_global_net_state_interface_alias_matches_get_netadapter_name() {
     let mut checked = 0usize;
     if let Some(hop) = best_route(IpAddr::V4(Ipv4Addr::UNSPECIFIED)).expect("lookup must not fail") {
         // Skipped when the upstream is not a Get-NetAdapter object (e.g. a

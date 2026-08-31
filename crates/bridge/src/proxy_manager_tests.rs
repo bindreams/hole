@@ -1394,11 +1394,11 @@ fn gateway_failure_sets_last_error() {
 /// shape of "Hole's own fail-closed cover severed a third-party VPN the
 /// upstream route depended on": the cover engages successfully (it names
 /// only the server + resolver, not anything the third-party VPN needs), and
-/// `default_gateway` then fails. This task does not change that outcome —
-/// `Err(e) => { self.last_error = ...; Err(e) }` in `start_cancellable`
-/// already retains the cover unconditionally on any non-cancel failure — it
-/// establishes that the retained-cover state is LEGIBLE: `blocked_until_connected()`
-/// reads true, and the recorded reason is a gateway failure specifically,
+/// `default_gateway` then fails. `Err(e) => { self.last_error = ...; Err(e) }`
+/// in `start_cancellable` already retains the cover unconditionally on any
+/// non-cancel failure; this test establishes that the retained-cover state
+/// is LEGIBLE: `blocked_until_connected()` reads true, and the recorded
+/// reason is a gateway failure specifically,
 /// distinguishable from an ordinary unreachable-server failure (compare
 /// `RouteSetup`'s prefix) rather than a generic message that could be either.
 #[skuld::test]

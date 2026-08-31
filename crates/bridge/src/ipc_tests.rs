@@ -249,7 +249,7 @@ impl Routing for MockRouting {
     /// Deliberately ignores `fail_server_gateway_only` — that flag configures
     /// the SERVER-SCOPED mock failure `default_gateway` returns, and this is
     /// the destination-independent diagnostics probe. If diagnostics routed
-    /// through the server-scoped mock instead (the bug this split fixes),
+    /// through the server-scoped mock instead,
     /// `the_diagnostics_probe_does_not_take_a_server` would catch it.
     fn default_route(&self) -> Result<GatewayInfo, RoutingError> {
         if self.fail_gateway.load(Ordering::SeqCst) {

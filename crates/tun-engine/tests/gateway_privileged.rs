@@ -1,14 +1,10 @@
 //! Privileged-lane proof that the upstream-route lookup can see a **wintun**
 //! adapter.
 //!
-//! This is the one test that covers bindreams/hole#798's actual defect. The
-//! `default-net` crate this replaced enumerated adapters through
-//! `GetAdaptersAddresses` and silently skipped every one whose `IfType` was
-//! absent from its own hard-coded allowlist. Wintun reports
-//! `IF_TYPE_PROP_VIRTUAL` (53), which is not in that list, so an adapter of
-//! exactly this kind was invisible to it, and a user whose default route ran
-//! through one got `"Default Interface not found"`. A lookup that asks the OS
-//! cannot have that blind spot — and here is the adapter that proves it.
+//! This is the one test that covers bindreams/hole#798's actual defect — see
+//! `gateway/windows.rs`'s module doc for the full blind-spot story. Here, a
+//! real wintun adapter proves the lookup can see an `IfType 53` interface,
+//! which `default-net`'s allowlist could not.
 //!
 //! **It never touches the default route.** The property under test is "can this
 //! lookup name an `IfType 53` adapter", not "what happens when one owns the

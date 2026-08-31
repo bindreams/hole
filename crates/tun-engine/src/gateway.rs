@@ -156,9 +156,12 @@ pub fn upstream_route(_dest: IpAddr) -> Result<GatewayInfo, GatewayError> {
 /// classification, rather than this shared function guessing on the caller's
 /// behalf.
 ///
-/// The refusal branches carry the hop into the error rather than dropping it —
-/// see `gateway/error.rs` for why that is the guarantee and the `warn!` is only
-/// a convenience.
+/// Neither refusal below constructs a `HopDetail` — `NoDefaultRoute` is
+/// fieldless, and `InterfaceNameUnavailable` carries only the index, not
+/// `hop.next_hop`. `HopDetail` (see `gateway/error.rs`) is currently
+/// reachable only from `NoUsableGateway`, which has no producer on this path
+/// (see its own doc); on these two branches the `warn!` is the only thing
+/// that carries the hop, not a convenience on top of a structural guarantee.
 pub(crate) fn classify_hop(hop: Option<RouteHop>, ipv6_available: bool) -> Result<GatewayInfo, GatewayError> {
     let Some(hop) = hop else {
         warn!("no default route: nothing routes off this host");

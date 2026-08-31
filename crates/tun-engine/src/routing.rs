@@ -1381,6 +1381,16 @@ pub trait Routing: Send + Sync {
     /// specific destination (the diagnostics poll), see
     /// [`default_route`](Self::default_route) instead — passing a sentinel
     /// destination here would silently conflate the two questions.
+    ///
+    /// NOT a pure query in [`SystemRouting`]'s implementation: it first
+    /// best-effort deletes a leftover `ServerBypass` route to `dest` from a
+    /// prior crashed run, if the persisted state still names one (see
+    /// `clear_stale_server_bypass`'s own doc for why — the `/32` bypass
+    /// would otherwise outrank every real route in this same query). That
+    /// can spawn a real `route`/`netsh` delete and rewrite the persisted
+    /// route-state file before this returns. `MockRouting` implementations
+    /// are pure, matching this doc's framing; only the production path
+    /// mutates.
     fn default_gateway(&self, dest: IpAddr) -> Result<GatewayInfo, RoutingError>;
 
     /// Returns the host's default route, independent of any specific
@@ -1921,6 +1931,15 @@ fn platform_setup_commands(
                 // instead — the same `netsh interface ip` command family the
                 // IPv6 arm below already uses, unlike the gateway form's
                 // classic `route add`.
+                // `store=active`: `netsh interface ip add route`'s own
+                // documented default is `store=persistent` (registry-written,
+                // survives reboot). The gateway-form sibling below (classic
+                // `route add`, no `-p`) is active-only; without this operand
+                // the two forms would give the same logical bypass different
+                // lifetimes, and a persistent on-link route naming an
+                // upstream adapter alias can outlive the session, the
+                // process, and an uninstall — see CONTRIBUTING's Route
+                // ownership section.
                 (IpAddr::V4(_), NextHop::OnLink) => vec![
                     "netsh".into(),
                     "interface".into(),
@@ -1929,6 +1948,7 @@ fn platform_setup_commands(
                     "route".into(),
                     format!("{server_ip}/32"),
                     gateway.interface_name.clone(),
+                    "store=active".into(),
                 ],
                 (IpAddr::V4(_), NextHop::Via(via)) => vec![
                     "route".into(),
@@ -2076,6 +2096,18 @@ fn platform_setup_commands(
     gateway: &GatewayInfo,
     tun_ipv6_available: bool,
 ) -> Vec<SetupCommand> {
+    // macOS has no interface-scoped IPv4 bypass form (unlike the Windows arm
+    // above): `gateway.gateway_ip`, read below, is meaningless for
+    // `NextHop::OnLink` (the unspecified address). `reject_macos_on_link`
+    // (gateway.rs) is the ONLY thing that keeps an on-link `GatewayInfo` from
+    // reaching this function — it runs once, in a different module, and
+    // nothing local re-checks its own precondition. If that call is ever
+    // skipped or reordered, this would silently build `route add -host
+    // <server> 0.0.0.0` instead of failing loudly.
+    debug_assert!(
+        !matches!(gateway.next_hop, NextHop::OnLink),
+        "on-link must never reach macOS's setup commands — reject_macos_on_link should have refused it upstream"
+    );
     let ipv6 = tun_ipv6_available;
     let mut cmds = vec![
         // IPv4 low half: 0.0.0.0/1 via TUN
