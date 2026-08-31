@@ -353,6 +353,18 @@ mod windows_impl {
             hop.interface_index
         );
         assert_eq!(hop.interface_alias, TEST_ADAPTER);
+        // `TEST_DEST` is inside the adapter's own directly-attached subnet
+        // (`TEST_CIDR`), so this route is on-link — Microsoft documents
+        // `MIB_IPFORWARD_ROW2.NextHop` as unspecified for exactly that case.
+        // `classify_hop` never reads `DestinationPrefix`, so a real on-link
+        // route against a real kernel — not a fabricated `RouteHop` — is
+        // what proves `NextHop::OnLink` (bindreams/hole#798's PR1) reaches
+        // production from something the OS actually returned.
+        assert!(
+            hop.next_hop.is_unspecified(),
+            "an on-link destination must resolve to an unspecified next hop, got {}",
+            hop.next_hop
+        );
     }
 
     /// Proves `AddressChangeRegistration`'s cancel-before-release ordering
