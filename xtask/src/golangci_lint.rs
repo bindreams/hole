@@ -3,7 +3,7 @@
 //! `golangci-lint` is the single Go quality gate for the `crates/ex-ray/` Go
 //! module (it subsumes `go vet` via the `govet` linter and `gofmt`/`gofumpt`
 //! via its v2 `formatters` section). The `go-fmt` / `go-lint` prek hooks in
-//! `prek.toml` invoke the cached binary by absolute path, so provisioning it
+//! `prek.toml` reach the binary through this subcommand, so provisioning it
 //! through `cargo xtask deps` makes it available identically at pre-commit and
 //! in CI (CI's `Lint` job runs `setup-build` → `cargo xtask deps` →
 //! `cargo xtask run prek`). No `go install` and no PATH dependency.
@@ -123,16 +123,15 @@ fn asset_for() -> Result<Asset> {
     })
 }
 
-/// Repo-relative directory the verified binary is provisioned into. The
-/// `go-fmt` and `go-lint` hooks in `prek.toml` invoke that binary by absolute
-/// path, so the two must name the same place — pinned by
-/// `prek_go_hooks_run_the_provisioned_binary`.
-///
-/// Deliberately not version-scoped: [`VERSION`] would then have to be spelled
-/// out in those hook entries too, and the path is not what detects staleness —
-/// the `.verified` sentinel holds the pinned hash, so a bump replaces the
-/// binary in place.
-pub const CACHE_DIR: &str = ".cache/golangci-lint";
+/// Is the binary on disk the verified one for the pinned hash? The sentinel
+/// holds the hash rather than the version, so it also rejects a directory left
+/// half-written by an interrupted run.
+fn cache_is_valid(bin_path: &Path, sentinel: &Path, sha256: &str) -> bool {
+    if !bin_path.exists() || !sentinel.exists() {
+        return false;
+    }
+    std::fs::read_to_string(sentinel).is_ok_and(|stored| stored.trim() == sha256)
+}
 
 /// Download (if not cached) and verify golangci-lint, returning the path to the
 /// extracted binary. A cache hit (binary present + sentinel matches the pinned
@@ -140,20 +139,16 @@ pub const CACHE_DIR: &str = ".cache/golangci-lint";
 pub fn ensure(repo_root: &Path) -> Result<PathBuf> {
     let asset = asset_for()?;
 
-    let cache_dir = repo_root.join(CACHE_DIR);
+    // Version-scoped: a bump lands in a fresh directory rather than overwriting
+    // the binary in place, which the OS forbids while a prek hook is running it.
+    let cache_dir = repo_root.join(".cache").join("golangci-lint").join(VERSION);
     let bin_path = cache_dir.join(format!("golangci-lint{}", binary_ext()));
     let sentinel = cache_dir.join("golangci-lint.verified");
 
     std::fs::create_dir_all(&cache_dir).with_context(|| format!("failed to create {}", cache_dir.display()))?;
 
-    // Cache check: sentinel matching the pinned hash means the on-disk binary
-    // is the verified one — skip the network round-trip.
-    if bin_path.exists() && sentinel.exists() {
-        let stored = std::fs::read_to_string(&sentinel).unwrap_or_default();
-        if stored.trim() == asset.sha256 {
-            return Ok(bin_path);
-        }
-        // Hash mismatch — stale cache from a different version, re-download.
+    if cache_is_valid(&bin_path, &sentinel, asset.sha256) {
+        return Ok(bin_path);
     }
 
     let url = asset.url();
@@ -260,3 +255,7 @@ fn sha256_hex(data: &[u8]) -> String {
     let hash = sha2::Sha256::digest(data);
     hash.iter().map(|b| format!("{b:02x}")).collect()
 }
+
+#[cfg(test)]
+#[path = "golangci_lint_tests.rs"]
+mod golangci_lint_tests;

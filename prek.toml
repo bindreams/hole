@@ -57,14 +57,12 @@ pass_filenames = false
 [[repos.hooks]]
 id = "go-fmt"
 name = "golangci-lint fmt (ex-ray)"
-# prek (0.3.6) has no per-hook working-directory field, so this `cd`s into the
-# Go module via a bash wrapper. golangci-lint is provisioned by
-# `cargo xtask deps` into .cache/ -- referenced by absolute path (resolved from
-# the repo root via `git rev-parse`) so there's no PATH dependency and the hook
-# behaves identically locally and in CI. `fmt --diff` is check-only (the v2
-# formatters/gofumpt run). `crates/ex-ray` is the only Go module today; if a
-# second appears, extend this hook.
-entry = "bash -c 'cd crates/ex-ray && \"$(git rev-parse --show-toplevel)/.cache/golangci-lint/golangci-lint\" fmt --diff'"
+# xtask owns the binary's location and provisions it on demand, and runs it
+# inside the Go module -- prek has no per-hook working-directory field, and a
+# path spelled here would be a second copy of one xtask already holds.
+# `fmt --diff` is check-only (the v2 formatters/gofumpt run). `crates/ex-ray`
+# is the only Go module today; if a second appears, extend this hook.
+entry = "cargo xtask golangci-lint fmt --diff"
 language = "system"
 # types=["go"] means the hook is SKIPPED when no .go file is staged (same as the
 # Rust hooks). A `.golangci.yml`-only change still surfaces in CI's --all-files run.
@@ -75,9 +73,8 @@ pass_filenames = false
 id = "go-lint"
 name = "golangci-lint run (ex-ray)"
 # `run` = the v2 linters (incl. govet, which subsumes `go vet`). `fmt` and `run`
-# are both needed -- golangci-lint v2 separates formatting from linting. Same
-# bash-wrapper + absolute-cache-path rationale as `go-fmt` above.
-entry = "bash -c 'cd crates/ex-ray && \"$(git rev-parse --show-toplevel)/.cache/golangci-lint/golangci-lint\" run'"
+# are both needed -- golangci-lint v2 separates formatting from linting.
+entry = "cargo xtask golangci-lint run"
 language = "system"
 types = ["go"]
 pass_filenames = false

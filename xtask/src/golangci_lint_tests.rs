@@ -1,57 +1,64 @@
-//! Backs the `prek_go_hooks_run_the_provisioned_binary` conformance test.
+//! Unit tests for [`crate::golangci_lint`]'s cache decision.
 
-use serde::Deserialize;
+use std::fs;
 
-use crate::golangci_lint::CACHE_DIR;
+use crate::golangci_lint::cache_is_valid;
 
-#[derive(Deserialize)]
-struct Prek {
-    repos: Vec<Repo>,
+const SHA: &str = "b1946ac92492d2347c6235b4d2611184";
+
+/// (binary, sentinel) inside a fresh temp dir, neither created yet.
+fn paths(dir: &tempfile::TempDir) -> (std::path::PathBuf, std::path::PathBuf) {
+    (
+        dir.path().join("golangci-lint"),
+        dir.path().join("golangci-lint.verified"),
+    )
 }
 
-#[derive(Deserialize)]
-struct Repo {
-    #[serde(default)]
-    hooks: Vec<Hook>,
-}
-
-#[derive(Deserialize)]
-struct Hook {
-    id: String,
-    /// Absent on the external repos' inline hooks, which supply only an `id`.
-    entry: Option<String>,
-}
-
-/// prek has no per-hook working directory, so the Go hooks reach the binary by
-/// an absolute path they spell out themselves. Nothing makes that path follow
-/// [`crate::golangci_lint::ensure`]: they agreed only because both were edited
-/// together, and a pin bump that missed one would leave the hooks pointing at a
-/// directory that was never downloaded.
 #[skuld::test]
-fn prek_go_hooks_run_the_provisioned_binary() {
-    let root = crate::repo_root().expect("repo root");
-    let text = std::fs::read_to_string(root.join("prek.toml")).expect("read prek.toml");
-    let prek: Prek = toml::from_str(&text).expect("parse prek.toml");
+fn a_matching_sentinel_is_a_cache_hit() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (bin, sentinel) = paths(&dir);
+    fs::write(&bin, b"binary").expect("write bin");
+    fs::write(&sentinel, SHA).expect("write sentinel");
+    assert!(cache_is_valid(&bin, &sentinel, SHA));
+}
 
-    let expected = format!("{CACHE_DIR}/golangci-lint");
-    let go_hooks: Vec<&Hook> = prek
-        .repos
-        .iter()
-        .flat_map(|r| &r.hooks)
-        .filter(|h| h.entry.as_deref().is_some_and(|e| e.contains("golangci-lint")))
-        .collect();
+/// The sentinel is written after the binary, so an interrupted run leaves the
+/// binary with no sentinel — which must not read as verified.
+#[skuld::test]
+fn a_binary_with_no_sentinel_is_not_verified() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (bin, sentinel) = paths(&dir);
+    fs::write(&bin, b"binary").expect("write bin");
+    assert!(!cache_is_valid(&bin, &sentinel, SHA));
+}
 
-    assert_eq!(
-        go_hooks.iter().map(|h| h.id.as_str()).collect::<Vec<_>>(),
-        ["go-fmt", "go-lint"],
-        "the set of golangci-lint hooks changed; this test enumerates them so a new one cannot skip the check"
-    );
-    for hook in go_hooks {
-        let entry = hook.entry.as_deref().expect("filtered on Some");
-        assert!(
-            entry.contains(&expected),
-            "prek hook `{}` does not run the provisioned binary\n  expected to contain: {expected}\n  entry: {entry}",
-            hook.id
-        );
-    }
+/// A sentinel left behind by a previous pin records a different hash. This is
+/// what makes a `VERSION` bump re-download rather than trust a stale binary.
+#[skuld::test]
+fn a_sentinel_from_another_pin_is_not_verified() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (bin, sentinel) = paths(&dir);
+    fs::write(&bin, b"binary").expect("write bin");
+    fs::write(&sentinel, "0000000000000000000000000000000000000000").expect("write sentinel");
+    assert!(!cache_is_valid(&bin, &sentinel, SHA));
+}
+
+#[skuld::test]
+fn a_sentinel_with_no_binary_is_not_verified() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (bin, sentinel) = paths(&dir);
+    fs::write(&sentinel, SHA).expect("write sentinel");
+    assert!(!cache_is_valid(&bin, &sentinel, SHA));
+}
+
+/// The sentinel is written without a trailing newline, but an editor or a
+/// `echo` redirect can add one; a hit must not hinge on that.
+#[skuld::test]
+fn surrounding_whitespace_in_the_sentinel_is_ignored() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (bin, sentinel) = paths(&dir);
+    fs::write(&bin, b"binary").expect("write bin");
+    fs::write(&sentinel, format!("  {SHA}\n")).expect("write sentinel");
+    assert!(cache_is_valid(&bin, &sentinel, SHA));
 }
