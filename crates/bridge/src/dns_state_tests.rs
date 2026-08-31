@@ -303,3 +303,42 @@ fn supersede_renames_and_load_no_longer_sees_it() {
         "load must never read the superseded name — the bridge evaluates a file at most once"
     );
 }
+
+/// A second `supersede` call (reinstall, rollback, or a second crash before
+/// the first superseded file was ever inspected) must not destroy the
+/// first one — `fs::rename` replaces an existing destination on both POSIX
+/// and Windows, so `supersede` cannot be a bare rename once a superseded
+/// file already exists. The older file wins the canonical name and the
+/// newer one is archived under a fresh name instead; nothing is lost.
+#[skuld::test]
+fn supersede_twice_archives_the_newer_file_instead_of_clobbering_the_older_one() {
+    let dir = tempfile::tempdir().unwrap();
+
+    std::fs::write(dir.path().join(STATE_FILE_NAME), b"first").unwrap();
+    supersede(dir.path()).unwrap();
+    assert!(!dir.path().join(STATE_FILE_NAME).exists());
+    let superseded_path = dir.path().join(SUPERSEDED_FILE_NAME);
+    assert_eq!(
+        std::fs::read(&superseded_path).unwrap(),
+        b"first",
+        "first supersede must land the canonical name"
+    );
+
+    std::fs::write(dir.path().join(STATE_FILE_NAME), b"second").unwrap();
+    supersede(dir.path()).unwrap();
+    assert!(
+        !dir.path().join(STATE_FILE_NAME).exists(),
+        "the un-suffixed name must be gone after the second supersede too"
+    );
+    assert_eq!(
+        std::fs::read(&superseded_path).unwrap(),
+        b"first",
+        "the older, already-superseded file must survive untouched — it is the evidence closer to          the user's true original DNS"
+    );
+    let archive_path = dir.path().join("bridge-dns.superseded.2.json");
+    assert_eq!(
+        std::fs::read(&archive_path).unwrap(),
+        b"second",
+        "the newer file's content must survive under a non-colliding archive name, not be lost"
+    );
+}

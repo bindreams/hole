@@ -167,15 +167,65 @@ pub fn clear(state_dir: &Path) -> std::io::Result<()> {
     }
 }
 
+/// Filename for an ARCHIVED superseded file — used only when
+/// [`SUPERSEDED_FILE_NAME`] is already occupied by an earlier one. `n`
+/// starts at 2 (the canonical superseded file is implicitly "1"). Forensic
+/// only: nothing in this crate, and nothing in `scripts/network-reset.py`,
+/// ever reads an archived name back. The script's existing lookup order
+/// (un-suffixed, then [`SUPERSEDED_FILE_NAME`]) already lands on the
+/// OLDEST superseded evidence once the un-suffixed name is moved aside —
+/// which is the file this module keeps at the canonical name, never an
+/// archived one — so the script needs no changes to keep finding the right
+/// answer.
+fn archived_superseded_file(state_dir: &Path, n: u64) -> PathBuf {
+    state_dir.join(format!("bridge-dns.superseded.{n}.json"))
+}
+
 /// Rename the state file to [`SUPERSEDED_FILE_NAME`]. The upgrade sweep's
 /// "evaluated once, not fully confirmed" outcome: the bridge never reads the
 /// superseded name again (so the value-equality gate cannot re-arm on a
 /// later, unrelated coincidence), but `scripts/network-reset.py` reads both
 /// names, so the escape survives the rename rather than being hidden by it.
 /// Tolerates a missing source file (returns `Ok`).
+///
+/// **Never clobbers an existing superseded file.** `fs::rename` replaces an
+/// existing destination (POSIX `rename(2)`; Windows via
+/// `MOVEFILE_REPLACE_EXISTING`), so a bare rename onto an already-occupied
+/// [`SUPERSEDED_FILE_NAME`] would silently destroy it — reachable whenever
+/// this runs twice without the first superseded file ever being cleared
+/// (reinstall, rollback to an older build, or a second crash). When that
+/// happens, the OLDER file keeps the canonical name and the newer one is
+/// archived under [`archived_superseded_file`] instead: a superseded file
+/// exists precisely because an earlier restore did not fully succeed, so
+/// the newer file's recorded priors may already be Hole's own (dead)
+/// resolver IPs — the older file is the one closer to the user's true
+/// original DNS, and is what a reader should keep finding at the canonical
+/// name.
 pub fn supersede(state_dir: &Path) -> std::io::Result<()> {
     let from = state_file(state_dir);
     let to = superseded_file(state_dir);
+
+    if to.exists() {
+        if !from.exists() {
+            return Ok(());
+        }
+        let mut n = 2u64;
+        let archive = loop {
+            let candidate = archived_superseded_file(state_dir, n);
+            if !candidate.exists() {
+                break candidate;
+            }
+            n += 1;
+        };
+        std::fs::rename(&from, &archive)?;
+        tracing::warn!(
+            kept = %to.display(),
+            archived = %archive.display(),
+            "dns_state: bridge-dns.superseded.json already existed; archived the newer file instead              of overwriting it. The archive is forensic only — nothing reads it back."
+        );
+        return Ok(());
+    }
+
     match std::fs::rename(&from, &to) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
