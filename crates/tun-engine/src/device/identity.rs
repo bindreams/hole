@@ -4,7 +4,7 @@
 //! single-instance belief, bindreams/hole#936) and WITHOUT verifying after
 //! the adapter is created (which would judge the create path too, and turn
 //! a single Windows GUID-assignment quirk into a permanent, unbreakable
-//! refusal to connect — see the #846 plan's F2 for the full argument).
+//! refusal to connect).
 //!
 //! **The read happens BEFORE `create_as_async`, on the incumbent only.**
 //! `tun` 0.8.13's `platform/windows/device.rs` does `Adapter::open(name)`
@@ -102,7 +102,7 @@ fn classify_incumbent(status: u32, guid: Option<u128>, expect: u128) -> std::io:
 
 /// Probe `alias`'s incumbent adapter, pre-create. See the module doc for the
 /// full argument. Windows-only: there is no adapter-GUID mechanism to probe
-/// on macOS (F2).
+/// on macOS.
 #[cfg(target_os = "windows")]
 pub fn probe_incumbent(alias: &str, expect: u128) -> std::io::Result<Incumbent> {
     use windows::core::{GUID, PCWSTR};

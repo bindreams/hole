@@ -6,7 +6,7 @@
 //! that module's doc for the WFP mechanism and its process-scoped
 //! lifetime). It writes DNS to no other adapter — `crate::dns_state` and
 //! `crate::dns::recovery` cover the one place a write to another adapter is
-//! still correct: undoing a *pre-#846* build's own upstream-adapter rewrite
+//! still correct: undoing an older build's own upstream-adapter rewrite
 //! after a crash, gated on live evidence and evaluated at most once per
 //! file.
 //!
@@ -36,7 +36,6 @@
 
 use std::io;
 use std::net::IpAddr;
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use tokio_util::sync::CancellationToken;
@@ -76,8 +75,9 @@ pub trait Dns: Send + Sync + 'static {
     type Applied: DnsApplied;
 
     /// Confine DNS egress to `tun` and point the OS at `advertise_ips` (the
-    /// configured upstream resolver IPs) on `tun` only. `server_ip` and
-    /// `app_ids` are the confinement's own permits (R0-3, Q9) — see
+    /// configured upstream resolver IPs) on `tun` only. `server_ip` is the
+    /// confinement's own server permit — the tunnel's own handshake must
+    /// stay reachable even when the server runs on port 53 — see
     /// `tun_engine::dns_confine::build_spec`.
     ///
     /// On Windows, `set_servers` splits `advertise_ips` per address family
@@ -96,7 +96,6 @@ pub trait Dns: Send + Sync + 'static {
         advertise_ips: Vec<IpAddr>,
         tun: tun_engine::TunIdentity,
         server_ip: IpAddr,
-        app_ids: Vec<PathBuf>,
         cancel: CancellationToken,
     ) -> impl std::future::Future<Output = Result<Self::Applied, DnsError>> + Send;
 }
@@ -207,19 +206,9 @@ impl Dns for SystemDns {
         advertise_ips: Vec<IpAddr>,
         tun: tun_engine::TunIdentity,
         server_ip: IpAddr,
-        app_ids: Vec<PathBuf>,
         cancel: CancellationToken,
     ) -> Result<Self::Applied, DnsError> {
-        apply_windows(
-            &self.backend,
-            &self.confiner,
-            advertise_ips,
-            tun,
-            server_ip,
-            app_ids,
-            cancel,
-        )
-        .await
+        apply_windows(&self.backend, &self.confiner, advertise_ips, tun, server_ip, cancel).await
     }
 
     #[cfg(target_os = "macos")]
@@ -228,10 +217,9 @@ impl Dns for SystemDns {
         advertise_ips: Vec<IpAddr>,
         tun: tun_engine::TunIdentity,
         server_ip: IpAddr,
-        app_ids: Vec<PathBuf>,
         cancel: CancellationToken,
     ) -> Result<Self::Applied, DnsError> {
-        let _ = (server_ip, app_ids);
+        let _ = server_ip;
         apply_macos(&self.backend, advertise_ips, tun, cancel).await
     }
 
@@ -241,7 +229,6 @@ impl Dns for SystemDns {
         _advertise_ips: Vec<IpAddr>,
         _tun: tun_engine::TunIdentity,
         _server_ip: IpAddr,
-        _app_ids: Vec<PathBuf>,
         _cancel: CancellationToken,
     ) -> Result<Self::Applied, DnsError> {
         Ok(SystemDnsApplied {
@@ -265,7 +252,6 @@ async fn apply_windows(
     advertise_ips: Vec<IpAddr>,
     tun: tun_engine::TunIdentity,
     server_ip: IpAddr,
-    app_ids: Vec<PathBuf>,
     cancel: CancellationToken,
 ) -> Result<SystemDnsApplied, DnsError> {
     let started = std::time::Instant::now();
@@ -279,7 +265,7 @@ async fn apply_windows(
     // not a degraded session, it is an unprotected one.
     let confiner = Arc::clone(confiner);
     let luid = tun.luid();
-    let confinement = tokio::task::spawn_blocking(move || confiner.engage(luid, server_ip, &app_ids))
+    let confinement = tokio::task::spawn_blocking(move || confiner.engage(luid, server_ip))
         .await
         .map_err(|e| DnsError::Io(io::Error::other(e)))?
         .map_err(DnsError::Confine)?;
@@ -291,10 +277,15 @@ async fn apply_windows(
         return Err(DnsError::Cancelled);
     }
 
+    // The LUID of the device this process actually opened — never a name
+    // lookup. An alias, by contrast, is the name Hole REQUESTED
+    // (`TunIdentity::alias`), not a value read back from the opened device;
+    // a concurrent bridge's adapter can answer to that same name
+    // (bindreams/hole#936), so resolving a GUID from the alias instead of
+    // the LUID could target the wrong adapter.
     let b = Arc::clone(backend);
-    let alias = tun.alias().to_string();
     let ips = advertise_ips.clone();
-    let res = tokio::task::spawn_blocking(move || b.set_servers(&alias, &ips))
+    let res = tokio::task::spawn_blocking(move || b.set_servers(luid, &ips))
         .await
         .map_err(|e| DnsError::Io(io::Error::other(e)))?;
     // Fail-fatal (see module doc): after #846 there is exactly one target,
@@ -342,10 +333,10 @@ async fn apply_macos(
     let res = tokio::task::spawn_blocking(move || b.set_servers(&alias, &ips))
         .await
         .map_err(|e| DnsError::Io(io::Error::other(e)))?;
-    // NOT promoted to fatal (see module doc, and F5 in the #846 plan):
-    // `set_servers` is a guaranteed failure on this platform today
-    // (interface name handed to a service-name API), so promoting it
-    // would refuse every macOS Full-mode start with DNS enabled.
+    // NOT promoted to fatal (see module doc): `set_servers` is a guaranteed
+    // failure on this platform today (interface name handed to a
+    // service-name API), so promoting it would refuse every macOS
+    // Full-mode start with DNS enabled.
     if let Err(e) = res {
         tracing::warn!(error = %e, "DNS apply failed; continuing");
     }
@@ -479,12 +470,11 @@ pub use crate::dns_state::DnsPriorAdapter as PriorAdapter;
 
 // Upgrade-sweep evidence gate =========================================================================================
 //
-// Used ONLY by `crate::dns::recovery`'s upgrade sweep, which undoes a
-// *pre-#846* build's own upstream-adapter DNS rewrite after a crash — the
-// one place a write to another adapter is still correct. See that
-// module's doc for the full argument and F6 in the #846 plan for why the
-// gate is per family, not per adapter, and why it never clears a file it
-// found no evidence for.
+// Used ONLY by `crate::dns::recovery`'s upgrade sweep, which undoes an
+// older build's own upstream-adapter DNS rewrite after a crash — the one
+// place a write to another adapter is still correct. See that module's
+// doc for why the gate is per family, not per adapter, and why it never
+// clears a file it found no evidence for.
 
 /// What [`restore_family_if_ours`] did for one adapter + family.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -510,8 +500,7 @@ pub enum FamilyOutcome {
 /// Evaluate and, if warranted, restore ONE family of ONE recorded adapter.
 /// `advertised_family_subset` must already be filtered to the family this
 /// call is judging (the caller splits `DnsState.advertised` by family
-/// before calling — the union is not comparable to a live per-family read;
-/// see F6).
+/// before calling — the union is not comparable to a live per-family read).
 #[cfg(target_os = "windows")]
 pub(crate) fn restore_family_if_ours(
     backend: &dyn windows::WinDnsBackend,

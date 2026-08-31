@@ -52,7 +52,7 @@ mod win {
             Ok(self.live.lock().unwrap().get(alias).cloned())
         }
 
-        fn set_servers(&self, _alias: &str, _servers: &[IpAddr]) -> std::io::Result<()> {
+        fn set_servers(&self, _luid: u64, _servers: &[IpAddr]) -> std::io::Result<()> {
             unreachable!("the upgrade sweep never calls set_servers")
         }
 
@@ -91,6 +91,30 @@ fn v4(ip: (u8, u8, u8, u8)) -> IpAddr {
 
 // Tests ===============================================================================================================
 
+/// `finish`'s module-doc promise — the un-suffixed name is gone after the
+/// call, so `dns_state::load` can never re-evaluate the same file twice —
+/// must hold even when `dns_state::clear` itself fails. A directory at the
+/// state-file path makes `clear`'s `remove_file` fail deterministically and
+/// portably (`remove_file` on a directory always errors), while
+/// `supersede`'s `rename` still succeeds — isolating the fallback this test
+/// pins from the two operations' own correctness.
+#[skuld::test]
+fn finish_falls_back_to_supersede_when_clear_fails() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join(dns_state::STATE_FILE_NAME)).unwrap();
+
+    finish(dir.path(), true);
+
+    assert!(
+        !dir.path().join(dns_state::STATE_FILE_NAME).exists(),
+        "the un-suffixed name must be gone even when clear() fails — the evaluated-once bound must hold"
+    );
+    assert!(
+        dir.path().join(dns_state::SUPERSEDED_FILE_NAME).exists(),
+        "clear() failure must fall back to supersede() so the escape hatch (network-reset.py) survives"
+    );
+}
+
 #[skuld::test]
 fn recover_when_no_state_file_is_noop() {
     let dir = tempfile::tempdir().unwrap();
@@ -101,8 +125,8 @@ fn recover_when_no_state_file_is_noop() {
 
 #[skuld::test]
 fn recover_clears_state_file_with_no_adapters() {
-    // Empty adapters list is vacuously "every adapter settled" — matches
-    // the pre-#846 behavior of clearing on a no-op restore.
+    // Empty adapters list is vacuously "every adapter settled", so a
+    // no-op restore still clears the file.
     let dir = tempfile::tempdir().unwrap();
     let state = DnsState {
         version: SCHEMA_VERSION,
@@ -172,6 +196,63 @@ fn recover_dns_config_restores_a_pre_846_file() {
         "a fully-confirmed restore must delete the file"
     );
     assert!(!dir.path().join(dns_state::SUPERSEDED_FILE_NAME).exists());
+}
+
+/// `MockBackend::fail_restore` — the arm for `FamilyOutcome::Failed`, one
+/// of the two outcomes (with `SkippedNotOurs`) that must never settle — had
+/// zero coverage: nothing armed it. A restore that fails at the platform
+/// level must preserve the file (superseded), never delete it as if the
+/// restore had succeeded.
+#[cfg(target_os = "windows")]
+#[skuld::test]
+fn recover_dns_config_supersedes_when_restore_family_fails() {
+    let dir = tempfile::tempdir().unwrap();
+    let advertised = vec![v4((1, 1, 1, 1))];
+    let prior = DnsPriorAdapter {
+        id: AdapterId::WindowsAlias {
+            value: "Ethernet".into(),
+        },
+        name_at_capture: "Ethernet".into(),
+        v4: DnsPrior::Dhcp,
+        v6: DnsPrior::None,
+    };
+    let state = DnsState {
+        version: SCHEMA_VERSION,
+        advertised: advertised.clone(),
+        adapters: vec![prior.clone()],
+    };
+    write_state(dir.path(), &state);
+
+    let backend = MockBackend::new();
+    // Live v4 matches the evidence — a restore is genuinely owed — but the
+    // platform write itself fails.
+    backend.seed(
+        "Ethernet",
+        DnsPriorAdapter {
+            id: prior.id.clone(),
+            name_at_capture: "Ethernet".into(),
+            v4: DnsPrior::Static { servers: advertised },
+            v6: DnsPrior::None,
+        },
+    );
+    backend.fail_restore.store(true, SeqCst);
+
+    recover_dns_config_with(dir.path(), &backend);
+
+    assert_eq!(
+        backend.restore_family_calls.load(SeqCst),
+        1,
+        "the v4 restore must have been attempted (and failed)"
+    );
+    assert!(
+        !dir.path().join(dns_state::STATE_FILE_NAME).exists(),
+        "the un-suffixed name must be gone — a Failed outcome must never settle, so it is superseded, \
+         never left in place to be silently re-evaluated"
+    );
+    assert!(
+        dir.path().join(dns_state::SUPERSEDED_FILE_NAME).exists(),
+        "a restore_family failure must preserve the file as the superseded name, not silently drop it"
+    );
 }
 
 #[cfg(target_os = "windows")]
@@ -270,7 +351,7 @@ fn recover_dns_config_preserves_a_file_with_no_advertised_evidence() {
     );
     assert!(
         !dir.path().join(dns_state::STATE_FILE_NAME).exists(),
-        "must not leave the un-suffixed name — R0-2: the inverted gate manufactured a lockout here"
+        "must not leave the un-suffixed name — the file was already evaluated once"
     );
     assert!(
         dir.path().join(dns_state::SUPERSEDED_FILE_NAME).exists(),

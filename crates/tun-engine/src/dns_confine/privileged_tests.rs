@@ -37,8 +37,8 @@
 //!
 //! No `EscapeGuard` / recovery-record machinery here, unlike the fail-closed
 //! cover's privileged tests: the confinement persists NO state file by
-//! design (F6) — its entire disengage is `DnsConfinement`'s `Drop`, which
-//! this module relies on directly. A killed test leaves nothing on the host
+//! design — its entire disengage is `DnsConfinement`'s `Drop`, which this
+//! module relies on directly. A killed test leaves nothing on the host
 //! but a leaked wintun adapter (cleared the same way any other test's is —
 //! `scripts/network-reset.py`), never a stranded firewall block.
 //!
@@ -155,7 +155,7 @@ fn dns_confine_global_net_state_permits_dns_on_the_named_tun() {
     let route = OwnedRoute::add(PROBE_NET, name, None);
     route.assert_wins_for(IpAddr::V4(PROBE_IP));
 
-    let confinement = engage(luid, server_ip(), &[]).expect("engage real DNS confinement");
+    let confinement = engage(luid, server_ip()).expect("engage real DNS confinement");
 
     let (rt, socket) = probe_socket();
     let dir = tempfile::tempdir().expect("HARNESS: tempdir for the pktmon capture");
@@ -185,7 +185,7 @@ fn dns_confine_global_net_state_blocks_dns_off_the_tun() {
     let dev = open_device("dns-confine-test-tun-b", "10.255.249.1", "255.255.255.0");
     let luid = dev.tun_luid();
 
-    let confinement = engage(luid, server_ip(), &[]).expect("engage real DNS confinement");
+    let confinement = engage(luid, server_ip()).expect("engage real DNS confinement");
 
     let (rt, socket) = probe_socket();
     let dir = tempfile::tempdir().expect("HARNESS: tempdir for the pktmon capture");
@@ -221,7 +221,7 @@ fn dns_confine_global_net_state_leaves_other_ports_alone() {
     let dev = open_device("dns-confine-test-tun-c", "10.255.248.1", "255.255.255.0");
     let luid = dev.tun_luid();
 
-    let confinement = engage(luid, server_ip(), &[]).expect("engage real DNS confinement");
+    let confinement = engage(luid, server_ip()).expect("engage real DNS confinement");
     let result = TcpStream::connect_timeout(&OFF_TUNNEL_OTHER_PORT.parse().expect("literal"), Duration::from_secs(5));
     drop(confinement);
 
@@ -252,7 +252,7 @@ fn dns_confine_global_net_state_is_sensitive_to_the_interface_it_names() {
     route.assert_wins_for(IpAddr::V4(PROBE_IP));
 
     // Engage naming ONLY device A.
-    let confinement = engage(luid_a, server_ip(), &[]).expect("engage real DNS confinement naming device A");
+    let confinement = engage(luid_a, server_ip()).expect("engage real DNS confinement naming device A");
 
     let (rt, socket) = probe_socket();
     let dir = tempfile::tempdir().expect("HARNESS: tempdir for the pktmon capture");
@@ -290,7 +290,7 @@ fn dns_confine_global_net_state_filters_die_with_the_session() {
     let dev = open_device("dns-confine-test-tun-f", "10.255.245.1", "255.255.255.0");
     let luid = dev.tun_luid();
 
-    let confinement = engage(luid, server_ip(), &[]).expect("engage real DNS confinement");
+    let confinement = engage(luid, server_ip()).expect("engage real DNS confinement");
     drop(confinement);
 
     let (rt, socket) = probe_socket();
@@ -307,7 +307,7 @@ fn dns_confine_global_net_state_filters_die_with_the_session() {
     );
 }
 
-/// R0-3's live proof: the Shadowsocks server permit matches on port 53 too —
+/// Live proof that the Shadowsocks server permit matches on port 53 too —
 /// a server configured on port 53 (a standard censorship-evasion setup) must
 /// not be locked out of its own tunnel by the very confinement meant to
 /// protect it. Proven at the wire.
@@ -316,7 +316,7 @@ fn dns_confine_global_net_state_permits_the_server_on_port_53() {
     let dev = open_device("dns-confine-test-tun-g", "10.255.244.1", "255.255.255.0");
     let luid = dev.tun_luid();
 
-    let confinement = engage(luid, server_ip(), &[]).expect("engage real DNS confinement");
+    let confinement = engage(luid, server_ip()).expect("engage real DNS confinement");
 
     let (rt, socket) = probe_socket();
     let dir = tempfile::tempdir().expect("HARNESS: tempdir for the pktmon capture");

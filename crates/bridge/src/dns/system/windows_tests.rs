@@ -12,7 +12,6 @@
 
 use std::io;
 use std::net::{IpAddr, Ipv4Addr};
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
 use std::sync::{Arc, Mutex};
 
@@ -36,6 +35,7 @@ struct MockBackend {
     restore_calls: AtomicUsize,
     flush_calls: AtomicUsize,
     set_ips: Mutex<Vec<Vec<IpAddr>>>,
+    set_luids: Mutex<Vec<u64>>,
 }
 
 struct Rendezvous {
@@ -53,6 +53,7 @@ impl MockBackend {
             restore_calls: AtomicUsize::new(0),
             flush_calls: AtomicUsize::new(0),
             set_ips: Mutex::new(Vec::new()),
+            set_luids: Mutex::new(Vec::new()),
         })
     }
 }
@@ -70,8 +71,9 @@ impl WinDnsBackend for MockBackend {
         }))
     }
 
-    fn set_servers(&self, _alias: &str, servers: &[IpAddr]) -> io::Result<()> {
+    fn set_servers(&self, luid: u64, servers: &[IpAddr]) -> io::Result<()> {
         self.set_ips.lock().unwrap().push(servers.to_vec());
+        self.set_luids.lock().unwrap().push(luid);
         self.set_calls.fetch_add(1, SeqCst);
         Ok(())
     }
@@ -149,7 +151,6 @@ impl DnsConfiner for MockConfiner {
         &self,
         _tun_luid: u64,
         _server_ip: IpAddr,
-        _app_ids: &[PathBuf],
     ) -> Result<Box<dyn std::any::Any + Send>, tun_engine::dns_confine::DnsConfineError> {
         self.engage_calls.fetch_add(1, SeqCst);
         if let Some(r) = self.rendezvous.lock().unwrap().take() {
@@ -206,7 +207,6 @@ async fn dns_apply_cancelled_drops_the_confinement() {
             vec![IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))],
             tun_identity(),
             server_ip(),
-            Vec::new(),
             cancel,
         )
         .await;
@@ -244,7 +244,6 @@ async fn apply_sets_resolvers_on_hole_tun_only() {
             vec![IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))],
             tun_identity(),
             server_ip(),
-            Vec::new(),
             CancellationToken::new(),
         )
         .await
@@ -252,6 +251,14 @@ async fn apply_sets_resolvers_on_hole_tun_only() {
 
     assert_eq!(backend.set_calls.load(SeqCst), 1, "exactly one set_servers call");
     assert_eq!(backend.get_calls.load(SeqCst), 0, "apply must never call get_settings");
+    // `set_servers` must be handed the LUID of the opened device
+    // (`TunIdentity::luid`), never a value it would have to re-resolve from
+    // a name — see `apply_windows`'s doc.
+    assert_eq!(
+        backend.set_luids.lock().unwrap().as_slice(),
+        [tun_identity().luid()],
+        "set_servers must receive tun.luid() directly"
+    );
 
     applied.shutdown().await;
 }
@@ -272,7 +279,6 @@ async fn system_dns_applied_drop_panics_in_debug_if_shutdown_not_awaited() {
             vec![IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))],
             tun_identity(),
             server_ip(),
-            Vec::new(),
             CancellationToken::new(),
         )
         .await
@@ -299,7 +305,6 @@ async fn shutdown_releases_the_confinement() {
             vec![IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))],
             tun_identity(),
             server_ip(),
-            Vec::new(),
             CancellationToken::new(),
         )
         .await
@@ -331,7 +336,6 @@ async fn confiner_failure_surfaces_as_confine_error_and_skips_set_servers() {
             vec![IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))],
             tun_identity(),
             server_ip(),
-            Vec::new(),
             CancellationToken::new(),
         )
         .await;
@@ -349,9 +353,8 @@ async fn confiner_failure_surfaces_as_confine_error_and_skips_set_servers() {
     );
 }
 
-/// `set_servers` failure must be fatal (Q5's Windows promotion) — with the
-/// pre-#846 alias list gone there is exactly one target, so "continuing"
-/// has nothing to continue to.
+/// `set_servers` failure must be fatal on Windows: `hole-tun` is the only
+/// target, so "continuing" has nowhere to continue to.
 #[skuld::test]
 async fn set_servers_failure_is_fatal() {
     struct FailingSetBackend;
@@ -359,7 +362,7 @@ async fn set_servers_failure_is_fatal() {
         fn get_settings(&self, _alias: &str) -> io::Result<Option<DnsPriorAdapter>> {
             unreachable!("apply never calls get_settings")
         }
-        fn set_servers(&self, _alias: &str, _servers: &[IpAddr]) -> io::Result<()> {
+        fn set_servers(&self, _luid: u64, _servers: &[IpAddr]) -> io::Result<()> {
             Err(io::Error::other("mock set_servers failure"))
         }
         fn restore(&self, _adapter: &DnsPriorAdapter) -> io::Result<()> {
@@ -384,7 +387,6 @@ async fn set_servers_failure_is_fatal() {
             vec![IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))],
             tun_identity(),
             server_ip(),
-            Vec::new(),
             CancellationToken::new(),
         )
         .await;
@@ -414,13 +416,7 @@ async fn apply_advertises_resolver_ips_not_loopback() {
         IpAddr::V4(Ipv4Addr::new(1, 0, 0, 1)),
     ];
     let mut applied = dns
-        .apply(
-            resolvers.clone(),
-            tun_identity(),
-            server_ip(),
-            Vec::new(),
-            CancellationToken::new(),
-        )
+        .apply(resolvers.clone(), tun_identity(), server_ip(), CancellationToken::new())
         .await
         .expect("apply should succeed");
 
@@ -456,13 +452,7 @@ async fn apply_advertises_both_v4_and_v6_resolvers() {
         "2606:4700:4700::1111".parse().unwrap(),
     ];
     let mut applied = dns
-        .apply(
-            resolvers.clone(),
-            tun_identity(),
-            server_ip(),
-            Vec::new(),
-            CancellationToken::new(),
-        )
+        .apply(resolvers.clone(), tun_identity(), server_ip(), CancellationToken::new())
         .await
         .expect("apply should succeed");
 
@@ -475,9 +465,9 @@ async fn apply_advertises_both_v4_and_v6_resolvers() {
     applied.shutdown().await;
 }
 
-/// `Dns::apply` performs zero `get_settings` calls — there is no capture
-/// any more (bindreams/hole#846); an accidental reintroduction would be
-/// F1 site 3, the read the issue objects to.
+/// `Dns::apply` performs zero `get_settings` calls — nothing is captured
+/// before overwriting resolvers, because there is nothing left to restore
+/// but `hole-tun` itself.
 #[skuld::test]
 async fn dns_apply_captures_nothing() {
     let backend = MockBackend::new();
@@ -492,7 +482,6 @@ async fn dns_apply_captures_nothing() {
             vec![IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))],
             tun_identity(),
             server_ip(),
-            Vec::new(),
             CancellationToken::new(),
         )
         .await

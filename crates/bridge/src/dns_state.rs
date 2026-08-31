@@ -1,13 +1,12 @@
-//! Persisted DNS state — read-only escape hatch for a `bridge-dns.json` a
-//! pre-#846 build left behind. The bridge itself no longer writes this
-//! file: #846 replaced the upstream-adapter DNS rewrite with
-//! `tun_engine::dns_confine`'s WFP confinement, which persists nothing
-//! (see that module's doc for why a process-scoped dynamic FWPM session
-//! needs no crash-recovery state at all). What remains here is `load` +
-//! `clear`/`supersede`, used exactly once per file by
-//! [`crate::dns::recovery`]'s evidence-gated upgrade sweep, and the schema
-//! types themselves — kept so a pre-#846 file can still be parsed and,
-//! when the evidence supports it, undone.
+//! Persisted DNS state — read-only escape hatch for a `bridge-dns.json` an
+//! older build left behind. The bridge itself no longer writes this file:
+//! DNS egress is confined by `tun_engine::dns_confine`'s WFP confinement
+//! instead, which persists nothing (see that module's doc for why a
+//! process-scoped dynamic FWPM session needs no crash-recovery state at
+//! all). What remains here is `load` + `clear`/`supersede`, used exactly
+//! once per file by [`crate::dns::recovery`]'s evidence-gated upgrade
+//! sweep, and the schema types themselves — kept so an older build's file
+//! can still be parsed and, when the evidence supports it, undone.
 //!
 //! Single-reader assumption: only one bridge starts at a time reads this
 //! file (the IPC socket bind's intended single-instance guarantee — see
@@ -49,8 +48,8 @@ pub const SUPERSEDED_FILE_NAME: &str = "bridge-dns.superseded.json";
 // `adapters`.
 pub struct DnsState {
     pub version: u32,
-    /// The upstream resolver IPs the writing (pre-#846) build advertised to
-    /// its adapters. NOT diagnostic-only: the upgrade sweep's ONLY evidence
+    /// The upstream resolver IPs the writing build advertised to its
+    /// adapters. NOT diagnostic-only: the upgrade sweep's ONLY evidence
     /// that a live adapter's current DNS is still what that old build left
     /// behind — see `crate::dns::recovery`'s doc for the exact gate.
     /// `#[serde(default)]` so a file old enough to carry the obsolete

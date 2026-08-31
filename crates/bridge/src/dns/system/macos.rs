@@ -11,11 +11,10 @@
 //! Production goes through [`Networksetup`]; unit tests substitute
 //! `MockMacBackend` via [`crate::dns::system::SystemDns::new_with_mac_backend`].
 //! `get_settings` / `restore` / `restore_family` are used ONLY by
-//! `crate::dns::recovery`'s upgrade sweep now — the bridge itself no
-//! longer captures or blind-restores (bindreams/hole#846). Apply on this
-//! platform stays advisory (F5 in the #846 plan): `apply_macos` hands
-//! `hole-tun` — an *interface* name — to this service-name-keyed API, a
-//! guaranteed no-op until #868 lands the real mechanism.
+//! `crate::dns::recovery`'s upgrade sweep. Apply on this platform stays
+//! advisory: `apply_macos` hands `hole-tun` — an *interface* name — to
+//! this service-name-keyed API, a guaranteed no-op until #868 lands the
+//! real mechanism.
 
 use std::io;
 use std::net::IpAddr;

@@ -35,6 +35,18 @@ pub enum DriverExit {
     AlreadyDrained,
 }
 
+/// What [`Dispatcher::new`] can fail with. Keeps `tun_engine::DeviceError`
+/// distinguishable from every other start-time I/O failure, so a caller can
+/// match the specific variant (e.g. `DeviceError::ForeignAdapter`) instead
+/// of a flattened `io::Error` whose type information is already gone.
+#[derive(Debug, thiserror::Error)]
+pub enum DispatcherStartError {
+    #[error(transparent)]
+    Device(#[from] tun_engine::DeviceError),
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+}
+
 /// Awaits `handle` in place and classifies how the driver task ended. No
 /// bound: `Driver::run` observes its cancellation token at every await
 /// (see `tun_engine::engine::{dns, egress}`), so this can only hang if
@@ -104,7 +116,7 @@ impl Dispatcher {
         rules: RuleSet,
         local_dns_endpoint: Option<LocalDnsEndpoint>,
         cancel: &CancellationToken,
-    ) -> std::io::Result<Option<Self>> {
+    ) -> Result<Option<Self>, DispatcherStartError> {
         // Open the TUN device.
         let v4_cidr = TUN_SUBNET
             .parse()
@@ -125,7 +137,7 @@ impl Dispatcher {
         let Some(device) = built else {
             return Ok(None);
         };
-        let device = device.map_err(device_error_to_io)?;
+        let device = device?;
 
         // Give hole-tun the lowest possible interface metric so Windows
         // prefers whatever resolver Hole advertises over the physical
@@ -142,14 +154,14 @@ impl Dispatcher {
             match set_interface_metric(luid, TUNNEL_INTERFACE_METRIC, Family::V4) {
                 Ok(MetricOutcome::Applied) => {}
                 Ok(MetricOutcome::NoInterfaceRow) => {
-                    return Err(std::io::Error::other(
-                        "hole-tun has no IPv4 interface row immediately after creation",
-                    ));
+                    return Err(
+                        std::io::Error::other("hole-tun has no IPv4 interface row immediately after creation").into(),
+                    );
                 }
                 Err(e) => {
-                    return Err(std::io::Error::other(format!(
-                        "failed to set hole-tun's IPv4 interface metric: {e}"
-                    )));
+                    return Err(
+                        std::io::Error::other(format!("failed to set hole-tun's IPv4 interface metric: {e}")).into(),
+                    );
                 }
             }
             match set_interface_metric(luid, TUNNEL_INTERFACE_METRIC, Family::V6) {
@@ -158,9 +170,9 @@ impl Dispatcher {
                     warn!("hole-tun has no IPv6 interface row yet; IPv6 metric not set (host may lack IPv6, or the row has not appeared)");
                 }
                 Err(e) => {
-                    return Err(std::io::Error::other(format!(
-                        "failed to set hole-tun's IPv6 interface metric: {e}"
-                    )));
+                    return Err(
+                        std::io::Error::other(format!("failed to set hole-tun's IPv6 interface metric: {e}")).into(),
+                    );
                 }
             }
         }
@@ -308,16 +320,6 @@ where
         // The task is never aborted, so a `JoinError` is always a panic.
         r = task => Some(r.unwrap_or_else(|e| std::panic::resume_unwind(e.into_panic()))),
     }
-}
-
-/// The device was created; its IPv6 address was not. A user shown the
-/// create-failed sentence looks in the wrong place.
-fn device_error_to_io(e: tun_engine::DeviceError) -> std::io::Error {
-    let what = match e {
-        tun_engine::DeviceError::Ipv6Assign { .. } => "failed to assign the TUN device's IPv6 address",
-        _ => "failed to create TUN device",
-    };
-    std::io::Error::other(format!("{what}: {e}"))
 }
 
 /// Safety net for non-graceful paths (panic, cancel mid-`start_inner`, a

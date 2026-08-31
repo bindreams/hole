@@ -1,8 +1,7 @@
 //! DNS-egress confinement — a WFP filter set (Windows) that permits DNS
-//! (UDP+TCP port 53) only on `hole-tun` itself, on loopback, to the
-//! Shadowsocks server, and to the process paths that must be able to
-//! resolve off-tunnel (see [`spec::Condition::AppId`]), blocking it
-//! everywhere else. This is the *negative* half of #846: the positive half
+//! (UDP+TCP port 53) only on `hole-tun` itself, on loopback, and to the
+//! Shadowsocks server, blocking it everywhere else. This is the *negative*
+//! half of #846: the positive half
 //! (give the OS a resolver it can reach through the tunnel) stays where it
 //! is, in `crate::net::metric` + the bridge's existing resolver-IP
 //! advertisement.
@@ -29,10 +28,10 @@ mod platform;
 #[cfg(target_os = "windows")]
 pub use platform::{engage, DnsConfineError, DnsConfinement};
 
-// Privileged-lane live proof (#846): engages the REAL WFP confinement against
-// real wintun devices. Gated to the elevated `tun` lane by the crate-root
-// `TUN` label; excluded from the unprivileged pass. Windows-only — this crate
-// has no confinement implementation on any other platform yet (Q1).
+// Privileged-lane live proof: engages the REAL WFP confinement against real
+// wintun devices. Gated to the elevated `tun` lane by the crate-root `TUN`
+// label; excluded from the unprivileged pass. Windows-only — this crate has
+// no confinement implementation on any other platform yet.
 #[cfg(all(test, target_os = "windows"))]
 #[path = "dns_confine/privileged_tests.rs"]
 mod privileged_tests;

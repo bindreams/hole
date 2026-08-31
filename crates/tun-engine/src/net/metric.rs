@@ -94,6 +94,12 @@ pub fn set_interface_metric(luid: u64, metric: u32, family: Family) -> io::Resul
         MetricOutcome::Applied => {}
     }
 
+    // MSDN's `SetIpInterfaceEntry` Remarks: an application must not try to
+    // modify `SitePrefixLength`; it must be set to 0. `GetIpInterfaceEntry`
+    // above can return a nonzero value (measured: 64 on a real IPv4
+    // interface), and round-tripping it back unmodified is exactly what
+    // that Remark forbids.
+    row.SitePrefixLength = 0;
     row.Metric = metric;
     row.UseAutomaticMetric = false;
 
@@ -108,3 +114,7 @@ pub fn set_interface_metric(luid: u64, metric: u32, family: Family) -> io::Resul
 #[cfg(test)]
 #[path = "metric_tests.rs"]
 mod metric_tests;
+
+#[cfg(test)]
+#[path = "metric_privileged_tests.rs"]
+mod metric_privileged_tests;

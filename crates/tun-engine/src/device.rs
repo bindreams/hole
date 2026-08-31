@@ -93,25 +93,7 @@ impl Device {
             Err(e) => return Err(DeviceError::TunOpen(e)),
         }
 
-        let mut tun_config = tun::Configuration::default();
-        tun_config.tun_name(&config.tun_name).mtu(config.mtu).up();
-        if let Some(cidr) = config.ipv4 {
-            let addr = cidr.address();
-            let mask = std::net::Ipv4Addr::from(v4_mask(cidr.prefix_len()));
-            tun_config.address(addr).netmask(mask);
-        }
-        // The `tun` crate's `Configuration` holds a single address, so the v6
-        // CIDR is assigned to the OS interface separately, below.
-
-        // Request our own GUID on every create. `device_guid` sets `()`
-        // (doesn't chain), so this can't be folded into the builder chain
-        // above; Windows-only setter, so the call site is `#[cfg]`-gated
-        // too. Harmless on the ADOPT path: `tun` only consults
-        // `device_guid` inside its `Adapter::create` arm, so this is
-        // inert whenever `probe_incumbent` already found `Ours`/`None`
-        // (the alias didn't resolve) and `Adapter::open` succeeds instead.
-        #[cfg(target_os = "windows")]
-        tun_config.platform_config(|pc| pc.device_guid(identity::HOLE_ADAPTER_GUID));
+        let tun_config = build_tun_configuration(&config);
 
         let tun = tun::create_as_async(&tun_config).map_err(|e| DeviceError::TunOpen(std::io::Error::other(e)))?;
 
@@ -191,6 +173,36 @@ impl Device {
     pub fn into_inner(self) -> (AsyncDevice, DeviceConfig) {
         (self.tun, self.config)
     }
+}
+
+/// Assemble the `tun::Configuration` [`Device::build`] hands to
+/// `tun::create_as_async` — name, MTU, IPv4 address/netmask, and (Windows)
+/// the requested adapter GUID. Extracted so
+/// `config::config_tests::build_requests_the_hole_adapter_guid` exercises
+/// this exact function instead of a re-executed copy of the same lines,
+/// which would stay green through a regression in `Device::build` itself.
+fn build_tun_configuration(config: &DeviceConfig) -> tun::Configuration {
+    let mut tun_config = tun::Configuration::default();
+    tun_config.tun_name(&config.tun_name).mtu(config.mtu).up();
+    if let Some(cidr) = config.ipv4 {
+        let addr = cidr.address();
+        let mask = std::net::Ipv4Addr::from(v4_mask(cidr.prefix_len()));
+        tun_config.address(addr).netmask(mask);
+    }
+    // The `tun` crate's `Configuration` holds a single address, so the v6
+    // CIDR is assigned to the OS interface separately, in `Device::build`.
+
+    // Request our own GUID on every create. `device_guid` sets `()`
+    // (doesn't chain), so this can't be folded into the builder chain
+    // above; Windows-only setter, so the call site is `#[cfg]`-gated too.
+    // Harmless on the ADOPT path: `tun` only consults `device_guid` inside
+    // its `Adapter::create` arm, so this is inert whenever
+    // `identity::probe_incumbent` already found `Ours`/`None` (the alias
+    // didn't resolve) and `Adapter::open` succeeds instead.
+    #[cfg(target_os = "windows")]
+    tun_config.platform_config(|pc| pc.device_guid(identity::HOLE_ADAPTER_GUID));
+
+    tun_config
 }
 
 fn v4_mask(prefix_len: u8) -> [u8; 4] {

@@ -1370,6 +1370,53 @@ fn stop_with_cutover_disarms_lockdown_but_user_stop_disengages() {
     });
 }
 
+// lockdown_app_ids ====================================================================================================
+//
+// `resolve_plugin_path` deliberately falls back to the bare binary name when
+// it can't find the plugin next to the bridge exe, so shadowsocks can still
+// do a PATH lookup at spawn (see its own doc). `FwpmGetAppIdFromFileName0`
+// does no PATH search, so that bare name is not a resolvable path for it.
+
+/// A bare (no directory component) plugin name must be omitted from the
+/// App-ID list with a `warn!`, mirroring the `current_exe()`-failure
+/// handling — a narrowed permit set, never a fatal error, and never a bare
+/// name fed to the Win32 App-ID API.
+#[cfg(target_os = "windows")]
+#[skuld::test]
+fn lockdown_app_ids_skips_an_unresolvable_plugin_path() {
+    use crate::test_support::log_capture::VecWriter;
+    use tracing_subscriber::fmt;
+    use tracing_subscriber::layer::{Layer, SubscriberExt};
+
+    let writer = VecWriter::new();
+    let subscriber = tracing_subscriber::registry().with(
+        fmt::layer()
+            .with_writer(writer.clone())
+            .with_ansi(false)
+            .with_filter(tracing_subscriber::filter::LevelFilter::WARN),
+    );
+    let _guard = garter::tracing_test::set_default_in_current_thread(subscriber);
+
+    let mut config = test_config();
+    // Not a known friendly plugin name and not a file that exists next to
+    // the test binary — `resolve_plugin_path` falls back to this bare
+    // string verbatim.
+    config.server.plugin = Some("definitely-not-a-real-plugin-binary".into());
+
+    let ids = lockdown_app_ids(&config);
+
+    assert!(
+        ids.iter()
+            .all(|p| p.parent().is_some_and(|d| !d.as_os_str().is_empty())),
+        "no bare (unresolvable) path may reach the App-ID list: {ids:?}"
+    );
+    let output = writer.snapshot_string();
+    assert!(
+        output.contains("WARN") && output.contains("App-ID"),
+        "expected a WARN log naming the omitted App-ID permit; got:\n{output}"
+    );
+}
+
 // last_error coverage for early-failure paths =========================================================================
 
 #[skuld::test]
@@ -1782,20 +1829,15 @@ fn reload_when_not_running_starts() {
 }
 // DNS-apply instrumentation tests =====================================================================================
 //
-// `dns_apply_skips_tun_from_capture_keeps_in_apply` (pre-#846) pinned the
-// old capture-upstream/apply-both asymmetry — meaningless once #846 deleted
-// capture and both this crate and the confinement carry exactly one target
-// (`hole-tun`). It is deleted with the mechanism it pinned; the ONE
-// production target is now pinned by `dns_apply_targets_only_the_hole_tun`
-// below, which drives `start_inner`, not a hand-built `SystemDns::apply`
-// call.
+// The ONE production target (`hole-tun`) is pinned by
+// `dns_apply_targets_only_the_hole_tun` below, which drives `start_inner`,
+// not a hand-built `SystemDns::apply` call.
 
 /// Smoke-test: `apply_dns_settings` must emit an INFO log
 /// `"apply_dns_settings done"` with an `elapsed_ms` field so a slow apply
-/// is diagnosable without raising the log level. Uses mock backend +
-/// confiner (both succeeding) — post-#846 `apply` is fail-fatal on a real
-/// failure (Q5), so a real-but-nonexistent alias can no longer be used to
-/// force a fast no-op path the way the pre-#846 version of this test did.
+/// is diagnosable without raising the log level. Uses a succeeding mock
+/// backend + confiner: `apply` is fail-fatal on a real failure, so a
+/// nonexistent alias can't be used to force a fast no-op path instead.
 #[cfg(target_os = "windows")]
 #[skuld::test]
 fn dns_apply_emits_done_info_log() {
@@ -1821,7 +1863,7 @@ fn dns_apply_emits_done_info_log() {
                 v6: DnsPrior::None,
             }))
         }
-        fn set_servers(&self, _alias: &str, _servers: &[IpAddr]) -> std::io::Result<()> {
+        fn set_servers(&self, _luid: u64, _servers: &[IpAddr]) -> std::io::Result<()> {
             Ok(())
         }
         fn restore(&self, _adapter: &DnsPriorAdapter) -> std::io::Result<()> {
@@ -1840,7 +1882,6 @@ fn dns_apply_emits_done_info_log() {
             &self,
             _tun_luid: u64,
             _server_ip: IpAddr,
-            _app_ids: &[std::path::PathBuf],
         ) -> Result<Box<dyn std::any::Any + Send>, tun_engine::dns_confine::DnsConfineError> {
             Ok(Box::new(()))
         }
@@ -1869,7 +1910,6 @@ fn dns_apply_emits_done_info_log() {
                     vec![IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))],
                     tun_engine::TunIdentity::synthetic(0xFEED, "hole-tun"),
                     IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7)),
-                    Vec::new(),
                     CancellationToken::new(),
                 )
                 .await
@@ -1891,13 +1931,12 @@ fn dns_apply_emits_done_info_log() {
 
 // Phase 7 target + fail-fatal tests (bindreams/hole#846) ==============================================================
 
-/// The RED test for #846 and for #837's held side effect: `Dns::apply` must
-/// be reachable only with `hole-tun` — never the foreign gateway interface
-/// name `MockRouting::default_gateway` reports. Drives the REAL
-/// `start_inner` wiring (not a hand-built `MockDns::apply` call), so this
-/// catches a second target being reintroduced; it cannot catch the identity
-/// itself being wrong — `TunIdentity` having no production constructor
-/// reachable from a `GatewayInfo` is what rules that out (F8).
+/// `Dns::apply` must be reachable only with `hole-tun` — never the foreign
+/// gateway interface name `MockRouting::default_gateway` reports. Drives
+/// the REAL `start_inner` wiring (not a hand-built `MockDns::apply` call),
+/// so this catches a second target being reintroduced; it cannot catch the
+/// identity itself being wrong — `TunIdentity` having no production
+/// constructor reachable from a `GatewayInfo` is what rules that out.
 #[skuld::test]
 fn dns_apply_targets_only_the_hole_tun() {
     rt().block_on(async {
@@ -1936,7 +1975,7 @@ fn dns_apply_targets_only_the_hole_tun() {
     });
 }
 
-/// Q5's deliberate fail-open→fail-fatal change on Windows, pinned through
+/// A `set_servers` failure on Windows is fail-fatal, pinned through
 /// `start_inner` with a REAL `SystemDns` (a failing `WinDnsBackend` mock +
 /// an always-succeeding confiner mock) — `confinement_failure_aborts_the_start`
 /// below pins a DIFFERENT arm (`DnsError::Confine`) and cannot stand in for
@@ -1953,7 +1992,7 @@ fn windows_set_servers_failure_aborts_the_start() {
         fn get_settings(&self, _alias: &str) -> std::io::Result<Option<DnsPriorAdapter>> {
             unreachable!("apply never calls get_settings")
         }
-        fn set_servers(&self, _alias: &str, _servers: &[IpAddr]) -> std::io::Result<()> {
+        fn set_servers(&self, _luid: u64, _servers: &[IpAddr]) -> std::io::Result<()> {
             Err(std::io::Error::other("mock set_servers failure"))
         }
         fn restore(&self, _adapter: &DnsPriorAdapter) -> std::io::Result<()> {
@@ -1972,7 +2011,6 @@ fn windows_set_servers_failure_aborts_the_start() {
             &self,
             _tun_luid: u64,
             _server_ip: IpAddr,
-            _app_ids: &[std::path::PathBuf],
         ) -> Result<Box<dyn std::any::Any + Send>, tun_engine::dns_confine::DnsConfineError> {
             Ok(Box::new(()))
         }
@@ -1995,19 +2033,23 @@ fn windows_set_servers_failure_aborts_the_start() {
         config.dns.servers = vec![IpAddr::V4(Ipv4Addr::new(198, 51, 100, 53))];
 
         let result = pm.start(&config).await;
-        assert!(result.is_err(), "start must fail when set_servers fails: {result:?}");
+        match result {
+            Err(ProxyError::Runtime(_)) => {}
+            other => panic!(
+                "expected Err(ProxyError::Runtime), got {}",
+                describe_start_result(&other)
+            ),
+        }
         assert_eq!(pm.state(), ProxyState::Stopped, "no session may be left running");
     });
 }
 
-/// `confinement_failure_aborts_the_start` — an earlier draft asserted only
-/// `state() == Stopped`, which passes vacuously for ANY early failure
-/// (including the LUID resolve Q3 removed). Asserting the SPECIFIC variant
-/// is what actually pins the Confine arm, and the paired negative below
-/// keeps this from passing because the start failed for unrelated reasons.
-/// Windows-only: `DnsError::Confine` / `ProxyError::DnsConfinementFailed`
-/// only exist on Windows (`dns_confine` is Windows-gated entirely; F5 —
-/// macOS has no confinement to fail).
+/// Asserts the SPECIFIC `DnsError::Confine` / `ProxyError::DnsConfinementFailed`
+/// variant, not just `state() == Stopped` — the latter alone would pass
+/// vacuously for any early failure; the paired negative below keeps this
+/// from passing because the start failed for unrelated reasons. Windows-only:
+/// `dns_confine` is Windows-gated entirely, and macOS has no confinement to
+/// fail.
 #[cfg(target_os = "windows")]
 #[skuld::test]
 fn confinement_failure_aborts_the_start() {

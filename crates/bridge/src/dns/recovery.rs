@@ -3,7 +3,7 @@
 //! The bridge itself no longer writes `bridge-dns.json` — DNS is confined
 //! to `hole-tun` (see `tun_engine::dns_confine`), which persists nothing.
 //! What remains here is the one place a write to another adapter is still
-//! correct: undoing a *pre-#846* build's own upstream-adapter DNS rewrite
+//! correct: undoing an older build's own upstream-adapter DNS rewrite
 //! after that build crashed. Runs at bridge startup *after* the IPC socket
 //! bind and *before* `routing::recover_routes` — matches the existing
 //! convention in [`crate::plugin_recovery`] /
@@ -26,8 +26,8 @@
 //!   shipped default is v4-only, so this is the common case for v6), Hole
 //!   genuinely never claimed this family and there is nothing it could owe
 //!   — it does NOT block. If `advertised` is empty in its ENTIRETY (a file
-//!   of unknown provenance, R0-2), every family reads this way and the
-//!   whole file is treated as unconfirmed.
+//!   of unknown provenance), every family reads this way and the whole file
+//!   is treated as unconfirmed.
 //!
 //! Per family, not per adapter: a per-adapter verdict would let the v6
 //! family — which Hole never wrote — veto the v4 restore that is genuinely
@@ -42,10 +42,10 @@
 //! ([`dns_state::STATE_FILE_NAME`]) is gone after this call, so
 //! [`dns_state::load`] can never see it again on a later start — the
 //! value-equality gate above is evidence, not ownership, and without this
-//! bound it would stay armed for the life of the machine (see F6 in the
-//! #846 plan for the three hazards that bound removes). This mirrors the
-//! precedent at `tun_engine::routing::failclosed`'s cover state-file
-//! handling: an unconfirmed restore must not clear the escape hatch.
+//! bound it would stay armed for the life of the machine, re-evaluating the
+//! same stale evidence on every later start. This mirrors the precedent at
+//! `tun_engine::routing::failclosed`'s cover state-file handling: an
+//! unconfirmed restore must not clear the escape hatch.
 //! `scripts/network-reset.py` reads both names, so the escape survives the
 //! rename rather than being hidden by it.
 
@@ -70,8 +70,8 @@ fn split_advertised(advertised: &[IpAddr]) -> (Vec<IpAddr>, Vec<IpAddr>) {
 /// family's subset was empty while `advertised` overall was not (Hole
 /// genuinely never touched this family; there is nothing for it to owe).
 /// When `advertised` is empty in its ENTIRETY the file is of unknown
-/// provenance (R0-2): every family reads as `NoEvidence` and NONE of them
-/// may settle, so the file is preserved rather than deleted. `SkippedNotOurs`
+/// provenance: every family reads as `NoEvidence` and NONE of them may
+/// settle, so the file is preserved rather than deleted. `SkippedNotOurs`
 /// / `Failed` never settle — someone else may own that family now, or the
 /// read/write itself failed.
 fn settled(outcome: system::FamilyOutcome, advertised_totally_empty: bool) -> bool {
@@ -82,7 +82,7 @@ fn settled(outcome: system::FamilyOutcome, advertised_totally_empty: bool) -> bo
     }
 }
 
-/// Clean up system DNS settings left behind by a pre-#846 crashed run.
+/// Clean up system DNS settings left behind by an older build's crashed run.
 /// Best-effort — errors logged at `warn`, returns `()`. Production entry
 /// point; uses the real platform backend. Tests drive
 /// [`recover_dns_config_with`] directly with a mock so the write side
@@ -151,8 +151,19 @@ pub(crate) fn recover_dns_config_with(state_dir: &Path, backend: &dyn system::ma
 /// evaluation, ever — see the module doc.
 fn finish(state_dir: &Path, fully_settled: bool) {
     if fully_settled {
+        // `clear`'s own failure must not leave the un-suffixed name behind —
+        // this call's whole promise (module doc) is that it's gone either
+        // way. Falling back to `supersede` keeps that promise AND keeps the
+        // file itself alive as `scripts/network-reset.py`'s escape hatch,
+        // even though the restore actually succeeded.
         if let Err(e) = dns_state::clear(state_dir) {
-            tracing::warn!(error = %e, "dns_recovery: failed to clear bridge-dns.json after full restore");
+            tracing::warn!(
+                error = %e,
+                "dns_recovery: failed to clear bridge-dns.json after full restore; superseding it instead"
+            );
+            if let Err(e) = dns_state::supersede(state_dir) {
+                tracing::warn!(error = %e, "dns_recovery: failed to rename bridge-dns.json to the superseded name");
+            }
         }
     } else {
         tracing::warn!(

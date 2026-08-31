@@ -166,19 +166,16 @@ pub enum ProxyError {
     #[error("the network was unblocked, but the kill-switch setting could not be saved")]
     LockdownIntentNotPersisted,
     /// A pre-existing `hole-tun` adapter does not carry Hole's own adapter
-    /// GUID (bindreams/hole#846) — most often a build of Hole itself that
-    /// crashed before it could tear the adapter down. PII-free by
-    /// construction: `alias` is a network-adapter friendly name, never a
-    /// filesystem path.
+    /// GUID — most often a build of Hole itself that crashed before it
+    /// could tear the adapter down. PII-free by construction: `alias` is a
+    /// network-adapter friendly name, never a filesystem path.
     #[error("{}", tun_engine::DeviceError::ForeignAdapter { alias: alias.clone() })]
     ForeignAdapter { alias: String },
-    /// The DNS-egress confinement (bindreams/hole#846, Windows-only) could
-    /// not be engaged. Fail-fatal (Q5 in the #846 plan): after #846 removed
-    /// the upstream-adapter DNS rewrite, the confinement is the only thing
-    /// standing between OS DNS and the LAN resolver, so a session that
-    /// could not confine it must not go live. PII-free by construction —
-    /// `reason` is the confinement error's own `Display`, which names no
-    /// path.
+    /// The DNS-egress confinement (Windows-only) could not be engaged.
+    /// Fail-fatal: the confinement is the only thing standing between OS
+    /// DNS and the LAN resolver, so a session that could not confine it
+    /// must not go live. PII-free by construction — `reason` is the
+    /// confinement error's own `Display`, which names no path.
     #[error("could not confine DNS to the tunnel: {reason}")]
     DnsConfinementFailed { reason: String },
 }
@@ -247,6 +244,23 @@ impl From<tun_engine::DeviceError> for ProxyError {
             tun_engine::DeviceError::Ipv6Assign { index, message } => {
                 ProxyError::RouteSetup(format!("TUN IPv6 address on interface {index}: {message}"))
             }
+        }
+    }
+}
+
+/// `Dispatcher::new` keeps `DeviceError` distinguishable from its other
+/// start-time I/O failures (metric set, engine build) instead of flattening
+/// everything to `io::Error` — the flattening was what made
+/// `ProxyError::ForeignAdapter` unreachable from `start_inner`: the `?` on
+/// `Dispatcher::new(..).await?` converted straight to `ProxyError::Runtime`
+/// via `io::Error`'s own `#[from]`, before this impl ever got a chance to
+/// run. Delegating the `Device` arm to the impl above is what makes it
+/// reachable again.
+impl From<crate::dispatcher::DispatcherStartError> for ProxyError {
+    fn from(e: crate::dispatcher::DispatcherStartError) -> Self {
+        match e {
+            crate::dispatcher::DispatcherStartError::Device(e) => e.into(),
+            crate::dispatcher::DispatcherStartError::Io(e) => ProxyError::Runtime(e),
         }
     }
 }

@@ -19,12 +19,10 @@
 //! user would be locked out of DNS with no bridge left alive to release it.
 //!
 //! **Failure to engage is fatal to the start** — see
-//! `crate::dns_confine::engage`'s doc and Open question Q5 in the #846 plan.
-//! A confinement that failed to engage is not a degraded session, it is an
-//! unprotected one.
+//! `crate::dns_confine::engage`'s doc: a confinement that failed to engage
+//! is not a degraded session, it is an unprotected one.
 
 use std::net::IpAddr;
-use std::path::Path;
 
 use windows::core::{GUID, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{ERROR_SUCCESS, HANDLE};
@@ -89,22 +87,17 @@ fn wide(s: &str) -> Vec<u16> {
 }
 
 /// Engage the DNS-egress confinement: permit UDP+TCP/53 on `tun_luid` and on
-/// loopback, permit `server_ip` on any port, permit each of `app_ids` on any
-/// port, block UDP+TCP/53 everywhere else — see [`spec::build_spec`] for the
-/// exact filter set. Opens a **dynamic** FWPM session (see module doc) and
-/// adds the whole spec in one FWPM transaction, matching
-/// `failclosed/windows.rs`'s engage — a partial filter set is a half-open
-/// DNS policy.
+/// loopback, permit `server_ip` on any port, block UDP+TCP/53 everywhere
+/// else — see [`spec::build_spec`] for the exact filter set. Opens a
+/// **dynamic** FWPM session (see module doc) and adds the whole spec in one
+/// FWPM transaction, matching `failclosed/windows.rs`'s engage — a partial
+/// filter set is a half-open DNS policy.
 #[allow(
     clippy::disallowed_methods,
     reason = "sanctioned FWPM call site — see clippy.toml's amended reason string"
 )]
-pub fn engage(
-    tun_luid: u64,
-    server_ip: IpAddr,
-    app_ids: &[std::path::PathBuf],
-) -> Result<DnsConfinement, DnsConfineError> {
-    let built = spec::build_spec(tun_luid, server_ip, app_ids);
+pub fn engage(tun_luid: u64, server_ip: IpAddr) -> Result<DnsConfinement, DnsConfineError> {
+    let built = spec::build_spec(tun_luid, server_ip);
     unsafe {
         let session = FWPM_SESSION0 {
             flags: FWPM_SESSION_FLAG_DYNAMIC,
@@ -211,46 +204,6 @@ unsafe fn add_sublayer(engine: HANDLE, key: spec::Guid, provider: spec::Guid) ->
     Ok(())
 }
 
-/// Owned WFP app-id blob produced by `FwpmGetAppIdFromFileName0`; frees the
-/// WFP-allocated `FWP_BYTE_BLOB` on drop. Mirrors
-/// `failclosed::windows::AppIdBlob`.
-struct AppIdBlob {
-    ptr: *mut FWP_BYTE_BLOB,
-}
-impl AppIdBlob {
-    fn as_mut_ptr(&mut self) -> *mut FWP_BYTE_BLOB {
-        self.ptr
-    }
-}
-impl Drop for AppIdBlob {
-    fn drop(&mut self) {
-        #[allow(
-            clippy::disallowed_methods,
-            reason = "sanctioned FWPM call site — see clippy.toml's amended reason string"
-        )]
-        unsafe {
-            if !self.ptr.is_null() {
-                let mut p = self.ptr as *mut core::ffi::c_void;
-                FwpmFreeMemory0(&mut p);
-            }
-        }
-    }
-}
-
-#[allow(
-    clippy::disallowed_methods,
-    reason = "sanctioned FWPM call site — see clippy.toml's amended reason string"
-)]
-unsafe fn get_app_id_blob(path: &Path) -> Result<AppIdBlob, DnsConfineError> {
-    let wide_path = wide(&path.to_string_lossy());
-    let mut out: *mut FWP_BYTE_BLOB = std::ptr::null_mut();
-    let rc = FwpmGetAppIdFromFileName0(PCWSTR(wide_path.as_ptr()), &mut out);
-    if rc != ERROR_SUCCESS.0 {
-        return Err(classify(Stage::AddFilter, rc));
-    }
-    Ok(AppIdBlob { ptr: out })
-}
-
 fn l4_to_ipproto(l4: L4) -> u8 {
     match l4 {
         L4::Udp => IPPROTO_UDP,
@@ -289,8 +242,6 @@ unsafe fn add_filter(
     let mut v6mask = FWP_V6_ADDR_AND_MASK::default();
     #[allow(unused_assignments)]
     let mut luid_buf: u64 = 0;
-    #[allow(unused_assignments)]
-    let mut app_id_blob: Option<AppIdBlob> = None;
     let mut conditions: Vec<FWPM_FILTER_CONDITION0> = Vec::new();
 
     match &f.condition {
@@ -373,9 +324,9 @@ unsafe fn add_filter(
                 },
             });
         }
-        // Deliberately NO protocol / port condition — R0-3: the server
-        // permit must match on address alone so a server on port 53 is
-        // never locked out of its own tunnel.
+        // Deliberately NO protocol / port condition: the server permit
+        // must match on address alone so a server on port 53 is never
+        // locked out of its own tunnel.
         Condition::ServerIp(IpAddr::V4(v4)) => {
             conditions.push(FWPM_FILTER_CONDITION0 {
                 fieldKey: FWPM_CONDITION_IP_REMOTE_ADDRESS,
@@ -395,23 +346,6 @@ unsafe fn add_filter(
                     r#type: FWP_BYTE_ARRAY16_TYPE,
                     Anonymous: FWP_CONDITION_VALUE0_0 {
                         byteArray16: &mut v6buf,
-                    },
-                },
-            });
-        }
-        // FwpmGetAppIdFromFileName0 normalizes the path to the kernel device
-        // form WFP expects; the returned FWP_BYTE_BLOB is WFP-owned and
-        // freed on AppIdBlob drop (after FwpmFilterAdd0 copies it).
-        Condition::AppId(path) => {
-            app_id_blob = Some(get_app_id_blob(path)?);
-            let blob = app_id_blob.as_mut().expect("just set");
-            conditions.push(FWPM_FILTER_CONDITION0 {
-                fieldKey: FWPM_CONDITION_ALE_APP_ID,
-                matchType: FWP_MATCH_EQUAL,
-                conditionValue: FWP_CONDITION_VALUE0 {
-                    r#type: FWP_BYTE_BLOB_TYPE,
-                    Anonymous: FWP_CONDITION_VALUE0_0 {
-                        byteBlob: blob.as_mut_ptr(),
                     },
                 },
             });

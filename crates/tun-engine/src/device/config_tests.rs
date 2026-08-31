@@ -31,11 +31,21 @@ fn freeze_roundtrip() {
 /// requested GUID on create is settled by
 /// `dns_confine_global_net_state_adapter_reports_back_its_requested_guid`
 /// (elevated lane only) — the ship gate this test cannot substitute for.
+///
+/// Calls `crate::device::build_tun_configuration` — the exact function
+/// `Device::build` calls — rather than re-executing a copy of its lines, so
+/// a regression in that assembly fails here too instead of staying green.
 #[cfg(target_os = "windows")]
 #[skuld::test]
+#[allow(clippy::field_reassign_with_default)]
 fn build_requests_the_hole_adapter_guid() {
-    let mut tun_config = tun::Configuration::default();
-    tun_config.platform_config(|pc| pc.device_guid(crate::device::identity::HOLE_ADAPTER_GUID));
+    let mut mut_config = MutDeviceConfig::default();
+    mut_config.tun_name = "hole-tun".into();
+    mut_config.mtu = 1400;
+    mut_config.ipv4 = Some("10.255.0.1/24".parse().unwrap());
+    let config = mut_config.freeze();
+
+    let tun_config = crate::device::build_tun_configuration(&config);
 
     let debug_repr = format!("{tun_config:?}");
     let expected_fragment = crate::device::identity::HOLE_ADAPTER_GUID.to_string();

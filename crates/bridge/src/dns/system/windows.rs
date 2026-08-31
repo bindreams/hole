@@ -88,11 +88,18 @@ pub trait WinDnsBackend: Send + Sync + 'static {
     /// failures. Used only by the upgrade sweep now.
     fn get_settings(&self, alias: &str) -> io::Result<Option<DnsPriorAdapter>>;
 
-    /// Set the DNS resolvers on `alias`, advertising the v4 and v6 families
-    /// separately from the matching entries in `servers`. A family with no
-    /// entries is left untouched (never cleared — clearing would revert it
-    /// to DHCP and leak).
-    fn set_servers(&self, alias: &str, servers: &[IpAddr]) -> io::Result<()>;
+    /// Set the DNS resolvers on the adapter identified by `luid`,
+    /// advertising the v4 and v6 families separately from the matching
+    /// entries in `servers`. A family with no entries is left untouched
+    /// (never cleared — clearing would revert it to DHCP and leak).
+    ///
+    /// Takes the LUID, not an alias: the caller (`Dns::apply`) already
+    /// holds the LUID of the concrete adapter this process opened
+    /// (`TunIdentity::luid`), and resolving a GUID from that LUID directly
+    /// (`ConvertInterfaceLuidToGuid`) never re-resolves the *name* Hole
+    /// requested — which, unlike the LUID, could belong to a different
+    /// adapter than the one this process holds (bindreams/hole#936).
+    fn set_servers(&self, luid: u64, servers: &[IpAddr]) -> io::Result<()>;
 
     /// Restore BOTH families of the captured prior DNS state for `adapter`.
     /// Used only by the upgrade sweep now, and only when both families'
@@ -148,17 +155,9 @@ impl WinDnsBackend for Win32Real {
         }))
     }
 
-    fn set_servers(&self, alias: &str, servers: &[IpAddr]) -> io::Result<()> {
+    fn set_servers(&self, luid: u64, servers: &[IpAddr]) -> io::Result<()> {
         let started = Instant::now();
-        let guid = match alias_to_guid(alias)? {
-            Some(g) => g,
-            None => {
-                return Err(io::Error::new(
-                    io::ErrorKind::NotFound,
-                    format!("Win32Real::set_servers: adapter not found: {alias}"),
-                ));
-            }
-        };
+        let guid = luid_to_guid(luid)?;
         // Advertise per family. Set a family ONLY when `servers` carries at
         // least one address of that family: setting a family to an empty list
         // clears it and lets Windows revert to the DHCP-assigned resolver (an
@@ -175,7 +174,7 @@ impl WinDnsBackend for Win32Real {
             set_one(guid, true, &DnsPrior::Static { servers: v6 })?;
         }
         tracing::debug!(
-            %alias,
+            luid,
             servers = ?servers,
             elapsed_ms = started.elapsed().as_millis() as u64,
             "Win32Real::set_servers"
@@ -256,7 +255,6 @@ pub trait DnsConfiner: Send + Sync + 'static {
         &self,
         tun_luid: u64,
         server_ip: IpAddr,
-        app_ids: &[std::path::PathBuf],
     ) -> Result<Box<dyn std::any::Any + Send>, tun_engine::dns_confine::DnsConfineError>;
 }
 
@@ -269,10 +267,8 @@ impl DnsConfiner for RealDnsConfiner {
         &self,
         tun_luid: u64,
         server_ip: IpAddr,
-        app_ids: &[std::path::PathBuf],
     ) -> Result<Box<dyn std::any::Any + Send>, tun_engine::dns_confine::DnsConfineError> {
-        tun_engine::dns_confine::engage(tun_luid, server_ip, app_ids)
-            .map(|c| Box::new(c) as Box<dyn std::any::Any + Send>)
+        tun_engine::dns_confine::engage(tun_luid, server_ip).map(|c| Box::new(c) as Box<dyn std::any::Any + Send>)
     }
 }
 
@@ -305,6 +301,24 @@ fn alias_to_guid(alias: &str) -> io::Result<Option<GUID>> {
     }
     Ok(Some(guid))
 }
+
+/// Resolve a raw interface LUID directly to its GUID — no name lookup, no
+/// alias round-trip. The sanctioned way `set_servers` targets the adapter
+/// the caller already holds by LUID (`TunIdentity::luid`), instead of
+/// `alias_to_guid`'s `ConvertInterfaceAliasToLuid` re-resolving a name that
+/// might belong to a different adapter by the time this runs.
+fn luid_to_guid(luid: u64) -> io::Result<GUID> {
+    let net_luid = NET_LUID_LH { Value: luid };
+    let mut guid = GUID::zeroed();
+    // SAFETY: `net_luid` and `guid` are owned values whose addresses are
+    // valid for the call.
+    let rc: WIN32_ERROR = unsafe { ConvertInterfaceLuidToGuid(&net_luid, &mut guid) };
+    if rc != ERROR_SUCCESS {
+        return Err(io::Error::from_raw_os_error(rc.0 as i32));
+    }
+    Ok(guid)
+}
+
 /// The `Version` stamped into every `DNS_INTERFACE_SETTINGS` this module
 /// hands to the OS. **Must be `VERSION1`.** windows-rs models all three DNS
 /// FFIs (`GetInterfaceDnsSettings` / `SetInterfaceDnsSettings` /

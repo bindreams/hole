@@ -56,12 +56,14 @@ pub use luid::{LuidResolver, SystemLuidResolver};
 
 pub mod lockdown_state;
 
-// `pub(crate)` (not the default private) ONLY on the Windows arm: #846's
+// `pub(crate)` (not the default private) ONLY on the Windows arm:
 // `dns_confine::spec` — a sibling module outside this file's own subtree —
-// needs `platform::{FILTER_GUIDS, LOCKDOWN_FILTER_GUIDS}` to prove its own
-// WFP GUIDs are disjoint from the cover's, so a copy-paste collision can
-// never let one's fixed-GUID sweep delete the other's filters. The macOS arm
-// is untouched: nothing outside this file needs it.
+// needs `platform::{FILTER_GUIDS, LOCKDOWN_FILTER_GUIDS, PROVIDER_GUID,
+// SUBLAYER_GUID}` to prove its own WFP GUIDs are disjoint from the cover's,
+// so a copy-paste collision can never let one's fixed-GUID sweep delete the
+// other's filters (or a collision fail `FwpmProviderAdd0`/`FwpmSubLayerAdd0`
+// at runtime). The macOS arm is untouched: nothing outside this file needs
+// it.
 #[cfg(target_os = "windows")]
 #[path = "failclosed/windows.rs"]
 pub(crate) mod platform;

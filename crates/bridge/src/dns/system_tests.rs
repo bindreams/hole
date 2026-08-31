@@ -21,10 +21,7 @@ mod windows_timing_logs {
     /// `Win32Real::flush` calls the `DnsFlushResolverCache` FFI inline
     /// (ms-scale). This test guards that it stays inline (no subprocess
     /// detach) by asserting it returns quickly. Calls `Win32Real` directly
-    /// — the free-function shim this test used to go through
-    /// (`flush_dns_cache`) was deleted along with the rest of the
-    /// crash-recovery capture/restore-everything surface (bindreams/hole#846);
-    /// production now reaches this exact call through `SystemDnsApplied`'s
+    /// — production reaches this exact call through `SystemDnsApplied`'s
     /// `flush` on shutdown.
     #[skuld::test]
     fn flush_returns_quickly() {
@@ -42,9 +39,7 @@ mod windows_timing_logs {
     /// nonexistent adapter so the test doesn't depend on host network
     /// configuration — `ConvertInterfaceAliasToLuid` returns
     /// ERROR_INVALID_PARAMETER quickly and the timing log still fires. This
-    /// is now the upgrade sweep's ONLY read path (bindreams/hole#846) — the
-    /// free-function `capture_adapters` shim this test used to go through
-    /// was deleted alongside it.
+    /// is the upgrade sweep's ONLY read path.
     #[skuld::test]
     fn get_settings_emits_per_alias_elapsed_ms_debug_log() {
         let writer = VecWriter::new();
@@ -70,14 +65,14 @@ mod windows_timing_logs {
     }
 }
 
-// State-file surface, post-#846 =======================================================================================
+// State-file surface ==================================================================================================
 
-/// `Dns::apply`'s signature carries no `state_dir` any more — there is
-/// nothing left to persist (bindreams/hole#846: DNS confinement is a
-/// process-scoped WFP session, not a file). This is a structural pin: a
-/// full apply/shutdown cycle must not leave `bridge-dns.json` anywhere a
-/// test can observe, even in a directory `apply` was never told about,
-/// because it has no path parameter through which it COULD write one.
+/// `Dns::apply`'s signature carries no `state_dir` — there is nothing to
+/// persist: DNS confinement is a process-scoped WFP session, not a file.
+/// This is a structural pin: a full apply/shutdown cycle must not leave
+/// `bridge-dns.json` anywhere a test can observe, even in a directory
+/// `apply` was never told about, because it has no path parameter through
+/// which it COULD write one.
 #[cfg(target_os = "windows")]
 #[skuld::test]
 #[allow(clippy::disallowed_methods)] // one-shot token: no cooperative-cancel chain to join in a leaf test
@@ -102,7 +97,7 @@ async fn dns_apply_writes_no_state_file() {
                 v6: DnsPrior::None,
             }))
         }
-        fn set_servers(&self, _alias: &str, _servers: &[IpAddr]) -> std::io::Result<()> {
+        fn set_servers(&self, _luid: u64, _servers: &[IpAddr]) -> std::io::Result<()> {
             Ok(())
         }
         fn restore(&self, _adapter: &DnsPriorAdapter) -> std::io::Result<()> {
@@ -121,7 +116,6 @@ async fn dns_apply_writes_no_state_file() {
             &self,
             _tun_luid: u64,
             _server_ip: IpAddr,
-            _app_ids: &[std::path::PathBuf],
         ) -> Result<Box<dyn std::any::Any + Send>, tun_engine::dns_confine::DnsConfineError> {
             Ok(Box::new(()))
         }
@@ -137,7 +131,6 @@ async fn dns_apply_writes_no_state_file() {
             vec![IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))],
             tun_engine::TunIdentity::synthetic(0xFEED, "hole-tun"),
             IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7)),
-            Vec::new(),
             CancellationToken::new(),
         )
         .await

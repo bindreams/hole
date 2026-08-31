@@ -1686,16 +1686,19 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         };
 
         // The identity of the TUN device this start opened — the LUID and
-        // alias of the concrete OS object, never a name lookup
-        // (bindreams/hole#846). Threaded to `Dns::apply` below.
+        // alias of the concrete OS object, never a name lookup. Threaded to
+        // `Dns::apply` below.
         //
         // Under `#[cfg(test)]` the dispatcher is stubbed out (creating a
         // real TUN needs elevation), so no `hole-tun` exists on a clean
         // machine — a synthetic identity stands in instead. This is what
         // makes Phase 7 reachable and observable from a unit test on any
-        // machine, not just one with a leftover `hole-tun`; see Q3 in the
-        // #846 plan for why the alternative (resolving the alias via a raw
-        // OS call here) is wrong on both safety and testability grounds.
+        // machine, not just one with a leftover `hole-tun`. The
+        // alternative — resolving the alias via a raw OS call here instead
+        // of threading the identity through — would be wrong on both
+        // safety grounds (a name lookup can resolve to someone else's
+        // adapter) and testability grounds (nothing to substitute in a
+        // unit test).
         #[cfg(not(test))]
         let tun_identity = dispatcher
             .as_ref()
@@ -1737,11 +1740,9 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
             "TUN routes installed"
         );
 
-        // Process image paths for App-ID permits — the standing lockdown
-        // cover's own permit AND (bindreams/hole#846) the DNS confinement's:
-        // required, not optional (Q9) — without it, a plugin re-resolving a
-        // hostname during the galoshes yamux self-heal can only reach DNS
-        // through the tunnel it is trying to rebuild.
+        // Process image paths for the standing lockdown cover's own
+        // App-ID permit (`routing.install_lockdown` below) — see
+        // `lockdown_app_ids`'s doc.
         let app_ids = lockdown_app_ids(config);
 
         // Standing lockdown cover (#527). Engaged only when intent is on; when
@@ -1780,7 +1781,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         // unconfigured family is left untouched), so a mixed or v6 resolver
         // list is carried end-to-end on both platforms.
         //
-        // FAIL-FATAL on both error shapes (Q5): after #846 removed the
+        // FAIL-FATAL on both error shapes: after #846 removed the
         // upstream-adapter rewrite, the WFP confinement (Windows) is the
         // ONLY thing standing between OS DNS and the LAN resolver — a
         // degraded-but-running session here would be a silent leak on a
@@ -1788,10 +1789,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         // `DnsError` unwind the locally-owned `lockdown` / `routes` guards.
         let dns_applied = if forwarder.is_some() {
             let advertise_ips: Vec<IpAddr> = config.dns.servers.clone();
-            match dns
-                .apply(advertise_ips, tun_identity, server_ip, app_ids, cancel.clone())
-                .await
-            {
+            match dns.apply(advertise_ips, tun_identity, server_ip, cancel.clone()).await {
                 Ok(a) => Some(a),
                 Err(DnsError::Cancelled) => {
                     if let Some(mut d) = dispatcher.take() {
@@ -2141,9 +2139,21 @@ fn lockdown_app_ids(config: &ProxyConfig) -> Vec<std::path::PathBuf> {
     {
         let mut ids: Vec<std::path::PathBuf> = Vec::new();
         if let Some(ref plugin) = config.server.plugin {
-            ids.push(std::path::PathBuf::from(crate::proxy::config::resolve_plugin_path(
-                plugin,
-            )));
+            let resolved = crate::proxy::config::resolve_plugin_path(plugin);
+            let path = std::path::PathBuf::from(&resolved);
+            // `resolve_plugin_path` deliberately falls back to the bare
+            // binary name when it can't find the plugin next to the bridge
+            // exe, so shadowsocks can still do a PATH lookup at spawn — but
+            // `FwpmGetAppIdFromFileName0` does no PATH search of its own and
+            // needs a real file path. A bare name (no directory component)
+            // narrows the permit set rather than breaking the cover; warn so
+            // a bug report carries the signal, same disposition as the
+            // `current_exe()` failure below.
+            if path.parent().is_some_and(|d| !d.as_os_str().is_empty()) {
+                ids.push(path);
+            } else {
+                warn!(plugin = %resolved, "lockdown: plugin path did not resolve to a real file; App-ID permit omitted");
+            }
         }
         match std::env::current_exe() {
             Ok(exe) => ids.push(exe),

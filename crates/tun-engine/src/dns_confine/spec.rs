@@ -4,11 +4,10 @@
 //! turns this into live WFP objects.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::path::PathBuf;
 
 /// The one port this confinement ever names in a `Block` filter: DNS. See
-/// `Condition::ServerIp` and `Condition::AppId` for the two permits that are
-/// deliberately port-agnostic instead (R0-3, Q9).
+/// `Condition::ServerIp` for the permit that is deliberately port-agnostic
+/// instead.
 pub const DNS_PORT: u16 = 53;
 
 /// A plain 128-bit GUID value, independent of the `windows` crate's
@@ -62,16 +61,8 @@ pub enum Condition {
     /// no port condition. `server_port` has no validation forbidding 53
     /// (a standard censorship-evasion configuration), and without this
     /// permit the confinement would block the tunnel's own handshake
-    /// harder than the fail-closed covers permit it (R0-3).
+    /// harder than the fail-closed covers permit it.
     ServerIp(IpAddr),
-    /// Match the connecting process image path — required, not optional
-    /// hardening (Q9): without an App-ID permit, a plugin re-resolving a
-    /// hostname during the galoshes yamux self-heal can only reach DNS
-    /// through the tunnel it is trying to rebuild, a non-recoverable
-    /// circular deadlock. WFP is any-sublayer-blocks-wins, so the lockdown
-    /// cover's own App-ID permit — living in a different sublayer — cannot
-    /// rescue it.
-    AppId(PathBuf),
     /// No local-interface / address condition — protocol + remote port
     /// only. The block-all-else half.
     AnyTo { l4: L4, remote_port: u16 },
@@ -99,18 +90,18 @@ pub struct ConfineSpec {
 /// weight-only arbitration).
 pub const PERMIT_WEIGHT: u8 = 15;
 /// Weight for every `Block` filter. `0`, matching
-/// `failclosed/windows.rs:245` — an earlier draft used 8 with no rationale,
-/// and an unexplained number in a module whose whole argument is
-/// "structural, not heuristic" is not worth the question it invites.
+/// `failclosed/windows.rs:245` — an unexplained number in a module whose
+/// whole argument is "structural, not heuristic" is not worth the question
+/// it invites.
 pub const BLOCK_WEIGHT: u8 = 0;
 
 /// Build the DNS-egress confinement: permit UDP+TCP/53 on `tun_luid` and on
-/// loopback, permit the Shadowsocks server on any port, permit each of
-/// `app_ids` on any port, block UDP+TCP/53 everywhere else. Thirteen filters
-/// plus two per `app_ids` entry. Pure — no FFI; `windows::engage` submits it
-/// in one transaction inside a dynamic (process-scoped) FWPM session.
-pub fn build_spec(tun_luid: u64, server_ip: IpAddr, app_ids: &[PathBuf]) -> ConfineSpec {
-    let mut filters = Vec::with_capacity(13 + 2 * app_ids.len());
+/// loopback, permit the Shadowsocks server on any port, block UDP+TCP/53
+/// everywhere else. Thirteen filters, always. Pure — no FFI;
+/// `windows::engage` submits it in one transaction inside a dynamic
+/// (process-scoped) FWPM session.
+pub fn build_spec(tun_luid: u64, server_ip: IpAddr) -> ConfineSpec {
+    let mut filters = Vec::with_capacity(13);
 
     for l4 in [L4::Udp, L4::Tcp] {
         for (layer, loopback_addr) in [
@@ -163,18 +154,6 @@ pub fn build_spec(tun_luid: u64, server_ip: IpAddr, app_ids: &[PathBuf]) -> Conf
         condition: Condition::ServerIp(server_ip),
         weight: PERMIT_WEIGHT,
     });
-
-    for path in app_ids {
-        for layer in [Layer::ConnectV4, Layer::ConnectV6] {
-            filters.push(FilterSpec {
-                name: "dns-confine-appid-permit",
-                layer,
-                action: Action::Permit,
-                condition: Condition::AppId(path.clone()),
-                weight: PERMIT_WEIGHT,
-            });
-        }
-    }
 
     ConfineSpec {
         provider: PROVIDER_GUID,

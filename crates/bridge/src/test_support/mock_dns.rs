@@ -4,7 +4,6 @@
 //! state-handle-captured-before-move shape in `proxy_manager_tests.rs`.
 
 use std::net::IpAddr;
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use tokio_util::sync::CancellationToken;
@@ -12,16 +11,13 @@ use tokio_util::sync::CancellationToken;
 use crate::dns::system::{Dns, DnsApplied, DnsError};
 
 /// One recorded [`Dns::apply`] call. `targets` is named generically — not
-/// `apply_aliases` — because it now carries the single `TunIdentity`'s
-/// alias wrapped in a one-element `Vec`, matching what the field held
-/// before bindreams/hole#846's signature change; tests written against the
-/// field name don't need touching twice.
+/// `apply_aliases` — because it carries the single `TunIdentity`'s alias
+/// wrapped in a one-element `Vec`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct DnsApplyCall {
     pub(crate) advertise_ips: Vec<IpAddr>,
     pub(crate) targets: Vec<String>,
     pub(crate) server_ip: IpAddr,
-    pub(crate) app_ids: Vec<PathBuf>,
 }
 
 /// Instrumentation shared between `MockDns` and the handle a test clones
@@ -88,7 +84,6 @@ impl Dns for MockDns {
         advertise_ips: Vec<IpAddr>,
         tun: tun_engine::TunIdentity,
         server_ip: IpAddr,
-        app_ids: Vec<PathBuf>,
         _cancel: CancellationToken,
     ) -> Result<Self::Applied, DnsError> {
         if let Some(kind) = *self.state.fail_with.lock().unwrap() {
@@ -104,7 +99,6 @@ impl Dns for MockDns {
             advertise_ips,
             targets: vec![tun.alias().to_string()],
             server_ip,
-            app_ids,
         });
         Ok(MockDnsApplied {
             state: Arc::clone(&self.state),
