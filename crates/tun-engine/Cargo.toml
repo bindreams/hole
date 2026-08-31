@@ -87,3 +87,19 @@ hole-test-observability = { path = "../test-observability" }
 # not depend on tun-engine, so this is not a cycle.
 garter = { path = "../garter", features = ["test-utils"] }
 tracing-subscriber = { version = "0.3", features = ["fmt"] }
+
+[target.'cfg(target_os = "windows")'.dev-dependencies]
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+    "Win32_Networking_WinSock",
+] }
+
+# Own binary, not a module in the lib test binary: skuld validates that a label
+# is declared once per binary, and the lib already declares `TUN` in
+# `routing/failclosed/lockdown_privileged_tests.rs`.
+[[test]]
+name = "gateway_privileged"
+path = "tests/gateway_privileged.rs"
+harness = false
