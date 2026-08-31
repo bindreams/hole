@@ -583,12 +583,7 @@ jobs:
       - name: Install
         shell: pwsh
         run: |
-          $log = "$env:RUNNER_TEMP\msi-install.log"
-          $proc = Start-Process msiexec -ArgumentList "/i","target\release\hole.msi","/quiet","/norestart","/l*vx",$log -Wait -PassThru
-          if ($proc.ExitCode -ne 0) {
-            Get-Content $log -Tail 50
-            throw "msiexec /i failed with exit code $($proc.ExitCode)"
-          }
+          & .github/scripts/invoke-msiexec-bounded.ps1 -Verb /i -MsiPath target\release\hole.msi -LogPath "$env:RUNNER_TEMP\msi-install.log" -BoundMinutes 10 -FailOnNonZeroExit
 
       - name: Verify install
         shell: pwsh
@@ -711,12 +706,7 @@ jobs:
         if: always()
         shell: pwsh
         run: |
-          $log = "$env:RUNNER_TEMP\msi-uninstall.log"
-          $proc = Start-Process msiexec -ArgumentList "/x","target\release\hole.msi","/quiet","/norestart","/l*vx",$log -Wait -PassThru
-          if ($proc.ExitCode -ne 0) {
-            Get-Content $log -Tail 50
-            Write-Warning "msiexec /x failed with exit code $($proc.ExitCode)"
-          }
+          & .github/scripts/invoke-msiexec-bounded.ps1 -Verb /x -MsiPath target\release\hole.msi -LogPath "$env:RUNNER_TEMP\msi-uninstall.log" -BoundMinutes 10
 
       - name: Verify uninstall
         if: always()
@@ -728,6 +718,23 @@ jobs:
           if ($svc) { throw "HoleBridge service still registered" }
           $path = [Environment]::GetEnvironmentVariable("Path", "Machine")
           if ($path -match [regex]::Escape($binDir)) { throw "$binDir still in PATH" }
+
+      # Evidence outlives the runner. The bounded wait in
+      # invoke-msiexec-bounded.ps1 is what lets a wedged msiexec fail this
+      # step instead of the whole job, so this step is reached to upload it.
+      # `/l*vx` writes both logs regardless of exit code once Install/
+      # Uninstall start msiexec, so `if-no-files-found: ignore` only covers a
+      # job that failed before either did.
+      - name: Upload MSI logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: msi-logs-windows-amd64
+          path: |
+            ${{ runner.temp }}/msi-install.log
+            ${{ runner.temp }}/msi-uninstall.log
+          if-no-files-found: ignore
+          retention-days: 14
 
   # Darwin-only counterpart to `test-installer`: build the DMG and run the
   # signature-consistency tests in `dmg-installer/`. Catches issue #364 —
