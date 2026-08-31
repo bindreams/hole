@@ -12,6 +12,20 @@
 //! the current-thread tokio runtime invariant — see
 //! [bindreams/hole#302](https://github.com/bindreams/hole/issues/302).
 //! `#[skuld::test] async fn` builds a current-thread runtime by default.
+//!
+//! `run_with_tap` parks on two intra-process signals ("tap ready", "tap
+//! closed") emitted by `TapPlugin`/`StubPlugin` tasks this test spawns and
+//! fully controls — not an out-of-process op — so CONTRIBUTING.md's
+//! no-synchronizing-via-time rule does not sanction a per-await
+//! `tokio::time::timeout` here (that exception is scoped to a remote or
+//! child-process op that might never succeed). A regression that stops one
+//! of those signals from firing is instead bounded at the nextest-config
+//! level — `.config/nextest.toml`'s override naming every test in this file
+//! that calls `run_with_tap` (or its inline twin in
+//! `shutdown_cancels_in_flight_connection_without_panic`) — the same
+//! `slow-timeout`/`terminate-after` mechanism already used for the
+//! `tun-engine` driver tests, for the identical reason: the wait has no
+//! happens-before edge to bound it any other way.
 
 // `CancellationToken::new` is the cancel-test harness root; module-level
 // allow per the hole workspace clippy.toml's "Bridge cancellation contract"
@@ -172,9 +186,13 @@ where
     let (ready_tx, _ready_rx) = tokio::sync::oneshot::channel();
     let plugin_handle = tokio::spawn(async move { tap.run(local, remote, plugin_shutdown, ready_tx).await });
 
-    // Park until tap signals ready via tracing event. No timeout — the
-    // test framework bounds wall time; if tap is broken the failure is
-    // clear ("test took too long" vs "tap never bound"). Deterministic.
+    // Park until tap signals ready via tracing event. `StubPlugin`/`TapPlugin`
+    // are in-process tasks the test wrote both sides of, not an external
+    // process — CONTRIBUTING.md's no-synchronizing-via-time rule reserves a
+    // per-await timeout for an out-of-process op, so a never-firing event
+    // here is bounded at the nextest-config level instead (see this file's
+    // module doc and `.config/nextest.toml`'s `tap_tests.rs` override),
+    // exactly as the tun-engine driver tests are.
     tokio::task::spawn_blocking(move || ready_rx.recv().expect("tap never signaled ready"))
         .await
         .unwrap();
@@ -182,7 +200,8 @@ where
     // Run the user-supplied client interaction.
     client_body(local).await;
 
-    // Park until the tap logs "closed" for the connection (event-driven, no sleep).
+    // Park until the tap logs "closed" for the connection — same rationale
+    // as the "ready" park above.
     tokio::task::spawn_blocking(move || closed_rx.recv().expect("tap never signaled close"))
         .await
         .unwrap();
@@ -350,7 +369,8 @@ async fn shutdown_cancels_in_flight_connection_without_panic() {
     let (ready_tx, _ready_rx) = tokio::sync::oneshot::channel();
     let plugin_handle = tokio::spawn(async move { tap.run(local, remote, plugin_shutdown, ready_tx).await });
 
-    // Park until tap signals ready via tracing event. Deterministic.
+    // Park until tap signals ready via tracing event — see `run_with_tap`'s
+    // matching park for why this has no per-await timeout.
     tokio::task::spawn_blocking(move || ready_rx.recv().expect("tap never signaled ready"))
         .await
         .unwrap();
