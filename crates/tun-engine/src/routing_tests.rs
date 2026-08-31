@@ -1,5 +1,8 @@
 use std::cell::RefCell;
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::IpAddr;
+// `Ipv4Addr` is only reachable from `on_link_gw`, itself `cfg(windows)`.
+#[cfg(target_os = "windows")]
+use std::net::Ipv4Addr;
 
 use super::state::{self, RouteState, STATE_FILE_NAME};
 use super::*;
