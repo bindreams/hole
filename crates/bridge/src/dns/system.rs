@@ -1,45 +1,46 @@
-//! System DNS capture/apply/restore.
+//! System DNS apply + confine.
 //!
-//! The bridge re-points OS DNS clients at the configured upstream resolver
-//! IPs while a proxy is running, then restores the prior per-adapter / per-
-//! address-family DNS configuration on clean shutdown or crash recovery.
-//! OS DNS to those resolver IPs routes into `hole-tun` and is intercepted by
-//! the in-TUN `LocalDnsEndpoint` (there is no loopback `:53` server).
+//! The bridge advertises the configured resolver IPs on `hole-tun` (the
+//! adapter it created, per `tun_engine::device::identity`) and confines DNS
+//! egress to that adapter via `tun_engine::dns_confine` on Windows (see
+//! that module's doc for the WFP mechanism and its process-scoped
+//! lifetime). It writes DNS to no other adapter — `crate::dns_state` and
+//! `crate::dns::recovery` cover the one place a write to another adapter is
+//! still correct: undoing an older build's own upstream-adapter rewrite
+//! after a crash, gated on live evidence and evaluated at most once per
+//! file.
 //!
-//! ## Per-adapter, per-family, three prior kinds
+//! ## Windows: fail-fatal
 //!
-//! Each adapter carries two independent DNS lists (v4, v6); each list is
-//! in one of three states — static, DHCP-assigned, or unset. The restore
-//! path dispatches on the captured [`crate::dns_state::DnsPrior`] variant
-//! so a prior that was DHCP-assigned doesn't get reapplied as a static
-//! list (which would freeze DHCP renewal).
+//! After bindreams/hole#846, the confinement is the ONLY thing standing
+//! between OS DNS and the LAN resolver. `apply` is fail-fatal on Windows:
+//! if the confinement cannot engage, or the resolver IPs cannot be set on
+//! `hole-tun`, the whole start aborts rather than leaving a session the UI
+//! reports as connected with a silent DNS leak.
 //!
-//! ## Which adapters?
+//! ## macOS: advisory (until #868)
 //!
-//! Capture targets one adapter: the upstream physical adapter. Apply sets
-//! the resolver IPs on both the TUN adapter (which we want the best-route
-//! resolver lookup to land on) and the upstream. The TUN is recreated per
-//! connect so its prior state is "defaults"; nothing to capture.
-//! Restore replays the captured state per adapter.
+//! `set_servers` on macOS is a guaranteed no-op today — `apply_macos` hands
+//! `hole-tun` (an *interface* name) to a backend whose identifier type is a
+//! *service* name (#868). Promoting that failure to fatal would refuse
+//! every macOS Full-mode start with DNS enabled, so the macOS arm stays
+//! `warn!` + continue. There is no confinement on macOS to fail either.
 //!
-//! ## Platform implementations
+//! ## Cancellation
 //!
-//! - **Windows** — Direct Win32 calls via [`windows::WinDnsBackend`] +
-//!   [`windows::Win32Real`]. Adapter identity is the friendly alias
-//!   ("Wi-Fi", "wintun") which resolves to a LUID-then-GUID inside
-//!   `Win32Real`.
-//! - **macOS** — `networksetup -{getdnsservers,setdnsservers}`. Adapter
-//!   identity is the service name (e.g. "Wi-Fi"). Reasonably stable
-//!   across short periods; a user who renames a service mid-session
-//!   will see that service skipped on restore.
+//! `apply` checks `cancel` before engaging the confinement and again before
+//! setting resolvers. A cancel fired after the confinement engaged drops it
+//! (Windows: the dynamic WFP session tears down with the guard) before
+//! returning `DnsError::Cancelled` — there is nothing to inline-restore
+//! any more, since nothing but `hole-tun` is ever touched.
 
 use std::io;
-use std::path::PathBuf;
+use std::net::IpAddr;
 use std::sync::Arc;
 
 use tokio_util::sync::CancellationToken;
 
-use crate::dns_state::{AdapterId, DnsPriorAdapter};
+use crate::dns_state::DnsPrior;
 
 // Dns trait surface ===================================================================================================
 
@@ -51,18 +52,17 @@ use crate::dns_state::{AdapterId, DnsPriorAdapter};
 /// substitute a mock via [`crate::proxy_manager::ProxyManager::new_with_dns`].
 ///
 /// **Why a trait, not free functions.** Direct callers of the
-/// platform-free-function surface (`capture_adapters`, `restore_all`)
-/// outside the `SystemDns` impl are rejected by workspace
-/// `clippy.toml` `disallowed_methods`, mirroring the `setup_routes` /
-/// `teardown_routes` enforcement at
+/// platform-free-function surface outside the `SystemDns` impl are
+/// rejected by workspace `clippy.toml` `disallowed_methods`, mirroring the
+/// `setup_routes` / `teardown_routes` enforcement at
 /// [tun_engine::routing](../../../tun_engine/routing.rs). The motivation
 /// is identical to #165: a helper that bypasses the trait cannot be
 /// intercepted by the mock and will exercise real production code from
 /// unit tests, with catastrophic consequences for test reliability and
 /// CI health. See bindreams/hole#397.
 pub trait Dns: Send + Sync + 'static {
-    /// RAII guard returned by [`apply`](Self::apply). Owns the captured
-    /// `DnsPriorAdapter`s and any platform-specific state needed for restore.
+    /// RAII guard returned by [`apply`](Self::apply). Owns the confinement
+    /// (Windows) and the DebugDropBomb.
     ///
     /// **Two teardown paths**:
     ///
@@ -74,30 +74,28 @@ pub trait Dns: Send + Sync + 'static {
     ///   missed-shutdown bugs are caught at first test run.
     type Applied: DnsApplied;
 
-    /// Capture the prior DNS state of `capture_aliases`, persist it to
-    /// `bridge-dns.json` (if `state_dir` is set), then point the OS at
-    /// `advertise_ips` (the configured upstream resolver IPs) on each
-    /// adapter in `apply_aliases`.
+    /// Confine DNS egress to `tun` and point the OS at `advertise_ips` (the
+    /// configured upstream resolver IPs) on `tun` only. `server_ip` is the
+    /// confinement's own server permit — the tunnel's own handshake must
+    /// stay reachable even when the server runs on port 53 — see
+    /// `tun_engine::dns_confine::build_spec`.
     ///
     /// On Windows, `set_servers` splits `advertise_ips` per address family
-    /// and sets the v4 and v6 families separately; a family with no entries
-    /// is left untouched, never cleared. macOS sets the mixed list in one
-    /// call. OS UDP/53 to these IPs routes into `hole-tun` and is intercepted
-    /// by the in-TUN `LocalDnsEndpoint`; OS TCP/53 falls through the proxy
-    /// cascade to the real resolver over the tunnel.
+    /// and sets the v4 and v6 families separately; a family with no
+    /// entries is left untouched, never cleared. macOS sets the mixed list
+    /// in one call (but see the module doc — this is advisory-only on
+    /// macOS today). OS UDP/53 to these IPs routes into `hole-tun` and is
+    /// intercepted by the in-TUN `LocalDnsEndpoint`; OS TCP/53 falls
+    /// through the proxy cascade to the real resolver over the tunnel.
     ///
-    /// **Cancellation.** The implementation MUST check `cancel.cancelled()`
-    /// between per-adapter I/O operations and inline-restore any
-    /// partially-applied adapters before returning
-    /// [`DnsError::Cancelled`]. Cancel-check granularity is between calls,
-    /// not mid-call (an in-flight FFI write cannot be safely interrupted).
+    /// **Cancellation.** The implementation checks `cancel.is_cancelled()`
+    /// between the confinement engage and the resolver-IP set, dropping
+    /// the confinement before returning [`DnsError::Cancelled`].
     fn apply(
         &self,
-        advertise_ips: Vec<std::net::IpAddr>,
-        capture_aliases: Vec<String>,
-        apply_aliases: Vec<String>,
-        state_dir: Option<PathBuf>,
-        owner: Option<(u32, u32)>,
+        advertise_ips: Vec<IpAddr>,
+        tun: tun_engine::TunIdentity,
+        server_ip: IpAddr,
         cancel: CancellationToken,
     ) -> impl std::future::Future<Output = Result<Self::Applied, DnsError>> + Send;
 }
@@ -105,27 +103,33 @@ pub trait Dns: Send + Sync + 'static {
 /// RAII guard returned by [`Dns::apply`]. See [`Dns::Applied`] for the
 /// shutdown contract.
 pub trait DnsApplied: Send + 'static {
-    /// Restore the captured prior DNS state. Async so the platform I/O can
-    /// use `tokio::task::spawn_blocking` and never stall the runtime worker.
-    /// Idempotent: calling twice is a no-op the second time.
+    /// Release the confinement (Windows) and flush the OS resolver cache.
+    /// Async so the platform I/O can use `tokio::task::spawn_blocking` and
+    /// never stall the runtime worker. Idempotent: calling twice is a
+    /// no-op the second time.
     fn shutdown(&mut self) -> impl std::future::Future<Output = ()> + Send + '_;
 }
 
 /// Errors returned from [`Dns::apply`].
 #[derive(Debug, thiserror::Error)]
 pub enum DnsError {
-    /// The cancel token fired between FFI / netsh calls during apply.
-    /// Any partially-applied adapters have been inline-restored before
-    /// this variant is returned.
+    /// The cancel token fired between the confinement engage and the
+    /// resolver-IP set. The confinement (if it had engaged) has already
+    /// been dropped before this variant is returned.
     #[error("DNS apply cancelled")]
     Cancelled,
 
-    /// Capture or apply failed at the platform level. The bridge logs a
-    /// warning and continues with a degraded `RunningState.dns = None`
-    /// (forwarder up, OS resolvers not redirected). Non-cancel failures
-    /// are NOT fatal to proxy start.
+    /// Setting the resolver IPs on `hole-tun` failed. Fatal on Windows
+    /// (see the module doc); non-fatal (`warn!` + continue) on macOS.
     #[error("DNS apply failed: {0}")]
     Io(#[from] io::Error),
+
+    /// The DNS-egress confinement could not be engaged (Windows only).
+    /// Always fatal — a confinement that failed to engage is not a
+    /// degraded session, it is an unprotected one.
+    #[cfg(target_os = "windows")]
+    #[error("could not confine DNS to the tunnel: {0}")]
+    Confine(#[source] tun_engine::dns_confine::DnsConfineError),
 }
 
 // SystemDns ===========================================================================================================
@@ -134,11 +138,9 @@ pub enum DnsError {
 // can substitute a mock without touching the OS resolver. Mirrors
 // [`tun_engine::routing::SystemRouting`].
 //
-// - Windows: `Arc<dyn WinDnsBackend>`. Production: `Win32Real`
-//   (`SetInterfaceDnsSettings` / `GetInterfaceDnsSettings` /
-//   `DnsFlushResolverCache`, ~ms-scale FFI).
-// - macOS: `Arc<dyn MacDnsBackend>`. Production: `Networksetup`
-//   (`networksetup -getdnsservers` / `-setdnsservers` subprocess).
+// - Windows: `Arc<dyn WinDnsBackend>` + `Arc<dyn windows::DnsConfiner>`.
+//   Production: `Win32Real` / `RealDnsConfiner`.
+// - macOS: `Arc<dyn MacDnsBackend>`. Production: `Networksetup`.
 
 /// Production [`Dns`] implementation.
 #[derive(Clone)]
@@ -147,6 +149,11 @@ pub struct SystemDns {
     /// substitute via [`Self::new_with_backend`].
     #[cfg(target_os = "windows")]
     backend: Arc<dyn windows::WinDnsBackend>,
+    /// The DNS-egress confinement seam. Production:
+    /// [`windows::RealDnsConfiner`]; tests: substitute via
+    /// [`Self::new_with_backend`].
+    #[cfg(target_os = "windows")]
+    confiner: Arc<dyn windows::DnsConfiner>,
     /// macOS `networksetup` backend. Production:
     /// [`macos::Networksetup`]; tests: substitute via
     /// [`Self::new_with_mac_backend`].
@@ -165,17 +172,20 @@ impl SystemDns {
         Self {
             #[cfg(target_os = "windows")]
             backend: Arc::new(windows::Win32Real),
+            #[cfg(target_os = "windows")]
+            confiner: Arc::new(windows::RealDnsConfiner),
             #[cfg(target_os = "macos")]
             backend: Arc::new(macos::Networksetup),
         }
     }
 
     /// Construct a [`SystemDns`] with a specific [`windows::WinDnsBackend`]
-    /// implementation. Used by `windows_tests.rs` to substitute a mock;
-    /// production uses [`Self::new`].
+    /// and [`windows::DnsConfiner`] implementation. Used by
+    /// `windows_tests.rs` to substitute mocks; production uses
+    /// [`Self::new`].
     #[cfg(target_os = "windows")]
-    pub fn new_with_backend(backend: Arc<dyn windows::WinDnsBackend>) -> Self {
-        Self { backend }
+    pub fn new_with_backend(backend: Arc<dyn windows::WinDnsBackend>, confiner: Arc<dyn windows::DnsConfiner>) -> Self {
+        Self { backend, confiner }
     }
 
     /// Construct a [`SystemDns`] with a specific [`macos::MacDnsBackend`]
@@ -193,60 +203,35 @@ impl Dns for SystemDns {
     #[cfg(target_os = "windows")]
     async fn apply(
         &self,
-        advertise_ips: Vec<std::net::IpAddr>,
-        capture_aliases: Vec<String>,
-        apply_aliases: Vec<String>,
-        state_dir: Option<PathBuf>,
-        owner: Option<(u32, u32)>,
+        advertise_ips: Vec<IpAddr>,
+        tun: tun_engine::TunIdentity,
+        server_ip: IpAddr,
         cancel: CancellationToken,
     ) -> Result<Self::Applied, DnsError> {
-        apply_windows(
-            &self.backend,
-            advertise_ips,
-            capture_aliases,
-            apply_aliases,
-            state_dir,
-            owner,
-            cancel,
-        )
-        .await
+        apply_windows(&self.backend, &self.confiner, advertise_ips, tun, server_ip, cancel).await
     }
 
     #[cfg(target_os = "macos")]
     async fn apply(
         &self,
-        advertise_ips: Vec<std::net::IpAddr>,
-        capture_aliases: Vec<String>,
-        apply_aliases: Vec<String>,
-        state_dir: Option<PathBuf>,
-        owner: Option<(u32, u32)>,
+        advertise_ips: Vec<IpAddr>,
+        tun: tun_engine::TunIdentity,
+        server_ip: IpAddr,
         cancel: CancellationToken,
     ) -> Result<Self::Applied, DnsError> {
-        apply_macos(
-            &self.backend,
-            advertise_ips,
-            capture_aliases,
-            apply_aliases,
-            state_dir,
-            owner,
-            cancel,
-        )
-        .await
+        let _ = server_ip;
+        apply_macos(&self.backend, advertise_ips, tun, cancel).await
     }
 
     #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     async fn apply(
         &self,
-        _advertise_ips: Vec<std::net::IpAddr>,
-        _capture_aliases: Vec<String>,
-        _apply_aliases: Vec<String>,
-        state_dir: Option<PathBuf>,
-        _owner: Option<(u32, u32)>,
+        _advertise_ips: Vec<IpAddr>,
+        _tun: tun_engine::TunIdentity,
+        _server_ip: IpAddr,
         _cancel: CancellationToken,
     ) -> Result<Self::Applied, DnsError> {
         Ok(SystemDnsApplied {
-            applied_prior: Vec::new(),
-            state_dir,
             bomb: drop_bomb::DebugDropBomb::new(BOMB_MSG),
             shutdown_completed: false,
         })
@@ -258,91 +243,56 @@ impl Dns for SystemDns {
 /// exact string.
 const BOMB_MSG: &str = "SystemDnsApplied dropped without awaiting shutdown()";
 
-// Windows apply loop ==================================================================================================
+// Windows apply =======================================================================================================
 
 #[cfg(target_os = "windows")]
 async fn apply_windows(
     backend: &Arc<dyn windows::WinDnsBackend>,
-    advertise_ips: Vec<std::net::IpAddr>,
-    capture_aliases: Vec<String>,
-    apply_aliases: Vec<String>,
-    state_dir: Option<PathBuf>,
-    owner: Option<(u32, u32)>,
+    confiner: &Arc<dyn windows::DnsConfiner>,
+    advertise_ips: Vec<IpAddr>,
+    tun: tun_engine::TunIdentity,
+    server_ip: IpAddr,
     cancel: CancellationToken,
 ) -> Result<SystemDnsApplied, DnsError> {
     let started = std::time::Instant::now();
-    // `set_servers` advertises both families, splitting `advertise_ips` per
-    // family internally and leaving a family with no configured resolver
-    // untouched. Pass the full list through unchanged.
-    let mut captured: Vec<DnsPriorAdapter> = Vec::new();
 
-    // Capture phase. Cancel checked between FFIs; capture is read-only,
-    // so an early Err here mutates no state.
-    for alias in &capture_aliases {
-        if cancel.is_cancelled() {
-            return Err(DnsError::Cancelled);
-        }
-        let b = Arc::clone(backend);
-        let alias_owned = alias.clone();
-        let res = tokio::task::spawn_blocking(move || b.get_settings(&alias_owned))
-            .await
-            .map_err(|e| DnsError::Io(io::Error::other(e)))?;
-        match res {
-            Ok(Some(prior)) => captured.push(prior),
-            Ok(None) => tracing::debug!(%alias, "DNS capture: adapter not found; skipping"),
-            Err(e) => tracing::warn!(%alias, error = %e, "DNS capture failed for adapter"),
-        }
-    }
-
-    // Cancel-check after capture, before mutating side: capture is pure
-    // read, persist + apply mutate state. Skipping the check here would
-    // let a cancel arriving between the last capture and the first
-    // persist proceed to write `bridge-dns.json` and start mutating DNS.
     if cancel.is_cancelled() {
         return Err(DnsError::Cancelled);
     }
 
-    // Persist BEFORE apply so a mid-apply crash leaves a recoverable
-    // file (matches `tun_engine::routing::SystemRouting::install`).
-    if let Some(dir) = state_dir.as_deref() {
-        let state = crate::dns_state::DnsState {
-            version: crate::dns_state::SCHEMA_VERSION,
-            advertised: advertise_ips.clone(),
-            adapters: captured.clone(),
-        };
-        if let Err(e) = crate::dns_state::save(dir, &state, owner) {
-            tracing::warn!(error = %e, "dns_state::save failed; continuing without crash-recovery file");
-        }
+    // Confine DNS egress to hole-tun BEFORE advertising a resolver on it —
+    // fail-fatal (see module doc): a confinement that failed to engage is
+    // not a degraded session, it is an unprotected one.
+    let confiner = Arc::clone(confiner);
+    let luid = tun.luid();
+    let confinement = tokio::task::spawn_blocking(move || confiner.engage(luid, server_ip))
+        .await
+        .map_err(|e| DnsError::Io(io::Error::other(e)))?
+        .map_err(DnsError::Confine)?;
+
+    if cancel.is_cancelled() {
+        // The confinement drops here (local variable going out of scope) —
+        // nothing but this local guard reaches it, so dropping it IS the
+        // whole disengage.
+        return Err(DnsError::Cancelled);
     }
 
-    // Apply phase. Cancel between FFIs — we do NOT race cancel against
-    // an in-flight `spawn_blocking` because abandoning the join handle
-    // leaves the FFI running on the blocking pool and creates a TOCTOU
-    // race against the inline-restore that runs next (both could be
-    // mutating the same adapter from different threads). Each FFI is
-    // ~10 ms; the cancel-response delay is bounded by ≤1 FFI duration.
-    for alias in &apply_aliases {
-        if cancel.is_cancelled() {
-            // Cooperative inline-restore — runs serially through the
-            // same backend (cancel-disregarded inside restore). FFI
-            // budget for restore: 2 adapters × 2 families = ~40 ms.
-            // Also clears `bridge-dns.json` so the next start's
-            // `recover_dns_config` doesn't replay an already-restored
-            // prior over any user-side DNS changes made between this
-            // cancel and that next start.
-            inline_restore(backend, &captured, state_dir.as_deref()).await;
-            return Err(DnsError::Cancelled);
-        }
-        let b = Arc::clone(backend);
-        let alias_owned = alias.clone();
-        let ips = advertise_ips.clone();
-        let res = tokio::task::spawn_blocking(move || b.set_servers(&alias_owned, &ips))
-            .await
-            .map_err(|e| DnsError::Io(io::Error::other(e)))?;
-        if let Err(e) = res {
-            tracing::warn!(%alias, error = %e, "DNS apply failed; continuing");
-        }
-    }
+    // The LUID of the device this process actually opened — never a name
+    // lookup. An alias, by contrast, is the name Hole REQUESTED
+    // (`TunIdentity::alias`), not a value read back from the opened device;
+    // a concurrent bridge's adapter can answer to that same name
+    // (bindreams/hole#936), so resolving a GUID from the alias instead of
+    // the LUID could target the wrong adapter.
+    let b = Arc::clone(backend);
+    let ips = advertise_ips.clone();
+    let res = tokio::task::spawn_blocking(move || b.set_servers(luid, &ips))
+        .await
+        .map_err(|e| DnsError::Io(io::Error::other(e)))?;
+    // Fail-fatal (see module doc): after #846 there is exactly one target,
+    // so "continuing" has nowhere to continue to — confinement-up plus
+    // resolvers-never-set is a total DNS blackout on a session the UI
+    // reports as connected.
+    res?;
 
     // Flush. Best-effort — through the backend so MockBackend can count
     // it for the perf-regression test.
@@ -356,119 +306,41 @@ async fn apply_windows(
 
     Ok(SystemDnsApplied {
         backend: Arc::clone(backend),
-        applied_prior: captured,
-        state_dir,
+        confinement: Some(confinement),
         bomb: drop_bomb::DebugDropBomb::new(BOMB_MSG),
         shutdown_completed: false,
     })
 }
 
-#[cfg(target_os = "windows")]
-async fn inline_restore(
-    backend: &Arc<dyn windows::WinDnsBackend>,
-    prior: &[DnsPriorAdapter],
-    state_dir: Option<&std::path::Path>,
-) {
-    let backend = Arc::clone(backend);
-    let prior = prior.to_vec();
-    let state_dir = state_dir.map(std::path::Path::to_path_buf);
-    let _ = tokio::task::spawn_blocking(move || {
-        for adapter in &prior {
-            if let Err(e) = backend.restore(adapter) {
-                tracing::warn!(
-                    id = ?adapter.id,
-                    error = %e,
-                    "inline-restore: adapter failed; continuing"
-                );
-            }
-        }
-        let _ = backend.flush();
-        if let Some(dir) = state_dir {
-            if let Err(e) = crate::dns_state::clear(&dir) {
-                tracing::warn!(
-                    error = %e,
-                    "inline-restore: failed to clear bridge-dns.json"
-                );
-            }
-        }
-    })
-    .await;
-}
-
-// macOS apply loop ====================================================================================================
+// macOS apply =========================================================================================================
 
 #[cfg(target_os = "macos")]
 async fn apply_macos(
     backend: &Arc<dyn macos::MacDnsBackend>,
-    advertise_ips: Vec<std::net::IpAddr>,
-    capture_aliases: Vec<String>,
-    apply_aliases: Vec<String>,
-    state_dir: Option<PathBuf>,
-    owner: Option<(u32, u32)>,
+    advertise_ips: Vec<IpAddr>,
+    tun: tun_engine::TunIdentity,
     cancel: CancellationToken,
 ) -> Result<SystemDnsApplied, DnsError> {
     let started = std::time::Instant::now();
-    let mut captured: Vec<DnsPriorAdapter> = Vec::new();
-
-    // Capture phase. Cancel checked between subprocesses; capture is
-    // read-only, so an early Err here mutates no state.
-    for service in &capture_aliases {
-        if cancel.is_cancelled() {
-            return Err(DnsError::Cancelled);
-        }
-        let b = Arc::clone(backend);
-        let svc_owned = service.clone();
-        let res = tokio::task::spawn_blocking(move || b.get_settings(&svc_owned))
-            .await
-            .map_err(|e| DnsError::Io(io::Error::other(e)))?;
-        match res {
-            Ok(Some(prior)) => captured.push(prior),
-            Ok(None) => tracing::debug!(%service, "DNS capture: service not found; skipping"),
-            Err(e) => tracing::warn!(%service, error = %e, "DNS capture failed for service"),
-        }
-    }
 
     if cancel.is_cancelled() {
         return Err(DnsError::Cancelled);
     }
 
-    // Persist BEFORE apply so a mid-apply crash leaves a recoverable
-    // file (matches `tun_engine::routing::SystemRouting::install`).
-    if let Some(dir) = state_dir.as_deref() {
-        let state = crate::dns_state::DnsState {
-            version: crate::dns_state::SCHEMA_VERSION,
-            advertised: advertise_ips.clone(),
-            adapters: captured.clone(),
-        };
-        if let Err(e) = crate::dns_state::save(dir, &state, owner) {
-            tracing::warn!(error = %e, "dns_state::save failed; continuing without crash-recovery file");
-        }
+    let b = Arc::clone(backend);
+    let alias = tun.alias().to_string();
+    let ips = advertise_ips.clone();
+    let res = tokio::task::spawn_blocking(move || b.set_servers(&alias, &ips))
+        .await
+        .map_err(|e| DnsError::Io(io::Error::other(e)))?;
+    // NOT promoted to fatal (see module doc): `set_servers` is a guaranteed
+    // failure on this platform today (interface name handed to a
+    // service-name API), so promoting it would refuse every macOS
+    // Full-mode start with DNS enabled.
+    if let Err(e) = res {
+        tracing::warn!(error = %e, "DNS apply failed; continuing");
     }
 
-    // Apply phase. Cancel between subprocesses, mirroring the Windows
-    // path's TOCTOU rationale: abandoning an in-flight `spawn_blocking`
-    // leaves `networksetup` running on the blocking pool and would race
-    // the subsequent inline-restore.
-    for service in &apply_aliases {
-        if cancel.is_cancelled() {
-            // Clears `bridge-dns.json` alongside the per-adapter restore —
-            // same rationale as the Windows path above.
-            inline_restore_macos(backend, &captured, state_dir.as_deref()).await;
-            return Err(DnsError::Cancelled);
-        }
-        let b = Arc::clone(backend);
-        let svc_owned = service.clone();
-        let ips = advertise_ips.clone();
-        let res = tokio::task::spawn_blocking(move || b.set_servers(&svc_owned, &ips))
-            .await
-            .map_err(|e| DnsError::Io(io::Error::other(e)))?;
-        if let Err(e) = res {
-            tracing::warn!(%service, error = %e, "DNS apply failed; continuing");
-        }
-    }
-
-    // Flush. Best-effort — through the backend so mock backends can
-    // count it for the perf-regression test.
     let b = Arc::clone(backend);
     let _ = tokio::task::spawn_blocking(move || b.flush()).await;
 
@@ -479,43 +351,9 @@ async fn apply_macos(
 
     Ok(SystemDnsApplied {
         backend: Arc::clone(backend),
-        applied_prior: captured,
-        state_dir,
         bomb: drop_bomb::DebugDropBomb::new(BOMB_MSG),
         shutdown_completed: false,
     })
-}
-
-#[cfg(target_os = "macos")]
-async fn inline_restore_macos(
-    backend: &Arc<dyn macos::MacDnsBackend>,
-    prior: &[DnsPriorAdapter],
-    state_dir: Option<&std::path::Path>,
-) {
-    let backend = Arc::clone(backend);
-    let prior = prior.to_vec();
-    let state_dir = state_dir.map(std::path::Path::to_path_buf);
-    let _ = tokio::task::spawn_blocking(move || {
-        for adapter in &prior {
-            if let Err(e) = backend.restore(adapter) {
-                tracing::warn!(
-                    id = ?adapter.id,
-                    error = %e,
-                    "inline-restore: adapter failed; continuing"
-                );
-            }
-        }
-        let _ = backend.flush();
-        if let Some(dir) = state_dir {
-            if let Err(e) = crate::dns_state::clear(&dir) {
-                tracing::warn!(
-                    error = %e,
-                    "inline-restore: failed to clear bridge-dns.json"
-                );
-            }
-        }
-    })
-    .await;
 }
 
 // SystemDnsApplied ====================================================================================================
@@ -524,19 +362,21 @@ async fn inline_restore_macos(
 /// path is [`DnsApplied::shutdown`] (async) called by
 /// `ProxyManager::stop`; the `DebugDropBomb` panics in debug builds if
 /// shutdown wasn't awaited, catching missed-shutdown bugs at the first
-/// test run. Release builds fall through to a best-effort sync restore.
+/// test run. Release builds fall through to a best-effort sync fallback.
 #[must_use = "SystemDnsApplied owns async cleanup; call .shutdown().await before drop"]
 pub struct SystemDnsApplied {
-    /// Win32 backend used for restore on Windows. Mirrors the macOS
-    /// `backend` field below; both go through `Arc<dyn …Backend>` so
-    /// `SystemDnsApplied` is platform-agnostic.
+    /// Win32 backend, used only for `flush` now (nothing to restore — see
+    /// the module doc).
     #[cfg(target_os = "windows")]
     backend: Arc<dyn windows::WinDnsBackend>,
-    /// `networksetup` backend used for restore on macOS.
+    /// The engaged confinement. `None` only if `shutdown` already took it,
+    /// or on macOS (where there is none to hold). Dropping it is the whole
+    /// disengage — see `tun_engine::dns_confine`'s module doc.
+    #[cfg(target_os = "windows")]
+    confinement: Option<Box<dyn std::any::Any + Send>>,
+    /// `networksetup` backend used for `flush` on macOS.
     #[cfg(target_os = "macos")]
     backend: Arc<dyn macos::MacDnsBackend>,
-    applied_prior: Vec<DnsPriorAdapter>,
-    state_dir: Option<PathBuf>,
     /// Runtime safeguard: panics in debug builds on drop if `shutdown`
     /// wasn't awaited. No-op in release.
     ///
@@ -546,47 +386,45 @@ pub struct SystemDnsApplied {
     /// the fallback dead code in release. The `shutdown_completed` flag
     /// below is the load-bearing release-mode signal.
     bomb: drop_bomb::DebugDropBomb,
-    /// `true` after `DnsApplied::shutdown` has completed its restore +
-    /// cleanup. Set in `shutdown` regardless of build profile. `Drop`
-    /// checks this (not `bomb.is_defused()`) to decide whether to run
-    /// the sync-fallback restore. See bindreams/hole#397.
+    /// `true` after `DnsApplied::shutdown` has completed. Set regardless
+    /// of build profile. `Drop` checks this (not `bomb.is_defused()`) to
+    /// decide whether to run the sync-fallback flush. See
+    /// bindreams/hole#397.
     shutdown_completed: bool,
+}
+
+impl SystemDnsApplied {
+    /// Whether the confinement is currently held. Test-only — production
+    /// code has no reason to inspect this; the OS-level proof that
+    /// dropping it actually reopens DNS lives in
+    /// `dns_confine_global_net_state_filters_die_with_the_session`.
+    #[cfg(all(test, target_os = "windows"))]
+    pub(crate) fn confinement_engaged(&self) -> bool {
+        self.confinement.is_some()
+    }
 }
 
 impl DnsApplied for SystemDnsApplied {
     async fn shutdown(&mut self) {
         self.bomb.defuse();
         self.shutdown_completed = true;
-        let prior = std::mem::take(&mut self.applied_prior);
-        let state_dir = self.state_dir.clone();
+
+        #[cfg(target_os = "windows")]
+        {
+            // Dropping the confinement here IS the disengage — see
+            // `tun_engine::dns_confine`'s module doc. No adapter restore:
+            // nothing but `hole-tun` was ever touched, and it is about to
+            // be torn down by the routes/dispatcher teardown that follows
+            // this in `ProxyManager::stop_with`.
+            self.confinement.take();
+        }
+
         #[cfg(any(target_os = "windows", target_os = "macos"))]
         let backend = Arc::clone(&self.backend);
-
         let _ = tokio::task::spawn_blocking(move || {
             #[cfg(any(target_os = "windows", target_os = "macos"))]
             {
-                for adapter in &prior {
-                    if let Err(e) = backend.restore(adapter) {
-                        tracing::warn!(
-                            id = ?adapter.id,
-                            error = %e,
-                            "SystemDnsApplied::shutdown: restore failed for adapter"
-                        );
-                    }
-                }
                 let _ = backend.flush();
-            }
-            #[cfg(not(any(target_os = "windows", target_os = "macos")))]
-            {
-                let _ = prior;
-            }
-            if let Some(dir) = state_dir {
-                if let Err(e) = crate::dns_state::clear(&dir) {
-                    tracing::warn!(
-                        error = %e,
-                        "SystemDnsApplied::shutdown: failed to clear bridge-dns.json"
-                    );
-                }
             }
         })
         .await;
@@ -597,7 +435,7 @@ impl Drop for SystemDnsApplied {
     /// Sync fallback for crash / panic unwind. `DebugDropBomb`'s own
     /// Drop panics in debug builds if not defused (catching
     /// missed-shutdown bugs); release builds suppress the panic and we
-    /// run the best-effort sync restore below.
+    /// run the best-effort sync fallback below.
     ///
     /// The release signal is `shutdown_completed`, not `bomb.is_defused()`
     /// — see the `shutdown_completed` field doc.
@@ -605,30 +443,12 @@ impl Drop for SystemDnsApplied {
         if self.shutdown_completed {
             return;
         }
-        // Released paths: missed-shutdown bug in release. Log and run
-        // best-effort sync restore so the user's DNS isn't left
-        // hijacked.
         tracing::warn!("SystemDnsApplied dropped without shutdown() — sync fallback");
+        // The `confinement` field's own Drop releases it unconditionally —
+        // no explicit action needed here. Best-effort flush only.
         #[cfg(any(target_os = "windows", target_os = "macos"))]
         {
-            for adapter in &self.applied_prior {
-                if let Err(e) = self.backend.restore(adapter) {
-                    tracing::warn!(
-                        id = ?adapter.id,
-                        error = %e,
-                        "SystemDnsApplied::drop: restore failed (sync fallback)"
-                    );
-                }
-            }
             let _ = self.backend.flush();
-        }
-        if let Some(dir) = &self.state_dir {
-            if let Err(e) = crate::dns_state::clear(dir) {
-                tracing::warn!(
-                    error = %e,
-                    "SystemDnsApplied::drop: failed to clear bridge-dns.json"
-                );
-            }
         }
     }
 }
@@ -643,51 +463,126 @@ pub mod macos;
 #[cfg(target_os = "macos")]
 pub use macos::*;
 
-/// Restore all adapters listed in `prior`. Each adapter is restored
-/// independently — one failure is logged and the rest proceed. This
-/// matches the crash-recovery contract (best-effort).
-pub fn restore_all(prior: &[DnsPriorAdapter]) -> Vec<(AdapterId, io::Error)> {
-    let mut errors = Vec::new();
-    for adapter in prior {
-        if let Err(e) = restore_adapter(adapter) {
-            tracing::warn!(
-                id = ?adapter.id,
-                name = %adapter.name_at_capture,
-                error = %e,
-                "DNS restore failed for adapter; continuing"
-            );
-            errors.push((adapter.id.clone(), e));
-        }
-    }
-    errors
-}
-
-/// Dispatch a single adapter's restore to the platform implementation.
-/// The concrete function lives in `windows.rs` / `macos.rs`; this wrapper
-/// keeps the error type uniform across platforms and is usable from
-/// non-platform-gated callers.
-fn restore_adapter(adapter: &DnsPriorAdapter) -> io::Result<()> {
-    platform_restore_adapter(adapter)
-}
-
-// Placeholder when building on an unsupported platform — keeps the
-// module's surface area compilable for test-only targets like `cargo
-// check` on Linux in CI. The bridge is only shipped for Windows and
-// macOS so this branch never runs in production.
-#[cfg(not(any(target_os = "windows", target_os = "macos")))]
-pub fn platform_restore_adapter(_adapter: &DnsPriorAdapter) -> io::Result<()> {
-    Err(io::Error::other("system DNS restore not implemented on this target OS"))
-}
-
-#[cfg(not(any(target_os = "windows", target_os = "macos")))]
-pub fn capture_adapters(_aliases: &[String]) -> io::Result<Vec<DnsPriorAdapter>> {
-    Err(io::Error::other("system DNS capture not implemented on this target OS"))
-}
-
 // Re-export DnsPrior helpers so callers don't need a separate import just
 // for the "construct from raw lines" side.
 pub use crate::dns_state::DnsPrior as Prior;
 pub use crate::dns_state::DnsPriorAdapter as PriorAdapter;
+
+// Upgrade-sweep evidence gate =========================================================================================
+//
+// Used ONLY by `crate::dns::recovery`'s upgrade sweep, which undoes an
+// older build's own upstream-adapter DNS rewrite after a crash — the one
+// place a write to another adapter is still correct. See that module's
+// doc for why the gate is per family, not per adapter, and why it never
+// clears a file it found no evidence for.
+
+/// What [`restore_family_if_ours`] did for one adapter + family.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FamilyOutcome {
+    /// The live setting matched the recorded evidence, and was written
+    /// back to `prior` (it differed from `prior`).
+    Restored,
+    /// The live setting matched the recorded evidence AND already equalled
+    /// `prior` — nothing needed writing.
+    AlreadyCorrect,
+    /// The live setting did NOT match the recorded evidence — someone
+    /// else owns this family now. Nothing was read as ownership, nothing
+    /// was written.
+    SkippedNotOurs,
+    /// `advertised`'s subset for this family was empty (a file of unknown
+    /// provenance, or a family Hole never advertised) — no sound evidence
+    /// either way. Nothing was written.
+    NoEvidence,
+    /// A read or write failed at the platform level.
+    Failed,
+}
+
+/// Evaluate and, if warranted, restore ONE family of ONE recorded adapter.
+/// `advertised_family_subset` must already be filtered to the family this
+/// call is judging (the caller splits `DnsState.advertised` by family
+/// before calling — the union is not comparable to a live per-family read).
+#[cfg(target_os = "windows")]
+pub(crate) fn restore_family_if_ours(
+    backend: &dyn windows::WinDnsBackend,
+    alias: &str,
+    ipv6: bool,
+    prior: &DnsPrior,
+    advertised_family_subset: &[IpAddr],
+) -> FamilyOutcome {
+    if advertised_family_subset.is_empty() {
+        return FamilyOutcome::NoEvidence;
+    }
+    let live = match backend.get_settings(alias) {
+        Ok(Some(adapter)) => {
+            if ipv6 {
+                adapter.v6
+            } else {
+                adapter.v4
+            }
+        }
+        Ok(None) => return FamilyOutcome::SkippedNotOurs,
+        Err(_) => return FamilyOutcome::Failed,
+    };
+    if !dns_prior_matches_family_subset(&live, advertised_family_subset) {
+        return FamilyOutcome::SkippedNotOurs;
+    }
+    if &live == prior {
+        return FamilyOutcome::AlreadyCorrect;
+    }
+    match backend.restore_family(alias, ipv6, prior) {
+        Ok(()) => FamilyOutcome::Restored,
+        Err(_) => FamilyOutcome::Failed,
+    }
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn restore_family_if_ours(
+    backend: &dyn macos::MacDnsBackend,
+    service: &str,
+    ipv6: bool,
+    prior: &DnsPrior,
+    advertised_family_subset: &[IpAddr],
+) -> FamilyOutcome {
+    if advertised_family_subset.is_empty() {
+        return FamilyOutcome::NoEvidence;
+    }
+    let live = match backend.get_settings(service) {
+        Ok(Some(adapter)) => {
+            if ipv6 {
+                adapter.v6
+            } else {
+                adapter.v4
+            }
+        }
+        Ok(None) => return FamilyOutcome::SkippedNotOurs,
+        Err(_) => return FamilyOutcome::Failed,
+    };
+    if !dns_prior_matches_family_subset(&live, advertised_family_subset) {
+        return FamilyOutcome::SkippedNotOurs;
+    }
+    if &live == prior {
+        return FamilyOutcome::AlreadyCorrect;
+    }
+    match backend.restore_family(service, ipv6, prior) {
+        Ok(()) => FamilyOutcome::Restored,
+        Err(_) => FamilyOutcome::Failed,
+    }
+}
+
+/// The live family setting is "still Hole's" iff it is a static list whose
+/// members equal `advertised_family_subset` (order-independent). DHCP/None
+/// never matches — a family Hole is still holding always reads back as a
+/// static list of the exact IPs it advertised.
+fn dns_prior_matches_family_subset(live: &DnsPrior, advertised_family_subset: &[IpAddr]) -> bool {
+    let DnsPrior::Static { servers } = live else {
+        return false;
+    };
+    let mut a = servers.clone();
+    let mut b = advertised_family_subset.to_vec();
+    a.sort();
+    b.sort();
+    a == b
+}
 
 #[cfg(test)]
 #[path = "system_tests.rs"]

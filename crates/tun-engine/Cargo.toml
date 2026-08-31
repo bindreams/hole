@@ -20,13 +20,14 @@ workspace = true
 # Exposes the `sim` module — in-memory doubles for engine-owned types
 # that have no constructor outside this crate — and the `test_utils` module,
 # the harness the privileged (elevated) test lanes share: shelled-out command
-# diagnostics, a probe route owned by an RAII guard, and the escape from a
-# fail-closed cover. Off by default — enabled by this crate's own tests via
-# `cfg(test)` and by downstream crates that need to drive the router without an
-# OS device (`hole-bridge`, via a dev-dependency). Production builds do NOT
-# enable it, so neither module is compiled into them. Same shape as garter's
-# `test-utils`.
-test-utils = []
+# diagnostics, a probe route owned by an RAII guard, the escape from a
+# fail-closed cover, and (Windows only) the pktmon wire-capture oracle for an
+# unconnected UDP `send_to`. Off by default — enabled by this crate's own
+# tests via `cfg(test)` and by downstream crates that need to drive the
+# router without an OS device (`hole-bridge`, via a dev-dependency).
+# Production builds do NOT enable it, so none of these modules are compiled
+# into them. Same shape as garter's `test-utils`.
+test-utils = ["dep:rand"]
 
 [lib]
 harness = false
@@ -77,6 +78,11 @@ windows = { version = "0.62", features = [
 # Pinned to the same minor version that shadowsocks-service 1.24 uses
 # transitively (via tun-0.8.6) so cargo deduplicates the crate.
 wintun-bindings = "0.7"
+# Nonce generation for `test_utils::pktmon` — optional, pulled in only by the
+# `test-utils` feature (see the feature's own comment). Version pinned to
+# match `hole-bridge`'s own `rand` dependency, which the same module's twin in
+# `cutover_nic_capture_privileged.rs` used before promotion.
+rand = { version = "0.10", optional = true }
 
 [dev-dependencies]
 skuld = { workspace = true }
@@ -87,3 +93,11 @@ hole-test-observability = { path = "../test-observability" }
 # not depend on tun-engine, so this is not a cycle.
 garter = { path = "../garter", features = ["test-utils"] }
 tracing-subscriber = { version = "0.3", features = ["fmt"] }
+
+[target.'cfg(target_os = "windows")'.dev-dependencies]
+# `test_utils::pktmon` compiles under bare `cfg(test)` (this crate's own
+# privileged tests use it without needing the `test-utils` feature on) — same
+# gate as `test_utils` itself. The `[dependencies]` entry above only covers
+# the OTHER edge: a downstream crate (`hole-bridge`) depending on this crate
+# with the `test-utils` feature turned on, where dev-dependencies never leak.
+rand = "0.10"

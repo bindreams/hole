@@ -68,6 +68,7 @@ pub(crate) const GLOBAL_NET_STATE: skuld::Label;
 
 pub mod adapter_cleanup;
 pub mod device;
+pub mod dns_confine;
 pub mod engine;
 pub mod error;
 pub mod gateway;
@@ -83,7 +84,7 @@ pub mod sim;
 #[cfg(any(test, feature = "test-utils"))]
 pub mod test_utils;
 
-pub use device::{Assigned, Device, DeviceConfig, MutDeviceConfig};
+pub use device::{Assigned, Device, DeviceConfig, MutDeviceConfig, TunIdentity};
 pub use engine::{
     DnsInterceptor, Engine, EngineConfig, MutEngineConfig, Router, TcpFlow, TcpMeta, UdpFlow, UdpMeta, UdpSender,
 };

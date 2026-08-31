@@ -1,8 +1,17 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use super::*;
-#[cfg(target_os = "macos")]
-use skuld::temp_dir;
+
+/// Write `state` to `<dir>/bridge-dns.json` directly via `serde_json`, NOT
+/// through `dns_state::save` — that function is gone (the bridge no longer
+/// writes this file; see the module doc). This is what every fixture in
+/// this file uses in its place; it is deliberately the only place besides
+/// `crate::dns::recovery_tests` that constructs a `bridge-dns.json` on
+/// disk.
+fn write_state(dir: &std::path::Path, state: &DnsState) {
+    let json = serde_json::to_vec_pretty(state).unwrap();
+    std::fs::write(dir.join(STATE_FILE_NAME), json).unwrap();
+}
 
 fn sample_windows_state() -> DnsState {
     DnsState {
@@ -53,32 +62,32 @@ fn sample_macos_state() -> DnsState {
 }
 
 #[skuld::test]
-fn save_then_load_roundtrip_windows() {
+fn write_then_load_roundtrip_windows() {
     let dir = tempfile::tempdir().unwrap();
     let state = sample_windows_state();
-    save(dir.path(), &state, None).unwrap();
+    write_state(dir.path(), &state);
     let loaded = load(dir.path()).unwrap();
     assert_eq!(loaded, state);
 }
 
 #[skuld::test]
-fn save_then_load_roundtrip_macos() {
+fn write_then_load_roundtrip_macos() {
     let dir = tempfile::tempdir().unwrap();
     let state = sample_macos_state();
-    save(dir.path(), &state, None).unwrap();
+    write_state(dir.path(), &state);
     let loaded = load(dir.path()).unwrap();
     assert_eq!(loaded, state);
 }
 
 #[skuld::test]
-fn save_then_load_roundtrip_empty_advertised() {
+fn write_then_load_roundtrip_empty_advertised() {
     let dir = tempfile::tempdir().unwrap();
     let state = DnsState {
         version: SCHEMA_VERSION,
         advertised: vec![],
         adapters: vec![],
     };
-    save(dir.path(), &state, None).unwrap();
+    write_state(dir.path(), &state);
     let loaded = load(dir.path()).unwrap();
     assert_eq!(loaded, state);
 }
@@ -237,43 +246,16 @@ fn load_rejects_missing_required_field() {
 }
 
 #[skuld::test]
-fn save_then_load_roundtrip_ipv6_advertised() {
+fn write_then_load_roundtrip_ipv6_advertised() {
     let dir = tempfile::tempdir().unwrap();
     let state = DnsState {
         version: SCHEMA_VERSION,
         advertised: vec![IpAddr::V6(Ipv6Addr::LOCALHOST)],
         adapters: vec![],
     };
-    save(dir.path(), &state, None).unwrap();
+    write_state(dir.path(), &state);
     let loaded = load(dir.path()).unwrap();
     assert_eq!(loaded, state);
-}
-
-#[skuld::test]
-fn save_overwrites_prior_file() {
-    let dir = tempfile::tempdir().unwrap();
-    let first = sample_windows_state();
-    save(dir.path(), &first, None).unwrap();
-
-    let second = sample_macos_state();
-    save(dir.path(), &second, None).unwrap();
-
-    let loaded = load(dir.path()).unwrap();
-    assert_eq!(loaded, second);
-}
-
-#[skuld::test]
-fn save_leaves_no_stray_temp_files() {
-    // Guards against a future refactor that replaces `NamedTempFile` with
-    // a manual write+rename that leaks `.tmpXXX` siblings.
-    let dir = tempfile::tempdir().unwrap();
-    save(dir.path(), &sample_windows_state(), None).unwrap();
-    save(dir.path(), &sample_macos_state(), None).unwrap();
-    let entries: Vec<_> = std::fs::read_dir(dir.path())
-        .unwrap()
-        .map(|e| e.unwrap().file_name())
-        .collect();
-    assert_eq!(entries, vec![std::ffi::OsString::from(STATE_FILE_NAME)]);
 }
 
 #[skuld::test]
@@ -285,18 +267,10 @@ fn clear_missing_is_ok() {
 #[skuld::test]
 fn clear_existing_removes_file() {
     let dir = tempfile::tempdir().unwrap();
-    save(dir.path(), &sample_windows_state(), None).unwrap();
+    write_state(dir.path(), &sample_windows_state());
     assert!(dir.path().join(STATE_FILE_NAME).exists());
     clear(dir.path()).unwrap();
     assert!(!dir.path().join(STATE_FILE_NAME).exists());
-}
-
-#[skuld::test]
-fn save_creates_missing_dir() {
-    let parent = tempfile::tempdir().unwrap();
-    let nested = parent.path().join("a").join("b").join("c");
-    save(&nested, &sample_windows_state(), None).unwrap();
-    assert!(nested.join(STATE_FILE_NAME).exists());
 }
 
 #[skuld::test]
@@ -304,18 +278,67 @@ fn state_file_name_is_bridge_dns_json() {
     assert_eq!(STATE_FILE_NAME, "bridge-dns.json");
 }
 
-#[cfg(target_os = "macos")]
 #[skuld::test]
-fn save_chowns_dir_and_file_when_owner_set(#[fixture(temp_dir)] dir: &std::path::Path) {
-    use std::os::unix::fs::MetadataExt;
-    let (uid, gid) = (unsafe { libc::getuid() }, unsafe { libc::getgid() });
-    let state = crate::dns_state::DnsState {
-        version: crate::dns_state::SCHEMA_VERSION,
-        advertised: vec![],
-        adapters: vec![],
-    };
-    crate::dns_state::save(dir, &state, Some((uid, gid))).unwrap();
-    let f = dir.join(crate::dns_state::STATE_FILE_NAME);
-    assert!(f.exists());
-    assert_eq!(std::fs::metadata(&f).unwrap().uid(), uid);
+fn superseded_file_name_is_distinct() {
+    assert_eq!(SUPERSEDED_FILE_NAME, "bridge-dns.superseded.json");
+    assert_ne!(SUPERSEDED_FILE_NAME, STATE_FILE_NAME);
+}
+
+#[skuld::test]
+fn supersede_missing_is_ok() {
+    let dir = tempfile::tempdir().unwrap();
+    supersede(dir.path()).unwrap();
+}
+
+#[skuld::test]
+fn supersede_renames_and_load_no_longer_sees_it() {
+    let dir = tempfile::tempdir().unwrap();
+    write_state(dir.path(), &sample_windows_state());
+    supersede(dir.path()).unwrap();
+
+    assert!(!dir.path().join(STATE_FILE_NAME).exists());
+    assert!(dir.path().join(SUPERSEDED_FILE_NAME).exists());
+    assert!(
+        load(dir.path()).is_none(),
+        "load must never read the superseded name — the bridge evaluates a file at most once"
+    );
+}
+
+/// A second `supersede` call (reinstall, rollback, or a second crash before
+/// the first superseded file was ever inspected) must not destroy the
+/// first one — `fs::rename` replaces an existing destination on both POSIX
+/// and Windows, so `supersede` cannot be a bare rename once a superseded
+/// file already exists. The older file wins the canonical name and the
+/// newer one is archived under a fresh name instead; nothing is lost.
+#[skuld::test]
+fn supersede_twice_archives_the_newer_file_instead_of_clobbering_the_older_one() {
+    let dir = tempfile::tempdir().unwrap();
+
+    std::fs::write(dir.path().join(STATE_FILE_NAME), b"first").unwrap();
+    supersede(dir.path()).unwrap();
+    assert!(!dir.path().join(STATE_FILE_NAME).exists());
+    let superseded_path = dir.path().join(SUPERSEDED_FILE_NAME);
+    assert_eq!(
+        std::fs::read(&superseded_path).unwrap(),
+        b"first",
+        "first supersede must land the canonical name"
+    );
+
+    std::fs::write(dir.path().join(STATE_FILE_NAME), b"second").unwrap();
+    supersede(dir.path()).unwrap();
+    assert!(
+        !dir.path().join(STATE_FILE_NAME).exists(),
+        "the un-suffixed name must be gone after the second supersede too"
+    );
+    assert_eq!(
+        std::fs::read(&superseded_path).unwrap(),
+        b"first",
+        "the older, already-superseded file must survive untouched — it is the evidence closer to          the user's true original DNS"
+    );
+    let archive_path = dir.path().join("bridge-dns.superseded.2.json");
+    assert_eq!(
+        std::fs::read(&archive_path).unwrap(),
+        b"second",
+        "the newer file's content must survive under a non-colliding archive name, not be lost"
+    );
 }

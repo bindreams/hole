@@ -1,28 +1,24 @@
-//! macOS `networksetup`-based system DNS capture / apply / restore.
+//! macOS `networksetup`-based system DNS apply / restore.
 //!
 //! Identifier is the *network service* name (e.g. "Wi-Fi") as reported by
 //! `networksetup -listallnetworkservices`. This is what the set/get DNS
 //! subcommands accept directly, avoiding a separate name-to-GUID lookup
 //! via `scutil`.
 //!
-//! ## Two layers
-//!
-//! - [`MacDnsBackend`] — the **inner test seam**, mirroring
-//!   [`super::windows::WinDnsBackend`] and the `Routing` precedent from
-//!   [bindreams/hole#165](https://github.com/bindreams/hole/issues/165).
-//!   Production goes through [`Networksetup`]; unit tests substitute
-//!   `MockMacBackend` via [`crate::dns::system::SystemDns::new_with_mac_backend`].
-//!
-//! - The free-function shims [`capture_adapters`] /
-//!   [`platform_restore_adapter`] / [`flush_dns_cache`] keep the
-//!   crash-recovery / non-Dns-trait call sites (see
-//!   [`crate::dns::recovery`]) intact. Each shim instantiates
-//!   [`Networksetup`] and delegates.
+//! [`MacDnsBackend`] — the **inner test seam**, mirroring
+//! [`super::windows::WinDnsBackend`] and the `Routing` precedent from
+//! [bindreams/hole#165](https://github.com/bindreams/hole/issues/165).
+//! Production goes through [`Networksetup`]; unit tests substitute
+//! `MockMacBackend` via [`crate::dns::system::SystemDns::new_with_mac_backend`].
+//! `get_settings` / `restore` / `restore_family` are used ONLY by
+//! `crate::dns::recovery`'s upgrade sweep. Apply on this platform stays
+//! advisory: `apply_macos` hands `hole-tun` — an *interface* name — to
+//! this service-name-keyed API, a guaranteed no-op until #868 lands the
+//! real mechanism.
 
 use std::io;
 use std::net::IpAddr;
 use std::process::Command;
-use std::sync::Arc;
 
 use crate::dns_state::{AdapterId, DnsPrior, DnsPriorAdapter};
 
@@ -45,16 +41,25 @@ const NETWORKSETUP: &str = "networksetup";
 pub trait MacDnsBackend: Send + Sync + 'static {
     /// Capture the v4 + v6 DNS state of `service`. Returns `Ok(None)`
     /// when the service does not exist; returns `Err` only on unexpected
-    /// `networksetup` failures.
+    /// `networksetup` failures. Used only by the upgrade sweep now.
     fn get_settings(&self, service: &str) -> io::Result<Option<DnsPriorAdapter>>;
 
     /// Set the DNS resolvers on `service` to `servers`. `networksetup`
     /// accepts mixed v4/v6 lists in one call.
     fn set_servers(&self, service: &str, servers: &[IpAddr]) -> io::Result<()>;
 
-    /// Restore the captured prior DNS state for `adapter`. Replays both
-    /// v4 and v6 in a single `networksetup -setdnsservers` invocation.
+    /// Restore BOTH families of the captured prior DNS state for
+    /// `adapter` in a single `networksetup -setdnsservers` invocation.
+    /// Used only by the upgrade sweep now, and only when both families'
+    /// evidence supports a restore.
     fn restore(&self, adapter: &DnsPriorAdapter) -> io::Result<()>;
+
+    /// Restore ONE family, preserving whatever is CURRENTLY live for the
+    /// other. `networksetup` has no per-family API — both families share
+    /// one combined list — so this reads the adapter's current settings
+    /// first and merges. Used by the upgrade sweep's per-family evidence
+    /// gate.
+    fn restore_family(&self, service: &str, ipv6: bool, prior: &DnsPrior) -> io::Result<()>;
 
     /// Flush the macOS DNS cache (`dscacheutil -flushcache` +
     /// `killall -HUP mDNSResponder`). Best-effort; failures are logged
@@ -126,6 +131,35 @@ impl MacDnsBackend for Networksetup {
         }
     }
 
+    fn restore_family(&self, service: &str, ipv6: bool, prior: &DnsPrior) -> io::Result<()> {
+        // No per-family API on this platform: read the current combined
+        // list, keep the OTHER family's CURRENT value untouched, and
+        // replace only the family being restored.
+        let current = self.get_settings(service)?;
+        let (mut v4, mut v6) = match current {
+            Some(adapter) => (adapter.v4, adapter.v6),
+            None => (DnsPrior::None, DnsPrior::None),
+        };
+        if ipv6 {
+            v6 = prior.clone();
+        } else {
+            v4 = prior.clone();
+        }
+        let mut combined: Vec<IpAddr> = Vec::new();
+        let mut saw_static = false;
+        for p in [&v4, &v6] {
+            if let DnsPrior::Static { servers } = p {
+                saw_static = true;
+                combined.extend_from_slice(servers);
+            }
+        }
+        if saw_static {
+            set_dnsservers(service, &combined)
+        } else {
+            clear_dnsservers(service)
+        }
+    }
+
     fn flush(&self) -> io::Result<()> {
         // Fire-and-forget the cache flush. `dscacheutil` is fast; the
         // SIGHUP to mDNSResponder is a courtesy notification.
@@ -133,39 +167,6 @@ impl MacDnsBackend for Networksetup {
         let _ = Command::new("killall").args(["-HUP", "mDNSResponder"]).status();
         Ok(())
     }
-}
-
-// Free-function shims (crash-recovery + non-Dns-trait call sites) =====================================================
-//
-// `crate::dns::recovery` and `super::restore_all` call these shims; the
-// new `Dns`-trait path inside `SystemDns::apply` goes through
-// `Arc<dyn MacDnsBackend>` directly.
-
-pub fn capture_adapters(services: &[String]) -> io::Result<Vec<DnsPriorAdapter>> {
-    let backend = Networksetup;
-    let mut out = Vec::with_capacity(services.len());
-    for svc in services {
-        match backend.get_settings(svc) {
-            Ok(Some(p)) => out.push(p),
-            Ok(None) => {
-                tracing::debug!(service = %svc, "DNS capture: service not found; skipping");
-            }
-            Err(e) => {
-                tracing::warn!(service = %svc, error = %e, "DNS capture failed for service");
-            }
-        }
-    }
-    Ok(out)
-}
-
-/// Flush the macOS DNS cache inline via [`Networksetup::flush`] — the
-/// `dscacheutil` cost is ms-scale.
-pub fn flush_dns_cache() {
-    let _ = Networksetup.flush();
-}
-
-pub fn platform_restore_adapter(adapter: &DnsPriorAdapter) -> io::Result<()> {
-    Networksetup.restore(adapter)
 }
 
 // Helpers =============================================================================================================
@@ -246,9 +247,4 @@ fn set_dnsservers(svc: &str, ips: &[IpAddr]) -> io::Result<()> {
 
 fn clear_dnsservers(svc: &str) -> io::Result<()> {
     set_dnsservers(svc, &[])
-}
-
-/// Wrap a backend in an `Arc<dyn MacDnsBackend>` for trait-object use.
-pub fn boxed<B: MacDnsBackend>(backend: B) -> Arc<dyn MacDnsBackend> {
-    Arc::new(backend)
 }

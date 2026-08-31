@@ -33,6 +33,7 @@ fn build_dispatcher(driver_body: impl Future<Output = ()> + Send + 'static) -> D
         driver_abort,
         bomb: drop_bomb::DebugDropBomb::new("Dispatcher dropped without shutdown().await"),
         ipv6_assigned: None,
+        identity: tun_engine::TunIdentity::synthetic(0xFEED, "dispatcher-tests-tun"),
     }
 }
 

@@ -8863,6 +8863,7 @@ dependencies = [
  "garter",
  "hole-test-observability",
  "libc",
+ "rand 0.10.2",
  "serde",
  "serde_json",
  "skuld",

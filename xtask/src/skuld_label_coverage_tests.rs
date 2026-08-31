@@ -126,6 +126,37 @@ jobs:
     );
 }
 
+/// `--no-fail-fast` is a `cargo nextest run`-only flag: `cargo nextest list`
+/// rejects it as an unrecognized argument (bindreams/hole#961). It must not
+/// survive into the derived list command.
+#[skuld::test]
+fn drops_the_run_only_no_fail_fast_flag() {
+    let ci = r#"
+jobs:
+  test-hole:
+    steps:
+      - name: Test (non-TUN)
+        env:
+          SKULD_LABELS: "!tun"
+        run: cargo nextest run --no-default-features --no-fail-fast -E 'package(hole) + package(dump)'
+"#;
+    let candidates = extract_lane_candidates(ci, "test-hole").expect("extract");
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(
+        candidates[0].list_command,
+        argv(&[
+            "cargo",
+            "nextest",
+            "list",
+            "--message-format",
+            "json",
+            "--no-default-features",
+            "-E",
+            "package(hole) + package(dump)",
+        ])
+    );
+}
+
 #[skuld::test]
 fn ignores_non_nextest_and_no_run_steps() {
     let ci = r#"

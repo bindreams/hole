@@ -54,9 +54,17 @@ before editing; the sections linked below are the authoritative source.
   `SynReceived`/`FinWait2`/`CloseWait` holds its slot forever. →
   [CONTRIBUTING.md#tcp-accept-refusal](CONTRIBUTING.md#tcp-accept-refusal)
 - **DNS forwarder.** Carries DNS over the TCP tunnel for TCP-only plugins; OS
-  adapter DNS is advertised the configured resolver IPs, which route into
-  `hole-tun` and are intercepted by the in-TUN `LocalDnsEndpoint`; a start-time
-  forwarder self-test gates the whole connection. →
+  adapter DNS is advertised the configured resolver IPs on `hole-tun` only —
+  the one adapter Hole created — which route into it and are intercepted by
+  the in-TUN `LocalDnsEndpoint`; a start-time forwarder self-test gates the
+  whole connection. →
+  [CONTRIBUTING.md#dns-forwarder](CONTRIBUTING.md#dns-forwarder)
+- **DNS-egress confinement (Windows).** Hole never writes DNS settings to an
+  adapter it doesn't own; on Windows, egress on UDP+TCP port 53 is also
+  confined to `hole-tun` by a WFP filter set in a **process-scoped dynamic**
+  FWPM session — the opposite lifetime from the fail-closed covers below, and
+  deliberately so: it needs no crash-recovery state because it dies with the
+  bridge. →
   [CONTRIBUTING.md#dns-forwarder](CONTRIBUTING.md#dns-forwarder)
 - **Listener selection invariants.** `build_ss_config` rejects
   `TunnelRequiresSocks5` (full + HTTP-only) / `NoListenersEnabled`

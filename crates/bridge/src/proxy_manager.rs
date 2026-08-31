@@ -299,7 +299,10 @@ struct BlockedStart<C> {
 enum Posture<P: Proxy, R: Routing, D: Dns> {
     Idle,
     PendingStart(BlockedStart<R::Cover>),
-    Session(RunningState<P, R, D>),
+    // Boxed: `RunningState` (283+ bytes, dwarfing `PendingStart`'s ~75) would
+    // otherwise size every `Posture` — including the common `Idle` case — to
+    // its largest variant.
+    Session(Box<RunningState<P, R, D>>),
 }
 
 impl<P: Proxy, R: Routing, D: Dns> Posture<P, R, D> {
@@ -317,14 +320,14 @@ impl<P: Proxy, R: Routing, D: Dns> Posture<P, R, D> {
 
     fn session(&self) -> Option<&RunningState<P, R, D>> {
         match self {
-            Posture::Session(s) => Some(s),
+            Posture::Session(s) => Some(s.as_ref()),
             _ => None,
         }
     }
 
     fn session_mut(&mut self) -> Option<&mut RunningState<P, R, D>> {
         match self {
-            Posture::Session(s) => Some(s),
+            Posture::Session(s) => Some(s.as_mut()),
             _ => None,
         }
     }
@@ -357,7 +360,7 @@ impl<P: Proxy, R: Routing, D: Dns> Posture<P, R, D> {
             return None;
         }
         match std::mem::replace(self, Posture::Idle) {
-            Posture::Session(s) => Some(s),
+            Posture::Session(s) => Some(*s),
             _ => unreachable!("just matched Session above"),
         }
     }
@@ -385,7 +388,7 @@ impl<P: Proxy, R: Routing, D: Dns> Posture<P, R, D> {
             "commit_session: posture must be Idle — AlreadyRunning already ruled out a session, \
              and the caller's own take_pending() call ruled out a pending start"
         );
-        *self = Posture::Session(session);
+        *self = Posture::Session(Box::new(session));
     }
 }
 
@@ -1682,6 +1685,29 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
             None
         };
 
+        // The identity of the TUN device this start opened — the LUID and
+        // alias of the concrete OS object, never a name lookup. Threaded to
+        // `Dns::apply` below.
+        //
+        // Under `#[cfg(test)]` the dispatcher is stubbed out (creating a
+        // real TUN needs elevation), so no `hole-tun` exists on a clean
+        // machine — a synthetic identity stands in instead. This is what
+        // makes Phase 7 reachable and observable from a unit test on any
+        // machine, not just one with a leftover `hole-tun`. The
+        // alternative — resolving the alias via a raw OS call here instead
+        // of threading the identity through — would be wrong on both
+        // safety grounds (a name lookup can resolve to someone else's
+        // adapter) and testability grounds (nothing to substitute in a
+        // unit test).
+        #[cfg(not(test))]
+        let tun_identity = dispatcher
+            .as_ref()
+            .expect("dispatcher is always Some on the production (#[cfg(not(test))]) path")
+            .identity()
+            .clone();
+        #[cfg(test)]
+        let tun_identity = tun_engine::TunIdentity::synthetic(0xFEED, TUN_DEVICE_NAME);
+
         // The TUN's IPv6 verdict, read here because `Engine::build` has
         // already consumed the device by now. `Ipv6StackAbsent` is the second
         // operand of the route-install fatality rule: the IPv6 route adds are
@@ -1714,6 +1740,11 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
             "TUN routes installed"
         );
 
+        // Process image paths for the standing lockdown cover's own
+        // App-ID permit (`routing.install_lockdown` below) — see
+        // `lockdown_app_ids`'s doc.
+        let app_ids = lockdown_app_ids(config);
+
         // Standing lockdown cover (#527). Engaged only when intent is on; when
         // off this whole block is a no-op and the start is byte-identical to
         // today. Engaged AFTER routing.install (TUN exists => LUID resolvable)
@@ -1723,7 +1754,6 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         // unwind, tearing down — the opposite of the transient cover's
         // fail-open. Committed only on the Ok path (the field below).
         let lockdown = if standing_cover_expected {
-            let app_ids = lockdown_app_ids(config);
             match routing.install_lockdown(server_ip, TUN_DEVICE_NAME, &app_ids) {
                 Ok(cover) => {
                     promote_adopted_claim(state_dir, owner);
@@ -1740,36 +1770,26 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
             None
         };
 
-        // Phase 7: apply system DNS AFTER routes install so the OS
+        // Phase 7: confine DNS egress to hole-tun and advertise the
+        // configured resolver IPs on it, AFTER routes install so the OS
         // "best-route to DNS server" lookup resolves through the TUN.
-        // We advertise the configured upstream resolver IPs — OS UDP/53 to
-        // them routes into hole-tun and is intercepted by the in-TUN
-        // LocalDnsEndpoint; OS TCP/53 falls through the proxy cascade to the
-        // real resolver over the tunnel. (No loopback :53 server.)
-        // Pass the FULL list, not a v4 filter: `set_servers` advertises both
-        // the v4 and v6 families from their own entries (an unconfigured
-        // family is left untouched), so a mixed or v6 resolver list is carried
-        // end-to-end on both platforms. Persist + apply are cancel-aware inside
-        // `Dns::apply`. Non-cancel Io failures → warn! + None.
+        // OS UDP/53 to those IPs routes into hole-tun and is intercepted by
+        // the in-TUN LocalDnsEndpoint; OS TCP/53 falls through the proxy
+        // cascade to the real resolver over the tunnel. (No loopback :53
+        // server.) Pass the FULL list, not a v4 filter: `set_servers`
+        // advertises both the v4 and v6 families from their own entries (an
+        // unconfigured family is left untouched), so a mixed or v6 resolver
+        // list is carried end-to-end on both platforms.
+        //
+        // FAIL-FATAL on both error shapes: after #846 removed the
+        // upstream-adapter rewrite, the WFP confinement (Windows) is the
+        // ONLY thing standing between OS DNS and the LAN resolver — a
+        // degraded-but-running session here would be a silent leak on a
+        // session the UI reports as connected. `Cancelled` and every other
+        // `DnsError` unwind the locally-owned `lockdown` / `routes` guards.
         let dns_applied = if forwarder.is_some() {
             let advertise_ips: Vec<IpAddr> = config.dns.servers.clone();
-            // Capture runs on upstream only; the TUN was created by
-            // `routing.install` above so its prior is definitionally
-            // "defaults". Apply runs on both so the OS's best-route-to-DNS
-            // lookup lands on a TUN-routed resolver IP.
-            let capture_aliases = vec![gw_info.interface_name.clone()];
-            let apply_aliases = vec![TUN_DEVICE_NAME.into(), gw_info.interface_name.clone()];
-            match dns
-                .apply(
-                    advertise_ips,
-                    capture_aliases,
-                    apply_aliases,
-                    state_dir.map(std::path::Path::to_path_buf),
-                    owner,
-                    cancel.clone(),
-                )
-                .await
-            {
+            match dns.apply(advertise_ips, tun_identity, server_ip, cancel.clone()).await {
                 Ok(a) => Some(a),
                 Err(DnsError::Cancelled) => {
                     if let Some(mut d) = dispatcher.take() {
@@ -1777,9 +1797,18 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
                     }
                     return Err(ProxyError::Cancelled);
                 }
+                #[cfg(target_os = "windows")]
+                Err(DnsError::Confine(e)) => {
+                    if let Some(mut d) = dispatcher.take() {
+                        d.shutdown().await;
+                    }
+                    return Err(ProxyError::DnsConfinementFailed { reason: e.to_string() });
+                }
                 Err(DnsError::Io(e)) => {
-                    warn!(error = %e, "system DNS apply failed; in-tunnel DNS unreachable by OS clients");
-                    None
+                    if let Some(mut d) = dispatcher.take() {
+                        d.shutdown().await;
+                    }
+                    return Err(ProxyError::Runtime(e));
                 }
             }
         } else {
@@ -1850,7 +1879,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
                     udp_proxy_available: _,
                     ipv6_bypass_available: _,
                     traffic_window: _,
-                } = state;
+                } = *state;
 
                 // 0. Restore system DNS FIRST (while routes + SS are still live
                 // so any in-flight OS queries egress via the restored resolver).
@@ -2110,9 +2139,21 @@ fn lockdown_app_ids(config: &ProxyConfig) -> Vec<std::path::PathBuf> {
     {
         let mut ids: Vec<std::path::PathBuf> = Vec::new();
         if let Some(ref plugin) = config.server.plugin {
-            ids.push(std::path::PathBuf::from(crate::proxy::config::resolve_plugin_path(
-                plugin,
-            )));
+            let resolved = crate::proxy::config::resolve_plugin_path(plugin);
+            let path = std::path::PathBuf::from(&resolved);
+            // `resolve_plugin_path` deliberately falls back to the bare
+            // binary name when it can't find the plugin next to the bridge
+            // exe, so shadowsocks can still do a PATH lookup at spawn — but
+            // `FwpmGetAppIdFromFileName0` does no PATH search of its own and
+            // needs a real file path. A bare name (no directory component)
+            // narrows the permit set rather than breaking the cover; warn so
+            // a bug report carries the signal, same disposition as the
+            // `current_exe()` failure below.
+            if path.parent().is_some_and(|d| !d.as_os_str().is_empty()) {
+                ids.push(path);
+            } else {
+                warn!(plugin = %resolved, "lockdown: plugin path did not resolve to a real file; App-ID permit omitted");
+            }
         }
         match std::env::current_exe() {
             Ok(exe) => ids.push(exe),

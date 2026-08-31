@@ -58,6 +58,10 @@ nextest-version = "0.9.130"
 #     never run beside each other):
 #     crates/tun-engine/src/routing/failclosed/live_tun_permit_privileged_tests.rs
 #     crates/bridge/src/proxy_manager_live_tun_permit_e2e_tests.rs
+#   - `dns_confine_global_net_state_` prefix (#846 — real wintun devices + a
+#     real, process-scoped WFP DNS-egress confinement, reusing the
+#     `routing::failclosed::TUN` serial token; see that module's doc):
+#     crates/tun-engine/src/dns_confine/privileged_tests.rs
 #   - `tun_device_ipv6_` substring (creates a real wintun adapter and reads the
 #     host's whole AF_INET6 unicast address table, so a concurrent bridge e2e's
 #     TUN would both perturb it and be perturbed by it):
@@ -91,7 +95,7 @@ nextest-version = "0.9.130"
 max-threads = 1
 
 [[profile.default.overrides]]
-filter = 'test(/^e2e_.*full_tunnel/) + test(/windows_lockdown_permits_server_ip_/) + test(/macos_lockdown_permits_server_ip_/) + test(/failclosed_permits_/) + test(/release_all_/) + test(/cutover_global_net_state_/) + test(/live_tun_permit_/) + test(/tun_device_ipv6_/)'
+filter = 'test(/^e2e_.*full_tunnel/) + test(/windows_lockdown_permits_server_ip_/) + test(/macos_lockdown_permits_server_ip_/) + test(/failclosed_permits_/) + test(/release_all_/) + test(/cutover_global_net_state_/) + test(/live_tun_permit_/) + test(/tun_device_ipv6_/) + test(/dns_confine_global_net_state_/)'
 test-group = 'global_net_state'
 
 # `driver_dns_tests.rs` / `driver_udp_tests.rs` / `driver_lifecycle_tests.rs`
