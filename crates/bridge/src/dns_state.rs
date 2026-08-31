@@ -221,7 +221,7 @@ pub fn supersede(state_dir: &Path) -> std::io::Result<()> {
         tracing::warn!(
             kept = %to.display(),
             archived = %archive.display(),
-            "dns_state: bridge-dns.superseded.json already existed; archived the newer file instead              of overwriting it. The archive is forensic only — nothing reads it back."
+            "dns_state: bridge-dns.superseded.json already existed; archived the newer file \n             instead of overwriting it. The archive is forensic only — nothing reads it back."
         );
         return Ok(());
     }
