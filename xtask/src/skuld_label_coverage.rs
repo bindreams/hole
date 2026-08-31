@@ -189,10 +189,19 @@ fn is_launcher_token(tok: &str) -> bool {
     tok == "sudo" || tok == "env" || tok.contains('=')
 }
 
+/// Boolean flags `cargo nextest run` accepts that `cargo nextest list` does
+/// not — copying one through verbatim makes `cargo nextest list` itself
+/// reject the argv as unrecognized, so [`to_list_command`] drops them. None
+/// of these narrow *which* tests a filter selects (that's `-E`'s job, always
+/// carried through), only how a `run` schedules/reports ones it already
+/// selected, so dropping them cannot change the test set [`to_list_command`]
+/// reports.
+const RUN_ONLY_FLAGS: [&str; 1] = ["--no-fail-fast"];
+
 /// Rewrite a nextest-run command into the argv for the equivalent `nextest
 /// list --message-format json`, dropping any launcher prefix (`sudo`, `env`,
 /// bare `VAR=value` tokens) — listing tests takes no root and needs none of
-/// that.
+/// that — and any [`RUN_ONLY_FLAGS`] token, which `nextest list` rejects.
 ///
 /// Anchors on the same `nextest`,`run` token pair [`is_nextest_run`] matches,
 /// so both launcher shapes in ci.yaml survive: `cargo nextest run`, and the
@@ -216,6 +225,10 @@ pub(crate) fn to_list_command(cmd: &str) -> Result<Vec<String>> {
         if toks[i] == "nextest" && toks.get(i + 1).map(String::as_str) == Some("run") {
             out.extend(["nextest", "list", "--message-format", "json"].map(String::from));
             i += 2;
+            continue;
+        }
+        if RUN_ONLY_FLAGS.contains(&toks[i].as_str()) {
+            i += 1;
             continue;
         }
         out.push(toks[i].clone());

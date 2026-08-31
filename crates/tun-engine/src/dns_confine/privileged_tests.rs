@@ -9,12 +9,19 @@
 //! (#874) and `lockdown_privileged_tests` (#527) — this module follows their
 //! shape.
 //!
-//! **Assertions are on the error the probe's `send`/`connect` call returns,
-//! never on elapsed time.** A WFP block fails the operation synchronously; it
-//! does not stall it. [`crate::test_utils::classify`] turns the raw
-//! `io::Result` into a [`crate::test_utils::ProbeFate`] so a probe that never
-//! reached the network stack at all (a harness fault) can never be
-//! misreported as a firewall verdict.
+//! **Assertions are on the wire, never on elapsed time.** A WFP block fails
+//! synchronously; it does not stall. But for the UDP probes below, "the wire"
+//! means an actual `pktmon` capture
+//! ([`crate::test_utils::pktmon`]), not the `send_to` call's own return
+//! value: a bound, unconnected UDP socket's `send_to` returns `Ok` whether
+//! the datagram left or was dropped at `ALE_AUTH_CONNECT`, so `Ok(22)` is
+//! exactly what a successfully blocked send looks like too. Only the one TCP
+//! probe here (`leaves_other_ports_alone`) can trust its own `connect`
+//! result: a completed three-way handshake is proof no firewall drop can
+//! manufacture. Every UDP test instead sends a per-marker nonce and asks the
+//! capture whether it egressed, using a rendezvous tail on the same socket
+//! where the claim under test is an absence (see each test's own doc) — no
+//! sleep, no poll.
 //!
 //! **`serial = TUN` reuses `crate::TUN`** — the crate-root serial token
 //! declared once for the whole binary — rather than minting a second
@@ -50,13 +57,14 @@
 
 #![cfg(target_os = "windows")]
 
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream, UdpSocket};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream};
+use std::path::Path;
 use std::time::Duration;
 
 use tun::AbstractDeviceExt;
 
 use super::engage;
-use crate::test_utils::{classify, OwnedRoute, ProbeFate};
+use crate::test_utils::{capture_contains_nonce, nonce, pktmon, send_marker, OwnedRoute, PktmonGuard};
 use crate::{GLOBAL_NET_STATE, TUN};
 
 /// TEST-NET-2 (RFC 5737) — never routable on the real internet, so its only
@@ -85,14 +93,60 @@ fn server_ip() -> IpAddr {
     SERVER_IP.parse().expect("literal")
 }
 
-fn send_udp(dest: SocketAddr) -> std::io::Result<usize> {
-    let sock = UdpSocket::bind("0.0.0.0:0")?;
-    sock.send_to(b"hole-dns-confine-probe", dest)
+/// A tokio runtime plus a bound, unconnected UDP socket — the pair
+/// [`send_marker`] needs. Not bound to any interface: which one a marker
+/// actually egresses is left to the OS route lookup for its destination,
+/// which is exactly the thing each test below is probing.
+fn probe_socket() -> (tokio::runtime::Runtime, tokio::net::UdpSocket) {
+    let rt = tokio::runtime::Runtime::new().expect("HARNESS: tokio runtime for the probe socket");
+    let socket = rt
+        .block_on(tokio::net::UdpSocket::bind("0.0.0.0:0"))
+        .expect("HARNESS: bind probe socket");
+    (rt, socket)
+}
+
+/// Run `body` inside a fresh pktmon UDP capture window scoped to `label`
+/// under `dir`, returning the resulting pcapng path. Mirrors the proven
+/// phase structure in `cutover_nic_capture_privileged.rs`'s no-leak proof:
+/// filter to UDP only, capture every NIC component — the real physical
+/// egress AND any live wintun adapter, since pktmon's component discovery is
+/// not limited to physical hardware — at full packet size, `PktmonGuard` for
+/// teardown, then convert the trace to pcapng once the window closes.
+fn capture_udp_window(dir: &Path, label: &str, body: impl FnOnce()) -> std::path::PathBuf {
+    let cap = dir.join(format!("{label}.etl"));
+    let pcap = dir.join(format!("{label}.pcapng"));
+    pktmon(&["filter", "remove"]);
+    pktmon(&["filter", "add", "hole-nic-capture", "-t", "UDP"]);
+    let _guard = PktmonGuard;
+    pktmon(&[
+        "start",
+        "--capture",
+        "--comp",
+        "nics",
+        "--pkt-size",
+        "0",
+        "--file-name",
+        &cap.to_string_lossy(),
+    ]);
+    body();
+    pktmon(&["stop"]);
+    pktmon(&["etl2pcap", &cap.to_string_lossy(), "--out", &pcap.to_string_lossy()]);
+    pcap
 }
 
 /// Control + positive case: with the confinement engaged naming the device
-/// carrying the only route to `PROBE_IP`, a UDP send to `PROBE_IP:53` must be
-/// permitted.
+/// carrying the only route to `PROBE_IP`, a UDP send to `PROBE_IP:53` must
+/// actually egress — proven at the wire (module doc): `send_to`'s `Ok` alone
+/// cannot attest that on an unconnected UDP socket.
+///
+/// Not a separate harness-control gate for the tests below: a prior design
+/// made this test that gate, but as its own nextest test it gated nothing —
+/// alphabetical ordering ran `blocks_dns_off_the_tun` first, it failed, and
+/// fail-fast killed this one before it ever ran. Every UDP test below proves
+/// its own capture pipeline live within its own window instead (its
+/// rendezvous tail, or — for a lone must-egress marker like this one — the
+/// marker itself: a broken pipeline fails this test loud, it does not pass
+/// it vacuously).
 #[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
 fn dns_confine_global_net_state_permits_dns_on_the_named_tun() {
     let name = "dns-confine-test-tun-a";
@@ -102,32 +156,61 @@ fn dns_confine_global_net_state_permits_dns_on_the_named_tun() {
     route.assert_wins_for(IpAddr::V4(PROBE_IP));
 
     let confinement = engage(luid, server_ip(), &[]).expect("engage real DNS confinement");
-    let result = send_udp(SocketAddr::from((PROBE_IP, 53)));
+
+    let (rt, socket) = probe_socket();
+    let dir = tempfile::tempdir().expect("HARNESS: tempdir for the pktmon capture");
+    let marker = nonce();
+    let pcap = capture_udp_window(dir.path(), "permits-named-tun", || {
+        send_marker(&rt, &socket, SocketAddr::from((PROBE_IP, 53)), marker)
+            .expect("DNS to the address routed through the named tun must be accepted for send");
+    });
+
     drop(confinement);
 
-    assert_eq!(
-        classify(&result),
-        ProbeFate::Delivered,
-        "DNS to the address routed through the named tun must be permitted: {result:?}"
+    assert!(
+        capture_contains_nonce(&pcap, marker),
+        "DNS to the address routed through the named tun must egress: marker not found in the capture"
     );
 }
 
 /// Negative case: a UDP send to a port-53 destination reached via the
 /// physical adapter (never the tunnel) must be blocked while the confinement
-/// is engaged.
+/// is engaged — proven at the wire (module doc). The rendezvous tail, sent to
+/// the server IP on the same socket, is both the ordering proof (its
+/// presence means the leak marker's `ALE_AUTH_CONNECT` decision already
+/// resolved, so absence is a drop, not a still-pending send) and this test's
+/// own non-vacuous evidence that the server permit holds.
 #[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
 fn dns_confine_global_net_state_blocks_dns_off_the_tun() {
     let dev = open_device("dns-confine-test-tun-b", "10.255.249.1", "255.255.255.0");
     let luid = dev.tun_luid();
 
     let confinement = engage(luid, server_ip(), &[]).expect("engage real DNS confinement");
-    let result = send_udp(OFF_TUNNEL_DNS.parse().expect("literal"));
+
+    let (rt, socket) = probe_socket();
+    let dir = tempfile::tempdir().expect("HARNESS: tempdir for the pktmon capture");
+    let leak = nonce();
+    let tail = nonce();
+    let pcap = capture_udp_window(dir.path(), "blocks-off-tun", || {
+        // The leak send is allowed to fail: a WFP block at ALE_AUTH_CONNECT
+        // can surface as a synchronous `send_to` error, itself no-leak
+        // evidence — but the capture is the authority, so swallow the result
+        // and let the wire decide. The tail send must succeed (it is
+        // permitted) and is the rendezvous, so it stays strict.
+        let _ = send_marker(&rt, &socket, OFF_TUNNEL_DNS.parse().expect("literal"), leak);
+        send_marker(&rt, &socket, SocketAddr::from((server_ip(), 53)), tail).expect("permitted-tail marker send");
+    });
+
     drop(confinement);
 
-    let fate = classify(&result);
     assert!(
-        matches!(fate, ProbeFate::Rejected(_)),
-        "off-tunnel DNS must be blocked while the confinement is engaged: {result:?} (fate={fate:?})"
+        capture_contains_nonce(&pcap, tail),
+        "permitted-tail marker (→ server IP {SERVER_IP}) must egress: the server permit must hold AND the \
+         capture must have been live for the leak marker's decision"
+    );
+    assert!(
+        !capture_contains_nonce(&pcap, leak),
+        "DNS LEAK: a datagram to the off-tunnel host {OFF_TUNNEL_DNS} egressed while the confinement was engaged"
     );
 }
 
@@ -152,7 +235,10 @@ fn dns_confine_global_net_state_leaves_other_ports_alone() {
 /// send DNS that actually routes via device B. A confinement that (wrongly)
 /// permitted any live TUN-shaped interface would pass
 /// `permits_dns_on_the_named_tun` AND this test; only a permit genuinely
-/// keyed on the named LUID fails this one.
+/// keyed on the named LUID fails this one. Proven at the wire, same
+/// leak/tail shape as `blocks_dns_off_the_tun`: the leak marker routes via
+/// device B and must be absent, the tail (→ the server IP, permitted
+/// regardless of interface) must be present.
 #[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
 fn dns_confine_global_net_state_is_sensitive_to_the_interface_it_names() {
     let name_a = "dns-confine-test-tun-d";
@@ -167,21 +253,38 @@ fn dns_confine_global_net_state_is_sensitive_to_the_interface_it_names() {
 
     // Engage naming ONLY device A.
     let confinement = engage(luid_a, server_ip(), &[]).expect("engage real DNS confinement naming device A");
-    let result = send_udp(SocketAddr::from((PROBE_IP, 53)));
+
+    let (rt, socket) = probe_socket();
+    let dir = tempfile::tempdir().expect("HARNESS: tempdir for the pktmon capture");
+    let leak = nonce();
+    let tail = nonce();
+    let pcap = capture_udp_window(dir.path(), "sensitive-to-interface", || {
+        // The leak routes via device B, which the confinement does not name
+        // — allowed to fail synchronously, same as blocks_dns_off_the_tun.
+        let _ = send_marker(&rt, &socket, SocketAddr::from((PROBE_IP, 53)), leak);
+        send_marker(&rt, &socket, SocketAddr::from((server_ip(), 53)), tail).expect("permitted-tail marker send");
+    });
+
     drop(confinement);
     drop(dev_b);
 
-    let fate = classify(&result);
     assert!(
-        matches!(fate, ProbeFate::Rejected(_)),
-        "a confinement naming device A must NOT permit DNS actually routed via device B — \
-         the permit is not sensitive to the interface it names: {result:?} (fate={fate:?})"
+        capture_contains_nonce(&pcap, tail),
+        "permitted-tail marker (→ server IP {SERVER_IP}) must egress: the capture must have been live for the \
+         leak marker's decision"
+    );
+    assert!(
+        !capture_contains_nonce(&pcap, leak),
+        "a confinement naming device A must NOT permit DNS actually routed via device B — the permit is not \
+         sensitive to the interface it names: marker egressed"
     );
 }
 
 /// Rule #0, asserted rather than assumed: dropping the guard must fully
 /// release the confinement — a dynamic session's filters vanish with the
 /// engine handle, with no by-key sweep and nothing left to strand a user.
+/// Proven at the wire, after the guard is dropped: `send_to`'s `Ok` alone
+/// cannot attest that DNS is unblocked again.
 #[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
 fn dns_confine_global_net_state_filters_die_with_the_session() {
     let dev = open_device("dns-confine-test-tun-f", "10.255.245.1", "255.255.255.0");
@@ -190,31 +293,45 @@ fn dns_confine_global_net_state_filters_die_with_the_session() {
     let confinement = engage(luid, server_ip(), &[]).expect("engage real DNS confinement");
     drop(confinement);
 
-    let result = send_udp(OFF_TUNNEL_DNS.parse().expect("literal"));
-    assert_eq!(
-        classify(&result),
-        ProbeFate::Delivered,
-        "dropping the confinement guard must restore off-tunnel DNS: {result:?}"
+    let (rt, socket) = probe_socket();
+    let dir = tempfile::tempdir().expect("HARNESS: tempdir for the pktmon capture");
+    let marker = nonce();
+    let pcap = capture_udp_window(dir.path(), "filters-die-with-session", || {
+        send_marker(&rt, &socket, OFF_TUNNEL_DNS.parse().expect("literal"), marker)
+            .expect("dropping the confinement guard must restore off-tunnel DNS send");
+    });
+
+    assert!(
+        capture_contains_nonce(&pcap, marker),
+        "dropping the confinement guard must restore off-tunnel DNS: marker not found in the capture"
     );
 }
 
 /// R0-3's live proof: the Shadowsocks server permit matches on port 53 too —
 /// a server configured on port 53 (a standard censorship-evasion setup) must
 /// not be locked out of its own tunnel by the very confinement meant to
-/// protect it.
+/// protect it. Proven at the wire.
 #[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
 fn dns_confine_global_net_state_permits_the_server_on_port_53() {
     let dev = open_device("dns-confine-test-tun-g", "10.255.244.1", "255.255.255.0");
     let luid = dev.tun_luid();
 
     let confinement = engage(luid, server_ip(), &[]).expect("engage real DNS confinement");
-    let result = send_udp(SocketAddr::from((server_ip(), 53)));
+
+    let (rt, socket) = probe_socket();
+    let dir = tempfile::tempdir().expect("HARNESS: tempdir for the pktmon capture");
+    let marker = nonce();
+    let pcap = capture_udp_window(dir.path(), "permits-server-53", || {
+        send_marker(&rt, &socket, SocketAddr::from((server_ip(), 53)), marker)
+            .expect("the server IP must be accepted for send on port 53");
+    });
+
     drop(confinement);
 
-    assert_eq!(
-        classify(&result),
-        ProbeFate::Delivered,
-        "the server IP must stay reachable on port 53 even though it is not the tunnel LUID: {result:?}"
+    assert!(
+        capture_contains_nonce(&pcap, marker),
+        "the server IP must stay reachable on port 53 even though it is not the tunnel LUID: marker not found \
+         in the capture"
     );
 }
 

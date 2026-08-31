@@ -75,7 +75,7 @@ use std::time::Duration;
 use tun::AbstractDevice;
 
 use super::{engage_lockdown, SystemLuidResolver};
-use crate::test_utils::{classify, EscapeGuard, OwnedRoute, RecordSpec};
+use crate::test_utils::{classify, classify_send, EscapeGuard, OwnedRoute, RecordSpec};
 use crate::{GLOBAL_NET_STATE, TUN};
 
 // Constants ===========================================================================================================
@@ -530,9 +530,14 @@ fn run_live_tun_permit_core(
         // stack: a probe the stack rejected — including the
         // `PermissionDenied` a Windows WFP deny at `ALE_AUTH_CONNECT`
         // produces — IS a cover verdict, and belongs to the product assert
-        // below, not here. Both phases classify through the same function so
-        // the two can't drift into disjoint notions of "blocked".
-        let send2_fate = classify(&send2);
+        // below, not here. `send2` is a connectionless UDP send, so it goes
+        // through `classify_send`, never `classify` — its `Ok` says nothing
+        // about the cover on its own (see `test_utils::probe`'s module doc);
+        // only `is_verdict()` (shared error-classification logic with
+        // `classify`) is read from it, never a `Delivered`-shaped verdict.
+        // The real permit/leak evidence for send2 is `permit_seen`, read off
+        // `dev1.capture` below — a wire oracle, not this return value.
+        let send2_fate = classify_send(&send2);
         let tcp2_fate = classify(&tcp2);
         assert!(
             send2_fate.is_verdict() && tcp2_fate.is_verdict(),
@@ -578,8 +583,10 @@ fn run_live_tun_permit_core(
         let tail_seen = dev1.capture(Duration::from_secs(5), &mut seen3, udp_matches(4)).await;
 
         // 1. Classify send3/tcp3: absence from `seen3` is only a firewall
-        //    verdict if the probe actually reached the stack.
-        let send3_fate = classify(&send3);
+        //    verdict if the probe actually reached the stack. send3 is a
+        //    connectionless UDP send — see the classify_send note on send2
+        //    above for why it goes through classify_send, not classify.
+        let send3_fate = classify_send(&send3);
         let tcp3_fate = classify(&tcp3);
         assert!(
             send3_fate.is_verdict() && tcp3_fate.is_verdict(),
