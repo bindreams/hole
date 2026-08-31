@@ -62,32 +62,38 @@ fn classify_hop_maps_no_route_to_no_default_route() {
     assert!(matches!(err, GatewayError::NoDefaultRoute), "got {err:?}");
 }
 
-/// Run for both families: reading the on-link marker with the wrong address
-/// family would silently turn "no gateway" into a working start pointed at
-/// `0.0.0.0`.
+/// An on-link default route is a route **form**, not a refusal — the
+/// interface-scoped bypass (`routing.rs`) is what makes it usable. Run for
+/// both families: reading the on-link marker with the wrong address family
+/// would silently mis-handle a dual-stack host, which is exactly the cohort
+/// this exists for.
 #[skuld::test]
-fn classify_hop_maps_unspecified_next_hop_to_no_usable_gateway() {
-    for unspecified in [IpAddr::V4(Ipv4Addr::UNSPECIFIED), IpAddr::V6(Ipv6Addr::UNSPECIFIED)] {
-        let err = classify_hop(Some(hop(unspecified)), false).expect_err("on-link must be refused");
-        assert!(
-            matches!(err, GatewayError::NoUsableGateway { .. }),
-            "{unspecified} should be on-link, got {err:?}"
-        );
-    }
+fn an_on_link_default_classifies_as_on_link_not_an_error() {
+    let info = classify_hop(Some(hop(IpAddr::V4(Ipv4Addr::UNSPECIFIED))), false).expect("on-link must not be refused");
+    assert_eq!(info.next_hop, NextHop::OnLink);
 }
 
-/// The refusal branch must not destroy the adapter its own copy tells the user
-/// to look up. Without this the toast says "see bridge.log for the adapter
-/// involved" and `bridge.log` names nothing.
 #[skuld::test]
-fn classify_hop_preserves_the_adapter_in_the_error() {
-    let err = classify_hop(Some(hop(IpAddr::V4(Ipv4Addr::UNSPECIFIED))), false).expect_err("on-link is refused");
-    let GatewayError::NoUsableGateway { detail } = &err else {
-        panic!("expected NoUsableGateway, got {err:?}");
-    };
-    assert_eq!(detail.interface_alias, "ProtonVPN TUN");
-    assert_eq!(detail.interface_index, 42);
-    assert_eq!(detail.next_hop, IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+fn an_on_link_ipv6_default_classifies_as_on_link() {
+    let info = classify_hop(Some(hop(IpAddr::V6(Ipv6Addr::UNSPECIFIED))), false).expect("on-link must not be refused");
+    assert_eq!(info.next_hop, NextHop::OnLink);
+}
+
+/// The regression guard that matters most: an ordinary gateway must keep
+/// classifying as `Via`, never `OnLink` — this is the common case every VPN
+/// user relies on.
+#[skuld::test]
+fn a_gateway_default_still_classifies_as_via() {
+    let gateway = IpAddr::V4(Ipv4Addr::new(192, 168, 0, 1));
+    let info = classify_hop(Some(hop(gateway)), false).expect("a real next hop is usable");
+    assert_eq!(info.next_hop, NextHop::Via(gateway));
+}
+
+#[skuld::test]
+fn a_gateway_ipv6_default_classifies_as_via() {
+    let gateway: IpAddr = "2001:db8::1".parse().unwrap();
+    let info = classify_hop(Some(hop(gateway)), false).expect("a real next hop is usable");
+    assert_eq!(info.next_hop, NextHop::Via(gateway));
 }
 
 #[skuld::test]
@@ -109,7 +115,30 @@ fn classify_hop_accepts_a_real_next_hop() {
     let gateway = IpAddr::V4(Ipv4Addr::new(192, 168, 0, 1));
     let info = classify_hop(Some(hop(gateway)), true).expect("a real next hop is usable");
     assert_eq!(info.gateway_ip, gateway);
+    assert_eq!(info.next_hop, NextHop::Via(gateway));
     assert_eq!(info.interface_name, "ProtonVPN TUN");
     assert_eq!(info.interface_index, 42);
     assert!(info.ipv6_available);
+}
+
+// macOS's on-link mapping =============================================================================================
+//
+// Pure and platform-independent, so it is testable on every host regardless
+// of which platform's `get_default_gateway_info` calls it. macOS has no
+// interface-scoped IPv4 bypass form (`routing.rs`), so on-link must stay a
+// refusal there even though Windows now accepts it.
+
+#[skuld::test]
+fn reject_macos_on_link_refuses_on_link_as_no_default_route() {
+    let info = classify_hop(Some(hop(IpAddr::V4(Ipv4Addr::UNSPECIFIED))), false).unwrap();
+    let err = reject_macos_on_link(info).expect_err("macOS must still refuse on-link");
+    assert!(matches!(err, GatewayError::NoDefaultRoute), "got {err:?}");
+}
+
+#[skuld::test]
+fn reject_macos_on_link_passes_a_real_gateway_through_unchanged() {
+    let gateway = IpAddr::V4(Ipv4Addr::new(192, 168, 0, 1));
+    let info = classify_hop(Some(hop(gateway)), true).unwrap();
+    let passed = reject_macos_on_link(info.clone()).expect("a real gateway must not be refused");
+    assert_eq!(passed, info);
 }

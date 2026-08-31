@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
 use crate::error::{CommandFailure, RouteCommandError, RoutingError};
-use crate::gateway::{get_default_gateway_info, tun_ipv6_available, GatewayInfo};
+use crate::gateway::{self, get_default_gateway_info, tun_ipv6_available, GatewayInfo, NextHop};
 
 /// Total number of routing subprocess spawns this process has performed.
 /// Incremented once per command executed. Exposed so
@@ -80,6 +80,18 @@ pub fn planned_routes(server_ip: IpAddr) -> Vec<RouteId> {
     ids
 }
 
+/// The [`state::RouteForm`] this install's own IPv4 bypass takes, from the
+/// [`NextHop`] [`gateway::upstream_route`]/[`get_default_gateway_info`]
+/// resolved for it — the fact `install`'s own persisted record and
+/// `SystemRoutes`' teardown command builder both need to reconstruct the
+/// matching delete.
+fn route_form_of(gateway: &GatewayInfo) -> state::RouteForm {
+    match gateway.next_hop {
+        NextHop::Via(_) => state::RouteForm::Via,
+        NextHop::OnLink => state::RouteForm::OnLink,
+    }
+}
+
 // Command builders ====================================================================================================
 
 /// One route-install command, tagged with the route it acts on (so a setup
@@ -136,8 +148,10 @@ impl RouteCommand {
 /// 2. `128.0.0.0/1` via TUN — captures second half of IPv4 space
 /// 3. `::/1` via TUN — captures first half of IPv6 space
 /// 4. `8000::/1` via TUN — captures second half of IPv6 space
-/// 5. Server bypass — `<server_ip>` via `gateway.gateway_ip` (IPv4 server) or
-///    `gateway.interface_name` (IPv6 server)
+/// 5. Server bypass — `<server_ip>` via `gateway.next_hop`'s gateway (IPv4
+///    server, [`NextHop::Via`]), the interface (IPv4 server, on-link —
+///    [`NextHop::OnLink`], Windows only), or `gateway.interface_name` (IPv6
+///    server)
 ///
 /// Routes 3 and 4 are non-fatal when `tun_ipv6_available` is false — see
 /// [`SetupCommand`].
@@ -149,9 +163,9 @@ impl RouteCommand {
 /// `/128`) gateway bypass for loopback would hijack all loopback traffic to a
 /// gateway that cannot reach it.
 ///
-/// When `server_ip` is IPv6, `gateway.gateway_ip` is unused — the bypass route is
-/// interface-based because reliable IPv6 gateway detection is not available on all
-/// platforms.
+/// When `server_ip` is IPv6, `gateway.gateway_ip`/`next_hop` is unused — the
+/// bypass route is interface-based because reliable IPv6 gateway detection is
+/// not available on all platforms.
 pub fn build_setup_commands(
     tun_name: &str,
     server_ip: IpAddr,
@@ -169,18 +183,21 @@ pub fn build_setup_commands(
 
 /// Build the shell commands to tear down split routing (IPv4 + IPv6 splits and
 /// server bypass). `original_gateway`, when known, scopes the Windows IPv4
-/// bypass delete — see [`platform_bypass_teardown_command`].
+/// bypass delete; `route_form` picks which IPv4 delete shape — see
+/// [`platform_bypass_teardown_command`].
 pub(crate) fn build_teardown_commands(
     tun_name: &str,
     server_ip: IpAddr,
     interface_name: &str,
     original_gateway: Option<IpAddr>,
+    route_form: state::RouteForm,
 ) -> Vec<RouteCommand> {
     let mut cmds = platform_split_teardown_commands(tun_name);
     cmds.extend(platform_bypass_teardown_command(
         server_ip,
         interface_name,
         original_gateway,
+        route_form,
     ));
     cmds
 }
@@ -606,11 +623,13 @@ fn run_teardown_commands<R>(
 /// persisted it — falls back to the old unscoped delete). Returns the ids
 /// still believed installed when done (empty on full success) — the caller
 /// decides whether to clear or keep the state file from that.
+#[allow(clippy::too_many_arguments)] // private test/production seam — bundling into a struct adds more noise than the warning
 pub(crate) fn teardown_routes<R>(
     tun_name: &str,
     server_ip: IpAddr,
     interface_name: &str,
     original_gateway: Option<IpAddr>,
+    route_form: state::RouteForm,
     installed: &[RouteId],
     runner: R,
     checkpoint: impl FnMut(&[RouteId]),
@@ -618,10 +637,11 @@ pub(crate) fn teardown_routes<R>(
 where
     R: Fn(&[String], BestEffortPhase) -> Result<(), CommandFailure>,
 {
-    let cmds: Vec<RouteCommand> = build_teardown_commands(tun_name, server_ip, interface_name, original_gateway)
-        .into_iter()
-        .filter(|c| installed.contains(&c.id))
-        .collect();
+    let cmds: Vec<RouteCommand> =
+        build_teardown_commands(tun_name, server_ip, interface_name, original_gateway, route_form)
+            .into_iter()
+            .filter(|c| installed.contains(&c.id))
+            .collect();
     let mut still_installed = installed.to_vec();
     run_teardown_commands(
         &cmds,
@@ -687,6 +707,7 @@ where
             groups[i].server_ip,
             &groups[i].interface_name,
             groups[i].original_gateway,
+            groups[i].route_form,
         )
         .into_iter()
         .filter(|c| groups[i].installed.contains(&c.id))
@@ -732,6 +753,7 @@ fn sweep_leftover_before_install<R>(
             server_ip: leftover.server_ip,
             interface_name: leftover.interface_name,
             original_gateway: leftover.original_gateway,
+            route_form: leftover.route_form,
             installed: leftover.installed,
         });
     }
@@ -758,6 +780,90 @@ fn sweep_leftover_before_install<R>(
     persisted.stale.retain(|g| !g.installed.is_empty());
     if let Err(e) = state::save(state_dir, persisted, owner) {
         warn!(error = %e, "failed to checkpoint stale-route sweep result");
+    }
+}
+
+/// Best-effort delete a leftover `ServerBypass` route to `dest`, so
+/// [`default_gateway`](SystemRouting::default_gateway)'s upstream-route query
+/// cannot read back Hole's own stale bypass instead of a real route.
+///
+/// A `/32` host route is the longest prefix that exists, so a query for
+/// `dest` matches Hole's own bypass ahead of every other route once one is
+/// installed — harmless while the run that installed it owns it, wrong once
+/// that run is gone. Teardown is a [`BestEffortPhase`], so a `route delete`
+/// that exits non-zero leaves the route in the table (see
+/// `run_teardown_command`); this re-attempts exactly that delete, scoped to
+/// records whose own `server_ip` is `dest` — a leftover bypass to a
+/// different server cannot poison this query, since the query is itself
+/// destination-scoped, and deleting it here would be an unscoped extra
+/// deletion. Checks both the primary record and every carried-forward
+/// `stale` group, since either can hold a `ServerBypass` a prior sweep could
+/// not confirm gone.
+fn clear_stale_server_bypass<R>(state_dir: &Path, owner: Option<(u32, u32)>, dest: IpAddr, runner: R)
+where
+    R: Fn(&[String], BestEffortPhase) -> Result<(), CommandFailure>,
+{
+    let Some(mut leftover) = state::load(state_dir) else {
+        return;
+    };
+    let mut changed = false;
+
+    if leftover.server_ip == dest {
+        changed |= run_stale_bypass_delete(
+            dest,
+            &leftover.interface_name,
+            leftover.original_gateway,
+            leftover.route_form,
+            &mut leftover.installed,
+            &runner,
+        );
+    }
+    for group in &mut leftover.stale {
+        if group.server_ip == dest {
+            changed |= run_stale_bypass_delete(
+                dest,
+                &group.interface_name,
+                group.original_gateway,
+                group.route_form,
+                &mut group.installed,
+                &runner,
+            );
+        }
+    }
+    leftover.stale.retain(|g| !g.installed.is_empty());
+
+    if changed {
+        if let Err(e) = state::save(state_dir, &leftover, owner) {
+            warn!(error = %e, "failed to checkpoint stale server-bypass clear before gateway query");
+        }
+    }
+}
+
+/// Run `dest`'s `ServerBypass` teardown command, if `installed` names one,
+/// narrowing `installed` on confirmed delete. Returns whether `installed`
+/// changed.
+fn run_stale_bypass_delete<R>(
+    dest: IpAddr,
+    interface_name: &str,
+    original_gateway: Option<IpAddr>,
+    route_form: state::RouteForm,
+    installed: &mut Vec<RouteId>,
+    runner: &R,
+) -> bool
+where
+    R: Fn(&[String], BestEffortPhase) -> Result<(), CommandFailure>,
+{
+    if !installed.contains(&RouteId::ServerBypass) {
+        return false;
+    }
+    let Some(cmd) = platform_bypass_teardown_command(dest, interface_name, original_gateway, route_form) else {
+        return false;
+    };
+    if run_teardown_command(&cmd, BestEffortPhase::RecoverBypass, runner) {
+        installed.retain(|id| *id != RouteId::ServerBypass);
+        true
+    } else {
+        false
     }
 }
 
@@ -1051,6 +1157,7 @@ where
         let server_ip = loaded.server_ip;
         let interface_name = loaded.interface_name.clone();
         let original_gateway = loaded.original_gateway;
+        let route_form = loaded.route_form;
 
         // Merge the primary record and every carried-forward `stale` group
         // into one canonical set before anything runs. `state::coalesce`
@@ -1064,6 +1171,7 @@ where
             server_ip,
             interface_name: interface_name.clone(),
             original_gateway,
+            route_form,
             installed: loaded.installed,
         };
         let mut all_groups = loaded.stale;
@@ -1088,6 +1196,7 @@ where
                 && g.server_ip == server_ip
                 && g.interface_name == interface_name
                 && g.original_gateway == original_gateway
+                && g.route_form == route_form
         };
 
         let mut persisted = state::RouteState {
@@ -1096,6 +1205,7 @@ where
             server_ip,
             interface_name: interface_name.clone(),
             original_gateway,
+            route_form,
             installed: Vec::new(),
             stale: Vec::new(),
         };
@@ -1257,13 +1367,28 @@ pub trait Routing: Send + Sync {
         gateway: &GatewayInfo,
     ) -> Result<Self::Installed, RoutingError>;
 
-    /// Returns the current default gateway that the *next* call to
-    /// [`install`](Self::install) will bypass the tunnel through.
-    /// Lives on the trait (not as a free function) so mocks can stub a
-    /// predictable gateway without calling the real OS — without this
-    /// seam, every consumer unit test would depend on the host having a
-    /// route to the Internet.
-    fn default_gateway(&self) -> Result<GatewayInfo, RoutingError>;
+    /// Returns the upstream route to `dest` that the *next* call to
+    /// [`install`](Self::install) — passed the same `server_ip` — will bypass
+    /// the tunnel through. Lives on the trait (not as a free function) so
+    /// mocks can stub a predictable gateway without calling the real OS —
+    /// without this seam, every consumer unit test would depend on the host
+    /// having a route to the Internet.
+    ///
+    /// Destination-scoped so the query answers "what route reaches `dest`
+    /// specifically", not "what is the host's default route" — the two
+    /// answers can differ, and `install`'s bypass must point at the route
+    /// this call named. For "is there a default route at all" with no
+    /// specific destination (the diagnostics poll), see
+    /// [`default_route`](Self::default_route) instead — passing a sentinel
+    /// destination here would silently conflate the two questions.
+    fn default_gateway(&self, dest: IpAddr) -> Result<GatewayInfo, RoutingError>;
+
+    /// Returns the host's default route, independent of any specific
+    /// destination. For the diagnostics poll, which runs with no session
+    /// (and so no `server_ip`) and answers "can this host reach the
+    /// Internet at all" — see [`default_gateway`](Self::default_gateway) for
+    /// the server-scoped counterpart `install` actually bypasses through.
+    fn default_route(&self) -> Result<GatewayInfo, RoutingError>;
 
     /// RAII guard returned by [`install_failclosed_cover`](Self::install_failclosed_cover).
     /// Dropping it disengages the fail-closed cover. `Send` so a cutover
@@ -1382,6 +1507,7 @@ impl SystemRouting {
             server_ip,
             interface_name,
             persisted.original_gateway,
+            persisted.route_form,
             confirmed,
             runner,
             |ids| {
@@ -1435,7 +1561,12 @@ impl Routing for SystemRouting {
         )
     }
 
-    fn default_gateway(&self) -> Result<GatewayInfo, RoutingError> {
+    fn default_gateway(&self, dest: IpAddr) -> Result<GatewayInfo, RoutingError> {
+        clear_stale_server_bypass(&self.state_dir, self.owner, dest, exec_one::<BestEffortPhase>);
+        gateway::upstream_route(dest).map_err(|e| RoutingError::Gateway(e.to_string()))
+    }
+
+    fn default_route(&self) -> Result<GatewayInfo, RoutingError> {
         get_default_gateway_info().map_err(|e| RoutingError::Gateway(e.to_string()))
     }
 
@@ -1520,6 +1651,7 @@ impl SystemRouting {
             server_ip,
             interface_name: interface_name.to_owned(),
             original_gateway: Some(gateway.gateway_ip),
+            route_form: route_form_of(gateway),
             installed: Vec::new(),
             stale: Vec::new(),
         };
@@ -1600,6 +1732,7 @@ impl SystemRouting {
             server_ip,
             interface_name: interface_name.to_owned(),
             original_gateway: gateway.gateway_ip,
+            route_form: route_form_of(gateway),
             state_dir: self.state_dir.clone(),
             owner: self.owner,
             installed,
@@ -1620,6 +1753,8 @@ pub struct SystemRoutes {
     /// the Windows IPv4 bypass delete (see CONTRIBUTING's Route ownership
     /// section).
     original_gateway: IpAddr,
+    /// The IPv4 bypass route's form — see [`state::RouteForm`].
+    route_form: state::RouteForm,
     state_dir: PathBuf,
     /// Forwarded to every checkpoint `state::save` in `Drop` — same
     /// uid/gid-chown contract as `SystemRouting.owner`.
@@ -1650,6 +1785,7 @@ impl Drop for SystemRoutes {
             server_ip: self.server_ip,
             interface_name: self.interface_name.clone(),
             original_gateway: Some(self.original_gateway),
+            route_form: self.route_form,
             installed: self.installed.clone(),
             stale: self.stale.clone(),
         };
@@ -1659,6 +1795,7 @@ impl Drop for SystemRoutes {
             self.server_ip,
             &self.interface_name,
             Some(self.original_gateway),
+            self.route_form,
             &self.installed,
             exec_one::<BestEffortPhase>,
             |ids| {
@@ -1777,19 +1914,31 @@ fn platform_setup_commands(
     // see `build_setup_commands` (loopback is on-link, a gateway bypass would
     // hijack it).
     if !server_ip.to_canonical().is_loopback() {
-        let original_gateway = gateway.gateway_ip;
         cmds.push(SetupCommand::fatal(
             RouteId::ServerBypass,
-            match server_ip {
-                IpAddr::V4(_) => vec![
+            match (server_ip, gateway.next_hop) {
+                // On-link: no gateway to name, so this names the interface
+                // instead — the same `netsh interface ip` command family the
+                // IPv6 arm below already uses, unlike the gateway form's
+                // classic `route add`.
+                (IpAddr::V4(_), NextHop::OnLink) => vec![
+                    "netsh".into(),
+                    "interface".into(),
+                    "ip".into(),
+                    "add".into(),
+                    "route".into(),
+                    format!("{server_ip}/32"),
+                    gateway.interface_name.clone(),
+                ],
+                (IpAddr::V4(_), NextHop::Via(via)) => vec![
                     "route".into(),
                     "add".into(),
                     format!("{server_ip}"),
                     "mask".into(),
                     "255.255.255.255".into(),
-                    format!("{original_gateway}"),
+                    format!("{via}"),
                 ],
-                IpAddr::V6(_) => vec![
+                (IpAddr::V6(_), _) => vec![
                     "netsh".into(),
                     "interface".into(),
                     "ipv6".into(),
@@ -1859,18 +2008,24 @@ fn platform_split_teardown_commands(tun_name: &str) -> Vec<RouteCommand> {
     ]
 }
 
-/// `original_gateway`, when known, is appended as the `route delete`
-/// gateway operand for an IPv4 destination — `route.exe`'s own help
-/// confirms DELETE accepts (and does not require) a gateway argument, and
-/// unlike macOS, that argument DOES scope which entry is deleted (see
+/// `route_form` picks the IPv4 delete shape: [`state::RouteForm::OnLink`]
+/// deletes the interface-scoped form via `netsh interface ip delete route`
+/// (same command family the IPv6 arm below already uses, and the setup-side
+/// mirror in `platform_setup_commands`), never through classic `route
+/// delete` — that form was never told a gateway, so it has none to scope the
+/// delete with. [`state::RouteForm::Via`] keeps `original_gateway`, when
+/// known, appended as the `route delete` gateway operand — `route.exe`'s own
+/// help confirms DELETE accepts (and does not require) a gateway argument,
+/// and unlike macOS, that argument DOES scope which entry is deleted (see
 /// CONTRIBUTING's Route ownership section). `None` (a record migrated from
-/// schema 1/2, which never persisted a gateway) falls back to the old
+/// schema 1/2/3, which never persisted a gateway) falls back to the old
 /// unscoped delete — a disclosed residual, not a silent skip.
 #[cfg(target_os = "windows")]
 fn platform_bypass_teardown_command(
     server_ip: IpAddr,
     interface_name: &str,
     original_gateway: Option<IpAddr>,
+    route_form: state::RouteForm,
 ) -> Option<RouteCommand> {
     // No bypass was installed for a loopback server, so none to delete.
     if server_ip.to_canonical().is_loopback() {
@@ -1879,6 +2034,15 @@ fn platform_bypass_teardown_command(
     Some(RouteCommand::new(
         RouteId::ServerBypass,
         match server_ip {
+            IpAddr::V4(_) if route_form == state::RouteForm::OnLink => vec![
+                "netsh".into(),
+                "interface".into(),
+                "ip".into(),
+                "delete".into(),
+                "route".into(),
+                format!("{server_ip}/32"),
+                interface_name.into(),
+            ],
             IpAddr::V4(_) => {
                 let mut argv = vec![
                     "route".into(),
@@ -2060,12 +2224,18 @@ fn platform_split_teardown_commands(_tun_name: &str) -> Vec<RouteCommand> {
 /// abort on the stale name rather than delete the bypass. `original_gateway`
 /// is likewise unused: macOS `route delete` never reads the gateway (see
 /// CONTRIBUTING's Route ownership section), so it cannot scope anything here
-/// — unlike the Windows counterpart.
+/// — unlike the Windows counterpart. `route_form` is always
+/// [`state::RouteForm::Via`] here: macOS has no interface-scoped IPv4 bypass
+/// form, so `reject_macos_on_link` refuses on-link before `install` is ever
+/// reached — kept as a parameter only so this shares
+/// [`build_teardown_commands`]'s one, platform-independent signature with the
+/// Windows arm above.
 #[cfg(target_os = "macos")]
 fn platform_bypass_teardown_command(
     server_ip: IpAddr,
     _interface_name: &str,
     _original_gateway: Option<IpAddr>,
+    _route_form: state::RouteForm,
 ) -> Option<RouteCommand> {
     // No bypass was installed for a loopback server, so none to delete.
     if server_ip.to_canonical().is_loopback() {

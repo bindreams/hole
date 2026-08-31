@@ -14,7 +14,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
-use tun_engine::gateway::GatewayInfo;
+use tun_engine::gateway::{GatewayInfo, NextHop};
 use tun_engine::routing::failclosed::lockdown_state;
 use tun_engine::routing::{self as routing, state as route_state, Routing};
 use tun_engine::RoutingError;
@@ -156,7 +156,14 @@ impl Drop for MockRunning {
 
 struct MockRouting {
     state_dir: PathBuf,
+    /// Fails BOTH `default_gateway` (server-scoped) and `default_route`
+    /// (diagnostics) — "the gateway is unavailable" as a caller-independent
+    /// fact about the mocked host.
     fail_gateway: AtomicBool,
+    /// Fails ONLY `default_gateway` (server-scoped), leaving `default_route`
+    /// (diagnostics) succeeding — proves the diagnostics poll does not go
+    /// through the server-scoped path (`the_diagnostics_probe_does_not_take_a_server`).
+    fail_server_gateway_only: AtomicBool,
     /// Number of `release_all_covers` calls, so a test can assert the
     /// unconditional escape fired exactly once (or not at all). `Arc`-shared
     /// (mirroring `MockProxy::traffic`) so a test can clone it out BEFORE
@@ -171,6 +178,7 @@ impl MockRouting {
         Self {
             state_dir,
             fail_gateway: AtomicBool::new(false),
+            fail_server_gateway_only: AtomicBool::new(false),
             release_all_calls: Arc::new(AtomicU32::new(0)),
             fail_release: Arc::new(AtomicBool::new(false)),
         }
@@ -180,6 +188,17 @@ impl MockRouting {
         Self {
             state_dir,
             fail_gateway: AtomicBool::new(true),
+            fail_server_gateway_only: AtomicBool::new(false),
+            release_all_calls: Arc::new(AtomicU32::new(0)),
+            fail_release: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    fn failing_server_gateway_only(state_dir: PathBuf) -> Self {
+        Self {
+            state_dir,
+            fail_gateway: AtomicBool::new(false),
+            fail_server_gateway_only: AtomicBool::new(true),
             release_all_calls: Arc::new(AtomicU32::new(0)),
             fail_release: Arc::new(AtomicBool::new(false)),
         }
@@ -200,6 +219,10 @@ impl Routing for MockRouting {
             server_ip,
             interface_name: interface_name.to_owned(),
             original_gateway: Some(gateway.gateway_ip),
+            route_form: match gateway.next_hop {
+                NextHop::Via(_) => route_state::RouteForm::Via,
+                NextHop::OnLink => route_state::RouteForm::OnLink,
+            },
             installed: routing::planned_routes(server_ip),
             stale: Vec::new(),
         };
@@ -210,12 +233,31 @@ impl Routing for MockRouting {
         })
     }
 
-    fn default_gateway(&self) -> Result<GatewayInfo, RoutingError> {
+    fn default_gateway(&self, _dest: IpAddr) -> Result<GatewayInfo, RoutingError> {
+        if self.fail_gateway.load(Ordering::SeqCst) || self.fail_server_gateway_only.load(Ordering::SeqCst) {
+            return Err(RoutingError::Gateway("mock gateway failure".into()));
+        }
+        Ok(GatewayInfo {
+            gateway_ip: IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)),
+            next_hop: NextHop::Via(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1))),
+            interface_name: "MockEthernet".into(),
+            interface_index: 1,
+            ipv6_available: false,
+        })
+    }
+
+    /// Deliberately ignores `fail_server_gateway_only` — that flag configures
+    /// the SERVER-SCOPED mock failure `default_gateway` returns, and this is
+    /// the destination-independent diagnostics probe. If diagnostics routed
+    /// through the server-scoped mock instead (the bug this split fixes),
+    /// `the_diagnostics_probe_does_not_take_a_server` would catch it.
+    fn default_route(&self) -> Result<GatewayInfo, RoutingError> {
         if self.fail_gateway.load(Ordering::SeqCst) {
             return Err(RoutingError::Gateway("mock gateway failure".into()));
         }
         Ok(GatewayInfo {
             gateway_ip: IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)),
+            next_hop: NextHop::Via(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1))),
             interface_name: "MockEthernet".into(),
             interface_index: 1,
             ipv6_available: false,
@@ -332,6 +374,14 @@ fn failing_proxy() -> Arc<Mutex<ProxyManager<MockProxy, MockRouting>>> {
 fn gateway_failing_proxy() -> Arc<Mutex<ProxyManager<MockProxy, MockRouting>>> {
     let state_dir = tempfile::tempdir().unwrap().keep();
     let routing = MockRouting::failing_gateway(state_dir);
+    Arc::new(Mutex::new(ProxyManager::new(MockProxy::new(), routing)))
+}
+
+/// Only the SERVER-SCOPED `default_gateway` fails; `default_route`
+/// (diagnostics) still succeeds.
+fn server_gateway_failing_proxy() -> Arc<Mutex<ProxyManager<MockProxy, MockRouting>>> {
+    let state_dir = tempfile::tempdir().unwrap().keep();
+    let routing = MockRouting::failing_server_gateway_only(state_dir);
     Arc::new(Mutex::new(ProxyManager::new(MockProxy::new(), routing)))
 }
 
@@ -1687,6 +1737,31 @@ fn diagnostics_network_error_when_gateway_unavailable() {
         // validation state.
         assert_eq!(diag.vpn_server, "unknown");
         assert_eq!(diag.internet, "unknown");
+
+        drop(client);
+        handle.abort();
+        let _ = handle.await;
+    });
+}
+
+/// The diagnostics poll runs with no session (and so no `server_ip`) —
+/// `ProxyManager::default_route` must not go through the server-scoped
+/// `Routing::default_gateway`, which a probe with no server could not even
+/// call correctly. `server_gateway_failing_proxy` fails ONLY the
+/// server-scoped method, so this would read `network: "error"` if
+/// diagnostics routed through it instead.
+#[skuld::test]
+fn the_diagnostics_probe_does_not_take_a_server() {
+    rt().block_on(async {
+        let path = test_socket_path("diag-no-server");
+        let server = IpcServer::bind(&path, server_gateway_failing_proxy(), "test").unwrap();
+        let handle = tokio::spawn(async move {
+            server.run_once().await.unwrap();
+        });
+
+        let mut client = TestClient::connect(&path).await;
+        let diag = get_diagnostics(&mut client).await;
+        assert_eq!(diag.network, "ok");
 
         drop(client);
         handle.abort();

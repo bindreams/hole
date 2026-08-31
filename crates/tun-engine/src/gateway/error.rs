@@ -43,8 +43,12 @@ pub enum GatewayError {
     )]
     NoDefaultRoute,
 
-    /// A default route exists but is **on-link** — it names no next-hop gateway,
-    /// so there is nothing for the server-bypass route to point at.
+    /// Currently unconstructed: an on-link default route classifies as
+    /// [`crate::gateway::NextHop::OnLink`] on Windows (which can build an
+    /// interface-scoped bypass for it) and as `NoDefaultRoute` on macOS
+    /// (which cannot — see `crate::gateway::reject_macos_on_link`). Kept
+    /// rather than deleted for the platform-independent copy below, which a
+    /// future macOS-support producer can reuse verbatim.
     ///
     /// The copy names two causes and picks neither. On-link is equally the
     /// signature of another VPN's tunnel adapter and of a point-to-point

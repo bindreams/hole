@@ -23,17 +23,37 @@ pub use platform::best_route;
 
 use std::net::IpAddr;
 
-use tracing::warn;
+use tracing::{debug, warn};
 
 use crate::net::bind_to_interface_v6;
+
+/// The upstream route's form: a real gateway to bypass through, or on-link
+/// (no gateway — the destination is directly reachable off the interface
+/// itself). `routing.rs`'s IPv4 bypass builder reads this to choose which
+/// route form to emit; `gateway_ip` (below) stays the raw address either way
+/// for callers not yet updated to read it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NextHop {
+    /// A real next-hop gateway to route the bypass through.
+    Via(IpAddr),
+    /// The route has no gateway — the destination is directly attached to
+    /// the interface.
+    OnLink,
+}
 
 /// Gateway detection result, bundling the gateway IP with the original
 /// interface name.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GatewayInfo {
     /// Default gateway IP address (IPv4 in practice — the default-route lookup
-    /// is issued for the IPv4 unspecified address).
+    /// is issued for the IPv4 unspecified address). Unspecified
+    /// (`0.0.0.0`/`::`) when [`next_hop`](Self::next_hop) is
+    /// [`NextHop::OnLink`] — prefer `next_hop` where the on-link/gateway
+    /// distinction matters, since a bare `IpAddr` cannot tell "the unspecified
+    /// address" from "no gateway" apart.
     pub gateway_ip: IpAddr,
+    /// The route's form — see [`NextHop`].
+    pub next_hop: NextHop,
     /// Platform-appropriate interface name for route commands.
     /// On Windows: connection alias (e.g., "Wi-Fi"). On macOS: BSD name (e.g., "en0").
     pub interface_name: String,
@@ -89,25 +109,52 @@ pub fn get_default_gateway_info() -> Result<GatewayInfo, GatewayError> {
         .unwrap_or(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
 
     let ipv6_available = probe_ipv6(interface_index);
-    classify_hop(
+    let info = classify_hop(
         Some(RouteHop {
             next_hop,
             interface_index,
             interface_alias,
         }),
         ipv6_available,
-    )
+    )?;
+    reject_macos_on_link(info)
+}
+
+/// Detect the upstream route to `dest` — the destination-scoped counterpart
+/// of [`get_default_gateway_info`], used where the caller has a specific
+/// server address to route around (`SystemRouting::default_gateway`).
+///
+/// On Windows this asks `GetBestRoute2` for `dest` specifically. `default-net`
+/// (the macOS backend) has no destination-scoped query — it can only answer
+/// "what is the default route" — so `dest` is unused there and the answer is
+/// always [`get_default_gateway_info`]'s.
+#[cfg(target_os = "windows")]
+pub fn upstream_route(dest: IpAddr) -> Result<GatewayInfo, GatewayError> {
+    let hop = platform::best_route(dest)?;
+    let ipv6_available = hop.as_ref().map(|h| probe_ipv6(h.interface_index)).unwrap_or(false);
+    classify_hop(hop, ipv6_available)
+}
+
+/// Detect the upstream route to `dest` — see the Windows doc above for why
+/// `dest` is unused on macOS.
+#[cfg(target_os = "macos")]
+pub fn upstream_route(_dest: IpAddr) -> Result<GatewayInfo, GatewayError> {
+    get_default_gateway_info()
 }
 
 /// Turn a resolved route into a [`GatewayInfo`], or into the reason Hole cannot
 /// use it.
 ///
 /// Every branch keys on a **structural** property of what the OS returned — the
-/// absence of a route, an unspecified next hop, an unnamed interface. None of
-/// them inspects the adapter's type or name: separating "another VPN's tunnel"
-/// from "a point-to-point physical link" would take an `IfType` allowlist, which
-/// is the heuristic class this codebase does not allow, and `NoUsableGateway`'s
-/// copy names both causes instead of guessing.
+/// absence of a route, an unnamed interface. None of them inspects the
+/// adapter's type or name: separating "another VPN's tunnel" from "a
+/// point-to-point physical link" would take an `IfType` allowlist, which is
+/// the heuristic class this codebase does not allow. An unspecified next hop
+/// is a route **form** (on-link), not a refusal — see [`NextHop`]; a caller
+/// that cannot use an on-link route (macOS has no interface-scoped IPv4
+/// bypass — see `reject_macos_on_link`) rejects it itself, after this
+/// classification, rather than this shared function guessing on the caller's
+/// behalf.
 ///
 /// The refusal branches carry the hop into the error rather than dropping it —
 /// see `gateway/error.rs` for why that is the guarantee and the `warn!` is only
@@ -130,27 +177,44 @@ pub(crate) fn classify_hop(hop: Option<RouteHop>, ipv6_available: bool) -> Resul
         });
     }
 
-    if hop.next_hop.is_unspecified() {
-        warn!(
+    let next_hop = if hop.next_hop.is_unspecified() {
+        debug!(
             interface_alias = %hop.interface_alias,
             interface_index = hop.interface_index,
-            "default route is on-link — no next-hop gateway to build the server bypass through"
+            "default route is on-link — no next-hop gateway"
         );
-        return Err(GatewayError::NoUsableGateway {
-            detail: HopDetail {
-                interface_alias: hop.interface_alias,
-                interface_index: hop.interface_index,
-                next_hop: hop.next_hop,
-            },
-        });
-    }
+        NextHop::OnLink
+    } else {
+        NextHop::Via(hop.next_hop)
+    };
 
     Ok(GatewayInfo {
         gateway_ip: hop.next_hop,
+        next_hop,
         interface_name: hop.interface_alias,
         interface_index: hop.interface_index,
         ipv6_available,
     })
+}
+
+/// macOS has no interface-scoped IPv4 bypass form (`routing.rs`'s Windows
+/// IPv4 bypass builder does; the macOS one does not), so an on-link default
+/// route stays a refusal there even though [`classify_hop`] now accepts it.
+/// `NoDefaultRoute` rather than `NoUsableGateway`: that message described
+/// exactly the condition Windows now supports, so reusing it where it is
+/// still unsupported would tell a macOS user something false about what
+/// Hole can do.
+///
+/// Pure and platform-independent so it is testable without macOS: the
+/// platform gate lives at its one call site
+/// ([`get_default_gateway_info`](self)'s `#[cfg(target_os = "macos")]` arm),
+/// not in this function.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn reject_macos_on_link(info: GatewayInfo) -> Result<GatewayInfo, GatewayError> {
+    match info.next_hop {
+        NextHop::OnLink => Err(GatewayError::NoDefaultRoute),
+        NextHop::Via(_) => Ok(info),
+    }
 }
 
 // Interface index detection ===========================================================================================

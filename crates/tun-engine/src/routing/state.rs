@@ -20,7 +20,28 @@ use super::{planned_routes, RouteId};
 /// shape. Discarding an old file instead is not an option here: the file is
 /// the only record of what a crashed run leaked, so dropping it strands the
 /// host on routes pointing at a dead TUN.
-pub const SCHEMA_VERSION: u32 = 3;
+pub const SCHEMA_VERSION: u32 = 4;
+
+/// The IPv4 server-bypass route's form when this record's own routes went
+/// in — [`crate::gateway::NextHop`] at install time, persisted so a later
+/// teardown (possibly a different process, after a crash) rebuilds the
+/// matching delete command instead of guessing.
+///
+/// A separate field from `original_gateway`, not folded into its `None`
+/// case: "no gateway was ever recorded" (a schema 1/2/3 migration, which
+/// predates on-link support entirely) and "the route WAS on-link" are
+/// different facts. Collapsing them would make a migrated record — which
+/// really did have a real gateway, just an unrecorded one — look on-link,
+/// emitting the interface-scoped delete for a route that was actually
+/// installed through a gateway. See CONTRIBUTING's Route ownership section.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RouteForm {
+    /// The bypass names a gateway (today's form).
+    Via,
+    /// The bypass names only the interface — there was no gateway to name.
+    OnLink,
+}
 
 /// Filename of the persisted state file under `state_dir`. Exported so
 /// external tooling (notably `scripts/network-reset.py`) can reference the
@@ -44,6 +65,11 @@ pub struct RouteState {
     /// unscoped form (a disclosed residual; see CONTRIBUTING's Route
     /// ownership section). A fresh schema-3 write always sets `Some`.
     pub original_gateway: Option<IpAddr>,
+    /// The form `original_gateway`'s bypass route was installed in — see
+    /// [`RouteForm`]. Migrated records default to [`RouteForm::Via`], same as
+    /// `original_gateway` defaulting to `None`: on-link support postdates
+    /// every schema this migrates from.
+    pub route_form: RouteForm,
     /// The routes that run got into the table. Recovery deletes these and
     /// nothing else — see [`RouteId`] for the delete-side selectivity this
     /// provides on top of.
@@ -68,6 +94,7 @@ pub struct StaleRecord {
     pub server_ip: IpAddr,
     pub interface_name: String,
     pub original_gateway: Option<IpAddr>,
+    pub route_form: RouteForm,
     pub installed: Vec<RouteId>,
 }
 
@@ -96,6 +123,7 @@ impl From<RouteStateV1> for RouteState {
             server_ip: old.server_ip,
             interface_name: old.interface_name,
             original_gateway: None,
+            route_form: RouteForm::Via,
             stale: Vec::new(),
         }
     }
@@ -124,7 +152,63 @@ impl From<RouteStateV2> for RouteState {
             interface_name: old.interface_name,
             installed: old.installed,
             original_gateway: None,
+            route_form: RouteForm::Via,
             stale: Vec::new(),
+        }
+    }
+}
+
+/// Schema 3: like [`RouteState`] but without `route_form` — a schema-3
+/// record predates on-link support entirely, so every route it names was
+/// installed through a real gateway.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RouteStateV3 {
+    version: u32,
+    tun_name: String,
+    server_ip: IpAddr,
+    interface_name: String,
+    original_gateway: Option<IpAddr>,
+    installed: Vec<RouteId>,
+    stale: Vec<StaleRecordV3>,
+}
+
+/// [`StaleRecord`] without `route_form`, matching [`RouteStateV3`]'s vintage.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StaleRecordV3 {
+    tun_name: String,
+    server_ip: IpAddr,
+    interface_name: String,
+    original_gateway: Option<IpAddr>,
+    installed: Vec<RouteId>,
+}
+
+impl From<StaleRecordV3> for StaleRecord {
+    fn from(old: StaleRecordV3) -> Self {
+        Self {
+            tun_name: old.tun_name,
+            server_ip: old.server_ip,
+            interface_name: old.interface_name,
+            original_gateway: old.original_gateway,
+            route_form: RouteForm::Via,
+            installed: old.installed,
+        }
+    }
+}
+
+impl From<RouteStateV3> for RouteState {
+    fn from(old: RouteStateV3) -> Self {
+        debug_assert_eq!(old.version, 3, "only load's version-3 arm may build this");
+        Self {
+            version: SCHEMA_VERSION,
+            tun_name: old.tun_name,
+            server_ip: old.server_ip,
+            interface_name: old.interface_name,
+            original_gateway: old.original_gateway,
+            route_form: RouteForm::Via,
+            installed: old.installed,
+            stale: old.stale.into_iter().map(StaleRecord::from).collect(),
         }
     }
 }
@@ -143,8 +227,9 @@ fn state_file(state_dir: &Path) -> PathBuf {
 
 /// Reduce a list of route-provenance groups to canonical form: groups
 /// sharing an identity — `tun_name`, `server_ip`, `interface_name`,
-/// `original_gateway`, the tuple that determines the teardown argv a group
-/// emits — merge into one whose `installed` is the union, each surviving
+/// `original_gateway`, `route_form`, the tuple that determines the teardown
+/// argv a group emits — merge into one whose `installed` is the union, each
+/// surviving
 /// group's `installed` is sanitized against `planned_routes(server_ip)` (an
 /// id with no possible teardown command can never drain, so it would pin the
 /// group non-empty forever), and a group left with an empty `installed` is
@@ -163,6 +248,7 @@ pub fn coalesce(groups: Vec<StaleRecord>) -> Vec<StaleRecord> {
                 && m.server_ip == g.server_ip
                 && m.interface_name == g.interface_name
                 && m.original_gateway == g.original_gateway
+                && m.route_form == g.route_form
         }) {
             Some(existing) => {
                 for id in g.installed {
@@ -242,6 +328,9 @@ pub fn load(state_dir: &Path) -> Option<RouteState> {
     };
     let parsed = if version == SCHEMA_VERSION {
         serde_json::from_slice::<RouteState>(&bytes)
+    } else if version == 3 {
+        tracing::info!(got = version, want = SCHEMA_VERSION, "migrating route-state forward");
+        serde_json::from_slice::<RouteStateV3>(&bytes).map(RouteState::from)
     } else if version == 2 {
         tracing::info!(got = version, want = SCHEMA_VERSION, "migrating route-state forward");
         serde_json::from_slice::<RouteStateV2>(&bytes).map(RouteState::from)

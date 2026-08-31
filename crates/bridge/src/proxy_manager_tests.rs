@@ -16,7 +16,7 @@ use std::time::Duration;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
-use tun_engine::gateway::GatewayInfo;
+use tun_engine::gateway::{GatewayInfo, NextHop};
 use tun_engine::routing::failclosed::lockdown_state;
 use tun_engine::routing::{self, state as route_state, RouteId, Routing};
 use tun_engine::RoutingError;
@@ -319,6 +319,10 @@ impl Routing for MockRouting {
             server_ip,
             interface_name: interface_name.to_owned(),
             original_gateway: Some(gateway.gateway_ip),
+            route_form: match gateway.next_hop {
+                NextHop::Via(_) => route_state::RouteForm::Via,
+                NextHop::OnLink => route_state::RouteForm::OnLink,
+            },
             installed: installed.clone(),
             stale: Vec::new(),
         };
@@ -356,12 +360,26 @@ impl Routing for MockRouting {
         })
     }
 
-    fn default_gateway(&self) -> Result<GatewayInfo, RoutingError> {
+    fn default_gateway(&self, _dest: IpAddr) -> Result<GatewayInfo, RoutingError> {
         if self.state.fail_gateway.load(Ordering::SeqCst) {
             return Err(RoutingError::Gateway("mock gateway failure".into()));
         }
         Ok(GatewayInfo {
             gateway_ip: self.gateway,
+            next_hop: NextHop::Via(self.gateway),
+            interface_name: "MockEthernet".into(),
+            interface_index: 1,
+            ipv6_available: false,
+        })
+    }
+
+    fn default_route(&self) -> Result<GatewayInfo, RoutingError> {
+        if self.state.fail_gateway.load(Ordering::SeqCst) {
+            return Err(RoutingError::Gateway("mock gateway failure".into()));
+        }
+        Ok(GatewayInfo {
+            gateway_ip: self.gateway,
+            next_hop: NextHop::Via(self.gateway),
             interface_name: "MockEthernet".into(),
             interface_index: 1,
             ipv6_available: false,

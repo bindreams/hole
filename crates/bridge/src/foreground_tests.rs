@@ -10,7 +10,7 @@ use std::net::{IpAddr, Ipv4Addr};
 use std::path::PathBuf;
 use tokio::io::AsyncBufReadExt as _;
 use tokio::task::JoinHandle;
-use tun_engine::gateway::GatewayInfo;
+use tun_engine::gateway::{GatewayInfo, NextHop};
 use tun_engine::routing::Routing;
 use tun_engine::RoutingError;
 
@@ -138,9 +138,19 @@ impl Routing for StubRouting {
             _state_dir: self.state_dir.clone(),
         })
     }
-    fn default_gateway(&self) -> Result<GatewayInfo, RoutingError> {
+    fn default_gateway(&self, _dest: IpAddr) -> Result<GatewayInfo, RoutingError> {
         Ok(GatewayInfo {
             gateway_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            next_hop: NextHop::Via(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+            interface_name: "StubIf".into(),
+            interface_index: 1,
+            ipv6_available: false,
+        })
+    }
+    fn default_route(&self) -> Result<GatewayInfo, RoutingError> {
+        Ok(GatewayInfo {
+            gateway_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            next_hop: NextHop::Via(IpAddr::V4(Ipv4Addr::LOCALHOST)),
             interface_name: "StubIf".into(),
             interface_index: 1,
             ipv6_available: false,
