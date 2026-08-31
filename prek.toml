@@ -64,7 +64,7 @@ name = "golangci-lint fmt (ex-ray)"
 # behaves identically locally and in CI. `fmt --diff` is check-only (the v2
 # formatters/gofumpt run). `crates/ex-ray` is the only Go module today; if a
 # second appears, extend this hook.
-entry = "bash -c 'cd crates/ex-ray && \"$(git rev-parse --show-toplevel)/.cache/golangci-lint/2.12.2/golangci-lint\" fmt --diff'"
+entry = "bash -c 'cd crates/ex-ray && \"$(git rev-parse --show-toplevel)/.cache/golangci-lint/golangci-lint\" fmt --diff'"
 language = "system"
 # types=["go"] means the hook is SKIPPED when no .go file is staged (same as the
 # Rust hooks). A `.golangci.yml`-only change still surfaces in CI's --all-files run.
@@ -77,7 +77,7 @@ name = "golangci-lint run (ex-ray)"
 # `run` = the v2 linters (incl. govet, which subsumes `go vet`). `fmt` and `run`
 # are both needed -- golangci-lint v2 separates formatting from linting. Same
 # bash-wrapper + absolute-cache-path rationale as `go-fmt` above.
-entry = "bash -c 'cd crates/ex-ray && \"$(git rev-parse --show-toplevel)/.cache/golangci-lint/2.12.2/golangci-lint\" run'"
+entry = "bash -c 'cd crates/ex-ray && \"$(git rev-parse --show-toplevel)/.cache/golangci-lint/golangci-lint\" run'"
 language = "system"
 types = ["go"]
 pass_filenames = false

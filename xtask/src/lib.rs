@@ -83,6 +83,9 @@ mod git_util_tests;
 #[path = "global_net_state_conformance_tests.rs"]
 mod global_net_state_conformance_tests;
 #[cfg(test)]
+#[path = "golangci_lint_tests.rs"]
+mod golangci_lint_tests;
+#[cfg(test)]
 #[path = "manifest_tests.rs"]
 mod manifest_tests;
 #[cfg(test)]
