@@ -158,7 +158,3 @@ fn from_sockaddr_inet(sa: &SOCKADDR_INET) -> IpAddr {
 #[cfg(test)]
 #[path = "windows_tests.rs"]
 mod windows_tests;
-
-#[cfg(test)]
-#[path = "nextest_group_tests.rs"]
-mod nextest_group_tests;

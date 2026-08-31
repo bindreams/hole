@@ -28,12 +28,12 @@
 //! a default run on an unelevated box runs it and fails loud; opting out is the
 //! explicit `SKULD_LABELS="!tun"` filter, and CI provisions the elevation.
 //!
-//! COUPLED NAME: `.config/nextest.toml`'s `global-net-state` filter matches this
+//! COUPLED NAME: `.config/nextest.toml`'s `global_net_state` filter matches this
 //! test by the `gateway_global_net_state_` prefix, serializing it against the
 //! other tests that mutate global OS network state across binaries. Renaming it
-//! without updating that filter would silently drop it from the group — which
-//! `nextest_group_filter_covers_every_serialized_net_test` (tun-engine lib,
-//! unprivileged) fails on.
+//! without updating both that filter AND the `GLOBAL_NET_STATE` label below
+//! would silently drop it from the group — which `cargo xtask
+//! verify-global-net-state-labels` (run in CI, unprivileged) fails on.
 
 hole_test_observability::register!();
 
@@ -44,10 +44,20 @@ fn main() {
 #[skuld::label]
 const TUN: skuld::Label;
 
+/// Binds to `.config/nextest.toml`'s `global_net_state` test-group via
+/// `cargo xtask verify-global-net-state-labels` — see that guard's own doc
+/// for what it checks. This is a THIRD binary alongside the lib and
+/// `hole-bridge`'s privileged tests, each needing its own declaration (skuld
+/// requires exactly one per binary).
+#[skuld::label]
+const GLOBAL_NET_STATE: skuld::Label;
+
 #[cfg(target_os = "windows")]
 mod windows_impl {
-    use super::TUN;
+    use super::{GLOBAL_NET_STATE, TUN};
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc::{channel, Sender};
+    use std::sync::Arc;
 
     use windows::Win32::Foundation::{ERROR_NOT_FOUND, HANDLE, NO_ERROR};
     use windows::Win32::NetworkManagement::IpHelper::{
@@ -97,6 +107,86 @@ mod windows_impl {
         /// DAD is still running, or the address is not registered yet. The only
         /// state worth waiting through — wait for the next notification.
         Pending,
+    }
+
+    /// Owns both the registration handle and the boxed [`Sender`] its context
+    /// pointer targets, so one `Drop` cancels the registration before the box
+    /// releases — regardless of which order the two were constructed in.
+    /// Declaration order alone does not give this: `tx` was declared before
+    /// `notify` below, so a panic unwinding past both would drop `tx` (and
+    /// free the box) FIRST, while the kernel-held registration still points
+    /// into it — a leak turned into a use-after-free, reachable from every
+    /// `panic!` in the `DadVerdict` match below, not just a happy-path
+    /// return. Bundling them means there is no order left to get wrong.
+    struct AddressChangeRegistration {
+        notify: HANDLE,
+        /// Never read after registration — kept alive only because `notify`
+        /// holds a raw pointer into it until cancelled.
+        _tx: Box<Sender<u32>>,
+        /// Test-only observability: set once `Drop` confirms the cancel
+        /// succeeded. `None` in the privileged test's real usage. A second
+        /// real `CancelMibChangeNotify2` on an already-cancelled handle is
+        /// itself unsafe (confirmed empirically: it corrupted the heap) —
+        /// this flag is what lets `address_change_registration_cancels_on_drop_
+        /// even_through_an_early_return` observe the cancel ran without
+        /// touching the handle again.
+        cancel_confirmed: Option<Arc<AtomicBool>>,
+    }
+
+    impl AddressChangeRegistration {
+        /// Registers `tx` boxed, so its address is stable for the
+        /// registration's context pointer.
+        ///
+        /// # Safety
+        /// The boxed `tx` outlives the registration (this `Drop` cancels it
+        /// before the box releases), so the callback's context pointer stays
+        /// valid throughout.
+        fn register(tx: Sender<u32>) -> Self {
+            Self::register_with(tx, None)
+        }
+
+        fn register_with(tx: Sender<u32>, cancel_confirmed: Option<Arc<AtomicBool>>) -> Self {
+            let tx = Box::new(tx);
+            let mut notify = HANDLE::default();
+            let status = unsafe {
+                NotifyUnicastIpAddressChange(
+                    AF_INET,
+                    Some(on_address_change),
+                    Some(&*tx as *const Sender<u32> as *const core::ffi::c_void),
+                    false,
+                    &mut notify,
+                )
+            };
+            assert_eq!(status, NO_ERROR, "NotifyUnicastIpAddressChange failed: {status:?}");
+            Self {
+                notify,
+                _tx: tx,
+                cancel_confirmed,
+            }
+        }
+    }
+
+    impl Drop for AddressChangeRegistration {
+        fn drop(&mut self) {
+            // SAFETY: `self.notify` is the live handle `register`'s
+            // successful call produced.
+            let cancelled = unsafe { CancelMibChangeNotify2(self.notify) };
+            // Gated on `!panicking()`: a failed cancel during unwind must not
+            // itself panic — a second panic during unwind aborts the process,
+            // destroying the ORIGINAL failure message this Drop is running to
+            // preserve (a leaked, still-armed registration either way; abort
+            // just also erases the diagnostic).
+            if cancelled != NO_ERROR && !std::thread::panicking() {
+                panic!("CancelMibChangeNotify2 failed: {cancelled:?}");
+            }
+            if cancelled == NO_ERROR {
+                if let Some(flag) = &self.cancel_confirmed {
+                    flag.store(true, Ordering::SeqCst);
+                }
+            }
+            // `_tx` (and the box `notify`'s context pointer named) drops only
+            // after this line — the registration is confirmed gone first.
+        }
     }
 
     /// The notification callback.
@@ -184,7 +274,7 @@ mod windows_impl {
         sa
     }
 
-    #[skuld::test(labels = [TUN], serial = TUN)]
+    #[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
     fn gateway_global_net_state_best_route_sees_a_wintun_adapter() {
         // A previously crashed run could have left the adapter behind; removing
         // it first makes this idempotent rather than order-dependent.
@@ -199,20 +289,7 @@ mod windows_impl {
         // Registered BEFORE the adapter exists, so the address's DAD transition
         // cannot be missed in the gap between creation and subscription.
         let (tx, rx) = channel::<u32>();
-        let tx = Box::new(tx);
-        let mut notify = HANDLE::default();
-        // SAFETY: `tx` is boxed and outlives the registration (cancelled below),
-        // so the callback's context pointer stays valid throughout.
-        let status = unsafe {
-            NotifyUnicastIpAddressChange(
-                AF_INET,
-                Some(on_address_change),
-                Some(&*tx as *const Sender<u32> as *const core::ffi::c_void),
-                false,
-                &mut notify,
-            )
-        };
-        assert_eq!(status, NO_ERROR, "NotifyUnicastIpAddressChange failed: {status:?}");
+        let registration = AddressChangeRegistration::register(tx);
 
         let _guard = AdapterGuard;
         let _device = tun_engine::Device::build(|c| {
@@ -259,10 +336,11 @@ mod windows_impl {
             rx.recv().expect("the channel outlives the registration");
         };
 
-        // SAFETY: `notify` is the live handle from the registration above.
-        let cancelled = unsafe { CancelMibChangeNotify2(notify) };
-        assert_eq!(cancelled, NO_ERROR, "CancelMibChangeNotify2 failed: {cancelled:?}");
-        drop(tx);
+        // The registration is no longer needed once the address is known
+        // usable — dropped explicitly (rather than left to fall out of scope
+        // after the assertions below) so it cannot be live, even briefly,
+        // while `best_route` runs.
+        drop(registration);
 
         let hop = tun_engine::gateway::best_route(TEST_DEST.parse().unwrap())
             .expect("route lookup must not fail")
@@ -275,5 +353,41 @@ mod windows_impl {
             hop.interface_index
         );
         assert_eq!(hop.interface_alias, TEST_ADAPTER);
+    }
+
+    /// Proves `AddressChangeRegistration`'s cancel-before-release ordering
+    /// directly, without the elevation the privileged test above needs for
+    /// `Device::build`. `NotifyUnicastIpAddressChange`/`CancelMibChangeNotify2`
+    /// registration is itself unprivileged — only creating the wintun adapter
+    /// needs the elevated token — so this is the ONE piece of that test
+    /// reachable unelevated, and the ONLY one the leaked-callback defect
+    /// actually lived in.
+    ///
+    /// Drops the guard via an early return (not the end of its natural
+    /// scope — the same "control leaves before the happy-path cleanup"
+    /// shape a `panic!` unwind has) and proves the cancel already ran, via
+    /// `cancel_confirmed` — a second REAL `CancelMibChangeNotify2` on the
+    /// same handle is not a safe way to observe this (confirmed empirically:
+    /// it corrupted the heap on this box), so `Drop`'s own confirmation is
+    /// the only sound signal. Mutates no OS routing/adapter state, so —
+    /// unlike the test above — it carries neither `TUN` nor
+    /// `GLOBAL_NET_STATE` and runs in the ordinary unprivileged pass.
+    #[skuld::test]
+    fn address_change_registration_cancels_on_drop_even_through_an_early_return() {
+        fn construct_and_drop_early(tx: Sender<u32>, cancel_confirmed: Arc<AtomicBool>) {
+            let _registration = AddressChangeRegistration::register_with(tx, Some(cancel_confirmed));
+            // early return — exercises the same "control leaves before the
+            // happy-path cleanup" shape a `panic!` unwind has, dropping
+            // `_registration` here rather than at some later, explicit point.
+        }
+
+        let (tx, _rx) = channel::<u32>();
+        let cancel_confirmed = Arc::new(AtomicBool::new(false));
+        construct_and_drop_early(tx, Arc::clone(&cancel_confirmed));
+
+        assert!(
+            cancel_confirmed.load(Ordering::SeqCst),
+            "the registration's Drop must have cancelled it by the time the early return returns"
+        );
     }
 }

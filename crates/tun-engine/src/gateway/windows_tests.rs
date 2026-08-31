@@ -134,14 +134,22 @@ fn best_route_agrees_with_find_netroute() {
 /// A silent change there breaks three subsystems at once.
 #[skuld::test]
 fn interface_alias_matches_get_netadapter_name() {
-    let Some(hop) = best_route(IpAddr::V4(Ipv4Addr::UNSPECIFIED)).expect("lookup must not fail") else {
-        // No default route on this host; the agreement test above covers that branch.
-        return;
-    };
-    let Some(expected) = get_netadapter_name(hop.interface_index) else {
-        // The upstream is not a Get-NetAdapter object (e.g. a loopback/tunnel
-        // pseudo-interface). Nothing independent to compare against.
-        return;
-    };
-    assert_eq!(hop.interface_alias, expected);
+    let mut checked = 0usize;
+    if let Some(hop) = best_route(IpAddr::V4(Ipv4Addr::UNSPECIFIED)).expect("lookup must not fail") {
+        // Skipped when the upstream is not a Get-NetAdapter object (e.g. a
+        // loopback/tunnel pseudo-interface) — nothing independent to compare
+        // against.
+        if let Some(expected) = get_netadapter_name(hop.interface_index) {
+            assert_eq!(hop.interface_alias, expected);
+            checked += 1;
+        }
+    }
+    // Both `if let`s above are real skip conditions on SOME hosts, but this
+    // box (and every unprivileged CI runner) always has a default route
+    // through a real NIC — if neither ever ran, the oracle query broke, not
+    // the environment.
+    assert!(
+        checked > 0,
+        "no default route through a real NIC was found to compare against — the oracle is broken, not this host"
+    );
 }
