@@ -1,6 +1,6 @@
 use std::io;
 
-use super::{classify, ProbeFate};
+use super::{classify, classify_send, ProbeFate, SendFate};
 
 fn err<T>(kind: io::ErrorKind) -> io::Result<T> {
     Err(io::Error::new(kind, "test"))
@@ -55,4 +55,39 @@ fn only_delivered_and_rejected_are_verdicts() {
     assert!(classify(&io::Result::Ok(())).is_verdict());
     assert!(classify(&err::<()>(io::ErrorKind::TimedOut)).is_verdict());
     assert!(!classify(&err::<()>(io::ErrorKind::NetworkUnreachable)).is_verdict());
+}
+
+/// [`classify_send`]'s whole reason to exist: a `send_to` `Ok` classifies as
+/// `Accepted`, never as anything shaped like `ProbeFate::Delivered` — there
+/// is no such variant on [`SendFate`] to reach for.
+#[skuld::test]
+fn a_successful_send_is_accepted_not_delivered() {
+    assert_eq!(classify_send(&io::Result::Ok(())), SendFate::Accepted);
+}
+
+/// [`classify`] and [`classify_send`] must not drift into disjoint notions
+/// of which `io::ErrorKind`s are a rejection versus a harness fault.
+#[skuld::test]
+fn classify_send_agrees_with_classify_on_every_error_kind() {
+    for kind in [
+        io::ErrorKind::PermissionDenied,
+        io::ErrorKind::TimedOut,
+        io::ErrorKind::ConnectionRefused,
+        io::ErrorKind::ConnectionReset,
+        io::ErrorKind::ConnectionAborted,
+        io::ErrorKind::NetworkUnreachable,
+        io::ErrorKind::HostUnreachable,
+        io::ErrorKind::AddrNotAvailable,
+        io::ErrorKind::AddrInUse,
+        io::ErrorKind::InvalidInput,
+    ] {
+        let probe_fate = classify(&err::<()>(kind));
+        let send_fate = classify_send(&err::<()>(kind));
+        assert_eq!(probe_fate.is_verdict(), send_fate.is_verdict(), "{kind:?}");
+        match (probe_fate, send_fate) {
+            (ProbeFate::Rejected(a), SendFate::Rejected(b)) => assert_eq!(a, b, "{kind:?}"),
+            (ProbeFate::NeverLeft(a), SendFate::NeverLeft(b)) => assert_eq!(a, b, "{kind:?}"),
+            (a, b) => panic!("{kind:?}: classify={a:?} classify_send={b:?} disagree in shape"),
+        }
+    }
 }

@@ -408,7 +408,7 @@ jobs:
           SKULD_LABELS: "!tun"
         run: >
           cargo nextest run --no-default-features
-          --features tombstone/crash-dumps,tombstone/crash-child
+          --features tombstone/crash-dumps,tombstone/crash-child --no-fail-fast
           -E 'package(hole) + package(hole-bridge) + package(hole-common)
               + package(tun-engine) + package(tun-engine-macros)
               + package(dump) + package(dump-macros)
@@ -422,9 +422,16 @@ jobs:
         shell: bash
         env:
           SKULD_LABELS: "tun"
+        # `--no-fail-fast`: this lane serializes many independent real-OS-effect
+        # tests behind one elevated token; one failure otherwise cancels the
+        # rest of the run, hiding every verdict downstream of the first
+        # failure for a whole CI round (bindreams/hole#961 — 14 of 29 TUN
+        # tests cancelled by one failure, hiding five others for two rounds).
+        # Only changes how many tests run after a failure, never whether a
+        # passing run fails.
         run: >
           cargo nextest run --no-default-features
-          --features tombstone/crash-dumps,tombstone/crash-child
+          --features tombstone/crash-dumps,tombstone/crash-child --no-fail-fast
           -E 'package(hole) + package(hole-bridge) + package(hole-common)
               + package(tun-engine) + package(tun-engine-macros)
               + package(dump) + package(dump-macros)
@@ -448,7 +455,7 @@ jobs:
         run: >
           sudo env "PATH=$PATH" "HOME=$HOME" SKULD_LABELS=tun
           cargo nextest run --no-default-features
-          --features tombstone/crash-dumps,tombstone/crash-child
+          --features tombstone/crash-dumps,tombstone/crash-child --no-fail-fast
           -E 'package(hole) + package(hole-bridge) + package(hole-common)
               + package(tun-engine) + package(tun-engine-macros)
               + package(dump) + package(dump-macros)

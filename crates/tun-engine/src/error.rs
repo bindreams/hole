@@ -56,6 +56,13 @@ pub enum DeviceError {
     WintunMissing { tried: Vec<PathBuf> },
     #[error("wintun.dll load failed at {}: {message}", .path.display())]
     WintunLoad { path: PathBuf, message: String },
+    /// A pre-existing adapter named `alias` does not carry Hole's own
+    /// adapter GUID — it belongs to something else (most often a build of
+    /// Hole itself that crashed before it could tear the adapter down; see
+    /// `crates/tun-engine/src/device/identity.rs`). PII-free and
+    /// actionable: names no filesystem path, and points at the escape.
+    #[error("an existing '{alias}' adapter does not belong to Hole; run scripts/network-reset.py to remove it")]
+    ForeignAdapter { alias: String },
     /// The device exists; its IPv6 address does not. `index` is `0` — the
     /// reserved sentinel — when no interface index could be derived at all.
     #[error("IPv6 address assignment failed on interface {index}: {message}")]

@@ -371,3 +371,36 @@ fn tun_subnet6_is_a_generated_unique_local_64() {
         "the 40-bit global ID must be generated, not zero (fd00::); got {global_id:02x?}"
     );
 }
+
+// DispatcherStartError conversion =====================================================================================
+
+/// `Dispatcher::new` used to flatten every `tun_engine::DeviceError` into an
+/// opaque `io::Error` before it ever reached this conversion, which made
+/// `ProxyError::ForeignAdapter` unreachable from `start_inner` regardless of
+/// what `Device::build` returned. Asserts the conversion's SHAPE, not any
+/// string embedded in it — a string match would pass even if the variant
+/// were wrong.
+#[skuld::test]
+fn foreign_adapter_device_error_converts_to_the_matching_proxy_error() {
+    let alias = "hole-tun".to_string();
+    let err = crate::dispatcher::DispatcherStartError::Device(tun_engine::DeviceError::ForeignAdapter {
+        alias: alias.clone(),
+    });
+    match ProxyError::from(err) {
+        ProxyError::ForeignAdapter { alias: got } => assert_eq!(got, alias),
+        other => panic!("expected ProxyError::ForeignAdapter, got {other:?}"),
+    }
+}
+
+/// The paired negative: an `Io` arm must convert to `ProxyError::Runtime`,
+/// never accidentally to `ForeignAdapter` — without this, a match arm typo
+/// swallowing every variant into `ForeignAdapter` would still pass the test
+/// above.
+#[skuld::test]
+fn io_dispatcher_start_error_converts_to_runtime() {
+    let err = crate::dispatcher::DispatcherStartError::Io(std::io::Error::other("boom"));
+    match ProxyError::from(err) {
+        ProxyError::Runtime(_) => {}
+        other => panic!("expected ProxyError::Runtime, got {other:?}"),
+    }
+}

@@ -1,17 +1,19 @@
-//! Persisted DNS state for crash recovery.
+//! Persisted DNS state — read-only escape hatch for a `bridge-dns.json` an
+//! older build left behind. The bridge itself no longer writes this file:
+//! DNS egress is confined by `tun_engine::dns_confine`'s WFP confinement
+//! instead, which persists nothing (see that module's doc for why a
+//! process-scoped dynamic FWPM session needs no crash-recovery state at
+//! all). What remains here is `load` + `clear`/`supersede`, used exactly
+//! once per file by [`crate::dns::recovery`]'s evidence-gated upgrade
+//! sweep, and the schema types themselves — kept so an older build's file
+//! can still be parsed and, when the evidence supports it, undone.
 //!
-//! The bridge writes the advertised resolver IPs and prior system-DNS
-//! settings to a JSON file when DNS apply starts, clears it on clean
-//! shutdown, and reads it on startup to restore DNS leaked by a previous
-//! crashed run. Mirrors the `tun_engine::routing::state`
-//! (crates/tun-engine/src/routing/state.rs) / `plugin_state` crash-recovery
-//! pattern.
-//!
-//! Single-writer assumption: the bridge is the only writer of this file
-//! within a process, and only one bridge runs at a time (the IPC socket bind
-//! enforces single-instance). Concurrent `save` calls are not supported.
+//! Single-reader assumption: only one bridge starts at a time reads this
+//! file (the IPC socket bind's intended single-instance guarantee — see
+//! bindreams/hole#936 for why that guarantee does not fully hold today, and
+//! `crate::dns::recovery`'s doc for why this module's read-once bound makes
+//! that gap harmless here).
 
-use std::io::Write;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 
@@ -29,6 +31,15 @@ pub const SCHEMA_VERSION: u32 = 1;
 /// single source of truth.
 pub const STATE_FILE_NAME: &str = "bridge-dns.json";
 
+/// Filename a file is renamed to after the upgrade sweep has evaluated it
+/// once, whenever it wasn't deleted outright (some family lacked evidence).
+/// The bridge never reads this name — only ever the un-suffixed
+/// [`STATE_FILE_NAME`] — so the sweep can never re-evaluate the same file
+/// twice; `scripts/network-reset.py` reads both names, so the escape survives
+/// the rename. See `crate::dns::recovery`'s doc for why that bound is
+/// load-bearing.
+pub const SUPERSEDED_FILE_NAME: &str = "bridge-dns.superseded.json";
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 // NOTE: NO `deny_unknown_fields` — a v1 file from an older crashed run
 // carries the obsolete `chosen_loopback` key. Tolerating it (ignore the
@@ -37,10 +48,15 @@ pub const STATE_FILE_NAME: &str = "bridge-dns.json";
 // `adapters`.
 pub struct DnsState {
     pub version: u32,
-    /// The upstream resolver IPs advertised to the OS adapters this run.
-    /// Diagnostic only — recovery restores from `adapters`, not this field.
-    /// `#[serde(default)]` so a v1 file (which has no `advertised` key)
-    /// still loads, defaulting to empty.
+    /// The upstream resolver IPs the writing build advertised to its
+    /// adapters. NOT diagnostic-only: the upgrade sweep's ONLY evidence
+    /// that a live adapter's current DNS is still what that old build left
+    /// behind — see `crate::dns::recovery`'s doc for the exact gate.
+    /// `#[serde(default)]` so a file old enough to carry the obsolete
+    /// `chosen_loopback` key (never one that legitimately omits
+    /// `advertised` — the field has been declared and serialized since
+    /// schema version 1) still loads, defaulting to empty; an empty value
+    /// is treated as "no evidence", never as a match.
     #[serde(default)]
     pub advertised: Vec<IpAddr>,
     pub adapters: Vec<DnsPriorAdapter>,
@@ -101,29 +117,14 @@ fn state_file(state_dir: &Path) -> PathBuf {
     state_dir.join(STATE_FILE_NAME)
 }
 
-// I/O =================================================================================================================
-
-/// Write `state` to `<state_dir>/bridge-dns.json` atomically via a
-/// same-directory temp file + rename. Contents are `sync_all`'d before
-/// persist so a process crash sees either the old contents or the new
-/// contents, never a truncated file. Creates `state_dir` if missing.
-///
-/// Does NOT fsync the parent directory after the rename — power-loss
-/// durability is out of scope. The design target is process-crash recovery.
-pub fn save(state_dir: &Path, state: &DnsState, owner: Option<(u32, u32)>) -> std::io::Result<()> {
-    std::fs::create_dir_all(state_dir)?;
-    util::ownership::chown_if_some(state_dir, owner);
-
-    let json = serde_json::to_vec_pretty(state).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-
-    let path = state_file(state_dir);
-    let mut tmp = tempfile::NamedTempFile::new_in(state_dir)?;
-    tmp.write_all(&json)?;
-    tmp.as_file().sync_all()?;
-    tmp.persist(&path).map_err(|e| e.error)?;
-    util::ownership::chown_if_some(&path, owner);
-    Ok(())
+fn superseded_file(state_dir: &Path) -> PathBuf {
+    state_dir.join(SUPERSEDED_FILE_NAME)
 }
+
+// I/O =================================================================================================================
+//
+// No `save` — the bridge no longer writes this file (see the module doc).
+// Only `load`, `clear`, and `supersede` remain, all for the upgrade sweep.
 
 /// Load the state file. Returns `None` for any error — missing file,
 /// corrupted JSON, unknown fields, version mismatch — and logs at `warn`
@@ -160,6 +161,72 @@ pub fn load(state_dir: &Path) -> Option<DnsState> {
 pub fn clear(state_dir: &Path) -> std::io::Result<()> {
     let path = state_file(state_dir);
     match std::fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+/// Filename for an ARCHIVED superseded file — used only when
+/// [`SUPERSEDED_FILE_NAME`] is already occupied by an earlier one. `n`
+/// starts at 2 (the canonical superseded file is implicitly "1"). Forensic
+/// only: nothing in this crate, and nothing in `scripts/network-reset.py`,
+/// ever reads an archived name back. The script's existing lookup order
+/// (un-suffixed, then [`SUPERSEDED_FILE_NAME`]) already lands on the
+/// OLDEST superseded evidence once the un-suffixed name is moved aside —
+/// which is the file this module keeps at the canonical name, never an
+/// archived one — so the script needs no changes to keep finding the right
+/// answer.
+fn archived_superseded_file(state_dir: &Path, n: u64) -> PathBuf {
+    state_dir.join(format!("bridge-dns.superseded.{n}.json"))
+}
+
+/// Rename the state file to [`SUPERSEDED_FILE_NAME`]. The upgrade sweep's
+/// "evaluated once, not fully confirmed" outcome: the bridge never reads the
+/// superseded name again (so the value-equality gate cannot re-arm on a
+/// later, unrelated coincidence), but `scripts/network-reset.py` reads both
+/// names, so the escape survives the rename rather than being hidden by it.
+/// Tolerates a missing source file (returns `Ok`).
+///
+/// **Never clobbers an existing superseded file.** `fs::rename` replaces an
+/// existing destination (POSIX `rename(2)`; Windows via
+/// `MOVEFILE_REPLACE_EXISTING`), so a bare rename onto an already-occupied
+/// [`SUPERSEDED_FILE_NAME`] would silently destroy it — reachable whenever
+/// this runs twice without the first superseded file ever being cleared
+/// (reinstall, rollback to an older build, or a second crash). When that
+/// happens, the OLDER file keeps the canonical name and the newer one is
+/// archived under [`archived_superseded_file`] instead: a superseded file
+/// exists precisely because an earlier restore did not fully succeed, so
+/// the newer file's recorded priors may already be Hole's own (dead)
+/// resolver IPs — the older file is the one closer to the user's true
+/// original DNS, and is what a reader should keep finding at the canonical
+/// name.
+pub fn supersede(state_dir: &Path) -> std::io::Result<()> {
+    let from = state_file(state_dir);
+    let to = superseded_file(state_dir);
+
+    if to.exists() {
+        if !from.exists() {
+            return Ok(());
+        }
+        let mut n = 2u64;
+        let archive = loop {
+            let candidate = archived_superseded_file(state_dir, n);
+            if !candidate.exists() {
+                break candidate;
+            }
+            n += 1;
+        };
+        std::fs::rename(&from, &archive)?;
+        tracing::warn!(
+            kept = %to.display(),
+            archived = %archive.display(),
+            "dns_state: bridge-dns.superseded.json already existed; archived the newer file \n             instead of overwriting it. The archive is forensic only — nothing reads it back."
+        );
+        return Ok(());
+    }
+
+    match std::fs::rename(&from, &to) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(e),

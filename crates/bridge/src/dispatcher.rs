@@ -13,7 +13,7 @@ use std::time::Instant;
 use tokio::task::{AbortHandle, JoinHandle};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
-use tun_engine::{Assigned, Device, Engine, MutDeviceConfig};
+use tun_engine::{Assigned, Device, Engine, MutDeviceConfig, TunIdentity};
 
 use crate::drop_sink::LoggingDropSink;
 use crate::endpoint::{InterfaceEndpoint, LocalDnsEndpoint, Socks5Endpoint};
@@ -33,6 +33,18 @@ pub enum DriverExit {
     Panicked,
     /// `shutdown()` was called again after already draining the driver.
     AlreadyDrained,
+}
+
+/// What [`Dispatcher::new`] can fail with. Keeps `tun_engine::DeviceError`
+/// distinguishable from every other start-time I/O failure, so a caller can
+/// match the specific variant (e.g. `DeviceError::ForeignAdapter`) instead
+/// of a flattened `io::Error` whose type information is already gone.
+#[derive(Debug, thiserror::Error)]
+pub enum DispatcherStartError {
+    #[error(transparent)]
+    Device(#[from] tun_engine::DeviceError),
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
 }
 
 /// Awaits `handle` in place and classifies how the driver task ended. No
@@ -65,6 +77,11 @@ pub struct Dispatcher {
     /// See `SystemDnsApplied` for the same discipline.
     bomb: drop_bomb::DebugDropBomb,
     ipv6_assigned: Option<Assigned>,
+    /// The identity of the TUN device this dispatcher opened. Captured
+    /// before the device is consumed by `Engine::build`; threaded to
+    /// `Dns::apply` (bindreams/hole#846) so DNS is confined to the adapter
+    /// this process actually opened, never a name lookup.
+    identity: TunIdentity,
 }
 
 impl Dispatcher {
@@ -99,7 +116,7 @@ impl Dispatcher {
         rules: RuleSet,
         local_dns_endpoint: Option<LocalDnsEndpoint>,
         cancel: &CancellationToken,
-    ) -> std::io::Result<Option<Self>> {
+    ) -> Result<Option<Self>, DispatcherStartError> {
         // Open the TUN device.
         let v4_cidr = TUN_SUBNET
             .parse()
@@ -120,12 +137,55 @@ impl Dispatcher {
         let Some(device) = built else {
             return Ok(None);
         };
-        let device = device.map_err(device_error_to_io)?;
+        let device = device?;
+
+        // Give hole-tun the lowest possible interface metric so Windows
+        // prefers whatever resolver Hole advertises over the physical
+        // adapter's (#846's positive half; the negative half is
+        // `tun_engine::dns_confine`). IPv4 absence is fatal — a v4 row must
+        // exist for an adapter that was just created. IPv6 absence is
+        // logged and accepted: the host may have IPv6 off, or the v6 row
+        // may not have appeared yet — see `tun_engine::net::metric`'s
+        // module doc for why that race is reported, not asserted away.
+        #[cfg(target_os = "windows")]
+        {
+            use tun_engine::net::metric::{set_interface_metric, Family, MetricOutcome, TUNNEL_INTERFACE_METRIC};
+            let luid = device.identity().luid();
+            match set_interface_metric(luid, TUNNEL_INTERFACE_METRIC, Family::V4) {
+                Ok(MetricOutcome::Applied) => {}
+                Ok(MetricOutcome::NoInterfaceRow) => {
+                    return Err(
+                        std::io::Error::other("hole-tun has no IPv4 interface row immediately after creation").into(),
+                    );
+                }
+                Err(e) => {
+                    return Err(
+                        std::io::Error::other(format!("failed to set hole-tun's IPv4 interface metric: {e}")).into(),
+                    );
+                }
+            }
+            match set_interface_metric(luid, TUNNEL_INTERFACE_METRIC, Family::V6) {
+                Ok(MetricOutcome::Applied) => {}
+                Ok(MetricOutcome::NoInterfaceRow) => {
+                    warn!("hole-tun has no IPv6 interface row yet; IPv6 metric not set (host may lack IPv6, or the row has not appeared)");
+                }
+                Err(e) => {
+                    return Err(
+                        std::io::Error::other(format!("failed to set hole-tun's IPv6 interface metric: {e}")).into(),
+                    );
+                }
+            }
+        }
 
         // Read BEFORE `Engine::build`: that consumes the device through
         // `Device::into_inner`, which returns only the `AsyncDevice` and the
         // frozen config, so no later read is possible.
         let ipv6_assigned = device.ipv6_assigned();
+
+        // Captured BEFORE `Engine::build` consumes `device` below — this is
+        // the identity of the concrete OS object this call opened, never a
+        // name lookup (bindreams/hole#846).
+        let identity = device.identity().clone();
 
         // Build the two endpoints, the drop sink, and the HoleRouter.
         let proxy_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), local_port);
@@ -168,6 +228,7 @@ impl Dispatcher {
                 "Dispatcher dropped without shutdown().await — the wintun adapter handle may leak",
             ),
             ipv6_assigned,
+            identity,
         }))
     }
 
@@ -188,6 +249,13 @@ impl Dispatcher {
     /// Hot-swap the filter rules without restarting the dispatcher.
     pub fn swap_rules(&self, new_rules: RuleSet) {
         self.router.swap_rules(new_rules);
+    }
+
+    /// The identity of the TUN device this dispatcher opened — the LUID and
+    /// alias of the concrete OS object, not a name lookup. See
+    /// `crate::proxy_manager::start_inner`'s Phase 7.
+    pub fn identity(&self) -> &TunIdentity {
+        &self.identity
     }
 
     /// Graceful shutdown. Cancels the driver, then joins its task with no
@@ -252,16 +320,6 @@ where
         // The task is never aborted, so a `JoinError` is always a panic.
         r = task => Some(r.unwrap_or_else(|e| std::panic::resume_unwind(e.into_panic()))),
     }
-}
-
-/// The device was created; its IPv6 address was not. A user shown the
-/// create-failed sentence looks in the wrong place.
-fn device_error_to_io(e: tun_engine::DeviceError) -> std::io::Error {
-    let what = match e {
-        tun_engine::DeviceError::Ipv6Assign { .. } => "failed to assign the TUN device's IPv6 address",
-        _ => "failed to create TUN device",
-    };
-    std::io::Error::other(format!("{what}: {e}"))
 }
 
 /// Safety net for non-graceful paths (panic, cancel mid-`start_inner`, a

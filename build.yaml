@@ -194,8 +194,24 @@ targets:
           + package(dump) + package(dump-macros)
           + package(handle-holders) + package(tombstone)
           + package(hole-test-observability)'
+    # `--no-fail-fast`: the TUN lane runs many independent real-OS-effect
+    # tests serialized behind a single elevated token; one failure otherwise
+    # cancels the rest of the run (14 of 29 once, cutting five DNS-confine
+    # verdicts before they ever executed — bindreams/hole#961), hiding
+    # everything downstream of the first failure for a whole CI round. This
+    # only changes how many tests run after a failure; it cannot turn a
+    # passing run into a failing one. NOT on `build:`: nextest rejects
+    # `--no-fail-fast` alongside `--no-run` outright (it is a run-only flag,
+    # same class as the ones `xtask::skuld_label_coverage::RUN_ONLY_FLAGS`
+    # already had to strip for `nextest list`). `run:` legitimately differs
+    # from `build:` by exactly this flag now —
+    # `tests_targets_run_matches_build_minus_no_run` (xtask) checks
+    # "run == build minus --no-run, plus RUN_ONLY_FLAGS", not plain equality.
+    # `ci_test_hole_steps_match_the_hole_tests_target` (xtask) holds every
+    # `test-hole` nextest step in ci.yaml — including the non-TUN one — to
+    # this exact `run:` command, so all three carry the flag too.
     run: >
-      cargo nextest run --no-default-features --features tombstone/crash-dumps,tombstone/crash-child
+      cargo nextest run --no-default-features --features tombstone/crash-dumps,tombstone/crash-child --no-fail-fast
       -E 'package(hole) + package(hole-bridge) + package(hole-common)
           + package(tun-engine) + package(tun-engine-macros)
           + package(dump) + package(dump-macros)

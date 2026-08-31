@@ -1,9 +1,10 @@
-//! Layer-2 unit tests for the Win32 DNS backend.
+//! Layer-2 unit tests for the Win32 DNS backend and the confinement seam.
 //!
 //! See [`super::WinDnsBackend`] for the trait surface and
-//! [`super::Win32Real`] for the production impl. These tests use
-//! [`MockBackend`] to verify cancel-aware behavior in
-//! [`crate::dns::system::SystemDns::apply`] without touching the OS.
+//! [`super::Win32Real`] for the production impl; [`super::DnsConfiner`] for
+//! the confinement seam. These tests use [`MockBackend`] / [`MockConfiner`]
+//! to verify [`crate::dns::system::SystemDns::apply`]'s cancel/error
+//! handling without touching the OS or a real WFP engine.
 
 // `CancellationToken::new` is the cancel-test harness root — sanctioned
 // for test files by clippy.toml's "Bridge cancellation contract" exception.
@@ -11,38 +12,36 @@
 
 use std::io;
 use std::net::{IpAddr, Ipv4Addr};
-use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
 use std::sync::{Arc, Mutex};
 
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
-use super::WinDnsBackend;
+use super::{DnsConfiner, WinDnsBackend};
 use crate::dns::system::{Dns, DnsApplied, DnsError, SystemDns};
 use crate::dns_state::{AdapterId, DnsPrior, DnsPriorAdapter};
 
 // MockBackend =========================================================================================================
 
-/// Test-only [`WinDnsBackend`]. Counts calls per method and supports
-/// parking the *first* `set_servers` invocation on a rendezvous so cancel
-/// tests can fire `cancel.cancel()` while the FFI is mid-flight without
-/// any `sleep`-based synchronization.
+/// Test-only [`WinDnsBackend`]. Counts calls per method. `apply` now has
+/// exactly one target (`hole-tun`), so there is no second call for a cancel
+/// test to race against on the backend side any more — that race moved to
+/// [`MockConfiner::engage`], which still has a window before it (see
+/// `dns_apply_cancelled_drops_the_confinement`).
 struct MockBackend {
     get_calls: AtomicUsize,
     set_calls: AtomicUsize,
     restore_calls: AtomicUsize,
     flush_calls: AtomicUsize,
-    /// Records the IP list passed to each `set_servers` call, in order.
     set_ips: Mutex<Vec<Vec<IpAddr>>>,
-    /// One-shot rendezvous pair: when set, the first `set_servers` call
-    /// fires `entered_tx`, then blocks on `release_rx` before returning.
-    set_rendezvous: Mutex<Option<Rendezvous>>,
+    set_luids: Mutex<Vec<u64>>,
 }
 
 struct Rendezvous {
     entered_tx: oneshot::Sender<()>,
     /// `std::sync::mpsc::Receiver` rather than `tokio::sync::oneshot::Receiver`
-    /// because `set_servers` is sync and runs on the blocking pool.
+    /// because the mocked call is sync and runs on the blocking pool.
     release_rx: std::sync::mpsc::Receiver<()>,
 }
 
@@ -54,19 +53,8 @@ impl MockBackend {
             restore_calls: AtomicUsize::new(0),
             flush_calls: AtomicUsize::new(0),
             set_ips: Mutex::new(Vec::new()),
-            set_rendezvous: Mutex::new(None),
+            set_luids: Mutex::new(Vec::new()),
         })
-    }
-
-    /// Arm the first-`set_servers` rendezvous. Returns the receiver/sender
-    /// the test should park on / fire respectively:
-    /// - `entered_rx`: completes when the first `set_servers` runs.
-    /// - `release_tx`: send to let the first `set_servers` return.
-    fn arm_set_rendezvous(&self) -> (oneshot::Receiver<()>, std::sync::mpsc::Sender<()>) {
-        let (entered_tx, entered_rx) = oneshot::channel();
-        let (release_tx, release_rx) = std::sync::mpsc::channel();
-        *self.set_rendezvous.lock().unwrap() = Some(Rendezvous { entered_tx, release_rx });
-        (entered_rx, release_tx)
     }
 }
 
@@ -83,21 +71,19 @@ impl WinDnsBackend for MockBackend {
         }))
     }
 
-    fn set_servers(&self, _alias: &str, servers: &[IpAddr]) -> io::Result<()> {
+    fn set_servers(&self, luid: u64, servers: &[IpAddr]) -> io::Result<()> {
         self.set_ips.lock().unwrap().push(servers.to_vec());
-        let n = self.set_calls.fetch_add(1, SeqCst);
-        if n == 0 {
-            // First call — fire entered signal and park if rendezvous armed.
-            let r = self.set_rendezvous.lock().unwrap().take();
-            if let Some(r) = r {
-                let _ = r.entered_tx.send(());
-                let _ = r.release_rx.recv();
-            }
-        }
+        self.set_luids.lock().unwrap().push(luid);
+        self.set_calls.fetch_add(1, SeqCst);
         Ok(())
     }
 
     fn restore(&self, _adapter: &DnsPriorAdapter) -> io::Result<()> {
+        self.restore_calls.fetch_add(1, SeqCst);
+        Ok(())
+    }
+
+    fn restore_family(&self, _alias: &str, _ipv6: bool, _prior: &DnsPrior) -> io::Result<()> {
         self.restore_calls.fetch_add(1, SeqCst);
         Ok(())
     }
@@ -108,51 +94,125 @@ impl WinDnsBackend for MockBackend {
     }
 }
 
+// MockConfiner ========================================================================================================
+
+/// Boxed as the `SystemDnsApplied` confinement value; its `Drop` flips
+/// `alive` to `false` so a test can observe "the confinement was released"
+/// without inspecting `SystemDnsApplied`'s private fields.
+struct ConfinementProbe(Arc<AtomicBool>);
+
+impl Drop for ConfinementProbe {
+    fn drop(&mut self) {
+        self.0.store(false, SeqCst);
+    }
+}
+
+/// Test-only [`DnsConfiner`]. Supports failing on demand and parking
+/// `engage` on a rendezvous, mirroring [`MockBackend`].
+struct MockConfiner {
+    engage_calls: AtomicUsize,
+    fail: AtomicBool,
+    rendezvous: Mutex<Option<Rendezvous>>,
+    /// Shared with every [`ConfinementProbe`] this confiner hands out —
+    /// `true` while (the most recent) confinement is alive.
+    alive: Arc<AtomicBool>,
+}
+
+impl MockConfiner {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            engage_calls: AtomicUsize::new(0),
+            fail: AtomicBool::new(false),
+            rendezvous: Mutex::new(None),
+            alive: Arc::new(AtomicBool::new(false)),
+        })
+    }
+
+    fn failing() -> Arc<Self> {
+        let m = Self::new();
+        m.fail.store(true, SeqCst);
+        m
+    }
+
+    fn arm_rendezvous(&self) -> (oneshot::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        let (entered_tx, entered_rx) = oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        *self.rendezvous.lock().unwrap() = Some(Rendezvous { entered_tx, release_rx });
+        (entered_rx, release_tx)
+    }
+
+    fn confinement_alive(&self) -> bool {
+        self.alive.load(SeqCst)
+    }
+}
+
+impl DnsConfiner for MockConfiner {
+    fn engage(
+        &self,
+        _tun_luid: u64,
+        _server_ip: IpAddr,
+    ) -> Result<Box<dyn std::any::Any + Send>, tun_engine::dns_confine::DnsConfineError> {
+        self.engage_calls.fetch_add(1, SeqCst);
+        if let Some(r) = self.rendezvous.lock().unwrap().take() {
+            let _ = r.entered_tx.send(());
+            let _ = r.release_rx.recv();
+        }
+        if self.fail.load(SeqCst) {
+            return Err(tun_engine::dns_confine::DnsConfineError::EngineOpen(io::Error::other(
+                "mock confiner failure",
+            )));
+        }
+        self.alive.store(true, SeqCst);
+        Ok(Box::new(ConfinementProbe(Arc::clone(&self.alive))))
+    }
+}
+
+// Helpers =============================================================================================================
+
+fn tun_identity() -> tun_engine::TunIdentity {
+    tun_engine::TunIdentity::synthetic(0xFEED, "hole-tun")
+}
+
+fn server_ip() -> IpAddr {
+    IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7))
+}
+
 // Tests ===============================================================================================================
 
-/// Cooperative cancel observed BETWEEN `set_servers` calls aborts
-/// `apply` before the second adapter is touched and runs inline-restore
-/// for the captured prior. The first call is parked via the rendezvous;
-/// the test fires cancel from a peer task; the parked call is released
-/// and apply observes cancel before issuing the second call.
+/// Cancel fired AFTER the confinement engages but BEFORE `set_servers`
+/// aborts the apply and — the load-bearing assertion — leaves no
+/// confinement engaged. The confinement engage is parked via the
+/// rendezvous; the test fires cancel from a peer task while it's mid-flight.
 #[skuld::test]
-async fn system_dns_apply_aborts_between_calls_on_cancel() {
+async fn dns_apply_cancelled_drops_the_confinement() {
     let backend = MockBackend::new();
-    let (entered_rx, release_tx) = backend.arm_set_rendezvous();
-    let restore_calls = Arc::clone(&backend);
-    let set_calls = Arc::clone(&backend);
+    let confiner = MockConfiner::new();
+    let (entered_rx, release_tx) = confiner.arm_rendezvous();
 
-    let dns = SystemDns::new_with_backend(Arc::clone(&backend) as Arc<dyn WinDnsBackend>);
+    let dns = SystemDns::new_with_backend(
+        Arc::clone(&backend) as Arc<dyn WinDnsBackend>,
+        Arc::clone(&confiner) as Arc<dyn DnsConfiner>,
+    );
     let cancel = CancellationToken::new();
     let cancel_clone = cancel.clone();
 
     tokio::spawn(async move {
-        entered_rx.await.expect("first set_servers never entered");
+        entered_rx.await.expect("engage never entered");
         cancel_clone.cancel();
         let _ = release_tx.send(());
     });
 
     let result = dns
         .apply(
-            vec![
-                IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)),
-                IpAddr::V4(Ipv4Addr::new(1, 0, 0, 1)),
-            ],
-            vec!["upstream-alias".into()],
-            vec!["wintun".into(), "upstream-alias".into()],
-            None,
-            None,
+            vec![IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))],
+            tun_identity(),
+            server_ip(),
             cancel,
         )
         .await;
 
-    // `SystemDnsApplied` is intentionally not `Debug` (its `backend`
-    // trait object and `DebugDropBomb` don't implement Debug). Sidestep
-    // `expect_err`'s `T: Debug` bound by matching the result directly.
     match result {
         Ok(mut applied) => {
-            // Test invariant violated; defuse the bomb before panicking
-            // so the panic message that surfaces is ours, not the bomb's.
             applied.shutdown().await;
             panic!("apply should have returned DnsError::Cancelled");
         }
@@ -160,122 +220,66 @@ async fn system_dns_apply_aborts_between_calls_on_cancel() {
         Err(e) => panic!("expected Cancelled, got {e:?}"),
     }
     assert_eq!(
-        set_calls.set_calls.load(SeqCst),
-        1,
-        "second apply (wintun) must NOT run after cancel"
+        backend.set_calls.load(SeqCst),
+        0,
+        "set_servers must NOT run after cancel"
     );
-    assert_eq!(
-        restore_calls.restore_calls.load(SeqCst),
-        1,
-        "inline restore must run for the one captured upstream adapter"
-    );
-}
-
-/// Regression: cancel mid-apply must clear `bridge-dns.json` alongside
-/// the inline-restore, so the next bridge start's `recover_dns_config`
-/// doesn't replay an already-restored prior over any user-side DNS
-/// changes made between the cancelled start and the next start.
-#[skuld::test]
-async fn inline_restore_clears_state_file_on_cancel() {
-    let backend = MockBackend::new();
-    let (entered_rx, release_tx) = backend.arm_set_rendezvous();
-
-    let dns = SystemDns::new_with_backend(Arc::clone(&backend) as Arc<dyn WinDnsBackend>);
-    let cancel = CancellationToken::new();
-    let cancel_clone = cancel.clone();
-
-    let tmp = tempfile::tempdir().expect("tempdir");
-    let state_dir = tmp.path().to_path_buf();
-
-    tokio::spawn(async move {
-        entered_rx.await.expect("first set_servers never entered");
-        cancel_clone.cancel();
-        let _ = release_tx.send(());
-    });
-
-    let result = dns
-        .apply(
-            vec![
-                IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)),
-                IpAddr::V4(Ipv4Addr::new(1, 0, 0, 1)),
-            ],
-            vec!["upstream-alias".into()],
-            vec!["wintun".into(), "upstream-alias".into()],
-            Some(state_dir.clone()),
-            None,
-            cancel,
-        )
-        .await;
-    assert!(matches!(result, Err(DnsError::Cancelled)), "apply should cancel");
-
-    // `apply` writes the state file BEFORE the apply loop (the `save`
-    // call after capture). On cancel, inline_restore must clear it so
-    // the next start's recovery doesn't replay over user DNS changes.
     assert!(
-        crate::dns_state::load(&state_dir).is_none(),
-        "inline_restore must clear bridge-dns.json on cancel; presence would replay restore on next start"
+        !confiner.confinement_alive(),
+        "the confinement must be dropped when apply returns Cancelled"
     );
 }
 
-/// One `set_servers` per `apply_aliases` entry — guards against accidental
-/// double-application or reordering.
 #[skuld::test]
-async fn system_dns_apply_one_set_per_apply_alias() {
+async fn apply_sets_resolvers_on_hole_tun_only() {
     let backend = MockBackend::new();
-    let dns = SystemDns::new_with_backend(Arc::clone(&backend) as Arc<dyn WinDnsBackend>);
-    let cancel = CancellationToken::new();
+    let confiner = MockConfiner::new();
+    let dns = SystemDns::new_with_backend(
+        Arc::clone(&backend) as Arc<dyn WinDnsBackend>,
+        confiner as Arc<dyn DnsConfiner>,
+    );
 
     let mut applied = dns
         .apply(
-            vec![
-                IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)),
-                IpAddr::V4(Ipv4Addr::new(1, 0, 0, 1)),
-            ],
-            vec!["upstream-alias".into()],
-            vec!["wintun".into(), "upstream-alias".into()],
-            None,
-            None,
-            cancel,
+            vec![IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))],
+            tun_identity(),
+            server_ip(),
+            CancellationToken::new(),
         )
         .await
         .expect("apply should succeed");
 
+    assert_eq!(backend.set_calls.load(SeqCst), 1, "exactly one set_servers call");
+    assert_eq!(backend.get_calls.load(SeqCst), 0, "apply must never call get_settings");
+    // `set_servers` must be handed the LUID of the opened device
+    // (`TunIdentity::luid`), never a value it would have to re-resolve from
+    // a name — see `apply_windows`'s doc.
     assert_eq!(
-        backend.set_calls.load(SeqCst),
-        2,
-        "exactly one set_servers per apply_alias"
-    );
-    assert_eq!(
-        backend.get_calls.load(SeqCst),
-        1,
-        "exactly one get_settings per capture_alias"
+        backend.set_luids.lock().unwrap().as_slice(),
+        [tun_identity().luid()],
+        "set_servers must receive tun.luid() directly"
     );
 
-    // Clean shutdown to defuse the bomb.
     applied.shutdown().await;
 }
 
 /// The `DebugDropBomb` safeguard panics in debug builds when `shutdown`
 /// is not awaited before drop, catching missed-shutdown bugs at the
-/// first test run. Release builds use the no-op variant and fall through
-/// to the sync-fallback restore — exercised by
-/// [`drop_invokes_sync_fallback_when_shutdown_skipped`] below.
+/// first test run.
 #[skuld::test]
 #[cfg(debug_assertions)]
 #[should_panic(expected = "SystemDnsApplied dropped without awaiting shutdown()")]
 async fn system_dns_applied_drop_panics_in_debug_if_shutdown_not_awaited() {
     let backend = MockBackend::new();
-    let dns = SystemDns::new_with_backend(Arc::clone(&backend) as Arc<dyn WinDnsBackend>);
-    let cancel = CancellationToken::new();
+    let confiner = MockConfiner::new();
+    let dns = SystemDns::new_with_backend(backend as Arc<dyn WinDnsBackend>, confiner as Arc<dyn DnsConfiner>);
 
     let applied = dns
         .apply(
             vec![IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))],
-            vec!["upstream-alias".into()],
-            vec!["wintun".into()],
-            None,
-            None,
-            cancel,
+            tun_identity(),
+            server_ip(),
+            CancellationToken::new(),
         )
         .await
         .expect("apply should succeed");
@@ -284,129 +288,206 @@ async fn system_dns_applied_drop_panics_in_debug_if_shutdown_not_awaited() {
     drop(applied);
 }
 
-/// `SystemDnsApplied::Drop` MUST invoke the sync-fallback restore (and
-/// flush) in **both** debug and release when `shutdown().await` was
-/// skipped, so the user's DNS isn't left pointed at the advertised resolver
-/// IPs. The gate is `shutdown_completed`, not `bomb.is_defused()`
-/// (the latter is `true` unconditionally in release, which would make the
-/// fallback dead code there).
-///
-/// This test asserts the manual `Drop` impl invokes the backend's
-/// `restore` for each captured prior. In debug, the bomb's own Drop still
-/// panics afterward (manual Drop runs first, then field drops trigger the
-/// bomb) — `std::panic::catch_unwind` absorbs that.
+/// `shutdown` must release the confinement — the Rule #0 guarantee,
+/// pinned at this layer (the live proof that dropping it actually reopens
+/// DNS lives in the elevated `dns_confine_global_net_state_filters_die_with_the_session`).
 #[skuld::test]
-async fn drop_invokes_sync_fallback_when_shutdown_skipped() {
+async fn shutdown_releases_the_confinement() {
     let backend = MockBackend::new();
-    let dns = SystemDns::new_with_backend(Arc::clone(&backend) as Arc<dyn WinDnsBackend>);
-    let cancel = CancellationToken::new();
+    let confiner = MockConfiner::new();
+    let dns = SystemDns::new_with_backend(
+        Arc::clone(&backend) as Arc<dyn WinDnsBackend>,
+        Arc::clone(&confiner) as Arc<dyn DnsConfiner>,
+    );
 
-    let applied = dns
+    let mut applied = dns
         .apply(
-            vec![
-                IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)),
-                IpAddr::V4(Ipv4Addr::new(1, 0, 0, 1)),
-            ],
-            vec!["upstream-alias".into()],
-            vec!["wintun".into(), "upstream-alias".into()],
-            None,
-            None,
-            cancel,
+            vec![IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))],
+            tun_identity(),
+            server_ip(),
+            CancellationToken::new(),
         )
         .await
         .expect("apply should succeed");
 
-    let restore_before = backend.restore_calls.load(SeqCst);
-    let flush_before = backend.flush_calls.load(SeqCst);
-
-    // Drop without shutdown. In debug, the bomb (a field of `applied`)
-    // panics on its own Drop AFTER our `impl Drop` has run the sync
-    // fallback — catch_unwind absorbs the panic so the test can assert
-    // on the backend's call counts in either build profile.
-    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || drop(applied)));
-
     assert!(
-        backend.restore_calls.load(SeqCst) > restore_before,
-        "Drop must invoke sync-fallback restore when shutdown_completed=false (release dead-code regression)"
+        confiner.confinement_alive(),
+        "the confinement must be held right after apply"
     );
-    assert!(
-        backend.flush_calls.load(SeqCst) > flush_before,
-        "Drop must invoke flush after sync-fallback restore"
+    applied.shutdown().await;
+    assert!(!confiner.confinement_alive(), "shutdown must release the confinement");
+    assert!(!applied.confinement_engaged());
+}
+
+/// A `DnsConfiner` failure must surface as `DnsError::Confine` and must not
+/// call `set_servers` at all — confinement-up-with-no-resolver is worse
+/// than no confinement, so the two must never be reordered.
+#[skuld::test]
+async fn confiner_failure_surfaces_as_confine_error_and_skips_set_servers() {
+    let backend = MockBackend::new();
+    let confiner = MockConfiner::failing();
+    let dns = SystemDns::new_with_backend(
+        Arc::clone(&backend) as Arc<dyn WinDnsBackend>,
+        confiner as Arc<dyn DnsConfiner>,
+    );
+
+    let result = dns
+        .apply(
+            vec![IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))],
+            tun_identity(),
+            server_ip(),
+            CancellationToken::new(),
+        )
+        .await;
+
+    match result {
+        Err(DnsError::Confine(_)) => {}
+        Err(DnsError::Cancelled) => panic!("expected Confine, got Cancelled"),
+        Err(DnsError::Io(e)) => panic!("expected Confine, got Io({e})"),
+        Ok(_) => panic!("expected Confine, got Ok"),
+    }
+    assert_eq!(
+        backend.set_calls.load(SeqCst),
+        0,
+        "set_servers must not run when confinement fails"
     );
 }
 
+/// `set_servers` failure must be fatal on Windows: `hole-tun` is the only
+/// target, so "continuing" has nowhere to continue to.
+#[skuld::test]
+async fn set_servers_failure_is_fatal() {
+    struct FailingSetBackend;
+    impl WinDnsBackend for FailingSetBackend {
+        fn get_settings(&self, _alias: &str) -> io::Result<Option<DnsPriorAdapter>> {
+            unreachable!("apply never calls get_settings")
+        }
+        fn set_servers(&self, _luid: u64, _servers: &[IpAddr]) -> io::Result<()> {
+            Err(io::Error::other("mock set_servers failure"))
+        }
+        fn restore(&self, _adapter: &DnsPriorAdapter) -> io::Result<()> {
+            unreachable!("apply never calls restore")
+        }
+        fn restore_family(&self, _alias: &str, _ipv6: bool, _prior: &DnsPrior) -> io::Result<()> {
+            unreachable!("apply never calls restore_family")
+        }
+        fn flush(&self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let confiner = MockConfiner::new();
+    let dns = SystemDns::new_with_backend(
+        Arc::new(FailingSetBackend) as Arc<dyn WinDnsBackend>,
+        Arc::clone(&confiner) as Arc<dyn DnsConfiner>,
+    );
+
+    let result = dns
+        .apply(
+            vec![IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))],
+            tun_identity(),
+            server_ip(),
+            CancellationToken::new(),
+        )
+        .await;
+
+    match result {
+        Err(DnsError::Io(_)) => {}
+        Err(DnsError::Cancelled) => panic!("expected Io, got Cancelled"),
+        Err(DnsError::Confine(e)) => panic!("expected Io, got Confine({e})"),
+        Ok(_) => panic!("expected Io, got Ok"),
+    }
+}
+
 /// `Dns::apply` advertises the configured upstream resolver IPs
-/// (NOT 127.0.0.1) to every apply alias, so OS UDP/53 routes into hole-tun
-/// and is intercepted by the in-TUN LocalDnsEndpoint.
+/// (NOT 127.0.0.1), so OS UDP/53 routes into hole-tun and is intercepted
+/// by the in-TUN LocalDnsEndpoint.
 #[skuld::test]
 async fn apply_advertises_resolver_ips_not_loopback() {
     let backend = MockBackend::new();
-    let dns = SystemDns::new_with_backend(Arc::clone(&backend) as Arc<dyn WinDnsBackend>);
-    let cancel = CancellationToken::new();
+    let confiner = MockConfiner::new();
+    let dns = SystemDns::new_with_backend(
+        Arc::clone(&backend) as Arc<dyn WinDnsBackend>,
+        confiner as Arc<dyn DnsConfiner>,
+    );
 
     let resolvers = vec![
         IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)),
         IpAddr::V4(Ipv4Addr::new(1, 0, 0, 1)),
     ];
     let mut applied = dns
-        .apply(
-            resolvers.clone(),
-            vec!["upstream-alias".into()],
-            vec!["wintun".into(), "upstream-alias".into()],
-            None,
-            None,
-            cancel,
-        )
+        .apply(resolvers.clone(), tun_identity(), server_ip(), CancellationToken::new())
         .await
         .expect("apply should succeed");
 
     let recorded = backend.set_ips.lock().unwrap().clone();
-    assert_eq!(recorded.len(), 2, "one set_servers per apply alias");
-    for ips in &recorded {
-        assert_eq!(ips, &resolvers, "must advertise resolver IPs, got {ips:?}");
-        assert!(
-            !ips.contains(&IpAddr::V4(Ipv4Addr::LOCALHOST)),
-            "must NOT advertise 127.0.0.1"
-        );
-    }
+    assert_eq!(recorded.len(), 1, "exactly one set_servers call");
+    assert_eq!(
+        recorded[0], resolvers,
+        "must advertise resolver IPs, got {:?}",
+        recorded[0]
+    );
+    assert!(
+        !recorded[0].contains(&IpAddr::V4(Ipv4Addr::LOCALHOST)),
+        "must NOT advertise 127.0.0.1"
+    );
     applied.shutdown().await;
 }
 
 /// `Dns::apply` forwards the full configured resolver list — both v4
-/// and v6 — to `set_servers` on every apply alias. `set_servers` splits the
-/// list per family internally (v4 entries to the v4 family, v6 to v6),
-/// leaving an unconfigured family untouched. This pins that v6 resolvers are
-/// advertised end-to-end, not dropped.
+/// and v6 — to `set_servers`. `set_servers` splits the list per family
+/// internally, leaving an unconfigured family untouched. This pins that v6
+/// resolvers are advertised end-to-end, not dropped.
 #[skuld::test]
 async fn apply_advertises_both_v4_and_v6_resolvers() {
     let backend = MockBackend::new();
-    let dns = SystemDns::new_with_backend(Arc::clone(&backend) as Arc<dyn WinDnsBackend>);
-    let cancel = CancellationToken::new();
+    let confiner = MockConfiner::new();
+    let dns = SystemDns::new_with_backend(
+        Arc::clone(&backend) as Arc<dyn WinDnsBackend>,
+        confiner as Arc<dyn DnsConfiner>,
+    );
 
     let resolvers = vec![
         IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)),
         "2606:4700:4700::1111".parse().unwrap(),
     ];
     let mut applied = dns
-        .apply(
-            resolvers.clone(),
-            vec!["upstream-alias".into()],
-            vec!["wintun".into(), "upstream-alias".into()],
-            None,
-            None,
-            cancel,
-        )
+        .apply(resolvers.clone(), tun_identity(), server_ip(), CancellationToken::new())
         .await
         .expect("apply should succeed");
 
     let recorded = backend.set_ips.lock().unwrap().clone();
-    assert_eq!(recorded.len(), 2, "one set_servers per apply alias");
-    for ips in &recorded {
-        assert_eq!(
-            ips, &resolvers,
-            "set_servers must receive the full mixed v4+v6 list, got {ips:?}"
-        );
-    }
+    assert_eq!(recorded.len(), 1);
+    assert_eq!(
+        recorded[0], resolvers,
+        "set_servers must receive the full mixed v4+v6 list"
+    );
+    applied.shutdown().await;
+}
+
+/// `Dns::apply` performs zero `get_settings` calls — nothing is captured
+/// before overwriting resolvers, because there is nothing left to restore
+/// but `hole-tun` itself.
+#[skuld::test]
+async fn dns_apply_captures_nothing() {
+    let backend = MockBackend::new();
+    let confiner = MockConfiner::new();
+    let dns = SystemDns::new_with_backend(
+        Arc::clone(&backend) as Arc<dyn WinDnsBackend>,
+        confiner as Arc<dyn DnsConfiner>,
+    );
+
+    let mut applied = dns
+        .apply(
+            vec![IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))],
+            tun_identity(),
+            server_ip(),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("apply should succeed");
+
+    assert_eq!(backend.get_calls.load(SeqCst), 0);
     applied.shutdown().await;
 }
 
