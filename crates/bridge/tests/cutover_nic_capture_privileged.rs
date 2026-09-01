@@ -20,7 +20,7 @@
 //! Local verification is COMPILE + clippy only.
 //!
 //! Cross-binary serialization of the global WFP/pf/TUN state lives in
-//! `.config/nextest.toml` (`global-net-state` test-group). COUPLED NAMES: that
+//! `.config/nextest.toml` (`global_net_state` test-group). COUPLED NAMES: that
 //! group's filter matches by the `cutover_global_net_state_` prefix — renaming
 //! it WITHOUT updating the filter drops the test from the group (a silent
 //! cross-binary race). Change both together.
@@ -34,12 +34,15 @@ fn main() {
 #[skuld::label]
 const TUN: skuld::Label;
 
+/// Cross-binary serialization for tests that mutate GLOBAL OS network state —
+/// the `.config/nextest.toml` `global_net_state` test-group's `max-threads = 1`
+/// gate. This is a separate compiled binary, not part of `hole-bridge`'s lib
+/// target, so it needs its own declaration (bindreams/hole#894).
+#[skuld::label]
+const GLOBAL_NET_STATE: skuld::Label;
+
 #[cfg(target_os = "windows")]
 use std::net::{IpAddr, SocketAddr};
-#[cfg(target_os = "windows")]
-use std::path::Path;
-#[cfg(target_os = "windows")]
-use std::process::Command;
 
 // Engaged as the server IP — the WFP server permit at ALE_AUTH_CONNECT keys on
 // RemoteIp, which is protocol-agnostic, so a UDP datagram to it egresses. That
@@ -63,90 +66,13 @@ fn tcp_reachable(addr: SocketAddr) -> bool {
     std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(5)).is_ok()
 }
 
-/// Run a `pktmon` subcommand, failing loud on a non-zero exit. `pktmon` is the
-/// proof's measurement apparatus — a missing or broken pktmon must FAIL the
-/// test, never silently skip it.
+// `pktmon`, `PktmonGuard`, `send_marker`, `capture_contains_nonce`, and
+// `nonce` live in `tun_engine::test_utils::pktmon` — promoted there so this
+// crate and `tun-engine`'s own `dns_confine` privileged tests share one copy
+// instead of drifting (see that module's doc and this crate's `Cargo.toml`
+// dev-dependency comment on `tun-engine`).
 #[cfg(target_os = "windows")]
-fn pktmon(args: &[&str]) -> std::process::Output {
-    let out = Command::new("pktmon")
-        .args(args)
-        .output()
-        .unwrap_or_else(|e| panic!("pktmon is the measurement apparatus and must be present: spawn {args:?}: {e}"));
-    assert!(
-        out.status.success(),
-        "pktmon {args:?} failed ({}): stdout={} stderr={}",
-        out.status,
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr),
-    );
-    out
-}
-
-/// RAII guard that always tears down the live pktmon session and filters, so a
-/// panicking assertion never leaves a capture running or filters installed on
-/// the runner. Mirrors the cover guard / EtwGuard discipline.
-///
-/// `stop` ends the capture, `filter remove` clears the filter set (`reset` only
-/// zeroes counters, so it does NOT remove filters), `reset` clears counters as a
-/// final tidy. Best-effort: Drop must not panic, so failures are swallowed here —
-/// the positive assertions live in the test body.
-#[cfg(target_os = "windows")]
-struct PktmonGuard;
-
-#[cfg(target_os = "windows")]
-impl Drop for PktmonGuard {
-    fn drop(&mut self) {
-        for args in [
-            ["stop"].as_slice(),
-            ["filter", "remove"].as_slice(),
-            ["reset"].as_slice(),
-        ] {
-            let _ = Command::new("pktmon").args(args).output();
-        }
-    }
-}
-
-/// Send `nonce` followed by 16 zero filler bytes (a 32-byte datagram) to `dst`
-/// from the NIC-bound `socket`. The nonce is the wire fingerprint matched in the
-/// capture.
-///
-/// A bound, unconnected UDP `send_to` does no handshake: the datagram either
-/// egresses (and is captured) or is dropped at `ALE_AUTH_CONNECT` by the cover.
-/// `send_to` returning `Ok` means the kernel accepted it for transmission, not
-/// that WFP let it leave — the capture is the authority on what left.
-#[cfg(target_os = "windows")]
-fn send_marker(
-    rt: &tokio::runtime::Runtime,
-    socket: &tokio::net::UdpSocket,
-    dst: SocketAddr,
-    nonce: [u8; 16],
-) -> std::io::Result<()> {
-    let mut payload = [0u8; 32];
-    payload[..16].copy_from_slice(&nonce);
-    rt.block_on(socket.send_to(&payload, dst)).map(|_| ())
-}
-
-/// Whether the pktmon capture contains `nonce` anywhere in its bytes. The pktmon
-/// filter scopes the capture to UDP, the nonce is the leading 16 bytes of our UDP
-/// payload, and pktmon logs the full frame verbatim (`--pkt-size 0`), so the
-/// nonce appears contiguously in the file iff its packet was captured. A 16-byte
-/// random nonce cannot alias unrelated bytes, so a raw scan is sound — and it
-/// sidesteps both the pcapng-block quirks that trip strict pure-Rust pcapng
-/// parsers on pktmon output and any link-layer (Ethernet II vs raw IP) assumption.
-#[cfg(target_os = "windows")]
-fn capture_contains_nonce(pcapng: &Path, nonce: [u8; 16]) -> bool {
-    let bytes = std::fs::read(pcapng)
-        .unwrap_or_else(|e| panic!("pktmon must have produced the capture {}: {e}", pcapng.display()));
-    bytes.windows(16).any(|w| w == nonce)
-}
-
-/// Generate a fresh random 16-byte nonce per marker so two markers in one
-/// capture never collide and a stale prior-run capture can never match.
-#[cfg(target_os = "windows")]
-fn nonce() -> [u8; 16] {
-    use rand::RngExt;
-    rand::rng().random::<[u8; 16]>()
-}
+use tun_engine::test_utils::{capture_contains_nonce, nonce, pktmon, send_marker, PktmonGuard};
 
 /// Wire-level no-leak proof across the standing lockdown cover.
 ///
@@ -165,10 +91,10 @@ fn nonce() -> [u8; 16] {
 /// leak).
 ///
 /// The name carries the `cutover_global_net_state_` substring so it auto-joins
-/// the `global-net-state` nextest group (cross-binary serialization of the
+/// the `global_net_state` nextest group (cross-binary serialization of the
 /// system-wide WFP state). `serial = TUN` serializes it within this binary.
 #[cfg(target_os = "windows")]
-#[skuld::test(labels = [TUN], serial = TUN)]
+#[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
 fn cutover_global_net_state_nic_capture_no_udp_leak() {
     use tun_engine::gateway::get_default_gateway_info;
     use tun_engine::helpers::bypass::create_bypass_udp;

@@ -18,7 +18,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tun_engine::gateway::GatewayInfo;
 use tun_engine::routing::failclosed::lockdown_state;
-use tun_engine::routing::{self, state as route_state, Routing};
+use tun_engine::routing::{self, state as route_state, RouteId, Routing};
 use tun_engine::RoutingError;
 
 // MockProxy ===========================================================================================================
@@ -169,7 +169,7 @@ pub(super) struct MockRoutingState {
     fail_gateway: AtomicBool,
     cover_engage_calls: AtomicU32,
     pub(super) cover_disengage_calls: AtomicU32,
-    lockdown_engage_calls: AtomicU32,
+    pub(super) lockdown_engage_calls: AtomicU32,
     lockdown_disengage_calls: AtomicU32,
     fail_lockdown: AtomicBool,
     fail_cover: AtomicBool,
@@ -199,6 +199,16 @@ pub(super) struct MockRoutingState {
     /// (a set containing both values) for the double-failure fail-open path.
     /// `fail_cover` (always-fail) is unaffected and takes priority.
     fail_cover_for_resolvers: std::sync::Mutex<std::collections::HashSet<Option<IpAddr>>>,
+    /// `install` excludes any [`RouteId`] in this set from the persisted
+    /// `installed` list — simulates a route whose `add` failed (e.g. another
+    /// VPN already holds that prefix), analogous to `fail_cover_for_resolvers`.
+    fail_routes_for: std::sync::Mutex<std::collections::HashSet<RouteId>>,
+    /// The `installed` set `MockRoutes::drop` saw — the routes a test's mock
+    /// teardown "tore down". Under the fail-closed contract, a successful
+    /// install's `installed` is always the full planned set, so this is
+    /// currently only exercised to prove no teardown ran at all (`is_none()`
+    /// in `partial_route_failure_fails_closed_and_clears_state`).
+    pub(super) last_teardown_installed: std::sync::Mutex<Option<Vec<RouteId>>>,
 }
 
 impl Default for MockRoutingState {
@@ -221,6 +231,8 @@ impl Default for MockRoutingState {
             last_cover_server_ip: std::sync::Mutex::new(None),
             last_cover_resolver_ip: std::sync::Mutex::new(None),
             fail_cover_for_resolvers: std::sync::Mutex::new(std::collections::HashSet::new()),
+            fail_routes_for: std::sync::Mutex::new(std::collections::HashSet::new()),
+            last_teardown_installed: std::sync::Mutex::new(None),
         }
     }
 }
@@ -233,6 +245,11 @@ pub(super) struct MockRouting {
     /// routing a `TempDir` (see `new_manager`) to keep writes isolated.
     state_dir: PathBuf,
     gateway: IpAddr,
+    /// `GatewayInfo::interface_name` returned by `default_gateway`. Default
+    /// "MockEthernet"; a test can override it via
+    /// [`Self::with_gateway_interface_name`] to stand in for a foreign VPN
+    /// adapter (bindreams/hole#846's `dns_apply_targets_only_the_hole_tun`).
+    gateway_interface_name: String,
 }
 
 impl MockRouting {
@@ -241,7 +258,13 @@ impl MockRouting {
             state: Arc::new(MockRoutingState::default()),
             state_dir,
             gateway: IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)),
+            gateway_interface_name: "MockEthernet".into(),
         }
+    }
+
+    fn with_gateway_interface_name(mut self, name: &str) -> Self {
+        self.gateway_interface_name = name.into();
+        self
     }
 
     fn failing_install(state_dir: PathBuf) -> Self {
@@ -262,6 +285,15 @@ impl MockRouting {
         m
     }
 
+    /// `install` succeeds but excludes `ids` from the persisted/returned
+    /// `installed` set — simulating a partial route failure (e.g. another
+    /// VPN already holding one of the split prefixes).
+    fn failing_routes(state_dir: PathBuf, ids: impl IntoIterator<Item = RouteId>) -> Self {
+        let m = Self::new(state_dir);
+        m.state.fail_routes_for.lock().unwrap().extend(ids);
+        m
+    }
+
     pub(super) fn state(&self) -> Arc<MockRoutingState> {
         Arc::clone(&self.state)
     }
@@ -270,15 +302,23 @@ impl MockRouting {
 impl Routing for MockRouting {
     type Installed = MockRoutes;
 
-    fn install(
-        &self,
-        tun_name: &str,
-        server_ip: IpAddr,
-        _gateway: IpAddr,
-        interface_name: &str,
-    ) -> Result<MockRoutes, RoutingError> {
+    fn install(&self, tun_name: &str, server_ip: IpAddr, gateway: &GatewayInfo) -> Result<MockRoutes, RoutingError> {
+        let interface_name = gateway.interface_name.as_str();
         self.state.install_calls.fetch_add(1, Ordering::SeqCst);
         *self.state.last_install_server_ip.lock().unwrap() = Some(server_ip);
+
+        // Narrowed by `fail_routes_for` — a real partial install (e.g.
+        // another VPN already holding one of the split prefixes) never
+        // records the failed id, matching `SystemRouting::install`'s
+        // per-command checkpointing.
+        let fail_routes_for = self.state.fail_routes_for.lock().unwrap();
+        let planned = routing::planned_routes(server_ip);
+        let installed: Vec<RouteId> = planned
+            .iter()
+            .copied()
+            .filter(|id| !fail_routes_for.contains(id))
+            .collect();
+        drop(fail_routes_for);
 
         // Match `SystemRouting::install`'s critical ordering: write the
         // state file BEFORE any route mutation (or in this case, before
@@ -289,6 +329,9 @@ impl Routing for MockRouting {
             tun_name: tun_name.to_owned(),
             server_ip,
             interface_name: interface_name.to_owned(),
+            original_gateway: Some(gateway.gateway_ip),
+            installed: installed.clone(),
+            stale: Vec::new(),
         };
         route_state::save(&self.state_dir, &persisted, None)
             .map_err(|e| RoutingError::RouteSetup(format!("mock persist failed: {e}")))?;
@@ -300,9 +343,27 @@ impl Routing for MockRouting {
             return Err(RoutingError::RouteSetup("mock install failure".into()));
         }
 
+        if installed.len() != planned.len() {
+            // Mirror `SystemRouting::install`'s fail-closed contract: a
+            // narrowed `installed` is never returned as `Ok` — a degraded
+            // tunnel is worse than no tunnel (Rule #0). Roll back (clear the
+            // file we just wrote) and fail closed instead. Unlike
+            // `rollback_and_record`, this unconditionally clears rather than
+            // consulting `persisted.stale` — stale-group interaction with
+            // fail-closed rollback is untested at this layer and is covered
+            // only by the tun-engine unit tests in routing_tests.rs.
+            let _ = route_state::clear(&self.state_dir);
+            return Err(RoutingError::RouteSetup(format!(
+                "route install incomplete: {}/{} routes confirmed",
+                installed.len(),
+                planned.len()
+            )));
+        }
+
         Ok(MockRoutes {
             state: Arc::clone(&self.state),
             state_dir: self.state_dir.clone(),
+            installed,
         })
     }
 
@@ -312,7 +373,7 @@ impl Routing for MockRouting {
         }
         Ok(GatewayInfo {
             gateway_ip: self.gateway,
-            interface_name: "MockEthernet".into(),
+            interface_name: self.gateway_interface_name.clone(),
             interface_index: 1,
             ipv6_available: false,
         })
@@ -374,12 +435,15 @@ impl Routing for MockRouting {
 pub(super) struct MockRoutes {
     state: Arc<MockRoutingState>,
     state_dir: PathBuf,
+    /// The routes `install` actually recorded — mirrors `SystemRoutes.installed`.
+    installed: Vec<RouteId>,
 }
 
 impl Drop for MockRoutes {
     fn drop(&mut self) {
         self.state.teardown_calls.fetch_add(1, Ordering::SeqCst);
         self.state.teardown_order.lock().unwrap().push("routes");
+        *self.state.last_teardown_installed.lock().unwrap() = Some(self.installed.clone());
         let _ = route_state::clear(&self.state_dir);
     }
 }
@@ -518,6 +582,22 @@ fn new_manager_with_lockdown(
     (pm, dir)
 }
 
+/// `new_manager_with_routing` variant that also substitutes `MockDns` for
+/// `SystemDns`, so a unit test can reach Phase 7 (`Dns::apply`) and inspect
+/// what it was called with, without touching the host's real OS DNS.
+fn new_manager_with_dns(
+    proxy: MockProxy,
+    routing: MockRouting,
+    dns: crate::test_support::mock_dns::MockDns,
+    dir: tempfile::TempDir,
+) -> (
+    ProxyManager<MockProxy, MockRouting, crate::test_support::mock_dns::MockDns>,
+    tempfile::TempDir,
+) {
+    let pm = ProxyManager::new_with_dns(proxy, routing, dns);
+    (pm, dir)
+}
+
 pub(super) fn test_config() -> ProxyConfig {
     ProxyConfig {
         server: ServerEntry {
@@ -565,6 +645,38 @@ pub(super) fn test_config() -> ProxyConfig {
 const ECH_CAPABLE_OPTS: &str = "tls;host=cdn.example";
 
 // Tests ===============================================================================================================
+
+/// Scaffolding for #846: no unit test reaches `Dns::apply` through
+/// `start_inner` before this — the Phase-4 forwarder self-test gate fails
+/// first because `MockProxy` binds nothing. Wiring `Socks5DnsUpstream` in
+/// as the real listener at `config.local_port`, plus `MockDns` standing in
+/// for `SystemDns`, lets a Full-mode start clear the gate and reach Phase 7.
+#[skuld::test]
+fn start_reaches_dns_apply_when_the_forwarder_answers() {
+    rt().block_on(async {
+        let upstream = crate::test_support::socks5_dns_upstream::Socks5DnsUpstream::bind()
+            .await
+            .unwrap();
+        let dns = crate::test_support::mock_dns::MockDns::new();
+        let dns_state = dns.state_handle();
+
+        let dir = tempfile::tempdir().unwrap();
+        let routing = MockRouting::new(dir.path().to_path_buf());
+        let (mut pm, _dir) = new_manager_with_dns(MockProxy::new(), routing, dns, dir);
+
+        let mut config = test_config();
+        config.local_port = upstream.port();
+        config.dns.enabled = true;
+        config.dns.protocol = hole_common::config::DnsProtocol::PlainTcp;
+        config.dns.servers = vec![IpAddr::V4(Ipv4Addr::new(198, 51, 100, 53))];
+
+        pm.start(&config).await.unwrap();
+
+        assert_eq!(dns_state.calls().len(), 1, "Dns::apply must be called exactly once");
+
+        pm.stop().await.unwrap();
+    });
+}
 
 #[skuld::test]
 fn start_transitions_to_running() {
@@ -1258,6 +1370,53 @@ fn stop_with_cutover_disarms_lockdown_but_user_stop_disengages() {
     });
 }
 
+// lockdown_app_ids ====================================================================================================
+//
+// `resolve_plugin_path` deliberately falls back to the bare binary name when
+// it can't find the plugin next to the bridge exe, so shadowsocks can still
+// do a PATH lookup at spawn (see its own doc). `FwpmGetAppIdFromFileName0`
+// does no PATH search, so that bare name is not a resolvable path for it.
+
+/// A bare (no directory component) plugin name must be omitted from the
+/// App-ID list with a `warn!`, mirroring the `current_exe()`-failure
+/// handling — a narrowed permit set, never a fatal error, and never a bare
+/// name fed to the Win32 App-ID API.
+#[cfg(target_os = "windows")]
+#[skuld::test]
+fn lockdown_app_ids_skips_an_unresolvable_plugin_path() {
+    use crate::test_support::log_capture::VecWriter;
+    use tracing_subscriber::fmt;
+    use tracing_subscriber::layer::{Layer, SubscriberExt};
+
+    let writer = VecWriter::new();
+    let subscriber = tracing_subscriber::registry().with(
+        fmt::layer()
+            .with_writer(writer.clone())
+            .with_ansi(false)
+            .with_filter(tracing_subscriber::filter::LevelFilter::WARN),
+    );
+    let _guard = garter::tracing_test::set_default_in_current_thread(subscriber);
+
+    let mut config = test_config();
+    // Not a known friendly plugin name and not a file that exists next to
+    // the test binary — `resolve_plugin_path` falls back to this bare
+    // string verbatim.
+    config.server.plugin = Some("definitely-not-a-real-plugin-binary".into());
+
+    let ids = lockdown_app_ids(&config);
+
+    assert!(
+        ids.iter()
+            .all(|p| p.parent().is_some_and(|d| !d.as_os_str().is_empty())),
+        "no bare (unresolvable) path may reach the App-ID list: {ids:?}"
+    );
+    let output = writer.snapshot_string();
+    assert!(
+        output.contains("WARN") && output.contains("App-ID"),
+        "expected a WARN log naming the omitted App-ID permit; got:\n{output}"
+    );
+}
+
 // last_error coverage for early-failure paths =========================================================================
 
 #[skuld::test]
@@ -1381,6 +1540,46 @@ fn route_failure_clears_stale_state_file() {
         assert!(
             !state_path.exists(),
             "state file must be cleared on routing.install failure"
+        );
+    });
+}
+
+/// A partial route failure (another VPN already holds one of the split
+/// prefixes) must fail the whole `start` closed, not return a degraded
+/// tunnel — `SystemRouting::install` treats a narrowed `installed` as a
+/// hard error and rolls back (Rule #0: a user who believes traffic is
+/// captured when some of it is not is worse off than one told Hole failed
+/// to connect). `MockRouting::failing_routes` mirrors that contract.
+#[skuld::test]
+fn partial_route_failure_fails_closed_and_clears_state() {
+    rt().block_on(async {
+        let proxy = MockProxy::new();
+        let dir = tempfile::tempdir().unwrap();
+        let state_path = dir.path().join(route_state::STATE_FILE_NAME);
+        let routing = MockRouting::failing_routes(dir.path().to_path_buf(), [routing::RouteId::SplitV4Low]);
+        let routing_state = routing.state();
+
+        let (mut pm, _dir) = new_manager_with_routing(proxy, routing, dir);
+        // A non-loopback server so `planned_routes` includes the bypass —
+        // `test_config()`'s default `127.0.0.1` would not.
+        let mut config = test_config();
+        config.server.server = "9.9.9.9".into();
+
+        let err = pm.start(&config).await.unwrap_err();
+        assert!(err.to_string().contains("route install incomplete"), "got: {err}");
+
+        assert_eq!(
+            pm.state(),
+            ProxyState::Stopped,
+            "a failed-closed install must leave the manager idle, not holding a degraded guard"
+        );
+        assert!(
+            !state_path.exists(),
+            "a partial install must roll back and clear the state file, not leak a narrowed record"
+        );
+        assert!(
+            routing_state.last_teardown_installed.lock().unwrap().is_none(),
+            "no guard was ever handed out, so MockRoutes::drop must never have run"
         );
     });
 }
@@ -1628,24 +1827,65 @@ fn reload_when_not_running_starts() {
         pm.stop().await.unwrap();
     });
 }
-
 // DNS-apply instrumentation tests =====================================================================================
+//
+// The ONE production target (`hole-tun`) is pinned by
+// `dns_apply_targets_only_the_hole_tun` below, which drives `start_inner`,
+// not a hand-built `SystemDns::apply` call.
 
 /// Smoke-test: `apply_dns_settings` must emit an INFO log
-/// `"apply_dns_settings done"` with an `elapsed_ms` field so the ~10s
-/// stall is diagnosable without raising the log level.
-///
-/// Uses a nonexistent upstream interface name so the underlying `netsh` /
-/// `networksetup` calls fail fast (adapter not found), but the wrapping
-/// instrumentation still emits the diagnostic.
+/// `"apply_dns_settings done"` with an `elapsed_ms` field so a slow apply
+/// is diagnosable without raising the log level. Uses a succeeding mock
+/// backend + confiner: `apply` is fail-fatal on a real failure, so a
+/// nonexistent alias can't be used to force a fast no-op path instead.
+#[cfg(target_os = "windows")]
 #[skuld::test]
 fn dns_apply_emits_done_info_log() {
-    use crate::dns::system::{Dns, SystemDns};
+    use crate::dns::system::windows::{DnsConfiner, WinDnsBackend};
+    use crate::dns::system::{Dns, DnsApplied, SystemDns};
+    use crate::dns_state::{AdapterId, DnsPrior, DnsPriorAdapter};
     use crate::test_support::log_capture::VecWriter;
     use std::net::{IpAddr, Ipv4Addr};
+    use std::sync::Arc;
     use tokio_util::sync::CancellationToken;
     use tracing_subscriber::fmt;
     use tracing_subscriber::layer::{Layer, SubscriberExt};
+
+    struct OkBackend;
+    impl WinDnsBackend for OkBackend {
+        fn get_settings(&self, alias: &str) -> std::io::Result<Option<DnsPriorAdapter>> {
+            Ok(Some(DnsPriorAdapter {
+                id: AdapterId::WindowsAlias {
+                    value: alias.to_string(),
+                },
+                name_at_capture: alias.to_string(),
+                v4: DnsPrior::None,
+                v6: DnsPrior::None,
+            }))
+        }
+        fn set_servers(&self, _luid: u64, _servers: &[IpAddr]) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn restore(&self, _adapter: &DnsPriorAdapter) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn restore_family(&self, _alias: &str, _ipv6: bool, _prior: &DnsPrior) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn flush(&self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    struct OkConfiner;
+    impl DnsConfiner for OkConfiner {
+        fn engage(
+            &self,
+            _tun_luid: u64,
+            _server_ip: IpAddr,
+        ) -> Result<Box<dyn std::any::Any + Send>, tun_engine::dns_confine::DnsConfineError> {
+            Ok(Box::new(()))
+        }
+    }
 
     // Current-thread runtime so `tokio::spawn` in `SystemDns::apply`
     // (or anything downstream) stays on the test thread. The helper
@@ -1664,21 +1904,16 @@ fn dns_apply_emits_done_info_log() {
             );
             let _guard = garter::tracing_test::set_default_in_current_thread(subscriber);
 
-            let dns = SystemDns::default();
-            // Adapter doesn't exist — `Win32Real::get_settings` returns
-            // `Ok(None)` so nothing is captured and apply also no-ops, but
-            // the surrounding `apply_dns_settings done` INFO log still fires.
+            let dns = SystemDns::new_with_backend(Arc::new(OkBackend), Arc::new(OkConfiner));
             let mut applied = dns
                 .apply(
                     vec![IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))],
-                    vec!["hole-test-nonexistent-iface-xyz".into()],
-                    vec![],
-                    None,
-                    None,
+                    tun_engine::TunIdentity::synthetic(0xFEED, "hole-tun"),
+                    IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7)),
                     CancellationToken::new(),
                 )
                 .await
-                .expect("apply ok with missing adapter");
+                .expect("apply ok");
             applied.shutdown().await;
 
             let output = writer.snapshot_string();
@@ -1694,121 +1929,200 @@ fn dns_apply_emits_done_info_log() {
         });
 }
 
-// TUN skipped from capture, kept in apply =============================================================================
-//
-// The TUN adapter is created by `routing.install` immediately before
-// `apply_dns_settings` runs. Its prior DNS is whatever Windows defaults a
-// brand-new adapter to — unknowable and uninteresting. Calling
-// `netsh show dnsservers` against a freshly-created adapter is also the
-// slowest case on Windows. So capture runs on upstream only; apply still
-// runs on both.
-//
-// Test strategy: DEBUG-level log capture, assert the per-alias lines from
-// `dns::system::windows` show the expected asymmetry.
+// Phase 7 target + fail-fatal tests (bindreams/hole#846) ==============================================================
 
+/// `Dns::apply` must be reachable only with `hole-tun` — never the foreign
+/// gateway interface name `MockRouting::default_gateway` reports. Drives
+/// the REAL `start_inner` wiring (not a hand-built `MockDns::apply` call),
+/// so this catches a second target being reintroduced; it cannot catch the
+/// identity itself being wrong — `TunIdentity` having no production
+/// constructor reachable from a `GatewayInfo` is what rules that out.
+#[skuld::test]
+fn dns_apply_targets_only_the_hole_tun() {
+    rt().block_on(async {
+        let upstream = crate::test_support::socks5_dns_upstream::Socks5DnsUpstream::bind()
+            .await
+            .unwrap();
+        let dns = crate::test_support::mock_dns::MockDns::new();
+        let dns_state = dns.state_handle();
+
+        let dir = tempfile::tempdir().unwrap();
+        let routing = MockRouting::new(dir.path().to_path_buf()).with_gateway_interface_name("PretendForeignVpnTun");
+        let (mut pm, _dir) = new_manager_with_dns(MockProxy::new(), routing, dns, dir);
+
+        let mut config = test_config();
+        config.local_port = upstream.port();
+        config.dns.enabled = true;
+        config.dns.protocol = hole_common::config::DnsProtocol::PlainTcp;
+        config.dns.servers = vec![IpAddr::V4(Ipv4Addr::new(198, 51, 100, 53))];
+
+        pm.start(&config).await.unwrap();
+
+        let calls = dns_state.calls();
+        assert_eq!(calls.len(), 1, "Dns::apply must be called exactly once");
+        assert_eq!(
+            calls[0].targets,
+            vec!["hole-tun".to_string()],
+            "Dns::apply must target only hole-tun"
+        );
+        assert!(
+            !calls[0].targets.iter().any(|t| t == "PretendForeignVpnTun"),
+            "the foreign gateway interface name must never appear in the recorded call: {:?}",
+            calls[0].targets
+        );
+
+        pm.stop().await.unwrap();
+    });
+}
+
+/// A `set_servers` failure on Windows is fail-fatal, pinned through
+/// `start_inner` with a REAL `SystemDns` (a failing `WinDnsBackend` mock +
+/// an always-succeeding confiner mock) — `confinement_failure_aborts_the_start`
+/// below pins a DIFFERENT arm (`DnsError::Confine`) and cannot stand in for
+/// this one.
 #[cfg(target_os = "windows")]
 #[skuld::test]
-fn dns_apply_skips_tun_from_capture_keeps_in_apply() {
-    use crate::dns::system::{Dns, SystemDns};
-    use crate::proxy::TUN_DEVICE_NAME;
-    use crate::test_support::log_capture::VecWriter;
-    use std::net::{IpAddr, Ipv4Addr};
-    use tokio_util::sync::CancellationToken;
-    use tracing_subscriber::fmt;
-    use tracing_subscriber::layer::{Layer, SubscriberExt};
+fn windows_set_servers_failure_aborts_the_start() {
+    use crate::dns::system::windows::{DnsConfiner, WinDnsBackend};
+    use crate::dns::system::SystemDns;
+    use crate::dns_state::{DnsPrior, DnsPriorAdapter};
 
-    // Current-thread runtime — see `dns_apply_emits_done_info_log`
-    // for why the multi-thread `rt()` is unsafe with `set_default`.
-    // bindreams/hole#302.
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap()
-        .block_on(async {
-            let writer = VecWriter::new();
-            let subscriber = tracing_subscriber::registry().with(
-                fmt::layer()
-                    .with_writer(writer.clone())
-                    .with_ansi(false)
-                    .with_filter(tracing_subscriber::filter::LevelFilter::DEBUG),
-            );
-            let _guard = garter::tracing_test::set_default_in_current_thread(subscriber);
+    struct FailingSetBackend;
+    impl WinDnsBackend for FailingSetBackend {
+        fn get_settings(&self, _alias: &str) -> std::io::Result<Option<DnsPriorAdapter>> {
+            unreachable!("apply never calls get_settings")
+        }
+        fn set_servers(&self, _luid: u64, _servers: &[IpAddr]) -> std::io::Result<()> {
+            Err(std::io::Error::other("mock set_servers failure"))
+        }
+        fn restore(&self, _adapter: &DnsPriorAdapter) -> std::io::Result<()> {
+            unreachable!("apply never calls restore")
+        }
+        fn restore_family(&self, _alias: &str, _ipv6: bool, _prior: &DnsPrior) -> std::io::Result<()> {
+            unreachable!("apply never calls restore_family")
+        }
+        fn flush(&self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    struct OkConfiner;
+    impl DnsConfiner for OkConfiner {
+        fn engage(
+            &self,
+            _tun_luid: u64,
+            _server_ip: IpAddr,
+        ) -> Result<Box<dyn std::any::Any + Send>, tun_engine::dns_confine::DnsConfineError> {
+            Ok(Box::new(()))
+        }
+    }
 
-            // Upstream alias uses a distinctive name so we can grep for it.
-            // Mirrors `start_inner`'s phase 7 wiring: capture_aliases=
-            // [upstream] (TUN skipped), apply_aliases=
-            // [TUN, upstream].
-            let dns = SystemDns::default();
-            let mut applied = dns
-                .apply(
-                    vec![IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))],
-                    vec!["hole-p4-test-upstream-xyz".into()],
-                    vec![TUN_DEVICE_NAME.into(), "hole-p4-test-upstream-xyz".into()],
-                    None,
-                    None,
-                    CancellationToken::new(),
-                )
-                .await
-                .expect("apply ok");
-            applied.shutdown().await;
+    rt().block_on(async {
+        let upstream = crate::test_support::socks5_dns_upstream::Socks5DnsUpstream::bind()
+            .await
+            .unwrap();
+        let dns = SystemDns::new_with_backend(std::sync::Arc::new(FailingSetBackend), std::sync::Arc::new(OkConfiner));
 
-            let output = writer.snapshot_string();
+        let dir = tempfile::tempdir().unwrap();
+        let routing = MockRouting::new(dir.path().to_path_buf());
+        let mut pm = ProxyManager::new_with_dns(MockProxy::new(), routing, dns);
 
-            // The per-FFI lines from `Win32Real` are emitted on the
-            // blocking pool thread (the `apply_windows` loop dispatches
-            // each backend call via `spawn_blocking`) so the test's
-            // thread-local subscriber never sees them. We assert on the
-            // wrapper lines from `apply_windows` instead — those run on
-            // the test thread.
-            //
-            // Both fake aliases are missing from the system: capture
-            // surfaces `"DNS capture: adapter not found; skipping
-            // alias=..."` (debug); apply surfaces `"DNS apply failed;
-            // continuing alias=..."` (warn). Capture must NEVER carry
-            // the TUN alias; apply MUST carry both.
+        let mut config = test_config();
+        config.local_port = upstream.port();
+        config.dns.enabled = true;
+        config.dns.protocol = hole_common::config::DnsProtocol::PlainTcp;
+        config.dns.servers = vec![IpAddr::V4(Ipv4Addr::new(198, 51, 100, 53))];
 
-            // CAPTURE side: only the upstream alias appears.
-            let capture_lines: Vec<&str> = output
-                .lines()
-                .filter(|l| l.contains("DNS capture: adapter not found"))
-                .collect();
-            assert!(
-                !capture_lines.is_empty(),
-                "expected at least one capture-side DEBUG line; got:\n{output}"
-            );
-            for line in &capture_lines {
-                assert!(
-                    !line.contains(&format!("alias={TUN_DEVICE_NAME}")),
-                    "capture ran on TUN — expected to be skipped. line: {line}"
-                );
-            }
-            assert!(
-                capture_lines
-                    .iter()
-                    .any(|l| l.contains("alias=hole-p4-test-upstream-xyz")),
-                "capture should have run on upstream alias; got:\n{output}"
-            );
+        let result = pm.start(&config).await;
+        match result {
+            Err(ProxyError::Runtime(_)) => {}
+            other => panic!(
+                "expected Err(ProxyError::Runtime), got {}",
+                describe_start_result(&other)
+            ),
+        }
+        assert_eq!(pm.state(), ProxyState::Stopped, "no session may be left running");
+    });
+}
 
-            // APPLY side: the TUN alias DOES appear — we still set
-            // loopback DNS on the TUN so the OS's best-route-to-DNS
-            // lookup lands on 127.x.
-            let apply_lines: Vec<&str> = output
-                .lines()
-                .filter(|l| l.contains("DNS apply failed; continuing"))
-                .collect();
-            assert!(
-                apply_lines
-                    .iter()
-                    .any(|l| l.contains(&format!("alias={TUN_DEVICE_NAME}"))),
-                "apply should have run on TUN alias; got:\n{output}"
-            );
-            assert!(
-                apply_lines
-                    .iter()
-                    .any(|l| l.contains("alias=hole-p4-test-upstream-xyz")),
-                "apply should have run on upstream alias; got:\n{output}"
-            );
-        });
+/// Asserts the SPECIFIC `DnsError::Confine` / `ProxyError::DnsConfinementFailed`
+/// variant, not just `state() == Stopped` — the latter alone would pass
+/// vacuously for any early failure; the paired negative below keeps this
+/// from passing because the start failed for unrelated reasons. Windows-only:
+/// `dns_confine` is Windows-gated entirely, and macOS has no confinement to
+/// fail.
+#[cfg(target_os = "windows")]
+#[skuld::test]
+fn confinement_failure_aborts_the_start() {
+    rt().block_on(async {
+        let upstream = crate::test_support::socks5_dns_upstream::Socks5DnsUpstream::bind()
+            .await
+            .unwrap();
+        let dns =
+            crate::test_support::mock_dns::MockDns::new().fail_with(crate::test_support::mock_dns::FailKind::Confine);
+
+        let dir = tempfile::tempdir().unwrap();
+        let routing = MockRouting::new(dir.path().to_path_buf());
+        let (mut pm, _dir) = new_manager_with_dns(MockProxy::new(), routing, dns, dir);
+
+        let mut config = test_config();
+        config.local_port = upstream.port();
+        config.dns.enabled = true;
+        config.dns.protocol = hole_common::config::DnsProtocol::PlainTcp;
+        config.dns.servers = vec![IpAddr::V4(Ipv4Addr::new(198, 51, 100, 53))];
+
+        let result = pm.start(&config).await;
+        match result {
+            Err(ProxyError::DnsConfinementFailed { .. }) => {}
+            other => panic!(
+                "expected Err(DnsConfinementFailed), got {}",
+                describe_start_result(&other)
+            ),
+        }
+        assert_eq!(pm.state(), ProxyState::Stopped);
+    });
+}
+
+/// The paired negative for [`confinement_failure_aborts_the_start`]: a
+/// successful confinement must NOT abort the start. Without this, the
+/// failure test could pass vacuously if `start` always failed on this
+/// config for some unrelated reason.
+#[skuld::test]
+fn successful_confinement_does_not_abort_the_start() {
+    rt().block_on(async {
+        let upstream = crate::test_support::socks5_dns_upstream::Socks5DnsUpstream::bind()
+            .await
+            .unwrap();
+        let dns = crate::test_support::mock_dns::MockDns::new();
+
+        let dir = tempfile::tempdir().unwrap();
+        let routing = MockRouting::new(dir.path().to_path_buf());
+        let (mut pm, _dir) = new_manager_with_dns(MockProxy::new(), routing, dns, dir);
+
+        let mut config = test_config();
+        config.local_port = upstream.port();
+        config.dns.enabled = true;
+        config.dns.protocol = hole_common::config::DnsProtocol::PlainTcp;
+        config.dns.servers = vec![IpAddr::V4(Ipv4Addr::new(198, 51, 100, 53))];
+
+        pm.start(&config)
+            .await
+            .expect("start must succeed with a successful confinement");
+        assert_eq!(pm.state(), ProxyState::Running);
+
+        pm.stop().await.unwrap();
+    });
+}
+
+/// PII-free-ish debug helper: `ProxyError` doesn't need to hide anything in
+/// tests, but `Result<(), ProxyError>` isn't `Debug` when the `Ok` payload
+/// doesn't matter — this just renders the two cases we care about. Used
+/// only by `confinement_failure_aborts_the_start` (Windows-only).
+#[cfg(target_os = "windows")]
+fn describe_start_result(result: &Result<(), ProxyError>) -> String {
+    match result {
+        Ok(()) => "Ok(())".to_string(),
+        Err(e) => format!("Err({e})"),
+    }
 }
 
 // Transports-driven UDP-drop policy ===================================================================================
@@ -2304,7 +2618,7 @@ mod self_test {
         let (pm, dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, lockdown);
 
         let mut cfg = test_config();
-        cfg.server.server = closed.ip().to_string();
+        cfg.server.server = closed.ip().to_string().into();
         cfg.server.server_port = closed.port();
         cfg.dns.enabled = true;
         cfg.dns.servers = vec!["127.0.0.1".parse().unwrap()];
@@ -2434,7 +2748,7 @@ mod self_test {
         let st = routing.state();
         let (pm, dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, lockdown);
         let mut cfg = test_config();
-        cfg.server.server = closed.ip().to_string();
+        cfg.server.server = closed.ip().to_string().into();
         cfg.server.server_port = closed.port();
         cfg.dns.enabled = true;
         cfg.dns.servers = vec!["127.0.0.1".parse().unwrap()];
@@ -4685,12 +4999,12 @@ mod self_test {
             pm.start(&cfg).await.unwrap();
             assert_eq!(pm.state(), ProxyState::Running, "setup must leave a live session");
 
-            let server_ip: IpAddr = cfg.server.server.parse().unwrap();
+            let server_ip: IpAddr = cfg.server.server.expose().parse().unwrap();
             let second_routing = MockRouting::new(dir.path().to_path_buf());
             let cover = second_routing.install_failclosed_cover(server_ip, None).unwrap();
             pm.posture.hold_pending(BlockedStart {
                 cover,
-                host: cfg.server.server.clone(),
+                host: cfg.server.server.expose().to_string(),
                 server_ip,
                 pin: crate::dns::ech::PinSource::NoQueryNeeded,
                 resolver_permit: None,
@@ -4712,16 +5026,445 @@ mod self_test {
                 .unwrap_err();
             assert!(pm.blocked_until_connected(), "setup must leave a pending start held");
 
-            let server_ip: IpAddr = cfg.server.server.parse().unwrap();
+            let server_ip: IpAddr = cfg.server.server.expose().parse().unwrap();
             let second_routing = MockRouting::new(dir.path().to_path_buf());
             let cover = second_routing.install_failclosed_cover(server_ip, None).unwrap();
             pm.posture.hold_pending(BlockedStart {
                 cover,
-                host: cfg.server.server.clone(),
+                host: cfg.server.server.expose().to_string(),
                 server_ip,
                 pin: crate::dns::ech::PinSource::NoQueryNeeded,
                 resolver_permit: None,
             });
         });
     }
+}
+
+// Adopted-cover claim =================================================================================================
+//
+// See `ProxyManager::adopted_standing_cover` for the two facts these split.
+
+#[skuld::test]
+fn lockdown_enabled_reports_armed_when_the_intent_file_is_unreadable() {
+    // Losing the record is not the user telling us to disarm, so the tray keeps
+    // rendering Lockdown: On and keeps the Unblock item on the menu.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join(lockdown_state::STATE_FILE_NAME), b"{corrupt").unwrap();
+    let routing = MockRouting::new(dir.path().to_path_buf());
+    let pm = ProxyManager::new(MockProxy::new(), routing).with_state_dir(dir.path().to_path_buf());
+
+    assert!(pm.lockdown_enabled(), "a corrupt intent must read as ARMED");
+    assert!(
+        !pm.standing_cover_expected(),
+        "but it must NOT be taken as authority to install a standing cover"
+    );
+}
+
+#[skuld::test]
+fn a_corrupt_intent_file_still_engages_the_transient_cover() {
+    // The fail-safe direction: block early rather than skip the transient cover
+    // for a standing cover that only arrives after routing.install.
+    rt().block_on(async {
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let closed = probe.local_addr().unwrap();
+        drop(probe);
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(lockdown_state::STATE_FILE_NAME), b"{corrupt").unwrap();
+        let routing = MockRouting::new(dir.path().to_path_buf());
+        let st = routing.state();
+        let mut pm = ProxyManager::new(MockProxy::new(), routing).with_state_dir(dir.path().to_path_buf());
+        let mut cfg = test_config();
+        cfg.server.server = closed.ip().to_string().into();
+        cfg.server.server_port = closed.port();
+        cfg.dns.enabled = true;
+        cfg.dns.servers = vec!["127.0.0.1".parse().unwrap()];
+
+        pm.start_cancellable(&cfg, true, CancellationToken::new())
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            st.cover_engage_calls.load(Ordering::SeqCst),
+            1,
+            "a covered start over a corrupt intent must engage the transient cover"
+        );
+        assert_eq!(
+            st.lockdown_engage_calls.load(Ordering::SeqCst),
+            0,
+            "and must not install a standing cover off an unreadable record"
+        );
+        assert!(pm.blocked_until_connected());
+        assert!(pm.lockdown_enabled(), "the escape stays offered throughout");
+    });
+}
+
+#[skuld::test]
+fn an_adopted_cover_makes_the_connect_path_expect_a_standing_cover() {
+    // The otherwise-stranded cell: an EMPTY state dir (no intent at all) plus a
+    // cover recovery adopted. An inert Adopt still names the previous run's TUN
+    // and server IP, so this connect must re-engage through install_lockdown or
+    // it comes up connected with no traffic.
+    rt().block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        let routing = MockRouting::new(dir.path().to_path_buf());
+        let st = routing.state();
+        let mut pm = ProxyManager::new(MockProxy::new(), routing).with_state_dir(dir.path().to_path_buf());
+
+        assert!(
+            !pm.standing_cover_expected(),
+            "baseline: an empty state dir expects none"
+        );
+        pm.set_standing_cover_adopted(true);
+        assert!(pm.standing_cover_expected());
+        assert!(pm.lockdown_enabled(), "and the tray reports armed");
+
+        pm.start(&test_config()).await.unwrap();
+        assert_eq!(
+            st.lockdown_engage_calls.load(Ordering::SeqCst),
+            1,
+            "the adopted cover must be refreshed by this start's install_lockdown"
+        );
+        pm.stop().await.unwrap();
+    });
+}
+
+#[skuld::test]
+fn a_user_stop_that_dropped_a_standing_cover_clears_only_the_live_half() {
+    rt().block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        let routing = MockRouting::new(dir.path().to_path_buf());
+        let st = routing.state();
+        let mut pm = ProxyManager::new(MockProxy::new(), routing).with_state_dir(dir.path().to_path_buf());
+        pm.set_standing_cover_adopted(true);
+        pm.start(&test_config()).await.unwrap();
+
+        pm.stop_with(StopReason::UserStop).await.unwrap();
+        assert_eq!(
+            st.lockdown_disengage_calls.load(Ordering::SeqCst),
+            1,
+            "the user stop opened the host"
+        );
+        assert!(
+            !pm.standing_cover_adopted(),
+            "no cover is live any more, so the claim itself must clear"
+        );
+        assert_eq!(
+            lockdown_state::load_intent(dir.path()),
+            lockdown_state::Intent::On,
+            "but the armed half is durable: only turn_lockdown_off may clear it"
+        );
+        assert!(pm.lockdown_enabled(), "so the tray still reports the switch armed");
+        assert!(pm.standing_cover_expected(), "and the next start re-engages");
+    });
+}
+
+#[skuld::test]
+fn a_cutover_stop_keeps_the_claim() {
+    // A cutover DISARMS the cover: the filters survive the restart, so the host
+    // is still held closed and the escape must still be offered.
+    rt().block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        let routing = MockRouting::new(dir.path().to_path_buf());
+        let st = routing.state();
+        let mut pm = ProxyManager::new(MockProxy::new(), routing).with_state_dir(dir.path().to_path_buf());
+        pm.set_standing_cover_adopted(true);
+        pm.start(&test_config()).await.unwrap();
+
+        pm.stop_with(StopReason::Cutover).await.unwrap();
+        assert_eq!(
+            st.lockdown_disengage_calls.load(Ordering::SeqCst),
+            0,
+            "a cutover disarms rather than disengages"
+        );
+        assert!(
+            pm.lockdown_enabled(),
+            "the cover still holds the host, so the claim stands"
+        );
+        assert!(pm.standing_cover_expected());
+    });
+}
+
+#[skuld::test]
+fn an_adopted_kill_switch_survives_a_stop_and_start() {
+    // The claim that startup recovery measured is the ONLY record of an armed
+    // kill switch in the Adopt cells that record no intent. If a stop is
+    // allowed to destroy it, the next start re-derives `false` and installs
+    // nothing — a disconnect silently disarms the kill switch.
+    rt().block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        let routing = MockRouting::new(dir.path().to_path_buf());
+        let st = routing.state();
+        let mut pm = ProxyManager::new(MockProxy::new(), routing).with_state_dir(dir.path().to_path_buf());
+        pm.set_standing_cover_adopted(true);
+
+        pm.start(&test_config()).await.unwrap();
+        assert_eq!(st.lockdown_engage_calls.load(Ordering::SeqCst), 1);
+        pm.stop().await.unwrap();
+
+        assert!(
+            pm.standing_cover_expected(),
+            "a stop opens the host but must not disarm the kill switch"
+        );
+        pm.start(&test_config()).await.unwrap();
+        assert_eq!(
+            st.lockdown_engage_calls.load(Ordering::SeqCst),
+            2,
+            "the second start must install the standing cover again"
+        );
+        pm.stop().await.unwrap();
+    });
+}
+
+#[skuld::test]
+fn a_config_edit_does_not_disarm_an_adopted_kill_switch() {
+    // The realistic trigger: `reload`'s slow path is `stop()` then `start()`,
+    // so any structural config edit runs the full teardown. Editing a server
+    // address is not a request to turn the kill switch off.
+    rt().block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        let routing = MockRouting::new(dir.path().to_path_buf());
+        let st = routing.state();
+        let mut pm = ProxyManager::new(MockProxy::new(), routing).with_state_dir(dir.path().to_path_buf());
+        pm.set_standing_cover_adopted(true);
+        pm.start(&test_config()).await.unwrap();
+
+        let mut edited = test_config();
+        edited.server.server = "10.0.0.1".into();
+        pm.reload(&edited).await.unwrap();
+
+        assert_eq!(
+            st.lockdown_engage_calls.load(Ordering::SeqCst),
+            2,
+            "the restarted session must come up under a standing cover"
+        );
+        assert!(pm.lockdown_enabled(), "and the tray must still read armed");
+        pm.stop().await.unwrap();
+    });
+}
+
+#[skuld::test]
+fn an_unexpected_session_death_retires_the_claim_too() {
+    // `check_health` drops the same standing-cover guard `stop_with`'s UserStop
+    // arm does, so it must retire the claim on the same terms. Left set, it
+    // would outlive every cover this process can release.
+    rt().block_on(async {
+        let proxy = MockProxy::new();
+        let proxy_state = proxy.state_handle();
+        let dir = tempfile::tempdir().unwrap();
+        let routing = MockRouting::new(dir.path().to_path_buf());
+        let st = routing.state();
+        let mut pm = ProxyManager::new(proxy, routing).with_state_dir(dir.path().to_path_buf());
+        pm.set_standing_cover_adopted(true);
+        pm.start(&test_config()).await.unwrap();
+
+        proxy_state.crashed.store(true, Ordering::SeqCst);
+        pm.check_health();
+
+        assert_eq!(
+            st.lockdown_disengage_calls.load(Ordering::SeqCst),
+            1,
+            "the teardown dropped the standing cover"
+        );
+        assert!(
+            !pm.standing_cover_adopted(),
+            "so the live-cover half of the claim must go with it"
+        );
+        assert!(
+            pm.lockdown_enabled(),
+            "the armed half is durable, so the tray still offers the escape"
+        );
+    });
+}
+
+#[skuld::test]
+fn a_user_stop_whose_release_does_not_confirm_keeps_the_claim_and_the_escape() {
+    // Reintroduction proof for finding 5 (#898 rework): an unconditional
+    // `set_standing_cover_adopted(false)` right after the guard's silent Drop
+    // would clear the claim even when the OS-level release did not confirm —
+    // the Unblock item disappearing exactly in the failure case it exists to
+    // cover (Rule #0).
+    rt().block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        let routing = MockRouting::new(dir.path().to_path_buf());
+        let st = routing.state();
+        let mut pm = ProxyManager::new(MockProxy::new(), routing).with_state_dir(dir.path().to_path_buf());
+        pm.set_standing_cover_adopted(true);
+        pm.start(&test_config()).await.unwrap();
+
+        st.fail_release.store(true, Ordering::SeqCst);
+        pm.stop_with(StopReason::UserStop).await.unwrap();
+
+        assert_eq!(
+            st.release_all_calls.load(Ordering::SeqCst),
+            1,
+            "the confirmable release path must be tried"
+        );
+        assert!(
+            pm.standing_cover_adopted(),
+            "an unconfirmed release must leave the live-cover claim set"
+        );
+        assert!(
+            pm.lockdown_enabled(),
+            "the escape must stay on the tray when the release did not confirm"
+        );
+    });
+}
+
+#[skuld::test]
+fn a_crashed_session_whose_release_does_not_confirm_keeps_the_claim() {
+    // Same proof as above, over `check_health`'s teardown of a dead session.
+    rt().block_on(async {
+        let proxy = MockProxy::new();
+        let proxy_state = proxy.state_handle();
+        let dir = tempfile::tempdir().unwrap();
+        let routing = MockRouting::new(dir.path().to_path_buf());
+        let st = routing.state();
+        let mut pm = ProxyManager::new(proxy, routing).with_state_dir(dir.path().to_path_buf());
+        pm.set_standing_cover_adopted(true);
+        pm.start(&test_config()).await.unwrap();
+
+        st.fail_release.store(true, Ordering::SeqCst);
+        proxy_state.crashed.store(true, Ordering::SeqCst);
+        pm.check_health();
+
+        assert_eq!(
+            st.release_all_calls.load(Ordering::SeqCst),
+            1,
+            "the confirmable release path must be tried"
+        );
+        assert!(
+            pm.standing_cover_adopted(),
+            "an unconfirmed release during health-check teardown must leave the claim set"
+        );
+        assert!(pm.lockdown_enabled());
+    });
+}
+
+#[skuld::test]
+fn turning_lockdown_off_mid_session_clears_a_stale_adopted_claim() {
+    // Finding 4 (#898 rework): a claim carried in from startup recovery (or
+    // from this session's own now-superseded adoption) must not keep
+    // overriding an explicit off the user just persisted mid-session — or the
+    // toggle springs back to "on" and a second Unblock click reports success
+    // while changing nothing observable.
+    rt().block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        let routing = MockRouting::new(dir.path().to_path_buf());
+        let mut pm = ProxyManager::new(MockProxy::new(), routing).with_state_dir(dir.path().to_path_buf());
+        pm.set_standing_cover_adopted(true);
+        pm.start(&test_config()).await.unwrap();
+
+        let outcome = pm.turn_lockdown_off().expect("a running session must not error");
+        assert!(matches!(outcome, LockdownOffOutcome::SessionRunning));
+        assert!(
+            !lockdown_state::load_intent(dir.path()).reads_armed(),
+            "the intent must be recorded off"
+        );
+        assert!(
+            !pm.lockdown_enabled(),
+            "a stale adopted claim must not keep the tray reporting armed over a recorded off"
+        );
+
+        pm.stop().await.unwrap();
+    });
+}
+
+#[skuld::test]
+fn lockdown_reads_honor_an_out_of_process_off_over_a_stale_claim() {
+    // `hole bridge unlock` (cutover::unlock_with) writes `enabled: false`
+    // straight into the running bridge's bridge-lockdown.json — it never goes
+    // through `turn_lockdown_off`, so `adopted_standing_cover` stays set.
+    // Simulated here the same way: writing the state file directly, not via
+    // any ProxyManager setter.
+    let dir = tempfile::tempdir().unwrap();
+    let routing = MockRouting::new(dir.path().to_path_buf());
+    let mut pm = ProxyManager::new(MockProxy::new(), routing).with_state_dir(dir.path().to_path_buf());
+    pm.set_standing_cover_adopted(true);
+
+    lockdown_state::set_enabled(dir.path(), false, None).unwrap();
+
+    assert!(
+        !pm.lockdown_enabled(),
+        "an explicitly recorded off must win over a stale adopted claim"
+    );
+    assert!(
+        !pm.standing_cover_expected(),
+        "and the next start must not re-engage the standing cover"
+    );
+}
+
+#[skuld::test]
+fn an_out_of_process_unlock_prevents_the_next_start_from_re_engaging_the_cover() {
+    // Reintroduction proof: with the pre-fix `adopted_standing_cover ||
+    // intent.reads_armed()` fold, this start re-installs the cover the user
+    // just escaped via `hole bridge unlock`.
+    rt().block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        let routing = MockRouting::new(dir.path().to_path_buf());
+        let st = routing.state();
+        let mut pm = ProxyManager::new(MockProxy::new(), routing).with_state_dir(dir.path().to_path_buf());
+        pm.set_standing_cover_adopted(true);
+
+        lockdown_state::set_enabled(dir.path(), false, None).unwrap();
+
+        pm.start(&test_config()).await.unwrap();
+        assert_eq!(
+            st.lockdown_engage_calls.load(Ordering::SeqCst),
+            0,
+            "a fixed re-read must not re-arm the cover the user just escaped"
+        );
+        pm.stop().await.unwrap();
+    });
+}
+
+#[skuld::test]
+fn promote_adopted_claim_does_not_clobber_a_recorded_off() {
+    // Simulates the out-of-process race window between start_inner's
+    // `standing_cover_expected()` snapshot and this call: `hole bridge
+    // unlock` records Off directly in bridge-lockdown.json, the same
+    // `lockdown_state::set_enabled` call `cutover::unlock_with` makes on the
+    // running bridge's state_dir, bypassing every in-process setter.
+    let dir = tempfile::tempdir().unwrap();
+    lockdown_state::set_enabled(dir.path(), false, None).unwrap();
+
+    promote_adopted_claim(Some(dir.path()), None);
+
+    assert_eq!(
+        lockdown_state::load_intent(dir.path()),
+        lockdown_state::Intent::Off,
+        "a cover this start just installed must not overwrite an explicitly recorded off"
+    );
+}
+
+// Start-diagnostic redaction ==========================================================================================
+
+/// `ProxyStartedDiag` is the richest Hole-authored line on the start path.
+/// Its shape is the guarantee: there is no field an address can occupy.
+#[skuld::test]
+fn proxy_start_diag_carries_no_address() {
+    use hole_common::logging::redact_arm::token_for;
+
+    const ENTRY_ID: &str = "8f2a1c04-0000-0000-0000-000000000000";
+    const HOSTNAME: &str = "vpn.example.invalid";
+    const ADDR: &str = "203.0.113.7";
+    let ip: std::net::IpAddr = ADDR.parse().expect("literal");
+
+    let diag = super::ProxyStartedDiag {
+        server: token_for(ENTRY_ID),
+        server_kind: hole_common::logging::redact_arm::server_kind(HOSTNAME),
+        server_family: Some(hole_common::logging::redact_arm::ip_family(ip)),
+        server_scope: Some(hole_common::logging::redact_arm::ip_scope(ip)),
+        server_port: 8388,
+        local_port: 4073,
+        tunnel_mode: "full",
+        udp_proxy_available: true,
+        ipv6_bypass_available: false,
+    };
+    let rendered = dump::dump!(&diag).to_string();
+    assert!(rendered.contains(&token_for(ENTRY_ID)), "{rendered}");
+    assert!(!rendered.contains(HOSTNAME), "{rendered}");
+    assert!(!rendered.contains(ADDR), "{rendered}");
+    assert!(rendered.contains("global"), "the scope must survive: {rendered}");
+    assert!(rendered.contains("domain"), "the kind must survive: {rendered}");
 }

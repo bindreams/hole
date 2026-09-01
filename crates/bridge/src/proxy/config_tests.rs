@@ -351,3 +351,56 @@ fn proxy_error_converts_to_start_error() {
         other => panic!("expected Failed, got {other:?}"),
     }
 }
+
+/// The tunnel's ULA must carry a *generated* RFC 4193 §3.2.2 global ID, not
+/// the hand-typed `fd00::` (global ID zero) that WireGuard examples, Docker,
+/// Proxmox and NAS defaults hand out. `hole-tun` holds this prefix as a real
+/// on-link route, so a zero global ID would let the tunnel swallow a user's
+/// own ULA network — `fc00::/7` alone does not rule that out.
+#[skuld::test]
+fn tun_subnet6_is_a_generated_unique_local_64() {
+    let cidr: smoltcp::wire::Ipv6Cidr = TUN_SUBNET6.parse().expect("TUN_SUBNET6 parses as an IPv6 CIDR");
+    assert_eq!(cidr.prefix_len(), 64, "the TUN's v6 prefix is a /64");
+
+    let octets = cidr.address().octets();
+    assert_eq!(octets[0] & 0xfe, 0xfc, "the address is inside fc00::/7");
+
+    let global_id = &octets[1..6];
+    assert!(
+        global_id.iter().any(|b| *b != 0),
+        "the 40-bit global ID must be generated, not zero (fd00::); got {global_id:02x?}"
+    );
+}
+
+// DispatcherStartError conversion =====================================================================================
+
+/// `Dispatcher::new` used to flatten every `tun_engine::DeviceError` into an
+/// opaque `io::Error` before it ever reached this conversion, which made
+/// `ProxyError::ForeignAdapter` unreachable from `start_inner` regardless of
+/// what `Device::build` returned. Asserts the conversion's SHAPE, not any
+/// string embedded in it — a string match would pass even if the variant
+/// were wrong.
+#[skuld::test]
+fn foreign_adapter_device_error_converts_to_the_matching_proxy_error() {
+    let alias = "hole-tun".to_string();
+    let err = crate::dispatcher::DispatcherStartError::Device(tun_engine::DeviceError::ForeignAdapter {
+        alias: alias.clone(),
+    });
+    match ProxyError::from(err) {
+        ProxyError::ForeignAdapter { alias: got } => assert_eq!(got, alias),
+        other => panic!("expected ProxyError::ForeignAdapter, got {other:?}"),
+    }
+}
+
+/// The paired negative: an `Io` arm must convert to `ProxyError::Runtime`,
+/// never accidentally to `ForeignAdapter` — without this, a match arm typo
+/// swallowing every variant into `ForeignAdapter` would still pass the test
+/// above.
+#[skuld::test]
+fn io_dispatcher_start_error_converts_to_runtime() {
+    let err = crate::dispatcher::DispatcherStartError::Io(std::io::Error::other("boom"));
+    match ProxyError::from(err) {
+        ProxyError::Runtime(_) => {}
+        other => panic!("expected ProxyError::Runtime, got {other:?}"),
+    }
+}

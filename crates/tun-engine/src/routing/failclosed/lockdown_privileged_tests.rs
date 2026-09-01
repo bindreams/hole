@@ -25,15 +25,15 @@
 //! `!tun` filter, and CI provisions the elevation.
 //!
 //! Cross-binary serialization for the global WFP/pf/TUN state these touch lives
-//! in `.config/nextest.toml` (`global-net-state` test-group) — skuld's
-//! `serial = TUN` only serializes within one binary.
+//! in `.config/nextest.toml` (`global_net_state` test-group) — skuld serializes
+//! across binaries too, but it does not own nextest's thread budget.
 //!
 //! COUPLED NAMES: that group's filter matches these tests by the name substrings
 //! `windows_lockdown_permits_server_ip_`, `macos_lockdown_permits_server_ip_`,
 //! and `failclosed_permits_` (the transient-cover tests). Renaming one
 //! WITHOUT updating `.config/nextest.toml` drops the test from the group → a
-//! silent cross-binary race with the bridge's live-egress
-//! `e2e_none_full_tunnel_roundtrip`. Change both together.
+//! silent cross-binary race with the bridge's live-egress `mod tun` e2es.
+//! Change both together.
 //!
 //! The permitted/resolver/non-permitted targets MUST be addresses this host
 //! does NOT itself own (see `RESOLVER`'s doc for why a self-served target is
@@ -46,9 +46,7 @@
 //! when it could be a general outage instead.
 
 use super::*;
-
-#[skuld::label]
-pub(super) const TUN: skuld::Label;
+use crate::{GLOBAL_NET_STATE, TUN};
 
 // Two routable anycast hosts on :443 (the runner has outbound internet). IP
 // literals only — the cover blocks DNS, so a hostname connect would fail for the
@@ -95,10 +93,10 @@ const NON_PERMITTED: &str = "8.8.8.8:443";
 /// falsified separately, against two real, live TUN devices, in
 /// `live_tun_permit_privileged_tests.rs`. `serial = TUN` serializes against
 /// other in-binary TUN tests; the cross-binary race with the bridge's
-/// real-egress e2e is handled by the `global-net-state` test-group
+/// real-egress e2e is handled by the `global_net_state` test-group
 /// (`.config/nextest.toml`).
 #[cfg(target_os = "windows")]
-#[skuld::test(labels = [TUN], serial = TUN)]
+#[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
 fn windows_lockdown_permits_server_ip_and_blocks_other_egress() {
     use std::net::TcpStream;
     use std::time::Duration;
@@ -124,6 +122,15 @@ fn windows_lockdown_permits_server_ip_and_blocks_other_egress() {
         base_non.err().map(|e| e.kind()),
     );
 
+    // Pre-engage, the OS must report a clean host. This is the assertion that
+    // would have caught `lockdown_cover_present`'s hardcoded `true` — the value
+    // that made a bridge with a wiped state dir sweep a live kill switch.
+    assert_eq!(
+        super::lockdown_cover_presence(dir.path()),
+        crate::routing::CoverPresence::Absent,
+        "pre-engage the firewall must report no lockdown cover"
+    );
+
     // "Loopback Pseudo-Interface 1" is an always-present alias used only as a LUID
     // source to exercise the real resolve + `LocalInterface` filter path.
     let cover = engage_lockdown(
@@ -135,6 +142,12 @@ fn windows_lockdown_permits_server_ip_and_blocks_other_egress() {
         None,
     )
     .expect("engage real WFP lockdown cover");
+
+    assert_eq!(
+        super::lockdown_cover_presence(dir.path()),
+        crate::routing::CoverPresence::Live,
+        "while the cover is held the firewall must report it present"
+    );
 
     let permitted = connect(PERMITTED);
     let non = connect(NON_PERMITTED);
@@ -160,6 +173,11 @@ fn windows_lockdown_permits_server_ip_and_blocks_other_egress() {
         "disengage must restore egress to the previously-blocked host: {NON_PERMITTED}={:?}",
         connect(NON_PERMITTED).err().map(|e| e.kind()),
     );
+    assert_eq!(
+        super::lockdown_cover_presence(dir.path()),
+        crate::routing::CoverPresence::Absent,
+        "after the guard drops the firewall must report the cover gone"
+    );
 }
 
 /// macOS real-engage verification. Engages the REAL pf lockdown cover (an
@@ -177,11 +195,11 @@ fn windows_lockdown_permits_server_ip_and_blocks_other_egress() {
 /// WRONG one — is falsified separately, against two real, live `utunN`
 /// devices, in
 /// `live_tun_permit_privileged_tests.rs`. `serial = TUN` + the
-/// `global-net-state` test-group serialize the process-global pf state:
+/// `global_net_state` test-group serialize the process-global pf state:
 /// `pfctl -E`/`-X` is refcounted and the main ruleset is host-wide, so a
 /// concurrent cover test would race the snapshot restore.
 #[cfg(target_os = "macos")]
-#[skuld::test(labels = [TUN], serial = TUN)]
+#[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
 fn macos_lockdown_permits_server_ip_blocks_other_egress_and_restores() {
     use std::net::TcpStream;
     use std::process::Command;
@@ -208,6 +226,12 @@ fn macos_lockdown_permits_server_ip_blocks_other_egress_and_restores() {
         base_non.err().map(|e| e.kind()),
     );
 
+    assert_eq!(
+        super::lockdown_cover_presence(dir.path()),
+        crate::routing::CoverPresence::Absent,
+        "pre-engage pf must report no lockdown cover"
+    );
+
     let cover = engage_lockdown(server_ip, "utun-absent", &resolver, &[], dir.path(), None)
         .expect("engage real pf lockdown cover");
 
@@ -217,6 +241,23 @@ fn macos_lockdown_permits_server_ip_blocks_other_egress_and_restores() {
     assert!(
         rules.contains("block drop out quick all"),
         "main ruleset must carry the lockdown block (else inert):\n{rules}"
+    );
+
+    // (a2) The label really loaded, and `pfctl -s labels` really lists it. Every
+    // macOS `Live` in this feature flows through this one measurement, so a
+    // failure here means the intent repair and the self-capture guard are dead
+    // code that still passes its unit tests — fix the ruleset, never relax this.
+    let labels = Command::new("pfctl").args(["-s", "labels"]).output().unwrap();
+    let labels = String::from_utf8_lossy(&labels.stdout);
+    assert!(
+        super::platform::labels_listing_carries_our_label(&labels),
+        "`pfctl -s labels` must list {:?} while the cover is held:\n{labels}",
+        super::platform::LOCKDOWN_PF_LABEL
+    );
+    assert_eq!(
+        super::lockdown_cover_presence(dir.path()),
+        crate::routing::CoverPresence::Live,
+        "while the cover is held pf must report it present"
     );
 
     let permitted = connect(PERMITTED);
@@ -247,6 +288,13 @@ fn macos_lockdown_permits_server_ip_blocks_other_egress_and_restores() {
         "disengage must restore egress to the previously-blocked host: {NON_PERMITTED}={:?}",
         connect(NON_PERMITTED).err().map(|e| e.kind()),
     );
+    // Exercises BOTH halves of the fold: the label is gone from pf AND
+    // `disengage_lockdown` cleared the state file.
+    assert_eq!(
+        super::lockdown_cover_presence(dir.path()),
+        crate::routing::CoverPresence::Absent,
+        "after the guard drops, neither pf nor the state file may report a cover"
+    );
 }
 
 /// Windows real-engage verification for the transient block-until-connected
@@ -255,7 +303,7 @@ fn macos_lockdown_permits_server_ip_blocks_other_egress_and_restores() {
 /// beats block-all — catches the block-everything arbitration bug) while a
 /// non-permitted host is blocked (no leak). Drop restores egress.
 #[cfg(target_os = "windows")]
-#[skuld::test(labels = [TUN], serial = TUN)]
+#[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
 fn windows_failclosed_permits_server_blocks_other_egress() {
     use std::net::TcpStream;
     use std::time::Duration;
@@ -306,7 +354,7 @@ fn windows_failclosed_permits_server_blocks_other_egress() {
 /// proves the permit is scoped to TCP/443, not the whole resolver IP: the
 /// SAME resolver on a different port stays blocked.
 #[cfg(target_os = "windows")]
-#[skuld::test(labels = [TUN], serial = TUN)]
+#[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
 fn windows_failclosed_permits_resolver_blocks_other_egress() {
     use std::net::TcpStream;
     use std::time::Duration;
@@ -380,7 +428,7 @@ fn windows_failclosed_permits_resolver_blocks_other_egress() {
 /// loopback and the server IP), proves (a) the live ruleset carries our block,
 /// (b) it is SELECTIVE, and (c) Drop restores `/etc/pf.conf`.
 #[cfg(target_os = "macos")]
-#[skuld::test(labels = [TUN], serial = TUN)]
+#[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
 fn macos_failclosed_permits_server_blocks_other_egress() {
     use std::net::TcpStream;
     use std::process::Command;
@@ -434,7 +482,7 @@ fn macos_failclosed_permits_server_blocks_other_egress() {
 /// Also proves the permit is scoped to TCP/443, not the whole resolver IP: the
 /// SAME resolver on a different port stays blocked.
 #[cfg(target_os = "macos")]
-#[skuld::test(labels = [TUN], serial = TUN)]
+#[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
 fn macos_failclosed_permits_resolver_blocks_other_egress() {
     use std::net::TcpStream;
     use std::process::Command;

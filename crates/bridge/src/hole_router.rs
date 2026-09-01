@@ -1,14 +1,15 @@
 //! `HoleRouter` — hole's [`tun_engine::Router`] impl.
 //!
-//! Wires three [`Endpoint`](crate::endpoint::Endpoint) mechanisms into
-//! the filter engine and TUN dispatch shape of `tun-engine`:
+//! Wires two [`Endpoint`](crate::endpoint::Endpoint) mechanisms plus a
+//! [`DropSink`](crate::drop_sink::DropSink) into the filter engine and
+//! TUN dispatch shape of `tun-engine`:
 //!
 //! - `proxy`: [`Socks5Endpoint`](crate::endpoint::Socks5Endpoint) —
 //!   flows that should go through the SS tunnel.
 //! - `bypass`: [`InterfaceEndpoint`](crate::endpoint::InterfaceEndpoint) —
 //!   flows that should egress via the real upstream interface.
-//! - `block`: [`BlockEndpoint`](crate::endpoint::BlockEndpoint) —
-//!   flows that should be dropped.
+//! - `drops`: [`LoggingDropSink`](crate::drop_sink::LoggingDropSink) —
+//!   records flows the cascade refused to carry. Nothing serves them.
 //!
 //! ## Role vs. mechanism
 //!
@@ -24,21 +25,18 @@
 //!    equivalent and always matches on IP.
 //! 2. Build a [`ConnInfo`] and run [`crate::filter::engine::decide`].
 //! 3. Cascade the `FilterAction` + flow shape to a concrete endpoint via
-//!    [`HoleRouter::resolve_endpoint`], logging any drop reason via the
-//!    `BlockEndpoint`'s dedicated log methods.
+//!    [`HoleRouter::resolve_endpoint`], recording any drop reason on the
+//!    [`DropSink`](crate::drop_sink::DropSink).
 //! 4. Call `endpoint.serve_tcp` or `endpoint.serve_udp`.
 //!
 //! ## UDP-drop privacy invariant
 //!
-//! `FilterAction::Proxy` + UDP + `!proxy.supports_udp()` resolves to
-//! `&self.block`, **not** `&self.bypass`. This is deliberate: falling
-//! back to the clear-text bypass would leak UDP outside the encrypted
-//! tunnel, violating the user's VPN expectation. Users who need
-//! tunneled UDP should configure a UDP-capable plugin (galoshes). See
-//! [`BlockEndpoint`](crate::endpoint::BlockEndpoint) for the drop
-//! logging.
-
-pub mod block_log;
+//! `FilterAction::Proxy` + UDP + `!proxy.supports_udp()` resolves to a
+//! drop, **not** to `&self.bypass`. This is deliberate: falling back to
+//! the clear-text bypass would leak UDP outside the encrypted tunnel,
+//! violating the user's VPN expectation. Users who need tunneled UDP
+//! should configure a UDP-capable plugin (galoshes). The drop is
+//! recorded on the [`DropSink`](crate::drop_sink::DropSink).
 
 use std::io;
 use std::net::SocketAddr;
@@ -48,7 +46,8 @@ use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use tun_engine::{Router, TcpFlow, TcpMeta, UdpFlow, UdpMeta};
 
-use crate::endpoint::{BlockEndpoint, Endpoint, InterfaceEndpoint, LocalDnsEndpoint, Socks5Endpoint};
+use crate::drop_sink::{DropSink, LoggingDropSink};
+use crate::endpoint::{Endpoint, InterfaceEndpoint, LocalDnsEndpoint, Socks5Endpoint};
 use crate::filter;
 use crate::filter::engine::{decide, ConnInfo, L4Proto};
 use crate::filter::rules::RuleSet;
@@ -65,25 +64,19 @@ const PEEK_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(100);
 // HoleRouter ==========================================================================================================
 
 pub struct HoleRouter {
-    proxy: Socks5Endpoint,
-    bypass: InterfaceEndpoint,
-    block: BlockEndpoint,
+    proxy: Box<dyn Endpoint>,
+    bypass: Box<dyn Endpoint>,
+    drops: Box<dyn DropSink>,
     /// Optional in-tunnel DNS interceptor. When `Some`, the cascade diverts
     /// UDP/53 flows to this endpoint instead of the proxy; `is_some()` is the
     /// sole gate. `None` disables interception (DNS disabled or SocksOnly mode).
-    local_dns: Option<LocalDnsEndpoint>,
+    local_dns: Option<Box<dyn Endpoint>>,
     rules: Arc<ArcSwap<RuleSet>>,
 }
 
 impl HoleRouter {
-    pub fn new(proxy: Socks5Endpoint, bypass: InterfaceEndpoint, block: BlockEndpoint, rules: RuleSet) -> Self {
-        Self {
-            proxy,
-            bypass,
-            block,
-            local_dns: None,
-            rules: Arc::new(ArcSwap::from_pointee(rules)),
-        }
+    pub fn new(proxy: Socks5Endpoint, bypass: InterfaceEndpoint, drops: LoggingDropSink, rules: RuleSet) -> Self {
+        Self::with_endpoints(Box::new(proxy), Box::new(bypass), Box::new(drops), None, rules)
     }
 
     /// Construct with an in-tunnel DNS interceptor attached. When
@@ -92,14 +85,39 @@ impl HoleRouter {
     pub fn with_local_dns(
         proxy: Socks5Endpoint,
         bypass: InterfaceEndpoint,
-        block: BlockEndpoint,
+        drops: LoggingDropSink,
         local_dns: Option<LocalDnsEndpoint>,
+        rules: RuleSet,
+    ) -> Self {
+        Self::with_endpoints(
+            Box::new(proxy),
+            Box::new(bypass),
+            Box::new(drops),
+            local_dns.map(|e| Box::new(e) as Box<dyn Endpoint>),
+            rules,
+        )
+    }
+
+    /// Construct over the slots directly, so a caller can put any
+    /// mechanism in any slot. The production constructors above are thin
+    /// wrappers; this is the seam tests use to substitute doubles for
+    /// `Socks5Endpoint` and `InterfaceEndpoint`, both of which dial real
+    /// sockets, and for `LoggingDropSink`, whose only output is a log line.
+    ///
+    /// Crate-private: outside the crate, `new` and `with_local_dns` are
+    /// the only ways to build a router, so the three-mechanism wiring
+    /// cannot be sidestepped in a production build.
+    pub(crate) fn with_endpoints(
+        proxy: Box<dyn Endpoint>,
+        bypass: Box<dyn Endpoint>,
+        drops: Box<dyn DropSink>,
+        local_dns: Option<Box<dyn Endpoint>>,
         rules: RuleSet,
     ) -> Self {
         Self {
             proxy,
             bypass,
-            block,
+            drops,
             local_dns,
             rules: Arc::new(ArcSwap::from_pointee(rules)),
         }
@@ -156,7 +174,7 @@ impl HoleRouter {
         // Block/Bypass/Proxy (e.g. a user rule `Block 8.8.8.8` still sends
         // Chrome's hardcoded-DoH DNS through the local forwarder).
         if l4 == L4Proto::Udp && dst.port() == 53 {
-            if let Some(local) = self.local_dns.as_ref() {
+            if let Some(local) = self.local_dns.as_deref() {
                 return Dispatch::Endpoint(local);
             }
         }
@@ -167,32 +185,32 @@ impl HoleRouter {
                 if l4 == L4Proto::Udp && !self.proxy.supports_udp() {
                     return Dispatch::Drop(DropReason::UdpProxyUnavailable { rule_index });
                 }
-                Dispatch::Endpoint(&self.proxy)
+                Dispatch::Endpoint(self.proxy.as_ref())
             }
             FilterAction::Bypass => {
                 if dst.is_ipv6() && !self.bypass.supports_ipv6_dst() {
                     return Dispatch::Drop(DropReason::Ipv6BypassUnreachable { rule_index });
                 }
-                Dispatch::Endpoint(&self.bypass)
+                Dispatch::Endpoint(self.bypass.as_ref())
             }
             FilterAction::Block => Dispatch::Drop(DropReason::RuleBlock { rule_index }),
         }
     }
 
-    /// Log a drop reason before the flow is released. Uses per-reason
-    /// methods on `BlockEndpoint` so the log wording distinguishes
+    /// Record a drop reason before the flow is released. Uses per-reason
+    /// methods on the [`DropSink`] so the sink can distinguish
     /// explicit-rule from privacy from reachability drops.
     fn log_drop(&self, reason: DropReason, dst: SocketAddr, domain: Option<&str>, l4: L4Proto) {
         match (reason, l4) {
             (DropReason::RuleBlock { rule_index }, L4Proto::Tcp) => {
-                self.block.log_rule_block_tcp(rule_index, dst, domain);
+                self.drops.rule_block_tcp(rule_index, dst, domain);
             }
             (DropReason::RuleBlock { rule_index }, L4Proto::Udp) => {
-                self.block.log_rule_block_udp(rule_index, dst);
+                self.drops.rule_block_udp(rule_index, dst);
             }
             (DropReason::UdpProxyUnavailable { rule_index }, L4Proto::Udp) => {
-                self.block
-                    .log_udp_proxy_unavailable(rule_index, dst, self.proxy.plugin_name());
+                self.drops
+                    .udp_proxy_unavailable(rule_index, dst, self.proxy.plugin_name());
             }
             (DropReason::UdpProxyUnavailable { .. }, L4Proto::Tcp) => {
                 // Unreachable: UdpProxyUnavailable is UDP-only. debug_assert
@@ -204,7 +222,7 @@ impl HoleRouter {
                     L4Proto::Tcp => "tcp",
                     L4Proto::Udp => "udp",
                 };
-                self.block.log_ipv6_bypass_unreachable(rule_index, dst, l4_label);
+                self.drops.ipv6_bypass_unreachable(rule_index, dst, l4_label);
             }
         }
     }
@@ -264,7 +282,9 @@ impl HoleRouter {
             Dispatch::Endpoint(endpoint) => endpoint.serve_tcp(flow, dst).await,
             Dispatch::Drop(reason) => {
                 self.log_drop(reason, dst, domain.as_deref(), L4Proto::Tcp);
-                // Drop the flow — smoltcp sends RST.
+                // Drop the flow. Closing the handler channel makes the driver
+                // take its `Disconnected` arm — `socket.close()`, a graceful
+                // FIN, gated on `may_send()`. No RST is emitted here.
                 Ok(())
             }
         }
@@ -307,3 +327,7 @@ impl HoleRouter {
 #[cfg(test)]
 #[path = "hole_router_tests.rs"]
 mod hole_router_tests;
+
+#[cfg(test)]
+#[path = "hole_router_dispatch_tests.rs"]
+mod hole_router_dispatch_tests;

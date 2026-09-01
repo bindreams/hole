@@ -165,6 +165,19 @@ pub enum ProxyError {
     /// an IPC message reaches a GUI toast verbatim.
     #[error("the network was unblocked, but the kill-switch setting could not be saved")]
     LockdownIntentNotPersisted,
+    /// A pre-existing `hole-tun` adapter does not carry Hole's own adapter
+    /// GUID — most often a build of Hole itself that crashed before it
+    /// could tear the adapter down. PII-free by construction: `alias` is a
+    /// network-adapter friendly name, never a filesystem path.
+    #[error("{}", tun_engine::DeviceError::ForeignAdapter { alias: alias.clone() })]
+    ForeignAdapter { alias: String },
+    /// The DNS-egress confinement (Windows-only) could not be engaged.
+    /// Fail-fatal: the confinement is the only thing standing between OS
+    /// DNS and the LAN resolver, so a session that could not confine it
+    /// must not go live. PII-free by construction — `reason` is the
+    /// confinement error's own `Display`, which names no path.
+    #[error("could not confine DNS to the tunnel: {reason}")]
+    DnsConfinementFailed { reason: String },
 }
 
 impl From<&ProxyError> for hole_common::protocol::StartError {
@@ -196,7 +209,9 @@ impl From<&ProxyError> for hole_common::protocol::StartError {
             | ProxyError::TunnelSilent { .. }
             | ProxyError::TunnelSetupIncomplete { .. }
             | ProxyError::NoTunnelConnection { .. }
-            | ProxyError::LockdownIntentNotPersisted => StartError::Failed { message: e.to_string() },
+            | ProxyError::LockdownIntentNotPersisted
+            | ProxyError::ForeignAdapter { .. }
+            | ProxyError::DnsConfinementFailed { .. } => StartError::Failed { message: e.to_string() },
         }
     }
 }
@@ -225,6 +240,27 @@ impl From<tun_engine::DeviceError> for ProxyError {
             tun_engine::DeviceError::WintunLoad { path, message } => ProxyError::WintunLoad { path, message },
             tun_engine::DeviceError::TunOpen(err) => ProxyError::Runtime(err),
             tun_engine::DeviceError::InvalidConfig(msg) => ProxyError::RouteSetup(format!("device config: {msg}")),
+            tun_engine::DeviceError::ForeignAdapter { alias } => ProxyError::ForeignAdapter { alias },
+            tun_engine::DeviceError::Ipv6Assign { index, message } => {
+                ProxyError::RouteSetup(format!("TUN IPv6 address on interface {index}: {message}"))
+            }
+        }
+    }
+}
+
+/// `Dispatcher::new` keeps `DeviceError` distinguishable from its other
+/// start-time I/O failures (metric set, engine build) instead of flattening
+/// everything to `io::Error` — the flattening was what made
+/// `ProxyError::ForeignAdapter` unreachable from `start_inner`: the `?` on
+/// `Dispatcher::new(..).await?` converted straight to `ProxyError::Runtime`
+/// via `io::Error`'s own `#[from]`, before this impl ever got a chance to
+/// run. Delegating the `Device` arm to the impl above is what makes it
+/// reachable again.
+impl From<crate::dispatcher::DispatcherStartError> for ProxyError {
+    fn from(e: crate::dispatcher::DispatcherStartError) -> Self {
+        match e {
+            crate::dispatcher::DispatcherStartError::Device(e) => e.into(),
+            crate::dispatcher::DispatcherStartError::Io(e) => ProxyError::Runtime(e),
         }
     }
 }
@@ -233,6 +269,18 @@ impl From<tun_engine::DeviceError> for ProxyError {
 
 /// TUN interface subnet (hardcoded, not configurable via IPC).
 pub const TUN_SUBNET: &str = "10.255.0.1/24";
+
+/// TUN interface IPv6 subnet (hardcoded, not configurable via IPC). Held both
+/// by the OS interface and by smoltcp's address list — without the OS half, a
+/// host with no global IPv6 has no source address for the `::/1` + `8000::/1`
+/// split routes.
+///
+/// The 40-bit global ID is pseudo-randomly generated per RFC 4193 §3.2.2
+/// rather than the hand-typed `fd00::`, which WireGuard examples, Docker,
+/// Proxmox and NAS defaults all hand out: this prefix becomes a real on-link
+/// route on `hole-tun`, and a collision would let the tunnel swallow a user's
+/// own ULA network.
+pub const TUN_SUBNET6: &str = "fdf8:f6d5:536e::1/64";
 
 /// TUN interface device name.
 pub const TUN_DEVICE_NAME: &str = "hole-tun";

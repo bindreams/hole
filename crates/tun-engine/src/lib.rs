@@ -23,6 +23,16 @@
 //! the [`routing::Routing`] trait. The free functions `setup_routes` and
 //! `teardown_routes` are lint-disallowed outside the crate's own internals
 //! (see workspace `clippy.toml`). See bindreams/hole#165.
+//!
+//! ## Route-command failure policy
+//!
+//! Install is fatal ([`routing::setup_routes`] returns `Err` on the first
+//! command that does not exit zero and is marked fatal — see
+//! [`routing::SetupCommand`]); teardown and crash recovery are best-effort
+//! ([`routing::teardown_routes`] returns a [`routing::CleanupReport`] and has
+//! no error channel at all). See the "Execution" section of [`routing`].
+//! Reporting routes that were never installed is a leak; stopping cleanup at
+//! the first failure strands routes.
 
 // Install the workspace test subscriber + panic hook. The dev-dep
 // is gated on cfg(test) because it isn't linked in non-test builds.
@@ -35,24 +45,49 @@ fn main() {
     skuld::run_all();
 }
 
+/// The elevated-lane label (→ skuld filter name `tun`). skuld requires each
+/// label to be declared exactly once per test binary, and every module under
+/// this crate compiles into the SAME binary, so this is the crate's only
+/// declaration — a second `#[skuld::label] const TUN` anywhere would mint a
+/// different serial token and panic the runner at startup.
+#[cfg(test)]
+#[skuld::label]
+pub(crate) const TUN: skuld::Label;
+
+/// Cross-binary serialization for tests that mutate GLOBAL OS network state —
+/// the `.config/nextest.toml` `global_net_state` test-group's `max-threads = 1`
+/// gate. skuld's own `serial = TUN` only serializes within this one binary;
+/// this label is what `cargo xtask verify-global-net-state-labels` binds to
+/// that group's name-substring filter (bindreams/hole#894). Declared here
+/// (not at any one call site) for the same reason as `TUN` above: every
+/// module under this crate compiles into the same binary, so this is the
+/// crate's only declaration.
+#[cfg(test)]
+#[skuld::label]
+pub(crate) const GLOBAL_NET_STATE: skuld::Label;
+
 pub mod adapter_cleanup;
 pub mod device;
+pub mod dns_confine;
 pub mod engine;
 pub mod error;
 pub mod gateway;
 pub mod helpers;
 pub mod net;
 pub mod routing;
+#[cfg(any(test, feature = "test-utils"))]
+#[doc(hidden)]
+pub mod sim;
 
 // Dev-only; see the module doc. `cfg(test)` so this crate's own privileged
 // tests get it without the feature.
 #[cfg(any(test, feature = "test-utils"))]
 pub mod test_utils;
 
-pub use device::{Device, DeviceConfig, MutDeviceConfig};
+pub use device::{Assigned, Device, DeviceConfig, MutDeviceConfig, TunIdentity};
 pub use engine::{
     DnsInterceptor, Engine, EngineConfig, MutEngineConfig, Router, TcpFlow, TcpMeta, UdpFlow, UdpMeta, UdpSender,
 };
-pub use error::{DeviceError, EngineError, RoutingError};
+pub use error::{DeviceError, EngineError, RouteCommandError, RoutingError};
 pub use gateway::{get_default_gateway_info, GatewayInfo};
 pub use routing::{Routing, SystemRoutes, SystemRouting};

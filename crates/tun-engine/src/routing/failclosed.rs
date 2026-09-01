@@ -56,9 +56,17 @@ pub use luid::{LuidResolver, SystemLuidResolver};
 
 pub mod lockdown_state;
 
+// `pub(crate)` (not the default private) ONLY on the Windows arm:
+// `dns_confine::spec` — a sibling module outside this file's own subtree —
+// needs `platform::{FILTER_GUIDS, LOCKDOWN_FILTER_GUIDS, PROVIDER_GUID,
+// SUBLAYER_GUID}` to prove its own WFP GUIDs are disjoint from the cover's,
+// so a copy-paste collision can never let one's fixed-GUID sweep delete the
+// other's filters (or a collision fail `FwpmProviderAdd0`/`FwpmSubLayerAdd0`
+// at runtime). The macOS arm is untouched: nothing outside this file needs
+// it.
 #[cfg(target_os = "windows")]
 #[path = "failclosed/windows.rs"]
-mod platform;
+pub(crate) mod platform;
 
 #[cfg(target_os = "macos")]
 #[path = "failclosed/macos.rs"]
@@ -145,22 +153,109 @@ pub fn engage_lockdown(
     }
 }
 
-/// Act on a [`CoverRecovery`] decision for the standing lockdown cover at
-/// startup. Dispatches to the platform reconciler: `Adopt` keeps the host
-/// fail-closed, refreshing the volatile TUN + server permits; `Sweep` fully
-/// disengages; `Noop` does nothing. cfg-free for `routing::recover_routes`.
-/// Best-effort: a `Sweep` that cannot disengage is logged, not propagated —
-/// startup recovery has no caller to act on it.
-pub fn recover_lockdown(decision: crate::routing::CoverRecovery, state_dir: &Path) {
+/// Whether startup recovery disengages the standing cover for a given
+/// decision. There are only two answers, and only one of them opens the host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RecoveryDispatch {
+    /// The standing cover's own live/dead disposition is untouched. `Adopt`
+    /// additionally runs [`reclaim_stale_tun_permit`] (see `recover_lockdown`)
+    /// — narrow and provably unable to open a live cover, so it does not
+    /// change this classification.
+    Inert,
+    /// Disengage the standing cover.
+    Disengage,
+}
+
+/// Classify a [`CoverRecovery`] into whether it disengages the standing cover.
+/// Pure, exhaustive, and platform-free, so "`Adopt` never disengages the
+/// cover, on either platform" is a testable statement rather than a claim
+/// about two bodies of code.
+///
+/// `Adopt` never disengages because the volatile-permit refresh it used to
+/// perform for the SERVER-IP permit moved into `engage_lockdown`: a
+/// recovery-time delete would drop a RUNNING first bridge's server permit
+/// whenever a second bridge with a fresh state dir adopted the cover,
+/// hard-blocking a host whose GUI still said Connected. `Noop` never
+/// disengages by definition. Only an explicit recorded-off `Sweep` reaches the
+/// firewall to remove protection.
+pub(crate) fn recovery_dispatch(decision: crate::routing::CoverRecovery) -> RecoveryDispatch {
     use crate::routing::CoverRecovery::*;
     match decision {
-        Noop | Adopt => platform::recover_lockdown(decision, state_dir),
-        Sweep => {
+        Noop | Adopt => RecoveryDispatch::Inert,
+        Sweep => RecoveryDispatch::Disengage,
+    }
+}
+
+/// Act on a [`CoverRecovery`] decision for the standing lockdown cover at
+/// startup. cfg-free for `routing::recover_routes`. Best-effort: a `Sweep` that
+/// cannot disengage is logged, not propagated — startup recovery has no caller
+/// to act on it.
+///
+/// `tun_name` is THIS bridge's own TUN device: its own last-known name from
+/// `bridge-routes.json` when that file had something to recover, else the
+/// caller's own configured device name (see `routing::recover_routes_with`'s
+/// doc — the file's absence is not evidence the reclaim is unneeded). On
+/// `Adopt` it gates a narrow reclaim (see [`reclaim_stale_tun_permit`]); the
+/// rest of the decision's OS behaviour is unaffected by it.
+pub fn recover_lockdown(decision: crate::routing::CoverRecovery, state_dir: &Path, tun_name: Option<&str>) {
+    match recovery_dispatch(decision) {
+        RecoveryDispatch::Inert => {
+            // The standing cover itself is untouched: it must survive the
+            // restart (this IS the crash-leak fix), and it may not even be
+            // ours. On macOS the dead utun name in the `pass out quick on
+            // <tun>` line is harmless (it matches no live interface); pf rules
+            // and enable state do not survive a reboot, but the state file
+            // does, so the next connect's `engage_lockdown` re-enables pf and
+            // reloads a live ruleset. Residual: the boot->first-connect
+            // interval is unprotected until that first reconnect re-arms the
+            // host.
+            if decision == crate::routing::CoverRecovery::Adopt {
+                if let Some(tun_name) = tun_name {
+                    reclaim_stale_tun_permit(tun_name);
+                }
+            }
+            tracing::info!(
+                ?decision,
+                "lockdown recovery: no OS action beyond the TUN-permit reclaim"
+            );
+        }
+        RecoveryDispatch::Disengage => {
+            tracing::info!("lockdown recovery: sweeping leftover cover (intent off)");
             if let Err(e) = disengage_lockdown(state_dir) {
                 tracing::warn!(error = %e, "lockdown sweep could not disengage the cover");
             }
         }
     }
+}
+
+/// Windows only: delete the volatile TUN-interface permit pair when
+/// `tun_name` no longer resolves to a live `NET_LUID` — i.e. this permit's
+/// target adapter is provably gone. Called from [`recover_lockdown`] only on
+/// `Adopt`.
+///
+/// A `NET_LUID` is `IfType<<48 | NetLuidIndex<<24`, and NDIS reassigns a freed
+/// `NetLuidIndex` to the next adapter of the same type. Without this, an
+/// adopted cover's stale TUN permit — a persistent WFP filter that survives a
+/// crash — can silently authorize a LATER, unrelated wintun-based adapter that
+/// happens to inherit the freed index, while Hole still reports the kill
+/// switch armed.
+///
+/// Unlike the server-IP permit (whose recovery-time deletion is exactly what
+/// moved BOTH volatile deletes into `engage_lockdown`'s own transaction — see
+/// [`crate::routing::CoverRecovery::Adopt`]'s doc), a genuinely running
+/// bridge's own `hole-tun` resolves here successfully, so this can never
+/// delete a permit a live bridge relies on: it only fires when the name is
+/// provably unresolvable.
+///
+/// macOS's lockdown ruleset matches the TUN by literal interface name (`pass
+/// out quick on hole-tun`), not a numeric index the OS can silently reassign
+/// to an unrelated adapter, so there is no macOS analogue and this is a no-op
+/// there.
+pub fn reclaim_stale_tun_permit(tun_name: &str) {
+    #[cfg(target_os = "windows")]
+    platform::reclaim_stale_tun_permit(&luid::SystemLuidResolver, tun_name);
+    #[cfg(not(target_os = "windows"))]
+    let _ = tun_name;
 }
 
 /// Fail-loud disengage of a standing lockdown cover, with no running bridge.
@@ -173,22 +268,20 @@ pub fn disengage_lockdown(state_dir: &Path) -> Result<(), RoutingError> {
     platform::disengage_lockdown(state_dir)
 }
 
-/// Whether a standing lockdown cover from a prior run is present — the recovery
-/// decision's `prior_present` signal, keyed on the cover's OWN evidence (NOT
-/// `bridge-routes.json`). macOS: the `bridge-lockdown-pf.json` state file
-/// exists. Windows: always `true` — delete-by-GUID reconciliation is idempotent
-/// (a no-op when no filters exist), so probing would only add a redundant WFP
-/// enumeration; a `Sweep`/`Adopt` on a clean host does nothing.
-pub fn lockdown_cover_present(state_dir: &Path) -> bool {
-    #[cfg(target_os = "macos")]
-    {
-        lockdown_pf_state::load(state_dir).is_some()
-    }
-    #[cfg(target_os = "windows")]
-    {
-        let _ = state_dir;
-        true
-    }
+/// Ask the OS whether a standing lockdown cover from a prior run is present,
+/// keyed on the cover's OWN evidence (NOT `bridge-routes.json` — the cover's
+/// lifetime is independent of routes).
+///
+/// - **Windows**: query every lockdown filter GUID with `FwpmFilterGetByKey0`.
+/// - **macOS**: read our own ruleset label back from `pfctl -s labels`, falling back to `bridge-lockdown-pf.json`.
+///
+/// [`CoverPresence::Indeterminate`](crate::routing::CoverPresence::Indeterminate)
+/// means the OS was asked and its answer was unusable;
+/// [`CoverPresence::Unreachable`](crate::routing::CoverPresence::Unreachable)
+/// means it could not be asked at all. Neither ever authorises removing
+/// protection on its own — see [`crate::routing::decide_cover_recovery`].
+pub fn lockdown_cover_presence(state_dir: &Path) -> crate::routing::CoverPresence {
+    platform::lockdown_cover_presence(state_dir)
 }
 
 /// Clear every fail-closed cover this platform can install — both the

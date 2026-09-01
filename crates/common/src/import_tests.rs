@@ -10,7 +10,7 @@ fn parse_single_server_minimal() {
     }"#;
     let servers = import_servers(json).unwrap();
     assert_eq!(servers.len(), 1);
-    assert_eq!(servers[0].server, "1.2.3.4");
+    assert_eq!(servers[0].server.expose(), "1.2.3.4");
     assert_eq!(servers[0].server_port, 8388);
     assert_eq!(servers[0].method, "aes-256-gcm");
     assert_eq!(servers[0].password, "pw");
@@ -48,9 +48,9 @@ fn parse_multi_server_configs_array() {
     let servers = import_servers(json).unwrap();
     assert_eq!(servers.len(), 2);
     assert_eq!(servers[0].name, "S1");
-    assert_eq!(servers[0].server, "10.0.0.1");
+    assert_eq!(servers[0].server.expose(), "10.0.0.1");
     assert_eq!(servers[1].name, "S2");
-    assert_eq!(servers[1].server, "10.0.0.2");
+    assert_eq!(servers[1].server.expose(), "10.0.0.2");
     // Each should have a unique UUID
     assert_ne!(servers[0].id, servers[1].id);
 }
@@ -106,7 +106,7 @@ fn extra_unknown_fields_are_ignored() {
     }"#;
     let servers = import_servers(json).unwrap();
     assert_eq!(servers.len(), 1);
-    assert_eq!(servers[0].server, "1.2.3.4");
+    assert_eq!(servers[0].server.expose(), "1.2.3.4");
 }
 
 #[skuld::test]
@@ -193,7 +193,7 @@ fn parse_servers_array_with_address_port_aliases() {
     let servers = import_servers(json).expect("schema should be recognized");
     assert_eq!(servers.len(), 1);
     let entry = &servers[0];
-    assert_eq!(entry.server, "host.example.com");
+    assert_eq!(entry.server.expose(), "host.example.com");
     assert_eq!(entry.server_port, 443);
     assert_eq!(entry.password, "pw");
     assert_eq!(entry.method, "chacha20-ietf-poly1305");
@@ -214,9 +214,9 @@ fn parse_servers_array_multi() {
     }"#;
     let servers = import_servers(json).unwrap();
     assert_eq!(servers.len(), 2);
-    assert_eq!(servers[0].server, "10.0.0.1");
+    assert_eq!(servers[0].server.expose(), "10.0.0.1");
     assert_eq!(servers[0].server_port, 8388);
-    assert_eq!(servers[1].server, "10.0.0.2");
+    assert_eq!(servers[1].server.expose(), "10.0.0.2");
     assert_eq!(servers[1].server_port, 8389);
 }
 
@@ -231,7 +231,7 @@ fn parse_servers_array_with_legacy_field_names() {
     }"#;
     let servers = import_servers(json).unwrap();
     assert_eq!(servers.len(), 1);
-    assert_eq!(servers[0].server, "1.2.3.4");
+    assert_eq!(servers[0].server.expose(), "1.2.3.4");
     assert_eq!(servers[0].server_port, 8388);
 }
 
@@ -246,7 +246,7 @@ fn parse_configs_array_with_address_port_aliases() {
     }"#;
     let servers = import_servers(json).unwrap();
     assert_eq!(servers.len(), 1);
-    assert_eq!(servers[0].server, "1.2.3.4");
+    assert_eq!(servers[0].server.expose(), "1.2.3.4");
 }
 
 /// `configs` array takes precedence over `servers` if both are present.
@@ -263,7 +263,7 @@ fn configs_array_takes_precedence_over_servers() {
     }"#;
     let servers = import_servers(json).unwrap();
     assert_eq!(servers.len(), 1);
-    assert_eq!(servers[0].server, "from-configs");
+    assert_eq!(servers[0].server.expose(), "from-configs");
 }
 
 /// Empty `servers` array, like the empty `configs` array case.

@@ -50,16 +50,139 @@ Hole is a VPN. UDP flows whose filter decision resolves to `Proxy` are
 v2ray-plugin is TCP-only) — bypassing to the clear-text upstream would leak the
 flow outside the tunnel. The invariant is structurally enforced by the cascade
 in [`HoleRouter::resolve_endpoint`](crates/bridge/src/hole_router.rs):
-`Proxy` + UDP + `!supports_udp()` resolves to `&self.block`, never
+`Proxy` + UDP + `!supports_udp()` resolves to a drop, never to
 `&self.bypass`. UDP-capable plugins (galoshes, via YAMUX) tunnel UDP normally.
-The three drop reasons (rule block, UDP-proxy-unavailable, IPv6-bypass-unreachable)
-each log through dedicated [`BlockEndpoint`](crates/bridge/src/endpoint/block.rs)
-methods.
+A drop is not a dispatch — nothing serves the flow. The three drop reasons
+(rule block, UDP-proxy-unavailable, IPv6-bypass-unreachable) each get their own
+method on [`DropSink`](crates/bridge/src/drop_sink.rs), whose production impl
+logs them; tests substitute a recording sink, which is what makes this invariant
+assertable.
 
 **UDP/53 exception.** When DNS is enabled, UDP/53 is diverted to
 [`LocalDnsEndpoint`](crates/bridge/src/endpoint/local_dns.rs) *before* the
 cascade reads the filter decision, so DNS works even on a TCP-only plugin. See
 [DNS forwarder](#dns-forwarder).
+
+### IPv6 in the tunnel
+
+IPv6 traverses the tunnel. The `::/1` + `8000::/1` split pair captures it,
+[`Socks5Endpoint`](crates/bridge/src/endpoint/socks5.rs) carries any v6
+destination, and `Ipv6BypassUnreachable` is a **bypass**-only drop — a `Proxy`
+decision on a v6 flow goes to the proxy unconditionally.
+
+`hole-tun` holds `TUN_SUBNET6` twice: on the OS interface **and** in smoltcp's
+address list. Without the OS half a host with no global IPv6 anywhere has no
+source address for the `/1` routes, and every IPv6 flow fails instead of
+tunnelling. (A dual-stack host sources from the upstream adapter, which is why
+the gap is invisible there.)
+
+The ULA's 40-bit global ID is pseudo-randomly generated per RFC 4193 §3.2.2,
+not `fd00::`. That prefix is what WireGuard examples, Docker, Proxmox and NAS
+defaults hand out, and Hole's becomes a real on-link route on `hole-tun` — a
+collision would let the tunnel swallow the user's own ULA network.
+
+**The interface's IPv6 half does not exist when the device is created.** The
+`tun` crate waits for the IPv4 half and deliberately not the IPv6 one, so
+[`device::ipv6_addr`](crates/tun-engine/src/device/ipv6_addr.rs) waits itself:
+register the `NotifyIpInterfaceChange` callback, **then** check existence with
+`GetIpInterfaceEntry`, then block. Registering first is load-bearing —
+`MibInitialNotification` only confirms registration and carries a NULL row, so
+an interface the kernel published during the `tun` crate's own AF_INET wait
+emits no later `MibAddInstance`, and a register-and-block would burn the whole
+budget and report a live IPv6 half as absent. The budget bounds "it never
+appears", which is what IPv6 being unbound on the host looks like; it is a
+failure bound on an external event, not a synchronisation delay.
+
+The address row carries `DadState = IpDadStatePreferred`, so it is never
+tentative and no interface-wide state is touched — the same field the `tun`
+crate sets for the IPv4 address on every Full-mode start.
+
+**Assignment is fatal on Windows and warn-only on macOS.** A missing route is a
+leak; a missing address is a blackhole, and Windows is where the path is
+tested. The macOS path cannot run in production until the TUN naming issue is
+fixed and its only test is an argv-shape test, so a fatal failure there would
+first execute in a user's hands; it becomes fatal once it has run green on the
+darwin TUN lane. The tolerate predicate is **not** `ipv6_available`, which
+measures upstream reachability — an independent question. Route-install
+fatality follows the same rule: **the IPv6 route adds are non-fatal exactly
+when the TUN has no IPv6 half**, measured by `gateway::tun_ipv6_available` at
+install time. Upstream reachability is not an operand — a host whose EDR
+unbinds IPv6 from new adapters has a reachable upstream and an unusable
+tunnel, and reading upstream there refuses a connection that would work.
+
+Phase 5 of `start_inner` is cooperative because of this wait: `Dispatcher::new`
+runs `Device::build` on `spawn_blocking` raced against the start's cancel token
+in a `biased` `select!`. The phase is no longer millisecond-scale, and on a
+covered start a Cancel it could not observe would extend the window during
+which the whole host is fail-closed.
+
+The Windows path uses IP Helper FFI rather than `netsh` because `netsh interface ipv6 add address` defaults to `store=persistent`: such an address is
+written to the registry keyed by the adapter GUID, which wintun derives from
+the adapter name, so a crash would leave it waiting to be re-applied to the
+next `hole-tun`. A `CreateUnicastIpAddressEntry` address is runtime-only and
+dies with the adapter — nothing for `recover_routes` to sweep.
+
+### TCP accept refusal
+
+The accept verdict is reached while the listener socket is still in
+`SynReceived` with its SYN-ACK paused (smoltcp's `socket-tcp-pause-synack`), so
+a declined connection is refused with a pre-handshake RST and never with a reset
+of a connection the client believes it opened. The verdict itself is
+[`decide_admission`](crates/tun-engine/src/engine/admission.rs) — a pure
+function over the handshake plus a permit-acquiring closure — and the driver arm
+is a mechanical dispatch over its three outcomes. A socket with a packet still to
+emit is *retired* rather than removed:
+[`SocketStack::poll`](crates/tun-engine/src/engine/socket_stack.rs) reaps it
+once `remote_endpoint()` goes `None`, smoltcp's signal that it has emitted the
+socket's last packet. `decide_disposal` picks the path per state — `Closed` and
+`Listen` retire, while `TimeWait` is dropped at once, since retiring it would
+hold the socket and both its buffers for smoltcp's 10 s `CLOSE_DELAY`. The drop
+is safe because every socket the stack creates has its delayed ACK disabled
+(`set_ack_delay(None)`), so smoltcp emits any ACK it owes on the poll that
+ingests the segment and a socket removed at `TimeWait` is never holding one —
+without that, the peer's last data-plus-FIN would go unacknowledged and its
+retransmission would be answered with a reset. A connection socket that reverts
+to `Listen` — the client answered the SYN-ACK with an RST — is retired through
+that same list, so it cannot shadow the live listener on its port.
+
+Retiring a socket only marks it; reaping — the `SocketSet::remove` that actually
+frees its slot — happens inside the next `poll`. A socket marked but not yet
+reaped is still live and still bound to its port, so a SYN that arrives before
+that `poll` can be handed to it instead of to the real listener, and no accept
+path is watching it (bindreams/hole#911).
+[`Driver::settle_packet`](crates/tun-engine/src/engine/driver.rs) is the one
+production entry point for a TUN packet and closes that gap structurally rather
+than by convention: enqueue, both polls, admission dispatch and retirement all
+happen inside one call, so two packets' verdicts can never straddle a `poll` no
+matter how `run()`'s TUN-read cadence changes.
+
+Ownership of a 4-tuple is exclusive, and `take_handshakes` enforces it. Re-arming
+a port hands the listener whichever socket slot is lowest and free, which can put
+it *below* the connection it was just re-armed for; smoltcp gives a packet to the
+first socket that accepts it, and a `Listen` socket accepts a bare SYN on the
+local port alone. A SYN can therefore land on the replacement listener rather
+than on its own connection — and tuple equality alone does not say whether it is
+that connection's retransmit or a new connection reusing the tuple (a client
+that lost its own TCP state while the datapath's persists: reboot, sleep-resume,
+a recycled ephemeral port). `take_handshakes` tells them apart by ISN, read off
+the wire since smoltcp exposes none: the same ISN as the tuple's owner is
+`Duplicate` and its socket is dropped without a segment — no second permit, no
+second router task, and no RST, since one would acknowledge the client's SYN,
+which it must accept while in SYN-SENT, and so would kill the very connection it
+is retransmitting for. A different ISN reports `Pending` with `supersedes` set
+to the stale owner (RFC 9293 §3.10.7.4); the driver tears that owner down —
+closing its channels, removing its socket — before admitting or refusing the new
+SYN in its place.
+
+An admitted connection also gets a keep-alive interval and a timeout
+(`tcp_keep_alive_interval`, `tcp_peer_timeout`). They bound an external event —
+a client process that may never speak again — not anything inside the engine.
+Without them a connection stalled in `SynReceived`, `FinWait2` or `CloseWait`
+never reaches a state `decide_disposal` has a verdict for, and holds its entry,
+both buffers and its connection slot for the life of the process;
+`max_connections` of those wedge the tunnel for all new TCP. The probe is what
+keeps the bound off a client that is merely quiet: only silence in reply to it
+resets the socket to `Closed`, where the disposal path already runs.
 
 ### DNS forwarder
 
@@ -78,12 +201,20 @@ privacy). The bridge carries DNS over the TCP tunnel:
   forwarder's upstream through the SS SOCKS5 listener so user `Block` rules can't
   strand the resolver (TCP via `tokio-socks`; UDP via hand-rolled UDP ASSOCIATE,
   RFC 1928).
-- [`SystemDnsConfig`](crates/bridge/src/dns/system.rs) — Windows `netsh`, macOS
-  `networksetup`. Apply advertises the resolver IPs to the TUN **and** upstream
-  adapters (on Windows both v4 and v6 families, each set from its own configured
-  resolvers; a family with none is left untouched); capture runs on the upstream
-  only (the TUN is freshly created). Prior config persists to `bridge-dns.json`;
-  the post-apply cache flush is fire-and-forget.
+- [`SystemDns`](crates/bridge/src/dns/system.rs) — Hole writes DNS to no
+  adapter but `hole-tun`, the one it created (both v4 and v6 families, each
+  set from its own configured resolvers; a family with none is left
+  untouched). On Windows, egress on UDP+TCP port 53 is additionally confined
+  to that adapter by a WFP filter set
+  ([`tun_engine::dns_confine`](crates/tun-engine/src/dns_confine.rs)) — a
+  process-scoped dynamic FWPM session, not a persistent one, so it dies with
+  the bridge and needs no crash-recovery state. There is nothing to capture
+  and nothing to restore; the post-apply cache flush is fire-and-forget. See
+  [Crash recovery](#crash-recovery) for the one remaining, read-only use of
+  `bridge-dns.json`. Two residuals, disclosed rather than silently accepted:
+  DNS-over-HTTPS to an on-link resolver is indistinguishable from ordinary
+  HTTPS to that host, and DNS-over-TLS (port 853) is not confined — only
+  port 53 is.
 
 `DnsConfig::default()` is `enabled: true`, `Https`, `[1.1.1.1, 1.0.0.1]` — and
 `AppConfig` is `#[serde(default)]`, so the forwarder enables silently on
@@ -184,6 +315,27 @@ Three invariants:
 1. **`select!` arms must not drop work mid-cleanup** — restructure so cleanup is
    awaited after the select returns; see the apply loop in `SystemDns::apply`.
 
+**The engine driver's join carries no bound.** Every await in
+[`Driver::run`](crates/tun-engine/src/engine/driver.rs) is raced against the
+driver's cancellation token, including the DNS interceptor call
+(`tun_engine::engine::dns::intercept`) and the TUN write
+(`tun_engine::engine::egress::flush`) — the loop's only await a unix `AsyncFd`
+can hold `Pending` on indefinitely. Because of that,
+[`Dispatcher::shutdown`](crates/bridge/src/dispatcher.rs) joins the driver task
+with no bound, awaiting through `&mut JoinHandle` so a cancelled caller cannot
+detach it, and returns a `DriverExit`. What it actually waits for on Windows is
+the synchronous `WintunCloseAdapter` call (plus a registry subtree delete),
+which runs in the future's `Drop` once `Driver::run` returns — finite and
+uninterruptible (tokio **1.52.3**: a task's future is dropped before its join
+waker fires, `runtime/task/harness.rs:549` via `runtime/task/core.rs:403-408`),
+which is why a bound at the join would leak the adapter rather than merely
+being unnecessary. Consequence: on the bridge's multi-thread runtime,
+`Dispatcher::drop` blocks unboundedly the same way, so **dropping a future
+that owns a `Dispatcher` does not cancel that wait — it converts it into a
+synchronous block on the dropping thread.** No caller may drop such a future
+as a way to bound anything — this is what rules out a `TimeoutLayer` on the
+IPC router. See #905.
+
 [`SystemDnsApplied`](crates/bridge/src/dns/system.rs) owns a `DebugDropBomb`
 defused by `shutdown()` and is constructed only in the `Ok` branch of
 `Dns::apply`. **Known follow-up:** `SystemRoutes::Drop` still tears down routing
@@ -215,14 +367,92 @@ crate so both Hole's GPL crates and the Apache plugin world can depend on it.
 - `free_port` — primitive that returns a verified-free port divorced from a bound
   socket. **Direct callers are clippy-`disallowed_methods`** — use
   `bind_ephemeral`, or `#[allow]` + comment when the port must reach a subprocess
-  before the bind (`test_support::port_alloc::allocate_ephemeral_port` is the
-  sanctioned exception).
+  before the bind. Two sanctioned exceptions:
+  `test_support::port_alloc::allocate_ephemeral_port` and `plugin_e2e::ports`.
 - `ensure_port_free` — pure probe without allocation.
 
 The retry exists because Windows keeps **independent TCP/UDP excluded-port-range
 tables** (Hyper-V/WSL/Docker reservations); an OS-picked port for one transport
 may be reserved for the other. There is no "right" budget — a saturated runner
 needs many retries, a healthy machine one. See #285, #300, #304.
+
+**Reserve for the protocols the consumer will bind.** Where the consumer is
+known at reservation time, name it exactly —
+`hole_common::plugin::plugin_alloc_protocols` keys SS_LOCAL by binary (galoshes
+TCP+UDP, everything else TCP). Where the reservation happens before the
+consumer is known, reserve the union over the possible consumers:
+`plugin_e2e::ports::reserve_ss_local` is generic over which client plugin will
+run, and that set includes galoshes, so it always reserves TCP+UDP —
+over-reserving UDP for a TCP-only plugin costs a retry, under-reserving it for
+galoshes costs a race. `garter::chain::allocate_ports` verifies TCP only and is
+clippy-banned outside garter's own chain-internal use, which carries a per-site
+allow.
+
+### Route-command failure policy
+
+`netsh`/`route` subprocesses run through one of two phase runners in
+[routing.rs](crates/tun-engine/src/routing.rs), and which one a phase gets is a
+security decision, not a style one:
+
+- **Fatal — install only** (`run_setup_commands`, via `setup_routes`). The first
+  fatal command that does not exit zero aborts the phase and is returned as a
+  `RouteCommandError`. `SystemRouting::install` then rolls back and returns
+  `Err`, so no `SystemRoutes` guard exists. Reporting split routes that were
+  never installed is a **leak**: traffic egresses outside the tunnel while the UI
+  says "protected" (#901).
+- **Best-effort — teardown and crash recovery** (`run_teardown_commands`, via
+  `teardown_routes` / `recover_routes`). Every command is issued; a failure
+  neither short-circuits the rest nor is returned. Stopping at the first failure
+  would strand routes and leave the user worse off than if Hole had never run.
+
+No future edit can turn stranded-route cleanup into an early return: a
+best-effort runner narrows a `Vec<RouteId>` accumulator, not a `Result`, so
+there is nothing to `?` out of — see
+[Route ownership](#route-ownership) for what that accumulator is and how it's
+checkpointed.
+
+**The pairing is a compile error, not a convention.** A phase is a value of
+`FatalPhase` or `BestEffortPhase` (sealed `Phase` trait, `BEST_EFFORT` const per
+type — it also picks the log level, and for `exec_one` which success oracle
+applies — see [Route ownership](#route-ownership)), and each runner accepts
+only its own type; the command types differ too (`SetupCommand` vs
+`RouteCommand`). Wiring a teardown phase into the fatal runner does not
+compile. This replaces a `debug_assert` pairing check, which compiled out in
+release — the same silently-absorbed-failure class this policy exists to
+close.
+
+**Fatality is per command, not per phase** (`SetupCommand::fatal`). The two IPv6
+split routes are non-fatal when `gateway::tun_ipv6_available(tun_name)` is false:
+on a host whose IPv6 stack is unbound from the TUN adapter itself
+(`DisabledComponents`, or an EDR policy that unbinds IPv6 from new adapters)
+`netsh interface ipv6 add route ::/1 <tun>` cannot succeed, and such a host emits
+no IPv6 traffic to leak — aborting there would lose the whole tunnel and avoid
+nothing. Everything else, and every command when the TUN's IPv6 IS bound, stays
+fatal. The probe targets the TUN, not the upstream interface
+`GatewayInfo::ipv6_available` measures: it is the TUN's name the `::/1`/`8000::/1`
+commands carry, and `setup_routes` runs after `Dispatcher::new` has created it, so
+the adapter already exists to probe. The two commands are still *issued*, only
+their failure tolerated — the TUN is a virtual device, so a bound-but-otherwise-
+unreachable adapter still accepts the route; only a genuinely unbound TUN can
+make the add itself fail.
+
+**Accepted trade: a false start-failure is preferred to a silent leak.** No test
+exercises `setup_routes` against a real elevated `netsh`/`route` under an
+already-installed route, so it is not measured whether a healthy install can
+legitimately exit non-zero. One path could produce it: `SystemRoutes::drop`
+clears the state file even when teardown failed, and `recover_routes` only
+deletes split routes under that file's guard, so a stale route can outlive its
+record. If that ever bites, the fix is upstream — make the pre-install split
+sweep unconditional — never tolerating an "already exists" exit code here, which
+is the exists-tolerance heuristic #899/#910 forbids. Until then a hard start
+failure surfaces the stranded route instead of routing around it.
+
+`RouteCommandError`'s `Display` is PII-free by construction (program name,
+position in the phase, exit code): it reaches a GUI toast verbatim through
+`StartError::Failed`. The argv and the child's stdout/stderr go to `bridge.log`.
+
+A failed install's rollback does exactly four things — see
+`SystemRouting::install_with`'s doc comment, which is the source of truth.
 
 ### Proxy shutdown contract
 
@@ -343,6 +573,139 @@ scan (exact-substring match on the literal identifiers, not scoped to
 call-graph reachability) — a best-effort tripwire against an accidental
 upstream reintroduction, not a proof against a determined rename/alias.
 
+### Route ownership
+
+Teardown and crash recovery delete **only** the routes the run recorded in
+`bridge-routes.json`'s `installed` list.
+
+**On macOS, nothing about the delete command itself can express "only if it is
+ours"**:
+
+- macOS `route delete` resolves its victim from the destination key and netmask
+  alone. xnu's `rtrequest_common_locked` reaches `RTM_DELETE` via
+  `rnh_deladdr(dst, netmask)` (`in_deleteroute` → `rn_delete`) and never reads
+  the gateway, so `-interface <name>` — which `route(8)` turns into an
+  `AF_LINK` gateway, `case K_IFACE` in `network_cmds/route.tproj/route.c` —
+  scopes nothing. Worse, with that flag set and a name that no longer resolves,
+  `getaddr` exits before `rtmsg()` writes to the routing socket, so the delete
+  never happens at all.
+- `-ifscope` is the real scoping flag and is equally unusable: a route carrying
+  `RTF_IFSCOPE` is skipped by unscoped lookups (xnu `rt_lookup_common` searches
+  the unscoped table first and retries only under the *primary* interface's
+  scope), so scoping the install would leave the tunnel capturing nothing.
+- Reading the table back first — `route get` then `route delete` — is
+  check-then-act: it only narrows the window in which the other route is
+  destroyed.
+
+**On Windows, the delete command CAN express it, via the gateway.**
+`ROUTE DELETE destination [MASK netmask] [gateway] ...` — `route.exe`'s own
+help confirms the gateway argument is optional but accepted for DELETE, and
+unlike macOS it scopes which entry is deleted. `install` already knows the
+gateway (`platform_setup_commands` passes it to the matching `route add`), so
+the server-bypass teardown carries it forward as `RouteState.original_gateway`
+and emits `route delete <server_ip> mask 255.255.255.255 <gateway>` instead of
+the unscoped form. This is `None` — falling back to the old unscoped delete, a
+disclosed residual — only for a record migrated from schema 1/2, which never
+persisted a gateway. The split-route deletes stay unscoped on both platforms
+(`RouteId` provenance is their only handle); only the single-destination
+bypass delete can carry a gateway at all.
+
+Provenance is the one handle that outlives the interface, which matters because
+the utun is always already gone by teardown: `RunningState` closes the TUN at
+step 1 and drops the routes guard at step 4, and a crashed run's utun died with
+its control-socket fd.
+
+**Determining "ours" needs more than an exit code.** `route(8)` on macOS exits
+0 unconditionally for `add`/`delete`/`change` once it dispatches at all
+(`network_cmds/route.tproj/route.c`'s `K_ADD`/`K_DELETE`/`K_CHANGE` case runs
+`newroute(); exit(0)`); the only signal a real routing-socket failure (EEXIST,
+etc.) ever produces is the literal text `rtmsg()` prints to stderr via
+`warnx("writing to routing socket: %s", ...)`. `routing::macos_route_command_succeeded`
+parses that text for installs, and `routing::macos_route_confirmed_absent` for
+deletes (distinguishing `ESRCH`/"not in table", meaning already gone, from
+every other errno, meaning still installed). Windows' `route.exe`/`netsh`
+exit non-zero on a genuine `add` failure, so no parsing is needed for
+installs — but for *deletes*, a non-zero exit does NOT unambiguously mean
+"already gone" (verified empirically: an absent route and one requiring
+elevation both exit 1, no distinguishing text), so `route_confirmed_absent`
+only trusts exit 0; a Windows delete that fails for any reason stays
+recorded rather than risk silently dropping a route that is still there — a
+disclosed residual on top of the one below. Parsing a CLI's diagnostic text
+is a narrower and more fragile answer than a routing socket would be — see
+the Residual paragraph below.
+
+**A route command that ran but didn't confirm going in is a fail-closed
+condition, not a degraded connect.** If any planned route's command spawns
+but the oracle above says it did not go in (macOS: a real `rtmsg()` failure;
+either platform: the runner itself reporting `false`), `install` rolls back
+whatever did go in and returns `Err` rather than a partial tunnel — a user
+who believes traffic is captured when some of it is not is worse off than
+one who is told Hole failed to connect (Rule #0).
+
+The consequence a co-resident VPN cares about: if another VPN already holds
+`0.0.0.0/1` when Hole starts, Hole's `route add` fails, the route is never
+recorded, and Hole's Stop leaves it alone.
+
+**Persistence is checkpointed per command, not per phase.** `bridge-routes.json`
+is rewritten before AND after every single route command — not once before the
+whole install, not once after — so at any instant, including mid-crash, its
+`installed` list names at most one route beyond what is actually confirmed in
+the table (the one command in flight). Teardown and recovery apply the same
+per-command checkpointing on the way out: a command that spawns is dropped from
+the record only once its outcome is confirmed (deleted, or already absent);
+one that fails to spawn stays recorded so the next start retries it, and nothing
+downstream of it in the same run is skipped — teardown has no error channel to
+abort through. "Next start" means the next `install`, not only the next
+process start: `recover_routes` runs once per bridge process, but a
+long-lived process can `install` multiple times (reconnect, server switch),
+so `install` itself sweeps any record left retained by a prior `install` in
+the same process before starting a new one. A record is only ever retained
+because its own teardown could not confirm the route gone, so the sweep
+commonly fails the identical way again — whatever it still cannot confirm
+gone is carried forward into `RouteState.stale` (a list of
+`{tun_name, server_ip, interface_name, original_gateway, installed}` groups,
+each with its own provenance since a later sweep or `recover_routes` may run
+under a different `tun_name`/`server_ip`/gateway than the new session's own).
+The new session's own checkpoints only ever touch `installed`, never `stale`,
+so a leak from an earlier session survives being overwritten by a later one;
+`recover_routes` attempts every `stale` group in addition to the primary
+record, and the state file is cleared only once both are empty.
+
+**Groups are reduced to canonical form before anything runs.**
+`routing::state::coalesce` is the one place that folds a group into `stale`:
+groups sharing an identity (`tun_name`, `server_ip`, `interface_name`,
+`original_gateway` — the tuple that determines the argv a group's commands
+emit) merge into one whose `installed` is the union, each survivor is
+sanitized against `planned_routes(server_ip)` (an id with no possible
+teardown command — e.g. a `ServerBypass` against a loopback `server_ip` —
+can never drain, so it would pin `stale` non-empty forever), and an empty
+survivor is dropped. Without this, a reconnect to the same server — which
+shares `tun_name` (a fixed constant) and often `server_ip` with an
+already-carried-forward group — would re-emit a byte-identical delete: on
+Windows the second occurrence is never confirmed, permanently stranding the
+group; on macOS the split-route deletes are fully unscoped, so the second
+occurrence removes whatever a third party claimed after the first freed the
+prefix — the exact harm this section exists to prevent. `recover_groups`
+additionally runs every group's split deletes before any group's bypass
+delete, deduping by argv across groups (not just within one): a split
+delete's argv depends on `tun_name` alone, so two groups with different
+`server_ip` but the same `tun_name` would otherwise still collide.
+
+**Residual (macOS only):** a VPN that takes the prefix over *mid-session* —
+necessarily by deleting Hole's entry first — is still torn down by Hole's
+Stop. macOS exposes no compare-and-delete, so closing that needs a different
+mechanism (a routing socket that acts and then repairs from `RTM_DELETE`'s
+reply), not a different flag. The same routing-socket mechanism would also
+replace the stderr-text parsing above with a structured `rtm_errno` — tracked
+separately, since it cannot be verified without a macOS dev box. Windows has
+no equivalent residual here: a takeover VPN's route to the same destination
+has a different gateway, so Hole's gateway-scoped delete simply fails to
+match it (a safe no-op) rather than deleting the wrong entry — the failure
+mode a check-then-act race would otherwise produce.
+
+`scripts/network-reset.py` deliberately does not honour the record: it is the
+unconditional escape hatch, in the same spirit as `failclosed::release_all`.
+
 ### Crash recovery
 
 While a proxy is active the bridge persists small state files in `<state_dir>/`,
@@ -350,10 +713,13 @@ cleared on clean shutdown and replayed on next startup (all *after* the IPC
 socket binds; DNS recovery runs before route recovery so a mid-recovery crash
 leaves working DNS + broken routes, not the inverse):
 
-- **`bridge-routes.json`** — TUN name, server IP, upstream interface;
-  `routing::recover_routes` tears down leaked routes. The same call also sweeps a
-  stale [fail-closed cover](#fail-closed-cover) (Windows by fixed WFP GUID,
-  macOS via `bridge-failclosed.json`).
+- **`bridge-routes.json`** — TUN name, server IP, upstream interface, and the
+  `installed` list of [`RouteId`](crates/tun-engine/src/routing.rs)s;
+  `routing::recover_routes` tears down leaked routes. Teardown and recovery
+  delete **only** the routes in `installed` — see
+  [Route ownership](#route-ownership). The same call also sweeps a stale
+  [fail-closed cover](#fail-closed-cover) (Windows by fixed WFP GUID, macOS via
+  `bridge-failclosed.json`).
 - **`bridge-failclosed.json`** (macOS only) — the `pfctl -E` enable token of an
   engaged fail-closed cover; `routing::failclosed::recover_cover` restores
   `/etc/pf.conf` and drops the refcount. Windows keys its cover by fixed WFP
@@ -363,8 +729,20 @@ leaves working DNS + broken routes, not the inverse):
   no tolerance window — and deletes the file only after accounting for every
   record it named. The same reap runs at bridge start, at chain stop, and in the
   test harness's teardown.
-- **`bridge-dns.json`** — prior system DNS; `dns::recovery::recover_dns_config`
-  restores it.
+- **`bridge-dns.json`** — read-only now. The bridge stopped writing this file
+  (DNS confinement is process-scoped WFP state, not a file — see
+  [DNS forwarder](#dns-forwarder)); what's left is the evidence-gated upgrade
+  sweep that undoes a *pre-#846* build's own crashed-run rewrite:
+  `dns::recovery::recover_dns_config` restores each recorded adapter/family
+  only when its LIVE setting still equals what that old build advertised, and
+  evaluates any given file at most once — on full success it deletes the
+  file, otherwise it renames it to `bridge-dns.superseded.json` and never
+  reads that name again. `scripts/network-reset.py` reads both names, so the
+  escape survives the rename. A DNS confinement held by a **live but
+  unreachable** bridge (a #936 symptom, since the IPC socket bind does not
+  fully guarantee single-instance today) has no file-based release path —
+  the confinement dies only with its owning process, and `network-reset.py`
+  killing that process is the escape.
 - **ETW sessions** (Windows) — `hole-bridge-etw-<pid>`;
   `diagnostics::etw::sweep_stale_sessions` (`QueryAllTracesW`) stops stale ones by
   name prefix.
@@ -464,6 +842,17 @@ the **transient cutover cover** below and the **standing lockdown cover**
 ([next section](#lockdown-mode)). Both are RAII guards permitting a curated
 egress set and blocking everything else; they differ in lifetime and which set
 they permit.
+
+Both are deliberately **persistent** WFP filters, surviving an update-cutover
+restart on purpose. The Windows DNS-egress confinement
+([`tun_engine::dns_confine`](crates/tun-engine/src/dns_confine.rs), see
+[DNS forwarder](#dns-forwarder)) is the opposite: a **dynamic**, process-scoped
+FWPM session that dies with the engine handle, including on an abnormal exit —
+no state file, no `recover_routes` sweep, nothing for `release_all` or
+`hole bridge unlock` to clear. Do not "helpfully" unify the two lifetimes: a
+lockdown cover outliving the bridge is the user's *intent* (the kill switch
+stays armed across the cutover gap); a DNS block outliving the bridge is pure
+harm, with no bridge left alive to release it.
 
 #### Transient cutover cover
 
@@ -635,7 +1024,7 @@ milliseconds.
 Each platform splits a pure, unit-tested rule/spec builder (transient:
 `build_cover_spec` / `build_pf_ruleset`; lockdown: `build_lockdown_spec` /
 `build_lockdown_main_ruleset`) from the thin engage layer — mirroring
-`build_setup_commands` vs `run_commands`. Under the
+`build_setup_commands` vs the phase runners. Under the
 [#165](#bridge-test-isolation-contract) isolation contract the builders are the
 only thing unit-tested; the kernel-level engage is exercised in production and,
 for the lockdown cover, by the privileged-lane real-engage tests (#527) — both
@@ -713,9 +1102,11 @@ three axes:
   would block all browsing.
 - **Lifetime.** Lockdown is authoritative and standing — it persists across a
   crash or restart and is reconciled on the next start via
-  `decide_cover_recovery` (Adopt keeps the host fail-closed, dropping the
-  volatile TUN + server permits so the next connect re-adds them fresh; Sweep
-  disengages when intent is off). The transient cover is a non-standing,
+  `decide_cover_recovery` (Adopt never disengages the cover, and on Windows
+  additionally reclaims the volatile TUN permit if `hole-tun` no longer
+  resolves — see "Disclosed residuals" below; the server permit stays
+  deferred to the next connect's own `engage_lockdown`; Sweep disengages, and
+  only on an explicit recorded off). The transient cover is a non-standing,
   bounded-window RAII guard engaged only for the duration of one covered
   (auto-connect) start attempt, and swept by `recover_routes` like every other
   cover state on the next start.
@@ -786,27 +1177,155 @@ Disclosed residuals:
 1. The `Lockdown: On (warning: not engaged)` tray label can still be wrong in
    this window — it derives from the running session, not an OS probe of the
    cover.
+
 1. On macOS a state file that cannot be read costs the host its captured
    pre-cover pf rules (the release falls back to the default ruleset) and
    leaks a pf enable refcount until reboot.
-1. `lockdown_state::load_enabled` reads a corrupt or unreadable
-   `bridge-lockdown.json` as **off**, which hides the tray's Unblock item;
-   `hole bridge unlock` still works there because it never reads the intent to
-   decide.
-1. `failclosed::lockdown_cover_present` still infers presence from a file on
-   macOS and returns an unconditional `true` on Windows. It feeds
-   `decide_cover_recovery`, so widening it changes Adopt/Sweep/Noop at
-   unattended startup — the recovery decision, which belongs with the
-   ownership work, not here.
-1. On macOS, `release_all` treats a MISSING (not merely unreadable) state
-   file as "no cover of this kind" — `StateFile::Absent`, indistinguishable
-   from "never engaged." pf has no query for "who is holding this ruleset,"
-   so if a cover's state file is lost while the cover is still genuinely live
-   in pf (e.g. an external wipe of `state_dir`), `release_all` reports `Ok`
-   without touching pf and the host stays blocked. Closing this gap would
-   mean probing the live pf ruleset for Hole's own signature independent of
-   the state file — the cover-state probe this stage's constraints defer to
-   the ownership work.
+
+1. An unreadable `bridge-lockdown.json` is read through two named folds of
+   `lockdown_state::Intent`, not one bool, because the consumers want
+   different answers. `reads_armed` (`On | Unreadable`) drives the status
+   reply and the tray, so a corrupt record reads **armed** and keeps the
+   Unblock item on the menu — losing the record is not consent to disarm.
+   `installs_standing_cover` (`On` only) drives the connect path and the
+   update-consent gate, so the same corrupt record reads **not standing**: a
+   covered start keeps engaging the transient block-until-connected cover
+   (block early, do not leak) instead of skipping it for a standing cover
+   that only arrives after `routing.install`, and `consent_gate` still asks
+   for informed consent because no standing cover holds the update gap. The
+   tray can therefore read `Lockdown: On (warning: not engaged)` there, which
+   is the honest rendering.
+
+1. Startup reconciliation is a **20-cell table** over two measured axes, not
+   two bools — `decide_cover_recovery(Intent, CoverPresence)` in
+   `crates/tun-engine/src/routing.rs`. Intent is
+   `On | Off | Unset | Unreadable`; presence is
+   `Live | Recorded | Absent | Indeterminate | Unreachable`, measured by
+   `failclosed::lockdown_cover_presence` (Windows: `FwpmFilterGetByKey0` over
+   every lockdown GUID; macOS: our own `hole-lockdown` rule label read back
+   from `pfctl -s labels`, falling back to `bridge-lockdown-pf.json`). Four
+   rules: `Absent`/`Unreachable` are always `Noop`; `Sweep` requires
+   `Intent::Off` **and** an actionable presence; `Adopt` requires an
+   actionable presence with an intent of `On`/`Unreadable`/`Unset`, and
+   `Unset` additionally requires positive evidence; the intent file is
+   repaired to `enabled: true` only on `Presence::Live` with an `Unset` or
+   `Unreadable` intent, never inferred.
+
+   `Live` means **any residue**, not the whole cover: the Windows sweeps loop
+   delete-by-key with every return code discarded over persistent filters, so
+   a sweep interrupted mid-loop survives a reboot as a partial cover that a
+   single-GUID probe would call `Absent` forever.
+
+   `Adopt` never disengages the cover, on either platform. The server-permit
+   volatile-refresh it used to perform moved into `engage_lockdown`, which
+   deletes the TUN and server permits inside its own transaction before the
+   adds. Keeping that delete at recovery time meant a second bridge with a
+   fresh state dir (`Unset` x `Live` -> Adopt) would delete a *running* first
+   bridge's server-IP permit while block-all stayed in force. The disclosed
+   cost: an adopted cover keeps its stale server-IP permit until the next
+   connect re-engages — a permit on an idle cover, and the App-ID permit
+   already grants the bridge and plugin binaries unrestricted egress in that
+   window.
+
+   The TUN-LUID permit is the one exception: `Adopt` additionally calls
+   `failclosed::reclaim_stale_tun_permit` (Windows only), which deletes it
+   when `hole-tun` no longer resolves. Unlike the server IP, a resolving
+   `hole-tun` is itself proof some bridge may be relying on the permit, so
+   this can never touch a running bridge's cover — it only fires once the
+   name is provably gone (e.g. after a crash). Without it, a `NET_LUID`
+   (`IfType<<48 | NetLuidIndex<<24`) whose freed index NDIS later reassigns to
+   an unrelated wintun-based adapter would inherit unconditional egress from
+   the stale permit, armed but silently open, until the next connect. The
+   reclaim is keyed on THIS bridge's own last-known TUN name (from its own
+   `bridge-routes.json`, not a global constant): a different install's cover
+   leaves no such record, so the reclaim does not run for it — the same
+   per-install identity gap #878 tracks.
+
+1. On macOS, `release_all` still treats a MISSING (not merely unreadable)
+   state file as "no cover of this kind" — `StateFile::Absent`,
+   indistinguishable from "never engaged" — and still returns `Ok` over a
+   labelled-but-unrecorded cover, because it has no snapshot to restore.
+   Presence is no longer file-only, though: the pf rule label makes a live
+   cover with no state file detectable at **startup recovery**, which adopts
+   it, and the self-capture guard stops the next connect from recording that
+   cover as the host baseline (`main_snapshot_captured: false`, whose restore
+   target is `/etc/pf.conf`).
+
+1. A second bridge with an **explicit off intent** still sweeps machine-wide.
+   The Windows lockdown GUIDs are compile-time constants identical in every
+   build and install, and `lockdown_cover_presence` ignores `state_dir`, so
+   the probe answers "is a Hole lockdown cover present", never "is it mine".
+   `hole bridge run` takes independent `--socket-path`/`--state-dir`, so a
+   second bridge whose own `bridge-lockdown.json` says `enabled: false` still
+   sweeps a first bridge's live cover while that GUI reports Running. What
+   #881 closed is the three routes where the second state dir has *no
+   readable intent* — a wipe, a reinstall, a fresh `--state-dir` — which now
+   Adopt instead of Sweep AT RECOVERY TIME. The remaining route needs
+   per-install cover identity or the machine-wide lock, and is
+   [#878](https://github.com/bindreams/hole/issues/878)'s.
+
+   **The `Unset` x `Live` -> Adopt route is not fully closed — it is
+   deferred, not removed.** Recovery no longer clobbers a running first
+   bridge directly, but an adopted second bridge's OWN NEXT CONNECT still
+   can: `decide_cover_recovery(Unset, Live)` sets `record_intent_on = true`,
+   which persists `enabled: true` into the second bridge's own state dir and
+   sets its adopted claim, so `standing_cover_expected()` reads true on its
+   very next start. That start's `install_lockdown` -> `engage_lockdown`
+   deletes the TUN-LUID and server-IP permits by the SAME compile-time-constant
+   GUIDs (`LOCKDOWN_FILTER_GUIDS`, shared across every install) and re-adds
+   them keyed to the second bridge's own LUID and server IP, inside the same
+   transaction as its own block-all — while the first bridge is still
+   running. On Windows this breaks the first bridge's tunnel the moment the
+   second bridge connects; on macOS `engage_lockdown`'s `FreshEnable` reloads
+   the ENTIRE main pf ruleset via `pfctl -f -`, so the second bridge's connect
+   wholly overwrites the first bridge's lockdown ruleset. The fix needs the
+   same per-install cover identity as the bullet above — [#878](https://github.com/bindreams/hole/issues/878).
+
+1. `Unset` intent with `Unreachable` presence over a live cover leaves the
+   Unblock item hidden. The routes in are the Base Filtering Engine not
+   running or an RPC failure — both transient, and both states in which
+   `hole bridge unlock` would also fail, so the honest escape is the next
+   start once BFE answers, which adopts the cover and restores the menu item.
+
+1. An adopted cover records **two** facts, kept in two places. The
+   adopted-cover claim (`ProxyManager::set_standing_cover_adopted`, recorded
+   by `route_recovery::recover_and_record`) says only "a standing cover is
+   live right now and this process has not released it" — and is set only on
+   a MEASURED `CoverPresence::Live`, not merely `action == Adopt`: `Adopt` also
+   covers `Recorded` and `Indeterminate`, whose own docs say the OS did NOT
+   confirm one, so asserting liveness there would tell the connect path and
+   the update-consent gate no cover holds the update gap when none was
+   confirmed. The armed kill switch is `bridge-lockdown.json`, written by
+   `promote_adopted_claim` the moment a start honours the claim with a real
+   `install_lockdown`. Holding both in the claim is what let an ordinary
+   config edit disarm the switch: `reload`'s slow path is `stop()` then
+   `start()`, the `UserStop` teardown cleared the claim along with the cover,
+   and the next start re-derived `false`. Re-deriving on a later start is not
+   a fallback — once the cover is torn down the measurement reads `Absent` and
+   the decision is `Noop`. A failed repair write at `Unset`/`Live` therefore
+   costs the preference only until the next connect retries it, and never the
+   escape: within the run the claim is what keeps `lockdown_enabled` reporting
+   armed.
+
+   The claim is **not a latch** — it clears at four sites, three of which
+   release the cover and clear only on a CONFIRMED `release_all_covers()`
+   result, never on the guard's own silent `Drop`: `turn_lockdown_off`'s idle
+   arm, a `UserStop` teardown, and `check_health` tearing down a dead session.
+   An unconfirmed release at any of the three leaves the claim — and the
+   Unblock item — in place, on the theory that a false "released" is worse
+   than a stale "still armed". The fourth site, `turn_lockdown_off`'s
+   mid-session arm, releases nothing (the session's own cover is `stop_with`'s
+   to decide) and clears only because the user's newly-persisted explicit off
+   must not keep being overridden by a stale claim from before this session, or
+   from this session's own now-superseded adoption. Only `turn_lockdown_off`
+   clears the persisted arm, so the escape still disarms the switch for good.
+
+1. Startup still mutates global WFP state **unconditionally** via the
+   transient cover sweep, which runs outside every presence branch and
+   deletes the twelve transient GUIDs plus the shared sublayer and provider.
+   The standing kill switch is what #881 made conditional; the narrow true
+   claim is that it is never touched at startup without an explicit recorded
+   "off".
 
 #### Cover ownership
 
@@ -1365,7 +1884,67 @@ Spotlight "Hole" must reveal it.
   test ([`xtask/src/ci_coverage.rs`](xtask/src/ci_coverage.rs)) fails if a
   workspace crate's tests are run by no CI job (the recurring orphaned-test
   class). A new crate must join some CI test job's package filter, or — if it has
-  no runnable tests — get an `UNTESTED_IN_CI` entry with a reason. (#526)
+  no runnable tests — get an `UNTESTED_IN_CI` entry with a reason. (#526) A
+  general per-crate-per-platform version of this guard (asserting non-zero test
+  *counts*, not just presence) was found to be undetectable at package
+  granularity — every `test-hole` package already has ungated tests on every
+  platform it runs on — and was not built (#894). In its place,
+  `skuld_label_coverage::verify` asserts the `tun` skuld label's live listing
+  for `test-hole` is non-empty on the platform running it, catching the one
+  demonstrated regression class (a platform's whole privileged/TUN lane
+  silently going empty).
+- **`global_net_state` label conformance** — `.config/nextest.toml`'s
+  `global_net_state` test-group serializes cross-binary tests that mutate
+  global OS network state via a hand-maintained name-substring filter (see that
+  file's own comment). `cargo xtask verify-global-net-state-labels`
+  (`xtask/src/global_net_state_conformance.rs`) binds that filter to the
+  `global_net_state` skuld label attached at each test's own definition site,
+  checking live that both select the exact same tests and that the group's
+  `max-threads` is still `1` (#894). It does not catch a higher-precedence
+  `[[profile.default.overrides]]` entry stealing these tests into a different
+  group, and its universe is `test-hole`'s package set even though the
+  nextest.toml filter applies workspace-wide.
+
+### Datapath coverage: which lane proves what
+
+bindreams/hole#892 gives the TUN datapath's policy and packet paths headless
+coverage, via a router seam (Unit B) and a datapath seam (Units C–E). As of
+this section landing (end of Unit C), B and C are merged; the (D)/(E)-tagged
+entries below are the plan's target and not yet true on `main`.
+
+**Proved by the unprivileged lane** (`SKULD_LABELS=!tun`, all three CI legs):
+the drop cascade's consequence, including which mechanism served a flow and
+which recorded a drop (B); UDP dispatch identity, flow-table reuse and reply
+framing off the wire (C); the `DnsInterceptor` short-circuit and fall-through
+(C); cancellation teardown and read-error exit (C); TCP accept, 5-tuple
+fidelity and bidirectional relay including the partial-write drain (D, not
+yet landed); connection-permit release (D, not yet landed); and the
+dispatcher's shutdown/drop lifecycle (E, not yet landed).
+
+**Proved only by the elevated lane** (`SKULD_LABELS=tun`, plus the
+`hole bridge run` subprocess e2e): `Device::build` creating a real adapter
+with the requested name, MTU and address; the OS routing packets *into* that
+adapter (what #880 shows the current full-tunnel e2e does not prove); the OS
+*accepting* packets written out of it, which is what makes
+`VirtualTunDevice`'s `Checksum::Tx`-only choice load-bearing; adapter-handle
+lifetime, including `Dispatcher::Drop`'s wintun drain and `adapter_cleanup`'s
+sweep; and real egress from `InterfaceEndpoint` and `Socks5Endpoint`.
+
+**Proved by neither lane:** `cleanup_finished_connections`
+(`driver.rs:336-352`) — a resource-reclamation path with no external
+observable, whose absence is a leak rather than a behaviour change; the
+`Ok(0)` read arm (`driver.rs:131`), which `tun-0.8.13` never produces — the
+offset strip/prepend for macOS's utun header lives in the vendored `tun`
+crate's `platform/posix/split.rs` `Reader`/`Writer`, re-check there after the
+next bump (pinned only as a simulator contract, in `sim/wire_tests.rs`); whether
+`Dispatcher::shutdown` drained or aborted the driver task (#905); the
+`max_sniffers` budget (#906); and that the `plugin_supports_udp` constructor
+argument reaches the cascade (`dispatcher.rs:98`) — covered by reading, plus
+the pure derivation tests at `proxy_manager_tests.rs:1907-1945`.
+
+Each of the third list's five needs a product change, not a cleverer test, to
+close. See #892 for the tracking issue, #880 for the full-tunnel e2e gap, and
+#874 for the kill switch's own live-interface gap.
 
 ## Logging & diagnostics
 
@@ -1409,7 +1988,87 @@ line/column — never the raw `serde_json` message (which can echo a password).
 `warn!` and shows the path-free message in the toast. **(2) A detail-free
 structured wire variant + `warn!`** when the detail itself could carry
 content/PII: `import_servers_from_file` returns `ImportFailure::SaveFailed` /
-`CorruptedJson` (no fields) and logs the full error.
+`CorruptedJson` (no fields) and logs the full error. **(3) The redaction
+registry** ([below](#server-address-redaction)) for the configured server
+address, which no per-site rule can cover.
+
+### Server-address redaction
+
+The configured server address — hostname, DoH-resolved IP, and every textual
+form of either — is replaced by an opaque token before it reaches a log file,
+the dev console, a toast, or the support bundle. For a censorship-circumvention
+VPN it is the most sensitive value on the machine, and the default log filter is
+a **global `info`** (`build_filter` seeds `info` and *then* adds
+`hole_bridge=info`), so every crate in the process — third-party ones included —
+can write one. That set is not enumerable in advance, which is why the sink
+layer carries the weight.
+
+**What is covered.** [`util::redact`](crates/util/src/redact.rs) holds a
+process-global registry of armed literals behind an `ArcSwap` (lock-free reads,
+so no logging call can block behind a concurrent arm) and an `aho-corasick`
+automaton (`LeftmostLongest`, ASCII-case-insensitive). `RedactingWriter` wraps
+four non-blocking writers in `init_dual`, and **exactly one of them is a log
+file**: the `UserOwnedRotate` appender. Wrapping that one closes the file leak;
+the other three (the stderr layer's writer and the two stdio-relay tees) are the
+developer's terminal and cannot reopen it either way.
+
+**What is armed.** `arm_server` derives, from `entry.server`: the value as
+configured, its trailing-dot-stripped form, its `idna::domain_to_ascii` A-label,
+and — when it parses as an IP — that address's canonical text. `arm_resolved_ip`
+derives the bare and bracketed `[…]` forms (`handoff_host`'s IPv6 shape). **Each
+candidate is then filtered individually**, not the input string:
+`server = "127.0.0.1."` does not parse as an `IpAddr`, so a value-level carve-out
+passes it through and the trailing-dot strip arms the bare loopback address —
+turning every loopback mention in the process into a token. A candidate is armed
+unless it is empty, matches `localhost` case-insensitively, or (after stripping
+one `[`/`]` pair) parses to a loopback or unspecified address.
+
+**Tokens.** `<server:XXXXXXXX>` — the first 8 hex characters of the entry's
+random v4 UUID, never derived from the address — plus `<server:recovered>`, the
+one token minted without an entry in hand (crash recovery replays a prior run's
+routes before any config exists). Arming is keyed by literal, **last wins**: a
+re-arm re-points the literal in place and emits one `info!` naming both tokens
+and neither address, which is what joins the recovery lines to the session lines
+in a collected bundle. Replaced in place, never appended, so the automaton stays
+bounded however many times a long-running service arms.
+
+**Collisions.** Nothing validates a configured host, so `server: "hole"` is
+reachable, and arming it would rewrite `hole-tun`, `hole_bridge::proxy_manager`
+and the log-directory path throughout the file. There is no non-arbitrary
+threshold separating "too short" from "fine", so `arm` does not guess: it tests
+the candidate against `COLLISION_CORPUS`, **arms it anyway** — privacy does not
+yield — and emits one `warn!` naming the token and the collision, so the mangled
+log explains itself. The corpus's only job is that warning, so its
+incompleteness can weaken a diagnostic message and can never weaken redaction.
+
+**Prevention.** `ServerAddress` ([`config.rs`](crates/common/src/config.rs))
+implements neither `Display` nor `Deref`, so `server_host = %config.server.server`
+is a compile error and `format!("{}", *addr)` cannot reopen it. `expose()` is
+the single named exit, so grepping for it enumerates every real read site.
+
+**What replaces the address in a Hole-authored line.** `server` (the token),
+`server_kind` (`domain`/`ipv4`/`ipv6`), `server_family`, `server_scope`
+(`global`/`private`/`loopback`/`link_local`), and the unchanged `server_port`.
+Checked against the diagnoses this repo has actually needed (#248, #541, #655,
+#770, #694): none required the address. The joined `route`/`netsh` argv
+(`routing.rs`'s `log_route_command`), the ETW `remote` field, `netsh` stdout and
+garter's plugin relay deliberately get **no** per-site edit — the sink covers
+them, and hand-redaction there would rot.
+
+**Two limits, so this is not read as a total guarantee.** First, `dump!`'s
+ladder resolves per top-level expression, not per field: any `Serialize` type
+transitively holding a `ServerAddress` needs its own `Dump` impl, or the serde
+tree renders the inner string and `ServerAddress::dump` is never reached.
+`ServerEntry` and `ProxyConfig` have one; that is convention backed by
+per-container tests, not a compiler guarantee, with the sink as the backstop.
+Second, an address written in a form no armed literal is a byte-substring of —
+a percent- or punycode-escaped form from a third-party process, a non-canonical
+IPv6 text form from a peer that is not `std` — is not redacted.
+
+**Existing artifacts.** Files already on disk are not rewritten: a SYSTEM bridge
+rewriting files in a user-writable directory is an attack surface. The support
+bundle is scrubbed on collection instead, and its `REDACTION.txt` states the
+three residuals plainly.
 
 ### Logging directives (HOLE_BRIDGE_LOG)
 

@@ -150,11 +150,12 @@ ferrisetw = "1.2.0"
 [dev-dependencies]
 skuld = { workspace = true }
 hole-test-observability = { path = "../test-observability" }
-# Pulls in `tun_engine::test_utils` — the privileged-lane OS harness (probe
-# routes, shelled-out command diagnostics, the fail-closed escape guard) that
-# this crate's live-tun-permit e2e shares with tun-engine's own privileged
-# tests. The production dep above does not enable `test-utils`; this override
-# adds it for tests only.
+# Enables tun-engine's `test-utils` for tests only — the production dep above
+# does not. Brings both modules this crate's tests need: `tun_engine::test_utils`,
+# the privileged-lane OS harness (probe routes, shelled-out command diagnostics,
+# the fail-closed escape guard) shared with tun-engine's own privileged tests;
+# and `tun_engine::sim`, which builds the engine-owned `UdpFlow` the router
+# cascade tests need (its only constructor is `pub(crate)` inside tun-engine).
 tun-engine = { path = "../tun-engine", features = ["test-utils"] }
 # WaitableWriter + tracing_test::set_default_in_current_thread for the
 # sweep-wiring assertion in foreground_tests. The production dep above
@@ -197,7 +198,7 @@ xtask = { path = "../../xtask" }
 walkdir = "2"
 
 # What `start_plugin_chain` hands a real child, and what its output does. Binds
-# only an ephemeral loopback port, so it needs no `global-net-state` group.
+# only an ephemeral loopback port, so it needs no `global_net_state` group.
 [[test]]
 name = "plugin_chain"
 path = "tests/plugin_chain.rs"

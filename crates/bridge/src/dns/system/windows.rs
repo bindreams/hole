@@ -1,10 +1,11 @@
-//! Windows system DNS capture / apply / restore via the Win32 native API.
+//! Windows system DNS apply / restore via the Win32 native API, and the
+//! confinement seam.
 //!
 //! This layer calls `SetInterfaceDnsSettings` / `GetInterfaceDnsSettings`
 //! / `DnsFlushResolverCache` directly via the `windows = "0.62"` crate
 //! rather than shelling out to `netsh`. Each `netsh` subprocess cost ~5–7
 //! s on Defender-active machines (four per start); the direct FFIs are
-//! ms-scale (total apply ≈ 50 ms).
+//! ms-scale (total apply ~ 50 ms).
 //!
 //! ## Two layers
 //!
@@ -15,14 +16,15 @@
 //!   `MockBackend` via [`crate::dns::system::SystemDns::new_with_backend`].
 //!   The trait surface intentionally uses bridge types only (no
 //!   `windows::*` types) so the mock can be constructed without depending
-//!   on the Win32 crate.
+//!   on the Win32 crate. `get_settings` / `restore` / `restore_family` are
+//!   used ONLY by `crate::dns::recovery`'s upgrade sweep now — the bridge
+//!   itself no longer captures or blind-restores (bindreams/hole#846);
+//!   `set_servers` / `flush` are still the live `Dns::apply` path.
 //!
-//! - The free-function shims [`capture_adapters`] /
-//!   [`platform_restore_adapter`] / [`flush_dns_cache`] keep the
-//!   crash-recovery call sites (see [`crate::dns::recovery`]) intact.
-//!   Each shim instantiates [`Win32Real`] and delegates. The
-//!   `Dns`-trait apply path inside `SystemDns::apply` goes through
-//!   `Arc<dyn WinDnsBackend>` directly.
+//! - [`DnsConfiner`] — the same seam, one layer up, for
+//!   `tun_engine::dns_confine::engage`: production goes through
+//!   [`RealDnsConfiner`]; unit tests substitute a mock so `SystemDns::apply`
+//!   is fully testable without elevation or a real WFP engine.
 //!
 //! ## Windows version floor
 //!
@@ -37,15 +39,13 @@
 //! The DNS configuration on a Windows adapter is split per address
 //! family. `SetInterfaceDnsSettings` configures one family per call —
 //! select v4 vs v6 via the `DNS_SETTING_IPV6` flag in
-//! [`DNS_INTERFACE_SETTINGS::Flags`]. The apply path **configures both the
-//! v4 and v6 DNS families**, advertising the configured resolver IPs of
-//! each family; a family with no configured resolver is left untouched
-//! (never cleared — clearing would revert it to DHCP and leak) and replayed
-//! verbatim from the captured prior on restore.
+//! [`DNS_INTERFACE_SETTINGS::Flags`]. `set_servers` configures both the v4
+//! and v6 DNS families, advertising the configured resolver IPs of each; a
+//! family with no configured resolver is left untouched (never cleared —
+//! clearing would revert it to DHCP and leak).
 
 use std::io;
 use std::net::IpAddr;
-use std::sync::Arc;
 use std::time::Instant;
 
 use windows::core::{GUID, PCWSTR, PWSTR};
@@ -84,19 +84,33 @@ use crate::dns_state::{AdapterId, DnsPrior, DnsPriorAdapter};
 /// blocking pool so the FFI never stalls a runtime worker.
 pub trait WinDnsBackend: Send + Sync + 'static {
     /// Capture the v4 + v6 DNS state of `alias`. Returns `Ok(None)` when
-    /// the adapter does not exist (e.g. the TUN alias hasn't been created
-    /// yet); returns `Err` only on unexpected Win32 failures.
+    /// the adapter does not exist; returns `Err` only on unexpected Win32
+    /// failures. Used only by the upgrade sweep now.
     fn get_settings(&self, alias: &str) -> io::Result<Option<DnsPriorAdapter>>;
 
-    /// Set the DNS resolvers on `alias`, advertising the v4 and v6 families
-    /// separately from the matching entries in `servers`. A family with no
-    /// entries is left untouched (never cleared — clearing would revert it
-    /// to DHCP and leak).
-    fn set_servers(&self, alias: &str, servers: &[IpAddr]) -> io::Result<()>;
+    /// Set the DNS resolvers on the adapter identified by `luid`,
+    /// advertising the v4 and v6 families separately from the matching
+    /// entries in `servers`. A family with no entries is left untouched
+    /// (never cleared — clearing would revert it to DHCP and leak).
+    ///
+    /// Takes the LUID, not an alias: the caller (`Dns::apply`) already
+    /// holds the LUID of the concrete adapter this process opened
+    /// (`TunIdentity::luid`), and resolving a GUID from that LUID directly
+    /// (`ConvertInterfaceLuidToGuid`) never re-resolves the *name* Hole
+    /// requested — which, unlike the LUID, could belong to a different
+    /// adapter than the one this process holds (bindreams/hole#936).
+    fn set_servers(&self, luid: u64, servers: &[IpAddr]) -> io::Result<()>;
 
-    /// Restore the captured prior DNS state for `adapter`. Replays both
-    /// v4 and v6 from [`DnsPriorAdapter::v4`] / [`DnsPriorAdapter::v6`].
+    /// Restore BOTH families of the captured prior DNS state for `adapter`.
+    /// Used only by the upgrade sweep now, and only when both families'
+    /// evidence supports a restore.
     fn restore(&self, adapter: &DnsPriorAdapter) -> io::Result<()>;
+
+    /// Restore ONE family only, leaving the other untouched. Used by the
+    /// upgrade sweep's per-family evidence gate — `restore` (both families
+    /// unconditionally) would let a family with no evidence be overwritten
+    /// by a family that has some.
+    fn restore_family(&self, alias: &str, ipv6: bool, prior: &DnsPrior) -> io::Result<()>;
 
     /// Flush the OS resolver cache. Equivalent to `ipconfig /flushdns`.
     fn flush(&self) -> io::Result<()>;
@@ -141,17 +155,9 @@ impl WinDnsBackend for Win32Real {
         }))
     }
 
-    fn set_servers(&self, alias: &str, servers: &[IpAddr]) -> io::Result<()> {
+    fn set_servers(&self, luid: u64, servers: &[IpAddr]) -> io::Result<()> {
         let started = Instant::now();
-        let guid = match alias_to_guid(alias)? {
-            Some(g) => g,
-            None => {
-                return Err(io::Error::new(
-                    io::ErrorKind::NotFound,
-                    format!("Win32Real::set_servers: adapter not found: {alias}"),
-                ));
-            }
-        };
+        let guid = luid_to_guid(luid)?;
         // Advertise per family. Set a family ONLY when `servers` carries at
         // least one address of that family: setting a family to an empty list
         // clears it and lets Windows revert to the DHCP-assigned resolver (an
@@ -168,7 +174,7 @@ impl WinDnsBackend for Win32Real {
             set_one(guid, true, &DnsPrior::Static { servers: v6 })?;
         }
         tracing::debug!(
-            %alias,
+            luid,
             servers = ?servers,
             elapsed_ms = started.elapsed().as_millis() as u64,
             "Win32Real::set_servers"
@@ -204,6 +210,17 @@ impl WinDnsBackend for Win32Real {
         Ok(())
     }
 
+    fn restore_family(&self, alias: &str, ipv6: bool, prior: &DnsPrior) -> io::Result<()> {
+        let guid = match alias_to_guid(alias)? {
+            Some(g) => g,
+            None => {
+                tracing::warn!(%alias, "Win32Real::restore_family: adapter not found; skipping");
+                return Ok(());
+            }
+        };
+        set_one(guid, ipv6, prior)
+    }
+
     fn flush(&self) -> io::Result<()> {
         let started = Instant::now();
         // SAFETY: `DnsFlushResolverCache` takes no arguments and has no
@@ -219,6 +236,39 @@ impl WinDnsBackend for Win32Real {
         // a stale cache for one TTL window, so we surface no error to the
         // caller.
         Ok(())
+    }
+}
+
+// DnsConfiner trait ===================================================================================================
+
+/// The bridge-side seam over `tun_engine::dns_confine::engage`. Production
+/// [`RealDnsConfiner`] calls it directly; unit tests substitute a mock so
+/// `SystemDns::apply`'s cancel/error handling is testable without elevation
+/// or a real WFP engine. Mirrors [`WinDnsBackend`]'s shape.
+///
+/// The confinement guard is type-erased to `Box<dyn Any + Send>` because
+/// `tun_engine::dns_confine::DnsConfinement` itself carries no behavior
+/// this trait needs beyond "hold it, then drop it" — `SystemDnsApplied`
+/// never inspects it, only stores and drops it.
+pub trait DnsConfiner: Send + Sync + 'static {
+    fn engage(
+        &self,
+        tun_luid: u64,
+        server_ip: IpAddr,
+    ) -> Result<Box<dyn std::any::Any + Send>, tun_engine::dns_confine::DnsConfineError>;
+}
+
+/// Production [`DnsConfiner`]. Stateless.
+#[derive(Default, Debug, Clone, Copy)]
+pub struct RealDnsConfiner;
+
+impl DnsConfiner for RealDnsConfiner {
+    fn engage(
+        &self,
+        tun_luid: u64,
+        server_ip: IpAddr,
+    ) -> Result<Box<dyn std::any::Any + Send>, tun_engine::dns_confine::DnsConfineError> {
+        tun_engine::dns_confine::engage(tun_luid, server_ip).map(|c| Box::new(c) as Box<dyn std::any::Any + Send>)
     }
 }
 
@@ -250,6 +300,23 @@ fn alias_to_guid(alias: &str) -> io::Result<Option<GUID>> {
         return Err(io::Error::from_raw_os_error(rc.0 as i32));
     }
     Ok(Some(guid))
+}
+
+/// Resolve a raw interface LUID directly to its GUID — no name lookup, no
+/// alias round-trip. The sanctioned way `set_servers` targets the adapter
+/// the caller already holds by LUID (`TunIdentity::luid`), instead of
+/// `alias_to_guid`'s `ConvertInterfaceAliasToLuid` re-resolving a name that
+/// might belong to a different adapter by the time this runs.
+fn luid_to_guid(luid: u64) -> io::Result<GUID> {
+    let net_luid = NET_LUID_LH { Value: luid };
+    let mut guid = GUID::zeroed();
+    // SAFETY: `net_luid` and `guid` are owned values whose addresses are
+    // valid for the call.
+    let rc: WIN32_ERROR = unsafe { ConvertInterfaceLuidToGuid(&net_luid, &mut guid) };
+    if rc != ERROR_SUCCESS {
+        return Err(io::Error::from_raw_os_error(rc.0 as i32));
+    }
+    Ok(guid)
 }
 
 /// The `Version` stamped into every `DNS_INTERFACE_SETTINGS` this module
@@ -410,57 +477,6 @@ fn parse_servers(s: &str) -> Vec<IpAddr> {
         .filter(|tok| !tok.is_empty())
         .filter_map(|tok| tok.parse::<IpAddr>().ok())
         .collect()
-}
-
-// Free-function shims (crash-recovery + non-Dns-trait call sites) =====================================================
-//
-// `crate::dns::recovery` and `super::restore_all` call these shims; the
-// new `Dns`-trait path inside `SystemDns::apply` goes through
-// `Arc<dyn WinDnsBackend>` directly.
-
-/// Capture the v4+v6 DNS state of every adapter in `aliases`. Adapters
-/// that don't exist are silently skipped. See [`Win32Real::get_settings`].
-pub fn capture_adapters(aliases: &[String]) -> io::Result<Vec<DnsPriorAdapter>> {
-    let started = Instant::now();
-    let backend = Win32Real;
-    let mut out = Vec::with_capacity(aliases.len());
-    for alias in aliases {
-        match backend.get_settings(alias) {
-            Ok(Some(p)) => out.push(p),
-            Ok(None) => {
-                tracing::debug!(%alias, "DNS capture: adapter not found; skipping");
-            }
-            Err(e) => {
-                tracing::warn!(%alias, error = %e, "DNS capture failed for adapter");
-            }
-        }
-    }
-    tracing::debug!(
-        aliases = aliases.len(),
-        captured = out.len(),
-        elapsed_ms = started.elapsed().as_millis() as u64,
-        "capture_adapters"
-    );
-    Ok(out)
-}
-
-/// Restore one adapter. Invoked from [`super::restore_all`].
-pub fn platform_restore_adapter(adapter: &DnsPriorAdapter) -> io::Result<()> {
-    Win32Real.restore(adapter)
-}
-
-/// Flush the OS resolver cache. Inline call to [`DnsFlushResolverCache`]
-/// (~10 ms FFI); no need to detach onto a thread.
-pub fn flush_dns_cache() {
-    let _ = Win32Real.flush();
-}
-
-// Arc helpers — useful when MockBackend or Win32Real needs to cross
-// a `spawn_blocking` boundary as `Arc<dyn WinDnsBackend>`.
-
-/// Wrap a backend in an `Arc<dyn WinDnsBackend>` for trait-object use.
-pub fn boxed<B: WinDnsBackend>(backend: B) -> Arc<dyn WinDnsBackend> {
-    Arc::new(backend)
 }
 
 #[cfg(test)]
