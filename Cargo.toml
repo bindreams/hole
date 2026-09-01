@@ -21,7 +21,7 @@ skuld = { version = "0.2", features = ["tokio"] }
 # to the registry version and drops the git source (measured), publishing a garter
 # built against a cosca that lacks the graceful-signal work. Without one, publish
 # fails loudly until the epic's final registry flip. See bindreams/hole#816.
-cosca = { git = "https://github.com/bindreams/cosca", rev = "3ebbebb4dd6316764cad8c19d7c4ac13c769fadb", features = [
+cosca = { git = "https://github.com/bindreams/cosca", rev = "7f329afbb82bacd7b511ebabb71e65f42322bc7a", features = [
     "serde",
 ] }
 # Pre-main init for the test-observability subscriber install. See
