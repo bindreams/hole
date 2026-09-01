@@ -583,7 +583,7 @@ jobs:
       - name: Install
         shell: pwsh
         run: |
-          & .github/scripts/invoke-msiexec-bounded.ps1 -Verb /i -MsiPath target\release\hole.msi -LogPath "$env:RUNNER_TEMP\msi-install.log" -BoundMinutes 10 -FailOnNonZeroExit
+          & .github/scripts/invoke-msiexec-bounded.ps1 -Verb /i -MsiPath target\release\hole.msi -LogPath "$env:RUNNER_TEMP\msi-install.log" -FailOnNonZeroExit
 
       - name: Verify install
         shell: pwsh
@@ -689,11 +689,16 @@ jobs:
           pwsh -NoProfile -File .github/scripts/run-at-medium.ps1 -Script .github/scripts/e2e-medium.ps1
           exit $LASTEXITCODE
 
+      # Same TerminateProcess-returns-before-reap gap as the earlier "Kill any
+      # running hole.exe" step above: without Wait-Process, the Uninstall
+      # step's msiexec can start while hole.exe still holds file/service
+      # handles it needs to release.
       - name: Kill hole.exe after E2E
         if: always()
         shell: pwsh
         run: |
           Get-Process hole -ErrorAction SilentlyContinue | Stop-Process -Force
+          Wait-Process -Name hole -ErrorAction SilentlyContinue
 
       - name: Dump install log on failure
         if: failure()
@@ -706,7 +711,7 @@ jobs:
         if: always()
         shell: pwsh
         run: |
-          & .github/scripts/invoke-msiexec-bounded.ps1 -Verb /x -MsiPath target\release\hole.msi -LogPath "$env:RUNNER_TEMP\msi-uninstall.log" -BoundMinutes 10
+          & .github/scripts/invoke-msiexec-bounded.ps1 -Verb /x -MsiPath target\release\hole.msi -LogPath "$env:RUNNER_TEMP\msi-uninstall.log"
 
       - name: Verify uninstall
         if: always()
