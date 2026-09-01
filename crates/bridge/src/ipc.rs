@@ -881,9 +881,11 @@ async fn handle_diagnostics<P: Proxy + 'static, R: Routing + 'static>(
 
     // Network: does the host have a default gateway? Best-effort local
     // check; does not actually probe the gateway. Routes through
-    // `ProxyManager::default_gateway` (delegating to `Routing`) so tests
-    // hit `MockRouting`'s stub rather than the host OS.
-    let network = match pm.default_gateway() {
+    // `ProxyManager::default_route` (delegating to `Routing`) so tests hit
+    // `MockRouting`'s stub rather than the host OS. Destination-independent
+    // by design — this poll runs whether or not a session (and so a
+    // `server_ip`) exists.
+    let network = match pm.default_route() {
         Ok(_) => "ok".to_string(),
         Err(_) => "error".to_string(),
     };

@@ -16,7 +16,7 @@ use std::time::Duration;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
-use tun_engine::gateway::GatewayInfo;
+use tun_engine::gateway::{GatewayInfo, NextHop};
 use tun_engine::routing::failclosed::lockdown_state;
 use tun_engine::routing::{self, state as route_state, RouteId, Routing};
 use tun_engine::RoutingError;
@@ -330,6 +330,10 @@ impl Routing for MockRouting {
             server_ip,
             interface_name: interface_name.to_owned(),
             original_gateway: Some(gateway.gateway_ip),
+            route_form: match gateway.next_hop {
+                NextHop::Via(_) => route_state::RouteForm::Via,
+                NextHop::OnLink => route_state::RouteForm::OnLink,
+            },
             installed: installed.clone(),
             stale: Vec::new(),
         };
@@ -367,12 +371,26 @@ impl Routing for MockRouting {
         })
     }
 
-    fn default_gateway(&self) -> Result<GatewayInfo, RoutingError> {
+    fn default_gateway(&self, _dest: IpAddr) -> Result<GatewayInfo, RoutingError> {
         if self.state.fail_gateway.load(Ordering::SeqCst) {
             return Err(RoutingError::Gateway("mock gateway failure".into()));
         }
         Ok(GatewayInfo {
             gateway_ip: self.gateway,
+            next_hop: NextHop::Via(self.gateway),
+            interface_name: self.gateway_interface_name.clone(),
+            interface_index: 1,
+            ipv6_available: false,
+        })
+    }
+
+    fn default_route(&self) -> Result<GatewayInfo, RoutingError> {
+        if self.state.fail_gateway.load(Ordering::SeqCst) {
+            return Err(RoutingError::Gateway("mock gateway failure".into()));
+        }
+        Ok(GatewayInfo {
+            gateway_ip: self.gateway,
+            next_hop: NextHop::Via(self.gateway),
             interface_name: self.gateway_interface_name.clone(),
             interface_index: 1,
             ipv6_available: false,
@@ -1475,6 +1493,44 @@ fn gateway_failure_sets_last_error() {
         assert_eq!(pm.state(), ProxyState::Stopped);
         assert!(pm.last_error().is_some(), "default_gateway failure must set last_error");
         assert!(pm.last_error().unwrap().contains("mock gateway failure"));
+    });
+}
+
+/// A COVERED start (auto-connect) that fails at the gateway step — the
+/// shape of "Hole's own fail-closed cover severed a third-party VPN the
+/// upstream route depended on": the cover engages successfully (it names
+/// only the server + resolver, not anything the third-party VPN needs), and
+/// `default_gateway` then fails. `Err(e) => { self.last_error = ...; Err(e) }`
+/// in `start_cancellable` already retains the cover unconditionally on any
+/// non-cancel failure; this test establishes that the retained-cover state
+/// is LEGIBLE: `blocked_until_connected()` reads true, and the recorded
+/// reason is a gateway failure specifically,
+/// distinguishable from an ordinary unreachable-server failure (compare
+/// `RouteSetup`'s prefix) rather than a generic message that could be either.
+#[skuld::test]
+fn a_covered_start_that_fails_over_a_third_party_upstream_reports_blocked() {
+    rt().block_on(async {
+        let proxy = MockProxy::new();
+        let dir = tempfile::tempdir().unwrap();
+        let routing = MockRouting::failing_gateway(dir.path().to_path_buf());
+        let (mut pm, _dir) = new_manager_with_lockdown(proxy, routing, dir, false);
+
+        let err = pm
+            .start_cancellable(&test_config(), true, CancellationToken::new())
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, ProxyError::Gateway(_)), "got {err:?}");
+        assert!(
+            pm.blocked_until_connected(),
+            "a covered start's cover must be RETAINED on failure, never released"
+        );
+        let reason = pm.last_error().expect("a failed covered start must record a reason");
+        assert!(
+            reason.starts_with("gateway detection failed:"),
+            "the retained-cover reason must be legibly a gateway failure, not a generic \
+             unreachable-server message an operator could mistake for a DNS/connect problem: {reason:?}"
+        );
     });
 }
 

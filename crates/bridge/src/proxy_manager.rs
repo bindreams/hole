@@ -566,13 +566,17 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
     }
 
     /// Delegation for `handle_diagnostics`: expose the routing provider's
-    /// default-gateway query without leaking the provider itself. This is
-    /// NOT an encapsulation-breaking getter — it's a single capability
-    /// intentionally surfaced for the diagnostics handler so tests can
-    /// exercise the mock routing's gateway stub instead of hitting the
-    /// host OS.
-    pub fn default_gateway(&self) -> Result<GatewayInfo, ProxyError> {
-        self.routing.default_gateway().map_err(Into::into)
+    /// destination-independent default-route query without leaking the
+    /// provider itself. This is NOT an encapsulation-breaking getter — it's
+    /// a single capability intentionally surfaced for the diagnostics
+    /// handler so tests can exercise the mock routing's gateway stub instead
+    /// of hitting the host OS.
+    ///
+    /// `Routing::default_route`, not `default_gateway`: diagnostics runs
+    /// with no session, so there is no `server_ip` a server-scoped probe
+    /// could even be given (see `Routing::default_gateway`'s doc).
+    pub fn default_route(&self) -> Result<GatewayInfo, ProxyError> {
+        self.routing.default_route().map_err(Into::into)
     }
 
     /// Get the list of invalid (dropped) filter rules from the current ruleset.
@@ -1469,7 +1473,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         tun_engine::device::wintun::ensure_loaded()?;
 
         // Query the OS default gateway via the routing provider.
-        let gw_info = routing.default_gateway()?;
+        let gw_info = routing.default_gateway(server_ip)?;
 
         // Compile filter rules.
         let ruleset = crate::filter::rules::RuleSet::from_user_rules(&config.filters);

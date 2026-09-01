@@ -95,9 +95,23 @@ garter = { path = "../garter", features = ["test-utils"] }
 tracing-subscriber = { version = "0.3", features = ["fmt"] }
 
 [target.'cfg(target_os = "windows")'.dev-dependencies]
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+    "Win32_Networking_WinSock",
+] }
 # `test_utils::pktmon` compiles under bare `cfg(test)` (this crate's own
 # privileged tests use it without needing the `test-utils` feature on) — same
 # gate as `test_utils` itself. The `[dependencies]` entry above only covers
 # the OTHER edge: a downstream crate (`hole-bridge`) depending on this crate
 # with the `test-utils` feature turned on, where dev-dependencies never leak.
 rand = "0.10"
+
+# Own binary, not a module in the lib test binary: skuld validates that a label
+# is declared once per binary, and the lib already declares `TUN` in
+# `routing/failclosed/lockdown_privileged_tests.rs`.
+[[test]]
+name = "gateway_privileged"
+path = "tests/gateway_privileged.rs"
+harness = false

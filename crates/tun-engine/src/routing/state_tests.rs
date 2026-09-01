@@ -10,6 +10,7 @@ fn sample_ipv4() -> RouteState {
         server_ip,
         interface_name: "en0".into(),
         original_gateway: Some(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1))),
+        route_form: RouteForm::Via,
         installed: planned_routes(server_ip),
         stale: Vec::new(),
     }
@@ -23,6 +24,7 @@ fn sample_ipv6() -> RouteState {
         server_ip,
         interface_name: "Wi-Fi".into(),
         original_gateway: None,
+        route_form: RouteForm::Via,
         installed: vec![RouteId::SplitV6Low],
         stale: Vec::new(),
     }
@@ -39,6 +41,7 @@ fn sample_ipv4_with_stale() -> RouteState {
             server_ip: stale_server_ip,
             interface_name: "en1".into(),
             original_gateway: Some(IpAddr::V4(Ipv4Addr::new(9, 9, 9, 1))),
+            route_form: RouteForm::Via,
             installed: vec![RouteId::ServerBypass],
         }],
         ..sample_ipv4()
@@ -196,6 +199,62 @@ fn load_v2_migrates_preserving_installed_and_leaving_gateway_unknown() {
     assert_eq!(loaded.stale, Vec::new(), "v2 had no stale-group concept");
 }
 
+/// A record without a `route_form` field predates on-link support entirely,
+/// so every route it names was installed through a real gateway — teardown
+/// must pick the gateway delete form, never default to (or panic on) the
+/// interface-scoped form it never used.
+#[skuld::test]
+fn a_record_without_a_form_field_migrates_to_via() {
+    let dir = tempfile::tempdir().unwrap();
+    let json = serde_json::json!({
+        "version": 3,
+        "tun_name": "hole-tun",
+        "server_ip": "203.0.113.1",
+        "interface_name": "en0",
+        "original_gateway": "203.0.113.254",
+        "installed": ["server-bypass"],
+        "stale": [],
+    });
+    std::fs::write(dir.path().join(STATE_FILE_NAME), json.to_string()).unwrap();
+
+    let loaded = load(dir.path()).expect("a v3 file must still drive recovery, not be discarded");
+    assert_eq!(loaded.version, SCHEMA_VERSION);
+    assert_eq!(
+        loaded.route_form,
+        RouteForm::Via,
+        "a v3 record never had an on-link bypass"
+    );
+    assert_eq!(loaded.original_gateway, Some("203.0.113.254".parse().unwrap()));
+}
+
+/// The same migration, exercised on a carried-forward `stale` group nested
+/// inside the v3 record — `StaleRecordV3` must migrate too, not just the
+/// top-level fields.
+#[skuld::test]
+fn a_stale_group_without_a_form_field_migrates_to_via() {
+    let dir = tempfile::tempdir().unwrap();
+    let json = serde_json::json!({
+        "version": 3,
+        "tun_name": "hole-tun",
+        "server_ip": "203.0.113.1",
+        "interface_name": "en0",
+        "original_gateway": null,
+        "installed": [],
+        "stale": [{
+            "tun_name": "hole-tun",
+            "server_ip": "9.9.9.9",
+            "interface_name": "en1",
+            "original_gateway": "9.9.9.1",
+            "installed": ["server-bypass"],
+        }],
+    });
+    std::fs::write(dir.path().join(STATE_FILE_NAME), json.to_string()).unwrap();
+
+    let loaded = load(dir.path()).expect("a v3 file must still drive recovery, not be discarded");
+    assert_eq!(loaded.stale.len(), 1);
+    assert_eq!(loaded.stale[0].route_form, RouteForm::Via);
+}
+
 #[skuld::test]
 fn load_v2_with_unknown_field_returns_none() {
     let dir = tempfile::tempdir().unwrap();
@@ -258,6 +317,7 @@ fn group(server_ip: IpAddr, installed: Vec<RouteId>) -> StaleRecord {
         server_ip,
         interface_name: "en0".into(),
         original_gateway: Some(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1))),
+        route_form: RouteForm::Via,
         installed,
     }
 }

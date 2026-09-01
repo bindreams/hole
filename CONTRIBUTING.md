@@ -605,10 +605,22 @@ gateway (`platform_setup_commands` passes it to the matching `route add`), so
 the server-bypass teardown carries it forward as `RouteState.original_gateway`
 and emits `route delete <server_ip> mask 255.255.255.255 <gateway>` instead of
 the unscoped form. This is `None` — falling back to the old unscoped delete, a
-disclosed residual — only for a record migrated from schema 1/2, which never
-persisted a gateway. The split-route deletes stay unscoped on both platforms
-(`RouteId` provenance is their only handle); only the single-destination
-bypass delete can carry a gateway at all.
+disclosed residual — only for a record migrated from schema 1/2/3, which
+never persisted a gateway. The split-route deletes stay unscoped on both
+platforms (`RouteId` provenance is their only handle); only the
+single-destination bypass delete can carry a gateway at all.
+
+**On-link is a route form, not a fallback.** When the upstream route to the
+server has no gateway (`NextHop::OnLink`), Windows has no address to scope
+the bypass by — `netsh interface ip add/delete route <server>/32 <interface>`
+names the interface instead, symmetric with the IPv6 bypass, which has always
+been interface-scoped for the same reason (no reliable IPv6 gateway
+detection). Which form a record used is persisted as `RouteState.route_form`,
+a field distinct from `original_gateway` — an on-link install and a migrated
+pre-schema-4 record both leave `original_gateway`-shaped ambiguity, but only
+`route_form` says which delete argv to reconstruct. macOS has no
+interface-scoped IPv4 bypass form; an on-link default route is refused there
+before `install` is ever reached (`gateway::reject_macos_on_link`).
 
 Provenance is the one handle that outlives the interface, which matters because
 the utun is always already gone by teardown: `RunningState` closes the TUN at
@@ -663,7 +675,7 @@ the same process before starting a new one. A record is only ever retained
 because its own teardown could not confirm the route gone, so the sweep
 commonly fails the identical way again — whatever it still cannot confirm
 gone is carried forward into `RouteState.stale` (a list of
-`{tun_name, server_ip, interface_name, original_gateway, installed}` groups,
+`{tun_name, server_ip, interface_name, original_gateway, route_form, installed}` groups,
 each with its own provenance since a later sweep or `recover_routes` may run
 under a different `tun_name`/`server_ip`/gateway than the new session's own).
 The new session's own checkpoints only ever touch `installed`, never `stale`,
@@ -674,8 +686,8 @@ record, and the state file is cleared only once both are empty.
 **Groups are reduced to canonical form before anything runs.**
 `routing::state::coalesce` is the one place that folds a group into `stale`:
 groups sharing an identity (`tun_name`, `server_ip`, `interface_name`,
-`original_gateway` — the tuple that determines the argv a group's commands
-emit) merge into one whose `installed` is the union, each survivor is
+`original_gateway`, `route_form` — the tuple that determines the argv a
+group's commands emit) merge into one whose `installed` is the union, each survivor is
 sanitized against `planned_routes(server_ip)` (an id with no possible
 teardown command — e.g. a `ServerBypass` against a loopback `server_ip` —
 can never drain, so it would pin `stale` non-empty forever), and an empty
