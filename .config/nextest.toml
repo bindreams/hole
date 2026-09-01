@@ -132,3 +132,24 @@ test-group = 'global_net_state'
 [[profile.default.overrides]]
 filter = 'test(/^(a_port_53_datagram_reaches_the_interceptor|an_intercepted_reply_is_written_to_the_tun_with_the_five_tuple_swapped|an_interceptor_returning_none_falls_through_to_the_router|a_non_53_datagram_never_reaches_the_interceptor|tcp_to_port_53_never_reaches_the_interceptor|an_ipv6_port_53_datagram_reaches_the_interceptor_and_its_reply_is_framed_correctly|an_ipv6_interceptor_returning_none_falls_through_to_the_router|a_udp_datagram_reaches_the_router_with_its_five_tuple|the_first_datagram_is_seeded_into_the_new_flow|a_second_datagram_on_the_same_five_tuple_reuses_the_flow|a_datagram_with_a_different_source_port_opens_a_second_flow|a_router_reply_is_written_to_the_tun_with_the_five_tuple_swapped|an_ipv6_udp_datagram_round_trips|cancelling_the_engine_ends_the_run_loop|cancelling_the_engine_closes_every_in_flight_flow|a_tun_read_error_ends_the_run_loop|the_driver_sweep_closes_a_flow_the_router_still_holds)$/)'
 slow-timeout = { period = "30s", terminate-after = 2 }
+
+# `crates/garter/src/tap_tests.rs`'s `run_with_tap` harness (and its inline
+# twin in `shutdown_cancels_in_flight_connection_without_panic`) parks on two
+# intra-process signals ("tap ready", "tap closed") emitted by `TapPlugin`/
+# `StubPlugin` tasks the test itself spawns — not an out-of-process op, so
+# CONTRIBUTING.md's no-synchronizing-via-time rule does not sanction a
+# per-await `tokio::time::timeout` there (see that file's module doc). A
+# regression that stops one of those signals from firing is bounded here
+# instead, the same `slow-timeout`/`terminate-after` mechanism as the
+# `tun-engine` driver tests above, for the identical reason: the wait has no
+# happens-before edge to bound any other way. Every test in the file that
+# reaches `run_with_tap` or the inline twin is listed; the full file (7
+# tests, including `counting_stream_smoke`, the one that never calls either)
+# runs in well under 1s here, so a 20s period is a large multiple of that.
+#
+# COUPLED NAMES, same caveat as the two groups above: these are bare function
+# names. Add any new `run_with_tap`-driven test in this file here too, or it
+# hangs the job on a regression instead of failing fast.
+[[profile.default.overrides]]
+filter = 'test(/^(echo_records_round_trip_byte_counts_and_ttfb|silent_drop_records_zero_bytes_and_no_ttfb|silent_after_read_matches_248_shape|rst_close_classified_as_rst_with_os_errno|shutdown_cancels_in_flight_connection_without_panic|cross_check_inbound_and_upstream_counters_match)$/)'
+slow-timeout = { period = "20s", terminate-after = 2 }

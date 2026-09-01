@@ -10,7 +10,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::oneshot;
 
-use garter::{BinaryPlugin, ChainRunner, PluginEnv};
+use garter::{BinaryPlugin, ChainReady, ChainRunner, PluginEnv, StartError};
 use skuld::env;
 
 mod common;
@@ -79,9 +79,8 @@ async fn two_plugin_chain_relays_data() {
 
     // Park until the chain signals ready. Deterministic, no poll-retry.
     // Connect to the authoritative bound address reported by the chain.
-    let chain_ready = ready_rx
+    let chain_ready = expect_ready(ready_rx)
         .await
-        .expect("chain never signaled ready")
         .expect("chain should be ready, not a start error");
     let mut client = TcpStream::connect(chain_ready.listen)
         .await
@@ -153,10 +152,7 @@ async fn pid_sink_fires_once_per_binary_plugin() {
 
     let handle = tokio::spawn(async move { runner.run(env).await });
 
-    ready_rx
-        .await
-        .expect("ready_tx dropped")
-        .expect("chain should become ready");
+    expect_ready(ready_rx).await.expect("chain should become ready");
 
     {
         let recorded = pids.lock().unwrap();
@@ -223,9 +219,8 @@ async fn two_plugin_chain_server_mode_relays_data() {
     let chain_task = tokio::spawn(async move { runner.run(env).await });
 
     // on_ready fires when the OUTER plugin has bound the public port.
-    let chain_ready = ready_rx
+    let chain_ready = expect_ready(ready_rx)
         .await
-        .expect("chain never signaled ready")
         .expect("chain should be ready, not a start error");
     assert_eq!(
         chain_ready.listen.port(),
@@ -302,9 +297,8 @@ async fn tier2_plugin_without_sitrep_still_readies_via_probe() {
 
     let chain_task = tokio::spawn(async move { runner.run(env).await });
 
-    let chain_ready = ready_rx
+    let chain_ready = expect_ready(ready_rx)
         .await
-        .expect("chain never signaled ready")
         .expect("chain should ready via tier-2 probe, not a start error");
 
     let mut client = TcpStream::connect(chain_ready.listen)
@@ -355,7 +349,7 @@ async fn fatal_start_error_surfaces_typed() {
 
     let chain_task = tokio::spawn(async move { runner.run(env).await });
 
-    let outcome = ready_rx.await.expect("aggregator should send");
+    let outcome = expect_ready(ready_rx).await;
     assert!(
         matches!(outcome, Err(garter::StartError::Fatal { .. })),
         "expected StartError::Fatal, got {outcome:?}"
@@ -398,7 +392,7 @@ async fn bind_conflict_start_error_surfaces_typed() {
 
     let chain_task = tokio::spawn(async move { runner.run(env).await });
 
-    let outcome = ready_rx.await.expect("aggregator should send");
+    let outcome = expect_ready(ready_rx).await;
     match outcome {
         Err(garter::StartError::BindConflict { errno, addr }) => {
             // Host-native errno (10048 / 98 / 48) — assert nonzero rather
@@ -450,7 +444,7 @@ async fn empty_transports_ready_surfaces_fatal() {
 
     let chain_task = tokio::spawn(async move { runner.run(env).await });
 
-    let outcome = ready_rx.await.expect("aggregator should send");
+    let outcome = expect_ready(ready_rx).await;
     assert!(
         matches!(outcome, Err(garter::StartError::Fatal { .. })),
         "empty transports should surface StartError::Fatal, got {outcome:?}"
@@ -519,9 +513,8 @@ async fn version_skew_falls_back_to_probe() {
 
     let chain_task = tokio::spawn(async move { runner.run(env).await });
 
-    let chain_ready = ready_rx
+    let chain_ready = expect_ready(ready_rx)
         .await
-        .expect("chain never signaled ready")
         .expect("unknown-major should fall back to probe, not a start error");
 
     // The probe-fallback readiness reports Transports::TCP (the tier-2
@@ -598,9 +591,8 @@ async fn auto_readies_silent_non_sitrep_plugin_via_probe() {
     };
     let chain_task = tokio::spawn(async move { runner.run(env).await });
 
-    let chain_ready = ready_rx
+    let chain_ready = expect_ready(ready_rx)
         .await
-        .expect("chain never signaled ready")
         .expect("Auto must ready a silent non-sitrep plugin via the probe");
     // The probe is TCP-connect only.
     assert_eq!(chain_ready.transports, garter::Transports::TCP);
@@ -659,10 +651,7 @@ async fn auto_readies_sitrep_plugin() {
     };
     let chain_task = tokio::spawn(async move { runner.run(env).await });
 
-    let chain_ready = ready_rx
-        .await
-        .expect("chain never signaled ready")
-        .expect("Auto should ready a sitrep plugin");
+    let chain_ready = expect_ready(ready_rx).await.expect("Auto should ready a sitrep plugin");
     let mut client = TcpStream::connect(chain_ready.listen).await.expect("connect");
     client.write_all(b"hello auto sitrep").await.unwrap();
     let mut buf = [0u8; 1024];
@@ -704,7 +693,7 @@ async fn auto_surfaces_bind_conflict() {
     };
     let chain_task = tokio::spawn(async move { runner.run(env).await });
 
-    let outcome = ready_rx.await.expect("aggregator should send");
+    let outcome = expect_ready(ready_rx).await;
     assert!(
         matches!(outcome, Err(garter::StartError::BindConflict { .. })),
         "Auto must surface BindConflict, got {outcome:?}"
@@ -742,7 +731,7 @@ async fn auto_surfaces_fatal() {
     };
     let chain_task = tokio::spawn(async move { runner.run(env).await });
 
-    let outcome = ready_rx.await.expect("aggregator should send");
+    let outcome = expect_ready(ready_rx).await;
     assert!(
         matches!(outcome, Err(garter::StartError::Fatal { .. })),
         "Auto must surface Fatal, got {outcome:?}"
@@ -801,10 +790,7 @@ async fn force_kill_reaps_descendant_tree() {
     };
     let chain = tokio::spawn(async move { runner.run(env).await });
 
-    ready_rx
-        .await
-        .expect("ready_tx dropped")
-        .expect("mock-plugin should ready");
+    expect_ready(ready_rx).await.expect("mock-plugin should ready");
 
     // The grandchild dials back on startup; accepting proves it is alive without
     // a PID or a poll.
@@ -888,7 +874,7 @@ async fn log_sink_receives_every_line_including_sitrep_frames() {
         plugin_options: None,
     };
     let chain_task = tokio::spawn(async move { runner.run(env).await });
-    ready_rx.await.expect("aggregator should send").expect("chain ready");
+    expect_ready(ready_rx).await.expect("chain ready");
 
     let mut sunk = Vec::new();
     while let Ok(line) = rx.try_recv() {
@@ -941,7 +927,7 @@ async fn log_sink_receives_a_frame_the_sitrep_parser_consumes() {
     };
     let chain_task = tokio::spawn(async move { runner.run(env).await });
 
-    let outcome = ready_rx.await.expect("aggregator should send");
+    let outcome = expect_ready(ready_rx).await;
     assert!(
         matches!(outcome, Err(garter::StartError::Fatal { .. })),
         "expected StartError::Fatal, got {outcome:?}"
@@ -957,6 +943,40 @@ async fn log_sink_receives_a_frame_the_sitrep_parser_consumes() {
     );
 
     let _ = chain_task.await;
+}
+
+/// Bound for `ready_rx.await` — every plugin in this file's chains is a real
+/// spawned `mock-plugin` child process (`common::mock_plugin_path`), so a
+/// child that never becomes ready and never exits either leaves nothing to
+/// wake this await; the child is the sanctioned "may genuinely never happen"
+/// case CONTRIBUTING.md's no-synchronizing-via-time rule carves out. Without
+/// a bound this reads as a 10-minute CI job-timeout kill with no assertion
+/// and no test output instead of a named failure. Readiness itself is not one
+/// mechanism: `ReadinessMode::ExpectSitrep` reads it off the child's sitrep
+/// `hello`/`ready` frames, while `ReadinessMode::Probe`/`Auto` ready via a
+/// TCP self-probe (`chain::poll_ready`) that never touches sitrep — the
+/// timeout message below names both rather than presupposing one.
+const READY_TIMEOUT: Duration = Duration::from_secs(30);
+
+async fn expect_ready(ready_rx: oneshot::Receiver<Result<ChainReady, StartError>>) -> Result<ChainReady, StartError> {
+    match tokio::time::timeout(READY_TIMEOUT, ready_rx).await {
+        Ok(Ok(outcome)) => outcome,
+        // `run_readiness_aggregator`'s `shutdown.cancelled()` arm (chain.rs)
+        // returns without sending whenever chain-wide shutdown fires before
+        // THIS plugin's own readiness does — e.g. another plugin in the
+        // chain exiting (`record_exit` cancels `shutdown` on every exit) or
+        // an external cancel — not only when the aggregator task itself dies.
+        Ok(Err(_)) => panic!(
+            "chain's ready_tx was dropped without sending — chain-wide shutdown fired \
+             before this plugin readied (see garter::chain::run_readiness_aggregator's \
+             shutdown.cancelled() arm), or the aggregator task panicked"
+        ),
+        Err(_) => panic!(
+            "chain did not report readiness within {READY_TIMEOUT:?} — the mock-plugin child \
+             never became ready (sitrep hello/ready, or a TCP self-probe connect, depending on \
+             its ReadinessMode) and never exited either"
+        ),
+    }
 }
 
 /// Wait for a sunk line matching `pred`. Bounded, unlike the two tests above:
@@ -1039,7 +1059,7 @@ async fn log_sink_receives_probe_mode_stdout_lines() {
         plugin_options: None,
     };
     let chain_task = tokio::spawn(async move { runner.run(env).await });
-    ready_rx.await.expect("aggregator should send").expect("chain ready");
+    expect_ready(ready_rx).await.expect("chain ready");
 
     assert!(
         wait_for_sunk_line(&mut rx, |l| l.contains(r#""event":"hello""#)).await,
@@ -1083,7 +1103,7 @@ async fn log_sink_receives_stderr_lines() {
         plugin_options: None,
     };
     let chain_task = tokio::spawn(async move { runner.run(env).await });
-    ready_rx.await.expect("aggregator should send").expect("chain ready");
+    expect_ready(ready_rx).await.expect("chain ready");
 
     assert!(
         wait_for_sunk_line(&mut rx, |l| l.contains("mock-plugin: listening on")).await,
@@ -1145,9 +1165,8 @@ async fn log_sink_receives_lines_drained_after_version_skew_fallback() {
         plugin_options: None,
     };
     let chain_task = tokio::spawn(async move { runner.run(env).await });
-    ready_rx
+    expect_ready(ready_rx)
         .await
-        .expect("aggregator should send")
         .expect("unknown-major should fall back to probe, not a start error");
 
     // The bad-major `hello` is consumed by the reader's own loop before the
@@ -1198,7 +1217,7 @@ async fn stderr_relay_strips_ansi_even_from_an_uncooperative_child() {
         plugin_options: None,
     };
     let chain_task = tokio::spawn(async move { runner.run(env).await });
-    ready_rx.await.expect("aggregator should send").expect("chain ready");
+    expect_ready(ready_rx).await.expect("chain ready");
 
     let collected = collect_sunk_lines_until(&mut rx, |l| l.contains("colored line")).await;
     let colored = collected
@@ -1259,7 +1278,7 @@ async fn no_color_and_clicolor_reach_the_real_child(#[fixture] env: &skuld::EnvG
         plugin_options: None,
     };
     let chain_task = tokio::spawn(async move { runner.run(plugin_env).await });
-    ready_rx.await.expect("aggregator should send").expect("chain ready");
+    expect_ready(ready_rx).await.expect("chain ready");
 
     // CLICOLOR is echoed AFTER NO_COLOR (see mock-plugin.rs), so waiting on
     // it guarantees both lines have already been sunk.
@@ -1315,7 +1334,7 @@ async fn sitrep_parser_sees_the_line_before_any_ansi_strip() {
     };
     let chain_task = tokio::spawn(async move { runner.run(env).await });
 
-    let outcome = ready_rx.await.expect("aggregator should send");
+    let outcome = expect_ready(ready_rx).await;
     assert!(
         outcome.is_ok(),
         "the malformed line must stay inert passthrough (parse_event must see the RAW line, \
