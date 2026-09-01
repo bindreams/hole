@@ -40,10 +40,9 @@ param(
     # much smaller bound loses nothing.
     [double]$BoundMinutes = 3,
 
-    # Install failure is fatal (matches the pre-existing `throw` there);
-    # Uninstall failure is best-effort cleanup (matches the pre-existing
-    # `Write-Warning` there). A wedge is fatal either way -- see the `throw`
-    # below -- this switch only covers the ordinary nonzero-exit-code path.
+    # Install failure is fatal; Uninstall is best-effort cleanup -- callers set
+    # this switch to match their own error-handling policy. A wedge is fatal
+    # either way regardless of this switch (see the `throw` below).
     [switch]$FailOnNonZeroExit,
 
     [string]$ExePath = "msiexec",
