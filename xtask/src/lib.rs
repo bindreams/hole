@@ -159,11 +159,18 @@ pub enum Command {
     ///
     /// Output goes into `<repo>/.cache/wintun/`. No-op on non-Windows.
     Wintun,
-    /// Download and verify the golangci-lint binary for the host platform.
+    /// Download and verify the golangci-lint binary for the host platform, and
+    /// optionally run it against the `crates/ex-ray/` Go module.
     ///
-    /// Output goes into `<repo>/.cache/golangci-lint/<version>/`. Used by the
-    /// `go-fmt` / `go-lint` prek hooks against the `crates/ex-ray/` Go module.
-    GolangciLint,
+    /// Output goes into `<repo>/.cache/golangci-lint/<version>/`. With no
+    /// arguments this only provisions, which is all `deps` needs. The `go-fmt`
+    /// and `go-lint` prek hooks pass `fmt --diff` and `run` through it, so the
+    /// binary's path is spelled once, here, and never in `prek.toml`.
+    GolangciLint {
+        /// Arguments forwarded to golangci-lint, which runs in `crates/ex-ray`.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
     /// Clone + build the pinned upstream shadowsocks/v2ray-plugin for the
     /// ex-ray cross-implementation interop test.
     ///
@@ -387,7 +394,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
         Command::ExRay => run_ex_ray(),
         Command::Galoshes => run_galoshes(),
         Command::Wintun => run_wintun(),
-        Command::GolangciLint => run_golangci_lint(),
+        Command::GolangciLint { args } => run_golangci_lint(&args),
         Command::ProvisionUpstreamV2ray => run_provision_upstream_v2ray(),
         Command::PullSubrepo { path, tag } => run_pull_subrepo(path, tag),
         Command::ForceCommitConflictedSubrepo { path, tag } => {
@@ -482,10 +489,25 @@ pub fn run_dmg_background(_out_dir: Option<PathBuf>) -> Result<()> {
     anyhow::bail!("dmg-background is only supported on macOS")
 }
 
-pub fn run_golangci_lint() -> Result<()> {
+pub fn run_golangci_lint(args: &[String]) -> Result<()> {
     let repo_root = repo_root()?;
     let path = golangci_lint::ensure(&repo_root)?;
-    println!("xtask: golangci-lint at {}", path.display());
+    if args.is_empty() {
+        println!("xtask: golangci-lint at {}", path.display());
+        return Ok(());
+    }
+
+    // golangci-lint resolves `.golangci.yml` and the module from the working
+    // directory, so it has to run inside the Go module rather than the root.
+    let module = repo_root.join("crates").join("ex-ray");
+    let status = std::process::Command::new(&path)
+        .args(args)
+        .current_dir(&module)
+        .status()
+        .with_context(|| format!("failed to run {} in {}", path.display(), module.display()))?;
+    if !status.success() {
+        anyhow::bail!("golangci-lint {} failed: {status}", args.join(" "));
+    }
     Ok(())
 }
 
@@ -582,7 +604,7 @@ pub fn run_deps() -> Result<()> {
     run_ex_ray()?;
     run_galoshes()?;
     run_wintun()?;
-    run_golangci_lint()?;
+    run_golangci_lint(&[])?;
     Ok(())
 }
 

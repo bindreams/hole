@@ -3,7 +3,7 @@
 //! `golangci-lint` is the single Go quality gate for the `crates/ex-ray/` Go
 //! module (it subsumes `go vet` via the `govet` linter and `gofmt`/`gofumpt`
 //! via its v2 `formatters` section). The `go-fmt` / `go-lint` prek hooks in
-//! `prek.toml` invoke the cached binary by absolute path, so provisioning it
+//! `prek.toml` reach the binary through this subcommand, so provisioning it
 //! through `cargo xtask deps` makes it available identically at pre-commit and
 //! in CI (CI's `Lint` job runs `setup-build` → `cargo xtask deps` →
 //! `cargo xtask run prek`). No `go install` and no PATH dependency.
@@ -23,18 +23,21 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, bail, Context, Result};
 
-/// Pinned golangci-lint version — the single Go gate (v2 schema: `run`
-/// lints, `fmt` formats). v2.12.2 was built with go1.26.x and its
-/// bundled Go analysis is compatible with the `crates/ex-ray/go.mod`
-/// `go 1.25.5` directive. Bump this const AND every per-platform SHA256 in
-/// [`asset_for`] together; the `.verified` sentinel invalidates the cache on
-/// a version dir change.
-const VERSION: &str = "2.12.2";
+/// Pinned golangci-lint version — the single Go gate (v2 schema: `run` lints,
+/// `fmt` formats). golangci-lint refuses to load a config whose module targets
+/// a newer Go than the release its own binary was built with, so this pin has
+/// to keep up with the `go` directive in `crates/ex-ray/go.mod`. Each release
+/// names its build in `GO_VERSION` in golangci-lint's `.github/workflows/release.yml`
+/// at that tag; v2.13.2 is built with go1.27.0.
+///
+/// Bump this const AND every per-platform SHA256 in [`asset_for`] together —
+/// the `.verified` sentinel stores the pinned hash, so a mismatch re-downloads.
+const VERSION: &str = "2.13.2";
 
 /// One release archive: its download URL filename and the SHA256 pinned from
 /// the upstream `golangci-lint-<version>-checksums.txt`.
 struct Asset {
-    /// Archive filename, e.g. `golangci-lint-2.12.2-linux-amd64.tar.gz`.
+    /// Archive filename, e.g. `golangci-lint-2.13.2-linux-amd64.tar.gz`.
     file_name: String,
     /// Lowercase-hex SHA256 of the archive.
     sha256: &'static str,
@@ -83,32 +86,32 @@ fn asset_for() -> Result<Asset> {
     let (suffix, sha256, kind): (&str, &str, ArchiveKind) = match (std::env::consts::OS, std::env::consts::ARCH) {
         ("windows", "x86_64") => (
             "windows-amd64.zip",
-            "bd42e3ebc8cb4ececb86941983baaf1dc221bbb04d838e94ce63b49cc91e02bb",
+            "4735fdc8e84a0cfb7a15a1c364a650942f88215e0d36c674ebc4024f7b554524",
             ArchiveKind::Zip,
         ),
         ("windows", "aarch64") => (
             "windows-arm64.zip",
-            "947b9a5bf762d465710b376c156f0184abb2168378b0826af1899e0ee7183742",
+            "2dbffbd1225d41ac5740f0b478a43b6517f3e3f702fe0ab3aec470bd6ec8e263",
             ArchiveKind::Zip,
         ),
         ("macos", "x86_64") => (
             "darwin-amd64.tar.gz",
-            "f6f06d94b6241521c53d15450c5209b028270bf966f842afb11c030c79f5bc16",
+            "8a13aaf9cbbb1dee52824e862cf0d0720e5bb97c1f4260d1e51623a09492b57b",
             ArchiveKind::TarGz,
         ),
         ("macos", "aarch64") => (
             "darwin-arm64.tar.gz",
-            "a9c54498731b3128f79e090be6110f3e5fffccc617b08142ed244d4126c73f29",
+            "f4bf83f0b64f055c42b28fc9a38861839f69c096e61c788e72dfaae412011789",
             ArchiveKind::TarGz,
         ),
         ("linux", "x86_64") => (
             "linux-amd64.tar.gz",
-            "8df580d2670fed8fa984aac0507099af8df275e665215f5c7a2ae3943893a553",
+            "2277d43b98ec0054280f2ac26b53268bae97682444678a59a657dd565da021d6",
             ArchiveKind::TarGz,
         ),
         ("linux", "aarch64") => (
             "linux-arm64.tar.gz",
-            "44cd40a8c76c86755375adfeea52cfd3533cb43d7bd647771e0ae065e166df3a",
+            "a2a4e0065aa41be71f7c5ac90f271b61751331e5d04314e62afe4027855f0893",
             ArchiveKind::TarGz,
         ),
         (os, arch) => bail!("no pinned golangci-lint v{VERSION} asset for host {os}/{arch}"),
@@ -120,28 +123,32 @@ fn asset_for() -> Result<Asset> {
     })
 }
 
+/// Is the binary on disk the verified one for the pinned hash? The sentinel
+/// holds the hash rather than the version, so it also rejects a directory left
+/// half-written by an interrupted run.
+fn cache_is_valid(bin_path: &Path, sentinel: &Path, sha256: &str) -> bool {
+    if !bin_path.exists() || !sentinel.exists() {
+        return false;
+    }
+    std::fs::read_to_string(sentinel).is_ok_and(|stored| stored.trim() == sha256)
+}
+
 /// Download (if not cached) and verify golangci-lint, returning the path to the
 /// extracted binary. A cache hit (binary present + sentinel matches the pinned
 /// hash) returns immediately with no network access.
 pub fn ensure(repo_root: &Path) -> Result<PathBuf> {
     let asset = asset_for()?;
 
-    // Version-scoped cache dir so a VERSION bump lands in a fresh directory and
-    // never collides with a stale binary.
+    // Version-scoped: a bump lands in a fresh directory rather than overwriting
+    // the binary in place, which the OS forbids while a prek hook is running it.
     let cache_dir = repo_root.join(".cache").join("golangci-lint").join(VERSION);
     let bin_path = cache_dir.join(format!("golangci-lint{}", binary_ext()));
     let sentinel = cache_dir.join("golangci-lint.verified");
 
     std::fs::create_dir_all(&cache_dir).with_context(|| format!("failed to create {}", cache_dir.display()))?;
 
-    // Cache check: sentinel matching the pinned hash means the on-disk binary
-    // is the verified one — skip the network round-trip.
-    if bin_path.exists() && sentinel.exists() {
-        let stored = std::fs::read_to_string(&sentinel).unwrap_or_default();
-        if stored.trim() == asset.sha256 {
-            return Ok(bin_path);
-        }
-        // Hash mismatch — stale cache from a different version, re-download.
+    if cache_is_valid(&bin_path, &sentinel, asset.sha256) {
+        return Ok(bin_path);
     }
 
     let url = asset.url();
@@ -248,3 +255,7 @@ fn sha256_hex(data: &[u8]) -> String {
     let hash = sha2::Sha256::digest(data);
     hash.iter().map(|b| format!("{b:02x}")).collect()
 }
+
+#[cfg(test)]
+#[path = "golangci_lint_tests.rs"]
+mod golangci_lint_tests;
