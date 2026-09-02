@@ -1874,7 +1874,7 @@ checksum = "f678cf4a922c215c63e0de95eb1ff08a958a81d47e485cf9da1e27bf6305cfa5"
 
 [[package]]
 name = "dump"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "base64 0.22.1",
  "dump-macros",
@@ -1885,7 +1885,7 @@ dependencies = [
 
 [[package]]
 name = "dump-macros"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "dump",
  "hole-test-observability",
@@ -2479,7 +2479,7 @@ dependencies = [
 
 [[package]]
 name = "galoshes"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2505,7 +2505,7 @@ dependencies = [
 
 [[package]]
 name = "garter"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "bitflags 2.13.0",
@@ -2529,7 +2529,7 @@ dependencies = [
 
 [[package]]
 name = "garter-bin"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "garter",
@@ -2947,7 +2947,7 @@ dependencies = [
 
 [[package]]
 name = "handle-holders"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "hole-test-observability",
  "skuld",
@@ -3334,7 +3334,7 @@ dependencies = [
 
 [[package]]
 name = "hole"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "axum",
  "base64 0.22.1",
@@ -3394,7 +3394,7 @@ dependencies = [
 
 [[package]]
 name = "hole-bridge"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -3464,7 +3464,7 @@ dependencies = [
 
 [[package]]
 name = "hole-common"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "cosca",
  "dirs 6.0.0",
@@ -3502,7 +3502,7 @@ dependencies = [
 
 [[package]]
 name = "hole-test-observability"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "ctor 1.0.7",
  "hole-common",
@@ -8855,7 +8855,7 @@ dependencies = [
 
 [[package]]
 name = "tun-engine"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -8886,7 +8886,7 @@ dependencies = [
 
 [[package]]
 name = "tun-engine-macros"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "hole-test-observability",
  "proc-macro2",
