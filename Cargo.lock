@@ -1231,8 +1231,9 @@ dependencies = [
 
 [[package]]
 name = "cosca"
-version = "0.2.0"
-source = "git+https://github.com/bindreams/cosca?rev=3ebbebb4dd6316764cad8c19d7c4ac13c769fadb#3ebbebb4dd6316764cad8c19d7c4ac13c769fadb"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "437af5a5e9e0cf2ad0919adfcc8d316cde02e9f83e493b21222e1c1a80359986"
 dependencies = [
  "command-fds",
  "crossbeam-channel",
