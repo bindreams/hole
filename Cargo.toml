@@ -16,14 +16,7 @@ skuld = { version = "0.2", features = ["tokio"] }
 # Process identity: `(pid, raw kernel start token)` compared exactly, plus the
 # versioned `ProcessIdRecord` the bridge persists across a restart; and, with the
 # `tokio` feature, process-tree containment and the graceful teardown signals.
-#
-# No `version` key, deliberately: with one, `cargo package` silently rewrites this
-# to the registry version and drops the git source (measured), publishing a garter
-# built against a cosca that lacks the graceful-signal work. Without one, publish
-# fails loudly until the epic's final registry flip. See bindreams/hole#816.
-cosca = { git = "https://github.com/bindreams/cosca", rev = "7f329afbb82bacd7b511ebabb71e65f42322bc7a", features = [
-    "serde",
-] }
+cosca = { version = "0.3", features = ["serde"] }
 # Pre-main init for the test-observability subscriber install. See
 # crates/test-observability and bindreams/hole#301.
 #
