@@ -27,14 +27,19 @@ nextest-version = "0.9.130"
 # nextest to select on. These names are load-bearing and must change in
 # lockstep with the filter:
 #   - `^e2e_…full_tunnel…` — EVERY test in either of the bridge's two `mod tun`
-#     blocks. Both set `TunnelMode::Full` and install real split routes, and
-#     every member must carry this naming shape or it silently leaves the group
-#     and loses the thread budget (mutual exclusion comes from `serial = TUN`
-#     on every member, not from group membership):
+#     blocks, plus the macOS-only OS-effects smoke test below. All set
+#     `TunnelMode::Full` and install real split routes, and every member must
+#     carry this naming shape or it silently leaves the group and loses the
+#     thread budget (mutual exclusion comes from `serial = TUN` on every
+#     member, not from group membership):
 #     crates/bridge/src/proxy_manager_e2e_tests.rs (4: the `_captures_
 #       unowned_destination` pair and the `_local_networking_intact` pair)
 #     crates/bridge/src/proxy_manager_listener_e2e_tests.rs (1:
 #       e2e_full_tunnel_local_udp_intact)
+#     crates/bridge/src/proxy_manager_macos_full_tunnel_privileged_tests.rs (1:
+#       e2e_macos_full_tunnel_installs_the_os_state_it_claims — refs #850,
+#       #868, #893; reads the OS's own interface list, routing table and
+#       resolver configuration back rather than round-tripping traffic)
 #     The `^e2e_` anchor is what keeps the unlabelled in-process unit test
 #     `forward_gives_every_resolver_the_full_tunnel_bound`
 #     (crates/bridge/src/dns/forwarder_tests.rs — same binary, name carries
