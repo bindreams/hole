@@ -1,9 +1,15 @@
 //! macOS IPv6 address assignment, via `ifconfig`.
 //!
 //! Everything asserted here about runtime behaviour is **reasoned, not
-//! measured**: this path cannot run in production yet (the `tun` crate rejects
-//! any macOS device name not starting with `utun`, so `Dispatcher::new` fails
-//! before a device exists) and cannot be built on the maintainer's box.
+//! measured**: this path could not run in production before bindreams/hole#850
+//! (the `tun` crate rejects any macOS device name not starting with `utun`,
+//! so `Dispatcher::new` failed before a device existed), and still cannot be
+//! built on the maintainer's box. #850 fixes the naming half of that
+//! blocker; whether this specific path has since run green on the darwin TUN
+//! lane is a separate, still-open fact — `proxy_manager_macos_full_tunnel_privileged_tests.rs`'s
+//! Full-mode start exercises this code as a side effect but asserts nothing
+//! about it, so its first real run must be read from that test's own CI
+//! logs, not assumed from this file.
 //!
 //! A subprocess rather than FFI: `libc`'s Apple module has `in6_ifreq` but
 //! neither `in6_aliasreq` nor `SIOCAIFADDR_IN6`, so an FFI path would mean
@@ -12,14 +18,14 @@
 //! `pfctl`.
 //!
 //! **Failures warn and continue; on Windows they are fatal.** The asymmetry is
-//! deliberate, and the condition for removing it is: once the macOS TUN naming
-//! is fixed and this path has run green on the darwin TUN lane, make it fatal
-//! like Windows. Until then its first execution would be in a user's hands, on
-//! a path whose only test is an argv-shape test that cannot fail for any reason
-//! a real run would — and a fatal failure there kills their connection.
-//! `Ipv6StackAbsent` consequently means only "the alias did not take": macOS
-//! has no supported way to unbind the IPv6 stack from an interface, so there is
-//! no appearance wait and nothing else it could mean.
+//! deliberate, and the condition for removing it is: once this path has run
+//! green on the darwin TUN lane, make it fatal like Windows. That condition
+//! has not fired yet — the naming fix landing is necessary but not
+//! sufficient, since no test asserts success on this path. Until it does, a
+//! fatal failure here would first execute in a user's hands. `Ipv6StackAbsent`
+//! consequently means only "the alias did not take": macOS has no supported
+//! way to unbind the IPv6 stack from an interface, so there is no appearance
+//! wait and nothing else it could mean.
 //!
 //! Two open items:
 //!
