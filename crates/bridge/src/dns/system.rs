@@ -42,6 +42,12 @@ use tokio_util::sync::CancellationToken;
 
 use crate::dns_state::DnsPrior;
 
+mod phase;
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+use phase::Cosmetic;
+#[cfg(target_os = "windows")]
+use phase::LeakBearing;
+
 // Dns trait surface ===================================================================================================
 
 /// Bridge-side system-DNS facade.
@@ -126,10 +132,13 @@ pub enum DnsError {
 
     /// The DNS-egress confinement could not be engaged (Windows only).
     /// Always fatal — a confinement that failed to engage is not a
-    /// degraded session, it is an unprotected one.
+    /// degraded session, it is an unprotected one. `#[from]` (not just
+    /// `#[source]`) so `phase::run`'s generic `E: Into<DnsError>` bound
+    /// carries this variant through unchanged instead of collapsing it
+    /// into `DnsError::Io` — see `phase.rs`'s doc.
     #[cfg(target_os = "windows")]
     #[error("could not confine DNS to the tunnel: {0}")]
-    Confine(#[source] tun_engine::dns_confine::DnsConfineError),
+    Confine(#[from] tun_engine::dns_confine::DnsConfineError),
 }
 
 // SystemDns ===========================================================================================================
@@ -262,13 +271,15 @@ async fn apply_windows(
 
     // Confine DNS egress to hole-tun BEFORE advertising a resolver on it —
     // fail-fatal (see module doc): a confinement that failed to engage is
-    // not a degraded session, it is an unprotected one.
+    // not a degraded session, it is an unprotected one. `LeakBearing` so
+    // `phase::run` propagates the error (and preserves the
+    // `DnsError::Confine` variant, not a collapsed `DnsError::Io` — see
+    // `phase.rs`'s doc) instead of swallowing it.
     let confiner = Arc::clone(confiner);
     let luid = tun.luid();
-    let confinement = tokio::task::spawn_blocking(move || confiner.engage(luid, server_ip))
-        .await
-        .map_err(|e| DnsError::Io(io::Error::other(e)))?
-        .map_err(DnsError::Confine)?;
+    let confinement = phase::run::<LeakBearing, _, _>("confine", move || confiner.engage(luid, server_ip))
+        .await?
+        .expect("LeakBearing always returns Some on Ok — see phase.rs's doc");
 
     if cancel.is_cancelled() {
         // The confinement drops here (local variable going out of scope) —
@@ -283,21 +294,21 @@ async fn apply_windows(
     // a concurrent bridge's adapter can answer to that same name
     // (bindreams/hole#936), so resolving a GUID from the alias instead of
     // the LUID could target the wrong adapter.
-    let b = Arc::clone(backend);
-    let ips = advertise_ips.clone();
-    let res = tokio::task::spawn_blocking(move || b.set_servers(luid, &ips))
-        .await
-        .map_err(|e| DnsError::Io(io::Error::other(e)))?;
+    //
     // Fail-fatal (see module doc): after #846 there is exactly one target,
     // so "continuing" has nowhere to continue to — confinement-up plus
     // resolvers-never-set is a total DNS blackout on a session the UI
-    // reports as connected.
-    res?;
+    // reports as connected. `LeakBearing` for the same reason as the
+    // confinement engage above.
+    let b = Arc::clone(backend);
+    let ips = advertise_ips.clone();
+    phase::run::<LeakBearing, _, _>("set-servers", move || b.set_servers(luid, &ips)).await?;
 
     // Flush. Best-effort — through the backend so MockBackend can count
-    // it for the perf-regression test.
+    // it for the perf-regression test. `Cosmetic`: a failed cache flush
+    // leaves a stale entry for one TTL window, not a leak.
     let b = Arc::clone(backend);
-    let _ = tokio::task::spawn_blocking(move || b.flush()).await;
+    let _ = phase::run::<Cosmetic, _, _>("flush", move || b.flush()).await;
 
     tracing::info!(
         elapsed_ms = started.elapsed().as_millis() as u64,
@@ -327,22 +338,20 @@ async fn apply_macos(
         return Err(DnsError::Cancelled);
     }
 
+    // `Cosmetic`, not yet `LeakBearing` (refs #868): `set_servers` is a
+    // guaranteed failure on this platform today (interface name handed to
+    // a service-name API), so promoting it would refuse every macOS
+    // Full-mode start with DNS enabled. Task 3 replaces this whole call
+    // with the real `dns_steer` mechanism and promotes it then.
     let b = Arc::clone(backend);
     let alias = tun.alias().to_string();
     let ips = advertise_ips.clone();
-    let res = tokio::task::spawn_blocking(move || b.set_servers(&alias, &ips))
-        .await
-        .map_err(|e| DnsError::Io(io::Error::other(e)))?;
-    // NOT promoted to fatal (see module doc): `set_servers` is a guaranteed
-    // failure on this platform today (interface name handed to a
-    // service-name API), so promoting it would refuse every macOS
-    // Full-mode start with DNS enabled.
-    if let Err(e) = res {
-        tracing::warn!(error = %e, "DNS apply failed; continuing");
-    }
+    phase::run::<Cosmetic, _, _>("set-servers", move || b.set_servers(&alias, &ips)).await?;
 
+    // Flush. Best-effort — a failed cache flush leaves a stale entry for
+    // one TTL window, not a leak.
     let b = Arc::clone(backend);
-    let _ = tokio::task::spawn_blocking(move || b.flush()).await;
+    let _ = phase::run::<Cosmetic, _, _>("flush", move || b.flush()).await;
 
     tracing::info!(
         elapsed_ms = started.elapsed().as_millis() as u64,
