@@ -69,6 +69,7 @@ pub(crate) const GLOBAL_NET_STATE: skuld::Label;
 pub mod adapter_cleanup;
 pub mod device;
 pub mod dns_confine;
+pub mod dns_steer;
 pub mod engine;
 pub mod error;
 pub mod gateway;
