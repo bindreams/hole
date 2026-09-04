@@ -140,11 +140,12 @@ pub trait Dns: Send + Sync + 'static {
 /// D4). Windows ignores this: the WFP DNS-egress confinement blocks
 /// off-tunnel DNS egress regardless of family, so there is nothing this
 /// filter would add there.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RoutedFamilies {
-    pub v4: bool,
-    pub v6: bool,
-}
+///
+/// Defined in `tun-engine` (not here) and re-exported: `hole-bridge` depends
+/// on `tun-engine`, not the reverse, and `Routing::Installed`'s
+/// `routed_families()` — the only producer of this value — lives on that
+/// crate's `RoutesInstalled` trait (bindreams/hole#850's plan, Task 5).
+pub use tun_engine::routing::RoutedFamilies;
 
 /// RAII guard returned by [`Dns::apply`]. See [`Dns::Applied`] for the
 /// shutdown contract.

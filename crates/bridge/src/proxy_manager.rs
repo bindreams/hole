@@ -44,16 +44,19 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 use tun_engine::gateway::GatewayInfo;
 use tun_engine::routing::failclosed::lockdown_state;
-use tun_engine::routing::{CoverGuard, Routing, SystemRouting};
+use tun_engine::routing::{CoverGuard, RoutesInstalled, Routing, SystemRouting};
 
 use crate::dns::self_test::{
     build_local_dns, implicates_plugin_transport, report_plugin_output, run_forwarder_self_test, self_test_error_for,
     SelfTestOutcome,
 };
-use crate::dns::system::{Dns, DnsApplied, DnsError, RoutedFamilies, SystemDns};
-use crate::proxy::{
-    build_ss_config, Proxy, ProxyError, RunningProxy, ShadowsocksProxy, TrafficTotals, TUN_DEVICE_NAME,
-};
+use crate::dns::system::{Dns, DnsApplied, DnsError, SystemDns};
+use crate::proxy::{build_ss_config, Proxy, ProxyError, RunningProxy, ShadowsocksProxy, TrafficTotals};
+// `TUN_DEVICE_NAME` only stands in for a real `TunIdentity` on the
+// `#[cfg(test)]` synthetic path below — the production path threads the
+// identity `Engine::build`/`Dispatcher::identity()` actually opened.
+#[cfg(test)]
+use crate::proxy::TUN_DEVICE_NAME;
 
 mod cover;
 use cover::CoverHolder;
@@ -1729,7 +1732,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
             return Err(ProxyError::Cancelled);
         }
         // Install the routes — NOW traffic starts flowing to the TUN.
-        let routes = match routing.install(TUN_DEVICE_NAME, server_ip, &gw_info) {
+        let routes = match routing.install(&tun_identity, server_ip, &gw_info) {
             Ok(routes) => routes,
             Err(e) => {
                 if let Some(mut d) = dispatcher.take() {
@@ -1758,7 +1761,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         // unwind, tearing down — the opposite of the transient cover's
         // fail-open. Committed only on the Ok path (the field below).
         let lockdown = if standing_cover_expected {
-            match routing.install_lockdown(server_ip, TUN_DEVICE_NAME, &app_ids) {
+            match routing.install_lockdown(server_ip, &tun_identity, &app_ids) {
                 Ok(cover) => {
                     promote_adopted_claim(state_dir, owner);
                     Some(cover)
@@ -1793,15 +1796,11 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         // `DnsError` unwind the locally-owned `lockdown` / `routes` guards.
         let dns_applied = if forwarder.is_some() {
             let advertise_ips: Vec<IpAddr> = config.dns.servers.clone();
-            // PROVISIONAL (bindreams/hole#850's plan, Task 3 — see Task 5):
-            // `Routing::Installed` does not yet expose which split routes
-            // actually landed, so this unconditionally advertises both
-            // families pending Task 5's `routes.routed_families()`. Safe in
-            // the meantime: it derives from nothing (doesn't violate D4's
-            // anti-proxy-derivation rule) and matches the unconditional
-            // full-list behavior every platform had before this change.
-            let _ = &routes;
-            let routed = RoutedFamilies { v4: true, v6: true };
+            // Ground truth for D4's filter: exactly the families `routes`
+            // itself confirmed landed, read directly off the guard — no OS
+            // probe, no second measurement (bindreams/hole#850's plan, Task
+            // 5, decision D4; see `RoutesInstalled::routed_families`).
+            let routed = routes.routed_families();
             match dns
                 .apply(advertise_ips, routed, tun_identity, server_ip, cancel.clone())
                 .await

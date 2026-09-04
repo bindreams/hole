@@ -91,4 +91,4 @@ pub use engine::{
 };
 pub use error::{DeviceError, EngineError, RouteCommandError, RoutingError};
 pub use gateway::{get_default_gateway_info, GatewayInfo};
-pub use routing::{Routing, SystemRoutes, SystemRouting};
+pub use routing::{RoutedFamilies, RoutesInstalled, Routing, SystemRoutes, SystemRouting};
