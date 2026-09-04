@@ -11,10 +11,14 @@ nextest-version = "0.9.130"
 # e2es drive live egress and install real split routes while the tun-engine
 # `windows_lockdown_permits_server_ip_and_blocks_other_egress` test holds a
 # system-wide block-all WFP cover. `max-threads = 1` makes nextest run the
-# whole group on one thread across binaries. On macOS the bridge TUN e2es are
-# `cfg(windows)` so there is no macOS bridge partner today; the
-# `macos_lockdown_permits_server_ip_...` pf test still joins the group for free
-# (and is auto-grouped against any future macOS bridge TUN e2e).
+# whole group on one thread across binaries. `mod tun`'s own Full-mode
+# roundtrip e2es stay `cfg(windows)` (out of scope by design, D5 of
+# bindreams/hole#850's plan), but the `live_tun_permit_` session-level
+# composition guard below is no longer one of them: as of bindreams/hole#874
+# (Task 7) it is un-gated and runs on macOS too, engaging a real standing
+# lockdown cover there — so the `macos_lockdown_permits_server_ip_...` pf test
+# now has a real macOS bridge partner in this group, not merely a
+# forward-compatible slot for one.
 #
 # COUPLED NAMES — the filter below matches tests BY NAME ONLY. A module-path
 # anchor is not available: skuld hands libtest-mimic the bare function name

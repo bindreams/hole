@@ -1,5 +1,4 @@
-//! Session-level composition guard for the standing lockdown cover, Windows
-//! half.
+//! Session-level composition guard for the standing lockdown cover.
 //!
 //! `tun_engine`'s `live_tun_permit_privileged_tests` (crates/tun-engine)
 //! falsifies the cover's tunnel-permit rule directly: it opens two real TUN
@@ -9,36 +8,41 @@
 //! PRODUCTION path (`Dispatcher::new` -> `routing.install` ->
 //! `install_lockdown`), with the kill switch armed, still carries its own
 //! tunnel traffic, while a probe deliberately routed OFF the tunnel is
-//! blocked at the same instant.
+//! blocked at the same instant. Runs on both platforms Hole ships Full mode
+//! on (bindreams/hole#850, #874) — nothing in the test body is
+//! platform-conditional; only the elevated `tun` lane below gates it.
 //!
-//! **What this honestly establishes, on Windows, and no more:**
+//! **What this honestly establishes, and no more:**
 //!
 //! 1. The composition `routing.install` -> `install_lockdown` -> a live
 //!    session does not block the session it is protecting.
 //! 2. The cover is demonstrably LIVE at that same instant (the off-tunnel
 //!    probe is blocked) — so (1) is not the trivial pass of an inert cover.
-//! 3. It will CATCH a stale/duplicate-adapter LUID mismatch or a future
-//!    refactor that decouples the dispatcher's TUN identity from the one
-//!    passed to `install_lockdown`, if either occurs. It cannot DEMONSTRATE
-//!    that it would: on Windows `Dispatcher::new` requests
-//!    `TunName::Requested(WINDOWS_TUN_ALIAS)`, which `TunIdentity` never
-//!    reads back (bindreams/hole#850's read-back only happens under
-//!    `KernelAssigned`, macOS-only), so the same `TunIdentity`
-//!    `proxy_manager.rs` threads to `install_lockdown` carries that same
-//!    requested alias by construction — the two cannot disagree without a
-//!    bug in the threading itself, which this test does not induce. It is a
-//!    composition guard, not a falsification test — the interface-liveness
-//!    falsification lives in `tun-engine`'s test. The macOS half of THIS
-//!    test does not exist yet: `Dispatcher::new` now opens successfully on
-//!    macOS too (bindreams/hole#850), and reaches `install_lockdown` there,
-//!    but nothing exercises this SPECIFIC composition guard on that
-//!    platform — bindreams/hole#874's macOS deliverable, tracked as this
-//!    issue's Task 7, not this one.
+//! 3. Whether it can CATCH a stale/duplicate-adapter identity mismatch or a
+//!    future refactor that decouples the dispatcher's TUN identity from the
+//!    one passed to `install_lockdown` splits by platform:
+//!    - **On Windows**, it cannot DEMONSTRATE that it would: `Dispatcher::new`
+//!      requests `TunName::Requested(WINDOWS_TUN_ALIAS)`, which `TunIdentity`
+//!      never reads back (bindreams/hole#850's read-back only happens under
+//!      `KernelAssigned`, macOS-only), so the same `TunIdentity`
+//!      `proxy_manager.rs` threads to `install_lockdown` carries that same
+//!      requested alias by construction — the two cannot disagree without a
+//!      bug in the threading itself, which this test does not induce. There
+//!      it is a pure composition guard, not a falsification test.
+//!    - **On macOS**, it CAN: `TunName::KernelAssigned` means
+//!      `identity().alias()` is read back from the specific device this
+//!      `Dispatcher::new` call opened (a fresh `utunN` most runs), not a
+//!      value every install shares. A future refactor that threads a
+//!      different `TunIdentity` — or the wrong one — to `install_lockdown`
+//!      would name a DIFFERENT live interface than the session's own, so the
+//!      tunnel-traffic probe (point 1) would fail against a cover that still
+//!      reports armed: a real, catchable divergence, not merely a
+//!      hypothetical one. This is the one respect in which the macOS run of
+//!      this test is strictly stronger than the Windows run.
 //!
-//! Gate: `cfg(target_os = "windows")`, retained pending Task 7's un-gate —
-//! not because a macOS Full-mode start still dies before routes (it no
-//! longer does, per bindreams/hole#850's fix): this test's own machinery
-//! simply has not been exercised on macOS yet.
+//!    Either way, the interface-liveness falsification itself (that the
+//!    permit rule is sensitive to which adapter it names at all) lives in
+//!    `tun-engine`'s test, not here.
 //!
 //! COUPLED NAME: the test name below contains the literal substring
 //! `live_tun_permit_`, which `.config/nextest.toml`'s `global_net_state`
