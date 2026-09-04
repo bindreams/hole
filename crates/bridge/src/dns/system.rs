@@ -357,8 +357,13 @@ async fn apply_windows(
 
     // The LUID of the device this process actually opened — never a name
     // lookup. An alias, by contrast, is the name Hole REQUESTED
-    // (`TunIdentity::alias`), not a value read back from the opened device;
-    // a concurrent bridge's adapter can answer to that same name
+    // (`TunIdentity::alias`), not a value read back from the opened device —
+    // true on this Windows-only function's platform (`WINDOWS_TUN_ALIAS` is
+    // requested and never read back; see `crate::dispatcher::Dispatcher::new`),
+    // though NOT of `TunIdentity::alias` in general: on macOS, where this
+    // function never runs, the alias IS a value read back from the opened
+    // device (bindreams/hole#850's `TunName::KernelAssigned`). A concurrent
+    // bridge's adapter can answer to that same requested name
     // (bindreams/hole#936), so resolving a GUID from the alias instead of
     // the LUID could target the wrong adapter.
     //

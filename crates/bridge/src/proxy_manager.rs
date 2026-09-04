@@ -52,11 +52,14 @@ use crate::dns::self_test::{
 };
 use crate::dns::system::{Dns, DnsApplied, DnsError, SystemDns};
 use crate::proxy::{build_ss_config, Proxy, ProxyError, RunningProxy, ShadowsocksProxy, TrafficTotals};
-// `TUN_DEVICE_NAME` only stands in for a real `TunIdentity` on the
+// `WINDOWS_TUN_ALIAS` only stands in for a real `TunIdentity` on the
 // `#[cfg(test)]` synthetic path below — the production path threads the
-// identity `Engine::build`/`Dispatcher::identity()` actually opened.
+// identity `Engine::build`/`Dispatcher::identity()` actually opened. Names no
+// OS object either way, so borrowing the Windows-only alias constant here
+// (rather than a fresh literal) is inert on every platform this test code
+// compiles for.
 #[cfg(test)]
-use crate::proxy::TUN_DEVICE_NAME;
+use crate::proxy::config::WINDOWS_TUN_ALIAS;
 
 mod cover;
 use cover::CoverHolder;
@@ -1713,7 +1716,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
             .identity()
             .clone();
         #[cfg(test)]
-        let tun_identity = tun_engine::TunIdentity::synthetic(0xFEED, TUN_DEVICE_NAME);
+        let tun_identity = tun_engine::TunIdentity::synthetic(0xFEED, WINDOWS_TUN_ALIAS);
 
         // The TUN's IPv6 verdict, read here because `Engine::build` has
         // already consumed the device by now. `Ipv6StackAbsent` is the second

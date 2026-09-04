@@ -282,8 +282,21 @@ pub const TUN_SUBNET: &str = "10.255.0.1/24";
 /// own ULA network.
 pub const TUN_SUBNET6: &str = "fdf8:f6d5:536e::1/64";
 
-/// TUN interface device name.
-pub const TUN_DEVICE_NAME: &str = "hole-tun";
+/// The fixed TUN adapter alias `Dispatcher::new` requests on Windows, where
+/// `tun`/wintun honor a requested name exactly. Meaningless on macOS: a
+/// `Requested` name there is rejected outright unless it already has the
+/// kernel's own `utunN` shape (bindreams/hole#850), so macOS instead asks for
+/// `TunName::KernelAssigned` and reads the real name back — see
+/// `crate::dispatcher::Dispatcher::new`. Crate-private: nothing outside
+/// `hole-bridge` names the adapter directly.
+///
+/// `allow(dead_code)` off Windows: production code only reads this constant
+/// under `cfg(target_os = "windows")` (`dispatcher.rs`, `route_recovery.rs`);
+/// darwin's only user is `proxy_manager.rs`'s `cfg(test)` synthetic-identity
+/// placeholder, invisible to a plain (non-test) `--lib` build. Left ungated
+/// on Windows itself so a real future dead-code regression there still lints.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+pub(crate) const WINDOWS_TUN_ALIAS: &str = "hole-tun";
 
 /// Build a shadowsocks-service Config from our ProxyConfig.
 ///

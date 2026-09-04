@@ -731,7 +731,7 @@ fn start_reaches_dns_apply_when_the_forwarder_answers() {
 
 /// Call-site wiring only — NOT a naming regression guard. Under
 /// `#[cfg(test)]`, `start_inner` builds its `TunIdentity` from
-/// `TunIdentity::synthetic(0xFEED, TUN_DEVICE_NAME)` (`proxy_manager.rs`)
+/// `TunIdentity::synthetic(0xFEED, WINDOWS_TUN_ALIAS)` (`proxy_manager.rs`)
 /// rather than the real device-discovery path, so this test cannot catch a
 /// regression in macOS's real kernel-assigned naming (Task 8's privileged
 /// smoke is the only test that can). What it DOES prove: `Routing::install`,

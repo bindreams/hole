@@ -18,23 +18,27 @@
 //! 2. The cover is demonstrably LIVE at that same instant (the off-tunnel
 //!    probe is blocked) — so (1) is not the trivial pass of an inert cover.
 //! 3. It will CATCH a stale/duplicate-adapter LUID mismatch or a future
-//!    refactor that decouples the dispatcher's TUN name from the one passed
-//!    to `install_lockdown`, if either occurs. It cannot DEMONSTRATE that it
-//!    would: `dispatcher.rs` sets `c.tun_name = TUN_DEVICE_NAME` and
-//!    `proxy_manager.rs` passes that SAME constant to `install_lockdown`, so
-//!    the two names cannot disagree by construction, and this test induces
-//!    no mutation. It is a composition guard, not a falsification test — the
-//!    interface-liveness falsification lives in `tun-engine`'s test. The
-//!    macOS half of THIS test, where the TUN name is discovered at runtime
-//!    rather than shared as a compile-time constant (so production CAN name
-//!    the wrong interface), does not exist yet: `Dispatcher::new` is not
-//!    reachable on macOS at all until macOS TUN naming becomes
-//!    runtime-discovered.
+//!    refactor that decouples the dispatcher's TUN identity from the one
+//!    passed to `install_lockdown`, if either occurs. It cannot DEMONSTRATE
+//!    that it would: on Windows `Dispatcher::new` requests
+//!    `TunName::Requested(WINDOWS_TUN_ALIAS)`, which `TunIdentity` never
+//!    reads back (bindreams/hole#850's read-back only happens under
+//!    `KernelAssigned`, macOS-only), so the same `TunIdentity`
+//!    `proxy_manager.rs` threads to `install_lockdown` carries that same
+//!    requested alias by construction — the two cannot disagree without a
+//!    bug in the threading itself, which this test does not induce. It is a
+//!    composition guard, not a falsification test — the interface-liveness
+//!    falsification lives in `tun-engine`'s test. The macOS half of THIS
+//!    test does not exist yet: `Dispatcher::new` now opens successfully on
+//!    macOS too (bindreams/hole#850), and reaches `install_lockdown` there,
+//!    but nothing exercises this SPECIFIC composition guard on that
+//!    platform — bindreams/hole#874's macOS deliverable, tracked as this
+//!    issue's Task 7, not this one.
 //!
-//! Gate: `cfg(target_os = "windows")` — `Dispatcher::new` sets
-//! `c.tun_name = TUN_DEVICE_NAME` unconditionally and the pinned `tun` crate
-//! rejects any macOS name not starting with `utun`, so a macOS Full-mode
-//! start dies before routes, before DNS, and before `install_lockdown` today.
+//! Gate: `cfg(target_os = "windows")`, retained pending Task 7's un-gate —
+//! not because a macOS Full-mode start still dies before routes (it no
+//! longer does, per bindreams/hole#850's fix): this test's own machinery
+//! simply has not been exercised on macOS yet.
 //!
 //! COUPLED NAME: the test name below contains the literal substring
 //! `live_tun_permit_`, which `.config/nextest.toml`'s `global_net_state`

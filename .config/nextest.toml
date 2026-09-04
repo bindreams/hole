@@ -87,6 +87,10 @@ nextest-version = "0.9.130"
 #     publish a real synthetic-service DNS key, same reasoning as the prefix
 #     above):
 #     crates/tun-engine/tests/macos_session_key_lifetime_probe.rs
+#   - `dispatcher_opens_tun_` prefix (refs #850 — the production
+#     `Dispatcher::new` opens a real TUN device, and on macOS it is a
+#     kernel-assigned `utun` adapter with no fixed name):
+#     crates/bridge/src/dispatcher_privileged_tests.rs
 #   - `e2e_full_tunnel_local_udp_intact` — matched by the `^e2e_…full_tunnel…`
 #     anchor above, not by a term of its own. It carries
 #     `labels = [DIST_BIN, TUN], serial = TUN` in
@@ -116,7 +120,7 @@ nextest-version = "0.9.130"
 max-threads = 1
 
 [[profile.default.overrides]]
-filter = 'test(/^e2e_.*full_tunnel/) + test(/windows_lockdown_permits_server_ip_/) + test(/macos_lockdown_permits_server_ip_/) + test(/failclosed_permits_/) + test(/release_all_/) + test(/cutover_global_net_state_/) + test(/live_tun_permit_/) + test(/tun_device_ipv6_/) + test(/gateway_global_net_state_/) + test(/dns_confine_global_net_state_/) + test(/dns_steer_global_net_state_/) + test(/macos_dns_global_net_state_/) + test(/opens_a_kernel_assigned/)'
+filter = 'test(/^e2e_.*full_tunnel/) + test(/windows_lockdown_permits_server_ip_/) + test(/macos_lockdown_permits_server_ip_/) + test(/failclosed_permits_/) + test(/release_all_/) + test(/cutover_global_net_state_/) + test(/live_tun_permit_/) + test(/tun_device_ipv6_/) + test(/gateway_global_net_state_/) + test(/dns_confine_global_net_state_/) + test(/dns_steer_global_net_state_/) + test(/macos_dns_global_net_state_/) + test(/opens_a_kernel_assigned/) + test(/dispatcher_opens_tun_/)'
 test-group = 'global_net_state'
 
 # `driver_dns_tests.rs` / `driver_udp_tests.rs` / `driver_lifecycle_tests.rs`

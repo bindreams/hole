@@ -52,7 +52,7 @@ pub fn remove_adapter(tun_name: &str) {
     // Provenance canary, not a charset filter — `build_remove_adapter_script`
     // itself now escapes any `'` safely, so this is not standing in for that,
     // and a prefix/charset check on `tun_name` was tried and reverted: this
-    // function's callers are not only production's `TUN_DEVICE_NAME`/its
+    // function's callers are not only production's `WINDOWS_TUN_ALIAS`/its
     // #936-disambiguated siblings (`"hole-tun 2"`, ...) but also the
     // privileged tests in `device::ipv6_addr_privileged_tests` and
     // `net::metric_privileged_tests`, whose device names are deliberately

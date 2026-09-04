@@ -45,7 +45,7 @@ where
     // name is kernel-assigned and unknowable ahead of opening it (macOS);
     // see `tun_engine::routing::recover_routes`'s doc.
     #[cfg(target_os = "windows")]
-    let tun_name_fallback = Some(crate::proxy::TUN_DEVICE_NAME);
+    let tun_name_fallback = Some(crate::proxy::config::WINDOWS_TUN_ALIAS);
     #[cfg(not(target_os = "windows"))]
     let tun_name_fallback = None;
     let outcome =

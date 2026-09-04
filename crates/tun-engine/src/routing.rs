@@ -961,8 +961,9 @@ pub(crate) fn run_capturing<P: Phase>(
 /// `~/Library/Application Support/hole`.
 ///
 /// `tun_name` is the caller's own configured TUN device name (the bridge's
-/// `TUN_DEVICE_NAME` constant) — the fallback the TUN-permit reclaim uses when
-/// no `bridge-routes.json` survived this startup to name one. `None` on a
+/// `WINDOWS_TUN_ALIAS` constant, on Windows) — the fallback the TUN-permit
+/// reclaim uses when no `bridge-routes.json` survived this startup to name
+/// one. `None` on a
 /// platform with no such compile-time fallback to offer (macOS, where the
 /// name is kernel-assigned and unknowable before the device is opened) —
 /// the reclaim then relies solely on the recovered file's own `tun_name`,
@@ -1310,11 +1311,16 @@ where
     // `tun_name_hint` prefers THIS bridge's own last-known TUN device (from its
     // own `bridge-routes.json`) and falls back to the caller-supplied
     // `tun_name` otherwise — see this function's doc for why the file alone
-    // is not a safe gate. `TUN_DEVICE_NAME` is a compile-time constant shared
-    // by every install, so the fallback names the same device a different
-    // install's cover would too; only the reclaim's server-IP counterpart is
-    // scoped by the per-install identity gap CONTRIBUTING.md discloses
-    // (#878), and this reclaim never touches that permit.
+    // is not a safe gate. On Windows, the fallback is `WINDOWS_TUN_ALIAS`, a
+    // compile-time constant shared by every install, so it names the same
+    // device a different install's cover would too. On macOS there is no
+    // such fallback (`tun_name` is `None`: the name is kernel-assigned and
+    // unknowable ahead of opening the device, bindreams/hole#850) — a wiped
+    // `bridge-routes.json` there leaves `tun_name_hint` `None` and the
+    // reclaim below a no-op, never a cross-install guess. Either way, only
+    // the reclaim's server-IP counterpart is scoped by the per-install
+    // identity gap CONTRIBUTING.md discloses (#878), and this reclaim never
+    // touches that permit.
     lockdown_recover(decision.action, tun_name_hint.as_deref());
 
     // Sweep any transient fail-closed cover left by a crashed update cutover.
