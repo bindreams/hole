@@ -13,7 +13,10 @@ mod device_tests;
 #[cfg(all(test, target_os = "windows"))]
 mod ipv6_addr_privileged_tests;
 
-pub use config::{DeviceConfig, MutDeviceConfig};
+#[cfg(all(test, target_os = "macos"))]
+mod privileged_tests;
+
+pub use config::{DeviceConfig, MutDeviceConfig, TunName};
 pub use identity::TunIdentity;
 pub use ipv6_addr::Assigned;
 
@@ -21,6 +24,18 @@ use tracing::warn;
 use tun::{AbstractDevice, AsyncDevice};
 
 use crate::error::DeviceError;
+
+/// Bridges the real driver into [`identity::resolve_identity`]'s seam. The
+/// mac-only `KernelAssigned` arm is the only caller; on every other
+/// platform, `TunName` has no variant that ever consults it.
+impl identity::NameSource for AsyncDevice {
+    fn tun_name(&self) -> std::io::Result<String> {
+        // `AsyncDevice` derefs to the platform `tun::Device`, which is the
+        // actual `AbstractDevice` impl; UFCS on `self` directly would look
+        // for `AbstractDevice for AsyncDevice`, which doesn't exist.
+        AbstractDevice::tun_name(&**self).map_err(std::io::Error::other)
+    }
+}
 
 /// An opened TUN device, ready to be handed to [`Engine::build`](crate::engine::Engine::build).
 ///
@@ -64,8 +79,10 @@ impl Device {
         let mut c = MutDeviceConfig::default();
         init(&mut c);
 
-        if c.tun_name.is_empty() {
-            return Err(DeviceError::InvalidConfig("tun_name is required"));
+        if let TunName::Requested(name) = &c.tun_name {
+            if name.is_empty() {
+                return Err(DeviceError::InvalidConfig("tun_name is required"));
+            }
         }
         if c.mtu == 0 {
             return Err(DeviceError::InvalidConfig("mtu is required"));
@@ -78,19 +95,25 @@ impl Device {
 
         // Pre-create ownership check (Windows only — see the module doc on
         // `identity` for why this MUST run before `create_as_async`, never
-        // after).
+        // after). Windows builds `TunName` with only the `Requested` variant
+        // (`KernelAssigned` is macOS-only), so this destructure is
+        // irrefutable.
         #[cfg(target_os = "windows")]
-        match identity::probe_incumbent(&config.tun_name, identity::HOLE_ADAPTER_GUID) {
-            Ok(identity::Incumbent::None) | Ok(identity::Incumbent::Ours) => {}
-            Ok(identity::Incumbent::Foreign) => {
-                return Err(DeviceError::ForeignAdapter {
-                    alias: config.tun_name.clone(),
-                });
+        {
+            let TunName::Requested(requested_name) = &config.tun_name;
+            match identity::probe_incumbent(requested_name, identity::HOLE_ADAPTER_GUID) {
+                Ok(identity::Incumbent::None) | Ok(identity::Incumbent::Ours) => {}
+                Ok(identity::Incumbent::Foreign) => {
+                    return Err(DeviceError::ForeignAdapter {
+                        alias: requested_name.clone(),
+                    });
+                }
+                // A read failure is NEVER reported as ForeignAdapter —
+                // "cannot read the GUID" and "the GUID is not ours" are
+                // different facts, and only the second may refuse on
+                // ownership grounds.
+                Err(e) => return Err(DeviceError::TunOpen(e)),
             }
-            // A read failure is NEVER reported as ForeignAdapter — "cannot
-            // read the GUID" and "the GUID is not ours" are different
-            // facts, and only the second may refuse on ownership grounds.
-            Err(e) => return Err(DeviceError::TunOpen(e)),
         }
 
         let tun_config = build_tun_configuration(&config);
@@ -108,7 +131,7 @@ impl Device {
         };
         #[cfg(not(target_os = "windows"))]
         let luid = 0u64;
-        let identity = TunIdentity::from_open_device(&config.tun_name, luid);
+        let identity = identity::resolve_identity(&config.tun_name, &tun, luid)?;
 
         let (interface_index, ipv6_assigned) = match config.ipv6 {
             // Read the index from the CREATED device, never from the requested
@@ -183,7 +206,18 @@ impl Device {
 /// which would stay green through a regression in `Device::build` itself.
 fn build_tun_configuration(config: &DeviceConfig) -> tun::Configuration {
     let mut tun_config = tun::Configuration::default();
-    tun_config.tun_name(&config.tun_name).mtu(config.mtu).up();
+    match &config.tun_name {
+        TunName::Requested(name) => {
+            tun_config.tun_name(name);
+        }
+        // Leave `tun::Configuration::tun_name` unset. macOS's `Device::new`
+        // reads an unset name as `sc_unit: 0`, which asks the kernel to
+        // assign the next free `utunN` instead of parsing a name we don't
+        // have (`tun-0.8.13/src/platform/macos/device.rs:81-91`).
+        #[cfg(target_os = "macos")]
+        TunName::KernelAssigned => {}
+    }
+    tun_config.mtu(config.mtu).up();
     if let Some(cidr) = config.ipv4 {
         let addr = cidr.address();
         let mask = std::net::Ipv4Addr::from(v4_mask(cidr.prefix_len()));

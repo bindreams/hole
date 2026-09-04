@@ -69,6 +69,14 @@ nextest-version = "0.9.130"
 #   - `gateway_global_net_state_` prefix (creates a real wintun adapter to
 #     prove the upstream-route lookup can see an IfType 53 adapter):
 #     crates/tun-engine/tests/gateway_privileged.rs
+#   - `opens_a_kernel_assigned` substring (refs #850 — creates a real `utun`
+#     adapter with no requested name and reads the kernel-assigned one back
+#     via the OS's own interface-name table; NOT the bare `kernel_assigned`
+#     substring, which also matches the unlabelled unprivileged unit tests
+#     `kernel_assigned_alias_is_read_back` and
+#     `kernel_assigned_build_fails_when_the_device_cannot_report_its_name` in
+#     the same binary):
+#     crates/tun-engine/src/device/privileged_tests.rs
 #   - `dns_steer_global_net_state_` prefix (refs #868 — points the WHOLE
 #     MACHINE's DNS at a black-hole resolver for the test's duration via a
 #     real `SCDynamicStore` session, so it must never run beside another test
@@ -108,7 +116,7 @@ nextest-version = "0.9.130"
 max-threads = 1
 
 [[profile.default.overrides]]
-filter = 'test(/^e2e_.*full_tunnel/) + test(/windows_lockdown_permits_server_ip_/) + test(/macos_lockdown_permits_server_ip_/) + test(/failclosed_permits_/) + test(/release_all_/) + test(/cutover_global_net_state_/) + test(/live_tun_permit_/) + test(/tun_device_ipv6_/) + test(/gateway_global_net_state_/) + test(/dns_confine_global_net_state_/) + test(/dns_steer_global_net_state_/) + test(/macos_dns_global_net_state_/)'
+filter = 'test(/^e2e_.*full_tunnel/) + test(/windows_lockdown_permits_server_ip_/) + test(/macos_lockdown_permits_server_ip_/) + test(/failclosed_permits_/) + test(/release_all_/) + test(/cutover_global_net_state_/) + test(/live_tun_permit_/) + test(/tun_device_ipv6_/) + test(/gateway_global_net_state_/) + test(/dns_confine_global_net_state_/) + test(/dns_steer_global_net_state_/) + test(/macos_dns_global_net_state_/) + test(/opens_a_kernel_assigned/)'
 test-group = 'global_net_state'
 
 # `driver_dns_tests.rs` / `driver_udp_tests.rs` / `driver_lifecycle_tests.rs`

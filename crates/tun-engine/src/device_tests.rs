@@ -44,3 +44,23 @@ fn interface_index_from_carries_a_failed_query_message() {
         "the driver's own message survives: {message}"
     );
 }
+
+/// An empty `Requested` name is still rejected before any OS call — the
+/// validation this test guards runs ahead of `tun::create_as_async`, so it
+/// needs no elevation to exercise.
+#[skuld::test]
+fn build_rejects_an_empty_requested_name() {
+    let result = Device::build(|c| {
+        c.tun_name = TunName::Requested(String::new());
+        c.mtu = 1400;
+        c.ipv4 = Some("10.255.0.1/24".parse().unwrap());
+    });
+    let err = match result {
+        Ok(_) => panic!("expected InvalidConfig, got Ok"),
+        Err(e) => e,
+    };
+    assert!(
+        matches!(err, DeviceError::InvalidConfig(_)),
+        "expected InvalidConfig, got {err:?}"
+    );
+}
