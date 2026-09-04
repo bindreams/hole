@@ -50,7 +50,7 @@ use crate::dns::self_test::{
     build_local_dns, implicates_plugin_transport, report_plugin_output, run_forwarder_self_test, self_test_error_for,
     SelfTestOutcome,
 };
-use crate::dns::system::{Dns, DnsApplied, DnsError, SystemDns};
+use crate::dns::system::{Dns, DnsApplied, DnsError, RoutedFamilies, SystemDns};
 use crate::proxy::{
     build_ss_config, Proxy, ProxyError, RunningProxy, ShadowsocksProxy, TrafficTotals, TUN_DEVICE_NAME,
 };
@@ -1793,7 +1793,19 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         // `DnsError` unwind the locally-owned `lockdown` / `routes` guards.
         let dns_applied = if forwarder.is_some() {
             let advertise_ips: Vec<IpAddr> = config.dns.servers.clone();
-            match dns.apply(advertise_ips, tun_identity, server_ip, cancel.clone()).await {
+            // PROVISIONAL (bindreams/hole#850's plan, Task 3 — see Task 5):
+            // `Routing::Installed` does not yet expose which split routes
+            // actually landed, so this unconditionally advertises both
+            // families pending Task 5's `routes.routed_families()`. Safe in
+            // the meantime: it derives from nothing (doesn't violate D4's
+            // anti-proxy-derivation rule) and matches the unconditional
+            // full-list behavior every platform had before this change.
+            let _ = &routes;
+            let routed = RoutedFamilies { v4: true, v6: true };
+            match dns
+                .apply(advertise_ips, routed, tun_identity, server_ip, cancel.clone())
+                .await
+            {
                 Ok(a) => Some(a),
                 Err(DnsError::Cancelled) => {
                     if let Some(mut d) = dispatcher.take() {

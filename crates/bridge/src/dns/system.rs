@@ -18,21 +18,39 @@
 //! `hole-tun`, the whole start aborts rather than leaving a session the UI
 //! reports as connected with a silent DNS leak.
 //!
-//! ## macOS: advisory (until #868)
+//! ## macOS: fail-fatal (#868)
 //!
-//! `set_servers` on macOS is a guaranteed no-op today — `apply_macos` hands
-//! `hole-tun` (an *interface* name) to a backend whose identifier type is a
-//! *service* name (#868). Promoting that failure to fatal would refuse
-//! every macOS Full-mode start with DNS enabled, so the macOS arm stays
-//! `warn!` + continue. There is no confinement on macOS to fail either.
+//! `apply_macos` no longer shells out to `networksetup` with an interface
+//! name — that identifier type is a *service* name, so passing it was a
+//! guaranteed no-op (the original #868 defect). It now publishes a
+//! supplemental resolver at a synthetic, session-scoped `SCDynamicStore` key
+//! via `tun_engine::dns_steer` — the macOS analogue of the Windows
+//! confinement above: a process-scoped mechanism that needs no
+//! crash-recovery state because it dies with the bridge, including on
+//! `SIGKILL` (see that module's doc for the mechanism and its D3
+//! session-lifetime argument). A failure to engage it is fatal, for the
+//! identical reason the Windows confinement is: there is no longer a
+//! degraded "advisory" mode a session can silently fall back to.
+//!
+//! Unlike Windows, the steering key covers the whole machine rather than one
+//! adapter, so `tun`'s alias plays no role in reaching it — see
+//! `apply_macos`'s own doc. `advertise_ips` is filtered to the address
+//! families the tunnel is actually carrying (`RoutedFamilies`, read once
+//! from the routes that landed — never from the TUN's own IPv6 read-back or
+//! the upstream gateway's IPv6 availability, both of which answer a
+//! different question; see bindreams/hole#850's plan, decision D4). An
+//! empty filtered list is refused rather than silently advertising nothing.
 //!
 //! ## Cancellation
 //!
-//! `apply` checks `cancel` before engaging the confinement and again before
-//! setting resolvers. A cancel fired after the confinement engaged drops it
-//! (Windows: the dynamic WFP session tears down with the guard) before
-//! returning `DnsError::Cancelled` — there is nothing to inline-restore
-//! any more, since nothing but `hole-tun` is ever touched.
+//! `apply` checks `cancel` before engaging the confinement/steering and
+//! again afterward — Windows, before setting resolvers; macOS, immediately
+//! after the engage call returns. A cancel fired after the engage drops it
+//! (Windows: the dynamic WFP session tears down with the guard; macOS:
+//! `withdraw` is called explicitly, best-effort — see `apply_macos`) before
+//! returning `DnsError::Cancelled` — there is nothing to inline-restore any
+//! more, since nothing but `hole-tun` (Windows) or the synthetic steering
+//! key (macOS) is ever touched.
 
 use std::io;
 use std::net::IpAddr;
@@ -45,7 +63,7 @@ use crate::dns_state::DnsPrior;
 mod phase;
 #[cfg(any(target_os = "windows", target_os = "macos"))]
 use phase::Cosmetic;
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 use phase::LeakBearing;
 
 // Dns trait surface ===================================================================================================
@@ -88,22 +106,44 @@ pub trait Dns: Send + Sync + 'static {
     ///
     /// On Windows, `set_servers` splits `advertise_ips` per address family
     /// and sets the v4 and v6 families separately; a family with no
-    /// entries is left untouched, never cleared. macOS sets the mixed list
-    /// in one call (but see the module doc — this is advisory-only on
-    /// macOS today). OS UDP/53 to these IPs routes into `hole-tun` and is
-    /// intercepted by the in-TUN `LocalDnsEndpoint`; OS TCP/53 falls
-    /// through the proxy cascade to the real resolver over the tunnel.
+    /// entries is left untouched, never cleared. macOS instead publishes
+    /// the mixed list (filtered by `routed` — see the module doc) at a
+    /// synthetic supplemental-resolver key. OS UDP/53 to these IPs routes
+    /// into `hole-tun` and is intercepted by the in-TUN `LocalDnsEndpoint`;
+    /// OS TCP/53 falls through the proxy cascade to the real resolver over
+    /// the tunnel.
+    ///
+    /// `routed` is the address families the tunnel is actually carrying —
+    /// see [`RoutedFamilies`]. Windows ignores it (the WFP confinement
+    /// blocks off-tunnel DNS egress regardless of family); macOS filters
+    /// `advertise_ips` by it before publishing.
     ///
     /// **Cancellation.** The implementation checks `cancel.is_cancelled()`
-    /// between the confinement engage and the resolver-IP set, dropping
-    /// the confinement before returning [`DnsError::Cancelled`].
+    /// between the confinement/steering engage and the resolver-IP set (or,
+    /// on macOS, immediately after the engage call returns), dropping the
+    /// confinement/steering before returning [`DnsError::Cancelled`].
     fn apply(
         &self,
         advertise_ips: Vec<IpAddr>,
+        routed: RoutedFamilies,
         tun: tun_engine::TunIdentity,
         server_ip: IpAddr,
         cancel: CancellationToken,
     ) -> impl std::future::Future<Output = Result<Self::Applied, DnsError>> + Send;
+}
+
+/// Which address families the tunnel is actually carrying, at the moment
+/// [`Dns::apply`] runs. Read once from the routes `Routing::install` just
+/// installed (ground truth) — never re-derived from the TUN's own IPv6
+/// read-back or the upstream gateway's IPv6 availability, both of which
+/// answer a different question (see bindreams/hole#850's plan, decision
+/// D4). Windows ignores this: the WFP DNS-egress confinement blocks
+/// off-tunnel DNS egress regardless of family, so there is nothing this
+/// filter would add there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RoutedFamilies {
+    pub v4: bool,
+    pub v6: bool,
 }
 
 /// RAII guard returned by [`Dns::apply`]. See [`Dns::Applied`] for the
@@ -163,11 +203,15 @@ pub struct SystemDns {
     /// [`Self::new_with_backend`].
     #[cfg(target_os = "windows")]
     confiner: Arc<dyn windows::DnsConfiner>,
-    /// macOS `networksetup` backend. Production:
-    /// [`macos::Networksetup`]; tests: substitute via
-    /// [`Self::new_with_mac_backend`].
+    /// macOS `networksetup` backend, used only for `flush` now (see the
+    /// module doc). Production: [`macos::Networksetup`]; tests: substitute
+    /// via [`Self::new_with_mac_backend`].
     #[cfg(target_os = "macos")]
     backend: Arc<dyn macos::MacDnsBackend>,
+    /// The DNS-steering seam. Production: [`macos::RealMacDnsSteerer`];
+    /// tests: substitute via [`Self::new_with_mac_backend`].
+    #[cfg(target_os = "macos")]
+    steerer: Arc<dyn macos::MacDnsSteerer>,
 }
 
 impl Default for SystemDns {
@@ -185,6 +229,8 @@ impl SystemDns {
             confiner: Arc::new(windows::RealDnsConfiner),
             #[cfg(target_os = "macos")]
             backend: Arc::new(macos::Networksetup),
+            #[cfg(target_os = "macos")]
+            steerer: Arc::new(macos::RealMacDnsSteerer),
         }
     }
 
@@ -198,11 +244,14 @@ impl SystemDns {
     }
 
     /// Construct a [`SystemDns`] with a specific [`macos::MacDnsBackend`]
-    /// implementation. Used by Layer-2 unit tests to substitute a mock.
-    /// Production code uses [`Self::new`].
+    /// and [`macos::MacDnsSteerer`] implementation. Used by
+    /// `macos_tests.rs` to substitute mocks; production uses [`Self::new`].
     #[cfg(target_os = "macos")]
-    pub fn new_with_mac_backend(backend: Arc<dyn macos::MacDnsBackend>) -> Self {
-        Self { backend }
+    pub fn new_with_mac_backend(
+        backend: Arc<dyn macos::MacDnsBackend>,
+        steerer: Arc<dyn macos::MacDnsSteerer>,
+    ) -> Self {
+        Self { backend, steerer }
     }
 }
 
@@ -213,29 +262,41 @@ impl Dns for SystemDns {
     async fn apply(
         &self,
         advertise_ips: Vec<IpAddr>,
+        routed: RoutedFamilies,
         tun: tun_engine::TunIdentity,
         server_ip: IpAddr,
         cancel: CancellationToken,
     ) -> Result<Self::Applied, DnsError> {
-        apply_windows(&self.backend, &self.confiner, advertise_ips, tun, server_ip, cancel).await
+        apply_windows(
+            &self.backend,
+            &self.confiner,
+            advertise_ips,
+            routed,
+            tun,
+            server_ip,
+            cancel,
+        )
+        .await
     }
 
     #[cfg(target_os = "macos")]
     async fn apply(
         &self,
         advertise_ips: Vec<IpAddr>,
+        routed: RoutedFamilies,
         tun: tun_engine::TunIdentity,
         server_ip: IpAddr,
         cancel: CancellationToken,
     ) -> Result<Self::Applied, DnsError> {
         let _ = server_ip;
-        apply_macos(&self.backend, advertise_ips, tun, cancel).await
+        apply_macos(&self.backend, &self.steerer, advertise_ips, routed, tun, cancel).await
     }
 
     #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     async fn apply(
         &self,
         _advertise_ips: Vec<IpAddr>,
+        _routed: RoutedFamilies,
         _tun: tun_engine::TunIdentity,
         _server_ip: IpAddr,
         _cancel: CancellationToken,
@@ -259,11 +320,16 @@ async fn apply_windows(
     backend: &Arc<dyn windows::WinDnsBackend>,
     confiner: &Arc<dyn windows::DnsConfiner>,
     advertise_ips: Vec<IpAddr>,
+    routed: RoutedFamilies,
     tun: tun_engine::TunIdentity,
     server_ip: IpAddr,
     cancel: CancellationToken,
 ) -> Result<SystemDnsApplied, DnsError> {
     let started = std::time::Instant::now();
+    // Unused here — see `RoutedFamilies`'s and `Dns::apply`'s doc: the WFP
+    // confinement below blocks off-tunnel DNS egress on both families
+    // regardless of which the tunnel actually carries.
+    let _ = routed;
 
     if cancel.is_cancelled() {
         return Err(DnsError::Cancelled);
@@ -328,25 +394,54 @@ async fn apply_windows(
 #[cfg(target_os = "macos")]
 async fn apply_macos(
     backend: &Arc<dyn macos::MacDnsBackend>,
+    steerer: &Arc<dyn macos::MacDnsSteerer>,
     advertise_ips: Vec<IpAddr>,
+    routed: RoutedFamilies,
     tun: tun_engine::TunIdentity,
     cancel: CancellationToken,
 ) -> Result<SystemDnsApplied, DnsError> {
     let started = std::time::Instant::now();
+    // The steering key covers the whole machine, not one interface — unlike
+    // Windows, which must resolve the LUID of the concrete adapter it owns
+    // — so `tun` plays no role in reaching it. It stays a parameter only
+    // for signature symmetry with `Dns::apply`; it is never read here.
+    let _ = &tun;
 
     if cancel.is_cancelled() {
         return Err(DnsError::Cancelled);
     }
 
-    // `Cosmetic`, not yet `LeakBearing` (refs #868): `set_servers` is a
-    // guaranteed failure on this platform today (interface name handed to
-    // a service-name API), so promoting it would refuse every macOS
-    // Full-mode start with DNS enabled. Task 3 replaces this whole call
-    // with the real `dns_steer` mechanism and promotes it then.
-    let b = Arc::clone(backend);
-    let alias = tun.alias().to_string();
-    let ips = advertise_ips.clone();
-    phase::run::<Cosmetic, _, _>("set-servers", move || b.set_servers(&alias, &ips)).await?;
+    // D4 narrow filter (see the module doc and `RoutedFamilies`'s doc):
+    // only advertise a resolver whose address family actually has a live
+    // split route. An empty result is refused rather than silently
+    // publishing nothing.
+    let filtered: Vec<IpAddr> = advertise_ips
+        .into_iter()
+        .filter(|ip| if ip.is_ipv6() { routed.v6 } else { routed.v4 })
+        .collect();
+    if filtered.is_empty() {
+        return Err(DnsError::Io(io::Error::other(
+            "no advertised DNS server's address family has a live split route; refusing to leave the OS on the LAN resolver",
+        )));
+    }
+
+    // Publish the supplemental resolver key — fail-fatal (see module doc):
+    // this key is the ONLY thing steering OS DNS on macOS, so a failure to
+    // engage it is not a degraded session, it is an unprotected one.
+    // `LeakBearing` so `phase::run` propagates the error.
+    let s = Arc::clone(steerer);
+    let servers = filtered;
+    let steering = phase::run::<LeakBearing, _, _>("dns-steer-engage", move || s.engage(&servers))
+        .await?
+        .expect("LeakBearing always returns Some on Ok — see phase.rs's doc");
+
+    if cancel.is_cancelled() {
+        // Withdraw before returning Cancelled — best-effort (`Cosmetic`): a
+        // failed withdraw here does not change the Cancelled outcome, and
+        // is not silent either (see `RealSteeringHandle::withdraw`'s log).
+        let _ = phase::run::<Cosmetic, _, _>("dns-steer-withdraw", move || steering.withdraw()).await;
+        return Err(DnsError::Cancelled);
+    }
 
     // Flush. Best-effort — a failed cache flush leaves a stale entry for
     // one TTL window, not a leak.
@@ -360,6 +455,7 @@ async fn apply_macos(
 
     Ok(SystemDnsApplied {
         backend: Arc::clone(backend),
+        steering: Some(steering),
         bomb: drop_bomb::DebugDropBomb::new(BOMB_MSG),
         shutdown_completed: false,
     })
@@ -386,6 +482,11 @@ pub struct SystemDnsApplied {
     /// `networksetup` backend used for `flush` on macOS.
     #[cfg(target_os = "macos")]
     backend: Arc<dyn macos::MacDnsBackend>,
+    /// The engaged DNS-steering key guard. `None` only if `shutdown`
+    /// already took it. Dropping it without withdrawing is the
+    /// crash/unwind fallback — see `tun_engine::dns_steer::Steering`'s doc.
+    #[cfg(target_os = "macos")]
+    steering: Option<Box<dyn macos::SteeringHandle>>,
     /// Runtime safeguard: panics in debug builds on drop if `shutdown`
     /// wasn't awaited. No-op in release.
     ///
@@ -411,6 +512,15 @@ impl SystemDnsApplied {
     pub(crate) fn confinement_engaged(&self) -> bool {
         self.confinement.is_some()
     }
+
+    /// Whether the DNS-steering key is currently held. Test-only, mirrors
+    /// [`Self::confinement_engaged`] — the OS-level proof that dropping it
+    /// actually removes the key lives in `tun_engine::dns_steer`'s
+    /// privileged lane.
+    #[cfg(all(test, target_os = "macos"))]
+    pub(crate) fn steering_engaged(&self) -> bool {
+        self.steering.is_some()
+    }
 }
 
 impl DnsApplied for SystemDnsApplied {
@@ -426,6 +536,15 @@ impl DnsApplied for SystemDnsApplied {
             // be torn down by the routes/dispatcher teardown that follows
             // this in `ProxyManager::stop_with`.
             self.confinement.take();
+        }
+
+        #[cfg(target_os = "macos")]
+        if let Some(steering) = self.steering.take() {
+            // Best-effort (`Cosmetic`): a failed withdraw must not fail a
+            // stop, but is logged (with the key) by
+            // `RealSteeringHandle::withdraw` — the whole point of making it
+            // confirmable rather than silent.
+            let _ = phase::run::<Cosmetic, _, _>("dns-steer-withdraw", move || steering.withdraw()).await;
         }
 
         #[cfg(any(target_os = "windows", target_os = "macos"))]
@@ -453,8 +572,9 @@ impl Drop for SystemDnsApplied {
             return;
         }
         tracing::warn!("SystemDnsApplied dropped without shutdown() — sync fallback");
-        // The `confinement` field's own Drop releases it unconditionally —
-        // no explicit action needed here. Best-effort flush only.
+        // The `confinement`/`steering` field's own Drop releases it
+        // unconditionally — no explicit action needed here. Best-effort
+        // flush only.
         #[cfg(any(target_os = "windows", target_os = "macos"))]
         {
             let _ = self.backend.flush();

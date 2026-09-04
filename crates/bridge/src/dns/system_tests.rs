@@ -82,7 +82,7 @@ async fn dns_apply_writes_no_state_file() {
     use tokio_util::sync::CancellationToken;
 
     use crate::dns::system::windows::{DnsConfiner, WinDnsBackend};
-    use crate::dns::system::{Dns, DnsApplied, SystemDns};
+    use crate::dns::system::{Dns, DnsApplied, RoutedFamilies, SystemDns};
     use crate::dns_state::{AdapterId, DnsPrior, DnsPriorAdapter};
 
     struct NoopBackend;
@@ -129,6 +129,7 @@ async fn dns_apply_writes_no_state_file() {
     let mut applied = dns
         .apply(
             vec![IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))],
+            RoutedFamilies { v4: true, v6: true },
             tun_engine::TunIdentity::synthetic(0xFEED, "hole-tun"),
             IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7)),
             CancellationToken::new(),

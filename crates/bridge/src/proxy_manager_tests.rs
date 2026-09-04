@@ -1898,7 +1898,7 @@ fn reload_when_not_running_starts() {
 #[skuld::test]
 fn dns_apply_emits_done_info_log() {
     use crate::dns::system::windows::{DnsConfiner, WinDnsBackend};
-    use crate::dns::system::{Dns, DnsApplied, SystemDns};
+    use crate::dns::system::{Dns, DnsApplied, RoutedFamilies, SystemDns};
     use crate::dns_state::{AdapterId, DnsPrior, DnsPriorAdapter};
     use crate::test_support::log_capture::VecWriter;
     use std::net::{IpAddr, Ipv4Addr};
@@ -1964,6 +1964,7 @@ fn dns_apply_emits_done_info_log() {
             let mut applied = dns
                 .apply(
                     vec![IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))],
+                    RoutedFamilies { v4: true, v6: true },
                     tun_engine::TunIdentity::synthetic(0xFEED, "hole-tun"),
                     IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7)),
                     CancellationToken::new(),

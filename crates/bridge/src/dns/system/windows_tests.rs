@@ -19,7 +19,7 @@ use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
 use super::{DnsConfiner, WinDnsBackend};
-use crate::dns::system::{Dns, DnsApplied, DnsError, SystemDns};
+use crate::dns::system::{Dns, DnsApplied, DnsError, RoutedFamilies, SystemDns};
 use crate::dns_state::{AdapterId, DnsPrior, DnsPriorAdapter};
 
 // MockBackend =========================================================================================================
@@ -205,6 +205,7 @@ async fn dns_apply_cancelled_drops_the_confinement() {
     let result = dns
         .apply(
             vec![IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))],
+            RoutedFamilies { v4: true, v6: true },
             tun_identity(),
             server_ip(),
             cancel,
@@ -242,6 +243,7 @@ async fn apply_sets_resolvers_on_hole_tun_only() {
     let mut applied = dns
         .apply(
             vec![IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))],
+            RoutedFamilies { v4: true, v6: true },
             tun_identity(),
             server_ip(),
             CancellationToken::new(),
@@ -277,6 +279,7 @@ async fn system_dns_applied_drop_panics_in_debug_if_shutdown_not_awaited() {
     let applied = dns
         .apply(
             vec![IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))],
+            RoutedFamilies { v4: true, v6: true },
             tun_identity(),
             server_ip(),
             CancellationToken::new(),
@@ -303,6 +306,7 @@ async fn shutdown_releases_the_confinement() {
     let mut applied = dns
         .apply(
             vec![IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))],
+            RoutedFamilies { v4: true, v6: true },
             tun_identity(),
             server_ip(),
             CancellationToken::new(),
@@ -334,6 +338,7 @@ async fn confiner_failure_surfaces_as_confine_error_and_skips_set_servers() {
     let result = dns
         .apply(
             vec![IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))],
+            RoutedFamilies { v4: true, v6: true },
             tun_identity(),
             server_ip(),
             CancellationToken::new(),
@@ -385,6 +390,7 @@ async fn set_servers_failure_is_fatal() {
     let result = dns
         .apply(
             vec![IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))],
+            RoutedFamilies { v4: true, v6: true },
             tun_identity(),
             server_ip(),
             CancellationToken::new(),
@@ -416,7 +422,13 @@ async fn apply_advertises_resolver_ips_not_loopback() {
         IpAddr::V4(Ipv4Addr::new(1, 0, 0, 1)),
     ];
     let mut applied = dns
-        .apply(resolvers.clone(), tun_identity(), server_ip(), CancellationToken::new())
+        .apply(
+            resolvers.clone(),
+            RoutedFamilies { v4: true, v6: true },
+            tun_identity(),
+            server_ip(),
+            CancellationToken::new(),
+        )
         .await
         .expect("apply should succeed");
 
@@ -452,7 +464,13 @@ async fn apply_advertises_both_v4_and_v6_resolvers() {
         "2606:4700:4700::1111".parse().unwrap(),
     ];
     let mut applied = dns
-        .apply(resolvers.clone(), tun_identity(), server_ip(), CancellationToken::new())
+        .apply(
+            resolvers.clone(),
+            RoutedFamilies { v4: true, v6: true },
+            tun_identity(),
+            server_ip(),
+            CancellationToken::new(),
+        )
         .await
         .expect("apply should succeed");
 
@@ -480,6 +498,7 @@ async fn dns_apply_captures_nothing() {
     let mut applied = dns
         .apply(
             vec![IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))],
+            RoutedFamilies { v4: true, v6: true },
             tun_identity(),
             server_ip(),
             CancellationToken::new(),
