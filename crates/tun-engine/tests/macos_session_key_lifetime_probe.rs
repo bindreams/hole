@@ -65,13 +65,17 @@ fn main() {
         #[cfg(target_os = "macos")]
         {
             macos_impl::run_holder();
+            return;
         }
+        // `std::process::exit` diverges, so a `return` after this arm would
+        // be unreachable on every non-macOS target and rejected under `-D
+        // warnings` (caught by Windows CI, since this file must still
+        // compile there — see the module doc).
         #[cfg(not(target_os = "macos"))]
         {
             eprintln!("{HOLDER_ENV} is only ever set by this macOS-only test's own self re-exec");
             std::process::exit(2);
         }
-        return;
     }
     skuld::run_all();
 }
