@@ -37,11 +37,17 @@
 //!   add the prefix route explicitly after the alias, which suggests it does
 //!   not follow from the alias — the same open question as the Windows
 //!   `OnLinkPrefixLength` measurement.
+//!
+//! `assign`'s success path logs at `info` (its failure paths already warn) so
+//! a passing darwin-lane run states plainly whether the alias succeeded,
+//! rather than leaving success to be inferred from an absence of warnings —
+//! but that line does not, and cannot, speak to either open item above: it
+//! runs before DAD resolves and never inspects the routing table.
 
 use std::process::Command;
 
 use smoltcp::wire::Ipv6Cidr;
-use tracing::warn;
+use tracing::{info, warn};
 
 use super::Assigned;
 use crate::error::DeviceError;
@@ -68,6 +74,11 @@ pub(super) fn assign(if_index: u32, cidr: Ipv6Cidr) -> Result<Assigned, DeviceEr
         }
     };
     if output.status.success() {
+        // Only answers "did the alias succeed" (one of the open questions
+        // in this file's module doc) — DAD's cost and whether a prefix
+        // route followed are NOT measured here and this line does not
+        // speak to either.
+        info!(interface = %if_name, address = %cidr.address(), "ifconfig alias succeeded; the TUN interface holds an IPv6 address");
         return Ok(Assigned::Address);
     }
 
