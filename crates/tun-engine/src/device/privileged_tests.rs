@@ -4,8 +4,11 @@
 //! read it back correctly, and that the read-back name is the SAME device the
 //! kernel opened — not merely a plausible-looking string.
 //!
-//! macOS only: `KernelAssigned` has no variant on any other platform (see
-//! [`super::config::TunName`]'s doc), so there is nothing to probe elsewhere.
+//! macOS only: `KernelAssigned` exists as a variant on every platform, but
+//! only macOS's `utun` driver actually grants one — every other platform
+//! rejects it with `InvalidConfig` before any OS call (see
+//! [`super::config::TunName`]'s doc and `build_rejects_kernel_assigned_off_macos`
+//! in `device_tests.rs`), so there is nothing to probe elsewhere.
 //!
 //! Needs no adapter-cleanup guard, unlike the Windows wintun privileged tests:
 //! `crate::adapter_cleanup::remove_adapter` is a documented no-op on macOS —

@@ -17,15 +17,20 @@ use tun_engine_macros::freeze;
 ///   be actively harmful: Windows' own interface-name table can transiently
 ///   answer "not found" on a live machine, and the no-time-sync rule bars a
 ///   retry loop working around it.
-/// - `KernelAssigned` — there is no requested name; only macOS's `utun`
-///   driver supports this (an unset `sc_unit` asks the kernel for the next
-///   free `utunN`). The device's real name is read back from the just-opened
-///   handle, and that read failing is fatal — there is nothing to fall back
-///   to.
+/// - `KernelAssigned` — there is no requested name (an unset `sc_unit` asks
+///   the kernel for the next free `utunN`). The device's real name is read
+///   back from the just-opened handle, and that read failing is fatal —
+///   there is nothing to fall back to.
+///
+/// Both variants exist on every platform — the type describes the concept
+/// "a name may be requested or kernel-assigned", not "what this platform's
+/// driver happens to support" — but only macOS's `utun` driver actually
+/// grants a kernel-assigned name: [`super::Device::build`] rejects
+/// `KernelAssigned` with [`crate::error::DeviceError::InvalidConfig`] on
+/// every other platform, before any OS call.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TunName {
     Requested(String),
-    #[cfg(target_os = "macos")]
     KernelAssigned,
 }
 

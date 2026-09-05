@@ -25,9 +25,11 @@ use tun::{AbstractDevice, AsyncDevice};
 
 use crate::error::DeviceError;
 
-/// Bridges the real driver into [`identity::resolve_identity`]'s seam. The
-/// mac-only `KernelAssigned` arm is the only caller; on every other
-/// platform, `TunName` has no variant that ever consults it.
+/// Bridges the real driver into [`identity::resolve_identity`]'s seam.
+/// `tun::AbstractDevice::tun_name` is itself cross-platform, so this impl is
+/// unconditional; `resolve_identity`'s `KernelAssigned` arm is the only
+/// caller, and `Device::build`'s validation is what keeps that arm from
+/// actually running off macOS (see its doc), not a `#[cfg]` on this impl.
 impl identity::NameSource for AsyncDevice {
     fn tun_name(&self) -> std::io::Result<String> {
         // `AsyncDevice` derefs to the platform `tun::Device`, which is the
@@ -79,9 +81,25 @@ impl Device {
         let mut c = MutDeviceConfig::default();
         init(&mut c);
 
-        if let TunName::Requested(name) = &c.tun_name {
-            if name.is_empty() {
-                return Err(DeviceError::InvalidConfig("tun_name is required"));
+        match &c.tun_name {
+            TunName::Requested(name) => {
+                if name.is_empty() {
+                    return Err(DeviceError::InvalidConfig("tun_name is required"));
+                }
+            }
+            // Only macOS's `utun` driver actually grants a kernel-assigned
+            // name (see `TunName`'s doc); refusing it here, uniformly on
+            // every other platform, is what keeps the Windows ownership
+            // probe below and `resolve_identity`'s read-back arm from ever
+            // running on a config they were never meant to see — a runtime
+            // check the type itself no longer encodes now that the variant
+            // exists everywhere.
+            TunName::KernelAssigned => {
+                if !cfg!(target_os = "macos") {
+                    return Err(DeviceError::InvalidConfig(
+                        "tun_name: KernelAssigned is only supported on macOS",
+                    ));
+                }
             }
         }
         if c.mtu == 0 {
@@ -95,12 +113,19 @@ impl Device {
 
         // Pre-create ownership check (Windows only — see the module doc on
         // `identity` for why this MUST run before `create_as_async`, never
-        // after). Windows builds `TunName` with only the `Requested` variant
-        // (`KernelAssigned` is macOS-only), so this destructure is
-        // irrefutable.
+        // after). `TunName` has both variants on every platform now, so this
+        // destructure is genuinely refutable here — but the validation match
+        // above already turned `KernelAssigned` into `InvalidConfig` on every
+        // non-macOS platform, so by the time this line runs on Windows the
+        // `KernelAssigned` arm is unreachable, not merely unlikely.
         #[cfg(target_os = "windows")]
         {
-            let TunName::Requested(requested_name) = &config.tun_name;
+            let TunName::Requested(requested_name) = &config.tun_name else {
+                unreachable!(
+                    "Device::build's validation rejects TunName::KernelAssigned on every non-macOS \
+                     platform before this point is ever reached"
+                )
+            };
             match identity::probe_incumbent(requested_name, identity::HOLE_ADAPTER_GUID) {
                 Ok(identity::Incumbent::None) | Ok(identity::Incumbent::Ours) => {}
                 Ok(identity::Incumbent::Foreign) => {
@@ -213,8 +238,12 @@ fn build_tun_configuration(config: &DeviceConfig) -> tun::Configuration {
         // Leave `tun::Configuration::tun_name` unset. macOS's `Device::new`
         // reads an unset name as `sc_unit: 0`, which asks the kernel to
         // assign the next free `utunN` instead of parsing a name we don't
-        // have (`tun-0.8.13/src/platform/macos/device.rs:81-91`).
-        #[cfg(target_os = "macos")]
+        // have (`tun-0.8.13/src/platform/macos/device.rs:81-91`). Reached
+        // only on macOS in practice — `Device::build`'s validation rejects
+        // `KernelAssigned` everywhere else before this function is called —
+        // but the match itself must be exhaustive on every platform now
+        // that the variant exists everywhere, and leaving the name unset is
+        // harmless even if that invariant were ever violated.
         TunName::KernelAssigned => {}
     }
     tun_config.mtu(config.mtu).up();

@@ -94,11 +94,11 @@ fn requested_alias_is_not_read_back() {
 
 /// A [`NameSource`] returning a fixed, pre-armed result — the seam
 /// `TunName::KernelAssigned`'s read-back tests drive directly, without a
-/// real device.
-#[cfg(target_os = "macos")]
+/// real device. `resolve_identity`'s `KernelAssigned` arm has no `#[cfg]` on
+/// it (only `Device::build`'s validation keeps it from running off macOS in
+/// production), so this pure seam is exercised on every platform here too.
 struct FakeNameSource(std::io::Result<String>);
 
-#[cfg(target_os = "macos")]
 impl NameSource for FakeNameSource {
     fn tun_name(&self) -> std::io::Result<String> {
         match &self.0 {
@@ -111,7 +111,6 @@ impl NameSource for FakeNameSource {
 /// The returned name is deliberately something no config ever requested —
 /// `KernelAssigned` has no requested name at all, so the identity can only
 /// have come from the seam.
-#[cfg(target_os = "macos")]
 #[skuld::test]
 fn kernel_assigned_alias_is_read_back() {
     let source = FakeNameSource(Ok("utun7".to_string()));
@@ -119,7 +118,6 @@ fn kernel_assigned_alias_is_read_back() {
     assert_eq!(identity.alias(), "utun7");
 }
 
-#[cfg(target_os = "macos")]
 #[skuld::test]
 fn kernel_assigned_build_fails_when_the_device_cannot_report_its_name() {
     let source = FakeNameSource(Err(std::io::Error::other("getsockopt(UTUN_OPT_IFNAME) failed")));
