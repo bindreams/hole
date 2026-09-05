@@ -222,17 +222,34 @@ fn netstat_inet() -> String {
         .unwrap_or_else(|e| format!("HARNESS: failed to spawn netstat -rn -f inet: {e}"))
 }
 
-/// Whether `netstat_text` shows a route to the exact literal destination
-/// `dest` (netstat's own rendering of the split-route prefixes, matched
-/// verbatim against the production strings in `tun_engine::routing`) leaving
-/// via `iface`. Matches on destination-field equality plus interface-name
-/// presence anywhere in the line, rather than a fixed column index, since
-/// the `Expire` column is blank for an on-link route and shifts field count.
-fn netstat_route_via(netstat_text: &str, dest: &str, iface: &str) -> bool {
-    netstat_text
-        .lines()
-        .filter(|l| l.split_whitespace().next() == Some(dest))
-        .any(|l| l.split_whitespace().any(|f| f == iface))
+/// The interface the kernel's own longest-prefix-match lookup picks for
+/// `dest`, per `route -n get <dest>` — a real routing-table read, not a
+/// rendering of one. Chosen over parsing `netstat -rn -f inet`'s destination
+/// column because that column's format is not the production route strings:
+/// macOS's netstat elides trailing zero octets (`128.0.0.0/1` prints as
+/// `128.0/1`), so matching it verbatim against `tun_engine::routing`'s own
+/// `"128.0.0.0/1"` literal is brittle, and swapping in the abbreviated form
+/// would only be brittle in the other direction — it would break on the next
+/// rendering variation instead of this one. `route -n get` sidesteps table
+/// formatting entirely by asking the kernel a real question ("what would you
+/// route this destination through") whose answer needs no un-abbreviating.
+///
+/// `dest` is each split network's own base address (`0.0.0.0` for the low
+/// half, `128.0.0.0` for the high half) — a member of that /1 block — so
+/// when the split route is installed it outranks the machine's default
+/// route (`0.0.0.0/0`) by longest-prefix match; when the split is absent
+/// (before Start, after Stop) the lookup instead answers with whatever
+/// route already covers that address (typically the default), which the
+/// caller asserts differs from the TUN interface.
+fn route_get_interface(dest: &str) -> Option<String> {
+    let output = Command::new("route")
+        .args(["-n", "get", dest])
+        .output()
+        .unwrap_or_else(|e| panic!("HARNESS: failed to spawn route -n get {dest}: {e}"));
+    let text = String::from_utf8_lossy(&output.stdout);
+    text.lines()
+        .find_map(|l| l.trim().strip_prefix("interface: "))
+        .map(str::to_owned)
 }
 
 // Config ==============================================================================================================
@@ -256,7 +273,7 @@ fn entry_from(ss: &SsServerHandle) -> ServerEntry {
 /// SHIP GATE (#893). Starts a real Full-mode session with DNS enabled
 /// through the production `hole bridge run` subprocess, then asserts three
 /// facts read from the OS, not from our return values: a live `utun` the OS
-/// did not have before; the two IPv4 split routes (`0/1`, `128.0.0.0/1`)
+/// did not have before; the two IPv4 split routes (`0.0.0.0/1`, `128.0.0.0/1`)
 /// leaving via that interface; and the configured resolver present in the
 /// OS's own derived DNS configuration. Stops, then asserts all three are
 /// gone and the machine's `nameserver[…]` set is back to its pre-start
@@ -321,18 +338,25 @@ async fn run_macos_full_tunnel_os_state_e2e(dist: &Path, ss: &SsServerHandle) {
     };
     println!("[macos_full_tunnel] new utun after Start: {iface}");
 
-    // (b) the two IPv4 split routes leaving via that interface.
-    let routes_after_start = netstat_inet();
-    let low_half = netstat_route_via(&routes_after_start, "0/1", &iface);
-    let high_half = netstat_route_via(&routes_after_start, "128.0.0.0/1", &iface);
-    println!("[macos_full_tunnel] netstat -rn -f inet after Start:\n{routes_after_start}");
-    assert!(
-        low_half,
-        "expected netstat -rn -f inet to show a route to '0/1' via '{iface}':\n{routes_after_start}"
+    // (b) the two IPv4 split routes leaving via that interface. Read via
+    // `route -n get` on each split's own base address (see
+    // `route_get_interface`'s doc for why), not via parsing the table
+    // `netstat_inet` below prints for diagnostic context only.
+    let low_half = route_get_interface("0.0.0.0");
+    let high_half = route_get_interface("128.0.0.0");
+    println!(
+        "[macos_full_tunnel] netstat -rn -f inet after Start:\n{}",
+        netstat_inet()
     );
-    assert!(
-        high_half,
-        "expected netstat -rn -f inet to show a route to '128.0.0.0/1' via '{iface}':\n{routes_after_start}"
+    assert_eq!(
+        low_half.as_deref(),
+        Some(iface.as_str()),
+        "expected route -n get 0.0.0.0 to answer '{iface}', got {low_half:?}"
+    );
+    assert_eq!(
+        high_half.as_deref(),
+        Some(iface.as_str()),
+        "expected route -n get 128.0.0.0 to answer '{iface}', got {high_half:?}"
     );
 
     // (c) the configured resolver present in the OS's own derived DNS
@@ -366,15 +390,21 @@ async fn run_macos_full_tunnel_os_state_e2e(dist: &Path, ss: &SsServerHandle) {
         "expected {iface} to be gone from ifconfig -l after Stop, still present: {after_stop_ifaces:?}"
     );
 
-    let routes_after_stop = netstat_inet();
-    println!("[macos_full_tunnel] netstat -rn -f inet after Stop:\n{routes_after_stop}");
-    assert!(
-        !netstat_route_via(&routes_after_stop, "0/1", &iface),
-        "expected the '0/1' route via '{iface}' to be gone after Stop:\n{routes_after_stop}"
+    println!(
+        "[macos_full_tunnel] netstat -rn -f inet after Stop:\n{}",
+        netstat_inet()
     );
-    assert!(
-        !netstat_route_via(&routes_after_stop, "128.0.0.0/1", &iface),
-        "expected the '128.0.0.0/1' route via '{iface}' to be gone after Stop:\n{routes_after_stop}"
+    let low_half_after_stop = route_get_interface("0.0.0.0");
+    let high_half_after_stop = route_get_interface("128.0.0.0");
+    assert_ne!(
+        low_half_after_stop.as_deref(),
+        Some(iface.as_str()),
+        "expected route -n get 0.0.0.0 to no longer answer '{iface}' after Stop, got {low_half_after_stop:?}"
+    );
+    assert_ne!(
+        high_half_after_stop.as_deref(),
+        Some(iface.as_str()),
+        "expected route -n get 128.0.0.0 to no longer answer '{iface}' after Stop, got {high_half_after_stop:?}"
     );
 
     let unmerged = stop_notify.settle(budget(30), &configured_servers[0], false);
