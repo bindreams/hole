@@ -234,13 +234,23 @@ fn netstat_inet() -> String {
 /// formatting entirely by asking the kernel a real question ("what would you
 /// route this destination through") whose answer needs no un-abbreviating.
 ///
-/// `dest` is each split network's own base address (`0.0.0.0` for the low
-/// half, `128.0.0.0` for the high half) — a member of that /1 block — so
-/// when the split route is installed it outranks the machine's default
-/// route (`0.0.0.0/0`) by longest-prefix match; when the split is absent
-/// (before Start, after Stop) the lookup instead answers with whatever
-/// route already covers that address (typically the default), which the
-/// caller asserts differs from the TUN interface.
+/// `dest` must be an ordinary address *inside* a split — never the split's
+/// own base address. macOS treats `route get 0.0.0.0` as a request for the
+/// default route and answers with the physical interface even while
+/// `0.0.0.0/1` is installed and winning for every real address in that
+/// half, so probing the base address asks the wrong question and reports a
+/// working tunnel as broken. Any ordinary member of the /1 block outranks
+/// the machine's default route (`0.0.0.0/0`) by longest-prefix match once
+/// the split is installed; when the split is absent (before Start, after
+/// Stop) the lookup answers with whatever route already covers it
+/// (typically the default), which the caller asserts differs from the TUN
+/// interface.
+/// Ordinary addresses inside each IPv4 split, for [`route_get_interface`].
+/// Deliberately not the `0.0.0.0` / `128.0.0.0` base addresses — see that
+/// function's doc for why the base address answers the wrong question.
+const SPLIT_LOW_PROBE: &str = "1.2.3.4";
+const SPLIT_HIGH_PROBE: &str = "200.1.2.3";
+
 fn route_get_interface(dest: &str) -> Option<String> {
     let output = Command::new("route")
         .args(["-n", "get", dest])
@@ -342,8 +352,8 @@ async fn run_macos_full_tunnel_os_state_e2e(dist: &Path, ss: &SsServerHandle) {
     // `route -n get` on each split's own base address (see
     // `route_get_interface`'s doc for why), not via parsing the table
     // `netstat_inet` below prints for diagnostic context only.
-    let low_half = route_get_interface("0.0.0.0");
-    let high_half = route_get_interface("128.0.0.0");
+    let low_half = route_get_interface(SPLIT_LOW_PROBE);
+    let high_half = route_get_interface(SPLIT_HIGH_PROBE);
     println!(
         "[macos_full_tunnel] netstat -rn -f inet after Start:\n{}",
         netstat_inet()
@@ -351,12 +361,12 @@ async fn run_macos_full_tunnel_os_state_e2e(dist: &Path, ss: &SsServerHandle) {
     assert_eq!(
         low_half.as_deref(),
         Some(iface.as_str()),
-        "expected route -n get 0.0.0.0 to answer '{iface}', got {low_half:?}"
+        "expected route -n get {SPLIT_LOW_PROBE} to answer '{iface}', got {low_half:?}"
     );
     assert_eq!(
         high_half.as_deref(),
         Some(iface.as_str()),
-        "expected route -n get 128.0.0.0 to answer '{iface}', got {high_half:?}"
+        "expected route -n get {SPLIT_HIGH_PROBE} to answer '{iface}', got {high_half:?}"
     );
 
     // (c) the configured resolver present in the OS's own derived DNS
@@ -394,8 +404,8 @@ async fn run_macos_full_tunnel_os_state_e2e(dist: &Path, ss: &SsServerHandle) {
         "[macos_full_tunnel] netstat -rn -f inet after Stop:\n{}",
         netstat_inet()
     );
-    let low_half_after_stop = route_get_interface("0.0.0.0");
-    let high_half_after_stop = route_get_interface("128.0.0.0");
+    let low_half_after_stop = route_get_interface(SPLIT_LOW_PROBE);
+    let high_half_after_stop = route_get_interface(SPLIT_HIGH_PROBE);
     assert_ne!(
         low_half_after_stop.as_deref(),
         Some(iface.as_str()),
