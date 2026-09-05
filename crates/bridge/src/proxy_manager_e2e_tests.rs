@@ -19,9 +19,13 @@
 //! 6. Sends `BridgeRequest::Stop` and asserts the result.
 //!
 //! TUN tests go through the same pipeline with `tunnel_mode: Full` and are
-//! `cfg(target_os = "windows")` + `labels = [TUN]` because macOS CI does
-//! not run elevated and spawning an elevated child from an unelevated
-//! test binary would fail on both OSes.
+//! `cfg(target_os = "windows")` + `labels = [TUN]` — NOT because macOS CI
+//! cannot run elevated (it does: `proxy_manager_live_tun_permit_e2e_tests.rs`
+//! and `proxy_manager_macos_full_tunnel_privileged_tests.rs` both do). Extending
+//! this `mod tun`'s roundtrip proof to macOS stays explicitly out of scope
+//! (bindreams/hole#850's plan, decision D5); `proxy_manager_macos_full_tunnel_privileged_tests.rs`
+//! covers macOS's Full-mode OS-effects seam instead, by a different method
+//! (reading the OS's own state back, not a roundtrip).
 //!
 //! Two of the Full-mode tests prove tunnel *transit* — they dial
 //! [`crate::test_support::net_discovery::UNOWNED_DSTS`], which nothing but the

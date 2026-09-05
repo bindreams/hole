@@ -44,16 +44,22 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 use tun_engine::gateway::GatewayInfo;
 use tun_engine::routing::failclosed::lockdown_state;
-use tun_engine::routing::{CoverGuard, Routing, SystemRouting};
+use tun_engine::routing::{CoverGuard, RoutesInstalled, Routing, SystemRouting};
 
 use crate::dns::self_test::{
     build_local_dns, implicates_plugin_transport, report_plugin_output, run_forwarder_self_test, self_test_error_for,
     SelfTestOutcome,
 };
 use crate::dns::system::{Dns, DnsApplied, DnsError, SystemDns};
-use crate::proxy::{
-    build_ss_config, Proxy, ProxyError, RunningProxy, ShadowsocksProxy, TrafficTotals, TUN_DEVICE_NAME,
-};
+use crate::proxy::{build_ss_config, Proxy, ProxyError, RunningProxy, ShadowsocksProxy, TrafficTotals};
+// `WINDOWS_TUN_ALIAS` only stands in for a real `TunIdentity` on the
+// `#[cfg(test)]` synthetic path below — the production path threads the
+// identity `Engine::build`/`Dispatcher::identity()` actually opened. Names no
+// OS object either way, so borrowing the Windows-only alias constant here
+// (rather than a fresh literal) is inert on every platform this test code
+// compiles for.
+#[cfg(test)]
+use crate::proxy::config::WINDOWS_TUN_ALIAS;
 
 mod cover;
 use cover::CoverHolder;
@@ -1710,7 +1716,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
             .identity()
             .clone();
         #[cfg(test)]
-        let tun_identity = tun_engine::TunIdentity::synthetic(0xFEED, TUN_DEVICE_NAME);
+        let tun_identity = tun_engine::TunIdentity::synthetic(0xFEED, WINDOWS_TUN_ALIAS);
 
         // The TUN's IPv6 verdict, read here because `Engine::build` has
         // already consumed the device by now. `Ipv6StackAbsent` is the second
@@ -1729,7 +1735,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
             return Err(ProxyError::Cancelled);
         }
         // Install the routes — NOW traffic starts flowing to the TUN.
-        let routes = match routing.install(TUN_DEVICE_NAME, server_ip, &gw_info) {
+        let routes = match routing.install(&tun_identity, server_ip, &gw_info) {
             Ok(routes) => routes,
             Err(e) => {
                 if let Some(mut d) = dispatcher.take() {
@@ -1758,7 +1764,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         // unwind, tearing down — the opposite of the transient cover's
         // fail-open. Committed only on the Ok path (the field below).
         let lockdown = if standing_cover_expected {
-            match routing.install_lockdown(server_ip, TUN_DEVICE_NAME, &app_ids) {
+            match routing.install_lockdown(server_ip, &tun_identity, &app_ids) {
                 Ok(cover) => {
                     promote_adopted_claim(state_dir, owner);
                     Some(cover)
@@ -1793,7 +1799,15 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         // `DnsError` unwind the locally-owned `lockdown` / `routes` guards.
         let dns_applied = if forwarder.is_some() {
             let advertise_ips: Vec<IpAddr> = config.dns.servers.clone();
-            match dns.apply(advertise_ips, tun_identity, server_ip, cancel.clone()).await {
+            // Ground truth for D4's filter: exactly the families `routes`
+            // itself confirmed landed, read directly off the guard — no OS
+            // probe, no second measurement (bindreams/hole#850's plan, Task
+            // 5, decision D4; see `RoutesInstalled::routed_families`).
+            let routed = routes.routed_families();
+            match dns
+                .apply(advertise_ips, routed, tun_identity, server_ip, cancel.clone())
+                .await
+            {
                 Ok(a) => Some(a),
                 Err(DnsError::Cancelled) => {
                     if let Some(mut d) = dispatcher.take() {
@@ -2198,15 +2212,25 @@ mod proxy_manager_release_tests;
 #[path = "proxy_manager_e2e_tests.rs"]
 mod proxy_manager_e2e_tests;
 
-// Session-level composition guard (Windows half): a real Full-mode
-// session started through the production path with the kill switch armed
-// still carries its own tunnel traffic while an off-tunnel probe is blocked.
-// See that module's doc for what it does and does not establish. Gated on
-// the whole module, not per-item, matching `proxy_manager_e2e_tests`'s
-// `mod tun` — the entire file's content is Windows-only today.
-#[cfg(all(test, target_os = "windows"))]
+// Session-level composition guard: a real Full-mode session started through
+// the production path with the kill switch armed still carries its own
+// tunnel traffic while an off-tunnel probe is blocked. See that module's doc
+// for what it does and does not establish. Runs on both platforms Hole ships
+// Full mode on (bindreams/hole#850, #874) — the elevated `tun` lane gates it
+// (see that module's own doc), not a platform `cfg`.
+#[cfg(test)]
 #[path = "proxy_manager_live_tun_permit_e2e_tests.rs"]
 mod proxy_manager_live_tun_permit_e2e_tests;
+
+// The #893 seam: a real Full-mode start's three OS-visible effects (utun,
+// split routes, derived DNS config) and their clean removal, judged only by
+// reading the OS back — never our own return values. macOS-only (the file is
+// `#![cfg(target_os = "macos")]`); the module is still registered
+// unconditionally so a non-macOS build still typechecks the `cfg`-gated
+// contents (bindreams/hole#850, #868, #893).
+#[cfg(test)]
+#[path = "proxy_manager_macos_full_tunnel_privileged_tests.rs"]
+mod proxy_manager_macos_full_tunnel_privileged_tests;
 
 #[cfg(test)]
 #[path = "proxy_manager_listener_e2e_tests.rs"]

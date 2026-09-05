@@ -8860,6 +8860,7 @@ dependencies = [
  "arc-swap",
  "async-trait",
  "bytes",
+ "core-foundation 0.9.4",
  "default-net",
  "garter",
  "hole-test-observability",
@@ -8870,6 +8871,7 @@ dependencies = [
  "skuld",
  "smoltcp",
  "socket2",
+ "system-configuration 0.7.0",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
@@ -8880,6 +8882,7 @@ dependencies = [
  "tun",
  "tun-engine-macros",
  "util",
+ "uuid",
  "windows 0.62.2",
  "wintun-bindings",
 ]

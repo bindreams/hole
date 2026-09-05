@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 
 use tokio_util::sync::CancellationToken;
 
-use crate::dns::system::{Dns, DnsApplied, DnsError};
+use crate::dns::system::{Dns, DnsApplied, DnsError, RoutedFamilies};
 
 /// One recorded [`Dns::apply`] call. `targets` is named generically — not
 /// `apply_aliases` — because it carries the single `TunIdentity`'s alias
@@ -82,6 +82,9 @@ impl Dns for MockDns {
     async fn apply(
         &self,
         advertise_ips: Vec<IpAddr>,
+        // Not yet recorded on `DnsApplyCall` — no test needs it today; add
+        // a field when one does (see bindreams/hole#850's plan, Task 5).
+        _routed: RoutedFamilies,
         tun: tun_engine::TunIdentity,
         server_ip: IpAddr,
         _cancel: CancellationToken,

@@ -465,8 +465,20 @@ jobs:
       # Upload bridge.log produced by `DistHarness` subprocesses. Matches
       # files that the test harness redirected to `$RUNNER_TEMP` (see
       # `crates/bridge/src/test_support/dist_harness.rs::new_tempdir`).
-      - name: Upload bridge logs on test failure
-        if: ${{ failure() || cancelled() }}
+      #
+      # Unconditional on darwin only: `hole_common::logging::init`'s file
+      # layer writes bridge.log continuously, independent of pass/fail —
+      # nextest's own capture-and-suppress-on-success behavior is what
+      # actually hides it, not the log itself being absent. A passing
+      # darwin TUN-lane run is the ONLY way to observe the macOS
+      # IPv6-assignment path's tracing output (`device/ipv6_addr/macos.rs`,
+      # refs #850/#868), which nothing asserts on, so gating this upload to
+      # failure-only would make a green run permanently unobservable there.
+      # Left failure-gated elsewhere: this doubles artifact-upload volume
+      # on every darwin run, which is an acceptable, narrow, one-platform
+      # cost for a real observability gap, not a blanket policy change.
+      - name: Upload bridge logs (darwin always; else on failure)
+        if: ${{ matrix.os == 'darwin' || failure() || cancelled() }}
         uses: actions/upload-artifact@v7
         with:
           name: bridge-logs-${{ matrix.os }}-${{ matrix.arch }}

@@ -1,5 +1,4 @@
-//! Session-level composition guard for the standing lockdown cover, Windows
-//! half.
+//! Session-level composition guard for the standing lockdown cover.
 //!
 //! `tun_engine`'s `live_tun_permit_privileged_tests` (crates/tun-engine)
 //! falsifies the cover's tunnel-permit rule directly: it opens two real TUN
@@ -9,32 +8,42 @@
 //! PRODUCTION path (`Dispatcher::new` -> `routing.install` ->
 //! `install_lockdown`), with the kill switch armed, still carries its own
 //! tunnel traffic, while a probe deliberately routed OFF the tunnel is
-//! blocked at the same instant.
+//! blocked at the same instant. Runs on both platforms Hole ships Full mode
+//! on (bindreams/hole#850, #874) — the elevated `tun` lane below gates it,
+//! and the bypass-route section further down is the one place the test body
+//! itself branches by platform (see that section's own doc for why).
 //!
-//! **What this honestly establishes, on Windows, and no more:**
+//! **What this honestly establishes, and no more:**
 //!
 //! 1. The composition `routing.install` -> `install_lockdown` -> a live
 //!    session does not block the session it is protecting.
 //! 2. The cover is demonstrably LIVE at that same instant (the off-tunnel
 //!    probe is blocked) — so (1) is not the trivial pass of an inert cover.
-//! 3. It will CATCH a stale/duplicate-adapter LUID mismatch or a future
-//!    refactor that decouples the dispatcher's TUN name from the one passed
-//!    to `install_lockdown`, if either occurs. It cannot DEMONSTRATE that it
-//!    would: `dispatcher.rs` sets `c.tun_name = TUN_DEVICE_NAME` and
-//!    `proxy_manager.rs` passes that SAME constant to `install_lockdown`, so
-//!    the two names cannot disagree by construction, and this test induces
-//!    no mutation. It is a composition guard, not a falsification test — the
-//!    interface-liveness falsification lives in `tun-engine`'s test. The
-//!    macOS half of THIS test, where the TUN name is discovered at runtime
-//!    rather than shared as a compile-time constant (so production CAN name
-//!    the wrong interface), does not exist yet: `Dispatcher::new` is not
-//!    reachable on macOS at all until macOS TUN naming becomes
-//!    runtime-discovered.
+//! 3. Whether it can CATCH a stale/duplicate-adapter identity mismatch or a
+//!    future refactor that decouples the dispatcher's TUN identity from the
+//!    one passed to `install_lockdown` splits by platform:
+//!    - **On Windows**, it cannot DEMONSTRATE that it would: `Dispatcher::new`
+//!      requests `TunName::Requested(WINDOWS_TUN_ALIAS)`, which `TunIdentity`
+//!      never reads back (bindreams/hole#850's read-back only happens under
+//!      `KernelAssigned`, macOS-only), so the same `TunIdentity`
+//!      `proxy_manager.rs` threads to `install_lockdown` carries that same
+//!      requested alias by construction — the two cannot disagree without a
+//!      bug in the threading itself, which this test does not induce. There
+//!      it is a pure composition guard, not a falsification test.
+//!    - **On macOS**, it CAN: `TunName::KernelAssigned` means
+//!      `identity().alias()` is read back from the specific device this
+//!      `Dispatcher::new` call opened (a fresh `utunN` most runs), not a
+//!      value every install shares. A future refactor that threads a
+//!      different `TunIdentity` — or the wrong one — to `install_lockdown`
+//!      would name a DIFFERENT live interface than the session's own, so the
+//!      tunnel-traffic probe (point 1) would fail against a cover that still
+//!      reports armed: a real, catchable divergence, not merely a
+//!      hypothetical one. This is the one respect in which the macOS run of
+//!      this test is strictly stronger than the Windows run.
 //!
-//! Gate: `cfg(target_os = "windows")` — `Dispatcher::new` sets
-//! `c.tun_name = TUN_DEVICE_NAME` unconditionally and the pinned `tun` crate
-//! rejects any macOS name not starting with `utun`, so a macOS Full-mode
-//! start dies before routes, before DNS, and before `install_lockdown` today.
+//!    Either way, the interface-liveness falsification itself (that the
+//!    permit rule is sensitive to which adapter it names at all) lives in
+//!    `tun-engine`'s test, not here.
 //!
 //! COUPLED NAME: the test name below contains the literal substring
 //! `live_tun_permit_`, which `.config/nextest.toml`'s `global_net_state`
@@ -45,6 +54,7 @@
 
 use std::net::{IpAddr, SocketAddr, TcpStream};
 use std::path::Path;
+use std::process::Command;
 use std::time::Duration;
 
 use crate::test_support::dist_fixture::*;
@@ -54,7 +64,7 @@ use crate::test_support::rt;
 use crate::test_support::skuld_fixtures::*;
 use hole_common::config::{DnsConfig, FilterAction, FilterRule, MatchType, ServerEntry};
 use hole_common::protocol::{BridgeRequest, BridgeResponse, ProxyConfig, TunnelMode};
-use tun_engine::test_utils::{classify, EscapeGuard, OwnedRoute, ProbeFate, RecordSpec};
+use tun_engine::test_utils::{classify, describe_output, EscapeGuard, OwnedRoute, ProbeFate, RecordSpec};
 use tun_engine::GatewayInfo;
 use util::port_alloc::Protocols;
 
@@ -127,23 +137,198 @@ fn probe_tunnel() -> ProbeFate {
 }
 
 // Bypass route ========================================================================================================
+//
+// Windows and non-Windows (macOS in practice — this crate ships Full mode
+// nowhere else) need genuinely different route shapes here, so this section
+// is the one place in this file that IS platform-conditional (branching via
+// `cfg!()`, same convention `tun_engine::test_utils::route` itself uses, so
+// both branches are typechecked on every target even though only one runs).
+//
+// Windows routes this through `OwnedRoute`'s `nexthop=` support — a genuine
+// gateway route there. `OwnedRoute::add`'s non-Windows path cannot express
+// the same thing: it is `-interface`-only (own module doc), which means
+// "this destination is directly reachable via this interface" — correct for
+// this crate's on-link TUN split routes, wrong for `8.8.8.8`, a real host
+// reached through a real gateway. Passing `Some(gw.gateway_ip)` there used
+// to trip that path's own `assert!(nexthop.is_none(), ...)` (a harness
+// assertion doing its job, left untouched); silently dropping to `None`
+// instead would have cleared the panic but still installed an on-link
+// route that cannot actually deliver a packet to `8.8.8.8` — a route the
+// kernel accepts (so a table read-back alone would not catch it) but this
+// test's own later real TCP connect to that same host would have (that
+// connect is exactly why this is a delivery bug, not merely a table-lookup
+// one). [`MacosGatewayRoute`] is the correct shape instead, matching
+// production's own mechanism verbatim: `tun_engine::routing`'s macOS
+// `platform_setup_commands` installs its `RouteId::ServerBypass` route the
+// same way — `route add -host <dest> <gateway-ip>`, gateway as a plain
+// positional argument, no `-interface`.
+
+/// Either owned bypass-route shape, so the caller need not match on
+/// platform again after installing one.
+enum Bypass {
+    Windows(OwnedRoute),
+    Gateway(MacosGatewayRoute),
+}
+
+impl Bypass {
+    fn winner_for(&self, dest: IpAddr) -> Result<String, String> {
+        match self {
+            Bypass::Windows(route) => route.winner_for(dest),
+            Bypass::Gateway(route) => route.winner_for(dest),
+        }
+    }
+
+    fn interface(&self) -> &str {
+        match self {
+            Bypass::Windows(route) => route.interface(),
+            Bypass::Gateway(route) => route.interface(),
+        }
+    }
+}
 
 /// Own only what we installed. Without this route, `8.8.8.8` is a TUNNEL
 /// destination under a Full-mode session (the `0.0.0.0/1` split), so the
 /// interface permit would correctly permit it. Longest-prefix match puts this
-/// `/32` ahead of the `/1` split once installed.
-fn install_bypass_route(gw: &GatewayInfo) -> OwnedRoute {
-    let route = OwnedRoute::add(
-        &format!("{NO_LEAK_TARGET_IP}/32"),
-        &gw.interface_name,
-        Some(gw.gateway_ip),
-    );
-    // Read the table back via the kernel's own lookup for the real
-    // destination — distinguishes "add failed" from "add succeeded but
-    // another route still wins a metric tiebreak". The route is already
-    // owned, so a panic here still removes it on the way out.
+/// `/32` (Windows) / host route (non-Windows) ahead of the `/1` split once
+/// installed.
+fn install_bypass_route(gw: &GatewayInfo) -> Bypass {
+    if cfg!(target_os = "windows") {
+        let route = OwnedRoute::add(
+            &format!("{NO_LEAK_TARGET_IP}/32"),
+            &gw.interface_name,
+            Some(gw.gateway_ip),
+        );
+        // Read the table back via the kernel's own lookup for the real
+        // destination — distinguishes "add failed" from "add succeeded but
+        // another route still wins a metric tiebreak". The route is already
+        // owned, so a panic here still removes it on the way out.
+        route.assert_wins_for(no_leak_target_ip());
+        return Bypass::Windows(route);
+    }
+    let route = MacosGatewayRoute::add(no_leak_target_ip(), gw);
     route.assert_wins_for(no_leak_target_ip());
-    route
+    Bypass::Gateway(route)
+}
+
+/// A gateway-routed host route for a real (non on-link) destination, added
+/// on `route add -host <dest> <gateway-ip>` — the macOS-shaped counterpart
+/// to `OwnedRoute`'s Windows `nexthop=` path; see the section doc above for
+/// why `OwnedRoute` itself cannot express this on non-Windows.
+///
+/// Duplicates macOS `route(8)`'s exit-0-on-failure oracle
+/// (`tun_engine::routing::macos_route_command_succeeded` /
+/// `macos_route_confirmed_absent`) rather than importing it — both are
+/// `pub(crate)` to `tun-engine`, unreachable from this crate — the same
+/// reason this file already duplicates its `DnsConfigNotify` harness from
+/// `tun_engine::dns_steer::privileged_tests` (see the module doc).
+struct MacosGatewayRoute {
+    dest: IpAddr,
+    gateway: IpAddr,
+    interface: String,
+}
+
+/// True if macOS `route(8)`'s own text confirms the mutation went through.
+/// `route(8)` exits 0 unconditionally even on a routing-socket failure; the
+/// only reliable signal is the stderr text `rtmsg()` prints — verified
+/// mechanism, see CONTRIBUTING's Route ownership section.
+fn macos_route_command_succeeded(out: &std::process::Output) -> bool {
+    out.status.success() && !String::from_utf8_lossy(&out.stderr).contains("writing to routing socket")
+}
+
+/// True if macOS `route(8)`'s own text confirms the route is now gone.
+/// Mirrors `macos_route_command_succeeded`'s doc: a delete failing because
+/// there was nothing to delete (`"not in table"`) still means the route is
+/// gone.
+fn macos_route_confirmed_absent(out: &std::process::Output) -> bool {
+    if !out.status.success() {
+        return false;
+    }
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    if !stderr.contains("writing to routing socket") {
+        return true;
+    }
+    stderr.contains("writing to routing socket: not in table")
+}
+
+impl MacosGatewayRoute {
+    fn add(dest: IpAddr, gw: &GatewayInfo) -> Self {
+        let out = Command::new("route")
+            .args(["-n", "add", "-host", &dest.to_string(), &gw.gateway_ip.to_string()])
+            .output()
+            .unwrap_or_else(|e| panic!("HARNESS: failed to spawn route add -host {dest} {}: {e}", gw.gateway_ip));
+        if !macos_route_command_succeeded(&out) {
+            panic!(
+                "HARNESS: adding gateway route for {dest} via {} failed: {}",
+                gw.gateway_ip,
+                describe_output(&out)
+            );
+        }
+        Self {
+            dest,
+            gateway: gw.gateway_ip,
+            interface: gw.interface_name.clone(),
+        }
+    }
+
+    /// Assert the kernel's OWN lookup for `dest` now leaves via this
+    /// route's interface — same rationale as `OwnedRoute::assert_wins_for`.
+    fn assert_wins_for(&self, dest: IpAddr) {
+        let winner = self.winner_for(dest).unwrap_or_else(|e| panic!("HARNESS: {e}"));
+        assert_eq!(
+            winner, self.interface,
+            "HARNESS: after adding a gateway route for {} via {}, traffic to {dest} would actually leave via \
+             '{winner}', not '{}' — a pre-existing route may be winning a metric tiebreak",
+            self.dest, self.gateway, self.interface
+        );
+    }
+
+    /// The interface the kernel would send `dest` out of, right now, or a
+    /// rendered diagnostic. Never panics — see `OwnedRoute::winner_for`.
+    fn winner_for(&self, dest: IpAddr) -> Result<String, String> {
+        let out = Command::new("route")
+            .args(["-n", "get", &dest.to_string()])
+            .output()
+            .map_err(|e| format!("failed to spawn route get: {e}"))?;
+        if !out.status.success() {
+            return Err(format!("route -n get {dest} failed: {}", describe_output(&out)));
+        }
+        let text = String::from_utf8_lossy(&out.stdout).into_owned();
+        text.lines()
+            .find_map(|l| l.trim().strip_prefix("interface:").map(|s| s.trim().to_string()))
+            .ok_or_else(|| format!("could not parse `route -n get {dest}` output:\n{text}"))
+    }
+
+    fn interface(&self) -> &str {
+        &self.interface
+    }
+}
+
+impl Drop for MacosGatewayRoute {
+    fn drop(&mut self) {
+        let out = Command::new("route")
+            .args([
+                "-n",
+                "delete",
+                "-host",
+                &self.dest.to_string(),
+                &self.gateway.to_string(),
+            ])
+            .output();
+        match out {
+            Ok(o) if macos_route_confirmed_absent(&o) => {}
+            Ok(o) => eprintln!(
+                "HARNESS: removing gateway route for {} via {} failed: {} — the host is left modified",
+                self.dest,
+                self.gateway,
+                describe_output(&o)
+            ),
+            Err(e) => eprintln!(
+                "HARNESS: failed to spawn the gateway route-delete command for {} via {}: {e} — the host is left \
+                 modified",
+                self.dest, self.gateway
+            ),
+        }
+    }
 }
 
 // The session-level test ==============================================================================================

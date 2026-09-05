@@ -63,6 +63,30 @@ assertable.
 cascade reads the filter decision, so DNS works even on a TCP-only plugin. See
 [DNS forwarder](#dns-forwarder).
 
+### TUN naming
+
+The running TUN device's name has exactly one source of truth at runtime:
+`tun_engine::device::TunIdentity`, read back from the device
+`Dispatcher::new` just opened. No other site may assume or hardcode a value —
+this replaced a real defect (bindreams/hole#850): Full mode could not start
+on macOS at all, because the dispatcher passed a fixed name to a platform
+that rejects one.
+
+- **Windows**: `TunName::Requested(WINDOWS_TUN_ALIAS)` —
+  `WINDOWS_TUN_ALIAS` is the fixed constant `"hole-tun"`
+  (`crates/bridge/src/proxy/config.rs`), so wintun creates an adapter under
+  that literal name every session. `TunIdentity` still exists on this
+  platform; reading it back is just redundant with the constant every other
+  caller already has.
+- **macOS**: `TunName::KernelAssigned` — the `tun` crate opens the first free
+  `/dev/tunN` and the kernel assigns the interface name (`utunN`); the
+  specific `N` is neither chosen nor predictable. `identity().alias()` is the
+  only way to learn which interface a given `Dispatcher::new` call opened,
+  and every macOS consumer that used to assume a fixed name — DNS apply
+  (`SystemDns::apply`, see [DNS forwarder](#dns-forwarder)) and the lockdown
+  TUN-interface permit (see [Lockdown mode](#lockdown-mode)) — now takes a
+  `TunIdentity` instead of a string literal.
+
 ### IPv6 in the tunnel
 
 IPv6 traverses the tunnel. The `::/1` + `8000::/1` split pair captures it,
@@ -70,16 +94,17 @@ IPv6 traverses the tunnel. The `::/1` + `8000::/1` split pair captures it,
 destination, and `Ipv6BypassUnreachable` is a **bypass**-only drop — a `Proxy`
 decision on a v6 flow goes to the proxy unconditionally.
 
-`hole-tun` holds `TUN_SUBNET6` twice: on the OS interface **and** in smoltcp's
-address list. Without the OS half a host with no global IPv6 anywhere has no
-source address for the `/1` routes, and every IPv6 flow fails instead of
-tunnelling. (A dual-stack host sources from the upstream adapter, which is why
-the gap is invisible there.)
+The TUN interface (see [TUN naming](#tun-naming)) holds `TUN_SUBNET6` twice:
+on the OS interface **and** in smoltcp's address list. Without the OS half a
+host with no global IPv6 anywhere has no source address for the `/1` routes,
+and every IPv6 flow fails instead of tunnelling. (A dual-stack host sources
+from the upstream adapter, which is why the gap is invisible there.)
 
 The ULA's 40-bit global ID is pseudo-randomly generated per RFC 4193 §3.2.2,
 not `fd00::`. That prefix is what WireGuard examples, Docker, Proxmox and NAS
-defaults hand out, and Hole's becomes a real on-link route on `hole-tun` — a
-collision would let the tunnel swallow the user's own ULA network.
+defaults hand out, and Hole's becomes a real on-link route on the TUN
+interface — a collision would let the tunnel swallow the user's own ULA
+network.
 
 **The interface's IPv6 half does not exist when the device is created.** The
 `tun` crate waits for the IPv4 half and deliberately not the IPv6 one, so
@@ -99,10 +124,15 @@ crate sets for the IPv4 address on every Full-mode start.
 
 **Assignment is fatal on Windows and warn-only on macOS.** A missing route is a
 leak; a missing address is a blackhole, and Windows is where the path is
-tested. The macOS path cannot run in production until the TUN naming issue is
-fixed and its only test is an argv-shape test, so a fatal failure there would
-first execute in a user's hands; it becomes fatal once it has run green on the
-darwin TUN lane. The tolerate predicate is **not** `ipv6_available`, which
+tested. The macOS TUN-naming defect that used to block Full mode from
+starting at all is fixed (bindreams/hole#850), and real tests now exercise
+this path there (`crates/tun-engine/src/dns_steer/privileged_tests.rs`,
+`crates/bridge/src/proxy_manager_macos_full_tunnel_privileged_tests.rs`) —
+but neither asserts anything about IPv6 assignment specifically, so the
+macOS IPv6 path's first real execution is still this PR's own darwin TUN CI
+lane. Whether a failure there should become fatal, matching Windows, is a
+decision still pending that run's result. The tolerate predicate is **not**
+`ipv6_available`, which
 measures upstream reachability — an independent question. Route-install
 fatality follows the same rule: **the IPv6 route adds are non-fatal exactly
 when the TUN has no IPv6 half**, measured by `gateway::tun_ipv6_available` at
@@ -191,30 +221,74 @@ privacy). The bridge carries DNS over the TCP tunnel:
 
 - [`DnsForwarder`](crates/bridge/src/dns/forwarder.rs) — bytes-in/out forwarder;
   PlainUdp / PlainTcp / DoT / DoH; preserves the client's transaction ID.
+
 - [`LocalDnsEndpoint`](crates/bridge/src/endpoint/local_dns.rs) — the in-TUN
   UDP/53 interceptor; the sole OS DNS path. OS adapter DNS is pointed at the
   configured resolver IPs (default `[1.1.1.1, 1.0.0.1]`), which route into
-  `hole-tun` via the `0.0.0.0/1` split route and are diverted to this endpoint
-  → `DnsForwarder` over the tunnel. OS TCP/53 to those IPs falls through the
-  proxy cascade to the real resolver's `:53` over the tunnel.
+  the TUN interface (see [TUN naming](#tun-naming)) via the `0.0.0.0/1` split
+  route and are diverted to this endpoint → `DnsForwarder` over the tunnel.
+  OS TCP/53 to those IPs falls through the proxy cascade to the real
+  resolver's `:53` over the tunnel.
+
 - [`Socks5Connector`](crates/bridge/src/dns/socks5_connector.rs) — routes the
   forwarder's upstream through the SS SOCKS5 listener so user `Block` rules can't
   strand the resolver (TCP via `tokio-socks`; UDP via hand-rolled UDP ASSOCIATE,
   RFC 1928).
+
 - [`SystemDns`](crates/bridge/src/dns/system.rs) — Hole writes DNS to no
-  adapter but `hole-tun`, the one it created (both v4 and v6 families, each
-  set from its own configured resolvers; a family with none is left
-  untouched). On Windows, egress on UDP+TCP port 53 is additionally confined
-  to that adapter by a WFP filter set
-  ([`tun_engine::dns_confine`](crates/tun-engine/src/dns_confine.rs)) — a
-  process-scoped dynamic FWPM session, not a persistent one, so it dies with
-  the bridge and needs no crash-recovery state. There is nothing to capture
-  and nothing to restore; the post-apply cache flush is fire-and-forget. See
-  [Crash recovery](#crash-recovery) for the one remaining, read-only use of
-  `bridge-dns.json`. Two residuals, disclosed rather than silently accepted:
-  DNS-over-HTTPS to an on-link resolver is indistinguishable from ordinary
-  HTTPS to that host, and DNS-over-TLS (port 853) is not confined — only
-  port 53 is.
+  adapter or service but the one belonging to the tunnel it created, and the
+  mechanism diverges by platform (bindreams/hole#868):
+
+  - **Windows**: DNS is set directly on the TUN adapter (`hole-tun`); v4 and
+    v6 families are set separately, each from its own configured resolvers,
+    and a family with none is left untouched. Egress on UDP+TCP port 53 is
+    additionally confined to that adapter by a WFP filter set
+    ([`tun_engine::dns_confine`](crates/tun-engine/src/dns_confine.rs)) — a
+    process-scoped dynamic FWPM session, not a persistent one, so it dies
+    with the bridge and needs no crash-recovery state.
+  - **macOS**: `networksetup`'s DNS subcommands take a network-*service*
+    name (e.g. "Wi-Fi"), never an interface name — passing the TUN
+    interface's name here was the original #868 defect, a guaranteed no-op,
+    since there is no service by that name to configure. Instead,
+    `apply_macos` publishes the (routed-family-filtered, see below)
+    resolvers as a supplemental resolver at a synthetic, session-scoped
+    `SCDynamicStore` key
+    ([`tun_engine::dns_steer`](crates/tun-engine/src/dns_steer.rs), the
+    mechanism validated by PR #877's spike): a dictionary naming a
+    nonexistent service (`{ ServerAddresses, SupplementalMatchDomains: [""], SearchOrder: 100000 }`) that configd merges as a resolver for
+    every query, ranked above its own default. The store session opens with
+    `session_keys(true)`, so the key is scoped to the bridge's own
+    dynamic-store session and configd discards it on session close —
+    including on `SIGKILL` — the macOS analogue of the Windows WFP
+    session's process-scoped lifetime. Nothing of the user's own DNS
+    configuration is ever read or captured, so there is nothing to restore
+    beyond removing that one key. `advertise_ips` is filtered to the
+    address families the tunnel is actually carrying (`RoutedFamilies`,
+    read once from the routes `Routing::install` just landed — never from
+    the TUN's own IPv6 read-back or the upstream gateway's IPv6
+    availability, which answer a different question; bindreams/hole#850's
+    plan, decision D4); an empty filtered list is refused rather than
+    silently advertising nothing.
+  - **Both platforms are fail-fatal**: since bindreams/hole#846 (Windows)
+    and bindreams/hole#868 (macOS), a failure to confine/steer aborts the
+    whole start rather than leaving a session the UI reports as connected
+    with a silent DNS leak. `crate::dns::system::phase`'s sealed
+    `DnsPhase`/`LeakBearing`/`Cosmetic` split enforces this in the type
+    system — mirroring `tun_engine::routing`'s `FatalPhase`/`BestEffortPhase`
+    — so a backend call is generic over which phase runs it, and
+    warn-and-continue for a leak-bearing call requires choosing `Cosmetic`
+    at the call site: a visible, reviewable act, not an available idiom.
+    Only the post-apply resolver-cache flush is `Cosmetic`.
+
+  There is nothing to capture and nothing to restore on either platform's
+  fresh-apply path; see [Crash recovery](#crash-recovery) for the one
+  remaining, read-only use of `bridge-dns.json` (undoing an older build's
+  own upstream-adapter DNS rewrite after a crash). Residuals, disclosed
+  rather than silently accepted: DNS-over-HTTPS to an on-link resolver is
+  indistinguishable from ordinary HTTPS to that host on either platform, and
+  on Windows DNS-over-TLS (port 853) is not confined — only port 53 is
+  (macOS's steering key has no per-port egress filter to evade in the first
+  place; it only supplies an additional resolver).
 
 `DnsConfig::default()` is `enabled: true`, `Https`, `[1.1.1.1, 1.0.0.1]` — and
 `AppConfig` is `#[serde(default)]`, so the forwarder enables silently on
@@ -1098,11 +1172,12 @@ reachability then depends on `remoteAddr` instead.
 
 The **standing lockdown cover** (`Routing::install_lockdown`, #527) is an
 opt-in, **default-off**, bridge-owned kill switch. When enabled it engages a
-persistent OS-level egress block permitting **only** loopback, the `hole-tun`
-interface, the onward server connection, and (Windows) the plugin + bridge
-binaries by App-ID — so normal traffic flows while connected and the block holds
-across a bridge restart for free. When disabled, behavior is byte-identical to a
-Hole without it.
+persistent OS-level egress block permitting **only** loopback, the TUN
+interface Hole created (`hole-tun` on Windows; a kernel-assigned `utunN`,
+identified at runtime via `TunIdentity`, on macOS), the onward server
+connection, and (Windows) the plugin + bridge binaries by App-ID — so normal
+traffic flows while connected and the block holds across a bridge restart for
+free. When disabled, behavior is byte-identical to a Hole without it.
 
 It contrasts with the [transient cutover cover](#transient-cutover-cover) on
 three axes:
@@ -1136,13 +1211,21 @@ re-resolved every engage via `LuidResolver`.
 The TUN-interface permit is proven against two real, live TUN devices
 (`crates/tun-engine/src/routing/failclosed/live_tun_permit_privileged_tests.rs`,
 both platforms): it passes traffic on the interface it names and is blocked
-when re-engaged naming a different live interface. On Windows, a session-level
-composition guard additionally proves an armed kill switch does not block its
-own session's tunnel traffic while blocking an off-tunnel probe
-(`crates/bridge/src/proxy_manager_live_tun_permit_e2e_tests.rs`); it is not a
-falsification test — the dispatcher's TUN name and the one passed to
-`install_lockdown` share one constant, so they cannot disagree — and its macOS
-counterpart, where the name is runtime-discovered, does not exist yet.
+when re-engaged naming a different live interface. A session-level composition
+guard additionally proves, on both platforms Hole ships Full mode on
+(`crates/bridge/src/proxy_manager_live_tun_permit_e2e_tests.rs`, bindreams/hole#874),
+that an armed kill switch does not block its own session's tunnel traffic
+while blocking an off-tunnel probe. Whether it can also CATCH a future
+decoupling between the dispatcher's TUN identity and the one passed to
+`install_lockdown` splits by platform: on Windows the requested name
+(`WINDOWS_TUN_ALIAS`) is a fixed constant every install shares, so the two
+cannot disagree without a bug in the threading itself, and the test is a pure
+composition guard there; on macOS the name is kernel-assigned and read back
+per session (bindreams/hole#850), so `identity().alias()` names the specific
+device that session's own `Dispatcher::new` call opened, and a refactor that
+threaded the wrong `TunIdentity` to `install_lockdown` would name a different
+live interface — a real, catchable divergence, making the macOS run strictly
+stronger.
 No test carries a packet to the internet through the tunnel: the in-process
 test server dials the client's own route table, so a tunnel-routed destination
 loops back and pf has no per-process matching to exempt the local server's own

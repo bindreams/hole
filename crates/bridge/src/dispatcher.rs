@@ -13,13 +13,17 @@ use std::time::Instant;
 use tokio::task::{AbortHandle, JoinHandle};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
+#[cfg(target_os = "macos")]
+use tun_engine::device::TunName;
 use tun_engine::{Assigned, Device, Engine, MutDeviceConfig, TunIdentity};
 
 use crate::drop_sink::LoggingDropSink;
 use crate::endpoint::{InterfaceEndpoint, LocalDnsEndpoint, Socks5Endpoint};
 use crate::filter::rules::RuleSet;
 use crate::hole_router::HoleRouter;
-use crate::proxy::{TUN_DEVICE_NAME, TUN_SUBNET, TUN_SUBNET6};
+#[cfg(target_os = "windows")]
+use crate::proxy::config::WINDOWS_TUN_ALIAS;
+use crate::proxy::{TUN_SUBNET, TUN_SUBNET6};
 
 /// How the spawned driver task ended, reported by `drain`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -127,7 +131,21 @@ impl Dispatcher {
 
         let built = build_or_cancel(cancel, move || {
             Device::build(|c: &mut MutDeviceConfig| {
-                c.tun_name = TUN_DEVICE_NAME.into();
+                // macOS's `utun` driver rejects any `Requested` name that
+                // doesn't already have the kernel's own `utunN` shape
+                // (bindreams/hole#850) — asking for the fixed
+                // `WINDOWS_TUN_ALIAS` there fails before Full mode can start
+                // at all. `KernelAssigned` instead asks the driver for the
+                // next free `utunN` and reads the real name back via
+                // `Device::identity` (`crate::proxy::config` doc).
+                #[cfg(target_os = "macos")]
+                {
+                    c.tun_name = TunName::KernelAssigned;
+                }
+                #[cfg(target_os = "windows")]
+                {
+                    c.tun_name = WINDOWS_TUN_ALIAS.into();
+                }
                 c.mtu = 1400;
                 c.ipv4 = Some(v4_cidr);
                 c.ipv6 = Some(v6_cidr);
@@ -378,3 +396,7 @@ impl Drop for Dispatcher {
 #[cfg(test)]
 #[path = "dispatcher_tests.rs"]
 mod dispatcher_tests;
+
+#[cfg(test)]
+#[path = "dispatcher_privileged_tests.rs"]
+mod dispatcher_privileged_tests;

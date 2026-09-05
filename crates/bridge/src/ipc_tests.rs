@@ -16,8 +16,8 @@ use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tun_engine::gateway::{GatewayInfo, NextHop};
 use tun_engine::routing::failclosed::lockdown_state;
-use tun_engine::routing::{self as routing, state as route_state, Routing};
-use tun_engine::RoutingError;
+use tun_engine::routing::{self as routing, state as route_state, RoutedFamilies, RoutesInstalled, Routing};
+use tun_engine::{RoutingError, TunIdentity};
 
 // MockProxy ===========================================================================================================
 
@@ -208,14 +208,14 @@ impl MockRouting {
 impl Routing for MockRouting {
     type Installed = MockRoutes;
 
-    fn install(&self, tun_name: &str, server_ip: IpAddr, gateway: &GatewayInfo) -> Result<MockRoutes, RoutingError> {
+    fn install(&self, tun: &TunIdentity, server_ip: IpAddr, gateway: &GatewayInfo) -> Result<MockRoutes, RoutingError> {
         let interface_name = gateway.interface_name.as_str();
         // Match SystemRouting ordering: write the state file BEFORE
         // any mutation, so tests that assert on `bridge-routes.json`
         // see the same write-then-clear lifecycle as production.
         let persisted = route_state::RouteState {
             version: route_state::SCHEMA_VERSION,
-            tun_name: tun_name.to_owned(),
+            tun_name: tun.alias().to_owned(),
             server_ip,
             interface_name: interface_name.to_owned(),
             original_gateway: Some(gateway.gateway_ip),
@@ -277,7 +277,7 @@ impl Routing for MockRouting {
     fn install_lockdown(
         &self,
         _server_ip: IpAddr,
-        _tun_name: &str,
+        _tun: &TunIdentity,
         _app_ids: &[PathBuf],
     ) -> Result<MockCover, RoutingError> {
         Ok(MockCover)
@@ -309,6 +309,15 @@ struct MockRoutes {
 impl Drop for MockRoutes {
     fn drop(&mut self) {
         let _ = route_state::clear(&self.state_dir);
+    }
+}
+
+impl RoutesInstalled for MockRoutes {
+    // `install` above always persists the full `planned_routes(server_ip)`
+    // set — this module's mock never simulates a partial install — so the
+    // families routed are always both.
+    fn routed_families(&self) -> RoutedFamilies {
+        RoutedFamilies { v4: true, v6: true }
     }
 }
 

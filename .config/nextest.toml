@@ -11,10 +11,14 @@ nextest-version = "0.9.130"
 # e2es drive live egress and install real split routes while the tun-engine
 # `windows_lockdown_permits_server_ip_and_blocks_other_egress` test holds a
 # system-wide block-all WFP cover. `max-threads = 1` makes nextest run the
-# whole group on one thread across binaries. On macOS the bridge TUN e2es are
-# `cfg(windows)` so there is no macOS bridge partner today; the
-# `macos_lockdown_permits_server_ip_...` pf test still joins the group for free
-# (and is auto-grouped against any future macOS bridge TUN e2e).
+# whole group on one thread across binaries. `mod tun`'s own Full-mode
+# roundtrip e2es stay `cfg(windows)` (out of scope by design, D5 of
+# bindreams/hole#850's plan), but the `live_tun_permit_` session-level
+# composition guard below is no longer one of them: as of bindreams/hole#874
+# (Task 7) it is un-gated and runs on macOS too, engaging a real standing
+# lockdown cover there — so the `macos_lockdown_permits_server_ip_...` pf test
+# now has a real macOS bridge partner in this group, not merely a
+# forward-compatible slot for one.
 #
 # COUPLED NAMES — the filter below matches tests BY NAME ONLY. A module-path
 # anchor is not available: skuld hands libtest-mimic the bare function name
@@ -23,14 +27,19 @@ nextest-version = "0.9.130"
 # nextest to select on. These names are load-bearing and must change in
 # lockstep with the filter:
 #   - `^e2e_…full_tunnel…` — EVERY test in either of the bridge's two `mod tun`
-#     blocks. Both set `TunnelMode::Full` and install real split routes, and
-#     every member must carry this naming shape or it silently leaves the group
-#     and loses the thread budget (mutual exclusion comes from `serial = TUN`
-#     on every member, not from group membership):
+#     blocks, plus the macOS-only OS-effects smoke test below. All set
+#     `TunnelMode::Full` and install real split routes, and every member must
+#     carry this naming shape or it silently leaves the group and loses the
+#     thread budget (mutual exclusion comes from `serial = TUN` on every
+#     member, not from group membership):
 #     crates/bridge/src/proxy_manager_e2e_tests.rs (4: the `_captures_
 #       unowned_destination` pair and the `_local_networking_intact` pair)
 #     crates/bridge/src/proxy_manager_listener_e2e_tests.rs (1:
 #       e2e_full_tunnel_local_udp_intact)
+#     crates/bridge/src/proxy_manager_macos_full_tunnel_privileged_tests.rs (1:
+#       e2e_macos_full_tunnel_installs_the_os_state_it_claims — refs #850,
+#       #868, #893; reads the OS's own interface list, routing table and
+#       resolver configuration back rather than round-tripping traffic)
 #     The `^e2e_` anchor is what keeps the unlabelled in-process unit test
 #     `forward_gives_every_resolver_the_full_tunnel_bound`
 #     (crates/bridge/src/dns/forwarder_tests.rs — same binary, name carries
@@ -69,6 +78,28 @@ nextest-version = "0.9.130"
 #   - `gateway_global_net_state_` prefix (creates a real wintun adapter to
 #     prove the upstream-route lookup can see an IfType 53 adapter):
 #     crates/tun-engine/tests/gateway_privileged.rs
+#   - `opens_a_kernel_assigned` substring (refs #850 — creates a real `utun`
+#     adapter with no requested name and reads the kernel-assigned one back
+#     via the OS's own interface-name table; NOT the bare `kernel_assigned`
+#     substring, which also matches the unlabelled unprivileged unit tests
+#     `kernel_assigned_alias_is_read_back` and
+#     `kernel_assigned_build_fails_when_the_device_cannot_report_its_name` in
+#     the same binary):
+#     crates/tun-engine/src/device/privileged_tests.rs
+#   - `dns_steer_global_net_state_` prefix (refs #868 — points the WHOLE
+#     MACHINE's DNS at a black-hole resolver for the test's duration via a
+#     real `SCDynamicStore` session, so it must never run beside another test
+#     that resolves a name):
+#     crates/tun-engine/src/dns_steer/privileged_tests.rs
+#   - `macos_dns_global_net_state_` prefix (refs #868 Task 2 Steps 2/2b — the
+#     raw session-key-lifetime probe and the SIGKILL crash-path probe; both
+#     publish a real synthetic-service DNS key, same reasoning as the prefix
+#     above):
+#     crates/tun-engine/tests/macos_session_key_lifetime_probe.rs
+#   - `dispatcher_opens_tun_` prefix (refs #850 — the production
+#     `Dispatcher::new` opens a real TUN device, and on macOS it is a
+#     kernel-assigned `utun` adapter with no fixed name):
+#     crates/bridge/src/dispatcher_privileged_tests.rs
 #   - `e2e_full_tunnel_local_udp_intact` — matched by the `^e2e_…full_tunnel…`
 #     anchor above, not by a term of its own. It carries
 #     `labels = [DIST_BIN, TUN], serial = TUN` in
@@ -98,7 +129,7 @@ nextest-version = "0.9.130"
 max-threads = 1
 
 [[profile.default.overrides]]
-filter = 'test(/^e2e_.*full_tunnel/) + test(/windows_lockdown_permits_server_ip_/) + test(/macos_lockdown_permits_server_ip_/) + test(/failclosed_permits_/) + test(/release_all_/) + test(/cutover_global_net_state_/) + test(/live_tun_permit_/) + test(/tun_device_ipv6_/) + test(/gateway_global_net_state_/) + test(/dns_confine_global_net_state_/)'
+filter = 'test(/^e2e_.*full_tunnel/) + test(/windows_lockdown_permits_server_ip_/) + test(/macos_lockdown_permits_server_ip_/) + test(/failclosed_permits_/) + test(/release_all_/) + test(/cutover_global_net_state_/) + test(/live_tun_permit_/) + test(/tun_device_ipv6_/) + test(/gateway_global_net_state_/) + test(/dns_confine_global_net_state_/) + test(/dns_steer_global_net_state_/) + test(/macos_dns_global_net_state_/) + test(/opens_a_kernel_assigned/) + test(/dispatcher_opens_tun_/)'
 test-group = 'global_net_state'
 
 # `driver_dns_tests.rs` / `driver_udp_tests.rs` / `driver_lifecycle_tests.rs`

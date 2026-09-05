@@ -937,6 +937,60 @@ fn install_returns_a_guard_when_every_setup_command_succeeds() {
     std::mem::forget(routes);
 }
 
+// `SystemRoutes::routed_families` =====================================================================================
+//
+// Ground truth for `hole_bridge::dns::system::Dns::apply`'s D4 filter: which
+// address families this guard's OWN `installed` set actually landed, read
+// directly off the field — no OS probe, no second measurement. Constructed
+// as a bare struct literal (not through `install_with`) because
+// `install_with`'s own fail-closed Rule #0 check rolls back and errors on
+// ANY narrowed `installed`, so it cannot produce a `SystemRoutes` with a
+// partial family set to assert against — the accessor is exercised for what
+// it reads, independent of whether today's `install` can currently hand it
+// a partial result (bindreams/hole#850's plan, Task 5, decision D4; see
+// `crates/tun-engine/src/routing.rs`'s `RoutesInstalled` doc). Every field
+// but `installed` is a placeholder — `routed_families` reads only that one.
+#[skuld::test]
+fn routed_families_reports_only_the_splits_that_landed() {
+    let tmp = tempfile::tempdir().unwrap();
+
+    let both = SystemRoutes {
+        tun_name: "hole-tun".into(),
+        server_ip: ipv4_server(),
+        interface_name: "en0".into(),
+        original_gateway: ipv4_gateway(),
+        route_form: state::RouteForm::Via,
+        state_dir: tmp.path().to_path_buf(),
+        owner: None,
+        installed: vec![
+            RouteId::SplitV4Low,
+            RouteId::SplitV4High,
+            RouteId::SplitV6Low,
+            RouteId::SplitV6High,
+        ],
+        stale: Vec::new(),
+    };
+    assert_eq!(both.routed_families(), RoutedFamilies { v4: true, v6: true });
+    // `SystemRoutes::drop` issues REAL netsh/route commands and a
+    // `Remove-NetAdapter`; the #165 contract forbids that from a unit test —
+    // same reasoning as `install_returns_a_guard_when_every_setup_command_succeeds`.
+    std::mem::forget(both);
+
+    let v4_only = SystemRoutes {
+        tun_name: "hole-tun".into(),
+        server_ip: ipv4_server(),
+        interface_name: "en0".into(),
+        original_gateway: ipv4_gateway(),
+        route_form: state::RouteForm::Via,
+        state_dir: tmp.path().to_path_buf(),
+        owner: None,
+        installed: vec![RouteId::SplitV4Low, RouteId::SplitV4High],
+        stale: Vec::new(),
+    };
+    assert_eq!(v4_only.routed_families(), RoutedFamilies { v4: true, v6: false });
+    std::mem::forget(v4_only);
+}
+
 // Phase classification ================================================================================================
 //
 // Nothing to test at runtime. Each runner accepts only its own phase type, and
@@ -962,7 +1016,7 @@ fn recover_without_state_file_is_a_noop() {
     recover_routes_with(
         tmp.path(),
         None,
-        "hole-tun",
+        Some("hole-tun"),
         capturing_runner(&log),
         |_, _| {},
         failclosed::lockdown_state::Intent::Off,
@@ -994,7 +1048,7 @@ fn recover_with_state_file_runs_split_then_bypass_then_clears() {
     recover_routes_with(
         tmp.path(),
         None,
-        "hole-tun",
+        Some("hole-tun"),
         capturing_runner(&log),
         |_, _| {},
         failclosed::lockdown_state::Intent::Off,
@@ -1053,7 +1107,7 @@ fn recover_with_loopback_server_skips_bypass() {
     recover_routes_with(
         tmp.path(),
         None,
-        "hole-tun",
+        Some("hole-tun"),
         capturing_runner(&log),
         |_, _| {},
         failclosed::lockdown_state::Intent::Off,
@@ -1098,7 +1152,7 @@ fn recover_keeps_state_file_when_every_command_fails_to_spawn() {
     recover_routes_with(
         tmp.path(),
         None,
-        "hole-tun",
+        Some("hole-tun"),
         failing,
         |_, _| {},
         failclosed::lockdown_state::Intent::Off,
@@ -1139,7 +1193,7 @@ fn recover_narrows_the_state_file_to_the_command_that_failed_to_spawn() {
     recover_routes_with(
         tmp.path(),
         None,
-        "hole-tun",
+        Some("hole-tun"),
         failing_one,
         |_, _| {},
         failclosed::lockdown_state::Intent::Off,
@@ -1182,7 +1236,7 @@ fn recover_drops_an_unplannable_id_instead_of_looping_forever() {
     recover_routes_with(
         tmp.path(),
         None,
-        "hole-tun",
+        Some("hole-tun"),
         capturing_runner(&log),
         |_, _| {},
         failclosed::lockdown_state::Intent::Off,
@@ -1206,7 +1260,7 @@ fn recover_invokes_cover_sweep_even_without_route_state() {
     recover_routes_with(
         tmp.path(),
         None,
-        "hole-tun",
+        Some("hole-tun"),
         capturing_runner(&log),
         |_, _| swept.set(true),
         failclosed::lockdown_state::Intent::Off,
@@ -1230,7 +1284,7 @@ fn recover_sweeps_lockdown_when_intent_off_and_present() {
     recover_routes_with(
         tmp.path(),
         None,
-        "hole-tun",
+        Some("hole-tun"),
         capturing_runner(&log),
         |_, _| {},
         failclosed::lockdown_state::Intent::Off,
@@ -1248,7 +1302,7 @@ fn recover_adopts_lockdown_when_intent_on_and_present() {
     recover_routes_with(
         tmp.path(),
         None,
-        "hole-tun",
+        Some("hole-tun"),
         capturing_runner(&log),
         |_, _| {},
         failclosed::lockdown_state::Intent::On,
@@ -1267,7 +1321,7 @@ fn recover_lockdown_noop_when_cover_absent() {
     recover_routes_with(
         tmp.path(),
         None,
-        "hole-tun",
+        Some("hole-tun"),
         capturing_runner(&log),
         |_, _| {},
         failclosed::lockdown_state::Intent::On,
@@ -1288,7 +1342,7 @@ fn recover_orders_lockdown_before_transient_sweep_and_passes_adopting() {
     recover_routes_with(
         dir.path(),
         None,
-        "hole-tun",
+        Some("hole-tun"),
         |_cmd, _phase| Ok(()),
         |_state_dir, adopting| {
             order.borrow_mut().push("sweep_cover");
@@ -1450,7 +1504,7 @@ fn recover_passes_adopting_only_on_adopt() {
         recover_routes_with(
             dir.path(),
             None,
-            "hole-tun",
+            Some("hole-tun"),
             |_c, _p| Ok(()),
             |_d, adopting| *adopting_seen.borrow_mut() = Some(adopting),
             intent,
@@ -1524,7 +1578,7 @@ fn recover_over(dir: &Path, presence: CoverPresence) -> (Recovery, Option<CoverR
     let decision = recover_routes_with(
         dir,
         None,
-        "hole-tun",
+        Some("hole-tun"),
         |_c, _p| Ok(()),
         |_d, _a| {},
         failclosed::lockdown_state::load_intent(dir),
@@ -1565,7 +1619,7 @@ fn recover_records_the_intent_before_acting_on_it() {
     recover_routes_with(
         dir.path(),
         None,
-        "hole-tun",
+        Some("hole-tun"),
         |_c, _p| Ok(()),
         |_d, _a| {},
         failclosed::lockdown_state::load_intent(dir.path()),
@@ -1649,7 +1703,7 @@ fn recover_prefers_its_own_route_state_tun_name_over_the_fallback() {
     recover_routes_with(
         dir.path(),
         None,
-        "hole-tun-fallback",
+        Some("hole-tun-fallback"),
         |_c, _p| Ok(()),
         |_d, _a| {},
         Intent::On,
@@ -1677,7 +1731,7 @@ fn recover_falls_back_to_the_given_tun_name_when_no_route_state_exists() {
     recover_routes_with(
         dir.path(),
         None,
-        "hole-tun-fallback",
+        Some("hole-tun-fallback"),
         |_c, _p| Ok(()),
         |_d, _a| {},
         Intent::On,
@@ -1700,7 +1754,7 @@ fn recover_returns_its_decision() {
         let returned = recover_routes_with(
             dir.path(),
             None,
-            "hole-tun",
+            Some("hole-tun"),
             |_c, _p| Ok(()),
             |_d, _a| {},
             intent,
@@ -1913,7 +1967,7 @@ fn recovery_deletes_only_the_recorded_routes() {
     recover_routes_with(
         tmp.path(),
         None,
-        "hole-tun",
+        Some("hole-tun"),
         capturing_runner(&log),
         |_, _| {},
         failclosed::lockdown_state::Intent::Off,
@@ -1956,7 +2010,7 @@ fn recovery_bypass_phase_does_not_repeat_the_split_deletes() {
     recover_routes_with(
         tmp.path(),
         None,
-        "hole-tun",
+        Some("hole-tun"),
         capturing_runner(&log),
         |_, _| {},
         failclosed::lockdown_state::Intent::Off,
@@ -2012,7 +2066,7 @@ fn recover_attempts_a_stale_group_and_clears_the_file_once_everything_drains() {
     recover_routes_with(
         tmp.path(),
         None,
-        "hole-tun",
+        Some("hole-tun"),
         capturing_runner(&log),
         |_, _| {},
         failclosed::lockdown_state::Intent::Off,
@@ -2073,7 +2127,7 @@ fn recover_keeps_the_file_when_only_the_stale_group_fails_to_confirm_gone() {
     recover_routes_with(
         tmp.path(),
         None,
-        "hole-tun",
+        Some("hole-tun"),
         runner,
         |_, _| {},
         failclosed::lockdown_state::Intent::Off,
@@ -3067,7 +3121,7 @@ fn recovery_never_issues_the_same_split_delete_twice_across_groups() {
     recover_routes_with(
         tmp.path(),
         None,
-        "hole-tun",
+        Some("hole-tun"),
         capturing_runner(&log),
         |_, _| {},
         failclosed::lockdown_state::Intent::Off,
@@ -3125,7 +3179,7 @@ fn recovery_never_issues_the_same_macos_split_delete_twice_across_different_tun_
     recover_routes_with(
         tmp.path(),
         None,
-        "hole-tun",
+        Some("hole-tun"),
         capturing_runner(&log),
         |_, _| {},
         failclosed::lockdown_state::Intent::Off,
@@ -3143,6 +3197,77 @@ fn recovery_never_issues_the_same_macos_split_delete_twice_across_different_tun_
         1,
         "macOS ignores tun_name in the delete argv, so two differently-named groups must still \
          dedupe to one command: {log:?}"
+    );
+}
+
+/// macOS's bypass delete argv is `route -n delete -host <server_ip>` alone
+/// (see `platform_bypass_teardown_command`'s doc) — it embeds no `tun_name`,
+/// `interface_name`, or gateway. Two crashed sessions to the SAME server
+/// differ only in `tun_name` (kernel-assigned per open, so every pair of
+/// crashed macOS sessions to one server looks exactly like this), yet
+/// `state::coalesce` does not merge them — `tun_name` is part of a group's
+/// identity. Without dedup, recovery would re-issue the bypass delete once
+/// per group: the second occurrence removes whatever a third party claimed
+/// after the first delete freed the host route (see CONTRIBUTING's Route
+/// ownership section). The one confirmed delete must also narrow BOTH
+/// groups — its argv is shared, so its outcome applies to both.
+#[cfg(target_os = "macos")]
+#[skuld::test]
+fn recover_groups_issues_one_bypass_delete_for_two_unmerged_groups() {
+    let tmp = tempfile::tempdir().unwrap();
+    state::save(
+        tmp.path(),
+        &RouteState {
+            version: state::SCHEMA_VERSION,
+            tun_name: "utun7".into(),
+            server_ip: ipv4_server(),
+            interface_name: "en0".into(),
+            original_gateway: Some(ipv4_gateway()),
+            route_form: state::RouteForm::Via,
+            installed: vec![RouteId::ServerBypass],
+            stale: vec![state::StaleRecord {
+                tun_name: "utun9".into(),
+                server_ip: ipv4_server(),
+                interface_name: "en0".into(),
+                original_gateway: Some(ipv4_gateway()),
+                route_form: state::RouteForm::Via,
+                installed: vec![RouteId::ServerBypass],
+            }],
+        },
+        None,
+    )
+    .unwrap();
+
+    let log: RefCell<Captured> = RefCell::new(Vec::new());
+    recover_routes_with(
+        tmp.path(),
+        None,
+        Some("hole-tun"),
+        capturing_runner(&log),
+        |_, _| {},
+        failclosed::lockdown_state::Intent::Off,
+        || CoverPresence::Absent,
+        |_, _| {},
+    );
+
+    let log = log.into_inner();
+    let bypass_deletes: Vec<_> = commands_in_phase(&log, BestEffortPhase::RecoverBypass)
+        .into_iter()
+        .filter(|cmd| cmd.iter().any(|a| a == &ipv4_server().to_string()))
+        .collect();
+    assert_eq!(
+        bypass_deletes.len(),
+        1,
+        "two groups differing only in tun_name must dedupe to one bypass delete, not one per \
+         group: {log:?}"
+    );
+
+    // The single confirmed delete narrows BOTH groups, so the whole record
+    // (primary `installed` plus the one `stale` group) drains and the state
+    // file is cleared — exactly as it would for a single-group case.
+    assert!(
+        !tmp.path().join(STATE_FILE_NAME).exists(),
+        "both groups must be narrowed by the shared delete's confirmation, clearing the state file: {log:?}"
     );
 }
 

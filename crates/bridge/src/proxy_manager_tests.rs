@@ -18,8 +18,8 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tun_engine::gateway::{GatewayInfo, NextHop};
 use tun_engine::routing::failclosed::lockdown_state;
-use tun_engine::routing::{self, state as route_state, RouteId, Routing};
-use tun_engine::RoutingError;
+use tun_engine::routing::{self, state as route_state, RouteId, RoutedFamilies, RoutesInstalled, Routing};
+use tun_engine::{RoutingError, TunIdentity};
 
 // MockProxy ===========================================================================================================
 
@@ -185,6 +185,13 @@ pub(super) struct MockRoutingState {
     /// Last `server_ip` passed to `install`, so a test can assert the bypass
     /// route received the DoH-resolved IP (not a system-resolved one).
     last_install_server_ip: std::sync::Mutex<Option<IpAddr>>,
+    /// `tun.alias()` from the last `install` call — lets a test assert it
+    /// matches what `install_lockdown` and `Dns::apply` were handed from the
+    /// SAME `TunIdentity` (bindreams/hole#850's plan, Task 5, Step 2).
+    last_install_tun_alias: std::sync::Mutex<Option<String>>,
+    /// `tun.alias()` from the last `install_lockdown` call — see
+    /// `last_install_tun_alias`.
+    last_lockdown_tun_alias: std::sync::Mutex<Option<String>>,
     /// Last `server_ip` passed to `install_failclosed_cover`, so a test can assert
     /// the cover permits exactly the resolved server IP.
     last_cover_server_ip: std::sync::Mutex<Option<IpAddr>>,
@@ -228,6 +235,8 @@ impl Default for MockRoutingState {
             fail_release: AtomicBool::new(false),
             teardown_order: std::sync::Mutex::new(Vec::new()),
             last_install_server_ip: std::sync::Mutex::new(None),
+            last_install_tun_alias: std::sync::Mutex::new(None),
+            last_lockdown_tun_alias: std::sync::Mutex::new(None),
             last_cover_server_ip: std::sync::Mutex::new(None),
             last_cover_resolver_ip: std::sync::Mutex::new(None),
             fail_cover_for_resolvers: std::sync::Mutex::new(std::collections::HashSet::new()),
@@ -302,10 +311,12 @@ impl MockRouting {
 impl Routing for MockRouting {
     type Installed = MockRoutes;
 
-    fn install(&self, tun_name: &str, server_ip: IpAddr, gateway: &GatewayInfo) -> Result<MockRoutes, RoutingError> {
+    fn install(&self, tun: &TunIdentity, server_ip: IpAddr, gateway: &GatewayInfo) -> Result<MockRoutes, RoutingError> {
+        let tun_name = tun.alias();
         let interface_name = gateway.interface_name.as_str();
         self.state.install_calls.fetch_add(1, Ordering::SeqCst);
         *self.state.last_install_server_ip.lock().unwrap() = Some(server_ip);
+        *self.state.last_install_tun_alias.lock().unwrap() = Some(tun_name.to_owned());
 
         // Narrowed by `fail_routes_for` — a real partial install (e.g.
         // another VPN already holding one of the split prefixes) never
@@ -428,12 +439,13 @@ impl Routing for MockRouting {
     fn install_lockdown(
         &self,
         _server_ip: IpAddr,
-        _tun_name: &str,
+        tun: &TunIdentity,
         _app_ids: &[std::path::PathBuf],
     ) -> Result<MockCover, RoutingError> {
         if self.state.fail_lockdown.load(Ordering::SeqCst) {
             return Err(RoutingError::RouteSetup("mock lockdown failure".into()));
         }
+        *self.state.last_lockdown_tun_alias.lock().unwrap() = Some(tun.alias().to_owned());
         self.state.lockdown_engage_calls.fetch_add(1, Ordering::SeqCst);
         Ok(MockCover {
             state: Arc::clone(&self.state),
@@ -463,6 +475,19 @@ impl Drop for MockRoutes {
         self.state.teardown_order.lock().unwrap().push("routes");
         *self.state.last_teardown_installed.lock().unwrap() = Some(self.installed.clone());
         let _ = route_state::clear(&self.state_dir);
+    }
+}
+
+impl RoutesInstalled for MockRoutes {
+    // Mirrors `SystemRoutes::routed_families` exactly, reading the same
+    // `installed: Vec<RouteId>` shape `MockRouting::install` populates
+    // above (narrowed by `fail_routes_for` under the same fail-closed
+    // contract `SystemRouting::install` upholds).
+    fn routed_families(&self) -> RoutedFamilies {
+        RoutedFamilies {
+            v4: self.installed.contains(&RouteId::SplitV4Low) && self.installed.contains(&RouteId::SplitV4High),
+            v6: self.installed.contains(&RouteId::SplitV6Low) && self.installed.contains(&RouteId::SplitV6High),
+        }
     }
 }
 
@@ -507,7 +532,11 @@ fn mock_install_lockdown_records_engage_and_drop_records_disengage() {
     let state = routing.state();
 
     let cover = routing
-        .install_lockdown(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), "hole-tun", &[])
+        .install_lockdown(
+            IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)),
+            &TunIdentity::synthetic(0xFEED, "hole-tun"),
+            &[],
+        )
         .expect("lockdown engages");
     assert_eq!(state.lockdown_engage_calls.load(Ordering::SeqCst), 1);
     // The transient-cover counter must NOT move — the two covers are distinct.
@@ -525,7 +554,11 @@ fn mock_failing_lockdown_returns_err_without_recording() {
     let routing = MockRouting::failing_lockdown(dir.path().to_path_buf());
     let state = routing.state();
 
-    let result = routing.install_lockdown(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), "hole-tun", &[]);
+    let result = routing.install_lockdown(
+        IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)),
+        &TunIdentity::synthetic(0xFEED, "hole-tun"),
+        &[],
+    );
     assert!(result.is_err(), "failing_lockdown must return Err");
     assert_eq!(state.lockdown_engage_calls.load(Ordering::SeqCst), 0);
 }
@@ -691,6 +724,78 @@ fn start_reaches_dns_apply_when_the_forwarder_answers() {
         pm.start(&config).await.unwrap();
 
         assert_eq!(dns_state.calls().len(), 1, "Dns::apply must be called exactly once");
+
+        pm.stop().await.unwrap();
+    });
+}
+
+/// Call-site wiring only — NOT a naming regression guard. Under
+/// `#[cfg(test)]`, `start_inner` builds its `TunIdentity` from
+/// `TunIdentity::synthetic(0xFEED, WINDOWS_TUN_ALIAS)` (`proxy_manager.rs`)
+/// rather than the real device-discovery path, so this test cannot catch a
+/// regression in macOS's real kernel-assigned naming (Task 8's privileged
+/// smoke is the only test that can). What it DOES prove: `Routing::install`,
+/// `Routing::install_lockdown`, and `Dns::apply` are all handed the SAME
+/// `TunIdentity`'s alias from one Full-mode start with the standing lockdown
+/// engaged — the three signatures accepting `&TunIdentity` (bindreams/hole#850's
+/// plan, Task 5) is what makes passing three DIFFERENT names a compile error
+/// rather than a runtime drift only a privileged test would catch.
+#[skuld::test]
+fn install_and_lockdown_name_the_device_dns_was_given() {
+    rt().block_on(async {
+        let upstream = crate::test_support::socks5_dns_upstream::Socks5DnsUpstream::bind()
+            .await
+            .unwrap();
+        let dns = crate::test_support::mock_dns::MockDns::new();
+        let dns_state = dns.state_handle();
+
+        let dir = tempfile::tempdir().unwrap();
+        lockdown_state::set_enabled(dir.path(), true, None).unwrap();
+        let routing = MockRouting::new(dir.path().to_path_buf());
+        let routing_state = routing.state();
+        let (pm, dir) = new_manager_with_dns(MockProxy::new(), routing, dns, dir);
+        let mut pm = pm.with_state_dir(dir.path().to_path_buf());
+        assert!(
+            pm.standing_cover_expected(),
+            "HARNESS: the lockdown intent set above must make install_lockdown reachable"
+        );
+
+        let mut config = test_config();
+        config.local_port = upstream.port();
+        config.dns.enabled = true;
+        config.dns.protocol = hole_common::config::DnsProtocol::PlainTcp;
+        config.dns.servers = vec![IpAddr::V4(Ipv4Addr::new(198, 51, 100, 53))];
+
+        pm.start(&config).await.unwrap();
+
+        let install_alias = routing_state
+            .last_install_tun_alias
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("install must have been called");
+        let lockdown_alias = routing_state
+            .last_lockdown_tun_alias
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("install_lockdown must have been called (standing_cover_expected() was true)");
+        let dns_calls = dns_state.calls();
+        assert_eq!(dns_calls.len(), 1, "Dns::apply must be called exactly once");
+        let dns_alias = dns_calls[0]
+            .targets
+            .first()
+            .cloned()
+            .expect("Dns::apply must have been handed a target alias");
+
+        assert_eq!(
+            install_alias, lockdown_alias,
+            "install and install_lockdown must name the SAME device"
+        );
+        assert_eq!(
+            install_alias, dns_alias,
+            "Dns::apply must be handed the SAME device install/install_lockdown named"
+        );
 
         pm.stop().await.unwrap();
     });
@@ -1898,7 +2003,7 @@ fn reload_when_not_running_starts() {
 #[skuld::test]
 fn dns_apply_emits_done_info_log() {
     use crate::dns::system::windows::{DnsConfiner, WinDnsBackend};
-    use crate::dns::system::{Dns, DnsApplied, SystemDns};
+    use crate::dns::system::{Dns, DnsApplied, RoutedFamilies, SystemDns};
     use crate::dns_state::{AdapterId, DnsPrior, DnsPriorAdapter};
     use crate::test_support::log_capture::VecWriter;
     use std::net::{IpAddr, Ipv4Addr};
@@ -1964,6 +2069,7 @@ fn dns_apply_emits_done_info_log() {
             let mut applied = dns
                 .apply(
                     vec![IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))],
+                    RoutedFamilies { v4: true, v6: true },
                     tun_engine::TunIdentity::synthetic(0xFEED, "hole-tun"),
                     IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7)),
                     CancellationToken::new(),

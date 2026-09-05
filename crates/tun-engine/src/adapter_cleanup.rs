@@ -15,33 +15,63 @@
 //! utun adapter auto-cleans on FD close (no equivalent leak), so this
 //! is a no-op there.
 
+/// Build the PowerShell script [`remove_adapter`] executes. Extracted so the
+/// escaping is unit-testable without spawning PowerShell or touching a real
+/// adapter. `cfg`-gated to Windows-or-test rather than bare `windows`:
+/// production has exactly one caller, [`remove_adapter`] (Windows-only), but
+/// the escaping is also exercised directly by `adapter_cleanup_tests.rs` on
+/// every platform — same convention as `identity::classify_incumbent`.
+///
+/// `tun_name` reaches a **single-quoted** PowerShell string, where a literal
+/// `'` is the one character still given meaning (everything else, including
+/// a space or a newline, is literal content): it must be doubled (`''`) to
+/// escape it, or it would terminate the string early and let the remainder
+/// be evaluated as PowerShell. A space is passed straight through, never
+/// refused: `hole-tun 2` (#936's disambiguated alias) is real production
+/// input, and refusing it would skip cleanup and leak the adapter — worse
+/// than the injection this guards against.
+#[cfg(any(target_os = "windows", test))]
+fn build_remove_adapter_script(tun_name: &str) -> String {
+    let escaped = tun_name.replace('\'', "''");
+    // `-ErrorAction SilentlyContinue` on Get-NetAdapter swallows the
+    // "no MSFT_NetAdapter objects found" error so the pipe's overall
+    // exit code is 0 when nothing matches (the dominant case after a
+    // clean stop — `Dispatcher::drop` already released the adapter).
+    format!(
+        "Get-NetAdapter -Name '{tun}*' -ErrorAction SilentlyContinue | \
+         ForEach-Object {{ Remove-NetAdapter -Name $_.Name -Confirm:$false -ErrorAction SilentlyContinue }}",
+        tun = escaped,
+    )
+}
+
 #[cfg(target_os = "windows")]
 pub fn remove_adapter(tun_name: &str) {
     use std::process::Command;
     use tracing::{debug, warn};
 
-    // Guard against PowerShell injection. The only production caller
-    // passes the const `TUN_DEVICE_NAME = "hole-tun"`, so this assert
-    // never fires in practice — it's a structural guarantee against a
-    // future caller that interpolates user input. PowerShell uses
-    // single-quote strings (no expansion) but a literal `'` would
-    // terminate the string and the rest would be evaluated as PowerShell.
+    // Provenance canary, not a charset filter — `build_remove_adapter_script`
+    // itself now escapes any `'` safely, so this is not standing in for that,
+    // and a prefix/charset check on `tun_name` was tried and reverted: this
+    // function's callers are not only production's `WINDOWS_TUN_ALIAS`/its
+    // #936-disambiguated siblings (`"hole-tun 2"`, ...) but also the
+    // privileged tests in `device::ipv6_addr_privileged_tests` and
+    // `net::metric_privileged_tests`, whose device names are deliberately
+    // `"ipv6t-hole"`/`"metrict-hole"` — chosen specifically to NOT match
+    // `hole-tun*`, so a live production sweep can't delete them out from
+    // under a concurrent test (see those modules' docs). No shared prefix or
+    // charset exists across every legitimate caller, so the one invariant
+    // actually true of all of them — and the one whose violation is
+    // genuinely dangerous — is checked instead: an empty name turns the glob
+    // at `'{tun}*'` below into `'*'`, matching and deleting *every* adapter
+    // on the machine, not just Hole's own. A caller reaching here with no
+    // real device identity is exactly "provenance drifted".
     debug_assert!(
-        tun_name
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'),
-        "tun_name must be alphanumeric/-/_; got {tun_name:?}"
+        !tun_name.is_empty(),
+        "adapter_cleanup's provenance assumption drifted: an empty tun_name \
+         would glob-match and delete every adapter on the machine"
     );
 
-    // `-ErrorAction SilentlyContinue` on Get-NetAdapter swallows the
-    // "no MSFT_NetAdapter objects found" error so the pipe's overall
-    // exit code is 0 when nothing matches (the dominant case after a
-    // clean stop — `Dispatcher::drop` already released the adapter).
-    let ps = format!(
-        "Get-NetAdapter -Name '{tun}*' -ErrorAction SilentlyContinue | \
-         ForEach-Object {{ Remove-NetAdapter -Name $_.Name -Confirm:$false -ErrorAction SilentlyContinue }}",
-        tun = tun_name,
-    );
+    let ps = build_remove_adapter_script(tun_name);
 
     let result = Command::new("powershell")
         .args(["-NoProfile", "-Command", &ps])

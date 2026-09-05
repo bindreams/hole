@@ -69,6 +69,7 @@ pub(crate) const GLOBAL_NET_STATE: skuld::Label;
 pub mod adapter_cleanup;
 pub mod device;
 pub mod dns_confine;
+pub mod dns_steer;
 pub mod engine;
 pub mod error;
 pub mod gateway;
@@ -90,4 +91,4 @@ pub use engine::{
 };
 pub use error::{DeviceError, EngineError, RouteCommandError, RoutingError};
 pub use gateway::{get_default_gateway_info, GatewayInfo};
-pub use routing::{Routing, SystemRoutes, SystemRouting};
+pub use routing::{RoutedFamilies, RoutesInstalled, Routing, SystemRoutes, SystemRouting};

@@ -662,9 +662,15 @@ where
 /// would re-delete whatever claimed the freed prefix in the interim (see
 /// CONTRIBUTING's Route ownership section), so each distinct split argv runs
 /// at most once here and its confirmation narrows every group that named it.
-/// Bypass commands embed `server_ip`, so no analogous collision is possible
-/// there. `checkpoint` receives the full narrowed group list after every
-/// command. Shared by [`recover_routes_with`] (primary record + `stale`) and
+/// The bypass loop below gets the identical treatment: on macOS the bypass
+/// delete embeds only `server_ip` — not `tun_name`, `interface_name`, or a
+/// gateway (see `platform_bypass_teardown_command`'s doc) — so two crashed
+/// sessions to the SAME server produce the identical bypass argv even though
+/// they differ in `tun_name` (what every pair of crashed macOS sessions to
+/// one server now looks like, since `utunN` is kernel-assigned per open);
+/// Windows' bypass argv is likewise silent on `tun_name`. `checkpoint`
+/// receives the full narrowed group list after every command. Shared by
+/// [`recover_routes_with`] (primary record + `stale`) and
 /// [`sweep_leftover_before_install`] (`stale` alone) — the sole place either
 /// path actually spawns/scripts a teardown command.
 fn recover_groups<R>(
@@ -702,6 +708,7 @@ where
         }
     }
 
+    let mut issued_bypass_argv: Vec<Vec<String>> = Vec::new();
     for i in 0..groups.len() {
         let cmds: Vec<RouteCommand> = platform_bypass_teardown_command(
             groups[i].server_ip,
@@ -710,11 +717,29 @@ where
             groups[i].route_form,
         )
         .into_iter()
-        .filter(|c| groups[i].installed.contains(&c.id))
+        .filter(|c| groups[i].installed.contains(&c.id) && !issued_bypass_argv.contains(&c.argv))
         .collect();
         for cmd in cmds {
+            issued_bypass_argv.push(cmd.argv.clone());
             if run_teardown_command(&cmd, BestEffortPhase::RecoverBypass, runner) {
-                groups[i].installed.retain(|id| *id != cmd.id);
+                // The command's argv is keyed on server_ip (plus, on
+                // Windows, interface_name/gateway/route_form) alone — never
+                // tun_name — so narrow every group whose own bypass command
+                // would be the identical argv, not just group `i`.
+                for g in &mut groups {
+                    if g.installed.contains(&cmd.id) {
+                        let same_route = platform_bypass_teardown_command(
+                            g.server_ip,
+                            &g.interface_name,
+                            g.original_gateway,
+                            g.route_form,
+                        )
+                        .is_some_and(|c| c.id == cmd.id && c.argv == cmd.argv);
+                        if same_route {
+                            g.installed.retain(|id| *id != cmd.id);
+                        }
+                    }
+                }
             }
             checkpoint(&groups);
         }
@@ -936,11 +961,16 @@ pub(crate) fn run_capturing<P: Phase>(
 /// `~/Library/Application Support/hole`.
 ///
 /// `tun_name` is the caller's own configured TUN device name (the bridge's
-/// `TUN_DEVICE_NAME` constant) — the fallback the TUN-permit reclaim uses when
-/// no `bridge-routes.json` survived this startup to name one. See
+/// `WINDOWS_TUN_ALIAS` constant, on Windows) — the fallback the TUN-permit
+/// reclaim uses when no `bridge-routes.json` survived this startup to name
+/// one. `None` on a
+/// platform with no such compile-time fallback to offer (macOS, where the
+/// name is kernel-assigned and unknowable before the device is opened) —
+/// the reclaim then relies solely on the recovered file's own `tun_name`,
+/// falling back to a no-op when neither source is available. See
 /// [`recover_routes_with`]'s doc for why the file alone cannot be the only
 /// source.
-pub fn recover_routes(state_dir: &Path, owner: Option<(u32, u32)>, tun_name: &str) -> Recovery {
+pub fn recover_routes(state_dir: &Path, owner: Option<(u32, u32)>, tun_name: Option<&str>) -> Recovery {
     let intent = failclosed::lockdown_state::load_intent(state_dir);
     recover_routes_with(
         state_dir,
@@ -1119,12 +1149,14 @@ pub fn decide_cover_recovery(intent: failclosed::lockdown_state::Intent, presenc
 /// exactly when it definitely does not. Falling back to the caller's own
 /// configured name keeps the reclaim reachable on that path too; the resolve
 /// check inside `should_reclaim_tun_permit` is what makes deleting on a
-/// guessed name safe — a live `hole-tun` still blocks it.
+/// guessed name safe — a live `hole-tun` still blocks it. `None` when the
+/// caller has no compile-time fallback to offer (macOS) — the hint then
+/// degrades to whatever the recovered file itself names, or nothing at all.
 #[allow(clippy::too_many_arguments)] // private test seam — bundling into a struct adds more noise than the warning.
 pub(crate) fn recover_routes_with<R, S, P, L>(
     state_dir: &Path,
     owner: Option<(u32, u32)>,
-    tun_name: &str,
+    tun_name: Option<&str>,
     runner: R,
     sweep_cover: S,
     lockdown_intent: failclosed::lockdown_state::Intent,
@@ -1251,7 +1283,9 @@ where
     } else {
         debug!("no route-state file found, nothing to recover");
     }
-    let tun_name_hint = route_state.map(|st| st.tun_name).unwrap_or_else(|| tun_name.to_owned());
+    let tun_name_hint: Option<String> = route_state
+        .map(|st| st.tun_name)
+        .or_else(|| tun_name.map(|s| s.to_owned()));
 
     // Reconcile the standing lockdown cover FIRST. The presence is the
     // lockdown cover's OWN evidence (injected probe), NOT the route-state file,
@@ -1277,12 +1311,17 @@ where
     // `tun_name_hint` prefers THIS bridge's own last-known TUN device (from its
     // own `bridge-routes.json`) and falls back to the caller-supplied
     // `tun_name` otherwise — see this function's doc for why the file alone
-    // is not a safe gate. `TUN_DEVICE_NAME` is a compile-time constant shared
-    // by every install, so the fallback names the same device a different
-    // install's cover would too; only the reclaim's server-IP counterpart is
-    // scoped by the per-install identity gap CONTRIBUTING.md discloses
-    // (#878), and this reclaim never touches that permit.
-    lockdown_recover(decision.action, Some(tun_name_hint.as_str()));
+    // is not a safe gate. On Windows, the fallback is `WINDOWS_TUN_ALIAS`, a
+    // compile-time constant shared by every install, so it names the same
+    // device a different install's cover would too. On macOS there is no
+    // such fallback (`tun_name` is `None`: the name is kernel-assigned and
+    // unknowable ahead of opening the device, bindreams/hole#850) — a wiped
+    // `bridge-routes.json` there leaves `tun_name_hint` `None` and the
+    // reclaim below a no-op, never a cross-install guess. Either way, only
+    // the reclaim's server-IP counterpart is scoped by the per-install
+    // identity gap CONTRIBUTING.md discloses (#878), and this reclaim never
+    // touches that permit.
+    lockdown_recover(decision.action, tun_name_hint.as_deref());
 
     // Sweep any transient fail-closed cover left by a crashed update cutover.
     // Runs UNCONDITIONALLY (outside the route-state guard above): a crash can
@@ -1343,8 +1382,9 @@ pub trait Routing: Send + Sync {
     /// file. The real implementation ([`SystemRoutes`]) calls
     /// [`teardown_routes`]; a mock implementation increments a counter.
     /// No production code outside `SystemRoutes` calls the free teardown
-    /// function.
-    type Installed: Send;
+    /// function. [`RoutesInstalled`] exposes which address families the
+    /// install actually routed — see that trait's own doc.
+    type Installed: Send + RoutesInstalled;
 
     /// Install the split routes for the given TUN device and upstream
     /// gateway. On success, returns an RAII guard whose Drop tears down
@@ -1360,9 +1400,16 @@ pub trait Routing: Send + Sync {
     /// the server bypass route. IPv6 split-route fatality is decided
     /// separately, from the TUN's own IPv6 binding, not from anything on this
     /// struct — see [`SetupCommand`].
+    ///
+    /// Takes the whole [`TunIdentity`](crate::device::TunIdentity) (not a
+    /// bare name) so the alias reaching the route table, the lockdown cover,
+    /// and DNS steering all provably come from the SAME opened device — the
+    /// device-name plumbing bindreams/hole#850 fixed. The conversion to a
+    /// bare name happens once, at this trait boundary; everything below it
+    /// keeps using `&str`.
     fn install(
         &self,
-        tun_name: &str,
+        tun: &crate::device::TunIdentity,
         server_ip: IpAddr,
         gateway: &GatewayInfo,
     ) -> Result<Self::Installed, RoutingError>;
@@ -1443,12 +1490,15 @@ pub trait Routing: Send + Sync {
     /// [`install_failclosed_cover`](Self::install_failclosed_cover) returns —
     /// the platform guard is kind-aware, so its Drop disengages whichever cover
     /// it holds. Distinct from `install_failclosed_cover`, which does NOT permit
-    /// the TUN. The LUID is re-resolved on every call (never persisted).
+    /// the TUN. The LUID is re-resolved on every call (never persisted) —
+    /// `tun` supplies only the interface name the permit is scoped to; see
+    /// [`install`](Self::install)'s doc for why this takes a whole
+    /// [`TunIdentity`](crate::device::TunIdentity).
     /// Fail-FATAL: the bridge aborts the start on Err.
     fn install_lockdown(
         &self,
         server_ip: IpAddr,
-        tun_name: &str,
+        tun: &crate::device::TunIdentity,
         app_ids: &[PathBuf],
     ) -> Result<Self::Cover, RoutingError>;
 
@@ -1557,13 +1607,13 @@ impl Routing for SystemRouting {
 
     fn install(
         &self,
-        tun_name: &str,
+        tun: &crate::device::TunIdentity,
         server_ip: IpAddr,
         gateway: &GatewayInfo,
     ) -> Result<Self::Installed, RoutingError> {
         #[allow(clippy::disallowed_methods)] // we ARE the Routing impl
         self.install_with(
-            tun_name,
+            tun.alias(),
             server_ip,
             gateway,
             exec_one::<FatalPhase>,
@@ -1591,11 +1641,11 @@ impl Routing for SystemRouting {
     fn install_lockdown(
         &self,
         server_ip: IpAddr,
-        tun_name: &str,
+        tun: &crate::device::TunIdentity,
         app_ids: &[PathBuf],
     ) -> Result<Self::Cover, RoutingError> {
         let resolver = failclosed::SystemLuidResolver;
-        failclosed::engage_lockdown(server_ip, tun_name, &resolver, app_ids, &self.state_dir, self.owner)
+        failclosed::engage_lockdown(server_ip, tun.alias(), &resolver, app_ids, &self.state_dir, self.owner)
     }
 
     fn release_all_covers(&self) -> Result<(), RoutingError> {
@@ -1751,6 +1801,30 @@ impl SystemRouting {
     }
 }
 
+/// Which address families a completed [`Routing::install`] actually routed
+/// into the TUN. Read once, directly, off the routes `install` just
+/// confirmed (ground truth) — never re-derived from the TUN's own IPv6
+/// read-back or the upstream gateway's IPv6 availability, both of which can
+/// disagree with which split routes actually landed. Lives here (not in
+/// `hole_bridge`, its only consumer) because `hole-bridge` depends on
+/// `tun-engine`, not the reverse — `hole_bridge::dns::system` re-exports
+/// this type rather than defining its own (bindreams/hole#850's plan, Task
+/// 5, decision D4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RoutedFamilies {
+    pub v4: bool,
+    pub v6: bool,
+}
+
+/// Ground truth for which address families a [`Routing::Installed`] guard
+/// actually routed into the TUN — implemented by every `Routing::Installed`
+/// type so `Dns::apply`'s D4 filter can read it directly rather than
+/// re-deriving it. See [`RoutedFamilies`]'s own doc for the anti-derivation
+/// rule this exists to satisfy.
+pub trait RoutesInstalled {
+    fn routed_families(&self) -> RoutedFamilies;
+}
+
 /// RAII guard returned by [`SystemRouting::install`]. Dropping this value
 /// tears down the installed routes and clears the crash-recovery state
 /// file. Teardown routes through the `Routing` trait, never a raw
@@ -1776,6 +1850,20 @@ pub struct SystemRoutes {
     /// cleared or overwritten) by every checkpoint Drop performs below, so a
     /// leak from an earlier session survives this session's own teardown.
     stale: Vec<state::StaleRecord>,
+}
+
+impl RoutesInstalled for SystemRoutes {
+    /// `v4`/`v6` are each true iff BOTH halves of that family's split pair
+    /// (`SplitV4Low`+`SplitV4High` / `SplitV6Low`+`SplitV6High`) are present
+    /// in `installed` — a single confirmed half routes nothing (the other
+    /// half of the address space still exits the tunnel), so it must not
+    /// read as "family routed".
+    fn routed_families(&self) -> RoutedFamilies {
+        RoutedFamilies {
+            v4: self.installed.contains(&RouteId::SplitV4Low) && self.installed.contains(&RouteId::SplitV4High),
+            v6: self.installed.contains(&RouteId::SplitV6Low) && self.installed.contains(&RouteId::SplitV6High),
+        }
+    }
 }
 
 impl Drop for SystemRoutes {
