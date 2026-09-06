@@ -1,5 +1,5 @@
 //! Unprivileged unit tests for the macOS path's pure logic — the argv shape,
-//! and the network-address arithmetic behind [`prefix_route_interface`]'s
+//! and the network-address arithmetic behind [`prefix_route`]'s
 //! probe-address choice. See the module doc for why the rest (the actual
 //! `ifconfig`/`route` shell-outs) is unreachable without root and why the
 //! path is warn-only because of it.
@@ -61,7 +61,7 @@ fn probe_address_for_is_never_the_configured_address() {
 fn probe_address_for_falls_back_when_the_configured_address_has_no_host_part() {
     // A configured address whose host part is already all-zero — the one
     // case `network_address` alone would return the SAME address `assign`
-    // just aliased, which `prefix_route_interface`'s doc explains is
+    // just aliased, which `prefix_route`'s doc explains is
     // useless to probe (it would always resolve via the host-scope local
     // route, whether or not the wider prefix route is present).
     let cidr: Ipv6Cidr = "fdf8:f6d5:536e::/64".parse().unwrap();
@@ -88,5 +88,17 @@ fn probe_address_for_has_no_answer_for_a_single_address_prefix() {
         probe_address_for(cidr),
         None,
         "a single-address prefix has no probe address distinct from the configured one"
+    );
+}
+
+#[skuld::test]
+fn probe_address_for_has_no_answer_for_a_zero_length_prefix() {
+    // `/0`'s network address is `::`, which macOS resolves from the default
+    // route regardless of any prefix route — the IPv6 twin of `0.0.0.0`.
+    let cidr: Ipv6Cidr = "fdf8:f6d5:536e::1/0".parse().unwrap();
+    assert_eq!(
+        probe_address_for(cidr),
+        None,
+        "a zero-length prefix has no probe address that is not the default route"
     );
 }

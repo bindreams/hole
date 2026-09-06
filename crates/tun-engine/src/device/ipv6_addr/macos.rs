@@ -1,10 +1,10 @@
 //! macOS IPv6 address assignment, via `ifconfig`.
 //!
 //! Everything asserted here about runtime behaviour is **reasoned, not
-//! measured**: this path could not run in production before bindreams/hole#850
+//! measured**: this path could not run in production before
 //! (the `tun` crate rejects any macOS device name not starting with `utun`,
 //! so `Dispatcher::new` failed before a device existed), and still cannot be
-//! built on the maintainer's box. #850 fixes the naming half of that
+//! built on the maintainer's box.
 //! blocker; whether this specific path has since run green on the darwin TUN
 //! lane is a separate, still-open fact — `proxy_manager_macos_full_tunnel_privileged_tests.rs`'s
 //! Full-mode start exercises this code as a side effect but asserts nothing
@@ -159,19 +159,7 @@ pub(super) fn ifconfig_alias_argv(if_name: &str, cidr: Ipv6Cidr) -> Vec<String> 
     ]
 }
 
-/// The interface serving `cidr`'s prefix, per a real kernel routing lookup —
-/// `None` when no route answers for it. Queries [`probe_address_for`]'s
-/// address, never `cidr.address()` itself: macOS always has a host-scope
-/// local route for an address actually assigned to an interface, so probing
-/// our own address would report an interface regardless of whether the wider
-/// prefix route exists, proving nothing.
-///
-/// `route(8)` exits `0` unconditionally (confirmed live on this host, both
-/// for a present and an absent destination — see the module doc), so success
-/// is read from stdout's `"interface: "` line and absence from stderr's
-/// `"not in table"` text — never the exit code, the same reasoning
-/// `crate::routing::macos_route_confirmed_absent` documents for deletes.
-/// Anything else is [`PrefixRoute::Indeterminate`] rather than absence.
+/// What a kernel routing lookup said about `cidr`'s prefix.
 enum PrefixRoute {
     /// The kernel routes an address inside the prefix via this interface.
     Via(String),
@@ -194,6 +182,19 @@ impl std::fmt::Display for PrefixRoute {
     }
 }
 
+/// The interface serving `cidr`'s prefix, per a real kernel routing lookup —
+/// [`PrefixRoute::Absent`] when no route answers for it. Queries [`probe_address_for`]'s
+/// address, never `cidr.address()` itself: macOS always has a host-scope
+/// local route for an address actually assigned to an interface, so probing
+/// our own address would report an interface regardless of whether the wider
+/// prefix route exists, proving nothing.
+///
+/// `route(8)` exits `0` unconditionally (confirmed live on this host, both
+/// for a present and an absent destination — see the module doc), so success
+/// is read from stdout's `"interface: "` line and absence from stderr's
+/// `"not in table"` text — never the exit code, the same reasoning
+/// `crate::routing::macos_route_confirmed_absent` documents for deletes.
+/// Anything else is [`PrefixRoute::Indeterminate`] rather than absence.
 fn prefix_route(cidr: Ipv6Cidr) -> PrefixRoute {
     let Some(probe) = probe_address_for(cidr) else {
         return PrefixRoute::Indeterminate("no address inside the prefix differs from the configured one");
@@ -217,7 +218,7 @@ fn prefix_route(cidr: Ipv6Cidr) -> PrefixRoute {
 }
 
 /// An address inside `cidr`'s prefix that is NOT `cidr.address()` — see
-/// [`prefix_route_interface`]'s doc for why that distinction matters. Uses
+/// [`prefix_route`]'s doc for why that distinction matters. Uses
 /// the prefix's network address (all host bits cleared); on the vanishingly
 /// unlikely chance that address instance equals `cidr.address()` (only
 /// possible if the configured address's own host part is already
@@ -227,6 +228,13 @@ fn prefix_route(cidr: Ipv6Cidr) -> PrefixRoute {
 fn probe_address_for(cidr: Ipv6Cidr) -> Option<std::net::Ipv6Addr> {
     let addr = cidr.address();
     let net = network_address(addr, cidr.prefix_len());
+    // A `/0` network address is the unspecified address, which macOS answers
+    // from the default route — the IPv6 twin of `route get 0.0.0.0`. Probing
+    // it would report an interface whether or not any prefix route exists,
+    // which is the exact failure this function is shaped to avoid.
+    if cidr.prefix_len() == 0 {
+        return None;
+    }
     if net != addr {
         return Some(net);
     }
