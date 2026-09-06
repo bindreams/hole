@@ -99,7 +99,7 @@ mod macos_impl {
     use std::ffi::CString;
     use std::io::{self, BufRead, BufReader, Read, Write};
     use std::net::{IpAddr, Ipv4Addr};
-    use std::process::{Command, Stdio};
+    use std::process::{Child, Command, Stdio};
     use std::time::{Duration, Instant};
 
     use core_foundation::array::CFArray;
@@ -377,6 +377,43 @@ mod macos_impl {
 
     // Step 2b: the killed-process crash-path probe ====================================================================
 
+    /// Owns the holder child so a panic between spawn and the explicit kill
+    /// cannot leave it running. `Child`'s own `Drop` does not kill, and this
+    /// child parks forever holding a supplemental-resolver key whose
+    /// `SearchOrder` matches every domain — an orphan breaks the machine's
+    /// DNS until someone finds and kills it by hand. That is exactly the
+    /// state this test exists to disprove, so leaking it on failure would
+    /// manufacture the defect under investigation.
+    ///
+    /// `stderr` is read after reaping, so the child is kept in place rather
+    /// than moved out; `Drop` is a no-op once `kill_and_reap` has run.
+    struct KillOnDrop {
+        child: Child,
+        reaped: bool,
+    }
+
+    impl KillOnDrop {
+        fn as_mut(&mut self) -> &mut Child {
+            &mut self.child
+        }
+
+        fn kill_and_reap(&mut self) -> io::Result<std::process::ExitStatus> {
+            self.child.kill()?;
+            let status = self.child.wait()?;
+            self.reaped = true;
+            Ok(status)
+        }
+    }
+
+    impl Drop for KillOnDrop {
+        fn drop(&mut self) {
+            if !self.reaped {
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+            }
+        }
+    }
+
     /// SHIP GATE (Task 2 Step 2b, #868). If this fails, a `SIGKILL`ed
     /// process's session key survives it, D3's "no sweep" justification is
     /// false, and the resource-ownership rule in Global Constraints forbids
@@ -388,16 +425,19 @@ mod macos_impl {
         println!("[killed-process-probe] before:\n{before_dns}");
 
         let exe = std::env::current_exe().expect("HARNESS: current_exe");
-        let mut child = Command::new(&exe)
-            .env(HOLDER_ENV, "1")
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("HARNESS: spawn the holder child (self re-exec)");
+        let mut child = KillOnDrop {
+            child: Command::new(&exe)
+                .env(HOLDER_ENV, "1")
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("HARNESS: spawn the holder child (self re-exec)"),
+            reaped: false,
+        };
 
         // Rendezvous on the child's OWN readiness line — a real event, not a
         // bound.
-        let mut stdout = BufReader::new(child.stdout.take().expect("HARNESS: piped stdout"));
+        let mut stdout = BufReader::new(child.as_mut().stdout.take().expect("HARNESS: piped stdout"));
         let mut line = String::new();
         stdout
             .read_line(&mut line)
@@ -424,8 +464,9 @@ mod macos_impl {
              scutil --dns:\n{merged_dns}"
         );
 
-        child.kill().expect("HARNESS: SIGKILL the holder child");
-        let status = child.wait().expect("HARNESS: reap the killed holder child");
+        let status = child
+            .kill_and_reap()
+            .expect("HARNESS: SIGKILL and reap the holder child");
         println!("[killed-process-probe] holder child exit status: {status:?}");
 
         let unmerged = notify.settle(budget(30), &resolver_str, false);
@@ -434,7 +475,7 @@ mod macos_impl {
         println!("[killed-process-probe] after SIGKILL (unmerged={unmerged}):\n{after_dns}");
 
         let mut stderr = String::new();
-        if let Some(mut child_stderr) = child.stderr.take() {
+        if let Some(mut child_stderr) = child.as_mut().stderr.take() {
             let _ = child_stderr.read_to_string(&mut stderr);
         }
 

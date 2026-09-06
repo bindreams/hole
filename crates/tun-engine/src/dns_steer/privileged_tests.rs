@@ -1,6 +1,6 @@
 //! Privileged-lane live proof for [`super::engage`] (Task 2, refs #868).
 //!
-//! Harness shape lifted directly from PR #877's spike
+//!
 //! (`macos_dns_supplemental_spike.rs`), which proved the underlying mechanism
 //! on real hardware in CI, on both darwin arches (`MECHANISM: YES`,
 //! `Test hole (darwin/amd64)` and `Test hole (darwin/arm64)`, run
@@ -299,7 +299,39 @@ fn spawn_os_lookup(name: String) {
 
 // The test ============================================================================================================
 
-/// SHIP GATE (Task 2, #868). If this fails, `engage` does not steer macOS DNS
+/// Owns the harness route into the utun so a panic anywhere below cannot
+/// strand it. A stranded route points at a utun this test tears down moments
+/// later, poisoning both the host's routing table and every later test on
+/// this runner — and the paths between the add and the explicit delete are
+/// full of the assertions this test exists to report, so leaking on failure
+/// is the common case, not the rare one.
+///
+/// The explicit delete below still runs where it always did, so the observed
+/// ordering against the `scutil --dns` read is unchanged; `Drop` only covers
+/// the paths that never reach it.
+struct RouteGuard {
+    net: &'static str,
+    armed: bool,
+}
+
+impl RouteGuard {
+    fn delete(&mut self) -> String {
+        let (_, out) = run("route", &["-n", "delete", "-net", self.net]);
+        self.armed = false;
+        out
+    }
+}
+
+impl Drop for RouteGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            let (_, out) = run("route", &["-n", "delete", "-net", self.net]);
+            println!("{out}");
+        }
+    }
+}
+
+/// SHIP GATE . If this fails, `engage` does not steer macOS DNS
 /// as designed — the module doc's cross-reference to PR #877's CI-confirmed
 /// spike is what justifies treating that as a stop-and-escalate rather than
 /// a routine regression: the underlying mechanism is proven, so a failure
@@ -344,7 +376,10 @@ fn dns_steer_global_net_state_steers_the_os_resolver() {
     );
     println!("{out}");
     assert!(ok, "HARNESS: routing {RESOLVER_NET} into {tun_name} failed");
-    // Removed on every path below, before returning — see the final block.
+    let mut route_guard = RouteGuard {
+        net: RESOLVER_NET,
+        armed: true,
+    };
 
     // 2. HARNESS CONTROL, first (module doc).
     let mut seen = Vec::new();
@@ -391,7 +426,7 @@ fn dns_steer_global_net_state_steers_the_os_resolver() {
     let withdraw_result = steering.withdraw();
     let unmerged = notify.settle(budget(30), &RESOLVER.to_string(), false);
 
-    let (_, out) = run("route", &["-n", "delete", "-net", RESOLVER_NET]);
+    let out = route_guard.delete();
     println!("{out}");
 
     let after_dns = scutil_dns();
