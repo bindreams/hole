@@ -18,6 +18,11 @@ pub(crate) struct DnsApplyCall {
     pub(crate) advertise_ips: Vec<IpAddr>,
     pub(crate) targets: Vec<String>,
     pub(crate) server_ip: IpAddr,
+    /// What `RoutesInstalled::routed_families` reported for the install this
+    /// apply followed — recorded so a test can prove the value actually
+    /// travels from the routes guard to `Dns::apply`, rather than both ends
+    /// being correct in isolation.
+    pub(crate) routed: RoutedFamilies,
 }
 
 /// Instrumentation shared between `MockDns` and the handle a test clones
@@ -82,9 +87,7 @@ impl Dns for MockDns {
     async fn apply(
         &self,
         advertise_ips: Vec<IpAddr>,
-        // Not yet recorded on `DnsApplyCall` — no test needs it today; add
-        // a field when one does (see bindreams/hole#850's plan, Task 5).
-        _routed: RoutedFamilies,
+        routed: RoutedFamilies,
         tun: tun_engine::TunIdentity,
         server_ip: IpAddr,
         _cancel: CancellationToken,
@@ -102,6 +105,7 @@ impl Dns for MockDns {
             advertise_ips,
             targets: vec![tun.alias().to_string()],
             server_ip,
+            routed,
         });
         Ok(MockDnsApplied {
             state: Arc::clone(&self.state),

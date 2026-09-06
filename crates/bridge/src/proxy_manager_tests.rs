@@ -187,7 +187,7 @@ pub(super) struct MockRoutingState {
     last_install_server_ip: std::sync::Mutex<Option<IpAddr>>,
     /// `tun.alias()` from the last `install` call — lets a test assert it
     /// matches what `install_lockdown` and `Dns::apply` were handed from the
-    /// SAME `TunIdentity` (bindreams/hole#850's plan, Task 5, Step 2).
+    /// SAME `TunIdentity`.
     last_install_tun_alias: std::sync::Mutex<Option<String>>,
     /// `tun.alias()` from the last `install_lockdown` call — see
     /// `last_install_tun_alias`.
@@ -358,15 +358,24 @@ impl Routing for MockRouting {
             return Err(RoutingError::RouteSetup("mock install failure".into()));
         }
 
-        if installed.len() != planned.len() {
-            // Mirror `SystemRouting::install`'s fail-closed contract: a
-            // narrowed `installed` is never returned as `Ok` — a degraded
-            // tunnel is worse than no tunnel (Rule #0). Roll back (clear the
-            // file we just wrote) and fail closed instead. Unlike
-            // `rollback_and_record`, this unconditionally clears rather than
-            // consulting `persisted.stale` — stale-group interaction with
-            // fail-closed rollback is untested at this layer and is covered
-            // only by the tun-engine unit tests in routing_tests.rs.
+        // Mirror `SystemRouting::install`'s ACTUAL fatality, which is
+        // per-command, not per-install (see `routing.rs`'s `RouteCommand`
+        // doc): the IPv4 splits and the server bypass are always fatal — a
+        // missing one of those sends traffic outside the tunnel — while the
+        // IPv6 splits are tolerated where the TUN has no IPv6 binding,
+        // because a host with no IPv6 stack emits no IPv6 to leak. So a
+        // narrowed `installed` IS returned as `Ok` when only the v6 splits
+        // are missing, which is exactly the shape `routed_families` exists
+        // to report.
+        let missing_fatal = planned
+            .iter()
+            .any(|id| !installed.contains(id) && !matches!(id, RouteId::SplitV6Low | RouteId::SplitV6High));
+        if missing_fatal {
+            // Roll back (clear the file we just wrote) and fail closed.
+            // Unlike `rollback_and_record`, this unconditionally clears
+            // rather than consulting `persisted.stale` — stale-group
+            // interaction with fail-closed rollback is untested at this
+            // layer and is covered only by routing_tests.rs.
             let _ = route_state::clear(&self.state_dir);
             return Err(RoutingError::RouteSetup(format!(
                 "route install incomplete: {}/{} routes confirmed",
@@ -481,8 +490,9 @@ impl Drop for MockRoutes {
 impl RoutesInstalled for MockRoutes {
     // Mirrors `SystemRoutes::routed_families` exactly, reading the same
     // `installed: Vec<RouteId>` shape `MockRouting::install` populates
-    // above (narrowed by `fail_routes_for` under the same fail-closed
-    // contract `SystemRouting::install` upholds).
+    // above (narrowed by `fail_routes_for` under the same PER-COMMAND
+    // fatality `SystemRouting::install` applies — see that install's own
+    // comment).
     fn routed_families(&self) -> RoutedFamilies {
         RoutedFamilies {
             v4: self.installed.contains(&RouteId::SplitV4Low) && self.installed.contains(&RouteId::SplitV4High),
@@ -737,7 +747,7 @@ fn start_reaches_dns_apply_when_the_forwarder_answers() {
 /// smoke is the only test that can). What it DOES prove: `Routing::install`,
 /// `Routing::install_lockdown`, and `Dns::apply` are all handed the SAME
 /// `TunIdentity`'s alias from one Full-mode start with the standing lockdown
-/// engaged — the three signatures accepting `&TunIdentity` (bindreams/hole#850's
+/// engaged — the three signatures accepting `&TunIdentity` (
 /// plan, Task 5) is what makes passing three DIFFERENT names a compile error
 /// rather than a runtime drift only a privileged test would catch.
 #[skuld::test]
@@ -5629,4 +5639,45 @@ fn proxy_start_diag_carries_no_address() {
     assert!(!rendered.contains(ADDR), "{rendered}");
     assert!(rendered.contains("global"), "the scope must survive: {rendered}");
     assert!(rendered.contains("domain"), "the kind must survive: {rendered}");
+}
+
+/// The `routed_families()` value a completed install reports must reach
+/// `Dns::apply` unchanged. Both ends are covered in isolation —
+/// `routed_families` by `routed_families_reports_only_the_splits_that_landed`
+/// in tun-engine, `apply`'s use of the value by the per-platform DNS tests —
+/// but nothing proved the wire between them. A start whose IPv6 splits fail
+/// is exactly the production shape (a host whose TUN has no IPv6 binding,
+/// where those commands are non-fatal by design), so the value arriving as
+/// `{v4: true, v6: false}` is the whole claim.
+#[skuld::test]
+fn the_installed_routed_families_reach_dns_apply() {
+    rt().block_on(async {
+        let upstream = crate::test_support::socks5_dns_upstream::Socks5DnsUpstream::bind()
+            .await
+            .unwrap();
+        let dns = crate::test_support::mock_dns::MockDns::new();
+        let dns_state = dns.state_handle();
+
+        let dir = tempfile::tempdir().unwrap();
+        let routing =
+            MockRouting::failing_routes(dir.path().to_path_buf(), [RouteId::SplitV6Low, RouteId::SplitV6High]);
+        let (pm, dir) = new_manager_with_dns(MockProxy::new(), routing, dns, dir);
+        let mut pm = pm.with_state_dir(dir.path().to_path_buf());
+
+        let mut config = test_config();
+        config.local_port = upstream.port();
+        config.dns.enabled = true;
+        config.dns.protocol = hole_common::config::DnsProtocol::PlainTcp;
+        config.dns.servers = vec![IpAddr::V4(Ipv4Addr::new(198, 51, 100, 53))];
+
+        pm.start(&config).await.unwrap();
+
+        let dns_calls = dns_state.calls();
+        assert_eq!(dns_calls.len(), 1, "Dns::apply must be called exactly once");
+        assert_eq!(
+            dns_calls[0].routed,
+            RoutedFamilies { v4: true, v6: false },
+            "Dns::apply must receive the families the install actually landed, not a default"
+        );
+    });
 }
