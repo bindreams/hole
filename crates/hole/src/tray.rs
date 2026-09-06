@@ -3,7 +3,6 @@
 use crate::commands::build_proxy_config;
 use crate::state::AppState;
 use hole::tray_icons;
-use hole_common::config::StartupBehavior;
 use hole_common::protocol::{BridgeRequest, BridgeResponse};
 use serde::Serialize;
 use tauri::menu::{CheckMenuItem, MenuEvent, MenuItem, PredefinedMenuItem};
@@ -196,9 +195,10 @@ pub(crate) fn outcome_for_stop_response(
 }
 
 /// Sole writer of persisted `config.enabled` (#462): records the last user
-/// intent the bridge honored. Read at launch by `startup_should_connect` for
-/// `StartupBehavior::RestoreLastState` (#458); display and direction still come
-/// from the `ProxyStateCell`, never this flag.
+/// intent the bridge honored. The startup-connect decision itself no longer
+/// reads this field — the bridge decides and persists its own boot-time
+/// target from what it observes and is pushed (#979); display and direction
+/// still come from the `ProxyStateCell`, never this flag.
 pub(crate) fn persist_intended_enabled(
     config: &std::sync::Mutex<hole_common::config::AppConfig>,
     store: &hole_common::config_store::ConfigStore,
@@ -211,17 +211,6 @@ pub(crate) fn persist_intended_enabled(
     config.enabled = enabled;
     if let Err(e) = store.save(&config) {
         warn!(error = %e, path = %store.path().display(), "failed to persist intended enabled state");
-    }
-}
-
-/// Pure launch-time decision (#458): should the GUI auto-connect now?
-/// `last_enabled` is the persisted last-honored intent (#462), read only here.
-/// The exhaustive match makes a future `StartupBehavior` variant a compile error.
-pub(crate) fn startup_should_connect(behavior: StartupBehavior, last_enabled: bool) -> bool {
-    match behavior {
-        StartupBehavior::DoNotConnect => false,
-        StartupBehavior::RestoreLastState => last_enabled,
-        StartupBehavior::AlwaysConnect => true,
     }
 }
 
@@ -598,9 +587,9 @@ pub fn rebuild_tray_menu(app: &AppHandle) {
 /// Send a best-effort Stop to the bridge and exit the application.
 ///
 /// Persisted `config.enabled` is deliberately untouched: it is the record of
-/// the last honored intent (the `RestoreLastState` input read at next launch by
-/// `startup_should_connect`, #458), and the tray renders from bridge Status,
-/// never from that flag (#462).
+/// the last honored intent (#462); the startup-connect decision is the
+/// bridge's own now (#979), and the tray renders from bridge Status, never
+/// from that flag.
 pub(crate) async fn exit_app(app: AppHandle) {
     let state = app.state::<AppState>();
     let _ = state.bridge_send(BridgeRequest::Stop).await;
@@ -678,20 +667,27 @@ pub(crate) enum Prompts {
 
 /// Interactive connect/disconnect entry — the tray menu items and the
 /// `start_proxy`/`stop_proxy` commands. Delegates with prompts allowed.
-///
-/// A manual action supersedes the boot-connect intent (#458): consume the latch
-/// so a later reconciler tick can't override the user's explicit choice.
 pub async fn set_proxy_enabled(app: &AppHandle, enable: bool, attempt_id: String) -> Result<ToggleOutcome, String> {
-    app.state::<AppState>().take_pending_startup_connect();
-    // Manual connect is fail-open (covered=false): the user consents to the open window.
-    set_proxy_enabled_inner(app, enable, false, Prompts::Allowed, attempt_id).await
+    set_proxy_enabled_inner(app, enable, Prompts::Allowed, attempt_id).await
 }
 
-/// The sole non-interactive connect entry — startup auto-connect. Connect-only by
-/// construction (no `enable` param), so silent-disconnect is unrepresentable; the
-/// shared commit tail stays single-sourced.
+/// The blocked-state Retry entry (`ID_BLOCKED_RETRY`) — a background
+/// reattempt the tray fires without the user having to sit through a prompt,
+/// so it suppresses prompts the same way the (now-deleted) startup
+/// auto-connect path used to. Connect-only by construction.
+///
+/// #979: this can no longer retry *covered*. Once the bridge decides
+/// auto-connect, no wire signal can make an IPC-driven start covered any
+/// more (`handle_start` hardcodes `covered = false` unconditionally) — the
+/// only source of a genuinely covered start is the bridge's own reconcile
+/// (boot today, an ongoing loop once #617 lands). A failed retry here no
+/// longer keeps the host blocked; it fails open, exactly like any other
+/// manual connect attempted while blocked (`proxy_manager.rs`'s documented
+/// "uncovered start while blocked" behaviour). Retrying while blocked
+/// without releasing the cover is intended to become the reconcile loop's
+/// job, not this button's.
 async fn connect_silently(app: &AppHandle) -> Result<ToggleOutcome, String> {
-    set_proxy_enabled_inner(app, true, true, Prompts::Forbidden, uuid::Uuid::new_v4().to_string()).await
+    set_proxy_enabled_inner(app, true, Prompts::Forbidden, uuid::Uuid::new_v4().to_string()).await
 }
 
 /// Set the proxy to the given enabled state. Returns a `ToggleOutcome`
@@ -714,7 +710,6 @@ async fn connect_silently(app: &AppHandle) -> Result<ToggleOutcome, String> {
 async fn set_proxy_enabled_inner(
     app: &AppHandle,
     enable: bool,
-    covered: bool,
     prompts: Prompts,
     attempt_id: String,
 ) -> Result<ToggleOutcome, String> {
@@ -761,10 +756,15 @@ async fn set_proxy_enabled_inner(
     };
 
     let result: Result<ToggleOutcome, String> = if enable {
+        // Push the current Settings preference alongside the connect (#979):
+        // the bridge persists it and applies it at its own next boot, with no
+        // GUI running. This is a preference push, not a decision — the GUI no
+        // longer decides whether a start is auto-connect-covered.
+        let on_startup = state.config.lock().unwrap().on_startup;
         let request = BridgeRequest::Start {
             config: proxy_config.expect("built above for the enable path"),
             attempt_id,
-            covered,
+            on_startup: Some(on_startup),
         };
         let response = state.bridge_send(request.clone()).await;
         match outcome_for_start_response(&response) {
@@ -886,7 +886,8 @@ fn handle_tray_event(app: &AppHandle, event: MenuEvent) {
             info!("tray: retry clicked from the blocked state");
             let app_handle = app.clone();
             tauri::async_runtime::spawn(async move {
-                // Covered retry: re-attempt under the held cover (stays blocked on failure).
+                // #979: no longer a covered retry (see `connect_silently`'s doc) — a
+                // failed attempt here can fail the host open rather than re-block it.
                 match connect_silently(&app_handle).await {
                     Ok(outcome) => info!(?outcome, "blocked-state retry settled"),
                     Err(reason) => info!(%reason, "blocked-state retry did not connect"),
@@ -1536,9 +1537,9 @@ pub fn spawn_proxy_state_sync(app: &AppHandle) {
 /// (`BridgeLink::send` commits synchronously; no code waits on this
 /// loop). The immediate first tick doubles as the startup reconcile.
 ///
-/// Beyond presentation, each tick's Status result drives the one-shot
-/// startup-connect intent (#458): the recorded intent is applied (connect) at
-/// most once — the first time the bridge proves reachable — and never again.
+/// Startup auto-connect is no longer this loop's concern (#979): the bridge
+/// decides and applies it at its own boot, before any GUI runs. This poll is
+/// purely presentational.
 pub fn spawn_status_reconciler(app: &AppHandle, _settled: LaunchWindowsSettled) {
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
@@ -1546,98 +1547,10 @@ pub fn spawn_status_reconciler(app: &AppHandle, _settled: LaunchWindowsSettled) 
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tick.tick().await;
-            // The commit happens inside send; the result also drives the
-            // one-shot startup-connect intent (#458).
-            let result = app.state::<AppState>().bridge_send(BridgeRequest::Status).await;
-            apply_pending_startup_connect(&app, &result);
+            // The commit happens inside send.
+            let _ = app.state::<AppState>().bridge_send(BridgeRequest::Status).await;
         }
     });
-}
-
-/// Arm the one-shot startup-connect intent (#458) from the persisted
-/// `on_startup` policy. The status reconciler applies it the first time the
-/// bridge is reachable, so a cold-boot race — the bridge service and the GUI
-/// start as independent OS units with no ordering edge, and the GUI can reach
-/// here before the bridge has bound its socket — can't drop the connect. Runs
-/// once per live GUI instance. Snapshots the two Copy config fields under the
-/// lock and drops the guard.
-pub fn arm_startup_auto_connect(app: &AppHandle) {
-    let state = app.state::<AppState>();
-    let (behavior, last_enabled) = {
-        let cfg = state.config.lock().unwrap();
-        (cfg.on_startup, cfg.enabled)
-    };
-    if startup_should_connect(behavior, last_enabled) {
-        state.arm_pending_startup_connect();
-    }
-}
-
-/// What the status reconciler should do with a pending startup-connect intent
-/// (#458), given a Status exchange result. The bridge service and the GUI start
-/// as independent OS units with no ordering edge, so the boot connect can race
-/// the bridge's socket bind; this lets the reconciler apply the recorded intent
-/// the first time the bridge proves reachable.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum PendingAction {
-    /// Bridge reachable and idle — connect now and consume the intent.
-    Apply,
-    /// Bridge reachable and already running — intent satisfied; consume it.
-    Drop,
-    /// Readiness unproven (still booting, or a hiccup that says nothing about
-    /// reachability) — keep the intent for a later tick.
-    Retain,
-}
-
-/// Decide the pending startup-connect action from a reconciler `Status` result.
-/// Only a reachable bridge reporting its run state is conclusive; a transport
-/// failure means "not bound yet", and a DACL/version hiccup says nothing about
-/// readiness — both retain so a later tick can apply the intent. A host left
-/// fail-closed by a failed covered start (`blocked_until_connected`) is NOT idle
-/// to re-apply against: the bridge holds that blocked state independently of any
-/// GUI, so a fresh GUI instance re-arming the latch could otherwise observe a
-/// deliberately-blocked host as idle and auto-fire against it. Retain instead.
-pub(crate) fn should_apply_pending(
-    result: &Result<BridgeResponse, crate::bridge_client::ClientError>,
-) -> PendingAction {
-    match result {
-        Ok(BridgeResponse::Status {
-            running: false,
-            blocked_until_connected: true,
-            ..
-        }) => PendingAction::Retain,
-        Ok(BridgeResponse::Status { running: false, .. }) => PendingAction::Apply,
-        Ok(BridgeResponse::Status { running: true, .. }) => PendingAction::Drop,
-        _ => PendingAction::Retain,
-    }
-}
-
-/// Apply the one-shot startup-connect intent (#458) against a reconciler Status
-/// result: connect once the bridge is first reachable, drop the intent if it is
-/// already running, retain it while the bridge is still booting. Spawns the
-/// silent connect (the latch is consumed first, so it fires at most once).
-fn apply_pending_startup_connect(app: &AppHandle, status: &Result<BridgeResponse, crate::bridge_client::ClientError>) {
-    let state = app.state::<AppState>();
-    match should_apply_pending(status) {
-        PendingAction::Apply => {
-            if state.take_pending_startup_connect() {
-                let app = app.clone();
-                tauri::async_runtime::spawn(async move {
-                    // Both arms log at info: failing into the tray's Disconnected
-                    // state is the contract, not an error.
-                    match connect_silently(&app).await {
-                        Ok(outcome) => info!(?outcome, "startup auto-connect settled"),
-                        Err(e) => info!(reason = %e, "startup auto-connect did not connect"),
-                    }
-                });
-            }
-        }
-        // Already running: consume the intent so a later user disconnect can't
-        // be undone by a stale latch.
-        PendingAction::Drop => {
-            state.take_pending_startup_connect();
-        }
-        PendingAction::Retain => {}
-    }
 }
 
 #[cfg(test)]

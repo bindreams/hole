@@ -565,12 +565,12 @@ impl BridgeIpcClient {
             BridgeRequest::Start {
                 config,
                 attempt_id,
-                covered,
+                on_startup,
             } => {
                 let body = serde_json::to_vec(&config)?;
                 let mut headers: Vec<(&str, &str)> = vec![("x-hole-attempt-id", attempt_id.as_str())];
-                if covered {
-                    headers.push(("x-hole-covered", "true"));
+                if let Some(on_startup) = on_startup {
+                    headers.push(("x-hole-on-startup", on_startup.as_header_value()));
                 }
                 let resp = self.http_post(ROUTE_START, body, &headers).await?;
                 if resp.status().is_success() {

@@ -501,27 +501,6 @@ async fn post_start(
     client.send(req).await
 }
 
-/// `post_start` that carries `X-Hole-Covered: true`, signalling an auto-connect
-/// so the bridge engages a fail-closed cover that stays blocked while the attempt
-/// is in flight.
-async fn post_start_covered(
-    client: &mut TestClient,
-    config: &ProxyConfig,
-    attempt_id: &str,
-) -> http::Response<hyper::body::Incoming> {
-    let body_bytes = serde_json::to_vec(config).unwrap();
-    let req = http::Request::builder()
-        .method("POST")
-        .uri(ROUTE_START)
-        .header("host", "localhost")
-        .header("content-type", "application/json")
-        .header(ATTEMPT_ID_HEADER, attempt_id)
-        .header("x-hole-covered", "true")
-        .body(Full::new(Bytes::from(body_bytes)))
-        .unwrap();
-    client.send(req).await
-}
-
 async fn post_stop(client: &mut TestClient) -> http::Response<hyper::body::Incoming> {
     let req = http::Request::builder()
         .method("POST")
@@ -1367,32 +1346,114 @@ fn start_failure_returns_error() {
 }
 
 #[skuld::test]
-fn covered_header_retains_cover_after_failed_start() {
-    // Wire-seam test: a failed Start carrying
-    // `X-Hole-Covered: true` must leave the host fail-closed (status reports
-    // blocked_until_connected=true), while the same failure WITHOUT the header
-    // must not (a manual start falls open). If handle_start stopped reading the
-    // header, both would report false and the leak would be silent.
+fn setting_the_target_persists_the_startup_preference() {
+    // #979, Task 4's checklist, at the IPC layer rather than the pure
+    // save/load round-trip `target_tests.rs` already covers: an actual Start
+    // request carrying `x-hole-on-startup` writes the preference, and a
+    // fresh `load_startup_preference` (no in-memory state carried over,
+    // simulating a bridge restart) reads it back.
     rt().block_on(async {
-        // Covered: header present -> cover retained -> blocked.
-        let path = test_socket_path("covered-blocks");
-        let server = IpcServer::bind(&path, failing_proxy(), "test").unwrap();
+        let path = test_socket_path("on-startup-persist");
+        let state_dir = tempfile::tempdir().unwrap().keep();
+        let server =
+            IpcServer::bind_with_dirs(&path, mock_proxy(), "test", state_dir.clone(), state_dir.clone(), None).unwrap();
         let handle = tokio::spawn(async move {
             server.run_once().await.unwrap();
         });
+
         let mut client = TestClient::connect(&path).await;
-        consume(post_start_covered(&mut client, &sample_config(), "t").await).await;
-        let status = get_status(&mut client).await;
-        assert!(
-            status.blocked_until_connected,
-            "covered start that failed must stay fail-closed"
+        let req = http::Request::builder()
+            .method("POST")
+            .uri(ROUTE_START)
+            .header("host", "localhost")
+            .header("content-type", "application/json")
+            .header(ATTEMPT_ID_HEADER, "t")
+            .header(ON_STARTUP_HEADER, "always_connect")
+            .body(Full::new(Bytes::from(serde_json::to_vec(&sample_config()).unwrap())))
+            .unwrap();
+        consume(client.send(req).await).await;
+
+        let pref = target::load_startup_preference(&state_dir);
+        assert_eq!(
+            pref.on_startup,
+            StartupBehavior::AlwaysConnect,
+            "a fresh load must read back the preference the IPC Start carried"
         );
+
         drop(client);
         handle.abort();
         let _ = handle.await;
+    });
+}
 
-        // Control: no header -> manual start -> falls open.
-        let path = test_socket_path("uncovered-open");
+#[skuld::test]
+fn a_start_with_no_startup_preference_leaves_the_persisted_one_alone() {
+    // #979: the CLI has no Settings preference to push and sends no
+    // `X-Hole-On-Startup` header at all (distinct from an old client, which
+    // omits it not knowing it exists — both look identical on the wire, and
+    // are handled identically: nothing pushed). Either way, a Start missing
+    // the header must never downgrade a persisted preference (e.g. a real
+    // `AlwaysConnect` the GUI set) down to the wire default. It still
+    // records the connect as the fallback candidate for `AlwaysConnect` —
+    // that much is true regardless of who started it.
+    rt().block_on(async {
+        let path = test_socket_path("on-startup-noop");
+        let state_dir = tempfile::tempdir().unwrap().keep();
+        target::save_startup_preference(
+            &state_dir,
+            &target::StartupPreference {
+                on_startup: StartupBehavior::AlwaysConnect,
+                candidate: None,
+            },
+            None,
+        )
+        .unwrap();
+        let server =
+            IpcServer::bind_with_dirs(&path, mock_proxy(), "test", state_dir.clone(), state_dir.clone(), None).unwrap();
+        let handle = tokio::spawn(async move {
+            server.run_once().await.unwrap();
+        });
+
+        let mut client = TestClient::connect(&path).await;
+        let req = http::Request::builder()
+            .method("POST")
+            .uri(ROUTE_START)
+            .header("host", "localhost")
+            .header("content-type", "application/json")
+            .header(ATTEMPT_ID_HEADER, "t")
+            // deliberately no ON_STARTUP_HEADER
+            .body(Full::new(Bytes::from(serde_json::to_vec(&sample_config()).unwrap())))
+            .unwrap();
+        consume(client.send(req).await).await;
+
+        let pref = target::load_startup_preference(&state_dir);
+        assert_eq!(
+            pref.on_startup,
+            StartupBehavior::AlwaysConnect,
+            "a Start with no on_startup header must not overwrite the persisted preference"
+        );
+        assert_eq!(
+            pref.candidate.map(|c| c.server.server.expose().to_owned()),
+            Some(sample_config().server.server.expose().to_owned()),
+            "a successful start still updates the AlwaysConnect fallback candidate"
+        );
+
+        drop(client);
+        handle.abort();
+        let _ = handle.await;
+    });
+}
+
+#[skuld::test]
+fn ipc_start_never_engages_the_cover_even_on_failure() {
+    // #979: `handle_start` hardcodes `covered = false` unconditionally now —
+    // there is no wire signal left that can make an IPC-driven start covered
+    // (Q3 deleted `X-Hole-Covered`; the only remaining source of a covered
+    // start is the bridge's own boot-time reconcile, Task 7, which bypasses
+    // IPC entirely). A failed IPC start must therefore never leave the host
+    // fail-closed, regardless of any header a client sends.
+    rt().block_on(async {
+        let path = test_socket_path("ipc-start-uncovered");
         let server = IpcServer::bind(&path, failing_proxy(), "test").unwrap();
         let handle = tokio::spawn(async move {
             server.run_once().await.unwrap();
@@ -1402,7 +1463,7 @@ fn covered_header_retains_cover_after_failed_start() {
         let status = get_status(&mut client).await;
         assert!(
             !status.blocked_until_connected,
-            "manual start that failed must not stay fail-closed"
+            "an IPC-driven start must never stay fail-closed on failure"
         );
         drop(client);
         handle.abort();

@@ -290,24 +290,6 @@ fn unblock_dialog_message_maps_each_response_distinctly() {
     );
 }
 
-// startup_should_connect ==============================================================================================
-
-#[skuld::test]
-fn startup_should_connect_truth_table() {
-    use hole_common::config::StartupBehavior::*;
-    // DoNotConnect: never, regardless of last_enabled.
-    assert!(!startup_should_connect(DoNotConnect, false));
-    assert!(!startup_should_connect(DoNotConnect, true));
-    // RestoreLastState: mirror the last honored intent.
-    assert!(!startup_should_connect(RestoreLastState, false));
-    assert!(startup_should_connect(RestoreLastState, true));
-    // AlwaysConnect: always.
-    assert!(startup_should_connect(AlwaysConnect, false));
-    assert!(startup_should_connect(AlwaysConnect, true));
-}
-
-// should_apply_pending ================================================================================================
-
 fn status_resp(running: bool) -> BridgeResponse {
     BridgeResponse::Status {
         running,
@@ -319,60 +301,6 @@ fn status_resp(running: bool) -> BridgeResponse {
         lockdown_enabled: false,
         lockdown_active: false,
         blocked_until_connected: false,
-    }
-}
-
-fn status_resp_blocked() -> BridgeResponse {
-    match status_resp(false) {
-        BridgeResponse::Status {
-            uptime_secs,
-            error,
-            invalid_filters,
-            udp_proxy_available,
-            ipv6_bypass_available,
-            lockdown_enabled,
-            lockdown_active,
-            ..
-        } => BridgeResponse::Status {
-            running: false,
-            uptime_secs,
-            error,
-            invalid_filters,
-            udp_proxy_available,
-            ipv6_bypass_available,
-            lockdown_enabled,
-            lockdown_active,
-            blocked_until_connected: true,
-        },
-        other => other,
-    }
-}
-
-#[skuld::test]
-fn should_apply_pending_rules() {
-    use PendingAction::*;
-    // Owned Results, only borrowed (BridgeResponse/ClientError are not Clone).
-    let table: Vec<(Result<BridgeResponse, ClientError>, PendingAction)> = vec![
-        // Bridge reachable and idle -> apply the boot-connect intent now.
-        (Ok(status_resp(false)), Apply),
-        // Bridge reachable and already running -> intent satisfied, drop it.
-        (Ok(status_resp(true)), Drop),
-        // Bridge not reachable yet (still booting) -> keep the intent for a later tick.
-        (Err(transport_err()), Retain),
-        // A DACL/version/transport hiccup proves nothing about readiness -> keep the intent.
-        (Err(ClientError::PermissionDenied), Retain),
-        (Err(ClientError::VersionMismatch { bridge: None }), Retain),
-        (Err(ClientError::Io(std::io::Error::other("io"))), Retain),
-        (Err(ClientError::Protocol("bad frame".into())), Retain),
-        // Reachable but the bridge errored on Status -> keep the intent.
-        (Ok(err_resp("busy")), Retain),
-        (Ok(BridgeResponse::Ack), Retain),
-        // Not running but fail-closed -> retain (don't re-apply against a
-        // deliberately-blocked host).
-        (Ok(status_resp_blocked()), Retain),
-    ];
-    for (result, expected) in &table {
-        assert_eq!(should_apply_pending(result), *expected, "{result:?}");
     }
 }
 
@@ -452,4 +380,51 @@ fn external_bridge_denied_toast_is_actionable() {
     let toast = external_bridge_denied_toast();
     assert!(toast.to_lowercase().contains("permission denied"), "{toast}");
     assert!(toast.contains("gui.log"), "{toast}");
+}
+
+// Structural guard ====================================================================================================
+
+/// #979: the startup-connect decision moved to the bridge
+/// (`hole_bridge::target::startup_should_connect`) and the GUI's own copy was
+/// deleted, not left dormant. Same idiom as
+/// `the_standing_cover_field_has_exactly_one_reader`: a name reappearing in
+/// non-test GUI source would mean a second decider crept back in.
+#[skuld::test]
+fn the_gui_no_longer_decides() {
+    let needle = "startup_should_connect";
+    let src_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+
+    let mut matches: Vec<(String, usize, String)> = Vec::new();
+    for entry in walkdir::WalkDir::new(&src_root) {
+        let entry = entry.expect("failed to walk crates/hole/src");
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+            continue;
+        }
+        let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        if file_name.ends_with("_tests.rs") {
+            continue;
+        }
+        let text = std::fs::read_to_string(path).expect("failed to read a walked source file");
+        for (line_no, line) in text.lines().enumerate() {
+            if line.contains(needle) {
+                matches.push((path.display().to_string(), line_no + 1, line.trim().to_string()));
+            }
+        }
+    }
+
+    assert!(
+        matches.is_empty(),
+        "the_gui_no_longer_decides: `{needle}` must not appear in non-test GUI sources \
+         (skipping *_tests.rs) — it belongs to the bridge alone now (#979).\n\
+         Matches found ({}):\n{}",
+        matches.len(),
+        matches
+            .iter()
+            .map(|(file, line_no, line)| format!("  {file}:{line_no}: {line}\n"))
+            .collect::<String>()
+    );
 }

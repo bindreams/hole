@@ -383,7 +383,7 @@ async fn run_live_tun_permit_session(dist: &Path, ss: &SsServerHandle) {
         .send(BridgeRequest::Start {
             config: config.clone(),
             attempt_id: "live-tun-permit-e2e-a".into(),
-            covered: false,
+            on_startup: Some(hole_common::config::StartupBehavior::default()),
         })
         .await
         .expect("HARNESS: send Start (phase A)");
@@ -434,7 +434,7 @@ async fn run_live_tun_permit_session(dist: &Path, ss: &SsServerHandle) {
         .send(BridgeRequest::Start {
             config,
             attempt_id: "live-tun-permit-e2e-b".into(),
-            covered: false,
+            on_startup: Some(hole_common::config::StartupBehavior::default()),
         })
         .await;
     let start_b_acked = matches!(start_b, Ok(BridgeResponse::Ack));

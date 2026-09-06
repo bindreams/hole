@@ -849,7 +849,7 @@ fn cli_proxy_start_arms_the_config_file_entry() {
             ..ProxyConfig::default()
         },
         attempt_id: "attempt".to_string(),
-        covered: false,
+        on_startup: Some(hole_common::config::StartupBehavior::default()),
     });
 
     assert_eq!(util::redact::redact_str("203.0.113.7"), token_for(ENTRY_ID));
@@ -892,7 +892,7 @@ fn cli_ipc_send_arms_a_start_request(#[fixture(temp_dir)] dir: &Path) {
             ..ProxyConfig::default()
         },
         attempt_id: "attempt".to_string(),
-        covered: false,
+        on_startup: Some(hole_common::config::StartupBehavior::default()),
     };
 
     let path = dir.join("request.json");

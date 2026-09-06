@@ -72,6 +72,7 @@ pub mod dns_confine;
 pub mod dns_steer;
 pub mod engine;
 pub mod error;
+pub mod exclusive;
 pub mod gateway;
 pub mod helpers;
 pub mod net;

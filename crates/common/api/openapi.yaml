@@ -45,6 +45,21 @@ paths:
             cancel a later, unrelated attempt (#465). Absent/empty disables pre-arm
             scoping for that request (fail-safe: a start never consumes a pre-arm,
             a cancel never arms); the GUI/CLI always send a non-empty value.
+        - in: header
+          name: X-Hole-On-Startup
+          required: false
+          schema:
+            type: string
+            enum: [do_not_connect, restore_last_state, always_connect]
+          description: >-
+            The GUI's current startup preference, persisted alongside the target
+            (`bridge-startup.json`) so the bridge can apply it at its own next
+            boot with no GUI running (#979, #617). Absent (e.g. the CLI, which
+            has no preference to push) leaves whatever preference is already
+            persisted untouched — it is never read as a push of
+            `restore_last_state`. This is a preference the GUI pushes, not a
+            decision it makes: whether THIS start is itself auto-connect-covered
+            is for the bridge alone to decide.
       requestBody:
         required: true
         content:

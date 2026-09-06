@@ -143,7 +143,7 @@ fn send_start_receives_ack() {
         let resp = client
             .send(BridgeRequest::Start {
                 attempt_id: "id-123".into(),
-                covered: false,
+                on_startup: Some(hole_common::config::StartupBehavior::default()),
                 config: hole_common::protocol::ProxyConfig {
                     server: hole_common::config::ServerEntry {
                         id: "id".into(),
@@ -298,7 +298,7 @@ fn start_and_cancel_send_attempt_id_header() {
             .send(BridgeRequest::Start {
                 config: hole_common::protocol::ProxyConfig::default(),
                 attempt_id: "id-123".into(),
-                covered: false,
+                on_startup: Some(hole_common::config::StartupBehavior::default()),
             })
             .await
             .unwrap();
@@ -323,13 +323,15 @@ fn start_and_cancel_send_attempt_id_header() {
 }
 
 #[skuld::test]
-fn start_covered_sends_x_hole_covered_header() {
-    // The load-bearing wire seam of #553: a covered Start must emit
-    // `x-hole-covered: true`; a manual (covered:false) Start must OMIT it (the
-    // bridge treats absence as fail-open). If this regressed, every auto-connect
-    // would silently fail OPEN with the suite still green.
+fn start_sends_x_hole_on_startup_header_only_when_a_preference_is_pushed() {
+    // The load-bearing wire seam of #979: a Start carrying `Some` preference
+    // (the GUI's case) sends it on the wire; `None` (the CLI's case — no
+    // Settings preference to push) omits the header entirely rather than
+    // sending some default, so the bridge knows to leave whatever it already
+    // has persisted untouched (see `crate::bridge_client`'s `Start` arm and
+    // `hole_bridge::ipc::on_startup_from`).
     rt().block_on(async {
-        let path = test_socket_path("covered-header");
+        let path = test_socket_path("on-startup-header");
         let listener = hole_bridge::socket::LocalListener::bind(&path).unwrap();
         let captured: std::sync::Arc<std::sync::Mutex<Vec<String>>> =
             std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -341,7 +343,7 @@ fn start_covered_sends_x_hole_covered_header() {
                     let cap = cap.clone();
                     async move {
                         let v = headers
-                            .get("x-hole-covered")
+                            .get("x-hole-on-startup")
                             .and_then(|v| v.to_str().ok())
                             .unwrap_or("<absent>")
                             .to_owned();
@@ -376,12 +378,18 @@ fn start_covered_sends_x_hole_covered_header() {
         });
 
         let mut client = BridgeClient::connect(&path).await.unwrap();
-        for covered in [true, false] {
+        use hole_common::config::StartupBehavior;
+        for on_startup in [
+            Some(StartupBehavior::DoNotConnect),
+            Some(StartupBehavior::RestoreLastState),
+            Some(StartupBehavior::AlwaysConnect),
+            None,
+        ] {
             client
                 .send(BridgeRequest::Start {
                     config: hole_common::protocol::ProxyConfig::default(),
                     attempt_id: "id".into(),
-                    covered,
+                    on_startup,
                 })
                 .await
                 .unwrap();
@@ -390,8 +398,13 @@ fn start_covered_sends_x_hole_covered_header() {
         let _ = server.await;
         assert_eq!(
             captured.lock().unwrap().clone(),
-            vec!["true".to_owned(), "<absent>".to_owned()],
-            "covered:true sends x-hole-covered:true; covered:false omits the header"
+            vec![
+                "do_not_connect".to_owned(),
+                "restore_last_state".to_owned(),
+                "always_connect".to_owned(),
+                "<absent>".to_owned(),
+            ],
+            "Some(_) must send the mapped header; None must omit it entirely"
         );
     });
 }
@@ -507,7 +520,7 @@ fn start_500_maps_to_typed_start_failed() {
         let resp = client
             .send(BridgeRequest::Start {
                 attempt_id: "id-123".into(),
-                covered: false,
+                on_startup: Some(hole_common::config::StartupBehavior::default()),
                 config: hole_common::protocol::ProxyConfig {
                     server: hole_common::config::ServerEntry {
                         id: "id".into(),
@@ -926,7 +939,7 @@ async fn start_raw(
     c.send(BridgeRequest::Start {
         config: hole_common::protocol::ProxyConfig::default(),
         attempt_id: "a".into(),
-        covered: false,
+        on_startup: Some(hole_common::config::StartupBehavior::default()),
     })
     .await
 }

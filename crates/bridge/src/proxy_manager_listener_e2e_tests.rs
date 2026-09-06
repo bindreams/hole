@@ -68,7 +68,7 @@ async fn start_expect_ack(harness: &mut DistHarness, config: ProxyConfig) {
         .send(BridgeRequest::Start {
             config,
             attempt_id: "e2e".into(),
-            covered: false,
+            on_startup: Some(hole_common::config::StartupBehavior::default()),
         })
         .await
         .expect("send Start");
@@ -81,7 +81,7 @@ async fn start_expect_error(harness: &mut DistHarness, config: ProxyConfig) -> S
         .send(BridgeRequest::Start {
             config,
             attempt_id: "e2e".into(),
-            covered: false,
+            on_startup: Some(hole_common::config::StartupBehavior::default()),
         })
         .await
         .expect("send Start");

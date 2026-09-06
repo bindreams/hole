@@ -572,7 +572,7 @@ async fn start_ack_commits_true() {
     let resp = link
         .send(BridgeRequest::Start {
             attempt_id: "x".into(),
-            covered: false,
+            on_startup: Some(hole_common::config::StartupBehavior::default()),
             config: test_proxy_config(),
         })
         .await
@@ -1050,7 +1050,7 @@ async fn concurrent_requests_commit_in_bridge_order() {
         async move {
             link.send(BridgeRequest::Start {
                 attempt_id: "x".into(),
-                covered: false,
+                on_startup: Some(hole_common::config::StartupBehavior::default()),
                 config: test_proxy_config(),
             })
             .await

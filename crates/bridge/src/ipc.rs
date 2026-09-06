@@ -6,9 +6,11 @@ use crate::proxy::{Proxy, ProxyError};
 use crate::proxy_manager::{LockdownOffOutcome, ProxyManager, ProxyState};
 use crate::server_test::{run_server_test, TestConfig};
 use crate::socket::LocalListener;
+use crate::target::{self, Target};
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::Json;
+use hole_common::config::StartupBehavior;
 use hole_common::protocol::{
     DiagnosticsResponse, EmptyResponse, ErrorResponse, LockdownRequest, MetricsResponse, ProxyConfig, StartError,
     StatusResponse, TestServerRequest, TestServerResponse, UpdateApplyRequest, VersionResponse, ROUTE_CANCEL,
@@ -50,6 +52,20 @@ fn attempt_id_from(headers: &axum::http::HeaderMap) -> AttemptId {
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
         .to_owned()
+}
+
+/// The `X-Hole-On-Startup` request header carrying the GUI's current startup
+/// preference on `POST /v1/start` (#979, #617) — see `crate::target`.
+const ON_STARTUP_HEADER: &str = "x-hole-on-startup";
+
+/// Read the startup preference from a request's `X-Hole-On-Startup` header.
+/// A genuinely absent header — an older client that doesn't know about it,
+/// or the CLI, which has no preference to push (#979) — reads `None`: the
+/// bridge keeps whatever preference (if any) it already has, rather than
+/// stomping it with the wire default. A present-but-garbled value still
+/// fails safe to the default.
+fn on_startup_from(headers: &axum::http::HeaderMap) -> Option<StartupBehavior> {
+    StartupBehavior::from_header_value(headers.get(ON_STARTUP_HEADER).and_then(|v| v.to_str().ok()))
 }
 
 /// Per-attempt start-cancellation handoff. Held in a `std::sync::Mutex` because
@@ -349,12 +365,16 @@ async fn handle_start<P: Proxy + 'static, R: Routing + 'static>(
     // response boundary's `redact_str`.
     hole_common::logging::redact_arm::arm_server(&config.server);
     let attempt_id = attempt_id_from(&headers);
-    // The `X-Hole-Covered` header marks an auto-connect intent, so the bridge
-    // engages a fail-closed cover that stays blocked on failure.
-    let covered = headers
-        .get("x-hole-covered")
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(|v| v.eq_ignore_ascii_case("true"));
+    let on_startup = on_startup_from(&headers);
+    // No wire signal for "covered" reaches this handler anymore (#979 — see
+    // `hole_common::protocol::BridgeRequest::Start`'s doc for why the GUI
+    // stopped asserting it). Every start this HTTP handler ever sees is
+    // client-initiated (a manual connect, or the elevation re-exec of one) —
+    // the only source of a genuinely auto-connect-covered start is the
+    // bridge's own boot-time reconciliation (#617, Task 7's
+    // `reconcile_once`), which calls `ProxyManager` directly and never goes
+    // through this handler at all.
+    let covered = false;
     #[allow(clippy::disallowed_methods)]
     // IPC root: every bridge cancel scope descends from this token. See clippy.toml CancellationToken::new rule.
     let token = CancellationToken::new();
@@ -405,6 +425,8 @@ async fn handle_start<P: Proxy + 'static, R: Routing + 'static>(
         cs.in_flight = None;
     }
 
+    persist_after_start(&state, &config, on_startup, result.is_ok()).await;
+
     match result {
         Ok(()) => Ok(Json(EmptyResponse {})),
         Err(e) => {
@@ -414,6 +436,69 @@ async fn handle_start<P: Proxy + 'static, R: Routing + 'static>(
             }
             Err(StartHandlerError::Failed(redact_outgoing((&e).into())))
         }
+    }
+}
+
+/// Persist the target and the startup preference after a start attempt
+/// settles. Two different gates, on purpose:
+///
+/// - `on_startup` is a GUI-pushed preference, not a record of what happened —
+///   when `Some`, it is written on every attempt regardless of `succeeded`,
+///   same as the GUI would push a Settings change whether or not the tunnel
+///   is up. `None` means the caller (the CLI, which has no Settings to push,
+///   #979) pushed nothing: the persisted preference is left exactly as it
+///   was, never stomped down to the wire default.
+/// - The target and the preference's `candidate` (the config
+///   `resolve_startup_target`'s `AlwaysConnect` arm falls back on) both
+///   record what actually happened, so they are gated on `succeeded`
+///   regardless of who started it: a `ProxyError::AlreadyRunning` is `Err`
+///   here specifically because `start_cancellable` left the
+///   ALREADY-running session's config untouched, and writing THIS request's
+///   config over the target would silently mismatch the two (see
+///   `ProxyManager::start_cancellable`'s `AlreadyRunning` guard, which
+///   precedes any config change).
+///
+/// Runs in `spawn_blocking`, since both `target::apply` and
+/// `save_startup_preference` are sync (`target::apply`'s lock is a leaf lock
+/// that must never cross an `.await` — see `TargetExclusive`). A failure here
+/// is logged, never surfaced as a start failure: the tunnel's own outcome is
+/// already decided by the time this runs, and a metadata-write hiccup must
+/// not retroactively turn an established connection into a reported failure.
+async fn persist_after_start<P: Proxy, R: Routing>(
+    state: &IpcState<P, R>,
+    config: &ProxyConfig,
+    on_startup: Option<StartupBehavior>,
+    succeeded: bool,
+) {
+    let state_dir = state.state_dir.clone();
+    let owner = state.owner;
+    let config = config.clone();
+    let outcome = tokio::task::spawn_blocking(move || -> Result<(), target::TargetError> {
+        if succeeded {
+            let candidate_config = config.clone();
+            target::apply(&state_dir, owner, move |_current| Target::Connected {
+                config: Box::new(config),
+            })?;
+            let mut pref = target::load_startup_preference(&state_dir);
+            if let Some(on_startup) = on_startup {
+                pref.on_startup = on_startup;
+            }
+            pref.candidate = Some(Box::new(candidate_config));
+            target::save_startup_preference(&state_dir, &pref, owner)
+        } else if let Some(on_startup) = on_startup {
+            let mut pref = target::load_startup_preference(&state_dir);
+            pref.on_startup = on_startup;
+            target::save_startup_preference(&state_dir, &pref, owner)
+        } else {
+            Ok(())
+        }
+    })
+    .await;
+
+    match outcome {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => error!(error = %e, "failed to persist target/startup-preference after start"),
+        Err(e) => error!(error = %e, "target-persistence task panicked"),
     }
 }
 
@@ -803,7 +888,10 @@ async fn handle_stop<P: Proxy + 'static, R: Routing + 'static>(
 ) -> Result<Json<EmptyResponse>, (StatusCode, Json<ErrorResponse>)> {
     let mut pm = state.proxy.lock().await;
     match pm.stop().await {
-        Ok(()) => Ok(Json(EmptyResponse {})),
+        Ok(()) => {
+            persist_target_off(&state).await;
+            Ok(Json(EmptyResponse {}))
+        }
         Err(e) => {
             error!(error = %e, "proxy stop failed");
             Err((
@@ -811,6 +899,24 @@ async fn handle_stop<P: Proxy + 'static, R: Routing + 'static>(
                 Json(ErrorResponse { message: e.to_string() }),
             ))
         }
+    }
+}
+
+/// Persist `Target::Off` after a user-requested stop settles successfully —
+/// the `SessionEvent::UserStopped` transition (`target_after`), applied here
+/// rather than through the session-death path, since a clean user stop is not
+/// something `check_health` ever observes (Task 6 is the crash/give-up path).
+/// Same `spawn_blocking` + log-don't-fail discipline as
+/// [`persist_after_start`]: the stop already succeeded, so a persistence
+/// hiccup must not be reported back to the caller as a stop failure.
+async fn persist_target_off<P: Proxy, R: Routing>(state: &IpcState<P, R>) {
+    let state_dir = state.state_dir.clone();
+    let owner = state.owner;
+    let outcome = tokio::task::spawn_blocking(move || target::apply(&state_dir, owner, |_current| Target::Off)).await;
+    match outcome {
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => error!(error = %e, "failed to persist target after stop"),
+        Err(e) => error!(error = %e, "target-persistence task panicked"),
     }
 }
 

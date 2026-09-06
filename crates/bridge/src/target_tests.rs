@@ -1,6 +1,7 @@
 use super::*;
 use hole_common::config::ServerEntry;
 use hole_common::protocol::TunnelMode;
+use std::sync::mpsc;
 
 fn test_config() -> ProxyConfig {
     ProxyConfig {
@@ -190,6 +191,232 @@ fn a_clean_machine_shutdown_leaves_the_target_connected() {
             config: Box::new(config)
         },
         "a clean machine shutdown must not clear reconnect-on-boot"
+    );
+}
+
+// Task 4: startup preference / apply ==================================================================================
+
+#[skuld::test]
+fn the_bridge_owns_the_startup_connect_decision() {
+    // The full truth table, relocated verbatim from `crates/hole/src/tray.rs`
+    // (#979) — see `the_gui_no_longer_decides` for the structural half of
+    // this guarantee.
+    assert!(!startup_should_connect(StartupBehavior::DoNotConnect, true));
+    assert!(!startup_should_connect(StartupBehavior::DoNotConnect, false));
+    assert!(startup_should_connect(StartupBehavior::RestoreLastState, true));
+    assert!(!startup_should_connect(StartupBehavior::RestoreLastState, false));
+    assert!(startup_should_connect(StartupBehavior::AlwaysConnect, true));
+    assert!(startup_should_connect(StartupBehavior::AlwaysConnect, false));
+}
+
+#[skuld::test]
+fn always_connect_overrides_a_persisted_off_target() {
+    let config = test_config();
+    let candidate = Some(Box::new(config.clone()));
+    assert_eq!(
+        resolve_startup_target(Target::Off, StartupBehavior::AlwaysConnect, candidate),
+        Target::Connected {
+            config: Box::new(config)
+        },
+        "AlwaysConnect must write Connected before the first reconcile"
+    );
+}
+
+#[skuld::test]
+fn restore_last_state_leaves_the_persisted_target_unchanged() {
+    let config = test_config();
+    for persisted in [
+        Target::Off,
+        Target::Connected {
+            config: Box::new(config.clone()),
+        },
+        Target::Unreadable,
+    ] {
+        assert_eq!(
+            resolve_startup_target(persisted.clone(), StartupBehavior::RestoreLastState, None),
+            persisted,
+            "RestoreLastState must leave the persisted target as-is"
+        );
+    }
+}
+
+#[skuld::test]
+fn do_not_connect_always_writes_off() {
+    let config = test_config();
+    for persisted in [
+        Target::Off,
+        Target::Connected {
+            config: Box::new(config.clone()),
+        },
+        Target::Unreadable,
+    ] {
+        assert_eq!(
+            resolve_startup_target(persisted, StartupBehavior::DoNotConnect, Some(Box::new(config.clone()))),
+            Target::Off,
+            "DoNotConnect must write Off regardless of what was persisted"
+        );
+    }
+}
+
+#[skuld::test]
+fn always_connect_keeps_an_already_connected_target_over_the_candidate() {
+    let persisted_config = test_config();
+    let mut candidate_config = test_config();
+    candidate_config.local_port = 9999;
+    let persisted = Target::Connected {
+        config: Box::new(persisted_config.clone()),
+    };
+    assert_eq!(
+        resolve_startup_target(
+            persisted,
+            StartupBehavior::AlwaysConnect,
+            Some(Box::new(candidate_config))
+        ),
+        Target::Connected {
+            config: Box::new(persisted_config)
+        },
+        "an already-Connected target is already fully specified; the candidate must not override it"
+    );
+}
+
+#[skuld::test]
+fn always_connect_with_no_candidate_and_no_persisted_target_stays_unchanged() {
+    assert_eq!(
+        resolve_startup_target(Target::Off, StartupBehavior::AlwaysConnect, None),
+        Target::Off,
+        "there is nothing to fabricate a connection from"
+    );
+    assert_eq!(
+        resolve_startup_target(Target::Unreadable, StartupBehavior::AlwaysConnect, None),
+        Target::Unreadable,
+        "there is nothing to fabricate a connection from"
+    );
+}
+
+#[skuld::test]
+fn setting_the_target_persists_the_startup_preference() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = test_config();
+    let pref = StartupPreference {
+        on_startup: StartupBehavior::AlwaysConnect,
+        candidate: Some(Box::new(config.clone())),
+    };
+    save_startup_preference(tmp.path(), &pref, None).unwrap();
+
+    // A fresh load (no in-memory state carried over) reads the same value
+    // back — the property the IPC target-set handler relies on to survive a
+    // bridge restart between "user connected" and "machine reboots".
+    assert_eq!(load_startup_preference(tmp.path()), pref);
+}
+
+#[skuld::test]
+fn an_absent_startup_preference_defaults_to_restore_last_state_with_no_candidate() {
+    let tmp = tempfile::tempdir().unwrap();
+    assert_eq!(load_startup_preference(tmp.path()), StartupPreference::default());
+    assert_eq!(
+        load_startup_preference(tmp.path()).on_startup,
+        StartupBehavior::RestoreLastState
+    );
+}
+
+#[skuld::test]
+fn a_corrupt_startup_preference_file_reads_as_default() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path()).unwrap();
+    std::fs::write(tmp.path().join(STARTUP_PREFERENCE_FILE_NAME), b"not json").unwrap();
+    assert_eq!(
+        load_startup_preference(tmp.path()),
+        StartupPreference::default(),
+        "a corrupt startup-preference file must not be treated as an always-connect authorization"
+    );
+}
+
+#[skuld::test]
+fn apply_round_trips_through_load_and_save() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = test_config();
+    let next = apply(tmp.path(), None, |_current| Target::Connected {
+        config: Box::new(config.clone()),
+    })
+    .unwrap();
+    assert_eq!(
+        next,
+        Target::Connected {
+            config: Box::new(config.clone())
+        }
+    );
+    assert_eq!(
+        load(tmp.path()),
+        Target::Connected {
+            config: Box::new(config)
+        },
+        "apply must have saved before returning"
+    );
+}
+
+#[skuld::test]
+fn a_second_apply_call_sees_the_first_ones_write_not_a_value_captured_before_acquiring() {
+    // Genuine two-thread race, real rendezvous (channels, no sleep/poll) —
+    // same shape as `tun_engine::exclusive`'s
+    // `acquire_blocks_until_the_holder_releases`. Thread A holds `apply`'s
+    // lock open (via a closure that blocks on a channel) while thread B's
+    // `apply` call is issued; B must block until A's whole load-apply-save
+    // section has completed, and then must observe A's write as `current`
+    // — proving `apply` loads fresh under the lock rather than composing
+    // from a value read before acquiring it, which is exactly what would let
+    // a session-event write and the `unlock` escape's write race instead of
+    // serializing.
+    let tmp = tempfile::tempdir().unwrap();
+    let state_dir = tmp.path().to_path_buf();
+    let config = test_config();
+    let connected = Target::Connected {
+        config: Box::new(config.clone()),
+    };
+
+    let (a_holding_tx, a_holding_rx) = mpsc::channel::<()>();
+    let (release_a_tx, release_a_rx) = mpsc::channel::<()>();
+    let a_dir = state_dir.clone();
+    let a_target = connected.clone();
+    let a = std::thread::spawn(move || {
+        apply(&a_dir, None, move |_current| {
+            a_holding_tx.send(()).unwrap();
+            // Real rendezvous: block inside the critical section until the
+            // main thread confirms B's `apply` call has been issued.
+            release_a_rx.recv().unwrap();
+            a_target
+        })
+        .unwrap();
+    });
+    // Blocks until A is actually inside the critical section — no poll.
+    a_holding_rx.recv().unwrap();
+
+    let (b_saw_tx, b_saw_rx) = mpsc::channel::<Target>();
+    let b_dir = state_dir.clone();
+    let b = std::thread::spawn(move || {
+        let next = apply(&b_dir, None, |current| {
+            b_saw_tx.send(current).unwrap();
+            Target::Off
+        })
+        .unwrap();
+        assert_eq!(next, Target::Off);
+    });
+
+    // Let A finish (save, release the lock), then wait for B to report what
+    // it observed as `current`.
+    release_a_tx.send(()).unwrap();
+    let seen_by_b = b_saw_rx.recv().unwrap();
+
+    a.join().unwrap();
+    b.join().unwrap();
+
+    assert_eq!(
+        seen_by_b, connected,
+        "B's apply must load A's write fresh, not a value captured before B acquired the lock"
+    );
+    assert_eq!(
+        load(&state_dir),
+        Target::Off,
+        "B's save must be the final state on disk"
     );
 }
 
