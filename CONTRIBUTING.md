@@ -68,9 +68,6 @@ cascade reads the filter decision, so DNS works even on a TCP-only plugin. See
 The running TUN device's name has exactly one source of truth at runtime:
 `tun_engine::device::TunIdentity`, read back from the device
 `Dispatcher::new` just opened. No other site may assume or hardcode a value —
-this replaced a real defect (bindreams/hole#850): Full mode could not start
-on macOS at all, because the dispatcher passed a fixed name to a platform
-that rejects one.
 
 - **Windows**: `TunName::Requested(WINDOWS_TUN_ALIAS)` —
   `WINDOWS_TUN_ALIAS` is the fixed constant `"hole-tun"`
@@ -253,8 +250,8 @@ privacy). The bridge carries DNS over the TCP tunnel:
     `apply_macos` publishes the (routed-family-filtered, see below)
     resolvers as a supplemental resolver at a synthetic, session-scoped
     `SCDynamicStore` key
-    ([`tun_engine::dns_steer`](crates/tun-engine/src/dns_steer.rs), the
-    mechanism validated by PR #877's spike): a dictionary naming a
+    ([`tun_engine::dns_steer`](crates/tun-engine/src/dns_steer.rs)): a
+    dictionary naming a
     nonexistent service (`{ ServerAddresses, SupplementalMatchDomains: [""], SearchOrder: 100000 }`) that configd merges as a resolver for
     every query, ranked above its own default. The store session opens with
     `session_keys(true)`, so the key is scoped to the bridge's own
@@ -269,10 +266,7 @@ privacy). The bridge carries DNS over the TCP tunnel:
     availability, which answer a different question; bindreams/hole#850's
     plan, decision D4); an empty filtered list is refused rather than
     silently advertising nothing.
-  - **Both platforms are fail-fatal**: since bindreams/hole#846 (Windows)
-    and bindreams/hole#868 (macOS), a failure to confine/steer aborts the
-    whole start rather than leaving a session the UI reports as connected
-    with a silent DNS leak. `crate::dns::system::phase`'s sealed
+  - **Both platforms are fail-fatal**: a failure to confine/steer aborts the whole start rather than leaving a session the UI reports as connected with a silent DNS leak. `crate::dns::system::phase`'s sealed
     `DnsPhase`/`LeakBearing`/`Cosmetic` split enforces this in the type
     system — mirroring `tun_engine::routing`'s `FatalPhase`/`BestEffortPhase`
     — so a backend call is generic over which phase runs it, and
@@ -1213,7 +1207,7 @@ The TUN-interface permit is proven against two real, live TUN devices
 both platforms): it passes traffic on the interface it names and is blocked
 when re-engaged naming a different live interface. A session-level composition
 guard additionally proves, on both platforms Hole ships Full mode on
-(`crates/bridge/src/proxy_manager_live_tun_permit_e2e_tests.rs`, bindreams/hole#874),
+(`crates/bridge/src/proxy_manager_live_tun_permit_e2e_tests.rs`),
 that an armed kill switch does not block its own session's tunnel traffic
 while blocking an off-tunnel probe. Whether it can also CATCH a future
 decoupling between the dispatcher's TUN identity and the one passed to

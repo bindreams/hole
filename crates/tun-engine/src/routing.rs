@@ -1808,8 +1808,7 @@ impl SystemRouting {
 /// disagree with which split routes actually landed. Lives here (not in
 /// `hole_bridge`, its only consumer) because `hole-bridge` depends on
 /// `tun-engine`, not the reverse — `hole_bridge::dns::system` re-exports
-/// this type rather than defining its own (bindreams/hole#850's plan, Task
-/// 5, decision D4).
+/// this type rather than defining its own .
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RoutedFamilies {
     pub v4: bool,

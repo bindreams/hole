@@ -133,7 +133,7 @@ impl Dispatcher {
             Device::build(|c: &mut MutDeviceConfig| {
                 // macOS's `utun` driver rejects any `Requested` name that
                 // doesn't already have the kernel's own `utunN` shape
-                // (bindreams/hole#850) — asking for the fixed
+                //  — asking for the fixed
                 // `WINDOWS_TUN_ALIAS` there fails before Full mode can start
                 // at all. `KernelAssigned` instead asks the driver for the
                 // next free `utunN` and reads the real name back via

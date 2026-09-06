@@ -3,7 +3,7 @@
 //! machine's DNS resolvers, without writing to any of the user's real
 //! network services.
 //!
-//! The mechanism (validated by PR #877's spike, on both darwin arches): a
+//! The mechanism : a
 //! dictionary `{ ServerAddresses: [...], SupplementalMatchDomains: [""],
 //! SearchOrder: 100000 }` published at `State:/Network/Service/<uuid>/DNS`
 //! — a service that does not exist — is merged by configd as a supplemental

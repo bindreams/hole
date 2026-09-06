@@ -27,7 +27,7 @@
 /// a space or a newline, is literal content): it must be doubled (`''`) to
 /// escape it, or it would terminate the string early and let the remainder
 /// be evaluated as PowerShell. A space is passed straight through, never
-/// refused: `hole-tun 2` (#936's disambiguated alias) is real production
+/// refused: `hole-tun 2`  is real production
 /// input, and refusing it would skip cleanup and leak the adapter — worse
 /// than the injection this guards against.
 #[cfg(any(target_os = "windows", test))]

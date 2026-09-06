@@ -13,20 +13,13 @@
 //! that rebuilt them would assert about its own copy. Both tests below assert
 //! about whatever the production path actually asks for.
 //!
-//! `dispatcher_opens_tun_device_the_os_accepts` is #864's originally-authored
-//! test, harvested here unchanged in intent: the device open (and clean
-//! shutdown) must succeed on every platform Hole ships Full mode on.
-//! `dispatcher_opens_tun_names_the_interface_it_opened` closes the
-//! name-coherence gap #864's own doc explicitly left open: it resolves
+//! `dispatcher_opens_tun_device_the_os_accepts`: the device open (and clean shutdown) must succeed on every platform Hole ships Full mode on. `dispatcher_opens_tun_names_the_interface_it_opened` closes a name-coherence gap: it resolves
 //! `identity().alias()` back to a live OS interface through
 //! [`tun_engine::gateway::interface_index_by_name`] — the same Windows
 //! `ConvertInterfaceAliasToLuid`+`ConvertInterfaceLuidToIndex` / macOS
 //! `if_nametoindex` lookup production route-install already trusts, made
 //! `pub` for this test rather than reimplemented against raw platform FFI —
-//! and, on macOS, that the resolved name has the kernel-assigned `utunN`
-//! shape Task 6 now actually requests (closes #850), rather than falling
-//! back to the constant Task 6 renamed to `WINDOWS_TUN_ALIAS` because it is
-//! meaningless off Windows.
+//! and, on macOS, that the resolved name has the kernel-assigned `utunN` shape, rather than the `WINDOWS_TUN_ALIAS` constant, which is meaningless off Windows.
 //!
 //! Runs on the elevated `tun` lane only — the `TUN` label (reused from
 //! `crate::test_support::skuld_fixtures`, this crate's "elevated lane" bucket)

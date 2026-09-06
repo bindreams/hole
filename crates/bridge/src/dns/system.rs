@@ -144,7 +144,7 @@ pub trait Dns: Send + Sync + 'static {
 /// Defined in `tun-engine` (not here) and re-exported: `hole-bridge` depends
 /// on `tun-engine`, not the reverse, and `Routing::Installed`'s
 /// `routed_families()` — the only producer of this value — lives on that
-/// crate's `RoutesInstalled` trait (bindreams/hole#850's plan, Task 5).
+/// crate's `RoutesInstalled` trait .
 pub use tun_engine::routing::RoutedFamilies;
 
 /// RAII guard returned by [`Dns::apply`]. See [`Dns::Applied`] for the
