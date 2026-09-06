@@ -23,7 +23,7 @@
 //! cannot run elevated (it does: `proxy_manager_live_tun_permit_e2e_tests.rs`
 //! and `proxy_manager_macos_full_tunnel_privileged_tests.rs` both do). Extending
 //! this `mod tun`'s roundtrip proof to macOS stays explicitly out of scope
-//! (bindreams/hole#850's plan, decision D5); `proxy_manager_macos_full_tunnel_privileged_tests.rs`
+//! (); `proxy_manager_macos_full_tunnel_privileged_tests.rs`
 //! covers macOS's Full-mode OS-effects seam instead, by a different method
 //! (reading the OS's own state back, not a roundtrip).
 //!

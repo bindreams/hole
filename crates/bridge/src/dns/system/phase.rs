@@ -6,7 +6,7 @@
 //! route command cannot be run by the wrong runner because the runner is
 //! generic over a sealed trait. Before this module, `dns/system.rs` had no
 //! such split — `if let Err(e) = res { warn!(…) }` was writable, and was
-//! written, on the macOS apply path (bindreams/hole#868), where it means a
+//! written, on the macOS apply path, where it means a
 //! silent DNS leak rather than a cosmetic miss.
 //!
 //! [`run`] is the *only* place either apply function may consume a backend

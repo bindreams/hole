@@ -309,7 +309,7 @@ mod macos_impl {
 
     // Step 2: the framework lifetime probe ============================================================================
 
-    /// SHIP GATE (Task 2 Step 2, #868). If this fails, configd does not
+    /// SHIP GATE. If this fails, configd does not
     /// honour `session_keys(true)` for a merged DNS entry on a graceful
     /// in-process drop, and D3 is unimplementable as written — **stop and
     /// escalate to Anna**. The fallback (persistent key + owner token +
@@ -414,7 +414,7 @@ mod macos_impl {
         }
     }
 
-    /// SHIP GATE (Task 2 Step 2b, #868). If this fails, a `SIGKILL`ed
+    /// SHIP GATE. If this fails, a `SIGKILL`ed
     /// process's session key survives it, D3's "no sweep" justification is
     /// false, and the resource-ownership rule in Global Constraints forbids
     /// improvising an ungated sweep to cover the gap — **stop and escalate**.

@@ -9,7 +9,7 @@
 //! `install_lockdown`), with the kill switch armed, still carries its own
 //! tunnel traffic, while a probe deliberately routed OFF the tunnel is
 //! blocked at the same instant. Runs on both platforms Hole ships Full mode
-//! on (bindreams/hole#850, #874) — the elevated `tun` lane below gates it,
+//! on — the elevated `tun` lane below gates it,
 //! and the bypass-route section further down is the one place the test body
 //! itself branches by platform (see that section's own doc for why).
 //!
@@ -24,7 +24,7 @@
 //!    one passed to `install_lockdown` splits by platform:
 //!    - **On Windows**, it cannot DEMONSTRATE that it would: `Dispatcher::new`
 //!      requests `TunName::Requested(WINDOWS_TUN_ALIAS)`, which `TunIdentity`
-//!      never reads back (bindreams/hole#850's read-back only happens under
+//!      never reads back (read-back only happens under
 //!      `KernelAssigned`, macOS-only), so the same `TunIdentity`
 //!      `proxy_manager.rs` threads to `install_lockdown` carries that same
 //!      requested alias by construction — the two cannot disagree without a

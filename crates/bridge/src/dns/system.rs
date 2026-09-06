@@ -12,17 +12,17 @@
 //!
 //! ## Windows: fail-fatal
 //!
-//! After bindreams/hole#846, the confinement is the ONLY thing standing
+//! the confinement is the ONLY thing standing
 //! between OS DNS and the LAN resolver. `apply` is fail-fatal on Windows:
 //! if the confinement cannot engage, or the resolver IPs cannot be set on
 //! `hole-tun`, the whole start aborts rather than leaving a session the UI
 //! reports as connected with a silent DNS leak.
 //!
-//! ## macOS: fail-fatal (#868)
+//! ## macOS: fail-fatal
 //!
 //! `apply_macos` no longer shells out to `networksetup` with an interface
 //! name — that identifier type is a *service* name, so passing it was a
-//! guaranteed no-op (the original #868 defect). It now publishes a
+//! guaranteed no-op. It now publishes a
 //! supplemental resolver at a synthetic, session-scoped `SCDynamicStore` key
 //! via `tun_engine::dns_steer` — the macOS analogue of the Windows
 //! confinement above: a process-scoped mechanism that needs no
@@ -38,7 +38,7 @@
 //! families the tunnel is actually carrying (`RoutedFamilies`, read once
 //! from the routes that landed — never from the TUN's own IPv6 read-back or
 //! the upstream gateway's IPv6 availability, both of which answer a
-//! different question; see bindreams/hole#850's plan, decision D4). An
+//! different question). An
 //! empty filtered list is refused rather than silently advertising nothing.
 //!
 //! ## Cancellation
@@ -136,8 +136,7 @@ pub trait Dns: Send + Sync + 'static {
 /// [`Dns::apply`] runs. Read once from the routes `Routing::install` just
 /// installed (ground truth) — never re-derived from the TUN's own IPv6
 /// read-back or the upstream gateway's IPv6 availability, both of which
-/// answer a different question (see bindreams/hole#850's plan, decision
-/// D4). Windows ignores this: the WFP DNS-egress confinement blocks
+/// answer a different question . Windows ignores this: the WFP DNS-egress confinement blocks
 /// off-tunnel DNS egress regardless of family, so there is nothing this
 /// filter would add there.
 ///

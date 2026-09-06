@@ -249,7 +249,7 @@ pub fn recover_lockdown(decision: crate::routing::CoverRecovery, state_dir: &Pat
 ///
 /// macOS's lockdown ruleset matches the TUN by literal interface name (`pass
 /// out quick on utunN` — the kernel-assigned name `TunIdentity::alias` reads
-/// back, bindreams/hole#850, not the fixed `hole-tun` Windows requests), not
+/// back, not the fixed `hole-tun` Windows requests), not
 /// a numeric index the OS can silently reassign to an unrelated adapter, so
 /// there is no macOS analogue and this is a no-op there.
 pub fn reclaim_stale_tun_permit(tun_name: &str) {

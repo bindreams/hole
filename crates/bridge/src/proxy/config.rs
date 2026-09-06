@@ -285,7 +285,7 @@ pub const TUN_SUBNET6: &str = "fdf8:f6d5:536e::1/64";
 /// The fixed TUN adapter alias `Dispatcher::new` requests on Windows, where
 /// `tun`/wintun honor a requested name exactly. Meaningless on macOS: a
 /// `Requested` name there is rejected outright unless it already has the
-/// kernel's own `utunN` shape (bindreams/hole#850), so macOS instead asks for
+/// kernel's own `utunN` shape, so macOS instead asks for
 /// `TunName::KernelAssigned` and reads the real name back — see
 /// `crate::dispatcher::Dispatcher::new`. Crate-private: nothing outside
 /// `hole-bridge` names the adapter directly.

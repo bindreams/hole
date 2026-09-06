@@ -6,7 +6,7 @@
 //! runs before `routing.install`, before either fail-closed cover, and before
 //! `Dns::apply`. If the OS refuses the device, Full mode cannot start at all
 //! and nothing downstream is ever reached. No test had ever asked a
-//! non-Windows platform to create one before this file (bindreams/hole#850).
+//! non-Windows platform to create one before this file.
 //!
 //! Drives `Dispatcher::new` rather than `Device::build` with a copied config:
 //! the device name, subnet and MTU are chosen INSIDE the dispatcher, so a test
@@ -36,7 +36,7 @@
 //! subnet), so it must not run beside another real-device or real-cover test.
 //! `cargo xtask verify-global-net-state-labels` binds that name-substring
 //! membership to the `GLOBAL_NET_STATE` skuld label carried on both tests
-//! (bindreams/hole#894) — rename either only in lockstep with the other AND
+//! — rename either only in lockstep with the other AND
 //! with the filter.
 
 #![allow(clippy::disallowed_methods)] // this fixture builds its own root cancel token; see clippy.toml
@@ -95,7 +95,7 @@ async fn dispatcher_opens_tun_device_the_os_accepts() {
     dispatcher.shutdown().await;
 }
 
-/// The name-coherence gap #864 explicitly left open: the dispatcher's own
+/// The name-coherence gap : the dispatcher's own
 /// `identity().alias()` — not a name this test picked — must resolve, through
 /// the OS's own interface-name table, to the live interface the dispatcher
 /// just opened; and on macOS, where the name is kernel-assigned rather than

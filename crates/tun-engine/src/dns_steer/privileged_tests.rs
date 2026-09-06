@@ -2,9 +2,7 @@
 //!
 //!
 //! (`macos_dns_supplemental_spike.rs`), which proved the underlying mechanism
-//! on real hardware in CI, on both darwin arches (`MECHANISM: YES`,
-//! `Test hole (darwin/amd64)` and `Test hole (darwin/arm64)`, run
-//! `32661621358`, commit `e8717d669dff75d9a8e19fa78895297beec8fbda`). This
+//! . This
 //! test is that spike's mechanism, minus the hand-rolled `SCDynamicStore`
 //! calls the spike used to explore the shape: it drives the real
 //! [`super::engage`]/[`super::Steering`] production API instead, so what is
@@ -332,7 +330,7 @@ impl Drop for RouteGuard {
 }
 
 /// SHIP GATE . If this fails, `engage` does not steer macOS DNS
-/// as designed — the module doc's cross-reference to PR #877's CI-confirmed
+/// as designed — the module doc's cross-reference to
 /// spike is what justifies treating that as a stop-and-escalate rather than
 /// a routine regression: the underlying mechanism is proven, so a failure
 /// here means the production wiring around it (the session-scoped key, the

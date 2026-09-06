@@ -1801,8 +1801,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
             let advertise_ips: Vec<IpAddr> = config.dns.servers.clone();
             // Ground truth for D4's filter: exactly the families `routes`
             // itself confirmed landed, read directly off the guard — no OS
-            // probe, no second measurement (bindreams/hole#850's plan, Task
-            // 5, decision D4; see `RoutesInstalled::routed_families`).
+            // probe, no second measurement , decision D4; see `RoutesInstalled::routed_families`).
             let routed = routes.routed_families();
             match dns
                 .apply(advertise_ips, routed, tun_identity, server_ip, cancel.clone())
@@ -2216,18 +2215,18 @@ mod proxy_manager_e2e_tests;
 // the production path with the kill switch armed still carries its own
 // tunnel traffic while an off-tunnel probe is blocked. See that module's doc
 // for what it does and does not establish. Runs on both platforms Hole ships
-// Full mode on (bindreams/hole#850, #874) — the elevated `tun` lane gates it
+// Full mode on — the elevated `tun` lane gates it
 // (see that module's own doc), not a platform `cfg`.
 #[cfg(test)]
 #[path = "proxy_manager_live_tun_permit_e2e_tests.rs"]
 mod proxy_manager_live_tun_permit_e2e_tests;
 
-// The #893 seam: a real Full-mode start's three OS-visible effects (utun,
+// a real Full-mode start's three OS-visible effects (utun,
 // split routes, derived DNS config) and their clean removal, judged only by
 // reading the OS back — never our own return values. macOS-only (the file is
 // `#![cfg(target_os = "macos")]`); the module is still registered
 // unconditionally so a non-macOS build still typechecks the `cfg`-gated
-// contents (bindreams/hole#850, #868, #893).
+// contents.
 #[cfg(test)]
 #[path = "proxy_manager_macos_full_tunnel_privileged_tests.rs"]
 mod proxy_manager_macos_full_tunnel_privileged_tests;

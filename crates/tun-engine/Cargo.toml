@@ -61,10 +61,10 @@ smoltcp = { version = "0.13", default-features = false, features = [
 
 [target.'cfg(target_os = "macos")'.dependencies]
 libc = "0.2"
-# DNS steering (`dns_steer`, refs #868) publishes a supplemental resolver at
+# DNS steering (`dns_steer`) publishes a supplemental resolver at
 # a synthetic `SCDynamicStore` key. `system-configuration` 0.7 is built
 # against `core-foundation` 0.9, so this crate uses 0.9 too or the CF types
-# will not unify — same pin PR #877's spike used.
+# will not unify — same pin .
 system-configuration = "0.7"
 core-foundation = "0.9"
 # Per-session synthetic-service UUID for `dns_steer`'s session-scoped key
@@ -128,7 +128,7 @@ harness = false
 # Own binary for the same reason as `gateway_privileged` above: skuld's
 # exactly-one-label-declaration-per-binary rule, plus this binary needs its
 # own `main` to branch into Step 2b's self-re-exec holder mode before
-# `skuld::run_all` (refs #868 Task 2 Steps 2/2b).
+# `skuld::run_all`.
 [[test]]
 name = "macos_session_key_lifetime_probe"
 path = "tests/macos_session_key_lifetime_probe.rs"

@@ -122,7 +122,7 @@ crate sets for the IPv4 address on every Full-mode start.
 **Assignment is fatal on Windows and warn-only on macOS.** A missing route is a
 leak; a missing address is a blackhole, and Windows is where the path is
 tested. The macOS TUN-naming defect that used to block Full mode from
-starting at all is fixed (bindreams/hole#850), and real tests now exercise
+starting at all is fixed, and real tests now exercise
 this path there (`crates/tun-engine/src/dns_steer/privileged_tests.rs`,
 `crates/bridge/src/proxy_manager_macos_full_tunnel_privileged_tests.rs`) —
 but neither asserts anything about IPv6 assignment specifically, so the
@@ -245,7 +245,7 @@ privacy). The bridge carries DNS over the TCP tunnel:
     with the bridge and needs no crash-recovery state.
   - **macOS**: `networksetup`'s DNS subcommands take a network-*service*
     name (e.g. "Wi-Fi"), never an interface name — passing the TUN
-    interface's name here was the original #868 defect, a guaranteed no-op,
+    interface's name here was a guaranteed no-op,
     since there is no service by that name to configure. Instead,
     `apply_macos` publishes the (routed-family-filtered, see below)
     resolvers as a supplemental resolver at a synthetic, session-scoped
@@ -263,7 +263,7 @@ privacy). The bridge carries DNS over the TCP tunnel:
     address families the tunnel is actually carrying (`RoutedFamilies`,
     read once from the routes `Routing::install` just landed — never from
     the TUN's own IPv6 read-back or the upstream gateway's IPv6
-    availability, which answer a different question; bindreams/hole#850's
+    availability, which answer a different question;
     plan, decision D4); an empty filtered list is refused rather than
     silently advertising nothing.
   - **Both platforms are fail-fatal**: a failure to confine/steer aborts the whole start rather than leaving a session the UI reports as connected with a silent DNS leak. `crate::dns::system::phase`'s sealed
@@ -1215,7 +1215,7 @@ decoupling between the dispatcher's TUN identity and the one passed to
 (`WINDOWS_TUN_ALIAS`) is a fixed constant every install shares, so the two
 cannot disagree without a bug in the threading itself, and the test is a pure
 composition guard there; on macOS the name is kernel-assigned and read back
-per session (bindreams/hole#850), so `identity().alias()` names the specific
+per session, so `identity().alias()` names the specific
 device that session's own `Dispatcher::new` call opened, and a refactor that
 threaded the wrong `TunIdentity` to `install_lockdown` would name a different
 live interface — a real, catchable divergence, making the macOS run strictly

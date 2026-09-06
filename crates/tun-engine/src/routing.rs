@@ -1315,11 +1315,11 @@ where
     // compile-time constant shared by every install, so it names the same
     // device a different install's cover would too. On macOS there is no
     // such fallback (`tun_name` is `None`: the name is kernel-assigned and
-    // unknowable ahead of opening the device, bindreams/hole#850) — a wiped
+    // unknowable ahead of opening the device) — a wiped
     // `bridge-routes.json` there leaves `tun_name_hint` `None` and the
     // reclaim below a no-op, never a cross-install guess. Either way, only
     // the reclaim's server-IP counterpart is scoped by the per-install
-    // identity gap CONTRIBUTING.md discloses (#878), and this reclaim never
+    // identity gap CONTRIBUTING.md discloses, and this reclaim never
     // touches that permit.
     lockdown_recover(decision.action, tun_name_hint.as_deref());
 
@@ -1404,7 +1404,7 @@ pub trait Routing: Send + Sync {
     /// Takes the whole [`TunIdentity`](crate::device::TunIdentity) (not a
     /// bare name) so the alias reaching the route table, the lockdown cover,
     /// and DNS steering all provably come from the SAME opened device — the
-    /// device-name plumbing bindreams/hole#850 fixed. The conversion to a
+    /// device-name plumbing. The conversion to a
     /// bare name happens once, at this trait boundary; everything below it
     /// keeps using `&str`.
     fn install(

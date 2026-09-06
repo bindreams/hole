@@ -46,7 +46,7 @@ use crate::{GLOBAL_NET_STATE, TUN};
 /// `Device::build` from inside `tokio::task::spawn_blocking`
 /// (`crates/bridge/src/dispatcher.rs`), whose worker threads carry the
 /// runtime's `Handle`; this was the first time this exact test ran the real
-/// macOS path (bindreams/hole#850/#868) and the first time it did so bare.
+/// macOS path and the first time it did so bare.
 #[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
 fn device_opens_a_kernel_assigned_utun() {
     let rt = tokio::runtime::Builder::new_current_thread()

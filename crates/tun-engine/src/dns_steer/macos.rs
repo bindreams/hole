@@ -18,8 +18,7 @@ use system_configuration::sys::schema_definitions::{
     kSCPropNetDNSSearchOrder, kSCPropNetDNSServerAddresses, kSCPropNetDNSSupplementalMatchDomains,
 };
 
-/// Below configd's 200000 default search order — carried verbatim from the
-/// proven spike (PR #877), matching Tailscale's own choice.
+/// Below configd's 200000 default search order —  Tailscale's own choice.
 const SEARCH_ORDER: i32 = 100_000;
 
 #[derive(Debug, thiserror::Error)]

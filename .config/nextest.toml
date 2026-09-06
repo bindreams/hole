@@ -75,7 +75,7 @@ nextest-version = "0.9.130"
 #   - `gateway_global_net_state_` prefix (creates a real wintun adapter to
 #     prove the upstream-route lookup can see an IfType 53 adapter):
 #     crates/tun-engine/tests/gateway_privileged.rs
-#   - `opens_a_kernel_assigned` substring (refs #850 — creates a real `utun`
+#   - `opens_a_kernel_assigned` substring (creates a real `utun`
 #     adapter with no requested name and reads the kernel-assigned one back
 #     via the OS's own interface-name table; NOT the bare `kernel_assigned`
 #     substring, which also matches the unlabelled unprivileged unit tests
@@ -83,17 +83,17 @@ nextest-version = "0.9.130"
 #     `kernel_assigned_build_fails_when_the_device_cannot_report_its_name` in
 #     the same binary):
 #     crates/tun-engine/src/device/privileged_tests.rs
-#   - `dns_steer_global_net_state_` prefix (refs #868 — points the WHOLE
+#   - `dns_steer_global_net_state_` prefix (points the WHOLE
 #     MACHINE's DNS at a black-hole resolver for the test's duration via a
 #     real `SCDynamicStore` session, so it must never run beside another test
 #     that resolves a name):
 #     crates/tun-engine/src/dns_steer/privileged_tests.rs
-#   - `macos_dns_global_net_state_` prefix (refs #868 Task 2 Steps 2/2b — the
+#   - `macos_dns_global_net_state_` prefix (the
 #     raw session-key-lifetime probe and the SIGKILL crash-path probe; both
 #     publish a real synthetic-service DNS key, same reasoning as the prefix
 #     above):
 #     crates/tun-engine/tests/macos_session_key_lifetime_probe.rs
-#   - `dispatcher_opens_tun_` prefix (refs #850 — the production
+#   - `dispatcher_opens_tun_` prefix (the production
 #     `Dispatcher::new` opens a real TUN device, and on macOS it is a
 #     kernel-assigned `utun` adapter with no fixed name):
 #     crates/bridge/src/dispatcher_privileged_tests.rs

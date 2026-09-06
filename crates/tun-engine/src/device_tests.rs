@@ -67,7 +67,7 @@ fn build_rejects_an_empty_requested_name() {
 
 /// `TunName::KernelAssigned` exists as a variant on every platform (so
 /// matching on it is genuinely refutable everywhere, not irrefutable on
-/// non-macOS by construction — bindreams/hole#850/#868), but only macOS's
+/// non-macOS by construction — ), but only macOS's
 /// `utun` driver actually grants one. This validation runs before any OS
 /// call, so it needs no elevation to exercise — unlike macOS's acceptance
 /// path, covered instead by the elevated
