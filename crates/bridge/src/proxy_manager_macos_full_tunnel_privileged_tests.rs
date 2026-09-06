@@ -1,5 +1,4 @@
-//! macOS-only privileged smoke test for a real Full-mode start — the #893
-//! seam (refs bindreams/hole#850, #868).
+//! macOS-only privileged smoke test for a real Full-mode start.
 //!
 //! Every other Full-mode e2e in this crate (`proxy_manager_e2e_tests.rs`'s
 //! `mod tun`, `proxy_manager_live_tun_permit_e2e_tests.rs`) is driven through
@@ -9,8 +8,7 @@
 //! the OS's own interface list, routing table, and resolver configuration
 //! actually show what Hole claims to have done? On macOS that question was
 //! previously unanswerable at all — `TUN_DEVICE_NAME` didn't exist as
-//! something `Dispatcher::new` could open until Task 6 (closes #850), and
-//! `SystemDns::apply` was a no-op until Task 3 (closes #868).
+//! something `Dispatcher::new` could open, and `SystemDns::apply` was a silent no-op.
 //!
 //! Every fact this test asserts is read from the OS — `ifconfig -l`,
 //! `netstat -rn -f inet`, `scutil --dns` — never from a `BridgeResponse`
@@ -25,11 +23,14 @@
 //! `com.apple.system.SystemConfiguration.dns_configuration` notification
 //! before the mutating call (`Start`, then `Stop`) and block on it before
 //! reading `scutil --dns`** — a bare read races configd's own
-//! recomputation and can pass vacuously in either direction. Harness lifted
-//! from `tun_engine::dns_steer::privileged_tests` (this crate cannot import
-//! that module's private items, so it is duplicated here rather than made
-//! `pub`, matching how that file itself duplicated the pattern rather than
-//! sharing it with anything else).
+//! recomputation and can pass vacuously in either direction. The harness is
+//! copied from `tun_engine::dns_steer::privileged_tests` — the original —
+//! because this crate cannot reach that module's private items. It now
+//! exists three times: there, here, and
+//! `tun-engine/tests/macos_session_key_lifetime_probe.rs`, each carrying its
+//! own `unsafe` `notify_register_file_descriptor` declarations.
+//! `tun_engine::test_utils` is the natural home for one shared copy;
+//! tracked separately rather than done here.
 //!
 //! `DnsConfig::default()` (real Cloudflare resolvers, DoH) is used rather
 //! than a synthetic/unreachable address: the bridge's own start-time
@@ -222,6 +223,12 @@ fn netstat_inet() -> String {
         .unwrap_or_else(|e| format!("HARNESS: failed to spawn netstat -rn -f inet: {e}"))
 }
 
+/// Ordinary addresses inside each IPv4 split, for [`route_get_interface`].
+/// Deliberately not the `0.0.0.0` / `128.0.0.0` base addresses — see that
+/// function's doc for why the base address answers the wrong question.
+const SPLIT_LOW_PROBE: &str = "1.2.3.4";
+const SPLIT_HIGH_PROBE: &str = "200.1.2.3";
+
 /// The interface the kernel's own longest-prefix-match lookup picks for
 /// `dest`, per `route -n get <dest>` — a real routing-table read, not a
 /// rendering of one. Chosen over parsing `netstat -rn -f inet`'s destination
@@ -245,12 +252,6 @@ fn netstat_inet() -> String {
 /// Stop) the lookup answers with whatever route already covers it
 /// (typically the default), which the caller asserts differs from the TUN
 /// interface.
-/// Ordinary addresses inside each IPv4 split, for [`route_get_interface`].
-/// Deliberately not the `0.0.0.0` / `128.0.0.0` base addresses — see that
-/// function's doc for why the base address answers the wrong question.
-const SPLIT_LOW_PROBE: &str = "1.2.3.4";
-const SPLIT_HIGH_PROBE: &str = "200.1.2.3";
-
 fn route_get_interface(dest: &str) -> Option<String> {
     let output = Command::new("route")
         .args(["-n", "get", dest])
@@ -409,12 +410,12 @@ async fn run_macos_full_tunnel_os_state_e2e(dist: &Path, ss: &SsServerHandle) {
     assert_ne!(
         low_half_after_stop.as_deref(),
         Some(iface.as_str()),
-        "expected route -n get 0.0.0.0 to no longer answer '{iface}' after Stop, got {low_half_after_stop:?}"
+        "expected route -n get {SPLIT_LOW_PROBE} to no longer answer '{iface}' after Stop, got {low_half_after_stop:?}"
     );
     assert_ne!(
         high_half_after_stop.as_deref(),
         Some(iface.as_str()),
-        "expected route -n get 128.0.0.0 to no longer answer '{iface}' after Stop, got {high_half_after_stop:?}"
+        "expected route -n get {SPLIT_HIGH_PROBE} to no longer answer '{iface}' after Stop, got {high_half_after_stop:?}"
     );
 
     let unmerged = stop_notify.settle(budget(30), &configured_servers[0], false);
