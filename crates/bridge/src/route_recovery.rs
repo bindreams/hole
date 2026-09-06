@@ -40,10 +40,16 @@ where
     // Taken from the manager rather than re-derived, so recovery's intent
     // repair cannot chown to a different owner than the manager's own writes.
     let owner = proxy.lock().await.state_owner();
-    let outcome = tokio::task::spawn_blocking(move || {
-        tun_engine::routing::recover_routes(&dir, owner, crate::proxy::TUN_DEVICE_NAME)
-    })
-    .await;
+    // The reclaim's compile-time fallback name — `Some` where the platform
+    // has a fixed constant to offer (Windows), `None` where the real device
+    // name is kernel-assigned and unknowable ahead of opening it (macOS);
+    // see `tun_engine::routing::recover_routes`'s doc.
+    #[cfg(target_os = "windows")]
+    let tun_name_fallback = Some(crate::proxy::config::WINDOWS_TUN_ALIAS);
+    #[cfg(not(target_os = "windows"))]
+    let tun_name_fallback = None;
+    let outcome =
+        tokio::task::spawn_blocking(move || tun_engine::routing::recover_routes(&dir, owner, tun_name_fallback)).await;
     record_recovery_outcome(outcome, proxy).await;
 }
 

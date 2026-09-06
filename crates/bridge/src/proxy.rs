@@ -16,9 +16,10 @@
 //
 // Module layout:
 //
-// - [`config`] — `ProxyError`, `TUN_DEVICE_NAME`, `TUN_SUBNET`,
-//   `TUN_SUBNET6`, and the
-//   shadowsocks-service config builder. Not conceptually part of the
+// - [`config`] — `ProxyError`, `TUN_SUBNET`, `TUN_SUBNET6`, the
+//   Windows-only `WINDOWS_TUN_ALIAS` (crate-private: macOS instead discovers
+//   its adapter name from the OS, see `crate::dispatcher::Dispatcher::new`),
+//   and the shadowsocks-service config builder. Not conceptually part of the
 //   `Proxy` trait but lives in the same module tree because everything
 //   proxy-related is funneled through this module.
 // - [`shadowsocks`] — `ShadowsocksProxy` / `ShadowsocksRunning`, the
@@ -31,7 +32,7 @@ pub mod plugin;
 pub mod plugin_log;
 pub mod shadowsocks;
 
-pub use config::{build_ss_config, validate_proxy_config, ProxyError, TUN_DEVICE_NAME, TUN_SUBNET, TUN_SUBNET6};
+pub use config::{build_ss_config, validate_proxy_config, ProxyError, TUN_SUBNET, TUN_SUBNET6};
 pub use shadowsocks::{ShadowsocksProxy, ShadowsocksRunning};
 
 // Used by `server_test.rs` + `proxy_tests.rs`. Kept crate-private so

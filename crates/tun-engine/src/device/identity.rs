@@ -177,6 +177,43 @@ impl TunIdentity {
     }
 }
 
+/// Seam over the one OS call [`super::config::TunName::KernelAssigned`]'s
+/// read-back needs — `tun::AbstractDevice::tun_name` — so
+/// [`resolve_identity`] is unit-testable without a real device. Implemented
+/// for `tun::AsyncDevice` in `super` (device.rs, unconditionally — the
+/// underlying `tun` call is itself cross-platform); tests substitute a fake.
+pub(crate) trait NameSource {
+    fn tun_name(&self) -> std::io::Result<String>;
+}
+
+/// Resolve the identity of a just-opened device given what name was
+/// requested and its LUID (`0`, meaningless off Windows).
+///
+/// `Requested` carries the configured name straight through — `source` is
+/// NEVER consulted. See [`super::config::TunName`]'s doc for why: reading
+/// back a name the OS was already told to use would only add a new failure
+/// mode, for a value Windows never needed to be told.
+///
+/// `KernelAssigned` has no requested name at all, so `source.tun_name()` is
+/// the ONLY source, and its failure is fatal — falling back is impossible by
+/// construction. This arm is reachable on every platform the type checker
+/// sees, but [`super::Device::build`]'s validation rejects `KernelAssigned`
+/// with `InvalidConfig` before a device is ever opened on a non-macOS
+/// platform, so it never actually runs there.
+pub(crate) fn resolve_identity<T: NameSource>(
+    requested: &super::config::TunName,
+    source: &T,
+    luid: u64,
+) -> Result<TunIdentity, crate::error::DeviceError> {
+    match requested {
+        super::config::TunName::Requested(name) => Ok(TunIdentity::from_open_device(name, luid)),
+        super::config::TunName::KernelAssigned => source
+            .tun_name()
+            .map(|name| TunIdentity::from_open_device(&name, luid))
+            .map_err(crate::error::DeviceError::TunOpen),
+    }
+}
+
 #[cfg(test)]
 #[path = "identity_tests.rs"]
 mod identity_tests;

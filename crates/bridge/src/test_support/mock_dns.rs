@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 
 use tokio_util::sync::CancellationToken;
 
-use crate::dns::system::{Dns, DnsApplied, DnsError};
+use crate::dns::system::{Dns, DnsApplied, DnsError, RoutedFamilies};
 
 /// One recorded [`Dns::apply`] call. `targets` is named generically — not
 /// `apply_aliases` — because it carries the single `TunIdentity`'s alias
@@ -18,6 +18,11 @@ pub(crate) struct DnsApplyCall {
     pub(crate) advertise_ips: Vec<IpAddr>,
     pub(crate) targets: Vec<String>,
     pub(crate) server_ip: IpAddr,
+    /// What `RoutesInstalled::routed_families` reported for the install this
+    /// apply followed — recorded so a test can prove the value actually
+    /// travels from the routes guard to `Dns::apply`, rather than both ends
+    /// being correct in isolation.
+    pub(crate) routed: RoutedFamilies,
 }
 
 /// Instrumentation shared between `MockDns` and the handle a test clones
@@ -82,6 +87,7 @@ impl Dns for MockDns {
     async fn apply(
         &self,
         advertise_ips: Vec<IpAddr>,
+        routed: RoutedFamilies,
         tun: tun_engine::TunIdentity,
         server_ip: IpAddr,
         _cancel: CancellationToken,
@@ -99,6 +105,7 @@ impl Dns for MockDns {
             advertise_ips,
             targets: vec![tun.alias().to_string()],
             server_ip,
+            routed,
         });
         Ok(MockDnsApplied {
             state: Arc::clone(&self.state),

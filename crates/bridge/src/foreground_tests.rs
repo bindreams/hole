@@ -11,8 +11,8 @@ use std::path::PathBuf;
 use tokio::io::AsyncBufReadExt as _;
 use tokio::task::JoinHandle;
 use tun_engine::gateway::{GatewayInfo, NextHop};
-use tun_engine::routing::Routing;
-use tun_engine::RoutingError;
+use tun_engine::routing::{RoutedFamilies, RoutesInstalled, Routing};
+use tun_engine::{RoutingError, TunIdentity};
 
 #[skuld::test]
 fn sweep_wiring_reports_and_deletes_bridge_marker() {
@@ -133,7 +133,7 @@ impl StubRouting {
 impl Routing for StubRouting {
     type Installed = StubRoutes;
     type Cover = StubCover;
-    fn install(&self, _: &str, _: IpAddr, _: &GatewayInfo) -> Result<StubRoutes, RoutingError> {
+    fn install(&self, _: &TunIdentity, _: IpAddr, _: &GatewayInfo) -> Result<StubRoutes, RoutingError> {
         Ok(StubRoutes {
             _state_dir: self.state_dir.clone(),
         })
@@ -159,7 +159,7 @@ impl Routing for StubRouting {
     fn install_failclosed_cover(&self, _: IpAddr, _: Option<IpAddr>) -> Result<StubCover, RoutingError> {
         Ok(StubCover)
     }
-    fn install_lockdown(&self, _: IpAddr, _: &str, _: &[PathBuf]) -> Result<StubCover, RoutingError> {
+    fn install_lockdown(&self, _: IpAddr, _: &TunIdentity, _: &[PathBuf]) -> Result<StubCover, RoutingError> {
         Ok(StubCover)
     }
     fn release_all_covers(&self) -> Result<(), RoutingError> {
@@ -170,6 +170,16 @@ impl Routing for StubRouting {
 struct StubRoutes {
     // Unused; held only to mirror production's state-dir-owning routes type.
     _state_dir: PathBuf,
+}
+
+impl RoutesInstalled for StubRoutes {
+    // This stub carries no real route state to read a partial result from —
+    // every real production/mock `Routing::install` in this codebase is
+    // fail-closed (a narrowed `installed` is never returned `Ok`), so `Ok`
+    // always means "everything planned landed".
+    fn routed_families(&self) -> RoutedFamilies {
+        RoutedFamilies { v4: true, v6: true }
+    }
 }
 
 struct StubCover;

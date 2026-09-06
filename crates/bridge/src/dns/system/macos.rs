@@ -10,11 +10,21 @@
 //! [bindreams/hole#165](https://github.com/bindreams/hole/issues/165).
 //! Production goes through [`Networksetup`]; unit tests substitute
 //! `MockMacBackend` via [`crate::dns::system::SystemDns::new_with_mac_backend`].
-//! `get_settings` / `restore` / `restore_family` are used ONLY by
-//! `crate::dns::recovery`'s upgrade sweep. Apply on this platform stays
-//! advisory: `apply_macos` hands `hole-tun` — an *interface* name — to
-//! this service-name-keyed API, a guaranteed no-op until #868 lands the
-//! real mechanism.
+//! `get_settings` / `set_servers` / `restore` / `restore_family` are used
+//! ONLY by `crate::dns::recovery`'s upgrade sweep now — `apply_macos` no
+//! longer calls `set_servers` (refs #868; see
+//! [`crate::dns::system`]'s module doc), because that identifier type is a
+//! *service* name, and `apply_macos` was handing it `hole-tun`, an
+//! *interface* name: a guaranteed no-op. It now steers DNS via
+//! [`MacDnsSteerer`] instead.
+//!
+//! [`MacDnsSteerer`] / [`SteeringHandle`] — the apply-path seam, mirroring
+//! [`super::windows::DnsConfiner`]'s shape but not its `Box<dyn Any + Send>`
+//! erasure: `DnsApplied::shutdown` needs to *call* `withdraw`
+//! (confirmable, not `Drop`-only — Decided-without-asking #6), not merely
+//! hold and drop the guard. Production goes through [`RealMacDnsSteerer`],
+//! backed by `tun_engine::dns_steer::engage`; unit tests substitute a mock
+//! via [`crate::dns::system::SystemDns::new_with_mac_backend`].
 
 use std::io;
 use std::net::IpAddr;
@@ -248,3 +258,54 @@ fn set_dnsservers(svc: &str, ips: &[IpAddr]) -> io::Result<()> {
 fn clear_dnsservers(svc: &str) -> io::Result<()> {
     set_dnsservers(svc, &[])
 }
+
+// MacDnsSteerer / SteeringHandle ======================================================================================
+
+/// The bridge-side seam over `tun_engine::dns_steer::engage`. Production
+/// [`RealMacDnsSteerer`] calls it directly; unit tests substitute a mock so
+/// `SystemDns::apply`'s cancel / routed-family / error handling is
+/// testable without a real `SCDynamicStore` session. See the module doc.
+pub trait MacDnsSteerer: Send + Sync + 'static {
+    /// Publish the supplemental resolver key for `servers` — see
+    /// `tun_engine::dns_steer::engage`.
+    fn engage(&self, servers: &[IpAddr]) -> io::Result<Box<dyn SteeringHandle>>;
+}
+
+/// Guard for the engaged DNS steering. `withdraw` is confirmable — it
+/// consumes the box, so it can only be called once. `Drop` on the
+/// concrete production type is the crash/unwind fallback — see
+/// `tun_engine::dns_steer::Steering`'s own doc.
+pub trait SteeringHandle: Send {
+    fn withdraw(self: Box<Self>) -> io::Result<()>;
+}
+
+/// Production [`MacDnsSteerer`]. Stateless; calls
+/// `tun_engine::dns_steer::engage` directly.
+#[derive(Default, Debug, Clone, Copy)]
+pub struct RealMacDnsSteerer;
+
+impl MacDnsSteerer for RealMacDnsSteerer {
+    fn engage(&self, servers: &[IpAddr]) -> io::Result<Box<dyn SteeringHandle>> {
+        tun_engine::dns_steer::engage(servers)
+            .map(|s| Box::new(s) as Box<dyn SteeringHandle>)
+            .map_err(io::Error::other)
+    }
+}
+
+impl SteeringHandle for tun_engine::dns_steer::Steering {
+    fn withdraw(self: Box<Self>) -> io::Result<()> {
+        // Move the guard out of the box so its by-value inherent
+        // `withdraw` (not this trait method — inherent methods win method
+        // resolution) can run.
+        let inner = *self;
+        let key = inner.key().to_string();
+        inner.withdraw().map_err(|e| {
+            tracing::warn!(key = %key, error = %e, "dns_steer: withdraw failed");
+            io::Error::other(e)
+        })
+    }
+}
+
+#[cfg(test)]
+#[path = "macos_tests.rs"]
+mod macos_tests;

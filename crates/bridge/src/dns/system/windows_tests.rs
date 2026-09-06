@@ -19,7 +19,7 @@ use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
 use super::{DnsConfiner, WinDnsBackend};
-use crate::dns::system::{Dns, DnsApplied, DnsError, SystemDns};
+use crate::dns::system::{Dns, DnsApplied, DnsError, RoutedFamilies, SystemDns};
 use crate::dns_state::{AdapterId, DnsPrior, DnsPriorAdapter};
 
 // MockBackend =========================================================================================================
@@ -205,6 +205,7 @@ async fn dns_apply_cancelled_drops_the_confinement() {
     let result = dns
         .apply(
             vec![IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))],
+            RoutedFamilies { v4: true, v6: true },
             tun_identity(),
             server_ip(),
             cancel,
@@ -242,6 +243,7 @@ async fn apply_sets_resolvers_on_hole_tun_only() {
     let mut applied = dns
         .apply(
             vec![IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))],
+            RoutedFamilies { v4: true, v6: true },
             tun_identity(),
             server_ip(),
             CancellationToken::new(),
@@ -277,6 +279,7 @@ async fn system_dns_applied_drop_panics_in_debug_if_shutdown_not_awaited() {
     let applied = dns
         .apply(
             vec![IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))],
+            RoutedFamilies { v4: true, v6: true },
             tun_identity(),
             server_ip(),
             CancellationToken::new(),
@@ -303,6 +306,7 @@ async fn shutdown_releases_the_confinement() {
     let mut applied = dns
         .apply(
             vec![IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))],
+            RoutedFamilies { v4: true, v6: true },
             tun_identity(),
             server_ip(),
             CancellationToken::new(),
@@ -334,6 +338,7 @@ async fn confiner_failure_surfaces_as_confine_error_and_skips_set_servers() {
     let result = dns
         .apply(
             vec![IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))],
+            RoutedFamilies { v4: true, v6: true },
             tun_identity(),
             server_ip(),
             CancellationToken::new(),
@@ -385,6 +390,7 @@ async fn set_servers_failure_is_fatal() {
     let result = dns
         .apply(
             vec![IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))],
+            RoutedFamilies { v4: true, v6: true },
             tun_identity(),
             server_ip(),
             CancellationToken::new(),
@@ -416,7 +422,13 @@ async fn apply_advertises_resolver_ips_not_loopback() {
         IpAddr::V4(Ipv4Addr::new(1, 0, 0, 1)),
     ];
     let mut applied = dns
-        .apply(resolvers.clone(), tun_identity(), server_ip(), CancellationToken::new())
+        .apply(
+            resolvers.clone(),
+            RoutedFamilies { v4: true, v6: true },
+            tun_identity(),
+            server_ip(),
+            CancellationToken::new(),
+        )
         .await
         .expect("apply should succeed");
 
@@ -452,7 +464,13 @@ async fn apply_advertises_both_v4_and_v6_resolvers() {
         "2606:4700:4700::1111".parse().unwrap(),
     ];
     let mut applied = dns
-        .apply(resolvers.clone(), tun_identity(), server_ip(), CancellationToken::new())
+        .apply(
+            resolvers.clone(),
+            RoutedFamilies { v4: true, v6: true },
+            tun_identity(),
+            server_ip(),
+            CancellationToken::new(),
+        )
         .await
         .expect("apply should succeed");
 
@@ -480,6 +498,7 @@ async fn dns_apply_captures_nothing() {
     let mut applied = dns
         .apply(
             vec![IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))],
+            RoutedFamilies { v4: true, v6: true },
             tun_identity(),
             server_ip(),
             CancellationToken::new(),
@@ -523,4 +542,56 @@ fn empty_settings_flags_select_family() {
     let v6 = super::empty_settings(true).Flags;
     assert_ne!(v6 & DNS_SETTING_NAMESERVER as u64, 0, "NAMESERVER must always be set");
     assert_ne!(v6 & DNS_SETTING_IPV6 as u64, 0, "v6 must set the IPV6 flag");
+}
+
+/// Windows deliberately IGNORES `routed`: WFP confinement blocks off-tunnel
+/// DNS egress on both families regardless of which the tunnel actually
+/// carries, so filtering the advertised list by routed family would drop
+/// resolvers that are still reachable through the tunnel. Pinning that here
+/// because the parameter is threaded in and discarded (`let _ = routed;`),
+/// which reads exactly like an oversight — without this test, "fixing" it to
+/// filter would pass every other test in this file.
+#[skuld::test]
+async fn apply_windows_ignores_routed_families() {
+    let resolvers = vec![
+        IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)),
+        "2606:4700:4700::1111".parse().unwrap(),
+    ];
+
+    let mut recorded_per_case = Vec::new();
+    for routed in [
+        RoutedFamilies { v4: true, v6: true },
+        RoutedFamilies { v4: true, v6: false },
+        RoutedFamilies { v4: false, v6: true },
+        RoutedFamilies { v4: false, v6: false },
+    ] {
+        let backend = MockBackend::new();
+        let confiner = MockConfiner::new();
+        let dns = SystemDns::new_with_backend(
+            Arc::clone(&backend) as Arc<dyn WinDnsBackend>,
+            confiner as Arc<dyn DnsConfiner>,
+        );
+
+        let mut applied = dns
+            .apply(
+                resolvers.clone(),
+                routed,
+                tun_identity(),
+                server_ip(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("apply should succeed for every routed-family combination");
+
+        recorded_per_case.push(backend.set_ips.lock().unwrap().clone());
+        applied.shutdown().await;
+    }
+
+    for (case, recorded) in recorded_per_case.iter().enumerate() {
+        assert_eq!(recorded.len(), 1, "case {case}: exactly one set_servers call");
+        assert_eq!(
+            recorded[0], resolvers,
+            "case {case}: the advertised list must be the full one regardless of routed families"
+        );
+    }
 }

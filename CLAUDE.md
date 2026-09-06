@@ -26,14 +26,22 @@ before editing; the sections linked below are the authoritative source.
   tunnel); enforced structurally in `HoleRouter::resolve_endpoint`. UDP/53 is
   diverted to the DNS forwarder before the cascade. →
   [CONTRIBUTING.md#udp-policy](CONTRIBUTING.md#udp-policy)
+- **TUN naming.** The running TUN device's name has exactly one source of
+  truth at runtime, `tun_engine::device::TunIdentity`: Windows names it the
+  fixed constant `WINDOWS_TUN_ALIAS` (`"hole-tun"`), macOS's kernel assigns
+  it (`TunName::KernelAssigned`, a `utunN`) and every macOS consumer —
+  DNS apply, the lockdown TUN permit — reads it back rather than assuming
+  a literal. →
+  [CONTRIBUTING.md#tun-naming](CONTRIBUTING.md#tun-naming)
 - **IPv6 in the tunnel.** IPv6 is meant to traverse the tunnel: the `::/1` +
-  `8000::/1` split pair captures it, and `hole-tun` holds `TUN_SUBNET6` on the
-  **OS interface** as well as in smoltcp, so a host with no global IPv6 still
-  has a source address for those routes. The ULA's global ID is generated per
-  RFC 4193, not `fd00::`. Windows waits for the interface's IPv6 half itself
-  (`tun` waits only for the IPv4 one) and creates the address
-  `IpDadStatePreferred`; assignment is fatal on Windows, warn-only on macOS,
-  and `Dispatcher::ipv6_assigned()` is what route-install fatality must read. →
+  `8000::/1` split pair captures it, and the TUN interface holds
+  `TUN_SUBNET6` on the **OS interface** as well as in smoltcp, so a host with
+  no global IPv6 still has a source address for those routes. The ULA's
+  global ID is generated per RFC 4193, not `fd00::`. Windows waits for the
+  interface's IPv6 half itself (`tun` waits only for the IPv4 one) and
+  creates the address `IpDadStatePreferred`; assignment is fatal on Windows,
+  warn-only on macOS, and `Dispatcher::ipv6_assigned()` is what route-install
+  fatality must read. →
   [CONTRIBUTING.md#ipv6-in-the-tunnel](CONTRIBUTING.md#ipv6-in-the-tunnel)
 - **TCP accept refusal.** The accept verdict lands while the listener is still
   in `SynReceived` with its SYN-ACK paused, so a declined connection is refused
@@ -54,10 +62,15 @@ before editing; the sections linked below are the authoritative source.
   `SynReceived`/`FinWait2`/`CloseWait` holds its slot forever. →
   [CONTRIBUTING.md#tcp-accept-refusal](CONTRIBUTING.md#tcp-accept-refusal)
 - **DNS forwarder.** Carries DNS over the TCP tunnel for TCP-only plugins; OS
-  adapter DNS is advertised the configured resolver IPs on `hole-tun` only —
-  the one adapter Hole created — which route into it and are intercepted by
-  the in-TUN `LocalDnsEndpoint`; a start-time forwarder self-test gates the
-  whole connection. →
+  resolution is diverted to the configured resolver IPs on the TUN interface
+  only, which route into it and are intercepted by the in-TUN
+  `LocalDnsEndpoint`; a start-time forwarder self-test gates the whole
+  connection. The apply mechanism itself is platform-specific — Windows sets
+  the adapter's resolvers directly; macOS's `networksetup` has no interface
+  identifier, so it instead publishes a synthetic, session-scoped
+  `SCDynamicStore` supplemental-resolver key (`tun_engine::dns_steer`) — both
+  fail-fatal, enforced by the sealed `DnsPhase`/`LeakBearing`/`Cosmetic`
+  split. →
   [CONTRIBUTING.md#dns-forwarder](CONTRIBUTING.md#dns-forwarder)
 - **DNS-egress confinement (Windows).** Hole never writes DNS settings to an
   adapter it doesn't own; on Windows, egress on UDP+TCP port 53 is also

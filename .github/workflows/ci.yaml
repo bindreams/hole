@@ -465,8 +465,10 @@ jobs:
       # Upload bridge.log produced by `DistHarness` subprocesses. Matches
       # files that the test harness redirected to `$RUNNER_TEMP` (see
       # `crates/bridge/src/test_support/dist_harness.rs::new_tempdir`).
-      - name: Upload bridge logs on test failure
-        if: ${{ failure() || cancelled() }}
+      #
+      # Unconditional on darwin: nextest suppresses captured output on success, and a passing darwin run is currently the only way to see the macOS IPv6-assignment path's tracing output, which nothing asserts on yet.
+      - name: Upload bridge logs (darwin always; else on failure)
+        if: ${{ matrix.os == 'darwin' || failure() || cancelled() }}
         uses: actions/upload-artifact@v7
         with:
           name: bridge-logs-${{ matrix.os }}-${{ matrix.arch }}

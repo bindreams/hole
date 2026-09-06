@@ -226,8 +226,13 @@ fn reject_macos_on_link(info: GatewayInfo) -> Result<GatewayInfo, GatewayError> 
 /// friendly name/alias, e.g. `hole-tun`; macOS: BSD name, e.g. `utun7`).
 /// Shared by upstream-gateway lookup and [`tun_ipv6_available`], which needs
 /// the TUN's own index rather than the upstream one.
+///
+/// `pub`, not `pub(crate)`: also the OS-name-table oracle
+/// `crates/bridge/src/dispatcher_privileged_tests.rs` uses to prove a
+/// `Dispatcher`'s `TunIdentity::alias` names a live interface, rather than
+/// that test reimplementing this same lookup against raw platform FFI.
 #[cfg(target_os = "windows")]
-pub(crate) fn interface_index_by_name(name: &str) -> std::io::Result<u32> {
+pub fn interface_index_by_name(name: &str) -> std::io::Result<u32> {
     use windows::core::HSTRING;
     use windows::Win32::Foundation::NO_ERROR;
     use windows::Win32::NetworkManagement::IpHelper::{ConvertInterfaceAliasToLuid, ConvertInterfaceLuidToIndex};
@@ -255,8 +260,13 @@ pub(crate) fn interface_index_by_name(name: &str) -> std::io::Result<u32> {
 /// friendly name/alias; macOS: BSD name, e.g. `utun7`). Shared by
 /// upstream-gateway lookup and [`tun_ipv6_available`], which needs the TUN's
 /// own index rather than the upstream one.
+///
+/// `pub`, not `pub(crate)`: also the OS-name-table oracle
+/// `crates/bridge/src/dispatcher_privileged_tests.rs` uses to prove a
+/// `Dispatcher`'s `TunIdentity::alias` names a live interface, rather than
+/// that test reimplementing this same lookup against raw platform FFI.
 #[cfg(target_os = "macos")]
-pub(crate) fn interface_index_by_name(name: &str) -> std::io::Result<u32> {
+pub fn interface_index_by_name(name: &str) -> std::io::Result<u32> {
     let c_name =
         std::ffi::CString::new(name).map_err(|e| std::io::Error::other(format!("invalid interface name: {e}")))?;
     let idx = unsafe { libc::if_nametoindex(c_name.as_ptr()) };

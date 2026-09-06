@@ -26,6 +26,7 @@
 //! `.config/nextest.toml`'s `global_net_state` filter matches on it. Renaming
 //! a test WITHOUT updating that filter silently drops it from the group.
 
+use crate::device::TunIdentity;
 use crate::routing::{CoverGuard, Routing, SystemRouting};
 
 // `skuld` requires each label to be declared exactly once per test binary;
@@ -86,7 +87,11 @@ fn windows_release_all_clears_a_stranded_lockdown_cover() {
     assert_baseline_reachable();
 
     let cover = routing
-        .install_lockdown(server_ip, "Loopback Pseudo-Interface 1", &[])
+        .install_lockdown(
+            server_ip,
+            &TunIdentity::synthetic(0, "Loopback Pseudo-Interface 1"),
+            &[],
+        )
         .expect("engage real WFP lockdown cover");
     cover.disarm(); // strand it — no guard remains to remove it
 
@@ -119,7 +124,7 @@ fn macos_release_all_clears_a_stranded_lockdown_cover() {
     assert_baseline_reachable();
 
     let cover = routing
-        .install_lockdown(server_ip, "utun-absent", &[])
+        .install_lockdown(server_ip, &TunIdentity::synthetic(0, "utun-absent"), &[])
         .expect("engage real pf lockdown cover");
     cover.disarm();
 
@@ -229,7 +234,11 @@ fn windows_release_all_clears_both_stranded_covers() {
     assert_baseline_reachable();
 
     let lockdown = routing
-        .install_lockdown(server_ip, "Loopback Pseudo-Interface 1", &[])
+        .install_lockdown(
+            server_ip,
+            &TunIdentity::synthetic(0, "Loopback Pseudo-Interface 1"),
+            &[],
+        )
         .expect("engage real WFP lockdown cover");
     lockdown.disarm();
     let transient = routing
@@ -264,7 +273,7 @@ fn macos_release_all_clears_both_stranded_covers() {
     assert_baseline_reachable();
 
     let lockdown = routing
-        .install_lockdown(server_ip, "utun-absent", &[])
+        .install_lockdown(server_ip, &TunIdentity::synthetic(0, "utun-absent"), &[])
         .expect("engage real pf lockdown cover");
     lockdown.disarm();
     let transient = routing
@@ -378,7 +387,7 @@ fn macos_release_all_clears_a_cover_whose_state_file_is_unreadable() {
     assert_baseline_reachable();
 
     let cover = routing
-        .install_lockdown(server_ip, "utun-absent", &[])
+        .install_lockdown(server_ip, &TunIdentity::synthetic(0, "utun-absent"), &[])
         .expect("engage real pf lockdown cover");
     cover.disarm();
 
@@ -408,7 +417,7 @@ fn macos_release_all_falls_back_when_the_snapshot_will_not_load() {
     assert_baseline_reachable();
 
     let cover = routing
-        .install_lockdown(server_ip, "utun-absent", &[])
+        .install_lockdown(server_ip, &TunIdentity::synthetic(0, "utun-absent"), &[])
         .expect("engage real pf lockdown cover");
     cover.disarm();
 

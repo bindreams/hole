@@ -65,7 +65,7 @@ mod windows_impl {
         IpDadStateDeprecated, IpDadStateDuplicate, IpDadStateInvalid, IpDadStatePreferred, AF_INET, SOCKADDR_INET,
     };
 
-    /// Distinct from `TUN_DEVICE_NAME` (`hole-tun`) so a concurrent bridge e2e,
+    /// Distinct from `WINDOWS_TUN_ALIAS` (`hole-tun`) so a concurrent bridge e2e,
     /// the adapter-cleanup sweep, and this test can never target each other's
     /// adapter.
     const TEST_ADAPTER: &str = "hole-test-gw";
