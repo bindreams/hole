@@ -114,3 +114,104 @@ fn a_saved_target_file_is_owner_only_in_an_owner_only_directory() {
         assert_eq!(file_mode, 0o600, "target file must be 0600, got {file_mode:o}");
     }
 }
+
+// Task 2: target_after ================================================================================================
+
+#[skuld::test]
+fn a_cutover_leaves_the_target_connected() {
+    let config = test_config();
+    let current = Target::Connected {
+        config: Box::new(config.clone()),
+    };
+    assert_eq!(
+        target_after(current, SessionEvent::CutoverRestart),
+        Target::Connected {
+            config: Box::new(config)
+        }
+    );
+}
+
+#[skuld::test]
+fn a_blip_leaves_the_target_connected() {
+    let config = test_config();
+    let current = Target::Connected {
+        config: Box::new(config.clone()),
+    };
+    assert_eq!(
+        target_after(current, SessionEvent::Blipped),
+        Target::Connected {
+            config: Box::new(config)
+        }
+    );
+}
+
+#[skuld::test]
+fn giving_up_moves_the_target_off() {
+    let current = Target::Connected {
+        config: Box::new(test_config()),
+    };
+    assert_eq!(target_after(current, SessionEvent::GaveUp), Target::Off);
+}
+
+#[skuld::test]
+fn a_user_stop_moves_the_target_off() {
+    let current = Target::Connected {
+        config: Box::new(test_config()),
+    };
+    assert_eq!(target_after(current, SessionEvent::UserStopped), Target::Off);
+}
+
+#[skuld::test]
+fn no_event_revives_an_off_target() {
+    for ev in [
+        SessionEvent::UserStopped,
+        SessionEvent::GaveUp,
+        SessionEvent::CutoverRestart,
+        SessionEvent::Blipped,
+        SessionEvent::ProcessExiting,
+    ] {
+        assert_eq!(
+            target_after(Target::Off, ev),
+            Target::Off,
+            "event {ev:?} must not revive Off"
+        );
+    }
+}
+
+#[skuld::test]
+fn a_clean_machine_shutdown_leaves_the_target_connected() {
+    let config = test_config();
+    let current = Target::Connected {
+        config: Box::new(config.clone()),
+    };
+    assert_eq!(
+        target_after(current, SessionEvent::ProcessExiting),
+        Target::Connected {
+            config: Box::new(config)
+        },
+        "a clean machine shutdown must not clear reconnect-on-boot"
+    );
+}
+
+#[skuld::test]
+fn every_session_event_over_an_unreadable_target_is_defined() {
+    // Exhaustiveness documentation: an Unreadable current target has no
+    // config to preserve, so an event that would otherwise "leave it
+    // unchanged" leaves it Unreadable (nothing to lose), and an event that
+    // decides a definite outcome (give-up, user-stop) still lands on the
+    // same definite Off it would from a known Connected target.
+    assert_eq!(target_after(Target::Unreadable, SessionEvent::GaveUp), Target::Off);
+    assert_eq!(target_after(Target::Unreadable, SessionEvent::UserStopped), Target::Off);
+    assert_eq!(
+        target_after(Target::Unreadable, SessionEvent::ProcessExiting),
+        Target::Unreadable
+    );
+    assert_eq!(
+        target_after(Target::Unreadable, SessionEvent::CutoverRestart),
+        Target::Unreadable
+    );
+    assert_eq!(
+        target_after(Target::Unreadable, SessionEvent::Blipped),
+        Target::Unreadable
+    );
+}

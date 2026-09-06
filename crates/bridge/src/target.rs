@@ -243,6 +243,72 @@ impl dump::Dump for Target {
     }
 }
 
+// SessionEvent / target_after =========================================================================================
+
+/// A named cause for a session ending or persisting, each mapped to a
+/// deliberate target transition by [`target_after`]. Five variants, not
+/// two: `decide_cover_recovery`'s idiom (`crate::routing`, `tun-engine`)
+/// applies here too — an enum whose author must supply a case for every
+/// cause is what stops a fresh transition site from picking an existing
+/// variant "by elimination" (the defect `StopReason` had: two variants and
+/// a non-`Cutover` one opened the host).
+///
+/// Do not collapse any two variants onto their shared consequence. `GaveUp`
+/// and `UserStopped` both move the target to `Off`, but differ at the
+/// user-facing surface (only `GaveUp` sets a death reason); `CutoverRestart`,
+/// `Blipped`, and `ProcessExiting` all leave the target unchanged, but arise
+/// from three unrelated events (an update cutover, a transient retry, and a
+/// clean machine shutdown). Merging on shared consequence reproduces the
+/// exact defect this type exists to remove.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionEvent {
+    /// The user asked to disconnect (clean or unclean teardown — Q5: the
+    /// target moves because the user asked, never because teardown
+    /// succeeded or failed).
+    UserStopped,
+    /// The system gave up on the target: an unexpected session death
+    /// observed by a health check.
+    GaveUp,
+    /// An update cutover: the new bridge process is expected to adopt this
+    /// same target immediately, so it must survive across the restart.
+    CutoverRestart,
+    /// A transient retry/reconnect blip. Reconciliation working, not a
+    /// decision to disconnect.
+    Blipped,
+    /// A clean machine shutdown (launchd SIGTERM / SCM Stop with no cutover
+    /// marker present). Must NOT be confused with `UserStopped`: a user who
+    /// asked for reconnect-on-boot never authorised a disconnect just
+    /// because the machine is rebooting.
+    ProcessExiting,
+}
+
+/// The single pure decision: given the current target and a named cause,
+/// what should the target become? Exhaustive over both axes (no wildcard
+/// arm) so a new `SessionEvent` variant, or a new `Target` variant, is a
+/// compile error here — the same idiom `decide_cover_recovery` uses.
+///
+/// `CutoverRestart` and `Blipped` leave a `Connected` target unchanged; that
+/// is the whole reason a cutover disarms rather than releases the cover
+/// (see `crate::reconciler`), and it is what `StopReason::Cutover` used to
+/// encode by itself, one call site at a time.
+///
+/// Over [`Target::Unreadable`]: there is no config to preserve, so an event
+/// that would otherwise "leave the target unchanged" leaves it `Unreadable`
+/// (nothing to lose by not deciding); an event that reaches a definite
+/// outcome regardless of the prior value (`GaveUp`, `UserStopped`) still
+/// lands on the same definite `Off` it would from a known `Connected`
+/// target — the user's stop request, or the system's give-up, is not made
+/// less real by the file having been corrupt.
+pub fn target_after(current: Target, ev: SessionEvent) -> Target {
+    match (current, ev) {
+        (_, SessionEvent::UserStopped) => Target::Off,
+        (_, SessionEvent::GaveUp) => Target::Off,
+        (current, SessionEvent::CutoverRestart) => current,
+        (current, SessionEvent::Blipped) => current,
+        (current, SessionEvent::ProcessExiting) => current,
+    }
+}
+
 #[cfg(test)]
 #[path = "target_tests.rs"]
 mod target_tests;
