@@ -66,6 +66,7 @@ use std::path::Path;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
+use crate::proxy::TUN_SUBNET;
 use crate::test_support::dist_fixture::*;
 use crate::test_support::dist_harness::DistHarness;
 use crate::test_support::port_alloc::allocate_ephemeral_port;
@@ -192,18 +193,33 @@ fn nameservers(scutil_dns_output: &str) -> Vec<String> {
     out
 }
 
+/// Whether `iface` currently holds `addr`, per `ifconfig <iface>`.
+fn utun_holds_address(iface: &str, addr: &str) -> bool {
+    let Ok(output) = Command::new("ifconfig").arg(iface).output() else {
+        return false;
+    };
+    String::from_utf8_lossy(&output.stdout).lines().any(|line| {
+        // `ifconfig` prints e.g. "\tinet 10.255.0.1 netmask 0xffffff00 ..."
+        let mut fields = line.split_whitespace();
+        fields.next() == Some("inet") && fields.next() == Some(addr)
+    })
+}
+
 /// Every interface name `ifconfig -l` currently lists, in the order given.
+///
+/// Panics rather than yielding an empty list if `ifconfig` cannot be run: an
+/// empty result is indistinguishable from "no interfaces", which would make
+/// the before/after diff report zero new utuns and fail with a misleading
+/// message about the tunnel instead of the missing tool.
 fn ifconfig_list() -> Vec<String> {
-    Command::new("ifconfig")
+    let output = Command::new("ifconfig")
         .arg("-l")
         .output()
-        .map(|o| {
-            String::from_utf8_lossy(&o.stdout)
-                .split_whitespace()
-                .map(str::to_owned)
-                .collect()
-        })
-        .unwrap_or_default()
+        .expect("HARNESS: run `ifconfig -l`");
+    String::from_utf8_lossy(&output.stdout)
+        .split_whitespace()
+        .map(str::to_owned)
+        .collect()
 }
 
 /// The `utunN` interfaces newly present in `after` but absent from `before`.
@@ -281,7 +297,7 @@ fn entry_from(ss: &SsServerHandle) -> ServerEntry {
 
 // The test ============================================================================================================
 
-/// SHIP GATE (#893). Starts a real Full-mode session with DNS enabled
+/// Starts a real Full-mode session with DNS enabled
 /// through the production `hole bridge run` subprocess, then asserts three
 /// facts read from the OS, not from our return values: a live `utun` the OS
 /// did not have before; the two IPv4 split routes (`0.0.0.0/1`, `128.0.0.0/1`)
@@ -340,19 +356,32 @@ async fn run_macos_full_tunnel_os_state_e2e(dist: &Path, ss: &SsServerHandle) {
     // (a) a live utun the OS did not have before.
     let after_start_ifaces = ifconfig_list();
     let created = new_utuns(&before_ifaces, &after_start_ifaces);
-    let iface = match created.as_slice() {
-        [one] => one.clone(),
-        other => panic!(
-            "expected exactly one new utun after Start, got {other:?} (before: {before_ifaces:?}, after: \
+    // Identify OURS positively rather than assuming we are the only thing
+    // creating utuns: macOS makes them on its own (iCloud Private Relay, the
+    // built-in VPN stack, Personal Hotspot), and this test's serialization
+    // has no authority over the OS. Hole's TUN is the one carrying
+    // `TUN_SUBNET`'s address.
+    let tun_addr = TUN_SUBNET.split('/').next().expect("TUN_SUBNET has an address part");
+    let mut ours: Vec<String> = created
+        .iter()
+        .filter(|iface| utun_holds_address(iface, tun_addr))
+        .cloned()
+        .collect();
+    let iface = match ours.as_slice() {
+        [_one] => ours.remove(0),
+        [] => panic!(
+            "no new utun holds {tun_addr}: new utuns {created:?} (before: {before_ifaces:?}, after: \
              {after_start_ifaces:?})"
         ),
+        other => panic!("more than one new utun holds {tun_addr}, which should be impossible: {other:?}"),
     };
     println!("[macos_full_tunnel] new utun after Start: {iface}");
 
     // (b) the two IPv4 split routes leaving via that interface. Read via
-    // `route -n get` on each split's own base address (see
-    // `route_get_interface`'s doc for why), not via parsing the table
-    // `netstat_inet` below prints for diagnostic context only.
+    // `route -n get` on an ordinary address INSIDE each split — never the
+    // split's base address, which macOS answers from the default route (see
+    // `route_get_interface`'s doc) — not by parsing the table `netstat_inet`
+    // below prints for diagnostic context only.
     let low_half = route_get_interface(SPLIT_LOW_PROBE);
     let high_half = route_get_interface(SPLIT_HIGH_PROBE);
     println!(
@@ -377,11 +406,24 @@ async fn run_macos_full_tunnel_os_state_e2e(dist: &Path, ss: &SsServerHandle) {
     println!(
         "[macos_full_tunnel] configd merged the configured resolver into the DNS configuration: {merged}\n{dns_after_start}"
     );
+    let after_start_nameservers = nameservers(&dns_after_start);
     for server in &configured_servers {
         assert!(
             dns_after_start.contains(server.as_str()),
             "expected scutil --dns to list configured resolver {server} after Start:\n{dns_after_start}"
         );
+        // Presence alone proves nothing on a machine whose own resolver is
+        // already this address — `DnsConfig::default()` is a public one. Where
+        // the baseline did NOT list it, presence does prove Hole put it there,
+        // so demand the stronger fact exactly where it is available.
+        let was_in_baseline = before_nameservers.iter().any(|l| l.contains(server.as_str()));
+        if !was_in_baseline {
+            assert_ne!(
+                before_nameservers, after_start_nameservers,
+                "configured resolver {server} was absent before Start, so the nameserver set must have \
+                 changed once it was steered; before:\n{before_nameservers:#?}\nafter:\n{after_start_nameservers:#?}"
+            );
+        }
     }
 
     // Register a FRESH notification before the next mutating call (Stop).
@@ -424,12 +466,12 @@ async fn run_macos_full_tunnel_os_state_e2e(dist: &Path, ss: &SsServerHandle) {
     println!(
         "[macos_full_tunnel] configd's DNS configuration no longer lists the configured resolver: {unmerged}\n{dns_after_stop}"
     );
-    for server in &configured_servers {
-        assert!(
-            !dns_after_stop.contains(server.as_str()),
-            "expected scutil --dns to no longer list configured resolver {server} after Stop:\n{dns_after_stop}"
-        );
-    }
+    // No substring check for the configured resolvers here: `DnsConfig::default()`
+    // is a public resolver, so on a machine that already uses it the address is
+    // still listed after Stop and a `!contains` assertion would fail against a
+    // correct implementation. The baseline comparison below is the property that
+    // actually matters — the machine is exactly where it started — and it holds
+    // either way.
     assert_eq!(
         before_nameservers, after_nameservers,
         "expected the machine's nameserver[…] set to match its pre-start value after Stop; before:\n{before_nameservers:#?}\nafter:\n{after_nameservers:#?}"
