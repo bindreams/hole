@@ -93,6 +93,8 @@ nextest-version = "0.9.130"
 #     publish a real synthetic-service DNS key, same reasoning as the prefix
 #     above):
 #     crates/tun-engine/tests/macos_session_key_lifetime_probe.rs
+#     crates/bridge/src/dns/system/macos_tests.rs (the real steerer's
+#     engage/withdraw round trip through the trait objects)
 #   - `dispatcher_opens_tun_` prefix (the production
 #     `Dispatcher::new` opens a real TUN device, and on macOS it is a
 #     kernel-assigned `utun` adapter with no fixed name):

@@ -438,6 +438,12 @@ async fn macos_apply_refuses_when_no_routed_family_has_a_resolver() {
 /// trait method and recurse until the stack died. No type error marks the
 /// difference, so only executing it does.
 ///
+/// COUPLED NAME: the `macos_dns_global_net_state_` prefix is matched BY
+/// SUBSTRING by `.config/nextest.toml`'s `global_net_state` filter, and
+/// `cargo xtask verify-global-net-state-labels` fails the build if a test
+/// carrying the label does not match it. Renaming this without updating both
+/// is caught in CI, not review.
+///
 /// Requires root: `engage` opens a real `SCDynamicStore` session and
 /// publishes a key, which is global OS state. Labelled for the privileged
 /// lane accordingly. It cleans up after itself through the same `withdraw`
@@ -445,7 +451,7 @@ async fn macos_apply_refuses_when_no_routed_family_has_a_resolver() {
 /// assertion panics first.
 #[cfg(target_os = "macos")]
 #[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
-fn the_real_steerer_engages_and_withdraws_through_the_trait_objects() {
+fn macos_dns_global_net_state_real_steerer_engages_and_withdraws() {
     use super::{MacDnsSteerer, RealMacDnsSteerer};
 
     let steerer = RealMacDnsSteerer;
