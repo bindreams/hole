@@ -18,6 +18,8 @@
 // for test files by clippy.toml's "Bridge cancellation contract" exception.
 #![allow(clippy::disallowed_methods)]
 
+use crate::test_support::skuld_fixtures::{GLOBAL_NET_STATE, TUN};
+
 use std::io;
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
@@ -420,4 +422,40 @@ async fn macos_apply_refuses_when_no_routed_family_has_a_resolver() {
         Ok(_) => panic!("expected Io, got Ok"),
     }
     assert_eq!(steerer.engage_call_count(), 0, "must refuse before ever engaging");
+}
+
+/// The two REAL impls this module's mock-based tests deliberately bypass:
+/// `RealMacDnsSteerer::engage` and the `SteeringHandle` impl on
+/// `tun_engine::dns_steer::Steering`. Everything above proves `apply`'s
+/// handling of a steerer; nothing proved the production steerer itself is
+/// wired to `tun_engine::dns_steer` correctly.
+///
+/// The `withdraw` half is the part worth pinning. Its body does
+/// `let inner = *self; inner.withdraw()`, which resolves to `Steering`'s
+/// **inherent** by-value `withdraw` only because inherent methods win method
+/// resolution over trait methods. Written the obvious way — calling
+/// `withdraw` on the boxed value — it would dispatch back into this same
+/// trait method and recurse until the stack died. No type error marks the
+/// difference, so only executing it does.
+///
+/// Requires root: `engage` opens a real `SCDynamicStore` session and
+/// publishes a key, which is global OS state. Labelled for the privileged
+/// lane accordingly. It cleans up after itself through the same `withdraw`
+/// it is testing, and `Steering`'s own `Drop` is the backstop if the
+/// assertion panics first.
+#[cfg(target_os = "macos")]
+#[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
+fn the_real_steerer_engages_and_withdraws_through_the_trait_objects() {
+    use super::{MacDnsSteerer, RealMacDnsSteerer};
+
+    let steerer = RealMacDnsSteerer;
+    let handle = steerer
+        .engage(&[IpAddr::V4(Ipv4Addr::new(198, 51, 100, 53))])
+        .expect("RealMacDnsSteerer::engage must succeed against a real dynamic-store session");
+
+    // Exercises the inherent-vs-trait resolution described above. A recursive
+    // implementation never returns from this line.
+    handle
+        .withdraw()
+        .expect("withdrawing through the trait object must reach Steering's inherent withdraw");
 }

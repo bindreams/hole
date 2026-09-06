@@ -947,7 +947,7 @@ fn install_returns_a_guard_when_every_setup_command_succeeds() {
 // ANY narrowed `installed`, so it cannot produce a `SystemRoutes` with a
 // partial family set to assert against — the accessor is exercised for what
 // it reads, independent of whether today's `install` can currently hand it
-// a partial result (bindreams/hole#850's plan, Task 5, decision D4; see
+// a partial result (see
 // `crates/tun-engine/src/routing.rs`'s `RoutesInstalled` doc). Every field
 // but `installed` is a placeholder — `routed_families` reads only that one.
 #[skuld::test]
@@ -989,6 +989,29 @@ fn routed_families_reports_only_the_splits_that_landed() {
     };
     assert_eq!(v4_only.routed_families(), RoutedFamilies { v4: true, v6: false });
     std::mem::forget(v4_only);
+
+    // The case the doc calls out and the two above miss: exactly ONE half of a
+    // split pair landed. A single half routes nothing — the other half of the
+    // address space still exits outside the tunnel — so it must read as "family
+    // not routed". A `contains`-per-half implementation that used `||` instead
+    // of `&&` passes both cases above and fails only here.
+    let half_pairs = SystemRoutes {
+        tun_name: "hole-tun".into(),
+        server_ip: ipv4_server(),
+        interface_name: "en0".into(),
+        original_gateway: ipv4_gateway(),
+        route_form: state::RouteForm::Via,
+        state_dir: tmp.path().to_path_buf(),
+        owner: None,
+        installed: vec![RouteId::SplitV4Low, RouteId::SplitV6High],
+        stale: Vec::new(),
+    };
+    assert_eq!(
+        half_pairs.routed_families(),
+        RoutedFamilies { v4: false, v6: false },
+        "one half of a pair routes nothing, so neither family may read as routed"
+    );
+    std::mem::forget(half_pairs);
 }
 
 // Phase classification ================================================================================================
