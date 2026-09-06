@@ -109,14 +109,14 @@ pub(super) fn assign(if_index: u32, cidr: Ipv6Cidr) -> Result<Assigned, DeviceEr
         // Answers "did the alias succeed" AND "did the alias create the
         // prefix route" (two of the three open items above) — DAD's cost is
         // the one this still does not speak to; see the module doc.
-        let prefix_route_interface = prefix_route_interface(cidr);
+        let prefix_route = prefix_route(cidr);
         info!(
             interface = %if_name,
             address = %cidr.address(),
             exit = ?exit_code,
             stdout = %stdout.trim(),
             stderr = %stderr.trim(),
-            prefix_route_interface = ?prefix_route_interface,
+            prefix_route = %prefix_route,
             "ifconfig alias succeeded; the TUN interface holds an IPv6 address"
         );
         return Ok(Assigned::Address);
@@ -169,17 +169,51 @@ pub(super) fn ifconfig_alias_argv(if_name: &str, cidr: Ipv6Cidr) -> Vec<String> 
 /// `route(8)` exits `0` unconditionally (confirmed live on this host, both
 /// for a present and an absent destination — see the module doc), so success
 /// is read from stdout's `"interface: "` line and absence from stderr's
-/// `"not in table"` text, mirroring `crate::routing`'s
-/// `macos_route_confirmed_absent` convention — never the exit code.
-fn prefix_route_interface(cidr: Ipv6Cidr) -> Option<String> {
-    let probe = probe_address_for(cidr).to_string();
-    let output = Command::new("route")
-        .args(["-n", "get", "-inet6", &probe])
+/// `"not in table"` text — never the exit code, the same reasoning
+/// `crate::routing::macos_route_confirmed_absent` documents for deletes.
+/// Anything else is [`PrefixRoute::Indeterminate`] rather than absence.
+enum PrefixRoute {
+    /// The kernel routes an address inside the prefix via this interface.
+    Via(String),
+    /// route(8) positively reported no such route.
+    Absent,
+    /// The question could not be asked, or its answer could not be read.
+    /// Deliberately distinct from [`PrefixRoute::Absent`]: that is a finding,
+    /// this is the lack of one, and collapsing them would let a spawn failure
+    /// read as evidence that the alias creates no prefix route.
+    Indeterminate(&'static str),
+}
+
+impl std::fmt::Display for PrefixRoute {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Via(interface) => write!(f, "via {interface}"),
+            Self::Absent => f.write_str("absent"),
+            Self::Indeterminate(why) => write!(f, "indeterminate ({why})"),
+        }
+    }
+}
+
+fn prefix_route(cidr: Ipv6Cidr) -> PrefixRoute {
+    let Some(probe) = probe_address_for(cidr) else {
+        return PrefixRoute::Indeterminate("no address inside the prefix differs from the configured one");
+    };
+    let Ok(output) = Command::new("route")
+        .args(["-n", "get", "-inet6", &probe.to_string()])
         .output()
-        .ok()?;
-    String::from_utf8_lossy(&output.stdout)
+    else {
+        return PrefixRoute::Indeterminate("route(8) could not be spawned");
+    };
+    if let Some(interface) = String::from_utf8_lossy(&output.stdout)
         .lines()
         .find_map(|line| line.trim().strip_prefix("interface: ").map(str::to_owned))
+    {
+        return PrefixRoute::Via(interface);
+    }
+    if String::from_utf8_lossy(&output.stderr).contains("not in table") {
+        return PrefixRoute::Absent;
+    }
+    PrefixRoute::Indeterminate("route(8) reported neither an interface nor a confirmed absence")
 }
 
 /// An address inside `cidr`'s prefix that is NOT `cidr.address()` — see
@@ -187,17 +221,20 @@ fn prefix_route_interface(cidr: Ipv6Cidr) -> Option<String> {
 /// the prefix's network address (all host bits cleared); on the vanishingly
 /// unlikely chance that address instance equals `cidr.address()` (only
 /// possible if the configured address's own host part is already
-/// all-zero), the low bit is flipped instead — still inside the prefix
-/// (`prefix_len` `128` aside, which this crate never configures; see
-/// `TUN_SUBNET6`), still not the configured address.
-fn probe_address_for(cidr: Ipv6Cidr) -> std::net::Ipv6Addr {
+/// all-zero), the low bit is flipped instead — still inside the prefix,
+/// still not the configured address. `None` at `/128`, where the prefix
+/// holds exactly one address and no such neighbour can exist.
+fn probe_address_for(cidr: Ipv6Cidr) -> Option<std::net::Ipv6Addr> {
     let addr = cidr.address();
     let net = network_address(addr, cidr.prefix_len());
     if net != addr {
-        net
-    } else {
-        std::net::Ipv6Addr::from(u128::from(net) ^ 1)
+        return Some(net);
     }
+    // The configured address is its own network address, so flip the low bit
+    // to land elsewhere in the prefix. At /128 the prefix holds exactly one
+    // address, so no such neighbour exists and flipping would leave the
+    // prefix entirely — answer honestly instead of probing a different one.
+    (cidr.prefix_len() < 128).then(|| std::net::Ipv6Addr::from(u128::from(net) ^ 1))
 }
 
 /// `addr` masked down to `prefix_len` leading bits, host bits cleared.

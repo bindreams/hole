@@ -52,7 +52,7 @@ fn probe_address_for_is_never_the_configured_address() {
     let cidr: Ipv6Cidr = "fdf8:f6d5:536e::1/64".parse().unwrap();
     assert_eq!(
         probe_address_for(cidr),
-        "fdf8:f6d5:536e::".parse::<Ipv6Addr>().unwrap(),
+        Some("fdf8:f6d5:536e::".parse::<Ipv6Addr>().unwrap()),
         "the ordinary case: the network address already differs from the configured one"
     );
 }
@@ -63,9 +63,9 @@ fn probe_address_for_falls_back_when_the_configured_address_has_no_host_part() {
     // case `network_address` alone would return the SAME address `assign`
     // just aliased, which `prefix_route_interface`'s doc explains is
     // useless to probe (it would always resolve via the host-scope local
-    // route, present or not the wider prefix route is).
+    // route, whether or not the wider prefix route is present).
     let cidr: Ipv6Cidr = "fdf8:f6d5:536e::/64".parse().unwrap();
-    let probe = probe_address_for(cidr);
+    let probe = probe_address_for(cidr).expect("a /64 holds an address other than the configured one");
 
     assert_ne!(
         probe,
@@ -75,5 +75,18 @@ fn probe_address_for_falls_back_when_the_configured_address_has_no_host_part() {
     assert!(
         cidr.contains_addr(&probe),
         "the fallback must still land inside the prefix it's meant to probe, got {probe}"
+    );
+}
+
+#[skuld::test]
+fn probe_address_for_has_no_answer_for_a_single_address_prefix() {
+    // A /128 holds exactly one address, so no address inside it differs from
+    // the configured one. Flipping a bit to manufacture one would leave the
+    // prefix and probe an unrelated route, so there is nothing to return.
+    let cidr: Ipv6Cidr = "fdf8:f6d5:536e::1/128".parse().unwrap();
+    assert_eq!(
+        probe_address_for(cidr),
+        None,
+        "a single-address prefix has no probe address distinct from the configured one"
     );
 }
