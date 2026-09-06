@@ -142,6 +142,12 @@ struct MockStore {
     remove_ok: bool,
     set_calls: AtomicUsize,
     remove_calls: AtomicUsize,
+    /// Signalled once per `remove` call, when a test needs to rendezvous on
+    /// the store thread actually removing. The thread owns the only surviving
+    /// `Arc` once the test releases its own, so a thread that exits WITHOUT
+    /// removing drops this sender and the waiting `recv()` fails — which is
+    /// what makes the absence of a removal observable instead of a hang.
+    removed_tx: Option<std::sync::mpsc::Sender<()>>,
 }
 
 impl MockStore {
@@ -151,6 +157,17 @@ impl MockStore {
             remove_ok,
             set_calls: AtomicUsize::new(0),
             remove_calls: AtomicUsize::new(0),
+            removed_tx: None,
+        })
+    }
+
+    fn new_signalling(set_ok: bool, remove_ok: bool, removed_tx: std::sync::mpsc::Sender<()>) -> Arc<Self> {
+        Arc::new(Self {
+            set_ok,
+            remove_ok,
+            set_calls: AtomicUsize::new(0),
+            remove_calls: AtomicUsize::new(0),
+            removed_tx: Some(removed_tx),
         })
     }
 }
@@ -163,6 +180,9 @@ impl StoreOps for Arc<MockStore> {
 
     fn remove(&self, _key: &str) -> bool {
         self.remove_calls.fetch_add(1, Ordering::SeqCst);
+        if let Some(tx) = &self.removed_tx {
+            let _ = tx.send(());
+        }
         self.remove_ok
     }
 }
@@ -237,7 +257,8 @@ async fn withdraw_reports_a_remove_failure() {
 /// the same guarantee and is what regresses if the fallback is ever deleted.
 #[skuld::test]
 async fn drop_without_withdraw_still_attempts_removal() {
-    let store = MockStore::new(true, false);
+    let (removed_tx, removed_rx) = std::sync::mpsc::channel();
+    let store = MockStore::new_signalling(true, false, removed_tx);
     let for_thread = Arc::clone(&store);
 
     let steering = spawn_steering(
@@ -247,23 +268,21 @@ async fn drop_without_withdraw_still_attempts_removal() {
     )
     .expect("the mock store's set() succeeds, so engage-equivalent must too");
 
-    // No `.withdraw()` call — exercise `Drop` directly. `spawn_steering`'s
-    // `ready_rx.recv()` already rendezvoused with the store thread once (on
-    // the initial publish); dropping `Steering` closes `cmd_tx`, which wakes
-    // that SAME thread's `cmd_rx.recv()` synchronously from the thread's own
-    // perspective, so by the time this function returns the thread has
-    // already observed the close (recv() on a closed channel does not spin).
-    // The `remove_calls` assertion below still needs the OS to schedule that
-    // thread; poll it via the counter rather than sleeping, using the
-    // store's own `AtomicUsize` as the rendezvous instead of wall-clock time.
+    // No `.withdraw()` call — exercise `Drop` directly. Dropping `Steering`
+    // closes `cmd_tx`, waking the store thread's blocking `recv()`, and that
+    // thread performs the removal itself. `Steering::drop` deliberately never
+    // blocks, so there is no handle to join and the removal is observed
+    // through the mock instead.
     drop(steering);
-    while store.remove_calls.load(Ordering::SeqCst) == 0 {
-        std::thread::yield_now();
-    }
-
-    assert_eq!(
-        store.remove_calls.load(Ordering::SeqCst),
-        1,
-        "Drop must attempt removal exactly once"
-    );
+    // Release the test's own handle so the store thread holds the last `Arc`,
+    // and therefore the last sender. Waiting on the channel rather than
+    // spinning on the counter is what makes a MISSING removal a failure: if
+    // the `Drop` fallback this test guards is ever deleted, the thread exits
+    // without sending, drops the sender, and `recv()` returns `Err` — where a
+    // spin would have hung until CI killed the job with no diagnosis.
+    drop(store);
+    removed_rx
+        .recv()
+        .expect("Drop must attempt removal; the store thread ended without one");
+    assert!(removed_rx.recv().is_err(), "Drop must attempt removal exactly once");
 }
