@@ -1,7 +1,7 @@
 use super::*;
 use axum::Json;
 use hole_common::protocol::{
-    BridgeRequest, BridgeResponse, DiagnosticsResponse, EmptyResponse, MetricsResponse, StatusResponse,
+    BridgeRequest, BridgeResponse, CoverPresence, DiagnosticsResponse, EmptyResponse, MetricsResponse, StatusResponse,
 };
 use hyper::body::Incoming;
 use std::path::PathBuf;
@@ -32,7 +32,7 @@ async fn spawn_mock_bridge(path: &std::path::Path) -> tokio::task::JoinHandle<()
                     udp_proxy_available: true,
                     ipv6_bypass_available: true,
                     lockdown_enabled: false,
-                    lockdown_active: false,
+                    cover_presence: CoverPresence::Absent,
                     blocked_until_connected: false,
                 })
             }),
@@ -126,7 +126,7 @@ fn send_status_request_receives_response() {
                 udp_proxy_available: true,
                 ipv6_bypass_available: true,
                 lockdown_enabled: false,
-                lockdown_active: false,
+                cover_presence: CoverPresence::Absent,
                 blocked_until_connected: false,
             }
         );
@@ -467,7 +467,7 @@ async fn spawn_error_bridge(path: &std::path::Path) -> tokio::task::JoinHandle<(
                     udp_proxy_available: true,
                     ipv6_bypass_available: true,
                     lockdown_enabled: false,
-                    lockdown_active: false,
+                    cover_presence: CoverPresence::Absent,
                     blocked_until_connected: false,
                 })
             }),
@@ -620,7 +620,7 @@ async fn spawn_status_mock(path: &std::path::Path, version: Option<&'static str>
                 udp_proxy_available: true,
                 ipv6_bypass_available: true,
                 lockdown_enabled: false,
-                lockdown_active: false,
+                cover_presence: CoverPresence::Absent,
                 blocked_until_connected: false,
             })
         }),
@@ -673,6 +673,44 @@ fn absent_version_header_is_version_mismatch() {
             c.send(BridgeRequest::Status).await,
             Err(ClientError::VersionMismatch { .. })
         ));
+    });
+}
+
+/// Mock serving GET /v1/status with a mismatched version header AND a body
+/// missing `cover_presence` — a field this client's `StatusResponse` requires.
+/// If body decoding ran before (or instead of) the version check, this would
+/// surface as `ClientError::Protocol` (a decode failure); Q2's wire removal
+/// of `lockdown_active` in favor of a required `cover_presence` field rests
+/// on the version check running first, so this pins that ordering rather
+/// than assuming it.
+async fn spawn_version_skewed_incompatible_status_mock(path: &std::path::Path) -> tokio::task::JoinHandle<()> {
+    let listener = hole_bridge::socket::LocalListener::bind(path).unwrap();
+    let router = axum::Router::new().route(
+        hole_common::protocol::ROUTE_STATUS,
+        axum::routing::get(|| async {
+            (
+                [("x-hole-bridge-version", "6.0.0")],
+                Json(serde_json::json!({ "running": false, "uptime_secs": 0 })),
+            )
+        }),
+    );
+    serve_one(listener, router)
+}
+
+#[skuld::test]
+fn a_version_skewed_response_is_rejected_before_its_body_is_parsed() {
+    rt().block_on(async {
+        let path = test_socket_path("ver-skew-body-incompatible");
+        let _m = spawn_version_skewed_incompatible_status_mock(&path).await;
+        let mut c = BridgeClient::connect_with_version(&path, "7.0.0").await.unwrap();
+        assert!(
+            matches!(
+                c.send(BridgeRequest::Status).await,
+                Err(ClientError::VersionMismatch { .. })
+            ),
+            "a version-mismatched reply must be rejected before its body is decoded, even when the body is \
+             missing a field this client version requires"
+        );
     });
 }
 

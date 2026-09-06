@@ -165,6 +165,9 @@ impl Routing for StubRouting {
     fn release_all_covers(&self) -> Result<(), RoutingError> {
         Ok(())
     }
+    fn lockdown_cover_presence(&self) -> tun_engine::routing::CoverPresence {
+        tun_engine::routing::CoverPresence::Absent
+    }
 }
 
 struct StubRoutes {

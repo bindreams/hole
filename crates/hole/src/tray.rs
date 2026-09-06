@@ -3,7 +3,7 @@
 use crate::commands::build_proxy_config;
 use crate::state::AppState;
 use hole::tray_icons;
-use hole_common::protocol::{BridgeRequest, BridgeResponse};
+use hole_common::protocol::{BridgeRequest, BridgeResponse, CoverPresence};
 use serde::Serialize;
 use tauri::menu::{CheckMenuItem, MenuEvent, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
@@ -298,12 +298,15 @@ fn unblock_dialog_message(response: &Result<BridgeResponse, crate::bridge_client
 
 // Tray creation =======================================================================================================
 
-/// Tray label for the lockdown toggle from the (enabled, active) snapshot.
-/// `enabled && !active` is a warning state — never silent green (#527).
-fn lockdown_menu_label(enabled: bool, active: bool) -> String {
-    match (enabled, active) {
-        (true, true) => "Lockdown: On".into(),
-        (true, false) => "Lockdown: On (warning: not engaged)".into(),
+/// Tray label for the lockdown toggle from the (enabled, cover_presence)
+/// snapshot. `enabled && cover_presence == Absent` is a warning state — never
+/// silent green (#527). Every non-`Absent` reading — including
+/// `Indeterminate`/`Unreachable`, an uncertain probe — renders as engaged: an
+/// uncertain probe must never resolve toward "nothing is blocking".
+fn lockdown_menu_label(enabled: bool, cover_presence: CoverPresence) -> String {
+    match (enabled, cover_presence == CoverPresence::Absent) {
+        (true, false) => "Lockdown: On".into(),
+        (true, true) => "Lockdown: On (warning: not engaged)".into(),
         (false, _) => "Lockdown".into(),
     }
 }
@@ -364,11 +367,16 @@ struct EscapeItems {
 
 /// Resolve which escape items to show. The two conditions are independent —
 /// there is no probe input here to fail, only the exhaustive table test over
-/// all eight `(lockdown_enabled, running, blocked_offers_go_offline)` rows.
-fn escape_items(lockdown_enabled: bool, running: bool, blocked_offers_go_offline: bool) -> EscapeItems {
+/// all eight `(cover_presence, running, blocked_offers_go_offline)` rows.
+/// `cover_presence` replaces `lockdown_enabled` (Task 5): the gate still reads
+/// `&& !running` here — re-gating `unblock` on presence alone, independent of
+/// `running`, is Task 8b's job, not this one. `Indeterminate`/`Unreachable`
+/// count as present — an uncertain probe must never resolve toward "nothing
+/// is blocking".
+fn escape_items(cover_presence: CoverPresence, running: bool, blocked_offers_go_offline: bool) -> EscapeItems {
     EscapeItems {
         go_offline: blocked_offers_go_offline,
-        unblock: lockdown_enabled && !running,
+        unblock: cover_presence != CoverPresence::Absent && !running,
     }
 }
 
@@ -377,7 +385,7 @@ fn escape_items(lockdown_enabled: bool, running: bool, blocked_offers_go_offline
 /// `running` is the bridge's actual state (from the `ProxyStateCell`,
 /// never persisted config — #462); `transition` is an in-flight
 /// connect/disconnect target, rendered as Connecting…/Disconnecting…
-/// with the action item disabled. `lockdown_enabled`/`lockdown_active` render
+/// with the action item disabled. `lockdown_enabled`/`cover_presence` render
 /// the standing kill-switch toggle (#527).
 fn build_tray_menu(
     app: &AppHandle,
@@ -385,7 +393,7 @@ fn build_tray_menu(
     running: bool,
     transition: Option<bool>,
     lockdown_enabled: bool,
-    lockdown_active: bool,
+    cover_presence: CoverPresence,
     blocked: bool,
 ) -> Result<tauri::menu::Menu<tauri::Wry>, tauri::Error> {
     // The action item carries the intent its label displays: a click dispatches
@@ -420,7 +428,7 @@ fn build_tray_menu(
     let lockdown = CheckMenuItem::with_id(
         app,
         ID_LOCKDOWN,
-        lockdown_menu_label(lockdown_enabled, lockdown_active),
+        lockdown_menu_label(lockdown_enabled, cover_presence),
         true,
         lockdown_enabled,
         None::<&str>,
@@ -442,7 +450,7 @@ fn build_tray_menu(
     };
 
     let mut items: Vec<&dyn tauri::menu::IsMenuItem<tauri::Wry>> = vec![&status, &connect];
-    let escapes = escape_items(lockdown_enabled, running, acts.show_go_offline);
+    let escapes = escape_items(cover_presence, running, acts.show_go_offline);
     if escapes.go_offline {
         items.push(&go_offline);
     }
@@ -503,7 +511,7 @@ pub fn create_tray(app: &tauri::App) -> Result<TrayIcon, tauri::Error> {
         snap.running,
         None,
         snap.lockdown_enabled,
-        snap.lockdown_active,
+        snap.cover_presence,
         snap.blocked_until_connected,
     )?;
     let icon = tray_icons::tray_image(snap.running.into());
@@ -559,7 +567,7 @@ pub fn rebuild_tray_menu(app: &AppHandle) {
             snap.running,
             transition,
             snap.lockdown_enabled,
-            snap.lockdown_active,
+            snap.cover_presence,
             snap.blocked_until_connected,
         ) {
             Ok(menu) => {

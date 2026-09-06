@@ -216,6 +216,9 @@ pub(super) struct MockRoutingState {
     /// currently only exercised to prove no teardown ran at all (`is_none()`
     /// in `partial_route_failure_fails_closed_and_clears_state`).
     pub(super) last_teardown_installed: std::sync::Mutex<Option<Vec<RouteId>>>,
+    /// What `lockdown_cover_presence` reports — a test's stand-in for the OS
+    /// probe, settable independently of whether any session is running.
+    pub(super) cover_presence: std::sync::Mutex<tun_engine::routing::CoverPresence>,
 }
 
 impl Default for MockRoutingState {
@@ -242,6 +245,7 @@ impl Default for MockRoutingState {
             fail_cover_for_resolvers: std::sync::Mutex::new(std::collections::HashSet::new()),
             fail_routes_for: std::sync::Mutex::new(std::collections::HashSet::new()),
             last_teardown_installed: std::sync::Mutex::new(None),
+            cover_presence: std::sync::Mutex::new(tun_engine::routing::CoverPresence::Absent),
         }
     }
 }
@@ -456,6 +460,9 @@ impl Routing for MockRouting {
         }
         *self.state.last_lockdown_tun_alias.lock().unwrap() = Some(tun.alias().to_owned());
         self.state.lockdown_engage_calls.fetch_add(1, Ordering::SeqCst);
+        // Mirrors the real OS: a successful engage is what a subsequent
+        // `lockdown_cover_presence` probe would find.
+        *self.state.cover_presence.lock().unwrap() = tun_engine::routing::CoverPresence::Live;
         Ok(MockCover {
             state: Arc::clone(&self.state),
             lockdown: true,
@@ -467,7 +474,13 @@ impl Routing for MockRouting {
         if self.state.fail_release.load(Ordering::SeqCst) {
             return Err(RoutingError::RouteSetup("mock release_all_covers failure".into()));
         }
+        // Unconditional clear, mirroring `failclosed::release_all`.
+        *self.state.cover_presence.lock().unwrap() = tun_engine::routing::CoverPresence::Absent;
         Ok(())
+    }
+
+    fn lockdown_cover_presence(&self) -> tun_engine::routing::CoverPresence {
+        *self.state.cover_presence.lock().unwrap()
     }
 }
 
@@ -514,6 +527,10 @@ impl Drop for MockCover {
         if self.lockdown {
             self.state.lockdown_disengage_calls.fetch_add(1, Ordering::SeqCst);
             self.state.teardown_order.lock().unwrap().push("lockdown");
+            // Mirrors the real OS: an actual disengage (not `disarm`, which
+            // `mem::forget`s this guard and never runs `Drop`) is what a
+            // subsequent `lockdown_cover_presence` probe would no longer find.
+            *self.state.cover_presence.lock().unwrap() = tun_engine::routing::CoverPresence::Absent;
         } else {
             self.state.cover_disengage_calls.fetch_add(1, Ordering::SeqCst);
         }
@@ -1332,7 +1349,11 @@ fn lockdown_off_does_not_engage_cover() {
 
         pm.start(&test_config()).await.unwrap();
         assert_eq!(pm.state(), ProxyState::Running);
-        assert!(!pm.lockdown_active(), "lockdown OFF must leave no cover engaged");
+        assert_eq!(
+            pm.cover_presence(),
+            CoverPresence::Absent,
+            "lockdown OFF must leave no cover engaged"
+        );
         assert_eq!(
             st.lockdown_engage_calls.load(Ordering::SeqCst),
             0,
@@ -1354,7 +1375,11 @@ fn lockdown_on_engages_after_install_and_disengages_on_stop() {
 
         pm.start(&test_config()).await.unwrap();
         assert_eq!(pm.state(), ProxyState::Running);
-        assert!(pm.lockdown_active(), "intent-on start must engage the cover");
+        assert_ne!(
+            pm.cover_presence(),
+            CoverPresence::Absent,
+            "intent-on start must engage the cover"
+        );
         assert_eq!(st.install_calls.load(Ordering::SeqCst), 1);
         assert_eq!(
             st.lockdown_engage_calls.load(Ordering::SeqCst),
@@ -1368,7 +1393,11 @@ fn lockdown_on_engages_after_install_and_disengages_on_stop() {
         );
 
         pm.stop().await.unwrap();
-        assert!(!pm.lockdown_active(), "cover disengaged after stop");
+        assert_eq!(
+            pm.cover_presence(),
+            CoverPresence::Absent,
+            "cover disengaged after stop"
+        );
         assert_eq!(
             st.lockdown_disengage_calls.load(Ordering::SeqCst),
             1,
@@ -5026,71 +5055,57 @@ mod self_test {
         });
     }
 
-    // Cover ownership model ===========================================================================================
+    // Cover state model ===============================================================================================
     //
-    // These next two tests assert VALUE AGREEMENT: the two public predicates
-    // (`lockdown_active`, `blocked_until_connected`) never disagree with
-    // `Posture::cover_holder`, and the holder is exactly one thing at each
-    // observed point. They do NOT prove single derivation — a second,
-    // independent recomputation (e.g. a hypothetical
-    // `self.posture.session().map(|r| r.lockdown.is_some()).unwrap_or(false)`
-    // written directly into `lockdown_active`, bypassing `cover_holder`) that
-    // happens to agree at every state visited here would still pass both.
-    // `the_standing_cover_field_has_exactly_one_reader` (`cover_tests.rs`) is
-    // a PARTIAL backstop for `lockdown_active`'s half of this shape (itself
-    // blind to a destructuring read — see that guard's own doc); this file
-    // is skipped by its walk (it ends in `_tests.rs`), so naming the
-    // anti-pattern here in prose cannot trip it. `blocked_until_connected` —
-    // the transient half — has NO structural backstop at all: a
-    // recomputation like `self.posture.pending().is_some()` would agree with
-    // it at every state below and pass undetected.
+    // `cover_presence()` is a MEASURED fact (an OS probe via
+    // `Routing::lockdown_cover_presence`) — it does not derive from
+    // `Posture` at all, so there is nothing to pin agreement between anymore.
+    // `blocked_until_connected()` remains the one sanctioned exception that
+    // still reads `Posture` (see its doc on `ProxyManager`); the structural
+    // guard below, `no_bridge_source_derives_cover_state_from_a_session`
+    // (replacing `cover_tests.rs`'s deleted
+    // `the_standing_cover_field_has_exactly_one_reader`), catches a future
+    // second reader of `RunningState.lockdown` outside the one sanctioned
+    // site.
 
-    /// Pins value agreement between `lockdown_active()` and the holder at
-    /// each observed state in a session's lifecycle, and that a posture
-    /// leaves no session behind after `stop()`. Does NOT prove
-    /// `lockdown_active()` derives from the holder (see the preamble above),
-    /// and does NOT prove a cover stranded by a previous process is
-    /// invisible to all of this — there is no probe for that in this stage.
+    /// The mock's measured `cover_presence()` tracks a session's lifecycle —
+    /// engaged after a lockdown-on start, cleared after `stop()` — and stays
+    /// `Absent` throughout when intent is off. Does NOT prove a cover
+    /// stranded by a previous process is invisible to all of this — there is
+    /// no probe for that in this stage.
     #[skuld::test]
-    fn posture_reports_one_cover_holder_across_a_session_lifecycle() {
+    fn cover_presence_tracks_a_lockdown_session_lifecycle() {
         rt().block_on(async {
-            // Lockdown-on: Idle -> Session { standing: true } -> Idle.
+            // Lockdown-on: Absent -> Live -> Absent.
             let dir = tempfile::tempdir().unwrap();
             let routing = MockRouting::new(dir.path().to_path_buf());
             let (mut pm, _dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, true);
 
-            assert_eq!(pm.posture.cover_holder(), CoverHolder::Nobody);
-            assert!(!pm.lockdown_active());
+            assert_eq!(pm.cover_presence(), CoverPresence::Absent);
             assert!(!pm.blocked_until_connected());
 
             pm.start(&test_config()).await.unwrap();
-            assert_eq!(pm.posture.cover_holder(), CoverHolder::Session { standing: true });
-            assert!(pm.lockdown_active());
+            assert_ne!(pm.cover_presence(), CoverPresence::Absent);
             assert!(!pm.blocked_until_connected());
 
             pm.stop().await.unwrap();
-            assert_eq!(pm.posture.cover_holder(), CoverHolder::Nobody);
-            assert!(!pm.lockdown_active());
+            assert_eq!(pm.cover_presence(), CoverPresence::Absent);
             assert!(!pm.blocked_until_connected());
 
-            // Same shape, intent off: Session { standing: false }.
+            // Intent off: no lockdown engage, so the probe never leaves Absent.
             let dir = tempfile::tempdir().unwrap();
             let routing = MockRouting::new(dir.path().to_path_buf());
             let (mut pm, _dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, false);
             pm.start(&test_config()).await.unwrap();
-            assert_eq!(pm.posture.cover_holder(), CoverHolder::Session { standing: false });
-            assert!(!pm.lockdown_active());
+            assert_eq!(pm.cover_presence(), CoverPresence::Absent);
             assert!(!pm.blocked_until_connected());
         });
     }
 
-    /// Pins value agreement between `blocked_until_connected()` and the
-    /// holder after a failed covered start, and that the holder is
-    /// `PendingStart` — not `Session`, not `Nobody`. Does NOT prove
-    /// `blocked_until_connected()` derives from the holder — this predicate
-    /// has NO structural backstop at all (see the preamble above) — and does
-    /// NOT prove a cover stranded by a previous process is invisible to all
-    /// of this — there is no probe for that in this stage.
+    /// Pins `blocked_until_connected()` to a failed covered start: the
+    /// posture is `PendingStart`, not `Session`, not `Idle`, and the
+    /// measured `cover_presence()` — the standing lockdown probe — is
+    /// unaffected by a TRANSIENT cover, since no lockdown was ever engaged.
     #[skuld::test]
     fn posture_reports_a_pending_start_after_a_failed_covered_start() {
         rt().block_on(async {
@@ -5100,16 +5115,83 @@ mod self_test {
                 .await
                 .unwrap_err();
 
-            assert_eq!(pm.posture.cover_holder(), CoverHolder::PendingStart);
+            assert!(matches!(pm.posture, Posture::PendingStart(_)));
             assert!(pm.blocked_until_connected());
-            assert!(!pm.lockdown_active());
+            assert_eq!(pm.cover_presence(), CoverPresence::Absent);
         });
+    }
+
+    /// Replaces `cover_tests.rs`'s deleted
+    /// `the_standing_cover_field_has_exactly_one_reader`: `RunningState.lockdown`
+    /// must be read via `.lockdown` in exactly one non-test bridge source
+    /// location. A second reader would mean cover state is being
+    /// re-derived from a session somewhere instead of measured — the exact
+    /// defect this stage removes (bindreams/hole#825).
+    #[skuld::test]
+    fn no_bridge_source_derives_cover_state_from_a_session() {
+        let pattern = regex::Regex::new(r"\.lockdown\b").unwrap();
+        let src_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+
+        let mut matches: Vec<(String, usize, String)> = Vec::new();
+        for entry in walkdir::WalkDir::new(&src_root) {
+            let entry = entry.expect("failed to walk crates/bridge/src");
+            if !entry.file_type().is_file() {
+                continue;
+            }
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if file_name.ends_with("_tests.rs") {
+                continue;
+            }
+            if path.components().any(|c| c.as_os_str() == "test_support") {
+                continue;
+            }
+            let text = std::fs::read_to_string(path).expect("failed to read a walked source file");
+            for (line_no, line) in text.lines().enumerate() {
+                if pattern.is_match(line) {
+                    matches.push((path.display().to_string(), line_no + 1, line.trim().to_string()));
+                }
+            }
+        }
+
+        let diagnostic = || {
+            let mut msg = format!(
+                "no_bridge_source_derives_cover_state_from_a_session: pattern `{}` must match \
+                 exactly once in non-test bridge sources (skipping *_tests.rs and \
+                 src/test_support/).\nMatches found ({}):\n",
+                pattern.as_str(),
+                matches.len()
+            );
+            for (file, line_no, line) in &matches {
+                msg.push_str(&format!("  {file}:{line_no}: {line}\n"));
+            }
+            msg.push_str(
+                "A failure here means one of two things: either a second, independent reader of \
+                 `RunningState.lockdown` was added somewhere (the real defect — the one sanctioned \
+                 reader is `check_health`'s teardown decision), or a comment/doc string in a walked \
+                 file now quotes the pattern, which is a false positive and should be reworded. This \
+                 regex only catches `.field` access — a pattern-destructuring read (`let RunningState \
+                 { lockdown, .. } = ...;`, as `stop_with` does) is invisible to it and would evade \
+                 this guard entirely.",
+            );
+            msg
+        };
+
+        assert_eq!(matches.len(), 1, "{}", diagnostic());
+        let (file, _, _) = &matches[0];
+        assert!(
+            file.ends_with("proxy_manager.rs"),
+            "the one reader must be in proxy_manager.rs:\n{}",
+            diagnostic()
+        );
     }
 
     // The next three exercise `Posture`'s method contracts directly,
     // independent of any call site, so a future call site that violates one
-    // fails a test instead of silently drifting — `CoverHolder` gets an
-    // exhaustive truth table (`cover_tests.rs`); before this, `Posture` got
+    // fails a test instead of silently drifting — before this, `Posture` got
     // nothing but prose and reasoning about the present call graph, the same
     // unenforced-invariant shape this stage exists to remove.
 
@@ -5127,7 +5209,7 @@ mod self_test {
 
             assert!(pm.posture.take_pending().is_none());
             assert_eq!(pm.state(), ProxyState::Running);
-            assert!(pm.lockdown_active());
+            assert_ne!(pm.cover_presence(), CoverPresence::Absent);
 
             pm.stop().await.unwrap();
         });

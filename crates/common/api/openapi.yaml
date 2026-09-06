@@ -347,6 +347,7 @@ components:
       required:
         - running
         - uptime_secs
+        - cover_presence
       properties:
         running:
           type: boolean
@@ -376,12 +377,15 @@ components:
             Whether the standing kill switch (lockdown mode) intent is on.
             Bridge-owned, system-wide. serde-default false so older clients that
             don't send it keep today's behavior.
-        lockdown_active:
-          type: boolean
-          default: false
+        cover_presence:
+          $ref: "#/components/schemas/CoverPresence"
           description: >-
-            Whether a lockdown cover is currently engaged. `lockdown_enabled &&
-            !lockdown_active` is a tray warning state — never silent green.
+            What the bridge measured about a standing lockdown cover on the
+            host, replacing `lockdown_active: bool`. A required field, not
+            defaulted: a version-skewed reply is caught by the
+            `x-hole-bridge-version` header before this body is ever parsed
+            (see `check_version`), so an older/newer client never reaches a
+            missing-field decode here.
         blocked_until_connected:
           type: boolean
           default: false
@@ -425,6 +429,23 @@ components:
     EmptyResponse:
       type: object
       additionalProperties: false
+
+    CoverPresence:
+      type: string
+      description: |
+        What the bridge measured about a standing lockdown cover on the host
+        — mirrors `tun_engine::routing::CoverPresence` one-for-one. `live` is
+        "any residue found", tolerating an interrupted sweep. `recorded` is
+        unconfirmed-by-the-OS but locally on file. `indeterminate` and
+        `unreachable` mean the probe could not give a real answer; every
+        escape-offering site must treat them like `live`, never like `absent`
+        — an uncertain probe must never resolve toward "nothing is blocking".
+      enum:
+        - live
+        - recorded
+        - absent
+        - indeterminate
+        - unreachable
 
     InvalidFilter:
       type: object

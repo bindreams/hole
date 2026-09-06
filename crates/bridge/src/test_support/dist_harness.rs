@@ -555,7 +555,7 @@ impl BridgeIpcClient {
                         udp_proxy_available: status.udp_proxy_available,
                         ipv6_bypass_available: status.ipv6_bypass_available,
                         lockdown_enabled: status.lockdown_enabled,
-                        lockdown_active: status.lockdown_active,
+                        cover_presence: status.cover_presence,
                         blocked_until_connected: status.blocked_until_connected,
                     })
                 } else {

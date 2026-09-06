@@ -150,7 +150,11 @@ pub enum BridgeResponse {
         udp_proxy_available: bool,
         ipv6_bypass_available: bool,
         lockdown_enabled: bool,
-        lockdown_active: bool,
+        /// What the bridge measured about a standing lockdown cover on the
+        /// host — replaces the old `lockdown_active: bool`, which answered
+        /// the host question with a process-ownership answer instead of a
+        /// measurement (bindreams/hole#825).
+        cover_presence: CoverPresence,
         /// Whether a covered start failed and left the host fail-closed (blocked,
         /// not leaked) while not running. Drives the GUI's distinct blocked state
         /// (Retry / Disconnect).

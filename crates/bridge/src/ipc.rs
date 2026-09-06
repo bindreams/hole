@@ -312,9 +312,26 @@ async fn handle_status<P: Proxy + 'static, R: Routing + 'static>(
         udp_proxy_available: pm.udp_proxy_available(),
         ipv6_bypass_available: pm.ipv6_bypass_available(),
         lockdown_enabled: pm.lockdown_enabled(),
-        lockdown_active: pm.lockdown_active(),
+        cover_presence: wire_cover_presence(pm.cover_presence()),
         blocked_until_connected: pm.blocked_until_connected(),
     })
+}
+
+/// Wire-level mirror of `tun_engine::routing::CoverPresence`, variant for
+/// variant — `crates/hole` and `crates/common` do not depend on `tun-engine`,
+/// so the measured probe result needs a crate-local type to cross the wire.
+/// A free function, not a `From` impl: both types are foreign to this crate,
+/// so the orphan rule forbids the trait.
+fn wire_cover_presence(p: tun_engine::routing::CoverPresence) -> hole_common::protocol::CoverPresence {
+    use hole_common::protocol::CoverPresence as Wire;
+    use tun_engine::routing::CoverPresence as Probed;
+    match p {
+        Probed::Live => Wire::Live,
+        Probed::Recorded => Wire::Recorded,
+        Probed::Absent => Wire::Absent,
+        Probed::Indeterminate => Wire::Indeterminate,
+        Probed::Unreachable => Wire::Unreachable,
+    }
 }
 
 /// Enforce [`StartError::Failed`]'s "PII-free message" claim at the response

@@ -151,7 +151,7 @@ fn bridge_response_status_json_roundtrip() {
         udp_proxy_available: true,
         ipv6_bypass_available: false,
         lockdown_enabled: false,
-        lockdown_active: false,
+        cover_presence: CoverPresence::Absent,
         blocked_until_connected: true,
     };
     let json = serde_json::to_vec(&resp).unwrap();
@@ -232,7 +232,7 @@ fn status_response_json_roundtrip() {
         udp_proxy_available: false,
         ipv6_bypass_available: true,
         lockdown_enabled: false,
-        lockdown_active: false,
+        cover_presence: CoverPresence::Absent,
         blocked_until_connected: false,
     };
     let json = serde_json::to_string(&resp).unwrap();
@@ -250,7 +250,7 @@ fn status_response_without_error() {
         udp_proxy_available: true,
         ipv6_bypass_available: true,
         lockdown_enabled: false,
-        lockdown_active: false,
+        cover_presence: CoverPresence::Absent,
         blocked_until_connected: false,
     };
     let json = serde_json::to_string(&resp).unwrap();
@@ -278,7 +278,7 @@ fn empty_response_serializes_to_empty_object() {
 
 #[skuld::test]
 fn status_response_explicit_null_error() {
-    let json = r#"{"running": false, "uptime_secs": 0, "error": null}"#;
+    let json = r#"{"running": false, "uptime_secs": 0, "error": null, "cover_presence": "absent"}"#;
     let decoded: StatusResponse = serde_json::from_str(json).unwrap();
     assert_eq!(decoded.error, None);
     // Default values should be applied for missing fields
@@ -309,14 +309,29 @@ fn route_unblock_matches_the_spec_path() {
 }
 
 #[skuld::test]
-fn status_response_lockdown_fields_default_false_for_old_clients() {
+fn status_response_lockdown_enabled_defaults_false_for_old_clients() {
     use crate::protocol::StatusResponse;
-    // An old client sends a StatusResponse JSON without the lockdown fields;
-    // serde-default must fill them as false (matching udp/ipv6 fields).
-    let json = r#"{"running":true,"uptime_secs":0}"#;
+    // An old client sends a StatusResponse JSON without `lockdown_enabled`;
+    // serde-default must fill it as false (matching udp/ipv6 fields).
+    // `cover_presence` is included because it is required, not defaulted
+    // (see the next test).
+    let json = r#"{"running":true,"uptime_secs":0,"cover_presence":"absent"}"#;
     let s: StatusResponse = serde_json::from_str(json).unwrap();
     assert!(!s.lockdown_enabled);
-    assert!(!s.lockdown_active);
+}
+
+#[skuld::test]
+fn status_response_without_cover_presence_fails_to_decode() {
+    use crate::protocol::StatusResponse;
+    // Unlike `lockdown_enabled`, `cover_presence` is a REQUIRED field: a
+    // version-skewed reply is already rejected earlier, by the
+    // `x-hole-bridge-version` header check, before this body is ever parsed
+    // (`bridge_client.rs`'s `check_version`) — so a client that reaches this
+    // decode is never missing the field for a legitimate reason, and a
+    // silent default here would hide a genuine protocol mismatch instead of
+    // surfacing it.
+    let json = r#"{"running":true,"uptime_secs":0}"#;
+    assert!(serde_json::from_str::<StatusResponse>(json).is_err());
 }
 
 #[skuld::test]

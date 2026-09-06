@@ -171,6 +171,9 @@ struct MockRouting {
     release_all_calls: Arc<AtomicU32>,
     /// `release_all_covers` returns `RoutingError::RouteSetup` when set.
     fail_release: Arc<AtomicBool>,
+    /// What `lockdown_cover_presence` reports — a test's stand-in for the OS
+    /// probe. Defaults to `Absent`.
+    cover_presence: std::sync::Mutex<tun_engine::routing::CoverPresence>,
 }
 
 impl MockRouting {
@@ -181,7 +184,15 @@ impl MockRouting {
             fail_server_gateway_only: AtomicBool::new(false),
             release_all_calls: Arc::new(AtomicU32::new(0)),
             fail_release: Arc::new(AtomicBool::new(false)),
+            cover_presence: std::sync::Mutex::new(tun_engine::routing::CoverPresence::Absent),
         }
+    }
+
+    /// Builder: report `presence` from `lockdown_cover_presence` instead of
+    /// the default `Absent`.
+    fn with_cover_presence(self, presence: tun_engine::routing::CoverPresence) -> Self {
+        *self.cover_presence.lock().unwrap() = presence;
+        self
     }
 
     fn failing_gateway(state_dir: PathBuf) -> Self {
@@ -191,6 +202,7 @@ impl MockRouting {
             fail_server_gateway_only: AtomicBool::new(false),
             release_all_calls: Arc::new(AtomicU32::new(0)),
             fail_release: Arc::new(AtomicBool::new(false)),
+            cover_presence: std::sync::Mutex::new(tun_engine::routing::CoverPresence::Absent),
         }
     }
 
@@ -201,6 +213,7 @@ impl MockRouting {
             fail_server_gateway_only: AtomicBool::new(true),
             release_all_calls: Arc::new(AtomicU32::new(0)),
             fail_release: Arc::new(AtomicBool::new(false)),
+            cover_presence: std::sync::Mutex::new(tun_engine::routing::CoverPresence::Absent),
         }
     }
 }
@@ -290,6 +303,10 @@ impl Routing for MockRouting {
         }
         Ok(())
     }
+
+    fn lockdown_cover_presence(&self) -> tun_engine::routing::CoverPresence {
+        *self.cover_presence.lock().unwrap()
+    }
 }
 
 struct MockCover;
@@ -341,6 +358,18 @@ fn mock_proxy() -> Arc<Mutex<ProxyManager<MockProxy, MockRouting>>> {
 fn mock_proxy_with_state_dir() -> Arc<Mutex<ProxyManager<MockProxy, MockRouting>>> {
     let state_dir = tempfile::tempdir().unwrap().keep();
     let routing = MockRouting::new(state_dir.clone());
+    let pm = ProxyManager::new(MockProxy::new(), routing).with_state_dir(state_dir);
+    Arc::new(Mutex::new(pm))
+}
+
+/// `mock_proxy_with_state_dir` variant whose mock routing reports
+/// `presence` from `lockdown_cover_presence` — a test's stand-in for the OS
+/// probe, independent of whether any session is running.
+fn mock_proxy_with_cover_presence(
+    presence: tun_engine::routing::CoverPresence,
+) -> Arc<Mutex<ProxyManager<MockProxy, MockRouting>>> {
+    let state_dir = tempfile::tempdir().unwrap().keep();
+    let routing = MockRouting::new(state_dir.clone()).with_cover_presence(presence);
     let pm = ProxyManager::new(MockProxy::new(), routing).with_state_dir(state_dir);
     Arc::new(Mutex::new(pm))
 }
@@ -704,7 +733,7 @@ fn status_when_not_running_returns_false() {
                 udp_proxy_available: true,
                 ipv6_bypass_available: true,
                 lockdown_enabled: false,
-                lockdown_active: false,
+                cover_presence: hole_common::protocol::CoverPresence::Absent,
                 blocked_until_connected: false,
             }
         );
@@ -760,7 +789,45 @@ fn lockdown_post_sets_intent_and_status_reflects_it() {
         // GET /v1/status reflects the intent (same connection).
         let status = get_status(&mut client).await;
         assert!(status.lockdown_enabled, "status must reflect the set intent");
-        assert!(!status.lockdown_active, "no cover engaged while stopped");
+        assert_eq!(
+            status.cover_presence,
+            hole_common::protocol::CoverPresence::Absent,
+            "no cover engaged while stopped"
+        );
+
+        drop(client);
+        handle.abort();
+        let _ = handle.await;
+    });
+}
+
+#[skuld::test]
+fn an_adopted_cover_with_no_session_reports_engaged() {
+    // A cover left behind by a crashed prior process — adopted on this
+    // bridge's start, with no session ever created in THIS process — must
+    // still surface as engaged. `cover_presence` is a measured probe of the
+    // OS, not a derivation from `Posture`, so it owes nothing to the
+    // in-process session that would otherwise be the only source of truth.
+    rt().block_on(async {
+        let path = test_socket_path("adopted-cover-no-session");
+        let server = IpcServer::bind(
+            &path,
+            mock_proxy_with_cover_presence(tun_engine::routing::CoverPresence::Live),
+            "test",
+        )
+        .unwrap();
+        let handle = tokio::spawn(async move {
+            server.run_once().await.unwrap();
+        });
+
+        let mut client = TestClient::connect(&path).await;
+        let status = get_status(&mut client).await;
+        assert!(!status.running, "no session exists in this process");
+        assert_eq!(
+            status.cover_presence,
+            hole_common::protocol::CoverPresence::Live,
+            "the measured cover must be reported even with no session"
+        );
 
         drop(client);
         handle.abort();

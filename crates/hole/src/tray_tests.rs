@@ -170,24 +170,24 @@ fn persist_intended_enabled_writes_only_on_change(#[fixture(temp_dir)] dir: &Pat
 // lockdown_menu_label =================================================================================================
 
 #[skuld::test]
-fn lockdown_enabled_but_inactive_renders_warning_label() {
-    // enabled && !active must never render silent green — it is a warning.
-    let label = lockdown_menu_label(true, false);
+fn lockdown_enabled_but_absent_renders_warning_label() {
+    // enabled && == Absent must never render silent green — it is a warning.
+    let label = lockdown_menu_label(true, CoverPresence::Absent);
     assert!(
         label.to_lowercase().contains("warning") || label.contains('!'),
-        "enabled+inactive must signal a warning, got {label:?}"
+        "enabled+absent must signal a warning, got {label:?}"
     );
 }
 
 #[skuld::test]
-fn lockdown_active_renders_on_label() {
-    let label = lockdown_menu_label(true, true);
+fn lockdown_live_renders_on_label() {
+    let label = lockdown_menu_label(true, CoverPresence::Live);
     assert!(label.to_lowercase().contains("on") || label.to_lowercase().contains("lockdown"));
 }
 
 #[skuld::test]
 fn lockdown_off_renders_plain_label() {
-    let label = lockdown_menu_label(false, false);
+    let label = lockdown_menu_label(false, CoverPresence::Absent);
     assert!(!label.to_lowercase().contains("warning"));
 }
 
@@ -195,32 +195,48 @@ fn lockdown_off_renders_plain_label() {
 
 #[skuld::test]
 fn escape_items_offers_unblock_and_go_offline_independently() {
-    // Exhaustive over all eight (lockdown_enabled, running, blocked_offers_go_offline)
-    // rows. The two escapes are independent: `unblock` is exactly
-    // `lockdown_enabled && !running`; `go_offline` is exactly
-    // `blocked_offers_go_offline`. Both can be true at once — rendering both is the
-    // point (rule #0 favours more escapes over fewer). There is no probe input to
-    // fail — this table is the whole decision.
+    // Exhaustive over all eight (cover_presence, running, blocked_offers_go_offline)
+    // rows, `cover_presence` replacing `lockdown_enabled` (Task 5) but keeping the
+    // same `&& !running` gate — the property is preserved by construction, not
+    // reproven: `unblock` is exactly `cover_presence != Absent && !running`;
+    // `go_offline` is exactly `blocked_offers_go_offline`. Both can be true at
+    // once — rendering both is the point (rule #0 favours more escapes over
+    // fewer). Re-gating `unblock` on presence alone is Task 8b's job.
     let table = [
-        // (lockdown_enabled, running, blocked_offers_go_offline, expect_go_offline, expect_unblock)
-        (true, false, true, true, true),
-        (true, false, false, false, true),
-        (true, true, true, true, false),
-        (true, true, false, false, false),
-        (false, false, true, true, false),
-        (false, false, false, false, false),
-        (false, true, true, true, false),
-        (false, true, false, false, false),
+        // (cover_presence, running, blocked_offers_go_offline, expect_go_offline, expect_unblock)
+        (CoverPresence::Live, false, true, true, true),
+        (CoverPresence::Live, false, false, false, true),
+        (CoverPresence::Live, true, true, true, false),
+        (CoverPresence::Live, true, false, false, false),
+        (CoverPresence::Absent, false, true, true, false),
+        (CoverPresence::Absent, false, false, false, false),
+        (CoverPresence::Absent, true, true, true, false),
+        (CoverPresence::Absent, true, false, false, false),
     ];
-    for (lockdown_enabled, running, blocked_offers_go_offline, expect_go_offline, expect_unblock) in table {
-        let escapes = escape_items(lockdown_enabled, running, blocked_offers_go_offline);
+    for (cover_presence, running, blocked_offers_go_offline, expect_go_offline, expect_unblock) in table {
+        let escapes = escape_items(cover_presence, running, blocked_offers_go_offline);
         assert_eq!(
             escapes,
             EscapeItems {
                 go_offline: expect_go_offline,
                 unblock: expect_unblock,
             },
-            "lockdown_enabled={lockdown_enabled} running={running} blocked_offers_go_offline={blocked_offers_go_offline}"
+            "cover_presence={cover_presence:?} running={running} blocked_offers_go_offline={blocked_offers_go_offline}"
+        );
+    }
+}
+
+#[skuld::test]
+fn an_unreachable_probe_keeps_the_escape_offered() {
+    // A probe that could not determine the truth must never resolve toward
+    // "nothing is blocking" — Indeterminate and Unreachable both keep the
+    // unblock escape offered (with no session running), same as a confirmed
+    // Live/Recorded cover.
+    for presence in [CoverPresence::Indeterminate, CoverPresence::Unreachable] {
+        let escapes = escape_items(presence, false, false);
+        assert!(
+            escapes.unblock,
+            "an uncertain probe ({presence:?}) must still offer the unblock escape"
         );
     }
 }
@@ -299,7 +315,7 @@ fn status_resp(running: bool) -> BridgeResponse {
         udp_proxy_available: true,
         ipv6_bypass_available: true,
         lockdown_enabled: false,
-        lockdown_active: false,
+        cover_presence: CoverPresence::Absent,
         blocked_until_connected: false,
     }
 }

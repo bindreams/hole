@@ -3,7 +3,7 @@
 use crate::bridge_client::{BridgeClient, ClientError};
 use hole_common::config::AppConfig;
 use hole_common::config_store::ConfigStore;
-use hole_common::protocol::{BridgeRequest, BridgeResponse, StartError};
+use hole_common::protocol::{BridgeRequest, BridgeResponse, CoverPresence, StartError};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -239,7 +239,7 @@ impl BridgeLink {
         // A resolved observation retracts any stale wedge failure.
         self.cell.clear_update_failed(UPDATE_FAILED);
         match observed_lockdown(result) {
-            Some((le, la, blk)) => self.cell.commit_status(running, observed_error(result), le, la, blk),
+            Some((le, cp, blk)) => self.cell.commit_status(running, observed_error(result), le, cp, blk),
             None => self.cell.commit(running),
         }
     }
@@ -381,9 +381,10 @@ pub struct ProxySnapshot {
     pub error: Option<String>,
     /// Standing kill-switch intent (#527), from the bridge's StatusResponse.
     pub lockdown_enabled: bool,
-    /// Whether a lockdown cover is engaged. `enabled && !active` is a tray
-    /// warning state — never silent green.
-    pub lockdown_active: bool,
+    /// What the bridge measured about a standing lockdown cover on the host
+    /// (bindreams/hole#825). `enabled && == Absent` is a tray warning state —
+    /// never silent green.
+    pub cover_presence: CoverPresence,
     /// Whether a covered start (auto-connect) failed and left the host
     /// fail-closed (blocked, not leaked) while not running — a distinct blocked
     /// state (Retry / Disconnect), never silent Disconnected.
@@ -408,7 +409,7 @@ impl ProxyStateCell {
             running: false,
             error: None,
             lockdown_enabled: false,
-            lockdown_active: false,
+            cover_presence: CoverPresence::Absent,
             blocked_until_connected: false,
         });
         Self { tx }
@@ -432,7 +433,7 @@ impl ProxyStateCell {
                 running,
                 error: None,
                 lockdown_enabled: snap.lockdown_enabled,
-                lockdown_active: snap.lockdown_active,
+                cover_presence: snap.cover_presence,
                 blocked_until_connected: false,
             };
             true
@@ -449,13 +450,13 @@ impl ProxyStateCell {
         running: bool,
         error: Option<String>,
         lockdown_enabled: bool,
-        lockdown_active: bool,
+        cover_presence: CoverPresence,
         blocked_until_connected: bool,
     ) {
         self.tx.send_if_modified(|snap| {
             if snap.running == running
                 && snap.lockdown_enabled == lockdown_enabled
-                && snap.lockdown_active == lockdown_active
+                && snap.cover_presence == cover_presence
                 && snap.blocked_until_connected == blocked_until_connected
             {
                 return false;
@@ -465,7 +466,7 @@ impl ProxyStateCell {
                 running,
                 error,
                 lockdown_enabled,
-                lockdown_active,
+                cover_presence,
                 blocked_until_connected,
             };
             true
@@ -473,21 +474,18 @@ impl ProxyStateCell {
     }
 
     /// Commit a wedged-cutover failure: Disconnected + the path-free reason.
-    /// `lockdown` is `Some((enabled, active, blocked))` when the triggering Status
-    /// carried fresh flags (apply them) and `None` otherwise (preserve prior).
-    /// Idempotent — bumps `seq` only when running, error, or one of those flags
-    /// actually changes.
-    pub fn commit_update_failed(&self, reason: &'static str, lockdown: Option<(bool, bool, bool)>) {
+    /// `lockdown` is `Some((enabled, cover_presence, blocked))` when the
+    /// triggering Status carried fresh values (apply them) and `None`
+    /// otherwise (preserve prior). Idempotent — bumps `seq` only when
+    /// running, error, or one of those values actually changes.
+    pub fn commit_update_failed(&self, reason: &'static str, lockdown: Option<(bool, CoverPresence, bool)>) {
         self.tx.send_if_modified(|snap| {
-            let (le, la, blk) = lockdown.unwrap_or((
-                snap.lockdown_enabled,
-                snap.lockdown_active,
-                snap.blocked_until_connected,
-            ));
+            let (le, cp, blk) =
+                lockdown.unwrap_or((snap.lockdown_enabled, snap.cover_presence, snap.blocked_until_connected));
             if !snap.running
                 && snap.error.as_deref() == Some(reason)
                 && snap.lockdown_enabled == le
-                && snap.lockdown_active == la
+                && snap.cover_presence == cp
                 && snap.blocked_until_connected == blk
             {
                 return false;
@@ -497,7 +495,7 @@ impl ProxyStateCell {
                 running: false,
                 error: Some(reason.to_string()),
                 lockdown_enabled: le,
-                lockdown_active: la,
+                cover_presence: cp,
                 blocked_until_connected: blk,
             };
             true
@@ -674,11 +672,11 @@ pub fn classify_lockdown(result: &Result<BridgeResponse, ClientError>) -> Lockdo
     match result {
         Ok(BridgeResponse::Status {
             lockdown_enabled,
-            lockdown_active,
+            cover_presence,
             ..
         }) => LockdownRead::Known {
             enabled: *lockdown_enabled,
-            active: *lockdown_active,
+            active: *cover_presence != CoverPresence::Absent,
         },
         Ok(_) => LockdownRead::WrongReply,
         Err(_) => LockdownRead::Unreadable,
@@ -688,14 +686,14 @@ pub fn classify_lockdown(result: &Result<BridgeResponse, ClientError>) -> Lockdo
 /// The lockdown (enabled, active) + blocked-until-connected flags a Status
 /// exchange revealed, if any. Only a `Status` Ok carries them; every other
 /// exchange yields None (leave the snapshot's prior fields untouched).
-pub(crate) fn observed_lockdown(result: &Result<BridgeResponse, ClientError>) -> Option<(bool, bool, bool)> {
+pub(crate) fn observed_lockdown(result: &Result<BridgeResponse, ClientError>) -> Option<(bool, CoverPresence, bool)> {
     match result {
         Ok(BridgeResponse::Status {
             lockdown_enabled,
-            lockdown_active,
+            cover_presence,
             blocked_until_connected,
             ..
-        }) => Some((*lockdown_enabled, *lockdown_active, *blocked_until_connected)),
+        }) => Some((*lockdown_enabled, *cover_presence, *blocked_until_connected)),
         _ => None,
     }
 }

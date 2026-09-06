@@ -266,7 +266,7 @@ fn read_result_file_garbage_is_err() {
 
 use super::classify_elevated_send;
 use crate::bridge_client::ClientError;
-use hole_common::protocol::{BridgeResponse, StartError};
+use hole_common::protocol::{BridgeResponse, CoverPresence, StartError};
 
 #[skuld::test]
 fn classify_ack_is_success() {
@@ -288,7 +288,7 @@ fn classify_unexpected_ok_is_success() {
         udp_proxy_available: true,
         ipv6_bypass_available: true,
         lockdown_enabled: false,
-        lockdown_active: false,
+        cover_presence: CoverPresence::Absent,
         blocked_until_connected: false,
     });
     assert_eq!(classify_elevated_send(&r), ElevatedOutcome::Success);

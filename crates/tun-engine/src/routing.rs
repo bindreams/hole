@@ -1509,6 +1509,13 @@ pub trait Routing: Send + Sync {
     /// from a stranded cover; a required method (no default) so every
     /// `Routing` implementation, including every test mock, commits to one.
     fn release_all_covers(&self) -> Result<(), RoutingError>;
+
+    /// Measure whether a standing lockdown cover is present on the host right
+    /// now — an OS probe, not a recollection of what this process engaged.
+    /// See [`CoverPresence`] for what each variant means. A required method
+    /// (no default) so every `Routing` implementation, including every test
+    /// mock, commits to a value the caller can control.
+    fn lockdown_cover_presence(&self) -> CoverPresence;
 }
 
 // System (production) routing =========================================================================================
@@ -1650,6 +1657,10 @@ impl Routing for SystemRouting {
 
     fn release_all_covers(&self) -> Result<(), RoutingError> {
         failclosed::release_all(&self.state_dir)
+    }
+
+    fn lockdown_cover_presence(&self) -> CoverPresence {
+        failclosed::lockdown_cover_presence(&self.state_dir)
     }
 }
 
