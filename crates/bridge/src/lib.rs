@@ -20,6 +20,7 @@ pub mod reachability;
 pub mod route_recovery;
 pub mod server_test;
 pub mod socket;
+pub mod target;
 
 // Cross-cutting test helpers. Deviates from the sibling `foo_tests.rs`
 // convention used everywhere else in this crate because there is no
