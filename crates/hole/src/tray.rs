@@ -255,31 +255,17 @@ const UNBLOCK_UNREACHABLE_MESSAGE: &str =
     "Could not reach the Hole bridge. If you are currently connected, disconnect first, then run \
      \"hole bridge unlock\" as an administrator (use sudo on macOS).";
 
-/// Shown when the bridge answered `Err(ClientError::SessionRunning)`: a
-/// session is running, so there was no unowned cover to clear, but the kill
-/// switch is now off. Must NOT name `hole bridge unlock` — that command
-/// performs no running-session check, so directing a user there in this
-/// state would strip the cover from under a live tunnel.
-const UNBLOCK_SESSION_RUNNING_MESSAGE: &str =
-    "A session is running, so there was nothing to unblock. The kill switch is now off — Disconnect to release its cover.";
-
 /// Map a `BridgeRequest::Unblock` response to the dialog the tray should
-/// show, or `None` for a silent success. Pure (aside from logging) so the
-/// mapping — which of two mutually-distinct, purpose-built messages a user
-/// sees — is table-tested directly, mirroring `outcome_for_start_response`'s
-/// pattern. Menu visibility is decided at build time and the click lands
-/// arbitrarily later, so a session can legitimately have started in between;
-/// each branch gets the advice that is true for it.
+/// show, or `None` for a silent success. Pure (aside from logging), table-tested
+/// directly, mirroring `outcome_for_start_response`'s pattern. The escape's
+/// handler reads no session posture (Task 8b) and always either releases the
+/// cover or reports a bridge-authored failure, so there is no "session was
+/// running" case to map here.
 fn unblock_dialog_message(response: &Result<BridgeResponse, crate::bridge_client::ClientError>) -> Option<String> {
-    use crate::bridge_client::ClientError;
     match response {
         Ok(BridgeResponse::Ack) => {
             info!("tray: unblock succeeded");
             None
-        }
-        Err(ClientError::SessionRunning) => {
-            info!("tray: unblock found a session running");
-            Some(UNBLOCK_SESSION_RUNNING_MESSAGE.to_string())
         }
         Ok(BridgeResponse::Error { message }) => {
             error!(%message, "tray: unblock reported a failure");
@@ -366,17 +352,18 @@ struct EscapeItems {
 }
 
 /// Resolve which escape items to show. The two conditions are independent —
-/// there is no probe input here to fail, only the exhaustive table test over
-/// all eight `(cover_presence, running, blocked_offers_go_offline)` rows.
-/// `cover_presence` replaces `lockdown_enabled` (Task 5): the gate still reads
-/// `&& !running` here — re-gating `unblock` on presence alone, independent of
-/// `running`, is Task 8b's job, not this one. `Indeterminate`/`Unreachable`
-/// count as present — an uncertain probe must never resolve toward "nothing
-/// is blocking".
-fn escape_items(cover_presence: CoverPresence, running: bool, blocked_offers_go_offline: bool) -> EscapeItems {
+/// exhaustive table test over all 20 `(cover_presence, running,
+/// blocked_offers_go_offline)` rows. `unblock` keys on `cover_presence`
+/// alone, never on `running`: gating it on `!running` was deriving a
+/// lockdown answer from the tunnel surface, exactly the coupling this model
+/// removes (Task 8b) — the escape's handler (`ipc::handle_unblock`) reads no
+/// session posture either, so the affordance must not pretend one exists.
+/// `Indeterminate`/`Unreachable` count as present — an uncertain probe must
+/// never resolve toward "nothing is blocking".
+fn escape_items(cover_presence: CoverPresence, _running: bool, blocked_offers_go_offline: bool) -> EscapeItems {
     EscapeItems {
         go_offline: blocked_offers_go_offline,
-        unblock: cover_presence != CoverPresence::Absent && !running,
+        unblock: cover_presence != CoverPresence::Absent,
     }
 }
 

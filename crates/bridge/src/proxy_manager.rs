@@ -34,6 +34,7 @@
 // handed to `new`. A getter would recreate an encapsulation smell.
 
 use std::net::{IpAddr, Ipv4Addr};
+use std::sync::Arc;
 use std::time::Instant;
 use util::port_alloc;
 
@@ -43,8 +44,11 @@ use hole_common::protocol::{ProxyConfig, TunnelMode};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 use tun_engine::gateway::GatewayInfo;
-use tun_engine::routing::failclosed::lockdown_state;
+use tun_engine::routing::failclosed::lockdown_state::{self, Intent};
 use tun_engine::routing::{CoverGuard, CoverPresence, RoutesInstalled, Routing, SystemRouting};
+
+use crate::reconciler::{cover_step, CoverStep};
+use crate::target::{self, Target};
 
 use crate::dns::self_test::{
     build_local_dns, implicates_plugin_transport, report_plugin_output, run_forwarder_self_test, self_test_error_for,
@@ -231,7 +235,12 @@ pub const DEATH_REASON: &str = "proxy task exited unexpectedly";
 
 pub struct ProxyManager<P: Proxy = ShadowsocksProxy, R: Routing = SystemRouting, D: Dns = SystemDns> {
     proxy: P,
-    routing: R,
+    /// Shared, not owned outright: `IpcState` holds a clone of this SAME
+    /// `Arc` beside the proxy mutex so the unblock escape
+    /// (`ipc::handle_unblock`) can read cover presence and release covers
+    /// WITHOUT taking `state.proxy.lock()` — the escape must work even while
+    /// a teardown wedges that lock. See [`Self::routing_handle`].
+    routing: Arc<R>,
     dns: D,
     /// See the `Posture` section below. The pending-start case holds the
     /// single transient fail-closed cover, engaged when a covered
@@ -396,16 +405,6 @@ impl<P: Proxy, R: Routing, D: Dns> Posture<P, R, D> {
     }
 }
 
-/// Result of [`ProxyManager::turn_lockdown_off`]. `Cleared` means every
-/// unowned cover Hole can install has been released and the intent is off;
-/// `SessionRunning` means a live session owns its own cover instead — the
-/// intent was still recorded, but there was no unowned cover here to clear.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LockdownOffOutcome {
-    Cleared,
-    SessionRunning,
-}
-
 impl<P: Proxy, R: Routing> ProxyManager<P, R, SystemDns> {
     pub fn new(proxy: P, routing: R) -> Self {
         Self::new_with_dns(proxy, routing, SystemDns::default())
@@ -421,7 +420,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
     pub fn new_with_dns(proxy: P, routing: R, dns: D) -> Self {
         Self {
             proxy,
-            routing,
+            routing: Arc::new(routing),
             dns,
             posture: Posture::Idle,
             last_error: None,
@@ -445,6 +444,15 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
     #[cfg(test)]
     pub fn set_bootstrap_querier_for_test(&mut self, q: std::sync::Arc<dyn crate::dns::bootstrap::DohQuerier>) {
         self.bootstrap_querier = Some(q);
+    }
+
+    /// Clone of the shared routing handle. `bind_with_dirs`/`bind` derive
+    /// `IpcState::routing` from this — a `Mutex`-free clone taken once at
+    /// bind time, uncontended since the `ProxyManager` is freshly
+    /// constructed there — so the unblock escape can act on routing without
+    /// taking `state.proxy.lock()`.
+    pub fn routing_handle(&self) -> Arc<R> {
+        Arc::clone(&self.routing)
     }
 
     /// Set the state directory for plugin PID crash recovery.
@@ -722,79 +730,43 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
             .map_err(|e| ProxyError::Runtime(std::io::Error::other(format!("lockdown persist: {e}"))))
     }
 
-    /// Turn the kill-switch intent off, releasing any cover no running
-    /// session owns. This is the feature's only stateful decision: both the
-    /// tray's Unblock item and the Lockdown-off toggle call it and map the
-    /// returned outcome to their own reply; neither inspects the posture
-    /// itself — the condition is an arm of an exhaustive match over
-    /// `&self.posture`, so a future scope error shows up as a missing or
-    /// merged arm rather than as a new boolean.
+    /// Turn the kill-switch intent off, releasing the cover iff
+    /// `cover_step` says the target/presence pair calls for it. Reads no
+    /// session posture directly — Q4 ("unblock IS unticking") means a live
+    /// session's cover is released too when the persisted target is `Off`
+    /// and presence is not `Absent`/`Unreachable`; `cover_step`'s own
+    /// `Target::Off` arm is what decides that, uniformly, whether or not a
+    /// session is running.
     ///
-    /// The step-3-before-step-4 ordering (release, THEN persist) is
-    /// load-bearing: the tray offers this escape while the intent is on, so
-    /// flipping the intent off after a FAILED release would delete the
-    /// user's only retry affordance while the host is still held closed. The
-    /// intent moves only after the clear confirms.
-    pub fn turn_lockdown_off(&mut self) -> Result<LockdownOffOutcome, ProxyError> {
-        match &self.posture {
-            // 1. A live session owns the host's posture whether or not it
-            // installed a standing cover — `stop_with` decides that cover's
-            // fate, and nothing else may release it, so recording the intent
-            // is the whole of what "turn it off" can mean while connected
-            // (matches the toggle's existing mid-session behavior). Keying
-            // this on the session's own standing cover instead would be a
-            // behaviour change: a session with no standing cover would then
-            // let the clear below proceed.
-            Posture::Session(_) => {
-                // Mapped to the same `LockdownIntentNotPersisted` a failed persist
-                // in step 4 uses (not propagated raw via `?`): both name the one
-                // fact the caller can act on — the setting did not save — rather
-                // than an opaque `ProxyError::Runtime` the IPC layer's generic
-                // 500 path can't distinguish from a release failure.
-                let persisted = self.set_lockdown_intent(false);
-                if persisted.is_ok() {
-                    // The recorded off is the user's decision. A startup-recovery
-                    // claim from BEFORE this session started (or from a since-
-                    // superseded adoption this session's own fresh
-                    // `install_lockdown` already replaced) must not keep
-                    // overriding it: without this, `lockdown_enabled` still ORs
-                    // in the stale claim and reports armed right after the
-                    // caller was told the setting saved. The session's OWN cover,
-                    // if any, is untouched — `stop_with` alone decides its fate.
-                    self.set_standing_cover_adopted(false);
-                }
-                match persisted {
-                    Ok(()) => Ok(LockdownOffOutcome::SessionRunning),
-                    Err(_) => Err(ProxyError::LockdownIntentNotPersisted),
-                }
-            }
-            Posture::Idle | Posture::PendingStart(_) => {
-                // 2. Drop any held transient guard's in-process authority first.
-                // Not a condition — a no-op on `Nobody` — it exists so no live
-                // guard outlives the OS objects `release_all_covers` is about to
-                // delete out from under it.
-                self.posture.take_pending();
+    /// Release-then-persist ordering is load-bearing: the tray offers this
+    /// escape while the intent is on, so flipping the intent off after a
+    /// FAILED release would delete the user's only retry affordance while
+    /// the host is still held closed. The intent moves only after the clear
+    /// confirms (or after `cover_step` said no clear was owed).
+    pub fn turn_lockdown_off(&mut self) -> Result<(), ProxyError> {
+        // Drop any held transient guard's in-process authority first. Not a
+        // condition — a no-op when nothing is pending — it exists so no live
+        // guard outlives the OS objects `release_all_covers` is about to
+        // delete out from under it.
+        self.posture.take_pending();
 
-                // 3. The unconditional clear. On error, return WITHOUT touching
-                // the intent — see the ordering note above.
-                self.routing.release_all_covers()?;
-
-                // The clear confirmed, so the host is open: an adopted cover no
-                // longer holds it. Dropping this claim is what stops the tray
-                // from rendering `Lockdown: On` over an open host for the life
-                // of the process.
-                self.set_standing_cover_adopted(false);
-
-                // 4. Only now move the intent. The covers are already gone and
-                // the host is open; a persist failure here means only the
-                // SETTING did not save, which the caller must be able to say
-                // distinctly from a failed release.
-                match self.set_lockdown_intent(false) {
-                    Ok(()) => Ok(LockdownOffOutcome::Cleared),
-                    Err(_) => Err(ProxyError::LockdownIntentNotPersisted),
-                }
-            }
+        let target = self.state_dir.as_deref().map(target::load).unwrap_or(Target::Off);
+        let presence = self.routing.lockdown_cover_presence();
+        if cover_step(Intent::Off, presence, &target) == CoverStep::Release {
+            self.routing.release_all_covers()?;
+            // The clear confirmed, so the host is open: an adopted cover no
+            // longer holds it. Dropping this claim is what stops the tray
+            // from rendering `Lockdown: On` over an open host for the life
+            // of the process.
+            self.set_standing_cover_adopted(false);
         }
+
+        // Only now move the intent. Either the covers are already gone and
+        // the host is open, or `cover_step` said none needed releasing; a
+        // persist failure here means only the SETTING did not save, which
+        // the caller must be able to say distinctly from a failed release.
+        self.set_lockdown_intent(false)
+            .map_err(|_| ProxyError::LockdownIntentNotPersisted)
     }
 
     /// Non-cancellable convenience wrapper around

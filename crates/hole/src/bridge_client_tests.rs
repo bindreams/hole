@@ -786,10 +786,10 @@ async fn stop_against_status(
     client.send(BridgeRequest::Stop).await
 }
 
-/// Drive POST /v1/unblock against a mock — the `Unblock` arm has its own
-/// bespoke 409 mapping (`ClientError::SessionRunning`) ahead of the generic
-/// `parse_generic_error` fallback, mirroring `Start`'s 409 handling rather
-/// than `Stop`'s.
+/// Drive POST /v1/unblock against a mock — `Unblock` has no bespoke error
+/// mapping and falls through to the generic `parse_generic_error`, same as
+/// `Stop`: the handler reads no session posture, so there is no distinct
+/// "session running" status to map.
 async fn unblock_against_status(
     path: &std::path::Path,
     status: axum::http::StatusCode,
@@ -919,18 +919,18 @@ fn unblock_200_maps_to_ack() {
 }
 
 #[skuld::test]
-fn unblock_409_maps_to_session_running() {
+fn unblock_409_maps_to_protocol() {
     rt().block_on(async {
-        // Unlike `Stop`'s CONFLICT (which falls through to the generic
-        // Protocol-error mapping), Unblock's 409 must map to the typed
-        // variant the tray keys its distinct, cover-safe messaging on.
+        // The handler reads no session posture (Task 8b), so the bridge
+        // never answers Unblock with a 409 in the first place; but if it
+        // ever did, Unblock must not special-case it — same as `Stop`.
         let result = unblock_against_status(
             &test_socket_path("unblock409"),
             axum::http::StatusCode::CONFLICT,
-            "a session is running",
+            "nope",
         )
         .await;
-        assert!(matches!(result, Err(ClientError::SessionRunning)), "got {result:?}");
+        assert!(matches!(result, Err(ClientError::Protocol(_))), "got {result:?}");
     });
 }
 

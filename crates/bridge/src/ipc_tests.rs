@@ -377,7 +377,9 @@ fn mock_proxy_with_cover_presence(
 /// `mock_proxy_with_state_dir` variant that also hands back the mock
 /// routing's `release_all_calls` / `fail_release` handles (cloned out BEFORE
 /// `routing` moves into the manager, mirroring `mock_proxy_with_traffic`), so
-/// a test can assert the unconditional escape fired and drive a failure.
+/// a test can assert the escape fired and drive a failure. Presence defaults
+/// to `Live` — the escape is now gated on `cover_step`, so a test exercising
+/// `release_all_covers` needs a presence that actually calls for a release.
 #[allow(clippy::type_complexity)]
 fn mock_proxy_with_release_state() -> (
     Arc<Mutex<ProxyManager<MockProxy, MockRouting>>>,
@@ -386,7 +388,7 @@ fn mock_proxy_with_release_state() -> (
     PathBuf,
 ) {
     let state_dir = tempfile::tempdir().unwrap().keep();
-    let routing = MockRouting::new(state_dir.clone());
+    let routing = MockRouting::new(state_dir.clone()).with_cover_presence(tun_engine::routing::CoverPresence::Live);
     let release_all_calls = Arc::clone(&routing.release_all_calls);
     let fail_release = Arc::clone(&routing.fail_release);
     let pm = ProxyManager::new(MockProxy::new(), routing).with_state_dir(state_dir.clone());
@@ -891,18 +893,24 @@ fn unblock_clears_covers_and_returns_ok() {
     });
 }
 
+/// Q4/R3: the escape never refuses. A session still running with a live
+/// cover and the target going `Off` is exactly the wedged-teardown case the
+/// escape exists for; it must release the cover and 200, not 409.
 #[skuld::test]
-fn unblock_while_running_returns_conflict() {
+fn a_wedged_teardown_with_an_off_target_releases_the_cover() {
     rt().block_on(async {
         let path = test_socket_path("unblock-running");
         let (proxy, release_all_calls, _fail_release, dir) = mock_proxy_with_release_state();
-        // Seed the intent ON so the post-unblock "still off" assertion below
+        // Seed the intent ON so the post-unblock "now off" assertion below
         // actually exercises the persist — a fresh tempdir with no
         // bridge-lockdown.json already reads `false`, which would let that
         // assertion pass vacuously regardless of whether the handler wrote
         // anything.
         lockdown_state::set_enabled(&dir, true, None).unwrap();
-        let server = IpcServer::bind(&path, proxy, "test").unwrap();
+        // `handle_unblock` persists through `IpcState::state_dir`, not the
+        // proxy manager's own — `bind_with_dirs` with the SAME `dir` mirrors
+        // production wiring (`foreground.rs` passes one `state_dir` to both).
+        let server = IpcServer::bind_with_dirs(&path, proxy, "test", dir.clone(), dir.clone(), None).unwrap();
         let handle = tokio::spawn(async move {
             server.run_once().await.unwrap();
         });
@@ -914,19 +922,16 @@ fn unblock_while_running_returns_conflict() {
         let resp = post_unblock(&mut client).await;
         assert_eq!(
             resp.status(),
-            409,
-            "a running session must be reported, not silently overridden"
+            200,
+            "the escape never refuses, even with a session still running"
         );
         let _ = resp.into_body().collect().await;
         assert_eq!(
             release_all_calls.load(Ordering::SeqCst),
-            0,
-            "the escape must not fire under a live session"
+            1,
+            "a live cover must be released regardless of the running session"
         );
-        assert!(
-            !lockdown_state::load_enabled(&dir),
-            "the intent must still be recorded as off, even though there was no cover to clear"
-        );
+        assert!(!lockdown_state::load_enabled(&dir), "the intent must be recorded off");
 
         drop(client);
         handle.abort();
@@ -970,26 +975,8 @@ fn unblock_error_bodies_carry_no_filesystem_path() {
     }
 
     rt().block_on(async {
-        // The 409 (session running) case.
-        let path = test_socket_path("unblock-nopath-409");
-        let (proxy, _calls, _fail, _dir) = mock_proxy_with_release_state();
-        let server = IpcServer::bind(&path, proxy, "test").unwrap();
-        let handle = tokio::spawn(async move {
-            server.run_once().await.unwrap();
-        });
-        let mut client = TestClient::connect(&path).await;
-        assert_eq!(
-            consume(post_start(&mut client, &sample_config(), "a1").await).await,
-            200
-        );
-        let resp = post_unblock(&mut client).await;
-        assert_eq!(resp.status(), 409);
-        assert_no_path(&parse_error_body(resp).await.message);
-        drop(client);
-        handle.abort();
-        let _ = handle.await;
-
-        // The 500 (failed release) case.
+        // The 500 (failed release) case — the only error case unblock has
+        // left, now that the escape never refuses (Q4/R3).
         let path = test_socket_path("unblock-nopath-500");
         let (proxy, _calls, fail_release, _dir) = mock_proxy_with_release_state();
         fail_release.store(true, Ordering::SeqCst);
@@ -1035,6 +1022,32 @@ fn lockdown_off_releases_covers_through_the_same_path() {
         handle.abort();
         let _ = handle.await;
     });
+}
+
+/// Seam guard with the sibling teardown item: `handle_unblock` must consume
+/// no session posture at all, so a stopping session's reported posture can
+/// never reach this decision (R7's whole point — the escape reads only the
+/// reconciler's target/presence, off the proxy mutex entirely).
+#[skuld::test]
+fn the_unblock_handler_reads_no_session_posture() {
+    let src = include_str!("ipc.rs");
+    let start = src
+        .find("async fn handle_unblock")
+        .expect("handle_unblock must exist in ipc.rs");
+    let after_start = &src[start + 1..];
+    let end = after_start
+        .find("\nasync fn ")
+        .or_else(|| after_start.find("\nfn "))
+        .map(|i| start + 1 + i)
+        .unwrap_or(src.len());
+    let handler_src = &src[start..end];
+
+    let pattern = regex::Regex::new(r"(?i)posture|holder").unwrap();
+    assert!(
+        !pattern.is_match(handler_src),
+        "handle_unblock must take no Posture/holder input — the escape reads only the \
+         reconciler's target/presence, never a session's reported posture:\n{handler_src}"
+    );
 }
 
 #[skuld::test]
@@ -2575,8 +2588,13 @@ fn redacting_capture() -> (
 
 fn ipc_state(proxy: Arc<Mutex<ProxyManager<MockProxy, MockRouting>>>) -> Arc<IpcState<MockProxy, MockRouting>> {
     let dir = tempfile::tempdir().unwrap().keep();
+    let routing = proxy
+        .try_lock()
+        .expect("proxy mutex must be uncontended at construction time")
+        .routing_handle();
     Arc::new(IpcState {
         proxy,
+        routing,
         start_cancel: Arc::new(std::sync::Mutex::new(StartCancelState::default())),
         version: "test".to_string(),
         log_dir: dir.clone(),

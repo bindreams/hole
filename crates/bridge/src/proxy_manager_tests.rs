@@ -5609,8 +5609,7 @@ fn turning_lockdown_off_mid_session_clears_a_stale_adopted_claim() {
         pm.set_standing_cover_adopted(true);
         pm.start(&test_config()).await.unwrap();
 
-        let outcome = pm.turn_lockdown_off().expect("a running session must not error");
-        assert!(matches!(outcome, LockdownOffOutcome::SessionRunning));
+        pm.turn_lockdown_off().expect("a running session must not error");
         assert!(
             !lockdown_state::load_intent(dir.path()).reads_armed(),
             "the intent must be recorded off"

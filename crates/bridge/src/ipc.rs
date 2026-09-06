@@ -1,9 +1,11 @@
 //! IPC server — HTTP/1.1 REST API over local Unix domain socket.
 
+use tun_engine::routing::failclosed::lockdown_state::{self, Intent};
 use tun_engine::routing::Routing;
 
 use crate::proxy::{Proxy, ProxyError};
-use crate::proxy_manager::{LockdownOffOutcome, ProxyManager, ProxyState};
+use crate::proxy_manager::{ProxyManager, ProxyState};
+use crate::reconciler::{cover_step, CoverStep};
 use crate::server_test::{run_server_test, TestConfig};
 use crate::socket::LocalListener;
 use crate::target::{self, Target};
@@ -92,6 +94,12 @@ pub struct StartCancelState {
 /// start-cancellation handoff struct.
 pub struct IpcState<P: Proxy, R: Routing> {
     pub proxy: Arc<Mutex<ProxyManager<P, R>>>,
+    /// The SAME `Arc<R>` `proxy`'s `ProxyManager` holds internally, cloned
+    /// once at bind time via `ProxyManager::routing_handle`. Lets
+    /// `handle_unblock` act on routing (read presence, release covers)
+    /// WITHOUT taking `proxy.lock()` — the escape must work even while a
+    /// teardown wedges that lock.
+    pub routing: Arc<R>,
     // std::sync::Mutex — never held across .await. See StartCancelState docs.
     pub start_cancel: Arc<std::sync::Mutex<StartCancelState>>,
     /// This bridge's build version, stamped on every response
@@ -142,8 +150,19 @@ impl IpcServer {
         #[cfg(not(test))]
         apply_socket_permissions(path);
 
+        // `try_lock` is safe here: `proxy` is freshly constructed and not yet
+        // shared with any other task at this call site, in every production
+        // and test caller — uncontended by construction. Deriving the
+        // routing handle this way (rather than threading a new parameter)
+        // keeps every existing `bind`/`bind_with_dirs` call site unchanged.
+        let routing = proxy
+            .try_lock()
+            .expect("proxy mutex must be uncontended at bind time")
+            .routing_handle();
+
         let state = Arc::new(IpcState {
             proxy,
+            routing,
             start_cancel: Arc::new(std::sync::Mutex::new(StartCancelState::default())),
             version: version.to_owned(),
             log_dir,
@@ -554,12 +573,10 @@ async fn handle_cancel<P: Proxy + 'static, R: Routing + 'static>(
 /// sends intent.
 ///
 /// Turning the intent OFF reroutes through [`ProxyManager::turn_lockdown_off`]
-/// — the same unconditional release `POST /v1/unblock` performs — so the
-/// effect is immediate rather than deferred to the next start; both outcomes
-/// it can return mean the intent is now off, so both map to 200. This is a
-/// branch on the REQUEST's own payload (`enabled`), not on inspected proxy
-/// state — the `running` condition stays exactly where `turn_lockdown_off`
-/// put it. Turning the intent ON is unchanged: it only persists.
+/// — releasing the cover whenever `cover_step` calls for it — so the effect
+/// is immediate rather than deferred to the next start. This is a branch on
+/// the REQUEST's own payload (`enabled`), not on inspected proxy state.
+/// Turning the intent ON is unchanged: it only persists.
 async fn handle_lockdown<P: Proxy + 'static, R: Routing + 'static>(
     State(state): State<Arc<IpcState<P, R>>>,
     Json(req): Json<LockdownRequest>,
@@ -567,8 +584,8 @@ async fn handle_lockdown<P: Proxy + 'static, R: Routing + 'static>(
     let mut pm = state.proxy.lock().await;
     if !req.enabled {
         return match pm.turn_lockdown_off() {
-            Ok(_) => {
-                info!("lockdown intent set to off; released any cover no running session owns");
+            Ok(()) => {
+                info!("lockdown intent set to off; released the cover if the target/presence pair called for it");
                 Ok(Json(EmptyResponse {}))
             }
             Err(e) => {
@@ -598,40 +615,61 @@ async fn handle_lockdown<P: Proxy + 'static, R: Routing + 'static>(
 }
 
 /// The tray's escape from a fail-closed cover stranded by an unclean exit:
-/// unconditionally clear every cover Hole can install, then turn the kill
-/// switch off. `turn_lockdown_off`'s one condition — whether a session is
-/// running — maps to 409 (the intent is still off; the caller should
-/// disconnect to release the session's own cover); any other failure is 500.
-/// The OS calls run inline under the lock, exactly as `handle_stop`'s cover
-/// teardown already does — a one-shot user action, not a status poll.
+/// record the target off and the kill-switch intent off, then release the
+/// cover iff `cover_step` calls for it against the freshly-persisted target
+/// and the OS-probed presence. Deliberately reads no session posture and
+/// takes NO `state.proxy.lock()` — this must work even while a teardown
+/// wedges that lock (the circular dependency this design resolves: the
+/// escape can't depend on a lock a stuck teardown holds). `target::apply`
+/// and `lockdown_state::set_enabled` are sync, so they run in
+/// `spawn_blocking`, mirroring `persist_target_off`'s existing pattern.
 async fn handle_unblock<P: Proxy + 'static, R: Routing + 'static>(
     State(state): State<Arc<IpcState<P, R>>>,
 ) -> Result<Json<EmptyResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let mut pm = state.proxy.lock().await;
-    match pm.turn_lockdown_off() {
-        Ok(LockdownOffOutcome::Cleared) => {
-            info!("unblock: every cover cleared, kill switch off");
-            Ok(Json(EmptyResponse {}))
-        }
-        Ok(LockdownOffOutcome::SessionRunning) => {
-            info!("unblock: a session is running, so there was no unowned cover to clear");
-            Err((
-                StatusCode::CONFLICT,
-                Json(ErrorResponse {
-                    message: "a session is running; disconnect to release its own cover".into(),
-                }),
-            ))
-        }
-        Err(e) => {
-            error!(error = %e, "unblock failed");
-            Err((
+    let state_dir = state.state_dir.clone();
+    let owner = state.owner;
+    let persisted = tokio::task::spawn_blocking(move || -> Result<(), String> {
+        target::apply(&state_dir, owner, |_current| Target::Off).map_err(|e| e.to_string())?;
+        lockdown_state::set_enabled(&state_dir, false, owner).map_err(|e| e.to_string())?;
+        Ok(())
+    })
+    .await;
+    match persisted {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            error!(error = %e, "unblock: failed to persist target/intent off");
+            return Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse {
-                    message: unblock_error_message(&e),
+                    message: "the network could not be fully unblocked".into(),
                 }),
-            ))
+            ));
+        }
+        Err(e) => {
+            error!(error = %e, "unblock: persist task panicked");
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    message: "the network could not be fully unblocked".into(),
+                }),
+            ));
         }
     }
+
+    let presence = state.routing.lockdown_cover_presence();
+    if cover_step(Intent::Off, presence, &Target::Off) == CoverStep::Release {
+        if let Err(e) = state.routing.release_all_covers() {
+            error!(error = %e, "unblock: release failed");
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    message: "the network could not be fully unblocked".into(),
+                }),
+            ));
+        }
+    }
+    info!("unblock: target off, intent off, cover released if the presence called for it");
+    Ok(Json(EmptyResponse {}))
 }
 
 /// PII-free 500 body for a failed `turn_lockdown_off`. Never formats the

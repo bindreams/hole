@@ -51,12 +51,6 @@ pub enum ClientError {
     /// The bridge rejected a start because another is already in flight (409).
     #[error("a start is already in progress")]
     ConcurrentStart,
-    /// `Unblock` found a session running (409): there was no unowned cover to
-    /// clear, and the intent is now off. Without this mapping a 409 becomes
-    /// an opaque `Protocol` error and the caller cannot tell "a session
-    /// started" from "the clear failed".
-    #[error("a session is running; disconnect to release its own cover")]
-    SessionRunning,
 }
 
 // Client ==============================================================================================================
@@ -258,8 +252,6 @@ impl BridgeClient {
                 let resp = self.http_post(ROUTE_UNBLOCK, Vec::new(), &[]).await?;
                 if resp.status().is_success() {
                     Ok(BridgeResponse::Ack)
-                } else if resp.status() == http::StatusCode::CONFLICT {
-                    Err(ClientError::SessionRunning)
                 } else {
                     parse_generic_error(resp).await
                 }

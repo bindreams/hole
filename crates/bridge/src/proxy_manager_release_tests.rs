@@ -1,7 +1,8 @@
 //! Tests for `ProxyManager::turn_lockdown_off` — the whole feature's only
-//! stateful decision (the single `running` condition, the ordering that keeps
-//! the tray's escape available across a failed release, and the drop of a
-//! held transient guard before the OS-level clear). Reuses the mocks and
+//! stateful decision (whether `cover_step` calls for a release given the
+//! persisted target and OS-probed presence, the ordering that keeps the
+//! tray's escape available across a failed release, and the drop of a held
+//! transient guard before the OS-level clear). Reuses the mocks and
 //! constructors from the sibling `proxy_manager_tests` module rather than
 //! redefining them.
 
@@ -16,6 +17,7 @@ use crate::proxy::ProxyError;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tun_engine::routing::failclosed::lockdown_state;
+use tun_engine::routing::CoverPresence;
 
 /// A covered start that fails deterministically (a closed loopback port with
 /// the DNS forwarder self-test gate enabled, which `MockProxy` cannot
@@ -49,7 +51,13 @@ async fn covered_start_holding_the_cover(
 }
 
 #[skuld::test]
-fn turn_lockdown_off_records_the_intent_without_clearing_while_a_session_runs() {
+fn turn_lockdown_off_releases_a_stranded_cover_even_while_a_session_runs() {
+    // Q4: unblock IS unticking. `cover_step` reads no session posture, so a
+    // session that itself installed the standing cover (intent was On) does
+    // not shield it from the escape — the persisted target defaults to `Off`
+    // (no `bridge-target.json` is ever written by this ProxyManager-level
+    // test), and presence reads `Live` because the session's own start
+    // engaged it.
     rt().block_on(async {
         let dir = tempfile::tempdir().unwrap();
         let routing = MockRouting::new(dir.path().to_path_buf());
@@ -58,16 +66,15 @@ fn turn_lockdown_off_records_the_intent_without_clearing_while_a_session_runs() 
         let mut pm = ProxyManager::new(MockProxy::new(), routing).with_state_dir(dir.path().to_path_buf());
         pm.start(&test_config()).await.unwrap();
 
-        let outcome = pm.turn_lockdown_off().expect("a running session must not error");
-        assert!(matches!(outcome, LockdownOffOutcome::SessionRunning));
+        pm.turn_lockdown_off().expect("a running session must not error");
         assert_eq!(
             st.release_all_calls.load(Ordering::SeqCst),
-            0,
-            "a running session owns its own cover; release_all_covers must not fire"
+            1,
+            "presence Live + target Off must release the cover regardless of the running session"
         );
         assert!(
             !lockdown_state::load_enabled(dir.path()),
-            "the intent must still be recorded as off"
+            "the intent must be recorded as off"
         );
 
         pm.stop().await.unwrap();
@@ -80,8 +87,9 @@ fn turn_lockdown_off_reports_an_unsaved_intent_while_a_session_runs() {
         let dir = tempfile::tempdir().unwrap();
         let routing = MockRouting::new(dir.path().to_path_buf());
         let st = routing.state();
-        // No `.with_state_dir(..)`: the persist fails even though a session
-        // is running (there is no cover to clear either way).
+        // No `.with_state_dir(..)`: the persist fails. `standing_cover_expected`
+        // also reads no state_dir here, so this covered start engages no
+        // standing cover — presence stays `Absent` and `cover_step` holds.
         let mut pm = ProxyManager::new(MockProxy::new(), routing);
         pm.start(&test_config()).await.unwrap();
 
@@ -90,13 +98,13 @@ fn turn_lockdown_off_reports_an_unsaved_intent_while_a_session_runs() {
             .expect_err("an unpersistable intent must still be reported");
         assert!(
             matches!(err, ProxyError::LockdownIntentNotPersisted),
-            "must be the SAME distinguishable error the Cleared branch uses, not an opaque \
-             ProxyError::Runtime the IPC layer's generic 500 path can't tell apart from a failed release: {err:?}"
+            "must be the SAME distinguishable error a failed release uses, not an opaque \
+             ProxyError::Runtime the IPC layer's generic 500 path can't tell apart from it: {err:?}"
         );
         assert_eq!(
             st.release_all_calls.load(Ordering::SeqCst),
             0,
-            "a running session owns its own cover; release_all_covers must not fire"
+            "presence Absent (no standing cover was ever installed here); cover_step must hold"
         );
 
         pm.stop().await.unwrap();
@@ -104,7 +112,28 @@ fn turn_lockdown_off_reports_an_unsaved_intent_while_a_session_runs() {
 }
 
 #[skuld::test]
-fn turn_lockdown_off_clears_covers_then_turns_the_intent_off() {
+fn turn_lockdown_off_clears_a_stranded_standing_cover() {
+    rt().block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        let routing = MockRouting::new(dir.path().to_path_buf());
+        let st = routing.state();
+        lockdown_state::set_enabled(dir.path(), true, None).unwrap();
+        // Simulate an OS probe finding a standing cover from a prior run —
+        // the realistic shape of the escape's stranded-cover case.
+        *st.cover_presence.lock().unwrap() = CoverPresence::Live;
+        let mut pm = ProxyManager::new(MockProxy::new(), routing).with_state_dir(dir.path().to_path_buf());
+
+        pm.turn_lockdown_off()
+            .expect("a stranded cover must clear without error");
+        assert_eq!(st.release_all_calls.load(Ordering::SeqCst), 1);
+        assert!(!lockdown_state::load_enabled(dir.path()));
+    });
+}
+
+#[skuld::test]
+fn turn_lockdown_off_skips_the_release_when_presence_reads_absent() {
+    // A confirmed-clean host has nothing to release; `cover_step` must hold,
+    // not call `release_all_covers` for nothing to clear.
     rt().block_on(async {
         let dir = tempfile::tempdir().unwrap();
         let routing = MockRouting::new(dir.path().to_path_buf());
@@ -112,9 +141,12 @@ fn turn_lockdown_off_clears_covers_then_turns_the_intent_off() {
         lockdown_state::set_enabled(dir.path(), true, None).unwrap();
         let mut pm = ProxyManager::new(MockProxy::new(), routing).with_state_dir(dir.path().to_path_buf());
 
-        let outcome = pm.turn_lockdown_off().expect("a clean, idle manager must not error");
-        assert!(matches!(outcome, LockdownOffOutcome::Cleared));
-        assert_eq!(st.release_all_calls.load(Ordering::SeqCst), 1);
+        pm.turn_lockdown_off().expect("a clean manager must not error");
+        assert_eq!(
+            st.release_all_calls.load(Ordering::SeqCst),
+            0,
+            "presence Absent; cover_step must not call release_all_covers for nothing to clear"
+        );
         assert!(!lockdown_state::load_enabled(dir.path()));
     });
 }
@@ -126,6 +158,7 @@ fn turn_lockdown_off_failure_leaves_the_intent_on() {
         let routing = MockRouting::new(dir.path().to_path_buf());
         let st = routing.state();
         st.fail_release.store(true, Ordering::SeqCst);
+        *st.cover_presence.lock().unwrap() = CoverPresence::Live;
         lockdown_state::set_enabled(dir.path(), true, None).unwrap();
         let mut pm = ProxyManager::new(MockProxy::new(), routing).with_state_dir(dir.path().to_path_buf());
 
@@ -144,6 +177,7 @@ fn turn_lockdown_off_reports_an_unsaved_intent_distinctly_from_a_failed_release(
         let dir = tempfile::tempdir().unwrap();
         let routing = MockRouting::new(dir.path().to_path_buf());
         let st = routing.state();
+        *st.cover_presence.lock().unwrap() = CoverPresence::Live;
         // No `.with_state_dir(..)`: `set_lockdown_intent` hits its existing
         // no-state_dir error path even though the release itself succeeds.
         let mut pm = ProxyManager::new(MockProxy::new(), routing);
@@ -170,40 +204,23 @@ fn turn_lockdown_off_drops_a_held_transient_cover() {
         let (mut pm, st) = covered_start_holding_the_cover(&dir).await;
         assert_eq!(st.cover_disengage_calls.load(Ordering::SeqCst), 0);
 
-        let outcome = pm
-            .turn_lockdown_off()
+        pm.turn_lockdown_off()
             .expect("clearing a held transient cover must not error");
-        assert!(matches!(outcome, LockdownOffOutcome::Cleared));
         assert_eq!(
             st.cover_disengage_calls.load(Ordering::SeqCst),
             1,
-            "the held guard's Drop must run before the OS-level clear"
+            "the held guard's Drop must run unconditionally, before the presence check"
         );
-        assert_eq!(st.release_all_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            st.release_all_calls.load(Ordering::SeqCst),
+            0,
+            "no standing cover was ever installed (a transient engage does not touch presence); \
+             cover_step must not call release_all_covers for nothing left to clear"
+        );
         assert!(
             !pm.blocked_until_connected(),
             "the held guard must be gone once turn_lockdown_off returns"
         );
-    });
-}
-
-#[skuld::test]
-fn turn_lockdown_off_on_a_clean_manager_is_ok() {
-    rt().block_on(async {
-        let dir = tempfile::tempdir().unwrap();
-        let routing = MockRouting::new(dir.path().to_path_buf());
-        let st = routing.state();
-        lockdown_state::set_enabled(dir.path(), true, None).unwrap();
-        let mut pm = ProxyManager::new(MockProxy::new(), routing).with_state_dir(dir.path().to_path_buf());
-
-        let outcome = pm.turn_lockdown_off().expect("a clean manager must not error");
-        assert!(matches!(outcome, LockdownOffOutcome::Cleared));
-        assert_eq!(
-            st.release_all_calls.load(Ordering::SeqCst),
-            1,
-            "no presence check may skip the clear"
-        );
-        assert!(!lockdown_state::load_enabled(dir.path()));
     });
 }
 
@@ -216,12 +233,13 @@ fn unblock_clears_the_adopted_cover_claim() {
         let dir = tempfile::tempdir().unwrap();
         let routing = MockRouting::new(dir.path().to_path_buf());
         let st = routing.state();
+        *st.cover_presence.lock().unwrap() = CoverPresence::Live;
         let mut pm = ProxyManager::new(MockProxy::new(), routing).with_state_dir(dir.path().to_path_buf());
         pm.set_standing_cover_adopted(true);
         assert!(pm.lockdown_enabled());
 
-        let outcome = pm.turn_lockdown_off().expect("an idle manager must not error");
-        assert!(matches!(outcome, LockdownOffOutcome::Cleared));
+        pm.turn_lockdown_off()
+            .expect("an adopted, live cover must clear without error");
         assert_eq!(st.release_all_calls.load(Ordering::SeqCst), 1);
         assert!(!pm.lockdown_enabled(), "the claim must clear on a confirmed release");
         assert!(!pm.standing_cover_expected());
@@ -237,6 +255,7 @@ fn a_failed_release_keeps_the_adopted_cover_claim() {
         let routing = MockRouting::new(dir.path().to_path_buf());
         let st = routing.state();
         st.fail_release.store(true, Ordering::SeqCst);
+        *st.cover_presence.lock().unwrap() = CoverPresence::Live;
         let mut pm = ProxyManager::new(MockProxy::new(), routing).with_state_dir(dir.path().to_path_buf());
         pm.set_standing_cover_adopted(true);
 
@@ -256,8 +275,8 @@ fn a_failed_release_keeps_the_adopted_cover_claim() {
 #[skuld::test]
 fn unblock_during_a_session_disarms_a_promoted_adopted_switch() {
     // Rule #0 in the other direction: making the claim durable must not make
-    // the kill switch unreleasable. Turning it off mid-session records the off,
-    // and nothing re-promotes it once the session's cover is dropped.
+    // the kill switch unreleasable. Turning it off mid-session releases the
+    // session's own stranded cover (Q4) and nothing re-promotes it once gone.
     rt().block_on(async {
         let dir = tempfile::tempdir().unwrap();
         let routing = MockRouting::new(dir.path().to_path_buf());
@@ -271,8 +290,8 @@ fn unblock_during_a_session_disarms_a_promoted_adopted_switch() {
             "setup: honouring the claim made it durable"
         );
 
-        let outcome = pm.turn_lockdown_off().expect("a running session must not error");
-        assert!(matches!(outcome, LockdownOffOutcome::SessionRunning));
+        pm.turn_lockdown_off()
+            .expect("a running session's stranded cover must still release (Q4)");
         pm.stop().await.unwrap();
 
         assert!(

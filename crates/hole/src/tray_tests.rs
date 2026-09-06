@@ -195,19 +195,31 @@ fn lockdown_off_renders_plain_label() {
 
 #[skuld::test]
 fn escape_items_offers_unblock_and_go_offline_independently() {
-    // Exhaustive over all eight (cover_presence, running, blocked_offers_go_offline)
-    // rows, `cover_presence` replacing `lockdown_enabled` (Task 5) but keeping the
-    // same `&& !running` gate — the property is preserved by construction, not
-    // reproven: `unblock` is exactly `cover_presence != Absent && !running`;
-    // `go_offline` is exactly `blocked_offers_go_offline`. Both can be true at
-    // once — rendering both is the point (rule #0 favours more escapes over
-    // fewer). Re-gating `unblock` on presence alone is Task 8b's job.
+    // Exhaustive over all 20 (cover_presence, running, blocked_offers_go_offline)
+    // rows (5 CoverPresence variants x 2 x 2). `unblock` is exactly
+    // `cover_presence != Absent` — `running` no longer participates: the
+    // escape is gated on observed cover presence alone, never on recorded
+    // session posture (Task 8b). `go_offline` is exactly
+    // `blocked_offers_go_offline`. Both can be true at once — rendering both
+    // is the point (rule #0 favours more escapes over fewer).
     let table = [
         // (cover_presence, running, blocked_offers_go_offline, expect_go_offline, expect_unblock)
         (CoverPresence::Live, false, true, true, true),
         (CoverPresence::Live, false, false, false, true),
-        (CoverPresence::Live, true, true, true, false),
-        (CoverPresence::Live, true, false, false, false),
+        (CoverPresence::Live, true, true, true, true),
+        (CoverPresence::Live, true, false, false, true),
+        (CoverPresence::Recorded, false, true, true, true),
+        (CoverPresence::Recorded, false, false, false, true),
+        (CoverPresence::Recorded, true, true, true, true),
+        (CoverPresence::Recorded, true, false, false, true),
+        (CoverPresence::Indeterminate, false, true, true, true),
+        (CoverPresence::Indeterminate, false, false, false, true),
+        (CoverPresence::Indeterminate, true, true, true, true),
+        (CoverPresence::Indeterminate, true, false, false, true),
+        (CoverPresence::Unreachable, false, true, true, true),
+        (CoverPresence::Unreachable, false, false, false, true),
+        (CoverPresence::Unreachable, true, true, true, true),
+        (CoverPresence::Unreachable, true, false, false, true),
         (CoverPresence::Absent, false, true, true, false),
         (CoverPresence::Absent, false, false, false, false),
         (CoverPresence::Absent, true, true, true, false),
@@ -224,6 +236,33 @@ fn escape_items_offers_unblock_and_go_offline_independently() {
             "cover_presence={cover_presence:?} running={running} blocked_offers_go_offline={blocked_offers_go_offline}"
         );
     }
+}
+
+#[skuld::test]
+fn the_escape_is_offered_when_a_cover_is_recorded_but_intent_is_off() {
+    // A cover recorded from a prior run, observed while intent reads off,
+    // still needs an escape: presence is what gates it, not intent.
+    let escapes = escape_items(CoverPresence::Recorded, false, false);
+    assert!(escapes.unblock, "a Recorded cover must still offer the unblock escape");
+}
+
+#[skuld::test]
+fn only_a_confirmed_absent_cover_hides_the_escape() {
+    for presence in [
+        CoverPresence::Live,
+        CoverPresence::Recorded,
+        CoverPresence::Indeterminate,
+        CoverPresence::Unreachable,
+    ] {
+        assert!(
+            escape_items(presence, false, false).unblock,
+            "{presence:?} must offer the unblock escape"
+        );
+    }
+    assert!(
+        !escape_items(CoverPresence::Absent, false, false).unblock,
+        "only a confirmed Absent cover hides the unblock escape"
+    );
 }
 
 #[skuld::test]
@@ -255,31 +294,9 @@ fn unblock_unreachable_message_names_the_command_and_the_disconnect_caveat() {
 }
 
 #[skuld::test]
-fn unblock_session_running_message_does_not_name_the_cli() {
-    assert!(
-        UNBLOCK_SESSION_RUNNING_MESSAGE.to_lowercase().contains("disconnect"),
-        "must point the user at Disconnect: {UNBLOCK_SESSION_RUNNING_MESSAGE:?}"
-    );
-    assert!(
-        !UNBLOCK_SESSION_RUNNING_MESSAGE.contains("bridge unlock"),
-        "must NOT talk a user into an out-of-process clear over a live tunnel: {UNBLOCK_SESSION_RUNNING_MESSAGE:?}"
-    );
-}
-
-#[skuld::test]
 fn unblock_dialog_message_maps_each_response_distinctly() {
-    use crate::bridge_client::ClientError;
-
     // Ack: silent success, no dialog.
     assert_eq!(unblock_dialog_message(&Ok(BridgeResponse::Ack)), None);
-
-    // SessionRunning: the disconnect-safe message — a swapped arm here would
-    // show UNBLOCK_UNREACHABLE_MESSAGE instead, which names the CLI command
-    // and would strip a cover out from under a live tunnel.
-    assert_eq!(
-        unblock_dialog_message(&Err(ClientError::SessionRunning)).as_deref(),
-        Some(UNBLOCK_SESSION_RUNNING_MESSAGE)
-    );
 
     // A bridge-authored failure: shown verbatim, not replaced by a fixed string.
     assert_eq!(unblock_dialog_message(&Ok(err_resp("boom"))).as_deref(), Some("boom"));
