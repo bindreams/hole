@@ -128,13 +128,65 @@ fn parse_pf_enabled_reads_status() {
     assert!(!parse_pf_enabled("Status: Disabled\n"));
 }
 
+// disengage_lockdown_with (#882: gate on presence, not on the file) ===================================================
+//
+// `disengage_lockdown_absent_cover_is_ok` (the file-only gate this replaces)
+// asserted that an absent *state file* alone was proof of nothing to
+// disengage. That conflated "confirmed absent" with "could not tell" — the
+// exact bug #882 describes: a corrupt/lost file must not read the same as a
+// host pf genuinely confirmed clear. The replacement tests below gate on
+// `CoverPresence` (pf's own answer folded with the file), which is what
+// `disengage_lockdown` now consults, via the same `RecordingPfOps` seam
+// `release_all_with` already uses — so none of this touches a real `pfctl`.
+
 #[skuld::test]
-fn disengage_lockdown_absent_cover_is_ok() {
-    // No state file => no cover engaged => Ok (the early return precedes any
-    // pfctl spawn, so this touches no host state). `bridge unlock` on a clean
-    // host must succeed, not fail loud.
-    let dir = tempfile::tempdir().unwrap();
-    assert!(disengage_lockdown(dir.path()).is_ok());
+fn disengage_lockdown_confirmed_absent_is_ok_and_spawns_no_pfctl() {
+    // Both sources agree there is nothing: no pfctl spawned.
+    let mut ops = RecordingPfOps::default();
+    assert!(disengage_lockdown_with(CoverPresence::Absent, None, &mut ops).is_ok());
+    assert!(ops.log.is_empty(), "a confirmed-absent cover must spawn no pfctl");
+}
+
+#[skuld::test]
+fn an_absent_state_file_with_a_live_pf_label_still_disengages() {
+    // pf's own label says the cover IS loaded even though the state file is
+    // gone (lost, or never written this run) — presence is established
+    // independently of the file. The old file-only gate would have read this
+    // as "nothing to disengage" and returned Ok having done nothing (#882).
+    // With no snapshot to restore from, the fallback is the blind
+    // `/etc/pf.conf` reload.
+    let mut ops = RecordingPfOps::default();
+    let result = disengage_lockdown_with(CoverPresence::Live, None, &mut ops);
+    assert!(result.is_ok(), "{result:?}");
+    assert_eq!(
+        ops.log,
+        vec!["reload_default", "clear_standing"],
+        "a live pf label with no persisted snapshot must still attempt the restore"
+    );
+}
+
+#[skuld::test]
+fn an_indeterminate_presence_reports_doing_nothing() {
+    // Neither source could confirm anything either way — refuse loud rather
+    // than silently claim success, and name the manual recovery command.
+    for presence in [CoverPresence::Unreachable, CoverPresence::Indeterminate] {
+        let mut ops = RecordingPfOps::default();
+        let result = disengage_lockdown_with(presence, None, &mut ops);
+        let err = result.expect_err(&format!("{presence:?} must not report success"));
+        assert!(
+            err.to_string().contains("pfctl -f /etc/pf.conf"),
+            "must name the manual recovery command: {err}"
+        );
+        assert!(ops.log.is_empty(), "an unestablished presence must spawn no pfctl");
+    }
+}
+
+#[skuld::test]
+fn a_live_presence_with_a_captured_snapshot_restores_it_and_drops_the_token() {
+    let mut ops = RecordingPfOps::default();
+    let result = disengage_lockdown_with(CoverPresence::Live, Some(standing_state()), &mut ops);
+    assert!(result.is_ok(), "{result:?}");
+    assert_eq!(ops.log, vec!["load_ruleset", "drop_token", "clear_standing"]);
 }
 
 // pfctl_stdout (non-zero exit must not read as an empty success) ======================================================

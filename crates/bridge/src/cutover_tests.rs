@@ -22,9 +22,11 @@ fn unlock_failing_disengage_does_not_flip_intent() {
     let dir = tempfile::tempdir().unwrap();
     lockdown_state::set_enabled(dir.path(), true, None).unwrap();
 
-    let result = unlock_with(dir.path(), || {
-        Err(std::io::Error::other("cannot disengage / not elevated"))
-    });
+    let result = unlock_with(
+        dir.path(),
+        || false,
+        || Err(std::io::Error::other("cannot disengage / not elevated")),
+    );
 
     assert!(result.is_err(), "unlock must fail loud when it cannot disengage");
     assert!(
@@ -38,13 +40,65 @@ fn unlock_successful_disengage_flips_intent_off() {
     let dir = tempfile::tempdir().unwrap();
     lockdown_state::set_enabled(dir.path(), true, None).unwrap();
 
-    let result = unlock_with(dir.path(), || Ok(()));
+    let result = unlock_with(dir.path(), || false, || Ok(()));
 
     assert!(result.is_ok());
     assert!(
         !lockdown_state::load_enabled(dir.path()),
         "intent flips off only after a confirmed disengage"
     );
+}
+
+// `bridge unlock` vs. a live bridge (#840): the CLI escape and the in-app
+// "Unblock Network" action must not race each other over the same cover. A
+// live bridge already owns reconciliation (and will reconcile the target
+// itself); `unlock` must refuse rather than race it, and name the in-app
+// action as the alternative.
+
+#[skuld::test]
+fn unlock_refuses_against_a_live_bridge() {
+    let dir = tempfile::tempdir().unwrap();
+    lockdown_state::set_enabled(dir.path(), true, None).unwrap();
+
+    let result = unlock_with(
+        dir.path(),
+        || true,
+        || panic!("disengage must never run while a bridge instance is live"),
+    );
+
+    let err = result.expect_err("unlock must refuse while a bridge instance is running");
+    assert!(
+        err.to_string().contains("Unblock Network"),
+        "must name the in-app action as the alternative: {err}"
+    );
+    assert!(
+        lockdown_state::load_enabled(dir.path()),
+        "a refused unlock must not touch the persisted intent"
+    );
+}
+
+#[skuld::test]
+fn unlock_records_the_target_off_before_releasing() {
+    let dir = tempfile::tempdir().unwrap();
+    lockdown_state::set_enabled(dir.path(), true, None).unwrap();
+
+    let result = unlock_with(
+        dir.path(),
+        || false,
+        || {
+            // The disengage step runs after the target write, so the target must
+            // already read `Off` by the time this closure is invoked.
+            assert_eq!(
+                crate::target::load(dir.path()),
+                crate::target::Target::Off,
+                "target must already be recorded off before the release call"
+            );
+            Ok(())
+        },
+    );
+
+    assert!(result.is_ok(), "{result:?}");
+    assert_eq!(crate::target::load(dir.path()), crate::target::Target::Off);
 }
 
 #[cfg(target_os = "windows")]

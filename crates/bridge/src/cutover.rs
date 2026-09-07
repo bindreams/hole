@@ -119,17 +119,38 @@ pub fn run_detached(_payload: &Path, _target_version: &str) -> std::io::Result<(
 /// success. A swallowed failure (e.g. run unprivileged) would leave the cover
 /// engaged — egress still blocked — while the intent reads "off", misleading the
 /// user.
+///
+/// Refuses outright against a live bridge instance (#840): a running bridge
+/// already reconciles the target itself, and racing it from an unrelated CLI
+/// invocation is exactly the two-writer hazard `target::apply`'s locking
+/// exists to prevent. The in-app "Unblock Network" action is the live-bridge
+/// equivalent, so refusal names it as the alternative.
 pub fn unlock() -> std::io::Result<()> {
     let state_dir = service_state_dir();
-    unlock_with(&state_dir, || {
+    unlock_with(&state_dir, crate::platform::os::is_running, || {
         tun_engine::routing::failclosed::disengage_lockdown(&state_dir).map_err(std::io::Error::other)
     })
 }
 
-/// `unlock`'s ordering, with the disengage step injected so tests can drive the
-/// cannot-disengage path without touching the host firewall. Disengage → flip;
-/// the intent flips off ONLY after the disengage confirms success.
-fn unlock_with(state_dir: &Path, disengage: impl FnOnce() -> std::io::Result<()>) -> std::io::Result<()> {
+/// `unlock`'s ordering, with the liveness check and the disengage step both
+/// injected so tests can drive the refusal and cannot-disengage paths without
+/// touching the host firewall or a real bridge process. Live check → target
+/// off → disengage → intent flip; the intent flips off ONLY after the
+/// disengage confirms success, and the target is recorded off before the
+/// release call so a reconciler reading it mid-unlock never sees a stale
+/// `Connected`/prior target.
+fn unlock_with(
+    state_dir: &Path,
+    is_running: impl FnOnce() -> bool,
+    disengage: impl FnOnce() -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    if is_running() {
+        return Err(std::io::Error::other(
+            "a bridge instance is running; use the in-app \"Unblock Network\" action instead of `hole bridge unlock`",
+        ));
+    }
+    crate::target::apply(state_dir, None, |_| crate::target::Target::Off)
+        .map_err(|e| std::io::Error::other(format!("could not record target off: {e}")))?;
     disengage()?;
     tun_engine::routing::failclosed::lockdown_state::set_enabled(state_dir, false, None)
 }
