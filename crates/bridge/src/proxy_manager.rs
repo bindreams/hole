@@ -270,6 +270,14 @@ pub struct ProxyManager<P: Proxy = ShadowsocksProxy, R: Routing = SystemRouting,
     /// once a start honours this claim with a real `install_lockdown`. Holding
     /// both facts here is what let a plain disconnect disarm the switch.
     adopted_standing_cover: bool,
+    /// Set (lock-free) by `handle_unblock` via [`Self::cover_invalidation_handle`]
+    /// when it releases every OS-level cover from outside this manager's own
+    /// lock (R7: the escape must work even while a wedged teardown holds
+    /// `state.proxy.lock()`). `start_cancellable` consumes it — see the swap
+    /// at its top — the same way `turn_lockdown_off` drops a held transient
+    /// guard directly via `posture.take_pending()`, just reachable without
+    /// `&mut self`.
+    cover_invalidated: Arc<std::sync::atomic::AtomicBool>,
     /// Test-only DoH querier override. Set by `set_bootstrap_querier_for_test`;
     /// when present, `start_cancellable` resolves via `resolve_via_doh_with`
     /// instead of the production `resolve_via_doh`.
@@ -355,25 +363,6 @@ impl<P: Proxy, R: Routing, D: Dns> Posture<P, R, D> {
         }
     }
 
-    /// Take the session payload, leaving `Idle`. `None`, and the posture left
-    /// untouched, on any other variant — in particular this must not disturb
-    /// a held pending start.
-    ///
-    /// Test-only: `check_health` no longer tears down directly (Task 6 moved
-    /// that into `stop_with`, reached via the `SessionEvent::GaveUp` it now
-    /// returns), leaving this exercised only by
-    /// `posture_take_session_leaves_a_pending_start_untouched`.
-    #[cfg(test)]
-    fn take_session(&mut self) -> Option<RunningState<P, R, D>> {
-        if !matches!(self, Posture::Session(_)) {
-            return None;
-        }
-        match std::mem::replace(self, Posture::Idle) {
-            Posture::Session(s) => Some(*s),
-            _ => unreachable!("just matched Session above"),
-        }
-    }
-
     /// Contract: the posture is `Idle`. Provers: `start_cancellable`'s
     /// `AlreadyRunning` guard rules out `Session`; the caller's own
     /// `self.posture.pending().is_none()` check, immediately before this
@@ -427,6 +416,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
             state_dir: None,
             state_owner: None,
             adopted_standing_cover: false,
+            cover_invalidated: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             #[cfg(test)]
             bootstrap_querier: None,
             #[cfg(test)]
@@ -449,6 +439,15 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
     /// taking `state.proxy.lock()`.
     pub fn routing_handle(&self) -> Arc<R> {
         Arc::clone(&self.routing)
+    }
+
+    /// Clone of the lock-free cover-invalidation signal. `bind_with_dirs`
+    /// derives `IpcState::cover_invalidated` from this, the same way it
+    /// derives `routing` from [`Self::routing_handle`] — taken once at bind
+    /// time, uncontended. `handle_unblock` sets it after releasing every
+    /// OS-level cover; [`Self::start_cancellable`] consumes it.
+    pub fn cover_invalidation_handle(&self) -> Arc<std::sync::atomic::AtomicBool> {
+        Arc::clone(&self.cover_invalidated)
     }
 
     /// Set the state directory for plugin PID crash recovery.
@@ -726,19 +725,29 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
             .map_err(|e| ProxyError::Runtime(std::io::Error::other(format!("lockdown persist: {e}"))))
     }
 
-    /// Turn the kill-switch intent off, releasing the cover iff
-    /// `cover_step` says the target/presence pair calls for it. Reads no
+    /// Turn the kill-switch intent off, releasing the cover unless
+    /// `cover_step` has CONFIRMED there is nothing to release. Reads no
     /// session posture directly — Q4 ("unblock IS unticking") means a live
     /// session's cover is released too when the persisted target is `Off`
-    /// and presence is not `Absent`/`Unreachable`; `cover_step`'s own
+    /// and presence is not confirmed `Absent`; `cover_step`'s own
     /// `Target::Off` arm is what decides that, uniformly, whether or not a
     /// session is running.
+    ///
+    /// A target the bridge cannot even read, or a presence probe that
+    /// cannot even reach the OS (`Target::Unreadable` / `CoverPresence::
+    /// Unreachable`), is not evidence the host is clean — `cover_step`
+    /// holds on both because it has no authority to decide either way, but
+    /// this is an EXPLICIT user disarm, not a steady-state reconcile: an
+    /// escape-offering site must resolve an unknown toward releasing, never
+    /// toward "nothing to do" (see `crates/common/api/openapi.yaml`'s
+    /// `CoverPresence` doc). `release_all_covers` is documented unconditional
+    /// and idempotent, so calling it on a false positive costs nothing.
     ///
     /// Release-then-persist ordering is load-bearing: the tray offers this
     /// escape while the intent is on, so flipping the intent off after a
     /// FAILED release would delete the user's only retry affordance while
     /// the host is still held closed. The intent moves only after the clear
-    /// confirms (or after `cover_step` said no clear was owed).
+    /// confirms (or after this decided no clear was owed).
     pub fn turn_lockdown_off(&mut self) -> Result<(), ProxyError> {
         // Drop any held transient guard's in-process authority first. Not a
         // condition — a no-op when nothing is pending — it exists so no live
@@ -748,7 +757,10 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
 
         let target = self.state_dir.as_deref().map(target::load).unwrap_or(Target::Off);
         let presence = self.routing.lockdown_cover_presence();
-        if cover_step(Intent::Off, presence, &target) == CoverStep::Release {
+        let must_release = matches!(target, Target::Unreadable)
+            || presence == CoverPresence::Unreachable
+            || cover_step(Intent::Off, presence, &target) == CoverStep::Release;
+        if must_release {
             self.routing.release_all_covers()?;
             // The clear confirmed, so the host is open: an adopted cover no
             // longer holds it. Dropping this claim is what stops the tray
@@ -820,6 +832,20 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         );
         if self.posture.session().is_some() {
             return Err(ProxyError::AlreadyRunning);
+        }
+
+        // A lock-free `handle_unblock` may have released every OS-level
+        // cover while this manager wasn't holding the lock. Any
+        // `PendingStart` we're still carrying is now a zombie: the OS
+        // objects it claims to hold are already gone. Drop it before the
+        // reuse checks below (`repair_fallback`, the `pending().is_none()`
+        // gate) can trust it — `take_pending()` is a no-op when nothing is
+        // pending, and the dropped guard's own Drop is idempotent against
+        // an already-cleared cover on both platforms, so this is safe
+        // whether or not anything was actually held. `swap` both reads and
+        // clears in one step, so this consumes the signal exactly once.
+        if self.cover_invalidated.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            self.posture.take_pending();
         }
 
         // A (re)start supersedes any prior out-of-band death — clear the death
@@ -1741,6 +1767,23 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         // App-ID permit (`routing.install_lockdown` below) — see
         // `lockdown_app_ids`'s doc.
         let app_ids = lockdown_app_ids(config);
+
+        // Re-read the intent fresh, right before the install it gates:
+        // `standing_cover_expected` was snapshotted by the caller before
+        // plugin-chain/DNS-bootstrap/TUN-device work that can take long
+        // enough for an explicit `hole bridge unlock`-equivalent (the tray's
+        // Unblock, `handle_unblock`) to land on a second, lock-free path in
+        // between. A fresh `Off` overrides the stale `true` so a start that
+        // began before an unblock cannot install a cover after it; any other
+        // fresh read (`On`, `Unreadable`, `Unset`) leaves the snapshot's own
+        // verdict (which already folded in `adopted_standing_cover`) alone.
+        // This narrows, never widens, the window a full lock would close —
+        // the remaining gap is the same class of race #878 tracks and this
+        // plan does not fix.
+        let standing_cover_expected = match state_dir.map(lockdown_state::load_intent) {
+            Some(Intent::Off) => false,
+            _ => standing_cover_expected,
+        };
 
         // Standing lockdown cover (#527). Engaged only when intent is on; when
         // off this whole block is a no-op and the start is byte-identical to

@@ -167,7 +167,7 @@ pub(crate) struct MockRoutingState {
     teardown_calls: AtomicU32,
     fail_install: AtomicBool,
     fail_gateway: AtomicBool,
-    cover_engage_calls: AtomicU32,
+    pub(crate) cover_engage_calls: AtomicU32,
     pub(crate) cover_disengage_calls: AtomicU32,
     pub(crate) lockdown_engage_calls: AtomicU32,
     lockdown_disengage_calls: AtomicU32,
@@ -5343,22 +5343,6 @@ mod self_test {
             assert_ne!(pm.cover_presence(), CoverPresence::Absent);
 
             pm.stop().await.unwrap();
-        });
-    }
-
-    /// Mirrors [`posture_take_pending_leaves_a_session_untouched`]: fails
-    /// against a `take_session` that disturbs an unrelated `PendingStart`.
-    #[skuld::test]
-    fn posture_take_session_leaves_a_pending_start_untouched() {
-        rt().block_on(async {
-            let (mut pm, cfg, _st, _dir) = covered_gate_setup(false);
-            let _ = pm
-                .start_cancellable(&cfg, true, CancellationToken::new())
-                .await
-                .unwrap_err();
-
-            assert!(pm.posture.take_session().is_none());
-            assert!(pm.blocked_until_connected());
         });
     }
 

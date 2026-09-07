@@ -52,7 +52,7 @@ async fn covered_start_holding_the_cover(
 
 #[skuld::test]
 fn turn_lockdown_off_releases_a_stranded_cover_even_while_a_session_runs() {
-    // Q4: unblock IS unticking. `cover_step` reads no session posture, so a
+    // Unblock IS unticking. `cover_step` reads no session posture, so a
     // session that itself installed the standing cover (intent was On) does
     // not shield it from the escape — the persisted target defaults to `Off`
     // (no `bridge-target.json` is ever written by this ProxyManager-level
@@ -198,6 +198,60 @@ fn turn_lockdown_off_reports_an_unsaved_intent_distinctly_from_a_failed_release(
 }
 
 #[skuld::test]
+fn turn_lockdown_off_releases_when_the_target_is_unreadable() {
+    // A corrupt/version-skewed target file must not veto an explicit user
+    // disarm: `cover_step`'s `Target::Unreadable` arm holds unconditionally
+    // (it has no authority to decide either way), but this call site
+    // overrides that Hold to release — an unknown must resolve toward
+    // releasing, never toward "nothing to do" (fc63579e).
+    rt().block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        let routing = MockRouting::new(dir.path().to_path_buf());
+        let st = routing.state();
+        // Presence stays the default `Absent` — the confirmed-clean case
+        // `cover_step` alone would (correctly) hold on. Only the unreadable
+        // target should force the release here.
+        std::fs::write(dir.path().join(target::STATE_FILE_NAME), b"not json").unwrap();
+        lockdown_state::set_enabled(dir.path(), true, None).unwrap();
+        let mut pm = ProxyManager::new(MockProxy::new(), routing).with_state_dir(dir.path().to_path_buf());
+
+        pm.turn_lockdown_off()
+            .expect("an unreadable target must not block the explicit disarm");
+        assert_eq!(
+            st.release_all_calls.load(Ordering::SeqCst),
+            1,
+            "an unreadable target is not confirmation of a clean host; the release must run"
+        );
+        assert!(!lockdown_state::load_enabled(dir.path()));
+    });
+}
+
+#[skuld::test]
+fn turn_lockdown_off_releases_when_presence_is_unreachable() {
+    // A probe that cannot reach the OS is not evidence the host is clean —
+    // `cover_step`'s `Target::Off` arm holds on `Unreachable`, but this call
+    // site overrides that Hold to release, matching the documented
+    // `CoverPresence` contract (fc63579e).
+    rt().block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        let routing = MockRouting::new(dir.path().to_path_buf());
+        let st = routing.state();
+        *st.cover_presence.lock().unwrap() = CoverPresence::Unreachable;
+        lockdown_state::set_enabled(dir.path(), true, None).unwrap();
+        let mut pm = ProxyManager::new(MockProxy::new(), routing).with_state_dir(dir.path().to_path_buf());
+
+        pm.turn_lockdown_off()
+            .expect("an unreachable probe must not block the explicit disarm");
+        assert_eq!(
+            st.release_all_calls.load(Ordering::SeqCst),
+            1,
+            "an unreachable presence is not confirmation of a clean host; the release must run"
+        );
+        assert!(!lockdown_state::load_enabled(dir.path()));
+    });
+}
+
+#[skuld::test]
 fn turn_lockdown_off_drops_a_held_transient_cover() {
     rt().block_on(async {
         let dir = tempfile::tempdir().unwrap();
@@ -221,6 +275,60 @@ fn turn_lockdown_off_drops_a_held_transient_cover() {
             !pm.blocked_until_connected(),
             "the held guard must be gone once turn_lockdown_off returns"
         );
+    });
+}
+
+#[skuld::test]
+fn an_externally_released_cover_is_not_silently_reused() {
+    // 18c09cd9 (transient half): a lock-free `handle_unblock` releasing every
+    // OS-level cover while this manager isn't holding the lock leaves any
+    // `PendingStart` a zombie — the OS objects it claims to hold are already
+    // gone. Without consuming `cover_invalidated`, a same-host retry would
+    // trust the zombie (`pending().is_none()` reads false) and skip
+    // re-engaging, believing an already-gone cover still protects it. The
+    // signal must force the zombie's own `Drop` (idempotent against an
+    // already-cleared cover either way) and a fresh, real re-engage.
+    rt().block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut pm, st) = covered_start_holding_the_cover(&dir).await;
+        assert_eq!(
+            st.cover_engage_calls.load(Ordering::SeqCst),
+            1,
+            "setup: the first attempt engaged"
+        );
+        assert_eq!(st.cover_disengage_calls.load(Ordering::SeqCst), 0);
+
+        // Simulate `handle_unblock` releasing out-of-band, lock-free, while
+        // this manager wasn't holding its lock.
+        pm.cover_invalidation_handle().store(true, Ordering::SeqCst);
+
+        // `test_config()`'s default server host is the same `127.0.0.1` as
+        // `covered_start_holding_the_cover`'s closed probe, so this retry
+        // takes the same-host reuse path `start_cancellable` gates on
+        // `pending()` — but with `dns.enabled` at its default `false`, this
+        // attempt succeeds all the way through instead of failing again.
+        let cfg = test_config();
+
+        pm.start_cancellable(&cfg, true, tokio_util::sync::CancellationToken::new())
+            .await
+            .expect("the invalidated zombie must not block a fresh, successful retry");
+
+        assert_eq!(
+            st.cover_disengage_calls.load(Ordering::SeqCst),
+            2,
+            "one disengage for the dropped zombie, one for the retry's own successful-connect release"
+        );
+        assert_eq!(
+            st.cover_engage_calls.load(Ordering::SeqCst),
+            2,
+            "the retry must re-engage a real cover rather than trusting the dropped zombie"
+        );
+        assert!(
+            !pm.blocked_until_connected(),
+            "the retry succeeded and moved past the pending posture entirely"
+        );
+
+        pm.stop().await.unwrap();
     });
 }
 
@@ -276,7 +384,7 @@ fn a_failed_release_keeps_the_adopted_cover_claim() {
 fn unblock_during_a_session_disarms_a_promoted_adopted_switch() {
     // Rule #0 in the other direction: making the claim durable must not make
     // the kill switch unreleasable. Turning it off mid-session releases the
-    // session's own stranded cover (Q4) and nothing re-promotes it once gone.
+    // session's own stranded cover and nothing re-promotes it once gone.
     rt().block_on(async {
         let dir = tempfile::tempdir().unwrap();
         let routing = MockRouting::new(dir.path().to_path_buf());
@@ -291,7 +399,7 @@ fn unblock_during_a_session_disarms_a_promoted_adopted_switch() {
         );
 
         pm.turn_lockdown_off()
-            .expect("a running session's stranded cover must still release (Q4)");
+            .expect("a running session's stranded cover must still release");
         pm.stop().await.unwrap();
 
         assert!(

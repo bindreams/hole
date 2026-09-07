@@ -893,7 +893,7 @@ fn unblock_clears_covers_and_returns_ok() {
     });
 }
 
-/// Q4/R3: the escape never refuses. A session still running with a live
+/// The escape never refuses. A session still running with a live
 /// cover and the target going `Off` is exactly the wedged-teardown case the
 /// escape exists for; it must release the cover and 200, not 409.
 #[skuld::test]
@@ -976,7 +976,7 @@ fn unblock_error_bodies_carry_no_filesystem_path() {
 
     rt().block_on(async {
         // The 500 (failed release) case — the only error case unblock has
-        // left, now that the escape never refuses (Q4/R3).
+        // left, now that the escape never refuses.
         let path = test_socket_path("unblock-nopath-500");
         let (proxy, _calls, fail_release, _dir) = mock_proxy_with_release_state();
         fail_release.store(true, Ordering::SeqCst);
@@ -1026,8 +1026,8 @@ fn lockdown_off_releases_covers_through_the_same_path() {
 
 /// Seam guard with the sibling teardown item: `handle_unblock` must consume
 /// no session posture at all, so a stopping session's reported posture can
-/// never reach this decision (R7's whole point — the escape reads only the
-/// reconciler's target/presence, off the proxy mutex entirely).
+/// never reach this decision — the escape reads only the reconciler's
+/// target/presence, off the proxy mutex entirely.
 #[skuld::test]
 fn the_unblock_handler_reads_no_session_posture() {
     let src = include_str!("ipc.rs");
@@ -1427,7 +1427,7 @@ fn start_failure_returns_error() {
 
 #[skuld::test]
 fn setting_the_target_persists_the_startup_preference() {
-    // #979, Task 4's checklist, at the IPC layer rather than the pure
+    // #979 — at the IPC layer rather than the pure
     // save/load round-trip `target_tests.rs` already covers: an actual Start
     // request carrying `x-hole-on-startup` writes the preference, and a
     // fresh `load_startup_preference` (no in-memory state carried over,
@@ -1524,13 +1524,144 @@ fn a_start_with_no_startup_preference_leaves_the_persisted_one_alone() {
     });
 }
 
+/// Build an `IpcState` directly (bypassing `IpcServer::bind*`, which cannot
+/// wire up the test-only persist gate) so `persist_after_start` can be
+/// parked exactly inside its write window — the window `f745e03c`/
+/// `2c85d130` raced in, between `start_cancellable` returning and the
+/// target/startup-preference write landing. `proxy`'s own `state_dir` must
+/// be `dir`, same as `IpcState::state_dir`, for `handle_stop`'s write
+/// (via `ProxyManager::state_dir`) and `handle_start`'s (via this state's
+/// `state_dir`) to land in the same file.
+fn ipc_state_with_persist_gate(
+    dir: PathBuf,
+) -> (
+    Arc<IpcState<MockProxy, MockRouting>>,
+    Arc<tokio::sync::Notify>,
+    oneshot::Receiver<()>,
+) {
+    let routing = MockRouting::new(dir.clone());
+    let pm = ProxyManager::new(MockProxy::new(), routing).with_state_dir(dir.clone());
+    let proxy = Arc::new(Mutex::new(pm));
+    let routing_handle = proxy.try_lock().unwrap().routing_handle();
+    let cover_invalidated = proxy.try_lock().unwrap().cover_invalidation_handle();
+    let gate = Arc::new(tokio::sync::Notify::new());
+    let (entered_tx, entered_rx) = oneshot::channel();
+    let state = Arc::new(IpcState {
+        proxy,
+        routing: routing_handle,
+        cover_invalidated,
+        start_cancel: Arc::new(std::sync::Mutex::new(StartCancelState::default())),
+        version: "test".to_string(),
+        log_dir: dir.clone(),
+        state_dir: dir,
+        owner: None,
+        persist_gate: Some(gate.clone()),
+        persist_entered: std::sync::Mutex::new(Some(entered_tx)),
+    });
+    (state, gate, entered_rx)
+}
+
+#[skuld::test]
+async fn a_stop_landing_while_a_start_persists_does_not_get_reverted_to_connected() {
+    // f745e03c: `persist_after_start`'s target write used to run AFTER
+    // `handle_start` dropped the proxy lock, racing a concurrent
+    // `handle_stop`'s own target write (taken under that same lock). Now
+    // both run under one critical section, so a Stop dispatched while a
+    // Start is mid-persist cannot even begin its own write until the
+    // Start's is durably on disk — Off must win, never get silently
+    // reverted back to Connected by the Start's write landing later.
+    let dir = tempfile::tempdir().unwrap().keep();
+    let (state, persist_gate, persist_entered) = ipc_state_with_persist_gate(dir.clone());
+
+    let state_a = state.clone();
+    let start = tokio::spawn(async move {
+        handle_start(
+            axum::extract::State(state_a),
+            axum::http::HeaderMap::new(),
+            Json(sample_config()),
+        )
+        .await
+    });
+
+    // Park until A is *known* to be inside its persist window (holding the
+    // proxy lock, start_cancellable already returned) — deterministic, no
+    // sleep.
+    persist_entered.await.expect("persist_after_start never entered");
+
+    // B's Stop needs the same proxy lock A is holding through its persist;
+    // it cannot run until A's whole critical section — persist included —
+    // completes. Spawn it so it queues rather than blocking this task.
+    let state_b = state.clone();
+    let stop = tokio::spawn(async move { handle_stop(axum::extract::State(state_b)).await });
+
+    // Let A's persist proceed. Only once it (and the rest of A's critical
+    // section) finishes does the lock free up for B.
+    persist_gate.notify_one();
+
+    let _ = start.await.expect("A task panicked").expect("A's start must succeed");
+    let _ = stop.await.expect("B task panicked").expect("B's stop must succeed");
+
+    assert_eq!(
+        target::load(&dir),
+        Target::Off,
+        "a Stop dispatched while Start was mid-persist must win: it must not be reverted back to \
+         Connected by the Start's own persist finishing later"
+    );
+}
+
+#[skuld::test]
+async fn a_second_start_cannot_begin_while_the_first_is_still_persisting() {
+    // 2c85d130: `save_startup_preference`'s load-mutate-save has no lock of
+    // its own — its only protection is that `handle_start`'s single-
+    // occupancy `in_flight` guard, and the proxy lock it now shares with
+    // `persist_after_start`, keep two overlapping starts from ever having
+    // their persist windows in flight together. Previously `in_flight`
+    // cleared right after `start_cancellable` returned, BEFORE persist ran,
+    // so a second start landing in that gap was admitted and could race the
+    // first's unlocked preference read-modify-write. Prove the gap is
+    // closed: a second Start dispatched while the first is mid-persist
+    // (in_flight still held) is rejected with 409, not admitted.
+    let dir = tempfile::tempdir().unwrap().keep();
+    let (state, persist_gate, persist_entered) = ipc_state_with_persist_gate(dir.clone());
+
+    let state_a = state.clone();
+    let start_a = tokio::spawn(async move {
+        handle_start(
+            axum::extract::State(state_a),
+            axum::http::HeaderMap::new(),
+            Json(sample_config()),
+        )
+        .await
+    });
+
+    persist_entered.await.expect("persist_after_start never entered");
+
+    // B's Start while A is mid-persist: must be rejected outright (409-
+    // equivalent `StartHandlerError::Concurrent`) rather than being admitted
+    // to race A's still-in-flight preference write.
+    let state_b = state.clone();
+    let start_b = handle_start(
+        axum::extract::State(state_b),
+        axum::http::HeaderMap::new(),
+        Json(sample_config()),
+    )
+    .await;
+    assert!(
+        matches!(start_b, Err(StartHandlerError::Concurrent)),
+        "a second start must be rejected (StartHandlerError::Concurrent) while the first is still persisting"
+    );
+
+    persist_gate.notify_one();
+    let _ = start_a.await.expect("A task panicked").expect("A's start must succeed");
+}
+
 #[skuld::test]
 fn ipc_start_never_engages_the_cover_even_on_failure() {
     // #979: `handle_start` hardcodes `covered = false` unconditionally now —
     // there is no wire signal left that can make an IPC-driven start covered
-    // (Q3 deleted `X-Hole-Covered`; the only remaining source of a covered
-    // start is the bridge's own boot-time reconcile, Task 7, which bypasses
-    // IPC entirely). A failed IPC start must therefore never leave the host
+    // (`X-Hole-Covered` was deleted; the only remaining source of a covered
+    // start is the bridge's own boot-time reconcile, which bypasses IPC
+    // entirely). A failed IPC start must therefore never leave the host
     // fail-closed, regardless of any header a client sends.
     rt().block_on(async {
         let path = test_socket_path("ipc-start-uncovered");
@@ -1580,6 +1711,108 @@ fn reload_request_reloads_proxy() {
         handle.abort();
         let _ = handle.await;
     });
+}
+
+/// Build an `IpcState` directly, backed by `dir` for both `state.state_dir`
+/// (what `handle_start`/`handle_reload` persist through) and the proxy's
+/// own `with_state_dir` (what `MockRouting` and `set_lockdown_intent` read),
+/// same pairing `ipc_state_with_persist_gate` uses — without that helper's
+/// persist-gate machinery, which these tests don't need.
+fn ipc_state_with_dir(dir: PathBuf) -> Arc<IpcState<MockProxy, MockRouting>> {
+    let routing = MockRouting::new(dir.clone());
+    let pm = ProxyManager::new(MockProxy::new(), routing).with_state_dir(dir.clone());
+    let proxy = Arc::new(Mutex::new(pm));
+    let (routing_handle, cover_invalidated) = {
+        let guard = proxy.try_lock().unwrap();
+        (guard.routing_handle(), guard.cover_invalidation_handle())
+    };
+    Arc::new(IpcState {
+        proxy,
+        routing: routing_handle,
+        cover_invalidated,
+        start_cancel: Arc::new(std::sync::Mutex::new(StartCancelState::default())),
+        version: "test".to_string(),
+        log_dir: dir.clone(),
+        state_dir: dir,
+        owner: None,
+        persist_gate: None,
+        persist_entered: std::sync::Mutex::new(None),
+    })
+}
+
+#[skuld::test]
+async fn reload_persists_the_new_config_on_the_hot_swap_path() {
+    // 4d0e66d7: a reload whose config is structurally the same (only
+    // filters differ) takes `ProxyManager::reload`'s fast, hot-swap path,
+    // which never calls `start_cancellable` — so nothing wrote the new
+    // config to the persisted target until this handler does. Left
+    // unpersisted, a crash right after this reload would recover with the
+    // PRE-reload filters, silently reverting the swap.
+    let dir = tempfile::tempdir().unwrap().keep();
+    let state = ipc_state_with_dir(dir.clone());
+
+    let _ = handle_start(
+        axum::extract::State(state.clone()),
+        axum::http::HeaderMap::new(),
+        Json(sample_config()),
+    )
+    .await
+    .expect("start must succeed");
+
+    let mut reloaded = sample_config();
+    reloaded.filters = vec![hole_common::config::FilterRule {
+        address: "example.com".to_string(),
+        matching: hole_common::config::MatchType::Exactly,
+        action: hole_common::config::FilterAction::Block,
+    }];
+
+    let _ = handle_reload(axum::extract::State(state.clone()), Json(reloaded.clone()))
+        .await
+        .expect("reload must succeed");
+
+    match target::load(&dir) {
+        Target::Connected { config } => assert_eq!(
+            *config, reloaded,
+            "a hot-swapped reload must persist the NEW config, filters included"
+        ),
+        other => panic!("expected Target::Connected after a successful reload, got {other:?}"),
+    }
+}
+
+#[skuld::test]
+async fn reload_persists_the_new_config_on_the_stop_start_path() {
+    // 4d0e66d7: a reload whose config differs structurally (here,
+    // `local_port`) takes `ProxyManager::reload`'s slow stop+start path,
+    // which calls `ProxyManager::start` directly — the ProxyManager-level
+    // entry point that, like `handle_start`'s own call to
+    // `start_cancellable`, never persists on its own (persistence is this
+    // IPC layer's job, same division `persist_after_start` already keeps
+    // for a plain Start).
+    let dir = tempfile::tempdir().unwrap().keep();
+    let state = ipc_state_with_dir(dir.clone());
+
+    let _ = handle_start(
+        axum::extract::State(state.clone()),
+        axum::http::HeaderMap::new(),
+        Json(sample_config()),
+    )
+    .await
+    .expect("start must succeed");
+
+    let mut reloaded = sample_config();
+    reloaded.local_port = sample_config().local_port + 1;
+
+    let _ = handle_reload(axum::extract::State(state.clone()), Json(reloaded.clone()))
+        .await
+        .expect("reload must succeed");
+
+    match target::load(&dir) {
+        Target::Connected { config } => assert_eq!(
+            *config, reloaded,
+            "a stop+start reload must persist the NEW config, not the pre-reload one"
+        ),
+        other => panic!("expected Target::Connected after a successful reload, got {other:?}"),
+    }
 }
 
 #[skuld::test]
@@ -2588,18 +2821,23 @@ fn redacting_capture() -> (
 
 fn ipc_state(proxy: Arc<Mutex<ProxyManager<MockProxy, MockRouting>>>) -> Arc<IpcState<MockProxy, MockRouting>> {
     let dir = tempfile::tempdir().unwrap().keep();
-    let routing = proxy
-        .try_lock()
-        .expect("proxy mutex must be uncontended at construction time")
-        .routing_handle();
+    let (routing, cover_invalidated) = {
+        let guard = proxy
+            .try_lock()
+            .expect("proxy mutex must be uncontended at construction time");
+        (guard.routing_handle(), guard.cover_invalidation_handle())
+    };
     Arc::new(IpcState {
         proxy,
         routing,
+        cover_invalidated,
         start_cancel: Arc::new(std::sync::Mutex::new(StartCancelState::default())),
         version: "test".to_string(),
         log_dir: dir.clone(),
         state_dir: dir,
         owner: None,
+        persist_gate: None,
+        persist_entered: std::sync::Mutex::new(None),
     })
 }
 
