@@ -174,6 +174,16 @@ struct MockRouting {
     /// What `lockdown_cover_presence` reports — a test's stand-in for the OS
     /// probe. Defaults to `Absent`.
     cover_presence: std::sync::Mutex<tun_engine::routing::CoverPresence>,
+    /// How many times `lockdown_cover_presence` was probed, and a signal
+    /// fired on each probe.
+    ///
+    /// The real probe is an OS call, so *where* it runs matters, not only
+    /// what it returns. `notify_one` stores a permit, so a waiter that
+    /// registers after the probe still resolves — a test can hold a lock,
+    /// fire a request, and await this with no ordering assumption between
+    /// the two, and no timeout.
+    cover_presence_probes: Arc<AtomicU32>,
+    cover_presence_probed: Arc<tokio::sync::Notify>,
 }
 
 impl MockRouting {
@@ -185,6 +195,8 @@ impl MockRouting {
             release_all_calls: Arc::new(AtomicU32::new(0)),
             fail_release: Arc::new(AtomicBool::new(false)),
             cover_presence: std::sync::Mutex::new(tun_engine::routing::CoverPresence::Absent),
+            cover_presence_probes: Arc::new(AtomicU32::new(0)),
+            cover_presence_probed: Arc::new(tokio::sync::Notify::new()),
         }
     }
 
@@ -195,26 +207,20 @@ impl MockRouting {
         self
     }
 
+    // Both variants below differ from `new` only in one flag, so they build on
+    // it rather than restating every field: a field added to `MockRouting`
+    // then lands in one initializer, not three.
+
     fn failing_gateway(state_dir: PathBuf) -> Self {
-        Self {
-            state_dir,
-            fail_gateway: AtomicBool::new(true),
-            fail_server_gateway_only: AtomicBool::new(false),
-            release_all_calls: Arc::new(AtomicU32::new(0)),
-            fail_release: Arc::new(AtomicBool::new(false)),
-            cover_presence: std::sync::Mutex::new(tun_engine::routing::CoverPresence::Absent),
-        }
+        let mock = Self::new(state_dir);
+        mock.fail_gateway.store(true, Ordering::SeqCst);
+        mock
     }
 
     fn failing_server_gateway_only(state_dir: PathBuf) -> Self {
-        Self {
-            state_dir,
-            fail_gateway: AtomicBool::new(false),
-            fail_server_gateway_only: AtomicBool::new(true),
-            release_all_calls: Arc::new(AtomicU32::new(0)),
-            fail_release: Arc::new(AtomicBool::new(false)),
-            cover_presence: std::sync::Mutex::new(tun_engine::routing::CoverPresence::Absent),
-        }
+        let mock = Self::new(state_dir);
+        mock.fail_server_gateway_only.store(true, Ordering::SeqCst);
+        mock
     }
 }
 
@@ -305,6 +311,8 @@ impl Routing for MockRouting {
     }
 
     fn lockdown_cover_presence(&self) -> tun_engine::routing::CoverPresence {
+        self.cover_presence_probes.fetch_add(1, Ordering::SeqCst);
+        self.cover_presence_probed.notify_one();
         *self.cover_presence.lock().unwrap()
     }
 }
@@ -2781,6 +2789,70 @@ fn unblock_releases_nothing_when_the_probe_reports_absent() {
             0,
             "a confirmed-absent cover leaves nothing to release"
         );
+
+        drop(client);
+        handle.abort();
+        let _ = handle.await;
+    });
+}
+
+/// The cover probe must not run under the proxy lock.
+///
+/// `lockdown_cover_presence` is an OS call — `pfctl -s labels` on macOS, an
+/// FWPM engine open plus one filter lookup per swept GUID on Windows — and
+/// status is a poll: the tray reconciler and the dashboard each tick it every
+/// 5s. Its predecessor here was an in-memory `Posture` read. Run inline under
+/// `state.proxy.lock()`, every connect, disconnect and 1 Hz `/v1/metrics`
+/// poll would queue behind a subprocess.
+///
+/// The test holds the proxy lock for the whole request and waits for the
+/// probe to fire anyway. No timeout and no sleep: if the probe moved back
+/// under the lock this deadlocks, which the harness surfaces as "test took
+/// too long" — the same shape `foreground_run_accepts_ipc_and_shuts_down`
+/// relies on.
+#[skuld::test]
+fn the_cover_probe_does_not_run_under_the_proxy_lock() {
+    rt().block_on(async {
+        let path = test_socket_path("status-probe-lock");
+        let state_dir = tempfile::tempdir().unwrap().keep();
+        let routing = MockRouting::new(state_dir.clone());
+        // Cloned out BEFORE `routing` moves into the manager, the same shape
+        // `mock_proxy_with_release_state` uses for its counters.
+        let probes = Arc::clone(&routing.cover_presence_probes);
+        let probed_signal = Arc::clone(&routing.cover_presence_probed);
+        let pm = ProxyManager::new(MockProxy::new(), routing).with_state_dir(state_dir);
+        let proxy = Arc::new(Mutex::new(pm));
+
+        let server = IpcServer::bind(&path, Arc::clone(&proxy), "test").unwrap();
+        let handle = tokio::spawn(async move {
+            server.run_once().await.unwrap();
+        });
+
+        let mut client = TestClient::connect(&path).await;
+
+        // Registered BEFORE the request so no probe can be missed, and held
+        // across it. `notify_one` stores a permit regardless, so the order of
+        // these two is not load-bearing either way.
+        let probed = probed_signal.notified();
+        tokio::pin!(probed);
+
+        let held = proxy.lock().await;
+
+        let request = tokio::spawn(async move {
+            let _ = get_status(&mut client).await;
+            client
+        });
+
+        // Resolves only because the handler probed before reaching for the
+        // lock this test is holding.
+        probed.await;
+        assert!(
+            probes.load(Ordering::SeqCst) >= 1,
+            "the status handler must probe cover presence outside the proxy lock"
+        );
+
+        drop(held);
+        let client = request.await.expect("status request task panicked");
 
         drop(client);
         handle.abort();

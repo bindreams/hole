@@ -313,6 +313,28 @@ fn build_router<P: Proxy + 'static, R: Routing + 'static>(state: Arc<IpcState<P,
 async fn handle_status<P: Proxy + 'static, R: Routing + 'static>(
     State(state): State<Arc<IpcState<P, R>>>,
 ) -> Json<StatusResponse> {
+    // Probed BEFORE the proxy lock, and off the runtime.
+    //
+    // `lockdown_cover_presence` is an OS call: `pfctl -s labels` through a
+    // blocking `std::process::Command` on macOS, `FwpmEngineOpen0` plus one
+    // `FwpmFilterGetByKey0` RPC per swept GUID on Windows. Its predecessor
+    // here, `lockdown_active()`, was an in-memory `Posture` read — and status
+    // is a POLL: the tray reconciler ticks it every 5s and the dashboard polls
+    // it every 5s. Left inline under `state.proxy.lock()` that puts a blocking
+    // subprocess on a runtime worker and holds the proxy mutex across it, so
+    // every connect, disconnect, and 1 Hz `/v1/metrics` poll queues behind the
+    // probe. `state.routing` is the same `Arc<R>` the manager holds, reachable
+    // without that lock — the handle `handle_unblock` already uses.
+    let routing = Arc::clone(&state.routing);
+    let cover_presence = tokio::task::spawn_blocking(move || routing.lockdown_cover_presence())
+        .await
+        .unwrap_or_else(|e| {
+            tracing::error!(error = %e, "cover-presence probe task panicked");
+            // The lean every escape-offering site treats like `live`, never
+            // like `absent`: a probe that did not complete knows nothing.
+            CoverPresence::Unreachable
+        });
+
     let mut pm = state.proxy.lock().await;
     if let Some(event) = pm.check_health() {
         if let Err(e) = pm.stop_with(event).await {
@@ -334,7 +356,7 @@ async fn handle_status<P: Proxy + 'static, R: Routing + 'static>(
         udp_proxy_available: pm.udp_proxy_available(),
         ipv6_bypass_available: pm.ipv6_bypass_available(),
         lockdown_enabled: pm.lockdown_enabled(),
-        cover_presence: wire_cover_presence(pm.cover_presence()),
+        cover_presence: wire_cover_presence(cover_presence),
         blocked_until_connected: pm.blocked_until_connected(),
     })
 }

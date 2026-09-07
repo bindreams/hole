@@ -188,3 +188,18 @@ slow-timeout = { period = "30s", terminate-after = 2 }
 [[profile.default.overrides]]
 filter = 'test(/^(echo_records_round_trip_byte_counts_and_ttfb|silent_drop_records_zero_bytes_and_no_ttfb|silent_after_read_matches_248_shape|rst_close_classified_as_rst_with_os_errno|shutdown_cancels_in_flight_connection_without_panic|cross_check_inbound_and_upstream_counters_match)$/)'
 slow-timeout = { period = "20s", terminate-after = 2 }
+
+# `the_cover_probe_does_not_run_under_the_proxy_lock` (crates/bridge/src/ipc_tests.rs)
+# holds `state.proxy.lock()` across a `/v1/status` request and parks on the
+# mock's "cover presence probed" signal. That signal is the only edge
+# available: the assertion IS that the probe happens before the handler
+# reaches for the lock, so there is nothing downstream of it to order against,
+# and a regression that moves the probe back under the lock deadlocks rather
+# than failing (measured: 147s and still running when killed). Same
+# `slow-timeout`/`terminate-after` treatment, for the same reason, as the
+# `tun-engine` driver and `garter` tap groups above — the sanctioned "failure
+# bound surfaced to a human", not synchronization. The test runs in ~0.1s when
+# passing, so 20s is over two orders of magnitude of headroom.
+[[profile.default.overrides]]
+filter = 'test(/^the_cover_probe_does_not_run_under_the_proxy_lock$/)'
+slow-timeout = { period = "20s", terminate-after = 2 }
