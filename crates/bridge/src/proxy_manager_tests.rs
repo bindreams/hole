@@ -178,6 +178,13 @@ pub(crate) struct MockRoutingState {
     pub(crate) release_all_calls: AtomicU32,
     /// `release_all_covers` returns `RoutingError::RouteSetup` when set.
     pub(crate) fail_release: AtomicBool,
+    /// The guard's own `Drop` (the second, unconfirmable release attempt
+    /// `apply_cover_step` makes after `release_all_covers`, mirroring the real
+    /// `Cover::drop` calling `lockdown_disengage`) leaves the measured
+    /// presence untouched instead of clearing it when set — lets a test
+    /// simulate BOTH real release attempts failing to confirm, the only
+    /// scenario in which the OS cover can genuinely remain engaged.
+    pub(crate) fail_lockdown_disengage_on_drop: AtomicBool,
     /// Ordered record of teardown events ("routes" / "lockdown") so a test can
     /// observe the unwind teardown sequence. Shared via the `Arc<MockRoutingState>`
     /// both `MockRoutes` and `MockCover` clone.
@@ -236,6 +243,7 @@ impl Default for MockRoutingState {
             fail_cover: AtomicBool::new(false),
             release_all_calls: AtomicU32::new(0),
             fail_release: AtomicBool::new(false),
+            fail_lockdown_disengage_on_drop: AtomicBool::new(false),
             teardown_order: std::sync::Mutex::new(Vec::new()),
             last_install_server_ip: std::sync::Mutex::new(None),
             last_install_tun_alias: std::sync::Mutex::new(None),
@@ -529,8 +537,12 @@ impl Drop for MockCover {
             self.state.teardown_order.lock().unwrap().push("lockdown");
             // Mirrors the real OS: an actual disengage (not `disarm`, which
             // `mem::forget`s this guard and never runs `Drop`) is what a
-            // subsequent `lockdown_cover_presence` probe would no longer find.
-            *self.state.cover_presence.lock().unwrap() = tun_engine::routing::CoverPresence::Absent;
+            // subsequent `lockdown_cover_presence` probe would no longer find
+            // — UNLESS this Drop's own disengage attempt is simulated as
+            // failing to confirm too (`fail_lockdown_disengage_on_drop`).
+            if !self.state.fail_lockdown_disengage_on_drop.load(Ordering::SeqCst) {
+                *self.state.cover_presence.lock().unwrap() = tun_engine::routing::CoverPresence::Absent;
+            }
         } else {
             self.state.cover_disengage_calls.fetch_add(1, Ordering::SeqCst);
         }
@@ -5657,9 +5669,11 @@ fn a_config_edit_does_not_disarm_an_adopted_kill_switch() {
 
 #[skuld::test]
 fn an_unexpected_session_death_retires_the_claim_too() {
-    // `check_health` drops the same standing-cover guard `stop_with`'s UserStop
-    // arm does, so it must retire the claim on the same terms. Left set, it
-    // would outlive every cover this process can release.
+    // Spec correction (#898 follow-up): this used to assert the release as an
+    // incidental teardown side effect (a disengage-call count) and asserted
+    // nothing about the target or ordering. Under the target model the
+    // release is a *consequence of the target moving to `Off`*, and it must
+    // still follow the session teardown it covered, not precede it.
     rt().block_on(async {
         let proxy = MockProxy::new();
         let proxy_state = proxy.state_handle();
@@ -5669,23 +5683,28 @@ fn an_unexpected_session_death_retires_the_claim_too() {
         let mut pm = ProxyManager::new(proxy, routing).with_state_dir(dir.path().to_path_buf());
         pm.set_standing_cover_adopted(true);
         pm.start(&test_config()).await.unwrap();
+        target::save(
+            dir.path(),
+            &Target::Connected {
+                config: Box::new(test_config()),
+            },
+            None,
+        )
+        .unwrap();
 
         proxy_state.crashed.store(true, Ordering::SeqCst);
         let event = pm.check_health().expect("crashed task must report GaveUp");
         pm.stop_with(event).await.unwrap();
 
         assert_eq!(
-            st.lockdown_disengage_calls.load(Ordering::SeqCst),
-            1,
-            "the teardown dropped the standing cover"
+            target::load(dir.path()),
+            Target::Off,
+            "an unexpected death must move the target off"
         );
-        assert!(
-            !pm.standing_cover_adopted(),
-            "so the live-cover half of the claim must go with it"
-        );
-        assert!(
-            pm.lockdown_enabled(),
-            "the armed half is durable, so the tray still offers the escape"
+        assert_eq!(
+            st.teardown_order.lock().unwrap().clone(),
+            vec!["routes", "lockdown"],
+            "the standing cover must be released after the session it covered, not before"
         );
     });
 }
@@ -5696,7 +5715,9 @@ fn a_user_stop_whose_release_does_not_confirm_keeps_the_claim_and_the_escape() {
     // `set_standing_cover_adopted(false)` right after the guard's silent Drop
     // would clear the claim even when the OS-level release did not confirm —
     // the Unblock item disappearing exactly in the failure case it exists to
-    // cover (Rule #0).
+    // cover (Rule #0). Asserted against `CoverPresence` — the measured OS
+    // fact — rather than the internal claim: a false "released" is worse than
+    // a stale "still armed".
     rt().block_on(async {
         let dir = tempfile::tempdir().unwrap();
         let routing = MockRouting::new(dir.path().to_path_buf());
@@ -5706,6 +5727,7 @@ fn a_user_stop_whose_release_does_not_confirm_keeps_the_claim_and_the_escape() {
         pm.start(&test_config()).await.unwrap();
 
         st.fail_release.store(true, Ordering::SeqCst);
+        st.fail_lockdown_disengage_on_drop.store(true, Ordering::SeqCst);
         pm.stop_with(SessionEvent::UserStopped).await.unwrap();
 
         assert_eq!(
@@ -5713,9 +5735,10 @@ fn a_user_stop_whose_release_does_not_confirm_keeps_the_claim_and_the_escape() {
             1,
             "the confirmable release path must be tried"
         );
-        assert!(
-            pm.standing_cover_adopted(),
-            "an unconfirmed release must leave the live-cover claim set"
+        assert_eq!(
+            pm.cover_presence(),
+            tun_engine::routing::CoverPresence::Live,
+            "an unconfirmed release must leave the measured cover reading engaged"
         );
         assert!(
             pm.lockdown_enabled(),
@@ -5726,7 +5749,8 @@ fn a_user_stop_whose_release_does_not_confirm_keeps_the_claim_and_the_escape() {
 
 #[skuld::test]
 fn a_crashed_session_whose_release_does_not_confirm_keeps_the_claim() {
-    // Same proof as above, over `check_health`'s teardown of a dead session.
+    // Same proof as above, over `check_health`'s teardown of a dead session,
+    // asserted against `CoverPresence` for the same reason.
     rt().block_on(async {
         let proxy = MockProxy::new();
         let proxy_state = proxy.state_handle();
@@ -5738,6 +5762,7 @@ fn a_crashed_session_whose_release_does_not_confirm_keeps_the_claim() {
         pm.start(&test_config()).await.unwrap();
 
         st.fail_release.store(true, Ordering::SeqCst);
+        st.fail_lockdown_disengage_on_drop.store(true, Ordering::SeqCst);
         proxy_state.crashed.store(true, Ordering::SeqCst);
         let event = pm.check_health().expect("crashed task must report GaveUp");
         pm.stop_with(event).await.unwrap();
@@ -5747,9 +5772,10 @@ fn a_crashed_session_whose_release_does_not_confirm_keeps_the_claim() {
             1,
             "the confirmable release path must be tried"
         );
-        assert!(
-            pm.standing_cover_adopted(),
-            "an unconfirmed release during health-check teardown must leave the claim set"
+        assert_eq!(
+            pm.cover_presence(),
+            tun_engine::routing::CoverPresence::Live,
+            "an unconfirmed release during health-check teardown must leave the measured cover reading engaged"
         );
         assert!(pm.lockdown_enabled());
     });

@@ -317,3 +317,98 @@ fn startup_recovery_runs_before_reconciliation() {
         );
     });
 }
+
+// Sanctioned release call sites =======================================================================================
+//
+// `release_all_covers()` is unconditional and knows nothing about cover
+// state (see the module doc). The plan's own aspiration is a single caller
+// in `reconciler.rs`, but that is not achievable without an on-demand/
+// event-driven reconcile invocation (tracked separately, not scoped to any
+// task's file list): `handle_unblock`'s own doc is explicit that its direct
+// call is deliberate — it must work while a wedged teardown holds
+// `state.proxy.lock()`, so it cannot route through the reconciler/manager at
+// all. So this guards the WEAKER, achievable property instead: every real
+// caller is one of the four independently-reasoned-about sites below, each
+// with its own doc explaining why it releases directly rather than through
+// the others. A fifth, undocumented caller is exactly the kind of divergent,
+// re-introduced `ReleaseWarrant`-style release path this stage exists to
+// prevent. Same walk pattern as `proxy_manager_tests.rs`'s
+// `no_bridge_source_derives_cover_state_from_a_session`.
+
+/// An undocumented fifth caller of `release_all_covers()` would mean a new
+/// release path was added outside the four reasoned-about sites — the exact
+/// kind of divergent teardown route this stage collapses cover-release onto.
+#[skuld::test]
+fn release_all_covers_callers_are_the_known_sanctioned_set() {
+    let pattern = regex::Regex::new(r"release_all_covers\s*\(").unwrap();
+    let src_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+
+    // (file suffix, line) for every caller reasoned about above. A real
+    // caller not on this list, or one of these lines moving/disappearing
+    // without the list being updated, both fail loud below.
+    let sanctioned: &[(&str, usize)] = &[
+        ("ipc.rs", 666),            // handle_unblock: deliberately bypasses `state.proxy.lock()`.
+        ("proxy_manager.rs", 752),  // turn_lockdown_off: the explicit off-toggle.
+        ("proxy_manager.rs", 2007), // apply_cover_step: session-teardown's own release, ordered after routes.
+        ("reconciler.rs", 231),     // Phase::Cover(CoverStep::Release): boot-time reconciliation.
+    ];
+
+    let mut matches: Vec<(String, usize, String)> = Vec::new();
+    for entry in walkdir::WalkDir::new(&src_root) {
+        let entry = entry.expect("failed to walk crates/bridge/src");
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+            continue;
+        }
+        let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        if file_name.ends_with("_tests.rs") {
+            continue;
+        }
+        if path.components().any(|c| c.as_os_str() == "test_support") {
+            continue;
+        }
+        let text = std::fs::read_to_string(path).expect("failed to read a walked source file");
+        for (line_no, line) in text.lines().enumerate() {
+            if pattern.is_match(line) {
+                matches.push((path.display().to_string(), line_no + 1, line.trim().to_string()));
+            }
+        }
+    }
+
+    let diagnostic = || {
+        let mut msg = format!(
+            "release_all_covers_callers_are_the_known_sanctioned_set: pattern `{}` must match \
+             only at the {} known sanctioned call sites in non-test bridge sources (skipping \
+             *_tests.rs and src/test_support/).\nMatches found ({}):\n",
+            pattern.as_str(),
+            sanctioned.len(),
+            matches.len()
+        );
+        for (file, line_no, line) in &matches {
+            msg.push_str(&format!("  {file}:{line_no}: {line}\n"));
+        }
+        msg.push_str(
+            "A failure here means one of three things: a new, undocumented release path was added \
+             (the real defect — add it to `sanctioned` above only after writing down, next to the \
+             call, why it cannot route through one of the existing four), a sanctioned call moved \
+             lines (update `sanctioned` to match), or a comment/doc string in a walked file now \
+             quotes the pattern, which is a false positive and should be reworded.",
+        );
+        msg
+    };
+
+    assert_eq!(matches.len(), sanctioned.len(), "{}", diagnostic());
+    for (file, line_no, _) in &matches {
+        let is_sanctioned = sanctioned
+            .iter()
+            .any(|(suffix, line)| file.ends_with(suffix) && line == line_no);
+        assert!(
+            is_sanctioned,
+            "unsanctioned call site: {file}:{line_no}\n{}",
+            diagnostic()
+        );
+    }
+}
