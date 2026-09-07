@@ -211,10 +211,7 @@ mod platform {
             use std::os::windows::fs::MetadataExt;
             let attrs = file.metadata()?.file_attributes();
             if attrs & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::Other,
-                    "refusing to lock through a reparse point",
-                ));
+                return Err(io::Error::other("refusing to lock through a reparse point"));
             }
         }
 
@@ -222,7 +219,7 @@ mod platform {
         // applied by the caller's existing service/task-scheduler install
         // path, same as `target.rs::save`'s Windows arm.
 
-        let handle = HANDLE(file.as_raw_handle() as isize);
+        let handle = HANDLE(file.as_raw_handle());
         let flags = if block {
             LOCKFILE_EXCLUSIVE_LOCK
         } else {
@@ -233,7 +230,7 @@ mod platform {
         // this call; `overlapped` is a local, live for the same duration; the
         // lock region (0..=u32::MAX twice) covers the whole file, which is
         // never more than a few hundred bytes of JSON.
-        let result = unsafe { LockFileEx(handle, flags, 0, u32::MAX, u32::MAX, &mut overlapped) };
+        let result = unsafe { LockFileEx(handle, flags, None, u32::MAX, u32::MAX, &mut overlapped) };
         match result {
             Ok(()) => Ok(Some(file)),
             Err(e) => {
