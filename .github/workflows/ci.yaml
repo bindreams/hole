@@ -315,23 +315,39 @@ jobs:
     runs-on: ${{ matrix.runner }}
     # Per-leg, because the legs differ by ~2x: one number would either
     # under-budget darwin/amd64 or push every leg's hang-detection deadline out
-    # to suit the slowest. Whole-job wall clock, 38 runs per leg on `main`:
+    # to suit the slowest. Whole-job wall clock, 29 runs on `main` (2026-08-27 →
+    # 2026-09-07), re-measured for #989 after darwin/arm64 was killed at its
+    # wall:
     #
-    #   darwin/arm64   16m31s - 32m01s, 0 killed  -> 45
-    #   windows/amd64  23m48s - 42m06s, 0 killed  -> 60
-    #   darwin/amd64   22m22s - 44m28s, 8 killed  -> 90
+    #   darwin/arm64   19m54s - 43m12s, 1 killed  -> 70
+    #   windows/amd64  23m48s - 42m06s, 0 killed  -> 60  (38-run sample, kept)
+    #   darwin/amd64   22m22s - 72m30s, 8 killed  -> 90  (see below)
     #
-    # darwin/amd64's distribution is right-CENSORED by the 45min wall replaced
-    # here, so 44m28s is a floor, not a maximum. Reconstructing the killed runs
-    # from their phase timings puts the real requirement near 56min. 90
-    # clears the censored region so the true tail becomes observable; tighten
-    # once it is. windows/amd64 has never been killed but sits at 94% of the old
-    # wall, so it is raised too; darwin/arm64 has 29% margin and stays.
+    # darwin/arm64 is what #989 measured. Its old 45 came from a 16m31s-32m01s
+    # sample taken before #893/#982 gave the macOS privileged lane real work,
+    # and before the `hole`→`hole-tests` cascade grew; the leg reached 43m12s
+    # (96% of the wall) on 2026-09-03 and was killed four days later on the
+    # #988 tauri bump, whose cold-ish rebuild pushed `Build hole test binaries`
+    # to 16m36s against 10m54s/11m18s on the two runs before it. Build is the
+    # dominant and most volatile term on this leg (6m42s - 17m48s observed).
+    # 70 is ~1.6x the largest passing run, chosen to clear the censored region
+    # so the true tail becomes observable; tighten once it is.
     #
-    # The macOS TUN step's own rebuild is gone (its feature set now matches), so
-    # the darwin measurements above predate that — re-measure those legs before
-    # tightening. windows/amd64 is unaffected; its TUN step already matched. The
-    # `hole` → `hole-tests` cascade still recompiles the shared crates (#723).
+    # NOT a hang: the killed job had already spent 39m54s of its 45 before the
+    # TUN step began, so it was doomed whatever that step did. The step's own
+    # 5m12s sits mid-distribution for the leg (3m18s - 6m24s over 28 passing
+    # runs). See #989 for the full step-by-step timeline.
+    #
+    # darwin/amd64's 90 is unchanged and still holds: its own distribution was
+    # right-CENSORED by the 45min wall this replaced, and the leg has since been
+    # observed at 72m30s, inside 90 but well past the 56min the censored runs
+    # were reconstructed to. windows/amd64 has never been killed and its 38-run
+    # sample still stands.
+    #
+    # These are whole-JOB budgets, shared across build + verify + test. A slow
+    # build therefore eats the test steps' headroom — which is exactly how #989
+    # happened. The per-step `timeout-minutes` further down decouple the two, so
+    # a genuinely hung test fails its own step instead of consuming the wall.
     #
     # The `ci_installer_assembly_jobs_share_a_timeout_budget` conformance test
     # does not cover these: it selects jobs whose xtask cascade reaches a
@@ -345,7 +361,7 @@ jobs:
         include:
           - { os: windows, arch: amd64, runner: windows-latest, timeout: 60 }
           - { os: darwin,  arch: amd64, runner: macos-15-intel, timeout: 90 }
-          - { os: darwin,  arch: arm64, runner: macos-latest,   timeout: 45 }
+          - { os: darwin,  arch: arm64, runner: macos-latest,   timeout: 70 }
     steps:
       - uses: actions/checkout@v7
         with:
@@ -401,8 +417,38 @@ jobs:
       # compiled actually run (matching feature set → no rebuild). See #522.
       # The `ci_test_hole_steps_match_the_hole_tests_target` conformance test
       # holds every nextest step here equal to that target's `run:`.
+      #
+      # STEP-LEVEL BUDGETS (#989). The job wall above is shared across build +
+      # verify + test, so a slow build silently eats the test steps' headroom;
+      # when the wall then fires it kills the JOB, GitHub never uploads the log
+      # blob, and the run yields nothing but a `cancelled` with a 404 log. A
+      # step that blows its own budget instead fails normally: the job runs on,
+      # `Upload bridge logs` still fires (its `if` covers `failure()`), and the
+      # step's captured output survives. Same evidence-preservation move as #970
+      # made for the installer job's external wait, one level up from #972's
+      # per-test `slow-timeout`s in `.config/nextest.toml`.
+      #
+      # Sized off 29 runs on `main` (2026-08-27 → 2026-09-07), per-step maxima
+      # across all three legs:
+      #
+      #   non-TUN   windows 19m30s   darwin/amd64 16m24s   darwin/arm64 10m36s  -> 35
+      #   TUN       windows  5m30s   darwin/amd64 10m30s   darwin/arm64  6m24s  -> 25
+      #
+      # One number per step rather than per leg: the spread within a step is
+      # smaller than the margin, and a per-leg matrix entry here would have to
+      # be kept in step with the job budgets above for no measured gain.
+      #
+      # DISCLOSED RESIDUAL: these are not a guarantee that the step always
+      # loses the race to the job wall. On the windows leg (60) a hung TUN step
+      # can still reach the wall first when the build and non-TUN steps both
+      # run long (17 + 4 + 19 + 25 = 65). Bounding that away would mean either
+      # budgets too tight to survive an honest slow run or a wall raised past
+      # what the measurements support, so it is left stated rather than fixed;
+      # the common case — one step hangs while the others run normally — is
+      # covered on every leg.
       - name: Test (non-TUN)
         id: test-non-tun
+        timeout-minutes: 35
         shell: bash
         env:
           SKULD_LABELS: "!tun"
@@ -419,6 +465,7 @@ jobs:
       - name: "Test (TUN, runs last for #200)"
         if: matrix.os == 'windows' && matrix.arch == 'amd64'
         id: test-tun
+        timeout-minutes: 25
         shell: bash
         env:
           SKULD_LABELS: "tun"
@@ -451,6 +498,7 @@ jobs:
       - name: Test (TUN, macOS — root for pfctl)
         if: matrix.os == 'darwin'
         id: test-tun-macos
+        timeout-minutes: 25
         shell: bash
         run: >
           sudo env "PATH=$PATH" "HOME=$HOME" SKULD_LABELS=tun
