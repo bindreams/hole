@@ -150,15 +150,18 @@ before editing; the sections linked below are the authoritative source.
   Both are persistent WFP filters (Win) / self-contained pf ruleset (mac); the
   transient one is swept unconditionally on next start, the standing one only
   on an explicit recorded off — full reconciliation table (`decide_cover_recovery`)
-  and disclosed residuals in CONTRIBUTING.md. An adopted cover's ARMED half
-  is promoted into `bridge-lockdown.json` at the first real engage, so a
-  disconnect (`reload`'s slow path is stop + start) cannot disarm the switch;
-  only `turn_lockdown_off` clears it. The escape from a stranded
-  cover (`failclosed::release_all`) is unconditional and knows nothing about cover
-  state; its only condition is whether a session is running, and turning the
-  kill switch off takes the same path. Who holds a cover has exactly one
-  answer, derived once from `ProxyManager`'s single `posture` field
-  (`Posture::cover_holder`); no site recomputes it from session state. →
+  and disclosed residuals in CONTRIBUTING.md. A single persisted `Target`
+  (`Off` / `Connected` / `Unreadable`) is what both the cover and the tunnel
+  session reconcile toward (`reconciler::{cover_step,tunnel_step,step_order}`);
+  `reconcile_once` drives this at boot, and `turn_lockdown_off`, the tray's
+  Unblock action, and session teardown each drive it inline for their own
+  event, since only boot is covered by a reconcile pass today. Who holds a
+  cover is a **measured OS fact**, `CoverPresence`, read via
+  `Routing::lockdown_cover_presence`, not derived from session state; the
+  escape (`Routing::release_all_covers`) is unconditional, has a
+  structurally-guarded set of sanctioned callers, and clears the in-process
+  adopted-cover claim only on a confirmed release, never on a guard's silent
+  `Drop`. →
   [CONTRIBUTING.md#fail-closed-cover](CONTRIBUTING.md#fail-closed-cover)
 - **Server-address redaction.** The configured address — hostname, resolved IP,
   every textual form — is replaced by a `<server:XXXXXXXX>` token before it
