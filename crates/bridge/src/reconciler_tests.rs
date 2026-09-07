@@ -224,7 +224,7 @@ fn a_persisted_connected_target_reconciles_at_startup_with_no_gui() {
         let pm = ProxyManager::new(MockProxy::new(), routing).with_state_dir(dir.path().to_path_buf());
         let proxy = Arc::new(Mutex::new(pm));
 
-        reconcile_once(dir.path(), &proxy).await;
+        reconcile_once(dir.path(), None, &proxy).await;
 
         // The tunnel started with no client ever having connected...
         assert_eq!(
@@ -256,7 +256,7 @@ fn a_persisted_off_target_starts_nothing() {
         let pm = ProxyManager::new(MockProxy::new(), routing).with_state_dir(dir.path().to_path_buf());
         let proxy = Arc::new(Mutex::new(pm));
 
-        reconcile_once(dir.path(), &proxy).await;
+        reconcile_once(dir.path(), None, &proxy).await;
 
         assert_eq!(
             proxy.lock().await.state(),
@@ -307,13 +307,86 @@ fn startup_recovery_runs_before_reconciliation() {
         )
         .await;
 
-        reconcile_once(dir.path(), &proxy).await;
+        reconcile_once(dir.path(), None, &proxy).await;
 
         assert_eq!(
             state.lockdown_engage_calls.load(Ordering::SeqCst),
             1,
             "reconcile_once must see recovery's adopted claim — recorded before reconciliation ran — \
              and engage the standing cover even though bridge-lockdown.json itself records no intent"
+        );
+    });
+}
+
+#[skuld::test]
+fn reconcile_once_honours_a_do_not_connect_startup_preference() {
+    rt().block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        // The user was connected when the machine went down...
+        target::save(dir.path(), &connectable(), None).unwrap();
+        // ...but had pushed "do not connect on startup" before that.
+        target::save_startup_preference(
+            dir.path(),
+            &target::StartupPreference {
+                on_startup: hole_common::config::StartupBehavior::DoNotConnect,
+                candidate: None,
+            },
+            None,
+        )
+        .unwrap();
+
+        let routing = MockRouting::new(dir.path().to_path_buf());
+        let pm = ProxyManager::new(MockProxy::new(), routing).with_state_dir(dir.path().to_path_buf());
+        let proxy = Arc::new(Mutex::new(pm));
+
+        reconcile_once(dir.path(), None, &proxy).await;
+
+        assert_eq!(
+            proxy.lock().await.state(),
+            ProxyState::Stopped,
+            "DoNotConnect must suppress boot auto-connect even over a persisted Connected target"
+        );
+        assert_eq!(
+            target::load(dir.path()),
+            Target::Off,
+            "DoNotConnect must durably persist Off, not merely hold it in memory for this pass"
+        );
+    });
+}
+
+#[skuld::test]
+fn reconcile_once_honours_an_always_connect_startup_preference_with_a_candidate() {
+    rt().block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        // Nothing persisted (a fresh install, or a prior explicit stop)...
+        target::save(dir.path(), &Target::Off, None).unwrap();
+        // ...but the GUI pushed AlwaysConnect with the last-connected config
+        // as the candidate to substitute (R8/Task 4's `candidate`).
+        target::save_startup_preference(
+            dir.path(),
+            &target::StartupPreference {
+                on_startup: hole_common::config::StartupBehavior::AlwaysConnect,
+                candidate: Some(Box::new(connectable_config())),
+            },
+            None,
+        )
+        .unwrap();
+
+        let routing = MockRouting::new(dir.path().to_path_buf());
+        let pm = ProxyManager::new(MockProxy::new(), routing).with_state_dir(dir.path().to_path_buf());
+        let proxy = Arc::new(Mutex::new(pm));
+
+        reconcile_once(dir.path(), None, &proxy).await;
+
+        assert_eq!(
+            proxy.lock().await.state(),
+            ProxyState::Running,
+            "AlwaysConnect with a pushed candidate must start the tunnel even over a persisted Off target"
+        );
+        assert_eq!(
+            target::load(dir.path()),
+            connectable(),
+            "the resolved target must be durably persisted, so a later read sees what actually reconciled"
         );
     });
 }
@@ -347,10 +420,10 @@ fn cover_release_has_the_known_sanctioned_caller_set() {
     // caller not on this list, or one of these lines moving/disappearing
     // without the list being updated, both fail loud below.
     let sanctioned: &[(&str, usize)] = &[
-        ("ipc.rs", 666),            // handle_unblock: deliberately bypasses `state.proxy.lock()`.
-        ("proxy_manager.rs", 752),  // turn_lockdown_off: the explicit off-toggle.
-        ("proxy_manager.rs", 2007), // apply_cover_step: session-teardown's own release, ordered after routes.
-        ("reconciler.rs", 231),     // Phase::Cover(CoverStep::Release): boot-time reconciliation.
+        ("ipc.rs", 702),            // handle_unblock: deliberately bypasses `state.proxy.lock()`.
+        ("proxy_manager.rs", 764),  // turn_lockdown_off: the explicit off-toggle.
+        ("proxy_manager.rs", 2050), // apply_cover_step: session-teardown's own release, ordered after routes.
+        ("reconciler.rs", 265),     // Phase::Cover(CoverStep::Release): boot-time reconciliation.
     ];
 
     let mut matches: Vec<(String, usize, String)> = Vec::new();

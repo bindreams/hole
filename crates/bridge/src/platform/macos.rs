@@ -215,6 +215,13 @@ pub fn run(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async {
+        // Held for this bridge's entire run — see crate::liveness's module
+        // doc and foreground.rs's identical acquisition.
+        let state_dir_liveness = state_dir.to_path_buf();
+        let _liveness =
+            tokio::task::spawn_blocking(move || crate::liveness::BridgeLiveness::acquire(&state_dir_liveness, None))
+                .await??;
+
         let proxy = std::sync::Arc::new(tokio::sync::Mutex::new(
             crate::proxy_manager::ProxyManager::new(
                 crate::proxy::ShadowsocksProxy::new(),
@@ -249,7 +256,7 @@ pub fn run(
         // Reconcile the persisted target now, before any GUI or client has had a
         // chance to connect (closes #617) — must run after recovery above, see
         // crate::reconciler::reconcile_once's own doc.
-        crate::reconciler::reconcile_once(state_dir, &proxy_shutdown).await;
+        crate::reconciler::reconcile_once(state_dir, None, &proxy_shutdown).await;
         let state_dir_plugins = state_dir.to_path_buf();
         if let Err(e) =
             tokio::task::spawn_blocking(move || crate::plugin_recovery::reap_recorded_plugins(&state_dir_plugins)).await
@@ -280,7 +287,7 @@ pub fn run(
         // event differs, distinguishing an update cutover from a plain
         // machine shutdown for anyone reading the log/history.
         let mut pm = proxy_shutdown.lock().await;
-        let event = shutdown_reason(hole_common::update_marker::is_present(log_dir));
+        let event = crate::foreground::shutdown_reason(hole_common::update_marker::is_present(log_dir));
         if let Err(e) = pm.stop_with(event).await {
             tracing::error!(error = %e, "error stopping proxy during shutdown");
         }
@@ -288,19 +295,6 @@ pub fn run(
         Ok::<(), Box<dyn std::error::Error>>(())
     })?;
     Ok(())
-}
-
-/// Map an update-in-progress marker's presence to the session event: present
-/// means a cutover is mid-flight (`SessionEvent::CutoverRestart`); absent
-/// means a clean machine shutdown (`SessionEvent::ProcessExiting`) — neither
-/// is `UserStopped`, which is reserved for an actual user-initiated
-/// disconnect. Pure so the decision is table-testable.
-pub(crate) fn shutdown_reason(marker_present: bool) -> crate::target::SessionEvent {
-    if marker_present {
-        crate::target::SessionEvent::CutoverRestart
-    } else {
-        crate::target::SessionEvent::ProcessExiting
-    }
 }
 
 /// Clear a stale update-in-progress marker on the new bridge's post-bind sweep.

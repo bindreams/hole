@@ -2,7 +2,7 @@
 //!
 //! Split out from any call site so cover fate and tunnel fate stop being
 //! expressible by imitation (`StopReason`'s two-variant trap, `check_health`
-//! hand-copying `stop_with`'s arm) — see this plan's "Cause 1". Nothing here
+//! hand-copying `stop_with`'s arm). Nothing here
 //! performs I/O: every function is a table lookup from measured/decided
 //! inputs to a step, and the actual driving of those steps lives elsewhere.
 
@@ -35,7 +35,7 @@ pub enum CoverStep {
     /// Remove the cover. Either the target no longer authorises it (it
     /// moved to `Off`, regardless of intent — the engaged block follows the
     /// target, not the preference) or the intent was turned off mid-session
-    /// (Q4: unticking releases immediately, it does not wait for stop).
+    /// (unticking releases immediately, it does not wait for stop).
     Release,
 }
 
@@ -71,9 +71,9 @@ pub enum Phase {
 /// cover at all.
 ///
 /// Once the target is anything other than `Connected`, `intent` stops
-/// mattering: the engaged block follows the target (model point 6), so a
+/// mattering: the engaged block follows the target, so a
 /// target that moved to `Off` releases a live cover even with the
-/// preference still `On` — that is Q4/Q5's point, not an oversight. Reading
+/// preference still `On` — that is intentional, not an oversight. Reading
 /// the preference back out of a disarmed cover is exactly the boot-time job
 /// [`tun_engine::routing::decide_cover_recovery`] does instead; this
 /// function is the steady-state reconcile decision, not the recovery one,
@@ -81,7 +81,7 @@ pub enum Phase {
 ///
 /// `Target::Unreadable` authorises neither surface — there is nothing to
 /// preserve and nothing to disarm — so it holds regardless of intent or
-/// presence (R4).
+/// presence.
 ///
 /// Exhaustive on every axis with no wildcard arm, so a new `Intent`,
 /// `CoverPresence`, or `Target` variant is a compile error here, the same
@@ -122,7 +122,7 @@ pub fn cover_step(intent: Intent, presence: CoverPresence, target: &Target) -> C
             (I::Unreadable, P::Unreachable) => CoverStep::Hold,
 
             // `Off` never authorises engaging, and releases whatever is
-            // actionable — Q4's "unticking releases mid-session".
+            // actionable: unticking releases mid-session.
             (I::Off, P::Live) => CoverStep::Release,
             (I::Off, P::Recorded) => CoverStep::Release,
             (I::Off, P::Indeterminate) => CoverStep::Release,
@@ -146,7 +146,7 @@ pub fn cover_step(intent: Intent, presence: CoverPresence, target: &Target) -> C
 
 /// Decide what the tunnel session should do.
 ///
-/// `Target::Unreadable` authorises neither starting nor stopping (R4): an
+/// `Target::Unreadable` authorises neither starting nor stopping: an
 /// unreadable target is not consent to connect, but it is equally not the
 /// user asking to disconnect, so an already-live session is left alone
 /// rather than torn down on a corrupt read.
@@ -209,14 +209,48 @@ pub fn step_order(cover: CoverStep, tunnel: TunnelStep) -> [Phase; 2] {
 /// `standing_cover_expected()` gate, once the TUN device and routes it needs
 /// exist. The `covered = true` argument to `start_cancellable` is what holds
 /// a loopback+server transient cover across that connect window when the
-/// lockdown intent is off, per this plan's "R2 follow-on" resolution.
-pub async fn reconcile_once<P, R, D>(state_dir: &Path, proxy: &Arc<Mutex<ProxyManager<P, R, D>>>)
-where
+/// lockdown intent is off.
+///
+/// Before deciding anything, the persisted target is folded through
+/// `target::resolve_startup_target` against the GUI-pushed startup
+/// preference (R8: "one decider, not two" — the startup behaviour is
+/// applied first, to produce the target, so reconciliation afterward has
+/// exactly one input) and the resolved value is persisted via `target::apply`
+/// before use, not merely held in memory: `DoNotConnect` must durably write
+/// `Off` so a later status read (or a session-event write, should one ever
+/// race this early) sees the same target this pass reconciles toward, not
+/// the stale one it overrode.
+pub async fn reconcile_once<P, R, D>(
+    state_dir: &Path,
+    owner: Option<(u32, u32)>,
+    proxy: &Arc<Mutex<ProxyManager<P, R, D>>>,
+) where
     P: Proxy,
     R: Routing,
     D: Dns,
 {
-    let target = target::load(state_dir);
+    let pref = target::load_startup_preference(state_dir);
+    let state_dir_owned = state_dir.to_path_buf();
+    let target = match tokio::task::spawn_blocking(move || {
+        target::apply(&state_dir_owned, owner, move |current| {
+            target::resolve_startup_target(current, pref.on_startup, pref.candidate)
+        })
+    })
+    .await
+    {
+        Ok(Ok(target)) => target,
+        Ok(Err(error)) => {
+            tracing::error!(
+                %error,
+                "reconcile_once: failed to persist the startup-resolved target; reading current disk state instead of guessing"
+            );
+            target::load(state_dir)
+        }
+        Err(error) => {
+            tracing::error!(%error, "reconcile_once: startup-target resolution task panicked; treating target as unreadable");
+            Target::Unreadable
+        }
+    };
 
     let mut pm = proxy.lock().await;
     let intent = pm.effective_lockdown_intent();

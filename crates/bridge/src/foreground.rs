@@ -104,6 +104,21 @@ async fn notify_ready(spec: &str) {
     }
 }
 
+/// Map an update-in-progress marker's presence to the session event: present
+/// means a cutover is mid-flight (`SessionEvent::CutoverRestart`); absent
+/// means a clean machine shutdown (`SessionEvent::ProcessExiting`) — neither
+/// is `UserStopped`, which is reserved for an actual user-initiated
+/// disconnect. Pure so the decision is table-testable. Shared by all three
+/// entry points (this module, `platform::macos`, `platform::windows`) so the
+/// same shutdown-tail bug can't recur independently in one of them.
+pub(crate) fn shutdown_reason(marker_present: bool) -> crate::target::SessionEvent {
+    if marker_present {
+        crate::target::SessionEvent::CutoverRestart
+    } else {
+        crate::target::SessionEvent::ProcessExiting
+    }
+}
+
 /// Clear a stale update-in-progress marker on the new bridge's post-bind sweep.
 /// The marker's presence is co-extensive with "a cutover during which no bridge
 /// answered"; once this bridge binds, the cutover is done. Remove-by-path so a
@@ -123,6 +138,16 @@ async fn run_inner(
     version: &str,
     owner: Option<(u32, u32)>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // Held for this bridge's entire run, from before any OS mutation is
+    // possible to process exit — see crate::liveness's module doc. Blocks
+    // (in spawn_blocking, off the runtime worker) rather than failing, so a
+    // boot racing an in-flight `hole bridge unlock` waits for it instead of
+    // interleaving.
+    let state_dir_liveness = state_dir.to_path_buf();
+    let _liveness =
+        tokio::task::spawn_blocking(move || crate::liveness::BridgeLiveness::acquire(&state_dir_liveness, owner))
+            .await??;
+
     let proxy = std::sync::Arc::new(tokio::sync::Mutex::new(
         ProxyManager::new(
             ShadowsocksProxy::new(),
@@ -168,7 +193,7 @@ async fn run_inner(
     // Reconcile the persisted target now, before any GUI or client has had a
     // chance to connect (closes #617) — must run after recovery above, see
     // crate::reconciler::reconcile_once's own doc.
-    crate::reconciler::reconcile_once(state_dir, &proxy_shutdown).await;
+    crate::reconciler::reconcile_once(state_dir, owner, &proxy_shutdown).await;
     let state_dir_plugins = state_dir.to_path_buf();
     if let Err(e) =
         tokio::task::spawn_blocking(move || crate::plugin_recovery::reap_recorded_plugins(&state_dir_plugins)).await
@@ -231,8 +256,14 @@ async fn run_inner(
         _ = shutdown_signal() => {}
     }
 
+    // Neither event `shutdown_reason` can produce is a user disconnect, so
+    // the target is left unchanged either way (unlike a plain `pm.stop()`,
+    // which is `SessionEvent::UserStopped` and would wrongly move the
+    // target to `Off`, releasing a standing lockdown cover on a plain
+    // SIGTERM/Ctrl+C — e.g. from a machine shutdown or dev-console relay).
     let mut pm = proxy_shutdown.lock().await;
-    if let Err(e) = pm.stop().await {
+    let event = shutdown_reason(hole_common::update_marker::is_present(log_dir));
+    if let Err(e) = pm.stop_with(event).await {
         tracing::error!(error = %e, "error stopping proxy during shutdown");
     }
 

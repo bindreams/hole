@@ -39,7 +39,7 @@ fn an_absent_target_file_reads_off() {
 }
 
 #[skuld::test]
-fn a_corrupt_target_file_reads_off_and_warns() {
+fn a_corrupt_target_file_reads_unreadable_and_warns() {
     let tmp = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(tmp.path()).unwrap();
     std::fs::write(tmp.path().join(STATE_FILE_NAME), b"not json").unwrap();
@@ -440,5 +440,31 @@ fn every_session_event_over_an_unreadable_target_is_defined() {
     assert_eq!(
         target_after(Target::Unreadable, SessionEvent::Blipped),
         Target::Unreadable
+    );
+}
+
+#[skuld::test]
+fn apply_leaves_an_unreadable_target_file_untouched_when_f_declines() {
+    // `target_after`'s `ProcessExiting`/`CutoverRestart`/`Blipped` arms pass
+    // an `Unreadable` current target straight through — a real, reachable
+    // case, not a caller error — so `apply` must not hand that value to
+    // `save`, which has no on-disk form for it and would otherwise silently
+    // downgrade the file to `Off`, destroying the "not authority to disarm"
+    // property `Unreadable` exists for.
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path()).unwrap();
+    let corrupt: &[u8] = b"not json";
+    std::fs::write(tmp.path().join(STATE_FILE_NAME), corrupt).unwrap();
+
+    let next = apply(tmp.path(), None, |current| {
+        target_after(current, SessionEvent::ProcessExiting)
+    })
+    .unwrap();
+
+    assert_eq!(next, Target::Unreadable);
+    let on_disk = std::fs::read(tmp.path().join(STATE_FILE_NAME)).unwrap();
+    assert_eq!(
+        on_disk, corrupt,
+        "apply must leave an unreadable target file untouched when f declines to decide, not overwrite it with Off"
     );
 }
