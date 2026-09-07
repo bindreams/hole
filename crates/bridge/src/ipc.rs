@@ -315,7 +315,11 @@ async fn handle_status<P: Proxy + 'static, R: Routing + 'static>(
     State(state): State<Arc<IpcState<P, R>>>,
 ) -> Json<StatusResponse> {
     let mut pm = state.proxy.lock().await;
-    pm.check_health();
+    if let Some(event) = pm.check_health() {
+        if let Err(e) = pm.stop_with(event).await {
+            tracing::error!(error = %e, "error tearing down proxy after a failed health check");
+        }
+    }
     Json(StatusResponse {
         running: pm.state() == ProxyState::Running,
         uptime_secs: pm.uptime_secs(),
@@ -622,7 +626,8 @@ async fn handle_lockdown<P: Proxy + 'static, R: Routing + 'static>(
 /// wedges that lock (the circular dependency this design resolves: the
 /// escape can't depend on a lock a stuck teardown holds). `target::apply`
 /// and `lockdown_state::set_enabled` are sync, so they run in
-/// `spawn_blocking`, mirroring `persist_target_off`'s existing pattern.
+/// `spawn_blocking`, the same pattern `ProxyManager::persist_session_event`
+/// uses.
 async fn handle_unblock<P: Proxy + 'static, R: Routing + 'static>(
     State(state): State<Arc<IpcState<P, R>>>,
 ) -> Result<Json<EmptyResponse>, (StatusCode, Json<ErrorResponse>)> {
@@ -942,11 +947,11 @@ async fn handle_stop<P: Proxy + 'static, R: Routing + 'static>(
     State(state): State<Arc<IpcState<P, R>>>,
 ) -> Result<Json<EmptyResponse>, (StatusCode, Json<ErrorResponse>)> {
     let mut pm = state.proxy.lock().await;
+    // `stop()` persists `Target::Off` internally (`stop_with`'s
+    // `persist_session_event`) before it tears anything down, so there is
+    // nothing left for this handler to persist afterward.
     match pm.stop().await {
-        Ok(()) => {
-            persist_target_off(&state).await;
-            Ok(Json(EmptyResponse {}))
-        }
+        Ok(()) => Ok(Json(EmptyResponse {})),
         Err(e) => {
             error!(error = %e, "proxy stop failed");
             Err((
@@ -954,24 +959,6 @@ async fn handle_stop<P: Proxy + 'static, R: Routing + 'static>(
                 Json(ErrorResponse { message: e.to_string() }),
             ))
         }
-    }
-}
-
-/// Persist `Target::Off` after a user-requested stop settles successfully —
-/// the `SessionEvent::UserStopped` transition (`target_after`), applied here
-/// rather than through the session-death path, since a clean user stop is not
-/// something `check_health` ever observes (Task 6 is the crash/give-up path).
-/// Same `spawn_blocking` + log-don't-fail discipline as
-/// [`persist_after_start`]: the stop already succeeded, so a persistence
-/// hiccup must not be reported back to the caller as a stop failure.
-async fn persist_target_off<P: Proxy, R: Routing>(state: &IpcState<P, R>) {
-    let state_dir = state.state_dir.clone();
-    let owner = state.owner;
-    let outcome = tokio::task::spawn_blocking(move || target::apply(&state_dir, owner, |_current| Target::Off)).await;
-    match outcome {
-        Ok(Ok(_)) => {}
-        Ok(Err(e)) => error!(error = %e, "failed to persist target after stop"),
-        Err(e) => error!(error = %e, "target-persistence task panicked"),
     }
 }
 
@@ -998,7 +985,11 @@ async fn handle_metrics<P: Proxy + 'static, R: Routing + 'static>(
     State(state): State<Arc<IpcState<P, R>>>,
 ) -> Json<MetricsResponse> {
     let mut pm = state.proxy.lock().await;
-    pm.check_health();
+    if let Some(event) = pm.check_health() {
+        if let Err(e) = pm.stop_with(event).await {
+            tracing::error!(error = %e, "error tearing down proxy after a failed health check");
+        }
+    }
     let filter = if pm.state() == ProxyState::Running {
         Some(hole_common::protocol::FilterMetrics::default())
     } else {

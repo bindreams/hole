@@ -17,9 +17,9 @@ fn service_description_is_set() {
 
 #[skuld::test]
 fn shutdown_reason_keys_on_marker() {
-    use crate::proxy_manager::StopReason;
-    assert_eq!(shutdown_reason(true), StopReason::Cutover);
-    assert_eq!(shutdown_reason(false), StopReason::UserStop);
+    use crate::target::SessionEvent;
+    assert_eq!(shutdown_reason(true), SessionEvent::CutoverRestart);
+    assert_eq!(shutdown_reason(false), SessionEvent::ProcessExiting);
 }
 
 #[skuld::test]
@@ -130,16 +130,19 @@ fn sweep_recheck_admits_an_indeterminate_marker_path() {
 }
 
 #[skuld::test]
-fn shutdown_reason_treats_an_indeterminate_marker_as_an_ordinary_stop() {
-    // Reporting Cutover here disarms the standing lockdown cover and leaves it
-    // armed with no bridge running to release it — a kill switch the user
-    // cannot turn off.
-    use crate::proxy_manager::StopReason;
+fn shutdown_reason_treats_an_indeterminate_marker_as_a_process_exit_not_a_user_stop() {
+    // Reporting CutoverRestart here would misattribute the shutdown to an
+    // update cutover that never happened; reporting UserStopped would wrongly
+    // move the target to `Off` on a plain machine shutdown. `ProcessExiting`
+    // leaves the target unchanged either way, so an indeterminate marker
+    // reads the same as an absent one: a clean exit, not a disarm-or-drop
+    // decision either kind of stop would make.
+    use crate::target::SessionEvent;
     let base = tempfile::tempdir().unwrap();
     let dir = unprobeable_log_dir(base.path());
     assert_eq!(
         shutdown_reason(hole_common::update_marker::is_present(&dir)),
-        StopReason::UserStop
+        SessionEvent::ProcessExiting
     );
 }
 

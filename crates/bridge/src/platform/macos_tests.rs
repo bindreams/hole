@@ -65,9 +65,9 @@ async fn serve_until_signal_returns_when_signal_fires() {
 
 #[skuld::test]
 fn shutdown_reason_keys_on_marker() {
-    use crate::proxy_manager::StopReason;
-    assert_eq!(shutdown_reason(true), StopReason::Cutover);
-    assert_eq!(shutdown_reason(false), StopReason::UserStop);
+    use crate::target::SessionEvent;
+    assert_eq!(shutdown_reason(true), SessionEvent::CutoverRestart);
+    assert_eq!(shutdown_reason(false), SessionEvent::ProcessExiting);
 }
 
 #[skuld::test]

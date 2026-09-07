@@ -980,9 +980,111 @@ fn check_health_detects_crashed_task() {
         // cloned `Arc<MockProxyState>` via `is_alive()`.
         state.crashed.store(true, Ordering::SeqCst);
 
-        pm.check_health();
+        let event = pm.check_health().expect("crashed task must report GaveUp");
+        pm.stop_with(event).await.unwrap();
         assert_eq!(pm.state(), ProxyState::Stopped);
         assert!(pm.last_error().unwrap().contains("unexpectedly"));
+    });
+}
+
+#[skuld::test]
+fn an_unexpected_death_moves_the_target_off() {
+    // `check_health`'s GaveUp event must run through the same
+    // `persist_session_event` path a user stop does, moving the target to
+    // `Off` — otherwise a reconciling boot would read a stale `Connected`
+    // and reconnect after a crash the user never asked to resume.
+    rt().block_on(async {
+        let proxy = MockProxy::new();
+        let proxy_state = proxy.state_handle();
+        let dir = tempfile::tempdir().unwrap();
+        let routing = MockRouting::new(dir.path().to_path_buf());
+        let mut pm = ProxyManager::new(proxy, routing).with_state_dir(dir.path().to_path_buf());
+        pm.start(&test_config()).await.unwrap();
+        target::save(
+            dir.path(),
+            &Target::Connected {
+                config: Box::new(test_config()),
+            },
+            None,
+        )
+        .unwrap();
+
+        proxy_state.crashed.store(true, Ordering::SeqCst);
+        let event = pm.check_health().expect("crashed task must report GaveUp");
+        pm.stop_with(event).await.unwrap();
+
+        assert_eq!(
+            target::load(dir.path()),
+            Target::Off,
+            "an unexpected death must move the target off, not leave it Connected"
+        );
+    });
+}
+
+#[skuld::test]
+fn an_unexpected_death_releases_the_cover_after_the_session() {
+    // Same teardown-ordering guarantee as a user stop
+    // (`user_stop_tears_down_routes_before_disengaging_the_lockdown_cover`),
+    // but driven by `check_health`'s GaveUp: the standing cover's persistent
+    // filters must still outlive the routes they cover on a crash, not just
+    // a clean stop.
+    rt().block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        let routing = MockRouting::new(dir.path().to_path_buf());
+        let st = routing.state();
+        let proxy = MockProxy::new();
+        let proxy_state = proxy.state_handle();
+        let (mut pm, _dir) = new_manager_with_lockdown(proxy, routing, dir, true);
+        pm.start(&test_config()).await.unwrap();
+
+        proxy_state.crashed.store(true, Ordering::SeqCst);
+        let event = pm.check_health().expect("crashed task must report GaveUp");
+        pm.stop_with(event).await.unwrap();
+
+        let order = st.teardown_order.lock().unwrap().clone();
+        assert_eq!(
+            order,
+            vec!["routes", "lockdown"],
+            "the standing cover's persistent filters must outlive the routes they cover, even on a crash"
+        );
+    });
+}
+
+#[skuld::test]
+fn an_unexpected_death_restores_dns() {
+    // `check_health`'s GaveUp path must run the same DNS teardown a clean
+    // stop does — otherwise a crash leaves the host still pointed at the
+    // (now-dead) in-TUN forwarder for its DNS.
+    rt().block_on(async {
+        let upstream = crate::test_support::socks5_dns_upstream::Socks5DnsUpstream::bind()
+            .await
+            .unwrap();
+        let dns = crate::test_support::mock_dns::MockDns::new();
+        let dns_state = dns.state_handle();
+
+        let dir = tempfile::tempdir().unwrap();
+        let routing = MockRouting::new(dir.path().to_path_buf());
+        let proxy = MockProxy::new();
+        let proxy_state = proxy.state_handle();
+        let (mut pm, _dir) = new_manager_with_dns(proxy, routing, dns, dir);
+
+        let mut config = test_config();
+        config.local_port = upstream.port();
+        config.dns.enabled = true;
+        config.dns.protocol = hole_common::config::DnsProtocol::PlainTcp;
+        config.dns.servers = vec![IpAddr::V4(Ipv4Addr::new(198, 51, 100, 53))];
+
+        pm.start(&config).await.unwrap();
+        assert_eq!(dns_state.calls().len(), 1, "Dns::apply must be called exactly once");
+
+        proxy_state.crashed.store(true, Ordering::SeqCst);
+        let event = pm.check_health().expect("crashed task must report GaveUp");
+        pm.stop_with(event).await.unwrap();
+
+        assert!(
+            dns_state.shutdown_called(),
+            "an unexpected death must still restore DNS, not just a clean stop"
+        );
     });
 }
 
@@ -997,7 +1099,8 @@ fn check_health_sets_path_free_death_reason() {
         pm.start(&test_config()).await.unwrap();
 
         state.crashed.store(true, Ordering::SeqCst);
-        pm.check_health();
+        let event = pm.check_health().expect("crashed task must report GaveUp");
+        pm.stop_with(event).await.unwrap();
 
         assert_eq!(
             pm.death_reason(),
@@ -1043,7 +1146,8 @@ fn restart_clears_prior_death_reason() {
         pm.start(&test_config()).await.unwrap();
 
         state.crashed.store(true, Ordering::SeqCst);
-        pm.check_health();
+        let event = pm.check_health().expect("crashed task must report GaveUp");
+        pm.stop_with(event).await.unwrap();
         assert_eq!(pm.death_reason(), Some(DEATH_REASON));
 
         state.crashed.store(false, Ordering::SeqCst);
@@ -1062,7 +1166,8 @@ fn stop_clears_death_reason() {
         pm.start(&test_config()).await.unwrap();
 
         state.crashed.store(true, Ordering::SeqCst);
-        pm.check_health();
+        let event = pm.check_health().expect("crashed task must report GaveUp");
+        pm.stop_with(event).await.unwrap();
         assert_eq!(pm.death_reason(), Some(DEATH_REASON));
 
         // A fresh start then a clean stop must leave no death reason behind.
@@ -1088,7 +1193,8 @@ fn check_health_clears_active_config_so_reload_restarts() {
 
         // Simulate crash.
         state.crashed.store(true, Ordering::SeqCst);
-        pm.check_health();
+        let event = pm.check_health().expect("crashed task must report GaveUp");
+        pm.stop_with(event).await.unwrap();
         assert_eq!(pm.state(), ProxyState::Stopped);
 
         // Un-crash so the next start succeeds.
@@ -1112,7 +1218,7 @@ fn check_health_does_not_mark_healthy_task_as_crashed() {
 
         // The mock's start spawns a 3600s sleep task — still healthy
         // after a short delay. check_health must NOT flip to Stopped.
-        pm.check_health();
+        assert_eq!(pm.check_health(), None);
         assert_eq!(pm.state(), ProxyState::Running);
 
         pm.stop().await.unwrap();
@@ -1478,7 +1584,7 @@ fn user_stop_tears_down_routes_before_disengaging_the_lockdown_cover() {
         let (mut pm, _dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, true);
         pm.start(&test_config()).await.unwrap();
 
-        pm.stop_with(StopReason::UserStop).await.unwrap();
+        pm.stop_with(SessionEvent::UserStopped).await.unwrap();
 
         let order = st.teardown_order.lock().unwrap().clone();
         assert_eq!(
@@ -1500,7 +1606,7 @@ fn stop_with_cutover_disarms_lockdown_but_user_stop_disengages() {
             let (mut pm, _dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, true);
             pm.start(&test_config()).await.unwrap();
 
-            pm.stop_with(StopReason::UserStop).await.unwrap();
+            pm.stop_with(SessionEvent::UserStopped).await.unwrap();
             assert_eq!(
                 st.lockdown_disengage_calls.load(Ordering::SeqCst),
                 1,
@@ -1513,11 +1619,24 @@ fn stop_with_cutover_disarms_lockdown_but_user_stop_disengages() {
             let dir = tempfile::tempdir().unwrap();
             let routing = MockRouting::new(dir.path().to_path_buf());
             let st = routing.state();
+            // Seed a `Connected` target: `cover_step`'s `Off` arm ignores
+            // intent and would release the cover regardless of `event`, so
+            // reaching the `Connected` arm's `Hold` (what a cutover needs)
+            // requires the target to already read `Connected` before the
+            // stop.
+            target::save(
+                dir.path(),
+                &Target::Connected {
+                    config: Box::new(test_config()),
+                },
+                None,
+            )
+            .unwrap();
             let (mut pm, _dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, true);
             pm.start(&test_config()).await.unwrap();
             assert_eq!(st.teardown_calls.load(Ordering::SeqCst), 0);
 
-            pm.stop_with(StopReason::Cutover).await.unwrap();
+            pm.stop_with(SessionEvent::CutoverRestart).await.unwrap();
             assert_eq!(
                 st.lockdown_disengage_calls.load(Ordering::SeqCst),
                 0,
@@ -2994,7 +3113,7 @@ mod self_test {
                 .unwrap_err();
             assert_eq!(st.cover_engage_calls.load(Ordering::SeqCst), 1);
             assert!(pm.blocked_until_connected());
-            pm.stop_with(StopReason::Cutover).await.unwrap();
+            pm.stop_with(SessionEvent::CutoverRestart).await.unwrap();
             assert_eq!(
                 st.cover_disengage_calls.load(Ordering::SeqCst),
                 0,
@@ -3010,7 +3129,7 @@ mod self_test {
             pm.start_cancellable(&cfg, true, CancellationToken::new())
                 .await
                 .unwrap_err();
-            pm.stop_with(StopReason::UserStop).await.unwrap();
+            pm.stop_with(SessionEvent::UserStopped).await.unwrap();
             assert_eq!(
                 st.cover_disengage_calls.load(Ordering::SeqCst),
                 1,
@@ -5393,7 +5512,7 @@ fn a_user_stop_that_dropped_a_standing_cover_clears_only_the_live_half() {
         pm.set_standing_cover_adopted(true);
         pm.start(&test_config()).await.unwrap();
 
-        pm.stop_with(StopReason::UserStop).await.unwrap();
+        pm.stop_with(SessionEvent::UserStopped).await.unwrap();
         assert_eq!(
             st.lockdown_disengage_calls.load(Ordering::SeqCst),
             1,
@@ -5424,8 +5543,20 @@ fn a_cutover_stop_keeps_the_claim() {
         let mut pm = ProxyManager::new(MockProxy::new(), routing).with_state_dir(dir.path().to_path_buf());
         pm.set_standing_cover_adopted(true);
         pm.start(&test_config()).await.unwrap();
+        // `cover_step`'s `Off` arm ignores intent outright, so reaching the
+        // `Connected` arm's `Hold` (what a cutover needs) requires the
+        // target to already read `Connected` — `start()` itself never
+        // persists it (that is `ipc::persist_after_start`'s job).
+        target::save(
+            dir.path(),
+            &Target::Connected {
+                config: Box::new(test_config()),
+            },
+            None,
+        )
+        .unwrap();
 
-        pm.stop_with(StopReason::Cutover).await.unwrap();
+        pm.stop_with(SessionEvent::CutoverRestart).await.unwrap();
         assert_eq!(
             st.lockdown_disengage_calls.load(Ordering::SeqCst),
             0,
@@ -5436,6 +5567,33 @@ fn a_cutover_stop_keeps_the_claim() {
             "the cover still holds the host, so the claim stands"
         );
         assert!(pm.standing_cover_expected());
+    });
+}
+
+#[skuld::test]
+fn a_cutover_leaves_the_persisted_target_connected() {
+    // `target_after`'s `CutoverRestart` arm is already proved pure in
+    // `target.rs`'s own tests; this proves the same thing through
+    // `ProxyManager::stop_with`'s integration with disk state — a cutover
+    // must not touch the persisted target at all, so the restarted bridge's
+    // boot-time reconciliation still finds `Connected` and resumes.
+    rt().block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        let routing = MockRouting::new(dir.path().to_path_buf());
+        let mut pm = ProxyManager::new(MockProxy::new(), routing).with_state_dir(dir.path().to_path_buf());
+        pm.start(&test_config()).await.unwrap();
+        let connected = Target::Connected {
+            config: Box::new(test_config()),
+        };
+        target::save(dir.path(), &connected, None).unwrap();
+
+        pm.stop_with(SessionEvent::CutoverRestart).await.unwrap();
+
+        assert_eq!(
+            target::load(dir.path()),
+            connected,
+            "a cutover restart must leave the persisted target untouched"
+        );
     });
 }
 
@@ -5513,7 +5671,8 @@ fn an_unexpected_session_death_retires_the_claim_too() {
         pm.start(&test_config()).await.unwrap();
 
         proxy_state.crashed.store(true, Ordering::SeqCst);
-        pm.check_health();
+        let event = pm.check_health().expect("crashed task must report GaveUp");
+        pm.stop_with(event).await.unwrap();
 
         assert_eq!(
             st.lockdown_disengage_calls.load(Ordering::SeqCst),
@@ -5547,7 +5706,7 @@ fn a_user_stop_whose_release_does_not_confirm_keeps_the_claim_and_the_escape() {
         pm.start(&test_config()).await.unwrap();
 
         st.fail_release.store(true, Ordering::SeqCst);
-        pm.stop_with(StopReason::UserStop).await.unwrap();
+        pm.stop_with(SessionEvent::UserStopped).await.unwrap();
 
         assert_eq!(
             st.release_all_calls.load(Ordering::SeqCst),
@@ -5580,7 +5739,8 @@ fn a_crashed_session_whose_release_does_not_confirm_keeps_the_claim() {
 
         st.fail_release.store(true, Ordering::SeqCst);
         proxy_state.crashed.store(true, Ordering::SeqCst);
-        pm.check_health();
+        let event = pm.check_health().expect("crashed task must report GaveUp");
+        pm.stop_with(event).await.unwrap();
 
         assert_eq!(
             st.release_all_calls.load(Ordering::SeqCst),
