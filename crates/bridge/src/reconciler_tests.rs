@@ -1,5 +1,5 @@
 use super::*;
-use hole_common::config::ServerEntry;
+use hole_common::config::{ServerEntry, StartupBehavior};
 use hole_common::protocol::TunnelMode;
 use std::sync::atomic::Ordering;
 
@@ -276,6 +276,123 @@ fn a_persisted_off_target_starts_nothing() {
     });
 }
 
+/// The persisted target records what the user last connected to; the startup
+/// preference records whether a boot is allowed to act on it. `DoNotConnect`
+/// is the direction that must not fail open: `SessionEvent::ProcessExiting`
+/// deliberately preserves a `Connected` target across a clean shutdown, so
+/// without this every reboot would reconnect — and, with the switch on, arm a
+/// fail-closed cover the user never asked for.
+#[skuld::test]
+fn a_do_not_connect_preference_overrides_a_persisted_connected_target() {
+    rt().block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        lockdown_state::set_enabled(dir.path(), true, None).unwrap();
+        target::save(dir.path(), &connectable(), None).unwrap();
+        target::save_startup_preference(
+            dir.path(),
+            &target::StartupPreference {
+                on_startup: StartupBehavior::DoNotConnect,
+                candidate: Some(Box::new(connectable_config())),
+            },
+            None,
+        )
+        .unwrap();
+
+        let routing = MockRouting::new(dir.path().to_path_buf());
+        let state = routing.state();
+        let pm = ProxyManager::new(MockProxy::new(), routing).with_state_dir(dir.path().to_path_buf());
+        let proxy = Arc::new(Mutex::new(pm));
+
+        reconcile_once(dir.path(), &proxy).await;
+
+        assert_eq!(
+            proxy.lock().await.state(),
+            ProxyState::Stopped,
+            "DoNotConnect must not start a session, whatever the persisted target says"
+        );
+        assert_eq!(
+            state.lockdown_engage_calls.load(Ordering::SeqCst),
+            0,
+            "DoNotConnect must not arm the standing cover either"
+        );
+        // The resolution is persisted, not merely applied in memory: the rest
+        // of this pass and every later transition read one value, and a
+        // restart cannot re-derive a different answer from a stale file.
+        assert_eq!(
+            target::load(dir.path()),
+            Target::Off,
+            "the resolved target must be written back, so the target file agrees with what was done"
+        );
+    });
+}
+
+/// The `AlwaysConnect` direction of the same wiring: the persisted target
+/// carries no config to connect to, and the candidate pushed alongside the
+/// preference is what supplies one.
+#[skuld::test]
+fn an_always_connect_preference_starts_the_candidate_over_an_off_target() {
+    rt().block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        target::save(dir.path(), &Target::Off, None).unwrap();
+        target::save_startup_preference(
+            dir.path(),
+            &target::StartupPreference {
+                on_startup: StartupBehavior::AlwaysConnect,
+                candidate: Some(Box::new(connectable_config())),
+            },
+            None,
+        )
+        .unwrap();
+
+        let routing = MockRouting::new(dir.path().to_path_buf());
+        let pm = ProxyManager::new(MockProxy::new(), routing).with_state_dir(dir.path().to_path_buf());
+        let proxy = Arc::new(Mutex::new(pm));
+
+        reconcile_once(dir.path(), &proxy).await;
+
+        assert_eq!(
+            proxy.lock().await.state(),
+            ProxyState::Running,
+            "AlwaysConnect must connect the pushed candidate when the persisted target is Off"
+        );
+        assert_eq!(
+            target::load(dir.path()),
+            connectable(),
+            "the substituted candidate must be written back as the target"
+        );
+    });
+}
+
+/// `RestoreLastState` is the default, and the two tests above would both pass
+/// against a `reconcile_once` that ignored the preference entirely if the
+/// default did anything other than pass the persisted target through.
+#[skuld::test]
+fn the_default_preference_leaves_the_persisted_target_untouched() {
+    rt().block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        target::save(dir.path(), &connectable(), None).unwrap();
+        // No preference file written at all — `load_startup_preference`
+        // reads `RestoreLastState` with no candidate.
+
+        let routing = MockRouting::new(dir.path().to_path_buf());
+        let pm = ProxyManager::new(MockProxy::new(), routing).with_state_dir(dir.path().to_path_buf());
+        let proxy = Arc::new(Mutex::new(pm));
+
+        reconcile_once(dir.path(), &proxy).await;
+
+        assert_eq!(
+            proxy.lock().await.state(),
+            ProxyState::Running,
+            "an absent preference must restore the persisted target"
+        );
+        assert_eq!(
+            target::load(dir.path()),
+            connectable(),
+            "RestoreLastState must not rewrite the target"
+        );
+    });
+}
+
 #[skuld::test]
 fn startup_recovery_runs_before_reconciliation() {
     rt().block_on(async {
@@ -343,17 +460,36 @@ fn cover_release_has_the_known_sanctioned_caller_set() {
     let pattern = regex::Regex::new(r"release_all_covers\s*\(").unwrap();
     let src_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
 
-    // (file suffix, line) for every caller reasoned about above. A real
-    // caller not on this list, or one of these lines moving/disappearing
-    // without the list being updated, both fail loud below.
-    let sanctioned: &[(&str, usize)] = &[
-        ("ipc.rs", 666),            // handle_unblock: deliberately bypasses `state.proxy.lock()`.
-        ("proxy_manager.rs", 752),  // turn_lockdown_off: the explicit off-toggle.
-        ("proxy_manager.rs", 2007), // apply_cover_step: session-teardown's own release, ordered after routes.
-        ("reconciler.rs", 231),     // Phase::Cover(CoverStep::Release): boot-time reconciliation.
+    // (file suffix, enclosing fn) for every caller reasoned about above.
+    //
+    // Keyed on the FUNCTION each call sits in, not the line it sits on. The
+    // invariant is which functions release covers; a line number is not it.
+    // Pinning lines meant any unrelated edit above a call site — a doc
+    // comment, a blank line, a `#[cfg]` — reddened this test with a
+    // diagnostic indistinguishable from a real new caller, which trains
+    // readers to treat its failures as routine busywork. The enclosing fn
+    // changes only when the caller set actually does.
+    let sanctioned: &[(&str, &str)] = &[
+        ("ipc.rs", "handle_unblock"),              // deliberately bypasses `state.proxy.lock()`.
+        ("proxy_manager.rs", "turn_lockdown_off"), // the explicit off-toggle.
+        ("proxy_manager.rs", "apply_cover_step"),  // session-teardown's own release, ordered after routes.
+        ("reconciler.rs", "reconcile_once"),       // Phase::Cover(CoverStep::Release): boot-time reconciliation.
     ];
 
-    let mut matches: Vec<(String, usize, String)> = Vec::new();
+    // The nearest `fn` declaration at or above a 1-indexed line — the
+    // function a call on that line belongs to.
+    fn enclosing_fn(text: &str, line_no: usize) -> String {
+        let decl = regex::Regex::new(r"\bfn\s+([A-Za-z_][A-Za-z0-9_]*)").unwrap();
+        text.lines()
+            .take(line_no)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .find_map(|l| decl.captures(l).map(|c| c[1].to_string()))
+            .unwrap_or_else(|| "<none>".to_string())
+    }
+
+    let mut matches: Vec<(String, usize, String, String)> = Vec::new();
     for entry in walkdir::WalkDir::new(&src_root) {
         let entry = entry.expect("failed to walk crates/bridge/src");
         if !entry.file_type().is_file() {
@@ -373,7 +509,12 @@ fn cover_release_has_the_known_sanctioned_caller_set() {
         let text = std::fs::read_to_string(path).expect("failed to read a walked source file");
         for (line_no, line) in text.lines().enumerate() {
             if pattern.is_match(line) {
-                matches.push((path.display().to_string(), line_no + 1, line.trim().to_string()));
+                matches.push((
+                    path.display().to_string(),
+                    line_no + 1,
+                    line.trim().to_string(),
+                    enclosing_fn(&text, line_no + 1),
+                ));
             }
         }
     }
@@ -387,27 +528,28 @@ fn cover_release_has_the_known_sanctioned_caller_set() {
             sanctioned.len(),
             matches.len()
         );
-        for (file, line_no, line) in &matches {
-            msg.push_str(&format!("  {file}:{line_no}: {line}\n"));
+        for (file, line_no, line, enclosing) in &matches {
+            msg.push_str(&format!("  {file}:{line_no} (in fn {enclosing}): {line}\n"));
         }
         msg.push_str(
             "A failure here means one of three things: a new, undocumented release path was added \
              (the real defect — add it to `sanctioned` above only after writing down, next to the \
              call, why it cannot route through one of the existing four), a sanctioned call moved \
-             lines (update `sanctioned` to match), or a comment/doc string in a walked file now \
-             quotes the pattern, which is a false positive and should be reworded.",
+             out of the function that owned it (update `sanctioned` to match), or a comment/doc \
+             string in a walked file now quotes the pattern, which is a false positive and \
+             should be reworded.",
         );
         msg
     };
 
     assert_eq!(matches.len(), sanctioned.len(), "{}", diagnostic());
-    for (file, line_no, _) in &matches {
+    for (file, line_no, _, enclosing) in &matches {
         let is_sanctioned = sanctioned
             .iter()
-            .any(|(suffix, line)| file.ends_with(suffix) && line == line_no);
+            .any(|(suffix, func)| file.ends_with(suffix) && func == enclosing);
         assert!(
             is_sanctioned,
-            "unsanctioned call site: {file}:{line_no}\n{}",
+            "unsanctioned call site: {file}:{line_no} in fn {enclosing}\n{}",
             diagnostic()
         );
     }

@@ -368,3 +368,94 @@ fn sigterm_resolves_shutdown_signal() {
         fut.await;
     });
 }
+
+/// A signal shutdown must not read as a user disconnect.
+///
+/// `stop()` is `stop_with(SessionEvent::UserStopped)`, which moves the target
+/// to `Off` — and an `Off` target is what `cover_step` turns into a cover
+/// `Release`. So the foreground bridge taking that path meant a SIGTERM both
+/// erased the reconnect target and opened the host, while the launchd and SCM
+/// paths (which route through `target::shutdown_reason`) did neither. This
+/// pins the foreground path to the same decision.
+#[skuld::test]
+fn a_signal_shutdown_preserves_the_reconnect_target() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let state_dir = tempfile::tempdir().unwrap();
+        // No update marker in the log dir, so `shutdown_reason` reads this as
+        // a clean process exit rather than a cutover.
+        let log_dir = tempfile::tempdir().unwrap();
+
+        let target = crate::target::Target::Connected {
+            config: Box::new(shutdown_test_config()),
+        };
+        crate::target::save(state_dir.path(), &target, None).unwrap();
+
+        let mut pm = ProxyManager::new(StubProxy, StubRouting::new(state_dir.path().to_path_buf()))
+            .with_state_dir(state_dir.path().to_path_buf());
+
+        super::stop_for_shutdown(&mut pm, log_dir.path()).await;
+
+        assert_eq!(
+            crate::target::load(state_dir.path()),
+            target,
+            "a signal shutdown must leave the persisted target intact — a user who asked for              reconnect-on-boot did not authorise a disconnect just because the process is exiting"
+        );
+    });
+}
+
+/// The control for the test above: the same setup, taking the path
+/// `run_inner` used to take, DOES erase the target. Without this the
+/// assertion above would still pass against a `Target::load` that never
+/// changed for any reason.
+#[skuld::test]
+fn a_user_stop_still_clears_the_reconnect_target() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let state_dir = tempfile::tempdir().unwrap();
+        let target = crate::target::Target::Connected {
+            config: Box::new(shutdown_test_config()),
+        };
+        crate::target::save(state_dir.path(), &target, None).unwrap();
+
+        let mut pm = ProxyManager::new(StubProxy, StubRouting::new(state_dir.path().to_path_buf()))
+            .with_state_dir(state_dir.path().to_path_buf());
+
+        pm.stop().await.unwrap();
+
+        assert_eq!(
+            crate::target::load(state_dir.path()),
+            crate::target::Target::Off,
+            "a user-initiated disconnect must still move the target to Off"
+        );
+    });
+}
+
+fn shutdown_test_config() -> hole_common::protocol::ProxyConfig {
+    use hole_common::config::{DnsConfig, ServerEntry};
+    use hole_common::protocol::TunnelMode;
+    hole_common::protocol::ProxyConfig {
+        server: ServerEntry {
+            id: "fg-shutdown".into(),
+            name: "fg-shutdown".into(),
+            server: "127.0.0.1".into(),
+            server_port: 8388,
+            password: "super-secret-password".into(),
+            method: "aes-256-gcm".into(),
+            plugin: None,
+            plugin_opts: None,
+            validation: None,
+        },
+        local_port: 1080,
+        tunnel_mode: TunnelMode::Full,
+        filters: Vec::new(),
+        dns: DnsConfig {
+            enabled: false,
+            ..DnsConfig::default()
+        },
+        proxy_socks5: true,
+        proxy_http: false,
+        local_port_http: 4074,
+        diagnostic_plugin_tap: false,
+    }
+}

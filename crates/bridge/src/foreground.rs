@@ -4,8 +4,10 @@ use std::path::Path;
 
 use tun_engine::routing::SystemRouting;
 
-use crate::proxy::ShadowsocksProxy;
+use crate::dns::system::Dns;
+use crate::proxy::{Proxy, ShadowsocksProxy};
 use crate::proxy_manager::ProxyManager;
+use tun_engine::routing::Routing;
 
 /// Run the bridge in foreground mode (for development).
 ///
@@ -232,11 +234,32 @@ async fn run_inner(
     }
 
     let mut pm = proxy_shutdown.lock().await;
-    if let Err(e) = pm.stop().await {
-        tracing::error!(error = %e, "error stopping proxy during shutdown");
-    }
+    stop_for_shutdown(&mut pm, log_dir).await;
 
     Ok(())
+}
+
+/// Tear the session down on the way out of the process.
+///
+/// Takes [`crate::target::shutdown_reason`], the same decision the launchd and
+/// SCM service paths take, rather than plain `stop()`. `stop()` is
+/// `stop_with(SessionEvent::UserStopped)`, and `UserStopped` is reserved for a
+/// real user-initiated disconnect: it moves the target to `Off` and, via
+/// `cover_step`, releases a live standing cover. Reporting it here would mean a
+/// SIGTERM to a foreground bridge both erased the reconnect target and opened
+/// the host — the two outcomes `SessionEvent::ProcessExiting` exists to prevent.
+/// `cutover::os::macos`'s module doc names this path as the one a macOS cutover
+/// restart rides, so it must also be able to report `CutoverRestart`.
+pub(crate) async fn stop_for_shutdown<P, R, D>(pm: &mut ProxyManager<P, R, D>, log_dir: &Path)
+where
+    P: Proxy,
+    R: Routing,
+    D: Dns,
+{
+    let event = crate::target::shutdown_reason(hole_common::update_marker::is_present(log_dir));
+    if let Err(e) = pm.stop_with(event).await {
+        tracing::error!(error = %e, "error stopping proxy during shutdown");
+    }
 }
 
 #[cfg(test)]

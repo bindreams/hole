@@ -16,13 +16,6 @@ fn service_description_is_set() {
 }
 
 #[skuld::test]
-fn shutdown_reason_keys_on_marker() {
-    use crate::target::SessionEvent;
-    assert_eq!(shutdown_reason(true), SessionEvent::CutoverRestart);
-    assert_eq!(shutdown_reason(false), SessionEvent::ProcessExiting);
-}
-
-#[skuld::test]
 fn post_bind_sweep_clears_marker() {
     let dir = tempfile::tempdir().unwrap();
     hole_common::update_marker::write(dir.path(), &super::test_marker(), None).unwrap();
@@ -141,7 +134,7 @@ fn shutdown_reason_treats_an_indeterminate_marker_as_a_process_exit_not_a_user_s
     let base = tempfile::tempdir().unwrap();
     let dir = unprobeable_log_dir(base.path());
     assert_eq!(
-        shutdown_reason(hole_common::update_marker::is_present(&dir)),
+        crate::target::shutdown_reason(hole_common::update_marker::is_present(&dir)),
         SessionEvent::ProcessExiting
     );
 }

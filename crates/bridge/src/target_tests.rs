@@ -442,3 +442,12 @@ fn every_session_event_over_an_unreadable_target_is_defined() {
         Target::Unreadable
     );
 }
+
+/// Both process-exit paths (`platform::{windows,macos}`'s service shutdown and
+/// `foreground::stop_for_shutdown`) route through this one decision, so it is
+/// tested here once rather than once per platform module.
+#[skuld::test]
+fn shutdown_reason_keys_on_marker() {
+    assert_eq!(shutdown_reason(true), SessionEvent::CutoverRestart);
+    assert_eq!(shutdown_reason(false), SessionEvent::ProcessExiting);
+}

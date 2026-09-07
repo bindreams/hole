@@ -210,15 +210,66 @@ pub fn step_order(cover: CoverStep, tunnel: TunnelStep) -> [Phase; 2] {
 /// exist. The `covered = true` argument to `start_cancellable` is what holds
 /// a loopback+server transient cover across that connect window when the
 /// lockdown intent is off, per this plan's "R2 follow-on" resolution.
+/// Fold the GUI-pushed startup preference into the persisted target, and
+/// write the result back before anything else reads it.
+///
+/// The persisted target records *what* the user last connected to; the
+/// preference records *whether* a boot may act on it. Both are needed, and
+/// applying the preference here — rather than at each reader — is what keeps
+/// reconciliation single-input: [`cover_step`] and [`tunnel_step`] below see
+/// one already-decided [`Target`], not a target plus a modifier they would
+/// each have to combine identically.
+///
+/// The resolution is persisted rather than kept in memory so the file agrees
+/// with what was actually done: a `DoNotConnect` boot leaves `Off` on disk,
+/// and an `AlwaysConnect` boot that substituted the pushed candidate leaves
+/// that config. A later transition then reads one value instead of
+/// re-deriving a different answer from a stale file.
+///
+/// A failed *write* is not a reason to ignore the preference — the resolved
+/// value is still returned and honoured for this pass, and only the
+/// persistence is lost.
+async fn resolve_and_persist_startup_target(state_dir: &Path, owner: Option<(u32, u32)>) -> Target {
+    let dir = state_dir.to_path_buf();
+    // `load_startup_preference` and `apply` are both sync, and `apply` takes
+    // the `TargetExclusive` file lock — the same reason `ipc::persist_after_start`
+    // runs its pair of them off the runtime.
+    tokio::task::spawn_blocking(move || {
+        let pref = target::load_startup_preference(&dir);
+        let behavior = pref.on_startup;
+        let candidate = pref.candidate.clone();
+        match target::apply(&dir, owner, move |persisted| {
+            target::resolve_startup_target(persisted, behavior, candidate)
+        }) {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    "reconcile_once: could not persist the resolved startup target; honouring it for this boot only"
+                );
+                target::resolve_startup_target(target::load(&dir), pref.on_startup, pref.candidate)
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|error| {
+        // A panicked blocking task leaves the preference unknown. `Unreadable`
+        // is the lean that authorises neither starting nor stopping, matching
+        // `tunnel_step`'s treatment of an unreadable target file.
+        tracing::warn!(%error, "reconcile_once: startup-target resolution failed; treating the target as unreadable");
+        Target::Unreadable
+    })
+}
+
 pub async fn reconcile_once<P, R, D>(state_dir: &Path, proxy: &Arc<Mutex<ProxyManager<P, R, D>>>)
 where
     P: Proxy,
     R: Routing,
     D: Dns,
 {
-    let target = target::load(state_dir);
-
     let mut pm = proxy.lock().await;
+    let target = resolve_and_persist_startup_target(state_dir, pm.state_owner()).await;
+
     let intent = pm.effective_lockdown_intent();
     let presence = pm.cover_presence();
     let session_live = pm.state() == ProxyState::Running;

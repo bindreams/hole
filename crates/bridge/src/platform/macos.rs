@@ -280,7 +280,7 @@ pub fn run(
         // event differs, distinguishing an update cutover from a plain
         // machine shutdown for anyone reading the log/history.
         let mut pm = proxy_shutdown.lock().await;
-        let event = shutdown_reason(hole_common::update_marker::is_present(log_dir));
+        let event = crate::target::shutdown_reason(hole_common::update_marker::is_present(log_dir));
         if let Err(e) = pm.stop_with(event).await {
             tracing::error!(error = %e, "error stopping proxy during shutdown");
         }
@@ -288,19 +288,6 @@ pub fn run(
         Ok::<(), Box<dyn std::error::Error>>(())
     })?;
     Ok(())
-}
-
-/// Map an update-in-progress marker's presence to the session event: present
-/// means a cutover is mid-flight (`SessionEvent::CutoverRestart`); absent
-/// means a clean machine shutdown (`SessionEvent::ProcessExiting`) — neither
-/// is `UserStopped`, which is reserved for an actual user-initiated
-/// disconnect. Pure so the decision is table-testable.
-pub(crate) fn shutdown_reason(marker_present: bool) -> crate::target::SessionEvent {
-    if marker_present {
-        crate::target::SessionEvent::CutoverRestart
-    } else {
-        crate::target::SessionEvent::ProcessExiting
-    }
 }
 
 /// Clear a stale update-in-progress marker on the new bridge's post-bind sweep.

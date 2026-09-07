@@ -1,11 +1,10 @@
 //! IPC server — HTTP/1.1 REST API over local Unix domain socket.
 
-use tun_engine::routing::failclosed::lockdown_state::{self, Intent};
-use tun_engine::routing::Routing;
+use tun_engine::routing::failclosed::lockdown_state;
+use tun_engine::routing::{CoverPresence, Routing};
 
 use crate::proxy::{Proxy, ProxyError};
 use crate::proxy_manager::{ProxyManager, ProxyState};
-use crate::reconciler::{cover_step, CoverStep};
 use crate::server_test::{run_server_test, TestConfig};
 use crate::socket::LocalListener;
 use crate::target::{self, Target};
@@ -661,8 +660,18 @@ async fn handle_unblock<P: Proxy + 'static, R: Routing + 'static>(
         }
     }
 
+    // Gated on the presence itself, NOT on `cover_step`. `cover_step` holds on
+    // `CoverPresence::Unreachable` because a reconciliation pass that cannot
+    // measure the firewall must not act on it — but this is not a
+    // reconciliation pass, it is the user's one way out of a host held closed.
+    // `CoverPresence`'s wire contract (`crates/common/api/openapi.yaml`) states
+    // that every escape-offering site must treat `unreachable` and
+    // `indeterminate` like `live`, never like `absent`, and `tray::escape_items`
+    // offers the Unblock action for exactly those. Deferring to `cover_step`
+    // here answered 200 having attempted nothing. `Absent` is the one presence
+    // that positively reports nothing to release, and stays a no-op.
     let presence = state.routing.lockdown_cover_presence();
-    if cover_step(Intent::Off, presence, &Target::Off) == CoverStep::Release {
+    if presence != CoverPresence::Absent {
         if let Err(e) = state.routing.release_all_covers() {
             error!(error = %e, "unblock: release failed");
             return Err((

@@ -515,6 +515,26 @@ pub enum SessionEvent {
     ProcessExiting,
 }
 
+/// Map an update-in-progress marker's presence to the session event a
+/// process-exit path must report: present means a cutover is mid-flight
+/// ([`SessionEvent::CutoverRestart`]); absent means a clean machine shutdown
+/// ([`SessionEvent::ProcessExiting`]). Neither is [`SessionEvent::UserStopped`],
+/// which is reserved for an actual user-initiated disconnect.
+///
+/// Lives here, beside [`SessionEvent`], rather than once per platform module.
+/// It was previously duplicated byte-for-byte in `platform::windows` and
+/// `platform::macos`, and the copy each of them had is exactly why the third
+/// exit path — `foreground::run_inner` — was left calling plain `stop()`
+/// (`UserStopped`) instead: there was no shared thing for it to reach for.
+/// Every process-exit path takes this one.
+pub(crate) fn shutdown_reason(marker_present: bool) -> SessionEvent {
+    if marker_present {
+        SessionEvent::CutoverRestart
+    } else {
+        SessionEvent::ProcessExiting
+    }
+}
+
 /// The single pure decision: given the current target and a named cause,
 /// what should the target become? Exhaustive over both axes (no wildcard
 /// arm) so a new `SessionEvent` variant, or a new `Target` variant, is a

@@ -378,8 +378,8 @@ fn mock_proxy_with_cover_presence(
 /// routing's `release_all_calls` / `fail_release` handles (cloned out BEFORE
 /// `routing` moves into the manager, mirroring `mock_proxy_with_traffic`), so
 /// a test can assert the escape fired and drive a failure. Presence defaults
-/// to `Live` — the escape is now gated on `cover_step`, so a test exercising
-/// `release_all_covers` needs a presence that actually calls for a release.
+/// to `Live` — the escape is gated on the probed presence, so a test
+/// exercising `release_all_covers` needs one that is not `Absent`.
 #[allow(clippy::type_complexity)]
 fn mock_proxy_with_release_state() -> (
     Arc<Mutex<ProxyManager<MockProxy, MockRouting>>>,
@@ -393,6 +393,23 @@ fn mock_proxy_with_release_state() -> (
     let fail_release = Arc::clone(&routing.fail_release);
     let pm = ProxyManager::new(MockProxy::new(), routing).with_state_dir(state_dir.clone());
     (Arc::new(Mutex::new(pm)), release_all_calls, fail_release, state_dir)
+}
+
+/// `mock_proxy_with_release_state` with the OS cover probe pinned to a chosen
+/// presence, for the escape's "cannot measure the firewall" cases.
+#[allow(clippy::type_complexity)]
+fn mock_proxy_with_presence(
+    presence: tun_engine::routing::CoverPresence,
+) -> (
+    Arc<Mutex<ProxyManager<MockProxy, MockRouting>>>,
+    Arc<AtomicU32>,
+    PathBuf,
+) {
+    let state_dir = tempfile::tempdir().unwrap().keep();
+    let routing = MockRouting::new(state_dir.clone()).with_cover_presence(presence);
+    let release_all_calls = Arc::clone(&routing.release_all_calls);
+    let pm = ProxyManager::new(MockProxy::new(), routing).with_state_dir(state_dir.clone());
+    (Arc::new(Mutex::new(pm)), release_all_calls, state_dir)
 }
 
 /// `mock_proxy` variant that also hands back the mock's traffic counters
@@ -2702,4 +2719,71 @@ async fn an_outgoing_error_carrying_the_address_is_redacted() {
         "the toast would have carried the address: {wire}"
     );
     assert!(wire.contains(&token), "the outgoing error lost its token: {wire}");
+}
+
+/// An unreachable firewall probe means "cannot tell", not "nothing there".
+///
+/// `cover_step` holds on `Unreachable` because a reconciliation pass that
+/// cannot measure the firewall must not act on it. The escape is not a
+/// reconciliation pass — it is the user's one way out of a host held closed,
+/// and `CoverPresence`'s own wire contract says every escape-offering site
+/// must treat `unreachable` like `live`, never like `absent`. The tray offers
+/// the Unblock item for exactly this presence, so an escape that released
+/// nothing and still answered 200 would report success having done nothing,
+/// with no path onward to `hole bridge unlock`.
+#[skuld::test]
+fn unblock_attempts_a_release_when_the_probe_is_unreachable() {
+    rt().block_on(async {
+        let path = test_socket_path("unblock-unreachable");
+        let (proxy, release_all_calls, dir) =
+            mock_proxy_with_presence(tun_engine::routing::CoverPresence::Unreachable);
+        let server = IpcServer::bind_with_dirs(&path, proxy, "test", dir.clone(), dir.clone(), None).unwrap();
+        let handle = tokio::spawn(async move {
+            server.run_once().await.unwrap();
+        });
+
+        let mut client = TestClient::connect(&path).await;
+        let resp = post_unblock(&mut client).await;
+        assert_eq!(resp.status(), 200, "the escape never refuses");
+        let _ = resp.into_body().collect().await;
+        assert_eq!(
+            release_all_calls.load(Ordering::SeqCst),
+            1,
+            "an unreachable probe must still attempt the release — reporting success without              having tried is the lock-the-user-out failure the escape exists to prevent"
+        );
+
+        drop(client);
+        handle.abort();
+        let _ = handle.await;
+    });
+}
+
+/// The other side of the same gate: a probe that positively reports no cover
+/// is the one case with genuinely nothing to release, and must stay a no-op.
+/// Without this, "attempt the release whenever the probe is not Live" and
+/// "attempt it unconditionally" would be indistinguishable.
+#[skuld::test]
+fn unblock_releases_nothing_when_the_probe_reports_absent() {
+    rt().block_on(async {
+        let path = test_socket_path("unblock-absent");
+        let (proxy, release_all_calls, dir) = mock_proxy_with_presence(tun_engine::routing::CoverPresence::Absent);
+        let server = IpcServer::bind_with_dirs(&path, proxy, "test", dir.clone(), dir.clone(), None).unwrap();
+        let handle = tokio::spawn(async move {
+            server.run_once().await.unwrap();
+        });
+
+        let mut client = TestClient::connect(&path).await;
+        let resp = post_unblock(&mut client).await;
+        assert_eq!(resp.status(), 200);
+        let _ = resp.into_body().collect().await;
+        assert_eq!(
+            release_all_calls.load(Ordering::SeqCst),
+            0,
+            "a confirmed-absent cover leaves nothing to release"
+        );
+
+        drop(client);
+        handle.abort();
+        let _ = handle.await;
+    });
 }
