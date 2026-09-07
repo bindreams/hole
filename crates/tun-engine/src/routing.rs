@@ -1348,13 +1348,16 @@ where
 /// `Routing::Cover` associated type, and an inherent method is not callable
 /// through that type parameter.
 pub trait CoverGuard {
-    /// Persist the underlying filters without disengaging: consume the guard so
-    /// its `Drop` (the disengage) never runs.
+    /// Persist the underlying filters without disengaging: consume the guard,
+    /// suppressing the disengage its `Drop` would otherwise perform.
     ///
-    /// PRECONDITION: call only immediately before process exit. Skipping `Drop`
-    /// also skips releasing the guard's other resources (e.g. the Windows WFP
-    /// engine handle), which the kernel reclaims on exit but which a long-lived
-    /// caller would leak per call.
+    /// Suppresses the *disengage* only. The guard still releases its own
+    /// resources — on Windows, the FWPM engine handle, whose close does not
+    /// disturb the persistent filters. So this is safe for a long-lived
+    /// caller, and both callers are: a cutover restart disarms so the new
+    /// bridge can re-adopt the cover, and `ProxyManager::apply_cover_step`
+    /// disarms on a `CoverStep::Hold` so the host stays covered across the
+    /// stop + start a structural reload takes.
     fn disarm(self);
 }
 

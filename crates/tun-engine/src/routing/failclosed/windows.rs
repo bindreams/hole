@@ -503,10 +503,28 @@ enum CoverKind {
     Lockdown,
 }
 
-/// WFP-backed cover guard. Drop deletes the filters it installed by GUID.
+/// WFP-backed cover guard. Drop deletes the filters it installed by GUID,
+/// unless [`Cover::disarm`] left them standing.
 pub struct Cover {
     engine: HANDLE,
     kind: CoverKind,
+    /// Set by [`Cover::disarm`]: leave the installed filters in force and
+    /// release only this guard's own resources.
+    disarmed: bool,
+}
+
+impl Cover {
+    /// Leave the cover's filters installed and release only what this guard
+    /// itself owns.
+    ///
+    /// A flag read by `Drop`, not a `mem::forget`: forgetting the guard would
+    /// also skip closing the FWPM engine handle, which is this process's
+    /// resource and has nothing to do with whether the filters stand. The
+    /// filters are persistent-by-design (owned by the provider, not the
+    /// engine session), so closing the handle does not disturb them.
+    pub(crate) fn disarm(mut self) {
+        self.disarmed = true;
+    }
 }
 
 // SAFETY: the FWPM engine handle is owned exclusively by this guard and only
@@ -591,6 +609,7 @@ pub fn engage(
         Ok(Cover {
             engine,
             kind: CoverKind::Transient,
+            disarmed: false,
         })
     }
 }
@@ -639,6 +658,7 @@ pub fn engage_lockdown(
         Ok(Cover {
             engine,
             kind: CoverKind::Lockdown,
+            disarmed: false,
         })
     }
 }
@@ -938,26 +958,34 @@ unsafe fn add_filter(engine: HANDLE, provider: GUID, sublayer: GUID, f: &FilterS
 impl Drop for Cover {
     fn drop(&mut self) {
         unsafe {
-            match self.kind {
-                // Transient: today's full sweep (filters + sublayer + provider).
-                CoverKind::Transient => delete_all(self.engine),
-                // Lockdown: delete only the lockdown + App-ID filters; the
-                // shared sublayer/provider are owned by the transient sweep.
-                // A user stop RELIES on this Drop to open the host, and Drop
-                // cannot return an error, so a code that is neither success nor
-                // not-found is warned: silence there is indistinguishable from
-                // a clean release.
-                #[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
-                CoverKind::Lockdown => {
-                    let codes: Vec<(&'static str, u32)> = swept_lockdown_guids()
-                        .into_iter()
-                        .map(|g| ("lockdown filter", FwpmFilterDeleteByKey0(self.engine, &g)))
-                        .collect();
-                    if let Some(e) = first_delete_failure(&codes) {
-                        tracing::warn!(error = %e, "lockdown cover release left a filter installed; egress may still be blocked");
+            // A disarmed guard leaves the filters standing (a cutover restart
+            // re-adopts them, and a `CoverStep::Hold` across a reload keeps
+            // the host covered) but still closes the engine handle below.
+            if !self.disarmed {
+                match self.kind {
+                    // Transient: today's full sweep (filters + sublayer + provider).
+                    CoverKind::Transient => delete_all(self.engine),
+                    // Lockdown: delete only the lockdown + App-ID filters; the
+                    // shared sublayer/provider are owned by the transient sweep.
+                    // A user stop RELIES on this Drop to open the host, and Drop
+                    // cannot return an error, so a code that is neither success nor
+                    // not-found is warned: silence there is indistinguishable from
+                    // a clean release.
+                    #[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
+                    CoverKind::Lockdown => {
+                        let codes: Vec<(&'static str, u32)> = swept_lockdown_guids()
+                            .into_iter()
+                            .map(|g| ("lockdown filter", FwpmFilterDeleteByKey0(self.engine, &g)))
+                            .collect();
+                        if let Some(e) = first_delete_failure(&codes) {
+                            tracing::warn!(error = %e, "lockdown cover release left a filter installed; egress may still be blocked");
+                        }
                     }
                 }
             }
+            // Unconditional: the engine handle is this guard's own resource,
+            // and leaking one per disarm was how a structural reload under
+            // lockdown leaked a kernel handle per edit.
             #[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
             let rc = FwpmEngineClose0(self.engine);
             if rc != ERROR_SUCCESS.0 {

@@ -227,6 +227,23 @@ pub struct Cover {
     token: String,
     state_dir: std::path::PathBuf,
     kind: CoverKind,
+    /// Set by [`Cover::disarm`]: leave the pf ruleset and the pf enable
+    /// reference in force, and skip the disengage.
+    disarmed: bool,
+}
+
+impl Cover {
+    /// Leave the cover's pf state in force and release only what this guard
+    /// itself owns.
+    ///
+    /// A flag read by `Drop`, not a `mem::forget`, so the guard's own heap
+    /// fields still deallocate — the same shape as the Windows guard, whose
+    /// engine handle must be closed here. macOS has no comparable handle: the
+    /// pf enable reference is kernel state keyed by a token, and keeping it is
+    /// the whole point of disarming, since pf must stay enabled across the gap.
+    pub(crate) fn disarm(mut self) {
+        self.disarmed = true;
+    }
 }
 
 pub fn engage(
@@ -280,11 +297,15 @@ pub fn engage(
         token,
         state_dir: state_dir.to_owned(),
         kind: CoverKind::Transient,
+        disarmed: false,
     })
 }
 
 impl Drop for Cover {
     fn drop(&mut self) {
+        if self.disarmed {
+            return;
+        }
         match self.kind {
             // A user-stop drop never has a standing cover being adopted.
             CoverKind::Transient => disengage(&self.token, &self.state_dir, false),
@@ -518,6 +539,7 @@ pub fn engage_lockdown(
         token,
         state_dir: state_dir.to_owned(),
         kind: CoverKind::Lockdown,
+        disarmed: false,
     })
 }
 

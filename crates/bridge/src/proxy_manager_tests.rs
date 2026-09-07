@@ -226,6 +226,8 @@ pub(crate) struct MockRoutingState {
     /// What `lockdown_cover_presence` reports — a test's stand-in for the OS
     /// probe, settable independently of whether any session is running.
     pub(crate) cover_presence: std::sync::Mutex<tun_engine::routing::CoverPresence>,
+    /// How many cover guards were disarmed rather than disengaged.
+    pub(crate) cover_disarm_calls: AtomicU32,
 }
 
 impl Default for MockRoutingState {
@@ -254,6 +256,7 @@ impl Default for MockRoutingState {
             fail_routes_for: std::sync::Mutex::new(std::collections::HashSet::new()),
             last_teardown_installed: std::sync::Mutex::new(None),
             cover_presence: std::sync::Mutex::new(tun_engine::routing::CoverPresence::Absent),
+            cover_disarm_calls: AtomicU32::new(0),
         }
     }
 }
@@ -454,6 +457,7 @@ impl Routing for MockRouting {
         Ok(MockCover {
             state: Arc::clone(&self.state),
             lockdown: false,
+            disarmed: false,
         })
     }
 
@@ -474,6 +478,7 @@ impl Routing for MockRouting {
         Ok(MockCover {
             state: Arc::clone(&self.state),
             lockdown: true,
+            disarmed: false,
         })
     }
 
@@ -528,15 +533,22 @@ pub(crate) struct MockCover {
     /// fail-closed cover) — selects which disengage counter Drop bumps, mirroring
     /// the kind-aware `failclosed::Cover`.
     lockdown: bool,
+    /// Set by `disarm`, mirroring `failclosed::Cover`'s own flag: `Drop` still
+    /// runs and releases the guard's resources, it just skips the disengage.
+    disarmed: bool,
 }
 
 impl Drop for MockCover {
     fn drop(&mut self) {
+        if self.disarmed {
+            self.state.cover_disarm_calls.fetch_add(1, Ordering::SeqCst);
+            return;
+        }
         if self.lockdown {
             self.state.lockdown_disengage_calls.fetch_add(1, Ordering::SeqCst);
             self.state.teardown_order.lock().unwrap().push("lockdown");
             // Mirrors the real OS: an actual disengage (not `disarm`, which
-            // `mem::forget`s this guard and never runs `Drop`) is what a
+            // returns above and leaves the filters standing) is what a
             // subsequent `lockdown_cover_presence` probe would no longer find
             // — UNLESS this Drop's own disengage attempt is simulated as
             // failing to confirm too (`fail_lockdown_disengage_on_drop`).
@@ -550,11 +562,13 @@ impl Drop for MockCover {
 }
 
 impl tun_engine::routing::CoverGuard for MockCover {
-    /// Mirror `failclosed::Cover::disarm`: consume the guard without running
-    /// `Drop`, so the disengage counter does NOT move — the cutover persists the
-    /// cover instead of disengaging it.
-    fn disarm(self) {
-        std::mem::forget(self);
+    /// Mirror `failclosed::Cover::disarm`: flag the guard so `Drop` skips the
+    /// disengage, leaving the cover standing and the disengage counter still.
+    /// A flag rather than `mem::forget` for the same reason the real guard
+    /// uses one — a forgotten guard never releases its own resources either,
+    /// which on Windows leaked an FWPM engine handle per call.
+    fn disarm(mut self) {
+        self.disarmed = true;
     }
 }
 
@@ -6030,6 +6044,65 @@ fn a_restarting_reload_records_the_config_it_restarted_into() {
                 config: Box::new(edited)
             },
             "a restarting reload must persist the config it restarted into"
+        );
+    });
+}
+
+/// A structural reload under lockdown holds the cover across the gap, and
+/// disarms rather than disengages it.
+///
+/// `reload`'s slow path is `stop_with(Blipped)` + `start`, and `Blipped`
+/// leaves the target `Connected`, so `cover_step` returns `Hold` and
+/// `apply_cover_step` disarms the guard. That is the intended behaviour — the
+/// alternative briefly opens the host on every edit — but it means `disarm`
+/// runs on a long-lived path, not just at process exit. It used to be a
+/// `mem::forget`, which skipped the guard's own teardown too and leaked an
+/// FWPM engine handle per structural edit; the guard now flags itself and lets
+/// `Drop` release its resources while leaving the filters standing.
+///
+/// What this pins is the manager-side half: the host stays covered, and the
+/// disengage never runs. The handle close itself is unconditional in the
+/// platform guard's `Drop` and has no seam this suite can observe.
+#[skuld::test]
+fn a_structural_reload_under_lockdown_disarms_the_cover_rather_than_disengaging_it() {
+    rt().block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        lockdown_state::set_enabled(dir.path(), true, None).unwrap();
+        let routing = MockRouting::new(dir.path().to_path_buf());
+        let state = routing.state();
+        let mut pm = ProxyManager::new(MockProxy::new(), routing).with_state_dir(dir.path().to_path_buf());
+        pm.start(&test_config()).await.unwrap();
+        assert_eq!(
+            state.lockdown_engage_calls.load(Ordering::SeqCst),
+            1,
+            "setup: the standing cover must be engaged"
+        );
+
+        // `local_port` is structural, so this takes the stop + start path.
+        let mut edited = test_config();
+        edited.local_port += 1;
+        pm.reload(&edited).await.unwrap();
+
+        assert_eq!(
+            state.lockdown_disengage_calls.load(Ordering::SeqCst),
+            0,
+            "a Blipped reload must never disengage the standing cover — that opens the host mid-edit"
+        );
+        assert_eq!(
+            state.cover_disarm_calls.load(Ordering::SeqCst),
+            1,
+            "the held guard must be disarmed, which is what releases its own resources \
+             while leaving the filters standing"
+        );
+        assert_eq!(
+            state.release_all_calls.load(Ordering::SeqCst),
+            0,
+            "nor may it take the unconditional escape"
+        );
+        assert_eq!(
+            pm.cover_presence(),
+            tun_engine::routing::CoverPresence::Live,
+            "the host must stay covered across the reload"
         );
     });
 }

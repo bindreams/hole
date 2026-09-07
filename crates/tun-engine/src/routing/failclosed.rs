@@ -78,21 +78,26 @@ mod platform;
 /// coordinator can hold it across `.await`.
 ///
 /// Opaque wrapper over the private `platform::Cover` (the platform module can't
-/// be named by `#[cfg]`-free callers). `_inner` is held only for its `Drop`,
-/// which does the disengage — no explicit `Drop for Cover` needed.
+/// be named by `#[cfg]`-free callers). `_inner` is held for its `Drop`, which
+/// does the disengage — no explicit `Drop for Cover` needed — and for its
+/// `disarm`, which suppresses only that disengage.
 pub struct Cover {
     _inner: platform::Cover,
 }
 
 impl crate::routing::CoverGuard for Cover {
-    /// Persist the underlying filters without disengaging: consumes the guard so
-    /// its `Drop` does not run. The filters are persistent-by-design, so leaving
-    /// them in force across a cutover restart is exactly correct — the new
-    /// bridge re-adopts them. Forgetting the inner guard also skips its other
-    /// teardown (the Windows WFP engine handle close), so call only immediately
-    /// before process exit (see [`CoverGuard::disarm`]).
+    /// Persist the underlying filters without disengaging. The filters are
+    /// persistent-by-design, so leaving them in force — across a cutover
+    /// restart, or across the stop + start a structural reload takes — is
+    /// exactly correct: the next start re-adopts them.
+    ///
+    /// Delegates to the platform guard, which flags itself and lets `Drop`
+    /// run, rather than `mem::forget`ting it. Forgetting skipped the guard's
+    /// own teardown too — on Windows the FWPM engine handle close — which is
+    /// why this used to carry a "call only immediately before process exit"
+    /// precondition. It no longer does, and no caller needs to be at exit.
     fn disarm(self) {
-        std::mem::forget(self._inner);
+        self._inner.disarm();
     }
 }
 
