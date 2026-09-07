@@ -339,7 +339,7 @@ fn startup_recovery_runs_before_reconciliation() {
 /// release path was added outside the four reasoned-about sites — the exact
 /// kind of divergent teardown route this stage collapses cover-release onto.
 #[skuld::test]
-fn release_all_covers_callers_are_the_known_sanctioned_set() {
+fn cover_release_has_the_known_sanctioned_caller_set() {
     let pattern = regex::Regex::new(r"release_all_covers\s*\(").unwrap();
     let src_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
 
@@ -380,7 +380,7 @@ fn release_all_covers_callers_are_the_known_sanctioned_set() {
 
     let diagnostic = || {
         let mut msg = format!(
-            "release_all_covers_callers_are_the_known_sanctioned_set: pattern `{}` must match \
+            "cover_release_has_the_known_sanctioned_caller_set: pattern `{}` must match \
              only at the {} known sanctioned call sites in non-test bridge sources (skipping \
              *_tests.rs and src/test_support/).\nMatches found ({}):\n",
             pattern.as_str(),

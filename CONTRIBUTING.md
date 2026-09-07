@@ -1245,7 +1245,7 @@ version-skewed file is treated as a cover to clear, not as absence.
 
 Inside a live bridge, `Routing::release_all_covers` — the same primitive —
 has four sanctioned callers, guarded by a structural test
-(`release_all_covers_callers_are_the_known_sanctioned_set`,
+(`cover_release_has_the_known_sanctioned_caller_set`,
 `reconciler_tests.rs`) rather than a single funnel point: `reconciler::reconcile_once` at boot; `ProxyManager::turn_lockdown_off`, called by the
 Lockdown-off toggle, which reads no session posture — it decides via
 [`cover_step`](#cover-ownership) against the current target and the measured
@@ -1458,7 +1458,7 @@ from it any more. Two structural tests replace the deleted
 `no_bridge_source_derives_cover_state_from_a_session`
 (`proxy_manager_tests.rs`) counts reads of `RunningState.lockdown` outside its
 one sanctioned site (`stop_with`'s own teardown), and
-`release_all_covers_callers_are_the_known_sanctioned_set`
+`cover_release_has_the_known_sanctioned_caller_set`
 (`reconciler_tests.rs`) whitelists every real caller of the unconditional
 `release_all_covers()` — `handle_unblock`, `turn_lockdown_off`,
 `apply_cover_step`, and `reconcile_once` — against the four independently
