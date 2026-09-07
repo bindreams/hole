@@ -1189,6 +1189,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
                     ipv6_bypass_available,
                 };
                 info!(started = %dump!(&diag), "proxy started");
+                self.persist_session_started(config).await;
                 Ok(())
             }
             Err(ProxyError::Cancelled) => {
@@ -2052,6 +2053,39 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         }
     }
 
+    /// Record `config` as the persisted [`Target`] the surfaces reconcile
+    /// toward: what the user last asked to connect to.
+    ///
+    /// The mirror of [`Self::persist_session_event`], and here for the same
+    /// reason it is: every path that *establishes* a session records what it
+    /// established, from inside the manager, under the caller's lock. Leaving
+    /// this to the IPC handler meant two defects at once — the write escaped
+    /// the lock that orders every other target transition (so a stop or a
+    /// health-check give-up landing in the gap was clobbered back to
+    /// `Connected`), and [`Self::reload`] recorded nothing at all, leaving the
+    /// target naming the pre-reload config indefinitely.
+    async fn persist_session_started(&mut self, config: &ProxyConfig) {
+        let Some(state_dir) = self.state_dir.clone() else {
+            return;
+        };
+        let owner = self.state_owner;
+        let config = config.clone();
+        let outcome = tokio::task::spawn_blocking(move || {
+            target::apply(&state_dir, owner, move |_current| Target::Connected {
+                config: Box::new(config),
+            })
+        })
+        .await;
+        match outcome {
+            Ok(Ok(_)) => {}
+            // Never surfaced as a start failure: the tunnel's own outcome is
+            // already decided by the time this runs, and a metadata-write
+            // hiccup must not retroactively fail an established connection.
+            Ok(Err(e)) => tracing::error!(error = %e, "failed to persist target after session start"),
+            Err(e) => tracing::error!(error = %e, "target-persistence task panicked after session start"),
+        }
+    }
+
     pub async fn reload(&mut self, config: &ProxyConfig) -> Result<(), ProxyError> {
         let Some(ref active) = self.active_config else {
             // Not running: just start.
@@ -2088,6 +2122,11 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
                 }
             }
             self.active_config = Some(config.clone());
+            // The hot-swap path establishes a session state just as much as a
+            // start does — `reload_if_running` is fed a freshly built full
+            // `ProxyConfig`, not just filters — so it records what it
+            // established. The slow path below gets this via its `start`.
+            self.persist_session_started(config).await;
             info!("filter rules hot-swapped");
             Ok(())
         } else {

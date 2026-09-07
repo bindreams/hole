@@ -5948,3 +5948,88 @@ fn the_installed_routed_families_reach_dns_apply() {
         );
     });
 }
+
+/// A session start records what it established.
+///
+/// The persisted target is the sole input `reconcile_once` uses to bring the
+/// tunnel up at boot, so a start that does not record its own config leaves
+/// the bridge reconciling toward something the user never asked for.
+#[skuld::test]
+fn a_start_records_the_target_it_established() {
+    rt().block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        let routing = MockRouting::new(dir.path().to_path_buf());
+        let mut pm = ProxyManager::new(MockProxy::new(), routing).with_state_dir(dir.path().to_path_buf());
+
+        pm.start(&test_config()).await.unwrap();
+
+        assert_eq!(
+            target::load(dir.path()),
+            Target::Connected {
+                config: Box::new(test_config())
+            },
+            "a successful start must persist the config it started"
+        );
+    });
+}
+
+/// A reload's hot-swap path establishes a session state exactly as a start
+/// does, and must record it the same way.
+///
+/// `reload_if_running` is fed a freshly built full `ProxyConfig`, not just a
+/// filter list, so a target left naming the pre-reload config is not a
+/// cosmetic mismatch: the next boot's `reconcile_once` reads it and brings
+/// the tunnel up with the superseded config, silently reverting the edit.
+#[skuld::test]
+fn a_hot_swapped_reload_records_the_config_it_swapped_to() {
+    rt().block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        let routing = MockRouting::new(dir.path().to_path_buf());
+        let mut pm = ProxyManager::new(MockProxy::new(), routing).with_state_dir(dir.path().to_path_buf());
+        pm.start(&test_config()).await.unwrap();
+
+        // Filters are the only non-structural field, so this takes the
+        // hot-swap fast path rather than the stop + start slow one.
+        let mut edited = test_config();
+        edited.filters.push(hole_common::config::FilterRule {
+            address: "example.com".into(),
+            matching: hole_common::config::MatchType::Exactly,
+            action: hole_common::config::FilterAction::Block,
+        });
+        pm.reload(&edited).await.unwrap();
+
+        assert_eq!(
+            target::load(dir.path()),
+            Target::Connected {
+                config: Box::new(edited)
+            },
+            "a hot-swapped reload must persist the config it swapped to, not the one it replaced"
+        );
+    });
+}
+
+/// The slow (stop + start) reload path reaches the same place by a different
+/// route — through `start` — so both reload branches are pinned, not just the
+/// one that needed its own call.
+#[skuld::test]
+fn a_restarting_reload_records_the_config_it_restarted_into() {
+    rt().block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        let routing = MockRouting::new(dir.path().to_path_buf());
+        let mut pm = ProxyManager::new(MockProxy::new(), routing).with_state_dir(dir.path().to_path_buf());
+        pm.start(&test_config()).await.unwrap();
+
+        // `local_port` is structural, so this forces the stop + start path.
+        let mut edited = test_config();
+        edited.local_port += 1;
+        pm.reload(&edited).await.unwrap();
+
+        assert_eq!(
+            target::load(dir.path()),
+            Target::Connected {
+                config: Box::new(edited)
+            },
+            "a restarting reload must persist the config it restarted into"
+        );
+    });
+}

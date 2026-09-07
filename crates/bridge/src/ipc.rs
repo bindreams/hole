@@ -478,8 +478,8 @@ async fn handle_start<P: Proxy + 'static, R: Routing + 'static>(
     }
 }
 
-/// Persist the target and the startup preference after a start attempt
-/// settles. Two different gates, on purpose:
+/// Persist the startup preference after a start attempt settles. Two
+/// different gates, on purpose:
 ///
 /// - `on_startup` is a GUI-pushed preference, not a record of what happened —
 ///   when `Some`, it is written on every attempt regardless of `succeeded`,
@@ -487,15 +487,18 @@ async fn handle_start<P: Proxy + 'static, R: Routing + 'static>(
 ///   is up. `None` means the caller (the CLI, which has no Settings to push,
 ///   #979) pushed nothing: the persisted preference is left exactly as it
 ///   was, never stomped down to the wire default.
-/// - The target and the preference's `candidate` (the config
-///   `resolve_startup_target`'s `AlwaysConnect` arm falls back on) both
-///   record what actually happened, so they are gated on `succeeded`
-///   regardless of who started it: a `ProxyError::AlreadyRunning` is `Err`
-///   here specifically because `start_cancellable` left the
-///   ALREADY-running session's config untouched, and writing THIS request's
-///   config over the target would silently mismatch the two (see
-///   `ProxyManager::start_cancellable`'s `AlreadyRunning` guard, which
-///   precedes any config change).
+/// - The preference's `candidate` (the config `resolve_startup_target`'s
+///   `AlwaysConnect` arm falls back on) records what actually happened, so it
+///   is gated on `succeeded` regardless of who started it: a
+///   `ProxyError::AlreadyRunning` is `Err` here specifically because
+///   `start_cancellable` left the ALREADY-running session's config untouched,
+///   and writing THIS request's config as the candidate would silently
+///   mismatch the two.
+///
+/// The **target** is not written here. It is
+/// `ProxyManager::persist_session_started`'s job, under the same lock that
+/// orders every other target transition — see that function for why a write
+/// from out here was wrong twice over.
 ///
 /// Runs in `spawn_blocking`, since both `target::apply` and
 /// `save_startup_preference` are sync (`target::apply`'s lock is a leaf lock
@@ -514,15 +517,11 @@ async fn persist_after_start<P: Proxy, R: Routing>(
     let config = config.clone();
     let outcome = tokio::task::spawn_blocking(move || -> Result<(), target::TargetError> {
         if succeeded {
-            let candidate_config = config.clone();
-            target::apply(&state_dir, owner, move |_current| Target::Connected {
-                config: Box::new(config),
-            })?;
             let mut pref = target::load_startup_preference(&state_dir);
             if let Some(on_startup) = on_startup {
                 pref.on_startup = on_startup;
             }
-            pref.candidate = Some(Box::new(candidate_config));
+            pref.candidate = Some(Box::new(config));
             target::save_startup_preference(&state_dir, &pref, owner)
         } else if let Some(on_startup) = on_startup {
             let mut pref = target::load_startup_preference(&state_dir);
