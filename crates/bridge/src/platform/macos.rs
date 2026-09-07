@@ -215,13 +215,6 @@ pub fn run(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async {
-        // Held for this bridge's entire run — see crate::liveness's module
-        // doc and foreground.rs's identical acquisition.
-        let state_dir_liveness = state_dir.to_path_buf();
-        let _liveness =
-            tokio::task::spawn_blocking(move || crate::liveness::BridgeLiveness::acquire(&state_dir_liveness, None))
-                .await??;
-
         let proxy = std::sync::Arc::new(tokio::sync::Mutex::new(
             crate::proxy_manager::ProxyManager::new(
                 crate::proxy::ShadowsocksProxy::new(),
@@ -231,10 +224,12 @@ pub fn run(
         ));
         let proxy_shutdown = std::sync::Arc::clone(&proxy);
 
-        // Bind BEFORE recovery — a second instance's bind() fails before it
-        // can touch routing state. Route recovery is offloaded via
-        // spawn_blocking so a hung netsh/route command cannot wedge the
-        // runtime while the IPC socket is bound but not yet serving.
+        // Bind BEFORE the liveness acquire and BEFORE recovery — a second
+        // instance's bind() fails before it can touch routing state or
+        // contend on the liveness lock, matching crate::liveness's documented
+        // invariant. Route recovery is offloaded via spawn_blocking so a hung
+        // netsh/route command cannot wedge the runtime while the IPC socket
+        // is bound but not yet serving.
         let server = crate::ipc::IpcServer::bind_with_dirs(
             socket_path,
             proxy,
@@ -245,6 +240,13 @@ pub fn run(
             // design; no real user to chown writes back to.
             None,
         )?;
+
+        // Held for this bridge's entire run — see crate::liveness's module
+        // doc and foreground.rs's identical acquisition.
+        let state_dir_liveness = state_dir.to_path_buf();
+        let _liveness =
+            tokio::task::spawn_blocking(move || crate::liveness::BridgeLiveness::acquire(&state_dir_liveness, None))
+                .await??;
         // DNS recovery runs first; see crate::dns::recovery docs for ordering.
         let state_dir_dns = state_dir.to_path_buf();
         if let Err(e) =

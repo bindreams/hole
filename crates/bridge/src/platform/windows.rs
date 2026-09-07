@@ -104,13 +104,6 @@ fn run_service() -> Result<(), Box<dyn std::error::Error>> {
             .unwrap_or_else(hole_common::paths::default_state_dir);
         let log_dir = LOG_DIR_OVERRIDE.get().cloned().unwrap_or_else(service_log_dir);
 
-        // Held for this bridge's entire run — see crate::liveness's module
-        // doc and foreground.rs's identical acquisition.
-        let state_dir_liveness = state_dir.clone();
-        let _liveness =
-            tokio::task::spawn_blocking(move || crate::liveness::BridgeLiveness::acquire(&state_dir_liveness, None))
-                .await??;
-
         let proxy = std::sync::Arc::new(tokio::sync::Mutex::new(
             crate::proxy_manager::ProxyManager::new(
                 crate::proxy::ShadowsocksProxy::new(),
@@ -124,10 +117,14 @@ fn run_service() -> Result<(), Box<dyn std::error::Error>> {
             .get()
             .cloned()
             .unwrap_or_else(hole_common::protocol::default_bridge_socket_path);
-        // Bind BEFORE recovery — a second instance's bind() fails before it
-        // can touch routing state. Route recovery is offloaded via
-        // spawn_blocking so a hung netsh/route command cannot wedge the
-        // runtime while the IPC socket is bound but not yet serving.
+        // Bind BEFORE the liveness acquire and BEFORE recovery — a second
+        // instance's bind() fails before it can touch routing state or contend
+        // on the liveness lock, matching crate::liveness's documented invariant
+        // (BridgeLiveness::acquire's doc: "a second real bridge instance never
+        // reaches this call — the IPC socket bind already refuses it first").
+        // Route recovery is offloaded via spawn_blocking so a hung netsh/route
+        // command cannot wedge the runtime while the IPC socket is bound but
+        // not yet serving.
         let version = VERSION_OVERRIDE.get().cloned().unwrap_or_else(|| "unknown".to_string());
         // The `--service` daemon runs as SYSTEM and its dirs are SYSTEM-owned by
         // design; no real user to chown writes back to. (chown is a macOS no-op
@@ -140,6 +137,13 @@ fn run_service() -> Result<(), Box<dyn std::error::Error>> {
             state_dir.clone(),
             None,
         )?;
+
+        // Held for this bridge's entire run — see crate::liveness's module
+        // doc and foreground.rs's identical acquisition.
+        let state_dir_liveness = state_dir.clone();
+        let _liveness =
+            tokio::task::spawn_blocking(move || crate::liveness::BridgeLiveness::acquire(&state_dir_liveness, None))
+                .await??;
         // Socket is bound: sweep the marker, then report Running (see sweep_marker_then_ready).
         sweep_marker_then_ready(&log_dir, || {
             status_handle_ready

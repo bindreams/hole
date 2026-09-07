@@ -138,16 +138,6 @@ async fn run_inner(
     version: &str,
     owner: Option<(u32, u32)>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // Held for this bridge's entire run, from before any OS mutation is
-    // possible to process exit — see crate::liveness's module doc. Blocks
-    // (in spawn_blocking, off the runtime worker) rather than failing, so a
-    // boot racing an in-flight `hole bridge unlock` waits for it instead of
-    // interleaving.
-    let state_dir_liveness = state_dir.to_path_buf();
-    let _liveness =
-        tokio::task::spawn_blocking(move || crate::liveness::BridgeLiveness::acquire(&state_dir_liveness, owner))
-            .await??;
-
     let proxy = std::sync::Arc::new(tokio::sync::Mutex::new(
         ProxyManager::new(
             ShadowsocksProxy::new(),
@@ -158,8 +148,12 @@ async fn run_inner(
     ));
     let proxy_shutdown = std::sync::Arc::clone(&proxy);
 
-    // Bind BEFORE recovery. If a second bridge instance tries to run, the
-    // bind() fails and we exit without touching any routing state.
+    // Bind BEFORE the liveness acquire and BEFORE recovery. If a second
+    // bridge instance tries to run, the bind() fails and we exit without
+    // touching any routing state or contending on the liveness lock —
+    // matching crate::liveness's documented invariant (BridgeLiveness::acquire's
+    // doc: "a second real bridge instance never reaches this call — the IPC
+    // socket bind already refuses it first").
     let server = crate::ipc::IpcServer::bind_with_dirs(
         socket_path,
         proxy,
@@ -168,6 +162,16 @@ async fn run_inner(
         state_dir.to_path_buf(),
         owner,
     )?;
+
+    // Held for this bridge's entire run, from just after the socket bind to
+    // process exit — see crate::liveness's module doc. Blocks (in
+    // spawn_blocking, off the runtime worker) rather than failing, so a boot
+    // racing an in-flight `hole bridge unlock` waits for it instead of
+    // interleaving.
+    let state_dir_liveness = state_dir.to_path_buf();
+    let _liveness =
+        tokio::task::spawn_blocking(move || crate::liveness::BridgeLiveness::acquire(&state_dir_liveness, owner))
+            .await??;
 
     // First-party readiness signal (#454): the dev supervisor pre-binds a
     // localhost listener and passes `--ready-notify ADDR/TOKEN`; we connect
