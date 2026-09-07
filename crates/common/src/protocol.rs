@@ -46,7 +46,7 @@ pub enum BridgeRequest {
         /// (#979, #617) — see `hole_bridge::target::resolve_startup_target`.
         /// This is a preference the bridge persists, not a decision the GUI
         /// makes: whether THIS start is auto-connect-covered is for the
-        /// bridge alone to know (Q3), which is why the removed `covered`
+        /// bridge alone to know, which is why the removed `covered`
         /// field is not replaced by an equivalent. Sent on the wire as the
         /// `X-Hole-On-Startup` header (like `attempt_id`), so it survives the
         /// elevation re-serialization path.

@@ -679,7 +679,7 @@ fn absent_version_header_is_version_mismatch() {
 /// Mock serving GET /v1/status with a mismatched version header AND a body
 /// missing `cover_presence` — a field this client's `StatusResponse` requires.
 /// If body decoding ran before (or instead of) the version check, this would
-/// surface as `ClientError::Protocol` (a decode failure); Q2's wire removal
+/// surface as `ClientError::Protocol` (a decode failure); the wire removal
 /// of `lockdown_active` in favor of a required `cover_presence` field rests
 /// on the version check running first, so this pins that ordering rather
 /// than assuming it.

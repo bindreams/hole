@@ -258,7 +258,7 @@ const UNBLOCK_UNREACHABLE_MESSAGE: &str =
 /// Map a `BridgeRequest::Unblock` response to the dialog the tray should
 /// show, or `None` for a silent success. Pure (aside from logging), table-tested
 /// directly, mirroring `outcome_for_start_response`'s pattern. The escape's
-/// handler reads no session posture (Task 8b) and always either releases the
+/// handler reads no session posture and always either releases the
 /// cover or reports a bridge-authored failure, so there is no "session was
 /// running" case to map here.
 fn unblock_dialog_message(response: &Result<BridgeResponse, crate::bridge_client::ClientError>) -> Option<String> {
@@ -356,7 +356,7 @@ struct EscapeItems {
 /// blocked_offers_go_offline)` rows. `unblock` keys on `cover_presence`
 /// alone, never on `running`: gating it on `!running` was deriving a
 /// lockdown answer from the tunnel surface, exactly the coupling this model
-/// removes (Task 8b) — the escape's handler (`ipc::handle_unblock`) reads no
+/// removes — the escape's handler (`ipc::handle_unblock`) reads no
 /// session posture either, so the affordance must not pretend one exists.
 /// `Indeterminate`/`Unreachable` count as present — an uncertain probe must
 /// never resolve toward "nothing is blocking".
