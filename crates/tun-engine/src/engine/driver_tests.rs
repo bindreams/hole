@@ -302,7 +302,7 @@ async fn a_half_closing_router_still_receives_the_clients_final_bytes() {
 /// Route B (F7a): the router task ended and dropped its flow, so nothing
 /// can be delivered. Confined to this route is F7b's remaining downside —
 /// bytes still in `rx_buffer` at removal are now acknowledged and then
-/// dropped — which is #923's to close, not this plan's.
+/// dropped — which is #923's to close.
 ///
 /// A live spawned router cannot be observed reaching this state without a
 /// sleep or a poll-with-timeout, both forbidden here (see the plan's F8/Task

@@ -918,7 +918,7 @@ fn unblock_clears_covers_and_returns_ok() {
     });
 }
 
-/// Q4/R3: the escape never refuses. A session still running with a live
+/// The escape never refuses. A session still running with a live
 /// cover and the target going `Off` is exactly the wedged-teardown case the
 /// escape exists for; it must release the cover and 200, not 409.
 #[skuld::test]
@@ -1001,7 +1001,7 @@ fn unblock_error_bodies_carry_no_filesystem_path() {
 
     rt().block_on(async {
         // The 500 (failed release) case — the only error case unblock has
-        // left, now that the escape never refuses (Q4/R3).
+        // left, now that the escape never refuses.
         let path = test_socket_path("unblock-nopath-500");
         let (proxy, _calls, fail_release, _dir) = mock_proxy_with_release_state();
         fail_release.store(true, Ordering::SeqCst);
@@ -1051,7 +1051,7 @@ fn lockdown_off_releases_covers_through_the_same_path() {
 
 /// Seam guard with the sibling teardown item: `handle_unblock` must consume
 /// no session posture at all, so a stopping session's reported posture can
-/// never reach this decision (R7's whole point — the escape reads only the
+/// never reach this decision (the escape reads only the
 /// reconciler's target/presence, off the proxy mutex entirely).
 #[skuld::test]
 fn the_unblock_handler_reads_no_session_posture() {
@@ -1553,7 +1553,7 @@ fn a_start_with_no_startup_preference_leaves_the_persisted_one_alone() {
 fn ipc_start_never_engages_the_cover_even_on_failure() {
     // #979: `handle_start` hardcodes `covered = false` unconditionally now —
     // there is no wire signal left that can make an IPC-driven start covered
-    // (Q3 deleted `X-Hole-Covered`; the only remaining source of a covered
+    // (`X-Hole-Covered` is gone; the only remaining source of a covered
     // start is the bridge's own boot-time reconcile, Task 7, which bypasses
     // IPC entirely). A failed IPC start must therefore never leave the host
     // fail-closed, regardless of any header a client sends.

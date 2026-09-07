@@ -728,7 +728,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
 
     /// Turn the kill-switch intent off, releasing the cover iff
     /// `cover_step` says the target/presence pair calls for it. Reads no
-    /// session posture directly — Q4 ("unblock IS unticking") means a live
+    /// session posture directly — "unblock IS unticking" means a live
     /// session's cover is released too when the persisted target is `Off`
     /// and presence is not `Absent`/`Unreachable`; `cover_step`'s own
     /// `Target::Off` arm is what decides that, uniformly, whether or not a

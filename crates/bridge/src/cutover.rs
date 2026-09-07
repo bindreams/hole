@@ -120,11 +120,18 @@ pub fn run_detached(_payload: &Path, _target_version: &str) -> std::io::Result<(
 /// engaged — egress still blocked — while the intent reads "off", misleading the
 /// user.
 ///
-/// Refuses outright against a live bridge instance (#840): a running bridge
-/// already reconciles the target itself, and racing it from an unrelated CLI
-/// invocation is exactly the two-writer hazard `target::apply`'s locking
-/// exists to prevent. The in-app "Unblock Network" action is the live-bridge
-/// equivalent, so refusal names it as the alternative.
+/// Refuses against a live bridge instance (#840): a running bridge already
+/// reconciles the target itself, and racing it from an unrelated CLI
+/// invocation writes the same state from two places. The in-app "Unblock
+/// Network" action is the live-bridge equivalent, so refusal names it as the
+/// alternative.
+///
+/// That refusal NARROWS the race; it does not exclude it. `is_running` is a
+/// point-in-time SCM/launchd query with no exclusivity attached, so a bridge
+/// that starts after it answers is not held off by anything here — see
+/// [`unlock_with`] for what is done about that and what is left. Real mutual
+/// exclusion needs a lock a starting bridge also takes, and the bridge has no
+/// working single-instance lock to key on yet (#878).
 pub fn unlock() -> std::io::Result<()> {
     let state_dir = service_state_dir();
     unlock_with(&state_dir, crate::platform::os::is_running, || {
@@ -135,24 +142,48 @@ pub fn unlock() -> std::io::Result<()> {
 /// `unlock`'s ordering, with the liveness check and the disengage step both
 /// injected so tests can drive the refusal and cannot-disengage paths without
 /// touching the host firewall or a real bridge process. Live check → target
-/// off → disengage → intent flip; the intent flips off ONLY after the
-/// disengage confirms success, and the target is recorded off before the
-/// release call so a reconciler reading it mid-unlock never sees a stale
+/// off → live re-check → disengage → intent flip; the intent flips off ONLY
+/// after the disengage confirms success, and the target is recorded off before
+/// the release call so a reconciler reading it mid-unlock never sees a stale
 /// `Connected`/prior target.
+///
+/// `is_running` is re-checked immediately before the disengage rather than
+/// trusted once at the top. The sequence below is not atomic — it takes real
+/// wall-clock time across a `pfctl`/WFP call and two file writes — and a
+/// bridge that starts inside it would have its own cover disengaged out from
+/// under it by a caller that believed nothing was running. The re-check is a
+/// narrowing, not an exclusion: a bridge starting between the re-check and the
+/// disengage is still unhandled, and closing that needs a lock a starting
+/// bridge also takes (#878). What the re-check buys is that the escape stops
+/// rather than acting on an assumption it can see has become false.
+///
+/// A transition caught by the re-check leaves the target recorded `Off` and
+/// nothing else changed. That is a coherent state, and the same one the in-app
+/// Unblock action writes first, so the user's next step — the action the error
+/// names — proceeds from it correctly.
 fn unlock_with(
     state_dir: &Path,
-    is_running: impl FnOnce() -> bool,
+    is_running: impl Fn() -> bool,
     disengage: impl FnOnce() -> std::io::Result<()>,
 ) -> std::io::Result<()> {
     if is_running() {
-        return Err(std::io::Error::other(
-            "a bridge instance is running; use the in-app \"Unblock Network\" action instead of `hole bridge unlock`",
-        ));
+        return Err(running_bridge_error());
     }
     crate::target::apply(state_dir, None, |_| crate::target::Target::Off)
         .map_err(|e| std::io::Error::other(format!("could not record target off: {e}")))?;
+    if is_running() {
+        return Err(running_bridge_error());
+    }
     disengage()?;
     tun_engine::routing::failclosed::lockdown_state::set_enabled(state_dir, false, None)
+}
+
+/// The one refusal message, so the top check and the re-check cannot drift
+/// into naming different alternatives.
+fn running_bridge_error() -> std::io::Error {
+    std::io::Error::other(
+        "a bridge instance is running; use the in-app \"Unblock Network\" action instead of `hole bridge unlock`",
+    )
 }
 
 #[cfg(test)]

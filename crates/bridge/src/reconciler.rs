@@ -2,7 +2,7 @@
 //!
 //! Split out from any call site so cover fate and tunnel fate stop being
 //! expressible by imitation (`StopReason`'s two-variant trap, `check_health`
-//! hand-copying `stop_with`'s arm) — see this plan's "Cause 1". Nothing here
+//! hand-copying `stop_with`'s arm). Nothing here
 //! performs I/O: every function is a table lookup from measured/decided
 //! inputs to a step, and the actual driving of those steps lives elsewhere.
 
@@ -35,7 +35,7 @@ pub enum CoverStep {
     /// Remove the cover. Either the target no longer authorises it (it
     /// moved to `Off`, regardless of intent — the engaged block follows the
     /// target, not the preference) or the intent was turned off mid-session
-    /// (Q4: unticking releases immediately, it does not wait for stop).
+    /// (unticking releases immediately, it does not wait for stop).
     Release,
 }
 
@@ -73,7 +73,7 @@ pub enum Phase {
 /// Once the target is anything other than `Connected`, `intent` stops
 /// mattering: the engaged block follows the target (model point 6), so a
 /// target that moved to `Off` releases a live cover even with the
-/// preference still `On` — that is Q4/Q5's point, not an oversight. Reading
+/// preference still `On`. Reading
 /// the preference back out of a disarmed cover is exactly the boot-time job
 /// [`tun_engine::routing::decide_cover_recovery`] does instead; this
 /// function is the steady-state reconcile decision, not the recovery one,
@@ -81,7 +81,7 @@ pub enum Phase {
 ///
 /// `Target::Unreadable` authorises neither surface — there is nothing to
 /// preserve and nothing to disarm — so it holds regardless of intent or
-/// presence (R4).
+/// presence.
 ///
 /// Exhaustive on every axis with no wildcard arm, so a new `Intent`,
 /// `CoverPresence`, or `Target` variant is a compile error here, the same
@@ -122,7 +122,7 @@ pub fn cover_step(intent: Intent, presence: CoverPresence, target: &Target) -> C
             (I::Unreadable, P::Unreachable) => CoverStep::Hold,
 
             // `Off` never authorises engaging, and releases whatever is
-            // actionable — Q4's "unticking releases mid-session".
+            // actionable.
             (I::Off, P::Live) => CoverStep::Release,
             (I::Off, P::Recorded) => CoverStep::Release,
             (I::Off, P::Indeterminate) => CoverStep::Release,
@@ -146,7 +146,7 @@ pub fn cover_step(intent: Intent, presence: CoverPresence, target: &Target) -> C
 
 /// Decide what the tunnel session should do.
 ///
-/// `Target::Unreadable` authorises neither starting nor stopping (R4): an
+/// `Target::Unreadable` authorises neither starting nor stopping: an
 /// unreadable target is not consent to connect, but it is equally not the
 /// user asking to disconnect, so an already-live session is left alone
 /// rather than torn down on a corrupt read.
@@ -175,11 +175,11 @@ pub fn tunnel_step(session_live: bool, target: &Target) -> TunnelStep {
 /// The order the two surfaces move in this reconcile pass.
 ///
 /// Engaging goes lockdown-then-tunnel; releasing goes tunnel-then-lockdown.
-/// This is the fix for the ordering inversion `check_health` had (releasing
-/// the cover at `proxy_manager.rs:2047`, before tearing the session down at
-/// `2058` — egress open while the tunnel was still half-standing):
-/// `step_order` makes the order a value derived from the decision, not a
-/// second statement sequence an author can get wrong at a new call site.
+/// This is the fix for the ordering inversion `check_health` had — releasing
+/// the cover before tearing the session down, leaving egress open while the
+/// tunnel was still half-standing. `step_order` makes the order a value
+/// derived from the decision, not a second statement sequence an author can
+/// get wrong at a new call site.
 pub fn step_order(cover: CoverStep, tunnel: TunnelStep) -> [Phase; 2] {
     match cover {
         CoverStep::Release => [Phase::Tunnel(tunnel), Phase::Cover(cover)],
@@ -209,7 +209,7 @@ pub fn step_order(cover: CoverStep, tunnel: TunnelStep) -> [Phase; 2] {
 /// `standing_cover_expected()` gate, once the TUN device and routes it needs
 /// exist. The `covered = true` argument to `start_cancellable` is what holds
 /// a loopback+server transient cover across that connect window when the
-/// lockdown intent is off, per this plan's "R2 follow-on" resolution.
+/// lockdown intent is off.
 /// Fold the GUI-pushed startup preference into the persisted target, and
 /// write the result back before anything else reads it.
 ///

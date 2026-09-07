@@ -314,8 +314,9 @@ mod macos_impl {
     /// in-process drop, and D3 is unimplementable as written — **stop and
     /// escalate to Anna**. The fallback (persistent key + owner token +
     /// evidence-gated sweep) is a materially larger design and must not be
-    /// improvised; an ungated sweep would violate the resource-ownership
-    /// rule this plan carries forward from route ownership.
+    /// improvised; an ungated sweep would violate the same resource-ownership
+    /// rule route ownership rests on (`CONTRIBUTING.md#route-ownership`):
+    /// delete only what you recorded installing.
     #[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
     fn macos_dns_global_net_state_session_keys_die_with_their_session() {
         let before_dns = scutil_dns();

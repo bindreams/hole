@@ -52,7 +52,7 @@ async fn covered_start_holding_the_cover(
 
 #[skuld::test]
 fn turn_lockdown_off_releases_a_stranded_cover_even_while_a_session_runs() {
-    // Q4: unblock IS unticking. `cover_step` reads no session posture, so a
+    // Unblock IS unticking. `cover_step` reads no session posture, so a
     // session that itself installed the standing cover (intent was On) does
     // not shield it from the escape — the persisted target defaults to `Off`
     // (no `bridge-target.json` is ever written by this ProxyManager-level
@@ -276,7 +276,7 @@ fn a_failed_release_keeps_the_adopted_cover_claim() {
 fn unblock_during_a_session_disarms_a_promoted_adopted_switch() {
     // Rule #0 in the other direction: making the claim durable must not make
     // the kill switch unreleasable. Turning it off mid-session releases the
-    // session's own stranded cover (Q4) and nothing re-promotes it once gone.
+    // session's own stranded cover, and nothing re-promotes it once gone.
     rt().block_on(async {
         let dir = tempfile::tempdir().unwrap();
         let routing = MockRouting::new(dir.path().to_path_buf());
@@ -291,7 +291,7 @@ fn unblock_during_a_session_disarms_a_promoted_adopted_switch() {
         );
 
         pm.turn_lockdown_off()
-            .expect("a running session's stranded cover must still release (Q4)");
+            .expect("a running session's stranded cover must still release");
         pm.stop().await.unwrap();
 
         assert!(

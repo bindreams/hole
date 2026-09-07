@@ -223,3 +223,53 @@ fn plan_windows_images_covers_full_bindir_set() {
         assert!(img.staged.exists(), "staged source resolved: {:?}", img.staged);
     }
 }
+
+/// A bridge that comes up after the top check must not have its cover
+/// disengaged out from under it.
+///
+/// The sequence is not atomic — a `pfctl`/WFP call plus two file writes — so
+/// the top check alone does not establish that nothing is running by the time
+/// the destructive step runs. `is_running` reports `false` then `true` here,
+/// exactly the transition a bridge starting mid-unlock produces.
+#[skuld::test]
+fn a_bridge_starting_mid_unlock_stops_the_disengage() {
+    let dir = tempfile::tempdir().unwrap();
+    let calls = std::cell::Cell::new(0u32);
+    let disengaged = std::cell::Cell::new(false);
+
+    let result = unlock_with(
+        dir.path(),
+        || {
+            let n = calls.get();
+            calls.set(n + 1);
+            // false at the top check, true at the re-check.
+            n > 0
+        },
+        || {
+            disengaged.set(true);
+            Ok(())
+        },
+    );
+
+    assert!(
+        result.is_err(),
+        "a bridge that appeared mid-unlock must stop the escape"
+    );
+    assert!(
+        !disengaged.get(),
+        "the disengage must not run against a bridge that is now live — it would release a cover that bridge owns"
+    );
+    assert_eq!(
+        calls.get(),
+        2,
+        "liveness must be re-checked before the destructive step"
+    );
+    assert!(
+        result.unwrap_err().to_string().contains("Unblock Network"),
+        "the refusal must name the live-bridge alternative"
+    );
+    // The target write already landed, and is left standing: it is the same
+    // thing the in-app action records first, so the alternative the error
+    // names proceeds correctly from here.
+    assert_eq!(crate::target::load(dir.path()), crate::target::Target::Off);
+}

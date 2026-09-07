@@ -4,9 +4,9 @@
 //! survives disconnects): this file records what the user last asked to
 //! connect to, and is the one fact the bridge can read before any GUI
 //! exists — the boot requirement forces it to be root-owned and
-//! process-independent. See `CONTRIBUTING.md#fail-closed-cover` and this
-//! plan's "Q1" for why the connection parameters live here rather than
-//! being read from the user's own config file at reconcile time.
+//! process-independent. See `CONTRIBUTING.md#fail-closed-cover` for why the
+//! connection parameters live here rather than being read from the user's own
+//! config file at reconcile time.
 //!
 //! Modeled on `crate::routing`'s sibling `lockdown_state.rs` (schema
 //! version, atomic save, load-classifies-failure), imported here as
@@ -342,7 +342,7 @@ pub fn startup_should_connect(behavior: StartupBehavior, last_enabled: bool) -> 
 }
 
 /// What the bridge should reconcile toward at its own boot, given the
-/// persisted target and the GUI's pushed startup preference (R8: "one
+/// persisted target and the GUI's pushed startup preference ("one
 /// decider, not two" — the startup behaviour is applied first, to produce
 /// the target, so reconciliation afterward has exactly one input).
 ///
@@ -380,7 +380,7 @@ const STARTUP_PREFERENCE_SCHEMA_VERSION: u32 = 1;
 /// Filename for the GUI-pushed startup preference, alongside
 /// `STATE_FILE_NAME` in the same root-owned state directory. A separate file
 /// rather than a field on the target file: unlike the target (governed by
-/// [`TargetExclusive`]/[`apply`] because multiple writers race it — R9),
+/// [`TargetExclusive`]/[`apply`] because multiple writers race it),
 /// this is written by exactly one path (`handle_start`, on every connect) and
 /// read by exactly one (boot reconciliation), so it needs no shared lock.
 const STARTUP_PREFERENCE_FILE_NAME: &str = "bridge-startup.json";
@@ -495,7 +495,7 @@ impl dump::Dump for Target {
 /// exact defect this type exists to remove.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionEvent {
-    /// The user asked to disconnect (clean or unclean teardown — Q5: the
+    /// The user asked to disconnect (clean or unclean teardown — the
     /// target moves because the user asked, never because teardown
     /// succeeded or failed).
     UserStopped,
