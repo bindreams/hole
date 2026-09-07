@@ -147,6 +147,12 @@ fn run_service() -> Result<(), Box<dyn std::error::Error>> {
                 .map_err(std::io::Error::other)
         })?;
         info!("Windows service started");
+        // SCM delivers STOP through `shutdown_rx`; fold it into the one token
+        // the boot sequence below and the serve loop both observe.
+        let shutdown = crate::foreground::shutdown_token(async move {
+            let _ = shutdown_rx.await;
+        });
+
         // DNS recovery runs first; see crate::dns::recovery docs for ordering.
         let state_dir_for_dns = state_dir.clone();
         if let Err(e) =
@@ -158,7 +164,7 @@ fn run_service() -> Result<(), Box<dyn std::error::Error>> {
         // Reconcile the persisted target now, before any GUI or client has had a
         // chance to connect (closes #617) — must run after recovery above, see
         // crate::reconciler::reconcile_once's own doc.
-        crate::reconciler::reconcile_once(&state_dir, &proxy_shutdown).await;
+        crate::reconciler::reconcile_once(&state_dir, &proxy_shutdown, &shutdown).await;
         let state_dir_for_plugins = state_dir.clone();
         if let Err(e) =
             tokio::task::spawn_blocking(move || crate::plugin_recovery::reap_recorded_plugins(&state_dir_for_plugins))
@@ -204,7 +210,7 @@ fn run_service() -> Result<(), Box<dyn std::error::Error>> {
                     error!(error = %e, "IPC server error");
                 }
             }
-            _ = shutdown_rx => {
+            _ = shutdown.cancelled() => {
                 info!("shutdown signal received");
             }
         }

@@ -7,6 +7,7 @@ use tun_engine::routing::SystemRouting;
 use crate::dns::system::Dns;
 use crate::proxy::{Proxy, ShadowsocksProxy};
 use crate::proxy_manager::ProxyManager;
+use tokio_util::sync::CancellationToken;
 use tun_engine::routing::Routing;
 
 /// Run the bridge in foreground mode (for development).
@@ -156,6 +157,10 @@ async fn run_inner(
         notify_ready(spec).await;
     }
 
+    // Created before the boot sequence below, so every step of it — and the
+    // serve loop after it — observes the same stop signal.
+    let shutdown = shutdown_token(shutdown_signal());
+
     // DNS recovery runs *before* route recovery. Rationale: mid-recovery
     // crash leaves the user with functional DNS + broken routes (easier
     // diagnosis path) instead of broken DNS + functional routes. See
@@ -170,7 +175,7 @@ async fn run_inner(
     // Reconcile the persisted target now, before any GUI or client has had a
     // chance to connect (closes #617) — must run after recovery above, see
     // crate::reconciler::reconcile_once's own doc.
-    crate::reconciler::reconcile_once(state_dir, &proxy_shutdown).await;
+    crate::reconciler::reconcile_once(state_dir, &proxy_shutdown, &shutdown).await;
     let state_dir_plugins = state_dir.to_path_buf();
     if let Err(e) =
         tokio::task::spawn_blocking(move || crate::plugin_recovery::reap_recorded_plugins(&state_dir_plugins)).await
@@ -230,7 +235,7 @@ async fn run_inner(
                 tracing::error!(error = %e, "IPC server error");
             }
         }
-        _ = shutdown_signal() => {}
+        _ = shutdown.cancelled() => {}
     }
 
     let mut pm = proxy_shutdown.lock().await;
@@ -260,6 +265,34 @@ where
     if let Err(e) = pm.stop_with(event).await {
         tracing::error!(error = %e, "error stopping proxy during shutdown");
     }
+}
+
+/// A process-level shutdown token, cancelled when `signal` resolves.
+///
+/// The boot sequence and the serve loop both observe one token, so a stop that
+/// arrives during boot is honoured instead of waiting out whatever the boot is
+/// doing. `reconcile_once` can attempt a real connect to a user-configured —
+/// possibly unreachable — server, so "whatever the boot is doing" is up to the
+/// sum of the DNS, TCP and plugin-readiness bounds. On Windows that boot runs
+/// after the service has already told SCM it is `Running`, i.e. that it is
+/// accepting STOP.
+///
+/// The caller must have already created `signal`: [`shutdown_signal`] installs
+/// its SIGTERM/CTRL_BREAK handlers eagerly when called, not on first poll, and
+/// moving the *call* into the spawned task would reopen the window that
+/// eagerness exists to close.
+pub(crate) fn shutdown_token(signal: impl std::future::Future<Output = ()> + Send + 'static) -> CancellationToken {
+    #[allow(clippy::disallowed_methods)]
+    // Sanctioned root token: the top of the cooperative-cancel tree for a
+    // bridge process, not a fresh token shadowing an existing chain. See
+    // clippy.toml's CancellationToken::new sanctioned-sites list.
+    let token = CancellationToken::new();
+    let cancel_on_signal = token.clone();
+    tokio::spawn(async move {
+        signal.await;
+        cancel_on_signal.cancel();
+    });
+    token
 }
 
 #[cfg(test)]

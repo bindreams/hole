@@ -238,6 +238,10 @@ pub fn run(
             // design; no real user to chown writes back to.
             None,
         )?;
+        // launchd stops the daemon with SIGTERM; `shutdown_signal` handles that
+        // and SIGINT. One token for the boot sequence below and the serve loop.
+        let shutdown = crate::foreground::shutdown_token(crate::foreground::shutdown_signal());
+
         // DNS recovery runs first; see crate::dns::recovery docs for ordering.
         let state_dir_dns = state_dir.to_path_buf();
         if let Err(e) =
@@ -249,7 +253,7 @@ pub fn run(
         // Reconcile the persisted target now, before any GUI or client has had a
         // chance to connect (closes #617) — must run after recovery above, see
         // crate::reconciler::reconcile_once's own doc.
-        crate::reconciler::reconcile_once(state_dir, &proxy_shutdown).await;
+        crate::reconciler::reconcile_once(state_dir, &proxy_shutdown, &shutdown).await;
         let state_dir_plugins = state_dir.to_path_buf();
         if let Err(e) =
             tokio::task::spawn_blocking(move || crate::plugin_recovery::reap_recorded_plugins(&state_dir_plugins)).await
@@ -270,10 +274,11 @@ pub fn run(
             tracing::warn!(error = %e, "marker sweep task panicked");
         }
 
-        // launchd stops the daemon with SIGTERM; awaiting only ctrl_c (SIGINT)
-        // here would skip the pm.stop() teardown below and leak routes/DNS.
-        // `shutdown_signal()` handles SIGINT *and* SIGTERM (foreground.rs).
-        serve_until_signal(server.run(), crate::foreground::shutdown_signal()).await;
+        serve_until_signal(server.run(), {
+            let shutdown = shutdown.clone();
+            async move { shutdown.cancelled().await }
+        })
+        .await;
 
         // Clean shutdown: stop proxy before exiting. Neither event is a user
         // disconnect, so the target is left unchanged either way; only the

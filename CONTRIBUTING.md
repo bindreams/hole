@@ -363,10 +363,22 @@ cancel internally.
 
 Cooperative-cancellation propagation (Go `context.Context` style) is the **only**
 cancellation mechanism. Future-drop cancellation is reserved for catastrophic /
-panic teardown. The cancel scope is rooted at the IPC `handle_start` handler
-([ipc.rs](crates/bridge/src/ipc.rs)); every phase of
+panic teardown. A user-initiated connect roots its scope at the IPC
+`handle_start` handler ([ipc.rs](crates/bridge/src/ipc.rs)); every phase of
 [`ProxyManager::start_cancellable`](crates/bridge/src/proxy_manager.rs) receives
-the token by reference. A fresh `CancellationToken::new()` inside
+the token by reference.
+
+The bridge's own **boot** has a second root: `foreground::shutdown_token`, one
+per-process token cancelled by that entry point's stop signal (SIGTERM/SIGINT
+for the foreground and launchd paths, the SCM STOP control on Windows). Every
+entry point passes it to `reconciler::reconcile_once` and then selects on it to
+end the serve loop, so the boot reconcile's connect — which can reach a
+user-configured, possibly unreachable server — is cancellable rather than
+something a stop has to wait out. On Windows that boot runs *after* the service
+has reported `Running` to SCM, so an uncancellable connect there means SCM
+believes STOP is being accepted while it is not.
+
+A fresh `CancellationToken::new()` inside
 `crates/bridge/src/` would shadow the chain and is banned by `clippy.toml`
 (sanctioned exceptions carry a per-site `#[allow]` + citation). See #397.
 

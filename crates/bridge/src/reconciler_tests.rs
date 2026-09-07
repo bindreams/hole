@@ -1,3 +1,8 @@
+//! Boot-time reconciliation drives a real `start_cancellable`, which takes a
+//! cancel token; these tests root their own rather than deriving one from a
+//! process that does not exist here. Module-level per clippy.toml.
+#![allow(clippy::disallowed_methods)]
+
 use super::*;
 use hole_common::config::{ServerEntry, StartupBehavior};
 use hole_common::protocol::TunnelMode;
@@ -270,7 +275,7 @@ fn a_persisted_connected_target_reconciles_at_startup_with_no_gui() {
         let pm = ProxyManager::new(MockProxy::new(), routing).with_state_dir(dir.path().to_path_buf());
         let proxy = Arc::new(Mutex::new(pm));
 
-        reconcile_once(dir.path(), &proxy).await;
+        reconcile_once(dir.path(), &proxy, &CancellationToken::new()).await;
 
         // The tunnel started with no client ever having connected...
         assert_eq!(
@@ -302,7 +307,7 @@ fn a_persisted_off_target_starts_nothing() {
         let pm = ProxyManager::new(MockProxy::new(), routing).with_state_dir(dir.path().to_path_buf());
         let proxy = Arc::new(Mutex::new(pm));
 
-        reconcile_once(dir.path(), &proxy).await;
+        reconcile_once(dir.path(), &proxy, &CancellationToken::new()).await;
 
         assert_eq!(
             proxy.lock().await.state(),
@@ -349,7 +354,7 @@ fn a_do_not_connect_preference_overrides_a_persisted_connected_target() {
         let pm = ProxyManager::new(MockProxy::new(), routing).with_state_dir(dir.path().to_path_buf());
         let proxy = Arc::new(Mutex::new(pm));
 
-        reconcile_once(dir.path(), &proxy).await;
+        reconcile_once(dir.path(), &proxy, &CancellationToken::new()).await;
 
         assert_eq!(
             proxy.lock().await.state(),
@@ -394,7 +399,7 @@ fn an_always_connect_preference_starts_the_candidate_over_an_off_target() {
         let pm = ProxyManager::new(MockProxy::new(), routing).with_state_dir(dir.path().to_path_buf());
         let proxy = Arc::new(Mutex::new(pm));
 
-        reconcile_once(dir.path(), &proxy).await;
+        reconcile_once(dir.path(), &proxy, &CancellationToken::new()).await;
 
         assert_eq!(
             proxy.lock().await.state(),
@@ -424,7 +429,7 @@ fn the_default_preference_leaves_the_persisted_target_untouched() {
         let pm = ProxyManager::new(MockProxy::new(), routing).with_state_dir(dir.path().to_path_buf());
         let proxy = Arc::new(Mutex::new(pm));
 
-        reconcile_once(dir.path(), &proxy).await;
+        reconcile_once(dir.path(), &proxy, &CancellationToken::new()).await;
 
         assert_eq!(
             proxy.lock().await.state(),
@@ -470,7 +475,7 @@ fn startup_recovery_runs_before_reconciliation() {
         )
         .await;
 
-        reconcile_once(dir.path(), &proxy).await;
+        reconcile_once(dir.path(), &proxy, &CancellationToken::new()).await;
 
         assert_eq!(
             state.lockdown_engage_calls.load(Ordering::SeqCst),
@@ -599,4 +604,38 @@ fn cover_release_has_the_known_sanctioned_caller_set() {
             diagnostic()
         );
     }
+}
+
+/// A stop arriving during boot must reach the reconcile's own connect.
+///
+/// `reconcile_once` used to build a fresh, disconnected `CancellationToken`
+/// on the grounds that boot had no external cancel source. It has one now —
+/// the process shutdown token — and the connect it may attempt is to a
+/// user-configured, possibly unreachable server, bounded only by the sum of
+/// the DNS, TCP and plugin-readiness timeouts. On Windows the service has
+/// already reported `Running` to SCM by this point, so those seconds are
+/// spent with SCM believing STOP is being accepted.
+#[skuld::test]
+fn a_cancelled_shutdown_token_stops_the_boot_reconcile() {
+    rt().block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        target::save(dir.path(), &connectable(), None).unwrap();
+
+        let routing = MockRouting::new(dir.path().to_path_buf());
+        let pm = ProxyManager::new(MockProxy::new(), routing).with_state_dir(dir.path().to_path_buf());
+        let proxy = Arc::new(Mutex::new(pm));
+
+        // Already cancelled: stands in for a stop that landed before the
+        // reconcile reached its connect.
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+
+        reconcile_once(dir.path(), &proxy, &cancel).await;
+
+        assert_eq!(
+            proxy.lock().await.state(),
+            ProxyState::Stopped,
+            "a cancelled shutdown token must stop the boot reconcile from establishing a session"
+        );
+    });
 }
