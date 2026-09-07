@@ -246,6 +246,10 @@ pub fn run(
             tracing::warn!(error = %e, "recover_dns_config task panicked");
         }
         crate::route_recovery::recover_and_record(state_dir, &proxy_shutdown).await;
+        // Reconcile the persisted target now, before any GUI or client has had a
+        // chance to connect (closes #617) — must run after recovery above, see
+        // crate::reconciler::reconcile_once's own doc.
+        crate::reconciler::reconcile_once(state_dir, &proxy_shutdown).await;
         let state_dir_plugins = state_dir.to_path_buf();
         if let Err(e) =
             tokio::task::spawn_blocking(move || crate::plugin_recovery::reap_recorded_plugins(&state_dir_plugins)).await

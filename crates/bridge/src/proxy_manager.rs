@@ -1969,7 +1969,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
     /// WITHOUT touching the intent file, so a raw `load_intent()` here would
     /// read `Unset`/`Off` for an adopted-but-unpersisted cover and
     /// `cover_step` would incorrectly release it.
-    fn effective_lockdown_intent(&self) -> Intent {
+    pub(crate) fn effective_lockdown_intent(&self) -> Intent {
         let intent = self
             .state_dir
             .as_deref()
@@ -2240,7 +2240,7 @@ fn lockdown_app_ids(config: &ProxyConfig) -> Vec<std::path::PathBuf> {
 
 #[cfg(test)]
 #[path = "proxy_manager_tests.rs"]
-mod proxy_manager_tests;
+pub(crate) mod proxy_manager_tests;
 
 #[cfg(test)]
 #[path = "proxy_manager_release_tests.rs"]

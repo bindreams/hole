@@ -6,11 +6,20 @@
 //! performs I/O: every function is a table lookup from measured/decided
 //! inputs to a step, and the actual driving of those steps lives elsewhere.
 
-use crate::target::Target;
+use std::path::Path;
+use std::sync::Arc;
+
+use tokio::sync::Mutex;
+use tokio_util::sync::CancellationToken;
+use tun_engine::routing::failclosed::lockdown_state::Intent;
+use tun_engine::routing::{CoverPresence, Routing};
+
+use crate::dns::system::Dns;
+use crate::proxy::Proxy;
+use crate::proxy_manager::{ProxyManager, ProxyState};
+use crate::target::{self, Target};
 #[cfg(test)]
 use hole_common::protocol::ProxyConfig;
-use tun_engine::routing::failclosed::lockdown_state::Intent;
-use tun_engine::routing::CoverPresence;
 
 // Steps ===============================================================================================================
 
@@ -175,6 +184,80 @@ pub fn step_order(cover: CoverStep, tunnel: TunnelStep) -> [Phase; 2] {
     match cover {
         CoverStep::Release => [Phase::Tunnel(tunnel), Phase::Cover(cover)],
         CoverStep::Engage | CoverStep::Hold => [Phase::Cover(cover), Phase::Tunnel(tunnel)],
+    }
+}
+
+// reconcile_once ======================================================================================================
+
+/// Reconcile the persisted target once, at startup, before any GUI or client
+/// has connected (closes #617).
+///
+/// Must run strictly after `route_recovery::recover_and_record` completes —
+/// that call is what measures `CoverPresence` and folds a live-cover finding
+/// into the manager's `adopted_standing_cover` claim, which
+/// `ProxyManager::effective_lockdown_intent` (not a raw `load_intent`) needs
+/// to avoid releasing a cover crash recovery just adopted but that
+/// `bridge-lockdown.json` itself doesn't yet record.
+///
+/// At the moment this runs, no session has ever started on this
+/// `ProxyManager`, so `tunnel_step` can only decide `Start` or `Hold`, never
+/// `Stop`. A bare `CoverStep::Engage` with no accompanying
+/// `TunnelStep::Start` cannot arise either: `Engage` only arises for
+/// `Target::Connected`, whose `tunnel_step` is unconditionally `Start` here.
+/// So `Phase::Cover(Engage)` is a no-op in this driver — the standing cover's
+/// actual engage happens inside `start_cancellable`'s own
+/// `standing_cover_expected()` gate, once the TUN device and routes it needs
+/// exist. The `covered = true` argument to `start_cancellable` is what holds
+/// a loopback+server transient cover across that connect window when the
+/// lockdown intent is off, per this plan's "R2 follow-on" resolution.
+pub async fn reconcile_once<P, R, D>(state_dir: &Path, proxy: &Arc<Mutex<ProxyManager<P, R, D>>>)
+where
+    P: Proxy,
+    R: Routing,
+    D: Dns,
+{
+    let target = target::load(state_dir);
+
+    let mut pm = proxy.lock().await;
+    let intent = pm.effective_lockdown_intent();
+    let presence = pm.cover_presence();
+    let session_live = pm.state() == ProxyState::Running;
+
+    let cover = cover_step(intent, presence, &target);
+    let tunnel = tunnel_step(session_live, &target);
+
+    for phase in step_order(cover, tunnel) {
+        match phase {
+            Phase::Cover(CoverStep::Release) => match pm.routing_handle().release_all_covers() {
+                Ok(()) => pm.set_standing_cover_adopted(false),
+                Err(error) => {
+                    tracing::warn!(%error, "reconcile_once: failed to release a stray standing cover");
+                }
+            },
+            // Engaging happens inside `start_cancellable` below, not here —
+            // see the fn doc.
+            Phase::Cover(CoverStep::Engage) | Phase::Cover(CoverStep::Hold) => {}
+            Phase::Tunnel(TunnelStep::Start) => {
+                let Target::Connected { config } = &target else {
+                    debug_assert!(false, "tunnel_step only yields Start for Target::Connected");
+                    continue;
+                };
+                #[allow(clippy::disallowed_methods)]
+                // Boot-time reconcile has no external cancel source to thread through — see clippy.toml's
+                // CancellationToken::new sanctioned-sites list.
+                let token = CancellationToken::new();
+                if let Err(error) = pm.start_cancellable(config, true, token).await {
+                    tracing::warn!(%error, "reconcile_once: failed to start the persisted target");
+                }
+            }
+            Phase::Tunnel(TunnelStep::Hold) => {}
+            Phase::Tunnel(TunnelStep::Stop) => {
+                debug_assert!(
+                    false,
+                    "tunnel_step cannot yield Stop at boot: no session has ever started yet"
+                );
+            }
+        }
     }
 }
 

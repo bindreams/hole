@@ -45,7 +45,7 @@ struct MockProxyState {
     bytes_out: AtomicU64,
 }
 
-pub(super) struct MockProxy {
+pub(crate) struct MockProxy {
     state: Arc<MockProxyState>,
     /// If Some, `start` awaits this gate before returning — used to park
     /// start mid-flight so cancellation tests can fire the cancel token
@@ -59,7 +59,7 @@ pub(super) struct MockProxy {
 }
 
 impl MockProxy {
-    pub(super) fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             state: Arc::new(MockProxyState::default()),
             start_gate: None,
@@ -122,7 +122,7 @@ impl Proxy for MockProxy {
     }
 }
 
-pub(super) struct MockRunning {
+pub(crate) struct MockRunning {
     state: Arc<MockProxyState>,
     handle: Option<JoinHandle<io::Result<()>>>,
 }
@@ -162,22 +162,22 @@ impl Drop for MockRunning {
 
 // MockRouting =========================================================================================================
 
-pub(super) struct MockRoutingState {
+pub(crate) struct MockRoutingState {
     install_calls: AtomicU32,
     teardown_calls: AtomicU32,
     fail_install: AtomicBool,
     fail_gateway: AtomicBool,
     cover_engage_calls: AtomicU32,
-    pub(super) cover_disengage_calls: AtomicU32,
-    pub(super) lockdown_engage_calls: AtomicU32,
+    pub(crate) cover_disengage_calls: AtomicU32,
+    pub(crate) lockdown_engage_calls: AtomicU32,
     lockdown_disengage_calls: AtomicU32,
     fail_lockdown: AtomicBool,
     fail_cover: AtomicBool,
     /// Number of `release_all_covers` calls, so a test can assert the
     /// unconditional escape fired exactly once (or not at all).
-    pub(super) release_all_calls: AtomicU32,
+    pub(crate) release_all_calls: AtomicU32,
     /// `release_all_covers` returns `RoutingError::RouteSetup` when set.
-    pub(super) fail_release: AtomicBool,
+    pub(crate) fail_release: AtomicBool,
     /// Ordered record of teardown events ("routes" / "lockdown") so a test can
     /// observe the unwind teardown sequence. Shared via the `Arc<MockRoutingState>`
     /// both `MockRoutes` and `MockCover` clone.
@@ -215,10 +215,10 @@ pub(super) struct MockRoutingState {
     /// install's `installed` is always the full planned set, so this is
     /// currently only exercised to prove no teardown ran at all (`is_none()`
     /// in `partial_route_failure_fails_closed_and_clears_state`).
-    pub(super) last_teardown_installed: std::sync::Mutex<Option<Vec<RouteId>>>,
+    pub(crate) last_teardown_installed: std::sync::Mutex<Option<Vec<RouteId>>>,
     /// What `lockdown_cover_presence` reports — a test's stand-in for the OS
     /// probe, settable independently of whether any session is running.
-    pub(super) cover_presence: std::sync::Mutex<tun_engine::routing::CoverPresence>,
+    pub(crate) cover_presence: std::sync::Mutex<tun_engine::routing::CoverPresence>,
 }
 
 impl Default for MockRoutingState {
@@ -250,7 +250,7 @@ impl Default for MockRoutingState {
     }
 }
 
-pub(super) struct MockRouting {
+pub(crate) struct MockRouting {
     state: Arc<MockRoutingState>,
     /// Directory where the crash-recovery state file is written. Each
     /// `MockRouting` owns its own `state_dir` — in production,
@@ -266,7 +266,7 @@ pub(super) struct MockRouting {
 }
 
 impl MockRouting {
-    pub(super) fn new(state_dir: PathBuf) -> Self {
+    pub(crate) fn new(state_dir: PathBuf) -> Self {
         Self {
             state: Arc::new(MockRoutingState::default()),
             state_dir,
@@ -307,7 +307,7 @@ impl MockRouting {
         m
     }
 
-    pub(super) fn state(&self) -> Arc<MockRoutingState> {
+    pub(crate) fn state(&self) -> Arc<MockRoutingState> {
         Arc::clone(&self.state)
     }
 }
@@ -484,7 +484,7 @@ impl Routing for MockRouting {
     }
 }
 
-pub(super) struct MockRoutes {
+pub(crate) struct MockRoutes {
     state: Arc<MockRoutingState>,
     state_dir: PathBuf,
     /// The routes `install` actually recorded — mirrors `SystemRoutes.installed`.
@@ -514,7 +514,7 @@ impl RoutesInstalled for MockRoutes {
     }
 }
 
-pub(super) struct MockCover {
+pub(crate) struct MockCover {
     state: Arc<MockRoutingState>,
     /// Whether this guard holds the standing lockdown cover (vs the transient
     /// fail-closed cover) — selects which disengage counter Drop bumps, mirroring
@@ -592,7 +592,7 @@ fn mock_failing_lockdown_returns_err_without_recording() {
 
 // Helpers =============================================================================================================
 
-pub(super) fn rt() -> tokio::runtime::Runtime {
+pub(crate) fn rt() -> tokio::runtime::Runtime {
     tokio::runtime::Runtime::new().unwrap()
 }
 
@@ -676,7 +676,7 @@ fn new_manager_with_dns(
     (pm, dir)
 }
 
-pub(super) fn test_config() -> ProxyConfig {
+pub(crate) fn test_config() -> ProxyConfig {
     ProxyConfig {
         server: ServerEntry {
             id: "test-id".into(),

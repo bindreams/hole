@@ -1,6 +1,13 @@
 use super::*;
 use hole_common::config::ServerEntry;
 use hole_common::protocol::TunnelMode;
+use std::sync::atomic::Ordering;
+
+use crate::proxy_manager::proxy_manager_tests::{MockProxy, MockRouting};
+use crate::proxy_manager::ProxyState;
+use crate::test_support::rt;
+use tun_engine::routing::failclosed::lockdown_state;
+use tun_engine::routing::{CoverRecovery, Recovery};
 
 fn test_config() -> ProxyConfig {
     ProxyConfig {
@@ -182,4 +189,131 @@ fn tunnel_step_never_stops_a_session_on_an_unreadable_target() {
     // read while a session is live must not tear it down.
     assert_eq!(tunnel_step(true, &Target::Unreadable), TunnelStep::Hold);
     assert_eq!(tunnel_step(false, &Target::Unreadable), TunnelStep::Hold);
+}
+
+// reconcile_once ======================================================================================================
+
+/// Unlike `test_config()`, a literal-IP server so `start_cancellable` can
+/// actually run to completion against the mocks without a DoH bootstrap
+/// resolver — mirrors `proxy_manager_tests::test_config`'s own reasoning.
+fn connectable_config() -> ProxyConfig {
+    ProxyConfig {
+        server: ServerEntry {
+            server: "127.0.0.1".into(),
+            ..test_config().server
+        },
+        ..test_config()
+    }
+}
+
+fn connectable() -> Target {
+    Target::Connected {
+        config: Box::new(connectable_config()),
+    }
+}
+
+#[skuld::test]
+fn a_persisted_connected_target_reconciles_at_startup_with_no_gui() {
+    rt().block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        lockdown_state::set_enabled(dir.path(), true, None).unwrap();
+        target::save(dir.path(), &connectable(), None).unwrap();
+
+        let routing = MockRouting::new(dir.path().to_path_buf());
+        let state = routing.state();
+        let pm = ProxyManager::new(MockProxy::new(), routing).with_state_dir(dir.path().to_path_buf());
+        let proxy = Arc::new(Mutex::new(pm));
+
+        reconcile_once(dir.path(), &proxy).await;
+
+        // The tunnel started with no client ever having connected...
+        assert_eq!(
+            proxy.lock().await.state(),
+            ProxyState::Running,
+            "a persisted Connected target must start the tunnel with no GUI or client involved"
+        );
+        // ...and the standing cover engaged, because the persisted intent is On.
+        assert_eq!(
+            state.lockdown_engage_calls.load(Ordering::SeqCst),
+            1,
+            "an On intent toward a Connected target must engage the standing cover"
+        );
+        // Cover-before-tunnel is `start_inner`'s own existing phase order
+        // (already proven by `proxy_manager_tests`), inherited here rather
+        // than re-implemented: `reconcile_once` only decides *that* both
+        // happen, `start_cancellable` decides the order they happen in.
+    });
+}
+
+#[skuld::test]
+fn a_persisted_off_target_starts_nothing() {
+    rt().block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        target::save(dir.path(), &Target::Off, None).unwrap();
+
+        let routing = MockRouting::new(dir.path().to_path_buf());
+        let state = routing.state();
+        let pm = ProxyManager::new(MockProxy::new(), routing).with_state_dir(dir.path().to_path_buf());
+        let proxy = Arc::new(Mutex::new(pm));
+
+        reconcile_once(dir.path(), &proxy).await;
+
+        assert_eq!(
+            proxy.lock().await.state(),
+            ProxyState::Stopped,
+            "an Off target must not start a session"
+        );
+        assert_eq!(
+            state.lockdown_engage_calls.load(Ordering::SeqCst),
+            0,
+            "an Off target must not engage the standing cover"
+        );
+        assert_eq!(
+            state.release_all_calls.load(Ordering::SeqCst),
+            0,
+            "no cover was present (Absent), so there is nothing to release either"
+        );
+    });
+}
+
+#[skuld::test]
+fn startup_recovery_runs_before_reconciliation() {
+    rt().block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        // Deliberately no `bridge-lockdown.json` at all (`Intent::Unset`) —
+        // only crash recovery's own adopted-claim can authorise the standing
+        // cover to engage here. If `reconcile_once` read the target before
+        // recovery recorded that claim (or recovery never ran first, as
+        // startup must guarantee), this would stay `Hold`, not `Engage`.
+        target::save(dir.path(), &connectable(), None).unwrap();
+
+        let routing = MockRouting::new(dir.path().to_path_buf());
+        let state = routing.state();
+        *state.cover_presence.lock().unwrap() = CoverPresence::Recorded;
+        let pm = ProxyManager::new(MockProxy::new(), routing).with_state_dir(dir.path().to_path_buf());
+        let proxy = Arc::new(Mutex::new(pm));
+
+        // The exact call `route_recovery::recover_and_record` makes on its
+        // `Ok` arm — driven directly, the same way `route_recovery_tests.rs`
+        // does, since the real `recover_routes` free function needs
+        // elevation and cannot be mocked through `Routing`.
+        crate::route_recovery::record_recovery_outcome(
+            Ok(Recovery {
+                action: CoverRecovery::Adopt,
+                record_intent_on: false,
+                presence: CoverPresence::Live,
+            }),
+            &proxy,
+        )
+        .await;
+
+        reconcile_once(dir.path(), &proxy).await;
+
+        assert_eq!(
+            state.lockdown_engage_calls.load(Ordering::SeqCst),
+            1,
+            "reconcile_once must see recovery's adopted claim — recorded before reconciliation ran — \
+             and engage the standing cover even though bridge-lockdown.json itself records no intent"
+        );
+    });
 }

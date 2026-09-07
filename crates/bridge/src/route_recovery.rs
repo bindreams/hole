@@ -58,7 +58,7 @@ where
 /// panicking-task branch, with a REAL [`tokio::task::JoinError`] — without a
 /// live OS-level `recover_routes` call, which the WFP/pf presence probe makes
 /// impossible to control outside elevation.
-async fn record_recovery_outcome<P, R, D>(
+pub(crate) async fn record_recovery_outcome<P, R, D>(
     outcome: Result<Recovery, tokio::task::JoinError>,
     proxy: &Arc<Mutex<ProxyManager<P, R, D>>>,
 ) where
