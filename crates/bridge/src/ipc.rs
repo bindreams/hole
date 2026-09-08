@@ -1,7 +1,7 @@
 //! IPC server — HTTP/1.1 REST API over local Unix domain socket.
 
 use tun_engine::routing::failclosed::lockdown_state;
-use tun_engine::routing::Routing;
+use tun_engine::routing::{CoverPresence, Routing};
 
 use crate::proxy::{Proxy, ProxyError};
 use crate::proxy_manager::{ProxyManager, ProxyState};
@@ -386,8 +386,26 @@ async fn handle_status<P: Proxy + 'static, R: Routing + 'static>(
     // dead session down, and that teardown can release the cover. Measuring
     // presence after it is what stops a reply advertising a cover that no
     // longer exists.
+    //
+    // In `spawn_blocking`, because the probe is an OS call — `pfctl -s labels`
+    // through a blocking `std::process::Command` on macOS, `FwpmEngineOpen0`
+    // plus one `FwpmFilterGetByKey0` per swept GUID on Windows — and status is
+    // a POLL: the tray reconciler ticks it every 5s and the dashboard polls it
+    // every 5s. Run inline it forks a subprocess on a runtime worker twice
+    // that often, which is what `foreground.rs`'s own `spawn_blocking` comment
+    // means by keeping OS work off the runtime. The predecessor this replaced
+    // was an in-memory `Posture` read, so nothing here used to block.
+    let routing = Arc::clone(&state.routing);
+    let presence = tokio::task::spawn_blocking(move || routing.lockdown_cover_presence())
+        .await
+        .unwrap_or_else(|e| {
+            tracing::error!(error = %e, "cover-presence probe task panicked");
+            // The lean every escape-offering site treats like `live`, never
+            // like `absent`: a probe that did not complete knows nothing.
+            CoverPresence::Unreachable
+        });
     Json(StatusResponse {
-        cover_presence: wire_cover_presence(state.routing.lockdown_cover_presence()),
+        cover_presence: wire_cover_presence(presence),
         ..snapshot
     })
 }

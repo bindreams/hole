@@ -114,59 +114,104 @@ fn an_unreachable_firewall_never_yields_release() {
 
 #[skuld::test]
 fn cover_step_is_exhaustive_over_presence() {
-    // Documents the full decision table this function encodes. One row per
-    // (target-kind, intent, presence) triple; the exhaustive match inside
-    // `cover_step` is what makes a missing row here a compile error instead
-    // of a silently-inherited answer.
     use CoverPresence::{Absent, Indeterminate, Live, Recorded, Unreachable};
     use CoverStep::{Engage, Hold, Release};
 
-    let intents = [Intent::On, Intent::Off, Intent::Unset, Intent::Unreadable];
-    let presences = [Live, Recorded, Absent, Indeterminate, Unreachable];
+    // The expected answers are DATA, not recomputed from the same match arms
+    // `cover_step` uses. A mirror-match version of this test verified the test
+    // file against itself: an edit to a `cover_step` arm, mechanically copied
+    // here to make the test pass again, shipped green. Disagreeing with a row
+    // below means arguing about the policy, which is the point.
 
-    for intent in intents {
-        for presence in presences {
-            // Target::Off: intent never matters — the engaged block follows
-            // the target, so every intent gets the same answer.
-            let expected_off = match presence {
-                Live | Recorded | Indeterminate => Release,
-                Absent | Unreachable => Hold,
-            };
+    // Target::Off — the engaged block follows the target, so intent never
+    // enters. One row per presence.
+    let off_table: [(CoverPresence, CoverStep); 5] = [
+        (Live, Release),
+        (Recorded, Release),
+        (Indeterminate, Release),
+        (Absent, Hold),
+        (Unreachable, Hold),
+    ];
+
+    // Target::Connected — `On`/`Unreadable` authorise engaging, `Off`/`Unset`
+    // do not. One row per (armed, presence).
+    let connected_table: [(bool, CoverPresence, CoverStep); 10] = [
+        (true, Live, Hold),
+        (true, Recorded, Engage),
+        (true, Indeterminate, Engage),
+        (true, Absent, Engage),
+        (true, Unreachable, Hold),
+        (false, Live, Release),
+        (false, Recorded, Release),
+        (false, Indeterminate, Release),
+        (false, Absent, Hold),
+        (false, Unreachable, Hold),
+    ];
+
+    for intent in ALL_INTENTS {
+        for presence in ALL_PRESENCES {
+            let (_, expected_off) = off_table
+                .iter()
+                .find(|(p, _)| *p == presence)
+                .copied()
+                .expect("off_table must have a row for every presence");
             assert_eq!(
                 cover_step(intent, presence, &Target::Off),
                 expected_off,
                 "target=Off intent={intent:?} presence={presence:?}"
             );
 
-            // Target::Unreadable: always Hold, regardless of intent or
-            // presence.
+            // Target::Unreadable authorises nothing, whatever else is true.
             assert_eq!(
                 cover_step(intent, presence, &Target::Unreadable),
                 Hold,
                 "target=Unreadable intent={intent:?} presence={presence:?}"
             );
 
-            // Target::Connected: `On`/`Unreadable` authorise engaging;
-            // `Off`/`Unset` do not.
             let armed = matches!(intent, Intent::On | Intent::Unreadable);
-            let expected_connected = if armed {
-                match presence {
-                    Live => Hold,
-                    Recorded | Indeterminate | Absent => Engage,
-                    Unreachable => Hold,
-                }
-            } else {
-                match presence {
-                    Live | Recorded | Indeterminate => Release,
-                    Absent | Unreachable => Hold,
-                }
-            };
+            let (_, _, expected_connected) = connected_table
+                .iter()
+                .find(|(a, p, _)| *a == armed && *p == presence)
+                .copied()
+                .expect("connected_table must have a row for every (armed, presence)");
             assert_eq!(
                 cover_step(intent, presence, &connected()),
                 expected_connected,
                 "target=Connected intent={intent:?} presence={presence:?}"
             );
         }
+    }
+}
+
+/// The variant lists the table above iterates.
+///
+/// An array named "all" is a claim, not a fact: adding a variant leaves it
+/// silently short, and the one test whose name promises full coverage quietly
+/// stops providing it. [`assert_variant_lists_are_complete`] is what makes
+/// them true.
+const ALL_INTENTS: [Intent; 4] = [Intent::On, Intent::Off, Intent::Unset, Intent::Unreadable];
+const ALL_PRESENCES: [CoverPresence; 5] = [
+    CoverPresence::Live,
+    CoverPresence::Recorded,
+    CoverPresence::Absent,
+    CoverPresence::Indeterminate,
+    CoverPresence::Unreachable,
+];
+
+/// Compile-time proof that the two lists above really are every variant:
+/// wildcard-free matches, so a new variant fails to compile here — the same
+/// idiom `cover_step` itself relies on. Never called; its body is the check.
+#[allow(dead_code)]
+fn assert_variant_lists_are_complete(intent: Intent, presence: CoverPresence) {
+    match intent {
+        Intent::On | Intent::Off | Intent::Unset | Intent::Unreadable => {}
+    }
+    match presence {
+        CoverPresence::Live
+        | CoverPresence::Recorded
+        | CoverPresence::Absent
+        | CoverPresence::Indeterminate
+        | CoverPresence::Unreachable => {}
     }
 }
 
