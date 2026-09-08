@@ -772,16 +772,27 @@ async fn handle_unblock<P: Proxy + 'static, R: Routing + 'static>(
     let owner = state.owner;
     let generation = Arc::clone(&state.unblock_generation);
     let persisted = tokio::task::spawn_blocking(move || -> Result<(), String> {
-        target::apply(&state_dir, owner, |_current| {
-            // Inside the closure, so the bump happens while `apply` holds the
-            // target file's exclusive lock. A concurrent `persist_after_start`
-            // reads the counter inside its own `apply`, so the two are totally
-            // ordered and neither can observe a half-committed unblock.
-            generation.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            Target::Off
-        })
+        // The bump is the COMMIT hook, not part of the closure: it must not
+        // announce a write that `save` then failed to make, and it must happen
+        // before the exclusive lock is released so a concurrent
+        // `persist_after_start` cannot observe the committed `Off` without it.
+        target::apply_committing(
+            &state_dir,
+            owner,
+            |_current| Target::Off,
+            || {
+                generation.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            },
+        )
         .map_err(|e| e.to_string())?;
         lockdown_state::set_enabled(&state_dir, false, owner).map_err(|e| e.to_string())?;
+        // Clear the auto-connect candidate too. `resolve_startup_target` feeds
+        // it to `AlwaysConnect` over an `Off` target, so leaving it would let
+        // the next boot reconnect to the server the user just escaped from —
+        // the escape undone by a record it never touched.
+        let mut pref = target::load_startup_preference(&state_dir);
+        pref.candidate = None;
+        target::save_startup_preference(&state_dir, &pref, owner).map_err(|e| e.to_string())?;
         Ok(())
     })
     .await;

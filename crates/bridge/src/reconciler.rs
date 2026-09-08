@@ -207,14 +207,23 @@ pub fn teardown_cover_disposition(
     target: &Target,
 ) -> CoverDisposition {
     match event {
+        // The one unconditional arm: an explicit user disarm releases whatever
+        // the probe says, because an escape must resolve an unknown toward
+        // releasing.
         SessionEvent::UserStopped => CoverDisposition::ReleaseNow,
-        // Both immediately precede process exit; whatever runs next adopts
-        // the filters (a new bridge after a cutover, or the next boot).
-        SessionEvent::CutoverRestart | SessionEvent::ProcessExiting => CoverDisposition::KeepEngaged,
-        SessionEvent::GaveUp | SessionEvent::Blipped => match cover_step(intent, presence, target) {
-            CoverStep::Release => CoverDisposition::ReleaseNow,
-            CoverStep::Hold | CoverStep::Engage => CoverDisposition::KeepEngaged,
-        },
+        // Everything else defers to `cover_step`, INCLUDING the two pre-exit
+        // events. Returning `KeepEngaged` for them unconditionally was a
+        // regression: `cover_step`'s `Off`/`Unset` intent arms release a
+        // stranded cover, so a shutdown or cutover with the kill switch off
+        // used to sweep one and would instead have left the host blocked with
+        // nothing owning the filters. What makes a cutover keep its cover is
+        // the intent being ON, not the event — `cover_step` already says so.
+        SessionEvent::CutoverRestart | SessionEvent::ProcessExiting | SessionEvent::GaveUp | SessionEvent::Blipped => {
+            match cover_step(intent, presence, target) {
+                CoverStep::Release => CoverDisposition::ReleaseNow,
+                CoverStep::Hold | CoverStep::Engage => CoverDisposition::KeepEngaged,
+            }
+        }
     }
 }
 

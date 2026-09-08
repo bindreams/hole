@@ -139,7 +139,7 @@ pub enum ProxyState {
 /// 3. `plugin_chain` drop — graceful stop via SIGTERM/CTRL_BREAK.
 /// 4. `proxy.stop().await` — releases SS task.
 /// 5. `routes` drop — RAII teardown.
-/// 6. `lockdown` — its fate comes from `cover_step(intent, presence, target)`,
+/// 6. `lockdown` — its fate comes from `teardown_cover_disposition(event, intent, presence, target)`,
 ///    not from why the session ended: `Release` drops it (disengage; opens
 ///    the host), `Hold`/`Engage` disarms it (the persistent filters survive).
 ///    Last so the persistent filters outlive routes by Drop order.
@@ -725,23 +725,18 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
             .map_err(|e| ProxyError::Runtime(std::io::Error::other(format!("lockdown persist: {e}"))))
     }
 
-    /// Turn the kill-switch intent off, releasing the cover unless
-    /// `cover_step` has CONFIRMED there is nothing to release. Reads no
-    /// session posture directly — Q4 ("unblock IS unticking") means a live
-    /// session's cover is released too when the persisted target is `Off`
-    /// and presence is not confirmed `Absent`; `cover_step`'s own
-    /// `Target::Off` arm is what decides that, uniformly, whether or not a
-    /// session is running.
+    /// Turn the kill-switch intent off, releasing the cover UNCONDITIONALLY.
+    /// Reads no session posture — Q4 ("unblock IS unticking") means a live
+    /// session's cover is released too.
     ///
-    /// A target the bridge cannot even read, or a presence probe that
-    /// cannot even reach the OS (`Target::Unreadable` / `CoverPresence::
-    /// Unreachable`), is not evidence the host is clean — `cover_step`
-    /// holds on both because it has no authority to decide either way, but
-    /// this is an EXPLICIT user disarm, not a steady-state reconcile: an
-    /// escape-offering site must resolve an unknown toward releasing, never
-    /// toward "nothing to do" (see `crates/common/api/openapi.yaml`'s
-    /// `CoverPresence` doc). `release_all_covers` is documented unconditional
-    /// and idempotent, so calling it on a false positive costs nothing.
+    /// There is deliberately no presence check in front of the release. This
+    /// once consulted `cover_step` and skipped the call on a confirmed
+    /// `Absent`, which is check-then-act on an operation documented
+    /// idempotent — and at an EXPLICIT user disarm a stale `Absent` is the one
+    /// wrong answer that matters: it reports success while the host stays
+    /// blocked. A redundant release costs nothing; a skipped one strands the
+    /// user. `handle_unblock` shares this rule, which is what removed the
+    /// discrepancy the two bespoke `must_release` expressions used to carry.
     ///
     /// Release-then-persist ordering is load-bearing: the tray offers this
     /// escape while the intent is on, so flipping the intent off after a
@@ -1884,7 +1879,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
 
     /// Stop the proxy in response to `event`. The standing lockdown cover's
     /// fate is no longer read off `event` directly — it comes from
-    /// [`cover_step`], decided against the *persisted* [`Target`] `event`
+    /// [`teardown_cover_disposition`], decided against the *persisted* [`Target`] `event`
     /// moves it to (see [`persist_session_event`](Self::persist_session_event)).
     /// Routes/DNS/proxy/plugin tear down identically regardless of `event`.
     ///
@@ -1892,7 +1887,8 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
     /// with `Idle` up front: `Idle` is a no-op; `PendingStart` decides the
     /// held transient cover's fate directly from `event` (this is the
     /// bounded-window failclosed cover, a wholly separate mechanism from the
-    /// standing one `cover_step` governs — see `apply_cover_step`); `Session`
+    /// standing one `teardown_cover_disposition` governs — see
+    /// `apply_cover_disposition`); `Session`
     /// runs the full teardown below.
     pub async fn stop_with(&mut self, event: SessionEvent) -> Result<(), ProxyError> {
         let target = self.persist_session_event(event).await;

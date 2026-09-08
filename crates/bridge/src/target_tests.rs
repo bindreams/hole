@@ -562,8 +562,13 @@ fn windows_state_dir_and_files_are_not_readable_by_users() {
             "{what} DACL still grants BUILTIN\\Users: {sddl}"
         );
         let me = crate::target::current_user_sid().expect("current token user SID");
+        // Windows renders well-known SIDs as SDDL abbreviations, so the raw
+        // string need not appear. Under the service the token user IS SYSTEM,
+        // already granted by `SDDL_BASE` as `SY`; only a non-well-known user —
+        // the elevation-mode case this assertion exists for — shows verbatim.
+        let well_known = ["S-1-5-18", "S-1-5-32-544"];
         assert!(
-            sddl.contains(&me),
+            sddl.contains(&me) || well_known.contains(&me.as_str()),
             "{what} DACL does not grant the current user ({me}), which would \
              lock the elevation-mode owner out of their own state dir: {sddl}"
         );

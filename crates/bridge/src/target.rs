@@ -254,7 +254,11 @@ pub(crate) fn current_user_sid() -> std::io::Result<String> {
     // query the required size.
     let _ = unsafe { GetTokenInformation(token, TokenUser, None, 0, &mut len) };
 
-    let mut buf = vec![0u8; len as usize];
+    // `Vec<u64>`, not `Vec<u8>`: `TOKEN_USER` has pointer alignment, and
+    // forming a reference to it out of a byte vector (alignment 1) is
+    // undefined behaviour even when the address happens to land aligned.
+    let words = (len as usize).div_ceil(std::mem::size_of::<u64>()).max(1);
+    let mut buf = vec![0u64; words];
     // SAFETY: `buf` is at least `len` bytes, which is the size the call above
     // reported for this token's `TOKEN_USER`.
     let info = unsafe { GetTokenInformation(token, TokenUser, Some(buf.as_mut_ptr().cast()), len, &mut len) };
@@ -273,13 +277,14 @@ pub(crate) fn current_user_sid() -> std::io::Result<String> {
     unsafe { ConvertSidToStringSidW(user.User.Sid, &mut raw) }
         .map_err(|e| std::io::Error::other(format!("ConvertSidToStringSidW failed: {e}")))?;
     // SAFETY: `raw` is a NUL-terminated wide string owned by us until LocalFree.
-    let sid =
-        unsafe { raw.to_string() }.map_err(|e| std::io::Error::other(format!("SID was not valid UTF-16: {e}")))?;
+    let sid = unsafe { raw.to_string() };
+    // Freed BEFORE propagating: an early `?` on the conversion would leak the
+    // allocation on the one path where the string turns out to be unusable.
     // SAFETY: `raw` came from LocalAlloc inside `ConvertSidToStringSidW`.
     unsafe {
         let _ = LocalFree(Some(std::mem::transmute::<PWSTR, HLOCAL>(raw)));
     }
-    Ok(sid)
+    sid.map_err(|e| std::io::Error::other(format!("SID was not valid UTF-16: {e}")))
 }
 
 /// SDDL for the state directory and its files: SYSTEM + Administrators (from
@@ -311,7 +316,13 @@ fn state_sddl() -> String {
 /// matters.
 #[cfg(windows)]
 fn set_dir_mode(dir: &Path) -> Result<(), TargetError> {
-    crate::ipc::set_dacl_from_sddl(dir, &state_sddl(), true).map_err(TargetError::SetPermissions)
+    // `OICI` on every ACE: object- and container-inherit. Without it a
+    // PROTECTED directory DACL leaves children inheriting NOTHING, so state
+    // files written later by other modules (`bridge-routes.json`,
+    // `bridge-lockdown.json`, the lock files) fall back to whatever default
+    // the creating token supplies instead of the policy set here.
+    let sddl = state_sddl().replace("(A;;", "(A;OICI;");
+    crate::ipc::set_dacl_from_sddl(dir, &sddl, true).map_err(TargetError::SetPermissions)
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -411,6 +422,26 @@ pub fn apply(
     owner: Option<(u32, u32)>,
     f: impl FnOnce(Target) -> Target,
 ) -> Result<Target, TargetError> {
+    apply_committing(state_dir, owner, f, || {})
+}
+
+/// [`apply`] plus `on_commit`, run only after the new target is durably saved
+/// and while the exclusive lock is STILL held.
+///
+/// That placement is the point. A caller that needs to publish "this write
+/// happened" — `handle_unblock` bumping the generation counter
+/// `persist_after_start` compares against — cannot do it inside `f`, because
+/// `f` runs before `save` and a save failure would leave the announcement
+/// standing over a write that never landed, permanently declining every later
+/// start's target write. Doing it after `apply` returns is equally wrong: the
+/// lock is gone by then, so a concurrent reader can observe the commit without
+/// the announcement.
+pub fn apply_committing(
+    state_dir: &Path,
+    owner: Option<(u32, u32)>,
+    f: impl FnOnce(Target) -> Target,
+    on_commit: impl FnOnce(),
+) -> Result<Target, TargetError> {
     let _lock = TargetExclusive::acquire(state_dir, owner).map_err(TargetError::Lock)?;
     let current = load(state_dir);
     let next = f(current);
@@ -423,6 +454,7 @@ pub fn apply(
         return Ok(next);
     }
     save(state_dir, &next, owner)?;
+    on_commit();
     Ok(next)
 }
 

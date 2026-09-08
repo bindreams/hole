@@ -670,6 +670,24 @@ fn teardown_disposition_is_exhaustive_over_events() {
             "event={event:?} presence={presence:?} target={target:?}"
         );
     }
+
+    // The intent axis, which the table above holds fixed at `On`. With the
+    // kill switch OFF a live cover is stranded, and every non-`UserStopped`
+    // event must sweep it — including the two pre-exit ones. Returning
+    // `KeepEngaged` for those unconditionally left the host blocked with
+    // nothing owning the filters, which is what this row set exists to catch.
+    for event in [
+        SessionEvent::CutoverRestart,
+        SessionEvent::ProcessExiting,
+        SessionEvent::GaveUp,
+        SessionEvent::Blipped,
+    ] {
+        assert_eq!(
+            teardown_cover_disposition(event, Intent::Off, CoverPresence::Live, &connected),
+            CoverDisposition::ReleaseNow,
+            "{event:?} with the kill switch off must sweep a stranded cover, not keep it engaged"
+        );
+    }
 }
 
 // Contract guards =====================================================================================================
@@ -679,7 +697,12 @@ fn teardown_disposition_is_exhaustive_over_events() {
 fn code_lines(text: &str) -> impl Iterator<Item = (usize, &str)> {
     text.lines().enumerate().filter(|(_, l)| {
         let t = l.trim_start();
-        !t.starts_with("//") && !t.starts_with("/*") && !t.starts_with('*')
+        // NOT `starts_with('*')`: that also drops real code beginning with a
+        // dereference (`*cover_presence != ..`), exactly a line this guard
+        // exists to catch. Block-comment interiors become a false-positive
+        // source instead — a spurious failure is safe; a silently skipped
+        // decision site is not.
+        !t.starts_with("//") && !t.starts_with("/*")
     })
 }
 
@@ -696,9 +719,9 @@ fn code_lines(text: &str) -> impl Iterator<Item = (usize, &str)> {
 /// working. What this forbids is DECIDING from one (`=>`, `==`, `!=`).
 #[skuld::test]
 fn session_event_policy_lives_on_the_type_not_at_call_sites() {
-    let src_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-    // The two exhaustive deciders. Everything else asks them, or asks a
-    // classifier method on the enum.
+    let scan_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let src_root = scan_root.clone();
+    // The two exhaustive deciders, by path relative to `src/`.
     let sanctioned = ["target.rs", "reconciler.rs"];
     let mut offenders: Vec<String> = Vec::new();
 
@@ -709,7 +732,14 @@ fn session_event_policy_lives_on_the_type_not_at_call_sites() {
             continue;
         }
         let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-        if name.ends_with("_tests.rs") || sanctioned.contains(&name) {
+        // Relative PATH, never a bare file name: `macos.rs` alone would
+        // exempt every file of that name in the tree.
+        let rel = path
+            .strip_prefix(&scan_root)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .replace('\\', "/");
+        if name.ends_with("_tests.rs") || sanctioned.contains(&rel.as_str()) {
             continue;
         }
         if path.components().any(|c| c.as_os_str() == "test_support") {
@@ -717,7 +747,15 @@ fn session_event_policy_lives_on_the_type_not_at_call_sites() {
         }
         let text = std::fs::read_to_string(path).expect("failed to read a walked source file");
         for (idx, line) in code_lines(&text) {
-            if line.contains("SessionEvent::") && (line.contains("=>") || line.contains("==") || line.contains("!=")) {
+            // `matches!` decides too, and a match arm can be split across
+            // lines, leaving a bare `SessionEvent::Variant` on one of them.
+            let decides = line.contains("=>")
+                || line.contains("==")
+                || line.contains("!=")
+                || line.contains("matches!")
+                || line.trim_end().ends_with('|')
+                || line.trim_start().starts_with('|');
+            if line.contains("SessionEvent::") && decides {
                 offenders.push(format!("{}:{}: {}", path.display(), idx + 1, line.trim()));
             }
         }
@@ -757,7 +795,17 @@ fn cover_presence_is_never_compared_against_a_variant() {
     // the two type definitions, plus the platform modules under
     // `failclosed/` that PRODUCE the probe (they classify their own raw OS
     // result; the invariant is about consumers of the answer).
-    let sanctioned = ["routing.rs", "protocol.rs", "macos.rs", "windows.rs"];
+    let scan_root = workspace.clone();
+    // The type definitions, plus the platform modules that PRODUCE the probe
+    // (they classify their own raw OS result; the invariant binds consumers).
+    // Path-qualified: bare `macos.rs`/`windows.rs` exempted fourteen unrelated
+    // files, including `crates/bridge/src/platform/macos.rs`.
+    let sanctioned = [
+        "crates/tun-engine/src/routing.rs",
+        "crates/common/src/protocol.rs",
+        "crates/tun-engine/src/routing/failclosed/macos.rs",
+        "crates/tun-engine/src/routing/failclosed/windows.rs",
+    ];
     let mut offenders: Vec<String> = Vec::new();
 
     for entry in walkdir::WalkDir::new(workspace.join("crates")) {
@@ -767,7 +815,14 @@ fn cover_presence_is_never_compared_against_a_variant() {
             continue;
         }
         let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-        if name.ends_with("_tests.rs") || sanctioned.contains(&name) {
+        // Relative PATH, never a bare file name: `macos.rs` alone would
+        // exempt every file of that name in the tree.
+        let rel = path
+            .strip_prefix(&scan_root)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .replace('\\', "/");
+        if name.ends_with("_tests.rs") || sanctioned.contains(&rel.as_str()) {
             continue;
         }
         if path
