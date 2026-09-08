@@ -418,7 +418,7 @@ fn reconcile_once_honours_an_always_connect_startup_preference_with_a_candidate(
 /// generated inside a macro body may mis-attribute (accepted: this guard fails
 /// loud, so a mis-attribution surfaces as a failure to investigate, never as a
 /// silent pass).
-fn fn_decl_re() -> regex::Regex {
+pub(crate) fn fn_decl_re() -> regex::Regex {
     regex::Regex::new(
         r#"^\s*(?:pub(?:\s*\([^)]*\))?\s+)?(?:default\s+)?(?:const\s+)?(?:async\s+)?(?:unsafe\s+)?(?:extern\s+"[^"]*"\s+)?fn\s+([A-Za-z_][A-Za-z0-9_]*)"#,
     )
@@ -429,7 +429,7 @@ fn fn_decl_re() -> regex::Regex {
 /// line)`. Identity is the function name, not the line number, so an edit
 /// above a call site cannot change what the guard sees — the property
 /// `the_sanctioned_caller_guard_survives_line_shifts` pins.
-fn call_sites_by_function(text: &str, pattern: &regex::Regex) -> Vec<(String, String)> {
+pub(crate) fn call_sites_by_function(text: &str, pattern: &regex::Regex) -> Vec<(String, String)> {
     let decl = fn_decl_re();
     let lines: Vec<&str> = text.lines().collect();
     let mut out = Vec::new();

@@ -349,29 +349,47 @@ fn build_router<P: Proxy + 'static, R: Routing + 'static>(state: Arc<IpcState<P,
 async fn handle_status<P: Proxy + 'static, R: Routing + 'static>(
     State(state): State<Arc<IpcState<P, R>>>,
 ) -> Json<StatusResponse> {
-    let mut pm = state.proxy.lock().await;
-    if let Some(event) = pm.check_health() {
-        if let Err(e) = pm.stop_with(event).await {
-            tracing::error!(error = %e, "error tearing down proxy after a failed health check");
+    // The manager's fields are copied out and the guard is DROPPED at the end
+    // of this block — deliberately, not incidentally. Reading presence through
+    // `pm` would run an OS probe (a `pfctl -s labels` fork on macOS) inside
+    // this critical section, on a path the GUI polls every 5s for the life of
+    // the app, contending with `handle_start`/`stop_with` for the same lock.
+    // Returning the guard from the block instead of its values would keep the
+    // lock held and silently undo this.
+    let snapshot = {
+        let mut pm = state.proxy.lock().await;
+        if let Some(event) = pm.check_health() {
+            if let Err(e) = pm.stop_with(event).await {
+                tracing::error!(error = %e, "error tearing down proxy after a failed health check");
+            }
         }
-    }
+        StatusResponse {
+            running: pm.state() == ProxyState::Running,
+            uptime_secs: pm.uptime_secs(),
+            // Death reason only (path-free, #470) — NOT `last_error`, which can
+            // carry a filesystem path/hostname from a failed start and must never
+            // reach the GUI toast. The rich detail stays in `last_error` for
+            // diagnostics (bridge="error") and the click-path start-error surface.
+            // Redacted at the boundary alongside `StartError::Failed`, so "no
+            // outgoing error string carries the server address" holds for the
+            // whole response surface rather than for one variant.
+            error: pm.death_reason().map(|s| util::redact::redact_str(s).into_owned()),
+            invalid_filters: pm.invalid_filters(),
+            udp_proxy_available: pm.udp_proxy_available(),
+            ipv6_bypass_available: pm.ipv6_bypass_available(),
+            lockdown_enabled: pm.lockdown_enabled(),
+            // Filled in below, once the lock is released.
+            cover_presence: hole_common::protocol::CoverPresence::Absent,
+            blocked_until_connected: pm.blocked_until_connected(),
+        }
+    };
+    // Ordering is load-bearing and must stay: `check_health` above can tear a
+    // dead session down, and that teardown can release the cover. Measuring
+    // presence after it is what stops a reply advertising a cover that no
+    // longer exists.
     Json(StatusResponse {
-        running: pm.state() == ProxyState::Running,
-        uptime_secs: pm.uptime_secs(),
-        // Death reason only (path-free, #470) — NOT `last_error`, which can
-        // carry a filesystem path/hostname from a failed start and must never
-        // reach the GUI toast. The rich detail stays in `last_error` for
-        // diagnostics (bridge="error") and the click-path start-error surface.
-        // Redacted at the boundary alongside `StartError::Failed`, so "no
-        // outgoing error string carries the server address" holds for the
-        // whole response surface rather than for one variant.
-        error: pm.death_reason().map(|s| util::redact::redact_str(s).into_owned()),
-        invalid_filters: pm.invalid_filters(),
-        udp_proxy_available: pm.udp_proxy_available(),
-        ipv6_bypass_available: pm.ipv6_bypass_available(),
-        lockdown_enabled: pm.lockdown_enabled(),
-        cover_presence: wire_cover_presence(pm.cover_presence()),
-        blocked_until_connected: pm.blocked_until_connected(),
+        cover_presence: wire_cover_presence(state.routing.lockdown_cover_presence()),
+        ..snapshot
     })
 }
 

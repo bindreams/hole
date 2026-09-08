@@ -2992,3 +2992,33 @@ async fn an_unblock_during_the_post_start_persist_is_not_reverted() {
          records disagreeing about what the user last asked for"
     );
 }
+
+// Status probe placement ==============================================================================================
+
+/// `handle_status` used to reach cover presence through `pm.cover_presence()`
+/// while holding `state.proxy.lock()`. On macOS that probe forks
+/// `pfctl -s labels`, and the GUI polls status every 5s for the life of the
+/// app — so every poll ran a subprocess inside the same critical section
+/// `handle_start` and `stop_with` need.
+///
+/// Asserted structurally rather than by racing two tasks: the runtime version
+/// can only conclude "still serialised" by waiting, and the only way to bound
+/// that wait is a timeout, which this project forbids for synchronisation.
+/// `IpcState` already carries the same `Arc<R>` (added for `handle_unblock`),
+/// so the invariant is simply that this file never takes the manager's route.
+#[skuld::test]
+fn status_reads_presence_off_the_routing_handle_not_the_proxy_manager() {
+    let ipc_rs = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("src")
+        .join("ipc.rs");
+    let text = std::fs::read_to_string(&ipc_rs).expect("failed to read ipc.rs");
+    // A literal `.` before the name, so `routing.lockdown_cover_presence()`
+    // — the sanctioned route — does not match.
+    let pattern = regex::Regex::new(r"\.cover_presence\s*\(").unwrap();
+    let sites = crate::reconciler::reconciler_tests::call_sites_by_function(&text, &pattern);
+    assert!(
+        sites.is_empty(),
+        "ipc.rs reaches cover presence through the ProxyManager, which means the OS probe runs \
+         inside the proxy lock: {sites:?}. Read it from `state.routing` instead."
+    );
+}

@@ -297,4 +297,4 @@ pub async fn reconcile_once<P, R, D>(
 
 #[cfg(test)]
 #[path = "reconciler_tests.rs"]
-mod reconciler_tests;
+pub(crate) mod reconciler_tests;
