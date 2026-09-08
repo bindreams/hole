@@ -195,45 +195,33 @@ fn lockdown_off_renders_plain_label() {
 
 #[skuld::test]
 fn escape_items_offers_unblock_and_go_offline_independently() {
-    // Exhaustive over all 20 (cover_presence, running, blocked_offers_go_offline)
-    // rows (5 CoverPresence variants x 2 x 2). `unblock` is exactly
-    // `cover_presence != Absent` — `running` no longer participates: the
-    // escape is gated on observed cover presence alone, never on recorded
-    // session posture (Task 8b). `go_offline` is exactly
-    // `blocked_offers_go_offline`. Both can be true at once — rendering both
-    // is the point (rule #0 favours more escapes over fewer).
+    // Exhaustive over the gate's REAL domain: 5 `CoverPresence` variants x
+    // `blocked_offers_go_offline`. `running` was removed from the signature —
+    // the escape is gated on observed cover presence alone, never on recorded
+    // session posture (Task 8b) — so crossing it in would have duplicated
+    // every row rather than testing anything.
     let table = [
-        // (cover_presence, running, blocked_offers_go_offline, expect_go_offline, expect_unblock)
-        (CoverPresence::Live, false, true, true, true),
-        (CoverPresence::Live, false, false, false, true),
-        (CoverPresence::Live, true, true, true, true),
-        (CoverPresence::Live, true, false, false, true),
-        (CoverPresence::Recorded, false, true, true, true),
-        (CoverPresence::Recorded, false, false, false, true),
-        (CoverPresence::Recorded, true, true, true, true),
-        (CoverPresence::Recorded, true, false, false, true),
-        (CoverPresence::Indeterminate, false, true, true, true),
-        (CoverPresence::Indeterminate, false, false, false, true),
-        (CoverPresence::Indeterminate, true, true, true, true),
-        (CoverPresence::Indeterminate, true, false, false, true),
-        (CoverPresence::Unreachable, false, true, true, true),
-        (CoverPresence::Unreachable, false, false, false, true),
-        (CoverPresence::Unreachable, true, true, true, true),
-        (CoverPresence::Unreachable, true, false, false, true),
-        (CoverPresence::Absent, false, true, true, false),
-        (CoverPresence::Absent, false, false, false, false),
-        (CoverPresence::Absent, true, true, true, false),
-        (CoverPresence::Absent, true, false, false, false),
+        // (cover_presence, blocked_offers_go_offline, expect_go_offline, expect_unblock)
+        (CoverPresence::Live, true, true, true),
+        (CoverPresence::Live, false, false, true),
+        (CoverPresence::Recorded, true, true, true),
+        (CoverPresence::Recorded, false, false, true),
+        (CoverPresence::Indeterminate, true, true, true),
+        (CoverPresence::Indeterminate, false, false, true),
+        (CoverPresence::Unreachable, true, true, true),
+        (CoverPresence::Unreachable, false, false, true),
+        (CoverPresence::Absent, true, true, false),
+        (CoverPresence::Absent, false, false, false),
     ];
-    for (cover_presence, running, blocked_offers_go_offline, expect_go_offline, expect_unblock) in table {
-        let escapes = escape_items(cover_presence, running, blocked_offers_go_offline);
+    for (cover_presence, blocked_offers_go_offline, expect_go_offline, expect_unblock) in table {
+        let escapes = escape_items(cover_presence, blocked_offers_go_offline);
         assert_eq!(
             escapes,
             EscapeItems {
                 go_offline: expect_go_offline,
                 unblock: expect_unblock,
             },
-            "cover_presence={cover_presence:?} running={running} blocked_offers_go_offline={blocked_offers_go_offline}"
+            "cover_presence={cover_presence:?} blocked_offers_go_offline={blocked_offers_go_offline}"
         );
     }
 }
@@ -242,7 +230,7 @@ fn escape_items_offers_unblock_and_go_offline_independently() {
 fn the_escape_is_offered_when_a_cover_is_recorded_but_intent_is_off() {
     // A cover recorded from a prior run, observed while intent reads off,
     // still needs an escape: presence is what gates it, not intent.
-    let escapes = escape_items(CoverPresence::Recorded, false, false);
+    let escapes = escape_items(CoverPresence::Recorded, false);
     assert!(escapes.unblock, "a Recorded cover must still offer the unblock escape");
 }
 
@@ -255,12 +243,12 @@ fn only_a_confirmed_absent_cover_hides_the_escape() {
         CoverPresence::Unreachable,
     ] {
         assert!(
-            escape_items(presence, false, false).unblock,
+            escape_items(presence, false).unblock,
             "{presence:?} must offer the unblock escape"
         );
     }
     assert!(
-        !escape_items(CoverPresence::Absent, false, false).unblock,
+        !escape_items(CoverPresence::Absent, false).unblock,
         "only a confirmed Absent cover hides the unblock escape"
     );
 }
@@ -272,7 +260,7 @@ fn an_unreachable_probe_keeps_the_escape_offered() {
     // unblock escape offered (with no session running), same as a confirmed
     // Live/Recorded cover.
     for presence in [CoverPresence::Indeterminate, CoverPresence::Unreachable] {
-        let escapes = escape_items(presence, false, false);
+        let escapes = escape_items(presence, false);
         assert!(
             escapes.unblock,
             "an uncertain probe ({presence:?}) must still offer the unblock escape"

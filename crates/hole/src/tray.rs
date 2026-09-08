@@ -352,15 +352,15 @@ struct EscapeItems {
 }
 
 /// Resolve which escape items to show. The two conditions are independent —
-/// exhaustive table test over all 20 `(cover_presence, running,
+/// exhaustive table test over all 10 `(cover_presence,
 /// blocked_offers_go_offline)` rows. `unblock` keys on `cover_presence`
-/// alone, never on `running`: gating it on `!running` was deriving a
-/// lockdown answer from the tunnel surface, exactly the coupling this model
-/// removes — the escape's handler (`ipc::handle_unblock`) reads no
-/// session posture either, so the affordance must not pretend one exists.
-/// `Indeterminate`/`Unreachable` count as present — an uncertain probe must
-/// never resolve toward "nothing is blocking".
-fn escape_items(cover_presence: CoverPresence, _running: bool, blocked_offers_go_offline: bool) -> EscapeItems {
+/// alone: gating it on `!running` was deriving a lockdown answer from the
+/// tunnel surface, exactly the coupling this model removes — the escape's
+/// handler (`ipc::handle_unblock`) reads no session posture either, so the
+/// affordance must not pretend one exists, and this signature must not carry
+/// an input it does not read. `Indeterminate`/`Unreachable` count as present
+/// — an uncertain probe must never resolve toward "nothing is blocking".
+fn escape_items(cover_presence: CoverPresence, blocked_offers_go_offline: bool) -> EscapeItems {
     EscapeItems {
         go_offline: blocked_offers_go_offline,
         unblock: cover_presence != CoverPresence::Absent,
@@ -437,7 +437,7 @@ fn build_tray_menu(
     };
 
     let mut items: Vec<&dyn tauri::menu::IsMenuItem<tauri::Wry>> = vec![&status, &connect];
-    let escapes = escape_items(cover_presence, running, acts.show_go_offline);
+    let escapes = escape_items(cover_presence, acts.show_go_offline);
     if escapes.go_offline {
         items.push(&go_offline);
     }
