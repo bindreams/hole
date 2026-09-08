@@ -119,6 +119,12 @@
       "enabled": false
     },
     {
+      "description": "schemars is typify's choice, not ours: crates/common/build.rs names `schemars::schema::Schema` to feed `typify::TypeSpace`, typify does not re-export schemars, and typify-impl 0.7.0 (its latest, 2026-06) still requires ^0.8.22. schemars 0.9 and 1.x both made the `schema` module private, so a bump past 0.8 fails the build script with E0603 and turns every Rust-compiling job red — bindreams/hole#379, closed as upstream-blocked. Cargo cannot catch this (two schemars already coexist here: serde_with pulls 0.9 beside typify's 0.8), so the resolution succeeds and only compilation fails, which is invisible to Renovate. `allowedVersions` keeps patch updates within 0.8 flowing while suppressing the impossible one. NOT `enabled: false` — that would also stop a 0.8.x security patch. The pin's expiry is enforced by the `schemars_pin_still_tracks_typify` conformance test, which reads typify's own requirement from `cargo metadata` and fails when it stops being 0.8; deleting this rule without that test going red will re-open #379. Upstream plan is a rework, not a bump (oxidecomputer/typify#886 — the schemars schema structs 'have been removed. We will roll our own IR').",
+      "matchManagers": ["cargo"],
+      "matchDepNames": ["schemars"],
+      "allowedVersions": "<0.9"
+    },
+    {
       "description": "Rust compiler: its own reviewable PR, never automerged. A compiler bump lands new default-on clippy lints across the whole workspace at once (#855), so it must not ride in a batch. `groupName: null` un-groups it; `automerge: false` overrides the major-updates rule above, which matches every manager including this one. Last rule wins — these compiler rules must stay LAST in this array.",
       "matchManagers": ["rust-toolchain"],
       "matchDepNames": ["rust"],

@@ -34,6 +34,7 @@ pub mod interrupt;
 pub mod manifest;
 pub mod orchestrate;
 pub mod pull_subrepo;
+pub mod schemars_pin;
 pub mod skuld_label_coverage;
 pub mod stage;
 pub mod target;
@@ -61,6 +62,9 @@ mod ci_timeouts_tests;
 #[cfg(test)]
 #[path = "ci_toolchain_pins_tests.rs"]
 mod ci_toolchain_pins_tests;
+#[cfg(test)]
+#[path = "schemars_pin_tests.rs"]
+mod schemars_pin_tests;
 // These tests render with the macOS system font (/System/Library/Fonts/SFNS.ttf);
 // the DMG background is a darwin-only feature, so gate them to macOS. They fail
 // loudly on macOS if the font is missing — other platforms simply lack the feature.
