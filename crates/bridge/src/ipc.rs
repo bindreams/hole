@@ -108,6 +108,18 @@ pub struct IpcState<P: Proxy, R: Routing> {
     /// tell its own `Posture::PendingStart` guard is a zombie the next time
     /// it looks.
     pub cover_invalidated: Arc<std::sync::atomic::AtomicBool>,
+    /// Bumped by `handle_unblock` from INSIDE its `target::apply` closure, so
+    /// the increment is serialised against every other target write by the
+    /// same file lock. `handle_start`/`handle_reload` snapshot it before
+    /// touching the proxy and hand the snapshot to `persist_after_start`,
+    /// which declines its write if the counter moved — the compare-and-set
+    /// half of f745e03c that the proxy lock cannot provide, because
+    /// `handle_unblock` deliberately takes no proxy lock.
+    ///
+    /// A counter rather than `cover_invalidated`: that flag is consumed by
+    /// `start_cancellable`, which `reload`'s hot-swap path never calls, so a
+    /// single stale unblock would wedge every later hot-swap reload's write.
+    pub unblock_generation: Arc<std::sync::atomic::AtomicU64>,
     // std::sync::Mutex — never held across .await. See StartCancelState docs.
     pub start_cancel: Arc<std::sync::Mutex<StartCancelState>>,
     /// This bridge's build version, stamped on every response
@@ -181,6 +193,7 @@ impl IpcServer {
             proxy,
             routing,
             cover_invalidated,
+            unblock_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             start_cancel: Arc::new(std::sync::Mutex::new(StartCancelState::default())),
             version: version.to_owned(),
             log_dir,
@@ -479,10 +492,13 @@ async fn handle_start<P: Proxy + 'static, R: Routing + 'static>(
     // own startup-preference read-modify-write against a second start's,
     // since single-occupancy (the 409 above) will not admit the next start
     // until `in_flight` clears below, after this persist has completed.
+    // Snapshot BEFORE the proxy lock: any unblock from here on is concurrent
+    // with this start and must win the target write.
+    let unblock_snapshot = state.unblock_generation.load(std::sync::atomic::Ordering::SeqCst);
     let result = {
         let mut pm = state.proxy.lock().await;
         let result = pm.start_cancellable(&config, covered, token).await;
-        persist_after_start(&state, &config, on_startup, result.is_ok()).await;
+        persist_after_start(&state, &config, on_startup, result.is_ok(), unblock_snapshot).await;
         result
     };
 
@@ -542,6 +558,7 @@ async fn persist_after_start<P: Proxy, R: Routing>(
     config: &ProxyConfig,
     on_startup: Option<StartupBehavior>,
     succeeded: bool,
+    unblock_snapshot: u64,
 ) {
     #[cfg(test)]
     {
@@ -555,17 +572,36 @@ async fn persist_after_start<P: Proxy, R: Routing>(
     let state_dir = state.state_dir.clone();
     let owner = state.owner;
     let config = config.clone();
+    let generation = Arc::clone(&state.unblock_generation);
     let outcome = tokio::task::spawn_blocking(move || -> Result<(), target::TargetError> {
         if succeeded {
             let candidate_config = config.clone();
-            target::apply(&state_dir, owner, move |_current| Target::Connected {
-                config: Box::new(config),
+            let declined = std::sync::atomic::AtomicBool::new(false);
+            let declined_ref = &declined;
+            target::apply(&state_dir, owner, move |current| {
+                if generation.load(std::sync::atomic::Ordering::SeqCst) != unblock_snapshot {
+                    // An unblock committed `Target::Off` after this start
+                    // began. It is the newer intent; leave it standing.
+                    declined_ref.store(true, std::sync::atomic::Ordering::SeqCst);
+                    current
+                } else {
+                    Target::Connected {
+                        config: Box::new(config),
+                    }
+                }
             })?;
             let mut pref = target::load_startup_preference(&state_dir);
             if let Some(on_startup) = on_startup {
                 pref.on_startup = on_startup;
             }
-            pref.candidate = Some(Box::new(candidate_config));
+            // The candidate records what actually happened, so it follows the
+            // target's fate: recording it after a declined write would leave
+            // the two disagreeing about what the user last asked for. The
+            // `on_startup` push above is a PREFERENCE, not a record, so it
+            // stands either way.
+            if !declined.load(std::sync::atomic::Ordering::SeqCst) {
+                pref.candidate = Some(Box::new(candidate_config));
+            }
             target::save_startup_preference(&state_dir, &pref, owner)
         } else if let Some(on_startup) = on_startup {
             let mut pref = target::load_startup_preference(&state_dir);
@@ -716,8 +752,17 @@ async fn handle_unblock<P: Proxy + 'static, R: Routing + 'static>(
     // offering Unblock — while the host stays held closed.
     let state_dir = state.state_dir.clone();
     let owner = state.owner;
+    let generation = Arc::clone(&state.unblock_generation);
     let persisted = tokio::task::spawn_blocking(move || -> Result<(), String> {
-        target::apply(&state_dir, owner, |_current| Target::Off).map_err(|e| e.to_string())?;
+        target::apply(&state_dir, owner, |_current| {
+            // Inside the closure, so the bump happens while `apply` holds the
+            // target file's exclusive lock. A concurrent `persist_after_start`
+            // reads the counter inside its own `apply`, so the two are totally
+            // ordered and neither can observe a half-committed unblock.
+            generation.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Target::Off
+        })
+        .map_err(|e| e.to_string())?;
         lockdown_state::set_enabled(&state_dir, false, owner).map_err(|e| e.to_string())?;
         Ok(())
     })
@@ -1037,6 +1082,7 @@ async fn handle_reload<P: Proxy + 'static, R: Routing + 'static>(
     State(state): State<Arc<IpcState<P, R>>>,
     Json(config): Json<ProxyConfig>,
 ) -> Result<Json<EmptyResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let unblock_snapshot = state.unblock_generation.load(std::sync::atomic::Ordering::SeqCst);
     let mut pm = state.proxy.lock().await;
     let result = pm.reload(&config).await;
     // `ProxyManager::reload` never persists on either of its own paths — the
@@ -1048,7 +1094,7 @@ async fn handle_reload<P: Proxy + 'static, R: Routing + 'static>(
     // `on_startup` untouched, same as a Start with no header) keeps a
     // successful reload's config from silently reverting to the pre-reload
     // one on the next crash-recovery read of the target.
-    persist_after_start(&state, &config, None, result.is_ok()).await;
+    persist_after_start(&state, &config, None, result.is_ok(), unblock_snapshot).await;
     match result {
         Ok(()) => Ok(Json(EmptyResponse {})),
         Err(e) => {

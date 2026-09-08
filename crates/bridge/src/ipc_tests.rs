@@ -1550,6 +1550,7 @@ fn ipc_state_with_persist_gate(
         proxy,
         routing: routing_handle,
         cover_invalidated,
+        unblock_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         start_cancel: Arc::new(std::sync::Mutex::new(StartCancelState::default())),
         version: "test".to_string(),
         log_dir: dir.clone(),
@@ -1730,6 +1731,7 @@ fn ipc_state_with_dir(dir: PathBuf) -> Arc<IpcState<MockProxy, MockRouting>> {
         proxy,
         routing: routing_handle,
         cover_invalidated,
+        unblock_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         start_cancel: Arc::new(std::sync::Mutex::new(StartCancelState::default())),
         version: "test".to_string(),
         log_dir: dir.clone(),
@@ -2831,6 +2833,7 @@ fn ipc_state(proxy: Arc<Mutex<ProxyManager<MockProxy, MockRouting>>>) -> Arc<Ipc
         proxy,
         routing,
         cover_invalidated,
+        unblock_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         start_cancel: Arc::new(std::sync::Mutex::new(StartCancelState::default())),
         version: "test".to_string(),
         log_dir: dir.clone(),
@@ -2940,4 +2943,52 @@ async fn an_outgoing_error_carrying_the_address_is_redacted() {
         "the toast would have carried the address: {wire}"
     );
     assert!(wire.contains(&token), "the outgoing error lost its token: {wire}");
+}
+
+// Unblock vs post-start persist =======================================================================================
+
+/// f745e03c, second half. Holding the proxy lock across the persist closed the
+/// Start-vs-Stop race, because `handle_stop` takes that same lock and simply
+/// queues. It cannot close Start-vs-Unblock: `handle_unblock` takes NO proxy
+/// lock by design (it must work while a wedged teardown holds one), so it runs
+/// *inside* the start's persist window. The closure ignoring `current` is what
+/// makes that a lost update — the write is unconditional, so it reverts an
+/// unblock that already committed.
+#[skuld::test]
+async fn an_unblock_during_the_post_start_persist_is_not_reverted() {
+    let dir = tempfile::tempdir().unwrap().keep();
+    let (state, persist_gate, persist_entered) = ipc_state_with_persist_gate(dir.clone());
+
+    let state_a = state.clone();
+    let start = tokio::spawn(async move {
+        handle_start(
+            axum::extract::State(state_a),
+            axum::http::HeaderMap::new(),
+            Json(sample_config()),
+        )
+        .await
+    });
+
+    // Park until the start is known to be inside its persist window.
+    persist_entered.await.expect("persist_after_start never entered");
+
+    // Unblock needs no proxy lock, so unlike a Stop it does not queue behind
+    // the start — it commits `Target::Off` while the start is still parked.
+    let _ = handle_unblock(axum::extract::State(state.clone()))
+        .await
+        .expect("unblock must succeed");
+
+    persist_gate.notify_one();
+    let _ = start.await.expect("start task panicked").expect("start must succeed");
+
+    assert_eq!(
+        target::load(&dir),
+        Target::Off,
+        "an Unblock that committed while Start was mid-persist was silently reverted to Connected"
+    );
+    assert!(
+        target::load_startup_preference(&dir).candidate.is_none(),
+        "the declined target write still recorded an auto-connect candidate, leaving the two \
+         records disagreeing about what the user last asked for"
+    );
 }
