@@ -224,7 +224,97 @@ fn set_dir_mode(dir: &Path) -> Result<(), TargetError> {
     std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).map_err(TargetError::SetPermissions)
 }
 
-#[cfg(not(unix))]
+/// The SID of the user this process runs as, as an SDDL string.
+///
+/// Needed because `owner: Option<(u32, u32)>` carries unix ids, which say
+/// nothing about a Windows principal. Under the `--service` daemon this is
+/// SYSTEM (already in [`crate::ipc::SDDL_BASE`], so the extra ACE is
+/// redundant and harmless); under elevation it is the invoking user, whose
+/// access the unix arm preserves via `chown_if_some` and which a bare
+/// SYSTEM+Administrators DACL would otherwise revoke on their own state dir.
+#[cfg(windows)]
+pub(crate) fn current_user_sid() -> std::io::Result<String> {
+    use windows::core::PWSTR;
+    use windows::Win32::Foundation::{CloseHandle, LocalFree, HANDLE, HLOCAL};
+    use windows::Win32::Security::Authorization::ConvertSidToStringSidW;
+    use windows::Win32::Security::{GetTokenInformation, TokenUser, TOKEN_QUERY, TOKEN_USER};
+    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    let mut token = HANDLE::default();
+    // SAFETY: `GetCurrentProcess` returns a pseudo-handle that needs no close;
+    // `token` is an out-param the call fills on success.
+    unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) }
+        .map_err(|e| std::io::Error::other(format!("OpenProcessToken failed: {e}")))?;
+
+    // Size the buffer. This call is EXPECTED to fail with
+    // ERROR_INSUFFICIENT_BUFFER and only exists to populate `len`, so its
+    // result is deliberately discarded rather than checked.
+    let mut len = 0u32;
+    // SAFETY: passing a null buffer with zero length is the documented way to
+    // query the required size.
+    let _ = unsafe { GetTokenInformation(token, TokenUser, None, 0, &mut len) };
+
+    let mut buf = vec![0u8; len as usize];
+    // SAFETY: `buf` is at least `len` bytes, which is the size the call above
+    // reported for this token's `TOKEN_USER`.
+    let info = unsafe { GetTokenInformation(token, TokenUser, Some(buf.as_mut_ptr().cast()), len, &mut len) };
+    // SAFETY: `token` came from `OpenProcessToken` and is not used again.
+    unsafe {
+        let _ = CloseHandle(token);
+    }
+    info.map_err(|e| std::io::Error::other(format!("GetTokenInformation(TokenUser) failed: {e}")))?;
+
+    // SAFETY: on success the buffer holds a `TOKEN_USER` whose `Sid` points
+    // into that same allocation, which outlives this borrow.
+    let user = unsafe { &*(buf.as_ptr() as *const TOKEN_USER) };
+    let mut raw = PWSTR::null();
+    // SAFETY: `user.User.Sid` is a valid SID for the lifetime of `buf`; `raw`
+    // receives a LocalAlloc'd string freed below.
+    unsafe { ConvertSidToStringSidW(user.User.Sid, &mut raw) }
+        .map_err(|e| std::io::Error::other(format!("ConvertSidToStringSidW failed: {e}")))?;
+    // SAFETY: `raw` is a NUL-terminated wide string owned by us until LocalFree.
+    let sid =
+        unsafe { raw.to_string() }.map_err(|e| std::io::Error::other(format!("SID was not valid UTF-16: {e}")))?;
+    // SAFETY: `raw` came from LocalAlloc inside `ConvertSidToStringSidW`.
+    unsafe {
+        let _ = LocalFree(Some(std::mem::transmute::<PWSTR, HLOCAL>(raw)));
+    }
+    Ok(sid)
+}
+
+/// SDDL for the state directory and its files: SYSTEM + Administrators (from
+/// [`crate::ipc::SDDL_BASE`]) plus this process's own user.
+///
+/// Deliberately NOT `crate::ipc::build_sddl`, which unconditionally grants the
+/// `hole` GROUP full control — that group exists so non-admin users can reach
+/// the IPC socket, and these files hold the shadowsocks password. Reusing it
+/// would grant the secret to exactly the population this DACL excludes.
+///
+/// A failed SID lookup degrades to SYSTEM + Administrators rather than
+/// failing the write: losing the owner's own access is recoverable (they are
+/// an administrator in both run modes), leaving the password world-readable
+/// is not.
+#[cfg(windows)]
+fn state_sddl() -> String {
+    match current_user_sid() {
+        Ok(sid) => format!("{}(A;;GA;;;{sid})", crate::ipc::SDDL_BASE),
+        Err(e) => {
+            tracing::warn!(error = %e, "could not resolve this process's user SID; state DACL is admin-only");
+            crate::ipc::SDDL_BASE.to_string()
+        }
+    }
+}
+
+/// `protect = true` is the load-bearing half: it detaches the object from its
+/// parent's inheritance, which is what drops `C:\ProgramData`'s
+/// `BUILTIN\Users` read ACE. Without it this call changes nothing that
+/// matters.
+#[cfg(windows)]
+fn set_dir_mode(dir: &Path) -> Result<(), TargetError> {
+    crate::ipc::set_dacl_from_sddl(dir, &state_sddl(), true).map_err(TargetError::SetPermissions)
+}
+
+#[cfg(not(any(unix, windows)))]
 fn set_dir_mode(_dir: &Path) -> Result<(), TargetError> {
     Ok(())
 }
@@ -235,11 +325,13 @@ fn set_file_mode(path: &Path) -> std::io::Result<()> {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn set_file_mode(path: &Path) -> std::io::Result<()> {
+    crate::ipc::set_dacl_from_sddl(path, &state_sddl(), true)
+}
+
+#[cfg(not(any(unix, windows)))]
 fn set_file_mode(_path: &Path) -> std::io::Result<()> {
-    // Windows: the owner-only DACL is applied by the caller's existing
-    // service/task-scheduler install path (same as `bridge-lockdown.json`),
-    // not by this module. No portable POSIX-mode equivalent exists here.
     Ok(())
 }
 

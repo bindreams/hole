@@ -468,3 +468,102 @@ fn apply_leaves_an_unreadable_target_file_untouched_when_f_declines() {
         "apply must leave an unreadable target file untouched when f declines to decide, not overwrite it with Off"
     );
 }
+
+// Windows DACL ========================================================================================================
+
+/// Read `path`'s DACL back as an SDDL string. Round-tripping through SDDL
+/// rather than walking ACEs with `GetAce` keeps the unsafe surface to two
+/// calls and makes the assertion readable: the protected flag shows up as
+/// `D:P` and each ACE as a `(A;;...;SID)` clause.
+#[cfg(target_os = "windows")]
+fn dacl_sddl(path: &std::path::Path) -> String {
+    use windows::core::{HSTRING, PWSTR};
+    use windows::Win32::Foundation::LocalFree;
+    use windows::Win32::Security::Authorization::{
+        ConvertSecurityDescriptorToStringSecurityDescriptorW, GetNamedSecurityInfoW, SDDL_REVISION_1, SE_FILE_OBJECT,
+    };
+    use windows::Win32::Security::{DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR};
+
+    let wide = HSTRING::from(path.as_os_str());
+    let mut psd = PSECURITY_DESCRIPTOR::default();
+    // SAFETY: `wide` outlives the call; `psd` is an out-param Windows fills
+    // with a LocalAlloc'd descriptor that we free below. The two None
+    // out-params are documented as optional.
+    unsafe {
+        GetNamedSecurityInfoW(
+            &wide,
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            None,
+            None,
+            None,
+            None,
+            &mut psd,
+        )
+        .expect("GetNamedSecurityInfoW failed");
+    }
+
+    let mut out = PWSTR::null();
+    // SAFETY: `psd` is a valid descriptor from the call above; `out` receives
+    // a LocalAlloc'd string freed below.
+    unsafe {
+        ConvertSecurityDescriptorToStringSecurityDescriptorW(
+            psd,
+            SDDL_REVISION_1,
+            DACL_SECURITY_INFORMATION,
+            &mut out,
+            None,
+        )
+        .expect("ConvertSecurityDescriptorToStringSecurityDescriptorW failed");
+    }
+    // SAFETY: `out` is a NUL-terminated wide string owned by us until LocalFree.
+    let sddl = unsafe { out.to_string().expect("SDDL string was not valid UTF-16") };
+    // SAFETY: both pointers came from LocalAlloc inside the calls above.
+    unsafe {
+        let _ = LocalFree(Some(std::mem::transmute::<PWSTR, windows::Win32::Foundation::HLOCAL>(
+            out,
+        )));
+        let _ = LocalFree(Some(std::mem::transmute::<
+            PSECURITY_DESCRIPTOR,
+            windows::Win32::Foundation::HLOCAL,
+        >(psd)));
+    }
+    sddl
+}
+
+/// The state directory and the target file hold a `ProxyConfig`, i.e. the
+/// shadowsocks password. Under `C:\ProgramData` the inherited ACL grants
+/// `BUILTIN\Users` read, so both objects must carry a PROTECTED DACL (which
+/// is what drops the inherited ACE) naming only SYSTEM, Administrators and
+/// the current token's user.
+#[cfg(target_os = "windows")]
+#[skuld::test]
+fn windows_state_dir_and_files_are_not_readable_by_users() {
+    let tmp = tempfile::tempdir().unwrap();
+    let state_dir = tmp.path().join("state");
+    let target = Target::Connected {
+        config: Box::new(test_config()),
+    };
+    save(&state_dir, &target, None).unwrap();
+
+    let dir_sddl = dacl_sddl(&state_dir);
+    let file_sddl = dacl_sddl(&state_dir.join(STATE_FILE_NAME));
+
+    for (what, sddl) in [("state dir", &dir_sddl), ("target file", &file_sddl)] {
+        assert!(
+            sddl.starts_with("D:P"),
+            "{what} DACL is not protected, so C:\\ProgramData's inherited \
+             BUILTIN\\Users ACE would survive: {sddl}"
+        );
+        assert!(
+            !sddl.contains("S-1-5-32-545") && !sddl.contains(";BU)"),
+            "{what} DACL still grants BUILTIN\\Users: {sddl}"
+        );
+        let me = crate::target::current_user_sid().expect("current token user SID");
+        assert!(
+            sddl.contains(&me),
+            "{what} DACL does not grant the current user ({me}), which would \
+             lock the elevation-mode owner out of their own state dir: {sddl}"
+        );
+    }
+}
