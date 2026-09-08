@@ -562,13 +562,22 @@ fn windows_state_dir_and_files_are_not_readable_by_users() {
             "{what} DACL still grants BUILTIN\\Users: {sddl}"
         );
         let me = crate::target::current_user_sid().expect("current token user SID");
-        // Windows renders well-known SIDs as SDDL abbreviations, so the raw
-        // string need not appear. Under the service the token user IS SYSTEM,
-        // already granted by `SDDL_BASE` as `SY`; only a non-well-known user —
-        // the elevation-mode case this assertion exists for — shows verbatim.
-        let well_known = ["S-1-5-18", "S-1-5-32-544"];
+        // Windows renders well-known SIDs as SDDL ABBREVIATIONS, so the raw
+        // string need not appear even when the ACE is there. Observed on CI:
+        // the token user `S-1-5-21-...-500` (the built-in Administrator) comes
+        // back as `LA`, in
+        // `D:PAI(A;;FA;;;SY)(A;OICIIO;GA;;;SY)...(A;;FA;;;LA)(A;OICIIO;GA;;;LA)`.
+        //
+        // Every abbreviation below names a principal that ALREADY has access
+        // through `SDDL_BASE` (SYSTEM, Administrators) or is an administrator
+        // account, so accepting them cannot mask the case this guards: a
+        // genuinely non-privileged elevation-mode owner has no abbreviation
+        // and must appear verbatim.
+        let renders_as_abbreviation = me == "S-1-5-18" // SY, SYSTEM
+            || me == "S-1-5-32-544" // BA, BUILTIN\Administrators
+            || (me.starts_with("S-1-5-21-") && me.ends_with("-500")); // LA, built-in Administrator
         assert!(
-            sddl.contains(&me) || well_known.contains(&me.as_str()),
+            sddl.contains(&me) || renders_as_abbreviation,
             "{what} DACL does not grant the current user ({me}), which would \
              lock the elevation-mode owner out of their own state dir: {sddl}"
         );
