@@ -229,6 +229,20 @@ pub struct Cover {
     kind: CoverKind,
 }
 
+impl Cover {
+    /// Release this process's claim on the cover without disengaging it.
+    ///
+    /// macOS holds NO process-local OS resource here: `token` is the
+    /// `pfctl -E` enable ticket, and `Drop`'s `pfctl -X <token>` releases pf's
+    /// enable refcount rather than freeing anything owned by this process.
+    /// Leaving pf enabled is precisely what detaching means, so skipping
+    /// `Drop` is the whole operation — unlike Windows, which must close its
+    /// FWPM engine handle here.
+    pub(crate) fn detach(self) {
+        std::mem::forget(self);
+    }
+}
+
 pub fn engage(
     server_ip: IpAddr,
     resolver_ip: Option<IpAddr>,
