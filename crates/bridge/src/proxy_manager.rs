@@ -2072,7 +2072,15 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
     /// `event`.
     async fn persist_session_event(&mut self, event: SessionEvent) -> Target {
         let Some(state_dir) = self.state_dir.clone() else {
-            return target_after(Target::Off, event);
+            // No file to consult, so `target_after` needs a stand-in. It must
+            // be `Unreadable`, not `Off`: `Off` is a DECIDED target that
+            // `cover_step` acts on (its `Off` arm ignores intent and releases
+            // a live cover), which would turn every blip on a state-dir-less
+            // manager into a kill-switch teardown. `Unreadable` authorises
+            // neither surface, so the cover holds. `UserStopped`/`GaveUp` are
+            // unaffected — `target_after` collapses both to `Off` from any
+            // prior value.
+            return target_after(Target::Unreadable, event);
         };
         let owner = self.state_owner;
         let outcome = tokio::task::spawn_blocking(move || {

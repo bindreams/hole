@@ -5932,3 +5932,36 @@ fn the_installed_routed_families_reach_dns_apply() {
         );
     });
 }
+
+// No-state-dir seed ===================================================================================================
+
+/// `persist_session_event` cannot consult the target file when the manager has
+/// no state dir, so it seeds `target_after` with a stand-in. Seeding `Off`
+/// makes a transient blip indistinguishable from a user disconnect —
+/// `cover_step`'s `Off` arm ignores intent and releases a live cover — which
+/// would tear the kill switch down mid-reconnect. `Unreadable` is the honest
+/// stand-in: it authorises neither connecting nor disarming, so the cover
+/// holds. The two explicit-end events are unaffected either way, since
+/// `target_after` collapses them to `Off` from any prior value.
+#[skuld::test]
+fn a_blip_with_no_state_dir_does_not_release_a_standing_cover() {
+    rt().block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        let routing = MockRouting::new(dir.path().to_path_buf());
+        let st = routing.state();
+        *st.cover_presence.lock().unwrap() = tun_engine::routing::CoverPresence::Live;
+        // `new_manager_with_routing` deliberately does NOT call
+        // `with_state_dir`, so `state_dir` is `None` — the branch under test.
+        let (mut pm, _dir) = new_manager_with_routing(MockProxy::new(), routing, dir);
+        pm.start(&test_config()).await.unwrap();
+
+        pm.stop_with(SessionEvent::Blipped).await.unwrap();
+
+        assert_eq!(
+            st.release_all_calls.load(Ordering::SeqCst),
+            0,
+            "a blip with no state dir released the cover: the seed collapsed \
+             'we cannot read the target' into 'the user asked to disconnect'"
+        );
+    });
+}
