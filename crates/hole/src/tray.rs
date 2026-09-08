@@ -290,7 +290,7 @@ fn unblock_dialog_message(response: &Result<BridgeResponse, crate::bridge_client
 /// `Indeterminate`/`Unreachable`, an uncertain probe — renders as engaged: an
 /// uncertain probe must never resolve toward "nothing is blocking".
 fn lockdown_menu_label(enabled: bool, cover_presence: CoverPresence) -> String {
-    match (enabled, cover_presence == CoverPresence::Absent) {
+    match (enabled, !cover_presence.is_present()) {
         (true, false) => "Lockdown: On".into(),
         (true, true) => "Lockdown: On (warning: not engaged)".into(),
         (false, _) => "Lockdown".into(),
@@ -363,7 +363,7 @@ struct EscapeItems {
 fn escape_items(cover_presence: CoverPresence, blocked_offers_go_offline: bool) -> EscapeItems {
     EscapeItems {
         go_offline: blocked_offers_go_offline,
-        unblock: cover_presence != CoverPresence::Absent,
+        unblock: cover_presence.is_present(),
     }
 }
 

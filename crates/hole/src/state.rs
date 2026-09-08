@@ -676,7 +676,7 @@ pub fn classify_lockdown(result: &Result<BridgeResponse, ClientError>) -> Lockdo
             ..
         }) => LockdownRead::Known {
             enabled: *lockdown_enabled,
-            active: *cover_presence != CoverPresence::Absent,
+            active: cover_presence.is_present(),
         },
         Ok(_) => LockdownRead::WrongReply,
         Err(_) => LockdownRead::Unreadable,

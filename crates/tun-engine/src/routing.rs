@@ -1063,6 +1063,32 @@ pub enum CoverPresence {
     Unreachable,
 }
 
+impl CoverPresence {
+    /// Whether a cover should be treated as present.
+    ///
+    /// `Absent` is the ONLY answer that means "nothing is blocking". The two
+    /// uncertain variants (`Indeterminate`, `Unreachable`) mean the probe
+    /// could not give a real answer, and an escape-offering site must resolve
+    /// that toward "still blocked" — never toward "nothing to do". This
+    /// method exists so that rule is written once instead of being re-derived
+    /// as `!= Absent` at each site, where a plausible-looking `== Live`
+    /// silently drops both uncertain variants.
+    pub fn is_present(self) -> bool {
+        !matches!(self, CoverPresence::Absent)
+    }
+
+    /// Whether the OS positively CONFIRMED a cover, as distinct from
+    /// [`is_present`](Self::is_present)'s "not confirmed absent".
+    ///
+    /// Deliberately narrow, and correct only where a false negative is the
+    /// safe direction — recording an adopted-cover claim, or deciding a
+    /// pre-lockdown baseline is still capturable. Never use it to decide
+    /// whether to OFFER an escape.
+    pub fn is_confirmed_live(self) -> bool {
+        matches!(self, CoverPresence::Live)
+    }
+}
+
 /// The outcome of [`decide_cover_recovery`]: one action, plus whether the
 /// measured truth should be written back to the intent file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

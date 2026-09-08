@@ -205,6 +205,21 @@ before editing; the sections linked below are the authoritative source.
   redacted before reaching any log, toast, or bundle; a path's detail still
   lands in `gui.log`, but the server address never does.
   [→](CONTRIBUTING.md#logging--diagnostics)
+- **Per-variant policy lives on the type, never at a call site** — a decision
+  keyed to an enum variant belongs in ONE exhaustive match on that type
+  (`SessionEvent::preserves_death_reason`, `CoverPresence::is_present`), and
+  two variants are never grouped because they happen to share a consequence.
+  Grouping by consequence is what let `ProcessExiting` inherit an answer chosen
+  for a cutover; re-deriving the rule at each site is what let `== Live` drop
+  the two uncertain probe results. This exact shape produced four separate bugs
+  in one change — each a contract stated in prose at the definition site and
+  violated at a call site far away — so it is test-enforced
+  (`session_event_policy_lives_on_the_type_not_at_call_sites`,
+  `cover_presence_is_never_compared_against_a_variant`). Prefer removing the
+  hazard outright over guarding it: `CoverGuard::disarm` had a "call only
+  before process exit" precondition that no test could enforce, and closing the
+  handle it leaked deleted the rule instead of policing it.
+  [→](CONTRIBUTING.md#fail-closed-cover)
 - **The server address is never logged** — no `Display` on `ServerAddress`
   (compiler-enforced), `.expose()` is its only exit, and every `Serialize` type
   transitively holding one needs its own `Dump` impl.

@@ -615,6 +615,29 @@ pub enum SessionEvent {
     ProcessExiting,
 }
 
+impl SessionEvent {
+    /// Whether this event carries its own explanation of why the session
+    /// ended, which teardown must therefore NOT clear.
+    ///
+    /// A classifier method rather than a comparison at the call site: that is
+    /// the one place a sixth variant has to answer this question, instead of
+    /// silently inheriting whichever side of an `!=` it happens to fall on.
+    /// `check_health` sets `last_error`/`death_reason` to explain a `GaveUp`
+    /// teardown (#470); clearing them there would erase the explanation before
+    /// the GUI toast ever reads it. Every other cause arrives with no
+    /// explanation of its own, so the stale one from a previous failed start
+    /// is cleared (#142).
+    pub fn preserves_death_reason(self) -> bool {
+        match self {
+            SessionEvent::GaveUp => true,
+            SessionEvent::UserStopped
+            | SessionEvent::CutoverRestart
+            | SessionEvent::Blipped
+            | SessionEvent::ProcessExiting => false,
+        }
+    }
+}
+
 /// The single pure decision: given the current target and a named cause,
 /// what should the target become? Exhaustive over both axes (no wildcard
 /// arm) so a new `SessionEvent` variant, or a new `Target` variant, is a

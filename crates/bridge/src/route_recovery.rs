@@ -16,7 +16,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use tokio::sync::Mutex;
-use tun_engine::routing::{CoverPresence, CoverRecovery, Recovery, Routing};
+use tun_engine::routing::{CoverRecovery, Recovery, Routing};
 
 use crate::dns::system::Dns;
 use crate::proxy::Proxy;
@@ -73,7 +73,7 @@ pub(crate) async fn record_recovery_outcome<P, R, D>(
             // docs say the OS did NOT confirm one. Gate the claim on the
             // measured presence too, so `lockdown_enabled`/`standing_cover_expected`
             // never assert liveness recovery itself did not confirm.
-            let live = recovery.action == CoverRecovery::Adopt && recovery.presence == CoverPresence::Live;
+            let live = recovery.action == CoverRecovery::Adopt && recovery.presence.is_confirmed_live();
             proxy.lock().await.set_standing_cover_adopted(live);
         }
         Err(e) => {

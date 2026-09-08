@@ -115,7 +115,7 @@ fn udp_available_from_chain(transports: Option<garter::Transports>) -> bool {
 /// attempt is ABOUT to install (`standing_expected`, decided before
 /// `routing.install` runs it).
 fn suppresses_reachability_probe(cover: CoverPresence, transient_pending: bool, standing_expected: bool) -> bool {
-    cover != CoverPresence::Absent || transient_pending || standing_expected
+    cover.is_present() || transient_pending || standing_expected
 }
 
 // State ===============================================================================================================
@@ -1989,7 +1989,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
                 // death_reason to explain why THIS session ended (#470), and
                 // clearing them here would erase that explanation before the
                 // GUI/toast ever reads it.
-                if event != SessionEvent::GaveUp {
+                if !event.preserves_death_reason() {
                     self.last_error = None;
                     self.death_reason = None;
                 }

@@ -10,6 +10,18 @@ mod api_generated {
 }
 pub use api_generated::*;
 
+impl CoverPresence {
+    /// Wire-side mirror of `tun_engine::routing::CoverPresence::is_present`.
+    ///
+    /// The rule has to exist on this type too: `crates/hole` cannot depend on
+    /// tun-engine, so the GUI cannot reach the bridge-side method, and the
+    /// tray is exactly where getting it wrong hides a live kill switch behind
+    /// a silent-green menu.
+    pub fn is_present(self) -> bool {
+        !matches!(self, CoverPresence::Absent)
+    }
+}
+
 #[allow(clippy::derivable_impls)] // FilterMetrics is code-generated without Default
 impl Default for FilterMetrics {
     fn default() -> Self {

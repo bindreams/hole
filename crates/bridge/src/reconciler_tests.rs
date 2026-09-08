@@ -671,3 +671,126 @@ fn teardown_disposition_is_exhaustive_over_events() {
         );
     }
 }
+
+// Contract guards =====================================================================================================
+
+/// Strip comment lines so a doc comment naming a variant is not mistaken for
+/// a decision site. Crude on purpose: it must never hide a real match arm.
+fn code_lines(text: &str) -> impl Iterator<Item = (usize, &str)> {
+    text.lines().enumerate().filter(|(_, l)| {
+        let t = l.trim_start();
+        !t.starts_with("//") && !t.starts_with("/*") && !t.starts_with('*')
+    })
+}
+
+/// Four separate bugs in this one change had the same shape: a contract
+/// stated in prose at a definition site, violated at a call site far away.
+/// `SessionEvent`'s own doc says "do not collapse any two variants onto their
+/// shared consequence"; the transient-cover match did exactly that, and
+/// `stop_with`'s death-reason branch re-derived a per-variant policy of its
+/// own. The fix is that per-variant policy lives ON the type — one exhaustive
+/// match per question — and nowhere else.
+///
+/// Constructing a variant (`stop_with(SessionEvent::Blipped)`) is fine and
+/// deliberately not matched here: a caller naming its own cause is the API
+/// working. What this forbids is DECIDING from one (`=>`, `==`, `!=`).
+#[skuld::test]
+fn session_event_policy_lives_on_the_type_not_at_call_sites() {
+    let src_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    // The two exhaustive deciders. Everything else asks them, or asks a
+    // classifier method on the enum.
+    let sanctioned = ["target.rs", "reconciler.rs"];
+    let mut offenders: Vec<String> = Vec::new();
+
+    for entry in walkdir::WalkDir::new(&src_root) {
+        let entry = entry.expect("failed to walk crates/bridge/src");
+        let path = entry.path();
+        if !entry.file_type().is_file() || path.extension().and_then(|e| e.to_str()) != Some("rs") {
+            continue;
+        }
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        if name.ends_with("_tests.rs") || sanctioned.contains(&name) {
+            continue;
+        }
+        if path.components().any(|c| c.as_os_str() == "test_support") {
+            continue;
+        }
+        let text = std::fs::read_to_string(path).expect("failed to read a walked source file");
+        for (idx, line) in code_lines(&text) {
+            if line.contains("SessionEvent::") && (line.contains("=>") || line.contains("==") || line.contains("!=")) {
+                offenders.push(format!("{}:{}: {}", path.display(), idx + 1, line.trim()));
+            }
+        }
+    }
+
+    assert!(
+        offenders.is_empty(),
+        "per-variant SessionEvent policy decided outside `target.rs`/`reconciler.rs`:\n  {}\n\
+         Add a classifier method to `SessionEvent` (one exhaustive match, in one place) and ask \
+         it here instead. A sixth variant must be a compile error once, not silently inherit a \
+         group at every site that forgot it.",
+        offenders.join("\n  ")
+    );
+}
+
+/// The same defect shape as [`session_event_policy_lives_on_the_type_not_at_call_sites`],
+/// on the other axis. `CoverPresence` carries a rule stated in prose in
+/// `openapi.yaml` and in two doc comments — *"`indeterminate` and
+/// `unreachable` mean the probe could not give a real answer; every
+/// escape-offering site must treat them like `live`, never like `absent`"* —
+/// and every site re-derived it with its own comparison.
+///
+/// A site that writes `== Live` silently excludes the two uncertain variants
+/// and resolves an unreachable probe toward "nothing is blocking", which is
+/// the one direction that must never happen. So comparisons against a variant
+/// are forbidden outside the two type definitions; ask `is_present()` (or the
+/// deliberately narrow `is_confirmed_live()`) instead.
+///
+/// Scans the whole workspace, not just this crate: there are TWO
+/// `CoverPresence` types — `tun_engine::routing`'s and the generated wire type
+/// — and `crates/hole` cannot depend on tun-engine, so no single decider can
+/// own both. The invariant is per-type, and so is the check.
+#[skuld::test]
+fn cover_presence_is_never_compared_against_a_variant() {
+    let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..");
+    // The files that DEFINE the question, and may therefore answer it:
+    // the two type definitions, plus the platform modules under
+    // `failclosed/` that PRODUCE the probe (they classify their own raw OS
+    // result; the invariant is about consumers of the answer).
+    let sanctioned = ["routing.rs", "protocol.rs", "macos.rs", "windows.rs"];
+    let mut offenders: Vec<String> = Vec::new();
+
+    for entry in walkdir::WalkDir::new(workspace.join("crates")) {
+        let entry = entry.expect("failed to walk crates/");
+        let path = entry.path();
+        if !entry.file_type().is_file() || path.extension().and_then(|e| e.to_str()) != Some("rs") {
+            continue;
+        }
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        if name.ends_with("_tests.rs") || sanctioned.contains(&name) {
+            continue;
+        }
+        if path
+            .components()
+            .any(|c| c.as_os_str() == "test_support" || c.as_os_str() == "target")
+        {
+            continue;
+        }
+        let text = std::fs::read_to_string(path).expect("failed to read a walked source file");
+        for (idx, line) in code_lines(&text) {
+            let compares = line.contains("==") || line.contains("!=") || line.contains("matches!");
+            if line.contains("CoverPresence::") && compares {
+                offenders.push(format!("{}:{}: {}", path.display(), idx + 1, line.trim()));
+            }
+        }
+    }
+
+    assert!(
+        offenders.is_empty(),
+        "CoverPresence compared against a variant outside its own type definition:\n  {}\n\
+         Call `is_present()` instead. Writing `== Live` by hand drops Indeterminate and \
+         Unreachable, which resolves an uncertain probe toward \"nothing is blocking\" — the one \
+         direction an escape-offering site must never take.",
+        offenders.join("\n  ")
+    );
+}
