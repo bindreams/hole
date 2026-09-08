@@ -139,7 +139,7 @@ allow-invalid = true
 
 [[disallowed-methods]]
 path = "tokio_util::sync::CancellationToken::new"
-reason = "In `crates/bridge/src/`, fresh tokens shadow the cooperative-cancellation chain rooted at `ipc.rs::handle_start`. Use the propagated `cancel: &CancellationToken` parameter (or `cancel.child_token()` for phase isolation). Sanctioned production sites: `ipc.rs::handle_start`, `dispatcher.rs::Dispatcher::new`, `proxy_manager.rs::ProxyManager::start`, `reconciler.rs::reconcile_once`, `server_test.rs`. Test files use module-level `#![allow]`. See bindreams/hole#397."
+reason = "In `crates/bridge/src/`, fresh tokens shadow the cooperative-cancellation chain rooted at `ipc.rs::handle_start`. Use the propagated `cancel: &CancellationToken` parameter (or `cancel.child_token()` for phase isolation). Sanctioned production sites: `ipc.rs::handle_start`, `dispatcher.rs::Dispatcher::new`, `proxy_manager.rs::ProxyManager::start`, `server_test.rs`, and the three process/service entry points that root the shutdown chain (`foreground.rs::run_inner`, `platform/macos.rs`, `platform/windows.rs`). `reconcile_once` is NOT on this list: it takes the root token by reference — a token minted mid-call-graph is one nothing else holds, so nothing can cancel it. Test files use module-level `#![allow]`. See bindreams/hole#397."
 
 # macOS tray template flag ---------------------------------------------------------------------------------------------
 #

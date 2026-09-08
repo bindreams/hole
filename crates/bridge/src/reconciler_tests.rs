@@ -44,6 +44,15 @@ fn connected() -> Target {
 
 // step_order ordering =================================================================================================
 
+/// A root token for tests that are not exercising cancellation. Named so the
+/// call sites read as "no shutdown arrived", rather than repeating the
+/// `#[allow]` at each one.
+fn never_cancelled() -> CancellationToken {
+    #[allow(clippy::disallowed_methods)]
+    // Test-side root token; production roots live at the three entry points.
+    CancellationToken::new()
+}
+
 #[skuld::test]
 fn engaging_puts_lockdown_before_the_tunnel() {
     assert_eq!(
@@ -224,7 +233,7 @@ fn a_persisted_connected_target_reconciles_at_startup_with_no_gui() {
         let pm = ProxyManager::new(MockProxy::new(), routing).with_state_dir(dir.path().to_path_buf());
         let proxy = Arc::new(Mutex::new(pm));
 
-        reconcile_once(dir.path(), None, &proxy).await;
+        reconcile_once(dir.path(), None, &proxy, &never_cancelled()).await;
 
         // The tunnel started with no client ever having connected...
         assert_eq!(
@@ -256,7 +265,7 @@ fn a_persisted_off_target_starts_nothing() {
         let pm = ProxyManager::new(MockProxy::new(), routing).with_state_dir(dir.path().to_path_buf());
         let proxy = Arc::new(Mutex::new(pm));
 
-        reconcile_once(dir.path(), None, &proxy).await;
+        reconcile_once(dir.path(), None, &proxy, &never_cancelled()).await;
 
         assert_eq!(
             proxy.lock().await.state(),
@@ -307,7 +316,7 @@ fn startup_recovery_runs_before_reconciliation() {
         )
         .await;
 
-        reconcile_once(dir.path(), None, &proxy).await;
+        reconcile_once(dir.path(), None, &proxy, &never_cancelled()).await;
 
         assert_eq!(
             state.lockdown_engage_calls.load(Ordering::SeqCst),
@@ -339,7 +348,7 @@ fn reconcile_once_honours_a_do_not_connect_startup_preference() {
         let pm = ProxyManager::new(MockProxy::new(), routing).with_state_dir(dir.path().to_path_buf());
         let proxy = Arc::new(Mutex::new(pm));
 
-        reconcile_once(dir.path(), None, &proxy).await;
+        reconcile_once(dir.path(), None, &proxy, &never_cancelled()).await;
 
         assert_eq!(
             proxy.lock().await.state(),
@@ -376,7 +385,7 @@ fn reconcile_once_honours_an_always_connect_startup_preference_with_a_candidate(
         let pm = ProxyManager::new(MockProxy::new(), routing).with_state_dir(dir.path().to_path_buf());
         let proxy = Arc::new(Mutex::new(pm));
 
-        reconcile_once(dir.path(), None, &proxy).await;
+        reconcile_once(dir.path(), None, &proxy, &never_cancelled()).await;
 
         assert_eq!(
             proxy.lock().await.state(),
@@ -558,4 +567,42 @@ fn a_call_inside_a_closure_belongs_to_its_enclosing_function() {
     let sites = call_sites_by_function(src, &pattern);
     assert_eq!(sites.len(), 1, "expected exactly one call site, got {sites:?}");
     assert_eq!(sites[0].0, "gamma", "closure body attributed to the wrong function");
+}
+
+// Boot cancellation ===================================================================================================
+
+/// `reconcile_once` used to mint its own `CancellationToken::new()` under an
+/// `#[allow]`, on the premise that boot-time reconciliation "has no external
+/// cancel source to thread through". All three of its call sites sit in
+/// startup paths that own a shutdown signal — SIGINT/SIGTERM in the
+/// foreground, SCM Stop and launchd's SIGTERM in the two service paths — and
+/// that signal is exactly what has nothing to reach while a boot auto-connect
+/// is in flight. A token nothing else holds cannot be cancelled by anyone.
+#[skuld::test]
+fn a_cancelled_boot_reconcile_abandons_the_start() {
+    rt().block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        lockdown_state::set_enabled(dir.path(), true, None).unwrap();
+        target::save(dir.path(), &connectable(), None).unwrap();
+
+        let routing = MockRouting::new(dir.path().to_path_buf());
+        let pm = ProxyManager::new(MockProxy::new(), routing).with_state_dir(dir.path().to_path_buf());
+        let proxy = Arc::new(Mutex::new(pm));
+
+        // Shutdown arrived before reconciliation reached the start — the
+        // machine is going down mid-boot.
+        #[allow(clippy::disallowed_methods)]
+        // Test-side root token; the production roots live at the three entry points.
+        let shutdown = CancellationToken::new();
+        shutdown.cancel();
+
+        reconcile_once(dir.path(), None, &proxy, &shutdown).await;
+
+        assert_ne!(
+            proxy.lock().await.state(),
+            ProxyState::Running,
+            "a cancelled shutdown token must abandon the boot auto-connect, not start a tunnel \
+             the process is about to abandon"
+        );
+    });
 }

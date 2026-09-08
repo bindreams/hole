@@ -4,6 +4,8 @@ use std::path::Path;
 
 use tun_engine::routing::SystemRouting;
 
+use tokio_util::sync::CancellationToken;
+
 use crate::proxy::ShadowsocksProxy;
 use crate::proxy_manager::ProxyManager;
 
@@ -193,11 +195,28 @@ async fn run_inner(
         tracing::warn!(error = %e, "recover_dns_config task panicked");
     }
 
+    // Root cancellation token for this process, created BEFORE reconciliation
+    // and wired to the signal source immediately: `shutdown_signal()`
+    // registers its handlers eagerly, so installing the bridge here (rather
+    // than at the `select!` below) is also what closes the boot window in
+    // which a SIGTERM had nothing to reach.
+    #[allow(clippy::disallowed_methods)]
+    // Process entry point — the root every bridge cancel scope descends from.
+    // See clippy.toml's CancellationToken::new sanctioned-sites list.
+    let shutdown = CancellationToken::new();
+    {
+        let shutdown = shutdown.clone();
+        tokio::spawn(async move {
+            shutdown_signal().await;
+            shutdown.cancel();
+        });
+    }
+
     crate::route_recovery::recover_and_record(state_dir, &proxy_shutdown).await;
     // Reconcile the persisted target now, before any GUI or client has had a
     // chance to connect (closes #617) — must run after recovery above, see
     // crate::reconciler::reconcile_once's own doc.
-    crate::reconciler::reconcile_once(state_dir, owner, &proxy_shutdown).await;
+    crate::reconciler::reconcile_once(state_dir, owner, &proxy_shutdown, &shutdown).await;
     let state_dir_plugins = state_dir.to_path_buf();
     if let Err(e) =
         tokio::task::spawn_blocking(move || crate::plugin_recovery::reap_recorded_plugins(&state_dir_plugins)).await
@@ -257,7 +276,7 @@ async fn run_inner(
                 tracing::error!(error = %e, "IPC server error");
             }
         }
-        _ = shutdown_signal() => {}
+        _ = shutdown.cancelled() => {}
     }
 
     // Neither event `shutdown_reason` can produce is a user disconnect, so

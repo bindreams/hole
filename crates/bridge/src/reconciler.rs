@@ -224,6 +224,7 @@ pub async fn reconcile_once<P, R, D>(
     state_dir: &Path,
     owner: Option<(u32, u32)>,
     proxy: &Arc<Mutex<ProxyManager<P, R, D>>>,
+    cancel: &CancellationToken,
 ) where
     P: Proxy,
     R: Routing,
@@ -276,11 +277,11 @@ pub async fn reconcile_once<P, R, D>(
                     debug_assert!(false, "tunnel_step only yields Start for Target::Connected");
                     continue;
                 };
-                #[allow(clippy::disallowed_methods)]
-                // Boot-time reconcile has no external cancel source to thread through — see clippy.toml's
-                // CancellationToken::new sanctioned-sites list.
-                let token = CancellationToken::new();
-                if let Err(error) = pm.start_cancellable(config, true, token).await {
+                // A child of the process-wide shutdown token, so a SIGTERM /
+                // SCM Stop arriving mid-boot abandons the auto-connect instead
+                // of racing it. Minting a fresh token here, as this once did,
+                // produced one nothing else held: uncancellable by construction.
+                if let Err(error) = pm.start_cancellable(config, true, cancel.child_token()).await {
                     tracing::warn!(%error, "reconcile_once: failed to start the persisted target");
                 }
             }

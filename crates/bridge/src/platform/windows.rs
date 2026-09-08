@@ -166,11 +166,26 @@ fn run_service() -> Result<(), Box<dyn std::error::Error>> {
         {
             tracing::warn!(error = %e, "recover_dns_config task panicked");
         }
+        // Root cancellation token for the SCM service, fed by the same
+        // `shutdown_rx` oneshot the control handler signals. Created before
+        // reconciliation so an SCM Stop arriving mid-boot abandons the
+        // auto-connect rather than racing it.
+        #[allow(clippy::disallowed_methods)]
+        // Service entry point — see clippy.toml's CancellationToken::new list.
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        {
+            let shutdown = shutdown.clone();
+            tokio::spawn(async move {
+                let _ = shutdown_rx.await;
+                shutdown.cancel();
+            });
+        }
+
         crate::route_recovery::recover_and_record(&state_dir, &proxy_shutdown).await;
         // Reconcile the persisted target now, before any GUI or client has had a
         // chance to connect (closes #617) — must run after recovery above, see
         // crate::reconciler::reconcile_once's own doc.
-        crate::reconciler::reconcile_once(&state_dir, None, &proxy_shutdown).await;
+        crate::reconciler::reconcile_once(&state_dir, None, &proxy_shutdown, &shutdown).await;
         let state_dir_for_plugins = state_dir.clone();
         if let Err(e) =
             tokio::task::spawn_blocking(move || crate::plugin_recovery::reap_recorded_plugins(&state_dir_for_plugins))
@@ -216,7 +231,7 @@ fn run_service() -> Result<(), Box<dyn std::error::Error>> {
                     error!(error = %e, "IPC server error");
                 }
             }
-            _ = shutdown_rx => {
+            _ = shutdown.cancelled() => {
                 info!("shutdown signal received");
             }
         }

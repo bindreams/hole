@@ -254,11 +254,26 @@ pub fn run(
         {
             tracing::warn!(error = %e, "recover_dns_config task panicked");
         }
+        // Root cancellation token for the launchd service, wired to the same
+        // SIGINT/SIGTERM source `serve_until_signal` consumes below. Created
+        // before reconciliation so a stop arriving mid-boot abandons the
+        // auto-connect rather than racing it.
+        #[allow(clippy::disallowed_methods)]
+        // Service entry point — see clippy.toml's CancellationToken::new list.
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        {
+            let shutdown = shutdown.clone();
+            tokio::spawn(async move {
+                crate::foreground::shutdown_signal().await;
+                shutdown.cancel();
+            });
+        }
+
         crate::route_recovery::recover_and_record(state_dir, &proxy_shutdown).await;
         // Reconcile the persisted target now, before any GUI or client has had a
         // chance to connect (closes #617) — must run after recovery above, see
         // crate::reconciler::reconcile_once's own doc.
-        crate::reconciler::reconcile_once(state_dir, None, &proxy_shutdown).await;
+        crate::reconciler::reconcile_once(state_dir, None, &proxy_shutdown, &shutdown).await;
         let state_dir_plugins = state_dir.to_path_buf();
         if let Err(e) =
             tokio::task::spawn_blocking(move || crate::plugin_recovery::reap_recorded_plugins(&state_dir_plugins)).await
@@ -282,7 +297,8 @@ pub fn run(
         // launchd stops the daemon with SIGTERM; awaiting only ctrl_c (SIGINT)
         // here would skip the pm.stop() teardown below and leak routes/DNS.
         // `shutdown_signal()` handles SIGINT *and* SIGTERM (foreground.rs).
-        serve_until_signal(server.run(), crate::foreground::shutdown_signal()).await;
+        let shutdown_wait = shutdown.clone();
+        serve_until_signal(server.run(), async move { shutdown_wait.cancelled().await }).await;
 
         // Clean shutdown: stop proxy before exiting. Neither event is a user
         // disconnect, so the target is left unchanged either way; only the
