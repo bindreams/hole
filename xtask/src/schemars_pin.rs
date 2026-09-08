@@ -36,8 +36,8 @@
 //! would outlive that fact silently: the `allowedVersions` rule would keep
 //! suppressing a bump that had become possible, and nobody would notice,
 //! because a suppressed update produces no signal at all. This test reads
-//! typify's own declared requirement out of `cargo metadata` and fails the
-//! moment it stops being 0.8 — turning "upstream moved" from something
+//! which `schemars` typify actually resolved against out of `Cargo.lock` and
+//! fails the moment it stops being 0.8 — turning "upstream moved" from something
 //! someone has to remember to check into a red build with instructions.
 //!
 //! Note the eventual fix is not expected to be a `schemars` bump. Typify's
@@ -45,98 +45,102 @@
 //! will roll our own IR" (oxidecomputer/typify#886), so when this test fires,
 //! read that issue before assuming the answer is `schemars = "1"`.
 
-use std::process::Command;
-
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 
-/// The crate whose requirement decides ours. `typify-impl` rather than the
-/// `typify` facade: the facade's own `schemars` entry is a dev-dependency
-/// (its doctests), while `typify-impl` is what actually holds the schema
-/// types in its public API.
+/// The crate whose choice decides ours. `typify-impl` rather than the `typify`
+/// facade: the facade's own `schemars` entry is a dev-dependency (its
+/// doctests), while `typify-impl` is what holds the schema types in its public
+/// API.
 pub const UPSTREAM: &str = "typify-impl";
 
-/// The major.minor series `crates/common/build.rs` compiles against. Bare
-/// `0.8` rather than a full requirement string: what matters is the series,
-/// and the patch floor is typify's to raise.
+/// The major.minor series `crates/common/build.rs` compiles against.
 pub const PINNED_SERIES: &str = "0.8";
 
-// cargo metadata ======================================================================================================
+// Cargo.lock ==========================================================================================================
 
 #[derive(Deserialize)]
-struct Metadata {
-    packages: Vec<Package>,
+struct Lockfile {
+    #[serde(rename = "package", default)]
+    packages: Vec<LockPackage>,
 }
 
 #[derive(Deserialize)]
-struct Package {
+struct LockPackage {
     name: String,
     version: String,
-    dependencies: Vec<Dependency>,
+    #[serde(default)]
+    dependencies: Vec<String>,
 }
 
-#[derive(Deserialize)]
-struct Dependency {
-    name: String,
-    req: String,
-    /// `None` for a normal dependency; `"dev"`/`"build"` otherwise. Only the
-    /// normal one constrains what a consumer must link against.
-    kind: Option<String>,
-}
-
-/// `typify-impl`'s declared `schemars` requirement, as a `(version, req)`
-/// pair — e.g. `("0.7.0", "^0.8.22")`.
+/// Which `schemars` [`UPSTREAM`] actually resolved against, as a
+/// `(upstream version, schemars version)` pair — e.g. `("0.6.2", "0.8.22")`.
 ///
-/// `--offline` so this never reaches the network: the metadata comes from the
-/// already-vendored registry entry that the build itself resolved against, so
-/// the answer is the same one the compiler will get.
-pub fn upstream_requirement(manifest_dir: &str) -> Result<(String, String)> {
-    let out = Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()))
-        .args(["metadata", "--format-version", "1", "--offline"])
-        .current_dir(manifest_dir)
-        .output()
-        .context("failed to run `cargo metadata`")?;
-    if !out.status.success() {
-        bail!(
-            "`cargo metadata --offline` failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
-    }
-    let metadata: Metadata = serde_json::from_slice(&out.stdout).context("failed to parse `cargo metadata` output")?;
+/// Read out of `Cargo.lock` rather than `cargo metadata`. The lockfile is a
+/// tracked file, so this needs no subprocess, no registry and no network —
+/// which matters, because `Test tooling` runs from a nextest archive where
+/// `cargo metadata --offline` cannot resolve the workspace at all (it fails on
+/// `cosca`). The resolved version answers the question just as well as the
+/// declared requirement: if upstream ever admits schemars 1.x, that is what
+/// resolution will pick, and this fires.
+///
+/// A lockfile dependency entry carries its version only when the name is
+/// ambiguous — which it is today (`serde_with` pulls schemars 0.9 beside
+/// typify's 0.8) — so a bare `"schemars"` is resolved against the sole
+/// `[[package]]` entry instead.
+pub fn upstream_schemars(lock: &str) -> Result<(String, String)> {
+    let lockfile: Lockfile = toml::from_str(lock).context("failed to parse Cargo.lock")?;
 
-    let mut found = Vec::new();
-    for package in &metadata.packages {
-        if package.name != UPSTREAM {
-            continue;
-        }
-        for dep in &package.dependencies {
-            if dep.name == "schemars" && dep.kind.is_none() {
-                found.push((package.version.clone(), dep.req.clone()));
+    let upstream: Vec<&LockPackage> = lockfile.packages.iter().filter(|p| p.name == UPSTREAM).collect();
+    let upstream = match upstream.as_slice() {
+        [] => bail!(
+            "`{UPSTREAM}` is not in Cargo.lock. If typify was dropped, this pin has no reason to              exist and both it and this module should go; if it was renamed, this check needs to              follow it."
+        ),
+        [one] => *one,
+        many => bail!(
+            "`{UPSTREAM}` resolves to {} versions in Cargo.lock; one pin cannot describe them all",
+            many.len()
+        ),
+    };
+
+    let entry = upstream
+        .dependencies
+        .iter()
+        .find(|d| d == &"schemars" || d.starts_with("schemars "))
+        .with_context(|| {
+            format!(
+                "`{UPSTREAM}` {} no longer depends on schemars at all. Upstream may have landed its                  own IR (oxidecomputer/typify#886), which means this pin is obsolete rather than                  this check being broken.",
+                upstream.version
+            )
+        })?;
+
+    let schemars_version = match entry.split_once(' ') {
+        Some((_, version)) => version.to_string(),
+        // Unqualified: only one `schemars` in the graph, so the sole package
+        // entry is the one meant.
+        None => {
+            let all: Vec<&LockPackage> = lockfile.packages.iter().filter(|p| p.name == "schemars").collect();
+            match all.as_slice() {
+                [one] => one.version.clone(),
+                other => bail!(
+                    "`{UPSTREAM}` names schemars without a version, but {} schemars packages are                      locked; cannot tell which it resolved against",
+                    other.len()
+                ),
             }
         }
-    }
-    match found.len() {
-        0 => bail!(
-            "no normal `schemars` dependency found on `{UPSTREAM}` in `cargo metadata`. Either the \
-             dependency is gone (upstream may have landed its own IR — see oxidecomputer/typify#886) \
-             or the crate was renamed. Both mean this pin needs revisiting, not that the check is broken."
-        ),
-        1 => Ok(found.pop().expect("length checked")),
-        _ => bail!(
-            "`{UPSTREAM}` resolves to more than one version in this workspace ({found:?}); \
-             the pin below cannot describe both"
-        ),
-    }
+    };
+    Ok((upstream.version.clone(), schemars_version))
 }
 
-/// Does `req` constrain to the [`PINNED_SERIES`]?
+/// Is `version` inside the [`PINNED_SERIES`]?
 ///
-/// Deliberately a prefix test on the series, not a semver-range evaluation:
-/// the question is "which 0.x series does upstream speak", and any of
-/// `^0.8.22`, `0.8.22`, `=0.8.22`, `~0.8` answers it the same way. A range
-/// that admitted anything outside the series would not start with it.
-pub fn requirement_tracks_pin(req: &str) -> bool {
-    let bare = req.trim_start_matches(['^', '~', '=', '>', '<', ' ']);
+/// A series test, not a full semver comparison: the question is only "which
+/// 0.x line is this", and for a 0.x crate the minor IS the breaking axis. The
+/// leading-operator strip lets the same predicate read a requirement string
+/// (`^0.8.22`, `~0.8`) as well as a resolved version, so a caller that has one
+/// rather than the other needs no second function.
+pub fn requirement_tracks_pin(version: &str) -> bool {
+    let bare = version.trim_start_matches(['^', '~', '=', '>', '<', ' ']);
     bare == PINNED_SERIES || bare.starts_with(&format!("{PINNED_SERIES}."))
 }
 
