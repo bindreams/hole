@@ -500,6 +500,8 @@ fn dacl_sddl(path: &std::path::Path) -> String {
             None,
             &mut psd,
         )
+        // Returns WIN32_ERROR, not Result — `.ok()` converts it.
+        .ok()
         .expect("GetNamedSecurityInfoW failed");
     }
 
