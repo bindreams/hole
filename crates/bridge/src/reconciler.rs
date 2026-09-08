@@ -218,6 +218,33 @@ pub fn teardown_cover_disposition(
     }
 }
 
+/// Decide the TRANSIENT block-until-connected cover's fate from the cause of
+/// the teardown.
+///
+/// Separate from [`teardown_cover_disposition`] because the two covers answer
+/// different questions. The standing cover asks what the target authorises;
+/// this one asks only **"will a successor process adopt these filters"** —
+/// true for `CutoverRestart` alone, where a replacement bridge is already
+/// starting. Nothing adopts them on a clean shutdown, so keeping them there
+/// blocks the host from boot until the bridge next runs.
+///
+/// Exhaustive with no wildcard: the arm this replaced grouped
+/// `CutoverRestart | Blipped | ProcessExiting` by their shared consequence to
+/// the target, which is what let `ProcessExiting` inherit an answer chosen for
+/// a cutover.
+///
+/// `Blipped` deliberately keeps today's behaviour pending an open question:
+/// a blip's cover arguably *should* survive an in-process retry, but
+/// `stop_with` has already replaced the posture with `Idle` by this point, so
+/// nothing would own it. Changing it is a policy call, not a defect fix.
+pub fn transient_cover_disposition(event: SessionEvent) -> CoverDisposition {
+    match event {
+        SessionEvent::CutoverRestart => CoverDisposition::KeepEngaged,
+        SessionEvent::Blipped => CoverDisposition::KeepEngaged,
+        SessionEvent::UserStopped | SessionEvent::GaveUp | SessionEvent::ProcessExiting => CoverDisposition::ReleaseNow,
+    }
+}
+
 // step_order ==========================================================================================================
 
 /// The order the two surfaces move in this reconcile pass.

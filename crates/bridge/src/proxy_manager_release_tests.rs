@@ -420,3 +420,51 @@ fn unblock_during_a_session_disarms_a_promoted_adopted_switch() {
         pm.stop().await.unwrap();
     });
 }
+
+// Transient cover on a clean shutdown =================================================================================
+
+/// F7. The `PendingStart` arm used to group `CutoverRestart | Blipped |
+/// ProcessExiting => disarm()` against `UserStopped | GaveUp => drop()` —
+/// grouped by their shared consequence to the TARGET, which is the exact
+/// "collapse two variants onto a shared consequence" defect `SessionEvent`'s
+/// own doc forbids, reproduced inside the model built to remove it.
+///
+/// The transient cover's real question is not "does the target move" but
+/// "will a successor process adopt these filters", and that is true for
+/// `CutoverRestart` alone. On a clean machine shutdown nothing adopts them, so
+/// disarming leaves the host blocked from boot until the bridge next starts.
+#[skuld::test]
+fn a_clean_shutdown_with_a_pending_start_does_not_strand_the_transient_cover() {
+    rt().block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut pm, st) = covered_start_holding_the_cover(&dir).await;
+        assert_eq!(st.cover_disengage_calls.load(Ordering::SeqCst), 0);
+
+        pm.stop_with(SessionEvent::ProcessExiting).await.unwrap();
+
+        assert_eq!(
+            st.cover_disengage_calls.load(Ordering::SeqCst),
+            1,
+            "a clean shutdown has no successor to adopt the transient cover, so its guard must be \
+             DROPPED (releasing the filters), not disarmed (leaving them with no owner)"
+        );
+    });
+}
+
+/// The cutover is the one case that genuinely hands off: the replacement
+/// bridge adopts the filters, so disarming is correct there and must stay.
+#[skuld::test]
+fn a_cutover_still_hands_the_transient_cover_to_its_successor() {
+    rt().block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut pm, st) = covered_start_holding_the_cover(&dir).await;
+
+        pm.stop_with(SessionEvent::CutoverRestart).await.unwrap();
+
+        assert_eq!(
+            st.cover_disengage_calls.load(Ordering::SeqCst),
+            0,
+            "a cutover must persist the transient cover across the restart for the new bridge to adopt"
+        );
+    });
+}

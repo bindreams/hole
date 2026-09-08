@@ -47,7 +47,7 @@ use tun_engine::gateway::GatewayInfo;
 use tun_engine::routing::failclosed::lockdown_state::{self, Intent};
 use tun_engine::routing::{CoverGuard, CoverPresence, RoutesInstalled, Routing, SystemRouting};
 
-use crate::reconciler::{teardown_cover_disposition, CoverDisposition};
+use crate::reconciler::{teardown_cover_disposition, transient_cover_disposition, CoverDisposition};
 use crate::target::{self, target_after, SessionEvent, Target};
 
 use crate::dns::self_test::{
@@ -1904,11 +1904,9 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
                 // left engaged. Clear the stale error/death so a
                 // Disconnect-from-blocked lands the same clean state a normal
                 // stop does.
-                match event {
-                    SessionEvent::UserStopped | SessionEvent::GaveUp => drop(b.cover),
-                    SessionEvent::CutoverRestart | SessionEvent::Blipped | SessionEvent::ProcessExiting => {
-                        b.cover.disarm()
-                    }
+                match transient_cover_disposition(event) {
+                    CoverDisposition::ReleaseNow => drop(b.cover),
+                    CoverDisposition::KeepEngaged => b.cover.disarm(),
                 }
                 self.last_error = None;
                 self.death_reason = None;
