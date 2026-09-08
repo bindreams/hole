@@ -1380,9 +1380,7 @@ pub trait CoverGuard {
     /// Persists the filters and releases this process's claim on them. Safe
     /// for a LONG-LIVED caller: the implementation closes whatever the guard
     /// still holds (the Windows FWPM engine handle) rather than skipping it,
-    /// so there is no per-call leak. It previously carried a "call only
-    /// immediately before process exit" precondition for exactly that reason,
-    /// and `apply_cover_step`'s reload path broke it every time.
+    /// so there is no per-call leak.
     ///
     /// macOS deliberately leaves pf enabled: its guard holds no process-local
     /// resource, and the enable refcount is the thing being persisted.

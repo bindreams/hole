@@ -212,12 +212,10 @@ pub fn teardown_cover_disposition(
         // releasing.
         SessionEvent::UserStopped => CoverDisposition::ReleaseNow,
         // Everything else defers to `cover_step`, INCLUDING the two pre-exit
-        // events. Returning `KeepEngaged` for them unconditionally was a
-        // regression: `cover_step`'s `Off`/`Unset` intent arms release a
-        // stranded cover, so a shutdown or cutover with the kill switch off
-        // used to sweep one and would instead have left the host blocked with
-        // nothing owning the filters. What makes a cutover keep its cover is
-        // the intent being ON, not the event — `cover_step` already says so.
+        // events. What makes a cutover keep its cover is the intent being ON,
+        // not the event: `cover_step` already owns that axis, and its
+        // `Off`/`Unset` arms sweep a stranded cover rather than leaving the
+        // host blocked with nothing owning the filters.
         SessionEvent::CutoverRestart | SessionEvent::ProcessExiting | SessionEvent::GaveUp | SessionEvent::Blipped => {
             match cover_step(intent, presence, target) {
                 CoverStep::Release => CoverDisposition::ReleaseNow,
@@ -363,8 +361,8 @@ pub async fn reconcile_once<P, R, D>(
                 };
                 // A child of the process-wide shutdown token, so a SIGTERM /
                 // SCM Stop arriving mid-boot abandons the auto-connect instead
-                // of racing it. Minting a fresh token here, as this once did,
-                // produced one nothing else held: uncancellable by construction.
+                // of racing it. A token minted here would be one
+                // nothing else holds: uncancellable by construction.
                 if let Err(error) = pm.start_cancellable(config, true, cancel.child_token()).await {
                     tracing::warn!(%error, "reconcile_once: failed to start the persisted target");
                 }

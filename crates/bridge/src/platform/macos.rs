@@ -262,9 +262,13 @@ pub fn run(
         // Service entry point — see clippy.toml's CancellationToken::new list.
         let shutdown = tokio_util::sync::CancellationToken::new();
         {
+            // Called on the current task, not inside the spawn: registration is
+            // eager in `shutdown_signal()` itself, and `tokio::spawn` only
+            // queues. See the same comment in `foreground::run_inner`.
+            let signal = crate::foreground::shutdown_signal();
             let shutdown = shutdown.clone();
             tokio::spawn(async move {
-                crate::foreground::shutdown_signal().await;
+                signal.await;
                 shutdown.cancel();
             });
         }

@@ -423,7 +423,7 @@ fn unblock_during_a_session_disarms_a_promoted_adopted_switch() {
 
 // Transient cover on a clean shutdown =================================================================================
 
-/// F7. The `PendingStart` arm used to group `CutoverRestart | Blipped |
+/// The `PendingStart` arm used to group `CutoverRestart | Blipped |
 /// ProcessExiting => disarm()` against `UserStopped | GaveUp => drop()` —
 /// grouped by their shared consequence to the TARGET, which is the exact
 /// "collapse two variants onto a shared consequence" defect `SessionEvent`'s

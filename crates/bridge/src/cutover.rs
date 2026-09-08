@@ -159,6 +159,12 @@ fn unlock_with(state_dir: &Path, disengage: impl FnOnce() -> std::io::Result<()>
     crate::target::apply(state_dir, None, |_| crate::target::Target::Off)
         .map_err(|e| std::io::Error::other(format!("could not record target off: {e}")))?;
     disengage()?;
+    // Same reason `handle_unblock` clears it: `resolve_startup_target` feeds
+    // the candidate to `AlwaysConnect` over an `Off` target, so leaving it
+    // would let the next boot reconnect to the server this escape just freed
+    // the host from.
+    crate::target::apply_startup_preference(state_dir, None, |pref| pref.candidate = None)
+        .map_err(|e| std::io::Error::other(format!("could not clear the auto-connect candidate: {e}")))?;
     tun_engine::routing::failclosed::lockdown_state::set_enabled(state_dir, false, None)
 }
 

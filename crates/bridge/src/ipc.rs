@@ -625,23 +625,28 @@ async fn persist_after_start<P: Proxy, R: Routing>(
                     }
                 }
             })?;
-            let mut pref = target::load_startup_preference(&state_dir);
-            if let Some(on_startup) = on_startup {
-                pref.on_startup = on_startup;
-            }
-            // The candidate records what actually happened, so it follows the
-            // target's fate: recording it after a declined write would leave
-            // the two disagreeing about what the user last asked for. The
-            // `on_startup` push above is a PREFERENCE, not a record, so it
-            // stands either way.
-            if !declined.load(std::sync::atomic::Ordering::SeqCst) {
-                pref.candidate = Some(Box::new(candidate_config));
-            }
-            target::save_startup_preference(&state_dir, &pref, owner)
+            // Locked read-modify-write, NOT load-then-save: a concurrent
+            // `handle_unblock` clearing the candidate between the two halves
+            // would be silently re-added here, leaving `Target::Off` beside a
+            // live candidate that `AlwaysConnect` reconnects from — the escape
+            // undone. Sequential with the `target::apply` above, never nested:
+            // both take the same lock, and `flock` is per-open-description, so
+            // nesting would deadlock rather than recurse.
+            target::apply_startup_preference(&state_dir, owner, |pref| {
+                if let Some(on_startup) = on_startup {
+                    pref.on_startup = on_startup;
+                }
+                // The candidate records what actually happened, so it follows
+                // the target's fate. The `on_startup` push is a PREFERENCE,
+                // not a record, so it stands either way.
+                if !declined.load(std::sync::atomic::Ordering::SeqCst) {
+                    pref.candidate = Some(Box::new(candidate_config));
+                }
+            })
         } else if let Some(on_startup) = on_startup {
-            let mut pref = target::load_startup_preference(&state_dir);
-            pref.on_startup = on_startup;
-            target::save_startup_preference(&state_dir, &pref, owner)
+            target::apply_startup_preference(&state_dir, owner, |pref| {
+                pref.on_startup = on_startup;
+            })
         } else {
             Ok(())
         }
@@ -746,13 +751,11 @@ async fn handle_lockdown<P: Proxy + 'static, R: Routing + 'static>(
 /// stays blocked while every record says it isn't and the user's only retry
 /// affordance (the tray still offering Unblock) is gone.
 ///
-/// The release itself is called unless `cover_step` has CONFIRMED nothing
-/// is there: `Target::Off` with presence `Unreachable` (the probe could not
-/// reach the OS) is not confirmation, and an escape-offering site must
-/// resolve that toward releasing, never toward "nothing to do" — see
-/// `crates/common/api/openapi.yaml`'s `CoverPresence` doc. `release_all_covers`
-/// is documented unconditional and idempotent, so a false-positive call
-/// costs nothing.
+/// The release is UNCONDITIONAL — no presence probe gates it. This once
+/// consulted `cover_step` and skipped the call on a confirmed `Absent`, which
+/// is check-then-act in front of an operation documented idempotent, and at
+/// the escape hatch a stale `Absent` is the one wrong answer that matters: it
+/// reports success while the host stays blocked. `turn_lockdown_off` shares the rule.
 async fn handle_unblock<P: Proxy + 'static, R: Routing + 'static>(
     State(state): State<Arc<IpcState<P, R>>>,
 ) -> Result<Json<EmptyResponse>, (StatusCode, Json<ErrorResponse>)> {
@@ -808,9 +811,7 @@ async fn handle_unblock<P: Proxy + 'static, R: Routing + 'static>(
         // it to `AlwaysConnect` over an `Off` target, so leaving it would let
         // the next boot reconnect to the server the user just escaped from —
         // the escape undone by a record it never touched.
-        let mut pref = target::load_startup_preference(&state_dir);
-        pref.candidate = None;
-        target::save_startup_preference(&state_dir, &pref, owner).map_err(|e| e.to_string())?;
+        target::apply_startup_preference(&state_dir, owner, |pref| pref.candidate = None).map_err(|e| e.to_string())?;
         Ok(())
     })
     .await;

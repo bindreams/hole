@@ -462,9 +462,6 @@ fn reconcile_once_honours_an_always_connect_startup_preference_with_a_candidate(
 // prevent. Same walk pattern as `proxy_manager_tests.rs`'s
 // `no_bridge_source_derives_cover_state_from_a_session`.
 
-/// An undocumented fifth caller of `release_all_covers()` would mean a new
-/// release path was added outside the four reasoned-about sites — the exact
-/// kind of divergent teardown route this stage collapses cover-release onto.
 /// Regex for a Rust function declaration, used to attribute a call site to the
 /// function that lexically encloses it. A backwards line walk is a heuristic —
 /// a call inside a nested `fn` attributes to the nested one (correct), a call
@@ -512,6 +509,8 @@ fn cover_release_has_the_known_sanctioned_caller_set() {
     // Anchored on the function, NOT the line: an unrelated edit above a call
     // must not fail this guard, because the only tempting repair for that is
     // to bump the number, which re-blesses whatever moved into the old slot.
+    // Exact paths relative to `src/`, never `ends_with` suffixes: a suffix
+    // match would also bless a future `platform/ipc.rs` or `dns/reconciler.rs`.
     let sanctioned: &[(&str, &str)] = &[
         ("ipc.rs", "handle_unblock"),              // deliberately bypasses `state.proxy.lock()`.
         ("proxy_manager.rs", "turn_lockdown_off"), // the explicit off-toggle.
@@ -564,17 +563,27 @@ fn cover_release_has_the_known_sanctioned_caller_set() {
         msg
     };
 
-    assert_eq!(matches.len(), sanctioned.len(), "{}", diagnostic());
-    for (file, func, _) in &matches {
-        let is_sanctioned = sanctioned
-            .iter()
-            .any(|(suffix, name)| file.ends_with(suffix) && name == func);
-        assert!(
-            is_sanctioned,
-            "unsanctioned call site: {file} fn {func}\n{}",
-            diagnostic()
-        );
-    }
+    // SET equality, not count-plus-membership: two calls inside one sanctioned
+    // function and none in another satisfies the latter while a whole
+    // reasoned-about release path has silently disappeared. Paths are compared
+    // exactly, relative to `src/`, so a suffix match cannot bless a future
+    // `platform/ipc.rs`.
+    let found: std::collections::BTreeSet<(String, String)> = matches
+        .iter()
+        .map(|(file, func, _)| {
+            let rel = std::path::Path::new(file)
+                .strip_prefix(&src_root)
+                .unwrap_or(std::path::Path::new(file))
+                .to_string_lossy()
+                .replace('\\', "/");
+            (rel, func.clone())
+        })
+        .collect();
+    let expected: std::collections::BTreeSet<(String, String)> = sanctioned
+        .iter()
+        .map(|(f, n)| ((*f).to_string(), (*n).to_string()))
+        .collect();
+    assert_eq!(found, expected, "{}", diagnostic());
 }
 
 // Line-shift resilience ===============================================================================================
@@ -616,9 +625,7 @@ fn a_call_inside_a_closure_belongs_to_its_enclosing_function() {
 
 // Boot cancellation ===================================================================================================
 
-/// `reconcile_once` used to mint its own `CancellationToken::new()` under an
-/// `#[allow]`, on the premise that boot-time reconciliation "has no external
-/// cancel source to thread through". All three of its call sites sit in
+/// All three of `reconcile_once`'s call sites sit in
 /// startup paths that own a shutdown signal — SIGINT/SIGTERM in the
 /// foreground, SCM Stop and launchd's SIGTERM in the two service paths — and
 /// that signal is exactly what has nothing to reach while a boot auto-connect
@@ -737,6 +744,27 @@ fn teardown_disposition_is_exhaustive_over_events() {
 
 // Contract guards =====================================================================================================
 
+/// Whether `line` DECIDES from a value rather than merely naming or
+/// constructing one.
+///
+/// `=>` and `==`/`!=` are the obvious forms. The rest are the ones that
+/// silently slipped past an earlier version of these guards: `matches!`,
+/// a match arm split so a bare `Variant` sits alone on its own line (leading
+/// or trailing `|`), and the three binding forms — `if let`, `while let`, and
+/// let-else — which pattern-match without any of the above tokens.
+pub(crate) fn line_decides(line: &str) -> bool {
+    let t = line.trim();
+    t.contains("=>")
+        || t.contains("==")
+        || t.contains("!=")
+        || t.contains("matches!")
+        || t.contains("if let")
+        || t.contains("while let")
+        || (t.starts_with("let ") && t.contains(" else"))
+        || t.ends_with('|')
+        || t.starts_with('|')
+}
+
 /// Strip comment lines so a doc comment naming a variant is not mistaken for
 /// a decision site. Crude on purpose: it must never hide a real match arm.
 fn code_lines(text: &str) -> impl Iterator<Item = (usize, &str)> {
@@ -792,15 +820,7 @@ fn session_event_policy_lives_on_the_type_not_at_call_sites() {
         }
         let text = std::fs::read_to_string(path).expect("failed to read a walked source file");
         for (idx, line) in code_lines(&text) {
-            // `matches!` decides too, and a match arm can be split across
-            // lines, leaving a bare `SessionEvent::Variant` on one of them.
-            let decides = line.contains("=>")
-                || line.contains("==")
-                || line.contains("!=")
-                || line.contains("matches!")
-                || line.trim_end().ends_with('|')
-                || line.trim_start().starts_with('|');
-            if line.contains("SessionEvent::") && decides {
+            if line.contains("SessionEvent::") && line_decides(line) {
                 offenders.push(format!("{}:{}: {}", path.display(), idx + 1, line.trim()));
             }
         }
@@ -836,10 +856,6 @@ fn session_event_policy_lives_on_the_type_not_at_call_sites() {
 #[skuld::test]
 fn cover_presence_is_never_compared_against_a_variant() {
     let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..");
-    // The files that DEFINE the question, and may therefore answer it:
-    // the two type definitions, plus the platform modules under
-    // `failclosed/` that PRODUCE the probe (they classify their own raw OS
-    // result; the invariant is about consumers of the answer).
     let scan_root = workspace.clone();
     // The type definitions, plus the platform modules that PRODUCE the probe
     // (they classify their own raw OS result; the invariant binds consumers).
@@ -878,8 +894,7 @@ fn cover_presence_is_never_compared_against_a_variant() {
         }
         let text = std::fs::read_to_string(path).expect("failed to read a walked source file");
         for (idx, line) in code_lines(&text) {
-            let compares = line.contains("==") || line.contains("!=") || line.contains("matches!");
-            if line.contains("CoverPresence::") && compares {
+            if line.contains("CoverPresence::") && line_decides(line) {
                 offenders.push(format!("{}:{}: {}", path.display(), idx + 1, line.trim()));
             }
         }
@@ -893,4 +908,34 @@ fn cover_presence_is_never_compared_against_a_variant() {
          direction an escape-offering site must never take.",
         offenders.join("\n  ")
     );
+}
+
+/// The guards are only worth having if they FAIL on the shapes that slipped
+/// past earlier versions. Asserted directly against the predicate rather than
+/// by mutating real sources, so a regression in `line_decides` cannot hide
+/// behind a whitelist entry.
+#[skuld::test]
+fn the_decision_predicate_catches_every_pattern_matching_form() {
+    for line in [
+        "        SessionEvent::GaveUp => CoverDisposition::ReleaseNow,",
+        "    if event == SessionEvent::GaveUp {",
+        "    if event != SessionEvent::GaveUp {",
+        "    matches!(e, SessionEvent::GaveUp)",
+        "    if let SessionEvent::GaveUp = event {",
+        "    while let SessionEvent::GaveUp = next() {",
+        "    let SessionEvent::GaveUp = event else { return };",
+        "        SessionEvent::CutoverRestart |",
+        "        | SessionEvent::ProcessExiting => x,",
+    ] {
+        assert!(line_decides(line), "predicate missed a decision form: {line:?}");
+    }
+    // Construction and naming must NOT trip it, or every call site becomes an
+    // offender and the guard gets whitelisted into uselessness.
+    for line in [
+        "    self.stop_with(SessionEvent::UserStopped).await",
+        "    Some(SessionEvent::GaveUp)",
+        "        crate::target::SessionEvent::CutoverRestart",
+    ] {
+        assert!(!line_decides(line), "predicate flagged a construction site: {line:?}");
+    }
 }

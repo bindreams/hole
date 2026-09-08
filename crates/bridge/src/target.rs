@@ -571,6 +571,29 @@ pub(crate) fn load_startup_preference(state_dir: &Path) -> StartupPreference {
     }
 }
 
+/// The only read-modify-write surface for `bridge-startup.json`.
+///
+/// Takes the SAME [`TargetExclusive`] lock the target file uses, because the
+/// two records are read together by `resolve_startup_target` and a torn pair
+/// is what lets an escape be undone: `handle_unblock` clearing the candidate
+/// while a concurrent `persist_after_start` re-adds it leaves `Off` plus a
+/// live candidate, which `AlwaysConnect` then reconnects from.
+///
+/// A single lock rather than a second one: these files are always mutated in
+/// the same breath, and a second lock ordered against the first is a deadlock
+/// waiting to be written. The leaf-lock contract in [`TargetExclusive`] still
+/// applies — `f` must stay pure file I/O.
+pub(crate) fn apply_startup_preference(
+    state_dir: &Path,
+    owner: Option<(u32, u32)>,
+    f: impl FnOnce(&mut StartupPreference),
+) -> Result<(), TargetError> {
+    let _lock = TargetExclusive::acquire(state_dir, owner).map_err(TargetError::Lock)?;
+    let mut pref = load_startup_preference(state_dir);
+    f(&mut pref);
+    save_startup_preference(state_dir, &pref, owner)
+}
+
 /// Persist the startup preference (same atomic-write + 0600/0700 discipline
 /// as [`save`], via the same [`write_state_file`] helper).
 pub(crate) fn save_startup_preference(
@@ -655,10 +678,10 @@ impl SessionEvent {
     /// the one place a sixth variant has to answer this question, instead of
     /// silently inheriting whichever side of an `!=` it happens to fall on.
     /// `check_health` sets `last_error`/`death_reason` to explain a `GaveUp`
-    /// teardown (#470); clearing them there would erase the explanation before
+    /// teardown; clearing them there would erase the explanation before
     /// the GUI toast ever reads it. Every other cause arrives with no
     /// explanation of its own, so the stale one from a previous failed start
-    /// is cleared (#142).
+    /// is cleared.
     pub fn preserves_death_reason(self) -> bool {
         match self {
             SessionEvent::GaveUp => true,

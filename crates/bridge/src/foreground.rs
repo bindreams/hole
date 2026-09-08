@@ -205,9 +205,19 @@ async fn run_inner(
     // See clippy.toml's CancellationToken::new sanctioned-sites list.
     let shutdown = CancellationToken::new();
     {
+        // `shutdown_signal()` is called HERE, on the current task, not inside
+        // the `async move` below. Its handler registration
+        // (`signal(SignalKind::terminate())` / `ctrl_break()`) happens eagerly
+        // when the function runs, but `tokio::spawn` only QUEUES a task — it
+        // does not poll it. Constructing the future inside the spawn would
+        // defer registration to the runtime's first poll, leaving exactly the
+        // boot window this wiring exists to close: a SIGTERM arriving during
+        // `recover_and_record`/`reconcile_once` would hit the default
+        // disposition and kill the process with routes and cover half-installed.
+        let signal = shutdown_signal();
         let shutdown = shutdown.clone();
         tokio::spawn(async move {
-            shutdown_signal().await;
+            signal.await;
             shutdown.cancel();
         });
     }

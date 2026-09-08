@@ -1251,7 +1251,7 @@ Lockdown-off toggle, which reads no session posture — it decides via
 [`cover_step`](#cover-ownership) against the current target and the measured
 `CoverPresence`, so a session left wedged mid-teardown with the target
 already `Off` is released too, not just an idle bridge; session teardown's
-own `apply_cover_step`, ordered after routes so the release never precedes
+own `apply_cover_disposition`, ordered after routes so the release never precedes
 the tunnel it covered; and the tray's Unblock action (`handle_unblock`,
 below), which deliberately bypasses `ProxyManager` (and the lock a wedged
 teardown may hold) rather than routing through one of the other three.
@@ -1409,7 +1409,7 @@ Disclosed residuals:
 
    The claim is **not a latch** — it clears at three sites, all of them a
    CONFIRMED `release_all_covers()` result, never the guard's own silent
-   `Drop`: `turn_lockdown_off`, session teardown's `apply_cover_step`
+   `Drop`: `turn_lockdown_off`, session teardown's `apply_cover_disposition`
    (`check_health` tearing down a dead session included, via `stop_with`),
    and boot's `reconcile_once`. An unconfirmed release at any of the three
    leaves the claim — and the Unblock item — in place, on the theory that a
@@ -1461,7 +1461,7 @@ one sanctioned site (`stop_with`'s own teardown), and
 `cover_release_has_the_known_sanctioned_caller_set`
 (`reconciler_tests.rs`) whitelists every real caller of the unconditional
 `release_all_covers()` — `handle_unblock`, `turn_lockdown_off`,
-`apply_cover_step`, and `reconcile_once` — against the four independently
+`apply_cover_disposition`, and `reconcile_once` — against the four independently
 documented reasons each releases directly instead of routing through the
 others. Both are blind to an added accessor under a different name; see each
 guard's own doc for its disclosed gap.

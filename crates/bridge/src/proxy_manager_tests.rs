@@ -5968,7 +5968,7 @@ fn a_blip_with_no_state_dir_does_not_release_a_standing_cover() {
 
 // Explicit disarm =====================================================================================================
 
-/// F5. `cover_step` holds on every unknown, which is right for a steady-state
+/// `cover_step` holds on every unknown, which is right for a steady-state
 /// reconciler with no information — but a user Disconnect is an explicit
 /// disarm and must lean the other way. Keying teardown on `cover_step` alone
 /// meant an `Unreachable` probe produced `Hold`, which disarmed the guard and

@@ -1526,8 +1526,8 @@ fn a_start_with_no_startup_preference_leaves_the_persisted_one_alone() {
 
 /// Build an `IpcState` directly (bypassing `IpcServer::bind*`, which cannot
 /// wire up the test-only persist gate) so `persist_after_start` can be
-/// parked exactly inside its write window — the window `f745e03c`/
-/// `2c85d130` raced in, between `start_cancellable` returning and the
+/// parked exactly inside its write window — between `start_cancellable`
+/// returning and the
 /// target/startup-preference write landing. `proxy`'s own `state_dir` must
 /// be `dir`, same as `IpcState::state_dir`, for `handle_stop`'s write
 /// (via `ProxyManager::state_dir`) and `handle_start`'s (via this state's
@@ -1564,13 +1564,10 @@ fn ipc_state_with_persist_gate(
 
 #[skuld::test]
 async fn a_stop_landing_while_a_start_persists_does_not_get_reverted_to_connected() {
-    // f745e03c: `persist_after_start`'s target write used to run AFTER
-    // `handle_start` dropped the proxy lock, racing a concurrent
-    // `handle_stop`'s own target write (taken under that same lock). Now
-    // both run under one critical section, so a Stop dispatched while a
-    // Start is mid-persist cannot even begin its own write until the
-    // Start's is durably on disk — Off must win, never get silently
-    // reverted back to Connected by the Start's write landing later.
+    // The start's persist runs inside the proxy lock, so a Stop dispatched
+    // while a Start is mid-persist cannot begin its own write until the
+    // Start's is durably on disk. Off must win, never be reverted back to
+    // Connected by the Start's write landing later.
     let dir = tempfile::tempdir().unwrap().keep();
     let (state, persist_gate, persist_entered) = ipc_state_with_persist_gate(dir.clone());
 
@@ -1612,16 +1609,11 @@ async fn a_stop_landing_while_a_start_persists_does_not_get_reverted_to_connecte
 
 #[skuld::test]
 async fn a_second_start_cannot_begin_while_the_first_is_still_persisting() {
-    // 2c85d130: `save_startup_preference`'s load-mutate-save has no lock of
-    // its own — its only protection is that `handle_start`'s single-
-    // occupancy `in_flight` guard, and the proxy lock it now shares with
-    // `persist_after_start`, keep two overlapping starts from ever having
-    // their persist windows in flight together. Previously `in_flight`
-    // cleared right after `start_cancellable` returned, BEFORE persist ran,
-    // so a second start landing in that gap was admitted and could race the
-    // first's unlocked preference read-modify-write. Prove the gap is
-    // closed: a second Start dispatched while the first is mid-persist
-    // (in_flight still held) is rejected with 409, not admitted.
+    // `save_startup_preference`'s read-modify-write now shares the target
+    // file's lock, and `handle_start`'s single-occupancy `in_flight` guard
+    // holds until the persist has completed — so two overlapping starts can
+    // never have their persist windows in flight together. A second Start
+    // dispatched while the first is mid-persist is rejected with 409.
     let dir = tempfile::tempdir().unwrap().keep();
     let (state, persist_gate, persist_entered) = ipc_state_with_persist_gate(dir.clone());
 
@@ -2947,7 +2939,7 @@ async fn an_outgoing_error_carrying_the_address_is_redacted() {
 
 // Unblock vs post-start persist =======================================================================================
 
-/// f745e03c, second half. Holding the proxy lock across the persist closed the
+/// Holding the proxy lock across the persist closed the
 /// Start-vs-Stop race, because `handle_stop` takes that same lock and simply
 /// queues. It cannot close Start-vs-Unblock: `handle_unblock` takes NO proxy
 /// lock by design (it must work while a wedged teardown holds one), so it runs

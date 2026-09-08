@@ -753,9 +753,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         // Unconditional: `release_all_covers` is documented idempotent, so
         // gating it on a presence probe is a check-then-act guard on an
         // operation that needs none — and at an explicit disarm a stale
-        // `Absent` is the one wrong answer that matters. This is also what
-        // removes the discrepancy between this site's bespoke `must_release`
-        // and `handle_unblock`'s: neither computes a rule any more.
+        // `Absent` is the one wrong answer that matters.
         self.routing.release_all_covers()?;
         // The clear confirmed, so the host is open: an adopted cover no
         // longer holds it. Dropping this claim is what stops the tray
