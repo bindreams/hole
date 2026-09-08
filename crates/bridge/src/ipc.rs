@@ -1,11 +1,10 @@
 //! IPC server — HTTP/1.1 REST API over local Unix domain socket.
 
-use tun_engine::routing::failclosed::lockdown_state::{self, Intent};
-use tun_engine::routing::{CoverPresence, Routing};
+use tun_engine::routing::failclosed::lockdown_state;
+use tun_engine::routing::Routing;
 
 use crate::proxy::{Proxy, ProxyError};
 use crate::proxy_manager::{ProxyManager, ProxyState};
-use crate::reconciler::{cover_step, CoverStep};
 use crate::server_test::{run_server_test, TestConfig};
 use crate::socket::LocalListener;
 use crate::target::{self, Target};
@@ -749,19 +748,20 @@ async fn handle_unblock<P: Proxy + 'static, R: Routing + 'static>(
     // race it exists to close.
     state.cover_invalidated.store(true, std::sync::atomic::Ordering::SeqCst);
 
-    let presence = state.routing.lockdown_cover_presence();
-    let must_release =
-        presence == CoverPresence::Unreachable || cover_step(Intent::Off, presence, &Target::Off) == CoverStep::Release;
-    if must_release {
-        if let Err(e) = state.routing.release_all_covers() {
-            error!(error = %e, "unblock: release failed");
-            return Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse {
-                    message: "the network could not be fully unblocked".into(),
-                }),
-            ));
-        }
+    // Unconditional, with no presence probe in front of it.
+    // `release_all_covers` is documented idempotent, so a check here would be
+    // check-then-act on an operation that needs none — and at the escape
+    // hatch a stale `Absent` is the one wrong answer that matters. Sharing
+    // that rule with `turn_lockdown_off` is what removes the discrepancy the
+    // two bespoke `must_release` expressions used to carry.
+    if let Err(e) = state.routing.release_all_covers() {
+        error!(error = %e, "unblock: release failed");
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                message: "the network could not be fully unblocked".into(),
+            }),
+        ));
     }
 
     // Only once the release above is confirmed (or confirmed unneeded) does

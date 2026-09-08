@@ -5965,3 +5965,31 @@ fn a_blip_with_no_state_dir_does_not_release_a_standing_cover() {
         );
     });
 }
+
+// Explicit disarm =====================================================================================================
+
+/// F5. `cover_step` holds on every unknown, which is right for a steady-state
+/// reconciler with no information — but a user Disconnect is an explicit
+/// disarm and must lean the other way. Keying teardown on `cover_step` alone
+/// meant an `Unreachable` probe produced `Hold`, which disarmed the guard and
+/// left the filters installed with nothing left to own them.
+#[skuld::test]
+fn a_user_disconnect_with_an_unreachable_probe_releases_the_cover() {
+    rt().block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        let routing = MockRouting::new(dir.path().to_path_buf());
+        let st = routing.state();
+        let (mut pm, _dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, true);
+        pm.start(&test_config()).await.unwrap();
+        *st.cover_presence.lock().unwrap() = CoverPresence::Unreachable;
+
+        pm.stop_with(SessionEvent::UserStopped).await.unwrap();
+
+        assert_eq!(
+            st.release_all_calls.load(Ordering::SeqCst),
+            1,
+            "a user disconnect whose probe could not reach the firewall must still release: \
+             disarming there strands the filters with no owner"
+        );
+    });
+}

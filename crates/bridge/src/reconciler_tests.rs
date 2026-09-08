@@ -470,7 +470,7 @@ fn cover_release_has_the_known_sanctioned_caller_set() {
     let sanctioned: &[(&str, &str)] = &[
         ("ipc.rs", "handle_unblock"),              // deliberately bypasses `state.proxy.lock()`.
         ("proxy_manager.rs", "turn_lockdown_off"), // the explicit off-toggle.
-        ("proxy_manager.rs", "apply_cover_step"),  // session teardown, ordered after routes.
+        ("proxy_manager.rs", "apply_cover_disposition"), // session teardown, ordered after routes.
         ("reconciler.rs", "reconcile_once"),       // boot-time reconciliation.
     ];
 
@@ -605,4 +605,69 @@ fn a_cancelled_boot_reconcile_abandons_the_start() {
              the process is about to abandon"
         );
     });
+}
+
+// teardown_cover_disposition ==========================================================================================
+
+/// Teardown's cover fate keyed on the CAUSE of the teardown, exhaustively.
+///
+/// `UserStopped` is the explicit user disarm and always releases. The two
+/// pre-exit events hand off to whatever adopts the filters next.
+/// `GaveUp` and `Blipped` defer to `cover_step` — deliberately NOT grouped
+/// with `UserStopped` despite sharing its move to `Off`: giving up is the
+/// SYSTEM concluding the target is unreachable, not the user asking to open
+/// the host, and collapsing the two on that shared consequence is the exact
+/// defect `SessionEvent`'s own doc forbids.
+#[skuld::test]
+fn teardown_disposition_is_exhaustive_over_events() {
+    use CoverDisposition as D;
+    let connected = connected();
+    let table = [
+        // Explicit user act: releases regardless of what the probe says.
+        (
+            SessionEvent::UserStopped,
+            CoverPresence::Live,
+            &connected,
+            D::ReleaseNow,
+        ),
+        (
+            SessionEvent::UserStopped,
+            CoverPresence::Absent,
+            &connected,
+            D::ReleaseNow,
+        ),
+        (
+            SessionEvent::UserStopped,
+            CoverPresence::Unreachable,
+            &connected,
+            D::ReleaseNow,
+        ),
+        // A successor adopts the filters; the process is about to exit.
+        (
+            SessionEvent::CutoverRestart,
+            CoverPresence::Live,
+            &connected,
+            D::KeepEngaged,
+        ),
+        (
+            SessionEvent::ProcessExiting,
+            CoverPresence::Live,
+            &connected,
+            D::KeepEngaged,
+        ),
+        // Deferred to `cover_step`: a live cover toward a still-Connected
+        // target with the intent on is held, not released.
+        (SessionEvent::GaveUp, CoverPresence::Live, &connected, D::KeepEngaged),
+        (SessionEvent::Blipped, CoverPresence::Live, &connected, D::KeepEngaged),
+        // ...and the same events release once the target no longer authorises it.
+        (SessionEvent::GaveUp, CoverPresence::Live, &Target::Off, D::ReleaseNow),
+        (SessionEvent::Blipped, CoverPresence::Live, &Target::Off, D::ReleaseNow),
+    ];
+    for (event, presence, target, expected) in table {
+        assert_eq!(
+            teardown_cover_disposition(event, Intent::On, presence, target),
+            expected,
+            "event={event:?} presence={presence:?} target={target:?}"
+        );
+    }
 }

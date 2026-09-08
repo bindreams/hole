@@ -103,8 +103,9 @@ fn turn_lockdown_off_reports_an_unsaved_intent_while_a_session_runs() {
         );
         assert_eq!(
             st.release_all_calls.load(Ordering::SeqCst),
-            0,
-            "presence Absent (no standing cover was ever installed here); cover_step must hold"
+            1,
+            "the release runs unconditionally and first; only the intent persist fails here, \
+             which is what makes the error distinguishable"
         );
 
         pm.stop().await.unwrap();
@@ -131,9 +132,12 @@ fn turn_lockdown_off_clears_a_stranded_standing_cover() {
 }
 
 #[skuld::test]
-fn turn_lockdown_off_skips_the_release_when_presence_reads_absent() {
-    // A confirmed-clean host has nothing to release; `cover_step` must hold,
-    // not call `release_all_covers` for nothing to clear.
+fn turn_lockdown_off_releases_even_when_presence_reads_absent() {
+    // Inverted deliberately. This used to assert the release was SKIPPED on a
+    // confirmed-clean host, which is a check-then-act guard in front of an
+    // operation documented idempotent — and at an explicit disarm a stale
+    // `Absent` is the one wrong answer that matters: it reports success to the
+    // user while the host stays blocked. The redundant call costs nothing.
     rt().block_on(async {
         let dir = tempfile::tempdir().unwrap();
         let routing = MockRouting::new(dir.path().to_path_buf());
@@ -144,8 +148,9 @@ fn turn_lockdown_off_skips_the_release_when_presence_reads_absent() {
         pm.turn_lockdown_off().expect("a clean manager must not error");
         assert_eq!(
             st.release_all_calls.load(Ordering::SeqCst),
-            0,
-            "presence Absent; cover_step must not call release_all_covers for nothing to clear"
+            1,
+            "an explicit off-toggle must release unconditionally rather than trust a probe that \
+             may be reporting a stale Absent"
         );
         assert!(!lockdown_state::load_enabled(dir.path()));
     });
@@ -263,13 +268,13 @@ fn turn_lockdown_off_drops_a_held_transient_cover() {
         assert_eq!(
             st.cover_disengage_calls.load(Ordering::SeqCst),
             1,
-            "the held guard's Drop must run unconditionally, before the presence check"
+            "the held guard's Drop must run unconditionally, before the release"
         );
         assert_eq!(
             st.release_all_calls.load(Ordering::SeqCst),
-            0,
-            "no standing cover was ever installed (a transient engage does not touch presence); \
-             cover_step must not call release_all_covers for nothing left to clear"
+            1,
+            "the unconditional release runs even though no standing cover was installed: it is \
+             idempotent, and an escape must not gate on a probe that can read stale"
         );
         assert!(
             !pm.blocked_until_connected(),

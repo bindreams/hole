@@ -47,7 +47,7 @@ use tun_engine::gateway::GatewayInfo;
 use tun_engine::routing::failclosed::lockdown_state::{self, Intent};
 use tun_engine::routing::{CoverGuard, CoverPresence, RoutesInstalled, Routing, SystemRouting};
 
-use crate::reconciler::{cover_step, CoverStep};
+use crate::reconciler::{teardown_cover_disposition, CoverDisposition};
 use crate::target::{self, target_after, SessionEvent, Target};
 
 use crate::dns::self_test::{
@@ -755,19 +755,18 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
         // delete out from under it.
         self.posture.take_pending();
 
-        let target = self.state_dir.as_deref().map(target::load).unwrap_or(Target::Off);
-        let presence = self.routing.lockdown_cover_presence();
-        let must_release = matches!(target, Target::Unreadable)
-            || presence == CoverPresence::Unreachable
-            || cover_step(Intent::Off, presence, &target) == CoverStep::Release;
-        if must_release {
-            self.routing.release_all_covers()?;
-            // The clear confirmed, so the host is open: an adopted cover no
-            // longer holds it. Dropping this claim is what stops the tray
-            // from rendering `Lockdown: On` over an open host for the life
-            // of the process.
-            self.set_standing_cover_adopted(false);
-        }
+        // Unconditional: `release_all_covers` is documented idempotent, so
+        // gating it on a presence probe is a check-then-act guard on an
+        // operation that needs none — and at an explicit disarm a stale
+        // `Absent` is the one wrong answer that matters. This is also what
+        // removes the discrepancy between this site's bespoke `must_release`
+        // and `handle_unblock`'s: neither computes a rule any more.
+        self.routing.release_all_covers()?;
+        // The clear confirmed, so the host is open: an adopted cover no
+        // longer holds it. Dropping this claim is what stops the tray
+        // from rendering `Lockdown: On` over an open host for the life
+        // of the process.
+        self.set_standing_cover_adopted(false);
 
         // Only now move the intent. Either the covers are already gone and
         // the host is open, or `cover_step` said none needed releasing; a
@@ -1973,8 +1972,8 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
                 // the target `event` just moved us to, not by `event` itself.
                 let presence = self.routing.lockdown_cover_presence();
                 let intent = self.effective_lockdown_intent();
-                let step = cover_step(intent, presence, &target);
-                self.apply_cover_step(step, lockdown);
+                let disposition = teardown_cover_disposition(event, intent, presence, &target);
+                self.apply_cover_disposition(disposition, lockdown);
 
                 // Snapshot WFP + NDIS post-teardown. Emits warn when wintun-
                 // related references remain in either layer. Cheap and
@@ -2035,9 +2034,9 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
     /// turning lockdown on mid-session only persists the intent; there is no
     /// `turn_lockdown_on`). Treating it like `Hold` is the safe direction:
     /// it never opens the host.
-    fn apply_cover_step(&mut self, step: CoverStep, cover: Option<R::Cover>) {
-        match step {
-            CoverStep::Release => {
+    fn apply_cover_disposition(&mut self, disposition: CoverDisposition, cover: Option<R::Cover>) {
+        match disposition {
+            CoverDisposition::ReleaseNow => {
                 // The guard's own Drop can only WARN on a genuine OS failure
                 // — Drop cannot return a value, and silence there is
                 // indistinguishable from a clean release (see
@@ -2056,7 +2055,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
                 }
                 drop(cover);
             }
-            CoverStep::Hold | CoverStep::Engage => {
+            CoverDisposition::KeepEngaged => {
                 if let Some(c) = cover {
                     c.disarm();
                 }

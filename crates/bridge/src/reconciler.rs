@@ -17,7 +17,7 @@ use tun_engine::routing::{CoverPresence, Routing};
 use crate::dns::system::Dns;
 use crate::proxy::Proxy;
 use crate::proxy_manager::{ProxyManager, ProxyState};
-use crate::target::{self, Target};
+use crate::target::{self, SessionEvent, Target};
 #[cfg(test)]
 use hole_common::protocol::ProxyConfig;
 
@@ -167,6 +167,54 @@ pub fn tunnel_step(session_live: bool, target: &Target) -> TunnelStep {
                 TunnelStep::Hold
             }
         }
+    }
+}
+
+// teardown_cover_disposition ==========================================================================================
+
+/// What a torn-down session's standing cover should do. Two arms, not three:
+/// `disarm` releases the process's own claim (closing the Windows FWPM engine
+/// handle) while leaving the persistent filters in force, so "a successor
+/// adopts it" and "leave it in place across a blip" are the same operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CoverDisposition {
+    /// Release the filters now, via the confirmable `release_all_covers`.
+    ReleaseNow,
+    /// Leave the filters in force and give up this process's claim.
+    KeepEngaged,
+}
+
+/// Decide a torn-down session's cover fate from the CAUSE of the teardown.
+///
+/// Exhaustive over [`SessionEvent`] with no wildcard, so a sixth variant
+/// cannot inherit an answer by falling into someone else's group — the defect
+/// this function exists to remove, and the one the transient-cover match
+/// reproduced by grouping on shared consequence to the target.
+///
+/// `UserStopped` is an explicit user disarm: it releases regardless of intent,
+/// presence or target, because an escape must resolve an unknown toward
+/// releasing, never toward "nothing to do".
+///
+/// `GaveUp` is deliberately NOT grouped with it. Both move the target to
+/// `Off`, but giving up is the SYSTEM concluding the target is unreachable,
+/// not the user asking to open the host — so it defers to [`cover_step`],
+/// preserving today's behaviour rather than silently changing a policy nobody
+/// has been asked about.
+pub fn teardown_cover_disposition(
+    event: SessionEvent,
+    intent: Intent,
+    presence: CoverPresence,
+    target: &Target,
+) -> CoverDisposition {
+    match event {
+        SessionEvent::UserStopped => CoverDisposition::ReleaseNow,
+        // Both immediately precede process exit; whatever runs next adopts
+        // the filters (a new bridge after a cutover, or the next boot).
+        SessionEvent::CutoverRestart | SessionEvent::ProcessExiting => CoverDisposition::KeepEngaged,
+        SessionEvent::GaveUp | SessionEvent::Blipped => match cover_step(intent, presence, target) {
+            CoverStep::Release => CoverDisposition::ReleaseNow,
+            CoverStep::Hold | CoverStep::Engage => CoverDisposition::KeepEngaged,
+        },
     }
 }
 
