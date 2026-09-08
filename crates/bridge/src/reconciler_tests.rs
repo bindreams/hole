@@ -411,22 +411,61 @@ fn reconcile_once_honours_an_always_connect_startup_preference_with_a_candidate(
 /// An undocumented fifth caller of `release_all_covers()` would mean a new
 /// release path was added outside the four reasoned-about sites — the exact
 /// kind of divergent teardown route this stage collapses cover-release onto.
+/// Regex for a Rust function declaration, used to attribute a call site to the
+/// function that lexically encloses it. A backwards line walk is a heuristic —
+/// a call inside a nested `fn` attributes to the nested one (correct), a call
+/// inside a closure attributes to the enclosing `fn` (correct), and a call
+/// generated inside a macro body may mis-attribute (accepted: this guard fails
+/// loud, so a mis-attribution surfaces as a failure to investigate, never as a
+/// silent pass).
+fn fn_decl_re() -> regex::Regex {
+    regex::Regex::new(
+        r#"^\s*(?:pub(?:\s*\([^)]*\))?\s+)?(?:default\s+)?(?:const\s+)?(?:async\s+)?(?:unsafe\s+)?(?:extern\s+"[^"]*"\s+)?fn\s+([A-Za-z_][A-Za-z0-9_]*)"#,
+    )
+    .expect("fn-declaration regex must compile")
+}
+
+/// Every `pattern` match in `text`, as `(enclosing function name, trimmed
+/// line)`. Identity is the function name, not the line number, so an edit
+/// above a call site cannot change what the guard sees — the property
+/// `the_sanctioned_caller_guard_survives_line_shifts` pins.
+fn call_sites_by_function(text: &str, pattern: &regex::Regex) -> Vec<(String, String)> {
+    let decl = fn_decl_re();
+    let lines: Vec<&str> = text.lines().collect();
+    let mut out = Vec::new();
+    for (idx, line) in lines.iter().enumerate() {
+        if !pattern.is_match(line) {
+            continue;
+        }
+        let name = (0..=idx)
+            .rev()
+            .find_map(|i| decl.captures(lines[i]).map(|c| c[1].to_string()))
+            .unwrap_or_else(|| "<no enclosing fn>".to_string());
+        out.push((name, line.trim().to_string()));
+    }
+    out
+}
+
+/// An undocumented fifth caller of `release_all_covers()` would mean a new
+/// release path was added outside the four reasoned-about sites — the exact
+/// kind of divergent teardown route this stage collapses cover-release onto.
 #[skuld::test]
 fn cover_release_has_the_known_sanctioned_caller_set() {
     let pattern = regex::Regex::new(r"release_all_covers\s*\(").unwrap();
     let src_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
 
-    // (file suffix, line) for every caller reasoned about above. A real
-    // caller not on this list, or one of these lines moving/disappearing
-    // without the list being updated, both fail loud below.
-    let sanctioned: &[(&str, usize)] = &[
-        ("ipc.rs", 702),            // handle_unblock: deliberately bypasses `state.proxy.lock()`.
-        ("proxy_manager.rs", 764),  // turn_lockdown_off: the explicit off-toggle.
-        ("proxy_manager.rs", 2050), // apply_cover_step: session-teardown's own release, ordered after routes.
-        ("reconciler.rs", 265),     // Phase::Cover(CoverStep::Release): boot-time reconciliation.
+    // (file suffix, enclosing fn) for every caller reasoned about above.
+    // Anchored on the function, NOT the line: an unrelated edit above a call
+    // must not fail this guard, because the only tempting repair for that is
+    // to bump the number, which re-blesses whatever moved into the old slot.
+    let sanctioned: &[(&str, &str)] = &[
+        ("ipc.rs", "handle_unblock"),              // deliberately bypasses `state.proxy.lock()`.
+        ("proxy_manager.rs", "turn_lockdown_off"), // the explicit off-toggle.
+        ("proxy_manager.rs", "apply_cover_step"),  // session teardown, ordered after routes.
+        ("reconciler.rs", "reconcile_once"),       // boot-time reconciliation.
     ];
 
-    let mut matches: Vec<(String, usize, String)> = Vec::new();
+    let mut matches: Vec<(String, String, String)> = Vec::new();
     for entry in walkdir::WalkDir::new(&src_root) {
         let entry = entry.expect("failed to walk crates/bridge/src");
         if !entry.file_type().is_file() {
@@ -444,44 +483,79 @@ fn cover_release_has_the_known_sanctioned_caller_set() {
             continue;
         }
         let text = std::fs::read_to_string(path).expect("failed to read a walked source file");
-        for (line_no, line) in text.lines().enumerate() {
-            if pattern.is_match(line) {
-                matches.push((path.display().to_string(), line_no + 1, line.trim().to_string()));
-            }
+        for (func, line) in call_sites_by_function(&text, &pattern) {
+            matches.push((path.display().to_string(), func, line));
         }
     }
 
     let diagnostic = || {
         let mut msg = format!(
             "cover_release_has_the_known_sanctioned_caller_set: pattern `{}` must match \
-             only at the {} known sanctioned call sites in non-test bridge sources (skipping \
+             only inside the {} known sanctioned functions in non-test bridge sources (skipping \
              *_tests.rs and src/test_support/).\nMatches found ({}):\n",
             pattern.as_str(),
             sanctioned.len(),
             matches.len()
         );
-        for (file, line_no, line) in &matches {
-            msg.push_str(&format!("  {file}:{line_no}: {line}\n"));
+        for (file, func, line) in &matches {
+            msg.push_str(&format!("  {file} fn {func}: {line}\n"));
         }
         msg.push_str(
             "A failure here means one of three things: a new, undocumented release path was added \
              (the real defect — add it to `sanctioned` above only after writing down, next to the \
-             call, why it cannot route through one of the existing four), a sanctioned call moved \
-             lines (update `sanctioned` to match), or a comment/doc string in a walked file now \
-             quotes the pattern, which is a false positive and should be reworded.",
+             call, why it cannot route through one of the existing four), a sanctioned call was \
+             renamed or removed (update `sanctioned` to match), or a comment/doc string in a walked \
+             file now quotes the pattern, which is a false positive and should be reworded.",
         );
         msg
     };
 
     assert_eq!(matches.len(), sanctioned.len(), "{}", diagnostic());
-    for (file, line_no, _) in &matches {
+    for (file, func, _) in &matches {
         let is_sanctioned = sanctioned
             .iter()
-            .any(|(suffix, line)| file.ends_with(suffix) && line == line_no);
+            .any(|(suffix, name)| file.ends_with(suffix) && name == func);
         assert!(
             is_sanctioned,
-            "unsanctioned call site: {file}:{line_no}\n{}",
+            "unsanctioned call site: {file} fn {func}\n{}",
             diagnostic()
         );
     }
+}
+
+// Line-shift resilience ===============================================================================================
+
+/// `cover_release_has_the_known_sanctioned_caller_set` pins its whitelist by
+/// enclosing function name rather than by line number. Line numbers made the
+/// guard fail on every unrelated edit above a sanctioned call, and the
+/// tempting repair — bumping the numbers — silently re-blesses whatever moved
+/// into the old position. This asserts the property that repair-by-renumber
+/// destroyed: shifting a call site's line must not change its identity.
+#[skuld::test]
+fn the_sanctioned_caller_guard_survives_line_shifts() {
+    let src = "fn alpha() {\n    something();\n}\n\nfn beta() {\n    routing.release_all_covers()?;\n}\n";
+    let shifted = "fn alpha() {\n    something();\n}\n\n// an unrelated comment\n\nfn beta() {\n    routing.release_all_covers()?;\n}\n";
+
+    let pattern = regex::Regex::new(r"release_all_covers\s*\(").unwrap();
+    let before = call_sites_by_function(src, &pattern);
+    let after = call_sites_by_function(shifted, &pattern);
+
+    assert_eq!(before.len(), 1, "expected exactly one call site, got {before:?}");
+    assert_eq!(
+        before, after,
+        "a line shift changed the guard's view of the call site: {before:?} vs {after:?}"
+    );
+    assert_eq!(before[0].0, "beta", "call site attributed to the wrong function");
+}
+
+/// A call inside a closure belongs to the function that lexically encloses the
+/// closure — there is no `fn` declaration to find in between, so the backwards
+/// walk must not stop early or attribute it to the previous function.
+#[skuld::test]
+fn a_call_inside_a_closure_belongs_to_its_enclosing_function() {
+    let src = "fn alpha() {\n    noop();\n}\n\nasync fn gamma() {\n    let f = || {\n        routing.release_all_covers()?;\n    };\n}\n";
+    let pattern = regex::Regex::new(r"release_all_covers\s*\(").unwrap();
+    let sites = call_sites_by_function(src, &pattern);
+    assert_eq!(sites.len(), 1, "expected exactly one call site, got {sites:?}");
+    assert_eq!(sites[0].0, "gamma", "closure body attributed to the wrong function");
 }
