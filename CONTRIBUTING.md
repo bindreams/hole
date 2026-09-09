@@ -1096,6 +1096,7 @@ milliseconds.
   session would auto-delete the filters when the engaging process exits, reopening
   the leak mid-gap. Recovery deletes the fixed compiled-in GUIDs (idempotent), so
   no state file is needed. The FWPM FFIs are clippy-disallowed outside this module.
+
 - **macOS** ([`routing/failclosed/macos.rs`](crates/tun-engine/src/routing/failclosed/macos.rs)):
   `pfctl -E` (refcounted) + a self-contained ruleset loaded over stdin (`pfctl -f -`, absolute `/sbin/pfctl` — this runs as root, so a PATH-resolved bare `pfctl` is a hardening gap). Disengage restores `/etc/pf.conf` and drops the refcount (`pfctl -X <token>`). The token is persisted to `bridge-failclosed.json` *before* the
   blocking ruleset loads, so recovery can `-X` it cleanly. Caveat: restore reloads
@@ -1125,6 +1126,28 @@ milliseconds.
   privileged test files' own bare `pfctl` calls (test-only, not the
   production helper this fix hardened) are a separate, disclosed inconsistency
   (bindreams/hole#1005), and unchanged by this fix.
+
+  **Load before enable on a COLD engage** (found by the same
+  `macos_failclosed_cover_transition_never_admits_blocked_flow` test — its
+  prober pool starts before the loop's very first, cold, `engage()` call, so a
+  gap there fails the same assertion as a warm-transition gap): `pfctl -E`
+  (enable) and `pfctl -f -` (load) are always two separate `pfctl`
+  invocations, so enabling before loading is the same *shape* of bug as `-Fa`
+  — two separate pf kernel transactions with an open ruleset briefly live —
+  just triggered by cold-start ordering rather than `-Fa`. If pf starts
+  DISABLED, enabling first turns filtering ON with whatever ruleset already
+  happened to be loaded (the host's own, stale, or none) for as long as it
+  takes the next `pfctl` subprocess to load ours. `engage` and
+  `engage_lockdown` both close this by loading the ruleset *before* enabling
+  specifically when pf starts disabled — loading a ruleset is a documented
+  no-op while pf is off (the enable bit and the loaded ruleset are
+  independent pf state) — so the instant either function turns pf on, it is
+  already enforcing the ruleset it just loaded. When pf is already enabled at
+  entry the original enable-then-load order is unchanged, since that path was
+  already correct. This was found and fixed in the same change as the `-Fa`
+  removal above, in the standing lockdown cover as well as the transient
+  one — the lockdown cover's `-Fa`-free load was not itself the whole story
+  for a cold host.
 
 Each platform splits a pure, unit-tested rule/spec builder (transient:
 `build_cover_spec` / `build_pf_ruleset`; lockdown: `build_lockdown_spec` /

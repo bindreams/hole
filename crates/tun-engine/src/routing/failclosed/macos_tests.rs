@@ -966,6 +966,21 @@ fn an_empty_but_captured_baseline_still_restores_the_snapshot() {
 /// DIOCADDRULE/DIOCXCOMMIT ticket discipline (see `crates/tun-engine/src/
 /// routing/failclosed/macos.rs`'s module doc), so no such window should exist.
 ///
+/// The prober pool below starts before the loop's very first `engage()`, so
+/// this test also exercises a COLD engage (pf disabled at entry — the
+/// `global_net_state` test group runs each privileged test in its own
+/// process, but pf's enable bit is host-global kernel state that outlives any
+/// one process, and an earlier test's normal `disengage` can leave it off).
+/// `pfctl -E` (enable) and `pfctl -f -` (load) are always two separate
+/// `pfctl` invocations, so enabling before loading opens the same shape of
+/// pass-all-window bug as `-Fa` did, just triggered by cold-start ordering
+/// instead: pf would start filtering with whatever ruleset already happened
+/// to be loaded, before the intended one committed. `engage`/`engage_lockdown`
+/// close this by loading before enabling specifically when pf starts
+/// disabled (loading is a documented no-op while pf is off), so this test's
+/// iteration 0 covers that path and every later iteration covers the warm
+/// transition path.
+///
 /// Lives here (not `lockdown_privileged_tests.rs`) because it must retire an
 /// intermediate cover's pf enable refcount WITHOUT running its normal
 /// `Drop`/`disengage` — that disengage reloads `/etc/pf.conf`, which is
@@ -1093,9 +1108,10 @@ fn macos_failclosed_cover_transition_never_admits_blocked_flow() {
 
     assert!(
         !leaked.load(Ordering::SeqCst),
-        "a cover transition (a second real engage() replacing a still-live cover) admitted a \
-         connection to {NON_PERMITTED}, which every ruleset in the {ITERATIONS}-iteration loop \
-         blocks — pfctl's `-f -` load is not behaving as one atomic transaction"
+        "a cover engage (cold at iteration 0, a transition replacing a still-live cover at every \
+         later iteration) admitted a connection to {NON_PERMITTED}, which every ruleset in the \
+         {ITERATIONS}-iteration loop blocks — pfctl's enable/load are not behaving as one atomic \
+         transaction"
     );
 
     // The last cover's normal Drop restores /etc/pf.conf.
