@@ -287,3 +287,18 @@ allow-invalid = true
 path = "windows::Win32::NetworkManagement::WindowsFilteringPlatform::FwpmFilterGetByKey0"
 reason = "Lockdown cover presence probe must go through `routing::failclosed::lockdown_cover_presence`. Only `failclosed/windows.rs` may call FWPM. See #881."
 allow-invalid = true
+
+[[disallowed-methods]]
+path = "windows::Win32::NetworkManagement::WindowsFilteringPlatform::FwpmFilterCreateEnumHandle0"
+reason = "Boot-time-leftover sweep enumeration must go through `routing::failclosed::sweep_boottime_by_provider`. Only `failclosed/windows.rs` may call FWPM. See #998."
+allow-invalid = true
+
+[[disallowed-methods]]
+path = "windows::Win32::NetworkManagement::WindowsFilteringPlatform::FwpmFilterEnum0"
+reason = "Boot-time-leftover sweep enumeration must go through `routing::failclosed::sweep_boottime_by_provider`. Only `failclosed/windows.rs` may call FWPM. See #998."
+allow-invalid = true
+
+[[disallowed-methods]]
+path = "windows::Win32::NetworkManagement::WindowsFilteringPlatform::FwpmFilterDestroyEnumHandle0"
+reason = "Boot-time-leftover sweep enumeration must go through `routing::failclosed::sweep_boottime_by_provider`. Only `failclosed/windows.rs` may call FWPM. See #998."
+allow-invalid = true

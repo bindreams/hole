@@ -19,7 +19,8 @@ pub struct Guid(pub u128);
 
 /// Fresh GUIDs, minted for this confinement only — disjoint from
 /// `crate::routing::failclosed::windows::{PROVIDER_GUID, SUBLAYER_GUID,
-/// FILTER_GUIDS, LOCKDOWN_FILTER_GUIDS}`. A copy-paste collision here would
+/// FILTER_GUIDS, LOCKDOWN_FILTER_GUIDS, LOCKDOWN_BOOTTIME_BLOCK_ALL_GUIDS}`.
+/// A copy-paste collision here would
 /// let a cover's fixed-GUID sweep delete this confinement's filters (or vice
 /// versa); `spec_guids_are_disjoint_from_the_cover_guids` (Windows-only, since
 /// the cover GUIDs it compares against live in a Windows-gated module) pins

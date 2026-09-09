@@ -110,6 +110,75 @@ fn spec_uses_the_fixed_hole_guids() {
     assert_eq!(s.sublayer, SUBLAYER_GUID);
 }
 
+#[skuld::test]
+fn transient_spec_is_never_boottime() {
+    // The transient cover (bounded-window RAII guard around a connect) has no
+    // boot-window to cover — it only exists once the bridge is already
+    // running — so none of its filters may be `Boottime` (#998's scope
+    // decision: only the standing lockdown's block-all floor gets a twin).
+    let s = build_cover_spec(v4(), Some(resolver_v4()));
+    for f in &s.filters {
+        assert_eq!(
+            f.lifetime,
+            FilterLifetime::Persistent,
+            "transient cover filter {:?} must be Persistent, never Boottime",
+            f.guid
+        );
+    }
+}
+
+// Boot-time lifetime flag =============================================================================================
+
+#[skuld::test]
+fn filter_lifetime_flag_maps_to_the_real_wfp_constants() {
+    assert_eq!(
+        filter_lifetime_flag(FilterLifetime::Persistent),
+        FWPM_FILTER_FLAG_PERSISTENT.0
+    );
+    assert_eq!(
+        filter_lifetime_flag(FilterLifetime::Boottime),
+        FWPM_FILTER_FLAG_BOOTTIME.0
+    );
+}
+
+#[skuld::test]
+fn persistent_and_boottime_flags_are_mutually_exclusive_bits() {
+    // WFP's own `FWPM_FILTER0` docs: "This flag [PERSISTENT] cannot be set
+    // together with FWPM_FILTER_FLAG_BOOTTIME." A plain `assert_ne!` between
+    // the two flag values would pass even for two values that happened to
+    // share bits with a third, wrongly-OR'd flag combination; encode the
+    // actual documented contract instead — no bit position is shared.
+    let persistent = filter_lifetime_flag(FilterLifetime::Persistent);
+    let boottime = filter_lifetime_flag(FilterLifetime::Boottime);
+    assert_ne!(persistent, 0, "PERSISTENT must be a real, nonzero flag bit");
+    assert_ne!(boottime, 0, "BOOTTIME must be a real, nonzero flag bit");
+    assert_eq!(
+        persistent & boottime,
+        0,
+        "PERSISTENT and BOOTTIME must not share a bit — WFP treats them as mutually exclusive"
+    );
+}
+
+#[skuld::test]
+fn add_filter_maps_lifetime_through_filter_lifetime_flag() {
+    // Wiring guard: `add_filter` must derive its WFP flags from
+    // `filter_lifetime_flag(f.lifetime)`, not a hardcoded expression (that
+    // was the literal regression this guards). Whole-file substring check,
+    // not a function-body slice (a slice bounded by the next `fn` can swallow
+    // unrelated code, or miss a rename — see the sibling
+    // `no_stray_filter_deletes_outside_delete_guids_and_sweep_boottime_by_provider`
+    // guard for why this file prefers whole-file scans): `add_filter` is the
+    // only function taking `f: &FilterSpec`, so `f.lifetime` cannot resolve
+    // to anything else, and grep confirms `filter_lifetime_flag(f.lifetime)`
+    // appears exactly once in the file, at that one call site.
+    let src = include_str!("windows.rs");
+    let occurrences = src.matches("filter_lifetime_flag(f.lifetime)").count();
+    assert_eq!(
+        occurrences, 1,
+        "expected exactly one call to filter_lifetime_flag(f.lifetime), inside add_filter — found {occurrences}"
+    );
+}
+
 // resolver permit =====================================================================================================
 
 #[skuld::test]
@@ -346,6 +415,64 @@ fn lockdown_spec_v6_server_lands_on_v6_layer() {
     assert_eq!(server[0].layer, Layer::ConnectV6);
 }
 
+// Boot-time coverage (#998) ===========================================================================================
+
+#[skuld::test]
+fn lockdown_spec_blockall_has_boottime_twins() {
+    // The lockdown block-all floor must carry a `Boottime` twin on each
+    // layer, alongside its `Persistent` filter — the kernel enforces
+    // BOOTTIME filters from boot until BFE starts, when BFE re-adds the
+    // PERSISTENT ones; without both, the boot→BFE window egresses in the
+    // clear despite the kill switch being armed.
+    let s = build_lockdown_spec(v4(), luid(), &[plugin_path()]);
+    for layer in [Layer::ConnectV4, Layer::ConnectV6] {
+        let blocks: Vec<_> = s
+            .filters
+            .iter()
+            .filter(|f| f.action == Action::Block && f.layer == layer)
+            .collect();
+        assert!(
+            blocks.iter().any(|f| f.lifetime == FilterLifetime::Persistent),
+            "block-all on {layer:?} must keep its Persistent filter"
+        );
+        assert!(
+            blocks.iter().any(|f| f.lifetime == FilterLifetime::Boottime),
+            "block-all on {layer:?} must gain a Boottime twin (#998)"
+        );
+    }
+    assert!(
+        s.filters
+            .iter()
+            .any(|f| f.guid == LOCKDOWN_BOOTTIME_BLOCK_ALL_GUIDS[0] && f.layer == Layer::ConnectV4),
+        "boot-time block-all V4 must use its own fixed GUID"
+    );
+    assert!(
+        s.filters
+            .iter()
+            .any(|f| f.guid == LOCKDOWN_BOOTTIME_BLOCK_ALL_GUIDS[1] && f.layer == Layer::ConnectV6),
+        "boot-time block-all V6 must use its own fixed GUID"
+    );
+}
+
+#[skuld::test]
+fn lockdown_spec_permits_are_never_boottime() {
+    // Scope decision (module doc's "Boot-time coverage" section): ONLY the
+    // block-all floor gets a boot-time twin. No permit — loopback, TUN-LUID,
+    // server-IP, App-ID, RECV_ACCEPT — is ever boot-time, matching Mullvad's
+    // own shipped precedent (`FILTER_BOOTTIME_BLOCK_ALL` with no boot-time
+    // permit counterpart).
+    let s = build_lockdown_spec(v4(), luid(), &[plugin_path()]);
+    for f in s.filters.iter().filter(|f| f.action == Action::Permit) {
+        assert_eq!(
+            f.lifetime,
+            FilterLifetime::Persistent,
+            "lockdown permit {:?} on {:?} must be Persistent, never Boottime",
+            f.guid,
+            f.layer
+        );
+    }
+}
+
 // lockdown sweep / Adopt GUID sets ====================================================================================
 
 #[skuld::test]
@@ -355,6 +482,9 @@ fn all_swept_guids_cover_both_covers() {
     let swept = swept_lockdown_guids();
     for g in LOCKDOWN_FILTER_GUIDS {
         assert!(swept.contains(&g), "lockdown GUID {g:?} must be swept");
+    }
+    for g in LOCKDOWN_BOOTTIME_BLOCK_ALL_GUIDS {
+        assert!(swept.contains(&g), "boot-time block-all GUID {g:?} must be swept");
     }
     for i in 0..MAX_APPID_BINARIES {
         assert!(swept.contains(&appid_filter_guid(i, false)));
@@ -779,8 +909,8 @@ fn presence_probes_every_swept_lockdown_guid() {
     let probed = swept_lockdown_guids();
     assert_eq!(
         probed.len(),
-        LOCKDOWN_FILTER_GUIDS.len() + MAX_APPID_BINARIES * 2,
-        "the probe must cover the fixed lockdown GUIDs plus every App-ID slot"
+        LOCKDOWN_FILTER_GUIDS.len() + LOCKDOWN_BOOTTIME_BLOCK_ALL_GUIDS.len() + MAX_APPID_BINARIES * 2,
+        "the probe must cover the fixed lockdown GUIDs, the boot-time block-all pair, and every App-ID slot"
     );
     assert!(
         probed.contains(&LOCKDOWN_FILTER_GUIDS[6]),
@@ -789,6 +919,14 @@ fn presence_probes_every_swept_lockdown_guid() {
     assert!(
         probed.contains(&LOCKDOWN_FILTER_GUIDS[7]),
         "block-all V6 must be probed"
+    );
+    assert!(
+        probed.contains(&LOCKDOWN_BOOTTIME_BLOCK_ALL_GUIDS[0]),
+        "boot-time block-all V4 must be probed"
+    );
+    assert!(
+        probed.contains(&LOCKDOWN_BOOTTIME_BLOCK_ALL_GUIDS[1]),
+        "boot-time block-all V6 must be probed"
     );
     for i in 0..MAX_APPID_BINARIES {
         assert!(probed.contains(&appid_filter_guid(i, false)), "App-ID slot {i} V4");
@@ -921,36 +1059,48 @@ fn first_delete_failure_treats_access_denied_as_a_genuine_failure() {
 }
 
 #[skuld::test]
-fn reclaim_stale_tun_permit_does_not_discard_delete_codes() {
+fn no_stray_filter_deletes_outside_delete_guids_and_sweep_boottime_by_provider() {
     // Structural guard, not a proof (mirrors
     // `route_recovery::recover_routes_has_exactly_one_bridge_caller` in the
     // bridge crate): Finding 4 (#898 rework) was
     // `let _ = FwpmFilterDeleteByKey0(...)`, silently discarding the exact
-    // return code that means a filter is STILL blocking egress. Assert the
-    // source routes the TUN-permit deletes through the same
-    // `first_delete_failure` fold `Cover::drop`'s Lockdown arm and
-    // `delete_all` use, rather than re-running the real FWPM call under an
-    // access-denied DACL to observe it (this file has no such fixture).
+    // return code that means a filter is STILL blocking egress. Rather than
+    // slicing one function's body (fragile — a slice bounded by the next
+    // `pub fn` can swallow unrelated code, or miss a rename), this inspects
+    // the WHOLE file: `delete_guids` and `sweep_boottime_by_provider` are the
+    // only two functions allowed to call `FwpmFilterDeleteByKey0` directly
+    // (see `delete_guids`'s own doc), so every OTHER call site (`Cover::drop`'s
+    // Lockdown arm, `reclaim_stale_tun_permit`, `engage_lockdown`'s
+    // pre_delete, `disengage_lockdown`, `delete_all`, `release_all`) must
+    // route through one of those two rather than reintroducing a bare,
+    // code-discarding call.
+    //
+    // Comment lines are stripped before scanning: both checks below key on
+    // literal source text, and `delete_guids`'s own doc comment quotes the
+    // exact banned form (`let _ = FwpmFilterDeleteByKey0(...)`) to explain
+    // why it's banned — scanning the raw file would make that explanation
+    // trip the ban on itself.
     let src = include_str!("windows.rs");
-    let start = src
-        .find("pub fn reclaim_stale_tun_permit(")
-        .expect("reclaim_stale_tun_permit must exist in windows.rs");
-    let after = &src[start..];
-    let next_pub_fn = after[1..].find("\npub fn ").map(|i| i + 1);
-    let next_pub_crate_fn = after[1..].find("\npub(crate) fn ").map(|i| i + 1);
-    let end = [next_pub_fn, next_pub_crate_fn]
-        .into_iter()
-        .flatten()
-        .min()
-        .unwrap_or(after.len());
-    let body = &after[..end];
+    let code_only: String = src
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n");
 
     assert!(
-        !body.contains("let _ = FwpmFilterDeleteByKey0"),
-        "reclaim_stale_tun_permit must not discard a TUN-permit delete's return code:\n{body}"
+        !code_only.contains("let _ = FwpmFilterDeleteByKey0"),
+        "no call site may discard a filter delete's return code with `let _ = FwpmFilterDeleteByKey0(...)`"
     );
-    assert!(
-        body.contains("first_delete_failure"),
-        "reclaim_stale_tun_permit must fold its delete codes through first_delete_failure:\n{body}"
+
+    // The only two sanctioned call sites — one inside `delete_guids`, one
+    // inside `sweep_boottime_by_provider`'s enumeration loop. Keyed on the
+    // symbol itself, not on a receiver expression like `(engine`, so renaming
+    // the local (e.g. `self.engine`) or reflowing the call across lines can't
+    // evade the census.
+    let call_sites = code_only.matches("FwpmFilterDeleteByKey0(").count();
+    assert_eq!(
+        call_sites, 2,
+        "FwpmFilterDeleteByKey0 must be called from exactly two places (delete_guids, \
+         sweep_boottime_by_provider) — found {call_sites}; every other delete must route through delete_guids"
     );
 }

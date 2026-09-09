@@ -145,7 +145,8 @@ fn spec_permits_loopback_dns_per_family() {
 #[skuld::test]
 fn spec_guids_are_disjoint_from_the_cover_guids() {
     use crate::routing::failclosed::platform::{
-        FILTER_GUIDS, LOCKDOWN_FILTER_GUIDS, PROVIDER_GUID as COVER_PROVIDER_GUID, SUBLAYER_GUID as COVER_SUBLAYER_GUID,
+        FILTER_GUIDS, LOCKDOWN_BOOTTIME_BLOCK_ALL_GUIDS, LOCKDOWN_FILTER_GUIDS, PROVIDER_GUID as COVER_PROVIDER_GUID,
+        SUBLAYER_GUID as COVER_SUBLAYER_GUID,
     };
 
     let provider = windows::core::GUID::from_u128(super::PROVIDER_GUID.0);
@@ -155,6 +156,7 @@ fn spec_guids_are_disjoint_from_the_cover_guids() {
     for g in FILTER_GUIDS
         .iter()
         .chain(LOCKDOWN_FILTER_GUIDS.iter())
+        .chain(LOCKDOWN_BOOTTIME_BLOCK_ALL_GUIDS.iter())
         .chain(cover_provider_and_sublayer.iter())
     {
         assert_ne!(

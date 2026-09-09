@@ -32,9 +32,60 @@
 //! wireguard ships the same all-but-one-soft layout); a two-sublayer
 //! hard-permit/soft-block layout is a possible future hardening.
 //!
-//! Persistent (boot-time) filters — NOT a dynamic session — so a coordinator crash
+//! PERSISTENT filters — NOT a dynamic session — so a coordinator crash
 //! mid-cutover leaves traffic blocked (fail-closed), not leaked; `recover_cover`
 //! sweeps them by their fixed GUIDs on the next bridge start.
+//!
+//! ## Boot-time coverage (#998)
+//!
+//! `FWPM_FILTER_FLAG_PERSISTENT` filters are re-added by the Base Filtering
+//! Engine (BFE) once BFE starts; they are NOT enforced before that — the
+//! kernel (tcpip.sys) enforces only `FWPM_FILTER_FLAG_BOOTTIME` filters from
+//! kernel start until BFE takes over. The two flags are mutually exclusive on
+//! one filter (WFP's own `FWPM_FILTER0` docs), so covering both windows needs
+//! two filter objects. The standing LOCKDOWN cover (kill switch) is meant to
+//! survive an arbitrary reboot — CONTRIBUTING.md's Fail-closed cover section —
+//! so `build_lockdown_spec` gives ONLY its block-all pair a `Boottime` twin
+//! (`LOCKDOWN_BOOTTIME_BLOCK_ALL_GUIDS`); every permit, including loopback,
+//! stays `Persistent`-only, so the boot→BFE window is a full block with no
+//! exemptions (matches Mullvad's shipped `talpid-core` boot-time set, which
+//! has none either). That window's length is NOT bounded by any documented
+//! contract (Microsoft: BFE's boot-time-to-persistent handoff "could be
+//! several seconds, or even longer on a slow machine") — loopback is left
+//! unpermitted on its own merits, not because the window is assumed short:
+//! (a) it matches shipped precedent, (b) a boot-time loopback permit has no
+//! mechanism to hand itself off to the narrower persistent rule once BFE
+//! starts, and (c) the leak this issue exists to close is network egress, not
+//! loopback. The transient cutover cover is not meant to survive an arbitrary
+//! reboot, so it stays `Persistent`-only throughout.
+//!
+//! Deletion of a boot-time filter is architecturally the same
+//! `FwpmFilterDeleteByKey0` call used for persistent ones (no lifetime-specific
+//! delete API exists), but the DOWNGRADE story is worse: a stranded PERSISTENT
+//! leftover (e.g. from a version-skewed sweep — the `FILTER_GUIDS`
+//! CROSS-VERSION CONTRACT below) is still reachable by a LATER GUID-aware
+//! build, because BFE keeps re-adding it every start regardless of which
+//! build is currently running. A stranded BOOT-TIME leftover has no such
+//! self-healing path — it is reprovisioned from an on-disk boot-time policy
+//! record at every boot, independent of the live FWPM session — so an OLDER
+//! binary that never learned its GUID can never find it by key, and it then
+//! enforces (including blocking loopback) on every future boot, forever.
+//! Because a fixed-GUID sweep cannot bound that risk, boot-time deletion here
+//! does NOT rely on the fixed array alone: [`sweep_boottime_by_provider`]
+//! additionally enumerates every filter under [`PROVIDER_GUID`] and deletes
+//! any that still carries `FWPM_FILTER_FLAG_BOOTTIME`, regardless of its
+//! GUID — see its doc. It runs alongside every fixed-GUID lockdown sweep
+//! (`Cover::drop`'s Lockdown arm, `disengage_lockdown`, `release_all`).
+//!
+//! **Unverified by this change:** whether Microsoft's own documentation
+//! conflict — one page states a boot-time filter is "removed" once BFE
+//! finishes initialization, another states it is merely "disabled" — means a
+//! post-boot `FwpmFilterGetByKey0`/enumeration query can no longer see (and
+//! therefore cannot confirm-delete) a boot-time filter at all, regardless of
+//! whether the underlying boot-time policy record it re-provisions from at
+//! the NEXT boot was actually cleared. Only a real reboot test settles this;
+//! none is available (no elevated Windows CI lane can reboot — see the PR
+//! description for what the elevated `tun` lane COULD verify instead).
 
 use std::net::IpAddr;
 use std::path::Path;
@@ -109,6 +160,17 @@ pub const LOCKDOWN_FILTER_GUIDS: [GUID; 12] = [
     GUID::from_u128(0xd766a20f_050a_4c40_8de3_33bf259b7e34), // loopback-net CONNECT V6 (::1/128)
 ];
 
+// Boot-time twin of the lockdown block-all pair — see the module doc's
+// "Boot-time coverage" section. Disjoint from every other GUID in this file.
+// CROSS-VERSION CONTRACT, same as `FILTER_GUIDS`/`LOCKDOWN_FILTER_GUIDS`
+// above: never remove or reorder an entry. Unlike those, a build's fixed-GUID
+// sweep missing an entry here is NOT the only removal path — see
+// `sweep_boottime_by_provider`.
+pub const LOCKDOWN_BOOTTIME_BLOCK_ALL_GUIDS: [GUID; 2] = [
+    GUID::from_u128(0x890e33c4_aa6d_4969_8d82_0716bb287cfe), // block-all V4 (boot-time)
+    GUID::from_u128(0xc049154c_ae96_4a16_a3d3_e8f1678ed089), // block-all V6 (boot-time)
+];
+
 /// Indices into [`LOCKDOWN_FILTER_GUIDS`] for the TUN-interface (LUID) permit
 /// pair — one of the two volatile permits an engage refreshes (see
 /// [`adopt_delete_guids`]).
@@ -139,11 +201,14 @@ fn swept_transient_guids() -> Vec<GUID> {
     FILTER_GUIDS.to_vec()
 }
 
-/// Every lockdown filter GUID a full Sweep must delete: the ten fixed
-/// lockdown GUIDs + the per-binary App-ID GUIDs. (Transient GUIDs are swept
-/// separately by `delete_all`.)
+/// Every lockdown filter GUID a full Sweep must delete: the twelve fixed
+/// lockdown GUIDs + the boot-time block-all pair + the per-binary App-ID
+/// GUIDs. (Transient GUIDs are swept separately by `delete_all`.) The
+/// boot-time pair is ALSO covered by [`sweep_boottime_by_provider`], which
+/// does not depend on this array — see the module doc.
 fn swept_lockdown_guids() -> Vec<GUID> {
     let mut guids: Vec<GUID> = LOCKDOWN_FILTER_GUIDS.to_vec();
+    guids.extend_from_slice(&LOCKDOWN_BOOTTIME_BLOCK_ALL_GUIDS);
     for i in 0..MAX_APPID_BINARIES {
         guids.push(appid_filter_guid(i, false));
         guids.push(appid_filter_guid(i, true));
@@ -180,10 +245,67 @@ pub enum Layer {
     RecvAcceptV6,
 }
 
+impl Layer {
+    /// Every layer this file's [`add_filter`] can ever install into — the
+    /// same four variants, in no particular order. [`sweep_boottime_by_provider`]
+    /// enumerates all of these so a stranded boot-time filter can never hide
+    /// on a layer that sweep doesn't know to look at. `add_filter` and the
+    /// sweep both resolve a `Layer` through [`layer_key`], whose match has no
+    /// wildcard arm — a new `Layer` variant is a compile error there until
+    /// `layer_key` is updated, which is the reminder to extend this array too.
+    const ALL: [Layer; 4] = [
+        Layer::ConnectV4,
+        Layer::ConnectV6,
+        Layer::RecvAcceptV4,
+        Layer::RecvAcceptV6,
+    ];
+}
+
+/// Map a [`Layer`] to its WFP layer GUID — the one translation site, shared
+/// by [`add_filter`] (installing a real filter) and
+/// [`sweep_boottime_by_provider`] (enumerating every layer a filter could be
+/// on). Centralizing it here, rather than duplicating the match at each call
+/// site, is what keeps the sweep's layer coverage from silently drifting out
+/// of sync with the layers filters actually get installed on.
+fn layer_key(layer: Layer) -> GUID {
+    match layer {
+        Layer::ConnectV4 => FWPM_LAYER_ALE_AUTH_CONNECT_V4,
+        Layer::ConnectV6 => FWPM_LAYER_ALE_AUTH_CONNECT_V6,
+        Layer::RecvAcceptV4 => FWPM_LAYER_ALE_AUTH_RECV_ACCEPT_V4,
+        Layer::RecvAcceptV6 => FWPM_LAYER_ALE_AUTH_RECV_ACCEPT_V6,
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
     Permit,
     Block,
+}
+
+/// Which WFP lifetime flag a filter carries — see the module doc's "Boot-time
+/// coverage" section. Mutually exclusive on one filter (WFP's `FWPM_FILTER0`
+/// docs), so a rule needing both windows covered needs two [`FilterSpec`]s.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FilterLifetime {
+    /// `FWPM_FILTER_FLAG_PERSISTENT` — re-added by BFE once it starts; not
+    /// enforced before that.
+    Persistent,
+    /// `FWPM_FILTER_FLAG_BOOTTIME` — enforced by the kernel from boot until
+    /// BFE starts; not re-added by BFE afterwards.
+    Boottime,
+}
+
+/// Map a [`FilterLifetime`] to its WFP flag bit. Pure and total, so
+/// `add_filter`'s actual FFI mapping is unit-testable without FWPM
+/// (`windows_tests` asserts both real constants by exact value AND their
+/// mutual exclusivity via bitwise-AND, encoding WFP's documented "cannot be
+/// set together" contract, not just an inequality that a wrongly-combined
+/// value would still pass).
+fn filter_lifetime_flag(lifetime: FilterLifetime) -> u32 {
+    match lifetime {
+        FilterLifetime::Persistent => FWPM_FILTER_FLAG_PERSISTENT.0,
+        FilterLifetime::Boottime => FWPM_FILTER_FLAG_BOOTTIME.0,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -230,6 +352,8 @@ pub struct FilterSpec {
     /// within our single sublayer is pure weight, so the higher-weight permit
     /// wins over block-all.
     pub weight: u8,
+    /// Which WFP lifetime flag this filter carries — see [`FilterLifetime`].
+    pub lifetime: FilterLifetime,
 }
 
 #[derive(Debug, Clone)]
@@ -273,6 +397,7 @@ pub fn build_cover_spec(server_ip: IpAddr, resolver_ip: Option<IpAddr>) -> Cover
             action: Action::Permit,
             condition: Condition::Loopback,
             weight: PERMIT_WEIGHT,
+            lifetime: FilterLifetime::Persistent,
         },
         FilterSpec {
             guid: FILTER_GUIDS[1],
@@ -280,6 +405,7 @@ pub fn build_cover_spec(server_ip: IpAddr, resolver_ip: Option<IpAddr>) -> Cover
             action: Action::Permit,
             condition: Condition::Loopback,
             weight: PERMIT_WEIGHT,
+            lifetime: FilterLifetime::Persistent,
         },
         // Belt-and-suspenders for the flag permits above: the IS_LOOPBACK flag is
         // not reliably set at ALE_AUTH_CONNECT in CI's elevated lane, so match the
@@ -291,6 +417,7 @@ pub fn build_cover_spec(server_ip: IpAddr, resolver_ip: Option<IpAddr>) -> Cover
             action: Action::Permit,
             condition: Condition::LoopbackNet(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
             weight: PERMIT_WEIGHT,
+            lifetime: FilterLifetime::Persistent,
         },
         FilterSpec {
             guid: FILTER_GUIDS[9],
@@ -298,6 +425,7 @@ pub fn build_cover_spec(server_ip: IpAddr, resolver_ip: Option<IpAddr>) -> Cover
             action: Action::Permit,
             condition: Condition::LoopbackNet(IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)),
             weight: PERMIT_WEIGHT,
+            lifetime: FilterLifetime::Persistent,
         },
         // A loopback connect is authorized at RECV_ACCEPT too; permitting only at
         // CONNECT denies the accept side, breaking the loopback SOCKS5 data plane.
@@ -312,6 +440,7 @@ pub fn build_cover_spec(server_ip: IpAddr, resolver_ip: Option<IpAddr>) -> Cover
             action: Action::Permit,
             condition: Condition::LoopbackNet(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
             weight: PERMIT_WEIGHT,
+            lifetime: FilterLifetime::Persistent,
         },
         FilterSpec {
             guid: FILTER_GUIDS[7],
@@ -319,6 +448,7 @@ pub fn build_cover_spec(server_ip: IpAddr, resolver_ip: Option<IpAddr>) -> Cover
             action: Action::Permit,
             condition: Condition::LoopbackNet(IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)),
             weight: PERMIT_WEIGHT,
+            lifetime: FilterLifetime::Persistent,
         },
         FilterSpec {
             guid: if server_layer == Layer::ConnectV4 {
@@ -330,6 +460,7 @@ pub fn build_cover_spec(server_ip: IpAddr, resolver_ip: Option<IpAddr>) -> Cover
             action: Action::Permit,
             condition: Condition::RemoteIp(server_ip),
             weight: PERMIT_WEIGHT,
+            lifetime: FilterLifetime::Persistent,
         },
     ];
     if let Some(ip) = resolver_ip {
@@ -343,10 +474,11 @@ pub fn build_cover_spec(server_ip: IpAddr, resolver_ip: Option<IpAddr>) -> Cover
             action: Action::Permit,
             condition: Condition::RemoteIpPortTcp(ip, RESOLVER_PERMIT_PORT),
             weight: PERMIT_WEIGHT,
+            lifetime: FilterLifetime::Persistent,
         });
     }
-    filters.push(block(FILTER_GUIDS[4], Layer::ConnectV4));
-    filters.push(block(FILTER_GUIDS[5], Layer::ConnectV6));
+    filters.push(block(FILTER_GUIDS[4], Layer::ConnectV4, FilterLifetime::Persistent));
+    filters.push(block(FILTER_GUIDS[5], Layer::ConnectV6, FilterLifetime::Persistent));
     CoverSpec {
         provider: PROVIDER_GUID,
         sublayer: SUBLAYER_GUID,
@@ -367,7 +499,9 @@ pub fn build_cover_spec(server_ip: IpAddr, resolver_ip: Option<IpAddr>) -> Cover
 /// there, so the range is the only matcher). Block stays CONNECT-only — egress
 /// kill switch, not inbound. Permits at `PERMIT_WEIGHT`, block at `BLOCK_WEIGHT`;
 /// within the single sublayer the higher-weight permit wins (no
-/// `CLEAR_ACTION_RIGHT`). Pure — no FFI.
+/// `CLEAR_ACTION_RIGHT`). The block-all pair also gets a `Boottime` twin (see
+/// the module doc's "Boot-time coverage" section) — every permit stays
+/// `Persistent`-only. Pure — no FFI.
 pub fn build_lockdown_spec(server_ip: IpAddr, tun_luid: u64, app_ids: &[std::path::PathBuf]) -> CoverSpec {
     let server_layer = match server_ip {
         IpAddr::V4(_) => Layer::ConnectV4,
@@ -436,8 +570,29 @@ pub fn build_lockdown_spec(server_ip: IpAddr, tun_luid: u64, app_ids: &[std::pat
         LOCKDOWN_FILTER_GUIDS[5]
     };
     filters.push(permit(server_guid, server_layer, Condition::RemoteIp(server_ip)));
-    filters.push(block(LOCKDOWN_FILTER_GUIDS[6], Layer::ConnectV4));
-    filters.push(block(LOCKDOWN_FILTER_GUIDS[7], Layer::ConnectV6));
+    filters.push(block(
+        LOCKDOWN_FILTER_GUIDS[6],
+        Layer::ConnectV4,
+        FilterLifetime::Persistent,
+    ));
+    filters.push(block(
+        LOCKDOWN_FILTER_GUIDS[7],
+        Layer::ConnectV6,
+        FilterLifetime::Persistent,
+    ));
+    // Boot-time twin — enforced by the kernel from boot until BFE starts,
+    // when the persistent pair above takes over. See the module doc's
+    // "Boot-time coverage" section for why only block-all gets one.
+    filters.push(block(
+        LOCKDOWN_BOOTTIME_BLOCK_ALL_GUIDS[0],
+        Layer::ConnectV4,
+        FilterLifetime::Boottime,
+    ));
+    filters.push(block(
+        LOCKDOWN_BOOTTIME_BLOCK_ALL_GUIDS[1],
+        Layer::ConnectV6,
+        FilterLifetime::Boottime,
+    ));
     CoverSpec {
         provider: PROVIDER_GUID,
         sublayer: SUBLAYER_GUID,
@@ -446,6 +601,8 @@ pub fn build_lockdown_spec(server_ip: IpAddr, tun_luid: u64, app_ids: &[std::pat
     }
 }
 
+/// Always `Persistent` — no permit is ever boot-time twinned (see the module
+/// doc's "Boot-time coverage" section: only the block-all floor gets one).
 fn permit(guid: GUID, layer: Layer, condition: Condition) -> FilterSpec {
     FilterSpec {
         guid,
@@ -453,16 +610,18 @@ fn permit(guid: GUID, layer: Layer, condition: Condition) -> FilterSpec {
         action: Action::Permit,
         condition,
         weight: PERMIT_WEIGHT,
+        lifetime: FilterLifetime::Persistent,
     }
 }
 
-fn block(guid: GUID, layer: Layer) -> FilterSpec {
+fn block(guid: GUID, layer: Layer, lifetime: FilterLifetime) -> FilterSpec {
     FilterSpec {
         guid,
         layer,
         action: Action::Block,
         condition: Condition::Any,
         weight: BLOCK_WEIGHT,
+        lifetime,
     }
 }
 
@@ -485,15 +644,117 @@ const FWP_E_FILTER_NOT_FOUND_DWORD: u32 = 0x8032_0003;
 /// code that is neither `ERROR_SUCCESS` nor "filter not found". Pure and total
 /// over the slice: it never stops at the first failure to decide whether to
 /// keep going, so a caller that issues every delete before calling this gets
-/// a structurally short-circuit-free fold.
+/// a structurally short-circuit-free fold. `what` is not always a delete:
+/// [`sweep_boottime_by_provider`] also folds its enumeration-open/enumeration
+/// codes through here, so the message below deliberately says "failed", not
+/// "delete failed" — the latter would misdescribe an enum-handle-open failure
+/// as a delete that was attempted and failed.
 fn first_delete_failure(codes: &[(&'static str, u32)]) -> Option<RoutingError> {
     codes.iter().find_map(|&(what, code)| {
         if code == ERROR_SUCCESS.0 || code == FWP_E_FILTER_NOT_FOUND_DWORD {
             None
         } else {
-            Some(RoutingError::RouteSetup(format!("{what} delete failed: 0x{code:08x}")))
+            Some(RoutingError::RouteSetup(format!("{what} failed: 0x{code:08x}")))
         }
     })
+}
+
+/// Delete every GUID in `guids` by key, folding every return code through
+/// [`first_delete_failure`] before returning. This is one of only two places
+/// in this file allowed to call `FwpmFilterDeleteByKey0` (the other is
+/// [`sweep_boottime_by_provider`]'s enumeration loop) — every sweep
+/// (`Cover::drop`'s Lockdown arm, `reclaim_stale_tun_permit`,
+/// `disengage_lockdown`, `delete_all`, `release_all`) routes through this
+/// function so a genuine delete failure can never be silently discarded by a
+/// bare `let _ = FwpmFilterDeleteByKey0(...)` reappearing at a call site
+/// (`windows_tests::no_stray_filter_deletes_outside_delete_guids_and_sweep_boottime_by_provider`
+/// enforces this structurally, over the whole file, not a slice of one function).
+#[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
+unsafe fn delete_guids(engine: HANDLE, guids: &[GUID], context: &'static str) -> Option<RoutingError> {
+    let codes: Vec<(&'static str, u32)> = guids
+        .iter()
+        .map(|g| (context, unsafe { FwpmFilterDeleteByKey0(engine, g) }))
+        .collect();
+    first_delete_failure(&codes)
+}
+
+/// Enumerate every filter WFP has installed under [`PROVIDER_GUID`], on every
+/// layer [`Layer::ALL`] names (all four this file's `add_filter` can ever
+/// target — not just the two CONNECT layers the boot-time block-all
+/// currently lives on, so a future boot-time filter on a different layer
+/// this provider uses is not invisible to the sweep), and delete every one
+/// still carrying `FWPM_FILTER_FLAG_BOOTTIME` — regardless of its GUID. See
+/// the module doc's "Boot-time coverage" section for why a fixed-GUID sweep
+/// alone (`LOCKDOWN_BOOTTIME_BLOCK_ALL_GUIDS`) cannot bound the
+/// downgrade-strand risk for boot-time filters specifically, and why this
+/// enumeration is run alongside it rather than instead of it. Scoped to (a)
+/// [`PROVIDER_GUID`], (b) `FWP_FILTER_ENUM_FLAG_BOOTTIME_ONLY` at the engine
+/// level, and (c) a redundant per-entry `FWPM_FILTER_FLAG_BOOTTIME` check, so
+/// it can never touch a persistent filter or another provider's filter.
+/// Best-effort like every other sweep in this file: an enumeration failure
+/// (e.g. BFE unreachable) folds into the same `Option<RoutingError>` contract
+/// as [`delete_guids`] so callers combine both without a second error type.
+#[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
+unsafe fn sweep_boottime_by_provider(engine: HANDLE) -> Option<RoutingError> {
+    let mut provider_key = PROVIDER_GUID;
+    let mut codes: Vec<(&'static str, u32)> = Vec::new();
+    for layer in Layer::ALL.map(layer_key) {
+        let template = FWPM_FILTER_ENUM_TEMPLATE0 {
+            providerKey: &mut provider_key,
+            layerKey: layer,
+            enumType: FWP_FILTER_ENUM_OVERLAPPING,
+            // BOOTTIME_ONLY: this sweep exists only to find boot-time
+            // filters, so ask the engine to hand back exactly that set —
+            // `flags: 0` (the pre-fix value) yields run-time filters only,
+            // making the enumeration below iterate zero boot-time filters no
+            // matter what a downgraded binary left behind. The per-entry
+            // `FWPM_FILTER_FLAG_BOOTTIME` check further down is kept as a
+            // second, independent guard against ever deleting a
+            // non-boot-time filter, rather than relying on this flag alone.
+            flags: FWP_FILTER_ENUM_FLAG_BOOTTIME_ONLY,
+            providerContextTemplate: std::ptr::null_mut(),
+            numFilterConditions: 0,
+            filterCondition: std::ptr::null_mut(),
+            actionMask: FWP_ACTION_FLAG_TERMINATING | FWP_ACTION_FLAG_NON_TERMINATING | FWP_ACTION_FLAG_CALLOUT,
+            calloutKey: std::ptr::null_mut(),
+        };
+        let mut enum_handle = HANDLE::default();
+        let rc = unsafe { FwpmFilterCreateEnumHandle0(engine, Some(&template), &mut enum_handle) };
+        if rc != ERROR_SUCCESS.0 {
+            codes.push(("boot-time provider enum open", rc));
+            continue;
+        }
+        loop {
+            let mut entries: *mut *mut FWPM_FILTER0 = std::ptr::null_mut();
+            let mut returned: u32 = 0;
+            // 64: an arbitrary, generous page size — this file's own filter
+            // count tops out in the low tens (see `swept_lockdown_guids`), and
+            // the loop below pages regardless via `returned < requested`.
+            const PAGE: u32 = 64;
+            let rc = unsafe { FwpmFilterEnum0(engine, enum_handle, PAGE, &mut entries, &mut returned) };
+            if rc != ERROR_SUCCESS.0 {
+                codes.push(("boot-time provider enum", rc));
+                break;
+            }
+            if !entries.is_null() {
+                let slice = unsafe { std::slice::from_raw_parts(entries, returned as usize) };
+                for &f_ptr in slice {
+                    let f = unsafe { &*f_ptr };
+                    if f.flags.0 & FWPM_FILTER_FLAG_BOOTTIME.0 != 0 {
+                        let del_rc = unsafe { FwpmFilterDeleteByKey0(engine, &f.filterKey) };
+                        codes.push(("boot-time filter (by provider enum)", del_rc));
+                    }
+                }
+                let mut p = entries as *mut core::ffi::c_void;
+                unsafe { FwpmFreeMemory0(&mut p) };
+            }
+            if returned < PAGE {
+                break;
+            }
+        }
+        let _ = unsafe { FwpmFilterDestroyEnumHandle0(engine, enum_handle) };
+    }
+    first_delete_failure(&codes)
 }
 
 /// Which cover a [`Cover`] guard owns — selects the GUID set its Drop deletes.
@@ -533,13 +794,15 @@ fn wfp_check(code: u32, what: &str) -> Result<(), RoutingError> {
 ///
 /// CROSS-VERSION CONTRACT, disclosed residual: this idempotency also means a
 /// repair (release the held cover, re-engage with a corrected server/resolver
-/// value — `ProxyManager`'s retry-repair path) can silently keep the OLD
-/// filter value live if the release's `FwpmFilterDeleteByKey0` (in
-/// `delete_all`, whose return codes are discarded) fails for that GUID: the
-/// re-add then hits `FWP_E_ALREADY_EXISTS` and reports success while the LIVE
-/// filter still carries the value the delete failed to remove. A stale
-/// PERMIT surviving, never a leaked block; see CONTRIBUTING.md's "Transient
-/// cutover cover" section.
+/// value — `ProxyManager`'s retry-repair path) can keep the OLD filter value
+/// live if the release's `FwpmFilterDeleteByKey0` (in `delete_all`, whose
+/// return codes ARE checked and warned via [`first_delete_failure`], but the
+/// warning is not acted on — `delete_all` still returns `()`, so the
+/// repair caller never sees the failure) fails for that GUID: the re-add then
+/// hits `FWP_E_ALREADY_EXISTS` and reports success while the LIVE filter
+/// still carries the value the delete failed to remove. A stale PERMIT
+/// surviving, never a leaked block; see CONTRIBUTING.md's "Transient cutover
+/// cover" section.
 fn ok_or_exists(code: u32, what: &str) -> Result<(), RoutingError> {
     if code == FWP_E_ALREADY_EXISTS_DWORD {
         return Ok(());
@@ -614,11 +877,14 @@ pub fn engage_lockdown(
             // Refresh the volatile permits: delete their fixed keys before the
             // adds, in this same transaction, so a re-engage over an adopted
             // cover lands the CURRENT TUN LUID and server IP instead of hitting
-            // `ok_or_exists` on a stale filter. Return codes are ignored for
-            // the same reason every other sweep ignores them — a delete that
-            // finds nothing (the ordinary first engage) is not an error.
-            for g in &spec.pre_delete {
-                let _ = FwpmFilterDeleteByKey0(engine, g);
+            // `ok_or_exists` on a stale filter. A delete that finds nothing (the
+            // ordinary first engage) is not an error — `delete_guids` treats
+            // `FWP_E_FILTER_NOT_FOUND` as success — but a GENUINE failure here
+            // aborts the whole transaction (no filters added), consistent with
+            // this cover's fail-closed philosophy: a re-engage that can't prove
+            // the old volatile filters are gone must not layer new ones on top.
+            if let Some(e) = delete_guids(engine, &spec.pre_delete, "lockdown pre-engage") {
+                return Err(e);
             }
             // Idempotent over an unswept cover: add_provider/add_sublayer use
             // ok_or_exists, and the kept floor (block-all + loopback + App-ID)
@@ -711,25 +977,22 @@ unsafe fn get_app_id_blob(path: &Path) -> Result<AppIdBlob, RoutingError> {
 
 #[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
 unsafe fn add_filter(engine: HANDLE, provider: GUID, sublayer: GUID, f: &FilterSpec) -> Result<(), RoutingError> {
-    let layer = match f.layer {
-        Layer::ConnectV4 => FWPM_LAYER_ALE_AUTH_CONNECT_V4,
-        Layer::ConnectV6 => FWPM_LAYER_ALE_AUTH_CONNECT_V6,
-        Layer::RecvAcceptV4 => FWPM_LAYER_ALE_AUTH_RECV_ACCEPT_V4,
-        Layer::RecvAcceptV6 => FWPM_LAYER_ALE_AUTH_RECV_ACCEPT_V6,
-    };
+    let layer = layer_key(f.layer);
     let action_type = match f.action {
         Action::Permit => FWP_ACTION_PERMIT,
         Action::Block => FWP_ACTION_BLOCK,
     };
-    // PERSISTENT only — NO CLEAR_ACTION_RIGHT. Setting that flag makes a filter's
-    // action SOFT (cross-sublayer overridable); omitting it makes the action HARD,
-    // and hardness governs only cross-sublayer arbitration. A BLOCK with the flag
-    // omitted is thus a default-HARD block — and the old code set the flag on the
-    // permits (soft) but not the block (hard), so block-all vetoed every permit
-    // (the cover blocked everything). With the flag off everywhere, within-sublayer
-    // arbitration is pure weight: the weight-15 permits beat the weight-0 block-all
-    // (the wireguard-windows recipe — see the module doc).
-    let flags = FWPM_FILTER_FLAGS(FWPM_FILTER_FLAG_PERSISTENT.0);
+    // Lifetime flag (PERSISTENT or BOOTTIME, see `filter_lifetime_flag` and the
+    // module doc's "Boot-time coverage" section) — NO CLEAR_ACTION_RIGHT.
+    // Setting that flag makes a filter's action SOFT (cross-sublayer
+    // overridable); omitting it makes the action HARD, and hardness governs
+    // only cross-sublayer arbitration. A BLOCK with the flag omitted is thus
+    // a default-HARD block — and the old code set the flag on the permits
+    // (soft) but not the block (hard), so block-all vetoed every permit (the
+    // cover blocked everything). With the flag off everywhere, within-sublayer
+    // arbitration is pure weight: the weight-15 permits beat the weight-0
+    // block-all (the wireguard-windows recipe — see the module doc).
+    let flags = FWPM_FILTER_FLAGS(filter_lifetime_flag(f.lifetime));
 
     // Keep-alive bindings: `FWPM_FILTER0` holds raw pointers into these; they
     // must outlive the `FwpmFilterAdd0` call below.
@@ -947,13 +1210,16 @@ impl Drop for Cover {
                 // cannot return an error, so a code that is neither success nor
                 // not-found is warned: silence there is indistinguishable from
                 // a clean release.
-                #[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
                 CoverKind::Lockdown => {
-                    let codes: Vec<(&'static str, u32)> = swept_lockdown_guids()
-                        .into_iter()
-                        .map(|g| ("lockdown filter", FwpmFilterDeleteByKey0(self.engine, &g)))
-                        .collect();
-                    if let Some(e) = first_delete_failure(&codes) {
+                    let guids = swept_lockdown_guids();
+                    let by_key = delete_guids(self.engine, &guids, "lockdown filter");
+                    // Enumeration sweep, additional to the by-key deletes above:
+                    // a boot-time block-all filter installed by a NEWER binary
+                    // whose GUID this binary's `swept_lockdown_guids` doesn't
+                    // know about would otherwise survive the by-key pass — see
+                    // the module doc's "Boot-time coverage" section.
+                    let by_provider = sweep_boottime_by_provider(self.engine);
+                    if let Some(e) = by_key.or(by_provider) {
                         tracing::warn!(error = %e, "lockdown cover release left a filter installed; egress may still be blocked");
                     }
                 }
@@ -986,7 +1252,6 @@ pub(crate) fn should_reclaim_tun_permit(resolved: bool) -> bool {
 /// close — so it is folded through [`first_delete_failure`] and warned, same
 /// as `Cover::drop`'s Lockdown arm and [`delete_all`]: a DACL-denied delete
 /// must not read as a successful reclaim.
-#[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
 pub fn reclaim_stale_tun_permit(resolver: &dyn super::LuidResolver, tun_name: &str) {
     if !should_reclaim_tun_permit(resolver.resolve(tun_name).is_ok()) {
         // A live `hole-tun` exists — some bridge may be relying on this
@@ -995,6 +1260,7 @@ pub fn reclaim_stale_tun_permit(resolver: &dyn super::LuidResolver, tun_name: &s
     }
     unsafe {
         let mut engine = HANDLE::default();
+        #[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
         let rc = FwpmEngineOpen0(PCWSTR::null(), RPC_C_AUTHN_WINNT, None, None, &mut engine);
         if rc != ERROR_SUCCESS.0 {
             tracing::warn!(
@@ -1003,18 +1269,17 @@ pub fn reclaim_stale_tun_permit(resolver: &dyn super::LuidResolver, tun_name: &s
             );
             return;
         }
-        let codes: Vec<(&'static str, u32)> = LOCKDOWN_TUN_GUID_INDICES
+        let guids: Vec<GUID> = LOCKDOWN_TUN_GUID_INDICES
             .iter()
-            .map(|&i| {
-                (
-                    "TUN-LUID permit",
-                    FwpmFilterDeleteByKey0(engine, &LOCKDOWN_FILTER_GUIDS[i]),
-                )
-            })
+            .map(|&i| LOCKDOWN_FILTER_GUIDS[i])
             .collect();
-        if let Some(e) = first_delete_failure(&codes) {
+        // TUN permits are never boot-time (see the module doc: only the
+        // block-all floor gets a boot-time twin), so no provider-enumeration
+        // sweep is needed here — by-key is exhaustive for this GUID set.
+        if let Some(e) = delete_guids(engine, &guids, "TUN-LUID permit") {
             tracing::warn!(error = %e, "stale TUN permit reclaim left a filter installed; a later adapter reusing this LUID would inherit unconditional egress");
         }
+        #[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
         let _ = FwpmEngineClose0(engine);
     }
 }
@@ -1101,13 +1366,19 @@ pub fn lockdown_cover_presence(_state_dir: &Path) -> crate::routing::CoverPresen
 
 /// Fail-loud disengage for the `bridge unlock` escape hatch. Deletes all
 /// lockdown + App-ID filters by their fixed GUIDs (idempotent — a "not found"
-/// delete is a no-op, so a clean host returns `Ok`). The failure that means
-/// "cannot disengage" is the ENGINE OPEN: the Base Filtering Engine could not
-/// be reached, so nothing could have been issued → `Err`. That is NOT "not
-/// elevated" — FWPM opens without elevation (`release_all`'s doc records the
-/// same measurement); a failed open means BFE is not running or RPC failed.
-/// There is no persisted Windows state to key absence on (delete-by-GUID is
-/// idempotent), so a successful open always reports `Ok`.
+/// delete is a no-op, so a clean host returns `Ok`), then additionally sweeps
+/// boot-time filters by provider enumeration (see the module doc's
+/// "Boot-time coverage" section — a fixed-GUID delete alone cannot bound the
+/// downgrade-strand risk for boot-time filters). "Fail-loud" covers TWO
+/// failure modes, both surfaced as `Err`: the ENGINE OPEN (the Base Filtering
+/// Engine could not be reached, so nothing could have been issued — NOT "not
+/// elevated"; FWPM opens without elevation, `release_all`'s doc records the
+/// same measurement) and a GENUINE delete failure (neither success nor
+/// not-found) from either sweep — a lockdown filter or a boot-time filter
+/// that a delete call could not remove is exactly the condition `bridge
+/// unlock` exists to report, not silently swallow. There is no persisted
+/// Windows state to key absence on (delete-by-GUID is idempotent), so a
+/// successful open with every delete clean reports `Ok`.
 pub fn disengage_lockdown(_state_dir: &Path) -> Result<(), RoutingError> {
     unsafe {
         let mut engine = HANDLE::default();
@@ -1119,12 +1390,14 @@ pub fn disengage_lockdown(_state_dir: &Path) -> Result<(), RoutingError> {
                  cover could not be disengaged"
             )));
         }
-        #[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
-        for g in swept_lockdown_guids() {
-            let _ = FwpmFilterDeleteByKey0(engine, &g);
-        }
+        let guids = swept_lockdown_guids();
+        let by_key = delete_guids(engine, &guids, "lockdown filter");
+        let by_provider = sweep_boottime_by_provider(engine);
         #[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
         let _ = FwpmEngineClose0(engine);
+        if let Some(e) = by_key.or(by_provider) {
+            return Err(e);
+        }
     }
     Ok(())
 }
@@ -1158,16 +1431,17 @@ pub fn recover_cover(_state_dir: &Path, adopting: bool) {
 /// callers (`Cover::drop`, `recover_cover`) can return nothing, so it is
 /// warned here. The sublayer/provider deletes stay best-effort: an orphaned
 /// empty sublayer holds no traffic.
-#[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
 unsafe fn delete_all(engine: HANDLE) {
-    let codes: Vec<(&'static str, u32)> = swept_transient_guids()
-        .into_iter()
-        .map(|g| ("transient filter", FwpmFilterDeleteByKey0(engine, &g)))
-        .collect();
-    if let Some(e) = first_delete_failure(&codes) {
+    let guids = swept_transient_guids();
+    // The transient cover has no boot-time filters (only the lockdown
+    // block-all floor does — see the module doc), so no provider-enumeration
+    // sweep is needed here — by-key is exhaustive for this GUID set.
+    if let Some(e) = delete_guids(engine, &guids, "transient filter") {
         tracing::warn!(error = %e, "transient cover sweep left a filter installed; egress may still be blocked");
     }
+    #[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
     let _ = FwpmSubLayerDeleteByKey0(engine, &SUBLAYER_GUID);
+    #[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
     let _ = FwpmProviderDeleteByKey0(engine, &PROVIDER_GUID);
 }
 
@@ -1185,7 +1459,10 @@ unsafe fn delete_all(engine: HANDLE) {
 /// structurally impossible — then the codes are folded by
 /// `first_delete_failure`. The sublayer/provider delete is best-effort
 /// (ignored): an orphaned empty sublayer/provider holds no traffic, matching
-/// `delete_all`.
+/// `delete_all`. Additionally sweeps boot-time filters by provider
+/// enumeration (see the module doc's "Boot-time coverage" section) — this is
+/// the unconditional escape hatch, so it must be at least as thorough at
+/// removing a boot-time filter as `Cover::drop` and `disengage_lockdown` are.
 pub fn release_all(_state_dir: &Path) -> Result<(), RoutingError> {
     unsafe {
         let mut engine = HANDLE::default();
@@ -1197,15 +1474,10 @@ pub fn release_all(_state_dir: &Path) -> Result<(), RoutingError> {
             )));
         }
 
-        let mut codes: Vec<(&'static str, u32)> = Vec::new();
-        #[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
-        for g in swept_lockdown_guids() {
-            codes.push(("lockdown filter", FwpmFilterDeleteByKey0(engine, &g)));
-        }
-        #[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
-        for g in swept_transient_guids() {
-            codes.push(("transient filter", FwpmFilterDeleteByKey0(engine, &g)));
-        }
+        let mut guids = swept_lockdown_guids();
+        guids.extend(swept_transient_guids());
+        let by_key = delete_guids(engine, &guids, "cover filter");
+        let by_provider = sweep_boottime_by_provider(engine);
         #[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
         let _ = FwpmSubLayerDeleteByKey0(engine, &SUBLAYER_GUID);
         #[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
@@ -1213,7 +1485,169 @@ pub fn release_all(_state_dir: &Path) -> Result<(), RoutingError> {
         #[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
         let _ = FwpmEngineClose0(engine);
 
-        match first_delete_failure(&codes) {
+        match by_key.or(by_provider) {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
+}
+
+// Test-only, real-FWPM helpers for `lockdown_privileged_tests.rs` =====================================================
+//
+// These exist to let the elevated `tun` CI lane exercise the REAL FWPM engine:
+// add/get/delete of an actual BOOTTIME filter, and a round-trip through
+// `sweep_boottime_by_provider`'s enumeration path for a filter GUID no fixed
+// array in this file knows about — the downgrade-brick scenario
+// `sweep_boottime_by_provider` exists to close. `#[cfg(test)]` keeps them out
+// of release builds entirely.
+
+/// A throwaway GUID deliberately absent from every fixed sweep array in this
+/// file (`FILTER_GUIDS`, `LOCKDOWN_FILTER_GUIDS`,
+/// `LOCKDOWN_BOOTTIME_BLOCK_ALL_GUIDS`). Used only by
+/// [`install_probe_boottime_filter`] to stand in for "a boot-time filter a
+/// NEWER binary installed, whose GUID this (OLDER) binary's by-key sweep
+/// cannot know" — the scenario only `sweep_boottime_by_provider`'s
+/// provider-keyed enumeration can clean up.
+#[cfg(test)]
+pub(crate) const TEST_ONLY_PROBE_BOOTTIME_GUID: GUID = GUID::from_u128(0x5ac57c82_9d26_4c44_8689_180060eaed0e);
+
+/// A second throwaway GUID, also absent from every fixed sweep array, but
+/// `Persistent` rather than `Boottime`. Used only by
+/// [`install_probe_persistent_filter`] to prove the negative half of
+/// `sweep_boottime_by_provider`'s safety contract: a filter under the SAME
+/// [`PROVIDER_GUID`] that is NOT boot-time must survive the provider
+/// enumeration sweep untouched, because the sweep's per-entry
+/// `FWPM_FILTER_FLAG_BOOTTIME` check is the only thing standing between
+/// "clean up a stranded boot-time leftover" and "delete a live PERSISTENT
+/// permit/block out from under a running cover."
+#[cfg(test)]
+pub(crate) const TEST_ONLY_PROBE_PERSISTENT_GUID: GUID = GUID::from_u128(0x6bd68d93_ae37_4d55_9790_291171fb1f1f);
+
+/// Look up a filter's WFP flags by key against the real engine. `Ok(None)`
+/// means not found (deleted or never installed); `Ok(Some(flags))` is the
+/// raw `FWPM_FILTER0::flags` bitmask, letting a test assert
+/// `flags & FWPM_FILTER_FLAG_BOOTTIME.0 != 0` against a LIVE filter rather
+/// than trusting `filter_lifetime_flag`'s pure mapping alone.
+#[cfg(test)]
+pub(crate) fn filter_flags_by_key(guid: GUID) -> Result<Option<u32>, RoutingError> {
+    #[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
+    unsafe {
+        let mut engine = HANDLE::default();
+        wfp_check(
+            FwpmEngineOpen0(PCWSTR::null(), RPC_C_AUTHN_WINNT, None, None, &mut engine),
+            "FwpmEngineOpen0",
+        )?;
+        let mut out: *mut FWPM_FILTER0 = std::ptr::null_mut();
+        let rc = FwpmFilterGetByKey0(engine, &guid, &mut out);
+        let result = if rc == ERROR_SUCCESS.0 {
+            let flags = if out.is_null() { 0 } else { (*out).flags.0 };
+            if !out.is_null() {
+                let mut p = out as *mut core::ffi::c_void;
+                FwpmFreeMemory0(&mut p);
+            }
+            Ok(Some(flags))
+        } else if rc == FWP_E_FILTER_NOT_FOUND_DWORD {
+            Ok(None)
+        } else {
+            Err(RoutingError::RouteSetup(format!(
+                "FwpmFilterGetByKey0 failed: 0x{rc:08x}"
+            )))
+        };
+        let _ = FwpmEngineClose0(engine);
+        result
+    }
+}
+
+/// Add a single real BOOTTIME block filter under [`PROVIDER_GUID`] /
+/// [`SUBLAYER_GUID`] at `ALE_AUTH_CONNECT_V4`, keyed by
+/// [`TEST_ONLY_PROBE_BOOTTIME_GUID`] — a GUID no production sweep array in
+/// this file lists. Creates the provider/sublayer first (idempotent via
+/// `ok_or_exists`, matching `engage_lockdown`), so this can run standalone
+/// without a lockdown cover already engaged.
+#[cfg(test)]
+pub(crate) fn install_probe_boottime_filter() -> Result<(), RoutingError> {
+    #[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
+    unsafe {
+        let mut engine = HANDLE::default();
+        wfp_check(
+            FwpmEngineOpen0(PCWSTR::null(), RPC_C_AUTHN_WINNT, None, None, &mut engine),
+            "FwpmEngineOpen0",
+        )?;
+        let result = (|| -> Result<(), RoutingError> {
+            add_provider(engine, PROVIDER_GUID)?;
+            add_sublayer(engine, SUBLAYER_GUID, PROVIDER_GUID)?;
+            add_filter(
+                engine,
+                PROVIDER_GUID,
+                SUBLAYER_GUID,
+                &block(
+                    TEST_ONLY_PROBE_BOOTTIME_GUID,
+                    Layer::ConnectV4,
+                    FilterLifetime::Boottime,
+                ),
+            )
+        })();
+        let _ = FwpmEngineClose0(engine);
+        result
+    }
+}
+
+/// Install [`TEST_ONLY_PROBE_PERSISTENT_GUID`] — a `Persistent` block filter
+/// under the same [`PROVIDER_GUID`] as [`install_probe_boottime_filter`]'s
+/// `Boottime` one. Creates the provider/sublayer first (idempotent via
+/// `ok_or_exists`), so this can also run standalone.
+#[cfg(test)]
+pub(crate) fn install_probe_persistent_filter() -> Result<(), RoutingError> {
+    #[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
+    unsafe {
+        let mut engine = HANDLE::default();
+        wfp_check(
+            FwpmEngineOpen0(PCWSTR::null(), RPC_C_AUTHN_WINNT, None, None, &mut engine),
+            "FwpmEngineOpen0",
+        )?;
+        let result = (|| -> Result<(), RoutingError> {
+            add_provider(engine, PROVIDER_GUID)?;
+            add_sublayer(engine, SUBLAYER_GUID, PROVIDER_GUID)?;
+            add_filter(
+                engine,
+                PROVIDER_GUID,
+                SUBLAYER_GUID,
+                &block(
+                    TEST_ONLY_PROBE_PERSISTENT_GUID,
+                    Layer::ConnectV4,
+                    FilterLifetime::Persistent,
+                ),
+            )
+        })();
+        let _ = FwpmEngineClose0(engine);
+        result
+    }
+}
+
+/// Delete a single filter by key, directly — deliberately NOT via
+/// [`sweep_boottime_by_provider`] (unlike `release_all`, which the tests this
+/// supports are exercising). A probe filter's teardown must not depend on the
+/// correctness of the mechanism the test is proving: if the sweep were
+/// broken, relying on it alone for cleanup would fail the test's assertion
+/// AND leave the probe's real filter permanently installed on the host —
+/// including a CI runner, which for a BOOTTIME probe would then lose
+/// outbound egress on that layer on every future boot, with no filter any
+/// production sweep can find. `delete_guids`'s success-or-genuinely-not-found
+/// contract makes this a no-op, not an error, if the filter is already gone.
+/// Shared by both [`TEST_ONLY_PROBE_BOOTTIME_GUID`] and
+/// [`TEST_ONLY_PROBE_PERSISTENT_GUID`] cleanup.
+#[cfg(test)]
+pub(crate) fn delete_probe_filter_by_key(guid: GUID) -> Result<(), RoutingError> {
+    #[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
+    unsafe {
+        let mut engine = HANDLE::default();
+        wfp_check(
+            FwpmEngineOpen0(PCWSTR::null(), RPC_C_AUTHN_WINNT, None, None, &mut engine),
+            "FwpmEngineOpen0",
+        )?;
+        let result = delete_guids(engine, &[guid], "probe filter (by key)");
+        let _ = FwpmEngineClose0(engine);
+        match result {
             Some(e) => Err(e),
             None => Ok(()),
         }

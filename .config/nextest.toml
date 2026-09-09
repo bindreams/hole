@@ -99,6 +99,15 @@ nextest-version = "0.9.130"
 #     `Dispatcher::new` opens a real TUN device, and on macOS it is a
 #     kernel-assigned `utun` adapter with no fixed name):
 #     crates/bridge/src/dispatcher_privileged_tests.rs
+#   - `windows_boottime_global_net_state_` prefix (#998 — real FWPM: one
+#     engages the real lockdown cover and reads the live block-all filters'
+#     flags back to prove they genuinely carry `FWPM_FILTER_FLAG_BOOTTIME`,
+#     not merely that the pure `filter_lifetime_flag` mapping is right; the
+#     other installs a throwaway BOOTTIME filter under a GUID absent from
+#     every fixed sweep array and proves `release_all`'s provider-enumeration
+#     sweep — not a by-key delete — finds and removes it, the exact
+#     downgrade-brick scenario that sweep exists to close):
+#     crates/tun-engine/src/routing/failclosed/lockdown_privileged_tests.rs
 #   - `e2e_full_tunnel_local_udp_intact` — matched by the `^e2e_…full_tunnel…`
 #     anchor above, not by a term of its own. It carries
 #     `labels = [DIST_BIN, TUN], serial = TUN` in
@@ -128,7 +137,7 @@ nextest-version = "0.9.130"
 max-threads = 1
 
 [[profile.default.overrides]]
-filter = 'test(/^e2e_.*full_tunnel/) + test(/windows_lockdown_permits_server_ip_/) + test(/macos_lockdown_permits_server_ip_/) + test(/failclosed_permits_/) + test(/release_all_/) + test(/cutover_global_net_state_/) + test(/live_tun_permit_/) + test(/tun_device_ipv6_/) + test(/gateway_global_net_state_/) + test(/dns_confine_global_net_state_/) + test(/dns_steer_global_net_state_/) + test(/macos_dns_global_net_state_/) + test(/opens_a_kernel_assigned/) + test(/dispatcher_opens_tun_/)'
+filter = 'test(/^e2e_.*full_tunnel/) + test(/windows_lockdown_permits_server_ip_/) + test(/macos_lockdown_permits_server_ip_/) + test(/failclosed_permits_/) + test(/release_all_/) + test(/cutover_global_net_state_/) + test(/live_tun_permit_/) + test(/tun_device_ipv6_/) + test(/gateway_global_net_state_/) + test(/dns_confine_global_net_state_/) + test(/dns_steer_global_net_state_/) + test(/macos_dns_global_net_state_/) + test(/opens_a_kernel_assigned/) + test(/dispatcher_opens_tun_/) + test(/windows_boottime_global_net_state_/)'
 test-group = 'global_net_state'
 
 # `driver_dns_tests.rs` / `driver_udp_tests.rs` / `driver_lifecycle_tests.rs`

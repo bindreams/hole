@@ -924,7 +924,9 @@ egress set and blocking everything else; they differ in lifetime and which set
 they permit.
 
 Both are deliberately **persistent** WFP filters, surviving an update-cutover
-restart on purpose. The Windows DNS-egress confinement
+restart on purpose (Windows: the standing lockdown cover's block-all is
+ADDITIONALLY boot-time, closing a gap `PERSISTENT` alone cannot — see
+[Lockdown mode](#lockdown-mode)). The Windows DNS-egress confinement
 ([`tun_engine::dns_confine`](crates/tun-engine/src/dns_confine.rs), see
 [DNS forwarder](#dns-forwarder)) is the opposite: a **dynamic**, process-scoped
 FWPM session that dies with the engine handle, including on an abnormal exit —
@@ -1050,7 +1052,10 @@ not a leak of blocked traffic. Disclosed as a source comment on
 `FILTER_GUIDS` itself. Tracked separately:
 [#754](https://github.com/bindreams/hole/issues/754). **Windows only, also
 pre-existing:** the repair's release step deletes the held cover's filters by
-fixed GUID and discards the result; if a delete genuinely fails, the
+fixed GUID; the return codes ARE checked (via `delete_guids`/`first_delete_failure`)
+and a genuine failure IS logged through a `tracing::warn!`, but the warning is
+not acted on — the deleting function still returns `()`,
+so the repair caller never sees it. If a delete genuinely fails, the
 subsequent re-engage's add for that same GUID reports success
 (`FWP_E_ALREADY_EXISTS` is treated as OK, by design, for the crash-recovery
 idempotency case) while the LIVE filter still carries the OLD value — a
@@ -1172,6 +1177,39 @@ identified at runtime via `TunIdentity`, on macOS), the onward server
 connection, and (Windows) the plugin + bridge binaries by App-ID — so normal
 traffic flows while connected and the block holds across a bridge restart for
 free. When disabled, behavior is byte-identical to a Hole without it.
+
+**Windows, #998:** a merely-`PERSISTENT` filter is re-added by the Base
+Filtering Engine (BFE) once it starts, not enforced before that — the kernel
+enforces only `FWPM_FILTER_FLAG_BOOTTIME` filters from boot until BFE takes
+over, so a `PERSISTENT`-only block-all left the host briefly open on every
+reboot with the kill switch armed. The block-all half of the standing cover
+now additionally installs a `BOOTTIME` twin
+(`LOCKDOWN_BOOTTIME_BLOCK_ALL_GUIDS`) — the two flags are mutually exclusive
+on one filter object, so this is a second filter, not a second bit on the
+same one. Every permit, including loopback, stays `PERSISTENT`-only by
+design: a boot-time loopback permit has no handoff mechanism to the narrower
+persistent rule once BFE starts, and the leak this closes is network egress,
+not loopback (matches Mullvad's shipped `talpid-core` boot-time set, which
+permits nothing either). Deleting a boot-time filter uses the same
+`FwpmFilterDeleteByKey0` call as a persistent one, but a stranded boot-time
+leftover has no self-healing path the way a stranded persistent one does: BFE
+keeps re-adding a persistent leftover every start regardless of which build
+is running, so a later GUID-aware build can still reach it by key, while a
+boot-time leftover is reprovisioned from an on-disk policy record independent
+of the live FWPM session, so an older binary that never learned its GUID can
+never find it by key — and it then blocks loopback on every future boot,
+forever. Because a fixed-GUID sweep cannot bound that risk,
+`sweep_boottime_by_provider` additionally enumerates every filter under
+`PROVIDER_GUID` and deletes any that still carries
+`FWPM_FILTER_FLAG_BOOTTIME` regardless of its GUID, run alongside every
+fixed-GUID lockdown sweep (`Cover::drop`'s Lockdown arm, `disengage_lockdown`,
+`release_all`). **Not verified by this change:** whether a post-boot query
+can still see a boot-time filter at all — Microsoft's own documentation
+conflicts between "removed" and "disabled" once BFE finishes initializing —
+and the boot→BFE window's actual behavior, which needs a real reboot to
+observe; no elevated Windows CI lane can reboot a machine. Full detail is in
+the module doc on
+[`routing/failclosed/windows.rs`](crates/tun-engine/src/routing/failclosed/windows.rs).
 
 It contrasts with the [transient cutover cover](#transient-cutover-cover) on
 three axes:
@@ -1300,10 +1338,14 @@ Disclosed residuals:
    repaired to `enabled: true` only on `Presence::Live` with an `Unset` or
    `Unreadable` intent, never inferred.
 
-   `Live` means **any residue**, not the whole cover: the Windows sweeps loop
-   delete-by-key with every return code discarded over persistent filters, so
-   a sweep interrupted mid-loop survives a reboot as a partial cover that a
-   single-GUID probe would call `Absent` forever.
+   `Live` means **any residue**, not the whole cover: even though every
+   Windows sweep checks each delete-by-key return code and `disengage_lockdown`
+   fails loud on a genuine per-GUID failure, matching `release_all` (see
+   `delete_guids`/`first_delete_failure`), nothing RETRIES a code that reporting can't fix
+   (BFE unreachable partway through, a DACL-denied delete, or the sweeping
+   process itself being killed mid-loop), so a sweep interrupted mid-loop
+   still survives a reboot as a partial cover that a single-GUID probe would
+   call `Absent` forever.
 
    `Adopt` never disengages the cover, on either platform. The server-permit
    volatile-refresh it used to perform moved into `engage_lockdown`, which

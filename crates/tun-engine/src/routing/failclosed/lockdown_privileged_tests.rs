@@ -48,6 +48,12 @@
 use super::*;
 use crate::{GLOBAL_NET_STATE, TUN};
 
+// FFI constant, not re-exported by `platform` — needed directly to assert a
+// LIVE filter's flags carry the real BOOTTIME bit (#998), not merely that
+// `filter_lifetime_flag`'s pure mapping is right.
+#[cfg(target_os = "windows")]
+use windows::Win32::NetworkManagement::WindowsFilteringPlatform::FWPM_FILTER_FLAG_BOOTTIME;
+
 // Two routable anycast hosts on :443 (the runner has outbound internet). IP
 // literals only — the cover blocks DNS, so a hostname connect would fail for the
 // wrong reason. PERMITTED is engaged as the server IP; NON_PERMITTED proves the
@@ -177,6 +183,136 @@ fn windows_lockdown_permits_server_ip_and_blocks_other_egress() {
         super::lockdown_cover_presence(dir.path()),
         crate::routing::CoverPresence::Absent,
         "after the guard drops the firewall must report the cover gone"
+    );
+}
+
+/// Proves the lockdown block-all's boot-time twin is a
+/// GENUINE `FWPM_FILTER_FLAG_BOOTTIME` filter on the real, live engine — not
+/// merely that the pure `filter_lifetime_flag` mapping is right (that is
+/// `filter_lifetime_flag_maps_to_the_real_wfp_constants`, in `windows_tests`,
+/// which never touches FWPM). Reads the live filters' flags back by key via
+/// `filter_flags_by_key` both while the cover is held (must carry the bit)
+/// and after `Cover::drop` (must be gone — `Cover::drop`'s by-key delete is
+/// sufficient for a filter whose GUID it already knows, unlike the
+/// downgrade-brick scenario the next test exercises).
+#[cfg(target_os = "windows")]
+#[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
+fn windows_boottime_global_net_state_lockdown_filters_are_genuinely_boottime() {
+    let dir = tempfile::tempdir().unwrap();
+    let resolver = SystemLuidResolver;
+    let server_ip: std::net::IpAddr = "1.1.1.1".parse().unwrap();
+
+    let cover = engage_lockdown(
+        server_ip,
+        "Loopback Pseudo-Interface 1",
+        &resolver,
+        &[],
+        dir.path(),
+        None,
+    )
+    .expect("engage real WFP lockdown cover");
+
+    for guid in super::platform::LOCKDOWN_BOOTTIME_BLOCK_ALL_GUIDS {
+        let flags = super::platform::filter_flags_by_key(guid)
+            .expect("FwpmFilterGetByKey0 must succeed while the cover is held")
+            .unwrap_or_else(|| panic!("boot-time block-all filter {guid:?} must be live while the cover is held"));
+        assert!(
+            flags & FWPM_FILTER_FLAG_BOOTTIME.0 != 0,
+            "filter {guid:?} must carry FWPM_FILTER_FLAG_BOOTTIME on the real engine, not just in the local FilterSpec (flags=0x{flags:08x})"
+        );
+    }
+
+    drop(cover);
+
+    for guid in super::platform::LOCKDOWN_BOOTTIME_BLOCK_ALL_GUIDS {
+        let flags = super::platform::filter_flags_by_key(guid).expect("FwpmFilterGetByKey0 must succeed after drop");
+        assert!(
+            flags.is_none(),
+            "boot-time block-all filter {guid:?} must be gone after Cover::drop, found flags={flags:?}"
+        );
+    }
+}
+
+/// Removes anything `install_probe_boottime_filter` / `install_probe_persistent_filter`
+/// stranded, on every exit path including a panicking assertion. Mirrors
+/// `ReleaseOnDrop` in `release_privileged_tests.rs`. Deletes both probes by
+/// key FIRST, independent of `sweep_boottime_by_provider` (the mechanism the
+/// tests below are actually proving): if that sweep is broken, cleanup must
+/// not also fail and strand a live filter on the runner. `release_all` still
+/// runs afterward too, as a second, redundant pass mirroring what a real
+/// caller would do — but it is not load-bearing for either GUID's removal.
+#[cfg(target_os = "windows")]
+struct ProbeReleaseOnDrop;
+#[cfg(target_os = "windows")]
+impl Drop for ProbeReleaseOnDrop {
+    fn drop(&mut self) {
+        let _ = super::platform::delete_probe_filter_by_key(super::platform::TEST_ONLY_PROBE_BOOTTIME_GUID);
+        let _ = super::platform::delete_probe_filter_by_key(super::platform::TEST_ONLY_PROBE_PERSISTENT_GUID);
+        let dir = tempfile::tempdir().unwrap();
+        let _ = super::release_all(dir.path());
+    }
+}
+
+/// A fixed-GUID sweep alone cannot remove a boot-time filter
+/// whose GUID it doesn't know — the downgrade-brick scenario where a NEWER
+/// binary's boot-time GUID is invisible to an OLDER binary's compiled-in
+/// array. Installs a throwaway BOOTTIME filter under
+/// `TEST_ONLY_PROBE_BOOTTIME_GUID` — deliberately absent from every fixed
+/// sweep array in `windows.rs` — then proves `release_all` (the unconditional
+/// escape hatch every recovery path shares) still finds and removes it, via
+/// `sweep_boottime_by_provider`'s provider-keyed enumeration rather than a
+/// by-key delete. Also installs a `Persistent` probe filter
+/// (`TEST_ONLY_PROBE_PERSISTENT_GUID`) under the same provider, and asserts
+/// it SURVIVES the same `release_all` call: `sweep_boottime_by_provider`'s
+/// per-entry `FWPM_FILTER_FLAG_BOOTTIME` check is the only thing standing
+/// between "clean up a stranded boot-time leftover" and "delete a live
+/// PERSISTENT permit/block out from under a running cover" — an inverted or
+/// dropped flag check would delete both probes, and only this assertion
+/// would catch it.
+#[cfg(target_os = "windows")]
+#[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
+fn windows_boottime_global_net_state_release_all_sweeps_by_provider_enumeration() {
+    let _release_guard = ProbeReleaseOnDrop;
+    let boottime_guid = super::platform::TEST_ONLY_PROBE_BOOTTIME_GUID;
+    let persistent_guid = super::platform::TEST_ONLY_PROBE_PERSISTENT_GUID;
+
+    super::platform::install_probe_boottime_filter().expect("install a real, throwaway BOOTTIME filter");
+    super::platform::install_probe_persistent_filter().expect("install a real, throwaway PERSISTENT filter");
+
+    let flags = super::platform::filter_flags_by_key(boottime_guid)
+        .expect("FwpmFilterGetByKey0 must succeed for the boottime probe filter")
+        .expect("boottime probe filter must be live after install");
+    assert!(
+        flags & FWPM_FILTER_FLAG_BOOTTIME.0 != 0,
+        "boottime probe filter must be genuinely BOOTTIME (flags=0x{flags:08x})"
+    );
+
+    let flags = super::platform::filter_flags_by_key(persistent_guid)
+        .expect("FwpmFilterGetByKey0 must succeed for the persistent probe filter")
+        .expect("persistent probe filter must be live after install");
+    assert!(
+        flags & FWPM_FILTER_FLAG_BOOTTIME.0 == 0,
+        "persistent probe filter must NOT be BOOTTIME (flags=0x{flags:08x})"
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    super::release_all(dir.path()).expect("release_all must succeed");
+
+    let flags = super::platform::filter_flags_by_key(boottime_guid)
+        .expect("FwpmFilterGetByKey0 must succeed after release_all");
+    assert!(
+        flags.is_none(),
+        "release_all must remove the boottime probe filter via provider enumeration — it is not in any \
+         fixed sweep array, so a by-key-only delete could never find it; found flags={flags:?}"
+    );
+
+    let flags = super::platform::filter_flags_by_key(persistent_guid)
+        .expect("FwpmFilterGetByKey0 must succeed after release_all");
+    assert!(
+        flags.is_some(),
+        "release_all's provider-enumeration sweep must NOT remove a co-present PERSISTENT filter under \
+         the same provider — found gone (flags={flags:?}), which means the BOOTTIME-only guard in \
+         sweep_boottime_by_provider is broken"
     );
 }
 
