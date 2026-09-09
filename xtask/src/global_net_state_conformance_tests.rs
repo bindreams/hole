@@ -1,14 +1,16 @@
 //! Unit tests for guard 2's structural building blocks (bindreams/hole#894):
 //! [`group_config`], [`job_list_template`], [`narrow_filter`], and
 //! [`set_mismatch`] — and guard 3's (bindreams/hole#999):
-//! [`junit_executed_tests`], [`merge_executed`], and [`set_missing`].
-//! `verify`/`verify_executed` themselves are not unit-tested directly — every
-//! piece of logic they orchestrate is covered here.
+//! [`junit_executed_tests`], [`merge_executed`], the recorded-expectation
+//! handoff, and [`set_missing`]. `verify`/`verify_executed` themselves are not
+//! unit-tested directly — every piece of logic they orchestrate is covered
+//! here.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::global_net_state_conformance::{
-    group_config, job_list_template, junit_executed_tests, merge_executed, narrow_filter, set_mismatch, set_missing,
+    group_config, job_list_template, junit_executed_tests, merge_executed, narrow_filter, read_expectation,
+    set_mismatch, set_missing, write_expectation, Expectation,
 };
 use crate::manifest::Manifest;
 
@@ -305,56 +307,6 @@ fn junit_executed_tests_returns_empty_map_for_a_report_with_no_testcases() {
     assert!(executed.is_empty());
 }
 
-// ===== merge_executed (bindreams/hole#999) ===========================================================================
-
-#[skuld::test]
-fn merge_executed_unions_names_within_a_shared_binary_id() {
-    // The real motivating case: a mocked test runs only in the non-TUN
-    // step's report, a privileged one only in the TUN step's — both must
-    // survive the merge even though neither report alone has both.
-    let non_tun = binmap(&[("tun-engine", &["mocked_release_all_test"])]);
-    let tun = binmap(&[("tun-engine", &["privileged_gateway_test"])]);
-    let merged = merge_executed([non_tun, tun]);
-    assert_eq!(
-        merged["tun-engine"],
-        names(&["mocked_release_all_test", "privileged_gateway_test"])
-    );
-}
-
-#[skuld::test]
-fn merge_executed_unions_across_different_binary_ids() {
-    let a = binmap(&[("hole-bridge", &["x"])]);
-    let b = binmap(&[("tun-engine::gateway_privileged", &["y"])]);
-    let merged = merge_executed([a, b]);
-    assert_eq!(merged.len(), 2);
-    assert_eq!(merged["hole-bridge"], names(&["x"]));
-    assert_eq!(merged["tun-engine::gateway_privileged"], names(&["y"]));
-}
-
-#[skuld::test]
-fn merge_executed_of_a_single_map_is_that_map() {
-    let only = binmap(&[("hole-bridge", &["a", "b"])]);
-    let merged = merge_executed([only.clone()]);
-    assert_eq!(merged, only);
-}
-
-#[skuld::test]
-fn merge_executed_of_zero_maps_is_empty() {
-    let merged = merge_executed(Vec::<BTreeMap<String, BTreeSet<String>>>::new());
-    assert!(merged.is_empty());
-}
-
-#[skuld::test]
-fn merge_executed_deduplicates_a_name_present_in_more_than_one_map() {
-    // A test that happens to run in both partitions (e.g. TUN and non-TUN,
-    // were that ever true for one test) must not produce a duplicate — sets
-    // already guarantee this, but pin it as the documented behavior.
-    let a = binmap(&[("hole-bridge", &["a"])]);
-    let b = binmap(&[("hole-bridge", &["a"])]);
-    let merged = merge_executed([a, b]);
-    assert_eq!(merged["hole-bridge"], names(&["a"]));
-}
-
 // ===== set_missing (bindreams/hole#999) ==============================================================================
 
 #[skuld::test]
@@ -389,4 +341,86 @@ fn set_missing_ignores_tests_executed_but_not_expected() {
     let expected = binmap(&[("hole-bridge", &["a"])]);
     let executed = binmap(&[("hole-bridge", &["a", "z"])]);
     assert!(set_missing(&expected, &executed).is_empty());
+}
+
+// ===== merge_executed (bindreams/hole#999) ===========================================================================
+
+/// The property the whole per-lane-report design rests on: the group spans
+/// BOTH `SKULD_LABELS` lanes, so neither lane's report alone accounts for it
+/// and only their union does. Asserted against each lane individually as
+/// well, so a regression that silently reads one report cannot pass this.
+#[skuld::test]
+fn merge_executed_accounts_for_a_group_that_neither_lane_covers_alone() {
+    let expected = binmap(&[("tun-engine", &["privileged_one", "unprivileged_two"])]);
+    let tun_lane = binmap(&[("tun-engine", &["privileged_one"])]);
+    let non_tun_lane = binmap(&[("tun-engine", &["unprivileged_two"])]);
+
+    assert_eq!(
+        set_missing(&expected, &tun_lane)["tun-engine"],
+        names(&["unprivileged_two"])
+    );
+    assert_eq!(
+        set_missing(&expected, &non_tun_lane)["tun-engine"],
+        names(&["privileged_one"])
+    );
+    assert!(set_missing(&expected, &merge_executed(&[non_tun_lane, tun_lane])).is_empty());
+}
+
+#[skuld::test]
+fn merge_executed_merges_binaries_present_in_only_one_report() {
+    let a = binmap(&[("hole-bridge", &["a"])]);
+    let b = binmap(&[("tun-engine", &["b"])]);
+    let united = merge_executed(&[a, b]);
+    assert_eq!(united.len(), 2);
+    assert_eq!(united["hole-bridge"], names(&["a"]));
+    assert_eq!(united["tun-engine"], names(&["b"]));
+}
+
+#[skuld::test]
+fn merge_executed_of_a_single_report_is_that_report() {
+    let only = binmap(&[("hole-bridge", &["a", "b"])]);
+    assert_eq!(merge_executed(std::slice::from_ref(&only)), only);
+}
+
+#[skuld::test]
+fn merge_executed_of_nothing_is_empty() {
+    assert!(merge_executed(&[]).is_empty());
+}
+
+/// A test present in more than one lane's report — sets already guarantee
+/// this, but pin it as the documented behavior.
+#[skuld::test]
+fn merge_executed_deduplicates_a_name_present_in_more_than_one_report() {
+    let a = binmap(&[("hole-bridge", &["a"])]);
+    let b = binmap(&[("hole-bridge", &["a"])]);
+    assert_eq!(merge_executed(&[a, b])["hole-bridge"], names(&["a"]));
+}
+
+// ===== recorded expectation (bindreams/hole#999) =====================================================================
+
+#[skuld::test]
+fn expectation_round_trips_through_the_recorded_file() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    // A subdirectory that does not exist yet: the recording step writes under
+    // `target/`, which a `cargo xtask` run has created, but the guard must not
+    // depend on that.
+    let path = dir.path().join("nested/expected.json");
+    let recorded = Expectation {
+        job: "test-hole".to_string(),
+        tests: binmap(&[("tun-engine", &["a", "b"]), ("hole-bridge", &["c"])]),
+    };
+
+    write_expectation(&path, &recorded).expect("record");
+    assert_eq!(read_expectation(&path).expect("read back"), recorded);
+}
+
+/// The recording and the reading live in two different ci.yaml steps, so
+/// "someone dropped the recording step" is a real failure mode — it must name
+/// the flag that produces the file rather than surfacing a bare ENOENT.
+#[skuld::test]
+fn read_expectation_names_the_recording_flag_when_the_file_is_absent() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let err = read_expectation(&dir.path().join("absent.json")).expect_err("should error");
+    let msg = err.to_string();
+    assert!(msg.contains("--record"), "{msg}");
 }

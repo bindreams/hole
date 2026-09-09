@@ -403,9 +403,19 @@ jobs:
       # `global_net_state` cross-binary serialization group. That reads as an
       # intermittent flake, not the rename that caused it — see
       # bindreams/hole#894.
+      #
+      # `--record` additionally writes the membership it just verified out for
+      # the execution proof below (bindreams/hole#999) to read back. Taken
+      # HERE, before the test steps: the listing is the same one this guard
+      # already computes, and re-deriving it afterwards would both cost a
+      # second `cargo nextest list` (64s-3m30s measured on this leg, which
+      # runs closest to its job wall) and introduce a second, unverified
+      # derivation of the very set this guard exists to pin.
       - name: Verify global_net_state label matches the nextest.toml filter
         shell: bash
-        run: cargo xtask verify-global-net-state-labels --job test-hole
+        run: >
+          cargo xtask verify-global-net-state-labels --job test-hole
+          --record target/global-net-state-expected.json
 
       # `--no-default-features` mirrors the `hole-tests` xtask target. Without
       # it Cargo recompiles `hole` with `tauri/custom-protocol` ON (different
@@ -441,10 +451,11 @@ jobs:
       # DISCLOSED RESIDUAL: these are not a guarantee that the step always
       # loses the race to the job wall. On the windows leg (60) a hung TUN step
       # can still reach the wall first when the build and non-TUN steps both
-      # run long (17 + 4 + 19 + 25 = 65). Bounding that away would mean either
-      # budgets too tight to survive an honest slow run or a wall raised past
-      # what the measurements support, so it is left stated rather than fixed;
-      # the common case — one step hangs while the others run normally — is
+      # run long (17 + 4 + 19 + 25 + 3 = 68, the trailing 3 being the #999
+      # execution proof below). Bounding that away would mean either budgets
+      # too tight to survive an honest slow run or a wall raised past what the
+      # measurements support, so it is left stated rather than fixed; the
+      # common case — one step hangs while the others run normally — is
       # covered on every leg.
       - name: Test (non-TUN)
         id: test-non-tun
@@ -461,16 +472,17 @@ jobs:
               + package(handle-holders) + package(tombstone)
               + package(hole-test-observability)'
 
-      # `[profile.default.junit]` overwrites the same `junit.xml` on every
-      # `cargo nextest run` invocation on this profile, and not every
-      # `global_net_state`-labeled test is privileged: some are mocked unit
-      # tests that never carry `TUN` (bindreams/hole#894 "Option B") and so
-      # run HERE, in the non-TUN partition, never in the TUN step below.
-      # Without this copy their PASS record would be gone by the time guard 3
-      # (below) reads the file — bindreams/hole#999.
-      - name: "Preserve non-TUN JUnit report for guard 3 (#999)"
+      # Every `cargo nextest run --profile default` overwrites the SAME
+      # `[profile.default.junit].path`, so the last lane to run is the only one
+      # whose report survives — and the `global_net_state` group spans both
+      # lanes (its `.config/nextest.toml` filter matches by name substring and
+      # deliberately sweeps in unprivileged `release_all_` /
+      # `gateway_global_net_state_` cases, which carry no `tun` label and so
+      # run HERE, not in the TUN step). Copying each lane's report aside is
+      # what lets the proof below account for the whole group instead of
+      # whichever fraction ran last. bindreams/hole#999.
+      - name: "Save the non-TUN lane's JUnit report (#999)"
         if: matrix.os == 'windows' && matrix.arch == 'amd64'
-        timeout-minutes: 2
         shell: bash
         run: cp target/nextest/default/junit.xml target/nextest/default/junit-non-tun.xml
 
@@ -498,28 +510,44 @@ jobs:
               + package(handle-holders) + package(tombstone)
               + package(hole-test-observability)'
 
+      - name: "Save the TUN lane's JUnit report (#999)"
+        if: matrix.os == 'windows' && matrix.arch == 'amd64'
+        shell: bash
+        run: cp target/nextest/default/junit.xml target/nextest/default/junit-tun.xml
+
       # Guard 2 above (`verify-global-net-state-labels`) only proves the
       # `global_net_state` group's tests were SELECTABLE; a job that silently
       # ran zero of them (e.g. nextest's own group/filter machinery
-      # mis-scheduling on Windows) would still read as green. This reads BOTH
-      # the preserved non-TUN report and the JUnit report the "Test (TUN,
-      # ...)" step just wrote (`.config/nextest.toml`'s
-      # `[profile.default.junit]`) and confirms every `global_net_state`-
-      # labeled test shows up as actually executed in at least one of them —
-      # bindreams/hole#999. Windows-only: this is the one leg the issue's
-      # premise was about, and this is the first landing of the check —
-      # `continue-on-error` keeps it non-blocking until it's proven stable
-      # (safer than risking every PR's required check on a brand-new guard;
-      # can be promoted to required once green over a few runs).
-      - name: "Verify global_net_state tests actually executed (Windows, #999)"
+      # mis-scheduling on Windows) would still read as green. This diffs the
+      # membership guard 2 recorded against the two lane reports saved above
+      # and fails on any member that never shows up as executed —
+      # bindreams/hole#999.
+      #
+      # WINDOWS LEG ONLY, and the name says so: the darwin legs write the same
+      # single JUnit path and would need the same per-lane copies, but their
+      # job walls are the scarce resource this repo protects, so extending the
+      # proof there is a separate, separately-measured decision. Nothing here
+      # claims the group is proven executed anywhere else.
+      #
+      # No status function in the `if:`, so GitHub ANDs in `success()`: when a
+      # test step fails, this is skipped. Deliberate — the proof answers "did
+      # everything run", which is only interesting once "did everything pass"
+      # is already yes; a failed test step is its own, louder signal, and the
+      # lane reports it leaves behind are partial by construction.
+      #
+      # Blocking (no `continue-on-error`): the check is a set diff over two
+      # files plus a recorded listing, with no network, no test execution and
+      # no timing — it has no flake surface of its own, and a non-blocking
+      # version of it could not distinguish a real regression from noise.
+      - name: "Verify every global_net_state test executed (windows leg, #999)"
         if: matrix.os == 'windows' && matrix.arch == 'amd64'
-        continue-on-error: true
-        timeout-minutes: 5
+        timeout-minutes: 3
         shell: bash
         run: >
-          cargo xtask verify-global-net-state-executed --job test-hole
+          cargo xtask verify-global-net-state-executed
+          --expected target/global-net-state-expected.json
           --junit target/nextest/default/junit-non-tun.xml
-          --junit target/nextest/default/junit.xml
+          --junit target/nextest/default/junit-tun.xml
 
       # macOS TUN lane runs UNDER ROOT: the lockdown real-engage test (#527)
       # drives `pfctl -E`/`-f`, which require root. The runner's cargo/nextest

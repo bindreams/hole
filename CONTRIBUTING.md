@@ -1993,6 +1993,19 @@ Spotlight "Hole" must reveal it.
   `[[profile.default.overrides]]` entry stealing these tests into a different
   group, and its universe is `test-hole`'s package set even though the
   nextest.toml filter applies workspace-wide.
+- **`global_net_state` execution proof** — membership being correct still says
+  nothing about whether those tests *ran*; a job that silently executed zero of
+  them reads exactly as green as one that executed them all. `--record` has the
+  label guard write its verified membership out before the test steps; after
+  them, `cargo xtask verify-global-net-state-executed` diffs that set against
+  the tests nextest's JUnit reports say actually executed (present, not
+  `<skipped>`) and fails by exact name on any that never appear (#999). The
+  group spans BOTH `SKULD_LABELS` lanes — the name-substring filter deliberately
+  sweeps in unprivileged cases — and every lane overwrites the one
+  `[profile.default.junit]` path, so ci.yaml copies each lane's report aside and
+  the guard reads their union. Windows leg only: extending it to the darwin legs
+  needs the same per-lane copies and its own budget measurement against those
+  jobs' walls.
 
 ### Datapath coverage: which lane proves what
 

@@ -350,30 +350,32 @@ pub enum Command {
         /// test-running nextest command shape).
         #[arg(long, default_value = "test-hole")]
         job: String,
+        /// Also record the verified group membership here (relative to the
+        /// repo root unless absolute), for a later
+        /// `verify-global-net-state-executed` step in the same job to read
+        /// back. Written only when the check above passes.
+        #[arg(long)]
+        record: Option<PathBuf>,
     },
-    /// Verify that the `global_net_state`-labeled tests `job_id`'s own
-    /// nextest command template selects actually ran — present, non-skipped
-    /// — in a nextest JUnit report, not merely that they were selectable
-    /// (guard 2 above already covers that) — see
+    /// Verify that every `global_net_state` test recorded by
+    /// `verify-global-net-state-labels --record` actually ran — present,
+    /// non-skipped — in this job's per-lane nextest JUnit reports, not merely
+    /// that it was selectable (guard 2 above already covers that) — see
     /// `xtask::global_net_state_conformance::verify_executed`
     /// (bindreams/hole#999).
     VerifyGlobalNetStateExecuted {
-        /// ci.yaml job id to check (its steps must include exactly one
-        /// test-running nextest command shape).
-        #[arg(long, default_value = "test-hole")]
-        job: String,
-        /// Path to a nextest JUnit report, resolved relative to the repo
-        /// root if not absolute. Matches `.config/nextest.toml`'s
-        /// `[profile.default.junit].path` under `target/nextest/<profile>/`.
-        /// Repeatable: `.config/nextest.toml`'s single `junit.path` is
-        /// overwritten by every `cargo nextest run` invocation on that
-        /// profile, and `global_net_state`-labeled tests can legitimately
-        /// execute in more than one of `job_id`'s nextest-run steps — pass
-        /// one `--junit` per step whose report should count, in step order;
-        /// their executed-test sets are unioned. Defaults to the one
-        /// standard path if none are given.
-        #[arg(long = "junit")]
-        junit: Vec<PathBuf>,
+        /// The membership file `verify-global-net-state-labels --record`
+        /// wrote earlier in this job, relative to the repo root unless
+        /// absolute.
+        #[arg(long)]
+        expected: PathBuf,
+        /// One nextest JUnit report per `SKULD_LABELS` lane, relative to the
+        /// repo root unless absolute. The group spans BOTH lanes and every
+        /// lane overwrites `[profile.default.junit].path`, so the reports
+        /// must be copied aside per lane and all passed here — see
+        /// `xtask::global_net_state_conformance`. Repeat the flag per lane.
+        #[arg(long = "junit", required = true)]
+        junits: Vec<PathBuf>,
     },
 }
 
@@ -456,9 +458,11 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             Ok(())
         }
         Command::VerifySkuldLabelCoverage { job } => skuld_label_coverage::verify(&repo_root()?, &job),
-        Command::VerifyGlobalNetStateLabels { job } => global_net_state_conformance::verify(&repo_root()?, &job),
-        Command::VerifyGlobalNetStateExecuted { job, junit } => {
-            global_net_state_conformance::verify_executed(&repo_root()?, &job, &junit)
+        Command::VerifyGlobalNetStateLabels { job, record } => {
+            global_net_state_conformance::verify(&repo_root()?, &job, record.as_deref())
+        }
+        Command::VerifyGlobalNetStateExecuted { expected, junits } => {
+            global_net_state_conformance::verify_executed(&repo_root()?, &expected, &junits)
         }
     }
 }

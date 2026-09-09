@@ -24,32 +24,40 @@
 //! Guard 3 (bindreams/hole#999) answers a different question: not "is the
 //! `global_net_state` group's membership correct" (guard 2), but "did the
 //! tests it selected on THIS run actually execute" — closing the gap where a
-//! job that silently ran zero of them would still look green. [`run_nextest_list`]
-//! (reused from guard 1/2) gives the `global_net_state`-labeled tests a given
-//! `job_id` step template *should* select; [`junit_executed_tests`] reads
-//! nextest's own JUnit report (`.config/nextest.toml`'s
-//! `[profile.default.junit]`) for the tests that actually ran (present,
-//! un-skipped); [`set_missing`] diffs the two one-directionally.
+//! job that silently ran zero of them would still look green.
 //!
-//! A single JUnit report is not always enough: `[profile.default.junit]`
-//! overwrites the same file on every `cargo nextest run` invocation, and not
-//! every `global_net_state`-labeled test is privileged — some are mocked
-//! unit tests that preserve the nextest.toml filter's membership without
-//! carrying `TUN` (bindreams/hole#894 "Option B"), so they run in the
-//! non-TUN partition and never in the TUN one. [`verify_executed`] therefore
-//! takes one JUnit path per nextest-run step that might contain a
-//! `global_net_state` test and [`merge_executed`] unions their executed sets
-//! before diffing — a lone report from whichever step ran last would
-//! otherwise call an earlier-only test "missing" despite it having passed.
-//! [`verify_executed`] orchestrates all four and fails loudly, by exact test
-//! name, on any test that was selected but never shows up as executed in any
-//! of them.
+//! The group is NOT a subset of any one `SKULD_LABELS` lane. Its
+//! `.config/nextest.toml` filter selects by name substring and deliberately
+//! sweeps in unprivileged cases (`release_all_`, `gateway_global_net_state_`)
+//! that carry no `tun` label, so they run in the `"!tun"` step while the
+//! privileged members run in the `"tun"` one. Every lane writes the same
+//! `target/nextest/default/junit.xml`, each overwriting the last, so the
+//! report a single lane leaves behind can never account for the whole group.
+//! ci.yaml therefore copies each lane's report aside and hands guard 3 all of
+//! them; [`merge_executed`] merges them back into the one set the job as a
+//! whole executed.
+//!
+//! The expectation is likewise NOT re-derived here. Guard 2's step already
+//! lists the group's live membership *before* the test steps run, and records
+//! it ([`write_expectation`]); guard 3 reads it back ([`read_expectation`]).
+//! Re-listing after the run would cost a second `cargo nextest list` — 64s to
+//! 3m30s measured on the windows leg, which runs closest to its job wall —
+//! and would introduce a second, unverified derivation of the very set guard
+//! 2 exists to pin.
+//!
+//! [`junit_executed_tests`] reads nextest's own JUnit report
+//! (`.config/nextest.toml`'s `[profile.default.junit]`) for the tests that
+//! actually ran (present, un-skipped); [`set_missing`] diffs expectation
+//! against union one-directionally. [`verify_executed`] orchestrates them and
+//! fails loudly, by exact test name, on any test that was selected but never
+//! shows up as executed.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, ensure, Context, Result};
 use roxmltree::Document;
+use serde::{Deserialize, Serialize};
 
 use crate::ci_coverage;
 use crate::manifest::Manifest;
@@ -195,7 +203,13 @@ pub(crate) fn set_mismatch(
 /// filter and its skuld label select the exact same live tests. Fails
 /// loudly, by exact test name in both directions per binary, on any
 /// divergence.
-pub fn verify(repo_root: &Path, job_id: &str) -> Result<()> {
+///
+/// `record` additionally writes the verified membership out for guard 3
+/// ([`verify_executed`]) to read after the test steps have run — see this
+/// module's doc for why guard 3 does not list it again itself. Written only
+/// once the conformance check above has passed, so the file never carries a
+/// set this guard would have rejected.
+pub fn verify(repo_root: &Path, job_id: &str, record: Option<&Path>) -> Result<()> {
     let ci_yaml = std::fs::read_to_string(repo_root.join(".github/workflows/ci.yaml")).context("read ci.yaml")?;
     let nextest_toml =
         std::fs::read_to_string(repo_root.join(".config/nextest.toml")).context("read .config/nextest.toml")?;
@@ -234,6 +248,20 @@ pub fn verify(repo_root: &Path, job_id: &str) -> Result<()> {
             "xtask: global_net_state label conformance OK for job {job_id:?} — the nextest.toml \
              filter and the {LABEL_NAME:?} label select the exact same tests"
         );
+        if let Some(path) = record {
+            let path = absolutize(repo_root, path);
+            write_expectation(
+                &path,
+                &Expectation {
+                    job: job_id.to_string(),
+                    tests: label_matched,
+                },
+            )?;
+            println!(
+                "xtask: recorded the group's membership for the execution proof at {}",
+                path.display()
+            );
+        }
         return Ok(());
     }
 
@@ -314,105 +342,119 @@ pub(crate) fn set_missing(
 
 // merge_executed (bindreams/hole#999) =================================================================================
 
-/// Union several [`junit_executed_tests`] maps into one, per binary-id. Not
-/// every `global_net_state`-labeled test is privileged: the group also
-/// deliberately carries mocked, non-privileged tests that preserve the
-/// `.config/nextest.toml` name-substring filter's membership without
-/// mutating real OS state (bindreams/hole#894 "Option B" — e.g.
-/// `release_all_first_delete_failure_reports_the_first_real_error_and_inspects_every_code`,
-/// which never carries `TUN` and so runs only in the non-TUN partition,
-/// never the TUN one). A JUnit report is one nextest invocation's output
-/// (`[profile.default.junit]` overwrites the same file on every `cargo
-/// nextest run`), so proving every labeled test executed *somewhere* across
-/// `job_id`'s several nextest-run steps needs each step's report unioned —
-/// a lone report from the last step to run would otherwise call a test that
-/// only ran earlier "missing", despite it having passed.
-pub(crate) fn merge_executed(
-    maps: impl IntoIterator<Item = BTreeMap<String, BTreeSet<String>>>,
-) -> BTreeMap<String, BTreeSet<String>> {
+/// Every test any lane's report says executed, merged per binary-id. The
+/// group spans both `SKULD_LABELS` lanes, so this — not any single report —
+/// is what the expectation is diffed against.
+pub(crate) fn merge_executed(reports: &[BTreeMap<String, BTreeSet<String>>]) -> BTreeMap<String, BTreeSet<String>> {
     let mut out: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-    for map in maps {
-        for (binary_id, names) in map {
-            out.entry(binary_id).or_default().extend(names);
+    for report in reports {
+        for (binary_id, names) in report {
+            out.entry(binary_id.clone()).or_default().extend(names.iter().cloned());
         }
     }
     out
 }
 
+// Recorded expectation (bindreams/hole#999) ===========================================================================
+
+/// The `global_net_state` group's live membership as guard 2 verified it,
+/// handed across ci.yaml steps to guard 3.
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct Expectation {
+    /// The ci.yaml job the listing was taken for — carried so guard 3's
+    /// messages can name it without re-reading ci.yaml.
+    pub job: String,
+    /// Per binary-id, the test names the group contains.
+    pub tests: BTreeMap<String, BTreeSet<String>>,
+}
+
+/// `path` if absolute, else resolved against `repo_root`.
+fn absolutize(repo_root: &Path, path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        repo_root.join(path)
+    }
+}
+
+pub(crate) fn write_expectation(path: &Path, expectation: &Expectation) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+    }
+    let json = serde_json::to_string_pretty(expectation).context("serializing the recorded expectation")?;
+    std::fs::write(path, json).with_context(|| format!("writing the recorded expectation to {}", path.display()))
+}
+
+pub(crate) fn read_expectation(path: &Path) -> Result<Expectation> {
+    let json = std::fs::read_to_string(path).with_context(|| {
+        format!(
+            "reading the recorded {LABEL_NAME} expectation at {} — it is written by \
+             `cargo xtask verify-global-net-state-labels --record`, which must run (and pass) \
+             earlier in the same job",
+            path.display()
+        )
+    })?;
+    serde_json::from_str(&json).with_context(|| format!("parsing the recorded expectation at {}", path.display()))
+}
+
 // verify_executed (bindreams/hole#999) ================================================================================
 
-/// `.config/nextest.toml`'s standard JUnit report path, used when
-/// [`verify_executed`] is given no `--junit` path at all.
-const DEFAULT_JUNIT_PATH: &str = "target/nextest/default/junit.xml";
+/// Run guard 3: read the `global_net_state` membership guard 2 recorded
+/// before the test steps ran, then confirm every one of those tests appears
+/// as executed (non-skipped) in at least one of `junit_paths` — the per-lane
+/// JUnit reports ci.yaml copied aside after each `cargo nextest run`. Paths
+/// are resolved against `repo_root` when relative. Fails loudly, by exact
+/// test name, on any that don't: proof the job didn't just SELECT these tests
+/// but actually RAN them.
+pub fn verify_executed(repo_root: &Path, expected_path: &Path, junit_paths: &[PathBuf]) -> Result<()> {
+    ensure!(
+        !junit_paths.is_empty(),
+        "guard 3 needs at least one --junit report to read; with none it would confirm nothing \
+         (bindreams/hole#999)"
+    );
 
-/// Run guard 3 for `job_id`: list the tests the `global_net_state` skuld
-/// label selects for `job_id`'s own nextest command template (the same
-/// listing guard 2's `label_matched` computes), then confirm every one of
-/// them appears as executed (non-skipped) in at least one of `junit_paths`'
-/// JUnit reports (each resolved relative to `repo_root` if not absolute;
-/// defaults to the one standard path if `junit_paths` is empty). Fails
-/// loudly, by exact test name, on any that don't — proving the privileged
-/// lane didn't just SELECT these tests but actually RAN them.
-pub fn verify_executed(repo_root: &Path, job_id: &str, junit_paths: &[PathBuf]) -> Result<()> {
-    let ci_yaml = std::fs::read_to_string(repo_root.join(".github/workflows/ci.yaml")).context("read ci.yaml")?;
-    let manifest = Manifest::parse(&std::fs::read_to_string(repo_root.join("build.yaml")).context("read build.yaml")?)
-        .context("parse build.yaml")?;
-
-    let template = job_list_template(&ci_yaml, &manifest, job_id)?;
-    let expected = run_nextest_list(repo_root, &template, Some(LABEL_NAME))?;
+    let expectation = read_expectation(&absolutize(repo_root, expected_path))?;
+    let job_id = &expectation.job;
 
     // Same defense as guard 2 (bindreams/hole#865 audit finding 4): a
     // vacuously-empty expectation would make an all-zero JUnit report pass
     // just as cleanly as a real one.
-    let any_expected = expected.values().any(|s| !s.is_empty());
     ensure!(
-        any_expected,
-        "job {job_id:?}: the {LABEL_NAME:?} label selected ZERO tests — guard 3 has nothing to confirm \
+        expectation.tests.values().any(|s| !s.is_empty()),
+        "job {job_id:?}: the recorded {LABEL_NAME:?} membership is EMPTY — guard 3 has nothing to confirm \
          actually ran, which defeats it as surely as a real execution gap would (bindreams/hole#999)"
     );
 
-    let default_paths = [PathBuf::from(DEFAULT_JUNIT_PATH)];
-    let junit_paths: &[PathBuf] = if junit_paths.is_empty() {
-        &default_paths
-    } else {
-        junit_paths
-    };
-
-    let mut junit_abs_paths = Vec::with_capacity(junit_paths.len());
-    let mut executed_maps = Vec::with_capacity(junit_paths.len());
+    let mut reports = Vec::new();
     for junit_path in junit_paths {
-        let junit_abs = if junit_path.is_absolute() {
-            junit_path.clone()
-        } else {
-            repo_root.join(junit_path)
-        };
+        let junit_abs = absolutize(repo_root, junit_path);
         let junit_xml = std::fs::read_to_string(&junit_abs)
             .with_context(|| format!("reading JUnit report at {}", junit_abs.display()))?;
-        executed_maps.push(junit_executed_tests(&junit_xml)?);
-        junit_abs_paths.push(junit_abs);
+        reports.push(junit_executed_tests(&junit_xml)?);
     }
-    let executed = merge_executed(executed_maps);
-    let junit_paths_display = junit_abs_paths
-        .iter()
-        .map(|p| p.display().to_string())
-        .collect::<Vec<_>>()
-        .join(", ");
+    let executed = merge_executed(&reports);
 
-    let missing = set_missing(&expected, &executed);
+    let missing = set_missing(&expectation.tests, &executed);
     if missing.is_empty() {
-        let total: usize = expected.values().map(BTreeSet::len).sum();
+        let total: usize = expectation.tests.values().map(BTreeSet::len).sum();
         println!(
-            "xtask: global_net_state execution proof OK for job {job_id:?} — all {total} {LABEL_NAME:?}-labeled \
-             test(s) appear as executed (non-skipped) across the JUnit report(s) at {junit_paths_display}"
+            "xtask: global_net_state execution proof OK for job {job_id:?} — all {total} {LABEL_NAME:?} test(s) \
+             appear as executed (non-skipped) across {} lane report(s)",
+            junit_paths.len()
         );
         return Ok(());
     }
 
     let missing_count: usize = missing.values().map(BTreeSet::len).sum();
     let mut msg = format!(
-        "job {job_id:?}: {missing_count} {LABEL_NAME:?}-labeled test(s) were selected but do NOT appear as \
-         executed (non-skipped) in any of the JUnit report(s) at {junit_paths_display} — a green job that \
-         silently ran zero (or fewer than expected) of these tests (bindreams/hole#999):\n"
+        "job {job_id:?}: {missing_count} {LABEL_NAME:?} test(s) were selected but do NOT appear as executed \
+         (non-skipped) in any of this job's lane JUnit reports ({}) — a green job that silently ran zero (or \
+         fewer than expected) of these tests (bindreams/hole#999):\n",
+        junit_paths
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
     );
     for (binary_id, names) in &missing {
         msg.push_str(&format!("  {binary_id}:\n"));

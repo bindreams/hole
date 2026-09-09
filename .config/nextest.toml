@@ -184,17 +184,20 @@ slow-timeout = { period = "30s", terminate-after = 2 }
 filter = 'test(/^(echo_records_round_trip_byte_counts_and_ttfb|silent_drop_records_zero_bytes_and_no_ttfb|silent_after_read_matches_248_shape|rst_close_classified_as_rst_with_os_errno|shutdown_cancels_in_flight_connection_without_panic|cross_check_inbound_and_upstream_counters_match)$/)'
 slow-timeout = { period = "20s", terminate-after = 2 }
 
-# Every `cargo nextest run --profile default` invocation overwrites
-# `target/nextest/default/junit.xml` (nextest, not appended). `test-hole`'s
-# Windows leg runs "Test (non-TUN)" then "Test (TUN, runs last for #200)"
-# sequentially on this profile, so by the time the TUN step's file exists it
-# reflects ONLY the TUN run — not every `global_net_state`-labeled test lives
-# there, since some are mocked and only run in the non-TUN partition
-# (bindreams/hole#894 "Option B"). ci.yaml's "Preserve non-TUN JUnit report
-# for guard 3" step copies this file aside before it gets overwritten, and
-# `cargo xtask verify-global-net-state-executed` (bindreams/hole#999) reads
-# both copies to confirm those tests didn't just get *selected* (guard 2,
-# #894) but actually *ran*: a green job that silently ran zero of them would
-# otherwise look identical to one that ran them all.
+# `cargo xtask verify-global-net-state-executed` (bindreams/hole#999) parses
+# this report to confirm the `global_net_state` group's tests didn't just get
+# *selected* (guard 2, #894) but actually *ran*: a green job that silently ran
+# zero of them would otherwise look identical to one that ran them all.
+#
+# Every `cargo nextest run --profile default` invocation OVERWRITES this file
+# (nextest, not appended), and the group spans both of `test-hole`'s
+# `SKULD_LABELS` lanes — the filter above matches by name substring and
+# deliberately sweeps in unprivileged cases that carry no `tun` label. So no
+# single lane's report accounts for the group, and ci.yaml copies each lane's
+# report aside (`junit-non-tun.xml` / `junit-tun.xml`) before the next run
+# clobbers it. A per-lane profile with its own `path` is not available: the
+# `ci_test_hole_steps_match_the_hole_tests_target` conformance test holds every
+# test-hole nextest step equal to build.yaml's `hole-tests` target, so the two
+# lanes cannot differ by a `--profile` flag.
 [profile.default.junit]
 path = "junit.xml"
