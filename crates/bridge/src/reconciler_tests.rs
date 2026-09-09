@@ -939,3 +939,41 @@ fn the_decision_predicate_catches_every_pattern_matching_form() {
         assert!(!line_decides(line), "predicate flagged a construction site: {line:?}");
     }
 }
+
+// Boot auto-connect fails OPEN ========================================================================================
+
+/// A boot auto-connect that fails must leave the host REACHABLE, not blocked.
+///
+/// The transient block-until-connected cover is engaged without the user ever
+/// asking for a kill switch, so a bug anywhere in the connect path would strand
+/// them with no network and no obvious cause. That trade is only acceptable
+/// where the user opted in: with the lockdown intent ON the standing cover
+/// still engages and still holds, which this test deliberately does not touch.
+#[skuld::test]
+fn a_failed_boot_connect_leaves_the_host_reachable() {
+    rt().block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        // Kill switch OFF — the only case where the transient cover decides
+        // the outcome. With it on, the standing cover governs instead.
+        lockdown_state::set_enabled(dir.path(), false, None).unwrap();
+        target::save(dir.path(), &connectable(), None).unwrap();
+
+        let routing = MockRouting::new(dir.path().to_path_buf());
+        let state = routing.state();
+        let pm = ProxyManager::new(MockProxy::failing_start(), routing).with_state_dir(dir.path().to_path_buf());
+        let proxy = Arc::new(Mutex::new(pm));
+
+        reconcile_once(dir.path(), None, &proxy, &never_cancelled()).await;
+
+        assert_eq!(
+            state.cover_engage_calls.load(Ordering::SeqCst),
+            0,
+            "a boot auto-connect must not engage the transient fail-closed cover: a failure \
+             anywhere in the connect path would leave the user with no network"
+        );
+        assert!(
+            !proxy.lock().await.blocked_until_connected(),
+            "a failed boot connect must not leave the host in the blocked state"
+        );
+    });
+}

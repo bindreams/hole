@@ -67,7 +67,7 @@ impl MockProxy {
         }
     }
 
-    fn failing_start() -> Self {
+    pub(crate) fn failing_start() -> Self {
         let m = Self::new();
         m.state.fail_start.store(true, Ordering::SeqCst);
         m

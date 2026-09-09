@@ -289,9 +289,10 @@ pub fn step_order(cover: CoverStep, tunnel: TunnelStep) -> [Phase; 2] {
 /// So `Phase::Cover(Engage)` is a no-op in this driver — the standing cover's
 /// actual engage happens inside `start_cancellable`'s own
 /// `standing_cover_expected()` gate, once the TUN device and routes it needs
-/// exist. The `covered = true` argument to `start_cancellable` is what holds
-/// a loopback+server transient cover across that connect window when the
-/// lockdown intent is off.
+/// exist. `start_cancellable` is called with `covered = false`, so no
+/// transient cover holds the connect window when the lockdown intent is off —
+/// a boot auto-connect that fails leaves the host reachable rather than
+/// blocked.
 ///
 /// Before deciding anything, the persisted target is folded through
 /// `target::resolve_startup_target` against the GUI-pushed startup
@@ -363,7 +364,15 @@ pub async fn reconcile_once<P, R, D>(
                 // SCM Stop arriving mid-boot abandons the auto-connect instead
                 // of racing it. A token minted here would be one
                 // nothing else holds: uncancellable by construction.
-                if let Err(error) = pm.start_cancellable(config, true, cancel.child_token()).await {
+                // `covered = false`: a boot auto-connect that fails leaves the
+                // host REACHABLE. The transient block-until-connected cover
+                // would block all egress on a path the user never opted into,
+                // so any bug in the connect sequence strands them with no
+                // network and no visible cause — a worse failure than the leak
+                // it prevents. Users who want the strict trade turn the kill
+                // switch on, which engages the STANDING cover instead; that
+                // path is untouched and still holds on failure.
+                if let Err(error) = pm.start_cancellable(config, false, cancel.child_token()).await {
                     tracing::warn!(%error, "reconcile_once: failed to start the persisted target");
                 }
             }
