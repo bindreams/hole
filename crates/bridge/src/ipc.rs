@@ -1,14 +1,17 @@
 //! IPC server — HTTP/1.1 REST API over local Unix domain socket.
 
-use tun_engine::routing::Routing;
+use tun_engine::routing::failclosed::lockdown_state;
+use tun_engine::routing::{CoverPresence, Routing};
 
 use crate::proxy::{Proxy, ProxyError};
-use crate::proxy_manager::{LockdownOffOutcome, ProxyManager, ProxyState};
+use crate::proxy_manager::{ProxyManager, ProxyState};
 use crate::server_test::{run_server_test, TestConfig};
 use crate::socket::LocalListener;
+use crate::target::{self, Target};
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::Json;
+use hole_common::config::StartupBehavior;
 use hole_common::protocol::{
     DiagnosticsResponse, EmptyResponse, ErrorResponse, LockdownRequest, MetricsResponse, ProxyConfig, StartError,
     StatusResponse, TestServerRequest, TestServerResponse, UpdateApplyRequest, VersionResponse, ROUTE_CANCEL,
@@ -52,6 +55,20 @@ fn attempt_id_from(headers: &axum::http::HeaderMap) -> AttemptId {
         .to_owned()
 }
 
+/// The `X-Hole-On-Startup` request header carrying the GUI's current startup
+/// preference on `POST /v1/start` (#979, #617) — see `crate::target`.
+const ON_STARTUP_HEADER: &str = "x-hole-on-startup";
+
+/// Read the startup preference from a request's `X-Hole-On-Startup` header.
+/// A genuinely absent header — an older client that doesn't know about it,
+/// or the CLI, which has no preference to push (#979) — reads `None`: the
+/// bridge keeps whatever preference (if any) it already has, rather than
+/// stomping it with the wire default. A present-but-garbled value still
+/// fails safe to the default.
+fn on_startup_from(headers: &axum::http::HeaderMap) -> Option<StartupBehavior> {
+    StartupBehavior::from_header_value(headers.get(ON_STARTUP_HEADER).and_then(|v| v.to_str().ok()))
+}
+
 /// Per-attempt start-cancellation handoff. Held in a `std::sync::Mutex` because
 /// all access is a trivial read/write of a small struct, never held across
 /// `.await`, and the sync lock avoids any coupling with the async proxy mutex.
@@ -76,6 +93,32 @@ pub struct StartCancelState {
 /// start-cancellation handoff struct.
 pub struct IpcState<P: Proxy, R: Routing> {
     pub proxy: Arc<Mutex<ProxyManager<P, R>>>,
+    /// The SAME `Arc<R>` `proxy`'s `ProxyManager` holds internally, cloned
+    /// once at bind time via `ProxyManager::routing_handle`. Lets
+    /// `handle_unblock` act on routing (read presence, release covers)
+    /// WITHOUT taking `proxy.lock()` — the escape must work even while a
+    /// teardown wedges that lock.
+    pub routing: Arc<R>,
+    /// The SAME `Arc<AtomicBool>` `proxy`'s `ProxyManager` holds internally,
+    /// cloned once at bind time via `ProxyManager::cover_invalidation_handle`
+    /// — the same derivation pattern as `routing` above. `handle_unblock`
+    /// sets this after releasing every OS-level cover, lock-free, so a
+    /// concurrent `start_cancellable` (which does hold `proxy.lock()`) can
+    /// tell its own `Posture::PendingStart` guard is a zombie the next time
+    /// it looks.
+    pub cover_invalidated: Arc<std::sync::atomic::AtomicBool>,
+    /// Bumped by `handle_unblock` from INSIDE its `target::apply` closure, so
+    /// the increment is serialised against every other target write by the
+    /// same file lock. `handle_start`/`handle_reload` snapshot it before
+    /// touching the proxy and hand the snapshot to `persist_after_start`,
+    /// which declines its write if the counter moved — the compare-and-set
+    /// half of f745e03c that the proxy lock cannot provide, because
+    /// `handle_unblock` deliberately takes no proxy lock.
+    ///
+    /// A counter rather than `cover_invalidated`: that flag is consumed by
+    /// `start_cancellable`, which `reload`'s hot-swap path never calls, so a
+    /// single stale unblock would wedge every later hot-swap reload's write.
+    pub unblock_generation: Arc<std::sync::atomic::AtomicU64>,
     // std::sync::Mutex — never held across .await. See StartCancelState docs.
     pub start_cancel: Arc<std::sync::Mutex<StartCancelState>>,
     /// This bridge's build version, stamped on every response
@@ -90,6 +133,15 @@ pub struct IpcState<P: Proxy, R: Routing> {
     /// user's profile (e.g. the cutover marker) are chowned back to them.
     /// `None` for the `--service` daemon, whose dirs are root-owned by design.
     pub owner: Option<(u32, u32)>,
+    /// Test-only rendezvous, mirroring `MockProxy`'s `start_gate`/
+    /// `start_entered`: if set, `persist_after_start` fires `persist_entered`
+    /// on entry, then awaits `persist_gate`, before doing any write. Lets a
+    /// test park a second request exactly inside the persist window
+    /// `handle_start`'s lock now spans, instead of racing scheduler timing.
+    #[cfg(test)]
+    pub(crate) persist_gate: Option<Arc<tokio::sync::Notify>>,
+    #[cfg(test)]
+    pub(crate) persist_entered: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
 }
 
 // Server ==============================================================================================================
@@ -126,13 +178,30 @@ impl IpcServer {
         #[cfg(not(test))]
         apply_socket_permissions(path);
 
+        // `try_lock` is safe here: `proxy` is freshly constructed and not yet
+        // shared with any other task at this call site, in every production
+        // and test caller — uncontended by construction. Deriving the
+        // routing handle this way (rather than threading a new parameter)
+        // keeps every existing `bind`/`bind_with_dirs` call site unchanged.
+        let (routing, cover_invalidated) = {
+            let guard = proxy.try_lock().expect("proxy mutex must be uncontended at bind time");
+            (guard.routing_handle(), guard.cover_invalidation_handle())
+        };
+
         let state = Arc::new(IpcState {
             proxy,
+            routing,
+            cover_invalidated,
+            unblock_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             start_cancel: Arc::new(std::sync::Mutex::new(StartCancelState::default())),
             version: version.to_owned(),
             log_dir,
             state_dir,
             owner,
+            #[cfg(test)]
+            persist_gate: None,
+            #[cfg(test)]
+            persist_entered: std::sync::Mutex::new(None),
         });
         let router = build_router(state, version);
         Ok(Self {
@@ -279,26 +348,83 @@ fn build_router<P: Proxy + 'static, R: Routing + 'static>(state: Arc<IpcState<P,
 async fn handle_status<P: Proxy + 'static, R: Routing + 'static>(
     State(state): State<Arc<IpcState<P, R>>>,
 ) -> Json<StatusResponse> {
-    let mut pm = state.proxy.lock().await;
-    pm.check_health();
+    // The manager's fields are copied out and the guard is DROPPED at the end
+    // of this block — deliberately, not incidentally. Reading presence through
+    // `pm` would run an OS probe (a `pfctl -s labels` fork on macOS) inside
+    // this critical section, on a path the GUI polls every 5s for the life of
+    // the app, contending with `handle_start`/`stop_with` for the same lock.
+    // Returning the guard from the block instead of its values would keep the
+    // lock held and silently undo this.
+    let snapshot = {
+        let mut pm = state.proxy.lock().await;
+        if let Some(event) = pm.check_health() {
+            if let Err(e) = pm.stop_with(event).await {
+                tracing::error!(error = %e, "error tearing down proxy after a failed health check");
+            }
+        }
+        StatusResponse {
+            running: pm.state() == ProxyState::Running,
+            uptime_secs: pm.uptime_secs(),
+            // Death reason only (path-free, #470) — NOT `last_error`, which can
+            // carry a filesystem path/hostname from a failed start and must never
+            // reach the GUI toast. The rich detail stays in `last_error` for
+            // diagnostics (bridge="error") and the click-path start-error surface.
+            // Redacted at the boundary alongside `StartError::Failed`, so "no
+            // outgoing error string carries the server address" holds for the
+            // whole response surface rather than for one variant.
+            error: pm.death_reason().map(|s| util::redact::redact_str(s).into_owned()),
+            invalid_filters: pm.invalid_filters(),
+            udp_proxy_available: pm.udp_proxy_available(),
+            ipv6_bypass_available: pm.ipv6_bypass_available(),
+            lockdown_enabled: pm.lockdown_enabled(),
+            // Filled in below, once the lock is released.
+            cover_presence: hole_common::protocol::CoverPresence::Absent,
+            blocked_until_connected: pm.blocked_until_connected(),
+        }
+    };
+    // Ordering is load-bearing and must stay: `check_health` above can tear a
+    // dead session down, and that teardown can release the cover. Measuring
+    // presence after it is what stops a reply advertising a cover that no
+    // longer exists.
+    //
+    // In `spawn_blocking`, because the probe is an OS call — `pfctl -s labels`
+    // through a blocking `std::process::Command` on macOS, `FwpmEngineOpen0`
+    // plus one `FwpmFilterGetByKey0` per swept GUID on Windows — and status is
+    // a POLL: the tray reconciler ticks it every 5s and the dashboard polls it
+    // every 5s. Run inline it forks a subprocess on a runtime worker twice
+    // that often, which is what `foreground.rs`'s own `spawn_blocking` comment
+    // means by keeping OS work off the runtime. The predecessor this replaced
+    // was an in-memory `Posture` read, so nothing here used to block.
+    let routing = Arc::clone(&state.routing);
+    let presence = tokio::task::spawn_blocking(move || routing.lockdown_cover_presence())
+        .await
+        .unwrap_or_else(|e| {
+            tracing::error!(error = %e, "cover-presence probe task panicked");
+            // The lean every escape-offering site treats like `live`, never
+            // like `absent`: a probe that did not complete knows nothing.
+            CoverPresence::Unreachable
+        });
     Json(StatusResponse {
-        running: pm.state() == ProxyState::Running,
-        uptime_secs: pm.uptime_secs(),
-        // Death reason only (path-free, #470) — NOT `last_error`, which can
-        // carry a filesystem path/hostname from a failed start and must never
-        // reach the GUI toast. The rich detail stays in `last_error` for
-        // diagnostics (bridge="error") and the click-path start-error surface.
-        // Redacted at the boundary alongside `StartError::Failed`, so "no
-        // outgoing error string carries the server address" holds for the
-        // whole response surface rather than for one variant.
-        error: pm.death_reason().map(|s| util::redact::redact_str(s).into_owned()),
-        invalid_filters: pm.invalid_filters(),
-        udp_proxy_available: pm.udp_proxy_available(),
-        ipv6_bypass_available: pm.ipv6_bypass_available(),
-        lockdown_enabled: pm.lockdown_enabled(),
-        lockdown_active: pm.lockdown_active(),
-        blocked_until_connected: pm.blocked_until_connected(),
+        cover_presence: wire_cover_presence(presence),
+        ..snapshot
     })
+}
+
+/// Wire-level mirror of `tun_engine::routing::CoverPresence`, variant for
+/// variant — `crates/hole` and `crates/common` do not depend on `tun-engine`,
+/// so the measured probe result needs a crate-local type to cross the wire.
+/// A free function, not a `From` impl: both types are foreign to this crate,
+/// so the orphan rule forbids the trait.
+fn wire_cover_presence(p: tun_engine::routing::CoverPresence) -> hole_common::protocol::CoverPresence {
+    use hole_common::protocol::CoverPresence as Wire;
+    use tun_engine::routing::CoverPresence as Probed;
+    match p {
+        Probed::Live => Wire::Live,
+        Probed::Recorded => Wire::Recorded,
+        Probed::Absent => Wire::Absent,
+        Probed::Indeterminate => Wire::Indeterminate,
+        Probed::Unreachable => Wire::Unreachable,
+    }
 }
 
 /// Enforce [`StartError::Failed`]'s "PII-free message" claim at the response
@@ -320,6 +446,7 @@ fn redact_outgoing(error: StartError) -> StartError {
 
 /// Error side of `handle_start`: a control-plane 409 carries a generic
 /// `ErrorResponse`; an actual start failure (500) carries the typed `StartError`.
+#[derive(Debug)]
 enum StartHandlerError {
     Concurrent,
     Failed(StartError),
@@ -349,12 +476,16 @@ async fn handle_start<P: Proxy + 'static, R: Routing + 'static>(
     // response boundary's `redact_str`.
     hole_common::logging::redact_arm::arm_server(&config.server);
     let attempt_id = attempt_id_from(&headers);
-    // The `X-Hole-Covered` header marks an auto-connect intent, so the bridge
-    // engages a fail-closed cover that stays blocked on failure.
-    let covered = headers
-        .get("x-hole-covered")
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(|v| v.eq_ignore_ascii_case("true"));
+    let on_startup = on_startup_from(&headers);
+    // No wire signal for "covered" reaches this handler anymore (#979 — see
+    // `hole_common::protocol::BridgeRequest::Start`'s doc for why the GUI
+    // stopped asserting it). Every start this HTTP handler ever sees is
+    // client-initiated (a manual connect, or the elevation re-exec of one) —
+    // the only source of a genuinely auto-connect-covered start is the
+    // bridge's own boot-time reconciliation (#617, `reconcile_once`), which
+    // calls `ProxyManager` directly and never goes through this handler at
+    // all.
+    let covered = false;
     #[allow(clippy::disallowed_methods)]
     // IPC root: every bridge cancel scope descends from this token. See clippy.toml CancellationToken::new rule.
     let token = CancellationToken::new();
@@ -386,9 +517,24 @@ async fn handle_start<P: Proxy + 'static, R: Routing + 'static>(
         cs.in_flight = Some((attempt_id.clone(), token.clone()));
     }
 
+    // Persist while still holding the proxy lock: `handle_stop`/`stop_with`
+    // holds this same lock across its own target write
+    // (`persist_session_event`), so keeping the two critical sections under
+    // one lock makes the writers mutually exclusive instead of racing — an
+    // explicit Stop landing between this attempt's start and its own
+    // persist can no longer be silently reverted back to `Connected` by this
+    // handler's unconditional overwrite. It also serializes this handler's
+    // own startup-preference read-modify-write against a second start's,
+    // since single-occupancy (the 409 above) will not admit the next start
+    // until `in_flight` clears below, after this persist has completed.
+    // Snapshot BEFORE the proxy lock: any unblock from here on is concurrent
+    // with this start and must win the target write.
+    let unblock_snapshot = state.unblock_generation.load(std::sync::atomic::Ordering::SeqCst);
     let result = {
         let mut pm = state.proxy.lock().await;
-        pm.start_cancellable(&config, covered, token).await
+        let result = pm.start_cancellable(&config, covered, token).await;
+        persist_after_start(&state, &config, on_startup, result.is_ok(), unblock_snapshot).await;
+        result
     };
 
     // Clear the slot. Single-occupancy (the 409 above) guarantees it still holds
@@ -414,6 +560,103 @@ async fn handle_start<P: Proxy + 'static, R: Routing + 'static>(
             }
             Err(StartHandlerError::Failed(redact_outgoing((&e).into())))
         }
+    }
+}
+
+/// Persist the target and the startup preference after a start attempt
+/// settles. Two different gates, on purpose:
+///
+/// - `on_startup` is a GUI-pushed preference, not a record of what happened —
+///   when `Some`, it is written on every attempt regardless of `succeeded`,
+///   same as the GUI would push a Settings change whether or not the tunnel
+///   is up. `None` means the caller (the CLI, which has no Settings to push,
+///   #979) pushed nothing: the persisted preference is left exactly as it
+///   was, never stomped down to the wire default.
+/// - The target and the preference's `candidate` (the config
+///   `resolve_startup_target`'s `AlwaysConnect` arm falls back on) both
+///   record what actually happened, so they are gated on `succeeded`
+///   regardless of who started it: a `ProxyError::AlreadyRunning` is `Err`
+///   here specifically because `start_cancellable` left the
+///   ALREADY-running session's config untouched, and writing THIS request's
+///   config over the target would silently mismatch the two (see
+///   `ProxyManager::start_cancellable`'s `AlreadyRunning` guard, which
+///   precedes any config change).
+///
+/// Runs in `spawn_blocking`, since both `target::apply` and
+/// `save_startup_preference` are sync (`target::apply`'s lock is a leaf lock
+/// that must never cross an `.await` — see `TargetExclusive`). A failure here
+/// is logged, never surfaced as a start failure: the tunnel's own outcome is
+/// already decided by the time this runs, and a metadata-write hiccup must
+/// not retroactively turn an established connection into a reported failure.
+async fn persist_after_start<P: Proxy, R: Routing>(
+    state: &IpcState<P, R>,
+    config: &ProxyConfig,
+    on_startup: Option<StartupBehavior>,
+    succeeded: bool,
+    unblock_snapshot: u64,
+) {
+    #[cfg(test)]
+    {
+        if let Some(tx) = state.persist_entered.lock().unwrap().take() {
+            let _ = tx.send(());
+        }
+        if let Some(gate) = state.persist_gate.as_ref() {
+            gate.notified().await;
+        }
+    }
+    let state_dir = state.state_dir.clone();
+    let owner = state.owner;
+    let config = config.clone();
+    let generation = Arc::clone(&state.unblock_generation);
+    let outcome = tokio::task::spawn_blocking(move || -> Result<(), target::TargetError> {
+        if succeeded {
+            let candidate_config = config.clone();
+            let declined = std::sync::atomic::AtomicBool::new(false);
+            let declined_ref = &declined;
+            target::apply(&state_dir, owner, move |current| {
+                if generation.load(std::sync::atomic::Ordering::SeqCst) != unblock_snapshot {
+                    // An unblock committed `Target::Off` after this start
+                    // began. It is the newer intent; leave it standing.
+                    declined_ref.store(true, std::sync::atomic::Ordering::SeqCst);
+                    current
+                } else {
+                    Target::Connected {
+                        config: Box::new(config),
+                    }
+                }
+            })?;
+            // Locked read-modify-write, NOT load-then-save: a concurrent
+            // `handle_unblock` clearing the candidate between the two halves
+            // would be silently re-added here, leaving `Target::Off` beside a
+            // live candidate that `AlwaysConnect` reconnects from — the escape
+            // undone. Sequential with the `target::apply` above, never nested:
+            // both take the same lock, and `flock` is per-open-description, so
+            // nesting would deadlock rather than recurse.
+            target::apply_startup_preference(&state_dir, owner, |pref| {
+                if let Some(on_startup) = on_startup {
+                    pref.on_startup = on_startup;
+                }
+                // The candidate records what actually happened, so it follows
+                // the target's fate. The `on_startup` push is a PREFERENCE,
+                // not a record, so it stands either way.
+                if !declined.load(std::sync::atomic::Ordering::SeqCst) {
+                    pref.candidate = Some(Box::new(candidate_config));
+                }
+            })
+        } else if let Some(on_startup) = on_startup {
+            target::apply_startup_preference(&state_dir, owner, |pref| {
+                pref.on_startup = on_startup;
+            })
+        } else {
+            Ok(())
+        }
+    })
+    .await;
+
+    match outcome {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => error!(error = %e, "failed to persist target/startup-preference after start"),
+        Err(e) => error!(error = %e, "target-persistence task panicked"),
     }
 }
 
@@ -452,12 +695,10 @@ async fn handle_cancel<P: Proxy + 'static, R: Routing + 'static>(
 /// sends intent.
 ///
 /// Turning the intent OFF reroutes through [`ProxyManager::turn_lockdown_off`]
-/// — the same unconditional release `POST /v1/unblock` performs — so the
-/// effect is immediate rather than deferred to the next start; both outcomes
-/// it can return mean the intent is now off, so both map to 200. This is a
-/// branch on the REQUEST's own payload (`enabled`), not on inspected proxy
-/// state — the `running` condition stays exactly where `turn_lockdown_off`
-/// put it. Turning the intent ON is unchanged: it only persists.
+/// — releasing the cover whenever `cover_step` calls for it — so the effect
+/// is immediate rather than deferred to the next start. This is a branch on
+/// the REQUEST's own payload (`enabled`), not on inspected proxy state.
+/// Turning the intent ON is unchanged: it only persists.
 async fn handle_lockdown<P: Proxy + 'static, R: Routing + 'static>(
     State(state): State<Arc<IpcState<P, R>>>,
     Json(req): Json<LockdownRequest>,
@@ -465,8 +706,8 @@ async fn handle_lockdown<P: Proxy + 'static, R: Routing + 'static>(
     let mut pm = state.proxy.lock().await;
     if !req.enabled {
         return match pm.turn_lockdown_off() {
-            Ok(_) => {
-                info!("lockdown intent set to off; released any cover no running session owns");
+            Ok(()) => {
+                info!("lockdown intent set to off; released the cover if the target/presence pair called for it");
                 Ok(Json(EmptyResponse {}))
             }
             Err(e) => {
@@ -496,40 +737,108 @@ async fn handle_lockdown<P: Proxy + 'static, R: Routing + 'static>(
 }
 
 /// The tray's escape from a fail-closed cover stranded by an unclean exit:
-/// unconditionally clear every cover Hole can install, then turn the kill
-/// switch off. `turn_lockdown_off`'s one condition — whether a session is
-/// running — maps to 409 (the intent is still off; the caller should
-/// disconnect to release the session's own cover); any other failure is 500.
-/// The OS calls run inline under the lock, exactly as `handle_stop`'s cover
-/// teardown already does — a one-shot user action, not a status poll.
+/// release the cover, then (only once that's confirmed) record the target
+/// and kill-switch intent off. Deliberately reads no session posture and
+/// takes NO `state.proxy.lock()` — this must work even while a teardown
+/// wedges that lock (the circular dependency this design resolves: the
+/// escape can't depend on a lock a stuck teardown holds). `target::apply`
+/// and `lockdown_state::set_enabled` are sync, so they run in
+/// `spawn_blocking`, the same pattern `ProxyManager::persist_session_event`
+/// uses.
+///
+/// Release-then-persist, mirroring `ProxyManager::turn_lockdown_off`: a
+/// FAILED release must not also record the target/intent off, or the host
+/// stays blocked while every record says it isn't and the user's only retry
+/// affordance (the tray still offering Unblock) is gone.
+///
+/// The release is UNCONDITIONAL — no presence probe gates it. This once
+/// consulted `cover_step` and skipped the call on a confirmed `Absent`, which
+/// is check-then-act in front of an operation documented idempotent, and at
+/// the escape hatch a stale `Absent` is the one wrong answer that matters: it
+/// reports success while the host stays blocked. `turn_lockdown_off` shares the rule.
 async fn handle_unblock<P: Proxy + 'static, R: Routing + 'static>(
     State(state): State<Arc<IpcState<P, R>>>,
 ) -> Result<Json<EmptyResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let mut pm = state.proxy.lock().await;
-    match pm.turn_lockdown_off() {
-        Ok(LockdownOffOutcome::Cleared) => {
-            info!("unblock: every cover cleared, kill switch off");
-            Ok(Json(EmptyResponse {}))
-        }
-        Ok(LockdownOffOutcome::SessionRunning) => {
-            info!("unblock: a session is running, so there was no unowned cover to clear");
-            Err((
-                StatusCode::CONFLICT,
-                Json(ErrorResponse {
-                    message: "a session is running; disconnect to release its own cover".into(),
-                }),
-            ))
-        }
-        Err(e) => {
-            error!(error = %e, "unblock failed");
-            Err((
+    // Invalidate any transient cover guard a concurrent, lock-holding
+    // `start_cancellable` may still be tracking internally — set
+    // unconditionally, a no-op if nothing is tracked, reachable without
+    // `&mut self`, unlike `turn_lockdown_off`'s own equivalent first step.
+    // Must happen before the release below, not after: `start_cancellable`
+    // only reads this signal at its own entry, so setting it late (after a
+    // concurrent start has already passed that check) would miss the very
+    // race it exists to close.
+    state.cover_invalidated.store(true, std::sync::atomic::Ordering::SeqCst);
+
+    // Unconditional, with no presence probe in front of it.
+    // `release_all_covers` is documented idempotent, so a check here would be
+    // check-then-act on an operation that needs none — and at the escape
+    // hatch a stale `Absent` is the one wrong answer that matters. Sharing
+    // that rule with `turn_lockdown_off` is what removes the discrepancy the
+    // two bespoke `must_release` expressions used to carry.
+    if let Err(e) = state.routing.release_all_covers() {
+        error!(error = %e, "unblock: release failed");
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                message: "the network could not be fully unblocked".into(),
+            }),
+        ));
+    }
+
+    // Only once the release above is confirmed (or confirmed unneeded) does
+    // the record move: recording target/intent off before a FAILED release
+    // would delete the user's only retry affordance — the tray still
+    // offering Unblock — while the host stays held closed.
+    let state_dir = state.state_dir.clone();
+    let owner = state.owner;
+    let generation = Arc::clone(&state.unblock_generation);
+    let persisted = tokio::task::spawn_blocking(move || -> Result<(), String> {
+        // The bump is the COMMIT hook, not part of the closure: it must not
+        // announce a write that `save` then failed to make, and it must happen
+        // before the exclusive lock is released so a concurrent
+        // `persist_after_start` cannot observe the committed `Off` without it.
+        target::apply_committing(
+            &state_dir,
+            owner,
+            |_current| Target::Off,
+            || {
+                generation.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            },
+        )
+        .map_err(|e| e.to_string())?;
+        lockdown_state::set_enabled(&state_dir, false, owner).map_err(|e| e.to_string())?;
+        // Clear the auto-connect candidate too. `resolve_startup_target` feeds
+        // it to `AlwaysConnect` over an `Off` target, so leaving it would let
+        // the next boot reconnect to the server the user just escaped from —
+        // the escape undone by a record it never touched.
+        target::apply_startup_preference(&state_dir, owner, |pref| pref.candidate = None).map_err(|e| e.to_string())?;
+        Ok(())
+    })
+    .await;
+    match persisted {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            error!(error = %e, "unblock: failed to persist target/intent off");
+            return Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse {
-                    message: unblock_error_message(&e),
+                    message: "the network could not be fully unblocked".into(),
                 }),
-            ))
+            ));
+        }
+        Err(e) => {
+            error!(error = %e, "unblock: persist task panicked");
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    message: "the network could not be fully unblocked".into(),
+                }),
+            ));
         }
     }
+
+    info!("unblock: cover released if the presence called for it, target off, intent off");
+    Ok(Json(EmptyResponse {}))
 }
 
 /// PII-free 500 body for a failed `turn_lockdown_off`. Never formats the
@@ -802,6 +1111,9 @@ async fn handle_stop<P: Proxy + 'static, R: Routing + 'static>(
     State(state): State<Arc<IpcState<P, R>>>,
 ) -> Result<Json<EmptyResponse>, (StatusCode, Json<ErrorResponse>)> {
     let mut pm = state.proxy.lock().await;
+    // `stop()` persists `Target::Off` internally (`stop_with`'s
+    // `persist_session_event`) before it tears anything down, so there is
+    // nothing left for this handler to persist afterward.
     match pm.stop().await {
         Ok(()) => Ok(Json(EmptyResponse {})),
         Err(e) => {
@@ -818,8 +1130,20 @@ async fn handle_reload<P: Proxy + 'static, R: Routing + 'static>(
     State(state): State<Arc<IpcState<P, R>>>,
     Json(config): Json<ProxyConfig>,
 ) -> Result<Json<EmptyResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let unblock_snapshot = state.unblock_generation.load(std::sync::atomic::Ordering::SeqCst);
     let mut pm = state.proxy.lock().await;
-    match pm.reload(&config).await {
+    let result = pm.reload(&config).await;
+    // `ProxyManager::reload` never persists on either of its own paths — the
+    // hot-swap fast path never calls `start_cancellable` at all, and the
+    // stop+start slow path calls `ProxyManager::start` directly, the same
+    // ProxyManager-level entry point `handle_start` calls before doing its
+    // own persist below. Reusing `persist_after_start` (no `on_startup`
+    // header exists on a reload request, so `None` leaves the preference's
+    // `on_startup` untouched, same as a Start with no header) keeps a
+    // successful reload's config from silently reverting to the pre-reload
+    // one on the next crash-recovery read of the target.
+    persist_after_start(&state, &config, None, result.is_ok(), unblock_snapshot).await;
+    match result {
         Ok(()) => Ok(Json(EmptyResponse {})),
         Err(e) => {
             error!(error = %e, "proxy reload failed");
@@ -837,7 +1161,11 @@ async fn handle_metrics<P: Proxy + 'static, R: Routing + 'static>(
     State(state): State<Arc<IpcState<P, R>>>,
 ) -> Json<MetricsResponse> {
     let mut pm = state.proxy.lock().await;
-    pm.check_health();
+    if let Some(event) = pm.check_health() {
+        if let Err(e) = pm.stop_with(event).await {
+            tracing::error!(error = %e, "error tearing down proxy after a failed health check");
+        }
+    }
     let filter = if pm.state() == ProxyState::Running {
         Some(hole_common::protocol::FilterMetrics::default())
     } else {

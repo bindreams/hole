@@ -4,6 +4,8 @@ use std::path::Path;
 
 use tun_engine::routing::SystemRouting;
 
+use tokio_util::sync::CancellationToken;
+
 use crate::proxy::ShadowsocksProxy;
 use crate::proxy_manager::ProxyManager;
 
@@ -104,6 +106,21 @@ async fn notify_ready(spec: &str) {
     }
 }
 
+/// Map an update-in-progress marker's presence to the session event: present
+/// means a cutover is mid-flight (`SessionEvent::CutoverRestart`); absent
+/// means a clean machine shutdown (`SessionEvent::ProcessExiting`) — neither
+/// is `UserStopped`, which is reserved for an actual user-initiated
+/// disconnect. Pure so the decision is table-testable. Shared by all three
+/// entry points (this module, `platform::macos`, `platform::windows`) so the
+/// same shutdown-tail bug can't recur independently in one of them.
+pub(crate) fn shutdown_reason(marker_present: bool) -> crate::target::SessionEvent {
+    if marker_present {
+        crate::target::SessionEvent::CutoverRestart
+    } else {
+        crate::target::SessionEvent::ProcessExiting
+    }
+}
+
 /// Clear a stale update-in-progress marker on the new bridge's post-bind sweep.
 /// The marker's presence is co-extensive with "a cutover during which no bridge
 /// answered"; once this bridge binds, the cutover is done. Remove-by-path so a
@@ -133,8 +150,12 @@ async fn run_inner(
     ));
     let proxy_shutdown = std::sync::Arc::clone(&proxy);
 
-    // Bind BEFORE recovery. If a second bridge instance tries to run, the
-    // bind() fails and we exit without touching any routing state.
+    // Bind BEFORE the liveness acquire and BEFORE recovery. If a second
+    // bridge instance tries to run, the bind() fails and we exit without
+    // touching any routing state or contending on the liveness lock —
+    // matching crate::liveness's documented invariant (BridgeLiveness::acquire's
+    // doc: "a second real bridge instance never reaches this call — the IPC
+    // socket bind already refuses it first").
     let server = crate::ipc::IpcServer::bind_with_dirs(
         socket_path,
         proxy,
@@ -143,6 +164,16 @@ async fn run_inner(
         state_dir.to_path_buf(),
         owner,
     )?;
+
+    // Held for this bridge's entire run, from just after the socket bind to
+    // process exit — see crate::liveness's module doc. Blocks (in
+    // spawn_blocking, off the runtime worker) rather than failing, so a boot
+    // racing an in-flight `hole bridge unlock` waits for it instead of
+    // interleaving.
+    let state_dir_liveness = state_dir.to_path_buf();
+    let _liveness =
+        tokio::task::spawn_blocking(move || crate::liveness::BridgeLiveness::acquire(&state_dir_liveness, owner))
+            .await??;
 
     // First-party readiness signal (#454): the dev supervisor pre-binds a
     // localhost listener and passes `--ready-notify ADDR/TOKEN`; we connect
@@ -164,7 +195,39 @@ async fn run_inner(
         tracing::warn!(error = %e, "recover_dns_config task panicked");
     }
 
+    // Root cancellation token for this process, created BEFORE reconciliation
+    // and wired to the signal source immediately: `shutdown_signal()`
+    // registers its handlers eagerly, so installing the bridge here (rather
+    // than at the `select!` below) is also what closes the boot window in
+    // which a SIGTERM had nothing to reach.
+    #[allow(clippy::disallowed_methods)]
+    // Process entry point — the root every bridge cancel scope descends from.
+    // See clippy.toml's CancellationToken::new sanctioned-sites list.
+    let shutdown = CancellationToken::new();
+    {
+        // `shutdown_signal()` is called HERE, on the current task, not inside
+        // the `async move` below. Its handler registration
+        // (`signal(SignalKind::terminate())` / `ctrl_break()`) happens eagerly
+        // when the function runs, but `tokio::spawn` only QUEUES a task — it
+        // does not poll it. Constructing the future inside the spawn would
+        // defer registration to the runtime's first poll, leaving exactly the
+        // boot window this wiring exists to close: a SIGTERM arriving during
+        // `recover_and_record`/`reconcile_once` would hit the default
+        // disposition and kill the process with routes and cover half-installed.
+        let signal = shutdown_signal();
+        let shutdown = shutdown.clone();
+        tokio::spawn(async move {
+            signal.await;
+            shutdown.cancel();
+        });
+    }
+
     crate::route_recovery::recover_and_record(state_dir, &proxy_shutdown).await;
+    // Reconcile the persisted target now, before any GUI or client has had a
+    // chance to connect (narrows, does not close, #617's boot->first-connect
+    // gap: a failed connect engages nothing) — must run after recovery above, see
+    // crate::reconciler::reconcile_once's own doc.
+    crate::reconciler::reconcile_once(state_dir, owner, &proxy_shutdown, &shutdown).await;
     let state_dir_plugins = state_dir.to_path_buf();
     if let Err(e) =
         tokio::task::spawn_blocking(move || crate::plugin_recovery::reap_recorded_plugins(&state_dir_plugins)).await
@@ -224,11 +287,17 @@ async fn run_inner(
                 tracing::error!(error = %e, "IPC server error");
             }
         }
-        _ = shutdown_signal() => {}
+        _ = shutdown.cancelled() => {}
     }
 
+    // Neither event `shutdown_reason` can produce is a user disconnect, so
+    // the target is left unchanged either way (unlike a plain `pm.stop()`,
+    // which is `SessionEvent::UserStopped` and would wrongly move the
+    // target to `Off`, releasing a standing lockdown cover on a plain
+    // SIGTERM/Ctrl+C — e.g. from a machine shutdown or dev-console relay).
     let mut pm = proxy_shutdown.lock().await;
-    if let Err(e) = pm.stop().await {
+    let event = shutdown_reason(hole_common::update_marker::is_present(log_dir));
+    if let Err(e) = pm.stop_with(event).await {
         tracing::error!(error = %e, "error stopping proxy during shutdown");
     }
 

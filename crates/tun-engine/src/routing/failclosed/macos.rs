@@ -229,6 +229,20 @@ pub struct Cover {
     kind: CoverKind,
 }
 
+impl Cover {
+    /// Release this process's claim on the cover without disengaging it.
+    ///
+    /// macOS holds NO process-local OS resource here: `token` is the
+    /// `pfctl -E` enable ticket, and `Drop`'s `pfctl -X <token>` releases pf's
+    /// enable refcount rather than freeing anything owned by this process.
+    /// Leaving pf enabled is precisely what detaching means, so skipping
+    /// `Drop` is the whole operation — unlike Windows, which must close its
+    /// FWPM engine handle here.
+    pub(crate) fn detach(self) {
+        std::mem::forget(self);
+    }
+}
+
 pub fn engage(
     server_ip: IpAddr,
     resolver_ip: Option<IpAddr>,
@@ -522,44 +536,74 @@ pub fn engage_lockdown(
 }
 
 /// Fail-loud disengage: restore the pre-lockdown ruleset from the snapshot, drop
-/// our pf refcount, clear the state. An ABSENT cover (no state file) is `Ok` —
-/// nothing to disengage, so no pfctl is spawned. A PRESENT cover that fails to
-/// restore propagates the error and LEAVES the state file in place, so a retry
-/// (or the next start) still sees the cover rather than reading "disengaged"
-/// while the block persists. Powers the `bridge unlock` escape hatch.
+/// our pf refcount, clear the state. Powers the `bridge unlock` escape hatch.
+///
+/// Gates on [`lockdown_cover_presence`] — pf's own answer folded with the
+/// state file — not on the file alone (#882): a state file that is absent or
+/// unusable is not proof pf was never engaged, since pf's label can outlive a
+/// lost or corrupted file. Only a presence [`CoverPresence::Absent`] (both
+/// sources agree there is nothing) is a silent `Ok`; a presence that could not
+/// be established at all ([`CoverPresence::Unreachable`]/
+/// [`CoverPresence::Indeterminate`]) refuses rather than claim success having
+/// done nothing. A restore that fails propagates the error and LEAVES the
+/// state file in place, so a retry (or the next start) still sees the cover
+/// rather than reading "disengaged" while the block persists.
 ///
 /// Caveat: pf exposes no dump of prior `set` options, so the restore reloads the
 /// host's filter+nat rules under pf defaults (same class of limitation the
 /// transient cover documents for its `/etc/pf.conf` reload).
 pub fn disengage_lockdown(state_dir: &Path) -> Result<(), RoutingError> {
-    let Some(st) = lockdown_state::load(state_dir) else {
-        return Ok(()); // No cover engaged — nothing to disengage.
-    };
-    // No captured baseline means our own cover was the loaded ruleset at engage
-    // time, so `/etc/pf.conf` IS the restore target — see
+    disengage_lockdown_with(
+        lockdown_cover_presence(state_dir),
+        lockdown_state::load(state_dir),
+        &mut RealPfOps { state_dir },
+    )
+}
+
+/// `disengage_lockdown`'s sequencing, with presence and the [`PfOps`] seam
+/// injected so the gate (and the "nothing to restore from" fallback) is
+/// table-tested without shelling out to `pfctl`.
+fn disengage_lockdown_with(
+    presence: crate::routing::CoverPresence,
+    st: Option<lockdown_state::LockdownPfState>,
+    ops: &mut dyn PfOps,
+) -> Result<(), RoutingError> {
+    use crate::routing::CoverPresence;
+    match presence {
+        // Both sources agree there is nothing — no pfctl spawned.
+        CoverPresence::Absent => return Ok(()),
+        // Neither source could confirm anything either way: claiming success
+        // here would be the #882 bug in a different guise. Refuse loud and
+        // name the manual recovery command.
+        CoverPresence::Unreachable | CoverPresence::Indeterminate => {
+            return Err(RoutingError::RouteSetup(
+                "could not determine whether a lockdown cover is present; nothing was done — \
+                 run `sudo pfctl -f /etc/pf.conf` to restore the system firewall manually"
+                    .to_string(),
+            ));
+        }
+        CoverPresence::Live | CoverPresence::Recorded => {}
+    }
+
+    // No captured baseline (or no state at all — presence was established by
+    // pf's label alone) means there is no snapshot to restore from, so
+    // `/etc/pf.conf` IS the restore target — see
     // `LockdownPfState::main_snapshot_captured`.
-    let out = if st.main_snapshot_captured {
-        let restore = build_lockdown_restore_ruleset(&st.nat_snapshot, &st.main_snapshot);
-        pfctl(&["-f", "-"], Some(restore.as_bytes()), BestEffortPhase::RecoverCover)?
-    } else {
-        pfctl(&["-f", PFCONF], None, BestEffortPhase::RecoverCover)?
-    };
-    if !out.status.success() {
-        return Err(RoutingError::RouteSetup(format!(
-            "pfctl lockdown restore failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        )));
+    match &st {
+        Some(st) if st.main_snapshot_captured => {
+            ops.load_ruleset(&build_lockdown_restore_ruleset(&st.nat_snapshot, &st.main_snapshot))?
+        }
+        _ => ops.reload_default()?,
     }
-    let xout = pfctl(&["-X", &st.pf_token], None, BestEffortPhase::RecoverCover)?;
-    if !xout.status.success() {
-        return Err(RoutingError::RouteSetup(format!(
-            "pfctl -X (drop pf refcount) failed: {}",
-            String::from_utf8_lossy(&xout.stderr).trim()
-        )));
+
+    // Only release a pf refcount token we actually hold on record.
+    if let Some(st) = &st {
+        ops.drop_token(&st.pf_token)?;
     }
+
     // State cleared only after a confirmed restore — a failed clear is the only
     // remaining best-effort step (the cover is already down).
-    if let Err(e) = lockdown_state::clear(state_dir) {
+    if let Err(e) = ops.clear_standing() {
         tracing::warn!(error = %e, "lockdown-pf-state clear failed after disengage");
     }
     Ok(())
@@ -616,8 +660,10 @@ pub(crate) trait PfOps {
     fn reload_default(&mut self) -> Result<(), RoutingError>;
     /// `pfctl -f -` with `text` on stdin: load a specific ruleset.
     fn load_ruleset(&mut self, text: &str) -> Result<(), RoutingError>;
-    /// `pfctl -X <token>`: drop a pf enable refcount. Always best-effort at
-    /// the call site — its `Err` is never propagated.
+    /// `pfctl -X <token>`: drop a pf enable refcount. Whether a failure here
+    /// propagates is the caller's choice: `release_all_with` swallows it
+    /// (best-effort, never propagated); `disengage_lockdown_with` — the
+    /// single-cover fail-loud escape — propagates it, per its own doc.
     fn drop_token(&mut self, token: &str) -> Result<(), RoutingError>;
     /// Delete the transient cover's state file.
     fn clear_transient(&mut self) -> Result<(), RoutingError>;

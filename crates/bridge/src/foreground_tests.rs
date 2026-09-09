@@ -58,6 +58,18 @@ fn sweep_wiring_reports_and_deletes_bridge_marker() {
 }
 
 #[skuld::test]
+fn shutdown_reason_keys_on_marker() {
+    // f473b5d2: shared by all three entry points (this module,
+    // platform::macos, platform::windows) so the shutdown-tail bug this
+    // guards against — treating a plain SIGTERM/Ctrl+C as a user disconnect
+    // (`UserStopped`, which wrongly moves the target to `Off`) — can't
+    // recur independently in one of them.
+    use crate::target::SessionEvent;
+    assert_eq!(super::shutdown_reason(true), SessionEvent::CutoverRestart);
+    assert_eq!(super::shutdown_reason(false), SessionEvent::ProcessExiting);
+}
+
+#[skuld::test]
 fn post_bind_sweep_clears_marker() {
     // Marker parity with the macOS/Windows service paths: once a foreground
     // bridge binds the IPC socket it is authoritative, so any update-in-progress
@@ -164,6 +176,9 @@ impl Routing for StubRouting {
     }
     fn release_all_covers(&self) -> Result<(), RoutingError> {
         Ok(())
+    }
+    fn lockdown_cover_presence(&self) -> tun_engine::routing::CoverPresence {
+        tun_engine::routing::CoverPresence::Absent
     }
 }
 

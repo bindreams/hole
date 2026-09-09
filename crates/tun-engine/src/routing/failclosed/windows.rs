@@ -935,6 +935,31 @@ unsafe fn add_filter(engine: HANDLE, provider: GUID, sublayer: GUID, f: &FilterS
     ok_or_exists(FwpmFilterAdd0(engine, &filter, None, None), "FwpmFilterAdd0")
 }
 
+impl Cover {
+    /// Release this process's claim on the cover without disengaging it:
+    /// close the FWPM engine handle, then skip `Drop` so its filter deletes
+    /// never run.
+    ///
+    /// Safe because the provider, sublayer and every filter are installed
+    /// `FWPM_*_FLAG_PERSISTENT` (see `engage`), so they survive the engine
+    /// session closing — closing the handle cannot destroy them. That is what
+    /// lets a LONG-LIVED caller keep the host covered without leaking a
+    /// handle per call: `std::mem::forget` alone, which this replaces, leaked
+    /// one on every armed reload for the life of the process.
+    pub(crate) fn detach(self) {
+        // SAFETY: `self.engine` is a live FWPM engine handle owned solely by
+        // this guard, and `self` is consumed here, so it cannot be closed twice.
+        unsafe {
+            #[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
+            let rc = FwpmEngineClose0(self.engine);
+            if rc != ERROR_SUCCESS.0 {
+                tracing::warn!("FwpmEngineClose0 failed while detaching a cover: 0x{rc:08x}");
+            }
+        }
+        std::mem::forget(self);
+    }
+}
+
 impl Drop for Cover {
     fn drop(&mut self) {
         unsafe {

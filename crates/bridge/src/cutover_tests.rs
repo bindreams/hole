@@ -47,6 +47,83 @@ fn unlock_successful_disengage_flips_intent_off() {
     );
 }
 
+// `bridge unlock` vs. a live bridge (#840): the CLI escape and the in-app
+// "Unblock Network" action must not race each other over the same cover. A
+// live bridge already owns reconciliation (and will reconcile the target
+// itself); `unlock` must refuse rather than race it, and name the in-app
+// action as the alternative.
+
+#[skuld::test]
+fn unlock_refuses_against_a_live_bridge() {
+    let dir = tempfile::tempdir().unwrap();
+    lockdown_state::set_enabled(dir.path(), true, None).unwrap();
+
+    // Simulate a live bridge with the same lock a running bridge holds for
+    // its whole lifetime — real contention, not a mocked probe.
+    let _bridge = crate::liveness::BridgeLiveness::acquire(dir.path(), None).unwrap();
+
+    let result = unlock_with(dir.path(), || {
+        panic!("disengage must never run while a bridge instance is live")
+    });
+
+    let err = result.expect_err("unlock must refuse while a bridge instance is running");
+    assert!(
+        err.to_string().contains("Unblock Network"),
+        "must name the in-app action as the alternative: {err}"
+    );
+    assert!(
+        lockdown_state::load_enabled(dir.path()),
+        "a refused unlock must not touch the persisted intent"
+    );
+}
+
+#[skuld::test]
+fn unlock_records_the_target_off_before_releasing() {
+    let dir = tempfile::tempdir().unwrap();
+    lockdown_state::set_enabled(dir.path(), true, None).unwrap();
+
+    let result = unlock_with(dir.path(), || {
+        assert_eq!(
+            crate::target::load(dir.path()),
+            crate::target::Target::Off,
+            "target must already be recorded off before the release call"
+        );
+        Ok(())
+    });
+
+    assert!(result.is_ok(), "{result:?}");
+    assert_eq!(crate::target::load(dir.path()), crate::target::Target::Off);
+}
+
+// #986: the liveness exclusion is structural (a lock held across the whole
+// sequence), not a point-in-time probe — a bridge that would start mid-unlock
+// must observe the lock as held throughout, not just at the initial check.
+
+#[skuld::test]
+fn unlock_holds_the_liveness_lock_across_the_whole_sequence() {
+    let dir = tempfile::tempdir().unwrap();
+    lockdown_state::set_enabled(dir.path(), true, None).unwrap();
+
+    let result = unlock_with(dir.path(), || {
+        // A bridge "starting" here — anywhere between the initial check and
+        // the intent flip — must see the lock held, never a window where it
+        // could acquire it and race the disengage/intent-flip below.
+        assert!(
+            crate::liveness::BridgeLiveness::try_acquire(dir.path(), None)
+                .unwrap()
+                .is_none(),
+            "a bridge starting mid-unlock must contend on the same lock, not observe it free"
+        );
+        Ok(())
+    });
+
+    assert!(result.is_ok(), "{result:?}");
+    // Released once `unlock_with` returns.
+    assert!(crate::liveness::BridgeLiveness::try_acquire(dir.path(), None)
+        .unwrap()
+        .is_some());
+}
+
 #[cfg(target_os = "windows")]
 #[skuld::test]
 fn clear_marker_on_failure_clears_only_on_err() {

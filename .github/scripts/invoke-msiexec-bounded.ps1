@@ -111,6 +111,18 @@ if (-not $proc.WaitForExit([int]($BoundMinutes * 60000))) {
         Write-Host "(failed to query hole.exe processes: $($_.Exception.Message))"
     }
 
+    # `Get-Process` above has no ParentProcessId/CommandLine -- same gap the
+    # msiexec probe below works around via CIM. A second, unexpected hole.exe
+    # (e.g. a distinct session/parent from the service's) is otherwise
+    # unattributable to whatever launched it.
+    Write-Host "--- hole.exe process tree (parent pid + command line) ---"
+    try {
+        $holeCimProcs = Get-CimInstance Win32_Process -Filter "Name = 'hole.exe'" -ErrorAction Stop
+        if ($holeCimProcs) { $holeCimProcs | Select-Object ProcessId, ParentProcessId, SessionId, CreationDate, CommandLine | Format-Table -AutoSize | Out-String -Width 4096 } else { Write-Host "(no hole.exe process running)" }
+    } catch {
+        Write-Host "(CIM query for hole.exe failed: $($_.Exception.Message))"
+    }
+
     # Unlike Get-Service/Get-Process above, Get-CimInstance returns an empty
     # result silently on a genuinely empty query -- it does not raise the
     # non-terminating error `-ErrorAction SilentlyContinue` is meant to

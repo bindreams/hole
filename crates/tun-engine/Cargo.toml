@@ -83,6 +83,10 @@ windows = { version = "0.62", features = [
     "Win32_Security",
     # RPC_C_AUTHN_WINNT for FwpmEngineOpen0's session auth.
     "Win32_System_Rpc",
+    # LockFileEx for `exclusive.rs`'s cross-process file lock.
+    "Win32_Storage_FileSystem",
+    # OVERLAPPED, required by LockFileEx's signature.
+    "Win32_System_IO",
 ] }
 # Pinned to the same minor version that shadowsocks-service 1.24 uses
 # transitively (via tun-0.8.6) so cargo deduplicates the crate.

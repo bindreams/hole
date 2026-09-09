@@ -1154,9 +1154,10 @@ fn handle_proxy(action: ProxyAction) -> i32 {
                 },
                 // CLI-initiated start has no paired cancel; a fresh id is fine.
                 attempt_id: uuid::Uuid::new_v4().to_string(),
-                // A manual `hole proxy start` is fail-open (today's behavior);
-                // the auto-connect stay-blocked cover is GUI-only.
-                covered: false,
+                // The CLI has no Settings preference to push; `None` leaves
+                // whatever startup preference is already persisted untouched
+                // (#979 — a `Some` here would stomp a real GUI preference).
+                on_startup: None,
             };
             match send_bridge_request_inner(request) {
                 Ok(BridgeResponse::Ack) => {

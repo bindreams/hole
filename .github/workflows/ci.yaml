@@ -798,6 +798,20 @@ jobs:
           if-no-files-found: ignore
           retention-days: 14
 
+      # bridge.log (C:\ProgramData\hole\logs) has this job's only record of
+      # what the HoleBridge service process itself was doing -- SCM
+      # start/stop/restart, the liveness lock, IPC bind -- none of which
+      # appears in the MSI logs above. On failure only: this repo has an
+      # unresolved uninstall-hang history (#790) this is meant to help close.
+      - name: Upload bridge logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: bridge-logs-windows-amd64
+          path: C:\ProgramData\hole\logs\**
+          if-no-files-found: ignore
+          retention-days: 14
+
   # Darwin-only counterpart to `test-installer`: build the DMG and run the
   # signature-consistency tests in `dmg-installer/`. Catches issue #364 —
   # an unsigned .app bundle that launches "damaged" under Gatekeeper

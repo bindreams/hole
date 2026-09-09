@@ -48,7 +48,7 @@ fn bridge_request_start_json_roundtrip() {
     let req = BridgeRequest::Start {
         config: sample_config(),
         attempt_id: "attempt-1".into(),
-        covered: true,
+        on_startup: Some(crate::config::StartupBehavior::AlwaysConnect),
     };
     let json = serde_json::to_vec(&req).unwrap();
     let decoded: BridgeRequest = serde_json::from_slice(&json).unwrap();
@@ -56,13 +56,16 @@ fn bridge_request_start_json_roundtrip() {
 }
 
 #[skuld::test]
-fn bridge_request_start_covered_defaults_false_for_old_clients() {
-    // An older GUI serializes Start without `covered`; it must decode to false
-    // (fail-open, today's behavior) via serde default.
+fn bridge_request_start_on_startup_defaults_for_old_clients() {
+    // An older GUI serializes Start without `on_startup`; it must decode to
+    // `None` (#979: "no preference pushed", exactly like a genuinely absent
+    // `X-Hole-On-Startup` header) via serde's `#[serde(default)]`, not to
+    // `Some(StartupBehavior::default())` — an old client's silence must not
+    // be read as an explicit push of the wire default.
     let json = r#"{"Start":{"config":{"server":{"id":"i","name":"n","server":"1.2.3.4","server_port":8388,"method":"aes-256-gcm","password":"p","plugin":null,"plugin_opts":null,"validation":null},"local_port":4073,"filters":[],"dns":{"enabled":true,"servers":["1.1.1.1"],"protocol":"https","allow_insecure_bootstrap":false},"local_port_http":4074,"diagnostic_plugin_tap":false},"attempt_id":"a"}}"#;
     let decoded: BridgeRequest = serde_json::from_str(json).unwrap();
     match decoded {
-        BridgeRequest::Start { covered, .. } => assert!(!covered, "covered must default to false"),
+        BridgeRequest::Start { on_startup, .. } => assert_eq!(on_startup, None),
         other => panic!("expected Start, got {other:?}"),
     }
 }
@@ -148,7 +151,7 @@ fn bridge_response_status_json_roundtrip() {
         udp_proxy_available: true,
         ipv6_bypass_available: false,
         lockdown_enabled: false,
-        lockdown_active: false,
+        cover_presence: CoverPresence::Absent,
         blocked_until_connected: true,
     };
     let json = serde_json::to_vec(&resp).unwrap();
@@ -229,7 +232,7 @@ fn status_response_json_roundtrip() {
         udp_proxy_available: false,
         ipv6_bypass_available: true,
         lockdown_enabled: false,
-        lockdown_active: false,
+        cover_presence: CoverPresence::Absent,
         blocked_until_connected: false,
     };
     let json = serde_json::to_string(&resp).unwrap();
@@ -247,7 +250,7 @@ fn status_response_without_error() {
         udp_proxy_available: true,
         ipv6_bypass_available: true,
         lockdown_enabled: false,
-        lockdown_active: false,
+        cover_presence: CoverPresence::Absent,
         blocked_until_connected: false,
     };
     let json = serde_json::to_string(&resp).unwrap();
@@ -275,7 +278,7 @@ fn empty_response_serializes_to_empty_object() {
 
 #[skuld::test]
 fn status_response_explicit_null_error() {
-    let json = r#"{"running": false, "uptime_secs": 0, "error": null}"#;
+    let json = r#"{"running": false, "uptime_secs": 0, "error": null, "cover_presence": "absent"}"#;
     let decoded: StatusResponse = serde_json::from_str(json).unwrap();
     assert_eq!(decoded.error, None);
     // Default values should be applied for missing fields
@@ -306,14 +309,29 @@ fn route_unblock_matches_the_spec_path() {
 }
 
 #[skuld::test]
-fn status_response_lockdown_fields_default_false_for_old_clients() {
+fn status_response_lockdown_enabled_defaults_false_for_old_clients() {
     use crate::protocol::StatusResponse;
-    // An old client sends a StatusResponse JSON without the lockdown fields;
-    // serde-default must fill them as false (matching udp/ipv6 fields).
-    let json = r#"{"running":true,"uptime_secs":0}"#;
+    // An old client sends a StatusResponse JSON without `lockdown_enabled`;
+    // serde-default must fill it as false (matching udp/ipv6 fields).
+    // `cover_presence` is included because it is required, not defaulted
+    // (see the next test).
+    let json = r#"{"running":true,"uptime_secs":0,"cover_presence":"absent"}"#;
     let s: StatusResponse = serde_json::from_str(json).unwrap();
     assert!(!s.lockdown_enabled);
-    assert!(!s.lockdown_active);
+}
+
+#[skuld::test]
+fn status_response_without_cover_presence_fails_to_decode() {
+    use crate::protocol::StatusResponse;
+    // Unlike `lockdown_enabled`, `cover_presence` is a REQUIRED field: a
+    // version-skewed reply is already rejected earlier, by the
+    // `x-hole-bridge-version` header check, before this body is ever parsed
+    // (`bridge_client.rs`'s `check_version`) — so a client that reaches this
+    // decode is never missing the field for a legitimate reason, and a
+    // silent default here would hide a genuine protocol mismatch instead of
+    // surfacing it.
+    let json = r#"{"running":true,"uptime_secs":0}"#;
+    assert!(serde_json::from_str::<StatusResponse>(json).is_err());
 }
 
 #[skuld::test]

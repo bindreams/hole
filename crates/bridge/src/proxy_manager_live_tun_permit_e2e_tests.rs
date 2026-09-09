@@ -383,7 +383,7 @@ async fn run_live_tun_permit_session(dist: &Path, ss: &SsServerHandle) {
         .send(BridgeRequest::Start {
             config: config.clone(),
             attempt_id: "live-tun-permit-e2e-a".into(),
-            covered: false,
+            on_startup: Some(hole_common::config::StartupBehavior::default()),
         })
         .await
         .expect("HARNESS: send Start (phase A)");
@@ -434,14 +434,14 @@ async fn run_live_tun_permit_session(dist: &Path, ss: &SsServerHandle) {
         .send(BridgeRequest::Start {
             config,
             attempt_id: "live-tun-permit-e2e-b".into(),
-            covered: false,
+            on_startup: Some(hole_common::config::StartupBehavior::default()),
         })
         .await;
     let start_b_acked = matches!(start_b, Ok(BridgeResponse::Ack));
 
-    let intent_active = if start_b_acked {
+    let cover_presence = if start_b_acked {
         match harness.send(BridgeRequest::Status).await {
-            Ok(BridgeResponse::Status { lockdown_active, .. }) => Some(lockdown_active),
+            Ok(BridgeResponse::Status { cover_presence, .. }) => Some(cover_presence),
             _ => None,
         }
     } else {
@@ -507,11 +507,10 @@ async fn run_live_tun_permit_session(dist: &Path, ss: &SsServerHandle) {
          downstream (including tun_outcome) means anything; got {no_leak:?}",
         no_leak_target_addr()
     );
-    assert_eq!(
-        intent_active,
-        Some(true),
-        "the lockdown intent must be reported active after SetLockdown(true) + Start — in-process bookkeeping, \
-         necessary but not sufficient on its own; got {intent_active:?}"
+    assert!(
+        matches!(cover_presence, Some(p) if p != hole_common::protocol::CoverPresence::Absent),
+        "the measured cover must be reported engaged after SetLockdown(true) + Start — in-process bookkeeping, \
+         necessary but not sufficient on its own; got {cover_presence:?}"
     );
     assert_eq!(
         tun_outcome,

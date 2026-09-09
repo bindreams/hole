@@ -79,6 +79,34 @@ pub enum StartupBehavior {
     AlwaysConnect,
 }
 
+impl StartupBehavior {
+    /// Wire representation for the `X-Hole-On-Startup` header (#979) — a
+    /// header value isn't run through serde, so this spells out the same
+    /// `rename_all = "snake_case"` strings by hand. Single source of truth for
+    /// both the client's header emission and the bridge's header parsing.
+    pub fn as_header_value(self) -> &'static str {
+        match self {
+            Self::DoNotConnect => "do_not_connect",
+            Self::RestoreLastState => "restore_last_state",
+            Self::AlwaysConnect => "always_connect",
+        }
+    }
+
+    /// Parse a `X-Hole-On-Startup` header value. `None` (the header is
+    /// genuinely absent — an older client, or one with no preference to
+    /// push, like the CLI, #979) is distinguished from a present-but-garbled
+    /// value, which fails safe to the wire default rather than being treated
+    /// as absent: only a caller that says nothing gets nothing pushed.
+    pub fn from_header_value(value: Option<&str>) -> Option<Self> {
+        match value? {
+            "do_not_connect" => Some(Self::DoNotConnect),
+            "restore_last_state" => Some(Self::RestoreLastState),
+            "always_connect" => Some(Self::AlwaysConnect),
+            _ => Some(Self::default()),
+        }
+    }
+}
+
 #[derive(Debug, Default, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum Theme {

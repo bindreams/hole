@@ -170,24 +170,24 @@ fn persist_intended_enabled_writes_only_on_change(#[fixture(temp_dir)] dir: &Pat
 // lockdown_menu_label =================================================================================================
 
 #[skuld::test]
-fn lockdown_enabled_but_inactive_renders_warning_label() {
-    // enabled && !active must never render silent green — it is a warning.
-    let label = lockdown_menu_label(true, false);
+fn lockdown_enabled_but_absent_renders_warning_label() {
+    // enabled && == Absent must never render silent green — it is a warning.
+    let label = lockdown_menu_label(true, CoverPresence::Absent);
     assert!(
         label.to_lowercase().contains("warning") || label.contains('!'),
-        "enabled+inactive must signal a warning, got {label:?}"
+        "enabled+absent must signal a warning, got {label:?}"
     );
 }
 
 #[skuld::test]
-fn lockdown_active_renders_on_label() {
-    let label = lockdown_menu_label(true, true);
+fn lockdown_live_renders_on_label() {
+    let label = lockdown_menu_label(true, CoverPresence::Live);
     assert!(label.to_lowercase().contains("on") || label.to_lowercase().contains("lockdown"));
 }
 
 #[skuld::test]
 fn lockdown_off_renders_plain_label() {
-    let label = lockdown_menu_label(false, false);
+    let label = lockdown_menu_label(false, CoverPresence::Absent);
     assert!(!label.to_lowercase().contains("warning"));
 }
 
@@ -195,32 +195,75 @@ fn lockdown_off_renders_plain_label() {
 
 #[skuld::test]
 fn escape_items_offers_unblock_and_go_offline_independently() {
-    // Exhaustive over all eight (lockdown_enabled, running, blocked_offers_go_offline)
-    // rows. The two escapes are independent: `unblock` is exactly
-    // `lockdown_enabled && !running`; `go_offline` is exactly
-    // `blocked_offers_go_offline`. Both can be true at once — rendering both is the
-    // point (rule #0 favours more escapes over fewer). There is no probe input to
-    // fail — this table is the whole decision.
+    // Exhaustive over the gate's REAL domain: 5 `CoverPresence` variants x
+    // `blocked_offers_go_offline`. `running` was removed from the signature —
+    // the escape is gated on observed cover presence alone, never on recorded
+    // session posture (Task 8b) — so crossing it in would have duplicated
+    // every row rather than testing anything.
     let table = [
-        // (lockdown_enabled, running, blocked_offers_go_offline, expect_go_offline, expect_unblock)
-        (true, false, true, true, true),
-        (true, false, false, false, true),
-        (true, true, true, true, false),
-        (true, true, false, false, false),
-        (false, false, true, true, false),
-        (false, false, false, false, false),
-        (false, true, true, true, false),
-        (false, true, false, false, false),
+        // (cover_presence, blocked_offers_go_offline, expect_go_offline, expect_unblock)
+        (CoverPresence::Live, true, true, true),
+        (CoverPresence::Live, false, false, true),
+        (CoverPresence::Recorded, true, true, true),
+        (CoverPresence::Recorded, false, false, true),
+        (CoverPresence::Indeterminate, true, true, true),
+        (CoverPresence::Indeterminate, false, false, true),
+        (CoverPresence::Unreachable, true, true, true),
+        (CoverPresence::Unreachable, false, false, true),
+        (CoverPresence::Absent, true, true, false),
+        (CoverPresence::Absent, false, false, false),
     ];
-    for (lockdown_enabled, running, blocked_offers_go_offline, expect_go_offline, expect_unblock) in table {
-        let escapes = escape_items(lockdown_enabled, running, blocked_offers_go_offline);
+    for (cover_presence, blocked_offers_go_offline, expect_go_offline, expect_unblock) in table {
+        let escapes = escape_items(cover_presence, blocked_offers_go_offline);
         assert_eq!(
             escapes,
             EscapeItems {
                 go_offline: expect_go_offline,
                 unblock: expect_unblock,
             },
-            "lockdown_enabled={lockdown_enabled} running={running} blocked_offers_go_offline={blocked_offers_go_offline}"
+            "cover_presence={cover_presence:?} blocked_offers_go_offline={blocked_offers_go_offline}"
+        );
+    }
+}
+
+#[skuld::test]
+fn the_escape_is_offered_when_a_cover_is_recorded_but_intent_is_off() {
+    // A cover recorded from a prior run, observed while intent reads off,
+    // still needs an escape: presence is what gates it, not intent.
+    let escapes = escape_items(CoverPresence::Recorded, false);
+    assert!(escapes.unblock, "a Recorded cover must still offer the unblock escape");
+}
+
+#[skuld::test]
+fn only_a_confirmed_absent_cover_hides_the_escape() {
+    for presence in [
+        CoverPresence::Live,
+        CoverPresence::Recorded,
+        CoverPresence::Indeterminate,
+        CoverPresence::Unreachable,
+    ] {
+        assert!(
+            escape_items(presence, false).unblock,
+            "{presence:?} must offer the unblock escape"
+        );
+    }
+    assert!(
+        !escape_items(CoverPresence::Absent, false).unblock,
+        "only a confirmed Absent cover hides the unblock escape"
+    );
+}
+
+#[skuld::test]
+fn an_unreachable_probe_keeps_the_escape_offered() {
+    // A probe that could not determine the truth must never resolve toward
+    // "nothing is blocking" — Indeterminate and Unreachable both keep the
+    // unblock escape offered (with no session running), same as a confirmed
+    // Live/Recorded cover.
+    for presence in [CoverPresence::Indeterminate, CoverPresence::Unreachable] {
+        let escapes = escape_items(presence, false);
+        assert!(
+            escapes.unblock,
+            "an uncertain probe ({presence:?}) must still offer the unblock escape"
         );
     }
 }
@@ -239,31 +282,9 @@ fn unblock_unreachable_message_names_the_command_and_the_disconnect_caveat() {
 }
 
 #[skuld::test]
-fn unblock_session_running_message_does_not_name_the_cli() {
-    assert!(
-        UNBLOCK_SESSION_RUNNING_MESSAGE.to_lowercase().contains("disconnect"),
-        "must point the user at Disconnect: {UNBLOCK_SESSION_RUNNING_MESSAGE:?}"
-    );
-    assert!(
-        !UNBLOCK_SESSION_RUNNING_MESSAGE.contains("bridge unlock"),
-        "must NOT talk a user into an out-of-process clear over a live tunnel: {UNBLOCK_SESSION_RUNNING_MESSAGE:?}"
-    );
-}
-
-#[skuld::test]
 fn unblock_dialog_message_maps_each_response_distinctly() {
-    use crate::bridge_client::ClientError;
-
     // Ack: silent success, no dialog.
     assert_eq!(unblock_dialog_message(&Ok(BridgeResponse::Ack)), None);
-
-    // SessionRunning: the disconnect-safe message — a swapped arm here would
-    // show UNBLOCK_UNREACHABLE_MESSAGE instead, which names the CLI command
-    // and would strip a cover out from under a live tunnel.
-    assert_eq!(
-        unblock_dialog_message(&Err(ClientError::SessionRunning)).as_deref(),
-        Some(UNBLOCK_SESSION_RUNNING_MESSAGE)
-    );
 
     // A bridge-authored failure: shown verbatim, not replaced by a fixed string.
     assert_eq!(unblock_dialog_message(&Ok(err_resp("boom"))).as_deref(), Some("boom"));
@@ -290,24 +311,6 @@ fn unblock_dialog_message_maps_each_response_distinctly() {
     );
 }
 
-// startup_should_connect ==============================================================================================
-
-#[skuld::test]
-fn startup_should_connect_truth_table() {
-    use hole_common::config::StartupBehavior::*;
-    // DoNotConnect: never, regardless of last_enabled.
-    assert!(!startup_should_connect(DoNotConnect, false));
-    assert!(!startup_should_connect(DoNotConnect, true));
-    // RestoreLastState: mirror the last honored intent.
-    assert!(!startup_should_connect(RestoreLastState, false));
-    assert!(startup_should_connect(RestoreLastState, true));
-    // AlwaysConnect: always.
-    assert!(startup_should_connect(AlwaysConnect, false));
-    assert!(startup_should_connect(AlwaysConnect, true));
-}
-
-// should_apply_pending ================================================================================================
-
 fn status_resp(running: bool) -> BridgeResponse {
     BridgeResponse::Status {
         running,
@@ -317,62 +320,8 @@ fn status_resp(running: bool) -> BridgeResponse {
         udp_proxy_available: true,
         ipv6_bypass_available: true,
         lockdown_enabled: false,
-        lockdown_active: false,
+        cover_presence: CoverPresence::Absent,
         blocked_until_connected: false,
-    }
-}
-
-fn status_resp_blocked() -> BridgeResponse {
-    match status_resp(false) {
-        BridgeResponse::Status {
-            uptime_secs,
-            error,
-            invalid_filters,
-            udp_proxy_available,
-            ipv6_bypass_available,
-            lockdown_enabled,
-            lockdown_active,
-            ..
-        } => BridgeResponse::Status {
-            running: false,
-            uptime_secs,
-            error,
-            invalid_filters,
-            udp_proxy_available,
-            ipv6_bypass_available,
-            lockdown_enabled,
-            lockdown_active,
-            blocked_until_connected: true,
-        },
-        other => other,
-    }
-}
-
-#[skuld::test]
-fn should_apply_pending_rules() {
-    use PendingAction::*;
-    // Owned Results, only borrowed (BridgeResponse/ClientError are not Clone).
-    let table: Vec<(Result<BridgeResponse, ClientError>, PendingAction)> = vec![
-        // Bridge reachable and idle -> apply the boot-connect intent now.
-        (Ok(status_resp(false)), Apply),
-        // Bridge reachable and already running -> intent satisfied, drop it.
-        (Ok(status_resp(true)), Drop),
-        // Bridge not reachable yet (still booting) -> keep the intent for a later tick.
-        (Err(transport_err()), Retain),
-        // A DACL/version/transport hiccup proves nothing about readiness -> keep the intent.
-        (Err(ClientError::PermissionDenied), Retain),
-        (Err(ClientError::VersionMismatch { bridge: None }), Retain),
-        (Err(ClientError::Io(std::io::Error::other("io"))), Retain),
-        (Err(ClientError::Protocol("bad frame".into())), Retain),
-        // Reachable but the bridge errored on Status -> keep the intent.
-        (Ok(err_resp("busy")), Retain),
-        (Ok(BridgeResponse::Ack), Retain),
-        // Not running but fail-closed -> retain (don't re-apply against a
-        // deliberately-blocked host).
-        (Ok(status_resp_blocked()), Retain),
-    ];
-    for (result, expected) in &table {
-        assert_eq!(should_apply_pending(result), *expected, "{result:?}");
     }
 }
 
@@ -452,4 +401,51 @@ fn external_bridge_denied_toast_is_actionable() {
     let toast = external_bridge_denied_toast();
     assert!(toast.to_lowercase().contains("permission denied"), "{toast}");
     assert!(toast.contains("gui.log"), "{toast}");
+}
+
+// Structural guard ====================================================================================================
+
+/// #979: the startup-connect decision moved to the bridge
+/// (`hole_bridge::target::startup_should_connect`) and the GUI's own copy was
+/// deleted, not left dormant. Same idiom as
+/// `the_standing_cover_field_has_exactly_one_reader`: a name reappearing in
+/// non-test GUI source would mean a second decider crept back in.
+#[skuld::test]
+fn the_gui_no_longer_decides() {
+    let needle = "startup_should_connect";
+    let src_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+
+    let mut matches: Vec<(String, usize, String)> = Vec::new();
+    for entry in walkdir::WalkDir::new(&src_root) {
+        let entry = entry.expect("failed to walk crates/hole/src");
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+            continue;
+        }
+        let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        if file_name.ends_with("_tests.rs") {
+            continue;
+        }
+        let text = std::fs::read_to_string(path).expect("failed to read a walked source file");
+        for (line_no, line) in text.lines().enumerate() {
+            if line.contains(needle) {
+                matches.push((path.display().to_string(), line_no + 1, line.trim().to_string()));
+            }
+        }
+    }
+
+    assert!(
+        matches.is_empty(),
+        "the_gui_no_longer_decides: `{needle}` must not appear in non-test GUI sources \
+         (skipping *_tests.rs) — it belongs to the bridge alone now (#979).\n\
+         Matches found ({}):\n{}",
+        matches.len(),
+        matches
+            .iter()
+            .map(|(file, line_no, line)| format!("  {file}:{line_no}: {line}\n"))
+            .collect::<String>()
+    );
 }

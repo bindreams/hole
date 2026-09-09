@@ -64,13 +64,6 @@ async fn serve_until_signal_returns_when_signal_fires() {
 }
 
 #[skuld::test]
-fn shutdown_reason_keys_on_marker() {
-    use crate::proxy_manager::StopReason;
-    assert_eq!(shutdown_reason(true), StopReason::Cutover);
-    assert_eq!(shutdown_reason(false), StopReason::UserStop);
-}
-
-#[skuld::test]
 fn post_bind_sweep_clears_marker() {
     let dir = tempfile::tempdir().unwrap();
     hole_common::update_marker::write(dir.path(), &super::test_marker(), None).unwrap();

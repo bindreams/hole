@@ -31,7 +31,7 @@ fn encode_request_roundtrips() {
             diagnostic_plugin_tap: false,
         },
         attempt_id: "elev-test".into(),
-        covered: false,
+        on_startup: Some(hole_common::config::StartupBehavior::default()),
     };
 
     let b64 = super::encode_request(&request);
@@ -88,7 +88,7 @@ fn write_request_file_roundtrip() {
             diagnostic_plugin_tap: false,
         },
         attempt_id: "elev-test".into(),
-        covered: false,
+        on_startup: Some(hole_common::config::StartupBehavior::default()),
     };
 
     let temp_path = super::write_request_file(&request).unwrap();
@@ -133,7 +133,7 @@ fn read_request_file_roundtrip() {
             diagnostic_plugin_tap: false,
         },
         attempt_id: "elev-test".into(),
-        covered: false,
+        on_startup: Some(hole_common::config::StartupBehavior::default()),
     };
 
     let temp_path = super::write_request_file(&request).unwrap();
@@ -172,7 +172,7 @@ fn start_attempt_id_survives_request_file_roundtrip() {
     let request = BridgeRequest::Start {
         config: ProxyConfig::default(),
         attempt_id: "elev-attempt-42".into(),
-        covered: false,
+        on_startup: Some(hole_common::config::StartupBehavior::default()),
     };
     let temp_path = super::write_request_file(&request).unwrap();
     let path = temp_path.to_path_buf();
@@ -266,7 +266,7 @@ fn read_result_file_garbage_is_err() {
 
 use super::classify_elevated_send;
 use crate::bridge_client::ClientError;
-use hole_common::protocol::{BridgeResponse, StartError};
+use hole_common::protocol::{BridgeResponse, CoverPresence, StartError};
 
 #[skuld::test]
 fn classify_ack_is_success() {
@@ -288,7 +288,7 @@ fn classify_unexpected_ok_is_success() {
         udp_proxy_available: true,
         ipv6_bypass_available: true,
         lockdown_enabled: false,
-        lockdown_active: false,
+        cover_presence: CoverPresence::Absent,
         blocked_until_connected: false,
     });
     assert_eq!(classify_elevated_send(&r), ElevatedOutcome::Success);

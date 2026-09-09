@@ -1,7 +1,7 @@
 use super::*;
 use axum::Json;
 use hole_common::protocol::{
-    BridgeRequest, BridgeResponse, DiagnosticsResponse, EmptyResponse, MetricsResponse, StatusResponse,
+    BridgeRequest, BridgeResponse, CoverPresence, DiagnosticsResponse, EmptyResponse, MetricsResponse, StatusResponse,
 };
 use hyper::body::Incoming;
 use std::path::PathBuf;
@@ -32,7 +32,7 @@ async fn spawn_mock_bridge(path: &std::path::Path) -> tokio::task::JoinHandle<()
                     udp_proxy_available: true,
                     ipv6_bypass_available: true,
                     lockdown_enabled: false,
-                    lockdown_active: false,
+                    cover_presence: CoverPresence::Absent,
                     blocked_until_connected: false,
                 })
             }),
@@ -126,7 +126,7 @@ fn send_status_request_receives_response() {
                 udp_proxy_available: true,
                 ipv6_bypass_available: true,
                 lockdown_enabled: false,
-                lockdown_active: false,
+                cover_presence: CoverPresence::Absent,
                 blocked_until_connected: false,
             }
         );
@@ -143,7 +143,7 @@ fn send_start_receives_ack() {
         let resp = client
             .send(BridgeRequest::Start {
                 attempt_id: "id-123".into(),
-                covered: false,
+                on_startup: Some(hole_common::config::StartupBehavior::default()),
                 config: hole_common::protocol::ProxyConfig {
                     server: hole_common::config::ServerEntry {
                         id: "id".into(),
@@ -298,7 +298,7 @@ fn start_and_cancel_send_attempt_id_header() {
             .send(BridgeRequest::Start {
                 config: hole_common::protocol::ProxyConfig::default(),
                 attempt_id: "id-123".into(),
-                covered: false,
+                on_startup: Some(hole_common::config::StartupBehavior::default()),
             })
             .await
             .unwrap();
@@ -323,13 +323,15 @@ fn start_and_cancel_send_attempt_id_header() {
 }
 
 #[skuld::test]
-fn start_covered_sends_x_hole_covered_header() {
-    // The load-bearing wire seam of #553: a covered Start must emit
-    // `x-hole-covered: true`; a manual (covered:false) Start must OMIT it (the
-    // bridge treats absence as fail-open). If this regressed, every auto-connect
-    // would silently fail OPEN with the suite still green.
+fn start_sends_x_hole_on_startup_header_only_when_a_preference_is_pushed() {
+    // The load-bearing wire seam of #979: a Start carrying `Some` preference
+    // (the GUI's case) sends it on the wire; `None` (the CLI's case — no
+    // Settings preference to push) omits the header entirely rather than
+    // sending some default, so the bridge knows to leave whatever it already
+    // has persisted untouched (see `crate::bridge_client`'s `Start` arm and
+    // `hole_bridge::ipc::on_startup_from`).
     rt().block_on(async {
-        let path = test_socket_path("covered-header");
+        let path = test_socket_path("on-startup-header");
         let listener = hole_bridge::socket::LocalListener::bind(&path).unwrap();
         let captured: std::sync::Arc<std::sync::Mutex<Vec<String>>> =
             std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -341,7 +343,7 @@ fn start_covered_sends_x_hole_covered_header() {
                     let cap = cap.clone();
                     async move {
                         let v = headers
-                            .get("x-hole-covered")
+                            .get("x-hole-on-startup")
                             .and_then(|v| v.to_str().ok())
                             .unwrap_or("<absent>")
                             .to_owned();
@@ -376,12 +378,18 @@ fn start_covered_sends_x_hole_covered_header() {
         });
 
         let mut client = BridgeClient::connect(&path).await.unwrap();
-        for covered in [true, false] {
+        use hole_common::config::StartupBehavior;
+        for on_startup in [
+            Some(StartupBehavior::DoNotConnect),
+            Some(StartupBehavior::RestoreLastState),
+            Some(StartupBehavior::AlwaysConnect),
+            None,
+        ] {
             client
                 .send(BridgeRequest::Start {
                     config: hole_common::protocol::ProxyConfig::default(),
                     attempt_id: "id".into(),
-                    covered,
+                    on_startup,
                 })
                 .await
                 .unwrap();
@@ -390,8 +398,13 @@ fn start_covered_sends_x_hole_covered_header() {
         let _ = server.await;
         assert_eq!(
             captured.lock().unwrap().clone(),
-            vec!["true".to_owned(), "<absent>".to_owned()],
-            "covered:true sends x-hole-covered:true; covered:false omits the header"
+            vec![
+                "do_not_connect".to_owned(),
+                "restore_last_state".to_owned(),
+                "always_connect".to_owned(),
+                "<absent>".to_owned(),
+            ],
+            "Some(_) must send the mapped header; None must omit it entirely"
         );
     });
 }
@@ -454,7 +467,7 @@ async fn spawn_error_bridge(path: &std::path::Path) -> tokio::task::JoinHandle<(
                     udp_proxy_available: true,
                     ipv6_bypass_available: true,
                     lockdown_enabled: false,
-                    lockdown_active: false,
+                    cover_presence: CoverPresence::Absent,
                     blocked_until_connected: false,
                 })
             }),
@@ -507,7 +520,7 @@ fn start_500_maps_to_typed_start_failed() {
         let resp = client
             .send(BridgeRequest::Start {
                 attempt_id: "id-123".into(),
-                covered: false,
+                on_startup: Some(hole_common::config::StartupBehavior::default()),
                 config: hole_common::protocol::ProxyConfig {
                     server: hole_common::config::ServerEntry {
                         id: "id".into(),
@@ -607,7 +620,7 @@ async fn spawn_status_mock(path: &std::path::Path, version: Option<&'static str>
                 udp_proxy_available: true,
                 ipv6_bypass_available: true,
                 lockdown_enabled: false,
-                lockdown_active: false,
+                cover_presence: CoverPresence::Absent,
                 blocked_until_connected: false,
             })
         }),
@@ -660,6 +673,44 @@ fn absent_version_header_is_version_mismatch() {
             c.send(BridgeRequest::Status).await,
             Err(ClientError::VersionMismatch { .. })
         ));
+    });
+}
+
+/// Mock serving GET /v1/status with a mismatched version header AND a body
+/// missing `cover_presence` — a field this client's `StatusResponse` requires.
+/// If body decoding ran before (or instead of) the version check, this would
+/// surface as `ClientError::Protocol` (a decode failure); the wire removal
+/// of `lockdown_active` in favor of a required `cover_presence` field rests
+/// on the version check running first, so this pins that ordering rather
+/// than assuming it.
+async fn spawn_version_skewed_incompatible_status_mock(path: &std::path::Path) -> tokio::task::JoinHandle<()> {
+    let listener = hole_bridge::socket::LocalListener::bind(path).unwrap();
+    let router = axum::Router::new().route(
+        hole_common::protocol::ROUTE_STATUS,
+        axum::routing::get(|| async {
+            (
+                [("x-hole-bridge-version", "6.0.0")],
+                Json(serde_json::json!({ "running": false, "uptime_secs": 0 })),
+            )
+        }),
+    );
+    serve_one(listener, router)
+}
+
+#[skuld::test]
+fn a_version_skewed_response_is_rejected_before_its_body_is_parsed() {
+    rt().block_on(async {
+        let path = test_socket_path("ver-skew-body-incompatible");
+        let _m = spawn_version_skewed_incompatible_status_mock(&path).await;
+        let mut c = BridgeClient::connect_with_version(&path, "7.0.0").await.unwrap();
+        assert!(
+            matches!(
+                c.send(BridgeRequest::Status).await,
+                Err(ClientError::VersionMismatch { .. })
+            ),
+            "a version-mismatched reply must be rejected before its body is decoded, even when the body is \
+             missing a field this client version requires"
+        );
     });
 }
 
@@ -735,10 +786,10 @@ async fn stop_against_status(
     client.send(BridgeRequest::Stop).await
 }
 
-/// Drive POST /v1/unblock against a mock — the `Unblock` arm has its own
-/// bespoke 409 mapping (`ClientError::SessionRunning`) ahead of the generic
-/// `parse_generic_error` fallback, mirroring `Start`'s 409 handling rather
-/// than `Stop`'s.
+/// Drive POST /v1/unblock against a mock — `Unblock` has no bespoke error
+/// mapping and falls through to the generic `parse_generic_error`, same as
+/// `Stop`: the handler reads no session posture, so there is no distinct
+/// "session running" status to map.
 async fn unblock_against_status(
     path: &std::path::Path,
     status: axum::http::StatusCode,
@@ -868,18 +919,18 @@ fn unblock_200_maps_to_ack() {
 }
 
 #[skuld::test]
-fn unblock_409_maps_to_session_running() {
+fn unblock_409_maps_to_protocol() {
     rt().block_on(async {
-        // Unlike `Stop`'s CONFLICT (which falls through to the generic
-        // Protocol-error mapping), Unblock's 409 must map to the typed
-        // variant the tray keys its distinct, cover-safe messaging on.
+        // The handler reads no session posture (Task 8b), so the bridge
+        // never answers Unblock with a 409 in the first place; but if it
+        // ever did, Unblock must not special-case it — same as `Stop`.
         let result = unblock_against_status(
             &test_socket_path("unblock409"),
             axum::http::StatusCode::CONFLICT,
-            "a session is running",
+            "nope",
         )
         .await;
-        assert!(matches!(result, Err(ClientError::SessionRunning)), "got {result:?}");
+        assert!(matches!(result, Err(ClientError::Protocol(_))), "got {result:?}");
     });
 }
 
@@ -926,7 +977,7 @@ async fn start_raw(
     c.send(BridgeRequest::Start {
         config: hole_common::protocol::ProxyConfig::default(),
         attempt_id: "a".into(),
-        covered: false,
+        on_startup: Some(hole_common::config::StartupBehavior::default()),
     })
     .await
 }

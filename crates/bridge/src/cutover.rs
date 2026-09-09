@@ -119,6 +119,13 @@ pub fn run_detached(_payload: &Path, _target_version: &str) -> std::io::Result<(
 /// success. A swallowed failure (e.g. run unprivileged) would leave the cover
 /// engaged — egress still blocked — while the intent reads "off", misleading the
 /// user.
+///
+/// Refuses outright against a live bridge instance (#840): a running bridge
+/// already reconciles the target itself, and racing it from an unrelated CLI
+/// invocation is exactly the two-writer hazard `target::apply`'s locking
+/// exists to prevent. The in-app "Unblock Network" action is the live-bridge
+/// equivalent, so refusal names it as the alternative. The exclusion is
+/// structural, not a point-in-time probe: see [`unlock_with`].
 pub fn unlock() -> std::io::Result<()> {
     let state_dir = service_state_dir();
     unlock_with(&state_dir, || {
@@ -126,11 +133,38 @@ pub fn unlock() -> std::io::Result<()> {
     })
 }
 
-/// `unlock`'s ordering, with the disengage step injected so tests can drive the
-/// cannot-disengage path without touching the host firewall. Disengage → flip;
-/// the intent flips off ONLY after the disengage confirms success.
+/// `unlock`'s ordering, with the disengage step injected so tests can drive
+/// the cannot-disengage path without touching the host firewall. Liveness
+/// check → target off → disengage → intent flip; the intent flips off ONLY
+/// after the disengage confirms success, and the target is recorded off
+/// before the release call so a reconciler reading it mid-unlock never sees
+/// a stale `Connected`/prior target.
+///
+/// The liveness check is [`crate::liveness::BridgeLiveness::try_acquire`] on
+/// the SAME lock a running bridge holds for its whole lifetime, held across
+/// this whole sequence rather than released after the check: a point-in-time
+/// probe (the old `is_running`) can go stale before the first mutation runs,
+/// letting a bridge that starts mid-unlock have its live cover restored away
+/// and its intent flipped off underneath it. Holding the lock instead means
+/// a bridge trying to start during this sequence contends on the same lock
+/// (single-instance is separately enforced by the IPC socket bind, so no
+/// second real bridge is racing this token itself) rather than interleaving
+/// with it.
 fn unlock_with(state_dir: &Path, disengage: impl FnOnce() -> std::io::Result<()>) -> std::io::Result<()> {
+    let Some(_liveness) = crate::liveness::BridgeLiveness::try_acquire(state_dir, None)? else {
+        return Err(std::io::Error::other(
+            "a bridge instance is running; use the in-app \"Unblock Network\" action instead of `hole bridge unlock`",
+        ));
+    };
+    crate::target::apply(state_dir, None, |_| crate::target::Target::Off)
+        .map_err(|e| std::io::Error::other(format!("could not record target off: {e}")))?;
     disengage()?;
+    // Same reason `handle_unblock` clears it: `resolve_startup_target` feeds
+    // the candidate to `AlwaysConnect` over an `Off` target, so leaving it
+    // would let the next boot reconnect to the server this escape just freed
+    // the host from.
+    crate::target::apply_startup_preference(state_dir, None, |pref| pref.candidate = None)
+        .map_err(|e| std::io::Error::other(format!("could not clear the auto-connect candidate: {e}")))?;
     tun_engine::routing::failclosed::lockdown_state::set_enabled(state_dir, false, None)
 }
 

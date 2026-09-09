@@ -150,15 +150,18 @@ before editing; the sections linked below are the authoritative source.
   Both are persistent WFP filters (Win) / self-contained pf ruleset (mac); the
   transient one is swept unconditionally on next start, the standing one only
   on an explicit recorded off — full reconciliation table (`decide_cover_recovery`)
-  and disclosed residuals in CONTRIBUTING.md. An adopted cover's ARMED half
-  is promoted into `bridge-lockdown.json` at the first real engage, so a
-  disconnect (`reload`'s slow path is stop + start) cannot disarm the switch;
-  only `turn_lockdown_off` clears it. The escape from a stranded
-  cover (`failclosed::release_all`) is unconditional and knows nothing about cover
-  state; its only condition is whether a session is running, and turning the
-  kill switch off takes the same path. Who holds a cover has exactly one
-  answer, derived once from `ProxyManager`'s single `posture` field
-  (`Posture::cover_holder`); no site recomputes it from session state. →
+  and disclosed residuals in CONTRIBUTING.md. A single persisted `Target`
+  (`Off` / `Connected` / `Unreadable`) is what both the cover and the tunnel
+  session reconcile toward (`reconciler::{cover_step,tunnel_step,step_order}`);
+  `reconcile_once` drives this at boot, and `turn_lockdown_off`, the tray's
+  Unblock action, and session teardown each drive it inline for their own
+  event, since only boot is covered by a reconcile pass today. Who holds a
+  cover is a **measured OS fact**, `CoverPresence`, read via
+  `Routing::lockdown_cover_presence`, not derived from session state; the
+  escape (`Routing::release_all_covers`) is unconditional, has a
+  structurally-guarded set of sanctioned callers, and clears the in-process
+  adopted-cover claim only on a confirmed release, never on a guard's silent
+  `Drop`. →
   [CONTRIBUTING.md#fail-closed-cover](CONTRIBUTING.md#fail-closed-cover)
 - **Server-address redaction.** The configured address — hostname, resolved IP,
   every textual form — is replaced by a `<server:XXXXXXXX>` token before it
@@ -202,6 +205,21 @@ before editing; the sections linked below are the authoritative source.
   redacted before reaching any log, toast, or bundle; a path's detail still
   lands in `gui.log`, but the server address never does.
   [→](CONTRIBUTING.md#logging--diagnostics)
+- **Per-variant policy lives on the type, never at a call site** — a decision
+  keyed to an enum variant belongs in ONE exhaustive match on that type
+  (`SessionEvent::preserves_death_reason`, `CoverPresence::is_present`), and
+  two variants are never grouped because they happen to share a consequence.
+  Grouping by consequence is what let `ProcessExiting` inherit an answer chosen
+  for a cutover; re-deriving the rule at each site is what let `== Live` drop
+  the two uncertain probe results. This exact shape produced four separate bugs
+  in one change — each a contract stated in prose at the definition site and
+  violated at a call site far away — so it is test-enforced
+  (`session_event_policy_lives_on_the_type_not_at_call_sites`,
+  `cover_presence_is_never_compared_against_a_variant`). Prefer removing the
+  hazard outright over guarding it: `CoverGuard::disarm` had a "call only
+  before process exit" precondition that no test could enforce, and closing the
+  handle it leaked deleted the rule instead of policing it.
+  [→](CONTRIBUTING.md#fail-closed-cover)
 - **The server address is never logged** — no `Display` on `ServerAddress`
   (compiler-enforced), `.expose()` is its only exit, and every `Serialize` type
   transitively holding one needs its own `Dump` impl.

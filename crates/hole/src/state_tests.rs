@@ -100,7 +100,7 @@ fn cell_bumps_seq_only_on_change() {
             running: false,
             error: None,
             lockdown_enabled: false,
-            lockdown_active: false,
+            cover_presence: CoverPresence::Absent,
             blocked_until_connected: false
         }
     );
@@ -114,7 +114,7 @@ fn cell_bumps_seq_only_on_change() {
             running: true,
             error: None,
             lockdown_enabled: false,
-            lockdown_active: false,
+            cover_presence: CoverPresence::Absent,
             blocked_until_connected: false
         }
     );
@@ -126,7 +126,7 @@ fn cell_bumps_seq_only_on_change() {
             running: false,
             error: None,
             lockdown_enabled: false,
-            lockdown_active: false,
+            cover_presence: CoverPresence::Absent,
             blocked_until_connected: false
         }
     );
@@ -147,7 +147,7 @@ async fn cell_wakes_watchers_only_on_change() {
             running: true,
             error: None,
             lockdown_enabled: false,
-            lockdown_active: false,
+            cover_presence: CoverPresence::Absent,
             blocked_until_connected: false,
         }
     );
@@ -158,11 +158,11 @@ fn commit_status_carries_lockdown_fields() {
     let cell = ProxyStateCell::new();
     // Initial snapshot defaults the lockdown fields to false.
     let s0 = cell.snapshot();
-    assert!(!s0.lockdown_enabled && !s0.lockdown_active);
+    assert!(!s0.lockdown_enabled && s0.cover_presence == CoverPresence::Absent);
     // A Status commit threads both lockdown bools alongside `running`.
-    cell.commit_status(true, None, true, false, false);
+    cell.commit_status(true, None, true, CoverPresence::Absent, false);
     let s1 = cell.snapshot();
-    assert!(s1.running && s1.lockdown_enabled && !s1.lockdown_active);
+    assert!(s1.running && s1.lockdown_enabled && s1.cover_presence == CoverPresence::Absent);
     assert_eq!(s1.seq, 1, "seq bumped on change");
 }
 
@@ -172,15 +172,15 @@ fn commit_preserves_lockdown_fields() {
     // `commit_status`); its `..*snap` must NOT clobber the lockdown warning state
     // a prior Status established (`enabled && !active` is the tray warning state).
     let cell = ProxyStateCell::new();
-    cell.commit_status(true, None, true, false, false); // running + lockdown enabled, not active
+    cell.commit_status(true, None, true, CoverPresence::Absent, false); // running + lockdown enabled, not active
     let before = cell.snapshot();
-    assert!(before.lockdown_enabled && !before.lockdown_active);
+    assert!(before.lockdown_enabled && before.cover_presence == CoverPresence::Absent);
 
     cell.commit(false); // a Stop/transport observation knows only `running`
     let after = cell.snapshot();
     assert!(!after.running, "running flipped to false");
     assert!(
-        after.lockdown_enabled && !after.lockdown_active,
+        after.lockdown_enabled && after.cover_presence == CoverPresence::Absent,
         "commit must preserve the lockdown fields, got {after:?}"
     );
     assert_eq!(after.seq, before.seq + 1, "running change bumps seq");
@@ -194,7 +194,7 @@ fn commit_clears_blocked_on_a_settled_running_edge() {
     // the next Status poll. A settled running edge resolves the transient blocked
     // sub-state, so commit clears the flag AND bumps seq to repaint immediately.
     let cell = ProxyStateCell::new();
-    cell.commit_status(false, None, false, false, true); // enter the blocked state
+    cell.commit_status(false, None, false, CoverPresence::Absent, true); // enter the blocked state
     let before = cell.snapshot();
     assert!(before.blocked_until_connected, "precondition: blocked");
 
@@ -221,7 +221,7 @@ fn commit_status_carries_error_on_death() {
         false,
         Some("proxy task exited unexpectedly".into()),
         false,
-        false,
+        CoverPresence::Absent,
         false,
     );
     let snap = cell.snapshot();
@@ -235,7 +235,7 @@ fn commit_clears_error_on_non_status_running_change() {
     // A non-Status running edge (Start/Stop/Cancel) is user-initiated and
     // carries no death reason — `commit` must clear any prior error.
     let cell = ProxyStateCell::new();
-    cell.commit_status(true, Some("synthetic".into()), false, false, false); // running -> true with an error
+    cell.commit_status(true, Some("synthetic".into()), false, CoverPresence::Absent, false); // running -> true with an error
     assert_eq!(cell.snapshot().error.as_deref(), Some("synthetic"));
     cell.commit(false); // clean stop via the non-Status path
     assert_eq!(cell.snapshot().error, None, "non-Status commit must clear error");
@@ -249,7 +249,7 @@ fn reconnect_clears_death_error() {
         false,
         Some("proxy task exited unexpectedly".into()),
         false,
-        false,
+        CoverPresence::Absent,
         false,
     );
     cell.commit(true); // reconnect via a Start Ack
@@ -265,7 +265,7 @@ fn proxy_snapshot_serializes_error() {
         running: false,
         error: Some("boom".into()),
         lockdown_enabled: false,
-        lockdown_active: false,
+        cover_presence: CoverPresence::Absent,
         blocked_until_connected: false,
     })
     .unwrap();
@@ -275,7 +275,7 @@ fn proxy_snapshot_serializes_error() {
         running: false,
         error: None,
         lockdown_enabled: false,
-        lockdown_active: false,
+        cover_presence: CoverPresence::Absent,
         blocked_until_connected: false,
     })
     .unwrap();
@@ -295,7 +295,7 @@ fn observed_error_only_from_status_ok() {
         udp_proxy_available: true,
         ipv6_bypass_available: true,
         lockdown_enabled: false,
-        lockdown_active: false,
+        cover_presence: CoverPresence::Absent,
         blocked_until_connected: false,
     });
     assert_eq!(
@@ -317,7 +317,7 @@ fn status_resp(running: bool) -> BridgeResponse {
         udp_proxy_available: true,
         ipv6_bypass_available: true,
         lockdown_enabled: false,
-        lockdown_active: false,
+        cover_presence: CoverPresence::Absent,
         blocked_until_connected: false,
     }
 }
@@ -470,7 +470,7 @@ fn status_response(running: bool) -> StatusResponse {
         udp_proxy_available: true,
         ipv6_bypass_available: true,
         lockdown_enabled: false,
-        lockdown_active: false,
+        cover_presence: CoverPresence::Absent,
         blocked_until_connected: false,
     }
 }
@@ -572,7 +572,7 @@ async fn start_ack_commits_true() {
     let resp = link
         .send(BridgeRequest::Start {
             attempt_id: "x".into(),
-            covered: false,
+            on_startup: Some(hole_common::config::StartupBehavior::default()),
             config: test_proxy_config(),
         })
         .await
@@ -585,7 +585,7 @@ async fn start_ack_commits_true() {
             running: true,
             error: None,
             lockdown_enabled: false,
-            lockdown_active: false,
+            cover_presence: CoverPresence::Absent,
             blocked_until_connected: false
         }
     );
@@ -638,7 +638,7 @@ async fn transport_error_commits_false() {
             running: false,
             error: None,
             lockdown_enabled: false,
-            lockdown_active: false,
+            cover_presence: CoverPresence::Absent,
             blocked_until_connected: false
         }
     );
@@ -663,7 +663,7 @@ async fn transport_error_holds_snapshot_while_marker_present() {
             running: true,
             error: None,
             lockdown_enabled: false,
-            lockdown_active: false,
+            cover_presence: CoverPresence::Absent,
             blocked_until_connected: false
         },
         "marker present => transport error holds the last snapshot"
@@ -755,7 +755,7 @@ async fn wedge_reachable_carries_lockdown_change() {
                 Json(StatusResponse {
                     running: false,
                     lockdown_enabled: true,
-                    lockdown_active: false,
+                    cover_presence: CoverPresence::Absent,
                     ..status_response(false)
                 })
             }),
@@ -770,7 +770,7 @@ async fn wedge_reachable_carries_lockdown_change() {
     let s = link.cell().snapshot();
     assert!(!s.running && s.error.as_deref() == Some(super::UPDATE_FAILED));
     assert!(
-        s.lockdown_enabled && !s.lockdown_active,
+        s.lockdown_enabled && s.cover_presence == CoverPresence::Absent,
         "the wedge Status's lockdown fields must apply, not the stale prior ones"
     );
 }
@@ -895,22 +895,22 @@ fn commit_update_failed_applies_a_lockdown_change() {
     // A wedge whose Status carried a lockdown change must surface UPDATE_FAILED
     // AND the new lockdown fields — not preserve the stale prior ones.
     let cell = super::ProxyStateCell::new();
-    cell.commit_status(true, None, false, false, false); // connected, no lockdown
-    cell.commit_update_failed(super::UPDATE_FAILED, Some((true, false, false)));
+    cell.commit_status(true, None, false, CoverPresence::Absent, false); // connected, no lockdown
+    cell.commit_update_failed(super::UPDATE_FAILED, Some((true, CoverPresence::Absent, false)));
     let s = cell.snapshot();
     assert!(!s.running && s.error.as_deref() == Some(super::UPDATE_FAILED));
     assert!(
-        s.lockdown_enabled && !s.lockdown_active,
+        s.lockdown_enabled && s.cover_presence == CoverPresence::Absent,
         "the wedge's lockdown fields apply"
     );
     // Re-committing the same wedge + lockdown is idempotent.
     let seq = s.seq;
-    cell.commit_update_failed(super::UPDATE_FAILED, Some((true, false, false)));
+    cell.commit_update_failed(super::UPDATE_FAILED, Some((true, CoverPresence::Absent, false)));
     assert_eq!(cell.snapshot().seq, seq);
     // A lockdown change bumps seq even though running/error are unchanged.
-    cell.commit_update_failed(super::UPDATE_FAILED, Some((true, true, false)));
+    cell.commit_update_failed(super::UPDATE_FAILED, Some((true, CoverPresence::Live, false)));
     let s2 = cell.snapshot();
-    assert!(s2.lockdown_active && s2.seq == seq + 1);
+    assert!(s2.cover_presence != CoverPresence::Absent && s2.seq == seq + 1);
 }
 
 // Real seam, alive, through send(): held.
@@ -981,7 +981,7 @@ async fn oneshot_never_commits() {
             running: true,
             error: None,
             lockdown_enabled: false,
-            lockdown_active: false,
+            cover_presence: CoverPresence::Absent,
             blocked_until_connected: false
         }
     );
@@ -1014,7 +1014,7 @@ async fn untracked_requests_never_commit() {
             running: false,
             error: None,
             lockdown_enabled: false,
-            lockdown_active: false,
+            cover_presence: CoverPresence::Absent,
             blocked_until_connected: false
         }
     );
@@ -1050,7 +1050,7 @@ async fn concurrent_requests_commit_in_bridge_order() {
         async move {
             link.send(BridgeRequest::Start {
                 attempt_id: "x".into(),
-                covered: false,
+                on_startup: Some(hole_common::config::StartupBehavior::default()),
                 config: test_proxy_config(),
             })
             .await
@@ -1077,7 +1077,7 @@ async fn concurrent_requests_commit_in_bridge_order() {
             running: true,
             error: None,
             lockdown_enabled: false,
-            lockdown_active: false,
+            cover_presence: CoverPresence::Absent,
             blocked_until_connected: false
         }
     );
@@ -1141,7 +1141,7 @@ async fn reload_if_running_reloads_when_running() {
             running: true,
             error: None,
             lockdown_enabled: false,
-            lockdown_active: false,
+            cover_presence: CoverPresence::Absent,
             blocked_until_connected: false
         }
     );
@@ -1185,7 +1185,11 @@ fn classify_lockdown_is_fail_closed_three_state() {
             udp_proxy_available: true,
             ipv6_bypass_available: true,
             lockdown_enabled,
-            lockdown_active: lockdown_enabled,
+            cover_presence: if lockdown_enabled {
+                CoverPresence::Live
+            } else {
+                CoverPresence::Absent
+            },
             blocked_until_connected: false,
         })
     };
@@ -1211,7 +1215,10 @@ fn classify_lockdown_is_fail_closed_three_state() {
         super::classify_lockdown(&Err(ClientError::PermissionDenied)),
         super::LockdownRead::Unreadable
     );
-    assert_eq!(super::observed_lockdown(&status(true)), Some((true, true, false)));
+    assert_eq!(
+        super::observed_lockdown(&status(true)),
+        Some((true, CoverPresence::Live, false))
+    );
     assert_eq!(super::observed_lockdown(&Ok(BridgeResponse::Ack)), None);
     assert_eq!(super::observed_lockdown(&Err(ClientError::PermissionDenied)), None);
 }

@@ -197,11 +197,9 @@ fn launch_gui(show_dashboard: bool) {
             // immediate first tick is the startup resync against the
             // bridge's actual state (#462).
             tray::spawn_proxy_state_sync(app.handle());
-            // Record the persisted "On startup" intent (#458); the status
-            // reconciler applies it (silently — no install/elevation/error modal)
-            // the first time the bridge is reachable, so a cold-boot race against
-            // the bridge's socket bind can't drop it.
-            tray::arm_startup_auto_connect(app.handle());
+            // Startup auto-connect is the bridge's own decision now (#979): it
+            // applies its persisted `on_startup` preference at its own boot,
+            // before any GUI runs — the GUI has nothing to arm here.
             platform::on_setup(app)?;
             // Registrations written before the dashboard flag existed carry no
             // arguments and would open a window at login. Best-effort: never

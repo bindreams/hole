@@ -10,6 +10,18 @@ mod api_generated {
 }
 pub use api_generated::*;
 
+impl CoverPresence {
+    /// Wire-side mirror of `tun_engine::routing::CoverPresence::is_present`.
+    ///
+    /// The rule has to exist on this type too: `crates/hole` cannot depend on
+    /// tun-engine, so the GUI cannot reach the bridge-side method, and the
+    /// tray is exactly where getting it wrong hides a live kill switch behind
+    /// a silent-green menu.
+    pub fn is_present(self) -> bool {
+        !matches!(self, CoverPresence::Absent)
+    }
+}
+
 #[allow(clippy::derivable_impls)] // FilterMetrics is code-generated without Default
 impl Default for FilterMetrics {
     fn default() -> Self {
@@ -41,13 +53,21 @@ pub enum BridgeRequest {
         /// client-side-only header, so it survives the elevation
         /// re-serialization path (`encode_request` / `write_request_file`).
         attempt_id: String,
-        /// Whether this start represents an auto-connect intent, so the bridge
-        /// engages a fail-closed cover that stays blocked on failure. Sent on the
-        /// wire as the `X-Hole-Covered` header (like `attempt_id`); a struct field
-        /// so it survives the elevation re-serialization path. serde-default false
-        /// so a manual connect and older payloads keep today's fail-open behavior.
+        /// The GUI's current startup preference, pushed on every connect so
+        /// the bridge can apply it at its own next boot with no GUI running
+        /// (#979, #617) — see `hole_bridge::target::resolve_startup_target`.
+        /// This is a preference the bridge persists, not a decision the GUI
+        /// makes: whether THIS start is auto-connect-covered is for the
+        /// bridge alone to know, which is why the removed `covered`
+        /// field is not replaced by an equivalent. Sent on the wire as the
+        /// `X-Hole-On-Startup` header (like `attempt_id`), so it survives the
+        /// elevation re-serialization path.
+        ///
+        /// `None` when the caller has no preference to push — the CLI's
+        /// case, which must leave whatever the bridge already has persisted
+        /// untouched rather than stomping it with the wire default (#979).
         #[serde(default)]
-        covered: bool,
+        on_startup: Option<crate::config::StartupBehavior>,
     },
     Stop,
     /// Cancel the in-flight `Start` whose `attempt_id` matches, or pre-arm a
@@ -142,7 +162,11 @@ pub enum BridgeResponse {
         udp_proxy_available: bool,
         ipv6_bypass_available: bool,
         lockdown_enabled: bool,
-        lockdown_active: bool,
+        /// What the bridge measured about a standing lockdown cover on the
+        /// host — replaces the old `lockdown_active: bool`, which answered
+        /// the host question with a process-ownership answer instead of a
+        /// measurement (bindreams/hole#825).
+        cover_presence: CoverPresence,
         /// Whether a covered start failed and left the host fail-closed (blocked,
         /// not leaked) while not running. Drives the GUI's distinct blocked state
         /// (Retry / Disconnect).

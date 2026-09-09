@@ -1063,6 +1063,32 @@ pub enum CoverPresence {
     Unreachable,
 }
 
+impl CoverPresence {
+    /// Whether a cover should be treated as present.
+    ///
+    /// `Absent` is the ONLY answer that means "nothing is blocking". The two
+    /// uncertain variants (`Indeterminate`, `Unreachable`) mean the probe
+    /// could not give a real answer, and an escape-offering site must resolve
+    /// that toward "still blocked" — never toward "nothing to do". This
+    /// method exists so that rule is written once instead of being re-derived
+    /// as `!= Absent` at each site, where a plausible-looking `== Live`
+    /// silently drops both uncertain variants.
+    pub fn is_present(self) -> bool {
+        !matches!(self, CoverPresence::Absent)
+    }
+
+    /// Whether the OS positively CONFIRMED a cover, as distinct from
+    /// [`is_present`](Self::is_present)'s "not confirmed absent".
+    ///
+    /// Deliberately narrow, and correct only where a false negative is the
+    /// safe direction — recording an adopted-cover claim, or deciding a
+    /// pre-lockdown baseline is still capturable. Never use it to decide
+    /// whether to OFFER an escape.
+    pub fn is_confirmed_live(self) -> bool {
+        matches!(self, CoverPresence::Live)
+    }
+}
+
 /// The outcome of [`decide_cover_recovery`]: one action, plus whether the
 /// measured truth should be written back to the intent file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1351,10 +1377,13 @@ pub trait CoverGuard {
     /// Persist the underlying filters without disengaging: consume the guard so
     /// its `Drop` (the disengage) never runs.
     ///
-    /// PRECONDITION: call only immediately before process exit. Skipping `Drop`
-    /// also skips releasing the guard's other resources (e.g. the Windows WFP
-    /// engine handle), which the kernel reclaims on exit but which a long-lived
-    /// caller would leak per call.
+    /// Persists the filters and releases this process's claim on them. Safe
+    /// for a LONG-LIVED caller: the implementation closes whatever the guard
+    /// still holds (the Windows FWPM engine handle) rather than skipping it,
+    /// so there is no per-call leak.
+    ///
+    /// macOS deliberately leaves pf enabled: its guard holds no process-local
+    /// resource, and the enable refcount is the thing being persisted.
     fn disarm(self);
 }
 
@@ -1509,6 +1538,13 @@ pub trait Routing: Send + Sync {
     /// from a stranded cover; a required method (no default) so every
     /// `Routing` implementation, including every test mock, commits to one.
     fn release_all_covers(&self) -> Result<(), RoutingError>;
+
+    /// Measure whether a standing lockdown cover is present on the host right
+    /// now — an OS probe, not a recollection of what this process engaged.
+    /// See [`CoverPresence`] for what each variant means. A required method
+    /// (no default) so every `Routing` implementation, including every test
+    /// mock, commits to a value the caller can control.
+    fn lockdown_cover_presence(&self) -> CoverPresence;
 }
 
 // System (production) routing =========================================================================================
@@ -1650,6 +1686,10 @@ impl Routing for SystemRouting {
 
     fn release_all_covers(&self) -> Result<(), RoutingError> {
         failclosed::release_all(&self.state_dir)
+    }
+
+    fn lockdown_cover_presence(&self) -> CoverPresence {
+        failclosed::lockdown_cover_presence(&self.state_dir)
     }
 }
 

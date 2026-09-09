@@ -344,7 +344,7 @@ async fn run_macos_full_tunnel_os_state_e2e(dist: &Path, ss: &SsServerHandle) {
         .send(BridgeRequest::Start {
             config,
             attempt_id: "macos-full-tunnel-os-state-e2e".into(),
-            covered: false,
+            on_startup: Some(hole_common::config::StartupBehavior::default()),
         })
         .await
         .expect("send Start");

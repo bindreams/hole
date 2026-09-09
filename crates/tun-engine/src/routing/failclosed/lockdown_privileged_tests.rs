@@ -297,6 +297,131 @@ fn macos_lockdown_permits_server_ip_blocks_other_egress_and_restores() {
     );
 }
 
+/// Proves #617's boot-time reconciliation actually rearms a real host, not
+/// just decides to in a mock: engage the standing cover for real, simulate
+/// what a reboot does to pf (disable + flush the loaded ruleset, but leave
+/// `bridge-lockdown-pf.json` on disk — a reboot resets pf, not the
+/// filesystem), then drive the SAME production sequence startup takes
+/// (`decide_cover_recovery` → `recover_lockdown` → the re-engage
+/// `reconcile_once`'s `Cover(Engage)` phase triggers via `start_cancellable`,
+/// represented here directly by a second `engage_lockdown` call since this
+/// test targets the pf mechanics, not the whole bridge process) and assert
+/// egress is blocked again.
+///
+/// `recover_lockdown`'s `Adopt` arm performs no direct pf mutation by design
+/// (its own doc: "the next connect's `engage_lockdown` re-enables pf and
+/// reloads a live ruleset") — the rearm is `engage_pf_action`'s `Reenable`
+/// case, already pinned unprivileged by
+/// `engage_action_persisted_but_pf_disabled_reenables` in `macos_tests.rs`.
+/// This test is the one thing that unit test cannot prove: that calling
+/// `engage_lockdown` again after a REAL pf reset actually reopens a live,
+/// blocking ruleset on this host, not merely a decision table entry.
+///
+/// **Disclosed: this simulates a reboot's effect on pf, it does not perform
+/// one.** CI cannot reboot its runners; an unverifiable claim ("survives a
+/// real reboot") would be worse than this disclosed proxy for it.
+#[cfg(target_os = "macos")]
+#[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
+fn a_simulated_reboot_rearms_the_cover() {
+    use std::net::TcpStream;
+    use std::process::Command;
+    use std::time::Duration;
+
+    let dir = tempfile::tempdir().unwrap();
+    let server_ip: std::net::IpAddr = "1.1.1.1".parse().unwrap();
+    let connect = |addr: &str| TcpStream::connect_timeout(&addr.parse().unwrap(), Duration::from_secs(5));
+
+    let base_permitted = connect(PERMITTED);
+    let base_non = connect(NON_PERMITTED);
+    assert!(
+        base_permitted.is_ok() && base_non.is_ok(),
+        "NETWORK/ENVIRONMENT problem (not the cover): pre-cover baseline egress must reach both hosts; \
+         {PERMITTED}={:?} {NON_PERMITTED}={:?}",
+        base_permitted.err().map(|e| e.kind()),
+        base_non.err().map(|e| e.kind()),
+    );
+
+    // First engage: FreshEnable (no persisted state yet).
+    let cover = engage_lockdown(server_ip, "utun-absent", &SystemLuidResolver, &[], dir.path(), None)
+        .expect("engage real pf lockdown cover");
+    assert!(
+        connect(NON_PERMITTED).is_err(),
+        "sanity: the cover must actually be blocking before the reboot is simulated"
+    );
+
+    // Simulate the reboot's effect on pf: flush every loaded rule/state, then
+    // disable pf and drop its refcount to 0 — the two things a reboot resets.
+    // `bridge-lockdown-pf.json` is untouched, exactly like a real reboot: the
+    // OS state is gone, the filesystem is not.
+    Command::new("pfctl")
+        .args(["-F", "all"])
+        .output()
+        .expect("pfctl -F all");
+    Command::new("pfctl").args(["-d"]).output().expect("pfctl -d");
+    // std::mem::forget was not used: `cover`'s Drop would call
+    // `disengage_lockdown`, which would (correctly) no-op against the
+    // already-torn-down pf state below and clear the state file this test
+    // needs to survive — so the simulated reboot must happen, and be
+    // confirmed, before `cover` is allowed to drop. Confirmed here rather than
+    // assumed: a failure to actually reset pf would make every assertion below
+    // vacuous.
+    let info = Command::new("pfctl")
+        .args(["-s", "info"])
+        .output()
+        .expect("pfctl -s info");
+    assert!(
+        !super::platform::parse_pf_enabled(&String::from_utf8_lossy(&info.stdout)),
+        "the simulated reboot must actually leave pf disabled"
+    );
+    assert!(
+        connect(NON_PERMITTED).is_ok(),
+        "the simulated reboot must actually reopen egress, else re-blocking it below proves nothing new"
+    );
+
+    // The production sequence startup takes: recovery measures presence and
+    // decides, then reconciliation re-engages.
+    let presence = super::lockdown_cover_presence(dir.path());
+    assert_eq!(
+        presence,
+        crate::routing::CoverPresence::Recorded,
+        "post-reboot the label is gone from a disabled pf — only the state file's record survives"
+    );
+    let decision = crate::routing::decide_cover_recovery(lockdown_state::Intent::On, presence);
+    assert_eq!(
+        decision.action,
+        crate::routing::CoverRecovery::Adopt,
+        "an On intent with a recorded-but-unconfirmed cover must adopt, not sweep, across the simulated reboot"
+    );
+    recover_lockdown(decision.action, dir.path(), None);
+
+    // The rearm itself: same call `start_cancellable`'s `standing_cover_expected`
+    // gate makes on a persisted `Connected` target, driven directly here.
+    let rearmed = engage_lockdown(server_ip, "utun-absent", &SystemLuidResolver, &[], dir.path(), None)
+        .expect("re-engage after simulated reboot");
+
+    assert!(
+        connect(PERMITTED).is_ok(),
+        "the server-IP permit must still beat block-all after the rearm"
+    );
+    assert!(
+        connect(NON_PERMITTED).is_err(),
+        "a post-reboot reconciliation must rearm the block, not leave the host fail-open"
+    );
+
+    // Both guards disengage on drop via `lockdown_disengage(state_dir)`, which
+    // reads the state file rather than the guard's own (stale, pre-reboot for
+    // `cover`) token — `rearmed` drops first (reverse declaration order),
+    // clearing the state file and restoring the host; `cover`'s later drop
+    // then sees an absent cover and is a no-op, per `lockdown_disengage`'s own
+    // doc. No manual cleanup is needed.
+    drop(rearmed);
+    drop(cover);
+    assert!(
+        connect(NON_PERMITTED).is_ok(),
+        "the final disengage must restore egress to the previously-blocked host"
+    );
+}
+
 /// Windows real-engage verification for the transient block-until-connected
 /// cover. Engages the REAL WFP transient cover with `server_ip = 1.1.1.1` and
 /// proves it is SELECTIVE: egress to the permitted server IP stays Ok (the permit

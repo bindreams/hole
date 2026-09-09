@@ -45,7 +45,7 @@ struct MockProxyState {
     bytes_out: AtomicU64,
 }
 
-pub(super) struct MockProxy {
+pub(crate) struct MockProxy {
     state: Arc<MockProxyState>,
     /// If Some, `start` awaits this gate before returning — used to park
     /// start mid-flight so cancellation tests can fire the cancel token
@@ -59,7 +59,7 @@ pub(super) struct MockProxy {
 }
 
 impl MockProxy {
-    pub(super) fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             state: Arc::new(MockProxyState::default()),
             start_gate: None,
@@ -67,7 +67,7 @@ impl MockProxy {
         }
     }
 
-    fn failing_start() -> Self {
+    pub(crate) fn failing_start() -> Self {
         let m = Self::new();
         m.state.fail_start.store(true, Ordering::SeqCst);
         m
@@ -122,7 +122,7 @@ impl Proxy for MockProxy {
     }
 }
 
-pub(super) struct MockRunning {
+pub(crate) struct MockRunning {
     state: Arc<MockProxyState>,
     handle: Option<JoinHandle<io::Result<()>>>,
 }
@@ -162,22 +162,29 @@ impl Drop for MockRunning {
 
 // MockRouting =========================================================================================================
 
-pub(super) struct MockRoutingState {
+pub(crate) struct MockRoutingState {
     install_calls: AtomicU32,
     teardown_calls: AtomicU32,
     fail_install: AtomicBool,
     fail_gateway: AtomicBool,
-    cover_engage_calls: AtomicU32,
-    pub(super) cover_disengage_calls: AtomicU32,
-    pub(super) lockdown_engage_calls: AtomicU32,
+    pub(crate) cover_engage_calls: AtomicU32,
+    pub(crate) cover_disengage_calls: AtomicU32,
+    pub(crate) lockdown_engage_calls: AtomicU32,
     lockdown_disengage_calls: AtomicU32,
     fail_lockdown: AtomicBool,
     fail_cover: AtomicBool,
     /// Number of `release_all_covers` calls, so a test can assert the
     /// unconditional escape fired exactly once (or not at all).
-    pub(super) release_all_calls: AtomicU32,
+    pub(crate) release_all_calls: AtomicU32,
     /// `release_all_covers` returns `RoutingError::RouteSetup` when set.
-    pub(super) fail_release: AtomicBool,
+    pub(crate) fail_release: AtomicBool,
+    /// The guard's own `Drop` (the second, unconfirmable release attempt
+    /// `apply_cover_step` makes after `release_all_covers`, mirroring the real
+    /// `Cover::drop` calling `lockdown_disengage`) leaves the measured
+    /// presence untouched instead of clearing it when set — lets a test
+    /// simulate BOTH real release attempts failing to confirm, the only
+    /// scenario in which the OS cover can genuinely remain engaged.
+    pub(crate) fail_lockdown_disengage_on_drop: AtomicBool,
     /// Ordered record of teardown events ("routes" / "lockdown") so a test can
     /// observe the unwind teardown sequence. Shared via the `Arc<MockRoutingState>`
     /// both `MockRoutes` and `MockCover` clone.
@@ -215,7 +222,10 @@ pub(super) struct MockRoutingState {
     /// install's `installed` is always the full planned set, so this is
     /// currently only exercised to prove no teardown ran at all (`is_none()`
     /// in `partial_route_failure_fails_closed_and_clears_state`).
-    pub(super) last_teardown_installed: std::sync::Mutex<Option<Vec<RouteId>>>,
+    pub(crate) last_teardown_installed: std::sync::Mutex<Option<Vec<RouteId>>>,
+    /// What `lockdown_cover_presence` reports — a test's stand-in for the OS
+    /// probe, settable independently of whether any session is running.
+    pub(crate) cover_presence: std::sync::Mutex<tun_engine::routing::CoverPresence>,
 }
 
 impl Default for MockRoutingState {
@@ -233,6 +243,7 @@ impl Default for MockRoutingState {
             fail_cover: AtomicBool::new(false),
             release_all_calls: AtomicU32::new(0),
             fail_release: AtomicBool::new(false),
+            fail_lockdown_disengage_on_drop: AtomicBool::new(false),
             teardown_order: std::sync::Mutex::new(Vec::new()),
             last_install_server_ip: std::sync::Mutex::new(None),
             last_install_tun_alias: std::sync::Mutex::new(None),
@@ -242,11 +253,12 @@ impl Default for MockRoutingState {
             fail_cover_for_resolvers: std::sync::Mutex::new(std::collections::HashSet::new()),
             fail_routes_for: std::sync::Mutex::new(std::collections::HashSet::new()),
             last_teardown_installed: std::sync::Mutex::new(None),
+            cover_presence: std::sync::Mutex::new(tun_engine::routing::CoverPresence::Absent),
         }
     }
 }
 
-pub(super) struct MockRouting {
+pub(crate) struct MockRouting {
     state: Arc<MockRoutingState>,
     /// Directory where the crash-recovery state file is written. Each
     /// `MockRouting` owns its own `state_dir` — in production,
@@ -262,7 +274,7 @@ pub(super) struct MockRouting {
 }
 
 impl MockRouting {
-    pub(super) fn new(state_dir: PathBuf) -> Self {
+    pub(crate) fn new(state_dir: PathBuf) -> Self {
         Self {
             state: Arc::new(MockRoutingState::default()),
             state_dir,
@@ -303,7 +315,7 @@ impl MockRouting {
         m
     }
 
-    pub(super) fn state(&self) -> Arc<MockRoutingState> {
+    pub(crate) fn state(&self) -> Arc<MockRoutingState> {
         Arc::clone(&self.state)
     }
 }
@@ -456,6 +468,9 @@ impl Routing for MockRouting {
         }
         *self.state.last_lockdown_tun_alias.lock().unwrap() = Some(tun.alias().to_owned());
         self.state.lockdown_engage_calls.fetch_add(1, Ordering::SeqCst);
+        // Mirrors the real OS: a successful engage is what a subsequent
+        // `lockdown_cover_presence` probe would find.
+        *self.state.cover_presence.lock().unwrap() = tun_engine::routing::CoverPresence::Live;
         Ok(MockCover {
             state: Arc::clone(&self.state),
             lockdown: true,
@@ -467,11 +482,17 @@ impl Routing for MockRouting {
         if self.state.fail_release.load(Ordering::SeqCst) {
             return Err(RoutingError::RouteSetup("mock release_all_covers failure".into()));
         }
+        // Unconditional clear, mirroring `failclosed::release_all`.
+        *self.state.cover_presence.lock().unwrap() = tun_engine::routing::CoverPresence::Absent;
         Ok(())
+    }
+
+    fn lockdown_cover_presence(&self) -> tun_engine::routing::CoverPresence {
+        *self.state.cover_presence.lock().unwrap()
     }
 }
 
-pub(super) struct MockRoutes {
+pub(crate) struct MockRoutes {
     state: Arc<MockRoutingState>,
     state_dir: PathBuf,
     /// The routes `install` actually recorded — mirrors `SystemRoutes.installed`.
@@ -501,7 +522,7 @@ impl RoutesInstalled for MockRoutes {
     }
 }
 
-pub(super) struct MockCover {
+pub(crate) struct MockCover {
     state: Arc<MockRoutingState>,
     /// Whether this guard holds the standing lockdown cover (vs the transient
     /// fail-closed cover) — selects which disengage counter Drop bumps, mirroring
@@ -514,6 +535,14 @@ impl Drop for MockCover {
         if self.lockdown {
             self.state.lockdown_disengage_calls.fetch_add(1, Ordering::SeqCst);
             self.state.teardown_order.lock().unwrap().push("lockdown");
+            // Mirrors the real OS: an actual disengage (not `disarm`, which
+            // `mem::forget`s this guard and never runs `Drop`) is what a
+            // subsequent `lockdown_cover_presence` probe would no longer find
+            // — UNLESS this Drop's own disengage attempt is simulated as
+            // failing to confirm too (`fail_lockdown_disengage_on_drop`).
+            if !self.state.fail_lockdown_disengage_on_drop.load(Ordering::SeqCst) {
+                *self.state.cover_presence.lock().unwrap() = tun_engine::routing::CoverPresence::Absent;
+            }
         } else {
             self.state.cover_disengage_calls.fetch_add(1, Ordering::SeqCst);
         }
@@ -575,7 +604,7 @@ fn mock_failing_lockdown_returns_err_without_recording() {
 
 // Helpers =============================================================================================================
 
-pub(super) fn rt() -> tokio::runtime::Runtime {
+pub(crate) fn rt() -> tokio::runtime::Runtime {
     tokio::runtime::Runtime::new().unwrap()
 }
 
@@ -659,7 +688,7 @@ fn new_manager_with_dns(
     (pm, dir)
 }
 
-pub(super) fn test_config() -> ProxyConfig {
+pub(crate) fn test_config() -> ProxyConfig {
     ProxyConfig {
         server: ServerEntry {
             id: "test-id".into(),
@@ -963,9 +992,111 @@ fn check_health_detects_crashed_task() {
         // cloned `Arc<MockProxyState>` via `is_alive()`.
         state.crashed.store(true, Ordering::SeqCst);
 
-        pm.check_health();
+        let event = pm.check_health().expect("crashed task must report GaveUp");
+        pm.stop_with(event).await.unwrap();
         assert_eq!(pm.state(), ProxyState::Stopped);
         assert!(pm.last_error().unwrap().contains("unexpectedly"));
+    });
+}
+
+#[skuld::test]
+fn an_unexpected_death_moves_the_target_off() {
+    // `check_health`'s GaveUp event must run through the same
+    // `persist_session_event` path a user stop does, moving the target to
+    // `Off` — otherwise a reconciling boot would read a stale `Connected`
+    // and reconnect after a crash the user never asked to resume.
+    rt().block_on(async {
+        let proxy = MockProxy::new();
+        let proxy_state = proxy.state_handle();
+        let dir = tempfile::tempdir().unwrap();
+        let routing = MockRouting::new(dir.path().to_path_buf());
+        let mut pm = ProxyManager::new(proxy, routing).with_state_dir(dir.path().to_path_buf());
+        pm.start(&test_config()).await.unwrap();
+        target::save(
+            dir.path(),
+            &Target::Connected {
+                config: Box::new(test_config()),
+            },
+            None,
+        )
+        .unwrap();
+
+        proxy_state.crashed.store(true, Ordering::SeqCst);
+        let event = pm.check_health().expect("crashed task must report GaveUp");
+        pm.stop_with(event).await.unwrap();
+
+        assert_eq!(
+            target::load(dir.path()),
+            Target::Off,
+            "an unexpected death must move the target off, not leave it Connected"
+        );
+    });
+}
+
+#[skuld::test]
+fn an_unexpected_death_releases_the_cover_after_the_session() {
+    // Same teardown-ordering guarantee as a user stop
+    // (`user_stop_tears_down_routes_before_disengaging_the_lockdown_cover`),
+    // but driven by `check_health`'s GaveUp: the standing cover's persistent
+    // filters must still outlive the routes they cover on a crash, not just
+    // a clean stop.
+    rt().block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        let routing = MockRouting::new(dir.path().to_path_buf());
+        let st = routing.state();
+        let proxy = MockProxy::new();
+        let proxy_state = proxy.state_handle();
+        let (mut pm, _dir) = new_manager_with_lockdown(proxy, routing, dir, true);
+        pm.start(&test_config()).await.unwrap();
+
+        proxy_state.crashed.store(true, Ordering::SeqCst);
+        let event = pm.check_health().expect("crashed task must report GaveUp");
+        pm.stop_with(event).await.unwrap();
+
+        let order = st.teardown_order.lock().unwrap().clone();
+        assert_eq!(
+            order,
+            vec!["routes", "lockdown"],
+            "the standing cover's persistent filters must outlive the routes they cover, even on a crash"
+        );
+    });
+}
+
+#[skuld::test]
+fn an_unexpected_death_restores_dns() {
+    // `check_health`'s GaveUp path must run the same DNS teardown a clean
+    // stop does — otherwise a crash leaves the host still pointed at the
+    // (now-dead) in-TUN forwarder for its DNS.
+    rt().block_on(async {
+        let upstream = crate::test_support::socks5_dns_upstream::Socks5DnsUpstream::bind()
+            .await
+            .unwrap();
+        let dns = crate::test_support::mock_dns::MockDns::new();
+        let dns_state = dns.state_handle();
+
+        let dir = tempfile::tempdir().unwrap();
+        let routing = MockRouting::new(dir.path().to_path_buf());
+        let proxy = MockProxy::new();
+        let proxy_state = proxy.state_handle();
+        let (mut pm, _dir) = new_manager_with_dns(proxy, routing, dns, dir);
+
+        let mut config = test_config();
+        config.local_port = upstream.port();
+        config.dns.enabled = true;
+        config.dns.protocol = hole_common::config::DnsProtocol::PlainTcp;
+        config.dns.servers = vec![IpAddr::V4(Ipv4Addr::new(198, 51, 100, 53))];
+
+        pm.start(&config).await.unwrap();
+        assert_eq!(dns_state.calls().len(), 1, "Dns::apply must be called exactly once");
+
+        proxy_state.crashed.store(true, Ordering::SeqCst);
+        let event = pm.check_health().expect("crashed task must report GaveUp");
+        pm.stop_with(event).await.unwrap();
+
+        assert!(
+            dns_state.shutdown_called(),
+            "an unexpected death must still restore DNS, not just a clean stop"
+        );
     });
 }
 
@@ -980,7 +1111,8 @@ fn check_health_sets_path_free_death_reason() {
         pm.start(&test_config()).await.unwrap();
 
         state.crashed.store(true, Ordering::SeqCst);
-        pm.check_health();
+        let event = pm.check_health().expect("crashed task must report GaveUp");
+        pm.stop_with(event).await.unwrap();
 
         assert_eq!(
             pm.death_reason(),
@@ -1026,7 +1158,8 @@ fn restart_clears_prior_death_reason() {
         pm.start(&test_config()).await.unwrap();
 
         state.crashed.store(true, Ordering::SeqCst);
-        pm.check_health();
+        let event = pm.check_health().expect("crashed task must report GaveUp");
+        pm.stop_with(event).await.unwrap();
         assert_eq!(pm.death_reason(), Some(DEATH_REASON));
 
         state.crashed.store(false, Ordering::SeqCst);
@@ -1045,7 +1178,8 @@ fn stop_clears_death_reason() {
         pm.start(&test_config()).await.unwrap();
 
         state.crashed.store(true, Ordering::SeqCst);
-        pm.check_health();
+        let event = pm.check_health().expect("crashed task must report GaveUp");
+        pm.stop_with(event).await.unwrap();
         assert_eq!(pm.death_reason(), Some(DEATH_REASON));
 
         // A fresh start then a clean stop must leave no death reason behind.
@@ -1071,7 +1205,8 @@ fn check_health_clears_active_config_so_reload_restarts() {
 
         // Simulate crash.
         state.crashed.store(true, Ordering::SeqCst);
-        pm.check_health();
+        let event = pm.check_health().expect("crashed task must report GaveUp");
+        pm.stop_with(event).await.unwrap();
         assert_eq!(pm.state(), ProxyState::Stopped);
 
         // Un-crash so the next start succeeds.
@@ -1095,7 +1230,7 @@ fn check_health_does_not_mark_healthy_task_as_crashed() {
 
         // The mock's start spawns a 3600s sleep task — still healthy
         // after a short delay. check_health must NOT flip to Stopped.
-        pm.check_health();
+        assert_eq!(pm.check_health(), None);
         assert_eq!(pm.state(), ProxyState::Running);
 
         pm.stop().await.unwrap();
@@ -1332,7 +1467,11 @@ fn lockdown_off_does_not_engage_cover() {
 
         pm.start(&test_config()).await.unwrap();
         assert_eq!(pm.state(), ProxyState::Running);
-        assert!(!pm.lockdown_active(), "lockdown OFF must leave no cover engaged");
+        assert_eq!(
+            pm.cover_presence(),
+            CoverPresence::Absent,
+            "lockdown OFF must leave no cover engaged"
+        );
         assert_eq!(
             st.lockdown_engage_calls.load(Ordering::SeqCst),
             0,
@@ -1354,7 +1493,11 @@ fn lockdown_on_engages_after_install_and_disengages_on_stop() {
 
         pm.start(&test_config()).await.unwrap();
         assert_eq!(pm.state(), ProxyState::Running);
-        assert!(pm.lockdown_active(), "intent-on start must engage the cover");
+        assert_ne!(
+            pm.cover_presence(),
+            CoverPresence::Absent,
+            "intent-on start must engage the cover"
+        );
         assert_eq!(st.install_calls.load(Ordering::SeqCst), 1);
         assert_eq!(
             st.lockdown_engage_calls.load(Ordering::SeqCst),
@@ -1368,7 +1511,11 @@ fn lockdown_on_engages_after_install_and_disengages_on_stop() {
         );
 
         pm.stop().await.unwrap();
-        assert!(!pm.lockdown_active(), "cover disengaged after stop");
+        assert_eq!(
+            pm.cover_presence(),
+            CoverPresence::Absent,
+            "cover disengaged after stop"
+        );
         assert_eq!(
             st.lockdown_disengage_calls.load(Ordering::SeqCst),
             1,
@@ -1449,7 +1596,7 @@ fn user_stop_tears_down_routes_before_disengaging_the_lockdown_cover() {
         let (mut pm, _dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, true);
         pm.start(&test_config()).await.unwrap();
 
-        pm.stop_with(StopReason::UserStop).await.unwrap();
+        pm.stop_with(SessionEvent::UserStopped).await.unwrap();
 
         let order = st.teardown_order.lock().unwrap().clone();
         assert_eq!(
@@ -1471,7 +1618,7 @@ fn stop_with_cutover_disarms_lockdown_but_user_stop_disengages() {
             let (mut pm, _dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, true);
             pm.start(&test_config()).await.unwrap();
 
-            pm.stop_with(StopReason::UserStop).await.unwrap();
+            pm.stop_with(SessionEvent::UserStopped).await.unwrap();
             assert_eq!(
                 st.lockdown_disengage_calls.load(Ordering::SeqCst),
                 1,
@@ -1484,11 +1631,24 @@ fn stop_with_cutover_disarms_lockdown_but_user_stop_disengages() {
             let dir = tempfile::tempdir().unwrap();
             let routing = MockRouting::new(dir.path().to_path_buf());
             let st = routing.state();
+            // Seed a `Connected` target: `cover_step`'s `Off` arm ignores
+            // intent and would release the cover regardless of `event`, so
+            // reaching the `Connected` arm's `Hold` (what a cutover needs)
+            // requires the target to already read `Connected` before the
+            // stop.
+            target::save(
+                dir.path(),
+                &Target::Connected {
+                    config: Box::new(test_config()),
+                },
+                None,
+            )
+            .unwrap();
             let (mut pm, _dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, true);
             pm.start(&test_config()).await.unwrap();
             assert_eq!(st.teardown_calls.load(Ordering::SeqCst), 0);
 
-            pm.stop_with(StopReason::Cutover).await.unwrap();
+            pm.stop_with(SessionEvent::CutoverRestart).await.unwrap();
             assert_eq!(
                 st.lockdown_disengage_calls.load(Ordering::SeqCst),
                 0,
@@ -2965,7 +3125,7 @@ mod self_test {
                 .unwrap_err();
             assert_eq!(st.cover_engage_calls.load(Ordering::SeqCst), 1);
             assert!(pm.blocked_until_connected());
-            pm.stop_with(StopReason::Cutover).await.unwrap();
+            pm.stop_with(SessionEvent::CutoverRestart).await.unwrap();
             assert_eq!(
                 st.cover_disengage_calls.load(Ordering::SeqCst),
                 0,
@@ -2981,7 +3141,7 @@ mod self_test {
             pm.start_cancellable(&cfg, true, CancellationToken::new())
                 .await
                 .unwrap_err();
-            pm.stop_with(StopReason::UserStop).await.unwrap();
+            pm.stop_with(SessionEvent::UserStopped).await.unwrap();
             assert_eq!(
                 st.cover_disengage_calls.load(Ordering::SeqCst),
                 1,
@@ -5026,71 +5186,57 @@ mod self_test {
         });
     }
 
-    // Cover ownership model ===========================================================================================
+    // Cover state model ===============================================================================================
     //
-    // These next two tests assert VALUE AGREEMENT: the two public predicates
-    // (`lockdown_active`, `blocked_until_connected`) never disagree with
-    // `Posture::cover_holder`, and the holder is exactly one thing at each
-    // observed point. They do NOT prove single derivation — a second,
-    // independent recomputation (e.g. a hypothetical
-    // `self.posture.session().map(|r| r.lockdown.is_some()).unwrap_or(false)`
-    // written directly into `lockdown_active`, bypassing `cover_holder`) that
-    // happens to agree at every state visited here would still pass both.
-    // `the_standing_cover_field_has_exactly_one_reader` (`cover_tests.rs`) is
-    // a PARTIAL backstop for `lockdown_active`'s half of this shape (itself
-    // blind to a destructuring read — see that guard's own doc); this file
-    // is skipped by its walk (it ends in `_tests.rs`), so naming the
-    // anti-pattern here in prose cannot trip it. `blocked_until_connected` —
-    // the transient half — has NO structural backstop at all: a
-    // recomputation like `self.posture.pending().is_some()` would agree with
-    // it at every state below and pass undetected.
+    // `cover_presence()` is a MEASURED fact (an OS probe via
+    // `Routing::lockdown_cover_presence`) — it does not derive from
+    // `Posture` at all, so there is nothing to pin agreement between anymore.
+    // `blocked_until_connected()` remains the one sanctioned exception that
+    // still reads `Posture` (see its doc on `ProxyManager`); the structural
+    // guard below, `no_bridge_source_derives_cover_state_from_a_session`
+    // (replacing `cover_tests.rs`'s deleted
+    // `the_standing_cover_field_has_exactly_one_reader`), catches a future
+    // second reader of `RunningState.lockdown` outside the one sanctioned
+    // site.
 
-    /// Pins value agreement between `lockdown_active()` and the holder at
-    /// each observed state in a session's lifecycle, and that a posture
-    /// leaves no session behind after `stop()`. Does NOT prove
-    /// `lockdown_active()` derives from the holder (see the preamble above),
-    /// and does NOT prove a cover stranded by a previous process is
-    /// invisible to all of this — there is no probe for that in this stage.
+    /// The mock's measured `cover_presence()` tracks a session's lifecycle —
+    /// engaged after a lockdown-on start, cleared after `stop()` — and stays
+    /// `Absent` throughout when intent is off. Does NOT prove a cover
+    /// stranded by a previous process is invisible to all of this — there is
+    /// no probe for that in this stage.
     #[skuld::test]
-    fn posture_reports_one_cover_holder_across_a_session_lifecycle() {
+    fn cover_presence_tracks_a_lockdown_session_lifecycle() {
         rt().block_on(async {
-            // Lockdown-on: Idle -> Session { standing: true } -> Idle.
+            // Lockdown-on: Absent -> Live -> Absent.
             let dir = tempfile::tempdir().unwrap();
             let routing = MockRouting::new(dir.path().to_path_buf());
             let (mut pm, _dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, true);
 
-            assert_eq!(pm.posture.cover_holder(), CoverHolder::Nobody);
-            assert!(!pm.lockdown_active());
+            assert_eq!(pm.cover_presence(), CoverPresence::Absent);
             assert!(!pm.blocked_until_connected());
 
             pm.start(&test_config()).await.unwrap();
-            assert_eq!(pm.posture.cover_holder(), CoverHolder::Session { standing: true });
-            assert!(pm.lockdown_active());
+            assert_ne!(pm.cover_presence(), CoverPresence::Absent);
             assert!(!pm.blocked_until_connected());
 
             pm.stop().await.unwrap();
-            assert_eq!(pm.posture.cover_holder(), CoverHolder::Nobody);
-            assert!(!pm.lockdown_active());
+            assert_eq!(pm.cover_presence(), CoverPresence::Absent);
             assert!(!pm.blocked_until_connected());
 
-            // Same shape, intent off: Session { standing: false }.
+            // Intent off: no lockdown engage, so the probe never leaves Absent.
             let dir = tempfile::tempdir().unwrap();
             let routing = MockRouting::new(dir.path().to_path_buf());
             let (mut pm, _dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, false);
             pm.start(&test_config()).await.unwrap();
-            assert_eq!(pm.posture.cover_holder(), CoverHolder::Session { standing: false });
-            assert!(!pm.lockdown_active());
+            assert_eq!(pm.cover_presence(), CoverPresence::Absent);
             assert!(!pm.blocked_until_connected());
         });
     }
 
-    /// Pins value agreement between `blocked_until_connected()` and the
-    /// holder after a failed covered start, and that the holder is
-    /// `PendingStart` — not `Session`, not `Nobody`. Does NOT prove
-    /// `blocked_until_connected()` derives from the holder — this predicate
-    /// has NO structural backstop at all (see the preamble above) — and does
-    /// NOT prove a cover stranded by a previous process is invisible to all
-    /// of this — there is no probe for that in this stage.
+    /// Pins `blocked_until_connected()` to a failed covered start: the
+    /// posture is `PendingStart`, not `Session`, not `Idle`, and the
+    /// measured `cover_presence()` — the standing lockdown probe — is
+    /// unaffected by a TRANSIENT cover, since no lockdown was ever engaged.
     #[skuld::test]
     fn posture_reports_a_pending_start_after_a_failed_covered_start() {
         rt().block_on(async {
@@ -5100,16 +5246,83 @@ mod self_test {
                 .await
                 .unwrap_err();
 
-            assert_eq!(pm.posture.cover_holder(), CoverHolder::PendingStart);
+            assert!(matches!(pm.posture, Posture::PendingStart(_)));
             assert!(pm.blocked_until_connected());
-            assert!(!pm.lockdown_active());
+            assert_eq!(pm.cover_presence(), CoverPresence::Absent);
         });
+    }
+
+    /// Replaces `cover_tests.rs`'s deleted
+    /// `the_standing_cover_field_has_exactly_one_reader`: `RunningState.lockdown`
+    /// must be read via `.lockdown` in exactly one non-test bridge source
+    /// location. A second reader would mean cover state is being
+    /// re-derived from a session somewhere instead of measured — the exact
+    /// defect this stage removes (bindreams/hole#825).
+    #[skuld::test]
+    fn no_bridge_source_derives_cover_state_from_a_session() {
+        let pattern = regex::Regex::new(r"\.lockdown\b").unwrap();
+        let src_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+
+        let mut matches: Vec<(String, usize, String)> = Vec::new();
+        for entry in walkdir::WalkDir::new(&src_root) {
+            let entry = entry.expect("failed to walk crates/bridge/src");
+            if !entry.file_type().is_file() {
+                continue;
+            }
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if file_name.ends_with("_tests.rs") {
+                continue;
+            }
+            if path.components().any(|c| c.as_os_str() == "test_support") {
+                continue;
+            }
+            let text = std::fs::read_to_string(path).expect("failed to read a walked source file");
+            for (line_no, line) in text.lines().enumerate() {
+                if pattern.is_match(line) {
+                    matches.push((path.display().to_string(), line_no + 1, line.trim().to_string()));
+                }
+            }
+        }
+
+        let diagnostic = || {
+            let mut msg = format!(
+                "no_bridge_source_derives_cover_state_from_a_session: pattern `{}` must match \
+                 exactly once in non-test bridge sources (skipping *_tests.rs and \
+                 src/test_support/).\nMatches found ({}):\n",
+                pattern.as_str(),
+                matches.len()
+            );
+            for (file, line_no, line) in &matches {
+                msg.push_str(&format!("  {file}:{line_no}: {line}\n"));
+            }
+            msg.push_str(
+                "A failure here means one of two things: either a second, independent reader of \
+                 `RunningState.lockdown` was added somewhere (the real defect — the one sanctioned \
+                 reader is `check_health`'s teardown decision), or a comment/doc string in a walked \
+                 file now quotes the pattern, which is a false positive and should be reworded. This \
+                 regex only catches `.field` access — a pattern-destructuring read (`let RunningState \
+                 { lockdown, .. } = ...;`, as `stop_with` does) is invisible to it and would evade \
+                 this guard entirely.",
+            );
+            msg
+        };
+
+        assert_eq!(matches.len(), 1, "{}", diagnostic());
+        let (file, _, _) = &matches[0];
+        assert!(
+            file.ends_with("proxy_manager.rs"),
+            "the one reader must be in proxy_manager.rs:\n{}",
+            diagnostic()
+        );
     }
 
     // The next three exercise `Posture`'s method contracts directly,
     // independent of any call site, so a future call site that violates one
-    // fails a test instead of silently drifting — `CoverHolder` gets an
-    // exhaustive truth table (`cover_tests.rs`); before this, `Posture` got
+    // fails a test instead of silently drifting — before this, `Posture` got
     // nothing but prose and reasoning about the present call graph, the same
     // unenforced-invariant shape this stage exists to remove.
 
@@ -5127,25 +5340,9 @@ mod self_test {
 
             assert!(pm.posture.take_pending().is_none());
             assert_eq!(pm.state(), ProxyState::Running);
-            assert!(pm.lockdown_active());
+            assert_ne!(pm.cover_presence(), CoverPresence::Absent);
 
             pm.stop().await.unwrap();
-        });
-    }
-
-    /// Mirrors [`posture_take_pending_leaves_a_session_untouched`]: fails
-    /// against a `take_session` that disturbs an unrelated `PendingStart`.
-    #[skuld::test]
-    fn posture_take_session_leaves_a_pending_start_untouched() {
-        rt().block_on(async {
-            let (mut pm, cfg, _st, _dir) = covered_gate_setup(false);
-            let _ = pm
-                .start_cancellable(&cfg, true, CancellationToken::new())
-                .await
-                .unwrap_err();
-
-            assert!(pm.posture.take_session().is_none());
-            assert!(pm.blocked_until_connected());
         });
     }
 
@@ -5311,7 +5508,7 @@ fn a_user_stop_that_dropped_a_standing_cover_clears_only_the_live_half() {
         pm.set_standing_cover_adopted(true);
         pm.start(&test_config()).await.unwrap();
 
-        pm.stop_with(StopReason::UserStop).await.unwrap();
+        pm.stop_with(SessionEvent::UserStopped).await.unwrap();
         assert_eq!(
             st.lockdown_disengage_calls.load(Ordering::SeqCst),
             1,
@@ -5342,8 +5539,20 @@ fn a_cutover_stop_keeps_the_claim() {
         let mut pm = ProxyManager::new(MockProxy::new(), routing).with_state_dir(dir.path().to_path_buf());
         pm.set_standing_cover_adopted(true);
         pm.start(&test_config()).await.unwrap();
+        // `cover_step`'s `Off` arm ignores intent outright, so reaching the
+        // `Connected` arm's `Hold` (what a cutover needs) requires the
+        // target to already read `Connected` — `start()` itself never
+        // persists it (that is `ipc::persist_after_start`'s job).
+        target::save(
+            dir.path(),
+            &Target::Connected {
+                config: Box::new(test_config()),
+            },
+            None,
+        )
+        .unwrap();
 
-        pm.stop_with(StopReason::Cutover).await.unwrap();
+        pm.stop_with(SessionEvent::CutoverRestart).await.unwrap();
         assert_eq!(
             st.lockdown_disengage_calls.load(Ordering::SeqCst),
             0,
@@ -5354,6 +5563,33 @@ fn a_cutover_stop_keeps_the_claim() {
             "the cover still holds the host, so the claim stands"
         );
         assert!(pm.standing_cover_expected());
+    });
+}
+
+#[skuld::test]
+fn a_cutover_leaves_the_persisted_target_connected() {
+    // `target_after`'s `CutoverRestart` arm is already proved pure in
+    // `target.rs`'s own tests; this proves the same thing through
+    // `ProxyManager::stop_with`'s integration with disk state — a cutover
+    // must not touch the persisted target at all, so the restarted bridge's
+    // boot-time reconciliation still finds `Connected` and resumes.
+    rt().block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        let routing = MockRouting::new(dir.path().to_path_buf());
+        let mut pm = ProxyManager::new(MockProxy::new(), routing).with_state_dir(dir.path().to_path_buf());
+        pm.start(&test_config()).await.unwrap();
+        let connected = Target::Connected {
+            config: Box::new(test_config()),
+        };
+        target::save(dir.path(), &connected, None).unwrap();
+
+        pm.stop_with(SessionEvent::CutoverRestart).await.unwrap();
+
+        assert_eq!(
+            target::load(dir.path()),
+            connected,
+            "a cutover restart must leave the persisted target untouched"
+        );
     });
 }
 
@@ -5417,9 +5653,11 @@ fn a_config_edit_does_not_disarm_an_adopted_kill_switch() {
 
 #[skuld::test]
 fn an_unexpected_session_death_retires_the_claim_too() {
-    // `check_health` drops the same standing-cover guard `stop_with`'s UserStop
-    // arm does, so it must retire the claim on the same terms. Left set, it
-    // would outlive every cover this process can release.
+    // Spec correction (#898 follow-up): this used to assert the release as an
+    // incidental teardown side effect (a disengage-call count) and asserted
+    // nothing about the target or ordering. Under the target model the
+    // release is a *consequence of the target moving to `Off`*, and it must
+    // still follow the session teardown it covered, not precede it.
     rt().block_on(async {
         let proxy = MockProxy::new();
         let proxy_state = proxy.state_handle();
@@ -5429,22 +5667,28 @@ fn an_unexpected_session_death_retires_the_claim_too() {
         let mut pm = ProxyManager::new(proxy, routing).with_state_dir(dir.path().to_path_buf());
         pm.set_standing_cover_adopted(true);
         pm.start(&test_config()).await.unwrap();
+        target::save(
+            dir.path(),
+            &Target::Connected {
+                config: Box::new(test_config()),
+            },
+            None,
+        )
+        .unwrap();
 
         proxy_state.crashed.store(true, Ordering::SeqCst);
-        pm.check_health();
+        let event = pm.check_health().expect("crashed task must report GaveUp");
+        pm.stop_with(event).await.unwrap();
 
         assert_eq!(
-            st.lockdown_disengage_calls.load(Ordering::SeqCst),
-            1,
-            "the teardown dropped the standing cover"
+            target::load(dir.path()),
+            Target::Off,
+            "an unexpected death must move the target off"
         );
-        assert!(
-            !pm.standing_cover_adopted(),
-            "so the live-cover half of the claim must go with it"
-        );
-        assert!(
-            pm.lockdown_enabled(),
-            "the armed half is durable, so the tray still offers the escape"
+        assert_eq!(
+            st.teardown_order.lock().unwrap().clone(),
+            vec!["routes", "lockdown"],
+            "the standing cover must be released after the session it covered, not before"
         );
     });
 }
@@ -5455,7 +5699,9 @@ fn a_user_stop_whose_release_does_not_confirm_keeps_the_claim_and_the_escape() {
     // `set_standing_cover_adopted(false)` right after the guard's silent Drop
     // would clear the claim even when the OS-level release did not confirm —
     // the Unblock item disappearing exactly in the failure case it exists to
-    // cover (Rule #0).
+    // cover (Rule #0). Asserted against `CoverPresence` — the measured OS
+    // fact — rather than the internal claim: a false "released" is worse than
+    // a stale "still armed".
     rt().block_on(async {
         let dir = tempfile::tempdir().unwrap();
         let routing = MockRouting::new(dir.path().to_path_buf());
@@ -5465,16 +5711,18 @@ fn a_user_stop_whose_release_does_not_confirm_keeps_the_claim_and_the_escape() {
         pm.start(&test_config()).await.unwrap();
 
         st.fail_release.store(true, Ordering::SeqCst);
-        pm.stop_with(StopReason::UserStop).await.unwrap();
+        st.fail_lockdown_disengage_on_drop.store(true, Ordering::SeqCst);
+        pm.stop_with(SessionEvent::UserStopped).await.unwrap();
 
         assert_eq!(
             st.release_all_calls.load(Ordering::SeqCst),
             1,
             "the confirmable release path must be tried"
         );
-        assert!(
-            pm.standing_cover_adopted(),
-            "an unconfirmed release must leave the live-cover claim set"
+        assert_eq!(
+            pm.cover_presence(),
+            tun_engine::routing::CoverPresence::Live,
+            "an unconfirmed release must leave the measured cover reading engaged"
         );
         assert!(
             pm.lockdown_enabled(),
@@ -5485,7 +5733,8 @@ fn a_user_stop_whose_release_does_not_confirm_keeps_the_claim_and_the_escape() {
 
 #[skuld::test]
 fn a_crashed_session_whose_release_does_not_confirm_keeps_the_claim() {
-    // Same proof as above, over `check_health`'s teardown of a dead session.
+    // Same proof as above, over `check_health`'s teardown of a dead session,
+    // asserted against `CoverPresence` for the same reason.
     rt().block_on(async {
         let proxy = MockProxy::new();
         let proxy_state = proxy.state_handle();
@@ -5497,17 +5746,20 @@ fn a_crashed_session_whose_release_does_not_confirm_keeps_the_claim() {
         pm.start(&test_config()).await.unwrap();
 
         st.fail_release.store(true, Ordering::SeqCst);
+        st.fail_lockdown_disengage_on_drop.store(true, Ordering::SeqCst);
         proxy_state.crashed.store(true, Ordering::SeqCst);
-        pm.check_health();
+        let event = pm.check_health().expect("crashed task must report GaveUp");
+        pm.stop_with(event).await.unwrap();
 
         assert_eq!(
             st.release_all_calls.load(Ordering::SeqCst),
             1,
             "the confirmable release path must be tried"
         );
-        assert!(
-            pm.standing_cover_adopted(),
-            "an unconfirmed release during health-check teardown must leave the claim set"
+        assert_eq!(
+            pm.cover_presence(),
+            tun_engine::routing::CoverPresence::Live,
+            "an unconfirmed release during health-check teardown must leave the measured cover reading engaged"
         );
         assert!(pm.lockdown_enabled());
     });
@@ -5527,8 +5779,7 @@ fn turning_lockdown_off_mid_session_clears_a_stale_adopted_claim() {
         pm.set_standing_cover_adopted(true);
         pm.start(&test_config()).await.unwrap();
 
-        let outcome = pm.turn_lockdown_off().expect("a running session must not error");
-        assert!(matches!(outcome, LockdownOffOutcome::SessionRunning));
+        pm.turn_lockdown_off().expect("a running session must not error");
         assert!(
             !lockdown_state::load_intent(dir.path()).reads_armed(),
             "the intent must be recorded off"
@@ -5678,6 +5929,67 @@ fn the_installed_routed_families_reach_dns_apply() {
             dns_calls[0].routed,
             RoutedFamilies { v4: true, v6: false },
             "Dns::apply must receive the families the install actually landed, not a default"
+        );
+    });
+}
+
+// No-state-dir seed ===================================================================================================
+
+/// `persist_session_event` cannot consult the target file when the manager has
+/// no state dir, so it seeds `target_after` with a stand-in. Seeding `Off`
+/// makes a transient blip indistinguishable from a user disconnect —
+/// `cover_step`'s `Off` arm ignores intent and releases a live cover — which
+/// would tear the kill switch down mid-reconnect. `Unreadable` is the honest
+/// stand-in: it authorises neither connecting nor disarming, so the cover
+/// holds. The two explicit-end events are unaffected either way, since
+/// `target_after` collapses them to `Off` from any prior value.
+#[skuld::test]
+fn a_blip_with_no_state_dir_does_not_release_a_standing_cover() {
+    rt().block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        let routing = MockRouting::new(dir.path().to_path_buf());
+        let st = routing.state();
+        *st.cover_presence.lock().unwrap() = tun_engine::routing::CoverPresence::Live;
+        // `new_manager_with_routing` deliberately does NOT call
+        // `with_state_dir`, so `state_dir` is `None` — the branch under test.
+        let (mut pm, _dir) = new_manager_with_routing(MockProxy::new(), routing, dir);
+        pm.start(&test_config()).await.unwrap();
+
+        pm.stop_with(SessionEvent::Blipped).await.unwrap();
+
+        assert_eq!(
+            st.release_all_calls.load(Ordering::SeqCst),
+            0,
+            "a blip with no state dir released the cover: the seed collapsed \
+             'we cannot read the target' into 'the user asked to disconnect'"
+        );
+    });
+}
+
+// Explicit disarm =====================================================================================================
+
+/// `cover_step` holds on every unknown, which is right for a steady-state
+/// reconciler with no information — but a user Disconnect is an explicit
+/// disarm and must lean the other way. Keying teardown on `cover_step` alone
+/// meant an `Unreachable` probe produced `Hold`, which disarmed the guard and
+/// left the filters installed with nothing left to own them.
+#[skuld::test]
+fn a_user_disconnect_with_an_unreachable_probe_releases_the_cover() {
+    rt().block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        let routing = MockRouting::new(dir.path().to_path_buf());
+        let st = routing.state();
+        let (mut pm, _dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, true);
+        pm.start(&test_config()).await.unwrap();
+        *st.cover_presence.lock().unwrap() = CoverPresence::Unreachable;
+
+        pm.stop_with(SessionEvent::UserStopped).await.unwrap();
+
+        assert_eq!(
+            st.release_all_calls.load(Ordering::SeqCst),
+            1,
+            "a user disconnect whose probe could not reach the firewall must still release: \
+             disarming there strands the filters with no owner"
         );
     });
 }

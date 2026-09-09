@@ -1242,10 +1242,21 @@ present, never short-circuits (every clear is attempted before any failure is
 examined), never reports success over a host it left closed, and never erases
 a cover's state file after a restore that did not confirm — a corrupt or
 version-skewed file is treated as a cover to clear, not as absence.
-`ProxyManager::turn_lockdown_off` wraps it with the feature's only condition —
-whether a session is running — and is called by both the tray's Unblock item
-and the Lockdown-off toggle, so turning the kill switch off now releases
-immediately rather than waiting for the next bridge start.
+
+Inside a live bridge, `Routing::release_all_covers` — the same primitive —
+has four sanctioned callers, guarded by a structural test
+(`cover_release_has_the_known_sanctioned_caller_set`,
+`reconciler_tests.rs`) rather than a single funnel point: `reconciler::reconcile_once` at boot; `ProxyManager::turn_lockdown_off`, called by the
+Lockdown-off toggle, which reads no session posture — it decides via
+[`cover_step`](#cover-ownership) against the current target and the measured
+`CoverPresence`, so a session left wedged mid-teardown with the target
+already `Off` is released too, not just an idle bridge; session teardown's
+own `apply_cover_disposition`, ordered after routes so the release never precedes
+the tunnel it covered; and the tray's Unblock action (`handle_unblock`,
+below), which deliberately bypasses `ProxyManager` (and the lock a wedged
+teardown may hold) rather than routing through one of the other three.
+Turning the kill switch off, from either surface, now releases immediately
+rather than waiting for the next bridge start.
 
 `POST /v1/unblock` and `hole bridge unlock` are two doors with deliberately
 different scopes. The transient cover's authority inside a live bridge is the
@@ -1396,18 +1407,24 @@ Disclosed residuals:
    escape: within the run the claim is what keeps `lockdown_enabled` reporting
    armed.
 
-   The claim is **not a latch** — it clears at four sites, three of which
-   release the cover and clear only on a CONFIRMED `release_all_covers()`
-   result, never on the guard's own silent `Drop`: `turn_lockdown_off`'s idle
-   arm, a `UserStop` teardown, and `check_health` tearing down a dead session.
-   An unconfirmed release at any of the three leaves the claim — and the
-   Unblock item — in place, on the theory that a false "released" is worse
-   than a stale "still armed". The fourth site, `turn_lockdown_off`'s
-   mid-session arm, releases nothing (the session's own cover is `stop_with`'s
-   to decide) and clears only because the user's newly-persisted explicit off
-   must not keep being overridden by a stale claim from before this session, or
-   from this session's own now-superseded adoption. Only `turn_lockdown_off`
-   clears the persisted arm, so the escape still disarms the switch for good.
+   The claim is **not a latch** — it clears at three sites, all of them a
+   CONFIRMED `release_all_covers()` result, never the guard's own silent
+   `Drop`: `turn_lockdown_off`, session teardown's `apply_cover_disposition`
+   (`check_health` tearing down a dead session included, via `stop_with`),
+   and boot's `reconcile_once`. An unconfirmed release at any of the three
+   leaves the claim — and the Unblock item — in place, on the theory that a
+   false "released" is worse than a stale "still armed". The tray's Unblock
+   action (`handle_unblock`) is deliberately the exception: it releases
+   against `Routing` directly and never touches this in-process claim (see
+   [above](#the-unconditional-escape-from-a-stranded-cover)), so a stranded
+   claim can outlive an unblock done this way. Harmless in practice — both
+   public reads of the claim already fold in the persisted intent and
+   short-circuit to "not armed" the moment intent reads `Off`, which
+   `handle_unblock` writes before it ever attempts the release — and the
+   connect path calls `install_lockdown` unconditionally whenever a standing
+   cover is expected, never skipping it because the claim was already `true`.
+   Only `turn_lockdown_off` clears the persisted intent, so the escape still
+   disarms the switch for good.
 
 1. Startup still mutates global WFP state **unconditionally** via the
    transient cover sweep, which runs outside every presence branch and
@@ -1418,27 +1435,36 @@ Disclosed residuals:
 
 #### Cover ownership
 
-`ProxyManager` answers "who, inside this process, holds a fail-closed cover"
-in exactly one place: one field (`posture: Posture<P, R, D>`, replacing what
-were two independently mutable `Option` fields), three states (`Idle` / a
-pending covered start / a live session), one derivation
-(`Posture::cover_holder`, producing a `CoverHolder`) that every other site
-asks rather than recomputes. `CoverHolder::Nobody` is a claim about *this
-process* and never about the host — a cover stranded by an unclean exit, or
-adopted at startup, is `Nobody` here and can still block every packet.
-Answering "is the host held closed right now" needs an OS probe this model
-does not have; that probe is later work, and this model is the vocabulary it
-composes into, not a substitute for it.
+"Who holds a fail-closed cover" is no longer answered from in-process state at
+all — it is the measured `CoverPresence` (`Live` / `Recorded` / `Absent` /
+`Indeterminate` / `Unreachable`, [`routing.rs`](crates/tun-engine/src/routing.rs))
+read via `Routing::lockdown_cover_presence()`, an OS probe rather than a
+derivation. Both surfaces — the lockdown cover and the tunnel — reconcile
+toward the single persisted `Target` (`Off` / `Connected{config}` /
+`Unreadable`) against that presence, via the pure decision functions in
+[`reconciler.rs`](crates/bridge/src/reconciler.rs): `cover_step(intent, presence, target)` and `tunnel_step(session_live, target)`. This replaces the
+earlier model, where `ProxyManager`'s `posture` field derived a `CoverHolder`
+answer from in-process session state; that model could not see a cover
+stranded by an unclean exit or adopted at startup, because those are true
+about the host, not about anything a live process remembers.
 
-"That every other site asks rather than recomputes" is enforced by a
-structural test (`the_standing_cover_field_has_exactly_one_reader`,
-`proxy_manager/cover_tests.rs`), not proven by the type system — it counts
-`.field`-access reads of the session's standing-cover field and asserts
-there is exactly one, in `Posture::cover_holder`. It is blind to an added
-accessor under a different name and to a pattern-destructuring read (the
-shape `stop_with` itself already uses, to consume rather than derive
-ownership from, this same field); see the guard's own doc for the full
-disclosed gap.
+`posture: Posture<P, R, D>` still exists and still tracks three in-process
+states (`Idle` / a pending covered start / a live `Session`) — teardown
+ordering (DNS, dispatcher, plugins, proxy, routes, then the cover step) still
+needs to know which one it's in — but no site derives cover-holder status
+from it any more. Two structural tests replace the deleted
+`the_standing_cover_field_has_exactly_one_reader`
+(`proxy_manager/cover_tests.rs`, gone along with the model it guarded):
+`no_bridge_source_derives_cover_state_from_a_session`
+(`proxy_manager_tests.rs`) counts reads of `RunningState.lockdown` outside its
+one sanctioned site (`stop_with`'s own teardown), and
+`cover_release_has_the_known_sanctioned_caller_set`
+(`reconciler_tests.rs`) whitelists every real caller of the unconditional
+`release_all_covers()` — `handle_unblock`, `turn_lockdown_off`,
+`apply_cover_disposition`, and `reconcile_once` — against the four independently
+documented reasons each releases directly instead of routing through the
+others. Both are blind to an added accessor under a different name; see each
+guard's own doc for its disclosed gap.
 
 ### Update cutover
 

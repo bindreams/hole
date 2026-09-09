@@ -103,6 +103,7 @@ fn run_service() -> Result<(), Box<dyn std::error::Error>> {
             .cloned()
             .unwrap_or_else(hole_common::paths::default_state_dir);
         let log_dir = LOG_DIR_OVERRIDE.get().cloned().unwrap_or_else(service_log_dir);
+
         let proxy = std::sync::Arc::new(tokio::sync::Mutex::new(
             crate::proxy_manager::ProxyManager::new(
                 crate::proxy::ShadowsocksProxy::new(),
@@ -116,10 +117,14 @@ fn run_service() -> Result<(), Box<dyn std::error::Error>> {
             .get()
             .cloned()
             .unwrap_or_else(hole_common::protocol::default_bridge_socket_path);
-        // Bind BEFORE recovery — a second instance's bind() fails before it
-        // can touch routing state. Route recovery is offloaded via
-        // spawn_blocking so a hung netsh/route command cannot wedge the
-        // runtime while the IPC socket is bound but not yet serving.
+        // Bind BEFORE the liveness acquire and BEFORE recovery — a second
+        // instance's bind() fails before it can touch routing state or contend
+        // on the liveness lock, matching crate::liveness's documented invariant
+        // (BridgeLiveness::acquire's doc: "a second real bridge instance never
+        // reaches this call — the IPC socket bind already refuses it first").
+        // Route recovery is offloaded via spawn_blocking so a hung netsh/route
+        // command cannot wedge the runtime while the IPC socket is bound but
+        // not yet serving.
         let version = VERSION_OVERRIDE.get().cloned().unwrap_or_else(|| "unknown".to_string());
         // The `--service` daemon runs as SYSTEM and its dirs are SYSTEM-owned by
         // design; no real user to chown writes back to. (chown is a macOS no-op
@@ -132,6 +137,13 @@ fn run_service() -> Result<(), Box<dyn std::error::Error>> {
             state_dir.clone(),
             None,
         )?;
+
+        // Held for this bridge's entire run — see crate::liveness's module
+        // doc and foreground.rs's identical acquisition.
+        let state_dir_liveness = state_dir.clone();
+        let _liveness =
+            tokio::task::spawn_blocking(move || crate::liveness::BridgeLiveness::acquire(&state_dir_liveness, None))
+                .await??;
         // Socket is bound: sweep the marker, then report Running (see sweep_marker_then_ready).
         sweep_marker_then_ready(&log_dir, || {
             status_handle_ready
@@ -154,7 +166,27 @@ fn run_service() -> Result<(), Box<dyn std::error::Error>> {
         {
             tracing::warn!(error = %e, "recover_dns_config task panicked");
         }
+        // Root cancellation token for the SCM service, fed by the same
+        // `shutdown_rx` oneshot the control handler signals. Created before
+        // reconciliation so an SCM Stop arriving mid-boot abandons the
+        // auto-connect rather than racing it.
+        #[allow(clippy::disallowed_methods)]
+        // Service entry point — see clippy.toml's CancellationToken::new list.
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        {
+            let shutdown = shutdown.clone();
+            tokio::spawn(async move {
+                let _ = shutdown_rx.await;
+                shutdown.cancel();
+            });
+        }
+
         crate::route_recovery::recover_and_record(&state_dir, &proxy_shutdown).await;
+        // Reconcile the persisted target now, before any GUI or client has had a
+        // chance to connect (narrows, does not close, #617's boot->first-connect
+        // gap: a failed connect engages nothing) — must run after recovery above, see
+        // crate::reconciler::reconcile_once's own doc.
+        crate::reconciler::reconcile_once(&state_dir, None, &proxy_shutdown, &shutdown).await;
         let state_dir_for_plugins = state_dir.clone();
         if let Err(e) =
             tokio::task::spawn_blocking(move || crate::plugin_recovery::reap_recorded_plugins(&state_dir_for_plugins))
@@ -200,17 +232,18 @@ fn run_service() -> Result<(), Box<dyn std::error::Error>> {
                     error!(error = %e, "IPC server error");
                 }
             }
-            _ = shutdown_rx => {
+            _ = shutdown.cancelled() => {
                 info!("shutdown signal received");
             }
         }
 
-        // Clean shutdown: stop proxy before exiting. A cutover-driven shutdown
-        // (marker present) disarms the standing cover so the persistent WFP
-        // filters survive the restart; an ordinary stop disengages it.
+        // Clean shutdown: stop proxy before exiting. Neither event is a user
+        // disconnect, so the target is left unchanged either way; only the
+        // event differs, distinguishing an update cutover from a plain
+        // machine shutdown for anyone reading the log/history.
         let mut pm = proxy_shutdown.lock().await;
-        let reason = shutdown_reason(hole_common::update_marker::is_present(&log_dir));
-        if let Err(e) = pm.stop_with(reason).await {
+        let event = crate::foreground::shutdown_reason(hole_common::update_marker::is_present(&log_dir));
+        if let Err(e) = pm.stop_with(event).await {
             error!(error = %e, "error stopping proxy during shutdown");
         }
 
@@ -235,17 +268,6 @@ fn run_service() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     run_result
-}
-
-/// Map an update-in-progress marker's presence to the stop reason: present
-/// means a cutover is mid-flight, so the standing cover is disarmed (persists)
-/// rather than disengaged. Pure so the decision is table-testable.
-pub(crate) fn shutdown_reason(marker_present: bool) -> crate::proxy_manager::StopReason {
-    if marker_present {
-        crate::proxy_manager::StopReason::Cutover
-    } else {
-        crate::proxy_manager::StopReason::UserStop
-    }
 }
 
 /// Clear a stale update-in-progress marker on the new bridge's post-bind sweep.

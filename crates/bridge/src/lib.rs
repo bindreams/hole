@@ -10,6 +10,7 @@ pub mod foreground;
 pub mod group;
 pub mod hole_router;
 pub mod ipc;
+pub mod liveness;
 pub mod logging;
 pub mod platform;
 pub mod plugin_recovery;
@@ -17,9 +18,11 @@ pub mod plugin_state;
 pub mod proxy;
 pub mod proxy_manager;
 pub mod reachability;
+pub mod reconciler;
 pub mod route_recovery;
 pub mod server_test;
 pub mod socket;
+pub mod target;
 
 // Cross-cutting test helpers. Deviates from the sibling `foo_tests.rs`
 // convention used everywhere else in this crate because there is no
