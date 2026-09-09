@@ -9,6 +9,64 @@
 
 use tracing::{debug, info, warn};
 
+/// Stop one named ETW session via `ControlTraceW(EVENT_TRACE_CONTROL_STOP)`.
+///
+/// Unlike [`sweep_sessions_with_prefix`], which stops whatever
+/// `QueryAllTracesW` enumerated, this addresses a session the caller already
+/// knows the name of and supplies its own properties block — hence the
+/// `Wnode.Flags = WNODE_FLAG_TRACED_GUID` MSDN requires when Windows did not
+/// fill the block in, the same shape `etw::query_session_stats` uses.
+///
+/// `ERROR_WMI_INSTANCE_NOT_FOUND` is the expected answer for a session that is
+/// already gone, and is logged at `debug!`: the caller asked for the session to
+/// be stopped and it is, which is not news. Best-effort like the sweep — warns
+/// on a real failure, never panics.
+///
+/// `log_target` is a short subsystem string, as in [`sweep_sessions_with_prefix`].
+pub(crate) fn stop_session_by_name(name: &str, log_target: &str) {
+    use windows::Win32::Foundation::{ERROR_SUCCESS, ERROR_WMI_INSTANCE_NOT_FOUND};
+    use windows::Win32::System::Diagnostics::Etw::{
+        ControlTraceW, CONTROLTRACE_HANDLE, EVENT_TRACE_CONTROL_STOP, EVENT_TRACE_PROPERTIES, WNODE_FLAG_TRACED_GUID,
+    };
+
+    const STRING_RESERVE: usize = 1024;
+    const PROPERTIES_SIZE: usize = std::mem::size_of::<EVENT_TRACE_PROPERTIES>() + 2 * STRING_RESERVE;
+
+    let mut buffer = vec![0u8; PROPERTIES_SIZE];
+    let props = buffer.as_mut_ptr().cast::<EVENT_TRACE_PROPERTIES>();
+    // SAFETY: `buffer` is a zero-initialised block large enough to hold one
+    // `EVENT_TRACE_PROPERTIES` plus 2 × 1 KB of inline strings; the field
+    // writes below are within that allocation.
+    unsafe {
+        (*props).Wnode.BufferSize = PROPERTIES_SIZE as u32;
+        (*props).Wnode.Flags = WNODE_FLAG_TRACED_GUID;
+        (*props).LoggerNameOffset = std::mem::size_of::<EVENT_TRACE_PROPERTIES>() as u32;
+        (*props).LogFileNameOffset = (std::mem::size_of::<EVENT_TRACE_PROPERTIES>() + STRING_RESERVE) as u32;
+    }
+
+    let mut wide: Vec<u16> = name.encode_utf16().collect();
+    wide.push(0);
+
+    // SAFETY: `wide` outlives the call; `props` points into `buffer`; handle
+    // value 0 tells Windows to resolve the session by name.
+    let err = unsafe {
+        ControlTraceW(
+            CONTROLTRACE_HANDLE { Value: 0 },
+            windows::core::PCWSTR(wide.as_ptr()),
+            props,
+            EVENT_TRACE_CONTROL_STOP,
+        )
+    };
+
+    if err == ERROR_SUCCESS {
+        info!(session = %name, "{log_target}: stopped session by name");
+    } else if err == ERROR_WMI_INSTANCE_NOT_FOUND {
+        debug!(session = %name, "{log_target}: session already stopped");
+    } else {
+        warn!(session = %name, code = err.0, "{log_target}: failed to stop session by name");
+    }
+}
+
 /// Enumerate live ETW sessions via `QueryAllTracesW` and stop any
 /// whose name starts with `prefix`. Best-effort: any failure is logged
 /// via the provided `log_target` at `warn!`, never panics.

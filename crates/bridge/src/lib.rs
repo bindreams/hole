@@ -1,3 +1,8 @@
+// Windows-only in production — its sole consumer is `diagnostics::etw`, which
+// is itself Windows-only — but platform-neutral by construction, so `cfg(test)`
+// keeps it compiled and unit-tested on every target the bridge builds for.
+#[cfg(any(target_os = "windows", test))]
+mod bounded_thread;
 pub mod cutover;
 pub mod diagnostics;
 pub mod dispatcher;

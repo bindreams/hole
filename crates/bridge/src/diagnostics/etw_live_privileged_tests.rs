@@ -111,7 +111,7 @@ fn events_lost_reported_from_a_live_session_without_stopping_it() {
     trace.stop().expect("cleanup: stop the test's own ETW session");
 }
 
-/// `EtwGuard::drop` must stop and join the periodic stats-timer thread
+/// `EtwGuard::drop` must stop and wait for the periodic stats-timer thread
 /// *before* running its own stop-phase query, so no "live" phase query can
 /// still be mid-flight — or start afresh — once the "stop" phase query
 /// begins. Proven by driving a real [`EtwGuard`] (built via
@@ -121,7 +121,7 @@ fn events_lost_reported_from_a_live_session_without_stopping_it() {
 /// thread itself writes into, not a sleep — then dropping it and asserting
 /// every captured `"phase=\"live\""` log line's position precedes the
 /// single `"phase=\"stop\""` line's position. If a regression reordered
-/// `EtwGuard::drop` to query stop-phase before joining the timer thread,
+/// `EtwGuard::drop` to query stop-phase before waiting for the timer thread,
 /// the still-running timer thread could log a live-phase tick after the
 /// stop-phase line.
 #[cfg(target_os = "windows")]
@@ -257,5 +257,75 @@ fn periodic_tick_rewarns_after_a_transient_failure_recovers() {
         "expected exactly 2 fresh (warn-level) failures -- tick 1's initial failure and tick 3's \
          failure after tick 2's success reset the throttle; a stuck throttle would leave tick 3 \
          logged as \"still failing\" instead; got:\n{output}"
+    );
+}
+
+/// `EtwGuard::stop_session`'s backstop must genuinely stop a live session by
+/// name. That is the whole reason it can stand in for the
+/// `ControlTraceW(EVENT_TRACE_CONTROL_STOP)` `UserTrace::stop` skips when its
+/// `CloseTrace` fails — and a session left running is what leaves
+/// `ProcessTrace`, and therefore `EtwGuard::drop`, with nothing to wait for.
+/// Proven against a real session: a query answers while it is up, the by-name
+/// stop takes it down, and the follow-up query fails because there is no
+/// session left to answer. A second by-name stop is the idempotence check:
+/// "already stopped" is the expected answer, not a warning.
+#[cfg(target_os = "windows")]
+#[skuld::test(labels = [TUN], serial = TUN)]
+fn stop_session_by_name_stops_a_live_session() {
+    const PREFIX: &str = "hole-etw-live-stats-test-stop-by-name-";
+    crate::diagnostics::etw_sweep::sweep_sessions_with_prefix(PREFIX, "etw-test");
+
+    let writer = VecWriter::new();
+    let subscriber = tracing_subscriber::registry().with(
+        fmt::layer()
+            .with_writer(writer.clone())
+            .with_ansi(false)
+            .with_filter(tracing_subscriber::filter::LevelFilter::INFO),
+    );
+    let _guard = set_default_in_current_thread(subscriber);
+
+    let session_name = format!("{PREFIX}{}", std::process::id());
+    let provider = Provider::by_guid(TCPIP_PROVIDER)
+        .any(TCPIP_KEYWORDS)
+        .add_callback(|_record: &EventRecord, _schema_locator: &SchemaLocator| {})
+        .build();
+    let trace_properties = TraceProperties {
+        buffer_size: 256,
+        ..Default::default()
+    };
+    // Bound to `_trace`, not `_`: the latter would drop the session at the end
+    // of this statement, leaving nothing live for the by-name stop to prove
+    // itself against. No processing thread is needed — the claim under test is
+    // kernel-side session state, which `ControlTraceW` reads and writes
+    // independently of user-mode buffer draining.
+    let (_trace, _handle) = UserTrace::new()
+        .named(session_name.clone())
+        .set_trace_properties(trace_properties)
+        .enable(provider)
+        .start()
+        .expect("start a real ETW session (requires admin or Performance Log Users)");
+
+    let before = query_session_stats(&session_name, "live");
+    assert!(before.is_ok(), "the session must be live before the stop: {before:?}");
+
+    crate::diagnostics::etw_sweep::stop_session_by_name(&session_name, "etw-test");
+
+    let after = query_session_stats(&session_name, "live");
+    assert!(
+        after.is_err(),
+        "the session must be gone after a by-name stop -- a backstop that does not stop the \
+         session leaves ProcessTrace blocked forever: {after:?}"
+    );
+
+    crate::diagnostics::etw_sweep::stop_session_by_name(&session_name, "etw-test");
+
+    let output = writer.snapshot_string();
+    assert!(
+        output.contains("etw-test: stopped session by name"),
+        "expected the successful by-name stop to be logged; got:\n{output}"
+    );
+    assert!(
+        !output.contains("failed to stop session by name"),
+        "a repeat stop of an already-stopped session is expected, not a failure; got:\n{output}"
     );
 }

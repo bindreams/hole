@@ -121,6 +121,13 @@ before editing; the sections linked below are the authoritative source.
 - **Crash-recovery sweep.** `bridge-{routes,plugins,dns}.json` + ETW sessions are
   replayed/cleaned on next startup after the IPC socket binds. →
   [CONTRIBUTING.md#crash-recovery](CONTRIBUTING.md#crash-recovery)
+- **ETW teardown.** `EtwGuard::drop` is on the SCM shutdown path, where a hang
+  reads as a healthy `Running` service and wedges the MSI uninstall. Its threads
+  are `BoundedThread`s — no `JoinHandle`, so an unbounded wait is not
+  expressible — and STOP is re-issued by name whenever `UserTrace::stop`'s
+  `CloseTrace` failed and skipped it, since a session nobody stopped is what
+  `ProcessTrace` blocks on forever. →
+  [CONTRIBUTING.md#etw-teardown](CONTRIBUTING.md#etw-teardown)
 - **Yamux transport self-heal.** The galoshes yamux client reconnects after a
   transport reset instead of wedging; death is detected via the driver's
   inbound channel closing, and reconnect backoff is floored and resets on

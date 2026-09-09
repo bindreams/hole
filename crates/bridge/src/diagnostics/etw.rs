@@ -35,8 +35,10 @@
 //!    `hole-bridge-etw-<pid>` with `buffer_size = 256` KB to absorb
 //!    the wider event volume without kernel ring-buffer overrun.
 //!    d. Spawns a dedicated OS thread that calls `process_from_handle`
-//!    in a blocking loop. This thread runs the per-event callback.
-//!    e. Returns an [`EtwGuard`] that owns the session + the join handle.
+//!    in a blocking loop. This thread runs the per-event callback. It is a
+//!    [`crate::bounded_thread::BoundedThread`], so nothing can wait on it
+//!    without a failure bound.
+//!    e. Returns an [`EtwGuard`] that owns the session + that thread.
 //!
 //! 2. The callback ([`handle_event`]) filters by `process_id`, extracts
 //!    a minimal shape-only [`ParsedFields`] struct from the live
@@ -58,14 +60,15 @@
 //!
 //! 4. [`EtwGuard::drop`] first stops the timer thread (closing its shutdown
 //!    channel wakes it immediately, not after the rest of the current
-//!    interval) and joins it, THEN reads session statistics one final time
+//!    interval) and waits for it, THEN reads session statistics one final time
 //!    via `ControlTraceW(EVENT_TRACE_CONTROL_QUERY)` ([`query_session_stats`])
-//!    before calling `UserTrace::stop` (which signals the kernel to stop
-//!    delivering events) and joining the processing thread, guaranteeing the
-//!    callback drains the pending event queue before shutdown completes.
+//!    before stopping the session ([`EtwGuard::stop_session`], which signals
+//!    the kernel to stop delivering events) and waiting for the processing
+//!    thread, guaranteeing the callback drains the pending event queue before
+//!    shutdown completes.
 //!    Stopping the timer thread first is load-bearing, not incidental: it
-//!    guarantees no periodic tick can still be mid-query when `trace.stop()`
-//!    runs, so the two `query_session_stats` callers (periodic, drop-time)
+//!    guarantees no periodic tick can still be mid-query when the session is
+//!    stopped, so the two `query_session_stats` callers (periodic, drop-time)
 //!    never race the session teardown and no lock needs to serialize them.
 //!    Each stats query surfaces `EventsLost`, `BuffersWritten`,
 //!    `LogBuffersLost`, and `RealTimeBuffersLost` as a diagnostic
@@ -76,17 +79,20 @@
 //!    unchanging cumulative count doesn't re-warn every tick. See
 //!    [Drain on Drop](#drain-on-drop) below.
 //!
-//! # Drop's added wait
+//! # Drop's bounded waits
 //!
-//! Joining the timer thread in `Drop` adds a second, small, bounded
-//! blocking wait ahead of the pre-existing processing-thread join — bounded
-//! by however long one in-flight `ControlTraceW(QUERY)` call takes (a
-//! single synchronous Win32 call, not [`LIVE_STATS_INTERVAL`]), because
-//! closing the channel wakes a blocked `recv_timeout` immediately rather
-//! than waiting out the interval. This is the same shape of synchronous
-//! wait `Drop` already performs for the processing thread, not a new
-//! category of blocking risk; it is not solved with a timeout (this
-//! project does not paper over synchronization with timeouts).
+//! `Drop` waits for two threads, and both waits carry [`TEARDOWN_BOUND`].
+//! This is the one place in the bridge where a wait on our own thread is
+//! bounded, because it is the one place where what the thread is waiting for
+//! belongs to the kernel: the processing thread returns from `ProcessTrace`
+//! only when the kernel acknowledges STOP, and the timer thread's last act is
+//! a synchronous `ControlTraceW(QUERY)`. An unbounded wait here is not a
+//! stalled thread, it is a Windows service that never reports `Stopped` — see
+//! [`crate::bounded_thread`] for the full argument and bindreams/hole#978 for
+//! what it cost. Neither wait *elapses* the bound in the healthy case: each
+//! thread signals a channel as its body ends, and closing the timer's shutdown
+//! channel wakes its blocked `recv_timeout` immediately rather than waiting out
+//! [`LIVE_STATS_INTERVAL`].
 //!
 //! # Drain on Drop
 //!
@@ -97,11 +103,16 @@
 //!
 //! - [`ferrisetw::UserTrace::start`] returns `(trace, handle)` without
 //!   spawning a processing thread.
-//! - We spawn that thread ourselves and store its `JoinHandle` in
-//!   [`EtwGuard`].
-//! - [`ferrisetw::UserTrace::stop`] signals STOP; once STOP is processed
-//!   by the kernel, `process_from_handle` returns, our thread exits, and
-//!   `JoinHandle::join` returns.
+//! - We spawn that thread ourselves and store it in [`EtwGuard`].
+//! - [`EtwGuard::stop_session`] signals STOP; once STOP is processed
+//!   by the kernel, `process_from_handle` returns, our thread ends, and
+//!   `Drop`'s wait on it completes.
+//!
+//! `ferrisetw::UserTrace::stop` alone is not enough to guarantee that last
+//! step: it chains `CloseTrace` and `ControlTraceW(STOP)` with `?`, so a
+//! `CloseTrace` failure skips STOP and leaves the session — and therefore
+//! `ProcessTrace` — running. [`EtwGuard::stop_session`] re-issues STOP by name
+//! whenever that happens.
 //!
 //! # Failure mode
 //!
@@ -134,6 +145,7 @@
 //! events — [`dispatch`] gates on the provider GUID before applying
 //! TCPIP severity.
 
+use crate::bounded_thread::{self, BoundedThread, ThreadExit};
 use dump::{dump, DeriveDump};
 use ferrisetw::parser::Parser;
 use ferrisetw::provider::Provider;
@@ -143,9 +155,8 @@ use ferrisetw::{EventRecord, GUID};
 use std::borrow::Cow;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::mpsc;
-use std::thread::JoinHandle;
 use std::time::Duration;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 // Provider GUIDs ======================================================================================================
 
@@ -280,35 +291,52 @@ const RETRANSMIT_WARN_THRESHOLD: u32 = 3;
 
 // Public types ========================================================================================================
 
+/// Failure bound on each of the two teardown waits in [`EtwGuard::drop`].
+///
+/// Not a synchronisation delay: both threads signal a channel the instant
+/// their body ends, so the healthy path never elapses this. It covers only
+/// the case where a thread is parked in a Win32 ETW call the kernel owns —
+/// `ProcessTrace`, which returns when the kernel acknowledges
+/// `ControlTraceW(EVENT_TRACE_CONTROL_STOP)` and hands back the last
+/// real-time buffer, and `ControlTraceW(QUERY)` for the stats timer. See
+/// [`crate::bounded_thread`] for why that qualifies as an external event
+/// under CONTRIBUTING.md's rule.
+///
+/// 20 seconds is an order of magnitude above what a healthy drain costs
+/// (the session's `FlushTimer` is `TraceProperties::default`'s 1 second, and
+/// MSDN documents "a delay of several seconds" before a real-time
+/// `ProcessTrace` returns) and an order of magnitude below the installer's
+/// 3-minute `msiexec` bound, which a service wedged in this `Drop` used to
+/// blow straight through (bindreams/hole#978).
+const TEARDOWN_BOUND: Duration = Duration::from_secs(20);
+
 /// RAII guard holding the live ETW session, its processing thread, and the
 /// periodic live-stats timer thread. Drop order and rationale: see module
-/// doc [Drain on Drop](self#drain-on-drop) and [Drop's added wait](self#drops-added-wait).
+/// doc [Drain on Drop](self#drain-on-drop) and [Drop's bounded waits](self#drops-bounded-waits).
 pub struct EtwGuard {
     // `Option<UserTrace>` so Drop can `take()` it and consume via
     // `UserTrace::stop(self)` (which takes `self` by value).
     trace: Option<UserTrace>,
-    thread: Option<JoinHandle<()>>,
-    /// Session name saved at construction time so
-    /// `query_session_stats` can look it up in Drop without holding a
+    processing: Option<BoundedThread>,
+    /// Session name saved at construction time so `query_session_stats` and
+    /// [`EtwGuard::stop_session`] can look it up in Drop without holding a
     /// reference into `trace`.
     session_name: String,
     /// Dropping this closes the channel, waking the stats timer thread's
     /// blocked `recv_timeout` immediately instead of waiting out the rest
     /// of `LIVE_STATS_INTERVAL`.
     stats_tx: Option<mpsc::Sender<()>>,
-    stats_thread: Option<JoinHandle<()>>,
+    stats: Option<BoundedThread>,
 }
 
 impl Drop for EtwGuard {
     fn drop(&mut self) {
-        // Stop the periodic timer thread FIRST and join it, so no live-phase
+        // Stop the periodic timer thread FIRST and wait for it, so no live-phase
         // query can still be in flight when the stop-phase query and
-        // trace.stop() below run — see module doc "Drop's added wait".
+        // `stop_session` below run — see module doc "Drop's bounded waits".
         drop(self.stats_tx.take());
-        if let Some(stats_thread) = self.stats_thread.take() {
-            if let Err(e) = stats_thread.join() {
-                warn!(panic = ?e, "etw: live-stats thread panicked during drop");
-            }
+        if let Some(stats) = self.stats.take() {
+            report_exit(stats.wait(TEARDOWN_BOUND), "live-stats");
         }
 
         // Query first, stop second. `UserTrace::stop` consumes the trace
@@ -327,21 +355,61 @@ impl Drop for EtwGuard {
             }
         }
 
-        if let Some(trace) = self.trace.take() {
-            if let Err(e) = trace.stop() {
-                warn!(error = ?e, "etw: UserTrace::stop failed during drop");
-            }
-        }
-        if let Some(thread) = self.thread.take() {
-            // The processing thread exits once the kernel acknowledges
-            // STOP, which drains pending events through our callback.
-            // Ignore the JoinHandle's result: the thread only returns on
-            // kernel-signalled shutdown and has no useful return value.
-            if let Err(e) = thread.join() {
-                warn!(panic = ?e, "etw: processing thread panicked during drop");
-            }
+        self.stop_session();
+
+        // The processing thread ends once the kernel acknowledges STOP, which
+        // drains pending events through our callback.
+        if let Some(processing) = self.processing.take() {
+            report_exit(processing.wait(TEARDOWN_BOUND), "processing");
         }
         info!("etw: consumer stopped");
+    }
+}
+
+impl EtwGuard {
+    /// Tell the kernel to stop the session — unconditionally, whatever
+    /// `UserTrace::stop` did.
+    ///
+    /// `UserTrace::stop` is `CloseTrace` followed by
+    /// `ControlTraceW(EVENT_TRACE_CONTROL_STOP)`, chained with `?`. A
+    /// `CloseTrace` that fails for any reason other than
+    /// `ERROR_CTX_CLOSE_PENDING` therefore skips the STOP entirely — and a
+    /// session that is never stopped is precisely what `ProcessTrace` blocks
+    /// on, so the processing thread would then never end, no matter how long
+    /// anyone waited for it. Re-issuing STOP by name closes that path with a
+    /// real primitive rather than leaving [`TEARDOWN_BOUND`] to absorb it.
+    fn stop_session(&mut self) {
+        let stop_issued = match self.trace.take() {
+            Some(trace) => match trace.stop() {
+                Ok(()) => true,
+                Err(e) => {
+                    warn!(error = ?e, session = %self.session_name, "etw: UserTrace::stop failed during drop");
+                    false
+                }
+            },
+            None => false,
+        };
+        if !stop_issued {
+            crate::diagnostics::etw_sweep::stop_session_by_name(&self.session_name, "etw");
+        }
+    }
+}
+
+/// Log how a teardown thread ended.
+///
+/// [`ThreadExit::Abandoned`] is an `error!`, matching `start_consumer`'s
+/// infrastructure-failure level: it is the one outcome a human must act on —
+/// the session's last events went unlogged, a thread is leaked for the rest of
+/// the process's life, and the bound it blew through is the evidence that the
+/// kernel never released it.
+fn report_exit(exit: ThreadExit, thread: &'static str) {
+    match exit {
+        ThreadExit::Finished => {}
+        ThreadExit::Panicked => warn!("etw: {thread} thread panicked during drop"),
+        ThreadExit::Abandoned => error!(
+            bound_secs = TEARDOWN_BOUND.as_secs(),
+            "etw: {thread} thread did not end within the teardown bound; abandoning it"
+        ),
     }
 }
 
@@ -447,40 +515,36 @@ fn start_consumer_named(
         .map_err(EtwError::SessionStart)?;
 
     let processor_dispatch = dispatch.clone();
-    let thread = std::thread::Builder::new()
-        .name("hole-bridge-etw-processor".into())
-        .spawn(move || {
-            tracing::dispatcher::with_default(&processor_dispatch, || {
-                if let Err(e) = UserTrace::process_from_handle(handle) {
-                    // `process_from_handle` returns when the kernel
-                    // acknowledges STOP — which is the normal shutdown path,
-                    // but may also carry an Err if the session was already
-                    // dead. Log and exit; the guard's Drop handles user-
-                    // visible cleanup.
-                    debug!(error = ?e, "etw: processing thread exiting");
-                }
-            });
-        })
-        .map_err(EtwError::ThreadSpawn)?;
+    let processing = bounded_thread::spawn("hole-bridge-etw-processor", move || {
+        tracing::dispatcher::with_default(&processor_dispatch, || {
+            if let Err(e) = UserTrace::process_from_handle(handle) {
+                // `process_from_handle` returns when the kernel
+                // acknowledges STOP — which is the normal shutdown path,
+                // but may also carry an Err if the session was already
+                // dead. Log and exit; the guard's Drop handles user-
+                // visible cleanup.
+                debug!(error = ?e, "etw: processing thread exiting");
+            }
+        });
+    })
+    .map_err(EtwError::ThreadSpawn)?;
 
     // Best-effort, unlike the session/processing-thread spawns above: by
     // this point the processing thread is already live and consuming real
     // events, so a fallible `?` here would tear the whole consumer down
-    // (dropping `trace` without joining `thread` — see the module's
-    // "Drain on Drop" contract) over the failure of a purely supplementary
+    // (dropping `trace` without waiting for the processing thread — see the
+    // module's "Drain on Drop" contract) over the failure of a purely supplementary
     // 60-second diagnostics timer. Missing live stats is a degraded
     // diagnostic, not a reason to lose ETW event logging entirely.
     let (stats_tx, stats_rx) = mpsc::channel::<()>();
     let stats_session_name = session_name.clone();
-    let stats_thread_spawn = std::thread::Builder::new()
-        .name("hole-bridge-etw-live-stats".into())
-        .spawn(move || {
-            tracing::dispatcher::with_default(&dispatch, || {
-                run_periodic_stats_inner(stats_session_name, interval, stats_rx, on_tick);
-            });
+    let stats_spawn = bounded_thread::spawn("hole-bridge-etw-live-stats", move || {
+        tracing::dispatcher::with_default(&dispatch, || {
+            run_periodic_stats_inner(stats_session_name, interval, stats_rx, on_tick);
         });
-    let (stats_tx, stats_thread) = match stats_thread_spawn {
-        Ok(handle) => (Some(stats_tx), Some(handle)),
+    });
+    let (stats_tx, stats) = match stats_spawn {
+        Ok(thread) => (Some(stats_tx), Some(thread)),
         Err(e) => {
             warn!(error = ?e, "etw: failed to spawn live-stats timer thread; continuing without periodic stats");
             (None, None)
@@ -490,10 +554,10 @@ fn start_consumer_named(
     info!(session = %session_name, "etw: consumer started");
     Ok(EtwGuard {
         trace: Some(trace),
-        thread: Some(thread),
+        processing: Some(processing),
         session_name,
         stats_tx,
-        stats_thread,
+        stats,
     })
 }
 

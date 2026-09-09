@@ -825,7 +825,8 @@ leaves working DNS + broken routes, not the inverse):
   killing that process is the escape.
 - **ETW sessions** (Windows) — `hole-bridge-etw-<pid>`;
   `diagnostics::etw::sweep_stale_sessions` (`QueryAllTracesW`) stops stale ones by
-  name prefix.
+  name prefix. This bridge's own session is stopped in `EtwGuard::drop`, which
+  is on the SCM shutdown path — see [ETW teardown](#etw-teardown).
 
 Default `<state_dir>` is `dirs::state_dir()/hole/state` — Windows
 `%LOCALAPPDATA%\hole\state\`, macOS `~/Library/Application Support/hole/state/`;
@@ -834,6 +835,34 @@ installed service `C:\ProgramData\hole\state\` / `/var/db/hole/state/`;
 
 If in-bridge recovery can't run, [`scripts/network-reset.py`](scripts/network-reset.py)
 performs equivalent cleanup from outside.
+
+### ETW teardown
+
+`EtwGuard::drop` runs while the Windows service is shutting down, and
+`run_service` reports no `StopPending`, so a service hung there is
+indistinguishable from a healthy `Running` one and the SCM `Stop` — and with it
+the MSI uninstall's custom action — never completes (#978). Two things keep that
+from happening:
+
+- **STOP is unconditional.** `ferrisetw::UserTrace::stop` chains `CloseTrace`
+  and `ControlTraceW(EVENT_TRACE_CONTROL_STOP)` with `?`, so a failed
+  `CloseTrace` skips STOP entirely — and a session nobody stopped is exactly
+  what `ProcessTrace` blocks on, forever. `EtwGuard::stop_session` re-issues
+  STOP by name (`etw_sweep::stop_session_by_name`) whenever `UserTrace::stop`
+  did not get that far.
+- **Both teardown waits are bounded.** The processing and live-stats threads are
+  `bounded_thread::BoundedThread`s, which hand out no `JoinHandle` — an
+  unbounded wait on one is not expressible. `wait` returns the instant the
+  thread's body ends (a channel signal, a real rendezvous, not the bound
+  elapsing); `TEARDOWN_BOUND` covers only a thread parked in a Win32 ETW call
+  the kernel owns, and expiry is an `error!` plus an abandoned — not killed —
+  thread. This is the sanctioned "external event with graceful failure bound"
+  exception; see [`crates/bridge/src/bounded_thread.rs`](crates/bridge/src/bounded_thread.rs)
+  for the argument.
+
+The two `ControlTraceW` calls `Drop` makes itself stay synchronous: MSDN and
+ferrisetw both document them as returning immediately, and `CloseTrace` answers
+`ERROR_CTX_CLOSE_PENDING` rather than waiting out the drain.
 
 ### Yamux transport self-heal
 
