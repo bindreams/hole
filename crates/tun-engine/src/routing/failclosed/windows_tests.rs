@@ -110,6 +110,72 @@ fn spec_uses_the_fixed_hole_guids() {
     assert_eq!(s.sublayer, SUBLAYER_GUID);
 }
 
+// Boot-time lifetime (#998) ===========================================================================================
+
+#[skuld::test]
+fn transient_spec_is_never_boottime() {
+    // The transient cover (bounded-window RAII guard held only while the
+    // bridge process is already running) has no boot window to cover, so
+    // none of its filters may be `Boottime` — #998's scope decision is that
+    // only the standing lockdown's block-all floor gets a twin.
+    let s = build_cover_spec(v4(), Some(resolver_v4()));
+    for f in &s.filters {
+        assert_eq!(
+            f.lifetime,
+            FilterLifetime::Persistent,
+            "transient cover filter {:?} must be Persistent, never Boottime",
+            f.guid
+        );
+    }
+}
+
+#[skuld::test]
+fn filter_lifetime_flag_maps_to_the_real_wfp_constants() {
+    assert_eq!(
+        filter_lifetime_flag(FilterLifetime::Persistent),
+        FWPM_FILTER_FLAG_PERSISTENT.0
+    );
+    assert_eq!(
+        filter_lifetime_flag(FilterLifetime::Boottime),
+        FWPM_FILTER_FLAG_BOOTTIME.0
+    );
+}
+
+#[skuld::test]
+fn persistent_and_boottime_flags_are_mutually_exclusive_bits() {
+    // WFP's own `FWPM_FILTER0` docs: "This flag [PERSISTENT] cannot be set
+    // together with FWPM_FILTER_FLAG_BOOTTIME." A plain `assert_ne!` between
+    // the two flag values would pass even for two values that happened to
+    // share bits with a third, wrongly-OR'd flag combination; encode the
+    // actual documented contract instead — no bit position is shared.
+    let persistent = filter_lifetime_flag(FilterLifetime::Persistent);
+    let boottime = filter_lifetime_flag(FilterLifetime::Boottime);
+    assert_ne!(persistent, 0, "PERSISTENT must be a real, nonzero flag bit");
+    assert_ne!(boottime, 0, "BOOTTIME must be a real, nonzero flag bit");
+    assert_eq!(
+        persistent & boottime,
+        0,
+        "PERSISTENT and BOOTTIME must not share a bit — WFP treats them as mutually exclusive"
+    );
+}
+
+#[skuld::test]
+fn add_filter_maps_lifetime_through_filter_lifetime_flag() {
+    // Wiring guard: `add_filter` must derive its WFP flags from
+    // `filter_lifetime_flag(f.lifetime)`, not a hardcoded expression (that
+    // was the literal bug #998 reports — the block-all filter was hardcoded
+    // to PERSISTENT regardless of its spec). `add_filter` is the only
+    // function taking `f: &FilterSpec`, so `f.lifetime` cannot resolve to
+    // anything else; assert the exact call appears, and exactly once, so a
+    // future refactor can't quietly reintroduce a hardcoded flag alongside it.
+    let src = include_str!("windows.rs");
+    let occurrences = src.matches("filter_lifetime_flag(f.lifetime)").count();
+    assert_eq!(
+        occurrences, 1,
+        "expected exactly one call to filter_lifetime_flag(f.lifetime), inside add_filter — found {occurrences}"
+    );
+}
+
 // resolver permit =====================================================================================================
 
 #[skuld::test]
@@ -346,6 +412,53 @@ fn lockdown_spec_v6_server_lands_on_v6_layer() {
     assert_eq!(server[0].layer, Layer::ConnectV6);
 }
 
+#[skuld::test]
+fn lockdown_spec_blockall_has_boottime_twins() {
+    // #998: the block-all floor must be enforced from boot, before BFE starts
+    // re-adding the Persistent pair — so each of ConnectV4/ConnectV6 needs
+    // both a Persistent AND a Boottime block, the latter keyed on the fixed
+    // LOCKDOWN_BOOTTIME_BLOCK_ALL_GUIDS pair (see the module doc's "Boot-time
+    // coverage" section).
+    let s = build_lockdown_spec(v4(), luid(), &[plugin_path()]);
+    let blocks: Vec<_> = s.filters.iter().filter(|f| f.action == Action::Block).collect();
+
+    for (layer, boottime_guid) in [
+        (Layer::ConnectV4, LOCKDOWN_BOOTTIME_BLOCK_ALL_GUIDS[0]),
+        (Layer::ConnectV6, LOCKDOWN_BOOTTIME_BLOCK_ALL_GUIDS[1]),
+    ] {
+        assert!(
+            blocks
+                .iter()
+                .any(|f| f.layer == layer && f.lifetime == FilterLifetime::Persistent),
+            "expected a Persistent block on {layer:?}"
+        );
+        let boottime = blocks
+            .iter()
+            .find(|f| f.layer == layer && f.lifetime == FilterLifetime::Boottime)
+            .unwrap_or_else(|| panic!("expected a Boottime block on {layer:?}"));
+        assert_eq!(boottime.guid, boottime_guid);
+    }
+}
+
+#[skuld::test]
+fn lockdown_spec_permits_are_never_boottime() {
+    // Only the block-all floor gets a boot-time twin (#998's scope decision:
+    // TUN-LUID/server-IP permits carry runtime-discovered values that would
+    // be stale pre-BFE, and a boot-time loopback/App-ID permit has no
+    // hand-off to its persistent counterpart). See the module doc's
+    // "Boot-time coverage" section.
+    let s = build_lockdown_spec(v4(), luid(), &[plugin_path()]);
+    for f in s.filters.iter().filter(|f| f.action == Action::Permit) {
+        assert_eq!(
+            f.lifetime,
+            FilterLifetime::Persistent,
+            "lockdown permit {:?} on {:?} must be Persistent, never Boottime",
+            f.guid,
+            f.layer
+        );
+    }
+}
+
 // lockdown sweep / Adopt GUID sets ====================================================================================
 
 #[skuld::test]
@@ -355,6 +468,9 @@ fn all_swept_guids_cover_both_covers() {
     let swept = swept_lockdown_guids();
     for g in LOCKDOWN_FILTER_GUIDS {
         assert!(swept.contains(&g), "lockdown GUID {g:?} must be swept");
+    }
+    for g in LOCKDOWN_BOOTTIME_BLOCK_ALL_GUIDS {
+        assert!(swept.contains(&g), "boot-time block-all GUID {g:?} must be swept");
     }
     for i in 0..MAX_APPID_BINARIES {
         assert!(swept.contains(&appid_filter_guid(i, false)));
@@ -779,8 +895,9 @@ fn presence_probes_every_swept_lockdown_guid() {
     let probed = swept_lockdown_guids();
     assert_eq!(
         probed.len(),
-        LOCKDOWN_FILTER_GUIDS.len() + MAX_APPID_BINARIES * 2,
-        "the probe must cover the fixed lockdown GUIDs plus every App-ID slot"
+        LOCKDOWN_FILTER_GUIDS.len() + LOCKDOWN_BOOTTIME_BLOCK_ALL_GUIDS.len() + MAX_APPID_BINARIES * 2,
+        "the probe must cover the fixed lockdown GUIDs, the boot-time block-all pair (#998), \
+         and every App-ID slot"
     );
     assert!(
         probed.contains(&LOCKDOWN_FILTER_GUIDS[6]),
@@ -789,6 +906,14 @@ fn presence_probes_every_swept_lockdown_guid() {
     assert!(
         probed.contains(&LOCKDOWN_FILTER_GUIDS[7]),
         "block-all V6 must be probed"
+    );
+    assert!(
+        probed.contains(&LOCKDOWN_BOOTTIME_BLOCK_ALL_GUIDS[0]),
+        "boot-time block-all V4 must be probed"
+    );
+    assert!(
+        probed.contains(&LOCKDOWN_BOOTTIME_BLOCK_ALL_GUIDS[1]),
+        "boot-time block-all V6 must be probed"
     );
     for i in 0..MAX_APPID_BINARIES {
         assert!(probed.contains(&appid_filter_guid(i, false)), "App-ID slot {i} V4");

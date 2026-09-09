@@ -32,9 +32,85 @@
 //! wireguard ships the same all-but-one-soft layout); a two-sublayer
 //! hard-permit/soft-block layout is a possible future hardening.
 //!
-//! Persistent (boot-time) filters — NOT a dynamic session — so a coordinator crash
+//! PERSISTENT filters — NOT a dynamic session — so a coordinator crash
 //! mid-cutover leaves traffic blocked (fail-closed), not leaked; `recover_cover`
 //! sweeps them by their fixed GUIDs on the next bridge start.
+//!
+//! ## Boot-time coverage (#998)
+//!
+//! `FWPM_FILTER_FLAG_PERSISTENT` filters are re-added by the Base Filtering
+//! Engine (BFE) once it starts; they are NOT enforced before that — the
+//! kernel (tcpip.sys) enforces only `FWPM_FILTER_FLAG_BOOTTIME` filters from
+//! kernel start until BFE takes over. The two flags are mutually exclusive on
+//! one filter (WFP's own `FWPM_FILTER0` docs: "This flag \[PERSISTENT\]
+//! cannot be set together with FWPM_FILTER_FLAG_BOOTTIME"), so covering both
+//! windows needs two filter objects. A boot-time filter does NOT need its own
+//! boot-time sublayer/provider: `FWPM_SUBLAYER0`/`FWPM_PROVIDER0` have no
+//! BOOTTIME flag at all (only `..._FLAG_PERSISTENT`), so PERSISTENT is the
+//! only non-static lifetime those containers support — a boot-time or
+//! persistent filter must reference one of those (a merely static
+//! sublayer/provider fails with `FWP_E_LIFETIME_MISMATCH`), and [`PROVIDER_GUID`]/
+//! [`SUBLAYER_GUID`] are already added with `FWPM_PROVIDER_FLAG_PERSISTENT`/
+//! `FWPM_SUBLAYER_FLAG_PERSISTENT` below, so the new boot-time filters need no
+//! new container. The standing LOCKDOWN cover (kill
+//! switch) is meant to survive an arbitrary reboot — CONTRIBUTING.md's
+//! "Fail-closed cover" section — so `build_lockdown_spec` gives ONLY its
+//! block-all pair a `Boottime` twin (`LOCKDOWN_BOOTTIME_BLOCK_ALL_GUIDS`);
+//! every permit, including loopback, stays `Persistent`-only, so the
+//! boot→BFE window is a full block with no exemptions (matches Mullvad's
+//! shipped `talpid-core` boot-time set, which has none either). Reasons a
+//! permit is NOT given a boot-time twin: (a) the TUN-LUID and server-IP
+//! permits carry values discovered at runtime — a boot-time copy would enforce
+//! whatever value was live at the PREVIOUS engage, stale by construction,
+//! since nothing runs before BFE to refresh it; (b) a boot-time loopback or
+//! App-ID permit has no mechanism to hand itself off to the narrower
+//! persistent rule once BFE starts, so it would need its own separate
+//! lifecycle to avoid becoming a second stranded-filter risk; (c) the leak
+//! this issue exists to close is network egress, not loopback. The transient
+//! cutover cover is not meant to survive an arbitrary reboot (bounded-window
+//! RAII guard held only while the bridge process is already running), so it
+//! stays `Persistent`-only throughout — see `build_cover_spec`.
+//!
+//! Deletion of a boot-time filter is architecturally the same
+//! `FwpmFilterDeleteByKey0` call used for a persistent one (no lifetime-specific
+//! delete API exists in WFP's reference), so every existing fixed-GUID sweep in
+//! this file (`Cover::drop`'s Lockdown arm, `disengage_lockdown`, `release_all`,
+//! `swept_lockdown_guids`) covers the boot-time pair for free once its GUIDs are
+//! added to that array — no new delete path is introduced here.
+//!
+//! **Disclosed, NOT closed by this change:** a fixed-GUID sweep can only
+//! delete a boot-time filter whose GUID the RUNNING binary knows. A stranded
+//! PERSISTENT leftover (e.g. from a version-skewed `FILTER_GUIDS` sweep, see
+//! that constant's CROSS-VERSION CONTRACT doc) is still reachable by a LATER
+//! GUID-aware build, because BFE keeps re-adding it every start regardless of
+//! which build is currently running. A stranded BOOT-TIME leftover has no
+//! such self-healing path: it is reprovisioned from an on-disk boot-time
+//! policy record at every boot, independent of the live FWPM session, so an
+//! OLDER binary that never learned a NEWER binary's boot-time GUID (a
+//! downgrade) can never find and delete it by key — it then enforces
+//! (including, if ever mis-scoped, blocking all egress) on every future boot,
+//! forever, with no automatic recovery. Bounding that risk needs a
+//! version-independent sweep (enumerate live filters by [`PROVIDER_GUID`]
+//! instead of a fixed array, deleting any that still carry
+//! `FWPM_FILTER_FLAG_BOOTTIME`) — tracked as #1008, deliberately NOT part of
+//! this change (a prior attempt combining both was rejected in review; #1008
+//! records that review's findings as its acceptance criteria). **Per #1008's
+//! own ordering constraint: this change is safe to develop and review on its
+//! own, but must not ship in a release a user could downgrade from until
+//! #1008 lands.**
+//!
+//! Also unverified by this change: Microsoft's own docs (`FWPM_FILTER0`'s
+//! flags table and the WFP Operation conceptual page) consistently say a
+//! boot-time filter is "disabled" — never "removed" — once BFE finishes
+//! initializing, which argues the filter object and its key survive the
+//! transition. But neither page states outright whether a post-boot
+//! `FwpmFilterGetByKey0`/enumeration call can still see a "disabled"
+//! boot-time filter, nor whether a `FwpmFilterDeleteByKey0` issued through
+//! the live FWPM session against that key actually purges the underlying
+//! boot-time policy record so it does NOT get reprovisioned at the NEXT
+//! boot (as opposed to only removing it from the current, already-disabled
+//! runtime copy). Only a real reboot test settles this; none is available —
+//! there is no elevated Windows CI lane (#999).
 
 use std::net::IpAddr;
 use std::path::Path;
@@ -109,6 +185,18 @@ pub const LOCKDOWN_FILTER_GUIDS: [GUID; 12] = [
     GUID::from_u128(0xd766a20f_050a_4c40_8de3_33bf259b7e34), // loopback-net CONNECT V6 (::1/128)
 ];
 
+// Boot-time twin of the lockdown block-all pair (#998) — see the module doc's
+// "Boot-time coverage" section. Disjoint from every other GUID in this file.
+// CROSS-VERSION CONTRACT, same as `FILTER_GUIDS`/`LOCKDOWN_FILTER_GUIDS`
+// above: never remove or reorder an entry. Unlike those arrays, a fixed-GUID
+// sweep missing an entry here (an older build that never learned a newer
+// build's boot-time GUID) has no other removal path in THIS change — see the
+// module doc's disclosed downgrade-strand residual (#1008).
+pub const LOCKDOWN_BOOTTIME_BLOCK_ALL_GUIDS: [GUID; 2] = [
+    GUID::from_u128(0xba322087_a133_481c_86cc_0692ad222e2d), // block-all V4 (boot-time)
+    GUID::from_u128(0x227bca1d_5415_4421_a5da_bf5babe1c556), // block-all V6 (boot-time)
+];
+
 /// Indices into [`LOCKDOWN_FILTER_GUIDS`] for the TUN-interface (LUID) permit
 /// pair — one of the two volatile permits an engage refreshes (see
 /// [`adopt_delete_guids`]).
@@ -139,11 +227,15 @@ fn swept_transient_guids() -> Vec<GUID> {
     FILTER_GUIDS.to_vec()
 }
 
-/// Every lockdown filter GUID a full Sweep must delete: the ten fixed
-/// lockdown GUIDs + the per-binary App-ID GUIDs. (Transient GUIDs are swept
-/// separately by `delete_all`.)
+/// Every lockdown filter GUID a full Sweep must delete: the twelve fixed
+/// lockdown GUIDs + the boot-time block-all pair (#998) + the per-binary
+/// App-ID GUIDs. (Transient GUIDs are swept separately by `delete_all`.) The
+/// boot-time pair's deletion is bounded to what this array's own GUIDs cover
+/// — see the module doc's "Boot-time coverage" section for the disclosed
+/// downgrade-strand residual this leaves open (#1008).
 fn swept_lockdown_guids() -> Vec<GUID> {
     let mut guids: Vec<GUID> = LOCKDOWN_FILTER_GUIDS.to_vec();
+    guids.extend_from_slice(&LOCKDOWN_BOOTTIME_BLOCK_ALL_GUIDS);
     for i in 0..MAX_APPID_BINARIES {
         guids.push(appid_filter_guid(i, false));
         guids.push(appid_filter_guid(i, true));
@@ -184,6 +276,29 @@ pub enum Layer {
 pub enum Action {
     Permit,
     Block,
+}
+
+/// Which WFP lifetime flag a filter carries — see the module doc's "Boot-time
+/// coverage" section. Mutually exclusive on one filter (WFP's own
+/// `FWPM_FILTER0` docs), so a rule needing both coverage windows needs two
+/// [`FilterSpec`]s.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FilterLifetime {
+    /// `FWPM_FILTER_FLAG_PERSISTENT` — re-added by the Base Filtering Engine
+    /// (BFE) once it starts; NOT enforced before that.
+    Persistent,
+    /// `FWPM_FILTER_FLAG_BOOTTIME` — enforced by the kernel (tcpip.sys) from
+    /// boot until BFE starts; NOT re-added by BFE afterwards.
+    Boottime,
+}
+
+/// Map a [`FilterLifetime`] to its WFP flag bit. Pure and total, so
+/// `add_filter`'s actual FFI mapping is unit-testable without FWPM.
+fn filter_lifetime_flag(lifetime: FilterLifetime) -> u32 {
+    match lifetime {
+        FilterLifetime::Persistent => FWPM_FILTER_FLAG_PERSISTENT.0,
+        FilterLifetime::Boottime => FWPM_FILTER_FLAG_BOOTTIME.0,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -230,6 +345,8 @@ pub struct FilterSpec {
     /// within our single sublayer is pure weight, so the higher-weight permit
     /// wins over block-all.
     pub weight: u8,
+    /// Which WFP lifetime flag this filter carries — see [`FilterLifetime`].
+    pub lifetime: FilterLifetime,
 }
 
 #[derive(Debug, Clone)]
@@ -273,6 +390,7 @@ pub fn build_cover_spec(server_ip: IpAddr, resolver_ip: Option<IpAddr>) -> Cover
             action: Action::Permit,
             condition: Condition::Loopback,
             weight: PERMIT_WEIGHT,
+            lifetime: FilterLifetime::Persistent,
         },
         FilterSpec {
             guid: FILTER_GUIDS[1],
@@ -280,6 +398,7 @@ pub fn build_cover_spec(server_ip: IpAddr, resolver_ip: Option<IpAddr>) -> Cover
             action: Action::Permit,
             condition: Condition::Loopback,
             weight: PERMIT_WEIGHT,
+            lifetime: FilterLifetime::Persistent,
         },
         // Belt-and-suspenders for the flag permits above: the IS_LOOPBACK flag is
         // not reliably set at ALE_AUTH_CONNECT in CI's elevated lane, so match the
@@ -291,6 +410,7 @@ pub fn build_cover_spec(server_ip: IpAddr, resolver_ip: Option<IpAddr>) -> Cover
             action: Action::Permit,
             condition: Condition::LoopbackNet(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
             weight: PERMIT_WEIGHT,
+            lifetime: FilterLifetime::Persistent,
         },
         FilterSpec {
             guid: FILTER_GUIDS[9],
@@ -298,6 +418,7 @@ pub fn build_cover_spec(server_ip: IpAddr, resolver_ip: Option<IpAddr>) -> Cover
             action: Action::Permit,
             condition: Condition::LoopbackNet(IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)),
             weight: PERMIT_WEIGHT,
+            lifetime: FilterLifetime::Persistent,
         },
         // A loopback connect is authorized at RECV_ACCEPT too; permitting only at
         // CONNECT denies the accept side, breaking the loopback SOCKS5 data plane.
@@ -312,6 +433,7 @@ pub fn build_cover_spec(server_ip: IpAddr, resolver_ip: Option<IpAddr>) -> Cover
             action: Action::Permit,
             condition: Condition::LoopbackNet(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
             weight: PERMIT_WEIGHT,
+            lifetime: FilterLifetime::Persistent,
         },
         FilterSpec {
             guid: FILTER_GUIDS[7],
@@ -319,6 +441,7 @@ pub fn build_cover_spec(server_ip: IpAddr, resolver_ip: Option<IpAddr>) -> Cover
             action: Action::Permit,
             condition: Condition::LoopbackNet(IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)),
             weight: PERMIT_WEIGHT,
+            lifetime: FilterLifetime::Persistent,
         },
         FilterSpec {
             guid: if server_layer == Layer::ConnectV4 {
@@ -330,6 +453,7 @@ pub fn build_cover_spec(server_ip: IpAddr, resolver_ip: Option<IpAddr>) -> Cover
             action: Action::Permit,
             condition: Condition::RemoteIp(server_ip),
             weight: PERMIT_WEIGHT,
+            lifetime: FilterLifetime::Persistent,
         },
     ];
     if let Some(ip) = resolver_ip {
@@ -343,10 +467,11 @@ pub fn build_cover_spec(server_ip: IpAddr, resolver_ip: Option<IpAddr>) -> Cover
             action: Action::Permit,
             condition: Condition::RemoteIpPortTcp(ip, RESOLVER_PERMIT_PORT),
             weight: PERMIT_WEIGHT,
+            lifetime: FilterLifetime::Persistent,
         });
     }
-    filters.push(block(FILTER_GUIDS[4], Layer::ConnectV4));
-    filters.push(block(FILTER_GUIDS[5], Layer::ConnectV6));
+    filters.push(block(FILTER_GUIDS[4], Layer::ConnectV4, FilterLifetime::Persistent));
+    filters.push(block(FILTER_GUIDS[5], Layer::ConnectV6, FilterLifetime::Persistent));
     CoverSpec {
         provider: PROVIDER_GUID,
         sublayer: SUBLAYER_GUID,
@@ -367,7 +492,9 @@ pub fn build_cover_spec(server_ip: IpAddr, resolver_ip: Option<IpAddr>) -> Cover
 /// there, so the range is the only matcher). Block stays CONNECT-only — egress
 /// kill switch, not inbound. Permits at `PERMIT_WEIGHT`, block at `BLOCK_WEIGHT`;
 /// within the single sublayer the higher-weight permit wins (no
-/// `CLEAR_ACTION_RIGHT`). Pure — no FFI.
+/// `CLEAR_ACTION_RIGHT`). The block-all pair also gets a `Boottime` twin (see
+/// the module doc's "Boot-time coverage" section) — every permit stays
+/// `Persistent`-only. Pure — no FFI.
 pub fn build_lockdown_spec(server_ip: IpAddr, tun_luid: u64, app_ids: &[std::path::PathBuf]) -> CoverSpec {
     let server_layer = match server_ip {
         IpAddr::V4(_) => Layer::ConnectV4,
@@ -436,8 +563,30 @@ pub fn build_lockdown_spec(server_ip: IpAddr, tun_luid: u64, app_ids: &[std::pat
         LOCKDOWN_FILTER_GUIDS[5]
     };
     filters.push(permit(server_guid, server_layer, Condition::RemoteIp(server_ip)));
-    filters.push(block(LOCKDOWN_FILTER_GUIDS[6], Layer::ConnectV4));
-    filters.push(block(LOCKDOWN_FILTER_GUIDS[7], Layer::ConnectV6));
+    filters.push(block(
+        LOCKDOWN_FILTER_GUIDS[6],
+        Layer::ConnectV4,
+        FilterLifetime::Persistent,
+    ));
+    filters.push(block(
+        LOCKDOWN_FILTER_GUIDS[7],
+        Layer::ConnectV6,
+        FilterLifetime::Persistent,
+    ));
+    // Boot-time twin of the block-all pair (#998) — enforced by the kernel
+    // from boot until BFE starts, when the persistent pair above takes over.
+    // See the module doc's "Boot-time coverage" section for why only
+    // block-all gets one.
+    filters.push(block(
+        LOCKDOWN_BOOTTIME_BLOCK_ALL_GUIDS[0],
+        Layer::ConnectV4,
+        FilterLifetime::Boottime,
+    ));
+    filters.push(block(
+        LOCKDOWN_BOOTTIME_BLOCK_ALL_GUIDS[1],
+        Layer::ConnectV6,
+        FilterLifetime::Boottime,
+    ));
     CoverSpec {
         provider: PROVIDER_GUID,
         sublayer: SUBLAYER_GUID,
@@ -446,6 +595,8 @@ pub fn build_lockdown_spec(server_ip: IpAddr, tun_luid: u64, app_ids: &[std::pat
     }
 }
 
+/// Always `Persistent` — no permit is ever boot-time twinned (see the module
+/// doc's "Boot-time coverage" section: only the block-all floor gets one).
 fn permit(guid: GUID, layer: Layer, condition: Condition) -> FilterSpec {
     FilterSpec {
         guid,
@@ -453,16 +604,18 @@ fn permit(guid: GUID, layer: Layer, condition: Condition) -> FilterSpec {
         action: Action::Permit,
         condition,
         weight: PERMIT_WEIGHT,
+        lifetime: FilterLifetime::Persistent,
     }
 }
 
-fn block(guid: GUID, layer: Layer) -> FilterSpec {
+fn block(guid: GUID, layer: Layer, lifetime: FilterLifetime) -> FilterSpec {
     FilterSpec {
         guid,
         layer,
         action: Action::Block,
         condition: Condition::Any,
         weight: BLOCK_WEIGHT,
+        lifetime,
     }
 }
 
@@ -721,15 +874,17 @@ unsafe fn add_filter(engine: HANDLE, provider: GUID, sublayer: GUID, f: &FilterS
         Action::Permit => FWP_ACTION_PERMIT,
         Action::Block => FWP_ACTION_BLOCK,
     };
-    // PERSISTENT only — NO CLEAR_ACTION_RIGHT. Setting that flag makes a filter's
-    // action SOFT (cross-sublayer overridable); omitting it makes the action HARD,
-    // and hardness governs only cross-sublayer arbitration. A BLOCK with the flag
-    // omitted is thus a default-HARD block — and the old code set the flag on the
-    // permits (soft) but not the block (hard), so block-all vetoed every permit
-    // (the cover blocked everything). With the flag off everywhere, within-sublayer
-    // arbitration is pure weight: the weight-15 permits beat the weight-0 block-all
-    // (the wireguard-windows recipe — see the module doc).
-    let flags = FWPM_FILTER_FLAGS(FWPM_FILTER_FLAG_PERSISTENT.0);
+    // Lifetime flag (PERSISTENT or BOOTTIME, see `filter_lifetime_flag` and the
+    // module doc's "Boot-time coverage" section) — NO CLEAR_ACTION_RIGHT.
+    // Setting that flag makes a filter's action SOFT (cross-sublayer
+    // overridable); omitting it makes the action HARD, and hardness governs
+    // only cross-sublayer arbitration. A BLOCK with the flag omitted is thus
+    // a default-HARD block — and the old code set the flag on the permits
+    // (soft) but not the block (hard), so block-all vetoed every permit (the
+    // cover blocked everything). With the flag off everywhere, within-sublayer
+    // arbitration is pure weight: the weight-15 permits beat the weight-0
+    // block-all (the wireguard-windows recipe — see the module doc).
+    let flags = FWPM_FILTER_FLAGS(filter_lifetime_flag(f.lifetime));
 
     // Keep-alive bindings: `FWPM_FILTER0` holds raw pointers into these; they
     // must outlive the `FwpmFilterAdd0` call below.
