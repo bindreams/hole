@@ -1127,6 +1127,27 @@ milliseconds.
   production helper this fix hardened) are a separate, disclosed inconsistency
   (bindreams/hole#1005), and unchanged by this fix.
 
+  **Neither cover purges pf state** (bindreams/hole#1015, disclosed, not fixed
+  here). pf matches the state table *before* the ruleset (`pf_test` calls
+  `pf_test_state_*` and reaches `pf_test_rule` only on `s == NULL`), and
+  `DIOCXCOMMIT` leaves `tree_id` untouched — a state whose creating rule the
+  commit removed is kept alive by `rule->states`. So a flow that already holds a
+  state entry when a cover engages never reaches `block out all`. `-Fa` used to
+  purge state as a side effect of flushing everything; a bare `pfctl -f -` does
+  not. This bites **only** when pf was already enabled by someone else (Docker,
+  another VPN, Internet Sharing): pf creates no state while disabled
+  (`pf_af_hook` bails on `!pf_is_enabled`), stock macOS ships pf loaded but not
+  enabled, and `Cover::drop` returns the refcount to zero between sessions — so
+  the ordinary cold engage has no state to purge, and load-before-enable makes
+  it strictly tighter than the old `-E`-first order. The standing lockdown has
+  the same gap and always has (it never used `-Fa`), which is the half that
+  matters for a kill switch; Windows shares it structurally, filtering at
+  `ALE_AUTH_CONNECT`/`RECV_ACCEPT` rather than per packet. Fixing it is deferred
+  because the blunt remedy does not generalize: `pfctl -F states` is host-wide,
+  and at `engage_lockdown` time that would kill Hole's own live tunnel. A
+  targeted kill needs `DIOCKILLSTATES`' `neg` flag, which macOS's `pfctl` CLI
+  cannot set — hence sequencing behind bindreams/hole#1002.
+
   **Load before enable on a COLD engage** (guarded by the same
   `macos_failclosed_cover_transition_never_admits_blocked_flow` test, via a
   deliberately *different* assertion — see below): `pfctl -E`
