@@ -183,3 +183,15 @@ slow-timeout = { period = "30s", terminate-after = 2 }
 [[profile.default.overrides]]
 filter = 'test(/^(echo_records_round_trip_byte_counts_and_ttfb|silent_drop_records_zero_bytes_and_no_ttfb|silent_after_read_matches_248_shape|rst_close_classified_as_rst_with_os_errno|shutdown_cancels_in_flight_connection_without_panic|cross_check_inbound_and_upstream_counters_match)$/)'
 slow-timeout = { period = "20s", terminate-after = 2 }
+
+# Every `cargo nextest run --profile default` invocation overwrites
+# `target/nextest/default/junit.xml` (nextest, not appended). `test-hole`'s
+# Windows leg runs "Test (non-TUN)" then "Test (TUN, runs last for #200)"
+# sequentially on this profile, so by the time a step reads this file it
+# reflects the TUN run — the one that includes the `global_net_state` group.
+# `cargo xtask verify-global-net-state-executed` (bindreams/hole#999) parses
+# it to confirm those tests didn't just get *selected* (guard 2, #894) but
+# actually *ran*: a green job that silently ran zero of them would otherwise
+# look identical to one that ran them all.
+[profile.default.junit]
+path = "junit.xml"

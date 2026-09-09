@@ -351,6 +351,23 @@ pub enum Command {
         #[arg(long, default_value = "test-hole")]
         job: String,
     },
+    /// Verify that the `global_net_state`-labeled tests `job_id`'s own
+    /// nextest command template selects actually ran — present, non-skipped
+    /// — in a nextest JUnit report, not merely that they were selectable
+    /// (guard 2 above already covers that) — see
+    /// `xtask::global_net_state_conformance::verify_executed`
+    /// (bindreams/hole#999).
+    VerifyGlobalNetStateExecuted {
+        /// ci.yaml job id to check (its steps must include exactly one
+        /// test-running nextest command shape).
+        #[arg(long, default_value = "test-hole")]
+        job: String,
+        /// Path to nextest's JUnit report, resolved relative to the repo
+        /// root if not absolute. Matches `.config/nextest.toml`'s
+        /// `[profile.default.junit].path` under `target/nextest/<profile>/`.
+        #[arg(long, default_value = "target/nextest/default/junit.xml")]
+        junit: PathBuf,
+    },
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum, PartialEq, Eq)]
@@ -433,6 +450,9 @@ pub fn dispatch(cli: Cli) -> Result<()> {
         }
         Command::VerifySkuldLabelCoverage { job } => skuld_label_coverage::verify(&repo_root()?, &job),
         Command::VerifyGlobalNetStateLabels { job } => global_net_state_conformance::verify(&repo_root()?, &job),
+        Command::VerifyGlobalNetStateExecuted { job, junit } => {
+            global_net_state_conformance::verify_executed(&repo_root()?, &job, &junit)
+        }
     }
 }
 

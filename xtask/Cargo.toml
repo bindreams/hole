@@ -60,6 +60,14 @@ tempfile = "3"
 # dev-) dependency because the check runs in the subcommand, not in tests.
 skuld = { workspace = true }
 
+# `verify-global-net-state-executed` (bindreams/hole#999) parses nextest's
+# JUnit report to confirm the `global_net_state`-labeled tests it expects
+# actually ran, not merely that they were selectable. Pinned to "0.21" so it
+# resolves to the SAME version (0.21.1) already in the graph via the macOS
+# `typst`/`resvg` chain below — adds no new roxmltree version, just a new
+# direct edge to one already present.
+roxmltree = "0.21"
+
 # background.typ → transparent PNG via Typst. macOS-only: the DMG background is a
 # darwin feature and the Typst tree is heavy (~300 crates); compiling it on
 # windows/linux needlessly slowed every `cargo xtask` there (the MSI build hit its

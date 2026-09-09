@@ -485,6 +485,25 @@ jobs:
               + package(handle-holders) + package(tombstone)
               + package(hole-test-observability)'
 
+      # Guard 2 above (`verify-global-net-state-labels`) only proves the
+      # `global_net_state` group's tests were SELECTABLE; a job that silently
+      # ran zero of them (e.g. nextest's own group/filter machinery
+      # mis-scheduling on Windows) would still read as green. This reads the
+      # JUnit report the "Test (TUN, ...)" step just wrote
+      # (`.config/nextest.toml`'s `[profile.default.junit]`) and confirms
+      # every one of those tests shows up as actually executed —
+      # bindreams/hole#999. Windows-only: this is the one leg the issue's
+      # premise was about, and this is the first landing of the check —
+      # `continue-on-error` keeps it non-blocking until it's proven stable
+      # (safer than risking every PR's required check on a brand-new guard;
+      # can be promoted to required once green over a few runs).
+      - name: "Verify global_net_state tests actually executed (Windows, #999)"
+        if: matrix.os == 'windows' && matrix.arch == 'amd64'
+        continue-on-error: true
+        timeout-minutes: 5
+        shell: bash
+        run: cargo xtask verify-global-net-state-executed --job test-hole
+
       # macOS TUN lane runs UNDER ROOT: the lockdown real-engage test (#527)
       # drives `pfctl -E`/`-f`, which require root. The runner's cargo/nextest
       # and the user-owned `target/` are reused via `sudo env PATH/HOME` (the

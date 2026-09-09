@@ -20,11 +20,24 @@
 //! nextest.toml name-substring filter; [`set_mismatch`] diffs the two live
 //! listings. [`verify`] orchestrates all four and fails loudly, by exact test
 //! name in both directions, on any divergence.
+//!
+//! Guard 3 (bindreams/hole#999) answers a different question: not "is the
+//! `global_net_state` group's membership correct" (guard 2), but "did the
+//! tests it selected on THIS run actually execute" — closing the gap where a
+//! job that silently ran zero of them would still look green. [`run_nextest_list`]
+//! (reused from guard 1/2) gives the `global_net_state`-labeled tests a given
+//! `job_id` step template *should* select; [`junit_executed_tests`] reads
+//! nextest's own JUnit report (`.config/nextest.toml`'s
+//! `[profile.default.junit]`) for the tests that actually ran (present,
+//! un-skipped); [`set_missing`] diffs the two one-directionally.
+//! [`verify_executed`] orchestrates all three and fails loudly, by exact test
+//! name, on any test that was selected but never shows up as executed.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use anyhow::{bail, ensure, Context, Result};
+use roxmltree::Document;
 
 use crate::ci_coverage;
 use crate::manifest::Manifest;
@@ -229,6 +242,122 @@ pub fn verify(repo_root: &Path, job_id: &str) -> Result<()> {
             msg.push_str(&format!(
                 "    carries the label, missing from the nextest.toml filter: {name}\n"
             ));
+        }
+    }
+    bail!(msg)
+}
+
+// junit_executed_tests (bindreams/hole#999) ===========================================================================
+
+/// Per `<testsuite>`'s testcases' `classname` — nextest emits the same
+/// `binary_id` shape here as `cargo nextest list --message-format json`'s
+/// map key (e.g. `hole-bridge::cutover_leak_privileged`), confirmed against
+/// nextest-runner's own JUnit writer — the set of `name`s that appear as
+/// EXECUTED: present in the report and carrying no `<skipped>` child. A
+/// `<failure>` child still counts as executed; only `<skipped>` does not
+/// (nextest's `report-skipped` policy defaults to emitting none of these at
+/// all, so in practice a skipped entry here means an explicit opt-in
+/// elsewhere — the check does not assume that policy).
+pub(crate) fn junit_executed_tests(xml: &str) -> Result<BTreeMap<String, BTreeSet<String>>> {
+    let doc = Document::parse(xml).context("parsing JUnit XML report")?;
+
+    let mut out: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for node in doc.descendants().filter(|n| n.has_tag_name("testcase")) {
+        let classname = node
+            .attribute("classname")
+            .context("JUnit report has a <testcase> with no classname attribute")?;
+        let name = node
+            .attribute("name")
+            .context("JUnit report has a <testcase> with no name attribute")?;
+        let skipped = node.children().any(|c| c.is_element() && c.has_tag_name("skipped"));
+        if skipped {
+            continue;
+        }
+        out.entry(classname.to_string()).or_default().insert(name.to_string());
+    }
+    Ok(out)
+}
+
+// set_missing (bindreams/hole#999) ====================================================================================
+
+/// Per binary-id, the `expected` tests that `executed` doesn't have — the
+/// one-directional counterpart of [`set_mismatch`]: `executed` may
+/// legitimately be a superset (other labels ran in the same job), only
+/// "selected but never ran" is a finding here.
+pub(crate) fn set_missing(
+    expected: &BTreeMap<String, BTreeSet<String>>,
+    executed: &BTreeMap<String, BTreeSet<String>>,
+) -> BTreeMap<String, BTreeSet<String>> {
+    let empty = BTreeSet::new();
+    let mut out = BTreeMap::new();
+    for (binary_id, names) in expected {
+        let ran = executed.get(binary_id).unwrap_or(&empty);
+        let missing: BTreeSet<String> = names.difference(ran).cloned().collect();
+        if !missing.is_empty() {
+            out.insert(binary_id.clone(), missing);
+        }
+    }
+    out
+}
+
+// verify_executed (bindreams/hole#999) ================================================================================
+
+/// Run guard 3 for `job_id`: list the tests the `global_net_state` skuld
+/// label selects for `job_id`'s own nextest command template (the same
+/// listing guard 2's `label_matched` computes), then confirm every one of
+/// them appears as executed (non-skipped) in the JUnit report at
+/// `junit_path` (resolved relative to `repo_root` if not absolute). Fails
+/// loudly, by exact test name, on any that don't — proving the privileged
+/// lane didn't just SELECT these tests but actually RAN them.
+pub fn verify_executed(repo_root: &Path, job_id: &str, junit_path: &Path) -> Result<()> {
+    let ci_yaml = std::fs::read_to_string(repo_root.join(".github/workflows/ci.yaml")).context("read ci.yaml")?;
+    let manifest = Manifest::parse(&std::fs::read_to_string(repo_root.join("build.yaml")).context("read build.yaml")?)
+        .context("parse build.yaml")?;
+
+    let template = job_list_template(&ci_yaml, &manifest, job_id)?;
+    let expected = run_nextest_list(repo_root, &template, Some(LABEL_NAME))?;
+
+    // Same defense as guard 2 (bindreams/hole#865 audit finding 4): a
+    // vacuously-empty expectation would make an all-zero JUnit report pass
+    // just as cleanly as a real one.
+    let any_expected = expected.values().any(|s| !s.is_empty());
+    ensure!(
+        any_expected,
+        "job {job_id:?}: the {LABEL_NAME:?} label selected ZERO tests — guard 3 has nothing to confirm \
+         actually ran, which defeats it as surely as a real execution gap would (bindreams/hole#999)"
+    );
+
+    let junit_abs = if junit_path.is_absolute() {
+        junit_path.to_path_buf()
+    } else {
+        repo_root.join(junit_path)
+    };
+    let junit_xml = std::fs::read_to_string(&junit_abs)
+        .with_context(|| format!("reading JUnit report at {}", junit_abs.display()))?;
+    let executed = junit_executed_tests(&junit_xml)?;
+
+    let missing = set_missing(&expected, &executed);
+    if missing.is_empty() {
+        let total: usize = expected.values().map(BTreeSet::len).sum();
+        println!(
+            "xtask: global_net_state execution proof OK for job {job_id:?} — all {total} {LABEL_NAME:?}-labeled \
+             test(s) appear as executed (non-skipped) in {}",
+            junit_abs.display()
+        );
+        return Ok(());
+    }
+
+    let missing_count: usize = missing.values().map(BTreeSet::len).sum();
+    let mut msg = format!(
+        "job {job_id:?}: {missing_count} {LABEL_NAME:?}-labeled test(s) were selected but do NOT appear as \
+         executed (non-skipped) in the JUnit report at {} — a green job that silently ran zero (or fewer than \
+         expected) of these tests (bindreams/hole#999):\n",
+        junit_abs.display()
+    );
+    for (binary_id, names) in &missing {
+        msg.push_str(&format!("  {binary_id}:\n"));
+        for name in names {
+            msg.push_str(&format!("    {name}\n"));
         }
     }
     bail!(msg)
