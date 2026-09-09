@@ -74,7 +74,7 @@ impl UiSettings {
                     server: ui.server.clone().into(),
                     server_port: ui.server_port,
                     method: ui.method.clone(),
-                    password: ui.password.clone(),
+                    password: ui.password.clone().into(),
                     plugin: ui.plugin.clone(),
                     plugin_opts: ui.plugin_opts.clone(),
                     // Backend-owned — preserved.

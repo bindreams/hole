@@ -292,6 +292,63 @@ impl dump::Dump for ServerAddress {
     }
 }
 
+/// A configured shadowsocks password.
+///
+/// The same `Display`-less, `Deref`-less shape as [`ServerAddress`], for the
+/// same reason and with the same single named exit,
+/// [`expose`](Self::expose) — so `rg '\.expose\(\)'` enumerates every site
+/// that reads a real secret, and `password = %entry.password` is a compile
+/// error rather than a leak.
+///
+/// Until #980 the password was a bare `String` whose only protection was the
+/// hand-written [`Debug`] and [`Dump`](dump::Dump) impls on its two
+/// containers — a convention two levels above the value, which the `dump!`
+/// ladder had already defeated once for the address. This newtype moves the
+/// protection onto the value itself.
+///
+/// `#[serde(transparent)]`: the on-disk and on-the-wire form is unchanged, a
+/// bare JSON string. Moving the secret out of `config.json` and into the OS
+/// keystore ([`crate::secrets`]) is the follow-up half of #980.
+#[derive(Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct Password(String);
+
+impl Password {
+    pub fn new(secret: impl Into<String>) -> Self {
+        Self(secret.into())
+    }
+
+    /// The secret in clear. Every caller is a site that genuinely needs to
+    /// dial with it, compare it, or persist it — never a log field.
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<&str> for Password {
+    fn from(value: &str) -> Self {
+        Self::new(value)
+    }
+}
+
+impl From<String> for Password {
+    fn from(value: String) -> Self {
+        Self::new(value)
+    }
+}
+
+impl std::fmt::Debug for Password {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Password(<redacted>)")
+    }
+}
+
+impl dump::Dump for Password {
+    fn dump(&self) -> dump::DumpValue {
+        dump::DumpValue::tagged(dump::tag::SECRET, dump::DumpValue::String(self.0.clone()))
+    }
+}
+
 #[derive(Clone, Serialize, Deserialize, PartialEq)]
 pub struct ServerEntry {
     pub id: String,
@@ -299,7 +356,7 @@ pub struct ServerEntry {
     pub server: ServerAddress,
     pub server_port: u16,
     pub method: String,
-    pub password: String,
+    pub password: Password,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub plugin: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -325,7 +382,7 @@ impl ServerEntry {
             server: ServerAddress::new("127.0.0.1"),
             server_port: 0,
             method: "aes-256-gcm".into(),
-            password: String::new(),
+            password: Password::new(""),
             plugin: None,
             plugin_opts: None,
             validation: None,
@@ -341,7 +398,7 @@ impl std::fmt::Debug for ServerEntry {
             .field("server", &self.server)
             .field("server_port", &self.server_port)
             .field("method", &self.method)
-            .field("password", &"<redacted>")
+            .field("password", &self.password)
             .field("plugin", &self.plugin)
             .field("plugin_opts", &self.plugin_opts)
             .field("validation", &self.validation)
@@ -363,7 +420,7 @@ impl std::fmt::Debug for ServerEntry {
 /// compiler guarantee; the redacting sink is the backstop.
 impl dump::Dump for ServerEntry {
     fn dump(&self) -> dump::DumpValue {
-        use dump::{tag, DumpValue};
+        use dump::DumpValue;
         let key = |k: &str| DumpValue::String(k.to_string());
         DumpValue::Map(vec![
             (key("id"), dump::from_serialize(&self.id)),
@@ -371,10 +428,7 @@ impl dump::Dump for ServerEntry {
             (key("server"), self.server.dump()),
             (key("server_port"), dump::from_serialize(&self.server_port)),
             (key("method"), dump::from_serialize(&self.method)),
-            (
-                key("password"),
-                DumpValue::tagged(tag::SECRET, DumpValue::String(self.password.clone())),
-            ),
+            (key("password"), self.password.dump()),
             (key("plugin"), dump::from_serialize(&self.plugin)),
             (key("plugin_opts"), dump::from_serialize(&self.plugin_opts)),
             (key("validation"), dump::from_serialize(&self.validation)),

@@ -8,7 +8,7 @@ fn sample_server() -> ServerEntry {
         server: "1.2.3.4".into(),
         server_port: 8388,
         method: "aes-256-gcm".to_string(),
-        password: "pw".to_string(),
+        password: "pw".to_string().into(),
         plugin: None,
         plugin_opts: None,
         validation: None,
@@ -657,7 +657,7 @@ fn secret_config() -> ProxyConfig {
         ..ProxyConfig::default()
     };
     config.server.server = SECRET_ADDR.into();
-    config.server.password = SECRET_PW.to_string();
+    config.server.password = SECRET_PW.to_string().into();
     config
 }
 

@@ -323,7 +323,7 @@ fn build_server_config(entry: &ServerEntry, server_ip: IpAddr) -> Result<ServerC
         .map_err(|_| format!("unsupported cipher: {}", entry.method))?;
     ServerConfig::new(
         ServerAddr::SocketAddr(SocketAddr::new(server_ip, entry.server_port)),
-        entry.password.clone(),
+        entry.password.expose().to_owned(),
         cipher,
     )
     .map_err(|e| format!("invalid server config: {e}"))

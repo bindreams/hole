@@ -386,7 +386,7 @@ pub fn build_ss_config(
         Some(addr) => ServerAddr::SocketAddr(addr),
         None => ServerAddr::SocketAddr(SocketAddr::new(server_ip, entry.server_port)),
     };
-    let server_config = ServerConfig::new(server_addr, entry.password.clone(), method)
+    let server_config = ServerConfig::new(server_addr, entry.password.expose().to_owned(), method)
         .map_err(|e| ProxyError::InvalidMethod(e.to_string()))?;
 
     // No PluginConfig is set — Garter manages the plugin lifecycle externally.

@@ -13,7 +13,7 @@ fn parse_single_server_minimal() {
     assert_eq!(servers[0].server.expose(), "1.2.3.4");
     assert_eq!(servers[0].server_port, 8388);
     assert_eq!(servers[0].method, "aes-256-gcm");
-    assert_eq!(servers[0].password, "pw");
+    assert_eq!(servers[0].password.expose(), "pw");
     assert_eq!(servers[0].name, "1.2.3.4:8388"); // fallback name
     assert!(servers[0].plugin.is_none());
     assert!(!servers[0].id.is_empty()); // UUID assigned
@@ -195,7 +195,7 @@ fn parse_servers_array_with_address_port_aliases() {
     let entry = &servers[0];
     assert_eq!(entry.server.expose(), "host.example.com");
     assert_eq!(entry.server_port, 443);
-    assert_eq!(entry.password, "pw");
+    assert_eq!(entry.password.expose(), "pw");
     assert_eq!(entry.method, "chacha20-ietf-poly1305");
     assert_eq!(entry.plugin.as_deref(), Some("galoshes"));
     assert_eq!(entry.plugin_opts.as_deref(), Some("tls;path=/x;host=host.example.com"));

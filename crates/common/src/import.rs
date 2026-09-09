@@ -144,7 +144,7 @@ fn parse_server_value(value: &serde_json::Value) -> Result<ServerEntry, ImportEr
         server: server.into(),
         server_port,
         method: method.to_string(),
-        password: password.to_string(),
+        password: crate::config::Password::new(password),
         plugin,
         plugin_opts,
         validation: None,

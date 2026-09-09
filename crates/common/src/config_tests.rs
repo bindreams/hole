@@ -34,7 +34,7 @@ fn load_valid_json_roundtrips(#[fixture(temp_dir)] dir: &Path) {
             server: "1.2.3.4".into(),
             server_port: 8388,
             method: "aes-256-gcm".to_string(),
-            password: "secret".to_string(),
+            password: "secret".to_string().into(),
             plugin: None,
             plugin_opts: None,
             validation: None,
@@ -167,7 +167,7 @@ fn selected_entry_with_unknown_uuid_returns_none() {
             server: "1.2.3.4".into(),
             server_port: 8388,
             method: "aes-256-gcm".to_string(),
-            password: "pw".to_string(),
+            password: "pw".to_string().into(),
             plugin: None,
             plugin_opts: None,
             validation: None,
@@ -188,7 +188,7 @@ fn selected_entry_with_valid_uuid_returns_correct_entry() {
                 server: "1.1.1.1".into(),
                 server_port: 1111,
                 method: "aes-256-gcm".to_string(),
-                password: "pw1".to_string(),
+                password: "pw1".to_string().into(),
                 plugin: None,
                 plugin_opts: None,
                 validation: None,
@@ -199,7 +199,7 @@ fn selected_entry_with_valid_uuid_returns_correct_entry() {
                 server: "2.2.2.2".into(),
                 server_port: 2222,
                 method: "chacha20-ietf-poly1305".to_string(),
-                password: "pw2".to_string(),
+                password: "pw2".to_string().into(),
                 plugin: None,
                 plugin_opts: None,
                 validation: None,
@@ -339,7 +339,7 @@ fn server_entry_debug_redacts_password() {
         server: "1.2.3.4".into(),
         server_port: 8388,
         method: "aes-256-gcm".to_string(),
-        password: "super-secret-do-not-leak".to_string(),
+        password: "super-secret-do-not-leak".to_string().into(),
         plugin: None,
         plugin_opts: None,
         validation: None,
@@ -363,7 +363,7 @@ fn server_entry_debug_shows_non_sensitive_fields() {
         server: "10.20.30.40".into(),
         server_port: 9999,
         method: "chacha20-ietf-poly1305".to_string(),
-        password: "do-not-show-this".to_string(),
+        password: "do-not-show-this".to_string().into(),
         plugin: Some("v2ray-plugin".to_string()),
         plugin_opts: Some("server;tls".to_string()),
         validation: None,
@@ -697,7 +697,7 @@ fn secret_entry() -> ServerEntry {
         server: SECRET_ADDR.into(),
         server_port: 8388,
         method: "aes-256-gcm".to_string(),
-        password: SECRET_PW.to_string(),
+        password: SECRET_PW.to_string().into(),
         plugin: None,
         plugin_opts: None,
         validation: None,
@@ -737,6 +737,34 @@ fn server_address_dump_renders_as_a_secret() {
     let rendered = dump::dump!(&addr).to_string();
     assert!(!rendered.contains(SECRET_ADDR), "{rendered}");
     assert!(rendered.contains("REDACTED"), "{rendered}");
+}
+
+#[skuld::test]
+fn password_debug_is_redacted() {
+    let password = Password::new(SECRET_PW);
+    assert_eq!(format!("{password:?}"), "Password(<redacted>)");
+}
+
+#[skuld::test]
+fn password_dump_renders_as_a_secret() {
+    let password = Password::new(SECRET_PW);
+    let rendered = dump::dump!(&password).to_string();
+    assert!(!rendered.contains(SECRET_PW), "{rendered}");
+    assert!(rendered.contains("REDACTED"), "{rendered}");
+}
+
+/// `#[serde(transparent)]` is what makes the newtype a pure refactor: the
+/// config file and the IPC wire keep the bare string they carried before, so
+/// this step needs no migration and a bridge of either vintage still parses
+/// the other's `ProxyConfig`.
+#[skuld::test]
+fn password_json_form_is_a_bare_string() {
+    let entry = secret_entry();
+    let json = serde_json::to_value(&entry).expect("serialize");
+    assert_eq!(json["password"], serde_json::Value::String(SECRET_PW.to_string()));
+
+    let back: ServerEntry = serde_json::from_value(json).expect("deserialize");
+    assert_eq!(back.password.expose(), SECRET_PW);
 }
 
 #[skuld::test]
