@@ -45,7 +45,7 @@ const SETTINGS_DOM = `
   <span class="setting-label" id="lbl-start-on-login">Start Hole on login</span>
   <button type="button" class="toggle" id="toggle-start-on-login" role="switch" aria-checked="false" aria-labelledby="lbl-start-on-login"></button>
 
-  <span class="setting-label" id="lbl-on-startup">On startup</span>
+  <span class="setting-label" id="lbl-on-startup">On system startup</span>
   <div class="custom-select-wrap">
     <button type="button" class="custom-select-btn" id="select-on-startup" aria-haspopup="listbox" aria-expanded="false" aria-labelledby="lbl-on-startup select-on-startup">Do not connect</button>
     <div class="custom-select-menu" id="menu-on-startup" role="listbox" aria-labelledby="lbl-on-startup">
