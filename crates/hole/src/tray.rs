@@ -243,7 +243,7 @@ const ID_LOCKDOWN: &str = "lockdown";
 const ID_BLOCKED_RETRY: &str = "blocked_retry";
 const ID_UNBLOCK: &str = "unblock";
 
-const UNBLOCK_ITEM_LABEL: &str = "Unblock Network (turns Lockdown off)";
+const UNBLOCK_ITEM_LABEL: &str = "Unblock Network (disconnects, turns Lockdown off)";
 
 /// Shown when `BridgeRequest::Unblock` could not be reached or answered
 /// unintelligibly — the case the CLI door exists for. Must name the CLI
