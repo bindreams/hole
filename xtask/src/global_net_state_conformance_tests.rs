@@ -1,14 +1,14 @@
 //! Unit tests for guard 2's structural building blocks (bindreams/hole#894):
 //! [`group_config`], [`job_list_template`], [`narrow_filter`], and
 //! [`set_mismatch`] — and guard 3's (bindreams/hole#999):
-//! [`junit_executed_tests`] and [`set_missing`]. `verify`/`verify_executed`
-//! themselves are not unit-tested directly — every piece of logic they
-//! orchestrate is covered here.
+//! [`junit_executed_tests`], [`merge_executed`], and [`set_missing`].
+//! `verify`/`verify_executed` themselves are not unit-tested directly — every
+//! piece of logic they orchestrate is covered here.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::global_net_state_conformance::{
-    group_config, job_list_template, junit_executed_tests, narrow_filter, set_mismatch, set_missing,
+    group_config, job_list_template, junit_executed_tests, merge_executed, narrow_filter, set_mismatch, set_missing,
 };
 use crate::manifest::Manifest;
 
@@ -303,6 +303,56 @@ fn junit_executed_tests_returns_empty_map_for_a_report_with_no_testcases() {
     let xml = r#"<testsuites><testsuite name="empty"></testsuite></testsuites>"#;
     let executed = junit_executed_tests(xml).expect("parse");
     assert!(executed.is_empty());
+}
+
+// ===== merge_executed (bindreams/hole#999) ===========================================================================
+
+#[skuld::test]
+fn merge_executed_unions_names_within_a_shared_binary_id() {
+    // The real motivating case: a mocked test runs only in the non-TUN
+    // step's report, a privileged one only in the TUN step's — both must
+    // survive the merge even though neither report alone has both.
+    let non_tun = binmap(&[("tun-engine", &["mocked_release_all_test"])]);
+    let tun = binmap(&[("tun-engine", &["privileged_gateway_test"])]);
+    let merged = merge_executed([non_tun, tun]);
+    assert_eq!(
+        merged["tun-engine"],
+        names(&["mocked_release_all_test", "privileged_gateway_test"])
+    );
+}
+
+#[skuld::test]
+fn merge_executed_unions_across_different_binary_ids() {
+    let a = binmap(&[("hole-bridge", &["x"])]);
+    let b = binmap(&[("tun-engine::gateway_privileged", &["y"])]);
+    let merged = merge_executed([a, b]);
+    assert_eq!(merged.len(), 2);
+    assert_eq!(merged["hole-bridge"], names(&["x"]));
+    assert_eq!(merged["tun-engine::gateway_privileged"], names(&["y"]));
+}
+
+#[skuld::test]
+fn merge_executed_of_a_single_map_is_that_map() {
+    let only = binmap(&[("hole-bridge", &["a", "b"])]);
+    let merged = merge_executed([only.clone()]);
+    assert_eq!(merged, only);
+}
+
+#[skuld::test]
+fn merge_executed_of_zero_maps_is_empty() {
+    let merged = merge_executed(Vec::<BTreeMap<String, BTreeSet<String>>>::new());
+    assert!(merged.is_empty());
+}
+
+#[skuld::test]
+fn merge_executed_deduplicates_a_name_present_in_more_than_one_map() {
+    // A test that happens to run in both partitions (e.g. TUN and non-TUN,
+    // were that ever true for one test) must not produce a duplicate — sets
+    // already guarantee this, but pin it as the documented behavior.
+    let a = binmap(&[("hole-bridge", &["a"])]);
+    let b = binmap(&[("hole-bridge", &["a"])]);
+    let merged = merge_executed([a, b]);
+    assert_eq!(merged["hole-bridge"], names(&["a"]));
 }
 
 // ===== set_missing (bindreams/hole#999) ==============================================================================

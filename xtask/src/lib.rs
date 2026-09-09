@@ -362,11 +362,18 @@ pub enum Command {
         /// test-running nextest command shape).
         #[arg(long, default_value = "test-hole")]
         job: String,
-        /// Path to nextest's JUnit report, resolved relative to the repo
+        /// Path to a nextest JUnit report, resolved relative to the repo
         /// root if not absolute. Matches `.config/nextest.toml`'s
         /// `[profile.default.junit].path` under `target/nextest/<profile>/`.
-        #[arg(long, default_value = "target/nextest/default/junit.xml")]
-        junit: PathBuf,
+        /// Repeatable: `.config/nextest.toml`'s single `junit.path` is
+        /// overwritten by every `cargo nextest run` invocation on that
+        /// profile, and `global_net_state`-labeled tests can legitimately
+        /// execute in more than one of `job_id`'s nextest-run steps — pass
+        /// one `--junit` per step whose report should count, in step order;
+        /// their executed-test sets are unioned. Defaults to the one
+        /// standard path if none are given.
+        #[arg(long = "junit")]
+        junit: Vec<PathBuf>,
     },
 }
 

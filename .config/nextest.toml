@@ -187,11 +187,14 @@ slow-timeout = { period = "20s", terminate-after = 2 }
 # Every `cargo nextest run --profile default` invocation overwrites
 # `target/nextest/default/junit.xml` (nextest, not appended). `test-hole`'s
 # Windows leg runs "Test (non-TUN)" then "Test (TUN, runs last for #200)"
-# sequentially on this profile, so by the time a step reads this file it
-# reflects the TUN run — the one that includes the `global_net_state` group.
-# `cargo xtask verify-global-net-state-executed` (bindreams/hole#999) parses
-# it to confirm those tests didn't just get *selected* (guard 2, #894) but
-# actually *ran*: a green job that silently ran zero of them would otherwise
-# look identical to one that ran them all.
+# sequentially on this profile, so by the time the TUN step's file exists it
+# reflects ONLY the TUN run — not every `global_net_state`-labeled test lives
+# there, since some are mocked and only run in the non-TUN partition
+# (bindreams/hole#894 "Option B"). ci.yaml's "Preserve non-TUN JUnit report
+# for guard 3" step copies this file aside before it gets overwritten, and
+# `cargo xtask verify-global-net-state-executed` (bindreams/hole#999) reads
+# both copies to confirm those tests didn't just get *selected* (guard 2,
+# #894) but actually *ran*: a green job that silently ran zero of them would
+# otherwise look identical to one that ran them all.
 [profile.default.junit]
 path = "junit.xml"

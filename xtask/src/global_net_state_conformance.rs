@@ -30,11 +30,23 @@
 //! nextest's own JUnit report (`.config/nextest.toml`'s
 //! `[profile.default.junit]`) for the tests that actually ran (present,
 //! un-skipped); [`set_missing`] diffs the two one-directionally.
-//! [`verify_executed`] orchestrates all three and fails loudly, by exact test
-//! name, on any test that was selected but never shows up as executed.
+//!
+//! A single JUnit report is not always enough: `[profile.default.junit]`
+//! overwrites the same file on every `cargo nextest run` invocation, and not
+//! every `global_net_state`-labeled test is privileged — some are mocked
+//! unit tests that preserve the nextest.toml filter's membership without
+//! carrying `TUN` (bindreams/hole#894 "Option B"), so they run in the
+//! non-TUN partition and never in the TUN one. [`verify_executed`] therefore
+//! takes one JUnit path per nextest-run step that might contain a
+//! `global_net_state` test and [`merge_executed`] unions their executed sets
+//! before diffing — a lone report from whichever step ran last would
+//! otherwise call an earlier-only test "missing" despite it having passed.
+//! [`verify_executed`] orchestrates all four and fails loudly, by exact test
+//! name, on any test that was selected but never shows up as executed in any
+//! of them.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{bail, ensure, Context, Result};
 use roxmltree::Document;
@@ -300,16 +312,48 @@ pub(crate) fn set_missing(
     out
 }
 
+// merge_executed (bindreams/hole#999) =================================================================================
+
+/// Union several [`junit_executed_tests`] maps into one, per binary-id. Not
+/// every `global_net_state`-labeled test is privileged: the group also
+/// deliberately carries mocked, non-privileged tests that preserve the
+/// `.config/nextest.toml` name-substring filter's membership without
+/// mutating real OS state (bindreams/hole#894 "Option B" — e.g.
+/// `release_all_first_delete_failure_reports_the_first_real_error_and_inspects_every_code`,
+/// which never carries `TUN` and so runs only in the non-TUN partition,
+/// never the TUN one). A JUnit report is one nextest invocation's output
+/// (`[profile.default.junit]` overwrites the same file on every `cargo
+/// nextest run`), so proving every labeled test executed *somewhere* across
+/// `job_id`'s several nextest-run steps needs each step's report unioned —
+/// a lone report from the last step to run would otherwise call a test that
+/// only ran earlier "missing", despite it having passed.
+pub(crate) fn merge_executed(
+    maps: impl IntoIterator<Item = BTreeMap<String, BTreeSet<String>>>,
+) -> BTreeMap<String, BTreeSet<String>> {
+    let mut out: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for map in maps {
+        for (binary_id, names) in map {
+            out.entry(binary_id).or_default().extend(names);
+        }
+    }
+    out
+}
+
 // verify_executed (bindreams/hole#999) ================================================================================
+
+/// `.config/nextest.toml`'s standard JUnit report path, used when
+/// [`verify_executed`] is given no `--junit` path at all.
+const DEFAULT_JUNIT_PATH: &str = "target/nextest/default/junit.xml";
 
 /// Run guard 3 for `job_id`: list the tests the `global_net_state` skuld
 /// label selects for `job_id`'s own nextest command template (the same
 /// listing guard 2's `label_matched` computes), then confirm every one of
-/// them appears as executed (non-skipped) in the JUnit report at
-/// `junit_path` (resolved relative to `repo_root` if not absolute). Fails
+/// them appears as executed (non-skipped) in at least one of `junit_paths`'
+/// JUnit reports (each resolved relative to `repo_root` if not absolute;
+/// defaults to the one standard path if `junit_paths` is empty). Fails
 /// loudly, by exact test name, on any that don't — proving the privileged
 /// lane didn't just SELECT these tests but actually RAN them.
-pub fn verify_executed(repo_root: &Path, job_id: &str, junit_path: &Path) -> Result<()> {
+pub fn verify_executed(repo_root: &Path, job_id: &str, junit_paths: &[PathBuf]) -> Result<()> {
     let ci_yaml = std::fs::read_to_string(repo_root.join(".github/workflows/ci.yaml")).context("read ci.yaml")?;
     let manifest = Manifest::parse(&std::fs::read_to_string(repo_root.join("build.yaml")).context("read build.yaml")?)
         .context("parse build.yaml")?;
@@ -327,22 +371,39 @@ pub fn verify_executed(repo_root: &Path, job_id: &str, junit_path: &Path) -> Res
          actually ran, which defeats it as surely as a real execution gap would (bindreams/hole#999)"
     );
 
-    let junit_abs = if junit_path.is_absolute() {
-        junit_path.to_path_buf()
+    let default_paths = [PathBuf::from(DEFAULT_JUNIT_PATH)];
+    let junit_paths: &[PathBuf] = if junit_paths.is_empty() {
+        &default_paths
     } else {
-        repo_root.join(junit_path)
+        junit_paths
     };
-    let junit_xml = std::fs::read_to_string(&junit_abs)
-        .with_context(|| format!("reading JUnit report at {}", junit_abs.display()))?;
-    let executed = junit_executed_tests(&junit_xml)?;
+
+    let mut junit_abs_paths = Vec::with_capacity(junit_paths.len());
+    let mut executed_maps = Vec::with_capacity(junit_paths.len());
+    for junit_path in junit_paths {
+        let junit_abs = if junit_path.is_absolute() {
+            junit_path.clone()
+        } else {
+            repo_root.join(junit_path)
+        };
+        let junit_xml = std::fs::read_to_string(&junit_abs)
+            .with_context(|| format!("reading JUnit report at {}", junit_abs.display()))?;
+        executed_maps.push(junit_executed_tests(&junit_xml)?);
+        junit_abs_paths.push(junit_abs);
+    }
+    let executed = merge_executed(executed_maps);
+    let junit_paths_display = junit_abs_paths
+        .iter()
+        .map(|p| p.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
 
     let missing = set_missing(&expected, &executed);
     if missing.is_empty() {
         let total: usize = expected.values().map(BTreeSet::len).sum();
         println!(
             "xtask: global_net_state execution proof OK for job {job_id:?} — all {total} {LABEL_NAME:?}-labeled \
-             test(s) appear as executed (non-skipped) in {}",
-            junit_abs.display()
+             test(s) appear as executed (non-skipped) across the JUnit report(s) at {junit_paths_display}"
         );
         return Ok(());
     }
@@ -350,9 +411,8 @@ pub fn verify_executed(repo_root: &Path, job_id: &str, junit_path: &Path) -> Res
     let missing_count: usize = missing.values().map(BTreeSet::len).sum();
     let mut msg = format!(
         "job {job_id:?}: {missing_count} {LABEL_NAME:?}-labeled test(s) were selected but do NOT appear as \
-         executed (non-skipped) in the JUnit report at {} — a green job that silently ran zero (or fewer than \
-         expected) of these tests (bindreams/hole#999):\n",
-        junit_abs.display()
+         executed (non-skipped) in any of the JUnit report(s) at {junit_paths_display} — a green job that \
+         silently ran zero (or fewer than expected) of these tests (bindreams/hole#999):\n"
     );
     for (binary_id, names) in &missing {
         msg.push_str(&format!("  {binary_id}:\n"));
