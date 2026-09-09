@@ -1,7 +1,10 @@
 use super::*;
 use std::net::IpAddr;
 
-use crate::GLOBAL_NET_STATE;
+// Aliased: this file already has its own `const TUN: &str = "hole-tun"` (the
+// interface-name fixture for the lockdown ruleset builder tests), colliding
+// with the `TUN` skuld label.
+use crate::{GLOBAL_NET_STATE, TUN as TUN_LABEL};
 
 fn v4() -> IpAddr {
     "203.0.113.7".parse().unwrap()
@@ -948,5 +951,159 @@ fn an_empty_but_captured_baseline_still_restores_the_snapshot() {
         ops.log.contains(&"load_ruleset"),
         "a captured baseline is restored from the snapshot even when empty: {:?}",
         ops.log
+    );
+}
+
+// cover transition (bindreams/hole#997) ===============================================================================
+
+/// Proves a transient-cover TRANSITION — a second real `engage()` replacing a
+/// still-live cover, with no intervening `disengage` — never admits a flow the
+/// OLD cover was blocking. This is the scenario `-Fa` broke: `pfctl -Fa -f -`
+/// is two separate kernel transactions (flush, then load), so a host between
+/// them briefly runs with no pf rules at all — a pass-all window between two
+/// rulesets that both block `NON_PERMITTED`. Dropping `-Fa` makes the load a
+/// single `pfctl -f -`, one atomic pf transaction under the kernel's
+/// DIOCADDRULE/DIOCXCOMMIT ticket discipline (see `crates/tun-engine/src/
+/// routing/failclosed/macos.rs`'s module doc), so no such window should exist.
+///
+/// Lives here (not `lockdown_privileged_tests.rs`) because it must retire an
+/// intermediate cover's pf enable refcount WITHOUT running its normal
+/// `Drop`/`disengage` — that disengage reloads `/etc/pf.conf`, which is
+/// exactly the open-host state this test must never let onto the wire — and
+/// doing that needs `Cover`'s private `token` field plus the private `pfctl`
+/// helper, both visible only inside `platform`'s own module tree.
+///
+/// EVIDENTIARY SCOPE (the #997 caveat): pf has no programmatic API and no
+/// published kernel source this repo can read, so "a single `pfctl -f -` is
+/// one atomic transaction" is an inference from `pfctl`'s documented ticket
+/// behaviour, not a fact read out of the kernel. This test does not prove
+/// that inference — it runs 25 real transitions against a pool of concurrent
+/// background probers spanning the whole loop, so IF the inference were wrong
+/// (an `-Fa`-shaped gap still existed, or reappeared some other way), the
+/// prober pool has many overlapping, independent real chances to catch a SYN
+/// that got out during an open window and would very likely observe at least
+/// one. A pass here is strong empirical evidence of atomicity across real
+/// transitions on this kernel, not a mathematical proof — a race narrower
+/// than the prober pool's combined polling resolution could in principle
+/// still slip through undetected. The pool (not a single serial prober) is
+/// load-bearing here: pf's `block-policy drop` (silent drop, no RST) means a
+/// blocked connect blocks for its *entire* timeout before the same thread can
+/// probe again, so one thread alone could be parked inside a single blocked
+/// `connect_timeout` call for the whole duration of a given `engage()` (a few
+/// subprocess `pfctl` calls, plausibly a handful of milliseconds) and never
+/// overlap that transition at all. `PROBER_THREADS` concurrent, short-timeout
+/// probers keep the number of in-flight SYNs high at every instant instead of
+/// only between a single thread's timeouts.
+#[cfg(target_os = "macos")]
+#[skuld::test(labels = [TUN_LABEL, GLOBAL_NET_STATE], serial = TUN_LABEL)]
+fn macos_failclosed_cover_transition_never_admits_blocked_flow() {
+    use std::net::TcpStream;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    // Two real, reachable hosts on the same reliable anycast network the
+    // neighbouring privileged tests use (see `lockdown_privileged_tests.rs`'s
+    // `PERMITTED`/`RESOLVER` doc for why real routable IPs, not loopback, are
+    // required here). Alternating the permitted server between them forces
+    // every `engage()` in the loop to load a ruleset whose TEXT actually
+    // differs from the one it replaces. `NON_PERMITTED` is blocked by EVERY
+    // ruleset in the loop, so any successful connect to it during the loop is
+    // a leak, full stop — it can never be explained by which server happens
+    // to be permitted at that moment.
+    const SERVER_A: &str = "1.1.1.1";
+    const SERVER_B: &str = "1.0.0.1";
+    const NON_PERMITTED: &str = "8.8.8.8:443";
+    const ITERATIONS: usize = 25;
+    // See the doc comment above: `block-policy drop` parks a single prober
+    // thread inside one blocked `connect_timeout` call for the whole timeout,
+    // so a lone prober could miss an entire fast transition. A pool of short-
+    // timeout probers keeps several SYNs in flight at every instant instead.
+    const PROBER_THREADS: usize = 16;
+    const PROBER_TIMEOUT: Duration = Duration::from_millis(20);
+
+    // External-event probe with a graceful failure bound: the timeout is the
+    // failure-to-human signal for a remote host that might not respond, not a
+    // sync sleep or a poll on state this test controls.
+    let connect = |addr: &str, timeout: Duration| TcpStream::connect_timeout(&addr.parse().unwrap(), timeout);
+
+    let baseline = connect(NON_PERMITTED, Duration::from_secs(5));
+    assert!(
+        baseline.is_ok(),
+        "NETWORK/ENVIRONMENT problem (not the cover): pre-cover baseline egress must reach \
+         {NON_PERMITTED}: {:?}",
+        baseline.err().map(|e| e.kind()),
+    );
+
+    let leaked = Arc::new(AtomicBool::new(false));
+    let stop = Arc::new(AtomicBool::new(false));
+
+    // Continuous prober POOL spanning the WHOLE transition loop below, each on
+    // its own thread with a short timeout, so many SYNs are in flight at every
+    // instant and the pool overlaps every one of the loop's real `pfctl` calls
+    // rather than only sampling between iterations (see the doc comment above
+    // for why a single serial prober is not enough under `block-policy drop`).
+    let probers: Vec<_> = (0..PROBER_THREADS)
+        .map(|_| {
+            let (leaked_prober, stop_prober) = (leaked.clone(), stop.clone());
+            std::thread::spawn(move || {
+                let mut attempts = 0usize;
+                while !stop_prober.load(Ordering::SeqCst) {
+                    attempts += 1;
+                    if connect(NON_PERMITTED, PROBER_TIMEOUT).is_ok() {
+                        leaked_prober.store(true, Ordering::SeqCst);
+                    }
+                }
+                attempts
+            })
+        })
+        .collect();
+
+    // One `state_dir` for the whole loop: each engage's persist-before-mutate
+    // save overwrites the previous cover's state file with its own token
+    // before loading its ruleset, exactly as a real re-engage-without-
+    // disengage would.
+    let dir = tempfile::tempdir().unwrap();
+    let addrs = [SERVER_A, SERVER_B];
+    let mut held: Option<Cover> = None;
+    for i in 0..ITERATIONS {
+        let server_ip: IpAddr = addrs[i % addrs.len()].parse().unwrap();
+        let new_cover = engage(server_ip, None, dir.path(), None).expect("engage real pf transient cover");
+        if let Some(old) = held.take() {
+            // Retire the OLD cover's pf enable refcount only — never its
+            // normal Drop, which would reload /etc/pf.conf (a pass-all host)
+            // over the ruleset the NEW cover (already engaged above) just
+            // loaded. The refcount stays balanced: this engage's own `-E`
+            // already ran, so this `-X` brings it back down by exactly one.
+            let _ = pfctl(&["-X", &old.token], None, BestEffortPhase::RecoverCover);
+            std::mem::forget(old);
+        }
+        held = Some(new_cover);
+    }
+
+    stop.store(true, Ordering::SeqCst);
+    let attempts: usize = probers
+        .into_iter()
+        .map(|p| p.join().expect("prober thread panicked"))
+        .sum();
+    assert!(
+        attempts > 0,
+        "prober pool made no attempts at all — this test is vacuous"
+    );
+
+    assert!(
+        !leaked.load(Ordering::SeqCst),
+        "a cover transition (a second real engage() replacing a still-live cover) admitted a \
+         connection to {NON_PERMITTED}, which every ruleset in the {ITERATIONS}-iteration loop \
+         blocks — pfctl's `-f -` load is not behaving as one atomic transaction"
+    );
+
+    // The last cover's normal Drop restores /etc/pf.conf.
+    drop(held.take());
+    let restored = connect(NON_PERMITTED, Duration::from_secs(5));
+    assert!(
+        restored.is_ok(),
+        "final disengage must restore egress: {NON_PERMITTED}={:?}",
+        restored.err().map(|e| e.kind()),
     );
 }

@@ -1097,9 +1097,34 @@ milliseconds.
   the leak mid-gap. Recovery deletes the fixed compiled-in GUIDs (idempotent), so
   no state file is needed. The FWPM FFIs are clippy-disallowed outside this module.
 - **macOS** ([`routing/failclosed/macos.rs`](crates/tun-engine/src/routing/failclosed/macos.rs)):
-  `pfctl -E` (refcounted) + a self-contained ruleset loaded over stdin (`pfctl -Fa -f -`). Disengage restores `/etc/pf.conf` and drops the refcount (`pfctl -X <token>`). The token is persisted to `bridge-failclosed.json` *before* the
+  `pfctl -E` (refcounted) + a self-contained ruleset loaded over stdin (`pfctl -f -`, absolute `/sbin/pfctl` — this runs as root, so a PATH-resolved bare `pfctl` is a hardening gap). Disengage restores `/etc/pf.conf` and drops the refcount (`pfctl -X <token>`). The token is persisted to `bridge-failclosed.json` *before* the
   blocking ruleset loads, so recovery can `-X` it cleanly. Caveat: restore reloads
   the on-disk `/etc/pf.conf`, not a snapshot of a live ruleset (matches wg-quick).
+  **No `-Fa`** (bindreams/hole#997): `pfctl -Fa -f -` (the standing lockdown cover
+  never did this) is two separate, separately-committed kernel operations — flush,
+  then load — leaving a pass-all host briefly live between them, including across
+  a cover TRANSITION (a second `engage` replacing a still-live one with no
+  intervening `disengage`). A bare `pfctl -f -` load is one atomic pf transaction
+  (`DIOCADDRULE` stages into an inactive ruleset under a ticket, `DIOCXCOMMIT`
+  swaps it in atomically under `pf_lock`), so the previously-loaded ruleset stays
+  authoritative until the new one fully commits. pf has no programmatic API and no
+  published kernel source this repo can read, so that atomicity claim is an
+  inference from `pfctl`'s documented ticket behaviour, not a fact read out of the
+  kernel; `macos_failclosed_cover_transition_never_admits_blocked_flow`
+  (`macos_tests.rs`) is empirical evidence for it — 25 real transitions against a
+  pool of concurrent background probers (a single serial prober can be parked
+  inside one blocked `connect_timeout` call, under `block-policy drop`'s silent
+  no-response, for a whole fast transition and never overlap it) spanning the
+  loop, proving (not merely failing to disprove, on a pass) that none of them let
+  a probed flow through that every ruleset in the loop blocked — not a
+  mathematical proof. This closes the gap in a single successful `engage()`
+  call's own atomicity; the separate release-then-reengage gap in
+  `ProxyManager`'s repair path (bindreams/hole#758) is unrelated, as is a
+  *failed* re-engage during a transition reloading `/etc/pf.conf` over a
+  still-good prior cover (bindreams/hole#1004, disclosed, not fixed here). Two
+  privileged test files' own bare `pfctl` calls (test-only, not the
+  production helper this fix hardened) are a separate, disclosed inconsistency
+  (bindreams/hole#1005), and unchanged by this fix.
 
 Each platform splits a pure, unit-tested rule/spec builder (transient:
 `build_cover_spec` / `build_pf_ruleset`; lockdown: `build_lockdown_spec` /

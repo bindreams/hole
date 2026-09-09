@@ -1,10 +1,18 @@
 //! macOS fail-closed cover via pf (`pfctl`). Two layers share the `Cover` guard:
 //!
 //! - **Transient cover** (`engage`/`disengage`): enables pf (refcounted,
-//!   `pfctl -E`), flushes all state (`-Fa`), and loads a self-contained
-//!   ruleset (see `build_pf_ruleset`) blocking everything but loopback, the
+//!   `pfctl -E`) and loads a self-contained ruleset (see `build_pf_ruleset`,
+//!   via `pfctl -f -`, NO `-Fa`) blocking everything but loopback, the
 //!   server, and the pinned resolver. Disengage restores the canonical
-//!   `/etc/pf.conf` and drops the refcount.
+//!   `/etc/pf.conf` and drops the refcount. Dropping `-Fa` (bindreams/hole#997)
+//!   is load-bearing: `-Fa` flushes ALL pf state as its own, separately
+//!   committed kernel operation, so `-Fa -f -` was two transactions with a
+//!   pass-all host briefly live between them — including across a cover
+//!   TRANSITION (a second `engage` replacing a still-live one, with no
+//!   intervening `disengage`). A bare `pfctl -f -` load is a single pf
+//!   transaction (DIOCADDRULE stages into an inactive ruleset under a ticket,
+//!   DIOCXCOMMIT swaps it in atomically under `pf_lock`), so the old ruleset
+//!   stays authoritative right up until the new one is fully committed.
 //! - **Standing lockdown** (`engage_lockdown`/`lockdown_disengage`): loads a
 //!   self-contained MAIN ruleset (NO `-Fa`) that carries the host's translation
 //!   rules forward and blocks all egress except the TUN and server IP. Disengage
@@ -197,8 +205,14 @@ fn engage_pf_action(pf_enabled: bool, has_persisted: bool) -> PfEngageAction {
 
 const PFCONF: &str = "/etc/pf.conf";
 
+/// `pfctl`'s fixed system path. This runs as root — a bare `"pfctl"` would
+/// resolve against the caller's `PATH`, letting an earlier, attacker-writable
+/// directory on it shadow the real binary. `/sbin/pfctl` is where macOS ships
+/// it, unconditionally.
+const PFCTL: &str = "/sbin/pfctl";
+
 fn pfctl<P: Phase>(args: &[&str], stdin: Option<&[u8]>, phase: P) -> Result<std::process::Output, RoutingError> {
-    let cmd: Vec<String> = std::iter::once("pfctl")
+    let cmd: Vec<String> = std::iter::once(PFCTL)
         .chain(args.iter().copied())
         .map(str::to_owned)
         .collect();
@@ -269,20 +283,34 @@ pub fn engage(
     )
     .map_err(|e| RoutingError::RouteSetup(format!("failed to persist failclosed-state: {e}")))?;
 
-    // 4. Flush all + load our self-contained blocking ruleset from stdin.
+    // 4. Load our self-contained blocking ruleset from stdin — NO `-Fa`
+    //    (bindreams/hole#997): a bare `pfctl -f -` is one atomic pf
+    //    transaction (see this module's doc), so whatever ruleset was
+    //    already loaded (the host's own, or a still-live prior cover's)
+    //    stays authoritative until this one fully commits.
     let ruleset = build_pf_ruleset(server_ip, resolver_ip);
-    let out = pfctl(&["-Fa", "-f", "-"], Some(ruleset.as_bytes()), FatalPhase::CoverEngage)?;
+    let out = pfctl(&["-f", "-"], Some(ruleset.as_bytes()), FatalPhase::CoverEngage)?;
     if !out.status.success() {
         // A *failed engage* is the sole place this module fails OPEN on its own
-        // error: we must not leave a half-loaded ruleset blocking traffic. Note
-        // `-Fa` already flushed the host's prior rules, so a full `disengage`
-        // (restore `/etc/pf.conf` + drop our refcount + clear the state file) is
-        // required to undo the flush — dropping only the refcount would strand
-        // the host with an empty pass-all ruleset. The PR3 cutover treats an
-        // engage error as fatal and aborts before stopping the old bridge, so
-        // the tunnel is never torn down uncovered. No standing cover is being
-        // adopted on this engage-failure path, so the `/etc/pf.conf` restore
-        // (undoing the `-Fa` flush) must run.
+        // error: we must not leave a half-loaded ruleset blocking traffic. A
+        // failed `pfctl -f -` load never committed (the ticket discipline that
+        // makes a successful load atomic also makes a failed one a no-op on
+        // the live ruleset), so the host still runs whatever was loaded
+        // before this call — restoring `/etc/pf.conf` here does not "undo a
+        // flush" (there is none), it returns the host to its canonical
+        // baseline rather than leaving it under a stale cover ruleset. The
+        // PR3 cutover treats an engage error as fatal and aborts before
+        // stopping the old bridge, so the tunnel is never torn down
+        // uncovered. No standing cover is being adopted on this
+        // engage-failure path, so the `/etc/pf.conf` restore must run.
+        //
+        // Known residual (bindreams/hole#1004, not fixed here): if THIS call
+        // is a transition over a still-live prior cover (see this module's
+        // doc), that prior cover's ruleset was still loaded and still
+        // blocking right up until this failed load — the `/etc/pf.conf`
+        // reload below replaces it with the open host baseline rather than
+        // leaving the still-good prior ruleset in place. `engage` has no
+        // parameter today to tell "first engage" from "transition" apart.
         disengage(&token, state_dir, false);
         return Err(RoutingError::RouteSetup(format!(
             "pfctl load failed: {}",
@@ -324,9 +352,10 @@ fn restore_confirmed(adopting: bool, out: &Result<std::process::Output, RoutingE
 }
 
 /// Drop the transient enable refcount + clear the file. When `adopting` is
-/// false, also restore the canonical ruleset (the transient engage did `-Fa`,
-/// flushing host rules, so the restore is mandatory to undo the flush). When a
-/// standing cover is being adopted, skip the `/etc/pf.conf` reload — it would
+/// false, also restore the canonical ruleset — the cover's own block-all
+/// ruleset is still live (engage no longer flushes it away), so this reload
+/// is what actually returns the host to `/etc/pf.conf` rather than leaving it
+/// under our block. When a standing cover is being adopted, skip the reload — it would
 /// wipe the standing lockdown ruleset (which is the live main ruleset) before
 /// Adopt. The `-X` drop is best-effort regardless; the state-file clear is
 /// NOT — it runs only when [`restore_confirmed`] says the replacement ruleset

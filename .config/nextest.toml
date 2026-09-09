@@ -50,6 +50,12 @@ nextest-version = "0.9.130"
 #     does to pf, then a real re-engage; must not run beside another test
 #     touching pf state):
 #     crates/tun-engine/src/routing/failclosed/lockdown_privileged_tests.rs
+#   - `failclosed_cover_transition_` (bindreams/hole#997 — 25 real transient
+#     re-engages with no intervening disengage, plus a continuous background
+#     prober, proving a cover transition never admits a flow the old cover
+#     blocked; lives beside the unprivileged macos_tests cases because it
+#     needs `Cover`'s private field + the private `pfctl` helper):
+#     crates/tun-engine/src/routing/failclosed/macos_tests.rs
 #   - `release_all_` substring (privileged AND unprivileged — the unprivileged
 #     macos_tests/windows_tests cases join for free; a name-based filter must
 #     not silently miss a privileged test):
@@ -133,7 +139,7 @@ nextest-version = "0.9.130"
 max-threads = 1
 
 [[profile.default.overrides]]
-filter = 'test(/^e2e_.*full_tunnel/) + test(/windows_lockdown_permits_server_ip_/) + test(/macos_lockdown_permits_server_ip_/) + test(/failclosed_permits_/) + test(/simulated_reboot_rearms_the_cover/) + test(/release_all_/) + test(/cutover_global_net_state_/) + test(/live_tun_permit_/) + test(/tun_device_ipv6_/) + test(/gateway_global_net_state_/) + test(/dns_confine_global_net_state_/) + test(/dns_steer_global_net_state_/) + test(/macos_dns_global_net_state_/) + test(/opens_a_kernel_assigned/) + test(/dispatcher_opens_tun_/)'
+filter = 'test(/^e2e_.*full_tunnel/) + test(/windows_lockdown_permits_server_ip_/) + test(/macos_lockdown_permits_server_ip_/) + test(/failclosed_permits_/) + test(/simulated_reboot_rearms_the_cover/) + test(/failclosed_cover_transition_/) + test(/release_all_/) + test(/cutover_global_net_state_/) + test(/live_tun_permit_/) + test(/tun_device_ipv6_/) + test(/gateway_global_net_state_/) + test(/dns_confine_global_net_state_/) + test(/dns_steer_global_net_state_/) + test(/macos_dns_global_net_state_/) + test(/opens_a_kernel_assigned/) + test(/dispatcher_opens_tun_/)'
 test-group = 'global_net_state'
 
 # `driver_dns_tests.rs` / `driver_udp_tests.rs` / `driver_lifecycle_tests.rs`
