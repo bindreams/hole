@@ -272,7 +272,15 @@ pub fn step_order(cover: CoverStep, tunnel: TunnelStep) -> [Phase; 2] {
 // reconcile_once ======================================================================================================
 
 /// Reconcile the persisted target once, at startup, before any GUI or client
-/// has connected (closes #617).
+/// has connected.
+///
+/// This NARROWS #617's boot->first-connect gap without closing it. The gap is
+/// that macOS pf rules do not survive a reboot, so an armed user egresses in
+/// the clear until a connect re-engages the cover; reconciling at boot makes
+/// that connect happen sooner, but a boot connect that FAILS engages nothing
+/// at all (it is deliberately uncovered — see `start_cancellable`'s `covered`
+/// argument below). Closing #617 needs a cover that survives reboot on its
+/// own; see #1000.
 ///
 /// Must run strictly after `route_recovery::recover_and_record` completes —
 /// that call is what measures `CoverPresence` and folds a live-cover finding

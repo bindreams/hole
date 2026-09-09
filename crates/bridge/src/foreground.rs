@@ -224,7 +224,8 @@ async fn run_inner(
 
     crate::route_recovery::recover_and_record(state_dir, &proxy_shutdown).await;
     // Reconcile the persisted target now, before any GUI or client has had a
-    // chance to connect (closes #617) — must run after recovery above, see
+    // chance to connect (narrows, does not close, #617's boot->first-connect
+    // gap: a failed connect engages nothing) — must run after recovery above, see
     // crate::reconciler::reconcile_once's own doc.
     crate::reconciler::reconcile_once(state_dir, owner, &proxy_shutdown, &shutdown).await;
     let state_dir_plugins = state_dir.to_path_buf();
