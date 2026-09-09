@@ -1013,7 +1013,7 @@ fn an_empty_but_captured_baseline_still_restores_the_snapshot() {
 #[skuld::test(labels = [TUN_LABEL, GLOBAL_NET_STATE], serial = TUN_LABEL)]
 fn macos_failclosed_cover_transition_never_admits_blocked_flow() {
     use std::net::TcpStream;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -1053,6 +1053,17 @@ fn macos_failclosed_cover_transition_never_admits_blocked_flow() {
     let leaked = Arc::new(AtomicBool::new(false));
     let stop = Arc::new(AtomicBool::new(false));
 
+    // DIAGNOSTIC (root-causing a CI failure of this test, not yet a permanent
+    // fixture): `phase` names which loop iteration is in flight at any instant
+    // (-1 = before the loop's first `engage()` call has even started), and
+    // `leaked_at_phase` latches the phase a leak was first observed at, so a
+    // failure can say WHICH engage let the flow through instead of just THAT
+    // one did — needed to tell a cold-start (`phase <= 0`) leak apart from a
+    // steady-state transition (`phase >= 1`) leak, since only the latter is
+    // the #997 property this test exists to prove (see the doc comment above).
+    let phase = Arc::new(AtomicIsize::new(-1));
+    let leaked_at_phase = Arc::new(AtomicIsize::new(isize::MAX));
+
     // Continuous prober POOL spanning the WHOLE transition loop below, each on
     // its own thread with a short timeout, so many SYNs are in flight at every
     // instant and the pool overlaps every one of the loop's real `pfctl` calls
@@ -1060,13 +1071,20 @@ fn macos_failclosed_cover_transition_never_admits_blocked_flow() {
     // for why a single serial prober is not enough under `block-policy drop`).
     let probers: Vec<_> = (0..PROBER_THREADS)
         .map(|_| {
-            let (leaked_prober, stop_prober) = (leaked.clone(), stop.clone());
+            let (leaked_prober, stop_prober, phase_prober, leaked_at_phase_prober) =
+                (leaked.clone(), stop.clone(), phase.clone(), leaked_at_phase.clone());
             std::thread::spawn(move || {
                 let mut attempts = 0usize;
                 while !stop_prober.load(Ordering::SeqCst) {
                     attempts += 1;
                     if connect(NON_PERMITTED, PROBER_TIMEOUT).is_ok() {
                         leaked_prober.store(true, Ordering::SeqCst);
+                        let _ = leaked_at_phase_prober.compare_exchange(
+                            isize::MAX,
+                            phase_prober.load(Ordering::SeqCst),
+                            Ordering::SeqCst,
+                            Ordering::SeqCst,
+                        );
                     }
                 }
                 attempts
@@ -1082,6 +1100,7 @@ fn macos_failclosed_cover_transition_never_admits_blocked_flow() {
     let addrs = [SERVER_A, SERVER_B];
     let mut held: Option<Cover> = None;
     for i in 0..ITERATIONS {
+        phase.store(i as isize, Ordering::SeqCst);
         let server_ip: IpAddr = addrs[i % addrs.len()].parse().unwrap();
         let new_cover = engage(server_ip, None, dir.path(), None).expect("engage real pf transient cover");
         if let Some(old) = held.take() {
@@ -1111,7 +1130,9 @@ fn macos_failclosed_cover_transition_never_admits_blocked_flow() {
         "a cover engage (cold at iteration 0, a transition replacing a still-live cover at every \
          later iteration) admitted a connection to {NON_PERMITTED}, which every ruleset in the \
          {ITERATIONS}-iteration loop blocks — pfctl's enable/load are not behaving as one atomic \
-         transaction"
+         transaction; leaked_at_phase={} (-1 = before the loop's first engage(), 0 = the cold \
+         engage, >=1 = a steady-state transition)",
+        leaked_at_phase.load(Ordering::SeqCst),
     );
 
     // The last cover's normal Drop restores /etc/pf.conf.
