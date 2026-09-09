@@ -1112,7 +1112,7 @@ milliseconds.
   published kernel source this repo can read, so that atomicity claim is an
   inference from `pfctl`'s documented ticket behaviour, not a fact read out of the
   kernel; `macos_failclosed_cover_transition_never_admits_blocked_flow`
-  (`macos_tests.rs`) is empirical evidence for it — 25 real transitions against a
+  (`macos_tests.rs`) is empirical evidence for it — 24 real transitions against a
   pool of concurrent background probers (a single serial prober can be parked
   inside one blocked `connect_timeout` call, under `block-policy drop`'s silent
   no-response, for a whole fast transition and never overlap it) spanning the
@@ -1127,10 +1127,9 @@ milliseconds.
   production helper this fix hardened) are a separate, disclosed inconsistency
   (bindreams/hole#1005), and unchanged by this fix.
 
-  **Load before enable on a COLD engage** (found by the same
-  `macos_failclosed_cover_transition_never_admits_blocked_flow` test — its
-  prober pool starts before the loop's very first, cold, `engage()` call, so a
-  gap there fails the same assertion as a warm-transition gap): `pfctl -E`
+  **Load before enable on a COLD engage** (guarded by the same
+  `macos_failclosed_cover_transition_never_admits_blocked_flow` test, via a
+  deliberately *different* assertion — see below): `pfctl -E`
   (enable) and `pfctl -f -` (load) are always two separate `pfctl`
   invocations, so enabling before loading is the same *shape* of bug as `-Fa`
   — two separate pf kernel transactions with an open ruleset briefly live —
@@ -1144,10 +1143,24 @@ milliseconds.
   independent pf state) — so the instant either function turns pf on, it is
   already enforcing the ruleset it just loaded. When pf is already enabled at
   entry the original enable-then-load order is unchanged, since that path was
-  already correct. This was found and fixed in the same change as the `-Fa`
+  already correct. This was fixed in the same change as the `-Fa`
   removal above, in the standing lockdown cover as well as the transient
   one — the lockdown cover's `-Fa`-free load was not itself the whole story
   for a cold host.
+
+  The cold engage gets a **post-condition** assertion (once `engage()` has
+  returned, the non-permitted host must be unreachable), NOT the continuous
+  never-admit assertion the transitions get, and the split is structural
+  rather than a concession. Before a cold engage the host carries no cover
+  and is *supposed* to be open — the test's own baseline requires it — so
+  there is no property to violate in the pre/mid-engage window, and instrumented
+  CI confirmed it: every leak the strict form reported latched at the cold
+  engage while all 24 transitions passed clean. The window is also not
+  closable in any ordering, since `-E` and `-f -` are separate process
+  invocations and nothing is filtered at all while pf is disabled. The strict
+  assertion stays strict because the prober pool starts only after the cold
+  post-condition is settled: from the first prober SYN the host is known
+  blocked, so any success is a leak with no phase carve-out.
 
 Each platform splits a pure, unit-tested rule/spec builder (transient:
 `build_cover_spec` / `build_pf_ruleset`; lockdown: `build_lockdown_spec` /

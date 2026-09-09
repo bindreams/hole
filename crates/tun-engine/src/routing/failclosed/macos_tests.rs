@@ -966,20 +966,43 @@ fn an_empty_but_captured_baseline_still_restores_the_snapshot() {
 /// DIOCADDRULE/DIOCXCOMMIT ticket discipline (see `crates/tun-engine/src/
 /// routing/failclosed/macos.rs`'s module doc), so no such window should exist.
 ///
-/// The prober pool below starts before the loop's very first `engage()`, so
-/// this test also exercises a COLD engage (pf disabled at entry — the
-/// `global_net_state` test group runs each privileged test in its own
-/// process, but pf's enable bit is host-global kernel state that outlives any
-/// one process, and an earlier test's normal `disengage` can leave it off).
-/// `pfctl -E` (enable) and `pfctl -f -` (load) are always two separate
-/// `pfctl` invocations, so enabling before loading opens the same shape of
-/// pass-all-window bug as `-Fa` did, just triggered by cold-start ordering
-/// instead: pf would start filtering with whatever ruleset already happened
-/// to be loaded, before the intended one committed. `engage`/`engage_lockdown`
-/// close this by loading before enabling specifically when pf starts
-/// disabled (loading is a documented no-op while pf is off), so this test's
-/// iteration 0 covers that path and every later iteration covers the warm
-/// transition path.
+/// TWO DIFFERENT ASSERTIONS, and the difference is structural. Do NOT unify
+/// them — the strict one is deliberately not applied to the cold engage, and
+/// widening it there does not make this test stricter, it makes it
+/// unconditionally red:
+///
+/// - **Cold engage** (the first one, over a host carrying no cover at all —
+///   pf's enable bit is host-global kernel state that outlives the
+///   per-test process, so an earlier test's normal `disengage` leaves this
+///   the state nearly every real CI run starts in). Asserted on its
+///   POST-CONDITION only: once `engage()` has RETURNED, `NON_PERMITTED` must
+///   be unreachable. Nothing is asserted about the window before or during
+///   that call, because there is no property to assert there — an uncovered
+///   host is *supposed* to be open, and this test's own `baseline` below
+///   REQUIRES it to be open before anything starts. A prober spanning that
+///   window observes exactly the open host the baseline demanded and reports
+///   a "leak" on every run: the instrumented CI run that produced this split
+///   latched `leaked_at_phase=0` (the cold engage) while all 24 transitions
+///   passed clean. Mechanically the window cannot be closed either, in any
+///   ordering: `pfctl -E` (enable) and `pfctl -f -` (load) are separate
+///   process invocations, and while pf is disabled nothing is filtered
+///   regardless of what is loaded.
+/// - **Every transition** (each later `engage()`, replacing a still-live
+///   cover). Asserted STRICTLY: the prober pool runs continuously across all
+///   of them and not one probe may succeed. This is the actual #997 property.
+///   The pool starts only after the cold engage's post-condition has been
+///   verified, so from the instant the first prober SYN goes out the host is
+///   KNOWN blocked and any success at all is a leak — no phase filtering, no
+///   carve-outs.
+///
+/// The cold post-condition is not a formality. `engage` loads the ruleset
+/// BEFORE `-E` when pf starts disabled (loading is a documented no-op while pf
+/// is off), so the instant pf goes live it is already enforcing our ruleset
+/// rather than whatever happened to be loaded — and the failure mode that
+/// ordering has to avoid is the INERT cover: `engage` returning Ok with the
+/// ruleset loaded but pf never actually enabled, reported armed while egress
+/// runs in the clear. A load that outright fails already surfaces as an Err
+/// from `engage`; only a settled connect catches the silent half.
 ///
 /// Lives here (not `lockdown_privileged_tests.rs`) because it must retire an
 /// intermediate cover's pf enable refcount WITHOUT running its normal
@@ -992,8 +1015,8 @@ fn an_empty_but_captured_baseline_still_restores_the_snapshot() {
 /// published kernel source this repo can read, so "a single `pfctl -f -` is
 /// one atomic transaction" is an inference from `pfctl`'s documented ticket
 /// behaviour, not a fact read out of the kernel. This test does not prove
-/// that inference — it runs 25 real transitions against a pool of concurrent
-/// background probers spanning the whole loop, so IF the inference were wrong
+/// that inference — it runs `TRANSITIONS` real transitions against a pool of
+/// concurrent background probers spanning the whole loop, so IF it were wrong
 /// (an `-Fa`-shaped gap still existed, or reappeared some other way), the
 /// prober pool has many overlapping, independent real chances to catch a SYN
 /// that got out during an open window and would very likely observe at least
@@ -1013,7 +1036,7 @@ fn an_empty_but_captured_baseline_still_restores_the_snapshot() {
 #[skuld::test(labels = [TUN_LABEL, GLOBAL_NET_STATE], serial = TUN_LABEL)]
 fn macos_failclosed_cover_transition_never_admits_blocked_flow() {
     use std::net::TcpStream;
-    use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -1021,28 +1044,36 @@ fn macos_failclosed_cover_transition_never_admits_blocked_flow() {
     // neighbouring privileged tests use (see `lockdown_privileged_tests.rs`'s
     // `PERMITTED`/`RESOLVER` doc for why real routable IPs, not loopback, are
     // required here). Alternating the permitted server between them forces
-    // every `engage()` in the loop to load a ruleset whose TEXT actually
-    // differs from the one it replaces. `NON_PERMITTED` is blocked by EVERY
-    // ruleset in the loop, so any successful connect to it during the loop is
-    // a leak, full stop — it can never be explained by which server happens
-    // to be permitted at that moment.
+    // every `engage()` here to load a ruleset whose TEXT actually differs from
+    // the one it replaces. `NON_PERMITTED` is blocked by EVERY ruleset in the
+    // run, so any successful connect to it while a cover is live is a leak,
+    // full stop — it can never be explained by which server happens to be
+    // permitted at that moment.
     const SERVER_A: &str = "1.1.1.1";
     const SERVER_B: &str = "1.0.0.1";
     const NON_PERMITTED: &str = "8.8.8.8:443";
-    const ITERATIONS: usize = 25;
+    // Transitions after the cold engage, so `TRANSITIONS + 1` real `engage()`
+    // calls in total.
+    const TRANSITIONS: usize = 24;
     // See the doc comment above: `block-policy drop` parks a single prober
     // thread inside one blocked `connect_timeout` call for the whole timeout,
     // so a lone prober could miss an entire fast transition. A pool of short-
     // timeout probers keeps several SYNs in flight at every instant instead.
     const PROBER_THREADS: usize = 16;
     const PROBER_TIMEOUT: Duration = Duration::from_millis(20);
+    // The bound for the three one-shot verdicts that must be SETTLED rather
+    // than sampled (reachable baseline, cold-engage post-condition, restored
+    // egress). The same value both ways round on purpose: "blocked" means the
+    // host stayed silent for the very bound it cleared when open. It is the
+    // 5s the neighbouring privileged cover tests already use.
+    const SETTLED_TIMEOUT: Duration = Duration::from_secs(5);
 
     // External-event probe with a graceful failure bound: the timeout is the
     // failure-to-human signal for a remote host that might not respond, not a
     // sync sleep or a poll on state this test controls.
     let connect = |addr: &str, timeout: Duration| TcpStream::connect_timeout(&addr.parse().unwrap(), timeout);
 
-    let baseline = connect(NON_PERMITTED, Duration::from_secs(5));
+    let baseline = connect(NON_PERMITTED, SETTLED_TIMEOUT);
     assert!(
         baseline.is_ok(),
         "NETWORK/ENVIRONMENT problem (not the cover): pre-cover baseline egress must reach \
@@ -1050,19 +1081,40 @@ fn macos_failclosed_cover_transition_never_admits_blocked_flow() {
         baseline.err().map(|e| e.kind()),
     );
 
+    // One `state_dir` for the whole run: each engage's persist-before-mutate
+    // save overwrites the previous cover's state file with its own token
+    // before loading its ruleset, exactly as a real re-engage-without-
+    // disengage would.
+    let dir = tempfile::tempdir().unwrap();
+    let addrs = [SERVER_A, SERVER_B];
+
+    // COLD engage — its POST-CONDITION is the whole of its assertion (doc
+    // comment above: the pre/mid-engage window is the open host `baseline`
+    // just required, so there is nothing there to assert). Settling that
+    // post-condition here is also what licenses the strict rule for everything
+    // after it: the host is KNOWN blocked from this point on, so the prober
+    // pool spawned below needs no phase carve-out.
+    let mut held: Option<Cover> =
+        Some(engage(addrs[0].parse().unwrap(), None, dir.path(), None).expect("cold engage real pf transient cover"));
+    let cold = connect(NON_PERMITTED, SETTLED_TIMEOUT);
+    assert!(
+        cold.is_err(),
+        "a cold engage that returned Ok must already block {NON_PERMITTED} — the cover is INERT: \
+         reported armed while egress runs in the clear (pf never enabled, or enabled under a \
+         ruleset that is not ours)",
+    );
+
     let leaked = Arc::new(AtomicBool::new(false));
     let stop = Arc::new(AtomicBool::new(false));
 
-    // DIAGNOSTIC (root-causing a CI failure of this test, not yet a permanent
-    // fixture): `phase` names which loop iteration is in flight at any instant
-    // (-1 = before the loop's first `engage()` call has even started), and
-    // `leaked_at_phase` latches the phase a leak was first observed at, so a
-    // failure can say WHICH engage let the flow through instead of just THAT
-    // one did — needed to tell a cold-start (`phase <= 0`) leak apart from a
-    // steady-state transition (`phase >= 1`) leak, since only the latter is
-    // the #997 property this test exists to prove (see the doc comment above).
-    let phase = Arc::new(AtomicIsize::new(-1));
-    let leaked_at_phase = Arc::new(AtomicIsize::new(isize::MAX));
+    // `phase` names which transition is in flight at any instant (0 = the cold
+    // cover is live and steady, no transition started yet), and
+    // `leaked_at_phase` latches the phase of the FIRST leak, so a failure says
+    // WHICH engage admitted the flow instead of only THAT one did. Every value
+    // it can report is a real leak — the cold engage's own window is not
+    // probed at all.
+    let phase = Arc::new(AtomicUsize::new(0));
+    let leaked_at_phase = Arc::new(AtomicUsize::new(usize::MAX));
 
     // Continuous prober POOL spanning the WHOLE transition loop below, each on
     // its own thread with a short timeout, so many SYNs are in flight at every
@@ -1080,7 +1132,7 @@ fn macos_failclosed_cover_transition_never_admits_blocked_flow() {
                     if connect(NON_PERMITTED, PROBER_TIMEOUT).is_ok() {
                         leaked_prober.store(true, Ordering::SeqCst);
                         let _ = leaked_at_phase_prober.compare_exchange(
-                            isize::MAX,
+                            usize::MAX,
                             phase_prober.load(Ordering::SeqCst),
                             Ordering::SeqCst,
                             Ordering::SeqCst,
@@ -1092,15 +1144,8 @@ fn macos_failclosed_cover_transition_never_admits_blocked_flow() {
         })
         .collect();
 
-    // One `state_dir` for the whole loop: each engage's persist-before-mutate
-    // save overwrites the previous cover's state file with its own token
-    // before loading its ruleset, exactly as a real re-engage-without-
-    // disengage would.
-    let dir = tempfile::tempdir().unwrap();
-    let addrs = [SERVER_A, SERVER_B];
-    let mut held: Option<Cover> = None;
-    for i in 0..ITERATIONS {
-        phase.store(i as isize, Ordering::SeqCst);
+    for i in 1..=TRANSITIONS {
+        phase.store(i, Ordering::SeqCst);
         let server_ip: IpAddr = addrs[i % addrs.len()].parse().unwrap();
         let new_cover = engage(server_ip, None, dir.path(), None).expect("engage real pf transient cover");
         if let Some(old) = held.take() {
@@ -1127,17 +1172,17 @@ fn macos_failclosed_cover_transition_never_admits_blocked_flow() {
 
     assert!(
         !leaked.load(Ordering::SeqCst),
-        "a cover engage (cold at iteration 0, a transition replacing a still-live cover at every \
-         later iteration) admitted a connection to {NON_PERMITTED}, which every ruleset in the \
-         {ITERATIONS}-iteration loop blocks — pfctl's enable/load are not behaving as one atomic \
-         transaction; leaked_at_phase={} (-1 = before the loop's first engage(), 0 = the cold \
-         engage, >=1 = a steady-state transition)",
+        "a connection to {NON_PERMITTED} got out while a cover was live — every ruleset across \
+         the {TRANSITIONS} transitions blocks it, and the cold engage was verified blocking \
+         before the first prober started, so `pfctl -f -` is not behaving as one atomic \
+         transaction; leaked_at_phase={} (0 = the cold cover, steady, before any transition \
+         began; >=1 = that transition)",
         leaked_at_phase.load(Ordering::SeqCst),
     );
 
     // The last cover's normal Drop restores /etc/pf.conf.
     drop(held.take());
-    let restored = connect(NON_PERMITTED, Duration::from_secs(5));
+    let restored = connect(NON_PERMITTED, SETTLED_TIMEOUT);
     assert!(
         restored.is_ok(),
         "final disengage must restore egress: {NON_PERMITTED}={:?}",

@@ -50,11 +50,11 @@ nextest-version = "0.9.130"
 #     does to pf, then a real re-engage; must not run beside another test
 #     touching pf state):
 #     crates/tun-engine/src/routing/failclosed/lockdown_privileged_tests.rs
-#   - `failclosed_cover_transition_` (bindreams/hole#997 — 25 real transient
+#   - `failclosed_cover_transition_` (bindreams/hole#997 — 24 real transient
 #     re-engages with no intervening disengage, plus a continuous background
-#     prober, proving a cover transition never admits a flow the old cover
-#     blocked; lives beside the unprivileged macos_tests cases because it
-#     needs `Cover`'s private field + the private `pfctl` helper):
+#     prober pool, proving a cover transition never admits a flow the old
+#     cover blocked; lives beside the unprivileged macos_tests cases because
+#     it needs `Cover`'s private field + the private `pfctl` helper):
 #     crates/tun-engine/src/routing/failclosed/macos_tests.rs
 #   - `release_all_` substring (privileged AND unprivileged — the unprivileged
 #     macos_tests/windows_tests cases join for free; a name-based filter must
