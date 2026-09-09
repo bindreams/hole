@@ -56,6 +56,11 @@ nextest-version = "0.9.130"
 #     crates/tun-engine/src/routing/failclosed/release_privileged_tests.rs
 #     crates/tun-engine/src/routing/failclosed/macos_tests.rs
 #     crates/tun-engine/src/routing/failclosed/windows_tests.rs
+#   - `boottime_global_net_state_` prefix (#998 — adds a real BOOT-TIME WFP
+#     filter under the covers' own provider/sublayer and deletes it again, so
+#     it must not run beside a cover test whose `delete_all` drops that shared
+#     sublayer):
+#     crates/tun-engine/src/routing/failclosed/boottime_privileged_tests.rs
 #   - `cutover_global_net_state_` prefix:
 #     crates/bridge/tests/cutover_privileged.rs (real cutover swap + SCM restart)
 #     crates/bridge/tests/cutover_leak_privileged.rs (fail-open + both-covers)
@@ -133,7 +138,7 @@ nextest-version = "0.9.130"
 max-threads = 1
 
 [[profile.default.overrides]]
-filter = 'test(/^e2e_.*full_tunnel/) + test(/windows_lockdown_permits_server_ip_/) + test(/macos_lockdown_permits_server_ip_/) + test(/failclosed_permits_/) + test(/simulated_reboot_rearms_the_cover/) + test(/release_all_/) + test(/cutover_global_net_state_/) + test(/live_tun_permit_/) + test(/tun_device_ipv6_/) + test(/gateway_global_net_state_/) + test(/dns_confine_global_net_state_/) + test(/dns_steer_global_net_state_/) + test(/macos_dns_global_net_state_/) + test(/opens_a_kernel_assigned/) + test(/dispatcher_opens_tun_/)'
+filter = 'test(/^e2e_.*full_tunnel/) + test(/windows_lockdown_permits_server_ip_/) + test(/macos_lockdown_permits_server_ip_/) + test(/failclosed_permits_/) + test(/simulated_reboot_rearms_the_cover/) + test(/release_all_/) + test(/boottime_global_net_state_/) + test(/cutover_global_net_state_/) + test(/live_tun_permit_/) + test(/tun_device_ipv6_/) + test(/gateway_global_net_state_/) + test(/dns_confine_global_net_state_/) + test(/dns_steer_global_net_state_/) + test(/macos_dns_global_net_state_/) + test(/opens_a_kernel_assigned/) + test(/dispatcher_opens_tun_/)'
 test-group = 'global_net_state'
 
 # `driver_dns_tests.rs` / `driver_udp_tests.rs` / `driver_lifecycle_tests.rs`

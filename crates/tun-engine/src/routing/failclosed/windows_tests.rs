@@ -141,40 +141,14 @@ fn filter_lifetime_flag_maps_to_the_real_wfp_constants() {
     );
 }
 
-#[skuld::test]
-fn persistent_and_boottime_flags_are_mutually_exclusive_bits() {
-    // WFP's own `FWPM_FILTER0` docs: "This flag [PERSISTENT] cannot be set
-    // together with FWPM_FILTER_FLAG_BOOTTIME." A plain `assert_ne!` between
-    // the two flag values would pass even for two values that happened to
-    // share bits with a third, wrongly-OR'd flag combination; encode the
-    // actual documented contract instead — no bit position is shared.
-    let persistent = filter_lifetime_flag(FilterLifetime::Persistent);
-    let boottime = filter_lifetime_flag(FilterLifetime::Boottime);
-    assert_ne!(persistent, 0, "PERSISTENT must be a real, nonzero flag bit");
-    assert_ne!(boottime, 0, "BOOTTIME must be a real, nonzero flag bit");
-    assert_eq!(
-        persistent & boottime,
-        0,
-        "PERSISTENT and BOOTTIME must not share a bit — WFP treats them as mutually exclusive"
-    );
-}
-
-#[skuld::test]
-fn add_filter_maps_lifetime_through_filter_lifetime_flag() {
-    // Wiring guard: `add_filter` must derive its WFP flags from
-    // `filter_lifetime_flag(f.lifetime)`, not a hardcoded expression (that
-    // was the literal bug #998 reports — the block-all filter was hardcoded
-    // to PERSISTENT regardless of its spec). `add_filter` is the only
-    // function taking `f: &FilterSpec`, so `f.lifetime` cannot resolve to
-    // anything else; assert the exact call appears, and exactly once, so a
-    // future refactor can't quietly reintroduce a hardcoded flag alongside it.
-    let src = include_str!("windows.rs");
-    let occurrences = src.matches("filter_lifetime_flag(f.lifetime)").count();
-    assert_eq!(
-        occurrences, 1,
-        "expected exactly one call to filter_lifetime_flag(f.lifetime), inside add_filter — found {occurrences}"
-    );
-}
+// That `add_filter` really carries a spec's lifetime through to the live WFP
+// object — the literal bug #998 reports, a block-all hardcoded to PERSISTENT
+// regardless of its spec — is proven against the real firewall by
+// `boottime_privileged_tests`, which adds a `Boottime` spec through THIS
+// `add_filter` and reads `FWPM_FILTER_FLAG_BOOTTIME` (and not PERSISTENT) back
+// off the filter WFP stored. Nothing here can prove that: the mapping is
+// FFI-side, and a source-text guard over `windows.rs` asserts the shape of the
+// code rather than its effect.
 
 // resolver permit =====================================================================================================
 

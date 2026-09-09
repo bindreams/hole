@@ -147,7 +147,9 @@ before editing; the sections linked below are the authoritative source.
   scoped to TCP/443) is a bounded-window RAII guard engaged by every covered
   (auto-connect) start whose lockdown intent is OFF; a lockdown-on covered
   start uses the standing cover instead and releases any held transient one.
-  Both are persistent WFP filters (Win) / self-contained pf ruleset (mac); the
+  Both are persistent WFP filters (Win) / self-contained pf ruleset (mac) —
+  plus, for the standing cover's Windows block-all pair, a `BOOTTIME` twin
+  holding the kernel-start→BFE-start window `PERSISTENT` alone leaves open; the
   transient one is swept unconditionally on next start, the standing one only
   on an explicit recorded off — full reconciliation table (`decide_cover_recovery`)
   and disclosed residuals in CONTRIBUTING.md. A single persisted `Target`

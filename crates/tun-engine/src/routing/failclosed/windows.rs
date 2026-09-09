@@ -34,7 +34,9 @@
 //!
 //! PERSISTENT filters — NOT a dynamic session — so a coordinator crash
 //! mid-cutover leaves traffic blocked (fail-closed), not leaked; `recover_cover`
-//! sweeps them by their fixed GUIDs on the next bridge start.
+//! sweeps them by their fixed GUIDs on the next bridge start. The standing
+//! lockdown cover's block-all pair additionally gets a BOOTTIME twin; see
+//! "Boot-time coverage" below.
 //!
 //! ## Boot-time coverage (#998)
 //!
@@ -44,39 +46,62 @@
 //! kernel start until BFE takes over. The two flags are mutually exclusive on
 //! one filter (WFP's own `FWPM_FILTER0` docs: "This flag \[PERSISTENT\]
 //! cannot be set together with FWPM_FILTER_FLAG_BOOTTIME"), so covering both
-//! windows needs two filter objects. A boot-time filter does NOT need its own
-//! boot-time sublayer/provider: `FWPM_SUBLAYER0`/`FWPM_PROVIDER0` have no
-//! BOOTTIME flag at all (only `..._FLAG_PERSISTENT`), so PERSISTENT is the
-//! only non-static lifetime those containers support — a boot-time or
-//! persistent filter must reference one of those (a merely static
-//! sublayer/provider fails with `FWP_E_LIFETIME_MISMATCH`), and [`PROVIDER_GUID`]/
-//! [`SUBLAYER_GUID`] are already added with `FWPM_PROVIDER_FLAG_PERSISTENT`/
-//! `FWPM_SUBLAYER_FLAG_PERSISTENT` below, so the new boot-time filters need no
-//! new container. The standing LOCKDOWN cover (kill
-//! switch) is meant to survive an arbitrary reboot — CONTRIBUTING.md's
-//! "Fail-closed cover" section — so `build_lockdown_spec` gives ONLY its
-//! block-all pair a `Boottime` twin (`LOCKDOWN_BOOTTIME_BLOCK_ALL_GUIDS`);
-//! every permit, including loopback, stays `Persistent`-only, so the
-//! boot→BFE window is a full block with no exemptions (matches Mullvad's
-//! shipped `talpid-core` boot-time set, which has none either). Reasons a
-//! permit is NOT given a boot-time twin: (a) the TUN-LUID and server-IP
-//! permits carry values discovered at runtime — a boot-time copy would enforce
-//! whatever value was live at the PREVIOUS engage, stale by construction,
-//! since nothing runs before BFE to refresh it; (b) a boot-time loopback or
-//! App-ID permit has no mechanism to hand itself off to the narrower
-//! persistent rule once BFE starts, so it would need its own separate
+//! windows needs two filter objects — and the hand-off between them is
+//! documented as seamless: "The transition from boot-time to persistent
+//! filters could be several seconds... It is atomic, so if a provider has both
+//! a boot-time and a persistent filter, there will never be a window when
+//! neither is in effect" (WFP's "Basic Operation" page). The twin pair is
+//! exactly the shape that sentence describes.
+//!
+//! Both twins reference the same [`PROVIDER_GUID`]/[`SUBLAYER_GUID`] the
+//! persistent filters already use. That is a MEASURED choice, not a documented
+//! one: WFP's reference states no constraint tying a filter's lifetime to its
+//! containers', and shipped implementations differ — Fort Firewall puts its
+//! boot-time blocks on the default sublayer (`FORT_GUID_EMPTY`, no provider),
+//! TinyWall installs each filter twice, PERSISTENT and BOOTTIME, both under
+//! its OWN persistent sublayer. `boottime_privileged_tests` settles it for our
+//! containers on the real firewall: it adds a boot-time filter under them and
+//! reads back what WFP stored. Whether the *provider* survives is what decides
+//! whether #1008's provider-enumeration sweep is possible for boot-time
+//! filters at all.
+//!
+//! The standing LOCKDOWN cover (kill switch) is meant to survive an arbitrary
+//! reboot — CONTRIBUTING.md's "Fail-closed cover" section — so
+//! `build_lockdown_spec` gives ONLY its block-all pair a `Boottime` twin
+//! (`LOCKDOWN_BOOTTIME_BLOCK_ALL_GUIDS`); every permit, including loopback,
+//! stays `Persistent`-only, so the boot→BFE window is a full block with no
+//! exemptions (as in Fort Firewall's shipped boot-time set: four blocks, no
+//! permits). Reasons a permit is NOT given a boot-time twin: (a) the TUN-LUID
+//! and server-IP permits carry values discovered at runtime — a boot-time copy
+//! would enforce whatever value was live at the PREVIOUS engage, stale by
+//! construction, since nothing runs before BFE to refresh it; (b) a boot-time
+//! loopback or App-ID permit has no mechanism to hand itself off to the
+//! narrower persistent rule once BFE starts, so it would need its own separate
 //! lifecycle to avoid becoming a second stranded-filter risk; (c) the leak
 //! this issue exists to close is network egress, not loopback. The transient
 //! cutover cover is not meant to survive an arbitrary reboot (bounded-window
 //! RAII guard held only while the bridge process is already running), so it
 //! stays `Persistent`-only throughout — see `build_cover_spec`.
 //!
-//! Deletion of a boot-time filter is architecturally the same
-//! `FwpmFilterDeleteByKey0` call used for a persistent one (no lifetime-specific
-//! delete API exists in WFP's reference), so every existing fixed-GUID sweep in
-//! this file (`Cover::drop`'s Lockdown arm, `disengage_lockdown`, `release_all`,
-//! `swept_lockdown_guids`) covers the boot-time pair for free once its GUIDs are
-//! added to that array — no new delete path is introduced here.
+//! Deletion of a boot-time filter is the same `FwpmFilterDeleteByKey0` call
+//! used for a persistent one — no lifetime-specific delete API exists, and
+//! Microsoft's own WFP sample (`HlprFwpmFilterRemoveAll` in
+//! Windows-driver-samples) deletes boot-time filters by key off a live engine
+//! handle, as does Fort Firewall's teardown. So every existing fixed-GUID
+//! sweep in this file (`Cover::drop`'s Lockdown arm, `disengage_lockdown`,
+//! `release_all`, `swept_lockdown_guids`) covers the boot-time pair for free
+//! once its GUIDs are in that array — no new delete path is introduced here.
+//!
+//! That delete is the one failure this design could not survive, so it is
+//! measured rather than argued: a boot-time filter is EXCLUDED from the
+//! default enumeration view (`FWP_FILTER_ENUM_FLAG_BOOTTIME_ONLY` /
+//! `..._INCLUDE_BOOTTIME` exist to opt in, and Microsoft's sample ORs the
+//! latter in for exactly this reason). A by-key delete that could not see the
+//! boot-time view would return `FWP_E_FILTER_NOT_FOUND`, which
+//! [`first_delete_failure`] whitelists as benign — so `release_all` would
+//! report `Ok` over a host it never unblocked, breaking its "never a false
+//! success" clause. `boottime_privileged_tests` asserts the delete returns
+//! `ERROR_SUCCESS` and that the filter leaves the boot-time view.
 //!
 //! **Disclosed, NOT closed by this change:** a fixed-GUID sweep can only
 //! delete a boot-time filter whose GUID the RUNNING binary knows. A stranded
@@ -99,18 +124,21 @@
 //! own, but must not ship in a release a user could downgrade from until
 //! #1008 lands.**
 //!
-//! Also unverified by this change: Microsoft's own docs (`FWPM_FILTER0`'s
-//! flags table and the WFP Operation conceptual page) consistently say a
-//! boot-time filter is "disabled" — never "removed" — once BFE finishes
-//! initializing, which argues the filter object and its key survive the
-//! transition. But neither page states outright whether a post-boot
-//! `FwpmFilterGetByKey0`/enumeration call can still see a "disabled"
-//! boot-time filter, nor whether a `FwpmFilterDeleteByKey0` issued through
-//! the live FWPM session against that key actually purges the underlying
-//! boot-time policy record so it does NOT get reprovisioned at the NEXT
-//! boot (as opposed to only removing it from the current, already-disabled
-//! runtime copy). Only a real reboot test settles this; none is available —
-//! there is no elevated Windows CI lane (#999).
+//! **What no test here can reach.** Microsoft's own pages do not agree on
+//! what happens to a boot-time filter when BFE starts: `FwpmFilterAdd0`'s
+//! Remarks say boot-time filters "are removed once the BFE finishes
+//! initialization", while the "Basic Operation of WFP" page says twice that
+//! one is "disabled when BFE starts". Those are operationally different
+//! claims, and the difference matters for exactly one question this change
+//! cannot answer: whether a `FwpmFilterDeleteByKey0` against a live engine
+//! purges the underlying on-disk boot-time policy record — so the filter does
+//! not come back at the NEXT boot — or only clears the current runtime copy.
+//! `boottime_privileged_tests` proves the delete succeeds and the filter
+//! leaves the boot-time view within one boot; only a real reboot can prove it
+//! stays gone across one, and no CI runner reboots (the same disclosed limit
+//! `a_simulated_reboot_rearms_the_cover` carries on macOS). Nor can anything
+//! here prove the kernel actually ENFORCES the filter during the boot→BFE
+//! window — that is the reboot question too.
 
 use std::net::IpAddr;
 use std::path::Path;
@@ -632,7 +660,7 @@ const FWP_E_ALREADY_EXISTS_DWORD: u32 = 0x8032_0009;
 /// doc for why that mismatch matters). A delete that finds nothing is benign:
 /// the filter was never installed (a clean host) or a prior release already
 /// removed it — never treated as an error.
-const FWP_E_FILTER_NOT_FOUND_DWORD: u32 = 0x8032_0003;
+pub(crate) const FWP_E_FILTER_NOT_FOUND_DWORD: u32 = 0x8032_0003;
 
 /// Walk every `(what, code)` pair and return the first GENUINE failure — a
 /// code that is neither `ERROR_SUCCESS` nor "filter not found". Pure and total
@@ -864,12 +892,7 @@ unsafe fn get_app_id_blob(path: &Path) -> Result<AppIdBlob, RoutingError> {
 
 #[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
 unsafe fn add_filter(engine: HANDLE, provider: GUID, sublayer: GUID, f: &FilterSpec) -> Result<(), RoutingError> {
-    let layer = match f.layer {
-        Layer::ConnectV4 => FWPM_LAYER_ALE_AUTH_CONNECT_V4,
-        Layer::ConnectV6 => FWPM_LAYER_ALE_AUTH_CONNECT_V6,
-        Layer::RecvAcceptV4 => FWPM_LAYER_ALE_AUTH_RECV_ACCEPT_V4,
-        Layer::RecvAcceptV6 => FWPM_LAYER_ALE_AUTH_RECV_ACCEPT_V6,
-    };
+    let layer = layer_guid(f.layer);
     let action_type = match f.action {
         Action::Permit => FWP_ACTION_PERMIT,
         Action::Block => FWP_ACTION_BLOCK,
@@ -1095,10 +1118,13 @@ impl Cover {
     /// close the FWPM engine handle, then skip `Drop` so its filter deletes
     /// never run.
     ///
-    /// Safe because the provider, sublayer and every filter are installed
-    /// `FWPM_*_FLAG_PERSISTENT` (see `engage`), so they survive the engine
-    /// session closing — closing the handle cannot destroy them. That is what
-    /// lets a LONG-LIVED caller keep the host covered without leaking a
+    /// Safe because no object this cover installs is owned by the engine
+    /// session: `engage`/`engage_lockdown` open a NON-dynamic session, the
+    /// provider and sublayer carry `FWPM_*_FLAG_PERSISTENT`, and every filter
+    /// carries a lifetime flag of its own — `PERSISTENT`, or `BOOTTIME` for
+    /// the lockdown block-all twins ([`FilterLifetime`]). Only a filter with
+    /// NEITHER flag, in a dynamic session, would die with the handle. That is
+    /// what lets a LONG-LIVED caller keep the host covered without leaking a
     /// handle per call: `std::mem::forget` alone, which this replaces, leaked
     /// one on every armed reload for the life of the process.
     pub(crate) fn detach(self) {
@@ -1397,6 +1423,199 @@ pub fn release_all(_state_dir: &Path) -> Result<(), RoutingError> {
             Some(e) => Err(e),
             None => Ok(()),
         }
+    }
+}
+
+/// Test-only FWPM reads/writes that answer the BOOT-TIME lifecycle questions
+/// WFP's documentation does not — see `boottime_privileged_tests.rs`, which is
+/// this module's only caller.
+///
+/// It deliberately reuses the PRODUCTION [`add_filter`] and the same
+/// `FwpmFilterDeleteByKey0`/`FwpmFilterGetByKey0` calls the sweeps and the
+/// presence probe make, so what it measures is the shipped path, not a
+/// re-implementation of it. The only thing here that production has no
+/// counterpart for is [`enum_boottime`]: the default enumeration/get view
+/// excludes boot-time filters (`FWP_FILTER_ENUM_FLAG_BOOTTIME_ONLY` /
+/// `..._INCLUDE_BOOTTIME` exist precisely to opt in), so a by-key read alone
+/// cannot tell "the delete worked" from "the delete was never able to see it".
+#[cfg(all(test, target_os = "windows"))]
+pub(crate) mod boottime_probe {
+    use super::*;
+
+    /// The fields of a live `FWPM_FILTER0` this probe reads back. Copied out
+    /// of the WFP-allocated struct before it is freed — no borrowed pointers
+    /// survive the read.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) struct FilterRecord {
+        pub key: GUID,
+        pub flags: u32,
+        /// `None` when the live filter carries a NULL `providerKey` — which is
+        /// what a boot-time record dropping its provider would look like.
+        pub provider: Option<GUID>,
+        pub sublayer: GUID,
+        pub layer: GUID,
+    }
+
+    impl FilterRecord {
+        /// SAFETY: `p` must point at a live, WFP-allocated `FWPM_FILTER0`.
+        unsafe fn read(p: *const FWPM_FILTER0) -> Self {
+            let f = &*p;
+            Self {
+                key: f.filterKey,
+                flags: f.flags.0,
+                provider: if f.providerKey.is_null() {
+                    None
+                } else {
+                    Some(*f.providerKey)
+                },
+                sublayer: f.subLayerKey,
+                layer: f.layerKey,
+            }
+        }
+
+        pub(crate) fn is_boottime(&self) -> bool {
+            self.flags & FWPM_FILTER_FLAG_BOOTTIME.0 != 0
+        }
+    }
+
+    /// What [`enum_boottime`] can report, three-valued on purpose:
+    /// `Err(code)` — the engine could not be opened, so nothing was asked;
+    /// `Ok(Err(code))` — the enumeration itself failed;
+    /// `Ok(Ok(records))` — the (possibly empty) boot-time set.
+    pub(crate) type EnumResult = Result<Result<Vec<FilterRecord>, u32>, u32>;
+
+    /// Open an engine, run `body`, close it. Returns `Err(code)` if the open
+    /// itself failed, so a test can tell "the firewall could not be asked"
+    /// from every answer it might have given.
+    #[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
+    fn with_engine<T>(body: impl FnOnce(HANDLE) -> T) -> Result<T, u32> {
+        unsafe {
+            let mut engine = HANDLE::default();
+            let rc = FwpmEngineOpen0(PCWSTR::null(), RPC_C_AUTHN_WINNT, None, None, &mut engine);
+            if rc != ERROR_SUCCESS.0 {
+                return Err(rc);
+            }
+            let out = body(engine);
+            let _ = FwpmEngineClose0(engine);
+            Ok(out)
+        }
+    }
+
+    /// Add `f` through the production [`add_filter`], inside a transaction,
+    /// under the production provider/sublayer — byte-for-byte the call
+    /// `engage_lockdown` makes for its own boot-time twins. Returns the raw
+    /// `Result` so a test can assert on the add's own verdict.
+    #[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
+    pub(crate) fn add(f: &FilterSpec) -> Result<Result<(), RoutingError>, u32> {
+        with_engine(|engine| unsafe {
+            let r = (|| -> Result<(), RoutingError> {
+                wfp_check(FwpmTransactionBegin0(engine, 0), "FwpmTransactionBegin0")?;
+                add_provider(engine, PROVIDER_GUID)?;
+                add_sublayer(engine, SUBLAYER_GUID, PROVIDER_GUID)?;
+                add_filter(engine, PROVIDER_GUID, SUBLAYER_GUID, f)?;
+                wfp_check(FwpmTransactionCommit0(engine), "FwpmTransactionCommit0")
+            })();
+            if r.is_err() {
+                let _ = FwpmTransactionAbort0(engine);
+            }
+            r
+        })
+    }
+
+    /// `FwpmFilterGetByKey0` — the exact call [`lockdown_cover_presence`]
+    /// makes. Returns the raw code plus, on success, the filter as WFP
+    /// reports it back.
+    #[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
+    pub(crate) fn get_by_key(key: GUID) -> Result<(u32, Option<FilterRecord>), u32> {
+        with_engine(|engine| unsafe {
+            let mut out: *mut FWPM_FILTER0 = std::ptr::null_mut();
+            let rc = FwpmFilterGetByKey0(engine, &key, &mut out);
+            let record = if out.is_null() {
+                None
+            } else {
+                let r = FilterRecord::read(out);
+                let mut p = out as *mut core::ffi::c_void;
+                FwpmFreeMemory0(&mut p);
+                Some(r)
+            };
+            (rc, record)
+        })
+    }
+
+    /// `FwpmFilterDeleteByKey0` — the exact call every sweep in this file
+    /// makes. Returns the raw code, UNfiltered: [`first_delete_failure`]
+    /// whitelists `FWP_E_FILTER_NOT_FOUND`, and telling that apart from
+    /// `ERROR_SUCCESS` is the whole point of the probe.
+    #[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
+    pub(crate) fn delete_by_key(key: GUID) -> Result<u32, u32> {
+        with_engine(|engine| unsafe { FwpmFilterDeleteByKey0(engine, &key) })
+    }
+
+    /// Every BOOT-TIME filter at `layer`, via an enumeration template that
+    /// opts into the boot-time view (`FWP_FILTER_ENUM_FLAG_BOOTTIME_ONLY`)
+    /// — the default view excludes them, so this is the only read that can
+    /// distinguish an absent boot-time filter from an invisible one.
+    ///
+    /// The template names no provider on purpose. Filtering by
+    /// [`PROVIDER_GUID`] (as Microsoft's own `HlprFwpmFilterRemoveAll` sample
+    /// does) would make "the boot-time record dropped its provider"
+    /// indistinguishable from "there is no boot-time record" — and telling
+    /// those apart is half of what the probe exists for.
+    ///
+    #[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
+    pub(crate) fn enum_boottime(layer: Layer, enum_type: FWP_FILTER_ENUM_TYPE) -> EnumResult {
+        let layer_key = layer_guid(layer);
+        with_engine(|engine| unsafe {
+            let template = FWPM_FILTER_ENUM_TEMPLATE0 {
+                layerKey: layer_key,
+                enumType: enum_type,
+                flags: FWP_FILTER_ENUM_FLAG_BOOTTIME_ONLY,
+                actionMask: 0xffff_ffff,
+                ..Default::default()
+            };
+            let mut enum_handle = HANDLE::default();
+            let rc = FwpmFilterCreateEnumHandle0(engine, Some(&template), &mut enum_handle);
+            if rc != ERROR_SUCCESS.0 {
+                return Err(rc);
+            }
+            let mut found: Vec<FilterRecord> = Vec::new();
+            let result = loop {
+                let mut entries: *mut *mut FWPM_FILTER0 = std::ptr::null_mut();
+                let mut num: u32 = 0;
+                // Page size is a batch hint, not a cap: the loop runs until
+                // WFP returns an empty page, so nothing is ever truncated.
+                let rc = FwpmFilterEnum0(engine, enum_handle, 64, &mut entries, &mut num);
+                if rc != ERROR_SUCCESS.0 {
+                    break Err(rc);
+                }
+                if num == 0 {
+                    if !entries.is_null() {
+                        let mut p = entries as *mut core::ffi::c_void;
+                        FwpmFreeMemory0(&mut p);
+                    }
+                    break Ok(());
+                }
+                for i in 0..num as usize {
+                    found.push(FilterRecord::read(*entries.add(i)));
+                }
+                let mut p = entries as *mut core::ffi::c_void;
+                FwpmFreeMemory0(&mut p);
+            };
+            let _ = FwpmFilterDestroyEnumHandle0(engine, enum_handle);
+            result.map(|()| found)
+        })
+    }
+}
+
+/// The WFP layer GUID a [`Layer`] names. Shared by [`add_filter`] and the
+/// boot-time probe's enumeration template, so the two can never disagree
+/// about which layer a `Layer` means.
+fn layer_guid(layer: Layer) -> GUID {
+    match layer {
+        Layer::ConnectV4 => FWPM_LAYER_ALE_AUTH_CONNECT_V4,
+        Layer::ConnectV6 => FWPM_LAYER_ALE_AUTH_CONNECT_V6,
+        Layer::RecvAcceptV4 => FWPM_LAYER_ALE_AUTH_RECV_ACCEPT_V4,
+        Layer::RecvAcceptV6 => FWPM_LAYER_ALE_AUTH_RECV_ACCEPT_V6,
     }
 }
 

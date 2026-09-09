@@ -375,3 +375,12 @@ mod release_privileged_tests;
 #[cfg(test)]
 #[path = "failclosed/live_tun_permit_privileged_tests.rs"]
 mod live_tun_permit_privileged_tests;
+
+// Privileged-lane measurement (#998) of what WFP does with a BOOT-TIME filter:
+// whether it accepts one under our persistent containers, keeps them, and
+// removes it on a by-key delete. Windows-only — macOS's pf ruleset has no
+// boot-time equivalent (pf rules do not survive a reboot at all, #617). Gated
+// identically to `lockdown_privileged_tests` above.
+#[cfg(all(test, target_os = "windows"))]
+#[path = "failclosed/boottime_privileged_tests.rs"]
+mod boottime_privileged_tests;

@@ -924,7 +924,9 @@ egress set and blocking everything else; they differ in lifetime and which set
 they permit.
 
 Both are deliberately **persistent** WFP filters, surviving an update-cutover
-restart on purpose. The Windows DNS-egress confinement
+restart on purpose (Windows: the standing lockdown cover's block-all is
+ADDITIONALLY boot-time, closing a window `PERSISTENT` alone cannot — see
+[Lockdown mode](#lockdown-mode)). The Windows DNS-egress confinement
 ([`tun_engine::dns_confine`](crates/tun-engine/src/dns_confine.rs), see
 [DNS forwarder](#dns-forwarder)) is the opposite: a **dynamic**, process-scoped
 FWPM session that dies with the engine handle, including on an abnormal exit —
@@ -1172,6 +1174,53 @@ identified at runtime via `TunIdentity`, on macOS), the onward server
 connection, and (Windows) the plugin + bridge binaries by App-ID — so normal
 traffic flows while connected and the block holds across a bridge restart for
 free. When disabled, behavior is byte-identical to a Hole without it.
+
+**Windows, boot-time coverage ([#998](https://github.com/bindreams/hole/issues/998)).**
+A merely-`PERSISTENT` filter is re-added by the Base Filtering Engine (BFE)
+once it starts, not enforced before that — the kernel enforces only
+`FWPM_FILTER_FLAG_BOOTTIME` filters from boot until BFE takes over, so a
+`PERSISTENT`-only block-all left the host open on every reboot with the kill
+switch armed. The block-all half of the standing cover now additionally
+installs a `BOOTTIME` twin (`LOCKDOWN_BOOTTIME_BLOCK_ALL_GUIDS`); the two flags
+are mutually exclusive on one filter object, so this is a second filter, not a
+second bit, and WFP documents the hand-off between them as atomic. Every
+permit, including loopback, stays `PERSISTENT`-only: a boot-time permit either
+carries a runtime-discovered value nothing can refresh pre-BFE, or has no
+hand-off to its narrower persistent counterpart — and the leak this closes is
+network egress, not loopback.
+
+Two things that decide whether this is safe are undocumented by WFP, so they
+are **measured on the real firewall** by
+[`boottime_privileged_tests.rs`](crates/tun-engine/src/routing/failclosed/boottime_privileged_tests.rs)
+rather than argued: whether a boot-time filter keeps the provider and sublayer
+it was added under (if it does not, sweeping boot-time filters by provider
+enumeration — [#1008](https://github.com/bindreams/hole/issues/1008) — is
+impossible for them), and whether `FwpmFilterDeleteByKey0` genuinely removes
+one. The second is the dangerous one: the default enumeration view *excludes*
+boot-time filters, so a delete that could not see them would return
+`FWP_E_FILTER_NOT_FOUND` — which `first_delete_failure` whitelists — and
+`release_all` would report success over a still-blocked host. That probe filter
+is deliberately a *permit* on an RFC 5737 documentation address, never a block,
+so the test cannot itself brick the machine it is ruling out bricking.
+
+**Not settled by any test, and not claimed:** whether the kernel enforces the
+filter during the boot→BFE window, and whether a by-key delete purges the
+on-disk boot-time record so it does not reappear at the next boot. Both need a
+real reboot; no CI runner offers one, the same disclosed limit
+`a_simulated_reboot_rearms_the_cover` carries on macOS. Microsoft's own pages
+disagree on the underlying mechanic — `FwpmFilterAdd0`'s Remarks say boot-time
+filters are "removed" once BFE finishes initializing; the "Basic Operation of
+WFP" page says they are "disabled".
+
+A stranded boot-time leftover also has no self-healing path the way a stranded
+persistent one does: BFE re-adds a persistent leftover every start regardless
+of which build is running, so a later GUID-aware build can still reach it by
+key, while a boot-time leftover is reprovisioned from an on-disk record
+independent of the live FWPM session — an older binary that never learned its
+GUID can never find it. Bounding that is
+[#1008](https://github.com/bindreams/hole/issues/1008), and its
+provider-enumeration mechanism is only viable if the measurement above says
+boot-time filters keep their provider.
 
 It contrasts with the [transient cutover cover](#transient-cutover-cover) on
 three axes:
