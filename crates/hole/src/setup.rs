@@ -398,22 +398,73 @@ pub fn install_bridge(repair_user_data_dir: Option<&Path>) -> Result<(), Box<dyn
 }
 
 /// Run `bridge uninstall`.
-pub fn uninstall_bridge() -> Result<(), Box<dyn std::error::Error>> {
-    if !hole_bridge::platform::os::is_installed() {
+///
+/// `keep_covers` leaves every fail-closed cover engaged and the target
+/// untouched — see [`uninstall_bridge_with`] for who needs that.
+pub fn uninstall_bridge(keep_covers: bool) -> Result<(), Box<dyn std::error::Error>> {
+    uninstall_bridge_with(
+        keep_covers,
+        hole_bridge::platform::os::is_installed,
+        || {
+            hole_bridge::platform::os::uninstall()?;
+
+            // Cosmetic leftovers, not a block: neither can strand the host.
+            let _ = std::fs::remove_file(hole_common::protocol::default_bridge_socket_path());
+            let _ = hole_bridge::group::delete_group();
+
+            cli_log!(info, "bridge uninstalled");
+            Ok(())
+        },
+        || Ok(hole_bridge::cutover::release_covers()?),
+    )
+}
+
+/// `uninstall_bridge`'s ordering, with the three effects injected so tests can
+/// drive it without touching SCM/launchd or the host firewall.
+///
+/// **Teardown, then release.** `cutover::release_covers` refuses against a live
+/// bridge — an out-of-process clear of the transient cover would leave
+/// `ProxyManager`'s posture claiming a cover that no longer exists, and the
+/// next covered start would skip re-engagement on that claim. Stopping the
+/// service first is what frees the liveness lock for it; a bridge that survives
+/// the teardown turns the release into a loud refusal rather than a silent
+/// desync. Releasing first would only buy protection against a wedged `stop()`,
+/// and a wedge is a hang, not a brick: it stalls before `RemoveFiles`, so the
+/// binary that can still run the release survives either way.
+///
+/// **The release is unconditional** — never gated on `is_installed`, never
+/// skipped because the teardown failed. Cover existence is independent of
+/// service registration: the Windows filters are keyed on compile-time GUIDs
+/// and are machine-wide, so a lost registration (a failed install, `sc delete`,
+/// an aborted prior uninstall) must not turn the release into a no-op over a
+/// live block. It is also the one failure worth being loud about — the MSI runs
+/// it `Return="check"` so a failed release aborts before `RemoveFiles` deletes
+/// the only binary that could remove a persistent WFP filter
+/// (bindreams/hole#1003). A failed *teardown* is merely untidy and surfaces
+/// afterwards.
+///
+/// `keep_covers` skips the release entirely. Its one caller is the MSI, whose
+/// major-upgrade path (`RemoveExistingProducts`) must tear the old service down
+/// so its image can be replaced WITHOUT disarming the kill switch: the standing
+/// cover is what holds the update-cutover gap, and the new bridge re-adopts it.
+fn uninstall_bridge_with(
+    keep_covers: bool,
+    is_installed: impl FnOnce() -> bool,
+    teardown: impl FnOnce() -> Result<(), Box<dyn std::error::Error>>,
+    release: impl FnOnce() -> Result<(), Box<dyn std::error::Error>>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let torn_down = if is_installed() {
+        teardown()
+    } else {
         cli_log!(warn, "bridge is not installed");
-        return Ok(());
+        Ok(())
+    };
+
+    if !keep_covers {
+        release()?;
     }
 
-    hole_bridge::platform::os::uninstall()?;
-
-    // Remove socket file
-    let _ = std::fs::remove_file(hole_common::protocol::default_bridge_socket_path());
-
-    // Best-effort: remove the access group
-    let _ = hole_bridge::group::delete_group();
-
-    cli_log!(info, "bridge uninstalled");
-    Ok(())
+    torn_down
 }
 
 // GUI install prompt ==================================================================================================

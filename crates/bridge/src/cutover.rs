@@ -168,6 +168,59 @@ fn unlock_with(state_dir: &Path, disengage: impl FnOnce() -> std::io::Result<()>
     tun_engine::routing::failclosed::lockdown_state::set_enabled(state_dir, false, None)
 }
 
+/// The uninstaller's escape: clear EVERY fail-closed cover and record the
+/// target off, with no running bridge.
+///
+/// Wider than [`unlock`], which disengages only the STANDING cover because an
+/// out-of-process clear of the transient one would desync a live bridge's
+/// posture. Uninstall cannot leave that to the in-process escapes: there is no
+/// next bridge start to sweep a transient cover stranded by an earlier crash,
+/// and on Windows the filters are `FWPM_FILTER_FLAG_PERSISTENT` — the Base
+/// Filtering Engine re-adds them every boot, and the uninstaller is about to
+/// delete the only binary that could remove them (bindreams/hole#1003).
+///
+/// The desync hazard is answered structurally, not by ordering: like [`unlock`]
+/// this REFUSES against a live bridge instance, so there is never an
+/// in-process posture to leave claiming a cover that no longer exists.
+/// `bridge uninstall` tears the service down first, which is what frees the
+/// lock for it.
+///
+/// Fatality is deliberately narrower than [`unlock`]'s, because the MSI runs
+/// this `Return="check"`: only the target write and the release itself abort.
+/// The trailing bookkeeping warns instead, since failing there would roll an
+/// uninstall back over a host that is in fact already open — trading a
+/// permanent block for a permanently unremovable product. Recording the target
+/// off BEFORE the release is what makes that safe: whatever happens after, a
+/// later start reconciles toward `Off` and sweeps.
+pub fn release_covers() -> std::io::Result<()> {
+    let state_dir = service_state_dir();
+    release_covers_with(&state_dir, || {
+        tun_engine::routing::failclosed::release_all(&state_dir).map_err(std::io::Error::other)
+    })
+}
+
+/// `release_covers`' ordering, with the release injected so tests can drive the
+/// cannot-release path without touching the host firewall.
+fn release_covers_with(state_dir: &Path, release: impl FnOnce() -> std::io::Result<()>) -> std::io::Result<()> {
+    let Some(_liveness) = crate::liveness::BridgeLiveness::try_acquire(state_dir, None)? else {
+        return Err(std::io::Error::other(
+            "a bridge instance is running; stop the bridge before releasing its fail-closed covers",
+        ));
+    };
+    crate::target::apply(state_dir, None, |_| crate::target::Target::Off)
+        .map_err(|e| std::io::Error::other(format!("could not record target off: {e}")))?;
+    release()?;
+
+    // Best-effort from here — see the fatality note on `release_covers`.
+    if let Err(e) = crate::target::apply_startup_preference(state_dir, None, |pref| pref.candidate = None) {
+        tracing::warn!(error = %e, "covers released, but the auto-connect candidate could not be cleared");
+    }
+    if let Err(e) = tun_engine::routing::failclosed::lockdown_state::set_enabled(state_dir, false, None) {
+        tracing::warn!(error = %e, "covers released, but the legacy lockdown intent could not be recorded off");
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 #[path = "cutover_tests.rs"]
 mod cutover_tests;

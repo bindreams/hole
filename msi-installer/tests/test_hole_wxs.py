@@ -167,6 +167,10 @@ def _is_uninstall_condition(condition: str) -> bool:
 # CAs that launch the app after install — exempt from Return=check and After=InstallFiles rules.
 _LAUNCH_CAS = {"LaunchApp"}
 
+# Uninstall CAs whose failure must BLOCK rather than be ignored — see
+# test_uninstall_cas_return_ignore.
+_COVER_RELEASE_CAS = {"BridgeRelease"}
+
 
 def test_install_cas_sequenced_after_install_files(package: ET.Element) -> None:
     """Every install CA (except launch CAs) must be transitively After='InstallFiles'."""
@@ -230,35 +234,33 @@ def test_launch_ca_passes_no_arguments(package: ET.Element) -> None:
 
 
 def test_uninstall_cas_sequenced_before_remove_files(package: ET.Element) -> None:
-    """Every uninstall CA must have a direct Before anchor that leads to RemoveFiles.
+    """Every uninstall CA must be transitively anchored Before RemoveFiles.
 
-    Only one hop of indirection is allowed: Before='RemoveFiles' directly,
-    or Before another uninstall CA that itself has Before='RemoveFiles'.
-    This keeps the ordering fully explicit and solver-independent.
+    Each CA is Before='RemoveFiles' or Before another uninstall CA, and
+    following that chain must terminate at RemoveFiles. Every hop is an
+    explicit Before attribute, so the ordering stays solver-independent — the
+    chain may be any length (it mirrors the install-side After walk).
     """
     customs = _get_custom_entries(package)
     uninstall_cas = [c for c in customs if _is_uninstall_condition(c.get("Condition", ""))]
+    before_map = {c.get("Action", ""): c.get("Before") for c in uninstall_cas}
 
-    for custom in uninstall_cas:
-        action = custom.get("Action", "")
-        before = custom.get("Before")
+    for action, before in before_map.items():
         assert before is not None, (
             f"Uninstall CA '{action}' has no Before attribute "
             "(must be directly anchored before a standard action)"
         )
 
-        # The Before target must be RemoveFiles or another uninstall CA
-        # that is itself directly Before RemoveFiles.
-        allowed_targets = {"RemoveFiles"}
-        for other in uninstall_cas:
-            other_action = other.get("Action", "")
-            if other.get("Before") == "RemoveFiles":
-                allowed_targets.add(other_action)
+        visited: set[str] = set()
+        current = action
+        while current in before_map and current not in visited:
+            visited.add(current)
+            current = before_map[current]
 
-        assert before in allowed_targets, (
-            f"Uninstall CA '{action}' has Before='{before}', which is not 'RemoveFiles' "
-            f"or another uninstall CA directly anchored to RemoveFiles. "
-            f"Allowed targets: {allowed_targets}"
+        assert current == "RemoveFiles", (
+            f"Uninstall CA '{action}' anchors to '{current}', not 'RemoveFiles'. "
+            f"Chain followed: {visited}. Every uninstall CA must reach RemoveFiles "
+            "through explicit Before hops (a cycle stops the walk early)."
         )
 
 
@@ -425,16 +427,112 @@ def test_install_cas_return_check(package: ET.Element) -> None:
 
 
 def test_uninstall_cas_return_ignore(package: ET.Element) -> None:
+    """Uninstall CAs must not block the uninstall — except the cover release.
+
+    A leftover PATH entry or an undeleted service is untidy. A leftover
+    fail-closed cover is a permanently blocked host: the WFP filters are
+    persistent, the Base Filtering Engine re-adds them every boot, and
+    RemoveFiles is about to delete the only binary that could remove them
+    (bindreams/hole#1003). That one failure is worth aborting for, so
+    BridgeRelease is deliberately Return='check' and asserted separately by
+    test_bridge_release_blocks_uninstall_on_failure.
+    """
     cas = _ca_map(package)
     for custom in _get_custom_entries(package):
         if _is_uninstall_condition(custom.get("Condition", "")):
             action = custom.get("Action", "")
+            if action in _COVER_RELEASE_CAS:
+                continue
             ca = cas.get(action)
             assert ca is not None, f"Custom references undefined CA '{action}'"
             assert ca.get("Return") == "ignore", (
                 f"Uninstall CA '{action}' should have Return='ignore' "
                 "to avoid blocking uninstall"
             )
+
+
+# Fail-closed cover release (bindreams/hole#1003) ======================================================================
+
+
+def test_bridge_release_blocks_uninstall_on_failure(package: ET.Element) -> None:
+    """A cover release that fails must abort before RemoveFiles deletes hole.exe."""
+    ca = _ca_map(package).get("BridgeRelease")
+    assert ca is not None, "BridgeRelease CA must exist so uninstall releases the kill switch"
+    assert ca.get("Return") == "check", (
+        "BridgeRelease must be Return='check': proceeding into RemoveFiles after a "
+        "failed release leaves persistent WFP filters with no binary left to remove them"
+    )
+    assert ca.get("ExeCommand") == "bridge release-covers"
+    assert ca.get("Execute") == "deferred"
+    assert ca.get("Impersonate") == "no", "the release needs elevation to reach WFP"
+
+
+def test_bridge_release_is_skipped_on_major_upgrade(package: ET.Element) -> None:
+    """Disarming across an upgrade would defeat the cover that holds the cutover gap.
+
+    RemoveExistingProducts uninstalls the old product with REMOVE=ALL, so only
+    UPGRADINGPRODUCTCODE distinguishes an upgrade from a real uninstall.
+    """
+    entries = {c.get("Action", ""): c for c in _get_custom_entries(package)}
+    release = entries.get("BridgeRelease")
+    assert release is not None, "BridgeRelease must be sequenced"
+    assert "NOT UPGRADINGPRODUCTCODE" in release.get("Condition", ""), (
+        "BridgeRelease must skip the upgrade path — the standing cover must survive "
+        "the cutover gap for the new bridge to re-adopt"
+    )
+
+
+def test_bridge_uninstall_runs_on_upgrade_and_keeps_covers(package: ET.Element) -> None:
+    """The service teardown must run on an upgrade, but must not disarm anything.
+
+    The old service has to release its image before RemoveFiles replaces it, so
+    BridgeUninstall carries no upgrade guard — `--keep-covers` is what stops it
+    from disarming the kill switch on that path.
+    """
+    entries = {c.get("Action", ""): c for c in _get_custom_entries(package)}
+    teardown = entries.get("BridgeUninstall")
+    assert teardown is not None, "BridgeUninstall must be sequenced"
+    assert "UPGRADINGPRODUCTCODE" not in teardown.get("Condition", ""), (
+        "BridgeUninstall must run during RemoveExistingProducts so the old service "
+        "stops before its image is replaced"
+    )
+    ca = _ca_map(package).get("BridgeUninstall")
+    assert ca is not None
+    assert ca.get("ExeCommand") == "bridge uninstall --keep-covers", (
+        "without --keep-covers the upgrade path silently disarms the kill switch"
+    )
+
+
+def test_bridge_release_follows_the_service_teardown(package: ET.Element) -> None:
+    """The release must run against a dead bridge, and before PATH is stripped.
+
+    Clearing a cover out of process under a LIVE bridge leaves its posture
+    claiming a cover that no longer exists, and the next covered start skips
+    re-engagement on that claim. PathRemove trails the release because it is
+    deferred with no rollback partner: an aborted release must not leave the
+    PATH entry stripped.
+    """
+    entries = {c.get("Action", ""): c for c in _get_custom_entries(package)}
+    assert entries["BridgeUninstall"].get("Before") == "BridgeRelease"
+    assert entries["BridgeRelease"].get("Before") == "PathRemove"
+    assert entries["PathRemove"].get("Before") == "RemoveFiles"
+
+
+def test_bridge_release_has_an_override(package: ET.Element) -> None:
+    """Return='check' must not be able to make the product unremovable.
+
+    A release that can never succeed (BFE stopped, hole.exe quarantined) would
+    otherwise block every uninstall attempt forever.
+    """
+    entries = {c.get("Action", ""): c for c in _get_custom_entries(package)}
+    assert "NOT HOLE_KEEP_COVERS" in entries["BridgeRelease"].get("Condition", "")
+
+    props = {p.get("Id"): p for p in package.iter(f"{{{NS['wix']}}}Property")}
+    prop = props.get("HOLE_KEEP_COVERS")
+    assert prop is not None, "the override property must be declared"
+    assert prop.get("Secure") == "yes", (
+        "a public property must be Secure to survive into the deferred execute sequence under UAC"
+    )
 
 
 # Shortcut component tests =============================================================================================

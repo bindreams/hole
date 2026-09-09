@@ -171,7 +171,15 @@ pub(crate) enum BridgeAction {
         repair_user_data_dir: Option<std::path::PathBuf>,
     },
     /// Stop and remove the bridge service
-    Uninstall,
+    Uninstall {
+        /// Internal (the MSI's major-upgrade path): tear the service down but
+        /// leave every fail-closed cover engaged and the kill switch armed.
+        /// The standing cover is what holds the update-cutover gap.
+        ///
+        /// Hidden: hand-running it reproduces #1003 exactly.
+        #[arg(long, hide = true)]
+        keep_covers: bool,
+    },
     /// Print bridge install/running status
     Status,
     /// View bridge logs
@@ -225,6 +233,14 @@ pub(crate) enum BridgeAction {
     /// Disengage a standing lockdown cover when no bridge is alive to do it
     /// (elevated recovery hatch; last-writer-wins, not a privilege gate).
     Unlock,
+    /// Internal (the MSI's uninstall): release every fail-closed cover and
+    /// record the target off. Wider than `unlock` — it also clears a transient
+    /// cover that no later bridge start is left to sweep.
+    ///
+    /// Hidden because `unlock` is the user-facing hatch; like `unlock`, this
+    /// refuses against a live bridge.
+    #[command(hide = true)]
+    ReleaseCovers,
 }
 
 #[derive(Subcommand)]
@@ -701,8 +717,8 @@ fn handle_bridge(action: BridgeAction) -> i32 {
             }
             0
         }
-        BridgeAction::Uninstall => {
-            if let Err(e) = crate::setup::uninstall_bridge() {
+        BridgeAction::Uninstall { keep_covers } => {
+            if let Err(e) = crate::setup::uninstall_bridge(keep_covers) {
                 cli_log!(error, "bridge uninstall failed: {e}");
                 return 1;
             }
@@ -763,6 +779,13 @@ fn handle_bridge(action: BridgeAction) -> i32 {
                 }
             }
         }
+        BridgeAction::ReleaseCovers => match hole_bridge::cutover::release_covers() {
+            Ok(()) => 0,
+            Err(e) => {
+                cli_log!(error, "cover release failed: {e}");
+                1
+            }
+        },
         BridgeAction::Unlock => match hole_bridge::cutover::unlock() {
             Ok(()) => 0,
             Err(e) => {

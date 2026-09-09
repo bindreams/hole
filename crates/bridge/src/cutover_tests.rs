@@ -246,3 +246,71 @@ fn plan_windows_images_covers_full_bindir_set() {
         assert!(img.staged.exists(), "staged source resolved: {:?}", img.staged);
     }
 }
+
+// `bridge release-covers` (the uninstaller's escape) shares `unlock`'s
+// ordering over a wider reach — both cover kinds. It records the target off
+// FIRST, so a release that never lands still converges: a later start
+// reconciles toward `Off` and sweeps. And it refuses against a live bridge for
+// the same reason `unlock` does — an out-of-process clear would leave the
+// bridge's posture claiming a cover that no longer exists (#1003).
+
+#[skuld::test]
+fn release_covers_refuses_against_a_live_bridge() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let _bridge = crate::liveness::BridgeLiveness::acquire(dir.path(), None).unwrap();
+
+    let result = release_covers_with(dir.path(), || {
+        panic!("the release must never run while a bridge instance is live")
+    });
+
+    result.expect_err("release-covers must refuse while a bridge instance is running");
+}
+
+#[skuld::test]
+fn release_covers_records_the_target_off_before_releasing() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let result = release_covers_with(dir.path(), || {
+        assert_eq!(
+            crate::target::load(dir.path()),
+            crate::target::Target::Off,
+            "target must already be recorded off before the release call"
+        );
+        Ok(())
+    });
+
+    assert!(result.is_ok(), "{result:?}");
+    assert_eq!(crate::target::load(dir.path()), crate::target::Target::Off);
+}
+
+#[skuld::test]
+fn release_covers_fails_loud_when_it_cannot_release() {
+    let dir = tempfile::tempdir().unwrap();
+    lockdown_state::set_enabled(dir.path(), true, None).unwrap();
+
+    let result = release_covers_with(dir.path(), || Err(std::io::Error::other("not elevated")));
+
+    assert!(
+        result.is_err(),
+        "a failed release must abort before RemoveFiles deletes the only binary that could retry it"
+    );
+    assert!(
+        lockdown_state::load_enabled(dir.path()),
+        "the legacy intent must not read disarmed over a host still covered"
+    );
+}
+
+#[skuld::test]
+fn release_covers_disarms_the_kill_switch_on_a_confirmed_release() {
+    let dir = tempfile::tempdir().unwrap();
+    lockdown_state::set_enabled(dir.path(), true, None).unwrap();
+
+    let result = release_covers_with(dir.path(), || Ok(()));
+
+    assert!(result.is_ok());
+    assert!(
+        !lockdown_state::load_enabled(dir.path()),
+        "a confirmed release must disarm, not leave the switch armed over an open host"
+    );
+}

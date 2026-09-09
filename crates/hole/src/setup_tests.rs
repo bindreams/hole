@@ -300,3 +300,98 @@ fn build_elevation_script_output_compiles_and_roundtrips_via_osascript() {
         "a\"b c\\d e f a'b"
     );
 }
+
+// `bridge uninstall` orchestration ====================================================================================
+
+// bindreams/hole#1003: uninstalling with a fail-closed cover engaged left the
+// host blocked with no binary left to release it. The release must therefore
+// run after the bridge is dead, run regardless of the teardown's outcome or the
+// service registration, and be the failure that aborts.
+
+struct UninstallOutcome {
+    result: Result<(), Box<dyn std::error::Error>>,
+    steps: Vec<&'static str>,
+}
+
+fn uninstall_probe(
+    keep_covers: bool,
+    installed: bool,
+    teardown: Result<(), Box<dyn std::error::Error>>,
+    release: Result<(), Box<dyn std::error::Error>>,
+) -> UninstallOutcome {
+    let steps = std::cell::RefCell::new(Vec::new());
+    let result = uninstall_bridge_with(
+        keep_covers,
+        || installed,
+        || {
+            steps.borrow_mut().push("teardown");
+            teardown
+        },
+        || {
+            steps.borrow_mut().push("release");
+            release
+        },
+    );
+    UninstallOutcome {
+        result,
+        steps: steps.into_inner(),
+    }
+}
+
+#[skuld::test]
+fn uninstall_tears_the_service_down_before_releasing_covers() {
+    let out = uninstall_probe(false, true, Ok(()), Ok(()));
+
+    assert!(out.result.is_ok());
+    assert_eq!(
+        out.steps,
+        vec!["teardown", "release"],
+        "an out-of-process release under a live bridge desyncs its cover posture"
+    );
+}
+
+#[skuld::test]
+fn uninstall_releases_covers_even_when_the_service_is_not_registered() {
+    let out = uninstall_probe(false, false, Err("must never be called".into()), Ok(()));
+
+    assert!(out.result.is_ok(), "an absent service is not an uninstall failure");
+    assert_eq!(
+        out.steps,
+        vec!["release"],
+        "covers are machine-wide: a lost registration must not skip the release"
+    );
+}
+
+#[skuld::test]
+fn uninstall_releases_covers_even_when_the_teardown_fails() {
+    let out = uninstall_probe(false, true, Err("service delete failed".into()), Ok(()));
+
+    assert!(out.result.is_err(), "the teardown failure still surfaces");
+    assert_eq!(
+        out.steps,
+        vec!["teardown", "release"],
+        "an undeletable service must not strand the firewall behind it"
+    );
+}
+
+#[skuld::test]
+fn uninstall_fails_loud_when_the_release_fails() {
+    let out = uninstall_probe(false, true, Ok(()), Err("cannot release".into()));
+
+    assert!(
+        out.result.is_err(),
+        "a failed release must abort before RemoveFiles deletes the only binary that could retry it"
+    );
+}
+
+#[skuld::test]
+fn uninstall_keep_covers_tears_down_without_releasing() {
+    let out = uninstall_probe(true, true, Ok(()), Err("must never be called".into()));
+
+    assert!(out.result.is_ok());
+    assert_eq!(
+        out.steps,
+        vec!["teardown"],
+        "the MSI's major-upgrade path replaces the service image but must not disarm the kill switch"
+    );
+}

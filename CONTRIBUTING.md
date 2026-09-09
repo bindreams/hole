@@ -1267,10 +1267,53 @@ censorship self-test on that basis. An
 out-of-process command that deleted the transient filters would leave that
 guard claiming a cover that no longer exists, and the next retry would run
 uncovered while believing itself protected — so `cutover::unlock` keeps
-clearing only the standing cover. The transient cover therefore has exactly
-two escapes, both in-process: the tray's Go Offline action while the bridge
-holds it, and `recover_routes`' unconditional sweep at the next bridge start
-when it does not.
+clearing only the standing cover.
+
+The transient cover therefore has **three** escapes. Two are in-process and
+available at any time: the tray's Go Offline action while the bridge holds it,
+and `recover_routes`' unconditional sweep at the next bridge start when it does
+not. The third is out-of-process and reserved for uninstall.
+
+#### Uninstall: the third escape
+
+Uninstall is the one moment the in-process escapes cannot cover, because there
+is no next bridge start. On Windows the filters are
+`FWPM_FILTER_FLAG_PERSISTENT`: the Base Filtering Engine re-adds them every
+boot, and the uninstaller is about to delete the only binary that could remove
+them — a permanently blocked host with no way back short of `netsh wfp`
+(#1003). `cutover::release_covers` (`hole bridge release-covers`) is therefore
+`release_all` — both cover kinds — wrapped in the same escape shape as
+`unlock`.
+
+What makes the wider reach safe here is not ordering but the same structural
+exclusion `unlock` uses: it **refuses against a live bridge instance**
+(`BridgeLiveness::try_acquire`), so there is never an in-process posture left
+claiming a cover that no longer exists. `uninstall_bridge` tears the service
+down *first*, which is what frees the lock; a bridge that survives the teardown
+turns the release into a loud refusal rather than a silent desync.
+
+Two more properties are load-bearing:
+
+- **The release is not gated on the service.** Cover existence is independent
+  of service registration (the Windows filters are keyed on compile-time GUIDs
+  and are machine-wide), so it runs even when `is_installed()` is false or the
+  teardown failed.
+- **It is the only uninstall failure that blocks.** The MSI runs
+  `BridgeRelease` `Return="check"` — uniquely among the uninstall custom
+  actions — so a failed release aborts before `RemoveFiles`. Fatality stops
+  there: the target write and the release itself abort, while the trailing
+  bookkeeping only warns, since failing there would roll an uninstall back over
+  a host that is in fact already open. Recording the target `Off` *before* the
+  release is what makes that safe — whatever happens after, a later start
+  reconciles toward `Off` and sweeps. `HOLE_KEEP_COVERS=1` is the documented
+  escape from the gate itself, so a release that can never succeed cannot make
+  the product unremovable (see RELEASE-OPS.md).
+
+A major upgrade skips the release entirely (`NOT UPGRADINGPRODUCTCODE`, and
+`bridge uninstall --keep-covers` for the service teardown that must still run):
+the standing cover is what holds the update-cutover gap, and the new bridge
+re-adopts it. Both CLI surfaces are `hide = true` — the uninstaller is their
+only sanctioned caller.
 
 Disclosed residuals:
 
@@ -1386,6 +1429,28 @@ Disclosed residuals:
    running or an RPC failure — both transient, and both states in which
    `hole bridge unlock` would also fail, so the honest escape is the next
    start once BFE answers, which adopts the cover and restores the menu item.
+
+1. Uninstall proves it *issued* the deletes, not that no filter remains. On
+   Windows `lockdown_cover_presence` could confirm the stronger claim by GUID;
+   nothing does so yet, and the end-to-end "uninstall from an armed state
+   leaves no filters behind" test needs the elevated Windows lane (#999).
+   macOS is weaker still: `release_all` reads its own state files, so a cover
+   engaged under a non-default `--state-dir` reads `StateFile::Absent` against
+   the fixed `service_state_dir()` and returns `Ok` over a blocked host. The
+   recorded `Target::Off` limits the damage — a later start reconciles toward
+   it and sweeps — and pf does not survive a reboot. Windows is clean here:
+   the sweep is by GUID and ignores `state_dir` entirely.
+
+1. On macOS, uninstall only runs when the user takes it: the tray's Uninstall
+   Helper shells out to `hole bridge uninstall`. Dragging Hole.app to the
+   trash runs none of this and leaves the launchd job, the helper, and any
+   cover in place. Acceptable only because pf does not survive a reboot; the
+   Windows MSI has no such gap.
+
+1. A release that succeeds while the trailing bookkeeping fails leaves a stale
+   auto-connect candidate or a stale legacy `bridge-lockdown.json` label. The
+   target is already `Off` by then, so reconciliation still converges;
+   propagating those failures would abort the uninstall over an open host.
 
 1. An adopted cover records **two** facts, kept in two places. The
    adopted-cover claim (`ProxyManager::set_standing_cover_adopted`, recorded

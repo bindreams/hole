@@ -243,10 +243,48 @@
       Impersonate="no"
       Return="ignore" />
 
+    <!-- Release every fail-closed cover and disarm the kill switch, before
+         RemoveFiles deletes the only binary that could do it later. The WFP
+         filters are FWPM_FILTER_FLAG_PERSISTENT, so the Base Filtering Engine
+         re-adds them on every boot: leaving them behind is a permanently
+         blocked host with no way back short of `netsh wfp` (#1003).
+
+         Return="check", uniquely among the uninstall CAs: a failed release
+         MUST abort and roll the uninstall back, leaving hole.exe in place, and
+         is the only failure here worth blocking on. Its sibling below stays
+         Return="ignore" — a service that will not deregister is untidy, not a
+         lockout.
+
+         NOT UPGRADINGPRODUCTCODE, also uniquely: during a major upgrade's
+         RemoveExistingProducts the old product uninstalls with REMOVE=ALL, and
+         disarming there would break the cover's whole purpose. The standing
+         cover is what holds the update-cutover gap; the new bridge re-adopts
+         it (decide_cover_recovery(On, Live) == Adopt).
+
+         HOLE_KEEP_COVERS is the escape from the escape: Return="check" means a
+         release that can never succeed (BFE stopped, hole.exe quarantined)
+         would otherwise make the product permanently unremovable. Secure="yes"
+         so the value survives into the server-side execute sequence under UAC.
+         Documented in RELEASE-OPS.md as a last resort; it leaves the block in
+         place, so `netsh wfp` is the only thing left after it. -->
+    <Property Id="HOLE_KEEP_COVERS" Secure="yes" />
+
+    <CustomAction
+      Id="BridgeRelease"
+      FileRef="hole.exe"
+      ExeCommand="bridge release-covers"
+      Execute="deferred"
+      Impersonate="no"
+      Return="check" />
+
+    <!-- Stop and deregister the service. Runs on a major upgrade too, so the
+         old service releases its image before RemoveFiles replaces it. The
+         keep-covers flag is what makes that safe: it leaves the cover and the
+         kill-switch intent to BridgeRelease above, which the upgrade skips. -->
     <CustomAction
       Id="BridgeUninstall"
       FileRef="hole.exe"
-      ExeCommand="bridge uninstall"
+      ExeCommand="bridge uninstall --keep-covers"
       Execute="deferred"
       Impersonate="no"
       Return="ignore" />
@@ -271,12 +309,24 @@
       <Custom Action="PathAdd" After="BridgeInstall"
         Condition="NOT Installed AND NOT REMOVE" />
 
-      <!-- Pre-uninstall: PATH remove then bridge uninstall.
-           Each uninstall CA must be transitively anchored Before RemoveFiles
-           via explicit Before attributes, so ordering is fully determined. -->
-      <Custom Action="PathRemove" Before="BridgeUninstall"
+      <!-- Pre-uninstall: deregister the service, release the covers, then
+           strip PATH. Each uninstall CA must be transitively anchored Before
+           RemoveFiles via explicit Before attributes, so ordering is fully
+           determined.
+
+           The service goes first so the release runs against a DEAD bridge:
+           clearing a cover out of process under a live one leaves its posture
+           claiming a cover that no longer exists, and the next covered start
+           would skip re-engagement and run uncovered.
+
+           PATH goes last so an aborted release (Return="check") leaves the
+           entry intact — PathRemove is deferred with no rollback partner, so
+           anything sequenced after it survives a rollback stripped. -->
+      <Custom Action="BridgeUninstall" Before="BridgeRelease"
         Condition="REMOVE=&quot;ALL&quot;" />
-      <Custom Action="BridgeUninstall" Before="RemoveFiles"
+      <Custom Action="BridgeRelease" Before="PathRemove"
+        Condition="REMOVE=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE AND NOT HOLE_KEEP_COVERS" />
+      <Custom Action="PathRemove" Before="RemoveFiles"
         Condition="REMOVE=&quot;ALL&quot;" />
 
       <!-- Launch app after fresh install (not upgrades, not silent) -->
