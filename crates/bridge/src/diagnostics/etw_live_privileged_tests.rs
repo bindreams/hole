@@ -259,3 +259,121 @@ fn periodic_tick_rewarns_after_a_transient_failure_recovers() {
          logged as \"still failing\" instead; got:\n{output}"
     );
 }
+
+/// `EtwGuard::drop` must leave no live session behind even when
+/// `UserTrace::stop` never got as far as issuing STOP. Without the by-name
+/// backstop the session stays live, which is what leaves `ProcessTrace` — and
+/// therefore the `join()` after this call — with nothing to return for.
+///
+/// Driven through the real `Drop`, over a real session, with `trace: None` —
+/// the guard state that arm sees. A genuine `CloseTrace` failure cannot be
+/// manufactured from outside ferrisetw (`UserTrace` has no constructor taking
+/// a handle), so this drives the same `stop_issued == false` branch directly.
+/// Remove the backstop and the post-drop query below still answers.
+#[cfg(target_os = "windows")]
+#[skuld::test(labels = [TUN], serial = TUN)]
+fn etw_guard_drop_stops_a_session_usertrace_stop_left_running() {
+    const PREFIX: &str = "hole-etw-live-stats-test-stop-by-name-";
+    crate::diagnostics::etw_sweep::sweep_sessions_with_prefix(PREFIX, "etw-test");
+
+    let writer = VecWriter::new();
+    let subscriber = tracing_subscriber::registry().with(
+        fmt::layer()
+            .with_writer(writer.clone())
+            .with_ansi(false)
+            .with_filter(tracing_subscriber::filter::LevelFilter::INFO),
+    );
+    let _guard = set_default_in_current_thread(subscriber);
+
+    let session_name = format!("{PREFIX}{}", std::process::id());
+    let provider = Provider::by_guid(TCPIP_PROVIDER)
+        .any(TCPIP_KEYWORDS)
+        .add_callback(|_record: &EventRecord, _schema_locator: &SchemaLocator| {})
+        .build();
+    let trace_properties = TraceProperties {
+        buffer_size: 256,
+        ..Default::default()
+    };
+    // Bound to `_trace`, not `_`: the latter would drop the session at the end
+    // of this statement (ferrisetw's own `Drop` stops it), leaving the backstop
+    // nothing to prove itself against. No processing thread is needed — the
+    // claim under test is kernel-side session state, which `ControlTraceW`
+    // reads and writes independently of user-mode buffer draining. The
+    // end-of-scope `Drop` lands after the assertions and ignores its own error.
+    let _trace = UserTrace::new()
+        .named(session_name.clone())
+        .set_trace_properties(trace_properties)
+        .enable(provider)
+        .start()
+        .expect("start a real ETW session (requires admin or Performance Log Users)");
+
+    let before = query_session_stats(&session_name, "live");
+    assert!(before.is_ok(), "the session must be live before the drop: {before:?}");
+
+    drop(EtwGuard {
+        trace: None,
+        thread: None,
+        session_name: session_name.clone(),
+        stats_tx: None,
+        stats_thread: None,
+    });
+
+    let after = query_session_stats(&session_name, "live");
+    assert!(
+        after.is_err(),
+        "the session must be gone once EtwGuard::drop has run -- a drop that only reports the \
+         failed handle stop leaves the session registered in the kernel: {after:?}"
+    );
+
+    let output = writer.snapshot_string();
+    assert!(
+        output.contains("etw: stopped session by name"),
+        "expected the by-name stop to be logged as the path that took the session down; got:\n{output}"
+    );
+}
+
+/// The healthy path must leave nothing behind either, and must not need the
+/// backstop to do it: `UserTrace::stop` issued STOP, so re-issuing it by name
+/// would only log a second, confusing line about a session already gone.
+/// Driven through a real [`EtwGuard`] — session, processing thread and stats
+/// timer — from `start_consumer_for_test`.
+#[cfg(target_os = "windows")]
+#[skuld::test(labels = [TUN], serial = TUN)]
+fn etw_guard_drop_stops_the_session_it_started() {
+    const PREFIX: &str = "hole-etw-live-stats-test-drop-stops-";
+    crate::diagnostics::etw_sweep::sweep_sessions_with_prefix(PREFIX, "etw-test");
+
+    let writer = VecWriter::new();
+    let subscriber = tracing_subscriber::registry().with(
+        fmt::layer()
+            .with_writer(writer.clone())
+            .with_ansi(false)
+            .with_filter(tracing_subscriber::filter::LevelFilter::INFO),
+    );
+    let _guard = set_default_in_current_thread(subscriber);
+
+    let session_name = format!("{PREFIX}{}", std::process::id());
+    let etw_guard = start_consumer_for_test(session_name.clone(), LIVE_STATS_INTERVAL, |_| {})
+        .expect("start a real ETW session (requires admin or Performance Log Users)");
+
+    let before = query_session_stats(&session_name, "live");
+    assert!(before.is_ok(), "the session must be live before the drop: {before:?}");
+
+    drop(etw_guard);
+
+    let after = query_session_stats(&session_name, "live");
+    assert!(
+        after.is_err(),
+        "the session must be gone once EtwGuard::drop has run: {after:?}"
+    );
+
+    let output = writer.snapshot_string();
+    assert!(
+        !output.contains("etw: stopped session by name"),
+        "the healthy path must not reach the by-name backstop; got:\n{output}"
+    );
+    assert!(
+        !output.contains("etw: UserTrace::stop failed during drop"),
+        "UserTrace::stop must succeed on the healthy path; got:\n{output}"
+    );
+}

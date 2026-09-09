@@ -735,3 +735,38 @@ fn provider_name_unknown_returns_guid_string() {
     );
     assert_ne!(got, "unknown", "must preserve GUID, not return literal \"unknown\"");
 }
+
+// Session stop ========================================================================================================
+
+/// `is_session_not_found` must recognise `ERROR_WMI_INSTANCE_NOT_FOUND` in the
+/// form ferrisetw actually delivers it: `io::Error::from_raw_os_error` of the
+/// *`HRESULT`*, not of the Win32 code. The literals are spelled out rather
+/// than built with `to_hresult()` so this pins the encoding instead of
+/// restating the implementation — `0x8007_1069` is `FACILITY_WIN32` (`0x7`)
+/// plus `ERROR_WMI_INSTANCE_NOT_FOUND` (`4201` = `0x1069`).
+///
+/// A regression here is silent: the by-name stop's expected outcome starts
+/// logging at `warn!` as if the session had been left behind.
+#[skuld::test]
+fn session_not_found_is_recognised_in_its_hresult_form() {
+    let not_found = TraceError::EtwNativeError(EvntraceNativeError::IoError(std::io::Error::from_raw_os_error(
+        0x8007_1069_u32 as i32,
+    )));
+    assert!(is_session_not_found(&not_found));
+}
+
+/// Everything that is not "no such session" must stay a real failure — a
+/// blanket `true` would hide a session we genuinely could not reclaim.
+/// `0x8007_0005` is `ERROR_ACCESS_DENIED`, the plausible other answer to a
+/// STOP the bridge is not privileged for.
+#[skuld::test]
+fn other_stop_failures_are_not_read_as_already_stopped() {
+    let denied = TraceError::EtwNativeError(EvntraceNativeError::IoError(std::io::Error::from_raw_os_error(
+        0x8007_0005_u32 as i32,
+    )));
+    assert!(!is_session_not_found(&denied));
+    // The bare Win32 code, unconverted: the mistake this pair exists to catch.
+    let unconverted = TraceError::EtwNativeError(EvntraceNativeError::IoError(std::io::Error::from_raw_os_error(4201)));
+    assert!(!is_session_not_found(&unconverted));
+    assert!(!is_session_not_found(&TraceError::InvalidTraceName));
+}

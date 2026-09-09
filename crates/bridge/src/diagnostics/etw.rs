@@ -60,12 +60,13 @@
 //!    channel wakes it immediately, not after the rest of the current
 //!    interval) and joins it, THEN reads session statistics one final time
 //!    via `ControlTraceW(EVENT_TRACE_CONTROL_QUERY)` ([`query_session_stats`])
-//!    before calling `UserTrace::stop` (which signals the kernel to stop
-//!    delivering events) and joining the processing thread, guaranteeing the
-//!    callback drains the pending event queue before shutdown completes.
+//!    before stopping the session ([`EtwGuard::stop_session`], which signals
+//!    the kernel to stop delivering events) and joining the processing thread,
+//!    guaranteeing the callback drains the pending event queue before shutdown
+//!    completes.
 //!    Stopping the timer thread first is load-bearing, not incidental: it
-//!    guarantees no periodic tick can still be mid-query when `trace.stop()`
-//!    runs, so the two `query_session_stats` callers (periodic, drop-time)
+//!    guarantees no periodic tick can still be mid-query when the session is
+//!    stopped, so the two `query_session_stats` callers (periodic, drop-time)
 //!    never race the session teardown and no lock needs to serialize them.
 //!    Each stats query surfaces `EventsLost`, `BuffersWritten`,
 //!    `LogBuffersLost`, and `RealTimeBuffersLost` as a diagnostic
@@ -103,6 +104,14 @@
 //!   by the kernel, `process_from_handle` returns, our thread exits, and
 //!   `JoinHandle::join` returns.
 //!
+//! `UserTrace::stop` does not by itself guarantee that last step: it chains
+//! `CloseTrace` and `ControlTraceW(STOP)` with `?`, so any `CloseTrace` error
+//! short-circuits before STOP is issued — leaving the session live, the
+//! failed close having released nothing, and `process_from_handle` with
+//! nothing left to return for. [`EtwGuard::stop_session`] closes that gap by
+//! re-issuing STOP by name; see its doc for what is and is not established
+//! about the trigger.
+//!
 //! # Failure mode
 //!
 //! ETW diagnostics are best-effort but **not silent** on infrastructure
@@ -135,10 +144,11 @@
 //! TCPIP severity.
 
 use dump::{dump, DeriveDump};
+use ferrisetw::native::EvntraceNativeError;
 use ferrisetw::parser::Parser;
 use ferrisetw::provider::Provider;
 use ferrisetw::schema_locator::SchemaLocator;
-use ferrisetw::trace::{TraceProperties, TraceTrait, UserTrace};
+use ferrisetw::trace::{stop_trace_by_name, TraceError, TraceProperties, TraceTrait, UserTrace};
 use ferrisetw::{EventRecord, GUID};
 use std::borrow::Cow;
 use std::net::{IpAddr, SocketAddr};
@@ -288,8 +298,8 @@ pub struct EtwGuard {
     // `UserTrace::stop(self)` (which takes `self` by value).
     trace: Option<UserTrace>,
     thread: Option<JoinHandle<()>>,
-    /// Session name saved at construction time so
-    /// `query_session_stats` can look it up in Drop without holding a
+    /// Session name saved at construction time so `query_session_stats` and
+    /// [`EtwGuard::stop_session`] can look it up in Drop without holding a
     /// reference into `trace`.
     session_name: String,
     /// Dropping this closes the channel, waking the stats timer thread's
@@ -303,7 +313,7 @@ impl Drop for EtwGuard {
     fn drop(&mut self) {
         // Stop the periodic timer thread FIRST and join it, so no live-phase
         // query can still be in flight when the stop-phase query and
-        // trace.stop() below run — see module doc "Drop's added wait".
+        // `stop_session` below run — see module doc "Drop's added wait".
         drop(self.stats_tx.take());
         if let Some(stats_thread) = self.stats_thread.take() {
             if let Err(e) = stats_thread.join() {
@@ -327,11 +337,8 @@ impl Drop for EtwGuard {
             }
         }
 
-        if let Some(trace) = self.trace.take() {
-            if let Err(e) = trace.stop() {
-                warn!(error = ?e, "etw: UserTrace::stop failed during drop");
-            }
-        }
+        self.stop_session();
+
         if let Some(thread) = self.thread.take() {
             // The processing thread exits once the kernel acknowledges
             // STOP, which drains pending events through our callback.
@@ -342,6 +349,83 @@ impl Drop for EtwGuard {
             }
         }
         info!("etw: consumer stopped");
+    }
+}
+
+impl EtwGuard {
+    /// Stop the kernel-side session, whatever [`UserTrace::stop`] managed.
+    ///
+    /// `UserTrace::stop` is `close_trace(..)?; control_trace(.., STOP)?`
+    /// (ferrisetw 1.2.0, `src/trace.rs:359-366`), so **any** `CloseTrace` error
+    /// other than `ERROR_CTX_CLOSE_PENDING` short-circuits before the STOP is
+    /// issued — and that combination leaves `ProcessTrace` with no exit
+    /// condition at all. MSDN gives a real-time consumer two: a `CloseTrace`
+    /// that took effect, and the controller stopping the session. The first
+    /// just failed; the second was skipped. `Drop`'s `join()` on the
+    /// processing thread then blocks forever, deterministically.
+    ///
+    /// That matters beyond a leaked session because `Drop` runs inside
+    /// `run_service`'s async block (`platform::windows`, where the guard is
+    /// held across every `.await`), after `pm.stop_with(event)` and before the
+    /// SCM `Stopped` report: a bridge hung there never reports `Stopped`, so
+    /// `stop()`'s `NotifyServiceStatusChangeW` — and the MSI uninstall's custom
+    /// action behind it — wedges.
+    ///
+    /// **The trigger is unestablished, not the consequence.** MSDN documents
+    /// only `ERROR_INVALID_HANDLE` and the pre-Vista `ERROR_BUSY` for
+    /// `CloseTrace`, and ferrisetw's own `InvalidHandle` arm re-runs
+    /// `open_trace`'s accept predicate, which a handle `open_trace` returned
+    /// cannot fail. So this is a backstop for a reachable code shape, not a
+    /// reproduction of bindreams/hole#978 — and it does not close it: a kernel
+    /// that never acknowledges a *correctly issued* STOP still hangs the same
+    /// two bare `join()`s (bindreams/hole#1016).
+    fn stop_session(&mut self) {
+        let stop_issued = match self.trace.take() {
+            Some(trace) => match trace.stop() {
+                Ok(()) => true,
+                Err(e) => {
+                    warn!(error = ?e, session = %self.session_name, "etw: UserTrace::stop failed during drop");
+                    false
+                }
+            },
+            None => false,
+        };
+        if !stop_issued {
+            stop_session_by_name(&self.session_name);
+        }
+    }
+}
+
+/// Issue `ControlTraceW(EVENT_TRACE_CONTROL_STOP)` against a session by name.
+///
+/// Best-effort, like [`sweep_stale_sessions`]: `ERROR_WMI_INSTANCE_NOT_FOUND`
+/// is the outcome we asked for and only earns a `debug!`; anything else is a
+/// session we failed to reclaim.
+fn stop_session_by_name(session_name: &str) {
+    match stop_trace_by_name(session_name) {
+        Ok(()) => info!(session = %session_name, "etw: stopped session by name"),
+        Err(e) if is_session_not_found(&e) => {
+            debug!(session = %session_name, "etw: session already stopped");
+        }
+        Err(e) => warn!(error = ?e, session = %session_name, "etw: failed to stop session by name"),
+    }
+}
+
+/// Does `e` mean "no such session"?
+///
+/// ferrisetw builds its native errors with
+/// `io::Error::from_raw_os_error(HRESULT)` — the `HRESULT` form of the Win32
+/// code, not the code itself — so the comparison has to convert too. Getting
+/// this wrong costs a spurious `warn!` on the expected path, not a behaviour
+/// change, which is why it is pinned by a test rather than by review.
+fn is_session_not_found(e: &TraceError) -> bool {
+    use windows::Win32::Foundation::ERROR_WMI_INSTANCE_NOT_FOUND;
+
+    match e {
+        TraceError::EtwNativeError(EvntraceNativeError::IoError(io)) => {
+            io.raw_os_error() == Some(ERROR_WMI_INSTANCE_NOT_FOUND.to_hresult().0)
+        }
+        _ => false,
     }
 }
 
