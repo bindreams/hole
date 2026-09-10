@@ -288,10 +288,18 @@ fn release_covers_with(
         ));
     };
     let mut held = vec![liveness];
+    let mut probed: Vec<&Path> = vec![state_dir];
     for peer in peers {
-        if peer == state_dir || !peer.exists() {
+        // Skip a path already probed. The lock contends per open handle, not
+        // per owning process (`tun_engine::exclusive`'s module doc), so
+        // probing one twice would answer "a bridge is running" against this
+        // call's own guard — and duplicates are ordinary, not exotic: an
+        // un-elevated run resolves `default_state_dir` and the real user's dir
+        // to the same path.
+        if probed.contains(&peer.as_path()) || !peer.exists() {
             continue;
         }
+        probed.push(peer.as_path());
         match crate::liveness::BridgeLiveness::try_acquire(peer, None) {
             Ok(Some(guard)) => held.push(guard),
             Ok(None) => {

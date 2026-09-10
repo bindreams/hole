@@ -310,6 +310,29 @@ fn release_covers_does_not_provision_a_peer_state_dir_that_is_absent() {
     assert!(!absent.exists(), "an absent peer dir must be skipped, not created");
 }
 
+/// The liveness lock contends per open handle, not per owning process, so a
+/// path probed twice would refuse against this call's OWN guard. Duplicates are
+/// ordinary: an un-elevated run resolves `default_state_dir` and the real
+/// user's dir to one and the same path, and the service dir can appear in the
+/// peer list too.
+#[skuld::test]
+fn release_covers_does_not_refuse_against_its_own_guard() {
+    let service = tempfile::tempdir().unwrap();
+    let peer = tempfile::tempdir().unwrap();
+    let peers = vec![
+        service.path().to_path_buf(),
+        peer.path().to_path_buf(),
+        peer.path().to_path_buf(),
+    ];
+
+    let result = release_covers_with(service.path(), &peers, || Ok(()), || {});
+
+    assert!(
+        result.is_ok(),
+        "a repeated peer path must not read as a live bridge: {result:?}"
+    );
+}
+
 #[skuld::test]
 fn release_covers_records_the_target_off_before_releasing() {
     let dir = tempfile::tempdir().unwrap();
