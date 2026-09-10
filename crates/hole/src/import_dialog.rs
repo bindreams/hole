@@ -134,6 +134,7 @@ pub fn describe_failure(failure: &ImportFailure) -> FailureMessage {
 /// What an import attempt did, as the dashboard needs to hear it: the
 /// servers to render and auto-test, and how many files failed (each of
 /// which the user has already seen a dialog for).
+///
 /// `Serialize` derived and holding `ServerEntry`, so CONTRIBUTING's ladder
 /// rule reads as "this needs a `Dump` impl". It does not, and must not get
 /// one: `crates/hole` has no `dump` dependency, so no `dump!` can reach this
