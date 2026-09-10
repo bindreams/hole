@@ -2001,11 +2001,19 @@ Spotlight "Hole" must reveal it.
   the tests nextest's JUnit reports say actually executed (present, not
   `<skipped>`) and fails by exact name on any that never appear (#999). The
   group spans BOTH `SKULD_LABELS` lanes — the name-substring filter deliberately
-  sweeps in unprivileged cases — and every lane overwrites the one
-  `[profile.default.junit]` path, so ci.yaml copies each lane's report aside and
-  the guard reads their union. Windows leg only: extending it to the darwin legs
-  needs the same per-lane copies and its own budget measurement against those
-  jobs' walls.
+  sweeps in unprivileged cases — and every lane run under the SAME nextest
+  profile would overwrite the last one's JUnit report. ci.yaml instead runs
+  each lane under its own nextest profile (`non-tun` / `tun`, selected via the
+  `NEXTEST_PROFILE` env var so the two lanes' command text still matches
+  `ci_test_hole_steps_match_the_hole_tests_target`), an empty table that
+  inherits `[profile.default.junit]`'s path and every override via nextest's
+  own profile-inheritance model; each profile therefore keeps its own report,
+  and the guard reads their union. This also keeps a privileged (`sudo`) lane's
+  JUnit report confined to its own profile directory rather than the one an
+  unprivileged rerun would write to next, avoiding a root-owned file blocking
+  a later unprivileged `cargo nextest run`. Windows leg only: extending it to
+  the darwin legs needs the same per-lane profiles and its own budget
+  measurement against those jobs' walls.
 
 ### Datapath coverage: which lane proves what
 

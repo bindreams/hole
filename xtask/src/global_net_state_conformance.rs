@@ -30,10 +30,14 @@
 //! `.config/nextest.toml` filter selects by name substring and deliberately
 //! sweeps in unprivileged cases (`release_all_`, `gateway_global_net_state_`)
 //! that carry no `tun` label, so they run in the `"!tun"` step while the
-//! privileged members run in the `"tun"` one. Every lane writes the same
-//! `target/nextest/default/junit.xml`, each overwriting the last, so the
-//! report a single lane leaves behind can never account for the whole group.
-//! ci.yaml therefore copies each lane's report aside and hands guard 3 all of
+//! privileged members run in the `"tun"` one. A single nextest profile writes
+//! one JUnit path, each run overwriting the last, so a lone lane's report can
+//! never account for the whole group on its own. ci.yaml instead runs each
+//! lane under its own nextest profile (`non-tun` / `tun`, selected by the
+//! `NEXTEST_PROFILE` env var — an empty profile table inherits
+//! `[profile.default.junit]`'s path and every override, including this
+//! group's `max-threads = 1`, via nextest's own profile-inheritance model),
+//! so each lane's report survives at its own path and hands guard 3 both of
 //! them; [`merge_executed`] merges them back into the one set the job as a
 //! whole executed.
 //!
@@ -196,80 +200,44 @@ pub(crate) fn set_mismatch(
     out
 }
 
-// verify ==============================================================================================================
+// conformant_membership ===============================================================================================
 
-/// Run guard 2 for `job_id`: confirm the `global_net_state` test-group's
-/// `max-threads` is still `1`, then confirm its nextest.toml name-substring
-/// filter and its skuld label select the exact same live tests. Fails
-/// loudly, by exact test name in both directions per binary, on any
-/// divergence.
-///
-/// `record` additionally writes the verified membership out for guard 3
-/// ([`verify_executed`]) to read after the test steps have run — see this
-/// module's doc for why guard 3 does not list it again itself. Written only
-/// once the conformance check above has passed, so the file never carries a
-/// set this guard would have rejected.
-pub fn verify(repo_root: &Path, job_id: &str, record: Option<&Path>) -> Result<()> {
-    let ci_yaml = std::fs::read_to_string(repo_root.join(".github/workflows/ci.yaml")).context("read ci.yaml")?;
-    let nextest_toml =
-        std::fs::read_to_string(repo_root.join(".config/nextest.toml")).context("read .config/nextest.toml")?;
-    let manifest = Manifest::parse(&std::fs::read_to_string(repo_root.join("build.yaml")).context("read build.yaml")?)
-        .context("parse build.yaml")?;
-
-    let cfg = group_config(&nextest_toml, LABEL_NAME)?;
-    ensure!(
-        cfg.max_threads == 1,
-        "test-group {LABEL_NAME:?} has max-threads={}, not 1 — cross-binary serialization of the \
-         global OS network state these tests mutate is OFF (bindreams/hole#894)",
-        cfg.max_threads
-    );
-
-    let template = job_list_template(&ci_yaml, &manifest, job_id)?;
-    let name_matched = run_nextest_list(repo_root, &narrow_filter(&template, &cfg.filter)?, None)?;
-    let label_matched = run_nextest_list(repo_root, &template, Some(LABEL_NAME))?;
-
-    // A silent empty/empty pass (both sides select nothing everywhere) would
-    // defeat this guard exactly as a zero-match `SKULD_LABELS` does elsewhere
-    // in this codebase (bindreams/hole#865 audit finding 4) — assert real
-    // signal exists before trusting the diff below.
+/// Guard 2's pass/fail verdict, reduced to its two live listings so it is
+/// unit-testable without a `cargo nextest list` subprocess. `Ok` only once
+/// (a) at least one side matched something — a vacuous empty/empty pass
+/// would defeat the guard exactly as a real divergence would (bindreams/
+/// hole#865 audit finding 4) — and (b) the two sides agree exactly, binary-id
+/// for binary-id (bindreams/hole#894). Returns `label_matched` back on
+/// success: the exact value [`verify`]'s `--record` branch writes out for
+/// guard 3 (bindreams/hole#999) to read, so any caller holding `Ok` already
+/// has proof its result is not vacuously empty — pinned directly by this
+/// function's own tests, which is the property M5 (bindreams/hole#999) named:
+/// an empty `--record` write would make guard 3's diff trivially pass no
+/// matter what actually ran.
+pub(crate) fn conformant_membership(
+    name_matched: BTreeMap<String, BTreeSet<String>>,
+    label_matched: BTreeMap<String, BTreeSet<String>>,
+    job_id: &str,
+    filter: &str,
+) -> Result<BTreeMap<String, BTreeSet<String>>> {
     let any_name_matched = name_matched.values().any(|s| !s.is_empty());
     let any_label_matched = label_matched.values().any(|s| !s.is_empty());
     ensure!(
         any_name_matched || any_label_matched,
-        "job {job_id:?}: neither the nextest.toml filter {:?} nor the {LABEL_NAME:?} label selected \
+        "job {job_id:?}: neither the nextest.toml filter {filter:?} nor the {LABEL_NAME:?} label selected \
          ANY test — guard 2 has nothing to verify, which defeats it as surely as a real divergence \
-         would (bindreams/hole#894)",
-        cfg.filter
+         would (bindreams/hole#894)"
     );
 
     let mismatches = set_mismatch(&name_matched, &label_matched);
     if mismatches.is_empty() {
-        println!(
-            "xtask: global_net_state label conformance OK for job {job_id:?} — the nextest.toml \
-             filter and the {LABEL_NAME:?} label select the exact same tests"
-        );
-        if let Some(path) = record {
-            let path = absolutize(repo_root, path);
-            write_expectation(
-                &path,
-                &Expectation {
-                    job: job_id.to_string(),
-                    tests: label_matched,
-                },
-            )?;
-            println!(
-                "xtask: recorded the group's membership for the execution proof at {}",
-                path.display()
-            );
-        }
-        return Ok(());
+        return Ok(label_matched);
     }
 
     let mut msg = format!(
-        "job {job_id:?}: the .config/nextest.toml filter {:?} and the {LABEL_NAME:?} skuld label \
+        "job {job_id:?}: the .config/nextest.toml filter {filter:?} and the {LABEL_NAME:?} skuld label \
          select DIFFERENT tests — a rename or a missing/extra label has drifted the group's \
-         membership (bindreams/hole#894):\n",
-        cfg.filter
+         membership (bindreams/hole#894):\n"
     );
     for (binary_id, (name_only, label_only)) in &mismatches {
         msg.push_str(&format!("  {binary_id}:\n"));
@@ -287,17 +255,89 @@ pub fn verify(repo_root: &Path, job_id: &str, record: Option<&Path>) -> Result<(
     bail!(msg)
 }
 
-// junit_executed_tests (bindreams/hole#999) ===========================================================================
+// verify ==============================================================================================================
+
+/// Run guard 2 for `job_id`: confirm the `global_net_state` test-group's
+/// `max-threads` is still `1`, then confirm its nextest.toml name-substring
+/// filter and its skuld label select the exact same live tests
+/// ([`conformant_membership`]). Fails loudly, by exact test name in both
+/// directions per binary, on any divergence.
+///
+/// `record` additionally writes the verified membership out for guard 3
+/// ([`verify_executed`]) to read after the test steps have run — see this
+/// module's doc for why guard 3 does not list it again itself. Written only
+/// once the conformance check above has passed, so the file never carries a
+/// set this guard would have rejected.
+pub fn verify(repo_root: &Path, job_id: &str, record: Option<&Path>) -> Result<()> {
+    verify_with(repo_root, job_id, record, run_nextest_list)
+}
+
+/// [`verify`]'s body with its one subprocess call (`cargo nextest list`)
+/// taken as a parameter, so it is unit-testable against a fake `list`
+/// without a real nextest binary — the file reads above it are plain text
+/// (ci.yaml, .config/nextest.toml, build.yaml), cheap to fixture directly.
+pub(crate) fn verify_with(
+    repo_root: &Path,
+    job_id: &str,
+    record: Option<&Path>,
+    list: impl Fn(&Path, &[String], Option<&str>) -> Result<BTreeMap<String, BTreeSet<String>>>,
+) -> Result<()> {
+    let ci_yaml = std::fs::read_to_string(repo_root.join(".github/workflows/ci.yaml")).context("read ci.yaml")?;
+    let nextest_toml =
+        std::fs::read_to_string(repo_root.join(".config/nextest.toml")).context("read .config/nextest.toml")?;
+    let manifest = Manifest::parse(&std::fs::read_to_string(repo_root.join("build.yaml")).context("read build.yaml")?)
+        .context("parse build.yaml")?;
+
+    let cfg = group_config(&nextest_toml, LABEL_NAME)?;
+    ensure!(
+        cfg.max_threads == 1,
+        "test-group {LABEL_NAME:?} has max-threads={}, not 1 — cross-binary serialization of the \
+         global OS network state these tests mutate is OFF (bindreams/hole#894)",
+        cfg.max_threads
+    );
+
+    let template = job_list_template(&ci_yaml, &manifest, job_id)?;
+    let name_matched = list(repo_root, &narrow_filter(&template, &cfg.filter)?, None)?;
+    let label_matched = list(repo_root, &template, Some(LABEL_NAME))?;
+
+    let label_matched = conformant_membership(name_matched, label_matched, job_id, &cfg.filter)?;
+    println!(
+        "xtask: global_net_state label conformance OK for job {job_id:?} — the nextest.toml \
+         filter and the {LABEL_NAME:?} label select the exact same tests"
+    );
+    if let Some(path) = record {
+        let path = absolutize(repo_root, path);
+        write_expectation(
+            &path,
+            &Expectation {
+                job: job_id.to_string(),
+                tests: label_matched,
+            },
+        )?;
+        println!(
+            "xtask: recorded the group's membership for the execution proof at {}",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+// junit_executed_tests ================================================================================================
 
 /// Per `<testsuite>`'s testcases' `classname` — nextest emits the same
 /// `binary_id` shape here as `cargo nextest list --message-format json`'s
 /// map key (e.g. `hole-bridge::cutover_leak_privileged`), confirmed against
 /// nextest-runner's own JUnit writer — the set of `name`s that appear as
 /// EXECUTED: present in the report and carrying no `<skipped>` child. A
-/// `<failure>` child still counts as executed; only `<skipped>` does not
-/// (nextest's `report-skipped` policy defaults to emitting none of these at
-/// all, so in practice a skipped entry here means an explicit opt-in
-/// elsewhere — the check does not assume that policy).
+/// `<failure>` child still counts as executed; only `<skipped>` does not. On
+/// the nextest version pinned by this repo, a test that did not run is simply
+/// ABSENT from the report rather than present with a `<skipped>` child —
+/// confirmed for both filter exclusion and fail-fast cancellation, so absence
+/// is the signal [`set_missing`] actually keys on. The `<skipped>`-child
+/// branch below is not reachable today; it is kept forward-defensive against
+/// a JUnit producer that does emit them, not attributed to any nextest
+/// config key — `[profile.default.junit].report-skipped` is not one; nextest
+/// rejects it as an unrecognized key.
 pub(crate) fn junit_executed_tests(xml: &str) -> Result<BTreeMap<String, BTreeSet<String>>> {
     let doc = Document::parse(xml).context("parsing JUnit XML report")?;
 
@@ -318,7 +358,7 @@ pub(crate) fn junit_executed_tests(xml: &str) -> Result<BTreeMap<String, BTreeSe
     Ok(out)
 }
 
-// set_missing (bindreams/hole#999) ====================================================================================
+// set_missing =========================================================================================================
 
 /// Per binary-id, the `expected` tests that `executed` doesn't have — the
 /// one-directional counterpart of [`set_mismatch`]: `executed` may
@@ -340,7 +380,7 @@ pub(crate) fn set_missing(
     out
 }
 
-// merge_executed (bindreams/hole#999) =================================================================================
+// merge_executed ======================================================================================================
 
 /// Every test any lane's report says executed, merged per binary-id. The
 /// group spans both `SKULD_LABELS` lanes, so this — not any single report —
@@ -355,7 +395,7 @@ pub(crate) fn merge_executed(reports: &[BTreeMap<String, BTreeSet<String>>]) -> 
     out
 }
 
-// Recorded expectation (bindreams/hole#999) ===========================================================================
+// Recorded expectation ================================================================================================
 
 /// The `global_net_state` group's live membership as guard 2 verified it,
 /// handed across ci.yaml steps to guard 3.
@@ -397,15 +437,15 @@ pub(crate) fn read_expectation(path: &Path) -> Result<Expectation> {
     serde_json::from_str(&json).with_context(|| format!("parsing the recorded expectation at {}", path.display()))
 }
 
-// verify_executed (bindreams/hole#999) ================================================================================
+// verify_executed =====================================================================================================
 
 /// Run guard 3: read the `global_net_state` membership guard 2 recorded
 /// before the test steps ran, then confirm every one of those tests appears
 /// as executed (non-skipped) in at least one of `junit_paths` — the per-lane
-/// JUnit reports ci.yaml copied aside after each `cargo nextest run`. Paths
-/// are resolved against `repo_root` when relative. Fails loudly, by exact
-/// test name, on any that don't: proof the job didn't just SELECT these tests
-/// but actually RAN them.
+/// JUnit reports each lane's own nextest profile wrote (see this module's
+/// doc). Paths are resolved against `repo_root` when relative. Fails loudly,
+/// by exact test name, on any that don't: proof the job didn't just SELECT
+/// these tests but actually RAN them.
 pub fn verify_executed(repo_root: &Path, expected_path: &Path, junit_paths: &[PathBuf]) -> Result<()> {
     ensure!(
         !junit_paths.is_empty(),

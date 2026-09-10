@@ -370,10 +370,11 @@ pub enum Command {
         #[arg(long)]
         expected: PathBuf,
         /// One nextest JUnit report per `SKULD_LABELS` lane, relative to the
-        /// repo root unless absolute. The group spans BOTH lanes and every
-        /// lane overwrites `[profile.default.junit].path`, so the reports
-        /// must be copied aside per lane and all passed here — see
-        /// `xtask::global_net_state_conformance`. Repeat the flag per lane.
+        /// repo root unless absolute. The group spans BOTH lanes, and each
+        /// lane runs under its own nextest profile so its report lands at
+        /// its own path instead of being overwritten by the other lane's —
+        /// see `xtask::global_net_state_conformance`. Repeat the flag per
+        /// lane.
         #[arg(long = "junit", required = true)]
         junits: Vec<PathBuf>,
     },

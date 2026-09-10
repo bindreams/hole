@@ -404,13 +404,10 @@ jobs:
       # intermittent flake, not the rename that caused it — see
       # bindreams/hole#894.
       #
-      # `--record` additionally writes the membership it just verified out for
-      # the execution proof below (bindreams/hole#999) to read back. Taken
-      # HERE, before the test steps: the listing is the same one this guard
-      # already computes, and re-deriving it afterwards would both cost a
-      # second `cargo nextest list` (64s-3m30s measured on this leg, which
-      # runs closest to its job wall) and introduce a second, unverified
-      # derivation of the very set this guard exists to pin.
+      # `--record` writes the membership just verified for guard 3 (below) to
+      # read back after the test steps — see `verify` in
+      # global_net_state_conformance.rs for why it isn't re-listed there
+      # instead. bindreams/hole#999.
       - name: Verify global_net_state label matches the nextest.toml filter
         shell: bash
         run: >
@@ -448,21 +445,52 @@ jobs:
       # smaller than the margin, and a per-leg matrix entry here would have to
       # be kept in step with the job budgets above for no measured gain.
       #
-      # DISCLOSED RESIDUAL: these are not a guarantee that the step always
-      # loses the race to the job wall. On the windows leg (60) a hung TUN step
-      # can still reach the wall first when the build and non-TUN steps both
-      # run long (17 + 4 + 19 + 25 + 3 = 68, the trailing 3 being the #999
-      # execution proof below). Bounding that away would mean either budgets
-      # too tight to survive an honest slow run or a wall raised past what the
-      # measurements support, so it is left stated rather than fixed; the
-      # common case — one step hangs while the others run normally — is
-      # covered on every leg.
+      # DISCLOSED RESIDUAL (hung TUN step): these are not a guarantee that the
+      # step always loses the race to the job wall. On the windows leg (60) a
+      # hung TUN step can still reach the wall first when the build and
+      # non-TUN steps both run long (17 + 4 + 19 + 25 = 65, already past the
+      # wall on its own). The #999 execution proof step below does NOT add to
+      # this sum: its `if:` names no status function, so GitHub ANDs in
+      # `success()`, and a failed/timed-out TUN step makes that condition
+      # false — the proof step is skipped, not run, and spends none of its
+      # budget. Bounding the 65 away would mean either budgets too tight to
+      # survive an honest slow run or a wall raised past what the measurements
+      # support, so it is left stated rather than fixed; the common case — one
+      # step hangs while the others run normally — is covered on every leg.
+      #
+      # DISCLOSED RESIDUAL (thin post-TUN margin): a SLOW-BUT-PASSING TUN step
+      # — one that stays under its own 25-minute step budget rather than
+      # hanging — reaches the #999 execution proof step with whatever wall
+      # remains after build + both verify steps + non-TUN + TUN, and the
+      # per-step budgets above do not bound that remainder: they cap each step
+      # alone, not their sum against the shared 60-minute wall. If what is
+      # left is under the proof step's own 3-minute budget, the JOB wall can
+      # kill the whole job mid-proof instead of letting the step's own timeout
+      # fail it cleanly — the exact #989/#970 failure mode this per-step
+      # design otherwise avoids: a bare `cancelled`, no log blob, destroying
+      # the evidence the proof step exists to produce. Narrowing this away has
+      # the same cost as the residual above and is left stated rather than
+      # fixed.
       - name: Test (non-TUN)
         id: test-non-tun
         timeout-minutes: 35
         shell: bash
         env:
           SKULD_LABELS: "!tun"
+          # Selects `.config/nextest.toml`'s `[profile.non-tun]`, an empty
+          # table that inherits `[profile.default.junit].path` and every
+          # `[[profile.default.overrides]]` entry — including the
+          # `global_net_state` test-group. Each profile writes its own JUnit
+          # report (`target/nextest/non-tun/junit.xml`), so this lane's
+          # report survives the TUN lane's run below rather than being
+          # overwritten by it; see that file's comment. Set via env rather
+          # than a `--profile` flag because
+          # `ci_test_hole_steps_match_the_hole_tests_target` holds every
+          # test-hole nextest step's command text equal to build.yaml's
+          # `hole-tests` target — `NEXTEST_PROFILE` is exempted from that
+          # comparison (`ci_nextest_parity::FINGERPRINT_NEUTRAL_ENV`) because
+          # nextest reads it at its own run/list time, never cargo's.
+          NEXTEST_PROFILE: non-tun
         run: >
           cargo nextest run --no-default-features
           --features tombstone/crash-dumps,tombstone/crash-child --no-fail-fast
@@ -472,20 +500,6 @@ jobs:
               + package(handle-holders) + package(tombstone)
               + package(hole-test-observability)'
 
-      # Every `cargo nextest run --profile default` overwrites the SAME
-      # `[profile.default.junit].path`, so the last lane to run is the only one
-      # whose report survives — and the `global_net_state` group spans both
-      # lanes (its `.config/nextest.toml` filter matches by name substring and
-      # deliberately sweeps in unprivileged `release_all_` /
-      # `gateway_global_net_state_` cases, which carry no `tun` label and so
-      # run HERE, not in the TUN step). Copying each lane's report aside is
-      # what lets the proof below account for the whole group instead of
-      # whichever fraction ran last. bindreams/hole#999.
-      - name: "Save the non-TUN lane's JUnit report (#999)"
-        if: matrix.os == 'windows' && matrix.arch == 'amd64'
-        shell: bash
-        run: cp target/nextest/default/junit.xml target/nextest/default/junit-non-tun.xml
-
       # Quoted: an unquoted ` #` opens a YAML comment and truncates the name.
       - name: "Test (TUN, runs last for #200)"
         if: matrix.os == 'windows' && matrix.arch == 'amd64'
@@ -494,6 +508,10 @@ jobs:
         shell: bash
         env:
           SKULD_LABELS: "tun"
+          # `.config/nextest.toml`'s `[profile.tun]` — see the non-TUN step's
+          # comment above; same inheritance, own JUnit report
+          # (`target/nextest/tun/junit.xml`).
+          NEXTEST_PROFILE: tun
         # `--no-fail-fast`: this lane serializes many independent real-OS-effect
         # tests behind one elevated token; one failure otherwise cancels the
         # rest of the run, hiding every verdict downstream of the first
@@ -510,24 +528,19 @@ jobs:
               + package(handle-holders) + package(tombstone)
               + package(hole-test-observability)'
 
-      - name: "Save the TUN lane's JUnit report (#999)"
-        if: matrix.os == 'windows' && matrix.arch == 'amd64'
-        shell: bash
-        run: cp target/nextest/default/junit.xml target/nextest/default/junit-tun.xml
-
       # Guard 2 above (`verify-global-net-state-labels`) only proves the
       # `global_net_state` group's tests were SELECTABLE; a job that silently
       # ran zero of them (e.g. nextest's own group/filter machinery
       # mis-scheduling on Windows) would still read as green. This diffs the
-      # membership guard 2 recorded against the two lane reports saved above
-      # and fails on any member that never shows up as executed —
-      # bindreams/hole#999.
+      # membership guard 2 recorded against the two lanes' own-profile JUnit
+      # reports above and fails on any member that never shows up as executed
+      # — bindreams/hole#999.
       #
-      # WINDOWS LEG ONLY, and the name says so: the darwin legs write the same
-      # single JUnit path and would need the same per-lane copies, but their
-      # job walls are the scarce resource this repo protects, so extending the
-      # proof there is a separate, separately-measured decision. Nothing here
-      # claims the group is proven executed anywhere else.
+      # WINDOWS LEG ONLY, and the name says so: the darwin legs would need
+      # their own pair of `non-tun`/`tun` profiles too, but their job walls
+      # are the scarce resource this repo protects, so extending the proof
+      # there is a separate, separately-measured decision. Nothing here claims
+      # the group is proven executed anywhere else.
       #
       # No status function in the `if:`, so GitHub ANDs in `success()`: when a
       # test step fails, this is skipped. Deliberate — the proof answers "did
@@ -546,8 +559,8 @@ jobs:
         run: >
           cargo xtask verify-global-net-state-executed
           --expected target/global-net-state-expected.json
-          --junit target/nextest/default/junit-non-tun.xml
-          --junit target/nextest/default/junit-tun.xml
+          --junit target/nextest/non-tun/junit.xml
+          --junit target/nextest/tun/junit.xml
 
       # macOS TUN lane runs UNDER ROOT: the lockdown real-engage test (#527)
       # drives `pfctl -E`/`-f`, which require root. The runner's cargo/nextest
@@ -559,13 +572,22 @@ jobs:
       # `--features` must match `Build hole test binaries` and the non-TUN
       # step above (see that comment) or cargo rebuilds instead of reusing
       # the prebuilt binaries.
+      # NEXTEST_PROFILE=tun (see the windows TUN step's comment above): this
+      # step runs under `sudo`, so without a lane-specific profile it would
+      # write a ROOT-owned `target/nextest/default/junit.xml` that no
+      # subsequent unprivileged `cargo nextest run` in this checkout could
+      # overwrite or clean up (exit 110) even though the tests themselves had
+      # already passed — the failure mode M1 in the #1012 review names. The
+      # darwin leg does not feed guard 3 (windows leg only, see below), but it
+      # is the ONLY step here that runs privileged, so it is the one place
+      # this problem can actually occur.
       - name: Test (TUN, macOS — root for pfctl)
         if: matrix.os == 'darwin'
         id: test-tun-macos
         timeout-minutes: 25
         shell: bash
         run: >
-          sudo env "PATH=$PATH" "HOME=$HOME" SKULD_LABELS=tun
+          sudo env "PATH=$PATH" "HOME=$HOME" SKULD_LABELS=tun NEXTEST_PROFILE=tun
           cargo nextest run --no-default-features
           --features tombstone/crash-dumps,tombstone/crash-child --no-fail-fast
           -E 'package(hole) + package(hole-bridge) + package(hole-common)

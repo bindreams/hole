@@ -39,10 +39,13 @@ use crate::manifest::Manifest;
 /// INVALIDATE rather than corrupt it? `PATH` passes on the second clause (a
 /// different rustc changes the fingerprint's version hash, so cargo rebuilds
 /// instead of reusing stale units), `HOME` only relocates `CARGO_HOME`, and
-/// `SKULD_LABELS` is read by skuld at test runtime. `RUSTFLAGS`, `RUSTC_WRAPPER`
-/// and `CARGO_TARGET_DIR` fail it. The test is asymmetric: rejecting a neutral
-/// variable is loud and costs one line here, admitting a relevant one is silent.
-pub const FINGERPRINT_NEUTRAL_ENV: [&str; 3] = ["HOME", "PATH", "SKULD_LABELS"];
+/// `SKULD_LABELS` is read by skuld at test runtime. `NEXTEST_PROFILE` is read
+/// by nextest itself at its own run/list time (`.config/nextest.toml`'s
+/// `[profile.<name>]` selection) — cargo never sees it, so it cannot affect
+/// what gets compiled. `RUSTFLAGS`, `RUSTC_WRAPPER` and `CARGO_TARGET_DIR` fail
+/// it. The test is asymmetric: rejecting a neutral variable is loud and costs
+/// one line here, admitting a relevant one is silent.
+pub const FINGERPRINT_NEUTRAL_ENV: [&str; 4] = ["HOME", "PATH", "SKULD_LABELS", "NEXTEST_PROFILE"];
 
 // Minimal `ci.yaml` shape — serde ignores every field we don't name, so this
 // tracks only `jobs.<id>.steps[].{name,id,run,env}`.

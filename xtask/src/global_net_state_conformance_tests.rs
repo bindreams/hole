@@ -1,16 +1,23 @@
 //! Unit tests for guard 2's structural building blocks (bindreams/hole#894):
-//! [`group_config`], [`job_list_template`], [`narrow_filter`], and
-//! [`set_mismatch`] — and guard 3's (bindreams/hole#999):
-//! [`junit_executed_tests`], [`merge_executed`], the recorded-expectation
-//! handoff, and [`set_missing`]. `verify`/`verify_executed` themselves are not
-//! unit-tested directly — every piece of logic they orchestrate is covered
-//! here.
+//! [`group_config`], [`job_list_template`], [`narrow_filter`],
+//! [`set_mismatch`], [`conformant_membership`], and [`verify_with`] itself —
+//! and guard 3's (bindreams/hole#999): [`junit_executed_tests`],
+//! [`merge_executed`], the recorded-expectation handoff, [`set_missing`], and
+//! [`verify_executed`] itself. Neither guard shells out to a real `cargo
+//! nextest list`/subprocess from a unit test — guard 3 only reads files, and
+//! guard 2's `verify` takes its one subprocess call as a parameter
+//! ([`verify_with`]), so a fake `list` closure stands in for it against a
+//! fixtured `.github/workflows/ci.yaml` / `.config/nextest.toml` /
+//! `build.yaml` on disk (plain-text reads, not a synthetic compilable
+//! workspace). [`verify`] itself is just `verify_with(..., run_nextest_list)`
+//! and is not separately tested.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
 
 use crate::global_net_state_conformance::{
-    group_config, job_list_template, junit_executed_tests, merge_executed, narrow_filter, read_expectation,
-    set_mismatch, set_missing, write_expectation, Expectation,
+    conformant_membership, group_config, job_list_template, junit_executed_tests, merge_executed, narrow_filter,
+    read_expectation, set_mismatch, set_missing, verify_executed, verify_with, write_expectation, Expectation,
 };
 use crate::manifest::Manifest;
 
@@ -423,4 +430,260 @@ fn read_expectation_names_the_recording_flag_when_the_file_is_absent() {
     let err = read_expectation(&dir.path().join("absent.json")).expect_err("should error");
     let msg = err.to_string();
     assert!(msg.contains("--record"), "{msg}");
+}
+
+// ===== verify_executed (bindreams/hole#999, guard 3 end-to-end) ======================================================
+
+/// A minimal JUnit report naming exactly the given `(classname, [name, ...])`
+/// testcases — enough for [`junit_executed_tests`] to parse, nothing else.
+fn junit_xml(entries: &[(&str, &[&str])]) -> String {
+    let mut testcases = String::new();
+    for (classname, names) in entries {
+        for name in *names {
+            testcases.push_str(&format!(
+                "    <testcase classname=\"{classname}\" name=\"{name}\" time=\"0.1\"/>\n"
+            ));
+        }
+    }
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<testsuites>\n  <testsuite name=\"suite\">\n{testcases}  \
+         </testsuite>\n</testsuites>\n"
+    )
+}
+
+/// Guard 3's whole point: a group member guard 2 recorded but that never
+/// shows up (non-skipped) in any lane's JUnit report must fail loudly, by
+/// name — a green job that silently ran fewer than expected must not pass.
+#[skuld::test]
+fn verify_executed_fails_when_a_group_member_never_appears_in_any_junit_report() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    write_expectation(
+        &dir.path().join("expected.json"),
+        &Expectation {
+            job: "test-hole".to_string(),
+            tests: binmap(&[("tun-engine", &["privileged_one", "unprivileged_two"])]),
+        },
+    )
+    .expect("record");
+    // Only one of the two expected tests appears in the (single) lane report.
+    std::fs::write(
+        dir.path().join("junit.xml"),
+        junit_xml(&[("tun-engine", &["privileged_one"])]),
+    )
+    .expect("write junit");
+
+    let err = verify_executed(dir.path(), Path::new("expected.json"), &[PathBuf::from("junit.xml")])
+        .expect_err("a missing group member must fail guard 3");
+    assert!(err.to_string().contains("unprivileged_two"), "{err}");
+}
+
+/// The green counterpart: every recorded group member appears somewhere
+/// across the lane reports (here split across two, mirroring the non-tun/tun
+/// lane split guard 3 exists to reunite — see this module's doc).
+#[skuld::test]
+fn verify_executed_passes_when_every_group_member_appears_in_the_junit_reports() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    write_expectation(
+        &dir.path().join("expected.json"),
+        &Expectation {
+            job: "test-hole".to_string(),
+            tests: binmap(&[("tun-engine", &["privileged_one", "unprivileged_two"])]),
+        },
+    )
+    .expect("record");
+    std::fs::write(
+        dir.path().join("non-tun-junit.xml"),
+        junit_xml(&[("tun-engine", &["unprivileged_two"])]),
+    )
+    .expect("write junit");
+    std::fs::write(
+        dir.path().join("tun-junit.xml"),
+        junit_xml(&[("tun-engine", &["privileged_one"])]),
+    )
+    .expect("write junit");
+
+    verify_executed(
+        dir.path(),
+        Path::new("expected.json"),
+        &[PathBuf::from("non-tun-junit.xml"), PathBuf::from("tun-junit.xml")],
+    )
+    .expect("every expected test appears across the two lane reports");
+}
+
+/// Zero `--junit` reports would confirm nothing — the same emptiness defense
+/// guard 2 applies to its own listings (bindreams/hole#865 audit finding 4).
+#[skuld::test]
+fn verify_executed_errs_when_no_junit_paths_are_given() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    write_expectation(
+        &dir.path().join("expected.json"),
+        &Expectation {
+            job: "test-hole".to_string(),
+            tests: binmap(&[("tun-engine", &["a"])]),
+        },
+    )
+    .expect("record");
+
+    let err = verify_executed(dir.path(), Path::new("expected.json"), &[]).expect_err("no reports to read");
+    assert!(err.to_string().contains("--junit"), "{}", err);
+}
+
+/// A vacuously-empty recorded expectation must not pass trivially — the exact
+/// risk M5 (bindreams/hole#999) named for `verify`'s `--record` branch, from
+/// guard 3's side: even if it somehow got written, guard 3 must still refuse
+/// to treat "nothing was expected" as "everything ran".
+#[skuld::test]
+fn verify_executed_errs_when_the_recorded_expectation_is_vacuously_empty() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    write_expectation(
+        &dir.path().join("expected.json"),
+        &Expectation {
+            job: "test-hole".to_string(),
+            tests: binmap(&[("tun-engine", &[])]),
+        },
+    )
+    .expect("record");
+    std::fs::write(
+        dir.path().join("junit.xml"),
+        junit_xml(&[("tun-engine", &["unrelated"])]),
+    )
+    .expect("write junit");
+
+    let err = verify_executed(dir.path(), Path::new("expected.json"), &[PathBuf::from("junit.xml")])
+        .expect_err("an empty recorded expectation has nothing to confirm");
+    assert!(err.to_string().contains("EMPTY"), "{}", err);
+}
+
+// ===== conformant_membership (bindreams/hole#894 / #999) =============================================================
+
+/// The property M5 (bindreams/hole#999) named directly: reaching `Ok` here
+/// must never carry a vacuously-empty membership, because `verify` writes
+/// this exact return value out via `--record` for guard 3 to diff against —
+/// an empty write would make that diff trivially pass no matter what actually
+/// ran.
+#[skuld::test]
+fn conformant_membership_returns_the_agreed_membership_when_it_is_non_empty() {
+    let matched = binmap(&[("hole-bridge", &["a", "b"])]);
+    let out = conformant_membership(matched.clone(), matched, "test-hole", "test(/bar/)").expect("agree, non-empty");
+    assert_eq!(out, binmap(&[("hole-bridge", &["a", "b"])]));
+}
+
+/// Guards exactly the #999 risk M5 calls out: when the two sides disagree,
+/// `conformant_membership` must error rather than return either side — here
+/// the label side is empty, so returning `Ok` would let `verify` record an
+/// empty expectation that trivially passes guard 3's diff.
+#[skuld::test]
+fn conformant_membership_errs_rather_than_recording_when_only_one_side_matched_anything() {
+    let name_matched = binmap(&[("hole-bridge", &["a"])]);
+    let label_matched: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let err = conformant_membership(name_matched, label_matched, "test-hole", "test(/bar/)")
+        .expect_err("a one-sided match is a real divergence, not something to record");
+    let msg = err.to_string();
+    assert!(msg.contains("hole-bridge") && msg.contains('a'), "{msg}");
+}
+
+/// The other half of the same defense (bindreams/hole#865 audit finding 4,
+/// carried into #999 by the same reasoning): a vacuous empty/empty pass must
+/// not be recordable either.
+#[skuld::test]
+fn conformant_membership_errs_when_neither_side_matched_anything() {
+    let empty: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let err = conformant_membership(empty.clone(), empty, "test-hole", "test(/bar/)")
+        .expect_err("an empty/empty pass has nothing to verify or record");
+    let msg = err.to_string();
+    assert!(msg.contains("test-hole") && msg.contains("ANY"), "{msg}");
+}
+
+// ===== verify_with (bindreams/hole#894 / #999, guard 2's orchestration with an injected `list`) ======================
+
+/// A minimal `ci.yaml` + `.config/nextest.toml` + `build.yaml` on disk —
+/// `verify_with`'s only real file I/O, all plain text, none of it a
+/// `cargo nextest list` subprocess — plus a fake `list` closure lets
+/// `verify_with` itself be pinned without compiling a synthetic workspace.
+fn write_repo_fixture(dir: &Path) {
+    std::fs::create_dir_all(dir.join(".github/workflows")).expect("mkdir ci.yaml dir");
+    std::fs::write(
+        dir.join(".github/workflows/ci.yaml"),
+        "
+jobs:
+  test-hole:
+    steps:
+      - run: cargo nextest run -p a -E 'package(a)'
+      - run: cargo nextest run -p a -E 'package(a)'
+",
+    )
+    .expect("write ci.yaml");
+    std::fs::create_dir_all(dir.join(".config")).expect("mkdir .config");
+    std::fs::write(dir.join(".config/nextest.toml"), FIXTURE_NEXTEST_TOML).expect("write nextest.toml");
+    std::fs::write(dir.join("build.yaml"), "targets: {}").expect("write build.yaml");
+}
+
+/// The exact risk M5 (bindreams/hole#999) named for `verify`'s `--record`
+/// branch: it must write the *label*-matched set, not the name-matched one.
+/// `bin_b` here is label-only (an empty-set entry the name side never lists,
+/// which is not itself a conformance mismatch — see `set_mismatch`), so its
+/// presence in the recorded file is proof of which side was actually
+/// written.
+#[skuld::test]
+fn verify_with_records_the_label_matched_set_not_the_name_matched_one() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    write_repo_fixture(dir.path());
+
+    let list = |_: &Path, _: &[String], labels: Option<&str>| -> anyhow::Result<BTreeMap<String, BTreeSet<String>>> {
+        Ok(match labels {
+            None => binmap(&[("pkg::bin_a", &["t1", "t2"])]),
+            Some(_) => {
+                let mut m = binmap(&[("pkg::bin_a", &["t1", "t2"])]);
+                m.insert("pkg::bin_b".to_string(), BTreeSet::new());
+                m
+            }
+        })
+    };
+
+    let record_path = dir.path().join("expected.json");
+    verify_with(dir.path(), "test-hole", Some(Path::new("expected.json")), list).expect("conformant");
+
+    let recorded = read_expectation(&record_path).expect("read back");
+    assert!(
+        recorded.tests.contains_key("pkg::bin_b"),
+        "expected the label-matched extra binary to be recorded, got {:?}",
+        recorded.tests
+    );
+}
+
+/// The `record: None` half of the same guarantee: nothing is ever written
+/// when the caller didn't ask for a recording.
+#[skuld::test]
+fn verify_with_writes_nothing_when_record_is_none() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    write_repo_fixture(dir.path());
+
+    let list = |_: &Path, _: &[String], _: Option<&str>| -> anyhow::Result<BTreeMap<String, BTreeSet<String>>> {
+        Ok(binmap(&[("pkg::bin_a", &["t1"])]))
+    };
+
+    verify_with(dir.path(), "test-hole", None, list).expect("conformant");
+
+    assert!(!dir.path().join("expected.json").exists());
+}
+
+/// The other half M5 (bindreams/hole#999) asked for directly: a failed
+/// conformance check must not write a file either — the guard's whole point
+/// is that a rejected membership is never the one guard 3 reads back.
+#[skuld::test]
+fn verify_with_writes_nothing_when_the_conformance_check_fails() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    write_repo_fixture(dir.path());
+
+    let list = |_: &Path, _: &[String], labels: Option<&str>| -> anyhow::Result<BTreeMap<String, BTreeSet<String>>> {
+        Ok(match labels {
+            None => binmap(&[("pkg::bin_a", &["t1"])]),
+            Some(_) => binmap(&[("pkg::bin_a", &["t2"])]),
+        })
+    };
+
+    let record_path = dir.path().join("expected.json");
+    verify_with(dir.path(), "test-hole", Some(Path::new("expected.json")), list).expect_err("mismatch should fail");
+
+    assert!(!record_path.exists());
 }
