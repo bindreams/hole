@@ -404,7 +404,14 @@ pub fn install_bridge(repair_user_data_dir: Option<&Path>) -> Result<(), Box<dyn
 pub fn uninstall_bridge(keep_covers: bool) -> Result<(), Box<dyn std::error::Error>> {
     uninstall_bridge_with(
         keep_covers,
-        || Ok(hole_bridge::platform::os::ensure_stopped()?),
+        // Statement form, not `Ok(..?)`: the platforms return different error
+        // types (macOS `io::Error`, Windows `Box<dyn Error>`), so on Windows
+        // the `?` inside an `Ok` would convert nothing and trip
+        // `clippy::needless_question_mark`.
+        || {
+            hole_bridge::platform::os::ensure_stopped()?;
+            Ok(())
+        },
         hole_bridge::platform::os::is_installed,
         || {
             hole_bridge::platform::os::uninstall()?;
