@@ -1201,12 +1201,14 @@ stop. Deleting the key first is correct under both readings of what BFE does.
 
 The twin-pair shape and the blocks-only choice both follow shipped precedent:
 Mullvad and TinyWall each install a rule twice, `BOOTTIME` and `PERSISTENT`,
-under their own persistent containers, and neither they nor Fort Firewall ship
-a boot-time *permit*. Mullvad differs from Hole in when: its blocks go in as
+under their own persistent containers. Of the two boot-time rule sets that
+could be read — Fort's and Mullvad's — every filter is a `BLOCK`; neither ships
+a boot-time *permit*. TinyWall is cited for the twin-pair shape only; its
+boot-time rule set was not read. Mullvad differs from Hole in when: its blocks go in as
 the daemon shuts down under a blocking policy and are swept by provider
 enumeration on the way back up, where Hole's go in at engage and stay while the
 kill switch is armed — a much wider window for a version skew to strand one.
-Two implementations declined boot-time entirely and belong in the same survey:
+Two implementations ship without boot-time filters and belong in the same survey:
 `wireguard-windows` defines `cFWPM_FILTER_FLAG_BOOTTIME` and never uses it
 (`blocker.go` runs a fully dynamic session under a per-run random provider
 GUID), and OpenVPN's `wfp_block.c` sets `FWPM_SESSION_FLAG_DYNAMIC` under the

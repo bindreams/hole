@@ -135,9 +135,10 @@ impl Drop for DeleteProbeOnDrop {
         if !cleared {
             eprintln!(
                 "BOOT-TIME PROBE STRANDED: {PROBE_GUID:?} could not be removed ({code:?}). It is a \
-                 permit on {PROBE_ADDR} (RFC 5737, unroutable) so it blocks nothing, and `netsh wfp` \
-                 has no delete verb, so removing it needs a WFP-aware tool or another Hole run — \
-                 harmless on an ephemeral CI runner, residue anywhere else."
+                 permit on {PROBE_ADDR} (RFC 5737, unroutable) so it blocks nothing. No Hole sweep \
+                 can reach it — PROBE_GUID is deliberately disjoint from every cover GUID — and \
+                 `netsh wfp` has no verb that deletes a filter, so removing it needs a WFP-aware \
+                 tool. Harmless on an ephemeral CI runner, residue anywhere else."
             );
         }
         // `add` must create the persistent provider + sublayer to hang the

@@ -1079,9 +1079,11 @@ fn first_delete_failure_treats_access_denied_as_a_genuine_failure() {
 
 #[skuld::test]
 fn a_not_found_pre_delete_is_benign_but_any_other_code_aborts_the_engage() {
-    // The verdict `engage_lockdown` folds its pre-delete codes through, tested
-    // on the exact `(label, code)` shape it builds. Two directions matter and
-    // they pull opposite ways:
+    // The VERDICT function `engage_lockdown` folds its pre-delete codes
+    // through, exercised on the exact `(label, code)` shape it builds. This
+    // pins the decision, not the FFI wiring — that the real codes reach this
+    // fold at all is `engage_lockdown_does_not_discard_its_pre_delete_codes`.
+    // Two directions matter and they pull opposite ways:
     //
     // BENIGN — every ordinary engage pre-deletes keys that are not there. The
     // first engage on a clean host finds none of the six; the "removed" reading
@@ -1116,25 +1118,31 @@ fn a_not_found_pre_delete_is_benign_but_any_other_code_aborts_the_engage() {
 fn every_pre_delete_guid_has_its_own_label() {
     // A failing pre-delete now ABORTS a kill-switch-armed start, and
     // `first_delete_failure`'s `"{what} delete failed"` string is the whole
-    // diagnostic. One shared label would make a dead TUN LUID, a changed
-    // server and a spent boot-time twin the same message.
-    let labels: Vec<&'static str> = lockdown_pre_delete_guids().iter().map(pre_delete_label).collect();
+    // diagnostic — it carries no GUID. So the label must identify the key on
+    // its own, down to the address family: a V6-only failure has ordinary
+    // causes (a host with no IPv6 binding) that a V4 one does not.
+    let guids = lockdown_pre_delete_guids();
+    let labels: Vec<&'static str> = guids.iter().map(pre_delete_label).collect();
     assert!(
         !labels.contains(&"unnamed lockdown pre-delete key"),
         "every pre-delete key must be named for the operator who sees the abort: {labels:?}"
     );
     assert_eq!(
         pre_delete_label(&LOCKDOWN_BOOTTIME_BLOCK_ALL_GUIDS[0]),
-        "boot-time block-all twin"
+        "boot-time block-all twin V4"
     );
-    assert_eq!(pre_delete_label(&LOCKDOWN_FILTER_GUIDS[2]), "TUN-LUID permit");
-    assert_eq!(pre_delete_label(&LOCKDOWN_FILTER_GUIDS[4]), "server-IP permit");
-    // The three causes must stay distinguishable from each other.
+    assert_eq!(
+        pre_delete_label(&LOCKDOWN_BOOTTIME_BLOCK_ALL_GUIDS[1]),
+        "boot-time block-all twin V6"
+    );
+    assert_eq!(pre_delete_label(&LOCKDOWN_FILTER_GUIDS[2]), "TUN-LUID permit V4");
+    assert_eq!(pre_delete_label(&LOCKDOWN_FILTER_GUIDS[5]), "server-IP permit V6");
+    // Six keys, six labels — no two pre-delete failures read alike.
     let distinct: std::collections::HashSet<&'static str> = labels.iter().copied().collect();
     assert_eq!(
         distinct.len(),
-        3,
-        "TUN, server and boot-time twin must not share a label"
+        guids.len(),
+        "each pre-delete key needs its own label, including per family: {labels:?}"
     );
 }
 
@@ -1178,6 +1186,14 @@ fn engage_lockdown_does_not_discard_its_pre_delete_codes() {
         body.contains("first_delete_failure(&pre_delete_codes)"),
         "engage_lockdown must fold its pre-delete codes through first_delete_failure, so a \
          not-found stays benign and anything else aborts the transaction:\n{body}"
+    );
+    // The label mapping is only worth testing if production actually uses it;
+    // a hardcoded string here would leave `pre_delete_label` dead and every
+    // abort message identical.
+    assert!(
+        body.contains("pre_delete_label(g)"),
+        "engage_lockdown must label each pre-delete via pre_delete_label, or the abort cannot \
+         say which key failed:\n{body}"
     );
 }
 

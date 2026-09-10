@@ -71,8 +71,8 @@
 //! the add, and the stored record carries `FWPM_FILTER_FLAG_BOOTTIME` (not
 //! `PERSISTENT`), our `providerKey` and our `subLayerKey`.
 //!
-//! Two implementations DECLINED boot-time, which belongs in the survey beside
-//! the three that took it (TinyWall, Mullvad, Fort). `wireguard-windows` defines
+//! Two implementations SHIP WITHOUT boot-time filters, which belongs in the
+//! survey beside the three that use them (TinyWall, Mullvad, Fort). `wireguard-windows` defines
 //! `cFWPM_FILTER_FLAG_BOOTTIME` in `tunnel/firewall/types_windows.go` and never
 //! uses it — `blocker.go` runs a fully DYNAMIC session under a per-run random
 //! provider GUID, so nothing it installs outlives the process, let alone a
@@ -107,10 +107,11 @@
 //! — a total egress block with no exemptions, not a scaled-down version of the
 //! cover BFE later installs. It is egress-only all the same, since the twins
 //! sit on `ALE_AUTH_CONNECT_V4`/`_V6` and nothing is added at `RECV_ACCEPT`.
-//! Blocks-only matches every shipped precedent whose boot-time rule set could
-//! be read: Fort's four boot-time filters and Mullvad's four are all `BLOCK`,
-//! and none of the three that ship boot-time filters ships a boot-time PERMIT.
-//! Fort and Mullvad also cover `RECV_ACCEPT`, which we do not.
+//! Blocks-only matches both shipped boot-time rule sets that could be read:
+//! Fort's four boot-time filters and Mullvad's four are all `BLOCK`, neither
+//! ships a boot-time PERMIT, and both also cover `RECV_ACCEPT`, which we do
+//! not. TinyWall is cited above for the twin-pair SHAPE only; its boot-time
+//! rule set was not read, so it is not evidence either way here.
 //!
 //! **What that block does to the machine around it is NOT analysed here, and
 //! saying so is the point.** The twins are [`Condition::Any`] +
@@ -170,9 +171,11 @@
 //! **Read that measurement at its actual scope.** It deletes a LIVE FWPM
 //! object, in the same session that added it. It says nothing about the delete
 //! this design is really exposed to, which is the one issued in a LATER boot
-//! against a key whose only remaining trace is the boot-time policy record: no
-//! live object, so `FwpmFilterDeleteByKey0` answers `FWP_E_FILTER_NOT_FOUND`,
-//! and [`first_delete_failure`] whitelists it. That is the same false `Ok` this
+//! against a key whose only remaining trace is the boot-time policy record. No
+//! live object exists, so the expected answer is `FWP_E_FILTER_NOT_FOUND`,
+//! which [`first_delete_failure`] whitelists — but that is an expectation, not
+//! a measurement, and this file does not get to predict later-boot behaviour it
+//! elsewhere refuses to predict. That is the same false `Ok` this
 //! paragraph opened by claiming to have excluded, still open, and it can only
 //! be closed by a reboot no lane here has. The measurement rules out "by-key
 //! delete cannot see the boot-time view at all"; it does not establish that a
@@ -318,11 +321,14 @@
 //! filters" — so it is not the bit "Basic Operation" means when it says a
 //! boot-time filter is disabled at BFE start.
 //!
-//! Measured clear on both lifetimes (`flags` read back as `0x2` —
+//! Measured clear on both lifetimes, and be precise about which read is which.
+//! On the BOOT-TIME probe `flags` came back as `0x2` —
 //! `FWPM_FILTER_FLAG_BOOTTIME` alone — on the one elevated host this was taken
-//! on; the ASSERTION is only that `DISABLED` and `PERSISTENT` are clear, since
-//! WFP may set flags of its own such as `INDEXED` on other builds). **Be
-//! precise about how little that buys**. Both reads are taken on filters this same process added seconds
+//! on; what that test ASSERTS is weaker and more portable, that `PERSISTENT`
+//! and `DISABLED` are both clear, since WFP may set flags of its own such as
+//! `INDEXED` on other builds. On the PERSISTENT block-all only `DISABLED` is
+//! asserted clear, since `PERSISTENT` is necessarily set there. **Be precise
+//! about how little either buys**. Both reads are taken on filters this same process added seconds
 //! earlier, so BFE has not started since they existed and the bit can only read
 //! clear — the assertion checks that WFP honours its own "cannot be set when
 //! adding new filters" rule, and nothing more. It is NOT evidence that Hole's
@@ -397,7 +403,7 @@ const IPPROTO_TCP: u8 = 6;
 
 // Lockdown-cover filter GUIDs — disjoint from FILTER_GUIDS. A Sweep deletes
 // all of these (`swept_lockdown_guids`); an engage refreshes the volatile
-// subset (`adopt_delete_guids`). A crash that leaves the cover engaged is
+// subset (`lockdown_pre_delete_guids`). A crash that leaves the cover engaged is
 // reconciled on the next start.
 // Layout: [loopback CONNECT V4, loopback CONNECT V6, TUN V4, TUN V6,
 //          server V4, server V6, block-all V4, block-all V6,
@@ -517,8 +523,11 @@ fn adopt_delete_guids() -> Vec<GUID> {
 /// exactly as it is for a volatile permit, and a successful one (the "disabled"
 /// branch) clears the way for a genuine re-add.
 ///
-/// The delete and the add are in ONE FWPM transaction, so no boot-time gap is
-/// opened by the refresh. The `Persistent` block-all beside them is NOT in this
+/// The delete and the add are in ONE FWPM transaction, so no gap is opened in
+/// the FWPM object store. Whether the underlying boot-time POLICY RECORD is
+/// updated transactionally is not documented and is not claimed here — the
+/// refresh runs while BFE is up, where no twin is enforcing under either
+/// reading, so a non-atomic record update has no window to leak through. The `Persistent` block-all beside them is NOT in this
 /// set: it is live and enforcing right now, and dropping it — even
 /// transactionally — is the one thing a refresh must never do to the floor.
 fn lockdown_pre_delete_guids() -> Vec<GUID> {
@@ -529,29 +538,27 @@ fn lockdown_pre_delete_guids() -> Vec<GUID> {
 
 /// What to call a [`lockdown_pre_delete_guids`] entry in an error message.
 ///
-/// [`first_delete_failure`] renders `"{what} delete failed: 0x{code:08x}"`, and
-/// since a failing pre-delete now ABORTS a kill-switch-armed start, that string
-/// is the entire diagnostic an operator gets. One shared label across all six
-/// keys would make three unrelated root causes — a dead TUN LUID, a changed
-/// server, a spent boot-time twin — indistinguishable. Pure and total, so
-/// `every_pre_delete_guid_has_its_own_label` can check the mapping without FWPM.
+/// [`first_delete_failure`] renders `"{what} delete failed: 0x{code:08x}"` and
+/// carries no GUID, so this string is the entire diagnostic an operator gets
+/// from a failing pre-delete — which now ABORTS a kill-switch-armed start. One
+/// shared label would collapse three unrelated root causes (a dead TUN LUID, a
+/// changed server, a spent boot-time twin); a family-blind one would still
+/// leave a V4/V6 pair indistinguishable, and those fail for different reasons —
+/// a host with no IPv6 binding is an ordinary cause of a V6-only anomaly.
+/// So: one label per key, six for six. Pure and total, so
+/// `every_pre_delete_guid_has_its_own_label` can check the mapping without
+/// FWPM.
 fn pre_delete_label(guid: &GUID) -> &'static str {
-    if LOCKDOWN_BOOTTIME_BLOCK_ALL_GUIDS.contains(guid) {
-        "boot-time block-all twin"
-    } else if LOCKDOWN_TUN_GUID_INDICES
-        .iter()
-        .any(|&i| LOCKDOWN_FILTER_GUIDS[i] == *guid)
-    {
-        "TUN-LUID permit"
-    } else if LOCKDOWN_SERVER_GUID_INDICES
-        .iter()
-        .any(|&i| LOCKDOWN_FILTER_GUIDS[i] == *guid)
-    {
-        "server-IP permit"
-    } else {
+    match guid {
+        g if *g == LOCKDOWN_BOOTTIME_BLOCK_ALL_GUIDS[0] => "boot-time block-all twin V4",
+        g if *g == LOCKDOWN_BOOTTIME_BLOCK_ALL_GUIDS[1] => "boot-time block-all twin V6",
+        g if *g == LOCKDOWN_FILTER_GUIDS[LOCKDOWN_TUN_GUID_INDICES[0]] => "TUN-LUID permit V4",
+        g if *g == LOCKDOWN_FILTER_GUIDS[LOCKDOWN_TUN_GUID_INDICES[1]] => "TUN-LUID permit V6",
+        g if *g == LOCKDOWN_FILTER_GUIDS[LOCKDOWN_SERVER_GUID_INDICES[0]] => "server-IP permit V4",
+        g if *g == LOCKDOWN_FILTER_GUIDS[LOCKDOWN_SERVER_GUID_INDICES[1]] => "server-IP permit V6",
         // Unreachable for anything `lockdown_pre_delete_guids` yields, and
         // asserted so. A future pre-delete entry lands here until it is named.
-        "unnamed lockdown pre-delete key"
+        _ => "unnamed lockdown pre-delete key",
     }
 }
 
@@ -648,8 +655,10 @@ pub struct CoverSpec {
     pub provider: GUID,
     pub sublayer: GUID,
     /// Filter keys the engage deletes inside its transaction BEFORE adding
-    /// anything. Non-empty only for the lockdown cover, whose volatile permits
-    /// carry fixed keys — see [`adopt_delete_guids`].
+    /// anything. Non-empty only for the lockdown cover — see
+    /// [`lockdown_pre_delete_guids`] for the two different reasons a key is in
+    /// here (a volatile permit whose value changes, or a boot-time twin spent
+    /// by the boot it covered).
     pub pre_delete: Vec<GUID>,
     pub filters: Vec<FilterSpec>,
 }
@@ -1088,8 +1097,21 @@ pub fn engage_lockdown(
             // degraded silently on a non-benign delete — a stale TUN LUID or a
             // stale server IP surviving inside a cover that reports `Ok` — and
             // that is the same false success, one object over. Widening it is
-            // the point, not a side effect. `pre_delete_label` keeps the
-            // resulting error able to say which of the six it was.
+            // the point, not a side effect. `pre_delete_label` gives each of
+            // the six keys its own name, so the abort says which one failed.
+            //
+            // WHAT THIS COSTS, stated because the twins make it reachable in a
+            // way it was not before. A boot-time key in a later boot has no
+            // live object; the expected answer is not-found, which is benign —
+            // but this file refuses elsewhere to predict later-boot behaviour,
+            // so it must not quietly assume it here either. If such a delete
+            // ever returns a THIRD code, every engage on an armed host fails
+            // and the user cannot connect until it is diagnosed. That is the
+            // accepted direction, not an oversight: the host keeps whatever
+            // cover it already had (the transaction aborts, nothing is opened),
+            // so the failure is "cannot connect", never "leaks". Arming a twin
+            // that was never actually re-armed would be the opposite trade —
+            // a silent `Ok` over a kill switch that stopped working.
             let pre_delete_codes: Vec<(&'static str, u32)> = spec
                 .pre_delete
                 .iter()
