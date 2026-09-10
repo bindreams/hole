@@ -10,28 +10,62 @@
 //! version is not ours to choose: we must name it ourselves and it must be the
 //! one typify speaks. `schemars` 0.9 and 1.x both made the `schema` module
 //! private, so any bump past 0.8 fails the build script with `E0603`
-//! regardless of what the rest of the workspace wants — which is what left
-//! bindreams/hole#379 permanently red.
+//! regardless of what the rest of the workspace wants.
 //!
-//! Cargo does not catch this. Three semver-incompatible `schemars` already
-//! coexist in this tree — 0.8.22, 0.9.0 and 1.2.1, with `serde_with` 3.18.0
-//! declaring all three as optional features and resolving to both 0.9.0 and
-//! 1.2.1 — so 1.x is already vendored, a bump resolves cleanly, and the failure
-//! only appears at compile time. Renovate therefore cannot see the constraint
-//! either, which is why `.github/renovate.json` carries an `allowedVersions`
-//! rule and why that rule needs an expiry.
+//! **The real protection is that `E0603`, not this module.** A wrong pin does
+//! not ship silently: it fails `crates/common/build.rs` to compile, on every
+//! platform, unconditionally. This module exists one layer up from that: to
+//! keep the *annoyance* of a reopened bindreams/hole#379 self-resolving
+//! instead of a standing trap nobody notices, by catching upstream moving
+//! before Renovate proposes the impossible bump at all.
 //!
-//! ## Three artefacts, one fact
+//! Cargo cannot see the compile failure coming. Three semver-incompatible
+//! `schemars` already coexist in this tree — 0.8.22, 0.9.0 and 1.2.1 — with
+//! `serde_with` 3.18.0 declaring all three as optional features and resolving
+//! to two of them, 0.9.0 and 1.2.1. So 1.x is already vendored, a bump
+//! resolves cleanly, and the only failure is at compile time. Renovate cannot
+//! see the constraint either, which is why `.github/renovate.json` carries an
+//! `allowedVersions` rule for it.
 //!
-//! [`PINNED_SERIES`] is the fact. `.github/renovate.json`'s `allowedVersions`
-//! and `crates/common/Cargo.toml`'s `schemars = "0.8"` are consequences of it,
-//! and both are checked *against* it rather than compared textually: the
-//! Renovate range is evaluated as an interval against the one derived from
-//! `PINNED_SERIES` (see [`requirement_admits_beyond_pin`]), so a rule that has
-//! drifted into permitting the next series up fails even though it still
-//! "constrains schemars". Presence was never the property worth guarding —
-//! bindreams/hole#379 reopens on an `allowedVersions` of `"<2"`, on a rule
-//! Renovate no longer applies, and on no rule at all, identically.
+//! ## The Renovate rule is best-effort, and is not modelled here
+//!
+//! This module used to also verify that Renovate would actually *apply* that
+//! `allowedVersions` rule: a hand-rolled model of Renovate's own packageRule
+//! selector resolution — which selectors reach `schemars`, glob/regex
+//! dependency-name matching, negation precedence, last-wins merging across
+//! nested and manager-scoped rules. Three independent review rounds each found
+//! a fresh divergence from Renovate's real behaviour (empty selector arrays
+//! matching nothing, minimatch's `*` not crossing `/`, `ignoreDeps` invisible
+//! to it, `matchDepTypes` on `build-dependencies` producing a false red, case
+//! folding) — an arms race against a moving upstream, fought with machinery
+//! that itself needed guarding as much as the thing it guarded.
+//!
+//! That model has been removed. The Renovate rule is now **best-effort noise
+//! suppression, and nothing more is claimed of it**: if it is ever malformed,
+//! scoped away from `schemars`, or shadowed by a later rule, the worst case is
+//! that Renovate reopens bindreams/hole#379 as an ordinary PR. `E0603` refuses
+//! the bump regardless of why Renovate proposed it, so a *dead* Renovate rule
+//! costs a noisy reopened PR — never a broken build, and never a shipped
+//! defect. Guarding the guard was the part of this that needed to stop.
+//!
+//! `.github/renovate.json` is still schema-validated — the `Validate renovate
+//! config` CI job runs `renovate-config-validator --strict` against it — so a
+//! typo that Renovate's schema itself rejects is still caught. What is gone is
+//! this module deciding, on Renovate's behalf, whether a *schema-valid* rule
+//! would actually reach `schemars`.
+//!
+//! ## The fact this module still guards
+//!
+//! [`PINNED_SERIES`] is that fact — the one hand-written copy of it.
+//! `crates/common/Cargo.toml`'s `schemars = "0.8"` is a consequence of it and
+//! is checked *against* it ([`check_local_pin`]), not compared textually: a
+//! constant edited out from under the guard would otherwise leave it policing
+//! the wrong series without anything noticing.
+//!
+//! If the upstream fact stops holding — `typify` no longer requires 0.8 — the
+//! pin, the Renovate rule and this module have all become friction with no
+//! fact behind them, and should be deleted rather than defended; see
+//! [`WHEN_UPSTREAM_MOVES`].
 //!
 //! ## Two upstream signals, and why both
 //!
@@ -61,8 +95,8 @@
 //!
 //! - `schemars_pin_still_tracks_typify` (this crate's tests, and therefore the
 //!   archive lane) checks everything readable from tracked files: the resolved
-//!   version, the Renovate rule, and the local pin.
-//! - `cargo xtask check-schemars-pin` checks those *plus* the declared
+//!   version and the local pin.
+//! - `cargo xtask check-schemars-pin` checks that *plus* the declared
 //!   requirement, and runs where a registry exists: the `check-schemars-pin`
 //!   prek hook, which `prek.toml` gates by `files` to commits touching
 //!   `Cargo.lock`, `.github/renovate.json`, `crates/common/Cargo.toml` or this
@@ -80,9 +114,8 @@
 //! any run of this test already proves that agreement. An assertion that can
 //! only execute when it is already true detects nothing — the shape
 //! bindreams/hole#894 exists to stop. [`check_local_pin`] compares that
-//! manifest against [`PINNED_SERIES`], which is a different question and is not
-//! compiler-covered: a constant edited out from under the guard would otherwise
-//! leave it checking the wrong series.
+//! manifest against [`PINNED_SERIES`] instead, which is a different question
+//! and is not compiler-covered.
 //!
 //! ## Why this is a test and not a comment
 //!
@@ -104,7 +137,6 @@ use std::process::Command;
 use anyhow::{bail, Context, Result};
 use cargo_metadata::semver::{BuildMetadata, Comparator, Version, VersionReq};
 use serde::Deserialize;
-use serde_json::{Map, Value};
 
 /// The crate whose choice decides ours. `typify-impl` rather than the `typify`
 /// facade: the facade's own `schemars` entry is a dev-dependency (its
@@ -296,34 +328,20 @@ fn is_empty(lower: &Bound<Version>, upper: &Bound<Version>) -> bool {
 }
 
 /// How much of [`PINNED_SERIES`] a requirement still admits.
+///
+/// The only distinction [`requirement_admits_series_patches`] reads out of
+/// this is whether it is [`SeriesReach::WholeTail`] — a range that caps the
+/// series short or misses it entirely is equally a failure to admit every
+/// {PINNED_SERIES}.x patch, so the two non-tail cases carry no payload to
+/// report a finding with.
 enum SeriesReach {
     /// Every release from some floor upward, however high the patch number
     /// climbs.
     WholeTail,
-    /// In-series releases only up to `highest`. `inclusive` says whether the
-    /// bound itself is admitted — which only a pre-release endpoint makes true,
-    /// so the wording it selects must not imply a *release* lands there.
-    CappedAt { highest: Version, inclusive: bool },
+    /// In-series releases only up to some point short of the next series.
+    CappedAt,
     /// Nothing inside the series at all.
     Nothing,
-}
-
-impl SeriesReach {
-    /// The clause naming what this range does to the series, for the finding.
-    fn describe(&self) -> String {
-        match self {
-            SeriesReach::WholeTail => format!("admits every {PINNED_SERIES}.x release"),
-            SeriesReach::Nothing => format!("admits no {PINNED_SERIES}.x release at all"),
-            SeriesReach::CappedAt {
-                highest,
-                inclusive: false,
-            } => format!("admits no {PINNED_SERIES}.x release at or above {highest}"),
-            SeriesReach::CappedAt {
-                highest,
-                inclusive: true,
-            } => format!("admits no {PINNED_SERIES}.x release above the pre-release {highest}"),
-        }
-    }
 }
 
 /// Which part of [`PINNED_SERIES`] `req` still admits.
@@ -374,14 +392,7 @@ fn series_reach(req: &VersionReq) -> Result<SeriesReach> {
     Ok(match upper {
         Unbounded => SeriesReach::WholeTail,
         Included(bound) | Excluded(bound) if reaches_tail(&bound) => SeriesReach::WholeTail,
-        Included(highest) => SeriesReach::CappedAt {
-            highest,
-            inclusive: true,
-        },
-        Excluded(highest) => SeriesReach::CappedAt {
-            highest,
-            inclusive: false,
-        },
+        Included(_) | Excluded(_) => SeriesReach::CappedAt,
     })
 }
 
@@ -707,6 +718,9 @@ pub fn cargo_metadata_json(repo_root: &Path) -> Result<String> {
 
 // crates/common/Cargo.toml — the local pin ============================================================================
 
+/// Path this pin's manifest lives at, relative to the repo root.
+const LOCAL_MANIFEST: &str = "crates/common/Cargo.toml";
+
 /// The `schemars` build-dependency requirement declared by
 /// `crates/common/Cargo.toml`.
 pub fn local_schemars_requirement(manifest: &str) -> Result<String> {
@@ -745,726 +759,10 @@ pub fn check_local_pin(manifest: &str) -> Result<()> {
     Ok(())
 }
 
-// .github/renovate.json — the suppression rule ========================================================================
-
-/// The dependency, manager, manifest path and manifest section a packageRule's
-/// selectors are evaluated against. `schemars` reaches this repo only as a
-/// `cargo` build-dependency of `crates/common/Cargo.toml`, so a rule scoped
-/// away from any one of the four never applies to it.
-///
-/// The section is a selector subject because the `cargo` manager tags every
-/// dependency with the table it was extracted from
-/// (`modules/manager/cargo/schema.ts`: `dependencies`, `dev-dependencies`,
-/// `build-dependencies`, `workspace.dependencies`), and `schemars` is declared
-/// under `[build-dependencies]`.
-///
-/// `matchFileNames` has *two* subjects, not one:
-/// `util/package-rules/files.ts` tries the `packageFile` and then every entry
-/// of `lockFiles`, and `modules/manager/cargo/extract.ts` sets
-/// `lockFiles = [Cargo.lock]`. A rule spelled `matchFileNames: ["Cargo.lock"]`
-/// reaches `schemars` even though it names no manifest.
-const PIN_DEPENDENCY: &str = "schemars";
-const PIN_MANAGER: &str = "cargo";
-const PIN_MANIFEST: &str = "crates/common/Cargo.toml";
-const PIN_LOCKFILE: &str = "Cargo.lock";
-const PIN_DEP_TYPE: &str = "build-dependencies";
-
-/// What a `match*`/`exclude*` selector is matched against.
-///
-/// Renovate carries roughly fifteen selector keys and each one can scope a rule
-/// away from `schemars` entirely — `matchDatasources: ["npm"]`,
-/// `matchBaseBranches`, `matchRepositories`, `matchJsonata`, the `exclude*`
-/// family. A rule so scoped is dead, and a dead rule suppresses exactly as much
-/// as no rule at all. So the ones absent from this table are *rejected*, not
-/// ignored, on the principle [`comparator_bounds`] already applies to semver
-/// operators: a selector this guard cannot reason about must be taught here
-/// rather than assumed harmless.
-fn selector_subject(key: &str) -> Option<Subject> {
-    Some(match key {
-        "matchDepNames" | "matchPackageNames" => Subject::Name,
-        // Renovate's pre-39 spelling: bare regexes rather than glob-or-`/re/`.
-        "matchDepPatterns" | "matchPackagePatterns" => Subject::NamePattern,
-        "matchManagers" => Subject::Manager,
-        "matchFileNames" => Subject::File,
-        "matchDepTypes" => Subject::DepType,
-        _ => return None,
-    })
-}
-
-#[derive(Clone, Copy)]
-enum Subject {
-    Name,
-    NamePattern,
-    Manager,
-    File,
-    DepType,
-}
-
-/// Is this option one `mergeChildConfig` *joins* rather than replaces when a
-/// nested rule is flattened? Renovate carries the flag on the option definition
-/// itself; these are the ones whose value this guard decides. `matchFileNames`
-/// is deliberately absent — it is not mergeable, so a child's list replaces the
-/// parent's.
-///
-/// A key this table gets wrong on some *other* selector cannot change a
-/// verdict: every selector [`selector_subject`] does not know makes its rule
-/// [`Verdict::Unknown`] whether it was joined or replaced.
-fn joins_when_flattened(key: &str) -> bool {
-    matches!(
-        key,
-        "matchDepNames" | "matchPackageNames" | "matchManagers" | "matchDepTypes" | "ignoreDeps"
-    )
-}
-
-/// A three-valued selector verdict.
-///
-/// `Unknown` is not a shrug: it is the answer that makes the caller fail.
-/// "Renovate does not apply this rule" and "this guard cannot tell whether
-/// Renovate applies this rule" are different findings and must not share a
-/// message — telling a maintainer to restore a rule that is present and working
-/// is the false red that gets guards deleted.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Verdict {
-    Selected,
-    Excluded,
-    Unknown,
-}
-
-impl Verdict {
-    /// Distinct selectors are ANDed. One that provably excludes the dependency
-    /// settles the rule whatever the others say — which is what stops an
-    /// unreadable selector on an already-excluded rule from failing the check.
-    fn and(self, other: Verdict) -> Verdict {
-        match (self, other) {
-            (Verdict::Excluded, _) | (_, Verdict::Excluded) => Verdict::Excluded,
-            (Verdict::Unknown, _) | (_, Verdict::Unknown) => Verdict::Unknown,
-            _ => Verdict::Selected,
-        }
-    }
-
-    /// Entries within one selector are ORed.
-    fn or(self, other: Verdict) -> Verdict {
-        match (self, other) {
-            (Verdict::Selected, _) | (_, Verdict::Selected) => Verdict::Selected,
-            (Verdict::Unknown, _) | (_, Verdict::Unknown) => Verdict::Unknown,
-            _ => Verdict::Excluded,
-        }
-    }
-
-    fn of(hit: bool) -> Verdict {
-        if hit {
-            Verdict::Selected
-        } else {
-            Verdict::Excluded
-        }
-    }
-
-    /// What a `!` in front of this entry makes of it. `Unknown` stays unknown:
-    /// negating an answer this guard does not have does not produce one.
-    fn negate(self) -> Verdict {
-        match self {
-            Verdict::Selected => Verdict::Excluded,
-            Verdict::Excluded => Verdict::Selected,
-            Verdict::Unknown => Verdict::Unknown,
-        }
-    }
-}
-
-/// `glob`'s reading of a minimatch pattern built the way Renovate builds every
-/// one of them, `{ dot: true, nocase: true }`.
-///
-/// `require_literal_separator` because minimatch's `*` stops at a `/` — the
-/// opposite of `glob`'s default, and the difference decides the one subject
-/// with separators in it, [`PIN_MANIFEST`]. Without it `crates/*` and
-/// `*/Cargo.toml`, which Renovate does not apply to
-/// `crates/common/Cargo.toml`, both read as selecting it.
-const MINIMATCH: glob::MatchOptions = glob::MatchOptions {
-    case_sensitive: false,
-    require_literal_separator: true,
-    require_literal_leading_dot: false,
-};
-
-/// minimatch's `**` spans zero or more path segments only where the segment
-/// *is* exactly `**`; written anywhere else — `tauri-plugin-**`,
-/// `**Cargo.toml`, or a longer run like `crates/***` — it is a plain `*`.
-/// `glob` accepts `**` in that same whole-segment position only, so rewriting
-/// the other spellings the way minimatch reads them makes the two agree rather
-/// than approximating one with the other.
-fn expand_globstars(matcher: &str) -> String {
-    let bytes = matcher.as_bytes();
-    let mut out = String::with_capacity(matcher.len());
-    let (mut copied, mut index) = (0, 0);
-    while index < bytes.len() {
-        if bytes[index] != b'*' {
-            index += 1;
-            continue;
-        }
-        let run = index;
-        while index < bytes.len() && bytes[index] == b'*' {
-            index += 1;
-        }
-        if index - run < 2 {
-            continue;
-        }
-        // minimatch tests the segment for equality with `**`, so a longer run
-        // is not a globstar either: `crates/***` matches as `crates/*`.
-        let globstar =
-            index - run == 2 && (run == 0 || bytes[run - 1] == b'/') && (index == bytes.len() || bytes[index] == b'/');
-        out.push_str(&matcher[copied..run]);
-        out.push_str(if globstar { "**" } else { "*" });
-        copied = index;
-    }
-    out.push_str(&matcher[copied..]);
-    out
-}
-
-/// Does minimatch read this pattern with syntax `glob` has no equivalent for?
-///
-/// Two constructs, both live in Renovate because it passes neither `noext` nor
-/// any brace option:
-///
-/// - **Brace alternation** (`{schemars,serde}`), which `glob` does not expand.
-/// - **Extglob** (`@(a|b)`, `?()`, `*()`, `+()`) — a `(` under one of
-///   `?*+@!`. A leading `!(` never reaches here: the caller has already read
-///   that `!` as minimatch's negation, which is what minimatch does too. This
-///   is the reason a bare `(` is *not* enough to disqualify a
-///   pattern: minimatch treats unprefixed parentheses as literal, and so does
-///   the literal branch below. `@(schemars)` selects `schemars`, but reading it
-///   as a literal makes it select nothing, which is a dead rule read as a live
-///   one.
-fn beyond_glob(matcher: &str) -> bool {
-    if matcher.contains(['{', '}']) {
-        return true;
-    }
-    // minimatch's escape: `s\chemars` is the literal `schemars`. `glob` reads a
-    // backslash as an ordinary character on this platform, so the two disagree
-    // on both halves — the escaped pattern matches where the guard would not,
-    // and `sc\*hemars` does not match where a naive read says it should.
-    if matcher.contains('\\') {
-        return true;
-    }
-    matcher
-        .as_bytes()
-        .windows(2)
-        .any(|pair| pair[1] == b'(' && matches!(pair[0], b'?' | b'*' | b'+' | b'@' | b'!'))
-}
-
-/// Is this the delimited `/regex/` spelling? `isRegexMatch` requires the
-/// opening `/` and a closing `/` or `/i`; the caller decides how many `!` may
-/// precede it, because `/^!?\//` allows exactly one.
-fn is_delimited_regex(matcher: &str) -> bool {
-    matcher.starts_with('/') && (matcher.ends_with('/') || matcher.ends_with("/i"))
-}
-
-/// Does one matcher entry select `subject`?
-///
-/// Renovate accepts a literal, a minimatch glob, a delimited `/regex/`
-/// (optionally `/i`), and any of those under a `!` negation, which the caller
-/// splits off. All are honoured — `.github/renovate.json` already spells
-/// `matchPackageNames` with globs. A spelling this guard cannot decide, such as
-/// anything [`beyond_glob`] names, returns `Unknown` rather than a guess in
-/// either direction.
-///
-/// The glob path is case-insensitive because every minimatch Renovate builds
-/// carries `nocase: true`; the regex path is not, because `parseRegexMatch`
-/// asks for the `i` flag only when the spelling ends in one.
-fn matcher_selects(matcher: &str, subject: &str) -> Verdict {
-    // `matchRegexOrGlob` short-circuits a bare `*` to "everything" before
-    // minimatch sees it, so it reaches a subject with separators in it that a
-    // `*` glob would not. Only the whole entry: `!*` is not this case.
-    if matcher == "*" {
-        return Verdict::Selected;
-    }
-    // `isRegexMatch` needs *both* delimiters. With only the opening one this is
-    // not a regex at all: Renovate hands it to minimatch as an ordinary glob,
-    // so falling through is what Renovate does rather than a guess about what
-    // it meant.
-    if is_delimited_regex(matcher) {
-        let body = &matcher[1..];
-        let body = body
-            .strip_suffix("/i")
-            .or_else(|| body.strip_suffix('/'))
-            .unwrap_or(body);
-        // The flag is read off the whole spelling, not off what was stripped:
-        // `parseRegexMatch` tests `input.endsWith('i')`.
-        let flags = if matcher.ends_with('i') { "(?i)" } else { "" };
-        return regex_selects(&format!("{flags}{body}"), subject);
-    }
-    glob_selects(matcher, subject)
-}
-
-/// The glob half, once `isRegexMatch` has said no. Split out because that
-/// question is settled on the entry as written, before any `!` is stripped: a
-/// `/re/` left over from a doubled negation is a minimatch pattern of three
-/// path segments, not a regex, and routing it back through
-/// [`matcher_selects`] would compile it as one.
-fn glob_selects(matcher: &str, subject: &str) -> Verdict {
-    if beyond_glob(matcher) {
-        return Verdict::Unknown;
-    }
-    // minimatch splits on `/` and drops the empty segments a `//` run leaves
-    // behind, so `crates//common/Cargo.toml` is `crates/common/Cargo.toml`.
-    let collapsed = if matcher.contains("//") {
-        let mut out = matcher.to_string();
-        while out.contains("//") {
-            out = out.replace("//", "/");
-        }
-        out
-    } else {
-        matcher.to_string()
-    };
-    // A trailing `/` is the one empty segment minimatch keeps: it requires the
-    // subject to end in a separator, and no subject this guard matches against
-    // does. Decidable, so not an `Unknown`.
-    if collapsed.len() > 1 && collapsed.ends_with('/') {
-        return Verdict::Excluded;
-    }
-    if !collapsed.contains(['*', '?', '[', ']']) {
-        // A literal is a glob with no metacharacters, and inherits `nocase`.
-        return Verdict::of(collapsed.eq_ignore_ascii_case(subject));
-    }
-    match glob::Pattern::new(&expand_globstars(&collapsed)) {
-        Ok(pattern) => Verdict::of(pattern.matches_with(subject, MINIMATCH)),
-        Err(_) => Verdict::Unknown,
-    }
-}
-
-fn regex_selects(pattern: &str, subject: &str) -> Verdict {
-    match regex::Regex::new(pattern) {
-        Ok(compiled) => Verdict::of(compiled.is_match(subject)),
-        // Renovate's engine is not Rust's. One it accepts and this cannot
-        // compile is undecidable here, not absent.
-        Err(_) => Verdict::Unknown,
-    }
-}
-
-/// One entry's own predicate, the way `getRegexOrGlobPredicate` builds it.
-///
-/// Whether an entry is *filed* as a negation is a separate question from what
-/// its predicate says: `matchRegexOrGlobList` buckets on a single leading `!`,
-/// but the predicate it then calls is built from the whole spelling, and
-/// minimatch's `parseNegate` consumes *every* leading `!`, toggling each time.
-/// So `!!foo` is filed under the negations while its predicate is the plain
-/// `foo` — a positive requirement in the negative bucket. Stripping one `!` and
-/// assuming the sense flipped reads that as "everything except foo".
-fn entry_predicate(matcher: &str, subject: &str, bare_regex: bool) -> Verdict {
-    if bare_regex {
-        return regex_selects(matcher, subject);
-    }
-    if !matcher.starts_with('!') {
-        return matcher_selects(matcher, subject);
-    }
-    // `isRegexMatch` is `/^!?\//` — *one* optional `!`, and only immediately
-    // before the opening delimiter. That is the single negation the regex path
-    // knows, and `parseRegexMatch` strips exactly it.
-    let body = &matcher[1..];
-    if is_delimited_regex(body) {
-        return matcher_selects(body, subject).negate();
-    }
-    // Everything else with a leading `!` belongs to minimatch, where
-    // `parseNegate` eats every one of them and what remains is a *glob*. Two
-    // `!` therefore do not restore a regex: `!!/schemars/` asks minimatch for
-    // the three-segment path `/schemars/`, which matches nothing. Nor do they
-    // restore the bare-`*` short-circuit, which `matchRegexOrGlob` applies to
-    // the whole entry only.
-    let bare = matcher.trim_start_matches('!');
-    let toggles = matcher.len() - bare.len();
-    let hit = glob_selects(bare, subject);
-    if toggles.is_multiple_of(2) {
-        hit
-    } else {
-        hit.negate()
-    }
-}
-
-/// Does a whole selector list select `subject`?
-///
-/// `matchRegexOrGlobList`, line for line: an empty list selects nothing; if
-/// there are positive entries at least one must hold; if there are negative
-/// entries every one of them must hold. A list of only negations therefore
-/// means "everything except", because the positive test is skipped rather than
-/// failed — and an *empty* list is not that case, it is the `if
-/// (!patterns.length) return false` on the first line, which leaves a rule that
-/// still reads exactly like the pin, still validates, and is dead.
-fn list_selects(matchers: &[Value], subject: &str, bare_regex: bool) -> Verdict {
-    if matchers.is_empty() {
-        return Verdict::Excluded;
-    }
-    // `some` over the positives, `every` over the negatives.
-    let (mut some_positive, mut every_negative): (Option<Verdict>, Option<Verdict>) = (None, None);
-    for entry in matchers {
-        let Some(matcher) = entry.as_str() else {
-            return Verdict::Unknown;
-        };
-        let holds = entry_predicate(matcher, subject, bare_regex);
-        // The bucket is chosen by one leading `!`, whatever the predicate says.
-        if !bare_regex && matcher.starts_with('!') {
-            every_negative = Some(every_negative.unwrap_or(Verdict::Selected).and(holds));
-        } else {
-            some_positive = Some(some_positive.unwrap_or(Verdict::Excluded).or(holds));
-        }
-    }
-    some_positive
-        .unwrap_or(Verdict::Selected)
-        .and(every_negative.unwrap_or(Verdict::Selected))
-}
-
-/// Would Renovate apply this packageRule to `schemars`, and if not — or if that
-/// cannot be decided — which selector settled it?
-fn rule_applies(rule: &Value) -> (Verdict, Option<String>) {
-    let Some(fields) = rule.as_object() else {
-        return (Verdict::Unknown, Some("the rule is not an object".into()));
-    };
-    let mut verdict = Verdict::Selected;
-    let (mut excluded_by, mut unreadable) = (None, None);
-    for (key, value) in fields {
-        if !key.starts_with("match") && !key.starts_with("exclude") {
-            continue;
-        }
-        let axis = match (selector_subject(key), value.as_array()) {
-            // Every selector this table knows takes an array. A scalar there is
-            // a different option shape than the one being evaluated.
-            (Some(subject), Some(list)) => match subject {
-                Subject::Name => list_selects(list, PIN_DEPENDENCY, false),
-                Subject::NamePattern => list_selects(list, PIN_DEPENDENCY, true),
-                Subject::Manager => list_selects(list, PIN_MANAGER, false),
-                // Either file reaches the dependency, so the rule applies if
-                // either matches.
-                Subject::File => list_selects(list, PIN_MANIFEST, false).or(list_selects(list, PIN_LOCKFILE, false)),
-                Subject::DepType => list_selects(list, PIN_DEP_TYPE, false),
-            },
-            _ => Verdict::Unknown,
-        };
-        let settled = match axis {
-            Verdict::Excluded => &mut excluded_by,
-            Verdict::Unknown => &mut unreadable,
-            Verdict::Selected => {
-                verdict = verdict.and(axis);
-                continue;
-            }
-        };
-        settled.get_or_insert_with(|| key.clone());
-        verdict = verdict.and(axis);
-    }
-    let reason = match verdict {
-        Verdict::Excluded => excluded_by,
-        Verdict::Unknown => unreadable,
-        Verdict::Selected => None,
-    };
-    (verdict, reason)
-}
-
-/// Does this rule select `schemars` *by name*, rather than reaching it inside a
-/// broader scope? A blanket rule does not, which is what separates "no rule
-/// names it" from "the rule that names it constrains nothing".
-fn names_schemars(rule: &Value) -> Verdict {
-    let mut verdict = Verdict::Excluded;
-    for (key, value) in rule.as_object().into_iter().flatten() {
-        let Some(list) = value.as_array() else { continue };
-        verdict = match selector_subject(key) {
-            Some(Subject::Name) => verdict.or(list_selects(list, PIN_DEPENDENCY, false)),
-            Some(Subject::NamePattern) => verdict.or(list_selects(list, PIN_DEPENDENCY, true)),
-            _ => verdict,
-        };
-    }
-    verdict
-}
-
-/// Does this `ignoreDeps` list name the pinned dependency? Renovate's check is
-/// `config.ignoreDeps.includes(depName)` — plain equality, not a glob.
-fn ignores_pin(value: Option<&Value>) -> bool {
-    value
-        .and_then(|v| v.as_array())
-        .is_some_and(|list| list.iter().any(|entry| entry.as_str() == Some(PIN_DEPENDENCY)))
-}
-
-/// Renovate does not *descend* into a nested `packageRules`. Migration
-/// **flattens** it (`config/migration.ts`), replacing the parent with one
-/// lifted copy per child, each folded through `mergeChildConfig`: the child's
-/// fields win, except that a mergeable array option set on both sides is
-/// concatenated.
-///
-/// Concatenation is a union, not an intersection, which is why a nested rule
-/// cannot be dismissed by reading its parent: a parent scoped to `npm` does not
-/// confine a `cargo` child, it widens the pair to both managers. Flattening
-/// here rather than bailing also keeps an unrelated nested rule — one whose
-/// flattened form cannot reach `schemars` — from reddening this guard.
-fn flatten(rule: &Value) -> Vec<Value> {
-    let Some(fields) = rule.as_object() else {
-        return vec![rule.clone()];
-    };
-    let Some(children) = fields.get("packageRules").and_then(|nested| nested.as_array()) else {
-        return vec![rule.clone()];
-    };
-    let mut parent = fields.clone();
-    parent.remove("packageRules");
-    children
-        .iter()
-        .flat_map(|child| flatten(&fold(&parent, child)))
-        .collect()
-}
-
-/// One `mergeChildConfig` of a nested child onto its parent.
-fn fold(parent: &Map<String, Value>, child: &Value) -> Value {
-    let Some(child) = child.as_object() else {
-        // Not an object, so not something `rule_applies` can read either; hand
-        // it on unchanged and let it get the same answer it would at the top
-        // level.
-        return child.clone();
-    };
-    let mut merged = parent.clone();
-    for (key, value) in child {
-        let folded = match (joins_when_flattened(key), merged.get(key), value) {
-            (true, Some(Value::Array(inherited)), Value::Array(own)) => {
-                Value::Array(inherited.iter().chain(own).cloned().collect())
-            }
-            _ => value.clone(),
-        };
-        merged.insert(key.clone(), folded);
-    }
-    Value::Object(merged)
-}
-
-/// What Renovate resolves for `schemars` once every applying rule is merged.
-struct Resolved {
-    /// The last applying rule's `allowedVersions`, with the label of the rule
-    /// it came from.
-    allowed: Option<(String, String)>,
-    /// The last applying rule to leave it `enabled: false`.
-    disabled: Option<String>,
-    /// The position of the first applying rule to list `schemars` in
-    /// `ignoreDeps`. First, not last: `ignoreDeps` is a mergeable array, so a
-    /// later rule adds to it and none can take a name back out.
-    ignored: Option<String>,
-    /// Did any applying rule select `schemars` by name?
-    named: bool,
-    /// Rules that set `allowedVersions`/`enabled`/`ignoreDeps` but do not
-    /// apply, as `#position (selector)` — the difference between a rule that is
-    /// missing and one that is merely out of reach.
-    sidelined: Vec<String>,
-}
-
-/// Merge every packageRule that applies to `schemars`, in order.
-///
-/// Renovate is last-wins across *all* matching rules, not "the first rule that
-/// names it, then whatever follows": `[<2, <0.9]` resolves to `<0.9`, and a
-/// grouping rule above the pin does not displace it.
-fn resolve_schemars(rules: &[(String, Value)]) -> Result<Resolved> {
-    let mut resolved = Resolved {
-        allowed: None,
-        disabled: None,
-        ignored: None,
-        named: false,
-        sidelined: Vec::new(),
-    };
-    // A flattened child reports its parent's index: that is where a reader
-    // finds it in the file, and the array is identity-flattened when nothing
-    // nests.
-    let flattened: Vec<(String, Value)> = rules
-        .iter()
-        .flat_map(|(label, rule)| flatten(rule).into_iter().map(|rule| (label.clone(), rule)))
-        .collect();
-    for (position, rule) in flattened {
-        let rule = &rule;
-        let allowed = match rule.get("allowedVersions") {
-            None => None,
-            Some(Value::String(range)) => Some(range.clone()),
-            Some(other) => bail!(
-                ".github/renovate.json's {position} sets `allowedVersions` to {other}, which is \
-                 not a string. `allowedVersions` is a string option: a one-element array is migrated to one \
-                 (`config/migration.ts`) and anything else is rejected, and either way \
-                 `renovate-config-validator --strict` fails the config before this guard sees it. Spell it as \
-                 a bare range."
-            ),
-        };
-        let enabled = rule.get("enabled").and_then(|v| v.as_bool());
-        let ignored = ignores_pin(rule.get("ignoreDeps"));
-        let (verdict, reason) = rule_applies(rule);
-        if verdict == Verdict::Selected {
-            resolved.named |= names_schemars(rule) == Verdict::Selected;
-            if let Some(range) = allowed {
-                resolved.allowed = Some((position.clone(), range));
-            }
-            if ignored {
-                resolved.ignored.get_or_insert_with(|| position.clone());
-            }
-            match enabled {
-                Some(false) => resolved.disabled = Some(position.clone()),
-                Some(true) => resolved.disabled = None,
-                None => {}
-            }
-        } else if allowed.is_some() || enabled.is_some() || ignored {
-            let selector = reason.unwrap_or_else(|| "an unnamed selector".into());
-            if verdict == Verdict::Unknown {
-                bail!(
-                    ".github/renovate.json's {position} sets \
-                     `allowedVersions`/`enabled`/`ignoreDeps`, and this guard cannot determine whether \
-                     Renovate applies it to `{PIN_DEPENDENCY}`: `{selector}` settled it, either because \
-                     `selector_subject` does not know that key or because one of its entries is a spelling \
-                     this guard cannot decide (a brace alternation, an extglob, or a regex Rust will not \
-                     compile). A rule Renovate does not apply suppresses nothing while looking exactly like \
-                     one that does, so an unreadable selector must be taught here rather than assumed \
-                     harmless.\nRule: {rule}"
-                );
-            }
-            resolved.sidelined.push(format!("{position} (`{selector}`)"));
-        }
-        // A rule setting neither field cannot change what Renovate resolves
-        // here, so whether it applies never has to be decided.
-    }
-    Ok(resolved)
-}
-
-/// Does `.github/renovate.json` still *effectively* stop Renovate proposing a
-/// `schemars` bump past [`PINNED_SERIES`]?
-///
-/// Effectively, not merely present. The config is resolved the way Renovate
-/// resolves it — every rule that applies to `schemars` under `cargo`, merged
-/// last-wins — and the result must satisfy all of:
-///
-/// - some rule has to apply at all. Every `match*`/`exclude*` selector narrows
-///   the set a rule reaches, and one this guard cannot evaluate is rejected
-///   rather than ignored (see [`selector_subject`]);
-/// - it must not resolve to `enabled: false`, nor to an `ignoreDeps` naming
-///   `schemars` — Renovate's two spellings for the same skip, both of which
-///   also block 0.8.x patches, the reason the rule is a range in the first
-///   place;
-/// - the resolved `allowedVersions` must exclude the next series up, evaluated
-///   as an interval against the one [`PINNED_SERIES`] names, while still
-///   admitting the whole patch tail inside it.
-pub fn check_renovate_rule(config: &str) -> Result<()> {
-    let doc: Value = serde_json::from_str(config).context("failed to parse .github/renovate.json")?;
-    let manager = doc.get(PIN_MANAGER);
-    // `config/index.ts` folds the manager's own block into the config with
-    // `mergeChildConfig`, and `packageRules` is a mergeable array — so
-    // `cargo.packageRules` is **appended** to the top-level ones and therefore
-    // wins every last-wins contest against them.
-    let empty = Vec::new();
-    let top_level = doc.get("packageRules").and_then(|r| r.as_array()).unwrap_or(&empty);
-    let manager_scoped = manager
-        .and_then(|block| block.get("packageRules"))
-        .and_then(|r| r.as_array())
-        .unwrap_or(&empty);
-    let label = |source: &str, index: usize| format!("{source} #{index}");
-    let rules: Vec<(String, Value)> = top_level
-        .iter()
-        .enumerate()
-        .map(|(index, rule)| (label("packageRule", index), rule.clone()))
-        .chain(
-            manager_scoped
-                .iter()
-                .enumerate()
-                .map(|(index, rule)| (label(&format!("`{PIN_MANAGER}.packageRules`"), index), rule.clone())),
-        )
-        .collect();
-    let resolved = resolve_schemars(&rules)?;
-
-    // `fetch.js` reads the ignore a few lines above the `enabled === false`
-    // branch and after the same packageRules merge, so this check goes first
-    // too. Both options are also settable outside `packageRules` — `enabled`
-    // lists `.` and every manager among its `parents` — where no selector has
-    // to reach `schemars` for them to skip it.
-    let ignore_site = match (
-        ignores_pin(doc.get("ignoreDeps")),
-        ignores_pin(manager.and_then(|block| block.get("ignoreDeps"))),
-        resolved.ignored,
-    ) {
-        (true, _, _) => Some("the top-level `ignoreDeps`".to_string()),
-        (_, true, _) => Some(format!("`{PIN_MANAGER}.ignoreDeps`")),
-        (_, _, Some(position)) => Some(format!("`ignoreDeps` on {position}")),
-        (false, false, None) => None,
-    };
-    if let Some(site) = ignore_site {
-        bail!(
-            ".github/renovate.json lists `{PIN_DEPENDENCY}` in {site}. `fetch.js` sets \
-             `skipReason: \"ignored\"` just above the `enabled === false` branch and both run after the \
-             packageRules merge, so an ignore is `enabled: false` under a second name: it suppresses the \
-             impossible bump but also every {PINNED_SERIES}.x patch, including a security one — which is \
-             exactly why the pin is written as an `allowedVersions` range instead. Nothing takes a name back \
-             out of `ignoreDeps`; drop it and leave the range to do the suppressing."
-        );
-    }
-
-    let disabled_outside = [
-        ("the top level", doc.get("enabled")),
-        (PIN_MANAGER, manager.and_then(|b| b.get("enabled"))),
-    ]
-    .into_iter()
-    .find(|(_, value)| value.and_then(|v| v.as_bool()) == Some(false))
-    .map(|(site, _)| site);
-    if let Some(site) = disabled_outside {
-        bail!(
-            ".github/renovate.json sets `enabled: false` at {site}, which turns `{PIN_DEPENDENCY}` off \
-             without any selector having to reach it. That suppresses the impossible bump but also every \
-             {PINNED_SERIES}.x patch, including a security one — which is exactly why the pin is written as \
-             an `allowedVersions` range instead. Re-enable it and let the range do the suppressing."
-        );
-    }
-
-    if let Some(position) = resolved.disabled {
-        bail!(
-            ".github/renovate.json resolves `{PIN_DEPENDENCY}` to `enabled: false` ({position}). \
-             That suppresses the impossible bump but also every {PINNED_SERIES}.x patch, including a security \
-             one — which is exactly why the pin is written as an `allowedVersions` range instead. Renovate \
-             merges every applying rule last-wins, so a later blanket disable counts for as much as the pin \
-             rule's own fields. Restore the range."
-        );
-    }
-
-    let Some((position, allowed)) = resolved.allowed else {
-        if resolved.named {
-            bail!(
-                ".github/renovate.json's `{PIN_DEPENDENCY}` rule declares no `allowedVersions`. Naming the \
-                 dependency constrains nothing on its own; the range is what suppresses the bump past \
-                 {PINNED_SERIES}."
-            );
-        }
-        let sidelined = match resolved.sidelined.as_slice() {
-            [] => String::new(),
-            out_of_reach => format!(
-                " {} sets `allowedVersions`/`enabled`/`ignoreDeps`, but that selector keeps it off \
-                 `{PIN_DEPENDENCY}` as a `{PIN_MANAGER}` dependency of {PIN_MANIFEST}, so Renovate never \
-                 applies it.",
-                out_of_reach.join(", ")
-            ),
-        };
-        bail!(
-            ".github/renovate.json has no packageRule naming `{PIN_DEPENDENCY}` that Renovate would apply to \
-             it.{sidelined} Without one Renovate re-proposes the bump past {PINNED_SERIES} that `{UPSTREAM}` \
-             cannot compile against — bindreams/hole#379, permanently red. Restore the rule, or, if upstream \
-             has moved, delete this module too."
-        )
-    };
-
-    if let Some(admitted) = requirement_admits_beyond_pin(&allowed)? {
-        bail!(
-            ".github/renovate.json resolves `{PIN_DEPENDENCY}` to `allowedVersions` `{allowed}` \
-             ({position}), which admits {admitted} — outside the {PINNED_SERIES} series `{UPSTREAM}` \
-             requires. The rule is present but no longer suppresses anything: Renovate will propose the bump \
-             that fails crates/common/build.rs with E0603 (bindreams/hole#379). Renovate merges every \
-             applying rule last-wins, so this is the range that applies. Narrow it back to the \
-             {PINNED_SERIES} series."
-        );
-    }
-
-    let reach = series_reach(&parse_requirement(&allowed)?)?;
-    if !matches!(reach, SeriesReach::WholeTail) {
-        bail!(
-            ".github/renovate.json resolves `{PIN_DEPENDENCY}` to `allowedVersions` `{allowed}` \
-             ({position}), which {}, so no such patch can ever land — a security one included. The rule is a \
-             range rather than `enabled: false` precisely to keep {PINNED_SERIES}.x patches flowing, and the \
-             number the next one will carry is not knowable in advance; widen it back to the whole \
-             {PINNED_SERIES} series.",
-            reach.describe()
-        );
-    }
-    Ok(())
-}
-
 // Entry points ========================================================================================================
 
-/// Every check sourceable from tracked files: the resolved upstream version,
-/// the Renovate rule, and the local pin.
+/// Every check sourceable from tracked files: the resolved upstream version
+/// and the local pin.
 ///
 /// Split out from [`verify`] because this half needs no registry and therefore
 /// runs in the nextest archive lane, where `cargo metadata` cannot resolve the
@@ -1481,8 +779,7 @@ pub fn verify_offline(repo_root: &Path) -> Result<()> {
         );
     }
 
-    check_renovate_rule(&read(repo_root, ".github/renovate.json")?)?;
-    check_local_pin(&read(repo_root, PIN_MANIFEST)?)?;
+    check_local_pin(&read(repo_root, LOCAL_MANIFEST)?)?;
     Ok(())
 }
 

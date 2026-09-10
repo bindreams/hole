@@ -579,13 +579,14 @@ jobs:
   # runner: the gate logic is platform-independent (domainsocket is !windows).
   # `.github/renovate.json` is only ever executed by Renovate's own bot, so a
   # typo in it (`matchDepNamez`, a number where a duration string belongs) is
-  # silently ignored rather than reported anywhere this repo can see. The
-  # schemars pin depends on one of those rules actually applying — see
-  # xtask/src/schemars_pin.rs, which checks that the rule is *effective* but
-  # takes its schema for granted. This is the other half: the rule exists, and
-  # it is spelled in a way Renovate accepts. Linux, measured at 25s for the step
-  # and 31s for the job; deliberately not folded into `Lint`, which is a Windows
-  # job with a Rust toolchain it does not need.
+  # silently ignored rather than reported anywhere this repo can see. This
+  # catches that the config is schema-valid; it says nothing about whether a
+  # given rule actually applies to a given dependency (xtask/src/schemars_pin.rs
+  # no longer models that either — the schemars rule is best-effort suppression,
+  # not something this repo verifies is "effective"; see that module's doc).
+  # Linux, measured at 25s for the step and 31s for the job; deliberately not
+  # folded into `Lint`, which is a Windows job with a Rust toolchain it does not
+  # need.
   renovate-config:
     name: Validate renovate config
     runs-on: ubuntu-latest
