@@ -1,10 +1,7 @@
 use super::*;
 use std::net::IpAddr;
 
-// Aliased: this file already has its own `const TUN: &str = "hole-tun"` (the
-// interface-name fixture for the lockdown ruleset builder tests), colliding
-// with the `TUN` skuld label.
-use crate::{GLOBAL_NET_STATE, TUN as TUN_LABEL};
+use crate::{GLOBAL_NET_STATE, TUN};
 
 fn v4() -> IpAddr {
     "203.0.113.7".parse().unwrap()
@@ -280,10 +277,14 @@ fn ensure_trailing_nl_keeps_single_newline() {
 
 // build_lockdown_main_ruleset (authoritative main-ruleset replace) ====================================================
 
-const TUN: &str = "hole-tun";
+/// The interface-name fixture. Named `TUN_IF`, not `TUN`: `TUN` is the crate's
+/// skuld label, and `#[skuld::test(serial = ...)]` takes a bare `Ident` that it
+/// stringifies rather than resolves, so shadowing or aliasing that name yields a
+/// serial filter matching nothing — silently unserialized, not a compile error.
+const TUN_IF: &str = "hole-tun";
 
 fn lockdown(ip: IpAddr, nat: &str) -> String {
-    build_lockdown_main_ruleset(TUN, ip, nat)
+    build_lockdown_main_ruleset(TUN_IF, ip, nat)
 }
 
 #[skuld::test]
@@ -995,14 +996,11 @@ fn an_empty_but_captured_baseline_still_restores_the_snapshot() {
 ///   KNOWN blocked and any success at all is a leak — no phase filtering, no
 ///   carve-outs.
 ///
-/// The cold post-condition is not a formality. `engage` loads the ruleset
-/// BEFORE `-E` when pf starts disabled (loading is a documented no-op while pf
-/// is off), so the instant pf goes live it is already enforcing our ruleset
-/// rather than whatever happened to be loaded — and the failure mode that
-/// ordering has to avoid is the INERT cover: `engage` returning Ok with the
-/// ruleset loaded but pf never actually enabled, reported armed while egress
-/// runs in the clear. A load that outright fails already surfaces as an Err
-/// from `engage`; only a settled connect catches the silent half.
+/// The cold post-condition is not a formality: the failure mode it catches is
+/// the INERT cover — `engage` returning Ok with the ruleset loaded but pf never
+/// actually enabled, reported armed while egress runs in the clear. A load that
+/// outright fails already surfaces as an Err from `engage`; only a settled
+/// connect catches the silent half.
 ///
 /// Lives here (not `lockdown_privileged_tests.rs`) because it must retire an
 /// intermediate cover's pf enable refcount WITHOUT running its normal
@@ -1033,7 +1031,7 @@ fn an_empty_but_captured_baseline_still_restores_the_snapshot() {
 /// probers keep the number of in-flight SYNs high at every instant instead of
 /// only between a single thread's timeouts.
 #[cfg(target_os = "macos")]
-#[skuld::test(labels = [TUN_LABEL, GLOBAL_NET_STATE], serial = TUN_LABEL)]
+#[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
 fn macos_failclosed_cover_transition_never_admits_blocked_flow() {
     use std::net::TcpStream;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -1144,6 +1142,30 @@ fn macos_failclosed_cover_transition_never_admits_blocked_flow() {
         })
         .collect();
 
+    // POSITIVE CONTROL for `PROBER_TIMEOUT`. The strict assertion below is "no
+    // prober ever connected" — which is equally what a timeout too short to
+    // complete ANY handshake on this runner would produce, silently. One extra
+    // thread probes, at the same timeout over the same run, the servers the
+    // covers PERMIT: a single success anywhere proves the budget is live, so
+    // the silence next door is the cover's doing and not the clock's. It
+    // alternates its two targets instead of reading `phase`, so one of them is
+    // always the currently-permitted one and it needs no synchronization with
+    // the loop.
+    let control_hits = Arc::new(AtomicUsize::new(0));
+    let control = {
+        let (control_hits, stop_control) = (control_hits.clone(), stop.clone());
+        std::thread::spawn(move || {
+            let mut attempts = 0usize;
+            while !stop_control.load(Ordering::SeqCst) {
+                let target = format!("{}:443", [SERVER_A, SERVER_B][attempts % 2]);
+                attempts += 1;
+                if connect(&target, PROBER_TIMEOUT).is_ok() {
+                    control_hits.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+        })
+    };
+
     for i in 1..=TRANSITIONS {
         phase.store(i, Ordering::SeqCst);
         let server_ip: IpAddr = addrs[i % addrs.len()].parse().unwrap();
@@ -1155,7 +1177,7 @@ fn macos_failclosed_cover_transition_never_admits_blocked_flow() {
             // loaded. The refcount stays balanced: this engage's own `-E`
             // already ran, so this `-X` brings it back down by exactly one.
             let _ = pfctl(&["-X", &old.token], None, BestEffortPhase::RecoverCover);
-            std::mem::forget(old);
+            old.detach();
         }
         held = Some(new_cover);
     }
@@ -1165,6 +1187,7 @@ fn macos_failclosed_cover_transition_never_admits_blocked_flow() {
         .into_iter()
         .map(|p| p.join().expect("prober thread panicked"))
         .sum();
+    control.join().expect("control prober thread panicked");
     assert!(
         attempts > 0,
         "prober pool made no attempts at all — this test is vacuous"
@@ -1178,6 +1201,14 @@ fn macos_failclosed_cover_transition_never_admits_blocked_flow() {
          transaction; leaked_at_phase={} (0 = the cold cover, steady, before any transition \
          began; >=1 = that transition)",
         leaked_at_phase.load(Ordering::SeqCst),
+    );
+
+    assert!(
+        control_hits.load(Ordering::SeqCst) > 0,
+        "positive control: not one connect to a PERMITTED server ({SERVER_A}/{SERVER_B}) completed \
+         within {PROBER_TIMEOUT:?} across the whole run, so that budget cannot complete a handshake \
+         on this runner at all and the never-admitted assertion above held vacuously — raise \
+         PROBER_TIMEOUT rather than trusting the green"
     );
 
     // The last cover's normal Drop restores /etc/pf.conf.

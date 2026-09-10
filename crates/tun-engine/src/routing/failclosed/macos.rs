@@ -12,15 +12,18 @@
 //!   intervening `disengage`). A bare `pfctl -f -` load is a single pf
 //!   transaction (DIOCADDRULE stages into an inactive ruleset under a ticket,
 //!   DIOCXCOMMIT swaps it in atomically under `pf_lock`), so the old ruleset
-//!   stays authoritative right up until the new one is fully committed. The
-//!   same class of gap exists on a COLD engage (pf currently disabled): `-E`
-//!   and `-f -` are always two separate pfctl invocations, so enabling before
-//!   loading would turn filtering on with whatever ruleset already happened
-//!   to be loaded, briefly, before ours committed. `engage`/`engage_lockdown`
-//!   close this by ordering load before enable specifically when pf starts
-//!   disabled — loading is a documented no-op while pf is off (rules and the
-//!   enable bit are independent pf state) — so the instant either function
-//!   turns pf on, it is already enforcing the ruleset it just loaded.
+//!   stays authoritative right up until the new one is fully committed.
+//!   A COLD engage (pf currently disabled) has NO gap of that class, and both
+//!   engages deliberately keep `-E` first there. pf enforces nothing while
+//!   disabled, so the pre-`-E` host is already maximally open and `-E` can
+//!   only ADD filtering, whatever ruleset happens to be loaded; loading first
+//!   would lengthen the fully-open stretch by one `pfctl` spawn, not shorten
+//!   it. Order matters the other way instead: enabling is what makes the host
+//!   dark, so it must precede the persist, or a failed `state::save` strands a
+//!   blocking host with no file to recover it from (see `engage`'s step 3).
+//!   pf state minted under the stale ruleset during that window survives our
+//!   load, but that is the state-purge gap (bindreams/hole#1015), not an
+//!   ordering one — reordering closes no part of it.
 //! - **Standing lockdown** (`engage_lockdown`/`lockdown_disengage`): loads a
 //!   self-contained MAIN ruleset (NO `-Fa`) that carries the host's translation
 //!   rules forward and blocks all egress except the TUN and server IP. Disengage
@@ -28,8 +31,7 @@
 //!   not a blind `/etc/pf.conf` reload — and drops the refcount. Engage
 //!   idempotently ENSURES pf is enabled (pf is disabled — and its refcount reset
 //!   — across a reboot, but the state file persists), so a reconnect re-enables
-//!   pf and loads a live ruleset instead of an inert one; when it was disabled
-//!   it also gets the same load-before-enable ordering as the transient cover.
+//!   pf and loads a live ruleset instead of an inert one.
 //!
 //! Documented caveats (pf has no programmatic API — `pfctl` text I/O IS the
 //! interface, as `netsh`/`route` are for routing):
@@ -275,43 +277,15 @@ pub fn engage(
     // 1. Read current enabled-state (read-only).
     let info = pfctl_stdout(pfctl(&["-s", "info"], None, FatalPhase::CoverEngage), "pfctl -s info")?;
     let was_enabled = parse_pf_enabled(&info);
-    let ruleset = build_pf_ruleset(server_ip, resolver_ip);
 
-    // 2a. COLD engage only (pf currently disabled): a cold-start residual of
-    //     bindreams/hole#997, found by this module's own transition test —
-    //     `pfctl -E` alone would turn filtering ON with whatever ruleset
-    //     already happens to be loaded (the host's own, stale, or none),
-    //     an open window between enable and our load with the exact same
-    //     shape as the removed `-Fa` gap: two separate pf kernel
-    //     transactions with an unprotected ruleset briefly the enforced
-    //     one. Loading OUR ruleset now is a documented no-op while pf stays
-    //     disabled (enable/disable and the loaded ruleset are independent
-    //     pf state; nothing is enforced either way yet), so a load failure
-    //     here has mutated nothing and needs no unwind. Enabling second
-    //     (step 2b) then makes the very first instant pf enforces anything,
-    //     it enforces our already-loaded ruleset — zero window.
-    if !was_enabled {
-        let pre = pfctl(&["-f", "-"], Some(ruleset.as_bytes()), FatalPhase::CoverEngage)?;
-        if !pre.status.success() {
-            return Err(RoutingError::RouteSetup(format!(
-                "pfctl load failed: {}",
-                String::from_utf8_lossy(&pre.stderr).trim()
-            )));
-        }
-    }
-
-    // 2b. Enable pf (refcounted) and capture the token. When pf was already
-    //     enabled (step 2a was skipped), this is a refcount-only bump with
-    //     no live-filtering effect, so the ruleset already in force (loaded
-    //     in step 4 below) stays authoritative straight through. When it
-    //     wasn't, this is the exact instant blocking begins, already atomic
-    //     with the load in step 2a above.
+    // 2. Enable pf (refcounted) and capture the token. This runs BEFORE the
+    //    load in both the warm and the cold case — see this module's doc for
+    //    why a cold engage has no window to close by reordering, and why
+    //    reordering would break step 3.
     let token = enable_pf_capture_token()?;
 
-    // 3. Persist (persist-before-mutate), so a crash after this point is
-    //    recoverable (`pfctl -X <token>`). This is before the only mutation
-    //    still ahead in the warm case (step 4) and right after the one
-    //    mutation there was in the cold case (step 2b) — never after both.
+    // 3. Persist BEFORE loading the blocking ruleset (persist-before-mutate),
+    //    so a crash after this point is recoverable (`pfctl -X <token>`).
     state::save(
         state_dir,
         &state::FailClosedState {
@@ -323,42 +297,39 @@ pub fn engage(
     )
     .map_err(|e| RoutingError::RouteSetup(format!("failed to persist failclosed-state: {e}")))?;
 
-    // 4. WARM engage only: load our self-contained blocking ruleset from
-    //    stdin — NO `-Fa` (bindreams/hole#997): a bare `pfctl -f -` is one
-    //    atomic pf transaction (see this module's doc), so whatever ruleset
-    //    was already loaded (the host's own, or a still-live prior cover's)
-    //    stays authoritative until this one fully commits. A cold engage
-    //    already loaded this identical ruleset in step 2a, before pf ever
-    //    went live, so it is not repeated here.
-    if was_enabled {
-        let out = pfctl(&["-f", "-"], Some(ruleset.as_bytes()), FatalPhase::CoverEngage)?;
-        if !out.status.success() {
-            // A *failed engage* is the sole place this module fails OPEN on its own
-            // error: we must not leave a half-loaded ruleset blocking traffic. A
-            // failed `pfctl -f -` load never committed (the ticket discipline that
-            // makes a successful load atomic also makes a failed one a no-op on
-            // the live ruleset), so the host still runs whatever was loaded
-            // before this call — restoring `/etc/pf.conf` here does not "undo a
-            // flush" (there is none), it returns the host to its canonical
-            // baseline rather than leaving it under a stale cover ruleset. The
-            // PR3 cutover treats an engage error as fatal and aborts before
-            // stopping the old bridge, so the tunnel is never torn down
-            // uncovered. No standing cover is being adopted on this
-            // engage-failure path, so the `/etc/pf.conf` restore must run.
-            //
-            // Known residual (bindreams/hole#1004, not fixed here): if THIS call
-            // is a transition over a still-live prior cover (see this module's
-            // doc), that prior cover's ruleset was still loaded and still
-            // blocking right up until this failed load — the `/etc/pf.conf`
-            // reload below replaces it with the open host baseline rather than
-            // leaving the still-good prior ruleset in place. `engage` has no
-            // parameter today to tell "first engage" from "transition" apart.
-            disengage(&token, state_dir, false);
-            return Err(RoutingError::RouteSetup(format!(
-                "pfctl load failed: {}",
-                String::from_utf8_lossy(&out.stderr).trim()
-            )));
-        }
+    // 4. Load our self-contained blocking ruleset from stdin — NO `-Fa`
+    //    (bindreams/hole#997): a bare `pfctl -f -` is one atomic pf
+    //    transaction (see this module's doc), so whatever ruleset was already
+    //    loaded (the host's own, or a still-live prior cover's) stays
+    //    authoritative until this one fully commits.
+    let ruleset = build_pf_ruleset(server_ip, resolver_ip);
+    let out = pfctl(&["-f", "-"], Some(ruleset.as_bytes()), FatalPhase::CoverEngage)?;
+    if !out.status.success() {
+        // A *failed engage* is the sole place this module fails OPEN on its own
+        // error: we must not leave a half-loaded ruleset blocking traffic. A
+        // failed `pfctl -f -` load never committed (the ticket discipline that
+        // makes a successful load atomic also makes a failed one a no-op on
+        // the live ruleset), so the host still runs whatever was loaded
+        // before this call — restoring `/etc/pf.conf` here does not "undo a
+        // flush" (there is none), it returns the host to its canonical
+        // baseline rather than leaving it under a stale cover ruleset. The
+        // PR3 cutover treats an engage error as fatal and aborts before
+        // stopping the old bridge, so the tunnel is never torn down
+        // uncovered. No standing cover is being adopted on this
+        // engage-failure path, so the `/etc/pf.conf` restore must run.
+        //
+        // Known residual (bindreams/hole#1004, not fixed here): if THIS call
+        // is a transition over a still-live prior cover (see this module's
+        // doc), that prior cover's ruleset was still loaded and still
+        // blocking right up until this failed load — the `/etc/pf.conf`
+        // reload below replaces it with the open host baseline rather than
+        // leaving the still-good prior ruleset in place. `engage` has no
+        // parameter today to tell "first engage" from "transition" apart.
+        disengage(&token, state_dir, false);
+        return Err(RoutingError::RouteSetup(format!(
+            "pfctl load failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
     }
 
     Ok(Cover {
@@ -450,20 +421,26 @@ pub fn recover_cover(state_dir: &Path, adopting: bool) {
 
 // --- lockdown layer ---
 
-/// Snapshot the host's filter (`-sr`) and translation (`-sn`) rules. Read-only
-/// — independent of pf's enable/disable state — so `engage_lockdown` can call
-/// this before ever touching `-E`, needed to build the main ruleset up front
-/// for the cold-engage load-before-enable ordering (this module's doc).
+/// Snapshot the host's filter (`-sr`) and translation (`-sn`) rules and persist
+/// them with `token` (persist-before-mutate). Returns the nat snapshot for the
+/// engage ruleset. Separated so its `?`-error path can be unwound (drop the pf
+/// refcount) by the caller without leaking the `-E` enable.
+///
+/// Runs before `engage_lockdown` loads anything, and that is load-bearing: once
+/// our own labelled ruleset is the loaded one, `pfctl -sr` no longer sees the
+/// host's policy, and the state file that would otherwise hold it does not
+/// exist yet. A mutation ahead of this capture therefore destroys the only copy
+/// of the baseline, permanently — every later engage re-reads its own cover.
 ///
 /// The presence probe leads: if OUR OWN cover is already the loaded ruleset,
 /// `pfctl -sr` would hand back our block-all as if it were the host's policy.
 /// Detection asks [`lockdown_cover_presence`] rather than parsing rule text, so
 /// it depends on no claim about `pfctl -sr`'s print format.
-fn capture_baseline(state_dir: &Path) -> Result<(crate::routing::CoverPresence, String, String), RoutingError> {
+fn capture_and_persist(token: &str, state_dir: &Path, owner: Option<(u32, u32)>) -> Result<String, RoutingError> {
     let presence = lockdown_cover_presence(state_dir);
     let main_snapshot = pfctl_stdout(pfctl(&["-sr"], None, FatalPhase::CoverEngage), "pfctl -sr")?;
     let nat_snapshot = pfctl_stdout(pfctl(&["-sn"], None, FatalPhase::CoverEngage), "pfctl -sn")?;
-    Ok((presence, main_snapshot, nat_snapshot))
+    persist_baseline(token, state_dir, owner, presence, main_snapshot, nat_snapshot)
 }
 
 /// Persist the engage-time baseline. Pure over its inputs — the snapshots and
@@ -513,18 +490,16 @@ fn persist_baseline(
 /// read) so the ruleset never loads into a disabled, INERT pf. The three cases
 /// (single-line bullets keep clippy's doc_lazy_continuation happy):
 ///
-/// - `FreshEnable` (no persisted state): snapshot `pfctl -sr` (filter) and `pfctl -sn` (nat) first (read-only, works either way pf is enabled), then `pfctl -E` (refcount) + capture token, persist {token, snapshots} before mutating.
+/// - `FreshEnable` (no persisted state): `pfctl -E` (refcount) + capture token, snapshot `pfctl -sr` (filter) and `pfctl -sn` (nat), persist {token, snapshots} before mutating.
 /// - `ReuseToken` (Adopt re-engage, pf still enabled): reuse the persisted token + snapshots; re-running `-sr`/`-sn` would snapshot our OWN lockdown ruleset as the host and lose the real host policy.
 /// - `Reenable` (Adopt re-engage but pf DISABLED, e.g. a reboot reset pf and its refcount): the persisted token is stale, so `pfctl -E` for a FRESH token and re-persist it under the SAME host snapshot. Without this the ruleset loads into a disabled pf and the cover is inert while reported active — egress in the clear during an armed session, not just the boot window.
 ///
 /// Then load the self-contained main ruleset via `pfctl -f -` (NO `-Fa`), so the
-/// block takes effect while host translation is carried forward. When pf is
-/// currently DISABLED at entry (`Reenable`, always; `FreshEnable`, sometimes),
-/// this load happens BEFORE `-E` instead of after — the same cold-engage
-/// ordering fix as `engage` (this module's doc): a documented no-op while pf
-/// is off, so the instant `-E` turns pf on, it is already enforcing this
-/// ruleset, closing the same-shaped window `-Fa`'s removal closed for the
-/// warm/transition case.
+/// block takes effect while host translation is carried forward. The load is
+/// LAST in every case, including a cold one: it must not precede
+/// `capture_and_persist`'s snapshot (which it would overwrite — see that
+/// function's doc), and a cold engage has no window that reordering could close
+/// (this module's doc).
 ///
 /// On load failure the host is restored (`lockdown_disengage`) and Err returned;
 /// the bridge's fail-FATAL caller aborts the start.
@@ -540,47 +515,21 @@ pub fn engage_lockdown(
     let pf_enabled = parse_pf_enabled(&info);
     let persisted = lockdown_state::load(state_dir);
 
-    let token = match engage_pf_action(pf_enabled, persisted.is_some()) {
+    let (token, nat_snapshot) = match engage_pf_action(pf_enabled, persisted.is_some()) {
         // Live Adopt re-engage within one boot: pf still enabled and we hold the
         // token+snapshot. Reuse both so the real host policy is preserved for the
         // eventual restore. ReuseToken assumes our refcount is still live (the
-        // reboot case is `Reenable`); do not double `-E`. pf is already enabled
-        // here (this arm's precondition), so the load below is already one
-        // atomic transaction over whatever is currently live — no reordering
-        // needed.
+        // reboot case is `Reenable`); do not double `-E`.
         PfEngageAction::ReuseToken => {
             let st = persisted.expect("ReuseToken implies persisted state");
-            let main = build_lockdown_main_ruleset(tun_name, server_ip, &st.nat_snapshot);
-            let out = pfctl(&["-f", "-"], Some(main.as_bytes()), FatalPhase::CoverEngage)?;
-            if !out.status.success() {
-                lockdown_disengage(state_dir);
-                return Err(RoutingError::RouteSetup(format!(
-                    "pfctl lockdown load failed: {}",
-                    String::from_utf8_lossy(&out.stderr).trim()
-                )));
-            }
-            st.pf_token
+            (st.pf_token, st.nat_snapshot)
         }
         // Persisted state survived but pf was disabled (reboot reset pf and its
         // refcount). Enable afresh and re-persist the SAME host snapshot under the
         // fresh token — never re-snapshot the live lockdown ruleset. The single
         // `pfctl -X <fresh-token>` on disengage matches this single `-E`.
-        //
-        // pf is DISABLED here (this arm's precondition): load the already-known
-        // ruleset FIRST, while it is inert (pf's enable bit and its loaded
-        // ruleset are independent state; nothing is enforced either way yet),
-        // THEN enable — so the instant pf goes live it is already enforcing
-        // this ruleset. A load failure here mutated nothing, so needs no unwind.
         PfEngageAction::Reenable => {
             let st = persisted.expect("Reenable implies persisted state");
-            let main = build_lockdown_main_ruleset(tun_name, server_ip, &st.nat_snapshot);
-            let pre = pfctl(&["-f", "-"], Some(main.as_bytes()), FatalPhase::CoverEngage)?;
-            if !pre.status.success() {
-                return Err(RoutingError::RouteSetup(format!(
-                    "pfctl lockdown load failed: {}",
-                    String::from_utf8_lossy(&pre.stderr).trim()
-                )));
-            }
             let token = enable_pf_capture_token()?;
             let fresh = lockdown_state::LockdownPfState {
                 version: lockdown_state::SCHEMA_VERSION,
@@ -600,55 +549,37 @@ pub fn engage_lockdown(
                     "failed to re-persist lockdown-pf-state: {e}"
                 )));
             }
-            token
+            (token, st.nat_snapshot)
         }
-        // First engage: snapshot the host up front (read-only, safe regardless
-        // of pf's enabled state), then the same was-pf-enabled split as
-        // `Reenable` above to close the cold-engage window: load before enable
-        // when pf started disabled, enable before load (as before) when it was
-        // already on.
+        // First engage: enable + snapshot the host.
         PfEngageAction::FreshEnable => {
-            let (presence, main_snapshot, nat_snapshot) = capture_baseline(state_dir)?;
-            let main = build_lockdown_main_ruleset(tun_name, server_ip, &nat_snapshot);
-
-            if !pf_enabled {
-                let pre = pfctl(&["-f", "-"], Some(main.as_bytes()), FatalPhase::CoverEngage)?;
-                if !pre.status.success() {
-                    return Err(RoutingError::RouteSetup(format!(
-                        "pfctl lockdown load failed: {}",
-                        String::from_utf8_lossy(&pre.stderr).trim()
-                    )));
-                }
-            }
-
             let token = enable_pf_capture_token()?;
-            // The refcount is now held. Persisting may fail, so undo the `-E`
-            // on any error before propagating — else the refcount leaks with
-            // no state file to recover it from. In the cold branch above the
-            // ruleset is already live at this point; unwinding here still
-            // correctly drops the refcount (disabling pf back down), leaving
-            // the now-inert ruleset loaded but unenforced.
-            if let Err(e) = persist_baseline(&token, state_dir, owner, presence, main_snapshot, nat_snapshot.clone()) {
-                if let Err(xe) = pfctl(&["-X", &token], None, FatalPhase::CoverEngage) {
-                    tracing::warn!(error = %xe, "pfctl -X failed unwinding a failed lockdown engage");
-                }
-                return Err(e);
-            }
-
-            if pf_enabled {
-                let out = pfctl(&["-f", "-"], Some(main.as_bytes()), FatalPhase::CoverEngage)?;
-                if !out.status.success() {
-                    lockdown_disengage(state_dir);
-                    return Err(RoutingError::RouteSetup(format!(
-                        "pfctl lockdown load failed: {}",
-                        String::from_utf8_lossy(&out.stderr).trim()
-                    )));
+            // The refcount is now held. Capture + persist may fail, so undo the
+            // `-E` on any error before propagating — else the refcount leaks with
+            // no state file to recover it from.
+            match capture_and_persist(&token, state_dir, owner) {
+                Ok(nat_snapshot) => (token, nat_snapshot),
+                Err(e) => {
+                    if let Err(xe) = pfctl(&["-X", &token], None, FatalPhase::CoverEngage) {
+                        tracing::warn!(error = %xe, "pfctl -X failed unwinding a failed lockdown engage");
+                    }
+                    return Err(e);
                 }
             }
-
-            token
         }
     };
+
+    let main = build_lockdown_main_ruleset(tun_name, server_ip, &nat_snapshot);
+    let out = pfctl(&["-f", "-"], Some(main.as_bytes()), FatalPhase::CoverEngage)?;
+    if !out.status.success() {
+        // Restore the host (snapshot reload + drop refcount) before failing, so
+        // a partially-loaded ruleset never strands the host.
+        lockdown_disengage(state_dir);
+        return Err(RoutingError::RouteSetup(format!(
+            "pfctl lockdown load failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
+    }
 
     Ok(Cover {
         token,

@@ -1134,12 +1134,26 @@ milliseconds.
   commit removed is kept alive by `rule->states`. So a flow that already holds a
   state entry when a cover engages never reaches `block out all`. `-Fa` used to
   purge state as a side effect of flushing everything; a bare `pfctl -f -` does
-  not. This bites **only** when pf was already enabled by someone else (Docker,
-  another VPN, Internet Sharing): pf creates no state while disabled
-  (`pf_af_hook` bails on `!pf_is_enabled`), stock macOS ships pf loaded but not
-  enabled, and `Cover::drop` returns the refcount to zero between sessions — so
-  the ordinary cold engage has no state to purge, and load-before-enable makes
-  it strictly tighter than the old `-E`-first order. The standing lockdown has
+  not. It bites wherever pf is enabled while a ruleset swap happens, and that
+  is **not only** when a third party (Docker, another VPN, Internet Sharing)
+  enabled it — Hole's own paths reach it too:
+
+  - a transient→transient TRANSITION, where `engage` alternates which server
+    is permitted: the old server's flows hold state and survive into a ruleset
+    that no longer permits them;
+  - a transient→lockdown transition: the transient cover permits the `ech-doh`
+    resolver on TCP/443 and the lockdown ruleset does not, so those flows
+    survive the swap;
+  - a cold engage's own `-E`-then-load window, which briefly mints state under
+    the stale ruleset. Reordering does not fix this: load-then-enable mints no
+    state in the window but leaves the host fully unfiltered across it
+    instead, and it breaks persist-before-mutate — see "Enable before load"
+    below.
+
+  A genuinely cold, never-enabled host has nothing to purge: pf creates no
+  state while disabled (`pf_af_hook` bails on `!pf_is_enabled`), stock macOS
+  ships pf loaded but not enabled, and `Cover::drop` returns the refcount to
+  zero between sessions. The standing lockdown has
   the same gap and always has (it never used `-Fa`), which is the half that
   matters for a kill switch; Windows shares it structurally, filtering at
   `ALE_AUTH_CONNECT`/`RECV_ACCEPT` rather than per packet. Fixing it is deferred
@@ -1148,32 +1162,31 @@ milliseconds.
   targeted kill needs `DIOCKILLSTATES`' `neg` flag, which macOS's `pfctl` CLI
   cannot set — hence sequencing behind bindreams/hole#1002.
 
-  **Load before enable on a COLD engage** (guarded by the same
-  `macos_failclosed_cover_transition_never_admits_blocked_flow` test, via a
-  deliberately *different* assertion — see below): `pfctl -E`
-  (enable) and `pfctl -f -` (load) are always two separate `pfctl`
-  invocations, so enabling before loading is the same *shape* of bug as `-Fa`
-  — two separate pf kernel transactions with an open ruleset briefly live —
-  just triggered by cold-start ordering rather than `-Fa`. If pf starts
-  DISABLED, enabling first turns filtering ON with whatever ruleset already
-  happened to be loaded (the host's own, stale, or none) for as long as it
-  takes the next `pfctl` subprocess to load ours. `engage` and
-  `engage_lockdown` both close this by loading the ruleset *before* enabling
-  specifically when pf starts disabled — loading a ruleset is a documented
-  no-op while pf is off (the enable bit and the loaded ruleset are
-  independent pf state) — so the instant either function turns pf on, it is
-  already enforcing the ruleset it just loaded. When pf is already enabled at
-  entry the original enable-then-load order is unchanged, since that path was
-  already correct. This was fixed in the same change as the `-Fa`
-  removal above, in the standing lockdown cover as well as the transient
-  one — the lockdown cover's `-Fa`-free load was not itself the whole story
-  for a cold host.
+  **Enable before load, on a COLD engage too.** A cold engage (pf disabled at
+  entry) looks like it wants the `-Fa` treatment — `-E` and `-f -` are two
+  separate `pfctl` invocations, so enabling first briefly runs whatever ruleset
+  happened to be loaded. It is not the same bug, and both engages deliberately
+  keep `-E` first. pf enforces nothing while disabled, so the pre-`-E` host is
+  already maximally open and `-E` can only *add* filtering; loading first would
+  lengthen the fully-open stretch by one `pfctl` spawn rather than shorten it.
+  What the order does decide is recoverability: `-E` is the step that makes the
+  host dark, so it must land *before* the `bridge-failclosed.json` persist. Put
+  both mutations ahead of the persist and a failed `state::save` leaves pf
+  enabled under a live `block out all` with no state file — `recover_cover`
+  no-ops on a missing file, the `-E` token is gone, and the host is off the
+  network with no way back. The lockdown cover has a second reason: its
+  `capture_and_persist` snapshot of `pfctl -sr` is the only copy of the host's
+  pre-lockdown policy, so any load ahead of it captures our own labelled
+  ruleset as the "baseline" — permanently, since every later engage re-reads
+  the same cover. Neither ordering is covered by a test today; both are
+  argued, not measured.
 
-  The cold engage gets a **post-condition** assertion (once `engage()` has
-  returned, the non-permitted host must be unreachable), NOT the continuous
-  never-admit assertion the transitions get, and the split is structural
-  rather than a concession. Before a cold engage the host carries no cover
-  and is *supposed* to be open — the test's own baseline requires it — so
+  The cold engage gets a **post-condition** assertion in
+  `macos_failclosed_cover_transition_never_admits_blocked_flow` (once
+  `engage()` has returned, the non-permitted host must be unreachable), NOT the
+  continuous never-admit assertion the transitions get, and the split is
+  structural rather than a concession. Before a cold engage the host carries no
+  cover and is *supposed* to be open — the test's own baseline requires it — so
   there is no property to violate in the pre/mid-engage window, and instrumented
   CI confirmed it: every leak the strict form reported latched at the cold
   engage while all 24 transitions passed clean. The window is also not
@@ -1181,7 +1194,10 @@ milliseconds.
   invocations and nothing is filtered at all while pf is disabled. The strict
   assertion stays strict because the prober pool starts only after the cold
   post-condition is settled: from the first prober SYN the host is known
-  blocked, so any success is a leak with no phase carve-out.
+  blocked, so any success is a leak with no phase carve-out. A positive-control
+  thread probes a *permitted* server at the same short timeout across the same
+  run, so a `PROBER_TIMEOUT` too small to complete any handshake on the runner
+  fails the test instead of passing it vacuously.
 
 Each platform splits a pure, unit-tested rule/spec builder (transient:
 `build_cover_spec` / `build_pf_ruleset`; lockdown: `build_lockdown_spec` /
