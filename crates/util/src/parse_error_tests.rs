@@ -24,6 +24,10 @@ fn a_description_never_echoes_the_input() {
 
     let unknown_field = serde_json::from_str::<Probe>(&format!(r#"{{"version":1,"{SECRET}":2}}"#))
         .expect_err("an unknown field must not parse under deny_unknown_fields");
+    assert!(
+        unknown_field.to_string().contains(SECRET),
+        "guard: serde_json echoes the offending field name: {unknown_field}"
+    );
 
     for e in [mistyped, unknown_field] {
         let described = describe_parse_error(&e);
