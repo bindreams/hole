@@ -54,17 +54,56 @@ jobs:
   build:
     name: Build (${{ matrix.os }}/${{ matrix.arch }})
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 30
+    # Per-leg, because the legs differ by ~6x (linux/arm64's 4m36s max vs
+    # darwin/amd64's 29m42s+): one shared wall either hides a regression on
+    # the fast legs or keeps killing the slow one, which is exactly what
+    # happened here — #995. Whole-job wall clock, 31 runs on `main`
+    # (2026-08-27 -> 2026-09-10), the re-measure #995 asked for across every
+    # leg, not just the one that surfaced:
+    #
+    #   linux/arm64    2m52s - 4m36s,   0 killed -> 10
+    #   linux/amd64    2m48s - 5m16s,   0 killed -> 10
+    #   windows/arm64  7m36s - 11m39s,  0 killed -> 20
+    #   darwin/arm64   7m17s - 16m05s,  0 killed -> 25
+    #   windows/amd64  11m10s - 17m32s, 0 killed -> 25
+    #   darwin/amd64   10m07s - 29m42s, 5 killed  -> 50  (see below)
+    #
+    # darwin/amd64's distribution is right-CENSORED by the old 30m wall: 5 of
+    # 31 runs were killed at 30m00s-30m34s, and 10 of 31 (32%) landed within 3
+    # minutes of it, so 29m42s — the largest run that actually finished — is a
+    # floor on the true tail, not its ceiling. 50 is ~1.7x that floor, chosen
+    # the same way #989/#990 picked 70 for `Test hole (darwin/arm64)`: enough
+    # to clear the censored region so the true tail becomes observable next
+    # time this is re-measured; tighten once it is.
+    #
+    # The other five legs were never killed, so their budgets are ~1.4-2x the
+    # observed max rather than a "clear the censoring" multiple — and the
+    # smaller legs get more relative headroom (linux's ~5m job gets a 10m
+    # floor, not a 7m one) so ordinary runner noise doesn't trip a kill on a
+    # job that was never actually hung.
+    #
+    # Whether darwin/amd64 got slower from genuine growth or sccache hit-rate
+    # is NOT settled, only narrowed: step-level timing (setup-build's dep
+    # fetch, Clippy, and the nextest-archive build) scales by roughly the same
+    # factor between its fastest and slowest runs (correlation with the job
+    # total: 0.66 / 0.96 / 0.85) rather than one step alone accounting for the
+    # swing, which argues against one crate's code having grown and toward a
+    # global factor — consistent with the cache-rate variance
+    # `test-dmg-signing` documents for the same macos-15-intel runner (25m
+    # warm vs 45m45s cold, 5% hit rate). But CI never runs `sccache
+    # --show-stats`, so there's no per-run hit-rate number to confirm that
+    # directly.
+    timeout-minutes: ${{ matrix.timeout }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - { os: windows, arch: amd64, runner: windows-latest }
-          - { os: darwin,  arch: amd64, runner: macos-15-intel }
-          - { os: darwin,  arch: arm64, runner: macos-latest }
-          - { os: linux,   arch: amd64, runner: ubuntu-latest }
-          - { os: linux,   arch: arm64, runner: ubuntu-24.04-arm }
-          - { os: windows, arch: arm64, runner: windows-11-arm }
+          - { os: windows, arch: amd64, runner: windows-latest,     timeout: 25 }
+          - { os: darwin,  arch: amd64, runner: macos-15-intel,     timeout: 50 }
+          - { os: darwin,  arch: arm64, runner: macos-latest,       timeout: 25 }
+          - { os: linux,   arch: amd64, runner: ubuntu-latest,      timeout: 10 }
+          - { os: linux,   arch: arm64, runner: ubuntu-24.04-arm,   timeout: 10 }
+          - { os: windows, arch: arm64, runner: windows-11-arm,     timeout: 20 }
     steps:
       - uses: actions/checkout@v7
         with:
