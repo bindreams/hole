@@ -37,6 +37,12 @@ minidump-writer = { workspace = true, optional = true }
 sadness-generator = { workspace = true, optional = true }
 tracing = "0.1"
 
+[target.'cfg(target_os = "macos")'.dependencies]
+# Named Mach exception constants (EXC_SOFTWARE, EXC_SOFT_SIGNAL) to identify
+# the SIGABRT-relay exception signature precisely in `is_macos_sigabrt_relay`.
+# See bindreams/hole#842.
+mach2 = { workspace = true }
+
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62", features = [
     "Win32_Foundation",

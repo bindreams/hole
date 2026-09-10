@@ -65,6 +65,12 @@ crash-handler = "0.7"
 crash-context = "0.6"
 minidump-writer = "0.12"
 sadness-generator = "0.7"
+# macOS-only: named Mach exception constants (EXC_SOFTWARE, EXC_SOFT_SIGNAL)
+# used to precisely identify the SIGABRT-relay exception signature in
+# tombstone's crash.rs, instead of magic numbers. Already resolved
+# transitively via crash-handler/crash-context on macOS; pinned directly
+# because tombstone names its constants explicitly. See bindreams/hole#842.
+mach2 = "0.4"
 
 [workspace.lints.clippy]
 disallowed_methods = "deny"

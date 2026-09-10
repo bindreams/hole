@@ -39,9 +39,28 @@ fn crash_child_bin() -> std::path::PathBuf {
     )
 }
 
+// Production bound for waiting on a crash_child to exit. 60s is ~2 orders
+// of magnitude above every observed passing run (<1s) and exists ONLY as
+// the failure bound surfaced to a human when a child genuinely never exits
+// (the sanctioned no-sleep exception: "awaiting … a child-process exit …
+// where the timeout is the failure bound surfaced to a human," never a bet
+// that N is long enough for the happy path). It is a SAFETY NET, not the
+// fix for bindreams/hole#842/#719: the actual cause — macOS's SIGABRT relay
+// taking a second trip through the host crash reporter — is addressed
+// structurally in `crash::is_macos_sigabrt_relay`/`on_crash`, which stops
+// `crash_marker_abort`'s child from ever reaching the reporter. This bound
+// still earns its keep independently: it turns ANY future test-child stall,
+// for ANY reason (a new fault class, a reporter regression, a platform
+// change), into one test failing loudly in ~60s instead of silently
+// consuming the entire darwin/amd64 job's 90-minute wall — which is exactly
+// what happened before (observed: orphaned crash_child/crash_child-2fe/
+// cargo-nextest processes reaped at the wall, still waiting on each other).
+#[cfg(feature = "crash-child")]
+const CHILD_WAIT_BOUND: std::time::Duration = std::time::Duration::from_secs(60);
+
 #[cfg(feature = "crash-child")]
 fn run_crash_child(class: &str, log_dir: &std::path::Path) -> std::process::Output {
-    std::process::Command::new(crash_child_bin())
+    let child = std::process::Command::new(crash_child_bin())
         .env("TOMBSTONE_CRASH_CLASS", class)
         .env("TOMBSTONE_LOG_DIR", log_dir)
         // Scrub re-exec env so the child doesn't take a foreign branch.
@@ -49,8 +68,85 @@ fn run_crash_child(class: &str, log_dir: &std::path::Path) -> std::process::Outp
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
-        .output()
-        .expect("spawn crash_child")
+        .spawn()
+        .expect("spawn crash_child");
+    wait_bounded(child, CHILD_WAIT_BOUND)
+}
+
+/// Wait for `child` to exit, bounded by `bound`. The wait itself is a real
+/// blocking `Child::wait()` on a dedicated thread — NOT a sleep/poll loop —
+/// relayed back via a channel so it can be raced against the bound with
+/// `recv_timeout`. On timeout, best-effort SIGKILLs the child (so it cannot
+/// itself go on to hang some *other* process, e.g. a wedged system crash
+/// reporter) and panics with a message naming the pid and the bound, per
+/// this codebase's rule that a timeout here must be a clearly-reported
+/// failure bound, never a synchronization assumption.
+#[cfg(feature = "crash-child")]
+fn wait_bounded(mut child: std::process::Child, bound: std::time::Duration) -> std::process::Output {
+    let pid = child.id();
+    let (tx, rx) = std::sync::mpsc::channel();
+    // The child is fully redirected to Stdio::null() (see run_crash_child),
+    // so there is no pipe to drain concurrently with wait() the way
+    // Child::wait_with_output's reader threads exist for — a single
+    // blocking wait() on this thread is sufficient.
+    std::thread::spawn(move || {
+        let status = child.wait();
+        // A disconnected receiver only means the timeout arm already fired
+        // and moved on; nothing left to report to.
+        let _ = tx.send(status);
+    });
+
+    match rx.recv_timeout(bound) {
+        Ok(Ok(status)) => std::process::Output {
+            status,
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+        },
+        Ok(Err(e)) => panic!("crash_child (pid {pid}): wait() failed: {e}"),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            kill_pid_best_effort(pid);
+            panic!(
+                "crash_child (pid {pid}) did not exit within {bound:?} — sent SIGKILL as a \
+                 safety net. This is the child-process-exit failure bound from \
+                 bindreams/hole#842/#719, not a synchronization timeout: if this fires, the \
+                 child genuinely stalled (most likely exposure to the macOS crash reporter that \
+                 `crash::is_macos_sigabrt_relay` is meant to prevent) and needs investigation, \
+                 not a longer bound."
+            );
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            panic!("crash_child (pid {pid}): wait thread dropped its sender without a result")
+        }
+    }
+}
+
+/// Best-effort SIGKILL (unix) / TerminateProcess (Windows) by raw pid. Takes
+/// a bare pid rather than `&Child` because by the time a caller needs this
+/// (a bounded wait timed out), the `Child` handle has already been moved
+/// into the wait thread — see `wait_bounded`. SIGKILL is chosen deliberately
+/// over a milder signal: it terminates a process even mid-exception-handling
+/// (XNU cannot mask SIGKILL), which is the exact state this helper exists to
+/// break out of. Errors (already exited, no such pid, permission) are
+/// swallowed — a target that is already gone is not a bug here.
+#[cfg(all(feature = "crash-child", unix))]
+fn kill_pid_best_effort(pid: u32) {
+    // SAFETY: libc::kill with any pid value is always sound to call — it is
+    // a plain syscall wrapper with no aliasing/lifetime requirements; the
+    // kernel itself rejects an invalid target (ESRCH), which is ignored
+    // here (best-effort).
+    unsafe {
+        libc::kill(pid as libc::pid_t, libc::SIGKILL);
+    }
+}
+
+#[cfg(all(feature = "crash-child", windows))]
+fn kill_pid_best_effort(pid: u32) {
+    let _ = std::process::Command::new("taskkill")
+        .args(["/F", "/PID", &pid.to_string()])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
 }
 
 #[cfg(feature = "crash-child")]
@@ -155,3 +251,13 @@ fn crash_writes_minidump_segfault() {
     let len = std::fs::metadata(&dmp).expect("dmp metadata").len();
     assert!(len > 0, "minidump is non-empty");
 }
+
+// `tests/crash_child_wait_tests/mod.rs`, NOT a bare `tests/crash_child_wait_tests.rs`
+// — Cargo autodiscovers every top-level `tests/*.rs` file as its OWN
+// integration-test binary, which would double-compile this module as a
+// standalone (harness-having, `fn main`-less) target and fail with
+// "unresolved import" on its sibling helpers. The `<dir>/mod.rs` form is
+// invisible to that autodiscovery glob. See `crates/garter/tests/common/`
+// for the established precedent.
+#[cfg(feature = "crash-child")]
+mod crash_child_wait_tests;

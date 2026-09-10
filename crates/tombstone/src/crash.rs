@@ -486,6 +486,39 @@ struct MarkerCrashEvent {
     state: &'static HandlerState,
 }
 
+// macOS has no hardware exception for `abort()`, so `crash-handler` hooks
+// `SIGABRT` with a plain `sigaction` and relays it to this same `on_crash` as
+// a SYNTHESIZED `EXC_SOFTWARE`/`EXC_SOFT_SIGNAL` exception (see its own
+// `mac/signal.rs`: "Macos doesn't have an exception for process aborts, so we
+// hook SIGABRT"). That relay does not `detach()` crash-handler's task-level
+// exception port the way a REAL fault (segfault/bus/illegal/trap) does — and
+// `abort()`'s C-standard-mandated contract (terminate even if a caught signal
+// handler returns) then re-raises `SIGABRT` with the default disposition,
+// generating a SECOND, genuine `EXC_CRASH` exception that forwards, like
+// every fault class eventually does, to the host-level exception port — the
+// system crash reporter (`ReportCrash`/`crashreporterd`). That reporter hop
+// is where `tombstone::crash_child crash_marker_abort` intermittently stalls
+// for minutes to hours on CI, never releasing the child
+// (bindreams/hole#842, #719); the other fault classes don't take this
+// synthetic-signal detour and are not observed to hang. `on_crash` is not
+// wired to see which detour a given call took (the SIGABRT relay's "handled"
+// reply is discarded — see the signal handler's ignored return value — so
+// returning `Handled(true)` there would not skip the reporter hop the way it
+// does for a real exception), so the escape is structural: recognize the
+// relay's exact signature and terminate before `abort()`'s guaranteed
+// re-raise can run at all.
+#[cfg(target_os = "macos")]
+fn is_macos_sigabrt_relay(ctx: &crash_handler::CrashContext) -> bool {
+    matches!(
+        ctx.exception,
+        Some(crash_context::ExceptionInfo {
+            kind: mach2::exception_types::EXC_SOFTWARE,
+            code,
+            subcode: Some(subcode),
+        }) if code == mach2::exception_types::EXC_SOFT_SIGNAL as u64 && subcode == libc::SIGABRT as u64
+    )
+}
+
 // SAFETY: on_crash runs in a COMPROMISED context (heap + locks unsafe). For
 // the always-on marker it does ONLY signal-safe work: a raw file open/write
 // from a stack buffer + the pre-encoded marker path, with no heap allocation
@@ -497,7 +530,10 @@ struct MarkerCrashEvent {
 // see the Linux carve-out at `write_minidump_best_effort`), and MAY allocate /
 // run non-signal-safe code — accepted because it runs strictly AFTER the
 // signal-safe marker is already durably on disk, so a fault inside the dump
-// branch cannot lose the breadcrumb. See review S2/S3.
+// branch cannot lose the breadcrumb. See review S2/S3. The test-only,
+// macOS-only `_exit` below is likewise signal-safe (a bare syscall — no
+// atexit, no libc/heap state) and runs LAST, after the marker (and any
+// minidump) are already durable.
 unsafe impl crash_handler::CrashEvent for MarkerCrashEvent {
     fn on_crash(&self, context: &crash_handler::CrashContext) -> crash_handler::CrashEventResult {
         // 1. ALWAYS (Win/mac/Linux): write the signal-safe marker first.
@@ -509,6 +545,29 @@ unsafe impl crash_handler::CrashEvent for MarkerCrashEvent {
         // `write_minidump_best_effort`.
         #[cfg(all(feature = "crash-dumps", any(windows, target_os = "macos")))]
         write_minidump_best_effort(self.state, context);
+
+        // 3. TEST-ONLY, macOS-ONLY: stop the system crash reporter from ever
+        // seeing this process, instead of relying on it to behave. Scoped to
+        // `kind == "test"` (tombstone::crash_child, the only caller of
+        // `attach("test", ...)`) so production crash reporting for "gui" /
+        // "bridge" / "galoshes" is unchanged — those still forward to the OS
+        // default below, exactly as before. See `is_macos_sigabrt_relay` for
+        // why only the SIGABRT relay needs this.
+        #[cfg(target_os = "macos")]
+        if self.state.kind == "test" && is_macos_sigabrt_relay(context) {
+            // SAFETY: `_exit` is async-signal-safe (POSIX.1-2017 §2.4.3): a
+            // bare syscall, no atexit handlers, no libc/heap state touched.
+            // Terminating here — before returning from this call, and so
+            // before `abort()`'s guaranteed re-raise can run — means the
+            // real `EXC_CRASH` this relay would otherwise trigger never
+            // happens, and the child never reaches the host-level exception
+            // port (ReportCrash). The exit code is not asserted on by the
+            // test (see `tests/crash_child.rs`); 70 is sysexits.h's
+            // `EX_SOFTWARE` (not in the `libc` crate — it's BSD-only cruft),
+            // documenting "abnormal, internal" in the (ignored) status.
+            const EX_SOFTWARE: i32 = 70;
+            unsafe { libc::_exit(EX_SOFTWARE) };
+        }
 
         // Forward to the OS default (Windows: WER LocalDumps; macOS: previous
         // Mach exception port → .ips; Linux: re-raises the default signal

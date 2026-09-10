@@ -192,6 +192,92 @@ async fn sweep_reports_malformed_marker() {
     assert!(!marker.exists(), "malformed marker deleted after report");
 }
 
+// `is_macos_sigabrt_relay` identifies the exact synthetic-exception
+// signature crash-handler's SIGABRT sigaction relay produces on macOS
+// (bindreams/hole#842, #719): EXC_SOFTWARE / EXC_SOFT_SIGNAL / subcode ==
+// SIGABRT. Every field must match — a fault class that shares two of three
+// fields with a real abort relay must NOT be misidentified as one, or the
+// `_exit` bypass in `on_crash` would swallow a genuine crash report.
+#[cfg(target_os = "macos")]
+mod is_macos_sigabrt_relay_tests {
+    use crate::crash::is_macos_sigabrt_relay;
+
+    fn ctx_with(exception: Option<crash_context::ExceptionInfo>) -> crash_handler::CrashContext {
+        crash_handler::CrashContext {
+            task: 0,
+            thread: 0,
+            handler_thread: 0,
+            exception,
+        }
+    }
+
+    fn abort_relay_exception() -> crash_context::ExceptionInfo {
+        crash_context::ExceptionInfo {
+            kind: mach2::exception_types::EXC_SOFTWARE,
+            code: mach2::exception_types::EXC_SOFT_SIGNAL as u64,
+            subcode: Some(libc::SIGABRT as u64),
+        }
+    }
+
+    #[skuld::test]
+    fn matches_the_exact_sigabrt_relay_signature() {
+        let ctx = ctx_with(Some(abort_relay_exception()));
+        assert!(is_macos_sigabrt_relay(&ctx));
+    }
+
+    #[skuld::test]
+    fn rejects_no_exception() {
+        // e.g. a directly-invoked on_crash in a test double, or a context
+        // crash-handler itself never populates this way in practice — must
+        // not panic on None, must not match.
+        let ctx = ctx_with(None);
+        assert!(!is_macos_sigabrt_relay(&ctx));
+    }
+
+    #[skuld::test]
+    fn rejects_a_real_hardware_exception_kind() {
+        // EXC_BAD_ACCESS (segfault/bus) — same subcode SHAPE class
+        // (Some(u64)) but a different `kind`. Must not be conflated with the
+        // SIGABRT relay just because both carry a subcode.
+        let mut exc = abort_relay_exception();
+        exc.kind = mach2::exception_types::EXC_BAD_ACCESS;
+        let ctx = ctx_with(Some(exc));
+        assert!(!is_macos_sigabrt_relay(&ctx));
+    }
+
+    #[skuld::test]
+    fn rejects_exc_software_with_a_different_code() {
+        // Right kind (EXC_SOFTWARE), wrong code — EXC_SOFTWARE is also used
+        // for other synthetic conditions (e.g. EXC_SOFT_TRACE_BREAKPOINT), not
+        // exclusively the SIGABRT relay.
+        let mut exc = abort_relay_exception();
+        exc.code = 0;
+        let ctx = ctx_with(Some(exc));
+        assert!(!is_macos_sigabrt_relay(&ctx));
+    }
+
+    #[skuld::test]
+    fn rejects_exc_soft_signal_for_a_different_signal() {
+        // Right kind + code, but the relayed signal is NOT SIGABRT (e.g.
+        // SIGTERM can also in principle be relayed through EXC_SOFT_SIGNAL) —
+        // must not fire the abort-only bypass for a different signal.
+        let mut exc = abort_relay_exception();
+        exc.subcode = Some(libc::SIGTERM as u64);
+        let ctx = ctx_with(Some(exc));
+        assert!(!is_macos_sigabrt_relay(&ctx));
+    }
+
+    #[skuld::test]
+    fn rejects_missing_subcode() {
+        // kind + code match, but subcode is None — cannot confirm it's
+        // SIGABRT specifically, so must not match.
+        let mut exc = abort_relay_exception();
+        exc.subcode = None;
+        let ctx = ctx_with(Some(exc));
+        assert!(!is_macos_sigabrt_relay(&ctx));
+    }
+}
+
 #[skuld::test]
 async fn sweep_reports_unreadable_marker() {
     // A "marker" that is actually a directory makes read_to_string fail with

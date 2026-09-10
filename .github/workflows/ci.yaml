@@ -384,6 +384,19 @@ jobs:
     # were reconstructed to. windows/amd64 has never been killed and its 38-run
     # sample still stands.
     #
+    # Investigated for bindreams/hole#842/#719 (the tombstone::crash_child
+    # crash_marker_abort intermittent hang): of the 8 killed darwin/amd64 runs
+    # above, only one (2026-07-12T00:06, job 86595016035) shows that signature
+    # in its log — nextest reporting crash_marker_abort SLOW at escalating 60s
+    # intervals up to 1080s before the job was cancelled. The other 7 were
+    # killed elsewhere: crash_marker_abort had already passed cleanly before a
+    # slow incremental rebuild for the second (non-TUN) nextest pass ate the
+    # remaining budget (5 runs), a slow first-phase build never reached the
+    # test step at all (1 run), or the already-tracked e2e_*_roundtrip /
+    # udp_associate_galoshes stall consumed it (1 run). So #842/#719's fix does
+    # not materially shrink darwin/amd64's real budget need — this 90 stands on
+    # the other 7's genuine slowness alone.
+    #
     # These are whole-JOB budgets, shared across build + verify + test. A slow
     # build therefore eats the test steps' headroom — which is exactly how #989
     # happened. The per-step `timeout-minutes` further down decouple the two, so
