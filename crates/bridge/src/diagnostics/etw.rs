@@ -105,12 +105,21 @@
 //!   `JoinHandle::join` returns.
 //!
 //! `UserTrace::stop` does not by itself guarantee that last step: it chains
-//! `CloseTrace` and `ControlTraceW(STOP)` with `?`, so any `CloseTrace` error
-//! short-circuits before STOP is issued — leaving the session live, the
-//! failed close having released nothing, and `process_from_handle` with
-//! nothing left to return for. [`EtwGuard::stop_session`] closes that gap by
-//! re-issuing STOP by name; see its doc for what is and is not established
-//! about the trigger.
+//! `CloseTrace` and `ControlTraceW(STOP)` with `?`, so a `CloseTrace` error
+//! short-circuits before STOP is issued. The qualifier matters —
+//! `ERROR_CTX_CLOSE_PENDING` is not one of those errors but ferrisetw's `Ok`,
+//! and it is the ordinary answer whenever events are still queued, i.e. for
+//! any busy session. On a genuine error the session stays live and
+//! `process_from_handle` has nothing left to return for: MSDN gives a
+//! real-time consumer two exit conditions — a `CloseTrace` that took effect,
+//! and the controller stopping the session — and that path has neither.
+//!
+//! `UserTrace::stop` takes `self` by value, so ferrisetw's own `Drop` repeats
+//! close+STOP once more, discarding the error, before the caller ever sees the
+//! `Err`. A one-off `CloseTrace` failure is therefore already covered by that
+//! second attempt and [`EtwGuard::stop_session`]'s by-name STOP is a benign
+//! no-op; a failure that *repeats* is what reaches the third attempt — the
+//! only one addressed to the session rather than to a handle.
 //!
 //! # Failure mode
 //!
@@ -355,30 +364,14 @@ impl Drop for EtwGuard {
 impl EtwGuard {
     /// Stop the kernel-side session, whatever [`UserTrace::stop`] managed.
     ///
-    /// `UserTrace::stop` is `close_trace(..)?; control_trace(.., STOP)?`
-    /// (ferrisetw 1.2.0, `src/trace.rs:359-366`), so **any** `CloseTrace` error
-    /// other than `ERROR_CTX_CLOSE_PENDING` short-circuits before the STOP is
-    /// issued — and that combination leaves `ProcessTrace` with no exit
-    /// condition at all. MSDN gives a real-time consumer two: a `CloseTrace`
-    /// that took effect, and the controller stopping the session. The first
-    /// just failed; the second was skipped. `Drop`'s `join()` on the
-    /// processing thread then blocks forever, deterministically.
+    /// Why a by-name STOP is needed, and why it is the third close+STOP attempt
+    /// rather than the second: module doc, [Drain on Drop](self#drain-on-drop).
     ///
-    /// That matters beyond a leaked session because `Drop` runs inside
-    /// `run_service`'s async block (`platform::windows`, where the guard is
-    /// held across every `.await`), after `pm.stop_with(event)` and before the
-    /// SCM `Stopped` report: a bridge hung there never reports `Stopped`, so
-    /// `stop()`'s `NotifyServiceStatusChangeW` — and the MSI uninstall's custom
-    /// action behind it — wedges.
-    ///
-    /// **The trigger is unestablished, not the consequence.** MSDN documents
-    /// only `ERROR_INVALID_HANDLE` and the pre-Vista `ERROR_BUSY` for
-    /// `CloseTrace`, and ferrisetw's own `InvalidHandle` arm re-runs
-    /// `open_trace`'s accept predicate, which a handle `open_trace` returned
-    /// cannot fail. So this is a backstop for a reachable code shape, not a
-    /// reproduction of bindreams/hole#978 — and it does not close it: a kernel
-    /// that never acknowledges a *correctly issued* STOP still hangs the same
-    /// two bare `join()`s (bindreams/hole#1016).
+    /// The trigger is unestablished, not the consequence. MSDN documents only
+    /// `ERROR_INVALID_HANDLE` and the pre-Vista `ERROR_BUSY` for `CloseTrace`,
+    /// and ferrisetw's `InvalidHandle` arm re-runs `open_trace`'s accept
+    /// predicate, which a handle `open_trace` returned cannot fail. This is a
+    /// backstop for a reachable code shape, not a reproduction.
     fn stop_session(&mut self) {
         let stop_issued = match self.trace.take() {
             Some(trace) => match trace.stop() {

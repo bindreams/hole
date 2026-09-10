@@ -1,6 +1,7 @@
-//! Privileged-lane proof that `ControlTraceW(EVENT_TRACE_CONTROL_QUERY)`
-//! works against a LIVE, unstopped ETW session. Runs on the elevated `tun`
-//! lane only: the `TUN` label (reused
+//! Claims about ETW sessions that only a real one can settle: what
+//! `ControlTraceW` answers for a live, a stopped, and a never-started session,
+//! and what [`EtwGuard::drop`] does with each answer. Runs on the elevated
+//! `tun` lane only: the `TUN` label (reused
 //! from `crate::test_support::skuld_fixtures`, this crate's existing
 //! "elevated Windows lane" bucket — not just literal TUN-adapter tests, see
 //! `proxy_manager_e2e_tests.rs`) gates it so the unprivileged
@@ -260,16 +261,18 @@ fn periodic_tick_rewarns_after_a_transient_failure_recovers() {
     );
 }
 
-/// `EtwGuard::drop` must leave no live session behind even when
-/// `UserTrace::stop` never got as far as issuing STOP. Without the by-name
-/// backstop the session stays live, which is what leaves `ProcessTrace` — and
-/// therefore the `join()` after this call — with nothing to return for.
+/// The by-name backstop must actually take a live session down. Without it the
+/// session stays live, which is what leaves `ProcessTrace` — and therefore the
+/// `join()` after this call — with nothing to return for.
 ///
-/// Driven through the real `Drop`, over a real session, with `trace: None` —
-/// the guard state that arm sees. A genuine `CloseTrace` failure cannot be
-/// manufactured from outside ferrisetw (`UserTrace` has no constructor taking
-/// a handle), so this drives the same `stop_issued == false` branch directly.
-/// Remove the backstop and the post-drop query below still answers.
+/// This is the *consequence* half of the backstop's coverage: it reaches
+/// `stop_session_by_name` through `trace: None` because that is the one guard
+/// state where the session outlives the drop, and asserts the session is gone
+/// afterwards. The *branch* half — that a real `Err` from `trace.stop()` also
+/// reaches the backstop — is
+/// `etw_guard_drop_falls_back_to_the_by_name_stop_when_usertrace_stop_errs`,
+/// whose session is already stopped by the time the backstop runs and so
+/// cannot prove this.
 #[cfg(target_os = "windows")]
 #[skuld::test(labels = [TUN], serial = TUN)]
 fn etw_guard_drop_stops_a_session_usertrace_stop_left_running() {
@@ -294,13 +297,13 @@ fn etw_guard_drop_stops_a_session_usertrace_stop_left_running() {
         buffer_size: 256,
         ..Default::default()
     };
-    // Bound to `_trace`, not `_`: the latter would drop the session at the end
-    // of this statement (ferrisetw's own `Drop` stops it), leaving the backstop
-    // nothing to prove itself against. No processing thread is needed — the
-    // claim under test is kernel-side session state, which `ControlTraceW`
+    // Bound, not discarded with `_`: the latter would drop the session at the
+    // end of this statement (ferrisetw's own `Drop` stops it), leaving the
+    // backstop nothing to prove itself against. No processing thread is needed
+    // — the claim under test is kernel-side session state, which `ControlTraceW`
     // reads and writes independently of user-mode buffer draining. The
     // end-of-scope `Drop` lands after the assertions and ignores its own error.
-    let _trace = UserTrace::new()
+    let (_trace, _handle) = UserTrace::new()
         .named(session_name.clone())
         .set_trace_properties(trace_properties)
         .enable(provider)
@@ -375,5 +378,83 @@ fn etw_guard_drop_stops_the_session_it_started() {
     assert!(
         !output.contains("etw: UserTrace::stop failed during drop"),
         "UserTrace::stop must succeed on the healthy path; got:\n{output}"
+    );
+}
+
+/// The `Err` arm of `trace.stop()` — the branch the backstop exists for — must
+/// fall through to the by-name STOP. Driven by a real failure rather than a
+/// synthesised guard state: stopping the session out of band leaves the guard
+/// holding a valid trace handle over a session that is gone, so `close_trace`
+/// succeeds and the `control_trace(STOP)` behind it returns not-found. That is
+/// the same `Err` a short-circuiting `CloseTrace` produces, which cannot be
+/// manufactured from outside ferrisetw (`UserTrace` has no constructor taking a
+/// handle).
+///
+/// Rewrite `stop_session`'s `if !stop_issued` to key off the guard state
+/// instead of the stop's outcome and this is the test that fails.
+#[cfg(target_os = "windows")]
+#[skuld::test(labels = [TUN], serial = TUN)]
+fn etw_guard_drop_falls_back_to_the_by_name_stop_when_usertrace_stop_errs() {
+    const PREFIX: &str = "hole-etw-live-stats-test-stop-errs-";
+    crate::diagnostics::etw_sweep::sweep_sessions_with_prefix(PREFIX, "etw-test");
+
+    // DEBUG, not INFO like the tests above: the backstop's expected outcome
+    // against an already-stopped session is a `debug!`.
+    let writer = VecWriter::new();
+    let subscriber = tracing_subscriber::registry().with(
+        fmt::layer()
+            .with_writer(writer.clone())
+            .with_ansi(false)
+            .with_filter(tracing_subscriber::filter::LevelFilter::DEBUG),
+    );
+    let _guard = set_default_in_current_thread(subscriber);
+
+    let session_name = format!("{PREFIX}{}", std::process::id());
+    let etw_guard = start_consumer_for_test(session_name.clone(), LIVE_STATS_INTERVAL, |_| {})
+        .expect("start a real ETW session (requires admin or Performance Log Users)");
+
+    stop_trace_by_name(&session_name).expect("stop the session out of band, behind the guard's back");
+
+    drop(etw_guard);
+
+    let output = writer.snapshot_string();
+    assert!(
+        output.contains("etw: UserTrace::stop failed during drop"),
+        "expected UserTrace::stop to fail, which is what puts Drop on the backstop path; got:\n{output}"
+    );
+    assert!(
+        output.contains("etw: session already stopped"),
+        "expected the by-name backstop to run and report the session already gone; got:\n{output}"
+    );
+}
+
+/// `stop_session_by_name`'s expected outcome — nothing to stop — must not log
+/// at `warn!`. Pins what `ControlTraceW(name, STOP)` really answers for a
+/// session that does not exist, which no unit test can observe: unit tests can
+/// only assert that [`is_session_not_found`] recognises a code they themselves
+/// chose. If Windows answers with anything else, every clean shutdown reports
+/// "failed to stop session by name".
+#[cfg(target_os = "windows")]
+#[skuld::test(labels = [TUN], serial = TUN)]
+fn stopping_a_session_that_does_not_exist_is_not_a_warning() {
+    let writer = VecWriter::new();
+    let subscriber = tracing_subscriber::registry().with(
+        fmt::layer()
+            .with_writer(writer.clone())
+            .with_ansi(false)
+            .with_filter(tracing_subscriber::filter::LevelFilter::DEBUG),
+    );
+    let _guard = set_default_in_current_thread(subscriber);
+
+    stop_session_by_name(&format!("hole-etw-live-stats-test-absent-{}", std::process::id()));
+
+    let output = writer.snapshot_string();
+    assert!(
+        output.contains("etw: session already stopped"),
+        "a session that was never started must read as already stopped; got:\n{output}"
+    );
+    assert!(
+        !output.contains("etw: failed to stop session by name"),
+        "the expected outcome must not warn; got:\n{output}"
     );
 }
