@@ -300,8 +300,9 @@ enum SeriesReach {
     /// Every release from some floor upward, however high the patch number
     /// climbs.
     WholeTail,
-    /// In-series releases only up to `highest`, which is itself admitted when
-    /// `inclusive`.
+    /// In-series releases only up to `highest`. `inclusive` says whether the
+    /// bound itself is admitted — which only a pre-release endpoint makes true,
+    /// so the wording it selects must not imply a *release* lands there.
     CappedAt { highest: Version, inclusive: bool },
     /// Nothing inside the series at all.
     Nothing,
@@ -320,7 +321,7 @@ impl SeriesReach {
             SeriesReach::CappedAt {
                 highest,
                 inclusive: true,
-            } => format!("admits no {PINNED_SERIES}.x release above {highest}"),
+            } => format!("admits no {PINNED_SERIES}.x release above the pre-release {highest}"),
         }
     }
 }
@@ -756,9 +757,16 @@ pub fn check_local_pin(manifest: &str) -> Result<()> {
 /// (`modules/manager/cargo/schema.ts`: `dependencies`, `dev-dependencies`,
 /// `build-dependencies`, `workspace.dependencies`), and `schemars` is declared
 /// under `[build-dependencies]`.
+///
+/// `matchFileNames` has *two* subjects, not one:
+/// `util/package-rules/files.ts` tries the `packageFile` and then every entry
+/// of `lockFiles`, and `modules/manager/cargo/extract.ts` sets
+/// `lockFiles = [Cargo.lock]`. A rule spelled `matchFileNames: ["Cargo.lock"]`
+/// reaches `schemars` even though it names no manifest.
 const PIN_DEPENDENCY: &str = "schemars";
 const PIN_MANAGER: &str = "cargo";
 const PIN_MANIFEST: &str = "crates/common/Cargo.toml";
+const PIN_LOCKFILE: &str = "Cargo.lock";
 const PIN_DEP_TYPE: &str = "build-dependencies";
 
 /// What a `match*`/`exclude*` selector is matched against.
@@ -916,8 +924,10 @@ fn expand_globstars(matcher: &str) -> String {
 /// any brace option:
 ///
 /// - **Brace alternation** (`{schemars,serde}`), which `glob` does not expand.
-/// - **Extglob** (`@(a|b)`, `?()`, `*()`, `+()`, `!()`) — a `(` under one of
-///   `?*+@!`. This one is the reason a bare `(` is *not* enough to disqualify a
+/// - **Extglob** (`@(a|b)`, `?()`, `*()`, `+()`) — a `(` under one of
+///   `?*+@!`. A leading `!(` never reaches here: the caller has already read
+///   that `!` as minimatch's negation, which is what minimatch does too. This
+///   is the reason a bare `(` is *not* enough to disqualify a
 ///   pattern: minimatch treats unprefixed parentheses as literal, and so does
 ///   the literal branch below. `@(schemars)` selects `schemars`, but reading it
 ///   as a literal makes it select nothing, which is a dead rule read as a live
@@ -926,10 +936,24 @@ fn beyond_glob(matcher: &str) -> bool {
     if matcher.contains(['{', '}']) {
         return true;
     }
+    // minimatch's escape: `s\chemars` is the literal `schemars`. `glob` reads a
+    // backslash as an ordinary character on this platform, so the two disagree
+    // on both halves — the escaped pattern matches where the guard would not,
+    // and `sc\*hemars` does not match where a naive read says it should.
+    if matcher.contains('\\') {
+        return true;
+    }
     matcher
         .as_bytes()
         .windows(2)
         .any(|pair| pair[1] == b'(' && matches!(pair[0], b'?' | b'*' | b'+' | b'@' | b'!'))
+}
+
+/// Is this the delimited `/regex/` spelling? `isRegexMatch` requires the
+/// opening `/` and a closing `/` or `/i`; the caller decides how many `!` may
+/// precede it, because `/^!?\//` allows exactly one.
+fn is_delimited_regex(matcher: &str) -> bool {
+    matcher.starts_with('/') && (matcher.ends_with('/') || matcher.ends_with("/i"))
 }
 
 /// Does one matcher entry select `subject`?
@@ -947,15 +971,15 @@ fn beyond_glob(matcher: &str) -> bool {
 fn matcher_selects(matcher: &str, subject: &str) -> Verdict {
     // `matchRegexOrGlob` short-circuits a bare `*` to "everything" before
     // minimatch sees it, so it reaches a subject with separators in it that a
-    // `*` glob would not.
+    // `*` glob would not. Only the whole entry: `!*` is not this case.
     if matcher == "*" {
         return Verdict::Selected;
     }
-    // `isRegexMatch` needs *both* delimiters (`/^!?\//` and `/\/i?$/`). With
-    // only the opening one this is not a regex at all: Renovate hands it to
-    // minimatch as an ordinary glob, so falling through is what Renovate does
-    // rather than a guess about what it meant.
-    if matcher.starts_with('/') && (matcher.ends_with('/') || matcher.ends_with("/i")) {
+    // `isRegexMatch` needs *both* delimiters. With only the opening one this is
+    // not a regex at all: Renovate hands it to minimatch as an ordinary glob,
+    // so falling through is what Renovate does rather than a guess about what
+    // it meant.
+    if is_delimited_regex(matcher) {
         let body = &matcher[1..];
         let body = body
             .strip_suffix("/i")
@@ -966,22 +990,40 @@ fn matcher_selects(matcher: &str, subject: &str) -> Verdict {
         let flags = if matcher.ends_with('i') { "(?i)" } else { "" };
         return regex_selects(&format!("{flags}{body}"), subject);
     }
+    glob_selects(matcher, subject)
+}
+
+/// The glob half, once `isRegexMatch` has said no. Split out because that
+/// question is settled on the entry as written, before any `!` is stripped: a
+/// `/re/` left over from a doubled negation is a minimatch pattern of three
+/// path segments, not a regex, and routing it back through
+/// [`matcher_selects`] would compile it as one.
+fn glob_selects(matcher: &str, subject: &str) -> Verdict {
     if beyond_glob(matcher) {
         return Verdict::Unknown;
     }
-    // minimatch splits on `/` and matches segment by segment, so an empty
-    // segment is a segment that has to match. `glob` has no such notion:
-    // `crates/**/` selects nothing in minimatch and everything under
-    // `crates/` in `glob`. A leading empty segment (`/schemars`) is left
-    // alone — there the two already agree.
-    if matcher.contains("//") || (matcher.len() > 1 && matcher.ends_with('/')) {
-        return Verdict::Unknown;
+    // minimatch splits on `/` and drops the empty segments a `//` run leaves
+    // behind, so `crates//common/Cargo.toml` is `crates/common/Cargo.toml`.
+    let collapsed = if matcher.contains("//") {
+        let mut out = matcher.to_string();
+        while out.contains("//") {
+            out = out.replace("//", "/");
+        }
+        out
+    } else {
+        matcher.to_string()
+    };
+    // A trailing `/` is the one empty segment minimatch keeps: it requires the
+    // subject to end in a separator, and no subject this guard matches against
+    // does. Decidable, so not an `Unknown`.
+    if collapsed.len() > 1 && collapsed.ends_with('/') {
+        return Verdict::Excluded;
     }
-    if !matcher.contains(['*', '?', '[', ']']) {
+    if !collapsed.contains(['*', '?', '[', ']']) {
         // A literal is a glob with no metacharacters, and inherits `nocase`.
-        return Verdict::of(matcher.eq_ignore_ascii_case(subject));
+        return Verdict::of(collapsed.eq_ignore_ascii_case(subject));
     }
-    match glob::Pattern::new(&expand_globstars(matcher)) {
+    match glob::Pattern::new(&expand_globstars(&collapsed)) {
         Ok(pattern) => Verdict::of(pattern.matches_with(subject, MINIMATCH)),
         Err(_) => Verdict::Unknown,
     }
@@ -1009,17 +1051,25 @@ fn entry_predicate(matcher: &str, subject: &str, bare_regex: bool) -> Verdict {
     if bare_regex {
         return regex_selects(matcher, subject);
     }
-    // A delimited regex keeps its own `!` handling: `isRegexMatch` allows one
-    // optional `!` before the opening `/`, and `parseRegexMatch` strips exactly
-    // that one.
-    if let Some(body) = matcher.strip_prefix('!') {
-        if body.starts_with('/') && (body.ends_with('/') || body.ends_with("/i")) {
-            return matcher_selects(body, subject).negate();
-        }
+    if !matcher.starts_with('!') {
+        return matcher_selects(matcher, subject);
     }
+    // `isRegexMatch` is `/^!?\//` — *one* optional `!`, and only immediately
+    // before the opening delimiter. That is the single negation the regex path
+    // knows, and `parseRegexMatch` strips exactly it.
+    let body = &matcher[1..];
+    if is_delimited_regex(body) {
+        return matcher_selects(body, subject).negate();
+    }
+    // Everything else with a leading `!` belongs to minimatch, where
+    // `parseNegate` eats every one of them and what remains is a *glob*. Two
+    // `!` therefore do not restore a regex: `!!/schemars/` asks minimatch for
+    // the three-segment path `/schemars/`, which matches nothing. Nor do they
+    // restore the bare-`*` short-circuit, which `matchRegexOrGlob` applies to
+    // the whole entry only.
     let bare = matcher.trim_start_matches('!');
     let toggles = matcher.len() - bare.len();
-    let hit = matcher_selects(bare, subject);
+    let hit = glob_selects(bare, subject);
     if toggles.is_multiple_of(2) {
         hit
     } else {
@@ -1078,7 +1128,9 @@ fn rule_applies(rule: &Value) -> (Verdict, Option<String>) {
                 Subject::Name => list_selects(list, PIN_DEPENDENCY, false),
                 Subject::NamePattern => list_selects(list, PIN_DEPENDENCY, true),
                 Subject::Manager => list_selects(list, PIN_MANAGER, false),
-                Subject::File => list_selects(list, PIN_MANIFEST, false),
+                // Either file reaches the dependency, so the rule applies if
+                // either matches.
+                Subject::File => list_selects(list, PIN_MANIFEST, false).or(list_selects(list, PIN_LOCKFILE, false)),
                 Subject::DepType => list_selects(list, PIN_DEP_TYPE, false),
             },
             _ => Verdict::Unknown,
@@ -1175,14 +1227,15 @@ fn fold(parent: &Map<String, Value>, child: &Value) -> Value {
 
 /// What Renovate resolves for `schemars` once every applying rule is merged.
 struct Resolved {
-    /// The last applying rule's `allowedVersions`, with its position.
-    allowed: Option<(usize, String)>,
-    /// The position of the last applying rule to leave it `enabled: false`.
-    disabled: Option<usize>,
+    /// The last applying rule's `allowedVersions`, with the label of the rule
+    /// it came from.
+    allowed: Option<(String, String)>,
+    /// The last applying rule to leave it `enabled: false`.
+    disabled: Option<String>,
     /// The position of the first applying rule to list `schemars` in
     /// `ignoreDeps`. First, not last: `ignoreDeps` is a mergeable array, so a
     /// later rule adds to it and none can take a name back out.
-    ignored: Option<usize>,
+    ignored: Option<String>,
     /// Did any applying rule select `schemars` by name?
     named: bool,
     /// Rules that set `allowedVersions`/`enabled`/`ignoreDeps` but do not
@@ -1196,7 +1249,7 @@ struct Resolved {
 /// Renovate is last-wins across *all* matching rules, not "the first rule that
 /// names it, then whatever follows": `[<2, <0.9]` resolves to `<0.9`, and a
 /// grouping rule above the pin does not displace it.
-fn resolve_schemars(rules: &[Value]) -> Result<Resolved> {
+fn resolve_schemars(rules: &[(String, Value)]) -> Result<Resolved> {
     let mut resolved = Resolved {
         allowed: None,
         disabled: None,
@@ -1207,10 +1260,9 @@ fn resolve_schemars(rules: &[Value]) -> Result<Resolved> {
     // A flattened child reports its parent's index: that is where a reader
     // finds it in the file, and the array is identity-flattened when nothing
     // nests.
-    let flattened: Vec<(usize, Value)> = rules
+    let flattened: Vec<(String, Value)> = rules
         .iter()
-        .enumerate()
-        .flat_map(|(position, rule)| flatten(rule).into_iter().map(move |rule| (position, rule)))
+        .flat_map(|(label, rule)| flatten(rule).into_iter().map(|rule| (label.clone(), rule)))
         .collect();
     for (position, rule) in flattened {
         let rule = &rule;
@@ -1218,7 +1270,7 @@ fn resolve_schemars(rules: &[Value]) -> Result<Resolved> {
             None => None,
             Some(Value::String(range)) => Some(range.clone()),
             Some(other) => bail!(
-                ".github/renovate.json's packageRule #{position} sets `allowedVersions` to {other}, which is \
+                ".github/renovate.json's {position} sets `allowedVersions` to {other}, which is \
                  not a string. `allowedVersions` is a string option: a one-element array is migrated to one \
                  (`config/migration.ts`) and anything else is rejected, and either way \
                  `renovate-config-validator --strict` fails the config before this guard sees it. Spell it as \
@@ -1231,13 +1283,13 @@ fn resolve_schemars(rules: &[Value]) -> Result<Resolved> {
         if verdict == Verdict::Selected {
             resolved.named |= names_schemars(rule) == Verdict::Selected;
             if let Some(range) = allowed {
-                resolved.allowed = Some((position, range));
+                resolved.allowed = Some((position.clone(), range));
             }
             if ignored {
-                resolved.ignored.get_or_insert(position);
+                resolved.ignored.get_or_insert_with(|| position.clone());
             }
             match enabled {
-                Some(false) => resolved.disabled = Some(position),
+                Some(false) => resolved.disabled = Some(position.clone()),
                 Some(true) => resolved.disabled = None,
                 None => {}
             }
@@ -1245,7 +1297,7 @@ fn resolve_schemars(rules: &[Value]) -> Result<Resolved> {
             let selector = reason.unwrap_or_else(|| "an unnamed selector".into());
             if verdict == Verdict::Unknown {
                 bail!(
-                    ".github/renovate.json's packageRule #{position} sets \
+                    ".github/renovate.json's {position} sets \
                      `allowedVersions`/`enabled`/`ignoreDeps`, and this guard cannot determine whether \
                      Renovate applies it to `{PIN_DEPENDENCY}`: `{selector}` settled it, either because \
                      `selector_subject` does not know that key or because one of its entries is a spelling \
@@ -1255,7 +1307,7 @@ fn resolve_schemars(rules: &[Value]) -> Result<Resolved> {
                      harmless.\nRule: {rule}"
                 );
             }
-            resolved.sidelined.push(format!("#{position} (`{selector}`)"));
+            resolved.sidelined.push(format!("{position} (`{selector}`)"));
         }
         // A rule setting neither field cannot change what Renovate resolves
         // here, so whether it applies never has to be decided.
@@ -1282,22 +1334,50 @@ fn resolve_schemars(rules: &[Value]) -> Result<Resolved> {
 ///   admitting the whole patch tail inside it.
 pub fn check_renovate_rule(config: &str) -> Result<()> {
     let doc: Value = serde_json::from_str(config).context("failed to parse .github/renovate.json")?;
+    let manager = doc.get(PIN_MANAGER);
+    // `config/index.ts` folds the manager's own block into the config with
+    // `mergeChildConfig`, and `packageRules` is a mergeable array — so
+    // `cargo.packageRules` is **appended** to the top-level ones and therefore
+    // wins every last-wins contest against them.
     let empty = Vec::new();
-    let rules = doc.get("packageRules").and_then(|r| r.as_array()).unwrap_or(&empty);
-    let resolved = resolve_schemars(rules)?;
+    let top_level = doc.get("packageRules").and_then(|r| r.as_array()).unwrap_or(&empty);
+    let manager_scoped = manager
+        .and_then(|block| block.get("packageRules"))
+        .and_then(|r| r.as_array())
+        .unwrap_or(&empty);
+    let label = |source: &str, index: usize| format!("{source} #{index}");
+    let rules: Vec<(String, Value)> = top_level
+        .iter()
+        .enumerate()
+        .map(|(index, rule)| (label("packageRule", index), rule.clone()))
+        .chain(
+            manager_scoped
+                .iter()
+                .enumerate()
+                .map(|(index, rule)| (label(&format!("`{PIN_MANAGER}.packageRules`"), index), rule.clone())),
+        )
+        .collect();
+    let resolved = resolve_schemars(&rules)?;
 
-    // `fetch.js` reads the ignore first, two lines above the `enabled === false`
+    // `fetch.js` reads the ignore a few lines above the `enabled === false`
     // branch and after the same packageRules merge, so this check goes first
-    // too.
-    let ignore_site = match (ignores_pin(doc.get("ignoreDeps")), resolved.ignored) {
-        (true, _) => Some("the top-level `ignoreDeps`".to_string()),
-        (false, Some(position)) => Some(format!("`ignoreDeps` on packageRule #{position}")),
-        (false, None) => None,
+    // too. Both options are also settable outside `packageRules` — `enabled`
+    // lists `.` and every manager among its `parents` — where no selector has
+    // to reach `schemars` for them to skip it.
+    let ignore_site = match (
+        ignores_pin(doc.get("ignoreDeps")),
+        ignores_pin(manager.and_then(|block| block.get("ignoreDeps"))),
+        resolved.ignored,
+    ) {
+        (true, _, _) => Some("the top-level `ignoreDeps`".to_string()),
+        (_, true, _) => Some(format!("`{PIN_MANAGER}.ignoreDeps`")),
+        (_, _, Some(position)) => Some(format!("`ignoreDeps` on {position}")),
+        (false, false, None) => None,
     };
     if let Some(site) = ignore_site {
         bail!(
             ".github/renovate.json lists `{PIN_DEPENDENCY}` in {site}. `fetch.js` sets \
-             `skipReason: \"ignored\"` two lines above the `enabled === false` branch and both run after the \
+             `skipReason: \"ignored\"` just above the `enabled === false` branch and both run after the \
              packageRules merge, so an ignore is `enabled: false` under a second name: it suppresses the \
              impossible bump but also every {PINNED_SERIES}.x patch, including a security one — which is \
              exactly why the pin is written as an `allowedVersions` range instead. Nothing takes a name back \
@@ -1305,9 +1385,25 @@ pub fn check_renovate_rule(config: &str) -> Result<()> {
         );
     }
 
+    let disabled_outside = [
+        ("the top level", doc.get("enabled")),
+        (PIN_MANAGER, manager.and_then(|b| b.get("enabled"))),
+    ]
+    .into_iter()
+    .find(|(_, value)| value.and_then(|v| v.as_bool()) == Some(false))
+    .map(|(site, _)| site);
+    if let Some(site) = disabled_outside {
+        bail!(
+            ".github/renovate.json sets `enabled: false` at {site}, which turns `{PIN_DEPENDENCY}` off \
+             without any selector having to reach it. That suppresses the impossible bump but also every \
+             {PINNED_SERIES}.x patch, including a security one — which is exactly why the pin is written as \
+             an `allowedVersions` range instead. Re-enable it and let the range do the suppressing."
+        );
+    }
+
     if let Some(position) = resolved.disabled {
         bail!(
-            ".github/renovate.json resolves `{PIN_DEPENDENCY}` to `enabled: false` (packageRule #{position}). \
+            ".github/renovate.json resolves `{PIN_DEPENDENCY}` to `enabled: false` ({position}). \
              That suppresses the impossible bump but also every {PINNED_SERIES}.x patch, including a security \
              one — which is exactly why the pin is written as an `allowedVersions` range instead. Renovate \
              merges every applying rule last-wins, so a later blanket disable counts for as much as the pin \
@@ -1326,7 +1422,7 @@ pub fn check_renovate_rule(config: &str) -> Result<()> {
         let sidelined = match resolved.sidelined.as_slice() {
             [] => String::new(),
             out_of_reach => format!(
-                " packageRule {} sets `allowedVersions`/`enabled`/`ignoreDeps`, but that selector keeps it off \
+                " {} sets `allowedVersions`/`enabled`/`ignoreDeps`, but that selector keeps it off \
                  `{PIN_DEPENDENCY}` as a `{PIN_MANAGER}` dependency of {PIN_MANIFEST}, so Renovate never \
                  applies it.",
                 out_of_reach.join(", ")
@@ -1342,8 +1438,8 @@ pub fn check_renovate_rule(config: &str) -> Result<()> {
 
     if let Some(admitted) = requirement_admits_beyond_pin(&allowed)? {
         bail!(
-            ".github/renovate.json resolves `{PIN_DEPENDENCY}` to `allowedVersions` `{allowed}` (packageRule \
-             #{position}), which admits {admitted} — outside the {PINNED_SERIES} series `{UPSTREAM}` \
+            ".github/renovate.json resolves `{PIN_DEPENDENCY}` to `allowedVersions` `{allowed}` \
+             ({position}), which admits {admitted} — outside the {PINNED_SERIES} series `{UPSTREAM}` \
              requires. The rule is present but no longer suppresses anything: Renovate will propose the bump \
              that fails crates/common/build.rs with E0603 (bindreams/hole#379). Renovate merges every \
              applying rule last-wins, so this is the range that applies. Narrow it back to the \
@@ -1354,8 +1450,8 @@ pub fn check_renovate_rule(config: &str) -> Result<()> {
     let reach = series_reach(&parse_requirement(&allowed)?)?;
     if !matches!(reach, SeriesReach::WholeTail) {
         bail!(
-            ".github/renovate.json resolves `{PIN_DEPENDENCY}` to `allowedVersions` `{allowed}` (packageRule \
-             #{position}), which {}, so no such patch can ever land — a security one included. The rule is a \
+            ".github/renovate.json resolves `{PIN_DEPENDENCY}` to `allowedVersions` `{allowed}` \
+             ({position}), which {}, so no such patch can ever land — a security one included. The rule is a \
              range rather than `enabled: false` precisely to keep {PINNED_SERIES}.x patches flowing, and the \
              number the next one will carry is not knowable in advance; widen it back to the whole \
              {PINNED_SERIES} series.",

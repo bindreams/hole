@@ -444,9 +444,9 @@ fn a_file_name_glob_does_not_cross_a_path_separator() {
         "**Cargo.toml",
         "*.toml",
         // minimatch tests the segment against `**` exactly, so a longer run is
-        // not a globstar and does not cross `/` either.
+        // not a globstar and does not cross `/` either. A bare `***` is *not*
+        // here: it reaches `Cargo.lock`, which has no separator to cross.
         "crates/***",
-        "***",
     ] {
         let selector = format!(r#""matchFileNames": ["{dead}"]"#);
         let err = check_renovate_rule(&renovate_config(&rule_with(&selector)))
@@ -461,15 +461,35 @@ fn a_file_name_glob_does_not_cross_a_path_separator() {
             "these are decidable exclusions, not unknowns: {message}"
         );
     }
+    // A trailing `/` is an empty final segment minimatch keeps, and no subject
+    // here ends in a separator. Decidably dead, not undecidable.
+    for trailing in ["crates/**/", "**/", "crates/common/Cargo.toml/"] {
+        let selector = format!(r#""matchFileNames": ["{trailing}"]"#);
+        let err = check_renovate_rule(&renovate_config(&rule_with(&selector)))
+            .err()
+            .unwrap_or_else(|| panic!("{trailing} requires a trailing separator the subjects do not have"));
+        assert!(
+            !err.to_string().contains("cannot determine"),
+            "a trailing separator is decided, not undecidable: {err}"
+        );
+    }
     for live in [
         "crates/**",
         "**/Cargo.toml",
         "crates/*/Cargo.toml",
         "**/*.toml",
         "crates/common/Cargo.toml",
+        // minimatch drops the empty segments a `//` run leaves behind, so these
+        // are the same pattern as the one above.
+        "crates//common/Cargo.toml",
+        "crates///common/Cargo.toml",
+        "crates//**",
         // Renovate short-circuits a bare `*` to "everything" before minimatch
         // ever sees it.
         "*",
+        // `***` is a plain `*`, which does not cross the manifest's separators
+        // — but `Cargo.lock` has none, and it is the second subject.
+        "***",
     ] {
         let selector = format!(r#""matchFileNames": ["{live}"]"#);
         check_renovate_rule(&renovate_config(&rule_with(&selector)))
@@ -706,6 +726,17 @@ fn an_extglob_is_undecidable_rather_than_read_as_a_literal() {
             .unwrap_or_else(|| panic!("Renovate applies {spelling} to schemars; the guard must not pass it"));
         assert!(err.to_string().contains("cannot determine"), "unexpected error: {err}");
     }
+    // An extglob reached through an interior `!` is still one.
+    let interior = r#"{ "matchManagers": ["cargo"], "matchPackageNames": ["sch!(emars)"], "allowedVersions": "<2" }"#;
+    let err = check_renovate_rule(&format!(r#"{{ "packageRules": [ {REAL_RULE}, {interior} ] }}"#))
+        .expect_err("`sch!(emars)` is an extglob, not a literal");
+    assert!(err.to_string().contains("cannot determine"), "unexpected error: {err}");
+
+    // A *leading* `!(` is minimatch's negation winning over extglob, which is
+    // what the guard does too — so that one stays decided.
+    let leading = REAL_RULE.replace(r#"["schemars"]"#, r#"["!(serde)"]"#);
+    check_renovate_rule(&renovate_config(&leading)).expect("`!(serde)` negates the literal `(serde)`");
+
     // Unprefixed parentheses are literal in minimatch, and stay literal here.
     let parens = REAL_RULE.replace(
         r#""matchDepNames": ["schemars"]"#,
@@ -737,6 +768,115 @@ fn a_doubled_negation_is_not_read_as_a_single_one() {
     // Doubled back onto the name itself, it selects, exactly as one `!` would not.
     let live = REAL_RULE.replace(r#"["schemars"]"#, r#"["!!schemars"]"#);
     check_renovate_rule(&renovate_config(&live)).expect("`!!schemars` is `schemars` with the sense toggled twice");
+
+    // The case the `!`-counting exists for. `isRegexMatch` is `/^!?\//` — one
+    // `!` at most — so a second one takes the entry away from the regex path
+    // for good: minimatch gets the glob `/schemars/`, three path segments that
+    // match no dependency name. Stripping both `!`s and *then* asking whether
+    // what is left looks like a regex compiles it as one and selects.
+    let dead = REAL_RULE.replace(r#"["schemars"]"#, r#"["!!/schemars/"]"#);
+    let err = check_renovate_rule(&renovate_config(&dead))
+        .expect_err("`!!/schemars/` is the glob `/schemars/`, which matches no dependency name");
+    assert!(
+        err.to_string().contains("no packageRule naming"),
+        "unexpected error: {err}"
+    );
+    // A third `!` toggles the sense back, and the glob still matches nothing —
+    // so the negation holds and the rule applies. Same reading, opposite
+    // outcome: counting is what makes both come out right.
+    let live = REAL_RULE.replace(r#"["schemars"]"#, r#"["!!!/schemars/"]"#);
+    check_renovate_rule(&renovate_config(&live)).expect("three `!` leave a negation that nothing trips");
+    // One `!` still is the regex negation Renovate defines.
+    let negated = REAL_RULE.replace(
+        r#""matchDepNames": ["schemars"]"#,
+        r#""matchPackageNames": ["!/serde/"]"#,
+    );
+    check_renovate_rule(&renovate_config(&negated)).expect("`!/serde/` excludes serde and keeps schemars");
+}
+
+/// minimatch reads `\` as an escape, so `s\chemars` is the literal `schemars`
+/// and `sc\*hemars` is not the glob it looks like. `glob` has no such rule, so
+/// both readings would be wrong in opposite directions — decide neither.
+#[skuld::test]
+fn a_backslash_escape_is_undecidable_rather_than_compared_literally() {
+    let later = r#"{ "matchManagers": ["cargo"], "matchPackageNames": ["!s\\chemars"], "allowedVersions": "<2" }"#;
+    let err = check_renovate_rule(&format!(r#"{{ "packageRules": [ {REAL_RULE}, {later} ] }}"#))
+        .expect_err("`!s\\chemars` vetoes schemars in minimatch, so that rule reaches nothing");
+    assert!(err.to_string().contains("cannot determine"), "unexpected error: {err}");
+}
+
+/// `util/package-rules/files.ts` tries the `packageFile` and then every entry
+/// of `lockFiles`, and the cargo manager sets `lockFiles = ["Cargo.lock"]`. A
+/// rule naming only the lockfile still reaches `schemars`, so a later one that
+/// does it re-widens the pin.
+#[skuld::test]
+fn a_file_name_rule_matching_the_lockfile_reaches_the_dependency() {
+    for spelling in ["Cargo.lock", "*.lock", "**/Cargo.lock"] {
+        let later = format!(
+            r#"{{ "matchFileNames": ["{spelling}"], "matchDepNames": ["schemars"], "allowedVersions": "<2" }}"#
+        );
+        let err = check_renovate_rule(&format!(r#"{{ "packageRules": [ {REAL_RULE}, {later} ] }}"#))
+            .err()
+            .unwrap_or_else(|| panic!("{spelling} matches the lockfile, so the rule applies"));
+        assert!(err.to_string().contains("admits 0.9.0"), "unexpected error: {err}");
+    }
+    // And the pin itself may be scoped that way.
+    check_renovate_rule(&renovate_config(&rule_with(r#""matchFileNames": ["Cargo.lock"]"#))).unwrap();
+}
+
+/// `config/index.ts` folds the manager's own block in with `mergeChildConfig`,
+/// and `packageRules` is mergeable — so `cargo.packageRules` is appended after
+/// the top-level ones and wins last-wins against them. Reading only the
+/// top-level array misses a rule that is strictly later than every rule the
+/// guard does read.
+#[skuld::test]
+fn a_manager_scoped_package_rule_is_merged_after_the_top_level_ones() {
+    let widening = r#"{ "matchManagers": ["cargo"], "matchDepNames": ["schemars"], "allowedVersions": "<2" }"#;
+    let err = check_renovate_rule(&format!(
+        r#"{{ "packageRules": [ {REAL_RULE} ], "cargo": {{ "packageRules": [ {widening} ] }} }}"#
+    ))
+    .expect_err("`cargo.packageRules` is appended last, so its `<2` is what resolves");
+    let message = err.to_string();
+    assert!(message.contains("admits 0.9.0"), "unexpected error: {message}");
+    assert!(
+        message.contains("cargo.packageRules"),
+        "the error must name where the winning rule came from: {message}"
+    );
+
+    // The pin may equally live there, with nothing at the top level.
+    check_renovate_rule(&format!(r#"{{ "cargo": {{ "packageRules": [ {REAL_RULE} ] }} }}"#)).unwrap();
+}
+
+/// `enabled` lists `.` and every manager among its `parents`, and `ignoreDeps`
+/// is settable in a manager block too. Neither needs a selector to reach
+/// `schemars`, and both cost the 0.8.x patches the range exists to keep.
+#[skuld::test]
+fn a_skip_set_outside_package_rules_is_rejected() {
+    for (config, expected) in [
+        (
+            format!(r#"{{ "enabled": false, "packageRules": [ {REAL_RULE} ] }}"#),
+            "the top level",
+        ),
+        (
+            format!(r#"{{ "cargo": {{ "enabled": false }}, "packageRules": [ {REAL_RULE} ] }}"#),
+            "cargo",
+        ),
+        (
+            format!(r#"{{ "cargo": {{ "ignoreDeps": ["schemars"] }}, "packageRules": [ {REAL_RULE} ] }}"#),
+            "cargo.ignoreDeps",
+        ),
+    ] {
+        let err = check_renovate_rule(&config).expect_err("a skip outside packageRules still skips");
+        assert!(
+            err.to_string().contains(expected),
+            "the error must name where the skip lives, expected {expected}: {err}"
+        );
+    }
+    // `enabled: true` there is not a skip.
+    check_renovate_rule(&format!(
+        r#"{{ "cargo": {{ "enabled": true }}, "packageRules": [ {REAL_RULE} ] }}"#
+    ))
+    .unwrap();
 }
 
 /// An absent `matchManagers` matches every manager, `cargo` among them. Not a
