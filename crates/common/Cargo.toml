@@ -70,9 +70,10 @@ typify = "0.6"
 # `schemars_pin` guard fails when the fact moves, so neither claim outlives it:
 # `schemars_pin_still_tracks_typify` reads the schemars version typify resolved
 # against out of Cargo.lock and checks this line against its own PINNED_SERIES,
-# and the `check-schemars-pin` prek hook additionally reads typify's declared
-# requirement from `cargo metadata` — the half that catches upstream widening,
-# which the lockfile cannot show.
+# and the `check-schemars-pin` prek hook — gated to commits touching this file,
+# Cargo.lock or the Renovate config, and unconditional in CI's Lint job —
+# additionally reads typify's declared requirement from `cargo metadata`, the
+# half that catches upstream widening, which the lockfile cannot show.
 schemars = "0.8"
 serde_json = "1"
 yaml_serde = "0.10"

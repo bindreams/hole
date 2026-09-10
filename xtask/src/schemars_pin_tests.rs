@@ -54,6 +54,11 @@ fn a_requirement_confined_to_the_series_admits_nothing_beyond_it() {
         "0.8.*",
         ">=0.8.16, <0.9",
         ">0.8.0, <0.9",
+        // A pre-release endpoint is the endpoint: 0.9.0-alpha sorts below
+        // 0.9.0, so `version_tracks_pin` puts it inside the series and this
+        // range never leaves it.
+        "<=0.9.0-alpha",
+        "=0.9.0-alpha",
     ] {
         assert_eq!(requirement_admits_beyond_pin(req).unwrap(), None, "req: {req}");
     }
@@ -79,6 +84,10 @@ fn a_widened_requirement_is_reported_with_the_version_it_readmits() {
         "1.*",
         "~1.2.3",
         "<=0.9",
+        // Pre-release endpoints past the pin. Both drove the fabricating tail
+        // this test's second assertion exists to catch.
+        "<=1.0.0-alpha",
+        ">=0.9.0-alpha",
     ] {
         let admitted = requirement_admits_beyond_pin(req)
             .unwrap()
@@ -104,6 +113,56 @@ fn a_widened_requirement_is_reported_with_the_version_it_readmits() {
         Some("1.0.2".to_string()),
         "a range that starts past the pin reports its own floor"
     );
+}
+
+/// Whatever version comes back is one the requirement really admits.
+///
+/// The reported version *is* the finding — it is what a maintainer reads and
+/// acts on — so a range that cannot be shown to reach past the pin must not be
+/// decorated with a version it does not accept. `<=0.9.0-alpha` is the input
+/// that broke this: its interval was computed with the pre-release dropped, no
+/// candidate in it matched, and the fallback reported the series boundary
+/// regardless.
+#[skuld::test]
+fn a_reported_version_is_never_fabricated() {
+    for req in [
+        "<0.9",
+        "<=0.8.22",
+        "^0.8.22",
+        "0.8.*",
+        ">=0.8.16, <0.9",
+        "<2",
+        "*",
+        ">=0.8",
+        ">0.8",
+        "<1.3",
+        "^0.9",
+        "^1.0.2",
+        ">=1.4, <1.5",
+        "1.*",
+        "~1.2.3",
+        "<=0.9",
+        "<=0.9.0-alpha",
+        "=0.9.0-alpha",
+        "<=1.0.0-alpha",
+        ">=0.9.0-alpha",
+        ">0.9.0-alpha",
+        "^0.9.0-alpha",
+    ] {
+        let Some(admitted) = requirement_admits_beyond_pin(req).unwrap() else {
+            continue;
+        };
+        assert!(
+            cargo_metadata::semver::VersionReq::parse(req)
+                .unwrap()
+                .matches(&admitted),
+            "`{req}` was reported as admitting {admitted}, which it does not accept"
+        );
+        assert!(
+            !version_tracks_pin(&admitted.to_string()).unwrap(),
+            "`{req}` was reported as admitting {admitted}, which is inside the pin"
+        );
+    }
 }
 
 /// A range that has tightened onto one release has become the `enabled: false`
@@ -193,10 +252,129 @@ fn a_rule_that_freezes_the_series_is_rejected() {
 fn a_rule_scoped_to_the_wrong_manager_is_rejected() {
     let err = check_renovate_rule(&renovate_config(&REAL_RULE.replace(r#"["cargo"]"#, r#"["npm"]"#)))
         .expect_err("a rule scoped to npm never reaches a cargo dependency");
+    let message = err.to_string();
     assert!(
-        err.to_string().contains("does not include `cargo`"),
-        "unexpected error: {err}"
+        message.contains("`matchManagers`"),
+        "the error must name the selector that sidelined the rule: {message}"
     );
+    assert!(
+        message.contains("`cargo` dependency"),
+        "the error must say what the rule failed to reach: {message}"
+    );
+}
+
+/// MUTATION: add a selector that makes Renovate not apply the rule.
+///
+/// Each of these is schema-valid — renovate-config-validator --strict accepts
+/// them all — and each leaves a rule that reads exactly like the pin and
+/// suppresses nothing. `matchManagers` is one of about fifteen such keys, so
+/// the guard enumerates the ones it can evaluate and rejects the rest rather
+/// than the other way round.
+#[skuld::test]
+fn a_rule_scoped_by_a_selector_the_guard_cannot_evaluate_is_rejected() {
+    for selector in [
+        r#""matchDatasources": ["npm"]"#,
+        r#""matchCategories": ["js"]"#,
+        r#""matchRepositories": ["someone/else"]"#,
+        r#""matchBaseBranches": ["nonexistent"]"#,
+        r#""matchDepTypes": ["dependencies"]"#,
+        r#""matchCurrentVersion": ">=1.0.0""#,
+        r#""matchUpdateTypes": ["major"]"#,
+        r#""matchJsonata": ["false"]"#,
+        r#""excludeDepNames": ["schemars"]"#,
+        r#""excludePackageNames": ["schemars"]"#,
+    ] {
+        let rule = REAL_RULE.replace(r#""matchManagers""#, &format!("{selector},\n  \"matchManagers\""));
+        let err = check_renovate_rule(&renovate_config(&rule))
+            .err()
+            .unwrap_or_else(|| panic!("a rule scoped by {selector} may never apply, and must not pass"));
+        let message = err.to_string();
+        assert!(
+            message.contains("cannot determine"),
+            "an unreadable selector is not an absent rule: {message}"
+        );
+        assert!(
+            message.contains("must be taught"),
+            "the error must say what to do about it: {message}"
+        );
+    }
+}
+
+/// MUTATION: `matchFileNames` pointed at a manifest `schemars` is not in.
+/// Decidable, unlike the selectors above, and so it gets the finding that fits:
+/// the rule exists and Renovate does not apply it.
+#[skuld::test]
+fn a_rule_scoped_to_another_manifest_is_rejected() {
+    let rule = REAL_RULE.replace(
+        r#""matchManagers""#,
+        r#""matchFileNames": ["package.json"],
+  "matchManagers""#,
+    );
+    let err = check_renovate_rule(&renovate_config(&rule)).expect_err("schemars is not declared in package.json");
+    let message = err.to_string();
+    assert!(message.contains("`matchFileNames`"), "unexpected error: {message}");
+    assert!(
+        message.contains("crates/common/Cargo.toml"),
+        "the error must name the manifest the rule failed to reach: {message}"
+    );
+}
+
+/// MUTATION: a negation that cancels the rule's own name match. Renovate vetoes
+/// on `!schemars` and the rule matches nothing.
+#[skuld::test]
+fn a_rule_whose_negation_cancels_its_name_match_is_rejected() {
+    let rule = REAL_RULE.replace(r#"["schemars"]"#, r#"["schemars", "!schemars"]"#);
+    let err = check_renovate_rule(&renovate_config(&rule)).expect_err("a vetoed rule matches nothing");
+    assert!(err.to_string().contains("`matchDepNames`"), "unexpected error: {err}");
+}
+
+/// The dep-name spellings Renovate honours, which the guard must read as the
+/// pin rather than as no rule at all. The glob form is not hypothetical:
+/// `.github/renovate.json`'s own Tauri rule is spelled that way.
+#[skuld::test]
+fn the_dep_name_spellings_renovate_honours_are_accepted() {
+    for selector in [
+        r#""matchDepNames": ["schemars"]"#,
+        r#""matchPackageNames": ["schemars"]"#,
+        r#""matchPackageNames": ["schemars*"]"#,
+        r#""matchPackageNames": ["sch*mars"]"#,
+        r#""matchPackageNames": ["/^schemars$/"]"#,
+        r#""matchPackageNames": ["/^SCHEMARS$/i"]"#,
+        r#""matchPackageNames": ["schemars", "serde"]"#,
+        r#""matchPackageNames": ["!serde"]"#,
+        r#""matchPackagePatterns": ["^schemars$"]"#,
+        r#""matchDepPatterns": ["^schemars$"]"#,
+    ] {
+        let rule = REAL_RULE.replace(r#""matchDepNames": ["schemars"]"#, selector);
+        check_renovate_rule(&renovate_config(&rule))
+            .unwrap_or_else(|e| panic!("Renovate applies {selector}; the guard must too\n{e}"));
+    }
+}
+
+/// A spelling the guard cannot decide is reported as undecided. "No rule names
+/// schemars" would send a maintainer to restore a rule that is right there.
+#[skuld::test]
+fn an_undecidable_name_spelling_is_reported_as_undecidable_not_absent() {
+    for selector in [
+        // `glob` does not expand brace alternation.
+        r#""matchPackageNames": ["{schemars,serde}"]"#,
+        // A regex Rust's engine will not compile. Renovate's might.
+        r#""matchPackageNames": ["/^(?=schemars)/"]"#,
+        // An opening delimiter with no closing one is not a spelling Renovate
+        // defines, so neither reading of it is safe.
+        r#""matchPackageNames": ["/schemars"]"#,
+    ] {
+        let rule = REAL_RULE.replace(r#""matchDepNames": ["schemars"]"#, selector);
+        let err = check_renovate_rule(&renovate_config(&rule))
+            .err()
+            .unwrap_or_else(|| panic!("{selector} is not decidable here, and must not pass"));
+        let message = err.to_string();
+        assert!(message.contains("cannot determine"), "unexpected error: {message}");
+        assert!(
+            !message.contains("no packageRule naming"),
+            "undecidable is not absent, and the two must not share a message: {message}"
+        );
+    }
 }
 
 /// An absent `matchManagers` matches every manager, `cargo` among them. Not a
@@ -230,6 +408,18 @@ fn a_schemars_rule_without_a_version_constraint_is_rejected() {
         err.to_string().contains("no `allowedVersions`"),
         "unexpected error: {err}"
     );
+}
+
+/// Renovate lets a packageRule carry its own `packageRules`, so a nested
+/// `allowedVersions` is reachable from a rule this merge only reads the surface
+/// of. Same class as an unreadable selector, same answer.
+#[skuld::test]
+fn a_rule_nesting_its_own_package_rules_is_rejected() {
+    let nested = format!(r#"{{ "matchManagers": ["cargo"], "packageRules": [ {REAL_RULE} ] }}"#);
+    let err = check_renovate_rule(&renovate_config(&nested)).expect_err("this guard reads the top-level array");
+    let message = err.to_string();
+    assert!(message.contains("cannot determine"), "unexpected error: {message}");
+    assert!(message.contains("nests its own"), "unexpected error: {message}");
 }
 
 #[skuld::test]
@@ -274,11 +464,44 @@ fn later_rules_that_cannot_reach_schemars_are_accepted() {
         r#"{ "matchManagers": ["rust-toolchain"], "matchDepNames": ["rust"], "automerge": false }"#,
         r#"{ "matchPackageNames": ["@tauri-apps/**", "tauri"], "groupName": "Tauri" }"#,
         r#"{ "matchManagers": ["cargo"], "matchDepNames": ["serde"], "allowedVersions": "<2" }"#,
+        // This repo's own first rule: a blanket `enabled: false` narrowed to a
+        // path `schemars` is not declared in.
+        r#"{ "matchFileNames": ["external/*/.circleci/**"], "enabled": false }"#,
+        // A selector the guard cannot read, on a rule another selector has
+        // already excluded. Excluded settles it; unreadable does not get a vote.
+        r#"{ "matchManagers": ["gomod"], "matchJsonata": ["true"], "enabled": false }"#,
     ];
     for other in others {
         check_renovate_rule(&format!(r#"{{ "packageRules": [ {REAL_RULE}, {other} ] }}"#))
             .unwrap_or_else(|e| panic!("rule should not have tripped last-wins: {other}\n{e}"));
     }
+}
+
+/// Renovate merges *every* applying rule, so last-wins runs forwards as well as
+/// backwards: an earlier widened rule is overridden by the pin that follows it,
+/// and the resolved range is safe. Taking the first rule that names `schemars`
+/// and scanning only later ones reports the `<2` that never applies.
+#[skuld::test]
+fn an_earlier_widened_rule_is_overridden_by_the_pin_that_follows_it() {
+    let earlier = r#"{ "matchManagers": ["cargo"], "matchDepNames": ["schemars"], "allowedVersions": "<2" }"#;
+    check_renovate_rule(&format!(r#"{{ "packageRules": [ {earlier}, {REAL_RULE} ] }}"#))
+        .expect("Renovate resolves the later `<0.9`, which holds the pin");
+
+    let disabled = r#"{ "matchPackageNames": ["*"], "enabled": false }"#;
+    let reenabled = REAL_RULE.replace(r#""allowedVersions""#, r#""enabled": true, "allowedVersions""#);
+    check_renovate_rule(&format!(r#"{{ "packageRules": [ {disabled}, {reenabled} ] }}"#))
+        .expect("the pin rule re-enables what the blanket disable turned off");
+}
+
+/// A grouping rule above the pin is the realistic version of the same mistake:
+/// it names `schemars`, sets no `allowedVersions`, and Renovate merges the pin
+/// on top of it. Reading only the first naming rule reports "no
+/// `allowedVersions`" about a config that has one.
+#[skuld::test]
+fn an_earlier_grouping_rule_does_not_displace_the_pin() {
+    let grouping = r#"{ "matchManagers": ["cargo"], "matchDepNames": ["schemars"], "groupName": "Rust crates" }"#;
+    check_renovate_rule(&format!(r#"{{ "packageRules": [ {grouping}, {REAL_RULE} ] }}"#))
+        .expect("a rule that sets no allowedVersions cannot displace one that does");
 }
 
 // upstream_schemars (Cargo.lock) ======================================================================================
@@ -582,10 +805,11 @@ fn a_manifest_without_the_build_dependency_is_reported() {
 ///    the range is evaluated, not merely found.
 /// 3. `crates/common/Cargo.toml` still names the series `PINNED_SERIES` does.
 ///
-/// A fourth, `typify-impl`'s declared requirement, needs a registry and so
-/// cannot run here; `cargo xtask check-schemars-pin` covers it on every commit
-/// and in the `Lint` job. See the module doc for why the split is by lane
-/// rather than by strength.
+/// A fourth, `typify-impl`'s declared requirement, needs a registry and so does
+/// not run here; `cargo xtask check-schemars-pin` covers it in the `Lint` job
+/// and in the `check-schemars-pin` prek hook, which `prek.toml` gates to
+/// commits touching the files this pin lives in. See the module doc for why the
+/// split is by lane rather than by strength.
 ///
 /// `repo_root()` rather than `env!("CARGO_MANIFEST_DIR")`: this binary runs
 /// from a nextest archive under `--workspace-remap`, where the build-time path

@@ -583,9 +583,9 @@ jobs:
   # schemars pin depends on one of those rules actually applying — see
   # xtask/src/schemars_pin.rs, which checks that the rule is *effective* but
   # takes its schema for granted. This is the other half: the rule exists, and
-  # it is spelled in a way Renovate accepts. Linux and ~15s; deliberately not
-  # folded into `Lint`, which is a Windows job with a Rust toolchain it does not
-  # need.
+  # it is spelled in a way Renovate accepts. Linux, measured at 25s for the step
+  # and 31s for the job; deliberately not folded into `Lint`, which is a Windows
+  # job with a Rust toolchain it does not need.
   renovate-config:
     name: Validate renovate config
     runs-on: ubuntu-latest
