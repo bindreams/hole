@@ -5,8 +5,8 @@
 //! the signal-safe on_crash wrote before termination.
 //!
 //! Also doubles as the child-process test double for
-//! `tests/crash_child_wait_tests/mod.rs`'s `wait_bounded`/`kill_pid_best_effort`
-//! unit tests (bindreams/hole#842, #719): `TOMBSTONE_TEST_HANG_FOREVER` and
+//! `tests/crash_child_wait_tests/mod.rs`'s `wait_bounded` unit tests
+//! (bindreams/hole#842, #719): `TOMBSTONE_TEST_HANG_FOREVER` and
 //! `TOMBSTONE_TEST_EXIT_FAST`, checked before any crash-class handling below,
 //! give those tests a child whose exit timing is deterministic without
 //! needing a real native fault.

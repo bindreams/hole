@@ -494,20 +494,53 @@ struct MarkerCrashEvent {
 // exception port the way a REAL fault (segfault/bus/illegal/trap) does — and
 // `abort()`'s C-standard-mandated contract (terminate even if a caught signal
 // handler returns) then re-raises `SIGABRT` with the default disposition,
-// generating a SECOND, genuine `EXC_CRASH` exception that forwards, like
-// every fault class eventually does, to the host-level exception port — the
-// system crash reporter (`ReportCrash`/`crashreporterd`). That reporter hop
-// is where `tombstone::crash_child crash_marker_abort` intermittently stalls
-// for minutes to hours on CI, never releasing the child
-// (bindreams/hole#842, #719); the other fault classes don't take this
-// synthetic-signal detour and are not observed to hang. `on_crash` is not
-// wired to see which detour a given call took (the SIGABRT relay's "handled"
-// reply is discarded — see the signal handler's ignored return value — so
-// returning `Handled(true)` there would not skip the reporter hop the way it
-// does for a real exception), so the escape is structural: recognize the
-// relay's exact signature and terminate before `abort()`'s guaranteed
-// re-raise can run at all.
-#[cfg(target_os = "macos")]
+// generating a SECOND, genuine `EXC_CRASH` exception. Because the relay never
+// detached, crash-handler's port is STILL registered for `EXC_MASK_CRASH`, so
+// — contrary to how this used to read — that second exception runs
+// `on_crash` AGAIN, this time via crash-handler's real `Exception` message
+// path with `context.exception.kind == EXC_CRASH`; it is THAT invocation's
+// return that finally triggers crash-handler's own `detach(true)`, restoring
+// the previous (OS-default) ports and letting the process forward on to the
+// system crash reporter (`ReportCrash`/`crashreporterd`). We never observe
+// this second invocation here: the `_exit` below fires on the FIRST call
+// (`kind == EXC_SOFTWARE`) and tears the process down before `abort()`'s
+// guaranteed re-raise can happen at all, so the second `EXC_CRASH` is never
+// actually raised — which is why the marker this test build writes always
+// carries `code=0x5` (`EXC_SOFTWARE`), never `0xa` (`EXC_CRASH`).
+//
+// Every fault class we handle reaches the crash reporter eventually —
+// confirmed by per-class `.ips` capture on darwin/arm64 (bindreams/hole#842):
+// abort, segfault, bus, illegal_instruction, trap, and stack_overflow all
+// produce one. What distinguishes abort is the ROUTE, visible in each
+// report's `termination.byProc`: abort's second, genuine `EXC_CRASH` is held
+// synchronously — crash-handler's task ports are still attached
+// (`byProc: crash_child`) — whereas a real fault is seen once, handled and
+// detached in the same pass, and reported via crash-handler's own reply
+// after that detach (`byProc: exc handler`). `tombstone::crash_child
+// crash_marker_abort` is the one that intermittently stalls for minutes to
+// hours on CI, never releasing the child (bindreams/hole#842, #719); the
+// fault classes are not observed to hang. Why the route matters — inferred
+// from XNU's exception-delivery model, not independently confirmed — is
+// likely the corpse path: a real fault's report goes through XNU's async,
+// corpse-based reporting, while abort's second exception blocks on the
+// synchronous `task_exception_notify(EXC_CRASH)` hold, which would degrade
+// when the system's corpse budget is exhausted on a busy CI runner — this
+// would also explain the intermittency, which a "different detour" story by
+// itself does not.
+//
+// `on_crash` is not wired to see which detour a given call took (the SIGABRT
+// relay's "handled" reply is discarded — see the signal handler's ignored
+// return value — so returning `Handled(true)` there would not skip the
+// reporter hop the way it does for a real exception), so the escape is
+// structural: recognize the relay's exact signature and terminate before
+// `abort()`'s guaranteed re-raise can run at all.
+// `any(test, feature = "crash-child")`, not a bare `target_os = "macos"`:
+// this predicate exists only to feed the compile-time-gated `_exit` bypass
+// in `on_crash` below (crash-child builds) or the unit tests in
+// `crash_tests.rs` (test builds) — a plain macOS release build (neither) has
+// no caller for it, and leaving it universally compiled would make it dead
+// code there. See review B4.
+#[cfg(all(target_os = "macos", any(test, feature = "crash-child")))]
 fn is_macos_sigabrt_relay(ctx: &crash_handler::CrashContext) -> bool {
     matches!(
         ctx.exception,
@@ -547,13 +580,27 @@ unsafe impl crash_handler::CrashEvent for MarkerCrashEvent {
         write_minidump_best_effort(self.state, context);
 
         // 3. TEST-ONLY, macOS-ONLY: stop the system crash reporter from ever
-        // seeing this process, instead of relying on it to behave. Scoped to
-        // `kind == "test"` (tombstone::crash_child, the only caller of
-        // `attach("test", ...)`) so production crash reporting for "gui" /
-        // "bridge" / "galoshes" is unchanged — those still forward to the OS
-        // default below, exactly as before. See `is_macos_sigabrt_relay` for
-        // why only the SIGABRT relay needs this.
-        #[cfg(target_os = "macos")]
+        // seeing this process, instead of relying on it to behave.
+        //
+        // Gated `feature = "crash-child"` (the tombstone::crash_child bin's
+        // own required-feature — the ONLY thing in the workspace that calls
+        // `attach("test", ...)`) as a COMPILE-TIME fact, not merely the
+        // runtime `kind == "test"` check below: production crash-reporting
+        // builds (gui/bridge/galoshes; `crash-child` is off by default and
+        // enabled only by the test workflow's nextest invocation, see
+        // Cargo.toml) do not even contain this code, so a future caller
+        // mistakenly passing `attach("test", ...)` from non-test code cannot
+        // resurrect it — there is nothing here for that string to switch on.
+        // The `kind == "test"` check stays as a second, in-build condition:
+        // within a crash-child-enabled build it still confines the bypass to
+        // the state actually produced by `attach("test", ...)`, e.g. against
+        // a future crash-child-linked binary that also serves a non-test
+        // kind. See `is_macos_sigabrt_relay` for why only the SIGABRT relay
+        // needs this; see `crash_marker_abort` (`tests/crash_child.rs`) for
+        // the test that exercises this exact conjunction end-to-end — it
+        // asserts the child's exit status IS `EX_SOFTWARE` (review B5), so
+        // removing either condition here fails it, not just goes unnoticed.
+        #[cfg(all(target_os = "macos", feature = "crash-child"))]
         if self.state.kind == "test" && is_macos_sigabrt_relay(context) {
             // SAFETY: `_exit` is async-signal-safe (POSIX.1-2017 §2.4.3): a
             // bare syscall, no atexit handlers, no libc/heap state touched.
@@ -561,10 +608,10 @@ unsafe impl crash_handler::CrashEvent for MarkerCrashEvent {
             // before `abort()`'s guaranteed re-raise can run — means the
             // real `EXC_CRASH` this relay would otherwise trigger never
             // happens, and the child never reaches the host-level exception
-            // port (ReportCrash). The exit code is not asserted on by the
-            // test (see `tests/crash_child.rs`); 70 is sysexits.h's
-            // `EX_SOFTWARE` (not in the `libc` crate — it's BSD-only cruft),
-            // documenting "abnormal, internal" in the (ignored) status.
+            // port (ReportCrash). 70 is sysexits.h's `EX_SOFTWARE` (not in
+            // the `libc` crate — it's BSD-only cruft), documenting
+            // "abnormal, internal" in the exit status that
+            // `crash_marker_abort` asserts on.
             const EX_SOFTWARE: i32 = 70;
             unsafe { libc::_exit(EX_SOFTWARE) };
         }

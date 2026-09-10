@@ -385,17 +385,42 @@ jobs:
     # sample still stands.
     #
     # Investigated for bindreams/hole#842/#719 (the tombstone::crash_child
-    # crash_marker_abort intermittent hang): of the 8 killed darwin/amd64 runs
-    # above, only one (2026-07-12T00:06, job 86595016035) shows that signature
-    # in its log — nextest reporting crash_marker_abort SLOW at escalating 60s
-    # intervals up to 1080s before the job was cancelled. The other 7 were
-    # killed elsewhere: crash_marker_abort had already passed cleanly before a
-    # slow incremental rebuild for the second (non-TUN) nextest pass ate the
-    # remaining budget (5 runs), a slow first-phase build never reached the
-    # test step at all (1 run), or the already-tracked e2e_*_roundtrip /
-    # udp_associate_galoshes stall consumed it (1 run). So #842/#719's fix does
-    # not materially shrink darwin/amd64's real budget need — this 90 stands on
-    # the other 7's genuine slowness alone.
+    # crash_marker_abort intermittent hang). This is its own sample, not the
+    # "8 killed" above — that count's date range is unstated, and it belongs
+    # to the pre-#989 45min-wall population, not the 29-run 2026-08-27 →
+    # 2026-09-07 one this paragraph is spliced under. Enumerating killed
+    # darwin/amd64 `test-hole` jobs on `main` for 2026-05-31 - 2026-08-04
+    # (all under that retired 45min wall) returns 12, not 8; one (run
+    # 80597393392, 2026-06-10) has since aged out of GitHub's log retention
+    # and can't be classified. Of the 11 with logs:
+    #   - 1 shows the hang signature: job 86595016035 (2026-07-11T23:27),
+    #     crash_marker_abort SLOW at escalating 60s intervals to 1080s
+    #     before the job was cancelled.
+    #   - 5 ran crash_marker_abort clean AND completed the TUN pass —
+    #     nextest's actual SECOND pass (SKULD_LABELS=tun runs after !tun,
+    #     not before — see job 86694590188's own log) — in full, then were
+    #     cancelled 1m54s-7m57s later in post-test cleanup: jobs
+    #     91615517954, 91565615662, 89807697019, 86694590188, 83671628233.
+    #     None were waiting on a rebuild ahead of a pass; both passes had
+    #     already printed every result.
+    #   - 2 hit the already-tracked e2e_*_roundtrip/udp_associate_galoshes
+    #     stall: jobs 89745070531, 86542250513.
+    #   - 1 never reached the test step (slow build): job 87336029086.
+    #   - 2 were killed mid the non-TUN pass with neither signature
+    #     present: jobs 89498063447, 86633700324.
+    # So "a slow rebuild ate the second pass's budget" describes none of
+    # these — the closest-shaped 5 completed both passes outright. #842's
+    # own trigger, job 95548588839 (PR #832 / azhukova/825, 2026-08-18), is
+    # a further kill outside both this sample and the "8 killed" window
+    # above: crash_marker_abort SLOW to >3660s before the CURRENT 90min
+    # wall cancelled it — the only hang observed at 90min, and exactly what
+    # this fix targets. Net over the 13 kills examined: 2 are this hang
+    # (86595016035, 95548588839), 2 are the unrelated tracked flake, 8 are
+    # plain build/test slowness under the retired 45min wall (relevance to
+    # the current 90min budget unmeasured), and 1 is unclassifiable (log
+    # expired). This fix removes a real, confirmed-recurring cause of
+    # darwin/amd64 kills; it does not by itself establish whether 90 can
+    # now be lowered.
     #
     # These are whole-JOB budgets, shared across build + verify + test. A slow
     # build therefore eats the test steps' headroom — which is exactly how #989
