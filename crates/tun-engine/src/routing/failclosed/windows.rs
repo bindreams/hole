@@ -454,7 +454,8 @@ fn swept_lockdown_guids() -> Vec<GUID> {
 /// current values. The floor (block-all, loopback, App-ID) is never in this set
 /// — it stays in force so the host is never opened by a refresh.
 ///
-/// Reached through `CoverSpec::pre_delete`, so recovery cannot issue it: a
+/// Reached through `CoverSpec::pre_delete` (as one half of
+/// [`lockdown_pre_delete_guids`]), so recovery cannot issue it: a
 /// recovery-time delete would drop a RUNNING bridge's server permit whenever a
 /// second bridge with a fresh state dir adopted the cover.
 fn adopt_delete_guids() -> Vec<GUID> {
