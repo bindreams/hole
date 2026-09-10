@@ -474,6 +474,87 @@ fn read_server_entry_file_rejects_malformed_json(#[fixture(temp_dir)] dir: &Path
     );
 }
 
+/// `serde_json::Error`'s `Display` echoes the bytes around the failure, and
+/// the file parsed here is a `ServerEntry`. That window is also the one with
+/// no sink backstop: `arm_server` runs only on the success path.
+#[skuld::test]
+fn read_server_entry_file_never_echoes_the_file_contents(#[fixture(temp_dir)] dir: &Path) {
+    // A password mistyped as a JSON number. serde_json reports "invalid type:
+    // integer `N`", and the value it names IS the secret.
+    const SECRET_PW: &str = "9876543210";
+    let body = format!(
+        r#"{{"id":"x","name":"x","server":"203.0.113.7","server_port":8388,"method":"aes-256-gcm","password":{SECRET_PW}}}"#
+    );
+    let path = dir.join("mistyped.json");
+    std::fs::write(&path, body.as_bytes()).unwrap();
+
+    // Guard: without it this test would also pass against a `serde_json` that
+    // had stopped echoing, and would prove nothing.
+    let raw = serde_json::from_slice::<hole_common::config::ServerEntry>(body.as_bytes())
+        .expect_err("must not parse")
+        .to_string();
+    assert!(raw.contains(SECRET_PW), "guard: serde_json echoes the value: {raw}");
+
+    let err = super::read_server_entry_file(&path).expect_err("mistyped json should error");
+    assert!(!err.contains(SECRET_PW), "the secret reached the CLI message: {err}");
+    assert!(err.contains("failed to parse"), "{err}");
+    assert!(
+        err.contains("line 1"),
+        "position must survive so the message stays actionable: {err}"
+    );
+}
+
+/// The elevation payload's own decode path, and the sharper of the two: it
+/// carries a whole `BridgeRequest`, and `arm_request_redaction` runs only
+/// after it succeeds, so nothing is armed on either failure arm.
+#[skuld::test]
+fn decode_b64_request_never_echoes_the_payload() {
+    use base64::Engine as _;
+    const SECRET_PW: &str = "9876543210";
+
+    let json = format!(
+        r#"{{"Start":{{"config":{{"server":{{"id":"x","name":"x","server":"203.0.113.7","server_port":8388,"method":"aes-256-gcm","password":{SECRET_PW}}},"local_port":4073}},"attempt_id":"a"}}}}"#
+    );
+    let encoded = base64::engine::general_purpose::STANDARD.encode(json.as_bytes());
+
+    // Guard: serde_json really does name the offending value.
+    let raw = serde_json::from_str::<hole_common::protocol::BridgeRequest>(&json)
+        .expect_err("must not parse")
+        .to_string();
+    assert!(raw.contains(SECRET_PW), "guard: serde_json echoes the value: {raw}");
+
+    let err = super::decode_b64_request(&encoded).expect_err("mistyped payload must be rejected");
+    assert!(!err.contains(SECRET_PW), "the secret reached the CLI message: {err}");
+    assert!(err.contains("line 1"), "position must survive: {err}");
+}
+
+/// The base64 arm carries no input at all — the payload is Hole's own
+/// encoding, so a decode failure means corruption and the offending byte
+/// would say nothing a retry doesn't.
+#[skuld::test]
+fn decode_b64_request_never_echoes_a_malformed_encoding() {
+    // `@` is not in the base64 alphabet; `DecodeError` would name it and its
+    // offset into the encoded secret-bearing payload.
+    let err = super::decode_b64_request("not@base64").expect_err("malformed base64 must be rejected");
+    assert!(!err.contains('@'), "the offending byte reached the message: {err}");
+    assert!(!err.contains("offset"), "{err}");
+    assert!(err.contains("base64"), "the message must still name the fault: {err}");
+}
+
+/// Paired positive: a well-formed payload still decodes, so the two guards
+/// above are not passing because everything is rejected.
+#[skuld::test]
+fn decode_b64_request_round_trips_a_well_formed_payload() {
+    use base64::Engine as _;
+    use hole_common::protocol::BridgeRequest;
+
+    let request = BridgeRequest::Cancel {
+        attempt_id: "attempt-7".into(),
+    };
+    let encoded = base64::engine::general_purpose::STANDARD.encode(serde_json::to_vec(&request).expect("serialize"));
+    assert_eq!(super::decode_b64_request(&encoded).expect("must decode"), request);
+}
+
 // `bridge install` flag parsing =======================================================================================
 //
 // The GUI's elevated-install path passes `--log-dir` to redirect the CLI's

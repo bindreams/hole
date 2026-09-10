@@ -32,8 +32,22 @@ pub enum ConfigError {
     SaveBlocked,
 }
 
+/// Content-safe description of a `serde_json` parse failure: the category and
+/// the position, never a fragment of the input.
+///
+/// The single public door for reporting a parse failure to a user, a toast,
+/// or a log. `serde_json::Error`'s own `Display` echoes the bytes around the
+/// error — for a `ServerEntry`, an `AppConfig`, or a `BridgeRequest` that can
+/// be the password itself, which is why [`ConfigError::Parse`] drops its
+/// source. Sites outside this module that hold a `serde_json::Error` and
+/// need to say something about it use this instead of `{e}`.
+pub fn describe_parse_error(e: &serde_json::Error) -> String {
+    format!("{} (line {}, column {})", parse_kind(e), e.line(), e.column())
+}
+
 /// Content-safe label for a `serde_json` parse failure (never echoes the input).
-/// `pub(crate)` so `ConfigStore::load` builds the same leak-safe variant.
+/// `pub(crate)` so `ConfigStore::load` builds the same leak-safe variant;
+/// [`describe_parse_error`] is the out-of-crate door.
 pub(crate) fn parse_kind(e: &serde_json::Error) -> &'static str {
     use serde_json::error::Category;
     match e.classify() {
@@ -223,6 +237,57 @@ pub struct AppConfig {
     pub diagnostic_plugin_tap: bool,
 }
 
+/// The widest rung of the ladder: `AppConfig` derives `Serialize` and holds
+/// **every** entry's secrets at once, so `dump!(&config)` without this impl
+/// renders the whole settings tree with each transparent newtype as its inner
+/// string.
+///
+/// Exhaustive destructure on purpose, the same device `UiSettings::apply`
+/// (`crates/hole/src/ui_settings.rs`) uses for its struct literal: adding a
+/// field to `AppConfig` fails compilation here until someone decides whether
+/// it is a secret.
+impl dump::Dump for AppConfig {
+    fn dump(&self) -> dump::DumpValue {
+        use dump::DumpValue;
+        let AppConfig {
+            servers,
+            selected_server,
+            local_port,
+            enabled,
+            elevation_prompt_shown,
+            filters,
+            on_startup,
+            theme,
+            proxy_server_enabled,
+            proxy_socks5,
+            proxy_http,
+            dns,
+            local_port_http,
+            diagnostic_plugin_tap,
+        } = self;
+        let field = |k: &str, v: DumpValue| (DumpValue::String(k.to_string()), v);
+        DumpValue::Map(vec![
+            field(
+                "servers",
+                DumpValue::Seq(servers.iter().map(ServerEntry::dump).collect()),
+            ),
+            field("selected_server", dump::from_serialize(selected_server)),
+            field("local_port", dump::from_serialize(local_port)),
+            field("enabled", dump::from_serialize(enabled)),
+            field("elevation_prompt_shown", dump::from_serialize(elevation_prompt_shown)),
+            field("filters", dump::from_serialize(filters)),
+            field("on_startup", dump::from_serialize(on_startup)),
+            field("theme", dump::from_serialize(theme)),
+            field("proxy_server_enabled", dump::from_serialize(proxy_server_enabled)),
+            field("proxy_socks5", dump::from_serialize(proxy_socks5)),
+            field("proxy_http", dump::from_serialize(proxy_http)),
+            field("dns", dump::from_serialize(dns)),
+            field("local_port_http", dump::from_serialize(local_port_http)),
+            field("diagnostic_plugin_tap", dump::from_serialize(diagnostic_plugin_tap)),
+        ])
+    }
+}
+
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
@@ -307,8 +372,8 @@ impl dump::Dump for ServerAddress {
 /// protection onto the value itself.
 ///
 /// `#[serde(transparent)]`: the on-disk and on-the-wire form is unchanged, a
-/// bare JSON string. Moving the secret out of `config.json` and into the OS
-/// keystore ([`crate::secrets`]) is the follow-up half of #980.
+/// bare JSON string. This is prevention only — moving the secret out of
+/// `config.json` is the still-open half of #980.
 #[derive(Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct Password(String);

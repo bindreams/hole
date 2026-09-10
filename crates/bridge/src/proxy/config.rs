@@ -7,7 +7,7 @@
 
 use hole_common::config::is_valid_plugin_name;
 use hole_common::protocol::ProxyConfig;
-use shadowsocks::config::{Mode, ServerAddr};
+use shadowsocks::config::{Mode, ServerAddr, ServerConfigError};
 use shadowsocks::ServerConfig;
 use shadowsocks_service::config::{
     Config, ConfigType, LocalConfig, LocalInstanceConfig, ProtocolType, ServerInstanceConfig,
@@ -20,10 +20,60 @@ use hole_common::plugin;
 
 // Errors ==============================================================================================================
 
+/// Why the configured password is unusable as key material for the cipher.
+///
+/// A closed set of causes carrying no decode detail, which is the entire
+/// point: upstream's [`ServerConfigError`] renders the offending base64
+/// symbol and its offset — one character of the user's key and where to find
+/// it — and a `ProxyError`'s `Display` reaches a GUI toast and `bridge.log`.
+/// The lengths the two length faults carry are the whole diagnostic and are
+/// not key bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum KeyMaterialFault {
+    #[error("the password is not valid base64")]
+    PskNotBase64,
+    #[error("an identity key in the password is not valid base64")]
+    IdentityKeyNotBase64,
+    #[error("the password decodes to {found} bytes, but this cipher needs {expected}")]
+    PskLength { expected: usize, found: usize },
+    #[error("an identity key decodes to {found} bytes, but this cipher needs {expected}")]
+    IdentityKeyLength { expected: usize, found: usize },
+}
+
+/// Per-variant policy on the type: the ONE exhaustive match on
+/// [`ServerConfigError`] in the workspace. No `_` arm — a new upstream
+/// variant fails compilation here rather than defaulting into a message that
+/// carries its `Display`. `shadowsocks` is pinned to `=1.24.0`, so that break
+/// arrives with a deliberate bump.
+///
+/// `pub(crate)` for [`crate::server_test`], which builds its own
+/// `ServerConfig` and has the same leak on the same error.
+pub(crate) fn classify_key_material(e: ServerConfigError) -> KeyMaterialFault {
+    match e {
+        ServerConfigError::InvalidKeyEncoding(..) => KeyMaterialFault::PskNotBase64,
+        ServerConfigError::InvalidUserKeyEncoding(..) => KeyMaterialFault::IdentityKeyNotBase64,
+        ServerConfigError::InvalidKeyLength(_, expected, found) => KeyMaterialFault::PskLength { expected, found },
+        ServerConfigError::InvalidUserKeyLength(_, expected, found) => {
+            KeyMaterialFault::IdentityKeyLength { expected, found }
+        }
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum ProxyError {
     #[error("invalid cipher method: {0}")]
     InvalidMethod(String),
+    /// The cipher name parsed, but the password is not usable as its key —
+    /// the 2022-blake3 ciphers take base64 key material, so
+    /// `ServerConfig::new` can reject a password the method check accepted.
+    ///
+    /// A separate variant from [`InvalidMethod`](Self::InvalidMethod), which
+    /// is a cipher name Hole does not know: these are different faults in
+    /// different fields, and reporting one as the other sends the user to
+    /// edit the wrong box. PII-free by construction — see
+    /// [`KeyMaterialFault`].
+    #[error("invalid key for cipher {method}: {fault}")]
+    InvalidKeyMaterial { method: String, fault: KeyMaterialFault },
     #[error("invalid plugin name: {0}")]
     InvalidPluginName(String),
     #[error("proxy runtime error: {0}")]
@@ -191,6 +241,7 @@ impl From<&ProxyError> for hole_common::protocol::StartError {
             // Listed exhaustively (no `_`) so a new `ProxyError` variant forces a
             // deliberate classification choice here.
             ProxyError::InvalidMethod(_)
+            | ProxyError::InvalidKeyMaterial { .. }
             | ProxyError::InvalidPluginName(_)
             | ProxyError::Runtime(_)
             | ProxyError::Gateway(_)
@@ -386,8 +437,12 @@ pub fn build_ss_config(
         Some(addr) => ServerAddr::SocketAddr(addr),
         None => ServerAddr::SocketAddr(SocketAddr::new(server_ip, entry.server_port)),
     };
-    let server_config = ServerConfig::new(server_addr, entry.password.expose().to_owned(), method)
-        .map_err(|e| ProxyError::InvalidMethod(e.to_string()))?;
+    let server_config = ServerConfig::new(server_addr, entry.password.expose().to_owned(), method).map_err(|e| {
+        ProxyError::InvalidKeyMaterial {
+            method: entry.method.clone(),
+            fault: classify_key_material(e),
+        }
+    })?;
 
     // No PluginConfig is set — Garter manages the plugin lifecycle externally.
     let mut ss_config = Config::new(ConfigType::Local);

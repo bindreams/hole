@@ -583,3 +583,71 @@ fn windows_state_dir_and_files_are_not_readable_by_users() {
         );
     }
 }
+
+/// The on-disk shapes are the same ladder as [`Target`]'s, and unlike
+/// `Target` they *do* derive `Serialize` — so a `dump!` on one renders the
+/// serde tree and never reaches `ProxyConfig::dump`. Private to this module
+/// today; visibility is not what makes a secret safe.
+#[skuld::test]
+fn the_persisted_file_shapes_never_carry_the_secrets() {
+    use dump::Dump;
+    let config = Box::new(test_config());
+    let rendered = [
+        TargetFile {
+            version: 1,
+            target: PersistedTarget::Connected { config: config.clone() },
+        }
+        .dump(),
+        PersistedTarget::Connected { config: config.clone() }.dump(),
+        StartupPreferenceFile {
+            version: 1,
+            on_startup: hole_common::config::StartupBehavior::default(),
+            candidate: Some(config),
+        }
+        .dump(),
+    ];
+    for value in rendered {
+        let text = dump::YamlFormatter::default().to_string(&value);
+        assert!(
+            !text.contains("example.invalid"),
+            "rendered dump must not carry the configured host in clear, got: {text}"
+        );
+        assert!(
+            !text.contains("super-secret-password"),
+            "rendered dump must not carry the password in clear, got: {text}"
+        );
+    }
+}
+
+/// The paired positive. Without it, a `Dump` impl that rendered `Null` for
+/// every secret-bearing arm would satisfy the negative above and destroy the
+/// diagnostic instead of redacting it — so the assertion has to land on the
+/// `Connected` / `Some(candidate)` arms specifically, not just on `Off`.
+#[skuld::test]
+fn the_persisted_file_shapes_still_carry_their_non_secret_payload() {
+    use dump::Dump;
+    let config = Box::new(test_config()); // local_port 1080, not a secret
+    let yaml = |v: dump::DumpValue| dump::YamlFormatter::default().to_string(&v);
+
+    let text = yaml(
+        TargetFile {
+            version: 7,
+            target: PersistedTarget::Connected { config: config.clone() },
+        }
+        .dump(),
+    );
+    assert!(text.contains('7'), "the schema version: {text}");
+    assert!(text.contains("1080"), "and the config's non-secret fields: {text}");
+
+    let text = yaml(
+        StartupPreferenceFile {
+            version: 9,
+            on_startup: hole_common::config::StartupBehavior::AlwaysConnect,
+            candidate: Some(config),
+        }
+        .dump(),
+    );
+    assert!(text.contains('9'), "the schema version: {text}");
+    assert!(text.contains("always_connect"), "the startup preference: {text}");
+    assert!(text.contains("1080"), "and the candidate's non-secret fields: {text}");
+}

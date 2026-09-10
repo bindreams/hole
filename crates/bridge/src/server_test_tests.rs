@@ -897,3 +897,39 @@ fn run_test_reclassify_plugin_start_failed_passes_through() {
         }
     });
 }
+
+// Key-material classification -----------------------------------------------------------------------------------------
+//
+// Same defect as `build_ss_config`'s, one module over: `ServerConfigError`'s
+// `Display` names the offending base64 symbol and its offset, and this
+// runner's failure string reaches the GUI as `ServerTestOutcome`.
+
+#[skuld::test]
+fn a_key_decode_failure_leaks_no_decode_detail() {
+    // `@` is the symbol upstream would name; 2022-blake3 takes the password
+    // as base64 key material, so this fails before anything is dialed.
+    let entry = entry("127.0.0.1", 8388, "2022-blake3-aes-256-gcm", "abc@def");
+    let detail = super::build_server_config(&entry, std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST))
+        .expect_err("a password that is not base64 must be rejected");
+    // Equality, not a substring hunt: upstream renders the offending byte as
+    // a *number* ("Invalid symbol 64, offset 3."), so `!contains('@')` passes
+    // vacuously. The message is `build_ss_config`'s, from the same classifier.
+    assert_eq!(
+        detail,
+        "invalid key for cipher 2022-blake3-aes-256-gcm: the password is not valid base64"
+    );
+}
+
+/// Paired positive: a well-formed PSK still builds, so the guard above is not
+/// passing because everything fails.
+#[skuld::test]
+fn a_well_formed_psk_still_builds_a_server_config() {
+    let entry = entry(
+        "127.0.0.1",
+        8388,
+        "2022-blake3-aes-256-gcm",
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+    );
+    super::build_server_config(&entry, std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST))
+        .expect("a correct PSK must build");
+}

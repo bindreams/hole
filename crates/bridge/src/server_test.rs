@@ -326,7 +326,17 @@ fn build_server_config(entry: &ServerEntry, server_ip: IpAddr) -> Result<ServerC
         entry.password.expose().to_owned(),
         cipher,
     )
-    .map_err(|e| format!("invalid server config: {e}"))
+    // Never `{e}`: `ServerConfigError`'s own `Display` names the offending
+    // base64 symbol and its offset, and this string becomes a
+    // `ServerTestOutcome` the GUI shows. Same classifier, and therefore the
+    // same message, as `build_ss_config`'s.
+    .map_err(|e| {
+        crate::proxy::ProxyError::InvalidKeyMaterial {
+            method: entry.method.clone(),
+            fault: crate::proxy::config::classify_key_material(e),
+        }
+        .to_string()
+    })
 }
 
 /// If `entry.plugin` is set, spawn it via Garter and override `svr_cfg`'s
@@ -398,8 +408,16 @@ async fn maybe_start_plugin(
         svr_cfg.password().to_owned(),
         svr_cfg.method(),
     )
+    // Same reason as `build_server_config`'s, and the same message shape, so
+    // the three `ServerConfig::new` sites report a key fault identically. The
+    // password here already derived its keys once, so this cannot fail today
+    // — the classification is what keeps that true if it ever can.
     .map_err(|e| ServerTestOutcome::PluginStartFailed {
-        detail: format!("failed to rebuild server config: {e}"),
+        detail: crate::proxy::ProxyError::InvalidKeyMaterial {
+            method: entry.method.clone(),
+            fault: crate::proxy::config::classify_key_material(e),
+        }
+        .to_string(),
     })?;
 
     debug!("server_test plugin bound at {local}");

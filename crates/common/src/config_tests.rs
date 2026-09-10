@@ -775,3 +775,55 @@ fn server_entry_json_round_trips_the_exact_address() {
     let back: ServerEntry = serde_json::from_str(&json).expect("deserialize");
     assert_eq!(back.server.expose(), SECRET_ADDR);
 }
+
+/// The widest rung of the ladder: `AppConfig` is the whole settings file, and
+/// its `servers` vector holds every entry's secrets at once.
+#[skuld::test]
+fn app_config_dump_omits_the_address_and_password() {
+    let config = AppConfig {
+        servers: vec![secret_entry()],
+        ..AppConfig::default()
+    };
+    let rendered = dump::dump!(&config).to_string();
+    assert!(
+        !rendered.contains(SECRET_ADDR),
+        "dump! must not carry the server address: {rendered}"
+    );
+    assert!(!rendered.contains(SECRET_PW), "nor the password: {rendered}");
+}
+
+/// Paired with the above: the non-secret settings still have to render, or
+/// the impl is useless for the diagnostics it exists to serve.
+#[skuld::test]
+fn app_config_dump_still_renders_non_secret_settings() {
+    let config = AppConfig {
+        local_port: 40731,
+        ..AppConfig::default()
+    };
+    let rendered = dump::dump!(&config).to_string();
+    assert!(rendered.contains("40731"), "{rendered}");
+}
+
+/// The content-safe replacement for `serde_json::Error`'s own `Display`,
+/// which echoes the bytes around the failure — for any payload Hole parses,
+/// that can be the password.
+#[skuld::test]
+fn describe_parse_error_never_echoes_the_input() {
+    // A password mistyped as a JSON number: the value serde_json names IS the
+    // secret.
+    const MISTYPED_PW: &str = "9876543210";
+    let json = format!(
+        r#"{{"id":"x","name":"x","server":"203.0.113.7","server_port":8388,"method":"aes-256-gcm","password":{MISTYPED_PW}}}"#
+    );
+    let e = serde_json::from_str::<ServerEntry>(&json).expect_err("must not parse");
+
+    // Guard: without it this passes against a serde_json that stopped echoing.
+    assert!(
+        e.to_string().contains(MISTYPED_PW),
+        "guard: serde_json echoes the offending value: {e}"
+    );
+
+    let described = describe_parse_error(&e);
+    assert!(!described.contains(MISTYPED_PW), "the secret survived: {described}");
+    assert!(described.contains("line 1"), "position must survive: {described}");
+}

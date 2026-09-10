@@ -57,6 +57,37 @@ enum PersistedTarget {
     Connected { config: Box<ProxyConfig> },
 }
 
+/// [`Target`]'s `Dump` impl below exists because `Target` has no `Serialize`
+/// to fall through to. These two do, which makes the trap live rather than
+/// hypothetical: a `dump!` on either renders the serde tree and
+/// `ProxyConfig::dump` is never reached. Private to this module today, and
+/// visibility is not what makes a secret safe.
+///
+/// Destructured rather than field-accessed, here and in
+/// [`StartupPreferenceFile`]'s impl below: a new field fails compilation
+/// until someone decides whether it is a secret, where a `self.field` list
+/// would let it vanish from the dump silently.
+impl dump::Dump for TargetFile {
+    fn dump(&self) -> dump::DumpValue {
+        use dump::DumpValue;
+        let TargetFile { version, target } = self;
+        DumpValue::Map(vec![
+            (DumpValue::String("version".into()), dump::from_serialize(version)),
+            (DumpValue::String("target".into()), target.dump()),
+        ])
+    }
+}
+
+impl dump::Dump for PersistedTarget {
+    fn dump(&self) -> dump::DumpValue {
+        use dump::DumpValue;
+        match self {
+            PersistedTarget::Off => DumpValue::String("off".to_string()),
+            PersistedTarget::Connected { config } => config.dump(),
+        }
+    }
+}
+
 // Target ==============================================================================================================
 
 /// What both surfaces reconcile toward. A closed classification rather than
@@ -523,6 +554,28 @@ struct StartupPreferenceFile {
     version: u32,
     on_startup: StartupBehavior,
     candidate: Option<Box<ProxyConfig>>,
+}
+
+/// Same live trap as [`TargetFile`]'s: `Serialize` derived, `ProxyConfig`
+/// inside.
+impl dump::Dump for StartupPreferenceFile {
+    fn dump(&self) -> dump::DumpValue {
+        use dump::DumpValue;
+        let StartupPreferenceFile {
+            version,
+            on_startup,
+            candidate,
+        } = self;
+        let candidate = match candidate {
+            Some(config) => config.dump(),
+            None => DumpValue::Null,
+        };
+        DumpValue::Map(vec![
+            (DumpValue::String("version".into()), dump::from_serialize(version)),
+            (DumpValue::String("on_startup".into()), dump::from_serialize(on_startup)),
+            (DumpValue::String("candidate".into()), candidate),
+        ])
+    }
 }
 
 /// The GUI-pushed startup preference: what to do at the bridge's own next

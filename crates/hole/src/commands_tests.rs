@@ -1097,10 +1097,10 @@ fn saving_a_config_arms_a_newly_added_entry() {
         servers: vec![crate::ui_settings::UiServerEntry {
             id: EDITED_ID.to_string(),
             name: "Test".to_string(),
-            server: "203.0.113.7".to_string(),
+            server: "203.0.113.7".into(),
             server_port: 8388,
             method: "aes-256-gcm".to_string(),
-            password: "pw".to_string(),
+            password: "pw".into(),
             plugin: None,
             plugin_opts: None,
         }],

@@ -1,4 +1,4 @@
-use crate::config::{is_valid_plugin_name, ServerEntry};
+use crate::config::{is_valid_plugin_name, Password, ServerEntry};
 use crate::plugin as known_plugin;
 use thiserror::Error;
 use uuid::Uuid;
@@ -144,7 +144,7 @@ fn parse_server_value(value: &serde_json::Value) -> Result<ServerEntry, ImportEr
         server: server.into(),
         server_port,
         method: method.to_string(),
-        password: crate::config::Password::new(password),
+        password: Password::new(password),
         plugin,
         plugin_opts,
         validation: None,

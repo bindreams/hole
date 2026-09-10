@@ -1000,24 +1000,41 @@ fn handle_grant_access(
     }
 }
 
-fn handle_ipc_send_b64(base64_request: &str) -> i32 {
+/// Decode the `--base64` elevation payload, or return a message safe to log.
+///
+/// Split out of [`handle_ipc_send_b64`] to be testable: both failure arms are
+/// leak-bearing and `cli_log!` returns nothing, so a test on the handler
+/// itself could not see what they say.
+///
+/// Neither arm carries its error's `Display`. `base64::DecodeError` names an
+/// offending byte and its offset into what is an encoded `BridgeRequest` — a
+/// `Password` and a `ServerAddress` in transit — and `serde_json::Error`
+/// echoes the bytes around a parse failure, which is that same payload. This
+/// is also the window with no sink-level backstop: `arm_request_redaction`
+/// runs only once decoding has succeeded.
+fn decode_b64_request(base64_request: &str) -> Result<hole_common::protocol::BridgeRequest, String> {
     use base64::Engine;
-    use hole_common::protocol::BridgeRequest;
 
-    // Decode base64
-    let json_bytes = match base64::engine::general_purpose::STANDARD.decode(base64_request) {
-        Ok(b) => b,
-        Err(e) => {
-            cli_log!(error, "invalid base64: {e}");
-            return 1;
-        }
-    };
+    // Hole encodes this payload itself, so a base64 failure means corruption
+    // and no byte-level detail would tell the operator anything a retry
+    // doesn't. Nothing from the error is kept.
+    let json_bytes = base64::engine::general_purpose::STANDARD
+        .decode(base64_request)
+        .map_err(|_| "request payload is not valid base64".to_string())?;
 
-    // Deserialize request
-    let request: BridgeRequest = match serde_json::from_slice(&json_bytes) {
+    serde_json::from_slice(&json_bytes).map_err(|e| {
+        format!(
+            "invalid request JSON: {}",
+            hole_common::config::describe_parse_error(&e)
+        )
+    })
+}
+
+fn handle_ipc_send_b64(base64_request: &str) -> i32 {
+    let request = match decode_b64_request(base64_request) {
         Ok(r) => r,
-        Err(e) => {
-            cli_log!(error, "invalid request JSON: {e}");
+        Err(msg) => {
+            cli_log!(error, "{msg}");
             return 1;
         }
     };
@@ -1116,8 +1133,17 @@ fn send_bridge_request_inner(
 /// message on file IO or parse failure.
 fn read_server_entry_file(path: &std::path::Path) -> Result<hole_common::config::ServerEntry, String> {
     let bytes = std::fs::read(path).map_err(|e| format!("failed to read {}: {e}", path.display()))?;
-    serde_json::from_slice::<hole_common::config::ServerEntry>(&bytes)
-        .map_err(|e| format!("failed to parse {} as ServerEntry JSON: {e}", path.display()))
+    // Never `{e}`: `serde_json::Error`'s `Display` echoes the bytes around the
+    // failure, and this file holds a password. Nothing is armed yet either —
+    // `arm_server` runs only after a successful parse — so this line has no
+    // sink-level backstop for the address either.
+    serde_json::from_slice::<hole_common::config::ServerEntry>(&bytes).map_err(|e| {
+        format!(
+            "failed to parse {} as ServerEntry JSON: {}",
+            path.display(),
+            hole_common::config::describe_parse_error(&e)
+        )
+    })
 }
 
 fn handle_proxy(action: ProxyAction) -> i32 {
