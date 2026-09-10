@@ -1246,6 +1246,21 @@ fn an_empty_but_captured_baseline_still_restores_the_snapshot() {
 /// the runner landed on. `.config/nextest.toml` gives this test
 /// `success-output` so the line survives a PASS, where nextest otherwise
 /// discards captured output.
+///
+/// A MEASURED number, not a hypothetical one: on the darwin/amd64 CI runner
+/// (2026-09-10, job 102969439298) the control completed 7/31 connects (22.6%)
+/// to a PERMITTED server within the 20ms budget — under a quarter of the
+/// control's own attempts land inside the window at all. So this guard
+/// catches a leak with roughly that probability per transition it overlaps,
+/// nowhere near the near-certainty a green result would otherwise suggest,
+/// and the `pfctl -f -` commit window it exists to guard is plausibly
+/// sub-millisecond (see the paragraph above) — an order of magnitude below
+/// even the 20ms the control was already struggling to clear. Widening
+/// `PROBER_TIMEOUT` to manufacture a better-looking ratio would not close
+/// that gap: it would relax the very probe the leak-detection assertion
+/// depends on, at 20ms of dwell time a leaked connection already has to
+/// survive. The honest fix for the gap is a narrower, more certain detection
+/// mechanism, not a bigger budget.
 #[cfg(target_os = "macos")]
 #[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
 fn macos_failclosed_cover_transition_never_admits_blocked_flow() {
