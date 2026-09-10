@@ -1182,9 +1182,9 @@ once it starts, not enforced before that — the kernel enforces only
 `FWPM_FILTER_FLAG_BOOTTIME` filters from boot until BFE takes over, so a
 `PERSISTENT`-only block-all left the host open on every reboot with the kill
 switch armed. The block-all half of the standing cover now additionally
-installs a `BOOTTIME` twin (`LOCKDOWN_BOOTTIME_BLOCK_ALL_GUIDS`); the two flags
-are mutually exclusive on one filter object, so this is a second filter, not a
-second bit, and WFP documents the hand-off between them as atomic. Every
+installs `BOOTTIME` twins (`LOCKDOWN_BOOTTIME_BLOCK_ALL_GUIDS`); the two flags
+are mutually exclusive on one filter object, so these are two more filters, not
+two more bits, and WFP documents the hand-off between them as atomic. Every
 permit, including loopback, stays `PERSISTENT`-only: a boot-time permit either
 carries a runtime-discovered value nothing can refresh pre-BFE, or has no
 hand-off to its narrower persistent counterpart — and the leak this closes is

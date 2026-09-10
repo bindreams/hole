@@ -79,7 +79,7 @@
 //!
 //! The standing LOCKDOWN cover (kill switch) is meant to survive an arbitrary
 //! reboot — CONTRIBUTING.md's "Fail-closed cover" section — so
-//! `build_lockdown_spec` gives ONLY its block-all pair a `Boottime` twin
+//! `build_lockdown_spec` gives ONLY its block-all pair `Boottime` twins
 //! (`LOCKDOWN_BOOTTIME_BLOCK_ALL_GUIDS`); every permit, including loopback,
 //! stays `Persistent`-only. Be precise about what that buys and what it costs:
 //! the twins carry the block and nothing else, so in the boot→BFE window there
@@ -133,13 +133,6 @@
 //! binary that never learned a NEWER binary's boot-time GUID (a downgrade)
 //! cannot find it by key to delete it.
 //!
-//! Note we are exposed to that for longer than the precedent is. Mullvad
-//! installs its boot-time blocks only as the daemon SHUTS DOWN under a
-//! blocking policy, after deleting its ephemeral objects, and sweeps them by
-//! provider on the way back up; ours go in at engage and stay for as long as
-//! the kill switch is armed. Same filters, a much wider window in which a
-//! version skew can strand one.
-//!
 //! How bad that is turns on the open question below — whether a boot-time
 //! policy record is re-provisioned at EVERY subsequent boot or applied only
 //! once — and the answer cuts both ways at once, which is the honest way to
@@ -149,7 +142,14 @@
 //! hazard largely evaporates and so does most of the protection, since a twin
 //! installed in one session would cover the next boot and no other. Neither
 //! branch is established here, so this file assumes the worse one for safety
-//! and claims the weaker one for coverage. Bounding the risk needs a
+//! and claims the weaker one for coverage.
+//!
+//! Note we are exposed to this for longer than the precedent is. Mullvad
+//! installs its boot-time blocks only as the daemon SHUTS DOWN under a
+//! blocking policy, after deleting its ephemeral objects, and sweeps them by
+//! provider on the way back up; ours go in at engage and stay for as long as
+//! the kill switch is armed. Same filters, a much wider window in which a
+//! version skew can strand one. Bounding the risk needs a
 //! version-independent sweep (enumerate live filters by [`PROVIDER_GUID`]
 //! instead of a fixed array, deleting any that still carry
 //! `FWPM_FILTER_FLAG_BOOTTIME`) — tracked as #1008, deliberately NOT part of
