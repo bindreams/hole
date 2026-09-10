@@ -761,17 +761,18 @@ fn test_server_request_dump_omits_the_address_and_password() {
 /// because it reads as covered and renders nothing.
 #[skuld::test]
 fn test_server_request_dump_still_renders_non_secret_payload() {
+    // Distinct values: an id that shares digits with the port would satisfy
+    // the port assertion on its own and prove nothing about it.
     let mut entry = secret_config().server;
-    entry.id = "entry-40731".into();
+    entry.id = "id-becfd".into();
     entry.server_port = 40731;
     let rendered = dump::dump!(&TestServerRequest {
         entry,
         dns: crate::config::DnsConfig::default(),
     })
     .to_string();
-    assert!(rendered.contains("entry"), "the field name: {rendered}");
     assert!(
-        rendered.contains("entry-40731"),
+        rendered.contains("id-becfd"),
         "the entry's non-secret fields: {rendered}"
     );
     assert!(rendered.contains("40731"), "including the port: {rendered}");

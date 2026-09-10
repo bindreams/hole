@@ -2200,20 +2200,25 @@ in different fields.
 
 **And through a parse error.** `serde_json::Error`'s `Display` quotes its input
 back — the offending value for a data error, an arbitrary caller-supplied
-*string* for an unknown variant — and every JSON Hole parses can hold a
-password: the user's `config.json`, an imported profile, the elevation payload
-(a whole `BridgeRequest`, in transit), and the bridge's own
-`bridge-target.json` / `bridge-startup.json`.
-`hole_common::config::describe_parse_error` is the out-of-crate door: category
-plus line and column, never a fragment. Its callers are `cli`'s
-`decode_b64_request` and `read_server_entry_file`,
-`elevation::read_request_file`, and the bridge's two state-file loaders in
-`target.rs`. `ConfigError::Parse` and `ImportError::Parse` go further and drop
-the `serde_json::Error` outright, carrying the same scalars as fields, so
-neither their `Display` nor their derived `Debug` can echo. The elevation and
-state-file sites are the sharp ones: `arm_request_redaction` runs only after a
-successful parse, so the address has no sink-level backstop on a failure arm
-either, and the password never has one.
+*string* for an unknown variant or field — and every JSON this workspace parses
+can hold a protected value: the user's `config.json`, an imported profile, the
+elevation payload (a whole `BridgeRequest`, in transit), and four bridge state
+files (`bridge-target.json` and `bridge-startup.json` hold a password;
+`bridge-routes.json` holds `server_ip`; `bridge-lockdown-pf.json`'s
+`main_snapshot` holds one whenever the `pfctl -sr` ruleset it captured was
+Hole's own cover). [`util::parse_error::describe_parse_error`](crates/util/src/parse_error.rs)
+is the one door: category plus line and column, never a fragment. It lives in
+`util` rather than `hole-common` because `tun-engine` parses two of those files
+and does not depend on `hole-common`; `hole_common::config` re-exports it so
+Hole-side callers keep one name. `ConfigError::Parse` and `ImportError::Parse`
+go further and drop the `serde_json::Error` outright, carrying the same scalars
+as *fields*, so neither their `Display` nor their derived `Debug` can echo.
+
+The state-file and elevation sites are the sharp ones, for the same reason:
+nothing is armed when they run. The elevation arms only after a successful
+parse, and the crash-recovery sweep runs before any session exists — so on
+those paths the address has no sink-level backstop either, and the password
+never has one anywhere.
 
 **What replaces the address in a Hole-authored line.** `server` (the token),
 `server_kind` (`domain`/`ipv4`/`ipv6`), `server_family`, `server_scope`

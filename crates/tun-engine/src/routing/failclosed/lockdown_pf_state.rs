@@ -98,7 +98,15 @@ pub fn load_presence(state_dir: &Path) -> super::StateFile<LockdownPfState> {
             StateFile::Unusable
         }
         Err(e) => {
-            tracing::warn!(error = %e, path = %path.display(), "lockdown-pf-state parse failed");
+            // Classified, never `%e`: `main_snapshot` is a captured `pfctl -sr`
+            // ruleset, which contains the server IP whenever the ruleset it
+            // captured was Hole's own cover, and `serde_json::Error`'s
+            // `Display` quotes the offending bytes back.
+            tracing::warn!(
+                error = %util::parse_error::describe_parse_error(&e),
+                path = %path.display(),
+                "lockdown-pf-state parse failed"
+            );
             StateFile::Unusable
         }
     }

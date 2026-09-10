@@ -738,10 +738,7 @@ fn handle_bridge(action: BridgeAction) -> i32 {
         } => match (base64, request_file) {
             (Some(b64), _) => handle_ipc_send_b64(&b64),
             (_, Some(path)) => match crate::elevation::read_request_file(&path) {
-                Ok(request) => {
-                    arm_request_redaction(&request);
-                    send_bridge_request(request, result_file.as_deref())
-                }
+                Ok(request) => send_bridge_request(request, result_file.as_deref()),
                 Err(e) => {
                     cli_log!(error, "{e}");
                     1
@@ -1039,7 +1036,6 @@ fn handle_ipc_send_b64(base64_request: &str) -> i32 {
         }
     };
 
-    arm_request_redaction(&request);
     send_bridge_request(request, None)
 }
 
@@ -1099,6 +1095,16 @@ fn send_bridge_request(request: hole_common::protocol::BridgeRequest, result_fil
 /// Underlying request driver. Returns the parsed `BridgeResponse` or the typed
 /// `ClientError` (kept typed so the elevated classifier can distinguish a
 /// control-plane `ConcurrentStart` from a transport failure).
+///
+/// Arms redaction itself. This is the one place a `BridgeRequest` reaches the
+/// wire, and arming used to be a per-call-site obligation discharged by two
+/// different mechanisms — `arm_request_redaction` on the three elevation
+/// paths, a hand-written `arm_server` on the two `proxy` ones — which
+/// `grant-access --then-send-file` simply did not discharge at all. Doing it
+/// here makes the CLI's log writers live for every path by construction, and
+/// the `--base64`/`--request-file` decode arms are the only windows left
+/// (they precede a parsed request existing at all). Arming is last-wins and
+/// idempotent, so a repeat costs nothing.
 /// Arm log redaction from a request the CLI is about to send.
 ///
 /// The CLI writes its own log file (`gui-cli.log`) and executes none of the
@@ -1106,6 +1112,11 @@ fn send_bridge_request(request: hole_common::protocol::BridgeRequest, result_fil
 /// whole process lifetime. Covers the elevation flow, which re-enters this
 /// binary as `hole bridge ipc-send --request-file` carrying the address and
 /// the password.
+///
+/// Called from exactly one place, [`send_bridge_request`] — the funnel every
+/// payload path reaches. Test-enforced
+/// (`redaction_is_armed_only_by_the_send_funnel`): when this was a call-site
+/// obligation instead, one of the three paths did not meet it.
 pub(crate) fn arm_request_redaction(request: &hole_common::protocol::BridgeRequest) {
     use hole_common::logging::redact_arm::arm_server;
     use hole_common::protocol::BridgeRequest;
@@ -1119,6 +1130,7 @@ pub(crate) fn arm_request_redaction(request: &hole_common::protocol::BridgeReque
 fn send_bridge_request_inner(
     request: hole_common::protocol::BridgeRequest,
 ) -> Result<hole_common::protocol::BridgeResponse, crate::bridge_client::ClientError> {
+    arm_request_redaction(&request);
     let rt = tokio::runtime::Runtime::new().unwrap();
     rt.block_on(async {
         let socket_path = hole_common::protocol::default_bridge_socket_path();
@@ -1165,7 +1177,6 @@ fn handle_proxy(action: ProxyAction) -> i32 {
                     return 1;
                 }
             };
-            hole_common::logging::redact_arm::arm_server(&entry);
             let request = BridgeRequest::Start {
                 config: ProxyConfig {
                     server: entry,
@@ -1239,7 +1250,6 @@ fn handle_proxy(action: ProxyAction) -> i32 {
                     return 1;
                 }
             };
-            hole_common::logging::redact_arm::arm_server(&entry);
             // The dev/admin CLI reads only a ServerEntry file — no AppConfig in
             // hand — so it bootstraps over the default DoH resolver.
             let dns = hole_common::config::DnsConfig::default();

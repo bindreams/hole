@@ -12,7 +12,8 @@ pub enum ImportError {
     /// A user's imported profile is the most-likely-malformed input in the
     /// product and holds a password; dropping the source makes an echo
     /// structurally impossible rather than a property of who happens to
-    /// construct this today. [`From`] below is the only way to build it.
+    /// construct this today — the fields cannot hold content, so no
+    /// constructor anywhere can reintroduce one.
     #[error("failed to parse config JSON: {kind} (line {line}, column {column})")]
     Parse {
         kind: &'static str,

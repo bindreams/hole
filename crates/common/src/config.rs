@@ -35,28 +35,16 @@ pub enum ConfigError {
 /// Content-safe description of a `serde_json` parse failure: the category and
 /// the position, never a fragment of the input.
 ///
-/// The single public door for reporting a parse failure to a user, a toast,
-/// or a log. `serde_json::Error`'s own `Display` echoes the bytes around the
-/// error — for a `ServerEntry`, an `AppConfig`, or a `BridgeRequest` that can
-/// be the password itself, which is why [`ConfigError::Parse`] drops its
-/// source. Sites outside this module that hold a `serde_json::Error` and
-/// need to say something about it use this instead of `{e}`.
-pub fn describe_parse_error(e: &serde_json::Error) -> String {
-    format!("{} (line {}, column {})", parse_kind(e), e.line(), e.column())
-}
-
-/// Content-safe label for a `serde_json` parse failure (never echoes the input).
-/// `pub(crate)` so `ConfigStore::load` builds the same leak-safe variant;
-/// [`describe_parse_error`] is the out-of-crate door.
-pub(crate) fn parse_kind(e: &serde_json::Error) -> &'static str {
-    use serde_json::error::Category;
-    match e.classify() {
-        Category::Io => "I/O error",
-        Category::Syntax => "syntax error",
-        Category::Data => "data error",
-        Category::Eof => "unexpected end of input",
-    }
-}
+/// Hole's door onto [`util::parse_error::describe_parse_error`]. The
+/// implementation lives in `util` because `tun-engine` parses secret-bearing
+/// state files too and does not depend on this crate; re-exported here so
+/// the callers that reach for it via `hole_common::config` keep one name.
+/// `serde_json::Error`'s own `Display` echoes the bytes around the error —
+/// for a `ServerEntry`, an `AppConfig`, or a `BridgeRequest` that can be the
+/// password itself, which is why [`ConfigError::Parse`] drops its source.
+/// Sites that hold a `serde_json::Error` and need to say something about it
+/// use this instead of `{e}`.
+pub use util::parse_error::{describe_parse_error, parse_kind};
 
 // Types ===============================================================================================================
 

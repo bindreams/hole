@@ -984,3 +984,53 @@ fn cli_ipc_send_arms_a_start_request(#[fixture(temp_dir)] dir: &Path) {
 
     assert_eq!(util::redact::redact_str("203.0.113.11"), token_for(ENTRY_ID));
 }
+
+/// Arming is a *funnel* property, not a call-site obligation.
+///
+/// The CLI puts a `BridgeRequest` on the wire from six places. Arming used to
+/// be each one's own job, discharged by two different mechanisms — three
+/// elevation paths called `arm_request_redaction`, two `proxy` paths called
+/// `arm_server` by hand — and `grant-access --then-send-file` called neither,
+/// so its elevated process ran unarmed for the address on its *success* path.
+/// No test noticed, because every arming test called the arming function
+/// directly. The rule is now structural: one mechanism, invoked once, at the
+/// single point a request reaches the wire.
+#[skuld::test]
+fn redaction_is_armed_only_by_the_wire_funnel() {
+    let source = std::fs::read_to_string(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/cli.rs"))
+        .expect("read cli.rs");
+
+    let calls = |needle: &str| -> Vec<String> {
+        source
+            .lines()
+            .filter(|l| l.contains(needle))
+            .filter(|l| !l.trim_start().starts_with("///") && !l.contains(&format!("fn {needle}")))
+            .map(str::to_string)
+            .collect()
+    };
+
+    let arm_calls = calls("arm_request_redaction(");
+    assert_eq!(
+        arm_calls.len(),
+        1,
+        "arming must have exactly one call site, got: {arm_calls:?}"
+    );
+
+    // No second mechanism: a hand-rolled `arm_server` beside a send is how two
+    // of the six paths used to do this, and is what let the sixth do nothing.
+    let ad_hoc = calls("arm_server(");
+    assert!(
+        ad_hoc.iter().all(|l| l.contains("=> arm_server(")),
+        "the only `arm_server` calls may be inside arm_request_redaction's match: {ad_hoc:?}"
+    );
+
+    // The one call site is inside the driver, ahead of the connect.
+    let driver = source
+        .split_once("fn send_bridge_request_inner(")
+        .expect("the driver must exist")
+        .1;
+    let body = driver.split("\nfn ").next().expect("driver body");
+    let arm_at = body.find("arm_request_redaction(").expect("the driver must arm");
+    let connect_at = body.find("BridgeClient::connect(").expect("the driver must connect");
+    assert!(arm_at < connect_at, "arming must precede the connect");
+}
