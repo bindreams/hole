@@ -770,3 +770,73 @@ fn other_stop_failures_are_not_read_as_already_stopped() {
     assert!(!is_session_not_found(&unconverted));
     assert!(!is_session_not_found(&TraceError::InvalidTraceName));
 }
+
+// Drop's abandon path =================================================================================================
+
+/// `EtwGuard::drop` must return WITHOUT joining the processing thread when
+/// the session was not reclaimed, and it must say so at `warn!` — the one
+/// consequence `Drop`'s `if session_reclaimed { join } else { abandon }`
+/// split exists for. No real ETW session or admin privilege is needed to
+/// reach the `false` arm deterministically: `session_name` carries an
+/// interior NUL, so `ferrisetw::trace::stop_trace_by_name`'s
+/// `U16CString::from_str` fails before any Win32 call is made, returning
+/// `TraceError::InvalidTraceName` — which `is_session_not_found` reads as
+/// `false` (pinned by `other_stop_failures_are_not_read_as_already_stopped`
+/// above), so `stop_session` reports the session as not reclaimed every
+/// time.
+///
+/// `thread` is a real, spawned OS thread parked on a channel this test
+/// itself controls and never signals until after `drop` below returns. This
+/// is the only way to observe "did not join" from outside `Drop`: if a
+/// regression reverted the `if session_reclaimed` gate to an unconditional
+/// join (as it was before this split), `drop(etw_guard)` would block on
+/// that thread forever instead of returning. That hang is the sanctioned
+/// "no other happens-before edge" exception CONTRIBUTING.md carves out for
+/// this class of assertion — same shape as the tun-engine driver and
+/// `run_with_tap` cases documented in `.config/nextest.toml`, which is
+/// where this test's name is listed so the hang fails loud instead of
+/// consuming the job budget.
+#[skuld::test]
+fn drop_abandons_the_processing_thread_without_joining_when_the_session_is_not_reclaimed() {
+    use crate::test_support::log_capture::VecWriter;
+    use garter::tracing_test::set_default_in_current_thread;
+    use tracing_subscriber::fmt;
+    use tracing_subscriber::layer::{Layer, SubscriberExt};
+
+    let writer = VecWriter::new();
+    let subscriber = tracing_subscriber::registry().with(
+        fmt::layer()
+            .with_writer(writer.clone())
+            .with_ansi(false)
+            .with_filter(tracing_subscriber::filter::LevelFilter::WARN),
+    );
+    let _guard = set_default_in_current_thread(subscriber);
+
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let thread = std::thread::spawn(move || {
+        let _ = release_rx.recv();
+    });
+
+    let etw_guard = EtwGuard {
+        trace: None,
+        thread: Some(thread),
+        session_name: "x\0y".to_string(),
+        stats_tx: None,
+        stats_thread: None,
+    };
+
+    // If a regression rejoins unconditionally, this call never returns --
+    // see the function doc and the `.config/nextest.toml` entry carrying
+    // this test's name.
+    drop(etw_guard);
+
+    let output = writer.snapshot_string();
+    assert!(
+        output.contains("etw: kernel did not confirm the session was stopped"),
+        "expected Drop to log the abandon warning after returning without joining; got:\n{output}"
+    );
+
+    // `drop` above already returned without joining -- release the parked
+    // thread so it can exit instead of leaking past this test.
+    drop(release_tx);
+}

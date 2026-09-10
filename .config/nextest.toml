@@ -188,3 +188,21 @@ slow-timeout = { period = "30s", terminate-after = 2 }
 [[profile.default.overrides]]
 filter = 'test(/^(echo_records_round_trip_byte_counts_and_ttfb|silent_drop_records_zero_bytes_and_no_ttfb|silent_after_read_matches_248_shape|rst_close_classified_as_rst_with_os_errno|shutdown_cancels_in_flight_connection_without_panic|cross_check_inbound_and_upstream_counters_match)$/)'
 slow-timeout = { period = "20s", terminate-after = 2 }
+
+# `crates/bridge/src/diagnostics/etw_tests.rs`'s
+# `drop_abandons_the_processing_thread_without_joining_when_the_session_is_not_reclaimed`
+# parks a real OS thread on a channel that only the test itself (never
+# production code) signals, so it can observe "EtwGuard::drop returned
+# without joining" from outside `Drop` -- there is no other happens-before
+# edge for that claim. A regression that rejoins the processing thread
+# unconditionally (reverting `EtwGuard::drop`'s `if session_reclaimed` gate)
+# hangs `drop(etw_guard)` forever instead of failing; bounded here the same
+# way as the tun-engine driver and `run_with_tap` groups above, for the
+# identical reason.
+#
+# COUPLED NAME, same caveat as the two groups above: this is a bare
+# function name. Windows-only (`#[cfg(target_os = "windows")]` on the
+# enclosing `etw` module), so this override is inert elsewhere.
+[[profile.default.overrides]]
+filter = 'test(/^drop_abandons_the_processing_thread_without_joining_when_the_session_is_not_reclaimed$/)'
+slow-timeout = { period = "20s", terminate-after = 2 }

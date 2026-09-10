@@ -61,9 +61,15 @@
 //!    interval) and joins it, THEN reads session statistics one final time
 //!    via `ControlTraceW(EVENT_TRACE_CONTROL_QUERY)` ([`query_session_stats`])
 //!    before stopping the session ([`EtwGuard::stop_session`], which signals
-//!    the kernel to stop delivering events) and joining the processing thread,
-//!    guaranteeing the callback drains the pending event queue before shutdown
-//!    completes.
+//!    the kernel to stop delivering events). If the kernel confirmed the
+//!    session was reclaimed, `Drop` then joins the processing thread too,
+//!    guaranteeing the callback drains the pending event queue before
+//!    shutdown completes. If it did NOT — even the by-name STOP backstop
+//!    failed — `Drop` cannot tell a thread that is genuinely stuck apart
+//!    from one whose `CloseTrace` already succeeded and is about to return
+//!    on its own, so it abandons the thread rather than risk blocking
+//!    shutdown forever: it logs a `warn!` and drops the `JoinHandle`
+//!    without joining, detaching the OS thread instead.
 //!    Stopping the timer thread first is load-bearing, not incidental: it
 //!    guarantees no periodic tick can still be mid-query when the session is
 //!    stopped, so the two `query_session_stats` callers (periodic, drop-time)
@@ -358,12 +364,18 @@ impl Drop for EtwGuard {
                     warn!(panic = ?e, "etw: processing thread panicked during drop");
                 }
             } else {
-                // `stop_session` positively knows the kernel session was not
-                // reclaimed: `process_from_handle` has no remaining exit
-                // condition (module doc, "Drain on Drop"), so joining here
-                // blocks `Drop` forever. Dropping the `JoinHandle` without
-                // joining detaches the OS thread instead -- it keeps running,
-                // but no longer holds up bridge shutdown.
+                // `stop_session` returning `false` means only that we failed
+                // to CONFIRM the kernel reclaimed the session -- not that
+                // `process_from_handle` is guaranteed stuck. `CloseTrace`
+                // (one of the two exit conditions MSDN documents for a
+                // real-time consumer) may already have taken effect even
+                // though the STOP issued after it failed, in which case the
+                // processing thread will still return on its own; from here
+                // we cannot tell that case apart from a session genuinely
+                // still live. Either way, detaching an already-finishing
+                // thread costs nothing, so `Drop` abandons it rather than
+                // risk blocking shutdown forever on a join that might never
+                // return.
                 warn!(
                     session = %self.session_name,
                     "etw: kernel did not confirm the session was stopped; abandoning the \
@@ -378,10 +390,15 @@ impl Drop for EtwGuard {
 impl EtwGuard {
     /// Stop the kernel-side session, whatever [`UserTrace::stop`] managed.
     /// Returns whether the session is now known-reclaimed by the kernel: a
-    /// caller that gets `false` positively knows `process_from_handle` has
-    /// no exit condition left to return for (module doc,
-    /// [Drain on Drop](self#drain-on-drop)) and must not join the processing
-    /// thread.
+    /// caller that gets `false` knows only that we failed to CONFIRM the
+    /// session was reclaimed -- not that `process_from_handle` is stuck.
+    /// `CloseTrace` may already have taken effect (one of the two exit
+    /// conditions MSDN documents for a real-time consumer) even though the
+    /// STOP issued after it failed, in which case the processing thread
+    /// will still return on its own; `false` cannot distinguish that from a
+    /// session genuinely still live, so a caller must not join the
+    /// processing thread on the strength of this return value alone (module
+    /// doc, [Drain on Drop](self#drain-on-drop)).
     ///
     /// Why a by-name STOP is needed, and why it is the third close+STOP attempt
     /// rather than the second: module doc, [Drain on Drop](self#drain-on-drop).
@@ -576,7 +593,7 @@ fn start_consumer_named(
         .map_err(EtwError::SessionStart)?;
 
     let processor_dispatch = dispatch.clone();
-    let thread = std::thread::Builder::new()
+    let thread = match std::thread::Builder::new()
         .name("hole-bridge-etw-processor".into())
         .spawn(move || {
             tracing::dispatcher::with_default(&processor_dispatch, || {
@@ -589,8 +606,21 @@ fn start_consumer_named(
                     debug!(error = ?e, "etw: processing thread exiting");
                 }
             });
-        })
-        .map_err(|e| abandon_session_on_thread_spawn_failure(&session_name, e))?;
+        }) {
+        Ok(t) => t,
+        Err(e) => {
+            // Drop `trace` (attempts 1+2: ferrisetw's own `Drop for
+            // UserTrace` runs close+STOP, discarding any error) BEFORE
+            // calling the helper below (attempt 3: our by-name STOP
+            // backstop) -- not after. `trace` is a live local here, so
+            // without this explicit drop it would instead fall at the end
+            // of this `match` arm's containing statement, i.e. AFTER the
+            // helper call, inverting the module doc's "third attempt"
+            // ordering (see "Drain on Drop" above) for this one error path.
+            drop(trace);
+            return Err(abandon_session_on_thread_spawn_failure(&session_name, e));
+        }
+    };
 
     // Best-effort, unlike the session/processing-thread spawns above: by
     // this point the processing thread is already live and consuming real

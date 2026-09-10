@@ -398,6 +398,11 @@ fn etw_guard_drop_stops_the_session_it_started() {
         "the healthy path must not reach the by-name backstop -- without this arm a reached \
          backstop that got an unexpected error would pass both checks above; got:\n{output}"
     );
+    assert!(
+        !output.contains("etw: kernel did not confirm the session was stopped"),
+        "the healthy path must not abandon the processing thread -- the session WAS reclaimed \
+         here, so `Drop` must join it rather than log the abandon warning and detach; got:\n{output}"
+    );
 }
 
 /// The `Err` arm of `trace.stop()` — the branch the backstop exists for — must
@@ -497,7 +502,13 @@ fn stopping_a_session_that_does_not_exist_is_not_a_warning() {
 /// cleanup itself: `abandon_session_on_thread_spawn_failure` is the single
 /// function both a real spawn failure and this test call, so driving it
 /// directly with a synthetic `io::Error` exercises the identical code a real
-/// failure would run.
+/// failure would run. This test therefore does NOT pin that
+/// `start_consumer_named`'s thread-spawn `.map_err` arm actually calls
+/// `abandon_session_on_thread_spawn_failure` -- e.g. reverting that call site
+/// to a bare `.map_err(EtwError::ThreadSpawn)` would leave every test in this
+/// file, including this one, green. That call site's own ordering (dropping
+/// the orphaned `trace` before invoking this helper, not after) is untested
+/// by anything here.
 #[cfg(target_os = "windows")]
 #[skuld::test(labels = [TUN], serial = TUN)]
 fn thread_spawn_failure_stops_the_orphaned_session() {
