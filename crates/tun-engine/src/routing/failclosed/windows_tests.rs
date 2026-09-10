@@ -1078,6 +1078,41 @@ fn first_delete_failure_treats_access_denied_as_a_genuine_failure() {
 }
 
 #[skuld::test]
+fn a_not_found_pre_delete_is_benign_but_any_other_code_aborts_the_engage() {
+    // The verdict `engage_lockdown` folds its pre-delete codes through, tested
+    // on the exact `(label, code)` shape it builds. Two directions matter and
+    // they pull opposite ways:
+    //
+    // BENIGN — every ordinary engage pre-deletes keys that are not there. The
+    // first engage on a clean host finds none of the six; the "removed" reading
+    // of BFE startup means a spent twin is gone too. If not-found were fatal,
+    // the kill switch could never arm at all.
+    let all_absent: Vec<(&'static str, u32)> = lockdown_pre_delete_guids()
+        .iter()
+        .map(|g| (pre_delete_label(g), FWP_E_FILTER_NOT_FOUND_DWORD))
+        .collect();
+    assert!(
+        first_delete_failure(&all_absent).is_none(),
+        "a first engage on a clean host pre-deletes six absent keys; that must not abort the start"
+    );
+
+    // FATAL — anything else means the key is still occupied, so the add that
+    // follows returns FWP_E_ALREADY_EXISTS, `ok_or_exists` reports success, and
+    // the engage hands back a cover that was never actually refreshed. That is
+    // the silent failure the pre-delete exists to prevent.
+    for (i, guid) in lockdown_pre_delete_guids().iter().enumerate() {
+        let mut codes = all_absent.clone();
+        codes[i] = (pre_delete_label(guid), ERROR_ACCESS_DENIED_DWORD);
+        let err = first_delete_failure(&codes)
+            .unwrap_or_else(|| panic!("an access-denied pre-delete of {guid:?} must abort the engage"));
+        assert!(
+            err.to_string().contains(pre_delete_label(guid)),
+            "the abort must name which key failed, not just that one did: {err}"
+        );
+    }
+}
+
+#[skuld::test]
 fn every_pre_delete_guid_has_its_own_label() {
     // A failing pre-delete now ABORTS a kill-switch-armed start, and
     // `first_delete_failure`'s `"{what} delete failed"` string is the whole
