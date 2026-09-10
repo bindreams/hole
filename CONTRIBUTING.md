@@ -1238,9 +1238,13 @@ machine it is ruling out bricking.
 **What that measurement returned**, for a boot-time filter added through the
 production `add_filter` under the covers' own persistent provider and sublayer:
 WFP accepted it; the stored record carries `FWPM_FILTER_FLAG_BOOTTIME` and not
-`FWPM_FILTER_FLAG_PERSISTENT`, our `providerKey` and our `subLayerKey`; and
-`FwpmFilterDeleteByKey0` returned `ERROR_SUCCESS` (not `FWP_E_FILTER_NOT_FOUND`)
-after which the filter was gone from the boot-time view. A second test drives
+`FWPM_FILTER_FLAG_PERSISTENT`, our `providerKey` and our `subLayerKey`
+(`flags == 0x2` exactly — `FWPM_FILTER_FLAG_DISABLED` is clear); a by-key
+`FwpmFilterGetByKey0` of it returns `ERROR_SUCCESS`, so boot-time filters *are*
+visible to `lockdown_cover_presence` despite having no by-key equivalent of the
+enumeration opt-in; and `FwpmFilterDeleteByKey0` returned `ERROR_SUCCESS` (not
+`FWP_E_FILTER_NOT_FOUND`) after which the filter was gone from the boot-time
+view. A second test drives
 the real `engage_lockdown` twice in one boot and asserts, on WFP's own
 `filterId`, that the twins were genuinely re-created while the persistent
 block-all beside them was not.

@@ -36,11 +36,12 @@
 //! 4. **What does a by-key GET say about a live boot-time filter?**
 //!    `lockdown_cover_presence` now queries the twins' GUIDs, and
 //!    `classify_presence` turns any code that is neither `ERROR_SUCCESS` nor
-//!    the literal `FWP_E_FILTER_NOT_FOUND` into `Indeterminate`. Which of the
-//!    two it returns is not asserted — `FwpmFilterGetByKey0` has no boot-time
-//!    opt-in the way enumeration does and its page is silent — but a THIRD code
-//!    is, because it would flip an otherwise-clean host's verdict on its own.
-//!    This read was previously taken and discarded.
+//!    the literal `FWP_E_FILTER_NOT_FOUND` into `Indeterminate`. Measured:
+//!    `ERROR_SUCCESS` — `FwpmFilterGetByKey0` sees a boot-time filter even
+//!    though it has no boot-time opt-in the way enumeration does and its page
+//!    is silent. A not-found would have been safe too; a THIRD code would flip
+//!    an otherwise-clean host's verdict on its own. This read was previously
+//!    taken and discarded.
 //! 5. **Does every engage RE-ARM the twins, or only the first?** The twins have
 //!    fixed keys, so an engage that merely re-adds them hits
 //!    `FWP_E_ALREADY_EXISTS` and `ok_or_exists` reports `Ok`. Under the
@@ -161,23 +162,46 @@ impl Drop for DeleteProbeOnDrop {
 /// silently produced nothing is not a cross-check: before this, the command's
 /// exit status was discarded and its output surfaced only inside another
 /// assertion's failure message, so a `netsh` that never ran — wrong verb,
-/// missing binary, `file=-` unsupported — was indistinguishable from a green
-/// run.
+/// missing binary, an unsupported `file=` argument — was indistinguishable
+/// from a green run.
+///
+/// `file=` names a REAL path, which is `netsh wfp`'s documented contract
+/// ("using `file=<path>` as the output file name; by default the output is
+/// saved as `btpol.xml`"). The earlier `file=-` relied on the stdout
+/// convention, which is documented for no `netsh wfp show` verb — and since
+/// nothing asserted on the result, an `file=-` that silently wrote `btpol.xml`
+/// into the test's CWD instead would have looked identical. Reading a file back
+/// makes "it produced a dump" an observation rather than an assumption.
 struct PolicyDump {
     /// `None` when `netsh` could not be spawned at all.
     status: Option<std::process::ExitStatus>,
-    text: String,
+    /// The dump `netsh` wrote, or `None` if it wrote no readable file.
+    dump: Option<String>,
+    /// Whatever `netsh` said on its own streams — diagnostics for a failure.
+    console: String,
 }
 
 impl PolicyDump {
     fn capture() -> Self {
+        let dir = match tempfile::tempdir() {
+            Ok(d) => d,
+            Err(e) => {
+                return Self {
+                    status: None,
+                    dump: None,
+                    console: format!("<no tempdir for the netsh dump: {e}>"),
+                }
+            }
+        };
+        let out = dir.path().join("btpol.xml");
         match std::process::Command::new("netsh")
-            .args(["wfp", "show", "boottimepolicy", "file=-"])
+            .args(["wfp", "show", "boottimepolicy", &format!("file={}", out.display())])
             .output()
         {
             Ok(o) => Self {
                 status: Some(o.status),
-                text: format!(
+                dump: std::fs::read_to_string(&out).ok(),
+                console: format!(
                     "{}{}",
                     String::from_utf8_lossy(&o.stdout),
                     String::from_utf8_lossy(&o.stderr)
@@ -185,34 +209,51 @@ impl PolicyDump {
             },
             Err(e) => Self {
                 status: None,
-                text: format!("<netsh could not be spawned: {e}>"),
+                dump: None,
+                console: format!("<netsh could not be spawned: {e}>"),
             },
         }
     }
 
     /// The cross-check must be able to report its own success. Asserts only
-    /// that the command ran and said something — never what it said.
+    /// that the command ran and produced a dump — never what the dump says.
     fn require_ran(&self, when: &str) {
-        let status = self
-            .status
-            .unwrap_or_else(|| panic!("`netsh wfp show boottimepolicy` ({when}) could not run: {}", self.text));
+        let status = self.status.unwrap_or_else(|| {
+            panic!(
+                "`netsh wfp show boottimepolicy` ({when}) could not run: {}",
+                self.console
+            )
+        });
         assert!(
             status.success(),
             "`netsh wfp show boottimepolicy` ({when}) exited {status}; the manual boot-time \
              cross-check this test claims to capture is not being captured\n{}",
-            self.text
+            self.console
         );
+        let dump = self.dump.as_deref().unwrap_or_else(|| {
+            panic!(
+                "`netsh wfp show boottimepolicy` ({when}) exited 0 but wrote no readable dump \
+                 file; the cross-check captured nothing\n{}",
+                self.console
+            )
+        });
         assert!(
-            !self.text.trim().is_empty(),
-            "`netsh wfp show boottimepolicy` ({when}) exited 0 but produced no output; \
-             the cross-check is empty"
+            !dump.trim().is_empty(),
+            "`netsh wfp show boottimepolicy` ({when}) wrote an empty dump; the cross-check is empty\n{}",
+            self.console
         );
     }
 }
 
 impl std::fmt::Display for PolicyDump {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "[status={:?}]\n{}", self.status, self.text)
+        write!(
+            f,
+            "[status={:?}] console={}\n{}",
+            self.status,
+            self.console,
+            self.dump.as_deref().unwrap_or("<no dump file>")
+        )
     }
 }
 
@@ -389,23 +430,29 @@ fn boottime_global_net_state_filter_is_accepted_keeps_its_containers_and_is_dele
     // already being taken and thrown away; it is the datum that decides whether
     // adding the twins' GUIDs to `lockdown_cover_presence`'s probe is free.
     //
-    // WHICH of the two codes comes back is not asserted — `FwpmFilterGetByKey0`
-    // has no boot-time opt-in the way enumeration does, and Microsoft's page
-    // for it is silent, so either answer is a legitimate OS behaviour and
-    // pinning one would be inventing a contract. What IS asserted is that there
-    // is no THIRD code, because `classify_presence` returns `Absent` only when
-    // every code is the literal not-found and `Indeterminate` for anything
-    // else: a third code on a boot-time key would flip an otherwise-clean host
-    // to `Indeterminate` on its own, and that branch is reachable from
-    // `lockdown_cover_presence` only because these two GUIDs are now in its
-    // sweep list.
+    // Measured: `ERROR_SUCCESS`. `FwpmFilterGetByKey0` DOES see a live
+    // boot-time filter, even though it has no boot-time opt-in the way
+    // enumeration does and Microsoft's page for it is silent. So the twins are
+    // genuinely visible to `lockdown_cover_presence`, and a host holding only
+    // them reads `Live` rather than `Absent`.
+    //
+    // A `FWP_E_FILTER_NOT_FOUND` here would ALSO be safe — the twins are only
+    // ever added and deleted alongside the `Persistent` block-all beside them,
+    // and `classify_presence` answers `Live` on any success — so if this ever
+    // fails with not-found, the fix is to correct the sentence above, not to
+    // treat it as a leak. What must never appear is a THIRD code:
+    // `classify_presence` returns `Absent` only when every code is the literal
+    // not-found and `Indeterminate` for anything else, so a third code on a
+    // boot-time key would flip an otherwise-clean host to `Indeterminate` on
+    // its own — a branch reachable only because these two GUIDs are now in the
+    // probe's sweep list.
     let (get_code, _) = get_after_add.expect("FwpmEngineOpen0 must succeed on the elevated lane");
-    assert!(
-        get_code == ERROR_SUCCESS.0 || get_code == FWP_E_FILTER_NOT_FOUND_DWORD,
-        "FwpmFilterGetByKey0 on a live boot-time key returned 0x{get_code:08x}, which is neither \
-         ERROR_SUCCESS nor 0x{FWP_E_FILTER_NOT_FOUND_DWORD:08x} (FWP_E_FILTER_NOT_FOUND). \
-         classify_presence turns any third code into CoverPresence::Indeterminate, so this would \
-         make lockdown_cover_presence answer Indeterminate on a clean host\n{evidence}"
+    assert_eq!(
+        get_code, ERROR_SUCCESS.0,
+        "FwpmFilterGetByKey0 on a live boot-time key returned 0x{get_code:08x}, not ERROR_SUCCESS. \
+         0x{FWP_E_FILTER_NOT_FOUND_DWORD:08x} (FWP_E_FILTER_NOT_FOUND) is safe but contradicts the \
+         measured claim in this file and in windows.rs — update both. Any OTHER code makes \
+         classify_presence answer Indeterminate on a clean host\n{evidence}"
     );
 
     // The manual boot-time cross-check must be able to report its own success —

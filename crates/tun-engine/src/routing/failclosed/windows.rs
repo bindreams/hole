@@ -299,11 +299,13 @@
 //! provider has no associated Windows service name, or if the associated
 //! service is not set to auto-start", and it "cannot be set when adding new
 //! filters" — so it is not the bit "Basic Operation" means when it says a
-//! boot-time filter is disabled at BFE start. `boottime_privileged_tests` reads
-//! it on both lifetimes anyway, because if it were ever SET on our filters that
-//! would mean Hole's service-name-less provider is one BFE disables, and the
-//! PERSISTENT half of the kill switch would not survive a reboot either — a
-//! bigger finding than #998, and not one to learn from a user report.
+//! boot-time filter is disabled at BFE start. Measured on both lifetimes, and
+//! CLEAR on both: a freshly added boot-time twin reads back `flags == 0x2`,
+//! `FWPM_FILTER_FLAG_BOOTTIME` alone. It is asserted anyway, because if it were
+//! ever SET that would mean Hole's service-name-less provider is one BFE
+//! disables, and the PERSISTENT half of the kill switch would not survive a
+//! reboot either — a bigger finding than #998, and not one to learn from a user
+//! report.
 //!
 //! `boottime_privileged_tests` proves, within one boot: the add is accepted
 //! under our containers and stored with them; a by-key delete of a LIVE twin
@@ -1510,25 +1512,28 @@ pub(crate) fn classify_presence(engine_opened: bool, codes: &[u32]) -> crate::ro
 /// for no code but the literal not-found, so a denied read is `Indeterminate`.
 ///
 /// [`swept_lockdown_guids`] now also yields the two boot-time block-all GUIDs,
-/// so they are queried here — but do NOT read that as presence detecting a
-/// boot-time filter. The boot-time view is opt-in for ENUMERATION
+/// so they are queried here. The boot-time view is opt-in for ENUMERATION
 /// (`FWP_FILTER_ENUM_FLAG_INCLUDE_BOOTTIME`) and `FwpmFilterGetByKey0` has no
-/// such opt-in; Microsoft's `FwpmFilterGetByKey0` page is silent on whether a
-/// by-key GET sees a boot-time record, so WHICH of the two codes it returns for
-/// one is not claimed here.
+/// such opt-in, and Microsoft's page for it is silent on whether a by-key GET
+/// sees a boot-time record — so it was measured rather than assumed.
 ///
-/// What IS claimed, and what the safety of adding these two keys to the probe
-/// actually rests on, is narrower and is asserted rather than reasoned:
-/// **a by-key GET on a live boot-time key returns `ERROR_SUCCESS` or
-/// `FWP_E_FILTER_NOT_FOUND` and never a third code**
-/// (`boottime_privileged_tests`' `get_by_key AFTER add` assertion). That is the
-/// load-bearing part, because [`classify_presence`] returns `Absent` only when
-/// EVERY code is the literal not-found and `Indeterminate` for anything else —
-/// so a third code on a boot-time key would flip an otherwise-clean host to
-/// `Indeterminate` all by itself. Within those two codes the twin is inert: it
-/// is only ever added and deleted alongside the `Persistent` block-all beside
-/// it, `Live` wins on ANY success, and a not-found twin cannot outvote a
-/// found sibling.
+/// **Measured: it does.** A by-key GET of a live boot-time filter returns
+/// `ERROR_SUCCESS` (`boottime_privileged_tests`' `get_by_key AFTER add`
+/// assertion), so the twins are genuinely visible here and a host holding one
+/// reads [`CoverPresence::Live`](crate::routing::CoverPresence::Live).
+///
+/// The load-bearing half of that is the negative: **no THIRD code**.
+/// [`classify_presence`] returns `Absent` only when EVERY code is the literal
+/// not-found and `Indeterminate` for anything else, so a boot-time key
+/// answering anything unexpected would flip an otherwise-clean host to
+/// `Indeterminate` all by itself. A not-found would have been harmless — the
+/// twin is only ever added and deleted alongside the `Persistent` block-all
+/// beside it, and `Live` wins on ANY success — which is why the assertion's
+/// failure message says to correct this doc rather than to treat it as a leak.
+/// The clean-host and engaged-host ends are covered independently, by
+/// `windows_lockdown_permits_server_ip_and_blocks_other_egress`' `Absent`
+/// before engage and `Live` while held, both taken with these GUIDs in the
+/// probe list.
 #[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
 pub fn lockdown_cover_presence(_state_dir: &Path) -> crate::routing::CoverPresence {
     unsafe {
