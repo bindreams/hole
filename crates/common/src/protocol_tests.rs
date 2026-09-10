@@ -755,6 +755,29 @@ fn test_server_request_dump_omits_the_address_and_password() {
     assert!(!rendered.contains(SECRET_PW), "nor the password: {rendered}");
 }
 
+/// The paired positive, matching every other hand-written `Dump` impl's.
+/// Without it the test above would pass against an impl that returned
+/// `DumpValue::Null` — the failure that is worse than no impl at all,
+/// because it reads as covered and renders nothing.
+#[skuld::test]
+fn test_server_request_dump_still_renders_non_secret_payload() {
+    let mut entry = secret_config().server;
+    entry.id = "entry-40731".into();
+    entry.server_port = 40731;
+    let rendered = dump::dump!(&TestServerRequest {
+        entry,
+        dns: crate::config::DnsConfig::default(),
+    })
+    .to_string();
+    assert!(rendered.contains("entry"), "the field name: {rendered}");
+    assert!(
+        rendered.contains("entry-40731"),
+        "the entry's non-secret fields: {rendered}"
+    );
+    assert!(rendered.contains("40731"), "including the port: {rendered}");
+    assert!(rendered.contains("dns"), "and the DnsConfig beside it: {rendered}");
+}
+
 /// The `Dump` impls are hand-written beside a derived `Serialize`; the wire
 /// form is what the bridge parses and must not drift with them.
 #[skuld::test]

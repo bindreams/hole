@@ -147,7 +147,16 @@ fn read_target(state_dir: &Path) -> Target {
             Target::Unreadable
         }
         Err(e) => {
-            tracing::warn!(error = %e, path = %path.display(), "target-state parse failed; treating as no authority to connect");
+            // Classified, never `%e`: this file holds a `ProxyConfig` -> a
+            // `Password` and a `ServerAddress` (see [`save`]'s doc), and
+            // `serde_json::Error`'s `Display` quotes the offending value
+            // back. The sink is `bridge.log`, which the support bundle
+            // collects, and the password has no redacting writer under it.
+            tracing::warn!(
+                error = %hole_common::config::describe_parse_error(&e),
+                path = %path.display(),
+                "target-state parse failed; treating as no authority to connect"
+            );
             Target::Unreadable
         }
     }
@@ -618,7 +627,13 @@ pub(crate) fn load_startup_preference(state_dir: &Path) -> StartupPreference {
             StartupPreference::default()
         }
         Err(e) => {
-            tracing::warn!(error = %e, path = %path.display(), "startup-preference parse failed; using defaults");
+            // Classified, never `%e`: same secrets as the target file, in
+            // `candidate`. See [`read_target`]'s parse arm.
+            tracing::warn!(
+                error = %hole_common::config::describe_parse_error(&e),
+                path = %path.display(),
+                "startup-preference parse failed; using defaults"
+            );
             StartupPreference::default()
         }
     }

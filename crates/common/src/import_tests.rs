@@ -370,3 +370,33 @@ fn import_accepts_entry_with_no_plugin() {
     let servers = import_servers(json).unwrap();
     assert!(servers[0].plugin.is_none());
 }
+
+/// `ImportError::Parse` is a `pub` variant over the most-likely-malformed
+/// user input in the product, so it may not hold a `serde_json::Error` at
+/// all — `Display` echoes the bytes around a failure and the derived `Debug`
+/// echoes them too. `import_servers` only ever reaches it with a syntax
+/// error today (it parses to `serde_json::Value` first, which has no data
+/// errors), and `to_import_failure` discards it; both are properties of the
+/// callers, not of the type, and the `From` impl is public.
+#[skuld::test]
+fn the_parse_variant_never_carries_the_input() {
+    const MISTYPED_PW: &str = "9876543210";
+    let e = serde_json::from_str::<Vec<String>>(&format!("[{MISTYPED_PW}]")).expect_err("must not parse");
+
+    // Guard: without it this passes against a serde_json that stopped echoing.
+    assert!(
+        e.to_string().contains(MISTYPED_PW),
+        "guard: serde_json echoes the offending value: {e}"
+    );
+
+    let err = ImportError::from(e);
+    assert!(!err.to_string().contains(MISTYPED_PW), "the secret survived: {err}");
+    assert!(
+        !format!("{err:?}").contains(MISTYPED_PW),
+        "nor may `Debug` carry it: {err:?}"
+    );
+    assert!(
+        err.to_string().contains("line 1"),
+        "position must survive so the message stays actionable: {err}"
+    );
+}

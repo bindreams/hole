@@ -1,0 +1,8 @@
+error[E0277]: `ServerAddress` doesn't implement `std::fmt::Display`
+ --> tests/secret_shape/server_address_display.rs:7:15
+  |
+7 |     println!("{address}");
+  |               ^^^^^^^^^ `ServerAddress` cannot be formatted with the default formatter
+  |
+  = help: the trait `std::fmt::Display` is not implemented for `ServerAddress`
+  = note: in format strings you may be able to use `{:?}` (or {:#?} for pretty-print) instead

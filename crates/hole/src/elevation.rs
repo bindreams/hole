@@ -101,11 +101,25 @@ fn write_request_file(request: &BridgeRequest) -> std::io::Result<tempfile::Temp
 ///
 /// The file is deleted after reading as defense-in-depth (the writer's [`TempPath`]
 /// also deletes on drop, but the writer process may crash before cleanup).
+///
+/// The parse arm never carries `serde_json::Error`'s own `Display`: it echoes
+/// the input around the failure, and this file is a whole `BridgeRequest` — a
+/// `Password` and a `ServerAddress` in transit. Both callers report it with
+/// `cli_log!(error, "{e}")`, which is stderr *plus* `tracing::error!` -> the
+/// log file -> the support bundle, and `arm_request_redaction` runs only once
+/// the parse has succeeded, so this arm has no sink-level backstop. Sibling of
+/// `cli::decode_b64_request`, which takes the same payload through `--base64`.
 pub fn read_request_file(path: &std::path::Path) -> Result<BridgeRequest, String> {
     let content =
         std::fs::read_to_string(path).map_err(|e| format!("failed to read request file {}: {e}", path.display()))?;
     let _ = std::fs::remove_file(path);
-    serde_json::from_str(&content).map_err(|e| format!("invalid request JSON in {}: {e}", path.display()))
+    serde_json::from_str(&content).map_err(|e| {
+        format!(
+            "invalid request JSON in {}: {}",
+            path.display(),
+            hole_common::config::describe_parse_error(&e)
+        )
+    })
 }
 
 /// Typed outcome of an elevated `ipc-send` / `grant-access --then-send-file`,

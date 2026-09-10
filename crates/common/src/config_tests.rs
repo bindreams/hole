@@ -827,3 +827,24 @@ fn describe_parse_error_never_echoes_the_input() {
     assert!(!described.contains(MISTYPED_PW), "the secret survived: {described}");
     assert!(described.contains("line 1"), "position must survive: {described}");
 }
+
+// Secret-newtype shape ------------------------------------------------------------------------------------------------
+
+/// `Password` and `ServerAddress` are pinned by *shape*, not only by
+/// consequence.
+///
+/// The consequence — a rendered secret — is already caught two ways for
+/// `Debug` and for `dump!`. But `impl Display for Password` or
+/// `impl Deref<Target = str> for Password` compiles cleanly and fails no
+/// test: the single named exit (`expose()`) silently becomes two, and
+/// `rg '\.expose\(\)'` stops enumerating the sites that read a real secret.
+/// These probes fail to compile today; the day one of them compiles is the
+/// day this test fails.
+///
+/// The `.stderr` fixtures are regenerated with `TRYBUILD=overwrite cargo test
+/// -p hole-common -- the_secret_newtypes_have_no_second_exit`; the toolchain
+/// is pinned in `rust-toolchain.toml`, so they move only when it does.
+#[skuld::test]
+fn the_secret_newtypes_have_no_second_exit() {
+    trybuild::TestCases::new().compile_fail("tests/secret_shape/*.rs");
+}

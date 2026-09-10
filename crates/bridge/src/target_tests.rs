@@ -2,6 +2,41 @@ use super::*;
 use hole_common::config::ServerEntry;
 use hole_common::protocol::TunnelMode;
 use std::sync::mpsc;
+use tracing_subscriber::layer::{Layer, SubscriberExt};
+
+use crate::test_support::log_capture::VecWriter;
+
+/// Capture this crate's log records at `WARN` and above for the duration of
+/// `body`. Both state-file loaders classify their failure into a `warn!` and
+/// return a value that says nothing about *why*, so the message is the only
+/// place the leak would be visible.
+fn captured(body: impl FnOnce()) -> String {
+    let writer = VecWriter::new();
+    let subscriber = tracing_subscriber::registry().with(
+        tracing_subscriber::fmt::layer()
+            .with_writer(writer.clone())
+            .with_ansi(false)
+            .with_filter(tracing_subscriber::filter::LevelFilter::WARN),
+    );
+    {
+        let _guard = garter::tracing_test::set_default_in_current_thread(subscriber);
+        body();
+    }
+    writer.snapshot_string()
+}
+
+/// A JSON encoding of `file` with the password mistyped as a bare number —
+/// the shape whose `serde_json::Error` names the offending value, so the
+/// secret is *in* the error rather than merely near it. Built by
+/// re-encoding a real record so it cannot drift from the on-disk shape.
+fn with_mistyped_password(json: String) -> String {
+    let quoted = format!("\"{SECRET_PW}\"");
+    assert!(json.contains(&quoted), "the fixture must carry the password: {json}");
+    json.replace(&quoted, MISTYPED_PW)
+}
+
+const SECRET_PW: &str = "super-secret-password";
+const MISTYPED_PW: &str = "9876543210";
 
 fn test_config() -> ProxyConfig {
     ProxyConfig {
@@ -331,6 +366,78 @@ fn a_corrupt_startup_preference_file_reads_as_default() {
     );
 }
 
+/// `bridge-target.json` holds a `ProxyConfig` -> `ServerEntry` -> `Password`
+/// + `ServerAddress` (see [`save`]'s own doc). A *data* error — a
+/// hand-edited, truncated-then-patched, or downgrade-skewed file — makes
+/// `serde_json::Error`'s `Display` quote the offending value back, and the
+/// classification `warn!` lands in `bridge.log`, which the support bundle
+/// collects. The password has no sink-level cure, so the message is the only
+/// place this can be stopped.
+#[skuld::test]
+fn a_corrupt_target_file_never_echoes_its_contents_into_the_log() {
+    let json = with_mistyped_password(
+        serde_json::to_string(&TargetFile {
+            version: SCHEMA_VERSION,
+            target: PersistedTarget::Connected {
+                config: Box::new(test_config()),
+            },
+        })
+        .unwrap(),
+    );
+
+    // Guard: without it this passes against a serde_json that stopped echoing.
+    let raw = serde_json::from_str::<TargetFile>(&json)
+        .expect_err("must not parse")
+        .to_string();
+    assert!(raw.contains(MISTYPED_PW), "guard: serde_json echoes the value: {raw}");
+
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join(STATE_FILE_NAME), &json).unwrap();
+
+    let mut target = Target::Off;
+    let logs = captured(|| target = load(tmp.path()));
+    assert_eq!(target, Target::Unreadable);
+    assert!(!logs.contains(MISTYPED_PW), "the secret reached bridge.log: {logs}");
+    assert!(
+        logs.contains("line 1"),
+        "position must survive so the warning stays actionable: {logs}"
+    );
+}
+
+/// The same for `bridge-startup.json`, which holds the same `ProxyConfig` in
+/// its `candidate`. Probed through the variant tag rather than a field
+/// value: an externally- or internally-tagged enum makes `serde_json` quote
+/// an arbitrary caller-supplied *string* verbatim, a second echo shape the
+/// mistyped-number case above does not cover.
+#[skuld::test]
+fn a_corrupt_startup_preference_never_echoes_its_contents_into_the_log() {
+    const SECRET_TAG: &str = "hunter2-SECRET";
+    let json = serde_json::to_string(&StartupPreferenceFile {
+        version: STARTUP_PREFERENCE_SCHEMA_VERSION,
+        on_startup: hole_common::config::StartupBehavior::AlwaysConnect,
+        candidate: Some(Box::new(test_config())),
+    })
+    .unwrap()
+    .replace("\"always_connect\"", &format!("\"{SECRET_TAG}\""));
+
+    let raw = serde_json::from_str::<StartupPreferenceFile>(&json)
+        .expect_err("must not parse")
+        .to_string();
+    assert!(raw.contains(SECRET_TAG), "guard: serde_json echoes the value: {raw}");
+
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join(STARTUP_PREFERENCE_FILE_NAME), &json).unwrap();
+
+    let mut pref = StartupPreference::default();
+    let logs = captured(|| pref = load_startup_preference(tmp.path()));
+    assert_eq!(pref, StartupPreference::default());
+    assert!(!logs.contains(SECRET_TAG), "the secret reached bridge.log: {logs}");
+    assert!(
+        logs.contains("line 1"),
+        "position must survive so the warning stays actionable: {logs}"
+    );
+}
+
 #[skuld::test]
 fn apply_round_trips_through_load_and_save() {
     let tmp = tempfile::tempdir().unwrap();
@@ -643,11 +750,22 @@ fn the_persisted_file_shapes_still_carry_their_non_secret_payload() {
         StartupPreferenceFile {
             version: 9,
             on_startup: hole_common::config::StartupBehavior::AlwaysConnect,
-            candidate: Some(config),
+            candidate: Some(config.clone()),
         }
         .dump(),
     );
     assert!(text.contains('9'), "the schema version: {text}");
     assert!(text.contains("always_connect"), "the startup preference: {text}");
     assert!(text.contains("1080"), "and the candidate's non-secret fields: {text}");
+
+    // `PersistedTarget` standalone: the negative above dumps it directly, so
+    // its positive has to land directly too — a `Null` for `Connected` would
+    // hide inside `TargetFile`'s assertion, which reaches it only nested.
+    let text = yaml(PersistedTarget::Connected { config }.dump());
+    assert!(
+        text.contains("1080"),
+        "the connected config's non-secret fields: {text}"
+    );
+    let text = yaml(PersistedTarget::Off.dump());
+    assert!(text.contains("off"), "and `Off` still names itself: {text}");
 }

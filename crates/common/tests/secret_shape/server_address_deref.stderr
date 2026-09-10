@@ -1,0 +1,5 @@
+error[E0614]: type `ServerAddress` cannot be dereferenced
+ --> tests/secret_shape/server_address_deref.rs:6:26
+  |
+6 |     let exposed: &str = &*address;
+  |                          ^^^^^^^^ can't be dereferenced

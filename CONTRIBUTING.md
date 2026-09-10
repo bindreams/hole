@@ -2161,7 +2161,12 @@ implements neither `Display` nor `Deref`, so `server_host = %config.server.serve
 is a compile error and `format!("{}", *addr)` cannot reopen it. `expose()` is
 the single named exit, so grepping for it enumerates every real read site.
 `Password` is the same shape beside it, and both carry a redacting `Debug` so
-a derived `Debug` on a container is not a hole.
+a derived `Debug` on a container is not a hole. The *absence* of those two
+impls is pinned by compile-fail probes
+([`crates/common/tests/secret_shape/`](crates/common/tests/secret_shape/),
+driven by `trybuild` from `the_secret_newtypes_have_no_second_exit`): adding
+either compiles cleanly and fails no other test, so the shape needs a test of
+its own and not only its consequence.
 
 **The password's asymmetry.** For the password, prevention is the *whole*
 mechanism: nothing arms it into the registry above, so there is no sink-level
@@ -2192,6 +2197,23 @@ plugin-path rebuild in `server_test::maybe_start_plugin`) route it through
 `ProxyError` variant is `InvalidKeyMaterial`, not `InvalidMethod`: a cipher
 name Hole does not know and a good cipher with a bad key are different faults
 in different fields.
+
+**And through a parse error.** `serde_json::Error`'s `Display` quotes its input
+back — the offending value for a data error, an arbitrary caller-supplied
+*string* for an unknown variant — and every JSON Hole parses can hold a
+password: the user's `config.json`, an imported profile, the elevation payload
+(a whole `BridgeRequest`, in transit), and the bridge's own
+`bridge-target.json` / `bridge-startup.json`.
+`hole_common::config::describe_parse_error` is the out-of-crate door: category
+plus line and column, never a fragment. Its callers are `cli`'s
+`decode_b64_request` and `read_server_entry_file`,
+`elevation::read_request_file`, and the bridge's two state-file loaders in
+`target.rs`. `ConfigError::Parse` and `ImportError::Parse` go further and drop
+the `serde_json::Error` outright, carrying the same scalars as fields, so
+neither their `Display` nor their derived `Debug` can echo. The elevation and
+state-file sites are the sharp ones: `arm_request_redaction` runs only after a
+successful parse, so the address has no sink-level backstop on a failure arm
+either, and the password never has one.
 
 **What replaces the address in a Hole-authored line.** `server` (the token),
 `server_kind` (`domain`/`ipv4`/`ipv6`), `server_family`, `server_scope`
