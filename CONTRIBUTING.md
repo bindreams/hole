@@ -826,17 +826,9 @@ leaves working DNS + broken routes, not the inverse):
 - **ETW sessions** (Windows) — `hole-bridge-etw-<pid>`;
   `diagnostics::etw::sweep_stale_sessions` (`QueryAllTracesW`) stops stale ones by
   name prefix. The bridge's own session is stopped in `EtwGuard::drop`, which
-  re-issues STOP by name when `UserTrace::stop` did not report a successful
-  STOP, because `ferrisetw::UserTrace::stop` chains `CloseTrace` and STOP with
-  `?`: a `CloseTrace` error *other than* `ERROR_CTX_CLOSE_PENDING` (which
-  ferrisetw maps to `Ok` — it is the ordinary answer for a busy session) skips
-  the STOP, and a live session whose close also failed leaves
-  `ProcessTrace` — and `Drop`'s join on it — with no exit condition. `stop`
-  takes `self` by value, so ferrisetw's `Drop` retries close+STOP once before
-  the caller sees the `Err`; the by-name STOP is the third attempt and the only
-  one that reaches a repeating failure. `Drop` is otherwise unbounded, and still
-  is (bindreams/hole#1016); the trigger for a failing `CloseTrace` is
-  unestablished, so the by-name STOP is a backstop, not a reproduction.
+  re-issues STOP by name as a backstop when `UserTrace::stop` did not report
+  success — mechanism: `etw.rs` module doc, "Drain on Drop". `Drop` is
+  otherwise unbounded (bindreams/hole#1016).
 
 Default `<state_dir>` is `dirs::state_dir()/hole/state` — Windows
 `%LOCALAPPDATA%\hole\state\`, macOS `~/Library/Application Support/hole/state/`;

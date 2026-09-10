@@ -346,15 +346,29 @@ impl Drop for EtwGuard {
             }
         }
 
-        self.stop_session();
+        let session_reclaimed = self.stop_session();
 
         if let Some(thread) = self.thread.take() {
-            // The processing thread exits once the kernel acknowledges
-            // STOP, which drains pending events through our callback.
-            // Ignore the JoinHandle's result: the thread only returns on
-            // kernel-signalled shutdown and has no useful return value.
-            if let Err(e) = thread.join() {
-                warn!(panic = ?e, "etw: processing thread panicked during drop");
+            if session_reclaimed {
+                // The processing thread exits once the kernel acknowledges
+                // STOP, which drains pending events through our callback.
+                // Ignore the JoinHandle's result: the thread only returns on
+                // kernel-signalled shutdown and has no useful return value.
+                if let Err(e) = thread.join() {
+                    warn!(panic = ?e, "etw: processing thread panicked during drop");
+                }
+            } else {
+                // `stop_session` positively knows the kernel session was not
+                // reclaimed: `process_from_handle` has no remaining exit
+                // condition (module doc, "Drain on Drop"), so joining here
+                // blocks `Drop` forever. Dropping the `JoinHandle` without
+                // joining detaches the OS thread instead -- it keeps running,
+                // but no longer holds up bridge shutdown.
+                warn!(
+                    session = %self.session_name,
+                    "etw: kernel did not confirm the session was stopped; abandoning the \
+                     processing thread instead of joining it"
+                );
             }
         }
         info!("etw: consumer stopped");
@@ -363,6 +377,11 @@ impl Drop for EtwGuard {
 
 impl EtwGuard {
     /// Stop the kernel-side session, whatever [`UserTrace::stop`] managed.
+    /// Returns whether the session is now known-reclaimed by the kernel: a
+    /// caller that gets `false` positively knows `process_from_handle` has
+    /// no exit condition left to return for (module doc,
+    /// [Drain on Drop](self#drain-on-drop)) and must not join the processing
+    /// thread.
     ///
     /// Why a by-name STOP is needed, and why it is the third close+STOP attempt
     /// rather than the second: module doc, [Drain on Drop](self#drain-on-drop).
@@ -372,7 +391,8 @@ impl EtwGuard {
     /// and ferrisetw's `InvalidHandle` arm re-runs `open_trace`'s accept
     /// predicate, which a handle `open_trace` returned cannot fail. This is a
     /// backstop for a reachable code shape, not a reproduction.
-    fn stop_session(&mut self) {
+    #[must_use]
+    fn stop_session(&mut self) -> bool {
         let stop_issued = match self.trace.take() {
             Some(trace) => match trace.stop() {
                 Ok(()) => true,
@@ -383,24 +403,39 @@ impl EtwGuard {
             },
             None => false,
         };
-        if !stop_issued {
-            stop_session_by_name(&self.session_name);
+        if stop_issued {
+            true
+        } else {
+            stop_session_by_name(&self.session_name)
         }
     }
 }
 
 /// Issue `ControlTraceW(EVENT_TRACE_CONTROL_STOP)` against a session by name.
+/// Returns whether the session is now known-reclaimed by the kernel: `true`
+/// on success or on `ERROR_WMI_INSTANCE_NOT_FOUND` (no such session is the
+/// outcome we asked for); `false` for any other error, which is a session we
+/// know we failed to reclaim, not merely one we're unsure about.
 ///
-/// Best-effort, like [`sweep_stale_sessions`]: `ERROR_WMI_INSTANCE_NOT_FOUND`
-/// is the outcome we asked for and only earns a `debug!`; anything else is a
-/// session we failed to reclaim.
-fn stop_session_by_name(session_name: &str) {
+/// Best-effort like [`sweep_stale_sessions`] in the sense that a caller who
+/// only logs the `false` case loses nothing over today's behaviour; a caller
+/// that must not proceed on `false` (see [`EtwGuard::stop_session`]) is what
+/// makes the return value load-bearing.
+#[must_use]
+fn stop_session_by_name(session_name: &str) -> bool {
     match stop_trace_by_name(session_name) {
-        Ok(()) => info!(session = %session_name, "etw: stopped session by name"),
+        Ok(()) => {
+            info!(session = %session_name, "etw: stopped session by name");
+            true
+        }
         Err(e) if is_session_not_found(&e) => {
             debug!(session = %session_name, "etw: session already stopped");
+            true
         }
-        Err(e) => warn!(error = ?e, session = %session_name, "etw: failed to stop session by name"),
+        Err(e) => {
+            warn!(error = ?e, session = %session_name, "etw: failed to stop session by name");
+            false
+        }
     }
 }
 
@@ -410,7 +445,7 @@ fn stop_session_by_name(session_name: &str) {
 /// `io::Error::from_raw_os_error(HRESULT)` — the `HRESULT` form of the Win32
 /// code, not the code itself — so the comparison has to convert too. Getting
 /// this wrong costs a spurious `warn!` on the expected path, not a behaviour
-/// change, which is why it is pinned by a test rather than by review.
+/// change.
 fn is_session_not_found(e: &TraceError) -> bool {
     use windows::Win32::Foundation::ERROR_WMI_INSTANCE_NOT_FOUND;
 
@@ -431,6 +466,23 @@ pub enum EtwError {
     SessionStart(ferrisetw::trace::TraceError),
     #[error("failed to spawn processing thread: {0}")]
     ThreadSpawn(std::io::Error),
+}
+
+/// Cleanup for [`start_consumer_named`]'s processing-thread spawn failure —
+/// the only other `UserTrace` lifetime site in this file besides
+/// [`EtwGuard::drop`]. No `EtwGuard` exists yet on this path, so without this
+/// call the session's only fate is ferrisetw's own `impl Drop for UserTrace`
+/// (`non_consuming_stop`), which discards whatever error `close_trace` +
+/// `control_trace(STOP)` returns — the exact failure mode the by-name
+/// backstop exists to catch elsewhere. Issue it here too, before the caller
+/// returns the error, so a spawn failure doesn't also leave an unreclaimed
+/// kernel session behind with no thread and no guard left to notice.
+fn abandon_session_on_thread_spawn_failure(session_name: &str, err: std::io::Error) -> EtwError {
+    // No thread exists yet to conditionally join, so unlike `EtwGuard::drop`
+    // there's nothing to gate on the result here; `stop_session_by_name`
+    // already warns internally on the one outcome that matters.
+    let _: bool = stop_session_by_name(session_name);
+    EtwError::ThreadSpawn(err)
 }
 
 // Entry point =========================================================================================================
@@ -538,7 +590,7 @@ fn start_consumer_named(
                 }
             });
         })
-        .map_err(EtwError::ThreadSpawn)?;
+        .map_err(|e| abandon_session_on_thread_spawn_failure(&session_name, e))?;
 
     // Best-effort, unlike the session/processing-thread spawns above: by
     // this point the processing thread is already live and consuming real
