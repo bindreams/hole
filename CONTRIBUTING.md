@@ -1296,7 +1296,11 @@ The lock is per-state-dir but the covers are not — on Windows they are keyed o
 compile-time GUIDs and swept machine-wide — so the refusal probes the service
 state dir *and* the per-user dirs `cli.rs` gives foreground and elevated
 non-`--service` runs (`cutover::peer_state_dirs`). A peer dir that does not
-exist is skipped, not probed: `try_acquire` creates what it locks.
+exist is skipped, not probed — `try_acquire` creates what it locks — and so is
+one already probed: the lock contends per open handle, not per owning process,
+so a path probed twice would refuse against the call's own guard, and duplicates
+are ordinary (an un-elevated run resolves `default_state_dir` and the real
+user's dir to one path).
 
 ##### Stop, deregister, release — and what gates what
 
