@@ -322,14 +322,19 @@ pub fn load(state_dir: &Path) -> Option<RouteState> {
     let version = match serde_json::from_slice::<VersionProbe>(&bytes) {
         Ok(probe) => probe.version,
         Err(e) => {
-            // Classified, never `%e`: this file records `server_ip` (and one
-            // per `StaleRecord`), a protected value, and `serde_json::Error`'s
-            // `Display` quotes the offending bytes back — a skewed file with
-            // an address where a number belongs echoes it verbatim. Nothing
-            // arms redaction on the recovery path either, so there is no sink
-            // backstop here.
+            // Converted immediately, never held as a `serde_json::Error`:
+            // this file records `server_ip` (and one per `StaleRecord`), a
+            // protected value, and `serde_json::Error`'s `Display` quotes the
+            // offending bytes back — a skewed file with an address where a
+            // number belongs echoes it verbatim. Nothing arms redaction on
+            // the recovery path either, so there is no sink backstop here.
+            // Shadowing `e` with the source-free `ParseFailure` here, rather
+            // than only calling `describe_parse_error` where it's logged,
+            // means there is no live `serde_json::Error` left in scope for a
+            // later edit to reach for with `%e`.
+            let e = util::parse_error::ParseFailure::from(&e);
             tracing::warn!(
-                error = %util::parse_error::describe_parse_error(&e),
+                error = %e,
                 path = %path.display(),
                 "route-state parse failed"
             );
@@ -359,8 +364,9 @@ pub fn load(state_dir: &Path) -> Option<RouteState> {
         Ok(state) => Some(state),
         Err(e) => {
             // Same reason as the version probe's arm above.
+            let e = util::parse_error::ParseFailure::from(&e);
             tracing::warn!(
-                error = %util::parse_error::describe_parse_error(&e),
+                error = %e,
                 path = %path.display(),
                 "route-state parse failed"
             );

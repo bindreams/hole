@@ -44,7 +44,7 @@ pub enum ConfigError {
 /// password itself, which is why [`ConfigError::Parse`] drops its source.
 /// Sites that hold a `serde_json::Error` and need to say something about it
 /// use this instead of `{e}`.
-pub use util::parse_error::{describe_parse_error, parse_kind};
+pub use util::parse_error::{describe_parse_error, parse_kind, ParseFailure};
 
 // Types ===============================================================================================================
 
@@ -353,15 +353,8 @@ impl dump::Dump for ServerAddress {
 /// that reads a real secret, and `password = %entry.password` is a compile
 /// error rather than a leak.
 ///
-/// Until #980 the password was a bare `String` whose only protection was the
-/// hand-written [`Debug`] and [`Dump`](dump::Dump) impls on its two
-/// containers — a convention two levels above the value, which the `dump!`
-/// ladder had already defeated once for the address. This newtype moves the
-/// protection onto the value itself.
-///
 /// `#[serde(transparent)]`: the on-disk and on-the-wire form is unchanged, a
-/// bare JSON string. This is prevention only — moving the secret out of
-/// `config.json` is the still-open half of #980.
+/// bare JSON string.
 #[derive(Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct Password(String);

@@ -147,13 +147,19 @@ fn read_target(state_dir: &Path) -> Target {
             Target::Unreadable
         }
         Err(e) => {
-            // Classified, never `%e`: this file holds a `ProxyConfig` -> a
-            // `Password` and a `ServerAddress` (see [`save`]'s doc), and
-            // `serde_json::Error`'s `Display` quotes the offending value
-            // back. The sink is `bridge.log`, which the support bundle
-            // collects, and the password has no redacting writer under it.
+            // Converted immediately, never held as a `serde_json::Error`:
+            // this file holds a `ProxyConfig` -> a `Password` and a
+            // `ServerAddress` (see [`save`]'s doc), and `serde_json::Error`'s
+            // `Display` quotes the offending value back. The sink is
+            // `bridge.log`, which the support bundle collects, and the
+            // password has no redacting writer under it. Shadowing `e` with
+            // the source-free `ParseFailure` here, rather than only calling
+            // `describe_parse_error` where it's logged, means there is no
+            // live `serde_json::Error` left in scope for a later edit to
+            // reach for with `%e`.
+            let e = hole_common::config::ParseFailure::from(&e);
             tracing::warn!(
-                error = %hole_common::config::describe_parse_error(&e),
+                error = %e,
                 path = %path.display(),
                 "target-state parse failed; treating as no authority to connect"
             );
@@ -627,10 +633,12 @@ pub(crate) fn load_startup_preference(state_dir: &Path) -> StartupPreference {
             StartupPreference::default()
         }
         Err(e) => {
-            // Classified, never `%e`: same secrets as the target file, in
-            // `candidate`. See [`read_target`]'s parse arm.
+            // Converted immediately, never held as a `serde_json::Error`:
+            // same secrets as the target file, in `candidate`. See
+            // [`read_target`]'s parse arm.
+            let e = hole_common::config::ParseFailure::from(&e);
             tracing::warn!(
-                error = %hole_common::config::describe_parse_error(&e),
+                error = %e,
                 path = %path.display(),
                 "startup-preference parse failed; using defaults"
             );
