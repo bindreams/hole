@@ -165,13 +165,40 @@ fn a_reported_version_is_never_fabricated() {
     }
 }
 
-/// A range that has tightened onto one release has become the `enabled: false`
-/// the rule is written to avoid.
+/// A range that stops short of the series' top has become the `enabled: false`
+/// the rule is written to avoid. The whole tail is the property, not "more than
+/// one release": the number the next security patch carries is not knowable in
+/// advance, so any ceiling below the next series can block it.
+///
+/// Answered from the range's own endpoints, like every other question in this
+/// module. A probe at one high in-series version cannot tell `>=0.8, <0.8.30`,
+/// which admits 0.8.23 through 0.8.29, from a range that admits nothing at all.
 #[skuld::test]
-fn a_requirement_pinned_to_one_release_no_longer_admits_patches() {
-    assert!(requirement_admits_series_patches("<0.9").unwrap());
-    assert!(requirement_admits_series_patches("^0.8.22").unwrap());
-    assert!(!requirement_admits_series_patches("=0.8.22").unwrap());
+fn a_requirement_that_stops_short_of_the_series_top_no_longer_admits_patches() {
+    for whole_tail in [
+        "<0.9",
+        "^0.8.22",
+        "0.8",
+        "*",
+        ">=0.8.16, <0.9",
+        // The endpoint is 0.9.0-alpha, which sorts above every 0.8.x release.
+        "<=0.9.0-alpha",
+    ] {
+        assert!(
+            requirement_admits_series_patches(whole_tail).unwrap(),
+            "req: {whole_tail}"
+        );
+    }
+    for capped in [
+        "=0.8.22",
+        ">=0.8, <0.8.30",
+        "<=0.8.30",
+        // Nothing inside the series at all, from either side.
+        ">=0.9",
+        ">=2.0, <1.0",
+    ] {
+        assert!(!requirement_admits_series_patches(capped).unwrap(), "req: {capped}");
+    }
 }
 
 /// A range whose bounds cross admits nothing, so it admits nothing *beyond the
@@ -207,6 +234,11 @@ const REAL_RULE: &str = r#"{
   "allowedVersions": "<0.9"
 }"#;
 
+/// [`REAL_RULE`] with one more selector spliced in ahead of `matchManagers`.
+fn rule_with(selector: &str) -> String {
+    REAL_RULE.replace(r#""matchManagers""#, &format!("{selector},\n  \"matchManagers\""))
+}
+
 #[skuld::test]
 fn the_real_rule_shape_is_accepted() {
     check_renovate_rule(&renovate_config(REAL_RULE)).unwrap();
@@ -240,9 +272,31 @@ fn a_rule_allowing_everything_is_rejected() {
 fn a_rule_that_freezes_the_series_is_rejected() {
     let err = check_renovate_rule(&renovate_config(&REAL_RULE.replace("<0.9", "=0.8.22")))
         .expect_err("a rule allowing exactly one release blocks security patches");
+    let message = err.to_string();
+    assert!(message.contains("can ever land"), "unexpected error: {message}");
     assert!(
-        err.to_string().contains("patch can ever land"),
-        "unexpected error: {err}"
+        message.contains("at or above 0.8.23"),
+        "the error must name the ceiling this range sets: {message}"
+    );
+}
+
+/// MUTATION: `<0.9` → `>=0.8, <0.8.30`. 0.8.23 through 0.8.29 still land, so
+/// "no 0.8.x patch can ever land" would be a false sentence a maintainer would
+/// act on. The rule is still broken — the next security patch's number is not
+/// knowable in advance — and the finding has to be the ceiling the range itself
+/// sets.
+#[skuld::test]
+fn a_rule_that_caps_the_series_short_names_the_ceiling_it_sets() {
+    let err = check_renovate_rule(&renovate_config(&REAL_RULE.replace("<0.9", ">=0.8, <0.8.30")))
+        .expect_err("a range that stops at 0.8.30 cannot carry an arbitrary future patch");
+    let message = err.to_string();
+    assert!(
+        message.contains("at or above 0.8.30"),
+        "the error must name the ceiling the range itself sets: {message}"
+    );
+    assert!(
+        !message.contains("9999"),
+        "the ceiling is read off the range's endpoints, not from a probe version: {message}"
     );
 }
 
@@ -265,11 +319,20 @@ fn a_rule_scoped_to_the_wrong_manager_is_rejected() {
 
 /// MUTATION: add a selector that makes Renovate not apply the rule.
 ///
-/// Each of these is schema-valid — renovate-config-validator --strict accepts
-/// them all — and each leaves a rule that reads exactly like the pin and
-/// suppresses nothing. `matchManagers` is one of about fifteen such keys, so
-/// the guard enumerates the ones it can evaluate and rejects the rest rather
-/// than the other way round.
+/// Each leaves a rule that reads exactly like the pin and suppresses nothing.
+/// `matchManagers` is one of about fifteen such keys, so the guard enumerates
+/// the ones it can evaluate and rejects the rest rather than the other way
+/// round.
+///
+/// Five of these are `--strict`-valid; the other four Renovate will not take
+/// from a repo config at all, which is the design working rather than a gap.
+/// `matchBaseBranches` needs a `baseBranchPatterns` to reference;
+/// `excludeDepNames`/`excludePackageNames` are migrated away (into
+/// `matchDepNames: ["schemars", "!schemars"]` — a spelling the guard *does*
+/// decide, and rejects); and `matchUpdateTypes` is refused outright beside a
+/// range: "packageRules cannot combine both matchUpdateTypes and
+/// allowedVersions". So the scopings that would silently kill this rule are
+/// largely unwritable, and the guard covers the rest.
 #[skuld::test]
 fn a_rule_scoped_by_a_selector_the_guard_cannot_evaluate_is_rejected() {
     for selector in [
@@ -277,15 +340,13 @@ fn a_rule_scoped_by_a_selector_the_guard_cannot_evaluate_is_rejected() {
         r#""matchCategories": ["js"]"#,
         r#""matchRepositories": ["someone/else"]"#,
         r#""matchBaseBranches": ["nonexistent"]"#,
-        r#""matchDepTypes": ["dependencies"]"#,
         r#""matchCurrentVersion": ">=1.0.0""#,
         r#""matchUpdateTypes": ["major"]"#,
         r#""matchJsonata": ["false"]"#,
         r#""excludeDepNames": ["schemars"]"#,
         r#""excludePackageNames": ["schemars"]"#,
     ] {
-        let rule = REAL_RULE.replace(r#""matchManagers""#, &format!("{selector},\n  \"matchManagers\""));
-        let err = check_renovate_rule(&renovate_config(&rule))
+        let err = check_renovate_rule(&renovate_config(&rule_with(selector)))
             .err()
             .unwrap_or_else(|| panic!("a rule scoped by {selector} may never apply, and must not pass"));
         let message = err.to_string();
@@ -298,6 +359,185 @@ fn a_rule_scoped_by_a_selector_the_guard_cannot_evaluate_is_rejected() {
             "the error must say what to do about it: {message}"
         );
     }
+}
+
+/// MUTATION: a selector list emptied out. `matchRegexOrGlobList` opens with
+/// `if (!patterns.length) return false`, and every matcher forwards to it once
+/// the key is present — so an empty array selects *nothing*. The rule reads
+/// exactly like the pin, validates, and Renovate never applies it.
+#[skuld::test]
+fn a_rule_with_an_emptied_selector_list_is_rejected() {
+    for emptied in [
+        r#""matchManagers": ["cargo"], "matchDepNames": [], "allowedVersions": "<0.9""#,
+        r#""matchManagers": [], "matchDepNames": ["schemars"], "allowedVersions": "<0.9""#,
+        r#""matchManagers": ["cargo"], "matchPackageNames": [], "allowedVersions": "<0.9""#,
+        r#""matchManagers": ["cargo"], "matchDepNames": ["schemars"], "matchFileNames": [], "allowedVersions": "<0.9""#,
+    ] {
+        let err = check_renovate_rule(&renovate_config(&format!("{{ {emptied} }}")))
+            .err()
+            .unwrap_or_else(|| panic!("an empty list selects nothing, and must not pass: {emptied}"));
+        assert!(
+            err.to_string().contains("no packageRule naming"),
+            "unexpected error: {err}"
+        );
+    }
+}
+
+/// A list of only negations is not an empty list. Renovate skips the
+/// positive-entry check when there are no positive entries, leaving "everything
+/// except these" — which reaches `schemars`.
+#[skuld::test]
+fn a_list_of_only_negations_still_reaches_schemars() {
+    check_renovate_rule(&renovate_config(&REAL_RULE.replace(r#"["schemars"]"#, r#"["!serde"]"#))).unwrap();
+}
+
+/// `matchFileNames` is the one subject carrying path separators, and
+/// minimatch's `*` stops at one. Only a pattern that spells the separator — or
+/// `**` as a whole segment, the one place minimatch does cross — reaches
+/// `crates/common/Cargo.toml`.
+#[skuld::test]
+fn a_file_name_glob_does_not_cross_a_path_separator() {
+    for dead in [
+        "*/Cargo.toml",
+        "crates/*",
+        "**Cargo.toml",
+        "*.toml",
+        // minimatch tests the segment against `**` exactly, so a longer run is
+        // not a globstar and does not cross `/` either.
+        "crates/***",
+        "***",
+    ] {
+        let selector = format!(r#""matchFileNames": ["{dead}"]"#);
+        let err = check_renovate_rule(&renovate_config(&rule_with(&selector)))
+            .err()
+            .unwrap_or_else(|| panic!("minimatch's `*` does not cross `/`, so {dead} is dead"));
+        assert!(err.to_string().contains("`matchFileNames`"), "unexpected error: {err}");
+    }
+    for live in [
+        "crates/**",
+        "**/Cargo.toml",
+        "crates/*/Cargo.toml",
+        "**/*.toml",
+        "crates/common/Cargo.toml",
+        // Renovate short-circuits a bare `*` to "everything" before minimatch
+        // ever sees it.
+        "*",
+    ] {
+        let selector = format!(r#""matchFileNames": ["{live}"]"#);
+        check_renovate_rule(&renovate_config(&rule_with(&selector)))
+            .unwrap_or_else(|e| panic!("Renovate applies {live}; the guard must too\n{e}"));
+    }
+}
+
+/// MUTATION: `ignoreDeps`. `fetch.js` sets `skipReason: "ignored"` two lines
+/// above the `enabled === false` branch and both run after `applyPackageRules`,
+/// so this is `enabled: false` under a second name — and it takes the 0.8.x
+/// patches with it just the same. Renovate reads it at the top level and on any
+/// applying packageRule.
+#[skuld::test]
+fn an_ignored_dependency_is_rejected_like_a_disabled_one() {
+    let top_level = format!(r#"{{ "ignoreDeps": ["schemars"], "packageRules": [ {REAL_RULE} ] }}"#);
+    let in_rule = renovate_config(&REAL_RULE.replace(
+        r#""allowedVersions": "<0.9""#,
+        r#""allowedVersions": "<0.9", "ignoreDeps": ["schemars"]"#,
+    ));
+    for config in [top_level, in_rule] {
+        let err = check_renovate_rule(&config).expect_err("an ignored dependency gets no updates at all");
+        let message = err.to_string();
+        assert!(message.contains("ignoreDeps"), "unexpected error: {message}");
+        assert!(
+            message.contains("patch"),
+            "the error must say what the ignore costs: {message}"
+        );
+    }
+}
+
+/// An ignore naming something else, or riding a rule Renovate does not apply,
+/// leaves the pin alone.
+#[skuld::test]
+fn an_ignore_that_does_not_reach_schemars_is_accepted() {
+    check_renovate_rule(&format!(
+        r#"{{ "ignoreDeps": ["serde"], "packageRules": [ {REAL_RULE} ] }}"#
+    ))
+    .unwrap();
+
+    let out_of_reach = r#"{ "matchManagers": ["npm"], "ignoreDeps": ["schemars"] }"#;
+    check_renovate_rule(&format!(r#"{{ "packageRules": [ {REAL_RULE}, {out_of_reach} ] }}"#)).unwrap();
+}
+
+/// The cargo manager tags each dependency with the manifest section it came
+/// from (`modules/manager/cargo/schema.ts`), and `schemars` is declared under
+/// `[build-dependencies]` — so scoping the pin that way is correct, valid, and
+/// works. Rejecting it reds a working config.
+#[skuld::test]
+fn a_rule_scoped_to_the_build_dependencies_dep_type_is_accepted() {
+    for selector in [
+        r#""matchDepTypes": ["build-dependencies"]"#,
+        r#""matchDepTypes": ["dependencies", "build-dependencies"]"#,
+        r#""matchDepTypes": ["build-*"]"#,
+        r#""matchDepTypes": ["!dev-dependencies"]"#,
+    ] {
+        check_renovate_rule(&renovate_config(&rule_with(selector)))
+            .unwrap_or_else(|e| panic!("Renovate applies {selector}; the guard must too\n{e}"));
+    }
+}
+
+/// The other sections `cargo` emits are decidable exclusions, not unknowns:
+/// `schemars` is declared under none of them.
+#[skuld::test]
+fn a_rule_scoped_to_another_dep_type_is_rejected() {
+    for selector in [
+        r#""matchDepTypes": ["dependencies"]"#,
+        r#""matchDepTypes": ["dev-dependencies"]"#,
+        r#""matchDepTypes": ["workspace.dependencies"]"#,
+    ] {
+        let err = check_renovate_rule(&renovate_config(&rule_with(selector)))
+            .err()
+            .unwrap_or_else(|| panic!("schemars is not declared under {selector}"));
+        let message = err.to_string();
+        assert!(message.contains("`matchDepTypes`"), "unexpected error: {message}");
+        assert!(
+            !message.contains("cannot determine"),
+            "a dep type this guard knows is decided, not undecidable: {message}"
+        );
+    }
+}
+
+/// Renovate builds every glob with `nocase: true`, so a selector differing only
+/// in case is the same selector. Reading it as absent sends a maintainer to
+/// restore a rule that is right there and working.
+#[skuld::test]
+fn selector_matching_is_case_insensitive() {
+    for selector in [
+        r#""matchDepNames": ["Schemars"]"#,
+        r#""matchPackageNames": ["SCHEMARS"]"#,
+        r#""matchPackageNames": ["SCHE*"]"#,
+    ] {
+        let rule = REAL_RULE.replace(r#""matchDepNames": ["schemars"]"#, selector);
+        check_renovate_rule(&renovate_config(&rule))
+            .unwrap_or_else(|e| panic!("Renovate applies {selector}; the guard must too\n{e}"));
+    }
+    check_renovate_rule(&renovate_config(&REAL_RULE.replace(r#"["cargo"]"#, r#"["Cargo"]"#))).unwrap();
+    check_renovate_rule(&renovate_config(&rule_with(
+        r#""matchFileNames": ["CRATES/**/CARGO.TOML"]"#,
+    )))
+    .unwrap();
+}
+
+/// A delimited regex is `new RegExp(body)` — case-sensitive unless the `/i`
+/// suffix asks otherwise. `nocase` belongs to the glob path and must not leak
+/// here.
+#[skuld::test]
+fn a_delimited_regex_stays_case_sensitive_without_the_i_flag() {
+    let rule = REAL_RULE.replace(
+        r#""matchDepNames": ["schemars"]"#,
+        r#""matchPackageNames": ["/^SCHEMARS$/"]"#,
+    );
+    let err = check_renovate_rule(&renovate_config(&rule)).expect_err("/^SCHEMARS$/ does not match schemars");
+    assert!(
+        err.to_string().contains("no packageRule naming"),
+        "unexpected error: {err}"
+    );
 }
 
 /// MUTATION: `matchFileNames` pointed at a manifest `schemars` is not in.
@@ -360,9 +600,6 @@ fn an_undecidable_name_spelling_is_reported_as_undecidable_not_absent() {
         r#""matchPackageNames": ["{schemars,serde}"]"#,
         // A regex Rust's engine will not compile. Renovate's might.
         r#""matchPackageNames": ["/^(?=schemars)/"]"#,
-        // An opening delimiter with no closing one is not a spelling Renovate
-        // defines, so neither reading of it is safe.
-        r#""matchPackageNames": ["/schemars"]"#,
     ] {
         let rule = REAL_RULE.replace(r#""matchDepNames": ["schemars"]"#, selector);
         let err = check_renovate_rule(&renovate_config(&rule))
@@ -375,6 +612,26 @@ fn an_undecidable_name_spelling_is_reported_as_undecidable_not_absent() {
             "undecidable is not absent, and the two must not share a message: {message}"
         );
     }
+}
+
+/// An unclosed delimiter is not undecidable. `isRegexMatch` needs both
+/// `/^!?\//` and `/\/i?$/`, so `"/schemars"` is not a regex at all: Renovate
+/// hands it to minimatch, where it is a literal that cannot match `schemars`.
+/// Decidably dead, and the finding that fits a dead rule is the one a dead rule
+/// gets.
+#[skuld::test]
+fn an_unclosed_regex_delimiter_is_a_dead_literal_glob() {
+    let rule = REAL_RULE.replace(
+        r#""matchDepNames": ["schemars"]"#,
+        r#""matchPackageNames": ["/schemars"]"#,
+    );
+    let err = check_renovate_rule(&renovate_config(&rule)).expect_err("`/schemars` is a literal, not a regex");
+    let message = err.to_string();
+    assert!(message.contains("no packageRule naming"), "unexpected error: {message}");
+    assert!(
+        !message.contains("cannot determine"),
+        "a spelling Renovate resolves is decided here too: {message}"
+    );
 }
 
 /// An absent `matchManagers` matches every manager, `cargo` among them. Not a
@@ -410,16 +667,51 @@ fn a_schemars_rule_without_a_version_constraint_is_rejected() {
     );
 }
 
-/// Renovate lets a packageRule carry its own `packageRules`, so a nested
-/// `allowedVersions` is reachable from a rule this merge only reads the surface
-/// of. Same class as an unreadable selector, same answer.
+/// Renovate does not descend into a nested `packageRules`: migration *flattens*
+/// it, lifting each child out through `mergeChildConfig` with the parent's
+/// fields folded in. So the pin nested inside another rule still resolves to
+/// the pin, and there is nothing here for the guard to be blind to.
 #[skuld::test]
-fn a_rule_nesting_its_own_package_rules_is_rejected() {
+fn the_pin_nested_inside_another_rule_still_resolves_to_the_pin() {
     let nested = format!(r#"{{ "matchManagers": ["cargo"], "packageRules": [ {REAL_RULE} ] }}"#);
-    let err = check_renovate_rule(&renovate_config(&nested)).expect_err("this guard reads the top-level array");
-    let message = err.to_string();
-    assert!(message.contains("cannot determine"), "unexpected error: {message}");
-    assert!(message.contains("nests its own"), "unexpected error: {message}");
+    check_renovate_rule(&renovate_config(&nested)).unwrap();
+}
+
+/// The fold is `mergeChildConfig`, not an intersection: a *mergeable* array
+/// option present on both sides is **concatenated**, so a parent scoped to
+/// `npm` does not confine a child scoped to `cargo` — it widens to both, and
+/// the child's `<2` reaches `schemars` after all. An option that is not
+/// mergeable (`matchFileNames`) is replaced by the child's instead.
+#[skuld::test]
+fn a_nested_rule_is_flattened_the_way_migration_flattens_it() {
+    let widening = r#"{ "matchManagers": ["npm"],
+         "packageRules": [ { "matchManagers": ["cargo"], "matchDepNames": ["schemars"], "allowedVersions": "<2" } ] }"#;
+    let err = check_renovate_rule(&format!(r#"{{ "packageRules": [ {REAL_RULE}, {widening} ] }}"#))
+        .expect_err("the joined `[npm, cargo]` still reaches schemars, and `<2` is last");
+    assert!(err.to_string().contains("admits 0.9.0"), "unexpected error: {err}");
+
+    let replaced = r#"{ "matchFileNames": ["crates/**"],
+         "packageRules": [ { "matchFileNames": ["package.json"], "matchDepNames": ["schemars"],
+             "allowedVersions": "<2" } ] }"#;
+    check_renovate_rule(&format!(r#"{{ "packageRules": [ {REAL_RULE}, {replaced} ] }}"#))
+        .expect("`matchFileNames` is not mergeable, so the child's package.json replaces crates/**");
+}
+
+/// Flattening does not cost the guard its other answers: a nested rule that
+/// cannot reach `schemars` stops tripping it, and an unreadable selector on one
+/// that can is still rejected.
+#[skuld::test]
+fn a_nested_rule_is_judged_on_what_it_flattens_to() {
+    let npm_only = r#"{ "matchManagers": ["npm"],
+         "packageRules": [ { "matchDepNames": ["lodash"], "allowedVersions": "<5" } ] }"#;
+    check_renovate_rule(&format!(r#"{{ "packageRules": [ {REAL_RULE}, {npm_only} ] }}"#))
+        .expect("an npm-scoped nested rule cannot touch a cargo dependency");
+
+    let unreadable = r#"{ "matchJsonata": ["false"],
+         "packageRules": [ { "matchDepNames": ["schemars"], "allowedVersions": "<2" } ] }"#;
+    let err = check_renovate_rule(&format!(r#"{{ "packageRules": [ {REAL_RULE}, {unreadable} ] }}"#))
+        .expect_err("the parent's unreadable selector rides down onto the flattened rule");
+    assert!(err.to_string().contains("cannot determine"), "unexpected error: {err}");
 }
 
 #[skuld::test]
@@ -441,17 +733,36 @@ fn a_config_with_no_schemars_rule_is_rejected() {
 /// Renovate is last-wins, so a rule after the pin that can also reach
 /// `schemars` under `cargo` replaces it. `.github/renovate.json`'s own comments
 /// depend on this ordering ("these compiler rules must stay LAST").
+/// The findings are what the *merge* resolves, not "a later rule could also
+/// match": the range reported is the one that actually applies, evaluated, at
+/// the position it came from. Asserting only "last-wins" passes against a guard
+/// that stops at the first rule naming `schemars` and never reads the later
+/// range at all.
 #[skuld::test]
 fn a_later_rule_that_rewidens_the_pin_is_rejected() {
     let later = r#"{ "matchManagers": ["cargo"], "matchDepNames": ["schemars"], "allowedVersions": "<2" }"#;
     let err = check_renovate_rule(&format!(r#"{{ "packageRules": [ {REAL_RULE}, {later} ] }}"#))
         .expect_err("a later rule overrides the pin");
-    assert!(err.to_string().contains("last-wins"), "unexpected error: {err}");
+    let message = err.to_string();
+    assert!(message.contains("last-wins"), "unexpected error: {message}");
+    assert!(
+        message.contains("`<2` (packageRule #1)"),
+        "the error must report the range that resolved, and where: {message}"
+    );
+    assert!(
+        message.contains("admits 0.9.0"),
+        "the resolved range has to be evaluated, not just named: {message}"
+    );
 
     let later_disable = r#"{ "matchPackageNames": ["*"], "enabled": false }"#;
     let err = check_renovate_rule(&format!(r#"{{ "packageRules": [ {REAL_RULE}, {later_disable} ] }}"#))
         .expect_err("a later blanket disable overrides the pin");
-    assert!(err.to_string().contains("last-wins"), "unexpected error: {err}");
+    let message = err.to_string();
+    assert!(message.contains("last-wins"), "unexpected error: {message}");
+    assert!(
+        message.contains("`enabled: false` (packageRule #1)"),
+        "the error must report what resolved, and where: {message}"
+    );
 }
 
 /// The rules that really do follow the pin in `.github/renovate.json` — scoped
