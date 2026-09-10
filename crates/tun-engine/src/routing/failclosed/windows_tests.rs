@@ -460,11 +460,17 @@ fn all_swept_guids_are_mutually_distinct() {
     // derives Hash + Eq, so collect directly (no to_u128 — it doesn't exist).
     let mut all: Vec<GUID> = swept_transient_guids(); // fixed transient GUIDs
     all.extend(swept_lockdown_guids());
+    // The boot-time probe's GUID belongs in the same set. Its disjointness from
+    // every cover GUID is what keeps the probe a probe: a collision would make
+    // it install a real cover filter under a cover key — a boot-time PERMIT
+    // sitting where a swept object is expected — and its documented "no sweep
+    // can reach it" would be false in the worst possible direction.
+    all.push(crate::routing::failclosed::boottime_privileged_tests::PROBE_GUID);
     let unique: std::collections::HashSet<GUID> = all.iter().copied().collect();
     assert_eq!(
         unique.len(),
         all.len(),
-        "every filter GUID (transient + lockdown + App-ID) must be distinct"
+        "every filter GUID (transient + lockdown + App-ID + the boot-time probe) must be distinct"
     );
 }
 
@@ -905,10 +911,16 @@ fn engage_lockdown_refreshes_the_volatile_permits() {
     let spec = build_lockdown_spec(v4(), luid(), &[plugin_path(), bridge_path()]);
     assert_eq!(
         spec.pre_delete,
-        adopt_delete_guids(),
+        lockdown_pre_delete_guids(),
         "engage must drop exactly the volatile permits — the TUN pair and BOTH server-family \
-         permits — before adding anything"
+         permits — plus the boot-time twins, before adding anything"
     );
+    for &g in &adopt_delete_guids() {
+        assert!(
+            spec.pre_delete.contains(&g),
+            "the volatile permit {g:?} must still be refreshed"
+        );
+    }
 
     // Every deleted key is either re-added with this attempt's fresh values
     // (the TUN pair, and the server permit for THIS family) or deliberately
@@ -946,6 +958,47 @@ fn engage_lockdown_refreshes_the_volatile_permits() {
     for i in 0..MAX_APPID_BINARIES {
         assert!(!spec.pre_delete.contains(&appid_filter_guid(i, false)));
         assert!(!spec.pre_delete.contains(&appid_filter_guid(i, true)));
+    }
+}
+
+#[skuld::test]
+fn engage_lockdown_rearms_the_boottime_twins_rather_than_leaving_them_to_ok_or_exists() {
+    // The twins carry FIXED keys, like the volatile permits and unlike nothing
+    // else in the floor — but a boot-time filter is SPENT by the boot it
+    // covered, and Microsoft's pages disagree on what "spent" leaves behind.
+    // Under the "removed" reading (`FwpmFilterAdd0`, "Object Management") a
+    // plain add is enough. Under the "disabled" reading ("Basic Operation",
+    // twice) the object survives with its key occupied, so the add returns
+    // FWP_E_ALREADY_EXISTS, `ok_or_exists` reports Ok, and every engage after
+    // the first re-arms nothing: the kill switch would cover one boot and then
+    // silently stop. This PR refuses to adjudicate that disagreement, so it has
+    // to be right under both — which means the keys must be pre-deleted.
+    let spec = build_lockdown_spec(v4(), luid(), &[plugin_path(), bridge_path()]);
+    for g in LOCKDOWN_BOOTTIME_BLOCK_ALL_GUIDS {
+        assert!(
+            spec.pre_delete.contains(&g),
+            "the boot-time twin {g:?} must be deleted before it is re-added, or a second engage \
+             in one boot short-circuits on FWP_E_ALREADY_EXISTS and re-arms nothing"
+        );
+    }
+
+    // A pre-delete only helps if the same engage adds the key back — otherwise
+    // it is a disarm, not a re-arm.
+    let added: std::collections::HashSet<GUID> = spec.filters.iter().map(|f| f.guid).collect();
+    for g in LOCKDOWN_BOOTTIME_BLOCK_ALL_GUIDS {
+        assert!(
+            added.contains(&g),
+            "the boot-time twin {g:?} must be re-added by the same engage that deletes it"
+        );
+    }
+
+    // The PERSISTENT block-all is live and enforcing right now; a refresh must
+    // never drop the floor, not even inside a transaction.
+    for guid in [LOCKDOWN_FILTER_GUIDS[6], LOCKDOWN_FILTER_GUIDS[7]] {
+        assert!(
+            !spec.pre_delete.contains(&guid),
+            "the persistent block-all {guid:?} stays in force across a refresh"
+        );
     }
 }
 

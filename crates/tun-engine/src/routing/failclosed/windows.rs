@@ -344,6 +344,35 @@ fn adopt_delete_guids() -> Vec<GUID> {
         .collect()
 }
 
+/// Everything [`engage_lockdown`] deletes inside its own transaction before the
+/// adds: the volatile permits ([`adopt_delete_guids`]) PLUS the boot-time twins.
+///
+/// The twins are here for a different reason than the permits, and it is the
+/// reason the twins are re-armed rather than re-added: **a boot-time filter is
+/// spent by the boot it covers.** Microsoft's pages disagree on how (see the
+/// module doc: "Object Management"/`FwpmFilterAdd0` say the filter is REMOVED
+/// once BFE finishes initializing, "Basic Operation" says twice it is
+/// DISABLED), and this file deliberately declines to adjudicate — so it must be
+/// correct under BOTH readings. Under "removed" a plain add suffices. Under
+/// "disabled" the object survives with its key still occupied, every subsequent
+/// add returns `FWP_E_ALREADY_EXISTS`, [`ok_or_exists`] reports `Ok`, and the
+/// twin the kill switch is relying on is a disabled leftover of a boot already
+/// past — the switch would cover the boot after its first engage and silently
+/// stop. Deleting the key first makes the two readings converge: a NOT_FOUND
+/// pre-delete (the "removed" branch, and the ordinary first engage) is benign
+/// exactly as it is for a volatile permit, and a successful one (the "disabled"
+/// branch) clears the way for a genuine re-add.
+///
+/// The delete and the add are in ONE FWPM transaction, so no boot-time gap is
+/// opened by the refresh. The `Persistent` block-all beside them is NOT in this
+/// set: it is live and enforcing right now, and dropping it — even
+/// transactionally — is the one thing a refresh must never do to the floor.
+fn lockdown_pre_delete_guids() -> Vec<GUID> {
+    let mut guids = adopt_delete_guids();
+    guids.extend_from_slice(&LOCKDOWN_BOOTTIME_BLOCK_ALL_GUIDS);
+    guids
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Layer {
     ConnectV4,
@@ -577,7 +606,9 @@ pub fn build_cover_spec(server_ip: IpAddr, resolver_ip: Option<IpAddr>) -> Cover
 /// within the single sublayer the higher-weight permit wins (no
 /// `CLEAR_ACTION_RIGHT`). The block-all pair also gets a `Boottime` twin (see
 /// the module doc's "Boot-time coverage" section) — every permit stays
-/// `Persistent`-only. Pure — no FFI.
+/// `Persistent`-only. The twins' keys go in `pre_delete` so every engage
+/// RE-ARMS them rather than short-circuiting on `FWP_E_ALREADY_EXISTS` — see
+/// [`lockdown_pre_delete_guids`]. Pure — no FFI.
 pub fn build_lockdown_spec(server_ip: IpAddr, tun_luid: u64, app_ids: &[std::path::PathBuf]) -> CoverSpec {
     let server_layer = match server_ip {
         IpAddr::V4(_) => Layer::ConnectV4,
@@ -659,7 +690,8 @@ pub fn build_lockdown_spec(server_ip: IpAddr, tun_luid: u64, app_ids: &[std::pat
     // Boot-time twin of the block-all pair (#998) — enforced by the kernel
     // from boot until BFE starts, when the persistent pair above takes over.
     // See the module doc's "Boot-time coverage" section for why only
-    // block-all gets one.
+    // block-all gets one, and `lockdown_pre_delete_guids` for why these two
+    // keys are deleted before this add rather than left to `ok_or_exists`.
     filters.push(block(
         LOCKDOWN_BOOTTIME_BLOCK_ALL_GUIDS[0],
         Layer::ConnectV4,
@@ -673,7 +705,7 @@ pub fn build_lockdown_spec(server_ip: IpAddr, tun_luid: u64, app_ids: &[std::pat
     CoverSpec {
         provider: PROVIDER_GUID,
         sublayer: SUBLAYER_GUID,
-        pre_delete: adopt_delete_guids(),
+        pre_delete: lockdown_pre_delete_guids(),
         filters,
     }
 }
@@ -847,12 +879,16 @@ pub fn engage_lockdown(
         )?;
         let result = (|| -> Result<(), RoutingError> {
             wfp_check(FwpmTransactionBegin0(engine, 0), "FwpmTransactionBegin0")?;
-            // Refresh the volatile permits: delete their fixed keys before the
-            // adds, in this same transaction, so a re-engage over an adopted
-            // cover lands the CURRENT TUN LUID and server IP instead of hitting
-            // `ok_or_exists` on a stale filter. Return codes are ignored for
-            // the same reason every other sweep ignores them — a delete that
-            // finds nothing (the ordinary first engage) is not an error.
+            // Refresh the volatile permits AND re-arm the boot-time twins:
+            // delete their fixed keys before the adds, in this same
+            // transaction, so a re-engage over an adopted cover lands the
+            // CURRENT TUN LUID and server IP instead of hitting `ok_or_exists`
+            // on a stale filter — and so a twin left DISABLED-but-present by
+            // the boot it already covered is replaced rather than reported
+            // `Ok` (see `lockdown_pre_delete_guids`). Return codes are ignored
+            // for the same reason every other sweep ignores them — a delete
+            // that finds nothing (the ordinary first engage, and the "removed"
+            // reading of a spent twin) is not an error.
             for g in &spec.pre_delete {
                 let _ = FwpmFilterDeleteByKey0(engine, g);
             }
@@ -1342,12 +1378,22 @@ pub(crate) fn classify_presence(engine_opened: bool, codes: &[u32]) -> crate::ro
 /// so they are queried here — but do NOT read that as presence detecting a
 /// boot-time filter. The boot-time view is opt-in for ENUMERATION
 /// (`FWP_FILTER_ENUM_FLAG_INCLUDE_BOOTTIME`) and `FwpmFilterGetByKey0` has no
-/// such opt-in; whether a by-key GET sees a boot-time record is unmeasured
-/// (`boottime_privileged_tests` captures that read into its evidence dump but
-/// asserts nothing on it). It costs nothing either way: a boot-time twin is
-/// only ever added and deleted alongside the `Persistent` block-all beside it,
-/// and `classify_presence` answers `Live` on ANY success, so an invisible twin
-/// changes no verdict this function can reach.
+/// such opt-in; Microsoft's `FwpmFilterGetByKey0` page is silent on whether a
+/// by-key GET sees a boot-time record, so WHICH of the two codes it returns for
+/// one is not claimed here.
+///
+/// What IS claimed, and what the safety of adding these two keys to the probe
+/// actually rests on, is narrower and is asserted rather than reasoned:
+/// **a by-key GET on a live boot-time key returns `ERROR_SUCCESS` or
+/// `FWP_E_FILTER_NOT_FOUND` and never a third code**
+/// (`boottime_privileged_tests`' `get_by_key AFTER add` assertion). That is the
+/// load-bearing part, because [`classify_presence`] returns `Absent` only when
+/// EVERY code is the literal not-found and `Indeterminate` for anything else —
+/// so a third code on a boot-time key would flip an otherwise-clean host to
+/// `Indeterminate` all by itself. Within those two codes the twin is inert: it
+/// is only ever added and deleted alongside the `Persistent` block-all beside
+/// it, `Live` wins on ANY success, and a not-found twin cannot outvote a
+/// found sibling.
 #[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
 pub fn lockdown_cover_presence(_state_dir: &Path) -> crate::routing::CoverPresence {
     unsafe {
@@ -1532,6 +1578,12 @@ pub(crate) mod boottime_probe {
         pub provider: Option<GUID>,
         pub sublayer: GUID,
         pub layer: GUID,
+        /// WFP's own runtime identity for this filter object, assigned at add
+        /// time. The KEY is ours and fixed; `filterId` is WFP's and changes
+        /// whenever the object is genuinely re-created. That is what lets a
+        /// test tell a real delete-then-re-add from an `ok_or_exists`
+        /// short-circuit that reported success and changed nothing.
+        pub filter_id: u64,
     }
 
     impl FilterRecord {
@@ -1548,11 +1600,31 @@ pub(crate) mod boottime_probe {
                 },
                 sublayer: f.subLayerKey,
                 layer: f.layerKey,
+                filter_id: f.filterId,
             }
         }
 
         pub(crate) fn is_boottime(&self) -> bool {
             self.flags & FWPM_FILTER_FLAG_BOOTTIME.0 != 0
+        }
+
+        /// `FWPM_FILTER_FLAG_DISABLED`. Microsoft documents this bit as meaning
+        /// exactly one thing, and it is NOT boot-time supersession:
+        /// "A provider's filters are disabled when the BFE starts if the
+        /// provider has no associated Windows service name, or if the
+        /// associated service is not set to auto-start" — and "this flag cannot
+        /// be set when adding new filters. It can only be returned by BFE when
+        /// getting or enumerating filters" (`FWPM_FILTER0` reference).
+        ///
+        /// So reading it answers a question about Hole's PROVIDER, not about
+        /// the boot-time lifecycle. It is read anyway because the same bit
+        /// governs visibility: an enumeration must OR in
+        /// `FWP_FILTER_ENUM_FLAG_INCLUDE_DISABLED` to return a disabled filter
+        /// at all (Microsoft's `HlprFwpmFilterRemoveAll` ORs it together with
+        /// `..._INCLUDE_BOOTTIME`), so a probe that did not read it could
+        /// mistake "disabled, therefore filtered out of my view" for "absent".
+        pub(crate) fn is_disabled(&self) -> bool {
+            self.flags & FWPM_FILTER_FLAG_DISABLED.0 != 0
         }
     }
 
@@ -1629,6 +1701,24 @@ pub(crate) mod boottime_probe {
         with_engine(|engine| unsafe { FwpmFilterDeleteByKey0(engine, &key) })
     }
 
+    /// Drop the PERSISTENT provider + sublayer [`add`] had to create to hang
+    /// its filter off. Without this the probe leaves two persistent FWPM
+    /// container objects behind on whatever machine ran it — invisible,
+    /// harmless (an empty sublayer holds no traffic), and still residue a
+    /// developer never asked for on their own box.
+    ///
+    /// Best-effort and correctly so: the delete FAILS while any Hole cover
+    /// filter still references them, which is exactly the case where they must
+    /// not be removed. Mirrors `delete_all`'s ordering — filters first, then
+    /// sublayer, then provider.
+    #[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
+    pub(crate) fn delete_containers() {
+        let _ = with_engine(|engine| unsafe {
+            let _ = FwpmSubLayerDeleteByKey0(engine, &SUBLAYER_GUID);
+            let _ = FwpmProviderDeleteByKey0(engine, &PROVIDER_GUID);
+        });
+    }
+
     /// Every BOOT-TIME filter at `layer`, via an enumeration template that
     /// opts into the boot-time view (`FWP_FILTER_ENUM_FLAG_BOOTTIME_ONLY`)
     /// — the default view excludes them, so this is the only read that can
@@ -1640,6 +1730,13 @@ pub(crate) mod boottime_probe {
     /// indistinguishable from "there is no boot-time record" — and telling
     /// those apart is half of what the probe exists for.
     ///
+    /// `FWP_FILTER_ENUM_FLAG_INCLUDE_DISABLED` is ORed in for the other half.
+    /// `HlprFwpmFilterRemoveAll` sets it alongside the boot-time flag, and both
+    /// halves matter here: `FWPM_FILTER_FLAG_DISABLED` filters are excluded
+    /// from the default view exactly as boot-time ones are, so without it a
+    /// disabled boot-time filter would read as ABSENT — turning "the delete
+    /// worked" and "the filter is merely invisible to me" back into the same
+    /// answer this function exists to separate.
     #[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
     pub(crate) fn enum_boottime(layer: Layer, enum_type: FWP_FILTER_ENUM_TYPE) -> EnumResult {
         let layer_key = layer_guid(layer);
@@ -1647,7 +1744,7 @@ pub(crate) mod boottime_probe {
             let template = FWPM_FILTER_ENUM_TEMPLATE0 {
                 layerKey: layer_key,
                 enumType: enum_type,
-                flags: FWP_FILTER_ENUM_FLAG_BOOTTIME_ONLY,
+                flags: FWP_FILTER_ENUM_FLAG_BOOTTIME_ONLY | FWP_FILTER_ENUM_FLAG_INCLUDE_DISABLED,
                 actionMask: 0xffff_ffff,
                 ..Default::default()
             };
