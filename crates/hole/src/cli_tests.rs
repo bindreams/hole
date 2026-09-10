@@ -913,9 +913,27 @@ fn grant_access_rejects_result_file_with_then_send() {
 //
 // The CLI writes a fourth log file (`gui-cli.log`) and executes no GUI arming
 // site, so without these the wrapped writers are inert for its whole life.
+//
+// Every test below drives arming as a *side effect* of the real production
+// call graph — never by calling `arm_request_redaction` directly, which is
+// the anti-pattern that let `grant-access --then-send-file` ship unarmed and
+// let `BridgeRequest::Reload` ship unclassified (neither miss moved a single
+// one of these assertions). Each test ends at
+// [`super::send_bridge_request_inner_at`], the same funnel every real CLI
+// invocation reaches, pointed at a socket path with no listener so the
+// connect fails fast and safely instead of ever touching a live bridge.
+
+/// A socket path guaranteed to have no listener: unique per test (by
+/// `suffix`) and per process, and removed first in case a previous run
+/// left a stale file.
+fn unarmed_socket_path(suffix: &str) -> std::path::PathBuf {
+    let path = std::env::temp_dir().join(format!("hole-cli-test-{}-{suffix}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    path
+}
 
 #[skuld::test]
-fn cli_proxy_start_arms_the_config_file_entry() {
+fn cli_proxy_start_arms_the_config_file_entry(#[fixture(temp_dir)] dir: &Path) {
     use hole_common::logging::redact_arm::token_for;
     use hole_common::protocol::{BridgeRequest, ProxyConfig};
 
@@ -924,20 +942,27 @@ fn cli_proxy_start_arms_the_config_file_entry() {
     entry.id = ENTRY_ID.to_string();
     entry.server = "203.0.113.7".into();
 
-    super::arm_request_redaction(&BridgeRequest::Start {
+    // Exactly what `ProxyAction::Start`'s handler does with `--config-file`
+    // before it builds the request.
+    let config_path = dir.join("entry.json");
+    std::fs::write(&config_path, serde_json::to_string(&entry).unwrap()).unwrap();
+    let entry = super::read_server_entry_file(&config_path).expect("read the entry file");
+
+    let request = BridgeRequest::Start {
         config: ProxyConfig {
             server: entry,
             ..ProxyConfig::default()
         },
         attempt_id: "attempt".to_string(),
-        on_startup: Some(hole_common::config::StartupBehavior::default()),
-    });
+        on_startup: None,
+    };
+    let _ = super::send_bridge_request_inner_at(request, &unarmed_socket_path("proxy-start"));
 
     assert_eq!(util::redact::redact_str("203.0.113.7"), token_for(ENTRY_ID));
 }
 
 #[skuld::test]
-fn cli_test_server_arms_the_config_file_entry() {
+fn cli_test_server_arms_the_config_file_entry(#[fixture(temp_dir)] dir: &Path) {
     use hole_common::logging::redact_arm::token_for;
     use hole_common::protocol::BridgeRequest;
 
@@ -946,20 +971,25 @@ fn cli_test_server_arms_the_config_file_entry() {
     entry.id = ENTRY_ID.to_string();
     entry.server = "203.0.113.9".into();
 
-    super::arm_request_redaction(&BridgeRequest::TestServer {
+    // Exactly what `ProxyAction::TestServer`'s handler does with
+    // `--config-file` before it builds the request.
+    let config_path = dir.join("entry.json");
+    std::fs::write(&config_path, serde_json::to_string(&entry).unwrap()).unwrap();
+    let entry = super::read_server_entry_file(&config_path).expect("read the entry file");
+
+    let request = BridgeRequest::TestServer {
         entry,
         dns: Default::default(),
-    });
+    };
+    let _ = super::send_bridge_request_inner_at(request, &unarmed_socket_path("test-server"));
 
     assert_eq!(util::redact::redact_str("203.0.113.9"), token_for(ENTRY_ID));
 }
 
-/// The elevation flow re-enters this binary as
-/// `hole bridge ipc-send --request-file`, carrying the address and the
-/// password. It is the CLI path that matters most and the one with no GUI
-/// arming site anywhere upstream of it.
+/// The `--base64` elevation path: `decode_b64_request` (the real decoder)
+/// feeds straight into the funnel, exactly as `handle_ipc_send_b64` does.
 #[skuld::test]
-fn cli_ipc_send_arms_a_start_request(#[fixture(temp_dir)] dir: &Path) {
+fn cli_ipc_send_base64_arms_a_start_request() {
     use hole_common::logging::redact_arm::token_for;
     use hole_common::protocol::{BridgeRequest, ProxyConfig};
 
@@ -973,16 +1003,49 @@ fn cli_ipc_send_arms_a_start_request(#[fixture(temp_dir)] dir: &Path) {
             ..ProxyConfig::default()
         },
         attempt_id: "attempt".to_string(),
-        on_startup: Some(hole_common::config::StartupBehavior::default()),
+        on_startup: None,
+    };
+
+    let b64 = crate::elevation::encode_request(&request);
+    let decoded = super::decode_b64_request(&b64).expect("decode the base64 payload");
+    let _ = super::send_bridge_request_inner_at(decoded, &unarmed_socket_path("ipc-send-b64"));
+
+    assert_eq!(util::redact::redact_str("203.0.113.11"), token_for(ENTRY_ID));
+}
+
+/// The `--request-file` / `--then-send-file` elevation path:
+/// `crate::elevation::read_request_file` is the exact function both
+/// `hole bridge ipc-send --request-file` and `hole bridge grant-access
+/// --then-send-file` call before handing the decoded request to the funnel —
+/// there is no other code between them, so driving it once proves both.
+///
+/// This is also the case that must catch a classifier that silently skips a
+/// secret-bearing variant: `Reload` is the request this exact path carries
+/// when the elevation flow retries a running proxy's config after a
+/// permission grant, and it was the one variant `arm_request_redaction`'s old
+/// `_ => {}` let through unarmed.
+#[skuld::test]
+fn cli_request_file_arms_a_reload_request(#[fixture(temp_dir)] dir: &Path) {
+    use hole_common::logging::redact_arm::token_for;
+    use hole_common::protocol::{BridgeRequest, ProxyConfig};
+
+    const ENTRY_ID: &str = "88888888-0000-4000-8000-000000000000";
+    let mut entry = hole_common::config::ServerEntry::default_placeholder();
+    entry.id = ENTRY_ID.to_string();
+    entry.server = "203.0.113.13".into();
+    let request = BridgeRequest::Reload {
+        config: ProxyConfig {
+            server: entry,
+            ..ProxyConfig::default()
+        },
     };
 
     let path = dir.join("request.json");
     std::fs::write(&path, serde_json::to_string(&request).unwrap()).unwrap();
     let decoded = crate::elevation::read_request_file(&path).expect("decode the request file");
+    let _ = super::send_bridge_request_inner_at(decoded, &unarmed_socket_path("request-file-reload"));
 
-    super::arm_request_redaction(&decoded);
-
-    assert_eq!(util::redact::redact_str("203.0.113.11"), token_for(ENTRY_ID));
+    assert_eq!(util::redact::redact_str("203.0.113.13"), token_for(ENTRY_ID));
 }
 
 /// Arming is a *funnel* property, not a call-site obligation.
@@ -994,7 +1057,8 @@ fn cli_ipc_send_arms_a_start_request(#[fixture(temp_dir)] dir: &Path) {
 /// so its elevated process ran unarmed for the address on its *success* path.
 /// No test noticed, because every arming test called the arming function
 /// directly. The rule is now structural: one mechanism, invoked once, at the
-/// single point a request reaches the wire.
+/// single point a request reaches the wire — and the behavioral tests above
+/// exercise it through that real call graph, not by calling it directly.
 #[skuld::test]
 fn redaction_is_armed_only_by_the_wire_funnel() {
     let source = std::fs::read_to_string(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/cli.rs"))
@@ -1004,7 +1068,10 @@ fn redaction_is_armed_only_by_the_wire_funnel() {
         source
             .lines()
             .filter(|l| l.contains(needle))
-            .filter(|l| !l.trim_start().starts_with("///") && !l.contains(&format!("fn {needle}")))
+            // Strip *any* comment line (`//...`, which also matches doc
+            // comments `///...`), not just doc comments: a plain `//` comment
+            // mentioning the function name must not miscount as a call site.
+            .filter(|l| !l.trim_start().starts_with("//") && !l.contains(&format!("fn {needle}")))
             .map(str::to_string)
             .collect()
     };
@@ -1026,7 +1093,7 @@ fn redaction_is_armed_only_by_the_wire_funnel() {
 
     // The one call site is inside the driver, ahead of the connect.
     let driver = source
-        .split_once("fn send_bridge_request_inner(")
+        .split_once("fn send_bridge_request_inner_at(")
         .expect("the driver must exist")
         .1;
     let body = driver.split("\nfn ").next().expect("driver body");

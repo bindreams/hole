@@ -1092,6 +1092,41 @@ fn send_bridge_request(request: hole_common::protocol::BridgeRequest, result_fil
     }
 }
 
+/// Arm log redaction from a request the CLI is about to send.
+///
+/// The CLI writes its own log file (`gui-cli.log`) and executes none of the
+/// GUI's arming sites, so without this its wrapped writers are inert for the
+/// whole process lifetime. Covers the elevation flow, which re-enters this
+/// binary as `hole bridge ipc-send --request-file` carrying the address and
+/// the password.
+///
+/// Called from exactly one place, [`send_bridge_request_inner`] — the funnel
+/// every payload path reaches. Test-enforced
+/// (`redaction_is_armed_only_by_the_wire_funnel`): when this was a call-site
+/// obligation instead, one of the three paths did not meet it.
+///
+/// Exhaustive, no `_` arm: a new variant states whether it carries a secret
+/// instead of silently inheriting `{}` from its neighbours (mirrors
+/// `impl Dump for BridgeRequest` in `crates/common/src/protocol.rs`, which
+/// groups the same variants as secret-free for the same reason).
+pub(crate) fn arm_request_redaction(request: &hole_common::protocol::BridgeRequest) {
+    use hole_common::logging::redact_arm::arm_server;
+    use hole_common::protocol::BridgeRequest;
+    match request {
+        BridgeRequest::Start { config, .. } => arm_server(&config.server),
+        BridgeRequest::Reload { config, .. } => arm_server(&config.server),
+        BridgeRequest::TestServer { entry, .. } => arm_server(entry),
+        BridgeRequest::Stop
+        | BridgeRequest::Cancel { .. }
+        | BridgeRequest::Status
+        | BridgeRequest::Metrics
+        | BridgeRequest::Diagnostics
+        | BridgeRequest::SetLockdown { .. }
+        | BridgeRequest::Unblock
+        | BridgeRequest::ApplyUpdate { .. } => {}
+    }
+}
+
 /// Underlying request driver. Returns the parsed `BridgeResponse` or the typed
 /// `ClientError` (kept typed so the elevated classifier can distinguish a
 /// control-plane `ConcurrentStart` from a transport failure).
@@ -1105,36 +1140,24 @@ fn send_bridge_request(request: hole_common::protocol::BridgeRequest, result_fil
 /// the `--base64`/`--request-file` decode arms are the only windows left
 /// (they precede a parsed request existing at all). Arming is last-wins and
 /// idempotent, so a repeat costs nothing.
-/// Arm log redaction from a request the CLI is about to send.
-///
-/// The CLI writes its own log file (`gui-cli.log`) and executes none of the
-/// GUI's arming sites, so without this its wrapped writers are inert for the
-/// whole process lifetime. Covers the elevation flow, which re-enters this
-/// binary as `hole bridge ipc-send --request-file` carrying the address and
-/// the password.
-///
-/// Called from exactly one place, [`send_bridge_request`] — the funnel every
-/// payload path reaches. Test-enforced
-/// (`redaction_is_armed_only_by_the_send_funnel`): when this was a call-site
-/// obligation instead, one of the three paths did not meet it.
-pub(crate) fn arm_request_redaction(request: &hole_common::protocol::BridgeRequest) {
-    use hole_common::logging::redact_arm::arm_server;
-    use hole_common::protocol::BridgeRequest;
-    match request {
-        BridgeRequest::Start { config, .. } => arm_server(&config.server),
-        BridgeRequest::TestServer { entry, .. } => arm_server(entry),
-        _ => {}
-    }
-}
-
 fn send_bridge_request_inner(
     request: hole_common::protocol::BridgeRequest,
+) -> Result<hole_common::protocol::BridgeResponse, crate::bridge_client::ClientError> {
+    send_bridge_request_inner_at(request, &hole_common::protocol::default_bridge_socket_path())
+}
+
+/// Pure seam for [`send_bridge_request_inner`]: the socket path is a
+/// parameter so a test can point it at a controlled, unlistened path and
+/// still exercise arming plus the real connect attempt, instead of ever
+/// reaching the live production bridge socket.
+fn send_bridge_request_inner_at(
+    request: hole_common::protocol::BridgeRequest,
+    socket_path: &std::path::Path,
 ) -> Result<hole_common::protocol::BridgeResponse, crate::bridge_client::ClientError> {
     arm_request_redaction(&request);
     let rt = tokio::runtime::Runtime::new().unwrap();
     rt.block_on(async {
-        let socket_path = hole_common::protocol::default_bridge_socket_path();
-        let mut client = crate::bridge_client::BridgeClient::connect(&socket_path).await?;
+        let mut client = crate::bridge_client::BridgeClient::connect(socket_path).await?;
         client.send(request).await
     })
 }
