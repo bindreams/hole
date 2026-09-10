@@ -1073,6 +1073,49 @@ fn first_delete_failure_treats_access_denied_as_a_genuine_failure() {
 }
 
 #[skuld::test]
+fn engage_lockdown_does_not_discard_its_pre_delete_codes() {
+    // A pre-delete is the ONLY thing standing between a re-engage and
+    // `ok_or_exists` reporting `Ok` over a filter it never replaced. So unlike
+    // a sweep, where a failed delete is warned and life goes on, a failed
+    // pre-delete here must abort: the add that follows finds the key still
+    // occupied, returns FWP_E_ALREADY_EXISTS, and the engage would hand back a
+    // cover whose boot-time twin was never re-armed and whose server permit
+    // still names the previous server.
+    //
+    // Structural guard, same technique and same reason as
+    // `reclaim_stale_tun_permit_does_not_discard_delete_codes` below: there is
+    // no fixture in this file that can make a real FwpmFilterDeleteByKey0 fail
+    // with an access-denied DACL. Keyed on the enclosing function symbol and
+    // bounded by its own closing brace, so it cannot drift onto a neighbour or
+    // read its own prose.
+    let src = include_str!("windows.rs");
+    let start = src
+        .find("pub fn engage_lockdown(")
+        .expect("engage_lockdown must exist in windows.rs");
+    let after = &src[start..];
+    let end = after.find("\n}\n").map(|i| i + 2).unwrap_or(after.len());
+    let body = &after[..end];
+
+    // Self-check on the slice, matched on `.pre_delete` rather than
+    // `spec.pre_delete`: rustfmt breaks the receiver onto its own line, so the
+    // dotted form is the part that survives reformatting.
+    assert!(
+        body.contains(".pre_delete"),
+        "the slice must actually cover the pre-delete loop:\n{body}"
+    );
+    assert!(
+        !body.contains("let _ = FwpmFilterDeleteByKey0"),
+        "engage_lockdown must not discard a pre-delete's return code — a genuine failure there \
+         becomes a silent FWP_E_ALREADY_EXISTS success on the add that follows:\n{body}"
+    );
+    assert!(
+        body.contains("first_delete_failure(&pre_delete_codes)"),
+        "engage_lockdown must fold its pre-delete codes through first_delete_failure, so a \
+         not-found stays benign and anything else aborts the transaction:\n{body}"
+    );
+}
+
+#[skuld::test]
 fn reclaim_stale_tun_permit_does_not_discard_delete_codes() {
     // Structural guard, not a proof (mirrors
     // `route_recovery::recover_routes_has_exactly_one_bridge_caller` in the

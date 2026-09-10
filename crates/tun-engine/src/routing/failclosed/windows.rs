@@ -1004,12 +1004,28 @@ pub fn engage_lockdown(
             // CURRENT TUN LUID and server IP instead of hitting `ok_or_exists`
             // on a stale filter — and so a twin left DISABLED-but-present by
             // the boot it already covered is replaced rather than reported
-            // `Ok` (see `lockdown_pre_delete_guids`). Return codes are ignored
-            // for the same reason every other sweep ignores them — a delete
-            // that finds nothing (the ordinary first engage, and the "removed"
-            // reading of a spent twin) is not an error.
-            for g in &spec.pre_delete {
-                let _ = FwpmFilterDeleteByKey0(engine, g);
+            // `Ok` (see `lockdown_pre_delete_guids`).
+            //
+            // The codes are FOLDED, not discarded. A pre-delete that finds
+            // nothing is benign — the ordinary first engage, and the "removed"
+            // reading of a spent twin — and `first_delete_failure` whitelists
+            // exactly that. Any OTHER code is fatal here, unlike in a sweep,
+            // because of what happens next: the add that follows finds the key
+            // still occupied, returns `FWP_E_ALREADY_EXISTS`, and
+            // `ok_or_exists` reports success. The engage would then return `Ok`
+            // holding a cover whose twin was never re-armed and whose server
+            // permit still names the previous server — the same silent failure
+            // the pre-delete exists to prevent, reached by a different route.
+            // Failing is also the safe direction: the transaction aborts, so
+            // whatever was in force stays in force, and `install_lockdown` is
+            // fail-fatal in `ProxyManager`.
+            let pre_delete_codes: Vec<(&'static str, u32)> = spec
+                .pre_delete
+                .iter()
+                .map(|g| ("lockdown pre-delete", FwpmFilterDeleteByKey0(engine, g)))
+                .collect();
+            if let Some(e) = first_delete_failure(&pre_delete_codes) {
+                return Err(e);
             }
             // Idempotent over an unswept cover: add_provider/add_sublayer use
             // ok_or_exists, and the kept floor (block-all + loopback + App-ID)
