@@ -26,3 +26,19 @@ pub(crate) fn default_user_subdir(leaf: &str) -> PathBuf {
 pub fn default_state_dir() -> PathBuf {
     default_user_subdir("state")
 }
+
+/// State directory for a named user's home, rather than for whoever the
+/// process's effective user happens to be.
+///
+/// An elevated, non-`--service` bridge run resolves its state dir this way,
+/// against the real interactive user behind `sudo`. Anything that has to find
+/// that bridge's state after the fact — `cutover::peer_state_dirs`, looking for
+/// its liveness lock — must resolve it the same way, so the mapping lives here
+/// rather than at either call site.
+///
+/// The layout is macOS's, and so are both callers; the function itself is a
+/// pure path join and is compiled everywhere so its unit test does not need a
+/// platform of its own.
+pub fn user_state_dir(home: &std::path::Path) -> PathBuf {
+    home.join("Library/Application Support/hole/state")
+}

@@ -116,6 +116,10 @@ filetime = "0.2"
 # `the_gui_no_longer_decides` (tray_tests.rs) walks `src/` on every platform
 # clippy-hole covers, not just macOS — the runtime use above is macOS-only.
 walkdir = "2"
+# Attributing a walked call site to its enclosing `fn` for the uninstall
+# wiring guard (`setup_tests.rs`), the same instrument
+# `crates/bridge/src/reconciler_tests.rs` uses for the cover-release callers.
+regex = "1"
 # Test-only: the ASSET_SUFFIX drift-guard asserts against the shared
 # release-asset source (`asset::host_update_asset_suffix`). No features — the
 # `asset` module is feature-independent.

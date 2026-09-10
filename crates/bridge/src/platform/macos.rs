@@ -146,12 +146,39 @@ pub fn install(source_binary: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Stop, unload, and remove the bridge.
-pub fn uninstall() -> std::io::Result<()> {
-    // bootout stops and unregisters. Best-effort: ignore the Result because
-    // uninstall must succeed even if the plist isn't currently loaded.
+/// Stop the bridge *without* removing its plist, tolerating a host where
+/// launchd has no job to stop.
+///
+/// The uninstall orchestration calls this unconditionally, before it consults
+/// any registration record — see `setup::uninstall_bridge_with` for why the
+/// two are independent.
+///
+/// `bootout`, not [`stop`]'s SIGTERM: the plist sets `KeepAlive`, so launchd
+/// relaunches a bare-signalled daemon. launchctl's exit codes do not separate
+/// "was not loaded" from a real failure, so the outcome is confirmed by cause
+/// instead — a label launchd no longer knows is a label that is not running.
+pub fn ensure_stopped() -> std::io::Result<()> {
     let system_label = format!("system/{LAUNCHD_LABEL}");
-    let _ = run_launchctl("bootout", &["bootout", &system_label], LaunchctlFailLevel::BestEffort);
+    if run_launchctl("bootout", &["bootout", &system_label], LaunchctlFailLevel::BestEffort).is_ok() {
+        return Ok(());
+    }
+    if is_running() {
+        return Err(std::io::Error::other(format!(
+            "launchctl bootout did not stop {LAUNCHD_LABEL}, and launchd still has the job loaded"
+        )));
+    }
+    Ok(())
+}
+
+/// Stop, unload, and remove the bridge.
+///
+/// The stop is FATAL here, not the best-effort it used to be. `is_installed()`
+/// is a `PLIST_PATH` existence check, so deleting the plist over a still-loaded
+/// job makes every later `uninstall` skip its teardown — nothing would ever
+/// stop the bridge again, and the cover release refuses against it forever
+/// (bindreams/hole#1003).
+pub fn uninstall() -> std::io::Result<()> {
+    ensure_stopped()?;
 
     if Path::new(PLIST_PATH).exists() {
         std::fs::remove_file(PLIST_PATH)?;

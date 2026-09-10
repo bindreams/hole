@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::Duration;
 use tracing::{error, info, warn};
+use windows::Win32::Foundation::{ERROR_SERVICE_DOES_NOT_EXIST, ERROR_SERVICE_MARKED_FOR_DELETE};
 use windows_service::service::{
     ServiceAccess, ServiceAction, ServiceActionType, ServiceControl, ServiceControlAccept, ServiceErrorControl,
     ServiceExitCode, ServiceFailureActions, ServiceFailureResetPeriod, ServiceInfo, ServiceStartType, ServiceState,
@@ -471,15 +472,62 @@ pub fn ensure_failure_actions() -> Result<(), windows_service::Error> {
 }
 
 /// Stop and uninstall the bridge Windows Service.
-pub fn uninstall() -> Result<(), windows_service::Error> {
-    // Stop first (ignore errors — service may not be running)
-    let _ = stop();
+///
+/// The stop is FATAL here, not the best-effort it used to be. `DeleteService`
+/// against a still-running service *succeeds* — it only marks the entry for
+/// deletion — and from that moment `OpenService` answers
+/// `ERROR_SERVICE_MARKED_FOR_DELETE`, so nothing can send the service a stop
+/// control ever again and no retry can even find it. The registration is the
+/// only handle a later attempt has; keeping it over a failed stop is what
+/// makes the uninstall retryable instead of terminal (bindreams/hole#1003).
+pub fn uninstall() -> Result<(), Box<dyn std::error::Error>> {
+    stop()?;
 
     let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)?;
     let service = manager.open_service(SERVICE_NAME, ServiceAccess::DELETE)?;
     service.delete()?;
     info!("Windows service uninstalled");
     Ok(())
+}
+
+/// Stop the bridge service *without* deregistering it, tolerating a host where
+/// SCM has nothing to stop.
+///
+/// The uninstall orchestration calls this unconditionally, before it consults
+/// any registration record: whether a bridge is running and whether SCM still
+/// has a row for it are independent facts, and the fail-closed covers are held
+/// by the live process, not by the row. See `setup::uninstall_bridge_with`.
+///
+/// An absent row — never registered, or already marked for deletion by a prior
+/// `DeleteService` — is `Ok`: there is no handle SCM could act through, so
+/// there is nothing here to fail over. The cover release that follows carries
+/// the real guarantee; it holds the bridge's own liveness lock and refuses
+/// outright if a bridge is still alive.
+pub fn ensure_stopped() -> Result<(), Box<dyn std::error::Error>> {
+    let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)?;
+    match manager.open_service(SERVICE_NAME, ServiceAccess::QUERY_STATUS) {
+        Ok(service) => {
+            drop(service);
+            stop()
+        }
+        Err(e) if open_error_is_absent(&e) => {
+            info!("no Windows service registration to stop");
+            Ok(())
+        }
+        Err(e) => Err(Box::new(e)),
+    }
+}
+
+/// Whether an `open_service` failure means SCM has no service left to act on.
+/// `ERROR_SERVICE_MARKED_FOR_DELETE` counts: the row survives only until its
+/// last handle closes, and no handle opened through it can carry a control.
+fn open_error_is_absent(e: &windows_service::Error) -> bool {
+    let windows_service::Error::Winapi(io) = e else {
+        return false;
+    };
+    io.raw_os_error().is_some_and(|code| {
+        code == ERROR_SERVICE_DOES_NOT_EXIST.0 as i32 || code == ERROR_SERVICE_MARKED_FOR_DELETE.0 as i32
+    })
 }
 
 // Start/stop ==========================================================================================================

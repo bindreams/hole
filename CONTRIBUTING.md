@@ -1288,16 +1288,48 @@ them — a permanently blocked host with no way back short of `netsh wfp`
 What makes the wider reach safe here is not ordering but the same structural
 exclusion `unlock` uses: it **refuses against a live bridge instance**
 (`BridgeLiveness::try_acquire`), so there is never an in-process posture left
-claiming a cover that no longer exists. `uninstall_bridge` tears the service
-down *first*, which is what frees the lock; a bridge that survives the teardown
-turns the release into a loud refusal rather than a silent desync.
+claiming a cover that no longer exists. `uninstall_bridge` stops the bridge
+*first*, which is what frees the lock; a bridge that survives the stop turns the
+release into a loud refusal rather than a silent desync.
+
+The lock is per-state-dir but the covers are not — on Windows they are keyed on
+compile-time GUIDs and swept machine-wide — so the refusal probes the service
+state dir *and* the per-user dirs `cli.rs` gives foreground and elevated
+non-`--service` runs (`cutover::peer_state_dirs`). A peer dir that does not
+exist is skipped, not probed: `try_acquire` creates what it locks.
+
+##### Stop, deregister, release — and what gates what
+
+`uninstall_bridge_with` runs three effects in that order, with two rules that
+are the whole of #1003's second half:
+
+- **The stop is gated on nothing.** Whether a bridge is running and whether a
+  registration record still names it are independent facts, and the covers are
+  held by the live process, not by the record. Gating the stop on
+  `is_installed()` made them look like one, and that is what turned an
+  uninstall into a dead end: `DeleteService` against a live service *succeeds*
+  by marking the row for deletion, `OpenService` then answers
+  `ERROR_SERVICE_MARKED_FOR_DELETE`, `is_installed()` reads false, and every
+  retry skips the teardown that would have stopped the bridge — whose liveness
+  lock then refuses the release forever. macOS reaches the same place through a
+  plist deleted over a still-loaded job.
+- **Deregistration requires a confirmed stop.** The registration is the only
+  handle a later attempt has, so an unconfirmed stop leaves it alone: the
+  uninstall fails and the next one still has something to work with. Both
+  platform `uninstall()`s enforce the same rule at their own level, and
+  `platform::os::ensure_stopped` is the stop that tolerates a host with nothing
+  registered (launchd's `bootout`, not `stop`'s SIGTERM — the plist sets
+  `KeepAlive`).
+
+Steps do not short-circuit each other and the error names all of them; an early
+`?` on the release swallowed the context that explains why it refused.
 
 Two more properties are load-bearing:
 
 - **The release is not gated on the service.** Cover existence is independent
   of service registration (the Windows filters are keyed on compile-time GUIDs
-  and are machine-wide), so it runs even when `is_installed()` is false or the
-  teardown failed.
+  and are machine-wide), so it runs even when `is_installed()` is false or an
+  earlier step failed.
 - **It is the only uninstall failure that blocks.** The MSI runs
   `BridgeRelease` `Return="check"` — uniquely among the uninstall custom
   actions — so a failed release aborts before `RemoveFiles`. Fatality stops
@@ -1309,11 +1341,29 @@ Two more properties are load-bearing:
   escape from the gate itself, so a release that can never succeed cannot make
   the product unremovable (see RELEASE-OPS.md).
 
+A confirmed release owns the cleanup of the state dir it needed
+(`cutover::purge_state_dir`): recording the target `Off` provisions
+`service_state_dir()` even on a host that never ran a bridge, and neither
+platform's `uninstall()` removes it. Best-effort — a leftover directory is
+litter, not a stranded host — and it never runs on a major upgrade, which needs
+the intent it holds.
+
 A major upgrade skips the release entirely (`NOT UPGRADINGPRODUCTCODE`, and
 `bridge uninstall --keep-covers` for the service teardown that must still run):
 the standing cover is what holds the update-cutover gap, and the new bridge
 re-adopts it. Both CLI surfaces are `hide = true` — the uninstaller is their
 only sanctioned caller.
+
+Wiring these together is what the tests could not see: every unit test drives
+`uninstall_bridge_with` / `release_covers_with` through injected closures, so
+all of them stay green against a refactor that severs the production call.
+`setup_tests.rs`'s `the_cover_release_is_wired_to_both_of_its_entry_points` and
+`the_bridge_stop_is_wired_ahead_of_every_deregistration` walk `crates/hole/src`
+and pin the call sites by enclosing function, and
+`reconciler_tests.rs`'s `cover_release_has_the_known_sanctioned_caller_set`
+matches the `failclosed::release_all` free function as well as the `Routing`
+trait method — `cutover::release_covers` has no `Routing` handle, and a pattern
+naming only the trait method let this whole release path in unseen.
 
 Disclosed residuals:
 
@@ -1440,6 +1490,29 @@ Disclosed residuals:
    recorded `Target::Off` limits the damage — a later start reconciles toward
    it and sweeps — and pf does not survive a reboot. Windows is clean here:
    the sweep is by GUID and ignores `state_dir` entirely.
+
+1. The live-bridge refusal probes a known set of state dirs, not every
+   possible one. A bridge given an explicit `--state-dir` outside
+   `peer_state_dirs`, or one running under a different account than the
+   uninstaller (the MSI's custom actions run as SYSTEM, whose
+   `default_state_dir` is not the developer's), holds a lock nothing here can
+   see. On Windows the consequence is the desync the refusal exists to
+   prevent: `release_all` sweeps by GUID and would delete that bridge's
+   filters while its posture still claims them, so its next covered start
+   would skip re-engagement and run uncovered. `bridge release-covers` is
+   hidden and uninstall-only for exactly this reason.
+
+1. A stop that never returns is not covered at all. `platform::os::stop` waits
+   on a real SCM `STOPPED` callback with no bound, and `ProxyManager`'s
+   teardown is itself unbounded (#556) — so against the known
+   windows-installer uninstall hang the release never runs, and the user's end
+   state is #1003 minus the deleted binary. The fix here addresses the stop
+   that *fails*, not the stop that hangs. What the stop no longer does is
+   fail spuriously against a service that is merely already stopping:
+   `ControlService` answers `ERROR_SERVICE_CANNOT_ACCEPT_CTRL` there, which
+   `stop_via_notify` now treats as benign because its arm already covers
+   `STOPPED`/`STOP_PENDING`/`RUNNING` and it re-issues the control on the
+   `RUNNING` a refused `START_PENDING` resolves to.
 
 1. On macOS, uninstall only runs when the user takes it: the tray's Uninstall
    Helper shells out to `hole bridge uninstall`. Dragging Hole.app to the

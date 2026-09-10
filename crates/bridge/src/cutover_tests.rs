@@ -254,24 +254,67 @@ fn plan_windows_images_covers_full_bindir_set() {
 // the same reason `unlock` does — an out-of-process clear would leave the
 // bridge's posture claiming a cover that no longer exists (#1003).
 
+/// `release_covers_with` with no peer dirs and the purge stubbed out, so the
+/// assertions below can still read the state dir afterwards.
+fn release_covers_probe(dir: &std::path::Path, release: impl FnOnce() -> std::io::Result<()>) -> std::io::Result<()> {
+    release_covers_with(dir, &[], release, || {})
+}
+
 #[skuld::test]
 fn release_covers_refuses_against_a_live_bridge() {
     let dir = tempfile::tempdir().unwrap();
 
     let _bridge = crate::liveness::BridgeLiveness::acquire(dir.path(), None).unwrap();
 
-    let result = release_covers_with(dir.path(), || {
+    let result = release_covers_probe(dir.path(), || {
         panic!("the release must never run while a bridge instance is live")
     });
 
     result.expect_err("release-covers must refuse while a bridge instance is running");
 }
 
+/// The covers `release_all` sweeps are machine-wide (Windows keys them on
+/// compile-time GUIDs), but the liveness lock is per-state-dir. A bridge run
+/// with a different `--state-dir` — which is what `cli.rs` gives every
+/// foreground and elevated non-`--service` run — holds a lock the service dir
+/// knows nothing about, and clearing its filters out from under it leaves its
+/// posture claiming covers that no longer exist.
+#[skuld::test]
+fn release_covers_refuses_against_a_bridge_live_in_a_peer_state_dir() {
+    let service = tempfile::tempdir().unwrap();
+    let peer = tempfile::tempdir().unwrap();
+
+    let _bridge = crate::liveness::BridgeLiveness::acquire(peer.path(), None).unwrap();
+
+    let result = release_covers_with(
+        service.path(),
+        &[peer.path().to_path_buf()],
+        || panic!("the release must never run while a bridge instance is live"),
+        || {},
+    );
+
+    result.expect_err("a bridge alive in a peer state dir must refuse the release too");
+}
+
+/// `try_acquire` creates the directory it locks, so probing a peer dir that is
+/// not there would provision state for a bridge that never existed — the very
+/// litter the purge below exists to remove.
+#[skuld::test]
+fn release_covers_does_not_provision_a_peer_state_dir_that_is_absent() {
+    let service = tempfile::tempdir().unwrap();
+    let absent = service.path().join("no-such-user").join("state");
+
+    let result = release_covers_with(service.path(), std::slice::from_ref(&absent), || Ok(()), || {});
+
+    assert!(result.is_ok(), "{result:?}");
+    assert!(!absent.exists(), "an absent peer dir must be skipped, not created");
+}
+
 #[skuld::test]
 fn release_covers_records_the_target_off_before_releasing() {
     let dir = tempfile::tempdir().unwrap();
 
-    let result = release_covers_with(dir.path(), || {
+    let result = release_covers_probe(dir.path(), || {
         assert_eq!(
             crate::target::load(dir.path()),
             crate::target::Target::Off,
@@ -289,7 +332,7 @@ fn release_covers_fails_loud_when_it_cannot_release() {
     let dir = tempfile::tempdir().unwrap();
     lockdown_state::set_enabled(dir.path(), true, None).unwrap();
 
-    let result = release_covers_with(dir.path(), || Err(std::io::Error::other("not elevated")));
+    let result = release_covers_probe(dir.path(), || Err(std::io::Error::other("not elevated")));
 
     assert!(
         result.is_err(),
@@ -306,11 +349,53 @@ fn release_covers_disarms_the_kill_switch_on_a_confirmed_release() {
     let dir = tempfile::tempdir().unwrap();
     lockdown_state::set_enabled(dir.path(), true, None).unwrap();
 
-    let result = release_covers_with(dir.path(), || Ok(()));
+    let result = release_covers_probe(dir.path(), || Ok(()));
 
     assert!(result.is_ok());
     assert!(
         !lockdown_state::load_enabled(dir.path()),
         "a confirmed release must disarm, not leave the switch armed over an open host"
     );
+}
+
+/// The release provisions a state dir on a host that never ran a bridge (the
+/// liveness lock and the target write both create what they touch), and neither
+/// platform's `uninstall()` removes it. Purging is the last step and runs only
+/// once nothing is left that needs the directory.
+#[skuld::test]
+fn release_covers_purges_the_state_dir_only_after_a_confirmed_release() {
+    let dir = tempfile::tempdir().unwrap();
+    let purged = std::cell::Cell::new(false);
+
+    let refused = release_covers_with(
+        dir.path(),
+        &[],
+        || Err(std::io::Error::other("not elevated")),
+        || purged.set(true),
+    );
+    assert!(refused.is_err());
+    assert!(!purged.get(), "a failed release must leave the state it recorded off");
+
+    let released = release_covers_with(dir.path(), &[], || Ok(()), || purged.set(true));
+    assert!(released.is_ok(), "{released:?}");
+    assert!(
+        purged.get(),
+        "a confirmed release owns the cleanup of the dir it created"
+    );
+}
+
+/// The production purge, driven directly: `release_covers` hands it the real
+/// `remove_dir_all`, and the lock the release held sits inside the directory it
+/// removes.
+#[skuld::test]
+fn purge_state_dir_removes_the_tree_and_tolerates_its_absence() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("state");
+    std::fs::create_dir_all(state.join("nested")).unwrap();
+    std::fs::write(state.join("bridge-target.json"), "{}").unwrap();
+
+    purge_state_dir(&state);
+    assert!(!state.exists());
+
+    purge_state_dir(&state); // idempotent: a host that never had one
 }

@@ -194,19 +194,118 @@ fn unlock_with(state_dir: &Path, disengage: impl FnOnce() -> std::io::Result<()>
 /// later start reconciles toward `Off` and sweeps.
 pub fn release_covers() -> std::io::Result<()> {
     let state_dir = service_state_dir();
-    release_covers_with(&state_dir, || {
-        tun_engine::routing::failclosed::release_all(&state_dir).map_err(std::io::Error::other)
-    })
+    let others = peer_state_dirs();
+    release_covers_with(
+        &state_dir,
+        &others,
+        // The free function, not `Routing::release_all_covers`: there is no
+        // bridge here, so no `Routing` handle to reach the trait method
+        // through. `reconciler_tests.rs`'s sanctioned-caller guard matches both
+        // forms so this site is visible to it.
+        || tun_engine::routing::failclosed::release_all(&state_dir).map_err(std::io::Error::other),
+        || purge_state_dir(&state_dir),
+    )
 }
 
-/// `release_covers`' ordering, with the release injected so tests can drive the
-/// cannot-release path without touching the host firewall.
-fn release_covers_with(state_dir: &Path, release: impl FnOnce() -> std::io::Result<()>) -> std::io::Result<()> {
-    let Some(_liveness) = crate::liveness::BridgeLiveness::try_acquire(state_dir, None)? else {
+/// Every state dir OTHER than the service's that a bridge on this host could be
+/// holding its liveness lock in.
+///
+/// The lock is per-state-dir, but the covers `release_all` sweeps are not: on
+/// Windows they are keyed on compile-time GUIDs and are machine-wide, so a
+/// release that only consulted the service's dir would clear the filters of a
+/// bridge started with a different `--state-dir` while that bridge's posture
+/// still claims them — and its next covered start would skip re-engagement and
+/// run uncovered. `cli.rs` defaults foreground and elevated non-`--service`
+/// runs to a per-user dir, which is that bridge in practice.
+///
+/// Disclosed residual: a bridge given an explicit `--state-dir` outside this
+/// set, or a per-user dir belonging to some other account (the MSI's CAs run as
+/// SYSTEM, whose `default_state_dir` is not the developer's), is still
+/// undetectable here. `bridge release-covers` is hidden and uninstall-only for
+/// that reason.
+fn peer_state_dirs() -> Vec<PathBuf> {
+    let mut dirs = vec![hole_common::paths::default_state_dir()];
+    if let Some(dir) = real_user_state_dir() {
+        dirs.push(dir);
+    }
+    dirs
+}
+
+/// The state dir an elevated, non-`--service` run resolves against the real
+/// user behind `sudo`, rather than the effective one `default_state_dir` sees.
+/// macOS only — no other platform has that indirection.
+fn real_user_state_dir() -> Option<PathBuf> {
+    #[cfg(target_os = "macos")]
+    {
+        match crate::group::resolve_real_user() {
+            Ok(u) => Some(hole_common::paths::user_state_dir(&u.home)),
+            Err(e) => {
+                tracing::debug!(error = %e, "no real user to resolve a peer state dir for");
+                None
+            }
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        None
+    }
+}
+
+/// Remove the service state dir once the release has fully succeeded. The
+/// product is on its way out and every file under it has just been made moot —
+/// including the ones this very call had to create to record the target off on
+/// a host that never ran a bridge. Best-effort: a leftover directory is litter,
+/// not a stranded host.
+///
+/// It takes the crash-recovery records (`bridge-{routes,dns,plugins}.json`)
+/// with it. Those are already unreachable at this point — the sweep that reads
+/// them only ever runs from a bridge start, and there is no next start.
+fn purge_state_dir(state_dir: &Path) {
+    match std::fs::remove_dir_all(state_dir) {
+        Ok(()) => tracing::info!("bridge state directory removed"),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => tracing::warn!(error = %e, "covers released, but the bridge state directory could not be removed"),
+    }
+}
+
+/// `release_covers`' ordering, with the release and the state purge injected so
+/// tests can drive the cannot-release path without touching the host firewall.
+///
+/// `peers` are the other state dirs a bridge could be alive in; a lock held in
+/// any of them refuses the release just as the service's own does. A peer dir
+/// that does not exist is skipped rather than probed — `try_acquire` creates
+/// what it locks, and a probe that provisions a state dir for a bridge that
+/// was never there is the litter this function exists to clean up.
+fn release_covers_with(
+    state_dir: &Path,
+    peers: &[PathBuf],
+    release: impl FnOnce() -> std::io::Result<()>,
+    purge: impl FnOnce(),
+) -> std::io::Result<()> {
+    let Some(liveness) = crate::liveness::BridgeLiveness::try_acquire(state_dir, None)? else {
         return Err(std::io::Error::other(
             "a bridge instance is running; stop the bridge before releasing its fail-closed covers",
         ));
     };
+    let mut held = vec![liveness];
+    for peer in peers {
+        if peer == state_dir || !peer.exists() {
+            continue;
+        }
+        match crate::liveness::BridgeLiveness::try_acquire(peer, None) {
+            Ok(Some(guard)) => held.push(guard),
+            Ok(None) => {
+                return Err(std::io::Error::other(
+                    "a bridge instance is running; stop the bridge before releasing its fail-closed covers",
+                ))
+            }
+            // Not evidence of a bridge — an unreadable peer dir (another
+            // account's home) says nothing either way, and refusing on it would
+            // make the uninstall unrunnable on a multi-user host.
+            Err(e) => tracing::warn!(error = %e, "could not probe a peer state dir for a live bridge"),
+        }
+    }
+
     crate::target::apply(state_dir, None, |_| crate::target::Target::Off)
         .map_err(|e| std::io::Error::other(format!("could not record target off: {e}")))?;
     release()?;
@@ -218,6 +317,11 @@ fn release_covers_with(state_dir: &Path, release: impl FnOnce() -> std::io::Resu
     if let Err(e) = tun_engine::routing::failclosed::lockdown_state::set_enabled(state_dir, false, None) {
         tracing::warn!(error = %e, "covers released, but the legacy lockdown intent could not be recorded off");
     }
+
+    // Drop before the purge: on Windows the lock is an open handle on a file
+    // inside the directory about to be removed.
+    drop(held);
+    purge();
     Ok(())
 }
 
