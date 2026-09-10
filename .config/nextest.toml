@@ -59,7 +59,8 @@ nextest-version = "0.9.130"
 #   - `boottime_global_net_state_` prefix (#998 — adds a real BOOT-TIME WFP
 #     filter under the covers' own provider/sublayer and deletes it again, so
 #     it must not run beside a cover test whose `delete_all` drops that shared
-#     sublayer):
+#     sublayer; the twin re-arm test additionally engages the REAL standing
+#     lockdown twice, so it blocks host egress for its duration):
 #     crates/tun-engine/src/routing/failclosed/boottime_privileged_tests.rs
 #   - `cutover_global_net_state_` prefix:
 #     crates/bridge/tests/cutover_privileged.rs (real cutover swap + SCM restart)
