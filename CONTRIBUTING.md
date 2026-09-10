@@ -1192,6 +1192,13 @@ network egress, not loopback. So the boot→BFE window gets the block and nothin
 else: no loopback, TUN, server or App-ID permit, a total egress block rather
 than a scaled-down copy of the cover BFE later installs. Egress-only all the
 same — the twins sit on `ALE_AUTH_CONNECT_V4`/`_V6`, nothing at `RECV_ACCEPT`.
+The twin-pair shape and the blocks-only choice both follow shipped precedent:
+Mullvad and TinyWall each install a rule twice, `BOOTTIME` and `PERSISTENT`,
+under their own persistent containers, and neither they nor Fort Firewall ship
+a boot-time *permit*. Mullvad differs from Hole in when: its blocks go in as
+the daemon shuts down under a blocking policy and are swept by provider
+enumeration on the way back up, where Hole's go in at engage and stay while the
+kill switch is armed — a much wider window for a version skew to strand one.
 
 Two things that decide whether this is safe are undocumented by WFP, so they
 are **measured on the real firewall** by
@@ -1230,12 +1237,12 @@ itself provisions, so what the pre-BFE kernel does with them is not merely
 unmeasured but undocumented); whether a by-key delete purges the underlying
 boot-time record rather than the runtime copy; and whether a twin covers boots
 after the one following its install. Microsoft's own pages disagree on the
-underlying mechanic — `FwpmFilterAdd0`'s Remarks say boot-time filters are
-"removed" once BFE finishes initializing; the "Basic Operation of WFP" page says
-they are "disabled" — and, more to the point, **neither addresses
-re-provisioning at later boots at all**. That is silence, not contradiction, and
-it stays recorded as silence rather than resolved by picking the convenient
-reading.
+underlying mechanic — `FwpmFilterAdd0`'s Remarks and "Object Management" say
+boot-time filters are "removed" once BFE finishes initializing; "Basic Operation
+of WFP" says twice that they are "disabled" — and, more to the point, **none of
+them addresses re-provisioning at later boots at all**. That is silence, not
+contradiction, and it stays recorded as silence rather than resolved by picking
+the convenient reading.
 
 A stranded boot-time leftover has no self-healing path the way a stranded
 persistent one does: BFE re-adds a persistent leftover at every start whatever

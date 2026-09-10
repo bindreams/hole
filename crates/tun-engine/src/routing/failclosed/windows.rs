@@ -58,8 +58,10 @@
 //! one: WFP's reference states no constraint tying a filter's lifetime to its
 //! containers', and shipped implementations differ — Fort Firewall puts its
 //! boot-time blocks on the default sublayer (`FORT_GUID_EMPTY`, no provider),
-//! TinyWall installs each filter twice, PERSISTENT and BOOTTIME, both under
-//! its OWN persistent sublayer. `boottime_privileged_tests` settles it for our
+//! while TinyWall (`TinyWallService.cs`) and Mullvad
+//! (`talpid-core/.../objects/persistent.rs`) each install the same rule twice,
+//! PERSISTENT and BOOTTIME, under their OWN persistent containers — the shape
+//! used here. `boottime_privileged_tests` settles it for our
 //! containers on the real firewall, and this is what it returned: WFP accepts
 //! the add, and the stored record carries `FWPM_FILTER_FLAG_BOOTTIME` (not
 //! `PERSISTENT`), our `providerKey` and our `subLayerKey`.
@@ -70,7 +72,10 @@
 //! record CARRIES our `providerKey`, not that a `BOOTTIME_ONLY` template
 //! filtered BY `providerKey` returns it. #1008's sweep needs the second. The
 //! measurement rules out the outcome that would have made #1008 impossible; it
-//! does not demonstrate #1008's mechanism.
+//! does not demonstrate #1008's mechanism. The nearest independent evidence
+//! that the mechanism works is that Mullvad ships it — its teardown removes
+//! its boot-time blocks by enumerating its provider, never by fixed GUID —
+//! which is a working system's word, not a measurement of ours.
 //!
 //! The standing LOCKDOWN cover (kill switch) is meant to survive an arbitrary
 //! reboot — CONTRIBUTING.md's "Fail-closed cover" section — so
@@ -82,6 +87,9 @@
 //! — a total egress block with no exemptions, not a scaled-down version of the
 //! cover BFE later installs. It is egress-only all the same, since the twins
 //! sit on `ALE_AUTH_CONNECT_V4`/`_V6` and nothing is added at `RECV_ACCEPT`.
+//! Blocks-only matches both shipped precedents — Fort's four boot-time filters
+//! and Mullvad's four are all `BLOCK`, neither ships a boot-time permit —
+//! though both also cover `RECV_ACCEPT`, which we do not.
 //! Reasons a permit is NOT given a boot-time twin: (a) the TUN-LUID
 //! and server-IP permits carry values discovered at runtime — a boot-time copy
 //! would enforce whatever value was live at the PREVIOUS engage, stale by
@@ -125,6 +133,13 @@
 //! binary that never learned a NEWER binary's boot-time GUID (a downgrade)
 //! cannot find it by key to delete it.
 //!
+//! Note we are exposed to that for longer than the precedent is. Mullvad
+//! installs its boot-time blocks only as the daemon SHUTS DOWN under a
+//! blocking policy, after deleting its ephemeral objects, and sweeps them by
+//! provider on the way back up; ours go in at engage and stay for as long as
+//! the kill switch is armed. Same filters, a much wider window in which a
+//! version skew can strand one.
+//!
 //! How bad that is turns on the open question below — whether a boot-time
 //! policy record is re-provisioned at EVERY subsequent boot or applied only
 //! once — and the answer cuts both ways at once, which is the honest way to
@@ -150,10 +165,12 @@
 //! the case to. Do not read this file's green CI as covering anything below.
 //!
 //! Microsoft's own pages do not agree on what happens to a boot-time filter
-//! when BFE starts: `FwpmFilterAdd0`'s Remarks say boot-time filters are
-//! "removed" once BFE finishes initializing, while the "Basic Operation of
-//! WFP" page says one is "disabled" when BFE starts. Those are operationally
-//! different claims. More to the point, NEITHER page — nor any other found —
+//! when BFE starts. `FwpmFilterAdd0`'s Remarks and the "Object Management"
+//! page both say boot-time filters are "removed" once BFE finishes
+//! initializing; "Basic Operation of WFP" says twice that one is "disabled"
+//! when BFE starts. Those are operationally different claims, and the
+//! disagreement is between Microsoft pages, not between Microsoft and us —
+//! so it is recorded, not adjudicated. More to the point, no page found
 //! says what becomes of the underlying boot-time policy record at LATER boots:
 //! whether it is re-provisioned at every boot or applied once and spent. That
 //! is silence, not contradiction, and it is left stated as silence here rather
