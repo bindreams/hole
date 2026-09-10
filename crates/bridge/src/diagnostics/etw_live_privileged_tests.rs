@@ -390,8 +390,11 @@ fn etw_guard_drop_stops_the_session_it_started() {
 /// manufactured from outside ferrisetw (`UserTrace` has no constructor taking a
 /// handle).
 ///
-/// Rewrite `stop_session`'s `if !stop_issued` to key off the guard state
-/// instead of the stop's outcome and this is the test that fails.
+/// Make `stop_session`'s `Err` arm report `stop_issued = true` — a complete
+/// revert of the backstop for its only real scenario — and this is the one test
+/// that fails. (Keying `if !stop_issued` off `self.trace.is_none()` instead is
+/// *not* that revert: `self.trace.take()` has already emptied it, so the
+/// backstop still always runs.)
 #[cfg(target_os = "windows")]
 #[skuld::test(labels = [TUN], serial = TUN)]
 fn etw_guard_drop_falls_back_to_the_by_name_stop_when_usertrace_stop_errs() {
@@ -432,8 +435,9 @@ fn etw_guard_drop_falls_back_to_the_by_name_stop_when_usertrace_stop_errs() {
 /// at `warn!`. Pins what `ControlTraceW(name, STOP)` really answers for a
 /// session that does not exist, which no unit test can observe: unit tests can
 /// only assert that [`is_session_not_found`] recognises a code they themselves
-/// chose. If Windows answers with anything else, every clean shutdown reports
-/// "failed to stop session by name".
+/// chose. If Windows answers with anything else, every trip through the backstop
+/// against an already-gone session — the case the test above exercises — warns
+/// about a session it in fact reclaimed.
 #[cfg(target_os = "windows")]
 #[skuld::test(labels = [TUN], serial = TUN)]
 fn stopping_a_session_that_does_not_exist_is_not_a_warning() {
