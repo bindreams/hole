@@ -76,11 +76,12 @@ jobs:
     # to clear the censored region so the true tail becomes observable next
     # time this is re-measured; tighten once it is.
     #
-    # The other five legs were never killed, so their budgets are ~1.4-2x the
-    # observed max rather than a "clear the censoring" multiple — and the
-    # smaller legs get more relative headroom (linux's ~5m job gets a 10m
-    # floor, not a 7m one) so ordinary runner noise doesn't trip a kill on a
-    # job that was never actually hung.
+    # The other five legs were never killed, so they KEEP the existing 30 —
+    # measured here, deliberately not tightened. Their observed maxima would
+    # justify lower walls (1.4-2.2x headroom), but a timeout that has never
+    # fired is not costing anything, and this change exists to stop kills, not
+    # to introduce new ones on legs that were fine. Tightening them is a
+    # separate decision with its own evidence, not a rider on this fix.
     #
     # Whether darwin/amd64 got slower from genuine growth or sccache hit-rate
     # is NOT settled, only narrowed: step-level timing (setup-build's dep
@@ -98,12 +99,12 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { os: windows, arch: amd64, runner: windows-latest,     timeout: 25 }
+          - { os: windows, arch: amd64, runner: windows-latest,     timeout: 30 }
           - { os: darwin,  arch: amd64, runner: macos-15-intel,     timeout: 50 }
-          - { os: darwin,  arch: arm64, runner: macos-latest,       timeout: 25 }
-          - { os: linux,   arch: amd64, runner: ubuntu-latest,      timeout: 10 }
-          - { os: linux,   arch: arm64, runner: ubuntu-24.04-arm,   timeout: 10 }
-          - { os: windows, arch: arm64, runner: windows-11-arm,     timeout: 20 }
+          - { os: darwin,  arch: arm64, runner: macos-latest,       timeout: 30 }
+          - { os: linux,   arch: amd64, runner: ubuntu-latest,      timeout: 30 }
+          - { os: linux,   arch: arm64, runner: ubuntu-24.04-arm,   timeout: 30 }
+          - { os: windows, arch: arm64, runner: windows-11-arm,     timeout: 30 }
     steps:
       - uses: actions/checkout@v7
         with:
