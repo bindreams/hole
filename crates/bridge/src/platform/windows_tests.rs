@@ -160,3 +160,31 @@ fn sweep_recheck_uses_presence_not_schema() {
         "Running must not be reported while a marker is present"
     );
 }
+
+// `ensure_stopped`'s absent-service classification ====================================================================
+//
+// This is what makes the stop independent of a registration record (#1003).
+// `ERROR_SERVICE_MARKED_FOR_DELETE` is the one that matters: it is the state a
+// `DeleteService` over a live service leaves behind, and mis-reading it as a
+// real failure would make an uninstall unrunnable on a host that merely has a
+// stale row with an open handle. Anything else is a genuine SCM error and must
+// stay one.
+
+fn winapi_error(code: u32) -> windows_service::Error {
+    windows_service::Error::Winapi(std::io::Error::from_raw_os_error(code as i32))
+}
+
+#[skuld::test]
+fn an_unregistered_or_deleted_service_has_nothing_to_stop() {
+    assert!(open_error_is_absent(&winapi_error(ERROR_SERVICE_DOES_NOT_EXIST.0)));
+    assert!(open_error_is_absent(&winapi_error(ERROR_SERVICE_MARKED_FOR_DELETE.0)));
+}
+
+#[skuld::test]
+fn a_real_scm_failure_is_not_an_absent_service() {
+    // Access denied: the caller is unprivileged, the service is very much there.
+    assert!(!open_error_is_absent(&winapi_error(5)));
+    assert!(!open_error_is_absent(
+        &windows_service::Error::LaunchArgumentsNotSupported
+    ));
+}
