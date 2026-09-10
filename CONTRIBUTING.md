@@ -1212,9 +1212,11 @@ Two implementations declined boot-time entirely and belong in the same survey:
 GUID), and OpenVPN's `wfp_block.c` sets `FWPM_SESSION_FLAG_DYNAMIC` under the
 comment "Add temporary filters which don't survive reboots or crashes".
 wireguard-windows is where this file's weight-arbitration recipe comes from, so
-its silence here was a choice, not an oversight — though neither project ships
-an always-on kill switch meant to survive an arbitrary reboot, which is the
-requirement that makes `PERSISTENT`-only insufficient.
+it was read closely — grounds for trusting the survey did not simply miss a
+boot-time usage, not grounds for claiming its authors weighed boot-time and
+rejected it. Neither project ships an always-on kill switch meant to survive an
+arbitrary reboot, which is the requirement that makes `PERSISTENT`-only
+insufficient.
 
 **Unanalysed, and stated as such:** the twins are `Condition::Any` +
 `Action::Block` with no `CLEAR_ACTION_RIGHT`, so they are default-*hard*. On an
@@ -1239,7 +1241,10 @@ machine it is ruling out bricking.
 production `add_filter` under the covers' own persistent provider and sublayer:
 WFP accepted it; the stored record carries `FWPM_FILTER_FLAG_BOOTTIME` and not
 `FWPM_FILTER_FLAG_PERSISTENT`, our `providerKey` and our `subLayerKey`
-(`flags == 0x2` exactly — `FWPM_FILTER_FLAG_DISABLED` is clear); a by-key
+(`flags` read back as `0x2` on the host this was measured on; what the test
+*asserts* is the weaker and more portable claim that `FWPM_FILTER_FLAG_DISABLED`
+and `PERSISTENT` are both clear, since WFP may set flags of its own such as
+`INDEXED`); a by-key
 `FwpmFilterGetByKey0` of it returns `ERROR_SUCCESS`, so boot-time filters *are*
 visible to `lockdown_cover_presence` despite having no by-key equivalent of the
 enumeration opt-in; and `FwpmFilterDeleteByKey0` returned `ERROR_SUCCESS` (not
@@ -1299,10 +1304,16 @@ rather than re-added.
 `FWPM_FILTER_FLAG_DISABLED` does not adjudicate it, despite the name. Microsoft
 defines that bit as a *provider* property — set when BFE starts if the provider
 has no associated Windows service name or its service is not auto-start — and
-says it cannot be set when adding a filter. The privileged test reads it on both
-lifetimes anyway: if it were ever set on Hole's filters, Hole's
-service-name-less provider would be one BFE disables, and the `PERSISTENT` half
-of the kill switch would not survive a reboot either.
+says it cannot be set when adding a filter. The privileged tests read it on both lifetimes, but only as a check that WFP
+honours its own add-time rule: both reads are taken on filters the test process
+added seconds earlier, so BFE has not started since they existed and the bit
+cannot be set on them. **It is not evidence that Hole's provider survives a BFE
+start.** That question is open and separate: `add_provider` passes no
+`serviceName`, which is the first condition Microsoft names for a provider whose
+filters BFE disables at startup — and if it applies, the `PERSISTENT` half of the
+kill switch comes back disabled every boot. Settling it needs
+`FwpmProviderGetByKey0` against a provider that outlived a reboot, which no
+single-boot lane can produce.
 
 A stranded boot-time leftover has no self-healing path the way a stranded
 persistent one does: BFE re-adds a persistent leftover at every start whatever
@@ -1318,17 +1329,27 @@ weaker one for coverage. Bounding the hazard is
 
 **Size that worst case correctly.** Both Microsoft readings agree the filter
 stops applying once BFE starts, so a stranded twin blocks egress from tcpip.sys
-until BFE and then stops — seconds per boot, before anything user-facing is on
-the network. #998 and #1008 both describe it as "a permanent block-all with no
-way to remove it"; that is the `PERSISTENT` failure mode, not this one, and
-overstates the boot-time hazard by the length of a whole session. The genuinely
+until BFE and then stops — seconds per boot. #998 and #1008 both describe it as
+"a permanent block-all with no way to remove it"; that is the `PERSISTENT`
+failure mode, not this one, and overstates the boot-time hazard by the length of
+a whole session.
+
+That recalibration is **conditional on the unanalysed hazard above** and must
+travel with it: it holds for a host whose boot does not itself need egress. On a
+PXE- or iSCSI-booted machine, or one unlocking a volume against a network key
+server, a hard total-egress block in that window could stop the boot from
+reaching BFE — and a boot that never reaches BFE never reaches the thing that
+lifts the block, which *is* the bricked machine this paragraph otherwise rules
+out. "Boot-window outage" for an ordinary workstation; unestablished, and
+possibly worse, for a network-booted one. The genuinely
 unrecoverable case is narrower: **BFE failing to start**, where `FwpmEngineOpen0`
 fails and `release_all` and `bridge unlock` both return `Err` having issued
 nothing.
 
-Out-of-band recovery, at the confidence it deserves: `netsh wfp` has **no delete
-verb** (`capture`, `dump`, `set options`, `show`), so the usual "recover with
-`netsh wfp`" advice does not apply to any WFP filter. The plausible hatches are
+Out-of-band recovery, at the confidence it deserves: `netsh wfp` has **no verb that deletes an
+individual filter** — its verbs are `capture`, `dump`, `help`, `set` (capture
+options only), `show` and `reset`, none of which takes a filter key — so the
+usual "recover with `netsh wfp`" advice does not apply to any WFP filter. The plausible hatches are
 `netsh wfp reset` and removing
 `HKLM\SYSTEM\CurrentControlSet\Services\BFE\Parameters\Policy\BootTime`.
 **Neither is verified, and the registry path is not Microsoft-documented** — it

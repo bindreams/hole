@@ -909,18 +909,23 @@ fn engage_lockdown_refreshes_the_volatile_permits() {
     // re-add of a fixed-key filter as success, so without a delete first the
     // stale TUN LUID and the previous server IP would survive a reconnect.
     let spec = build_lockdown_spec(v4(), luid(), &[plugin_path(), bridge_path()]);
+    // Pinned as LITERALS, not as `lockdown_pre_delete_guids()`: comparing the
+    // spec against the same expression `build_lockdown_spec` used to build it
+    // is a tautology that cannot fail, and it would silently bless any future
+    // edit to that helper.
     assert_eq!(
         spec.pre_delete,
-        lockdown_pre_delete_guids(),
+        vec![
+            LOCKDOWN_FILTER_GUIDS[2], // TUN V4
+            LOCKDOWN_FILTER_GUIDS[3], // TUN V6
+            LOCKDOWN_FILTER_GUIDS[4], // server V4
+            LOCKDOWN_FILTER_GUIDS[5], // server V6
+            LOCKDOWN_BOOTTIME_BLOCK_ALL_GUIDS[0],
+            LOCKDOWN_BOOTTIME_BLOCK_ALL_GUIDS[1],
+        ],
         "engage must drop exactly the volatile permits — the TUN pair and BOTH server-family \
          permits — plus the boot-time twins, before adding anything"
     );
-    for &g in &adopt_delete_guids() {
-        assert!(
-            spec.pre_delete.contains(&g),
-            "the volatile permit {g:?} must still be refreshed"
-        );
-    }
 
     // Every deleted key is either re-added with this attempt's fresh values
     // (the TUN pair, and the server permit for THIS family) or deliberately
@@ -1069,6 +1074,32 @@ fn first_delete_failure_treats_access_denied_as_a_genuine_failure() {
     assert!(
         err.to_string().contains("TUN-LUID permit"),
         "must name what failed: {err}"
+    );
+}
+
+#[skuld::test]
+fn every_pre_delete_guid_has_its_own_label() {
+    // A failing pre-delete now ABORTS a kill-switch-armed start, and
+    // `first_delete_failure`'s `"{what} delete failed"` string is the whole
+    // diagnostic. One shared label would make a dead TUN LUID, a changed
+    // server and a spent boot-time twin the same message.
+    let labels: Vec<&'static str> = lockdown_pre_delete_guids().iter().map(pre_delete_label).collect();
+    assert!(
+        !labels.contains(&"unnamed lockdown pre-delete key"),
+        "every pre-delete key must be named for the operator who sees the abort: {labels:?}"
+    );
+    assert_eq!(
+        pre_delete_label(&LOCKDOWN_BOOTTIME_BLOCK_ALL_GUIDS[0]),
+        "boot-time block-all twin"
+    );
+    assert_eq!(pre_delete_label(&LOCKDOWN_FILTER_GUIDS[2]), "TUN-LUID permit");
+    assert_eq!(pre_delete_label(&LOCKDOWN_FILTER_GUIDS[4]), "server-IP permit");
+    // The three causes must stay distinguishable from each other.
+    let distinct: std::collections::HashSet<&'static str> = labels.iter().copied().collect();
+    assert_eq!(
+        distinct.len(),
+        3,
+        "TUN, server and boot-time twin must not share a label"
     );
 }
 

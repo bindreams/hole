@@ -158,50 +158,37 @@ impl Drop for DeleteProbeOnDrop {
 /// found, so an assertion on what it says could fail for a reason that has
 /// nothing to do with the filter.
 ///
-/// Its own EXECUTION is asserted, by [`Self::require_ran`]. A cross-check that
-/// silently produced nothing is not a cross-check: before this, the command's
-/// exit status was discarded and its output surfaced only inside another
-/// assertion's failure message, so a `netsh` that never ran — wrong verb,
-/// missing binary, an unsupported `file=` argument — was indistinguishable
-/// from a green run.
+/// Its own EXECUTION is asserted, by [`Self::require_ran`], and only that: it
+/// spawned and it exited zero. Before this, the exit status was discarded and
+/// the output surfaced only inside another assertion's failure message, so a
+/// `netsh` that never ran — wrong verb, missing binary, unsupported argument —
+/// was indistinguishable from a green run, which is not a cross-check.
 ///
-/// `file=` names a REAL path, which is `netsh wfp`'s documented contract
-/// ("using `file=<path>` as the output file name; by default the output is
-/// saved as `btpol.xml`"). The earlier `file=-` relied on the stdout
-/// convention, which is documented for no `netsh wfp show` verb — and since
-/// nothing asserted on the result, an `file=-` that silently wrote `btpol.xml`
-/// into the test's CWD instead would have looked identical. Reading a file back
-/// makes "it produced a dump" an observation rather than an assumption.
+/// Where the line is drawn and why: exit status is a property of the COMMAND,
+/// and `file=-` writing its XML to stdout with status 0 is measured on a real
+/// elevated host. Whether the dump is non-empty is a property of the machine's
+/// boot-time POLICY, which on a runner that never armed a kill switch may
+/// legitimately be empty — asserting on that would redden a correct run for a
+/// reason this test knows nothing about. So the byte count travels in the
+/// evidence instead of in an assertion.
 struct PolicyDump {
     /// `None` when `netsh` could not be spawned at all.
     status: Option<std::process::ExitStatus>,
-    /// The dump `netsh` wrote, or `None` if it wrote no readable file.
-    dump: Option<String>,
-    /// Whatever `netsh` said on its own streams — diagnostics for a failure.
-    console: String,
+    text: String,
 }
 
 impl PolicyDump {
     fn capture() -> Self {
-        let dir = match tempfile::tempdir() {
-            Ok(d) => d,
-            Err(e) => {
-                return Self {
-                    status: None,
-                    dump: None,
-                    console: format!("<no tempdir for the netsh dump: {e}>"),
-                }
-            }
-        };
-        let out = dir.path().join("btpol.xml");
+        // `file=-` rather than a temp path: it needs no filesystem argument at
+        // all, so it cannot be broken by a runner whose `%TEMP%` contains a
+        // space going through netsh's own argument parser.
         match std::process::Command::new("netsh")
-            .args(["wfp", "show", "boottimepolicy", &format!("file={}", out.display())])
+            .args(["wfp", "show", "boottimepolicy", "file=-"])
             .output()
         {
             Ok(o) => Self {
                 status: Some(o.status),
-                dump: std::fs::read_to_string(&out).ok(),
-                console: format!(
+                text: format!(
                     "{}{}",
                     String::from_utf8_lossy(&o.stdout),
                     String::from_utf8_lossy(&o.stderr)
@@ -209,51 +196,29 @@ impl PolicyDump {
             },
             Err(e) => Self {
                 status: None,
-                dump: None,
-                console: format!("<netsh could not be spawned: {e}>"),
+                text: format!("<netsh could not be spawned: {e}>"),
             },
         }
     }
 
-    /// The cross-check must be able to report its own success. Asserts only
-    /// that the command ran and produced a dump — never what the dump says.
+    /// The cross-check must be able to report its own failure. Asserts that the
+    /// command ran and exited zero — never what it said, nor how much.
     fn require_ran(&self, when: &str) {
-        let status = self.status.unwrap_or_else(|| {
-            panic!(
-                "`netsh wfp show boottimepolicy` ({when}) could not run: {}",
-                self.console
-            )
-        });
+        let status = self
+            .status
+            .unwrap_or_else(|| panic!("`netsh wfp show boottimepolicy` ({when}) could not run: {}", self.text));
         assert!(
             status.success(),
             "`netsh wfp show boottimepolicy` ({when}) exited {status}; the manual boot-time \
              cross-check this test claims to capture is not being captured\n{}",
-            self.console
-        );
-        let dump = self.dump.as_deref().unwrap_or_else(|| {
-            panic!(
-                "`netsh wfp show boottimepolicy` ({when}) exited 0 but wrote no readable dump \
-                 file; the cross-check captured nothing\n{}",
-                self.console
-            )
-        });
-        assert!(
-            !dump.trim().is_empty(),
-            "`netsh wfp show boottimepolicy` ({when}) wrote an empty dump; the cross-check is empty\n{}",
-            self.console
+            self.text
         );
     }
 }
 
 impl std::fmt::Display for PolicyDump {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "[status={:?}] console={}\n{}",
-            self.status,
-            self.console,
-            self.dump.as_deref().unwrap_or("<no dump file>")
-        )
+        write!(f, "[status={:?} bytes={}]\n{}", self.status, self.text.len(), self.text)
     }
 }
 
@@ -382,32 +347,34 @@ fn boottime_global_net_state_filter_is_accepted_keeps_its_containers_and_is_dele
          weight-based arbitration does not govern it\n{evidence}"
     );
 
-    // Q2b: the DISABLED bit, measured rather than left as a gap. Microsoft
-    // documents it as meaning ONE thing, and it is not boot-time supersession:
-    // "a provider's filters are disabled when the BFE starts if the provider
-    // has no associated Windows service name, or if the associated service is
-    // not set to auto-start", and "this flag cannot be set when adding new
-    // filters" (`FWPM_FILTER0` reference). So it must be clear here, and a
-    // failure means one of two things, both worth stopping for: either the bit
-    // carries an undocumented boot-time meaning after all, or Hole's own
-    // service-name-less provider is one BFE will disable — which would make the
-    // PERSISTENT half of the kill switch inert across a reboot too, a far
-    // bigger finding than #998. Either way it is not something to discover from
-    // a user report.
+    // Q2b: the DISABLED bit. **This assertion is weaker than it looks, and the
+    // comment says so rather than letting the next reader assume otherwise.**
     //
-    // Note what this does NOT settle: because the bit is documented as a
-    // provider property, a clear bit is not evidence for the "removed" reading
-    // of what BFE does to a boot-time filter, and a set one would not be
-    // evidence for "disabled". That disagreement stays unadjudicated, which is
-    // why `lockdown_pre_delete_guids` re-arms the twins under both readings
-    // instead of choosing one.
+    // Microsoft documents the bit as a PROVIDER property — "a provider's
+    // filters are disabled when the BFE starts if the provider has no
+    // associated Windows service name, or if the associated service is not set
+    // to auto-start" — and as unsettable at add time (`FWPM_FILTER0`). This
+    // filter was added seconds ago by this process, so BFE has not started
+    // since it existed and the bit CANNOT be set on it. What is checked is that
+    // WFP honours its own add-time rule; a pass is not evidence that Hole's
+    // provider survives a BFE start, and the module doc must not be read as
+    // claiming it does.
+    //
+    // The question that assertion is often mistaken for — does Hole's
+    // `serviceName`-less provider come back DISABLED after a reboot, taking the
+    // PERSISTENT kill switch with it? — needs `FwpmProviderGetByKey0` against a
+    // provider that outlived a boot. Nothing in a single-boot lane can produce
+    // one.
+    //
+    // Nor does a clear bit adjudicate "removed" versus "disabled" for boot-time
+    // filters: it is simply a different bit. That is why
+    // `lockdown_pre_delete_guids` re-arms under both readings rather than
+    // choosing one.
     assert!(
         !probe.is_disabled(),
-        "FWPM_FILTER_FLAG_DISABLED is set on a freshly-added boot-time filter. Microsoft \
-         documents that flag as unsettable at add time and as meaning the PROVIDER was disabled \
-         at BFE start for want of an auto-start service name — so this is either an undocumented \
-         boot-time meaning or evidence that Hole's provider is disabled, which would also make \
-         the persistent kill switch inert across a reboot\n{evidence}"
+        "FWPM_FILTER_FLAG_DISABLED is set on a filter added moments ago, which Microsoft says \
+         cannot happen (\"this flag cannot be set when adding new filters\"). Either that rule is \
+         wrong or the bit carries an undocumented boot-time meaning\n{evidence}"
     );
 
     // Q3, the one that can brick a machine: the delete must genuinely find and
@@ -608,21 +575,22 @@ fn boottime_global_net_state_every_engage_rearms_the_twins_instead_of_reporting_
         );
     }
 
-    // The DISABLED bit read on BOTH lifetimes under the same provider. This is
-    // what disambiguates the flag: Microsoft documents it as a PROVIDER
-    // property ("a provider's filters are disabled when the BFE starts if the
-    // provider has no associated Windows service name"), so if it were ever set
-    // it would be set on both. Seeing it on the boot-time half alone would mean
-    // an undocumented boot-time meaning; seeing it on both would mean Hole's
-    // provider is one BFE disables, which would break the persistent kill
-    // switch across a reboot too.
+    // The DISABLED bit on the PERSISTENT half, checked for the same narrow
+    // reason the probe test checks it on the boot-time half: these filters were
+    // added by this process moments ago, so BFE has not started since they
+    // existed and Microsoft says the bit "cannot be set when adding new
+    // filters". This asserts that rule holds.
+    //
+    // It is NOT a check that Hole's `serviceName`-less provider survives a BFE
+    // start — that needs a provider which outlived a reboot, which no
+    // single-boot lane can produce. See the `windows.rs` module doc, which
+    // records that question as open rather than pretending this covers it.
     for (guid, _, flags) in &second_floor {
         assert_eq!(
             flags & windows::Win32::NetworkManagement::WindowsFilteringPlatform::FWPM_FILTER_FLAG_DISABLED.0,
             0,
-            "FWPM_FILTER_FLAG_DISABLED is set on the PERSISTENT block-all {guid:?}; Hole's provider \
-             names no Windows service, and if that is what BFE disables then the kill switch does not \
-             survive a reboot at all\n{evidence}"
+            "FWPM_FILTER_FLAG_DISABLED is set on the PERSISTENT block-all {guid:?}, which was added \
+             moments ago — Microsoft says that flag cannot be set at add time\n{evidence}"
         );
     }
 }

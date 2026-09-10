@@ -64,15 +64,15 @@
 //! `fort_prov_init_boot_filters`, against `FORT_GUID_SUBLAYER` in
 //! `fort_prov_init_persist_filters`) — and only the sublayer half of that is a
 //! boot-time choice: `FORT_PROV_INIT_FILTER_ARGS` in
-//! `src/driver/common/fortprov.c` has no `providerKey` field at all, so EVERY
-//! Fort filter is provider-less and its provider tells us nothing about
-//! boot-time either way. `boottime_privileged_tests` settles it for our
+//! `src/driver/common/fortprov.c` (read at an unpinned upstream revision) has
+//! no `providerKey` field at all — on that reading every Fort filter is
+//! provider-less, so its provider tells us nothing about boot-time either way. `boottime_privileged_tests` settles it for our
 //! containers on the real firewall, and this is what it returned: WFP accepts
 //! the add, and the stored record carries `FWPM_FILTER_FLAG_BOOTTIME` (not
 //! `PERSISTENT`), our `providerKey` and our `subLayerKey`.
 //!
 //! Two implementations DECLINED boot-time, which belongs in the survey beside
-//! the three that took it. `wireguard-windows` defines
+//! the three that took it (TinyWall, Mullvad, Fort). `wireguard-windows` defines
 //! `cFWPM_FILTER_FLAG_BOOTTIME` in `tunnel/firewall/types_windows.go` and never
 //! uses it — `blocker.go` runs a fully DYNAMIC session under a per-run random
 //! provider GUID, so nothing it installs outlives the process, let alone a
@@ -80,8 +80,9 @@
 //! `FWPM_SESSION_FLAG_DYNAMIC` under the comment "Add temporary filters which
 //! don't survive reboots or crashes". Neither is a neutral omission for us:
 //! wireguard-windows is the source of this file's own weight-arbitration
-//! recipe, cited above, so it was read closely and its silence here is a
-//! choice. Both are also solving a narrower problem — neither ships an opt-in
+//! recipe, cited above, so it was read closely — which is grounds for trusting
+//! that the survey did not simply MISS a boot-time usage, not grounds for
+//! claiming its authors weighed boot-time and rejected it. Both are also solving a narrower problem — neither ships an opt-in
 //! always-on kill switch meant to hold across an arbitrary reboot, which is the
 //! requirement that makes `PERSISTENT`-only insufficient in the first place.
 //!
@@ -106,9 +107,10 @@
 //! — a total egress block with no exemptions, not a scaled-down version of the
 //! cover BFE later installs. It is egress-only all the same, since the twins
 //! sit on `ALE_AUTH_CONNECT_V4`/`_V6` and nothing is added at `RECV_ACCEPT`.
-//! Blocks-only matches both shipped precedents — Fort's four boot-time filters
-//! and Mullvad's four are all `BLOCK`, neither ships a boot-time permit —
-//! though both also cover `RECV_ACCEPT`, which we do not.
+//! Blocks-only matches every shipped precedent whose boot-time rule set could
+//! be read: Fort's four boot-time filters and Mullvad's four are all `BLOCK`,
+//! and none of the three that ship boot-time filters ships a boot-time PERMIT.
+//! Fort and Mullvad also cover `RECV_ACCEPT`, which we do not.
 //!
 //! **What that block does to the machine around it is NOT analysed here, and
 //! saying so is the point.** The twins are [`Condition::Any`] +
@@ -152,10 +154,13 @@
 //! That delete is the one failure this design could not survive, so it is
 //! measured rather than argued: a boot-time filter is EXCLUDED from the
 //! default enumeration view (`FWP_FILTER_ENUM_FLAG_BOOTTIME_ONLY` /
-//! `..._INCLUDE_BOOTTIME` exist to opt in; Microsoft's sample ORs the latter
-//! together with `..._INCLUDE_DISABLED`, and `enum_boottime` sets both — a
-//! disabled filter is excluded from the default view exactly as a boot-time
-//! one is). A by-key delete that could not see the boot-time view would return
+//! `..._INCLUDE_BOOTTIME` exist to opt in, and a disabled filter is excluded
+//! from the default view exactly as a boot-time one is — Microsoft's sample ORs
+//! `INCLUDE_BOOTTIME | INCLUDE_DISABLED` for that reason. `enum_boottime` needs
+//! the boot-time set specifically, so it uses `BOOTTIME_ONLY | INCLUDE_DISABLED`
+//! — a different pair from the sample's, which no Microsoft page documents as
+//! valid or invalid; that it enumerates successfully is measured on the
+//! elevated lane, not inherited from the sample). A by-key delete that could not see the boot-time view would return
 //! `FWP_E_FILTER_NOT_FOUND`, which [`first_delete_failure`] whitelists as
 //! benign — so `release_all` would report `Ok` over a host it never unblocked,
 //! breaking its "never a false success" clause.
@@ -174,8 +179,8 @@
 //! successful delete purges the record.
 //!
 //! **Where that false `Ok` is load-bearing, and it is not `release_all`'s
-//! logging.** #1009 makes `release_covers` → [`release_all`] the MSI's
-//! `Return="check"` uninstall gate: `Ok` means the installer proceeds and
+//! logging.** #1009 would make `release_covers` → [`release_all`] the MSI's
+//! `Return="check"` uninstall gate (proposed there, not yet landed): `Ok` means the installer proceeds and
 //! deletes `hole.exe`. [`swept_lockdown_guids`] does now include the twins, so
 //! they ARE reachable — but only while a live object exists. Uninstall on a
 //! boot where this bridge never engaged (the kill switch armed in an earlier
@@ -208,16 +213,27 @@
 //! branch is established here, so this file assumes the worse one for safety
 //! and claims the weaker one for coverage.
 //!
-//! **Size that worst case correctly — it is a boot-window outage, not a bricked
-//! machine.** Both Microsoft readings agree the filter stops applying once BFE
-//! starts ("disabled" and "removed" differ on the mechanism, not on that), so a
-//! stranded twin blocks egress from tcpip.sys until BFE and then stops: seconds,
-//! every boot, before anything user-facing is on the network. #998 and #1008
-//! both describe the hazard as "a permanent block-all with no way to remove
-//! it", and that overstates it by the whole length of a session — a user with a
-//! stranded twin and no stranded PERSISTENT filter has a working network as soon
-//! as BFE is up. (The PERSISTENT half is the one that can strand a machine
-//! indefinitely, and it is not what this change adds.)
+//! **Size that worst case correctly.** Both Microsoft readings agree the filter
+//! stops applying once BFE starts ("disabled" and "removed" differ on the
+//! mechanism, not on that), so a stranded twin blocks egress from tcpip.sys
+//! until BFE and then stops: seconds, every boot. #998 and #1008 both describe
+//! the hazard as "a permanent block-all with no way to remove it", and for the
+//! BOOT-TIME half that overstates it by the whole length of a session — a user
+//! with a stranded twin and no stranded PERSISTENT filter has a working network
+//! as soon as BFE is up. (The PERSISTENT half is the one that can strand a
+//! machine indefinitely, and it is not what this change adds.)
+//!
+//! That recalibration is CONDITIONAL on the unanalysed question above, and the
+//! two must be read together: it holds only for a host whose boot does not
+//! itself need egress before BFE. On a machine that PXE- or iSCSI-boots, or
+//! unlocks a volume against a network key server, a hard total-egress block in
+//! that window could stop the boot from reaching BFE at all — and a boot that
+//! never reaches BFE never reaches the thing that would lift the block, which
+//! IS the bricked machine this paragraph otherwise rules out. So: "boot-window
+//! outage, not a bricked machine" for an ordinary workstation; unestablished,
+//! and potentially much worse, for a network-booted one. Neither #998 nor #1008
+//! currently distinguishes the two, and that is the correction to make in both
+//! directions rather than trading one overstatement for another.
 //!
 //! The genuinely unrecoverable case is narrower and worth naming on its own:
 //! **BFE failing to start.** Then `FwpmEngineOpen0` fails, [`release_all`] and
@@ -226,9 +242,10 @@
 //! because the only removal API needs the engine that is down.
 //!
 //! Out-of-band escape, stated at the confidence it deserves: `netsh wfp` has NO
-//! delete verb — `capture`, `dump`, `set options`, `show` and nothing else — so
-//! the usual "recover with `netsh wfp`" advice does not apply to any WFP filter,
-//! boot-time or otherwise. The plausible hatches are `netsh wfp reset` (which
+//! verb that deletes an individual filter. Its verbs are `capture`, `dump`,
+//! `help`, `set` (capture options only), `show` and `reset` — none of which
+//! takes a filter key — so the usual "recover with `netsh wfp`" advice does not
+//! apply to any WFP filter, boot-time or otherwise. The plausible hatches are `netsh wfp reset` (which
 //! restores default WFP policy) and removing
 //! `HKLM\SYSTEM\CurrentControlSet\Services\BFE\Parameters\Policy\BootTime`,
 //! where boot-time filter blobs are reported to live. **Neither is verified
@@ -281,8 +298,8 @@
 //!   is undocumented. Fort Firewall's use of the DEFAULT SUBLAYER for its
 //!   boot-time filters — and only for those, against its own sublayer for the
 //!   persistent ones — is at least consistent with treating that as a hazard.
-//!   Its provider-less-ness is not evidence either way: Fort names no provider
-//!   on any filter (see the container discussion above).
+//!   Its provider-less-ness is not evidence either way: on the reading above,
+//!   Fort names no provider on any filter, boot-time or not.
 //! - Whether a twin covers boots after the one following its install — the
 //!   re-provisioning question above, restated.
 //!
@@ -299,13 +316,28 @@
 //! provider has no associated Windows service name, or if the associated
 //! service is not set to auto-start", and it "cannot be set when adding new
 //! filters" — so it is not the bit "Basic Operation" means when it says a
-//! boot-time filter is disabled at BFE start. Measured on both lifetimes, and
-//! CLEAR on both: a freshly added boot-time twin reads back `flags == 0x2`,
-//! `FWPM_FILTER_FLAG_BOOTTIME` alone. It is asserted anyway, because if it were
-//! ever SET that would mean Hole's service-name-less provider is one BFE
-//! disables, and the PERSISTENT half of the kill switch would not survive a
-//! reboot either — a bigger finding than #998, and not one to learn from a user
-//! report.
+//! boot-time filter is disabled at BFE start.
+//!
+//! Measured clear on both lifetimes (`flags` read back as `0x2` —
+//! `FWPM_FILTER_FLAG_BOOTTIME` alone — on the one elevated host this was taken
+//! on; the ASSERTION is only that `DISABLED` and `PERSISTENT` are clear, since
+//! WFP may set flags of its own such as `INDEXED` on other builds). **Be
+//! precise about how little that buys**. Both reads are taken on filters this same process added seconds
+//! earlier, so BFE has not started since they existed and the bit can only read
+//! clear — the assertion checks that WFP honours its own "cannot be set when
+//! adding new filters" rule, and nothing more. It is NOT evidence that Hole's
+//! provider survives a BFE start.
+//!
+//! That question is real and is NOT answered here. [`add_provider`] passes no
+//! `serviceName` (`FWPM_PROVIDER0::serviceName` is left NULL by
+//! `..Default::default()`), which is the first of the two conditions Microsoft
+//! names for a provider whose filters BFE disables at startup. If that rule
+//! applies as written, the PERSISTENT half of the kill switch comes back
+//! disabled at every boot — bigger than #998 and not introduced by it. The read
+//! that could settle it inside one boot is `FwpmProviderGetByKey0` →
+//! `FWPM_PROVIDER_FLAG_DISABLED` against a provider that SURVIVED a reboot; a
+//! provider created in this session cannot answer it, which is why no assertion
+//! here attempts to.
 //!
 //! `boottime_privileged_tests` proves, within one boot: the add is accepted
 //! under our containers and stored with them; a by-key delete of a LIVE twin
@@ -493,6 +525,34 @@ fn lockdown_pre_delete_guids() -> Vec<GUID> {
     let mut guids = adopt_delete_guids();
     guids.extend_from_slice(&LOCKDOWN_BOOTTIME_BLOCK_ALL_GUIDS);
     guids
+}
+
+/// What to call a [`lockdown_pre_delete_guids`] entry in an error message.
+///
+/// [`first_delete_failure`] renders `"{what} delete failed: 0x{code:08x}"`, and
+/// since a failing pre-delete now ABORTS a kill-switch-armed start, that string
+/// is the entire diagnostic an operator gets. One shared label across all six
+/// keys would make three unrelated root causes — a dead TUN LUID, a changed
+/// server, a spent boot-time twin — indistinguishable. Pure and total, so
+/// `every_pre_delete_guid_has_its_own_label` can check the mapping without FWPM.
+fn pre_delete_label(guid: &GUID) -> &'static str {
+    if LOCKDOWN_BOOTTIME_BLOCK_ALL_GUIDS.contains(guid) {
+        "boot-time block-all twin"
+    } else if LOCKDOWN_TUN_GUID_INDICES
+        .iter()
+        .any(|&i| LOCKDOWN_FILTER_GUIDS[i] == *guid)
+    {
+        "TUN-LUID permit"
+    } else if LOCKDOWN_SERVER_GUID_INDICES
+        .iter()
+        .any(|&i| LOCKDOWN_FILTER_GUIDS[i] == *guid)
+    {
+        "server-IP permit"
+    } else {
+        // Unreachable for anything `lockdown_pre_delete_guids` yields, and
+        // asserted so. A future pre-delete entry lands here until it is named.
+        "unnamed lockdown pre-delete key"
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1022,10 +1082,18 @@ pub fn engage_lockdown(
             // Failing is also the safe direction: the transaction aborts, so
             // whatever was in force stays in force, and `install_lockdown` is
             // fail-fatal in `ProxyManager`.
+            //
+            // DELIBERATE SCOPE: this fatality covers all six pre-delete keys,
+            // not only the two #998 adds. The four volatile permits previously
+            // degraded silently on a non-benign delete — a stale TUN LUID or a
+            // stale server IP surviving inside a cover that reports `Ok` — and
+            // that is the same false success, one object over. Widening it is
+            // the point, not a side effect. `pre_delete_label` keeps the
+            // resulting error able to say which of the six it was.
             let pre_delete_codes: Vec<(&'static str, u32)> = spec
                 .pre_delete
                 .iter()
-                .map(|g| ("lockdown pre-delete", FwpmFilterDeleteByKey0(engine, g)))
+                .map(|g| (pre_delete_label(g), FwpmFilterDeleteByKey0(engine, g)))
                 .collect();
             if let Some(e) = first_delete_failure(&pre_delete_codes) {
                 return Err(e);
@@ -1842,16 +1910,20 @@ pub(crate) mod boottime_probe {
         with_engine(|engine| unsafe { FwpmFilterDeleteByKey0(engine, &key) })
     }
 
-    /// Drop the PERSISTENT provider + sublayer [`add`] had to create to hang
-    /// its filter off. Without this the probe leaves two persistent FWPM
-    /// container objects behind on whatever machine ran it — invisible,
-    /// harmless (an empty sublayer holds no traffic), and still residue a
-    /// developer never asked for on their own box.
+    /// Drop the PERSISTENT provider + sublayer the probe's filter hangs off.
+    /// Without this the probe leaves two persistent FWPM container objects
+    /// behind on whatever machine ran it — invisible, harmless (an empty
+    /// sublayer holds no traffic), and still residue a developer never asked
+    /// for on their own box.
     ///
-    /// Best-effort and correctly so: the delete FAILS while any Hole cover
-    /// filter still references them, which is exactly the case where they must
-    /// not be removed. Mirrors `delete_all`'s ordering — filters first, then
-    /// sublayer, then provider.
+    /// It does not follow that the probe CREATED them: [`add`] goes through
+    /// [`ok_or_exists`], so on a host that already had a cover they were
+    /// already there. That is exactly why this is best-effort and why the
+    /// codes are discarded — both deletes fail with `FWP_E_IN_USE` while any
+    /// filter still references the containers, which is the case where they
+    /// must not be removed. Sublayer before provider, matching `delete_all`;
+    /// the filter delete that must precede both is the caller's, immediately
+    /// above.
     #[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
     pub(crate) fn delete_containers() {
         let _ = with_engine(|engine| unsafe {
