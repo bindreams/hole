@@ -577,6 +577,37 @@ jobs:
   # client transports ex-ray can't select (uTLS, hysteria2) are exercised here
   # since the plugin-e2e roundtrips can only drive ws-tls + QUIC. Single linux
   # runner: the gate logic is platform-independent (domainsocket is !windows).
+  # `.github/renovate.json` is only ever executed by Renovate's own bot, so a
+  # typo in it (`matchDepNamez`, a number where a duration string belongs) is
+  # silently ignored rather than reported anywhere this repo can see. The
+  # schemars pin depends on one of those rules actually applying — see
+  # xtask/src/schemars_pin.rs, which checks that the rule is *effective* but
+  # takes its schema for granted. This is the other half: the rule exists, and
+  # it is spelled in a way Renovate accepts. Linux and ~15s; deliberately not
+  # folded into `Lint`, which is a Windows job with a Rust toolchain it does not
+  # need.
+  renovate-config:
+    name: Validate renovate config
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v6
+        with:
+          node-version: lts/*
+
+      # No file argument: the validator discovers `.github/renovate.json` itself
+      # and validates it as a *repository* config. Naming the file explicitly
+      # makes it validate as a global config instead, which accepts a different
+      # option set and would pass configs Renovate rejects at runtime.
+      #
+      # Unpinned on purpose, and the one place in this repo where that is the
+      # correct answer: the bot that reads this config is always Renovate's
+      # latest release, so validating against anything older would assert a
+      # schema nothing uses. `--strict` makes warnings fatal.
+      - name: Validate .github/renovate.json
+        run: npx --yes --package renovate renovate-config-validator --strict
+
   test-ex-ray:
     name: Test ex-ray (Go)
     runs-on: ubuntu-latest

@@ -235,6 +235,15 @@ pub enum Command {
     /// `prek.toml` as an `always_run` local hook (`pass_filenames = false`
     /// — it always operates on the whole repo).
     CheckVendoringIntegrity,
+    /// Check that `typify` is still the reason `schemars` is pinned to 0.8, and
+    /// that the artefacts holding that pin still do so.
+    ///
+    /// The superset of the `schemars_pin_still_tracks_typify` conformance test:
+    /// it adds `typify-impl`'s *declared* requirement, read via `cargo
+    /// metadata`, which the test cannot source because it runs from a nextest
+    /// archive with no registry. Wired into `prek.toml` as the
+    /// `check-schemars-pin` hook. See `xtask/src/schemars_pin.rs`.
+    CheckSchemarsPin,
     /// Run all `cargo xtask <step>` commands required for a runnable build.
     ///
     /// Currently: `ex-ray` + `galoshes` + `wintun` + `golangci-lint`.
@@ -406,6 +415,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
         }
         Command::FinishVendorBump { path, dep_name, tag } => run_finish_vendor_bump(path, dep_name, tag),
         Command::CheckVendoringIntegrity => run_check_vendoring_integrity(),
+        Command::CheckSchemarsPin => schemars_pin::verify(&repo_root()?),
         Command::Deps => run_deps(),
         Command::Version { group, check, exact } => run_version(group, check, exact),
         Command::Build { target, all } => run_build(target, all),

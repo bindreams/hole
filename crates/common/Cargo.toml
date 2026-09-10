@@ -66,9 +66,13 @@ typify = "0.6"
 # the series typify speaks — `typify-impl` requires `^0.8.22`. 0.9 and 1.x both
 # made the `schema` module private, so a bump fails the build script with E0603
 # (#379, closed as upstream-blocked; oxidecomputer/typify#886 upstream).
-# Renovate is told the same in `.github/renovate.json`, and
-# `schemars_pin_still_tracks_typify` fails when typify's requirement moves so
-# neither claim outlives the fact.
+# Renovate is told the same in `.github/renovate.json`, and xtask's
+# `schemars_pin` guard fails when the fact moves, so neither claim outlives it:
+# `schemars_pin_still_tracks_typify` reads the schemars version typify resolved
+# against out of Cargo.lock and checks this line against its own PINNED_SERIES,
+# and the `check-schemars-pin` prek hook additionally reads typify's declared
+# requirement from `cargo metadata` — the half that catches upstream widening,
+# which the lockfile cannot show.
 schemars = "0.8"
 serde_json = "1"
 yaml_serde = "0.10"
