@@ -925,8 +925,9 @@ they permit.
 
 Both are deliberately **persistent** WFP filters, surviving an update-cutover
 restart on purpose (Windows: the standing lockdown cover's block-all is
-ADDITIONALLY boot-time, closing a window `PERSISTENT` alone cannot — see
-[Lockdown mode](#lockdown-mode)). The Windows DNS-egress confinement
+ADDITIONALLY twinned by a boot-time filter, aimed at a window `PERSISTENT`
+alone cannot reach — see [Lockdown mode](#lockdown-mode) for what that is
+measured to do and what it is not). The Windows DNS-egress confinement
 ([`tun_engine::dns_confine`](crates/tun-engine/src/dns_confine.rs), see
 [DNS forwarder](#dns-forwarder)) is the opposite: a **dynamic**, process-scoped
 FWPM session that dies with the engine handle, including on an abnormal exit —
@@ -1187,40 +1188,66 @@ second bit, and WFP documents the hand-off between them as atomic. Every
 permit, including loopback, stays `PERSISTENT`-only: a boot-time permit either
 carries a runtime-discovered value nothing can refresh pre-BFE, or has no
 hand-off to its narrower persistent counterpart — and the leak this closes is
-network egress, not loopback.
+network egress, not loopback. So the boot→BFE window gets the block and nothing
+else: no loopback, TUN, server or App-ID permit, a total egress block rather
+than a scaled-down copy of the cover BFE later installs. Egress-only all the
+same — the twins sit on `ALE_AUTH_CONNECT_V4`/`_V6`, nothing at `RECV_ACCEPT`.
 
 Two things that decide whether this is safe are undocumented by WFP, so they
 are **measured on the real firewall** by
 [`boottime_privileged_tests.rs`](crates/tun-engine/src/routing/failclosed/boottime_privileged_tests.rs)
-rather than argued: whether a boot-time filter keeps the provider and sublayer
-it was added under (if it does not, sweeping boot-time filters by provider
-enumeration — [#1008](https://github.com/bindreams/hole/issues/1008) — is
-impossible for them), and whether `FwpmFilterDeleteByKey0` genuinely removes
-one. The second is the dangerous one: the default enumeration view *excludes*
-boot-time filters, so a delete that could not see them would return
-`FWP_E_FILTER_NOT_FOUND` — which `first_delete_failure` whitelists — and
-`release_all` would report success over a still-blocked host. That probe filter
-is deliberately a *permit* on an RFC 5737 documentation address, never a block,
-so the test cannot itself brick the machine it is ruling out bricking.
+rather than argued, in the elevated `tun` lane, with no reboot. The dangerous
+one is deletion: the default enumeration view *excludes* boot-time filters, so
+a delete that could not see them would return `FWP_E_FILTER_NOT_FOUND` — which
+`first_delete_failure` whitelists — and `release_all` would report success over
+a still-blocked host. The probe filter is deliberately a *permit* on an RFC
+5737 documentation address, never a block, so the test cannot itself brick the
+machine it is ruling out bricking.
 
-**Not settled by any test, and not claimed:** whether the kernel enforces the
-filter during the boot→BFE window, and whether a by-key delete purges the
-on-disk boot-time record so it does not reappear at the next boot. Both need a
-real reboot; no CI runner offers one, the same disclosed limit
-`a_simulated_reboot_rearms_the_cover` carries on macOS. Microsoft's own pages
-disagree on the underlying mechanic — `FwpmFilterAdd0`'s Remarks say boot-time
-filters are "removed" once BFE finishes initializing; the "Basic Operation of
-WFP" page says they are "disabled".
+**What that measurement returned**, for a boot-time filter added through the
+production `add_filter` under the covers' own persistent provider and sublayer:
+WFP accepted it; the stored record carries `FWPM_FILTER_FLAG_BOOTTIME` and not
+`FWPM_FILTER_FLAG_PERSISTENT`, our `providerKey` and our `subLayerKey`; and
+`FwpmFilterDeleteByKey0` returned `ERROR_SUCCESS` (not `FWP_E_FILTER_NOT_FOUND`)
+after which the filter was gone from the boot-time view.
 
-A stranded boot-time leftover also has no self-healing path the way a stranded
-persistent one does: BFE re-adds a persistent leftover every start regardless
-of which build is running, so a later GUID-aware build can still reach it by
-key, while a boot-time leftover is reprovisioned from an on-disk record
-independent of the live FWPM session — an older binary that never learned its
-GUID can never find it. Bounding that is
-[#1008](https://github.com/bindreams/hole/issues/1008), and its
-provider-enumeration mechanism is only viable if the measurement above says
-boot-time filters keep their provider.
+**Its limit, which must travel with the result.** The probe's enumeration
+template names *no provider* — deliberately, since filtering by ours would make
+"the record dropped its provider" and "there is no record" the same empty
+answer. So what is proven is that the stored record *carries* our `providerKey`,
+**not** that a `BOOTTIME_ONLY` template filtered *by* `providerKey` returns it.
+Those are one step apart and
+[#1008](https://github.com/bindreams/hole/issues/1008) needs the second. The
+result rules out the outcome that would have made #1008 impossible; it does not
+demonstrate #1008's mechanism.
+
+**Not settled by any test, and not claimed.** Everything above holds *within a
+single boot* — that is the whole reach of the elevated lane, which does not
+reboot, and there is no reboot-capable elevated lane to add the case to. Green
+CI on this change is not coverage of any of: whether the kernel enforces a twin
+during the boot→BFE window (the twins name a provider and sublayer that BFE
+itself provisions, so what the pre-BFE kernel does with them is not merely
+unmeasured but undocumented); whether a by-key delete purges the underlying
+boot-time record rather than the runtime copy; and whether a twin covers boots
+after the one following its install. Microsoft's own pages disagree on the
+underlying mechanic — `FwpmFilterAdd0`'s Remarks say boot-time filters are
+"removed" once BFE finishes initializing; the "Basic Operation of WFP" page says
+they are "disabled" — and, more to the point, **neither addresses
+re-provisioning at later boots at all**. That is silence, not contradiction, and
+it stays recorded as silence rather than resolved by picking the convenient
+reading.
+
+A stranded boot-time leftover has no self-healing path the way a stranded
+persistent one does: BFE re-adds a persistent leftover at every start whatever
+build is running, so a later GUID-aware build can still reach it by key, while
+nothing any build runs re-adds a boot-time one — an older binary that never
+learned its GUID cannot find it. How much that matters rides on the same
+unanswered re-provisioning question, and it cuts both ways: if a record is
+re-provisioned every boot, the twins work every boot *and* a stranded one blocks
+every boot forever; if it is spent after one, the hazard mostly evaporates and
+so does most of the protection. Hole assumes the worse branch for safety and
+claims the weaker one for coverage. Bounding the hazard is
+[#1008](https://github.com/bindreams/hole/issues/1008).
 
 It contrasts with the [transient cutover cover](#transient-cutover-cover) on
 three axes:
@@ -1361,9 +1388,12 @@ Disclosed residuals:
    `Unreadable` intent, never inferred.
 
    `Live` means **any residue**, not the whole cover: the Windows sweeps loop
-   delete-by-key with every return code discarded over persistent filters, so
-   a sweep interrupted mid-loop survives a reboot as a partial cover that a
-   single-GUID probe would call `Absent` forever.
+   delete-by-key with every return code discarded, over the persistent filters
+   and — for lockdown — the boot-time twins in the same array, so a sweep
+   interrupted mid-loop leaves a partial cover that a single-GUID probe would
+   call `Absent` forever. The persistent half of such a residue certainly
+   survives a reboot; what the boot-time half does is the open question in
+   [Lockdown mode](#lockdown-mode).
 
    `Adopt` never disengages the cover, on either platform. The server-permit
    volatile-refresh it used to perform moved into `engage_lockdown`, which

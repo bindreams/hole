@@ -17,7 +17,13 @@
 //!    not assumed: if WFP stores the boot-time record with a NULL provider or
 //!    the default sublayer, then sweeping boot-time filters by provider
 //!    enumeration (#1008) is impossible by construction, and the cover's
-//!    weight-based arbitration does not apply to them.
+//!    weight-based arbitration does not apply to them. Note the exact shape of
+//!    what a pass here buys: the template below names no provider (see
+//!    `boottime_probe::enum_boottime` for why), so this measures that the
+//!    stored record CARRIES our `providerKey` — not that a `BOOTTIME_ONLY`
+//!    template filtered BY `providerKey` returns it. #1008 needs the second.
+//!    Passing rules out the one answer that would make #1008 impossible; it
+//!    does not show #1008's mechanism works.
 //! 3. **Does `FwpmFilterDeleteByKey0` actually remove it?** The default
 //!    enumeration/get view EXCLUDES boot-time filters
 //!    (`FWP_FILTER_ENUM_FLAG_BOOTTIME_ONLY` / `..._INCLUDE_BOOTTIME` exist to
@@ -39,12 +45,17 @@
 //! anyway. A boot-time BLOCK probe would have made this test the very
 //! machine-bricking failure it exists to rule out.
 //!
-//! What this CANNOT answer, and does not claim to: whether the kernel actually
-//! ENFORCES the filter during the boot→BFE window, and whether the by-key
-//! delete purges the on-disk boot-time record so the filter does not reappear
-//! at the NEXT boot. Both need a real reboot, which no CI runner offers — the
-//! same disclosed limit `a_simulated_reboot_rearms_the_cover` carries on
-//! macOS. `netsh wfp show boottimepolicy` is the manual cross-check for the
+//! What this CANNOT answer, and does not claim to. Every observation here is
+//! made inside ONE boot: this lane does not reboot, and there is no
+//! reboot-capable elevated lane to add the case to, so a pass says nothing
+//! about whether the kernel actually ENFORCES the filter during the boot→BFE
+//! window, whether the by-key delete purges the underlying boot-time record so
+//! the filter does not reappear at the NEXT boot, or whether the record is
+//! re-provisioned at boots after that (Microsoft documents no answer to the
+//! last one either way — see the `windows.rs` module doc). Those need a real
+//! reboot, which no CI runner offers — the same disclosed limit
+//! `a_simulated_reboot_rearms_the_cover` carries on macOS.
+//! `netsh wfp show boottimepolicy` is the manual cross-check for the
 //! second one; [`boottime_policy_dump`] captures it into the failure message
 //! but nothing asserts on it, for the reason given on that function.
 //!
@@ -240,6 +251,9 @@ fn boottime_global_net_state_filter_is_accepted_keeps_its_containers_and_is_dele
         "add_filter must not also set PERSISTENT on a Boottime spec — the two flags are mutually \
          exclusive on one filter\n{evidence}"
     );
+    // Necessary for #1008, not sufficient: the template names no provider, so
+    // this says the record CARRIES our providerKey, not that a provider-filtered
+    // BOOTTIME_ONLY enumeration returns it. See the module doc's question 2.
     assert_eq!(
         probe.provider,
         Some(PROVIDER_GUID),

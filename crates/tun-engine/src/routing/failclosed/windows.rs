@@ -35,8 +35,8 @@
 //! PERSISTENT filters — NOT a dynamic session — so a coordinator crash
 //! mid-cutover leaves traffic blocked (fail-closed), not leaked; `recover_cover`
 //! sweeps them by their fixed GUIDs on the next bridge start. The standing
-//! lockdown cover's block-all pair additionally gets a BOOTTIME twin; see
-//! "Boot-time coverage" below.
+//! lockdown cover's block-all pair additionally gets BOOTTIME twins — two more
+//! filters, not two more bits; see "Boot-time coverage" below.
 //!
 //! ## Boot-time coverage (#998)
 //!
@@ -60,18 +60,29 @@
 //! boot-time blocks on the default sublayer (`FORT_GUID_EMPTY`, no provider),
 //! TinyWall installs each filter twice, PERSISTENT and BOOTTIME, both under
 //! its OWN persistent sublayer. `boottime_privileged_tests` settles it for our
-//! containers on the real firewall: it adds a boot-time filter under them and
-//! reads back what WFP stored. Whether the *provider* survives is what decides
-//! whether #1008's provider-enumeration sweep is possible for boot-time
-//! filters at all.
+//! containers on the real firewall, and this is what it returned: WFP accepts
+//! the add, and the stored record carries `FWPM_FILTER_FLAG_BOOTTIME` (not
+//! `PERSISTENT`), our `providerKey` and our `subLayerKey`.
+//!
+//! Carry the limit with that result wherever it is cited. The probe's
+//! enumeration template names NO provider, on purpose — see
+//! `boottime_probe::enum_boottime` — so what is proven is that the stored
+//! record CARRIES our `providerKey`, not that a `BOOTTIME_ONLY` template
+//! filtered BY `providerKey` returns it. #1008's sweep needs the second. The
+//! measurement rules out the outcome that would have made #1008 impossible; it
+//! does not demonstrate #1008's mechanism.
 //!
 //! The standing LOCKDOWN cover (kill switch) is meant to survive an arbitrary
 //! reboot — CONTRIBUTING.md's "Fail-closed cover" section — so
 //! `build_lockdown_spec` gives ONLY its block-all pair a `Boottime` twin
 //! (`LOCKDOWN_BOOTTIME_BLOCK_ALL_GUIDS`); every permit, including loopback,
-//! stays `Persistent`-only, so the boot→BFE window is a full block with no
-//! exemptions (as in Fort Firewall's shipped boot-time set: four blocks, no
-//! permits). Reasons a permit is NOT given a boot-time twin: (a) the TUN-LUID
+//! stays `Persistent`-only. Be precise about what that buys and what it costs:
+//! the twins carry the block and nothing else, so in the boot→BFE window there
+//! is no loopback permit, no TUN permit, no server permit and no App-ID permit
+//! — a total egress block with no exemptions, not a scaled-down version of the
+//! cover BFE later installs. It is egress-only all the same, since the twins
+//! sit on `ALE_AUTH_CONNECT_V4`/`_V6` and nothing is added at `RECV_ACCEPT`.
+//! Reasons a permit is NOT given a boot-time twin: (a) the TUN-LUID
 //! and server-IP permits carry values discovered at runtime — a boot-time copy
 //! would enforce whatever value was live at the PREVIOUS engage, stale by
 //! construction, since nothing runs before BFE to refresh it; (b) a boot-time
@@ -109,12 +120,21 @@
 //! that constant's CROSS-VERSION CONTRACT doc) is still reachable by a LATER
 //! GUID-aware build, because BFE keeps re-adding it every start regardless of
 //! which build is currently running. A stranded BOOT-TIME leftover has no
-//! such self-healing path: it is reprovisioned from an on-disk boot-time
-//! policy record at every boot, independent of the live FWPM session, so an
-//! OLDER binary that never learned a NEWER binary's boot-time GUID (a
-//! downgrade) can never find and delete it by key — it then enforces
-//! (including, if ever mis-scoped, blocking all egress) on every future boot,
-//! forever, with no automatic recovery. Bounding that risk needs a
+//! such self-healing path — nothing any later build runs puts it back, so
+//! whatever keeps it alive is a record no running Hole owns — and an OLDER
+//! binary that never learned a NEWER binary's boot-time GUID (a downgrade)
+//! cannot find it by key to delete it.
+//!
+//! How bad that is turns on the open question below — whether a boot-time
+//! policy record is re-provisioned at EVERY subsequent boot or applied only
+//! once — and the answer cuts both ways at once, which is the honest way to
+//! hold it. Re-provisioned: the twins do their job at every boot AND a
+//! stranded one enforces (including, if ever mis-scoped, blocking all egress)
+//! at every boot, forever, with no automatic recovery. Applied once: the
+//! hazard largely evaporates and so does most of the protection, since a twin
+//! installed in one session would cover the next boot and no other. Neither
+//! branch is established here, so this file assumes the worse one for safety
+//! and claims the weaker one for coverage. Bounding the risk needs a
 //! version-independent sweep (enumerate live filters by [`PROVIDER_GUID`]
 //! instead of a fixed array, deleting any that still carry
 //! `FWPM_FILTER_FLAG_BOOTTIME`) — tracked as #1008, deliberately NOT part of
@@ -124,21 +144,39 @@
 //! own, but must not ship in a release a user could downgrade from until
 //! #1008 lands.**
 //!
-//! **What no test here can reach.** Microsoft's own pages do not agree on
-//! what happens to a boot-time filter when BFE starts: `FwpmFilterAdd0`'s
-//! Remarks say boot-time filters "are removed once the BFE finishes
-//! initialization", while the "Basic Operation of WFP" page says twice that
-//! one is "disabled when BFE starts". Those are operationally different
-//! claims, and the difference matters for exactly one question this change
-//! cannot answer: whether a `FwpmFilterDeleteByKey0` against a live engine
-//! purges the underlying on-disk boot-time policy record — so the filter does
-//! not come back at the NEXT boot — or only clears the current runtime copy.
+//! **What no test here can reach.** EVERYTHING measured for #998 happens
+//! inside a SINGLE boot, because that is all the elevated Windows lane can
+//! do — it does not reboot, and no reboot-capable elevated lane exists to add
+//! the case to. Do not read this file's green CI as covering anything below.
+//!
+//! Microsoft's own pages do not agree on what happens to a boot-time filter
+//! when BFE starts: `FwpmFilterAdd0`'s Remarks say boot-time filters are
+//! "removed" once BFE finishes initializing, while the "Basic Operation of
+//! WFP" page says one is "disabled" when BFE starts. Those are operationally
+//! different claims. More to the point, NEITHER page — nor any other found —
+//! says what becomes of the underlying boot-time policy record at LATER boots:
+//! whether it is re-provisioned at every boot or applied once and spent. That
+//! is silence, not contradiction, and it is left stated as silence here rather
+//! than settled by picking the reading that suits the design.
+//!
+//! Three things follow that no test here settles:
+//!
+//! - Whether `FwpmFilterDeleteByKey0` against a live engine purges the
+//!   underlying record — so the filter does not come back at the NEXT boot —
+//!   or only clears the current runtime copy.
+//! - Whether the kernel actually ENFORCES a twin during the boot→BFE window.
+//!   Note this is not purely a matter of instrumentation: the twins name a
+//!   [`PROVIDER_GUID`]/[`SUBLAYER_GUID`] that BFE itself provisions, and what
+//!   the pre-BFE kernel does with a filter whose containers do not exist yet
+//!   is undocumented. Fort Firewall's choice of the default sublayer and no
+//!   provider is at least consistent with treating that as a hazard.
+//! - Whether a twin covers boots after the one following its install — the
+//!   re-provisioning question above, restated.
+//!
 //! `boottime_privileged_tests` proves the delete succeeds and the filter
-//! leaves the boot-time view within one boot; only a real reboot can prove it
-//! stays gone across one, and no CI runner reboots (the same disclosed limit
-//! `a_simulated_reboot_rearms_the_cover` carries on macOS). Nor can anything
-//! here prove the kernel actually ENFORCES the filter during the boot→BFE
-//! window — that is the reboot question too.
+//! leaves the boot-time view within one boot; only a real reboot proves it
+//! stays gone across one (the same disclosed limit
+//! `a_simulated_reboot_rearms_the_cover` carries on macOS).
 
 use std::net::IpAddr;
 use std::path::Path;
@@ -1119,14 +1157,26 @@ impl Cover {
     /// never run.
     ///
     /// Safe because no object this cover installs is owned by the engine
-    /// session: `engage`/`engage_lockdown` open a NON-dynamic session, the
-    /// provider and sublayer carry `FWPM_*_FLAG_PERSISTENT`, and every filter
-    /// carries a lifetime flag of its own — `PERSISTENT`, or `BOOTTIME` for
-    /// the lockdown block-all twins ([`FilterLifetime`]). Only a filter with
-    /// NEITHER flag, in a dynamic session, would die with the handle. That is
-    /// what lets a LONG-LIVED caller keep the host covered without leaking a
-    /// handle per call: `std::mem::forget` alone, which this replaces, leaked
-    /// one on every armed reload for the life of the process.
+    /// session, and that turns on the SESSION, not on any filter's flags:
+    /// `engage`/`engage_lockdown` pass no `FWPM_SESSION0`, so the session is
+    /// NON-dynamic, and only a dynamic session's objects are deleted when it
+    /// ends. Every filter here would outlive the handle whatever lifetime flag
+    /// it carried.
+    ///
+    /// The lifetime flags decide a different question — which objects survive
+    /// a BFE restart or a reboot — and the two halves answer it differently.
+    /// The provider, the sublayer and every `Persistent` filter carry
+    /// `FWPM_*_FLAG_PERSISTENT`, so BFE re-adds them at every start; that half
+    /// is what still covers the running host after this returns. The lockdown
+    /// block-all `Boottime` twins ([`FilterLifetime`]) are NOT re-added by BFE
+    /// and are not in force while it runs, so they add nothing to the coverage
+    /// being handed off here; they exist for a later boot's pre-BFE window
+    /// (module doc's "Boot-time coverage" — what about that is measured, and
+    /// what is not, is recorded there).
+    ///
+    /// That is what lets a LONG-LIVED caller keep the host covered without
+    /// leaking a handle per call: `std::mem::forget` alone, which this
+    /// replaces, leaked one on every armed reload for the life of the process.
     pub(crate) fn detach(self) {
         // SAFETY: `self.engine` is a live FWPM engine handle owned solely by
         // this guard, and `self` is consumed here, so it cannot be closed twice.
@@ -1270,6 +1320,17 @@ pub(crate) fn classify_presence(engine_opened: bool, codes: &[u32]) -> crate::ro
 /// EXISTING filter's DACL is permitted unelevated is not established by that
 /// measurement, and does not need to be: `classify_presence` yields `Absent`
 /// for no code but the literal not-found, so a denied read is `Indeterminate`.
+///
+/// [`swept_lockdown_guids`] now also yields the two boot-time block-all GUIDs,
+/// so they are queried here — but do NOT read that as presence detecting a
+/// boot-time filter. The boot-time view is opt-in for ENUMERATION
+/// (`FWP_FILTER_ENUM_FLAG_INCLUDE_BOOTTIME`) and `FwpmFilterGetByKey0` has no
+/// such opt-in; whether a by-key GET sees a boot-time record is unmeasured
+/// (`boottime_privileged_tests` captures that read into its evidence dump but
+/// asserts nothing on it). It costs nothing either way: a boot-time twin is
+/// only ever added and deleted alongside the `Persistent` block-all beside it,
+/// and `classify_presence` answers `Live` on ANY success, so an invisible twin
+/// changes no verdict this function can reach.
 #[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
 pub fn lockdown_cover_presence(_state_dir: &Path) -> crate::routing::CoverPresence {
     unsafe {
