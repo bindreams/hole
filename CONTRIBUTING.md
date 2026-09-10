@@ -1098,17 +1098,25 @@ milliseconds.
   no state file is needed. The FWPM FFIs are clippy-disallowed outside this module.
 
 - **macOS** ([`routing/failclosed/macos.rs`](crates/tun-engine/src/routing/failclosed/macos.rs)):
-  `pfctl -E` (refcounted) + a self-contained ruleset loaded over stdin (`pfctl -f -`, absolute `/sbin/pfctl` — this runs as root, so a PATH-resolved bare `pfctl` is a hardening gap). Disengage restores `/etc/pf.conf` and drops the refcount (`pfctl -X <token>`). The token is persisted to `bridge-failclosed.json` *before* the
-  blocking ruleset loads, so recovery can `-X` it cleanly. Caveat: restore reloads
+  `pfctl -E` (refcounted) + a self-contained ruleset loaded over stdin (`pfctl -f -`, absolute `/sbin/pfctl` — this runs as root, so a PATH-resolved bare `pfctl` is a hardening gap; pinning it is **one of ~35** equally exposed root spawns, alongside `routing.rs`'s 32 bare `route` sites, `device/ipv6_addr/macos.rs`'s `ifconfig` and the bridge's `NETWORKSETUP`, so it reduces no net attack surface on its own — widening it is tracked separately). Disengage restores `/etc/pf.conf` and drops the refcount (`pfctl -X <token>`). The token is persisted to `bridge-failclosed.json` *before* the
+  blocking ruleset loads, so recovery can `-X` it cleanly — and a persist that
+  *fails* unwinds the `-E` with `pfctl -X` before propagating, the same
+  symmetry `engage_lockdown`'s `FreshEnable`/`Reenable` arms already had; without
+  it pf stays enabled under an unreferenced token until reboot, with no state
+  file for `recover_cover` to return it from. Caveat: restore reloads
   the on-disk `/etc/pf.conf`, not a snapshot of a live ruleset (matches wg-quick).
   **No `-Fa`** (bindreams/hole#997): `pfctl -Fa -f -` (the standing lockdown cover
   never did this) is two separate, separately-committed kernel operations — flush,
   then load — leaving a pass-all host briefly live between them, including across
   a cover TRANSITION (a second `engage` replacing a still-live one with no
   intervening `disengage`). A bare `pfctl -f -` load is one atomic pf transaction
-  (`DIOCADDRULE` stages into an inactive ruleset under a ticket, `DIOCXCOMMIT`
-  swaps it in atomically under `pf_lock`), so the previously-loaded ruleset stays
-  authoritative until the new one fully commits. pf has no programmatic API and no
+  **for the rules** (`DIOCADDRULE` stages into an inactive ruleset under a ticket,
+  `DIOCXCOMMIT` swaps it in atomically under `pf_lock`), so the previously-loaded
+  ruleset stays authoritative until the new one fully commits. The `set` lines are
+  outside that ticket: `pfctl` applies `set block-policy` / `skip` / `limit` /
+  `timeout` through their own immediate ioctls as it parses. No hole opens either
+  way — neither `block-policy drop` nor `skip on lo0` is a permit — but the
+  atomicity claim covers the rules, not the options. pf has no programmatic API and no
   published kernel source this repo can read, so that atomicity claim is an
   inference from `pfctl`'s documented ticket behaviour, not a fact read out of the
   kernel; `macos_failclosed_cover_transition_never_admits_blocked_flow`
@@ -1127,40 +1135,71 @@ milliseconds.
   production helper this fix hardened) are a separate, disclosed inconsistency
   (bindreams/hole#1005), and unchanged by this fix.
 
-  **Neither cover purges pf state** (bindreams/hole#1015, disclosed, not fixed
-  here). pf matches the state table *before* the ruleset (`pf_test` calls
-  `pf_test_state_*` and reaches `pf_test_rule` only on `s == NULL`), and
-  `DIOCXCOMMIT` leaves `tree_id` untouched — a state whose creating rule the
-  commit removed is kept alive by `rule->states`. So a flow that already holds a
-  state entry when a cover engages never reaches `block out all`. `-Fa` used to
-  purge state as a side effect of flushing everything; a bare `pfctl -f -` does
-  not. It bites wherever pf is enabled while a ruleset swap happens, and that
-  is **not only** when a third party (Docker, another VPN, Internet Sharing)
-  enabled it — Hole's own paths reach it too:
+  **Only the standing lockdown skips the pf state purge** (bindreams/hole#1015;
+  the transient half is closed, the lockdown half remains). pf matches the state
+  table *before* the ruleset (`pf_test` calls `pf_test_state_*` and reaches
+  `pf_test_rule` only on `s == NULL`), and `DIOCXCOMMIT` leaves `tree_id`
+  untouched — a state whose creating rule the commit removed is kept alive by
+  `rule->states`. So a flow that already holds a state entry when a cover engages
+  never reaches `block out all`, and it never expires on its own either:
+  `tcp.established` defaults to 86400s and every packet refreshes it, so a
+  long-lived upload, an SSH session or a WebSocket keeps running indefinitely.
+  `-Fa` used to purge state as a side effect of flushing everything; the bare
+  `pfctl -f -` that replaced it does not.
 
-  - a transient→transient TRANSITION, where `engage` alternates which server
-    is permitted: the old server's flows hold state and survive into a ruleset
-    that no longer permits them;
-  - a transient→lockdown transition: the transient cover permits the `ech-doh`
+  The **transient** cover therefore issues `pfctl -F states` immediately *after*
+  its load (never before — flushing first leaves a window in which state is gone
+  but the permissive ruleset being replaced is still live, so packets simply
+  re-create it). A host-wide flush is safe on that path specifically because
+  there is no tunnel of ours yet: the transient cover is engaged in
+  `hold_pending`, *before* `start_inner`. The reachable cases it closes:
+
+  - pf enabled by a third party (Internet Sharing, another VPN, a hand-run
+    `pfctl -e`) — the case with by far the widest blast radius;
+  - a transient→standing swap: the transient ruleset permits the `ech-doh`
     resolver on TCP/443 and the lockdown ruleset does not, so those flows
-    survive the swap;
+    would otherwise survive the swap;
+  - a **cross-process** transient engage over a still-live *standing* ruleset —
+    a new bridge's `engage()` after the outgoing bridge's `CoverGuard::disarm`
+    left the standing cover up;
   - a cold engage's own `-E`-then-load window, which briefly mints state under
-    the stale ruleset. Reordering does not fix this: load-then-enable mints no
-    state in the window but leaves the host fully unfiltered across it
+    the stale ruleset. Reordering does not fix that one (load-then-enable mints
+    no state in the window but leaves the host fully unfiltered across it
     instead, and it breaks persist-before-mutate — see "Enable before load"
-    below.
+    below); the purge does.
+
+  A transient→transient TRANSITION is **not** among them and cannot be:
+  `Posture::hold_pending` (`crates/bridge/src/proxy_manager.rs`) carries
+  `debug_assert!(matches!(self, Posture::Idle))` and its sole caller is guarded
+  by `if self.posture.pending().is_none()`, so two live transient covers never
+  coexist in production. The 24-transition privileged test constructs that shape
+  deliberately; nothing else does.
 
   A genuinely cold, never-enabled host has nothing to purge: pf creates no
   state while disabled (`pf_af_hook` bails on `!pf_is_enabled`), stock macOS
   ships pf loaded but not enabled, and `Cover::drop` returns the refcount to
-  zero between sessions. The standing lockdown has
-  the same gap and always has (it never used `-Fa`), which is the half that
-  matters for a kill switch; Windows shares it structurally, filtering at
-  `ALE_AUTH_CONNECT`/`RECV_ACCEPT` rather than per packet. Fixing it is deferred
-  because the blunt remedy does not generalize: `pfctl -F states` is host-wide,
-  and at `engage_lockdown` time that would kill Hole's own live tunnel. A
-  targeted kill needs `DIOCKILLSTATES`' `neg` flag, which macOS's `pfctl` CLI
-  cannot set — hence sequencing behind bindreams/hole#1002.
+  zero between sessions.
+
+  The **standing lockdown** keeps the gap, and always has (it never used `-Fa`).
+  That is the half that matters for a kill switch, and it is deferred rather than
+  fixed because the blunt remedy does not generalize: `pfctl -F states` →
+  `DIOCCLRSTATES` is host-wide with neither `psk_ifname` nor `psk_ownername` set,
+  and `engage_lockdown` runs with the tunnel LIVE, so a flush there kills the very
+  tunnel the switch protects. "Everything except the tunnel" needs
+  `DIOCKILLSTATES`' `psk_dst.neg`, which macOS's `pfctl` CLI has no flag to set —
+  hence sequencing behind bindreams/hole#1002. Windows shares the gap
+  structurally, filtering at `ALE_AUTH_CONNECT`/`RECV_ACCEPT` rather than per
+  packet.
+
+  Which kinds purge is one exhaustive match, `purges_state(CoverKind)`, and both
+  engages load through the same `load_cover_ruleset`, so the lockdown's "no
+  purge" is a decision the type carries rather than the absence of a call. The
+  transient purge is proven on the kernel by
+  `macos_failclosed_cover_state_purge_kills_a_flow_established_before_engage`
+  (privileged): it enables pf itself under a permissive keep-state ruleset,
+  establishes a real flow to a destination the cover blocks, engages, and reads
+  `pfctl -s state` back. A failed purge is logged, never propagated — engage
+  failure unwinds to a fully open host, which is strictly worse than the residue.
 
   **Enable before load, on a COLD engage too.** A cold engage (pf disabled at
   entry) looks like it wants the `-Fa` treatment — `-E` and `-f -` are two
@@ -1187,10 +1226,14 @@ milliseconds.
   continuous never-admit assertion the transitions get, and the split is
   structural rather than a concession. Before a cold engage the host carries no
   cover and is *supposed* to be open — the test's own baseline requires it — so
-  there is no property to violate in the pre/mid-engage window, and instrumented
-  CI confirmed it: every leak the strict form reported latched at the cold
-  engage while all 24 transitions passed clean. The window is also not
-  closable in any ordering, since `-E` and `-f -` are separate process
+  there is no property to violate in the pre/mid-engage window. The instrumented
+  CI run supports exactly this much: the strict form's *first* leak latched at
+  phase 0, the cold engage. It cannot support "all 24 transitions passed clean" —
+  `leaked_at_phase` is a `compare_exchange` from `usize::MAX`, so once phase 0
+  latched, a leak in any later transition was invisible to it; and `phase` is
+  read at connect-*completion* time, so a SYN emitted before the cold engage that
+  completed milliseconds later is attributed to phase 0 regardless. The window is
+  also not closable in any ordering, since `-E` and `-f -` are separate process
   invocations and nothing is filtered at all while pf is disabled. The strict
   assertion stays strict because the prober pool starts only after the cold
   post-condition is settled: from the first prober SYN the host is known
@@ -1198,6 +1241,20 @@ milliseconds.
   thread probes a *permitted* server at the same short timeout across the same
   run, so a `PROBER_TIMEOUT` too small to complete any handshake on the runner
   fails the test instead of passing it vacuously.
+
+  **The guard prints its own sensitivity.** Every real failure it has caught was
+  the cold `-E`→load window: two process spawns, tens of milliseconds. The `-Fa`
+  window it exists for is a flush ioctl plus a stdin parse plus
+  `DIOCADDRULE`/`DIOCXCOMMIT` inside one process — plausibly sub-millisecond —
+  and the positive control's `control_hits > 0` proves only that the 20ms budget
+  is not impossible, not that detection is likely. The test-and-`-Fa`-removal
+  also landed in one commit, so no red-then-green against `-Fa` exists. So the
+  run now reports `control_hits`/`control_attempts` and the pool's aggregate
+  probe rate as a mean interval between SYNs, and `.config/nextest.toml` gives
+  the test `success-output` so the line survives a PASS. Read that interval
+  against the window being guarded before treating a green as evidence; the fix
+  for an underpowered result is to say so, not to widen `PROBER_TIMEOUT` until
+  the control passes.
 
 Each platform splits a pure, unit-tested rule/spec builder (transient:
 `build_cover_spec` / `build_pf_ruleset`; lockdown: `build_lockdown_spec` /

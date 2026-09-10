@@ -496,6 +496,206 @@ fn release_all_restore_confirmed_requires_a_successful_exit_status() {
     ));
 }
 
+// engage_with =========================================================================================================
+
+/// [`EngageOps`] test double: records every call by method name and returns a
+/// per-method injectable result, so an engage's ordering, its state purge and
+/// its unwind on a failed persist are asserted without shelling out to
+/// `pfctl`. `token` is what `enable_capture_token` hands back, so the unwind
+/// assertions can check the refcount that was dropped is the one that was
+/// taken.
+#[derive(Default)]
+struct RecordingEngageOps {
+    log: Vec<&'static str>,
+    pf_enabled: bool,
+    token: String,
+    dropped: Vec<String>,
+    restored: Vec<String>,
+    fail_save_transient: bool,
+    fail_load_ruleset: bool,
+    fail_flush_states: bool,
+}
+
+impl EngageOps for RecordingEngageOps {
+    fn pf_enabled(&mut self) -> Result<bool, RoutingError> {
+        self.log.push("pf_enabled");
+        Ok(self.pf_enabled)
+    }
+
+    fn enable_capture_token(&mut self) -> Result<String, RoutingError> {
+        self.log.push("enable_capture_token");
+        Ok(self.token.clone())
+    }
+
+    fn save_transient(&mut self, _st: &state::FailClosedState) -> Result<(), RoutingError> {
+        self.log.push("save_transient");
+        if self.fail_save_transient {
+            Err(RoutingError::RouteSetup("mock save_transient failure".into()))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn load_ruleset(&mut self, _text: &str) -> Result<(), RoutingError> {
+        self.log.push("load_ruleset");
+        if self.fail_load_ruleset {
+            Err(RoutingError::RouteSetup("mock load_ruleset failure".into()))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn flush_states(&mut self) -> Result<(), RoutingError> {
+        self.log.push("flush_states");
+        if self.fail_flush_states {
+            Err(RoutingError::RouteSetup("mock flush_states failure".into()))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn drop_token(&mut self, token: &str) -> Result<(), RoutingError> {
+        self.log.push("drop_token");
+        self.dropped.push(token.to_owned());
+        Ok(())
+    }
+
+    fn transient_restore(&mut self, token: &str) {
+        self.log.push("transient_restore");
+        self.restored.push(token.to_owned());
+    }
+}
+
+fn recording_engage_ops() -> RecordingEngageOps {
+    RecordingEngageOps {
+        token: "424242".into(),
+        ..Default::default()
+    }
+}
+
+#[skuld::test]
+fn the_state_purge_is_decided_per_cover_kind() {
+    // The transient cover engages in `hold_pending`, BEFORE `start_inner`, so a
+    // host-wide flush has no tunnel of ours to kill. `engage_lockdown` runs with
+    // the tunnel live and `DIOCCLRSTATES` is host-wide, so it must not purge
+    // until a targeted kill is reachable (bindreams/hole#1015 / #1002).
+    assert!(
+        purges_state(CoverKind::Transient),
+        "the transient cover must purge pf state: pf matches state before rules, so a flow \
+         established before it engages otherwise keeps flowing past `block out all`"
+    );
+    assert!(
+        !purges_state(CoverKind::Lockdown),
+        "the standing lockdown must NOT purge pf state: the flush is host-wide and the tunnel \
+         it protects is already live"
+    );
+}
+
+#[skuld::test]
+fn a_transient_engage_purges_pf_state_after_loading_its_ruleset() {
+    // Order is the assertion, not just presence. Purging BEFORE the load leaves
+    // a window where state is gone but the permissive ruleset being replaced is
+    // still live, so packets simply re-create their state under it.
+    let mut ops = recording_engage_ops();
+    let token = engage_with(v4(), None, &mut ops).expect("engage_with");
+
+    assert_eq!(token, "424242");
+    assert_eq!(
+        ops.log,
+        vec![
+            "pf_enabled",
+            "enable_capture_token",
+            "save_transient",
+            "load_ruleset",
+            "flush_states",
+        ],
+        "the transient engage must read, enable, persist, load, THEN purge: {:?}",
+        ops.log
+    );
+}
+
+#[skuld::test]
+fn a_lockdown_engage_loads_its_ruleset_without_purging_pf_state() {
+    // The negative half of the same rule, on the code both engages share.
+    let mut ops = recording_engage_ops();
+    load_cover_ruleset(CoverKind::Lockdown, "block drop out quick all\n", &mut ops).expect("load");
+    assert_eq!(
+        ops.log,
+        vec!["load_ruleset"],
+        "the standing lockdown must load and stop — a host-wide purge there kills the live \
+         tunnel (bindreams/hole#1015, deferred to #1002): {:?}",
+        ops.log
+    );
+}
+
+#[skuld::test]
+fn a_failed_ruleset_load_never_purges_pf_state() {
+    // A failed load never committed, so there is no new policy for a purge to
+    // enforce — and the engage is about to reload /etc/pf.conf, under which the
+    // flows a purge would have killed are permitted anyway.
+    let mut ops = RecordingEngageOps {
+        fail_load_ruleset: true,
+        ..recording_engage_ops()
+    };
+    let err = engage_with(v4(), None, &mut ops).expect_err("a failed load must fail the engage");
+    assert!(err.to_string().contains("load_ruleset"), "{err}");
+    assert!(
+        !ops.log.contains(&"flush_states"),
+        "a load that never committed must not be followed by a purge: {:?}",
+        ops.log
+    );
+    assert_eq!(
+        ops.restored,
+        vec!["424242".to_string()],
+        "the failed engage must still restore the host"
+    );
+}
+
+#[skuld::test]
+fn a_failed_state_purge_does_not_fail_the_engage() {
+    // The cover is already live and blocking. Failing here would unwind to a
+    // fully open host — strictly worse than the #1015 residue the failed purge
+    // leaves behind.
+    let mut ops = RecordingEngageOps {
+        fail_flush_states: true,
+        ..recording_engage_ops()
+    };
+    let result = engage_with(v4(), None, &mut ops);
+    assert!(
+        result.is_ok(),
+        "a failed purge must not unwind a live, blocking cover into an open host: {result:?}"
+    );
+    assert!(ops.restored.is_empty(), "nothing to restore: {:?}", ops.restored);
+}
+
+#[skuld::test]
+fn a_failed_persist_unwinds_the_pf_enable_refcount() {
+    // `enable_capture_token` has already taken a refcount. `state::save` fails
+    // on a real, enumerated set of causes — unwritable state dir, full disk,
+    // failed chown — and without this unwind pf stays ENABLED under an
+    // unreferenced token until reboot, with no `bridge-failclosed.json` for
+    // `recover_cover` to return it from. `engage_lockdown`'s FreshEnable and
+    // Reenable arms already unwind on exactly this failure; this is the
+    // transient path's half of that symmetry.
+    let mut ops = RecordingEngageOps {
+        fail_save_transient: true,
+        ..recording_engage_ops()
+    };
+    let err = engage_with(v4(), None, &mut ops).expect_err("a failed persist must fail the engage");
+    assert!(err.to_string().contains("save_transient"), "{err}");
+    assert_eq!(
+        ops.dropped,
+        vec!["424242".to_string()],
+        "the refcount taken by `pfctl -E` must be dropped again: {:?}",
+        ops.log
+    );
+    assert!(
+        !ops.log.contains(&"load_ruleset"),
+        "persist-before-mutate: nothing may load once the persist failed: {:?}",
+        ops.log
+    );
+}
+
 // release_all_with ====================================================================================================
 
 /// `PfOps` test double: records every call (by method name) and returns a
@@ -1030,6 +1230,22 @@ fn an_empty_but_captured_baseline_still_restores_the_snapshot() {
 /// overlap that transition at all. `PROBER_THREADS` concurrent, short-timeout
 /// probers keep the number of in-flight SYNs high at every instant instead of
 /// only between a single thread's timeouts.
+///
+/// SENSITIVITY IS PRINTED, NOT ASSUMED. Every real failure this guard has
+/// caught was the cold `-E`→load window: two process spawns, tens of
+/// milliseconds. The `-Fa` window it was written for is narrower by orders of
+/// magnitude — a flush ioctl, a stdin parse and a `DIOCADDRULE`/`DIOCXCOMMIT`
+/// pair inside ONE process, plausibly sub-millisecond — and the positive
+/// control below only establishes that the 20ms budget is not *impossible*,
+/// never that detection is likely. Nothing here turns a green into a bound on
+/// the narrowest window that would still be caught. So the run prints its own
+/// numbers instead of leaving the green uninformative: the control's
+/// completed-connect ratio, and the pool's aggregate probe rate as a mean
+/// interval between SYNs. A window shorter than that interval is likelier to
+/// be missed than caught, and the printed line is what says which side of it
+/// the runner landed on. `.config/nextest.toml` gives this test
+/// `success-output` so the line survives a PASS, where nextest otherwise
+/// discards captured output.
 #[cfg(target_os = "macos")]
 #[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
 fn macos_failclosed_cover_transition_never_admits_blocked_flow() {
@@ -1151,6 +1367,11 @@ fn macos_failclosed_cover_transition_never_admits_blocked_flow() {
     // alternates its two targets instead of reading `phase`, so one of them is
     // always the currently-permitted one and it needs no synchronization with
     // the loop.
+    //
+    // It also RETURNS its attempt count, so the pass reports `hits/attempts`
+    // rather than only `hits > 0`: that ratio is this guard's stated
+    // sensitivity, and `> 0` alone cannot distinguish a budget that lands
+    // nearly every time from one that lands once in a whole run.
     let control_hits = Arc::new(AtomicUsize::new(0));
     let control = {
         let (control_hits, stop_control) = (control_hits.clone(), stop.clone());
@@ -1163,8 +1384,13 @@ fn macos_failclosed_cover_transition_never_admits_blocked_flow() {
                     control_hits.fetch_add(1, Ordering::SeqCst);
                 }
             }
+            attempts
         })
     };
+
+    // Wall clock spanning exactly the window the pool covers, so the printed
+    // probe rate is probes-per-second of the run the assertions are about.
+    let pool_started = std::time::Instant::now();
 
     for i in 1..=TRANSITIONS {
         phase.store(i, Ordering::SeqCst);
@@ -1183,14 +1409,30 @@ fn macos_failclosed_cover_transition_never_admits_blocked_flow() {
     }
 
     stop.store(true, Ordering::SeqCst);
+    let elapsed = pool_started.elapsed();
     let attempts: usize = probers
         .into_iter()
         .map(|p| p.join().expect("prober thread panicked"))
         .sum();
-    control.join().expect("control prober thread panicked");
+    let control_attempts = control.join().expect("control prober thread panicked");
     assert!(
         attempts > 0,
         "prober pool made no attempts at all — this test is vacuous"
+    );
+
+    // The guard stating its own sensitivity. Printed unconditionally (see the
+    // doc comment): a green with no number attached says only that nothing was
+    // caught, not that anything would have been.
+    let hits = control_hits.load(Ordering::SeqCst);
+    let control_rate = 100.0 * hits as f64 / control_attempts as f64;
+    let per_probe_us = elapsed.as_micros() as f64 / attempts as f64;
+    eprintln!(
+        "[sensitivity] macos_failclosed_cover_transition: control completed {hits}/{control_attempts} \
+         connects ({control_rate:.1}%) to a PERMITTED server within {PROBER_TIMEOUT:?}; the pool \
+         emitted {attempts} probes across {PROBER_THREADS} threads over {elapsed:?} = one probe per \
+         {per_probe_us:.0} us of wall clock. A leak window shorter than that interval is likelier to \
+         be missed than caught — compare it against the ~sub-millisecond `pfctl -f -` commit this \
+         test guards."
     );
 
     assert!(
@@ -1204,11 +1446,11 @@ fn macos_failclosed_cover_transition_never_admits_blocked_flow() {
     );
 
     assert!(
-        control_hits.load(Ordering::SeqCst) > 0,
-        "positive control: not one connect to a PERMITTED server ({SERVER_A}/{SERVER_B}) completed \
-         within {PROBER_TIMEOUT:?} across the whole run, so that budget cannot complete a handshake \
-         on this runner at all and the never-admitted assertion above held vacuously — raise \
-         PROBER_TIMEOUT rather than trusting the green"
+        hits > 0,
+        "positive control: not one of {control_attempts} connects to a PERMITTED server \
+         ({SERVER_A}/{SERVER_B}) completed within {PROBER_TIMEOUT:?} across the whole run, so that \
+         budget cannot complete a handshake on this runner at all and the never-admitted assertion \
+         above held vacuously — raise PROBER_TIMEOUT rather than trusting the green"
     );
 
     // The last cover's normal Drop restores /etc/pf.conf.
@@ -1218,5 +1460,115 @@ fn macos_failclosed_cover_transition_never_admits_blocked_flow() {
         restored.is_ok(),
         "final disengage must restore egress: {NON_PERMITTED}={:?}",
         restored.err().map(|e| e.kind()),
+    );
+}
+
+// pf state purge on a transient engage (bindreams/hole#1015, transient half) ==========================================
+
+/// Proves the behavioural half of [`purges_state`]: a flow that already holds
+/// a pf state entry when the transient cover engages does **not** survive it.
+///
+/// pf matches the state table before the ruleset, so without the purge this
+/// flow keeps running past `block out all` for as long as its entry lives —
+/// `tcp.established` defaults to 86400s and every packet refreshes it, so a
+/// long-lived upload, an SSH session or a WebSocket never expires at all. The
+/// unit tests next door assert the `pfctl` sequence; this one asserts the
+/// kernel consequence, which is the property that actually matters.
+///
+/// **Staging the precondition is the whole setup.** A state entry exists only
+/// if pf saw the packet while pf was ENABLED (`pf_af_hook` bails on
+/// `!pf_is_enabled`), and stock macOS ships pf loaded but never enabled. So the
+/// test stands in for the third party that enabled it — Internet Sharing,
+/// another VPN, a hand-run `pfctl -e` — with its own `pfctl -E` plus a
+/// permissive keep-state ruleset, exactly the case #1015 calls its case 2. The
+/// `-E` refcount this takes is returned at the end; the cover's own `-E`/`-X`
+/// pair nests inside it, so pf's enable state is exactly as this test found it
+/// once both are released.
+///
+/// Asserted on the STATE TABLE (`pfctl -s state`) rather than on whether the
+/// held socket still carries traffic: the state entry is the thing pf consults
+/// before the ruleset, so its absence is the property directly, with no
+/// dependence on a remote peer choosing to answer.
+#[cfg(target_os = "macos")]
+#[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
+fn macos_failclosed_cover_state_purge_kills_a_flow_established_before_engage() {
+    use std::net::TcpStream;
+    use std::time::Duration;
+
+    // Same reliable anycast pair the transition test above uses, and for the
+    // same reason (see its doc): the cover's permits are IP-based, so the flow
+    // that must die has to be a real routable destination the cover blocks.
+    const PERMITTED: &str = "1.1.1.1";
+    const NON_PERMITTED_IP: &str = "8.8.8.8";
+    const NON_PERMITTED: &str = "8.8.8.8:443";
+    // External-event bound: a remote host that might not answer, surfaced to a
+    // human — not a sync sleep. Same 5s the neighbouring cover tests use.
+    const SETTLED_TIMEOUT: Duration = Duration::from_secs(5);
+
+    let states = || {
+        pfctl_stdout(
+            pfctl(&["-s", "state"], None, BestEffortPhase::RecoverCover),
+            "pfctl -s state",
+        )
+        .expect("pfctl -s state")
+    };
+
+    // 1. Stand in for the third party that already enabled pf, under a ruleset
+    //    that creates state for everything. RAII, so EVERY exit path — a failed
+    //    assertion included — reloads /etc/pf.conf and returns the refcount;
+    //    otherwise a red run leaves the runner with pf enabled under a pass-all
+    //    ruleset and an unreferenced token until reboot. Declared first, so it
+    //    unwinds after the cover and the socket below.
+    struct HostPfStandIn(String);
+    impl Drop for HostPfStandIn {
+        fn drop(&mut self) {
+            let _ = pfctl(&["-f", PFCONF], None, BestEffortPhase::RecoverCover);
+            let _ = pfctl(&["-X", &self.0], None, BestEffortPhase::RecoverCover);
+        }
+    }
+    let enabled = pfctl(&["-E"], None, BestEffortPhase::RecoverCover).expect("pfctl -E");
+    let _host_pf = HostPfStandIn(
+        parse_enable_token(&String::from_utf8_lossy(&enabled.stderr))
+            .or_else(|| parse_enable_token(&String::from_utf8_lossy(&enabled.stdout)))
+            .expect("pfctl -E must print an enable token"),
+    );
+    let permissive = pfctl(
+        &["-f", "-"],
+        Some(b"pass out all keep state\npass in all keep state\n"),
+        BestEffortPhase::RecoverCover,
+    )
+    .expect("load the permissive pre-cover ruleset");
+    assert!(
+        permissive.status.success(),
+        "the permissive pre-cover ruleset must load: {}",
+        String::from_utf8_lossy(&permissive.stderr).trim()
+    );
+
+    // 2. Establish the flow the cover must kill, and HOLD it open — a closed
+    //    socket's state would drain on its own and prove nothing.
+    let _flow = TcpStream::connect_timeout(&NON_PERMITTED.parse().unwrap(), SETTLED_TIMEOUT)
+        .unwrap_or_else(|e| panic!("NETWORK/ENVIRONMENT problem (not the cover): must reach {NON_PERMITTED}: {e:?}"));
+    assert!(
+        states().contains(NON_PERMITTED_IP),
+        "PRECONDITION: pf must hold a state entry for the flow before the cover engages, or this \
+         test proves nothing — pf enabled and a keep-state ruleset loaded, yet `pfctl -s state` \
+         does not name {NON_PERMITTED_IP}"
+    );
+
+    // 3. Engage the transient cover over that live flow, and read the state
+    //    table back while the cover is still the loaded ruleset.
+    let dir = tempfile::tempdir().unwrap();
+    let cover = engage(PERMITTED.parse().unwrap(), None, dir.path(), None).expect("engage the transient cover");
+    let after = states();
+    // Restore before asserting: a failure must not leave the machine behind a
+    // block-all cover while the panic unwinds.
+    drop(cover);
+
+    assert!(
+        !after.contains(NON_PERMITTED_IP),
+        "a flow to {NON_PERMITTED_IP} still held a pf state entry after the transient cover \
+         engaged — pf matches state BEFORE rules, so it keeps flowing past `block out all` until \
+         the entry expires (`tcp.established` default 86400s, refreshed per packet). \
+         `pfctl -s state` after engage:\n{after}"
     );
 }
