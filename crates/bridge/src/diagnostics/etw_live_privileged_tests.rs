@@ -266,10 +266,11 @@ fn periodic_tick_rewarns_after_a_transient_failure_recovers() {
 /// `join()` after this call — with nothing to return for.
 ///
 /// This is the *consequence* half of the backstop's coverage: it reaches
-/// `stop_session_by_name` through `trace: None` because that is the one guard
-/// state where the session outlives the drop, and asserts the session is gone
-/// afterwards. The *branch* half — that a real `Err` from `trace.stop()` also
-/// reaches the backstop — is
+/// `stop_session_by_name` through `trace: None` — a state production never
+/// builds (`start_consumer_named` always fills it), and the only one we can
+/// deterministically construct in which the session outlives the drop — and
+/// asserts the session is gone afterwards. The *branch* half — that a real
+/// `Err` from `trace.stop()` also reaches the backstop — is
 /// `etw_guard_drop_falls_back_to_the_by_name_stop_when_usertrace_stop_errs`,
 /// whose session is already stopped by the time the backstop runs and so
 /// cannot prove this.
@@ -336,10 +337,18 @@ fn etw_guard_drop_stops_a_session_usertrace_stop_left_running() {
 }
 
 /// The healthy path must leave nothing behind either, and must not need the
-/// backstop to do it: `UserTrace::stop` issued STOP, so re-issuing it by name
-/// would only log a second, confusing line about a session already gone.
+/// backstop to do it: reaching it would add an unbounded synchronous
+/// `ControlTraceW` to every shutdown, the cost class of bindreams/hole#1016.
 /// Driven through a real [`EtwGuard`] — session, processing thread and stats
 /// timer — from `start_consumer_for_test`.
+///
+/// Captures at DEBUG: a backstop that ran here would find the session already
+/// stopped by handle and take `stop_session_by_name`'s `debug!` arm, invisible
+/// to the INFO capture the tests above use. All three of that function's arms
+/// are asserted absent, so "the backstop did not run" rests on no guess about
+/// which one a stray call would take — the `info!` arm needs a *live* session,
+/// which a successful `UserTrace::stop` has just ruled out, and its assertion
+/// is the canary for that assumption.
 #[cfg(target_os = "windows")]
 #[skuld::test(labels = [TUN], serial = TUN)]
 fn etw_guard_drop_stops_the_session_it_started() {
@@ -351,7 +360,7 @@ fn etw_guard_drop_stops_the_session_it_started() {
         fmt::layer()
             .with_writer(writer.clone())
             .with_ansi(false)
-            .with_filter(tracing_subscriber::filter::LevelFilter::INFO),
+            .with_filter(tracing_subscriber::filter::LevelFilter::DEBUG),
     );
     let _guard = set_default_in_current_thread(subscriber);
 
@@ -371,13 +380,27 @@ fn etw_guard_drop_stops_the_session_it_started() {
     );
 
     let output = writer.snapshot_string();
-    assert!(
-        !output.contains("etw: stopped session by name"),
-        "the healthy path must not reach the by-name backstop; got:\n{output}"
-    );
+    // Root cause first: a genuine `trace.stop()` failure also trips the
+    // backstop assertions below, and diagnosing it as "reached the backstop"
+    // would name the symptom.
     assert!(
         !output.contains("etw: UserTrace::stop failed during drop"),
         "UserTrace::stop must succeed on the healthy path; got:\n{output}"
+    );
+    assert!(
+        !output.contains("etw: session already stopped"),
+        "the healthy path must not reach the by-name backstop -- this is the arm it would \
+         actually take, the session having just been stopped by handle; got:\n{output}"
+    );
+    assert!(
+        !output.contains("etw: stopped session by name"),
+        "the healthy path must not reach the by-name backstop -- reaching it and finding the \
+         session still live would mean UserTrace::stop's STOP never landed; got:\n{output}"
+    );
+    assert!(
+        !output.contains("etw: failed to stop session by name"),
+        "the healthy path must not reach the by-name backstop -- without this arm a reached \
+         backstop that got an unexpected error would pass both checks above; got:\n{output}"
     );
 }
 
@@ -394,15 +417,16 @@ fn etw_guard_drop_stops_the_session_it_started() {
 /// revert of the backstop for its only real scenario — and this is the one test
 /// that fails. (Keying `if !stop_issued` off `self.trace.is_none()` instead is
 /// *not* that revert: `self.trace.take()` has already emptied it, so the
-/// backstop still always runs.)
+/// backstop still always runs — `etw_guard_drop_stops_the_session_it_started`
+/// is what catches that one.)
 #[cfg(target_os = "windows")]
 #[skuld::test(labels = [TUN], serial = TUN)]
 fn etw_guard_drop_falls_back_to_the_by_name_stop_when_usertrace_stop_errs() {
     const PREFIX: &str = "hole-etw-live-stats-test-stop-errs-";
     crate::diagnostics::etw_sweep::sweep_sessions_with_prefix(PREFIX, "etw-test");
 
-    // DEBUG, not INFO like the tests above: the backstop's expected outcome
-    // against an already-stopped session is a `debug!`.
+    // DEBUG, not INFO: the backstop's expected outcome against an
+    // already-stopped session is a `debug!`.
     let writer = VecWriter::new();
     let subscriber = tracing_subscriber::registry().with(
         fmt::layer()
