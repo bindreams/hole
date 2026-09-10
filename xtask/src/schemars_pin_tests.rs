@@ -193,12 +193,53 @@ fn a_requirement_that_stops_short_of_the_series_top_no_longer_admits_patches() {
         "=0.8.22",
         ">=0.8, <0.8.30",
         "<=0.8.30",
+        // The input that separates the interval from a probe: a ceiling above
+        // every patch anyone would sample, and still a ceiling.
+        "<0.8.99999",
         // Nothing inside the series at all, from either side.
         ">=0.9",
         ">=2.0, <1.0",
+        // Pre-release-only ranges. Each sits inside `[0.8.0, 0.9.0)` by semver
+        // ordering while admitting no release at all — the tightest freeze
+        // there is, and the one a bounds check that ignores pre-releases calls
+        // healthy.
+        "=0.9.0-alpha",
+        "=0.9.0-0",
+        ">=0.9.0-alpha, <0.9.0",
+        "=0.8.22-rc.1",
     ] {
         assert!(!requirement_admits_series_patches(capped).unwrap(), "req: {capped}");
     }
+}
+
+/// Renovate reads `allowedVersions` through node-semver, which separates ANDed
+/// comparators with whitespace. Refusing that spelling reds a pin that works.
+#[skuld::test]
+fn an_npm_spaced_range_is_read_rather_than_refused() {
+    assert!(requirement_admits_series_patches(">=0.8.22 <0.9").unwrap());
+    assert_eq!(requirement_admits_beyond_pin(">=0.8.22 <0.9").unwrap(), None);
+    assert_eq!(
+        requirement_admits_beyond_pin(">=0.8 <2")
+            .unwrap()
+            .map(|v| v.to_string()),
+        Some("0.9.0".to_string())
+    );
+    check_renovate_rule(&renovate_config(&REAL_RULE.replace("<0.9", ">=0.8.22 <0.9"))).unwrap();
+}
+
+/// An OR range is a union of intervals and this guard carries one. Reading a
+/// single branch of `<0.9 || >=2` would call a range that readmits 2.x a pin,
+/// so it is refused — and the refusal has to say that, not that Renovate cannot
+/// read it.
+#[skuld::test]
+fn an_or_range_is_refused_as_a_union_this_guard_does_not_evaluate() {
+    let err = requirement_admits_beyond_pin("<0.9 || >=2").unwrap_err();
+    let message = err.to_string();
+    assert!(message.contains("OR range"), "unexpected error: {message}");
+    assert!(
+        !message.contains("is not a semver requirement range"),
+        "Renovate reads this range; the finding must not claim otherwise: {message}"
+    );
 }
 
 /// A range whose bounds cross admits nothing, so it admits nothing *beyond the
@@ -324,15 +365,15 @@ fn a_rule_scoped_to_the_wrong_manager_is_rejected() {
 /// the ones it can evaluate and rejects the rest rather than the other way
 /// round.
 ///
-/// Five of these are `--strict`-valid; the other four Renovate will not take
-/// from a repo config at all, which is the design working rather than a gap.
-/// `matchBaseBranches` needs a `baseBranchPatterns` to reference;
-/// `excludeDepNames`/`excludePackageNames` are migrated away (into
-/// `matchDepNames: ["schemars", "!schemars"]` — a spelling the guard *does*
-/// decide, and rejects); and `matchUpdateTypes` is refused outright beside a
-/// range: "packageRules cannot combine both matchUpdateTypes and
-/// allowedVersions". So the scopings that would silently kill this rule are
-/// largely unwritable, and the guard covers the rest.
+/// Five of these pass `--strict`; the other four do not, which is the design
+/// working rather than a gap. `matchUpdateTypes` is a hard error beside a range
+/// ("packageRules cannot combine both matchUpdateTypes and allowedVersions")
+/// and `matchBaseBranches` is one without a `baseBranchPatterns` to reference;
+/// `excludeDepNames`/`excludePackageNames` are schema-valid but require
+/// migration (into `matchDepNames: ["schemars", "!schemars"]`), which `--strict`
+/// fails on. So several of the scopings that would silently kill this rule
+/// cannot land here at all, and the guard covers the rest — including, as the
+/// entries below assert, the unmigrated spellings themselves.
 #[skuld::test]
 fn a_rule_scoped_by_a_selector_the_guard_cannot_evaluate_is_rejected() {
     for selector in [
@@ -411,7 +452,14 @@ fn a_file_name_glob_does_not_cross_a_path_separator() {
         let err = check_renovate_rule(&renovate_config(&rule_with(&selector)))
             .err()
             .unwrap_or_else(|| panic!("minimatch's `*` does not cross `/`, so {dead} is dead"));
-        assert!(err.to_string().contains("`matchFileNames`"), "unexpected error: {err}");
+        let message = err.to_string();
+        assert!(message.contains("`matchFileNames`"), "unexpected error: {message}");
+        // The `Unknown` bail names the selector too, so naming it is not enough
+        // to show the pattern was *decided* dead.
+        assert!(
+            !message.contains("cannot determine"),
+            "these are decidable exclusions, not unknowns: {message}"
+        );
     }
     for live in [
         "crates/**",
@@ -634,6 +682,63 @@ fn an_unclosed_regex_delimiter_is_a_dead_literal_glob() {
     );
 }
 
+/// Renovate passes minimatch neither `noext` nor a brace option, so extglob
+/// (`@()`, `?()`, `+()`, `*()`) and brace alternation are live syntax. Reading
+/// `@(schemars)` as a literal makes it select nothing — which turns a rule
+/// Renovate *does* apply into one the guard thinks is dead, the exact shape
+/// that lets a later widening rule through unnoticed.
+#[skuld::test]
+fn an_extglob_is_undecidable_rather_than_read_as_a_literal() {
+    for spelling in [
+        "@(schemars)",
+        "?(schemars)",
+        "+(schemars)",
+        "*(schemars)",
+        "schemar+(s)",
+    ] {
+        // As a later rule's selector: it reaches `schemars`, so its `<2` is
+        // what resolves, and the guard must not pass the config.
+        let later = format!(
+            r#"{{ "matchManagers": ["cargo"], "matchPackageNames": ["{spelling}"], "allowedVersions": "<2" }}"#
+        );
+        let err = check_renovate_rule(&format!(r#"{{ "packageRules": [ {REAL_RULE}, {later} ] }}"#))
+            .err()
+            .unwrap_or_else(|| panic!("Renovate applies {spelling} to schemars; the guard must not pass it"));
+        assert!(err.to_string().contains("cannot determine"), "unexpected error: {err}");
+    }
+    // Unprefixed parentheses are literal in minimatch, and stay literal here.
+    let parens = REAL_RULE.replace(
+        r#""matchDepNames": ["schemars"]"#,
+        r#""matchPackageNames": ["(schemars)"]"#,
+    );
+    let err = check_renovate_rule(&renovate_config(&parens)).expect_err("`(schemars)` is a literal, not a group");
+    assert!(
+        err.to_string().contains("no packageRule naming"),
+        "a bare paren is decided, not undecidable: {err}"
+    );
+}
+
+/// `matchRegexOrGlobList` buckets an entry as a negation on *one* leading `!`,
+/// but the predicate it then calls is minimatch's, and `parseNegate` consumes
+/// every `!` and toggles each time. So `!!foo` is filed under the negations
+/// while requiring a plain `foo` — and since it does not match, Renovate
+/// applies the rule to nothing. Stripping one `!` reads it as "everything
+/// except foo" and passes a dead pin.
+#[skuld::test]
+fn a_doubled_negation_is_not_read_as_a_single_one() {
+    let rule = REAL_RULE.replace(r#"["schemars"]"#, r#"["!!foo"]"#);
+    let err = check_renovate_rule(&renovate_config(&rule))
+        .expect_err("`!!foo` requires the dep to be `foo`, so the rule never reaches schemars");
+    assert!(
+        err.to_string().contains("no packageRule naming"),
+        "unexpected error: {err}"
+    );
+
+    // Doubled back onto the name itself, it selects, exactly as one `!` would not.
+    let live = REAL_RULE.replace(r#"["schemars"]"#, r#"["!!schemars"]"#);
+    check_renovate_rule(&renovate_config(&live)).expect("`!!schemars` is `schemars` with the sense toggled twice");
+}
+
 /// An absent `matchManagers` matches every manager, `cargo` among them. Not a
 /// mutation to reject — rejecting it would fail a config that works.
 #[skuld::test]
@@ -688,6 +793,16 @@ fn a_nested_rule_is_flattened_the_way_migration_flattens_it() {
          "packageRules": [ { "matchManagers": ["cargo"], "matchDepNames": ["schemars"], "allowedVersions": "<2" } ] }"#;
     let err = check_renovate_rule(&format!(r#"{{ "packageRules": [ {REAL_RULE}, {widening} ] }}"#))
         .expect_err("the joined `[npm, cargo]` still reaches schemars, and `<2` is last");
+    assert!(err.to_string().contains("admits 0.9.0"), "unexpected error: {err}");
+
+    // The direction that tells a join from a replacement: with the parent on
+    // `cargo` and the child on `npm`, replacing would leave `[npm]` and the
+    // rule would not reach schemars at all. Joining leaves `[cargo, npm]`,
+    // which does.
+    let joined = r#"{ "matchManagers": ["cargo"],
+         "packageRules": [ { "matchManagers": ["npm"], "matchDepNames": ["schemars"], "allowedVersions": "<2" } ] }"#;
+    let err = check_renovate_rule(&format!(r#"{{ "packageRules": [ {REAL_RULE}, {joined} ] }}"#))
+        .expect_err("`matchManagers` is mergeable, so the parent's `cargo` rides down onto the child");
     assert!(err.to_string().contains("admits 0.9.0"), "unexpected error: {err}");
 
     let replaced = r#"{ "matchFileNames": ["crates/**"],

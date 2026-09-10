@@ -337,19 +337,42 @@ impl SeriesReach {
 /// ceiling below the next series can block it. A bound's pre-release does not
 /// count towards that ceiling — `<=0.9.0-alpha` stops at an endpoint that
 /// already sorts above every `0.8.x` release, so it caps nothing.
+///
+/// Everything here is counted in *releases*. A pre-release is not a patch
+/// anyone can receive — Renovate does not propose one by default — so an
+/// interval that contains only pre-releases admits nothing, however non-empty
+/// it is as a set of versions. `=0.9.0-alpha` is the case that makes the
+/// difference visible: it sits inside `[0.8.0, 0.9.0)` by semver ordering, and
+/// reading that as "still admits the series" would call the tightest possible
+/// freeze a healthy pin.
 fn series_reach(req: &VersionReq) -> Result<SeriesReach> {
     let (floor, next) = pinned_bounds();
     let (lower, upper) = requirement_bounds(req)?;
-    let in_series_lower = tighter_lower(lower, Included(floor));
-    let in_series_upper = tighter_upper(upper.clone(), Excluded(next.clone()));
-    if is_empty(&in_series_lower, &in_series_upper) {
+    // The lowest in-series *release* at or above the floor this range sets.
+    let candidate = match &lower {
+        Unbounded => floor.clone(),
+        // A pre-release bound sorts below the release it names, so that release
+        // is the first one at or above it whether the bound is open or closed.
+        Included(bound) | Excluded(bound) if !bound.pre.is_empty() => {
+            Version::new(bound.major, bound.minor, bound.patch)
+        }
+        Included(bound) => bound.clone(),
+        Excluded(bound) => Version::new(bound.major, bound.minor, bound.patch + 1),
+    };
+    let lowest = std::cmp::max(candidate, floor);
+    let within_upper = match &upper {
+        Unbounded => true,
+        Included(bound) => lowest <= *bound,
+        Excluded(bound) => lowest < *bound,
+    };
+    if lowest >= next || !within_upper {
         return Ok(SeriesReach::Nothing);
     }
-    let above_series =
+    let reaches_tail =
         |bound: &Version| (bound.major, bound.minor, bound.patch) >= (next.major, next.minor, next.patch);
     Ok(match upper {
         Unbounded => SeriesReach::WholeTail,
-        Included(bound) | Excluded(bound) if above_series(&bound) => SeriesReach::WholeTail,
+        Included(bound) | Excluded(bound) if reaches_tail(&bound) => SeriesReach::WholeTail,
         Included(highest) => SeriesReach::CappedAt {
             highest,
             inclusive: true,
@@ -431,8 +454,44 @@ pub fn requirement_admits_series_patches(req: &str) -> Result<bool> {
     ))
 }
 
+/// Renovate reads `allowedVersions` for a cargo dependency through
+/// `modules/versioning/cargo`, which converts the range to npm's spelling and
+/// hands it to node-semver. node-semver separates ANDed comparators with
+/// whitespace; Rust's `semver` insists on a comma. `>=0.8.22 <0.9` is a working
+/// pin that `renovate-config-validator --strict` accepts, so rejecting it is a
+/// red on a config that holds — put the comma in rather than refuse to read it.
+///
+/// Only a separator is rewritten: the space in `>= 0.8.22` does not precede a
+/// comparator and is left alone.
+fn comma_separate(req: &str) -> String {
+    let mut out = String::with_capacity(req.len() + 4);
+    for (index, current) in req.char_indices() {
+        if current.is_whitespace() {
+            let follows_comparator = req[index..].trim_start().starts_with(['<', '>', '=', '^', '~', '*']);
+            let already_separated = out.trim_end().ends_with(',');
+            if follows_comparator && !already_separated && !out.trim().is_empty() {
+                out.push(',');
+            }
+        }
+        out.push(current);
+    }
+    out
+}
+
 fn parse_requirement(req: &str) -> Result<VersionReq> {
-    VersionReq::parse(req).with_context(|| {
+    // node-semver's `||` is a union of intervals; this guard carries one
+    // interval, and quietly reading only half of a union is how a range that
+    // readmits 2.x passes for a pin.
+    if req.contains("||") {
+        bail!(
+            "`{req}` is an OR range. Renovate reads `allowedVersions` through node-semver, which unions the \
+             alternatives, while this guard evaluates a single interval against the one PINNED_SERIES \
+             ({PINNED_SERIES}) names — so it would read at most one branch and could call a range that \
+             readmits the next series up a pin. Express the constraint as one range, or teach this check to \
+             union them."
+        );
+    }
+    VersionReq::parse(&comma_separate(req)).with_context(|| {
         format!(
             "`{req}` is not a semver requirement range. This guard compares the range's interval against the \
              one PINNED_SERIES ({PINNED_SERIES}) names, so it cannot read a regex or glob spelling; express \
@@ -791,6 +850,16 @@ impl Verdict {
             Verdict::Excluded
         }
     }
+
+    /// What a `!` in front of this entry makes of it. `Unknown` stays unknown:
+    /// negating an answer this guard does not have does not produce one.
+    fn negate(self) -> Verdict {
+        match self {
+            Verdict::Selected => Verdict::Excluded,
+            Verdict::Excluded => Verdict::Selected,
+            Verdict::Unknown => Verdict::Unknown,
+        }
+    }
 }
 
 /// `glob`'s reading of a minimatch pattern built the way Renovate builds every
@@ -841,14 +910,36 @@ fn expand_globstars(matcher: &str) -> String {
     out
 }
 
+/// Does minimatch read this pattern with syntax `glob` has no equivalent for?
+///
+/// Two constructs, both live in Renovate because it passes neither `noext` nor
+/// any brace option:
+///
+/// - **Brace alternation** (`{schemars,serde}`), which `glob` does not expand.
+/// - **Extglob** (`@(a|b)`, `?()`, `*()`, `+()`, `!()`) — a `(` under one of
+///   `?*+@!`. This one is the reason a bare `(` is *not* enough to disqualify a
+///   pattern: minimatch treats unprefixed parentheses as literal, and so does
+///   the literal branch below. `@(schemars)` selects `schemars`, but reading it
+///   as a literal makes it select nothing, which is a dead rule read as a live
+///   one.
+fn beyond_glob(matcher: &str) -> bool {
+    if matcher.contains(['{', '}']) {
+        return true;
+    }
+    matcher
+        .as_bytes()
+        .windows(2)
+        .any(|pair| pair[1] == b'(' && matches!(pair[0], b'?' | b'*' | b'+' | b'@' | b'!'))
+}
+
 /// Does one matcher entry select `subject`?
 ///
-/// Renovate accepts four spellings in a selector list: a literal, a minimatch
-/// glob, a delimited `/regex/` (optionally `/i`), and any of those under a `!`
-/// negation, which the caller splits off. All four are honoured —
-/// `.github/renovate.json` already spells `matchPackageNames` with globs.
-/// Anything undecidable here, such as a brace alternation `glob` does not
-/// expand, returns `Unknown` rather than a guess in either direction.
+/// Renovate accepts a literal, a minimatch glob, a delimited `/regex/`
+/// (optionally `/i`), and any of those under a `!` negation, which the caller
+/// splits off. All are honoured — `.github/renovate.json` already spells
+/// `matchPackageNames` with globs. A spelling this guard cannot decide, such as
+/// anything [`beyond_glob`] names, returns `Unknown` rather than a guess in
+/// either direction.
 ///
 /// The glob path is case-insensitive because every minimatch Renovate builds
 /// carries `nocase: true`; the regex path is not, because `parseRegexMatch`
@@ -875,7 +966,15 @@ fn matcher_selects(matcher: &str, subject: &str) -> Verdict {
         let flags = if matcher.ends_with('i') { "(?i)" } else { "" };
         return regex_selects(&format!("{flags}{body}"), subject);
     }
-    if matcher.contains(['{', '}']) {
+    if beyond_glob(matcher) {
+        return Verdict::Unknown;
+    }
+    // minimatch splits on `/` and matches segment by segment, so an empty
+    // segment is a segment that has to match. `glob` has no such notion:
+    // `crates/**/` selects nothing in minimatch and everything under
+    // `crates/` in `glob`. A leading empty segment (`/schemars`) is left
+    // alone — there the two already agree.
+    if matcher.contains("//") || (matcher.len() > 1 && matcher.ends_with('/')) {
         return Verdict::Unknown;
     }
     if !matcher.contains(['*', '?', '[', ']']) {
@@ -897,49 +996,67 @@ fn regex_selects(pattern: &str, subject: &str) -> Verdict {
     }
 }
 
+/// One entry's own predicate, the way `getRegexOrGlobPredicate` builds it.
+///
+/// Whether an entry is *filed* as a negation is a separate question from what
+/// its predicate says: `matchRegexOrGlobList` buckets on a single leading `!`,
+/// but the predicate it then calls is built from the whole spelling, and
+/// minimatch's `parseNegate` consumes *every* leading `!`, toggling each time.
+/// So `!!foo` is filed under the negations while its predicate is the plain
+/// `foo` — a positive requirement in the negative bucket. Stripping one `!` and
+/// assuming the sense flipped reads that as "everything except foo".
+fn entry_predicate(matcher: &str, subject: &str, bare_regex: bool) -> Verdict {
+    if bare_regex {
+        return regex_selects(matcher, subject);
+    }
+    // A delimited regex keeps its own `!` handling: `isRegexMatch` allows one
+    // optional `!` before the opening `/`, and `parseRegexMatch` strips exactly
+    // that one.
+    if let Some(body) = matcher.strip_prefix('!') {
+        if body.starts_with('/') && (body.ends_with('/') || body.ends_with("/i")) {
+            return matcher_selects(body, subject).negate();
+        }
+    }
+    let bare = matcher.trim_start_matches('!');
+    let toggles = matcher.len() - bare.len();
+    let hit = matcher_selects(bare, subject);
+    if toggles.is_multiple_of(2) {
+        hit
+    } else {
+        hit.negate()
+    }
+}
+
 /// Does a whole selector list select `subject`?
 ///
-/// Renovate's list semantics: positive entries are ORed, a list of only
-/// negations means "everything except", and a matching negation vetoes whatever
-/// the positives said.
-///
-/// An *empty* list is none of those. `matchRegexOrGlobList` opens
-/// `if (!patterns.length) return false`, and every matcher forwards to it once
-/// the key is present, so an emptied-out selector selects nothing — a rule that
-/// still reads exactly like the pin, still validates, and is dead. That is not
-/// the same as a list of only negations, where the positive check is skipped
-/// rather than failed.
+/// `matchRegexOrGlobList`, line for line: an empty list selects nothing; if
+/// there are positive entries at least one must hold; if there are negative
+/// entries every one of them must hold. A list of only negations therefore
+/// means "everything except", because the positive test is skipped rather than
+/// failed — and an *empty* list is not that case, it is the `if
+/// (!patterns.length) return false` on the first line, which leaves a rule that
+/// still reads exactly like the pin, still validates, and is dead.
 fn list_selects(matchers: &[Value], subject: &str, bare_regex: bool) -> Verdict {
     if matchers.is_empty() {
         return Verdict::Excluded;
     }
-    let mut positive: Option<Verdict> = None;
-    let mut negative = Verdict::Excluded;
+    // `some` over the positives, `every` over the negatives.
+    let (mut some_positive, mut every_negative): (Option<Verdict>, Option<Verdict>) = (None, None);
     for entry in matchers {
         let Some(matcher) = entry.as_str() else {
             return Verdict::Unknown;
         };
-        let (matcher, negated) = match matcher.strip_prefix('!') {
-            Some(rest) if !bare_regex => (rest, true),
-            _ => (matcher, false),
-        };
-        let hit = if bare_regex {
-            regex_selects(matcher, subject)
+        let holds = entry_predicate(matcher, subject, bare_regex);
+        // The bucket is chosen by one leading `!`, whatever the predicate says.
+        if !bare_regex && matcher.starts_with('!') {
+            every_negative = Some(every_negative.unwrap_or(Verdict::Selected).and(holds));
         } else {
-            matcher_selects(matcher, subject)
-        };
-        if negated {
-            negative = negative.or(hit);
-        } else {
-            positive = Some(positive.unwrap_or(Verdict::Excluded).or(hit));
+            some_positive = Some(some_positive.unwrap_or(Verdict::Excluded).or(holds));
         }
     }
-    let selected = positive.unwrap_or(Verdict::Selected);
-    match negative {
-        Verdict::Selected => Verdict::Excluded,
-        Verdict::Excluded => selected,
-        Verdict::Unknown => selected.and(Verdict::Unknown),
-    }
+    some_positive
+        .unwrap_or(Verdict::Selected)
+        .and(every_negative.unwrap_or(Verdict::Selected))
 }
 
 /// Would Renovate apply this packageRule to `schemars`, and if not — or if that
@@ -1102,8 +1219,10 @@ fn resolve_schemars(rules: &[Value]) -> Result<Resolved> {
             Some(Value::String(range)) => Some(range.clone()),
             Some(other) => bail!(
                 ".github/renovate.json's packageRule #{position} sets `allowedVersions` to {other}, which is \
-                 not a string. Renovate takes a semver range there and this guard evaluates it as one, so \
-                 there is nothing here to read."
+                 not a string. `allowedVersions` is a string option: a one-element array is migrated to one \
+                 (`config/migration.ts`) and anything else is rejected, and either way \
+                 `renovate-config-validator --strict` fails the config before this guard sees it. Spell it as \
+                 a bare range."
             ),
         };
         let enabled = rule.get("enabled").and_then(|v| v.as_bool());
@@ -1128,10 +1247,12 @@ fn resolve_schemars(rules: &[Value]) -> Result<Resolved> {
                 bail!(
                     ".github/renovate.json's packageRule #{position} sets \
                      `allowedVersions`/`enabled`/`ignoreDeps`, and this guard cannot determine whether \
-                     Renovate applies it to `{PIN_DEPENDENCY}`: it is scoped by `{selector}`, which this \
-                     module does not evaluate. A rule Renovate does not apply suppresses nothing while \
-                     looking exactly like one that does, so an unreadable selector must be taught to \
-                     `selector_subject` rather than assumed harmless.\nRule: {rule}"
+                     Renovate applies it to `{PIN_DEPENDENCY}`: `{selector}` settled it, either because \
+                     `selector_subject` does not know that key or because one of its entries is a spelling \
+                     this guard cannot decide (a brace alternation, an extglob, or a regex Rust will not \
+                     compile). A rule Renovate does not apply suppresses nothing while looking exactly like \
+                     one that does, so an unreadable selector must be taught here rather than assumed \
+                     harmless.\nRule: {rule}"
                 );
             }
             resolved.sidelined.push(format!("#{position} (`{selector}`)"));
