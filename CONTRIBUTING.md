@@ -1192,6 +1192,13 @@ network egress, not loopback. So the boot→BFE window gets the block and nothin
 else: no loopback, TUN, server or App-ID permit, a total egress block rather
 than a scaled-down copy of the cover BFE later installs. Egress-only all the
 same — the twins sit on `ALE_AUTH_CONNECT_V4`/`_V6`, nothing at `RECV_ACCEPT`.
+The twins carry fixed GUIDs and are **pre-deleted at every engage**
+(`lockdown_pre_delete_guids`), not merely re-added: a boot-time filter is spent
+by the boot it covered, and under the reading where the spent object survives
+with its key occupied, an add would hit `FWP_E_ALREADY_EXISTS`, `ok_or_exists`
+would report success, and the kill switch would arm once and then silently
+stop. Deleting the key first is correct under both readings of what BFE does.
+
 The twin-pair shape and the blocks-only choice both follow shipped precedent:
 Mullvad and TinyWall each install a rule twice, `BOOTTIME` and `PERSISTENT`,
 under their own persistent containers, and neither they nor Fort Firewall ship
@@ -1199,6 +1206,23 @@ a boot-time *permit*. Mullvad differs from Hole in when: its blocks go in as
 the daemon shuts down under a blocking policy and are swept by provider
 enumeration on the way back up, where Hole's go in at engage and stay while the
 kill switch is armed — a much wider window for a version skew to strand one.
+Two implementations declined boot-time entirely and belong in the same survey:
+`wireguard-windows` defines `cFWPM_FILTER_FLAG_BOOTTIME` and never uses it
+(`blocker.go` runs a fully dynamic session under a per-run random provider
+GUID), and OpenVPN's `wfp_block.c` sets `FWPM_SESSION_FLAG_DYNAMIC` under the
+comment "Add temporary filters which don't survive reboots or crashes".
+wireguard-windows is where this file's weight-arbitration recipe comes from, so
+its silence here was a choice, not an oversight — though neither project ships
+an always-on kill switch meant to survive an arbitrary reboot, which is the
+requirement that makes `PERSISTENT`-only insufficient.
+
+**Unanalysed, and stated as such:** the twins are `Condition::Any` +
+`Action::Block` with no `CLEAR_ACTION_RIGHT`, so they are default-*hard*. On an
+armed host, every outbound connect between tcpip.sys start and BFE start fails
+— loopback included, unoverridable from another sublayer. What in that window
+might need egress (early-boot drivers, domain network providers, PXE/iSCSI, a
+network-key volume unlock) has not been established. Fort's boot-time blocks
+set `CLEAR_ACTION_RIGHT` and are soft; Mullvad's are hard like ours.
 
 Two things that decide whether this is safe are undocumented by WFP, so they
 are **measured on the real firewall** by
@@ -1216,7 +1240,25 @@ production `add_filter` under the covers' own persistent provider and sublayer:
 WFP accepted it; the stored record carries `FWPM_FILTER_FLAG_BOOTTIME` and not
 `FWPM_FILTER_FLAG_PERSISTENT`, our `providerKey` and our `subLayerKey`; and
 `FwpmFilterDeleteByKey0` returned `ERROR_SUCCESS` (not `FWP_E_FILTER_NOT_FOUND`)
-after which the filter was gone from the boot-time view.
+after which the filter was gone from the boot-time view. A second test drives
+the real `engage_lockdown` twice in one boot and asserts, on WFP's own
+`filterId`, that the twins were genuinely re-created while the persistent
+block-all beside them was not.
+
+**Read the delete result at its scope.** That delete removed a *live* FWPM
+object in the same session that added it. The delete this design is actually
+exposed to is the one issued in a *later* boot, where no live object remains and
+`FwpmFilterDeleteByKey0` answers `FWP_E_FILTER_NOT_FOUND` — which
+`first_delete_failure` whitelists as benign. So the false `Ok` the measurement is
+often cited as excluding is still open, and only a reboot can close it. That
+matters most at one call site: [#1009](https://github.com/bindreams/hole/issues/1009)
+makes `release_covers` → `failclosed::release_all` the MSI's `Return="check"`
+uninstall gate. On a boot where the bridge never engaged, both twin keys answer
+not-found, the gate reads `Ok`, and the installer deletes `hole.exe`. If the
+boot-time record outlives its object that is [#1003](https://github.com/bindreams/hole/issues/1003)
+recreated for the pre-BFE window, with nothing left to clear it. #1008's
+provider-enumeration sweep does not close it either — that also reads live
+objects.
 
 **Its limit, which must travel with the result.** The probe's enumeration
 template names *no provider* — deliberately, since filtering by ours would make
@@ -1234,15 +1276,29 @@ reboot, and there is no reboot-capable elevated lane to add the case to. Green
 CI on this change is not coverage of any of: whether the kernel enforces a twin
 during the boot→BFE window (the twins name a provider and sublayer that BFE
 itself provisions, so what the pre-BFE kernel does with them is not merely
-unmeasured but undocumented); whether a by-key delete purges the underlying
-boot-time record rather than the runtime copy; and whether a twin covers boots
-after the one following its install. Microsoft's own pages disagree on the
-underlying mechanic — `FwpmFilterAdd0`'s Remarks and "Object Management" say
-boot-time filters are "removed" once BFE finishes initializing; "Basic Operation
-of WFP" says twice that they are "disabled" — and, more to the point, **none of
-them addresses re-provisioning at later boots at all**. That is silence, not
-contradiction, and it stays recorded as silence rather than resolved by picking
-the convenient reading.
+unmeasured but undocumented — Fort's use of the *default sublayer* for its
+boot-time filters only, against its own sublayer for its persistent ones, is
+consistent with treating that as a hazard; its provider-less-ness is not
+evidence either way, since `FORT_PROV_INIT_FILTER_ARGS` has no `providerKey`
+field and *no* Fort filter names a provider); whether a by-key delete purges the
+underlying boot-time record rather than the runtime copy; and whether a twin
+covers boots after the one following its install. Microsoft's own pages disagree
+on the underlying mechanic — `FwpmFilterAdd0`'s Remarks and "Object Management"
+say boot-time filters are "removed" once BFE finishes initializing; "Basic
+Operation of WFP" says twice that they are "disabled" — and, more to the point,
+**none of them addresses re-provisioning at later boots at all**. That is
+silence, not contradiction, and it stays recorded as silence rather than resolved
+by picking the convenient reading. What it *does* settle is a constraint: every
+path must be correct under both readings, which is why the twins are pre-deleted
+rather than re-added.
+
+`FWPM_FILTER_FLAG_DISABLED` does not adjudicate it, despite the name. Microsoft
+defines that bit as a *provider* property — set when BFE starts if the provider
+has no associated Windows service name or its service is not auto-start — and
+says it cannot be set when adding a filter. The privileged test reads it on both
+lifetimes anyway: if it were ever set on Hole's filters, Hole's
+service-name-less provider would be one BFE disables, and the `PERSISTENT` half
+of the kill switch would not survive a reboot either.
 
 A stranded boot-time leftover has no self-healing path the way a stranded
 persistent one does: BFE re-adds a persistent leftover at every start whatever
@@ -1251,10 +1307,29 @@ nothing any build runs re-adds a boot-time one — an older binary that never
 learned its GUID cannot find it. How much that matters rides on the same
 unanswered re-provisioning question, and it cuts both ways: if a record is
 re-provisioned every boot, the twins work every boot *and* a stranded one blocks
-every boot forever; if it is spent after one, the hazard mostly evaporates and
-so does most of the protection. Hole assumes the worse branch for safety and
-claims the weaker one for coverage. Bounding the hazard is
+every boot; if it is spent after one, the hazard mostly evaporates and so does
+most of the protection. Hole assumes the worse branch for safety and claims the
+weaker one for coverage. Bounding the hazard is
 [#1008](https://github.com/bindreams/hole/issues/1008).
+
+**Size that worst case correctly.** Both Microsoft readings agree the filter
+stops applying once BFE starts, so a stranded twin blocks egress from tcpip.sys
+until BFE and then stops — seconds per boot, before anything user-facing is on
+the network. #998 and #1008 both describe it as "a permanent block-all with no
+way to remove it"; that is the `PERSISTENT` failure mode, not this one, and
+overstates the boot-time hazard by the length of a whole session. The genuinely
+unrecoverable case is narrower: **BFE failing to start**, where `FwpmEngineOpen0`
+fails and `release_all` and `bridge unlock` both return `Err` having issued
+nothing.
+
+Out-of-band recovery, at the confidence it deserves: `netsh wfp` has **no delete
+verb** (`capture`, `dump`, `set options`, `show`), so the usual "recover with
+`netsh wfp`" advice does not apply to any WFP filter. The plausible hatches are
+`netsh wfp reset` and removing
+`HKLM\SYSTEM\CurrentControlSet\Services\BFE\Parameters\Policy\BootTime`.
+**Neither is verified, and the registry path is not Microsoft-documented** — it
+comes from third-party reverse engineering. Do not hand either to a user as a
+known-good step without testing it.
 
 It contrasts with the [transient cutover cover](#transient-cutover-cover) on
 three axes:

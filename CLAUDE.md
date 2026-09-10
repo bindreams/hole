@@ -151,9 +151,16 @@ before editing; the sections linked below are the authoritative source.
   standing cover's Windows block-all pair additionally installs `BOOTTIME`
   twins — two more filters, aimed at the kernel-start→BFE-start window
   `PERSISTENT` alone cannot reach. They carry the block only, so that window
-  has no permits at all, and what about them is measured (WFP accepts and
-  stores them under our containers; a by-key delete removes them) versus
-  unverified (any behaviour spanning a reboot) is in CONTRIBUTING.md. The
+  has no permits at all, and it is a HARD block (no `CLEAR_ACTION_RIGHT`) whose
+  effect on early boot is disclosed as unanalysed. A boot-time filter is spent
+  by the boot it covered, so every engage **pre-deletes** the twins' fixed keys
+  rather than re-adding them — an add would short-circuit on
+  `FWP_E_ALREADY_EXISTS` under the reading where the spent object survives, and
+  the switch would arm once and then stop. What is measured (WFP accepts and
+  stores them under our containers; a by-key delete removes a LIVE one; every
+  engage re-arms) versus unverified (anything spanning a reboot, including the
+  later-boot delete that #1009's uninstall gate depends on) is in
+  CONTRIBUTING.md. The
   transient one is swept unconditionally on next start, the standing one only
   on an explicit recorded off — full reconciliation table (`decide_cover_recovery`)
   and disclosed residuals in CONTRIBUTING.md. A single persisted `Target`

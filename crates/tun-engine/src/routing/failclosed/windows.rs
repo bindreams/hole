@@ -56,15 +56,34 @@
 //! Both twins reference the same [`PROVIDER_GUID`]/[`SUBLAYER_GUID`] the
 //! persistent filters already use. That is a MEASURED choice, not a documented
 //! one: WFP's reference states no constraint tying a filter's lifetime to its
-//! containers', and shipped implementations differ — Fort Firewall puts its
-//! boot-time blocks on the default sublayer (`FORT_GUID_EMPTY`, no provider),
-//! while TinyWall (`TinyWallService.cs`) and Mullvad
-//! (`talpid-core/.../objects/persistent.rs`) each install the same rule twice,
-//! PERSISTENT and BOOTTIME, under their OWN persistent containers — the shape
-//! used here. `boottime_privileged_tests` settles it for our
+//! containers', and shipped implementations differ. TinyWall
+//! (`TinyWallService.cs`) and Mullvad (`talpid-core/.../objects/persistent.rs`)
+//! each install the same rule twice, PERSISTENT and BOOTTIME, under their OWN
+//! persistent containers — the shape used here. Fort Firewall puts its
+//! boot-time blocks on the DEFAULT SUBLAYER (`FORT_GUID_EMPTY` in
+//! `fort_prov_init_boot_filters`, against `FORT_GUID_SUBLAYER` in
+//! `fort_prov_init_persist_filters`) — and only the sublayer half of that is a
+//! boot-time choice: `FORT_PROV_INIT_FILTER_ARGS` in
+//! `src/driver/common/fortprov.c` has no `providerKey` field at all, so EVERY
+//! Fort filter is provider-less and its provider tells us nothing about
+//! boot-time either way. `boottime_privileged_tests` settles it for our
 //! containers on the real firewall, and this is what it returned: WFP accepts
 //! the add, and the stored record carries `FWPM_FILTER_FLAG_BOOTTIME` (not
 //! `PERSISTENT`), our `providerKey` and our `subLayerKey`.
+//!
+//! Two implementations DECLINED boot-time, which belongs in the survey beside
+//! the three that took it. `wireguard-windows` defines
+//! `cFWPM_FILTER_FLAG_BOOTTIME` in `tunnel/firewall/types_windows.go` and never
+//! uses it — `blocker.go` runs a fully DYNAMIC session under a per-run random
+//! provider GUID, so nothing it installs outlives the process, let alone a
+//! reboot. OpenVPN's `src/openvpn/wfp_block.c` sets
+//! `FWPM_SESSION_FLAG_DYNAMIC` under the comment "Add temporary filters which
+//! don't survive reboots or crashes". Neither is a neutral omission for us:
+//! wireguard-windows is the source of this file's own weight-arbitration
+//! recipe, cited above, so it was read closely and its silence here is a
+//! choice. Both are also solving a narrower problem — neither ships an opt-in
+//! always-on kill switch meant to hold across an arbitrary reboot, which is the
+//! requirement that makes `PERSISTENT`-only insufficient in the first place.
 //!
 //! Carry the limit with that result wherever it is cited. The probe's
 //! enumeration template names NO provider, on purpose — see
@@ -90,6 +109,25 @@
 //! Blocks-only matches both shipped precedents — Fort's four boot-time filters
 //! and Mullvad's four are all `BLOCK`, neither ships a boot-time permit —
 //! though both also cover `RECV_ACCEPT`, which we do not.
+//!
+//! **What that block does to the machine around it is NOT analysed here, and
+//! saying so is the point.** The twins are [`Condition::Any`] +
+//! [`Action::Block`] with no `CLEAR_ACTION_RIGHT`, which makes them
+//! default-HARD: between tcpip.sys start and BFE start, on a host with the kill
+//! switch armed, every outbound connect at `ALE_AUTH_CONNECT_V4`/`_V6` fails,
+//! loopback included, and no other sublayer can override it. Whether anything
+//! in that window needs egress — early boot drivers, a domain-joined machine's
+//! network provider, iSCSI or PXE boot paths, an encrypted-volume unlock that
+//! reaches a network key server — has not been established, and this change
+//! ships without establishing it. Two things bound the exposure rather than
+//! remove it: the window is the seconds before BFE, and it only exists on a
+//! host whose owner opted into an always-on kill switch, which is a request for
+//! exactly this. The nearest precedent points the other way and is worth
+//! weighing: Fort's boot-time blocks set `FWPM_FILTER_FLAG_CLEAR_ACTION_RIGHT`,
+//! making them SOFT and overridable from another sublayer; Hole's are hard.
+//! Mullvad's are hard like ours. Softening ours would trade a leak-proof window
+//! for an overridable one, so it is a decision to take deliberately rather than
+//! a default to drift into.
 //! Reasons a permit is NOT given a boot-time twin: (a) the TUN-LUID
 //! and server-IP permits carry values discovered at runtime — a boot-time copy
 //! would enforce whatever value was live at the PREVIOUS engage, stale by
@@ -114,13 +152,40 @@
 //! That delete is the one failure this design could not survive, so it is
 //! measured rather than argued: a boot-time filter is EXCLUDED from the
 //! default enumeration view (`FWP_FILTER_ENUM_FLAG_BOOTTIME_ONLY` /
-//! `..._INCLUDE_BOOTTIME` exist to opt in, and Microsoft's sample ORs the
-//! latter in for exactly this reason). A by-key delete that could not see the
-//! boot-time view would return `FWP_E_FILTER_NOT_FOUND`, which
-//! [`first_delete_failure`] whitelists as benign — so `release_all` would
-//! report `Ok` over a host it never unblocked, breaking its "never a false
-//! success" clause. `boottime_privileged_tests` asserts the delete returns
-//! `ERROR_SUCCESS` and that the filter leaves the boot-time view.
+//! `..._INCLUDE_BOOTTIME` exist to opt in; Microsoft's sample ORs the latter
+//! together with `..._INCLUDE_DISABLED`, and `enum_boottime` sets both — a
+//! disabled filter is excluded from the default view exactly as a boot-time
+//! one is). A by-key delete that could not see the boot-time view would return
+//! `FWP_E_FILTER_NOT_FOUND`, which [`first_delete_failure`] whitelists as
+//! benign — so `release_all` would report `Ok` over a host it never unblocked,
+//! breaking its "never a false success" clause.
+//! `boottime_privileged_tests` asserts the delete returns `ERROR_SUCCESS` and
+//! that the filter leaves the boot-time view.
+//!
+//! **Read that measurement at its actual scope.** It deletes a LIVE FWPM
+//! object, in the same session that added it. It says nothing about the delete
+//! this design is really exposed to, which is the one issued in a LATER boot
+//! against a key whose only remaining trace is the boot-time policy record: no
+//! live object, so `FwpmFilterDeleteByKey0` answers `FWP_E_FILTER_NOT_FOUND`,
+//! and [`first_delete_failure`] whitelists it. That is the same false `Ok` this
+//! paragraph opened by claiming to have excluded, still open, and it can only
+//! be closed by a reboot no lane here has. The measurement rules out "by-key
+//! delete cannot see the boot-time view at all"; it does not establish that a
+//! successful delete purges the record.
+//!
+//! **Where that false `Ok` is load-bearing, and it is not `release_all`'s
+//! logging.** #1009 makes `release_covers` → [`release_all`] the MSI's
+//! `Return="check"` uninstall gate: `Ok` means the installer proceeds and
+//! deletes `hole.exe`. [`swept_lockdown_guids`] does now include the twins, so
+//! they ARE reachable — but only while a live object exists. Uninstall on a
+//! boot where this bridge never engaged (the kill switch armed in an earlier
+//! session, no connect in this one) finds no live twin, both keys answer
+//! not-found, the gate reads `Ok`, and the binary goes. If the boot-time record
+//! outlives its object, that is #1003 recreated for the pre-BFE window with the
+//! only tool that could clear it uninstalled. #1008's provider-enumeration
+//! sweep does not close this either — it also reads live objects. Closing it
+//! needs the record itself to be reachable, or the gate to stop treating
+//! not-found on a boot-time key as proof of absence.
 //!
 //! **Disclosed, NOT closed by this change:** a fixed-GUID sweep can only
 //! delete a boot-time filter whose GUID the RUNNING binary knows. A stranded
@@ -136,13 +201,41 @@
 //! How bad that is turns on the open question below — whether a boot-time
 //! policy record is re-provisioned at EVERY subsequent boot or applied only
 //! once — and the answer cuts both ways at once, which is the honest way to
-//! hold it. Re-provisioned: the twins do their job at every boot AND a
-//! stranded one enforces (including, if ever mis-scoped, blocking all egress)
-//! at every boot, forever, with no automatic recovery. Applied once: the
+//! hold it. Re-provisioned: the twins do their job at every boot AND a stranded
+//! one enforces at every boot, with no automatic recovery. Applied once: the
 //! hazard largely evaporates and so does most of the protection, since a twin
 //! installed in one session would cover the next boot and no other. Neither
 //! branch is established here, so this file assumes the worse one for safety
 //! and claims the weaker one for coverage.
+//!
+//! **Size that worst case correctly — it is a boot-window outage, not a bricked
+//! machine.** Both Microsoft readings agree the filter stops applying once BFE
+//! starts ("disabled" and "removed" differ on the mechanism, not on that), so a
+//! stranded twin blocks egress from tcpip.sys until BFE and then stops: seconds,
+//! every boot, before anything user-facing is on the network. #998 and #1008
+//! both describe the hazard as "a permanent block-all with no way to remove
+//! it", and that overstates it by the whole length of a session — a user with a
+//! stranded twin and no stranded PERSISTENT filter has a working network as soon
+//! as BFE is up. (The PERSISTENT half is the one that can strand a machine
+//! indefinitely, and it is not what this change adds.)
+//!
+//! The genuinely unrecoverable case is narrower and worth naming on its own:
+//! **BFE failing to start.** Then `FwpmEngineOpen0` fails, [`release_all`] and
+//! `bridge unlock` both return `Err` having issued nothing, and no in-band
+//! escape exists at all — not because a boot-time filter is hard to delete but
+//! because the only removal API needs the engine that is down.
+//!
+//! Out-of-band escape, stated at the confidence it deserves: `netsh wfp` has NO
+//! delete verb — `capture`, `dump`, `set options`, `show` and nothing else — so
+//! the usual "recover with `netsh wfp`" advice does not apply to any WFP filter,
+//! boot-time or otherwise. The plausible hatches are `netsh wfp reset` (which
+//! restores default WFP policy) and removing
+//! `HKLM\SYSTEM\CurrentControlSet\Services\BFE\Parameters\Policy\BootTime`,
+//! where boot-time filter blobs are reported to live. **Neither is verified
+//! here, and the registry path is not Microsoft-documented at all** — it comes
+//! from third-party reverse engineering of BFE's on-disk policy. Do not put
+//! either in front of a user as a known-good recovery step without testing it
+//! first.
 //!
 //! Note we are exposed to this for longer than the precedent is. Mullvad
 //! installs its boot-time blocks only as the daemon SHUTS DOWN under a
@@ -185,15 +278,41 @@
 //!   Note this is not purely a matter of instrumentation: the twins name a
 //!   [`PROVIDER_GUID`]/[`SUBLAYER_GUID`] that BFE itself provisions, and what
 //!   the pre-BFE kernel does with a filter whose containers do not exist yet
-//!   is undocumented. Fort Firewall's choice of the default sublayer and no
-//!   provider is at least consistent with treating that as a hazard.
+//!   is undocumented. Fort Firewall's use of the DEFAULT SUBLAYER for its
+//!   boot-time filters — and only for those, against its own sublayer for the
+//!   persistent ones — is at least consistent with treating that as a hazard.
+//!   Its provider-less-ness is not evidence either way: Fort names no provider
+//!   on any filter (see the container discussion above).
 //! - Whether a twin covers boots after the one following its install — the
 //!   re-provisioning question above, restated.
 //!
-//! `boottime_privileged_tests` proves the delete succeeds and the filter
-//! leaves the boot-time view within one boot; only a real reboot proves it
-//! stays gone across one (the same disclosed limit
-//! `a_simulated_reboot_rearms_the_cover` carries on macOS).
+//! What that unresolved disagreement DOES settle is a design constraint, and it
+//! is enforced: since neither reading is adjudicated, every path here must be
+//! correct under both. That is why [`lockdown_pre_delete_guids`] deletes the
+//! twins' keys before re-adding them — under "removed" the pre-delete is a
+//! benign not-found, under "disabled" it is the only thing that replaces a
+//! spent twin instead of letting [`ok_or_exists`] report `Ok` over it.
+//!
+//! One thing that sounds like it would settle the disagreement and does not:
+//! `FWPM_FILTER_FLAG_DISABLED`. Microsoft defines that bit as a PROVIDER
+//! property — "a provider's filters are disabled when the BFE starts if the
+//! provider has no associated Windows service name, or if the associated
+//! service is not set to auto-start", and it "cannot be set when adding new
+//! filters" — so it is not the bit "Basic Operation" means when it says a
+//! boot-time filter is disabled at BFE start. `boottime_privileged_tests` reads
+//! it on both lifetimes anyway, because if it were ever SET on our filters that
+//! would mean Hole's service-name-less provider is one BFE disables, and the
+//! PERSISTENT half of the kill switch would not survive a reboot either — a
+//! bigger finding than #998, and not one to learn from a user report.
+//!
+//! `boottime_privileged_tests` proves, within one boot: the add is accepted
+//! under our containers and stored with them; a by-key delete of a LIVE twin
+//! returns `ERROR_SUCCESS` and it leaves the boot-time view; a by-key GET of
+//! one returns no code that could make [`classify_presence`] answer
+//! `Indeterminate`; and every engage re-arms the twins rather than
+//! short-circuiting. Only a real reboot proves the deleted one stays gone
+//! across a boot, or that a re-armed one is enforced before BFE (the same
+//! disclosed limit `a_simulated_reboot_rearms_the_cover` carries on macOS).
 
 use std::net::IpAddr;
 use std::path::Path;
