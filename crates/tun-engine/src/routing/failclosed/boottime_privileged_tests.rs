@@ -56,8 +56,8 @@
 //! reboot, which no CI runner offers — the same disclosed limit
 //! `a_simulated_reboot_rearms_the_cover` carries on macOS.
 //! `netsh wfp show boottimepolicy` is the manual cross-check for the
-//! second one; [`boottime_policy_dump`] captures it into the failure message
-//! but nothing asserts on it, for the reason given on that function.
+//! record-purging one; [`boottime_policy_dump`] captures it into the failure
+//! message but nothing asserts on it, for the reason given on that function.
 //!
 //! Gated to the elevated `tun` lane exactly like `lockdown_privileged_tests`
 //! (see that module's doc). COUPLED NAMES: `.config/nextest.toml`'s
