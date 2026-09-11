@@ -1111,17 +1111,11 @@ milliseconds.
   rules, so a still-live prior cover stays authoritative across a TRANSITION
   until the new ruleset fully commits. Empirically checked by
   `macos_failclosed_cover_transition_never_admits_blocked_flow`
-  (`macos_tests.rs`; see its own doc comment for the method, the caveats, and
-  its printed sensitivity) — not a mathematical proof. That test prints its own
-  sensitivity rather than leaving a green uninformative; the figure to read is
-  the RAW one (raw hits per total control attempt), and it was last measured in
-  run 34586524077:
-  [darwin/arm64](https://github.com/bindreams/hole/actions/runs/34586524077/job/103221908470)
-  36/38 (94.7%), 352 pool probes over 451 ms (one per 1282 us);
-  [darwin/amd64](https://github.com/bindreams/hole/actions/runs/34586524077/job/103221908546)
-  339/347 (97.7%), 784 pool probes over 1.041 s (one per 1328 us). The
-  straddle-exclusion rate differs by leg (58% vs 7%) purely because attempt
-  duration differs against transition period — see the test's doc comment.
+  (`macos_transition_tests.rs`) — not a mathematical proof. That test prints its
+  own measured sensitivity rather than leaving a green uninformative
+  (`success-output` in `.config/nextest.toml` is what makes the line survive a
+  PASS); its doc comment carries the method, the caveats and the last measured
+  figures, and is the single place they live.
   Disclosed, not fixed here: a *failed* re-engage during a transition still
   reloads `/etc/pf.conf`
   over a still-good prior cover (bindreams/hole#1004), and two privileged test
@@ -1133,6 +1127,14 @@ milliseconds.
   decides this, and its doc lists exactly which reachable cases the transient
   purge closes; the kernel behaviour is proven by
   `macos_failclosed_cover_state_purge_kills_a_flow_established_before_engage`.
+  **Loopback is exempted with `set skip on lo0`, never a `pass` rule.** That
+  purge is host-wide, so the ruleset — not the flush's scope — is what keeps it
+  from severing every local TCP session on the machine. pf applies `flags S/SA`
+  by default, so a `pass ... on lo0` only ever matches a SYN; a mid-stream
+  segment with no state entry left to match against falls through to
+  `block out all` and is silently dropped under `block-policy drop`.
+  `set skip` passes lo0 "as if pf was disabled", with no state to lose. Proven
+  by `macos_failclosed_cover_engage_does_not_sever_established_loopback_flows`.
   **Enable before load, on a COLD engage too** — see `engage_with`'s doc for why
   reordering does not help and what a failed persist would strand without it.
 

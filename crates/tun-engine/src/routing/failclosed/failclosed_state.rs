@@ -31,9 +31,17 @@ pub struct FailClosedState {
     /// Opaque enable token returned by `pfctl -E`, replayed to `pfctl -X` on
     /// recovery. Stored as a string — it is an opaque handle, not arithmetic.
     pub pf_token: String,
-    /// Whether pf reported `Status: Enabled` before we engaged. Diagnostic;
-    /// recovery restores `/etc/pf.conf` and drops our refcount regardless.
-    pub pf_was_enabled: bool,
+    /// Whether pf reported `Status: Enabled` before we engaged, or `None` if
+    /// the read failed and it was never established. Diagnostic only — its one
+    /// reader is a log field in `recover_cover`, and recovery restores
+    /// `/etc/pf.conf` and drops our refcount regardless. Tri-state rather than
+    /// `bool` so a failed read records the unknown honestly instead of
+    /// asserting a value nothing measured; the engage does not fail on it (see
+    /// `macos::engage_with`'s step 1).
+    ///
+    /// Reads an older file written as `true`/`false` unchanged, so
+    /// [`SCHEMA_VERSION`] is not bumped.
+    pub pf_was_enabled: Option<bool>,
 }
 
 fn state_file(state_dir: &Path) -> PathBuf {

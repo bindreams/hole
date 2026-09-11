@@ -61,24 +61,34 @@ use super::RESOLVER_PERMIT_PORT;
 /// Build the self-contained pf ruleset (loaded via `pfctl -f -`).
 ///
 /// `set block-policy drop` silently drops blocked packets (no RST/ICMP).
-/// `block out all` is the fail-closed default; the `quick` pass rules for
-/// loopback, the server IP, and (when given) the resolver the caller's own
-/// `ech-doh` URL names win without depending on pf's last-match rule. The
-/// `to {ip}` form carries a v6 address as written. `resolver_ip` is `None`
-/// whenever nothing should be permitted — see
-/// `Routing::install_failclosed_cover`'s doc for the exact conditions. The
-/// resolver pass is scoped to `proto tcp port` [`RESOLVER_PERMIT_PORT`] (see
-/// that const's doc for why this is the only port this fetch can need) — NOT
-/// the server permit's unrestricted shape.
+/// `block out all` is the fail-closed default; the `quick` pass rules for the
+/// server IP and (when given) the resolver the caller's own `ech-doh` URL names
+/// win without depending on pf's last-match rule. The `to {ip}` form carries a
+/// v6 address as written. `resolver_ip` is `None` whenever nothing should be
+/// permitted — see `Routing::install_failclosed_cover`'s doc for the exact
+/// conditions. The resolver pass is scoped to `proto tcp port`
+/// [`RESOLVER_PERMIT_PORT`] (see that const's doc for why this is the only port
+/// this fetch can need) — NOT the server permit's unrestricted shape.
+///
+/// Loopback is exempted with `set skip on lo0` — the same mechanism
+/// [`build_lockdown_main_ruleset`] uses — and NOT with a `pass` rule, because
+/// this cover is the one that purges pf state ([`purges_state`]). A `pass`
+/// creates state under pf's default `flags S/SA`, so only a SYN matches it;
+/// after the purge a mid-stream loopback segment of an ALREADY-ESTABLISHED
+/// session matches no state, fails that SYN-only pass, and falls through to
+/// `block out all` — silently discarded under `block-policy drop`. Every local
+/// TCP session on the host (databases, dev servers, `ssh -L` forwards,
+/// IDE↔language-server sockets) would die on every covered start and every
+/// covered retry. `set skip` passes lo0 "as if pf was disabled", with no state
+/// to lose.
 pub fn build_pf_ruleset(server_ip: IpAddr, resolver_ip: Option<IpAddr>) -> String {
     let resolver_pass = resolver_ip
         .map(|ip| format!("pass out quick proto tcp from any to {ip} port {RESOLVER_PERMIT_PORT}\n"))
         .unwrap_or_default();
     format!(
         "set block-policy drop\n\
+         set skip on lo0\n\
          block out all\n\
-         pass out quick on lo0 all\n\
-         pass in quick on lo0 all\n\
          pass out quick from any to {server_ip}\n\
          {resolver_pass}"
     )
@@ -227,16 +237,14 @@ const PFCONF: &str = "/etc/pf.conf";
 /// directory on it shadow the real binary. `/sbin/pfctl` is where macOS ships
 /// it, unconditionally.
 ///
-/// NOT a closed hardening. This is one of roughly 29 equally exposed root
-/// spawns: `routing.rs` spawns a bare `"route"` at 26 sites,
-/// `device/ipv6_addr/macos.rs` spawns `"ifconfig"`, and
-/// `bridge/src/dns/system/macos.rs` holds `const NETWORKSETUP: &str =
-/// "networksetup"` — every one of them PATH-resolved through
-/// `Command::new(&cmd[0])` as root. A `--service` bridge inherits launchd's
-/// fixed `PATH`, but a GUI-elevated one inherits the user's, `/opt/homebrew/bin`
-/// included. Pinning this one call site is correct in itself and delivers no
-/// net attack-surface reduction while the other 28 stand; widening it is
-/// tracked separately.
+/// NOT a closed hardening. Every other root spawn in the tree is still
+/// PATH-resolved through `Command::new(&cmd[0])`: `routing.rs`'s bare
+/// `"route"`, `device/ipv6_addr/macos.rs`'s `"ifconfig"`, and
+/// `bridge/src/dns/system/macos.rs`'s `const NETWORKSETUP: &str =
+/// "networksetup"`. A `--service` bridge inherits launchd's fixed `PATH`, but a
+/// GUI-elevated one inherits the user's, `/opt/homebrew/bin` included. Pinning
+/// this one call site is correct in itself and delivers no net attack-surface
+/// reduction while the rest stand; widening it is tracked separately.
 const PFCTL: &str = "/sbin/pfctl";
 
 /// Build the argv `pfctl` runs with: [`PFCTL`]'s absolute path followed by
@@ -310,11 +318,16 @@ impl Cover {
 /// - [`CoverKind::Transient`] — **purge**. Reachable whenever pf was already
 ///   enabled ahead of us: Internet Sharing, another VPN, a hand-run
 ///   `pfctl -e`, or a cross-process transient engage over a still-live
-///   standing ruleset left by an outgoing bridge's `CoverGuard::disarm`. A
-///   host-wide flush is safe HERE specifically because there is no
-///   tunnel of ours yet: the transient cover is engaged in `hold_pending`,
-///   *before* `start_inner`, so the only flows it can break are the
-///   pre-existing ones it exists to break.
+///   standing ruleset left by an outgoing bridge's `CoverGuard::disarm`. There
+///   is no tunnel of ours for it to kill — the transient cover is engaged in
+///   `hold_pending`, *before* `start_inner`. The flush is nonetheless HOST-WIDE
+///   (`DIOCCLRSTATES`, no `psk_ifname`/`psk_ownername`), so what protects the
+///   traffic this cover means to PERMIT is not the flush's scope but the
+///   ruleset's: loopback is exempted with `set skip on lo0` rather than a
+///   state-bearing `pass` ([`build_pf_ruleset`]), so local sessions survive a
+///   purge that a `pass` rule would have severed. Egress this cover permits by
+///   IP (the server, the resolver) is a fresh connection after the engage, so
+///   it re-creates its own state under the new ruleset.
 /// - [`CoverKind::Lockdown`] — **do not purge** (bindreams/hole#1015's
 ///   remaining half, sequenced behind bindreams/hole#1002).
 ///   `engage_lockdown` runs with the tunnel LIVE, and `pfctl -F states` →
@@ -415,8 +428,24 @@ fn engage_with(
     resolver_ip: Option<IpAddr>,
     ops: &mut dyn EngageOps,
 ) -> Result<String, RoutingError> {
-    // 1. Read current enabled-state (read-only).
-    let was_enabled = ops.pf_enabled()?;
+    // 1. Read current enabled-state (read-only) — DIAGNOSTIC ONLY, so it is
+    //    best-effort. `pf_was_enabled`'s single reader is a log field in
+    //    `recover_cover`; nothing branches on it. Propagating a failure here
+    //    would fail the cover OPEN — `install_failclosed_cover`'s caller logs
+    //    "host NOT blocked, proceeding open" and starts the session uncovered —
+    //    over a read that none of the cover-establishing steps below needs. A
+    //    failure is recorded as `None`, not guessed at.
+    let was_enabled = match ops.pf_enabled() {
+        Ok(enabled) => Some(enabled),
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "could not read whether pf was already enabled; recording it as unknown and \
+                 continuing the engage — this read is diagnostic and the cover does not depend on it"
+            );
+            None
+        }
+    };
 
     // 2. Enable pf (refcounted) and capture the token. This runs BEFORE the
     //    load in both the warm and the cold case — see this module's doc for
@@ -589,7 +618,7 @@ pub fn recover_cover(state_dir: &Path, adopting: bool) {
         return;
     };
     tracing::info!(
-        was_enabled = st.pf_was_enabled,
+        was_enabled = ?st.pf_was_enabled,
         "recovering fail-closed cover from crashed run"
     );
     disengage(&st.pf_token, state_dir, adopting);
@@ -897,13 +926,30 @@ pub(crate) trait PfOps {
     fn load_ruleset(&mut self, text: &str) -> Result<(), RoutingError>;
     /// `pfctl -X <token>`: drop a pf enable refcount. Whether a failure here
     /// propagates is the caller's choice: `release_all_with` swallows it
-    /// (best-effort, never propagated); `disengage_lockdown_with` — the
-    /// single-cover fail-loud escape — propagates it, per its own doc.
+    /// (best-effort, never propagated, via [`drop_token_or_warn`]);
+    /// `disengage_lockdown_with` — the single-cover fail-loud escape —
+    /// propagates it, per its own doc. Swallowing is never DISCARDING: no
+    /// caller may drop this `Result` without at least logging it.
     fn drop_token(&mut self, token: &str) -> Result<(), RoutingError>;
     /// Delete the transient cover's state file.
     fn clear_transient(&mut self) -> Result<(), RoutingError>;
     /// Delete the standing lockdown cover's state file.
     fn clear_standing(&mut self) -> Result<(), RoutingError>;
+}
+
+/// [`drop_refcount_or_warn`]'s counterpart for the [`PfOps`] seam, and for the
+/// same reason: `drop_token`'s failure is not propagated here (that IS the
+/// contract — see [`PfOps::drop_token`]), but not propagating it is no licence
+/// to discard it. A `let _ =` leaves a leaked pf enable refcount with nothing
+/// in the log saying so, on the one path (`bridge unlock`, the crash-recovery
+/// sweep) whose whole job is to leave no cover behind. A separate function
+/// rather than a call to [`drop_refcount_or_warn`] because this layer reaches
+/// pf through the injected seam, not through the free `pfctl` helper. `message`
+/// is per-call-site, so a warn still names which of the three drops it was.
+fn drop_token_or_warn(ops: &mut dyn PfOps, token: &str, message: &str) {
+    if let Err(e) = ops.drop_token(token) {
+        tracing::warn!(error = %e, "{message}");
+    }
 }
 
 /// The unconditional two-cover clear, factored as a pure sequencer over an
@@ -926,7 +972,11 @@ pub(crate) fn release_all_with(
         StateFile::Absent => {}
         StateFile::Present(st) => {
             let reload = ops.reload_default();
-            let _ = ops.drop_token(&st.pf_token);
+            drop_token_or_warn(
+                ops,
+                &st.pf_token,
+                "pfctl -X failed releasing the transient cover's pf refcount during release_all",
+            );
             match reload {
                 Ok(()) => {
                     if let Err(e) = ops.clear_transient() {
@@ -961,7 +1011,12 @@ pub(crate) fn release_all_with(
             // `LockdownPfState::main_snapshot_captured`. Loading the empty one
             // would leave a pass-all host.
             let outcome = ops.reload_default();
-            let _ = ops.drop_token(&st.pf_token);
+            drop_token_or_warn(
+                ops,
+                &st.pf_token,
+                "pfctl -X failed releasing the standing cover's pf refcount during release_all after a \
+                 default-ruleset restore",
+            );
             match outcome {
                 Ok(()) => {
                     if let Err(e) = ops.clear_standing() {
@@ -994,7 +1049,12 @@ pub(crate) fn release_all_with(
                     ))),
                 },
             };
-            let _ = ops.drop_token(&st.pf_token);
+            drop_token_or_warn(
+                ops,
+                &st.pf_token,
+                "pfctl -X failed releasing the standing cover's pf refcount during release_all after a \
+                 snapshot restore",
+            );
             match outcome {
                 Ok(()) => {
                     if let Err(e) = ops.clear_standing() {
@@ -1182,3 +1242,12 @@ pub fn release_all(state_dir: &Path) -> Result<(), RoutingError> {
 #[cfg(test)]
 #[path = "macos_tests.rs"]
 mod macos_tests;
+
+/// Privileged-lane real-engage tests. A DESCENDANT of this module, not a
+/// sibling of the other `*_privileged_tests.rs` files under `failclosed`,
+/// because they reach for [`Cover`]'s private `token` field and the private
+/// [`pfctl`] helper — and that is what descendance buys, not sharing a file
+/// with [`macos_tests`].
+#[cfg(test)]
+#[path = "macos_transition_tests.rs"]
+mod macos_transition_tests;
