@@ -275,8 +275,12 @@
     <!-- Release every fail-closed cover and disarm the kill switch, before
          RemoveFiles deletes the only binary that could do it later. The WFP
          filters are FWPM_FILTER_FLAG_PERSISTENT, so the Base Filtering Engine
-         re-adds them on every boot: leaving them behind is a permanently
-         blocked host with no way back short of `netsh wfp` (#1003).
+         re-adds them on every boot: leaving them behind blocks the host
+         permanently, and nothing shipped with Windows takes them off again.
+         `netsh wfp` is diagnostics-only — capture, dump, help, set, show, and
+         no delete verb — and removing a WFP filter takes an FWPM call, whose
+         only caller on the host is the hole.exe this uninstall is about to
+         delete. Reinstalling Hole is the way back (#1003).
 
          Return="check", uniquely among the uninstall CAs: a failed release
          MUST abort and roll the uninstall back, leaving hole.exe in place, and
@@ -295,7 +299,7 @@
          would otherwise make the product permanently unremovable. Secure="yes"
          so the value survives into the server-side execute sequence under UAC.
          Documented in RELEASE-OPS.md as a last resort; it leaves the block in
-         place, so `netsh wfp` is the only thing left after it. -->
+         place, and reinstalling Hole is the only thing that clears it. -->
     <Property Id="HOLE_KEEP_COVERS" Secure="yes" />
 
     <CustomAction

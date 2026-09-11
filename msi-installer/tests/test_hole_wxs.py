@@ -6,7 +6,7 @@ Parse the WiX source (hole.wxs) and verify structural correctness without buildi
 import re
 import xml.etree.ElementTree as ET
 
-from conftest import NS, canonical_windows_bindir
+from conftest import NS, WXS_PATH, canonical_windows_bindir
 
 # Known bind path variables passed via `-bindpath` to `wix build`.
 KNOWN_BINDPATHS = {"BinDir", "IconDir", "LicenseDir"}
@@ -1080,3 +1080,48 @@ def test_verifyreadydlg_back_publishes_to_shortcutsdlg(package: ET.Element) -> N
         f"VerifyReadyDlg.Back→ShortcutsDlg must condition on 'NOT Installed' to avoid "
         f"intercepting maintenance/patch flows; got Condition='{condition}'"
     )
+
+
+# Rationale comments (bindreams/hole#1003) =============================================================================
+
+# Substrings that make a `netsh wfp` mention honest rather than a remedy.
+_NETSH_IS_NOT_A_REMEDY = ("no delete verb", "cannot remove", "diagnostics-only")
+
+
+def _wxs_comments() -> list[str]:
+    return re.findall(r"<!--(.*?)-->", WXS_PATH.read_text(encoding="utf-8"), re.DOTALL)
+
+
+def test_wxs_comments_offer_no_remedy_that_does_not_exist() -> None:
+    """The rationale a maintainer reads before touching Return='check' has to be true.
+
+    `netsh wfp` is a diagnostics-only netsh context: capture, dump, help, set,
+    show, and no delete verb. A comment that offers it as the way back from a
+    stranded cover tells whoever is weighing "should this really block the
+    uninstall?" that there is a safety net under HOLE_KEEP_COVERS. There is
+    not. Source-side mirror of cutover_tests.rs's guard on the shipped
+    operator message,
+    `an_unproven_release_does_not_send_the_operator_to_a_command_that_cannot_help`.
+    """
+    for comment in _wxs_comments():
+        if "netsh wfp" not in comment:
+            continue
+        assert any(p in comment for p in _NETSH_IS_NOT_A_REMEDY), (
+            f"a hole.wxs comment names `netsh wfp` without saying it removes nothing; "
+            f"allowed qualifiers: {_NETSH_IS_NOT_A_REMEDY}\n---\n{comment.strip()}"
+        )
+
+
+def test_keep_covers_comment_names_the_only_way_back() -> None:
+    """HOLE_KEEP_COVERS strands the block; the comment must say what clears it.
+
+    Removing a WFP filter takes an FWPM call and hole.exe is the only caller
+    of one on the host, so reinstalling Hole is the whole remedy. Saying
+    nothing leaves the escape looking cheaper than it is.
+    """
+    comments = [c for c in _wxs_comments() if "HOLE_KEEP_COVERS" in c]
+    assert comments, "no hole.wxs comment explains HOLE_KEEP_COVERS"
+    for comment in comments:
+        assert "reinstall" in comment.lower(
+        ), (f"the HOLE_KEEP_COVERS rationale must name reinstalling Hole as the way back"
+            f"\n---\n{comment.strip()}")
