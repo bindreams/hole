@@ -123,13 +123,12 @@ pub(crate) fn format_marker_into(rec: &MarkerRecord, buf: &mut [u8]) -> usize {
 
 // === signal-safe marker write (per platform) =========================================================================
 
-/// Returns whether the marker was actually written (a signal-safe `bool`,
-/// no allocation) so `on_crash` can gate the test-only `_exit` bypass on a
-/// marker that is really on disk, instead of firing unconditionally and
-/// risking zero diagnostics if the write failed (disk full, permission,
-/// TOCTOU on the pre-encoded path).
+/// Best-effort and infallible by design: every failure mode here (disk full,
+/// permission, TOCTOU on the pre-encoded path) costs a breadcrumb and
+/// nothing else, and there is no signal-safe way to report one from a
+/// compromised context anyway.
 #[cfg(windows)]
-fn write_marker_signal_safe(state: &HandlerState, ctx: &crash_handler::CrashContext) -> bool {
+fn write_marker_signal_safe(state: &HandlerState, ctx: &crash_handler::CrashContext) {
     // Extract fields. ctx.exception_code is the top-level code (e.g.
     // 0xC0000005). For an access violation, ExceptionInformation[1] is the
     // faulting data address; otherwise fall back to the instruction ptr.
@@ -192,13 +191,8 @@ fn write_marker_signal_safe(state: &HandlerState, ctx: &crash_handler::CrashCont
             None,
         );
         if let Ok(handle) = h {
-            let mut written = 0u32;
-            let write_ok =
-                WriteFile(handle, Some(&buf[..n]), Some(&mut written), None).is_ok() && written as usize == n;
+            let _ = WriteFile(handle, Some(&buf[..n]), None, None);
             let _ = CloseHandle(handle);
-            write_ok
-        } else {
-            false
         }
     }
 }
@@ -224,13 +218,12 @@ fn win_time() -> u64 {
 // (crash-context 0.6.3: CrashContext { context, float_state, siginfo, pid,
 // tid } — bindreams/hole#438).
 
-/// Returns whether the marker was actually written (a signal-safe `bool`,
-/// no allocation) so `on_crash` can gate the test-only `_exit` bypass on a
-/// marker that is really on disk, instead of firing unconditionally and
-/// risking zero diagnostics if the write failed (disk full, permission,
-/// TOCTOU on the pre-encoded path).
+/// Best-effort and infallible by design: every failure mode here (disk full,
+/// permission, TOCTOU on the pre-encoded path) costs a breadcrumb and
+/// nothing else, and there is no signal-safe way to report one from a
+/// compromised context anyway.
 #[cfg(unix)]
-fn write_marker_signal_safe(state: &HandlerState, ctx: &crash_handler::CrashContext) -> bool {
+fn write_marker_signal_safe(state: &HandlerState, ctx: &crash_handler::CrashContext) {
     let (code, fault_addr, pid, tid) = extract_fault_fields(ctx);
     let time = unix_time();
 
@@ -255,11 +248,8 @@ fn write_marker_signal_safe(state: &HandlerState, ctx: &crash_handler::CrashCont
             0o644,
         );
         if fd >= 0 {
-            let written = libc::write(fd, buf.as_ptr() as *const libc::c_void, n);
-            let _ = libc::close(fd);
-            written == n as isize
-        } else {
-            false
+            libc::write(fd, buf.as_ptr() as *const libc::c_void, n);
+            libc::close(fd);
         }
     }
 }
@@ -315,7 +305,26 @@ fn unix_time() -> u64 {
     }
 }
 
-// === dev-only minidump (.dmp) — NEVER linked in release ==============================================================
+// === dev-only minidump (.dmp) — Windows only, NEVER linked in release ================================================
+
+// macOS has NO in-process minidump branch, and Linux never had one.
+//
+// On macOS `on_crash` runs on crash-handler's message-loop thread with every
+// other thread Mach-suspended (`mac/state.rs`'s `ScopedSuspend`), so any
+// allocation there can deadlock against a thread suspended mid-`malloc`.
+// MEASURED on darwin/arm64, not inferred: with eight threads allocating
+// 1 MiB blocks, an allocating `on_crash` hung 8/10 runs, and `sample(1)` of
+// a hung child shows the handler thread parked in
+// `_xzm_malloc_large_huge` → `_os_unfair_lock_lock_slow` → `__ulock_wait2`
+// while a suspended thread sits inside `_xzm_malloc_large_huge` holding
+// that lock. `minidump-writer` allocates (and `File::create` builds a
+// `CString`, and `dmp_path_from_marker` a `PathBuf`), so there is no
+// ordering that keeps it AND keeps the promise that tombstone never hangs
+// the process. See `MarkerCrashEvent`'s macOS impl.
+//
+// Windows is a different shape: `on_crash` runs on the faulting thread via
+// a vectored/unhandled exception filter with no threads suspended, so the
+// dump branch cannot deadlock the same way.
 
 #[cfg(all(feature = "crash-dumps", windows))]
 fn write_minidump_best_effort(state: &HandlerState, ctx: &crash_handler::CrashContext) {
@@ -331,62 +340,15 @@ fn write_minidump_best_effort(state: &HandlerState, ctx: &crash_handler::CrashCo
     let _ = minidump_writer::minidump_writer::MinidumpWriter::dump_crash_context(ctx, None, &mut file);
 }
 
-#[cfg(all(feature = "crash-dumps", target_os = "macos"))]
-fn write_minidump_best_effort(state: &HandlerState, ctx: &crash_handler::CrashContext) {
-    let Some(dmp_path) = dmp_path_from_marker(state) else {
-        return;
-    };
-    let Ok(mut file) = std::fs::File::create(&dmp_path) else {
-        return;
-    };
-    // `with_crash_context` takes CrashContext BY VALUE; on_crash only lends
-    // `&CrashContext`. `crash_context::CrashContext` derives only `Debug`
-    // (NOT `Clone`), so `ctx.clone()` is NOT available — we MUST rebuild it
-    // field-by-field. The macOS CrashContext is cheap (3 Mach-port ints + an
-    // Option<ExceptionInfo> of 3 ints). `crash_context::ExceptionInfo` is in
-    // scope via the macOS-only `crash-context` direct dep (crash-handler
-    // re-exports CrashContext but NOT ExceptionInfo). See review S1.
-    let cc = crash_context::CrashContext {
-        task: ctx.task,
-        thread: ctx.thread,
-        handler_thread: ctx.handler_thread,
-        exception: ctx.exception.as_ref().map(|e| crash_context::ExceptionInfo {
-            kind: e.kind,
-            code: e.code,
-            subcode: e.subcode,
-        }),
-    };
-    let mut writer = minidump_writer::minidump_writer::MinidumpWriter::with_crash_context(cc);
-    let _ = writer.dump(&mut file);
-}
-
-// Gated to Win/mac (NOT plain `feature = "crash-dumps"`): on Linux the dump
-// call site is cfg'd out, so this fn is never called there — and gating it to
-// the same condition means it is never COMPILED on Linux either (otherwise it
-// would be a body with no matching inner cfg block → a `() vs Option` type
-// error). See the Linux carve-out above.
-#[cfg(all(feature = "crash-dumps", any(windows, target_os = "macos")))]
+#[cfg(all(feature = "crash-dumps", windows))]
 fn dmp_path_from_marker(state: &HandlerState) -> Option<std::path::PathBuf> {
-    // Decode the pre-encoded marker path back to a PathBuf, swap extension.
-    #[cfg(windows)]
-    {
-        use std::os::windows::ffi::OsStringExt;
-        // Strip the trailing NUL before decoding.
-        let wide = &state.marker_path_wide[..state.marker_path_wide.len().saturating_sub(1)];
-        let os = std::ffi::OsString::from_wide(wide);
-        let mut p = std::path::PathBuf::from(os);
-        p.set_extension("dmp");
-        Some(p)
-    }
-    #[cfg(target_os = "macos")]
-    {
-        use std::os::unix::ffi::OsStrExt;
-        let bytes = &state.marker_path_c[..state.marker_path_c.len().saturating_sub(1)];
-        let os = std::ffi::OsStr::from_bytes(bytes);
-        let mut p = std::path::PathBuf::from(os);
-        p.set_extension("dmp");
-        Some(p)
-    }
+    use std::os::windows::ffi::OsStringExt;
+    // Strip the trailing NUL before decoding.
+    let wide = &state.marker_path_wide[..state.marker_path_wide.len().saturating_sub(1)];
+    let os = std::ffi::OsString::from_wide(wide);
+    let mut p = std::path::PathBuf::from(os);
+    p.set_extension("dmp");
+    Some(p)
 }
 
 /// Parse a marker's text (heap-OK; called only by `sweep`). Returns `None`
@@ -503,252 +465,121 @@ struct MarkerCrashEvent {
     state: &'static HandlerState,
 }
 
-// macOS has no hardware exception for `abort()`, so `crash-handler` hooks
-// `SIGABRT` with a plain `sigaction` and relays it to this same `on_crash` as
-// a SYNTHESIZED `EXC_SOFTWARE`/`EXC_SOFT_SIGNAL` exception (see its own
-// `mac/signal.rs`: "Macos doesn't have an exception for process aborts, so we
-// hook SIGABRT"). SOURCE-GROUNDED, not inferred, verified in the vendored
-// `crash-handler` crate: a REAL fault's message handler
-// (`MessageIds::Exception`/`ExceptionStateIdentity`) calls `detach(true)`
-// (`mac/state.rs`), which tears down via `uninstall()` →
-// `restore_abort_handler` (`mac/state.rs`); the SIGABRT relay's own message
-// handler (`MessageIds::SignalCrash`, `mac/state.rs`) contains no `detach`
-// call anywhere in its branch, so the task-level exception port is still
-// attached once it returns. `abort()`'s
-// C-standard-mandated contract (terminate even if a caught signal handler
-// returns) means it re-raises `SIGABRT` with the default disposition once
-// the relay returns — which, on an unhandled abort, is the textbook
-// condition for a second, genuine `EXC_CRASH` exception.
-//
-// MEASURED, not inferred: that second `on_crash` invocation does not happen.
-// With the `_exit` bypass below compiled out via an env-gated no-op (so
-// `abort()`'s re-raise is free to run) and a signal-safe per-invocation probe
-// added ad hoc for this measurement, 8/8 runs of the SIGABRT-relay path
-// produced exactly ONE `on_crash` call, `context.exception.kind ==
-// EXC_SOFTWARE` (0x5) every time — never a second call, never `kind ==
-// EXC_CRASH` (0xa). The marker's `code` field is consequently
-// NON-discriminating between "the `_exit` bypass is present" and "it was
-// deleted outright": both were measured to write `code=0x5`, because in
-// neither case does a second, `EXC_CRASH`-carrying invocation ever occur to
-// overwrite it.
-//
-// A separate, later measurement confirms the same absence a different way:
-// 10/10 runs of the abort class, again with the `_exit` bypass deleted,
-// terminated promptly — sub-second, `exit=134` (the default SIGABRT
-// disposition) — every time, with the marker still holding `code=0x5`. The
-// marker file is opened `O_WRONLY|O_CREAT|O_TRUNC` (`crash.rs:238`), so a
-// second, `EXC_CRASH`-bearing invocation would have overwritten `0x5` with
-// `0xa` before any of these processes exited; it did not, in 10/10 runs.
-//
-// Why the second invocation never arrives, and why this class intermittently
-// hangs for minutes to hours on CI, is NOT established — unknown, not
-// inferred-and-therefore-good-enough. Do not add a guess here without new
-// measurement. This PR's justification is narrower and is itself measured:
-// the `_exit` bypass removes the process's exposure to the crash reporter
-// before `abort()`'s re-raise can produce whatever the second exception is,
-// and with it in place `crash_marker_abort` no longer hangs. That is
-// sufficient to justify the fix without a correct explanation of the
-// failure it fixes.
-//
-// Every fault class we handle reaches the crash reporter eventually —
-// confirmed by per-class `.ips` capture on darwin/arm64:
-// abort, segfault, bus, illegal_instruction, trap, and stack_overflow all
-// produce one. `termination.byProc` does NOT split cleanly along "port
-// attached vs. detached": segfault/bus/illegal_instruction/trap — real
-// faults crash-handler detaches and forwards in the same pass — report
-// `byProc: exc handler` in every captured instance, and plain `abort`
-// reports `byProc: crash_child`, as the dichotomy predicts for both — but
-// `stack_overflow` breaks it. It is also a real fault (`EXC_BAD_ACCESS`,
-// `KERN_PROTECTION_FAILURE` — a genuine guard-page hit, detached and
-// forwarded the same way as the other four) and yet its captured `.ips`
-// shows `termination.indicator: Abort trap: 6`, `byProc: crash_child`: the
-// forwarded fault reaches Rust's OWN stack-overflow signal handler
-// (`std::sys::pal::unix::stack_overflow::imp::signal_handler`, visible in
-// the faulting thread's backtrace), which calls `process::abort()` itself.
-// So `byProc` does not track which port was attached at fault time; it
-// tracks who executed the syscall that actually ended the process — the
-// process's own thread (`crash_child`) vs. a registered exception-handling
-// agent replying on its behalf (`exc handler`) — and a real, detached fault
-// can still end up in the first bucket if something in-process reacts to it
-// by calling `abort()`.
-//
-// Is `stack_overflow` exposed to the same hang, and does this fix
-// cover it? MEASURED: no to both, as far as the `_exit` bypass goes.
-// `is_macos_sigabrt_relay` requires `kind == EXC_SOFTWARE`; a captured
-// `stack_overflow` marker instead carries `code=0x1` (`EXC_BAD_ACCESS`) in
-// 5/5 local runs — `on_crash` sees the genuine guard-page fault, not a
-// SIGABRT relay, so the `_exit(EX_SOFTWARE)` bypass below never fires for
-// it, and this PR does not extend it to. All 5 runs still exited promptly
-// (134 = default SIGABRT disposition, the in-process `abort()` above going
-// unintercepted post-detach — not a hang, and not this fix's doing). That is
-// NOT a guarantee `stack_overflow` can never hang the way `abort`'s SIGABRT
-// relay did: 5 local runs is not the intermittent, load-sensitive CI
-// condition the hang was observed under. What IS source-grounded, not
-// inferred, is that `stack_overflow` cannot take the non-detaching code path
-// abort's relay takes: a guard-page hit is delivered through
-// `crash-handler`'s `MessageIds::Exception`/`ExceptionStateIdentity` handler
-// (`mac/state.rs`), the same branch that calls `detach(true)` for every
-// other real fault class above, whereas the SIGABRT relay is delivered
-// through the separate `MessageIds::SignalCrash` handler (`mac/state.rs`),
-// which never calls `detach` at all. That is a
-// verified difference in which code path each class takes through the
-// vendored crate — not a claim about what the kernel does with either port
-// afterward, which remains unknown. What would settle the open question:
-// the same 8-run, probe-instrumented measurement done above for `abort`, run
-// instead against `stack_overflow` under sustained CI-like load (parallel
-// test-suite pressure), watching for a stalled `wait_bounded`. Absent that,
-// `wait_bounded`'s 60s bound — not the `_exit` bypass — is the only thing
-// standing between a hypothetical `stack_overflow` hang and consuming the
-// whole job's wall, exactly as it was before this PR; the risk is
-// unmeasured, not eliminated.
-//
-// `on_crash` is not wired to see which detour a given call took (the SIGABRT
-// relay's "handled" reply is discarded — see the signal handler's ignored
-// return value — so returning `Handled(true)` there would not skip the
-// reporter hop the way it does for a real exception), so the escape is
-// structural: recognize the relay's exact signature and terminate before
-// `abort()`'s guaranteed re-raise can run at all.
-// `any(test, feature = "crash-child")`, not a bare `target_os = "macos"`:
-// this predicate exists only to feed the compile-time-gated `_exit` bypass
-// in `on_crash` below (crash-child builds) or the unit tests in
-// `crash_tests.rs` (test builds) — a plain macOS release build (neither) has
-// no caller for it, and leaving it universally compiled would make it dead
-// code there.
-#[cfg(all(target_os = "macos", any(test, feature = "crash-child")))]
-fn is_macos_sigabrt_relay(ctx: &crash_handler::CrashContext) -> bool {
-    matches!(
-        ctx.exception,
-        Some(crash_context::ExceptionInfo {
-            kind: mach2::exception_types::EXC_SOFTWARE,
-            code,
-            subcode: Some(subcode),
-        }) if code == mach2::exception_types::EXC_SOFT_SIGNAL as u64 && subcode == libc::SIGABRT as u64
-    )
+// `on_crash` runs in a COMPROMISED context: the heap and every lock in the
+// process may be held by a thread that will never run again. The marker
+// write is therefore allocation-free and lock-free on all three platforms —
+// a raw file open/write from a stack buffer plus the marker path pre-encoded
+// at attach time — with no `format!`, no locks, and no tracing. That is not
+// a nicety; see the macOS impl below for the measured deadlock it avoids.
+
+/// macOS: end the process here, without returning to `crash-handler`.
+///
+/// `-> !` is the contract, and the compiler enforces it: the macOS
+/// `on_crash` below has no other tail expression, so the termination cannot
+/// be made conditional without visibly inventing a `CrashEventResult` that
+/// arm does not otherwise have.
+#[cfg(target_os = "macos")]
+fn terminate_without_returning() -> ! {
+    // sysexits.h's EX_SOFTWARE, "internal software error" — not in the
+    // `libc` crate (BSD-only cruft), so spelled out here.
+    const EX_SOFTWARE: i32 = 70;
+    // SAFETY: `_exit` is async-signal-safe (POSIX.1-2017 §2.4.3): a bare
+    // syscall that runs no atexit handler and touches no libc or heap state.
+    unsafe { libc::_exit(EX_SOFTWARE) }
 }
 
-// SAFETY: on_crash runs in a COMPROMISED context (heap + locks unsafe). For
-// the always-on marker it does ONLY signal-safe work: a raw file open/write
-// from a stack buffer + the pre-encoded marker path, with no heap allocation
-// on the success path (the windows-crate wrappers allocate only on their
-// discarded failure paths, where the marker is lost anyway — best-effort),
-// no `format!`, no locks, and no tracing — this path is total across
-// Windows / macOS / Linux.
+// macOS: `on_crash` writes the marker and then never returns.
 //
-// The macOS-only `_exit` bypass below is likewise signal-safe (a bare
-// syscall — no atexit, no libc/heap state) and runs IMMEDIATELY after the
-// marker is durable, BEFORE the minidump branch — and only if the marker
-// write itself reported success (`write_marker_signal_safe`'s `bool`
-// return, also signal-safe): a failed write must fall through to the OS
-// reporter instead of exiting with zero diagnostics.
+// tombstone is observability only — "turn a silent process death into a
+// logged event on the next start". Once the marker is on disk the process
+// has nothing left to contribute, while everything that would run after
+// this callback returns is unbounded. A hung bridge is far worse than a
+// lost crash report: it still holds the TUN device, its routes and its pf
+// rules, and never reaches its own cleanup, so the user loses the network.
+// Detection of unclean shutdown does not depend on any of this — the
+// bridge's `bridge-{routes,plugins,dns}.json` state files are swept on the
+// next start and survive SIGKILL and power loss.
 //
-// That ordering is deliberate, not cosmetic. HYPOTHESIS, not confirmed:
-// vendored `crash-handler`'s Mach message loop (`mac/state.rs`) Mach-
-// suspends every other thread (`ScopedSuspend::new()`) before calling into
-// the user callback (`on_crash`), and on the SIGABRT-relay path the
-// suspended thread is the ABORTING thread itself — unlike a genuine
-// hardware fault, which halts at the faulting instruction, outside any
-// lock. The relay's own `send_message` does a `mach_msg` SEND (which wakes
-// the handler thread into that suspend) and then immediately blocks on a
-// condvar; that wait's first park in the process allocates internally
-// (`parking_lot_core::create_hashtable` → `Box::into_raw`). This is
-// CONSISTENT WITH, and PREDICTS, the observed abort-vs-fault asymmetry and
-// the darwin/amd64 load sensitivity: if the suspend lands while the
-// aborting thread holds the allocator's lock, any other allocation is
-// exactly what would deadlock. It is NOT DIRECTLY OBSERVED — no
-// suspended-thread backtrace has confirmed the allocator lock actually held
-// at suspend time. What would confirm it: a backtrace of the suspended
-// thread captured at the moment `write_minidump_best_effort` hangs, showing
-// that lock held. Because the minidump branch itself allocates
-// (`dmp_path_from_marker` builds a `PathBuf`, `File::create` builds a
-// `CString`, `MinidumpWriter` allocates internally), it must never run
-// before the `_exit` escape has had its chance on an allocation-free path.
+// What is unbounded, specifically:
 //
-// The minidump branch is DEV-ONLY (never linked in release/shipped
-// binaries), Win/mac ONLY (no in-process minidump on Linux — see the Linux
-// carve-out at `write_minidump_best_effort`), and MAY allocate / run
-// non-signal-safe code — accepted because it runs strictly AFTER the
-// signal-safe marker (and the `_exit` escape) have already had their turn,
-// so a fault inside the dump branch cannot lose the breadcrumb.
+//  * The SIGABRT relay never detaches. macOS has no exception for `abort()`,
+//    so crash-handler hooks SIGABRT with a `sigaction` and relays it as a
+//    synthesized `EXC_SOFTWARE`/`EXC_SOFT_SIGNAL` (`mac/signal.rs`). A real
+//    fault's branch calls `detach(true)` (`mac/state.rs`,
+//    `MessageIds::Exception`); the relay's branch (`MessageIds::SignalCrash`)
+//    contains no `detach` at all, so `abort()`'s C-mandated re-raise fires
+//    with the task exception port still attached.
+//  * Allocation in this callback can deadlock outright. crash-handler
+//    Mach-suspends every other thread before calling in (`ScopedSuspend`),
+//    so a thread suspended inside `malloc` never releases the allocator
+//    lock. MEASURED on darwin/arm64: an allocating `on_crash` hung 8/10 runs
+//    under allocator contention, with `sample(1)` showing this thread parked
+//    in `_os_unfair_lock_lock_slow` and a suspended thread holding the lock.
+//  * The system crash reporter's involvement is not something this process
+//    can bound at all.
+//
+// Calling `detach` from here does not fix the first point — it is what the
+// hang looks like. MEASURED, 2/2: `crash_handler::CrashHandler::detach()`
+// invoked from inside `on_crash` never returns. `call_user_callback` holds
+// `HANDLER.read()` across this callback and `state::detach` takes
+// `HANDLER.write()` on that same non-reentrant `parking_lot::RwLock`; the
+// `handler_thread.join()` beneath it would deadlock a second time, since
+// `on_crash` runs ON the handler thread. Upstream's own `detach(true)` is
+// reachable only from its message loop, after this returns.
+//
+// Restoring the task exception ports by hand instead — `uninstall`'s effect
+// without its lock — was measured too, and does not earn its keep: with the
+// ports restored the abort class terminates exactly as it does without them
+// (SIGABRT, sub-second, 3/3), and a fault raised INSIDE `on_crash` hangs
+// either way (2/2 with, 2/2 without). It buys nothing `_exit` does not.
+//
+// MEASURED, 3 runs each of abort, segfault, stack_overflow, bus,
+// illegal_instruction and trap on darwin/arm64: every one exits 70 in under
+// 0.02s. `stack_overflow` is covered by the same call and needs no special
+// case — it arrives as a genuine `EXC_BAD_ACCESS` guard-page fault, and
+// terminating on that first delivery means Rust's own stack-overflow
+// handler, which responds by calling `abort()`, never runs at all.
+//
+// Unconditional by construction: no fault-class predicate, no attach-`kind`
+// discriminator (`kind` never identified a process — `hole-common`'s
+// log-bridge test helpers attach as `"test"` too), and no cargo feature,
+// because a shipped `hole`, `hole bridge` and `galoshes` must not hang
+// either. `tests/crash_child.rs` pins each of those three separately.
+//
+// KNOWN COST, accepted deliberately: no `.ips` crash report and no
+// in-process minidump on macOS. The marker still carries kind, pid, tid,
+// exception code and fault address, which is what `sweep` reports; what is
+// lost is the stack. Reaching the reporter is exactly the unbounded step
+// this exists to remove.
+#[cfg(target_os = "macos")]
 unsafe impl crash_handler::CrashEvent for MarkerCrashEvent {
     fn on_crash(&self, context: &crash_handler::CrashContext) -> crash_handler::CrashEventResult {
-        // 1. ALWAYS (Win/mac/Linux): write the signal-safe marker first.
-        let marker_written = write_marker_signal_safe(self.state, context);
-        // `marker_written` is read below only on macOS `crash-child` builds
-        // (it gates the test-only `_exit` bypass); this no-op read keeps it
-        // from tripping `unused_variables` under `-D warnings` on every other
-        // build, where nothing else consumes it.
-        let _ = marker_written;
+        write_marker_signal_safe(self.state, context);
+        terminate_without_returning()
+    }
+}
 
-        // 2. macOS-ONLY: stop the system crash reporter from ever seeing
-        // THIS SPECIFIC process kind, instead of relying on it to behave.
-        //
-        // Gated `feature = "crash-child"` as a COMPILE-TIME fact narrows WHEN
-        // this code exists at all — it is off by default, and shipped
-        // gui/bridge/galoshes builds never link it in (see Cargo.toml). It
-        // does NOT narrow WHICH process it can fire in once the feature IS
-        // on: Cargo's feature unification builds one `tombstone` with
-        // `crash-child` enabled for the WHOLE dependency graph under a given
-        // `cargo`/`nextest` invocation, and CI's nextest run (ci.yaml) covers
-        // `package(hole-common)` in the SAME invocation as
-        // `package(tombstone)` — so `hole-common`'s own log-bridge test
-        // helpers (`logging_test_helpers.rs`, which call
-        // `logging::init(..., "test", ...)` → `tombstone::attach("test",
-        // log_dir)`) compile this branch in too. The runtime `kind` check
-        // below is therefore the ONLY thing that confines the bypass to
-        // `crash_child`: that bin attaches under its own dedicated
-        // `"crash-child"` kind (see its module doc comment), a string no
-        // other caller in the workspace uses, so a SIGABRT in
-        // `hole-common`'s test subprocess still reaches the OS reporter
-        // instead of being silently rewritten to a clean `_exit(70)`. See
-        // `is_macos_sigabrt_relay` for why only the SIGABRT relay needs this
-        // at all.
-        //
-        // Three tests pin this conjunction, each covering the condition the
-        // others can't: `crash_marker_abort` (`tests/crash_child.rs`)
-        // asserts the child's exit status IS `EX_SOFTWARE` — measured to
-        // fail if the whole `if` is disabled, but NOT if only
-        // `is_macos_sigabrt_relay(context)` is dropped, since
-        // `self.state.kind == "crash-child"` alone still lets abort's relay
-        // through. `crash_marker_segfault` closes exactly that gap: a real
-        // fault's `CrashContext` never matches `is_macos_sigabrt_relay`, so
-        // it asserts the child instead dies by its real signal (`SIGSEGV`)
-        // — measured to fail (child wrongly exits 70) if
-        // `is_macos_sigabrt_relay(context)` is dropped, because this process
-        // also runs under `kind == "crash-child"`. `crash_marker_abort_non_crash_child_kind_still_dies_by_sigabrt`
-        // closes the kind-discriminator gap itself: it spawns `crash_child`
-        // with `TOMBSTONE_TEST_ATTACH_KIND=test`, i.e. the exact kind
-        // `hole-common`'s log-bridge tests use, and asserts the child dies
-        // by real `SIGABRT` instead of taking the bypass — measured to fail
-        // (child wrongly exits 70) if the `kind` string this `if` compares
-        // against is widened back to `"test"`.
-        #[cfg(all(target_os = "macos", feature = "crash-child"))]
-        if marker_written && self.state.kind == "crash-child" && is_macos_sigabrt_relay(context) {
-            // SAFETY: `_exit` is async-signal-safe (POSIX.1-2017 §2.4.3): a
-            // bare syscall, no atexit handlers, no libc/heap state touched.
-            // Terminating here — before returning from this call, and so
-            // before `abort()`'s guaranteed re-raise can run — means the
-            // real `EXC_CRASH` this relay would otherwise trigger never
-            // happens, and the child never reaches the host-level exception
-            // port (ReportCrash). 70 is sysexits.h's `EX_SOFTWARE` (not in
-            // the `libc` crate — it's BSD-only cruft), documenting
-            // "abnormal, internal" in the exit status that
-            // `crash_marker_abort` asserts on.
-            const EX_SOFTWARE: i32 = 70;
-            unsafe { libc::_exit(EX_SOFTWARE) };
-        }
+// Windows and Linux: write the marker, then hand back to the OS default.
+//
+// Neither has macOS's shape. Windows runs `on_crash` on the faulting thread
+// via an exception filter, and Linux on the crashing thread in a signal
+// handler; neither suspends other threads or routes the callback through a
+// second thread, so returning does not walk into the machinery above.
+// Returning `Handled(false)` keeps the OS default path — WER LocalDumps,
+// or a re-raise to the default signal disposition and a core dump.
+//
+// The dev-only minidump branch is Windows-only and MAY allocate; it runs
+// after the signal-safe marker is already durable, so a fault inside it
+// cannot cost the breadcrumb.
+#[cfg(not(target_os = "macos"))]
+unsafe impl crash_handler::CrashEvent for MarkerCrashEvent {
+    fn on_crash(&self, context: &crash_handler::CrashContext) -> crash_handler::CrashEventResult {
+        write_marker_signal_safe(self.state, context);
 
-        // 3. dev-only, Win/mac ONLY: best-effort minidump. Linux gets NO
-        // in-process minidump — even with crash-dumps enabled, tombstone writes
-        // only the marker there. See the Linux carve-out at
-        // `write_minidump_best_effort`. Runs AFTER the `_exit` bypass above —
-        // see the SAFETY comment on this impl for why the ordering matters.
-        #[cfg(all(feature = "crash-dumps", any(windows, target_os = "macos")))]
+        #[cfg(all(feature = "crash-dumps", windows))]
         write_minidump_best_effort(self.state, context);
 
-        // Forward to the OS default (Windows: WER LocalDumps; macOS: previous
-        // Mach exception port → .ips; Linux: re-raises the default signal
-        // disposition → core dump if enabled). Only ever construct
-        // Handled(_) — Jump is not used.
+        // Only ever construct Handled(_) — Jump is not used.
         crash_handler::CrashEventResult::Handled(false)
     }
 }

@@ -192,13 +192,11 @@ async fn sweep_reports_malformed_marker() {
     assert!(!marker.exists(), "malformed marker deleted after report");
 }
 
-// `write_marker_signal_safe`'s `bool` return is what `on_crash` gates the
-// macOS `_exit` bypass on: a marker write that fails must NOT be
-// reported as a success, or the bypass would fire with zero diagnostics on
-// disk. This covers the open-failure half of that contract (a bad marker
-// path). It does NOT cover a failed/short `write(2)` on an otherwise-good
-// fd — there is no clean macOS mechanism (no `/dev/full`) to force that; see
-// the Coverage table entry for the `marker_written &&` gate mutant.
+// `write_marker_signal_safe` is best-effort and infallible: it writes what
+// it can and returns. What must hold is that a GOOD path really gets the
+// marker, and that an unopenable one is survived rather than propagated —
+// the `fd < 0` branch, which on a crash path has no signal-safe way to
+// report anything anyway.
 #[cfg(target_os = "macos")]
 mod write_marker_signal_safe_tests {
     use crate::crash::{write_marker_signal_safe, HandlerState};
@@ -223,102 +221,66 @@ mod write_marker_signal_safe_tests {
     }
 
     #[skuld::test]
-    fn true_on_success_false_on_open_failure() {
+    fn writes_a_good_path_and_survives_an_unopenable_one() {
         let dir = tempfile::tempdir().expect("tempdir");
         let good = dir.path().join("crash-test-1.marker");
         // Under a nonexistent directory: `open(O_CREAT)` fails with ENOENT.
         let bad = dir.path().join("does-not-exist").join("crash-test-2.marker");
 
-        assert!(write_marker_signal_safe(&state_for(&good), &ctx()));
-        assert!(good.exists(), "the good path was actually written");
-        assert!(!write_marker_signal_safe(&state_for(&bad), &ctx()));
+        write_marker_signal_safe(&state_for(&good), &ctx());
+        let text = std::fs::read_to_string(&good).expect("the good path was actually written");
+        assert!(text.starts_with("tombstone-marker v1\n"), "got: {text}");
+
+        // The open-failure branch: returns normally, leaves nothing behind.
+        write_marker_signal_safe(&state_for(&bad), &ctx());
+        assert!(!bad.exists());
     }
 }
 
-// `is_macos_sigabrt_relay` identifies the exact synthetic-exception
-// signature crash-handler's SIGABRT sigaction relay produces on macOS:
-// EXC_SOFTWARE / EXC_SOFT_SIGNAL / subcode == SIGABRT. Every field must
-// match — a fault class that shares two of three fields with a real abort
-// relay must NOT be misidentified as one, or the
-// `_exit` bypass in `on_crash` would swallow a genuine crash report.
+// The macOS `on_crash` must terminate the process for EVERY crash, in EVERY
+// binary that links tombstone. `tests/crash_child.rs` pins "every fault
+// class" and "every attach kind" by crashing real children, but it cannot
+// pin "every BUILD": those tests only exist under `crash-child`, so a
+// termination re-gated on a cargo feature would still look green there
+// while shipped `hole` / `hole bridge` / `galoshes` kept the hang. A
+// safety net that only arms in test builds is not a safety net.
+//
+// Two things already guard this structurally — the impl's sole tail
+// expression is a `-> !` call, so making the termination conditional means
+// visibly inventing a `CrashEventResult`; and there is no `kind` or feature
+// left in that impl to branch on. This asserts the second directly, because
+// it is the one a future edit could quietly undo.
 #[cfg(target_os = "macos")]
-mod is_macos_sigabrt_relay_tests {
-    use crate::crash::is_macos_sigabrt_relay;
+#[skuld::test]
+fn macos_on_crash_terminates_unconditionally() {
+    let src = include_str!("crash.rs");
+    let start = src
+        .find("#[cfg(target_os = \"macos\")]\nunsafe impl crash_handler::CrashEvent for MarkerCrashEvent {")
+        .expect("macOS CrashEvent impl present (did the attribute or impl header change?)");
+    let body = &src[start..];
+    let end = body.find("\n}\n").expect("impl is brace-terminated") + 3;
+    let body = &body[..end];
 
-    fn ctx_with(exception: Option<crash_context::ExceptionInfo>) -> crash_handler::CrashContext {
-        crash_handler::CrashContext {
-            task: 0,
-            thread: 0,
-            handler_thread: 0,
-            exception,
-        }
-    }
-
-    fn abort_relay_exception() -> crash_context::ExceptionInfo {
-        crash_context::ExceptionInfo {
-            kind: mach2::exception_types::EXC_SOFTWARE,
-            code: mach2::exception_types::EXC_SOFT_SIGNAL as u64,
-            subcode: Some(libc::SIGABRT as u64),
-        }
-    }
-
-    #[skuld::test]
-    fn matches_the_exact_sigabrt_relay_signature() {
-        let ctx = ctx_with(Some(abort_relay_exception()));
-        assert!(is_macos_sigabrt_relay(&ctx));
-    }
-
-    #[skuld::test]
-    fn rejects_no_exception() {
-        // e.g. a directly-invoked on_crash in a test double, or a context
-        // crash-handler itself never populates this way in practice — must
-        // not panic on None, must not match.
-        let ctx = ctx_with(None);
-        assert!(!is_macos_sigabrt_relay(&ctx));
-    }
-
-    #[skuld::test]
-    fn rejects_a_real_hardware_exception_kind() {
-        // EXC_BAD_ACCESS (segfault/bus) — same subcode SHAPE class
-        // (Some(u64)) but a different `kind`. Must not be conflated with the
-        // SIGABRT relay just because both carry a subcode.
-        let mut exc = abort_relay_exception();
-        exc.kind = mach2::exception_types::EXC_BAD_ACCESS;
-        let ctx = ctx_with(Some(exc));
-        assert!(!is_macos_sigabrt_relay(&ctx));
-    }
-
-    #[skuld::test]
-    fn rejects_exc_software_with_a_different_code() {
-        // Right kind (EXC_SOFTWARE), wrong code — EXC_SOFTWARE is also used
-        // for other synthetic conditions (e.g. EXC_SOFT_TRACE_BREAKPOINT), not
-        // exclusively the SIGABRT relay.
-        let mut exc = abort_relay_exception();
-        exc.code = 0;
-        let ctx = ctx_with(Some(exc));
-        assert!(!is_macos_sigabrt_relay(&ctx));
-    }
-
-    #[skuld::test]
-    fn rejects_exc_soft_signal_for_a_different_signal() {
-        // Right kind + code, but the relayed signal is NOT SIGABRT (e.g.
-        // SIGTERM can also in principle be relayed through EXC_SOFT_SIGNAL) —
-        // must not fire the abort-only bypass for a different signal.
-        let mut exc = abort_relay_exception();
-        exc.subcode = Some(libc::SIGTERM as u64);
-        let ctx = ctx_with(Some(exc));
-        assert!(!is_macos_sigabrt_relay(&ctx));
-    }
-
-    #[skuld::test]
-    fn rejects_missing_subcode() {
-        // kind + code match, but subcode is None — cannot confirm it's
-        // SIGABRT specifically, so must not match.
-        let mut exc = abort_relay_exception();
-        exc.subcode = None;
-        let ctx = ctx_with(Some(exc));
-        assert!(!is_macos_sigabrt_relay(&ctx));
-    }
+    // One `cfg` only: the `target_os = "macos"` attribute this match started
+    // at. Anything else is a build-dependent termination.
+    assert_eq!(
+        body.matches("#[cfg(").count(),
+        1,
+        "macOS on_crash must not be gated on anything but the platform: {body}"
+    );
+    assert!(
+        !body.contains("feature ="),
+        "macOS on_crash must not be gated on a cargo feature — shipped builds need it too: {body}"
+    );
+    assert!(
+        !body.contains("kind"),
+        "macOS on_crash must not discriminate on the attach kind — it never identified a \
+         process (hole-common's log-bridge helpers attach as \"test\" too): {body}"
+    );
+    assert!(
+        body.contains("terminate_without_returning()"),
+        "macOS on_crash must end by terminating: {body}"
+    );
 }
 
 #[skuld::test]

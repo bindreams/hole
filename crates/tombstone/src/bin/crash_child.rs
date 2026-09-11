@@ -10,13 +10,11 @@
 //! before any crash-class handling below, give those tests a child whose
 //! exit timing is deterministic without needing a real native fault.
 //!
-//! Attaches under its own dedicated `"crash-child"` kind by default — the
-//! SIGABRT-relay `_exit` bypass in `crash::on_crash` is keyed on that exact
-//! string so it can never fire for a real `hole-{gui,bridge,common}` process,
-//! which attaches under `"gui"`/`"bridge"`/`"test"` instead. A test that
-//! needs to simulate one of those other kinds hitting the relay (e.g. to
-//! prove the bypass does NOT fire for them) can override it with
-//! `TOMBSTONE_TEST_ATTACH_KIND`.
+//! Attaches under its own dedicated `"crash-child"` kind by default, purely
+//! so the marker filename is unambiguous when several tests run at once.
+//! `crash::on_crash` does NOT branch on `kind`, and
+//! `TOMBSTONE_TEST_ATTACH_KIND` lets a test prove it by attaching under a
+//! kind a real `hole-{gui,bridge,common}` process would use.
 //!
 //! No sleeps. Modeled on crates/handle-holders/src/bin/hold_file.rs.
 
@@ -44,9 +42,9 @@ fn main() {
     let log_dir = std::path::PathBuf::from(log_dir);
 
     // Defaults to this binary's own dedicated kind (see the module doc
-    // comment); a test can override it to simulate a different real caller's
-    // kind hitting the SIGABRT relay. `Box::leak` is fine here: this process
-    // crashes or exits within milliseconds of this call.
+    // comment); a test can override it to simulate a different real caller.
+    // `Box::leak` is fine here: this process crashes or exits within
+    // milliseconds of this call.
     let kind: &'static str = match std::env::var("TOMBSTONE_TEST_ATTACH_KIND") {
         Ok(k) => Box::leak(k.into_boxed_str()),
         Err(_) => "crash-child",

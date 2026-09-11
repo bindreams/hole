@@ -1539,8 +1539,23 @@ Rust's unwinding panic hook. The first-party Apache-2.0
 `install_panic_hook()`), covering GUI/CLI/bridge; galoshes attaches in its own
 `main`. On a fault, `on_crash` runs in a compromised context and does only
 signal-safe work: write a fixed-format `crash-<kind>-<pid>.marker` via raw
-syscalls (no heap/locks/`format!`), then return `Handled(false)` so the OS
-default path (WER / `.ips` / core dump) still runs. All I/O errors are swallowed.
+syscalls (no heap/locks/`format!`). All I/O errors are swallowed.
+
+On Windows and Linux it then returns `Handled(false)` so the OS default path
+(WER / core dump) still runs. **On macOS it never returns** — it `_exit(70)`s,
+for every fault class, every attach kind and every build. tombstone is
+observability only, and everything that would run after that callback returns
+is unbounded: crash-handler's SIGABRT relay never detaches (`mac/state.rs`'s
+`MessageIds::SignalCrash` branch, unlike the real-fault branch beside it), it
+Mach-suspends every other thread before calling in — so any allocation in the
+callback can deadlock against a thread suspended mid-`malloc`, measured at
+8/10 runs under contention — and the system crash reporter's involvement
+cannot be bounded from in-process at all. A hung bridge still holds the TUN
+device and its routes and never reaches its own cleanup, so a lost `.ips`
+is the cheaper loss; unclean shutdown is detected by the `bridge-*.json`
+state files regardless. Calling `detach` from the callback is not the
+alternative — it is measured to hang outright, since `call_user_callback`
+holds crash-handler's `HANDLER` read lock across it. See bindreams/hole#842.
 `tombstone::sweep(log_dir)` runs at the next start of the same kind, emits a
 `tracing::error!(target: "crash", …)`, and deletes the marker. Markers land in
 `log_dir` (not `state_dir`) so the elevated bridge's marker is readable by the
@@ -1551,10 +1566,12 @@ unprivileged GUI.
   Linux runtime crash tests are a known gap (compile-verified via the galoshes
   Linux build; runtime-exercised only on the Win/mac `hole-tests` lane).
 - **Dev-only minidumps:** under the non-default `crash-dumps` feature, `on_crash`
-  also writes a `.dmp` via `minidump-writer` — **Windows/macOS only** (no
-  in-process Linux self-dump). `minidump-writer` never links into a shipped
-  binary (process memory holds keys + traffic, and it has no Windows-aarch64
-  support).
+  also writes a `.dmp` via `minidump-writer` — **Windows only**. Linux never had
+  an in-process self-dump; macOS gave its up in #842, because `minidump-writer`
+  allocates and the macOS callback cannot allocate without risking the deadlock
+  above. `minidump-writer` is declared under `cfg(windows)`, so it links into no
+  other target at all (process memory holds keys + traffic, and it has no
+  Windows-aarch64 support).
 - **Plugins:** ex-ray is spawned with `GOTRACEBACK=crash`; `record_exit` logs a
   mid-run plugin death with `exit_code`/`killed`.
 - **Known gap (accepted, untested):** Windows `__fastfail` / `int 29h` (incl.

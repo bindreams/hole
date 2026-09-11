@@ -5,12 +5,14 @@
 //! wrote BEFORE termination. The child is the dedicated `crash_child` bin.
 //! Waiting on the child's exit is the sanctioned external-process-exit
 //! no-sleep exception (the marker write happens-before the parent read via
-//! process exit). We do NOT assert on the exit STATUS for most classes — a
-//! native fault's exit code is non-deterministic across platforms/fault
-//! classes. The one deliberate exception is `crash_marker_abort` on macOS,
-//! where `crash::on_crash`'s `_exit(EX_SOFTWARE)` bypass makes the exit
-//! status a controlled, assertable fact instead of "whatever the OS's
-//! default disposition for this signal happens to produce" — see that test.
+//! process exit).
+//!
+//! On Windows and Linux a native fault's exit status is whatever the OS's
+//! default disposition produces, so nothing here asserts on it. On macOS it
+//! is a controlled fact for EVERY class: `crash::on_crash` never returns
+//! there, it `_exit(70)`s. `assert_macos_terminated_by_tombstone` pins that
+//! on each class, and is what fails — instead of `wait_bounded`'s bound
+//! expiring — if the termination is ever weakened.
 //!
 //! Integration-test target, not a unit-test module, because
 //! `CARGO_BIN_EXE_crash_child` is only set for `tests/*.rs` (and benches),
@@ -49,10 +51,9 @@ fn crash_child_bin() -> std::path::PathBuf {
 // (the sanctioned no-sleep exception: "awaiting … a child-process exit …
 // where the timeout is the failure bound surfaced to a human," never a bet
 // that N is long enough for the happy path). It is a SAFETY NET, not the
-// fix for the underlying hang: the actual cause — macOS's SIGABRT relay
-// taking a second trip through the host crash reporter — is addressed
-// structurally in `crash::is_macos_sigabrt_relay`/`on_crash`, which stops
-// `crash_marker_abort`'s child from ever reaching the reporter. This bound
+// fix for the underlying hang: that is addressed structurally in
+// `crash::on_crash`, which on macOS terminates the process itself rather
+// than returning into machinery this process cannot bound. This bound
 // still earns its keep independently: it turns ANY future test-child stall,
 // for ANY reason (a new fault class, a reporter regression, a platform
 // change), into one test failing loudly in ~60s instead of silently
@@ -201,9 +202,9 @@ fn wait_bounded(mut child: std::process::Child, bound: std::time::Duration) -> s
                 "crash_child (pid {pid}) did not exit within {bound:?} — reaped with status \
                  {status:?} ({termination_proof}). This is the child-process-exit failure \
                  bound, not a synchronization timeout: if this fires, the child genuinely \
-                 stalled (most likely exposure to the macOS crash reporter that \
-                 `crash::is_macos_sigabrt_relay` is meant to prevent) and needs investigation, \
-                 not a longer bound."
+                 stalled and needs investigation, not a longer bound. On macOS `crash::on_crash` \
+                 terminates the process itself, so a stall there means it never reached that \
+                 call — e.g. the marker write itself blocked."
             );
         }
         Err(e) => {
@@ -249,6 +250,40 @@ fn assert_marker(log_dir: &std::path::Path, kind: &str, expect_code_nonzero: boo
     }
 }
 
+/// macOS: `crash::on_crash` never returns — it writes the marker and then
+/// `_exit(EX_SOFTWARE)`s, for every fault class and every attach kind. So
+/// the child's exit status is a controlled fact rather than whatever the
+/// OS's default disposition for that signal would produce, and asserting on
+/// it pins the termination directly.
+///
+/// This is the one assertion that catches a weakened termination as a
+/// FAILURE rather than as `wait_bounded`'s bound expiring: neutralise the
+/// `_exit`, or make it conditional on the fault class / attach kind / a
+/// cargo feature again, and the affected classes die by their raw signal
+/// here instead.
+#[cfg(all(feature = "crash-child", target_os = "macos"))]
+fn assert_macos_terminated_by_tombstone(output: &std::process::Output, case: &str) {
+    use std::os::unix::process::ExitStatusExt;
+    assert_eq!(
+        output.status.signal(),
+        None,
+        "{case}: on_crash must terminate the child itself, not let it die by a signal: {:?}",
+        output.status
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(70),
+        "{case}: child must exit with EX_SOFTWARE (70): {:?}",
+        output.status
+    );
+}
+
+/// Windows/Linux keep the OS default disposition, so there is no controlled
+/// exit status to assert. Taking `output` anyway keeps every call site
+/// uniform (and consumes it, so nothing needs an `unused` shim).
+#[cfg(all(feature = "crash-child", not(target_os = "macos")))]
+fn assert_macos_terminated_by_tombstone(_output: &std::process::Output, _case: &str) {}
+
 #[cfg(feature = "crash-child")]
 fn marker_field<'a>(text: &'a str, key: &str) -> Option<&'a str> {
     text.lines()
@@ -267,131 +302,40 @@ macro_rules! crash_class_test {
         #[skuld::test]
         fn $name() {
             let dir = tempfile::tempdir().expect("tempdir");
-            let _ = run_crash_child($class, dir.path());
+            let output = run_crash_child($class, dir.path());
             assert_marker(dir.path(), "crash-child", true);
+            assert_macos_terminated_by_tombstone(&output, $class);
         }
     };
 }
 
-// Cross-platform fault classes.
+// Cross-platform fault classes. Every one of them asserts the macOS exit
+// status, because the termination there is unconditional across classes —
+// `stack_overflow` included, which matters most: it arrives as a genuine
+// `EXC_BAD_ACCESS` guard-page fault, and terminating on that first delivery
+// means Rust's own stack-overflow handler (which responds by calling
+// `abort()`) never runs at all.
+crash_class_test!(crash_marker_segfault, "segfault");
+crash_class_test!(crash_marker_abort, "abort");
 crash_class_test!(crash_marker_stack_overflow, "stack_overflow");
 crash_class_test!(crash_marker_illegal_instruction, "illegal_instruction");
 crash_class_test!(crash_marker_trap, "trap");
 
-// `segfault` is written by hand, NOT via `crash_class_test!`, because on
-// macOS it is the negative case that pins `is_macos_sigabrt_relay`'s half of
-// the `on_crash` bypass condition (see the comment on that `if` in
-// `crash.rs`): a real fault's `CrashContext` never matches
-// `is_macos_sigabrt_relay` (that helper only matches the synthesized
-// `EXC_SOFTWARE`/`EXC_SOFT_SIGNAL`/`SIGABRT` triple SIGABRT gets relayed as),
-// so segfault must NOT take the `_exit(EX_SOFTWARE)` bypass — it must still
-// die by its real signal (`SIGSEGV`, 11). Measured: deleting
-// `is_macos_sigabrt_relay(context)` from that `if` (leaving only
-// `self.state.kind == "crash-child"`) makes THIS process — which also runs
-// under `kind == "crash-child"` — take the bypass too, exiting 70 instead of
-// being killed by SIGSEGV; every other class here only asserts the marker
-// file exists, so nothing else in this binary would have noticed that
-// regression.
+// The one class NOT covered by `crash_class_test!`, because it varies the
+// attach KIND rather than the fault class. `crash::on_crash`'s macOS
+// termination deliberately has no `kind` discriminator: `kind` never
+// identified a process in the first place (`hole-common`'s log-bridge test
+// helpers attach as `"test"`, the same string a `hole` test process uses),
+// and a shipped `hole`/`hole bridge`/`galoshes` must not hang either.
+// Re-introduce any `self.state.kind == …` guard and this child — attaching
+// under a kind the guard would not name — dies by raw SIGABRT instead.
 #[cfg(feature = "crash-child")]
 #[skuld::test]
-fn crash_marker_segfault() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let output = run_crash_child("segfault", dir.path());
-    assert_marker(dir.path(), "crash-child", true);
-
-    #[cfg(target_os = "macos")]
-    {
-        use std::os::unix::process::ExitStatusExt;
-        assert_eq!(
-            output.status.signal(),
-            Some(libc::SIGSEGV),
-            "segfault child must die by SIGSEGV, not take the SIGABRT-relay `_exit` bypass: {:?}",
-            output.status
-        );
-    }
-    // Non-macOS: `output` is read only inside the block above.
-    #[cfg(not(target_os = "macos"))]
-    let _ = &output;
-}
-
-// `abort` is written by hand, NOT via `crash_class_test!`, because — unlike
-// every other class, whose exit status is genuinely non-deterministic
-// across platforms (see the file header) — macOS's abort case is made
-// deterministic on purpose by `crash::on_crash`'s `_exit(EX_SOFTWARE)`
-// bypass, and that determinism is exactly what this test needs somewhere
-// to assert on.
-#[cfg(feature = "crash-child")]
-#[skuld::test]
-fn crash_marker_abort() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let output = run_crash_child("abort", dir.path());
-    assert_marker(dir.path(), "crash-child", true);
-
-    // macOS only: this is the one platform/class combination where
-    // `on_crash`'s `_exit(EX_SOFTWARE)` bypass fires (see
-    // `is_macos_sigabrt_relay`), so it is the one place an exit-status
-    // assertion is meaningful rather than a coin flip. It exists to catch a
-    // regression in the bypass itself: delete the `_exit` call, or weaken
-    // its `#[cfg(all(target_os = "macos", feature = "crash-child"))]`/
-    // `kind == "crash-child"` conjunction, and this assertion fails — either the
-    // child goes on to deliver a raw, differently-coded `SIGABRT`, or (the
-    // actual bug this guards against) it hangs and `wait_bounded`'s 60s
-    // bound fails the test instead.
-    #[cfg(target_os = "macos")]
-    {
-        use std::os::unix::process::ExitStatusExt;
-        assert_eq!(
-            output.status.signal(),
-            None,
-            "abort child must exit via _exit(EX_SOFTWARE), not be killed by a signal: {:?}",
-            output.status
-        );
-        assert_eq!(
-            output.status.code(),
-            Some(70),
-            "abort child must exit with EX_SOFTWARE (70): {:?}",
-            output.status
-        );
-    }
-    // Non-macOS: `output` is read only inside the block above.
-    #[cfg(not(target_os = "macos"))]
-    let _ = &output;
-}
-
-// Regression test for review M2: `crash::on_crash`'s `_exit` bypass is keyed
-// on `self.state.kind == "crash-child"`, NOT the shared `"test"` string that
-// `hole-common`'s log-bridge test helpers (`logging_test_helpers.rs`, via
-// `logging::init(..., "test", ...)`) also attach under. Simulates that exact
-// caller by overriding this child's attach kind to `"test"` and raising
-// `abort` — the SIGABRT relay must still reach the OS reporter as a real
-// `SIGABRT`, not be silently rewritten to a clean `_exit(EX_SOFTWARE)`.
-// Measured: widening the discriminator back to `self.state.kind == "test"`
-// makes this test's child take the bypass and exit 70 instead of dying by
-// SIGABRT.
-#[cfg(feature = "crash-child")]
-#[skuld::test]
-fn crash_marker_abort_non_crash_child_kind_still_dies_by_sigabrt() {
+fn crash_marker_abort_under_a_foreign_attach_kind_terminates_the_same_way() {
     let dir = tempfile::tempdir().expect("tempdir");
     let output = run_crash_child_with_attach_kind("abort", dir.path(), "test");
     assert_marker(dir.path(), "test", true);
-
-    // macOS only: this is the one platform where the `_exit` bypass could
-    // fire at all (see `is_macos_sigabrt_relay`), so it is the one place
-    // this assertion is meaningful rather than a coin flip.
-    #[cfg(target_os = "macos")]
-    {
-        use std::os::unix::process::ExitStatusExt;
-        assert_eq!(
-            output.status.signal(),
-            Some(libc::SIGABRT),
-            "a non-crash_child kind's abort must die by real SIGABRT, not take the \
-             crash_child-only `_exit` bypass: {:?}",
-            output.status
-        );
-    }
-    // Non-macOS: `output` is read only inside the block above.
-    #[cfg(not(target_os = "macos"))]
-    let _ = &output;
+    assert_macos_terminated_by_tombstone(&output, "abort under kind=test");
 }
 
 // x86-only: integer divide-by-zero raises SIGFPE on x86, but is non-trapping on
@@ -413,9 +357,10 @@ crash_class_test!(crash_marker_bus, "bus", unix);
 
 // Gated on BOTH features (crash-dumps = the .dmp branch under test;
 // crash-child = it spawns the crash_child bin via run_crash_child) AND on
-// Win/mac — Linux intentionally writes NO in-process .dmp (the carve-out),
-// so this assertion is meaningful only on the platforms with a dump branch.
-#[cfg(all(feature = "crash-dumps", feature = "crash-child", any(windows, target_os = "macos")))]
+// Windows — the only platform with an in-process dump branch left. Linux
+// never had one (the carve-out); macOS gave its up so that `on_crash` can
+// terminate without ever allocating (see `crash.rs`).
+#[cfg(all(feature = "crash-dumps", feature = "crash-child", windows))]
 #[skuld::test]
 fn crash_writes_minidump_segfault() {
     let dir = tempfile::tempdir().expect("tempdir");

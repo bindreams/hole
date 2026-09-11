@@ -8515,12 +8515,10 @@ dependencies = [
 name = "tombstone"
 version = "0.1.0"
 dependencies = [
- "crash-context",
  "crash-handler",
  "garter",
  "hole-test-observability",
  "libc",
- "mach2",
  "minidump-writer",
  "sadness-generator",
  "skuld",
