@@ -1349,6 +1349,65 @@ Two more properties are load-bearing:
   escape from the gate itself, so a release that can never succeed cannot make
   the product unremovable (see RELEASE-OPS.md).
 
+##### What the gate can prove, and what it only attempted
+
+`Return="check"` reads an exit code as "safe to delete the binary", so the
+question is what a zero exit actually establishes. A delete-by-key answers one
+of three things — removed, not found, or a genuine failure — and "not found"
+has always been folded in as benign (`first_delete_failure`). For a
+`FWPM_FILTER_FLAG_PERSISTENT` filter that is sound: BFE's store is the key's
+only record and the delete addresses it directly, so an empty answer proves the
+key carries nothing. For a `FWPM_FILTER_FLAG_BOOTTIME` filter it proves less.
+A boot-time object is live only between kernel start and BFE start, so on any
+later boot the key answers "not found" **whether or not a boot-time policy
+record is still provisioned behind it** — and nothing this crate can call
+separates the two. On the boot where uninstall matters most (lockdown armed in
+an earlier session, the user uninstalls without ever connecting) every such key
+answers empty, and a bare `Ok` told the MSI it was safe to delete the only
+binary that could act on it — #1003 recreated for the pre-BFE window.
+
+So `release_all` no longer returns a bare `Ok`. Its payload is a
+`failclosed::Clearance`: `Ok` still means no delete failed, while
+`Clearance::is_proven` is the narrower claim that every empty answer *proved*
+its key empty. `#[must_use]` keeps a caller from collapsing them again, and the
+lifetime rides on the key itself (`SweptKey`) rather than in a parallel
+"which of these are boot-time" list — the two would drift, silently and in the
+direction that hurts.
+
+**An unproven key does not fail the release**, and that is a deliberate
+sizing call rather than an oversight. Both readings of Microsoft's docs agree a
+boot-time filter stops applying once BFE starts, so a stranded record blocks
+egress across the boot→BFE window only — seconds, before anything user-facing
+is on the network. Refusing the uninstall over that would trade it for a
+permanently unremovable product: the same trade the bookkeeping clause above
+already refuses. The gate stops claiming proof it does not have; it does not
+withhold the uninstall. What replaces the silence is
+`cutover::release_clearance_report`, which `bridge release-covers` and `bridge uninstall` both print: it names each unproven key and points at `netsh wfp`,
+because this is the last moment a Hole binary exists to say anything at all.
+It deliberately does not assert a leftover is *present* — an unproven key is
+equally consistent with never having been installed, which is what it will be
+on almost every uninstall.
+
+Today every key Hole sweeps is `Persistent`, so the unproven set is empty and
+the report never fires (`a_sweep_of_todays_keys_proves_every_one_of_them_empty`
+pins that). The ordering is on purpose: the gate lands **before** the
+boot-time filters of #998/#1010 do, so they cannot arrive as a silent false
+`Ok`. `a_boot_time_flag_cannot_be_introduced_without_classifying_its_key` is
+the tripwire — a source-level check, because the fact it guards spans a runtime
+`FilterSpec` and a static sweep array and no type holds both.
+
+The in-process escapes (`disengage_lockdown`, `ProxyManager::turn_lockdown_off`,
+the tray's Unblock) share the same boot-time blind spot and deliberately do
+**not** gate on it: they leave the binary on disk, the next engage re-arms the
+key, and `hole bridge unlock` stays reachable. `Routing::release_all_covers` is
+the one site sanctioned to drop the `Clearance`, and says so.
+
+Not established by any of this, and not claimed: whether a by-key delete purges
+the underlying boot-time policy record, and whether such a record is
+re-provisioned at later boots at all. Both need a reboot-capable elevated lane
+that does not exist (see #1010). The design holds under either answer rather
+than picking one.
+
 A confirmed release owns the cleanup of the state dir it needed
 (`cutover::purge_state_dir`): recording the target `Off` provisions
 `service_state_dir()` even on a host that never ran a bridge, and neither

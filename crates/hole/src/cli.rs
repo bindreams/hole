@@ -805,7 +805,12 @@ fn handle_bridge(action: BridgeAction) -> i32 {
             }
         }
         BridgeAction::ReleaseCovers => match hole_bridge::cutover::release_covers() {
-            Ok(()) => 0,
+            Ok(clearance) => {
+                if let Some(report) = hole_bridge::cutover::release_clearance_report(&clearance) {
+                    cli_log!(warn, "{report}");
+                }
+                0
+            }
             Err(e) => {
                 cli_log!(error, "cover release failed: {e}{}", elevation_hint());
                 1

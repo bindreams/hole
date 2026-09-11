@@ -423,7 +423,17 @@ pub fn uninstall_bridge(keep_covers: bool) -> Result<(), Box<dyn std::error::Err
             cli_log!(info, "bridge uninstalled");
             Ok(())
         },
-        || Ok(hole_bridge::cutover::release_covers()?),
+        // `bridge uninstall` reaches the same release the MSI's own
+        // `release-covers` action does, so it must tell the same story about
+        // it — a clearance reported in one path and dropped in the other is
+        // how the two drift.
+        || {
+            let clearance = hole_bridge::cutover::release_covers()?;
+            if let Some(report) = hole_bridge::cutover::release_clearance_report(&clearance) {
+                cli_log!(warn, "{report}");
+            }
+            Ok(())
+        },
     )
 }
 

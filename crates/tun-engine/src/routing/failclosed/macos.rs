@@ -30,6 +30,7 @@ use crate::error::RoutingError;
 // `failclosed` module and `failclosed_state` is its sibling child.
 use super::failclosed_state as state;
 use super::lockdown_pf_state as lockdown_state;
+use super::Clearance;
 use super::StateFile;
 use super::RESOLVER_PERMIT_PORT;
 
@@ -862,10 +863,18 @@ impl PfOps for RealPfOps<'_> {
 /// asking whether either is present. See `failclosed::release_all` for the
 /// full contract; this loads both state-file presences and delegates the
 /// sequencing to [`release_all_with`].
-pub fn release_all(state_dir: &Path) -> Result<(), RoutingError> {
+///
+/// The clearance is unconditionally [`Clearance::proven`]: pf has no boot-time
+/// analogue — a ruleset does not survive a reboot at all — so every macOS
+/// cover key is [`super::KeyLifetime::Persistent`] and there is nothing a
+/// release can leave unproven. macOS's own "`Ok` over a still-blocked host" residual is a
+/// different one (an entirely absent state file, clause 1) and is not what
+/// this type tracks.
+pub fn release_all(state_dir: &Path) -> Result<Clearance, RoutingError> {
     let transient = state::load_presence(state_dir);
     let standing = lockdown_state::load_presence(state_dir);
-    release_all_with(transient, standing, &mut RealPfOps { state_dir })
+    release_all_with(transient, standing, &mut RealPfOps { state_dir })?;
+    Ok(Clearance::proven())
 }
 
 #[cfg(test)]

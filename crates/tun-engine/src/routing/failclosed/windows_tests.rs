@@ -3,6 +3,16 @@ use std::net::IpAddr;
 
 use crate::GLOBAL_NET_STATE;
 
+// GUID-only views of the swept key lists. The production lists carry each
+// key's `KeyLifetime` (see `SweptKey`); the tests below are about GUID set
+// membership and disjointness, which the lifetime does not bear on.
+fn swept_lockdown_guids() -> Vec<GUID> {
+    swept_lockdown_keys().into_iter().map(|k| k.guid).collect()
+}
+fn swept_transient_guids() -> Vec<GUID> {
+    swept_transient_keys().into_iter().map(|k| k.guid).collect()
+}
+
 fn v4() -> IpAddr {
     "203.0.113.7".parse().unwrap()
 }
@@ -678,6 +688,102 @@ fn release_all_first_delete_failure_reports_the_first_real_error_and_inspects_ev
     assert!(
         first_delete_failure(&clean).is_none(),
         "success and not-found must never be treated as an error"
+    );
+}
+
+// Clearance wiring ----------------------------------------------------------------------------------------------------
+
+fn key(label: &'static str, lifetime: KeyLifetime) -> SweptKey {
+    SweptKey {
+        guid: GUID::from_u128(0x0000_0000_0000_0000_0000_0000_0000_0001),
+        label,
+        lifetime,
+    }
+}
+
+#[skuld::test]
+fn observations_map_not_found_apart_from_a_real_removal() {
+    // The FWPM half of the gate: `FWP_E_FILTER_NOT_FOUND` is the only code
+    // that means "the key answered empty". Everything else reaching here has
+    // already passed `first_delete_failure`, so it is a removal we watched.
+    let swept = [
+        (key("persistent", KeyLifetime::Persistent), ERROR_SUCCESS.0),
+        (key("persistent", KeyLifetime::Persistent), FWP_E_FILTER_NOT_FOUND_DWORD),
+        (key("boot-time", KeyLifetime::BootTime), ERROR_SUCCESS.0),
+        (key("boot-time", KeyLifetime::BootTime), FWP_E_FILTER_NOT_FOUND_DWORD),
+    ];
+    let obs = observations(&swept);
+    assert_eq!(
+        obs.iter().map(|o| o.outcome).collect::<Vec<_>>(),
+        [
+            KeyOutcome::Removed,
+            KeyOutcome::NotFound,
+            KeyOutcome::Removed,
+            KeyOutcome::NotFound
+        ]
+    );
+    // ...and the lifetime rides through untouched, so the fold sees the class
+    // the sweep list declared rather than one re-derived here.
+    assert_eq!(
+        obs.iter().map(|o| o.lifetime).collect::<Vec<_>>(),
+        [
+            KeyLifetime::Persistent,
+            KeyLifetime::Persistent,
+            KeyLifetime::BootTime,
+            KeyLifetime::BootTime
+        ]
+    );
+}
+
+#[skuld::test]
+fn a_sweep_of_todays_keys_proves_every_one_of_them_empty() {
+    // End-to-end over the REAL sweep lists with the "clean host" answer
+    // (`FWP_E_FILTER_NOT_FOUND` everywhere): every key Hole installs today is
+    // PERSISTENT, so a clean host is fully proven and `bridge release-covers`
+    // reports an unqualified clearance. This is what must stop being true the
+    // moment a boot-time key joins the sweep — see the tripwire below.
+    let swept: Vec<(SweptKey, u32)> = swept_lockdown_keys()
+        .into_iter()
+        .chain(swept_transient_keys())
+        .map(|k| (k, FWP_E_FILTER_NOT_FOUND_DWORD))
+        .collect();
+    let clearance = Clearance::from_observations(&observations(&swept));
+    assert!(
+        clearance.is_proven(),
+        "every key Hole sweeps today is persistent, so a clean host is provably clear: {:?}",
+        clearance.unproven_keys()
+    );
+}
+
+#[skuld::test]
+fn a_boot_time_flag_cannot_be_introduced_without_classifying_its_key() {
+    // A tripwire, deliberately, and not a proof — the fact it guards spans a
+    // runtime `FilterSpec` (what `add_filter` stamps) and a static sweep array
+    // (what `release_all` classifies), and no type in this module holds both.
+    //
+    // What it catches is the one mistake that is silent AND harmful: adding a
+    // `FWPM_FILTER_FLAG_BOOTTIME` filter (bindreams/hole#998, #1010) while
+    // leaving its key tagged `KeyLifetime::Persistent`. `release_all` would
+    // then report proof it does not have, and the MSI would delete `hole.exe`
+    // on the strength of it (bindreams/hole#1003). Both halves are absent
+    // today; whoever adds the first must add the other.
+    //
+    // Comments are stripped first: this module's docs discuss the boot-time
+    // flag by name (`disengage_lockdown`, `release_all`), and a guard that
+    // counted prose would fire on documentation alone — the fastest way to
+    // get a tripwire deleted rather than obeyed.
+    let code: String = include_str!("windows.rs")
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let installs_boot_time = code.contains("FWPM_FILTER_FLAG_BOOTTIME");
+    let classifies_boot_time = code.contains("KeyLifetime::BootTime");
+    assert_eq!(
+        installs_boot_time, classifies_boot_time,
+        "windows.rs installs boot-time filters ({installs_boot_time}) but classifies boot-time keys \
+         ({classifies_boot_time}); a sweep that deletes a boot-time key while calling it Persistent \
+         reports a proof of removal it never observed"
     );
 }
 

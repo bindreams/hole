@@ -1537,6 +1537,15 @@ pub trait Routing: Send + Sync {
     /// [`failclosed::release_all`] for the full contract. This is the escape
     /// from a stranded cover; a required method (no default) so every
     /// `Routing` implementation, including every test mock, commits to one.
+    ///
+    /// Drops [`failclosed::Clearance`] deliberately, and this is the ONE site
+    /// allowed to. Every caller of this method is in-process — the tray's
+    /// Unblock action, `turn_lockdown_off`, session teardown — and for them an
+    /// unproven boot-time key binds nothing: `hole.exe` is still on disk, the
+    /// next engage re-arms and pre-deletes the key, and `hole bridge unlock`
+    /// remains reachable. The distinction matters only where the binary is
+    /// about to be removed, which is `cutover::release_covers` — and that
+    /// caller reaches the free function directly, not this trait.
     fn release_all_covers(&self) -> Result<(), RoutingError>;
 
     /// Measure whether a standing lockdown cover is present on the host right
@@ -1685,7 +1694,9 @@ impl Routing for SystemRouting {
     }
 
     fn release_all_covers(&self) -> Result<(), RoutingError> {
-        failclosed::release_all(&self.state_dir)
+        // Named discard, not `?;` — see the trait method's doc for why the
+        // in-process escape is the one caller the clearance does not bind.
+        failclosed::release_all(&self.state_dir).map(|_clearance_binds_only_the_uninstall_gate| ())
     }
 
     fn lockdown_cover_presence(&self) -> CoverPresence {

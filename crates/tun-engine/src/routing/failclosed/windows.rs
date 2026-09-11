@@ -45,6 +45,7 @@ use windows::Win32::NetworkManagement::WindowsFilteringPlatform::*;
 use windows::Win32::System::Rpc::RPC_C_AUTHN_WINNT;
 
 use super::RESOLVER_PERMIT_PORT;
+use super::{Clearance, KeyLifetime, KeyObservation, KeyOutcome};
 use crate::error::RoutingError;
 
 // Fixed Hole identifiers. Compiled in so recovery can delete by key with no
@@ -133,22 +134,70 @@ fn appid_filter_guid(index: usize, v6: bool) -> GUID {
 /// ignored), so an unused App-ID slot is harmless.
 const MAX_APPID_BINARIES: usize = 4;
 
+/// One key a sweep deletes, carrying the lifetime that decides what a
+/// `FWP_E_FILTER_NOT_FOUND` on it PROVES.
+///
+/// The lifetime rides on the key rather than sitting in a parallel array on
+/// purpose. A sweep list and a "which of these are boot-time" list are two
+/// things that can drift, and the drift is silent in exactly the direction
+/// that hurts: a boot-time key mis-tagged `Persistent` makes `release_all`
+/// report proof it does not have, and the MSI deletes `hole.exe` on the
+/// strength of it (bindreams/hole#1003). Here a new key cannot be added
+/// without naming its lifetime, because there is no field to leave out.
+#[derive(Debug, Clone, Copy)]
+struct SweptKey {
+    guid: GUID,
+    /// Operator-facing label, surfaced by `bridge release-covers` when the
+    /// key's absence goes unproven — `netsh wfp` is the only remedy left once
+    /// the binary is gone, so it has to name what to look for.
+    label: &'static str,
+    lifetime: KeyLifetime,
+}
+
 /// Every transient-cover filter GUID a recovery `delete_all` must remove: the
-/// twelve fixed GUIDs. Mirrors [`swept_lockdown_guids`] for the lockdown cover.
-fn swept_transient_guids() -> Vec<GUID> {
-    FILTER_GUIDS.to_vec()
+/// twelve fixed GUIDs. Mirrors [`swept_lockdown_keys`] for the lockdown cover.
+///
+/// All `Persistent`: `add_filter` stamps `FWPM_FILTER_FLAG_PERSISTENT` on
+/// every filter it installs, and the transient cover has no boot-time half
+/// (it is a bounded-window guard — there is no boot it needs to span).
+fn swept_transient_keys() -> Vec<SweptKey> {
+    FILTER_GUIDS
+        .iter()
+        .map(|&guid| SweptKey {
+            guid,
+            label: "transient filter",
+            lifetime: KeyLifetime::Persistent,
+        })
+        .collect()
 }
 
 /// Every lockdown filter GUID a full Sweep must delete: the ten fixed
 /// lockdown GUIDs + the per-binary App-ID GUIDs. (Transient GUIDs are swept
 /// separately by `delete_all`.)
-fn swept_lockdown_guids() -> Vec<GUID> {
-    let mut guids: Vec<GUID> = LOCKDOWN_FILTER_GUIDS.to_vec();
+///
+/// All `Persistent` today — `add_filter` has one flag and it is
+/// `FWPM_FILTER_FLAG_PERSISTENT`. A key added here with a boot-time flag must
+/// say so in its [`SweptKey::lifetime`]; see that field for what silently
+/// getting it wrong costs.
+fn swept_lockdown_keys() -> Vec<SweptKey> {
+    let mut keys: Vec<SweptKey> = LOCKDOWN_FILTER_GUIDS
+        .iter()
+        .map(|&guid| SweptKey {
+            guid,
+            label: "lockdown filter",
+            lifetime: KeyLifetime::Persistent,
+        })
+        .collect();
     for i in 0..MAX_APPID_BINARIES {
-        guids.push(appid_filter_guid(i, false));
-        guids.push(appid_filter_guid(i, true));
+        for v6 in [false, true] {
+            keys.push(SweptKey {
+                guid: appid_filter_guid(i, v6),
+                label: "lockdown app-id filter",
+                lifetime: KeyLifetime::Persistent,
+            });
+        }
     }
-    guids
+    keys
 }
 
 /// The VOLATILE lockdown permits — the TUN-LUID pair (dies with the TUN) and
@@ -974,9 +1023,9 @@ impl Drop for Cover {
                 // a clean release.
                 #[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
                 CoverKind::Lockdown => {
-                    let codes: Vec<(&'static str, u32)> = swept_lockdown_guids()
+                    let codes: Vec<(&'static str, u32)> = swept_lockdown_keys()
                         .into_iter()
-                        .map(|g| ("lockdown filter", FwpmFilterDeleteByKey0(self.engine, &g)))
+                        .map(|k| (k.label, FwpmFilterDeleteByKey0(self.engine, &k.guid)))
                         .collect();
                     if let Some(e) = first_delete_failure(&codes) {
                         tracing::warn!(error = %e, "lockdown cover release left a filter installed; egress may still be blocked");
@@ -1103,9 +1152,9 @@ pub fn lockdown_cover_presence(_state_dir: &Path) -> crate::routing::CoverPresen
         }
 
         let mut codes: Vec<u32> = Vec::new();
-        for g in swept_lockdown_guids() {
+        for k in swept_lockdown_keys() {
             let mut out: *mut FWPM_FILTER0 = std::ptr::null_mut();
-            codes.push(FwpmFilterGetByKey0(engine, &g, &mut out));
+            codes.push(FwpmFilterGetByKey0(engine, &k.guid, &mut out));
             if !out.is_null() {
                 let mut p = out as *mut core::ffi::c_void;
                 FwpmFreeMemory0(&mut p);
@@ -1133,6 +1182,19 @@ pub fn lockdown_cover_presence(_state_dir: &Path) -> crate::routing::CoverPresen
 /// same measurement); a failed open means BFE is not running or RPC failed.
 /// There is no persisted Windows state to key absence on (delete-by-GUID is
 /// idempotent), so a successful open always reports `Ok`.
+///
+/// That `Ok` carries the same boot-time qualification `release_all`'s does
+/// (see [`Clearance`]): a `FWPM_FILTER_FLAG_BOOTTIME` key answers
+/// `FWP_E_FILTER_NOT_FOUND` on any boot where its runtime object is not live,
+/// so turning the kill switch off in a boot where the bridge never engaged
+/// reports `Ok` over a key that may still have a record behind it.
+///
+/// It is not gated here, and deliberately so. This is an IN-PROCESS escape:
+/// `hole.exe` is still on disk, `hole bridge unlock` is still reachable, and
+/// the next engage re-arms the key (pre-deleting it first), so nothing about
+/// the difference is unrecoverable. Only `cutover::release_covers` — which
+/// runs as the binary is being deleted — has to read the narrower claim, and
+/// it is the one that returns the `Clearance`.
 pub fn disengage_lockdown(_state_dir: &Path) -> Result<(), RoutingError> {
     unsafe {
         let mut engine = HANDLE::default();
@@ -1145,8 +1207,8 @@ pub fn disengage_lockdown(_state_dir: &Path) -> Result<(), RoutingError> {
             )));
         }
         #[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
-        for g in swept_lockdown_guids() {
-            let _ = FwpmFilterDeleteByKey0(engine, &g);
+        for k in swept_lockdown_keys() {
+            let _ = FwpmFilterDeleteByKey0(engine, &k.guid);
         }
         #[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
         let _ = FwpmEngineClose0(engine);
@@ -1185,9 +1247,9 @@ pub fn recover_cover(_state_dir: &Path, adopting: bool) {
 /// empty sublayer holds no traffic.
 #[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
 unsafe fn delete_all(engine: HANDLE) {
-    let codes: Vec<(&'static str, u32)> = swept_transient_guids()
+    let codes: Vec<(&'static str, u32)> = swept_transient_keys()
         .into_iter()
-        .map(|g| ("transient filter", FwpmFilterDeleteByKey0(engine, &g)))
+        .map(|k| (k.label, FwpmFilterDeleteByKey0(engine, &k.guid)))
         .collect();
     if let Some(e) = first_delete_failure(&codes) {
         tracing::warn!(error = %e, "transient cover sweep left a filter installed; egress may still be blocked");
@@ -1207,11 +1269,18 @@ unsafe fn delete_all(engine: HANDLE) {
 /// reached at all, so nothing could have been deleted — the ONLY early
 /// return; it does not mean "not elevated" (FWPM opens without elevation).
 /// Every delete is ISSUED before any code is inspected — a short-circuit is
-/// structurally impossible — then the codes are folded by
-/// `first_delete_failure`. The sublayer/provider delete is best-effort
-/// (ignored): an orphaned empty sublayer/provider holds no traffic, matching
-/// `delete_all`.
-pub fn release_all(_state_dir: &Path) -> Result<(), RoutingError> {
+/// structurally impossible — then the codes are folded twice, by
+/// `first_delete_failure` (does anything still fail?) and by
+/// [`Clearance::from_observations`] (what did the empty answers prove?). The
+/// sublayer/provider delete is best-effort (ignored): an orphaned empty
+/// sublayer/provider holds no traffic, matching `delete_all`.
+///
+/// The second fold is what the uninstall gate reads. `FWP_E_FILTER_NOT_FOUND`
+/// is benign for the FAILURE verdict on every key — nothing is left blocking
+/// that this call can see — but it is only *proof of absence* for a
+/// [`KeyLifetime::Persistent`] one. See [`Clearance`] for why collapsing the
+/// two lets the MSI delete `hole.exe` over a key it never observed.
+pub fn release_all(_state_dir: &Path) -> Result<Clearance, RoutingError> {
     unsafe {
         let mut engine = HANDLE::default();
         #[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
@@ -1222,14 +1291,20 @@ pub fn release_all(_state_dir: &Path) -> Result<(), RoutingError> {
             )));
         }
 
-        let mut codes: Vec<(&'static str, u32)> = Vec::new();
+        // One pass, both folds: each key carries its lifetime out of the
+        // sweep list, so the failure verdict and the clearance are derived
+        // from the SAME observation rather than from two walks that could
+        // disagree about which key answered what.
+        let mut swept: Vec<(SweptKey, u32)> = Vec::new();
         #[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
-        for g in swept_lockdown_guids() {
-            codes.push(("lockdown filter", FwpmFilterDeleteByKey0(engine, &g)));
+        for k in swept_lockdown_keys() {
+            let code = FwpmFilterDeleteByKey0(engine, &k.guid);
+            swept.push((k, code));
         }
         #[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
-        for g in swept_transient_guids() {
-            codes.push(("transient filter", FwpmFilterDeleteByKey0(engine, &g)));
+        for k in swept_transient_keys() {
+            let code = FwpmFilterDeleteByKey0(engine, &k.guid);
+            swept.push((k, code));
         }
         #[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
         let _ = FwpmSubLayerDeleteByKey0(engine, &SUBLAYER_GUID);
@@ -1238,11 +1313,36 @@ pub fn release_all(_state_dir: &Path) -> Result<(), RoutingError> {
         #[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
         let _ = FwpmEngineClose0(engine);
 
-        match first_delete_failure(&codes) {
-            Some(e) => Err(e),
-            None => Ok(()),
+        let codes: Vec<(&'static str, u32)> = swept.iter().map(|(k, code)| (k.label, *code)).collect();
+        if let Some(e) = first_delete_failure(&codes) {
+            return Err(e);
         }
+        Ok(Clearance::from_observations(&observations(&swept)))
     }
+}
+
+/// Turn swept `(key, return code)` pairs into the observations the clearance
+/// fold reads. Pure, and separated from the FFI loop above so the mapping is
+/// testable without a firewall.
+///
+/// Only reached once `first_delete_failure` has cleared the slice, so every
+/// code here is `ERROR_SUCCESS` or `FWP_E_FILTER_NOT_FOUND`. Anything else
+/// would already have failed the release; it maps to `Removed` here only
+/// because that arm is unreachable, and treating an unreachable code as
+/// "removed" is the conservative direction for a value that is discarded.
+fn observations(swept: &[(SweptKey, u32)]) -> Vec<KeyObservation> {
+    swept
+        .iter()
+        .map(|(k, code)| KeyObservation {
+            key: k.label,
+            lifetime: k.lifetime,
+            outcome: if *code == FWP_E_FILTER_NOT_FOUND_DWORD {
+                KeyOutcome::NotFound
+            } else {
+                KeyOutcome::Removed
+            },
+        })
+        .collect()
 }
 
 #[cfg(test)]

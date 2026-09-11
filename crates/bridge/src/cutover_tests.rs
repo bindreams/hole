@@ -257,7 +257,11 @@ fn plan_windows_images_covers_full_bindir_set() {
 /// `release_covers_with` with no peer dirs and the purge stubbed out, so the
 /// assertions below can still read the state dir afterwards.
 fn release_covers_probe(dir: &std::path::Path, release: impl FnOnce() -> std::io::Result<()>) -> std::io::Result<()> {
-    release_covers_with(dir, &[], release, || {})
+    // These probes are about the sequencing around the release (liveness,
+    // target write, purge), not about what the sweep proved — so they hand it
+    // the fully-proven clearance and drop it again. The propagation itself is
+    // pinned by `release_covers_reports_what_the_sweep_could_not_prove`.
+    release_covers_with(dir, &[], || release().map(|()| Clearance::proven()), || {}).map(|_| ())
 }
 
 #[skuld::test]
@@ -304,7 +308,12 @@ fn release_covers_does_not_provision_a_peer_state_dir_that_is_absent() {
     let service = tempfile::tempdir().unwrap();
     let absent = service.path().join("no-such-user").join("state");
 
-    let result = release_covers_with(service.path(), std::slice::from_ref(&absent), || Ok(()), || {});
+    let result = release_covers_with(
+        service.path(),
+        std::slice::from_ref(&absent),
+        || Ok(Clearance::proven()),
+        || {},
+    );
 
     assert!(result.is_ok(), "{result:?}");
     assert!(!absent.exists(), "an absent peer dir must be skipped, not created");
@@ -325,7 +334,7 @@ fn release_covers_does_not_refuse_against_its_own_guard() {
         peer.path().to_path_buf(),
     ];
 
-    let result = release_covers_with(service.path(), &peers, || Ok(()), || {});
+    let result = release_covers_with(service.path(), &peers, || Ok(Clearance::proven()), || {});
 
     assert!(
         result.is_ok(),
@@ -399,7 +408,7 @@ fn release_covers_purges_the_state_dir_only_after_a_confirmed_release() {
     assert!(refused.is_err());
     assert!(!purged.get(), "a failed release must leave the state it recorded off");
 
-    let released = release_covers_with(dir.path(), &[], || Ok(()), || purged.set(true));
+    let released = release_covers_with(dir.path(), &[], || Ok(Clearance::proven()), || purged.set(true));
     assert!(released.is_ok(), "{released:?}");
     assert!(
         purged.get(),
@@ -421,4 +430,84 @@ fn purge_state_dir_removes_the_tree_and_tolerates_its_absence() {
     assert!(!state.exists());
 
     purge_state_dir(&state); // idempotent: a host that never had one
+}
+
+// Release clearance ---------------------------------------------------------------------------------------------------
+//
+// `bridge release-covers` is the last moment `hole.exe` exists on an
+// uninstalling host. What it reports here is all that survives `RemoveFiles`.
+
+use tun_engine::routing::failclosed::{KeyLifetime, KeyObservation, KeyOutcome};
+
+fn unproven_clearance(keys: &[&'static str]) -> Clearance {
+    let obs: Vec<KeyObservation> = keys
+        .iter()
+        .map(|&key| KeyObservation {
+            key,
+            lifetime: KeyLifetime::BootTime,
+            outcome: KeyOutcome::NotFound,
+        })
+        .collect();
+    Clearance::from_observations(&obs)
+}
+
+#[skuld::test]
+fn release_covers_reports_what_the_sweep_could_not_prove() {
+    // The propagation itself: `release_covers_with` must hand the caller the
+    // sweep's verdict, not a bare `Ok`. Collapsing it here would put the
+    // silent `Ok` of #1003 back one layer up from where it was removed.
+    let dir = tempfile::tempdir().unwrap();
+    let clearance = release_covers_with(
+        dir.path(),
+        &[],
+        || Ok(unproven_clearance(&["lockdown boot-time block-all V4"])),
+        || {},
+    )
+    .expect("an unproven clearance is not a failure");
+
+    assert!(!clearance.is_proven());
+    assert_eq!(clearance.unproven_keys(), ["lockdown boot-time block-all V4"]);
+}
+
+#[skuld::test]
+fn a_proven_release_says_nothing_extra() {
+    // The common case by far — no cover, or one this sweep watched go away. A
+    // warning here would train operators to ignore the one that matters.
+    assert_eq!(release_clearance_report(&Clearance::proven()), None);
+}
+
+#[skuld::test]
+fn an_unproven_release_names_the_keys_and_the_remedy() {
+    let report = release_clearance_report(&unproven_clearance(&["lockdown boot-time block-all V4"]))
+        .expect("an unproven clearance must be reported");
+    assert!(
+        report.contains("lockdown boot-time block-all V4"),
+        "the key must be named — `netsh wfp` is the only remedy left and it needs a target: {report}"
+    );
+    assert!(
+        report.contains("netsh wfp"),
+        "the remedy must be named while the message can still reach someone: {report}"
+    );
+}
+
+#[skuld::test]
+fn an_unproven_release_does_not_claim_a_cover_is_present() {
+    // "Could not be proven absent" is not "is there". Asserting the latter
+    // would send an operator hunting a filter that most likely never existed,
+    // on every clean uninstall of a build that ships a boot-time key.
+    let report = release_clearance_report(&unproven_clearance(&["k"])).expect("reported");
+    let lowered = report.to_lowercase();
+    assert!(
+        !lowered.contains("still blocking") && !lowered.contains("is still installed"),
+        "must not assert presence it did not measure: {report}"
+    );
+}
+
+#[skuld::test]
+fn an_unproven_release_names_every_key_not_just_the_first() {
+    let report = release_clearance_report(&unproven_clearance(&["alpha-key", "beta-key"])).expect("reported");
+    assert!(
+        report.contains("alpha-key") && report.contains("beta-key"),
+        "every unproven key must be named: {report}"
+    );
 }

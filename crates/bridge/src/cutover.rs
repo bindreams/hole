@@ -15,6 +15,8 @@ pub mod scm_wait;
 
 use std::path::{Path, PathBuf};
 
+use tun_engine::routing::failclosed::Clearance;
+
 /// The privileged service's state dir, where the lockdown intent + cover state
 /// files live. `unlock` needs it without a running bridge, so it resolves the
 /// same per-platform location `install()` provisions.
@@ -192,7 +194,24 @@ fn unlock_with(state_dir: &Path, disengage: impl FnOnce() -> std::io::Result<()>
 /// permanent block for a permanently unremovable product. Recording the target
 /// off BEFORE the release is what makes that safe: whatever happens after, a
 /// later start reconciles toward `Off` and sweeps.
-pub fn release_covers() -> std::io::Result<()> {
+///
+/// **`Ok` means "nothing failed", not "the host is clear."** The returned
+/// [`Clearance`] carries the difference and the caller must not collapse it.
+/// A `FWPM_FILTER_FLAG_BOOTTIME` key answers `FWP_E_FILTER_NOT_FOUND` on any
+/// boot where its runtime object is not live — indistinguishable from never
+/// having been installed. On the boot this function matters most (lockdown
+/// armed in an earlier session, the user uninstalls without ever connecting)
+/// every such key answers empty, and a bare `Ok` told the MSI it was safe to
+/// delete the only binary that could act on it.
+///
+/// That does NOT make it an error. See [`Clearance`] for the bound on the
+/// harm: a stranded boot-time record blocks egress across the boot→BFE window
+/// only, so failing the uninstall over it would trade a seconds-long block for
+/// a permanently unremovable product — the exact trade the paragraph above
+/// refuses for the bookkeeping. The gate stops claiming proof it does not
+/// have; it does not withhold the uninstall. `hole bridge release-covers`
+/// turns an unproven clearance into something an operator can act on.
+pub fn release_covers() -> std::io::Result<Clearance> {
     let state_dir = service_state_dir();
     let others = peer_state_dirs();
     release_covers_with(
@@ -205,6 +224,39 @@ pub fn release_covers() -> std::io::Result<()> {
         || tun_engine::routing::failclosed::release_all(&state_dir).map_err(std::io::Error::other),
         || purge_state_dir(&state_dir),
     )
+}
+
+/// The operator's last word on a cover release, or `None` when the sweep
+/// proved every key it touched empty.
+///
+/// Pure, so the wording is testable, and living here rather than in the CLI so
+/// `bridge release-covers` and `bridge uninstall` cannot drift into telling
+/// two different stories about the same clearance.
+///
+/// This runs at the one moment `hole.exe` still exists on an uninstalling
+/// host: the exit code is 0 either way (see [`release_covers`] for why an
+/// unproven key must not fail an uninstall), so this message IS the
+/// qualification. Without it the `Ok` is silent again and the installer reads
+/// it as proof (bindreams/hole#1003).
+///
+/// It deliberately does NOT assert that a cover is present. An unproven key is
+/// equally consistent with never having been installed — which is what it will
+/// be on almost every uninstall — and crying leftover every time is how the
+/// one host where it is real gets ignored.
+pub fn release_clearance_report(clearance: &Clearance) -> Option<String> {
+    if clearance.is_proven() {
+        return None;
+    }
+    Some(format!(
+        "covers released, but {} boot-time filter key(s) could not be proven empty: {}. \
+         A boot-time filter is live only between kernel start and Base Filtering Engine start, \
+         so a delete-by-key finds nothing on any later boot whether or not a policy record \
+         survives behind it. If egress is blocked early in boot after this uninstall, \
+         `netsh wfp show filters` will show any leftover and `netsh wfp` can remove it — \
+         no Hole binary remains that could.",
+        clearance.unproven_keys().len(),
+        clearance.unproven_keys().join(", "),
+    ))
 }
 
 /// Every state dir OTHER than the service's that a bridge on this host could be
@@ -279,9 +331,9 @@ fn purge_state_dir(state_dir: &Path) {
 fn release_covers_with(
     state_dir: &Path,
     peers: &[PathBuf],
-    release: impl FnOnce() -> std::io::Result<()>,
+    release: impl FnOnce() -> std::io::Result<Clearance>,
     purge: impl FnOnce(),
-) -> std::io::Result<()> {
+) -> std::io::Result<Clearance> {
     let Some(liveness) = crate::liveness::BridgeLiveness::try_acquire(state_dir, None)? else {
         return Err(std::io::Error::other(
             "a bridge instance is running; stop the bridge before releasing its fail-closed covers",
@@ -316,7 +368,7 @@ fn release_covers_with(
 
     crate::target::apply(state_dir, None, |_| crate::target::Target::Off)
         .map_err(|e| std::io::Error::other(format!("could not record target off: {e}")))?;
-    release()?;
+    let clearance = release()?;
 
     // Best-effort from here — see the fatality note on `release_covers`.
     if let Err(e) = crate::target::apply_startup_preference(state_dir, None, |pref| pref.candidate = None) {
@@ -330,7 +382,7 @@ fn release_covers_with(
     // inside the directory about to be removed.
     drop(held);
     purge();
-    Ok(())
+    Ok(clearance)
 }
 
 #[cfg(test)]
