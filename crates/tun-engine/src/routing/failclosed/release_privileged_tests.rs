@@ -415,14 +415,19 @@ fn macos_release_all_clears_a_cover_whose_state_file_is_unreadable() {
 /// `recover_cover` used to go through `failclosed_state::load`, which collapses
 /// `Unusable` into `None` alongside `Absent`, and then logged "no
 /// failclosed-state file, nothing to recover" over a host still behind
-/// `block out all`. The reachable production cause is a ROLLBACK: a newer
-/// bridge persists `"pf_was_enabled": null` when its `pfctl -s info` read
-/// fails, and an older binary's `bool` field cannot parse that — so the older
-/// bridge's boot sweep declines to act and only `bridge unlock` escapes.
-/// Bumping the schema version does not help; a version mismatch is `Unusable`
-/// too.
+/// `block out all`. The reachable production cause is a ROLLBACK, and the
+/// payload below is the vector of it THIS binary classifies as `Unusable`: a
+/// record one schema version ahead, as a newer bridge writes and a rolled-back
+/// one reads. (The sibling field-skew vector — a newer bridge's
+/// `"pf_was_enabled": null` against an older binary's `bool` — is the same
+/// rollback, but this binary's own schema reads that `null` fine, so writing
+/// it here would exercise `Present` and certify nothing. See
+/// `macos_tests::a_rolled_back_bridges_sweep_reads_a_newer_record_as_a_cover_to_clear`.)
 ///
-/// The payload written below is that exact JSON, not arbitrary corruption.
+/// The classification is asserted, not assumed: a payload that quietly parses
+/// takes the `Present` arm, which `recover_cover` handled identically before
+/// `Unusable` existed, and this test would then pass against the very
+/// regression it exists to catch.
 #[cfg(target_os = "macos")]
 #[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
 fn macos_recover_cover_clears_a_cover_whose_state_file_is_unreadable() {
@@ -439,20 +444,27 @@ fn macos_recover_cover_clears_a_cover_whose_state_file_is_unreadable() {
     let cover = routing
         .install_failclosed_cover(server_ip, None)
         .expect("engage real pf transient cover");
-    // Read the real enable token back BEFORE corrupting the file: with no token
-    // on record the sweep cannot drop the pf refcount, so this test returns it
-    // itself rather than leaving the runner's pf enabled under an
-    // unreferenced token.
+    // Read the real enable token back BEFORE overwriting the file: an
+    // `Unusable` record carries no token the sweep can hand `pfctl -X`, so
+    // this test returns the refcount itself rather than leaving the runner's
+    // pf enabled under an unreferenced token.
     let token = super::failclosed_state::load(dir.path())
         .expect("the engage must have persisted a state file")
         .pf_token;
     cover.disarm(); // stand in for the crash: no guard remains
 
-    std::fs::write(
-        dir.path().join(super::failclosed_state::STATE_FILE_NAME),
-        format!(r#"{{"version":1,"pf_token":"{token}","pf_was_enabled":null}}"#),
-    )
-    .unwrap();
+    let rolled_back = format!(
+        r#"{{"version":{},"pf_token":"{token}","pf_was_enabled":null}}"#,
+        super::failclosed_state::SCHEMA_VERSION + 1
+    );
+    std::fs::write(dir.path().join(super::failclosed_state::STATE_FILE_NAME), &rolled_back).unwrap();
+    let presence = super::failclosed_state::load_presence(dir.path());
+    assert!(
+        matches!(presence, super::StateFile::Unusable),
+        "this test's premise: the payload must be UNREADABLE to this binary. On `Present` the \
+         sweep takes the arm it handled before this fix and proves nothing: {rolled_back} -> \
+         {presence:?}"
+    );
 
     assert!(
         connect(NON_PERMITTED).is_err(),
@@ -463,8 +475,9 @@ fn macos_recover_cover_clears_a_cover_whose_state_file_is_unreadable() {
 
     let restored = connect(NON_PERMITTED);
 
-    // Balance the `-E` the engage took. Best-effort and AFTER the measurement,
-    // so it can neither mask nor cause the verdict.
+    // Balance the `-E` the engage took — the sweep could not, having had no
+    // token. Best-effort and AFTER the measurement, so it can neither mask nor
+    // cause the verdict.
     let _ = Command::new("/sbin/pfctl").args(["-X", &token]).output();
 
     assert!(

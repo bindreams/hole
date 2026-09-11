@@ -645,12 +645,20 @@ fn recover_cover_with_an_unreadable_state_file_still_restores_the_host() {
     );
 }
 
-/// The rollback payload itself, through the REAL `load_presence`: this is the
-/// byte sequence a newer bridge writes and an older one cannot parse, so the
-/// test pins the actual cause rather than standing in for it with arbitrary
-/// corruption.
+/// A rolled-back bridge's sweep, driven from persisted bytes through the REAL
+/// [`state::load_presence`] into [`recover_cover_with`] — so `Unusable` is
+/// pinned to a payload rather than hand-constructed at the seam.
+///
+/// Rollback reaches `Unusable` by two vectors, and this binary can only DRIVE
+/// one of them. FIELD skew: a newer bridge persists `"pf_was_enabled": null`
+/// for a failed `pfctl -s info` read and an older binary's `bool` schema
+/// rejects it — asserted below against the real persisted bytes, because this
+/// binary reads that `null` fine and so cannot classify its own write as
+/// unusable. VERSION skew: the same rollback across a bumped
+/// [`state::SCHEMA_VERSION`], which this binary DOES classify as `Unusable` —
+/// so that is the payload the round trip carries.
 #[skuld::test]
-fn a_null_pf_was_enabled_is_unreadable_to_a_bool_schema_and_reads_as_a_cover() {
+fn a_rolled_back_bridges_sweep_reads_a_newer_record_as_a_cover_to_clear() {
     #[derive(serde::Deserialize)]
     #[serde(deny_unknown_fields)]
     #[allow(dead_code)]
@@ -663,7 +671,8 @@ fn a_null_pf_was_enabled_is_unreadable_to_a_bool_schema_and_reads_as_a_cover() {
 
     let dir = tempfile::tempdir().unwrap();
     state::save(dir.path(), &unknown_pf_cover("7"), None).expect("persist the newer shape");
-    let bytes = std::fs::read(dir.path().join(state::STATE_FILE_NAME)).unwrap();
+    let path = dir.path().join(state::STATE_FILE_NAME);
+    let bytes = std::fs::read(&path).unwrap();
 
     assert!(
         serde_json::from_slice::<OlderFailClosedState>(&bytes).is_err(),
@@ -672,10 +681,26 @@ fn a_null_pf_was_enabled_is_unreadable_to_a_bool_schema_and_reads_as_a_cover() {
         String::from_utf8_lossy(&bytes)
     );
 
-    // What that older bridge's own sweep would then see, and what it must do.
+    let newer = format!(
+        r#"{{"version":{},"pf_token":"7","pf_was_enabled":null}}"#,
+        state::SCHEMA_VERSION + 1
+    );
+    std::fs::write(&path, &newer).unwrap();
+
+    let file = state::load_presence(dir.path());
+    assert!(
+        matches!(file, StateFile::Unusable),
+        "a record one schema version ahead must read as `Unusable` — on any other arm the \
+         assertion below is exercising some other path: {newer} -> {file:?}"
+    );
+
     let mut ops = RecordingRecoverOps::default();
-    recover_cover_with(StateFile::Unusable, false, &mut ops);
-    assert_eq!(ops.restores, vec![(None, false)]);
+    recover_cover_with(file, false, &mut ops);
+    assert_eq!(
+        ops.restores,
+        vec![(None, false)],
+        "a record this binary cannot read must still drive a restore, with no token to drop"
+    );
 }
 
 // engage_with =========================================================================================================

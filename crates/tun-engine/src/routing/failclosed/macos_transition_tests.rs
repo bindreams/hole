@@ -879,11 +879,14 @@ fn macos_failclosed_cover_load_never_drops_a_loopback_datagram() {
         drop(cover);
     });
 
-    assert!(
-        control_round_trips > 0 && guarded_round_trips > 0,
-        "the loopback probe completed no round trip at all (control={control_round_trips}, \
-         guarded={guarded_round_trips}) — this test is vacuous"
-    );
+    // The control is gated on its LOSS, never on its round-trip count:
+    // `with_loopback_datagram_probe` returns on the first loss, so a control
+    // that sees the window on datagram 1 legitimately reports zero COMPLETED
+    // round trips. Requiring `control_round_trips > 0` would red a control
+    // that did exactly what it exists to do, on nothing but the ordering of a
+    // thread spawn against a `pfctl` fork. Only the guarded leg needs a
+    // round-trip floor, because there a green is an ABSENCE of loss and a
+    // probe that never ran would supply one.
     assert!(
         control_loss.is_some(),
         "POSITIVE CONTROL FAILED: {LOADS} `pfctl -f -` loads replacing a live `block out all` cover \
@@ -891,6 +894,11 @@ fn macos_failclosed_cover_load_never_drops_a_loopback_datagram() {
          {control_round_trips} round trips. Either this `pfctl` does not clear interface skip flags \
          outside the rule ticket (and the guarded assertion below is vacuous), or the probe cannot \
          see the window — do not silence this by weakening the assertion below; establish which."
+    );
+    assert!(
+        guarded_round_trips > 0,
+        "the guarded leg's loopback probe completed no round trip at all — the assertion below \
+         would then hold over a probe that never ran"
     );
     assert_eq!(
         guarded_loss, None,
