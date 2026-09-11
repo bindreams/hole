@@ -508,6 +508,24 @@ fn restore_confirmed(adopting: bool, out: &Result<std::process::Output, RoutingE
     matches!(out, Ok(o) if o.status.success())
 }
 
+/// Drop a pf enable refcount (`pfctl -X token`) best-effort: log-and-swallow
+/// on failure rather than propagate, because every call site is already
+/// mid-unwind or mid-teardown with its own outcome (an error, or none) to
+/// return, and a refcount that fails to drop is a leak the caller has no
+/// action left to take beyond logging it. Routed through [`pfctl_status`],
+/// NOT a bare `pfctl(...)?`-then-discard: a spawn can succeed while `pfctl`
+/// itself exits non-zero (e.g. an already-dropped or unknown token), and
+/// reading only the spawn result treats that exit as a silent success — the
+/// refcount then leaks with the log claiming nothing went wrong. `message` is
+/// the call-site-specific warn text (kept distinct per caller rather than
+/// generic, so a `-X` warn in the log still says which of `disengage` /
+/// `engage_lockdown`'s two unwind arms it came from).
+fn drop_refcount_or_warn<P: Phase>(token: &str, phase: P, message: &str) {
+    if let Err(e) = pfctl_status(pfctl(&["-X", token], None, phase), "pfctl -X") {
+        tracing::warn!(error = %e, "{message}");
+    }
+}
+
 /// Drop the transient enable refcount + clear the file. When `adopting` is
 /// false, also restore the canonical ruleset — the cover's own block-all
 /// ruleset is still live (engage no longer flushes it away), so this reload
@@ -535,9 +553,11 @@ fn disengage(token: &str, state_dir: &Path, adopting: bool) {
         }
         out
     };
-    if let Err(e) = pfctl_status(pfctl(&["-X", token], None, BestEffortPhase::RecoverCover), "pfctl -X") {
-        tracing::warn!(error = %e, "pfctl -X failed during cover disengage");
-    }
+    drop_refcount_or_warn(
+        token,
+        BestEffortPhase::RecoverCover,
+        "pfctl -X failed during cover disengage",
+    );
     if restore_confirmed(adopting, &reload) {
         if let Err(e) = state::clear(state_dir) {
             tracing::warn!(error = %e, "failclosed-state clear failed during cover disengage");
@@ -685,9 +705,11 @@ pub fn engage_lockdown(
                 main_snapshot_captured: st.main_snapshot_captured,
             };
             if let Err(e) = lockdown_state::save(state_dir, &fresh, owner) {
-                if let Err(xe) = pfctl_status(pfctl(&["-X", &token], None, FatalPhase::CoverEngage), "pfctl -X") {
-                    tracing::warn!(error = %xe, "pfctl -X failed unwinding a failed lockdown re-enable");
-                }
+                drop_refcount_or_warn(
+                    &token,
+                    FatalPhase::CoverEngage,
+                    "pfctl -X failed unwinding a failed lockdown re-enable",
+                );
                 return Err(RoutingError::RouteSetup(format!(
                     "failed to re-persist lockdown-pf-state: {e}"
                 )));
@@ -703,9 +725,11 @@ pub fn engage_lockdown(
             match capture_and_persist(&token, state_dir, owner) {
                 Ok(nat_snapshot) => (token, nat_snapshot),
                 Err(e) => {
-                    if let Err(xe) = pfctl_status(pfctl(&["-X", &token], None, FatalPhase::CoverEngage), "pfctl -X") {
-                        tracing::warn!(error = %xe, "pfctl -X failed unwinding a failed lockdown engage");
-                    }
+                    drop_refcount_or_warn(
+                        &token,
+                        FatalPhase::CoverEngage,
+                        "pfctl -X failed unwinding a failed lockdown engage",
+                    );
                     return Err(e);
                 }
             }

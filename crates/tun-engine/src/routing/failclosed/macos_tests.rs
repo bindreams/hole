@@ -767,6 +767,115 @@ fn a_failed_unwind_of_a_failed_persist_still_returns_the_original_error_and_logs
     );
 }
 
+#[skuld::test]
+fn a_failed_pf_enabled_read_fails_the_engage_before_any_refcount_is_taken() {
+    // Step 1 (`pf_enabled`, read-only) is the very first thing `engage_with`
+    // does. A failure here must stop before step 2 ever runs: there is no
+    // refcount yet to unwind, so a `drop_token` call at this point would be
+    // dropping a token nothing took.
+    let mut ops = RecordingEngageOps {
+        fail_pf_enabled: true,
+        ..recording_engage_ops()
+    };
+    let err = engage_with(v4(), None, &mut ops).expect_err("a failed pf_enabled read must fail the engage");
+    assert!(err.to_string().contains("pf_enabled"), "{err}");
+    assert_eq!(
+        ops.log,
+        vec!["pf_enabled"],
+        "step 1 failing must stop the sequence before step 2 (`enable_capture_token`) ever runs: {:?}",
+        ops.log
+    );
+    assert!(
+        ops.dropped.is_empty(),
+        "no refcount was ever taken, so none may be dropped: {:?}",
+        ops.dropped
+    );
+}
+
+#[skuld::test]
+fn a_failed_enable_capture_token_fails_the_engage_without_a_spurious_unwind() {
+    // Step 2 (`enable_capture_token`, the `pfctl -E` call) is what takes the
+    // refcount `drop_token` would later undo. When taking it fails outright,
+    // there is nothing to unwind — a `drop_token` call here would be dropping
+    // a refcount that was never actually acquired (the same shape as
+    // `engage_lockdown`'s `FreshEnable`/`Reenable` arms, which only unwind
+    // AFTER `enable_pf_capture_token` returns `Ok`).
+    let mut ops = RecordingEngageOps {
+        fail_enable_capture_token: true,
+        ..recording_engage_ops()
+    };
+    let err = engage_with(v4(), None, &mut ops).expect_err("a failed enable_capture_token must fail the engage");
+    assert!(err.to_string().contains("enable_capture_token"), "{err}");
+    assert_eq!(
+        ops.log,
+        vec!["pf_enabled", "enable_capture_token"],
+        "step 2 failing must stop the sequence before step 3 (`save_transient`) ever runs: {:?}",
+        ops.log
+    );
+    assert!(
+        ops.dropped.is_empty(),
+        "an `enable_capture_token` failure must NOT attempt a `drop_token` unwind — there is no \
+         refcount to undo: {:?}",
+        ops.dropped
+    );
+}
+
+// drop_refcount_or_warn (pfctl -X exit status must not be silently swallowed) =========================================
+
+/// `disengage` (macos.rs:~538) and `engage_lockdown`'s two unwind arms
+/// (macos.rs:~688, ~706) used to read `pfctl(&["-X", token], ...)`'s spawn
+/// `Result` directly and discard it (`let _ = pfctl(...)`-shaped), which is
+/// `Ok` whenever the SPAWN succeeds — even when `pfctl` itself exits
+/// non-zero, e.g. dropping a token that is already gone. That refcount then
+/// leaked with the log (there wasn't one) claiming nothing happened. All
+/// three sites now share [`drop_refcount_or_warn`], which routes the call
+/// through [`pfctl_status`] specifically so a non-zero EXIT is caught, not
+/// just a spawn failure — this pins THAT check with a REAL (unmocked) failing
+/// `pfctl -X`, root-free: an unprivileged `pfctl -X <token>` deterministically
+/// fails with "Permission denied" (confirmed: `/sbin/pfctl -X 12345` as a
+/// non-root user prints `pfctl: /dev/pf: Permission denied`, exit 1, spawn
+/// itself succeeds) on every macOS host this test runs on, privileged or not
+/// — so this test needs no `TUN`/`GLOBAL_NET_STATE` label and no root.
+///
+/// Reverting `drop_refcount_or_warn` to the old shape — reading `pfctl(...)`'s
+/// `Result` and discarding it instead of passing it through `pfctl_status` —
+/// makes this test fail: the spawn still succeeds (unprivileged `pfctl` DOES
+/// spawn; it only fails on its own exit status), so the old code sees `Ok(_)`
+/// and never warns, and the assertion below (the warn fired) goes red. Driven
+/// locally: reverting the call inside `drop_refcount_or_warn` to
+/// `let _ = pfctl(&["-X", token], None, phase);` fails this test; restoring
+/// the `pfctl_status(...)` wrapper passes it again.
+#[skuld::test]
+fn drop_refcount_or_warn_logs_a_pfctl_x_that_spawned_but_exited_non_zero() {
+    use tracing_subscriber::layer::{Layer, SubscriberExt};
+
+    let writer = garter::test_utils::WaitableWriter::new();
+    let subscriber = tracing_subscriber::registry().with(
+        tracing_subscriber::fmt::layer()
+            .with_writer(writer.clone())
+            .with_ansi(false)
+            .with_filter(tracing_subscriber::filter::LevelFilter::WARN),
+    );
+    {
+        let _guard = garter::tracing_test::set_default_in_current_thread(subscriber);
+        // Not a real pf token — and even if it were, this process is
+        // unprivileged, so `-X` fails on the OS permission check before it
+        // could ever get far enough to consult the token at all.
+        drop_refcount_or_warn(
+            "not-a-real-token",
+            BestEffortPhase::RecoverCover,
+            "test sentinel: drop_refcount_or_warn pin",
+        );
+    }
+    let log = writer.snapshot();
+    assert!(
+        log.contains("test sentinel: drop_refcount_or_warn pin"),
+        "an unprivileged `pfctl -X` exits non-zero (spawn succeeds, status fails) — that must \
+         be logged via pfctl_status's exit-code check, not read as an `Ok` spawn result and \
+         silently swallowed: {log}"
+    );
+}
+
 // release_all_with ====================================================================================================
 
 /// `PfOps` test double: records every call (by method name) and returns a
@@ -1302,18 +1411,40 @@ fn an_empty_but_captured_baseline_still_restores_the_snapshot() {
 /// `success-output` so that line survives a PASS. See the printed line itself
 /// for what it means and its own caveats — this comment does not restate them.
 ///
-/// A MEASURED number, not a hypothetical one — AWAITING RE-MEASUREMENT. The
-/// darwin/amd64 CI run (2026-09-10, job 102969439298) previously cited here
-/// reported 7/31 (22.6%), but that denominator counted every alternating
-/// control attempt, not just the ones targeting the currently-permitted
-/// server — roughly half of the 31 targeted the server the loop was actively
-/// blocking at that moment and, under `block-policy drop`, could never
-/// complete regardless of budget health. Fixed above
-/// (`control_permitted_attempts` excludes the blocked-target arm), which
-/// retires the 22.6%/"under a quarter" figure as an artefact of the old
-/// miscount rather than a fact about this guard's power. A corrected figure
-/// needs a fresh privileged darwin run against the fixed counter; record it
-/// here (and in `CONTRIBUTING.md`) once one is available.
+/// A MEASURED number, not a hypothetical one. Two prior figures cited here
+/// were both wrong and are retired, not averaged in:
+///
+/// - The original darwin/amd64 run (2026-09-10, job 102969439298) reported
+///   7/31 (22.6%), but that denominator counted every alternating control
+///   attempt, not just the ones targeting the currently-permitted server —
+///   roughly half of the 31 targeted the server the loop was actively
+///   blocking at that moment and, under `block-policy drop`, could never
+///   complete regardless of budget health.
+/// - The filter that was supposed to fix that (`control_permitted_attempts`,
+///   reading `phase` to keep only the permitted-target arm) was itself
+///   inverted: `phase`/the permitted address were published to the control
+///   thread *before* `engage`'s `pfctl -f -` actually committed, so for most
+///   of each phase the filter counted the arm that was still BLOCKED and
+///   excluded the one that was actually permitted. It shipped a figure
+///   4-5x smaller than the true rate (2/49 and 3/37 against a true rate on
+///   the order of 0.22-0.33 hits/attempt) rather than the roughly-2x-larger
+///   figure the stated premise predicted.
+///
+/// Fixed for real this time: the permitted address is published only after
+/// `engage` returns (so the marker names the ruleset actually in force), and
+/// the control thread samples it both before and after each connect,
+/// counting the attempt only when the two agree — a real happens-before on
+/// the published value, not a timing bet. `success-output = 'final'`
+/// (`.config/nextest.toml`) is the mechanism that gets a number out of a
+/// privileged darwin run at all: it is what makes this line survive a PASS
+/// instead of being discarded, so the figure below comes from this PR's own
+/// green head run, not a hypothetical follow-up.
+///
+/// Last measured: PENDING — this fix has not yet had a privileged darwin CI
+/// run against it. Record the actual `hits/permitted_attempts` here (and the
+/// job link in `CONTRIBUTING.md`) from the first green run after this commit;
+/// it must be **at least** the pre-filter-bug figures above (0.219/0.327
+/// hits/attempt) — if it is not, the filter is still wrong.
 #[cfg(target_os = "macos")]
 #[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
 fn macos_failclosed_cover_transition_never_admits_blocked_flow() {
@@ -1398,6 +1529,15 @@ fn macos_failclosed_cover_transition_never_admits_blocked_flow() {
     let phase = Arc::new(AtomicUsize::new(0));
     let leaked_at_phase = Arc::new(AtomicUsize::new(usize::MAX));
 
+    // `permitted_idx` names which of `addrs` the LIVE ruleset actually
+    // permits right now — unlike `phase`, this is published only after the
+    // `pfctl -f -` that makes it true has committed (see the control thread's
+    // doc comment below for why `phase`, sampled before `engage` runs, is the
+    // WRONG signal for this). The cold engage above already committed
+    // `addrs[0]` before this line runs, so `0` is correct from the start, not
+    // a placeholder.
+    let permitted_idx = Arc::new(AtomicUsize::new(0));
+
     // Continuous prober POOL spanning the WHOLE transition loop below, each on
     // its own thread with a short timeout, so many SYNs are in flight at every
     // instant and the pool overlaps every one of the loop's real `pfctl` calls
@@ -1432,19 +1572,29 @@ fn macos_failclosed_cover_transition_never_admits_blocked_flow() {
     // thread probes, at the same timeout over the same run, the servers the
     // covers PERMIT: a single success anywhere proves the budget is live, so
     // the silence next door is the cover's doing and not the clock's. It
-    // alternates its two targets instead of reading `phase` to pick WHERE to
-    // connect, so it needs no synchronization with the loop to decide that.
+    // alternates its two targets instead of reading `permitted_idx` to pick
+    // WHERE to connect, so it needs no synchronization with the loop to
+    // decide that.
     //
-    // But `phase` IS read for what gets COUNTED: at any instant the transition
-    // loop permits exactly one of the two addresses (`addrs[i % addrs.len()]`)
-    // and `set block-policy drop` means a connect to the OTHER one silently
-    // burns the entire `PROBER_TIMEOUT` rather than completing — so on
-    // alternation alone, roughly half of every attempt targets the currently-
-    // blocked server and can never land. Counting those in the denominator
-    // caps the printed rate at ~50% regardless of how healthy the runner is.
-    // Each attempt still fires exactly as before (the alternation itself is
-    // unchanged — only the arm matching the currently-permitted address, read
-    // off `phase`, is added to `control_permitted_attempts`/`control_hits`).
+    // But `permitted_idx` IS read for what gets COUNTED: at any instant the
+    // transition loop permits exactly one of the two addresses, and
+    // `set block-policy drop` means a connect to the OTHER one silently burns
+    // the entire `PROBER_TIMEOUT` rather than completing — so on alternation
+    // alone, some of every attempt targets the currently-blocked server and
+    // can never land. Counting those in the denominator would understate the
+    // real rate. Each attempt still fires exactly as before (the alternation
+    // itself is unchanged — only the arm matching the currently-permitted
+    // address is added to `control_permitted_attempts`/`control_hits`).
+    //
+    // `permitted_idx` is sampled BOTH before and after the connect, and the
+    // attempt is counted only when the two agree (with the dialled target).
+    // A single sample (before OR after only) can straddle the instant
+    // `engage`'s `pfctl -f -` actually commits a transition — the transition
+    // loop below publishes `permitted_idx` only once that commit has
+    // returned, so an attempt whose window spans a transition reads
+    // differently before vs. after, and the double-read-agreement here is
+    // what excludes it: a real happens-before on the published value, not a
+    // timing bet on how long the attempt takes relative to the transition.
     //
     // It also RETURNS its total attempt count (both arms), so the pass can
     // report `hits/permitted_attempts` — that ratio is this guard's stated
@@ -1453,11 +1603,11 @@ fn macos_failclosed_cover_transition_never_admits_blocked_flow() {
     let control_hits = Arc::new(AtomicUsize::new(0));
     let control_permitted_attempts = Arc::new(AtomicUsize::new(0));
     let control = {
-        let (control_hits, control_permitted_attempts, stop_control, phase_control) = (
+        let (control_hits, control_permitted_attempts, stop_control, permitted_idx_control) = (
             control_hits.clone(),
             control_permitted_attempts.clone(),
             stop.clone(),
-            phase.clone(),
+            permitted_idx.clone(),
         );
         std::thread::spawn(move || {
             let mut attempts = 0usize;
@@ -1465,12 +1615,13 @@ fn macos_failclosed_cover_transition_never_admits_blocked_flow() {
                 let target_idx = attempts % 2;
                 let target = format!("{}:443", [SERVER_A, SERVER_B][target_idx]);
                 attempts += 1;
+                let permitted_before = permitted_idx_control.load(Ordering::SeqCst);
                 let ok = connect(&target, PROBER_TIMEOUT).is_ok();
-                // addrs[phase % addrs.len()] is the transition loop's own rule
-                // for which address is currently permitted (see the loop
-                // below); only an attempt against that address belongs in the
-                // sensitivity denominator.
-                if target_idx == phase_control.load(Ordering::SeqCst) % 2 {
+                let permitted_after = permitted_idx_control.load(Ordering::SeqCst);
+                // Only count an attempt whose permitted target held steady
+                // (unchanged before vs. after — see the doc comment above)
+                // AND matches the address actually dialled.
+                if permitted_before == permitted_after && target_idx == permitted_before % 2 {
                     control_permitted_attempts.fetch_add(1, Ordering::SeqCst);
                     if ok {
                         control_hits.fetch_add(1, Ordering::SeqCst);
@@ -1493,8 +1644,14 @@ fn macos_failclosed_cover_transition_never_admits_blocked_flow() {
 
     for i in 1..=TRANSITIONS {
         phase.store(i, Ordering::SeqCst);
-        let server_ip: IpAddr = addrs[i % addrs.len()].parse().unwrap();
+        let server_idx = i % addrs.len();
+        let server_ip: IpAddr = addrs[server_idx].parse().unwrap();
         let new_cover = engage(server_ip, None, dir.path(), None).expect("engage real pf transient cover");
+        // Publish AFTER `engage` returns, not before: the marker must
+        // describe the ruleset actually in force, and that only becomes true
+        // once `engage`'s `pfctl -f -` has committed (see `permitted_idx`'s
+        // doc comment above and the control thread's).
+        permitted_idx.store(server_idx, Ordering::SeqCst);
         if let Some(old) = held.take() {
             // Retire the OLD cover's pf enable refcount only — never its
             // normal Drop, which would reload /etc/pf.conf (a pass-all host)
@@ -1534,25 +1691,33 @@ fn macos_failclosed_cover_transition_never_admits_blocked_flow() {
     // The guard stating its own sensitivity. Printed unconditionally (see the
     // doc comment): a green with no number attached says only that nothing was
     // caught, not that anything would have been. The denominator here is
-    // `permitted_attempts`, NOT the control's total attempt count: half of the
-    // latter targets whichever server the loop currently blocks and can never
-    // complete under `block-policy drop`, so counting it would understate the
-    // budget's real hit rate by roughly half (see the control thread's doc
-    // comment above).
+    // `permitted_attempts`, NOT the control's total attempt count: some of the
+    // latter target whichever server the loop currently blocks (never lands
+    // under `block-policy drop`) or straddle a transition (excluded by the
+    // before/after agreement check), so counting them would understate the
+    // budget's real hit rate (see the control thread's doc comment above).
     let hits = control_hits.load(Ordering::SeqCst);
     let permitted_attempts = control_permitted_attempts.load(Ordering::SeqCst);
-    let control_rate = 100.0 * hits as f64 / permitted_attempts as f64;
+    // Guard the division: a `permitted_attempts` of 0 (every control attempt
+    // straddled a transition or targeted the blocked arm) must print as an
+    // explicit "no permitted-target attempts" rather than a silent `NaN%`
+    // that could slip past a human skimming the printed line.
+    let control_rate = if permitted_attempts == 0 {
+        f64::NAN
+    } else {
+        100.0 * hits as f64 / permitted_attempts as f64
+    };
     let per_probe_us = elapsed.as_micros() as f64 / attempts as f64;
     eprintln!(
         "[sensitivity] macos_failclosed_cover_transition: control completed {hits}/{permitted_attempts} \
          connects ({control_rate:.1}%) to a PERMITTED server within {PROBER_TIMEOUT:?} ({control_total_attempts} \
-         total alternating attempts, half of which target the currently-blocked server and are excluded); \
-         the pool emitted {attempts} probes across {PROBER_THREADS} threads over {elapsed:?} = one probe \
-         per {per_probe_us:.0} us of wall clock. That interval bounds probe COVERAGE, not detection: a \
-         leak must still complete the WHOLE handshake — SYN, SYN/ACK across the RTT, and the client's \
-         outbound ACK — before the next `pfctl -f -` commit can cut it off, so a leak window shorter than \
-         that interval, or too short to fit a full handshake at all, is likelier to be missed than caught; \
-         compare it against the ~sub-millisecond `pfctl -f -` commit this test guards."
+         total alternating attempts; the rest either targeted the currently-blocked server or straddled a \
+         transition and were excluded); the pool emitted {attempts} probes across {PROBER_THREADS} threads \
+         over {elapsed:?} = one probe per {per_probe_us:.0} us of wall clock. That interval bounds probe \
+         COVERAGE, not detection: a leak must still complete the WHOLE handshake — SYN, SYN/ACK across the \
+         RTT, and the client's outbound ACK — before the next `pfctl -f -` commit can cut it off, so a leak \
+         window shorter than that interval, or too short to fit a full handshake at all, is likelier to be \
+         missed than caught; compare it against the ~sub-millisecond `pfctl -f -` commit this test guards."
     );
 
     assert!(
@@ -1568,9 +1733,13 @@ fn macos_failclosed_cover_transition_never_admits_blocked_flow() {
     assert!(
         hits > 0,
         "positive control: not one of {permitted_attempts} connects to a PERMITTED server \
-         ({SERVER_A}/{SERVER_B}) completed within {PROBER_TIMEOUT:?} across the whole run, so that \
-         budget cannot complete a handshake on this runner at all and the never-admitted assertion \
-         above held vacuously — raise PROBER_TIMEOUT rather than trusting the green"
+         ({SERVER_A}/{SERVER_B}) completed within {PROBER_TIMEOUT:?} across the whole run ({control_total_attempts} \
+         total control attempts), so the never-admitted assertion above held vacuously. This is NOT \
+         necessarily a `PROBER_TIMEOUT` problem — before raising it, first suspect the permitted-target \
+         filter above (`permitted_idx` before/after agreement): a filter that is too strict (e.g. inverted \
+         again, or excluding more than it should) can drive `permitted_attempts` toward 0 on its own, with \
+         a healthy budget underneath it. Only raise `PROBER_TIMEOUT` once the filter itself is confirmed \
+         correct — see this test's doc comment for how it was verified last time it broke."
     );
 
     // The last cover's normal Drop restores /etc/pf.conf.

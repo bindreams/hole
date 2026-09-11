@@ -1100,7 +1100,7 @@ milliseconds.
 - **macOS** ([`routing/failclosed/macos.rs`](crates/tun-engine/src/routing/failclosed/macos.rs)):
   `pfctl -E` (refcounted) + a self-contained ruleset loaded over stdin
   (`pfctl -f -`, absolute `/sbin/pfctl` — see the module doc for the hardening
-  caveat and the ~29 other equally exposed root spawns it does not close).
+  caveat and the 28 other equally exposed root spawns it does not close).
   Disengage restores `/etc/pf.conf` and drops the refcount (`pfctl -X <token>`);
   the token is persisted to `bridge-failclosed.json` *before* the blocking
   ruleset loads (persist-before-mutate), and a failed persist unwinds the `-E`
