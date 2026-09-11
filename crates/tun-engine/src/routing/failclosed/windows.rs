@@ -1667,8 +1667,21 @@ pub fn lockdown_cover_presence(_state_dir: &Path) -> crate::routing::CoverPresen
 /// be reached, so nothing could have been issued → `Err`. That is NOT "not
 /// elevated" — FWPM opens without elevation (`release_all`'s doc records the
 /// same measurement); a failed open means BFE is not running or RPC failed.
-/// There is no persisted Windows state to key absence on (delete-by-GUID is
-/// idempotent), so a successful open always reports `Ok`.
+/// There is no persisted Windows state to key absence on, so a successful open
+/// always reports `Ok` — and for the boot-time twins (#998) that `Ok` is weaker
+/// than "idempotent" claims. On a later boot no live twin exists, both keys
+/// answer `FWP_E_FILTER_NOT_FOUND`, and that is indistinguishable from a key
+/// whose boot-time policy record survives: `bridge unlock` run in a boot where
+/// this bridge never engaged reports success over a host it may not have
+/// unlocked. That is the same unmeasured false `Ok` the module doc's
+/// "Boot-time coverage" section qualifies for [`release_all`] and for #1009's
+/// `Return="check"` uninstall gate — read the argument there, not here.
+///
+/// Known residual, PRE-EXISTING and NOT changed by #998: this function discards
+/// every delete code (`let _ =`) where [`release_all`] collects them and folds
+/// them through [`first_delete_failure`]. So a delete failing for a reason that
+/// is neither success nor not-found — a filter still blocking egress — is
+/// invisible here as well, on every GUID, not just the twins.
 pub fn disengage_lockdown(_state_dir: &Path) -> Result<(), RoutingError> {
     unsafe {
         let mut engine = HANDLE::default();
