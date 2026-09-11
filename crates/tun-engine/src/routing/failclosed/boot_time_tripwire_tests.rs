@@ -1,19 +1,40 @@
 //! Tripwire: a `FWPM_FILTER_FLAG_BOOTTIME` filter may not be installed
 //! without its key being classified `KeyLifetime::BootTime`.
 //!
-//! Scope is the `failclosed/` **platform** sources, recursively, minus their
-//! `*_tests.rs` siblings — not `failclosed.rs` itself, which defines
-//! `KeyLifetime` and its fold and therefore names `BootTime` in code by
-//! construction. Nothing in that file can install a WFP filter; FWPM lives
-//! only under `failclosed/`.
+//! Scope is every production source in this crate, recursively — not just
+//! `failclosed/`. `failclosed/windows.rs` is NOT the only sanctioned FWPM site
+//! in tun-engine: `dns_confine/windows.rs` calls `FwpmFilterAdd0` too, and
+//! `clippy.toml` names both. Nothing can reach a boot-time filter through that
+//! second one today — `dns_confine::engage` opens its engine
+//! `FWPM_SESSION_FLAG_DYNAMIC` and stamps `FWPM_FILTER_FLAGS(0)`, and WFP does
+//! not accept a boot-time filter on a dynamic-session object — but that is a
+//! property of today's code held up by clippy's site list, not by this file,
+//! so the scan does not lean on it.
+//!
+//! The one exclusion is `failclosed.rs`, which DEFINES `KeyLifetime` and the
+//! `proves_empty` fold and therefore names `BootTime` in code by construction.
+//! It is excluded from the classification half only — an install there would
+//! still fire — and the exclusion is anchored to where the fold actually
+//! lives, so moving `proves_empty` fails the guard rather than silently
+//! turning the fold's own mention into a classification and letting an
+//! unclassified install through (bindreams/hole#1003, #1010).
 
 use std::path::{Path, PathBuf};
 
-/// The failclosed platform sources on disk, sorted.
+/// The crate's production sources on disk, sorted.
+///
+/// Symlinks are followed. `rustc` resolves `mod boottime;` through one, so a
+/// symlinked source ships; a scan that skipped it would disagree with the
+/// compiler about what is in the binary. (`WalkDir` does not follow links by
+/// default, and an unfollowed symlink's `file_type()` is neither file nor dir,
+/// so the default configuration drops it before `is_production_source` is
+/// asked.) An I/O error is a panic, not an empty result: a scan that read
+/// nothing must never read as a scan that found nothing.
 fn production_sources_under(dir: &Path) -> Vec<PathBuf> {
     let mut found: Vec<PathBuf> = walkdir::WalkDir::new(dir)
+        .follow_links(true)
         .into_iter()
-        .map(|e| e.expect("walk the failclosed sources"))
+        .map(|e| e.expect("walk the crate sources"))
         .filter(|e| e.file_type().is_file())
         .map(walkdir::DirEntry::into_path)
         .filter(|p| is_production_source(p))
@@ -33,32 +54,54 @@ fn is_production_source(path: &Path) -> bool {
     name.ends_with(".rs") && !name.ends_with("_tests.rs")
 }
 
-/// `(installs_boot_time, classifies_boot_time)` across the given sources.
+/// One source with its comments stripped.
 ///
-/// Comments are stripped first: the failclosed modules' docs discuss the
-/// boot-time flag by name, and a guard that counted prose would fire on
-/// documentation alone — the fastest way to get a tripwire deleted rather
-/// than obeyed.
-fn boot_time_halves(sources: &[PathBuf]) -> (bool, bool) {
-    let code = sources
-        .iter()
-        .map(|p| {
-            let text = std::fs::read_to_string(p).unwrap_or_else(|e| panic!("read {}: {e}", p.display()));
-            text.lines()
-                .filter(|l| !l.trim_start().starts_with("//"))
-                .collect::<Vec<_>>()
-                .join("\n")
-        })
+/// The failclosed modules' docs discuss the boot-time flag by name, and a
+/// guard that counted prose would fire on documentation alone — the fastest
+/// way to get a tripwire deleted rather than obeyed.
+fn code(path: &Path) -> String {
+    let text = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    text.lines()
+        .filter(|l| !l.trim_start().starts_with("//"))
         .collect::<Vec<_>>()
-        .join("\n");
-    (
-        code.contains("FWPM_FILTER_FLAG_BOOTTIME"),
-        code.contains("KeyLifetime::BootTime"),
-    )
+        .join("\n")
 }
 
-fn failclosed_dir() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("src/routing/failclosed")
+/// The sources that DEFINE the lifetime fold, found by the definition rather
+/// than by a path.
+///
+/// This is what anchors the classification half's one exclusion. `proves_empty`
+/// is the function that decides what an empty answer proves for each
+/// `KeyLifetime`, so its file's `KeyLifetime::BootTime` mentions are the
+/// definition of the rule, not a classification of any key.
+fn decision_sites(sources: &[PathBuf]) -> Vec<PathBuf> {
+    sources
+        .iter()
+        .filter(|p| code(p).contains("fn proves_empty"))
+        .cloned()
+        .collect()
+}
+
+/// `(installs_boot_time, classifies_boot_time)` across `sources`.
+///
+/// The install half spans every source given; the classification half skips
+/// `decision_site`, for the reason [`decision_sites`] gives. Asymmetric on
+/// purpose: an install in the file that defines the fold must still fire.
+fn boot_time_halves(sources: &[PathBuf], decision_site: &Path) -> (bool, bool) {
+    let joined = |paths: Vec<&PathBuf>| paths.into_iter().map(|p| code(p)).collect::<Vec<_>>().join("\n");
+    let installs = joined(sources.iter().collect()).contains("FWPM_FILTER_FLAG_BOOTTIME");
+    let classifies =
+        joined(sources.iter().filter(|p| p.as_path() != decision_site).collect()).contains("KeyLifetime::BootTime");
+    (installs, classifies)
+}
+
+fn crate_src() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("src")
+}
+
+/// Where the fold is expected to live. Asserted, never assumed.
+fn decision_site() -> PathBuf {
+    crate_src().join("routing").join("failclosed.rs")
 }
 
 /// Relative, slash-normalised names, for readable fixture assertions.
@@ -89,22 +132,37 @@ fn a_boot_time_flag_cannot_be_introduced_without_classifying_its_key() {
     // on the strength of it (bindreams/hole#1003). Both halves are absent
     // today; whoever adds the first must add the other.
     //
-    // The scan is the source tree, not one hardcoded file: an add that landed
-    // in a new submodule (`failclosed/windows/boottime.rs`) would leave both
-    // halves false, the equality holding, and the mis-tag shipping.
-    let dir = failclosed_dir();
-    let sources = production_sources_under(&dir);
+    // The scan is the crate's source tree, not one hardcoded file: an add that
+    // landed in a new submodule (`failclosed/windows/boottime.rs`) — or at the
+    // other sanctioned FWPM site, `dns_confine/windows.rs` — would otherwise
+    // leave both halves false, the equality holding, and the mis-tag shipping.
+    let src = crate_src();
+    let sources = production_sources_under(&src);
     assert!(
-        sources.iter().any(|p| p.ends_with("windows.rs")),
-        "the scan found no failclosed/windows.rs under {}; a tripwire that reads nothing \
-         passes forever: {sources:?}",
-        dir.display()
+        sources.iter().any(|p| p.ends_with("routing/failclosed/windows.rs")),
+        "the scan found no routing/failclosed/windows.rs under {}; a tripwire that reads nothing \
+         passes forever",
+        src.display()
     );
 
-    let (installs_boot_time, classifies_boot_time) = boot_time_halves(&sources);
+    // The classification half excludes exactly one file, and this is what
+    // keeps that exclusion honest. Move `proves_empty` into a scanned source
+    // and its own `KeyLifetime::BootTime` arm would make `classifies`
+    // permanently true — after which an UNCLASSIFIED boot-time install
+    // satisfies the equality below and passes in silence. That is the worst
+    // failure this guard has, so it is the one it refuses to reach.
+    let site = decision_site();
+    assert_eq!(
+        decision_sites(&sources),
+        vec![site.clone()],
+        "`fn proves_empty` — the fold this guard's one exclusion is scoped to — is not where the \
+         exclusion says it is; re-anchor `decision_site()` before trusting the halves below"
+    );
+
+    let (installs_boot_time, classifies_boot_time) = boot_time_halves(&sources, &site);
     assert_eq!(
         installs_boot_time, classifies_boot_time,
-        "the failclosed sources install boot-time filters ({installs_boot_time}) but classify \
+        "the crate's sources install boot-time filters ({installs_boot_time}) but classify \
          boot-time keys ({classifies_boot_time}); a sweep that deletes a boot-time key while \
          calling it Persistent reports a proof of removal it never observed"
     );
@@ -132,6 +190,39 @@ fn the_scan_reaches_a_nested_source_and_never_a_test_file() {
     );
 }
 
+#[cfg(unix)]
+#[skuld::test]
+fn the_scan_reads_a_source_that_is_a_symlink() {
+    // `rustc` resolves `mod boottime;` through a symlink, so a symlinked
+    // source ships. `WalkDir` does not follow links by default, and an
+    // unfollowed symlink's `file_type()` is neither file nor dir — so the
+    // default configuration drops it before `is_production_source` is ever
+    // asked. The compiler and the tripwire then disagree about what ships.
+    // The `include_str!` form this scan replaced followed links; the move is
+    // what opened the gap.
+    //
+    // `#[cfg(unix)]` because creating a symlink on Windows needs
+    // SeCreateSymbolicLinkPrivilege or Developer Mode. What is under test is
+    // the `WalkDir` configuration, which is not platform-specific.
+    let root = tempfile::tempdir().expect("tempdir");
+    let dir = root.path().join("failclosed");
+    std::fs::create_dir_all(dir.join("windows")).expect("mkdir");
+    std::fs::write(dir.join("windows.rs"), "let l = KeyLifetime::Persistent;").expect("write");
+    // The target sits outside the scanned tree, so the scan can reach its
+    // contents only by following the link.
+    let target = root.path().join("boottime-source");
+    std::fs::write(&target, "*f |= FWPM_FILTER_FLAG_BOOTTIME.0;").expect("write");
+    std::os::unix::fs::symlink(&target, dir.join("windows/boottime.rs")).expect("symlink");
+
+    let sources = production_sources_under(&dir);
+    assert_eq!(
+        relative(&dir, sources.clone()),
+        vec!["windows.rs", "windows/boottime.rs"],
+        "a symlinked .rs is a source the compiler reads, so the scan reads it too"
+    );
+    assert_eq!(boot_time_halves(&sources, &dir.join("failclosed.rs")), (true, false));
+}
+
 #[skuld::test]
 fn the_tripwire_fires_on_a_flag_added_in_a_new_submodule() {
     // The #1010 shape, landed one directory deeper than #1010 lands it.
@@ -147,7 +238,10 @@ fn the_tripwire_fires_on_a_flag_added_in_a_new_submodule() {
     )
     .expect("write");
 
-    assert_eq!(boot_time_halves(&production_sources_under(dir)), (true, false));
+    assert_eq!(
+        boot_time_halves(&production_sources_under(dir), &dir.join("failclosed.rs")),
+        (true, false)
+    );
 }
 
 #[skuld::test]
@@ -162,5 +256,51 @@ fn a_boot_time_symbol_named_only_in_prose_does_not_fire_the_tripwire() {
     )
     .expect("write");
 
-    assert_eq!(boot_time_halves(&production_sources_under(dir)), (false, false));
+    assert_eq!(
+        boot_time_halves(&production_sources_under(dir), &dir.join("failclosed.rs")),
+        (false, false)
+    );
+}
+
+#[skuld::test]
+fn the_fold_is_found_by_its_definition_and_never_by_prose() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let dir = root.path();
+    std::fs::write(dir.join("failclosed.rs"), "pub fn proves_empty(&self) -> bool { true }").expect("write");
+    std::fs::write(
+        dir.join("windows.rs"),
+        "/// Whether `fn proves_empty` says so.\nfn g() {}",
+    )
+    .expect("write");
+
+    assert_eq!(
+        relative(dir, decision_sites(&production_sources_under(dir))),
+        vec!["failclosed.rs"]
+    );
+}
+
+#[skuld::test]
+fn a_fold_that_moved_is_not_mistaken_for_a_classification() {
+    // The vacuity trigger this guard is built against. `proves_empty`'s
+    // `(KeyLifetime::BootTime, KeyOutcome::NotFound)` arm names the variant
+    // without classifying any key. If that arm ever sat in a scanned source
+    // and were counted, `classifies` would be permanently true and an
+    // UNCLASSIFIED boot-time install would satisfy the equality — a silent
+    // pass, on the guard that gates #1010's merge.
+    let root = tempfile::tempdir().expect("tempdir");
+    let dir = root.path();
+    std::fs::write(
+        dir.join("windows.rs"),
+        "flags |= FWPM_FILTER_FLAG_BOOTTIME.0;\n\
+         fn proves_empty(&self) -> bool { matches!(self.0, KeyLifetime::BootTime) }\n",
+    )
+    .expect("write");
+    let sources = production_sources_under(dir);
+
+    // Scoped to where the fold actually is, the install stands alone.
+    assert_eq!(boot_time_halves(&sources, &dir.join("windows.rs")), (true, false));
+    // Scoped anywhere else, the fold's own mention masks it — which is why the
+    // main test asserts `decision_sites` before it asserts the halves.
+    assert_eq!(boot_time_halves(&sources, &dir.join("elsewhere.rs")), (true, true));
+    assert_eq!(relative(dir, decision_sites(&sources)), vec!["windows.rs"]);
 }

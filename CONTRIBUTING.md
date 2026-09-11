@@ -1428,10 +1428,17 @@ pins that). The ordering is on purpose: the gate lands **before** the
 boot-time filters of #998/#1010 do, so they cannot arrive as a silent false
 `Ok`. `a_boot_time_flag_cannot_be_introduced_without_classifying_its_key` is
 the tripwire — a source-level check, because the fact it guards spans a runtime
-`FilterSpec` and a static sweep array and no type holds both. It reads the
-`failclosed/` production sources off disk rather than one hardcoded file, so an
-add landing in a new submodule cannot slip past both halves; the `*_tests.rs`
-siblings are excluded, or the scan would read an install out of test code.
+`FilterSpec` and a static sweep array and no type holds both. It reads every
+production source in tun-engine off disk, symlinks followed (`rustc` resolves a
+`mod` through one, so a symlinked source ships), rather than one hardcoded file:
+an add landing in a new submodule — or at the crate's other sanctioned FWPM
+site, `dns_confine/windows.rs` — cannot slip past both halves. The `*_tests.rs`
+siblings are excluded, or the scan would read an install out of test code. The
+classification half skips exactly one file, the one defining the `proves_empty`
+fold and so naming `BootTime` by construction; that exclusion is anchored to
+where `fn proves_empty` actually is, so relocating the fold fails the guard
+instead of turning its own mention into a classification and letting an
+unclassified install pass in silence.
 
 The in-process escapes (`disengage_lockdown`, `ProxyManager::turn_lockdown_off`,
 the tray's Unblock) share the same boot-time blind spot and deliberately do
