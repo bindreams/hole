@@ -13,7 +13,7 @@ pub mod os;
 #[cfg(target_os = "windows")]
 pub mod scm_wait;
 
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", test))]
 mod windows_profiles;
 
 use std::path::{Path, PathBuf};

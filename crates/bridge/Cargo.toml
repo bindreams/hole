@@ -141,6 +141,9 @@ windows = { version = "0.62", features = [
     "Win32_Storage_FileSystem",
     "Win32_System_Diagnostics_Etw",
     "Win32_System_Diagnostics_ToolHelp",
+    # ExpandEnvironmentStringsW for `cutover::windows_profiles`: the service
+    # SIDs store ProfileImagePath unexpanded.
+    "Win32_System_Environment",
     "Win32_System_JobObjects",
     "Win32_System_RemoteDesktop",
     "Win32_System_Services",
