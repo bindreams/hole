@@ -599,10 +599,14 @@ fn thread_spawn_failure_at_the_real_call_site_stops_the_session_after_dropping_t
         |_tick| {},
         |_builder, _body| Err(std::io::Error::other("synthetic spawn failure")),
     );
-    assert!(
-        matches!(result, Err(EtwError::ThreadSpawn(_))),
-        "a spawn failure must still surface as ThreadSpawn: {result:?}"
-    );
+    // `EtwGuard` is deliberately not `Debug`: it owns a live session handle, a
+    // `JoinHandle` and a stats channel, none of which render usefully. Only the
+    // error side is formatted, so the failure still names the variant that came.
+    match result {
+        Err(EtwError::ThreadSpawn(_)) => {}
+        Ok(_) => panic!("a spawn failure must surface as ThreadSpawn, got a live guard"),
+        Err(other) => panic!("a spawn failure must surface as ThreadSpawn, got: {other:?}"),
+    }
 
     let after = query_session_stats(&session_name, "live");
     assert!(
