@@ -191,7 +191,11 @@ fn write_marker_signal_safe(state: &HandlerState, ctx: &crash_handler::CrashCont
             None,
         );
         if let Ok(handle) = h {
-            let _ = WriteFile(handle, Some(&buf[..n]), None, None);
+            // `lpNumberOfBytesWritten` may be NULL only when `lpOverlapped`
+            // is non-NULL; this handle is synchronous, so the out-param is
+            // mandatory even though nothing reads it.
+            let mut written = 0u32;
+            let _ = WriteFile(handle, Some(&buf[..n]), Some(&mut written), None);
             let _ = CloseHandle(handle);
         }
     }
