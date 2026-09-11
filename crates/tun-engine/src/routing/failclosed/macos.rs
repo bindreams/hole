@@ -431,10 +431,15 @@ fn engage_with(
     //    the `-E` before propagating — else the refcount leaks with no state
     //    file to recover it from, exactly as `engage_lockdown`'s `FreshEnable`
     //    and `Reenable` arms already unwind. The failures this covers are the
-    //    ones `state::save` really has: an unwritable state dir, a full disk, a
-    //    failed chown. Without the unwind, pf stays enabled until reboot under
-    //    an unreferenced token — a fail-CLOSED leak hiding behind a path whose
-    //    traffic verdict is fail-open.
+    //    ones `state::save` really has: an unwritable state dir, a full disk.
+    //    NOT a failed chown — `save` chowns via `chown_if_some`, which logs
+    //    and swallows, so it cannot fail this call. Without the unwind, pf
+    //    stays enabled until reboot under an unreferenced token — a
+    //    fail-CLOSED leak hiding behind a path whose traffic verdict is
+    //    fail-open. The refcount is the ONLY thing stranded: `save` is
+    //    tempfile + `persist`, and `persist` is both the sole writer of
+    //    `bridge-failclosed.json` and the last fallible step, so a failed save
+    //    leaves no partial file for a later sweep to act on.
     let st = state::FailClosedState {
         version: state::SCHEMA_VERSION,
         pf_token: token.clone(),
@@ -457,10 +462,18 @@ fn engage_with(
     if let Err(e) = load_cover_ruleset(CoverKind::Transient, &ruleset, ops) {
         // A *failed engage* is the sole place this module fails OPEN on its own
         // error: we must not leave a half-loaded ruleset blocking traffic. A
-        // failed `pfctl -f -` load never committed (the ticket discipline that
-        // makes a successful load atomic also makes a failed one a no-op on
-        // the live ruleset), so the host still runs whatever was loaded
-        // before this call — restoring `/etc/pf.conf` here does not "undo a
+        // failed `pfctl -f -` load never committed its RULES (the ticket
+        // discipline that makes a successful load atomic also makes a failed
+        // one a no-op on the live RULESET), so the host still filters under
+        // whatever ruleset was loaded before this call. That is NOT the same
+        // as "a no-op on the live config": everything `pfctl` does outside the
+        // ticket lands even when the load then fails — the `set block-policy`/
+        // `skip`/`limit`/`timeout` ioctls it issues as it parses (module doc),
+        // and the interface skip flags it clears before parsing, which is why
+        // `set skip` has to be restated by every ruleset. Each of those only
+        // ever tightens — none is a permit — so no hole opens either way, but
+        // the state is not byte-identical to the pre-call one. Restoring
+        // `/etc/pf.conf` here does not "undo a
         // flush" (there is none), it returns the host to its canonical
         // baseline rather than leaving it under a stale cover ruleset. The
         // PR3 cutover treats an engage error as fatal and aborts before

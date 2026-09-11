@@ -705,9 +705,10 @@ fn a_failed_state_purge_does_not_fail_the_engage() {
 #[skuld::test]
 fn a_failed_persist_unwinds_the_pf_enable_refcount() {
     // `enable_capture_token` has already taken a refcount. `state::save` fails
-    // on a real, enumerated set of causes — unwritable state dir, full disk,
-    // failed chown — and without this unwind pf stays ENABLED under an
-    // unreferenced token until reboot, with no `bridge-failclosed.json` for
+    // on a real, enumerated set of causes — unwritable state dir, full disk;
+    // NOT a failed chown, which `util::ownership::chown_if_some` logs and
+    // swallows. Without this unwind pf stays ENABLED under an unreferenced
+    // token until reboot, with no `bridge-failclosed.json` for
     // `recover_cover` to return it from. `engage_lockdown`'s FreshEnable and
     // Reenable arms already unwind on exactly this failure; this is the
     // transient path's half of that symmetry.
@@ -831,11 +832,18 @@ fn a_failed_enable_capture_token_fails_the_engage_without_a_spurious_unwind() {
 /// three sites now share [`drop_refcount_or_warn`], which routes the call
 /// through [`pfctl_status`] specifically so a non-zero EXIT is caught, not
 /// just a spawn failure — this pins THAT check with a REAL (unmocked) failing
-/// `pfctl -X`, root-free: an unprivileged `pfctl -X <token>` deterministically
-/// fails with "Permission denied" (confirmed: `/sbin/pfctl -X 12345` as a
-/// non-root user prints `pfctl: /dev/pf: Permission denied`, exit 1, spawn
-/// itself succeeds) on every macOS host this test runs on, privileged or not
-/// — so this test needs no `TUN`/`GLOBAL_NET_STATE` label and no root.
+/// `pfctl -X`, root-free.
+///
+/// The operative reason it fails is the TOKEN, not the privilege: `pfctl`
+/// rejects a non-numeric `-X` argument while parsing arguments, before it ever
+/// opens `/dev/pf` (confirmed: `/sbin/pfctl -X not-a-real-token` prints
+/// `pfctl: Invalid token value 'not-a-real-token'` plus usage, exit 1, spawn
+/// itself succeeds). A *numeric* token would instead reach the open and fail
+/// there — `/sbin/pfctl -X 12345` prints `pfctl: /dev/pf: Permission denied`,
+/// which is the privilege-dependent failure this test deliberately does not
+/// rely on. Since the parse precedes the open, the failure here is identical
+/// under root: the test cannot go vacuous if it is ever run elevated, and it
+/// needs no `TUN`/`GLOBAL_NET_STATE` label and no root.
 ///
 /// Reverting `drop_refcount_or_warn` to the old shape — reading `pfctl(...)`'s
 /// `Result` and discarding it instead of passing it through `pfctl_status` —
@@ -858,9 +866,10 @@ fn drop_refcount_or_warn_logs_a_pfctl_x_that_spawned_but_exited_non_zero() {
     );
     {
         let _guard = garter::tracing_test::set_default_in_current_thread(subscriber);
-        // Not a real pf token — and even if it were, this process is
-        // unprivileged, so `-X` fails on the OS permission check before it
-        // could ever get far enough to consult the token at all.
+        // Not a real pf token, and not even a well-formed one: `pfctl` rejects
+        // it while parsing arguments, before `/dev/pf` is opened, so the
+        // non-zero exit does not depend on this process being unprivileged
+        // (see the doc comment above).
         drop_refcount_or_warn(
             "not-a-real-token",
             BestEffortPhase::RecoverCover,
@@ -870,8 +879,8 @@ fn drop_refcount_or_warn_logs_a_pfctl_x_that_spawned_but_exited_non_zero() {
     let log = writer.snapshot();
     assert!(
         log.contains("test sentinel: drop_refcount_or_warn pin"),
-        "an unprivileged `pfctl -X` exits non-zero (spawn succeeds, status fails) — that must \
-         be logged via pfctl_status's exit-code check, not read as an `Ok` spawn result and \
+        "a `pfctl -X` with an invalid token exits non-zero (spawn succeeds, status fails) — that \
+         must be logged via pfctl_status's exit-code check, not read as an `Ok` spawn result and \
          silently swallowed: {log}"
     );
 }
@@ -1530,14 +1539,28 @@ fn engage_publishing(
 /// this line survive a PASS instead of being discarded, so the figures below
 /// come from this PR's own green head run, not a hypothetical follow-up.
 ///
-/// Last measured: PENDING — this fix has not yet had a privileged darwin CI
-/// run against it. Record the printed line's RAW figure (raw hits per total
-/// control attempt) here, and the job link in `CONTRIBUTING.md`, from the
-/// first green run after this commit — NOT `hits/permitted_attempts`, which
-/// is filtered and therefore not comparable to the figures below. It must be
-/// **at least** the pre-filter-bug figures above (0.219/0.327 hits/attempt):
-/// a correct filter changes only which attempts are counted, never whether a
-/// connect succeeds, so anything less means the filter is still wrong.
+/// Last measured: run 34586524077, the first green privileged darwin run after
+/// this fix (job links in `CONTRIBUTING.md`). RAW figures — raw hits per TOTAL
+/// control attempt, NOT `hits/permitted_attempts`, which is filtered and
+/// therefore not comparable to the pre-filter-bug figures above:
+///
+/// - **darwin/arm64**: 36/38 (94.7%). 352 pool probes over 451 ms, one per
+///   1282 us.
+/// - **darwin/amd64**: 339/347 (97.7%). 784 pool probes over 1.041 s, one per
+///   1328 us.
+///
+/// Both clear the pre-filter-bug figures (0.219/0.327 hits/attempt) by an
+/// order of magnitude, which is the check that says the filter is now right: a
+/// correct filter changes only which attempts are counted, never whether a
+/// connect succeeds, so anything BELOW those figures would mean it is still
+/// wrong.
+///
+/// The straddle-exclusion rate differs sharply by leg — arm64 excludes 22/38
+/// (58%), amd64 24/347 (7%) — and that asymmetry is the filter working, not a
+/// defect in either. An attempt is excluded exactly when a commit lands inside
+/// its window, so the rate is attempt duration over transition period: ~11.9 ms
+/// against ~18.8 ms on arm64 (63% predicted) versus ~3.0 ms against ~43.4 ms on
+/// amd64 (7% predicted). Both legs land on their prediction.
 #[cfg(target_os = "macos")]
 #[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
 fn macos_failclosed_cover_transition_never_admits_blocked_flow() {
@@ -1685,9 +1708,13 @@ fn macos_failclosed_cover_transition_never_admits_blocked_flow() {
     //
     // Both a RAW count (every successful connect, uncounted attempts
     // included) and the filtered `hits`/`permitted_attempts` are tracked, so
-    // the printed line carries both — see the print site for why the raw
-    // number is the one this guard's acceptance criterion is checked
-    // against.
+    // the printed line carries both. RAW is the one the assertion and the
+    // acceptance criterion both read: a hit is a hit whether or not its window
+    // straddled a publish, so gating the positive control on the filtered
+    // count would let the straddle filter alone redden a run on which the
+    // budget was demonstrably live. The filtered pair stays for the printed
+    // line, where the permitted-target denominator is what makes the rate
+    // meaningful.
     let control_hits = Arc::new(AtomicUsize::new(0));
     let control_permitted_attempts = Arc::new(AtomicUsize::new(0));
     let control_raw_hits = Arc::new(AtomicUsize::new(0));
@@ -1808,6 +1835,15 @@ fn macos_failclosed_cover_transition_never_admits_blocked_flow() {
         100.0 * raw_hits as f64 / control_total_attempts as f64
     };
     let per_probe_us = elapsed.as_micros() as f64 / attempts as f64;
+    // What a probe needs to DETECT a leak, stated exactly: the cover's ruleset
+    // is `block out all` with no `block in` at all (`build_pf_ruleset`,
+    // macos.rs), so only the outbound SYN has to escape the window — the
+    // SYN-ACK comes back through an unfiltered inbound path, and the client's
+    // own outbound ACK being dropped afterwards does not fail the connect,
+    // because BSD completes `connect` at ESTABLISHED on SYN-ACK receipt and
+    // queues the ACK behind it. That last half is reasoned from TCP and
+    // `std`'s documented `connect_timeout` semantics, not executed here; the
+    // `block out all`/no-`block in` half is read straight off the builder.
     eprintln!(
         "[sensitivity] macos_failclosed_cover_transition: control completed {hits}/{permitted_attempts} \
          connects ({control_rate:.1}%) to a PERMITTED server within {PROBER_TIMEOUT:?}, filtered by the \
@@ -1815,11 +1851,13 @@ fn macos_failclosed_cover_transition_never_admits_blocked_flow() {
          ({raw_rate:.1}%) across every control attempt — raw/total is the figure comparable to the \
          pre-filter-bug baseline (see this test's doc comment); the pool emitted {attempts} probes across \
          {PROBER_THREADS} threads over {elapsed:?} = one probe per {per_probe_us:.0} us of wall clock. That \
-         interval bounds probe COVERAGE, not detection: a leak must still complete the WHOLE handshake — \
-         SYN, SYN/ACK across the RTT, and the client's outbound ACK — before the next `pfctl -f -` commit can \
-         cut it off, so a leak window shorter than that interval, or too short to fit a full handshake at \
-         all, is likelier to be missed than caught; compare it against the ~sub-millisecond `pfctl -f -` \
-         commit this test guards."
+         interval bounds probe COVERAGE, not detection: to be CAUGHT, a leak window must let a probe's \
+         outbound SYN escape and the SYN-ACK return inside {PROBER_TIMEOUT:?}. The cover blocks egress only \
+         (`block out all`, no `block in`) and `connect` completes on the SYN-ACK, so the client's own ACK \
+         being dropped by the next `pfctl -f -` commit does NOT hide the leak — the ACK is not required. A \
+         leak window shorter than the probe interval, or too short to pass a SYN at all, is still likelier \
+         to be missed than caught; compare it against the ~sub-millisecond `pfctl -f -` commit this test \
+         guards."
     );
 
     assert!(
@@ -1832,16 +1870,19 @@ fn macos_failclosed_cover_transition_never_admits_blocked_flow() {
         leaked_at_phase.load(Ordering::SeqCst),
     );
 
+    // Gated on RAW, not `hits`: the straddle filter decides what gets COUNTED,
+    // never whether a connect succeeded, so it has no business deciding
+    // whether the budget is live (see the control thread's doc comment).
     assert!(
-        hits > 0,
-        "positive control: not one of {permitted_attempts} connects to a PERMITTED server \
-         ({SERVER_A}/{SERVER_B}) completed within {PROBER_TIMEOUT:?} across the whole run ({control_total_attempts} \
-         total control attempts), so the never-admitted assertion above held vacuously. This is NOT \
-         necessarily a `PROBER_TIMEOUT` problem — before raising it, first suspect the permitted-target \
-         filter above (`permitted_idx` before/after agreement): a filter that is too strict (e.g. inverted \
-         again, or excluding more than it should) can drive `permitted_attempts` toward 0 on its own, with \
-         a healthy budget underneath it. Only raise `PROBER_TIMEOUT` once the filter itself is confirmed \
-         correct — see this test's doc comment for how it was verified last time it broke."
+        raw_hits > 0,
+        "positive control: not one of {control_total_attempts} connects to a PERMITTED server \
+         ({SERVER_A}/{SERVER_B}) completed within {PROBER_TIMEOUT:?} across the whole run (of which \
+         {permitted_attempts} survived the permitted-target filter), so the never-admitted assertion above \
+         held vacuously. This gates on the RAW count, so the filter cannot be the cause — suspect the \
+         budget itself: {PROBER_TIMEOUT:?} is also the control's connect budget, and an anycast RTT from \
+         this runner above it fails every control attempt on a perfectly healthy host. Do NOT widen \
+         {PROBER_TIMEOUT:?} to buy that margin: it is the prober pool's budget too, and raising it thins \
+         the pool's probe density, which IS this guard's sensitivity. The knob is loaded both ways."
     );
 
     // The last cover's normal Drop restores /etc/pf.conf.

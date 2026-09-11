@@ -1112,8 +1112,18 @@ milliseconds.
   until the new ruleset fully commits. Empirically checked by
   `macos_failclosed_cover_transition_never_admits_blocked_flow`
   (`macos_tests.rs`; see its own doc comment for the method, the caveats, and
-  its printed sensitivity) — not a mathematical proof. Disclosed, not fixed
-  here: a *failed* re-engage during a transition still reloads `/etc/pf.conf`
+  its printed sensitivity) — not a mathematical proof. That test prints its own
+  sensitivity rather than leaving a green uninformative; the figure to read is
+  the RAW one (raw hits per total control attempt), and it was last measured in
+  run 34586524077:
+  [darwin/arm64](https://github.com/bindreams/hole/actions/runs/34586524077/job/103221908470)
+  36/38 (94.7%), 352 pool probes over 451 ms (one per 1282 us);
+  [darwin/amd64](https://github.com/bindreams/hole/actions/runs/34586524077/job/103221908546)
+  339/347 (97.7%), 784 pool probes over 1.041 s (one per 1328 us). The
+  straddle-exclusion rate differs by leg (58% vs 7%) purely because attempt
+  duration differs against transition period — see the test's doc comment.
+  Disclosed, not fixed here: a *failed* re-engage during a transition still
+  reloads `/etc/pf.conf`
   over a still-good prior cover (bindreams/hole#1004), and two privileged test
   files' own bare `pfctl` calls are a separate inconsistency (bindreams/hole#1005).
   **Only the standing lockdown skips the pf state purge** (bindreams/hole#1015,
