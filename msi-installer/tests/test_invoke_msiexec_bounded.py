@@ -381,6 +381,35 @@ def test_a_target_the_capture_left_suspended_is_detected_and_terminated(tmp_path
     assert "failed to kill process id(s)" not in combined, f"the freed pid was tree-killed again:\n{combined}"
 
 
+def test_a_debugger_that_cannot_start_is_reported_and_terminates_nothing(tmp_path: Path) -> None:
+    """A debugger that never launched attached to nothing, so it froze nothing.
+
+    With budget to spare the loop reaches `Start-Process` and it throws: the
+    step must say so and carry on to the same ending as always.
+    """
+    log_path = tmp_path / "wedge.log"
+
+    result = _run_script(
+        params={
+            "Verb": "/x",
+            "MsiPath": "unused.msi",
+            "LogPath": str(log_path),
+            "BoundMinutes": "0.02",
+            "ExePath": sys.executable,
+            "StackCaptureSeconds": "30",
+            "CdbPath": str(tmp_path / "does-not-exist-cdb.exe"),
+        },
+        exe_args=_python_exe_args("import time; time.sleep(3600)"),
+    )
+    combined = result.stdout + result.stderr
+
+    assert result.returncode != 0
+    assert "failed to start cdb" in combined, f"a debugger that could not launch went unreported:\n{combined}"
+    assert "terminated suspended pid" not in combined, f"nothing was attached, so nothing may be killed:\n{combined}"
+    assert WEDGE_THROW in combined, f"a failed launch swallowed the wedge throw:\n{combined}"
+    assert "killed process id(s)" in combined, f"the tree kill was skipped:\n{combined}"
+
+
 def test_stack_capture_budget_exhaustion_is_reported_and_does_not_swallow_the_wedge(tmp_path: Path) -> None:
     """A zero budget must skip the capture loudly and still reach the throw --
     the capture is additive instrumentation, never a new way to lose the
