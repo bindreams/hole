@@ -34,6 +34,7 @@ pub mod interrupt;
 pub mod manifest;
 pub mod orchestrate;
 pub mod pull_subrepo;
+pub mod schemars_pin;
 pub mod skuld_label_coverage;
 pub mod stage;
 pub mod target;
@@ -61,6 +62,9 @@ mod ci_timeouts_tests;
 #[cfg(test)]
 #[path = "ci_toolchain_pins_tests.rs"]
 mod ci_toolchain_pins_tests;
+#[cfg(test)]
+#[path = "schemars_pin_tests.rs"]
+mod schemars_pin_tests;
 // These tests render with the macOS system font (/System/Library/Fonts/SFNS.ttf);
 // the DMG background is a darwin-only feature, so gate them to macOS. They fail
 // loudly on macOS if the font is missing — other platforms simply lack the feature.
@@ -231,6 +235,15 @@ pub enum Command {
     /// `prek.toml` as an `always_run` local hook (`pass_filenames = false`
     /// — it always operates on the whole repo).
     CheckVendoringIntegrity,
+    /// Check that `typify` is still the reason `schemars` is pinned to 0.8, and
+    /// that the artefacts holding that pin still do so.
+    ///
+    /// The superset of the `schemars_pin_still_tracks_typify` conformance test:
+    /// it adds `typify-impl`'s *declared* requirement, read via `cargo
+    /// metadata`, which the test cannot source because it runs from a nextest
+    /// archive with no registry. Wired into `prek.toml` as the
+    /// `check-schemars-pin` hook. See `xtask/src/schemars_pin.rs`.
+    CheckSchemarsPin,
     /// Run all `cargo xtask <step>` commands required for a runnable build.
     ///
     /// Currently: `ex-ray` + `galoshes` + `wintun` + `golangci-lint`.
@@ -350,6 +363,33 @@ pub enum Command {
         /// test-running nextest command shape).
         #[arg(long, default_value = "test-hole")]
         job: String,
+        /// Also record the verified group membership here (relative to the
+        /// repo root unless absolute), for a later
+        /// `verify-global-net-state-executed` step in the same job to read
+        /// back. Written only when the check above passes.
+        #[arg(long)]
+        record: Option<PathBuf>,
+    },
+    /// Verify that every `global_net_state` test recorded by
+    /// `verify-global-net-state-labels --record` actually ran — present,
+    /// non-skipped — in this job's per-lane nextest JUnit reports, not merely
+    /// that it was selectable (guard 2 above already covers that) — see
+    /// `xtask::global_net_state_conformance::verify_executed`
+    /// (bindreams/hole#999).
+    VerifyGlobalNetStateExecuted {
+        /// The membership file `verify-global-net-state-labels --record`
+        /// wrote earlier in this job, relative to the repo root unless
+        /// absolute.
+        #[arg(long)]
+        expected: PathBuf,
+        /// One nextest JUnit report per `SKULD_LABELS` lane, relative to the
+        /// repo root unless absolute. The group spans BOTH lanes, and each
+        /// lane runs under its own nextest profile so its report lands at
+        /// its own path instead of being overwritten by the other lane's —
+        /// see `xtask::global_net_state_conformance`. Repeat the flag per
+        /// lane.
+        #[arg(long = "junit", required = true)]
+        junits: Vec<PathBuf>,
     },
 }
 
@@ -402,6 +442,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
         }
         Command::FinishVendorBump { path, dep_name, tag } => run_finish_vendor_bump(path, dep_name, tag),
         Command::CheckVendoringIntegrity => run_check_vendoring_integrity(),
+        Command::CheckSchemarsPin => schemars_pin::verify(&repo_root()?),
         Command::Deps => run_deps(),
         Command::Version { group, check, exact } => run_version(group, check, exact),
         Command::Build { target, all } => run_build(target, all),
@@ -432,7 +473,12 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             Ok(())
         }
         Command::VerifySkuldLabelCoverage { job } => skuld_label_coverage::verify(&repo_root()?, &job),
-        Command::VerifyGlobalNetStateLabels { job } => global_net_state_conformance::verify(&repo_root()?, &job),
+        Command::VerifyGlobalNetStateLabels { job, record } => {
+            global_net_state_conformance::verify(&repo_root()?, &job, record.as_deref())
+        }
+        Command::VerifyGlobalNetStateExecuted { expected, junits } => {
+            global_net_state_conformance::verify_executed(&repo_root()?, &expected, &junits)
+        }
     }
 }
 

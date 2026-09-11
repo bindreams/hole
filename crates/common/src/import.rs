@@ -1,4 +1,4 @@
-use crate::config::{is_valid_plugin_name, ServerEntry};
+use crate::config::{is_valid_plugin_name, Password, ServerEntry};
 use crate::plugin as known_plugin;
 use thiserror::Error;
 use uuid::Uuid;
@@ -7,8 +7,19 @@ use uuid::Uuid;
 
 #[derive(Debug, Error)]
 pub enum ImportError {
-    #[error("failed to parse config JSON: {0}")]
-    Parse(#[from] serde_json::Error),
+    /// Carries only content-safe scalars, never the `serde_json::Error` —
+    /// same shape and same reason as [`crate::config::ConfigError::Parse`].
+    /// A user's imported profile is the most-likely-malformed input in the
+    /// product and holds a password; dropping the source makes an echo
+    /// structurally impossible rather than a property of who happens to
+    /// construct this today — the fields cannot hold content, so no
+    /// constructor anywhere can reintroduce one.
+    #[error("failed to parse config JSON: {kind} (line {line}, column {column})")]
+    Parse {
+        kind: &'static str,
+        line: usize,
+        column: usize,
+    },
     #[error("missing required field: {0}")]
     MissingField(&'static str),
     #[error("invalid field value: {0}")]
@@ -25,6 +36,19 @@ pub enum ImportError {
         crate::plugin::known_plugin_names_joined()
     )]
     UnsupportedPlugin { name: String },
+}
+
+/// Hand-written rather than `#[from]`: the derive would keep the
+/// `serde_json::Error` as a field, which is the leak. This classifies it on
+/// the way in, so `?` still reads the same at the call site.
+impl From<serde_json::Error> for ImportError {
+    fn from(e: serde_json::Error) -> Self {
+        Self::Parse {
+            kind: crate::config::parse_kind(&e),
+            line: e.line(),
+            column: e.column(),
+        }
+    }
 }
 
 // Import logic ========================================================================================================
@@ -144,7 +168,7 @@ fn parse_server_value(value: &serde_json::Value) -> Result<ServerEntry, ImportEr
         server: server.into(),
         server_port,
         method: method.to_string(),
-        password: password.to_string(),
+        password: Password::new(password),
         plugin,
         plugin_opts,
         validation: None,

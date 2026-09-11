@@ -54,17 +54,57 @@ jobs:
   build:
     name: Build (${{ matrix.os }}/${{ matrix.arch }})
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 30
+    # Per-leg, because the legs differ by ~6x (linux/arm64's 4m36s max vs
+    # darwin/amd64's 29m42s+): one shared wall either hides a regression on
+    # the fast legs or keeps killing the slow one, which is exactly what
+    # happened here — #995. Whole-job wall clock, 31 runs on `main`
+    # (2026-08-27 -> 2026-09-10), the re-measure #995 asked for across every
+    # leg, not just the one that surfaced:
+    #
+    #   linux/arm64    2m52s - 4m36s,   0 killed -> 10
+    #   linux/amd64    2m48s - 5m16s,   0 killed -> 10
+    #   windows/arm64  7m36s - 11m39s,  0 killed -> 20
+    #   darwin/arm64   7m17s - 16m05s,  0 killed -> 25
+    #   windows/amd64  11m10s - 17m32s, 0 killed -> 25
+    #   darwin/amd64   10m07s - 29m42s, 5 killed  -> 50  (see below)
+    #
+    # darwin/amd64's distribution is right-CENSORED by the old 30m wall: 5 of
+    # 31 runs were killed at 30m00s-30m34s, and 10 of 31 (32%) landed within 3
+    # minutes of it, so 29m42s — the largest run that actually finished — is a
+    # floor on the true tail, not its ceiling. 50 is ~1.7x that floor, chosen
+    # the same way #989/#990 picked 70 for `Test hole (darwin/arm64)`: enough
+    # to clear the censored region so the true tail becomes observable next
+    # time this is re-measured; tighten once it is.
+    #
+    # The other five legs were never killed, so they KEEP the existing 30 —
+    # measured here, deliberately not tightened. Their observed maxima would
+    # justify lower walls (1.4-2.2x headroom), but a timeout that has never
+    # fired is not costing anything, and this change exists to stop kills, not
+    # to introduce new ones on legs that were fine. Tightening them is a
+    # separate decision with its own evidence, not a rider on this fix.
+    #
+    # Whether darwin/amd64 got slower from genuine growth or sccache hit-rate
+    # is NOT settled, only narrowed: step-level timing (setup-build's dep
+    # fetch, Clippy, and the nextest-archive build) scales by roughly the same
+    # factor between its fastest and slowest runs (correlation with the job
+    # total: 0.66 / 0.96 / 0.85) rather than one step alone accounting for the
+    # swing, which argues against one crate's code having grown and toward a
+    # global factor — consistent with the cache-rate variance
+    # `test-dmg-signing` documents for the same macos-15-intel runner (25m
+    # warm vs 45m45s cold, 5% hit rate). But CI never runs `sccache
+    # --show-stats`, so there's no per-run hit-rate number to confirm that
+    # directly.
+    timeout-minutes: ${{ matrix.timeout }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - { os: windows, arch: amd64, runner: windows-latest }
-          - { os: darwin,  arch: amd64, runner: macos-15-intel }
-          - { os: darwin,  arch: arm64, runner: macos-latest }
-          - { os: linux,   arch: amd64, runner: ubuntu-latest }
-          - { os: linux,   arch: arm64, runner: ubuntu-24.04-arm }
-          - { os: windows, arch: arm64, runner: windows-11-arm }
+          - { os: windows, arch: amd64, runner: windows-latest,     timeout: 30 }
+          - { os: darwin,  arch: amd64, runner: macos-15-intel,     timeout: 50 }
+          - { os: darwin,  arch: arm64, runner: macos-latest,       timeout: 30 }
+          - { os: linux,   arch: amd64, runner: ubuntu-latest,      timeout: 30 }
+          - { os: linux,   arch: arm64, runner: ubuntu-24.04-arm,   timeout: 30 }
+          - { os: windows, arch: arm64, runner: windows-11-arm,     timeout: 30 }
     steps:
       - uses: actions/checkout@v7
         with:
@@ -403,9 +443,16 @@ jobs:
       # `global_net_state` cross-binary serialization group. That reads as an
       # intermittent flake, not the rename that caused it — see
       # bindreams/hole#894.
+      #
+      # `--record` writes the membership just verified for guard 3 (below) to
+      # read back after the test steps — see `verify` in
+      # global_net_state_conformance.rs for why it isn't re-listed there
+      # instead. bindreams/hole#999.
       - name: Verify global_net_state label matches the nextest.toml filter
         shell: bash
-        run: cargo xtask verify-global-net-state-labels --job test-hole
+        run: >
+          cargo xtask verify-global-net-state-labels --job test-hole
+          --record target/global-net-state-expected.json
 
       # `--no-default-features` mirrors the `hole-tests` xtask target. Without
       # it Cargo recompiles `hole` with `tauri/custom-protocol` ON (different
@@ -438,20 +485,52 @@ jobs:
       # smaller than the margin, and a per-leg matrix entry here would have to
       # be kept in step with the job budgets above for no measured gain.
       #
-      # DISCLOSED RESIDUAL: these are not a guarantee that the step always
-      # loses the race to the job wall. On the windows leg (60) a hung TUN step
-      # can still reach the wall first when the build and non-TUN steps both
-      # run long (17 + 4 + 19 + 25 = 65). Bounding that away would mean either
-      # budgets too tight to survive an honest slow run or a wall raised past
-      # what the measurements support, so it is left stated rather than fixed;
-      # the common case — one step hangs while the others run normally — is
-      # covered on every leg.
+      # DISCLOSED RESIDUAL (hung TUN step): these are not a guarantee that the
+      # step always loses the race to the job wall. On the windows leg (60) a
+      # hung TUN step can still reach the wall first when the build and
+      # non-TUN steps both run long (17 + 4 + 19 + 25 = 65, already past the
+      # wall on its own). The #999 execution proof step below does NOT add to
+      # this sum: its `if:` names no status function, so GitHub ANDs in
+      # `success()`, and a failed/timed-out TUN step makes that condition
+      # false — the proof step is skipped, not run, and spends none of its
+      # budget. Bounding the 65 away would mean either budgets too tight to
+      # survive an honest slow run or a wall raised past what the measurements
+      # support, so it is left stated rather than fixed; the common case — one
+      # step hangs while the others run normally — is covered on every leg.
+      #
+      # DISCLOSED RESIDUAL (thin post-TUN margin): a SLOW-BUT-PASSING TUN step
+      # — one that stays under its own 25-minute step budget rather than
+      # hanging — reaches the #999 execution proof step with whatever wall
+      # remains after build + both verify steps + non-TUN + TUN, and the
+      # per-step budgets above do not bound that remainder: they cap each step
+      # alone, not their sum against the shared 60-minute wall. If what is
+      # left is under the proof step's own 3-minute budget, the JOB wall can
+      # kill the whole job mid-proof instead of letting the step's own timeout
+      # fail it cleanly — the exact #989/#970 failure mode this per-step
+      # design otherwise avoids: a bare `cancelled`, no log blob, destroying
+      # the evidence the proof step exists to produce. Narrowing this away has
+      # the same cost as the residual above and is left stated rather than
+      # fixed.
       - name: Test (non-TUN)
         id: test-non-tun
         timeout-minutes: 35
         shell: bash
         env:
           SKULD_LABELS: "!tun"
+          # Selects `.config/nextest.toml`'s `[profile.non-tun]`, an empty
+          # table that inherits `[profile.default.junit].path` and every
+          # `[[profile.default.overrides]]` entry — including the
+          # `global_net_state` test-group. Each profile writes its own JUnit
+          # report (`target/nextest/non-tun/junit.xml`), so this lane's
+          # report survives the TUN lane's run below rather than being
+          # overwritten by it; see that file's comment. Set via env rather
+          # than a `--profile` flag because
+          # `ci_test_hole_steps_match_the_hole_tests_target` holds every
+          # test-hole nextest step's command text equal to build.yaml's
+          # `hole-tests` target — `NEXTEST_PROFILE` is exempted from that
+          # comparison (`ci_nextest_parity::FINGERPRINT_NEUTRAL_ENV`) because
+          # nextest reads it at its own run/list time, never cargo's.
+          NEXTEST_PROFILE: non-tun
         run: >
           cargo nextest run --no-default-features
           --features tombstone/crash-dumps,tombstone/crash-child --no-fail-fast
@@ -469,6 +548,10 @@ jobs:
         shell: bash
         env:
           SKULD_LABELS: "tun"
+          # `.config/nextest.toml`'s `[profile.tun]` — see the non-TUN step's
+          # comment above; same inheritance, own JUnit report
+          # (`target/nextest/tun/junit.xml`).
+          NEXTEST_PROFILE: tun
         # `--no-fail-fast`: this lane serializes many independent real-OS-effect
         # tests behind one elevated token; one failure otherwise cancels the
         # rest of the run, hiding every verdict downstream of the first
@@ -485,6 +568,40 @@ jobs:
               + package(handle-holders) + package(tombstone)
               + package(hole-test-observability)'
 
+      # Guard 2 above (`verify-global-net-state-labels`) only proves the
+      # `global_net_state` group's tests were SELECTABLE; a job that silently
+      # ran zero of them (e.g. nextest's own group/filter machinery
+      # mis-scheduling on Windows) would still read as green. This diffs the
+      # membership guard 2 recorded against the two lanes' own-profile JUnit
+      # reports above and fails on any member that never shows up as executed
+      # — bindreams/hole#999.
+      #
+      # WINDOWS LEG ONLY, and the name says so: the darwin legs would need
+      # their own pair of `non-tun`/`tun` profiles too, but their job walls
+      # are the scarce resource this repo protects, so extending the proof
+      # there is a separate, separately-measured decision. Nothing here claims
+      # the group is proven executed anywhere else.
+      #
+      # No status function in the `if:`, so GitHub ANDs in `success()`: when a
+      # test step fails, this is skipped. Deliberate — the proof answers "did
+      # everything run", which is only interesting once "did everything pass"
+      # is already yes; a failed test step is its own, louder signal, and the
+      # lane reports it leaves behind are partial by construction.
+      #
+      # Blocking (no `continue-on-error`): the check is a set diff over two
+      # files plus a recorded listing, with no network, no test execution and
+      # no timing — it has no flake surface of its own, and a non-blocking
+      # version of it could not distinguish a real regression from noise.
+      - name: "Verify every global_net_state test executed (windows leg, #999)"
+        if: matrix.os == 'windows' && matrix.arch == 'amd64'
+        timeout-minutes: 3
+        shell: bash
+        run: >
+          cargo xtask verify-global-net-state-executed
+          --expected target/global-net-state-expected.json
+          --junit target/nextest/non-tun/junit.xml
+          --junit target/nextest/tun/junit.xml
+
       # macOS TUN lane runs UNDER ROOT: the lockdown real-engage test (#527)
       # drives `pfctl -E`/`-f`, which require root. The runner's cargo/nextest
       # and the user-owned `target/` are reused via `sudo env PATH/HOME` (the
@@ -495,13 +612,22 @@ jobs:
       # `--features` must match `Build hole test binaries` and the non-TUN
       # step above (see that comment) or cargo rebuilds instead of reusing
       # the prebuilt binaries.
+      # NEXTEST_PROFILE=tun (see the windows TUN step's comment above): this
+      # step runs under `sudo`, so without a lane-specific profile it would
+      # write a ROOT-owned `target/nextest/default/junit.xml` that no
+      # subsequent unprivileged `cargo nextest run` in this checkout could
+      # overwrite or clean up (exit 110) even though the tests themselves had
+      # already passed — the failure mode M1 in the #1012 review names. The
+      # darwin leg does not feed guard 3 (windows leg only, see below), but it
+      # is the ONLY step here that runs privileged, so it is the one place
+      # this problem can actually occur.
       - name: Test (TUN, macOS — root for pfctl)
         if: matrix.os == 'darwin'
         id: test-tun-macos
         timeout-minutes: 25
         shell: bash
         run: >
-          sudo env "PATH=$PATH" "HOME=$HOME" SKULD_LABELS=tun
+          sudo env "PATH=$PATH" "HOME=$HOME" SKULD_LABELS=tun NEXTEST_PROFILE=tun
           cargo nextest run --no-default-features
           --features tombstone/crash-dumps,tombstone/crash-child --no-fail-fast
           -E 'package(hole) + package(hole-bridge) + package(hole-common)
@@ -588,6 +714,41 @@ jobs:
 
       - name: Test ex-ray Go (ECH gate)
         run: cargo xtask run ex-ray-tests
+
+  # `.github/renovate.json` is only ever executed by Renovate's own bot, so a
+  # typo in it (`matchDepNamez`, a number where a duration string belongs) is
+  # silently ignored rather than reported anywhere this repo can see. This
+  # catches that the config is schema-valid; it says nothing about whether a
+  # given rule actually applies to a given dependency — see
+  # xtask/src/schemars_pin.rs's module doc for why that's not verified here.
+  # Linux, measured at 25s for the step and 31s for the job; deliberately not
+  # folded into `Lint`, which is a Windows job with a Rust toolchain it does not
+  # need.
+  renovate-config:
+    name: Validate renovate config
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: lts/*
+
+      # Named explicitly, with --no-global: naming a config file makes the
+      # validator treat it as *global* self-hosted config by default, which
+      # accepts a different option set and would pass configs Renovate rejects
+      # at runtime -- --no-global keeps it validating as a *repository* config
+      # instead. Without a file argument at all, the validator silently skips
+      # every default config filename that doesn't exist and exits 0 with only
+      # a warning logged, so a renovate.json moved or deleted in a refactor
+      # would pass this job having validated nothing.
+      #
+      # Unpinned on purpose, and the one place in this repo where that is the
+      # correct answer: the bot that reads this config is always Renovate's
+      # latest release, so validating against anything older would assert a
+      # schema nothing uses. `--strict` makes warnings fatal.
+      - name: Validate .github/renovate.json
+        run: npx --yes --package renovate renovate-config-validator --strict --no-global .github/renovate.json
 
   # Runs the ex-ray-unit-tests target (build.yaml) on windows/darwin -- see there
   # for why it is split from test-ex-ray.

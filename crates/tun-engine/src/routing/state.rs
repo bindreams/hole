@@ -214,7 +214,7 @@ impl From<RouteStateV3> for RouteState {
 }
 
 /// Reads only the discriminant, tolerating fields from any schema.
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
 struct VersionProbe {
     version: u32,
 }
@@ -322,7 +322,22 @@ pub fn load(state_dir: &Path) -> Option<RouteState> {
     let version = match serde_json::from_slice::<VersionProbe>(&bytes) {
         Ok(probe) => probe.version,
         Err(e) => {
-            tracing::warn!(error = %e, path = %path.display(), "route-state parse failed");
+            // Converted immediately, never held as a `serde_json::Error`:
+            // this file records `server_ip` (and one per `StaleRecord`), a
+            // protected value, and `serde_json::Error`'s `Display` quotes the
+            // offending bytes back — a skewed file with an address where a
+            // number belongs echoes it verbatim. Nothing arms redaction on
+            // the recovery path either, so there is no sink backstop here.
+            // See `util::parse_error::ParseFailure`'s own doc for why
+            // shadowing `e` here (rather than only calling
+            // `describe_parse_error` where it's logged) is what makes that
+            // safe by construction.
+            let e = util::parse_error::ParseFailure::from(&e);
+            tracing::warn!(
+                error = %e,
+                path = %path.display(),
+                "route-state parse failed"
+            );
             return None;
         }
     };
@@ -348,7 +363,13 @@ pub fn load(state_dir: &Path) -> Option<RouteState> {
     match parsed {
         Ok(state) => Some(state),
         Err(e) => {
-            tracing::warn!(error = %e, path = %path.display(), "route-state parse failed");
+            // Same reason as the version probe's arm above.
+            let e = util::parse_error::ParseFailure::from(&e);
+            tracing::warn!(
+                error = %e,
+                path = %path.display(),
+                "route-state parse failed"
+            );
             None
         }
     }

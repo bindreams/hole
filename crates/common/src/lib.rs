@@ -5,6 +5,7 @@ pub mod logging;
 pub mod paths;
 pub mod plugin;
 pub mod protocol;
+mod secret_newtype;
 pub mod update_marker;
 pub mod verify;
 pub mod version;

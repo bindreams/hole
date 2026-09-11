@@ -32,7 +32,7 @@ pub mod plugin;
 pub mod plugin_log;
 pub mod shadowsocks;
 
-pub use config::{build_ss_config, validate_proxy_config, ProxyError, TUN_SUBNET, TUN_SUBNET6};
+pub use config::{build_ss_config, validate_proxy_config, KeyMaterialFault, ProxyError, TUN_SUBNET, TUN_SUBNET6};
 pub use shadowsocks::{ShadowsocksProxy, ShadowsocksRunning};
 
 // Used by `server_test.rs` + `proxy_tests.rs`. Kept crate-private so

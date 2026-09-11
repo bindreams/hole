@@ -268,3 +268,57 @@ fn apply_then_build_proxy_config_carries_allow_insecure_bootstrap() {
         "allow_insecure_bootstrap must reach ProxyConfig.dns through the settings flow"
     );
 }
+
+// Secret redaction ====================================================================================================
+
+const SECRET_ADDR: &str = "203.0.113.7";
+const SECRET_PW: &str = "super-secret-do-not-leak";
+
+fn secret_settings() -> UiSettings {
+    let mut json = default_settings_json();
+    json["servers"] = serde_json::json!([{
+        "id": "a", "name": "Server a", "server": SECRET_ADDR,
+        "server_port": 8388, "method": "aes-256-gcm", "password": SECRET_PW
+    }]);
+    serde_json::from_value(json).unwrap()
+}
+
+/// This type is where a password *enters* the process: it is the shape of the
+/// webview's `save_config` payload. It derives `Debug` and nothing else, so
+/// `Debug` is the whole sink surface — a `debug!(?settings)` anywhere in that
+/// command path is the leak, and the field types are what stop it.
+#[skuld::test]
+fn ui_settings_debug_omits_the_password_and_the_address() {
+    let rendered = format!("{:?}", secret_settings());
+    assert!(
+        !rendered.contains(SECRET_PW),
+        "Debug must not carry the password: {rendered}"
+    );
+    assert!(
+        !rendered.contains(SECRET_ADDR),
+        "Debug must not carry the server address: {rendered}"
+    );
+}
+
+/// Both newtypes are `#[serde(transparent)]`, so the payload the frontend
+/// sends is byte-identical to the one it sent before they existed.
+#[skuld::test]
+fn ui_server_entry_deserializes_the_secrets_from_bare_strings() {
+    let settings = secret_settings();
+    let ui = &settings.servers[0];
+    assert_eq!(ui.password.expose(), SECRET_PW);
+    assert_eq!(ui.server.expose(), SECRET_ADDR);
+}
+
+/// The payload's secrets have to survive the merge intact — a redacting type
+/// that also redacted what it stored would break the connect path.
+#[skuld::test]
+fn apply_carries_the_secrets_into_the_config() {
+    let mut current = AppConfig {
+        servers: vec![entry("a")],
+        ..Default::default()
+    };
+    secret_settings().apply(&mut current);
+    assert_eq!(current.servers[0].password.expose(), SECRET_PW);
+    assert_eq!(current.servers[0].server.expose(), SECRET_ADDR);
+}

@@ -1,6 +1,6 @@
 module github.com/bindreams/hole/ex-ray
 
-go 1.25.5
+go 1.26.0
 
 // The Go pin, for every consumer at once: `go` itself honours this locally, so
 // a bare `go build` cannot silently use whatever is first on PATH, and
@@ -14,7 +14,7 @@ toolchain go1.27.0
 require (
 	github.com/golang/protobuf v1.5.4
 	github.com/v2fly/v2ray-core/v5 v5.52.0
-	golang.org/x/sys v0.47.0
+	golang.org/x/sys v0.48.0
 	google.golang.org/protobuf v1.36.12
 )
 

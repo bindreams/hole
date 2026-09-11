@@ -184,7 +184,8 @@ before editing; the sections linked below are the authoritative source.
   the set of crates that can write an address is not enumerable; a `Display`-less
   `ServerAddress` newtype provides prevention. Arming is last-wins, so the
   crash-recovery `<server:recovered>` token joins to the session token on the
-  next connect. →
+  next connect. The password has a matching `Display`-less `Password` newtype
+  and its own asymmetric limits. →
   [CONTRIBUTING.md#server-address-redaction](CONTRIBUTING.md#server-address-redaction)
 - **Logging & plugin diagnostics.** Log destinations, the WebView2/console-relay
   tee, `HOLE_BRIDGE_LOG` directives, and the plugin tap. →
@@ -233,9 +234,10 @@ before editing; the sections linked below are the authoritative source.
   before process exit" precondition that no test could enforce, and closing the
   handle it leaked deleted the rule instead of policing it.
   [→](CONTRIBUTING.md#fail-closed-cover)
-- **The server address is never logged** — no `Display` on `ServerAddress`
-  (compiler-enforced), `.expose()` is its only exit, and every `Serialize` type
-  transitively holding one needs its own `Dump` impl.
+- **Hole never writes the server address or the password** — no `Display` on
+  `ServerAddress` or `Password` (compiler-enforced), `.expose()` is the only
+  exit from either, and every `Serialize` type transitively holding one needs
+  its own `Dump` impl.
   [→](CONTRIBUTING.md#server-address-redaction)
 
 ## macOS CI is the scarce resource

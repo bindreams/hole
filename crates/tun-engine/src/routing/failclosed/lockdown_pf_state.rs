@@ -98,7 +98,21 @@ pub fn load_presence(state_dir: &Path) -> super::StateFile<LockdownPfState> {
             StateFile::Unusable
         }
         Err(e) => {
-            tracing::warn!(error = %e, path = %path.display(), "lockdown-pf-state parse failed");
+            // Converted immediately, never held as a `serde_json::Error`:
+            // `main_snapshot` is a captured `pfctl -sr` ruleset, which
+            // contains the server IP whenever the ruleset it captured was
+            // Hole's own cover, and `serde_json::Error`'s `Display` quotes
+            // the offending bytes back. Shadowing `e` with the source-free
+            // `ParseFailure` here, rather than only calling
+            // `describe_parse_error` where it's logged, means there is no
+            // live `serde_json::Error` left in scope for a later edit to
+            // reach for with `%e`.
+            let e = util::parse_error::ParseFailure::from(&e);
+            tracing::warn!(
+                error = %e,
+                path = %path.display(),
+                "lockdown-pf-state parse failed"
+            );
             StateFile::Unusable
         }
     }

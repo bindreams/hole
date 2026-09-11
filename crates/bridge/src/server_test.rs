@@ -323,10 +323,20 @@ fn build_server_config(entry: &ServerEntry, server_ip: IpAddr) -> Result<ServerC
         .map_err(|_| format!("unsupported cipher: {}", entry.method))?;
     ServerConfig::new(
         ServerAddr::SocketAddr(SocketAddr::new(server_ip, entry.server_port)),
-        entry.password.clone(),
+        entry.password.expose().to_owned(),
         cipher,
     )
-    .map_err(|e| format!("invalid server config: {e}"))
+    // Never `{e}`: `ServerConfigError`'s own `Display` names the offending
+    // base64 symbol and its offset, and this string becomes a
+    // `ServerTestOutcome` the GUI shows. Same classifier, and therefore the
+    // same message, as `build_ss_config`'s.
+    .map_err(|e| {
+        crate::proxy::ProxyError::InvalidKeyMaterial {
+            method: entry.method.clone(),
+            fault: crate::proxy::config::classify_key_material(e),
+        }
+        .to_string()
+    })
 }
 
 /// If `entry.plugin` is set, spawn it via Garter and override `svr_cfg`'s
@@ -391,16 +401,15 @@ async fn maybe_start_plugin(
     .await
     .map_err(|e| ServerTestOutcome::PluginStartFailed { detail: e.to_string() })?;
 
-    // Override the server address to point at the plugin's local port.
+    // Override the server address to point at the plugin's local port. Uses
+    // `set_addr`, not a rebuilt `ServerConfig::new`: for an AEAD-2022 EIH
+    // password (`iPSK1:...:uPSK`), `svr_cfg.password()` returns only the
+    // uPSK, so rebuilding from it would silently drop `identity_keys` and
+    // send the plugin-routed probe without its identity headers. `set_addr`
+    // mutates only the address and cannot fail, so it also can't misclassify
+    // key material — there is no `Err` arm here to test.
     let local = chain.local_addr();
-    *svr_cfg = ServerConfig::new(
-        ServerAddr::SocketAddr(local),
-        svr_cfg.password().to_owned(),
-        svr_cfg.method(),
-    )
-    .map_err(|e| ServerTestOutcome::PluginStartFailed {
-        detail: format!("failed to rebuild server config: {e}"),
-    })?;
+    svr_cfg.set_addr(local);
 
     debug!("server_test plugin bound at {local}");
     Ok(Some(chain))

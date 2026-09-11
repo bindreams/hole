@@ -1,6 +1,8 @@
 //! Small cross-platform utilities shared across the workspace.
 //!
 //! - [`ownership`] — generic `chown(2)` primitive (macOS; a no-op elsewhere).
+//! - [`parse_error`] — content-safe classification of a `serde_json` parse
+//!   failure, so an error that quotes its input never reaches a log.
 //! - [`port_alloc`] — ephemeral port allocation with multi-transport
 //!   verification and retry around Windows bind races.
 //! - [`redact`] — process-global registry of literals that must never reach
@@ -17,6 +19,7 @@
 //! shadowsocks-specific.
 
 pub mod ownership;
+pub mod parse_error;
 pub mod port_alloc;
 pub mod redact;
 pub mod retry;
