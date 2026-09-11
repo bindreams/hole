@@ -1,3 +1,81 @@
+//! Native-crash capture: the `on_crash` callback, the signal-safe marker it
+//! writes, and the `sweep` that reports one on the next start.
+//!
+//! # What each platform produces
+//!
+//! |         | marker | OS-level report  | `.dmp` (dev-only, `crash-dumps`) |
+//! |---------|--------|------------------|----------------------------------|
+//! | Windows | yes    | WER / LocalDumps | yes                              |
+//! | Linux   | yes    | core dump        | never had one                    |
+//! | macOS   | yes    | none — no `.ips` | none                             |
+//!
+//! `crash-dumps` reads like a cross-platform feature and is not one. It gates
+//! a Windows-only branch, and `minidump-writer` is declared under
+//! `[target.'cfg(windows)'.dependencies]`, so enabling the feature on macOS or
+//! Linux links nothing and changes nothing.
+//!
+//! # macOS: marker only, by decision
+//!
+//! Owner ruling on bindreams/hole#842, and the whole of the rationale: **no
+//! part of Hole should hang the process even sometimes — not a diagnostics
+//! crate, not anything else.** The cost was put explicitly and accepted: on
+//! macOS a native crash leaves the marker and produces neither an `.ips` nor
+//! a minidump. That is a decision, not a gap and not a TODO. Two sites
+//! implement it — `MarkerCrashEvent`'s macOS `on_crash`, which `_exit`s
+//! instead of returning, so the system reporter never runs; and the
+//! `cfg(windows)` on `write_minidump_best_effort`.
+//!
+//! ## Why the callback cannot allocate
+//!
+//! `on_crash` runs on crash-handler's message-loop thread with every other
+//! thread Mach-suspended — `mac/state.rs`'s `ScopedSuspend`, constructed
+//! before `call_user_callback` on both the exception and the SIGABRT-relay
+//! branch. A thread suspended inside `malloc` never releases the allocator
+//! lock, so anything in the callback that allocates can block forever.
+//! `write_minidump_best_effort` allocates three times over: a `PathBuf` for
+//! the dump path, a `CString` inside `File::create`, and `MinidumpWriter`'s
+//! own buffers. The marker write allocates not at all — path pre-encoded at
+//! `attach`, stack scratch buffer, raw `open`/`write`/`close` — and runs
+//! first, which is why it is what survives.
+//!
+//! ## The deadlock is observed, not predicted
+//!
+//! MEASURED on darwin/arm64: with eight threads allocating 1 MiB blocks, an
+//! allocating `on_crash` hung 8 runs in 10, and `sample(1)` of a hung child
+//! shows the handler thread parked in `_xzm_malloc_large_huge` →
+//! `_os_unfair_lock_lock_slow` → `__ulock_wait2` while a suspended thread
+//! sits inside `_xzm_malloc_large_huge` holding that lock.
+//!
+//! Weigh that against its history before reverting anything here. Three
+//! earlier causal stories for this hang were written into these comments in
+//! turn — a second `on_crash` invocation from `abort()`'s re-raise, a corpse
+//! path through XNU's asynchronous exception delivery, and XNU permanently
+//! blocking the second exception's delivery — and measurement falsified all
+//! three. The allocator deadlock is the only explanation that was ever seen
+//! rather than argued.
+//!
+//! ## Both obvious alternatives were built and measured
+//!
+//! - **Detach inside the callback, then let the OS reporter run.** Hangs,
+//!   2/2. `call_user_callback` holds `HANDLER.read()` across `on_crash` and
+//!   `state::detach` takes `HANDLER.write()` on that same non-reentrant
+//!   `parking_lot::RwLock`; under it, `shutdown` would `handler_thread.join()`
+//!   the very thread `on_crash` runs on. `CrashHandler::detach()` hardcodes
+//!   `is_handler_thread: false`, so that join is not avoidable from here.
+//! - **Restore the task exception ports by hand** — `uninstall`'s effect
+//!   without its lock. Measured to earn nothing: with the ports restored the
+//!   abort class terminates exactly as it does without them (3/3), and a
+//!   fault raised inside `on_crash` hangs either way (2/2 with, 2/2 without).
+//!
+//! ## What would reopen this
+//!
+//! A minidump path that is signal-safe and allocation-free end to end:
+//! buffers reserved at `attach` time, the dump fd opened there too, and a
+//! writer that touches neither the allocator nor a lock. That removes the
+//! reason, and the decision should be revisited on it. Nothing short of it
+//! qualifies — the ruling is about hanging at all, so a change that only
+//! makes the deadlock rarer does not reopen anything.
+
 use std::path::Path;
 use std::sync::OnceLock;
 
@@ -311,24 +389,18 @@ fn unix_time() -> u64 {
 
 // === dev-only minidump (.dmp) — Windows only, NEVER linked in release ================================================
 
-// macOS has NO in-process minidump branch, and Linux never had one.
+// The `windows` in the cfg below is load-bearing, not an oversight. This
+// branch allocates, and on macOS `on_crash` runs with every other thread
+// Mach-suspended, where allocating deadlocked 8 runs in 10 under measurement.
+// Deleting the gate reinstates a hang that was directly observed, and macOS
+// producing no dump is a decision, not an omission — the module doc's "macOS:
+// marker only, by decision" carries the evidence, the alternatives already
+// tried, and the one thing that would reopen it. Linux never had an
+// in-process dump branch at all.
 //
-// On macOS `on_crash` runs on crash-handler's message-loop thread with every
-// other thread Mach-suspended (`mac/state.rs`'s `ScopedSuspend`), so any
-// allocation there can deadlock against a thread suspended mid-`malloc`.
-// MEASURED on darwin/arm64, not inferred: with eight threads allocating
-// 1 MiB blocks, an allocating `on_crash` hung 8/10 runs, and `sample(1)` of
-// a hung child shows the handler thread parked in
-// `_xzm_malloc_large_huge` → `_os_unfair_lock_lock_slow` → `__ulock_wait2`
-// while a suspended thread sits inside `_xzm_malloc_large_huge` holding
-// that lock. `minidump-writer` allocates (and `File::create` builds a
-// `CString`, and `dmp_path_from_marker` a `PathBuf`), so there is no
-// ordering that keeps it AND keeps the promise that tombstone never hangs
-// the process. See `MarkerCrashEvent`'s macOS impl.
-//
-// Windows is a different shape: `on_crash` runs on the faulting thread via
-// a vectored/unhandled exception filter with no threads suspended, so the
-// dump branch cannot deadlock the same way.
+// Windows is a different shape: `on_crash` runs on the faulting thread via a
+// vectored/unhandled exception filter with no threads suspended, so this
+// branch cannot deadlock that way.
 
 #[cfg(all(feature = "crash-dumps", windows))]
 fn write_minidump_best_effort(state: &HandlerState, ctx: &crash_handler::CrashContext) {
@@ -474,7 +546,7 @@ struct MarkerCrashEvent {
 // write is therefore allocation-free and lock-free on all three platforms —
 // a raw file open/write from a stack buffer plus the marker path pre-encoded
 // at attach time — with no `format!`, no locks, and no tracing. That is not
-// a nicety; see the macOS impl below for the measured deadlock it avoids.
+// a nicety; module doc has the measured deadlock it avoids.
 
 /// macOS: end the process here, without returning to `crash-handler`.
 ///
@@ -513,29 +585,16 @@ fn terminate_without_returning() -> ! {
 //    `MessageIds::Exception`); the relay's branch (`MessageIds::SignalCrash`)
 //    contains no `detach` at all, so `abort()`'s C-mandated re-raise fires
 //    with the task exception port still attached.
-//  * Allocation in this callback can deadlock outright. crash-handler
-//    Mach-suspends every other thread before calling in (`ScopedSuspend`),
-//    so a thread suspended inside `malloc` never releases the allocator
-//    lock. MEASURED on darwin/arm64: an allocating `on_crash` hung 8/10 runs
-//    under allocator contention, with `sample(1)` showing this thread parked
-//    in `_os_unfair_lock_lock_slow` and a suspended thread holding the lock.
+//  * Allocation in this callback can deadlock outright, against a thread
+//    Mach-suspended mid-`malloc`. Observed, not predicted — module doc.
 //  * The system crash reporter's involvement is not something this process
 //    can bound at all.
 //
-// Calling `detach` from here does not fix the first point — it is what the
-// hang looks like. MEASURED, 2/2: `crash_handler::CrashHandler::detach()`
-// invoked from inside `on_crash` never returns. `call_user_callback` holds
-// `HANDLER.read()` across this callback and `state::detach` takes
-// `HANDLER.write()` on that same non-reentrant `parking_lot::RwLock`; the
-// `handler_thread.join()` beneath it would deadlock a second time, since
-// `on_crash` runs ON the handler thread. Upstream's own `detach(true)` is
-// reachable only from its message loop, after this returns.
-//
-// Restoring the task exception ports by hand instead — `uninstall`'s effect
-// without its lock — was measured too, and does not earn its keep: with the
-// ports restored the abort class terminates exactly as it does without them
-// (SIGABRT, sub-second, 3/3), and a fault raised INSIDE `on_crash` hangs
-// either way (2/2 with, 2/2 without). It buys nothing `_exit` does not.
+// The two alternatives to `_exit` that suggest themselves — detach from
+// inside the callback and let the reporter run, or restore the task
+// exception ports by hand — were both built and measured. The first hangs
+// on crash-handler's own lock, the second changes nothing. Module doc has
+// the measurements; do not re-derive them here.
 //
 // MEASURED, 3 runs each of abort, segfault, stack_overflow, bus,
 // illegal_instruction and trap on darwin/arm64: every one exits 70 in under
@@ -550,11 +609,10 @@ fn terminate_without_returning() -> ! {
 // because a shipped `hole`, `hole bridge` and `galoshes` must not hang
 // either. `tests/crash_child.rs` pins each of those three separately.
 //
-// KNOWN COST, accepted deliberately: no `.ips` crash report and no
-// in-process minidump on macOS. The marker still carries kind, pid, tid,
-// exception code and fault address, which is what `sweep` reports; what is
-// lost is the stack. Reaching the reporter is exactly the unbounded step
-// this exists to remove.
+// The cost — no `.ips` and no minidump on macOS — is an owner decision, not
+// a limitation; module doc, "macOS: marker only, by decision". The marker
+// still carries kind, pid, tid, exception code and fault address, which is
+// what `sweep` reports; what is lost is the stack.
 #[cfg(target_os = "macos")]
 unsafe impl crash_handler::CrashEvent for MarkerCrashEvent {
     fn on_crash(&self, context: &crash_handler::CrashContext) -> crash_handler::CrashEventResult {

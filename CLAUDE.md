@@ -108,8 +108,9 @@ before editing; the sections linked below are the authoritative source.
   marker is durable, unconditionally, because crash-handler's relay never
   detaches, its callback runs with every other thread Mach-suspended (so
   allocating there can deadlock), and the crash reporter cannot be bounded.
-  A hung bridge still holds the TUN and routes; a lost `.ips` costs only
-  evidence. →
+  So a macOS crash yields the marker and **neither an `.ips` nor a minidump**
+  — an accepted cost, not a gap; `crates/tombstone/src/crash.rs`'s module doc
+  is the canonical record and the thing to read before restoring either. →
   [CONTRIBUTING.md#native-crash-observability-tombstone](CONTRIBUTING.md#native-crash-observability-tombstone)
 - **Route ownership.** Teardown and recovery delete only the `RouteId`s
   `bridge-routes.json` records as installed. On macOS no delete-side qualifier
