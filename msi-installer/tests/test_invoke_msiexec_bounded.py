@@ -212,6 +212,45 @@ def test_wedge_captures_symbolised_native_stacks_of_the_wedged_process(tmp_path:
     assert "Child-SP" in combined, f"stacks were written to file but never echoed to the job log:\n{combined}"
 
 
+def test_a_hung_debugger_is_killed_partial_output_survives_and_the_wedge_still_throws(tmp_path: Path) -> None:
+    """The capture must not become a second way to hang the step.
+
+    The stand-in writes one line and then never exits, so all three
+    consequences are observable at once: the budget kills it, what it managed
+    to write is still echoed, and the original bounded failure is what fails
+    the step.
+    """
+    log_path = tmp_path / "wedge.log"
+    # A batch stand-in ignores the cdb argv it is handed, and its spin loop
+    # keeps the hang inside the one process the script knows to kill -- a
+    # sleep helper would leave an orphan behind after Stop-Process.
+    standin = tmp_path / "hung-cdb.cmd"
+    standin.write_text("@echo off\necho STANDIN-PARTIAL-OUTPUT\n:loop\ngoto loop\n")
+
+    start = time.monotonic()
+    result = _run_script(
+        params={
+            "Verb": "/x",
+            "MsiPath": "unused.msi",
+            "LogPath": str(log_path),
+            "BoundMinutes": "0.02",
+            "ExePath": sys.executable,
+            "StackCaptureSeconds": "3",
+            "CdbPath": str(standin),
+        },
+        exe_args=_python_exe_args("import time; time.sleep(3600)"),
+    )
+    elapsed = time.monotonic() - start
+    combined = result.stdout + result.stderr
+
+    assert elapsed < 60, f"a hung debugger was not bounded (took {elapsed:.1f}s):\n{combined}"
+    assert result.returncode != 0
+    assert "did not finish" in combined, f"the hung debugger was not reported:\n{combined}"
+    assert "STANDIN-PARTIAL-OUTPUT" in combined, f"partial capture output was discarded:\n{combined}"
+    assert "wedged" in combined, f"the hung debugger swallowed the wedge throw:\n{combined}"
+    assert "killed process id(s)" in combined, f"the tree kill was skipped after a hung debugger:\n{combined}"
+
+
 def test_stack_capture_budget_exhaustion_is_reported_and_does_not_swallow_the_wedge(tmp_path: Path) -> None:
     """A zero budget must skip the capture loudly and still reach the throw --
     the capture is additive instrumentation, never a new way to lose the

@@ -62,7 +62,13 @@ param(
     [switch]$FailOnNonZeroExit,
 
     [string]$ExePath = "msiexec",
-    [string[]]$ExeArgs
+    [string[]]$ExeArgs,
+
+    # Second test seam, same shape as -ExePath: substitutes the debugger the
+    # capture shells out to, so a stand-in that never exits drives the
+    # capture's own bound. Empty means "find the real cdb" -- every ci.yaml
+    # call site leaves it that way.
+    [string]$CdbPath
 )
 
 if (-not $ExeArgs) {
@@ -287,7 +293,7 @@ if (-not $proc.WaitForExit([int]($BoundMinutes * 60000))) {
             }
         }
 
-        $cdbPath = Get-CdbPath
+        $cdbPath = if ($CdbPath) { $CdbPath } else { Get-CdbPath }
         if (-not $stackTargets) {
             Write-Host "(no live process to capture)"
         } elseif (-not $cdbPath) {
