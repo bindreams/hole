@@ -46,15 +46,16 @@ param(
     # survive. Spent in evidentiary order (bridge first), so an exhausted
     # budget costs the least-informative capture, not the decisive one.
     #
-    # Sized against the same 60min job budget the bound above is sized
-    # against: a wedge in both Install and Uninstall spends this twice, so
-    # 2min each eats 4 of the ~11min that analysis leaves spare. Measured
-    # cost is well below the cap -- 33s for one process against a cold
-    # symbol cache, 0.3s against a warm one (Windows 11 26100, SDK
-    # 10.0.26100 cdb), and the two steps share one cache under
-    # RUNNER_TEMP -- so the cap is a failure bound, not an expected
-    # duration.
-    [double]$StackCaptureSeconds = 120,
+    # Sized against what is actually spare in the 60min job budget, which is
+    # NOT the ~11min above: 6 of those minutes are already committed to the
+    # two 3-minute bounds when both steps wedge, leaving ~5min. A wedge in
+    # both steps spends this budget twice, so 1min each takes 2 of that 5 and
+    # still leaves the artifact upload -- the whole reason the bound exists --
+    # its margin. Measured cost is well under the cap: 33s for one process
+    # against a cold symbol cache and 0.3s against a warm one (Windows 11
+    # 26100, SDK 10.0.26100 cdb), with the two steps sharing one cache under
+    # RUNNER_TEMP. The cap is a failure bound, not an expected duration.
+    [double]$StackCaptureSeconds = 60,
 
     # Install failure is fatal; Uninstall is best-effort cleanup -- callers set
     # this switch to match their own error-handling policy. A wedge is fatal
@@ -96,7 +97,11 @@ function Get-DescendantProcessIds([int]$RootId, $AllProcs) {
 # up as a command. Returns $null when absent, which downgrades the capture to
 # thread states (see the caller) rather than failing the step.
 function Get-CdbPath {
-    $arch = switch ($env:PROCESSOR_ARCHITECTURE) {
+    # PROCESSOR_ARCHITECTURE reports the architecture of THIS process, so a
+    # 32-bit pwsh on an x64 host reports `x86` and would pick a cdb that
+    # cannot read x64 stacks. PROCESSOR_ARCHITEW6432 is set only in that
+    # case, and holds the machine's real architecture.
+    $arch = switch (($env:PROCESSOR_ARCHITEW6432, $env:PROCESSOR_ARCHITECTURE | Where-Object { $_ } | Select-Object -First 1)) {
         'ARM64' { 'arm64' }
         'x86' { 'x86' }
         default { 'x64' }
@@ -111,26 +116,43 @@ function Get-CdbPath {
     return (Get-Command cdb -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty Source)
 }
 
+# Milliseconds left of a shared budget, floored at zero.
+function Get-RemainingMs([datetime]$Deadline) {
+    return [int][Math]::Max(0, [Math]::Floor(($Deadline - (Get-Date)).TotalMilliseconds))
+}
+
+# The same budget as whole seconds for `-OperationTimeoutSec`, which reads 0
+# as "use the client default" (i.e. unbounded here) and so is floored at 1.
+function Get-CimTimeoutSec([datetime]$Deadline) {
+    return [uint32][Math]::Max(1, [Math]::Ceiling((Get-RemainingMs $Deadline) / 1000))
+}
+
 # Dumps every thread's call stack of $TargetId to $OutFile, then echoes it.
+# Returns $true when the capture was cut short and left $TargetId suspended
+# (see below), $false otherwise.
 #
 # The attach is NON-INVASIVE (`-pv`) on purpose. An invasive attach makes the
 # target run an injected break-in thread, which is precisely what a process
 # wedged under the loader lock will never do -- the instrument would go blind
 # in the case it exists to diagnose. A non-invasive attach asks the target for
-# nothing: it suspends the threads and reads their memory. The cost is that
-# killing cdb at the budget below leaves those threads suspended; that is
-# acceptable here, in a step that is already failing and whose process tree is
-# killed immediately afterwards.
+# nothing: it suspends the threads and reads their memory.
+#
+# The cost is that those threads stay suspended if cdb is killed rather than
+# reaching `qd`: measured on Windows 11 26100, a victim frozen this way makes
+# no further progress ever. A suspended HoleBridge can no more answer
+# SERVICE_CONTROL_STOP than a wedged one, so the caller terminates any target
+# this reports as cut short rather than leaving the instrument to manufacture
+# the hang it exists to diagnose.
 #
 # Everything this writes goes to the host stream (`Write-Host`/`Out-Host`),
-# never the output stream, so the caller can invoke it bare without the
-# capture's own text becoming its return value.
+# never the output stream, so only the boolean above reaches the caller.
 function Invoke-StackCapture {
     param(
-        [Parameter(Mandatory)][string]$CdbPath,
+        [Parameter(Mandatory)][string]$DebuggerPath,
         [Parameter(Mandatory)][int]$TargetId,
         [Parameter(Mandatory)][string]$Label,
         [Parameter(Mandatory)][string]$OutFile,
+        [Parameter(Mandatory)][string]$EmptyStdinPath,
         [Parameter(Mandatory)][int]$BudgetMs
     )
 
@@ -143,10 +165,16 @@ function Invoke-StackCapture {
 
     $started = $null
     try {
-        $started = Start-Process -FilePath $CdbPath -ArgumentList $cdbArgs -NoNewWindow -PassThru -RedirectStandardOutput $OutFile
+        # stdin comes from an empty file so that a cdb which falls through to
+        # its interactive prompt -- an attach that fails, a `-c` that errors --
+        # reads EOF and exits instead of sitting there until the budget kills
+        # it, which would cost every later target its capture. Verified not to
+        # truncate the `-c` commands: they run to completion first.
+        $started = Start-Process -FilePath $DebuggerPath -ArgumentList $cdbArgs -NoNewWindow -PassThru `
+            -RedirectStandardOutput $OutFile -RedirectStandardInput $EmptyStdinPath
     } catch {
         Write-Host "::warning::failed to start cdb against $Label (pid ${TargetId}): $($_.Exception.Message)"
-        return
+        return $false
     }
 
     # cdb is an external process that may never return -- a symbol-server
@@ -154,8 +182,10 @@ function Invoke-StackCapture {
     # mid-suspend. This bound is the failure report for that, surfaced below
     # as a warning naming the target that produced no stack; it synchronises
     # nothing.
+    $cutShort = $false
     if (-not $started.WaitForExit($BudgetMs)) {
-        Write-Host "::warning::cdb did not finish within its remaining $([int]($BudgetMs / 1000))s budget for $Label (pid ${TargetId}) -- killing it. Whatever it wrote first is below, and pid $TargetId may be left suspended."
+        $cutShort = $true
+        Write-Host "::warning::cdb did not finish within its remaining $([int]($BudgetMs / 1000))s budget for $Label (pid ${TargetId}) -- killing it. Whatever it wrote first is below."
         try {
             Stop-Process -Id $started.Id -Force -ErrorAction Stop
             Wait-Process -Id $started.Id -ErrorAction SilentlyContinue
@@ -171,6 +201,8 @@ function Invoke-StackCapture {
         Write-Host "(failed to read ${OutFile}: $($_.Exception.Message))"
     }
     Write-Host "::endgroup::"
+
+    return $cutShort
 }
 
 # `Start-Process -ArgumentList` joins array elements with a single space and
@@ -266,13 +298,20 @@ if (-not $proc.WaitForExit([int]($BoundMinutes * 60000))) {
     # first (it is the process that never stopped), then any other hole.exe,
     # then the msiexec tree, whose stack only confirms what it is waiting on.
     Write-Host "--- native thread stacks ---"
+    # One deadline for the whole section, not just the cdb branch: every CIM
+    # query below is bounded by it too. WMI is exactly the kind of thing that
+    # stops answering on a host sick enough to have wedged msiexec, and an
+    # unbounded probe sitting between the wedge and the `throw` would be a
+    # second hang of the same shape this script exists to prevent.
+    $captureDeadline = (Get-Date).AddSeconds($StackCaptureSeconds)
+    $suspendedTargetIds = @()
     try {
         $stackTargets = @()
         $seenStackIds = @{}
         # The Get-Service probe above reports state, not pid; the service's
         # hosting process is only reachable through CIM.
         try {
-            $svcCim = Get-CimInstance Win32_Service -Filter "Name = 'HoleBridge'" -ErrorAction Stop
+            $svcCim = Get-CimInstance Win32_Service -Filter "Name = 'HoleBridge'" -OperationTimeoutSec (Get-CimTimeoutSec $captureDeadline) -ErrorAction Stop
             if ($svcCim -and $svcCim.ProcessId -gt 0) {
                 $stackTargets += @{ Id = [int]$svcCim.ProcessId; Label = 'HoleBridge' }
                 $seenStackIds[[int]$svcCim.ProcessId] = $true
@@ -293,10 +332,13 @@ if (-not $proc.WaitForExit([int]($BoundMinutes * 60000))) {
             }
         }
 
-        $cdbPath = if ($CdbPath) { $CdbPath } else { Get-CdbPath }
+        # A distinct name from the `$CdbPath` parameter: PowerShell variables
+        # are case-insensitive, so `$cdbPath = ...` would assign the seam
+        # itself and leave the two indistinguishable from here on.
+        $resolvedCdbPath = if ($CdbPath) { $CdbPath } else { Get-CdbPath }
         if (-not $stackTargets) {
             Write-Host "(no live process to capture)"
-        } elseif (-not $cdbPath) {
+        } elseif (-not $resolvedCdbPath) {
             # Deliberately not an attempt to install the SDK feature on the
             # spot: that is a multi-minute download inside a diagnostic that
             # must stay bounded. Thread states are what is left, and they are
@@ -304,9 +346,17 @@ if (-not $proc.WaitForExit([int]($BoundMinutes * 60000))) {
             # but not on what -- so the remedy is spelled out instead.
             Write-Host "::warning::cdb.exe not found in the Windows SDK Debugging Tools paths or on PATH -- falling back to thread states, which name NO call site. Restore stacks by installing the SDK's OptionId.WindowsDesktopDebuggers feature in this job."
             foreach ($target in $stackTargets) {
+                if ((Get-RemainingMs $captureDeadline) -le 0) {
+                    Write-Host "::warning::stack-capture budget of ${StackCaptureSeconds}s is spent -- no thread states for $($target.Label) (pid $($target.Id))"
+                    continue
+                }
                 Write-Host "::group::thread states, NOT stacks -- $($target.Label) (pid $($target.Id))"
                 try {
-                    Get-CimInstance Win32_Thread -Filter "ProcessHandle = '$($target.Id)'" -ErrorAction Stop |
+                    # Win32_Thread has the provider enumerate every thread on
+                    # the box before the filter applies, so this is the most
+                    # expensive query in the script and the one most worth
+                    # bounding.
+                    Get-CimInstance Win32_Thread -Filter "ProcessHandle = '$($target.Id)'" -OperationTimeoutSec (Get-CimTimeoutSec $captureDeadline) -ErrorAction Stop |
                         Select-Object Handle, ThreadState, ThreadWaitReason, PriorityBase |
                         Format-Table -AutoSize | Out-String -Width 4096 | Out-Host
                 } catch {
@@ -339,25 +389,50 @@ if (-not $proc.WaitForExit([int]($BoundMinutes * 60000))) {
                     # path; the symbol server still covers its OS modules.
                 }
             }
+            # Downloaded PDBs land here rather than in a user profile, so both
+            # the Install and Uninstall steps share one warm cache and the
+            # whole thing dies with the runner.
             $symCache = Join-Path $stackDir "symcache"
             New-Item -ItemType Directory -Force -Path $symCache | Out-Null
+            $emptyStdin = Join-Path $stackDir "cdb-stdin-eof.txt"
+            Set-Content -Path $emptyStdin -Value '' -NoNewline
             $env:_NT_SYMBOL_PATH = (@($symbolDirs) + @("srv*$symCache*https://msdl.microsoft.com/download/symbols")) -join ';'
-            Write-Host "cdb: $cdbPath"
+            Write-Host "cdb: $resolvedCdbPath"
             Write-Host "_NT_SYMBOL_PATH: $env:_NT_SYMBOL_PATH"
 
-            $captureDeadline = (Get-Date).AddSeconds($StackCaptureSeconds)
             foreach ($target in $stackTargets) {
-                $remainingMs = [int][Math]::Floor(($captureDeadline - (Get-Date)).TotalMilliseconds)
+                $remainingMs = Get-RemainingMs $captureDeadline
                 if ($remainingMs -le 0) {
                     Write-Host "::warning::stack-capture budget of ${StackCaptureSeconds}s is spent -- no stack captured for $($target.Label) (pid $($target.Id))"
                     continue
                 }
                 $outFile = Join-Path $stackDir "$stackBase-stack-$($target.Label)-$($target.Id).txt"
-                Invoke-StackCapture -CdbPath $cdbPath -TargetId $target.Id -Label $target.Label -OutFile $outFile -BudgetMs $remainingMs
+                $cutShort = Invoke-StackCapture -DebuggerPath $resolvedCdbPath -TargetId $target.Id -Label $target.Label `
+                    -OutFile $outFile -EmptyStdinPath $emptyStdin -BudgetMs $remainingMs
+                if ($cutShort) { $suspendedTargetIds += $target.Id }
             }
         }
     } catch {
         Write-Host "::warning::native stack capture failed: $($_.Exception.Message)"
+    }
+
+    # A killed cdb never released the threads its non-invasive attach
+    # suspended, and nothing else in this job will: the tree kill below covers
+    # the msiexec tree only, so a suspended HoleBridge would survive this step
+    # unable to answer the very SERVICE_CONTROL_STOP whose absence is under
+    # investigation. Terminating it is the honest end state for a process the
+    # instrument froze.
+    if ($suspendedTargetIds) {
+        Write-Host "--- terminating targets left suspended by a cut-short capture ---"
+        foreach ($suspendedId in $suspendedTargetIds) {
+            try {
+                Stop-Process -Id $suspendedId -Force -ErrorAction Stop
+                Wait-Process -Id $suspendedId -ErrorAction SilentlyContinue
+                Write-Host "terminated suspended pid $suspendedId"
+            } catch {
+                Write-Host "::warning::failed to terminate suspended pid ${suspendedId}: $($_.Exception.Message)"
+            }
+        }
     }
 
     # Kill the tree so a wedged msiexec doesn't outlive this step: on Install
@@ -365,9 +440,14 @@ if (-not $proc.WaitForExit([int]($BoundMinutes * 60000))) {
     # runs next (`if: always()`), and on Uninstall it would keep appending to
     # the log while "Upload MSI logs" reads it. Best-effort and isolated like
     # the probes above -- a failure here must not swallow the wedge `throw`.
+    # Deferred by up to $StackCaptureSeconds so the stack capture above sees a
+    # live tree; the msiexec log keeps growing for that long, which the tail
+    # printed earlier is already past.
     Write-Host "--- killing wedged process tree ---"
     try {
-        $targetIds = $wedgedTreeIds
+        # A tree member already terminated for being left suspended would
+        # otherwise be reported here as a kill failure.
+        $targetIds = @($wedgedTreeIds | Where-Object { $_ -notin $suspendedTargetIds })
         $killed = @()
         $failed = @()
         foreach ($targetId in $targetIds) {

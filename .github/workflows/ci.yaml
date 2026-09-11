@@ -958,7 +958,7 @@ jobs:
           path: |
             ${{ runner.temp }}/msi-install.log
             ${{ runner.temp }}/msi-uninstall.log
-            ${{ runner.temp }}/msi-*-stack-*.txt
+            ${{ runner.temp }}/*-stack-*.txt
           if-no-files-found: ignore
           retention-days: 14
 

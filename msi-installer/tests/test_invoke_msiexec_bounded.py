@@ -26,6 +26,11 @@ pytestmark = pytest.mark.skipif(
 
 SCRIPT_PATH = REPO_ROOT / ".github" / "scripts" / "invoke-msiexec-bounded.ps1"
 
+# The `throw` text itself. Asserting the bare word "wedged" proves nothing:
+# it also appears in the "killing wedged process tree" header and in the
+# `wedged` stack-capture label, both of which print before the throw.
+WEDGE_THROW = "wedged: did not exit within"
+
 DIAGNOSTIC_HEADERS = [
     "--- MSI log tail:",
     "--- HoleBridge service state ---",
@@ -96,8 +101,12 @@ def test_wedge_throws_within_bound_and_emits_all_diagnostics(tmp_path: Path) -> 
             "ExePath": sys.executable,
             # Zero budget: this test is about the other diagnostics and the
             # kill, and a real cdb attach would dominate its runtime. The
-            # capture itself is covered below.
+            # capture itself is covered below. The debugger is named but never
+            # launched -- with no budget left the loop skips before starting
+            # it -- which keeps this off the cdb-absent fallback path, whose
+            # failure would otherwise be reported here as the wrong thing.
             "StackCaptureSeconds": "0",
+            "CdbPath": str(tmp_path / "never-launched-cdb.exe"),
         },
         exe_args=_python_exe_args("import time; time.sleep(3600)"),
     )
@@ -108,7 +117,7 @@ def test_wedge_throws_within_bound_and_emits_all_diagnostics(tmp_path: Path) -> 
     assert result.returncode != 0, f"expected a nonzero exit on wedge, got 0:\n{combined}"
     for header in DIAGNOSTIC_HEADERS:
         assert header in combined, f"missing diagnostic header {header!r} in output:\n{combined}"
-    assert "wedged" in combined
+    assert WEDGE_THROW in combined
 
     # Cluster 2: the stand-in process must actually be killed, not left running.
     match = re.search(r"killed process id\(s\): (\d+)", combined)
@@ -154,6 +163,7 @@ def test_wedge_still_emits_diagnostics_and_throws_when_log_read_fails(tmp_path: 
                 "BoundMinutes": "0.02",
                 "ExePath": sys.executable,
                 "StackCaptureSeconds": "0",
+                "CdbPath": str(tmp_path / "never-launched-cdb.exe"),
             },
             exe_args=_python_exe_args("import time; time.sleep(3600)"),
         )
@@ -164,7 +174,7 @@ def test_wedge_still_emits_diagnostics_and_throws_when_log_read_fails(tmp_path: 
         ), f"expected the log-read failure to be reported, not swallowed:\n{combined}"
         for header in DIAGNOSTIC_HEADERS:
             assert header in combined, f"missing diagnostic header {header!r} after a probe failure:\n{combined}"
-        assert "wedged" in combined, f"wedge throw did not surface after a probe failure:\n{combined}"
+        assert WEDGE_THROW in combined, f"wedge throw did not surface after a probe failure:\n{combined}"
     finally:
         holder.terminate()
         holder.wait(timeout=10)
@@ -173,6 +183,7 @@ def test_wedge_still_emits_diagnostics_and_throws_when_log_read_fails(tmp_path: 
 # Native stack capture -------------------------------------------------------------------------------------------------
 
 
+@pytest.mark.cdb
 def test_wedge_captures_symbolised_native_stacks_of_the_wedged_process(tmp_path: Path) -> None:
     """The datum #790 asks for: where the wedged process is actually blocked.
 
@@ -181,6 +192,11 @@ def test_wedge_captures_symbolised_native_stacks_of_the_wedged_process(tmp_path:
     is cdb's own `lm` verdict, not a `module!name` frame: dbghelp names
     *exported* functions with no PDB at all, so `ntdll!NtWaitForSingleObject`
     alone would still pass with symbol resolution completely broken.
+
+    The only test here that needs the real toolchain: cdb from the SDK's
+    Debugging Tools (present on `windows-latest`) and msdl.microsoft.com for
+    the OS PDBs. It fails rather than skips when either is missing, because a
+    capture that silently stops symbolising is the failure worth catching.
     """
     log_path = tmp_path / "wedge.log"
 
@@ -199,11 +215,14 @@ def test_wedge_captures_symbolised_native_stacks_of_the_wedged_process(tmp_path:
     combined = result.stdout + result.stderr
 
     assert result.returncode != 0, f"expected a nonzero exit on wedge:\n{combined}"
-    assert "wedged" in combined, f"the capture swallowed the wedge throw:\n{combined}"
+    assert WEDGE_THROW in combined, f"the capture swallowed the wedge throw:\n{combined}"
 
-    captures = sorted(tmp_path.glob("wedge-stack-*.txt"))
-    assert captures, f"no stack capture file written next to the MSI log:\n{combined}"
-    text = "\n".join(p.read_text(errors="replace") for p in captures)
+    # Only the stand-in's own capture, by label: a runner that happens to have
+    # a live HoleBridge or hole.exe contributes extra files, and concatenating
+    # them would let a good capture mask an empty one.
+    captures = sorted(tmp_path.glob("wedge-stack-wedged-*.txt"))
+    assert len(captures) == 1, f"expected exactly one capture of the wedged stand-in, got {captures}:\n{combined}"
+    text = captures[0].read_text(errors="replace")
 
     assert "Child-SP" in text, f"cdb produced no stack listing:\n{text}"
     assert "ntdll!" in text, f"frames carry no module-qualified names:\n{text}"
@@ -247,7 +266,7 @@ def test_a_hung_debugger_is_killed_partial_output_survives_and_the_wedge_still_t
     assert result.returncode != 0
     assert "did not finish" in combined, f"the hung debugger was not reported:\n{combined}"
     assert "STANDIN-PARTIAL-OUTPUT" in combined, f"partial capture output was discarded:\n{combined}"
-    assert "wedged" in combined, f"the hung debugger swallowed the wedge throw:\n{combined}"
+    assert WEDGE_THROW in combined, f"the hung debugger swallowed the wedge throw:\n{combined}"
     assert "killed process id(s)" in combined, f"the tree kill was skipped after a hung debugger:\n{combined}"
 
 
@@ -265,6 +284,7 @@ def test_stack_capture_budget_exhaustion_is_reported_and_does_not_swallow_the_we
             "BoundMinutes": "0.02",
             "ExePath": sys.executable,
             "StackCaptureSeconds": "0",
+            "CdbPath": str(tmp_path / "never-launched-cdb.exe"),
         },
         exe_args=_python_exe_args("import time; time.sleep(3600)"),
     )
@@ -273,7 +293,7 @@ def test_stack_capture_budget_exhaustion_is_reported_and_does_not_swallow_the_we
     assert result.returncode != 0
     assert "--- native thread stacks ---" in combined, f"the section vanished when skipped:\n{combined}"
     assert "budget" in combined.lower(), f"budget exhaustion was not reported:\n{combined}"
-    assert "wedged" in combined, f"wedge throw did not survive a skipped capture:\n{combined}"
+    assert WEDGE_THROW in combined, f"wedge throw did not survive a skipped capture:\n{combined}"
 
 
 # Non-wedge paths ======================================================================================================
