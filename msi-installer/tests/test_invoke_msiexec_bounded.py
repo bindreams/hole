@@ -8,6 +8,7 @@ transaction. Windows-only: the script uses Get-Service/Get-CimInstance,
 which pwsh only implements on Windows.
 """
 
+import os
 import platform
 import re
 import subprocess
@@ -25,6 +26,7 @@ pytestmark = pytest.mark.skipif(
 )
 
 SCRIPT_PATH = REPO_ROOT / ".github" / "scripts" / "invoke-msiexec-bounded.ps1"
+HELPERS_PATH = REPO_ROOT / ".github" / "scripts" / "wedge-diagnostics.ps1"
 
 # The `throw` text itself. Asserting the bare word "wedged" proves nothing:
 # it also appears in the "killing wedged process tree" header and in the
@@ -45,10 +47,13 @@ def _ps_quote(value: str) -> str:
     return "'" + value.replace("'", "''") + "'"
 
 
-def _run_script(*,
-                params: dict[str, str | None],
-                exe_args: list[str] | None = None,
-                timeout: float = 60) -> subprocess.CompletedProcess[str]:
+def _run_script(
+    *,
+    params: dict[str, str | None],
+    exe_args: list[str] | None = None,
+    timeout: float = 60,
+    env: dict[str, str] | None = None
+) -> subprocess.CompletedProcess[str]:
     """Invoke the script via `& <path> -K V ...`, built as a -Command string.
 
     A -Command call with an explicit `@(...)` array literal is used instead of
@@ -74,6 +79,7 @@ def _run_script(*,
         capture_output=True,
         text=True,
         timeout=timeout,
+        env=env,
     )
 
 
@@ -85,7 +91,9 @@ def _kill_processes_matching(command_line_fragment: str) -> None:
     """Best-effort cleanup of stand-ins a failing script may have orphaned.
 
     Matched on command line rather than name so it can only ever hit processes
-    launched from this test's own tmp_path.
+    launched from this test's own tmp_path -- and `$PID` is excluded because
+    this very command line contains the fragment it matches on, so without it
+    the cleanup can kill itself before reaching the orphan.
     """
     quoted = command_line_fragment.replace("'", "''")
     subprocess.run(
@@ -94,10 +102,8 @@ def _kill_processes_matching(command_line_fragment: str) -> None:
             "-NoProfile",
             "-Command",
             "Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | "
-            f"Where-Object {{ $_.CommandLine -and $_.CommandLine.Contains('{quoted}') }} | "
-            "ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }}".replace(
-                "{{", "{"
-            ).replace("}}", "}"),
+            f"Where-Object {{ $_.ProcessId -ne $PID -and $_.CommandLine -and $_.CommandLine.Contains('{quoted}') }} | "
+            "ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }",
         ],
         capture_output=True,
         timeout=60,
@@ -226,7 +232,7 @@ def test_wedge_still_emits_diagnostics_and_throws_when_log_read_fails(tmp_path: 
 
 @pytest.mark.cdb
 def test_wedge_captures_symbolised_native_stacks_of_the_wedged_process(tmp_path: Path) -> None:
-    """The datum #790 asks for: where the wedged process is actually blocked.
+    """What this asks for: where the wedged process is actually blocked.
 
     A thread-state table names no call, and neither does a stack of
     `hole+0x3f21a` frames, so this asserts real symbol resolution. The proof
@@ -485,3 +491,70 @@ def test_nonzero_exit_with_failonnonzeroexit_throws(tmp_path: Path) -> None:
     combined = result.stdout + result.stderr
     assert result.returncode != 0, f"expected -FailOnNonZeroExit to fail the step:\n{combined}"
     assert "failed with exit code 3" in combined
+
+
+# Helper library =======================================================================================================
+
+
+def test_process_tree_walk_collects_every_descendant_and_terminates_on_a_cycle() -> None:
+    """`Get-DescendantProcessIds` is what stops a wedged msiexec's elevated
+    child -- and the `_MSIExecute` mutex it holds -- outliving the step, but no
+    wedge test ever gives it a tree: the stand-in is a lone python.exe that the
+    `Name = 'msiexec.exe'` probe never matches. Driven directly instead, with a
+    parent/child cycle to prove the walk cannot loop.
+
+    Dot-sourcing also asserts the helper file has no top-level side effects.
+    """
+    procs = ", ".join(
+        f"[pscustomobject]@{{ProcessId={pid};ParentProcessId={ppid}}}"
+        for pid, ppid in [(100, 1), (200, 100), (300, 200), (400, 999), (100, 200)]
+    )
+    command = (
+        f". {_ps_quote(str(HELPERS_PATH))}; "
+        f"$procs = @({procs}); "
+        "(Get-DescendantProcessIds -RootId 100 -AllProcs $procs) -join ','"
+    )
+    result = subprocess.run(["pwsh", "-NoProfile", "-Command", command], capture_output=True, text=True, timeout=60)
+
+    assert result.returncode == 0, f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+    assert result.stdout.strip() == "100,200,300", \
+        f"tree walk returned {result.stdout.strip()!r}, expected the root and its two descendants"
+
+
+def test_wedge_falls_back_to_thread_states_when_no_debugger_is_installed(tmp_path: Path) -> None:
+    """A runner image without the SDK's Debugging Tools must still say something
+    useful, and say plainly that it is not stacks.
+
+    `Get-CdbPath` probes under the two ProgramFiles roots and then PATH, so
+    pointing all three at an empty directory is what makes the search genuinely
+    fail -- the script is not told, it looks and finds nothing.
+    """
+    log_path = tmp_path / "wedge.log"
+    empty_root = tmp_path / "no-sdk-here"
+    empty_root.mkdir()
+    env = dict(os.environ)
+    env["ProgramFiles"] = str(empty_root)
+    env["ProgramFiles(x86)"] = str(empty_root)
+    env["PATH"] = str(empty_root)
+
+    result = _run_script(
+        params={
+            "Verb": "/x",
+            "MsiPath": "unused.msi",
+            "LogPath": str(log_path),
+            "BoundMinutes": "0.02",
+            "ExePath": sys.executable,
+            "StackCaptureSeconds": "30",
+        },
+        exe_args=_python_exe_args("import time; time.sleep(3600)"),
+        env=env,
+    )
+    combined = result.stdout + result.stderr
+
+    assert result.returncode != 0
+    assert "falling back to thread states" in combined, \
+        f"a missing debugger was not reported as such:\n{combined}"
+    assert "OptionId.WindowsDesktopDebuggers" in combined, \
+        f"the remedy for a missing debugger was not named:\n{combined}"
+    assert "thread states, NOT stacks" in combined, f"no thread-state table was emitted:\n{combined}"
+    assert WEDGE_THROW in combined, f"the fallback swallowed the wedge throw:\n{combined}"
