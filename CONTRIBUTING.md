@@ -825,7 +825,11 @@ leaves working DNS + broken routes, not the inverse):
   killing that process is the escape.
 - **ETW sessions** (Windows) — `hole-bridge-etw-<pid>`;
   `diagnostics::etw::sweep_stale_sessions` (`QueryAllTracesW`) stops stale ones by
-  name prefix.
+  name prefix. The bridge's own session is stopped in `EtwGuard::drop`, which
+  re-issues STOP by name as a backstop when `UserTrace::stop` did not report
+  success; if even that fails, `Drop` abandons the processing thread rather
+  than risk an unbounded join (mechanism: `etw.rs` module doc, "Drain on
+  Drop"; `Drop` is otherwise unbounded, bindreams/hole#1016).
 
 Default `<state_dir>` is `dirs::state_dir()/hole/state` — Windows
 `%LOCALAPPDATA%\hole\state\`, macOS `~/Library/Application Support/hole/state/`;

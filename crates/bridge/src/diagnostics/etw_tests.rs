@@ -735,3 +735,128 @@ fn provider_name_unknown_returns_guid_string() {
     );
     assert_ne!(got, "unknown", "must preserve GUID, not return literal \"unknown\"");
 }
+
+// Session stop ========================================================================================================
+
+/// `is_session_not_found` must recognise `ERROR_WMI_INSTANCE_NOT_FOUND` in the
+/// form ferrisetw actually delivers it: `io::Error::from_raw_os_error` of the
+/// *`HRESULT`*, not of the Win32 code. The literals are spelled out rather
+/// than built with `to_hresult()` so this pins the encoding instead of
+/// restating the implementation — `0x8007_1069` is `FACILITY_WIN32` (`0x7`)
+/// plus `ERROR_WMI_INSTANCE_NOT_FOUND` (`4201` = `0x1069`).
+///
+/// A regression here is silent: the by-name stop's expected outcome starts
+/// logging at `warn!` as if the session had been left behind.
+#[skuld::test]
+fn session_not_found_is_recognised_in_its_hresult_form() {
+    let not_found = TraceError::EtwNativeError(EvntraceNativeError::IoError(std::io::Error::from_raw_os_error(
+        0x8007_1069_u32 as i32,
+    )));
+    assert!(is_session_not_found(&not_found));
+}
+
+/// Everything that is not "no such session" must stay a real failure — a
+/// blanket `true` would hide a session we genuinely could not reclaim.
+/// `0x8007_0005` is `ERROR_ACCESS_DENIED`, the plausible other answer to a
+/// STOP the bridge is not privileged for.
+#[skuld::test]
+fn other_stop_failures_are_not_read_as_already_stopped() {
+    let denied = TraceError::EtwNativeError(EvntraceNativeError::IoError(std::io::Error::from_raw_os_error(
+        0x8007_0005_u32 as i32,
+    )));
+    assert!(!is_session_not_found(&denied));
+    // The bare Win32 code, unconverted: the mistake this pair exists to catch.
+    let unconverted = TraceError::EtwNativeError(EvntraceNativeError::IoError(std::io::Error::from_raw_os_error(4201)));
+    assert!(!is_session_not_found(&unconverted));
+    assert!(!is_session_not_found(&TraceError::InvalidTraceName));
+}
+
+// Drop's abandon path =================================================================================================
+
+/// `EtwGuard::drop` must return WITHOUT joining the processing thread when
+/// the session was not reclaimed, and it must say so at `warn!` — the one
+/// consequence `Drop`'s `if session_reclaimed { join } else { abandon }`
+/// split exists for. No real ETW session or admin privilege is needed to
+/// reach the `false` arm deterministically: this test builds the `EtwGuard`
+/// with `trace: None` directly, so `stop_session`'s `self.trace.take()`
+/// takes its `None => false` arm without ever calling `trace.stop()`, and
+/// falls through to `stop_session_by_name`. `session_name` carries an
+/// interior NUL, so `ferrisetw::trace::stop_trace_by_name`'s
+/// `U16CString::from_str` fails before any Win32 call is made, returning
+/// `TraceError::InvalidTraceName` — which `is_session_not_found` reads as
+/// `false` (pinned by `other_stop_failures_are_not_read_as_already_stopped`
+/// above), so `stop_session` reports the session as not reclaimed every
+/// time.
+///
+/// What this does NOT pin: every real `EtwGuard` is constructed with
+/// `trace: Some(trace)` (`start_consumer_named`), so production only ever
+/// takes `stop_session`'s `Some(trace) => match trace.stop() { Err(e) => ...
+/// }` arm — the arm this test's `None` short-circuit skips entirely. No
+/// test in this suite drives that arm's `Err` case together with a by-name
+/// STOP that *also* fails as anything other than "already stopped" (the
+/// closest, `etw_guard_drop_falls_back_to_the_by_name_stop_when_usertrace_stop_errs`
+/// in `etw_live_privileged_tests.rs`, forces a real `trace.stop()` `Err` but
+/// its by-name backstop then succeeds, so `session_reclaimed` ends up `true`
+/// and `Drop` joins rather than abandons). Forcing that combination
+/// deterministically needs the by-name STOP to fail with something other
+/// than "session not found" against a still-live session — e.g. an
+/// access-denied condition — which is not reachable without mutating the
+/// test process's own privilege level mid-run. A regression that changed
+/// `Some(trace) => Err(e) => false` to `true` would therefore be caught by
+/// no test, unit or privileged.
+///
+/// `thread` is a real, spawned OS thread parked on a channel this test
+/// itself controls and never signals until after `drop` below returns. This
+/// is the only way to observe "did not join" from outside `Drop`: if a
+/// regression reverted the `if session_reclaimed` gate to an unconditional
+/// join (as it was before this split), `drop(etw_guard)` would block on
+/// that thread forever instead of returning. That hang is the sanctioned
+/// "no other happens-before edge" exception CONTRIBUTING.md carves out for
+/// this class of assertion — same shape as the tun-engine driver and
+/// `run_with_tap` cases documented in `.config/nextest.toml`, which is
+/// where this test's name is listed so the hang fails loud instead of
+/// consuming the job budget.
+#[skuld::test]
+fn drop_abandons_the_processing_thread_without_joining_when_the_session_is_not_reclaimed() {
+    use crate::test_support::log_capture::VecWriter;
+    use garter::tracing_test::set_default_in_current_thread;
+    use tracing_subscriber::fmt;
+    use tracing_subscriber::layer::{Layer, SubscriberExt};
+
+    let writer = VecWriter::new();
+    let subscriber = tracing_subscriber::registry().with(
+        fmt::layer()
+            .with_writer(writer.clone())
+            .with_ansi(false)
+            .with_filter(tracing_subscriber::filter::LevelFilter::WARN),
+    );
+    let _guard = set_default_in_current_thread(subscriber);
+
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let thread = std::thread::spawn(move || {
+        let _ = release_rx.recv();
+    });
+
+    let etw_guard = EtwGuard {
+        trace: None,
+        thread: Some(thread),
+        session_name: "x\0y".to_string(),
+        stats_tx: None,
+        stats_thread: None,
+    };
+
+    // If a regression rejoins unconditionally, this call never returns --
+    // see the function doc and the `.config/nextest.toml` entry carrying
+    // this test's name.
+    drop(etw_guard);
+
+    let output = writer.snapshot_string();
+    assert!(
+        output.contains("etw: kernel did not confirm the session was stopped"),
+        "expected Drop to log the abandon warning after returning without joining; got:\n{output}"
+    );
+
+    // `drop` above already returned without joining -- release the parked
+    // thread so it can exit instead of leaking past this test.
+    drop(release_tx);
+}
