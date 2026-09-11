@@ -1284,10 +1284,12 @@ Uninstall is the one moment the in-process escapes cannot cover, because there
 is no next bridge start. On Windows the filters are
 `FWPM_FILTER_FLAG_PERSISTENT`: the Base Filtering Engine re-adds them every
 boot, and the uninstaller is about to delete the only binary that could remove
-them — a permanently blocked host with no way back short of `netsh wfp`
-(#1003). `cutover::release_covers` (`hole bridge release-covers`) is therefore
-`release_all` — both cover kinds — wrapped in the same escape shape as
-`unlock`.
+them. Nothing shipped with Windows takes their place: `netsh wfp` is
+diagnostics-only (no delete verb), and removing a WFP filter takes an FWPM
+call. So the host is blocked until Hole is reinstalled — there is no in-band
+way back (#1003). `cutover::release_covers` (`hole bridge release-covers`) is
+therefore `release_all` — both cover kinds — wrapped in the same escape shape
+as `unlock`.
 
 What makes the wider reach safe here is not ordering but the same structural
 exclusion `unlock` uses: it **refuses against a live bridge instance**
@@ -1349,6 +1351,35 @@ Two more properties are load-bearing:
   escape from the gate itself, so a release that can never succeed cannot make
   the product unremovable (see RELEASE-OPS.md).
 
+##### What the MSI must guarantee for the keep-covers path to be safe
+
+Two `hole.wxs` properties, both of which the release depends on and neither of
+which is visible from the Rust side.
+
+- **`MajorUpgrade Schedule="afterInstallInitialize"`.** The upgrade path
+  deliberately leaves the covers armed — `BridgeUninstall` passes
+  `--keep-covers` and `BridgeRelease` is skipped under `UPGRADINGPRODUCTCODE`,
+  because the standing cover is what holds the cutover gap. That is only
+  survivable if a FAILED upgrade puts the old product back. WiX's default
+  (`afterInstallValidate`) removes the old product outside the new install's
+  transaction, so a failed upgrade leaves neither version installed: armed
+  persistent filters, no `hole.exe`, no in-band way back — this PR's own
+  hazard, reintroduced by an attribute nobody set.
+  `afterInstallInitialize` puts `RemoveExistingProducts` inside the
+  transaction, so a rollback reinstalls the old product. The two later
+  placements would also survive a failed upgrade, but install the new files
+  first — over a still-running old service holding `hole.exe` open, with the
+  old product's `PathRemove` landing after the new product's `PathAdd`. Only
+  `afterInstallInitialize` gives both properties, and both halves are pinned
+  (`test_major_upgrade_removal_is_undone_when_the_upgrade_fails`,
+  `test_major_upgrade_removes_the_old_product_before_the_new_files_land`).
+- **`BridgeUninstallRollback`.** `BridgeRelease` is `Return="check"` and runs
+  immediately after `BridgeUninstall`, so a failed release rolls back an
+  uninstall whose service teardown already happened. The rollback action
+  re-runs exactly what `BridgeInstall` runs, so the product is left as the
+  uninstall found it rather than installed-but-deregistered. MSI ignores a
+  rollback action's return value, so it can only add recovery.
+
 ##### What the gate can prove, and what it only attempted
 
 `Return="check"` reads an exit code as "safe to delete the binary", so the
@@ -1375,15 +1406,18 @@ lifetime rides on the key itself (`SweptKey`) rather than in a parallel
 direction that hurts.
 
 **An unproven key does not fail the release**, and that is a deliberate
-sizing call rather than an oversight. Both readings of Microsoft's docs agree a
-boot-time filter stops applying once BFE starts, so a stranded record blocks
-egress across the boot→BFE window only — seconds, before anything user-facing
-is on the network. Refusing the uninstall over that would trade it for a
-permanently unremovable product: the same trade the bookkeeping clause above
-already refuses. The gate stops claiming proof it does not have; it does not
-withhold the uninstall. What replaces the silence is
-`cutover::release_clearance_report`, which `bridge release-covers` and `bridge uninstall` both print: it names each unproven key and points at `netsh wfp`,
-because this is the last moment a Hole binary exists to say anything at all.
+sizing call rather than an oversight. A boot-time filter stops applying once
+BFE starts, so a stranded record blocks egress across the boot→BFE window
+only — a bounded window that ends before the network stack is generally
+usable. Its length is *not* measured here (that needs a reboot-capable
+elevated lane, which does not exist), so the sizing rests on the window being
+bounded, not on any figure. Refusing the uninstall over a bounded early-boot
+block would trade it for a permanently unremovable product: the same trade the
+bookkeeping clause above already refuses. The gate stops claiming proof it does
+not have; it does not withhold the uninstall. What replaces the silence is
+`cutover::release_clearance_report`, which `bridge release-covers` and `bridge uninstall` both print: it names each unproven key, points at `netsh wfp show boottimepolicy` to *see* whether a record survived, says outright that `netsh wfp` cannot remove one, and names reinstalling Hole as the only thing that can.
+This is the last moment a Hole binary exists to say anything at all, so what it
+says has to be runnable.
 It deliberately does not assert a leftover is *present* — an unproven key is
 equally consistent with never having been installed, which is what it will be
 on almost every uninstall.

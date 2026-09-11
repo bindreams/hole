@@ -66,7 +66,7 @@ If the release can never succeed, force the uninstall past the gate:
 msiexec /x hole.msi HOLE_KEEP_COVERS=1
 ```
 
-**This leaves the host blocked.** The property skips the release entirely, so after it the only remaining recovery is manual WFP surgery (`netsh wfp show filters`, then delete Hole's provider). Prefer `hole bridge release-covers` (elevated) before falling back to this.
+**This leaves the host blocked.** The property skips the release entirely, and nothing shipped with Windows can undo it: `netsh wfp` is diagnostics-only (`capture`, `dump`, `help`, `set`, `show` — [no delete verb](https://learn.microsoft.com/windows-server/administration/windows-commands/netsh-wfp)), so `netsh wfp show filters` can show Hole's provider but not remove it. Removing a WFP filter takes an FWPM call, and `hole.exe` is the only caller of one on that host. So use this only after the product has been reinstalled at least once and `hole bridge release-covers` (elevated) has been tried and cannot succeed — and expect to reinstall Hole again to clear the block.
 
 ## Minisign key rotation (hole only)
 
