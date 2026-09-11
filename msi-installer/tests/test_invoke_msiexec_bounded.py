@@ -81,6 +81,22 @@ def _python_exe_args(*code: str) -> list[str]:
     return ["-c", *code]
 
 
+def _real_cdb_path() -> Path:
+    """The debugger the script itself would find. Fails rather than skips when
+    the SDK's Debugging Tools are absent -- see the `cdb` marker."""
+    candidates = [
+        Path(r"C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\cdb.exe"),
+        Path(r"C:\Program Files\Windows Kits\10\Debuggers\x64\cdb.exe"),
+    ]
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    raise AssertionError(
+        f"cdb.exe not found in {[str(c) for c in candidates]}; install the Windows SDK's "
+        "OptionId.WindowsDesktopDebuggers feature, or deselect with -m 'not cdb'"
+    )
+
+
 # Wedge branch =========================================================================================================
 
 
@@ -170,8 +186,10 @@ def test_wedge_still_emits_diagnostics_and_throws_when_log_read_fails(tmp_path: 
         combined = result.stdout + result.stderr
 
         assert result.returncode != 0
-        assert "failed to read" in combined.lower(
-        ), f"expected the log-read failure to be reported, not swallowed:\n{combined}"
+        # Named in full: `Invoke-StackCapture` emits the same literal for a
+        # capture file it cannot read, which is a different failure.
+        assert f"failed to read {log_path}" in combined, \
+            f"expected the log-read failure to be reported, not swallowed:\n{combined}"
         for header in DIAGNOSTIC_HEADERS:
             assert header in combined, f"missing diagnostic header {header!r} after a probe failure:\n{combined}"
         assert WEDGE_THROW in combined, f"wedge throw did not surface after a probe failure:\n{combined}"
@@ -197,6 +215,12 @@ def test_wedge_captures_symbolised_native_stacks_of_the_wedged_process(tmp_path:
     Debugging Tools (present on `windows-latest`) and msdl.microsoft.com for
     the OS PDBs. It fails rather than skips when either is missing, because a
     capture that silently stops symbolising is the failure worth catching.
+
+    Expects exactly one capture, which holds because ci.yaml runs this suite
+    in the `Test` step, before `Install` -- so the stand-in is the only target
+    in existence. On a host that already has a HoleBridge or hole.exe running,
+    those are captured first and can spend the budget before the stand-in's
+    turn.
     """
     log_path = tmp_path / "wedge.log"
 
@@ -267,10 +291,51 @@ def test_a_hung_debugger_is_killed_partial_output_survives_and_the_wedge_still_t
     assert "did not finish" in combined, f"the hung debugger was not reported:\n{combined}"
     assert "STANDIN-PARTIAL-OUTPUT" in combined, f"partial capture output was discarded:\n{combined}"
     assert WEDGE_THROW in combined, f"the hung debugger swallowed the wedge throw:\n{combined}"
-    # A non-invasive attach leaves its target suspended when the debugger is
-    # killed rather than detached, and nothing else in the job releases it.
+    # This stand-in never attaches to anything, so nothing is left suspended
+    # and the tree kill is what reaps the stand-in target, as always.
+    assert "killed process id(s)" in combined, f"the tree kill was skipped:\n{combined}"
+    assert "failed to kill process id(s)" not in combined, f"the tree kill misfired:\n{combined}"
+
+
+@pytest.mark.cdb
+def test_a_target_the_capture_left_suspended_is_detected_and_terminated(tmp_path: Path) -> None:
+    """A non-invasive attach that does not end in `qd` freezes its target.
+
+    The script must notice and free it: a suspended HoleBridge can no more
+    answer SERVICE_CONTROL_STOP than a wedged one, so an instrument that
+    leaves one behind manufactures the hang it exists to diagnose.
+
+    The stand-in reproduces the real failure with the real tool rather than
+    simulating it -- `cdb -pv -p <pid>` with stdin at EOF attaches, falls to
+    its prompt, and exits WITHOUT detaching. Then it returns, so the script's
+    wait for it is the rendezvous and nothing here races: the suspension is
+    already in place when the script measures.
+    """
+    log_path = tmp_path / "wedge.log"
+    standin = tmp_path / "suspending-cdb.cmd"
+    # %3 is the target pid: the argv is `-pv -p <pid> -logo "<file>" -c "..."`.
+    standin.write_text(f'@echo off\necho STANDIN-SUSPENDED-THE-TARGET\n"{_real_cdb_path()}" -pv -p %3 <nul >nul 2>&1\n')
+
+    result = _run_script(
+        params={
+            "Verb": "/x",
+            "MsiPath": "unused.msi",
+            "LogPath": str(log_path),
+            "BoundMinutes": "0.02",
+            "ExePath": sys.executable,
+            "StackCaptureSeconds": "120",
+            "CdbPath": str(standin),
+        },
+        exe_args=_python_exe_args("import time; time.sleep(3600)"),
+        timeout=300,
+    )
+    combined = result.stdout + result.stderr
+
+    assert result.returncode != 0
+    assert "thread(s) suspended" in combined, f"the frozen target went unnoticed:\n{combined}"
     assert "terminated suspended pid" in combined, f"the frozen target was left suspended:\n{combined}"
-    assert "--- killing wedged process tree ---" in combined, f"the tree kill was skipped:\n{combined}"
+    assert WEDGE_THROW in combined, f"freeing the target swallowed the wedge throw:\n{combined}"
+    assert "failed to kill process id(s)" not in combined, f"the freed pid was tree-killed again:\n{combined}"
 
 
 def test_stack_capture_budget_exhaustion_is_reported_and_does_not_swallow_the_wedge(tmp_path: Path) -> None:
@@ -295,7 +360,8 @@ def test_stack_capture_budget_exhaustion_is_reported_and_does_not_swallow_the_we
 
     assert result.returncode != 0
     assert "--- native thread stacks ---" in combined, f"the section vanished when skipped:\n{combined}"
-    assert "budget" in combined.lower(), f"budget exhaustion was not reported:\n{combined}"
+    assert "stack-capture budget of 0s is spent" in combined, \
+        f"budget exhaustion was not reported:\n{combined}"
     assert WEDGE_THROW in combined, f"wedge throw did not survive a skipped capture:\n{combined}"
 
 
