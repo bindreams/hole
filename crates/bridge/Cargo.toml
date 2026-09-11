@@ -145,6 +145,10 @@ windows = { version = "0.62", features = [
     # SIDs store ProfileImagePath unexpanded.
     "Win32_System_Environment",
     "Win32_System_JobObjects",
+    # RegQueryInfoKeyW/RegEnumKeyExW for `cutover::windows_profiles`: the
+    # ProfileList pass is written out because `windows-registry`'s iterator
+    # reads any enumeration error as end-of-list.
+    "Win32_System_Registry",
     "Win32_System_RemoteDesktop",
     "Win32_System_Services",
     "Win32_System_Threading",
