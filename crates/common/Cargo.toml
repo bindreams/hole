@@ -61,6 +61,14 @@ libc = "0.2"
 
 [build-dependencies]
 typify = "0.6"
+# NOT ours to choose. `build.rs` names `schemars::schema::Schema` only to feed
+# `typify::TypeSpace`, and typify does not re-export schemars, so this must be
+# the series typify speaks — `typify-impl` requires `^0.8.22`. 0.9 and 1.x both
+# made the `schema` module private, so a bump fails the build script with E0603
+# (#379, closed as upstream-blocked; oxidecomputer/typify#886 upstream) — that
+# compile failure is the real enforcement, unconditionally. See
+# xtask/src/schemars_pin.rs's module doc (PINNED_SERIES) for what keeps this
+# line, that doc, and .github/renovate.json's allowedVersions rule in sync.
 schemars = "0.8"
 serde_json = "1"
 yaml_serde = "0.10"

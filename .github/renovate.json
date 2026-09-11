@@ -119,6 +119,12 @@
       "enabled": false
     },
     {
+      "description": "schemars is typify's choice, not ours: typify-impl still requires ^0.8.22, and a bump past 0.8 fails crates/common/build.rs with E0603 — bindreams/hole#379, closed as upstream-blocked. `allowedVersions` keeps 0.8.x patches flowing while suppressing the impossible bump; NOT `enabled: false`, which would also stop a security patch. Best-effort noise suppression only, not the enforcement (E0603 is); see xtask/src/schemars_pin.rs's module doc for what is and is not verified, and its `PINNED_SERIES` for the single source of the `<0.9` boundary below.",
+      "matchManagers": ["cargo"],
+      "matchDepNames": ["schemars"],
+      "allowedVersions": "<0.9"
+    },
+    {
       "description": "Rust compiler: its own reviewable PR, never automerged. A compiler bump lands new default-on clippy lints across the whole workspace at once (#855), so it must not ride in a batch. `groupName: null` un-groups it; `automerge: false` overrides the major-updates rule above, which matches every manager including this one. Last rule wins — these compiler rules must stay LAST in this array.",
       "matchManagers": ["rust-toolchain"],
       "matchDepNames": ["rust"],
