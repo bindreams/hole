@@ -34,11 +34,9 @@
 //! selector resolution — which selectors reach `schemars`, glob/regex
 //! dependency-name matching, negation precedence, last-wins merging across
 //! nested and manager-scoped rules. Three independent review rounds each found
-//! a fresh divergence from Renovate's real behaviour (empty selector arrays
-//! matching nothing, minimatch's `*` not crossing `/`, `ignoreDeps` invisible
-//! to it, `matchDepTypes` on `build-dependencies` producing a false red, case
-//! folding) — an arms race against a moving upstream, fought with machinery
-//! that itself needed guarding as much as the thing it guarded.
+//! a fresh divergence from Renovate's real behaviour — an arms race against a
+//! moving upstream, fought with machinery that itself needed guarding as much
+//! as the thing it guarded.
 //!
 //! That model has been removed. The Renovate rule is now **best-effort noise
 //! suppression, and nothing more is claimed of it**: if it is ever malformed,
@@ -56,11 +54,14 @@
 //!
 //! ## The fact this module still guards
 //!
-//! [`PINNED_SERIES`] is that fact — the one hand-written copy of it.
+//! [`PINNED_SERIES`] is that fact — its canonical copy.
 //! `crates/common/Cargo.toml`'s `schemars = "0.8"` is a consequence of it and
 //! is checked *against* it ([`check_local_pin`]), not compared textually: a
 //! constant edited out from under the guard would otherwise leave it policing
-//! the wrong series without anything noticing.
+//! the wrong series without anything noticing. `.github/renovate.json`'s
+//! `allowedVersions` rule is a second, independently hand-written copy of the
+//! same boundary; [`check_renovate_boundary`] compares its literal string
+//! against what [`PINNED_SERIES`] computes, for the same reason.
 //!
 //! If the upstream fact stops holding — `typify` no longer requires 0.8 — the
 //! pin, the Renovate rule and this module have all become friction with no
@@ -97,12 +98,11 @@
 //!   archive lane) checks everything readable from tracked files: the resolved
 //!   version and the local pin.
 //! - `cargo xtask check-schemars-pin` checks that *plus* the declared
-//!   requirement, and runs where a registry exists: the `check-schemars-pin`
-//!   prek hook, which `prek.toml` gates by `files` to commits touching
-//!   `Cargo.lock`, `crates/common/Cargo.toml` or this module (the three files
-//!   this check actually reads — `.github/renovate.json` is not among them,
-//!   see above) — and unconditionally in the `Lint` CI job, which runs prek
-//!   `--all-files`.
+//!   requirement and the `.github/renovate.json` boundary (see
+//!   [`check_renovate_boundary`]), and runs where a registry exists: the
+//!   `check-schemars-pin` prek hook, which `prek.toml` gates by `files` to
+//!   commits touching any of the four files this check reads — and
+//!   unconditionally in the `Lint` CI job, which runs prek `--all-files`.
 //!
 //! Nothing is skipped: each lane runs every check it can source data for, and
 //! the declared-requirement check fails loudly rather than passing when
@@ -397,7 +397,7 @@ pub fn requirement_admits_beyond_pin(req: &str) -> Result<Option<Version>> {
 /// from a manifest cargo has already agreed to build, `declared_schemars_requirements`
 /// from `cargo metadata`'s own normalized output — so neither node-semver's
 /// whitespace-separated comparators nor its `||` union ever reach here: a
-/// hand-edited manifest spelled either way is a range `Version::parse` inside
+/// hand-edited manifest spelled either way is a range `VersionReq::parse` inside
 /// cargo itself would already refuse, well before this check runs.
 fn parse_requirement(req: &str) -> Result<VersionReq> {
     VersionReq::parse(req).with_context(|| {
@@ -425,8 +425,15 @@ struct LockPackage {
     dependencies: Vec<String>,
 }
 
-/// Which `schemars` [`UPSTREAM`] actually resolved against, as a
-/// `(upstream version, schemars version)` pair — e.g. `("0.6.2", "0.8.22")`.
+/// Every `schemars` [`UPSTREAM`] actually resolved against, as an
+/// `(upstream version, versions)` pair — e.g. `("0.6.2", ["0.8.22"])`.
+///
+/// A list, not one string: cargo can resolve a dependency against more than
+/// one edge at once — this repo's own `Cargo.lock` has `serde_with` locked
+/// against both `schemars` 0.9.0 and 1.2.1 — and if `typify-impl` ever kept
+/// 0.8 locked alongside a 1.x edge, taking only the first (alphabetically
+/// earliest) edge would report the pin as held while a second, unpinned
+/// series sat right next to it.
 ///
 /// Read out of `Cargo.lock` rather than `cargo metadata`: the lockfile is a
 /// tracked file, so this needs no subprocess, no registry and no network, which
@@ -436,7 +443,7 @@ struct LockPackage {
 /// A lockfile dependency entry carries its version only when the name is
 /// ambiguous — which it is today (three `schemars` are locked) — so a bare
 /// `"schemars"` is resolved against the sole `[[package]]` entry instead.
-pub fn upstream_schemars(lock: &str) -> Result<(String, String)> {
+pub fn upstream_schemars(lock: &str) -> Result<(String, Vec<String>)> {
     let lockfile: Lockfile = toml::from_str(lock).context("failed to parse Cargo.lock")?;
 
     let upstream: Vec<&LockPackage> = lockfile.packages.iter().filter(|p| p.name == UPSTREAM).collect();
@@ -461,11 +468,12 @@ pub fn upstream_schemars(lock: &str) -> Result<(String, String)> {
         }
     };
 
-    let entry = upstream
+    let entries: Vec<&String> = upstream
         .dependencies
         .iter()
-        .find(|d| *d == "schemars" || d.starts_with("schemars "));
-    let Some(entry) = entry else {
+        .filter(|d| *d == "schemars" || d.starts_with("schemars "))
+        .collect();
+    if entries.is_empty() {
         bail!(
             "`{UPSTREAM}` {} no longer has `schemars` among its locked dependencies. This is the expected end \
              state, not a broken check: upstream may have landed its own IR (oxidecomputer/typify#886), or \
@@ -474,40 +482,48 @@ pub fn upstream_schemars(lock: &str) -> Result<(String, String)> {
              {WHEN_UPSTREAM_MOVES}",
             upstream.version
         )
-    };
+    }
 
+    let versions: Result<Vec<String>> = entries
+        .into_iter()
+        .map(|entry| resolve_schemars_entry_version(entry, &lockfile, &upstream.version))
+        .collect();
+    Ok((upstream.version.clone(), versions?))
+}
+
+/// The version a single locked `schemars` dependency entry names —
+/// `"schemars 0.8.22"` yields `"0.8.22"` directly; a bare `"schemars"` is
+/// resolved against the sole `[[package]] name = "schemars"` entry instead.
+fn resolve_schemars_entry_version(entry: &str, lockfile: &Lockfile, upstream_version: &str) -> Result<String> {
     // `name version (source)`; cargo omits the trailing fields as they become
     // unambiguous, so take the version positionally rather than by splitting once.
-    let schemars_version = match entry.split_whitespace().nth(1) {
-        Some(version) => version.to_string(),
+    match entry.split_whitespace().nth(1) {
+        Some(version) => Ok(version.to_string()),
         // Unqualified: cargo omits the version only when one `schemars` is in
         // the graph, so the sole package entry is the one meant.
         None => {
             let all: Vec<&LockPackage> = lockfile.packages.iter().filter(|p| p.name == "schemars").collect();
             match all.as_slice() {
-                [one] => one.version.clone(),
+                [one] => Ok(one.version.clone()),
                 [] => bail!(
-                    "`{UPSTREAM}` {} depends on `schemars`, but no `schemars` package is locked. Cargo does \
-                     not emit that; the lockfile has been hand-edited or truncated. Regenerate it with \
-                     `cargo update --workspace`.",
-                    upstream.version
+                    "`{UPSTREAM}` {upstream_version} depends on `schemars`, but no `schemars` package is \
+                     locked. Cargo does not emit that; the lockfile has been hand-edited or truncated. \
+                     Regenerate it with `cargo update --workspace`."
                 ),
                 other => {
                     let versions: Vec<&str> = other.iter().map(|p| p.version.as_str()).collect();
                     bail!(
-                        "`{UPSTREAM}` {} names `schemars` without a version, but {} `schemars` packages are \
-                         locked ({}). Cargo drops the version only when the name is unambiguous, so this \
-                         lockfile is inconsistent with itself — regenerate it with `cargo update --workspace` \
-                         rather than trusting either reading.",
-                        upstream.version,
+                        "`{UPSTREAM}` {upstream_version} names `schemars` without a version, but {} `schemars` \
+                         packages are locked ({}). Cargo drops the version only when the name is unambiguous, \
+                         so this lockfile is inconsistent with itself — regenerate it with `cargo update \
+                         --workspace` rather than trusting either reading.",
                         other.len(),
                         versions.join(", ")
                     )
                 }
             }
         }
-    };
-    Ok((upstream.version.clone(), schemars_version))
+    }
 }
 
 // cargo metadata — the declared signal ================================================================================
@@ -660,6 +676,61 @@ pub fn check_local_pin(manifest: &str) -> Result<()> {
     Ok(())
 }
 
+// .github/renovate.json — the second hand-written copy of the boundary ================================================
+
+/// Path the Renovate rule for `schemars` lives at, relative to the repo root.
+const RENOVATE_MANIFEST: &str = ".github/renovate.json";
+
+/// Does `.github/renovate.json`'s `schemars` `allowedVersions` rule still name
+/// the same series boundary [`PINNED_SERIES`] computes?
+///
+/// [`PINNED_SERIES`] is the one hand-written copy of the boundary fact; this
+/// rule is a second one, written independently as a literal `"<0.9"` string.
+/// [`check_local_pin`] never reads this file, so nothing else would notice the
+/// two drifting apart if `PINNED_SERIES` moved without a matching edit here.
+///
+/// Deliberately textual: this compares two literal version strings, not
+/// Renovate's own selector/rule-merging behaviour — that model was removed
+/// (see the module doc) and this check does not reopen it.
+pub fn check_renovate_boundary(renovate_json: &str) -> Result<()> {
+    let doc: serde_json::Value =
+        serde_json::from_str(renovate_json).context("failed to parse .github/renovate.json")?;
+    let rules = doc
+        .get("packageRules")
+        .and_then(|r| r.as_array())
+        .context(".github/renovate.json has no `packageRules` array")?;
+    let allowed = rules
+        .iter()
+        .find_map(|rule| {
+            let names_schemars = rule
+                .get("matchDepNames")
+                .and_then(|d| d.as_array())
+                .is_some_and(|names| names.iter().any(|n| n.as_str() == Some("schemars")));
+            if names_schemars {
+                rule.get("allowedVersions").and_then(|v| v.as_str())
+            } else {
+                None
+            }
+        })
+        .context(
+            ".github/renovate.json has no packageRules entry with matchDepNames including \"schemars\" and an \
+             allowedVersions string. If the rule was removed, PINNED_SERIES's second hand-written copy is gone \
+             with it — decide whether this check should go too.",
+        )?;
+
+    let (_, next) = pinned_bounds();
+    let expected = format!("<{}.{}", next.major, next.minor);
+    if allowed != expected {
+        bail!(
+            "`.github/renovate.json`'s schemars rule has allowedVersions {allowed:?}, but PINNED_SERIES \
+             ({PINNED_SERIES}) computes the boundary as {expected:?}. These are two independently hand-written \
+             copies of the same fact — the manifest's own `Cargo.toml` comment or PINNED_SERIES moved without \
+             the other; make them agree before trusting anything else this check reports."
+        );
+    }
+    Ok(())
+}
+
 // Entry points ========================================================================================================
 
 /// Every check sourceable from tracked files: the resolved upstream version
@@ -671,13 +742,15 @@ pub fn check_local_pin(manifest: &str) -> Result<()> {
 pub fn verify_offline(repo_root: &Path) -> Result<()> {
     let lock = read(repo_root, "Cargo.lock")?;
     let (upstream_version, resolved) = upstream_schemars(&lock)?;
-    if !version_tracks_pin(&resolved)? {
-        bail!(
-            "`{UPSTREAM}` {upstream_version} now resolves against schemars {resolved}, not {PINNED_SERIES}. \
-             The pin in crates/common/Cargo.toml and the `allowedVersions` rule in .github/renovate.json \
-             exist only because of that requirement, so both are now suppressing an update that may be \
-             possible.\n{WHEN_UPSTREAM_MOVES}"
-        );
+    for version in &resolved {
+        if !version_tracks_pin(version)? {
+            bail!(
+                "`{UPSTREAM}` {upstream_version} now resolves against schemars {version}, not {PINNED_SERIES}. \
+                 The pin in crates/common/Cargo.toml and the `allowedVersions` rule in .github/renovate.json \
+                 exist only because of that requirement, so both are now suppressing an update that may be \
+                 possible.\n{WHEN_UPSTREAM_MOVES}"
+            );
+        }
     }
 
     check_local_pin(&read(repo_root, LOCAL_MANIFEST)?)?;
@@ -685,12 +758,24 @@ pub fn verify_offline(repo_root: &Path) -> Result<()> {
 }
 
 /// [`verify_offline`] plus the declared-requirement signal, which needs a
-/// registry. Backs `cargo xtask check-schemars-pin`.
+/// registry, and the `.github/renovate.json` boundary check, which does not
+/// but has no other lane to run in. Backs `cargo xtask check-schemars-pin`.
 pub fn verify(repo_root: &Path) -> Result<()> {
     verify_offline(repo_root)?;
+    check_renovate_boundary(&read(repo_root, RENOVATE_MANIFEST)?)?;
 
     let (upstream_version, reqs) = declared_schemars_requirements(&cargo_metadata_json(repo_root)?)?;
-    for req in &reqs {
+    check_declared_requirements(&upstream_version, &reqs)
+}
+
+/// Fails if any of `reqs` admits a version beyond [`PINNED_SERIES`].
+///
+/// Split out of [`verify`] so the loop-and-bail wiring is unit-testable
+/// without a registry: `verify`'s own composition
+/// (`cargo_metadata_json` -> `declared_schemars_requirements` -> this) is
+/// otherwise only ever exercised live, by `cargo xtask check-schemars-pin`.
+pub(crate) fn check_declared_requirements(upstream_version: &str, reqs: &[String]) -> Result<()> {
+    for req in reqs {
         if let Some(admitted) = requirement_admits_beyond_pin(req)? {
             bail!(
                 "`{UPSTREAM}` {upstream_version} declares `schemars = \"{req}\"`, which admits {admitted} — \

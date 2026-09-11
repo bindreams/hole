@@ -1,14 +1,15 @@
 //! `schemars_pin_still_tracks_typify` conformance test, plus unit coverage of
 //! the readers it composes.
 //!
-//! The declared-requirement cases below are mutation proofs: each one is the
-//! real artefact with a single field changed to the shape that would silently
-//! reopen bindreams/hole#379, asserting that the guard notices. The Renovate
-//! rule itself is no longer modelled here — see the module doc for why.
+//! The declared-requirement cases below are mutation proofs: each one starts
+//! from `metadata()`'s synthetic two-package `cargo metadata` shape with a
+//! single field changed to the shape that would silently reopen
+//! bindreams/hole#379, asserting that the guard notices. The Renovate rule
+//! itself is no longer modelled here — see the module doc for why.
 
 use crate::schemars_pin::{
-    check_local_pin, declared_schemars_requirements, requirement_admits_beyond_pin, upstream_schemars, verify_offline,
-    version_tracks_pin, PINNED_SERIES, UPSTREAM,
+    check_declared_requirements, check_local_pin, check_renovate_boundary, declared_schemars_requirements,
+    requirement_admits_beyond_pin, upstream_schemars, verify_offline, version_tracks_pin, PINNED_SERIES, UPSTREAM,
 };
 
 // Series arithmetic ===================================================================================================
@@ -209,7 +210,10 @@ version = "1.2.1"
 #[skuld::test]
 fn a_qualified_dependency_entry_yields_the_resolved_pair() {
     let (upstream, schemars) = upstream_schemars(QUALIFIED_LOCK).unwrap();
-    assert_eq!((upstream.as_str(), schemars.as_str()), ("0.6.2", "0.8.22"));
+    assert_eq!(
+        (upstream.as_str(), schemars.as_slice()),
+        ("0.6.2", ["0.8.22".to_string()].as_slice())
+    );
 }
 
 /// Older lockfile formats append the source to the dependency entry; the
@@ -221,7 +225,7 @@ fn a_dependency_entry_carrying_its_source_still_yields_the_version() {
         r#""schemars 0.8.22 (registry+https://github.com/rust-lang/crates.io-index)""#,
     );
     let (_, schemars) = upstream_schemars(&lock).unwrap();
-    assert_eq!(schemars, "0.8.22");
+    assert_eq!(schemars, vec!["0.8.22".to_string()]);
 }
 
 /// With a single `schemars` in the graph Cargo omits the version from the
@@ -239,7 +243,10 @@ name = "schemars"
 version = "0.8.22"
 "#;
     let (upstream, schemars) = upstream_schemars(lock).unwrap();
-    assert_eq!((upstream.as_str(), schemars.as_str()), ("0.7.0", "0.8.22"));
+    assert_eq!(
+        (upstream.as_str(), schemars.as_slice()),
+        ("0.7.0", ["0.8.22".to_string()].as_slice())
+    );
 }
 
 /// Cargo drops the version only when the name is unambiguous, so an unqualified
@@ -336,7 +343,34 @@ fn two_locked_upstreams_are_reported_as_a_typify_split_not_a_schemars_problem() 
 fn a_resolved_schemars_outside_the_pin_does_not_track_it() {
     let lock = QUALIFIED_LOCK.replace("schemars 0.8.22", "schemars 1.2.2");
     let (_, schemars) = upstream_schemars(&lock).unwrap();
-    assert!(!version_tracks_pin(&schemars).unwrap());
+    assert!(schemars.iter().any(|v| !version_tracks_pin(v).unwrap()));
+}
+
+/// Dual resolution — schemars 0.8 kept locked alongside 1.x, the shape
+/// `serde_with` already has in this very `Cargo.lock` (0.9.0 and 1.2.1
+/// resolved together) — must be caught on every resolved edge, not just the
+/// alphabetically-first one. MUTATION: taking only the first edge reports
+/// `("0.7.0", "0.8.22")` here and never surfaces the 1.2.1 edge at all.
+#[skuld::test]
+fn every_resolved_schemars_is_returned_so_dual_resolution_cannot_hide() {
+    let lock = r#"
+[[package]]
+name = "typify-impl"
+version = "0.7.0"
+dependencies = ["schemars 0.8.22", "schemars 1.2.1"]
+
+[[package]]
+name = "schemars"
+version = "0.8.22"
+
+[[package]]
+name = "schemars"
+version = "1.2.1"
+"#;
+    let (upstream, resolved) = upstream_schemars(lock).unwrap();
+    assert_eq!(upstream, "0.7.0");
+    assert_eq!(resolved, vec!["0.8.22".to_string(), "1.2.1".to_string()]);
+    assert!(resolved.iter().any(|v| !version_tracks_pin(v).unwrap()));
 }
 
 // declared_schemars_requirements (cargo metadata) =====================================================================
@@ -379,7 +413,7 @@ fn a_widened_declared_requirement_is_caught_while_the_lockfile_stays_green() {
     // The lockfile that goes with it is untouched, and still passes.
     let (_, resolved) = upstream_schemars(QUALIFIED_LOCK).unwrap();
     assert!(
-        version_tracks_pin(&resolved).unwrap(),
+        resolved.iter().all(|v| version_tracks_pin(v).unwrap()),
         "the resolved signal is blind to this"
     );
 }
@@ -471,6 +505,65 @@ fn a_manifest_without_the_build_dependency_is_reported() {
         err.to_string().contains("no `schemars` build-dependency"),
         "unexpected error: {err}"
     );
+}
+
+// check_renovate_boundary (.github/renovate.json) =====================================================================
+
+fn renovate_json(allowed_versions: &str) -> String {
+    format!(
+        r#"{{ "packageRules": [
+             {{ "matchDepNames": ["some-other-crate"], "allowedVersions": "<9" }},
+             {{ "matchManagers": ["cargo"], "matchDepNames": ["schemars"], "allowedVersions": "{allowed_versions}" }}
+           ] }}"#
+    )
+}
+
+#[skuld::test]
+fn a_renovate_boundary_matching_pinned_series_is_accepted() {
+    check_renovate_boundary(&renovate_json("<0.9")).unwrap();
+}
+
+/// MUTATION: `PINNED_SERIES` moved but `.github/renovate.json` was not
+/// updated in the same commit. Nothing else notices this drift —
+/// `check_local_pin` never reads this file.
+#[skuld::test]
+fn a_renovate_boundary_off_pinned_series_is_rejected() {
+    let err = check_renovate_boundary(&renovate_json("<1.0")).unwrap_err();
+    let message = err.to_string();
+    assert!(message.contains("<1.0"), "unexpected error: {message}");
+    assert!(message.contains("<0.9"), "unexpected error: {message}");
+    assert!(message.contains("PINNED_SERIES"), "unexpected error: {message}");
+}
+
+#[skuld::test]
+fn a_renovate_file_with_no_schemars_rule_is_reported() {
+    let err = check_renovate_boundary(r#"{ "packageRules": [] }"#).unwrap_err();
+    assert!(
+        err.to_string().contains("no packageRules entry"),
+        "unexpected error: {err}"
+    );
+}
+
+// check_declared_requirements (the loop verify() runs) ================================================================
+
+/// `verify`'s own wiring — `cargo_metadata_json` -> `declared_schemars_requirements`
+/// -> this loop -> `bail!` on the first widened entry — is otherwise only ever
+/// exercised live via `cargo xtask check-schemars-pin`. A regression that
+/// checked only `reqs[0]`, or swallowed this loop's `Result`, would ship with
+/// nothing failing; these two cases pin the loop's actual behaviour.
+#[skuld::test]
+fn check_declared_requirements_fails_on_a_widened_entry_anywhere_in_the_list() {
+    let reqs = vec!["^0.8.22".to_string(), "^1.0.2".to_string()];
+    let err =
+        check_declared_requirements("0.6.2", &reqs).expect_err("the second, widened requirement must not be skipped");
+    let message = err.to_string();
+    assert!(message.contains("1.0.2"), "unexpected error: {message}");
+    assert!(message.contains("0.6.2"), "unexpected error: {message}");
+}
+
+#[skuld::test]
+fn check_declared_requirements_passes_when_every_entry_holds_the_pin() {
+    check_declared_requirements("0.6.2", &["^0.8.22".to_string(), "<0.9".to_string()]).unwrap();
 }
 
 // The conformance test ================================================================================================

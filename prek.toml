@@ -134,12 +134,13 @@ name = "schemars pin still tracks typify"
 # schemars requirement, via `cargo metadata`. Its sibling
 # (`schemars_pin_still_tracks_typify`) runs from the nextest archive, where
 # `cargo metadata` cannot resolve the workspace, and so can only read the
-# resolved version out of Cargo.lock -- blind to upstream *widening*. See
-# xtask/src/schemars_pin.rs.
+# resolved version out of Cargo.lock -- blind to upstream *widening*. Also
+# checks .github/renovate.json's allowedVersions boundary textually against
+# PINNED_SERIES. See xtask/src/schemars_pin.rs.
 entry = "cargo xtask check-schemars-pin"
 language = "system"
 pass_filenames = false
-files = "^(Cargo\\.lock|crates/common/Cargo\\.toml|xtask/src/schemars_pin\\.rs)$"
+files = "^(Cargo\\.lock|crates/common/Cargo\\.toml|xtask/src/schemars_pin\\.rs|\\.github/renovate\\.json)$"
 
 [[repos.hooks]]
 id = "check-workspace-lints"

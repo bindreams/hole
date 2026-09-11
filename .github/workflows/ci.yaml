@@ -593,9 +593,8 @@ jobs:
   # typo in it (`matchDepNamez`, a number where a duration string belongs) is
   # silently ignored rather than reported anywhere this repo can see. This
   # catches that the config is schema-valid; it says nothing about whether a
-  # given rule actually applies to a given dependency (xtask/src/schemars_pin.rs
-  # no longer models that either — the schemars rule is best-effort suppression,
-  # not something this repo verifies is "effective"; see that module's doc).
+  # given rule actually applies to a given dependency — see
+  # xtask/src/schemars_pin.rs's module doc for why that's not verified here.
   # Linux, measured at 25s for the step and 31s for the job; deliberately not
   # folded into `Lint`, which is a Windows job with a Rust toolchain it does not
   # need.
@@ -609,17 +608,21 @@ jobs:
         with:
           node-version: lts/*
 
-      # No file argument: the validator discovers `.github/renovate.json` itself
-      # and validates it as a *repository* config. Naming the file explicitly
-      # makes it validate as a global config instead, which accepts a different
-      # option set and would pass configs Renovate rejects at runtime.
+      # Named explicitly, with --no-global: naming a config file makes the
+      # validator treat it as *global* self-hosted config by default, which
+      # accepts a different option set and would pass configs Renovate rejects
+      # at runtime -- --no-global keeps it validating as a *repository* config
+      # instead. Without a file argument at all, the validator silently skips
+      # every default config filename that doesn't exist and exits 0 with only
+      # a warning logged, so a renovate.json moved or deleted in a refactor
+      # would pass this job having validated nothing.
       #
       # Unpinned on purpose, and the one place in this repo where that is the
       # correct answer: the bot that reads this config is always Renovate's
       # latest release, so validating against anything older would assert a
       # schema nothing uses. `--strict` makes warnings fatal.
       - name: Validate .github/renovate.json
-        run: npx --yes --package renovate renovate-config-validator --strict
+        run: npx --yes --package renovate renovate-config-validator --strict --no-global .github/renovate.json
 
   # Runs the ex-ray-unit-tests target (build.yaml) on windows/darwin -- see there
   # for why it is split from test-ex-ray.

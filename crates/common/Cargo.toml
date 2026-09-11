@@ -66,17 +66,9 @@ typify = "0.6"
 # the series typify speaks — `typify-impl` requires `^0.8.22`. 0.9 and 1.x both
 # made the `schema` module private, so a bump fails the build script with E0603
 # (#379, closed as upstream-blocked; oxidecomputer/typify#886 upstream) — that
-# compile failure is the real enforcement, unconditionally; `.github/renovate.json`'s
-# `allowedVersions` rule is only best-effort noise suppression so Renovate does
-# not keep reproposing the bump. xtask's `schemars_pin` guard does not verify
-# that Renovate rule; it tracks only whether the upstream fact above still
-# holds: `schemars_pin_still_tracks_typify` reads the schemars version typify
-# resolved against out of Cargo.lock and checks this line against its own
-# PINNED_SERIES, and the `check-schemars-pin` prek hook — gated to commits
-# touching this file, Cargo.lock or xtask/src/schemars_pin.rs, and unconditional
-# in CI's Lint job — additionally reads typify's declared requirement from
-# `cargo metadata`, the half that catches upstream widening, which the lockfile
-# cannot show.
+# compile failure is the real enforcement, unconditionally. See
+# xtask/src/schemars_pin.rs's module doc (PINNED_SERIES) for what keeps this
+# line, that doc, and .github/renovate.json's allowedVersions rule in sync.
 schemars = "0.8"
 serde_json = "1"
 yaml_serde = "0.10"
