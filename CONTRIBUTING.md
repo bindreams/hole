@@ -827,13 +827,9 @@ leaves working DNS + broken routes, not the inverse):
   `diagnostics::etw::sweep_stale_sessions` (`QueryAllTracesW`) stops stale ones by
   name prefix. The bridge's own session is stopped in `EtwGuard::drop`, which
   re-issues STOP by name as a backstop when `UserTrace::stop` did not report
-  success — mechanism: `etw.rs` module doc, "Drain on Drop". When even that
-  by-name STOP fails to reclaim the session, `Drop` cannot tell a thread that
-  is genuinely stuck apart from one whose `CloseTrace` already succeeded and
-  is about to return on its own, so it abandons the processing thread rather
-  than risk blocking shutdown forever on a join that may never return: it
-  logs a `warn!` and drops the `JoinHandle` without joining. `Drop` is
-  otherwise unbounded (bindreams/hole#1016).
+  success; if even that fails, `Drop` abandons the processing thread rather
+  than risk an unbounded join (mechanism: `etw.rs` module doc, "Drain on
+  Drop"; `Drop` is otherwise unbounded, bindreams/hole#1016).
 
 Default `<state_dir>` is `dirs::state_dir()/hole/state` — Windows
 `%LOCALAPPDATA%\hole\state\`, macOS `~/Library/Application Support/hole/state/`;

@@ -553,3 +553,72 @@ fn thread_spawn_failure_stops_the_orphaned_session() {
          to reclaim it: {after:?}"
     );
 }
+
+/// Drives `start_consumer_named`'s real thread-spawn-failure arm through the
+/// [`start_consumer_named_with_spawn`] test seam, rather than calling
+/// [`abandon_session_on_thread_spawn_failure`] directly the way
+/// [`thread_spawn_failure_stops_the_orphaned_session`] above does. That test
+/// pins the cleanup helper's own behaviour but, by its own doc, does not pin
+/// that the call site actually invokes the helper, nor that `drop(trace)`
+/// runs before the helper rather than after.
+///
+/// This test drives the real session-start + spawn-attempt path with an
+/// injected `spawn_processor` that always fails, and distinguishes the two
+/// orderings by which log line the by-name STOP backstop produces:
+/// - `drop(trace)` before the helper (correct): ferrisetw's own `Drop`
+///   already stopped the session, so the by-name STOP finds it already gone
+///   and logs `"etw: session already stopped"` (debug), never
+///   `"etw: stopped session by name"` (info).
+/// - the helper before `drop(trace)` (inverted): the by-name STOP runs
+///   against a still-live session and is the one that actually stops it,
+///   logging `"etw: stopped session by name"` instead.
+///
+/// A regression that deletes the call to `abandon_session_on_thread_spawn_failure`
+/// entirely (reverting to a bare `.map_err(EtwError::ThreadSpawn)?`) leaves the
+/// session live, which the `after.is_err()` assertion below catches on its own.
+#[cfg(target_os = "windows")]
+#[skuld::test(labels = [TUN], serial = TUN)]
+fn thread_spawn_failure_at_the_real_call_site_stops_the_session_after_dropping_the_trace() {
+    const PREFIX: &str = "hole-etw-live-stats-test-spawn-fail-seam-";
+    crate::diagnostics::etw_sweep::sweep_sessions_with_prefix(PREFIX, "etw-test");
+
+    let session_name = format!("{PREFIX}{}", std::process::id());
+
+    let writer = VecWriter::new();
+    let subscriber = tracing_subscriber::registry().with(
+        fmt::layer()
+            .with_writer(writer.clone())
+            .with_ansi(false)
+            .with_filter(tracing_subscriber::filter::LevelFilter::DEBUG),
+    );
+    let _guard = set_default_in_current_thread(subscriber);
+
+    let result = start_consumer_named_with_spawn(
+        session_name.clone(),
+        std::time::Duration::from_secs(60),
+        |_tick| {},
+        |_builder, _body| Err(std::io::Error::other("synthetic spawn failure")),
+    );
+    assert!(
+        matches!(result, Err(EtwError::ThreadSpawn(_))),
+        "a spawn failure must still surface as ThreadSpawn: {result:?}"
+    );
+
+    let after = query_session_stats(&session_name, "live");
+    assert!(
+        after.is_err(),
+        "the session must be gone once the spawn-failure cleanup has run: {after:?}"
+    );
+
+    let output = writer.snapshot_string();
+    assert!(
+        output.contains("etw: session already stopped"),
+        "drop(trace) must run before the by-name STOP backstop, so the backstop finds the \
+         session already stopped by ferrisetw's own `Drop` -- got:\n{output}"
+    );
+    assert!(
+        !output.contains("etw: stopped session by name"),
+        "the by-name STOP must be a no-op backstop here, not the call that actually stopped a \
+         still-live session -- that would mean the ordering was inverted -- got:\n{output}"
+    );
+}

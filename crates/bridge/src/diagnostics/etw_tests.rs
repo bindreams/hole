@@ -777,13 +777,33 @@ fn other_stop_failures_are_not_read_as_already_stopped() {
 /// the session was not reclaimed, and it must say so at `warn!` — the one
 /// consequence `Drop`'s `if session_reclaimed { join } else { abandon }`
 /// split exists for. No real ETW session or admin privilege is needed to
-/// reach the `false` arm deterministically: `session_name` carries an
+/// reach the `false` arm deterministically: this test builds the `EtwGuard`
+/// with `trace: None` directly, so `stop_session`'s `self.trace.take()`
+/// takes its `None => false` arm without ever calling `trace.stop()`, and
+/// falls through to `stop_session_by_name`. `session_name` carries an
 /// interior NUL, so `ferrisetw::trace::stop_trace_by_name`'s
 /// `U16CString::from_str` fails before any Win32 call is made, returning
 /// `TraceError::InvalidTraceName` — which `is_session_not_found` reads as
 /// `false` (pinned by `other_stop_failures_are_not_read_as_already_stopped`
 /// above), so `stop_session` reports the session as not reclaimed every
 /// time.
+///
+/// What this does NOT pin: every real `EtwGuard` is constructed with
+/// `trace: Some(trace)` (`start_consumer_named`), so production only ever
+/// takes `stop_session`'s `Some(trace) => match trace.stop() { Err(e) => ...
+/// }` arm — the arm this test's `None` short-circuit skips entirely. No
+/// test in this suite drives that arm's `Err` case together with a by-name
+/// STOP that *also* fails as anything other than "already stopped" (the
+/// closest, `etw_guard_drop_falls_back_to_the_by_name_stop_when_usertrace_stop_errs`
+/// in `etw_live_privileged_tests.rs`, forces a real `trace.stop()` `Err` but
+/// its by-name backstop then succeeds, so `session_reclaimed` ends up `true`
+/// and `Drop` joins rather than abandons). Forcing that combination
+/// deterministically needs the by-name STOP to fail with something other
+/// than "session not found" against a still-live session — e.g. an
+/// access-denied condition — which is not reachable without mutating the
+/// test process's own privilege level mid-run. A regression that changed
+/// `Some(trace) => Err(e) => false` to `true` would therefore be caught by
+/// no test, unit or privileged.
 ///
 /// `thread` is a real, spawned OS thread parked on a channel this test
 /// itself controls and never signals until after `drop` below returns. This

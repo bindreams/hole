@@ -364,22 +364,18 @@ impl Drop for EtwGuard {
                     warn!(panic = ?e, "etw: processing thread panicked during drop");
                 }
             } else {
-                // `stop_session` returning `false` means only that we failed
-                // to CONFIRM the kernel reclaimed the session -- not that
-                // `process_from_handle` is guaranteed stuck. `CloseTrace`
-                // (one of the two exit conditions MSDN documents for a
-                // real-time consumer) may already have taken effect even
-                // though the STOP issued after it failed, in which case the
-                // processing thread will still return on its own; from here
-                // we cannot tell that case apart from a session genuinely
-                // still live. Either way, detaching an already-finishing
-                // thread costs nothing, so `Drop` abandons it rather than
-                // risk blocking shutdown forever on a join that might never
-                // return.
+                // `stop_session` returned `false` -- see its doc for what
+                // that guarantees and doesn't. Abandoning here is not free:
+                // it forfeits the drain-on-drop guarantee (module doc,
+                // "Drain on Drop") for whatever the processing thread still
+                // has queued, and that loss is accepted only because a join
+                // with no remaining exit condition would hang shutdown
+                // forever (#978).
                 warn!(
                     session = %self.session_name,
                     "etw: kernel did not confirm the session was stopped; abandoning the \
-                     processing thread instead of joining it"
+                     processing thread instead of joining it -- events still queued in the \
+                     callback may be lost from this log"
                 );
             }
         }
@@ -538,6 +534,27 @@ fn start_consumer_named(
     interval: Duration,
     on_tick: impl FnMut(u32) + Send + 'static,
 ) -> Result<EtwGuard, EtwError> {
+    start_consumer_named_with_spawn(session_name, interval, on_tick, |builder, body| builder.spawn(body))
+}
+
+/// Same as [`start_consumer_named`], with the processing-thread spawn call
+/// itself substitutable. Production goes through `start_consumer_named`,
+/// which fills `spawn_processor` with `std::thread::Builder::spawn`; a test
+/// fills it with a closure that returns `Err`, so it can drive
+/// `start_consumer_named`'s own thread-spawn failure arm — the `drop(trace)`
+/// ordering plus [`abandon_session_on_thread_spawn_failure`] below — at the
+/// real call site, rather than calling `abandon_session_on_thread_spawn_failure`
+/// directly (see [`thread_spawn_failure_stops_the_orphaned_session`]'s doc
+/// comment for why that alone doesn't pin this call site).
+fn start_consumer_named_with_spawn(
+    session_name: String,
+    interval: Duration,
+    on_tick: impl FnMut(u32) + Send + 'static,
+    spawn_processor: impl FnOnce(
+        std::thread::Builder,
+        Box<dyn FnOnce() + Send + 'static>,
+    ) -> std::io::Result<JoinHandle<()>>,
+) -> Result<EtwGuard, EtwError> {
     let bridge_pid = std::process::id();
     // Captured once and propagated into both spawned threads below via
     // `tracing::dispatcher::with_default`: `tracing::subscriber::set_default`
@@ -593,30 +610,35 @@ fn start_consumer_named(
         .map_err(EtwError::SessionStart)?;
 
     let processor_dispatch = dispatch.clone();
-    let thread = match std::thread::Builder::new()
-        .name("hole-bridge-etw-processor".into())
-        .spawn(move || {
-            tracing::dispatcher::with_default(&processor_dispatch, || {
-                if let Err(e) = UserTrace::process_from_handle(handle) {
-                    // `process_from_handle` returns when the kernel
-                    // acknowledges STOP — which is the normal shutdown path,
-                    // but may also carry an Err if the session was already
-                    // dead. Log and exit; the guard's Drop handles user-
-                    // visible cleanup.
-                    debug!(error = ?e, "etw: processing thread exiting");
-                }
-            });
-        }) {
+    let processor_body: Box<dyn FnOnce() + Send + 'static> = Box::new(move || {
+        tracing::dispatcher::with_default(&processor_dispatch, || {
+            if let Err(e) = UserTrace::process_from_handle(handle) {
+                // `process_from_handle` returns when the kernel
+                // acknowledges STOP — which is the normal shutdown path,
+                // but may also carry an Err if the session was already
+                // dead. Log and exit; the guard's Drop handles user-
+                // visible cleanup.
+                debug!(error = ?e, "etw: processing thread exiting");
+            }
+        });
+    });
+    let thread = match spawn_processor(
+        std::thread::Builder::new().name("hole-bridge-etw-processor".into()),
+        processor_body,
+    ) {
         Ok(t) => t,
         Err(e) => {
-            // Drop `trace` (attempts 1+2: ferrisetw's own `Drop for
-            // UserTrace` runs close+STOP, discarding any error) BEFORE
-            // calling the helper below (attempt 3: our by-name STOP
-            // backstop) -- not after. `trace` is a live local here, so
-            // without this explicit drop it would instead fall at the end
-            // of this `match` arm's containing statement, i.e. AFTER the
-            // helper call, inverting the module doc's "third attempt"
-            // ordering (see "Drain on Drop" above) for this one error path.
+            // Drop `trace` BEFORE calling the helper below. On this path
+            // `UserTrace::stop` is never called, so this `drop(trace)` runs
+            // ferrisetw's own `Drop for UserTrace` (close+STOP, discarding
+            // any error) — this path's only close+STOP attempt — and the
+            // helper's by-name STOP is the second and last. `trace` is a
+            // live local here, so without this explicit drop it would
+            // instead fall at the end of this `match` arm's containing
+            // statement, i.e. AFTER the helper call, which would make the
+            // by-name STOP run against a session ferrisetw's own `Drop`
+            // hasn't yet had a chance to stop, instead of staying the final
+            // attempt (see "Drain on Drop" above).
             drop(trace);
             return Err(abandon_session_on_thread_spawn_failure(&session_name, e));
         }
