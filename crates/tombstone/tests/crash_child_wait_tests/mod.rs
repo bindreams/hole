@@ -23,14 +23,12 @@ fn spawn_double(env_var: &str) -> std::process::Child {
 #[skuld::test]
 fn wait_bounded_returns_promptly_when_child_exits() {
     let child = spawn_double("TOMBSTONE_TEST_EXIT_FAST");
-    // Generous bound relative to an immediate `return` — this asserts the
-    // HAPPY path returns via that immediate exit, not via a bug that always
-    // sleeps the full bound before checking. We assert only on the returned
-    // `Output`, not on wall-clock elapsed time: a hard elapsed-time ceiling
-    // here would be a scheduling assertion on shared CI hardware, not a
-    // regression signal. `status.success()` already tells the two paths
-    // apart — a `wait_bounded` that fell through to its SIGKILL arm would
-    // report a killed, non-success status instead.
+    // Generous bound relative to an immediate `return`. We assert only on
+    // the returned `Output`, not on wall-clock elapsed time: a hard
+    // elapsed-time ceiling here would be a scheduling assertion on shared CI
+    // hardware, not a regression signal. `status.success()` already tells
+    // the two paths apart — a `wait_bounded` that fell through to its
+    // SIGKILL arm would report a killed, non-success status instead.
     let bound = Duration::from_secs(10);
     let output = wait_bounded(child, bound);
     assert!(output.status.success(), "status: {:?}", output.status);

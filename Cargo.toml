@@ -69,7 +69,7 @@ sadness-generator = "0.7"
 # used to precisely identify the SIGABRT-relay exception signature in
 # tombstone's crash.rs, instead of magic numbers. Already resolved
 # transitively via crash-handler/crash-context on macOS; pinned directly
-# because tombstone names its constants explicitly. See bindreams/hole#842.
+# because tombstone names its constants explicitly.
 mach2 = "0.4"
 
 [workspace.lints.clippy]

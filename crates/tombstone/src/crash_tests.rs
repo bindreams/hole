@@ -192,6 +192,49 @@ async fn sweep_reports_malformed_marker() {
     assert!(!marker.exists(), "malformed marker deleted after report");
 }
 
+// `write_marker_signal_safe`'s `bool` return is what `on_crash` gates the
+// macOS `_exit` bypass on (M7): a marker write that fails must NOT be
+// reported as a success, or the bypass would fire with zero diagnostics on
+// disk. This covers the open-failure half of that contract (a bad marker
+// path). It does NOT cover a failed/short `write(2)` on an otherwise-good
+// fd — there is no clean macOS mechanism (no `/dev/full`) to force that; see
+// the Coverage table entry for the `marker_written &&` gate mutant.
+#[cfg(target_os = "macos")]
+mod write_marker_signal_safe_tests {
+    use crate::crash::{write_marker_signal_safe, HandlerState};
+    use std::os::unix::ffi::OsStrExt;
+
+    fn state_for(path: &std::path::Path) -> HandlerState {
+        let mut marker_path_c: Vec<u8> = path.as_os_str().as_bytes().to_vec();
+        marker_path_c.push(0);
+        HandlerState {
+            kind: "test",
+            marker_path_c,
+        }
+    }
+
+    fn ctx() -> crash_handler::CrashContext {
+        crash_handler::CrashContext {
+            task: 0,
+            thread: 0,
+            handler_thread: 0,
+            exception: None,
+        }
+    }
+
+    #[skuld::test]
+    fn true_on_success_false_on_open_failure() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let good = dir.path().join("crash-test-1.marker");
+        // Under a nonexistent directory: `open(O_CREAT)` fails with ENOENT.
+        let bad = dir.path().join("does-not-exist").join("crash-test-2.marker");
+
+        assert!(write_marker_signal_safe(&state_for(&good), &ctx()));
+        assert!(good.exists(), "the good path was actually written");
+        assert!(!write_marker_signal_safe(&state_for(&bad), &ctx()));
+    }
+}
+
 // `is_macos_sigabrt_relay` identifies the exact synthetic-exception
 // signature crash-handler's SIGABRT sigaction relay produces on macOS:
 // EXC_SOFTWARE / EXC_SOFT_SIGNAL / subcode == SIGABRT. Every field must
