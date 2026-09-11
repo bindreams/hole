@@ -201,3 +201,22 @@ slow-timeout = { period = "20s", terminate-after = 2 }
 [[profile.default.overrides]]
 filter = 'test(/^drop_abandons_the_processing_thread_without_joining_when_the_session_is_not_reclaimed$/)'
 slow-timeout = { period = "20s", terminate-after = 2 }
+
+# `cargo xtask verify-global-net-state-executed` (bindreams/hole#999) reads
+# this profile's JUnit report to confirm the `global_net_state` group's tests
+# didn't just get *selected* (guard 2, #894) but actually *ran*. The group
+# spans both of `test-hole`'s `SKULD_LABELS` lanes, so it needs one profile
+# per lane instead of this single shared path — see
+# `xtask::global_net_state_conformance` for why.
+[profile.default.junit]
+path = "junit.xml"
+
+# Selected via `NEXTEST_PROFILE=non-tun` / `NEXTEST_PROFILE=tun` rather than a
+# `--profile` flag (see `xtask::ci_nextest_parity::FINGERPRINT_NEUTRAL_ENV`).
+# Both tables are intentionally empty: nextest's profile inheritance falls
+# back to `[profile.default]` for any unset key, so each still gets
+# `junit.path` above and `global_net_state`'s `max-threads = 1` — verified
+# with `cargo nextest show-config test-groups --profile non-tun`.
+[profile.non-tun]
+
+[profile.tun]

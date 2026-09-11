@@ -10988,6 +10988,7 @@ dependencies = [
  "payload-archive",
  "petgraph",
  "png 0.18.1",
+ "roxmltree 0.21.1",
  "serde",
  "serde_json",
  "serde_yml 0.0.13",

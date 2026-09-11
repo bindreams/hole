@@ -20,11 +20,48 @@
 //! nextest.toml name-substring filter; [`set_mismatch`] diffs the two live
 //! listings. [`verify`] orchestrates all four and fails loudly, by exact test
 //! name in both directions, on any divergence.
+//!
+//! Guard 3 (bindreams/hole#999) answers a different question: not "is the
+//! `global_net_state` group's membership correct" (guard 2), but "did the
+//! tests it selected on THIS run actually execute" — closing the gap where a
+//! job that silently ran zero of them would still look green.
+//!
+//! The group is NOT a subset of any one `SKULD_LABELS` lane. Its
+//! `.config/nextest.toml` filter selects by name substring and deliberately
+//! sweeps in unprivileged cases (`release_all_`, `gateway_global_net_state_`)
+//! that carry no `tun` label, so they run in the `"!tun"` step while the
+//! privileged members run in the `"tun"` one. A single nextest profile writes
+//! one JUnit path, each run overwriting the last, so a lone lane's report can
+//! never account for the whole group on its own. ci.yaml instead runs each
+//! lane under its own nextest profile (`non-tun` / `tun`, selected by the
+//! `NEXTEST_PROFILE` env var — an empty profile table inherits
+//! `[profile.default.junit]`'s path and every override, including this
+//! group's `max-threads = 1`, via nextest's own profile-inheritance model),
+//! so each lane's report survives at its own path and hands guard 3 both of
+//! them; [`merge_executed`] merges them back into the one set the job as a
+//! whole executed.
+//!
+//! The expectation is likewise NOT re-derived here. Guard 2's step already
+//! lists the group's live membership *before* the test steps run, and records
+//! it ([`write_expectation`]); guard 3 reads it back ([`read_expectation`]).
+//! Re-listing after the run would cost a second `cargo nextest list` — 64s to
+//! 3m30s measured on the windows leg, which runs closest to its job wall —
+//! and would introduce a second, unverified derivation of the very set guard
+//! 2 exists to pin.
+//!
+//! [`junit_executed_tests`] reads nextest's own JUnit report
+//! (`.config/nextest.toml`'s `[profile.default.junit]`) for the tests that
+//! actually ran (present, un-skipped); [`set_missing`] diffs expectation
+//! against union one-directionally. [`verify_executed`] orchestrates them and
+//! fails loudly, by exact test name, on any test that was selected but never
+//! shows up as executed.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{bail, ensure, Context, Result};
+use roxmltree::Document;
+use serde::{Deserialize, Serialize};
 
 use crate::ci_coverage;
 use crate::manifest::Manifest;
@@ -163,14 +200,88 @@ pub(crate) fn set_mismatch(
     out
 }
 
+// conformant_membership ===============================================================================================
+
+/// Guard 2's pass/fail verdict, reduced to its two live listings so it is
+/// unit-testable without a `cargo nextest list` subprocess. `Ok` only once
+/// (a) at least one side matched something — a vacuous empty/empty pass
+/// would defeat the guard exactly as a real divergence would (bindreams/
+/// hole#865 audit finding 4) — and (b) the two sides agree exactly, binary-id
+/// for binary-id (bindreams/hole#894). Returns `label_matched` back on
+/// success: the exact value [`verify`]'s `--record` branch writes out for
+/// guard 3 (bindreams/hole#999) to read, so any caller holding `Ok` already
+/// has proof its result is not vacuously empty — pinned directly by this
+/// function's own tests, which is the property M5 (bindreams/hole#999) named:
+/// an empty `--record` write would make guard 3's diff trivially pass no
+/// matter what actually ran.
+pub(crate) fn conformant_membership(
+    name_matched: BTreeMap<String, BTreeSet<String>>,
+    label_matched: BTreeMap<String, BTreeSet<String>>,
+    job_id: &str,
+    filter: &str,
+) -> Result<BTreeMap<String, BTreeSet<String>>> {
+    let any_name_matched = name_matched.values().any(|s| !s.is_empty());
+    let any_label_matched = label_matched.values().any(|s| !s.is_empty());
+    ensure!(
+        any_name_matched || any_label_matched,
+        "job {job_id:?}: neither the nextest.toml filter {filter:?} nor the {LABEL_NAME:?} label selected \
+         ANY test — guard 2 has nothing to verify, which defeats it as surely as a real divergence \
+         would (bindreams/hole#894)"
+    );
+
+    let mismatches = set_mismatch(&name_matched, &label_matched);
+    if mismatches.is_empty() {
+        return Ok(label_matched);
+    }
+
+    let mut msg = format!(
+        "job {job_id:?}: the .config/nextest.toml filter {filter:?} and the {LABEL_NAME:?} skuld label \
+         select DIFFERENT tests — a rename or a missing/extra label has drifted the group's \
+         membership (bindreams/hole#894):\n"
+    );
+    for (binary_id, (name_only, label_only)) in &mismatches {
+        msg.push_str(&format!("  {binary_id}:\n"));
+        for name in name_only {
+            msg.push_str(&format!(
+                "    matched by nextest.toml filter, missing the label: {name}\n"
+            ));
+        }
+        for name in label_only {
+            msg.push_str(&format!(
+                "    carries the label, missing from the nextest.toml filter: {name}\n"
+            ));
+        }
+    }
+    bail!(msg)
+}
+
 // verify ==============================================================================================================
 
 /// Run guard 2 for `job_id`: confirm the `global_net_state` test-group's
 /// `max-threads` is still `1`, then confirm its nextest.toml name-substring
-/// filter and its skuld label select the exact same live tests. Fails
-/// loudly, by exact test name in both directions per binary, on any
-/// divergence.
-pub fn verify(repo_root: &Path, job_id: &str) -> Result<()> {
+/// filter and its skuld label select the exact same live tests
+/// ([`conformant_membership`]). Fails loudly, by exact test name in both
+/// directions per binary, on any divergence.
+///
+/// `record` additionally writes the verified membership out for guard 3
+/// ([`verify_executed`]) to read after the test steps have run — see this
+/// module's doc for why guard 3 does not list it again itself. Written only
+/// once the conformance check above has passed, so the file never carries a
+/// set this guard would have rejected.
+pub fn verify(repo_root: &Path, job_id: &str, record: Option<&Path>) -> Result<()> {
+    verify_with(repo_root, job_id, record, run_nextest_list)
+}
+
+/// [`verify`]'s body with its one subprocess call (`cargo nextest list`)
+/// taken as a parameter, so it is unit-testable against a fake `list`
+/// without a real nextest binary — the file reads above it are plain text
+/// (ci.yaml, .config/nextest.toml, build.yaml), cheap to fixture directly.
+pub(crate) fn verify_with(
+    repo_root: &Path,
+    job_id: &str,
+    record: Option<&Path>,
+    list: impl Fn(&Path, &[String], Option<&str>) -> Result<BTreeMap<String, BTreeSet<String>>>,
+) -> Result<()> {
     let ci_yaml = std::fs::read_to_string(repo_root.join(".github/workflows/ci.yaml")).context("read ci.yaml")?;
     let nextest_toml =
         std::fs::read_to_string(repo_root.join(".config/nextest.toml")).context("read .config/nextest.toml")?;
@@ -186,49 +297,209 @@ pub fn verify(repo_root: &Path, job_id: &str) -> Result<()> {
     );
 
     let template = job_list_template(&ci_yaml, &manifest, job_id)?;
-    let name_matched = run_nextest_list(repo_root, &narrow_filter(&template, &cfg.filter)?, None)?;
-    let label_matched = run_nextest_list(repo_root, &template, Some(LABEL_NAME))?;
+    let name_matched = list(repo_root, &narrow_filter(&template, &cfg.filter)?, None)?;
+    let label_matched = list(repo_root, &template, Some(LABEL_NAME))?;
 
-    // A silent empty/empty pass (both sides select nothing everywhere) would
-    // defeat this guard exactly as a zero-match `SKULD_LABELS` does elsewhere
-    // in this codebase (bindreams/hole#865 audit finding 4) — assert real
-    // signal exists before trusting the diff below.
-    let any_name_matched = name_matched.values().any(|s| !s.is_empty());
-    let any_label_matched = label_matched.values().any(|s| !s.is_empty());
+    let label_matched = conformant_membership(name_matched, label_matched, job_id, &cfg.filter)?;
+    println!(
+        "xtask: global_net_state label conformance OK for job {job_id:?} — the nextest.toml \
+         filter and the {LABEL_NAME:?} label select the exact same tests"
+    );
+    if let Some(path) = record {
+        let path = absolutize(repo_root, path);
+        write_expectation(
+            &path,
+            &Expectation {
+                job: job_id.to_string(),
+                tests: label_matched,
+            },
+        )?;
+        println!(
+            "xtask: recorded the group's membership for the execution proof at {}",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+// junit_executed_tests ================================================================================================
+
+/// Per `<testsuite>`'s testcases' `classname` — nextest emits the same
+/// `binary_id` shape here as `cargo nextest list --message-format json`'s
+/// map key (e.g. `hole-bridge::cutover_leak_privileged`), confirmed against
+/// nextest-runner's own JUnit writer — the set of `name`s that appear as
+/// EXECUTED: present in the report and carrying no `<skipped>` child. A
+/// `<failure>` child still counts as executed; only `<skipped>` does not. On
+/// the nextest version pinned by this repo, a test that did not run is simply
+/// ABSENT from the report rather than present with a `<skipped>` child —
+/// confirmed for both filter exclusion and fail-fast cancellation, so absence
+/// is the signal [`set_missing`] actually keys on. The `<skipped>`-child
+/// branch below is not reachable today; it is kept forward-defensive against
+/// a JUnit producer that does emit them, not attributed to any nextest
+/// config key — `[profile.default.junit].report-skipped` is not one; nextest
+/// rejects it as an unrecognized key.
+pub(crate) fn junit_executed_tests(xml: &str) -> Result<BTreeMap<String, BTreeSet<String>>> {
+    let doc = Document::parse(xml).context("parsing JUnit XML report")?;
+
+    let mut out: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for node in doc.descendants().filter(|n| n.has_tag_name("testcase")) {
+        let classname = node
+            .attribute("classname")
+            .context("JUnit report has a <testcase> with no classname attribute")?;
+        let name = node
+            .attribute("name")
+            .context("JUnit report has a <testcase> with no name attribute")?;
+        let skipped = node.children().any(|c| c.is_element() && c.has_tag_name("skipped"));
+        if skipped {
+            continue;
+        }
+        out.entry(classname.to_string()).or_default().insert(name.to_string());
+    }
+    Ok(out)
+}
+
+// set_missing =========================================================================================================
+
+/// Per binary-id, the `expected` tests that `executed` doesn't have — the
+/// one-directional counterpart of [`set_mismatch`]: `executed` may
+/// legitimately be a superset (other labels ran in the same job), only
+/// "selected but never ran" is a finding here.
+pub(crate) fn set_missing(
+    expected: &BTreeMap<String, BTreeSet<String>>,
+    executed: &BTreeMap<String, BTreeSet<String>>,
+) -> BTreeMap<String, BTreeSet<String>> {
+    let empty = BTreeSet::new();
+    let mut out = BTreeMap::new();
+    for (binary_id, names) in expected {
+        let ran = executed.get(binary_id).unwrap_or(&empty);
+        let missing: BTreeSet<String> = names.difference(ran).cloned().collect();
+        if !missing.is_empty() {
+            out.insert(binary_id.clone(), missing);
+        }
+    }
+    out
+}
+
+// merge_executed ======================================================================================================
+
+/// Every test any lane's report says executed, merged per binary-id. The
+/// group spans both `SKULD_LABELS` lanes, so this — not any single report —
+/// is what the expectation is diffed against.
+pub(crate) fn merge_executed(reports: &[BTreeMap<String, BTreeSet<String>>]) -> BTreeMap<String, BTreeSet<String>> {
+    let mut out: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for report in reports {
+        for (binary_id, names) in report {
+            out.entry(binary_id.clone()).or_default().extend(names.iter().cloned());
+        }
+    }
+    out
+}
+
+// Recorded expectation ================================================================================================
+
+/// The `global_net_state` group's live membership as guard 2 verified it,
+/// handed across ci.yaml steps to guard 3.
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct Expectation {
+    /// The ci.yaml job the listing was taken for — carried so guard 3's
+    /// messages can name it without re-reading ci.yaml.
+    pub job: String,
+    /// Per binary-id, the test names the group contains.
+    pub tests: BTreeMap<String, BTreeSet<String>>,
+}
+
+/// `path` if absolute, else resolved against `repo_root`.
+fn absolutize(repo_root: &Path, path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        repo_root.join(path)
+    }
+}
+
+pub(crate) fn write_expectation(path: &Path, expectation: &Expectation) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+    }
+    let json = serde_json::to_string_pretty(expectation).context("serializing the recorded expectation")?;
+    std::fs::write(path, json).with_context(|| format!("writing the recorded expectation to {}", path.display()))
+}
+
+pub(crate) fn read_expectation(path: &Path) -> Result<Expectation> {
+    let json = std::fs::read_to_string(path).with_context(|| {
+        format!(
+            "reading the recorded {LABEL_NAME} expectation at {} — it is written by \
+             `cargo xtask verify-global-net-state-labels --record`, which must run (and pass) \
+             earlier in the same job",
+            path.display()
+        )
+    })?;
+    serde_json::from_str(&json).with_context(|| format!("parsing the recorded expectation at {}", path.display()))
+}
+
+// verify_executed =====================================================================================================
+
+/// Run guard 3: read the `global_net_state` membership guard 2 recorded
+/// before the test steps ran, then confirm every one of those tests appears
+/// as executed (non-skipped) in at least one of `junit_paths` — the per-lane
+/// JUnit reports each lane's own nextest profile wrote (see this module's
+/// doc). Paths are resolved against `repo_root` when relative. Fails loudly,
+/// by exact test name, on any that don't: proof the job didn't just SELECT
+/// these tests but actually RAN them.
+pub fn verify_executed(repo_root: &Path, expected_path: &Path, junit_paths: &[PathBuf]) -> Result<()> {
     ensure!(
-        any_name_matched || any_label_matched,
-        "job {job_id:?}: neither the nextest.toml filter {:?} nor the {LABEL_NAME:?} label selected \
-         ANY test — guard 2 has nothing to verify, which defeats it as surely as a real divergence \
-         would (bindreams/hole#894)",
-        cfg.filter
+        !junit_paths.is_empty(),
+        "guard 3 needs at least one --junit report to read; with none it would confirm nothing \
+         (bindreams/hole#999)"
     );
 
-    let mismatches = set_mismatch(&name_matched, &label_matched);
-    if mismatches.is_empty() {
+    let expectation = read_expectation(&absolutize(repo_root, expected_path))?;
+    let job_id = &expectation.job;
+
+    // Same defense as guard 2 (bindreams/hole#865 audit finding 4): a
+    // vacuously-empty expectation would make an all-zero JUnit report pass
+    // just as cleanly as a real one.
+    ensure!(
+        expectation.tests.values().any(|s| !s.is_empty()),
+        "job {job_id:?}: the recorded {LABEL_NAME:?} membership is EMPTY — guard 3 has nothing to confirm \
+         actually ran, which defeats it as surely as a real execution gap would (bindreams/hole#999)"
+    );
+
+    let mut reports = Vec::new();
+    for junit_path in junit_paths {
+        let junit_abs = absolutize(repo_root, junit_path);
+        let junit_xml = std::fs::read_to_string(&junit_abs)
+            .with_context(|| format!("reading JUnit report at {}", junit_abs.display()))?;
+        reports.push(junit_executed_tests(&junit_xml)?);
+    }
+    let executed = merge_executed(&reports);
+
+    let missing = set_missing(&expectation.tests, &executed);
+    if missing.is_empty() {
+        let total: usize = expectation.tests.values().map(BTreeSet::len).sum();
         println!(
-            "xtask: global_net_state label conformance OK for job {job_id:?} — the nextest.toml \
-             filter and the {LABEL_NAME:?} label select the exact same tests"
+            "xtask: global_net_state execution proof OK for job {job_id:?} — all {total} {LABEL_NAME:?} test(s) \
+             appear as executed (non-skipped) across {} lane report(s)",
+            junit_paths.len()
         );
         return Ok(());
     }
 
+    let missing_count: usize = missing.values().map(BTreeSet::len).sum();
     let mut msg = format!(
-        "job {job_id:?}: the .config/nextest.toml filter {:?} and the {LABEL_NAME:?} skuld label \
-         select DIFFERENT tests — a rename or a missing/extra label has drifted the group's \
-         membership (bindreams/hole#894):\n",
-        cfg.filter
+        "job {job_id:?}: {missing_count} {LABEL_NAME:?} test(s) were selected but do NOT appear as executed \
+         (non-skipped) in any of this job's lane JUnit reports ({}) — a green job that silently ran zero (or \
+         fewer than expected) of these tests (bindreams/hole#999):\n",
+        junit_paths
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
     );
-    for (binary_id, (name_only, label_only)) in &mismatches {
+    for (binary_id, names) in &missing {
         msg.push_str(&format!("  {binary_id}:\n"));
-        for name in name_only {
-            msg.push_str(&format!(
-                "    matched by nextest.toml filter, missing the label: {name}\n"
-            ));
-        }
-        for name in label_only {
-            msg.push_str(&format!(
-                "    carries the label, missing from the nextest.toml filter: {name}\n"
-            ));
+        for name in names {
+            msg.push_str(&format!("    {name}\n"));
         }
     }
     bail!(msg)
