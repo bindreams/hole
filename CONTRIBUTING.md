@@ -1552,10 +1552,16 @@ because an allocating callback was directly observed to deadlock against a
 Mach-suspended thread. It is a decision, not a gap: do not restore either
 half without reading `crates/tombstone/src/crash.rs`'s module doc, which is
 the canonical record (mechanism, the `sample(1)` evidence, the alternatives
-already built and measured, and what would legitimately reopen it). A hung
-bridge still holds the TUN device and its routes and never reaches its own
-cleanup, so a lost `.ips` is much the cheaper loss; unclean shutdown is
-detected by the `bridge-*.json` state files regardless.
+already built and measured, and what would legitimately reopen it). Two
+source-scanning guards in `crash_tests.rs` hold that callback's shape —
+`macos_on_crash_terminates_unconditionally` (no cfg, feature or `kind` to
+branch on) and `macos_on_crash_calls_nothing_that_can_allocate` (nothing but
+the marker write and the `_exit`); the second exists because the deadlock
+needs CI-like allocation pressure, so the runtime `crash_marker_*` tests stay
+green on an allocating callback. A hung bridge still holds the TUN device and
+its routes and never reaches its own cleanup, so a lost `.ips` is much the
+cheaper loss; unclean shutdown is detected by the `bridge-*.json` state files
+regardless.
 
 `tombstone::sweep(log_dir)` runs at the next start of the same kind, emits a
 `tracing::error!(target: "crash", …)`, and deletes the marker. Markers land in

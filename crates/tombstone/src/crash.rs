@@ -54,7 +54,7 @@
 //! three. The allocator deadlock is the only explanation that was ever seen
 //! rather than argued.
 //!
-//! ## Both obvious alternatives were built and measured
+//! ## Three alternatives were built and measured
 //!
 //! - **Detach inside the callback, then let the OS reporter run.** Hangs,
 //!   2/2. `call_user_callback` holds `HANDLER.read()` across `on_crash` and
@@ -66,15 +66,27 @@
 //!   without its lock. Measured to earn nothing: with the ports restored the
 //!   abort class terminates exactly as it does without them (3/3), and a
 //!   fault raised inside `on_crash` hangs either way (2/2 with, 2/2 without).
+//! - **Stop allocating but keep returning `Handled(false)`** — the
+//!   `cfg(windows)` gate on `write_minidump_best_effort` WITHOUT the `_exit`,
+//!   which would keep the `.ips`. 20/20 clean terminations, all under 0.41s,
+//!   and nothing has falsified it — but on an idle darwin/arm64, carrying
+//!   none of the allocation pressure the deadlock needs, so it says nothing
+//!   yet about darwin/amd64 under CI load. `_exit` is preferred for a reason
+//!   independent of the allocator: returning hands control back to a process
+//!   whose handler is still installed (the `SignalCrash` relay branch never
+//!   detaches — `on_crash`'s comment has the detail), and the system
+//!   reporter's runtime is not something this process can bound.
 //!
 //! ## What would reopen this
 //!
-//! A minidump path that is signal-safe and allocation-free end to end:
-//! buffers reserved at `attach` time, the dump fd opened there too, and a
-//! writer that touches neither the allocator nor a lock. That removes the
-//! reason, and the decision should be revisited on it. Nothing short of it
-//! qualifies — the ruling is about hanging at all, so a change that only
-//! makes the deadlock rarer does not reopen anything.
+//! Two candidates. The clean one is a minidump path that is signal-safe and
+//! allocation-free end to end — buffers reserved at `attach` time, the dump
+//! fd opened there too, a writer touching neither the allocator nor a lock —
+//! which removes the reason outright. The cheap one is the third alternative
+//! above, the option measurement currently favours; reopening on it means
+//! answering the unbounded-return argument, not just re-running the 20.
+//! Neither is reopened by a change that merely makes the deadlock rarer: the
+//! ruling is about hanging at all.
 
 use std::path::Path;
 use std::sync::OnceLock;
@@ -590,11 +602,13 @@ fn terminate_without_returning() -> ! {
 //  * The system crash reporter's involvement is not something this process
 //    can bound at all.
 //
-// The two alternatives to `_exit` that suggest themselves — detach from
-// inside the callback and let the reporter run, or restore the task
-// exception ports by hand — were both built and measured. The first hangs
-// on crash-handler's own lock, the second changes nothing. Module doc has
-// the measurements; do not re-derive them here.
+// Three alternatives to `_exit` were built and measured: detach from inside
+// the callback and let the reporter run (hangs on crash-handler's own lock),
+// restore the task exception ports by hand (changes nothing), and merely
+// stop allocating while still returning `Handled(false)` (20/20 clean, but
+// on an idle machine, and it leaves everything listed above unbounded).
+// Module doc has the measurements and their caveats; do not re-derive them
+// here.
 //
 // MEASURED, 3 runs each of abort, segfault, stack_overflow, bus,
 // illegal_instruction and trap on darwin/arm64: every one exits 70 in under

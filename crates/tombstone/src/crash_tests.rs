@@ -237,6 +237,100 @@ mod write_marker_signal_safe_tests {
     }
 }
 
+// macOS `on_crash` structural guards ==================================================================================
+
+/// The macOS `CrashEvent` impl's source text, comment lines removed.
+///
+/// Comments go first because this module's prose names, by name, every
+/// symbol the guards below look for — a guard that fires on documentation
+/// alone is one that gets deleted rather than obeyed. Crude on purpose, same
+/// as `bridge::reconciler_tests::code_lines`: it must never hide real code.
+#[cfg(target_os = "macos")]
+fn macos_on_crash_impl() -> String {
+    let src = include_str!("crash.rs");
+    let start = src
+        .find("#[cfg(target_os = \"macos\")]\nunsafe impl crash_handler::CrashEvent for MarkerCrashEvent {")
+        .expect("macOS CrashEvent impl present (did the attribute or impl header change?)");
+    let body = &src[start..];
+    let end = body.find("\n}\n").expect("impl is brace-terminated") + 3;
+    body[..end]
+        .lines()
+        .filter(|l| {
+            let t = l.trim_start();
+            !t.starts_with("//") && !t.starts_with("/*")
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Remove attribute spans (`#[…]`, bracket-nesting aware) so `#[cfg(…)]`
+/// does not read as a call to `cfg`. WHICH attributes may be there at all is
+/// the guard above's question, not this one's.
+#[cfg(target_os = "macos")]
+fn strip_attributes(src: &str) -> String {
+    let b = src.as_bytes();
+    let mut out = String::with_capacity(src.len());
+    let (mut kept_from, mut i) = (0usize, 0usize);
+    while i < b.len() {
+        if !(b[i] == b'#' && b.get(i + 1) == Some(&b'[')) {
+            i += 1;
+            continue;
+        }
+        out.push_str(&src[kept_from..i]);
+        i += 1; // now at the opening '['
+        let mut depth = 0usize;
+        while i < b.len() {
+            match b[i] {
+                b'[' => depth += 1,
+                b']' => depth -= 1,
+                _ => {}
+            }
+            i += 1;
+            if depth == 0 {
+                break;
+            }
+        }
+        kept_from = i;
+    }
+    out.push_str(&src[kept_from..]);
+    out
+}
+
+/// Every call-shaped name in `src`: an identifier — optionally a macro,
+/// `ident!` — immediately followed by `(`, `[` or `{`. A free function, a
+/// method (`.to_vec()`), an associated fn (`PathBuf::from(…)`), a
+/// constructor and a macro all reduce to their last path segment, which is
+/// the level the allowlist is written at.
+#[cfg(target_os = "macos")]
+fn call_names(src: &str) -> Vec<String> {
+    fn is_ident(c: u8) -> bool {
+        c.is_ascii_alphanumeric() || c == b'_'
+    }
+    let b = src.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i < b.len() {
+        if !is_ident(b[i]) {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < b.len() && is_ident(b[i]) {
+            i += 1;
+        }
+        let mut name = src[start..i].to_string();
+        let mut j = i;
+        if b.get(j) == Some(&b'!') {
+            name.push('!');
+            j += 1;
+        }
+        if matches!(b.get(j), Some(b'(') | Some(b'[') | Some(b'{')) {
+            out.push(name);
+        }
+    }
+    out
+}
+
 // The macOS `on_crash` must terminate the process for EVERY crash, in EVERY
 // binary that links tombstone. `tests/crash_child.rs` pins "every fault
 // class" and "every attach kind" by crashing real children, but it cannot
@@ -253,13 +347,8 @@ mod write_marker_signal_safe_tests {
 #[cfg(target_os = "macos")]
 #[skuld::test]
 fn macos_on_crash_terminates_unconditionally() {
-    let src = include_str!("crash.rs");
-    let start = src
-        .find("#[cfg(target_os = \"macos\")]\nunsafe impl crash_handler::CrashEvent for MarkerCrashEvent {")
-        .expect("macOS CrashEvent impl present (did the attribute or impl header change?)");
-    let body = &src[start..];
-    let end = body.find("\n}\n").expect("impl is brace-terminated") + 3;
-    let body = &body[..end];
+    let body = macos_on_crash_impl();
+    let body = body.as_str();
 
     // One `cfg` only: the `target_os = "macos"` attribute this match started
     // at. Anything else is a build-dependent termination.
@@ -280,6 +369,59 @@ fn macos_on_crash_terminates_unconditionally() {
     assert!(
         body.contains("terminate_without_returning()"),
         "macOS on_crash must end by terminating: {body}"
+    );
+}
+
+// The macOS `on_crash` must not ALLOCATE — the cause of the #842 hang, and
+// the one property this PR's `_exit` does NOT by itself provide. A thread
+// Mach-suspended inside `malloc` never releases the allocator lock, so an
+// allocation on the handler thread can block forever: measured 8 hangs in 10
+// (module doc, "Why the callback cannot allocate").
+//
+// No behavioural test can stand in for this. The hang needs CI-like
+// allocation pressure; the allocating branch ran 15/15 green on an idle
+// darwin/arm64 and passes every `crash_marker_*` test in
+// `tests/crash_child.rs`, so a straight revert of the `cfg(windows)` gate on
+// `write_minidump_best_effort` would land silently. Hence a structural
+// guard: the body may CALL nothing but the two functions whose
+// allocation-freedom is itself established — `write_marker_signal_safe`
+// (pre-encoded path, stack buffer, raw open/write/close) and
+// `terminate_without_returning` (a bare `_exit` syscall).
+//
+// Deliberately strict: a new call of ANY shape fails, because every
+// allocation this crate ever put on the handler path arrived as one
+// (`write_minidump_best_effort`'s `PathBuf`, `File::create`'s `CString`,
+// `MinidumpWriter`'s buffers). Widening the allowlist is how a deliberate
+// change gets recorded.
+#[cfg(target_os = "macos")]
+#[skuld::test]
+fn macos_on_crash_calls_nothing_that_can_allocate() {
+    const ALLOWED: [&str; 3] = [
+        // The impl's own fn header, not a call.
+        "on_crash",
+        "write_marker_signal_safe",
+        "terminate_without_returning",
+    ];
+
+    let body = macos_on_crash_impl();
+    let names = call_names(&strip_attributes(&body));
+
+    // Anti-vacuity: a broken extraction yields an empty scan, which would
+    // pass the real assertion below while checking nothing.
+    for expected in ["write_marker_signal_safe", "terminate_without_returning"] {
+        assert!(
+            names.iter().any(|n| n == expected),
+            "extraction is broken — the guard must SEE the calls it permits, \
+             else it passes vacuously. Missing {expected:?} in {names:?}\n{body}"
+        );
+    }
+
+    let offenders: Vec<&String> = names.iter().filter(|n| !ALLOWED.contains(&n.as_str())).collect();
+    assert!(
+        offenders.is_empty(),
+        "macOS on_crash must call nothing but {ALLOWED:?}: allocating on the handler thread \
+         deadlocks against a Mach-suspended thread holding the malloc lock (crash.rs module \
+         doc). Offending calls: {offenders:?}\n{body}"
     );
 }
 

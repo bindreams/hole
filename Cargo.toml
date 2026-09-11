@@ -64,11 +64,6 @@ crash-handler = "0.7"
 crash-context = "0.6"
 minidump-writer = "0.12"
 sadness-generator = "0.7"
-# macOS-only named Mach exception constants (EXC_SOFTWARE, EXC_SOFT_SIGNAL).
-# Also has NO member consumer since #842: they identified the SIGABRT-relay
-# signature, and tombstone's macOS `on_crash` no longer discriminates by
-# fault class. Resolved transitively via crash-handler on macOS regardless.
-mach2 = "0.4"
 
 [workspace.lints.clippy]
 disallowed_methods = "deny"
