@@ -25,24 +25,56 @@ fn ruleset_blocks_all_outbound() {
     );
 }
 
+/// Every lo0 `pass` line in `r`, by direction, asserting each is `quick` and
+/// `no state`. Shared by the transient and the lockdown builder's case so the
+/// two-exemption rule (see [`loopback_is_exempted_twice_over`]) has one
+/// statement, not two that can drift.
+fn assert_stateless_loopback_passes(r: &str) {
+    let lo_passes: Vec<&str> = r
+        .lines()
+        .filter(|l| l.trim_start().starts_with("pass") && l.contains("lo0"))
+        .collect();
+    for dir in ["out", "in"] {
+        let rule = lo_passes
+            .iter()
+            .find(|l| l.trim_start().starts_with(&format!("pass {dir} ")))
+            .unwrap_or_else(|| panic!("no `pass {dir}` rule on lo0 — loopback is unprotected across the next load's skip-flag-clear window:\n{r}"));
+        assert!(rule.contains("quick"), "lo0 pass must be quick: {rule}");
+        assert!(
+            rule.contains("no state"),
+            "a lo0 pass WITHOUT `no state` is defaulted to `flags S/SA keep state` by pfctl, so it \
+             matches only a SYN and creates an entry the state purge flushes — it cannot carry a \
+             mid-stream segment: {rule}"
+        );
+    }
+}
+
+/// Loopback needs BOTH exemptions, because they cover two different failures.
+///
+/// `set skip on lo0` is the steady-state one: it passes loopback "as if pf was
+/// disabled", with no state entry for this cover's own `pfctl -F states` purge
+/// (`purges_state(Transient) == true`) to flush.
+///
+/// The `pass` rules cover the window `set skip` cannot cover for itself.
+/// `pfctl` clears every interface's skip flag in `main()` — BEFORE it parses
+/// and BEFORE `DIOCXBEGIN` — so from that clear until this ruleset's own
+/// `set skip` ioctl lands, lo0 is filtered again while the PREVIOUS ruleset is
+/// still the authoritative one. Rules live inside the ticket and stay
+/// authoritative to `DIOCXCOMMIT`, so it is the lo0 `pass` in the OUTGOING
+/// ruleset that carries loopback across the next load's flag-clear window — on
+/// a cover transition, on the `/etc/pf.conf` restore, and on lockdown
+/// engage/disengage alike.
+///
+/// `no state` is load-bearing: `pfctl -vn -f -` normalizes a bare
+/// `pass out quick on lo0 all` to `... flags S/SA keep state`, which matches
+/// only a SYN. A mid-stream segment would fall through to the block and be
+/// silently discarded under `block-policy drop` — bindreams/hole#1015 again, by
+/// a different route.
 #[skuld::test]
-fn ruleset_skips_loopback_rather_than_passing_it() {
-    // `set skip on lo0` exempts loopback from filtering wholesale, so a
-    // loopback packet needs no state entry. A `pass` rule would need one: pf
-    // applies `flags S/SA` by default, so only a SYN creates state. After this
-    // cover's own `pfctl -F states` purge (`purges_state(Transient) == true`) a
-    // mid-stream loopback segment would match no state, fail the SYN-only
-    // pass, fall through to `block out all`, and be silently discarded under
-    // `set block-policy drop` — severing every established local TCP session
-    // on the host, on every covered start.
+fn loopback_is_exempted_twice_over() {
     let r = build_pf_ruleset(v4(), None);
     assert!(r.contains("set skip on lo0"), "transient cover must skip lo0:\n{r}");
-    assert!(
-        !r.lines()
-            .any(|l| l.trim_start().starts_with("pass") && l.contains("lo0")),
-        "a lo0 `pass` rule is state-bearing and cannot survive this cover's own state purge — \
-         `set skip` is what replaces it:\n{r}"
-    );
+    assert_stateless_loopback_passes(&r);
 }
 
 #[skuld::test]
@@ -361,10 +393,29 @@ fn lockdown_main_passes_server_ip_over_tcp() {
 }
 
 #[skuld::test]
-fn lockdown_main_skips_loopback() {
-    // `set skip on lo0` exempts loopback from filtering wholesale.
+fn lockdown_main_exempts_loopback_twice_over() {
+    // Same two-exemption rule as the transient cover — see
+    // [`loopback_is_exempted_twice_over`]. The lockdown ruleset engages and
+    // disengages over a still-live blocking ruleset just as the transient one
+    // does, so its skip-flag-clear window is the same window.
     let r = lockdown(v4(), "");
     assert!(r.contains("set skip on lo0"), "lockdown main must skip lo0:\n{r}");
+    assert_stateless_loopback_passes(&r);
+}
+
+#[skuld::test]
+fn lockdown_main_passes_loopback_before_it_blocks_inet6() {
+    // `block drop out quick inet6 all` is `quick`, so it would terminate
+    // evaluation on a `::1` packet before any later lo0 pass could match. The
+    // lo0 passes are only an exemption if they LEAD it.
+    let r = lockdown(v4(), "");
+    let lo = r.find("pass out quick on lo0").expect("lo0 pass out rule");
+    let inet6 = r.find("block drop out quick inet6 all").expect("inet6 block");
+    assert!(
+        lo < inet6,
+        "lo0 must be passed before the quick inet6 block, or ::1 is dropped during the \
+         skip-flag-clear window:\n{r}"
+    );
 }
 
 #[skuld::test]
@@ -525,6 +576,106 @@ fn release_all_restore_confirmed_requires_a_successful_exit_status() {
         false,
         &Err(RoutingError::RouteSetup("spawn failed".into()))
     ));
+}
+
+// recover_cover_with ==================================================================================================
+
+/// [`RecoverOps`] test double: records the token each `restore` was handed
+/// (`None` = "no token on record"), so what the sweep DOES is assertable, not
+/// merely that it did something.
+#[derive(Default)]
+struct RecordingRecoverOps {
+    restores: Vec<(Option<String>, bool)>,
+}
+
+impl RecoverOps for RecordingRecoverOps {
+    fn restore(&mut self, token: Option<&str>, adopting: bool) {
+        self.restores.push((token.map(str::to_owned), adopting));
+    }
+}
+
+/// A record whose `pf_was_enabled` is the tri-state `None` a failed
+/// `pfctl -s info` read persists — the exact shape an older binary cannot
+/// parse.
+fn unknown_pf_cover(token: &str) -> state::FailClosedState {
+    state::FailClosedState {
+        version: state::SCHEMA_VERSION,
+        pf_token: token.to_owned(),
+        pf_was_enabled: None,
+    }
+}
+
+#[skuld::test]
+fn recover_cover_with_no_state_file_does_nothing() {
+    let mut ops = RecordingRecoverOps::default();
+    recover_cover_with(StateFile::Absent, false, &mut ops);
+    assert!(
+        ops.restores.is_empty(),
+        "an absent file means no cover was ever engaged; a sweep must spawn nothing: {:?}",
+        ops.restores
+    );
+}
+
+#[skuld::test]
+fn recover_cover_with_a_recorded_cover_restores_and_drops_its_token() {
+    let mut ops = RecordingRecoverOps::default();
+    recover_cover_with(StateFile::Present(unknown_pf_cover("42")), true, &mut ops);
+    assert_eq!(ops.restores, vec![(Some("42".to_owned()), true)]);
+}
+
+/// An UNREADABLE record is a cover to clear, not an absence.
+///
+/// `Absent` and `Unusable` are opposite facts for a sweep: the first says no
+/// cover was ever engaged, the second is Hole's own unreconciled record that
+/// one WAS and was never confirmed released. The reachable production cause is
+/// a ROLLBACK — a newer bridge persists `"pf_was_enabled": null` for a failed
+/// `pfctl -s info` read, and an older binary's `bool` field cannot read it, so
+/// its whole sweep sees "nothing to recover" while the crashed run's
+/// `block out all` still holds the host. Only the manual `bridge unlock` would
+/// escape it.
+#[skuld::test]
+fn recover_cover_with_an_unreadable_state_file_still_restores_the_host() {
+    let mut ops = RecordingRecoverOps::default();
+    recover_cover_with(StateFile::Unusable, false, &mut ops);
+    assert_eq!(
+        ops.restores,
+        vec![(None, false)],
+        "an unreadable failclosed-state file must still drive a restore — with no token to drop, \
+         but never as a no-op"
+    );
+}
+
+/// The rollback payload itself, through the REAL `load_presence`: this is the
+/// byte sequence a newer bridge writes and an older one cannot parse, so the
+/// test pins the actual cause rather than standing in for it with arbitrary
+/// corruption.
+#[skuld::test]
+fn a_null_pf_was_enabled_is_unreadable_to_a_bool_schema_and_reads_as_a_cover() {
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    #[allow(dead_code)]
+    struct OlderFailClosedState {
+        version: u32,
+        pf_token: String,
+        /// The pre-tri-state shape a released binary still carries.
+        pf_was_enabled: bool,
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    state::save(dir.path(), &unknown_pf_cover("7"), None).expect("persist the newer shape");
+    let bytes = std::fs::read(dir.path().join(state::STATE_FILE_NAME)).unwrap();
+
+    assert!(
+        serde_json::from_slice::<OlderFailClosedState>(&bytes).is_err(),
+        "this test's premise: an older bridge's `bool` schema must reject the `null` a newer one \
+         writes — {}",
+        String::from_utf8_lossy(&bytes)
+    );
+
+    // What that older bridge's own sweep would then see, and what it must do.
+    let mut ops = RecordingRecoverOps::default();
+    recover_cover_with(StateFile::Unusable, false, &mut ops);
+    assert_eq!(ops.restores, vec![(None, false)]);
 }
 
 // engage_with =========================================================================================================

@@ -15,9 +15,16 @@
 //!   the old ruleset stays authoritative right up until the new one is fully
 //!   committed. The `set` lines are NOT in that ticket: `pfctl` applies
 //!   `set block-policy` / `skip` / `limit` / `timeout` through their own
-//!   immediate ioctls as it parses, outside `DIOCXBEGIN`/`DIOCXCOMMIT`. No
-//!   hole opens either way — neither `block-policy drop` nor `skip on lo0` is
-//!   a permit — but the atomicity claim covers the rules only.
+//!   immediate ioctls as it parses, and it CLEARS every interface's skip flag
+//!   in `main()` before it even begins parsing — both outside
+//!   `DIOCXBEGIN`/`DIOCXCOMMIT`. The atomicity claim therefore covers the rules
+//!   only, and the gap that leaves is a real one. It is not a hole in the
+//!   fail-OPEN direction — none of those `set` ioctls is a permit — but a cover
+//!   fails in BOTH directions, and this one fails by TIGHTENING: a cleared
+//!   `skip on lo0` re-exposes loopback to the previous ruleset's `block out
+//!   all` for the whole parse. `LOOPBACK_PASSES` is what closes it; see that
+//!   const. Reading "no permit opens" as "no failure" is the same
+//!   merge-two-causes-on-one-consequence mistake bindreams/hole#1015 was.
 //!   A COLD engage (pf currently disabled) has NO gap of that class, and both
 //!   engages deliberately keep `-E` first there. pf enforces nothing while
 //!   disabled, so the pre-`-E` host is already maximally open and `-E` can
@@ -70,29 +77,68 @@ use super::RESOLVER_PERMIT_PORT;
 /// [`RESOLVER_PERMIT_PORT`] (see that const's doc for why this is the only port
 /// this fetch can need) — NOT the server permit's unrestricted shape.
 ///
-/// Loopback is exempted with `set skip on lo0` — the same mechanism
-/// [`build_lockdown_main_ruleset`] uses — and NOT with a `pass` rule, because
-/// this cover is the one that purges pf state ([`purges_state`]). A `pass`
-/// creates state under pf's default `flags S/SA`, so only a SYN matches it;
-/// after the purge a mid-stream loopback segment of an ALREADY-ESTABLISHED
-/// session matches no state, fails that SYN-only pass, and falls through to
-/// `block out all` — silently discarded under `block-policy drop`. Every local
-/// TCP session on the host (databases, dev servers, `ssh -L` forwards,
-/// IDE↔language-server sockets) would die on every covered start and every
-/// covered retry. `set skip` passes lo0 "as if pf was disabled", with no state
-/// to lose.
+/// Loopback is exempted TWICE, by [`LOOPBACK_SKIP`] *and* [`LOOPBACK_PASSES`]
+/// — see the latter for why one exemption is not enough.
 pub fn build_pf_ruleset(server_ip: IpAddr, resolver_ip: Option<IpAddr>) -> String {
     let resolver_pass = resolver_ip
         .map(|ip| format!("pass out quick proto tcp from any to {ip} port {RESOLVER_PERMIT_PORT}\n"))
         .unwrap_or_default();
     format!(
         "set block-policy drop\n\
-         set skip on lo0\n\
+         {LOOPBACK_SKIP}\
+         {LOOPBACK_PASSES}\
          block out all\n\
          pass out quick from any to {server_ip}\n\
          {resolver_pass}"
     )
 }
+
+/// The `set` half of the loopback exemption, holding its STEADY state: it
+/// passes loopback "as if pf was disabled", with no state entry for the
+/// transient cover's own `pfctl -F states` purge ([`purges_state`]) to flush.
+///
+/// Kept separate from [`LOOPBACK_PASSES`] because `require-order` puts Options
+/// before Translation before Filter, and [`build_lockdown_main_ruleset`] fits
+/// the host's `nat` snapshot between the two.
+pub const LOOPBACK_SKIP: &str = "set skip on lo0\n";
+
+/// The rule half of the loopback exemption, holding the one window
+/// [`LOOPBACK_SKIP`] cannot hold for itself. Both halves are mandatory in every
+/// cover ruleset; dropping either re-opens bindreams/hole#1015 — loopback
+/// silently severed — by its own route.
+///
+/// `set skip` is not part of the rule ticket. `pfctl`'s `main()` clears every
+/// interface's skip flag (`DIOCCLRIFFLAG`, via `pfctl_clear_interface_flags`)
+/// BEFORE `pfctl_rules()` — so before the `/etc/pf.os` fingerprint reload, the
+/// parse, and `DIOCXBEGIN`. Across that whole span lo0 is filtered again while
+/// the PREVIOUS ruleset is still the authoritative one, and if that previous
+/// ruleset is a live cover, loopback meets its `block out all` and is discarded
+/// under `block-policy drop`: an `ssh -L` forward or an IDE↔language-server
+/// socket stalls to the macOS minimum RTO, a loopback datagram is lost
+/// outright. Rules, unlike `set`, live inside the ticket and stay authoritative
+/// to `DIOCXCOMMIT` — so it is the OUTGOING ruleset's own lo0 `pass` that
+/// carries loopback across the NEXT load's flag-clear window. Every load
+/// replacing a live cover is affected alike: a cover transition, the
+/// `/etc/pf.conf` restore in [`disengage`], and lockdown engage/disengage.
+///
+/// `no state` is load-bearing here, and is exactly why these rules do not
+/// reintroduce the stateful-`pass` failure [`LOOPBACK_SKIP`] exists to avoid.
+/// `pfctl -vn -f -` normalizes a bare `pass out quick on lo0 all` to
+/// `... flags S/SA keep state` — a SYN-only match — but that default is gated
+/// on the rule keeping state, so `no state` suppresses it. These rules
+/// therefore match mid-stream segments, and create nothing for a state purge to
+/// take away. (One exception, benign here: a matching nat/rdr rule makes pf
+/// create state even for a `no state` filter rule. Only
+/// [`build_lockdown_main_ruleset`] carries translation rules, and that cover
+/// does not purge — [`purges_state`].)
+///
+/// BOTH directions, though only `out` is load-bearing against today's
+/// out-only blocks, because these rules stand in for [`LOOPBACK_SKIP`] and
+/// `set skip` is direction-agnostic. An `out`-only stand-in would be a partial
+/// replacement that silently stops covering the moment a ruleset grows a
+/// `block in`.
+pub const LOOPBACK_PASSES: &str = "pass out quick on lo0 all no state\n\
+                                   pass in quick on lo0 all no state\n";
 
 /// Normalize a snapshot fragment to end in exactly one `\n`. Empty stays empty
 /// (so an absent NAT section contributes no stray blank line); non-empty text
@@ -121,6 +167,11 @@ pub const LOCKDOWN_PF_LABEL: &str = "hole-lockdown";
 /// permit precedes `block drop out quick inet6 all` so a v6 server is not
 /// killed. pf has no per-process matching, so the server permit is IP-based.
 ///
+/// Loopback is exempted twice over, by [`LOOPBACK_SKIP`] and
+/// [`LOOPBACK_PASSES`], exactly as in [`build_pf_ruleset`]. The passes LEAD the
+/// filter section: `block drop out quick inet6 all` is `quick`, so it would
+/// terminate evaluation on a `::1` packet before any later lo0 rule.
+///
 /// The base rule's [`LOCKDOWN_PF_LABEL`] is **load-bearing**, not decoration:
 /// it is the only evidence [`lockdown_cover_presence`] has that does not come
 /// from `state_dir`. Dropping it returns macOS to file-only presence, which
@@ -130,8 +181,9 @@ pub fn build_lockdown_main_ruleset(tun_name: &str, server_ip: IpAddr, nat_snapsh
     let proto = "tcp"; // +udp once a UDP-transport plugin lands; egress is TCP-only today.
     format!(
         "set block-policy drop\n\
-         set skip on lo0\n\
+         {LOOPBACK_SKIP}\
          {nat}\
+         {LOOPBACK_PASSES}\
          pass out quick proto {proto} from any to {ip}\n\
          pass out quick on {tun} all\n\
          block drop out quick inet6 all\n\
@@ -499,10 +551,15 @@ fn engage_with(
         // ticket lands even when the load then fails — the `set block-policy`/
         // `skip`/`limit`/`timeout` ioctls it issues as it parses (module doc),
         // and the interface skip flags it clears before parsing, which is why
-        // `set skip` has to be restated by every ruleset. Each of those only
-        // ever tightens — none is a permit — so no hole opens either way, but
-        // the state is not byte-identical to the pre-call one. Restoring
-        // `/etc/pf.conf` here does not "undo a
+        // `set skip` has to be restated by every ruleset. None of those is a
+        // permit, so no hole opens; they TIGHTEN, which on this path is the
+        // more dangerous direction and is not bounded by a window. A load that
+        // failed before its `set skip on lo0` parsed leaves lo0 filtered under
+        // the still-live previous ruleset INDEFINITELY — until some later
+        // successful load restates the flag. `LOOPBACK_PASSES` is why that is
+        // survivable: the previous ruleset carries its own lo0 passes, inside
+        // the ticket, so loopback keeps flowing however long the flag stays
+        // cleared. Restoring `/etc/pf.conf` here does not "undo a
         // flush" (there is none), it returns the host to its canonical
         // baseline rather than leaving it under a stale cover ruleset. The
         // PR3 cutover treats an engage error as fatal and aborts before
@@ -528,7 +585,7 @@ impl Drop for Cover {
     fn drop(&mut self) {
         match self.kind {
             // A user-stop drop never has a standing cover being adopted.
-            CoverKind::Transient => disengage(&self.token, &self.state_dir, false),
+            CoverKind::Transient => disengage(Some(&self.token), &self.state_dir, false),
             CoverKind::Lockdown => lockdown_disengage(&self.state_dir),
         }
     }
@@ -579,7 +636,7 @@ fn drop_refcount_or_warn<P: Phase>(token: &str, phase: P, message: &str) {
 /// actually loaded, so a failed (but not adopting) restore leaves the file in
 /// place rather than erasing the cover's only record over a still-blocked
 /// host. Shared by `Drop` and `recover_cover`.
-fn disengage(token: &str, state_dir: &Path, adopting: bool) {
+fn disengage(token: Option<&str>, state_dir: &Path, adopting: bool) {
     // The placeholder `Err` in the `adopting` branch is never read:
     // `restore_confirmed(true, _)` returns `true` unconditionally, since
     // nothing was attempted to confirm.
@@ -595,11 +652,21 @@ fn disengage(token: &str, state_dir: &Path, adopting: bool) {
         }
         out
     };
-    drop_refcount_or_warn(
-        token,
-        BestEffortPhase::RecoverCover,
-        "pfctl -X failed during cover disengage",
-    );
+    match token {
+        Some(token) => drop_refcount_or_warn(
+            token,
+            BestEffortPhase::RecoverCover,
+            "pfctl -X failed during cover disengage",
+        ),
+        // Same disclosure `release_all_with`'s `Unusable` arm makes: the
+        // restore still runs — it is what unblocks the host — but with no
+        // token on record there is nothing to hand `pfctl -X`.
+        None => tracing::warn!(
+            "no pf token on record for this cover; no pf enable refcount to drop — a refcount may \
+             be leaked (pf then stays enabled over the canonical /etc/pf.conf, which blocks \
+             nothing, and a reboot resets it)"
+        ),
+    }
     if restore_confirmed(adopting, &reload) {
         if let Err(e) = state::clear(state_dir) {
             tracing::warn!(error = %e, "failclosed-state clear failed during cover disengage");
@@ -612,16 +679,66 @@ fn disengage(token: &str, state_dir: &Path, adopting: bool) {
     }
 }
 
+/// Seam over the one mutation [`recover_cover`] performs, so its trichotomy
+/// over the persisted record is table-tested without shelling out to `pfctl`.
+pub(crate) trait RecoverOps {
+    /// [`disengage`]: restore the replacement ruleset, drop `token`'s pf enable
+    /// refcount when one is on record, and clear the state file on a confirmed
+    /// restore.
+    fn restore(&mut self, token: Option<&str>, adopting: bool);
+}
+
 pub fn recover_cover(state_dir: &Path, adopting: bool) {
-    let Some(st) = state::load(state_dir) else {
-        tracing::debug!("no failclosed-state file, nothing to recover");
-        return;
-    };
-    tracing::info!(
-        was_enabled = ?st.pf_was_enabled,
-        "recovering fail-closed cover from crashed run"
+    recover_cover_with(
+        state::load_presence(state_dir),
+        adopting,
+        &mut RealRecoverOps { state_dir },
     );
-    disengage(&st.pf_token, state_dir, adopting);
+}
+
+/// `recover_cover`'s trichotomy over [`StateFile`], with the mutation injected.
+///
+/// Reads [`state::load_presence`], NOT `state::load`: `load` collapses
+/// `Unusable` into `None` alongside `Absent`, and for a SWEEP those two are
+/// opposite facts. `Absent` is "no cover was ever engaged". `Unusable` is
+/// Hole's own unreconciled record that one WAS engaged and never confirmed
+/// released — a corrupt file, a truncated write, or the reachable one: a
+/// ROLLBACK, where a newer bridge persisted a field an older binary's schema
+/// rejects (see [`state::FailClosedState::pf_was_enabled`], whose `null` an
+/// older `bool` cannot read). Collapsing it would leave a crashed covered run's
+/// `block out all` on the host with the automatic sweep declining to act, and
+/// only the manual `bridge unlock` left to escape — the same conflation
+/// `release_all_with` already refuses to make. Bumping [`state::SCHEMA_VERSION`]
+/// does not help: a version mismatch is `Unusable` too.
+fn recover_cover_with(file: StateFile<state::FailClosedState>, adopting: bool, ops: &mut dyn RecoverOps) {
+    match file {
+        StateFile::Absent => tracing::debug!("no failclosed-state file, nothing to recover"),
+        StateFile::Present(st) => {
+            tracing::info!(
+                was_enabled = ?st.pf_was_enabled,
+                "recovering fail-closed cover from crashed run"
+            );
+            ops.restore(Some(&st.pf_token), adopting);
+        }
+        StateFile::Unusable => {
+            tracing::warn!(
+                "failclosed-state file is unusable; recovering the cover anyway — an unreadable \
+                 record is not evidence there is no cover to clear"
+            );
+            ops.restore(None, adopting);
+        }
+    }
+}
+
+/// Production [`RecoverOps`]: the real [`disengage`].
+struct RealRecoverOps<'a> {
+    state_dir: &'a Path,
+}
+
+impl RecoverOps for RealRecoverOps<'_> {
+    fn restore(&mut self, token: Option<&str>, adopting: bool) {
+        disengage(token, self.state_dir, adopting);
+    }
 }
 
 // --- lockdown layer ---
@@ -1156,7 +1273,7 @@ impl EngageOps for RealEngageOps<'_> {
     }
 
     fn transient_restore(&mut self, token: &str) {
-        disengage(token, self.state_dir, false);
+        disengage(Some(token), self.state_dir, false);
     }
 }
 

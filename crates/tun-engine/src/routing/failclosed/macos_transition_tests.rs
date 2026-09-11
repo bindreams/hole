@@ -1,14 +1,16 @@
 //! Privileged-lane real-engage tests for the macOS transient cover's
-//! TRANSITION behaviour (bindreams/hole#997) and for its pf state purge
-//! (bindreams/hole#1015): a second `engage()` replacing a still-live cover must
-//! never open a window, and an engage must not let a flow established before it
-//! survive it. Both engage the REAL OS cover, so they run on the elevated `tun`
-//! lane only — the `TUN` label gates them out of the unprivileged
+//! TRANSITION behaviour (bindreams/hole#997), for its pf state purge
+//! (bindreams/hole#1015), and for what a `pfctl -f -` does to loopback while it
+//! loads: a second `engage()` replacing a still-live cover must never open a
+//! window, an engage must not let a flow established before it survive it, and
+//! no load may drop a loopback packet during the interval in which `pfctl` has
+//! cleared the interface skip flags but not yet committed the new rules. All
+//! engage the REAL OS cover, so they run on the elevated `tun` lane only — the `TUN` label gates them out of the unprivileged
 //! `SKULD_LABELS="!tun"` pass, and `serial = TUN` + `GLOBAL_NET_STATE`
 //! serialize them against every other test that mutates host network state.
 //!
 //! A DESCENDANT module of `platform` (mounted from `macos.rs`) rather than a
-//! sibling of `lockdown_privileged_tests.rs` under `failclosed`: both tests
+//! sibling of `lockdown_privileged_tests.rs` under `failclosed`: these tests
 //! reach for `Cover`'s private `token` field and the private `pfctl` helper,
 //! and Rust privacy cascades to descendant modules. Descendance is what buys
 //! that access — not sharing a file with the unprivileged builder tests.
@@ -107,6 +109,33 @@ fn engage_publishing(
     })
 }
 
+/// Floor the positive control of
+/// [`macos_failclosed_cover_transition_never_admits_blocked_flow`] is gated on,
+/// as a percentage of EVERY control attempt (raw, unfiltered).
+///
+/// A bare `raw_hits > 0` certifies nothing: one success in thousands passes it.
+/// And the number it would be hiding is not incidental — the control's
+/// completion rate and the prober pool's per-probe chance of catching a real
+/// leak are the same quantity, since both ask whether a handshake finishes
+/// inside `PROBER_TIMEOUT`. A collapsed control is a collapsed guard, reported
+/// green.
+///
+/// 25%, sited between the measurement and the cliff:
+///
+/// - ABOVE: both lanes measured ~97% (see LAST MEASURED on the test). A runner
+///   would have to fail more than three of every four handshakes to a healthy
+///   anycast host inside 20ms to breach this — a different runner, not
+///   variance. Near-measurement floors are what turn ordinary runner load into
+///   a red, and this repo pays for flakes.
+/// - BELOW: the pool emits ~0.8 probes/ms, so a 2-3ms window sees ~2 probes and
+///   24 transitions offer ~46 independent chances. At a 5% control rate the
+///   chance of missing every one is already ~10%; at the ~0.08% a genuine
+///   collapse produces it is ~97%. The floor sits ~5x above where the guard
+///   starts failing to detect, and ~4x below where it was measured — roughly
+///   the geometric mean, which is where a threshold with an order of magnitude
+///   of slack on each side belongs.
+const CONTROL_RATE_FLOOR_PCT: f64 = 25.0;
+
 /// Proves a transient-cover TRANSITION — a second real `engage()` replacing a
 /// still-live cover, with no intervening `disengage` — never admits a flow the
 /// OLD cover was blocking. This is the scenario `-Fa` broke: `pfctl -Fa -f -`
@@ -161,25 +190,40 @@ fn engage_publishing(
 /// call for a whole transition and never overlap it at all.
 ///
 /// SENSITIVITY IS PRINTED, NOT ASSUMED — every real failure this guard has
-/// caught was the cold `-E`→load window (tens of ms), which is orders of
-/// magnitude wider than the sub-millisecond `-Fa` window it exists for, so a
-/// green here is not a bound on the narrowest window that would still be
-/// caught. The run therefore prints its own numbers (the control's
-/// completed-connect ratio and the pool's aggregate probe rate) rather than
-/// leaving a green uninformative; `.config/nextest.toml` gives this test
-/// `success-output` so that line survives a PASS. See the printed line itself
-/// for what it means and its own caveats — this comment does not restate them.
+/// caught was the cold `-E`→load window (tens of ms), an order of magnitude
+/// wider than the `-Fa` window it exists for, so a green here is not a bound on
+/// the narrowest window that would still be caught. The run therefore prints its
+/// own numbers (the control's completed-connect ratio and the pool's aggregate
+/// probe rate) rather than leaving a green uninformative;
+/// `.config/nextest.toml` gives this test `success-output` so that line
+/// survives a PASS. See the printed line itself for what it means and its own
+/// caveats — this comment does not restate them.
 ///
-/// LAST MEASURED — figures go here from this branch's own green privileged
-/// darwin run, and nowhere else; they are not carried over from a previous
-/// filter's run, since the commit-generation check below changed which attempts
-/// are counted.
+/// LAST MEASURED — from this branch's own green privileged darwin run, and
+/// nowhere else; not carried over from a previous filter's run, since the
+/// commit-generation check below changed which attempts are counted.
 ///
-/// The straddle-exclusion rate differs sharply by leg, and that asymmetry is
-/// the filter working, not a defect in either. An attempt is excluded exactly
-/// when a commit lands inside its window, so the rate is attempt duration over
-/// transition period: a slow-attempt/fast-transition leg excludes most of its
-/// sample, a fast-attempt/slow-transition leg excludes almost none.
+/// | lane  | filtered       | raw (unfiltered) | pool                                              |
+/// |-------|----------------|------------------|---------------------------------------------------|
+/// | arm64 | 191/191 100.0% | 208/214 97.2%    | 480 probes / 16 threads / 627.470417ms = 1307 us   |
+/// | amd64 | 184/184 100.0% | 200/206 97.1%    | 416 probes / 16 threads / 523.110046ms = 1257 us   |
+///
+/// The raw rate is what [`CONTROL_RATE_FLOOR_PCT`] is set from; see that const
+/// for why the floor sits where it does.
+///
+/// Those figures answer the question the printed caveat leaves open. The window
+/// this guards is NOT sub-millisecond: `-Fa`'s gap spans the `/etc/pf.os`
+/// fingerprint reload plus the rule parse, and a bare `pfctl -n -f -` round
+/// trip measures 2.0-2.7ms. The pool's ~1.3ms probe interval is the same order
+/// — roughly two probes per window — which is why the guard works at all rather
+/// than being structurally coarser than what it hunts.
+///
+/// An attempt is excluded by the generation filter exactly when a commit lands
+/// inside its window, so the exclusion rate is attempt duration over transition
+/// period. Both lanes measured ~11% (arm64 23/214, amd64 22/206) — close,
+/// because their attempt durations and transition periods scale together. A leg
+/// with slow attempts against fast transitions would exclude most of its
+/// sample, and that too would be the filter working, not a defect.
 #[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
 fn macos_failclosed_cover_transition_never_admits_blocked_flow() {
     use std::net::TcpStream;
@@ -496,7 +540,9 @@ fn macos_failclosed_cover_transition_never_admits_blocked_flow() {
          and `connect` completes on the SYN-ACK, so the client's own ACK being dropped by the next \
          `pfctl -f -` commit does NOT hide the leak — the ACK is not required. A leak window shorter than \
          the probe interval, or too short to pass a SYN at all, is still likelier to be missed than \
-         caught; compare it against the ~sub-millisecond `pfctl -f -` commit this test guards."
+         caught; the window this guards is the `-Fa` gap — an /etc/pf.os fingerprint reload plus a rule \
+         parse, 2.0-2.7ms for a bare `pfctl -n -f -` round trip — so it is millisecond-scale, the same \
+         order as the interval above, not shorter than it."
     );
 
     assert!(
@@ -513,15 +559,23 @@ fn macos_failclosed_cover_transition_never_admits_blocked_flow() {
     // never whether a connect succeeded, so it has no business deciding
     // whether the budget is live (see the control thread's doc comment).
     assert!(
-        raw_hits > 0,
-        "positive control: not one of {control_total_attempts} connects to a PERMITTED server \
-         ({SERVER_A}/{SERVER_B}) completed within {PROBER_TIMEOUT:?} across the whole run (of which \
-         {permitted_attempts} survived the commit-generation filter), so the never-admitted assertion \
-         above held vacuously. This gates on the RAW count, so the filter cannot be the cause — suspect \
-         the budget itself: {PROBER_TIMEOUT:?} is also the control's connect budget, and an anycast RTT \
-         from this runner above it fails every control attempt on a perfectly healthy host. Do NOT widen \
-         {PROBER_TIMEOUT:?} to buy that margin: it is the prober pool's budget too, and raising it thins \
-         the pool's probe density, which IS this guard's sensitivity. The knob is loaded both ways."
+        control_total_attempts > 0,
+        "the control prober made no attempt at all — the positive control is vacuous"
+    );
+    assert!(
+        raw_rate >= CONTROL_RATE_FLOOR_PCT,
+        "positive control: only {raw_hits}/{control_total_attempts} ({raw_rate:.1}%) connects to a \
+         PERMITTED server ({SERVER_A}/{SERVER_B}) completed within {PROBER_TIMEOUT:?}, under the \
+         {CONTROL_RATE_FLOOR_PCT:.0}% floor (of which {permitted_attempts} survived the \
+         commit-generation filter). The never-admitted assertion above is therefore not trustworthy: \
+         this rate IS the prober pool's per-probe chance of catching a real leak, because both are the \
+         same question — does a handshake finish inside {PROBER_TIMEOUT:?}. This gates on the RAW count, \
+         so the filter cannot be the cause — suspect the budget itself: {PROBER_TIMEOUT:?} is also the \
+         control's connect budget, and an anycast RTT from this runner near it fails most control \
+         attempts on a perfectly healthy host. Do NOT widen {PROBER_TIMEOUT:?} to buy that margin, and \
+         do NOT lower the floor: {PROBER_TIMEOUT:?} is the prober pool's budget too, and raising it \
+         thins the pool's probe density, which IS this guard's sensitivity. The knob is loaded both \
+         ways."
     );
 
     // The last cover's normal Drop restores /etc/pf.conf.
@@ -651,19 +705,217 @@ fn macos_failclosed_cover_state_purge_kills_a_flow_established_before_engage() {
     );
 }
 
+// loopback across a pf LOAD (the skip-flag-clear window) ==============================================================
+
+/// Failure bound for a loopback datagram the KERNEL may never deliver. pf drops
+/// silently under `block-policy drop` — no ICMP, no socket error — so a blocked
+/// datagram produces no event at all, only absence. That is the sanctioned
+/// exception: the timeout IS the failure signal, and reporting it is the whole
+/// point of the probe, not a sleep synchronizing two halves of this test. Same
+/// 5s the neighbouring cover tests use.
+const DATAGRAM_LOST: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Run `run` with a lock-step loopback UDP round trip in flight continuously,
+/// and report whether any leg of any round trip failed to arrive.
+///
+/// Returns `run`'s value, the FIRST loss (a human-readable stage, `None` for a
+/// clean run) and the number of completed round trips — 0 means the probe never
+/// ran and any verdict from it is vacuous.
+///
+/// A datagram, not a TCP stream, because the two answer different questions. A
+/// TCP segment dropped inside a window this narrow is *retransmitted*, so the
+/// flow survives and the only trace is a stall to the macOS minimum RTO — which
+/// any read bound generous enough not to flake will absorb, leaving a green.
+/// A datagram has no retransmit: pf drops it and it is simply gone, so loss is
+/// observable directly rather than as latency.
+///
+/// One thread drives BOTH ends — probe `send` → echo `recv_from` → echo
+/// `send_to` → probe `recv` — so there is no second thread to shut down and no
+/// shutdown datagram that could itself be dropped and hang the join. Both
+/// sockets carry [`DATAGRAM_LOST`], so every leg is bounded and the loop's
+/// `stop` check is reached.
+fn with_loopback_datagram_probe<R>(run: impl FnOnce() -> R) -> (R, Option<String>, usize) {
+    use std::net::UdpSocket;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let echo = UdpSocket::bind("127.0.0.1:0").expect("bind the loopback echo socket");
+    let probe = UdpSocket::bind("127.0.0.1:0").expect("bind the loopback probe socket");
+    probe
+        .connect(echo.local_addr().expect("echo socket addr"))
+        .expect("point the probe socket at the echo socket");
+    echo.set_read_timeout(Some(DATAGRAM_LOST)).expect("echo read bound");
+    probe.set_read_timeout(Some(DATAGRAM_LOST)).expect("probe read bound");
+
+    let stop = AtomicBool::new(false);
+
+    std::thread::scope(|s| {
+        // Stops the probe on EVERY exit from this scope, a panic in `run`
+        // included — otherwise the unwind skips the `stop.store` below and
+        // `thread::scope`'s implicit join waits forever on a thread whose loop
+        // condition is still false. Declared first, so it drops last among
+        // these locals and therefore always before that join.
+        struct StopProbe<'a>(&'a AtomicBool);
+        impl Drop for StopProbe<'_> {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        let _stop_probe = StopProbe(&stop);
+
+        let prober = s.spawn(|| {
+            let mut buf = [0u8; 8];
+            let mut seq = 0u64;
+            let mut round_trips = 0usize;
+            while !stop.load(Ordering::SeqCst) {
+                seq += 1;
+                let payload = seq.to_le_bytes();
+                // A `block-policy drop` block is silent, so a send normally
+                // still reports success; an error here is a dropped datagram
+                // all the same, and is reported rather than ignored.
+                if let Err(e) = probe.send(&payload) {
+                    return (
+                        Some(format!("outbound send of datagram {seq} failed: {e:?}")),
+                        round_trips,
+                    );
+                }
+                let from = match echo.recv_from(&mut buf) {
+                    Ok((8, from)) if buf == payload => from,
+                    Ok((n, _)) => return (Some(format!("echo socket read {n} unexpected bytes")), round_trips),
+                    Err(e) => {
+                        return (
+                            Some(format!(
+                                "OUTBOUND leg lost: the echo socket never saw datagram {seq} ({e:?})"
+                            )),
+                            round_trips,
+                        )
+                    }
+                };
+                if let Err(e) = echo.send_to(&payload, from) {
+                    return (Some(format!("echo send of datagram {seq} failed: {e:?}")), round_trips);
+                }
+                match probe.recv(&mut buf) {
+                    Ok(8) if buf == payload => {}
+                    Ok(n) => return (Some(format!("probe socket read {n} unexpected bytes")), round_trips),
+                    Err(e) => {
+                        return (
+                            Some(format!(
+                                "RETURN leg lost: the probe socket never saw the echo of datagram {seq} ({e:?})"
+                            )),
+                            round_trips,
+                        )
+                    }
+                }
+                round_trips += 1;
+            }
+            (None, round_trips)
+        });
+
+        let r = run();
+        stop.store(true, Ordering::SeqCst);
+        let (loss, round_trips) = prober.join().expect("loopback probe thread panicked");
+        (r, loss, round_trips)
+    })
+}
+
+/// Proves the rule half of the loopback exemption ([`LOOPBACK_PASSES`]): a
+/// `pfctl -f -` that replaces a still-live blocking cover must not drop
+/// loopback while it loads.
+///
+/// `set skip on lo0` is applied OUTSIDE the rule ticket — `pfctl`'s `main()`
+/// clears every interface's skip flag before it parses and before
+/// `DIOCXBEGIN`, so from that clear until the new ruleset's own `set skip`
+/// ioctl lands, lo0 is filtered again while the OLD ruleset is still
+/// authoritative. If that old ruleset is a cover with no lo0 `pass`, loopback
+/// meets `block out all` and is silently discarded.
+///
+/// **The control is what makes this non-vacuous.** The same probe runs twice
+/// over the same loads: once with a cover ruleset carrying `set skip on lo0`
+/// alone (the pre-fix shape — MUST lose a datagram) and once with the
+/// production [`build_pf_ruleset`] (MUST NOT). A green here therefore carries
+/// its own proof that the window exists and that the probe can see it, rather
+/// than asserting an absence no one demonstrated was observable.
+///
+/// The guarded leg's loads are followed by `Cover::drop`'s
+/// `pfctl -f /etc/pf.conf`, which is the identical window on the identical
+/// victim and is the concrete user-visible failure: a covered auto-connect
+/// succeeds, and the disengage that should be invisible eats a local
+/// datagram.
+#[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
+fn macos_failclosed_cover_load_never_drops_a_loopback_datagram() {
+    // Same reliable anycast pair the tests above use; the IP only has to make
+    // the two rulesets in a cycle textually different.
+    const PERMITTED: &str = "1.1.1.1";
+    const ALT: &str = "1.0.0.1";
+    const LOADS: usize = 24;
+
+    let dir = tempfile::tempdir().unwrap();
+    // A real cover: pf enabled, a blocking ruleset live, state file written.
+    // RAII, so every exit path restores `/etc/pf.conf` — the guarded leg below
+    // consumes it deliberately, inside the probe.
+    let cover = engage(PERMITTED.parse().unwrap(), None, dir.path(), None).expect("engage the transient cover");
+
+    // The pre-fix ruleset shape: `set skip on lo0` and nothing else exempting
+    // loopback.
+    let unprotected =
+        |ip: &str| format!("set block-policy drop\n{LOOPBACK_SKIP}block out all\npass out quick from any to {ip}\n");
+    let protected = |ip: &str| build_pf_ruleset(ip.parse().unwrap(), None);
+    let load = |text: &str| real_load_ruleset(text).expect("pfctl -f - must load a cover ruleset");
+    let run_loads = |mk: &dyn Fn(&str) -> String| {
+        for i in 0..LOADS {
+            load(&mk(if i % 2 == 0 { ALT } else { PERMITTED }));
+        }
+    };
+
+    // CONTROL. The prime load matters: the window's victim is the OUTGOING
+    // ruleset, so the variant under test has to be the live one already when
+    // the first MEASURED load starts.
+    load(&unprotected(PERMITTED));
+    let ((), control_loss, control_round_trips) = with_loopback_datagram_probe(|| run_loads(&unprotected));
+
+    // GUARDED: the production builder, plus the `/etc/pf.conf` restore.
+    load(&protected(PERMITTED));
+    let ((), guarded_loss, guarded_round_trips) = with_loopback_datagram_probe(|| {
+        run_loads(&protected);
+        drop(cover);
+    });
+
+    assert!(
+        control_round_trips > 0 && guarded_round_trips > 0,
+        "the loopback probe completed no round trip at all (control={control_round_trips}, \
+         guarded={guarded_round_trips}) — this test is vacuous"
+    );
+    assert!(
+        control_loss.is_some(),
+        "POSITIVE CONTROL FAILED: {LOADS} `pfctl -f -` loads replacing a live `block out all` cover \
+         whose ONLY loopback exemption is `set skip on lo0` lost no datagram across \
+         {control_round_trips} round trips. Either this `pfctl` does not clear interface skip flags \
+         outside the rule ticket (and the guarded assertion below is vacuous), or the probe cannot \
+         see the window — do not silence this by weakening the assertion below; establish which."
+    );
+    assert_eq!(
+        guarded_loss, None,
+        "a loopback datagram was lost across a `pfctl -f -` that replaced a live production cover \
+         ({guarded_round_trips} round trips before it) — the control above proves the window is \
+         real and visible, so the cover ruleset's `pass ... on lo0 all no state` rules \
+         (`LOOPBACK_PASSES`) are missing, stateful, or ordered behind a `quick` block"
+    );
+}
+
 /// Loopback must SURVIVE that engage. What keeps the host-wide purge above
 /// (`DIOCCLRSTATES`, no `psk_ifname`/`psk_ownername`) from severing every local
 /// TCP session on the machine is not the flush's scope but the ruleset's:
 /// `set skip on lo0` passes loopback "as if pf was disabled", with no state
 /// entry to lose.
 ///
-/// A `pass out quick on lo0 all` would not, and for a reason wider than the
-/// purge: pf applies `flags S/SA` by default, so that rule only ever MATCHES a
-/// SYN. Any mid-stream segment of an already-established session falls through
-/// to `block out all` and is silently dropped under `block-policy drop`
+/// A STATEFUL `pass out quick on lo0 all` would not, and for a reason wider
+/// than the purge: pf applies `flags S/SA` by default, so that rule only ever
+/// MATCHES a SYN. Any mid-stream segment of an already-established session falls
+/// through to `block out all` and is silently dropped under `block-policy drop`
 /// whenever it has no state entry to be matched against first — after the purge
 /// flushed it, and equally on a host where pf was disabled until this engage
-/// enabled it, so the flow never had one.
+/// enabled it, so the flow never had one. That is why the lo0 passes the
+/// ruleset DOES carry ([`LOOPBACK_PASSES`], for a window `set skip` cannot
+/// cover) are `no state`: it suppresses that default.
 ///
 /// Asserted end-to-end on a real established loopback connection carried ACROSS
 /// a real engage, because the unit test next door

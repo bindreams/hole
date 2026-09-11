@@ -65,6 +65,18 @@ nextest-version = "0.9.130"
 #     a real established loopback flow must survive a real engage, which is
 #     what `set skip on lo0` buys over a state-bearing `pass` rule):
 #     crates/tun-engine/src/routing/failclosed/macos_transition_tests.rs
+#   - `failclosed_cover_load_` (the window `set skip on lo0` cannot cover for
+#     itself — pfctl clears interface skip flags OUTSIDE the rule ticket, so a
+#     real `pfctl -f -` replacing a live cover is probed with a lock-step
+#     loopback UDP round trip, twice: once against the pre-fix ruleset shape as
+#     a positive control, once against the production one):
+#     crates/tun-engine/src/routing/failclosed/macos_transition_tests.rs
+#   - `macos_recover_cover_` prefix (the crash-recovery sweep's own real
+#     engage: a stranded transient cover whose state file an older bridge
+#     cannot parse must still be cleared). The `macos_` prefix is what keeps
+#     the unprivileged `recover_cover_with_*` unit tests in macos_tests.rs out
+#     of this group; they need no serialization:
+#     crates/tun-engine/src/routing/failclosed/release_privileged_tests.rs
 #   - `release_all_` substring (privileged AND unprivileged — the unprivileged
 #     macos_tests/windows_tests cases join for free; a name-based filter must
 #     not silently miss a privileged test):
@@ -148,7 +160,7 @@ nextest-version = "0.9.130"
 max-threads = 1
 
 [[profile.default.overrides]]
-filter = 'test(/^e2e_.*full_tunnel/) + test(/windows_lockdown_permits_server_ip_/) + test(/macos_lockdown_permits_server_ip_/) + test(/failclosed_permits_/) + test(/simulated_reboot_rearms_the_cover/) + test(/failclosed_cover_transition_/) + test(/failclosed_cover_state_purge_/) + test(/failclosed_cover_engage_does_not_sever_/) + test(/release_all_/) + test(/cutover_global_net_state_/) + test(/live_tun_permit_/) + test(/tun_device_ipv6_/) + test(/gateway_global_net_state_/) + test(/dns_confine_global_net_state_/) + test(/dns_steer_global_net_state_/) + test(/macos_dns_global_net_state_/) + test(/opens_a_kernel_assigned/) + test(/dispatcher_opens_tun_/)'
+filter = 'test(/^e2e_.*full_tunnel/) + test(/windows_lockdown_permits_server_ip_/) + test(/macos_lockdown_permits_server_ip_/) + test(/failclosed_permits_/) + test(/simulated_reboot_rearms_the_cover/) + test(/failclosed_cover_transition_/) + test(/failclosed_cover_state_purge_/) + test(/failclosed_cover_engage_does_not_sever_/) + test(/failclosed_cover_load_/) + test(/macos_recover_cover_/) + test(/release_all_/) + test(/cutover_global_net_state_/) + test(/live_tun_permit_/) + test(/tun_device_ipv6_/) + test(/gateway_global_net_state_/) + test(/dns_confine_global_net_state_/) + test(/dns_steer_global_net_state_/) + test(/macos_dns_global_net_state_/) + test(/opens_a_kernel_assigned/) + test(/dispatcher_opens_tun_/)'
 test-group = 'global_net_state'
 
 # `macos_failclosed_cover_transition_never_admits_blocked_flow` prints the

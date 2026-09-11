@@ -1127,14 +1127,26 @@ milliseconds.
   decides this, and its doc lists exactly which reachable cases the transient
   purge closes; the kernel behaviour is proven by
   `macos_failclosed_cover_state_purge_kills_a_flow_established_before_engage`.
-  **Loopback is exempted with `set skip on lo0`, never a `pass` rule.** That
-  purge is host-wide, so the ruleset — not the flush's scope — is what keeps it
-  from severing every local TCP session on the machine. pf applies `flags S/SA`
-  by default, so a `pass ... on lo0` only ever matches a SYN; a mid-stream
-  segment with no state entry left to match against falls through to
-  `block out all` and is silently dropped under `block-policy drop`.
-  `set skip` passes lo0 "as if pf was disabled", with no state to lose. Proven
-  by `macos_failclosed_cover_engage_does_not_sever_established_loopback_flows`.
+  **Loopback is exempted TWICE: `set skip on lo0` AND a pair of `no state`
+  `pass` rules.** Both are mandatory; each closes a failure the other cannot.
+  The state purge is host-wide, so the ruleset — not the flush's scope — is
+  what keeps it from severing every local TCP session on the machine, and
+  `set skip` is what does that: it passes lo0 "as if pf was disabled", with no
+  state to lose, where a *stateful* `pass` would be defaulted to `flags S/SA`
+  and match only a SYN. But `set skip` is applied OUTSIDE the rule ticket —
+  `pfctl`'s `main()` clears every interface's skip flag before it parses and
+  before `DIOCXBEGIN` — so across each load's parse, lo0 is filtered again
+  while the *previous* ruleset is still authoritative. If that previous
+  ruleset is a cover, loopback meets its `block out all`. The outgoing
+  ruleset's own `pass out/in quick on lo0 all no state` is what carries
+  loopback across that window; `no state` suppresses the `flags S/SA` default
+  (it is gated on the rule keeping state) so the rules match mid-stream
+  segments and leave nothing for the purge to flush. Proven by
+  `macos_failclosed_cover_engage_does_not_sever_established_loopback_flows`
+  (the purge half) and
+  `macos_failclosed_cover_load_never_drops_a_loopback_datagram` (the
+  flag-clear-window half, which carries its own positive control: the same
+  probe over the `set skip`-only ruleset must lose a datagram).
   **Enable before load, on a COLD engage too** — see `engage_with`'s doc for why
   reordering does not help and what a failed persist would strand without it.
 
