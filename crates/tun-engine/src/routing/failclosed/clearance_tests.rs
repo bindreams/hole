@@ -62,9 +62,9 @@ fn a_boot_time_key_the_delete_actually_removed_is_proven_empty() {
 
 #[skuld::test]
 fn a_mixed_sweep_names_every_unproven_key_and_only_those() {
-    // The operator message has to be actionable — `netsh wfp` is what is left
-    // after this point, and it needs to name which keys to look for. A count
-    // would not survive that requirement.
+    // The operator message has to be actionable, and after this point the
+    // label is all anyone has to look a key up by. A count would not survive
+    // that requirement.
     let c = Clearance::from_observations(&[
         obs("lockdown filter", KeyLifetime::Persistent, KeyOutcome::NotFound),
         obs("boot-time block-all V4", KeyLifetime::BootTime, KeyOutcome::NotFound),
@@ -82,6 +82,48 @@ fn a_mixed_sweep_names_every_unproven_key_and_only_those() {
         ["boot-time block-all V4", "boot-time block-all V6 twin"],
         "only the boot-time keys that answered not-found are unproven"
     );
+}
+
+#[skuld::test]
+fn a_delete_that_failed_proves_nothing_for_either_lifetime() {
+    // The anti-pattern this type exists to refuse: "not NotFound, therefore
+    // Removed". An access denial, an RPC failure and a genuine removal share
+    // the consequence "the code was not FWP_E_FILTER_NOT_FOUND" and nothing
+    // else. Folding them together hands the uninstall gate a proof of removal
+    // nobody observed — and `RemoveFiles` then deletes the only binary that
+    // could have acted on the difference.
+    for lifetime in [KeyLifetime::Persistent, KeyLifetime::BootTime] {
+        let o = obs("lockdown filter", lifetime, KeyOutcome::Failed);
+        assert!(
+            !o.proves_empty(),
+            "a delete that neither removed nor found-empty proves nothing ({lifetime:?})"
+        );
+        let c = Clearance::from_observations(&[o]);
+        assert!(!c.is_proven(), "{lifetime:?}");
+        assert_eq!(c.unproven_keys(), ["lockdown filter"]);
+    }
+}
+
+#[skuld::test]
+fn every_outcome_lifetime_pair_has_one_answer_and_only_removal_is_universal() {
+    // The whole table, so the rule is readable in one place and a new variant
+    // cannot be added without landing here. `Removed` is the only outcome that
+    // proves anything on a boot-time key; `Failed` proves nothing anywhere.
+    let table = [
+        (KeyLifetime::Persistent, KeyOutcome::Removed, true),
+        (KeyLifetime::Persistent, KeyOutcome::NotFound, true),
+        (KeyLifetime::Persistent, KeyOutcome::Failed, false),
+        (KeyLifetime::BootTime, KeyOutcome::Removed, true),
+        (KeyLifetime::BootTime, KeyOutcome::NotFound, false),
+        (KeyLifetime::BootTime, KeyOutcome::Failed, false),
+    ];
+    for (lifetime, outcome, proves) in table {
+        assert_eq!(
+            obs("k", lifetime, outcome).proves_empty(),
+            proves,
+            "{lifetime:?} + {outcome:?}"
+        );
+    }
 }
 
 #[skuld::test]

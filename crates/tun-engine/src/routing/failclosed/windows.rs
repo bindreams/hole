@@ -148,8 +148,10 @@ const MAX_APPID_BINARIES: usize = 4;
 struct SweptKey {
     guid: GUID,
     /// Operator-facing label, surfaced by `bridge release-covers` when the
-    /// key's absence goes unproven — `netsh wfp` is the only remedy left once
-    /// the binary is gone, so it has to name what to look for.
+    /// key's absence goes unproven. Once the binary is gone the label is all
+    /// an operator has to look the key up by — `netsh wfp show boottimepolicy`
+    /// can show a surviving record but cannot remove one — so it has to name
+    /// what to look for.
     label: &'static str,
     lifetime: KeyLifetime,
 }
@@ -530,18 +532,34 @@ const FWP_E_ALREADY_EXISTS_DWORD: u32 = 0x8032_0009;
 /// removed it — never treated as an error.
 const FWP_E_FILTER_NOT_FOUND_DWORD: u32 = 0x8032_0003;
 
-/// Walk every `(what, code)` pair and return the first GENUINE failure — a
-/// code that is neither `ERROR_SUCCESS` nor "filter not found". Pure and total
-/// over the slice: it never stops at the first failure to decide whether to
-/// keep going, so a caller that issues every delete before calling this gets
-/// a structurally short-circuit-free fold.
+/// Classify one `FwpmFilterDeleteByKey0` return code by what it says the
+/// delete OBSERVED. The single place a code becomes a verdict: both folds
+/// below derive from this, so "does anything still fail?" and "what did the
+/// empty answers prove?" can never disagree about which code meant what.
+///
+/// Exhaustive by cause, with no residual arm standing in for another: only
+/// `ERROR_SUCCESS` is a removal, only `FWP_E_FILTER_NOT_FOUND` is an empty
+/// answer, and everything else — access denied, an RPC failure, a code this
+/// code has never seen — is [`KeyOutcome::Failed`], which proves nothing.
+fn classify_delete_code(code: u32) -> KeyOutcome {
+    if code == ERROR_SUCCESS.0 {
+        KeyOutcome::Removed
+    } else if code == FWP_E_FILTER_NOT_FOUND_DWORD {
+        KeyOutcome::NotFound
+    } else {
+        KeyOutcome::Failed
+    }
+}
+
+/// Walk every `(what, code)` pair and return the first GENUINE failure — one
+/// [`classify_delete_code`] calls [`KeyOutcome::Failed`]. Pure and total over
+/// the slice: it never stops at the first failure to decide whether to keep
+/// going, so a caller that issues every delete before calling this gets a
+/// structurally short-circuit-free fold.
 fn first_delete_failure(codes: &[(&'static str, u32)]) -> Option<RoutingError> {
-    codes.iter().find_map(|&(what, code)| {
-        if code == ERROR_SUCCESS.0 || code == FWP_E_FILTER_NOT_FOUND_DWORD {
-            None
-        } else {
-            Some(RoutingError::RouteSetup(format!("{what} delete failed: 0x{code:08x}")))
-        }
+    codes.iter().find_map(|&(what, code)| match classify_delete_code(code) {
+        KeyOutcome::Removed | KeyOutcome::NotFound => None,
+        KeyOutcome::Failed => Some(RoutingError::RouteSetup(format!("{what} delete failed: 0x{code:08x}"))),
     })
 }
 
@@ -1195,25 +1213,62 @@ pub fn lockdown_cover_presence(_state_dir: &Path) -> crate::routing::CoverPresen
 /// the difference is unrecoverable. Only `cutover::release_covers` — which
 /// runs as the binary is being deleted — has to read the narrower claim, and
 /// it is the one that returns the `Clearance`.
+///
+/// What it IS gated on is every delete's return code. `Ok` here means the host
+/// is genuinely open: `hole bridge unlock` flips the persisted intent off only
+/// on this function's success (`cutover::unlock_with`), so an `Ok` returned
+/// over deletes that were refused — the unelevated run, which reaches the
+/// engine open but not the write — would leave the kill switch engaged while
+/// the intent reads "off", with nothing left to reconcile it. The macOS arm
+/// has always propagated its `pfctl` failures; this is the same rule.
 pub fn disengage_lockdown(_state_dir: &Path) -> Result<(), RoutingError> {
-    unsafe {
+    let codes = unsafe {
         let mut engine = HANDLE::default();
         #[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
         let rc = FwpmEngineOpen0(PCWSTR::null(), RPC_C_AUTHN_WINNT, None, None, &mut engine);
         if rc != ERROR_SUCCESS.0 {
-            return Err(RoutingError::RouteSetup(format!(
-                "FwpmEngineOpen0 failed (0x{rc:08x}): the firewall could not be reached, so the lockdown \
-                 cover could not be disengaged"
-            )));
+            return disengage_verdict(Some(rc), &[]);
         }
+        // Every delete is ISSUED before any code is inspected, matching
+        // `release_all`: a short-circuit would leave a later lockdown filter
+        // installed because an earlier one failed.
         #[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
-        for k in swept_lockdown_keys() {
-            let _ = FwpmFilterDeleteByKey0(engine, &k.guid);
-        }
+        let codes: Vec<(&'static str, u32)> = swept_lockdown_keys()
+            .into_iter()
+            .map(|k| (k.label, FwpmFilterDeleteByKey0(engine, &k.guid)))
+            .collect();
         #[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
         let _ = FwpmEngineClose0(engine);
+        codes
+    };
+    disengage_verdict(None, &codes)
+}
+
+/// Whether a lockdown disengage may report success. Pure and separated from
+/// the FFI above so the fail-loud rule is a table-tested decision rather than
+/// a discarded return value: the previous body issued every delete as
+/// `let _ = FwpmFilterDeleteByKey0(..)` and returned `Ok` unconditionally, so
+/// an unelevated `hole bridge unlock` reported a host it had not unlocked.
+///
+/// Reads [`first_delete_failure`] — the same fold `release_all` uses — so
+/// "which codes are benign" has one answer for both paths.
+///
+/// `open_failure` is the `FwpmEngineOpen0` return code when the engine could
+/// not be opened at all, in which case no delete was issued and `codes` is
+/// empty. The two causes are kept apart because they say different things to
+/// the operator: "the firewall could not be reached" versus "the firewall
+/// refused the delete".
+fn disengage_verdict(open_failure: Option<u32>, codes: &[(&'static str, u32)]) -> Result<(), RoutingError> {
+    if let Some(rc) = open_failure {
+        return Err(RoutingError::RouteSetup(format!(
+            "FwpmEngineOpen0 failed (0x{rc:08x}): the firewall could not be reached, so the lockdown \
+             cover could not be disengaged"
+        )));
     }
-    Ok(())
+    match first_delete_failure(codes) {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
 }
 
 pub fn recover_cover(_state_dir: &Path, adopting: bool) {
@@ -1325,22 +1380,20 @@ pub fn release_all(_state_dir: &Path) -> Result<Clearance, RoutingError> {
 /// fold reads. Pure, and separated from the FFI loop above so the mapping is
 /// testable without a firewall.
 ///
-/// Only reached once `first_delete_failure` has cleared the slice, so every
-/// code here is `ERROR_SUCCESS` or `FWP_E_FILTER_NOT_FOUND`. Anything else
-/// would already have failed the release; it maps to `Removed` here only
-/// because that arm is unreachable, and treating an unreachable code as
-/// "removed" is the conservative direction for a value that is discarded.
+/// `release_all` calls this only after `first_delete_failure` has cleared the
+/// slice, so in that path no code here classifies as [`KeyOutcome::Failed`] —
+/// but this function does not rely on that. It classifies by cause
+/// ([`classify_delete_code`]) and a code it cannot account for stays
+/// unaccounted-for, rather than being read as a removal nobody watched
+/// happen. The two folds sharing one classifier is what keeps them from
+/// drifting apart.
 fn observations(swept: &[(SweptKey, u32)]) -> Vec<KeyObservation> {
     swept
         .iter()
         .map(|(k, code)| KeyObservation {
             key: k.label,
             lifetime: k.lifetime,
-            outcome: if *code == FWP_E_FILTER_NOT_FOUND_DWORD {
-                KeyOutcome::NotFound
-            } else {
-                KeyOutcome::Removed
-            },
+            outcome: classify_delete_code(*code),
         })
         .collect()
 }

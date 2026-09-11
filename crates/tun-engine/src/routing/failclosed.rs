@@ -372,40 +372,76 @@ pub enum KeyLifetime {
     /// boots at all — is unmeasured: it needs a reboot-capable elevated lane
     /// that does not exist. See CONTRIBUTING.md's fail-closed residuals.
     ///
-    /// The harm is bounded. A stranded boot-time record blocks egress only
-    /// across the boot→BFE window (seconds, before anything user-facing is on
-    /// the network), because BFE's start is what takes a boot-time filter out
-    /// of effect. It is not permanent network loss — which is why an
-    /// unproven key does not fail a release. What it must not do is read as
-    /// proof.
+    /// The harm is bounded: BFE's start is what takes a boot-time filter out
+    /// of effect, so a stranded record blocks egress across the boot→BFE
+    /// window only. How long that window is has not been measured here — the
+    /// claim is that it is bounded and ends before the network stack is
+    /// generally usable, not any particular duration. It is not permanent
+    /// network loss, which is why an unproven key does not fail a release.
+    /// What it must not do is read as proof.
     BootTime,
 }
 
-/// What one delete-by-key observed about its key.
+/// What one delete-by-key observed about its key, keyed on the CAUSE it
+/// reported rather than on which consequence the caller happens to share.
 ///
-/// A code that is neither of these is a genuine failure: it means an object
-/// is still there, it fails the release outright, and it never reaches the
-/// clearance fold.
+/// Three return codes, three variants. Deriving one of them from the absence
+/// of another — "not `NotFound`, therefore `Removed`" — folds an access
+/// denial, a transient RPC failure and a genuine removal into a single
+/// verdict, and that verdict is what the MSI deletes `hole.exe` on the
+/// strength of. See CLAUDE.md's "per-variant policy lives on the type".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeyOutcome {
-    /// The delete removed a live object. Proof of removal for ANY lifetime —
-    /// this is the half #1010 measured for boot-time keys (`ERROR_SUCCESS`,
-    /// and the filter leaves the `BOOTTIME_ONLY` view).
+    /// The delete removed a live object (`ERROR_SUCCESS`). Proof of removal
+    /// for ANY lifetime — this is the half #1010 measured for boot-time keys
+    /// (the filter leaves the `BOOTTIME_ONLY` view).
     Removed,
-    /// The delete found nothing on the key. Proof of absence only for
-    /// [`KeyLifetime::Persistent`].
+    /// The delete found nothing on the key (`FWP_E_FILTER_NOT_FOUND`). Proof
+    /// of absence only for [`KeyLifetime::Persistent`].
     NotFound,
+    /// The delete neither removed an object nor found the key empty: the OS
+    /// refused or failed (not elevated, engine error, RPC failure). Proof of
+    /// NOTHING, for any lifetime.
+    ///
+    /// Such a code also fails the release outright, so on the Windows sweep
+    /// path this variant does not survive to the clearance fold. It exists
+    /// anyway because the fold must be total over its own input — a verdict
+    /// that is only correct while a *different* function short-circuits first
+    /// is the coupling that lets an unproven state masquerade as proof the
+    /// moment either side moves.
+    Failed,
 }
 
 /// One key's contribution to a release verdict.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct KeyObservation {
-    /// Operator-facing label. Named, never counted: `netsh wfp` is the only
-    /// remedy left once the binary is gone, and it needs to know what to look
-    /// for.
+    /// Operator-facing label. Named, never counted: with the binary gone an
+    /// operator has only the label to look the key up by.
     pub key: &'static str,
     pub lifetime: KeyLifetime,
     pub outcome: KeyOutcome,
+}
+
+impl KeyObservation {
+    /// Whether this observation PROVES its key now carries nothing.
+    ///
+    /// The whole rule, in one exhaustive match on the pair, so no call site
+    /// re-derives it and no variant is grouped with another because they
+    /// happen to share a consequence.
+    pub fn proves_empty(&self) -> bool {
+        match (self.lifetime, self.outcome) {
+            // A removal we watched happen is proof regardless of lifetime.
+            (_, KeyOutcome::Removed) => true,
+            // The by-key delete addresses a persistent key's only record, so
+            // an empty answer proves the key carries nothing.
+            (KeyLifetime::Persistent, KeyOutcome::NotFound) => true,
+            // A boot-time key answers empty on any boot where its runtime
+            // object is not live, whether or not a record survives behind it.
+            (KeyLifetime::BootTime, KeyOutcome::NotFound) => false,
+            // The delete never got an answer about the key at all.
+            (_, KeyOutcome::Failed) => false,
+        }
+    }
 }
 
 /// What a [`release_all`] sweep PROVED, as distinct from what it attempted.
@@ -445,11 +481,16 @@ impl Clearance {
     /// Fold per-key observations into a verdict. Pure and total over the
     /// slice: it inspects every observation rather than stopping at the first
     /// unproven one, so the operator message can name all of them.
+    ///
+    /// The per-observation rule is [`KeyObservation::proves_empty`] and is not
+    /// restated here — an observation is unproven iff it did not prove itself
+    /// empty, so a new [`KeyOutcome`] or [`KeyLifetime`] variant cannot slip
+    /// past this fold by failing to match a filter predicate written here.
     pub fn from_observations(observations: &[KeyObservation]) -> Self {
         Self {
             unproven: observations
                 .iter()
-                .filter(|o| o.lifetime == KeyLifetime::BootTime && o.outcome == KeyOutcome::NotFound)
+                .filter(|o| !o.proves_empty())
                 .map(|o| o.key)
                 .collect(),
         }
