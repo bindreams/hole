@@ -49,13 +49,20 @@ param(
     #
     # Sized against what is actually spare in the 60min job budget, which is
     # NOT the ~11min above: 6 of those minutes are already committed to the
-    # two 3-minute bounds when both steps wedge, leaving ~5min. A wedge in
-    # both steps spends this budget twice, so 1min each takes 2 of that 5 and
-    # still leaves the artifact upload -- the whole reason the bound exists --
-    # its margin. Measured cost is well under the cap: 33s for one process
-    # against a cold symbol cache and 0.3s against a warm one (Windows 11
-    # 26100, SDK 10.0.26100 cdb), with the two steps sharing one cache under
-    # RUNNER_TEMP. The cap is a failure bound, not an expected duration.
+    # two 3-minute bounds when both steps wedge, leaving ~5min.
+    #
+    # This budget covers the capture loop only, so the wedge branch's real
+    # worst case is the sum of every bound in it: two 15s CIM probes before
+    # the loop, this 60s, and a 5s reap per process killed (one cdb, at most
+    # one per target, at most one per msiexec-tree member) -- about 2min 10s
+    # for a plausible four targets. Both steps wedging spends that twice,
+    # ~4.5min of the ~5min spare, and the artifact upload -- the whole reason
+    # the bound exists -- still runs.
+    #
+    # Measured cost is far under the cap: 33s for one process against a cold
+    # symbol cache and 0.3s against a warm one (Windows 11 26100, SDK
+    # 10.0.26100 cdb), with the two steps sharing one cache under RUNNER_TEMP.
+    # Every one of these is a failure bound, not an expected duration.
     [ValidateRange(0.0, 3600.0)]
     [double]$StackCaptureSeconds = 60,
 
@@ -131,7 +138,12 @@ function Get-RemainingMs([datetime]$Deadline) {
 # and an unbounded probe between the bound expiring and the `throw` would be a
 # second hang of the shape this whole script exists to prevent. A query that has
 # not answered in this long is not going to.
-$cimProbeTimeoutSeconds = 30
+$cimProbeTimeoutSeconds = 15
+
+# Ceiling on waiting for one TerminateProcess to be reaped. Same reasoning: a
+# kernel that has not finished tearing a process down in this long is not about
+# to, and the `throw` matters more than the confirmation.
+$reapTimeoutSeconds = 5
 
 # A CIM probe's bound in whole seconds, never more than the budget has left.
 # `-OperationTimeoutSec 0` means "client default", i.e. unbounded here, so 1 is
@@ -144,7 +156,7 @@ function Get-CimTimeoutSec([datetime]$Deadline) {
 # has reaped the process, so waiting matters -- but waiting forever here would
 # be that same second hang. The bound is a failure report on a termination that
 # has not completed, not a synchronisation.
-function Wait-ProcessReaped([int]$ProcessId, [string]$What, [int]$TimeoutSeconds = 15) {
+function Wait-ProcessReaped([int]$ProcessId, [string]$What, [int]$TimeoutSeconds = $reapTimeoutSeconds) {
     Wait-Process -Id $ProcessId -Timeout $TimeoutSeconds -ErrorAction SilentlyContinue
     if (Get-Process -Id $ProcessId -ErrorAction SilentlyContinue) {
         Write-Host "::warning::$What (pid $ProcessId) had not exited ${TimeoutSeconds}s after being killed"
@@ -163,6 +175,9 @@ function Wait-ProcessReaped([int]$ProcessId, [string]$What, [int]$TimeoutSeconds
 function Get-SuspendedThreadCount([int]$ProcessId) {
     $proc = Get-Process -Id $ProcessId -ErrorAction SilentlyContinue
     if (-not $proc) { return 0 }
+    # `-and` short-circuits, which is what keeps `WaitReason` -- documented to
+    # throw on a thread that is not waiting -- from being read on one. Do not
+    # reorder the two clauses.
     return @($proc.Threads | Where-Object { $_.ThreadState -eq 'Wait' -and $_.WaitReason -eq 'Suspended' }).Count
 }
 
@@ -179,8 +194,10 @@ function Get-SuspendedThreadCount([int]$ProcessId) {
 # one. The caller measures that afterwards with Get-SuspendedThreadCount and
 # acts on it, rather than this function guessing from how cdb ended.
 #
-# Everything this writes goes to the host stream (`Write-Host`/`Out-Host`), so
-# the caller can invoke it bare with nothing reaching the output stream.
+# Returns $true when cdb was actually launched -- the caller must not read a
+# suspended target as this capture's doing when no attach ever happened.
+# Everything else this writes goes to the host stream (`Write-Host`/`Out-Host`),
+# so the boolean is all that reaches the output stream.
 function Invoke-StackCapture {
     param(
         [Parameter(Mandatory)][string]$DebuggerPath,
@@ -216,7 +233,7 @@ function Invoke-StackCapture {
             -RedirectStandardOutput $StdoutSinkPath -RedirectStandardInput $EmptyStdinPath
     } catch {
         Write-Host "::warning::failed to start cdb against $Label (pid ${TargetId}): $($_.Exception.Message)"
-        return
+        return $false
     }
 
     # cdb is an external process that may never return -- a symbol-server
@@ -246,6 +263,8 @@ function Invoke-StackCapture {
         Write-Host "(failed to read ${OutFile}: $($_.Exception.Message))"
     }
     Write-Host "::endgroup::"
+
+    return $true
 }
 
 # `Start-Process -ArgumentList` joins array elements with a single space and
@@ -279,7 +298,14 @@ if (-not $proc.WaitForExit([int]($BoundMinutes * 60000))) {
     Write-Host "--- HoleBridge service state ---"
     try {
         $svc = Get-Service -Name HoleBridge -ErrorAction SilentlyContinue
-        if ($svc) { $svc | Format-List * } else { Write-Host "(HoleBridge service not registered)" }
+        # Named properties rather than `*`: ServiceController's
+        # DependentServices/ServicesDependedOn/RequiredServices each make a
+        # fresh, unbounded SCM RPC on access -- on the very SCM that is failing
+        # to answer SERVICE_CONTROL_STOP -- and HoleBridge declares no
+        # dependencies either way. Everything else `*` printed is still here.
+        if ($svc) {
+            $svc | Format-List Name, DisplayName, Status, StartType, ServiceType, CanStop, CanShutdown, CanPauseAndContinue, MachineName
+        } else { Write-Host "(HoleBridge service not registered)" }
     } catch {
         Write-Host "(failed to query HoleBridge service: $($_.Exception.Message))"
     }
@@ -449,13 +475,31 @@ if (-not $proc.WaitForExit([int]($BoundMinutes * 60000))) {
                     Write-Host "::warning::stack-capture budget of ${StackCaptureSeconds}s is spent -- no stack captured for $($target.Label) (pid $($target.Id))"
                     continue
                 }
-                $outFile = Join-Path $stackDir "$stackBase-stack-$($target.Label)-$($target.Id).txt"
-                Invoke-StackCapture -DebuggerPath $resolvedCdbPath -TargetId $target.Id -Label $target.Label -OutFile $outFile `
-                    -StdoutSinkPath (Join-Path $stackDir "cdb-stdout-$($target.Id).log") -EmptyStdinPath $emptyStdin -BudgetMs $remainingMs
-                $frozenThreads = Get-SuspendedThreadCount $target.Id
-                if ($frozenThreads -gt 0) {
-                    Write-Host "::warning::the capture left $($target.Label) (pid $($target.Id)) with $frozenThreads thread(s) suspended"
-                    $suspendedTargetIds += $target.Id
+                # Isolated per target: a terminating error here would
+                # otherwise abandon every later target's capture AND leave this
+                # one attached-but-unmeasured, i.e. frozen with nothing left in
+                # the job to thaw it.
+                try {
+                    $outFile = Join-Path $stackDir "$stackBase-stack-$($target.Label)-$($target.Id).txt"
+                    $sinkFile = Join-Path $stackDir "$stackBase-cdbout-$($target.Label)-$($target.Id).log"
+                    # A BASELINE, not an absolute count. Something else can
+                    # suspend a process -- WerFault freezes a crashing target's
+                    # threads while it writes the dump -- and killing that
+                    # target would destroy better evidence than this capture
+                    # was ever going to produce. Only the threads THIS attach
+                    # added are this capture's to answer for, and cdb suspends
+                    # every one of them, so a real freeze is unmistakable and a
+                    # clean `qd` is exactly zero.
+                    $alreadySuspended = Get-SuspendedThreadCount $target.Id
+                    $launched = Invoke-StackCapture -DebuggerPath $resolvedCdbPath -TargetId $target.Id -Label $target.Label `
+                        -OutFile $outFile -StdoutSinkPath $sinkFile -EmptyStdinPath $emptyStdin -BudgetMs $remainingMs
+                    $frozenThreads = (Get-SuspendedThreadCount $target.Id) - $alreadySuspended
+                    if ($launched -and $frozenThreads -gt 0) {
+                        Write-Host "::warning::the capture left $($target.Label) (pid $($target.Id)) with $frozenThreads thread(s) suspended"
+                        $suspendedTargetIds += $target.Id
+                    }
+                } catch {
+                    Write-Host "::warning::capture of $($target.Label) (pid $($target.Id)) failed: $($_.Exception.Message)"
                 }
             }
         }
@@ -495,9 +539,9 @@ if (-not $proc.WaitForExit([int]($BoundMinutes * 60000))) {
     # runs next (`if: always()`), and on Uninstall it would keep appending to
     # the log while "Upload MSI logs" reads it. Best-effort and isolated like
     # the probes above -- a failure here must not swallow the wedge `throw`.
-    # Deferred by up to $StackCaptureSeconds so the stack capture above sees a
-    # live tree; the msiexec log keeps growing for that long, which the tail
-    # printed earlier is already past.
+    # Deferred by the whole capture above -- its budget plus the reaps -- so
+    # the stacks are taken from a live tree; the msiexec log keeps growing for
+    # that long, which the tail printed earlier is already past.
     Write-Host "--- killing wedged process tree ---"
     try {
         # A tree member already terminated for being left suspended would

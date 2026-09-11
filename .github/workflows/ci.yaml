@@ -851,14 +851,22 @@ jobs:
       # after a fresh install. Tauri's single-instance plugin would route
       # tauri-driver's new launch into that already-running instance, so we
       # need a clean slate. `Stop-Process -Force` calls `TerminateProcess`
-      # synchronously; the subsequent `Wait-Process -ErrorAction Ignore`
-      # waits for the process object to be reaped without depending on a
-      # wall-clock delay.
+      # synchronously; the subsequent `Wait-Process` waits for the process
+      # object to be reaped without depending on a wall-clock delay.
       - name: Kill any running hole.exe (post-install LaunchApp)
         shell: pwsh
         run: |
-          Get-Process hole -ErrorAction SilentlyContinue | Stop-Process -Force
-          Wait-Process -Name hole -ErrorAction SilentlyContinue
+          # Waits on the process OBJECTS, not the name: HoleBridge carries SCM
+          # restart-on-failure with a 1s delay, so `Wait-Process -Name hole`
+          # re-resolves onto each restart and never returns. The bound is the
+          # failure report for a kill that did not take, not a delay.
+          $holeProcs = @(Get-Process hole -ErrorAction SilentlyContinue)
+          if ($holeProcs) {
+            $holeProcs | Stop-Process -Force
+            $holeProcs | Wait-Process -Timeout 30 -ErrorAction SilentlyContinue
+            $alive = @($holeProcs | Where-Object { -not $_.HasExited })
+            if ($alive) { Write-Host "::warning::hole.exe pid(s) $($alive.Id -join ', ') did not exit 30s after being killed" }
+          }
 
       # gsudo runs the dashboard E2E at Medium integrity. GitHub runners run
       # every process at High integrity (admin + UAC disabled), and WebView2
@@ -915,8 +923,17 @@ jobs:
         if: always()
         shell: pwsh
         run: |
-          Get-Process hole -ErrorAction SilentlyContinue | Stop-Process -Force
-          Wait-Process -Name hole -ErrorAction SilentlyContinue
+          # Waits on the process OBJECTS, not the name: HoleBridge carries SCM
+          # restart-on-failure with a 1s delay, so `Wait-Process -Name hole`
+          # re-resolves onto each restart and never returns. The bound is the
+          # failure report for a kill that did not take, not a delay.
+          $holeProcs = @(Get-Process hole -ErrorAction SilentlyContinue)
+          if ($holeProcs) {
+            $holeProcs | Stop-Process -Force
+            $holeProcs | Wait-Process -Timeout 30 -ErrorAction SilentlyContinue
+            $alive = @($holeProcs | Where-Object { -not $_.HasExited })
+            if ($alive) { Write-Host "::warning::hole.exe pid(s) $($alive.Id -join ', ') did not exit 30s after being killed" }
+          }
 
       - name: Dump install log on failure
         if: failure()
@@ -949,7 +966,8 @@ jobs:
       # Uninstall start msiexec, so `if-no-files-found: ignore` only covers a
       # job that failed before either did. `*-stack-*.txt` are the per-thread
       # native stacks a wedge captures; they are echoed into the job log too,
-      # and exist only when a step wedged.
+      # and exist only when a step wedged; `*-cdbout-*.log` is the debugger's
+      # stdout, the backstop for a capture whose log file never opened.
       - name: Upload MSI logs
         if: always()
         uses: actions/upload-artifact@v7
@@ -959,6 +977,7 @@ jobs:
             ${{ runner.temp }}/msi-install.log
             ${{ runner.temp }}/msi-uninstall.log
             ${{ runner.temp }}/*-stack-*.txt
+            ${{ runner.temp }}/*-cdbout-*.log
           if-no-files-found: ignore
           retention-days: 14
 

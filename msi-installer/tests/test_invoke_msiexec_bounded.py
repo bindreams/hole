@@ -81,6 +81,29 @@ def _python_exe_args(*code: str) -> list[str]:
     return ["-c", *code]
 
 
+def _kill_processes_matching(command_line_fragment: str) -> None:
+    """Best-effort cleanup of stand-ins a failing script may have orphaned.
+
+    Matched on command line rather than name so it can only ever hit processes
+    launched from this test's own tmp_path.
+    """
+    quoted = command_line_fragment.replace("'", "''")
+    subprocess.run(
+        [
+            "pwsh",
+            "-NoProfile",
+            "-Command",
+            "Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | "
+            f"Where-Object {{ $_.CommandLine -and $_.CommandLine.Contains('{quoted}') }} | "
+            "ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }}".replace(
+                "{{", "{"
+            ).replace("}}", "}"),
+        ],
+        capture_output=True,
+        timeout=60,
+    )
+
+
 def _real_cdb_path() -> Path:
     """The debugger the script itself would find. Fails rather than skips when
     the SDK's Debugging Tools are absent -- see the `cdb` marker."""
@@ -222,6 +245,10 @@ def test_wedge_captures_symbolised_native_stacks_of_the_wedged_process(tmp_path:
     those are captured first and can spend the budget before the stand-in's
     turn.
     """
+    # Asserted, not passed as `-CdbPath`: the script's own discovery is part of
+    # what this covers, and a missing toolchain must say so here rather than
+    # surface as an empty-looking capture further down.
+    _real_cdb_path()
     log_path = tmp_path / "wedge.log"
 
     result = _run_script(
@@ -250,9 +277,16 @@ def test_wedge_captures_symbolised_native_stacks_of_the_wedged_process(tmp_path:
 
     assert "Child-SP" in text, f"cdb produced no stack listing:\n{text}"
     assert "ntdll!" in text, f"frames carry no module-qualified names:\n{text}"
-    assert "pdb symbols" in text, f"no module loaded a PDB -- symbol resolution is broken:\n{text}"
+    assert "pdb symbols" in text, (
+        "no module loaded a PDB -- symbol resolution is broken, or "
+        f"msdl.microsoft.com did not serve the OS symbols this needs:\n{text}"
+    )
     # The job log is where a reader actually looks; the artifact is the backup.
     assert "Child-SP" in combined, f"stacks were written to file but never echoed to the job log:\n{combined}"
+    # The other half of the terminate response: a capture that detached cleanly
+    # froze nothing, so nothing may be killed for having been frozen.
+    assert "terminated suspended pid" not in combined, \
+        f"a target this capture did not freeze was terminated anyway:\n{combined}"
 
 
 def test_a_hung_debugger_is_killed_partial_output_survives_and_the_wedge_still_throws(tmp_path: Path) -> None:
@@ -271,18 +305,27 @@ def test_a_hung_debugger_is_killed_partial_output_survives_and_the_wedge_still_t
     standin.write_text("@echo off\necho STANDIN-PARTIAL-OUTPUT\n:loop\ngoto loop\n")
 
     start = time.monotonic()
-    result = _run_script(
-        params={
-            "Verb": "/x",
-            "MsiPath": "unused.msi",
-            "LogPath": str(log_path),
-            "BoundMinutes": "0.02",
-            "ExePath": sys.executable,
-            "StackCaptureSeconds": "3",
-            "CdbPath": str(standin),
-        },
-        exe_args=_python_exe_args("import time; time.sleep(3600)"),
-    )
+    try:
+        result = _run_script(
+            params={
+                "Verb": "/x",
+                "MsiPath": "unused.msi",
+                "LogPath": str(log_path),
+                "BoundMinutes": "0.02",
+                "ExePath": sys.executable,
+                "StackCaptureSeconds": "3",
+                "CdbPath": str(standin),
+            },
+            exe_args=_python_exe_args("import time; time.sleep(3600)"),
+            # Comfortably above the `elapsed` assertion below, so a regression
+            # trips that (with the output attached) instead of TimeoutExpired.
+            timeout=120,
+        )
+    finally:
+        # A regression that never kills the stand-in would otherwise leave its
+        # `goto` loop spinning a core for the rest of the session; subprocess
+        # only reaps the direct pwsh child.
+        _kill_processes_matching(str(standin))
     elapsed = time.monotonic() - start
     combined = result.stdout + result.stderr
 
