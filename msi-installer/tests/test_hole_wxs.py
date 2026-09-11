@@ -1092,6 +1092,28 @@ def _wxs_comments() -> list[str]:
     return re.findall(r"<!--(.*?)-->", WXS_PATH.read_text(encoding="utf-8"), re.DOTALL)
 
 
+def _paragraphs(comment: str) -> list[str]:
+    """The blank-line-separated paragraphs of one comment.
+
+    The scope the guards below run at, and the whole reason they bite. The
+    release rationale is a SINGLE `<!-- ... -->` block covering four subjects,
+    so a guard that searched the block was satisfied by a qualifier three
+    paragraphs above the claim it was meant to qualify — see
+    `test_the_guards_reject_the_wording_they_exist_to_delete`.
+    """
+    return [p for p in re.split(r"\n\s*\n", comment) if p.strip()]
+
+
+def _netsh_claims_without_qualifier(comment: str) -> list[str]:
+    """Paragraphs naming `netsh wfp` without saying, in that paragraph, that it removes nothing."""
+    return [p for p in _paragraphs(comment) if "netsh wfp" in p and not any(q in p for q in _NETSH_IS_NOT_A_REMEDY)]
+
+
+def _keep_covers_claims_without_remedy(comment: str) -> list[str]:
+    """Paragraphs naming HOLE_KEEP_COVERS without naming, in that paragraph, what clears it."""
+    return [p for p in _paragraphs(comment) if "HOLE_KEEP_COVERS" in p and "reinstall" not in p.lower()]
+
+
 def test_wxs_comments_offer_no_remedy_that_does_not_exist() -> None:
     """The rationale a maintainer reads before touching Return='check' has to be true.
 
@@ -1104,24 +1126,63 @@ def test_wxs_comments_offer_no_remedy_that_does_not_exist() -> None:
     `an_unproven_release_does_not_send_the_operator_to_a_command_that_cannot_help`.
     """
     for comment in _wxs_comments():
-        if "netsh wfp" not in comment:
-            continue
-        assert any(p in comment for p in _NETSH_IS_NOT_A_REMEDY), (
-            f"a hole.wxs comment names `netsh wfp` without saying it removes nothing; "
-            f"allowed qualifiers: {_NETSH_IS_NOT_A_REMEDY}\n---\n{comment.strip()}"
+        unqualified = _netsh_claims_without_qualifier(comment)
+        assert not unqualified, (
+            f"a hole.wxs paragraph names `netsh wfp` without saying it removes nothing; "
+            f"allowed qualifiers: {_NETSH_IS_NOT_A_REMEDY}\n---\n" + "\n---\n".join(p.strip() for p in unqualified)
         )
 
 
 def test_keep_covers_comment_names_the_only_way_back() -> None:
-    """HOLE_KEEP_COVERS strands the block; the comment must say what clears it.
+    """HOLE_KEEP_COVERS strands the block; the paragraph that names it must say what clears it.
 
     Removing a WFP filter takes an FWPM call and hole.exe is the only caller
     of one on the host, so reinstalling Hole is the whole remedy. Saying
     nothing leaves the escape looking cheaper than it is.
     """
-    comments = [c for c in _wxs_comments() if "HOLE_KEEP_COVERS" in c]
-    assert comments, "no hole.wxs comment explains HOLE_KEEP_COVERS"
-    for comment in comments:
-        assert "reinstall" in comment.lower(
-        ), (f"the HOLE_KEEP_COVERS rationale must name reinstalling Hole as the way back"
-            f"\n---\n{comment.strip()}")
+    assert any("HOLE_KEEP_COVERS" in c for c in _wxs_comments()), "no hole.wxs comment explains HOLE_KEEP_COVERS"
+    for comment in _wxs_comments():
+        silent = _keep_covers_claims_without_remedy(comment)
+        assert not silent, (
+            "the HOLE_KEEP_COVERS rationale must name reinstalling Hole as the way back, in the "
+            "paragraph that names the property\n---\n" + "\n---\n".join(p.strip() for p in silent)
+        )
+
+
+# The shape both guards above missed while they searched whole comments: a
+# qualified, remedy-naming paragraph followed by a paragraph that claims
+# neither. The last clause is hole.wxs:301's pre-PR wording verbatim — commit
+# c1b790b1 deleted it because it sends a maintainer weighing Return="check" to
+# a command that removes nothing. Restoring only that line left both guards
+# green.
+_QUALIFIED_PARAGRAPH = """\
+         `netsh wfp` is diagnostics-only — capture, dump, help, set, show, and
+         no delete verb — and removing a WFP filter takes an FWPM call, whose
+         only caller on the host is the hole.exe this uninstall is about to
+         delete. Reinstalling Hole is the way back (#1003)."""
+
+_PRE_PR_KEEP_COVERS_PARAGRAPH = """\
+         HOLE_KEEP_COVERS is the escape from the escape: Return="check" means a
+         release that can never succeed (BFE stopped, hole.exe quarantined)
+         would otherwise make the product permanently unremovable. Documented
+         in RELEASE-OPS.md as a last resort; it leaves the block in
+         place, so `netsh wfp` is the only thing left after it."""
+
+
+def test_the_guards_reject_the_wording_they_exist_to_delete() -> None:
+    """Both guards, against the exact mutation that used to slip past them.
+
+    Not a fixture for its own sake: it is the only thing standing between the
+    guards and a revert to comment scope, where the qualifier and the remedy
+    in the first paragraph answer for every paragraph after it.
+    """
+    comment = _QUALIFIED_PARAGRAPH + "\n\n" + _PRE_PR_KEEP_COVERS_PARAGRAPH
+
+    assert _netsh_claims_without_qualifier(comment) == [_PRE_PR_KEEP_COVERS_PARAGRAPH], (
+        "a `netsh wfp` claim must be qualified where it is made; a qualifier in an earlier "
+        "paragraph of the same comment does not answer for it"
+    )
+    assert _keep_covers_claims_without_remedy(comment) == [_PRE_PR_KEEP_COVERS_PARAGRAPH], (
+        "the HOLE_KEEP_COVERS remedy must be named where the property is named; 'reinstall' in "
+        "an earlier paragraph of the same comment does not answer for it"
+    )
