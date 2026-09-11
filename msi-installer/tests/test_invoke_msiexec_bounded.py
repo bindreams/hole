@@ -267,7 +267,10 @@ def test_a_hung_debugger_is_killed_partial_output_survives_and_the_wedge_still_t
     assert "did not finish" in combined, f"the hung debugger was not reported:\n{combined}"
     assert "STANDIN-PARTIAL-OUTPUT" in combined, f"partial capture output was discarded:\n{combined}"
     assert WEDGE_THROW in combined, f"the hung debugger swallowed the wedge throw:\n{combined}"
-    assert "killed process id(s)" in combined, f"the tree kill was skipped after a hung debugger:\n{combined}"
+    # A non-invasive attach leaves its target suspended when the debugger is
+    # killed rather than detached, and nothing else in the job releases it.
+    assert "terminated suspended pid" in combined, f"the frozen target was left suspended:\n{combined}"
+    assert "--- killing wedged process tree ---" in combined, f"the tree kill was skipped:\n{combined}"
 
 
 def test_stack_capture_budget_exhaustion_is_reported_and_does_not_swallow_the_wedge(tmp_path: Path) -> None:
