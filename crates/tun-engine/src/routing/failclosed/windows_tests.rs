@@ -843,38 +843,6 @@ fn a_sweep_of_todays_keys_proves_every_one_of_them_empty() {
 }
 
 #[skuld::test]
-fn a_boot_time_flag_cannot_be_introduced_without_classifying_its_key() {
-    // A tripwire, deliberately, and not a proof — the fact it guards spans a
-    // runtime `FilterSpec` (what `add_filter` stamps) and a static sweep array
-    // (what `release_all` classifies), and no type in this module holds both.
-    //
-    // What it catches is the one mistake that is silent AND harmful: adding a
-    // `FWPM_FILTER_FLAG_BOOTTIME` filter (bindreams/hole#998, #1010) while
-    // leaving its key tagged `KeyLifetime::Persistent`. `release_all` would
-    // then report proof it does not have, and the MSI would delete `hole.exe`
-    // on the strength of it (bindreams/hole#1003). Both halves are absent
-    // today; whoever adds the first must add the other.
-    //
-    // Comments are stripped first: this module's docs discuss the boot-time
-    // flag by name (`disengage_lockdown`, `release_all`), and a guard that
-    // counted prose would fire on documentation alone — the fastest way to
-    // get a tripwire deleted rather than obeyed.
-    let code: String = include_str!("windows.rs")
-        .lines()
-        .filter(|l| !l.trim_start().starts_with("//"))
-        .collect::<Vec<_>>()
-        .join("\n");
-    let installs_boot_time = code.contains("FWPM_FILTER_FLAG_BOOTTIME");
-    let classifies_boot_time = code.contains("KeyLifetime::BootTime");
-    assert_eq!(
-        installs_boot_time, classifies_boot_time,
-        "windows.rs installs boot-time filters ({installs_boot_time}) but classifies boot-time keys \
-         ({classifies_boot_time}); a sweep that deletes a boot-time key while calling it Persistent \
-         reports a proof of removal it never observed"
-    );
-}
-
-#[skuld::test]
 fn adopt_does_not_delete_the_address_range_loopback_floor() {
     // The address-range loopback permits are floor, not volatile: Adopt must keep
     // them (only the TUN-LUID + server-IP pairs are dropped). adopt_delete_guids

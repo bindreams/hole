@@ -1428,7 +1428,10 @@ pins that). The ordering is on purpose: the gate lands **before** the
 boot-time filters of #998/#1010 do, so they cannot arrive as a silent false
 `Ok`. `a_boot_time_flag_cannot_be_introduced_without_classifying_its_key` is
 the tripwire — a source-level check, because the fact it guards spans a runtime
-`FilterSpec` and a static sweep array and no type holds both.
+`FilterSpec` and a static sweep array and no type holds both. It reads the
+`failclosed/` production sources off disk rather than one hardcoded file, so an
+add landing in a new submodule cannot slip past both halves; the `*_tests.rs`
+siblings are excluded, or the scan would read an install out of test code.
 
 The in-process escapes (`disengage_lockdown`, `ProxyManager::turn_lockdown_off`,
 the tray's Unblock) share the same boot-time blind spot and deliberately do

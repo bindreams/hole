@@ -537,6 +537,14 @@ mod facade_tests;
 #[path = "failclosed/clearance_tests.rs"]
 mod clearance_tests;
 
+// Deliberately NOT platform-gated either, and for the same reason: the mistake
+// it catches is Windows-only, so gating the guard to Windows would put the
+// proof on the same platform as the hazard and nowhere else. It reads the
+// sources off disk, which every lane can do.
+#[cfg(test)]
+#[path = "failclosed/boot_time_tripwire_tests.rs"]
+mod boot_time_tripwire_tests;
+
 // Privileged-lane real-engage verification (#527): engages the REAL OS cover and
 // asserts it blocks egress. Gated to the elevated `hole-tests` TUN lane by the
 // `TUN` label (see the module docs); excluded from the unprivileged pass.
