@@ -432,6 +432,61 @@ fn purge_state_dir_removes_the_tree_and_tolerates_its_absence() {
     purge_state_dir(&state); // idempotent: a host that never had one
 }
 
+// Peer state dirs -----------------------------------------------------------------------------------------------------
+//
+// The liveness probe's reach. A peer set that resolves to nothing is not a
+// quiet degradation: `release_covers_with` reads "no lock held anywhere" and
+// clears machine-wide WFP filters out from under a live bridge whose posture
+// still claims them. The whole check silently passes.
+
+#[skuld::test]
+fn the_windows_profile_mapping_is_the_local_appdata_layout() {
+    // `%LOCALAPPDATA%` is `<profile>\AppData\Local`, so a profile maps to the
+    // same leaf `default_state_dir()` builds for the account that owns it.
+    // Compiled everywhere — it is a pure join, and pinning it only on Windows
+    // would put the proof on the one lane that already has the platform test
+    // below.
+    let mapped = hole_common::paths::windows_profile_state_dir(std::path::Path::new("C:/Users/alice"));
+    assert_eq!(
+        mapped,
+        std::path::PathBuf::from("C:/Users/alice")
+            .join("AppData")
+            .join("Local")
+            .join("hole")
+            .join("state")
+    );
+}
+
+#[cfg(target_os = "windows")]
+#[skuld::test]
+fn the_windows_peer_mapping_matches_what_a_bridge_resolves() {
+    // Falsifies the mapping against the real resolver rather than restating
+    // it: a bridge started by this account resolves its state dir through
+    // `default_state_dir()` (i.e. `dirs::data_local_dir`), and the peer probe
+    // has to arrive at the same path from the profile directory alone. If the
+    // two ever diverge the probe looks in the wrong place and always passes.
+    let profile = std::path::PathBuf::from(std::env::var("USERPROFILE").expect("USERPROFILE"));
+    assert_eq!(
+        hole_common::paths::windows_profile_state_dir(&profile),
+        hole_common::paths::default_state_dir()
+    );
+}
+
+#[cfg(target_os = "windows")]
+#[skuld::test]
+fn the_windows_peer_set_reaches_accounts_other_than_this_process() {
+    // The #1003/F3 regression itself: the peer enumeration used to be
+    // macOS-only, so on Windows the set was just `default_state_dir()` — the
+    // process's OWN dir, which `release_covers_with` skips as already probed.
+    // The probe then found nothing, every time.
+    let dirs = peer_state_dirs();
+    let profile = std::path::PathBuf::from(std::env::var("USERPROFILE").expect("USERPROFILE"));
+    assert!(
+        dirs.contains(&hole_common::paths::windows_profile_state_dir(&profile)),
+        "the profile enumeration must reach this host's real profiles: {dirs:?}"
+    );
+}
+
 // Release clearance ---------------------------------------------------------------------------------------------------
 //
 // `bridge release-covers` is the last moment `hole.exe` exists on an
@@ -477,16 +532,59 @@ fn a_proven_release_says_nothing_extra() {
 }
 
 #[skuld::test]
-fn an_unproven_release_names_the_keys_and_the_remedy() {
+fn an_unproven_release_names_the_keys_and_a_command_that_exists() {
+    // The diagnostic has to be a command the operator can actually run, and
+    // the one that shows a surviving boot-time record specifically:
+    // `netsh wfp show boottimepolicy` (learn.microsoft.com/windows-server/
+    // administration/windows-commands/netsh-wfp). `show filters` lists what is
+    // active NOW, which by definition excludes a boot-time filter after BFE
+    // has started — the only moment this message is ever read.
     let report = release_clearance_report(&unproven_clearance(&["lockdown boot-time block-all V4"]))
         .expect("an unproven clearance must be reported");
     assert!(
         report.contains("lockdown boot-time block-all V4"),
-        "the key must be named — `netsh wfp` is the only remedy left and it needs a target: {report}"
+        "the key must be named — with the binary gone, the label is all an operator can look it up by: {report}"
     );
     assert!(
-        report.contains("netsh wfp"),
-        "the remedy must be named while the message can still reach someone: {report}"
+        report.contains("netsh wfp show boottimepolicy"),
+        "the diagnostic must name the one netsh command that shows a surviving boot-time record: {report}"
+    );
+}
+
+#[skuld::test]
+fn an_unproven_release_does_not_send_the_operator_to_a_command_that_cannot_help() {
+    // `netsh wfp` is diagnostics-only — its verbs are capture, dump, help, set
+    // and show; there is no delete. Telling a user in the one state where they
+    // have no other tool that "`netsh wfp` can remove it" is a dead end
+    // dressed as a remedy, and the previous test pinned that exact string.
+    let report = release_clearance_report(&unproven_clearance(&["k"])).expect("reported");
+    let lowered = report.to_lowercase();
+    for claim in ["netsh wfp` can remove", "netsh wfp can remove", "netsh wfp delete"] {
+        assert!(
+            !lowered.contains(claim),
+            "netsh wfp has no delete verb; the message must not imply otherwise ({claim}): {report}"
+        );
+    }
+    assert!(
+        lowered.contains("no delete verb"),
+        "the message must say plainly that netsh cannot remove a filter, or the reader will try: {report}"
+    );
+}
+
+#[skuld::test]
+fn an_unproven_release_names_something_that_can_actually_remove_the_filter() {
+    // Removing a WFP filter takes an FWPM call. Once `RemoveFiles` has run,
+    // no such caller is left on the host — so the honest remedy is to put one
+    // back, and the message must say so rather than trail off.
+    let report = release_clearance_report(&unproven_clearance(&["k"])).expect("reported");
+    assert!(
+        report.contains("release-covers"),
+        "the remedy must name the command that addresses these keys: {report}"
+    );
+    let lowered = report.to_lowercase();
+    assert!(
+        lowered.contains("reinstall"),
+        "and must say how to get it back, since RemoveFiles just deleted it: {report}"
     );
 }
 

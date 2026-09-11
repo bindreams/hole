@@ -13,6 +13,9 @@ pub mod os;
 #[cfg(target_os = "windows")]
 pub mod scm_wait;
 
+#[cfg(target_os = "windows")]
+mod windows_profiles;
+
 use std::path::{Path, PathBuf};
 
 use tun_engine::routing::failclosed::Clearance;
@@ -206,9 +209,10 @@ fn unlock_with(state_dir: &Path, disengage: impl FnOnce() -> std::io::Result<()>
 ///
 /// That does NOT make it an error. See [`Clearance`] for the bound on the
 /// harm: a stranded boot-time record blocks egress across the boot→BFE window
-/// only, so failing the uninstall over it would trade a seconds-long block for
-/// a permanently unremovable product — the exact trade the paragraph above
-/// refuses for the bookkeeping. The gate stops claiming proof it does not
+/// only (a bounded window whose length is unmeasured), so failing the
+/// uninstall over it would trade a bounded early-boot block for a permanently
+/// unremovable product — the exact trade the paragraph above refuses for the
+/// bookkeeping. The gate stops claiming proof it does not
 /// have; it does not withhold the uninstall. `hole bridge release-covers`
 /// turns an unproven clearance into something an operator can act on.
 pub fn release_covers() -> std::io::Result<Clearance> {
@@ -243,6 +247,20 @@ pub fn release_covers() -> std::io::Result<Clearance> {
 /// equally consistent with never having been installed — which is what it will
 /// be on almost every uninstall — and crying leftover every time is how the
 /// one host where it is real gets ignored.
+///
+/// The remedy it names has to be one that exists. `netsh wfp` is a
+/// **diagnostics-only** context — its verbs are `capture`, `dump`, `help`,
+/// `set` and `show`, with no `delete`
+/// (<https://learn.microsoft.com/windows-server/administration/windows-commands/netsh-wfp>)
+/// — so the message says so outright rather than sending the reader to a
+/// command that cannot help in the one state where they have nothing else.
+/// The diagnostic it does name is `show boottimepolicy`, the subcommand for
+/// exactly this key class; `show filters` lists what is active *now*, which by
+/// definition excludes a boot-time filter once BFE has started, i.e. at every
+/// moment this message is read.
+///
+/// Removing a WFP filter takes an FWPM call, and `RemoveFiles` just deleted
+/// the only caller on the host. So the only honest remedy is to put one back.
 pub fn release_clearance_report(clearance: &Clearance) -> Option<String> {
     if clearance.is_proven() {
         return None;
@@ -251,9 +269,12 @@ pub fn release_clearance_report(clearance: &Clearance) -> Option<String> {
         "covers released, but {} boot-time filter key(s) could not be proven empty: {}. \
          A boot-time filter is live only between kernel start and Base Filtering Engine start, \
          so a delete-by-key finds nothing on any later boot whether or not a policy record \
-         survives behind it. If egress is blocked early in boot after this uninstall, \
-         `netsh wfp show filters` will show any leftover and `netsh wfp` can remove it — \
-         no Hole binary remains that could.",
+         survives behind it. To check after this uninstall, run `netsh wfp show boottimepolicy` \
+         elevated and look for these keys; if egress is blocked early in boot, that is where it \
+         would show. `netsh wfp` cannot remove one — it has no delete verb, only capture/dump/\
+         set/show — and removing a WFP filter takes an FWPM call, which no binary left on this \
+         host can make. Reinstalling Hole and running `hole bridge release-covers` elevated puts \
+         back the only tool that addresses these keys.",
         clearance.unproven_keys().len(),
         clearance.unproven_keys().join(", "),
     ))
@@ -271,35 +292,67 @@ pub fn release_clearance_report(clearance: &Clearance) -> Option<String> {
 /// runs to a per-user dir, which is that bridge in practice.
 ///
 /// Disclosed residual: a bridge given an explicit `--state-dir` outside this
-/// set, or a per-user dir belonging to some other account (the MSI's CAs run as
-/// SYSTEM, whose `default_state_dir` is not the developer's), is still
-/// undetectable here. `bridge release-covers` is hidden and uninstall-only for
-/// that reason.
+/// set is still undetectable here. `bridge release-covers` is hidden and
+/// uninstall-only for that reason.
 fn peer_state_dirs() -> Vec<PathBuf> {
     let mut dirs = vec![hole_common::paths::default_state_dir()];
-    if let Some(dir) = real_user_state_dir() {
-        dirs.push(dir);
-    }
+    dirs.extend(other_account_state_dirs());
     dirs
 }
 
-/// The state dir an elevated, non-`--service` run resolves against the real
-/// user behind `sudo`, rather than the effective one `default_state_dir` sees.
-/// macOS only — no other platform has that indirection.
-fn real_user_state_dir() -> Option<PathBuf> {
+/// The per-user state dirs belonging to accounts other than this process's
+/// own, which `default_state_dir` cannot reach.
+///
+/// Both platforms have the indirection; they just have different shapes of it,
+/// and NEITHER may answer with a silent empty set on a failure — an empty peer
+/// list is indistinguishable from "no other bridges", which is exactly the
+/// unconditional pass this probe exists to prevent. So a failure to enumerate
+/// warns, at the level an operator reading an uninstall's output will see.
+///
+/// - **macOS**: one indirection, `sudo`. The effective user is root while the
+///   bridge's own state dir is the invoking user's, so the real user behind
+///   the elevation is resolved and mapped.
+/// - **Windows**: elevation does NOT switch profiles, so an elevated
+///   non-`--service` bridge uses the interactive user's own `%LOCALAPPDATA%`
+///   — while the MSI's custom actions run as SYSTEM, which has a profile of
+///   its own. There is no "real user behind the elevation" to resolve; the
+///   answer is every profile on the host (see the `windows_profiles`
+///   submodule).
+fn other_account_state_dirs() -> Vec<PathBuf> {
     #[cfg(target_os = "macos")]
     {
         match crate::group::resolve_real_user() {
-            Ok(u) => Some(hole_common::paths::user_state_dir(&u.home)),
+            Ok(u) => vec![hole_common::paths::user_state_dir(&u.home)],
             Err(e) => {
-                tracing::debug!(error = %e, "no real user to resolve a peer state dir for");
-                None
+                tracing::warn!(
+                    error = %e,
+                    "could not resolve the real user behind this elevation; a bridge running under \
+                     that account would not be seen by the liveness probe"
+                );
+                Vec::new()
             }
         }
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "windows")]
     {
-        None
+        match windows_profiles::profile_dirs() {
+            Ok(profiles) => profiles
+                .iter()
+                .map(|p| hole_common::paths::windows_profile_state_dir(p))
+                .collect(),
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "could not enumerate this host's user profiles; a bridge running under another \
+                     account would not be seen by the liveness probe"
+                );
+                Vec::new()
+            }
+        }
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        Vec::new()
     }
 }
 

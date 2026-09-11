@@ -128,6 +128,8 @@ tar = "0.4"
 [target.'cfg(target_os = "windows")'.dependencies]
 payload-archive = { path = "../payload-archive" }
 windows-service = "0.8"
+# Safe HKLM reads for `cutover::windows_profiles` (ProfileList enumeration).
+windows-registry = "0.6"
 windows = { version = "0.62", features = [
     "Wdk_Foundation",
     "Wdk_System_SystemInformation",

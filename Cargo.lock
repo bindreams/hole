@@ -3458,6 +3458,7 @@ dependencies = [
  "walkdir",
  "webpki-roots",
  "windows 0.62.2",
+ "windows-registry",
  "windows-service",
  "xtask",
  "xtask-lib",

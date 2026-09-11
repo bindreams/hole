@@ -42,3 +42,26 @@ pub fn default_state_dir() -> PathBuf {
 pub fn user_state_dir(home: &std::path::Path) -> PathBuf {
     home.join("Library/Application Support/hole/state")
 }
+
+/// State directory inside a named Windows user profile, rather than the
+/// profile of whoever the process's token happens to belong to.
+///
+/// Windows' elevation does not switch profiles the way `sudo` does, so a
+/// foreground or elevated non-`--service` bridge resolves
+/// [`default_state_dir`] against the interactive user's own
+/// `%LOCALAPPDATA%`. `cutover::peer_state_dirs`, which runs as SYSTEM under
+/// the MSI and must find *that* bridge's liveness lock, cannot get there
+/// through `dirs` — SYSTEM has a profile of its own — so it enumerates the
+/// host's profiles and maps each one through here.
+///
+/// `%LOCALAPPDATA%` is `<profile>\AppData\Local`: `FOLDERID_LocalAppData` is
+/// not a redirectable known folder (unlike its roaming sibling), which is what
+/// makes this join equal to what `dirs::data_local_dir` returns for the user
+/// who owns `profile`. Pinned against the real resolver by
+/// `the_windows_peer_mapping_matches_what_a_bridge_resolves`.
+///
+/// A pure path join, compiled everywhere so its unit test needs no platform of
+/// its own — the same arrangement as [`user_state_dir`] above.
+pub fn windows_profile_state_dir(profile: &std::path::Path) -> PathBuf {
+    profile.join("AppData").join("Local").join("hole").join("state")
+}
