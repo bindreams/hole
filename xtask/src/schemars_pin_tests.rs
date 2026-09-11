@@ -7,8 +7,8 @@
 //! rule itself is no longer modelled here — see the module doc for why.
 
 use crate::schemars_pin::{
-    check_local_pin, declared_schemars_requirements, requirement_admits_beyond_pin, requirement_admits_series_patches,
-    upstream_schemars, verify_offline, version_tracks_pin, PINNED_SERIES, UPSTREAM,
+    check_local_pin, declared_schemars_requirements, requirement_admits_beyond_pin, upstream_schemars, verify_offline,
+    version_tracks_pin, PINNED_SERIES, UPSTREAM,
 };
 
 // Series arithmetic ===================================================================================================
@@ -166,89 +166,12 @@ fn a_reported_version_is_never_fabricated() {
     }
 }
 
-/// A range that stops short of the series' top has become the `enabled: false`
-/// the rule is written to avoid. The whole tail is the property, not "more than
-/// one release": the number the next security patch carries is not knowable in
-/// advance, so any ceiling below the next series can block it.
-///
-/// Answered from the range's own endpoints, like every other question in this
-/// module. A probe at one high in-series version cannot tell `>=0.8, <0.8.30`,
-/// which admits 0.8.23 through 0.8.29, from a range that admits nothing at all.
-#[skuld::test]
-fn a_requirement_that_stops_short_of_the_series_top_no_longer_admits_patches() {
-    for whole_tail in [
-        "<0.9",
-        "^0.8.22",
-        "0.8",
-        "*",
-        ">=0.8.16, <0.9",
-        // The endpoint is 0.9.0-alpha, which sorts above every 0.8.x release.
-        "<=0.9.0-alpha",
-    ] {
-        assert!(
-            requirement_admits_series_patches(whole_tail).unwrap(),
-            "req: {whole_tail}"
-        );
-    }
-    for capped in [
-        "=0.8.22",
-        ">=0.8, <0.8.30",
-        "<=0.8.30",
-        // The input that separates the interval from a probe: a ceiling above
-        // every patch anyone would sample, and still a ceiling.
-        "<0.8.99999",
-        // Nothing inside the series at all, from either side.
-        ">=0.9",
-        ">=2.0, <1.0",
-        // Pre-release-only ranges. Each sits inside `[0.8.0, 0.9.0)` by semver
-        // ordering while admitting no release at all — the tightest freeze
-        // there is, and the one a bounds check that ignores pre-releases calls
-        // healthy.
-        "=0.9.0-alpha",
-        "=0.9.0-0",
-        ">=0.9.0-alpha, <0.9.0",
-        "=0.8.22-rc.1",
-    ] {
-        assert!(!requirement_admits_series_patches(capped).unwrap(), "req: {capped}");
-    }
-}
-
-/// Renovate reads `allowedVersions` through node-semver, which separates ANDed
-/// comparators with whitespace. Refusing that spelling reds a pin that works.
-#[skuld::test]
-fn an_npm_spaced_range_is_read_rather_than_refused() {
-    assert!(requirement_admits_series_patches(">=0.8.22 <0.9").unwrap());
-    assert_eq!(requirement_admits_beyond_pin(">=0.8.22 <0.9").unwrap(), None);
-    assert_eq!(
-        requirement_admits_beyond_pin(">=0.8 <2")
-            .unwrap()
-            .map(|v| v.to_string()),
-        Some("0.9.0".to_string())
-    );
-}
-
-/// An OR range is a union of intervals and this guard carries one. Reading a
-/// single branch of `<0.9 || >=2` would call a range that readmits 2.x a pin,
-/// so it is refused — and the refusal has to say that, not that Renovate cannot
-/// read it.
-#[skuld::test]
-fn an_or_range_is_refused_as_a_union_this_guard_does_not_evaluate() {
-    let err = requirement_admits_beyond_pin("<0.9 || >=2").unwrap_err();
-    let message = err.to_string();
-    assert!(message.contains("OR range"), "unexpected error: {message}");
-    assert!(
-        !message.contains("is not a semver requirement range"),
-        "Renovate reads this range; the finding must not claim otherwise: {message}"
-    );
-}
-
 /// A range whose bounds cross admits nothing, so it admits nothing *beyond the
-/// pin* either. It is still broken — it blocks every 0.8.x patch — and that is
-/// the finding that fits it.
+/// pin* either. It is still broken — it blocks every 0.8.x patch — but that
+/// finding is no longer this module's to report; see the module doc.
 #[skuld::test]
 fn a_self_contradictory_range_is_not_reported_as_widening() {
     assert_eq!(requirement_admits_beyond_pin(">=2.0, <1.0").unwrap(), None);
-    assert!(!requirement_admits_series_patches(">=2.0, <1.0").unwrap());
 }
 
 #[skuld::test]

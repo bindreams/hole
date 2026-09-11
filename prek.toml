@@ -139,7 +139,7 @@ name = "schemars pin still tracks typify"
 entry = "cargo xtask check-schemars-pin"
 language = "system"
 pass_filenames = false
-files = "^(Cargo\\.lock|\\.github/renovate\\.json|crates/common/Cargo\\.toml|xtask/src/schemars_pin\\.rs)$"
+files = "^(Cargo\\.lock|crates/common/Cargo\\.toml|xtask/src/schemars_pin\\.rs)$"
 
 [[repos.hooks]]
 id = "check-workspace-lints"

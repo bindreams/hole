@@ -99,8 +99,9 @@
 //! - `cargo xtask check-schemars-pin` checks that *plus* the declared
 //!   requirement, and runs where a registry exists: the `check-schemars-pin`
 //!   prek hook, which `prek.toml` gates by `files` to commits touching
-//!   `Cargo.lock`, `.github/renovate.json`, `crates/common/Cargo.toml` or this
-//!   module — and unconditionally in the `Lint` CI job, which runs prek
+//!   `Cargo.lock`, `crates/common/Cargo.toml` or this module (the three files
+//!   this check actually reads — `.github/renovate.json` is not among them,
+//!   see above) — and unconditionally in the `Lint` CI job, which runs prek
 //!   `--all-files`.
 //!
 //! Nothing is skipped: each lane runs every check it can source data for, and
@@ -327,75 +328,6 @@ fn is_empty(lower: &Bound<Version>, upper: &Bound<Version>) -> bool {
     }
 }
 
-/// How much of [`PINNED_SERIES`] a requirement still admits.
-///
-/// The only distinction [`requirement_admits_series_patches`] reads out of
-/// this is whether it is [`SeriesReach::WholeTail`] — a range that caps the
-/// series short or misses it entirely is equally a failure to admit every
-/// {PINNED_SERIES}.x patch, so the two non-tail cases carry no payload to
-/// report a finding with.
-enum SeriesReach {
-    /// Every release from some floor upward, however high the patch number
-    /// climbs.
-    WholeTail,
-    /// In-series releases only up to some point short of the next series.
-    CappedAt,
-    /// Nothing inside the series at all.
-    Nothing,
-}
-
-/// Which part of [`PINNED_SERIES`] `req` still admits.
-///
-/// An interval computation for the same reason [`comparator_bounds`] is one. A
-/// probe at a single high in-series version cannot tell `>=0.8, <0.8.30`, which
-/// admits 0.8.23 through 0.8.29, from a range that admits nothing at all — and
-/// a guard that answers with one then reports the second about the first.
-///
-/// The property is the whole *tail*, not "more than one release": the number
-/// the next security patch will carry is not knowable in advance, so any
-/// ceiling below the next series can block it. A bound's pre-release does not
-/// count towards that ceiling — `<=0.9.0-alpha` stops at an endpoint that
-/// already sorts above every `0.8.x` release, so it caps nothing.
-///
-/// Everything here is counted in *releases*. A pre-release is not a patch
-/// anyone can receive — Renovate does not propose one by default — so an
-/// interval that contains only pre-releases admits nothing, however non-empty
-/// it is as a set of versions. `=0.9.0-alpha` is the case that makes the
-/// difference visible: it sits inside `[0.8.0, 0.9.0)` by semver ordering, and
-/// reading that as "still admits the series" would call the tightest possible
-/// freeze a healthy pin.
-fn series_reach(req: &VersionReq) -> Result<SeriesReach> {
-    let (floor, next) = pinned_bounds();
-    let (lower, upper) = requirement_bounds(req)?;
-    // The lowest in-series *release* at or above the floor this range sets.
-    let candidate = match &lower {
-        Unbounded => floor.clone(),
-        // A pre-release bound sorts below the release it names, so that release
-        // is the first one at or above it whether the bound is open or closed.
-        Included(bound) | Excluded(bound) if !bound.pre.is_empty() => {
-            Version::new(bound.major, bound.minor, bound.patch)
-        }
-        Included(bound) => bound.clone(),
-        Excluded(bound) => Version::new(bound.major, bound.minor, bound.patch + 1),
-    };
-    let lowest = std::cmp::max(candidate, floor);
-    let within_upper = match &upper {
-        Unbounded => true,
-        Included(bound) => lowest <= *bound,
-        Excluded(bound) => lowest < *bound,
-    };
-    if lowest >= next || !within_upper {
-        return Ok(SeriesReach::Nothing);
-    }
-    let reaches_tail =
-        |bound: &Version| (bound.major, bound.minor, bound.patch) >= (next.major, next.minor, next.patch);
-    Ok(match upper {
-        Unbounded => SeriesReach::WholeTail,
-        Included(bound) | Excluded(bound) if reaches_tail(&bound) => SeriesReach::WholeTail,
-        Included(_) | Excluded(_) => SeriesReach::CappedAt,
-    })
-}
-
 /// Is this concrete, resolved version inside [`PINNED_SERIES`]?
 ///
 /// Full semver, not a string prefix: `0.81.0` starts with `0.8` and is a
@@ -406,11 +338,20 @@ pub fn version_tracks_pin(version: &str) -> Result<bool> {
     Ok(version >= floor && version < next)
 }
 
-/// Does `req` admit anything outside [`PINNED_SERIES`]? Returns a version it
-/// lets through, or `None` if it confines to the pin.
+/// Does `req` admit anything above [`PINNED_SERIES`]? Returns a version it
+/// lets through, or `None` if it does not reach past the series.
 ///
-/// This is the effectiveness question, asked of a Renovate `allowedVersions`
-/// range and of an upstream's declared requirement alike. A range is not
+/// Deliberately one-sided: a requirement that sits *below* the series (e.g. a
+/// hand-edited `schemars = "0.7"`) is not reported here. It is not a silent
+/// gap — `crates/common/build.rs` still fails to compile, just with a type
+/// mismatch instead of `E0603`, because a `schemars` that upstream `typify`
+/// does not use cannot type-check against `typify::TypeSpace`'s ingestion
+/// API. What this function exists to catch is the direction upstream and
+/// Renovate actually move in: a bump past the pin that the lockfile and the
+/// manifest would otherwise admit silently.
+///
+/// This is the effectiveness question, asked of typify's declared requirement
+/// and of `crates/common/Cargo.toml`'s local pin alike. A range is not
 /// "constraining schemars" because it exists — `"<2"`, `"*"` and `"^0.8.22"`
 /// are all constraints, and only the last one holds the pin.
 pub fn requirement_admits_beyond_pin(req: &str) -> Result<Option<Version>> {
@@ -418,9 +359,7 @@ pub fn requirement_admits_beyond_pin(req: &str) -> Result<Option<Version>> {
     let (_, next) = pinned_bounds();
     let (lower, upper) = requirement_bounds(&parsed)?;
     // A range whose bounds cross is self-contradictory: it admits nothing at
-    // all, and so admits nothing beyond the pin either. That it also blocks
-    // every in-series patch is [`requirement_admits_series_patches`]'s finding
-    // to report, with the message that fits.
+    // all, and so admits nothing beyond the pin either.
     if is_empty(&lower, &upper) || !reaches(&upper, &next) {
         return Ok(None);
     }
@@ -452,58 +391,16 @@ pub fn requirement_admits_beyond_pin(req: &str) -> Result<Option<Version>> {
     Ok(Some(witness))
 }
 
-/// Does `req` still let every patch release inside [`PINNED_SERIES`] through?
+/// Parses `req` as a plain semver requirement range.
 ///
-/// The Renovate rule is deliberately a range and not `enabled: false` so a
-/// 0.8.x security patch still reaches us. A range that has tightened onto one
-/// exact version has quietly become that `enabled: false`; so has one that
-/// merely caps the series short, because the patch carrying the fix may be
-/// numbered above the cap. See [`series_reach`].
-pub fn requirement_admits_series_patches(req: &str) -> Result<bool> {
-    Ok(matches!(
-        series_reach(&parse_requirement(req)?)?,
-        SeriesReach::WholeTail
-    ))
-}
-
-/// Renovate reads `allowedVersions` for a cargo dependency through
-/// `modules/versioning/cargo`, which converts the range to npm's spelling and
-/// hands it to node-semver. node-semver separates ANDed comparators with
-/// whitespace; Rust's `semver` insists on a comma. `>=0.8.22 <0.9` is a working
-/// pin that `renovate-config-validator --strict` accepts, so rejecting it is a
-/// red on a config that holds — put the comma in rather than refuse to read it.
-///
-/// Only a separator is rewritten: the space in `>= 0.8.22` does not precede a
-/// comparator and is left alone.
-fn comma_separate(req: &str) -> String {
-    let mut out = String::with_capacity(req.len() + 4);
-    for (index, current) in req.char_indices() {
-        if current.is_whitespace() {
-            let follows_comparator = req[index..].trim_start().starts_with(['<', '>', '=', '^', '~', '*']);
-            let already_separated = out.trim_end().ends_with(',');
-            if follows_comparator && !already_separated && !out.trim().is_empty() {
-                out.push(',');
-            }
-        }
-        out.push(current);
-    }
-    out
-}
-
+/// Both callers source `req` from cargo itself — `local_schemars_requirement`
+/// from a manifest cargo has already agreed to build, `declared_schemars_requirements`
+/// from `cargo metadata`'s own normalized output — so neither node-semver's
+/// whitespace-separated comparators nor its `||` union ever reach here: a
+/// hand-edited manifest spelled either way is a range `Version::parse` inside
+/// cargo itself would already refuse, well before this check runs.
 fn parse_requirement(req: &str) -> Result<VersionReq> {
-    // node-semver's `||` is a union of intervals; this guard carries one
-    // interval, and quietly reading only half of a union is how a range that
-    // readmits 2.x passes for a pin.
-    if req.contains("||") {
-        bail!(
-            "`{req}` is an OR range. Renovate reads `allowedVersions` through node-semver, which unions the \
-             alternatives, while this guard evaluates a single interval against the one PINNED_SERIES \
-             ({PINNED_SERIES}) names — so it would read at most one branch and could call a range that \
-             readmits the next series up a pin. Express the constraint as one range, or teach this check to \
-             union them."
-        );
-    }
-    VersionReq::parse(&comma_separate(req)).with_context(|| {
+    VersionReq::parse(req).with_context(|| {
         format!(
             "`{req}` is not a semver requirement range. This guard compares the range's interval against the \
              one PINNED_SERIES ({PINNED_SERIES}) names, so it cannot read a regex or glob spelling; express \
@@ -740,17 +637,21 @@ pub fn local_schemars_requirement(manifest: &str) -> Result<String> {
     Ok(req)
 }
 
-/// Does `crates/common/Cargo.toml` pin the series this module thinks it does?
+/// Does `crates/common/Cargo.toml` pin the series this module thinks it does,
+/// or has it moved above it?
 ///
 /// Not the same question as "does it agree with typify" — that one the compiler
 /// answers with `E0603`. This one catches [`PINNED_SERIES`] and the manifest
-/// drifting apart, which nothing else would notice: the guard would simply
-/// start policing a series the build does not use.
+/// drifting apart *upward*, which nothing else would notice: the guard would
+/// simply start policing a series the build no longer bumps into. A manifest
+/// pinned *below* the series is not this function's finding — see
+/// [`requirement_admits_beyond_pin`] for why that half is left to the
+/// compiler.
 pub fn check_local_pin(manifest: &str) -> Result<()> {
     let req = local_schemars_requirement(manifest)?;
     if let Some(admitted) = requirement_admits_beyond_pin(&req)? {
         bail!(
-            "crates/common/Cargo.toml requires `schemars = \"{req}\"`, which admits {admitted} — outside the \
+            "crates/common/Cargo.toml requires `schemars = \"{req}\"`, which admits {admitted} — above the \
              {PINNED_SERIES} series this guard, the Renovate rule and build.rs are all written around. Either \
              the manifest or `PINNED_SERIES` in xtask/src/schemars_pin.rs was changed without the other; make \
              them agree before trusting anything else this check reports."
@@ -793,7 +694,7 @@ pub fn verify(repo_root: &Path) -> Result<()> {
         if let Some(admitted) = requirement_admits_beyond_pin(req)? {
             bail!(
                 "`{UPSTREAM}` {upstream_version} declares `schemars = \"{req}\"`, which admits {admitted} — \
-                 outside the {PINNED_SERIES} series crates/common/build.rs compiles against. Cargo.lock does \
+                 above the {PINNED_SERIES} series crates/common/build.rs compiles against. Cargo.lock does \
                  not show this: a widened requirement leaves the locked 0.8 version untouched, so the pin \
                  would go on suppressing an update that has become possible.\n{WHEN_UPSTREAM_MOVES}"
             );

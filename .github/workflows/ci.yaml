@@ -577,6 +577,18 @@ jobs:
   # client transports ex-ray can't select (uTLS, hysteria2) are exercised here
   # since the plugin-e2e roundtrips can only drive ws-tls + QUIC. Single linux
   # runner: the gate logic is platform-independent (domainsocket is !windows).
+  test-ex-ray:
+    name: Test ex-ray (Go)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: ./.github/actions/setup-build
+
+      - name: Test ex-ray Go (ECH gate)
+        run: cargo xtask run ex-ray-tests
+
   # `.github/renovate.json` is only ever executed by Renovate's own bot, so a
   # typo in it (`matchDepNamez`, a number where a duration string belongs) is
   # silently ignored rather than reported anywhere this repo can see. This
@@ -593,7 +605,7 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v7
         with:
           node-version: lts/*
 
@@ -608,18 +620,6 @@ jobs:
       # schema nothing uses. `--strict` makes warnings fatal.
       - name: Validate .github/renovate.json
         run: npx --yes --package renovate renovate-config-validator --strict
-
-  test-ex-ray:
-    name: Test ex-ray (Go)
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    steps:
-      - uses: actions/checkout@v7
-
-      - uses: ./.github/actions/setup-build
-
-      - name: Test ex-ray Go (ECH gate)
-        run: cargo xtask run ex-ray-tests
 
   # Runs the ex-ray-unit-tests target (build.yaml) on windows/darwin -- see there
   # for why it is split from test-ex-ray.
