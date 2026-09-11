@@ -10,6 +10,14 @@
 //! before any crash-class handling below, give those tests a child whose
 //! exit timing is deterministic without needing a real native fault.
 //!
+//! Attaches under its own dedicated `"crash-child"` kind by default — the
+//! SIGABRT-relay `_exit` bypass in `crash::on_crash` is keyed on that exact
+//! string so it can never fire for a real `hole-{gui,bridge,common}` process,
+//! which attaches under `"gui"`/`"bridge"`/`"test"` instead. A test that
+//! needs to simulate one of those other kinds hitting the relay (e.g. to
+//! prove the bypass does NOT fire for them) can override it with
+//! `TOMBSTONE_TEST_ATTACH_KIND`.
+//!
 //! No sleeps. Modeled on crates/handle-holders/src/bin/hold_file.rs.
 
 fn main() {
@@ -35,7 +43,15 @@ fn main() {
     let log_dir = std::env::var_os("TOMBSTONE_LOG_DIR").expect("TOMBSTONE_LOG_DIR env var required");
     let log_dir = std::path::PathBuf::from(log_dir);
 
-    tombstone::attach("test", &log_dir);
+    // Defaults to this binary's own dedicated kind (see the module doc
+    // comment); a test can override it to simulate a different real caller's
+    // kind hitting the SIGABRT relay. `Box::leak` is fine here: this process
+    // crashes or exits within milliseconds of this call.
+    let kind: &'static str = match std::env::var("TOMBSTONE_TEST_ATTACH_KIND") {
+        Ok(k) => Box::leak(k.into_boxed_str()),
+        Err(_) => "crash-child",
+    };
+    tombstone::attach(kind, &log_dir);
 
     // SAFETY: each raise_* deterministically triggers its fault class and
     // does not return (-> !). This is the entire purpose of this binary.

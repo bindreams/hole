@@ -50,10 +50,9 @@ fn wait_bounded_panics_with_clear_message_on_timeout() {
     assert!(msg.contains("200ms"), "bound should be named in the message: {msg}");
     // wait_bounded's timeout arm must not merely SEND a kill signal — it
     // must confirm `child` actually reached a reaped terminal state before
-    // reporting failure (the earlier background-thread design could report
-    // "timeout" after the *thread* had already reaped the child, racing a
-    // same-pid-reused victim process into a raw-pid kill). Proving that here
-    // is NOT a second, later check of `pid`'s liveness — this suite runs
+    // reporting failure, to avoid racing a same-pid-reused victim process
+    // into a raw-pid kill. Proving that here is NOT a second, later check
+    // of `pid`'s liveness — this suite runs
     // many crash_child's concurrently, so by the time a check ran here
     // (after catch_unwind has already unwound the panic), a sibling test's
     // spawn could have recycled the freed pid, reintroducing that exact race

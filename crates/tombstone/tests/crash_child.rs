@@ -56,9 +56,7 @@ fn crash_child_bin() -> std::path::PathBuf {
 // still earns its keep independently: it turns ANY future test-child stall,
 // for ANY reason (a new fault class, a reporter regression, a platform
 // change), into one test failing loudly in ~60s instead of silently
-// consuming the entire darwin/amd64 job's 90-minute wall — which is exactly
-// what happened before (observed: orphaned crash_child/crash_child-2fe/
-// cargo-nextest processes reaped at the wall, still waiting on each other).
+// consuming the entire darwin/amd64 job's 90-minute wall.
 #[cfg(feature = "crash-child")]
 const CHILD_WAIT_BOUND: std::time::Duration = std::time::Duration::from_secs(60);
 
@@ -77,15 +75,26 @@ fn scrub_reexec_env(cmd: &mut std::process::Command) -> &mut std::process::Comma
     cmd.env_remove("HOLE_LOGGING_TEST_KIND")
         .env_remove("TOMBSTONE_TEST_HANG_FOREVER")
         .env_remove("TOMBSTONE_TEST_EXIT_FAST")
+        .env_remove("TOMBSTONE_TEST_ATTACH_KIND")
 }
 
 #[cfg(feature = "crash-child")]
 fn run_crash_child(class: &str, log_dir: &std::path::Path) -> std::process::Output {
+    run_crash_child_with_attach_kind(class, log_dir, "crash-child")
+}
+
+// Like `run_crash_child`, but overrides the child's attach kind instead of
+// letting it default to `"crash-child"` — used to simulate a different real
+// caller (e.g. `hole-common`'s log-bridge test helpers, which attach under
+// `"test"`) hitting the same fault class.
+#[cfg(feature = "crash-child")]
+fn run_crash_child_with_attach_kind(class: &str, log_dir: &std::path::Path, attach_kind: &str) -> std::process::Output {
     let mut cmd = std::process::Command::new(crash_child_bin());
     scrub_reexec_env(&mut cmd);
     let child = cmd
         .env("TOMBSTONE_CRASH_CLASS", class)
         .env("TOMBSTONE_LOG_DIR", log_dir)
+        .env("TOMBSTONE_TEST_ATTACH_KIND", attach_kind)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -201,8 +210,7 @@ fn wait_bounded(mut child: std::process::Child, bound: std::time::Duration) -> s
             // wait_timeout() itself failed (not a timeout) — `child` may
             // still be running with no disposition recorded anywhere.
             // Best-effort kill + reap before panicking so this arm can't
-            // leak an orphaned, still-running crash_child the way the
-            // pre-`wait_bounded` design did.
+            // leak an orphaned, still-running crash_child.
             let _ = child.kill();
             let _ = child.wait();
             panic!("crash_child (pid {pid}): wait_timeout() failed: {e}")
@@ -211,8 +219,9 @@ fn wait_bounded(mut child: std::process::Child, bound: std::time::Duration) -> s
 }
 
 #[cfg(feature = "crash-child")]
-fn assert_marker(log_dir: &std::path::Path, expect_code_nonzero: bool) {
-    // Find the single crash-test-*.marker the child wrote.
+fn assert_marker(log_dir: &std::path::Path, kind: &str, expect_code_nonzero: bool) {
+    // Find the single crash-<kind>-*.marker the child wrote.
+    let prefix = format!("crash-{kind}-");
     let marker = std::fs::read_dir(log_dir)
         .unwrap()
         .filter_map(Result::ok)
@@ -220,7 +229,7 @@ fn assert_marker(log_dir: &std::path::Path, expect_code_nonzero: bool) {
         .find(|p| {
             p.file_name()
                 .and_then(|n| n.to_str())
-                .map(|n| n.starts_with("crash-test-") && n.ends_with(".marker"))
+                .map(|n| n.starts_with(&prefix) && n.ends_with(".marker"))
                 .unwrap_or(false)
         })
         .expect("crash marker exists");
@@ -231,7 +240,7 @@ fn assert_marker(log_dir: &std::path::Path, expect_code_nonzero: bool) {
     // in-crate unit tests; here we only verify on_crash wrote the right
     // fields on a real fault.
     assert!(text.starts_with("tombstone-marker v1\n"), "marker magic: {text}");
-    assert!(text.contains("\nkind=test\n"), "marker kind: {text}");
+    assert!(text.contains(&format!("\nkind={kind}\n")), "marker kind: {text}");
     let pid = marker_field(&text, "pid").expect("pid field present");
     assert_ne!(pid, "0", "marker pid set: {text}");
     if expect_code_nonzero {
@@ -259,7 +268,7 @@ macro_rules! crash_class_test {
         fn $name() {
             let dir = tempfile::tempdir().expect("tempdir");
             let _ = run_crash_child($class, dir.path());
-            assert_marker(dir.path(), true);
+            assert_marker(dir.path(), "crash-child", true);
         }
     };
 }
@@ -278,16 +287,17 @@ crash_class_test!(crash_marker_trap, "trap");
 // so segfault must NOT take the `_exit(EX_SOFTWARE)` bypass — it must still
 // die by its real signal (`SIGSEGV`, 11). Measured: deleting
 // `is_macos_sigabrt_relay(context)` from that `if` (leaving only
-// `self.state.kind == "test"`) makes THIS process — which also runs under
-// `kind == "test"` — take the bypass too, exiting 70 instead of being killed
-// by SIGSEGV; every other class here only asserts the marker file exists,
-// so nothing else in this binary would have noticed that regression.
+// `self.state.kind == "crash-child"`) makes THIS process — which also runs
+// under `kind == "crash-child"` — take the bypass too, exiting 70 instead of
+// being killed by SIGSEGV; every other class here only asserts the marker
+// file exists, so nothing else in this binary would have noticed that
+// regression.
 #[cfg(feature = "crash-child")]
 #[skuld::test]
 fn crash_marker_segfault() {
     let dir = tempfile::tempdir().expect("tempdir");
     let output = run_crash_child("segfault", dir.path());
-    assert_marker(dir.path(), true);
+    assert_marker(dir.path(), "crash-child", true);
 
     #[cfg(target_os = "macos")]
     {
@@ -315,7 +325,7 @@ fn crash_marker_segfault() {
 fn crash_marker_abort() {
     let dir = tempfile::tempdir().expect("tempdir");
     let output = run_crash_child("abort", dir.path());
-    assert_marker(dir.path(), true);
+    assert_marker(dir.path(), "crash-child", true);
 
     // macOS only: this is the one platform/class combination where
     // `on_crash`'s `_exit(EX_SOFTWARE)` bypass fires (see
@@ -323,7 +333,7 @@ fn crash_marker_abort() {
     // assertion is meaningful rather than a coin flip. It exists to catch a
     // regression in the bypass itself: delete the `_exit` call, or weaken
     // its `#[cfg(all(target_os = "macos", feature = "crash-child"))]`/
-    // `kind == "test"` conjunction, and this assertion fails — either the
+    // `kind == "crash-child"` conjunction, and this assertion fails — either the
     // child goes on to deliver a raw, differently-coded `SIGABRT`, or (the
     // actual bug this guards against) it hangs and `wait_bounded`'s 60s
     // bound fails the test instead.
@@ -340,6 +350,42 @@ fn crash_marker_abort() {
             output.status.code(),
             Some(70),
             "abort child must exit with EX_SOFTWARE (70): {:?}",
+            output.status
+        );
+    }
+    // Non-macOS: `output` is read only inside the block above.
+    #[cfg(not(target_os = "macos"))]
+    let _ = &output;
+}
+
+// Regression test for review M2: `crash::on_crash`'s `_exit` bypass is keyed
+// on `self.state.kind == "crash-child"`, NOT the shared `"test"` string that
+// `hole-common`'s log-bridge test helpers (`logging_test_helpers.rs`, via
+// `logging::init(..., "test", ...)`) also attach under. Simulates that exact
+// caller by overriding this child's attach kind to `"test"` and raising
+// `abort` — the SIGABRT relay must still reach the OS reporter as a real
+// `SIGABRT`, not be silently rewritten to a clean `_exit(EX_SOFTWARE)`.
+// Measured: widening the discriminator back to `self.state.kind == "test"`
+// makes this test's child take the bypass and exit 70 instead of dying by
+// SIGABRT.
+#[cfg(feature = "crash-child")]
+#[skuld::test]
+fn crash_marker_abort_non_crash_child_kind_still_dies_by_sigabrt() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let output = run_crash_child_with_attach_kind("abort", dir.path(), "test");
+    assert_marker(dir.path(), "test", true);
+
+    // macOS only: this is the one platform where the `_exit` bypass could
+    // fire at all (see `is_macos_sigabrt_relay`), so it is the one place
+    // this assertion is meaningful rather than a coin flip.
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(
+            output.status.signal(),
+            Some(libc::SIGABRT),
+            "a non-crash_child kind's abort must die by real SIGABRT, not take the \
+             crash_child-only `_exit` bypass: {:?}",
             output.status
         );
     }
@@ -374,7 +420,7 @@ crash_class_test!(crash_marker_bus, "bus", unix);
 fn crash_writes_minidump_segfault() {
     let dir = tempfile::tempdir().expect("tempdir");
     let _ = run_crash_child("segfault", dir.path());
-    // The .dmp sits next to the marker: crash-test-<pid>.dmp.
+    // The .dmp sits next to the marker: crash-crash-child-<pid>.dmp.
     let dmp = std::fs::read_dir(dir.path())
         .unwrap()
         .filter_map(Result::ok)
@@ -382,7 +428,7 @@ fn crash_writes_minidump_segfault() {
         .find(|p| {
             p.file_name()
                 .and_then(|n| n.to_str())
-                .map(|n| n.starts_with("crash-test-") && n.ends_with(".dmp"))
+                .map(|n| n.starts_with("crash-crash-child-") && n.ends_with(".dmp"))
                 .unwrap_or(false)
         });
     let dmp = dmp.expect("minidump written under crash-dumps feature");

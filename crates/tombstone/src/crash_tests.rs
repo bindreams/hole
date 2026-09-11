@@ -193,7 +193,7 @@ async fn sweep_reports_malformed_marker() {
 }
 
 // `write_marker_signal_safe`'s `bool` return is what `on_crash` gates the
-// macOS `_exit` bypass on (M7): a marker write that fails must NOT be
+// macOS `_exit` bypass on: a marker write that fails must NOT be
 // reported as a success, or the bypass would fire with zero diagnostics on
 // disk. This covers the open-failure half of that contract (a bad marker
 // path). It does NOT cover a failed/short `write(2)` on an otherwise-good
