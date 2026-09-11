@@ -176,9 +176,11 @@ def test_wedge_still_emits_diagnostics_and_throws_when_log_read_fails(tmp_path: 
 def test_wedge_captures_symbolised_native_stacks_of_the_wedged_process(tmp_path: Path) -> None:
     """The datum #790 asks for: where the wedged process is actually blocked.
 
-    A thread-state table names no call, so this asserts symbolised frames --
-    `ntdll!`-qualified names resolved off the Microsoft symbol server -- not
-    just that cdb ran. Frames like `hole+0x3f21a` would settle nothing.
+    A thread-state table names no call, and neither does a stack of
+    `hole+0x3f21a` frames, so this asserts real symbol resolution. The proof
+    is cdb's own `lm` verdict, not a `module!name` frame: dbghelp names
+    *exported* functions with no PDB at all, so `ntdll!NtWaitForSingleObject`
+    alone would still pass with symbol resolution completely broken.
     """
     log_path = tmp_path / "wedge.log"
 
@@ -204,7 +206,8 @@ def test_wedge_captures_symbolised_native_stacks_of_the_wedged_process(tmp_path:
     text = "\n".join(p.read_text(errors="replace") for p in captures)
 
     assert "Child-SP" in text, f"cdb produced no stack listing:\n{text}"
-    assert "ntdll!" in text, f"stacks came back symbol-less -- symbol resolution is broken:\n{text}"
+    assert "ntdll!" in text, f"frames carry no module-qualified names:\n{text}"
+    assert "pdb symbols" in text, f"no module loaded a PDB -- symbol resolution is broken:\n{text}"
     # The job log is where a reader actually looks; the artifact is the backup.
     assert "Child-SP" in combined, f"stacks were written to file but never echoed to the job log:\n{combined}"
 
