@@ -393,17 +393,27 @@ jobs:
     # (all under that retired 45min wall) returns 12, not 8; one (job
     # 80597393392, 2026-06-10) has since aged out of GitHub's log retention
     # and can't be classified. Of the 11 with logs:
-    #   - 1 shows the hang signature: job 86595016035 (2026-07-11T23:27),
+    #   - 1 shows the hang signature: job 86595016035 (workflow run
+    #     created_at 2026-07-11T23:27; job itself started 23:45:45),
     #     crash_marker_abort SLOW at escalating 60s intervals to 1080s
     #     before the job was cancelled.
     #   - 5 passed crash_marker_abort clean on the non-TUN pass, but the
     #     TUN pass — nextest's actual SECOND pass (SKULD_LABELS=tun runs
     #     after !tun, not before — see job 86694590188's own log) — never
-    #     got past its own rebuild in any of them: the tun invocation drops
+    #     got past its own rebuild in any of them. AT THE TIME (this sample
+    #     predates the fix below), the tun invocation dropped
     #     `--features tombstone/crash-dumps,tombstone/crash-child`, present
-    #     on the !tun command, which invalidates cargo's incremental cache
-    #     and forces a fresh build every time. The TUN step's own conclusion
-    #     is `cancelled` in all 5, landing mid that rebuild: job
+    #     on the !tun command, which invalidated cargo's incremental cache
+    #     and forced a fresh build every time. That is HISTORICAL, not the
+    #     current state of this file: #720 (closed 2026-08-03) is the fix,
+    #     and the `Build hole test binaries` step / `hole-tests` target in
+    #     build.yaml now carries this flag on all three nextest steps below
+    #     (`Test (non-TUN)`, `Test (TUN, runs last for #200)`, `Test (TUN,
+    #     macOS — root for pfctl)`) — the xtask conformance test
+    #     `ci_test_hole_steps_match_the_hole_tests_target` holds them to
+    #     that build target's exact command so this can't silently regress.
+    #     The TUN step's own conclusion is `cancelled` in all 5, landing mid
+    #     that rebuild (as it existed pre-#720): job
     #     86694590188's log shows `Compiling hole-common` 22:04:59 →
     #     `Compiling dev-console` 22:05:57 → cancelled 22:06:08, zero tests
     #     started, and exactly one `Summary` line in the whole job log (the
@@ -420,9 +430,13 @@ jobs:
     #   - 1 never reached the test step (slow build): job 87336029086.
     #   - 2 were killed mid the non-TUN pass with neither signature
     #     present: jobs 89498063447, 86633700324.
-    # So these 5 ARE "a slow rebuild ate the second pass's budget" — not an
-    # exception to it: in every one, the tun pass's own rebuild, not test
-    # execution and not post-test cleanup, is what the cancellation caught.
+    # So in all 5, the tun pass's own rebuild — not test execution and not
+    # post-test cleanup — is WHERE the cancellation landed, not what ate the
+    # 45-minute wall: the dominant consumers were the pre-test build (~30min
+    # — e.g. job 86694590188 started 21:21:05, its non-TUN step started
+    # 21:50:58) plus the non-TUN pass itself (10-14min); the TUN rebuild
+    # above only consumed the last 1-8 minutes of headroom before the wall
+    # hit.
     # #842's own trigger, job 95548588839 (PR #832 / azhukova/825, 2026-08-18), is
     # a further kill outside both this sample and the "8 killed" window
     # above: crash_marker_abort SLOW to >3660s before the CURRENT 90min

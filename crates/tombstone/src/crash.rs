@@ -490,11 +490,17 @@ struct MarkerCrashEvent {
 // `SIGABRT` with a plain `sigaction` and relays it to this same `on_crash` as
 // a SYNTHESIZED `EXC_SOFTWARE`/`EXC_SOFT_SIGNAL` exception (see its own
 // `mac/signal.rs`: "Macos doesn't have an exception for process aborts, so we
-// hook SIGABRT"). That relay does not `detach()` crash-handler's task-level
-// exception port the way a REAL fault (segfault/bus/illegal/trap) does, and
-// `abort()`'s C-standard-mandated contract (terminate even if a caught signal
-// handler returns) means it re-raises `SIGABRT` with the default disposition
-// once the relay returns — which, on an unhandled abort, is the textbook
+// hook SIGABRT"). SOURCE-GROUNDED, not inferred, verified in the vendored
+// `crash-handler-0.7.0` crate: a REAL fault's message handler
+// (`MessageIds::Exception`/`ExceptionStateIdentity`) calls `detach(true)`
+// (`crash-handler-0.7.0/src/mac/state.rs:457`), which tears down via
+// `uninstall()` → `restore_abort_handler` (`mac/state.rs:97-99`); the SIGABRT
+// relay's own message handler (`MessageIds::SignalCrash`, `mac/state.rs:494-
+// 528`) contains no `detach` call anywhere in its branch, so the task-level
+// exception port is still attached once it returns. `abort()`'s
+// C-standard-mandated contract (terminate even if a caught signal handler
+// returns) means it re-raises `SIGABRT` with the default disposition once
+// the relay returns — which, on an unhandled abort, is the textbook
 // condition for a second, genuine `EXC_CRASH` exception.
 //
 // MEASURED, not inferred: that second `on_crash` invocation does not happen.
@@ -509,22 +515,29 @@ struct MarkerCrashEvent {
 // neither case does a second, `EXC_CRASH`-carrying invocation ever occur to
 // overwrite it.
 //
-// Why the second invocation never arrives, and why this class hangs
-// (`crash_marker_abort` stalls for minutes to hours on CI, intermittently —
-// bindreams/hole#842, #719), is NOT independently confirmed. The
-// best-supported hypothesis — inferred from XNU's exception-delivery model,
-// not measured — is that XNU holds every other thread in the task suspended
-// before calling `task_exception_notify(EXC_CRASH)`, so the port the relay
-// left attached has no live server thread free to reply: the notify call
-// blocks rather than ever reaching `on_crash` again. One story would then
-// cover the absent second invocation, the intermittent hang (the block never
-// resolving), and `termination.byProc: crash_child` on the `.ips` this class
-// produces once the process does terminate (the "responsible" party at the
-// OS's book-keeping level is still the process's own thread, not a
-// registered exception-handling agent that replied). What would confirm it:
-// a kernel-level trace (e.g. `ktrace`) of all task threads during a captured
-// hang, showing every other thread parked and the exception-delivery thread
-// blocked inside `task_exception_notify`.
+// A separate, later measurement confirms the same absence a different way:
+// 10/10 runs of the abort class, again with the `_exit` bypass deleted,
+// terminated promptly — sub-second, `exit=134` (the default SIGABRT
+// disposition) — every time, with the marker still holding `code=0x5`. The
+// marker file is opened `O_WRONLY|O_CREAT|O_TRUNC` (`crash.rs:238`), so a
+// second, `EXC_CRASH`-bearing invocation would have overwritten `0x5` with
+// `0xa` before any of these processes exited; it did not, in 10/10 runs.
+//
+// This comment has now carried three successive mechanism stories for why
+// the second invocation never arrives and why this class intermittently
+// hangs for minutes to hours on CI (`crash_marker_abort`,
+// bindreams/hole#842, #719) — including, immediately prior to this revision,
+// a claim that XNU permanently blocks the second exception's delivery and
+// that the hang IS that block never resolving. All three were wrong: a
+// permanent block cannot produce a prompt exit, and the 10/10 runs above are
+// prompt. No fourth mechanism is offered here. Why the second invocation
+// never arrives, and why the hang happens at all, is NOT established —
+// unknown, not inferred-and-therefore-good-enough. This PR's justification
+// is narrower and is itself measured: the `_exit` bypass removes the
+// process's exposure to the crash reporter before `abort()`'s re-raise can
+// produce whatever the second exception is, and with it in place
+// `crash_marker_abort` no longer hangs. That is sufficient to justify the
+// fix without a correct explanation of the failure it fixes.
 //
 // Every fault class we handle reaches the crash reporter eventually —
 // confirmed by per-class `.ips` capture on darwin/arm64 (bindreams/hole#842):
@@ -559,19 +572,24 @@ struct MarkerCrashEvent {
 // unintercepted post-detach — not a hang, and not this fix's doing). That is
 // NOT a guarantee `stack_overflow` can never hang the way `abort`'s SIGABRT
 // relay did: 5 local runs is not the intermittent, load-sensitive CI
-// condition #842/#719 was filed against, and the hang hypothesis above turns
-// on a SECOND exception arriving on a still-attached port, which
-// `stack_overflow`'s single, detached-and-forwarded fault structurally does
-// not produce — but "structurally doesn't produce the one hypothesized
-// precondition" is itself inferred, not measured, so it is not being used
-// here to close the question. What would settle it: the same 8-run,
-// probe-instrumented measurement done above for `abort`, run instead against
-// `stack_overflow` under sustained CI-like load (parallel test-suite
-// pressure), watching for either a second `on_crash` call or a stalled
-// `wait_bounded`. Absent that, `wait_bounded`'s 60s bound — not the `_exit`
-// bypass — is the only thing standing between a hypothetical
-// `stack_overflow` hang and consuming the whole job's wall, exactly as it
-// was before this PR; the risk is unmeasured, not eliminated.
+// condition #842/#719 was filed against. What IS source-grounded, not
+// inferred, is that `stack_overflow` cannot take the non-detaching code path
+// abort's relay takes: a guard-page hit is delivered through
+// `crash-handler`'s `MessageIds::Exception`/`ExceptionStateIdentity` handler
+// (`mac/state.rs:416-457`), the same branch that calls `detach(true)` for
+// every other real fault class above, whereas the SIGABRT relay is delivered
+// through the separate `MessageIds::SignalCrash` handler
+// (`mac/state.rs:494-528`), which never calls `detach` at all. That is a
+// verified difference in which code path each class takes through the
+// vendored crate — not a claim about what the kernel does with either port
+// afterward, which remains unknown. What would settle the open question:
+// the same 8-run, probe-instrumented measurement done above for `abort`, run
+// instead against `stack_overflow` under sustained CI-like load (parallel
+// test-suite pressure), watching for a stalled `wait_bounded`. Absent that,
+// `wait_bounded`'s 60s bound — not the `_exit` bypass — is the only thing
+// standing between a hypothetical `stack_overflow` hang and consuming the
+// whole job's wall, exactly as it was before this PR; the risk is
+// unmeasured, not eliminated.
 //
 // `on_crash` is not wired to see which detour a given call took (the SIGABRT
 // relay's "handled" reply is discarded — see the signal handler's ignored
