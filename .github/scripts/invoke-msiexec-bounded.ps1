@@ -203,7 +203,7 @@ function Invoke-StackCapture {
     # redirected file -- so a killed cdb's last few KB survive here instead of
     # dying in a buffer. stdout still has to go somewhere that is not the job
     # log, hence the sink.
-    $cdbArgs = @('-pv', '-p', $TargetId, '-logo', "\"$OutFile\"", '-c', '"~*k; lm; qd"')
+    $cdbArgs = @('-pv', '-p', $TargetId, '-logo', ('"' + $OutFile + '"'), '-c', '"~*k; lm; qd"')
 
     $started = $null
     try {
