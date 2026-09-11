@@ -427,3 +427,83 @@ fn installed_routes_serialize_as_kebab_case() {
         "in:\n{raw}"
     );
 }
+
+// Parse-failure reporting ---------------------------------------------------------------------------------------------
+//
+// `bridge-routes.json` records `server_ip` — a protected value — on the
+// record itself and once per `StaleRecord`. `serde_json::Error`'s `Display`
+// quotes the offending bytes back, and nothing arms redaction on the
+// recovery path, so the classification in `load` is the only thing between a
+// skewed file and `bridge.log`.
+
+/// Capture this crate's records at `WARN` and above for the duration of `body`.
+fn captured(body: impl FnOnce()) -> String {
+    use tracing_subscriber::layer::{Layer, SubscriberExt};
+    let writer = garter::test_utils::WaitableWriter::new();
+    let subscriber = tracing_subscriber::registry().with(
+        tracing_subscriber::fmt::layer()
+            .with_writer(writer.clone())
+            .with_ansi(false)
+            .with_filter(tracing_subscriber::filter::LevelFilter::WARN),
+    );
+    {
+        let _guard = garter::tracing_test::set_default_in_current_thread(subscriber);
+        body();
+    }
+    writer.snapshot()
+}
+
+/// The version probe is the first parse, so a file skewed badly enough to
+/// put an address where the schema version belongs fails here.
+#[skuld::test]
+fn a_corrupt_route_state_never_echoes_its_contents_into_the_log() {
+    const SECRET_ADDR: &str = "203.0.113.42";
+    let json = format!(r#"{{"version":"{SECRET_ADDR}"}}"#);
+
+    // Guard: without it this passes against a serde_json that stopped echoing.
+    let raw = serde_json::from_str::<VersionProbe>(&json)
+        .expect_err("must not parse")
+        .to_string();
+    assert!(raw.contains(SECRET_ADDR), "guard: serde_json echoes the value: {raw}");
+
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(state_file(dir.path()), &json).unwrap();
+
+    let mut loaded = Some(sample_ipv4());
+    let logs = captured(|| loaded = load(dir.path()));
+    assert!(loaded.is_none(), "a corrupt record must not be acted on");
+    assert!(!logs.contains(SECRET_ADDR), "the address reached bridge.log: {logs}");
+    assert!(
+        logs.contains("line 1"),
+        "position must survive so the warning stays actionable: {logs}"
+    );
+}
+
+/// The second parse: the version is readable and current, so the record
+/// itself is decoded — and a bad *variant tag* makes serde quote an
+/// arbitrary caller-supplied string verbatim.
+#[skuld::test]
+fn a_corrupt_route_state_body_never_echoes_its_contents_into_the_log() {
+    const SECRET_ADDR: &str = "203.0.113.42";
+    let json = serde_json::to_string(&sample_ipv4())
+        .unwrap()
+        .replace(r#""route_form":"via""#, &format!(r#""route_form":"{SECRET_ADDR}""#));
+    assert!(json.contains(SECRET_ADDR), "the fixture must carry the address: {json}");
+
+    let raw = serde_json::from_str::<RouteState>(&json)
+        .expect_err("must not parse")
+        .to_string();
+    assert!(raw.contains(SECRET_ADDR), "guard: serde_json echoes the value: {raw}");
+
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(state_file(dir.path()), &json).unwrap();
+
+    let mut loaded = Some(sample_ipv4());
+    let logs = captured(|| loaded = load(dir.path()));
+    assert!(loaded.is_none(), "a corrupt record must not be acted on");
+    assert!(!logs.contains(SECRET_ADDR), "the address reached bridge.log: {logs}");
+    assert!(
+        logs.contains("line 1"),
+        "position must survive so the warning stays actionable: {logs}"
+    );
+}

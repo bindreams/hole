@@ -95,3 +95,47 @@ fn a_file_without_the_flag_reads_as_captured() {
     );
     assert_eq!(st.main_snapshot, "pass out all\n");
 }
+
+/// `main_snapshot` is a captured `pfctl -sr` ruleset, so whenever the ruleset
+/// it captured was Hole's own cover it contains the server IP in a permit
+/// rule — and `serde_json::Error`'s `Display` quotes the offending bytes
+/// back. Same class as `routing::state`'s two arms.
+#[skuld::test]
+fn a_corrupt_pf_state_never_echoes_its_contents_into_the_log() {
+    use tracing_subscriber::layer::{Layer, SubscriberExt};
+    const SECRET_ADDR: &str = "203.0.113.42";
+
+    let json = serde_json::to_string(&sample())
+        .unwrap()
+        .replace(r#""version":1"#, &format!(r#""version":"{SECRET_ADDR}""#));
+    assert!(json.contains(SECRET_ADDR), "the fixture must carry the address: {json}");
+
+    // Guard: without it this passes against a serde_json that stopped echoing.
+    let raw = serde_json::from_str::<LockdownPfState>(&json)
+        .expect_err("must not parse")
+        .to_string();
+    assert!(raw.contains(SECRET_ADDR), "guard: serde_json echoes the value: {raw}");
+
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(state_file(tmp.path()), &json).unwrap();
+
+    let writer = garter::test_utils::WaitableWriter::new();
+    let subscriber = tracing_subscriber::registry().with(
+        tracing_subscriber::fmt::layer()
+            .with_writer(writer.clone())
+            .with_ansi(false)
+            .with_filter(tracing_subscriber::filter::LevelFilter::WARN),
+    );
+    let loaded = {
+        let _guard = garter::tracing_test::set_default_in_current_thread(subscriber);
+        load(tmp.path())
+    };
+    let logs = writer.snapshot();
+
+    assert_eq!(loaded, None, "a corrupt record must not be acted on");
+    assert!(!logs.contains(SECRET_ADDR), "the address reached bridge.log: {logs}");
+    assert!(
+        logs.contains("line 1"),
+        "position must survive so the warning stays actionable: {logs}"
+    );
+}

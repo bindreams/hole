@@ -1130,6 +1130,13 @@ async fn handle_reload<P: Proxy + 'static, R: Routing + 'static>(
     State(state): State<Arc<IpcState<P, R>>>,
     Json(config): Json<ProxyConfig>,
 ) -> Result<Json<EmptyResponse>, (StatusCode, Json<ErrorResponse>)> {
+    // Same reason as `handle_start`'s: `reload`'s slow path (`structural_same`
+    // false) is `stop()` + `start(config)`, and `start_inner` arms only the
+    // resolved IP — never the configured host. A reload to a host this
+    // process has never armed (DNS/connect/plugin-start failure on that path)
+    // would otherwise put the configured address in clear into both
+    // `bridge.log` and this handler's error body.
+    hole_common::logging::redact_arm::arm_server(&config.server);
     let unblock_snapshot = state.unblock_generation.load(std::sync::atomic::Ordering::SeqCst);
     let mut pm = state.proxy.lock().await;
     let result = pm.reload(&config).await;
@@ -1147,10 +1154,20 @@ async fn handle_reload<P: Proxy + 'static, R: Routing + 'static>(
         Ok(()) => Ok(Json(EmptyResponse {})),
         Err(e) => {
             error!(error = %e, "proxy reload failed");
-            Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse { message: e.to_string() }),
-            ))
+            // Same reason as `handle_start`'s: the config is armed above, so
+            // this covers a plain toString of the error, but an embedded
+            // address can still arrive from outside Hole (e.g. garter's
+            // `remote_host` in a plugin error) — `redact_outgoing` tokenises
+            // it the same way `handle_start`'s response boundary does.
+            let message = match redact_outgoing((&e).into()) {
+                StartError::Failed { message } => message,
+                // `Cancelled`/`AlreadyRunning`/`NetworkBlocked` carry no
+                // arbitrary text — `redact_outgoing` is a no-op for them, so
+                // falling back to `e`'s own fixed, PII-free `Display` is
+                // exactly what `redact_outgoing` would have produced.
+                _ => e.to_string(),
+            };
+            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { message })))
         }
     }
 }

@@ -14,6 +14,8 @@ harness = false
 
 [dependencies]
 bitflags = { workspace = true }
+# `parse_error`: classifying a parse failure needs the error type it classifies.
+serde_json = { workspace = true }
 tokio = { version = "1", features = ["rt", "macros", "time", "net"] }
 tracing = "0.1"
 # Redaction registry: lock-free snapshot reads so no logging call can block
@@ -39,3 +41,5 @@ tracing-subscriber = { version = "0.3", features = ["fmt"] }
 # `retry_tests` uses `tokio::time::pause()` to auto-advance the mock clock
 # instead of burning wall-clock seconds on exponential backoff.
 tokio = { version = "1", features = ["test-util"] }
+# `parse_error_tests` derives `Deserialize` on its probe struct.
+serde = { workspace = true }

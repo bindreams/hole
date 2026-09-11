@@ -34,7 +34,7 @@ fn load_valid_json_roundtrips(#[fixture(temp_dir)] dir: &Path) {
             server: "1.2.3.4".into(),
             server_port: 8388,
             method: "aes-256-gcm".to_string(),
-            password: "secret".to_string(),
+            password: "secret".to_string().into(),
             plugin: None,
             plugin_opts: None,
             validation: None,
@@ -167,7 +167,7 @@ fn selected_entry_with_unknown_uuid_returns_none() {
             server: "1.2.3.4".into(),
             server_port: 8388,
             method: "aes-256-gcm".to_string(),
-            password: "pw".to_string(),
+            password: "pw".to_string().into(),
             plugin: None,
             plugin_opts: None,
             validation: None,
@@ -188,7 +188,7 @@ fn selected_entry_with_valid_uuid_returns_correct_entry() {
                 server: "1.1.1.1".into(),
                 server_port: 1111,
                 method: "aes-256-gcm".to_string(),
-                password: "pw1".to_string(),
+                password: "pw1".to_string().into(),
                 plugin: None,
                 plugin_opts: None,
                 validation: None,
@@ -199,7 +199,7 @@ fn selected_entry_with_valid_uuid_returns_correct_entry() {
                 server: "2.2.2.2".into(),
                 server_port: 2222,
                 method: "chacha20-ietf-poly1305".to_string(),
-                password: "pw2".to_string(),
+                password: "pw2".to_string().into(),
                 plugin: None,
                 plugin_opts: None,
                 validation: None,
@@ -339,7 +339,7 @@ fn server_entry_debug_redacts_password() {
         server: "1.2.3.4".into(),
         server_port: 8388,
         method: "aes-256-gcm".to_string(),
-        password: "super-secret-do-not-leak".to_string(),
+        password: "super-secret-do-not-leak".to_string().into(),
         plugin: None,
         plugin_opts: None,
         validation: None,
@@ -363,7 +363,7 @@ fn server_entry_debug_shows_non_sensitive_fields() {
         server: "10.20.30.40".into(),
         server_port: 9999,
         method: "chacha20-ietf-poly1305".to_string(),
-        password: "do-not-show-this".to_string(),
+        password: "do-not-show-this".to_string().into(),
         plugin: Some("v2ray-plugin".to_string()),
         plugin_opts: Some("server;tls".to_string()),
         validation: None,
@@ -697,7 +697,7 @@ fn secret_entry() -> ServerEntry {
         server: SECRET_ADDR.into(),
         server_port: 8388,
         method: "aes-256-gcm".to_string(),
-        password: SECRET_PW.to_string(),
+        password: SECRET_PW.to_string().into(),
         plugin: None,
         plugin_opts: None,
         validation: None,
@@ -740,10 +740,111 @@ fn server_address_dump_renders_as_a_secret() {
 }
 
 #[skuld::test]
+fn password_debug_is_redacted() {
+    let password = Password::new(SECRET_PW);
+    assert_eq!(format!("{password:?}"), "Password(<redacted>)");
+}
+
+#[skuld::test]
+fn password_dump_renders_as_a_secret() {
+    let password = Password::new(SECRET_PW);
+    let rendered = dump::dump!(&password).to_string();
+    assert!(!rendered.contains(SECRET_PW), "{rendered}");
+    assert!(rendered.contains("REDACTED"), "{rendered}");
+}
+
+/// `#[serde(transparent)]` is what makes the newtype a pure refactor: the
+/// config file and the IPC wire keep the bare string they carried before, so
+/// this step needs no migration and a bridge of either vintage still parses
+/// the other's `ProxyConfig`.
+#[skuld::test]
+fn password_json_form_is_a_bare_string() {
+    let entry = secret_entry();
+    let json = serde_json::to_value(&entry).expect("serialize");
+    assert_eq!(json["password"], serde_json::Value::String(SECRET_PW.to_string()));
+
+    let back: ServerEntry = serde_json::from_value(json).expect("deserialize");
+    assert_eq!(back.password.expose(), SECRET_PW);
+}
+
+#[skuld::test]
 fn server_entry_json_round_trips_the_exact_address() {
     let entry = secret_entry();
     let json = serde_json::to_string(&entry).expect("serialize");
     assert!(json.contains(SECRET_ADDR), "config.json must keep the real address");
     let back: ServerEntry = serde_json::from_str(&json).expect("deserialize");
     assert_eq!(back.server.expose(), SECRET_ADDR);
+}
+
+/// The widest rung of the ladder: `AppConfig` is the whole settings file, and
+/// its `servers` vector holds every entry's secrets at once.
+#[skuld::test]
+fn app_config_dump_omits_the_address_and_password() {
+    let config = AppConfig {
+        servers: vec![secret_entry()],
+        ..AppConfig::default()
+    };
+    let rendered = dump::dump!(&config).to_string();
+    assert!(
+        !rendered.contains(SECRET_ADDR),
+        "dump! must not carry the server address: {rendered}"
+    );
+    assert!(!rendered.contains(SECRET_PW), "nor the password: {rendered}");
+}
+
+/// Paired with the above: the non-secret settings still have to render, or
+/// the impl is useless for the diagnostics it exists to serve.
+#[skuld::test]
+fn app_config_dump_still_renders_non_secret_settings() {
+    let config = AppConfig {
+        local_port: 40731,
+        ..AppConfig::default()
+    };
+    let rendered = dump::dump!(&config).to_string();
+    assert!(rendered.contains("40731"), "{rendered}");
+}
+
+/// The content-safe replacement for `serde_json::Error`'s own `Display`,
+/// which echoes the bytes around the failure — for any payload Hole parses,
+/// that can be the password.
+#[skuld::test]
+fn describe_parse_error_never_echoes_the_input() {
+    // A password mistyped as a JSON number: the value serde_json names IS the
+    // secret.
+    const MISTYPED_PW: &str = "9876543210";
+    let json = format!(
+        r#"{{"id":"x","name":"x","server":"203.0.113.7","server_port":8388,"method":"aes-256-gcm","password":{MISTYPED_PW}}}"#
+    );
+    let e = serde_json::from_str::<ServerEntry>(&json).expect_err("must not parse");
+
+    // Guard: without it this passes against a serde_json that stopped echoing.
+    assert!(
+        e.to_string().contains(MISTYPED_PW),
+        "guard: serde_json echoes the offending value: {e}"
+    );
+
+    let described = describe_parse_error(&e);
+    assert!(!described.contains(MISTYPED_PW), "the secret survived: {described}");
+    assert!(described.contains("line 1"), "position must survive: {described}");
+}
+
+// Secret-newtype shape ------------------------------------------------------------------------------------------------
+
+/// `Password` and `ServerAddress` are pinned by *shape*, not only by
+/// consequence.
+///
+/// The consequence — a rendered secret — is already caught two ways for
+/// `Debug` and for `dump!`. But `impl Display for Password` or
+/// `impl Deref<Target = str> for Password` compiles cleanly and fails no
+/// test: the single named exit (`expose()`) silently becomes two, and
+/// `rg '\.expose\(\)'` stops enumerating the sites that read a real secret.
+/// These probes fail to compile today; the day one of them compiles is the
+/// day this test fails.
+///
+/// The `.stderr` fixtures are regenerated with `TRYBUILD=overwrite cargo test
+/// -p hole-common -- the_secret_newtypes_have_no_second_exit`; the toolchain
+/// is pinned in `rust-toolchain.toml`, so they move only when it does.
+#[skuld::test]
+fn the_secret_newtypes_have_no_second_exit() {
+    trybuild::TestCases::new().compile_fail("tests/secret_shape/*.rs");
 }
