@@ -23,7 +23,36 @@
     Version="$(ProductVersion)"
     UpgradeCode="6F2A8C1D-3E4B-4F5A-9D7E-1C2B3A4F5E6D">
 
+    <!-- Schedule is explicit, and load-bearing. The upgrade path deliberately
+         leaves the fail-closed covers armed (BridgeUninstall passes the
+         keep-covers flag, BridgeRelease is skipped under UPGRADINGPRODUCTCODE)
+         because the standing cover is what holds the update-cutover gap. That
+         is only survivable if a FAILED upgrade puts the old product back: the
+         covers are persistent WFP filters the Base Filtering Engine re-adds
+         every boot, and hole.exe is the only thing that can remove them
+         (bindreams/hole#1003).
+
+         WiX's default, `afterInstallValidate`, removes the old product in a
+         separate transaction — a failed upgrade leaves the machine with
+         neither version installed, i.e. armed covers and no binary.
+         `afterInstallInitialize` schedules RemoveExistingProducts after
+         InstallInitialize, inside the new install's transaction, so a failed
+         upgrade rolls the removal back and reinstalls the old product
+         (docs.firegiant.com/wix/schema/wxs/majorupgrade).
+
+         The two later placements (afterInstallExecute / afterInstallFinalize)
+         also survive a failed upgrade, but install the new files FIRST: over a
+         still-running old service holding hole.exe open, and with the old
+         product's PathRemove landing after the new product's PathAdd. Only
+         afterInstallInitialize gives both properties. Pinned by
+         test_major_upgrade_removal_is_undone_when_the_upgrade_fails and
+         test_major_upgrade_removes_the_old_product_before_the_new_files_land.
+
+         AppSearch (sequence 400) still precedes RemoveExistingProducts (1525),
+         so the sticky-shortcut RegistrySearches below still read the old
+         install's regkeys. -->
     <MajorUpgrade
+      Schedule="afterInstallInitialize"
       AllowSameVersionUpgrades="yes"
       DowngradeErrorMessage="A newer version of Hole is already installed." />
 
@@ -289,6 +318,26 @@
       Impersonate="no"
       Return="ignore" />
 
+    <!-- Undo the teardown above if the uninstall rolls back. BridgeRelease is
+         Return="check", so the action immediately after BridgeUninstall can
+         abort the whole transaction; without this, the product is still
+         installed but its service is stopped and deregistered, and nothing
+         puts it back. Re-runs exactly what BridgeInstall runs, so the restored
+         state is the state the uninstall found.
+
+         Sequenced Before="BridgeUninstall" because a rollback action must be
+         written into the script ahead of the deferred action it undoes; MSI
+         executes the rollback script in reverse, so it runs after. Its return
+         value is ignored by MSI during rollback, so it can only add recovery,
+         never block one. -->
+    <CustomAction
+      Id="BridgeUninstallRollback"
+      FileRef="hole.exe"
+      ExeCommand="bridge install"
+      Execute="rollback"
+      Impersonate="no"
+      Return="ignore" />
+
     <!-- Launch the app after a fresh install.
          Runs as the installing user (Impersonate=yes), non-blocking (asyncNoWait).
          Skipped on upgrades (WIX_UPGRADE_DETECTED) and uninstalls automatically;
@@ -322,6 +371,8 @@
            PATH goes last so an aborted release (Return="check") leaves the
            entry intact — PathRemove is deferred with no rollback partner, so
            anything sequenced after it survives a rollback stripped. -->
+      <Custom Action="BridgeUninstallRollback" Before="BridgeUninstall"
+        Condition="REMOVE=&quot;ALL&quot;" />
       <Custom Action="BridgeUninstall" Before="BridgeRelease"
         Condition="REMOVE=&quot;ALL&quot;" />
       <Custom Action="BridgeRelease" Before="PathRemove"

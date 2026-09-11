@@ -203,17 +203,18 @@ def test_sequence_install_order(decompiled_tree: ET.ElementTree) -> None:
 
 
 def test_sequence_uninstall_order(decompiled_tree: ET.ElementTree) -> None:
-    """Uninstall CAs: BridgeUninstall < BridgeRelease < PathRemove < RemoveFiles.
+    """Uninstall CAs: rollback < BridgeUninstall < BridgeRelease < PathRemove < RemoveFiles.
 
     The service is deregistered before the covers are released, so the release
     runs against a dead bridge (an out-of-process clear under a live one
     desyncs its cover posture). PathRemove trails the release because
     BridgeRelease is Return='check' and PathRemove has no rollback partner
-    (bindreams/hole#1003).
+    (bindreams/hole#1003). BridgeUninstallRollback leads, because a rollback
+    action is scripted before the deferred action it undoes.
     """
     entries = _get_decompiled_sequence_map(decompiled_tree)
 
-    chain = ["BridgeUninstall", "BridgeRelease", "PathRemove"]
+    chain = ["BridgeUninstallRollback", "BridgeUninstall", "BridgeRelease", "PathRemove"]
     for action in chain:
         assert action in entries, f"{action} not found in InstallExecuteSequence"
 
