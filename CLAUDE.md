@@ -171,17 +171,8 @@ before editing; the sections linked below are the authoritative source.
   the set of crates that can write an address is not enumerable; a `Display`-less
   `ServerAddress` newtype provides prevention. Arming is last-wins, so the
   crash-recovery `<server:recovered>` token joins to the session token on the
-  next connect. The **password** has the matching `Display`-less `Password`
-  newtype and no sink-level cure — nothing arms it, because a short or
-  dictionary-word secret in the global automaton would rewrite unrelated log
-  text — so for it the type-level half is the only mechanism Hole has, and it
-  starts at `UiServerEntry`, the one place a password enters the process. That
-  half stops at Hole's own code: upstream's `shadowsocks_service` writes the
-  password under `trace`, a residual CONTRIBUTING states rather than hides.
-  Either secret can also leak through an *error* that quotes its input —
-  `ServerConfigError` names the offending base64 byte and its offset,
-  `serde_json` echoes the bytes around a parse failure — so both are
-  classified (`KeyMaterialFault`, `describe_parse_error`), never stringified. →
+  next connect. The password has a matching `Display`-less `Password` newtype
+  and its own asymmetric limits. →
   [CONTRIBUTING.md#server-address-redaction](CONTRIBUTING.md#server-address-redaction)
 - **Logging & plugin diagnostics.** Log destinations, the WebView2/console-relay
   tee, `HOLE_BRIDGE_LOG` directives, and the plugin tap. →
@@ -233,14 +224,7 @@ before editing; the sections linked below are the authoritative source.
 - **Hole never writes the server address or the password** — no `Display` on
   `ServerAddress` or `Password` (compiler-enforced), `.expose()` is the only
   exit from either, and every `Serialize` type transitively holding one needs
-  its own `Dump` impl. A type that carries one in from outside the process
-  (`UiServerEntry`) holds the newtype, not a `String`, because its derived
-  `Debug` is a live sink; an error that quotes its input (`serde_json`,
-  `base64`, `ServerConfigError`) is classified, never stringified. Note what
-  this does **not** say: the address additionally has a redacting sink under
-  the log writers, which covers crates Hole does not own, and the password has
-  no such backstop — `shadowsocks_service=trace` still puts it in `bridge.log`
-  through upstream's derived `Debug`. A disclosed residual, not a closed hole.
+  its own `Dump` impl.
   [→](CONTRIBUTING.md#server-address-redaction)
 
 ## macOS CI is the scarce resource

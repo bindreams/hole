@@ -914,11 +914,10 @@ fn grant_access_rejects_result_file_with_then_send() {
 // The CLI writes a fourth log file (`gui-cli.log`) and executes no GUI arming
 // site, so without these the wrapped writers are inert for its whole life.
 //
-// Every test below drives arming as a *side effect* of the real production
-// call graph — never by calling `arm_request_redaction` directly, which is
-// the anti-pattern that let `grant-access --then-send-file` ship unarmed and
-// let `BridgeRequest::Reload` ship unclassified (neither miss moved a single
-// one of these assertions). Each test ends at
+// Every test below drives arming as a side effect of the real production
+// call graph, never by calling `arm_request_redaction` directly — that's the
+// only way a test can catch a path the funnel doesn't actually cover. Each
+// test ends at
 // [`super::send_bridge_request_inner_at`], the same funnel every real CLI
 // invocation reaches, pointed at a socket path with no listener so the
 // connect fails fast and safely instead of ever touching a live bridge.
@@ -1050,29 +1049,54 @@ fn cli_request_file_arms_a_reload_request(#[fixture(temp_dir)] dir: &Path) {
 
 /// Arming is a *funnel* property, not a call-site obligation.
 ///
-/// The CLI puts a `BridgeRequest` on the wire from six places. Arming used to
-/// be each one's own job, discharged by two different mechanisms — three
-/// elevation paths called `arm_request_redaction`, two `proxy` paths called
-/// `arm_server` by hand — and `grant-access --then-send-file` called neither,
-/// so its elevated process ran unarmed for the address on its *success* path.
-/// No test noticed, because every arming test called the arming function
-/// directly. The rule is now structural: one mechanism, invoked once, at the
-/// single point a request reaches the wire — and the behavioral tests above
-/// exercise it through that real call graph, not by calling it directly.
+/// The rule is structural: one mechanism, invoked once, at the single point a
+/// request reaches the wire — and the behavioral tests above exercise it
+/// through that real call graph, not by calling it directly.
 #[skuld::test]
 fn redaction_is_armed_only_by_the_wire_funnel() {
-    let source = std::fs::read_to_string(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/cli.rs"))
-        .expect("read cli.rs");
+    // Belt-and-braces alongside the behavioral tests above: this is a
+    // call-graph shape (arming is invoked from exactly one place, crate-wide,
+    // and no second mechanism exists beside it), which those tests can prove
+    // for the paths they each drive but not rule out for the rest of the
+    // crate. Scoped to every non-test source file under `src/` — not just
+    // `cli.rs` — because the property this guards ("no ad-hoc `arm_server`
+    // call exists anywhere") is falsified just as much by one appearing in
+    // another file as by one appearing here. `*_tests.rs` files are skipped:
+    // they legitimately reference these names in doc comments, `use`
+    // imports, and (as here) the needle strings themselves.
+    let src_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+
+    let mut sources: Vec<(String, String)> = Vec::new();
+    for entry in walkdir::WalkDir::new(&src_root) {
+        let entry = entry.expect("failed to walk crates/hole/src");
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+            continue;
+        }
+        let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        if file_name.ends_with("_tests.rs") {
+            continue;
+        }
+        let text = std::fs::read_to_string(path).expect("failed to read a walked source file");
+        sources.push((path.display().to_string(), text));
+    }
 
     let calls = |needle: &str| -> Vec<String> {
-        source
-            .lines()
-            .filter(|l| l.contains(needle))
-            // Strip *any* comment line (`//...`, which also matches doc
-            // comments `///...`), not just doc comments: a plain `//` comment
-            // mentioning the function name must not miscount as a call site.
-            .filter(|l| !l.trim_start().starts_with("//") && !l.contains(&format!("fn {needle}")))
-            .map(str::to_string)
+        sources
+            .iter()
+            .flat_map(|(file, source)| {
+                source
+                    .lines()
+                    .filter(|l| l.contains(needle))
+                    // Strip *any* comment line (`//...`, which also matches doc
+                    // comments `///...`), not just doc comments: a plain `//` comment
+                    // mentioning the function name must not miscount as a call site.
+                    .filter(|l| !l.trim_start().starts_with("//") && !l.contains(&format!("fn {needle}")))
+                    .map(move |l| format!("{file}: {}", l.trim()))
+            })
             .collect()
     };
 
@@ -1092,7 +1116,11 @@ fn redaction_is_armed_only_by_the_wire_funnel() {
     );
 
     // The one call site is inside the driver, ahead of the connect.
-    let driver = source
+    let (_, cli_source) = sources
+        .iter()
+        .find(|(file, _)| file.ends_with("/cli.rs"))
+        .expect("cli.rs must be among the walked sources");
+    let driver = cli_source
         .split_once("fn send_bridge_request_inner_at(")
         .expect("the driver must exist")
         .1;

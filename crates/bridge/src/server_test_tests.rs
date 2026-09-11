@@ -443,6 +443,66 @@ fn run_test_with_v2ray_plugin_happy_path() {
     });
 }
 
+/// M1 regression: an AEAD-2022 EIH password's `identity_keys` must survive
+/// [`maybe_start_plugin`]'s address override.
+///
+/// `svr_cfg.password()` returns only the uPSK half of an EIH password
+/// (`iPSK1:...:uPSK`) — upstream splits the identity keys off into their own
+/// field. Rebuilding the config from that accessor (the pre-fix code) would
+/// silently produce a `ServerConfig` with empty `identity_keys`, so a
+/// correctly configured EIH server tested with a plugin would be probed
+/// without its identity headers and reported unreachable. `maybe_start_plugin`
+/// doesn't dial the real server (only the plugin's local listener needs to
+/// come up), so a bogus, unreachable `server_host:server_port` is enough to
+/// drive this path.
+#[skuld::test(labels = [PORT_ALLOC], serial = PORT_ALLOC)]
+fn maybe_start_plugin_preserves_eih_identity_keys() {
+    let plugin_path = locate_ex_ray();
+    if !plugin_path.is_file() {
+        panic!("ex-ray not built at {plugin_path:?} — run 'cargo xtask ex-ray' before 'cargo test'");
+    }
+
+    // 32 zero bytes, base64-encoded: a well-formed key of the right length
+    // for `2022-blake3-aes-256-gcm`. `{PSK32}:{PSK32}` is a one-identity EIH
+    // password — `iPSK1:uPSK` shape.
+    const PSK32: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+    let password = format!("{PSK32}:{PSK32}");
+
+    rt().block_on(async {
+        let mut entry = entry("127.0.0.1", 8388, "2022-blake3-aes-256-gcm", &password);
+        entry.plugin = Some("v2ray-plugin".into());
+
+        let mut svr_cfg = super::build_server_config(&entry, "127.0.0.1".parse().unwrap())
+            .expect("a well-formed EIH password must build");
+        assert!(
+            !svr_cfg.identity_keys().is_empty(),
+            "sanity check: the pre-plugin config must actually carry identity keys"
+        );
+
+        let (sentinel_a, _sa) = start_fake_sentinel(b"HTTP/1.0 200 OK\r\n\r\n".to_vec()).await;
+        let (sentinel_b, _sb) = start_fake_sentinel(b"HTTP/1.0 200 OK\r\n\r\n".to_vec()).await;
+        let cfg = TestConfig {
+            plugin_path_override: Some(plugin_path.to_str().unwrap().to_string()),
+            ..fast_test_config(sentinel_a, sentinel_b)
+        };
+
+        let _chain = super::maybe_start_plugin(
+            &entry,
+            &mut svr_cfg,
+            "127.0.0.1",
+            &cfg,
+            crate::dns::ech::PinSource::NoQueryNeeded,
+        )
+        .await
+        .expect("plugin chain must start even though the upstream server is unreachable");
+
+        assert!(
+            !svr_cfg.identity_keys().is_empty(),
+            "maybe_start_plugin must preserve identity_keys when overriding the address"
+        );
+    });
+}
+
 /// Test 4: TCP connection timeout for an unroutable address.
 ///
 /// `192.0.2.1` is in TEST-NET-1 (RFC 5737), guaranteed unroutable on the

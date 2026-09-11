@@ -297,102 +297,32 @@ impl Default for AppConfig {
     }
 }
 
-/// A configured server address — hostname or IP literal, exactly as the user
-/// entered it.
-///
-/// Implements **neither `Display` nor `Deref`**, on purpose: without
-/// `Display`, `server_host = %config.server.server` is a compile error, and
-/// without `Deref<Target = str>`, `format!("{}", *addr)` cannot reopen it.
-/// [`expose`](Self::expose) is the single named exit, so `rg '\.expose\(\)'`
-/// enumerates every site that reads the real value.
-#[derive(Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct ServerAddress(String);
-
-impl ServerAddress {
-    pub fn new(value: impl Into<String>) -> Self {
-        Self(value.into())
-    }
-
-    /// The address in clear. Every caller is a site that genuinely needs to
-    /// dial, compare, or persist it — never a log field.
-    pub fn expose(&self) -> &str {
-        &self.0
-    }
+crate::secret_newtype! {
+    /// A configured server address — hostname or IP literal, exactly as the user
+    /// entered it.
+    ///
+    /// Implements **neither `Display` nor `Deref`**, on purpose: without
+    /// `Display`, `server_host = %config.server.server` is a compile error, and
+    /// without `Deref<Target = str>`, `format!("{}", *addr)` cannot reopen it.
+    /// [`expose`](Self::expose) is the single named exit, so `rg '\.expose\(\)'`
+    /// enumerates every site that reads the real value.
+    pub struct ServerAddress;
+    noun = "address";
 }
 
-impl From<&str> for ServerAddress {
-    fn from(value: &str) -> Self {
-        Self::new(value)
-    }
-}
-
-impl From<String> for ServerAddress {
-    fn from(value: String) -> Self {
-        Self::new(value)
-    }
-}
-
-impl std::fmt::Debug for ServerAddress {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("ServerAddress(<redacted>)")
-    }
-}
-
-impl dump::Dump for ServerAddress {
-    fn dump(&self) -> dump::DumpValue {
-        dump::DumpValue::tagged(dump::tag::SECRET, dump::DumpValue::String(self.0.clone()))
-    }
-}
-
-/// A configured shadowsocks password.
-///
-/// The same `Display`-less, `Deref`-less shape as [`ServerAddress`], for the
-/// same reason and with the same single named exit,
-/// [`expose`](Self::expose) — so `rg '\.expose\(\)'` enumerates every site
-/// that reads a real secret, and `password = %entry.password` is a compile
-/// error rather than a leak.
-///
-/// `#[serde(transparent)]`: the on-disk and on-the-wire form is unchanged, a
-/// bare JSON string.
-#[derive(Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct Password(String);
-
-impl Password {
-    pub fn new(secret: impl Into<String>) -> Self {
-        Self(secret.into())
-    }
-
-    /// The secret in clear. Every caller is a site that genuinely needs to
-    /// dial with it, compare it, or persist it — never a log field.
-    pub fn expose(&self) -> &str {
-        &self.0
-    }
-}
-
-impl From<&str> for Password {
-    fn from(value: &str) -> Self {
-        Self::new(value)
-    }
-}
-
-impl From<String> for Password {
-    fn from(value: String) -> Self {
-        Self::new(value)
-    }
-}
-
-impl std::fmt::Debug for Password {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("Password(<redacted>)")
-    }
-}
-
-impl dump::Dump for Password {
-    fn dump(&self) -> dump::DumpValue {
-        dump::DumpValue::tagged(dump::tag::SECRET, dump::DumpValue::String(self.0.clone()))
-    }
+crate::secret_newtype! {
+    /// A configured shadowsocks password.
+    ///
+    /// The same `Display`-less, `Deref`-less shape as [`ServerAddress`], for the
+    /// same reason and with the same single named exit,
+    /// [`expose`](Self::expose) — so `rg '\.expose\(\)'` enumerates every site
+    /// that reads a real secret, and `password = %entry.password` is a compile
+    /// error rather than a leak.
+    ///
+    /// `#[serde(transparent)]`: the on-disk and on-the-wire form is unchanged, a
+    /// bare JSON string.
+    pub struct Password;
+    noun = "secret";
 }
 
 #[derive(Clone, Serialize, Deserialize, PartialEq)]

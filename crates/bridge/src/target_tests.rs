@@ -695,26 +695,30 @@ fn windows_state_dir_and_files_are_not_readable_by_users() {
 /// `Target` they *do* derive `Serialize` — so a `dump!` on one renders the
 /// serde tree and never reaches `ProxyConfig::dump`. Private to this module
 /// today; visibility is not what makes a secret safe.
+///
+/// Drives this through `dump!`, not a direct `.dump()` call: a direct call
+/// only proves the hand-written `Dump` impl itself redacts, not that the
+/// ladder these types are actually rendered through (every real call site
+/// uses `dump!`) picks that impl over the `Serialize` derive sitting right
+/// behind it.
 #[skuld::test]
 fn the_persisted_file_shapes_never_carry_the_secrets() {
-    use dump::Dump;
     let config = Box::new(test_config());
     let rendered = [
-        TargetFile {
+        dump::dump!(&TargetFile {
             version: 1,
             target: PersistedTarget::Connected { config: config.clone() },
-        }
-        .dump(),
-        PersistedTarget::Connected { config: config.clone() }.dump(),
-        StartupPreferenceFile {
+        })
+        .to_string(),
+        dump::dump!(&PersistedTarget::Connected { config: config.clone() }).to_string(),
+        dump::dump!(&StartupPreferenceFile {
             version: 1,
             on_startup: hole_common::config::StartupBehavior::default(),
             candidate: Some(config),
-        }
-        .dump(),
+        })
+        .to_string(),
     ];
-    for value in rendered {
-        let text = dump::YamlFormatter::default().to_string(&value);
+    for text in rendered {
         assert!(
             !text.contains("example.invalid"),
             "rendered dump must not carry the configured host in clear, got: {text}"

@@ -163,14 +163,10 @@ fn read_request_file_missing_file_returns_error() {
     assert!(result.is_err());
 }
 
-/// The file arm of the elevation payload — the arm Hole's own GUI actually
-/// takes — and the sibling of `cli::decode_b64_request`'s. It parses a whole
-/// `BridgeRequest`: a `Password` and a `ServerAddress` in transit. Both call
-/// sites report it with `cli_log!(error, "{e}")`, which is `eprintln!` *plus*
-/// `tracing::error!` -> the log file -> the support bundle, and
-/// `arm_request_redaction` runs only once the parse has succeeded, so this
-/// arm has no sink-level backstop for the address and the password has none
-/// by design.
+/// The file arm of the elevation payload, mirroring `decode_b64_request`'s
+/// test: no sink-level backstop is armed yet on this path, so the
+/// classification here is the only thing standing between a corrupt request
+/// file and the log.
 #[skuld::test]
 fn read_request_file_never_echoes_the_payload() {
     // Two shapes serde_json quotes back verbatim: a value that is the wrong

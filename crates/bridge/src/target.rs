@@ -152,11 +152,10 @@ fn read_target(state_dir: &Path) -> Target {
             // `ServerAddress` (see [`save`]'s doc), and `serde_json::Error`'s
             // `Display` quotes the offending value back. The sink is
             // `bridge.log`, which the support bundle collects, and the
-            // password has no redacting writer under it. Shadowing `e` with
-            // the source-free `ParseFailure` here, rather than only calling
-            // `describe_parse_error` where it's logged, means there is no
-            // live `serde_json::Error` left in scope for a later edit to
-            // reach for with `%e`.
+            // password has no redacting writer under it. See
+            // `util::parse_error::ParseFailure`'s own doc for why shadowing
+            // `e` here (rather than only calling `describe_parse_error` where
+            // it's logged) is what makes that safe by construction.
             let e = hole_common::config::ParseFailure::from(&e);
             tracing::warn!(
                 error = %e,

@@ -401,24 +401,15 @@ async fn maybe_start_plugin(
     .await
     .map_err(|e| ServerTestOutcome::PluginStartFailed { detail: e.to_string() })?;
 
-    // Override the server address to point at the plugin's local port.
+    // Override the server address to point at the plugin's local port. Uses
+    // `set_addr`, not a rebuilt `ServerConfig::new`: for an AEAD-2022 EIH
+    // password (`iPSK1:...:uPSK`), `svr_cfg.password()` returns only the
+    // uPSK, so rebuilding from it would silently drop `identity_keys` and
+    // send the plugin-routed probe without its identity headers. `set_addr`
+    // mutates only the address and cannot fail, so it also can't misclassify
+    // key material — there is no `Err` arm here to test.
     let local = chain.local_addr();
-    *svr_cfg = ServerConfig::new(
-        ServerAddr::SocketAddr(local),
-        svr_cfg.password().to_owned(),
-        svr_cfg.method(),
-    )
-    // Same reason as `build_server_config`'s, and the same message shape, so
-    // the three `ServerConfig::new` sites report a key fault identically. The
-    // password here already derived its keys once, so this cannot fail today
-    // — the classification is what keeps that true if it ever can.
-    .map_err(|e| ServerTestOutcome::PluginStartFailed {
-        detail: crate::proxy::ProxyError::InvalidKeyMaterial {
-            method: entry.method.clone(),
-            fault: crate::proxy::config::classify_key_material(e),
-        }
-        .to_string(),
-    })?;
+    svr_cfg.set_addr(local);
 
     debug!("server_test plugin bound at {local}");
     Ok(Some(chain))

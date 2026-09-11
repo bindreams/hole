@@ -34,6 +34,13 @@ struct MockTraffic {
 
 struct MockProxy {
     fail_start: AtomicBool,
+    /// If `Some(n)`, `start` succeeds for its first `n` calls and fails
+    /// (with `fail_message`) on every call after — independent of
+    /// `fail_start`, which fails from the very first call. Lets a test
+    /// drive a `reload` whose *initial* start succeeded but whose
+    /// stop+start slow-path retry fails.
+    fail_from_call: Option<u32>,
+    start_calls: AtomicU32,
     traffic: Arc<MockTraffic>,
     /// If Some, `start` awaits this gate before returning. Used to
     /// simulate a slow start so tests can race `POST /v1/cancel` against
@@ -56,6 +63,8 @@ impl MockProxy {
     fn new() -> Self {
         Self {
             fail_start: AtomicBool::new(false),
+            fail_from_call: None,
+            start_calls: AtomicU32::new(0),
             traffic: Arc::new(MockTraffic::default()),
             start_gate: None,
             start_entered: std::sync::Mutex::new(None),
@@ -73,6 +82,17 @@ impl MockProxy {
     fn failing_with(message: &str) -> Self {
         Self {
             fail_start: AtomicBool::new(true),
+            fail_message: message.to_string(),
+            ..Self::new()
+        }
+    }
+
+    /// Succeeds on the first `start` call, fails every one after — for a
+    /// test driving a `reload` whose initial start must succeed and whose
+    /// slow-path retry must fail.
+    fn failing_from_second_start(message: &str) -> Self {
+        Self {
+            fail_from_call: Some(1),
             fail_message: message.to_string(),
             ..Self::new()
         }
@@ -103,7 +123,10 @@ impl Proxy for MockProxy {
         if let Some(gate) = self.start_gate.as_ref() {
             gate.notified().await;
         }
-        if self.fail_start.load(Ordering::SeqCst) {
+        let call_index = self.start_calls.fetch_add(1, Ordering::SeqCst);
+        let fails_this_call =
+            self.fail_start.load(Ordering::SeqCst) || self.fail_from_call.is_some_and(|n| call_index >= n);
+        if fails_this_call {
             return Err(ProxyError::Runtime(io::Error::other(self.fail_message.clone())));
         }
         // Fresh session ⇒ fresh counters (production: a new Server
@@ -1712,8 +1735,15 @@ fn reload_request_reloads_proxy() {
 /// same pairing `ipc_state_with_persist_gate` uses — without that helper's
 /// persist-gate machinery, which these tests don't need.
 fn ipc_state_with_dir(dir: PathBuf) -> Arc<IpcState<MockProxy, MockRouting>> {
+    ipc_state_with_dir_and_proxy(dir, MockProxy::new())
+}
+
+/// As [`ipc_state_with_dir`], but with a caller-supplied `MockProxy` — for a
+/// test that needs its `start` calls to behave differently across a
+/// start/reload sequence (e.g. succeed then fail).
+fn ipc_state_with_dir_and_proxy(dir: PathBuf, proxy: MockProxy) -> Arc<IpcState<MockProxy, MockRouting>> {
     let routing = MockRouting::new(dir.clone());
-    let pm = ProxyManager::new(MockProxy::new(), routing).with_state_dir(dir.clone());
+    let pm = ProxyManager::new(proxy, routing).with_state_dir(dir.clone());
     let proxy = Arc::new(Mutex::new(pm));
     let (routing_handle, cover_invalidated) = {
         let guard = proxy.try_lock().unwrap();
@@ -2935,6 +2965,66 @@ async fn an_outgoing_error_carrying_the_address_is_redacted() {
         "the toast would have carried the address: {wire}"
     );
     assert!(wire.contains(&token), "the outgoing error lost its token: {wire}");
+}
+
+/// M3 (#1033): `handle_reload` must arm and redact exactly as `handle_start`
+/// does. `reload`'s slow path (`stop()` + `start(config)`) runs precisely
+/// when the incoming server differs from the running one — i.e. exactly
+/// when the incoming host has never been armed in this process
+/// (`start_inner` only arms the *resolved IP*, never the configured host).
+/// Before the fix, a failure on that path put the configured address in
+/// clear into both `bridge.log` and this handler's error body.
+#[skuld::test]
+async fn reload_to_a_different_server_that_fails_is_redacted_in_log_and_response() {
+    let (subscriber, writer) = redacting_capture();
+    let token = hole_common::logging::redact_arm::token_for(REDACT_ENTRY_ID);
+
+    let dir = tempfile::tempdir().unwrap().keep();
+    let state = ipc_state_with_dir_and_proxy(
+        dir,
+        MockProxy::failing_from_second_start(&format!("creating connection to {REDACT_ADDR}:443 failed")),
+    );
+
+    // `redaction_config()`'s server (id `REDACT_ENTRY_ID`, address
+    // `REDACT_ADDR`) differs from `sample_config()`'s, so `reload`'s
+    // `structural_same` check is false and it takes the stop+start slow
+    // path — the one `MockProxy::failing_from_second_start` is built to fail.
+    let reloaded = redaction_config();
+
+    let (status, body) = {
+        let _g = garter::tracing_test::set_default_in_current_thread(subscriber);
+        let _ = handle_start(
+            axum::extract::State(state.clone()),
+            axum::http::HeaderMap::new(),
+            Json(sample_config()),
+        )
+        .await
+        .expect("initial start must succeed");
+
+        let result = handle_reload(axum::extract::State(state.clone()), Json(reloaded)).await;
+        emit_third_party_line();
+
+        let Err((status, Json(body))) = result else {
+            panic!("expected the stop+start reload to fail");
+        };
+        (status, body)
+    };
+
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert!(
+        !body.message.contains(REDACT_ADDR),
+        "the response body carried the address: {}",
+        body.message
+    );
+    assert!(
+        body.message.contains(&token),
+        "the response body lost its token: {}",
+        body.message
+    );
+
+    let log = writer.snapshot();
+    assert!(!log.contains(REDACT_ADDR), "the address reached the log: {log}");
+    assert!(log.contains(&token), "the token is missing from the log: {log}");
 }
 
 // Unblock vs post-start persist =======================================================================================

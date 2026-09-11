@@ -328,10 +328,10 @@ pub fn load(state_dir: &Path) -> Option<RouteState> {
             // offending bytes back — a skewed file with an address where a
             // number belongs echoes it verbatim. Nothing arms redaction on
             // the recovery path either, so there is no sink backstop here.
-            // Shadowing `e` with the source-free `ParseFailure` here, rather
-            // than only calling `describe_parse_error` where it's logged,
-            // means there is no live `serde_json::Error` left in scope for a
-            // later edit to reach for with `%e`.
+            // See `util::parse_error::ParseFailure`'s own doc for why
+            // shadowing `e` here (rather than only calling
+            // `describe_parse_error` where it's logged) is what makes that
+            // safe by construction.
             let e = util::parse_error::ParseFailure::from(&e);
             tracing::warn!(
                 error = %e,

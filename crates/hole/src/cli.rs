@@ -1131,15 +1131,11 @@ pub(crate) fn arm_request_redaction(request: &hole_common::protocol::BridgeReque
 /// `ClientError` (kept typed so the elevated classifier can distinguish a
 /// control-plane `ConcurrentStart` from a transport failure).
 ///
-/// Arms redaction itself. This is the one place a `BridgeRequest` reaches the
-/// wire, and arming used to be a per-call-site obligation discharged by two
-/// different mechanisms — `arm_request_redaction` on the three elevation
-/// paths, a hand-written `arm_server` on the two `proxy` ones — which
-/// `grant-access --then-send-file` simply did not discharge at all. Doing it
-/// here makes the CLI's log writers live for every path by construction, and
-/// the `--base64`/`--request-file` decode arms are the only windows left
-/// (they precede a parsed request existing at all). Arming is last-wins and
-/// idempotent, so a repeat costs nothing.
+/// Arms redaction itself: the one place a `BridgeRequest` reaches the wire, so
+/// every send path is covered by construction. The `--base64`/`--request-file`
+/// decode arms are the only windows left — they precede a parsed request
+/// existing at all. Arming is last-wins and idempotent, so a repeat costs
+/// nothing.
 fn send_bridge_request_inner(
     request: hole_common::protocol::BridgeRequest,
 ) -> Result<hole_common::protocol::BridgeResponse, crate::bridge_client::ClientError> {
