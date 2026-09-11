@@ -350,6 +350,33 @@ pub enum Command {
         /// test-running nextest command shape).
         #[arg(long, default_value = "test-hole")]
         job: String,
+        /// Also record the verified group membership here (relative to the
+        /// repo root unless absolute), for a later
+        /// `verify-global-net-state-executed` step in the same job to read
+        /// back. Written only when the check above passes.
+        #[arg(long)]
+        record: Option<PathBuf>,
+    },
+    /// Verify that every `global_net_state` test recorded by
+    /// `verify-global-net-state-labels --record` actually ran — present,
+    /// non-skipped — in this job's per-lane nextest JUnit reports, not merely
+    /// that it was selectable (guard 2 above already covers that) — see
+    /// `xtask::global_net_state_conformance::verify_executed`
+    /// (bindreams/hole#999).
+    VerifyGlobalNetStateExecuted {
+        /// The membership file `verify-global-net-state-labels --record`
+        /// wrote earlier in this job, relative to the repo root unless
+        /// absolute.
+        #[arg(long)]
+        expected: PathBuf,
+        /// One nextest JUnit report per `SKULD_LABELS` lane, relative to the
+        /// repo root unless absolute. The group spans BOTH lanes, and each
+        /// lane runs under its own nextest profile so its report lands at
+        /// its own path instead of being overwritten by the other lane's —
+        /// see `xtask::global_net_state_conformance`. Repeat the flag per
+        /// lane.
+        #[arg(long = "junit", required = true)]
+        junits: Vec<PathBuf>,
     },
 }
 
@@ -432,7 +459,12 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             Ok(())
         }
         Command::VerifySkuldLabelCoverage { job } => skuld_label_coverage::verify(&repo_root()?, &job),
-        Command::VerifyGlobalNetStateLabels { job } => global_net_state_conformance::verify(&repo_root()?, &job),
+        Command::VerifyGlobalNetStateLabels { job, record } => {
+            global_net_state_conformance::verify(&repo_root()?, &job, record.as_deref())
+        }
+        Command::VerifyGlobalNetStateExecuted { expected, junits } => {
+            global_net_state_conformance::verify_executed(&repo_root()?, &expected, &junits)
+        }
     }
 }
 
