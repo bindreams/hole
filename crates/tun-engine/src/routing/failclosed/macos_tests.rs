@@ -111,6 +111,23 @@ fn ruleset_resolver_pass_is_scoped_to_tcp_443_not_unrestricted() {
 }
 
 #[skuld::test]
+fn pfctl_cmd_uses_the_absolute_path() {
+    // Pins the hardening PFCTL's doc claims: reverting to a bare "pfctl"
+    // (PATH-resolved, spoofable by an earlier writable directory since this
+    // runs as root) must fail this test, not silently stay green.
+    let cmd = pfctl_cmd(&["-X", "12345"]);
+    assert_eq!(
+        cmd[0], "/sbin/pfctl",
+        "pfctl must be invoked by its absolute path: {cmd:?}"
+    );
+    assert_eq!(
+        cmd[1..],
+        ["-X", "12345"],
+        "pfctl_cmd must forward args unchanged after the binary: {cmd:?}"
+    );
+}
+
+#[skuld::test]
 fn parse_enable_token_extracts_token() {
     // `pfctl -E` prints to stderr e.g. "pf enabled\nToken : 12345678901234567890\n"
     let out = "pf enabled\nToken : 12345678901234567890\n";
@@ -511,31 +528,15 @@ struct RecordingEngageOps {
     token: String,
     dropped: Vec<String>,
     restored: Vec<String>,
+    fail_pf_enabled: bool,
+    fail_enable_capture_token: bool,
     fail_save_transient: bool,
     fail_load_ruleset: bool,
     fail_flush_states: bool,
+    fail_drop_token: bool,
 }
 
-impl EngageOps for RecordingEngageOps {
-    fn pf_enabled(&mut self) -> Result<bool, RoutingError> {
-        self.log.push("pf_enabled");
-        Ok(self.pf_enabled)
-    }
-
-    fn enable_capture_token(&mut self) -> Result<String, RoutingError> {
-        self.log.push("enable_capture_token");
-        Ok(self.token.clone())
-    }
-
-    fn save_transient(&mut self, _st: &state::FailClosedState) -> Result<(), RoutingError> {
-        self.log.push("save_transient");
-        if self.fail_save_transient {
-            Err(RoutingError::RouteSetup("mock save_transient failure".into()))
-        } else {
-            Ok(())
-        }
-    }
-
+impl CoverRulesetOps for RecordingEngageOps {
     fn load_ruleset(&mut self, _text: &str) -> Result<(), RoutingError> {
         self.log.push("load_ruleset");
         if self.fail_load_ruleset {
@@ -553,11 +554,44 @@ impl EngageOps for RecordingEngageOps {
             Ok(())
         }
     }
+}
+
+impl EngageOps for RecordingEngageOps {
+    fn pf_enabled(&mut self) -> Result<bool, RoutingError> {
+        self.log.push("pf_enabled");
+        if self.fail_pf_enabled {
+            Err(RoutingError::RouteSetup("mock pf_enabled failure".into()))
+        } else {
+            Ok(self.pf_enabled)
+        }
+    }
+
+    fn enable_capture_token(&mut self) -> Result<String, RoutingError> {
+        self.log.push("enable_capture_token");
+        if self.fail_enable_capture_token {
+            Err(RoutingError::RouteSetup("mock enable_capture_token failure".into()))
+        } else {
+            Ok(self.token.clone())
+        }
+    }
+
+    fn save_transient(&mut self, _st: &state::FailClosedState) -> Result<(), RoutingError> {
+        self.log.push("save_transient");
+        if self.fail_save_transient {
+            Err(RoutingError::RouteSetup("mock save_transient failure".into()))
+        } else {
+            Ok(())
+        }
+    }
 
     fn drop_token(&mut self, token: &str) -> Result<(), RoutingError> {
         self.log.push("drop_token");
         self.dropped.push(token.to_owned());
-        Ok(())
+        if self.fail_drop_token {
+            Err(RoutingError::RouteSetup("mock drop_token failure".into()))
+        } else {
+            Ok(())
+        }
     }
 
     fn transient_restore(&mut self, token: &str) {
@@ -693,6 +727,43 @@ fn a_failed_persist_unwinds_the_pf_enable_refcount() {
         !ops.log.contains(&"load_ruleset"),
         "persist-before-mutate: nothing may load once the persist failed: {:?}",
         ops.log
+    );
+}
+
+#[skuld::test]
+fn a_failed_unwind_of_a_failed_persist_still_returns_the_original_error_and_logs() {
+    // The unwind-of-an-unwind branch: `save_transient` fails, and the
+    // `drop_token` call that should undo the `-E` refcount ALSO fails. The
+    // refcount now genuinely leaks with no state file to recover it from
+    // (see `engage_with`'s doc) — that must be logged, not silently dropped —
+    // and the caller must still see the ORIGINAL failure (`save_transient`'s),
+    // not the unwind's, since that is the actionable one.
+    use tracing_subscriber::layer::{Layer, SubscriberExt};
+
+    let writer = garter::test_utils::WaitableWriter::new();
+    let subscriber = tracing_subscriber::registry().with(
+        tracing_subscriber::fmt::layer()
+            .with_writer(writer.clone())
+            .with_ansi(false)
+            .with_filter(tracing_subscriber::filter::LevelFilter::WARN),
+    );
+    let err = {
+        let _guard = garter::tracing_test::set_default_in_current_thread(subscriber);
+        let mut ops = RecordingEngageOps {
+            fail_save_transient: true,
+            fail_drop_token: true,
+            ..recording_engage_ops()
+        };
+        engage_with(v4(), None, &mut ops).expect_err("a failed persist must fail the engage")
+    };
+    assert!(
+        err.to_string().contains("save_transient"),
+        "the ORIGINAL failure must be returned, not the unwind's: {err}"
+    );
+    let log = writer.snapshot();
+    assert!(
+        log.contains("pfctl -X failed unwinding a failed transient engage"),
+        "the failed unwind must be logged, not silently dropped: {log}"
     );
 }
 
@@ -1211,58 +1282,38 @@ fn an_empty_but_captured_baseline_still_restores_the_snapshot() {
 /// doing that needs `Cover`'s private `token` field plus the private `pfctl`
 /// helper, both visible only inside `platform`'s own module tree.
 ///
-/// EVIDENTIARY SCOPE (the #997 caveat): pf has no programmatic API and no
-/// published kernel source this repo can read, so "a single `pfctl -f -` is
-/// one atomic transaction" is an inference from `pfctl`'s documented ticket
-/// behaviour, not a fact read out of the kernel. This test does not prove
-/// that inference — it runs `TRANSITIONS` real transitions against a pool of
-/// concurrent background probers spanning the whole loop, so IF it were wrong
-/// (an `-Fa`-shaped gap still existed, or reappeared some other way), the
-/// prober pool has many overlapping, independent real chances to catch a SYN
-/// that got out during an open window and would very likely observe at least
-/// one. A pass here is strong empirical evidence of atomicity across real
-/// transitions on this kernel, not a mathematical proof — a race narrower
-/// than the prober pool's combined polling resolution could in principle
-/// still slip through undetected. The pool (not a single serial prober) is
-/// load-bearing here: pf's `block-policy drop` (silent drop, no RST) means a
-/// blocked connect blocks for its *entire* timeout before the same thread can
-/// probe again, so one thread alone could be parked inside a single blocked
-/// `connect_timeout` call for the whole duration of a given `engage()` (a few
-/// subprocess `pfctl` calls, plausibly a handful of milliseconds) and never
-/// overlap that transition at all. `PROBER_THREADS` concurrent, short-timeout
-/// probers keep the number of in-flight SYNs high at every instant instead of
-/// only between a single thread's timeouts.
+/// EVIDENTIARY SCOPE (the #997 caveat, module doc has the ticket-discipline
+/// argument in full): a pass here is strong empirical evidence, not a
+/// mathematical proof, of atomicity across `TRANSITIONS` real transitions —
+/// `PROBER_THREADS` concurrent short-timeout probers give an `-Fa`-shaped
+/// regression many overlapping, independent chances to be caught. The pool
+/// (not a single serial prober) is load-bearing specifically because
+/// `block-policy drop` silently blocks a connect for its *entire* timeout, so
+/// one thread alone could be parked inside a single blocked `connect_timeout`
+/// call for a whole transition and never overlap it at all.
 ///
-/// SENSITIVITY IS PRINTED, NOT ASSUMED. Every real failure this guard has
-/// caught was the cold `-E`→load window: two process spawns, tens of
-/// milliseconds. The `-Fa` window it was written for is narrower by orders of
-/// magnitude — a flush ioctl, a stdin parse and a `DIOCADDRULE`/`DIOCXCOMMIT`
-/// pair inside ONE process, plausibly sub-millisecond — and the positive
-/// control below only establishes that the 20ms budget is not *impossible*,
-/// never that detection is likely. Nothing here turns a green into a bound on
-/// the narrowest window that would still be caught. So the run prints its own
-/// numbers instead of leaving the green uninformative: the control's
-/// completed-connect ratio, and the pool's aggregate probe rate as a mean
-/// interval between SYNs. A window shorter than that interval is likelier to
-/// be missed than caught, and the printed line is what says which side of it
-/// the runner landed on. `.config/nextest.toml` gives this test
-/// `success-output` so the line survives a PASS, where nextest otherwise
-/// discards captured output.
+/// SENSITIVITY IS PRINTED, NOT ASSUMED — every real failure this guard has
+/// caught was the cold `-E`→load window (tens of ms), which is orders of
+/// magnitude wider than the sub-millisecond `-Fa` window it exists for, so a
+/// green here is not a bound on the narrowest window that would still be
+/// caught. The run therefore prints its own numbers (the control's
+/// completed-connect ratio and the pool's aggregate probe rate) rather than
+/// leaving a green uninformative; `.config/nextest.toml` gives this test
+/// `success-output` so that line survives a PASS. See the printed line itself
+/// for what it means and its own caveats — this comment does not restate them.
 ///
-/// A MEASURED number, not a hypothetical one: on the darwin/amd64 CI runner
-/// (2026-09-10, job 102969439298) the control completed 7/31 connects (22.6%)
-/// to a PERMITTED server within the 20ms budget — under a quarter of the
-/// control's own attempts land inside the window at all. So this guard
-/// catches a leak with roughly that probability per transition it overlaps,
-/// nowhere near the near-certainty a green result would otherwise suggest,
-/// and the `pfctl -f -` commit window it exists to guard is plausibly
-/// sub-millisecond (see the paragraph above) — an order of magnitude below
-/// even the 20ms the control was already struggling to clear. Widening
-/// `PROBER_TIMEOUT` to manufacture a better-looking ratio would not close
-/// that gap: it would relax the very probe the leak-detection assertion
-/// depends on, at 20ms of dwell time a leaked connection already has to
-/// survive. The honest fix for the gap is a narrower, more certain detection
-/// mechanism, not a bigger budget.
+/// A MEASURED number, not a hypothetical one — AWAITING RE-MEASUREMENT. The
+/// darwin/amd64 CI run (2026-09-10, job 102969439298) previously cited here
+/// reported 7/31 (22.6%), but that denominator counted every alternating
+/// control attempt, not just the ones targeting the currently-permitted
+/// server — roughly half of the 31 targeted the server the loop was actively
+/// blocking at that moment and, under `block-policy drop`, could never
+/// complete regardless of budget health. Fixed above
+/// (`control_permitted_attempts` excludes the blocked-target arm), which
+/// retires the 22.6%/"under a quarter" figure as an artefact of the old
+/// miscount rather than a fact about this guard's power. A corrected figure
+/// needs a fresh privileged darwin run against the fixed counter; record it
+/// here (and in `CONTRIBUTING.md`) once one is available.
 #[cfg(target_os = "macos")]
 #[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
 fn macos_failclosed_cover_transition_never_admits_blocked_flow() {
@@ -1381,24 +1432,49 @@ fn macos_failclosed_cover_transition_never_admits_blocked_flow() {
     // thread probes, at the same timeout over the same run, the servers the
     // covers PERMIT: a single success anywhere proves the budget is live, so
     // the silence next door is the cover's doing and not the clock's. It
-    // alternates its two targets instead of reading `phase`, so one of them is
-    // always the currently-permitted one and it needs no synchronization with
-    // the loop.
+    // alternates its two targets instead of reading `phase` to pick WHERE to
+    // connect, so it needs no synchronization with the loop to decide that.
     //
-    // It also RETURNS its attempt count, so the pass reports `hits/attempts`
-    // rather than only `hits > 0`: that ratio is this guard's stated
-    // sensitivity, and `> 0` alone cannot distinguish a budget that lands
-    // nearly every time from one that lands once in a whole run.
+    // But `phase` IS read for what gets COUNTED: at any instant the transition
+    // loop permits exactly one of the two addresses (`addrs[i % addrs.len()]`)
+    // and `set block-policy drop` means a connect to the OTHER one silently
+    // burns the entire `PROBER_TIMEOUT` rather than completing — so on
+    // alternation alone, roughly half of every attempt targets the currently-
+    // blocked server and can never land. Counting those in the denominator
+    // caps the printed rate at ~50% regardless of how healthy the runner is.
+    // Each attempt still fires exactly as before (the alternation itself is
+    // unchanged — only the arm matching the currently-permitted address, read
+    // off `phase`, is added to `control_permitted_attempts`/`control_hits`).
+    //
+    // It also RETURNS its total attempt count (both arms), so the pass can
+    // report `hits/permitted_attempts` — that ratio is this guard's stated
+    // sensitivity — alongside how many of the run's attempts targeted the
+    // permitted server at all.
     let control_hits = Arc::new(AtomicUsize::new(0));
+    let control_permitted_attempts = Arc::new(AtomicUsize::new(0));
     let control = {
-        let (control_hits, stop_control) = (control_hits.clone(), stop.clone());
+        let (control_hits, control_permitted_attempts, stop_control, phase_control) = (
+            control_hits.clone(),
+            control_permitted_attempts.clone(),
+            stop.clone(),
+            phase.clone(),
+        );
         std::thread::spawn(move || {
             let mut attempts = 0usize;
             while !stop_control.load(Ordering::SeqCst) {
-                let target = format!("{}:443", [SERVER_A, SERVER_B][attempts % 2]);
+                let target_idx = attempts % 2;
+                let target = format!("{}:443", [SERVER_A, SERVER_B][target_idx]);
                 attempts += 1;
-                if connect(&target, PROBER_TIMEOUT).is_ok() {
-                    control_hits.fetch_add(1, Ordering::SeqCst);
+                let ok = connect(&target, PROBER_TIMEOUT).is_ok();
+                // addrs[phase % addrs.len()] is the transition loop's own rule
+                // for which address is currently permitted (see the loop
+                // below); only an attempt against that address belongs in the
+                // sensitivity denominator.
+                if target_idx == phase_control.load(Ordering::SeqCst) % 2 {
+                    control_permitted_attempts.fetch_add(1, Ordering::SeqCst);
+                    if ok {
+                        control_hits.fetch_add(1, Ordering::SeqCst);
+                    }
                 }
             }
             attempts
@@ -1408,6 +1484,12 @@ fn macos_failclosed_cover_transition_never_admits_blocked_flow() {
     // Wall clock spanning exactly the window the pool covers, so the printed
     // probe rate is probes-per-second of the run the assertions are about.
     let pool_started = std::time::Instant::now();
+
+    // Counts (not just logs) a failed `-X` retiring the OLD cover's refcount
+    // below — production code in this module never swallows a `pfctl` result
+    // without at least logging it, and a refcount that fails to drop here is
+    // a real leak, not a benign no-op.
+    let mut old_x_failures = 0usize;
 
     for i in 1..=TRANSITIONS {
         phase.store(i, Ordering::SeqCst);
@@ -1419,7 +1501,13 @@ fn macos_failclosed_cover_transition_never_admits_blocked_flow() {
             // over the ruleset the NEW cover (already engaged above) just
             // loaded. The refcount stays balanced: this engage's own `-E`
             // already ran, so this `-X` brings it back down by exactly one.
-            let _ = pfctl(&["-X", &old.token], None, BestEffortPhase::RecoverCover);
+            if let Err(e) = pfctl_status(
+                pfctl(&["-X", &old.token], None, BestEffortPhase::RecoverCover),
+                "pfctl -X",
+            ) {
+                tracing::warn!(error = %e, iteration = i, "pfctl -X failed retiring the old cover's refcount mid-transition");
+                old_x_failures += 1;
+            }
             old.detach();
         }
         held = Some(new_cover);
@@ -1431,25 +1519,40 @@ fn macos_failclosed_cover_transition_never_admits_blocked_flow() {
         .into_iter()
         .map(|p| p.join().expect("prober thread panicked"))
         .sum();
-    let control_attempts = control.join().expect("control prober thread panicked");
+    let control_total_attempts = control.join().expect("control prober thread panicked");
     assert!(
         attempts > 0,
         "prober pool made no attempts at all — this test is vacuous"
     );
+    assert_eq!(
+        old_x_failures, 0,
+        "pfctl -X failed retiring the old cover's refcount on {old_x_failures}/{TRANSITIONS} \
+         transitions — each failure leaks a pf enable refcount (see the warn logged above for \
+         which iteration and why)"
+    );
 
     // The guard stating its own sensitivity. Printed unconditionally (see the
     // doc comment): a green with no number attached says only that nothing was
-    // caught, not that anything would have been.
+    // caught, not that anything would have been. The denominator here is
+    // `permitted_attempts`, NOT the control's total attempt count: half of the
+    // latter targets whichever server the loop currently blocks and can never
+    // complete under `block-policy drop`, so counting it would understate the
+    // budget's real hit rate by roughly half (see the control thread's doc
+    // comment above).
     let hits = control_hits.load(Ordering::SeqCst);
-    let control_rate = 100.0 * hits as f64 / control_attempts as f64;
+    let permitted_attempts = control_permitted_attempts.load(Ordering::SeqCst);
+    let control_rate = 100.0 * hits as f64 / permitted_attempts as f64;
     let per_probe_us = elapsed.as_micros() as f64 / attempts as f64;
     eprintln!(
-        "[sensitivity] macos_failclosed_cover_transition: control completed {hits}/{control_attempts} \
-         connects ({control_rate:.1}%) to a PERMITTED server within {PROBER_TIMEOUT:?}; the pool \
-         emitted {attempts} probes across {PROBER_THREADS} threads over {elapsed:?} = one probe per \
-         {per_probe_us:.0} us of wall clock. A leak window shorter than that interval is likelier to \
-         be missed than caught — compare it against the ~sub-millisecond `pfctl -f -` commit this \
-         test guards."
+        "[sensitivity] macos_failclosed_cover_transition: control completed {hits}/{permitted_attempts} \
+         connects ({control_rate:.1}%) to a PERMITTED server within {PROBER_TIMEOUT:?} ({control_total_attempts} \
+         total alternating attempts, half of which target the currently-blocked server and are excluded); \
+         the pool emitted {attempts} probes across {PROBER_THREADS} threads over {elapsed:?} = one probe \
+         per {per_probe_us:.0} us of wall clock. That interval bounds probe COVERAGE, not detection: a \
+         leak must still complete the WHOLE handshake — SYN, SYN/ACK across the RTT, and the client's \
+         outbound ACK — before the next `pfctl -f -` commit can cut it off, so a leak window shorter than \
+         that interval, or too short to fit a full handshake at all, is likelier to be missed than caught; \
+         compare it against the ~sub-millisecond `pfctl -f -` commit this test guards."
     );
 
     assert!(
@@ -1464,7 +1567,7 @@ fn macos_failclosed_cover_transition_never_admits_blocked_flow() {
 
     assert!(
         hits > 0,
-        "positive control: not one of {control_attempts} connects to a PERMITTED server \
+        "positive control: not one of {permitted_attempts} connects to a PERMITTED server \
          ({SERVER_A}/{SERVER_B}) completed within {PROBER_TIMEOUT:?} across the whole run, so that \
          budget cannot complete a handshake on this runner at all and the never-admitted assertion \
          above held vacuously — raise PROBER_TIMEOUT rather than trusting the green"
@@ -1539,8 +1642,16 @@ fn macos_failclosed_cover_state_purge_kills_a_flow_established_before_engage() {
     struct HostPfStandIn(String);
     impl Drop for HostPfStandIn {
         fn drop(&mut self) {
-            let _ = pfctl(&["-f", PFCONF], None, BestEffortPhase::RecoverCover);
-            let _ = pfctl(&["-X", &self.0], None, BestEffortPhase::RecoverCover);
+            // Mirrors `disengage`'s warn-on-failure pattern (macos.rs): a red
+            // run must not ALSO leave a silently-stranded pf ruleset or an
+            // unreferenced enable token with no logged trace of why the
+            // restore failed.
+            if let Err(e) = pfctl_status(pfctl(&["-f", PFCONF], None, BestEffortPhase::RecoverCover), "pfctl -f") {
+                tracing::warn!(error = %e, "pf ruleset restore failed unwinding the HostPfStandIn test fixture");
+            }
+            if let Err(e) = pfctl_status(pfctl(&["-X", &self.0], None, BestEffortPhase::RecoverCover), "pfctl -X") {
+                tracing::warn!(error = %e, "pfctl -X failed unwinding the HostPfStandIn test fixture");
+            }
         }
     }
     let enabled = pfctl(&["-E"], None, BestEffortPhase::RecoverCover).expect("pfctl -E");

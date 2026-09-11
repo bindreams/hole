@@ -239,11 +239,18 @@ const PFCONF: &str = "/etc/pf.conf";
 /// tracked separately.
 const PFCTL: &str = "/sbin/pfctl";
 
-fn pfctl<P: Phase>(args: &[&str], stdin: Option<&[u8]>, phase: P) -> Result<std::process::Output, RoutingError> {
-    let cmd: Vec<String> = std::iter::once(PFCTL)
+/// Build the argv `pfctl` runs with: [`PFCTL`]'s absolute path followed by
+/// `args`. Pure so the hardening in [`PFCTL`]'s doc — the absolute path, not a
+/// PATH-resolved bare `"pfctl"` — is unit-tested without spawning anything.
+fn pfctl_cmd(args: &[&str]) -> Vec<String> {
+    std::iter::once(PFCTL)
         .chain(args.iter().copied())
         .map(str::to_owned)
-        .collect();
+        .collect()
+}
+
+fn pfctl<P: Phase>(args: &[&str], stdin: Option<&[u8]>, phase: P) -> Result<std::process::Output, RoutingError> {
+    let cmd = pfctl_cmd(args);
     run_capturing(&cmd, stdin, phase).map_err(|e| RoutingError::RouteSetup(format!("pfctl spawn failed: {e}")))
 }
 
@@ -338,18 +345,35 @@ const fn purges_state(kind: CoverKind) -> bool {
 /// open host. A live cover whose purge did not land is the pre-existing
 /// bindreams/hole#1015 residue; an open host is worse, so the purge never
 /// promotes itself into an engage failure.
-fn load_cover_ruleset(kind: CoverKind, ruleset: &str, ops: &mut dyn EngageOps) -> Result<(), RoutingError> {
+fn load_cover_ruleset<T: CoverRulesetOps + ?Sized>(
+    kind: CoverKind,
+    ruleset: &str,
+    ops: &mut T,
+) -> Result<(), RoutingError> {
     ops.load_ruleset(ruleset)?;
     if purges_state(kind) {
         if let Err(e) = ops.flush_states() {
             tracing::warn!(
                 error = %e,
                 "pf state purge failed after the cover ruleset loaded; flows established before \
-                 this engage may keep flowing past it (bindreams/hole#1015)"
+                 this engage may keep flowing past it"
             );
         }
     }
     Ok(())
+}
+
+/// Narrow seam [`load_cover_ruleset`] actually needs: load a ruleset and,
+/// depending on [`purges_state`], flush pf's state table. Split out of
+/// [`EngageOps`] (its supertrait) so the one caller that only ever needs
+/// these two calls — `engage_lockdown`'s ruleset-load step — can be handed
+/// exactly this instead of standing up a full `EngageOps` implementation
+/// that also drags in `state_dir`/`owner` for methods it never calls.
+pub(crate) trait CoverRulesetOps {
+    /// `pfctl -f -` with `text` on stdin.
+    fn load_ruleset(&mut self, text: &str) -> Result<(), RoutingError>;
+    /// `pfctl -F states`: purge pf's state table, host-wide.
+    fn flush_states(&mut self) -> Result<(), RoutingError>;
 }
 
 /// Seam over the pf + state-file mutations an engage performs, so its ordering
@@ -357,17 +381,13 @@ fn load_cover_ruleset(kind: CoverKind, ruleset: &str, ops: &mut dyn EngageOps) -
 /// which cover kinds purge pf state are table-tested without shelling out to
 /// `pfctl`. As with [`PfOps`], a non-success `pfctl` exit status is folded
 /// into `Err` by the production implementation ([`RealEngageOps`]).
-pub(crate) trait EngageOps {
+pub(crate) trait EngageOps: CoverRulesetOps {
     /// `pfctl -s info`, parsed: is pf currently enabled?
     fn pf_enabled(&mut self) -> Result<bool, RoutingError>;
     /// `pfctl -E` (refcounted enable) + capture the enable token.
     fn enable_capture_token(&mut self) -> Result<String, RoutingError>;
     /// Write `bridge-failclosed.json`.
     fn save_transient(&mut self, st: &state::FailClosedState) -> Result<(), RoutingError>;
-    /// `pfctl -f -` with `text` on stdin.
-    fn load_ruleset(&mut self, text: &str) -> Result<(), RoutingError>;
-    /// `pfctl -F states`: purge pf's state table, host-wide.
-    fn flush_states(&mut self) -> Result<(), RoutingError>;
     /// `pfctl -X <token>`: drop a pf enable refcount.
     fn drop_token(&mut self, token: &str) -> Result<(), RoutingError>;
     /// The transient cover's full restore, `disengage(token, .., false)`.
@@ -515,7 +535,7 @@ fn disengage(token: &str, state_dir: &Path, adopting: bool) {
         }
         out
     };
-    if let Err(e) = pfctl(&["-X", token], None, BestEffortPhase::RecoverCover) {
+    if let Err(e) = pfctl_status(pfctl(&["-X", token], None, BestEffortPhase::RecoverCover), "pfctl -X") {
         tracing::warn!(error = %e, "pfctl -X failed during cover disengage");
     }
     if restore_confirmed(adopting, &reload) {
@@ -665,7 +685,7 @@ pub fn engage_lockdown(
                 main_snapshot_captured: st.main_snapshot_captured,
             };
             if let Err(e) = lockdown_state::save(state_dir, &fresh, owner) {
-                if let Err(xe) = pfctl(&["-X", &token], None, FatalPhase::CoverEngage) {
+                if let Err(xe) = pfctl_status(pfctl(&["-X", &token], None, FatalPhase::CoverEngage), "pfctl -X") {
                     tracing::warn!(error = %xe, "pfctl -X failed unwinding a failed lockdown re-enable");
                 }
                 return Err(RoutingError::RouteSetup(format!(
@@ -683,7 +703,7 @@ pub fn engage_lockdown(
             match capture_and_persist(&token, state_dir, owner) {
                 Ok(nat_snapshot) => (token, nat_snapshot),
                 Err(e) => {
-                    if let Err(xe) = pfctl(&["-X", &token], None, FatalPhase::CoverEngage) {
+                    if let Err(xe) = pfctl_status(pfctl(&["-X", &token], None, FatalPhase::CoverEngage), "pfctl -X") {
                         tracing::warn!(error = %xe, "pfctl -X failed unwinding a failed lockdown engage");
                     }
                     return Err(e);
@@ -694,8 +714,12 @@ pub fn engage_lockdown(
 
     let main = build_lockdown_main_ruleset(tun_name, server_ip, &nat_snapshot);
     // Through the shared loader, so this path's "no state purge" is
-    // [`purges_state`]'s decision rather than the absence of a call here.
-    if let Err(e) = load_cover_ruleset(CoverKind::Lockdown, &main, &mut RealEngageOps { state_dir, owner }) {
+    // [`purges_state`]'s decision rather than the absence of a call here. Only
+    // `load_ruleset`/`flush_states` are needed here, so this passes the
+    // narrow `CoverRulesetOps` seam (`RealCoverRulesetOps`) rather than
+    // standing up a full `RealEngageOps` with a `state_dir`/`owner` this call
+    // never reads.
+    if let Err(e) = load_cover_ruleset(CoverKind::Lockdown, &main, &mut RealCoverRulesetOps) {
         // Restore the host (snapshot reload + drop refcount) before failing, so
         // a partially-loaded ruleset never strands the host.
         lockdown_disengage(state_dir);
@@ -987,6 +1011,34 @@ struct RealEngageOps<'a> {
     owner: Option<(u32, u32)>,
 }
 
+/// `pfctl -f -` with `text` on stdin, one [`FatalPhase::CoverEngage`]
+/// implementation shared by [`RealEngageOps`] and [`RealCoverRulesetOps`] so
+/// the narrower seam is not a second copy of the shell-out.
+fn real_load_ruleset(text: &str) -> Result<(), RoutingError> {
+    pfctl_status(
+        pfctl(&["-f", "-"], Some(text.as_bytes()), FatalPhase::CoverEngage),
+        "pfctl load",
+    )
+}
+
+/// `pfctl -F states`, same sharing rationale as [`real_load_ruleset`].
+fn real_flush_states() -> Result<(), RoutingError> {
+    pfctl_status(
+        pfctl(&["-F", "states"], None, FatalPhase::CoverEngage),
+        "pfctl -F states",
+    )
+}
+
+impl CoverRulesetOps for RealEngageOps<'_> {
+    fn load_ruleset(&mut self, text: &str) -> Result<(), RoutingError> {
+        real_load_ruleset(text)
+    }
+
+    fn flush_states(&mut self) -> Result<(), RoutingError> {
+        real_flush_states()
+    }
+}
+
 impl EngageOps for RealEngageOps<'_> {
     fn pf_enabled(&mut self) -> Result<bool, RoutingError> {
         let info = pfctl_stdout(pfctl(&["-s", "info"], None, FatalPhase::CoverEngage), "pfctl -s info")?;
@@ -1002,26 +1054,28 @@ impl EngageOps for RealEngageOps<'_> {
             .map_err(|e| RoutingError::RouteSetup(format!("failed to persist failclosed-state: {e}")))
     }
 
-    fn load_ruleset(&mut self, text: &str) -> Result<(), RoutingError> {
-        pfctl_status(
-            pfctl(&["-f", "-"], Some(text.as_bytes()), FatalPhase::CoverEngage),
-            "pfctl load",
-        )
-    }
-
-    fn flush_states(&mut self) -> Result<(), RoutingError> {
-        pfctl_status(
-            pfctl(&["-F", "states"], None, FatalPhase::CoverEngage),
-            "pfctl -F states",
-        )
-    }
-
     fn drop_token(&mut self, token: &str) -> Result<(), RoutingError> {
         pfctl_status(pfctl(&["-X", token], None, FatalPhase::CoverEngage), "pfctl -X")
     }
 
     fn transient_restore(&mut self, token: &str) {
         disengage(token, self.state_dir, false);
+    }
+}
+
+/// Production [`CoverRulesetOps`] for a bare ruleset-load-and-purge, with no
+/// `state_dir`/`owner` — unlike [`RealEngageOps`], which the `Lockdown` engage
+/// path does not need for this step (see its call site in
+/// [`engage_lockdown`]).
+struct RealCoverRulesetOps;
+
+impl CoverRulesetOps for RealCoverRulesetOps {
+    fn load_ruleset(&mut self, text: &str) -> Result<(), RoutingError> {
+        real_load_ruleset(text)
+    }
+
+    fn flush_states(&mut self) -> Result<(), RoutingError> {
+        real_flush_states()
     }
 }
 
