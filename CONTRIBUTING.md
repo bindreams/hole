@@ -1098,7 +1098,7 @@ milliseconds.
   no state file is needed. The FWPM FFIs are clippy-disallowed outside this module.
 
 - **macOS** ([`routing/failclosed/macos.rs`](crates/tun-engine/src/routing/failclosed/macos.rs)):
-  `pfctl -E` (refcounted) + a self-contained ruleset loaded over stdin (`pfctl -f -`, absolute `/sbin/pfctl` — this runs as root, so a PATH-resolved bare `pfctl` is a hardening gap; pinning it is **one of ~35** equally exposed root spawns, alongside `routing.rs`'s 32 bare `route` sites, `device/ipv6_addr/macos.rs`'s `ifconfig` and the bridge's `NETWORKSETUP`, so it reduces no net attack surface on its own — widening it is tracked separately). Disengage restores `/etc/pf.conf` and drops the refcount (`pfctl -X <token>`). The token is persisted to `bridge-failclosed.json` *before* the
+  `pfctl -E` (refcounted) + a self-contained ruleset loaded over stdin (`pfctl -f -`, absolute `/sbin/pfctl` — this runs as root, so a PATH-resolved bare `pfctl` is a hardening gap; pinning it is **one of ~29** equally exposed root spawns, alongside `routing.rs`'s 26 bare `route` sites, `device/ipv6_addr/macos.rs`'s `ifconfig` and the bridge's `NETWORKSETUP`, so it reduces no net attack surface on its own — widening it is tracked separately). Disengage restores `/etc/pf.conf` and drops the refcount (`pfctl -X <token>`). The token is persisted to `bridge-failclosed.json` *before* the
   blocking ruleset loads, so recovery can `-X` it cleanly — and a persist that
   *fails* unwinds the `-E` with `pfctl -X` before propagating, the same
   symmetry `engage_lockdown`'s `FreshEnable`/`Reenable` arms already had; without
@@ -1156,12 +1156,12 @@ milliseconds.
 
   - pf enabled by a third party (Internet Sharing, another VPN, a hand-run
     `pfctl -e`) — the case with by far the widest blast radius;
-  - a transient→standing swap: the transient ruleset permits the `ech-doh`
-    resolver on TCP/443 and the lockdown ruleset does not, so those flows
-    would otherwise survive the swap;
   - a **cross-process** transient engage over a still-live *standing* ruleset —
     a new bridge's `engage()` after the outgoing bridge's `CoverGuard::disarm`
-    left the standing cover up;
+    left the standing cover up. Narrowly reachable: a transient engage needs
+    `covered && !lockdown_on` (`proxy_manager.rs:1029`), and with lockdown
+    intent off, `decide_cover_recovery` sweeps the standing cover at startup
+    rather than adopting it, so reaching this case requires a *failed* sweep;
   - a cold engage's own `-E`-then-load window, which briefly mints state under
     the stale ruleset. Reordering does not fix that one (load-then-enable mints
     no state in the window but leaves the host fully unfiltered across it
@@ -1247,8 +1247,12 @@ milliseconds.
   window it exists for is a flush ioctl plus a stdin parse plus
   `DIOCADDRULE`/`DIOCXCOMMIT` inside one process — plausibly sub-millisecond —
   and the positive control's `control_hits > 0` proves only that the 20ms budget
-  is not impossible, not that detection is likely. The test-and-`-Fa`-removal
-  also landed in one commit, so no red-then-green against `-Fa` exists. So the
+  is not impossible, not that detection is likely. Detection also needs the
+  full handshake to clear the gap, not merely the SYN — the client's ACK is
+  outbound and is blocked once the new ruleset commits — so real power against
+  a sub-millisecond window is lower still than the probe-interval framing
+  implies. The test-and-`-Fa`-removal also landed in one commit, so no
+  red-then-green against `-Fa` exists. So the
   run now reports `control_hits`/`control_attempts` and the pool's aggregate
   probe rate as a mean interval between SYNs, and `.config/nextest.toml` gives
   the test `success-output` so the line survives a PASS. Read that interval

@@ -1183,11 +1183,13 @@ fn an_empty_but_captured_baseline_still_restores_the_snapshot() {
 ///   REQUIRES it to be open before anything starts. A prober spanning that
 ///   window observes exactly the open host the baseline demanded and reports
 ///   a "leak" on every run: the instrumented CI run that produced this split
-///   latched `leaked_at_phase=0` (the cold engage) while all 24 transitions
-///   passed clean. Mechanically the window cannot be closed either, in any
-///   ordering: `pfctl -E` (enable) and `pfctl -f -` (load) are separate
-///   process invocations, and while pf is disabled nothing is filtered
-///   regardless of what is loaded.
+///   latched `leaked_at_phase=0` (the cold engage). It cannot support "all 24
+///   transitions passed clean" — `leaked_at_phase` is a `compare_exchange`
+///   from `usize::MAX`, so once phase 0 latched, a leak in any later
+///   transition was invisible to it. Mechanically the window cannot be closed
+///   either, in any ordering: `pfctl -E` (enable) and `pfctl -f -` (load) are
+///   separate process invocations, and while pf is disabled nothing is
+///   filtered regardless of what is loaded.
 /// - **Every transition** (each later `engage()`, replacing a still-live
 ///   cover). Asserted STRICTLY: the prober pool runs continuously across all
 ///   of them and not one probe may succeed. This is the actual #997 property.

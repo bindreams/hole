@@ -227,15 +227,15 @@ const PFCONF: &str = "/etc/pf.conf";
 /// directory on it shadow the real binary. `/sbin/pfctl` is where macOS ships
 /// it, unconditionally.
 ///
-/// NOT a closed hardening. This is one of roughly 35 equally exposed root
-/// spawns: `routing.rs` spawns a bare `"route"` at 32 sites,
+/// NOT a closed hardening. This is one of roughly 29 equally exposed root
+/// spawns: `routing.rs` spawns a bare `"route"` at 26 sites,
 /// `device/ipv6_addr/macos.rs` spawns `"ifconfig"`, and
 /// `bridge/src/dns/system/macos.rs` holds `const NETWORKSETUP: &str =
 /// "networksetup"` — every one of them PATH-resolved through
 /// `Command::new(&cmd[0])` as root. A `--service` bridge inherits launchd's
 /// fixed `PATH`, but a GUI-elevated one inherits the user's, `/opt/homebrew/bin`
 /// included. Pinning this one call site is correct in itself and delivers no
-/// net attack-surface reduction while the other 34 stand; widening it is
+/// net attack-surface reduction while the other 28 stand; widening it is
 /// tracked separately.
 const PFCTL: &str = "/sbin/pfctl";
 
@@ -302,9 +302,9 @@ impl Cover {
 ///
 /// - [`CoverKind::Transient`] — **purge**. Reachable whenever pf was already
 ///   enabled ahead of us: Internet Sharing, another VPN, a hand-run
-///   `pfctl -e`, or Hole's own transient→standing swap, where the transient
-///   ruleset permitted the `ech-doh` resolver on TCP/443 and the standing one
-///   does not. A host-wide flush is safe HERE specifically because there is no
+///   `pfctl -e`, or a cross-process transient engage over a still-live
+///   standing ruleset left by an outgoing bridge's `CoverGuard::disarm`. A
+///   host-wide flush is safe HERE specifically because there is no
 ///   tunnel of ours yet: the transient cover is engaged in `hold_pending`,
 ///   *before* `start_inner`, so the only flows it can break are the
 ///   pre-existing ones it exists to break.
