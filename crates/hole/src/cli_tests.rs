@@ -1115,10 +1115,12 @@ fn redaction_is_armed_only_by_the_wire_funnel() {
         "the only `arm_server` calls may be inside arm_request_redaction's match: {ad_hoc:?}"
     );
 
-    // The one call site is inside the driver, ahead of the connect.
+    // The one call site is inside the driver, ahead of the connect. Matched
+    // by path component, not the rendered path string: `Display` renders
+    // `\` on Windows, so a `/`-suffix check silently finds nothing there.
     let (_, cli_source) = sources
         .iter()
-        .find(|(file, _)| file.ends_with("/cli.rs"))
+        .find(|(file, _)| std::path::Path::new(file).file_name() == Some(std::ffi::OsStr::new("cli.rs")))
         .expect("cli.rs must be among the walked sources");
     let driver = cli_source
         .split_once("fn send_bridge_request_inner_at(")
