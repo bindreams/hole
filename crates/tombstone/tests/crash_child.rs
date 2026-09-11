@@ -10,8 +10,7 @@
 //! classes. The one deliberate exception is `crash_marker_abort` on macOS,
 //! where `crash::on_crash`'s `_exit(EX_SOFTWARE)` bypass makes the exit
 //! status a controlled, assertable fact instead of "whatever the OS's
-//! default disposition for this signal happens to produce" — see that test
-//! and review B5.
+//! default disposition for this signal happens to produce" — see that test.
 //!
 //! Integration-test target, not a unit-test module, because
 //! `CARGO_BIN_EXE_crash_child` is only set for `tests/*.rs` (and benches),
@@ -50,7 +49,7 @@ fn crash_child_bin() -> std::path::PathBuf {
 // (the sanctioned no-sleep exception: "awaiting … a child-process exit …
 // where the timeout is the failure bound surfaced to a human," never a bet
 // that N is long enough for the happy path). It is a SAFETY NET, not the
-// fix for bindreams/hole#842/#719: the actual cause — macOS's SIGABRT relay
+// fix for the underlying hang: the actual cause — macOS's SIGABRT relay
 // taking a second trip through the host crash reporter — is addressed
 // structurally in `crash::is_macos_sigabrt_relay`/`on_crash`, which stops
 // `crash_marker_abort`'s child from ever reaching the reporter. This bound
@@ -63,20 +62,30 @@ fn crash_child_bin() -> std::path::PathBuf {
 #[cfg(feature = "crash-child")]
 const CHILD_WAIT_BOUND: std::time::Duration = std::time::Duration::from_secs(60);
 
+// Scrub re-exec env on EVERY spawn of `crash_child_bin()` in this binary, so
+// a value inherited from this process (or, since the suite runs many
+// crash_child's concurrently, from a sibling test process) can't silently
+// divert the child onto a branch the caller didn't ask for. This covers
+// crash_child.rs's OWN test-double vars (checked before its
+// TOMBSTONE_CRASH_CLASS dispatch), not just HOLE_LOGGING_TEST_KIND: an
+// inherited TOMBSTONE_TEST_HANG_FOREVER would divert a real fault-class spawn
+// (or an EXIT_FAST-requesting spawn) into parking forever instead. One
+// helper for both spawn sites (`run_crash_child` here and `spawn_double` in
+// `crash_child_wait_tests`) so the two lists cannot drift apart.
 #[cfg(feature = "crash-child")]
-fn run_crash_child(class: &str, log_dir: &std::path::Path) -> std::process::Output {
-    let child = std::process::Command::new(crash_child_bin())
-        .env("TOMBSTONE_CRASH_CLASS", class)
-        .env("TOMBSTONE_LOG_DIR", log_dir)
-        // Scrub re-exec env so the child doesn't take a foreign branch — this
-        // includes crash_child.rs's OWN test-double vars (checked before its
-        // TOMBSTONE_CRASH_CLASS dispatch), not just HOLE_LOGGING_TEST_KIND: an
-        // inherited TOMBSTONE_TEST_HANG_FOREVER/EXIT_FAST from a parent test
-        // process would silently divert this child away from the real fault
-        // class it was just told to raise.
-        .env_remove("HOLE_LOGGING_TEST_KIND")
+fn scrub_reexec_env(cmd: &mut std::process::Command) -> &mut std::process::Command {
+    cmd.env_remove("HOLE_LOGGING_TEST_KIND")
         .env_remove("TOMBSTONE_TEST_HANG_FOREVER")
         .env_remove("TOMBSTONE_TEST_EXIT_FAST")
+}
+
+#[cfg(feature = "crash-child")]
+fn run_crash_child(class: &str, log_dir: &std::path::Path) -> std::process::Output {
+    let mut cmd = std::process::Command::new(crash_child_bin());
+    scrub_reexec_env(&mut cmd);
+    let child = cmd
+        .env("TOMBSTONE_CRASH_CLASS", class)
+        .env("TOMBSTONE_LOG_DIR", log_dir)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -86,20 +95,39 @@ fn run_crash_child(class: &str, log_dir: &std::path::Path) -> std::process::Outp
 }
 
 /// Wait for `child` to exit, bounded by `bound`. Uses
-/// `wait_timeout::ChildExt::wait_timeout`, which races a real blocking wait
-/// against the bound WITHOUT ever moving `child` off this stack frame — NOT
-/// a sleep/poll loop, and critically NOT the earlier design's background
-/// thread + channel, which could report `Timeout` after the *thread* had
-/// already reaped the pid, racing a same-pid-reused victim process into
-/// `kill_pid_best_effort`. Because `child` is never handed to another
-/// thread, `Ok(None)` (timeout) is a hard guarantee that this exact pid has
-/// not yet been reaped — `child.kill()` cannot target a process the OS has
-/// recycled. Confirming that the reap in the `Ok(None)` arm below was real
-/// (not merely claimed) is likewise done WITHOUT any check performed after
-/// the fact on the bare `pid` — the caller runs many crash_child's
-/// concurrently, so by the time a later, separate probe ran, a sibling
-/// test's spawn could already have recycled the freed pid, reintroducing the
-/// exact same class of race B3 fixed. See bindreams/hole#842/#719 review B3.
+/// `wait_timeout::ChildExt::wait_timeout` — the sanctioned child-process-exit
+/// exception to the no-sleep/no-poll rule: `bound` is the failure bound
+/// surfaced to a human, not a bet that `bound` is "long enough" for the
+/// happy path.
+///
+/// What it actually does, verified against `wait-timeout` 0.2.1's vendored
+/// source (`src/unix.rs`) rather than assumed from its doc comment: on
+/// first use it installs a PROCESS-GLOBAL `SIGCHLD` `sigaction`; each call
+/// then runs a `libc::poll(2)` loop bounded by `dur` over a per-call
+/// self-pipe plus that process-global SIGCHLD self-pipe, reaping via
+/// `try_wait()` (`WNOHANG`) whenever a SIGCHLD wakes it. `child` is
+/// inserted, for the duration of the call, into a process-global
+/// `Mutex<HashMap<*mut Child, _>>`, and `State::process_sigchlds`
+/// dereferences and `try_wait()`s every entry in that map from WHICHEVER
+/// thread's `poll` happens to drain the shared SIGCHLD pipe first — not
+/// necessarily this one, since every thread currently waiting has that same
+/// fd registered. The crate's own doc comment warns "if your application is
+/// otherwise handling SIGCHLD then bugs may arise"; no other code in this
+/// workspace installs a SIGCHLD handler today, but `crash_child` (which
+/// attaches tombstone's own crash handler) is exactly the kind of target
+/// where that caveat would matter if it ever did.
+///
+/// The guarantee `Ok(None)` (timeout) actually gives: this call's own
+/// SIGCHLD-driven reap never observed `child` exit, so `child`'s pid is
+/// unreaped and therefore not recyclable — `child.kill()` cannot target a
+/// process the OS has freed and reassigned. It does NOT guarantee `child`
+/// is still running: the loop's final iteration can find `elapsed >= dur`
+/// and return before draining a SIGCHLD that arrived moments earlier, so a
+/// child that exits right at the bound is a live, unreaped ZOMBIE when
+/// `Ok(None)` returns. `kill()` on a zombie is a harmless no-op (POSIX:
+/// signal delivery to a zombie has no effect), and the following `wait()`
+/// then reaps the child's OWN exit status, not one our SIGKILL caused — see
+/// the `Ok(None)` arm below, which asserts accordingly.
 #[cfg(feature = "crash-child")]
 fn wait_bounded(mut child: std::process::Child, bound: std::time::Duration) -> std::process::Output {
     use wait_timeout::ChildExt;
@@ -112,57 +140,73 @@ fn wait_bounded(mut child: std::process::Child, bound: std::time::Duration) -> s
             stderr: Vec::new(),
         },
         Ok(None) => {
-            // Timed out — `child` is still live and still ours (see doc
-            // comment above), so `kill()` + `wait()` cannot hit a recycled
-            // pid. SIGKILL is deliberate over a milder signal: it terminates
-            // a process even mid-exception-handling (XNU cannot mask
-            // SIGKILL), which is the exact state this exists to break out
-            // of. `wait()` after `kill()` confirms the kill actually landed
-            // before we report failure, rather than merely asserting we
-            // asked.
+            // Timed out from wait_timeout's own perspective — `child`'s pid
+            // is unreaped and therefore not recyclable (see doc comment
+            // above), so `kill()` cannot land on a process the OS has
+            // recycled. It CAN land on a child that already self-exited but
+            // is sitting unreaped as a zombie (the doc comment above covers
+            // the race that produces one): `kill()` on a zombie is a
+            // harmless no-op, so the following `wait()` then reaps the
+            // child's OWN exit status rather than one our SIGKILL caused.
+            // SIGKILL is still the right signal to send on the belief the
+            // child is live: it terminates a process even mid-exception-
+            // handling (XNU cannot mask SIGKILL). Either way `wait()` after
+            // `kill()` reaps `child`, so this call always ends with a
+            // terminal status to report, never a still-unreaped child.
             child.kill().expect("SIGKILL a timed-out crash_child");
             let status = child.wait().expect("reap crash_child after SIGKILL");
-            // Prove the reap was REAL, not just a claim in this panic's text,
-            // WITHOUT a second, later, out-of-band pid probe: re-checking
-            // `pid`'s liveness via `kill(pid, 0)` after this point is exactly
-            // the prior B3 race in a new spot (this suite runs many
-            // crash_child's concurrently, so a freed pid is realistically
-            // recyclable by a SIBLING test's spawn before any later check
-            // runs — the gap is not merely theoretical here). Cross-platform
-            // termination-cause encoded straight from `status`, which only a
-            // genuine kill()-then-wait() can have produced, is the
-            // unfakeable-by-omission substitute: Unix `kill()` is SIGKILL, so
-            // `status.signal() == Some(SIGKILL)`; Windows `kill()` is
-            // `TerminateProcess(_, 1)`, so `status.code() == Some(1)`.
+            // kill()-then-wait() proves only that THIS Child reached SOME
+            // reaped terminal state — not which of the two races above
+            // produced it, so name the outcome rather than assume the
+            // SIGKILL one. Unix `kill()` delivers SIGKILL, so
+            // `signal() == Some(SIGKILL)` means our kill landed on a live
+            // process; any other terminal status means the child had
+            // already self-exited before `kill()` ran. Windows `kill()` is
+            // `TerminateProcess(_, 1)`, so `code() == Some(1)` is the
+            // equivalent "we killed it" signature there.
             #[cfg(unix)]
             let termination_proof = {
                 use std::os::unix::process::ExitStatusExt;
-                assert_eq!(
-                    status.signal(),
-                    Some(libc::SIGKILL),
-                    "reaped status must show SIGKILL termination, not a fabricated reap: {status:?}"
-                );
-                format!("signal={:?}", status.signal())
+                if status.signal() == Some(libc::SIGKILL) {
+                    format!("we killed it: signal={:?}", status.signal())
+                } else {
+                    format!(
+                        "it had already self-exited before our kill() landed: signal={:?} code={:?}",
+                        status.signal(),
+                        status.code()
+                    )
+                }
             };
             #[cfg(windows)]
             let termination_proof = {
-                assert_eq!(
-                    status.code(),
-                    Some(1),
-                    "reaped status must show TerminateProcess's exit code 1, not a fabricated reap: {status:?}"
-                );
-                format!("code={:?}", status.code())
+                if status.code() == Some(1) {
+                    format!("we killed it: code={:?}", status.code())
+                } else {
+                    format!(
+                        "it had already self-exited before our kill() landed: code={:?}",
+                        status.code()
+                    )
+                }
             };
             panic!(
-                "crash_child (pid {pid}) did not exit within {bound:?} — sent SIGKILL as a \
-                 safety net and confirmed it reaped with status {status:?} ({termination_proof}). \
-                 This is the child-process-exit failure bound from bindreams/hole#842/#719, not a \
-                 synchronization timeout: if this fires, the child genuinely stalled (most \
-                 likely exposure to the macOS crash reporter that `crash::is_macos_sigabrt_relay` \
-                 is meant to prevent) and needs investigation, not a longer bound."
+                "crash_child (pid {pid}) did not exit within {bound:?} — reaped with status \
+                 {status:?} ({termination_proof}). This is the child-process-exit failure \
+                 bound, not a synchronization timeout: if this fires, the child genuinely \
+                 stalled (most likely exposure to the macOS crash reporter that \
+                 `crash::is_macos_sigabrt_relay` is meant to prevent) and needs investigation, \
+                 not a longer bound."
             );
         }
-        Err(e) => panic!("crash_child (pid {pid}): wait_timeout() failed: {e}"),
+        Err(e) => {
+            // wait_timeout() itself failed (not a timeout) — `child` may
+            // still be running with no disposition recorded anywhere.
+            // Best-effort kill + reap before panicking so this arm can't
+            // leak an orphaned, still-running crash_child the way the
+            // pre-`wait_bounded` design did.
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("crash_child (pid {pid}): wait_timeout() failed: {e}")
+        }
     }
 }
 
@@ -264,8 +308,8 @@ fn crash_marker_segfault() {
 // every other class, whose exit status is genuinely non-deterministic
 // across platforms (see the file header) — macOS's abort case is made
 // deterministic on purpose by `crash::on_crash`'s `_exit(EX_SOFTWARE)`
-// bypass (bindreams/hole#842/#719 review B4/B5), and that determinism is
-// exactly what this test needs somewhere to assert on.
+// bypass, and that determinism is exactly what this test needs somewhere
+// to assert on.
 #[cfg(feature = "crash-child")]
 #[skuld::test]
 fn crash_marker_abort() {
@@ -281,8 +325,8 @@ fn crash_marker_abort() {
     // its `#[cfg(all(target_os = "macos", feature = "crash-child"))]`/
     // `kind == "test"` conjunction, and this assertion fails — either the
     // child goes on to deliver a raw, differently-coded `SIGABRT`, or (the
-    // actual #842/#719 bug) it hangs and `wait_bounded`'s 60s bound fails
-    // the test instead.
+    // actual bug this guards against) it hangs and `wait_bounded`'s 60s
+    // bound fails the test instead.
     #[cfg(target_os = "macos")]
     {
         use std::os::unix::process::ExitStatusExt;

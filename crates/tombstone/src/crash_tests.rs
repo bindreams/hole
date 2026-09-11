@@ -193,10 +193,10 @@ async fn sweep_reports_malformed_marker() {
 }
 
 // `is_macos_sigabrt_relay` identifies the exact synthetic-exception
-// signature crash-handler's SIGABRT sigaction relay produces on macOS
-// (bindreams/hole#842, #719): EXC_SOFTWARE / EXC_SOFT_SIGNAL / subcode ==
-// SIGABRT. Every field must match — a fault class that shares two of three
-// fields with a real abort relay must NOT be misidentified as one, or the
+// signature crash-handler's SIGABRT sigaction relay produces on macOS:
+// EXC_SOFTWARE / EXC_SOFT_SIGNAL / subcode == SIGABRT. Every field must
+// match — a fault class that shares two of three fields with a real abort
+// relay must NOT be misidentified as one, or the
 // `_exit` bypass in `on_crash` would swallow a genuine crash report.
 #[cfg(target_os = "macos")]
 mod is_macos_sigabrt_relay_tests {
