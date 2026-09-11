@@ -63,6 +63,77 @@ async fn serve_until_signal_returns_when_signal_fires() {
     join.await.unwrap();
 }
 
+// `ensure_stopped`'s absent-job classification ========================================================================
+//
+// The macOS half of #1003's "stop, then deregister" rule, and the mirror of
+// windows.rs's `open_error_is_absent`. Both platforms answer the same question
+// — does the service manager still have a job for this label? — and both must
+// answer it BY CAUSE. The old body answered it by re-probing with
+// `is_running()`, whose `.unwrap_or(false)` turned "launchd could not be asked"
+// into "nothing is running", so an `ensure_stopped` that stopped nothing
+// reported success and `uninstall_bridge_with` went on to deregister.
+
+#[skuld::test]
+fn launchd_answers_no_such_service_for_a_label_it_does_not_know() {
+    // Measures the constant against the running OS rather than asserting it
+    // from memory: `LAUNCHD_NO_SUCH_SERVICE` is what the classification of
+    // "there is no job to stop" hangs on, and a wrong value turns every clean
+    // uninstall into a failure (or, if it collided with success, a silent one).
+    let status = std::process::Command::new("launchctl")
+        .args(["print", "system/com.hole.bridge.absent-by-construction"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .expect("launchctl is present on every macOS host");
+    assert_eq!(
+        status.code(),
+        Some(LAUNCHD_NO_SUCH_SERVICE),
+        "launchctl print must report `no such service` for a label launchd cannot know"
+    );
+}
+
+#[skuld::test]
+fn a_registration_probe_classifies_by_cause() {
+    assert_eq!(classify_registration(Ok(Some(0))), Registration::Loaded);
+    assert_eq!(
+        classify_registration(Ok(Some(LAUNCHD_NO_SUCH_SERVICE))),
+        Registration::Absent
+    );
+    // Anything else is an answer about launchctl, not about the job. Neither
+    // an unexpected exit code, a signal, nor a failure to spawn says the
+    // bridge is stopped.
+    for unusable in [Some(1), Some(37), None] {
+        assert!(
+            matches!(classify_registration(Ok(unusable)), Registration::Unknown(_)),
+            "{unusable:?}"
+        );
+    }
+    assert!(matches!(
+        classify_registration(Err(std::io::Error::other("launchctl not found"))),
+        Registration::Unknown(_)
+    ));
+}
+
+#[skuld::test]
+fn an_unanswerable_probe_is_never_a_stopped_bridge() {
+    // The silent-success hole itself. `uninstall_bridge_with` gates
+    // deregistration on this returning Ok, and deleting the plist over a
+    // still-loaded job is the macOS dead end #1003 is about: `is_installed()`
+    // then reads false and no later uninstall ever tries to stop it again.
+    let err = ensure_stopped_verdict(Registration::Unknown("launchctl not found".into()))
+        .expect_err("an unanswerable probe must fail loud");
+    assert!(format!("{err}").contains("launchctl not found"), "{err}");
+
+    assert!(
+        ensure_stopped_verdict(Registration::Absent).is_ok(),
+        "a label launchd does not know is a label that is not running"
+    );
+
+    // Total over `Registration`, not merely over what its one caller passes:
+    // a still-loaded job is never a stopped bridge either, whoever asks.
+    assert!(ensure_stopped_verdict(Registration::Loaded).is_err());
+}
+
 #[skuld::test]
 fn post_bind_sweep_clears_marker() {
     let dir = tempfile::tempdir().unwrap();

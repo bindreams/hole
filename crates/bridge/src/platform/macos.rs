@@ -68,39 +68,22 @@ pub fn generate_plist(binary_path: &str) -> String {
 /// permissions, missing service) land in bridge.log instead of a terminal
 /// nobody sees in service mode.
 ///
-/// Failure severity is an argument because some call sites are best-effort
-/// (e.g. `uninstall` runs `bootout` on a service that may not be loaded, and
-/// a failure there is acceptable) — those use `BestEffort` to avoid spamming
-/// `ERROR`-level lines in `bridge.log`.
-#[derive(Clone, Copy)]
-enum LaunchctlFailLevel {
-    Error,
-    BestEffort,
-}
-
-fn run_launchctl(label: &str, args: &[&str], fail_level: LaunchctlFailLevel) -> std::io::Result<std::process::Output> {
+/// Every call site is fail-loud. The `BestEffort` severity this used to take
+/// existed for one caller — `uninstall`'s `bootout` against a job that might
+/// not be loaded — and that caller now asks launchd whether the job exists
+/// *before* issuing the bootout ([`ensure_stopped`]), so a failing bootout is
+/// always a real failure.
+fn run_launchctl(label: &str, args: &[&str]) -> std::io::Result<std::process::Output> {
     let output = std::process::Command::new("launchctl").args(args).output()?;
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     if !output.status.success() {
-        match fail_level {
-            LaunchctlFailLevel::Error => {
-                tracing::error!(
-                    %stdout,
-                    %stderr,
-                    status = ?output.status,
-                    "launchctl {label} failed",
-                );
-            }
-            LaunchctlFailLevel::BestEffort => {
-                tracing::debug!(
-                    %stdout,
-                    %stderr,
-                    status = ?output.status,
-                    "launchctl {label} best-effort call did not succeed",
-                );
-            }
-        }
+        tracing::error!(
+            %stdout,
+            %stderr,
+            status = ?output.status,
+            "launchctl {label} failed",
+        );
         return Err(std::io::Error::other(format!("launchctl {label} failed: {stderr}")));
     }
     tracing::debug!(%stdout, "launchctl {label} ok");
@@ -136,14 +119,62 @@ pub fn install(source_binary: &Path) -> std::io::Result<()> {
     std::fs::write(PLIST_PATH, plist)?;
 
     // Use modern launchctl bootstrap (replaces deprecated `load -w`)
-    run_launchctl(
-        "bootstrap",
-        &["bootstrap", "system", PLIST_PATH],
-        LaunchctlFailLevel::Error,
-    )?;
+    run_launchctl("bootstrap", &["bootstrap", "system", PLIST_PATH])?;
 
     info!("launchd bridge installed and loaded");
     Ok(())
+}
+
+/// launchd's "could not find the specified service" status, as `launchctl`
+/// exits with it. Measured against the running OS by
+/// `launchd_answers_no_such_service_for_a_label_it_does_not_know` rather than
+/// taken on trust — it is the one code that means "there is no job here",
+/// and the whole absent-vs-failed classification hangs on it.
+const LAUNCHD_NO_SUCH_SERVICE: i32 = 113;
+
+/// What launchd says about the bridge's job, keyed on the cause it reported.
+///
+/// The macOS counterpart of `windows::open_error_is_absent`: there are three
+/// answers, not two, and the third must never be folded into either of the
+/// others. See [`ensure_stopped_verdict`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Registration {
+    /// launchd has the job loaded.
+    Loaded,
+    /// launchd does not know this label: there is nothing to stop.
+    Absent,
+    /// launchd could not be asked, or answered something neither of the above.
+    /// Says nothing about the job either way.
+    Unknown(String),
+}
+
+/// Classify `launchctl print system/<label>`'s result. Pure, so the rule is
+/// table-tested without spawning anything.
+///
+/// `Ok(None)` is launchctl killed by a signal — an answer about launchctl, not
+/// about the job — and `Err` is a spawn failure. Both are [`Registration::Unknown`];
+/// the predecessor mapped both to `false` ("not running") via
+/// `is_running()`'s `.unwrap_or(false)`.
+fn classify_registration(status: std::io::Result<Option<i32>>) -> Registration {
+    match status {
+        Ok(Some(0)) => Registration::Loaded,
+        Ok(Some(LAUNCHD_NO_SUCH_SERVICE)) => Registration::Absent,
+        Ok(Some(code)) => Registration::Unknown(format!("launchctl print exited {code}")),
+        Ok(None) => Registration::Unknown("launchctl print was terminated by a signal".to_string()),
+        Err(e) => Registration::Unknown(format!("could not run launchctl print: {e}")),
+    }
+}
+
+/// Ask launchd whether it still has the bridge's job.
+fn probe_registration() -> Registration {
+    classify_registration(
+        std::process::Command::new("launchctl")
+            .args(["print", &format!("system/{LAUNCHD_LABEL}")])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.code()),
+    )
 }
 
 /// Stop the bridge *without* removing its plist, tolerating a host where
@@ -153,21 +184,54 @@ pub fn install(source_binary: &Path) -> std::io::Result<()> {
 /// any registration record — see `setup::uninstall_bridge_with` for why the
 /// two are independent.
 ///
+/// Structurally identical to the Windows arm: ask the service manager what it
+/// has, classify that answer BY CAUSE, and only then act. Windows asks with
+/// `OpenService` and classifies with `open_error_is_absent`; macOS asks with
+/// `launchctl print` and classifies with [`classify_registration`]. Neither
+/// platform infers "stopped" from the failure of something else.
+///
 /// `bootout`, not [`stop`]'s SIGTERM: the plist sets `KeepAlive`, so launchd
-/// relaunches a bare-signalled daemon. launchctl's exit codes do not separate
-/// "was not loaded" from a real failure, so the outcome is confirmed by cause
-/// instead — a label launchd no longer knows is a label that is not running.
+/// relaunches a bare-signalled daemon.
 pub fn ensure_stopped() -> std::io::Result<()> {
-    let system_label = format!("system/{LAUNCHD_LABEL}");
-    if run_launchctl("bootout", &["bootout", &system_label], LaunchctlFailLevel::BestEffort).is_ok() {
+    let registration = probe_registration();
+    if registration == Registration::Loaded {
+        let system_label = format!("system/{LAUNCHD_LABEL}");
+        run_launchctl("bootout", &["bootout", &system_label])?;
         return Ok(());
     }
-    if is_running() {
-        return Err(std::io::Error::other(format!(
-            "launchctl bootout did not stop {LAUNCHD_LABEL}, and launchd still has the job loaded"
-        )));
+    ensure_stopped_verdict(registration)
+}
+
+/// Whether a [`Registration`] lets the stop report success. Pure, so the arm
+/// that must never report it is testable without launchd.
+///
+/// `Unknown` is an error, not a success: `setup::uninstall_bridge_with` gates
+/// deregistration on this call, and deleting the plist over a still-loaded job
+/// is the macOS shape of the #1003 dead end — `is_installed()` then reads
+/// false, every later uninstall skips its teardown, and the bridge that holds
+/// the liveness lock is never stopped again, so the cover release refuses
+/// forever.
+///
+/// `Loaded` is the arm [`ensure_stopped`] handles itself — it issues the
+/// bootout rather than asking for a verdict — and is kept here so the function
+/// is total over `Registration` instead of being correct only while its one
+/// caller happens to filter that input out. Same reason
+/// `failclosed::KeyOutcome::Failed` is folded rather than assumed unreachable:
+/// a verdict that depends on a *different* function short-circuiting first is
+/// wrong the moment either side moves.
+fn ensure_stopped_verdict(registration: Registration) -> std::io::Result<()> {
+    match registration {
+        Registration::Absent => {
+            info!("launchd has no bridge job to stop");
+            Ok(())
+        }
+        Registration::Loaded => Err(std::io::Error::other(format!(
+            "launchd still has {LAUNCHD_LABEL} loaded after the stop"
+        ))),
+        Registration::Unknown(why) => Err(std::io::Error::other(format!(
+            "could not ask launchd whether {LAUNCHD_LABEL} is loaded ({why}); refusing to report the bridge stopped"
+        ))),
     }
-    Ok(())
 }
 
 /// Stop, unload, and remove the bridge.
@@ -195,11 +259,7 @@ pub fn uninstall() -> std::io::Result<()> {
 
 /// Start the bridge (bootstrap the plist if not already loaded).
 pub fn start() -> std::io::Result<()> {
-    run_launchctl(
-        "bootstrap",
-        &["bootstrap", "system", PLIST_PATH],
-        LaunchctlFailLevel::Error,
-    )?;
+    run_launchctl("bootstrap", &["bootstrap", "system", PLIST_PATH])?;
     info!("launchd bridge started");
     Ok(())
 }
@@ -207,7 +267,7 @@ pub fn start() -> std::io::Result<()> {
 /// Stop the bridge without unregistering it.
 pub fn stop() -> std::io::Result<()> {
     let system_label = format!("system/{LAUNCHD_LABEL}");
-    run_launchctl("kill", &["kill", "SIGTERM", &system_label], LaunchctlFailLevel::Error)?;
+    run_launchctl("kill", &["kill", "SIGTERM", &system_label])?;
     info!("launchd bridge stopped");
     Ok(())
 }
@@ -220,14 +280,21 @@ pub fn is_installed() -> bool {
 }
 
 /// Check whether the bridge is currently running.
+///
+/// Its one caller is `setup::bridge_install_status`, a cosmetic status
+/// readout, so an unanswerable probe has to collapse to *some* boolean. It
+/// collapses here, in an exhaustive match that names the uncertain case and
+/// logs it — never by a `.unwrap_or(false)` that also silently answered for
+/// [`ensure_stopped`], which acts on it.
 pub fn is_running() -> bool {
-    std::process::Command::new("launchctl")
-        .args(["print", &format!("system/{LAUNCHD_LABEL}")])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+    match probe_registration() {
+        Registration::Loaded => true,
+        Registration::Absent => false,
+        Registration::Unknown(why) => {
+            tracing::warn!(%why, "could not ask launchd whether the bridge is running; reporting it as not running");
+            false
+        }
+    }
 }
 
 /// Run the bridge directly (called by launchd).
