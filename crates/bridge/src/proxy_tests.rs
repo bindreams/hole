@@ -16,7 +16,7 @@ fn sample_server() -> ServerEntry {
         server: "1.2.3.4".into(),
         server_port: 8388,
         method: "aes-256-gcm".to_string(),
-        password: "secret".to_string(),
+        password: "secret".to_string().into(),
         plugin: None,
         plugin_opts: None,
         validation: None,

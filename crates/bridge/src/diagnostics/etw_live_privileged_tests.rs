@@ -1,6 +1,7 @@
-//! Privileged-lane proof that `ControlTraceW(EVENT_TRACE_CONTROL_QUERY)`
-//! works against a LIVE, unstopped ETW session. Runs on the elevated `tun`
-//! lane only: the `TUN` label (reused
+//! Claims about ETW sessions that only a real one can settle: what
+//! `ControlTraceW` answers for a live, a stopped, and a never-started session,
+//! and what [`EtwGuard::drop`] does with each answer. Runs on the elevated
+//! `tun` lane only: the `TUN` label (reused
 //! from `crate::test_support::skuld_fixtures`, this crate's existing
 //! "elevated Windows lane" bucket — not just literal TUN-adapter tests, see
 //! `proxy_manager_e2e_tests.rs`) gates it so the unprivileged
@@ -257,5 +258,371 @@ fn periodic_tick_rewarns_after_a_transient_failure_recovers() {
         "expected exactly 2 fresh (warn-level) failures -- tick 1's initial failure and tick 3's \
          failure after tick 2's success reset the throttle; a stuck throttle would leave tick 3 \
          logged as \"still failing\" instead; got:\n{output}"
+    );
+}
+
+/// The by-name backstop must actually take a live session down, or the
+/// session stays live and never gets stopped.
+///
+/// Calls [`stop_session_by_name`] directly against a real, still-live
+/// session rather than through [`EtwGuard::drop`]: driving it via a
+/// hand-built `EtwGuard { trace: None, .. }` would certify a state
+/// production never builds (`start_consumer_named` always fills `trace`),
+/// and the claim under test — that the by-name STOP can take a live session
+/// down — belongs to `stop_session_by_name` itself, not to `EtwGuard`'s
+/// field shape.
+#[cfg(target_os = "windows")]
+#[skuld::test(labels = [TUN], serial = TUN)]
+fn stop_session_by_name_stops_a_live_session() {
+    const PREFIX: &str = "hole-etw-live-stats-test-stop-by-name-";
+    crate::diagnostics::etw_sweep::sweep_sessions_with_prefix(PREFIX, "etw-test");
+
+    let writer = VecWriter::new();
+    let subscriber = tracing_subscriber::registry().with(
+        fmt::layer()
+            .with_writer(writer.clone())
+            .with_ansi(false)
+            .with_filter(tracing_subscriber::filter::LevelFilter::INFO),
+    );
+    let _guard = set_default_in_current_thread(subscriber);
+
+    let session_name = format!("{PREFIX}{}", std::process::id());
+    let provider = Provider::by_guid(TCPIP_PROVIDER)
+        .any(TCPIP_KEYWORDS)
+        .add_callback(|_record: &EventRecord, _schema_locator: &SchemaLocator| {})
+        .build();
+    let trace_properties = TraceProperties {
+        buffer_size: 256,
+        ..Default::default()
+    };
+    // Bound, not discarded with `_`: the latter would drop the session at the
+    // end of this statement (ferrisetw's own `Drop` stops it), leaving the
+    // backstop nothing to prove itself against. No processing thread is needed
+    // — the claim under test is kernel-side session state, which `ControlTraceW`
+    // reads and writes independently of user-mode buffer draining. The
+    // end-of-scope `Drop` lands after the assertions and ignores its own error.
+    let (_trace, _handle) = UserTrace::new()
+        .named(session_name.clone())
+        .set_trace_properties(trace_properties)
+        .enable(provider)
+        .start()
+        .expect("start a real ETW session (requires admin or Performance Log Users)");
+
+    let before = query_session_stats(&session_name, "live");
+    assert!(
+        before.is_ok(),
+        "the session must be live before the by-name stop: {before:?}"
+    );
+
+    let reclaimed = stop_session_by_name(&session_name);
+    assert!(reclaimed, "stop_session_by_name must report the session as reclaimed");
+
+    let after = query_session_stats(&session_name, "live");
+    assert!(
+        after.is_err(),
+        "the session must be gone once stop_session_by_name has run against it -- a call that \
+         only reports success without stopping the session leaves it registered in the kernel: \
+         {after:?}"
+    );
+
+    let output = writer.snapshot_string();
+    assert!(
+        output.contains("etw: stopped session by name"),
+        "expected the by-name stop to be logged as the path that took the session down; got:\n{output}"
+    );
+}
+
+/// The healthy path must leave nothing behind either, and must not need the
+/// backstop to do it: reaching it would add an unbounded synchronous
+/// `ControlTraceW` to every shutdown, the cost class of bindreams/hole#1016.
+/// Driven through a real [`EtwGuard`] — session, processing thread and stats
+/// timer — from `start_consumer_for_test`.
+///
+/// Captures at DEBUG: a backstop that ran here would find the session already
+/// stopped by handle and take `stop_session_by_name`'s `debug!` arm, invisible
+/// to the INFO capture the tests above use. All three of that function's arms
+/// are asserted absent, so "the backstop did not run" rests on no guess about
+/// which one a stray call would take — the `info!` arm needs a *live* session,
+/// which a successful `UserTrace::stop` has just ruled out, and its assertion
+/// is the canary for that assumption.
+#[cfg(target_os = "windows")]
+#[skuld::test(labels = [TUN], serial = TUN)]
+fn etw_guard_drop_stops_the_session_it_started() {
+    const PREFIX: &str = "hole-etw-live-stats-test-drop-stops-";
+    crate::diagnostics::etw_sweep::sweep_sessions_with_prefix(PREFIX, "etw-test");
+
+    let writer = VecWriter::new();
+    let subscriber = tracing_subscriber::registry().with(
+        fmt::layer()
+            .with_writer(writer.clone())
+            .with_ansi(false)
+            .with_filter(tracing_subscriber::filter::LevelFilter::DEBUG),
+    );
+    let _guard = set_default_in_current_thread(subscriber);
+
+    let session_name = format!("{PREFIX}{}", std::process::id());
+    let etw_guard = start_consumer_for_test(session_name.clone(), LIVE_STATS_INTERVAL, |_| {})
+        .expect("start a real ETW session (requires admin or Performance Log Users)");
+
+    let before = query_session_stats(&session_name, "live");
+    assert!(before.is_ok(), "the session must be live before the drop: {before:?}");
+
+    drop(etw_guard);
+
+    let after = query_session_stats(&session_name, "live");
+    assert!(
+        after.is_err(),
+        "the session must be gone once EtwGuard::drop has run: {after:?}"
+    );
+
+    let output = writer.snapshot_string();
+    // Root cause first: a genuine `trace.stop()` failure also trips the
+    // backstop assertions below, and diagnosing it as "reached the backstop"
+    // would name the symptom.
+    assert!(
+        !output.contains("etw: UserTrace::stop failed during drop"),
+        "UserTrace::stop must succeed on the healthy path; got:\n{output}"
+    );
+    assert!(
+        !output.contains("etw: session already stopped"),
+        "the healthy path must not reach the by-name backstop -- this is the arm it would \
+         actually take, the session having just been stopped by handle; got:\n{output}"
+    );
+    assert!(
+        !output.contains("etw: stopped session by name"),
+        "the healthy path must not reach the by-name backstop -- reaching it and finding the \
+         session still live would mean UserTrace::stop's STOP never landed; got:\n{output}"
+    );
+    assert!(
+        !output.contains("etw: failed to stop session by name"),
+        "the healthy path must not reach the by-name backstop -- without this arm a reached \
+         backstop that got an unexpected error would pass both checks above; got:\n{output}"
+    );
+    assert!(
+        !output.contains("etw: kernel did not confirm the session was stopped"),
+        "the healthy path must not abandon the processing thread -- the session WAS reclaimed \
+         here, so `Drop` must join it rather than log the abandon warning and detach; got:\n{output}"
+    );
+}
+
+/// The `Err` arm of `trace.stop()` — the branch the backstop exists for — must
+/// fall through to the by-name STOP. Driven by a real failure rather than a
+/// synthesised guard state: stopping the session out of band leaves the guard
+/// holding a valid trace handle over a session that is gone, so `close_trace`
+/// succeeds and the `control_trace(STOP)` behind it returns not-found. That is
+/// the same `Err` a short-circuiting `CloseTrace` produces, which cannot be
+/// manufactured from outside ferrisetw (`UserTrace` has no constructor taking a
+/// handle).
+///
+/// Make `stop_session`'s `Err` arm report `stop_issued = true` — a complete
+/// revert of the backstop for its only real scenario — and this is the one test
+/// that fails.
+#[cfg(target_os = "windows")]
+#[skuld::test(labels = [TUN], serial = TUN)]
+fn etw_guard_drop_falls_back_to_the_by_name_stop_when_usertrace_stop_errs() {
+    const PREFIX: &str = "hole-etw-live-stats-test-stop-errs-";
+    crate::diagnostics::etw_sweep::sweep_sessions_with_prefix(PREFIX, "etw-test");
+
+    // DEBUG, not INFO: the backstop's expected outcome against an
+    // already-stopped session is a `debug!`.
+    let writer = VecWriter::new();
+    let subscriber = tracing_subscriber::registry().with(
+        fmt::layer()
+            .with_writer(writer.clone())
+            .with_ansi(false)
+            .with_filter(tracing_subscriber::filter::LevelFilter::DEBUG),
+    );
+    let _guard = set_default_in_current_thread(subscriber);
+
+    let session_name = format!("{PREFIX}{}", std::process::id());
+    let etw_guard = start_consumer_for_test(session_name.clone(), LIVE_STATS_INTERVAL, |_| {})
+        .expect("start a real ETW session (requires admin or Performance Log Users)");
+
+    stop_trace_by_name(&session_name).expect("stop the session out of band, behind the guard's back");
+
+    drop(etw_guard);
+
+    let output = writer.snapshot_string();
+    assert!(
+        output.contains("etw: UserTrace::stop failed during drop"),
+        "expected UserTrace::stop to fail, which is what puts Drop on the backstop path; got:\n{output}"
+    );
+    assert!(
+        output.contains("etw: session already stopped"),
+        "expected the by-name backstop to run and report the session already gone; got:\n{output}"
+    );
+}
+
+/// `stop_session_by_name`'s expected outcome — nothing to stop — must not log
+/// at `warn!`. Pins what `ControlTraceW(name, STOP)` really answers for a
+/// session that does not exist, which no unit test can observe: unit tests can
+/// only assert that [`is_session_not_found`] recognises a code they themselves
+/// chose. If Windows answers with anything else, every trip through the backstop
+/// against an already-gone session — the case the test above exercises — warns
+/// about a session it in fact reclaimed.
+#[cfg(target_os = "windows")]
+#[skuld::test(labels = [TUN], serial = TUN)]
+fn stopping_a_session_that_does_not_exist_is_not_a_warning() {
+    let writer = VecWriter::new();
+    let subscriber = tracing_subscriber::registry().with(
+        fmt::layer()
+            .with_writer(writer.clone())
+            .with_ansi(false)
+            .with_filter(tracing_subscriber::filter::LevelFilter::DEBUG),
+    );
+    let _guard = set_default_in_current_thread(subscriber);
+
+    let reclaimed = stop_session_by_name(&format!("hole-etw-live-stats-test-absent-{}", std::process::id()));
+    assert!(reclaimed, "a session that never existed must read as known-reclaimed");
+
+    let output = writer.snapshot_string();
+    assert!(
+        output.contains("etw: session already stopped"),
+        "a session that was never started must read as already stopped; got:\n{output}"
+    );
+    assert!(
+        !output.contains("etw: failed to stop session by name"),
+        "the expected outcome must not warn; got:\n{output}"
+    );
+}
+
+/// Exercises [`abandon_session_on_thread_spawn_failure`], the exact cleanup
+/// `start_consumer_named` runs on a processing-thread spawn failure — the
+/// only other `UserTrace` lifetime site in this file, with no `EtwGuard` to
+/// own the by-name backstop (module doc "Drain on Drop", and see the
+/// function's own doc comment).
+///
+/// A real `std::thread::Builder::spawn` failure needs OS-level resource
+/// exhaustion (hitting a process- or system-wide thread-count limit), which
+/// is not something this test can trigger deterministically without mutating
+/// shared OS/process state for the whole test binary (`ulimit`, or actually
+/// spawning threads until the OS refuses one, which is itself
+/// platform-dependent and not bounded by anything this test controls). That
+/// trigger is therefore unverified here. What's verified instead is the
+/// cleanup itself: `abandon_session_on_thread_spawn_failure` is the single
+/// function both a real spawn failure and this test call, so driving it
+/// directly with a synthetic `io::Error` exercises the identical code a real
+/// failure would run. This test therefore does NOT pin that
+/// `start_consumer_named`'s thread-spawn `.map_err` arm actually calls
+/// `abandon_session_on_thread_spawn_failure` -- e.g. reverting that call site
+/// to a bare `.map_err(EtwError::ThreadSpawn)` would leave every test in this
+/// file, including this one, green. That call site's own ordering (dropping
+/// the orphaned `trace` before invoking this helper, not after) is untested
+/// by anything here.
+#[cfg(target_os = "windows")]
+#[skuld::test(labels = [TUN], serial = TUN)]
+fn thread_spawn_failure_stops_the_orphaned_session() {
+    const PREFIX: &str = "hole-etw-live-stats-test-spawn-fail-";
+    crate::diagnostics::etw_sweep::sweep_sessions_with_prefix(PREFIX, "etw-test");
+
+    let session_name = format!("{PREFIX}{}", std::process::id());
+    let provider = Provider::by_guid(TCPIP_PROVIDER)
+        .any(TCPIP_KEYWORDS)
+        .add_callback(|_record: &EventRecord, _schema_locator: &SchemaLocator| {})
+        .build();
+    let trace_properties = TraceProperties {
+        buffer_size: 256,
+        ..Default::default()
+    };
+    // Bound, not discarded with `_`: see the identical rationale on
+    // `stop_session_by_name_stops_a_live_session` above.
+    let (_trace, _handle) = UserTrace::new()
+        .named(session_name.clone())
+        .set_trace_properties(trace_properties)
+        .enable(provider)
+        .start()
+        .expect("start a real ETW session (requires admin or Performance Log Users)");
+
+    let before = query_session_stats(&session_name, "live");
+    assert!(
+        before.is_ok(),
+        "the session must be live before the simulated spawn failure: {before:?}"
+    );
+
+    let err = abandon_session_on_thread_spawn_failure(&session_name, std::io::Error::other("synthetic spawn failure"));
+    assert!(
+        matches!(err, EtwError::ThreadSpawn(_)),
+        "the cleanup must still surface the original error as ThreadSpawn: {err:?}"
+    );
+
+    let after = query_session_stats(&session_name, "live");
+    assert!(
+        after.is_err(),
+        "the session must be gone once the spawn-failure cleanup has run -- a cleanup that \
+         doesn't reach the by-name backstop leaks the session with no thread and no guard left \
+         to reclaim it: {after:?}"
+    );
+}
+
+/// Drives `start_consumer_named`'s real thread-spawn-failure arm through the
+/// [`start_consumer_named_with_spawn`] test seam, rather than calling
+/// [`abandon_session_on_thread_spawn_failure`] directly the way
+/// [`thread_spawn_failure_stops_the_orphaned_session`] above does. That test
+/// pins the cleanup helper's own behaviour but, by its own doc, does not pin
+/// that the call site actually invokes the helper, nor that `drop(trace)`
+/// runs before the helper rather than after.
+///
+/// This test drives the real session-start + spawn-attempt path with an
+/// injected `spawn_processor` that always fails, and distinguishes the two
+/// orderings by which log line the by-name STOP backstop produces:
+/// - `drop(trace)` before the helper (correct): ferrisetw's own `Drop`
+///   already stopped the session, so the by-name STOP finds it already gone
+///   and logs `"etw: session already stopped"` (debug), never
+///   `"etw: stopped session by name"` (info).
+/// - the helper before `drop(trace)` (inverted): the by-name STOP runs
+///   against a still-live session and is the one that actually stops it,
+///   logging `"etw: stopped session by name"` instead.
+///
+/// A regression that deletes the call to `abandon_session_on_thread_spawn_failure`
+/// entirely (reverting to a bare `.map_err(EtwError::ThreadSpawn)?`) leaves the
+/// session live, which the `after.is_err()` assertion below catches on its own.
+#[cfg(target_os = "windows")]
+#[skuld::test(labels = [TUN], serial = TUN)]
+fn thread_spawn_failure_at_the_real_call_site_stops_the_session_after_dropping_the_trace() {
+    const PREFIX: &str = "hole-etw-live-stats-test-spawn-fail-seam-";
+    crate::diagnostics::etw_sweep::sweep_sessions_with_prefix(PREFIX, "etw-test");
+
+    let session_name = format!("{PREFIX}{}", std::process::id());
+
+    let writer = VecWriter::new();
+    let subscriber = tracing_subscriber::registry().with(
+        fmt::layer()
+            .with_writer(writer.clone())
+            .with_ansi(false)
+            .with_filter(tracing_subscriber::filter::LevelFilter::DEBUG),
+    );
+    let _guard = set_default_in_current_thread(subscriber);
+
+    let result = start_consumer_named_with_spawn(
+        session_name.clone(),
+        std::time::Duration::from_secs(60),
+        |_tick| {},
+        |_builder, _body| Err(std::io::Error::other("synthetic spawn failure")),
+    );
+    // `EtwGuard` is deliberately not `Debug`: it owns a live session handle, a
+    // `JoinHandle` and a stats channel, none of which render usefully. Only the
+    // error side is formatted, so the failure still names the variant that came.
+    match result {
+        Err(EtwError::ThreadSpawn(_)) => {}
+        Ok(_) => panic!("a spawn failure must surface as ThreadSpawn, got a live guard"),
+        Err(other) => panic!("a spawn failure must surface as ThreadSpawn, got: {other:?}"),
+    }
+
+    let after = query_session_stats(&session_name, "live");
+    assert!(
+        after.is_err(),
+        "the session must be gone once the spawn-failure cleanup has run: {after:?}"
+    );
+
+    let output = writer.snapshot_string();
+    assert!(
+        output.contains("etw: session already stopped"),
+        "drop(trace) must run before the by-name STOP backstop, so the backstop finds the \
+         session already stopped by ferrisetw's own `Drop` -- got:\n{output}"
+    );
+    assert!(
+        !output.contains("etw: stopped session by name"),
+        "the by-name STOP must be a no-op backstop here, not the call that actually stopped a \
+         still-live session -- that would mean the ordering was inverted -- got:\n{output}"
     );
 }

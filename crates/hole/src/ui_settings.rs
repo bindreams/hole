@@ -6,7 +6,9 @@
 //! turns a frontend that tries into a loud deserialize error instead of a
 //! silent drop.
 
-use hole_common::config::{AppConfig, DnsConfig, FilterRule, ServerEntry, StartupBehavior, Theme};
+use hole_common::config::{
+    AppConfig, DnsConfig, FilterRule, Password, ServerAddress, ServerEntry, StartupBehavior, Theme,
+};
 use serde::Deserialize;
 use std::collections::HashMap;
 
@@ -29,15 +31,24 @@ pub struct UiSettings {
 
 /// `ServerEntry` minus the backend-owned `validation`. `deny_unknown_fields`
 /// does not recurse, so this type carries its own.
+///
+/// This is where the two secrets *enter* the process — the payload of the
+/// webview's `save_config`. They carry [`ServerAddress`]/[`Password`] from
+/// the deserializer inward rather than being wrapped at the far end of
+/// [`UiSettings::apply`], because this type and [`UiSettings`] both derive
+/// `Debug` — a live sink for every field between those two points, and one
+/// no `Dump` impl covers, since `crates/hole` cannot reach `dump!` at all.
+/// Both newtypes are
+/// `#[serde(transparent)]`, so the JSON the frontend sends is unchanged.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct UiServerEntry {
     pub id: String,
     pub name: String,
-    pub server: String,
+    pub server: ServerAddress,
     pub server_port: u16,
     pub method: String,
-    pub password: String,
+    pub password: Password,
     #[serde(default)]
     pub plugin: Option<String>,
     #[serde(default)]
@@ -71,7 +82,7 @@ impl UiSettings {
                 Some(ui) => ServerEntry {
                     id: c.id.clone(),
                     name: ui.name.clone(),
-                    server: ui.server.clone().into(),
+                    server: ui.server.clone(),
                     server_port: ui.server_port,
                     method: ui.method.clone(),
                     password: ui.password.clone(),

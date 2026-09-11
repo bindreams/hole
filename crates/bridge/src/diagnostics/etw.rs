@@ -60,12 +60,19 @@
 //!    channel wakes it immediately, not after the rest of the current
 //!    interval) and joins it, THEN reads session statistics one final time
 //!    via `ControlTraceW(EVENT_TRACE_CONTROL_QUERY)` ([`query_session_stats`])
-//!    before calling `UserTrace::stop` (which signals the kernel to stop
-//!    delivering events) and joining the processing thread, guaranteeing the
-//!    callback drains the pending event queue before shutdown completes.
+//!    before stopping the session ([`EtwGuard::stop_session`], which signals
+//!    the kernel to stop delivering events). If the kernel confirmed the
+//!    session was reclaimed, `Drop` then joins the processing thread too,
+//!    guaranteeing the callback drains the pending event queue before
+//!    shutdown completes. If it did NOT — even the by-name STOP backstop
+//!    failed — `Drop` cannot tell a thread that is genuinely stuck apart
+//!    from one whose `CloseTrace` already succeeded and is about to return
+//!    on its own, so it abandons the thread rather than risk blocking
+//!    shutdown forever: it logs a `warn!` and drops the `JoinHandle`
+//!    without joining, detaching the OS thread instead.
 //!    Stopping the timer thread first is load-bearing, not incidental: it
-//!    guarantees no periodic tick can still be mid-query when `trace.stop()`
-//!    runs, so the two `query_session_stats` callers (periodic, drop-time)
+//!    guarantees no periodic tick can still be mid-query when the session is
+//!    stopped, so the two `query_session_stats` callers (periodic, drop-time)
 //!    never race the session teardown and no lock needs to serialize them.
 //!    Each stats query surfaces `EventsLost`, `BuffersWritten`,
 //!    `LogBuffersLost`, and `RealTimeBuffersLost` as a diagnostic
@@ -103,6 +110,23 @@
 //!   by the kernel, `process_from_handle` returns, our thread exits, and
 //!   `JoinHandle::join` returns.
 //!
+//! `UserTrace::stop` does not by itself guarantee that last step: it chains
+//! `CloseTrace` and `ControlTraceW(STOP)` with `?`, so a `CloseTrace` error
+//! short-circuits before STOP is issued. The qualifier matters —
+//! `ERROR_CTX_CLOSE_PENDING` is not one of those errors but ferrisetw's `Ok`,
+//! and it is the ordinary answer whenever events are still queued, i.e. for
+//! any busy session. On a genuine error the session stays live and
+//! `process_from_handle` has nothing left to return for: MSDN gives a
+//! real-time consumer two exit conditions — a `CloseTrace` that took effect,
+//! and the controller stopping the session — and that path has neither.
+//!
+//! `UserTrace::stop` takes `self` by value, so ferrisetw's own `Drop` repeats
+//! close+STOP once more, discarding the error, before the caller ever sees the
+//! `Err`. A one-off `CloseTrace` failure is therefore already covered by that
+//! second attempt and [`EtwGuard::stop_session`]'s by-name STOP is a benign
+//! no-op; a failure that *repeats* is what reaches the third attempt — the
+//! only one addressed to the session rather than to a handle.
+//!
 //! # Failure mode
 //!
 //! ETW diagnostics are best-effort but **not silent** on infrastructure
@@ -135,10 +159,11 @@
 //! TCPIP severity.
 
 use dump::{dump, DeriveDump};
+use ferrisetw::native::EvntraceNativeError;
 use ferrisetw::parser::Parser;
 use ferrisetw::provider::Provider;
 use ferrisetw::schema_locator::SchemaLocator;
-use ferrisetw::trace::{TraceProperties, TraceTrait, UserTrace};
+use ferrisetw::trace::{stop_trace_by_name, TraceError, TraceProperties, TraceTrait, UserTrace};
 use ferrisetw::{EventRecord, GUID};
 use std::borrow::Cow;
 use std::net::{IpAddr, SocketAddr};
@@ -288,8 +313,8 @@ pub struct EtwGuard {
     // `UserTrace::stop(self)` (which takes `self` by value).
     trace: Option<UserTrace>,
     thread: Option<JoinHandle<()>>,
-    /// Session name saved at construction time so
-    /// `query_session_stats` can look it up in Drop without holding a
+    /// Session name saved at construction time so `query_session_stats` and
+    /// [`EtwGuard::stop_session`] can look it up in Drop without holding a
     /// reference into `trace`.
     session_name: String,
     /// Dropping this closes the channel, waking the stats timer thread's
@@ -303,7 +328,7 @@ impl Drop for EtwGuard {
     fn drop(&mut self) {
         // Stop the periodic timer thread FIRST and join it, so no live-phase
         // query can still be in flight when the stop-phase query and
-        // trace.stop() below run — see module doc "Drop's added wait".
+        // `stop_session` below run — see module doc "Drop's added wait".
         drop(self.stats_tx.take());
         if let Some(stats_thread) = self.stats_thread.take() {
             if let Err(e) = stats_thread.join() {
@@ -327,21 +352,121 @@ impl Drop for EtwGuard {
             }
         }
 
-        if let Some(trace) = self.trace.take() {
-            if let Err(e) = trace.stop() {
-                warn!(error = ?e, "etw: UserTrace::stop failed during drop");
-            }
-        }
+        let session_reclaimed = self.stop_session();
+
         if let Some(thread) = self.thread.take() {
-            // The processing thread exits once the kernel acknowledges
-            // STOP, which drains pending events through our callback.
-            // Ignore the JoinHandle's result: the thread only returns on
-            // kernel-signalled shutdown and has no useful return value.
-            if let Err(e) = thread.join() {
-                warn!(panic = ?e, "etw: processing thread panicked during drop");
+            if session_reclaimed {
+                // The processing thread exits once the kernel acknowledges
+                // STOP, which drains pending events through our callback.
+                // Ignore the JoinHandle's result: the thread only returns on
+                // kernel-signalled shutdown and has no useful return value.
+                if let Err(e) = thread.join() {
+                    warn!(panic = ?e, "etw: processing thread panicked during drop");
+                }
+            } else {
+                // `stop_session` returned `false` -- see its doc for what
+                // that guarantees and doesn't. Abandoning here is not free:
+                // it forfeits the drain-on-drop guarantee (module doc,
+                // "Drain on Drop") for whatever the processing thread still
+                // has queued, and that loss is accepted only because a join
+                // with no remaining exit condition would hang shutdown
+                // forever (#978).
+                warn!(
+                    session = %self.session_name,
+                    "etw: kernel did not confirm the session was stopped; abandoning the \
+                     processing thread instead of joining it -- events still queued in the \
+                     callback may be lost from this log"
+                );
             }
         }
         info!("etw: consumer stopped");
+    }
+}
+
+impl EtwGuard {
+    /// Stop the kernel-side session, whatever [`UserTrace::stop`] managed.
+    /// Returns whether the session is now known-reclaimed by the kernel: a
+    /// caller that gets `false` knows only that we failed to CONFIRM the
+    /// session was reclaimed -- not that `process_from_handle` is stuck.
+    /// `CloseTrace` may already have taken effect (one of the two exit
+    /// conditions MSDN documents for a real-time consumer) even though the
+    /// STOP issued after it failed, in which case the processing thread
+    /// will still return on its own; `false` cannot distinguish that from a
+    /// session genuinely still live, so a caller must not join the
+    /// processing thread on the strength of this return value alone (module
+    /// doc, [Drain on Drop](self#drain-on-drop)).
+    ///
+    /// Why a by-name STOP is needed, and why it is the third close+STOP attempt
+    /// rather than the second: module doc, [Drain on Drop](self#drain-on-drop).
+    ///
+    /// The trigger is unestablished, not the consequence. MSDN documents only
+    /// `ERROR_INVALID_HANDLE` and the pre-Vista `ERROR_BUSY` for `CloseTrace`,
+    /// and ferrisetw's `InvalidHandle` arm re-runs `open_trace`'s accept
+    /// predicate, which a handle `open_trace` returned cannot fail. This is a
+    /// backstop for a reachable code shape, not a reproduction.
+    #[must_use]
+    fn stop_session(&mut self) -> bool {
+        let stop_issued = match self.trace.take() {
+            Some(trace) => match trace.stop() {
+                Ok(()) => true,
+                Err(e) => {
+                    warn!(error = ?e, session = %self.session_name, "etw: UserTrace::stop failed during drop");
+                    false
+                }
+            },
+            None => false,
+        };
+        if stop_issued {
+            true
+        } else {
+            stop_session_by_name(&self.session_name)
+        }
+    }
+}
+
+/// Issue `ControlTraceW(EVENT_TRACE_CONTROL_STOP)` against a session by name.
+/// Returns whether the session is now known-reclaimed by the kernel: `true`
+/// on success or on `ERROR_WMI_INSTANCE_NOT_FOUND` (no such session is the
+/// outcome we asked for); `false` for any other error, which is a session we
+/// know we failed to reclaim, not merely one we're unsure about.
+///
+/// Best-effort like [`sweep_stale_sessions`] in the sense that a caller who
+/// only logs the `false` case loses nothing over today's behaviour; a caller
+/// that must not proceed on `false` (see [`EtwGuard::stop_session`]) is what
+/// makes the return value load-bearing.
+#[must_use]
+fn stop_session_by_name(session_name: &str) -> bool {
+    match stop_trace_by_name(session_name) {
+        Ok(()) => {
+            info!(session = %session_name, "etw: stopped session by name");
+            true
+        }
+        Err(e) if is_session_not_found(&e) => {
+            debug!(session = %session_name, "etw: session already stopped");
+            true
+        }
+        Err(e) => {
+            warn!(error = ?e, session = %session_name, "etw: failed to stop session by name");
+            false
+        }
+    }
+}
+
+/// Does `e` mean "no such session"?
+///
+/// ferrisetw builds its native errors with
+/// `io::Error::from_raw_os_error(HRESULT)` — the `HRESULT` form of the Win32
+/// code, not the code itself — so the comparison has to convert too. Getting
+/// this wrong costs a spurious `warn!` on the expected path, not a behaviour
+/// change.
+fn is_session_not_found(e: &TraceError) -> bool {
+    use windows::Win32::Foundation::ERROR_WMI_INSTANCE_NOT_FOUND;
+
+    match e {
+        TraceError::EtwNativeError(EvntraceNativeError::IoError(io)) => {
+            io.raw_os_error() == Some(ERROR_WMI_INSTANCE_NOT_FOUND.to_hresult().0)
+        }
+        _ => false,
     }
 }
 
@@ -354,6 +479,23 @@ pub enum EtwError {
     SessionStart(ferrisetw::trace::TraceError),
     #[error("failed to spawn processing thread: {0}")]
     ThreadSpawn(std::io::Error),
+}
+
+/// Cleanup for [`start_consumer_named`]'s processing-thread spawn failure —
+/// the only other `UserTrace` lifetime site in this file besides
+/// [`EtwGuard::drop`]. No `EtwGuard` exists yet on this path, so without this
+/// call the session's only fate is ferrisetw's own `impl Drop for UserTrace`
+/// (`non_consuming_stop`), which discards whatever error `close_trace` +
+/// `control_trace(STOP)` returns — the exact failure mode the by-name
+/// backstop exists to catch elsewhere. Issue it here too, before the caller
+/// returns the error, so a spawn failure doesn't also leave an unreclaimed
+/// kernel session behind with no thread and no guard left to notice.
+fn abandon_session_on_thread_spawn_failure(session_name: &str, err: std::io::Error) -> EtwError {
+    // No thread exists yet to conditionally join, so unlike `EtwGuard::drop`
+    // there's nothing to gate on the result here; `stop_session_by_name`
+    // already warns internally on the one outcome that matters.
+    let _: bool = stop_session_by_name(session_name);
+    EtwError::ThreadSpawn(err)
 }
 
 // Entry point =========================================================================================================
@@ -391,6 +533,27 @@ fn start_consumer_named(
     session_name: String,
     interval: Duration,
     on_tick: impl FnMut(u32) + Send + 'static,
+) -> Result<EtwGuard, EtwError> {
+    start_consumer_named_with_spawn(session_name, interval, on_tick, |builder, body| builder.spawn(body))
+}
+
+/// Same as [`start_consumer_named`], with the processing-thread spawn call
+/// itself substitutable. Production goes through `start_consumer_named`,
+/// which fills `spawn_processor` with `std::thread::Builder::spawn`; a test
+/// fills it with a closure that returns `Err`, so it can drive
+/// `start_consumer_named`'s own thread-spawn failure arm — the `drop(trace)`
+/// ordering plus [`abandon_session_on_thread_spawn_failure`] below — at the
+/// real call site, rather than calling `abandon_session_on_thread_spawn_failure`
+/// directly (see [`thread_spawn_failure_stops_the_orphaned_session`]'s doc
+/// comment for why that alone doesn't pin this call site).
+fn start_consumer_named_with_spawn(
+    session_name: String,
+    interval: Duration,
+    on_tick: impl FnMut(u32) + Send + 'static,
+    spawn_processor: impl FnOnce(
+        std::thread::Builder,
+        Box<dyn FnOnce() + Send + 'static>,
+    ) -> std::io::Result<JoinHandle<()>>,
 ) -> Result<EtwGuard, EtwError> {
     let bridge_pid = std::process::id();
     // Captured once and propagated into both spawned threads below via
@@ -447,21 +610,39 @@ fn start_consumer_named(
         .map_err(EtwError::SessionStart)?;
 
     let processor_dispatch = dispatch.clone();
-    let thread = std::thread::Builder::new()
-        .name("hole-bridge-etw-processor".into())
-        .spawn(move || {
-            tracing::dispatcher::with_default(&processor_dispatch, || {
-                if let Err(e) = UserTrace::process_from_handle(handle) {
-                    // `process_from_handle` returns when the kernel
-                    // acknowledges STOP — which is the normal shutdown path,
-                    // but may also carry an Err if the session was already
-                    // dead. Log and exit; the guard's Drop handles user-
-                    // visible cleanup.
-                    debug!(error = ?e, "etw: processing thread exiting");
-                }
-            });
-        })
-        .map_err(EtwError::ThreadSpawn)?;
+    let processor_body: Box<dyn FnOnce() + Send + 'static> = Box::new(move || {
+        tracing::dispatcher::with_default(&processor_dispatch, || {
+            if let Err(e) = UserTrace::process_from_handle(handle) {
+                // `process_from_handle` returns when the kernel
+                // acknowledges STOP — which is the normal shutdown path,
+                // but may also carry an Err if the session was already
+                // dead. Log and exit; the guard's Drop handles user-
+                // visible cleanup.
+                debug!(error = ?e, "etw: processing thread exiting");
+            }
+        });
+    });
+    let thread = match spawn_processor(
+        std::thread::Builder::new().name("hole-bridge-etw-processor".into()),
+        processor_body,
+    ) {
+        Ok(t) => t,
+        Err(e) => {
+            // Drop `trace` BEFORE calling the helper below. On this path
+            // `UserTrace::stop` is never called, so this `drop(trace)` runs
+            // ferrisetw's own `Drop for UserTrace` (close+STOP, discarding
+            // any error) — this path's only close+STOP attempt — and the
+            // helper's by-name STOP is the second and last. `trace` is a
+            // live local here, so without this explicit drop it would
+            // instead fall at the end of this `match` arm's containing
+            // statement, i.e. AFTER the helper call, which would make the
+            // by-name STOP run against a session ferrisetw's own `Drop`
+            // hasn't yet had a chance to stop, instead of staying the final
+            // attempt (see "Drain on Drop" above).
+            drop(trace);
+            return Err(abandon_session_on_thread_spawn_failure(&session_name, e));
+        }
+    };
 
     // Best-effort, unlike the session/processing-thread spawns above: by
     // this point the processing thread is already live and consuming real

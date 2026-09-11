@@ -38,7 +38,7 @@ fn entry_from(ss: &SsServerHandle) -> ServerEntry {
         server: ss.addr.ip().to_string().into(),
         server_port: ss.addr.port(),
         method: ss.method.into(),
-        password: ss.password.clone(),
+        password: ss.password.clone().into(),
         plugin: ss.plugin.clone(),
         plugin_opts: ss.plugin_opts.clone(),
         validation: None,

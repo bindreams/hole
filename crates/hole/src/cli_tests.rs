@@ -474,6 +474,87 @@ fn read_server_entry_file_rejects_malformed_json(#[fixture(temp_dir)] dir: &Path
     );
 }
 
+/// `serde_json::Error`'s `Display` echoes the bytes around the failure, and
+/// the file parsed here is a `ServerEntry`. That window is also the one with
+/// no sink backstop: `arm_server` runs only on the success path.
+#[skuld::test]
+fn read_server_entry_file_never_echoes_the_file_contents(#[fixture(temp_dir)] dir: &Path) {
+    // A password mistyped as a JSON number. serde_json reports "invalid type:
+    // integer `N`", and the value it names IS the secret.
+    const SECRET_PW: &str = "9876543210";
+    let body = format!(
+        r#"{{"id":"x","name":"x","server":"203.0.113.7","server_port":8388,"method":"aes-256-gcm","password":{SECRET_PW}}}"#
+    );
+    let path = dir.join("mistyped.json");
+    std::fs::write(&path, body.as_bytes()).unwrap();
+
+    // Guard: without it this test would also pass against a `serde_json` that
+    // had stopped echoing, and would prove nothing.
+    let raw = serde_json::from_slice::<hole_common::config::ServerEntry>(body.as_bytes())
+        .expect_err("must not parse")
+        .to_string();
+    assert!(raw.contains(SECRET_PW), "guard: serde_json echoes the value: {raw}");
+
+    let err = super::read_server_entry_file(&path).expect_err("mistyped json should error");
+    assert!(!err.contains(SECRET_PW), "the secret reached the CLI message: {err}");
+    assert!(err.contains("failed to parse"), "{err}");
+    assert!(
+        err.contains("line 1"),
+        "position must survive so the message stays actionable: {err}"
+    );
+}
+
+/// The elevation payload's own decode path, and the sharper of the two: it
+/// carries a whole `BridgeRequest`, and `arm_request_redaction` runs only
+/// after it succeeds, so nothing is armed on either failure arm.
+#[skuld::test]
+fn decode_b64_request_never_echoes_the_payload() {
+    use base64::Engine as _;
+    const SECRET_PW: &str = "9876543210";
+
+    let json = format!(
+        r#"{{"Start":{{"config":{{"server":{{"id":"x","name":"x","server":"203.0.113.7","server_port":8388,"method":"aes-256-gcm","password":{SECRET_PW}}},"local_port":4073}},"attempt_id":"a"}}}}"#
+    );
+    let encoded = base64::engine::general_purpose::STANDARD.encode(json.as_bytes());
+
+    // Guard: serde_json really does name the offending value.
+    let raw = serde_json::from_str::<hole_common::protocol::BridgeRequest>(&json)
+        .expect_err("must not parse")
+        .to_string();
+    assert!(raw.contains(SECRET_PW), "guard: serde_json echoes the value: {raw}");
+
+    let err = super::decode_b64_request(&encoded).expect_err("mistyped payload must be rejected");
+    assert!(!err.contains(SECRET_PW), "the secret reached the CLI message: {err}");
+    assert!(err.contains("line 1"), "position must survive: {err}");
+}
+
+/// The base64 arm carries no input at all — the payload is Hole's own
+/// encoding, so a decode failure means corruption and the offending byte
+/// would say nothing a retry doesn't.
+#[skuld::test]
+fn decode_b64_request_never_echoes_a_malformed_encoding() {
+    // `@` is not in the base64 alphabet; `DecodeError` would name it and its
+    // offset into the encoded secret-bearing payload.
+    let err = super::decode_b64_request("not@base64").expect_err("malformed base64 must be rejected");
+    assert!(!err.contains('@'), "the offending byte reached the message: {err}");
+    assert!(!err.contains("offset"), "{err}");
+    assert!(err.contains("base64"), "the message must still name the fault: {err}");
+}
+
+/// Paired positive: a well-formed payload still decodes, so the two guards
+/// above are not passing because everything is rejected.
+#[skuld::test]
+fn decode_b64_request_round_trips_a_well_formed_payload() {
+    use base64::Engine as _;
+    use hole_common::protocol::BridgeRequest;
+
+    let request = BridgeRequest::Cancel {
+        attempt_id: "attempt-7".into(),
+    };
+    let encoded = base64::engine::general_purpose::STANDARD.encode(serde_json::to_vec(&request).expect("serialize"));
+    assert_eq!(super::decode_b64_request(&encoded).expect("must decode"), request);
+}
+
 // `bridge install` flag parsing =======================================================================================
 //
 // The GUI's elevated-install path passes `--log-dir` to redirect the CLI's
@@ -866,9 +947,26 @@ fn grant_access_rejects_result_file_with_then_send() {
 //
 // The CLI writes a fourth log file (`gui-cli.log`) and executes no GUI arming
 // site, so without these the wrapped writers are inert for its whole life.
+//
+// Every test below drives arming as a side effect of the real production
+// call graph, never by calling `arm_request_redaction` directly — that's the
+// only way a test can catch a path the funnel doesn't actually cover. Each
+// test ends at
+// [`super::send_bridge_request_inner_at`], the same funnel every real CLI
+// invocation reaches, pointed at a socket path with no listener so the
+// connect fails fast and safely instead of ever touching a live bridge.
+
+/// A socket path guaranteed to have no listener: unique per test (by
+/// `suffix`) and per process, and removed first in case a previous run
+/// left a stale file.
+fn unarmed_socket_path(suffix: &str) -> std::path::PathBuf {
+    let path = std::env::temp_dir().join(format!("hole-cli-test-{}-{suffix}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    path
+}
 
 #[skuld::test]
-fn cli_proxy_start_arms_the_config_file_entry() {
+fn cli_proxy_start_arms_the_config_file_entry(#[fixture(temp_dir)] dir: &Path) {
     use hole_common::logging::redact_arm::token_for;
     use hole_common::protocol::{BridgeRequest, ProxyConfig};
 
@@ -877,20 +975,27 @@ fn cli_proxy_start_arms_the_config_file_entry() {
     entry.id = ENTRY_ID.to_string();
     entry.server = "203.0.113.7".into();
 
-    super::arm_request_redaction(&BridgeRequest::Start {
+    // Exactly what `ProxyAction::Start`'s handler does with `--config-file`
+    // before it builds the request.
+    let config_path = dir.join("entry.json");
+    std::fs::write(&config_path, serde_json::to_string(&entry).unwrap()).unwrap();
+    let entry = super::read_server_entry_file(&config_path).expect("read the entry file");
+
+    let request = BridgeRequest::Start {
         config: ProxyConfig {
             server: entry,
             ..ProxyConfig::default()
         },
         attempt_id: "attempt".to_string(),
-        on_startup: Some(hole_common::config::StartupBehavior::default()),
-    });
+        on_startup: None,
+    };
+    let _ = super::send_bridge_request_inner_at(request, &unarmed_socket_path("proxy-start"));
 
     assert_eq!(util::redact::redact_str("203.0.113.7"), token_for(ENTRY_ID));
 }
 
 #[skuld::test]
-fn cli_test_server_arms_the_config_file_entry() {
+fn cli_test_server_arms_the_config_file_entry(#[fixture(temp_dir)] dir: &Path) {
     use hole_common::logging::redact_arm::token_for;
     use hole_common::protocol::BridgeRequest;
 
@@ -899,20 +1004,25 @@ fn cli_test_server_arms_the_config_file_entry() {
     entry.id = ENTRY_ID.to_string();
     entry.server = "203.0.113.9".into();
 
-    super::arm_request_redaction(&BridgeRequest::TestServer {
+    // Exactly what `ProxyAction::TestServer`'s handler does with
+    // `--config-file` before it builds the request.
+    let config_path = dir.join("entry.json");
+    std::fs::write(&config_path, serde_json::to_string(&entry).unwrap()).unwrap();
+    let entry = super::read_server_entry_file(&config_path).expect("read the entry file");
+
+    let request = BridgeRequest::TestServer {
         entry,
         dns: Default::default(),
-    });
+    };
+    let _ = super::send_bridge_request_inner_at(request, &unarmed_socket_path("test-server"));
 
     assert_eq!(util::redact::redact_str("203.0.113.9"), token_for(ENTRY_ID));
 }
 
-/// The elevation flow re-enters this binary as
-/// `hole bridge ipc-send --request-file`, carrying the address and the
-/// password. It is the CLI path that matters most and the one with no GUI
-/// arming site anywhere upstream of it.
+/// The `--base64` elevation path: `decode_b64_request` (the real decoder)
+/// feeds straight into the funnel, exactly as `handle_ipc_send_b64` does.
 #[skuld::test]
-fn cli_ipc_send_arms_a_start_request(#[fixture(temp_dir)] dir: &Path) {
+fn cli_ipc_send_base64_arms_a_start_request() {
     use hole_common::logging::redact_arm::token_for;
     use hole_common::protocol::{BridgeRequest, ProxyConfig};
 
@@ -926,14 +1036,132 @@ fn cli_ipc_send_arms_a_start_request(#[fixture(temp_dir)] dir: &Path) {
             ..ProxyConfig::default()
         },
         attempt_id: "attempt".to_string(),
-        on_startup: Some(hole_common::config::StartupBehavior::default()),
+        on_startup: None,
+    };
+
+    let b64 = crate::elevation::encode_request(&request);
+    let decoded = super::decode_b64_request(&b64).expect("decode the base64 payload");
+    let _ = super::send_bridge_request_inner_at(decoded, &unarmed_socket_path("ipc-send-b64"));
+
+    assert_eq!(util::redact::redact_str("203.0.113.11"), token_for(ENTRY_ID));
+}
+
+/// The `--request-file` / `--then-send-file` elevation path:
+/// `crate::elevation::read_request_file` is the exact function both
+/// `hole bridge ipc-send --request-file` and `hole bridge grant-access
+/// --then-send-file` call before handing the decoded request to the funnel —
+/// there is no other code between them, so driving it once proves both.
+///
+/// This is also the case that must catch a classifier that silently skips a
+/// secret-bearing variant: `Reload` is the request this exact path carries
+/// when the elevation flow retries a running proxy's config after a
+/// permission grant, and it was the one variant `arm_request_redaction`'s old
+/// `_ => {}` let through unarmed.
+#[skuld::test]
+fn cli_request_file_arms_a_reload_request(#[fixture(temp_dir)] dir: &Path) {
+    use hole_common::logging::redact_arm::token_for;
+    use hole_common::protocol::{BridgeRequest, ProxyConfig};
+
+    const ENTRY_ID: &str = "88888888-0000-4000-8000-000000000000";
+    let mut entry = hole_common::config::ServerEntry::default_placeholder();
+    entry.id = ENTRY_ID.to_string();
+    entry.server = "203.0.113.13".into();
+    let request = BridgeRequest::Reload {
+        config: ProxyConfig {
+            server: entry,
+            ..ProxyConfig::default()
+        },
     };
 
     let path = dir.join("request.json");
     std::fs::write(&path, serde_json::to_string(&request).unwrap()).unwrap();
     let decoded = crate::elevation::read_request_file(&path).expect("decode the request file");
+    let _ = super::send_bridge_request_inner_at(decoded, &unarmed_socket_path("request-file-reload"));
 
-    super::arm_request_redaction(&decoded);
+    assert_eq!(util::redact::redact_str("203.0.113.13"), token_for(ENTRY_ID));
+}
 
-    assert_eq!(util::redact::redact_str("203.0.113.11"), token_for(ENTRY_ID));
+/// Arming is a *funnel* property, not a call-site obligation.
+///
+/// The rule is structural: one mechanism, invoked once, at the single point a
+/// request reaches the wire — and the behavioral tests above exercise it
+/// through that real call graph, not by calling it directly.
+#[skuld::test]
+fn redaction_is_armed_only_by_the_wire_funnel() {
+    // Belt-and-braces alongside the behavioral tests above: this is a
+    // call-graph shape (arming is invoked from exactly one place, crate-wide,
+    // and no second mechanism exists beside it), which those tests can prove
+    // for the paths they each drive but not rule out for the rest of the
+    // crate. Scoped to every non-test source file under `src/` — not just
+    // `cli.rs` — because the property this guards ("no ad-hoc `arm_server`
+    // call exists anywhere") is falsified just as much by one appearing in
+    // another file as by one appearing here. `*_tests.rs` files are skipped:
+    // they legitimately reference these names in doc comments, `use`
+    // imports, and (as here) the needle strings themselves.
+    let src_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+
+    let mut sources: Vec<(String, String)> = Vec::new();
+    for entry in walkdir::WalkDir::new(&src_root) {
+        let entry = entry.expect("failed to walk crates/hole/src");
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+            continue;
+        }
+        let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        if file_name.ends_with("_tests.rs") {
+            continue;
+        }
+        let text = std::fs::read_to_string(path).expect("failed to read a walked source file");
+        sources.push((path.display().to_string(), text));
+    }
+
+    let calls = |needle: &str| -> Vec<String> {
+        sources
+            .iter()
+            .flat_map(|(file, source)| {
+                source
+                    .lines()
+                    .filter(|l| l.contains(needle))
+                    // Strip *any* comment line (`//...`, which also matches doc
+                    // comments `///...`), not just doc comments: a plain `//` comment
+                    // mentioning the function name must not miscount as a call site.
+                    .filter(|l| !l.trim_start().starts_with("//") && !l.contains(&format!("fn {needle}")))
+                    .map(move |l| format!("{file}: {}", l.trim()))
+            })
+            .collect()
+    };
+
+    let arm_calls = calls("arm_request_redaction(");
+    assert_eq!(
+        arm_calls.len(),
+        1,
+        "arming must have exactly one call site, got: {arm_calls:?}"
+    );
+
+    // No second mechanism: a hand-rolled `arm_server` beside a send is how two
+    // of the six paths used to do this, and is what let the sixth do nothing.
+    let ad_hoc = calls("arm_server(");
+    assert!(
+        ad_hoc.iter().all(|l| l.contains("=> arm_server(")),
+        "the only `arm_server` calls may be inside arm_request_redaction's match: {ad_hoc:?}"
+    );
+
+    // The one call site is inside the driver, ahead of the connect. Matched
+    // by path component, not the rendered path string: `Display` renders
+    // `\` on Windows, so a `/`-suffix check silently finds nothing there.
+    let (_, cli_source) = sources
+        .iter()
+        .find(|(file, _)| std::path::Path::new(file).file_name() == Some(std::ffi::OsStr::new("cli.rs")))
+        .expect("cli.rs must be among the walked sources");
+    let driver = cli_source
+        .split_once("fn send_bridge_request_inner_at(")
+        .expect("the driver must exist")
+        .1;
+    let body = driver.split("\nfn ").next().expect("driver body");
+    let arm_at = body.find("arm_request_redaction(").expect("the driver must arm");
+    let connect_at = body.find("BridgeClient::connect(").expect("the driver must connect");
+    assert!(arm_at < connect_at, "arming must precede the connect");
 }

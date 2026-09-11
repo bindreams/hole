@@ -32,17 +32,19 @@ pub enum ConfigError {
     SaveBlocked,
 }
 
-/// Content-safe label for a `serde_json` parse failure (never echoes the input).
-/// `pub(crate)` so `ConfigStore::load` builds the same leak-safe variant.
-pub(crate) fn parse_kind(e: &serde_json::Error) -> &'static str {
-    use serde_json::error::Category;
-    match e.classify() {
-        Category::Io => "I/O error",
-        Category::Syntax => "syntax error",
-        Category::Data => "data error",
-        Category::Eof => "unexpected end of input",
-    }
-}
+/// Content-safe description of a `serde_json` parse failure: the category and
+/// the position, never a fragment of the input.
+///
+/// Hole's door onto [`util::parse_error::describe_parse_error`]. The
+/// implementation lives in `util` because `tun-engine` parses secret-bearing
+/// state files too and does not depend on this crate; re-exported here so
+/// the callers that reach for it via `hole_common::config` keep one name.
+/// `serde_json::Error`'s own `Display` echoes the bytes around the error —
+/// for a `ServerEntry`, an `AppConfig`, or a `BridgeRequest` that can be the
+/// password itself, which is why [`ConfigError::Parse`] drops its source.
+/// Sites that hold a `serde_json::Error` and need to say something about it
+/// use this instead of `{e}`.
+pub use util::parse_error::{describe_parse_error, parse_kind, ParseFailure};
 
 // Types ===============================================================================================================
 
@@ -223,6 +225,57 @@ pub struct AppConfig {
     pub diagnostic_plugin_tap: bool,
 }
 
+/// The widest rung of the ladder: `AppConfig` derives `Serialize` and holds
+/// **every** entry's secrets at once, so `dump!(&config)` without this impl
+/// renders the whole settings tree with each transparent newtype as its inner
+/// string.
+///
+/// Exhaustive destructure on purpose, the same device `UiSettings::apply`
+/// (`crates/hole/src/ui_settings.rs`) uses for its struct literal: adding a
+/// field to `AppConfig` fails compilation here until someone decides whether
+/// it is a secret.
+impl dump::Dump for AppConfig {
+    fn dump(&self) -> dump::DumpValue {
+        use dump::DumpValue;
+        let AppConfig {
+            servers,
+            selected_server,
+            local_port,
+            enabled,
+            elevation_prompt_shown,
+            filters,
+            on_startup,
+            theme,
+            proxy_server_enabled,
+            proxy_socks5,
+            proxy_http,
+            dns,
+            local_port_http,
+            diagnostic_plugin_tap,
+        } = self;
+        let field = |k: &str, v: DumpValue| (DumpValue::String(k.to_string()), v);
+        DumpValue::Map(vec![
+            field(
+                "servers",
+                DumpValue::Seq(servers.iter().map(ServerEntry::dump).collect()),
+            ),
+            field("selected_server", dump::from_serialize(selected_server)),
+            field("local_port", dump::from_serialize(local_port)),
+            field("enabled", dump::from_serialize(enabled)),
+            field("elevation_prompt_shown", dump::from_serialize(elevation_prompt_shown)),
+            field("filters", dump::from_serialize(filters)),
+            field("on_startup", dump::from_serialize(on_startup)),
+            field("theme", dump::from_serialize(theme)),
+            field("proxy_server_enabled", dump::from_serialize(proxy_server_enabled)),
+            field("proxy_socks5", dump::from_serialize(proxy_socks5)),
+            field("proxy_http", dump::from_serialize(proxy_http)),
+            field("dns", dump::from_serialize(dns)),
+            field("local_port_http", dump::from_serialize(local_port_http)),
+            field("diagnostic_plugin_tap", dump::from_serialize(diagnostic_plugin_tap)),
+        ])
+    }
+}
+
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
@@ -244,52 +297,32 @@ impl Default for AppConfig {
     }
 }
 
-/// A configured server address — hostname or IP literal, exactly as the user
-/// entered it.
-///
-/// Implements **neither `Display` nor `Deref`**, on purpose: without
-/// `Display`, `server_host = %config.server.server` is a compile error, and
-/// without `Deref<Target = str>`, `format!("{}", *addr)` cannot reopen it.
-/// [`expose`](Self::expose) is the single named exit, so `rg '\.expose\(\)'`
-/// enumerates every site that reads the real value.
-#[derive(Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct ServerAddress(String);
-
-impl ServerAddress {
-    pub fn new(value: impl Into<String>) -> Self {
-        Self(value.into())
-    }
-
-    /// The address in clear. Every caller is a site that genuinely needs to
-    /// dial, compare, or persist it — never a log field.
-    pub fn expose(&self) -> &str {
-        &self.0
-    }
+crate::secret_newtype! {
+    /// A configured server address — hostname or IP literal, exactly as the user
+    /// entered it.
+    ///
+    /// Implements **neither `Display` nor `Deref`**, on purpose: without
+    /// `Display`, `server_host = %config.server.server` is a compile error, and
+    /// without `Deref<Target = str>`, `format!("{}", *addr)` cannot reopen it.
+    /// [`expose`](Self::expose) is the single named exit, so `rg '\.expose\(\)'`
+    /// enumerates every site that reads the real value.
+    pub struct ServerAddress;
+    noun = "address";
 }
 
-impl From<&str> for ServerAddress {
-    fn from(value: &str) -> Self {
-        Self::new(value)
-    }
-}
-
-impl From<String> for ServerAddress {
-    fn from(value: String) -> Self {
-        Self::new(value)
-    }
-}
-
-impl std::fmt::Debug for ServerAddress {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("ServerAddress(<redacted>)")
-    }
-}
-
-impl dump::Dump for ServerAddress {
-    fn dump(&self) -> dump::DumpValue {
-        dump::DumpValue::tagged(dump::tag::SECRET, dump::DumpValue::String(self.0.clone()))
-    }
+crate::secret_newtype! {
+    /// A configured shadowsocks password.
+    ///
+    /// The same `Display`-less, `Deref`-less shape as [`ServerAddress`], for the
+    /// same reason and with the same single named exit,
+    /// [`expose`](Self::expose) — so `rg '\.expose\(\)'` enumerates every site
+    /// that reads a real secret, and `password = %entry.password` is a compile
+    /// error rather than a leak.
+    ///
+    /// `#[serde(transparent)]`: the on-disk and on-the-wire form is unchanged, a
+    /// bare JSON string.
+    pub struct Password;
+    noun = "secret";
 }
 
 #[derive(Clone, Serialize, Deserialize, PartialEq)]
@@ -299,7 +332,7 @@ pub struct ServerEntry {
     pub server: ServerAddress,
     pub server_port: u16,
     pub method: String,
-    pub password: String,
+    pub password: Password,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub plugin: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -325,7 +358,7 @@ impl ServerEntry {
             server: ServerAddress::new("127.0.0.1"),
             server_port: 0,
             method: "aes-256-gcm".into(),
-            password: String::new(),
+            password: Password::new(""),
             plugin: None,
             plugin_opts: None,
             validation: None,
@@ -341,7 +374,7 @@ impl std::fmt::Debug for ServerEntry {
             .field("server", &self.server)
             .field("server_port", &self.server_port)
             .field("method", &self.method)
-            .field("password", &"<redacted>")
+            .field("password", &self.password)
             .field("plugin", &self.plugin)
             .field("plugin_opts", &self.plugin_opts)
             .field("validation", &self.validation)
@@ -363,7 +396,7 @@ impl std::fmt::Debug for ServerEntry {
 /// compiler guarantee; the redacting sink is the backstop.
 impl dump::Dump for ServerEntry {
     fn dump(&self) -> dump::DumpValue {
-        use dump::{tag, DumpValue};
+        use dump::DumpValue;
         let key = |k: &str| DumpValue::String(k.to_string());
         DumpValue::Map(vec![
             (key("id"), dump::from_serialize(&self.id)),
@@ -371,10 +404,7 @@ impl dump::Dump for ServerEntry {
             (key("server"), self.server.dump()),
             (key("server_port"), dump::from_serialize(&self.server_port)),
             (key("method"), dump::from_serialize(&self.method)),
-            (
-                key("password"),
-                DumpValue::tagged(tag::SECRET, DumpValue::String(self.password.clone())),
-            ),
+            (key("password"), self.password.dump()),
             (key("plugin"), dump::from_serialize(&self.plugin)),
             (key("plugin_opts"), dump::from_serialize(&self.plugin_opts)),
             (key("validation"), dump::from_serialize(&self.validation)),

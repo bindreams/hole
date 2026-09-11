@@ -163,6 +163,45 @@ fn read_request_file_missing_file_returns_error() {
     assert!(result.is_err());
 }
 
+/// The file arm of the elevation payload, mirroring `decode_b64_request`'s
+/// test: no sink-level backstop is armed yet on this path, so the
+/// classification here is the only thing standing between a corrupt request
+/// file and the log.
+#[skuld::test]
+fn read_request_file_never_echoes_the_payload() {
+    // Two shapes serde_json quotes back verbatim: a value that is the wrong
+    // type (it names the value) and an unknown externally-tagged variant (it
+    // names an arbitrary caller-supplied *string*).
+    const MISTYPED_PW: &str = "9876543210";
+    const SECRET_TAG: &str = "hunter2-SECRET";
+    let payloads = [
+        format!(
+            r#"{{"Start":{{"config":{{"server":{{"id":"x","name":"x","server":"203.0.113.7","server_port":8388,"method":"aes-256-gcm","password":{MISTYPED_PW}}},"local_port":4073}},"attempt_id":"a"}}}}"#
+        ),
+        format!(r#"{{"{SECRET_TAG}":{{}}}}"#),
+    ];
+    let secrets = [MISTYPED_PW, SECRET_TAG];
+
+    for (json, secret) in payloads.iter().zip(secrets) {
+        // Guard: without it this passes against a serde_json that stopped echoing.
+        let raw = serde_json::from_str::<BridgeRequest>(json)
+            .expect_err("must not parse")
+            .to_string();
+        assert!(raw.contains(secret), "guard: serde_json echoes the input: {raw}");
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("request.json");
+        std::fs::write(&path, json).unwrap();
+
+        let err = super::read_request_file(&path).expect_err("mistyped payload must be rejected");
+        assert!(!err.contains(secret), "the secret reached the CLI message: {err}");
+        assert!(
+            err.contains("line 1"),
+            "position must survive so the message stays actionable: {err}"
+        );
+    }
+}
+
 #[skuld::test]
 fn start_attempt_id_survives_request_file_roundtrip() {
     // The attempt id is a STRUCT FIELD, so it round-trips through the elevation

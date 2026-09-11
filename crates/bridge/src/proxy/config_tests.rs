@@ -404,3 +404,133 @@ fn io_dispatcher_start_error_converts_to_runtime() {
         other => panic!("expected ProxyError::Runtime, got {other:?}"),
     }
 }
+
+// Key-material classification -----------------------------------------------------------------------------------------
+//
+// The 2022-blake3 ciphers take the password as base64 key material, so
+// `ServerConfig::new` can reject it. Upstream's `ServerConfigError::Display`
+// renders the offending symbol and its offset — one character of the user's
+// key — and `ProxyError::Display` reaches a GUI toast and `bridge.log`.
+
+/// 32 zero bytes: the right key length for `2022-blake3-aes-256-gcm`.
+const PSK32: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+/// 16 zero bytes: the wrong length for that cipher.
+const PSK16: &str = "AAAAAAAAAAAAAAAAAAAAAA==";
+/// Not base64. `@` is the symbol upstream would name in its message.
+const NOT_BASE64: &str = "abc@def";
+
+fn aead2022_config(password: &str) -> ProxyConfig {
+    let mut cfg = sample_config();
+    cfg.server.method = "2022-blake3-aes-256-gcm".into();
+    cfg.server.password = password.into();
+    cfg
+}
+
+#[skuld::test]
+fn aead2022_accepts_a_well_formed_psk() {
+    build_ss_config(&aead2022_config(PSK32), None, SAMPLE_IP, None).expect("a correct PSK must build");
+}
+
+#[skuld::test]
+fn a_password_that_is_not_base64_is_a_key_fault_not_a_method_fault() {
+    let cfg = aead2022_config(NOT_BASE64);
+    let err = build_ss_config(&cfg, None, SAMPLE_IP, None).unwrap_err();
+    match &err {
+        ProxyError::InvalidKeyMaterial { method, fault } => {
+            assert_eq!(method, "2022-blake3-aes-256-gcm");
+            assert_eq!(*fault, KeyMaterialFault::PskNotBase64);
+        }
+        other => panic!("expected InvalidKeyMaterial, got {other:?}"),
+    }
+}
+
+/// The load-bearing assertion: no byte of the key, and no detail that could
+/// locate one, survives into anything user-visible.
+///
+/// Equality, not a substring hunt. Upstream renders the offending byte as a
+/// *number* ("Invalid symbol 64, offset 3."), so `!contains('@')` passes
+/// vacuously; pinning the whole message is what actually proves no upstream
+/// detail survived.
+#[skuld::test]
+fn a_key_decode_failure_leaks_no_decode_detail() {
+    const EXPECTED: &str = "invalid key for cipher 2022-blake3-aes-256-gcm: the password is not valid base64";
+
+    let cfg = aead2022_config(NOT_BASE64);
+    let err = build_ss_config(&cfg, None, SAMPLE_IP, None).unwrap_err();
+    assert_eq!(err.to_string(), EXPECTED);
+
+    // `Debug` is the other sink — `?err` in a tracing field, or `{err:?}` in
+    // a panic message.
+    let debugged = format!("{err:?}");
+    assert!(!debugged.contains("offset"), "{debugged}");
+    assert!(!debugged.contains("symbol"), "{debugged}");
+
+    // And the toast, which is the `StartError` this maps to.
+    match hole_common::protocol::StartError::from(&err) {
+        hole_common::protocol::StartError::Failed { message } => assert_eq!(message, EXPECTED),
+        other => panic!("expected StartError::Failed, got {other:?}"),
+    }
+}
+
+/// A wrong-length key is a different cause from a malformed one and keeps its
+/// own variant — the lengths are the whole diagnostic and carry no key bytes.
+#[skuld::test]
+fn a_psk_of_the_wrong_length_reports_both_lengths() {
+    let cfg = aead2022_config(PSK16);
+    let err = build_ss_config(&cfg, None, SAMPLE_IP, None).unwrap_err();
+    match &err {
+        ProxyError::InvalidKeyMaterial {
+            fault: KeyMaterialFault::PskLength { expected, found },
+            ..
+        } => {
+            assert_eq!((*expected, *found), (32, 16));
+        }
+        other => panic!("expected InvalidKeyMaterial{{PskLength}}, got {other:?}"),
+    }
+    let rendered = err.to_string();
+    assert!(rendered.contains("32") && rendered.contains("16"), "{rendered}");
+}
+
+/// The EIH form is `iPSK:…:uPSK`, and its identity keys decode through a
+/// different upstream arm with the same `DecodeError` inside it.
+#[skuld::test]
+fn a_malformed_identity_key_is_classified_separately() {
+    let cfg = aead2022_config(&format!("{NOT_BASE64}:{PSK32}"));
+    let err = build_ss_config(&cfg, None, SAMPLE_IP, None).unwrap_err();
+    match &err {
+        ProxyError::InvalidKeyMaterial { fault, .. } => {
+            assert_eq!(*fault, KeyMaterialFault::IdentityKeyNotBase64);
+        }
+        other => panic!("expected InvalidKeyMaterial, got {other:?}"),
+    }
+    assert_eq!(
+        err.to_string(),
+        "invalid key for cipher 2022-blake3-aes-256-gcm: an identity key in the password is not valid base64"
+    );
+}
+
+#[skuld::test]
+fn an_identity_key_of_the_wrong_length_reports_both_lengths() {
+    let cfg = aead2022_config(&format!("{PSK16}:{PSK32}"));
+    let err = build_ss_config(&cfg, None, SAMPLE_IP, None).unwrap_err();
+    match &err {
+        ProxyError::InvalidKeyMaterial {
+            fault: KeyMaterialFault::IdentityKeyLength { expected, found },
+            ..
+        } => assert_eq!((*expected, *found), (32, 16)),
+        other => panic!("expected InvalidKeyMaterial{{IdentityKeyLength}}, got {other:?}"),
+    }
+}
+
+/// The paired negative for the rename: a cipher name Hole does not know is
+/// still `InvalidMethod`, which is the field the user has to fix.
+#[skuld::test]
+fn an_unknown_cipher_name_is_still_a_method_fault() {
+    let mut cfg = sample_config();
+    cfg.server.method = "not-a-cipher".into();
+    let err = build_ss_config(&cfg, None, SAMPLE_IP, None).unwrap_err();
+    match &err {
+        ProxyError::InvalidMethod(m) => assert_eq!(m, "not-a-cipher"),
+        other => panic!("expected InvalidMethod, got {other:?}"),
+    }
+}

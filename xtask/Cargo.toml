@@ -25,6 +25,8 @@ toml = "1.0"
 cargo_metadata = "0.23"
 clap = { version = "4", features = ["derive"] }
 ctrlc = "3" # transparent-launcher interrupt handling (#568): a handler (not SIG_IGN) resets to default across exec, so children stay interruptible while xtask survives Ctrl+C and propagates the child's exit status
+# `bindir::unique_glob_match` locates the single file a BINDIR name maps to
+# under a glob pattern (e.g. the platform-specific ex-ray/galoshes binaries).
 glob = "0.3"
 xtask-lib = { path = "../xtask-lib", features = ["serde", "clap", "version"] }
 hole-common = { path = "../crates/common" } # `gen-ui-constants` reads NETWORK_BLOCKED_MESSAGE
@@ -59,6 +61,14 @@ tempfile = "3"
 # `&`/`|`, so string comparison mis-accepts compound pairs. A normal (not
 # dev-) dependency because the check runs in the subcommand, not in tests.
 skuld = { workspace = true }
+
+# `verify-global-net-state-executed` (bindreams/hole#999) parses nextest's
+# JUnit report to confirm the `global_net_state`-labeled tests it expects
+# actually ran, not merely that they were selectable. Pinned to "0.21" so it
+# resolves to the SAME version (0.21.1) already in the graph via the macOS
+# `typst`/`resvg` chain below — adds no new roxmltree version, just a new
+# direct edge to one already present.
+roxmltree = "0.21"
 
 # background.typ → transparent PNG via Typst. macOS-only: the DMG background is a
 # darwin feature and the Typst tree is heavy (~300 crates); compiling it on

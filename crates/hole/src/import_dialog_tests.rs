@@ -217,3 +217,34 @@ fn entry(id: &str) -> ServerEntry {
 fn ids(outcome: &ImportOutcome) -> Vec<&str> {
     outcome.appended.iter().map(|s| s.id.as_str()).collect()
 }
+
+// Secret redaction ====================================================================================================
+
+/// The guarantee `ImportOutcome`'s doc comment claims: `crates/hole` cannot
+/// reach `dump!`, so the ladder rule has nothing to apply to. Debug is the
+/// live sink, and it goes through `ServerEntry`'s redacting one.
+#[skuld::test]
+fn import_outcome_debug_omits_the_address_and_password() {
+    const SECRET_ADDR: &str = "203.0.113.7";
+    const SECRET_PW: &str = "super-secret-do-not-leak";
+    let outcome = ImportOutcome {
+        appended: vec![hole_common::config::ServerEntry {
+            id: "8f2a1c04-0000-4000-8000-000000000000".into(),
+            name: "Test".into(),
+            server: SECRET_ADDR.into(),
+            server_port: 8388,
+            method: "aes-256-gcm".into(),
+            password: SECRET_PW.into(),
+            plugin: None,
+            plugin_opts: None,
+            validation: None,
+        }],
+        failed: 2,
+    };
+    let rendered = format!("{outcome:?}");
+    assert!(
+        !rendered.contains(SECRET_ADDR),
+        "Debug must not carry the server address: {rendered}"
+    );
+    assert!(!rendered.contains(SECRET_PW), "nor the password: {rendered}");
+}

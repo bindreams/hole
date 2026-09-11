@@ -782,10 +782,7 @@ fn handle_bridge(action: BridgeAction) -> i32 {
         } => match (base64, request_file) {
             (Some(b64), _) => handle_ipc_send_b64(&b64),
             (_, Some(path)) => match crate::elevation::read_request_file(&path) {
-                Ok(request) => {
-                    arm_request_redaction(&request);
-                    send_bridge_request(request, result_file.as_deref())
-                }
+                Ok(request) => send_bridge_request(request, result_file.as_deref()),
                 Err(e) => {
                     cli_log!(error, "{e}");
                     1
@@ -1051,29 +1048,45 @@ fn handle_grant_access(
     }
 }
 
-fn handle_ipc_send_b64(base64_request: &str) -> i32 {
+/// Decode the `--base64` elevation payload, or return a message safe to log.
+///
+/// Split out of [`handle_ipc_send_b64`] to be testable: both failure arms are
+/// leak-bearing and `cli_log!` returns nothing, so a test on the handler
+/// itself could not see what they say.
+///
+/// Neither arm carries its error's `Display`. `base64::DecodeError` names an
+/// offending byte and its offset into what is an encoded `BridgeRequest` — a
+/// `Password` and a `ServerAddress` in transit — and `serde_json::Error`
+/// echoes the bytes around a parse failure, which is that same payload. This
+/// is also the window with no sink-level backstop: `arm_request_redaction`
+/// runs only once decoding has succeeded.
+fn decode_b64_request(base64_request: &str) -> Result<hole_common::protocol::BridgeRequest, String> {
     use base64::Engine;
-    use hole_common::protocol::BridgeRequest;
 
-    // Decode base64
-    let json_bytes = match base64::engine::general_purpose::STANDARD.decode(base64_request) {
-        Ok(b) => b,
-        Err(e) => {
-            cli_log!(error, "invalid base64: {e}");
-            return 1;
-        }
-    };
+    // Hole encodes this payload itself, so a base64 failure means corruption
+    // and no byte-level detail would tell the operator anything a retry
+    // doesn't. Nothing from the error is kept.
+    let json_bytes = base64::engine::general_purpose::STANDARD
+        .decode(base64_request)
+        .map_err(|_| "request payload is not valid base64".to_string())?;
 
-    // Deserialize request
-    let request: BridgeRequest = match serde_json::from_slice(&json_bytes) {
+    serde_json::from_slice(&json_bytes).map_err(|e| {
+        format!(
+            "invalid request JSON: {}",
+            hole_common::config::describe_parse_error(&e)
+        )
+    })
+}
+
+fn handle_ipc_send_b64(base64_request: &str) -> i32 {
+    let request = match decode_b64_request(base64_request) {
         Ok(r) => r,
-        Err(e) => {
-            cli_log!(error, "invalid request JSON: {e}");
+        Err(msg) => {
+            cli_log!(error, "{msg}");
             return 1;
         }
     };
 
-    arm_request_redaction(&request);
     send_bridge_request(request, None)
 }
 
@@ -1130,9 +1143,6 @@ fn send_bridge_request(request: hole_common::protocol::BridgeRequest, result_fil
     }
 }
 
-/// Underlying request driver. Returns the parsed `BridgeResponse` or the typed
-/// `ClientError` (kept typed so the elevated classifier can distinguish a
-/// control-plane `ConcurrentStart` from a transport failure).
 /// Arm log redaction from a request the CLI is about to send.
 ///
 /// The CLI writes its own log file (`gui-cli.log`) and executes none of the
@@ -1140,23 +1150,61 @@ fn send_bridge_request(request: hole_common::protocol::BridgeRequest, result_fil
 /// whole process lifetime. Covers the elevation flow, which re-enters this
 /// binary as `hole bridge ipc-send --request-file` carrying the address and
 /// the password.
+///
+/// Called from exactly one place, [`send_bridge_request_inner`] — the funnel
+/// every payload path reaches. Test-enforced
+/// (`redaction_is_armed_only_by_the_wire_funnel`): when this was a call-site
+/// obligation instead, one of the three paths did not meet it.
+///
+/// Exhaustive, no `_` arm: a new variant states whether it carries a secret
+/// instead of silently inheriting `{}` from its neighbours (mirrors
+/// `impl Dump for BridgeRequest` in `crates/common/src/protocol.rs`, which
+/// groups the same variants as secret-free for the same reason).
 pub(crate) fn arm_request_redaction(request: &hole_common::protocol::BridgeRequest) {
     use hole_common::logging::redact_arm::arm_server;
     use hole_common::protocol::BridgeRequest;
     match request {
         BridgeRequest::Start { config, .. } => arm_server(&config.server),
+        BridgeRequest::Reload { config, .. } => arm_server(&config.server),
         BridgeRequest::TestServer { entry, .. } => arm_server(entry),
-        _ => {}
+        BridgeRequest::Stop
+        | BridgeRequest::Cancel { .. }
+        | BridgeRequest::Status
+        | BridgeRequest::Metrics
+        | BridgeRequest::Diagnostics
+        | BridgeRequest::SetLockdown { .. }
+        | BridgeRequest::Unblock
+        | BridgeRequest::ApplyUpdate { .. } => {}
     }
 }
 
+/// Underlying request driver. Returns the parsed `BridgeResponse` or the typed
+/// `ClientError` (kept typed so the elevated classifier can distinguish a
+/// control-plane `ConcurrentStart` from a transport failure).
+///
+/// Arms redaction itself: the one place a `BridgeRequest` reaches the wire, so
+/// every send path is covered by construction. The `--base64`/`--request-file`
+/// decode arms are the only windows left — they precede a parsed request
+/// existing at all. Arming is last-wins and idempotent, so a repeat costs
+/// nothing.
 fn send_bridge_request_inner(
     request: hole_common::protocol::BridgeRequest,
 ) -> Result<hole_common::protocol::BridgeResponse, crate::bridge_client::ClientError> {
+    send_bridge_request_inner_at(request, &hole_common::protocol::default_bridge_socket_path())
+}
+
+/// Pure seam for [`send_bridge_request_inner`]: the socket path is a
+/// parameter so a test can point it at a controlled, unlistened path and
+/// still exercise arming plus the real connect attempt, instead of ever
+/// reaching the live production bridge socket.
+fn send_bridge_request_inner_at(
+    request: hole_common::protocol::BridgeRequest,
+    socket_path: &std::path::Path,
+) -> Result<hole_common::protocol::BridgeResponse, crate::bridge_client::ClientError> {
+    arm_request_redaction(&request);
     let rt = tokio::runtime::Runtime::new().unwrap();
     rt.block_on(async {
-        let socket_path = hole_common::protocol::default_bridge_socket_path();
-        let mut client = crate::bridge_client::BridgeClient::connect(&socket_path).await?;
+        let mut client = crate::bridge_client::BridgeClient::connect(socket_path).await?;
         client.send(request).await
     })
 }
@@ -1167,8 +1215,17 @@ fn send_bridge_request_inner(
 /// message on file IO or parse failure.
 fn read_server_entry_file(path: &std::path::Path) -> Result<hole_common::config::ServerEntry, String> {
     let bytes = std::fs::read(path).map_err(|e| format!("failed to read {}: {e}", path.display()))?;
-    serde_json::from_slice::<hole_common::config::ServerEntry>(&bytes)
-        .map_err(|e| format!("failed to parse {} as ServerEntry JSON: {e}", path.display()))
+    // Never `{e}`: `serde_json::Error`'s `Display` echoes the bytes around the
+    // failure, and this file holds a password. Nothing is armed yet either —
+    // `arm_server` runs only after a successful parse — so this line has no
+    // sink-level backstop for the address either.
+    serde_json::from_slice::<hole_common::config::ServerEntry>(&bytes).map_err(|e| {
+        format!(
+            "failed to parse {} as ServerEntry JSON: {}",
+            path.display(),
+            hole_common::config::describe_parse_error(&e)
+        )
+    })
 }
 
 fn handle_proxy(action: ProxyAction) -> i32 {
@@ -1190,7 +1247,6 @@ fn handle_proxy(action: ProxyAction) -> i32 {
                     return 1;
                 }
             };
-            hole_common::logging::redact_arm::arm_server(&entry);
             let request = BridgeRequest::Start {
                 config: ProxyConfig {
                     server: entry,
@@ -1264,7 +1320,6 @@ fn handle_proxy(action: ProxyAction) -> i32 {
                     return 1;
                 }
             };
-            hole_common::logging::redact_arm::arm_server(&entry);
             // The dev/admin CLI reads only a ServerEntry file — no AppConfig in
             // hand — so it bootstraps over the default DoH resolver.
             let dns = hole_common::config::DnsConfig::default();

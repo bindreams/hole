@@ -59,16 +59,17 @@ pub enum ImportFailure {
 /// Convert an `ImportError` from the parser into the user-facing
 /// `ImportFailure`. The categorization is the only thing this function
 /// does — it's not a one-to-one map; for example,
-/// `ImportError::Parse(_)` collapses to `CorruptedJson` (no detail) to
-/// avoid leaking JSON parse-error messages (which can include fragments
-/// of file content). The `supported` plugin list is fetched directly
+/// `ImportError::Parse { .. }` collapses to `CorruptedJson` (no detail),
+/// which is defense in depth over the variant itself no longer carrying
+/// the `serde_json::Error` that echoes file content. The `supported`
+/// plugin list is fetched directly
 /// from the single source of truth via
 /// [`hole_common::plugin::user_visible_plugin_names`] — no comma-string
 /// round-trip, and the non-user-visible `ex-ray` impl-detail entry is
 /// filtered out (bindreams/hole#414).
 fn to_import_failure(err: import::ImportError) -> ImportFailure {
     match err {
-        import::ImportError::Parse(_) => ImportFailure::CorruptedJson,
+        import::ImportError::Parse { .. } => ImportFailure::CorruptedJson,
         import::ImportError::MissingField(name) => ImportFailure::UnrecognizedFormat {
             missing_field: name.to_string(),
         },

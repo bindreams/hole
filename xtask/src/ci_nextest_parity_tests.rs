@@ -243,6 +243,37 @@ jobs:
     assert_eq!(test_job(ci, "j").expect("analyze").runs.len(), 1);
 }
 
+/// `NEXTEST_PROFILE` picks a per-lane nextest profile (bindreams/hole#999's
+/// non-tun/tun split) without perturbing the compared command text, whether
+/// stated as step-level `env:` or inline under `sudo env …`.
+#[skuld::test]
+fn nextest_profile_is_fingerprint_neutral() {
+    let step_level = r#"
+jobs:
+  j:
+    steps:
+      - run: cargo xtask build tests
+      - name: s
+        env:
+          NEXTEST_PROFILE: non-tun
+        run: cargo nextest run -E 'package(a)'
+"#;
+    assert_eq!(test_job(step_level, "j").expect("analyze").runs.len(), 1);
+
+    let inline = r#"
+jobs:
+  j:
+    steps:
+      - run: cargo xtask build tests
+      - name: root
+        run: sudo env "PATH=$PATH" "HOME=$HOME" NEXTEST_PROFILE=tun cargo nextest run -E 'package(a)'
+"#;
+    assert_eq!(
+        test_job(inline, "j").expect("analyze").runs,
+        vec![("root".into(), "cargo nextest run -E 'package(a)'".into())]
+    );
+}
+
 // ===== target_nextest_run ============================================================================================
 
 fn fixture_manifest() -> Manifest {

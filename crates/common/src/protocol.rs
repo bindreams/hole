@@ -121,6 +121,57 @@ pub enum BridgeRequest {
     },
 }
 
+/// The top of the same ladder, and the last rung: this is what the elevation
+/// flow serializes whole. `BridgeRequest` derives `Serialize` and reaches a
+/// [`ServerEntry`] through three of its variants, so without this impl
+/// `dump!(&request)` renders the serde tree, the two transparent newtypes
+/// come out as their inner strings, and neither
+/// [`ProxyConfig`]'s nor [`ServerEntry`]'s `Dump` is ever reached.
+///
+/// Exhaustive, no `_` arm: a new variant states whether it carries a secret
+/// instead of inheriting the answer chosen for its neighbours.
+impl dump::Dump for BridgeRequest {
+    fn dump(&self) -> dump::DumpValue {
+        use dump::DumpValue;
+        let field = |k: &str, v: DumpValue| (DumpValue::String(k.to_string()), v);
+        let variant = |name: &str, body: Vec<(DumpValue, DumpValue)>| {
+            DumpValue::Map(vec![(DumpValue::String(name.to_string()), DumpValue::Map(body))])
+        };
+        match self {
+            BridgeRequest::Start {
+                config,
+                attempt_id,
+                on_startup,
+            } => variant(
+                "Start",
+                vec![
+                    field("config", config.dump()),
+                    field("attempt_id", dump::from_serialize(attempt_id)),
+                    field("on_startup", dump::from_serialize(on_startup)),
+                ],
+            ),
+            BridgeRequest::Reload { config } => variant("Reload", vec![field("config", config.dump())]),
+            BridgeRequest::TestServer { entry, dns } => variant(
+                "TestServer",
+                vec![field("entry", entry.dump()), field("dns", dump::from_serialize(dns))],
+            ),
+            // No `ServerEntry` anywhere in these, so the derived `Serialize`
+            // tree is the whole rendering. Narrowly a *secret* claim, not a
+            // PII one: `ApplyUpdate` renders `payload_path` / `app_dest`
+            // verbatim, which are filesystem paths — the same treatment they
+            // already get elsewhere in `gui.log`.
+            BridgeRequest::Stop
+            | BridgeRequest::Cancel { .. }
+            | BridgeRequest::Status
+            | BridgeRequest::Metrics
+            | BridgeRequest::Diagnostics
+            | BridgeRequest::SetLockdown { .. }
+            | BridgeRequest::Unblock
+            | BridgeRequest::ApplyUpdate { .. } => dump::from_serialize(self),
+        }
+    }
+}
+
 /// Host-free censorship toast text shown when the reachability probe finds the
 /// network is resetting/dropping the server handshake. The canonical source of
 /// this sentence.
@@ -404,6 +455,23 @@ pub struct TestServerRequest {
     /// → `DnsConfig::default()` for older clients.
     #[serde(default)]
     pub dns: crate::config::DnsConfig,
+}
+
+/// Same ladder trap as [`ProxyConfig`]'s: this is the wire body
+/// [`BridgeRequest::TestServer`] maps to, and it holds the [`ServerEntry`]
+/// directly.
+impl dump::Dump for TestServerRequest {
+    fn dump(&self) -> dump::DumpValue {
+        use dump::DumpValue;
+        // Destructured, not field-accessed: a new field fails compilation
+        // here rather than silently vanishing from the dump.
+        let TestServerRequest { entry, dns } = self;
+        let key = |k: &str| DumpValue::String(k.to_string());
+        DumpValue::Map(vec![
+            (key("entry"), entry.dump()),
+            (key("dns"), dump::from_serialize(dns)),
+        ])
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

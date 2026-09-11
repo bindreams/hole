@@ -217,8 +217,9 @@ fn run_service() -> Result<(), Box<dyn std::error::Error>> {
             tracing::warn!(error = %e, "ndis startup snapshot task panicked");
         }
 
-        // Always-on ETW consumer. Held for the service's run lifetime;
-        // Drop stops the session and joins the processing thread.
+        // Always-on ETW consumer, held for the service's run lifetime; Drop
+        // may abandon rather than join its processing thread if reclaim
+        // can't be confirmed (see `etw.rs` module doc, "Drain on Drop").
         let _etw_guard = match crate::diagnostics::etw::start_consumer() {
             Ok(g) => Some(g),
             Err(e) => {
