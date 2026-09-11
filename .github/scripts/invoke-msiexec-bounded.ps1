@@ -49,10 +49,11 @@ param(
     # Sized against the same 60min job budget the bound above is sized
     # against: a wedge in both Install and Uninstall spends this twice, so
     # 2min each eats 4 of the ~11min that analysis leaves spare. Measured
-    # cost is far below the cap -- an attach with a cold symbol cache
-    # resolved a 9-thread native service in 7.9s, a warm one in 0.3s (Windows
-    # 11 26100, SDK 10.0.26100 cdb) -- so the cap is a failure bound, not an
-    # expected duration.
+    # cost is well below the cap -- 33s for one process against a cold
+    # symbol cache, 0.3s against a warm one (Windows 11 26100, SDK
+    # 10.0.26100 cdb), and the two steps share one cache under
+    # RUNNER_TEMP -- so the cap is a failure bound, not an expected
+    # duration.
     [double]$StackCaptureSeconds = 120,
 
     # Install failure is fatal; Uninstall is best-effort cleanup -- callers set
