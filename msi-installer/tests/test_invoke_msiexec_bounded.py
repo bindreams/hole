@@ -31,6 +31,7 @@ DIAGNOSTIC_HEADERS = [
     "--- HoleBridge service state ---",
     "--- hole.exe processes ---",
     "--- msiexec process tree ---",
+    "--- native thread stacks ---",
 ]
 
 
@@ -93,6 +94,10 @@ def test_wedge_throws_within_bound_and_emits_all_diagnostics(tmp_path: Path) -> 
             "LogPath": str(log_path),
             "BoundMinutes": str(bound_minutes),
             "ExePath": sys.executable,
+            # Zero budget: this test is about the other diagnostics and the
+            # kill, and a real cdb attach would dominate its runtime. The
+            # capture itself is covered below.
+            "StackCaptureSeconds": "0",
         },
         exe_args=_python_exe_args("import time; time.sleep(3600)"),
     )
@@ -148,6 +153,7 @@ def test_wedge_still_emits_diagnostics_and_throws_when_log_read_fails(tmp_path: 
                 "LogPath": str(log_path),
                 "BoundMinutes": "0.02",
                 "ExePath": sys.executable,
+                "StackCaptureSeconds": "0",
             },
             exe_args=_python_exe_args("import time; time.sleep(3600)"),
         )
@@ -162,6 +168,70 @@ def test_wedge_still_emits_diagnostics_and_throws_when_log_read_fails(tmp_path: 
     finally:
         holder.terminate()
         holder.wait(timeout=10)
+
+
+# Native stack capture -------------------------------------------------------------------------------------------------
+
+
+def test_wedge_captures_symbolised_native_stacks_of_the_wedged_process(tmp_path: Path) -> None:
+    """The datum #790 asks for: where the wedged process is actually blocked.
+
+    A thread-state table names no call, so this asserts symbolised frames --
+    `ntdll!`-qualified names resolved off the Microsoft symbol server -- not
+    just that cdb ran. Frames like `hole+0x3f21a` would settle nothing.
+    """
+    log_path = tmp_path / "wedge.log"
+
+    result = _run_script(
+        params={
+            "Verb": "/x",
+            "MsiPath": "unused.msi",
+            "LogPath": str(log_path),
+            "BoundMinutes": "0.02",
+            "ExePath": sys.executable,
+            "StackCaptureSeconds": "120",
+        },
+        exe_args=_python_exe_args("import time; time.sleep(3600)"),
+        timeout=300,
+    )
+    combined = result.stdout + result.stderr
+
+    assert result.returncode != 0, f"expected a nonzero exit on wedge:\n{combined}"
+    assert "wedged" in combined, f"the capture swallowed the wedge throw:\n{combined}"
+
+    captures = sorted(tmp_path.glob("wedge-stack-*.txt"))
+    assert captures, f"no stack capture file written next to the MSI log:\n{combined}"
+    text = "\n".join(p.read_text(errors="replace") for p in captures)
+
+    assert "Child-SP" in text, f"cdb produced no stack listing:\n{text}"
+    assert "ntdll!" in text, f"stacks came back symbol-less -- symbol resolution is broken:\n{text}"
+    # The job log is where a reader actually looks; the artifact is the backup.
+    assert "Child-SP" in combined, f"stacks were written to file but never echoed to the job log:\n{combined}"
+
+
+def test_stack_capture_budget_exhaustion_is_reported_and_does_not_swallow_the_wedge(tmp_path: Path) -> None:
+    """A zero budget must skip the capture loudly and still reach the throw --
+    the capture is additive instrumentation, never a new way to lose the
+    original bounded failure."""
+    log_path = tmp_path / "wedge.log"
+
+    result = _run_script(
+        params={
+            "Verb": "/x",
+            "MsiPath": "unused.msi",
+            "LogPath": str(log_path),
+            "BoundMinutes": "0.02",
+            "ExePath": sys.executable,
+            "StackCaptureSeconds": "0",
+        },
+        exe_args=_python_exe_args("import time; time.sleep(3600)"),
+    )
+    combined = result.stdout + result.stderr
+
+    assert result.returncode != 0
+    assert "--- native thread stacks ---" in combined, f"the section vanished when skipped:\n{combined}"
+    assert "budget" in combined.lower(), f"budget exhaustion was not reported:\n{combined}"
+    assert "wedged" in combined, f"wedge throw did not survive a skipped capture:\n{combined}"
 
 
 # Non-wedge paths ======================================================================================================

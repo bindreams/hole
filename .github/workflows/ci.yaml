@@ -947,7 +947,9 @@ jobs:
       # step instead of the whole job, so this step is reached to upload it.
       # `/l*vx` writes both logs regardless of exit code once Install/
       # Uninstall start msiexec, so `if-no-files-found: ignore` only covers a
-      # job that failed before either did.
+      # job that failed before either did. `*-stack-*.txt` are the per-thread
+      # native stacks a wedge captures; they are echoed into the job log too,
+      # and exist only when a step wedged.
       - name: Upload MSI logs
         if: always()
         uses: actions/upload-artifact@v7
@@ -956,6 +958,7 @@ jobs:
           path: |
             ${{ runner.temp }}/msi-install.log
             ${{ runner.temp }}/msi-uninstall.log
+            ${{ runner.temp }}/msi-*-stack-*.txt
           if-no-files-found: ignore
           retention-days: 14
 
