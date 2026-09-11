@@ -390,27 +390,40 @@ jobs:
     # to the pre-#989 45min-wall population, not the 29-run 2026-08-27 →
     # 2026-09-07 one this paragraph is spliced under. Enumerating killed
     # darwin/amd64 `test-hole` jobs on `main` for 2026-05-31 - 2026-08-04
-    # (all under that retired 45min wall) returns 12, not 8; one (run
+    # (all under that retired 45min wall) returns 12, not 8; one (job
     # 80597393392, 2026-06-10) has since aged out of GitHub's log retention
     # and can't be classified. Of the 11 with logs:
     #   - 1 shows the hang signature: job 86595016035 (2026-07-11T23:27),
     #     crash_marker_abort SLOW at escalating 60s intervals to 1080s
     #     before the job was cancelled.
-    #   - 5 ran crash_marker_abort clean AND completed the TUN pass —
-    #     nextest's actual SECOND pass (SKULD_LABELS=tun runs after !tun,
-    #     not before — see job 86694590188's own log) — in full, then were
-    #     cancelled 1m54s-7m57s later in post-test cleanup: jobs
-    #     91615517954, 91565615662, 89807697019, 86694590188, 83671628233.
-    #     None were waiting on a rebuild ahead of a pass; both passes had
-    #     already printed every result.
+    #   - 5 passed crash_marker_abort clean on the non-TUN pass, but the
+    #     TUN pass — nextest's actual SECOND pass (SKULD_LABELS=tun runs
+    #     after !tun, not before — see job 86694590188's own log) — never
+    #     got past its own rebuild in any of them: the tun invocation drops
+    #     `--features tombstone/crash-dumps,tombstone/crash-child`, present
+    #     on the !tun command, which invalidates cargo's incremental cache
+    #     and forces a fresh build every time. The TUN step's own conclusion
+    #     is `cancelled` in all 5, landing mid that rebuild: job
+    #     86694590188's log shows `Compiling hole-common` 22:04:59 →
+    #     `Compiling dev-console` 22:05:57 → cancelled 22:06:08, zero tests
+    #     started, and exactly one `Summary` line in the whole job log (the
+    #     !tun pass's). The other 4 show the same shape — a final
+    #     `Compiling` line, then total silence (no more compiler output, no
+    #     `Finished`, no test output) until the cancel. Per job, the
+    #     cancelled TUN step's own duration: 91615517954 (3m31s), 91565615662
+    #     (5m36s), 89807697019 (7m15s), 86694590188 (1m14s), 83671628233
+    #     (7m37s) — each against a whole-job wall of 45m28s-45m44s. These are
+    #     NOT "completed the TUN pass, then cancelled in cleanup" — they are
+    #     the rebuild itself getting killed.
     #   - 2 hit the already-tracked e2e_*_roundtrip/udp_associate_galoshes
     #     stall: jobs 89745070531, 86542250513.
     #   - 1 never reached the test step (slow build): job 87336029086.
     #   - 2 were killed mid the non-TUN pass with neither signature
     #     present: jobs 89498063447, 86633700324.
-    # So "a slow rebuild ate the second pass's budget" describes none of
-    # these — the closest-shaped 5 completed both passes outright. #842's
-    # own trigger, job 95548588839 (PR #832 / azhukova/825, 2026-08-18), is
+    # So these 5 ARE "a slow rebuild ate the second pass's budget" — not an
+    # exception to it: in every one, the tun pass's own rebuild, not test
+    # execution and not post-test cleanup, is what the cancellation caught.
+    # #842's own trigger, job 95548588839 (PR #832 / azhukova/825, 2026-08-18), is
     # a further kill outside both this sample and the "8 killed" window
     # above: crash_marker_abort SLOW to >3660s before the CURRENT 90min
     # wall cancelled it — the only hang observed at 90min, and exactly what

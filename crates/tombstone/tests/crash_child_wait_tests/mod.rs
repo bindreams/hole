@@ -45,7 +45,6 @@ fn wait_bounded_returns_promptly_when_child_exits() {
 #[skuld::test]
 fn wait_bounded_panics_with_clear_message_on_timeout() {
     let child = spawn_double("TOMBSTONE_TEST_HANG_FOREVER");
-    let pid = child.id();
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         wait_bounded(child, Duration::from_millis(200))
     }));
@@ -61,43 +60,28 @@ fn wait_bounded_panics_with_clear_message_on_timeout() {
     // must confirm the child actually reaped before reporting failure (see
     // bindreams/hole#842/#719 review B3: the earlier background-thread
     // design could report "timeout" after the child was already gone,
-    // making a raw-pid kill race a pid-reuse victim). Proving that here
-    // means checking the process is actually dead by pid, independent of
-    // wait_bounded's own internal bookkeeping.
+    // making a raw-pid kill race a pid-reuse victim). Proving that here is
+    // NOT a second, later check of `pid`'s liveness — this suite runs many
+    // crash_child's concurrently, so by the time a check ran here (after
+    // catch_unwind has already unwound the panic), a sibling test's spawn
+    // could have recycled the freed pid, which is the exact same class of
+    // race B3 fixed, just relocated into this assertion instead of removed.
+    // `wait_bounded` instead asserts internally, at the moment of reap, that
+    // `status` shows a genuine kill()-caused termination (`termination_proof`
+    // in its panic message: `signal=Some(SIGKILL)` on Unix, `code=Some(1)`
+    // on Windows) — data only a real kill()-then-wait() can produce, so a
+    // panic message that merely CLAIMS "confirmed it reaped" without doing
+    // so has no way to also produce it. We only need to confirm that proof
+    // reached this message, not re-derive it via a second, racy probe.
     assert!(msg.contains("confirmed it reaped"), "got: {msg}");
+    #[cfg(unix)]
     assert!(
-        !process_alive(pid),
-        "child (pid {pid}) must be confirmed dead by the time wait_bounded panics"
+        msg.contains(&format!("signal=Some({})", libc::SIGKILL)),
+        "expected SIGKILL termination proof in message: {msg}"
     );
-}
-
-/// True if `pid` still names a live process. Unix: `kill(pid, 0)` is the
-/// standard existence probe (no signal delivered) — success or `EPERM`
-/// means the pid is alive, `ESRCH` means it is not. Windows: opening the
-/// process for `SYNCHRONIZE` and checking it hasn't signalled is the
-/// equivalent probe.
-#[cfg(unix)]
-fn process_alive(pid: u32) -> bool {
-    // SAFETY: kill() with signal 0 delivers no signal — it is a pure
-    // existence/permission probe, sound to call with any pid value.
-    let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
-    rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
-}
-
-#[cfg(windows)]
-fn process_alive(pid: u32) -> bool {
-    use windows::Win32::Foundation::{CloseHandle, WAIT_TIMEOUT};
-    use windows::Win32::System::Threading::{OpenProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE};
-
-    // SAFETY: plain Win32 handle open/wait/close with a caller-owned HANDLE;
-    // no aliasing requirements beyond closing what we open, which we do.
-    unsafe {
-        let Ok(handle) = OpenProcess(PROCESS_SYNCHRONIZE, false, pid) else {
-            // No such process (or no permission to open a dead one's slot).
-            return false;
-        };
-        let alive = WaitForSingleObject(handle, 0) == WAIT_TIMEOUT;
-        let _ = CloseHandle(handle);
-        alive
-    }
+    #[cfg(windows)]
+    assert!(
+        msg.contains("code=Some(1)"),
+        "expected TerminateProcess termination proof in message: {msg}"
+    );
 }

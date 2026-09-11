@@ -94,7 +94,12 @@ fn run_crash_child(class: &str, log_dir: &std::path::Path) -> std::process::Outp
 /// `kill_pid_best_effort`. Because `child` is never handed to another
 /// thread, `Ok(None)` (timeout) is a hard guarantee that this exact pid has
 /// not yet been reaped — `child.kill()` cannot target a process the OS has
-/// recycled. See bindreams/hole#842/#719 review B3.
+/// recycled. Confirming that the reap in the `Ok(None)` arm below was real
+/// (not merely claimed) is likewise done WITHOUT any check performed after
+/// the fact on the bare `pid` — the caller runs many crash_child's
+/// concurrently, so by the time a later, separate probe ran, a sibling
+/// test's spawn could already have recycled the freed pid, reintroducing the
+/// exact same class of race B3 fixed. See bindreams/hole#842/#719 review B3.
 #[cfg(feature = "crash-child")]
 fn wait_bounded(mut child: std::process::Child, bound: std::time::Duration) -> std::process::Output {
     use wait_timeout::ChildExt;
@@ -117,10 +122,41 @@ fn wait_bounded(mut child: std::process::Child, bound: std::time::Duration) -> s
             // asked.
             child.kill().expect("SIGKILL a timed-out crash_child");
             let status = child.wait().expect("reap crash_child after SIGKILL");
+            // Prove the reap was REAL, not just a claim in this panic's text,
+            // WITHOUT a second, later, out-of-band pid probe: re-checking
+            // `pid`'s liveness via `kill(pid, 0)` after this point is exactly
+            // the prior B3 race in a new spot (this suite runs many
+            // crash_child's concurrently, so a freed pid is realistically
+            // recyclable by a SIBLING test's spawn before any later check
+            // runs — the gap is not merely theoretical here). Cross-platform
+            // termination-cause encoded straight from `status`, which only a
+            // genuine kill()-then-wait() can have produced, is the
+            // unfakeable-by-omission substitute: Unix `kill()` is SIGKILL, so
+            // `status.signal() == Some(SIGKILL)`; Windows `kill()` is
+            // `TerminateProcess(_, 1)`, so `status.code() == Some(1)`.
+            #[cfg(unix)]
+            let termination_proof = {
+                use std::os::unix::process::ExitStatusExt;
+                assert_eq!(
+                    status.signal(),
+                    Some(libc::SIGKILL),
+                    "reaped status must show SIGKILL termination, not a fabricated reap: {status:?}"
+                );
+                format!("signal={:?}", status.signal())
+            };
+            #[cfg(windows)]
+            let termination_proof = {
+                assert_eq!(
+                    status.code(),
+                    Some(1),
+                    "reaped status must show TerminateProcess's exit code 1, not a fabricated reap: {status:?}"
+                );
+                format!("code={:?}", status.code())
+            };
             panic!(
                 "crash_child (pid {pid}) did not exit within {bound:?} — sent SIGKILL as a \
-                 safety net and confirmed it reaped with status {status:?}. This is the \
-                 child-process-exit failure bound from bindreams/hole#842/#719, not a \
+                 safety net and confirmed it reaped with status {status:?} ({termination_proof}). \
+                 This is the child-process-exit failure bound from bindreams/hole#842/#719, not a \
                  synchronization timeout: if this fires, the child genuinely stalled (most \
                  likely exposure to the macOS crash reporter that `crash::is_macos_sigabrt_relay` \
                  is meant to prevent) and needs investigation, not a longer bound."
@@ -185,10 +221,44 @@ macro_rules! crash_class_test {
 }
 
 // Cross-platform fault classes.
-crash_class_test!(crash_marker_segfault, "segfault");
 crash_class_test!(crash_marker_stack_overflow, "stack_overflow");
 crash_class_test!(crash_marker_illegal_instruction, "illegal_instruction");
 crash_class_test!(crash_marker_trap, "trap");
+
+// `segfault` is written by hand, NOT via `crash_class_test!`, because on
+// macOS it is the negative case that pins `is_macos_sigabrt_relay`'s half of
+// the `on_crash` bypass condition (see the comment on that `if` in
+// `crash.rs`): a real fault's `CrashContext` never matches
+// `is_macos_sigabrt_relay` (that helper only matches the synthesized
+// `EXC_SOFTWARE`/`EXC_SOFT_SIGNAL`/`SIGABRT` triple SIGABRT gets relayed as),
+// so segfault must NOT take the `_exit(EX_SOFTWARE)` bypass — it must still
+// die by its real signal (`SIGSEGV`, 11). Measured: deleting
+// `is_macos_sigabrt_relay(context)` from that `if` (leaving only
+// `self.state.kind == "test"`) makes THIS process — which also runs under
+// `kind == "test"` — take the bypass too, exiting 70 instead of being killed
+// by SIGSEGV; every other class here only asserts the marker file exists,
+// so nothing else in this binary would have noticed that regression.
+#[cfg(feature = "crash-child")]
+#[skuld::test]
+fn crash_marker_segfault() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let output = run_crash_child("segfault", dir.path());
+    assert_marker(dir.path(), true);
+
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(
+            output.status.signal(),
+            Some(libc::SIGSEGV),
+            "segfault child must die by SIGSEGV, not take the SIGABRT-relay `_exit` bypass: {:?}",
+            output.status
+        );
+    }
+    // Non-macOS: `output` is read only inside the block above.
+    #[cfg(not(target_os = "macos"))]
+    let _ = &output;
+}
 
 // `abort` is written by hand, NOT via `crash_class_test!`, because — unlike
 // every other class, whose exit status is genuinely non-deterministic

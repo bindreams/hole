@@ -50,10 +50,6 @@ windows = { version = "0.62", features = [
     "Win32_Storage_FileSystem",
     "Win32_System_IO",
     "Win32_System_SystemInformation",
-    # OpenProcess/WaitForSingleObject: crash_child_wait_tests's process_alive
-    # probe (review B3 — confirms the timed-out child is actually reaped,
-    # not just that wait_bounded sent a kill signal).
-    "Win32_System_Threading",
 ] }
 
 [target.'cfg(unix)'.dependencies]

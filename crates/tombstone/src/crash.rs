@@ -491,42 +491,87 @@ struct MarkerCrashEvent {
 // a SYNTHESIZED `EXC_SOFTWARE`/`EXC_SOFT_SIGNAL` exception (see its own
 // `mac/signal.rs`: "Macos doesn't have an exception for process aborts, so we
 // hook SIGABRT"). That relay does not `detach()` crash-handler's task-level
-// exception port the way a REAL fault (segfault/bus/illegal/trap) does — and
+// exception port the way a REAL fault (segfault/bus/illegal/trap) does, and
 // `abort()`'s C-standard-mandated contract (terminate even if a caught signal
-// handler returns) then re-raises `SIGABRT` with the default disposition,
-// generating a SECOND, genuine `EXC_CRASH` exception. Because the relay never
-// detached, crash-handler's port is STILL registered for `EXC_MASK_CRASH`, so
-// — contrary to how this used to read — that second exception runs
-// `on_crash` AGAIN, this time via crash-handler's real `Exception` message
-// path with `context.exception.kind == EXC_CRASH`; it is THAT invocation's
-// return that finally triggers crash-handler's own `detach(true)`, restoring
-// the previous (OS-default) ports and letting the process forward on to the
-// system crash reporter (`ReportCrash`/`crashreporterd`). We never observe
-// this second invocation here: the `_exit` below fires on the FIRST call
-// (`kind == EXC_SOFTWARE`) and tears the process down before `abort()`'s
-// guaranteed re-raise can happen at all, so the second `EXC_CRASH` is never
-// actually raised — which is why the marker this test build writes always
-// carries `code=0x5` (`EXC_SOFTWARE`), never `0xa` (`EXC_CRASH`).
+// handler returns) means it re-raises `SIGABRT` with the default disposition
+// once the relay returns — which, on an unhandled abort, is the textbook
+// condition for a second, genuine `EXC_CRASH` exception.
+//
+// MEASURED, not inferred: that second `on_crash` invocation does not happen.
+// With the `_exit` bypass below compiled out via an env-gated no-op (so
+// `abort()`'s re-raise is free to run) and a signal-safe per-invocation probe
+// added ad hoc for this measurement, 8/8 runs of the SIGABRT-relay path
+// produced exactly ONE `on_crash` call, `context.exception.kind ==
+// EXC_SOFTWARE` (0x5) every time — never a second call, never `kind ==
+// EXC_CRASH` (0xa). The marker's `code` field is consequently
+// NON-discriminating between "the `_exit` bypass is present" and "it was
+// deleted outright": both were measured to write `code=0x5`, because in
+// neither case does a second, `EXC_CRASH`-carrying invocation ever occur to
+// overwrite it.
+//
+// Why the second invocation never arrives, and why this class hangs
+// (`crash_marker_abort` stalls for minutes to hours on CI, intermittently —
+// bindreams/hole#842, #719), is NOT independently confirmed. The
+// best-supported hypothesis — inferred from XNU's exception-delivery model,
+// not measured — is that XNU holds every other thread in the task suspended
+// before calling `task_exception_notify(EXC_CRASH)`, so the port the relay
+// left attached has no live server thread free to reply: the notify call
+// blocks rather than ever reaching `on_crash` again. One story would then
+// cover the absent second invocation, the intermittent hang (the block never
+// resolving), and `termination.byProc: crash_child` on the `.ips` this class
+// produces once the process does terminate (the "responsible" party at the
+// OS's book-keeping level is still the process's own thread, not a
+// registered exception-handling agent that replied). What would confirm it:
+// a kernel-level trace (e.g. `ktrace`) of all task threads during a captured
+// hang, showing every other thread parked and the exception-delivery thread
+// blocked inside `task_exception_notify`.
 //
 // Every fault class we handle reaches the crash reporter eventually —
 // confirmed by per-class `.ips` capture on darwin/arm64 (bindreams/hole#842):
 // abort, segfault, bus, illegal_instruction, trap, and stack_overflow all
-// produce one. What distinguishes abort is the ROUTE, visible in each
-// report's `termination.byProc`: abort's second, genuine `EXC_CRASH` is held
-// synchronously — crash-handler's task ports are still attached
-// (`byProc: crash_child`) — whereas a real fault is seen once, handled and
-// detached in the same pass, and reported via crash-handler's own reply
-// after that detach (`byProc: exc handler`). `tombstone::crash_child
-// crash_marker_abort` is the one that intermittently stalls for minutes to
-// hours on CI, never releasing the child (bindreams/hole#842, #719); the
-// fault classes are not observed to hang. Why the route matters — inferred
-// from XNU's exception-delivery model, not independently confirmed — is
-// likely the corpse path: a real fault's report goes through XNU's async,
-// corpse-based reporting, while abort's second exception blocks on the
-// synchronous `task_exception_notify(EXC_CRASH)` hold, which would degrade
-// when the system's corpse budget is exhausted on a busy CI runner — this
-// would also explain the intermittency, which a "different detour" story by
-// itself does not.
+// produce one. `termination.byProc` does NOT split cleanly along "port
+// attached vs. detached": segfault/bus/illegal_instruction/trap — real
+// faults crash-handler detaches and forwards in the same pass — report
+// `byProc: exc handler` in every captured instance, and plain `abort`
+// reports `byProc: crash_child`, as the dichotomy predicts for both — but
+// `stack_overflow` breaks it. It is also a real fault (`EXC_BAD_ACCESS`,
+// `KERN_PROTECTION_FAILURE` — a genuine guard-page hit, detached and
+// forwarded the same way as the other four) and yet its captured `.ips`
+// shows `termination.indicator: Abort trap: 6`, `byProc: crash_child`: the
+// forwarded fault reaches Rust's OWN stack-overflow signal handler
+// (`std::sys::pal::unix::stack_overflow::imp::signal_handler`, visible in
+// the faulting thread's backtrace), which calls `process::abort()` itself.
+// So `byProc` does not track which port was attached at fault time; it
+// tracks who executed the syscall that actually ended the process — the
+// process's own thread (`crash_child`) vs. a registered exception-handling
+// agent replying on its behalf (`exc handler`) — and a real, detached fault
+// can still end up in the first bucket if something in-process reacts to it
+// by calling `abort()`.
+//
+// Is `stack_overflow` exposed to the same #842/#719 hang, and does this fix
+// cover it? MEASURED: no to both, as far as the `_exit` bypass goes.
+// `is_macos_sigabrt_relay` requires `kind == EXC_SOFTWARE`; a captured
+// `stack_overflow` marker instead carries `code=0x1` (`EXC_BAD_ACCESS`) in
+// 5/5 local runs — `on_crash` sees the genuine guard-page fault, not a
+// SIGABRT relay, so the `_exit(EX_SOFTWARE)` bypass below never fires for
+// it, and this PR does not extend it to. All 5 runs still exited promptly
+// (134 = default SIGABRT disposition, the in-process `abort()` above going
+// unintercepted post-detach — not a hang, and not this fix's doing). That is
+// NOT a guarantee `stack_overflow` can never hang the way `abort`'s SIGABRT
+// relay did: 5 local runs is not the intermittent, load-sensitive CI
+// condition #842/#719 was filed against, and the hang hypothesis above turns
+// on a SECOND exception arriving on a still-attached port, which
+// `stack_overflow`'s single, detached-and-forwarded fault structurally does
+// not produce — but "structurally doesn't produce the one hypothesized
+// precondition" is itself inferred, not measured, so it is not being used
+// here to close the question. What would settle it: the same 8-run,
+// probe-instrumented measurement done above for `abort`, run instead against
+// `stack_overflow` under sustained CI-like load (parallel test-suite
+// pressure), watching for either a second `on_crash` call or a stalled
+// `wait_bounded`. Absent that, `wait_bounded`'s 60s bound — not the `_exit`
+// bypass — is the only thing standing between a hypothetical
+// `stack_overflow` hang and consuming the whole job's wall, exactly as it
+// was before this PR; the risk is unmeasured, not eliminated.
 //
 // `on_crash` is not wired to see which detour a given call took (the SIGABRT
 // relay's "handled" reply is discarded — see the signal handler's ignored
@@ -596,10 +641,20 @@ unsafe impl crash_handler::CrashEvent for MarkerCrashEvent {
         // the state actually produced by `attach("test", ...)`, e.g. against
         // a future crash-child-linked binary that also serves a non-test
         // kind. See `is_macos_sigabrt_relay` for why only the SIGABRT relay
-        // needs this; see `crash_marker_abort` (`tests/crash_child.rs`) for
-        // the test that exercises this exact conjunction end-to-end — it
-        // asserts the child's exit status IS `EX_SOFTWARE` (review B5), so
-        // removing either condition here fails it, not just goes unnoticed.
+        // needs this.
+        //
+        // Two tests pin this conjunction from opposite sides, each covering
+        // the condition the other can't: `crash_marker_abort`
+        // (`tests/crash_child.rs`) asserts the child's exit status IS
+        // `EX_SOFTWARE` (review B5) — measured to fail if the whole `if` is
+        // disabled, but NOT if only `is_macos_sigabrt_relay(context)` is
+        // dropped, since `self.state.kind == "test"` alone still lets abort's
+        // relay through. `crash_marker_segfault` closes exactly that gap: a
+        // real fault's `CrashContext` never matches
+        // `is_macos_sigabrt_relay`, so it asserts the child instead dies by
+        // its real signal (`SIGSEGV`) — measured to fail (child wrongly
+        // exits 70) if `is_macos_sigabrt_relay(context)` is dropped, because
+        // this process also runs under `kind == "test"`.
         #[cfg(all(target_os = "macos", feature = "crash-child"))]
         if self.state.kind == "test" && is_macos_sigabrt_relay(context) {
             // SAFETY: `_exit` is async-signal-safe (POSIX.1-2017 §2.4.3): a
