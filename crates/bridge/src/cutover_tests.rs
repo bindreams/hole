@@ -254,14 +254,14 @@ fn plan_windows_images_covers_full_bindir_set() {
 // the same reason `unlock` does — an out-of-process clear would leave the
 // bridge's posture claiming a cover that no longer exists (#1003).
 
-/// `release_covers_with` with no peer dirs and the purge stubbed out, so the
-/// assertions below can still read the state dir afterwards.
+/// `release_covers_with` with no peer dirs, for the assertions about the
+/// sequencing around the release itself.
 fn release_covers_probe(dir: &std::path::Path, release: impl FnOnce() -> std::io::Result<()>) -> std::io::Result<()> {
     // These probes are about the sequencing around the release (liveness,
-    // target write, purge), not about what the sweep proved — so they hand it
+    // target write), not about what the sweep proved — so they hand it
     // the fully-proven clearance and drop it again. The propagation itself is
     // pinned by `release_covers_reports_what_the_sweep_could_not_prove`.
-    release_covers_with(dir, &[], || release().map(|()| Clearance::proven()), || {}).map(|_| ())
+    release_covers_with(dir, &[], || release().map(|()| Clearance::proven())).map(|_| ())
 }
 
 #[skuld::test]
@@ -290,12 +290,9 @@ fn release_covers_refuses_against_a_bridge_live_in_a_peer_state_dir() {
 
     let _bridge = crate::liveness::BridgeLiveness::acquire(peer.path(), None).unwrap();
 
-    let result = release_covers_with(
-        service.path(),
-        &[peer.path().to_path_buf()],
-        || panic!("the release must never run while a bridge instance is live"),
-        || {},
-    );
+    let result = release_covers_with(service.path(), &[peer.path().to_path_buf()], || {
+        panic!("the release must never run while a bridge instance is live")
+    });
 
     result.expect_err("a bridge alive in a peer state dir must refuse the release too");
 }
@@ -311,21 +308,16 @@ fn release_covers_locks_a_peer_state_dir_that_is_not_there_yet() {
     let service = tempfile::tempdir().unwrap();
     let absent = service.path().join("no-such-user").join("state");
 
-    let result = release_covers_with(
-        service.path(),
-        std::slice::from_ref(&absent),
-        || {
-            assert!(
-                crate::liveness::BridgeLiveness::try_acquire(&absent, None)
-                    .unwrap()
-                    .is_none(),
-                "a bridge starting under an account with no state dir yet must contend on the \
+    let result = release_covers_with(service.path(), std::slice::from_ref(&absent), || {
+        assert!(
+            crate::liveness::BridgeLiveness::try_acquire(&absent, None)
+                .unwrap()
+                .is_none(),
+            "a bridge starting under an account with no state dir yet must contend on the \
                  same lock, not find it free"
-            );
-            Ok(Clearance::proven())
-        },
-        || {},
-    );
+        );
+        Ok(Clearance::proven())
+    });
 
     assert!(result.is_ok(), "{result:?}");
 }
@@ -344,12 +336,7 @@ fn release_covers_leaves_every_peer_tree_it_provisioned() {
     let profile = service.path().join("no-such-user");
     let peer = profile.join("state");
 
-    let result = release_covers_with(
-        service.path(),
-        std::slice::from_ref(&peer),
-        || Ok(Clearance::proven()),
-        || {},
-    );
+    let result = release_covers_with(service.path(), std::slice::from_ref(&peer), || Ok(Clearance::proven()));
 
     assert!(result.is_ok(), "{result:?}");
     assert!(
@@ -361,9 +348,14 @@ fn release_covers_leaves_every_peer_tree_it_provisioned() {
 }
 
 /// A peer path can run through a symlink — a state dir relocated onto a volume
-/// that is not mounted at uninstall time, or a redirected Windows profile. Such
-/// a link is not this call's to touch: `remove_dir_all` does not follow one, it
-/// removes the link itself, destroying the relocation.
+/// that is not mounted at uninstall time, or a redirected Windows profile.
+///
+/// A tripwire, by construction: there is no removal code for it to reach, and
+/// that is the property. It catches the shape that was there before — an
+/// existence probe that follows links (`try_exists`) reads a dangling one as
+/// absent, names it as a level this call is about to create, and hands it to a
+/// `remove_dir_all` that does NOT follow links and so removes the link itself,
+/// one level above anything Hole owns.
 #[cfg(unix)]
 #[skuld::test]
 fn release_covers_never_removes_a_symlink_on_a_peer_path() {
@@ -372,12 +364,9 @@ fn release_covers_never_removes_a_symlink_on_a_peer_path() {
     let link = base.path().join("profile");
     std::os::unix::fs::symlink(base.path().join("volume-not-mounted"), &link).unwrap();
 
-    let result = release_covers_with(
-        service.path(),
-        &[link.join("hole").join("state")],
-        || Ok(Clearance::proven()),
-        || {},
-    );
+    let result = release_covers_with(service.path(), &[link.join("hole").join("state")], || {
+        Ok(Clearance::proven())
+    });
 
     assert!(result.is_ok(), "{result:?}");
     assert!(
@@ -387,8 +376,8 @@ fn release_covers_never_removes_a_symlink_on_a_peer_path() {
     );
 }
 
-/// The other side of that sweep: only what this call made goes. A peer dir
-/// that was already there belongs to the account that owns it, and its
+/// The same rule from the other side, and the one that was never in doubt: a
+/// peer dir that was already there belongs to the account that owns it, and its
 /// crash-recovery records are that bridge's, not this call's to delete.
 #[skuld::test]
 fn release_covers_leaves_a_peer_state_dir_that_was_already_there() {
@@ -397,12 +386,7 @@ fn release_covers_leaves_a_peer_state_dir_that_was_already_there() {
     let record = peer.path().join("bridge-routes.json");
     std::fs::write(&record, b"{}").unwrap();
 
-    let result = release_covers_with(
-        service.path(),
-        &[peer.path().to_path_buf()],
-        || Ok(Clearance::proven()),
-        || {},
-    );
+    let result = release_covers_with(service.path(), &[peer.path().to_path_buf()], || Ok(Clearance::proven()));
 
     assert!(result.is_ok(), "{result:?}");
     assert!(
@@ -426,7 +410,7 @@ fn release_covers_does_not_refuse_against_its_own_guard() {
         peer.path().to_path_buf(),
     ];
 
-    let result = release_covers_with(service.path(), &peers, || Ok(Clearance::proven()), || {});
+    let result = release_covers_with(service.path(), &peers, || Ok(Clearance::proven()));
 
     assert!(
         result.is_ok(),
@@ -482,89 +466,38 @@ fn release_covers_disarms_the_kill_switch_on_a_confirmed_release() {
     );
 }
 
-/// The release provisions a state dir on a host that never ran a bridge (the
-/// liveness lock and the target write both create what they touch), and neither
-/// platform's `uninstall()` removes it. Purging is the last step and runs only
-/// once nothing is left that needs the directory.
+/// The release writes records; it deletes none. `scripts/network-reset.py` —
+/// the out-of-band escape, whose whole reason to exist is a host with no
+/// working bridge — reads `bridge-routes.json` and `bridge-dns{,.superseded}
+/// .json` straight out of `service_state_dir()`, and `plugin_recovery`'s record
+/// may be deleted only by something that has accounted for every plugin in it.
+/// An uninstall is the one moment the in-band escapes are already gone:
+/// deleting these would leave a leaked bypass route, a rewritten adapter's DNS
+/// and orphaned plugin processes on the host with the only record of how to
+/// undo them destroyed by the uninstall itself.
 #[skuld::test]
-fn release_covers_purges_the_state_dir_only_after_a_confirmed_release() {
+fn release_covers_deletes_no_crash_recovery_record() {
+    const ESCAPE_RECORDS: [&str; 4] = [
+        "bridge-routes.json",
+        "bridge-dns.json",
+        "bridge-dns.superseded.json",
+        "bridge-plugins.json",
+    ];
     let dir = tempfile::tempdir().unwrap();
-    let purged = std::cell::Cell::new(false);
+    for name in ESCAPE_RECORDS {
+        std::fs::write(dir.path().join(name), b"{}").unwrap();
+    }
 
-    let refused = release_covers_with(
-        dir.path(),
-        &[],
-        || Err(std::io::Error::other("not elevated")),
-        || purged.set(true),
-    );
-    assert!(refused.is_err());
-    assert!(!purged.get(), "a failed release must leave the state it recorded off");
-
-    let released = release_covers_with(dir.path(), &[], || Ok(Clearance::proven()), || purged.set(true));
-    assert!(released.is_ok(), "{released:?}");
-    assert!(
-        purged.get(),
-        "a confirmed release owns the cleanup of the dir it created"
-    );
-}
-
-/// The purge runs while the liveness lock is still held, which is what makes it
-/// safe: a bridge blocked on that lock cannot be inside the directory yet, and
-/// by the time it wakes there is nothing left to delete. Released first, the
-/// purge would race that bridge and take its cover record with it.
-#[skuld::test]
-fn release_covers_purges_while_the_liveness_lock_is_still_held() {
-    let dir = tempfile::tempdir().unwrap();
-    let locked_during_purge = std::cell::Cell::new(false);
-
-    let result = release_covers_with(
-        dir.path(),
-        &[],
-        || Ok(Clearance::proven()),
-        || {
-            // The lock contends per open handle, so this probe answers against
-            // the release's OWN guard — held means the purge is inside it.
-            locked_during_purge.set(
-                crate::liveness::BridgeLiveness::try_acquire(dir.path(), None)
-                    .unwrap()
-                    .is_none(),
-            );
-        },
-    );
+    let result = release_covers_with(dir.path(), &[], || Ok(Clearance::proven()));
 
     assert!(result.is_ok(), "{result:?}");
-    assert!(
-        locked_during_purge.get(),
-        "the purge must run under the liveness lock, not after it is released"
-    );
-}
-
-/// The production purge, driven directly. It empties the directory but keeps
-/// the directory itself and the lock file inside it: it runs while that lock is
-/// held, and on Windows an open locked file cannot be deleted at all. A bridge
-/// that wakes on the release afterwards finds an empty state dir, which is what
-/// a fresh install looks like.
-#[skuld::test]
-fn purge_state_dir_empties_the_dir_but_keeps_the_lock_it_runs_under() {
-    let dir = tempfile::tempdir().unwrap();
-    let state = dir.path().join("state");
-    std::fs::create_dir_all(state.join("nested")).unwrap();
-    std::fs::write(state.join("nested").join("record.json"), "{}").unwrap();
-    std::fs::write(state.join("bridge-target.json"), "{}").unwrap();
-    let lock = state.join("bridge-liveness.lock");
-    std::fs::write(&lock, b"").unwrap();
-
-    purge_state_dir(&state);
-
-    assert!(
-        lock.exists(),
-        "the lock the purge runs under is not the purge's to delete"
-    );
-    assert!(state.exists(), "the directory holding that lock has to stay with it");
-    assert!(!state.join("bridge-target.json").exists(), "a moot record must go");
-    assert!(!state.join("nested").exists(), "a subtree of moot records must go too");
-
-    purge_state_dir(&dir.path().join("never-existed")); // a host that never had one
+    for name in ESCAPE_RECORDS {
+        assert!(
+            dir.path().join(name).exists(),
+            "{name} is what the out-of-band escape reads; the uninstall that makes it the only \
+             escape left must not be what deletes it"
+        );
+    }
 }
 
 // Peer state dirs -----------------------------------------------------------------------------------------------------
@@ -646,12 +579,9 @@ fn release_covers_reports_what_the_sweep_could_not_prove() {
     // sweep's verdict, not a bare `Ok`. Collapsing it here would put the
     // silent `Ok` of #1003 back one layer up from where it was removed.
     let dir = tempfile::tempdir().unwrap();
-    let clearance = release_covers_with(
-        dir.path(),
-        &[],
-        || Ok(unproven_clearance(&["lockdown boot-time block-all V4"])),
-        || {},
-    )
+    let clearance = release_covers_with(dir.path(), &[], || {
+        Ok(unproven_clearance(&["lockdown boot-time block-all V4"]))
+    })
     .expect("an unproven clearance is not a failure");
 
     assert!(!clearance.is_proven());

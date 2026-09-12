@@ -1482,22 +1482,21 @@ re-provisioned at later boots at all. Both need a reboot-capable elevated lane
 that does not exist (see #1010). The design holds under either answer rather
 than picking one.
 
-A confirmed release owns the cleanup of the state dir it needed
-(`cutover::purge_state_dir`): recording the target `Off` provisions
-`service_state_dir()` even on a host that never ran a bridge, and neither
-platform's `uninstall()` removes it. Best-effort — a leftover file is litter,
-not a stranded host — and it never runs on a major upgrade, which needs the
-intent it holds.
-
-It runs **inside** the liveness lock, and that is what makes it safe rather than
-the same hazard as the peer trees above: a bridge blocked on the lock cannot
-have written anything yet, so there is nothing of its to delete, and by the time
-the drop wakes it the purge is over. So it empties the directory rather than
-removing it, sparing the lock file and the directory holding it — on Windows an
-open locked file cannot be deleted at all, and on Unix it can, which would leave
-the woken bridge holding an exclusion on an unlinked inode with its directory
-gone out from under its writes. What that bridge finds instead is an empty state
-dir, which is what a fresh install looks like.
+**The release deletes no file, anywhere** — not a peer tree, and not the
+service's own state dir. Its records are not the release's to take:
+`scripts/network-reset.py`, the out-of-band escape for a host with no working
+bridge, reads `bridge-routes.json` and `bridge-dns{,.superseded}.json` out of
+`service_state_dir()` to undo a leaked bypass route or a rewritten adapter's
+DNS, and `bridge-plugins.json` may be deleted only by something that has
+accounted for every plugin in it. An uninstall is the moment those become the
+*only* escape — deleting them there would leave the leak on the host with the
+record of how to undo it destroyed by the uninstall itself, which is #1003's own
+end state one layer down. Nor is the directory itself the release's:
+`install()` pre-creates it on both platforms, so the only host where
+`try_acquire` provisions it is one that never installed — and what stays there
+is an empty `hole/state`, the same litter the peers keep. What the release
+leaves on a host that did install is `bridge-target.json` reading `Off` and
+`bridge-lockdown.json` disarmed, which is what a later start should read.
 
 A major upgrade skips the release entirely (`NOT UPGRADINGPRODUCTCODE`, and
 `bridge uninstall --keep-covers` for the service teardown that must still run):
@@ -1656,11 +1655,16 @@ Disclosed residuals:
 1. Locking those dirs leaves them behind. `try_acquire` creates what it locks,
    so an uninstall provisions an empty `.../hole/state` holding a
    `bridge-liveness.lock` on every account that never ran a bridge, and neither
-   platform's `uninstall()` removes it. Cleaning it up is what is refused, not
-   what was overlooked: the only moment to do it is after the peer locks are
-   released, which is the exact moment a bridge blocked on one of them wakes and
-   starts writing its own cover record there. Deleting nothing is always safe;
-   deleting the wrong thing during an uninstall has no in-band recovery.
+   platform's `uninstall()` removes it. On Windows the peer set keeps a
+   `ProfileList` entry whose directory is **not** on disk
+   (`ProfileEntry::Absent` — the probe is not the judge of whether the registry
+   is lying), so the tree can be conjured where no profile exists at all; what
+   the User Profile Service makes of that at the next logon is not measured
+   here. Cleaning any of it up is what is refused, not what was overlooked: the
+   only moment to do it is after the peer locks are released, which is the exact
+   moment a bridge blocked on one of them wakes and starts writing its own cover
+   record there. Deleting nothing is always safe; deleting the wrong thing
+   during an uninstall has no in-band recovery.
 
 1. A stop that never returns is not covered at all. `platform::os::stop` waits
    on a real SCM `STOPPED` callback with no bound, and `ProxyManager`'s

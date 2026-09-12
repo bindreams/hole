@@ -296,8 +296,12 @@ fn a_bootout_records_what_launchd_said_above_the_default_filter() {
         "the bootout's record must clear the default `info` filter, or a refused uninstall \
          explains itself to nobody; captured: {captured:?}"
     );
+    // The field, not launchd's wording: `bootout` answers different text for
+    // different domain forms, and pinning today's sentence buys nothing the
+    // line above does not already prove.
     assert!(
-        captured.contains("Boot-out failed"),
-        "launchd's own words are what the record is for; captured: {captured:?}"
+        captured.contains("stderr=") && !captured.contains("stderr=\"\""),
+        "launchd's own words are what the record is for, so its stderr must be in it; \
+         captured: {captured:?}"
     );
 }

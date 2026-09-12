@@ -24,10 +24,7 @@ use tun_engine::exclusive::Exclusive;
 
 /// Lock filename, alongside `bridge-target.json` in the same root-owned
 /// state directory. Never itself holds any state.
-///
-/// `pub(crate)` for one reader: `cutover::purge_state_dir` empties that
-/// directory from inside this lock and has to know which entry IS the lock.
-pub(crate) const LOCK_FILE_NAME: &str = "bridge-liveness.lock";
+const LOCK_FILE_NAME: &str = "bridge-liveness.lock";
 
 /// A held claim that "a bridge is running", for as long as this value lives.
 pub struct BridgeLiveness(#[allow(dead_code)] Exclusive);

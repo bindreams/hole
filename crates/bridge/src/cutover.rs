@@ -226,7 +226,6 @@ pub fn release_covers() -> std::io::Result<Clearance> {
         // through. `reconciler_tests.rs`'s sanctioned-caller guard matches both
         // forms so this site is visible to it.
         || tun_engine::routing::failclosed::release_all(&state_dir).map_err(std::io::Error::other),
-        || purge_state_dir(&state_dir),
     )
 }
 
@@ -356,68 +355,8 @@ fn other_account_state_dirs() -> Vec<PathBuf> {
     }
 }
 
-/// Empty the service state dir once the release has fully succeeded. The
-/// product is on its way out and every file under it has just been made moot —
-/// including the ones this very call had to create to record the target off on
-/// a host that never ran a bridge. Best-effort: a leftover file is litter, not
-/// a stranded host.
-///
-/// It takes the crash-recovery records (`bridge-{routes,dns,plugins}.json`)
-/// with it. Those are already unreachable at this point — the sweep that reads
-/// them only ever runs from a bridge start, and there is no next start.
-///
-/// Two things it deliberately does NOT remove: the liveness lock, and the
-/// directory holding it. This runs from inside that lock (see
-/// [`release_covers_with`]), which is the whole reason it is safe — a bridge
-/// blocked on the lock cannot have written anything yet, and by the time the
-/// release wakes it there is nothing here left to delete. Unlinking the lock
-/// itself would undo that: on Windows an open locked file cannot be deleted at
-/// all, and on Unix it can, which would leave the woken bridge holding an
-/// exclusion on an unlinked inode and its directory gone out from under its
-/// writes. What the woken bridge finds instead is an empty state dir, which is
-/// what a fresh install looks like.
-fn purge_state_dir(state_dir: &Path) {
-    let entries = match std::fs::read_dir(state_dir) {
-        Ok(entries) => entries,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
-        Err(e) => {
-            tracing::warn!(error = %e, "covers released, but the bridge state directory could not be read");
-            return;
-        }
-    };
-    let mut removed = 0usize;
-    for entry in entries {
-        let entry = match entry {
-            Ok(entry) => entry,
-            Err(e) => {
-                tracing::warn!(error = %e, "covers released, but a bridge state entry could not be listed");
-                continue;
-            }
-        };
-        if entry.file_name() == crate::liveness::LOCK_FILE_NAME {
-            continue;
-        }
-        let path = entry.path();
-        // `symlink_metadata`, not `metadata`: a symlink is removed as a link,
-        // never descended into, so a link planted in this directory cannot
-        // steer the removal outside it.
-        let is_dir = matches!(std::fs::symlink_metadata(&path), Ok(m) if m.is_dir());
-        let outcome = if is_dir {
-            std::fs::remove_dir_all(&path)
-        } else {
-            std::fs::remove_file(&path)
-        };
-        match outcome {
-            Ok(()) => removed += 1,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => tracing::warn!(error = %e, "covers released, but a bridge state entry could not be removed"),
-        }
-    }
-    tracing::info!(removed, "bridge state directory emptied");
-}
-
-/// `release_covers`' ordering, with the release and the state purge injected so
-/// tests can drive the cannot-release path without touching the host firewall.
+/// `release_covers`' ordering, with the release injected so tests can drive the
+/// cannot-release path without touching the host firewall.
 ///
 /// `peers` are the other state dirs a bridge could be alive in; a lock held in
 /// any of them refuses the release just as the service's own does. Every peer
@@ -438,11 +377,21 @@ fn purge_state_dir(state_dir: &Path) {
 /// is the end state this whole path exists to prevent, and it has no in-band
 /// recovery; an empty directory has no consequence at all. The choice is where
 /// to pay, never whether to lock.
+///
+/// The same answer covers the service's own state dir, which this does NOT
+/// clean up either. Its records are not this call's: `bridge-routes.json` and
+/// `bridge-dns{,.superseded}.json` are what `scripts/network-reset.py` reads to
+/// undo a leaked bypass route or a rewritten adapter's DNS, and
+/// `bridge-plugins.json` may be deleted only by something that has accounted
+/// for every plugin in it. An uninstall is the moment those become the ONLY
+/// escape. Nor is the directory itself this call's: `install()` pre-creates it
+/// on both platforms, so the only host where `try_acquire` provisions it is one
+/// that never installed — and what stays there is an empty `hole/state`, the
+/// same litter the peers keep.
 fn release_covers_with(
     state_dir: &Path,
     peers: &[PathBuf],
     release: impl FnOnce() -> std::io::Result<Clearance>,
-    purge: impl FnOnce(),
 ) -> std::io::Result<Clearance> {
     let Some(liveness) = crate::liveness::BridgeLiveness::try_acquire(state_dir, None)? else {
         return Err(std::io::Error::other(
@@ -488,13 +437,6 @@ fn release_covers_with(
         tracing::warn!(error = %e, "covers released, but the legacy lockdown intent could not be recorded off");
     }
 
-    // Purge INSIDE the lock, not after it. A bridge blocked on this lock is
-    // released by the drop below and starts writing immediately; anything the
-    // purge deleted afterwards would be that bridge's, up to and including the
-    // record of a cover it had just engaged. Under the lock there is nothing of
-    // its to delete yet. `purge_state_dir` leaves the lock file itself for the
-    // same reason it can: the lock is what it runs under.
-    purge();
     drop(held);
     Ok(clearance)
 }
