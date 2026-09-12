@@ -1301,12 +1301,15 @@ release into a loud refusal rather than a silent desync.
 The lock is per-state-dir but the covers are not — on Windows they are keyed on
 compile-time GUIDs and swept machine-wide — so the refusal probes the service
 state dir *and* the per-user dirs `cli.rs` gives foreground and elevated
-non-`--service` runs (`cutover::peer_state_dirs`). A peer dir that does not
-exist is skipped, not probed — `try_acquire` creates what it locks — and so is
-one already probed: the lock contends per open handle, not per owning process,
-so a path probed twice would refuse against the call's own guard, and duplicates
-are ordinary (an un-elevated run resolves `default_state_dir` and the real
-user's dir to one path).
+non-`--service` runs (`cutover::peer_state_dirs`). Every one of them is locked,
+including a dir that is not there yet — `try_acquire` creates what it locks, and
+a peer left unlocked because it looked absent is a peer nothing excludes, which
+is the whole desync again on an account that had not run a bridge until
+mid-release. The dirs that costs are removed on the way out
+(`cutover::provisioned_root`). A path already probed IS skipped: the lock
+contends per open handle, not per owning process, so probing one twice would
+refuse against the call's own guard, and duplicates are ordinary (an un-elevated
+run resolves `default_state_dir` and the real user's dir to one path).
 
 ##### Stop, deregister, release — and what gates what
 
@@ -1329,7 +1332,17 @@ are the whole of #1003's second half:
   platform `uninstall()`s enforce the same rule at their own level, and
   `platform::os::ensure_stopped` is the stop that tolerates a host with nothing
   registered (launchd's `bootout`, not `stop`'s SIGTERM — the plist sets
-  `KeepAlive`).
+  `KeepAlive`). It asks nothing first on either platform: it issues the stop and
+  classifies **that act's own** result by cause. A probe answers about the
+  moment it was taken, and the row can leave the service manager in between — a
+  concurrent uninstall attempt, an operator's own bootout, the daemon exiting
+  and being reaped — after which the act fails over a bridge that is provably
+  stopped and the uninstall refuses to deregister it. Windows classifies the
+  failed `stop()` (`windows::stop_error_is_absent`, which spans all three
+  layers the stop reaches SCM through); macOS asks launchd what it has *after*
+  the bootout (`macos::ensure_stopped_verdict`), because launchd's exit code
+  for "no such job" differs by subcommand and is not a classification to build
+  on.
 
 Steps do not short-circuit each other and the error names all of them; an early
 `?` on the release swallowed the context that explains why it refused.
@@ -1439,6 +1452,16 @@ fold and so naming `BootTime` by construction; that exclusion is anchored to
 where `fn proves_empty` actually is, so relocating the fold fails the guard
 instead of turning its own mention into a classification and letting an
 unclassified install pass in silence.
+
+What it matches is identifiers in **lexed** code (`proc-macro2`), not
+substrings: comments of every shape and string literals are gone before the
+scan, so prose cannot satisfy it, and an alias (`use ... FWPM_FILTER_FLAG_BOOTTIME as BOOT_FLAG`) cannot hide from it — the import names the symbol in full and the
+install half spans every production source. The disclosed residual is a flag
+that names no symbol at all: `FWPM_FILTER_FLAGS(0x4)` written as raw bits
+installs a boot-time filter nothing here can see. Closing that needs a
+constructor that cannot hand out the bits without a `KeyLifetime`, which is
+#1010's to land — introducing it now would put both symbols into production
+code and leave this guard permanently satisfied.
 
 The in-process escapes (`disengage_lockdown`, `ProxyManager::turn_lockdown_off`,
 the tray's Unblock) share the same boot-time blind spot and deliberately do

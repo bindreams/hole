@@ -1149,12 +1149,10 @@ def test_keep_covers_comment_names_the_only_way_back() -> None:
         )
 
 
-# The shape both guards above missed while they searched whole comments: a
-# qualified, remedy-naming paragraph followed by a paragraph that claims
-# neither. The last clause is hole.wxs:301's pre-PR wording verbatim — commit
-# c1b790b1 deleted it because it sends a maintainer weighing Return="check" to
-# a command that removes nothing. Restoring only that line left both guards
-# green.
+# The shape both guards above missed: a qualified, remedy-naming paragraph
+# followed by one that claims neither. A guard scoped to the whole comment
+# lets an earlier paragraph's qualifier or remedy silently answer for a later
+# paragraph that names netsh/HOLE_KEEP_COVERS on its own.
 _QUALIFIED_PARAGRAPH = """\
          `netsh wfp` is diagnostics-only — capture, dump, help, set, show, and
          no delete verb — and removing a WFP filter takes an FWPM call, whose
