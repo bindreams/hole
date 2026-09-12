@@ -261,3 +261,43 @@ fn plist_does_not_set_standard_paths() {
         "plist must not set StandardOutPath — the FD redirect already captures stdout",
     );
 }
+
+/// The bootout's own output is the only account of WHY a stop was refused, and
+/// `ensure_stopped_verdict(Loaded)` reports that refusal with no cause of its
+/// own. The bridge's default filter is a global `info`, so a record below it
+/// never reaches `bridge.log` and the operator gets a failed uninstall with
+/// nothing to act on.
+#[skuld::test]
+fn a_bootout_records_what_launchd_said_above_the_default_filter() {
+    use crate::test_support::log_capture::VecWriter;
+    use tracing_subscriber::fmt;
+    use tracing_subscriber::layer::{Layer, SubscriberExt};
+
+    let writer = VecWriter::new();
+    let subscriber = tracing_subscriber::registry().with(
+        fmt::layer()
+            .with_writer(writer.clone())
+            .with_ansi(false)
+            .with_filter(tracing_subscriber::filter::LevelFilter::INFO),
+    );
+    let label = format!("user/{}/com.hole.bridge.absent-by-construction", unsafe {
+        libc::getuid()
+    });
+
+    let code = {
+        let _guard = garter::tracing_test::set_default_in_current_thread(subscriber);
+        launchctl_status("bootout", &["bootout", &label]).expect("launchctl is present on every macOS host")
+    };
+
+    assert!(!matches!(code, Some(0)), "the label is absent by construction");
+    let captured = writer.snapshot_string();
+    assert!(
+        captured.contains("launchctl bootout finished"),
+        "the bootout's record must clear the default `info` filter, or a refused uninstall \
+         explains itself to nobody; captured: {captured:?}"
+    );
+    assert!(
+        captured.contains("Boot-out failed"),
+        "launchd's own words are what the record is for; captured: {captured:?}"
+    );
+}

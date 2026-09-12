@@ -93,9 +93,19 @@ fn run_launchctl(label: &str, args: &[&str]) -> std::io::Result<std::process::Ou
 /// Run `launchctl` with captured output and hand back its exit status WITHOUT
 /// judging it, for the one caller whose non-zero status is not yet a failure.
 /// `Ok(None)` is launchctl killed by a signal; `Err` is a spawn failure.
+///
+/// The record is `info!`, which the bridge's default global `info` filter lets
+/// through, because on the one path that fails an uninstall loud —
+/// [`ensure_stopped_verdict`] over [`Registration::Loaded`] — launchd's own
+/// words ("Boot-out failed: 1: Operation not permitted") are the ONLY account
+/// of why, and the error this function's caller raises carries none of its own.
+/// One level for every outcome, not a severity keyed to the exit code: a
+/// non-zero bootout is a refusal or an absent job and the code does not say
+/// which — that is the entire reason this function does not judge. Severity is
+/// [`ensure_stopped_verdict`]'s, which knows the cause.
 fn launchctl_status(label: &str, args: &[&str]) -> std::io::Result<Option<i32>> {
     let output = std::process::Command::new("launchctl").args(args).output()?;
-    tracing::debug!(
+    info!(
         stdout = %String::from_utf8_lossy(&output.stdout),
         stderr = %String::from_utf8_lossy(&output.stderr),
         status = ?output.status,
