@@ -1545,23 +1545,16 @@ On Windows and Linux it then returns `Handled(false)` so the OS default path
 (WER / core dump) still runs. **On macOS it never returns** — it `_exit(70)`s,
 for every fault class, every attach kind and every build, so a macOS crash
 produces the marker and **neither an `.ips` nor a minidump**. That cost was
-stated and accepted on #842 under a standing ruling — no part of Hole should
-hang the process even sometimes, a diagnostics crate included — because
-everything that would run after the callback returns is unbounded, and
-because an allocating callback was directly observed to deadlock against a
-Mach-suspended thread. It is a decision, not a gap: do not restore either
-half without reading `crates/tombstone/src/crash.rs`'s module doc, which is
-the canonical record (mechanism, the `sample(1)` evidence, the alternatives
-already built and measured, and what would legitimately reopen it). Two
-source-scanning guards in `crash_tests.rs` hold that callback's shape —
-`macos_on_crash_terminates_unconditionally` (no cfg, feature or `kind` to
-branch on) and `macos_on_crash_calls_nothing_that_can_allocate` (nothing but
-the marker write and the `_exit`); the second exists because the deadlock
-needs CI-like allocation pressure, so the runtime `crash_marker_*` tests stay
-green on an allocating callback. A hung bridge still holds the TUN device and
-its routes and never reaches its own cleanup, so a lost `.ips` is much the
-cheaper loss; unclean shutdown is detected by the `bridge-*.json` state files
-regardless.
+accepted on #842: no part of Hole should hang the process, even sometimes. Do
+not restore either half without reading `crates/tombstone/src/crash.rs`'s
+module doc, which is the canonical record. Two source-scanning guards in
+`crash_tests.rs` hold that callback's shape, because the deadlock needs
+CI-like allocation pressure and the runtime `crash_marker_*` tests stay green
+without it: `macos_on_crash_terminates_unconditionally`, and
+`macos_on_crash_calls_nothing_that_can_allocate`, which scans the whole
+handler path transitively — `on_crash`, the marker write and every helper
+below it — since an allocation one frame down deadlocks exactly as one in the
+callback does.
 
 `tombstone::sweep(log_dir)` runs at the next start of the same kind, emits a
 `tracing::error!(target: "crash", …)`, and deletes the marker. Markers land in

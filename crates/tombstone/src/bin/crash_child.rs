@@ -47,7 +47,13 @@ fn main() {
     // milliseconds of this call.
     let kind: &'static str = match std::env::var("TOMBSTONE_TEST_ATTACH_KIND") {
         Ok(k) => Box::leak(k.into_boxed_str()),
-        Err(_) => "crash-child",
+        Err(std::env::VarError::NotPresent) => "crash-child",
+        // Set but unreadable is a test-authoring bug, not the default case:
+        // attaching under "crash-child" here would let the run look like it
+        // proved something about a kind it never used.
+        Err(e @ std::env::VarError::NotUnicode(_)) => {
+            panic!("TOMBSTONE_TEST_ATTACH_KIND is set to a value that is not valid Unicode: {e}")
+        }
     };
     tombstone::attach(kind, &log_dir);
 

@@ -103,14 +103,9 @@ before editing; the sections linked below are the authoritative source.
   bound. →
   [CONTRIBUTING.md#bridge-cancellation-contract](CONTRIBUTING.md#bridge-cancellation-contract)
 - **Native-crash observability.** The `tombstone` crate writes a signal-safe
-  crash marker; the next start of the same kind sweeps it. It is observability
-  only, so on macOS `on_crash` **never returns** — it `_exit(70)`s once the
-  marker is durable, unconditionally, because crash-handler's relay never
-  detaches, its callback runs with every other thread Mach-suspended (so
-  allocating there can deadlock), and the crash reporter cannot be bounded.
-  So a macOS crash yields the marker and **neither an `.ips` nor a minidump**
-  — an accepted cost, not a gap; `crates/tombstone/src/crash.rs`'s module doc
-  is the canonical record and the thing to read before restoring either. →
+  crash marker; the next start of the same kind sweeps it. On macOS
+  `on_crash` terminates the process instead of returning — see crash.rs's
+  module doc before touching either half. →
   [CONTRIBUTING.md#native-crash-observability-tombstone](CONTRIBUTING.md#native-crash-observability-tombstone)
 - **Route ownership.** Teardown and recovery delete only the `RouteId`s
   `bridge-routes.json` records as installed. On macOS no delete-side qualifier

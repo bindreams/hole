@@ -8,13 +8,17 @@ use crate::{crash_child_bin, scrub_reexec_env, wait_bounded};
 use std::time::Duration;
 
 fn spawn_double(env_var: &str) -> std::process::Child {
+    spawn_double_with_stdout(env_var, std::process::Stdio::null())
+}
+
+fn spawn_double_with_stdout(env_var: &str, stdout: std::process::Stdio) -> std::process::Child {
     let mut cmd = std::process::Command::new(crash_child_bin());
     // Scrub first, THEN set `env_var` — scrubbing after would remove the
     // very double this call is trying to select.
     scrub_reexec_env(&mut cmd);
     cmd.env(env_var, "1")
         .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
+        .stdout(stdout)
         .stderr(std::process::Stdio::null())
         .spawn()
         .expect("spawn crash_child test double")
@@ -75,5 +79,58 @@ fn wait_bounded_panics_with_clear_message_on_timeout() {
     assert!(
         msg.contains("we killed it: code=Some(1)"),
         "expected TerminateProcess termination proof in message: {msg}"
+    );
+}
+
+// `wait_bounded`'s child must be killed and reaped on EVERY exit from its
+// body, not just the two it returns from. wait-timeout 0.2.1 panics in four
+// places inside `wait_timeout` itself — three of them holding its
+// process-global `Mutex<StateMap>`, which the panic then poisons, so every
+// later call in the process panics at the lock before its child is
+// registered anywhere. `std::process::Child::drop` neither kills nor reaps,
+// and this suite's stalled double is `loop { park() }`, so each such unwind
+// would leave a child that outlives the test binary on the runner.
+//
+// The panic is raised directly here rather than provoked out of
+// `wait_timeout`: what must hold is that ANY unwind through the guarded
+// region ends with the child dead and reaped, and wait-timeout's own panic
+// sites are not reachable on demand.
+#[skuld::test]
+fn an_unwind_through_the_guard_kills_and_reaps_the_child() {
+    let mut child = spawn_double_with_stdout("TOMBSTONE_TEST_HANG_FOREVER", std::process::Stdio::piped());
+    let pid = child.id();
+    // The child's end of this pipe is closed by the OS when it dies, so
+    // reading it to EOF is a rendezvous on its death, not a poll.
+    let mut stdout = child.stdout.take().expect("piped stdout");
+
+    let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _guard = crate::ReapOnDrop::new(child);
+        panic!("models a panic unwinding out of wait_timeout");
+    }));
+    assert!(unwound.is_err(), "the region must have unwound");
+
+    // Reaped: this process no longer has such a child, which only the
+    // guard's own `wait()` can have made true. A still-running leak answers
+    // 0 instead, and an unreaped zombie answers `pid`.
+    #[cfg(unix)]
+    {
+        let mut status = 0i32;
+        let r = unsafe { libc::waitpid(pid as i32, &mut status, libc::WNOHANG) };
+        let errno = std::io::Error::last_os_error().raw_os_error();
+        assert_eq!(
+            (r, errno),
+            (-1, Some(libc::ECHILD)),
+            "crash_child (pid {pid}) was not reaped by the guard: waitpid said ({r}, {errno:?})"
+        );
+    }
+
+    // Dead: every write end of the pipe is closed, and the child held the
+    // only one.
+    use std::io::Read;
+    let mut out = Vec::new();
+    stdout.read_to_end(&mut out).expect("read the child's stdout to EOF");
+    assert!(
+        out.is_empty(),
+        "the hang-forever double (pid {pid}) writes nothing: {out:?}"
     );
 }

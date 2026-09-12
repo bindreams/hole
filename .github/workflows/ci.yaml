@@ -384,12 +384,8 @@ jobs:
     # were reconstructed to. windows/amd64 has never been killed and its 38-run
     # sample still stands.
     #
-    # A separate re-enumeration of darwin/amd64 `test-hole` kills, run to
-    # confirm the crash_marker_abort hang's real incidence, found only 2 of
-    # 13 examined jobs actually match its signature; the rest are unrelated
-    # build/test slowness or the already-tracked e2e flake. The fix for that
-    # hang removes a real, confirmed-recurring cause of darwin/amd64 kills,
-    # but does not by itself establish whether 90 can now be lowered.
+    # crash_marker_abort was a confirmed, recurring cause of darwin/amd64
+    # kills — fixed in tombstone (#842); whether 90 can now drop is unmeasured.
     #
     # These are whole-JOB budgets, shared across build + verify + test. A slow
     # build therefore eats the test steps' headroom — which is exactly how #989

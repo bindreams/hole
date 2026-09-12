@@ -104,6 +104,50 @@ fn run_crash_child_with_attach_kind(class: &str, log_dir: &std::path::Path, atta
     wait_bounded(child, CHILD_WAIT_BOUND)
 }
 
+/// Owns a spawned `crash_child` for the whole of `wait_bounded` and kills +
+/// reaps it on EVERY exit from that body, `std::process::Child`'s own `Drop`
+/// doing neither. The path this exists for is a panic unwinding out of
+/// `wait_timeout` itself: wait-timeout 0.2.1 panics in four places inside
+/// that call, three of them while holding its process-global
+/// `Mutex<StateMap>`, which the panic then POISONS — so every later
+/// `wait_bounded` in the process panics at the lock too, before its child is
+/// registered anywhere. Each such unwind would otherwise strand a
+/// `loop { park() }` child that outlives the test binary on the runner.
+///
+/// `disarm` is for the arms that reaped the child themselves: once reaped,
+/// the pid is recyclable and must never be signalled again.
+#[cfg(feature = "crash-child")]
+struct ReapOnDrop {
+    child: std::process::Child,
+    reaped: bool,
+}
+
+#[cfg(feature = "crash-child")]
+impl ReapOnDrop {
+    fn new(child: std::process::Child) -> Self {
+        Self { child, reaped: false }
+    }
+
+    fn disarm(&mut self) {
+        self.reaped = true;
+    }
+}
+
+#[cfg(feature = "crash-child")]
+impl Drop for ReapOnDrop {
+    fn drop(&mut self) {
+        if self.reaped {
+            return;
+        }
+        // Best-effort by necessity: this runs while unwinding, with nothing
+        // left to report an error to. `kill()` on a child that already
+        // self-exited lands on a zombie and is a no-op, and `wait()` then
+        // reaps whichever status is the real one.
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
 /// Wait for `child` to exit, bounded by `bound`. Uses
 /// `wait_timeout::ChildExt::wait_timeout` — the sanctioned child-process-exit
 /// exception to the no-sleep/no-poll rule: `bound` is the failure bound
@@ -139,32 +183,33 @@ fn run_crash_child_with_attach_kind(class: &str, log_dir: &std::path::Path, atta
 /// then reaps the child's OWN exit status, not one our SIGKILL caused — see
 /// the `Ok(None)` arm below, which asserts accordingly.
 #[cfg(feature = "crash-child")]
-fn wait_bounded(mut child: std::process::Child, bound: std::time::Duration) -> std::process::Output {
+fn wait_bounded(child: std::process::Child, bound: std::time::Duration) -> std::process::Output {
     use wait_timeout::ChildExt;
 
-    let pid = child.id();
-    match child.wait_timeout(bound) {
-        Ok(Some(status)) => std::process::Output {
-            status,
-            stdout: Vec::new(),
-            stderr: Vec::new(),
-        },
+    // Every exit from here on is covered by the guard, including an unwind
+    // out of `wait_timeout` itself; the arms that reap the child themselves
+    // disarm it.
+    let mut guard = ReapOnDrop::new(child);
+    let pid = guard.child.id();
+    match guard.child.wait_timeout(bound) {
+        Ok(Some(status)) => {
+            // wait_timeout reaped it.
+            guard.disarm();
+            std::process::Output {
+                status,
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+            }
+        }
         Ok(None) => {
-            // Timed out from wait_timeout's own perspective — `child`'s pid
-            // is unreaped and therefore not recyclable (see doc comment
-            // above), so `kill()` cannot land on a process the OS has
-            // recycled. It CAN land on a child that already self-exited but
-            // is sitting unreaped as a zombie (the doc comment above covers
-            // the race that produces one): `kill()` on a zombie is a
-            // harmless no-op, so the following `wait()` then reaps the
-            // child's OWN exit status rather than one our SIGKILL caused.
-            // SIGKILL is still the right signal to send on the belief the
-            // child is live: it terminates a process even mid-exception-
-            // handling (XNU cannot mask SIGKILL). Either way `wait()` after
-            // `kill()` reaps `child`, so this call always ends with a
-            // terminal status to report, never a still-unreaped child.
-            child.kill().expect("SIGKILL a timed-out crash_child");
-            let status = child.wait().expect("reap crash_child after SIGKILL");
+            // kill() here is safe even if `child` already self-exited into a
+            // zombie (doc comment above) — it's a no-op, and wait() below
+            // reaps the real exit status.
+            guard.child.kill().expect("SIGKILL a timed-out crash_child");
+            let status = guard.child.wait().expect("reap crash_child after SIGKILL");
+            // Reaped above, so the pid is recyclable from here: the guard
+            // must not signal it again on the way out through the panic.
+            guard.disarm();
             // kill()-then-wait() proves only that THIS Child reached SOME
             // reaped terminal state — not which of the two races above
             // produced it, so name the outcome rather than assume the
@@ -209,11 +254,8 @@ fn wait_bounded(mut child: std::process::Child, bound: std::time::Duration) -> s
         }
         Err(e) => {
             // wait_timeout() itself failed (not a timeout) — `child` may
-            // still be running with no disposition recorded anywhere.
-            // Best-effort kill + reap before panicking so this arm can't
-            // leak an orphaned, still-running crash_child.
-            let _ = child.kill();
-            let _ = child.wait();
+            // still be running with no disposition recorded anywhere. Left
+            // ARMED: the guard kills and reaps it as this panic unwinds.
             panic!("crash_child (pid {pid}): wait_timeout() failed: {e}")
         }
     }
@@ -280,7 +322,9 @@ fn assert_macos_terminated_by_tombstone(output: &std::process::Output, case: &st
 
 /// Windows/Linux keep the OS default disposition, so there is no controlled
 /// exit status to assert. Taking `output` anyway keeps every call site
-/// uniform (and consumes it, so nothing needs an `unused` shim).
+/// uniform, and the call site's BORROW of it is what reads `output` on
+/// non-macOS builds — ownership stays with the caller, so nothing needs an
+/// `unused` shim.
 #[cfg(all(feature = "crash-child", not(target_os = "macos")))]
 fn assert_macos_terminated_by_tombstone(_output: &std::process::Output, _case: &str) {}
 
@@ -336,6 +380,75 @@ fn crash_marker_abort_under_a_foreign_attach_kind_terminates_the_same_way() {
     let output = run_crash_child_with_attach_kind("abort", dir.path(), "test");
     assert_marker(dir.path(), "test", true);
     assert_macos_terminated_by_tombstone(&output, "abort under kind=test");
+}
+
+// `TOMBSTONE_TEST_ATTACH_KIND` set to something that is not valid Unicode is
+// a DIFFERENT thing from it being unset: the variable was provided and could
+// not be read, which is a test-authoring bug. Folding it into the
+// "not present" default would attach under `"crash-child"` and let the run
+// look like it proved something about a kind it never used, so the child
+// must die on it instead. Every other env read in that bin fails loudly the
+// same way.
+#[cfg(feature = "crash-child")]
+#[skuld::test]
+fn a_non_unicode_attach_kind_fails_loudly_instead_of_defaulting_to_crash_child() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut cmd = std::process::Command::new(crash_child_bin());
+    scrub_reexec_env(&mut cmd);
+    let mut child = cmd
+        .env("TOMBSTONE_CRASH_CLASS", "abort")
+        .env("TOMBSTONE_LOG_DIR", dir.path())
+        .env("TOMBSTONE_TEST_ATTACH_KIND", non_unicode_attach_kind())
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn crash_child");
+    let mut stderr = child.stderr.take().expect("piped stderr");
+    let output = wait_bounded(child, CHILD_WAIT_BOUND);
+
+    assert!(
+        !output.status.success(),
+        "child must not succeed on an unreadable attach kind: {:?}",
+        output.status
+    );
+    let mut msg = String::new();
+    std::io::Read::read_to_string(&mut stderr, &mut msg).expect("read the child's stderr to EOF");
+    assert!(
+        msg.contains("TOMBSTONE_TEST_ATTACH_KIND"),
+        "the failure must name the variable that could not be read: {msg}"
+    );
+    // It must have died BEFORE attaching: a marker under any kind means it
+    // fell through into the default and ran the crash class regardless.
+    let markers: Vec<std::path::PathBuf> = std::fs::read_dir(dir.path())
+        .expect("read log dir")
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .map(|n| n.ends_with(".marker"))
+                .unwrap_or(false)
+        })
+        .collect();
+    assert!(markers.is_empty(), "no crash marker may be written: {markers:?}");
+}
+
+/// A `TOMBSTONE_TEST_ATTACH_KIND` value the OS accepts and `String` cannot
+/// hold, so `std::env::var` yields `VarError::NotUnicode`.
+#[cfg(all(feature = "crash-child", unix))]
+fn non_unicode_attach_kind() -> std::ffi::OsString {
+    // A lone 0xFF is not valid UTF-8 in any position.
+    use std::os::unix::ffi::OsStringExt;
+    std::ffi::OsString::from_vec(vec![b'k', 0xff, b'd'])
+}
+
+/// Windows twin of the above: an unpaired high surrogate is valid WTF-16 —
+/// which is what the environment block stores — and not valid UTF-16.
+#[cfg(all(feature = "crash-child", windows))]
+fn non_unicode_attach_kind() -> std::ffi::OsString {
+    use std::os::windows::ffi::OsStringExt;
+    std::ffi::OsString::from_wide(&[0x006b, 0xd800, 0x0064])
 }
 
 // x86-only: integer divide-by-zero raises SIGFPE on x86, but is non-trapping on

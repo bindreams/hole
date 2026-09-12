@@ -46,13 +46,8 @@
 //! `_os_unfair_lock_lock_slow` → `__ulock_wait2` while a suspended thread
 //! sits inside `_xzm_malloc_large_huge` holding that lock.
 //!
-//! Weigh that against its history before reverting anything here. Three
-//! earlier causal stories for this hang were written into these comments in
-//! turn — a second `on_crash` invocation from `abort()`'s re-raise, a corpse
-//! path through XNU's asynchronous exception delivery, and XNU permanently
-//! blocking the second exception's delivery — and measurement falsified all
-//! three. The allocator deadlock is the only explanation that was ever seen
-//! rather than argued.
+//! The allocator deadlock is measured, not argued — it is the only causal
+//! theory for this hang that survived measurement.
 //!
 //! ## Three alternatives were built and measured
 //!
@@ -283,9 +278,21 @@ fn write_marker_signal_safe(state: &HandlerState, ctx: &crash_handler::CrashCont
         if let Ok(handle) = h {
             // `lpNumberOfBytesWritten` may be NULL only when `lpOverlapped`
             // is non-NULL; this handle is synchronous, so the out-param is
-            // mandatory even though nothing reads it.
-            let mut written = 0u32;
-            let _ = WriteFile(handle, Some(&buf[..n]), Some(&mut written), None);
+            // mandatory — and it is also what tells a full write from a
+            // short one. `CREATE_ALWAYS` means the marker file exists the
+            // moment the handle opens, so a partial transfer (a disk filling
+            // mid-write) would leave a TRUNCATED record that `parse_marker`
+            // reports as fact. Resume until the buffer is out; a hard error
+            // or a zero-byte transfer has nothing to resume from. Same loop
+            // as the Unix writer, same reason.
+            let mut total = 0usize;
+            while total < n {
+                let mut written = 0u32;
+                if WriteFile(handle, Some(&buf[total..n]), Some(&mut written), None).is_err() || written == 0 {
+                    break;
+                }
+                total += written as usize;
+            }
             let _ = CloseHandle(handle);
         }
     }
@@ -342,9 +349,56 @@ fn write_marker_signal_safe(state: &HandlerState, ctx: &crash_handler::CrashCont
             0o644,
         );
         if fd >= 0 {
-            libc::write(fd, buf.as_ptr() as *const libc::c_void, n);
+            write_all_signal_safe(&buf[..n], |p, len| libc::write(fd, p as *const libc::c_void, len));
             libc::close(fd);
         }
+    }
+}
+
+/// Write all of `buf` through `write`, resuming after a short transfer and
+/// retrying an EINTR that moved nothing. `O_TRUNC` means a marker file
+/// exists the moment `open` succeeds, so a single unchecked `write` leaves a
+/// TRUNCATED record on a short count — and `parse_marker` is deliberately
+/// tolerant of partial markers, so `sweep` would report the truncation as
+/// fact. On macOS this record is the only crash artifact there is.
+///
+/// Signal-safe: no allocation, no locks, one syscall per iteration. The loop
+/// is not a bounded retry — nothing counts attempts — it ends when the buffer
+/// is written, when `write` moves nothing (a 0 return has nothing to resume
+/// from), or on any error other than EINTR.
+///
+/// `write` is a seam only so the short-count and EINTR paths are drivable
+/// from a test; the production caller passes `write(2)` itself and the
+/// closure inlines away.
+#[cfg(unix)]
+fn write_all_signal_safe(buf: &[u8], mut write: impl FnMut(*const u8, usize) -> isize) {
+    let mut written = 0usize;
+    while written < buf.len() {
+        // SAFETY: `written < buf.len()` on entry, so the offset pointer is
+        // inside the allocation.
+        let r = write(unsafe { buf.as_ptr().add(written) }, buf.len() - written);
+        if r > 0 {
+            written += r as usize;
+        } else if r < 0 && errno() == libc::EINTR {
+            continue;
+        } else {
+            break;
+        }
+    }
+}
+
+/// `errno` for the calling thread. Async-signal-safe on both Unixes Hole
+/// builds: each exposes the thread-local through a pure accessor function
+/// (glibc/musl `__errno_location`, Darwin `__error`) that takes no lock and
+/// allocates nothing.
+#[cfg(unix)]
+fn errno() -> i32 {
+    unsafe {
+        #[cfg(target_os = "linux")]
+        let p = libc::__errno_location();
+        #[cfg(not(target_os = "linux"))]
+        let p = libc::__error();
+        *p
     }
 }
 
@@ -602,13 +656,8 @@ fn terminate_without_returning() -> ! {
 //  * The system crash reporter's involvement is not something this process
 //    can bound at all.
 //
-// Three alternatives to `_exit` were built and measured: detach from inside
-// the callback and let the reporter run (hangs on crash-handler's own lock),
-// restore the task exception ports by hand (changes nothing), and merely
-// stop allocating while still returning `Handled(false)` (20/20 clean, but
-// on an idle machine, and it leaves everything listed above unbounded).
-// Module doc has the measurements and their caveats; do not re-derive them
-// here.
+// Three alternatives to `_exit` were built and measured; module doc has them,
+// their caveats and their verdicts. Do not re-derive them here.
 //
 // MEASURED, 3 runs each of abort, segfault, stack_overflow, bus,
 // illegal_instruction and trap on darwin/arm64: every one exits 70 in under
