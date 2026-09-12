@@ -38,9 +38,42 @@ pub enum StateFile<T> {
     Absent,
     /// A file exists but could not be read, parsed, or matched the expected
     /// schema version. Treated as a cover to clear, never as absence.
-    Unusable,
+    ///
+    /// `pf_token` is whatever [`StateFile::unusable`] could still salvage from
+    /// the bytes, and carrying it is not a nicety: the reachable cause of this
+    /// variant is a VERSION skew, where `serde_json` produced a complete record
+    /// — token intact — and only the version check rejected it. Discarding the
+    /// record discards the only copy of the `pfctl -E` ticket in existence, and
+    /// the sweep that then runs with no token to hand `pfctl -X` clears the
+    /// file as well, leaking pf's enable refcount until reboot. `None` is the
+    /// honest answer for bytes that yielded nothing — an unreadable file, or
+    /// JSON with no usable `pf_token` — not a licence to stop looking.
+    Unusable { pf_token: Option<String> },
     /// A file exists and parsed at the current schema version.
     Present(T),
+}
+
+impl<T> StateFile<T> {
+    /// [`StateFile::Unusable`] for a record whose BYTES we hold, salvaging its
+    /// `pf_token` if one can still be read out of them.
+    ///
+    /// Deliberately lenient where the typed deserialize was strict: a
+    /// `serde_json::Value` walk ignores the schema version, unknown fields
+    /// (`deny_unknown_fields` is what makes a forward-compatible write
+    /// unreadable in the first place), and every sibling field being wrong. One
+    /// implementation for both macOS state files, since both persist a
+    /// `pf_token` and both reach this variant by the same routes.
+    ///
+    /// `pub`, matching the type it constructs, rather than `pub(crate)`: only
+    /// macOS persists a pf token, so a crate-private constructor would be dead
+    /// code on every other target of this cfg-free module.
+    pub fn unusable(bytes: &[u8]) -> Self {
+        let pf_token = serde_json::from_slice::<serde_json::Value>(bytes)
+            .ok()
+            .and_then(|v| v.get("pf_token")?.as_str().map(str::to_owned))
+            .filter(|t| !t.is_empty());
+        Self::Unusable { pf_token }
+    }
 }
 
 // macOS persists its pf enable token; Windows recovers WFP filters by fixed

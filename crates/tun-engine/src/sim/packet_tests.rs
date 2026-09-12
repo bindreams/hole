@@ -82,3 +82,26 @@ fn built_tcp_syn_parses_back_v6() {
     assert_eq!(tcp.seq_number().0 as u32, 2000);
     assert!(tcp.verify_checksum(&IpAddress::Ipv6(ip.src_addr()), &IpAddress::Ipv6(ip.dst_addr())));
 }
+
+/// The SYN-ACK a privileged TUN test writes back to complete a handshake by
+/// hand. BOTH flags have to be set and the checksum has to cover the
+/// acknowledgement field, or the kernel discards it and the connection that
+/// test needs never reaches `ESTABLISHED` — a failure that would surface only
+/// in the elevated lane, as a timeout, with nothing naming the frame.
+#[skuld::test]
+fn built_tcp_syn_ack_parses_back_v4() {
+    let src = v4(Ipv4Addr::new(198, 51, 100, 9), 54330);
+    let dst = v4(Ipv4Addr::new(10, 255, 253, 1), 51000);
+    let pkt = tcp_syn_ack(src, dst, 4096, 777);
+
+    let ip = Ipv4Packet::new_checked(&pkt).expect("not a valid IPv4 packet");
+    let tcp = TcpPacket::new_checked(ip.payload()).expect("not a valid TCP packet");
+    assert!(tcp.syn(), "a SYN-ACK must carry SYN");
+    assert!(
+        tcp.ack(),
+        "a SYN-ACK must carry ACK — `emit` derives it from `ack_number.is_some()`"
+    );
+    assert_eq!(tcp.seq_number().0 as u32, 4096);
+    assert_eq!(tcp.ack_number().0 as u32, 777);
+    assert!(tcp.verify_checksum(&IpAddress::Ipv4(ip.src_addr()), &IpAddress::Ipv4(ip.dst_addr())));
+}

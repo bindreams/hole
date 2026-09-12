@@ -82,10 +82,13 @@ fn connect(addr: &str) -> std::io::Result<TcpStream> {
 /// box is left open.
 ///
 /// (This replaces the originally-planned both-covers recovery egress test, which
-/// could not be made faithful: the macOS transient `engage` does `pfctl -Fa`,
-/// flushing the standing ruleset, and `recover_lockdown(Adopt)` deliberately does
-/// not reload it -- so post-recovery the live ruleset is the transient leftover,
-/// and with a shared permit IP the egress assertions pass regardless of whether
+/// could not be made faithful: the macOS transient `engage`'s own `pfctl -f -`
+/// unconditionally replaces whatever ruleset is currently loaded -- standing or
+/// not -- with its own (bindreams/hole#997 dropped the `-Fa` that used to flush
+/// it first, but the replacement itself is unconditional either way), and
+/// `recover_lockdown(Adopt)` deliberately does not reload the standing ruleset
+/// afterward -- so post-recovery the live ruleset is the transient leftover, and
+/// with a shared permit IP the egress assertions pass regardless of whether
 /// standing-adopt works. The Task-4 reorder invariant it targeted -- lockdown
 /// reconcile BEFORE the transient sweep, the sweep told `standing_held` so it
 /// skips the `/etc/pf.conf` reload -- is proven at the unit level by

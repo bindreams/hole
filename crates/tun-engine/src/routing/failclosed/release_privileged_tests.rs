@@ -22,9 +22,12 @@
 //! (`.config/nextest.toml`) — a poisoned runner takes the rest of the job
 //! down and reads as an unrelated network flake.
 //!
-//! COUPLED NAMES: every test name here contains the substring `release_all_`;
-//! `.config/nextest.toml`'s `global_net_state` filter matches on it. Renaming
-//! a test WITHOUT updating that filter silently drops it from the group.
+//! COUPLED NAMES: every test name here contains the substring `release_all_`,
+//! except `macos_recover_cover_clears_a_cover_whose_state_file_is_unreadable`
+//! (the automatic sweep rather than the manual escape), which carries
+//! `macos_recover_cover_`. `.config/nextest.toml`'s `global_net_state` filter
+//! matches on both. Renaming a test WITHOUT updating that filter silently
+//! drops it from the group.
 
 use crate::device::TunIdentity;
 use crate::routing::{CoverGuard, Routing, SystemRouting};
@@ -403,6 +406,86 @@ fn macos_release_all_clears_a_cover_whose_state_file_is_unreadable() {
         connect(NON_PERMITTED).is_ok(),
         "release_all_covers must restore egress even with an unreadable state file: {NON_PERMITTED}={:?}",
         connect(NON_PERMITTED).err().map(|e| e.kind()),
+    );
+}
+
+/// The automatic sweep's half of the same rule the test above proves for the
+/// manual escape: an UNREADABLE record is a cover to clear, not an absence.
+///
+/// `recover_cover` used to go through `failclosed_state::load`, which collapses
+/// `Unusable` into `None` alongside `Absent`, and then logged "no
+/// failclosed-state file, nothing to recover" over a host still behind
+/// `block out all`. The reachable production cause is a ROLLBACK, and the
+/// payload below is the vector of it THIS binary classifies as `Unusable`: a
+/// record one schema version ahead, as a newer bridge writes and a rolled-back
+/// one reads. (The sibling field-skew vector — a newer bridge's
+/// `"pf_was_enabled": null` against an older binary's `bool` — is the same
+/// rollback, but this binary's own schema reads that `null` fine, so writing
+/// it here would exercise `Present` and certify nothing. See
+/// `macos_tests::a_rolled_back_bridges_sweep_reads_a_newer_record_as_a_cover_to_clear`.)
+///
+/// The classification is asserted, not assumed: a payload that quietly parses
+/// takes the `Present` arm, which `recover_cover` handled identically before
+/// `Unusable` existed, and this test would then pass against the very
+/// regression it exists to catch.
+#[cfg(target_os = "macos")]
+#[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
+fn macos_recover_cover_clears_a_cover_whose_state_file_is_unreadable() {
+    use std::process::Command;
+
+    let dir = tempfile::tempdir().unwrap();
+    let _release_guard = ReleaseOnDrop(dir.path().to_path_buf());
+    let routing = SystemRouting::new(dir.path().to_path_buf(), None);
+    let server_ip: std::net::IpAddr = "1.1.1.1".parse().unwrap();
+
+    assert_baseline_reachable();
+
+    // The TRANSIENT cover — `recover_cover`'s subject.
+    let cover = routing
+        .install_failclosed_cover(server_ip, None)
+        .expect("engage real pf transient cover");
+    // Read the real enable token back BEFORE overwriting the file, so the
+    // rolled-back payload below carries the REAL token and the safety net at
+    // the end of this test has one to fall back on.
+    let token = super::failclosed_state::load(dir.path())
+        .expect("the engage must have persisted a state file")
+        .pf_token;
+    cover.disarm(); // stand in for the crash: no guard remains
+
+    let rolled_back = format!(
+        r#"{{"version":{},"pf_token":"{token}","pf_was_enabled":null}}"#,
+        super::failclosed_state::SCHEMA_VERSION + 1
+    );
+    std::fs::write(dir.path().join(super::failclosed_state::STATE_FILE_NAME), &rolled_back).unwrap();
+    let presence = super::failclosed_state::load_presence(dir.path());
+    assert!(
+        matches!(presence, super::StateFile::Unusable { .. }),
+        "this test's premise: the payload must be UNREADABLE to this binary. On `Present` the \
+         sweep takes the arm it handled before this fix and proves nothing: {rolled_back} -> \
+         {presence:?}"
+    );
+
+    assert!(
+        connect(NON_PERMITTED).is_err(),
+        "the stranded transient cover must still be blocking egress before the sweep runs"
+    );
+
+    crate::routing::failclosed::recover_cover(dir.path(), false);
+
+    let restored = connect(NON_PERMITTED);
+
+    // Safety net, not the balance: the sweep salvages the `pf_token` out of
+    // the unusable record itself (`StateFile::unusable`) and drops it, so this
+    // normally finds the refcount already released and fails harmlessly. It
+    // stays so that a sweep whose own `-X` failed cannot leave the runner's pf
+    // enabled under an unreferenced token until reboot. Best-effort and AFTER
+    // the measurement, so it can neither mask nor cause the verdict.
+    let _ = Command::new("/sbin/pfctl").args(["-X", &token]).output();
+
+    assert!(
+        restored.is_ok(),
+        "recover_cover must restore egress even with an unreadable state file: {NON_PERMITTED}={:?}",
+        restored.err().map(|e| e.kind()),
     );
 }
 

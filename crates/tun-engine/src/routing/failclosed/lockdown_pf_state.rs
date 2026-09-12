@@ -84,7 +84,8 @@ pub fn load_presence(state_dir: &Path) -> super::StateFile<LockdownPfState> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return StateFile::Absent,
         Err(e) => {
             tracing::warn!(error = %e, path = %path.display(), "lockdown-pf-state read failed");
-            return StateFile::Unusable;
+            // No bytes, so nothing to salvage a token from.
+            return StateFile::Unusable { pf_token: None };
         }
     };
     match serde_json::from_slice::<LockdownPfState>(&bytes) {
@@ -93,9 +94,9 @@ pub fn load_presence(state_dir: &Path) -> super::StateFile<LockdownPfState> {
             tracing::warn!(
                 got = other.version,
                 want = SCHEMA_VERSION,
-                "lockdown-pf-state schema mismatch, discarding"
+                "lockdown-pf-state schema mismatch, discarding the record but salvaging its pf token"
             );
-            StateFile::Unusable
+            StateFile::unusable(&bytes)
         }
         Err(e) => {
             // Converted immediately, never held as a `serde_json::Error`:
@@ -113,7 +114,7 @@ pub fn load_presence(state_dir: &Path) -> super::StateFile<LockdownPfState> {
                 path = %path.display(),
                 "lockdown-pf-state parse failed"
             );
-            StateFile::Unusable
+            StateFile::unusable(&bytes)
         }
     }
 }
@@ -125,7 +126,7 @@ pub fn load_presence(state_dir: &Path) -> super::StateFile<LockdownPfState> {
 pub fn load(state_dir: &Path) -> Option<LockdownPfState> {
     match load_presence(state_dir) {
         super::StateFile::Present(s) => Some(s),
-        super::StateFile::Absent | super::StateFile::Unusable => None,
+        super::StateFile::Absent | super::StateFile::Unusable { .. } => None,
     }
 }
 

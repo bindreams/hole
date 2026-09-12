@@ -50,6 +50,33 @@ nextest-version = "0.9.130"
 #     does to pf, then a real re-engage; must not run beside another test
 #     touching pf state):
 #     crates/tun-engine/src/routing/failclosed/lockdown_privileged_tests.rs
+#   - `failclosed_cover_transition_` (bindreams/hole#997 — 24 real transient
+#     re-engages with no intervening disengage, plus a continuous background
+#     prober pool, proving a cover transition never admits a flow the old
+#     cover blocked):
+#     crates/tun-engine/src/routing/failclosed/macos_transition_tests.rs
+#   - `failclosed_cover_state_purge_` (bindreams/hole#1015 — enables pf itself
+#     under a permissive keep-state ruleset, establishes a real flow, then
+#     engages a real transient cover and reads `pfctl -s state` back; it also
+#     issues a HOST-WIDE `pfctl -F states`, so it must never run beside
+#     anything holding pf state):
+#     crates/tun-engine/src/routing/failclosed/macos_transition_tests.rs
+#   - `failclosed_cover_engage_does_not_sever_` (the other half of that purge:
+#     a real established loopback flow must survive a real engage, which is
+#     what `set skip on lo0` buys over a state-bearing `pass` rule):
+#     crates/tun-engine/src/routing/failclosed/macos_transition_tests.rs
+#   - `failclosed_cover_load_` (the window `set skip on lo0` cannot cover for
+#     itself — pfctl clears interface skip flags OUTSIDE the rule ticket, so a
+#     real `pfctl -f -` replacing a live cover is probed with a lock-step
+#     loopback UDP round trip, twice: once against the pre-fix ruleset shape as
+#     a positive control, once against the production one):
+#     crates/tun-engine/src/routing/failclosed/macos_transition_tests.rs
+#   - `macos_recover_cover_` prefix (the crash-recovery sweep's own real
+#     engage: a stranded transient cover whose state file an older bridge
+#     cannot parse must still be cleared). The `macos_` prefix is what keeps
+#     the unprivileged `recover_cover_with_*` unit tests in macos_tests.rs out
+#     of this group; they need no serialization:
+#     crates/tun-engine/src/routing/failclosed/release_privileged_tests.rs
 #   - `release_all_` substring (privileged AND unprivileged — the unprivileged
 #     macos_tests/windows_tests cases join for free; a name-based filter must
 #     not silently miss a privileged test):
@@ -63,10 +90,13 @@ nextest-version = "0.9.130"
 #       wire-capture no-UDP-leak proof)
 #   - `live_tun_permit_` substring (#874 — two real TUN devices + the real
 #     standing lockdown cover, proving the tunnel-permit rule is sensitive to
-#     the interface it names, not merely present; and the session-level
-#     composition guard, which starts a real Full-mode session with the kill
-#     switch armed — each engages a system-wide block-all cover, so they must
-#     never run beside each other):
+#     the interface it names, not merely present; the mid-stream proof, which
+#     completes a TCP handshake by hand over one of those devices and engages
+#     the real TRANSIENT cover to show its permit survives the engage's own
+#     host-wide `pfctl -F states` purge; and the session-level composition
+#     guard, which starts a real Full-mode session with the kill switch armed
+#     — each engages a system-wide block-all cover, so they must never run
+#     beside each other):
 #     crates/tun-engine/src/routing/failclosed/live_tun_permit_privileged_tests.rs
 #     crates/bridge/src/proxy_manager_live_tun_permit_e2e_tests.rs
 #   - `dns_confine_global_net_state_` prefix (#846 — real wintun devices + a
@@ -134,8 +164,21 @@ nextest-version = "0.9.130"
 max-threads = 1
 
 [[profile.default.overrides]]
-filter = 'test(/^e2e_.*full_tunnel/) + test(/windows_lockdown_permits_server_ip_/) + test(/macos_lockdown_permits_server_ip_/) + test(/failclosed_permits_/) + test(/simulated_reboot_rearms_the_cover/) + test(/release_all_/) + test(/cutover_global_net_state_/) + test(/live_tun_permit_/) + test(/tun_device_ipv6_/) + test(/gateway_global_net_state_/) + test(/dns_confine_global_net_state_/) + test(/dns_steer_global_net_state_/) + test(/macos_dns_global_net_state_/) + test(/opens_a_kernel_assigned/) + test(/dispatcher_opens_tun_/)'
+filter = 'test(/^e2e_.*full_tunnel/) + test(/windows_lockdown_permits_server_ip_/) + test(/macos_lockdown_permits_server_ip_/) + test(/failclosed_permits_/) + test(/simulated_reboot_rearms_the_cover/) + test(/failclosed_cover_transition_/) + test(/failclosed_cover_state_purge_/) + test(/failclosed_cover_engage_does_not_sever_/) + test(/failclosed_cover_load_/) + test(/macos_recover_cover_/) + test(/release_all_/) + test(/cutover_global_net_state_/) + test(/live_tun_permit_/) + test(/tun_device_ipv6_/) + test(/gateway_global_net_state_/) + test(/dns_confine_global_net_state_/) + test(/dns_steer_global_net_state_/) + test(/macos_dns_global_net_state_/) + test(/opens_a_kernel_assigned/) + test(/dispatcher_opens_tun_/)'
 test-group = 'global_net_state'
+
+# `macos_failclosed_cover_transition_never_admits_blocked_flow` prints the
+# sensitivity of its own guard — the control's completed-connect ratio and the
+# prober pool's aggregate probe rate. That number is what distinguishes an
+# informative pass from a merely green one, and nextest discards captured
+# output on success, so without this it only ever appears on the run that needs
+# it least. Sets `success-output` ONLY: nextest resolves each setting from the
+# first override that specifies it, so the `test-group` assignment above still
+# wins for this test — verified with `cargo nextest show-config test-groups`,
+# which must keep listing it under `global_net_state`.
+[[profile.default.overrides]]
+filter = 'test(/failclosed_cover_transition_/)'
+success-output = 'final'
 
 # `driver_dns_tests.rs` / `driver_udp_tests.rs` / `driver_lifecycle_tests.rs`
 # (crates/tun-engine/src/engine/) drive the whole engine over an in-memory
