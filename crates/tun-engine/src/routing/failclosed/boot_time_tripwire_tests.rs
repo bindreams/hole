@@ -1,33 +1,90 @@
-//! Tripwire: a `FWPM_FILTER_FLAG_BOOTTIME` filter may not be installed
-//! without its key being classified `KeyLifetime::BootTime`.
+//! Tripwire: the `FWPM_FILTER_FLAG_BOOTTIME` bit may be produced in exactly
+//! one place, the one that cannot produce it without a
+//! [`super::KeyLifetime`].
 //!
-//! Scope is every production source in this crate, recursively — not just
+//! ## What this guarded before, and why that form retired
+//!
+//! It used to assert an equality: the crate's production sources install
+//! boot-time filters iff they classify boot-time keys. That was a tripwire for
+//! a mistake with no compile-time answer — installing
+//! `FWPM_FILTER_FLAG_BOOTTIME` while leaving the key tagged
+//! `KeyLifetime::Persistent`, after which `release_all` reports a proof of
+//! removal it never observed and the MSI deletes `hole.exe` on the strength of
+//! it (bindreams/hole#1003).
+//!
+//! bindreams/hole#1010 gave it a compile-time answer, which is also what
+//! killed the equality form. `FilterLifetime` (`failclosed/windows.rs`) is a newtype
+//! over `KeyLifetime` whose only flag accessor reads the very variant the
+//! sweep records, and the twins' key, layer and lifetime come from one table
+//! both `build_lockdown_spec` and `swept_lockdown_keys` read. Installing a
+//! boot-time filter without classifying its key stopped being a mistake and
+//! became a thing you cannot say. But it also put BOTH symbols in production
+//! code permanently: `installs` and `classifies` are now both true and both
+//! stay true, so the equality holds no matter what a later change does — and
+//! a guard that can no longer fail in the direction that matters is worse than
+//! no guard, because it still reads like evidence. The equality is gone rather
+//! than left standing. This file's own doc predicted that and said to make the
+//! call here.
+//!
+//! ## What it guards now
+//!
+//! The property the type CANNOT enforce: that the type is the only way in.
+//! `FilterLifetime::filter_flags` couples the bit to the classification for
+//! everyone who goes through it; nothing stops a future source from naming
+//! `FWPM_FILTER_FLAG_BOOTTIME` itself and going around. So the scan asserts
+//! the flag is named by exactly one production source, the one that defines
+//! that mapping — found by its definition, never by a path, so moving it
+//! re-anchors the guard instead of silently widening it.
+//!
+//! That subsumes the old equality for the hazard it existed for. A boot-time
+//! filter reaching the firewall through `FilterLifetime` carries its
+//! classification by construction; one reaching it any other way names the
+//! flag and fires this.
+//!
+//! ## The residual the old doc disclosed, and where it went
+//!
+//! `FWPM_FILTER_FLAGS(0x4)` written as bits names no flag symbol at all, so
+//! the scan above cannot see it. Three things now stand between that and a
+//! boot-time filter, and the second test here is the first of them:
+//!
+//! 1. The raw flags type may be named only by the source that defines the
+//!    mapping, plus any source that opens its FWPM engine
+//!    `FWPM_SESSION_FLAG_DYNAMIC` — WFP does not accept a boot-time filter on
+//!    a dynamic-session object, so bits written there cannot reach the boot
+//!    window. The exemption is anchored to that flag rather than to a path, so
+//!    `dns_confine/windows.rs` falls back under the rule if it ever stops
+//!    naming it. **Its granularity is the FILE, not the session**, and that is
+//!    the residual: a source keeps the exemption for every raw-bit write in it
+//!    as long as it opens one dynamic session somewhere, so a second,
+//!    non-dynamic engine added to the same file would write `0x4` unseen.
+//!    Narrowing that needs the scan to tie a flags construction to the engine
+//!    it is spent on, which is dataflow, not lexing — out of reach of a
+//!    tripwire, and the reason 2 and 3 below are not optional.
+//! 2. `FwpmFilterAdd0` is clippy-`disallowed_methods` with exactly those two
+//!    sanctioned sites, so bits materialised in a third source have nowhere to
+//!    be spent.
+//! 3. Inside the one non-dynamic site, `add_filter` takes its flags from
+//!    `f.lifetime.filter_flags()` and there is no other assignment to
+//!    `FWPM_FILTER0::flags`.
+//!
+//! Clippy cannot close 1 on its own, and this was measured rather than
+//! assumed: `disallowed_types` fires on a type in a signature but NOT on a
+//! bare tuple-struct construction expression, which is the shape the residual
+//! takes.
+//!
+//! ## Scope
+//!
+//! Every production source in this crate, recursively — not just
 //! `failclosed/`. `failclosed/windows.rs` is NOT the only sanctioned FWPM site
 //! in tun-engine: `dns_confine/windows.rs` calls `FwpmFilterAdd0` too, and
-//! `clippy.toml` names both. Nothing can reach a boot-time filter through that
-//! second one today — `dns_confine::engage` opens its engine
-//! `FWPM_SESSION_FLAG_DYNAMIC` and stamps `FWPM_FILTER_FLAGS(0)`, and WFP does
-//! not accept a boot-time filter on a dynamic-session object — but that is a
-//! property of today's code held up by clippy's site list, not by this file,
-//! so the scan does not lean on it.
-//!
-//! The one exclusion is `failclosed.rs`, which DEFINES `KeyLifetime` and the
-//! `proves_empty` fold and therefore names `BootTime` in code by construction.
-//! It is excluded from the classification half only — an install there would
-//! still fire — and the exclusion is anchored to where the fold actually
-//! lives, so moving `proves_empty` fails the guard rather than silently
-//! turning the fold's own mention into a classification and letting an
-//! unclassified install through (bindreams/hole#1003, #1010).
+//! `clippy.toml` names both.
 //!
 //! What it scans for is identifiers, in lexed code — so renaming the symbol at
 //! its `use` does not hide it (`an_aliased_boot_time_flag_still_fires_the_tripwire`),
 //! and neither does spacing, a comment of any shape, or a string literal. The
-//! disclosed residual is a flag that names no symbol at all:
-//! `FWPM_FILTER_FLAGS(0x4)` written as bits installs a boot-time filter that
-//! nothing here can see. Closing that takes a type that cannot hand out the
-//! bits without the [`super::KeyLifetime`] — the compile-time coupling #1010
-//! is the change that can land it, because introducing it here would put both
-//! symbols in production code and leave this guard permanently satisfied.
+//! failclosed modules' docs discuss both symbols at length, and a guard that
+//! counted prose would fire on documentation alone — the fastest way to get a
+//! tripwire deleted rather than obeyed.
 
 use std::path::{Path, PathBuf};
 
@@ -56,7 +113,7 @@ fn production_sources_under(dir: &Path) -> Vec<PathBuf> {
 }
 
 /// A Rust source that ships, as opposed to one that tests it. The exclusion is
-/// load-bearing: `windows_tests.rs` and this very module name both boot-time
+/// load-bearing: `windows_tests.rs` and this very module name the boot-time
 /// symbols, so a scan that took the whole tree would read an install out of
 /// test code.
 fn is_production_source(path: &Path) -> bool {
@@ -69,18 +126,14 @@ fn is_production_source(path: &Path) -> bool {
 /// One source's executing tokens: what the compiler acts on, with every form
 /// of non-executing text gone.
 ///
-/// The failclosed modules' docs discuss the boot-time flag by name, and a
-/// guard that counted prose would fire on documentation alone — the fastest
-/// way to get a tripwire deleted rather than obeyed. Lexing is what decides
-/// which mentions those are, because there are four kinds and a line filter
-/// recognises one: `//` owning a line, `//` trailing a line of code,
-/// `/* ... */`, and a string literal. The lexer drops the first three
-/// outright; `///` and `//!` survive it as `#[doc = "..."]` attributes, which
-/// [`flatten`] drops; and every predicate below reads identifiers, so a
+/// Lexing is what decides which mentions are prose, because there are four
+/// kinds and a line filter recognises one: `//` owning a line, `//` trailing a
+/// line of code, `/* ... */`, and a string literal. The lexer drops the first
+/// three outright; `///` and `//!` survive it as `#[doc = "..."]` attributes,
+/// which [`flatten`] drops; and every predicate below reads identifiers, so a
 /// literal is never examined. A missed one is not a false alarm but a silent
-/// pass — it makes the classification half read true with no classification
-/// arm in existence, which satisfies the equality over an UNCLASSIFIED
-/// boot-time install.
+/// pass — it would put a source in the "names the flag" set on the strength of
+/// a comment, and the assertions below are set equalities.
 ///
 /// A lex failure is a panic, for the reason [`production_sources_under`]
 /// gives: a scan that read nothing must never read as a scan that found
@@ -95,9 +148,8 @@ fn tokens(path: &Path) -> Vec<TokenTree> {
 
 /// `stream`'s tokens depth-first, with doc attributes dropped.
 ///
-/// Flattened rather than walked as a tree so an adjacency is visible wherever
-/// it sits, including inside a macro's delimiters — `matches!(k,
-/// KeyLifetime::BootTime)` classifies just as much as a bare match arm does.
+/// Flattened rather than walked as a tree so a mention is visible wherever it
+/// sits, including inside a macro's delimiters.
 fn flatten(stream: TokenStream, out: &mut Vec<TokenTree>) {
     let mut it = stream.into_iter().peekable();
     while let Some(tt) = it.next() {
@@ -131,8 +183,7 @@ fn is_doc_attr(g: &Group) -> bool {
 /// Whether executing code names this identifier.
 ///
 /// An identifier, not a spelling: `use ... FWPM_FILTER_FLAG_BOOTTIME as
-/// BOOT_FLAG` names it at the import whichever file spends the alias, and
-/// `KeyLifetime :: BootTime` is the same three tokens however it is spaced.
+/// BOOT_FLAG` names it at the import whichever file spends the alias.
 fn names(tokens: &[TokenTree], ident: &str) -> bool {
     tokens.iter().any(|t| matches!(t, TokenTree::Ident(i) if i == ident))
 }
@@ -144,47 +195,50 @@ fn defines_fn(tokens: &[TokenTree], name: &str) -> bool {
         .any(|w| matches!(&w[0], TokenTree::Ident(i) if i == "fn") && matches!(&w[1], TokenTree::Ident(i) if i == name))
 }
 
-/// The sources that DEFINE the lifetime fold, found by the definition rather
-/// than by a path.
+/// The sources naming `ident` in executing code, in scan order.
+fn sources_naming(sources: &[PathBuf], ident: &str) -> Vec<PathBuf> {
+    sources.iter().filter(|p| names(&tokens(p), ident)).cloned().collect()
+}
+
+/// The sources that DEFINE the lifetime-to-flag mapping, found by the
+/// definition rather than by a path.
 ///
-/// This is what anchors the classification half's one exclusion. `proves_empty`
-/// is the function that decides what an empty answer proves for each
-/// `KeyLifetime`, so its file's `KeyLifetime::BootTime` mentions are the
-/// definition of the rule, not a classification of any key.
-fn decision_sites(sources: &[PathBuf]) -> Vec<PathBuf> {
+/// This is what both assertions are anchored to. `FilterLifetime::filter_flags`
+/// is the function that turns a [`super::KeyLifetime`] into
+/// `FWPM_FILTER0::flags`; moving it must re-anchor this guard, not quietly
+/// leave it pointing at a file that no longer produces the bits.
+fn flag_producer_sites(sources: &[PathBuf]) -> Vec<PathBuf> {
     sources
         .iter()
-        .filter(|p| defines_fn(&tokens(p), "proves_empty"))
+        .filter(|p| defines_fn(&tokens(p), "filter_flags"))
         .cloned()
         .collect()
 }
 
-/// `(installs_boot_time, classifies_boot_time)` across `sources`.
+/// The sources that open an FWPM engine with a DYNAMIC session, found by the
+/// session flag rather than by a path.
 ///
-/// The install half spans every source given; the classification half skips
-/// `decision_site`, for the reason [`decision_sites`] gives. Asymmetric on
-/// purpose: an install in the file that defines the fold must still fire.
+/// A dynamic session's objects die with the process and WFP does not accept a
+/// boot-time filter on one, so raw flag bits written there cannot reach the
+/// boot window. That is why `dns_confine/windows.rs` may name
+/// `FWPM_FILTER_FLAGS` — and anchoring on the flag rather than on its path is
+/// what makes the exemption expire if it ever stops being dynamic.
 ///
-/// The classification half looks for the bare `BootTime` rather than the
-/// qualified path: a variant reached through a `use` of it is a classification
-/// too, and an over-wide classification half can only fail this guard loudly,
-/// while an over-narrow one passes it in silence.
-fn boot_time_halves(sources: &[PathBuf], decision_site: &Path) -> (bool, bool) {
-    let installs = sources.iter().any(|p| names(&tokens(p), "FWPM_FILTER_FLAG_BOOTTIME"));
-    let classifies = sources
-        .iter()
-        .filter(|p| p.as_path() != decision_site)
-        .any(|p| names(&tokens(p), "BootTime"));
-    (installs, classifies)
+/// Whole-file granularity, stated because it is the guard's residual: this
+/// exempts every raw-bit write in a source that opens ONE dynamic session, not
+/// only the writes spent on that session. See the module doc's residual list
+/// for what stands behind it.
+fn dynamic_session_sites(sources: &[PathBuf]) -> Vec<PathBuf> {
+    sources_naming(sources, "FWPM_SESSION_FLAG_DYNAMIC")
 }
 
 fn crate_src() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("src")
 }
 
-/// Where the fold is expected to live. Asserted, never assumed.
-fn decision_site() -> PathBuf {
-    crate_src().join("routing").join("failclosed.rs")
+/// Where the mapping is expected to live. Asserted, never assumed.
+fn flag_producer_site() -> PathBuf {
+    crate_src().join("routing").join("failclosed").join("windows.rs")
 }
 
 /// Relative, slash-normalised names, for readable fixture assertions.
@@ -202,23 +256,9 @@ fn relative(dir: &Path, found: Vec<PathBuf>) -> Vec<String> {
     names
 }
 
-#[skuld::test]
-fn a_boot_time_flag_cannot_be_introduced_without_classifying_its_key() {
-    // A tripwire, deliberately, and not a proof — the fact it guards spans a
-    // runtime `FilterSpec` (what `add_filter` stamps) and a static sweep array
-    // (what `release_all` classifies), and no type in this module holds both.
-    //
-    // What it catches is the one mistake that is silent AND harmful: adding a
-    // `FWPM_FILTER_FLAG_BOOTTIME` filter (bindreams/hole#998, #1010) while
-    // leaving its key tagged `KeyLifetime::Persistent`. `release_all` would
-    // then report proof it does not have, and the MSI would delete `hole.exe`
-    // on the strength of it (bindreams/hole#1003). Both halves are absent
-    // today; whoever adds the first must add the other.
-    //
-    // The scan is the crate's source tree, not one hardcoded file: an add that
-    // landed in a new submodule (`failclosed/windows/boottime.rs`) — or at the
-    // other sanctioned FWPM site, `dns_confine/windows.rs` — would otherwise
-    // leave both halves false, the equality holding, and the mis-tag shipping.
+/// The scan's own precondition: it read the file the guard is about. A
+/// tripwire that reads nothing passes forever.
+fn scanned_sources() -> Vec<PathBuf> {
     let src = crate_src();
     let sources = production_sources_under(&src);
     assert!(
@@ -227,27 +267,65 @@ fn a_boot_time_flag_cannot_be_introduced_without_classifying_its_key() {
          passes forever",
         src.display()
     );
+    sources
+}
 
-    // The classification half excludes exactly one file, and this is what
-    // keeps that exclusion honest. Move `proves_empty` into a scanned source
-    // and its own `KeyLifetime::BootTime` arm would make `classifies`
-    // permanently true — after which an UNCLASSIFIED boot-time install
-    // satisfies the equality below and passes in silence. That is the worst
-    // failure this guard has, so it is the one it refuses to reach.
-    let site = decision_site();
+#[skuld::test]
+fn the_boot_time_flag_is_named_only_where_a_key_lifetime_produces_it() {
+    // The one mistake that is silent AND harmful: getting
+    // `FWPM_FILTER_FLAG_BOOTTIME` into the firewall without the
+    // `KeyLifetime::BootTime` that tells `release_all` what a not-found delete
+    // on that key proves (bindreams/hole#998, #1003, #1010). Going through
+    // `FilterLifetime` makes that impossible; this is the guard on the "going
+    // through" part.
+    let sources = scanned_sources();
+
+    // Anchored to where the mapping actually is. Move `filter_flags` and this
+    // fails loudly rather than leaving the assertion below pointing at a file
+    // that no longer couples anything.
+    let site = flag_producer_site();
     assert_eq!(
-        decision_sites(&sources),
+        flag_producer_sites(&sources),
         vec![site.clone()],
-        "`fn proves_empty` — the fold this guard's one exclusion is scoped to — is not where the \
-         exclusion says it is; re-anchor `decision_site()` before trusting the halves below"
+        "`fn filter_flags` — the lifetime-to-flag mapping this guard is anchored to — is not \
+         where the anchor says it is; re-anchor `flag_producer_site()` before trusting the \
+         assertion below"
     );
 
-    let (installs_boot_time, classifies_boot_time) = boot_time_halves(&sources, &site);
     assert_eq!(
-        installs_boot_time, classifies_boot_time,
-        "the crate's sources install boot-time filters ({installs_boot_time}) but classify \
-         boot-time keys ({classifies_boot_time}); a sweep that deletes a boot-time key while \
-         calling it Persistent reports a proof of removal it never observed"
+        sources_naming(&sources, "FWPM_FILTER_FLAG_BOOTTIME"),
+        vec![site],
+        "a production source other than the one defining `FilterLifetime::filter_flags` names \
+         the boot-time flag, so it can install a boot-time filter without a `KeyLifetime` — and \
+         a sweep that deletes such a key while calling it Persistent reports a proof of removal \
+         it never observed"
+    );
+}
+
+#[skuld::test]
+fn the_raw_flag_bits_are_named_only_where_they_cannot_reach_the_boot_window() {
+    // The residual the equality form disclosed and could not see:
+    // `FWPM_FILTER_FLAGS(0x4)` names no flag symbol. Clippy cannot cover it —
+    // `disallowed_types` fires on a type in a signature but not on a bare
+    // tuple-struct construction expression (measured, not assumed) — so the
+    // set of sources that can materialise the bits is pinned here instead.
+    let sources = scanned_sources();
+
+    let mut allowed = flag_producer_sites(&sources);
+    allowed.extend(dynamic_session_sites(&sources));
+    allowed.sort();
+    allowed.dedup();
+    assert!(
+        !allowed.is_empty(),
+        "neither anchor matched any source, which would make the assertion below vacuous"
+    );
+
+    assert_eq!(
+        sources_naming(&sources, "FWPM_FILTER_FLAGS"),
+        allowed,
+        "a production source materialises raw WFP filter flags without either defining the \
+         `KeyLifetime` mapping or running a DYNAMIC session (where WFP refuses a boot-time \
+         filter outright); bits written there can carry 0x4 with nothing to classify the key"
     );
 }
 
@@ -281,8 +359,6 @@ fn the_scan_reads_a_source_that_is_a_symlink() {
     // unfollowed symlink's `file_type()` is neither file nor dir — so the
     // default configuration drops it before `is_production_source` is ever
     // asked. The compiler and the tripwire then disagree about what ships.
-    // The `include_str!` form this scan replaced followed links; the move is
-    // what opened the gap.
     //
     // `#[cfg(unix)]` because creating a symlink on Windows needs
     // SeCreateSymbolicLinkPrivilege or Developer Mode. What is under test is
@@ -290,7 +366,7 @@ fn the_scan_reads_a_source_that_is_a_symlink() {
     let root = tempfile::tempdir().expect("tempdir");
     let dir = root.path().join("failclosed");
     std::fs::create_dir_all(dir.join("windows")).expect("mkdir");
-    std::fs::write(dir.join("windows.rs"), "let l = KeyLifetime::Persistent;").expect("write");
+    std::fs::write(dir.join("windows.rs"), "fn filter_flags() {}").expect("write");
     // The target sits outside the scanned tree, so the scan can reach its
     // contents only by following the link.
     let target = root.path().join("boottime-source");
@@ -303,27 +379,35 @@ fn the_scan_reads_a_source_that_is_a_symlink() {
         vec!["windows.rs", "windows/boottime.rs"],
         "a symlinked .rs is a source the compiler reads, so the scan reads it too"
     );
-    assert_eq!(boot_time_halves(&sources, &dir.join("failclosed.rs")), (true, false));
+    assert_eq!(
+        relative(&dir, sources_naming(&sources, "FWPM_FILTER_FLAG_BOOTTIME")),
+        vec!["windows/boottime.rs"]
+    );
 }
 
 #[skuld::test]
-fn the_tripwire_fires_on_a_flag_added_in_a_new_submodule() {
-    // The #1010 shape, landed one directory deeper than #1010 lands it.
+fn the_tripwire_fires_on_a_flag_named_in_a_new_submodule() {
+    // The shape the type cannot prevent: a source that reaches for the flag
+    // itself instead of going through `FilterLifetime`, landing one directory
+    // deeper than the mapping.
     let root = tempfile::tempdir().expect("tempdir");
     let dir = root.path();
     std::fs::create_dir_all(dir.join("windows")).expect("mkdir");
-    std::fs::write(dir.join("windows.rs"), "let l = KeyLifetime::Persistent;").expect("write");
+    std::fs::write(dir.join("windows.rs"), "fn filter_flags() {}").expect("write");
     std::fs::write(dir.join("windows/boottime.rs"), "flags |= FWPM_FILTER_FLAG_BOOTTIME.0;").expect("write");
-    // The trap: classifying it in a test is not classifying it.
+    // The trap: naming it in a test is not naming it in a source that ships.
     std::fs::write(
         dir.join("windows_tests.rs"),
         "assert_eq!(k.lifetime, KeyLifetime::BootTime);",
     )
     .expect("write");
 
+    let sources = production_sources_under(dir);
+    assert_eq!(relative(dir, flag_producer_sites(&sources)), vec!["windows.rs"]);
     assert_eq!(
-        boot_time_halves(&production_sources_under(dir), &dir.join("failclosed.rs")),
-        (true, false)
+        relative(dir, sources_naming(&sources, "FWPM_FILTER_FLAG_BOOTTIME")),
+        vec!["windows/boottime.rs"],
+        "the flag is named somewhere other than the mapping, which is what must fire"
     );
 }
 
@@ -339,18 +423,14 @@ fn a_boot_time_symbol_named_only_in_prose_does_not_fire_the_tripwire() {
     )
     .expect("write");
 
-    assert_eq!(
-        boot_time_halves(&production_sources_under(dir), &dir.join("failclosed.rs")),
-        (false, false)
-    );
+    let sources = production_sources_under(dir);
+    assert!(sources_naming(&sources, "FWPM_FILTER_FLAG_BOOTTIME").is_empty());
 }
 
 #[skuld::test]
 fn a_boot_time_symbol_in_a_trailing_comment_does_not_fire_the_tripwire() {
     // A comment does not have to own its line. The line filter this scan
-    // replaced only recognised one that did, so a trailing `// ...` made the
-    // classification half read true with no classification arm in existence —
-    // and an UNCLASSIFIED boot-time install then satisfied the equality.
+    // replaced only recognised one that did.
     let root = tempfile::tempdir().expect("tempdir");
     let dir = root.path();
     std::fs::write(
@@ -360,10 +440,8 @@ fn a_boot_time_symbol_in_a_trailing_comment_does_not_fire_the_tripwire() {
     )
     .expect("write");
 
-    assert_eq!(
-        boot_time_halves(&production_sources_under(dir), &dir.join("failclosed.rs")),
-        (false, false)
-    );
+    let sources = production_sources_under(dir);
+    assert!(sources_naming(&sources, "FWPM_FILTER_FLAG_BOOTTIME").is_empty());
 }
 
 #[skuld::test]
@@ -374,14 +452,13 @@ fn a_boot_time_symbol_in_a_block_comment_does_not_fire_the_tripwire() {
         dir.join("windows.rs"),
         "/* FWPM_FILTER_FLAG_BOOTTIME */\n\
          fn f() {}\n\
-         /* a /* nested */ note about KeyLifetime::BootTime */\n",
+         /* a /* nested */ note about FWPM_FILTER_FLAGS */\n",
     )
     .expect("write");
 
-    assert_eq!(
-        boot_time_halves(&production_sources_under(dir), &dir.join("failclosed.rs")),
-        (false, false)
-    );
+    let sources = production_sources_under(dir);
+    assert!(sources_naming(&sources, "FWPM_FILTER_FLAG_BOOTTIME").is_empty());
+    assert!(sources_naming(&sources, "FWPM_FILTER_FLAGS").is_empty());
 }
 
 #[skuld::test]
@@ -394,22 +471,20 @@ fn a_boot_time_symbol_in_a_string_literal_does_not_fire_the_tripwire() {
     std::fs::write(
         dir.join("windows.rs"),
         "let label = \"FWPM_FILTER_FLAG_BOOTTIME\";\n\
-         let doc = \"see KeyLifetime::BootTime\";\n",
+         let doc = \"see FWPM_FILTER_FLAGS\";\n",
     )
     .expect("write");
 
-    assert_eq!(
-        boot_time_halves(&production_sources_under(dir), &dir.join("failclosed.rs")),
-        (false, false)
-    );
+    let sources = production_sources_under(dir);
+    assert!(sources_naming(&sources, "FWPM_FILTER_FLAG_BOOTTIME").is_empty());
+    assert!(sources_naming(&sources, "FWPM_FILTER_FLAGS").is_empty());
 }
 
 #[skuld::test]
 fn an_aliased_boot_time_flag_still_fires_the_tripwire() {
     // Renaming the symbol at the `use` does not hide it: the import names it
-    // in full, and the install half spans every production source with no
-    // exclusion, so the `use` line is scanned whether or not it sits in the
-    // file that spends the alias.
+    // in full, and the scan spans every production source, so the `use` line
+    // is read whether or not it sits in the file that spends the alias.
     let root = tempfile::tempdir().expect("tempdir");
     let dir = root.path();
     std::fs::write(
@@ -420,51 +495,57 @@ fn an_aliased_boot_time_flag_still_fires_the_tripwire() {
     .expect("write");
     std::fs::write(dir.join("windows.rs"), "flags |= BOOT_FLAG.0;\n").expect("write");
 
-    assert_eq!(
-        boot_time_halves(&production_sources_under(dir), &dir.join("failclosed.rs")),
-        (true, false)
-    );
-}
-
-#[skuld::test]
-fn the_fold_is_found_by_its_definition_and_never_by_prose() {
-    let root = tempfile::tempdir().expect("tempdir");
-    let dir = root.path();
-    std::fs::write(dir.join("failclosed.rs"), "pub fn proves_empty(&self) -> bool { true }").expect("write");
-    std::fs::write(
-        dir.join("windows.rs"),
-        "/// Whether `fn proves_empty` says so.\nfn g() {}",
-    )
-    .expect("write");
-
-    assert_eq!(
-        relative(dir, decision_sites(&production_sources_under(dir))),
-        vec!["failclosed.rs"]
-    );
-}
-
-#[skuld::test]
-fn a_fold_that_moved_is_not_mistaken_for_a_classification() {
-    // The vacuity trigger this guard is built against. `proves_empty`'s
-    // `(KeyLifetime::BootTime, KeyOutcome::NotFound)` arm names the variant
-    // without classifying any key. If that arm ever sat in a scanned source
-    // and were counted, `classifies` would be permanently true and an
-    // UNCLASSIFIED boot-time install would satisfy the equality — a silent
-    // pass, on the guard that gates #1010's merge.
-    let root = tempfile::tempdir().expect("tempdir");
-    let dir = root.path();
-    std::fs::write(
-        dir.join("windows.rs"),
-        "flags |= FWPM_FILTER_FLAG_BOOTTIME.0;\n\
-         fn proves_empty(&self) -> bool { matches!(self.0, KeyLifetime::BootTime) }\n",
-    )
-    .expect("write");
     let sources = production_sources_under(dir);
+    assert_eq!(
+        relative(dir, sources_naming(&sources, "FWPM_FILTER_FLAG_BOOTTIME")),
+        vec!["imports.rs"]
+    );
+}
 
-    // Scoped to where the fold actually is, the install stands alone.
-    assert_eq!(boot_time_halves(&sources, &dir.join("windows.rs")), (true, false));
-    // Scoped anywhere else, the fold's own mention masks it — which is why the
-    // main test asserts `decision_sites` before it asserts the halves.
-    assert_eq!(boot_time_halves(&sources, &dir.join("elsewhere.rs")), (true, true));
-    assert_eq!(relative(dir, decision_sites(&sources)), vec!["windows.rs"]);
+#[skuld::test]
+fn the_mapping_is_found_by_its_definition_and_never_by_prose() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let dir = root.path();
+    std::fs::write(
+        dir.join("windows.rs"),
+        "fn filter_flags(self) -> FWPM_FILTER_FLAGS { todo!() }",
+    )
+    .expect("write");
+    std::fs::write(
+        dir.join("macos.rs"),
+        "/// Whether `fn filter_flags` says so.\nfn g() {}",
+    )
+    .expect("write");
+
+    assert_eq!(
+        relative(dir, flag_producer_sites(&production_sources_under(dir))),
+        vec!["windows.rs"]
+    );
+}
+
+#[skuld::test]
+fn a_dynamic_session_is_exempt_from_the_raw_bits_rule_and_a_static_one_is_not() {
+    // The exemption is anchored to the dynamic session, not to a path: a
+    // source that writes raw flag bits keeps the exemption only while it names
+    // the flag that makes WFP refuse a boot-time filter on its objects. Stop
+    // being dynamic and the exemption stops with it. (Whole-file granularity —
+    // see `dynamic_session_sites` for the residual that leaves.)
+    let root = tempfile::tempdir().expect("tempdir");
+    let dir = root.path();
+    std::fs::write(
+        dir.join("dynamic.rs"),
+        "let session = FWPM_SESSION0 { flags: FWPM_SESSION_FLAG_DYNAMIC, ..Default::default() };\n\
+         let flags = FWPM_FILTER_FLAGS(0);\n",
+    )
+    .expect("write");
+    std::fs::write(dir.join("persistent.rs"), "let flags = FWPM_FILTER_FLAGS(0x4);\n").expect("write");
+
+    let sources = production_sources_under(dir);
+    assert_eq!(relative(dir, dynamic_session_sites(&sources)), vec!["dynamic.rs"]);
+    assert_eq!(
+        relative(dir, sources_naming(&sources, "FWPM_FILTER_FLAGS")),
+        vec!["dynamic.rs", "persistent.rs"],
+        "`persistent.rs` names the bits with no dynamic session and no mapping, which is what \
+         must fire"
+    );
 }

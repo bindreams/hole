@@ -928,7 +928,10 @@ egress set and blocking everything else; they differ in lifetime and which set
 they permit.
 
 Both are deliberately **persistent** WFP filters, surviving an update-cutover
-restart on purpose. The Windows DNS-egress confinement
+restart on purpose (Windows: the standing lockdown cover's block-all is
+ADDITIONALLY twinned by a boot-time filter, aimed at a window `PERSISTENT`
+alone cannot reach — see [Lockdown mode](#lockdown-mode) for what that is
+measured to do and what it is not). The Windows DNS-egress confinement
 ([`tun_engine::dns_confine`](crates/tun-engine/src/dns_confine.rs), see
 [DNS forwarder](#dns-forwarder)) is the opposite: a **dynamic**, process-scoped
 FWPM session that dies with the engine handle, including on an abnormal exit —
@@ -1052,15 +1055,21 @@ sweep only knows the first ten) leaves those two permits un-swept; they are
 so this is bounded and self-healing (a later upgrade's sweep cleans them up),
 not a leak of blocked traffic. Disclosed as a source comment on
 `FILTER_GUIDS` itself. Tracked separately:
-[#754](https://github.com/bindreams/hole/issues/754). **Windows only, also
-pre-existing:** the repair's release step deletes the held cover's filters by
-fixed GUID and discards the result; if a delete genuinely fails, the
-subsequent re-engage's add for that same GUID reports success
+[#754](https://github.com/bindreams/hole/issues/754). **Windows only, was
+pre-existing, now closed:** the repair's release step deletes the held cover's
+filters by fixed GUID and discards the result; if a delete genuinely failed,
+the subsequent re-engage's add for that same GUID reported success
 (`FWP_E_ALREADY_EXISTS` is treated as OK, by design, for the crash-recovery
-idempotency case) while the LIVE filter still carries the OLD value — a
-stale permit surviving, not a leaked block. Disclosed as a source comment on
-`ok_or_exists`. Tracked separately:
-[#761](https://github.com/bindreams/hole/issues/761).
+idempotency case) while the LIVE filter still carried the OLD value — a stale
+permit surviving, not a leaked block. The same shape reached the lockdown
+cover's App-ID permits across an update-cutover, where the stale value is the
+*pre-update* `hole.exe` path and the running binary is the one left blocked.
+Both engages now pre-delete every filter whose condition carries a
+runtime-discovered value (`Condition::carries_runtime_value` —
+`transient_pre_delete_guids`, `appid_pre_delete_guids`) inside their own
+transaction, and `add_filter` refuses a duplicate on such a filter rather than
+papering over it, so the case is removed rather than documented
+([#761](https://github.com/bindreams/hole/issues/761)).
 
 It is **name-agnostic** — it does *not* permit the TUN interface. The new
 bridge's start-time DNS-forwarder self-test runs over loopback to the SS client
@@ -1176,6 +1185,200 @@ identified at runtime via `TunIdentity`, on macOS), the onward server
 connection, and (Windows) the plugin + bridge binaries by App-ID — so normal
 traffic flows while connected and the block holds across a bridge restart for
 free. When disabled, behavior is byte-identical to a Hole without it.
+
+**Windows, boot-time coverage ([#998](https://github.com/bindreams/hole/issues/998)).**
+A merely-`PERSISTENT` filter is re-added by the Base Filtering Engine (BFE)
+once it starts, not enforced before that — the kernel enforces only
+`FWPM_FILTER_FLAG_BOOTTIME` filters from boot until BFE takes over, so a
+`PERSISTENT`-only block-all left the host open on every reboot with the kill
+switch armed. The block-all half of the standing cover now additionally
+installs `BOOTTIME` twins (`LOCKDOWN_BOOTTIME_BLOCK_ALL_GUIDS`); the two flags
+are mutually exclusive on one filter object, so these are two more filters, not
+two more bits, and WFP documents the hand-off between them as atomic. Every
+permit, including loopback, stays `PERSISTENT`-only: a boot-time permit either
+carries a runtime-discovered value nothing can refresh pre-BFE, or has no
+hand-off to its narrower persistent counterpart — and the leak this closes is
+network egress, not loopback. So the boot→BFE window gets the block and nothing
+else: no loopback, TUN, server or App-ID permit, a total egress block rather
+than a scaled-down copy of the cover BFE later installs. Egress-only all the
+same — the twins sit on `ALE_AUTH_CONNECT_V4`/`_V6`, nothing at `RECV_ACCEPT`.
+The twins carry fixed GUIDs and are **pre-deleted at every engage**
+(`lockdown_pre_delete_guids`), not merely re-added: a boot-time filter is spent
+by the boot it covered, and under the reading where the spent object survives
+with its key occupied, an add would hit `FWP_E_ALREADY_EXISTS`, `ok_or_exists`
+would report success, and the kill switch would arm once and then silently
+stop. Deleting the key first is correct under both readings of what BFE does.
+
+The twin-pair shape and the blocks-only choice both follow shipped precedent:
+Mullvad and TinyWall each install a rule twice, `BOOTTIME` and `PERSISTENT`,
+under their own persistent containers. Of the two boot-time rule sets that
+could be read — Fort's and Mullvad's — every filter is a `BLOCK`; neither ships
+a boot-time *permit*. TinyWall is cited for the twin-pair shape only; its
+boot-time rule set was not read. Mullvad differs from Hole in when: its blocks go in as
+the daemon shuts down under a blocking policy and are swept by provider
+enumeration on the way back up, where Hole's go in at engage and stay while the
+kill switch is armed — a much wider window for a version skew to strand one.
+Two implementations ship without boot-time filters and belong in the same survey:
+`wireguard-windows` defines `cFWPM_FILTER_FLAG_BOOTTIME` and never uses it
+(`blocker.go` runs a fully dynamic session under a per-run random provider
+GUID), and OpenVPN's `wfp_block.c` sets `FWPM_SESSION_FLAG_DYNAMIC` under the
+comment "Add temporary filters which don't survive reboots or crashes".
+wireguard-windows is where this file's weight-arbitration recipe comes from, so
+it was read closely — grounds for trusting the survey did not simply miss a
+boot-time usage, not grounds for claiming its authors weighed boot-time and
+rejected it. Neither project ships an always-on kill switch meant to survive an
+arbitrary reboot, which is the requirement that makes `PERSISTENT`-only
+insufficient.
+
+**Unanalysed, and stated as such:** the twins are `Condition::Any` +
+`Action::Block` with no `CLEAR_ACTION_RIGHT`, so they are default-*hard*. On an
+armed host, every outbound connect between tcpip.sys start and BFE start fails
+— loopback included, unoverridable from another sublayer. What in that window
+might need egress (early-boot drivers, domain network providers, PXE/iSCSI, a
+network-key volume unlock) has not been established. Fort's boot-time blocks
+set `CLEAR_ACTION_RIGHT` and are soft; Mullvad's are hard like ours.
+
+Two things that decide whether this is safe are undocumented by WFP, so they
+are **measured on the real firewall** by
+[`boottime_privileged_tests.rs`](crates/tun-engine/src/routing/failclosed/boottime_privileged_tests.rs)
+rather than argued, in the elevated `tun` lane, with no reboot. The dangerous
+one is deletion: the default enumeration view *excludes* boot-time filters, so
+a delete that could not see them would return `FWP_E_FILTER_NOT_FOUND` — which
+`first_delete_failure` whitelists — and `release_all` would report success over
+a still-blocked host. The probe filter is deliberately a *permit* on an RFC
+5737 documentation address, never a block, so the test cannot itself brick the
+machine it is ruling out bricking.
+
+**What that measurement returned**, for a boot-time filter added through the
+production `add_filter` under the covers' own persistent provider and sublayer:
+WFP accepted it; the stored record carries `FWPM_FILTER_FLAG_BOOTTIME` and not
+`FWPM_FILTER_FLAG_PERSISTENT`, our `providerKey` and our `subLayerKey`
+(`flags` read back as `0x2` on the host this was measured on; what the test
+*asserts* is the weaker and more portable claim that `FWPM_FILTER_FLAG_DISABLED`
+and `PERSISTENT` are both clear, since WFP may set flags of its own such as
+`INDEXED`); a by-key
+`FwpmFilterGetByKey0` of it returns `ERROR_SUCCESS`, so boot-time filters *are*
+visible to `lockdown_cover_presence` despite having no by-key equivalent of the
+enumeration opt-in; and `FwpmFilterDeleteByKey0` returned `ERROR_SUCCESS` (not
+`FWP_E_FILTER_NOT_FOUND`) after which the filter was gone from the boot-time
+view. A second test drives
+the real `engage_lockdown` twice in one boot and asserts, on WFP's own
+`filterId`, that the twins were genuinely re-created while the persistent
+block-all beside them was not.
+
+**Read the delete result at its scope.** That delete removed a *live* FWPM
+object in the same session that added it. The delete this design is actually
+exposed to is the one issued in a *later* boot, where no live object remains and
+`FwpmFilterDeleteByKey0` answers `FWP_E_FILTER_NOT_FOUND` — which
+`first_delete_failure` whitelists as benign. So the question the measurement is often
+cited as settling is still open, and only a reboot can close it. That matters
+most at one call site: [#1009](https://github.com/bindreams/hole/issues/1009)
+made `release_covers` → `failclosed::release_all` the MSI's `Return="check"`
+uninstall gate. On a boot where the bridge never engaged, both twin keys answer
+not-found, and a bare `Ok` there would be
+[#1003](https://github.com/bindreams/hole/issues/1003) recreated for the pre-BFE
+window, with nothing left to clear it.
+
+The *claim* is closed even though the question is not: the twins' swept keys
+carry `KeyLifetime::BootTime`, so `KeyObservation::proves_empty` answers false
+for their not-found and `release_all` reports them **unproven** in its
+`Clearance`. The uninstall still proceeds — refusing it over a bounded
+boot-window block would trade that for a permanently unremovable product — but
+it proceeds without claiming a proof nobody made, and
+`cutover::release_clearance_report` names the keys while `hole.exe` still
+exists to name them. #1008's provider-enumeration sweep does not close the
+underlying question either — that also reads live objects.
+
+**Its limit, which must travel with the result.** The probe's enumeration
+template names *no provider* — deliberately, since filtering by ours would make
+"the record dropped its provider" and "there is no record" the same empty
+answer. So what is proven is that the stored record *carries* our `providerKey`,
+**not** that a `BOOTTIME_ONLY` template filtered *by* `providerKey` returns it.
+Those are one step apart and
+[#1008](https://github.com/bindreams/hole/issues/1008) needs the second. The
+result rules out the outcome that would have made #1008 impossible; it does not
+demonstrate #1008's mechanism.
+
+**Not settled by any test, and not claimed.** Everything above holds *within a
+single boot* — that is the whole reach of the elevated lane, which does not
+reboot, and there is no reboot-capable elevated lane to add the case to. Green
+CI on this change is not coverage of any of: whether the kernel enforces a twin
+during the boot→BFE window (the twins name a provider and sublayer that BFE
+itself provisions, so what the pre-BFE kernel does with them is not merely
+unmeasured but undocumented — Fort's use of the *default sublayer* for its
+boot-time filters only, against its own sublayer for its persistent ones, is
+consistent with treating that as a hazard; its provider-less-ness is not
+evidence either way, since `FORT_PROV_INIT_FILTER_ARGS` has no `providerKey`
+field and *no* Fort filter names a provider); whether a by-key delete purges the
+underlying boot-time record rather than the runtime copy; and whether a twin
+covers boots after the one following its install. Microsoft's own pages disagree
+on the underlying mechanic — `FwpmFilterAdd0`'s Remarks and "Object Management"
+say boot-time filters are "removed" once BFE finishes initializing; "Basic
+Operation of WFP" says twice that they are "disabled" — and, more to the point,
+**none of them addresses re-provisioning at later boots at all**. That is
+silence, not contradiction, and it stays recorded as silence rather than resolved
+by picking the convenient reading. What it *does* settle is a constraint: every
+path must be correct under both readings, which is why the twins are pre-deleted
+rather than re-added.
+
+`FWPM_FILTER_FLAG_DISABLED` does not adjudicate it, despite the name. Microsoft
+defines that bit as a *provider* property — set when BFE starts if the provider
+has no associated Windows service name or its service is not auto-start — and
+says it cannot be set when adding a filter. The privileged tests read it on both lifetimes, but only as a check that WFP
+honours its own add-time rule: both reads are taken on filters the test process
+added seconds earlier, so BFE has not started since they existed and the bit
+cannot be set on them. **It is not evidence that Hole's provider survives a BFE
+start.** That question is open and separate: `add_provider` passes no
+`serviceName`, which is the first condition Microsoft names for a provider whose
+filters BFE disables at startup — and if it applies, the `PERSISTENT` half of the
+kill switch comes back disabled every boot. Settling it needs
+`FwpmProviderGetByKey0` against a provider that outlived a reboot, which no
+single-boot lane can produce.
+
+A stranded boot-time leftover has no self-healing path the way a stranded
+persistent one does: BFE re-adds a persistent leftover at every start whatever
+build is running, so a later GUID-aware build can still reach it by key, while
+nothing any build runs re-adds a boot-time one — an older binary that never
+learned its GUID cannot find it. How much that matters rides on the same
+unanswered re-provisioning question, and it cuts both ways: if a record is
+re-provisioned every boot, the twins work every boot *and* a stranded one blocks
+every boot; if it is spent after one, the hazard mostly evaporates and so does
+most of the protection. Hole assumes the worse branch for safety and claims the
+weaker one for coverage. Bounding the hazard is
+[#1008](https://github.com/bindreams/hole/issues/1008).
+
+**Size that worst case correctly.** Both Microsoft readings agree the filter
+stops applying once BFE starts, so a stranded twin blocks egress from tcpip.sys
+until BFE and then stops — seconds per boot. #998 and #1008 both describe it as
+"a permanent block-all with no way to remove it"; that is the `PERSISTENT`
+failure mode, not this one, and overstates the boot-time hazard by the length of
+a whole session.
+
+That recalibration is **conditional on the unanalysed hazard above** and must
+travel with it: it holds for a host whose boot does not itself need egress. On a
+PXE- or iSCSI-booted machine, or one unlocking a volume against a network key
+server, a hard total-egress block in that window could stop the boot from
+reaching BFE — and a boot that never reaches BFE never reaches the thing that
+lifts the block, which *is* the bricked machine this paragraph otherwise rules
+out. "Boot-window outage" for an ordinary workstation; unestablished, and
+possibly worse, for a network-booted one. The genuinely
+unrecoverable case is narrower: **BFE failing to start**, where `FwpmEngineOpen0`
+fails and `release_all` and `bridge unlock` both return `Err` having issued
+nothing.
+
+Out-of-band recovery, at the confidence it deserves: there is no in-box one. `netsh wfp` is a
+**diagnostics-only** context — its verbs are `capture`, `dump`, `help`, `set` (capture options
+only) and `show` ([netsh
+wfp](https://learn.microsoft.com/windows-server/administration/windows-commands/netsh-wfp)), none
+of which takes a filter key — so the usual "recover with `netsh wfp`" advice does not apply to any
+WFP filter. There is no `netsh wfp reset`: `reset` belongs to other contexts (`netsh advfirewall reset`, `netsh int ip reset`) and resets firewall/TCP-IP policy, not WFP's filter store. What
+`netsh wfp` *can* do here is `show boottimepolicy`, the OS's own view of the boot-time policy
+store; `show filters` lists what is active *now*, which excludes a boot-time filter once BFE has
+started — i.e. at every moment an operator reads it. Seeing is not removing: the only removal API
+is FWPM. The one other hatch worth recording, and not worth offering a user, is removing
+`HKLM\SYSTEM\CurrentControlSet\Services\BFE\Parameters\Policy\BootTime`, where boot-time
+filter blobs are reported to live — **not Microsoft-documented at all** (third-party reverse
+engineering) and untested here.
 
 It contrasts with the [transient cutover cover](#transient-cutover-cover) on
 three axes:
@@ -1442,33 +1645,59 @@ It deliberately does not assert a leftover is *present* — an unproven key is
 equally consistent with never having been installed, which is what it will be
 on almost every uninstall.
 
-Today every key Hole sweeps is `Persistent`, so the unproven set is empty and
-the report never fires (`a_sweep_of_todays_keys_proves_every_one_of_them_empty`
-pins that). The ordering is on purpose: the gate lands **before** the
-boot-time filters of #998/#1010 do, so they cannot arrive as a silent false
-`Ok`. `a_boot_time_flag_cannot_be_introduced_without_classifying_its_key` is
-the tripwire — a source-level check, because the fact it guards spans a runtime
-`FilterSpec` and a static sweep array and no type holds both. It reads every
-production source in tun-engine off disk, symlinks followed (`rustc` resolves a
-`mod` through one, so a symlinked source ships), rather than one hardcoded file:
-an add landing in a new submodule — or at the crate's other sanctioned FWPM
-site, `dns_confine/windows.rs` — cannot slip past both halves. The `*_tests.rs`
-siblings are excluded, or the scan would read an install out of test code. The
-classification half skips exactly one file, the one defining the `proves_empty`
-fold and so naming `BootTime` by construction; that exclusion is anchored to
-where `fn proves_empty` actually is, so relocating the fold fails the guard
-instead of turning its own mention into a classification and letting an
-unclassified install pass in silence.
+#998/#1010's boot-time twins are the first and only keys Hole sweeps that are
+not `Persistent`, and the gate landed **before** them on purpose, so they could
+not arrive as a silent false `Ok`. On a not-found sweep the unproven set is now
+exactly those two keys and nothing else
+(`a_not_found_sweep_proves_every_key_but_the_boot_time_twins`); a sweep that
+watched them go answers `ERROR_SUCCESS` and is fully proven
+(`a_sweep_that_watched_the_twins_go_proves_them_empty`), which is the half that
+keeps `proves_empty` keyed on the *outcome* and not on the lifetime alone.
 
-What it matches is identifiers in **lexed** code (`proc-macro2`), not
-substrings: comments of every shape and string literals are gone before the
-scan, so prose cannot satisfy it, and an alias (`use ... FWPM_FILTER_FLAG_BOOTTIME as BOOT_FLAG`) cannot hide from it — the import names the symbol in full and the
-install half spans every production source. The disclosed residual is a flag
-that names no symbol at all: `FWPM_FILTER_FLAGS(0x4)` written as raw bits
-installs a boot-time filter nothing here can see. Closing that needs a
-constructor that cannot hand out the bits without a `KeyLifetime`, which is
-#1010's to land — introducing it now would put both symbols into production
-code and leave this guard permanently satisfied.
+**The mis-tag is now unrepresentable, not merely detectable.** `FilterLifetime`
+is a newtype over `KeyLifetime` with a private field: `filter_flags` — the
+crate's only producer of `FWPM_FILTER0::flags` — reads the very variant
+`key_lifetime` hands a sweep, so the flag and the classification are one value.
+`SweptKey` carries a `FilterLifetime` too, and the twins' key, layer, label and
+lifetime all come out of one `LOCKDOWN_BOOTTIME_TWINS` entry that both
+`build_lockdown_spec` and `swept_lockdown_keys` read. Installing a boot-time
+filter whose key a sweep calls `Persistent` is not a mistake that can be
+written. `every_lockdown_filter_is_swept_under_the_lifetime_it_is_installed_with`
+asserts it for every filter, including the App-ID ones whose two lists are still
+built independently.
+
+That is what retired the tripwire's original form.
+`a_boot_time_flag_cannot_be_introduced_without_classifying_its_key` asserted
+that the crate's sources install boot-time filters *iff* they classify
+boot-time keys. Once the coupling landed, both halves became permanently true
+— the equality holds no matter what a later change does, so it could no longer
+fail in the direction it existed for. A guard that still reads like evidence
+and cannot fail is worse than none, so the equality is gone and the scan is
+re-pointed at the property the type *cannot* enforce: that the type is the only
+way in. `the_boot_time_flag_is_named_only_where_a_key_lifetime_produces_it`
+asserts `FWPM_FILTER_FLAG_BOOTTIME` is named by exactly one production source
+— the one defining `fn filter_flags`, found by that definition rather than by a
+path, so moving the mapping re-anchors the guard instead of widening it.
+
+`the_raw_flag_bits_are_named_only_where_they_cannot_reach_the_boot_window`
+closes what the old form disclosed as a residual: `FWPM_FILTER_FLAGS(0x4)`
+written as raw bits names no flag symbol. `FWPM_FILTER_FLAGS` may be named only
+by the mapping's own source, plus any source opening its engine
+`FWPM_SESSION_FLAG_DYNAMIC` — WFP refuses a boot-time filter on a
+dynamic-session object, so bits written there cannot reach the boot window, and
+anchoring the exemption on the session flag means `dns_confine/windows.rs`
+stops being exempt the moment it stops being dynamic. Clippy cannot cover this:
+`disallowed_types` fires on a type in a signature but **not** on a bare
+tuple-struct construction expression (measured against clippy, not assumed).
+
+Both scans read every production source in tun-engine off disk, symlinks
+followed (`rustc` resolves a `mod` through one, so a symlinked source ships),
+rather than one hardcoded file — a boot-time flag landing in a new submodule, or
+at the crate's other sanctioned FWPM site, cannot slip past. The `*_tests.rs`
+siblings are excluded, or the scan would read an install out of test code. What
+they match is identifiers in **lexed** code (`proc-macro2`), not substrings:
+comments of every shape and string literals are gone before the scan, so prose
+cannot satisfy them, and an alias (`use ... FWPM_FILTER_FLAG_BOOTTIME as BOOT_FLAG`) cannot hide from them — the import names the symbol in full.
 
 The in-process escapes (`disengage_lockdown`, `ProxyManager::turn_lockdown_off`,
 the tray's Unblock) share the same boot-time blind spot and deliberately do
@@ -1555,9 +1784,12 @@ Disclosed residuals:
    `Unreadable` intent, never inferred.
 
    `Live` means **any residue**, not the whole cover: the Windows sweeps loop
-   delete-by-key with every return code discarded over persistent filters, so
-   a sweep interrupted mid-loop survives a reboot as a partial cover that a
-   single-GUID probe would call `Absent` forever.
+   delete-by-key with every return code discarded, over the persistent filters
+   and — for lockdown — the boot-time twins in the same array, so a sweep
+   interrupted mid-loop leaves a partial cover that a single-GUID probe would
+   call `Absent` forever. The persistent half of such a residue certainly
+   survives a reboot; what the boot-time half does is the open question in
+   [Lockdown mode](#lockdown-mode).
 
    `Adopt` never disengages the cover, on either platform. The server-permit
    volatile-refresh it used to perform moved into `engage_lockdown`, which

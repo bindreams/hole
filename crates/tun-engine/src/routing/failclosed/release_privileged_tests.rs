@@ -48,11 +48,33 @@ const NON_PERMITTED: &str = "8.8.8.8:443";
 /// Removes anything the test stranded, on every exit path including an
 /// unwind. `disarm` leaves no guard, so without this a failed assertion
 /// leaves the runner globally fail-closed.
+///
+/// It does NOT discard the release's verdict. This guard clears a system-wide
+/// block-all it may be the last thing able to clear, and it runs on the exit
+/// path of a test that had *already* decided something was wrong — so a
+/// failure here is the difference between a host that was tidied up and a host
+/// left with no egress. Swallowing it made "the sweep silently removed
+/// nothing" and "the sweep worked" the same observation, which is the exact
+/// failure class `release_all`'s "never a false success" clause exists to rule
+/// out. It panics (failing the test) when it can, and prints when it cannot —
+/// a panic during an unwind aborts the process, taking every other verdict in
+/// this serialized lane with it.
 struct ReleaseOnDrop(std::path::PathBuf);
 impl Drop for ReleaseOnDrop {
     fn drop(&mut self) {
-        // Must not panic during an unwind.
-        let _ = crate::routing::failclosed::release_all(&self.0);
+        let Err(e) = crate::routing::failclosed::release_all(&self.0) else {
+            return;
+        };
+        let msg = format!(
+            "CLEANUP FAILED: release_all could not clear this test's cover ({e}); this host may still \
+             be blocking all egress. Clear it with `hole bridge unlock`, elevated; `netsh wfp` \
+             cannot — it is diagnostics-only and has no delete verb."
+        );
+        if std::thread::panicking() {
+            eprintln!("{msg}");
+        } else {
+            panic!("{msg}");
+        }
     }
 }
 

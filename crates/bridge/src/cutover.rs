@@ -271,7 +271,7 @@ pub fn release_clearance_report(clearance: &Clearance) -> Option<String> {
          survives behind it. To check after this uninstall, run `netsh wfp show boottimepolicy` \
          elevated and look for these keys; if egress is blocked early in boot, that is where it \
          would show. `netsh wfp` cannot remove one — it has no delete verb, only capture/dump/\
-         set/show — and removing a WFP filter takes an FWPM call, which no binary left on this \
+         help/set/show — and removing a WFP filter takes an FWPM call, which no binary left on this \
          host can make. Reinstalling Hole and running `hole bridge release-covers` elevated puts \
          back the only tool that addresses these keys.",
         clearance.unproven_keys().len(),

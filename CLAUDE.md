@@ -150,6 +150,24 @@ before editing; the sections linked below are the authoritative source.
   (auto-connect) start whose lockdown intent is OFF; a lockdown-on covered
   start uses the standing cover instead and releases any held transient one.
   Both are persistent WFP filters (Win) / self-contained pf ruleset (mac); the
+  standing cover's Windows block-all pair additionally installs `BOOTTIME`
+  twins — two more filters, aimed at the kernel-start→BFE-start window
+  `PERSISTENT` alone cannot reach. They carry the block only, so that window
+  has no permits at all, and it is a HARD block (no `CLEAR_ACTION_RIGHT`) whose
+  effect on early boot is disclosed as unanalysed. The flag a twin is installed
+  with and the `KeyLifetime` its key is swept under are **one value**
+  (`FilterLifetime`, a newtype over `KeyLifetime`, read by both sites out of
+  `LOCKDOWN_BOOTTIME_TWINS`), so a boot-time filter whose key a sweep calls
+  `Persistent` — the #1003 false proof — is not expressible. Every engage
+  **pre-deletes** the twins' fixed keys, and every other key whose condition
+  carries a runtime value (server IP, TUN LUID, App-ID path), rather than
+  re-adding them: an add would short-circuit on `FWP_E_ALREADY_EXISTS` and
+  leave whatever the previous engage stored — a twin spent by the boot it
+  covered, or the pre-update `hole.exe` path. What is measured (WFP accepts and
+  stores them under our containers; a by-key delete removes a LIVE one; every
+  engage re-arms) versus unverified (anything spanning a reboot, including the
+  later-boot delete that #1009's uninstall gate depends on) is in
+  CONTRIBUTING.md. The
   transient one is swept unconditionally on next start, the standing one only
   on an explicit recorded off — full reconciliation table (`decide_cover_recovery`)
   and disclosed residuals in CONTRIBUTING.md. A single persisted `Target`

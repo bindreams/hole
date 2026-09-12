@@ -2,6 +2,12 @@
 
 Per-product release procedure: see [CONTRIBUTING.md § Releases](CONTRIBUTING.md#releases). This file is the runbook for the off-happy-path operations — rollback, minisign key rotation, and the crates.io dry-run staleness gap.
 
+## Ship blockers
+
+Conditions under which a `hole` release must not go out, recorded here because the code that states them is not where a release operator looks.
+
+- **Windows boot-time kill-switch filters require [#1008](https://github.com/bindreams/hole/issues/1008) first.** [#998](https://github.com/bindreams/hole/issues/998) adds `FWPM_FILTER_FLAG_BOOTTIME` twins to the standing lockdown cover's block-all pair. They are swept by a compiled-in fixed-GUID array, and unlike a stranded `PERSISTENT` filter — which BFE re-adds every boot, so a later GUID-aware build can always find it — a stranded BOOT-TIME filter has **no self-healing path**: nothing any later build runs puts it back, and an older binary that never learned a newer binary's boot-time GUID cannot delete it by key. So **do not ship the twins in a release a user could downgrade from until #1008's version-independent sweep (enumerate live filters by `PROVIDER_GUID`) has landed.** The constraint is #1008's own, restated in `crates/tun-engine/src/routing/failclosed/windows.rs`'s "Boot-time coverage" module doc; the harm is bounded (a stranded twin blocks egress from kernel start until BFE start, then stops) but it recurs every boot with no in-band removal.
+
 ## Rollback procedure
 
 Rollback is a **forward-only mitigation**, not undo. A yanked crates.io version cannot be republished; a deleted-and-recreated GitHub release with the same tag has a different commit history. Plan accordingly.
@@ -66,7 +72,7 @@ If the release can never succeed, force the uninstall past the gate:
 msiexec /x hole.msi HOLE_KEEP_COVERS=1
 ```
 
-**This leaves the host blocked.** The property skips the release entirely, and nothing shipped with Windows can undo it: `netsh wfp` is diagnostics-only (`capture`, `dump`, `help`, `set`, `show` — [no delete verb](https://learn.microsoft.com/windows-server/administration/windows-commands/netsh-wfp)), so `netsh wfp show filters` can show Hole's provider but not remove it. Removing a WFP filter takes an FWPM call, and `hole.exe` is the only caller of one on that host. So use this only after the product has been reinstalled at least once and `hole bridge release-covers` (elevated) has been tried and cannot succeed — and expect to reinstall Hole again to clear the block.
+**This leaves the host blocked.** The property skips the release entirely, and nothing shipped with Windows can undo it: `netsh wfp` is diagnostics-only (`capture`, `dump`, `help`, `set`, `show` — [no delete verb](https://learn.microsoft.com/windows-server/administration/windows-commands/netsh-wfp)), so `netsh wfp show filters` can show Hole's persistent provider but not remove it. Use `netsh wfp show boottimepolicy` for the kill switch's boot-time twins: `show filters` lists what is active *now*, which by definition excludes a boot-time filter once BFE has started — i.e. at every moment you can run the command. Removing a WFP filter takes an FWPM call, and `hole.exe` is the only caller of one on that host. So use this only after the product has been reinstalled at least once and `hole bridge release-covers` (elevated) has been tried and cannot succeed — and expect to reinstall Hole again to clear the block.
 
 ## Minisign key rotation (hole only)
 

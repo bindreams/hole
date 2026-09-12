@@ -377,8 +377,13 @@ pub enum KeyLifetime {
     /// window only. How long that window is has not been measured here — the
     /// claim is that it is bounded and ends before the network stack is
     /// generally usable, not any particular duration. It is not permanent
-    /// network loss, which is why an unproven key does not fail a release.
-    /// What it must not do is read as proof.
+    /// network loss, which is why an unproven key does not fail a release —
+    /// but conditionally: the Windows impl's "Boot-time coverage" module doc
+    /// (`failclosed/windows.rs`) declines to assert that bound for a host
+    /// whose boot itself needs egress (PXE or iSCSI boot, volume unlock
+    /// against a network key server), where a block in that window can stop
+    /// the boot from ever reaching the BFE start that would lift it. What it
+    /// must not do is read as proof.
     BootTime,
 }
 
@@ -471,9 +476,14 @@ pub struct Clearance {
 }
 
 impl Clearance {
-    /// The verdict for a sweep with nothing left unproven — every platform
-    /// whose covers are all [`KeyLifetime::Persistent`], which today is macOS
-    /// and every Windows key.
+    /// The verdict for a sweep with nothing left unproven.
+    ///
+    /// That is every platform whose covers are all
+    /// [`KeyLifetime::Persistent`] — today, macOS. It is NOT every Windows
+    /// key: the standing lockdown cover's boot-time block-all twins
+    /// (bindreams/hole#998) are [`KeyLifetime::BootTime`], so a Windows sweep
+    /// that did not watch them go is unproven and must build its verdict with
+    /// [`Self::from_observations`] rather than reach for this.
     pub fn proven() -> Self {
         Self { unproven: Vec::new() }
     }
@@ -564,3 +574,12 @@ mod release_privileged_tests;
 #[cfg(test)]
 #[path = "failclosed/live_tun_permit_privileged_tests.rs"]
 mod live_tun_permit_privileged_tests;
+
+// Privileged-lane measurement (#998) of what WFP does with a BOOT-TIME filter:
+// whether it accepts one under our persistent containers, keeps them, and
+// removes it on a by-key delete. Windows-only — macOS's pf ruleset has no
+// boot-time equivalent (pf rules do not survive a reboot at all, #617). Gated
+// identically to `lockdown_privileged_tests` above.
+#[cfg(all(test, target_os = "windows"))]
+#[path = "failclosed/boottime_privileged_tests.rs"]
+mod boottime_privileged_tests;
