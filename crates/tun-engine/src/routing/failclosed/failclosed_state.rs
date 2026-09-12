@@ -77,7 +77,8 @@ pub fn load_presence(state_dir: &Path) -> super::StateFile<FailClosedState> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return StateFile::Absent,
         Err(e) => {
             tracing::warn!(error = %e, path = %path.display(), "failclosed-state read failed");
-            return StateFile::Unusable;
+            // No bytes, so nothing to salvage a token from.
+            return StateFile::Unusable { pf_token: None };
         }
     };
     match serde_json::from_slice::<FailClosedState>(&bytes) {
@@ -86,13 +87,13 @@ pub fn load_presence(state_dir: &Path) -> super::StateFile<FailClosedState> {
             tracing::warn!(
                 got = other.version,
                 want = SCHEMA_VERSION,
-                "failclosed-state schema mismatch, discarding"
+                "failclosed-state schema mismatch, discarding the record but salvaging its pf token"
             );
-            StateFile::Unusable
+            StateFile::unusable(&bytes)
         }
         Err(e) => {
             tracing::warn!(error = %e, path = %path.display(), "failclosed-state parse failed");
-            StateFile::Unusable
+            StateFile::unusable(&bytes)
         }
     }
 }
@@ -104,7 +105,7 @@ pub fn load_presence(state_dir: &Path) -> super::StateFile<FailClosedState> {
 pub fn load(state_dir: &Path) -> Option<FailClosedState> {
     match load_presence(state_dir) {
         super::StateFile::Present(s) => Some(s),
-        super::StateFile::Absent | super::StateFile::Unusable => None,
+        super::StateFile::Absent | super::StateFile::Unusable { .. } => None,
     }
 }
 

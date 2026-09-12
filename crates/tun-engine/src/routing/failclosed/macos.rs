@@ -78,19 +78,66 @@ use super::RESOLVER_PERMIT_PORT;
 /// this fetch can need) — NOT the server permit's unrestricted shape.
 ///
 /// Loopback is exempted TWICE, by [`LOOPBACK_SKIP`] *and* [`LOOPBACK_PASSES`]
-/// — see the latter for why one exemption is not enough.
+/// — see the latter for why one exemption is not enough. Both permits are
+/// emitted through [`permit`], which is where the `no state` rule lives.
 pub fn build_pf_ruleset(server_ip: IpAddr, resolver_ip: Option<IpAddr>) -> String {
     let resolver_pass = resolver_ip
-        .map(|ip| format!("pass out quick proto tcp from any to {ip} port {RESOLVER_PERMIT_PORT}\n"))
+        .map(|ip| {
+            permit(&format!(
+                "pass out quick proto tcp from any to {ip} port {RESOLVER_PERMIT_PORT}"
+            ))
+        })
         .unwrap_or_default();
     format!(
         "set block-policy drop\n\
          {LOOPBACK_SKIP}\
          {LOOPBACK_PASSES}\
          block out all\n\
-         pass out quick from any to {server_ip}\n\
-         {resolver_pass}"
+         {server_pass}\
+         {resolver_pass}",
+        server_pass = permit(&format!("pass out quick from any to {server_ip}")),
     )
+}
+
+/// Terminate a cover `pass` rule with the `no state` qualifier EVERY permit in
+/// EVERY cover ruleset carries, and hold the single statement of why. A permit
+/// that does not come through here is a bug, in both covers and for two
+/// different reasons.
+///
+/// `pfctl` normalizes a bare `pass out quick from any to 1.1.1.1` to
+/// `... flags S/SA keep state` — measured, not assumed
+/// (`transient_cover_permits_are_never_syn_only` and its lockdown twin run the
+/// real `pfctl -vn -f -`). Such a rule matches ONLY a SYN, so a mid-stream
+/// segment of a flow the permit names falls through to the block-all base and
+/// is discarded under `block-policy drop` whenever that flow has no pf state
+/// entry to be matched against first. Each cover reaches that condition by its
+/// own route:
+///
+/// - [`CoverKind::Transient`] — the flow HAD an entry and lost it. The engage
+///   follows its load with `pfctl -F states` ([`purges_state`]), which is
+///   host-wide (`DIOCCLRSTATES`, no `psk_ifname`/`psk_ownername`), so it takes
+///   the entries of flows this ruleset PERMITS along with everyone else's. The
+///   resolver permit is the sharp edge: `resolver_ip` is the caller's own
+///   `ech-doh` host, typically a well-known public DoH address a browser on the
+///   same machine is already holding a TLS connection to.
+/// - [`CoverKind::Lockdown`] — the flow never had an entry. `engage_lockdown`
+///   runs AFTER `routing.install`, so the tunnel is already carrying traffic
+///   when the ruleset commits; on stock macOS (pf loaded, never enabled) the
+///   engage's own `pfctl -E` is what enabled pf, and pf creates no state for
+///   packets it never saw. [`purges_state`] not purging preserves nothing,
+///   because there is nothing there to preserve.
+///
+/// `no state` suppresses the `flags S/SA` default — that default is gated on
+/// the rule keeping state — so the permit matches a mid-stream segment and
+/// leaves nothing for a purge to take. Neither ruleset carries a `block in`, so
+/// an outbound-only permit needs no state entry for its return traffic either.
+/// Same primitive and same reason as [`LOOPBACK_PASSES`]; the one wrinkle noted
+/// there applies here too — a matching `nat`/`rdr` rule (only
+/// [`build_lockdown_main_ruleset`] carries translation) makes pf create state
+/// regardless, which is harmless, because what severed the flow was the
+/// `flags S/SA` MATCH and not the state entry.
+fn permit(rule: &str) -> String {
+    format!("{rule} no state\n")
 }
 
 /// The `set` half of the loopback exemption, holding its STEADY state: it
@@ -121,16 +168,13 @@ pub const LOOPBACK_SKIP: &str = "set skip on lo0\n";
 /// replacing a live cover is affected alike: a cover transition, the
 /// `/etc/pf.conf` restore in [`disengage`], and lockdown engage/disengage.
 ///
-/// `no state` is load-bearing here, and is exactly why these rules do not
-/// reintroduce the stateful-`pass` failure [`LOOPBACK_SKIP`] exists to avoid.
-/// `pfctl -vn -f -` normalizes a bare `pass out quick on lo0 all` to
-/// `... flags S/SA keep state` — a SYN-only match — but that default is gated
-/// on the rule keeping state, so `no state` suppresses it. These rules
-/// therefore match mid-stream segments, and create nothing for a state purge to
-/// take away. (One exception, benign here: a matching nat/rdr rule makes pf
-/// create state even for a `no state` filter rule. Only
-/// [`build_lockdown_main_ruleset`] carries translation rules, and that cover
-/// does not purge — [`purges_state`].)
+/// `no state` is load-bearing here, for the reason [`permit`] states for every
+/// permit in every cover ruleset; these rules are written out rather than built
+/// by it only because they are a const. Without it they would reintroduce the
+/// stateful-`pass` failure [`LOOPBACK_SKIP`] exists to avoid. (One exception,
+/// benign: a matching nat/rdr rule makes pf create state even for a `no state`
+/// filter rule. Only [`build_lockdown_main_ruleset`] carries translation rules,
+/// and that cover does not purge — [`purges_state`].)
 ///
 /// BOTH directions, though only `out` is load-bearing against today's
 /// out-only blocks, because these rules stand in for [`LOOPBACK_SKIP`] and
@@ -170,7 +214,10 @@ pub const LOCKDOWN_PF_LABEL: &str = "hole-lockdown";
 /// Loopback is exempted twice over, by [`LOOPBACK_SKIP`] and
 /// [`LOOPBACK_PASSES`], exactly as in [`build_pf_ruleset`]. The passes LEAD the
 /// filter section: `block drop out quick inet6 all` is `quick`, so it would
-/// terminate evaluation on a `::1` packet before any later lo0 rule.
+/// terminate evaluation on a `::1` packet before any later lo0 rule. The server
+/// and TUN permits are emitted through [`permit`] — the tunnel this ruleset
+/// exists to protect is already LIVE when it commits, so a permit that matched
+/// only a SYN would drop it.
 ///
 /// The base rule's [`LOCKDOWN_PF_LABEL`] is **load-bearing**, not decoration:
 /// it is the only evidence [`lockdown_cover_presence`] has that does not come
@@ -184,14 +231,13 @@ pub fn build_lockdown_main_ruleset(tun_name: &str, server_ip: IpAddr, nat_snapsh
          {LOOPBACK_SKIP}\
          {nat}\
          {LOOPBACK_PASSES}\
-         pass out quick proto {proto} from any to {ip}\n\
-         pass out quick on {tun} all\n\
+         {server_pass}\
+         {tun_pass}\
          block drop out quick inet6 all\n\
          block drop out quick all label \"{label}\"\n",
         nat = ensure_trailing_nl(nat_snapshot),
-        proto = proto,
-        ip = server_ip,
-        tun = tun_name,
+        server_pass = permit(&format!("pass out quick proto {proto} from any to {server_ip}")),
+        tun_pass = permit(&format!("pass out quick on {tun_name} all")),
         label = LOCKDOWN_PF_LABEL,
     )
 }
@@ -300,8 +346,8 @@ const PFCONF: &str = "/etc/pf.conf";
 const PFCTL: &str = "/sbin/pfctl";
 
 /// Build the argv `pfctl` runs with: [`PFCTL`]'s absolute path followed by
-/// `args`. Pure so the hardening in [`PFCTL`]'s doc — the absolute path, not a
-/// PATH-resolved bare `"pfctl"` — is unit-tested without spawning anything.
+/// `args`. Pure so the hardening in [`PFCTL`]'s doc is unit-tested without
+/// spawning anything.
 fn pfctl_cmd(args: &[&str]) -> Vec<String> {
     std::iter::once(PFCTL)
         .chain(args.iter().copied())
@@ -373,19 +419,23 @@ impl Cover {
 ///   standing ruleset left by an outgoing bridge's `CoverGuard::disarm`. There
 ///   is no tunnel of ours for it to kill — the transient cover is engaged in
 ///   `hold_pending`, *before* `start_inner`. The flush is nonetheless HOST-WIDE
-///   (`DIOCCLRSTATES`, no `psk_ifname`/`psk_ownername`), so what protects the
-///   traffic this cover means to PERMIT is not the flush's scope but the
-///   ruleset's: loopback is exempted with `set skip on lo0` rather than a
-///   state-bearing `pass` ([`build_pf_ruleset`]), so local sessions survive a
-///   purge that a `pass` rule would have severed. Egress this cover permits by
-///   IP (the server, the resolver) is a fresh connection after the engage, so
-///   it re-creates its own state under the new ruleset.
+///   (`DIOCCLRSTATES`, no `psk_ifname`/`psk_ownername`) — it takes the entries
+///   of flows this ruleset PERMITS along with everyone else's — so what protects
+///   the traffic this cover means to permit is the ruleset, never the flush's
+///   scope, and nothing here may assume that traffic is a fresh post-engage
+///   connection. Loopback is exempted with `set skip on lo0` rather than a
+///   state-bearing `pass` ([`build_pf_ruleset`]); the server and resolver
+///   permits carry `no state` ([`permit`]), so a flow whose entry this flush
+///   took still matches its permit mid-stream.
 /// - [`CoverKind::Lockdown`] — **do not purge** (bindreams/hole#1015's
 ///   remaining half, sequenced behind bindreams/hole#1002).
 ///   `engage_lockdown` runs with the tunnel LIVE, and `pfctl -F states` →
 ///   `DIOCCLRSTATES` is host-wide with neither `psk_ifname` nor
 ///   `psk_ownername` set: it would kill the very tunnel the kill switch
-///   exists to protect. "Everything except the tunnel" needs
+///   exists to protect. Not purging is not by itself enough to CARRY that
+///   tunnel across the load — on a pf this engage's own `pfctl -E` enabled
+///   there is no state to preserve — which is why the lockdown's permits are
+///   `no state` too ([`permit`]). "Everything except the tunnel" needs
 ///   `DIOCKILLSTATES`' `psk_dst.neg`, which macOS's `pfctl` CLI has no flag
 ///   to set, so it is not expressible through the only interface pf offers.
 const fn purges_state(kind: CoverKind) -> bool {
@@ -534,19 +584,15 @@ fn engage_with(
     }
 
     // 4. Load our self-contained blocking ruleset from stdin — NO `-Fa`
-    //    (bindreams/hole#997): a bare `pfctl -f -` is one atomic pf
-    //    transaction (see this module's doc), so whatever ruleset was already
-    //    loaded (the host's own, or a still-live prior cover's) stays
-    //    authoritative until this one fully commits. The state purge that
-    //    follows it is [`purges_state`]'s call, not this site's.
+    //    (bindreams/hole#997), see this module's doc for why that is atomic
+    //    for the rules. The state purge that follows is [`purges_state`]'s
+    //    call, not this site's.
     let ruleset = build_pf_ruleset(server_ip, resolver_ip);
     if let Err(e) = load_cover_ruleset(CoverKind::Transient, &ruleset, ops) {
         // A *failed engage* is the sole place this module fails OPEN on its own
         // error: we must not leave a half-loaded ruleset blocking traffic. A
-        // failed `pfctl -f -` load never committed its RULES (the ticket
-        // discipline that makes a successful load atomic also makes a failed
-        // one a no-op on the live RULESET), so the host still filters under
-        // whatever ruleset was loaded before this call. That is NOT the same
+        // failed `pfctl -f -` load never committed its RULES, so the host still
+        // filters under whatever ruleset was loaded before this call. That is NOT the same
         // as "a no-op on the live config": everything `pfctl` does outside the
         // ticket lands even when the load then fails — the `set block-policy`/
         // `skip`/`limit`/`timeout` ioctls it issues as it parses (module doc),
@@ -573,7 +619,16 @@ fn engage_with(
         // blocking right up until this failed load — the `/etc/pf.conf`
         // reload below replaces it with the open host baseline rather than
         // leaving the still-good prior ruleset in place. `engage` has no
-        // parameter today to tell "first engage" from "transition" apart.
+        // parameter today to tell "first engage" from "transition" apart —
+        // which is why the warn below fires unconditionally: this site cannot
+        // tell the harmless case from the one that just opened a host a live
+        // cover was still holding, so it says so and leaves that to the reader.
+        tracing::warn!(
+            "the transient cover's ruleset failed to load; restoring /etc/pf.conf, which REPLACES \
+             whatever ruleset was live. If this engage was a TRANSITION over a still-live prior \
+             cover, that cover was blocking the host until this instant and the host is now OPEN \
+             (bindreams/hole#1004)"
+        );
         ops.transient_restore(&token);
         return Err(e);
     }
@@ -660,7 +715,9 @@ fn disengage(token: Option<&str>, state_dir: &Path, adopting: bool) {
         ),
         // Same disclosure `release_all_with`'s `Unusable` arm makes: the
         // restore still runs — it is what unblocks the host — but with no
-        // token on record there is nothing to hand `pfctl -X`.
+        // token on record there is nothing to hand `pfctl -X`. An `Unusable`
+        // record reaches here with `None` only when nothing could be salvaged
+        // out of its bytes either ([`StateFile::unusable`]).
         None => tracing::warn!(
             "no pf token on record for this cover; no pf enable refcount to drop — a refcount may \
              be leaked (pf then stays enabled over the canonical /etc/pf.conf, which blocks \
@@ -720,12 +777,13 @@ fn recover_cover_with(file: StateFile<state::FailClosedState>, adopting: bool, o
             );
             ops.restore(Some(&st.pf_token), adopting);
         }
-        StateFile::Unusable => {
+        StateFile::Unusable { pf_token } => {
             tracing::warn!(
+                token_salvaged = pf_token.is_some(),
                 "failclosed-state file is unusable; recovering the cover anyway — an unreadable \
                  record is not evidence there is no cover to clear"
             );
-            ops.restore(None, adopting);
+            ops.restore(pf_token.as_deref(), adopting);
         }
     }
 }
@@ -1007,7 +1065,7 @@ pub(crate) fn fold_presence(
     use crate::routing::CoverPresence;
     match (pf_label, file) {
         (Some(true), _) => CoverPresence::Live,
-        (_, StateFile::Present(_) | StateFile::Unusable) => CoverPresence::Recorded,
+        (_, StateFile::Present(_) | StateFile::Unusable { .. }) => CoverPresence::Recorded,
         (Some(false), StateFile::Absent) => CoverPresence::Absent,
         (None, StateFile::Absent) => CoverPresence::Unreachable,
     }
@@ -1069,6 +1127,22 @@ fn drop_token_or_warn(ops: &mut dyn PfOps, token: &str, message: &str) {
     }
 }
 
+/// [`drop_token_or_warn`] for a token that may or may not have survived an
+/// unusable record ([`StateFile::Unusable`]'s `pf_token`). The `None` arm is
+/// the disclosure that used to be the WHOLE behaviour of both `Unusable` arms,
+/// before the token was carried on the variant: a refcount nothing can now
+/// release. `what` names which state file, since one `release_all` handles both.
+fn drop_salvaged_token_or_warn(ops: &mut dyn PfOps, token: Option<&str>, what: &str, message: &str) {
+    match token {
+        Some(token) => drop_token_or_warn(ops, token, message),
+        None => tracing::warn!(
+            "{what} file is unusable and no pf token could be read out of it — a pf enable \
+             refcount may be leaked (pf then stays enabled over the canonical /etc/pf.conf, which \
+             blocks nothing, and a reboot resets it)"
+        ),
+    }
+}
+
 /// The unconditional two-cover clear, factored as a pure sequencer over an
 /// injected [`PfOps`] so it is table-tested without touching pf. See
 /// `failclosed::release_all`'s doc for the contract this implements.
@@ -1103,13 +1177,16 @@ pub(crate) fn release_all_with(
                 Err(e) => first_err = Some(e),
             }
         }
-        StateFile::Unusable => {
-            tracing::warn!(
-                "transient failclosed-state file is unusable; no pf token to drop — a pf enable \
-                 refcount may be leaked (pf then stays enabled over the canonical /etc/pf.conf, \
-                 which blocks nothing, and a reboot resets it)"
+        StateFile::Unusable { pf_token } => {
+            let reload = ops.reload_default();
+            drop_salvaged_token_or_warn(
+                ops,
+                pf_token.as_deref(),
+                "transient failclosed-state",
+                "pfctl -X failed releasing the transient cover's pf refcount, salvaged from an \
+                 unusable record, during release_all",
             );
-            match ops.reload_default() {
+            match reload {
                 Ok(()) => {
                     if let Err(e) = ops.clear_transient() {
                         tracing::warn!(error = %e, "failclosed-state clear failed during release_all");
@@ -1185,12 +1262,20 @@ pub(crate) fn release_all_with(
                 }
             }
         }
-        StateFile::Unusable => {
+        StateFile::Unusable { pf_token } => {
             tracing::warn!(
                 "standing lockdown-pf-state file is unusable; no snapshot to restore, falling back to \
                  the default ruleset"
             );
-            match ops.reload_default() {
+            let outcome = ops.reload_default();
+            drop_salvaged_token_or_warn(
+                ops,
+                pf_token.as_deref(),
+                "standing lockdown-pf-state",
+                "pfctl -X failed releasing the standing cover's pf refcount, salvaged from an \
+                 unusable record, during release_all",
+            );
+            match outcome {
                 Ok(()) => {
                     if let Err(e) = ops.clear_standing() {
                         tracing::warn!(error = %e, "lockdown-pf-state clear failed during release_all");

@@ -16,6 +16,14 @@ fn resolver_v6() -> IpAddr {
     "2001:db8::abcd".parse().unwrap()
 }
 
+/// [`StateFile::Unusable`] with nothing salvaged — the shape an UNREADABLE file
+/// produces, since there are no bytes to read a `pf_token` out of. The
+/// version-skew vector, which is the reachable one in production, carries
+/// `Some(token)` instead (see `StateFile::unusable`).
+fn unusable<T>() -> StateFile<T> {
+    StateFile::Unusable { pf_token: None }
+}
+
 #[skuld::test]
 fn ruleset_blocks_all_outbound() {
     let r = build_pf_ruleset(v4(), None);
@@ -154,6 +162,151 @@ fn ruleset_resolver_pass_is_scoped_to_tcp_443_not_unrestricted() {
         !server_line.contains("port"),
         "server permit stays unrestricted: {server_line}"
     );
+}
+
+// permit state policy, read off the real pfctl ========================================================================
+
+/// Run `ruleset` through the real `/sbin/pfctl -vn -f -` and return the rules
+/// exactly as pfctl NORMALIZED them.
+///
+/// `-n` is parse-only — it stages nothing, commits nothing, and needs no root —
+/// so this belongs on the unprivileged lane. It is also the only way to see
+/// what pf will actually MATCH on: the qualifiers pfctl appends to a bare
+/// `pass` (`flags S/SA keep state`) are invisible in the text these builders
+/// emit, which is exactly how [`permit`]'s bug survived a suite of
+/// `r.contains(..)` assertions.
+///
+/// Fails loudly on a missing or failing `pfctl`, never skips: a cover ruleset
+/// this host's own `pfctl` will not parse is a bug on its own terms.
+fn pfctl_normalized(ruleset: &str) -> Vec<String> {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    let mut child = Command::new(PFCTL)
+        .args(["-vn", "-f", "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap_or_else(|e| panic!("{PFCTL} must be present to normalize a cover ruleset: {e}"));
+    // Dropped at the end of this statement, closing the pipe — `pfctl` reads to
+    // EOF before it prints, and a cover ruleset is far under a pipe buffer, so
+    // the write cannot block against the stdout this thread is not yet reading.
+    child
+        .stdin
+        .take()
+        .expect("piped stdin")
+        .write_all(ruleset.as_bytes())
+        .expect("write the ruleset to pfctl's stdin");
+    let out = child.wait_with_output().expect("pfctl -vn must run to completion");
+    assert!(
+        out.status.success(),
+        "pfctl rejected a cover ruleset:\n{ruleset}\n---\n{}",
+        String::from_utf8_lossy(&out.stderr).trim()
+    );
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(str::to_owned)
+        .collect()
+}
+
+/// `ruleset` with the `no state` qualifier stripped from every permit that is
+/// not a loopback pass — the pre-fix shape of both cover rulesets, and the
+/// positive control for the assertion below.
+fn without_permit_no_state(ruleset: &str) -> String {
+    ruleset
+        .lines()
+        .map(|l| {
+            if l.trim_start().starts_with("pass") && !l.contains("lo0") {
+                format!("{}\n", l.trim_end().trim_end_matches(" no state"))
+            } else {
+                format!("{l}\n")
+            }
+        })
+        .collect()
+}
+
+/// Assert that NOTHING pf will actually match in `ruleset` is SYN-only, with
+/// the control that proves the assertion is not vacuous.
+///
+/// pfctl normalizes a bare `pass out quick from any to 1.1.1.1` to
+/// `... flags S/SA keep state`: it matches only a SYN, and it creates a state
+/// entry. Both halves sever an established flow that the permit names, by two
+/// different routes — the transient cover follows its load with a HOST-WIDE
+/// `pfctl -F states` ([`purges_state`]), and the standing lockdown engages on a
+/// pf that may have been disabled until that very engage, so the flows it
+/// permits never held an entry to begin with. Either way the next mid-stream
+/// segment matches no permit and dies against the block-all base.
+///
+/// The CONTROL is the same ruleset with `no state` stripped from its permits:
+/// it MUST normalize to `flags S/SA keep state`. Without it a green here could
+/// mean "this pfctl appends no default" rather than "these permits suppressed
+/// it", and the guarded assertion would certify nothing.
+///
+/// The control is asserted AFTER the guarded ruleset, not before: it is DERIVED
+/// from it, so on the very regression this exists to catch — a permit that
+/// never carried `no state` — the strip is a no-op and a control-first order
+/// would report "the control proves nothing" over the real, named defect.
+fn assert_no_permit_is_syn_only(ruleset: &str, what: &str) {
+    let is_pass = |l: &&String| l.trim_start().starts_with("pass");
+
+    let rules = pfctl_normalized(ruleset);
+    let passes: Vec<&String> = rules.iter().filter(is_pass).collect();
+    assert!(
+        !passes.is_empty(),
+        "{what} normalized to no `pass` rule at all, so there is nothing here to certify:\n{}",
+        rules.join("\n")
+    );
+    for rule in passes {
+        assert!(
+            rule.contains("no state") && !rule.contains("keep state") && !rule.contains("flags"),
+            "{what} carries a STATEFUL permit. pfctl defaults it to `flags S/SA keep state`, so it \
+             matches only a SYN: an already-established flow to that address loses its state entry \
+             (the transient cover's purge is host-wide) or never had one (the lockdown engages on a \
+             possibly-cold pf), its next mid-stream segment matches no permit, and it is discarded \
+             by the block-all base under `block-policy drop`. Every permit in a cover ruleset goes \
+             through `permit`: {rule}"
+        );
+    }
+
+    let pre_fix = without_permit_no_state(ruleset);
+    assert_ne!(
+        pre_fix, ruleset,
+        "POSITIVE CONTROL FAILED: stripping `no state` off {what}'s permits changed nothing, so \
+         the control below is the ruleset under test and proves nothing about it:\n{ruleset}"
+    );
+    let control = pfctl_normalized(&pre_fix);
+    assert!(
+        control
+            .iter()
+            .filter(is_pass)
+            .any(|l| l.contains("flags S/SA keep state")),
+        "POSITIVE CONTROL FAILED: {what}'s permits WITHOUT `no state` did not normalize to \
+         `flags S/SA keep state`. Either this pfctl no longer applies that default (and the \
+         assertion above is vacuous) or the strip hit the wrong lines — establish which, do not \
+         weaken the assertion above:\n{}",
+        control.join("\n")
+    );
+}
+
+/// The transient cover's permits — see [`assert_no_permit_is_syn_only`]. The
+/// resolver permit is the sharper half of the two: `resolver_ip` comes from the
+/// caller's own `ech-doh` URL, typically a well-known public DoH address a
+/// browser on the same host already holds a TLS connection to, and the engage
+/// purges that connection's state host-wide.
+#[skuld::test]
+fn transient_cover_permits_are_never_syn_only() {
+    assert_no_permit_is_syn_only(&build_pf_ruleset(v4(), Some(resolver())), "the transient cover");
+}
+
+/// The standing lockdown's permits — see [`assert_no_permit_is_syn_only`].
+/// `engage_lockdown` runs AFTER `routing.install`, so the tunnel it permits is
+/// already carrying traffic when the ruleset commits; on a stock macOS whose pf
+/// this engage's own `pfctl -E` enabled, those flows hold no state entry for
+/// [`purges_state`]'s non-purge to preserve.
+#[skuld::test]
+fn lockdown_permits_are_never_syn_only() {
+    assert_no_permit_is_syn_only(&build_lockdown_main_ruleset(TUN_IF, v4(), ""), "the standing lockdown");
 }
 
 #[skuld::test]
@@ -636,13 +789,64 @@ fn recover_cover_with_a_recorded_cover_restores_and_drops_its_token() {
 #[skuld::test]
 fn recover_cover_with_an_unreadable_state_file_still_restores_the_host() {
     let mut ops = RecordingRecoverOps::default();
-    recover_cover_with(StateFile::Unusable, false, &mut ops);
+    recover_cover_with(unusable(), false, &mut ops);
     assert_eq!(
         ops.restores,
         vec![(None, false)],
         "an unreadable failclosed-state file must still drive a restore — with no token to drop, \
          but never as a no-op"
     );
+}
+
+/// An unusable record that STILL HOLDS a readable `pf_token` must hand it to
+/// the restore, not throw it away.
+///
+/// Version skew — the reachable vector — reaches `Unusable` only AFTER
+/// `serde_json` produced a complete record whose token is intact; the version
+/// check is the last thing to reject it. Dropping the record there discards the
+/// only copy of the `pfctl -E` ticket that exists, and `disengage(None, ..)`
+/// then skips `pfctl -X` and, on a confirmed restore, CLEARS the file — so
+/// pf stays enabled until reboot with nothing left to release it.
+#[skuld::test]
+fn recover_cover_with_an_unusable_record_still_drops_the_token_it_could_read() {
+    let mut ops = RecordingRecoverOps::default();
+    recover_cover_with(
+        StateFile::Unusable {
+            pf_token: Some("7".into()),
+        },
+        false,
+        &mut ops,
+    );
+    assert_eq!(
+        ops.restores,
+        vec![(Some("7".to_owned()), false)],
+        "a token salvaged from an unusable record is the only one there is — the restore must be \
+         handed it, or the pf enable refcount leaks permanently"
+    );
+}
+
+/// [`StateFile::unusable`]'s two answers, driven from bytes.
+///
+/// The salvage is deliberately lenient where the typed deserialize is strict,
+/// so it must still refuse to invent a token: bytes that are not JSON, JSON
+/// with no `pf_token`, and an empty token all yield `None`, which is what makes
+/// `Some(..)` downstream mean "there really is a refcount to release".
+#[skuld::test]
+fn a_pf_token_is_salvaged_from_unusable_bytes_only_when_one_is_really_there() {
+    let token = |bytes: &str| match StateFile::<state::FailClosedState>::unusable(bytes.as_bytes()) {
+        StateFile::Unusable { pf_token } => pf_token,
+        other => panic!("`unusable` must always produce `Unusable`: {other:?}"),
+    };
+    assert_eq!(
+        token(r#"{"version":99,"pf_token":"7","pf_was_enabled":null,"future_field":1}"#),
+        Some("7".to_owned()),
+        "a version skew and an unknown field are exactly what `deny_unknown_fields` + the version \
+         check reject, and exactly where the token is still readable"
+    );
+    assert_eq!(token("not json at all"), None);
+    assert_eq!(token(r#"{"version":1}"#), None);
+    assert_eq!(token(r#"{"pf_token":""}"#), None, "an empty token is not a token");
+    assert_eq!(token(r#"{"pf_token":42}"#), None, "a non-string token is not a token");
 }
 
 /// A rolled-back bridge's sweep, driven from persisted bytes through the REAL
@@ -689,7 +893,7 @@ fn a_rolled_back_bridges_sweep_reads_a_newer_record_as_a_cover_to_clear() {
 
     let file = state::load_presence(dir.path());
     assert!(
-        matches!(file, StateFile::Unusable),
+        matches!(file, StateFile::Unusable { .. }),
         "a record one schema version ahead must read as `Unusable` — on any other arm the \
          assertion below is exercising some other path: {newer} -> {file:?}"
     );
@@ -698,8 +902,9 @@ fn a_rolled_back_bridges_sweep_reads_a_newer_record_as_a_cover_to_clear() {
     recover_cover_with(file, false, &mut ops);
     assert_eq!(
         ops.restores,
-        vec![(None, false)],
-        "a record this binary cannot read must still drive a restore, with no token to drop"
+        vec![(Some("7".to_owned()), false)],
+        "a record this binary cannot read must still drive a restore — AND with the `pf_token` \
+         that record plainly still contains, which is the only copy of the pf enable ticket left"
     );
 }
 
@@ -962,6 +1167,49 @@ fn a_failed_unwind_of_a_failed_persist_still_returns_the_original_error_and_logs
     );
 }
 
+/// The bindreams/hole#1004 residual must FIRE AUDIBLY, not silently.
+///
+/// `engage_with`'s failed-load path calls `transient_restore`, which reloads
+/// `/etc/pf.conf` — the fully-open baseline — over whatever ruleset was live.
+/// When this engage is a TRANSITION, that ruleset was a still-good prior cover
+/// blocking the host until this instant. `disengage` warns only when a step of
+/// its own fails, so the SUCCESSFUL restore — the one that opens the host — is
+/// the quietest path in the module. Every other disclosed gap here logs where
+/// it fires; without this, nothing in the log tells an ordinary cold-engage
+/// failure over an already-open host apart from a transition failure that just
+/// unblocked one.
+#[skuld::test]
+fn a_failed_transient_load_warns_that_the_restore_reopens_the_host() {
+    use tracing_subscriber::layer::{Layer, SubscriberExt};
+
+    let writer = garter::test_utils::WaitableWriter::new();
+    let subscriber = tracing_subscriber::registry().with(
+        tracing_subscriber::fmt::layer()
+            .with_writer(writer.clone())
+            .with_ansi(false)
+            .with_filter(tracing_subscriber::filter::LevelFilter::WARN),
+    );
+    let restored = {
+        let _guard = garter::tracing_test::set_default_in_current_thread(subscriber);
+        let mut ops = RecordingEngageOps {
+            fail_load_ruleset: true,
+            ..recording_engage_ops()
+        };
+        engage_with(v4(), None, &mut ops).expect_err("a failed load must fail the engage");
+        ops.restored
+    };
+    assert_eq!(
+        restored,
+        vec!["424242".to_string()],
+        "this test's premise: the failed load must have driven the /etc/pf.conf restore"
+    );
+    let log = writer.snapshot();
+    assert!(
+        log.contains("bindreams/hole#1004"),
+        "the restore that reopens the host must name the residual it is: {log}"
+    );
+}
+
 #[skuld::test]
 fn a_failed_pf_enabled_read_records_unknown_and_still_engages() {
     // Step 1 (`pf_enabled`) is DIAGNOSTIC ONLY — `pf_was_enabled`'s single
@@ -1109,6 +1357,9 @@ fn drop_refcount_or_warn_logs_a_pfctl_x_that_spawned_but_exited_non_zero() {
 #[derive(Default)]
 struct RecordingPfOps {
     log: Vec<&'static str>,
+    /// Every token handed to `drop_token`, so WHICH refcount was released is
+    /// assertable and not merely that one was.
+    dropped: Vec<String>,
     fail_reload_default: bool,
     fail_load_ruleset: bool,
     fail_clear_transient: bool,
@@ -1135,8 +1386,9 @@ impl PfOps for RecordingPfOps {
         }
     }
 
-    fn drop_token(&mut self, _token: &str) -> Result<(), RoutingError> {
+    fn drop_token(&mut self, token: &str) -> Result<(), RoutingError> {
         self.log.push("drop_token");
+        self.dropped.push(token.to_owned());
         if self.fail_drop_token {
             Err(RoutingError::RouteSetup("mock drop_token failure".into()))
         } else {
@@ -1253,7 +1505,7 @@ fn release_all_falls_back_to_the_default_ruleset_when_the_snapshot_will_not_load
 fn release_all_treats_an_unusable_state_file_as_a_cover_to_clear() {
     // A corrupt or version-skewed file must never be read as "nothing to clear".
     let mut ops = RecordingPfOps::default();
-    let _ = release_all_with(StateFile::Absent, StateFile::Unusable, &mut ops);
+    let _ = release_all_with(StateFile::Absent, unusable(), &mut ops);
     assert!(
         ops.log.contains(&"reload_default"),
         "an Unusable standing state must still trigger the default-ruleset fallback: {:?}",
@@ -1278,7 +1530,7 @@ fn release_all_treats_an_unusable_transient_state_file_as_a_cover_to_clear() {
     // reloads the default ruleset rather than trying a restore first) — the
     // standing-side counterpart above does not exercise it.
     let mut ops = RecordingPfOps::default();
-    let result = release_all_with(StateFile::Unusable, StateFile::Absent, &mut ops);
+    let result = release_all_with(unusable(), StateFile::Absent, &mut ops);
     assert!(
         ops.log.contains(&"reload_default"),
         "an Unusable transient state must still trigger the default-ruleset reload: {:?}",
@@ -1290,6 +1542,38 @@ fn release_all_treats_an_unusable_transient_state_file_as_a_cover_to_clear() {
         ops.log
     );
     assert!(result.is_ok());
+}
+
+/// `release_all` is the escape hatch whose whole job is to leave no cover
+/// behind — so an unusable record that still names a `pf_token` must have that
+/// refcount released, on BOTH arms. Neither dropped one before the token was
+/// carried on the variant: the transient arm warned that it could not, and the
+/// standing arm did not even mention it.
+#[skuld::test(labels = [GLOBAL_NET_STATE])]
+fn release_all_drops_the_token_salvaged_from_an_unusable_record_on_both_arms() {
+    fn with_token<T>(t: &str) -> StateFile<T> {
+        StateFile::Unusable {
+            pf_token: Some(t.to_owned()),
+        }
+    }
+
+    let mut ops = RecordingPfOps::default();
+    release_all_with(with_token("111"), StateFile::Absent, &mut ops).expect("a clean transient release");
+    assert_eq!(
+        ops.dropped,
+        vec!["111".to_owned()],
+        "the transient arm must release the refcount its unusable record still names: {:?}",
+        ops.log
+    );
+
+    let mut ops = RecordingPfOps::default();
+    release_all_with(StateFile::Absent, with_token("222"), &mut ops).expect("a clean standing release");
+    assert_eq!(
+        ops.dropped,
+        vec!["222".to_owned()],
+        "the standing arm must release it too: {:?}",
+        ops.log
+    );
 }
 
 #[skuld::test(labels = [GLOBAL_NET_STATE])]
@@ -1423,17 +1707,17 @@ fn presence_fold_is_closed_over_the_probe_and_the_state_file() {
     let cases: [(Option<bool>, StateFile<lockdown_state::LockdownPfState>, CoverPresence); 9] = [
         (Some(true), StateFile::Absent, CoverPresence::Live),
         (Some(true), StateFile::Present(standing_state()), CoverPresence::Live),
-        (Some(true), StateFile::Unusable, CoverPresence::Live),
+        (Some(true), unusable(), CoverPresence::Live),
         (Some(false), StateFile::Absent, CoverPresence::Absent),
         (
             Some(false),
             StateFile::Present(standing_state()),
             CoverPresence::Recorded,
         ),
-        (Some(false), StateFile::Unusable, CoverPresence::Recorded),
+        (Some(false), unusable(), CoverPresence::Recorded),
         (None, StateFile::Absent, CoverPresence::Unreachable),
         (None, StateFile::Present(standing_state()), CoverPresence::Recorded),
-        (None, StateFile::Unusable, CoverPresence::Recorded),
+        (None, unusable(), CoverPresence::Recorded),
     ];
     for (label, file, expected) in cases {
         assert_eq!(
@@ -1449,11 +1733,7 @@ fn file_only_presence_never_reports_live() {
     // Pins the file-only body that ships before the pf probe lands: with no pf
     // answer the fold cannot reach `Live`, so it cannot trigger an intent
     // repair write off a state file alone.
-    for file in [
-        StateFile::Absent,
-        StateFile::Present(standing_state()),
-        StateFile::Unusable,
-    ] {
+    for file in [StateFile::Absent, StateFile::Present(standing_state()), unusable()] {
         assert_ne!(
             fold_presence(None, &file),
             CoverPresence::Live,

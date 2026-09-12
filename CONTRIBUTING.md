@@ -1106,46 +1106,41 @@ milliseconds.
   ruleset loads (persist-before-mutate), and a failed persist unwinds the `-E`
   before propagating, mirroring `engage_lockdown`'s `FreshEnable`/`Reenable`
   arms.
-  **No `-Fa`** (bindreams/hole#997): the module doc has the full ticket-discipline
-  argument for why a bare `pfctl -f -` load is one atomic pf transaction for the
-  rules, so a still-live prior cover stays authoritative across a TRANSITION
-  until the new ruleset fully commits. Empirically checked by
+  **No `-Fa`** (bindreams/hole#997): a bare `pfctl -f -` is one atomic pf
+  transaction *for the rules*, so a still-live prior cover stays authoritative
+  across a TRANSITION until the new ruleset fully commits — the full
+  ticket-discipline argument lives in `macos.rs`'s module doc. Empirically
+  checked, not proven, by
   `macos_failclosed_cover_transition_never_admits_blocked_flow`
-  (`macos_transition_tests.rs`) — not a mathematical proof. That test prints its
-  own measured sensitivity rather than leaving a green uninformative
-  (`success-output` in `.config/nextest.toml` is what makes the line survive a
-  PASS); its doc comment carries the method, the caveats and the last measured
-  figures, and is the single place they live.
+  (`macos_transition_tests.rs`), which prints its own measured sensitivity
+  rather than leaving a green uninformative (`success-output` in
+  `.config/nextest.toml` is what makes the line survive a PASS); its doc comment
+  is the single place the method, caveats and figures live.
   Disclosed, not fixed here: a *failed* re-engage during a transition still
-  reloads `/etc/pf.conf`
-  over a still-good prior cover (bindreams/hole#1004), and two privileged test
-  files' own bare `pfctl` calls are a separate inconsistency (bindreams/hole#1005).
+  reloads `/etc/pf.conf` over a still-good prior cover (bindreams/hole#1004 — it
+  warns where it fires), and two privileged test files' own bare `pfctl` calls
+  are a separate inconsistency (bindreams/hole#1005).
   **Only the standing lockdown skips the pf state purge** (bindreams/hole#1015,
-  transient half closed, lockdown half remains — `pfctl -F states` is host-wide
-  and would kill the very tunnel a live lockdown protects; sequenced behind
+  transient half closed, lockdown half remains; sequenced behind
   bindreams/hole#1002). `purges_state(CoverKind)` is the one place either engage
-  decides this, and its doc lists exactly which reachable cases the transient
-  purge closes; the kernel behaviour is proven by
+  decides this and carries the reasoning; the kernel behaviour is proven by
   `macos_failclosed_cover_state_purge_kills_a_flow_established_before_engage`.
+  **Every `pass` in a cover ruleset is `no state`.** `pfctl` defaults a bare
+  `pass` to `flags S/SA keep state`, i.e. SYN-only, which severs any flow the
+  permit names whose pf state entry is gone (the transient purge is host-wide)
+  or never existed (the lockdown engages on a possibly-cold pf, *after* the
+  routes are up and the tunnel is flowing). `permit` is the single place that
+  rule and its rationale live; `transient_cover_permits_are_never_syn_only` and
+  its lockdown twin pin it against the real `pfctl -vn -f -`, each with a
+  positive control.
   **Loopback is exempted TWICE: `set skip on lo0` AND a pair of `no state`
-  `pass` rules.** Both are mandatory; each closes a failure the other cannot.
-  The state purge is host-wide, so the ruleset — not the flush's scope — is
-  what keeps it from severing every local TCP session on the machine, and
-  `set skip` is what does that: it passes lo0 "as if pf was disabled", with no
-  state to lose, where a *stateful* `pass` would be defaulted to `flags S/SA`
-  and match only a SYN. But `set skip` is applied OUTSIDE the rule ticket —
-  `pfctl`'s `main()` clears every interface's skip flag before it parses and
-  before `DIOCXBEGIN` — so across each load's parse, lo0 is filtered again
-  while the *previous* ruleset is still authoritative. If that previous
-  ruleset is a cover, loopback meets its `block out all`. The outgoing
-  ruleset's own `pass out/in quick on lo0 all no state` is what carries
-  loopback across that window; `no state` suppresses the `flags S/SA` default
-  (it is gated on the rule keeping state) so the rules match mid-stream
-  segments and leave nothing for the purge to flush. Proven by
-  `macos_failclosed_cover_engage_does_not_sever_established_loopback_flows`
-  (the purge half) and
-  `macos_failclosed_cover_load_never_drops_a_loopback_datagram` (the
-  flag-clear-window half, which carries its own positive control: the same
+  `pass` rules** — both mandatory, each closing a failure the other cannot,
+  because `set skip` is applied outside the rule ticket and `pfctl` clears every
+  interface's skip flag before it parses. `LOOPBACK_PASSES` owns that argument.
+  Proven by
+  `macos_failclosed_cover_engage_does_not_sever_established_loopback_flows` (the
+  purge half) and `macos_failclosed_cover_load_never_drops_a_loopback_datagram`
+  (the flag-clear-window half, which carries its own positive control: the same
   probe over the `set skip`-only ruleset must lose a datagram).
   **Enable before load, on a COLD engage too** — see `engage_with`'s doc for why
   reordering does not help and what a failed persist would strand without it.

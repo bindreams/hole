@@ -12,6 +12,38 @@ fn save_then_load_roundtrips() {
     assert_eq!(load(tmp.path()), Some(st));
 }
 
+/// The compatibility direction [`FailClosedState::pf_was_enabled`]'s doc claims
+/// and nothing else asserted: an OLDER file, written by a binary whose field
+/// was a bare `bool`, read by this one.
+///
+/// That is why [`SCHEMA_VERSION`] was not bumped when the field became
+/// `Option<bool>` — so the claim is load-bearing, not cosmetic: if it were
+/// false, an upgraded binary would read every pre-upgrade record as `Unusable`
+/// and lose the `pf_token` in it. The opposite direction (this binary's `null`
+/// against an older `bool` schema) is pinned next door by
+/// `macos_tests::a_rolled_back_bridges_sweep_reads_a_newer_record_as_a_cover_to_clear`.
+///
+/// Driven from BYTES, not from `save`: `save` writes what this binary's schema
+/// emits, which is the shape already covered by `save_then_load_roundtrips`.
+#[skuld::test]
+fn load_reads_an_older_files_bare_bool_pf_was_enabled() {
+    for (written, want) in [("true", Some(true)), ("false", Some(false))] {
+        let tmp = tempfile::tempdir().unwrap();
+        let older = format!(r#"{{"version":{SCHEMA_VERSION},"pf_token":"5","pf_was_enabled":{written}}}"#);
+        std::fs::write(tmp.path().join(STATE_FILE_NAME), &older).unwrap();
+        assert_eq!(
+            load(tmp.path()),
+            Some(FailClosedState {
+                version: SCHEMA_VERSION,
+                pf_token: "5".into(),
+                pf_was_enabled: want,
+            }),
+            "an older binary's bare `{written}` must read unchanged — anything else makes every \
+             pre-upgrade record `Unusable` and discards the pf token in it: {older}"
+        );
+    }
+}
+
 #[skuld::test]
 fn load_absent_is_none() {
     let tmp = tempfile::tempdir().unwrap();

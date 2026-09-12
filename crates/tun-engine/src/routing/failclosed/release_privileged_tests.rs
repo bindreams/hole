@@ -444,10 +444,9 @@ fn macos_recover_cover_clears_a_cover_whose_state_file_is_unreadable() {
     let cover = routing
         .install_failclosed_cover(server_ip, None)
         .expect("engage real pf transient cover");
-    // Read the real enable token back BEFORE overwriting the file: an
-    // `Unusable` record carries no token the sweep can hand `pfctl -X`, so
-    // this test returns the refcount itself rather than leaving the runner's
-    // pf enabled under an unreferenced token.
+    // Read the real enable token back BEFORE overwriting the file, so the
+    // rolled-back payload below carries the REAL token and the safety net at
+    // the end of this test has one to fall back on.
     let token = super::failclosed_state::load(dir.path())
         .expect("the engage must have persisted a state file")
         .pf_token;
@@ -460,7 +459,7 @@ fn macos_recover_cover_clears_a_cover_whose_state_file_is_unreadable() {
     std::fs::write(dir.path().join(super::failclosed_state::STATE_FILE_NAME), &rolled_back).unwrap();
     let presence = super::failclosed_state::load_presence(dir.path());
     assert!(
-        matches!(presence, super::StateFile::Unusable),
+        matches!(presence, super::StateFile::Unusable { .. }),
         "this test's premise: the payload must be UNREADABLE to this binary. On `Present` the \
          sweep takes the arm it handled before this fix and proves nothing: {rolled_back} -> \
          {presence:?}"
@@ -475,9 +474,12 @@ fn macos_recover_cover_clears_a_cover_whose_state_file_is_unreadable() {
 
     let restored = connect(NON_PERMITTED);
 
-    // Balance the `-E` the engage took — the sweep could not, having had no
-    // token. Best-effort and AFTER the measurement, so it can neither mask nor
-    // cause the verdict.
+    // Safety net, not the balance: the sweep salvages the `pf_token` out of
+    // the unusable record itself (`StateFile::unusable`) and drops it, so this
+    // normally finds the refcount already released and fails harmlessly. It
+    // stays so that a sweep whose own `-X` failed cannot leave the runner's pf
+    // enabled under an unreferenced token until reboot. Best-effort and AFTER
+    // the measurement, so it can neither mask nor cause the verdict.
     let _ = Command::new("/sbin/pfctl").args(["-X", &token]).output();
 
     assert!(

@@ -895,17 +895,26 @@ fn macos_failclosed_cover_load_never_drops_a_loopback_datagram() {
          outside the rule ticket (and the guarded assertion below is vacuous), or the probe cannot \
          see the window — do not silence this by weakening the assertion below; establish which."
     );
-    assert!(
-        guarded_round_trips > 0,
-        "the guarded leg's loopback probe completed no round trip at all — the assertion below \
-         would then hold over a probe that never ran"
-    );
+    // LOSS FIRST, vacuity second. `with_loopback_datagram_probe` counts a round
+    // trip only at the END of a completed iteration and returns on the first
+    // loss, so the regression this test exists to catch — a guarded leg that
+    // drops datagram 1 — produces BOTH `guarded_loss == Some(..)` AND
+    // `guarded_round_trips == 0`. A vacuity-first order would then report "the
+    // probe never ran", point the maintainer at the harness, and never print
+    // the payload naming the lost datagram and its leg. The floor still guards
+    // a green, which is the only verdict it has to: a zero-round-trip run
+    // reaches it only with `guarded_loss == None`.
     assert_eq!(
         guarded_loss, None,
         "a loopback datagram was lost across a `pfctl -f -` that replaced a live production cover \
          ({guarded_round_trips} round trips before it) — the control above proves the window is \
          real and visible, so the cover ruleset's `pass ... on lo0 all no state` rules \
          (`LOOPBACK_PASSES`) are missing, stateful, or ordered behind a `quick` block"
+    );
+    assert!(
+        guarded_round_trips > 0,
+        "the guarded leg's loopback probe completed no round trip at all, and reported no loss \
+         either — the assertion above therefore held over a probe that never ran"
     );
 }
 
