@@ -248,10 +248,12 @@ async fn run_inner(
         }
     }
 
-    // Start the always-on ETW consumer. Held for the server's lifetime;
-    // Drop stops the session and joins the processing thread. Failure
-    // logs at error (not warn) — a silent ETW-broken customer machine
-    // is the opposite of the diagnostic goal. See diagnostics::etw.
+    // Start the always-on ETW consumer, held for the lifetime of the
+    // foreground bridge; Drop may abandon rather than join its processing
+    // thread if reclaim can't be confirmed (see `etw.rs` module doc, "Drain
+    // on Drop"). Failure logs at error (not warn) — a silent ETW-broken
+    // customer machine is the opposite of the diagnostic goal. See
+    // diagnostics::etw.
     #[cfg(target_os = "windows")]
     let _etw_guard = match crate::diagnostics::etw::start_consumer() {
         Ok(g) => Some(g),

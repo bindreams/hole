@@ -12,7 +12,7 @@ fn test_entry(id: &str) -> ServerEntry {
         server: "1.2.3.4".into(),
         server_port: 8388,
         method: "aes-256-gcm".to_string(),
-        password: "pw".to_string(),
+        password: "pw".to_string().into(),
         plugin: None,
         plugin_opts: None,
         validation: None,
@@ -679,7 +679,7 @@ fn entry(id: &str, server: &str, port: u16) -> ServerEntry {
         server: server.into(),
         server_port: port,
         method: "aes-256-gcm".to_string(),
-        password: "pw".to_string(),
+        password: "pw".to_string().into(),
         plugin: None,
         plugin_opts: None,
         validation: None,
@@ -832,16 +832,16 @@ fn apply_import_emits_summary_event() {
 
 // ImportFailure sanitization ==========================================================================================
 // `to_import_failure` converts the file-I/O + parse error surface into
-// the tagged enum the frontend deserializes. The conversion is the only
-// place where (a) `serde_json::Error`'s parse-error message (which echoes
-// file content) is scrubbed and (b) the per-variant categorization is
-// made — so the frontend can show the right blocking dialog without any
-// string parsing.
+// the tagged enum the frontend deserializes, so the frontend can show the
+// right blocking dialog without any string parsing. Dropping the parse
+// detail is defense in depth, not the cure: `ImportError::Parse` no longer
+// holds the `serde_json::Error` that echoes file content
+// (`import::the_parse_variant_never_carries_the_input`).
 
 #[skuld::test]
 fn to_import_failure_parse_error_becomes_corrupted_json() {
     let err =
-        hole_common::import::ImportError::Parse(serde_json::from_str::<serde_json::Value>("not-json").unwrap_err());
+        hole_common::import::ImportError::from(serde_json::from_str::<serde_json::Value>("not-json").unwrap_err());
     let failure = to_import_failure(err);
     assert!(matches!(failure, ImportFailure::CorruptedJson), "got {failure:?}");
 }
@@ -1097,10 +1097,10 @@ fn saving_a_config_arms_a_newly_added_entry() {
         servers: vec![crate::ui_settings::UiServerEntry {
             id: EDITED_ID.to_string(),
             name: "Test".to_string(),
-            server: "203.0.113.7".to_string(),
+            server: "203.0.113.7".into(),
             server_port: 8388,
             method: "aes-256-gcm".to_string(),
-            password: "pw".to_string(),
+            password: "pw".into(),
             plugin: None,
             plugin_opts: None,
         }],

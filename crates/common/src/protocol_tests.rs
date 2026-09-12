@@ -8,7 +8,7 @@ fn sample_server() -> ServerEntry {
         server: "1.2.3.4".into(),
         server_port: 8388,
         method: "aes-256-gcm".to_string(),
-        password: "pw".to_string(),
+        password: "pw".to_string().into(),
         plugin: None,
         plugin_opts: None,
         validation: None,
@@ -657,7 +657,7 @@ fn secret_config() -> ProxyConfig {
         ..ProxyConfig::default()
     };
     config.server.server = SECRET_ADDR.into();
-    config.server.password = SECRET_PW.to_string();
+    config.server.password = SECRET_PW.to_string().into();
     config
 }
 
@@ -680,4 +680,115 @@ fn proxy_config_json_round_trips_the_exact_address() {
     assert!(json.contains(SECRET_ADDR), "the IPC wire must carry the real address");
     let back: ProxyConfig = serde_json::from_str(&json).expect("deserialize");
     assert_eq!(back.server.server.expose(), SECRET_ADDR);
+}
+
+/// One level further up than `ProxyConfig`'s. `BridgeRequest` derives
+/// `Serialize` and reaches a `ServerEntry` through three of its variants, so
+/// without its own `Dump` impl `dump!(&request)` renders the serde tree and
+/// both transparent newtypes come out as their inner strings.
+#[skuld::test]
+fn bridge_request_dump_omits_the_address_and_password() {
+    let requests = [
+        BridgeRequest::Start {
+            config: secret_config(),
+            attempt_id: "attempt-1".into(),
+            on_startup: None,
+        },
+        BridgeRequest::Reload {
+            config: secret_config(),
+        },
+        BridgeRequest::TestServer {
+            entry: secret_config().server,
+            dns: crate::config::DnsConfig::default(),
+        },
+    ];
+    for req in requests {
+        let rendered = dump::dump!(&req).to_string();
+        assert!(
+            !rendered.contains(SECRET_ADDR),
+            "dump! must not carry the server address: {rendered}"
+        );
+        assert!(!rendered.contains(SECRET_PW), "nor the password: {rendered}");
+    }
+}
+
+/// The paired negative. A hand-written `Dump` that flattened everything to a
+/// variant name would pass the test above and make the impl useless, so both
+/// the secret-free variants and the non-secret fields *inside* a
+/// secret-bearing one have to keep rendering.
+#[skuld::test]
+fn bridge_request_dump_still_renders_non_secret_payload() {
+    let rendered = dump::dump!(&BridgeRequest::Cancel {
+        attempt_id: "attempt-7".into(),
+    })
+    .to_string();
+    assert!(rendered.contains("Cancel"), "{rendered}");
+    assert!(rendered.contains("attempt-7"), "{rendered}");
+
+    let mut config = secret_config();
+    config.local_port = 40731;
+    let rendered = dump::dump!(&BridgeRequest::Start {
+        config,
+        attempt_id: "attempt-8".into(),
+        on_startup: None,
+    })
+    .to_string();
+    assert!(rendered.contains("Start"), "{rendered}");
+    assert!(rendered.contains("attempt-8"), "the variant's own fields: {rendered}");
+    assert!(
+        rendered.contains("40731"),
+        "and the nested ProxyConfig's non-secret fields: {rendered}"
+    );
+}
+
+#[skuld::test]
+fn test_server_request_dump_omits_the_address_and_password() {
+    let req = TestServerRequest {
+        entry: secret_config().server,
+        dns: crate::config::DnsConfig::default(),
+    };
+    let rendered = dump::dump!(&req).to_string();
+    assert!(
+        !rendered.contains(SECRET_ADDR),
+        "dump! must not carry the server address: {rendered}"
+    );
+    assert!(!rendered.contains(SECRET_PW), "nor the password: {rendered}");
+}
+
+/// The paired positive, matching every other hand-written `Dump` impl's.
+/// Without it the test above would pass against an impl that returned
+/// `DumpValue::Null` — the failure that is worse than no impl at all,
+/// because it reads as covered and renders nothing.
+#[skuld::test]
+fn test_server_request_dump_still_renders_non_secret_payload() {
+    // Distinct values: an id that shares digits with the port would satisfy
+    // the port assertion on its own and prove nothing about it.
+    let mut entry = secret_config().server;
+    entry.id = "id-becfd".into();
+    entry.server_port = 40731;
+    let rendered = dump::dump!(&TestServerRequest {
+        entry,
+        dns: crate::config::DnsConfig::default(),
+    })
+    .to_string();
+    assert!(
+        rendered.contains("id-becfd"),
+        "the entry's non-secret fields: {rendered}"
+    );
+    assert!(rendered.contains("40731"), "including the port: {rendered}");
+    assert!(rendered.contains("dns"), "and the DnsConfig beside it: {rendered}");
+}
+
+/// The `Dump` impls are hand-written beside a derived `Serialize`; the wire
+/// form is what the bridge parses and must not drift with them.
+#[skuld::test]
+fn test_server_request_json_round_trips_the_exact_secrets() {
+    let req = TestServerRequest {
+        entry: secret_config().server,
+        dns: crate::config::DnsConfig::default(),
+    };
+    let json = serde_json::to_string(&req).expect("serialize");
+    let back: TestServerRequest = serde_json::from_str(&json).expect("deserialize");
+    assert_eq!(back.entry.password.expose(), SECRET_PW);
+    assert_eq!(back.entry.server.expose(), SECRET_ADDR);
 }

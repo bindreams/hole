@@ -139,10 +139,11 @@ nextest-version = "0.9.130"
 #     per-binary `serial = TUN` alone never serialized it against them; it
 #     drives live UDP through a real TUN adapter (the `hole-tun*` wildcard
 #     teardown sweep included), so a system-wide block-all beside it breaks it.
-#     NOT added: the three ETW tests in
+#     NOT added: the nine ETW tests in
 #     crates/bridge/src/diagnostics/etw_live_privileged_tests.rs — that
 #     module's TUN label means "the elevated Windows lane", not "touches a
-#     TUN adapter"; they query ETW sessions and mutate no network state.
+#     TUN adapter"; every one of them starts or stops a real ETW session and
+#     mutates no network state.
 # Renaming any of them WITHOUT updating this filter silently drops it from the
 # group → cross-binary data race. Verify with `cargo nextest show-config
 # test-groups`. Add any new real-engage/real-TUN test (and its substring) here.
@@ -228,3 +229,34 @@ slow-timeout = { period = "30s", terminate-after = 2 }
 [[profile.default.overrides]]
 filter = 'test(/^(echo_records_round_trip_byte_counts_and_ttfb|silent_drop_records_zero_bytes_and_no_ttfb|silent_after_read_matches_248_shape|rst_close_classified_as_rst_with_os_errno|shutdown_cancels_in_flight_connection_without_panic|cross_check_inbound_and_upstream_counters_match)$/)'
 slow-timeout = { period = "20s", terminate-after = 2 }
+
+# See `drop_abandons_the_processing_thread_without_joining_when_the_session_is_not_reclaimed`'s
+# own doc comment in etw_tests.rs for why this hangs on a gate regression
+# instead of failing; bounded here the same way as the tun-engine driver and
+# `run_with_tap` groups above.
+#
+# COUPLED NAME, same caveat as the two groups above: this is a bare
+# function name. Windows-only (`#[cfg(target_os = "windows")]` on the
+# enclosing `etw` module), so this override is inert elsewhere.
+[[profile.default.overrides]]
+filter = 'test(/^drop_abandons_the_processing_thread_without_joining_when_the_session_is_not_reclaimed$/)'
+slow-timeout = { period = "20s", terminate-after = 2 }
+
+# `cargo xtask verify-global-net-state-executed` (bindreams/hole#999) reads
+# this profile's JUnit report to confirm the `global_net_state` group's tests
+# didn't just get *selected* (guard 2, #894) but actually *ran*. The group
+# spans both of `test-hole`'s `SKULD_LABELS` lanes, so it needs one profile
+# per lane instead of this single shared path — see
+# `xtask::global_net_state_conformance` for why.
+[profile.default.junit]
+path = "junit.xml"
+
+# Selected via `NEXTEST_PROFILE=non-tun` / `NEXTEST_PROFILE=tun` rather than a
+# `--profile` flag (see `xtask::ci_nextest_parity::FINGERPRINT_NEUTRAL_ENV`).
+# Both tables are intentionally empty: nextest's profile inheritance falls
+# back to `[profile.default]` for any unset key, so each still gets
+# `junit.path` above and `global_net_state`'s `max-threads = 1` — verified
+# with `cargo nextest show-config test-groups --profile non-tun`.
+[profile.non-tun]
+
+[profile.tun]

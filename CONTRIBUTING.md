@@ -825,7 +825,11 @@ leaves working DNS + broken routes, not the inverse):
   killing that process is the escape.
 - **ETW sessions** (Windows) — `hole-bridge-etw-<pid>`;
   `diagnostics::etw::sweep_stale_sessions` (`QueryAllTracesW`) stops stale ones by
-  name prefix.
+  name prefix. The bridge's own session is stopped in `EtwGuard::drop`, which
+  re-issues STOP by name as a backstop when `UserTrace::stop` did not report
+  success; if even that fails, `Drop` abandons the processing thread rather
+  than risk an unbounded join (mechanism: `etw.rs` module doc, "Drain on
+  Drop"; `Drop` is otherwise unbounded, bindreams/hole#1016).
 
 Default `<state_dir>` is `dirs::state_dir()/hole/state` — Windows
 `%LOCALAPPDATA%\hole\state\`, macOS `~/Library/Application Support/hole/state/`;
@@ -1583,8 +1587,23 @@ Rust's unwinding panic hook. The first-party Apache-2.0
 `install_panic_hook()`), covering GUI/CLI/bridge; galoshes attaches in its own
 `main`. On a fault, `on_crash` runs in a compromised context and does only
 signal-safe work: write a fixed-format `crash-<kind>-<pid>.marker` via raw
-syscalls (no heap/locks/`format!`), then return `Handled(false)` so the OS
-default path (WER / `.ips` / core dump) still runs. All I/O errors are swallowed.
+syscalls (no heap/locks/`format!`). All I/O errors are swallowed.
+
+On Windows and Linux it then returns `Handled(false)` so the OS default path
+(WER / core dump) still runs. **On macOS it never returns** — it `_exit(70)`s,
+for every fault class, every attach kind and every build, so a macOS crash
+produces the marker and **neither an `.ips` nor a minidump**. That cost was
+accepted on #842: no part of Hole should hang the process, even sometimes. Do
+not restore either half without reading `crates/tombstone/src/crash.rs`'s
+module doc, which is the canonical record. Two source-scanning guards in
+`crash_tests.rs` hold that callback's shape, because the deadlock needs
+CI-like allocation pressure and the runtime `crash_marker_*` tests stay green
+without it: `macos_on_crash_terminates_unconditionally`, and
+`macos_on_crash_calls_nothing_that_can_allocate`, which scans the whole
+handler path transitively — `on_crash`, the marker write and every helper
+below it — since an allocation one frame down deadlocks exactly as one in the
+callback does.
+
 `tombstone::sweep(log_dir)` runs at the next start of the same kind, emits a
 `tracing::error!(target: "crash", …)`, and deletes the marker. Markers land in
 `log_dir` (not `state_dir`) so the elevated bridge's marker is readable by the
@@ -1595,10 +1614,11 @@ unprivileged GUI.
   Linux runtime crash tests are a known gap (compile-verified via the galoshes
   Linux build; runtime-exercised only on the Win/mac `hole-tests` lane).
 - **Dev-only minidumps:** under the non-default `crash-dumps` feature, `on_crash`
-  also writes a `.dmp` via `minidump-writer` — **Windows/macOS only** (no
-  in-process Linux self-dump). `minidump-writer` never links into a shipped
-  binary (process memory holds keys + traffic, and it has no Windows-aarch64
-  support).
+  also writes a `.dmp` via `minidump-writer` — **Windows only**, despite the
+  feature name reading cross-platform. Linux never had an in-process self-dump;
+  macOS gave its up in #842 (above). `minidump-writer` is declared under
+  `cfg(windows)`, so the feature links nothing on any other target (process
+  memory holds keys + traffic, and it has no Windows-aarch64 support).
 - **Plugins:** ex-ray is spawned with `GOTRACEBACK=crash`; `record_exit` logs a
   mid-run plugin death with `exit_code`/`killed`.
 - **Known gap (accepted, untested):** Windows `__fastfail` / `int 29h` (incl.
@@ -2063,6 +2083,27 @@ Spotlight "Hole" must reveal it.
   `[[profile.default.overrides]]` entry stealing these tests into a different
   group, and its universe is `test-hole`'s package set even though the
   nextest.toml filter applies workspace-wide.
+- **`global_net_state` execution proof** — membership being correct still says
+  nothing about whether those tests *ran*; a job that silently executed zero of
+  them reads exactly as green as one that executed them all. `--record` has the
+  label guard write its verified membership out before the test steps; after
+  them, `cargo xtask verify-global-net-state-executed` diffs that set against
+  the tests nextest's JUnit reports say actually executed (present, not
+  `<skipped>`) and fails by exact name on any that never appear (#999). The
+  group spans BOTH `SKULD_LABELS` lanes — the name-substring filter deliberately
+  sweeps in unprivileged cases — and every lane run under the SAME nextest
+  profile would overwrite the last one's JUnit report. ci.yaml instead runs
+  each lane under its own nextest profile (`non-tun` / `tun`, selected via the
+  `NEXTEST_PROFILE` env var so the two lanes' command text still matches
+  `ci_test_hole_steps_match_the_hole_tests_target`), an empty table that
+  inherits `[profile.default.junit]`'s path and every override via nextest's
+  own profile-inheritance model; each profile therefore keeps its own report,
+  and the guard reads their union. This also keeps a privileged (`sudo`) lane's
+  JUnit report confined to its own profile directory rather than the one an
+  unprivileged rerun would write to next, avoiding a root-owned file blocking
+  a later unprivileged `cargo nextest run`. Windows leg only: extending it to
+  the darwin legs needs the same per-lane profiles and its own budget
+  measurement against those jobs' walls.
 
 ### Datapath coverage: which lane proves what
 
@@ -2204,6 +2245,65 @@ incompleteness can weaken a diagnostic message and can never weaken redaction.
 implements neither `Display` nor `Deref`, so `server_host = %config.server.server`
 is a compile error and `format!("{}", *addr)` cannot reopen it. `expose()` is
 the single named exit, so grepping for it enumerates every real read site.
+`Password` is the same shape beside it, and both carry a redacting `Debug` so
+a derived `Debug` on a container is not a hole. The *absence* of those two
+impls is pinned by compile-fail probes
+([`crates/common/tests/secret_shape/`](crates/common/tests/secret_shape/),
+driven by `trybuild` from `the_secret_newtypes_have_no_second_exit`): adding
+either compiles cleanly and fails no other test, so the shape needs a test of
+its own and not only its consequence.
+
+**The password's asymmetry.** For the password, prevention is the *whole*
+mechanism: nothing arms it into the registry above, so there is no sink-level
+cure if a secret escapes through a formatter Hole does not own. That is
+deliberate — a short or dictionary-word password armed into the global
+automaton would rewrite unrelated log text, the `COLLISION_CORPUS` hazard
+without the bounded corpus that makes it diagnosable. So the type is what has
+to hold, and the two type-level rules below are load-bearing for the password
+in a way they are merely belt-and-braces for the address.
+
+**Where a secret enters.** `UiServerEntry`
+([`ui_settings.rs`](crates/hole/src/ui_settings.rs)) is the one place a
+password comes in from outside — the webview's `save_config` payload. It
+carries both newtypes from the deserializer inward rather than wrapping at the
+far end of `apply`, because it derives `Debug` and every field between those
+two points would otherwise be renderable. Both newtypes are
+`#[serde(transparent)]`, so the payload shape is unchanged.
+
+**Key material can leak through an error, not just a log field.** The
+2022-blake3 ciphers take the password as base64 key material, so
+`ServerConfig::new` can reject it — and `shadowsocks::config::ServerConfigError`'s
+`Display` names the offending byte and its offset, which is one character of
+the user's key plus where to find it. All three `ServerConfig::new` sites
+(`proxy::config::build_ss_config`, `server_test::build_server_config`, and the
+plugin-path rebuild in `server_test::maybe_start_plugin`) route it through
+`classify_key_material` — the one exhaustive match on that type — into
+`KeyMaterialFault`, a closed set of causes carrying no decode detail. Its
+`ProxyError` variant is `InvalidKeyMaterial`, not `InvalidMethod`: a cipher
+name Hole does not know and a good cipher with a bad key are different faults
+in different fields.
+
+**And through a parse error.** `serde_json::Error`'s `Display` quotes its input
+back — the offending value for a data error, an arbitrary caller-supplied
+*string* for an unknown variant or field — and every JSON this workspace parses
+can hold a protected value: the user's `config.json`, an imported profile, the
+elevation payload (a whole `BridgeRequest`, in transit), and four bridge state
+files (`bridge-target.json` and `bridge-startup.json` hold a password;
+`bridge-routes.json` holds `server_ip`; `bridge-lockdown-pf.json`'s
+`main_snapshot` holds one whenever the `pfctl -sr` ruleset it captured was
+Hole's own cover). [`util::parse_error::describe_parse_error`](crates/util/src/parse_error.rs)
+is the one door: category plus line and column, never a fragment. It lives in
+`util` rather than `hole-common` because `tun-engine` parses two of those files
+and does not depend on `hole-common`; `hole_common::config` re-exports it so
+Hole-side callers keep one name. `ConfigError::Parse` and `ImportError::Parse`
+go further and drop the `serde_json::Error` outright, carrying the same scalars
+as *fields*, so neither their `Display` nor their derived `Debug` can echo.
+
+The state-file and elevation sites are the sharp ones, for the same reason:
+nothing is armed when they run. The elevation arms only after a successful
+parse, and the crash-recovery sweep runs before any session exists — so on
+those paths the address has no sink-level backstop either, and the password
+never has one anywhere.
 
 **What replaces the address in a Hole-authored line.** `server` (the token),
 `server_kind` (`domain`/`ipv4`/`ipv6`), `server_family`, `server_scope`
@@ -2214,15 +2314,38 @@ Checked against the diagnoses this repo has actually needed (#248, #541, #655,
 garter's plugin relay deliberately get **no** per-site edit — the sink covers
 them, and hand-redaction there would rot.
 
-**Two limits, so this is not read as a total guarantee.** First, `dump!`'s
+**Three limits, so this is not read as a total guarantee.** First, `dump!`'s
 ladder resolves per top-level expression, not per field: any `Serialize` type
-transitively holding a `ServerAddress` needs its own `Dump` impl, or the serde
-tree renders the inner string and `ServerAddress::dump` is never reached.
-`ServerEntry` and `ProxyConfig` have one; that is convention backed by
-per-container tests, not a compiler guarantee, with the sink as the backstop.
-Second, an address written in a form no armed literal is a byte-substring of —
+transitively holding a `ServerAddress` **or a `Password`** needs its own `Dump`
+impl, or the serde tree renders the inner string and the newtype's `dump` is
+never reached. The rungs are `ServerEntry`, `AppConfig`, `ProxyConfig`,
+`TestServerRequest`, `BridgeRequest`, and the bridge's on-disk `TargetFile` /
+`PersistedTarget` / `StartupPreferenceFile`. `BridgeRequest` is the top — the
+type the elevation flow serializes whole — and its impl is exhaustive with no
+`_` arm, so a new variant has to state whether it carries a secret;
+`AppConfig`'s destructures exhaustively for the same reason. The one type the
+rule reads as covering and deliberately does not is `ImportOutcome`:
+`crates/hole` has no `dump` dependency, so nothing there can call `dump!` and
+adding the impl would mean adding the capability. All of this is convention
+backed by per-container tests, not a compiler guarantee, with the sink as the
+backstop for the address and nothing behind it for the password. Second, an
+address written in a form no armed literal is a byte-substring of —
 a percent- or punycode-escaped form from a third-party process, a non-canonical
 IPv6 text form from a peer that is not `std` — is not redacted.
+
+**Third, and the one to know about: `shadowsocks_service=trace` writes the
+password to `bridge.log` in clear.** `shadowsocks::ServerConfig` derives
+`Debug` over a cleartext `password: String`, and `shadowsocks_service` renders
+it — `local/mod.rs`'s `trace!("{:?}", config)` at local-server construction,
+and two `trace!`s in `local/dns/server.rs`. `expose()` hands upstream a
+`String` it is entitled to keep; no newtype on Hole's side can reach that, and
+the password has no sink-level cure to catch it the way the address does. The
+directive is not obscure — [`init_multi`](crates/common/src/logging.rs)'s own
+worked example is `HOLE_BRIDGE_LOG=hole_bridge=debug,shadowsocks_service=trace`
+— and `bridge.log` is collected into the support bundle. **Do not turn that
+directive on against a real server, and do not ship a bundle collected while
+it was on.** Flooring the third-party directive in `build_filter` would close
+it at the cost of the diagnostic; that trade has not been made.
 
 **Existing artifacts.** Files already on disk are not rewritten: a SYSTEM bridge
 rewriting files in a user-writable directory is an attack surface. The support
