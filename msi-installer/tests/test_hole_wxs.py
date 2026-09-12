@@ -6,7 +6,7 @@ Parse the WiX source (hole.wxs) and verify structural correctness without buildi
 import re
 import xml.etree.ElementTree as ET
 
-from conftest import NS, canonical_windows_bindir
+from conftest import NS, WXS_PATH, canonical_windows_bindir
 
 # Known bind path variables passed via `-bindpath` to `wix build`.
 KNOWN_BINDPATHS = {"BinDir", "IconDir", "LicenseDir"}
@@ -167,6 +167,10 @@ def _is_uninstall_condition(condition: str) -> bool:
 # CAs that launch the app after install — exempt from Return=check and After=InstallFiles rules.
 _LAUNCH_CAS = {"LaunchApp"}
 
+# Uninstall CAs whose failure must BLOCK rather than be ignored — see
+# test_uninstall_cas_return_ignore.
+_COVER_RELEASE_CAS = {"BridgeRelease"}
+
 
 def test_install_cas_sequenced_after_install_files(package: ET.Element) -> None:
     """Every install CA (except launch CAs) must be transitively After='InstallFiles'."""
@@ -230,35 +234,33 @@ def test_launch_ca_passes_no_arguments(package: ET.Element) -> None:
 
 
 def test_uninstall_cas_sequenced_before_remove_files(package: ET.Element) -> None:
-    """Every uninstall CA must have a direct Before anchor that leads to RemoveFiles.
+    """Every uninstall CA must be transitively anchored Before RemoveFiles.
 
-    Only one hop of indirection is allowed: Before='RemoveFiles' directly,
-    or Before another uninstall CA that itself has Before='RemoveFiles'.
-    This keeps the ordering fully explicit and solver-independent.
+    Each CA is Before='RemoveFiles' or Before another uninstall CA, and
+    following that chain must terminate at RemoveFiles. Every hop is an
+    explicit Before attribute, so the ordering stays solver-independent — the
+    chain may be any length (it mirrors the install-side After walk).
     """
     customs = _get_custom_entries(package)
     uninstall_cas = [c for c in customs if _is_uninstall_condition(c.get("Condition", ""))]
+    before_map = {c.get("Action", ""): c.get("Before") for c in uninstall_cas}
 
-    for custom in uninstall_cas:
-        action = custom.get("Action", "")
-        before = custom.get("Before")
+    for action, before in before_map.items():
         assert before is not None, (
             f"Uninstall CA '{action}' has no Before attribute "
             "(must be directly anchored before a standard action)"
         )
 
-        # The Before target must be RemoveFiles or another uninstall CA
-        # that is itself directly Before RemoveFiles.
-        allowed_targets = {"RemoveFiles"}
-        for other in uninstall_cas:
-            other_action = other.get("Action", "")
-            if other.get("Before") == "RemoveFiles":
-                allowed_targets.add(other_action)
+        visited: set[str] = set()
+        current = action
+        while current in before_map and current not in visited:
+            visited.add(current)
+            current = before_map[current]
 
-        assert before in allowed_targets, (
-            f"Uninstall CA '{action}' has Before='{before}', which is not 'RemoveFiles' "
-            f"or another uninstall CA directly anchored to RemoveFiles. "
-            f"Allowed targets: {allowed_targets}"
+        assert current == "RemoveFiles", (
+            f"Uninstall CA '{action}' anchors to '{current}', not 'RemoveFiles'. "
+            f"Chain followed: {visited}. Every uninstall CA must reach RemoveFiles "
+            "through explicit Before hops (a cycle stops the walk early)."
         )
 
 
@@ -425,16 +427,226 @@ def test_install_cas_return_check(package: ET.Element) -> None:
 
 
 def test_uninstall_cas_return_ignore(package: ET.Element) -> None:
+    """Uninstall CAs must not block the uninstall — except the cover release.
+
+    A leftover PATH entry or an undeleted service is untidy. A leftover
+    fail-closed cover is a permanently blocked host: the WFP filters are
+    persistent, the Base Filtering Engine re-adds them every boot, and
+    RemoveFiles is about to delete the only binary that could remove them
+    (bindreams/hole#1003). That one failure is worth aborting for, so
+    BridgeRelease is deliberately Return='check' and asserted separately by
+    test_bridge_release_blocks_uninstall_on_failure.
+    """
     cas = _ca_map(package)
     for custom in _get_custom_entries(package):
         if _is_uninstall_condition(custom.get("Condition", "")):
             action = custom.get("Action", "")
+            if action in _COVER_RELEASE_CAS:
+                continue
             ca = cas.get(action)
             assert ca is not None, f"Custom references undefined CA '{action}'"
             assert ca.get("Return") == "ignore", (
                 f"Uninstall CA '{action}' should have Return='ignore' "
                 "to avoid blocking uninstall"
             )
+
+
+# Major-upgrade scheduling (bindreams/hole#1003) =======================================================================
+#
+# `RemoveExistingProducts` has four legal placements and they differ in exactly
+# the two properties this product depends on: whether a failed upgrade can
+# restore the old product, and whether the old product is gone before the new
+# product's files land. Hole needs both, and only one placement gives both.
+#
+# Sources (quoted in the assertions below):
+#   RemoveExistingProducts Action — https://learn.microsoft.com/windows/win32/msi/removeexistingproducts-action
+#   MajorUpgrade element — https://docs.firegiant.com/wix/schema/wxs/majorupgrade/
+
+# Placements where RemoveExistingProducts runs INSIDE the upgrade's rollback
+# transaction, or after it can no longer strand the host: a failed upgrade
+# either reinstalls the old product or never removed it. `afterInstallValidate`
+# — the WiX default when Schedule is omitted — is the one that is not on this
+# list: it removes the old product in a separate transaction, so a failed
+# upgrade leaves the machine with neither version installed.
+_RESTORABLE_REMOVE_SCHEDULES = {
+    "afterInstallInitialize",
+    "afterInstallExecute",
+    "afterInstallExecuteAgain",
+    "afterInstallFinalize",
+}
+
+# Placements where the old product is fully removed BEFORE the new product's
+# files are installed, so the old service (holding hole.exe open) is stopped by
+# the old product's own BridgeUninstall before InstallFiles overwrites it, and
+# the old product's PathRemove cannot run after the new product's PathAdd.
+_PRE_INSTALLFILES_REMOVE_SCHEDULES = {"afterInstallValidate", "afterInstallInitialize"}
+
+
+def _major_upgrade(package: ET.Element) -> ET.Element:
+    mu = package.find("wix:MajorUpgrade", NS)
+    assert mu is not None, "<MajorUpgrade> element not found"
+    return mu
+
+
+def test_major_upgrade_removal_is_undone_when_the_upgrade_fails(package: ET.Element) -> None:
+    """A failed upgrade must not leave covers armed with no hole.exe on disk.
+
+    The upgrade path deliberately keeps the fail-closed covers engaged:
+    BridgeUninstall passes `--keep-covers` and BridgeRelease is skipped under
+    UPGRADINGPRODUCTCODE, because the standing cover is what holds the
+    update-cutover gap. That is only survivable if a failed upgrade puts the
+    old product back — the covers are persistent WFP filters the Base Filtering
+    Engine re-adds every boot, and hole.exe is the only thing that can remove
+    them.
+
+    With the WiX default (`afterInstallValidate`) RemoveExistingProducts runs
+    outside the new install's transaction, so a failed upgrade leaves neither
+    version installed: covers armed, no binary, no in-band way back.
+    """
+    schedule = _major_upgrade(package).get("Schedule")
+    assert schedule is not None, (
+        "MajorUpgrade must set Schedule explicitly; the default (afterInstallValidate) "
+        "removes the old product outside the upgrade's rollback transaction, so a failed "
+        "upgrade strands armed covers with no hole.exe"
+    )
+    assert schedule in _RESTORABLE_REMOVE_SCHEDULES, (
+        f"Schedule='{schedule}' cannot restore the old product after a failed upgrade. "
+        f"Allowed: {sorted(_RESTORABLE_REMOVE_SCHEDULES)}"
+    )
+
+
+def test_major_upgrade_removes_the_old_product_before_the_new_files_land(package: ET.Element) -> None:
+    """The old service must be stopped before InstallFiles replaces its image.
+
+    BridgeUninstall runs inside the old product's removal and is what releases
+    the running bridge's hold on hole.exe. Scheduling the removal at or after
+    InstallExecute installs the new files first — over a live service — and
+    runs the old product's PathRemove after the new product's PathAdd, undoing
+    it.
+    """
+    schedule = _major_upgrade(package).get("Schedule")
+    assert schedule in _PRE_INSTALLFILES_REMOVE_SCHEDULES, (
+        f"Schedule='{schedule}' removes the old product at or after InstallExecute, so the new "
+        f"files are written over a running service and the old product's PathRemove trails the "
+        f"new product's PathAdd. Allowed: {sorted(_PRE_INSTALLFILES_REMOVE_SCHEDULES)}"
+    )
+
+
+# Fail-closed cover release (bindreams/hole#1003) ======================================================================
+
+
+def test_bridge_release_blocks_uninstall_on_failure(package: ET.Element) -> None:
+    """A cover release that fails must abort before RemoveFiles deletes hole.exe."""
+    ca = _ca_map(package).get("BridgeRelease")
+    assert ca is not None, "BridgeRelease CA must exist so uninstall releases the kill switch"
+    assert ca.get("Return") == "check", (
+        "BridgeRelease must be Return='check': proceeding into RemoveFiles after a "
+        "failed release leaves persistent WFP filters with no binary left to remove them"
+    )
+    assert ca.get("ExeCommand") == "bridge release-covers"
+    assert ca.get("Execute") == "deferred"
+    assert ca.get("Impersonate") == "no", "the release needs elevation to reach WFP"
+
+
+def test_bridge_release_is_skipped_on_major_upgrade(package: ET.Element) -> None:
+    """Disarming across an upgrade would defeat the cover that holds the cutover gap.
+
+    RemoveExistingProducts uninstalls the old product with REMOVE=ALL, so only
+    UPGRADINGPRODUCTCODE distinguishes an upgrade from a real uninstall.
+    """
+    entries = {c.get("Action", ""): c for c in _get_custom_entries(package)}
+    release = entries.get("BridgeRelease")
+    assert release is not None, "BridgeRelease must be sequenced"
+    assert "NOT UPGRADINGPRODUCTCODE" in release.get("Condition", ""), (
+        "BridgeRelease must skip the upgrade path — the standing cover must survive "
+        "the cutover gap for the new bridge to re-adopt"
+    )
+
+
+def test_bridge_uninstall_runs_on_upgrade_and_keeps_covers(package: ET.Element) -> None:
+    """The service teardown must run on an upgrade, but must not disarm anything.
+
+    The old service has to release its image before RemoveFiles replaces it, so
+    BridgeUninstall carries no upgrade guard — `--keep-covers` is what stops it
+    from disarming the kill switch on that path.
+    """
+    entries = {c.get("Action", ""): c for c in _get_custom_entries(package)}
+    teardown = entries.get("BridgeUninstall")
+    assert teardown is not None, "BridgeUninstall must be sequenced"
+    assert "UPGRADINGPRODUCTCODE" not in teardown.get("Condition", ""), (
+        "BridgeUninstall must run during RemoveExistingProducts so the old service "
+        "stops before its image is replaced"
+    )
+    ca = _ca_map(package).get("BridgeUninstall")
+    assert ca is not None
+    assert ca.get("ExeCommand") == "bridge uninstall --keep-covers", (
+        "without --keep-covers the upgrade path silently disarms the kill switch"
+    )
+
+
+def test_bridge_release_follows_the_service_teardown(package: ET.Element) -> None:
+    """The release must run against a dead bridge, and before PATH is stripped.
+
+    Clearing a cover out of process under a LIVE bridge leaves its posture
+    claiming a cover that no longer exists, and the next covered start skips
+    re-engagement on that claim. PathRemove trails the release because it is
+    deferred with no rollback partner: an aborted release must not leave the
+    PATH entry stripped.
+    """
+    entries = {c.get("Action", ""): c for c in _get_custom_entries(package)}
+    assert entries["BridgeUninstall"].get("Before") == "BridgeRelease"
+    assert entries["BridgeRelease"].get("Before") == "PathRemove"
+    assert entries["PathRemove"].get("Before") == "RemoveFiles"
+
+
+def test_bridge_uninstall_has_a_rollback_partner(package: ET.Element) -> None:
+    """An aborted uninstall must not leave the service torn down.
+
+    BridgeUninstall stops and deregisters the bridge, and the very next action
+    (BridgeRelease) is Return='check' — so a failed release rolls the uninstall
+    back over a product whose service is already gone. Without a rollback
+    partner the product is still installed but no longer running, and nothing
+    restores it (bindreams/hole#1003).
+
+    MSI ignores a rollback action's return value, so this can only add
+    recovery, never block one.
+    """
+    entries = {c.get("Action", ""): c for c in _get_custom_entries(package)}
+    rollback = entries.get("BridgeUninstallRollback")
+    assert rollback is not None, (
+        "BridgeUninstallRollback must be sequenced; without it a rolled-back uninstall "
+        "leaves the bridge stopped and deregistered with the product still installed"
+    )
+    assert rollback.get("Before") == "BridgeUninstall", (
+        "a rollback action must be scripted immediately before the deferred action it undoes, "
+        f"got Before='{rollback.get('Before')}'"
+    )
+
+    ca = _ca_map(package).get("BridgeUninstallRollback")
+    assert ca is not None, "BridgeUninstallRollback CA must be defined"
+    assert ca.get("Execute") == "rollback", (f"must run in the rollback script, got Execute='{ca.get('Execute')}'")
+    assert ca.get("Impersonate") == "no", "re-registering a service needs the elevated server context"
+    assert ca.get("ExeCommand") == _ca_map(package)["BridgeInstall"].get("ExeCommand"), (
+        "the rollback must re-run exactly what the install CA runs, or the restored state "
+        "is not the state the uninstall found"
+    )
+
+
+def test_bridge_release_has_an_override(package: ET.Element) -> None:
+    """Return='check' must not be able to make the product unremovable.
+
+    A release that can never succeed (BFE stopped, hole.exe quarantined) would
+    otherwise block every uninstall attempt forever.
+    """
+    entries = {c.get("Action", ""): c for c in _get_custom_entries(package)}
+    assert "NOT HOLE_KEEP_COVERS" in entries["BridgeRelease"].get("Condition", "")
+
+    props = {p.get("Id"): p for p in package.iter(f"{{{NS['wix']}}}Property")}
+    prop = props.get("HOLE_KEEP_COVERS")
+    assert prop is not None, "the override property must be declared"
+    assert prop.get("Secure") == "yes", (
+        "a public property must be Secure to survive into the deferred execute sequence under UAC"
+    )
 
 
 # Shortcut component tests =============================================================================================
@@ -867,4 +1079,108 @@ def test_verifyreadydlg_back_publishes_to_shortcutsdlg(package: ET.Element) -> N
     assert "NOT Installed" in condition, (
         f"VerifyReadyDlg.Back→ShortcutsDlg must condition on 'NOT Installed' to avoid "
         f"intercepting maintenance/patch flows; got Condition='{condition}'"
+    )
+
+
+# Rationale comments (bindreams/hole#1003) =============================================================================
+
+# Substrings that make a `netsh wfp` mention honest rather than a remedy.
+_NETSH_IS_NOT_A_REMEDY = ("no delete verb", "cannot remove", "diagnostics-only")
+
+
+def _wxs_comments() -> list[str]:
+    return re.findall(r"<!--(.*?)-->", WXS_PATH.read_text(encoding="utf-8"), re.DOTALL)
+
+
+def _paragraphs(comment: str) -> list[str]:
+    """The blank-line-separated paragraphs of one comment.
+
+    The scope the guards below run at, and the whole reason they bite. The
+    release rationale is a SINGLE `<!-- ... -->` block covering four subjects,
+    so a guard that searched the block was satisfied by a qualifier three
+    paragraphs above the claim it was meant to qualify — see
+    `test_the_guards_reject_the_wording_they_exist_to_delete`.
+    """
+    return [p for p in re.split(r"\n\s*\n", comment) if p.strip()]
+
+
+def _netsh_claims_without_qualifier(comment: str) -> list[str]:
+    """Paragraphs naming `netsh wfp` without saying, in that paragraph, that it removes nothing."""
+    return [p for p in _paragraphs(comment) if "netsh wfp" in p and not any(q in p for q in _NETSH_IS_NOT_A_REMEDY)]
+
+
+def _keep_covers_claims_without_remedy(comment: str) -> list[str]:
+    """Paragraphs naming HOLE_KEEP_COVERS without naming, in that paragraph, what clears it."""
+    return [p for p in _paragraphs(comment) if "HOLE_KEEP_COVERS" in p and "reinstall" not in p.lower()]
+
+
+def test_wxs_comments_offer_no_remedy_that_does_not_exist() -> None:
+    """The rationale a maintainer reads before touching Return='check' has to be true.
+
+    `netsh wfp` is a diagnostics-only netsh context: capture, dump, help, set,
+    show, and no delete verb. A comment that offers it as the way back from a
+    stranded cover tells whoever is weighing "should this really block the
+    uninstall?" that there is a safety net under HOLE_KEEP_COVERS. There is
+    not. Source-side mirror of cutover_tests.rs's guard on the shipped
+    operator message,
+    `an_unproven_release_does_not_send_the_operator_to_a_command_that_cannot_help`.
+    """
+    for comment in _wxs_comments():
+        unqualified = _netsh_claims_without_qualifier(comment)
+        assert not unqualified, (
+            f"a hole.wxs paragraph names `netsh wfp` without saying it removes nothing; "
+            f"allowed qualifiers: {_NETSH_IS_NOT_A_REMEDY}\n---\n" + "\n---\n".join(p.strip() for p in unqualified)
+        )
+
+
+def test_keep_covers_comment_names_the_only_way_back() -> None:
+    """HOLE_KEEP_COVERS strands the block; the paragraph that names it must say what clears it.
+
+    Removing a WFP filter takes an FWPM call and hole.exe is the only caller
+    of one on the host, so reinstalling Hole is the whole remedy. Saying
+    nothing leaves the escape looking cheaper than it is.
+    """
+    assert any("HOLE_KEEP_COVERS" in c for c in _wxs_comments()), "no hole.wxs comment explains HOLE_KEEP_COVERS"
+    for comment in _wxs_comments():
+        silent = _keep_covers_claims_without_remedy(comment)
+        assert not silent, (
+            "the HOLE_KEEP_COVERS rationale must name reinstalling Hole as the way back, in the "
+            "paragraph that names the property\n---\n" + "\n---\n".join(p.strip() for p in silent)
+        )
+
+
+# The shape both guards above missed: a qualified, remedy-naming paragraph
+# followed by one that claims neither. A guard scoped to the whole comment
+# lets an earlier paragraph's qualifier or remedy silently answer for a later
+# paragraph that names netsh/HOLE_KEEP_COVERS on its own.
+_QUALIFIED_PARAGRAPH = """\
+         `netsh wfp` is diagnostics-only — capture, dump, help, set, show, and
+         no delete verb — and removing a WFP filter takes an FWPM call, whose
+         only caller on the host is the hole.exe this uninstall is about to
+         delete. Reinstalling Hole is the way back (#1003)."""
+
+_PRE_PR_KEEP_COVERS_PARAGRAPH = """\
+         HOLE_KEEP_COVERS is the escape from the escape: Return="check" means a
+         release that can never succeed (BFE stopped, hole.exe quarantined)
+         would otherwise make the product permanently unremovable. Documented
+         in RELEASE-OPS.md as a last resort; it leaves the block in
+         place, so `netsh wfp` is the only thing left after it."""
+
+
+def test_the_guards_reject_the_wording_they_exist_to_delete() -> None:
+    """Both guards, against the exact mutation that used to slip past them.
+
+    Not a fixture for its own sake: it is the only thing standing between the
+    guards and a revert to comment scope, where the qualifier and the remedy
+    in the first paragraph answer for every paragraph after it.
+    """
+    comment = _QUALIFIED_PARAGRAPH + "\n\n" + _PRE_PR_KEEP_COVERS_PARAGRAPH
+
+    assert _netsh_claims_without_qualifier(comment) == [_PRE_PR_KEEP_COVERS_PARAGRAPH], (
+        "a `netsh wfp` claim must be qualified where it is made; a qualifier in an earlier "
+        "paragraph of the same comment does not answer for it"
+    )
+    assert _keep_covers_claims_without_remedy(comment) == [_PRE_PR_KEEP_COVERS_PARAGRAPH], (
+        "the HOLE_KEEP_COVERS remedy must be named where the property is named; 'reinstall' in "
+        "an earlier paragraph of the same comment does not answer for it"
     )

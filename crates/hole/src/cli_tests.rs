@@ -225,7 +225,7 @@ fn dispatch_installs_cli_log_guard_for_write_actions() {
         },
     }));
     assert!(should_install_cli_log_guard(&Command::Bridge {
-        action: BridgeAction::Uninstall,
+        action: BridgeAction::Uninstall { keep_covers: false },
     }));
     assert!(should_install_cli_log_guard(&Command::Bridge {
         action: BridgeAction::Status,
@@ -805,6 +805,40 @@ fn bridge_unlock_takes_no_args() {
         cli.command,
         Some(Command::Bridge {
             action: BridgeAction::Unlock
+        })
+    ));
+}
+
+// The MSI invokes these two by name; a rename here silently breaks the
+// installer's uninstall custom actions (bindreams/hole#1003).
+
+#[skuld::test]
+fn bridge_release_covers_takes_no_args() {
+    let cli = Cli::try_parse_from(["hole", "bridge", "release-covers"]).expect("parse bridge release-covers");
+    assert!(matches!(
+        cli.command,
+        Some(Command::Bridge {
+            action: BridgeAction::ReleaseCovers
+        })
+    ));
+}
+
+#[skuld::test]
+fn bridge_uninstall_keeps_covers_only_when_asked() {
+    let bare = Cli::try_parse_from(["hole", "bridge", "uninstall"]).expect("parse bridge uninstall");
+    assert!(matches!(
+        bare.command,
+        Some(Command::Bridge {
+            action: BridgeAction::Uninstall { keep_covers: false }
+        })
+    ));
+
+    let kept = Cli::try_parse_from(["hole", "bridge", "uninstall", "--keep-covers"])
+        .expect("parse bridge uninstall --keep-covers");
+    assert!(matches!(
+        kept.command,
+        Some(Command::Bridge {
+            action: BridgeAction::Uninstall { keep_covers: true }
         })
     ));
 }

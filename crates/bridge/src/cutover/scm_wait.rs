@@ -39,14 +39,28 @@ pub trait ScmActor {
 /// Stop the service, gated strictly on a real STOPPED callback from
 /// `NotifyServiceStatusChangeW`; re-arms after a non-terminal (pending) callback.
 /// The cutover's `stop_service_wait_stopped` and `platform::os::stop` use this.
+///
+/// A RUNNING observation re-issues the control rather than merely re-arming.
+/// The SCM refuses `ControlService(STOP)` with
+/// `ERROR_SERVICE_CANNOT_ACCEPT_CTRL` whenever the service is STOPPED,
+/// STOP_PENDING or START_PENDING, and the impl treats that refusal as benign
+/// because a stop wait is armed for all three of STOPPED, STOP_PENDING and
+/// RUNNING. The first two resolve themselves. START_PENDING resolves to
+/// RUNNING — a service that never took the stop — so that observation is the
+/// signal to send it again, now that the service can accept it. Re-arming
+/// alone would wait forever for a STOPPED nothing asked for.
 pub fn stop_via_notify<A: ScmActor>(a: &mut A) -> std::io::Result<()> {
     a.arm(WantState::Stopped)?;
     a.control_stop()?;
     loop {
         match a.wait_callback()? {
             Observed::Stopped => return Ok(()),
-            // Running/Pending are non-terminal for a stop wait — re-arm and wait.
-            Observed::Running | Observed::Pending => a.arm(WantState::Stopped)?,
+            Observed::Running => {
+                a.control_stop()?;
+                a.arm(WantState::Stopped)?;
+            }
+            // Pending is non-terminal for a stop wait — re-arm and wait.
+            Observed::Pending => a.arm(WantState::Stopped)?,
         }
     }
 }
@@ -87,7 +101,9 @@ mod system {
     use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
     use windows::core::{HRESULT, PCWSTR};
-    use windows::Win32::Foundation::{ERROR_SERVICE_NOTIFY_CLIENT_LAGGING, ERROR_SERVICE_NOT_ACTIVE};
+    use windows::Win32::Foundation::{
+        ERROR_SERVICE_CANNOT_ACCEPT_CTRL, ERROR_SERVICE_NOTIFY_CLIENT_LAGGING, ERROR_SERVICE_NOT_ACTIVE,
+    };
     use windows::Win32::System::Services::{
         CloseServiceHandle, ControlService, NotifyServiceStatusChangeW, OpenSCManagerW, OpenServiceW, StartServiceW,
         SC_HANDLE, SC_MANAGER_CONNECT, SERVICE_CONTROL_STOP, SERVICE_NOTIFY, SERVICE_NOTIFY_2W, SERVICE_NOTIFY_RUNNING,
@@ -141,9 +157,14 @@ mod system {
     /// `start()` the service has entered `StartPending`, so a later
     /// `StartPending -> Stopped` (or an already-`Stopped` immediate-fire) delivers
     /// a real `Stopped` callback that terminates the wait with `Err`.
+    ///
+    /// The stop wait also arms RUNNING: a service that was START_PENDING when
+    /// the control went out refused it, and RUNNING is the only state from
+    /// which `stop_via_notify` can re-issue it. Without that bit the wait
+    /// blocks forever on a service that started instead of stopping.
     fn want_to_mask(want: WantState, started: bool) -> SERVICE_NOTIFY {
         match want {
-            WantState::Stopped => SERVICE_NOTIFY_STOPPED | SERVICE_NOTIFY_STOP_PENDING,
+            WantState::Stopped => SERVICE_NOTIFY_STOPPED | SERVICE_NOTIFY_STOP_PENDING | SERVICE_NOTIFY_RUNNING,
             WantState::Running if started => {
                 SERVICE_NOTIFY_RUNNING | SERVICE_NOTIFY_STOPPED | SERVICE_NOTIFY_START_PENDING
             }
@@ -264,6 +285,16 @@ mod system {
                 // this control. The STOPPED arm has already queued the
                 // notification, so the wait still completes — benign.
                 Err(e) if e.code() == HRESULT::from_win32(ERROR_SERVICE_NOT_ACTIVE.0) => Ok(()),
+                // The service is STOPPED, STOP_PENDING or START_PENDING — the
+                // three states from which the SCM refuses a stop control
+                // outright. STOP_PENDING is the reachable one: `ProxyManager`'s
+                // teardown is unbounded (#556), so a bridge that is already
+                // stopping stays there long enough for an uninstall to land in
+                // the window. All three are covered by the stop wait's arm
+                // (STOPPED | STOP_PENDING | RUNNING) — see `stop_via_notify`,
+                // which re-issues this control on the RUNNING observation that
+                // a refused START_PENDING resolves to.
+                Err(e) if e.code() == HRESULT::from_win32(ERROR_SERVICE_CANNOT_ACCEPT_CTRL.0) => Ok(()),
                 Err(e) => Err(io::Error::other(e)),
             }
         }

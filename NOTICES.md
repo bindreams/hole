@@ -113,17 +113,17 @@ MIT OR Apache-2.0 (both GPL-3.0-compatible):
   Mach exception ports on macOS, POSIX signal handlers on Linux). Always
   linked (Windows / macOS / Linux all first-tier).
 - [`minidump-writer`](https://github.com/rust-minidump/minidump-writer) — the
-  dev-only `.dmp` writer, linked **only** under the non-default `crash-dumps`
-  cargo feature. It is absent from all release artifacts (MSI / DMG /
-  standalone galoshes), so a memory-bearing minidump — which for a privacy
-  VPN would hold keys and user traffic — is never producible by shipped
-  binaries.
+  dev-only `.dmp` writer, linked **only** on Windows and **only** under the
+  non-default `crash-dumps` cargo feature. It is absent from all release
+  artifacts (MSI / DMG / standalone galoshes) and from every macOS and Linux
+  build, so a memory-bearing minidump — which for a privacy VPN would hold
+  keys and user traffic — is never producible by shipped binaries.
 - [`sadness-generator`](https://github.com/EmbarkStudios/crash-handling) — an
   optional, non-default dependency enabled only by the test workflow (the
   `crash-child` feature); never linked into any shipped binary.
 
 These crates' bytes, where linked (`crash-handler`/`crash-context` always;
-`minidump-writer` in dev builds), are covered by the combined-distribution
+`minidump-writer` in dev Windows builds), are covered by the combined-distribution
 GPL-3.0 terms above per MIT/Apache → GPL one-way compatibility.
 
 ## Bundled third-party UI assets

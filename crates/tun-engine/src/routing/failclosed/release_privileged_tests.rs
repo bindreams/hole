@@ -67,7 +67,8 @@ impl Drop for ReleaseOnDrop {
         };
         let msg = format!(
             "CLEANUP FAILED: release_all could not clear this test's cover ({e}); this host may still \
-             be blocking all egress. Clear it with `hole bridge unlock` or `netsh wfp`."
+             be blocking all egress. Clear it with `hole bridge unlock`, elevated; `netsh wfp` \
+             cannot — it is diagnostics-only and has no delete verb."
         );
         if std::thread::panicking() {
             eprintln!("{msg}");

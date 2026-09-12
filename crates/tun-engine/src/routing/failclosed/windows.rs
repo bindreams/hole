@@ -149,7 +149,7 @@
 //! Windows-driver-samples) deletes boot-time filters by key off a live engine
 //! handle, as does Fort Firewall's teardown. So every existing fixed-GUID
 //! sweep in this file (`Cover::drop`'s Lockdown arm, `disengage_lockdown`,
-//! `release_all`, `swept_lockdown_guids`) covers the boot-time pair for free
+//! `release_all`, `swept_lockdown_keys`) covers the boot-time pair for free
 //! once its GUIDs are in that array — no new delete path is introduced here.
 //!
 //! That delete is the one failure this design could not survive, so it is
@@ -181,19 +181,30 @@
 //! delete cannot see the boot-time view at all"; it does not establish that a
 //! successful delete purges the record.
 //!
-//! **Where that false `Ok` is load-bearing, and it is not `release_all`'s
-//! logging.** #1009 would make `release_covers` → [`release_all`] the MSI's
-//! `Return="check"` uninstall gate (proposed there, not yet landed): `Ok` means the installer proceeds and
-//! deletes `hole.exe`. [`swept_lockdown_guids`] does now include the twins, so
-//! they ARE reachable — but only while a live object exists. Uninstall on a
-//! boot where this bridge never engaged (the kill switch armed in an earlier
-//! session, no connect in this one) finds no live twin, both keys answer
-//! not-found, the gate reads `Ok`, and the binary goes. If the boot-time record
-//! outlives its object, that is #1003 recreated for the pre-BFE window with the
-//! only tool that could clear it uninstalled. #1008's provider-enumeration
-//! sweep does not close this either — it also reads live objects. Closing it
-//! needs the record itself to be reachable, or the gate to stop treating
-//! not-found on a boot-time key as proof of absence.
+//! **Where that false `Ok` was load-bearing, and what closed it.** #1009 made
+//! `release_covers` → [`release_all`] the MSI's `Return="check"` uninstall
+//! gate: an exit code the installer reads as "safe to delete the binary".
+//! [`swept_lockdown_keys`] includes the twins, so they ARE reached — but only
+//! while a live object exists. An uninstall on a boot where this bridge never
+//! engaged (kill switch armed in an earlier session, no connect in this one)
+//! finds no live twin, and both keys answer not-found: indistinguishable from
+//! "never installed". A bare `Ok` there is #1003 recreated for the pre-BFE
+//! window, with the only tool that could clear it uninstalled.
+//!
+//! Which is why those keys carry [`KeyLifetime::BootTime`] and `release_all`
+//! returns a [`Clearance`] rather than a bare `Ok`. A not-found on a boot-time
+//! key is [`KeyOutcome::NotFound`] against a lifetime whose record a by-key
+//! delete may not address, so [`KeyObservation::proves_empty`] answers false
+//! and the key is reported UNPROVEN. The uninstall still proceeds — see
+//! [`Clearance`] for why refusing it over a bounded boot-window block would be
+//! strictly worse — but it no longer proceeds on a claim of proof nobody made,
+//! and `cutover::release_clearance_report` names the keys to an operator while
+//! `hole.exe` still exists to name them.
+//!
+//! What stays open is the underlying question, not the claim about it: whether
+//! a boot-time record outlives its object at all. #1008's
+//! provider-enumeration sweep does not close that either — it also reads live
+//! objects. Closing it needs the record itself to be reachable.
 //!
 //! **Disclosed, NOT closed by this change:** a fixed-GUID sweep can only
 //! delete a boot-time filter whose GUID the RUNNING binary knows. A stranded
@@ -244,18 +255,35 @@
 //! escape exists at all — not because a boot-time filter is hard to delete but
 //! because the only removal API needs the engine that is down.
 //!
-//! Out-of-band escape, stated at the confidence it deserves: `netsh wfp` has NO
-//! verb that deletes an individual filter. Its verbs are `capture`, `dump`,
-//! `help`, `set` (capture options only), `show` and `reset` — none of which
-//! takes a filter key — so the usual "recover with `netsh wfp`" advice does not
-//! apply to any WFP filter, boot-time or otherwise. The plausible hatches are `netsh wfp reset` (which
-//! restores default WFP policy) and removing
+//! Out-of-band escape, stated at the confidence it deserves: there is no
+//! in-box one. `netsh wfp` is a DIAGNOSTICS-ONLY context — its verbs are
+//! `capture`, `dump`, `help`, `set` (capture options only) and `show`
+//! (<https://learn.microsoft.com/windows-server/administration/windows-commands/netsh-wfp>),
+//! none of which takes a filter key — so the usual "recover with `netsh wfp`"
+//! advice does not apply to any WFP filter, boot-time or otherwise. An earlier
+//! draft of this section offered `netsh wfp reset` as a hatch and listed
+//! `reset` among the verbs. **There is no such command.** `reset` belongs to
+//! other `netsh` contexts (`netsh advfirewall reset`, `netsh int ip reset`),
+//! which reset Windows Firewall and TCP/IP policy, not WFP's filter store.
+//! `cutover::release_clearance_report` — the message an operator actually
+//! reads — has always said the five-verb version, and this is now the same
+//! claim in both places (bindreams/hole#1003).
+//!
+//! What `netsh wfp` CAN do for this key class is `show boottimepolicy`: the
+//! OS's own view of the boot-time policy store, and therefore the one
+//! diagnostic that could see a surviving record. `show filters` is the wrong
+//! one — it lists what is active NOW, which by definition excludes a boot-time
+//! filter once BFE has started, i.e. at every moment an operator reads it.
+//! Seeing is not removing: the only removal API is FWPM, so the only remedy is
+//! to put a binary back on the host that can make that call.
+//!
+//! The one other hatch worth recording, and NOT worth offering a user:
+//! removing
 //! `HKLM\SYSTEM\CurrentControlSet\Services\BFE\Parameters\Policy\BootTime`,
-//! where boot-time filter blobs are reported to live. **Neither is verified
-//! here, and the registry path is not Microsoft-documented at all** — it comes
-//! from third-party reverse engineering of BFE's on-disk policy. Do not put
-//! either in front of a user as a known-good recovery step without testing it
-//! first.
+//! where boot-time filter blobs are reported to live. That path is not
+//! Microsoft-documented at all — it comes from third-party reverse engineering
+//! of BFE's on-disk policy — and nothing here has tested it. Do not put it in
+//! front of a user as a known-good recovery step.
 //!
 //! Note we are exposed to this for longer than the precedent is. Mullvad
 //! installs its boot-time blocks only as the daemon SHUTS DOWN under a
@@ -270,7 +298,9 @@
 //! records that review's findings as its acceptance criteria). **Per #1008's
 //! own ordering constraint: this change is safe to develop and review on its
 //! own, but must not ship in a release a user could downgrade from until
-//! #1008 lands.**
+//! #1008 lands.** That constraint is also recorded in RELEASE-OPS.md's "Ship
+//! blockers" section: a module doc is not where a release operator looks, and
+//! a ship blocker visible only to whoever is editing this file is not one.
 //!
 //! **What no test here can reach.** EVERYTHING measured for #998 happens
 //! inside a SINGLE boot, because that is all the elevated Windows lane can
@@ -363,6 +393,7 @@ use windows::Win32::NetworkManagement::WindowsFilteringPlatform::*;
 use windows::Win32::System::Rpc::RPC_C_AUTHN_WINNT;
 
 use super::RESOLVER_PERMIT_PORT;
+use super::{Clearance, KeyLifetime, KeyObservation, KeyOutcome};
 use crate::error::RoutingError;
 
 // Fixed Hole identifiers. Compiled in so recovery can delete by key with no
@@ -402,7 +433,7 @@ pub const FILTER_GUIDS: [GUID; 12] = [
 const IPPROTO_TCP: u8 = 6;
 
 // Lockdown-cover filter GUIDs — disjoint from FILTER_GUIDS. A Sweep deletes
-// all of these (`swept_lockdown_guids`); an engage refreshes the volatile
+// all of these (`swept_lockdown_keys`); an engage refreshes the volatile
 // subset (`lockdown_pre_delete_guids`). A crash that leaves the cover engaged is
 // reconciled on the next start.
 // Layout: [loopback CONNECT V4, loopback CONNECT V6, TUN V4, TUN V6,
@@ -439,6 +470,52 @@ pub const LOCKDOWN_BOOTTIME_BLOCK_ALL_GUIDS: [GUID; 2] = [
     GUID::from_u128(0x227bca1d_5415_4421_a5da_bf5babe1c556), // block-all V6 (boot-time)
 ];
 
+/// One boot-time block-all twin: its fixed key, the CONNECT layer it blocks,
+/// and the label every diagnostic names the key by.
+///
+/// The lifetime is deliberately NOT a field. It is [`Self::LIFETIME`] — one
+/// value for the whole table, read by [`build_lockdown_spec`] (which stamps
+/// the WFP flag on the object) and by [`swept_lockdown_keys`] (which records
+/// what a delete of that key proves). Those two used to be independent
+/// literals, and a disagreement between them is silent in exactly the
+/// direction that hurts: a twin installed `FWPM_FILTER_FLAG_BOOTTIME` whose
+/// key is swept as [`KeyLifetime::Persistent`] makes [`release_all`] report a
+/// proof of removal it never observed, and the MSI deletes `hole.exe` on the
+/// strength of it (bindreams/hole#1003). With one value there is nothing to
+/// disagree.
+///
+/// The label is shared with [`pre_delete_label`] for the same reason: with
+/// the binary gone an operator has only the label to look the key up by, so
+/// the pre-delete abort and `bridge release-covers` must not invent two names
+/// for one key.
+struct BootTimeTwin {
+    guid: GUID,
+    layer: Layer,
+    label: &'static str,
+}
+
+impl BootTimeTwin {
+    /// Every entry in [`LOCKDOWN_BOOTTIME_TWINS`] is boot-time by
+    /// construction — there is no per-entry field to get wrong.
+    const LIFETIME: FilterLifetime = FilterLifetime::BOOT_TIME;
+}
+
+/// The twins, in [`LOCKDOWN_BOOTTIME_BLOCK_ALL_GUIDS`] order. The length is
+/// taken from that array, so a GUID added there without an entry here is a
+/// compile error rather than a key that is installed and never swept.
+const LOCKDOWN_BOOTTIME_TWINS: [BootTimeTwin; LOCKDOWN_BOOTTIME_BLOCK_ALL_GUIDS.len()] = [
+    BootTimeTwin {
+        guid: LOCKDOWN_BOOTTIME_BLOCK_ALL_GUIDS[0],
+        layer: Layer::ConnectV4,
+        label: "lockdown boot-time block-all V4",
+    },
+    BootTimeTwin {
+        guid: LOCKDOWN_BOOTTIME_BLOCK_ALL_GUIDS[1],
+        layer: Layer::ConnectV6,
+        label: "lockdown boot-time block-all V6",
+    },
+];
+
 /// Indices into [`LOCKDOWN_FILTER_GUIDS`] for the TUN-interface (LUID) permit
 /// pair — one of the two volatile permits an engage refreshes (see
 /// [`adopt_delete_guids`]).
@@ -463,36 +540,105 @@ fn appid_filter_guid(index: usize, v6: bool) -> GUID {
 /// ignored), so an unused App-ID slot is harmless.
 const MAX_APPID_BINARIES: usize = 4;
 
-/// Every transient-cover filter GUID a recovery `delete_all` must remove: the
-/// twelve fixed GUIDs. Mirrors [`swept_lockdown_guids`] for the lockdown cover.
-fn swept_transient_guids() -> Vec<GUID> {
-    FILTER_GUIDS.to_vec()
+/// One key a sweep deletes, carrying the lifetime that decides what a
+/// `FWP_E_FILTER_NOT_FOUND` on it PROVES.
+///
+/// The lifetime rides on the key rather than sitting in a parallel array on
+/// purpose. A sweep list and a "which of these are boot-time" list are two
+/// things that can drift, and the drift is silent in exactly the direction
+/// that hurts: a boot-time key mis-tagged `Persistent` makes `release_all`
+/// report proof it does not have, and the MSI deletes `hole.exe` on the
+/// strength of it (bindreams/hole#1003). Here a new key cannot be added
+/// without naming its lifetime, because there is no field to leave out.
+///
+/// It is a [`FilterLifetime`] — the same vocabulary [`FilterSpec`] installs
+/// with — and not a bare [`KeyLifetime`], so a key is described in the terms
+/// its filter was created in and [`observations`] does the one conversion.
+/// Writing a sweep classification that no `add_filter` could have produced is
+/// not expressible.
+#[derive(Debug, Clone, Copy)]
+struct SweptKey {
+    guid: GUID,
+    /// Operator-facing label, surfaced by `bridge release-covers` when the
+    /// key's absence goes unproven. Once the binary is gone the label is all
+    /// an operator has to look the key up by — `netsh wfp show boottimepolicy`
+    /// can show a surviving record but cannot remove one — so it has to name
+    /// what to look for.
+    label: &'static str,
+    lifetime: FilterLifetime,
 }
 
-/// Every lockdown filter GUID a full Sweep must delete: the twelve fixed
-/// lockdown GUIDs + the boot-time block-all pair (#998) + the per-binary
-/// App-ID GUIDs. (Transient GUIDs are swept separately by `delete_all`.) The
-/// boot-time pair's deletion is bounded to what this array's own GUIDs cover
-/// — see the module doc's "Boot-time coverage" section for the disclosed
-/// downgrade-strand residual this leaves open (#1008).
-fn swept_lockdown_guids() -> Vec<GUID> {
-    let mut guids: Vec<GUID> = LOCKDOWN_FILTER_GUIDS.to_vec();
-    guids.extend_from_slice(&LOCKDOWN_BOOTTIME_BLOCK_ALL_GUIDS);
+/// Every transient-cover filter GUID a recovery `delete_all` must remove: the
+/// twelve fixed GUIDs. Mirrors [`swept_lockdown_keys`] for the lockdown cover.
+///
+/// All `Persistent`: `add_filter` stamps `FWPM_FILTER_FLAG_PERSISTENT` on
+/// every filter it installs, and the transient cover has no boot-time half
+/// (it is a bounded-window guard — there is no boot it needs to span).
+fn swept_transient_keys() -> Vec<SweptKey> {
+    FILTER_GUIDS
+        .iter()
+        .map(|&guid| SweptKey {
+            guid,
+            label: "transient filter",
+            lifetime: FilterLifetime::PERSISTENT,
+        })
+        .collect()
+}
+
+/// Every lockdown filter key a full Sweep must delete: the twelve fixed
+/// lockdown GUIDs + the boot-time block-all twins (#998) + the per-binary
+/// App-ID GUIDs. (Transient GUIDs are swept separately by `delete_all`.)
+///
+/// Every key here carries the lifetime of the flag `build_lockdown_spec`
+/// stamps on the filter behind it — see [`SweptKey::lifetime`] for what
+/// silently getting one wrong costs. The twins' deletion is bounded to what
+/// [`LOCKDOWN_BOOTTIME_BLOCK_ALL_GUIDS`] covers; see the module doc's
+/// "Boot-time coverage" section for the disclosed downgrade-strand residual
+/// that leaves open (#1008).
+fn swept_lockdown_keys() -> Vec<SweptKey> {
+    let mut keys: Vec<SweptKey> = LOCKDOWN_FILTER_GUIDS
+        .iter()
+        .map(|&guid| SweptKey {
+            guid,
+            label: "lockdown filter",
+            lifetime: FilterLifetime::PERSISTENT,
+        })
+        .collect();
+    keys.extend(LOCKDOWN_BOOTTIME_TWINS.iter().map(|t| SweptKey {
+        guid: t.guid,
+        label: t.label,
+        lifetime: BootTimeTwin::LIFETIME,
+    }));
     for i in 0..MAX_APPID_BINARIES {
-        guids.push(appid_filter_guid(i, false));
-        guids.push(appid_filter_guid(i, true));
+        for v6 in [false, true] {
+            keys.push(SweptKey {
+                guid: appid_filter_guid(i, v6),
+                label: "lockdown app-id filter",
+                lifetime: FilterLifetime::PERSISTENT,
+            });
+        }
     }
-    guids
+    keys
 }
 
 /// The VOLATILE lockdown permits — the TUN-LUID pair (dies with the TUN) and
 /// the server-IP pair (changes with the server). They carry fixed keys, so
 /// engage's `ok_or_exists` would silently keep a stale one; [`engage_lockdown`]
 /// deletes them inside its transaction before the adds, so every engage lands
-/// current values. The floor (block-all, loopback, App-ID) is never in this set
-/// — it stays in force so the host is never opened by a refresh.
+/// current values. BOTH families are here even though only one is ever added:
+/// a host that switches from a V4 server to a V6 one would otherwise leave the
+/// V4 permit standing for an address nothing dials any more.
 ///
-/// Reached through `CoverSpec::pre_delete` (as one half of
+/// The block-all and loopback floor is never in this set — it stays in force
+/// so the host is never opened by a refresh. The App-ID permits are not here
+/// either, but for a different reason and not because they are floor: they
+/// carry a runtime value too (see [`appid_pre_delete_guids`]) and are refreshed
+/// alongside these, just not under the name `Adopt` is defined in terms of.
+/// Deleting a PERMIT inside the transaction can only make the cover stricter,
+/// never open the host; that asymmetry is why the block-all is the one thing
+/// excluded.
+///
+/// Reached through `CoverSpec::pre_delete` (as one third of
 /// [`lockdown_pre_delete_guids`]), so recovery cannot issue it: a
 /// recovery-time delete would drop a RUNNING bridge's server permit whenever a
 /// second bridge with a fresh state dir adopted the cover.
@@ -504,8 +650,52 @@ fn adopt_delete_guids() -> Vec<GUID> {
         .collect()
 }
 
+/// EVERY App-ID permit slot, not only the ones this engage will re-add.
+///
+/// An App-ID permit matches on `Condition::AppId(path)` — a runtime value, so
+/// a re-engage over an occupied key would keep the stored path and discard the
+/// current one. The GUID is derived from the SLOT INDEX
+/// ([`appid_filter_guid`]), not from the path, so an update-cutover that
+/// changes `hole.exe`'s directory reuses slot 1's key with a new path: exactly
+/// the `FWP_E_ALREADY_EXISTS` case that used to leave the pre-update binary
+/// permitted and the running one blocked, under a cover reporting success
+/// (bindreams/hole#1010, finding F2).
+///
+/// All [`MAX_APPID_BINARIES`] slots rather than `app_ids.len()` for the second
+/// half of the same bug: a config that drops its plugin shortens the list, and
+/// the vacated slot's permit — for a binary this bridge no longer runs — would
+/// otherwise stand indefinitely. The engage re-adds only the slots in use, so
+/// the surplus deletes are benign not-founds on a first engage and genuine
+/// removals on a shrink.
+fn appid_pre_delete_guids() -> Vec<GUID> {
+    (0..MAX_APPID_BINARIES)
+        .flat_map(|i| [false, true].map(|v6| appid_filter_guid(i, v6)))
+        .collect()
+}
+
+/// The transient cover's runtime-valued permits: the server-IP pair and the
+/// resolver pair, both families of each.
+///
+/// Same rule as [`adopt_delete_guids`], for the cover [`engage`] installs. The
+/// transient cover is normally engaged over a swept host, so these are benign
+/// not-founds — but "normally" is not "always": `ok_or_exists`'s own disclosed
+/// residual was a repair (release the cover, re-engage with a corrected
+/// server) landing on a key whose release delete had failed, where the re-add
+/// reported success and the OLD address stayed permitted. Deleting first
+/// removes the case rather than documenting it.
+fn transient_pre_delete_guids() -> Vec<GUID> {
+    vec![
+        FILTER_GUIDS[2],  // server V4
+        FILTER_GUIDS[3],  // server V6
+        FILTER_GUIDS[10], // resolver V4
+        FILTER_GUIDS[11], // resolver V6
+    ]
+}
+
 /// Everything [`engage_lockdown`] deletes inside its own transaction before the
-/// adds: the volatile permits ([`adopt_delete_guids`]) PLUS the boot-time twins.
+/// adds, in three groups with two distinct causes: the runtime-valued permits
+/// — the TUN-LUID and server-IP pairs ([`adopt_delete_guids`]) and every
+/// App-ID slot ([`appid_pre_delete_guids`]) — PLUS the boot-time twins.
 ///
 /// The twins are here for a different reason than the permits, and it is the
 /// reason the twins are re-armed rather than re-added: **a boot-time filter is
@@ -524,41 +714,96 @@ fn adopt_delete_guids() -> Vec<GUID> {
 /// branch) clears the way for a genuine re-add.
 ///
 /// The delete and the add are in ONE FWPM transaction, so no gap is opened in
-/// the FWPM object store. Whether the underlying boot-time POLICY RECORD is
-/// updated transactionally is not documented and is not claimed here — the
-/// refresh runs while BFE is up, where no twin is enforcing under either
-/// reading, so a non-atomic record update has no window to leak through. The `Persistent` block-all beside them is NOT in this
-/// set: it is live and enforcing right now, and dropping it — even
+/// the FWPM object store, and nothing enforcing THIS boot is disturbed either
+/// way: the refresh runs while BFE is up, where no twin is in effect under
+/// either reading.
+///
+/// **Read that at its scope — it is an argument about the wrong boot, and it
+/// is the only one available.** A twin exists for the NEXT boot, and what
+/// serves that boot is the underlying boot-time POLICY RECORD, not the FWPM
+/// object this transaction covers. Whether FWPM's transaction extends to that
+/// record — whether an abort restores it, whether a committed delete+add
+/// leaves it consistent — is documented nowhere found and cannot be measured
+/// from a lane that never reboots. So the failure this could produce is not
+/// "egress leaks now"; it is "the next boot's pre-BFE window is unprotected
+/// while the GUI still reports the kill switch armed". Under the "removed"
+/// reading there is no record to update and the question is moot; under
+/// "disabled" it is open. Disclosed, not closed — see the module doc's "What
+/// no test here can reach". The `Persistent` block-all beside them is NOT in
+/// this set: it is live and enforcing right now, and dropping it — even
 /// transactionally — is the one thing a refresh must never do to the floor.
 fn lockdown_pre_delete_guids() -> Vec<GUID> {
     let mut guids = adopt_delete_guids();
-    guids.extend_from_slice(&LOCKDOWN_BOOTTIME_BLOCK_ALL_GUIDS);
+    guids.extend(appid_pre_delete_guids());
+    // From the twin table, the same place `build_lockdown_spec` takes the keys
+    // it adds back — not from the GUID array beside it, which would be a
+    // second reader able to drift out of step with the adds.
+    guids.extend(LOCKDOWN_BOOTTIME_TWINS.iter().map(|t| t.guid));
     guids
 }
 
-/// What to call a [`lockdown_pre_delete_guids`] entry in an error message.
+/// Operator-facing names for the App-ID pre-delete slots, indexed
+/// `slot * 2 + usize::from(v6)`.
+///
+/// Static strings because [`first_delete_failure`] renders a `&'static str`,
+/// and one per slot AND family for the reason [`pre_delete_label`] gives. The
+/// length is tied to [`MAX_APPID_BINARIES`], so raising the slot count without
+/// naming the new slots is a compile error.
+const APPID_PRE_DELETE_LABELS: [&str; MAX_APPID_BINARIES * 2] = [
+    "App-ID permit slot 0 V4",
+    "App-ID permit slot 0 V6",
+    "App-ID permit slot 1 V4",
+    "App-ID permit slot 1 V6",
+    "App-ID permit slot 2 V4",
+    "App-ID permit slot 2 V6",
+    "App-ID permit slot 3 V4",
+    "App-ID permit slot 3 V6",
+];
+
+/// What to call a pre-delete entry — [`lockdown_pre_delete_guids`]' or
+/// [`transient_pre_delete_guids`]' — in an error message.
 ///
 /// [`first_delete_failure`] renders `"{what} delete failed: 0x{code:08x}"` and
 /// carries no GUID, so this string is the entire diagnostic an operator gets
-/// from a failing pre-delete — which now ABORTS a kill-switch-armed start. One
-/// shared label would collapse three unrelated root causes (a dead TUN LUID, a
-/// changed server, a spent boot-time twin); a family-blind one would still
-/// leave a V4/V6 pair indistinguishable, and those fail for different reasons —
-/// a host with no IPv6 binding is an ordinary cause of a V6-only anomaly.
-/// So: one label per key, six for six. Pure and total, so
+/// from a failing pre-delete — which ABORTS the engage. One shared label would
+/// collapse unrelated root causes (a dead TUN LUID, a changed server, a
+/// renamed binary, a spent boot-time twin); a family-blind one would still
+/// leave a V4/V6 pair indistinguishable, and those fail for different reasons
+/// — a host with no IPv6 binding is an ordinary cause of a V6-only anomaly.
+/// So: one label per key. Pure and total, so
 /// `every_pre_delete_guid_has_its_own_label` can check the mapping without
 /// FWPM.
+///
+/// The transient keys are named apart from the lockdown ones even where the
+/// role matches: the two covers are separate objects with separate GUIDs, and
+/// an operator reading "server-IP permit V4 delete failed" needs to know which
+/// cover's engage aborted.
 fn pre_delete_label(guid: &GUID) -> &'static str {
+    // The twins' names come from `LOCKDOWN_BOOTTIME_TWINS`, the same table
+    // `swept_lockdown_keys` labels them from, so a pre-delete abort and
+    // `bridge release-covers` name one key one way.
+    if let Some(twin) = LOCKDOWN_BOOTTIME_TWINS.iter().find(|t| t.guid == *guid) {
+        return twin.label;
+    }
+    for slot in 0..MAX_APPID_BINARIES {
+        for (family, v6) in [false, true].into_iter().enumerate() {
+            if appid_filter_guid(slot, v6) == *guid {
+                return APPID_PRE_DELETE_LABELS[slot * 2 + family];
+            }
+        }
+    }
     match guid {
-        g if *g == LOCKDOWN_BOOTTIME_BLOCK_ALL_GUIDS[0] => "boot-time block-all twin V4",
-        g if *g == LOCKDOWN_BOOTTIME_BLOCK_ALL_GUIDS[1] => "boot-time block-all twin V6",
         g if *g == LOCKDOWN_FILTER_GUIDS[LOCKDOWN_TUN_GUID_INDICES[0]] => "TUN-LUID permit V4",
         g if *g == LOCKDOWN_FILTER_GUIDS[LOCKDOWN_TUN_GUID_INDICES[1]] => "TUN-LUID permit V6",
         g if *g == LOCKDOWN_FILTER_GUIDS[LOCKDOWN_SERVER_GUID_INDICES[0]] => "server-IP permit V4",
         g if *g == LOCKDOWN_FILTER_GUIDS[LOCKDOWN_SERVER_GUID_INDICES[1]] => "server-IP permit V6",
-        // Unreachable for anything `lockdown_pre_delete_guids` yields, and
-        // asserted so. A future pre-delete entry lands here until it is named.
-        _ => "unnamed lockdown pre-delete key",
+        g if *g == FILTER_GUIDS[2] => "transient server-IP permit V4",
+        g if *g == FILTER_GUIDS[3] => "transient server-IP permit V6",
+        g if *g == FILTER_GUIDS[10] => "transient resolver permit V4",
+        g if *g == FILTER_GUIDS[11] => "transient resolver permit V6",
+        // Unreachable for anything either pre-delete list yields, and asserted
+        // so. A future pre-delete entry lands here until it is named.
+        _ => "unnamed pre-delete key",
     }
 }
 
@@ -579,26 +824,64 @@ pub enum Action {
     Block,
 }
 
-/// Which WFP lifetime flag a filter carries — see the module doc's "Boot-time
-/// coverage" section. Mutually exclusive on one filter (WFP's own
-/// `FWPM_FILTER0` docs), so a rule needing both coverage windows needs two
-/// [`FilterSpec`]s.
+/// A filter's lifetime: the WFP flag [`add_filter`] stamps on the object AND
+/// the [`KeyLifetime`] a sweep of that object's key must record. One value,
+/// not two — see the module doc's "Boot-time coverage" section.
+///
+/// **This is the compile-time half of the #1003 hazard** (bindreams/hole#1010).
+/// The two used to be separate enums — a `Boottime` variant here, a
+/// [`KeyLifetime::BootTime`] variant in the facade — chosen at two sites, by
+/// hand, with nothing tying them together. That pair drifts silently in
+/// exactly the direction that hurts: a filter installed
+/// `FWPM_FILTER_FLAG_BOOTTIME` whose key is swept as
+/// [`KeyLifetime::Persistent`] makes [`release_all`] report a proof of removal
+/// it never observed, and the MSI deletes `hole.exe` on the strength of it.
+/// Here the classification is not a second thing to remember: it is the value
+/// the flag came from. [`Self::key_lifetime`] reads it back,
+/// [`Self::filter_flags`] is the only route in this crate from a lifetime to
+/// the flag bits, and there is no constructor that hands out the bits without
+/// it — so "install a boot-time filter without classifying its key" is not a
+/// mistake this vocabulary can express, rather than one a guard has to catch.
+///
+/// A newtype over [`KeyLifetime`] rather than a second enum for the same
+/// reason: two enums would have to be kept in step by a match somebody writes,
+/// and that match is the drift. Private field, so no caller outside this
+/// module can mint a lifetime that never came from a [`KeyLifetime`].
+///
+/// The flags remain mutually exclusive on one WFP filter object (WFP's own
+/// `FWPM_FILTER0` docs: "This flag \[PERSISTENT\] cannot be set together with
+/// FWPM_FILTER_FLAG_BOOTTIME"), so a rule needing both coverage windows still
+/// needs two [`FilterSpec`]s — which is what the twins are.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FilterLifetime {
-    /// `FWPM_FILTER_FLAG_PERSISTENT` — re-added by the Base Filtering Engine
-    /// (BFE) once it starts; NOT enforced before that.
-    Persistent,
-    /// `FWPM_FILTER_FLAG_BOOTTIME` — enforced by the kernel (tcpip.sys) from
-    /// boot until BFE starts; NOT re-added by BFE afterwards.
-    Boottime,
-}
+pub struct FilterLifetime(KeyLifetime);
 
-/// Map a [`FilterLifetime`] to its WFP flag bit. Pure and total, so
-/// `add_filter`'s actual FFI mapping is unit-testable without FWPM.
-fn filter_lifetime_flag(lifetime: FilterLifetime) -> u32 {
-    match lifetime {
-        FilterLifetime::Persistent => FWPM_FILTER_FLAG_PERSISTENT.0,
-        FilterLifetime::Boottime => FWPM_FILTER_FLAG_BOOTTIME.0,
+impl FilterLifetime {
+    /// `FWPM_FILTER_FLAG_PERSISTENT` — re-added by the Base Filtering Engine
+    /// (BFE) once it starts; NOT enforced before that. A by-key delete
+    /// addresses BFE's store, which is the key's only record, so a not-found
+    /// answer proves the key carries nothing.
+    pub const PERSISTENT: Self = Self(KeyLifetime::Persistent);
+    /// `FWPM_FILTER_FLAG_BOOTTIME` — enforced by the kernel (tcpip.sys) from
+    /// boot until BFE starts; NOT re-added by BFE afterwards. The runtime
+    /// object therefore exists only in that window, so on any boot where it is
+    /// not live the key answers not-found whether or not a boot-time policy
+    /// record survives behind it — see [`KeyLifetime::BootTime`].
+    pub const BOOT_TIME: Self = Self(KeyLifetime::BootTime);
+
+    /// What a sweep of this filter's key must record — see [`SweptKey`] and
+    /// [`KeyObservation::proves_empty`].
+    pub(crate) const fn key_lifetime(self) -> KeyLifetime {
+        self.0
+    }
+
+    /// The `FWPM_FILTER0::flags` value for this lifetime, and the only place
+    /// in this crate those bits are produced. Pure and total, so `add_filter`'s
+    /// FFI mapping is unit-testable without FWPM.
+    fn filter_flags(self) -> FWPM_FILTER_FLAGS {
+        FWPM_FILTER_FLAGS(match self.0 {
+            KeyLifetime::Persistent => FWPM_FILTER_FLAG_PERSISTENT.0,
+            KeyLifetime::BootTime => FWPM_FILTER_FLAG_BOOTTIME.0,
+        })
     }
 }
 
@@ -636,6 +919,39 @@ pub enum Condition {
     Any,
 }
 
+impl Condition {
+    /// Whether this condition matches on a value discovered at RUNTIME, as
+    /// opposed to one fixed at compile time.
+    ///
+    /// This is what decides whether `FWP_E_ALREADY_EXISTS` on an add is
+    /// benign. A filter key is a compile-time constant; the object stored
+    /// under it is not. When the condition is fixed, a duplicate add is
+    /// re-adding the identical rule and [`ok_or_exists`] reporting `Ok` is
+    /// exactly right. When it carries a runtime value, the stored object can
+    /// be the PREVIOUS value — a prior server IP, a dead TUN LUID, the
+    /// pre-update path of `hole.exe` — and `Ok` there is a cover reporting
+    /// success while enforcing something else. Every such key is therefore
+    /// pre-deleted inside the engage transaction, and [`add_filter`] refuses
+    /// a duplicate on one rather than papering over it.
+    ///
+    /// One exhaustive match, on the type, so a new variant must answer
+    /// (CLAUDE.md's "per-variant policy lives on the type"). Grouping by
+    /// consequence is what would get this wrong: `LoopbackNet` CARRIES an
+    /// `IpAddr` and is still fixed, because only the address FAMILY is read
+    /// and the family is a property of the key's layer — a V4 key always
+    /// gets 127.0.0.0/8. The question is not "does it hold data" but "can the
+    /// data differ between two engages of the same key".
+    fn carries_runtime_value(&self) -> bool {
+        match self {
+            Condition::Loopback | Condition::LoopbackNet(_) | Condition::Any => false,
+            Condition::RemoteIp(_)
+            | Condition::RemoteIpPortTcp(..)
+            | Condition::LocalInterface(_)
+            | Condition::AppId(_) => true,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct FilterSpec {
     pub guid: GUID,
@@ -650,6 +966,66 @@ pub struct FilterSpec {
     pub lifetime: FilterLifetime,
 }
 
+impl FilterSpec {
+    /// Whether this filter's key must be EMPTY when the add runs — i.e.
+    /// whether `FWP_E_ALREADY_EXISTS` on it is a silent failure rather than
+    /// benign idempotency.
+    ///
+    /// Two independent causes, named separately because they are separate and
+    /// a future third would be too:
+    ///
+    /// * the condition carries a runtime-discovered value
+    ///   ([`Condition::carries_runtime_value`]), so the stored object may hold
+    ///   the PREVIOUS value;
+    /// * the lifetime is [`FilterLifetime::BOOT_TIME`], so the stored object
+    ///   may be a twin spent by the boot it already covered — under the
+    ///   "disabled" reading its key stays occupied and the re-arm silently
+    ///   does nothing (see [`lockdown_pre_delete_guids`]).
+    ///
+    /// The second is why this lives on [`FilterSpec`] and not on
+    /// [`Condition`]: a twin's condition is [`Condition::Any`], which carries
+    /// no value at all, so a condition-only predicate cannot see the very
+    /// filters #998 exists to add. This is the one function both
+    /// [`add_filter`]'s duplicate policy and the pre-delete lists' coverage
+    /// test read, so neither can answer differently.
+    fn requires_fresh_add(&self) -> bool {
+        self.condition.carries_runtime_value() || self.lifetime == FilterLifetime::BOOT_TIME
+    }
+}
+
+/// What an engage does when a key that [`FilterSpec::requires_fresh_add`]
+/// could not be cleared, so the add that follows lands on an occupied key.
+///
+/// **Keyed on what the CALLER does with a failed engage**, which is the whole
+/// reason the two covers answer differently — not on which cover it is. Both
+/// answers are wrong for the other caller.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StaleKeyPolicy {
+    /// Fail the engage. The standing lockdown cover: `install_lockdown` is
+    /// fail-fatal in `ProxyManager`, so the start aborts, the transaction
+    /// rolls back, and whatever cover was already in force stays in force.
+    /// Nothing is opened and the failure is "cannot connect". The alternative
+    /// is a kill switch reporting `Ok` while its twin was never re-armed or
+    /// its App-ID permit still names the pre-update binary — a silent `Ok`
+    /// over a switch that stopped working.
+    Fail,
+    /// Warn and keep the stale object. The transient cover: `ProxyManager`'s
+    /// covered start logs "host NOT blocked, proceeding open" and runs
+    /// UNCOVERED when this engage returns `Err`, and its repair path has
+    /// already released the cover it held — so there is nothing "still in
+    /// force" for a rollback to preserve. Failing would trade "covered, with
+    /// one stale address permitted" for "no cover at all", and for a VPN that
+    /// is strictly worse: a stale PERMIT is one extra address, an absent
+    /// cover is every address.
+    ///
+    /// This is not a licence for the silent `Ok` of bindreams/hole#1010's
+    /// finding F2. The pre-delete still runs and still normally succeeds, so
+    /// the ordinary repair lands the corrected value; this arm is only the
+    /// floor for the case where the delete itself failed — which is exactly
+    /// the case where aborting costs the cover.
+    Degrade,
+}
+
 #[derive(Debug, Clone)]
 pub struct CoverSpec {
     pub provider: GUID,
@@ -661,6 +1037,11 @@ pub struct CoverSpec {
     /// by the boot it covered).
     pub pre_delete: Vec<GUID>,
     pub filters: Vec<FilterSpec>,
+    /// What this cover's engage does when a [`pre_delete`](Self::pre_delete)
+    /// key cannot be cleared — see [`StaleKeyPolicy`]. It is a property of the
+    /// SPEC because it is a property of the caller that submits it, and the
+    /// two callers answer differently.
+    pub stale_key: StaleKeyPolicy,
 }
 
 /// Filter weight (0..=15) for the permits — higher than [`BLOCK_WEIGHT`] so
@@ -693,7 +1074,7 @@ pub fn build_cover_spec(server_ip: IpAddr, resolver_ip: Option<IpAddr>) -> Cover
             action: Action::Permit,
             condition: Condition::Loopback,
             weight: PERMIT_WEIGHT,
-            lifetime: FilterLifetime::Persistent,
+            lifetime: FilterLifetime::PERSISTENT,
         },
         FilterSpec {
             guid: FILTER_GUIDS[1],
@@ -701,7 +1082,7 @@ pub fn build_cover_spec(server_ip: IpAddr, resolver_ip: Option<IpAddr>) -> Cover
             action: Action::Permit,
             condition: Condition::Loopback,
             weight: PERMIT_WEIGHT,
-            lifetime: FilterLifetime::Persistent,
+            lifetime: FilterLifetime::PERSISTENT,
         },
         // Belt-and-suspenders for the flag permits above: the IS_LOOPBACK flag is
         // not reliably set at ALE_AUTH_CONNECT in CI's elevated lane, so match the
@@ -713,7 +1094,7 @@ pub fn build_cover_spec(server_ip: IpAddr, resolver_ip: Option<IpAddr>) -> Cover
             action: Action::Permit,
             condition: Condition::LoopbackNet(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
             weight: PERMIT_WEIGHT,
-            lifetime: FilterLifetime::Persistent,
+            lifetime: FilterLifetime::PERSISTENT,
         },
         FilterSpec {
             guid: FILTER_GUIDS[9],
@@ -721,7 +1102,7 @@ pub fn build_cover_spec(server_ip: IpAddr, resolver_ip: Option<IpAddr>) -> Cover
             action: Action::Permit,
             condition: Condition::LoopbackNet(IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)),
             weight: PERMIT_WEIGHT,
-            lifetime: FilterLifetime::Persistent,
+            lifetime: FilterLifetime::PERSISTENT,
         },
         // A loopback connect is authorized at RECV_ACCEPT too; permitting only at
         // CONNECT denies the accept side, breaking the loopback SOCKS5 data plane.
@@ -736,7 +1117,7 @@ pub fn build_cover_spec(server_ip: IpAddr, resolver_ip: Option<IpAddr>) -> Cover
             action: Action::Permit,
             condition: Condition::LoopbackNet(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
             weight: PERMIT_WEIGHT,
-            lifetime: FilterLifetime::Persistent,
+            lifetime: FilterLifetime::PERSISTENT,
         },
         FilterSpec {
             guid: FILTER_GUIDS[7],
@@ -744,7 +1125,7 @@ pub fn build_cover_spec(server_ip: IpAddr, resolver_ip: Option<IpAddr>) -> Cover
             action: Action::Permit,
             condition: Condition::LoopbackNet(IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)),
             weight: PERMIT_WEIGHT,
-            lifetime: FilterLifetime::Persistent,
+            lifetime: FilterLifetime::PERSISTENT,
         },
         FilterSpec {
             guid: if server_layer == Layer::ConnectV4 {
@@ -756,7 +1137,7 @@ pub fn build_cover_spec(server_ip: IpAddr, resolver_ip: Option<IpAddr>) -> Cover
             action: Action::Permit,
             condition: Condition::RemoteIp(server_ip),
             weight: PERMIT_WEIGHT,
-            lifetime: FilterLifetime::Persistent,
+            lifetime: FilterLifetime::PERSISTENT,
         },
     ];
     if let Some(ip) = resolver_ip {
@@ -770,18 +1151,25 @@ pub fn build_cover_spec(server_ip: IpAddr, resolver_ip: Option<IpAddr>) -> Cover
             action: Action::Permit,
             condition: Condition::RemoteIpPortTcp(ip, RESOLVER_PERMIT_PORT),
             weight: PERMIT_WEIGHT,
-            lifetime: FilterLifetime::Persistent,
+            lifetime: FilterLifetime::PERSISTENT,
         });
     }
-    filters.push(block(FILTER_GUIDS[4], Layer::ConnectV4, FilterLifetime::Persistent));
-    filters.push(block(FILTER_GUIDS[5], Layer::ConnectV6, FilterLifetime::Persistent));
+    filters.push(block(FILTER_GUIDS[4], Layer::ConnectV4, FilterLifetime::PERSISTENT));
+    filters.push(block(FILTER_GUIDS[5], Layer::ConnectV6, FilterLifetime::PERSISTENT));
     CoverSpec {
         provider: PROVIDER_GUID,
         sublayer: SUBLAYER_GUID,
-        // The transient cover is engaged over a swept host and has no
-        // fixed-key volatile permit to refresh.
-        pre_delete: Vec::new(),
+        // The transient cover is normally engaged over a swept host, so these
+        // are benign not-founds — but its server and resolver permits carry
+        // runtime values, and a re-engage over one the release failed to
+        // remove would otherwise keep the OLD address permitted while
+        // reporting success. See `transient_pre_delete_guids`.
+        pre_delete: transient_pre_delete_guids(),
         filters,
+        // Fail-open caller: `ProxyManager` proceeds UNCOVERED when this engage
+        // returns `Err`, so a key it cannot clear must not cost the whole
+        // cover. See `StaleKeyPolicy::Degrade`.
+        stale_key: StaleKeyPolicy::Degrade,
     }
 }
 
@@ -871,33 +1259,34 @@ pub fn build_lockdown_spec(server_ip: IpAddr, tun_luid: u64, app_ids: &[std::pat
     filters.push(block(
         LOCKDOWN_FILTER_GUIDS[6],
         Layer::ConnectV4,
-        FilterLifetime::Persistent,
+        FilterLifetime::PERSISTENT,
     ));
     filters.push(block(
         LOCKDOWN_FILTER_GUIDS[7],
         Layer::ConnectV6,
-        FilterLifetime::Persistent,
+        FilterLifetime::PERSISTENT,
     ));
-    // Boot-time twin of the block-all pair (#998) — enforced by the kernel
+    // Boot-time twins of the block-all pair (#998) — enforced by the kernel
     // from boot until BFE starts, when the persistent pair above takes over.
     // See the module doc's "Boot-time coverage" section for why only
     // block-all gets one, and `lockdown_pre_delete_guids` for why these two
     // keys are deleted before this add rather than left to `ok_or_exists`.
-    filters.push(block(
-        LOCKDOWN_BOOTTIME_BLOCK_ALL_GUIDS[0],
-        Layer::ConnectV4,
-        FilterLifetime::Boottime,
-    ));
-    filters.push(block(
-        LOCKDOWN_BOOTTIME_BLOCK_ALL_GUIDS[1],
-        Layer::ConnectV6,
-        FilterLifetime::Boottime,
-    ));
+    //
+    // Key, layer and lifetime all come from `LOCKDOWN_BOOTTIME_TWINS`, which
+    // `swept_lockdown_keys` reads too: the flag stamped here and the lifetime
+    // the sweep records are literally the same value.
+    for twin in &LOCKDOWN_BOOTTIME_TWINS {
+        filters.push(block(twin.guid, twin.layer, BootTimeTwin::LIFETIME));
+    }
     CoverSpec {
         provider: PROVIDER_GUID,
         sublayer: SUBLAYER_GUID,
         pre_delete: lockdown_pre_delete_guids(),
         filters,
+        // Fail-fatal caller: `install_lockdown` aborts the start, the
+        // transaction rolls back, and the cover already in force stays in
+        // force. See `StaleKeyPolicy::Fail`.
+        stale_key: StaleKeyPolicy::Fail,
     }
 }
 
@@ -910,7 +1299,7 @@ fn permit(guid: GUID, layer: Layer, condition: Condition) -> FilterSpec {
         action: Action::Permit,
         condition,
         weight: PERMIT_WEIGHT,
-        lifetime: FilterLifetime::Persistent,
+        lifetime: FilterLifetime::PERSISTENT,
     }
 }
 
@@ -940,18 +1329,34 @@ const FWP_E_ALREADY_EXISTS_DWORD: u32 = 0x8032_0009;
 /// removed it — never treated as an error.
 pub(crate) const FWP_E_FILTER_NOT_FOUND_DWORD: u32 = 0x8032_0003;
 
-/// Walk every `(what, code)` pair and return the first GENUINE failure — a
-/// code that is neither `ERROR_SUCCESS` nor "filter not found". Pure and total
-/// over the slice: it never stops at the first failure to decide whether to
-/// keep going, so a caller that issues every delete before calling this gets
-/// a structurally short-circuit-free fold.
+/// Classify one `FwpmFilterDeleteByKey0` return code by what it says the
+/// delete OBSERVED. The single place a code becomes a verdict: both folds
+/// below derive from this, so "does anything still fail?" and "what did the
+/// empty answers prove?" can never disagree about which code meant what.
+///
+/// Exhaustive by cause, with no residual arm standing in for another: only
+/// `ERROR_SUCCESS` is a removal, only `FWP_E_FILTER_NOT_FOUND` is an empty
+/// answer, and everything else — access denied, an RPC failure, a code this
+/// code has never seen — is [`KeyOutcome::Failed`], which proves nothing.
+fn classify_delete_code(code: u32) -> KeyOutcome {
+    if code == ERROR_SUCCESS.0 {
+        KeyOutcome::Removed
+    } else if code == FWP_E_FILTER_NOT_FOUND_DWORD {
+        KeyOutcome::NotFound
+    } else {
+        KeyOutcome::Failed
+    }
+}
+
+/// Walk every `(what, code)` pair and return the first GENUINE failure — one
+/// [`classify_delete_code`] calls [`KeyOutcome::Failed`]. Pure and total over
+/// the slice: it never stops at the first failure to decide whether to keep
+/// going, so a caller that issues every delete before calling this gets a
+/// structurally short-circuit-free fold.
 fn first_delete_failure(codes: &[(&'static str, u32)]) -> Option<RoutingError> {
-    codes.iter().find_map(|&(what, code)| {
-        if code == ERROR_SUCCESS.0 || code == FWP_E_FILTER_NOT_FOUND_DWORD {
-            None
-        } else {
-            Some(RoutingError::RouteSetup(format!("{what} delete failed: 0x{code:08x}")))
-        }
+    codes.iter().find_map(|&(what, code)| match classify_delete_code(code) {
+        KeyOutcome::Removed | KeyOutcome::NotFound => None,
+        KeyOutcome::Failed => Some(RoutingError::RouteSetup(format!("{what} delete failed: 0x{code:08x}"))),
     })
 }
 
@@ -990,20 +1395,80 @@ fn wfp_check(code: u32, what: &str) -> Result<(), RoutingError> {
 /// As [`wfp_check`], but a duplicate-add (`FWP_E_ALREADY_EXISTS`) is also OK —
 /// re-engaging over an unswept cover is idempotent.
 ///
-/// CROSS-VERSION CONTRACT, disclosed residual: this idempotency also means a
-/// repair (release the held cover, re-engage with a corrected server/resolver
-/// value — `ProxyManager`'s retry-repair path) can silently keep the OLD
-/// filter value live if the release's `FwpmFilterDeleteByKey0` (in
-/// `delete_all`, whose return codes are discarded) fails for that GUID: the
-/// re-add then hits `FWP_E_ALREADY_EXISTS` and reports success while the LIVE
-/// filter still carries the value the delete failed to remove. A stale
-/// PERMIT surviving, never a leaked block; see CONTRIBUTING.md's "Transient
-/// cutover cover" section.
+/// **Only for objects whose content is fixed by their key**: the provider, the
+/// sublayer, and the filters [`Condition::carries_runtime_value`] says nothing
+/// to. [`add_filter`] no longer routes a runtime-valued filter through here.
+///
+/// That used to be a disclosed residual rather than a rule, and the residual
+/// was real: a repair (release the held cover, re-engage with a corrected
+/// server/resolver value — `ProxyManager`'s retry-repair path) could silently
+/// keep the OLD filter value live when the release's `FwpmFilterDeleteByKey0`
+/// (in `delete_all`, whose return codes are discarded) failed for that GUID,
+/// because the re-add hit `FWP_E_ALREADY_EXISTS` and reported success. The
+/// same shape reached the lockdown cover's App-ID permits across an
+/// update-cutover, where the stale value is the PRE-UPDATE `hole.exe` path and
+/// the running binary is the one left blocked. Both are now pre-deleted inside
+/// the engage transaction (`transient_pre_delete_guids`,
+/// `appid_pre_delete_guids`), so the case is removed rather than documented
+/// (bindreams/hole#1010, finding F2).
 fn ok_or_exists(code: u32, what: &str) -> Result<(), RoutingError> {
     if code == FWP_E_ALREADY_EXISTS_DWORD {
         return Ok(());
     }
     wfp_check(code, what)
+}
+
+/// Issue every key in `pre_delete`, then fold the codes under `policy`.
+/// Called from inside both engages' transactions, so the deletes and the adds
+/// that follow are one atomic unit.
+///
+/// Shared rather than written twice so "which codes are benign" has one
+/// answer: a pre-delete that finds nothing is benign — the ordinary first
+/// engage, and the "removed" reading of a spent twin — and
+/// [`first_delete_failure`] whitelists exactly that.
+///
+/// What the two covers do NOT share is what a genuine failure costs, which is
+/// why `policy` is a parameter and not a constant. See [`StaleKeyPolicy`]: the
+/// lockdown engage's caller is fail-fatal, so aborting keeps the cover already
+/// in force; the transient engage's caller proceeds UNCOVERED, so aborting
+/// removes the only cover there is. An earlier draft of this helper applied
+/// the lockdown reasoning to both and turned F2's "covered, one stale address
+/// permitted" into "no cover at all" (bindreams/hole#1010).
+///
+/// # Safety
+///
+/// `engine` must be a live FWPM engine handle inside an open transaction.
+#[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
+unsafe fn issue_pre_deletes(engine: HANDLE, pre_delete: &[GUID], policy: StaleKeyPolicy) -> Result<(), RoutingError> {
+    let codes: Vec<(&'static str, u32)> = pre_delete
+        .iter()
+        .map(|g| (pre_delete_label(g), FwpmFilterDeleteByKey0(engine, g)))
+        .collect();
+    pre_delete_verdict(policy, &codes)
+}
+
+/// Whether a pre-delete's codes fail the engage. Pure over its inputs and
+/// separated from the FFI above for the reason [`disengage_verdict`] is: a
+/// rule that decides whether a kill switch arms should be a table-tested
+/// decision, not a branch buried in an `unsafe` block.
+///
+/// Reads [`first_delete_failure`] — the same fold every sweep uses — so "which
+/// codes are benign" has one answer everywhere.
+fn pre_delete_verdict(policy: StaleKeyPolicy, codes: &[(&'static str, u32)]) -> Result<(), RoutingError> {
+    let Some(e) = first_delete_failure(codes) else {
+        return Ok(());
+    };
+    match policy {
+        StaleKeyPolicy::Fail => Err(e),
+        StaleKeyPolicy::Degrade => {
+            tracing::warn!(
+                error = %e,
+                "fail-closed cover refresh could not clear a key; keeping the stale filter rather \
+                 than failing the engage, which would leave the host with no cover at all"
+            );
+            Ok(())
+        }
+    }
 }
 
 #[allow(clippy::disallowed_methods)] // THIS is the sanctioned FWPM call site
@@ -1027,16 +1492,16 @@ pub fn engage(
 
         // Wrap the mutating steps so any failure aborts the transaction and
         // closes the engine before returning.
-        debug_assert!(
-            spec.pre_delete.is_empty(),
-            "the transient cover has no volatile permit to refresh; this engage honors no pre_delete"
-        );
         let result = (|| -> Result<(), RoutingError> {
             wfp_check(FwpmTransactionBegin0(engine, 0), "FwpmTransactionBegin0")?;
+            // Refresh the runtime-valued permits (server IP, resolver IP) in
+            // this same transaction — see `transient_pre_delete_guids` and
+            // `issue_pre_deletes`.
+            issue_pre_deletes(engine, &spec.pre_delete, spec.stale_key)?;
             add_provider(engine, spec.provider)?;
             add_sublayer(engine, spec.sublayer, spec.provider)?;
             for f in &spec.filters {
-                add_filter(engine, spec.provider, spec.sublayer, f)?;
+                add_filter(engine, spec.provider, spec.sublayer, f, spec.stale_key)?;
             }
             wfp_check(FwpmTransactionCommit0(engine), "FwpmTransactionCommit0")?;
             Ok(())
@@ -1070,35 +1535,23 @@ pub fn engage_lockdown(
         )?;
         let result = (|| -> Result<(), RoutingError> {
             wfp_check(FwpmTransactionBegin0(engine, 0), "FwpmTransactionBegin0")?;
-            // Refresh the volatile permits AND re-arm the boot-time twins:
-            // delete their fixed keys before the adds, in this same
+            // Refresh every runtime-valued permit AND re-arm the boot-time
+            // twins: delete their fixed keys before the adds, in this same
             // transaction, so a re-engage over an adopted cover lands the
-            // CURRENT TUN LUID and server IP instead of hitting `ok_or_exists`
-            // on a stale filter — and so a twin left DISABLED-but-present by
-            // the boot it already covered is replaced rather than reported
-            // `Ok` (see `lockdown_pre_delete_guids`).
+            // CURRENT TUN LUID, server IP and App-ID paths instead of hitting
+            // `ok_or_exists` on a stale filter — and so a twin left
+            // DISABLED-but-present by the boot it already covered is replaced
+            // rather than reported `Ok` (see `lockdown_pre_delete_guids`).
             //
-            // The codes are FOLDED, not discarded. A pre-delete that finds
-            // nothing is benign — the ordinary first engage, and the "removed"
-            // reading of a spent twin — and `first_delete_failure` whitelists
-            // exactly that. Any OTHER code is fatal here, unlike in a sweep,
-            // because of what happens next: the add that follows finds the key
-            // still occupied, returns `FWP_E_ALREADY_EXISTS`, and
-            // `ok_or_exists` reports success. The engage would then return `Ok`
-            // holding a cover whose twin was never re-armed and whose server
-            // permit still names the previous server — the same silent failure
-            // the pre-delete exists to prevent, reached by a different route.
-            // Failing is also the safe direction: the transaction aborts, so
-            // whatever was in force stays in force, and `install_lockdown` is
-            // fail-fatal in `ProxyManager`.
-            //
-            // DELIBERATE SCOPE: this fatality covers all six pre-delete keys,
-            // not only the two #998 adds. The four volatile permits previously
-            // degraded silently on a non-benign delete — a stale TUN LUID or a
-            // stale server IP surviving inside a cover that reports `Ok` — and
-            // that is the same false success, one object over. Widening it is
-            // the point, not a side effect. `pre_delete_label` gives each of
-            // the six keys its own name, so the abort says which one failed.
+            // DELIBERATE SCOPE: the fatality `issue_pre_deletes` applies
+            // covers ALL of them, not only the two #998 adds. The permits used
+            // to degrade silently on a non-benign delete — a stale TUN LUID, a
+            // stale server IP, or (the update-cutover case, bindreams/hole#1010
+            // finding F2) an App-ID permit still naming the pre-update
+            // `hole.exe` while the running one is blocked — inside a cover
+            // that reports `Ok`. Widening it is the point, not a side effect.
+            // `pre_delete_label` gives every key its own name, so the abort
+            // says which one failed.
             //
             // WHAT THIS COSTS, stated because the twins make it reachable in a
             // way it was not before. A boot-time key in a later boot has no
@@ -1112,21 +1565,23 @@ pub fn engage_lockdown(
             // so the failure is "cannot connect", never "leaks". Arming a twin
             // that was never actually re-armed would be the opposite trade —
             // a silent `Ok` over a kill switch that stopped working.
-            let pre_delete_codes: Vec<(&'static str, u32)> = spec
-                .pre_delete
-                .iter()
-                .map(|g| (pre_delete_label(g), FwpmFilterDeleteByKey0(engine, g)))
-                .collect();
-            if let Some(e) = first_delete_failure(&pre_delete_codes) {
-                return Err(e);
-            }
+            //
+            // Failing is the safe direction for THIS boot only. An abort
+            // restores the FWPM object store; whether it restores a twin's
+            // boot-time POLICY RECORD is undocumented (see
+            // `lockdown_pre_delete_guids`), so an abort can leave the NEXT
+            // boot's pre-BFE window uncovered — a failure to protect, never a
+            // leak of live traffic.
+            issue_pre_deletes(engine, &spec.pre_delete, spec.stale_key)?;
             // Idempotent over an unswept cover: add_provider/add_sublayer use
-            // ok_or_exists, and the kept floor (block-all + loopback + App-ID)
-            // is a benign re-add.
+            // ok_or_exists, and the kept floor — block-all and loopback, whose
+            // conditions are fixed by their keys — is a benign re-add. Every
+            // filter that is NOT (`Condition::carries_runtime_value`) was just
+            // pre-deleted above, so `add_filter`'s strict arm never fires here.
             add_provider(engine, spec.provider)?;
             add_sublayer(engine, spec.sublayer, spec.provider)?;
             for f in &spec.filters {
-                add_filter(engine, spec.provider, spec.sublayer, f)?;
+                add_filter(engine, spec.provider, spec.sublayer, f, spec.stale_key)?;
             }
             wfp_check(FwpmTransactionCommit0(engine), "FwpmTransactionCommit0")?;
             Ok(())
@@ -1210,13 +1665,19 @@ unsafe fn get_app_id_blob(path: &Path) -> Result<AppIdBlob, RoutingError> {
 }
 
 #[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
-unsafe fn add_filter(engine: HANDLE, provider: GUID, sublayer: GUID, f: &FilterSpec) -> Result<(), RoutingError> {
+unsafe fn add_filter(
+    engine: HANDLE,
+    provider: GUID,
+    sublayer: GUID,
+    f: &FilterSpec,
+    policy: StaleKeyPolicy,
+) -> Result<(), RoutingError> {
     let layer = layer_guid(f.layer);
     let action_type = match f.action {
         Action::Permit => FWP_ACTION_PERMIT,
         Action::Block => FWP_ACTION_BLOCK,
     };
-    // Lifetime flag (PERSISTENT or BOOTTIME, see `filter_lifetime_flag` and the
+    // Lifetime flag (PERSISTENT or BOOTTIME, see `FilterLifetime` and the
     // module doc's "Boot-time coverage" section) — NO CLEAR_ACTION_RIGHT.
     // Setting that flag makes a filter's action SOFT (cross-sublayer
     // overridable); omitting it makes the action HARD, and hardness governs
@@ -1226,7 +1687,11 @@ unsafe fn add_filter(engine: HANDLE, provider: GUID, sublayer: GUID, f: &FilterS
     // cover blocked everything). With the flag off everywhere, within-sublayer
     // arbitration is pure weight: the weight-15 permits beat the weight-0
     // block-all (the wireguard-windows recipe — see the module doc).
-    let flags = FWPM_FILTER_FLAGS(filter_lifetime_flag(f.lifetime));
+    // `FilterLifetime::filter_flags` is the ONLY producer of these bits in
+    // the crate, and it cannot be reached without a `KeyLifetime` — see
+    // `FilterLifetime`. Writing the bits here directly would install a filter
+    // whose key no sweep classifies, which is the #1003 hazard.
+    let flags = f.lifetime.filter_flags();
 
     // Keep-alive bindings: `FWPM_FILTER0` holds raw pointers into these; they
     // must outlive the `FwpmFilterAdd0` call below.
@@ -1429,7 +1894,26 @@ unsafe fn add_filter(engine: HANDLE, provider: GUID, sublayer: GUID, f: &FilterS
         },
         ..Default::default()
     };
-    ok_or_exists(FwpmFilterAdd0(engine, &filter, None, None), "FwpmFilterAdd0")
+    let code = FwpmFilterAdd0(engine, &filter, None, None);
+    // `FWP_E_ALREADY_EXISTS` is benign for a filter whose content is fixed by
+    // its key, and never for one `FilterSpec::requires_fresh_add` names — a
+    // runtime-discovered value, or a boot-time twin spent by the boot it
+    // covered. Both engages pre-delete every such key inside their own
+    // transaction, so this arm is unreachable while that holds; it is here so
+    // that a key dropping out of a pre-delete list fails loudly instead of
+    // silently reinstating whatever the previous engage stored
+    // (bindreams/hole#1010, finding F2).
+    //
+    // Gated on the same `policy` the pre-delete was: under `Degrade` the
+    // pre-delete failure that could put us here has ALREADY been warned, and
+    // failing now would cost the cover the warning exists to keep. The two
+    // must agree — a strict add under a degrading pre-delete would abort the
+    // engage anyway and make the degrade a no-op.
+    if f.requires_fresh_add() && policy == StaleKeyPolicy::Fail {
+        wfp_check(code, "FwpmFilterAdd0")
+    } else {
+        ok_or_exists(code, "FwpmFilterAdd0")
+    }
 }
 
 impl Cover {
@@ -1486,9 +1970,9 @@ impl Drop for Cover {
                 // a clean release.
                 #[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
                 CoverKind::Lockdown => {
-                    let codes: Vec<(&'static str, u32)> = swept_lockdown_guids()
+                    let codes: Vec<(&'static str, u32)> = swept_lockdown_keys()
                         .into_iter()
-                        .map(|g| ("lockdown filter", FwpmFilterDeleteByKey0(self.engine, &g)))
+                        .map(|k| (k.label, FwpmFilterDeleteByKey0(self.engine, &k.guid)))
                         .collect();
                     if let Some(e) = first_delete_failure(&codes) {
                         tracing::warn!(error = %e, "lockdown cover release left a filter installed; egress may still be blocked");
@@ -1586,7 +2070,7 @@ pub(crate) fn classify_presence(engine_opened: bool, codes: &[u32]) -> crate::ro
 }
 
 /// Ask WFP whether a standing lockdown cover — or any residue of one — is
-/// installed, by querying every GUID in [`swept_lockdown_guids`] with
+/// installed, by querying every GUID in [`swept_lockdown_keys`] with
 /// `FwpmFilterGetByKey0`. `state_dir` is unused: the lockdown GUIDs are
 /// compile-time constants, so this answers "is a Hole lockdown cover present",
 /// never "is it mine" (see CONTRIBUTING.md's disclosed residual).
@@ -1602,7 +2086,7 @@ pub(crate) fn classify_presence(engine_opened: bool, codes: &[u32]) -> crate::ro
 /// measurement, and does not need to be: `classify_presence` yields `Absent`
 /// for no code but the literal not-found, so a denied read is `Indeterminate`.
 ///
-/// [`swept_lockdown_guids`] now also yields the two boot-time block-all GUIDs,
+/// [`swept_lockdown_keys`] now also yields the two boot-time block-all GUIDs,
 /// so they are queried here. The boot-time view is opt-in for ENUMERATION
 /// (`FWP_FILTER_ENUM_FLAG_INCLUDE_BOOTTIME`) and `FwpmFilterGetByKey0` has no
 /// such opt-in, and Microsoft's page for it is silent on whether a by-key GET
@@ -1639,9 +2123,9 @@ pub fn lockdown_cover_presence(_state_dir: &Path) -> crate::routing::CoverPresen
         }
 
         let mut codes: Vec<u32> = Vec::new();
-        for g in swept_lockdown_guids() {
+        for k in swept_lockdown_keys() {
             let mut out: *mut FWPM_FILTER0 = std::ptr::null_mut();
-            codes.push(FwpmFilterGetByKey0(engine, &g, &mut out));
+            codes.push(FwpmFilterGetByKey0(engine, &k.guid, &mut out));
             if !out.is_null() {
                 let mut p = out as *mut core::ffi::c_void;
                 FwpmFreeMemory0(&mut p);
@@ -1667,40 +2151,76 @@ pub fn lockdown_cover_presence(_state_dir: &Path) -> crate::routing::CoverPresen
 /// be reached, so nothing could have been issued → `Err`. That is NOT "not
 /// elevated" — FWPM opens without elevation (`release_all`'s doc records the
 /// same measurement); a failed open means BFE is not running or RPC failed.
-/// There is no persisted Windows state to key absence on, so a successful open
-/// always reports `Ok` — and for the boot-time twins (#998) that `Ok` is weaker
-/// than "idempotent" claims. On a later boot no live twin exists, both keys
-/// answer `FWP_E_FILTER_NOT_FOUND`, and that is indistinguishable from a key
-/// whose boot-time policy record survives: `bridge unlock` run in a boot where
-/// this bridge never engaged reports success over a host it may not have
-/// unlocked. That is the same unmeasured false `Ok` the module doc's
-/// "Boot-time coverage" section qualifies for [`release_all`] and for #1009's
-/// `Return="check"` uninstall gate — read the argument there, not here.
+/// There is no persisted Windows state to key absence on (delete-by-GUID is
+/// idempotent), so a successful open always reports `Ok`.
 ///
-/// Known residual, PRE-EXISTING and NOT changed by #998: this function discards
-/// every delete code (`let _ =`) where [`release_all`] collects them and folds
-/// them through [`first_delete_failure`]. So a delete failing for a reason that
-/// is neither success nor not-found — a filter still blocking egress — is
-/// invisible here as well, on every GUID, not just the twins.
+/// That `Ok` carries the same boot-time qualification `release_all`'s does
+/// (see [`Clearance`]): a `FWPM_FILTER_FLAG_BOOTTIME` key answers
+/// `FWP_E_FILTER_NOT_FOUND` on any boot where its runtime object is not live,
+/// so turning the kill switch off in a boot where the bridge never engaged
+/// reports `Ok` over a key that may still have a record behind it.
+///
+/// It is not gated here, and deliberately so. This is an IN-PROCESS escape:
+/// `hole.exe` is still on disk, `hole bridge unlock` is still reachable, and
+/// the next engage re-arms the key (pre-deleting it first), so nothing about
+/// the difference is unrecoverable. Only `cutover::release_covers` — which
+/// runs as the binary is being deleted — has to read the narrower claim, and
+/// it is the one that returns the `Clearance`.
+///
+/// What it IS gated on is every delete's return code. `Ok` here means the host
+/// is genuinely open: `hole bridge unlock` flips the persisted intent off only
+/// on this function's success (`cutover::unlock_with`), so an `Ok` returned
+/// over deletes that were refused — the unelevated run, which reaches the
+/// engine open but not the write — would leave the kill switch engaged while
+/// the intent reads "off", with nothing left to reconcile it. The macOS arm
+/// has always propagated its `pfctl` failures; this is the same rule.
 pub fn disengage_lockdown(_state_dir: &Path) -> Result<(), RoutingError> {
-    unsafe {
+    let codes = unsafe {
         let mut engine = HANDLE::default();
         #[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
         let rc = FwpmEngineOpen0(PCWSTR::null(), RPC_C_AUTHN_WINNT, None, None, &mut engine);
         if rc != ERROR_SUCCESS.0 {
-            return Err(RoutingError::RouteSetup(format!(
-                "FwpmEngineOpen0 failed (0x{rc:08x}): the firewall could not be reached, so the lockdown \
-                 cover could not be disengaged"
-            )));
+            return disengage_verdict(Some(rc), &[]);
         }
+        // Every delete is ISSUED before any code is inspected, matching
+        // `release_all`: a short-circuit would leave a later lockdown filter
+        // installed because an earlier one failed.
         #[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
-        for g in swept_lockdown_guids() {
-            let _ = FwpmFilterDeleteByKey0(engine, &g);
-        }
+        let codes: Vec<(&'static str, u32)> = swept_lockdown_keys()
+            .into_iter()
+            .map(|k| (k.label, FwpmFilterDeleteByKey0(engine, &k.guid)))
+            .collect();
         #[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
         let _ = FwpmEngineClose0(engine);
+        codes
+    };
+    disengage_verdict(None, &codes)
+}
+
+/// Whether a lockdown disengage may report success. Pure and separated from
+/// the FFI above so the fail-loud rule is a table-tested decision rather than
+/// a discarded return value, which is what lets an unelevated `hole bridge
+/// unlock` report a host it had not unlocked.
+///
+/// Reads [`first_delete_failure`] — the same fold `release_all` uses — so
+/// "which codes are benign" has one answer for both paths.
+///
+/// `open_failure` is the `FwpmEngineOpen0` return code when the engine could
+/// not be opened at all, in which case no delete was issued and `codes` is
+/// empty. The two causes are kept apart because they say different things to
+/// the operator: "the firewall could not be reached" versus "the firewall
+/// refused the delete".
+fn disengage_verdict(open_failure: Option<u32>, codes: &[(&'static str, u32)]) -> Result<(), RoutingError> {
+    if let Some(rc) = open_failure {
+        return Err(RoutingError::RouteSetup(format!(
+            "FwpmEngineOpen0 failed (0x{rc:08x}): the firewall could not be reached, so the lockdown \
+             cover could not be disengaged"
+        )));
     }
-    Ok(())
+    match first_delete_failure(codes) {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
 }
 
 pub fn recover_cover(_state_dir: &Path, adopting: bool) {
@@ -1734,9 +2254,9 @@ pub fn recover_cover(_state_dir: &Path, adopting: bool) {
 /// empty sublayer holds no traffic.
 #[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
 unsafe fn delete_all(engine: HANDLE) {
-    let codes: Vec<(&'static str, u32)> = swept_transient_guids()
+    let codes: Vec<(&'static str, u32)> = swept_transient_keys()
         .into_iter()
-        .map(|g| ("transient filter", FwpmFilterDeleteByKey0(engine, &g)))
+        .map(|k| (k.label, FwpmFilterDeleteByKey0(engine, &k.guid)))
         .collect();
     if let Some(e) = first_delete_failure(&codes) {
         tracing::warn!(error = %e, "transient cover sweep left a filter installed; egress may still be blocked");
@@ -1756,11 +2276,18 @@ unsafe fn delete_all(engine: HANDLE) {
 /// reached at all, so nothing could have been deleted — the ONLY early
 /// return; it does not mean "not elevated" (FWPM opens without elevation).
 /// Every delete is ISSUED before any code is inspected — a short-circuit is
-/// structurally impossible — then the codes are folded by
-/// `first_delete_failure`. The sublayer/provider delete is best-effort
-/// (ignored): an orphaned empty sublayer/provider holds no traffic, matching
-/// `delete_all`.
-pub fn release_all(_state_dir: &Path) -> Result<(), RoutingError> {
+/// structurally impossible — then the codes are folded twice, by
+/// `first_delete_failure` (does anything still fail?) and by
+/// [`Clearance::from_observations`] (what did the empty answers prove?). The
+/// sublayer/provider delete is best-effort (ignored): an orphaned empty
+/// sublayer/provider holds no traffic, matching `delete_all`.
+///
+/// The second fold is what the uninstall gate reads. `FWP_E_FILTER_NOT_FOUND`
+/// is benign for the FAILURE verdict on every key — nothing is left blocking
+/// that this call can see — but it is only *proof of absence* for a
+/// [`KeyLifetime::Persistent`] one. See [`Clearance`] for why collapsing the
+/// two lets the MSI delete `hole.exe` over a key it never observed.
+pub fn release_all(_state_dir: &Path) -> Result<Clearance, RoutingError> {
     unsafe {
         let mut engine = HANDLE::default();
         #[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
@@ -1771,14 +2298,20 @@ pub fn release_all(_state_dir: &Path) -> Result<(), RoutingError> {
             )));
         }
 
-        let mut codes: Vec<(&'static str, u32)> = Vec::new();
+        // One pass, both folds: each key carries its lifetime out of the
+        // sweep list, so the failure verdict and the clearance are derived
+        // from the SAME observation rather than from two walks that could
+        // disagree about which key answered what.
+        let mut swept: Vec<(SweptKey, u32)> = Vec::new();
         #[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
-        for g in swept_lockdown_guids() {
-            codes.push(("lockdown filter", FwpmFilterDeleteByKey0(engine, &g)));
+        for k in swept_lockdown_keys() {
+            let code = FwpmFilterDeleteByKey0(engine, &k.guid);
+            swept.push((k, code));
         }
         #[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
-        for g in swept_transient_guids() {
-            codes.push(("transient filter", FwpmFilterDeleteByKey0(engine, &g)));
+        for k in swept_transient_keys() {
+            let code = FwpmFilterDeleteByKey0(engine, &k.guid);
+            swept.push((k, code));
         }
         #[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
         let _ = FwpmSubLayerDeleteByKey0(engine, &SUBLAYER_GUID);
@@ -1787,10 +2320,11 @@ pub fn release_all(_state_dir: &Path) -> Result<(), RoutingError> {
         #[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
         let _ = FwpmEngineClose0(engine);
 
-        match first_delete_failure(&codes) {
-            Some(e) => Err(e),
-            None => Ok(()),
+        let codes: Vec<(&'static str, u32)> = swept.iter().map(|(k, code)| (k.label, *code)).collect();
+        if let Some(e) = first_delete_failure(&codes) {
+            return Err(e);
         }
+        Ok(Clearance::from_observations(&observations(&swept)))
     }
 }
 
@@ -1906,7 +2440,7 @@ pub(crate) mod boottime_probe {
                 wfp_check(FwpmTransactionBegin0(engine, 0), "FwpmTransactionBegin0")?;
                 add_provider(engine, PROVIDER_GUID)?;
                 add_sublayer(engine, SUBLAYER_GUID, PROVIDER_GUID)?;
-                add_filter(engine, PROVIDER_GUID, SUBLAYER_GUID, f)?;
+                add_filter(engine, PROVIDER_GUID, SUBLAYER_GUID, f, StaleKeyPolicy::Fail)?;
                 wfp_check(FwpmTransactionCommit0(engine), "FwpmTransactionCommit0")
             })();
             if r.is_err() {
@@ -2040,6 +2574,28 @@ fn layer_guid(layer: Layer) -> GUID {
         Layer::RecvAcceptV4 => FWPM_LAYER_ALE_AUTH_RECV_ACCEPT_V4,
         Layer::RecvAcceptV6 => FWPM_LAYER_ALE_AUTH_RECV_ACCEPT_V6,
     }
+}
+
+/// Turn swept `(key, return code)` pairs into the observations the clearance
+/// fold reads. Pure, and separated from the FFI loop above so the mapping is
+/// testable without a firewall.
+///
+/// `release_all` calls this only after `first_delete_failure` has cleared the
+/// slice, so in that path no code here classifies as [`KeyOutcome::Failed`] —
+/// but this function does not rely on that. It classifies by cause
+/// ([`classify_delete_code`]) and a code it cannot account for stays
+/// unaccounted-for, rather than being read as a removal nobody watched
+/// happen. The two folds sharing one classifier is what keeps them from
+/// drifting apart.
+fn observations(swept: &[(SweptKey, u32)]) -> Vec<KeyObservation> {
+    swept
+        .iter()
+        .map(|(k, code)| KeyObservation {
+            key: k.label,
+            lifetime: k.lifetime.key_lifetime(),
+            outcome: classify_delete_code(*code),
+        })
+        .collect()
 }
 
 #[cfg(test)]

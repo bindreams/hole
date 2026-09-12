@@ -69,8 +69,8 @@ targets:
     #
     # `cargo xtask run hole` launches dev mode via the dev-console crate. The
     # cascade below builds the workspace; dev-console only supervises — it builds
-    # nothing (#564). `hole.run` rebuilds galoshes with dev-only crash-dumps
-    # before launching, so release/--all builds stay minidump-free (#438).
+    # nothing (#564). `hole.run` re-runs the galoshes build with the dev-only
+    # crash-dumps opt-in, so release/--all builds stay minidump-free (#438).
     # dev-console runs unprivileged and elevates only the bridge — via sudo on
     # POSIX (prompts for your password), inheriting the elevated token on
     # Windows (#452, #454).
@@ -86,10 +86,14 @@ targets:
       - cargo build --workspace --no-default-features --features tombstone/crash-dumps
       - cargo xtask stage --profile debug --out-dir target/debug/dist
     run:
-      # Dev-only galoshes minidumps (#438): rebuild galoshes WITH crash-dumps
-      # here, in a run-only step, so `cargo xtask build --all` and the release
-      # installers never link minidump-writer. The cascade above already produced
-      # everything; this step only swaps in the dev galoshes.
+      # Dev-only galoshes minidumps (#438): re-run the galoshes build with the
+      # crash-dumps opt-in here, in a run-only step, so `cargo xtask build --all`
+      # and the release installers never link minidump-writer. WINDOWS ONLY —
+      # `xtask::galoshes::build_args` drops the feature off Windows, where there
+      # is no `.dmp` branch left to enable (#842) and the changed feature set
+      # would buy a full galoshes + tombstone release rebuild for no behavioural
+      # difference at all. On darwin this step re-runs the command the cascade
+      # already ran, and cargo no-ops it.
       - process:
           args: [cargo, xtask, galoshes]
           environment: { HOLE_CRASH_DUMPS: "1" }

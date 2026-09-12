@@ -5,6 +5,8 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::Duration;
 use tracing::{error, info, warn};
+use windows::core::HRESULT;
+use windows::Win32::Foundation::{ERROR_SERVICE_DOES_NOT_EXIST, ERROR_SERVICE_MARKED_FOR_DELETE, WIN32_ERROR};
 use windows_service::service::{
     ServiceAccess, ServiceAction, ServiceActionType, ServiceControl, ServiceControlAccept, ServiceErrorControl,
     ServiceExitCode, ServiceFailureActions, ServiceFailureResetPeriod, ServiceInfo, ServiceStartType, ServiceState,
@@ -472,15 +474,114 @@ pub fn ensure_failure_actions() -> Result<(), windows_service::Error> {
 }
 
 /// Stop and uninstall the bridge Windows Service.
-pub fn uninstall() -> Result<(), windows_service::Error> {
-    // Stop first (ignore errors — service may not be running)
-    let _ = stop();
+///
+/// The stop is FATAL here, not the best-effort it used to be. `DeleteService`
+/// against a still-running service *succeeds* — it only marks the entry for
+/// deletion — and from that moment `OpenService` answers
+/// `ERROR_SERVICE_MARKED_FOR_DELETE`, so nothing can send the service a stop
+/// control ever again and no retry can even find it. The registration is the
+/// only handle a later attempt has; keeping it over a failed stop is what
+/// makes the uninstall retryable instead of terminal (bindreams/hole#1003).
+pub fn uninstall() -> Result<(), Box<dyn std::error::Error>> {
+    stop()?;
 
     let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)?;
     let service = manager.open_service(SERVICE_NAME, ServiceAccess::DELETE)?;
     service.delete()?;
     info!("Windows service uninstalled");
     Ok(())
+}
+
+/// Stop the bridge service *without* deregistering it, tolerating a host where
+/// SCM has nothing to stop.
+///
+/// The uninstall orchestration calls this unconditionally, before it consults
+/// any registration record: whether a bridge is running and whether SCM still
+/// has a row for it are independent facts, and the fail-closed covers are held
+/// by the live process, not by the row. See `setup::uninstall_bridge_with`.
+///
+/// An absent row — never registered, or already marked for deletion by a prior
+/// `DeleteService` — is `Ok`: there is no handle SCM could act through, so
+/// there is nothing here to fail over. The cover release that follows carries
+/// the real guarantee; it holds the bridge's own liveness lock and refuses
+/// outright if a bridge is still alive.
+///
+/// The stop is issued FIRST and its own failure is what gets classified. The
+/// predecessor opened the service to classify SCM's answer, dropped that
+/// handle, and then called [`stop`], which opens again — so the classification
+/// was applied to a handle deliberately thrown away before the act, and the
+/// act's open answered `ERROR_SERVICE_DOES_NOT_EXIST` unclassified whenever
+/// the row went away in between (a concurrent uninstall attempt's
+/// `DeleteService`, or the row being finalised as its last handle closed).
+/// The uninstall then refused to deregister over a service provably not
+/// running. A probe answers about the moment it was taken; only the act's own
+/// error is about the act.
+pub fn ensure_stopped() -> Result<(), Box<dyn std::error::Error>> {
+    match stop() {
+        Ok(()) => Ok(()),
+        Err(e) if stop_error_is_absent(&*e) => {
+            info!("no Windows service registration to stop");
+            Ok(())
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// The SCM status codes that mean there is no service row left to act through.
+/// `ERROR_SERVICE_MARKED_FOR_DELETE` counts: the row survives only until its
+/// last handle closes, and no handle opened through it can carry a control.
+///
+/// One table, two spellings below, because the layers report it in two: a
+/// Win32 status and the `HRESULT` the `windows` bindings widen it to.
+const ABSENT_SERVICE_CODES: [WIN32_ERROR; 2] = [ERROR_SERVICE_DOES_NOT_EXIST, ERROR_SERVICE_MARKED_FOR_DELETE];
+
+fn is_absent_service_code(code: i32) -> bool {
+    ABSENT_SERVICE_CODES.iter().any(|c| c.0 as i32 == code)
+}
+
+fn is_absent_service_hresult(code: HRESULT) -> bool {
+    ABSENT_SERVICE_CODES.iter().any(|c| code == HRESULT::from_win32(c.0))
+}
+
+/// Whether an `open_service` failure means SCM has no service left to act on.
+fn open_error_is_absent(e: &windows_service::Error) -> bool {
+    let windows_service::Error::Winapi(io) = e else {
+        return false;
+    };
+    io.raw_os_error().is_some_and(is_absent_service_code)
+}
+
+/// Whether a failed [`stop`] failed BECAUSE SCM has no service left to act on.
+///
+/// [`stop`] reaches SCM through three layers and each reports that same answer
+/// in its own shape, so the classification has to span all three or it is a
+/// classification of whichever layer happened to speak:
+///
+/// - `windows_service`'s `open_service` raises `Error::Winapi(io)`, carrying
+///   the Win32 status as an OS error;
+/// - `cutover::scm_wait`'s `SystemScmActor::open` calls `OpenServiceW` through
+///   the `windows` bindings and re-wraps their `HRESULT`-carrying error in
+///   `io::Error::other`, where it survives as a nested error and NOT as an OS
+///   code;
+/// - `NotifyServiceStatusChangeW` returns a bare Win32 status, which
+///   `stop_via_notify` turns into `io::Error::from_raw_os_error` (it completes
+///   with `ERROR_SERVICE_MARKED_FOR_DELETE` when the row is deleted under it).
+///
+/// Whichever layer it came from, the fact is the same one
+/// [`open_error_is_absent`] reads, and the consequence for the caller is the
+/// same: nothing SCM could stop, so nothing to fail over.
+fn stop_error_is_absent(e: &(dyn std::error::Error + 'static)) -> bool {
+    if let Some(service) = e.downcast_ref::<windows_service::Error>() {
+        return open_error_is_absent(service);
+    }
+    if let Some(win32) = e.downcast_ref::<windows::core::Error>() {
+        return is_absent_service_hresult(win32.code());
+    }
+    if let Some(io) = e.downcast_ref::<std::io::Error>() {
+        return io.raw_os_error().is_some_and(is_absent_service_code)
+            || io.get_ref().is_some_and(|inner| stop_error_is_absent(inner));
+    }
+    false
 }
 
 // Start/stop ==========================================================================================================

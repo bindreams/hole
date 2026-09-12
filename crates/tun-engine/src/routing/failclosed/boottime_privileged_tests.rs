@@ -117,7 +117,7 @@ fn probe_spec() -> FilterSpec {
         action: Action::Permit,
         condition: Condition::RemoteIp(PROBE_ADDR.parse().unwrap()),
         weight: BLOCK_WEIGHT,
-        lifetime: FilterLifetime::Boottime,
+        lifetime: FilterLifetime::BOOT_TIME,
     }
 }
 

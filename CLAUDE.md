@@ -103,7 +103,9 @@ before editing; the sections linked below are the authoritative source.
   bound. →
   [CONTRIBUTING.md#bridge-cancellation-contract](CONTRIBUTING.md#bridge-cancellation-contract)
 - **Native-crash observability.** The `tombstone` crate writes a signal-safe
-  crash marker; the next start of the same kind sweeps it. →
+  crash marker; the next start of the same kind sweeps it. On macOS
+  `on_crash` terminates the process instead of returning — see crash.rs's
+  module doc before touching either half. →
   [CONTRIBUTING.md#native-crash-observability-tombstone](CONTRIBUTING.md#native-crash-observability-tombstone)
 - **Route ownership.** Teardown and recovery delete only the `RouteId`s
   `bridge-routes.json` records as installed. On macOS no delete-side qualifier
@@ -152,11 +154,16 @@ before editing; the sections linked below are the authoritative source.
   twins — two more filters, aimed at the kernel-start→BFE-start window
   `PERSISTENT` alone cannot reach. They carry the block only, so that window
   has no permits at all, and it is a HARD block (no `CLEAR_ACTION_RIGHT`) whose
-  effect on early boot is disclosed as unanalysed. A boot-time filter is spent
-  by the boot it covered, so every engage **pre-deletes** the twins' fixed keys
-  rather than re-adding them — an add would short-circuit on
-  `FWP_E_ALREADY_EXISTS` under the reading where the spent object survives, and
-  the switch would arm once and then stop. What is measured (WFP accepts and
+  effect on early boot is disclosed as unanalysed. The flag a twin is installed
+  with and the `KeyLifetime` its key is swept under are **one value**
+  (`FilterLifetime`, a newtype over `KeyLifetime`, read by both sites out of
+  `LOCKDOWN_BOOTTIME_TWINS`), so a boot-time filter whose key a sweep calls
+  `Persistent` — the #1003 false proof — is not expressible. Every engage
+  **pre-deletes** the twins' fixed keys, and every other key whose condition
+  carries a runtime value (server IP, TUN LUID, App-ID path), rather than
+  re-adding them: an add would short-circuit on `FWP_E_ALREADY_EXISTS` and
+  leave whatever the previous engage stored — a twin spent by the boot it
+  covered, or the pre-update `hole.exe` path. What is measured (WFP accepts and
   stores them under our containers; a by-key delete removes a LIVE one; every
   engage re-arms) versus unverified (anything spanning a reboot, including the
   later-boot delete that #1009's uninstall gate depends on) is in

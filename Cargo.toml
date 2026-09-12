@@ -51,13 +51,12 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # Native-crash observability (bindreams/hole#438). All MIT-OR-Apache-2.0.
 # Pinned here so common + hole + bridge + galoshes share one version.
-# `crash-context` is pinned next to crash-handler because BOTH the macOS
-# minidump by-value path (rebuilds a CrashContext field-by-field, needs
-# `crash_context::ExceptionInfo` — crash-handler re-exports CrashContext but
-# NOT ExceptionInfo, and CrashContext is not Clone) AND the Linux marker
-# writer (reads `crash_context::CrashContext::{siginfo, pid, tid}` directly)
-# need crash-context types in scope. See review S1.
-# MUST be "0.6" (not "0.7"): crash-handler 0.7 depends on crash-context "0.6",
+# `crash-context` currently has NO member consumer: its two were the macOS
+# minidump's by-value CrashContext rebuild and the SIGABRT-relay signature
+# predicate, and #842 removed both — macOS has no dump branch at all now
+# (crates/tombstone/src/crash.rs module doc). The pin is kept only so that a
+# future direct dep cannot pick the wrong major.
+# It MUST stay "0.6" (not "0.7"): crash-handler 0.7 depends on crash-context "0.6",
 # so its re-exported `CrashContext` IS the 0.6 type. A "0.7" direct dep would
 # resolve to a DISTINCT, incompatible type and fail to unify with crash-handler's
 # API in the on_crash signature / minidump rebuild. (0.6.3 field shapes verified.)

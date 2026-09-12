@@ -384,6 +384,9 @@ jobs:
     # were reconstructed to. windows/amd64 has never been killed and its 38-run
     # sample still stands.
     #
+    # crash_marker_abort was a confirmed, recurring cause of darwin/amd64
+    # kills — fixed in tombstone (#842); whether 90 can now drop is unmeasured.
+    #
     # These are whole-JOB budgets, shared across build + verify + test. A slow
     # build therefore eats the test steps' headroom — which is exactly how #989
     # happened. The per-step `timeout-minutes` further down decouple the two, so
@@ -850,15 +853,13 @@ jobs:
       # The MSI's `LaunchApp` custom action runs `hole.exe --show-dashboard`
       # after a fresh install. Tauri's single-instance plugin would route
       # tauri-driver's new launch into that already-running instance, so we
-      # need a clean slate. `Stop-Process -Force` calls `TerminateProcess`
-      # synchronously; the subsequent `Wait-Process -ErrorAction Ignore`
-      # waits for the process object to be reaped without depending on a
-      # wall-clock delay.
+      # need a clean slate. The shared script resolves the processes before
+      # killing them and waits on those objects, so an SCM-restarted bridge
+      # cannot be mistaken for one that never died.
       - name: Kill any running hole.exe (post-install LaunchApp)
         shell: pwsh
         run: |
-          Get-Process hole -ErrorAction SilentlyContinue | Stop-Process -Force
-          Wait-Process -Name hole -ErrorAction SilentlyContinue
+          & .github/scripts/kill-hole-processes.ps1
 
       # gsudo runs the dashboard E2E at Medium integrity. GitHub runners run
       # every process at High integrity (admin + UAC disabled), and WebView2
@@ -908,15 +909,14 @@ jobs:
           exit $LASTEXITCODE
 
       # Same TerminateProcess-returns-before-reap gap as the earlier "Kill any
-      # running hole.exe" step above: without Wait-Process, the Uninstall
-      # step's msiexec can start while hole.exe still holds file/service
-      # handles it needs to release.
+      # running hole.exe" step above, and the same script: without the wait,
+      # the Uninstall step's msiexec can start while hole.exe still holds
+      # file/service handles it needs to release.
       - name: Kill hole.exe after E2E
         if: always()
         shell: pwsh
         run: |
-          Get-Process hole -ErrorAction SilentlyContinue | Stop-Process -Force
-          Wait-Process -Name hole -ErrorAction SilentlyContinue
+          & .github/scripts/kill-hole-processes.ps1
 
       - name: Dump install log on failure
         if: failure()
@@ -947,7 +947,10 @@ jobs:
       # step instead of the whole job, so this step is reached to upload it.
       # `/l*vx` writes both logs regardless of exit code once Install/
       # Uninstall start msiexec, so `if-no-files-found: ignore` only covers a
-      # job that failed before either did.
+      # job that failed before either did. `*-stack-*.txt` are the per-thread
+      # native stacks a wedge captures; they are echoed into the job log too,
+      # and exist only when a step wedged; `*-cdbout-*.log` is the debugger's
+      # stdout, the backstop for a capture whose log file never opened.
       - name: Upload MSI logs
         if: always()
         uses: actions/upload-artifact@v7
@@ -956,6 +959,8 @@ jobs:
           path: |
             ${{ runner.temp }}/msi-install.log
             ${{ runner.temp }}/msi-uninstall.log
+            ${{ runner.temp }}/*-stack-*.txt
+            ${{ runner.temp }}/*-cdbout-*.log
           if-no-files-found: ignore
           retention-days: 14
 

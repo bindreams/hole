@@ -21,6 +21,9 @@ harness = false
 # memory-bearing .dmp. NON-DEFAULT (opposite polarity to tauri/custom-protocol)
 # so release binaries never link minidump-writer — a privacy VPN's process
 # memory holds keys + user traffic. See bindreams/hole#438 §3/§5.4.
+# Windows-only in effect: macOS has no dump branch to enable (see crash.rs),
+# and minidump-writer is declared under [target.'cfg(windows)'.dependencies]
+# so enabling this on mac/Linux links nothing.
 crash-dumps = ["dep:minidump-writer"]
 # Builds the `crash_child` helper bin (which links sadness-generator). Enabled
 # ONLY by the test workflow (`cargo nextest run -p tombstone --features
@@ -30,7 +33,6 @@ crash-child = ["dep:sadness-generator"]
 
 [dependencies]
 crash-handler = { workspace = true }
-minidump-writer = { workspace = true, optional = true }
 # OPTIONAL NON-dev dep gated behind the `crash-child` feature: the helper bin
 # is the only consumer. NOT a [dev-dependency] — that would make it
 # unreachable from the [[bin]] under the test build. See review M1/M2.
@@ -38,6 +40,11 @@ sadness-generator = { workspace = true, optional = true }
 tracing = "0.1"
 
 [target.'cfg(windows)'.dependencies]
+# The `.dmp` writer, behind `crash-dumps`. Windows is the only platform with
+# an in-process dump branch left, so this is the only target that needs it —
+# and a privacy VPN's process memory holds keys + user traffic, so the fewer
+# builds that link it the better. See bindreams/hole#438 §3/§5.4.
+minidump-writer = { workspace = true, optional = true }
 windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_Security",
@@ -47,23 +54,26 @@ windows = { version = "0.62", features = [
 ] }
 
 [target.'cfg(unix)'.dependencies]
-# crash-context is needed on BOTH macOS and Linux:
-#  - macOS: the by-value MinidumpWriter::with_crash_context path rebuilds a
-#    CrashContext field-by-field and needs crash_context::ExceptionInfo in
-#    scope (crash-handler re-exports CrashContext but NOT ExceptionInfo, and
-#    CrashContext is not Clone).
-#  - Linux: extract_fault_fields reads crash_context::CrashContext's
-#    `siginfo: libc::signalfd_siginfo`, `pid`, `tid` fields directly.
-# See review S1 + the Linux verification (bindreams/hole#438).
-crash-context = { workspace = true }
-# Shared marker writer (open/write/close) + clock_gettime + the Linux
-# signalfd_siginfo field access. macOS + Linux.
+# Shared marker writer (open/write/close), clock_gettime, the macOS `_exit`
+# terminator, and the Linux `signalfd_siginfo` field access. macOS + Linux.
+#
+# NO direct `crash-context` dep: the only two consumers were the macOS
+# minidump's by-value CrashContext rebuild and the SIGABRT-relay signature
+# predicate, both gone. `extract_fault_fields` reads fields off
+# `crash_handler::CrashContext` (a re-export), which needs no direct dep.
 libc = "0.2"
 
 [dev-dependencies]
 skuld = { workspace = true }
 hole-test-observability = { path = "../test-observability" }
 tempfile = "3"
+# `ChildExt::wait_timeout` for `crash_child.rs`'s `wait_bounded`: bounds a
+# wait on a SIGCHLD self-pipe + `poll(2)` WITHOUT moving `Child` into a
+# background thread, so a timeout can never kill a pid the OS has already
+# recycled (on `Ok(None)`, `child` stays unreaped, so its pid can't be
+# recycled — the reap on `Ok(Some)` can happen from whichever thread drains
+# the shared SIGCHLD pipe first, not necessarily this one).
+wait-timeout = "0.2"
 # The sweep tests + their helpers build a tracing subscriber via
 # `tracing_subscriber::fmt()` (only `tracing` is a non-dev dep). See review M8.
 tracing-subscriber = { version = "0.3", features = ["fmt"] }

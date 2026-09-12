@@ -171,7 +171,15 @@ pub(crate) enum BridgeAction {
         repair_user_data_dir: Option<std::path::PathBuf>,
     },
     /// Stop and remove the bridge service
-    Uninstall,
+    Uninstall {
+        /// Internal (the MSI's major-upgrade path): tear the service down but
+        /// leave every fail-closed cover engaged and the kill switch armed.
+        /// The standing cover is what holds the update-cutover gap.
+        ///
+        /// Hidden: hand-running it reproduces #1003 exactly.
+        #[arg(long, hide = true)]
+        keep_covers: bool,
+    },
     /// Print bridge install/running status
     Status,
     /// View bridge logs
@@ -225,6 +233,14 @@ pub(crate) enum BridgeAction {
     /// Disengage a standing lockdown cover when no bridge is alive to do it
     /// (elevated recovery hatch; last-writer-wins, not a privilege gate).
     Unlock,
+    /// Internal (the MSI's uninstall): release every fail-closed cover and
+    /// record the target off. Wider than `unlock` — it also clears a transient
+    /// cover that no later bridge start is left to sweep.
+    ///
+    /// Hidden because `unlock` is the user-facing hatch; like `unlock`, this
+    /// refuses against a live bridge.
+    #[command(hide = true)]
+    ReleaseCovers,
 }
 
 #[derive(Subcommand)]
@@ -404,10 +420,38 @@ fn user_log_dir(home: &std::path::Path) -> std::path::PathBuf {
 }
 
 /// Per-user state directory under the resolved user's home. See
-/// [`user_log_dir`].
+/// [`user_log_dir`]. Delegates so `cutover::peer_state_dirs`, which has to find
+/// this bridge's liveness lock afterwards, resolves the same path from the same
+/// source.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn user_state_dir(home: &std::path::Path) -> std::path::PathBuf {
-    home.join("Library/Application Support/hole/state")
+    hole_common::paths::user_state_dir(home)
+}
+
+/// The remedy to append to a failed privileged bridge command, or `""` when
+/// this process is already elevated and elevation is therefore not the answer.
+///
+/// Every step of an uninstall needs elevation — launchd/SCM, the plist or the
+/// service registration, the pf ruleset and the WFP filters — so an
+/// unprivileged run surfaces only whichever bare `Permission denied (os error
+/// 13)` it reached first, with no path and no hint that the fix is to re-run
+/// elevated. A hint rather than an up-front refusal on purpose: the MSI's
+/// uninstall custom actions run these same commands as SYSTEM under
+/// `Return="check"`, and a privilege probe that answered wrong there would make
+/// the product unremovable — the exact failure this whole path exists to
+/// prevent.
+fn elevation_hint() -> &'static str {
+    if stepstool::is_privileged() {
+        return "";
+    }
+    #[cfg(target_os = "windows")]
+    {
+        " — this command needs elevated privileges; re-run it from an Administrator console"
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        " — this command needs elevated privileges; re-run it with sudo"
+    }
 }
 
 /// Dispatch a parsed subcommand to its handler. Exits the process when done.
@@ -701,9 +745,9 @@ fn handle_bridge(action: BridgeAction) -> i32 {
             }
             0
         }
-        BridgeAction::Uninstall => {
-            if let Err(e) = crate::setup::uninstall_bridge() {
-                cli_log!(error, "bridge uninstall failed: {e}");
+        BridgeAction::Uninstall { keep_covers } => {
+            if let Err(e) = crate::setup::uninstall_bridge(keep_covers) {
+                cli_log!(error, "bridge uninstall failed: {e}{}", elevation_hint());
                 return 1;
             }
             0
@@ -760,6 +804,18 @@ fn handle_bridge(action: BridgeAction) -> i32 {
                 }
             }
         }
+        BridgeAction::ReleaseCovers => match hole_bridge::cutover::release_covers() {
+            Ok(clearance) => {
+                if let Some(report) = hole_bridge::cutover::release_clearance_report(&clearance) {
+                    cli_log!(warn, "{report}");
+                }
+                0
+            }
+            Err(e) => {
+                cli_log!(error, "cover release failed: {e}{}", elevation_hint());
+                1
+            }
+        },
         BridgeAction::Unlock => match hole_bridge::cutover::unlock() {
             Ok(()) => 0,
             Err(e) => {

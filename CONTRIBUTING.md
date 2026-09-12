@@ -1055,15 +1055,21 @@ sweep only knows the first ten) leaves those two permits un-swept; they are
 so this is bounded and self-healing (a later upgrade's sweep cleans them up),
 not a leak of blocked traffic. Disclosed as a source comment on
 `FILTER_GUIDS` itself. Tracked separately:
-[#754](https://github.com/bindreams/hole/issues/754). **Windows only, also
-pre-existing:** the repair's release step deletes the held cover's filters by
-fixed GUID and discards the result; if a delete genuinely fails, the
-subsequent re-engage's add for that same GUID reports success
+[#754](https://github.com/bindreams/hole/issues/754). **Windows only, was
+pre-existing, now closed:** the repair's release step deletes the held cover's
+filters by fixed GUID and discards the result; if a delete genuinely failed,
+the subsequent re-engage's add for that same GUID reported success
 (`FWP_E_ALREADY_EXISTS` is treated as OK, by design, for the crash-recovery
-idempotency case) while the LIVE filter still carries the OLD value — a
-stale permit surviving, not a leaked block. Disclosed as a source comment on
-`ok_or_exists`. Tracked separately:
-[#761](https://github.com/bindreams/hole/issues/761).
+idempotency case) while the LIVE filter still carried the OLD value — a stale
+permit surviving, not a leaked block. The same shape reached the lockdown
+cover's App-ID permits across an update-cutover, where the stale value is the
+*pre-update* `hole.exe` path and the running binary is the one left blocked.
+Both engages now pre-delete every filter whose condition carries a
+runtime-discovered value (`Condition::carries_runtime_value` —
+`transient_pre_delete_guids`, `appid_pre_delete_guids`) inside their own
+transaction, and `add_filter` refuses a duplicate on such a filter rather than
+papering over it, so the case is removed rather than documented
+([#761](https://github.com/bindreams/hole/issues/761)).
 
 It is **name-agnostic** — it does *not* permit the TUN interface. The new
 bridge's start-time DNS-forwarder self-test runs over loopback to the SS client
@@ -1264,16 +1270,24 @@ block-all beside them was not.
 object in the same session that added it. The delete this design is actually
 exposed to is the one issued in a *later* boot, where no live object remains and
 `FwpmFilterDeleteByKey0` answers `FWP_E_FILTER_NOT_FOUND` — which
-`first_delete_failure` whitelists as benign. So the false `Ok` the measurement is
-often cited as excluding is still open, and only a reboot can close it. That
-matters most at one call site: [#1009](https://github.com/bindreams/hole/issues/1009)
-makes `release_covers` → `failclosed::release_all` the MSI's `Return="check"`
+`first_delete_failure` whitelists as benign. So the question the measurement is often
+cited as settling is still open, and only a reboot can close it. That matters
+most at one call site: [#1009](https://github.com/bindreams/hole/issues/1009)
+made `release_covers` → `failclosed::release_all` the MSI's `Return="check"`
 uninstall gate. On a boot where the bridge never engaged, both twin keys answer
-not-found, the gate reads `Ok`, and the installer deletes `hole.exe`. If the
-boot-time record outlives its object that is [#1003](https://github.com/bindreams/hole/issues/1003)
-recreated for the pre-BFE window, with nothing left to clear it. #1008's
-provider-enumeration sweep does not close it either — that also reads live
-objects.
+not-found, and a bare `Ok` there would be
+[#1003](https://github.com/bindreams/hole/issues/1003) recreated for the pre-BFE
+window, with nothing left to clear it.
+
+The *claim* is closed even though the question is not: the twins' swept keys
+carry `KeyLifetime::BootTime`, so `KeyObservation::proves_empty` answers false
+for their not-found and `release_all` reports them **unproven** in its
+`Clearance`. The uninstall still proceeds — refusing it over a bounded
+boot-window block would trade that for a permanently unremovable product — but
+it proceeds without claiming a proof nobody made, and
+`cutover::release_clearance_report` names the keys while `hole.exe` still
+exists to name them. #1008's provider-enumeration sweep does not close the
+underlying question either — that also reads live objects.
 
 **Its limit, which must travel with the result.** The probe's enumeration
 template names *no provider* — deliberately, since filtering by ours would make
@@ -1352,15 +1366,19 @@ unrecoverable case is narrower: **BFE failing to start**, where `FwpmEngineOpen0
 fails and `release_all` and `bridge unlock` both return `Err` having issued
 nothing.
 
-Out-of-band recovery, at the confidence it deserves: `netsh wfp` has **no verb that deletes an
-individual filter** — its verbs are `capture`, `dump`, `help`, `set` (capture
-options only), `show` and `reset`, none of which takes a filter key — so the
-usual "recover with `netsh wfp`" advice does not apply to any WFP filter. The plausible hatches are
-`netsh wfp reset` and removing
-`HKLM\SYSTEM\CurrentControlSet\Services\BFE\Parameters\Policy\BootTime`.
-**Neither is verified, and the registry path is not Microsoft-documented** — it
-comes from third-party reverse engineering. Do not hand either to a user as a
-known-good step without testing it.
+Out-of-band recovery, at the confidence it deserves: there is no in-box one. `netsh wfp` is a
+**diagnostics-only** context — its verbs are `capture`, `dump`, `help`, `set` (capture options
+only) and `show` ([netsh
+wfp](https://learn.microsoft.com/windows-server/administration/windows-commands/netsh-wfp)), none
+of which takes a filter key — so the usual "recover with `netsh wfp`" advice does not apply to any
+WFP filter. There is no `netsh wfp reset`: `reset` belongs to other contexts (`netsh advfirewall reset`, `netsh int ip reset`) and resets firewall/TCP-IP policy, not WFP's filter store. What
+`netsh wfp` *can* do here is `show boottimepolicy`, the OS's own view of the boot-time policy
+store; `show filters` lists what is active *now*, which excludes a boot-time filter once BFE has
+started — i.e. at every moment an operator reads it. Seeing is not removing: the only removal API
+is FWPM. The one other hatch worth recording, and not worth offering a user, is removing
+`HKLM\SYSTEM\CurrentControlSet\Services\BFE\Parameters\Policy\BootTime`, where boot-time
+filter blobs are reported to live — **not Microsoft-documented at all** (third-party reverse
+engineering) and untested here.
 
 It contrasts with the [transient cutover cover](#transient-cutover-cover) on
 three axes:
@@ -1456,10 +1474,275 @@ censorship self-test on that basis. An
 out-of-process command that deleted the transient filters would leave that
 guard claiming a cover that no longer exists, and the next retry would run
 uncovered while believing itself protected — so `cutover::unlock` keeps
-clearing only the standing cover. The transient cover therefore has exactly
-two escapes, both in-process: the tray's Go Offline action while the bridge
-holds it, and `recover_routes`' unconditional sweep at the next bridge start
-when it does not.
+clearing only the standing cover.
+
+The transient cover therefore has **three** escapes. Two are in-process and
+available at any time: the tray's Go Offline action while the bridge holds it,
+and `recover_routes`' unconditional sweep at the next bridge start when it does
+not. The third is out-of-process and reserved for uninstall.
+
+#### Uninstall: the third escape
+
+Uninstall is the one moment the in-process escapes cannot cover, because there
+is no next bridge start. On Windows the filters are
+`FWPM_FILTER_FLAG_PERSISTENT`: the Base Filtering Engine re-adds them every
+boot, and the uninstaller is about to delete the only binary that could remove
+them. Nothing shipped with Windows takes their place: `netsh wfp` is
+diagnostics-only (no delete verb), and removing a WFP filter takes an FWPM
+call. So the host is blocked until Hole is reinstalled — there is no in-band
+way back (#1003). `cutover::release_covers` (`hole bridge release-covers`) is
+therefore `release_all` — both cover kinds — wrapped in the same escape shape
+as `unlock`.
+
+What makes the wider reach safe here is not ordering but the same structural
+exclusion `unlock` uses: it **refuses against a live bridge instance**
+(`BridgeLiveness::try_acquire`), so there is never an in-process posture left
+claiming a cover that no longer exists. `uninstall_bridge` stops the bridge
+*first*, which is what frees the lock; a bridge that survives the stop turns the
+release into a loud refusal rather than a silent desync.
+
+The lock is per-state-dir but the covers are not — on Windows they are keyed on
+compile-time GUIDs and swept machine-wide — so the refusal probes the service
+state dir *and* the per-user dirs `cli.rs` gives foreground and elevated
+non-`--service` runs (`cutover::peer_state_dirs`). Every one of them is locked,
+including a dir that is not there yet — `try_acquire` creates what it locks, and
+a peer left unlocked because it looked absent is a peer nothing excludes, which
+is the whole desync again on an account that had not run a bridge until
+mid-release. **What that costs is kept, not cleaned up:** an empty
+`.../hole/state` holding a `bridge-liveness.lock` is left behind on every
+account that never ran a bridge. Removing it could only happen after the peer
+locks are released, and every bridge takes its own with the *blocking*
+`BridgeLiveness::acquire` — so the bridge this exclusion exists to keep out is
+woken by that release, and a cleanup running then would delete the
+`bridge-lockdown.json` it had just written. That is the stranded-cover end state
+the whole path exists to prevent, and it has no in-band recovery; an empty
+directory has none at all. A path already probed IS skipped: the lock
+contends per open handle, not per owning process, so probing one twice would
+refuse against the call's own guard, and duplicates are ordinary (an un-elevated
+run resolves `default_state_dir` and the real user's dir to one path).
+
+##### Stop, deregister, release — and what gates what
+
+`uninstall_bridge_with` runs three effects in that order, with two rules that
+are the whole of #1003's second half:
+
+- **The stop is gated on nothing.** Whether a bridge is running and whether a
+  registration record still names it are independent facts, and the covers are
+  held by the live process, not by the record. Gating the stop on
+  `is_installed()` made them look like one, and that is what turned an
+  uninstall into a dead end: `DeleteService` against a live service *succeeds*
+  by marking the row for deletion, `OpenService` then answers
+  `ERROR_SERVICE_MARKED_FOR_DELETE`, `is_installed()` reads false, and every
+  retry skips the teardown that would have stopped the bridge — whose liveness
+  lock then refuses the release forever. macOS reaches the same place through a
+  plist deleted over a still-loaded job.
+- **Deregistration requires a confirmed stop.** The registration is the only
+  handle a later attempt has, so an unconfirmed stop leaves it alone: the
+  uninstall fails and the next one still has something to work with. Both
+  platform `uninstall()`s enforce the same rule at their own level, and
+  `platform::os::ensure_stopped` is the stop that tolerates a host with nothing
+  registered (launchd's `bootout`, not `stop`'s SIGTERM — the plist sets
+  `KeepAlive`). It asks nothing first on either platform: it issues the stop and
+  classifies **that act's own** result by cause. A probe answers about the
+  moment it was taken, and the row can leave the service manager in between — a
+  concurrent uninstall attempt, an operator's own bootout, the daemon exiting
+  and being reaped — after which the act fails over a bridge that is provably
+  stopped and the uninstall refuses to deregister it. Windows classifies the
+  failed `stop()` (`windows::stop_error_is_absent`, which spans all three
+  layers the stop reaches SCM through); macOS asks launchd what it has *after*
+  the bootout (`macos::ensure_stopped_verdict`), because launchd's exit code
+  for "no such job" differs by subcommand and is not a classification to build
+  on.
+
+Steps do not short-circuit each other and the error names all of them; an early
+`?` on the release swallowed the context that explains why it refused.
+
+Two more properties are load-bearing:
+
+- **The release is not gated on the service.** Cover existence is independent
+  of service registration (the Windows filters are keyed on compile-time GUIDs
+  and are machine-wide), so it runs even when `is_installed()` is false or an
+  earlier step failed.
+- **It is the only uninstall failure that blocks.** The MSI runs
+  `BridgeRelease` `Return="check"` — uniquely among the uninstall custom
+  actions — so a failed release aborts before `RemoveFiles`. Fatality stops
+  there: the target write and the release itself abort, while the trailing
+  bookkeeping only warns, since failing there would roll an uninstall back over
+  a host that is in fact already open. Recording the target `Off` *before* the
+  release is what makes that safe — whatever happens after, a later start
+  reconciles toward `Off` and sweeps. `HOLE_KEEP_COVERS=1` is the documented
+  escape from the gate itself, so a release that can never succeed cannot make
+  the product unremovable (see RELEASE-OPS.md).
+
+##### What the MSI must guarantee for the keep-covers path to be safe
+
+Two `hole.wxs` properties, both of which the release depends on and neither of
+which is visible from the Rust side.
+
+- **`MajorUpgrade Schedule="afterInstallInitialize"`.** The upgrade path
+  deliberately leaves the covers armed — `BridgeUninstall` passes
+  `--keep-covers` and `BridgeRelease` is skipped under `UPGRADINGPRODUCTCODE`,
+  because the standing cover is what holds the cutover gap. That is only
+  survivable if a FAILED upgrade puts the old product back. WiX's default
+  (`afterInstallValidate`) removes the old product outside the new install's
+  transaction, so a failed upgrade leaves neither version installed: armed
+  persistent filters, no `hole.exe`, no in-band way back — this PR's own
+  hazard, reintroduced by an attribute nobody set.
+  `afterInstallInitialize` puts `RemoveExistingProducts` inside the
+  transaction, so a rollback reinstalls the old product. The two later
+  placements would also survive a failed upgrade, but install the new files
+  first — over a still-running old service holding `hole.exe` open, with the
+  old product's `PathRemove` landing after the new product's `PathAdd`. Only
+  `afterInstallInitialize` gives both properties, and both halves are pinned
+  (`test_major_upgrade_removal_is_undone_when_the_upgrade_fails`,
+  `test_major_upgrade_removes_the_old_product_before_the_new_files_land`).
+- **`BridgeUninstallRollback`.** `BridgeRelease` is `Return="check"` and runs
+  immediately after `BridgeUninstall`, so a failed release rolls back an
+  uninstall whose service teardown already happened. The rollback action
+  re-runs exactly what `BridgeInstall` runs, so the product is left as the
+  uninstall found it rather than installed-but-deregistered. MSI ignores a
+  rollback action's return value, so it can only add recovery.
+
+##### What the gate can prove, and what it only attempted
+
+`Return="check"` reads an exit code as "safe to delete the binary", so the
+question is what a zero exit actually establishes. A delete-by-key answers one
+of three things — removed, not found, or a genuine failure — and "not found"
+has always been folded in as benign (`first_delete_failure`). For a
+`FWPM_FILTER_FLAG_PERSISTENT` filter that is sound: BFE's store is the key's
+only record and the delete addresses it directly, so an empty answer proves the
+key carries nothing. For a `FWPM_FILTER_FLAG_BOOTTIME` filter it proves less.
+A boot-time object is live only between kernel start and BFE start, so on any
+later boot the key answers "not found" **whether or not a boot-time policy
+record is still provisioned behind it** — and nothing this crate can call
+separates the two. On the boot where uninstall matters most (lockdown armed in
+an earlier session, the user uninstalls without ever connecting) every such key
+answers empty, and a bare `Ok` told the MSI it was safe to delete the only
+binary that could act on it — #1003 recreated for the pre-BFE window.
+
+So `release_all` no longer returns a bare `Ok`. Its payload is a
+`failclosed::Clearance`: `Ok` still means no delete failed, while
+`Clearance::is_proven` is the narrower claim that every empty answer *proved*
+its key empty. `#[must_use]` keeps a caller from collapsing them again, and the
+lifetime rides on the key itself (`SweptKey`) rather than in a parallel
+"which of these are boot-time" list — the two would drift, silently and in the
+direction that hurts.
+
+**An unproven key does not fail the release**, and that is a deliberate
+sizing call rather than an oversight. A boot-time filter stops applying once
+BFE starts, so a stranded record blocks egress across the boot→BFE window
+only — a bounded window that ends before the network stack is generally
+usable. Its length is *not* measured here (that needs a reboot-capable
+elevated lane, which does not exist), so the sizing rests on the window being
+bounded, not on any figure. Refusing the uninstall over a bounded early-boot
+block would trade it for a permanently unremovable product: the same trade the
+bookkeeping clause above already refuses. The gate stops claiming proof it does
+not have; it does not withhold the uninstall. What replaces the silence is
+`cutover::release_clearance_report`, which `bridge release-covers` and `bridge uninstall` both print: it names each unproven key, points at `netsh wfp show boottimepolicy` to *see* whether a record survived, says outright that `netsh wfp` cannot remove one, and names reinstalling Hole as the only thing that can.
+This is the last moment a Hole binary exists to say anything at all, so what it
+says has to be runnable.
+It deliberately does not assert a leftover is *present* — an unproven key is
+equally consistent with never having been installed, which is what it will be
+on almost every uninstall.
+
+#998/#1010's boot-time twins are the first and only keys Hole sweeps that are
+not `Persistent`, and the gate landed **before** them on purpose, so they could
+not arrive as a silent false `Ok`. On a not-found sweep the unproven set is now
+exactly those two keys and nothing else
+(`a_not_found_sweep_proves_every_key_but_the_boot_time_twins`); a sweep that
+watched them go answers `ERROR_SUCCESS` and is fully proven
+(`a_sweep_that_watched_the_twins_go_proves_them_empty`), which is the half that
+keeps `proves_empty` keyed on the *outcome* and not on the lifetime alone.
+
+**The mis-tag is now unrepresentable, not merely detectable.** `FilterLifetime`
+is a newtype over `KeyLifetime` with a private field: `filter_flags` — the
+crate's only producer of `FWPM_FILTER0::flags` — reads the very variant
+`key_lifetime` hands a sweep, so the flag and the classification are one value.
+`SweptKey` carries a `FilterLifetime` too, and the twins' key, layer, label and
+lifetime all come out of one `LOCKDOWN_BOOTTIME_TWINS` entry that both
+`build_lockdown_spec` and `swept_lockdown_keys` read. Installing a boot-time
+filter whose key a sweep calls `Persistent` is not a mistake that can be
+written. `every_lockdown_filter_is_swept_under_the_lifetime_it_is_installed_with`
+asserts it for every filter, including the App-ID ones whose two lists are still
+built independently.
+
+That is what retired the tripwire's original form.
+`a_boot_time_flag_cannot_be_introduced_without_classifying_its_key` asserted
+that the crate's sources install boot-time filters *iff* they classify
+boot-time keys. Once the coupling landed, both halves became permanently true
+— the equality holds no matter what a later change does, so it could no longer
+fail in the direction it existed for. A guard that still reads like evidence
+and cannot fail is worse than none, so the equality is gone and the scan is
+re-pointed at the property the type *cannot* enforce: that the type is the only
+way in. `the_boot_time_flag_is_named_only_where_a_key_lifetime_produces_it`
+asserts `FWPM_FILTER_FLAG_BOOTTIME` is named by exactly one production source
+— the one defining `fn filter_flags`, found by that definition rather than by a
+path, so moving the mapping re-anchors the guard instead of widening it.
+
+`the_raw_flag_bits_are_named_only_where_they_cannot_reach_the_boot_window`
+closes what the old form disclosed as a residual: `FWPM_FILTER_FLAGS(0x4)`
+written as raw bits names no flag symbol. `FWPM_FILTER_FLAGS` may be named only
+by the mapping's own source, plus any source opening its engine
+`FWPM_SESSION_FLAG_DYNAMIC` — WFP refuses a boot-time filter on a
+dynamic-session object, so bits written there cannot reach the boot window, and
+anchoring the exemption on the session flag means `dns_confine/windows.rs`
+stops being exempt the moment it stops being dynamic. Clippy cannot cover this:
+`disallowed_types` fires on a type in a signature but **not** on a bare
+tuple-struct construction expression (measured against clippy, not assumed).
+
+Both scans read every production source in tun-engine off disk, symlinks
+followed (`rustc` resolves a `mod` through one, so a symlinked source ships),
+rather than one hardcoded file — a boot-time flag landing in a new submodule, or
+at the crate's other sanctioned FWPM site, cannot slip past. The `*_tests.rs`
+siblings are excluded, or the scan would read an install out of test code. What
+they match is identifiers in **lexed** code (`proc-macro2`), not substrings:
+comments of every shape and string literals are gone before the scan, so prose
+cannot satisfy them, and an alias (`use ... FWPM_FILTER_FLAG_BOOTTIME as BOOT_FLAG`) cannot hide from them — the import names the symbol in full.
+
+The in-process escapes (`disengage_lockdown`, `ProxyManager::turn_lockdown_off`,
+the tray's Unblock) share the same boot-time blind spot and deliberately do
+**not** gate on it: they leave the binary on disk, the next engage re-arms the
+key, and `hole bridge unlock` stays reachable. `Routing::release_all_covers` is
+the one site sanctioned to drop the `Clearance`, and says so.
+
+Not established by any of this, and not claimed: whether a by-key delete purges
+the underlying boot-time policy record, and whether such a record is
+re-provisioned at later boots at all. Both need a reboot-capable elevated lane
+that does not exist (see #1010). The design holds under either answer rather
+than picking one.
+
+**The release deletes no file, anywhere** — not a peer tree, and not the
+service's own state dir. Its records are not the release's to take:
+`scripts/network-reset.py`, the out-of-band escape for a host with no working
+bridge, reads `bridge-routes.json` and `bridge-dns{,.superseded}.json` out of
+`service_state_dir()` to undo a leaked bypass route or a rewritten adapter's
+DNS, and `bridge-plugins.json` may be deleted only by something that has
+accounted for every plugin in it. An uninstall is the moment those become the
+*only* escape — deleting them there would leave the leak on the host with the
+record of how to undo it destroyed by the uninstall itself, which is #1003's own
+end state one layer down. Nor is the directory itself the release's:
+`install()` pre-creates it on both platforms, so the only host where
+`try_acquire` provisions it is one that never installed — and what stays there
+is an empty `hole/state`, the same litter the peers keep. What the release
+leaves on a host that did install is `bridge-target.json` reading `Off` and
+`bridge-lockdown.json` disarmed, which is what a later start should read.
+
+A major upgrade skips the release entirely (`NOT UPGRADINGPRODUCTCODE`, and
+`bridge uninstall --keep-covers` for the service teardown that must still run):
+the standing cover is what holds the update-cutover gap, and the new bridge
+re-adopts it. Both CLI surfaces are `hide = true` — the uninstaller is their
+only sanctioned caller.
+
+Wiring these together is what the tests could not see: every unit test drives
+`uninstall_bridge_with` / `release_covers_with` through injected closures, so
+all of them stay green against a refactor that severs the production call.
+`setup_tests.rs`'s `the_cover_release_is_wired_to_both_of_its_entry_points` and
+`the_bridge_stop_is_wired_ahead_of_every_deregistration` walk `crates/hole/src`
+and pin the call sites by enclosing function, and
+`reconciler_tests.rs`'s `cover_release_has_the_known_sanctioned_caller_set`
+matches the `failclosed::release_all` free function as well as the `Routing`
+trait method — `cutover::release_covers` has no `Routing` handle, and a pattern
+naming only the trait method let this whole release path in unseen.
 
 Disclosed residuals:
 
@@ -1578,6 +1861,65 @@ Disclosed residuals:
    running or an RPC failure — both transient, and both states in which
    `hole bridge unlock` would also fail, so the honest escape is the next
    start once BFE answers, which adopts the cover and restores the menu item.
+
+1. Uninstall proves it *issued* the deletes, not that no filter remains. On
+   Windows `lockdown_cover_presence` could confirm the stronger claim by GUID;
+   nothing does so yet, and the end-to-end "uninstall from an armed state
+   leaves no filters behind" test needs the elevated Windows lane (#999).
+   macOS is weaker still: `release_all` reads its own state files, so a cover
+   engaged under a non-default `--state-dir` reads `StateFile::Absent` against
+   the fixed `service_state_dir()` and returns `Ok` over a blocked host. The
+   recorded `Target::Off` limits the damage — a later start reconciles toward
+   it and sweeps — and pf does not survive a reboot. Windows is clean here:
+   the sweep is by GUID and ignores `state_dir` entirely.
+
+1. The live-bridge refusal probes a known set of state dirs, not every
+   possible one. A bridge given an explicit `--state-dir` outside
+   `peer_state_dirs`, or one running under a different account than the
+   uninstaller (the MSI's custom actions run as SYSTEM, whose
+   `default_state_dir` is not the developer's), holds a lock nothing here can
+   see. On Windows the consequence is the desync the refusal exists to
+   prevent: `release_all` sweeps by GUID and would delete that bridge's
+   filters while its posture still claims them, so its next covered start
+   would skip re-engagement and run uncovered. `bridge release-covers` is
+   hidden and uninstall-only for exactly this reason.
+
+1. Locking those dirs leaves them behind. `try_acquire` creates what it locks,
+   so an uninstall provisions an empty `.../hole/state` holding a
+   `bridge-liveness.lock` on every account that never ran a bridge, and neither
+   platform's `uninstall()` removes it. On Windows the peer set keeps a
+   `ProfileList` entry whose directory is **not** on disk
+   (`ProfileEntry::Absent` — the probe is not the judge of whether the registry
+   is lying), so the tree can be conjured where no profile exists at all; what
+   the User Profile Service makes of that at the next logon is not measured
+   here. Cleaning any of it up is what is refused, not what was overlooked: the
+   only moment to do it is after the peer locks are released, which is the exact
+   moment a bridge blocked on one of them wakes and starts writing its own cover
+   record there. Deleting nothing is always safe; deleting the wrong thing
+   during an uninstall has no in-band recovery.
+
+1. A stop that never returns is not covered at all. `platform::os::stop` waits
+   on a real SCM `STOPPED` callback with no bound, and `ProxyManager`'s
+   teardown is itself unbounded (#556) — so against the known
+   windows-installer uninstall hang the release never runs, and the user's end
+   state is #1003 minus the deleted binary. The fix here addresses the stop
+   that *fails*, not the stop that hangs. What the stop no longer does is
+   fail spuriously against a service that is merely already stopping:
+   `ControlService` answers `ERROR_SERVICE_CANNOT_ACCEPT_CTRL` there, which
+   `stop_via_notify` now treats as benign because its arm already covers
+   `STOPPED`/`STOP_PENDING`/`RUNNING` and it re-issues the control on the
+   `RUNNING` a refused `START_PENDING` resolves to.
+
+1. On macOS, uninstall only runs when the user takes it: the tray's Uninstall
+   Helper shells out to `hole bridge uninstall`. Dragging Hole.app to the
+   trash runs none of this and leaves the launchd job, the helper, and any
+   cover in place. Acceptable only because pf does not survive a reboot; the
+   Windows MSI has no such gap.
+
+1. A release that succeeds while the trailing bookkeeping fails leaves a stale
+   auto-connect candidate or a stale legacy `bridge-lockdown.json` label. The
+   target is already `Off` by then, so reconciliation still converges;
+   propagating those failures would abort the uninstall over an open host.
 
 1. An adopted cover records **two** facts, kept in two places. The
    adopted-cover claim (`ProxyManager::set_standing_cover_adopted`, recorded
@@ -1731,8 +2073,23 @@ Rust's unwinding panic hook. The first-party Apache-2.0
 `install_panic_hook()`), covering GUI/CLI/bridge; galoshes attaches in its own
 `main`. On a fault, `on_crash` runs in a compromised context and does only
 signal-safe work: write a fixed-format `crash-<kind>-<pid>.marker` via raw
-syscalls (no heap/locks/`format!`), then return `Handled(false)` so the OS
-default path (WER / `.ips` / core dump) still runs. All I/O errors are swallowed.
+syscalls (no heap/locks/`format!`). All I/O errors are swallowed.
+
+On Windows and Linux it then returns `Handled(false)` so the OS default path
+(WER / core dump) still runs. **On macOS it never returns** — it `_exit(70)`s,
+for every fault class, every attach kind and every build, so a macOS crash
+produces the marker and **neither an `.ips` nor a minidump**. That cost was
+accepted on #842: no part of Hole should hang the process, even sometimes. Do
+not restore either half without reading `crates/tombstone/src/crash.rs`'s
+module doc, which is the canonical record. Two source-scanning guards in
+`crash_tests.rs` hold that callback's shape, because the deadlock needs
+CI-like allocation pressure and the runtime `crash_marker_*` tests stay green
+without it: `macos_on_crash_terminates_unconditionally`, and
+`macos_on_crash_calls_nothing_that_can_allocate`, which scans the whole
+handler path transitively — `on_crash`, the marker write and every helper
+below it — since an allocation one frame down deadlocks exactly as one in the
+callback does.
+
 `tombstone::sweep(log_dir)` runs at the next start of the same kind, emits a
 `tracing::error!(target: "crash", …)`, and deletes the marker. Markers land in
 `log_dir` (not `state_dir`) so the elevated bridge's marker is readable by the
@@ -1743,10 +2100,11 @@ unprivileged GUI.
   Linux runtime crash tests are a known gap (compile-verified via the galoshes
   Linux build; runtime-exercised only on the Win/mac `hole-tests` lane).
 - **Dev-only minidumps:** under the non-default `crash-dumps` feature, `on_crash`
-  also writes a `.dmp` via `minidump-writer` — **Windows/macOS only** (no
-  in-process Linux self-dump). `minidump-writer` never links into a shipped
-  binary (process memory holds keys + traffic, and it has no Windows-aarch64
-  support).
+  also writes a `.dmp` via `minidump-writer` — **Windows only**, despite the
+  feature name reading cross-platform. Linux never had an in-process self-dump;
+  macOS gave its up in #842 (above). `minidump-writer` is declared under
+  `cfg(windows)`, so the feature links nothing on any other target (process
+  memory holds keys + traffic, and it has no Windows-aarch64 support).
 - **Plugins:** ex-ray is spawned with `GOTRACEBACK=crash`; `record_exit` logs a
   mid-run plugin death with `exit_code`/`killed`.
 - **Known gap (accepted, untested):** Windows `__fastfail` / `int 29h` (incl.
