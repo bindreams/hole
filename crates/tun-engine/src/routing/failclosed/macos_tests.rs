@@ -359,7 +359,7 @@ fn parse_pf_enabled_reads_status() {
 fn disengage_lockdown_confirmed_absent_is_ok_and_spawns_no_pfctl() {
     // Both sources agree there is nothing: no pfctl spawned.
     let mut ops = RecordingPfOps::default();
-    assert!(disengage_lockdown_with(CoverPresence::Absent, None, &mut ops).is_ok());
+    assert!(disengage_lockdown_with(CoverPresence::Absent, StateFile::Absent, &mut ops).is_ok());
     assert!(ops.log.is_empty(), "a confirmed-absent cover must spawn no pfctl");
 }
 
@@ -372,7 +372,7 @@ fn an_absent_state_file_with_a_live_pf_label_still_disengages() {
     // With no snapshot to restore from, the fallback is the blind
     // `/etc/pf.conf` reload.
     let mut ops = RecordingPfOps::default();
-    let result = disengage_lockdown_with(CoverPresence::Live, None, &mut ops);
+    let result = disengage_lockdown_with(CoverPresence::Live, StateFile::Absent, &mut ops);
     assert!(result.is_ok(), "{result:?}");
     assert_eq!(
         ops.log,
@@ -387,7 +387,7 @@ fn an_indeterminate_presence_reports_doing_nothing() {
     // than silently claim success, and name the manual recovery command.
     for presence in [CoverPresence::Unreachable, CoverPresence::Indeterminate] {
         let mut ops = RecordingPfOps::default();
-        let result = disengage_lockdown_with(presence, None, &mut ops);
+        let result = disengage_lockdown_with(presence, StateFile::Absent, &mut ops);
         let err = result.expect_err(&format!("{presence:?} must not report success"));
         assert!(
             err.to_string().contains("pfctl -f /etc/pf.conf"),
@@ -397,10 +397,72 @@ fn an_indeterminate_presence_reports_doing_nothing() {
     }
 }
 
+/// The manual escape hatch's half of the rule `release_all_with` already
+/// obeys: an UNUSABLE record still names the `pf_token` it must release.
+///
+/// Driven from persisted bytes through the REAL [`lockdown_state::load_presence`],
+/// so the `Unusable` arm is pinned to a payload a rolled-back bridge really
+/// produces rather than hand-constructed at the seam. The production cause is
+/// a version skew: `serde_json` produced a complete record, token intact, and
+/// only the version check rejected it. `disengage_lockdown` used to read this
+/// through `lockdown_state::load`, which collapses `Unusable` to `None`, so
+/// `bridge unlock` skipped `pfctl -X` entirely and `clear_standing` then
+/// deleted the only copy of the ticket — pf enabled under an unreferenced
+/// refcount until reboot.
+#[skuld::test]
+fn disengage_lockdown_drops_the_token_salvaged_from_an_unusable_record() {
+    let dir = tempfile::tempdir().unwrap();
+    let skewed = format!(
+        r#"{{"version":{},"pf_token":"9","main_snapshot":"","nat_snapshot":"","main_snapshot_captured":true}}"#,
+        lockdown_state::SCHEMA_VERSION + 1
+    );
+    std::fs::write(dir.path().join(lockdown_state::STATE_FILE_NAME), &skewed).unwrap();
+
+    let file = lockdown_state::load_presence(dir.path());
+    assert!(
+        matches!(file, StateFile::Unusable { pf_token: Some(ref t) } if t == "9"),
+        "this test's premise: a record one schema version ahead must read as `Unusable` WITH its \
+         token salvaged — on any other arm the assertion below exercises some other path: \
+         {skewed} -> {file:?}"
+    );
+    // pf says no, so the gate is the file alone — and it must not
+    // short-circuit, or the drop below is never reached for a different reason.
+    let presence = fold_presence(Some(false), &file);
+    assert_eq!(presence, CoverPresence::Recorded);
+
+    let mut ops = RecordingPfOps::default();
+    let result = disengage_lockdown_with(presence, file, &mut ops);
+    assert!(result.is_ok(), "{result:?}");
+    assert_eq!(
+        ops.dropped,
+        vec!["9".to_owned()],
+        "the escape hatch must release the refcount its unusable record still names, before \
+         `clear_standing` destroys the only record of it: {:?}",
+        ops.log
+    );
+}
+
+/// An unusable record with NO readable token is still a cover to clear: the
+/// restore runs, and the unreleasable refcount is disclosed rather than
+/// passed off as a clean release.
+#[skuld::test]
+fn disengage_lockdown_with_an_unusable_record_and_no_token_still_restores() {
+    let mut ops = RecordingPfOps::default();
+    let result = disengage_lockdown_with(CoverPresence::Recorded, unusable(), &mut ops);
+    assert!(result.is_ok(), "{result:?}");
+    assert_eq!(
+        ops.log,
+        vec!["reload_default", "clear_standing"],
+        "no snapshot to restore from means the default-ruleset fallback, and no token means no \
+         `pfctl -X` — but never a no-op"
+    );
+    assert!(ops.dropped.is_empty(), "there was no token to drop: {:?}", ops.dropped);
+}
+
 #[skuld::test]
 fn a_live_presence_with_a_captured_snapshot_restores_it_and_drops_the_token() {
     let mut ops = RecordingPfOps::default();
-    let result = disengage_lockdown_with(CoverPresence::Live, Some(standing_state()), &mut ops);
+    let result = disengage_lockdown_with(CoverPresence::Live, StateFile::Present(standing_state()), &mut ops);
     assert!(result.is_ok(), "{result:?}");
     assert_eq!(ops.log, vec!["load_ruleset", "drop_token", "clear_standing"]);
 }
@@ -1207,6 +1269,21 @@ fn a_failed_transient_load_warns_that_the_restore_reopens_the_host() {
     assert!(
         log.contains("bindreams/hole#1004"),
         "the restore that reopens the host must name the residual it is: {log}"
+    );
+    // The warn is emitted BEFORE `transient_restore`, so it may not report the
+    // reopening as accomplished: a restore that itself fails leaves the host
+    // behind the prior cover's block-all, and a categorical "the host is now
+    // OPEN" is then a falsehood stated as fact, with only `disengage`'s own
+    // failure lines further down to contradict it. The disclosure must be
+    // prospective and must point at those lines.
+    assert!(
+        !log.contains("is now OPEN"),
+        "the disclosure precedes the restore, so it must not report the reopening as already \
+         done: {log}"
+    );
+    assert!(
+        log.contains("logs its own failure"),
+        "a prospective disclosure has to say how to tell the two outcomes apart: {log}"
     );
 }
 

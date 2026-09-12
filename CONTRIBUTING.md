@@ -1136,7 +1136,15 @@ milliseconds.
   routes are up and the tunnel is flowing). `permit` is the single place that
   rule and its rationale live; `transient_cover_permits_are_never_syn_only` and
   its lockdown twin pin it against the real `pfctl -vn -f -`, each with a
-  positive control.
+  positive control. That is `pfctl`'s TEXT;
+  `macos_live_tun_permit_cover_carries_a_mid_stream_segment_after_a_state_purge`
+  takes the kernel's own verdict on a NON-`lo0` permit, which the loopback
+  tests above cannot (`lo0` is `set skip`-exempt): a real TCP connection over a
+  real utun — handshake completed by a SYN-ACK the test injects onto the
+  device, so there is no peer and no internet — must still carry a mid-stream
+  segment across the engage's purge, and must NOT across the pre-fix ruleset,
+  a one-line `no state` swap derived from the production builder's own
+  output.
   **Loopback is exempted TWICE: `set skip on lo0` AND a pair of `no state`
   `pass` rules** — both mandatory, each closing a failure the other cannot,
   because `set skip` is applied outside the rule ticket and `pfctl` clears every

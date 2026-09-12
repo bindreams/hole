@@ -621,13 +621,23 @@ fn engage_with(
         // leaving the still-good prior ruleset in place. `engage` has no
         // parameter today to tell "first engage" from "transition" apart —
         // which is why the warn below fires unconditionally: this site cannot
-        // tell the harmless case from the one that just opened a host a live
-        // cover was still holding, so it says so and leaves that to the reader.
+        // tell the harmless case from the one that is about to open a host a
+        // live cover was still holding, so it says so and leaves that to the
+        // reader.
+        //
+        // Prospective, not accomplished: this fires BEFORE the restore it
+        // describes, and `transient_restore` reports back nothing a phrasing
+        // could branch on. A restore that itself fails leaves the host behind
+        // the prior cover's block-all, so a categorical "the host is now OPEN"
+        // would be a falsehood stated as fact — and the only thing
+        // contradicting it would be `disengage`'s own failure lines below,
+        // which is exactly what this warn now sends the reader to.
         tracing::warn!(
             "the transient cover's ruleset failed to load; restoring /etc/pf.conf, which REPLACES \
              whatever ruleset was live. If this engage was a TRANSITION over a still-live prior \
-             cover, that cover was blocking the host until this instant and the host is now OPEN \
-             (bindreams/hole#1004)"
+             cover, that cover was blocking the host until this instant and the restore below \
+             REOPENS it (bindreams/hole#1004); a restore that fails instead logs its own failure \
+             below and leaves the host behind that prior cover"
         );
         ops.transient_restore(&token);
         return Err(e);
@@ -992,11 +1002,8 @@ pub fn engage_lockdown(
 /// host's filter+nat rules under pf defaults (same class of limitation the
 /// transient cover documents for its `/etc/pf.conf` reload).
 pub fn disengage_lockdown(state_dir: &Path) -> Result<(), RoutingError> {
-    disengage_lockdown_with(
-        lockdown_cover_presence(state_dir),
-        lockdown_state::load(state_dir),
-        &mut RealPfOps { state_dir },
-    )
+    let (presence, file) = lockdown_presence_and_state(state_dir);
+    disengage_lockdown_with(presence, file, &mut RealPfOps { state_dir })
 }
 
 /// `disengage_lockdown`'s sequencing, with presence and the [`PfOps`] seam
@@ -1004,7 +1011,7 @@ pub fn disengage_lockdown(state_dir: &Path) -> Result<(), RoutingError> {
 /// table-tested without shelling out to `pfctl`.
 fn disengage_lockdown_with(
     presence: crate::routing::CoverPresence,
-    st: Option<lockdown_state::LockdownPfState>,
+    st: StateFile<lockdown_state::LockdownPfState>,
     ops: &mut dyn PfOps,
 ) -> Result<(), RoutingError> {
     use crate::routing::CoverPresence;
@@ -1029,15 +1036,24 @@ fn disengage_lockdown_with(
     // `/etc/pf.conf` IS the restore target — see
     // `LockdownPfState::main_snapshot_captured`.
     match &st {
-        Some(st) if st.main_snapshot_captured => {
+        StateFile::Present(st) if st.main_snapshot_captured => {
             ops.load_ruleset(&build_lockdown_restore_ruleset(&st.nat_snapshot, &st.main_snapshot))?
         }
         _ => ops.reload_default()?,
     }
 
-    // Only release a pf refcount token we actually hold on record.
-    if let Some(st) = &st {
-        ops.drop_token(&st.pf_token)?;
+    // Only release a pf refcount token we actually hold on record — but an
+    // UNUSABLE record still holds one. This is the escape hatch (`bridge
+    // unlock`, the intent-off sweep) whose `clear_standing` below deletes the
+    // file, so a token skipped here is a `pfctl -E` refcount with nothing left
+    // on disk to release it: pf stays enabled until reboot. Fail-loud, per
+    // this function's contract and unlike `release_all_with`'s warn-only
+    // twin — a caller who asked to be let out is told if it did not happen.
+    match &st {
+        StateFile::Absent => {}
+        StateFile::Present(st) => ops.drop_token(&st.pf_token)?,
+        StateFile::Unusable { pf_token: Some(token) } => ops.drop_token(token)?,
+        StateFile::Unusable { pf_token: None } => warn_unsalvageable_token("standing lockdown-pf-state"),
     }
 
     // State cleared only after a confirmed restore — a failed clear is the only
@@ -1075,8 +1091,23 @@ pub(crate) fn fold_presence(
 /// state file. The pf half asks `pfctl -s labels` for [`LOCKDOWN_PF_LABEL`],
 /// which is the only evidence here independent of `state_dir`.
 pub fn lockdown_cover_presence(state_dir: &Path) -> crate::routing::CoverPresence {
+    lockdown_presence_and_state(state_dir).0
+}
+
+/// [`lockdown_cover_presence`] and the record it was folded from, in ONE read.
+/// `disengage_lockdown` needs both, and taking them separately would let the
+/// gate and the token come from two different reads of the same file — a
+/// `Recorded` presence paired with a record that vanished in between skips
+/// `pfctl -X` for a cover it just confirmed.
+fn lockdown_presence_and_state(
+    state_dir: &Path,
+) -> (
+    crate::routing::CoverPresence,
+    StateFile<lockdown_state::LockdownPfState>,
+) {
     let pf_label = pf_label_answer(pfctl(&["-s", "labels"], None, BestEffortPhase::RecoverCover));
-    fold_presence(pf_label, &lockdown_state::load_presence(state_dir))
+    let file = lockdown_state::load_presence(state_dir);
+    (fold_presence(pf_label, &file), file)
 }
 
 /// Best-effort wrapper for `Drop` (user-stop): disengage and swallow. Drop has
@@ -1135,12 +1166,21 @@ fn drop_token_or_warn(ops: &mut dyn PfOps, token: &str, message: &str) {
 fn drop_salvaged_token_or_warn(ops: &mut dyn PfOps, token: Option<&str>, what: &str, message: &str) {
     match token {
         Some(token) => drop_token_or_warn(ops, token, message),
-        None => tracing::warn!(
-            "{what} file is unusable and no pf token could be read out of it — a pf enable \
-             refcount may be leaked (pf then stays enabled over the canonical /etc/pf.conf, which \
-             blocks nothing, and a reboot resets it)"
-        ),
+        None => warn_unsalvageable_token(what),
     }
+}
+
+/// The disclosure for an unusable record that yielded no token at all — the
+/// one case where nothing can be done about the refcount. Shared by
+/// [`drop_salvaged_token_or_warn`] and by `disengage_lockdown_with`, which
+/// cannot use that helper (it propagates a failed drop rather than warning),
+/// so the two do not drift into disclosing the same leak differently.
+fn warn_unsalvageable_token(what: &str) {
+    tracing::warn!(
+        "{what} file is unusable and no pf token could be read out of it — a pf enable refcount \
+         may be leaked (pf then stays enabled over the canonical /etc/pf.conf, which blocks \
+         nothing, and a reboot resets it)"
+    );
 }
 
 /// The unconditional two-cover clear, factored as a pure sequencer over an
@@ -1313,15 +1353,22 @@ struct RealEngageOps<'a> {
 /// `pfctl -f -` with `text` on stdin, one [`FatalPhase::CoverEngage`]
 /// implementation shared by [`RealEngageOps`] and [`RealCoverRulesetOps`] so
 /// the narrower seam is not a second copy of the shell-out.
-fn real_load_ruleset(text: &str) -> Result<(), RoutingError> {
+///
+/// `pub(super)` for the privileged test module next door, which loads a
+/// deliberately PRE-FIX control ruleset as the positive control for the
+/// mid-stream proof. Not a seam production code may reach for: every
+/// production load goes through one of the two `*Ops` impls above, which is
+/// what gives each its phase.
+pub(super) fn real_load_ruleset(text: &str) -> Result<(), RoutingError> {
     pfctl_status(
         pfctl(&["-f", "-"], Some(text.as_bytes()), FatalPhase::CoverEngage),
         "pfctl load",
     )
 }
 
-/// `pfctl -F states`, same sharing rationale as [`real_load_ruleset`].
-fn real_flush_states() -> Result<(), RoutingError> {
+/// `pfctl -F states`, same sharing rationale — and same `pub(super)` caveat —
+/// as [`real_load_ruleset`].
+pub(super) fn real_flush_states() -> Result<(), RoutingError> {
     pfctl_status(
         pfctl(&["-F", "states"], None, FatalPhase::CoverEngage),
         "pfctl -F states",
