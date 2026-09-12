@@ -103,7 +103,9 @@ before editing; the sections linked below are the authoritative source.
   bound. →
   [CONTRIBUTING.md#bridge-cancellation-contract](CONTRIBUTING.md#bridge-cancellation-contract)
 - **Native-crash observability.** The `tombstone` crate writes a signal-safe
-  crash marker; the next start of the same kind sweeps it. →
+  crash marker; the next start of the same kind sweeps it. On macOS
+  `on_crash` terminates the process instead of returning — see crash.rs's
+  module doc before touching either half. →
   [CONTRIBUTING.md#native-crash-observability-tombstone](CONTRIBUTING.md#native-crash-observability-tombstone)
 - **Route ownership.** Teardown and recovery delete only the `RouteId`s
   `bridge-routes.json` records as installed. On macOS no delete-side qualifier

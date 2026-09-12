@@ -384,6 +384,9 @@ jobs:
     # were reconstructed to. windows/amd64 has never been killed and its 38-run
     # sample still stands.
     #
+    # crash_marker_abort was a confirmed, recurring cause of darwin/amd64
+    # kills — fixed in tombstone (#842); whether 90 can now drop is unmeasured.
+    #
     # These are whole-JOB budgets, shared across build + verify + test. A slow
     # build therefore eats the test steps' headroom — which is exactly how #989
     # happened. The per-step `timeout-minutes` further down decouple the two, so
