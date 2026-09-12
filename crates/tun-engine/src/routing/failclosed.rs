@@ -537,10 +537,8 @@ mod facade_tests;
 #[path = "failclosed/clearance_tests.rs"]
 mod clearance_tests;
 
-// Deliberately NOT platform-gated either, and for the same reason: the mistake
-// it catches is Windows-only, so gating the guard to Windows would put the
-// proof on the same platform as the hazard and nowhere else. It reads the
-// sources off disk, which every lane can do.
+// Same reason as clearance_tests above — a source-tree scan, so every lane can
+// run it.
 #[cfg(test)]
 #[path = "failclosed/boot_time_tripwire_tests.rs"]
 mod boot_time_tripwire_tests;

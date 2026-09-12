@@ -1246,9 +1246,8 @@ pub fn disengage_lockdown(_state_dir: &Path) -> Result<(), RoutingError> {
 
 /// Whether a lockdown disengage may report success. Pure and separated from
 /// the FFI above so the fail-loud rule is a table-tested decision rather than
-/// a discarded return value: the previous body issued every delete as
-/// `let _ = FwpmFilterDeleteByKey0(..)` and returned `Ok` unconditionally, so
-/// an unelevated `hole bridge unlock` reported a host it had not unlocked.
+/// a discarded return value, which is what lets an unelevated `hole bridge
+/// unlock` report a host it had not unlocked.
 ///
 /// Reads [`first_delete_failure`] — the same fold `release_all` uses — so
 /// "which codes are benign" has one answer for both paths.

@@ -110,6 +110,10 @@ tracing-subscriber = { version = "0.3", features = ["fmt"] }
 # rather than one hardcoded `include_str!`, so a flag added in a new submodule
 # cannot slip past it.
 walkdir = "2"
+# ...and lexes them, so `//`, `/* */` and string literals are dropped by the
+# same rules the compiler uses rather than by a hand-rolled approximation of
+# them. Already in the tree (every proc-macro crate pulls it).
+proc-macro2 = "1"
 
 [target.'cfg(target_os = "windows")'.dev-dependencies]
 windows = { version = "0.62", features = [

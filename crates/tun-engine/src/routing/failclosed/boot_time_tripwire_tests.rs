@@ -18,8 +18,20 @@
 //! lives, so moving `proves_empty` fails the guard rather than silently
 //! turning the fold's own mention into a classification and letting an
 //! unclassified install through (bindreams/hole#1003, #1010).
+//!
+//! What it scans for is identifiers, in lexed code — so renaming the symbol at
+//! its `use` does not hide it (`an_aliased_boot_time_flag_still_fires_the_tripwire`),
+//! and neither does spacing, a comment of any shape, or a string literal. The
+//! disclosed residual is a flag that names no symbol at all:
+//! `FWPM_FILTER_FLAGS(0x4)` written as bits installs a boot-time filter that
+//! nothing here can see. Closing that takes a type that cannot hand out the
+//! bits without the [`super::KeyLifetime`] — the compile-time coupling #1010
+//! is the change that can land it, because introducing it here would put both
+//! symbols in production code and leave this guard permanently satisfied.
 
 use std::path::{Path, PathBuf};
+
+use proc_macro2::{Delimiter, Group, TokenStream, TokenTree};
 
 /// The crate's production sources on disk, sorted.
 ///
@@ -54,17 +66,82 @@ fn is_production_source(path: &Path) -> bool {
     name.ends_with(".rs") && !name.ends_with("_tests.rs")
 }
 
-/// One source with its comments stripped.
+/// One source's executing tokens: what the compiler acts on, with every form
+/// of non-executing text gone.
 ///
 /// The failclosed modules' docs discuss the boot-time flag by name, and a
 /// guard that counted prose would fire on documentation alone — the fastest
-/// way to get a tripwire deleted rather than obeyed.
-fn code(path: &Path) -> String {
+/// way to get a tripwire deleted rather than obeyed. Lexing is what decides
+/// which mentions those are, because there are four kinds and a line filter
+/// recognises one: `//` owning a line, `//` trailing a line of code,
+/// `/* ... */`, and a string literal. The lexer drops the first three
+/// outright; `///` and `//!` survive it as `#[doc = "..."]` attributes, which
+/// [`flatten`] drops; and every predicate below reads identifiers, so a
+/// literal is never examined. A missed one is not a false alarm but a silent
+/// pass — it makes the classification half read true with no classification
+/// arm in existence, which satisfies the equality over an UNCLASSIFIED
+/// boot-time install.
+///
+/// A lex failure is a panic, for the reason [`production_sources_under`]
+/// gives: a scan that read nothing must never read as a scan that found
+/// nothing.
+fn tokens(path: &Path) -> Vec<TokenTree> {
     let text = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
-    text.lines()
-        .filter(|l| !l.trim_start().starts_with("//"))
-        .collect::<Vec<_>>()
-        .join("\n")
+    let stream: TokenStream = text.parse().unwrap_or_else(|e| panic!("lex {}: {e}", path.display()));
+    let mut out = Vec::new();
+    flatten(stream, &mut out);
+    out
+}
+
+/// `stream`'s tokens depth-first, with doc attributes dropped.
+///
+/// Flattened rather than walked as a tree so an adjacency is visible wherever
+/// it sits, including inside a macro's delimiters — `matches!(k,
+/// KeyLifetime::BootTime)` classifies just as much as a bare match arm does.
+fn flatten(stream: TokenStream, out: &mut Vec<TokenTree>) {
+    let mut it = stream.into_iter().peekable();
+    while let Some(tt) = it.next() {
+        if matches!(&tt, TokenTree::Punct(p) if p.as_char() == '#') {
+            let bang = it.next_if(|t| matches!(t, TokenTree::Punct(p) if p.as_char() == '!'));
+            if it
+                .peek()
+                .is_some_and(|t| matches!(t, TokenTree::Group(g) if is_doc_attr(g)))
+            {
+                it.next();
+                continue;
+            }
+            out.push(tt);
+            out.extend(bang);
+            continue;
+        }
+        match tt {
+            TokenTree::Group(g) => flatten(g.stream(), out),
+            other => out.push(other),
+        }
+    }
+}
+
+/// Whether a group is the body of a `#[doc = "..."]` attribute — a `///` or
+/// `//!` comment as the lexer rewrote it.
+fn is_doc_attr(g: &Group) -> bool {
+    g.delimiter() == Delimiter::Bracket
+        && matches!(g.stream().into_iter().next(), Some(TokenTree::Ident(i)) if i == "doc")
+}
+
+/// Whether executing code names this identifier.
+///
+/// An identifier, not a spelling: `use ... FWPM_FILTER_FLAG_BOOTTIME as
+/// BOOT_FLAG` names it at the import whichever file spends the alias, and
+/// `KeyLifetime :: BootTime` is the same three tokens however it is spaced.
+fn names(tokens: &[TokenTree], ident: &str) -> bool {
+    tokens.iter().any(|t| matches!(t, TokenTree::Ident(i) if i == ident))
+}
+
+/// Whether executing code defines a function by this name.
+fn defines_fn(tokens: &[TokenTree], name: &str) -> bool {
+    tokens
+        .windows(2)
+        .any(|w| matches!(&w[0], TokenTree::Ident(i) if i == "fn") && matches!(&w[1], TokenTree::Ident(i) if i == name))
 }
 
 /// The sources that DEFINE the lifetime fold, found by the definition rather
@@ -77,7 +154,7 @@ fn code(path: &Path) -> String {
 fn decision_sites(sources: &[PathBuf]) -> Vec<PathBuf> {
     sources
         .iter()
-        .filter(|p| code(p).contains("fn proves_empty"))
+        .filter(|p| defines_fn(&tokens(p), "proves_empty"))
         .cloned()
         .collect()
 }
@@ -87,11 +164,17 @@ fn decision_sites(sources: &[PathBuf]) -> Vec<PathBuf> {
 /// The install half spans every source given; the classification half skips
 /// `decision_site`, for the reason [`decision_sites`] gives. Asymmetric on
 /// purpose: an install in the file that defines the fold must still fire.
+///
+/// The classification half looks for the bare `BootTime` rather than the
+/// qualified path: a variant reached through a `use` of it is a classification
+/// too, and an over-wide classification half can only fail this guard loudly,
+/// while an over-narrow one passes it in silence.
 fn boot_time_halves(sources: &[PathBuf], decision_site: &Path) -> (bool, bool) {
-    let joined = |paths: Vec<&PathBuf>| paths.into_iter().map(|p| code(p)).collect::<Vec<_>>().join("\n");
-    let installs = joined(sources.iter().collect()).contains("FWPM_FILTER_FLAG_BOOTTIME");
-    let classifies =
-        joined(sources.iter().filter(|p| p.as_path() != decision_site).collect()).contains("KeyLifetime::BootTime");
+    let installs = sources.iter().any(|p| names(&tokens(p), "FWPM_FILTER_FLAG_BOOTTIME"));
+    let classifies = sources
+        .iter()
+        .filter(|p| p.as_path() != decision_site)
+        .any(|p| names(&tokens(p), "BootTime"));
     (installs, classifies)
 }
 
@@ -259,6 +342,87 @@ fn a_boot_time_symbol_named_only_in_prose_does_not_fire_the_tripwire() {
     assert_eq!(
         boot_time_halves(&production_sources_under(dir), &dir.join("failclosed.rs")),
         (false, false)
+    );
+}
+
+#[skuld::test]
+fn a_boot_time_symbol_in_a_trailing_comment_does_not_fire_the_tripwire() {
+    // A comment does not have to own its line. The line filter this scan
+    // replaced only recognised one that did, so a trailing `// ...` made the
+    // classification half read true with no classification arm in existence —
+    // and an UNCLASSIFIED boot-time install then satisfied the equality.
+    let root = tempfile::tempdir().expect("tempdir");
+    let dir = root.path();
+    std::fs::write(
+        dir.join("windows.rs"),
+        "let flags = 0; // FWPM_FILTER_FLAG_BOOTTIME is not set here\n\
+         let l = KeyLifetime::Persistent; // not KeyLifetime::BootTime\n",
+    )
+    .expect("write");
+
+    assert_eq!(
+        boot_time_halves(&production_sources_under(dir), &dir.join("failclosed.rs")),
+        (false, false)
+    );
+}
+
+#[skuld::test]
+fn a_boot_time_symbol_in_a_block_comment_does_not_fire_the_tripwire() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let dir = root.path();
+    std::fs::write(
+        dir.join("windows.rs"),
+        "/* FWPM_FILTER_FLAG_BOOTTIME */\n\
+         fn f() {}\n\
+         /* a /* nested */ note about KeyLifetime::BootTime */\n",
+    )
+    .expect("write");
+
+    assert_eq!(
+        boot_time_halves(&production_sources_under(dir), &dir.join("failclosed.rs")),
+        (false, false)
+    );
+}
+
+#[skuld::test]
+fn a_boot_time_symbol_in_a_string_literal_does_not_fire_the_tripwire() {
+    // The third way a symbol appears in text that does not execute. A key's
+    // operator-facing `label` is a string sitting right beside its lifetime,
+    // so this is the one a real edit is most likely to produce.
+    let root = tempfile::tempdir().expect("tempdir");
+    let dir = root.path();
+    std::fs::write(
+        dir.join("windows.rs"),
+        "let label = \"FWPM_FILTER_FLAG_BOOTTIME\";\n\
+         let doc = \"see KeyLifetime::BootTime\";\n",
+    )
+    .expect("write");
+
+    assert_eq!(
+        boot_time_halves(&production_sources_under(dir), &dir.join("failclosed.rs")),
+        (false, false)
+    );
+}
+
+#[skuld::test]
+fn an_aliased_boot_time_flag_still_fires_the_tripwire() {
+    // Renaming the symbol at the `use` does not hide it: the import names it
+    // in full, and the install half spans every production source with no
+    // exclusion, so the `use` line is scanned whether or not it sits in the
+    // file that spends the alias.
+    let root = tempfile::tempdir().expect("tempdir");
+    let dir = root.path();
+    std::fs::write(
+        dir.join("imports.rs"),
+        "use windows::Win32::NetworkManagement::WindowsFilteringPlatform::\n\
+         FWPM_FILTER_FLAG_BOOTTIME as BOOT_FLAG;\n",
+    )
+    .expect("write");
+    std::fs::write(dir.join("windows.rs"), "flags |= BOOT_FLAG.0;\n").expect("write");
+
+    assert_eq!(
+        boot_time_halves(&production_sources_under(dir), &dir.join("failclosed.rs")),
+        (true, false)
     );
 }
 

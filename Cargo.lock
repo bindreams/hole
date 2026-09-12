@@ -8868,6 +8868,7 @@ dependencies = [
  "garter",
  "hole-test-observability",
  "libc",
+ "proc-macro2",
  "rand 0.10.2",
  "serde",
  "serde_json",
