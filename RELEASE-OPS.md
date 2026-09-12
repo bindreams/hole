@@ -51,6 +51,23 @@ What this means for rollback:
 1. Time-to-rollback equals time-to-cut-hotfix. There is no kill switch. For severe bugs, notify users out-of-band (GitHub release announcement, README banner) while the hotfix is in flight.
 1. Do not publish a hotfix with a lower version number than the defective one. The version-comparison check would skip it.
 
+## Windows uninstall refuses to complete
+
+The MSI's `BridgeRelease` custom action releases every fail-closed cover and disarms the kill switch before `RemoveFiles` deletes `hole.exe`. It is the one uninstall action with `Return="check"`, because the WFP filters are `FWPM_FILTER_FLAG_PERSISTENT`: leaving them behind is a host that is blocked on every boot with no binary left to remove them ([#1003](https://github.com/bindreams/hole/issues/1003)).
+
+So an uninstall that aborts at `BridgeRelease` is the gate working. Fix the cause first — it is almost always one of:
+
+1. The Base Filtering Engine service is not running (`sc query BFE`). Start it and retry.
+1. `hole.exe` was quarantined by AV, so the custom action could not launch at all. Restore it and retry.
+
+If the release can never succeed, force the uninstall past the gate:
+
+```
+msiexec /x hole.msi HOLE_KEEP_COVERS=1
+```
+
+**This leaves the host blocked.** The property skips the release entirely, and nothing shipped with Windows can undo it: `netsh wfp` is diagnostics-only (`capture`, `dump`, `help`, `set`, `show` — [no delete verb](https://learn.microsoft.com/windows-server/administration/windows-commands/netsh-wfp)), so `netsh wfp show filters` can show Hole's provider but not remove it. Removing a WFP filter takes an FWPM call, and `hole.exe` is the only caller of one on that host. So use this only after the product has been reinstalled at least once and `hole bridge release-covers` (elevated) has been tried and cannot succeed — and expect to reinstall Hole again to clear the block.
+
 ## Minisign key rotation (hole only)
 
 Hole's release `SHA256SUMS` is signed with a long-lived minisign key. **Two embedded copies of the public key must stay in sync**:

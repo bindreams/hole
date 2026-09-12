@@ -320,6 +320,15 @@ pub fn lockdown_cover_presence(state_dir: &Path) -> crate::routing::CoverPresenc
 ///    is the one case where `Ok` can be reported over a still-blocked host —
 ///    it is not a violation of this clause, since the cover left no evidence
 ///    to detect.
+///
+///    **`Ok` is therefore qualified, not absolute**, and [`Clearance`] — the
+///    `Ok` payload — carries the qualification. `Ok` says every delete this
+///    call issued either removed an object or came back empty;
+///    [`Clearance::is_proven`] is the narrower claim that an empty answer
+///    *proved* the key carries nothing. The two differ for exactly one key
+///    class, [`KeyLifetime::BootTime`]. The uninstall gate is the caller that
+///    must read the narrower one: it is about to delete the only binary that
+///    could act on the difference.
 /// 5. **Bookkeeping is best-effort, except the state-file clear.** The macOS
 ///    `pfctl -X` refcount drop and the Windows sublayer/provider delete log a
 ///    warning on failure and do not fail the call. A cover's state-file clear
@@ -331,8 +340,174 @@ pub fn lockdown_cover_presence(state_dir: &Path) -> crate::routing::CoverPresenc
 /// Windows keeps no cover state file at all: the filter set is compiled-in
 /// fixed GUIDs, so there is no bookkeeping that can be corrupt or
 /// version-skewed and nothing to erase — only GUID sweeps run there.
-pub fn release_all(state_dir: &Path) -> Result<(), RoutingError> {
+pub fn release_all(state_dir: &Path) -> Result<Clearance, RoutingError> {
     platform::release_all(state_dir)
+}
+
+// Release clearance ===================================================================================================
+
+/// Which record backs a fail-closed filter key, and therefore what a
+/// delete-by-key that finds nothing PROVES about it.
+///
+/// This is the whole reason [`Clearance`] exists. A delete-by-key reports one
+/// of three things — removed, not-found, or a genuine failure — and the
+/// release path has always treated not-found as benign. For one key class
+/// that reading is sound; for the other it is an assumption.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyLifetime {
+    /// The record a by-key delete addresses is the key's ONLY record.
+    ///
+    /// Windows `FWPM_FILTER_FLAG_PERSISTENT`: BFE's store is the record, BFE
+    /// re-adds the runtime object from it every boot, and the delete removes
+    /// the store entry. macOS pf: the ruleset does not survive a reboot at
+    /// all. Either way "not found" proves the key carries nothing.
+    Persistent,
+    /// The record a by-key delete addresses may not be the key's only record.
+    ///
+    /// Windows `FWPM_FILTER_FLAG_BOOTTIME`: the runtime object exists only
+    /// between kernel start and Base Filtering Engine start, so on any boot
+    /// where it is not live the key answers "not found" **whether or not a
+    /// boot-time policy record is still provisioned behind it**. Whether such
+    /// a record survives a by-key delete — or is re-provisioned at later
+    /// boots at all — is unmeasured: it needs a reboot-capable elevated lane
+    /// that does not exist. See CONTRIBUTING.md's fail-closed residuals.
+    ///
+    /// The harm is bounded: BFE's start is what takes a boot-time filter out
+    /// of effect, so a stranded record blocks egress across the boot→BFE
+    /// window only. How long that window is has not been measured here — the
+    /// claim is that it is bounded and ends before the network stack is
+    /// generally usable, not any particular duration. It is not permanent
+    /// network loss, which is why an unproven key does not fail a release.
+    /// What it must not do is read as proof.
+    BootTime,
+}
+
+/// What one delete-by-key observed about its key, keyed on the CAUSE it
+/// reported rather than on which consequence the caller happens to share.
+///
+/// Three return codes, three variants. Deriving one of them from the absence
+/// of another — "not `NotFound`, therefore `Removed`" — folds an access
+/// denial, a transient RPC failure and a genuine removal into a single
+/// verdict, and that verdict is what the MSI deletes `hole.exe` on the
+/// strength of. See CLAUDE.md's "per-variant policy lives on the type".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyOutcome {
+    /// The delete removed a live object (`ERROR_SUCCESS`). Proof of removal
+    /// for ANY lifetime — this is the half #1010 measured for boot-time keys
+    /// (the filter leaves the `BOOTTIME_ONLY` view).
+    Removed,
+    /// The delete found nothing on the key (`FWP_E_FILTER_NOT_FOUND`). Proof
+    /// of absence only for [`KeyLifetime::Persistent`].
+    NotFound,
+    /// The delete neither removed an object nor found the key empty: the OS
+    /// refused or failed (not elevated, engine error, RPC failure). Proof of
+    /// NOTHING, for any lifetime.
+    ///
+    /// Such a code also fails the release outright, so on the Windows sweep
+    /// path this variant does not survive to the clearance fold. It exists
+    /// anyway because the fold must be total over its own input — a verdict
+    /// that is only correct while a *different* function short-circuits first
+    /// is the coupling that lets an unproven state masquerade as proof the
+    /// moment either side moves.
+    Failed,
+}
+
+/// One key's contribution to a release verdict.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KeyObservation {
+    /// Operator-facing label. Named, never counted: with the binary gone an
+    /// operator has only the label to look the key up by.
+    pub key: &'static str,
+    pub lifetime: KeyLifetime,
+    pub outcome: KeyOutcome,
+}
+
+impl KeyObservation {
+    /// Whether this observation PROVES its key now carries nothing.
+    ///
+    /// The whole rule, in one exhaustive match on the pair, so no call site
+    /// re-derives it and no variant is grouped with another because they
+    /// happen to share a consequence.
+    pub fn proves_empty(&self) -> bool {
+        match (self.lifetime, self.outcome) {
+            // A removal we watched happen is proof regardless of lifetime.
+            (_, KeyOutcome::Removed) => true,
+            // The by-key delete addresses a persistent key's only record, so
+            // an empty answer proves the key carries nothing.
+            (KeyLifetime::Persistent, KeyOutcome::NotFound) => true,
+            // A boot-time key answers empty on any boot where its runtime
+            // object is not live, whether or not a record survives behind it.
+            (KeyLifetime::BootTime, KeyOutcome::NotFound) => false,
+            // The delete never got an answer about the key at all.
+            (_, KeyOutcome::Failed) => false,
+        }
+    }
+}
+
+/// What a [`release_all`] sweep PROVED, as distinct from what it attempted.
+///
+/// `release_all` returning `Ok` means no delete failed. It does **not** mean
+/// every cover key is demonstrably empty: a [`KeyLifetime::BootTime`] key that
+/// answered [`KeyOutcome::NotFound`] is consistent both with "never installed"
+/// and with "installed in an earlier boot, policy record still provisioned",
+/// and nothing this crate can call separates them.
+///
+/// Collapsing those into a bare `Ok` is the #1003 hazard recreated for the
+/// pre-BFE window: the MSI runs `bridge release-covers` under `Return="check"`,
+/// reads the exit code as "safe to delete the binary", and `RemoveFiles` then
+/// takes away the only thing that could have acted on the difference. So the
+/// verdict carries the qualification instead of dropping it, and
+/// `#[must_use]` keeps a caller from re-collapsing it by accident.
+///
+/// **This does not fail the release.** See [`KeyLifetime::BootTime`] for the
+/// bound on the harm: refusing an uninstall over a seconds-long boot-window
+/// block would trade it for a permanently unremovable product, which is
+/// strictly worse. The gate's job is to stop claiming proof it does not have,
+/// not to withhold an uninstall.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[must_use = "the uninstall gate reads this; dropping it restores the silent `Ok` of #1003"]
+pub struct Clearance {
+    unproven: Vec<&'static str>,
+}
+
+impl Clearance {
+    /// The verdict for a sweep with nothing left unproven — every platform
+    /// whose covers are all [`KeyLifetime::Persistent`], which today is macOS
+    /// and every Windows key.
+    pub fn proven() -> Self {
+        Self { unproven: Vec::new() }
+    }
+
+    /// Fold per-key observations into a verdict. Pure and total over the
+    /// slice: it inspects every observation rather than stopping at the first
+    /// unproven one, so the operator message can name all of them.
+    ///
+    /// The per-observation rule is [`KeyObservation::proves_empty`] and is not
+    /// restated here — an observation is unproven iff it did not prove itself
+    /// empty, so a new [`KeyOutcome`] or [`KeyLifetime`] variant cannot slip
+    /// past this fold by failing to match a filter predicate written here.
+    pub fn from_observations(observations: &[KeyObservation]) -> Self {
+        Self {
+            unproven: observations
+                .iter()
+                .filter(|o| !o.proves_empty())
+                .map(|o| o.key)
+                .collect(),
+        }
+    }
+
+    /// Whether the sweep proved every key it touched is empty. `false` does
+    /// NOT mean a cover is present — it means one could not be ruled out.
+    pub fn is_proven(&self) -> bool {
+        self.unproven.is_empty()
+    }
+
+    /// The keys whose absence went unproven, in sweep order. Not deduplicated:
+    /// distinct keys share a label, and collapsing them would under-report how
+    /// much of the sweep was unproven.
+    pub fn unproven_keys(&self) -> &[&'static str] {
+        &self.unproven
+    }
 }
 
 /// Windows-only test helper: resolve the LUID then build the spec, exercising
@@ -353,6 +528,20 @@ pub(crate) fn build_lockdown_spec_for_test(
 #[cfg(all(test, target_os = "windows"))]
 #[path = "failclosed/facade_tests.rs"]
 mod facade_tests;
+
+// Deliberately NOT platform-gated. The clearance fold is the decision the
+// uninstall gate reads, and the key class it exists for is Windows-only — so
+// gating its tests to Windows would put the proof on the same platform as the
+// hazard and nowhere else. Pure, so every lane can falsify it.
+#[cfg(test)]
+#[path = "failclosed/clearance_tests.rs"]
+mod clearance_tests;
+
+// Same reason as clearance_tests above — a source-tree scan, so every lane can
+// run it.
+#[cfg(test)]
+#[path = "failclosed/boot_time_tripwire_tests.rs"]
+mod boot_time_tripwire_tests;
 
 // Privileged-lane real-engage verification (#527): engages the REAL OS cover and
 // asserts it blocks egress. Gated to the elevated `hole-tests` TUN lane by the

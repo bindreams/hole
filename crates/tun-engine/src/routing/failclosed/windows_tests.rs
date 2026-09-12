@@ -3,6 +3,16 @@ use std::net::IpAddr;
 
 use crate::GLOBAL_NET_STATE;
 
+// GUID-only views of the swept key lists. The production lists carry each
+// key's `KeyLifetime` (see `SweptKey`); the tests below are about GUID set
+// membership and disjointness, which the lifetime does not bear on.
+fn swept_lockdown_guids() -> Vec<GUID> {
+    swept_lockdown_keys().into_iter().map(|k| k.guid).collect()
+}
+fn swept_transient_guids() -> Vec<GUID> {
+    swept_transient_keys().into_iter().map(|k| k.guid).collect()
+}
+
 fn v4() -> IpAddr {
     "203.0.113.7".parse().unwrap()
 }
@@ -678,6 +688,157 @@ fn release_all_first_delete_failure_reports_the_first_real_error_and_inspects_ev
     assert!(
         first_delete_failure(&clean).is_none(),
         "success and not-found must never be treated as an error"
+    );
+}
+
+// Clearance wiring ----------------------------------------------------------------------------------------------------
+
+fn key(label: &'static str, lifetime: KeyLifetime) -> SweptKey {
+    SweptKey {
+        guid: GUID::from_u128(0x0000_0000_0000_0000_0000_0000_0000_0001),
+        label,
+        lifetime,
+    }
+}
+
+#[skuld::test]
+fn a_code_that_is_neither_success_nor_not_found_is_a_failure_not_a_removal() {
+    // The #1003/F4 anti-pattern, at the one place a raw DWORD becomes a
+    // verdict. `ERROR_ACCESS_DENIED` (5) is the live example: an unelevated
+    // sweep, an object still installed, and — under a "not NotFound therefore
+    // Removed" mapping — a `KeyOutcome::Removed` that proves the key empty.
+    assert_eq!(classify_delete_code(5), KeyOutcome::Failed);
+    assert_eq!(classify_delete_code(0xDEAD_BEEF), KeyOutcome::Failed);
+    assert_eq!(classify_delete_code(ERROR_SUCCESS.0), KeyOutcome::Removed);
+    assert_eq!(classify_delete_code(FWP_E_FILTER_NOT_FOUND_DWORD), KeyOutcome::NotFound);
+
+    // ...and that failure can never reach the gate as proof, whatever the
+    // key's lifetime.
+    let swept = [
+        (key("persistent", KeyLifetime::Persistent), 5u32),
+        (key("boot-time", KeyLifetime::BootTime), 5u32),
+    ];
+    let clearance = Clearance::from_observations(&observations(&swept));
+    assert!(!clearance.is_proven());
+    assert_eq!(clearance.unproven_keys(), ["persistent", "boot-time"]);
+}
+
+// `disengage_lockdown`'s fail-loud verdict ----------------------------------------------------------------------------
+//
+// `hole bridge unlock` flips the persisted kill-switch intent off ONLY on this
+// function's success (`cutover::unlock_with`). An `Ok` over a host it did not
+// unlock leaves the cover engaged with the intent reading "off" — egress
+// blocked and nothing left that will reconcile it.
+
+#[skuld::test]
+fn a_refused_delete_fails_the_disengage_instead_of_reporting_success() {
+    // ERROR_ACCESS_DENIED: the unelevated run. FWPM opens the engine without
+    // elevation but refuses the write, so this is the reachable case, not an
+    // exotic one. The previous body discarded every code and returned Ok.
+    let err = disengage_verdict(None, &[("lockdown block-all V4", 5)]).expect_err("a refused delete must fail loud");
+    assert!(
+        format!("{err}").contains("lockdown block-all V4"),
+        "the failing key must be named: {err}"
+    );
+}
+
+#[skuld::test]
+fn an_unreachable_firewall_and_a_refused_delete_are_distinct_failures() {
+    let unreachable = disengage_verdict(Some(0x8032_0001), &[]).expect_err("engine open failure");
+    assert!(
+        format!("{unreachable}").contains("could not be reached"),
+        "{unreachable}"
+    );
+    let refused = disengage_verdict(None, &[("k", 5)]).expect_err("refused delete");
+    assert_ne!(
+        format!("{unreachable}"),
+        format!("{refused}"),
+        "the two causes must not collapse into one message"
+    );
+}
+
+#[skuld::test]
+fn a_clean_or_already_swept_host_disengages_successfully() {
+    // Idempotency: a host that never engaged answers not-found on every key,
+    // and that must stay an unqualified success — the escape hatch is meant to
+    // be runnable at any time.
+    assert!(disengage_verdict(
+        None,
+        &[
+            ("a", ERROR_SUCCESS.0),
+            ("b", FWP_E_FILTER_NOT_FOUND_DWORD),
+            ("c", FWP_E_FILTER_NOT_FOUND_DWORD),
+        ]
+    )
+    .is_ok());
+    assert!(disengage_verdict(None, &[]).is_ok());
+}
+
+#[skuld::test]
+fn the_failure_verdict_and_the_clearance_read_the_same_classifier() {
+    // Two folds, one classifier: a code `first_delete_failure` calls a genuine
+    // failure is exactly a code `observations` refuses to call a removal. Were
+    // they independent, a code added to one and not the other would fail the
+    // release while the clearance still reported it proven — or, worse, the
+    // reverse.
+    for code in [ERROR_SUCCESS.0, FWP_E_FILTER_NOT_FOUND_DWORD, 5, 0x8032_0009] {
+        let fails = first_delete_failure(&[("k", code)]).is_some();
+        let observed_failed = classify_delete_code(code) == KeyOutcome::Failed;
+        assert_eq!(fails, observed_failed, "code 0x{code:08x}");
+    }
+}
+
+#[skuld::test]
+fn observations_map_not_found_apart_from_a_real_removal() {
+    // The FWPM half of the gate: `FWP_E_FILTER_NOT_FOUND` is the only code
+    // that means "the key answered empty", and `ERROR_SUCCESS` the only one
+    // that means "an object was removed".
+    let swept = [
+        (key("persistent", KeyLifetime::Persistent), ERROR_SUCCESS.0),
+        (key("persistent", KeyLifetime::Persistent), FWP_E_FILTER_NOT_FOUND_DWORD),
+        (key("boot-time", KeyLifetime::BootTime), ERROR_SUCCESS.0),
+        (key("boot-time", KeyLifetime::BootTime), FWP_E_FILTER_NOT_FOUND_DWORD),
+    ];
+    let obs = observations(&swept);
+    assert_eq!(
+        obs.iter().map(|o| o.outcome).collect::<Vec<_>>(),
+        [
+            KeyOutcome::Removed,
+            KeyOutcome::NotFound,
+            KeyOutcome::Removed,
+            KeyOutcome::NotFound
+        ]
+    );
+    // ...and the lifetime rides through untouched, so the fold sees the class
+    // the sweep list declared rather than one re-derived here.
+    assert_eq!(
+        obs.iter().map(|o| o.lifetime).collect::<Vec<_>>(),
+        [
+            KeyLifetime::Persistent,
+            KeyLifetime::Persistent,
+            KeyLifetime::BootTime,
+            KeyLifetime::BootTime
+        ]
+    );
+}
+
+#[skuld::test]
+fn a_sweep_of_todays_keys_proves_every_one_of_them_empty() {
+    // End-to-end over the REAL sweep lists with the "clean host" answer
+    // (`FWP_E_FILTER_NOT_FOUND` everywhere): every key Hole installs today is
+    // PERSISTENT, so a clean host is fully proven and `bridge release-covers`
+    // reports an unqualified clearance. This is what must stop being true the
+    // moment a boot-time key joins the sweep — see the tripwire below.
+    let swept: Vec<(SweptKey, u32)> = swept_lockdown_keys()
+        .into_iter()
+        .chain(swept_transient_keys())
+        .map(|k| (k, FWP_E_FILTER_NOT_FOUND_DWORD))
+        .collect();
+    let clearance = Clearance::from_observations(&observations(&swept));
+    assert!(
+        clearance.is_proven(),
+        "every key Hole sweeps today is persistent, so a clean host is provably clear: {:?}",
+        clearance.unproven_keys()
     );
 }
 
