@@ -840,8 +840,21 @@ pub enum Action {
 /// the flag came from. [`Self::key_lifetime`] reads it back,
 /// [`Self::filter_flags`] is the only route in this crate from a lifetime to
 /// the flag bits, and there is no constructor that hands out the bits without
-/// it — so "install a boot-time filter without classifying its key" is not a
-/// mistake this vocabulary can express, rather than one a guard has to catch.
+/// it — so WITHIN ONE VALUE, the flag and the classification cannot disagree.
+///
+/// That is all the type delivers, and it is less than the drift it was built
+/// against: install and sweep pick their own value. `build_lockdown_spec`
+/// stamps one; [`swept_lockdown_keys`] writes a second, and for the fixed
+/// lockdown GUIDs and the App-ID slots that second one is a bare
+/// [`Self::PERSISTENT`] literal with nothing tying it to the first. A new
+/// filter installed [`Self::BOOT_TIME`] and swept `PERSISTENT` therefore still
+/// compiles. Only the twins are unrepresentable-wrong: one
+/// [`LOCKDOWN_BOOTTIME_TWINS`] entry feeds both sites through
+/// `BootTimeTwin::LIFETIME`. Everything else is caught by a guard —
+/// `every_lockdown_filter_is_swept_under_the_lifetime_it_is_installed_with`
+/// and `every_transient_filter_is_swept_under_the_lifetime_it_is_installed_with`
+/// in `windows_tests.rs`, which compare the two lists filter by filter. A new
+/// spec needs its own such guard; the type will not carry it.
 ///
 /// A newtype over [`KeyLifetime`] rather than a second enum for the same
 /// reason: two enums would have to be kept in step by a match somebody writes,

@@ -287,3 +287,29 @@ allow-invalid = true
 path = "windows::Win32::NetworkManagement::WindowsFilteringPlatform::FwpmFilterGetByKey0"
 reason = "Lockdown cover presence probe must go through `routing::failclosed::lockdown_cover_presence`. Only `failclosed/windows.rs` may call FWPM. See #881."
 allow-invalid = true
+
+# The enumeration family is the ONLY read that can see a BOOT-TIME filter:
+# `FWP_FILTER_ENUM_FLAG_BOOTTIME_ONLY` selects a view the by-key and default
+# enumeration reads both exclude. That makes it the API a provider-scoped sweep
+# of boot-time leftovers is built out of (#1008, which #1010's RELEASE-OPS ship
+# blocker and downgrade-strand residual both depend on), and the reason the
+# boot-time tripwire's residual chain can argue raw `FWPM_FILTER_FLAG_BOOTTIME`
+# bits materialised outside `build_lockdown_spec` have nowhere to be spent.
+# Neither holds if the family can be called from anywhere. Same two sanctioned
+# sites as the rest of FWPM; `enum_boottime` in `failclosed/windows.rs` carries
+# the per-site `#[allow]`.
+
+[[disallowed-methods]]
+path = "windows::Win32::NetworkManagement::WindowsFilteringPlatform::FwpmFilterCreateEnumHandle0"
+reason = "The boot-time filter view (`FWP_FILTER_ENUM_FLAG_BOOTTIME_ONLY`) must be read through `routing::failclosed`'s `enum_boottime`. Only `failclosed/windows.rs` and `dns_confine/windows.rs` may call FWPM. See bindreams/hole#468, #846, #1008."
+allow-invalid = true
+
+[[disallowed-methods]]
+path = "windows::Win32::NetworkManagement::WindowsFilteringPlatform::FwpmFilterEnum0"
+reason = "The boot-time filter view (`FWP_FILTER_ENUM_FLAG_BOOTTIME_ONLY`) must be read through `routing::failclosed`'s `enum_boottime`. Only `failclosed/windows.rs` and `dns_confine/windows.rs` may call FWPM. See bindreams/hole#468, #846, #1008."
+allow-invalid = true
+
+[[disallowed-methods]]
+path = "windows::Win32::NetworkManagement::WindowsFilteringPlatform::FwpmFilterDestroyEnumHandle0"
+reason = "The boot-time filter view (`FWP_FILTER_ENUM_FLAG_BOOTTIME_ONLY`) must be read through `routing::failclosed`'s `enum_boottime`. Only `failclosed/windows.rs` and `dns_confine/windows.rs` may call FWPM. See bindreams/hole#468, #846, #1008."
+allow-invalid = true
