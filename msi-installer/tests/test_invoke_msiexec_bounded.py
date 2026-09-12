@@ -8,6 +8,7 @@ transaction. Windows-only: the script uses Get-Service/Get-CimInstance,
 which pwsh only implements on Windows.
 """
 
+import os
 import platform
 import re
 import subprocess
@@ -25,12 +26,19 @@ pytestmark = pytest.mark.skipif(
 )
 
 SCRIPT_PATH = REPO_ROOT / ".github" / "scripts" / "invoke-msiexec-bounded.ps1"
+HELPERS_PATH = REPO_ROOT / ".github" / "scripts" / "wedge-diagnostics.ps1"
+
+# The `throw` text itself. Asserting the bare word "wedged" proves nothing:
+# it also appears in the "killing wedged process tree" header and in the
+# `wedged` stack-capture label, both of which print before the throw.
+WEDGE_THROW = "wedged: did not exit within"
 
 DIAGNOSTIC_HEADERS = [
     "--- MSI log tail:",
     "--- HoleBridge service state ---",
     "--- hole.exe processes ---",
     "--- msiexec process tree ---",
+    "--- native thread stacks ---",
 ]
 
 
@@ -39,10 +47,13 @@ def _ps_quote(value: str) -> str:
     return "'" + value.replace("'", "''") + "'"
 
 
-def _run_script(*,
-                params: dict[str, str | None],
-                exe_args: list[str] | None = None,
-                timeout: float = 60) -> subprocess.CompletedProcess[str]:
+def _run_script(
+    *,
+    params: dict[str, str | None],
+    exe_args: list[str] | None = None,
+    timeout: float = 60,
+    env: dict[str, str] | None = None
+) -> subprocess.CompletedProcess[str]:
     """Invoke the script via `& <path> -K V ...`, built as a -Command string.
 
     A -Command call with an explicit `@(...)` array literal is used instead of
@@ -68,11 +79,51 @@ def _run_script(*,
         capture_output=True,
         text=True,
         timeout=timeout,
+        env=env,
     )
 
 
 def _python_exe_args(*code: str) -> list[str]:
     return ["-c", *code]
+
+
+def _kill_processes_matching(command_line_fragment: str) -> None:
+    """Best-effort cleanup of stand-ins a failing script may have orphaned.
+
+    Matched on command line rather than name so it can only ever hit processes
+    launched from this test's own tmp_path -- and `$PID` is excluded because
+    this very command line contains the fragment it matches on, so without it
+    the cleanup can kill itself before reaching the orphan.
+    """
+    quoted = command_line_fragment.replace("'", "''")
+    subprocess.run(
+        [
+            "pwsh",
+            "-NoProfile",
+            "-Command",
+            "Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | "
+            f"Where-Object {{ $_.ProcessId -ne $PID -and $_.CommandLine -and $_.CommandLine.Contains('{quoted}') }} | "
+            "ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }",
+        ],
+        capture_output=True,
+        timeout=60,
+    )
+
+
+def _real_cdb_path() -> Path:
+    """The debugger the script itself would find. Fails rather than skips when
+    the SDK's Debugging Tools are absent -- see the `cdb` marker."""
+    candidates = [
+        Path(r"C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\cdb.exe"),
+        Path(r"C:\Program Files\Windows Kits\10\Debuggers\x64\cdb.exe"),
+    ]
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    raise AssertionError(
+        f"cdb.exe not found in {[str(c) for c in candidates]}; install the Windows SDK's "
+        "OptionId.WindowsDesktopDebuggers feature, or deselect with -m 'not cdb'"
+    )
 
 
 # Wedge branch =========================================================================================================
@@ -93,6 +144,14 @@ def test_wedge_throws_within_bound_and_emits_all_diagnostics(tmp_path: Path) -> 
             "LogPath": str(log_path),
             "BoundMinutes": str(bound_minutes),
             "ExePath": sys.executable,
+            # Zero budget: this test is about the other diagnostics and the
+            # kill, and a real cdb attach would dominate its runtime. The
+            # capture itself is covered below. The debugger is named but never
+            # launched -- with no budget left the loop skips before starting
+            # it -- which keeps this off the cdb-absent fallback path, whose
+            # failure would otherwise be reported here as the wrong thing.
+            "StackCaptureSeconds": "0",
+            "CdbPath": str(tmp_path / "never-launched-cdb.exe"),
         },
         exe_args=_python_exe_args("import time; time.sleep(3600)"),
     )
@@ -103,7 +162,7 @@ def test_wedge_throws_within_bound_and_emits_all_diagnostics(tmp_path: Path) -> 
     assert result.returncode != 0, f"expected a nonzero exit on wedge, got 0:\n{combined}"
     for header in DIAGNOSTIC_HEADERS:
         assert header in combined, f"missing diagnostic header {header!r} in output:\n{combined}"
-    assert "wedged" in combined
+    assert WEDGE_THROW in combined
 
     # Cluster 2: the stand-in process must actually be killed, not left running.
     match = re.search(r"killed process id\(s\): (\d+)", combined)
@@ -148,20 +207,240 @@ def test_wedge_still_emits_diagnostics_and_throws_when_log_read_fails(tmp_path: 
                 "LogPath": str(log_path),
                 "BoundMinutes": "0.02",
                 "ExePath": sys.executable,
+                "StackCaptureSeconds": "0",
+                "CdbPath": str(tmp_path / "never-launched-cdb.exe"),
             },
             exe_args=_python_exe_args("import time; time.sleep(3600)"),
         )
         combined = result.stdout + result.stderr
 
         assert result.returncode != 0
-        assert "failed to read" in combined.lower(
-        ), f"expected the log-read failure to be reported, not swallowed:\n{combined}"
+        # Named in full: `Invoke-StackCapture` emits the same literal for a
+        # capture file it cannot read, which is a different failure.
+        assert f"failed to read {log_path}" in combined, \
+            f"expected the log-read failure to be reported, not swallowed:\n{combined}"
         for header in DIAGNOSTIC_HEADERS:
             assert header in combined, f"missing diagnostic header {header!r} after a probe failure:\n{combined}"
-        assert "wedged" in combined, f"wedge throw did not surface after a probe failure:\n{combined}"
+        assert WEDGE_THROW in combined, f"wedge throw did not surface after a probe failure:\n{combined}"
     finally:
         holder.terminate()
         holder.wait(timeout=10)
+
+
+# Native stack capture -------------------------------------------------------------------------------------------------
+
+
+@pytest.mark.cdb
+def test_wedge_captures_symbolised_native_stacks_of_the_wedged_process(tmp_path: Path) -> None:
+    """What this asks for: where the wedged process is actually blocked.
+
+    A thread-state table names no call, and neither does a stack of
+    `hole+0x3f21a` frames, so this asserts real symbol resolution. The proof
+    is cdb's own `lm` verdict, not a `module!name` frame: dbghelp names
+    *exported* functions with no PDB at all, so `ntdll!NtWaitForSingleObject`
+    alone would still pass with symbol resolution completely broken.
+
+    The only test here that needs the real toolchain: cdb from the SDK's
+    Debugging Tools (present on `windows-latest`) and msdl.microsoft.com for
+    the OS PDBs. It fails rather than skips when either is missing, because a
+    capture that silently stops symbolising is the failure worth catching.
+
+    Expects exactly one capture, which holds because ci.yaml runs this suite
+    in the `Test` step, before `Install` -- so the stand-in is the only target
+    in existence. On a host that already has a HoleBridge or hole.exe running,
+    those are captured first and can spend the budget before the stand-in's
+    turn.
+    """
+    # Asserted, not passed as `-CdbPath`: the script's own discovery is part of
+    # what this covers, and a missing toolchain must say so here rather than
+    # surface as an empty-looking capture further down.
+    _real_cdb_path()
+    log_path = tmp_path / "wedge.log"
+
+    result = _run_script(
+        params={
+            "Verb": "/x",
+            "MsiPath": "unused.msi",
+            "LogPath": str(log_path),
+            "BoundMinutes": "0.02",
+            "ExePath": sys.executable,
+            "StackCaptureSeconds": "120",
+        },
+        exe_args=_python_exe_args("import time; time.sleep(3600)"),
+        timeout=300,
+    )
+    combined = result.stdout + result.stderr
+
+    assert result.returncode != 0, f"expected a nonzero exit on wedge:\n{combined}"
+    assert WEDGE_THROW in combined, f"the capture swallowed the wedge throw:\n{combined}"
+
+    # Only the stand-in's own capture, by label: a runner that happens to have
+    # a live HoleBridge or hole.exe contributes extra files, and concatenating
+    # them would let a good capture mask an empty one.
+    captures = sorted(tmp_path.glob("wedge-stack-wedged-*.txt"))
+    assert len(captures) == 1, f"expected exactly one capture of the wedged stand-in, got {captures}:\n{combined}"
+    text = captures[0].read_text(errors="replace")
+
+    assert "Child-SP" in text, f"cdb produced no stack listing:\n{text}"
+    assert "ntdll!" in text, f"frames carry no module-qualified names:\n{text}"
+    assert "pdb symbols" in text, (
+        "no module loaded a PDB -- symbol resolution is broken, or "
+        f"msdl.microsoft.com did not serve the OS symbols this needs:\n{text}"
+    )
+    # The job log is where a reader actually looks; the artifact is the backup.
+    assert "Child-SP" in combined, f"stacks were written to file but never echoed to the job log:\n{combined}"
+    # The other half of the terminate response: a capture that detached cleanly
+    # froze nothing, so nothing may be killed for having been frozen.
+    assert "terminated suspended pid" not in combined, \
+        f"a target this capture did not freeze was terminated anyway:\n{combined}"
+
+
+def test_a_hung_debugger_is_killed_partial_output_survives_and_the_wedge_still_throws(tmp_path: Path) -> None:
+    """The capture must not become a second way to hang the step.
+
+    The stand-in writes one line and then never exits, so all three
+    consequences are observable at once: the budget kills it, what it managed
+    to write is still echoed, and the original bounded failure is what fails
+    the step.
+    """
+    log_path = tmp_path / "wedge.log"
+    # A batch stand-in ignores the cdb argv it is handed, and its spin loop
+    # keeps the hang inside the one process the script knows to kill -- a
+    # sleep helper would leave an orphan behind after Stop-Process.
+    standin = tmp_path / "hung-cdb.cmd"
+    standin.write_text("@echo off\necho STANDIN-PARTIAL-OUTPUT\n:loop\ngoto loop\n")
+
+    start = time.monotonic()
+    try:
+        result = _run_script(
+            params={
+                "Verb": "/x",
+                "MsiPath": "unused.msi",
+                "LogPath": str(log_path),
+                "BoundMinutes": "0.02",
+                "ExePath": sys.executable,
+                "StackCaptureSeconds": "3",
+                "CdbPath": str(standin),
+            },
+            exe_args=_python_exe_args("import time; time.sleep(3600)"),
+            # Comfortably above the `elapsed` assertion below, so a regression
+            # trips that (with the output attached) instead of TimeoutExpired.
+            timeout=120,
+        )
+    finally:
+        # A regression that never kills the stand-in would otherwise leave its
+        # `goto` loop spinning a core for the rest of the session; subprocess
+        # only reaps the direct pwsh child.
+        _kill_processes_matching(str(standin))
+    elapsed = time.monotonic() - start
+    combined = result.stdout + result.stderr
+
+    assert elapsed < 60, f"a hung debugger was not bounded (took {elapsed:.1f}s):\n{combined}"
+    assert result.returncode != 0
+    assert "did not finish" in combined, f"the hung debugger was not reported:\n{combined}"
+    assert "STANDIN-PARTIAL-OUTPUT" in combined, f"partial capture output was discarded:\n{combined}"
+    assert WEDGE_THROW in combined, f"the hung debugger swallowed the wedge throw:\n{combined}"
+    # This stand-in never attaches to anything, so nothing is left suspended
+    # and the tree kill is what reaps the stand-in target, as always.
+    assert "killed process id(s)" in combined, f"the tree kill was skipped:\n{combined}"
+    assert "failed to kill process id(s)" not in combined, f"the tree kill misfired:\n{combined}"
+
+
+@pytest.mark.cdb
+def test_a_target_the_capture_left_suspended_is_detected_and_terminated(tmp_path: Path) -> None:
+    """A non-invasive attach that does not end in `qd` freezes its target.
+
+    The script must notice and free it: a suspended HoleBridge can no more
+    answer SERVICE_CONTROL_STOP than a wedged one, so an instrument that
+    leaves one behind manufactures the hang it exists to diagnose.
+
+    The stand-in reproduces the real failure with the real tool rather than
+    simulating it -- `cdb -pv -p <pid>` with stdin at EOF attaches, falls to
+    its prompt, and exits WITHOUT detaching. Then it returns, so the script's
+    wait for it is the rendezvous and nothing here races: the suspension is
+    already in place when the script measures.
+    """
+    log_path = tmp_path / "wedge.log"
+    standin = tmp_path / "suspending-cdb.cmd"
+    # %3 is the target pid: the argv is `-pv -p <pid> -logo "<file>" -c "..."`.
+    standin.write_text(f'@echo off\necho STANDIN-SUSPENDED-THE-TARGET\n"{_real_cdb_path()}" -pv -p %3 <nul >nul 2>&1\n')
+
+    result = _run_script(
+        params={
+            "Verb": "/x",
+            "MsiPath": "unused.msi",
+            "LogPath": str(log_path),
+            "BoundMinutes": "0.02",
+            "ExePath": sys.executable,
+            "StackCaptureSeconds": "120",
+            "CdbPath": str(standin),
+        },
+        exe_args=_python_exe_args("import time; time.sleep(3600)"),
+        timeout=300,
+    )
+    combined = result.stdout + result.stderr
+
+    assert result.returncode != 0
+    assert "thread(s) suspended" in combined, f"the frozen target went unnoticed:\n{combined}"
+    assert "terminated suspended pid" in combined, f"the frozen target was left suspended:\n{combined}"
+    assert WEDGE_THROW in combined, f"freeing the target swallowed the wedge throw:\n{combined}"
+    assert "failed to kill process id(s)" not in combined, f"the freed pid was tree-killed again:\n{combined}"
+
+
+def test_a_debugger_that_cannot_start_is_reported_and_terminates_nothing(tmp_path: Path) -> None:
+    """A debugger that never launched attached to nothing, so it froze nothing.
+
+    With budget to spare the loop reaches `Start-Process` and it throws: the
+    step must say so and carry on to the same ending as always.
+    """
+    log_path = tmp_path / "wedge.log"
+
+    result = _run_script(
+        params={
+            "Verb": "/x",
+            "MsiPath": "unused.msi",
+            "LogPath": str(log_path),
+            "BoundMinutes": "0.02",
+            "ExePath": sys.executable,
+            "StackCaptureSeconds": "30",
+            "CdbPath": str(tmp_path / "does-not-exist-cdb.exe"),
+        },
+        exe_args=_python_exe_args("import time; time.sleep(3600)"),
+    )
+    combined = result.stdout + result.stderr
+
+    assert result.returncode != 0
+    assert "failed to start cdb" in combined, f"a debugger that could not launch went unreported:\n{combined}"
+    assert "terminated suspended pid" not in combined, f"nothing was attached, so nothing may be killed:\n{combined}"
+    assert WEDGE_THROW in combined, f"a failed launch swallowed the wedge throw:\n{combined}"
+    assert "killed process id(s)" in combined, f"the tree kill was skipped:\n{combined}"
+
+
+def test_stack_capture_budget_exhaustion_is_reported_and_does_not_swallow_the_wedge(tmp_path: Path) -> None:
+    """A zero budget must skip the capture loudly and still reach the throw --
+    the capture is additive instrumentation, never a new way to lose the
+    original bounded failure."""
+    log_path = tmp_path / "wedge.log"
+
+    result = _run_script(
+        params={
+            "Verb": "/x",
+            "MsiPath": "unused.msi",
+            "LogPath": str(log_path),
+            "BoundMinutes": "0.02",
+            "ExePath": sys.executable,
+            "StackCaptureSeconds": "0",
+            "CdbPath": str(tmp_path / "never-launched-cdb.exe"),
+        },
+        exe_args=_python_exe_args("import time; time.sleep(3600)"),
+    )
+    combined = result.stdout + result.stderr
+
+    assert result.returncode != 0
+    assert "--- native thread stacks ---" in combined, f"the section vanished when skipped:\n{combined}"
+    assert "stack-capture budget of 0s is spent" in combined, \
+        f"budget exhaustion was not reported:\n{combined}"
+    assert WEDGE_THROW in combined, f"wedge throw did not survive a skipped capture:\n{combined}"
 
 
 # Non-wedge paths ======================================================================================================
@@ -212,3 +491,70 @@ def test_nonzero_exit_with_failonnonzeroexit_throws(tmp_path: Path) -> None:
     combined = result.stdout + result.stderr
     assert result.returncode != 0, f"expected -FailOnNonZeroExit to fail the step:\n{combined}"
     assert "failed with exit code 3" in combined
+
+
+# Helper library =======================================================================================================
+
+
+def test_process_tree_walk_collects_every_descendant_and_terminates_on_a_cycle() -> None:
+    """`Get-DescendantProcessIds` is what stops a wedged msiexec's elevated
+    child -- and the `_MSIExecute` mutex it holds -- outliving the step, but no
+    wedge test ever gives it a tree: the stand-in is a lone python.exe that the
+    `Name = 'msiexec.exe'` probe never matches. Driven directly instead, with a
+    parent/child cycle to prove the walk cannot loop.
+
+    Dot-sourcing also asserts the helper file has no top-level side effects.
+    """
+    procs = ", ".join(
+        f"[pscustomobject]@{{ProcessId={pid};ParentProcessId={ppid}}}"
+        for pid, ppid in [(100, 1), (200, 100), (300, 200), (400, 999), (100, 200)]
+    )
+    command = (
+        f". {_ps_quote(str(HELPERS_PATH))}; "
+        f"$procs = @({procs}); "
+        "(Get-DescendantProcessIds -RootId 100 -AllProcs $procs) -join ','"
+    )
+    result = subprocess.run(["pwsh", "-NoProfile", "-Command", command], capture_output=True, text=True, timeout=60)
+
+    assert result.returncode == 0, f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+    assert result.stdout.strip() == "100,200,300", \
+        f"tree walk returned {result.stdout.strip()!r}, expected the root and its two descendants"
+
+
+def test_wedge_falls_back_to_thread_states_when_no_debugger_is_installed(tmp_path: Path) -> None:
+    """A runner image without the SDK's Debugging Tools must still say something
+    useful, and say plainly that it is not stacks.
+
+    `Get-CdbPath` probes under the two ProgramFiles roots and then PATH, so
+    pointing all three at an empty directory is what makes the search genuinely
+    fail -- the script is not told, it looks and finds nothing.
+    """
+    log_path = tmp_path / "wedge.log"
+    empty_root = tmp_path / "no-sdk-here"
+    empty_root.mkdir()
+    env = dict(os.environ)
+    env["ProgramFiles"] = str(empty_root)
+    env["ProgramFiles(x86)"] = str(empty_root)
+    env["PATH"] = str(empty_root)
+
+    result = _run_script(
+        params={
+            "Verb": "/x",
+            "MsiPath": "unused.msi",
+            "LogPath": str(log_path),
+            "BoundMinutes": "0.02",
+            "ExePath": sys.executable,
+            "StackCaptureSeconds": "30",
+        },
+        exe_args=_python_exe_args("import time; time.sleep(3600)"),
+        env=env,
+    )
+    combined = result.stdout + result.stderr
+
+    assert result.returncode != 0
+    assert "falling back to thread states" in combined, \
+        f"a missing debugger was not reported as such:\n{combined}"
+    assert "OptionId.WindowsDesktopDebuggers" in combined, \
+        f"the remedy for a missing debugger was not named:\n{combined}"
+    assert "thread states, NOT stacks" in combined, f"no thread-state table was emitted:\n{combined}"
+    assert WEDGE_THROW in combined, f"the fallback swallowed the wedge throw:\n{combined}"

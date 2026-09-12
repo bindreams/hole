@@ -17,7 +17,10 @@ packages = ["src/msi_installer"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-markers = ["wix: tests requiring the WiX toolchain (skip with -m 'not wix')"]
+markers = [
+    "wix: tests requiring the WiX toolchain (skip with -m 'not wix')",
+    "cdb: tests requiring the Windows SDK Debugging Tools and the Microsoft symbol server (skip with -m 'not cdb')",
+]
 
 [dependency-groups]
 dev = ["pytest"]

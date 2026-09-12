@@ -2,9 +2,9 @@
 # unbounded `Start-Process -Wait`. `Process.WaitForExit(ms)` returns false on
 # timeout without touching the process, so a wedged msiexec fails this step
 # with diagnostics -- log tail, HoleBridge service state, surviving hole.exe
-# processes, msiexec's own process tree -- instead of hanging until the JOB
-# timeout kills the whole job and every step after this one (including any
-# artifact upload) never runs.
+# processes, msiexec's own process tree, and every thread's native call stack
+# -- instead of hanging until the JOB timeout kills the whole job and every
+# step after this one (including any artifact upload) never runs.
 #
 # Shared by both the Install and Uninstall CI steps: they carry the same
 # unbounded-wait exposure, so the fix lives once here rather than twice in
@@ -38,7 +38,33 @@ param(
     # is already a pessimistic estimate. 3 minutes each leaves comfortable
     # margin; the steps themselves normally complete in 2-4 seconds, so a
     # much smaller bound loses nothing.
+    [ValidateRange(0.0, 60.0)]
     [double]$BoundMinutes = 3,
+
+    # Total wall-clock budget for the thread-stack capture at expiry, shared
+    # across every target process rather than granted per target, so the wedge
+    # branch's cost stays bounded however many hole.exe/msiexec.exe processes
+    # survive. Spent in evidentiary order (bridge first), so an exhausted
+    # budget costs the least-informative capture, not the decisive one.
+    #
+    # Sized against what is actually spare in the 60min job budget, which is
+    # NOT the ~11min above: 6 of those minutes are already committed to the
+    # two 3-minute bounds when both steps wedge, leaving ~5min.
+    #
+    # This budget covers the capture loop only, so the wedge branch's real
+    # worst case is the sum of every bound in it: two 15s CIM probes before
+    # the loop, this 60s, and a 5s reap per process killed (one cdb, at most
+    # one per target, at most one per msiexec-tree member) -- about 2min 10s
+    # for a plausible four targets. Both steps wedging spends that twice,
+    # ~4.5min of the ~5min spare, and the artifact upload -- the whole reason
+    # the bound exists -- still runs.
+    #
+    # Measured cost is far under the cap: 33s for one process against a cold
+    # symbol cache and 0.3s against a warm one (Windows 11 26100, SDK
+    # 10.0.26100 cdb), with the two steps sharing one cache under RUNNER_TEMP.
+    # Every one of these is a failure bound, not an expected duration.
+    [ValidateRange(0.0, 3600.0)]
+    [double]$StackCaptureSeconds = 60,
 
     # Install failure is fatal; Uninstall is best-effort cleanup -- callers set
     # this switch to match their own error-handling policy. A wedge is fatal
@@ -46,26 +72,23 @@ param(
     [switch]$FailOnNonZeroExit,
 
     [string]$ExePath = "msiexec",
-    [string[]]$ExeArgs
+    [string[]]$ExeArgs,
+
+    # Second test seam, same shape as -ExePath: substitutes the debugger the
+    # capture shells out to, so a stand-in that never exits drives the
+    # capture's own bound. Empty means "find the real cdb" -- every ci.yaml
+    # call site leaves it that way.
+    [string]$CdbPath
 )
 
 if (-not $ExeArgs) {
     $ExeArgs = @($Verb, $MsiPath, "/quiet", "/norestart", "/l*vx", $LogPath)
 }
 
-# Walks the Win32_Process table from $RootId through ParentProcessId links,
-# returning every pid in the tree. msiexec commonly re-launches itself as an
-# elevated child to run the actual transaction, so killing only the root
-# leaves that child -- and the global `_MSIExecute` mutex it holds -- running.
-function Get-DescendantProcessIds([int]$RootId, $AllProcs) {
-    $ids = @($RootId)
-    $frontier = @($RootId)
-    while ($frontier) {
-        $frontier = @($AllProcs | Where-Object { $_.ParentProcessId -in $frontier -and $_.ProcessId -notin $ids } | Select-Object -ExpandProperty ProcessId)
-        $ids += $frontier
-    }
-    return $ids
-}
+# The wedge branch's helpers: the process-tree walk and the native thread-stack
+# capture. Dot-sourced rather than inlined so this file keeps the shape of what
+# it does -- run bounded, probe, capture, kill, throw -- at one level.
+. (Join-Path $PSScriptRoot 'wedge-diagnostics.ps1')
 
 # `Start-Process -ArgumentList` joins array elements with a single space and
 # does not quote them (documented behavior) -- an element containing
@@ -98,7 +121,14 @@ if (-not $proc.WaitForExit([int]($BoundMinutes * 60000))) {
     Write-Host "--- HoleBridge service state ---"
     try {
         $svc = Get-Service -Name HoleBridge -ErrorAction SilentlyContinue
-        if ($svc) { $svc | Format-List * } else { Write-Host "(HoleBridge service not registered)" }
+        # Named properties rather than `*`: ServiceController's
+        # DependentServices/ServicesDependedOn/RequiredServices each make a
+        # fresh, unbounded SCM RPC on access -- on the very SCM that is failing
+        # to answer SERVICE_CONTROL_STOP -- and HoleBridge declares no
+        # dependencies either way. Everything else `*` printed is still here.
+        if ($svc) {
+            $svc | Format-List Name, DisplayName, Status, StartType, ServiceType, CanStop, CanShutdown, CanPauseAndContinue, MachineName
+        } else { Write-Host "(HoleBridge service not registered)" }
     } catch {
         Write-Host "(failed to query HoleBridge service: $($_.Exception.Message))"
     }
@@ -117,7 +147,7 @@ if (-not $proc.WaitForExit([int]($BoundMinutes * 60000))) {
     # unattributable to whatever launched it.
     Write-Host "--- hole.exe process tree (parent pid + command line) ---"
     try {
-        $holeCimProcs = Get-CimInstance Win32_Process -Filter "Name = 'hole.exe'" -ErrorAction Stop
+        $holeCimProcs = Get-CimInstance Win32_Process -Filter "Name = 'hole.exe'" -OperationTimeoutSec $cimProbeTimeoutSeconds -ErrorAction Stop
         if ($holeCimProcs) { $holeCimProcs | Select-Object ProcessId, ParentProcessId, SessionId, CreationDate, CommandLine | Format-Table -AutoSize | Out-String -Width 4096 } else { Write-Host "(no hole.exe process running)" }
     } catch {
         Write-Host "(CIM query for hole.exe failed: $($_.Exception.Message))"
@@ -132,10 +162,64 @@ if (-not $proc.WaitForExit([int]($BoundMinutes * 60000))) {
     Write-Host "--- msiexec process tree ---"
     $msiProcs = $null
     try {
-        $msiProcs = Get-CimInstance Win32_Process -Filter "Name = 'msiexec.exe'" -ErrorAction Stop
+        $msiProcs = Get-CimInstance Win32_Process -Filter "Name = 'msiexec.exe'" -OperationTimeoutSec $cimProbeTimeoutSeconds -ErrorAction Stop
         if ($msiProcs) { $msiProcs | Select-Object ProcessId, ParentProcessId, CreationDate, CommandLine | Format-Table -AutoSize | Out-String -Width 4096 } else { Write-Host "(no msiexec.exe process running)" }
     } catch {
         Write-Host "(CIM query for msiexec.exe failed: $($_.Exception.Message))"
+    }
+
+    # Shared by the stack capture and the kill below: both act on exactly the
+    # process tree this script started, and computing it once keeps them from
+    # disagreeing about what "the wedged tree" is.
+    $wedgedTreeIds = @($proc.Id)
+    try {
+        if ($msiProcs) { $wedgedTreeIds = Get-DescendantProcessIds -RootId $proc.Id -AllProcs $msiProcs }
+    } catch {
+        Write-Host "::warning::failed to walk the wedged process tree, falling back to pid $($proc.Id) alone: $($_.Exception.Message)"
+    }
+
+    # Pin each tree member against pid reuse for as long as this block holds the
+    # object. The capture below runs for up to a minute between reading these
+    # pids and acting on them, and a descendant that exits in that window
+    # releases its number to whatever the kernel hands it to next -- including
+    # the bridge SCM restarts after a suspended target is terminated. `$proc` is
+    # already pinned: this script started it and holds its handle.
+    $wedgedTreePins = @{}
+    foreach ($treeId in $wedgedTreeIds) {
+        $pinned = Get-PinnedProcess ([int]$treeId)
+        if ($pinned) { $wedgedTreePins[[int]$treeId] = $pinned }
+        else { Write-Host "::warning::could not pin pid ${treeId} against reuse; it will be killed by pid alone" }
+    }
+
+    Write-Host "--- native thread stacks ---"
+    $suspendedTargetIds = @(Invoke-ThreadStackCapture -LogPath $LogPath -WedgedTreeIds $wedgedTreeIds `
+            -BudgetSeconds $StackCaptureSeconds -DebuggerPathOverride $CdbPath)
+
+    # Nothing else in this job releases a target the capture left suspended:
+    # the tree kill below covers the msiexec tree only, and ci.yaml's
+    # "Kill hole.exe after E2E" runs BEFORE Uninstall, not after it. A
+    # suspended HoleBridge would therefore survive this step unable to answer
+    # the very SERVICE_CONTROL_STOP whose absence is under investigation --
+    # the instrument manufacturing the hang it exists to diagnose.
+    #
+    # Terminating it is not the end of the story, and the log says so: the
+    # service carries SCM restart-on-failure with a 1s delay
+    # (`restart_failure_actions` in crates/bridge/src/platform/windows.rs), and
+    # a force-kill counts as a failure, so a FRESH bridge appears about a
+    # second later. That is still strictly better than a frozen one -- a live
+    # bridge can be stopped, a suspended one can not -- but whatever reads the
+    # next steps needs to know the process it sees is not the wedged one.
+    if ($suspendedTargetIds) {
+        Write-Host "--- terminating targets the capture left suspended ---"
+        foreach ($suspendedId in $suspendedTargetIds) {
+            try {
+                Stop-Process -Id $suspendedId -Force -ErrorAction Stop
+                Wait-ProcessReaped -ProcessId $suspendedId -What 'suspended capture target'
+                Write-Host "terminated suspended pid $suspendedId (if this was HoleBridge, SCM restarts it ~1s later as a fresh process)"
+            } catch {
+                Write-Host "::warning::failed to terminate suspended pid ${suspendedId}: $($_.Exception.Message)"
+            }
+        }
     }
 
     # Kill the tree so a wedged msiexec doesn't outlive this step: on Install
@@ -143,19 +227,28 @@ if (-not $proc.WaitForExit([int]($BoundMinutes * 60000))) {
     # runs next (`if: always()`), and on Uninstall it would keep appending to
     # the log while "Upload MSI logs" reads it. Best-effort and isolated like
     # the probes above -- a failure here must not swallow the wedge `throw`.
+    # Deferred by the whole capture above -- its budget plus the reaps -- so
+    # the stacks are taken from a live tree; the msiexec log keeps growing for
+    # that long, which the tail printed earlier is already past.
     Write-Host "--- killing wedged process tree ---"
     try {
-        $targetIds = if ($msiProcs) { Get-DescendantProcessIds -RootId $proc.Id -AllProcs $msiProcs } else { @($proc.Id) }
+        # A tree member already terminated for being left suspended would
+        # otherwise be reported here as a kill failure.
+        $targetIds = @($wedgedTreeIds | Where-Object { $_ -notin $suspendedTargetIds })
         $killed = @()
         $failed = @()
         foreach ($targetId in $targetIds) {
             try {
-                Stop-Process -Id $targetId -Force -ErrorAction Stop
+                # By handle where one was pinned, so the kill cannot land on an
+                # unrelated process that inherited the number in the meantime.
+                $pin = $wedgedTreePins[[int]$targetId]
+                if ($pin) { Stop-Process -InputObject $pin -Force -ErrorAction Stop }
+                else { Stop-Process -Id $targetId -Force -ErrorAction Stop }
                 # `-Force` calls TerminateProcess, which returns synchronously
                 # without waiting for the process to actually be reaped --
                 # same reasoning as the `Wait-Process` after `Stop-Process` in
                 # the "Kill any running hole.exe" step.
-                Wait-Process -Id $targetId -ErrorAction SilentlyContinue
+                Wait-ProcessReaped -ProcessId $targetId -What 'wedged tree member'
                 $killed += $targetId
             } catch {
                 $failed += "$targetId ($($_.Exception.Message))"
