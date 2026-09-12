@@ -66,12 +66,9 @@ async fn serve_until_signal_returns_when_signal_fires() {
 // `ensure_stopped`'s absent-job classification ========================================================================
 //
 // The macOS half of #1003's "stop, then deregister" rule, and the mirror of
-// windows.rs's `open_error_is_absent`. Both platforms answer the same question
+// windows.rs's `stop_error_is_absent`. Both platforms answer the same question
 // — does the service manager still have a job for this label? — and both must
-// answer it BY CAUSE. The old body answered it by re-probing with
-// `is_running()`, whose `.unwrap_or(false)` turned "launchd could not be asked"
-// into "nothing is running", so an `ensure_stopped` that stopped nothing
-// reported success and `uninstall_bridge_with` went on to deregister.
+// answer it BY CAUSE, about the world the stop left.
 
 #[skuld::test]
 fn launchd_answers_no_such_service_for_a_label_it_does_not_know() {
@@ -132,6 +129,111 @@ fn an_unanswerable_probe_is_never_a_stopped_bridge() {
     // Total over `Registration`, not merely over what its one caller passes:
     // a still-loaded job is never a stopped bridge either, whoever asks.
     assert!(ensure_stopped_verdict(Registration::Loaded).is_err());
+}
+
+/// launchd's answer to `bootout` for a service target it does not have, read
+/// off the running OS. The system domain needs root, so the measurement uses
+/// the per-user domain, which is the same launchctl code path with a domain
+/// this test can reach: the point is that a bootout against a label launchd
+/// does not have exits NON-ZERO with something that is not a stopped bridge —
+/// which is why the verdict below comes from a fresh probe and not from the
+/// exit code.
+#[skuld::test]
+fn a_bootout_of_a_label_launchd_does_not_have_fails() {
+    let code = std::process::Command::new("launchctl")
+        .args([
+            "bootout",
+            &format!("user/{}/com.hole.bridge.absent-by-construction", unsafe {
+                libc::getuid()
+            }),
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .expect("launchctl is present on every macOS host")
+        .code();
+    assert!(
+        !matches!(code, Some(0)),
+        "a bootout of an absent label must not exit 0; classifying this as a stop would report a \
+         bridge stopped on the strength of launchd refusing the request"
+    );
+    assert_ne!(
+        code,
+        Some(LAUNCHD_NO_SUCH_SERVICE),
+        "measured: `bootout` does NOT reuse `print`'s no-such-service code, so an exit-code \
+         classifier built on it would be a fix that fixes nothing"
+    );
+}
+
+#[skuld::test]
+fn the_bootout_is_issued_before_launchd_is_asked_anything() {
+    // The act first, its consequence classified after: `ensure_stopped`'s only
+    // question is whether launchd still has the job, and only an answer taken
+    // AFTER the bootout is an answer about the world the bootout left.
+    let booted = std::cell::Cell::new(false);
+    let result = ensure_stopped_with(
+        || {
+            booted.set(true);
+            Ok(Some(1))
+        },
+        || {
+            assert!(
+                booted.get(),
+                "launchd must not be asked about a stop that has not happened"
+            );
+            Registration::Absent
+        },
+    );
+    assert!(result.is_ok(), "{result:?}");
+}
+
+#[skuld::test]
+fn a_failed_bootout_over_a_job_launchd_no_longer_has_is_a_stopped_bridge() {
+    // The window the probe-then-act shape left open: the job leaves launchd
+    // between the question and the bootout — a concurrent `hole bridge
+    // uninstall`, an operator's own `launchctl bootout`, the daemon exiting
+    // and being reaped — and the bootout then fails over a bridge that is in
+    // fact stopped. `uninstall_bridge_with` refuses to deregister on an
+    // unconfirmed stop, so the plist and the privileged helper stay on disk
+    // and every later uninstall skips its teardown (#1003).
+    for code in [Some(3), Some(LAUNCHD_NO_SUCH_SERVICE), Some(1), None] {
+        let result = ensure_stopped_with(|| Ok(code), || Registration::Absent);
+        assert!(
+            result.is_ok(),
+            "a bootout that exits {code:?} over a label launchd no longer has must read as \
+             stopped: {result:?}"
+        );
+    }
+    // Including one that could not be run at all — the verdict is launchd's
+    // answer, never launchctl's exit.
+    let result = ensure_stopped_with(
+        || Err(std::io::Error::other("launchctl not found")),
+        || Registration::Absent,
+    );
+    assert!(result.is_ok(), "{result:?}");
+}
+
+#[skuld::test]
+fn a_failed_bootout_over_a_still_loaded_job_fails_loud() {
+    let err = ensure_stopped_with(|| Ok(Some(1)), || Registration::Loaded)
+        .expect_err("a job launchd still has is never a stopped bridge");
+    assert!(format!("{err}").contains(LAUNCHD_LABEL), "{err}");
+
+    let err = ensure_stopped_with(|| Ok(Some(1)), || Registration::Unknown("launchctl not found".into()))
+        .expect_err("an unanswerable probe must fail loud");
+    assert!(format!("{err}").contains("launchctl not found"), "{err}");
+}
+
+#[skuld::test]
+fn a_bootout_that_succeeded_asks_launchd_nothing() {
+    // One round trip on the path that matters, and nothing re-derived: the
+    // act reported success, so there is no second answer that could disagree
+    // with it.
+    let result = ensure_stopped_with(
+        || Ok(Some(0)),
+        || panic!("a bootout launchd accepted needs no second opinion"),
+    );
+    assert!(result.is_ok(), "{result:?}");
 }
 
 #[skuld::test]

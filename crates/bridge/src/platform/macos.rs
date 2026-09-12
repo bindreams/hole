@@ -68,11 +68,11 @@ pub fn generate_plist(binary_path: &str) -> String {
 /// permissions, missing service) land in bridge.log instead of a terminal
 /// nobody sees in service mode.
 ///
-/// Every call site is fail-loud. The `BestEffort` severity this used to take
-/// existed for one caller — `uninstall`'s `bootout` against a job that might
-/// not be loaded — and that caller now asks launchd whether the job exists
-/// *before* issuing the bootout ([`ensure_stopped`]), so a failing bootout is
-/// always a real failure.
+/// Every call site is fail-loud, because at every one of them a non-zero exit
+/// IS the failure. `ensure_stopped`'s bootout is the caller that is not —
+/// launchd exits non-zero there both for a refusal and for a job it does not
+/// have — so it does not come through here; it runs
+/// [`launchctl_status`] and classifies what launchd has afterwards.
 fn run_launchctl(label: &str, args: &[&str]) -> std::io::Result<std::process::Output> {
     let output = std::process::Command::new("launchctl").args(args).output()?;
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -88,6 +88,20 @@ fn run_launchctl(label: &str, args: &[&str]) -> std::io::Result<std::process::Ou
     }
     tracing::debug!(%stdout, "launchctl {label} ok");
     Ok(output)
+}
+
+/// Run `launchctl` with captured output and hand back its exit status WITHOUT
+/// judging it, for the one caller whose non-zero status is not yet a failure.
+/// `Ok(None)` is launchctl killed by a signal; `Err` is a spawn failure.
+fn launchctl_status(label: &str, args: &[&str]) -> std::io::Result<Option<i32>> {
+    let output = std::process::Command::new("launchctl").args(args).output()?;
+    tracing::debug!(
+        stdout = %String::from_utf8_lossy(&output.stdout),
+        stderr = %String::from_utf8_lossy(&output.stderr),
+        status = ?output.status,
+        "launchctl {label} finished",
+    );
+    Ok(output.status.code())
 }
 
 // Install/uninstall ===================================================================================================
@@ -184,22 +198,39 @@ fn probe_registration() -> Registration {
 /// any registration record — see `setup::uninstall_bridge_with` for why the
 /// two are independent.
 ///
-/// Structurally identical to the Windows arm: ask the service manager what it
-/// has, classify that answer BY CAUSE, and only then act. Windows asks with
-/// `OpenService` and classifies with `open_error_is_absent`; macOS asks with
-/// `launchctl print` and classifies with [`classify_registration`]. Neither
-/// platform infers "stopped" from the failure of something else.
+/// Structurally identical to the Windows arm: issue the stop, then classify
+/// BY CAUSE what the stop left behind. Neither platform asks first — a probe
+/// answers about the moment it was taken, not about the instant the act lands,
+/// and the job can leave launchd in between (a concurrent `hole bridge
+/// uninstall`, an operator's own bootout, the daemon exiting and being
+/// reaped). Nor can the exit code stand in for the classification:
+/// `a_bootout_of_a_label_launchd_does_not_have_fails` measures that launchd
+/// answers a bootout of an absent label with neither 0 nor
+/// [`LAUNCHD_NO_SUCH_SERVICE`]. The question the caller actually has — does
+/// launchd still have this job? — has one answer, and only an answer taken
+/// after the act is about the world the act left.
 ///
 /// `bootout`, not [`stop`]'s SIGTERM: the plist sets `KeepAlive`, so launchd
 /// relaunches a bare-signalled daemon.
 pub fn ensure_stopped() -> std::io::Result<()> {
-    let registration = probe_registration();
-    if registration == Registration::Loaded {
-        let system_label = format!("system/{LAUNCHD_LABEL}");
-        run_launchctl("bootout", &["bootout", &system_label])?;
+    let system_label = format!("system/{LAUNCHD_LABEL}");
+    ensure_stopped_with(
+        || launchctl_status("bootout", &["bootout", &system_label]),
+        probe_registration,
+    )
+}
+
+/// [`ensure_stopped`]'s ordering, with the act and the post-act probe injected
+/// so the sequence is testable without launchd.
+fn ensure_stopped_with(
+    bootout: impl FnOnce() -> std::io::Result<Option<i32>>,
+    registration: impl FnOnce() -> Registration,
+) -> std::io::Result<()> {
+    if let Ok(Some(0)) = bootout() {
+        info!("launchd booted out the bridge job");
         return Ok(());
     }
-    ensure_stopped_verdict(registration)
+    ensure_stopped_verdict(registration())
 }
 
 /// Whether a [`Registration`] lets the stop report success. Pure, so the arm
@@ -212,13 +243,9 @@ pub fn ensure_stopped() -> std::io::Result<()> {
 /// the liveness lock is never stopped again, so the cover release refuses
 /// forever.
 ///
-/// `Loaded` is the arm [`ensure_stopped`] handles itself — it issues the
-/// bootout rather than asking for a verdict — and is kept here so the function
-/// is total over `Registration` instead of being correct only while its one
-/// caller happens to filter that input out. Same reason
-/// `failclosed::KeyOutcome::Failed` is folded rather than assumed unreachable:
-/// a verdict that depends on a *different* function short-circuiting first is
-/// wrong the moment either side moves.
+/// `Loaded` is reached whenever the bootout did not succeed and launchd still
+/// has the job — the real refusal, as opposed to the bootout that failed
+/// because there was nothing left to boot out.
 fn ensure_stopped_verdict(registration: Registration) -> std::io::Result<()> {
     match registration {
         Registration::Absent => {

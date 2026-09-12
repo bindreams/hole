@@ -174,6 +174,12 @@ fn winapi_error(code: u32) -> windows_service::Error {
     windows_service::Error::Winapi(std::io::Error::from_raw_os_error(code as i32))
 }
 
+/// The same Win32 status as the `windows` bindings raise it — an `HRESULT`,
+/// not an OS code. This is what `scm_wait`'s `OpenServiceW` failure carries.
+fn hresult_error(code: u32) -> windows::core::Error {
+    windows::core::Error::from_hresult(HRESULT::from_win32(code))
+}
+
 #[skuld::test]
 fn an_unregistered_or_deleted_service_has_nothing_to_stop() {
     assert!(open_error_is_absent(&winapi_error(ERROR_SERVICE_DOES_NOT_EXIST.0)));
@@ -187,4 +193,51 @@ fn a_real_scm_failure_is_not_an_absent_service() {
     assert!(!open_error_is_absent(
         &windows_service::Error::LaunchArgumentsNotSupported
     ));
+}
+
+#[skuld::test]
+fn a_stop_that_failed_over_a_row_that_is_gone_is_a_stopped_service() {
+    // `ensure_stopped` classifies the STOP's own error, and the stop reaches
+    // SCM through three layers that each report an absent row differently. A
+    // classifier that read only the first would answer for whichever layer
+    // happened to speak: the uninstall then refuses to deregister over a
+    // service provably not running, and every later attempt skips its teardown
+    // (#1003).
+    for code in [ERROR_SERVICE_DOES_NOT_EXIST.0, ERROR_SERVICE_MARKED_FOR_DELETE.0] {
+        assert!(stop_error_is_absent(&winapi_error(code)), "windows_service: {code}");
+        assert!(
+            stop_error_is_absent(&hresult_error(code)),
+            "the `windows` bindings' HRESULT: {code}"
+        );
+        assert!(
+            stop_error_is_absent(&std::io::Error::other(hresult_error(code))),
+            "scm_wait's io::Error::other wrapping of it: {code}"
+        );
+        assert!(
+            stop_error_is_absent(&std::io::Error::other(winapi_error(code))),
+            "a windows_service error wrapped the same way: {code}"
+        );
+        assert!(
+            stop_error_is_absent(&std::io::Error::from_raw_os_error(code as i32)),
+            "NotifyServiceStatusChangeW's bare OS code: {code}"
+        );
+    }
+}
+
+#[skuld::test]
+fn a_real_stop_failure_is_never_a_stopped_service() {
+    // Access denied at every layer, and a failure carrying no OS code at all.
+    // Reporting any of these stopped is the silent half of #1003: the plist
+    // equivalent is deleted over a service still running.
+    assert!(!stop_error_is_absent(&winapi_error(5)));
+    assert!(!stop_error_is_absent(&hresult_error(5)));
+    assert!(!stop_error_is_absent(&std::io::Error::other(hresult_error(5))));
+    assert!(!stop_error_is_absent(&std::io::Error::other(winapi_error(5))));
+    assert!(!stop_error_is_absent(&std::io::Error::from_raw_os_error(5)));
+    assert!(!stop_error_is_absent(
+        &windows_service::Error::LaunchArgumentsNotSupported
+    ));
+    assert!(!stop_error_is_absent(&std::io::Error::other(
+        "the service did not accept the control"
+    )));
 }
