@@ -330,49 +330,61 @@ fn release_covers_locks_a_peer_state_dir_that_is_not_there_yet() {
     assert!(result.is_ok(), "{result:?}");
 }
 
-/// The litter the lock above costs. `try_acquire` creates what it locks, so a
-/// peer that was not there is provisioned to be locked — and removed again on
-/// the way out, down to the shallowest level this call had to make.
+/// The litter the lock above costs, and why it is kept. The peer locks are
+/// released when this call returns, and every bridge takes its own with the
+/// BLOCKING `BridgeLiveness::acquire` — so the bridge this exclusion exists to
+/// keep out is woken by that release and writes `bridge-lockdown.json` into the
+/// very tree a cleanup would then remove. A cover with no record is the end
+/// state the whole uninstall path exists to prevent, so nothing under a peer
+/// dir is removed: an empty dir holding a lock file is litter, a stranded
+/// persistent cover is not recoverable in-band.
 #[skuld::test]
-fn release_covers_removes_the_peer_state_dirs_it_had_to_create() {
+fn release_covers_leaves_every_peer_tree_it_provisioned() {
     let service = tempfile::tempdir().unwrap();
     let profile = service.path().join("no-such-user");
+    let peer = profile.join("state");
 
     let result = release_covers_with(
         service.path(),
-        &[profile.join("state")],
+        std::slice::from_ref(&peer),
         || Ok(Clearance::proven()),
         || {},
     );
 
     assert!(result.is_ok(), "{result:?}");
     assert!(
-        !profile.exists(),
-        "a peer tree this call provisioned in order to lock it must not be left behind"
+        peer.join("bridge-liveness.lock").exists(),
+        "the release must remove nothing under a peer dir: the lock it took there is released \
+         before it returns, so anything it deleted afterwards could belong to the bridge that \
+         woke on that release"
     );
 }
 
+/// A peer path can run through a symlink — a state dir relocated onto a volume
+/// that is not mounted at uninstall time, or a redirected Windows profile. Such
+/// a link is not this call's to touch: `remove_dir_all` does not follow one, it
+/// removes the link itself, destroying the relocation.
+#[cfg(unix)]
 #[skuld::test]
-fn provisioned_root_names_only_what_is_missing_and_never_what_cannot_be_read() {
+fn release_covers_never_removes_a_symlink_on_a_peer_path() {
+    let service = tempfile::tempdir().unwrap();
     let base = tempfile::tempdir().unwrap();
-    assert_eq!(
-        provisioned_root(base.path()),
-        None,
-        "a dir already there has nothing to provision"
+    let link = base.path().join("profile");
+    std::os::unix::fs::symlink(base.path().join("volume-not-mounted"), &link).unwrap();
+
+    let result = release_covers_with(
+        service.path(),
+        &[link.join("hole").join("state")],
+        || Ok(Clearance::proven()),
+        || {},
     );
 
-    let deep = base.path().join("profile").join("hole").join("state");
-    assert_eq!(
-        provisioned_root(&deep),
-        Some(base.path().join("profile")),
-        "the shallowest level `create_dir_all` would make is the root of what this call creates"
+    assert!(result.is_ok(), "{result:?}");
+    assert!(
+        std::fs::symlink_metadata(&link).is_ok(),
+        "a dangling symlink on a peer path reads absent to anything that follows links; \
+         removing it takes out a user's relocation, one level above anything Hole owns"
     );
-
-    // An interior NUL makes every probe fail `InvalidInput` on both platforms.
-    // Undeterminable is not absent: reading it as absent would put a path this
-    // call never created onto the removal list.
-    let unprobeable = base.path().join("pro\0file").join("state");
-    assert_eq!(provisioned_root(&unprobeable), None);
 }
 
 /// The other side of that sweep: only what this call made goes. A peer dir
@@ -496,20 +508,63 @@ fn release_covers_purges_the_state_dir_only_after_a_confirmed_release() {
     );
 }
 
-/// The production purge, driven directly: `release_covers` hands it the real
-/// `remove_dir_all`, and the lock the release held sits inside the directory it
-/// removes.
+/// The purge runs while the liveness lock is still held, which is what makes it
+/// safe: a bridge blocked on that lock cannot be inside the directory yet, and
+/// by the time it wakes there is nothing left to delete. Released first, the
+/// purge would race that bridge and take its cover record with it.
 #[skuld::test]
-fn purge_state_dir_removes_the_tree_and_tolerates_its_absence() {
+fn release_covers_purges_while_the_liveness_lock_is_still_held() {
+    let dir = tempfile::tempdir().unwrap();
+    let locked_during_purge = std::cell::Cell::new(false);
+
+    let result = release_covers_with(
+        dir.path(),
+        &[],
+        || Ok(Clearance::proven()),
+        || {
+            // The lock contends per open handle, so this probe answers against
+            // the release's OWN guard — held means the purge is inside it.
+            locked_during_purge.set(
+                crate::liveness::BridgeLiveness::try_acquire(dir.path(), None)
+                    .unwrap()
+                    .is_none(),
+            );
+        },
+    );
+
+    assert!(result.is_ok(), "{result:?}");
+    assert!(
+        locked_during_purge.get(),
+        "the purge must run under the liveness lock, not after it is released"
+    );
+}
+
+/// The production purge, driven directly. It empties the directory but keeps
+/// the directory itself and the lock file inside it: it runs while that lock is
+/// held, and on Windows an open locked file cannot be deleted at all. A bridge
+/// that wakes on the release afterwards finds an empty state dir, which is what
+/// a fresh install looks like.
+#[skuld::test]
+fn purge_state_dir_empties_the_dir_but_keeps_the_lock_it_runs_under() {
     let dir = tempfile::tempdir().unwrap();
     let state = dir.path().join("state");
     std::fs::create_dir_all(state.join("nested")).unwrap();
+    std::fs::write(state.join("nested").join("record.json"), "{}").unwrap();
     std::fs::write(state.join("bridge-target.json"), "{}").unwrap();
+    let lock = state.join("bridge-liveness.lock");
+    std::fs::write(&lock, b"").unwrap();
 
     purge_state_dir(&state);
-    assert!(!state.exists());
 
-    purge_state_dir(&state); // idempotent: a host that never had one
+    assert!(
+        lock.exists(),
+        "the lock the purge runs under is not the purge's to delete"
+    );
+    assert!(state.exists(), "the directory holding that lock has to stay with it");
+    assert!(!state.join("bridge-target.json").exists(), "a moot record must go");
+    assert!(!state.join("nested").exists(), "a subtree of moot records must go too");
+
+    purge_state_dir(&dir.path().join("never-existed")); // a host that never had one
 }
 
 // Peer state dirs -----------------------------------------------------------------------------------------------------

@@ -1305,8 +1305,15 @@ non-`--service` runs (`cutover::peer_state_dirs`). Every one of them is locked,
 including a dir that is not there yet — `try_acquire` creates what it locks, and
 a peer left unlocked because it looked absent is a peer nothing excludes, which
 is the whole desync again on an account that had not run a bridge until
-mid-release. The dirs that costs are removed on the way out
-(`cutover::provisioned_root`). A path already probed IS skipped: the lock
+mid-release. **What that costs is kept, not cleaned up:** an empty
+`.../hole/state` holding a `bridge-liveness.lock` is left behind on every
+account that never ran a bridge. Removing it could only happen after the peer
+locks are released, and every bridge takes its own with the *blocking*
+`BridgeLiveness::acquire` — so the bridge this exclusion exists to keep out is
+woken by that release, and a cleanup running then would delete the
+`bridge-lockdown.json` it had just written. That is the stranded-cover end state
+the whole path exists to prevent, and it has no in-band recovery; an empty
+directory has none at all. A path already probed IS skipped: the lock
 contends per open handle, not per owning process, so probing one twice would
 refuse against the call's own guard, and duplicates are ordinary (an un-elevated
 run resolves `default_state_dir` and the real user's dir to one path).
@@ -1478,9 +1485,19 @@ than picking one.
 A confirmed release owns the cleanup of the state dir it needed
 (`cutover::purge_state_dir`): recording the target `Off` provisions
 `service_state_dir()` even on a host that never ran a bridge, and neither
-platform's `uninstall()` removes it. Best-effort — a leftover directory is
-litter, not a stranded host — and it never runs on a major upgrade, which needs
-the intent it holds.
+platform's `uninstall()` removes it. Best-effort — a leftover file is litter,
+not a stranded host — and it never runs on a major upgrade, which needs the
+intent it holds.
+
+It runs **inside** the liveness lock, and that is what makes it safe rather than
+the same hazard as the peer trees above: a bridge blocked on the lock cannot
+have written anything yet, so there is nothing of its to delete, and by the time
+the drop wakes it the purge is over. So it empties the directory rather than
+removing it, sparing the lock file and the directory holding it — on Windows an
+open locked file cannot be deleted at all, and on Unix it can, which would leave
+the woken bridge holding an exclusion on an unlinked inode with its directory
+gone out from under its writes. What that bridge finds instead is an empty state
+dir, which is what a fresh install looks like.
 
 A major upgrade skips the release entirely (`NOT UPGRADINGPRODUCTCODE`, and
 `bridge uninstall --keep-covers` for the service teardown that must still run):
@@ -1635,6 +1652,15 @@ Disclosed residuals:
    filters while its posture still claims them, so its next covered start
    would skip re-engagement and run uncovered. `bridge release-covers` is
    hidden and uninstall-only for exactly this reason.
+
+1. Locking those dirs leaves them behind. `try_acquire` creates what it locks,
+   so an uninstall provisions an empty `.../hole/state` holding a
+   `bridge-liveness.lock` on every account that never ran a bridge, and neither
+   platform's `uninstall()` removes it. Cleaning it up is what is refused, not
+   what was overlooked: the only moment to do it is after the peer locks are
+   released, which is the exact moment a bridge blocked on one of them wakes and
+   starts writing its own cover record there. Deleting nothing is always safe;
+   deleting the wrong thing during an uninstall has no in-band recovery.
 
 1. A stop that never returns is not covered at all. `platform::os::stop` waits
    on a real SCM `STOPPED` callback with no bound, and `ProxyManager`'s
