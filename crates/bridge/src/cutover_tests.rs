@@ -300,23 +300,103 @@ fn release_covers_refuses_against_a_bridge_live_in_a_peer_state_dir() {
     result.expect_err("a bridge alive in a peer state dir must refuse the release too");
 }
 
-/// `try_acquire` creates the directory it locks, so probing a peer dir that is
-/// not there would provision state for a bridge that never existed — the very
-/// litter the purge below exists to remove.
+/// The exclusion is what this function IS, so it is taken over every peer
+/// unconditionally — a peer whose dir is not there yet is the one an absent
+/// lock hurts most. `release_all` sweeps Windows' covers machine-wide, so a
+/// bridge that starts under that account mid-release engages a cover, records
+/// the posture, has the filters deleted underneath it, and skips
+/// re-engagement on its next covered start: a VPN running uncovered.
 #[skuld::test]
-fn release_covers_does_not_provision_a_peer_state_dir_that_is_absent() {
+fn release_covers_locks_a_peer_state_dir_that_is_not_there_yet() {
     let service = tempfile::tempdir().unwrap();
     let absent = service.path().join("no-such-user").join("state");
 
     let result = release_covers_with(
         service.path(),
         std::slice::from_ref(&absent),
+        || {
+            assert!(
+                crate::liveness::BridgeLiveness::try_acquire(&absent, None)
+                    .unwrap()
+                    .is_none(),
+                "a bridge starting under an account with no state dir yet must contend on the \
+                 same lock, not find it free"
+            );
+            Ok(Clearance::proven())
+        },
+        || {},
+    );
+
+    assert!(result.is_ok(), "{result:?}");
+}
+
+/// The litter the lock above costs. `try_acquire` creates what it locks, so a
+/// peer that was not there is provisioned to be locked — and removed again on
+/// the way out, down to the shallowest level this call had to make.
+#[skuld::test]
+fn release_covers_removes_the_peer_state_dirs_it_had_to_create() {
+    let service = tempfile::tempdir().unwrap();
+    let profile = service.path().join("no-such-user");
+
+    let result = release_covers_with(
+        service.path(),
+        &[profile.join("state")],
         || Ok(Clearance::proven()),
         || {},
     );
 
     assert!(result.is_ok(), "{result:?}");
-    assert!(!absent.exists(), "an absent peer dir must be skipped, not created");
+    assert!(
+        !profile.exists(),
+        "a peer tree this call provisioned in order to lock it must not be left behind"
+    );
+}
+
+#[skuld::test]
+fn provisioned_root_names_only_what_is_missing_and_never_what_cannot_be_read() {
+    let base = tempfile::tempdir().unwrap();
+    assert_eq!(
+        provisioned_root(base.path()),
+        None,
+        "a dir already there has nothing to provision"
+    );
+
+    let deep = base.path().join("profile").join("hole").join("state");
+    assert_eq!(
+        provisioned_root(&deep),
+        Some(base.path().join("profile")),
+        "the shallowest level `create_dir_all` would make is the root of what this call creates"
+    );
+
+    // An interior NUL makes every probe fail `InvalidInput` on both platforms.
+    // Undeterminable is not absent: reading it as absent would put a path this
+    // call never created onto the removal list.
+    let unprobeable = base.path().join("pro\0file").join("state");
+    assert_eq!(provisioned_root(&unprobeable), None);
+}
+
+/// The other side of that sweep: only what this call made goes. A peer dir
+/// that was already there belongs to the account that owns it, and its
+/// crash-recovery records are that bridge's, not this call's to delete.
+#[skuld::test]
+fn release_covers_leaves_a_peer_state_dir_that_was_already_there() {
+    let service = tempfile::tempdir().unwrap();
+    let peer = tempfile::tempdir().unwrap();
+    let record = peer.path().join("bridge-routes.json");
+    std::fs::write(&record, b"{}").unwrap();
+
+    let result = release_covers_with(
+        service.path(),
+        &[peer.path().to_path_buf()],
+        || Ok(Clearance::proven()),
+        || {},
+    );
+
+    assert!(result.is_ok(), "{result:?}");
+    assert!(
+        record.exists(),
+        "a pre-existing peer state dir is not this call's to remove"
+    );
 }
 
 /// The liveness lock contends per open handle, not per owning process, so a
@@ -475,10 +555,9 @@ fn the_windows_peer_mapping_matches_what_a_bridge_resolves() {
 #[cfg(target_os = "windows")]
 #[skuld::test]
 fn the_windows_peer_set_reaches_accounts_other_than_this_process() {
-    // The #1003/F3 regression itself: the peer enumeration used to be
-    // macOS-only, so on Windows the set was just `default_state_dir()` — the
-    // process's OWN dir, which `release_covers_with` skips as already probed.
-    // The probe then found nothing, every time.
+    // A peer set that resolves to only this process's own dir is
+    // indistinguishable from `release_covers_with`'s already-probed skip, and
+    // the probe reports no other bridges every time.
     let dirs = peer_state_dirs();
     let profile = std::path::PathBuf::from(std::env::var("USERPROFILE").expect("USERPROFILE"));
     assert!(

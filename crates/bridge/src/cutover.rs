@@ -373,19 +373,75 @@ fn purge_state_dir(state_dir: &Path) {
     }
 }
 
+/// The shallowest path `create_dir_all(dir)` would have to create — the root
+/// of the tree a peer lock is about to provision, so the sweep afterwards
+/// removes exactly what this call made and nothing above it. `None` when the
+/// dir is already there and nothing will be created.
+///
+/// Only a level this call established is ABSENT is named. A level whose
+/// presence cannot be told (`try_exists` errs — an unreadable ancestor, an
+/// unrepresentable path) reads as not-ours, because the removal list must
+/// never grow a path this call did not create.
+fn provisioned_root(dir: &Path) -> Option<PathBuf> {
+    let mut root: Option<PathBuf> = None;
+    let mut cur = Some(dir);
+    while let Some(p) = cur {
+        if !matches!(p.try_exists(), Ok(false)) {
+            break;
+        }
+        root = Some(p.to_path_buf());
+        cur = p.parent().filter(|q| !q.as_os_str().is_empty());
+    }
+    root
+}
+
 /// `release_covers`' ordering, with the release and the state purge injected so
 /// tests can drive the cannot-release path without touching the host firewall.
 ///
 /// `peers` are the other state dirs a bridge could be alive in; a lock held in
-/// any of them refuses the release just as the service's own does. A peer dir
-/// that does not exist is skipped rather than probed — `try_acquire` creates
-/// what it locks, and a probe that provisions a state dir for a bridge that
-/// was never there is the litter this function exists to clean up.
+/// any of them refuses the release just as the service's own does. Every peer
+/// is locked, including one whose dir is not there yet: the exclusion IS this
+/// function, and a peer left unlocked because it looked absent is a peer
+/// nothing excludes. `release_all` sweeps Windows' covers machine-wide, so a
+/// bridge starting under that account mid-release would engage a cover, record
+/// the posture, lose the filters to this sweep, and skip re-engagement on its
+/// next covered start — running uncovered.
+///
+/// `try_acquire` creates what it locks, so that costs a state dir on every
+/// account that never ran a bridge. It is litter, and it is removed on the way
+/// out ([`provisioned_root`]) — the choice is where to pay, never whether to
+/// lock.
 fn release_covers_with(
     state_dir: &Path,
     peers: &[PathBuf],
     release: impl FnOnce() -> std::io::Result<Clearance>,
     purge: impl FnOnce(),
+) -> std::io::Result<Clearance> {
+    let mut provisioned: Vec<PathBuf> = Vec::new();
+    let out = release_covers_locked(state_dir, peers, release, purge, &mut provisioned);
+    // Every lock is released by now — `release_covers_locked` drops them
+    // before it returns, on both its paths — so the trees it had to create to
+    // take them can go. Unconditional on the outcome: a refused release
+    // strands the same litter a successful one would.
+    for root in provisioned {
+        match std::fs::remove_dir_all(&root) {
+            Ok(()) => {}
+            // Nothing was created after all: `try_acquire`'s own
+            // `create_dir_all` failed, which is the unreadable-peer case the
+            // loop above warns on and tolerates.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => tracing::warn!(error = %e, "could not remove a peer state dir this release provisioned"),
+        }
+    }
+    out
+}
+
+fn release_covers_locked(
+    state_dir: &Path,
+    peers: &[PathBuf],
+    release: impl FnOnce() -> std::io::Result<Clearance>,
+    purge: impl FnOnce(),
+    provisioned: &mut Vec<PathBuf>,
 ) -> std::io::Result<Clearance> {
     let Some(liveness) = crate::liveness::BridgeLiveness::try_acquire(state_dir, None)? else {
         return Err(std::io::Error::other(
@@ -401,10 +457,15 @@ fn release_covers_with(
         // call's own guard — and duplicates are ordinary, not exotic: an
         // un-elevated run resolves `default_state_dir` and the real user's dir
         // to the same path.
-        if probed.contains(&peer.as_path()) || !peer.exists() {
+        if probed.contains(&peer.as_path()) {
             continue;
         }
         probed.push(peer.as_path());
+        // Read before the lock, and it decides only what the caller sweeps
+        // afterwards — never whether to lock. A dir that appeared in between
+        // was made by a bridge starting up, which would then hold the lock
+        // below and refuse the release outright.
+        provisioned.extend(provisioned_root(peer));
         match crate::liveness::BridgeLiveness::try_acquire(peer, None) {
             Ok(Some(guard)) => held.push(guard),
             Ok(None) => {
