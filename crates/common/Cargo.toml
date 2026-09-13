@@ -60,7 +60,7 @@ windows = { version = "0.62", features = [
 libc = "0.2"
 
 [build-dependencies]
-typify = "0.6"
+typify = "0.7"
 # NOT ours to choose. `build.rs` names `schemars::schema::Schema` only to feed
 # `typify::TypeSpace`, and typify does not re-export schemars, so this must be
 # the series typify speaks — `typify-impl` requires `^0.8.22`. 0.9 and 1.x both
