@@ -1668,11 +1668,38 @@ fn neither_engage_discards_its_pre_delete_codes() {
         "issue_pre_deletes must issue its deletes in exactly one place, the labelled map whose \
          codes are folded:\n{fold}"
     );
+    // Two links, because the fold is no longer in this body: the
+    // `StaleKeyPolicy` split moved it down into `pre_delete_verdict`, and a
+    // guard that chased the move by swapping one literal for the other would
+    // have stopped checking its own subject — that the codes reach
+    // `first_delete_failure` at all. Pin the hand-off AND the fold, so
+    // severing either one reds this test.
+    //
+    // Link one is `ends_with`, not `contains`: the call has to be the tail
+    // expression. That is the same discard hazard as above and the one
+    // spelling of it a `contains` cannot see — `let _ = pre_delete_verdict(..)`
+    // followed by `Ok(())` would satisfy a `contains` while throwing the
+    // verdict away.
     assert!(
-        fold.contains("first_delete_failure(&codes)"),
-        "issue_pre_deletes must fold its codes through first_delete_failure, so a not-found stays \
-         benign and anything else aborts the transaction:\n{fold}"
+        fold.trim_end().ends_with("pre_delete_verdict(policy, &codes)\n}"),
+        "issue_pre_deletes must RETURN the verdict on the codes it just collected, as its tail \
+         expression:\n{fold}"
     );
+    let verdict = item_body(src, "fn pre_delete_verdict(");
+    assert!(
+        verdict.contains("first_delete_failure(codes)"),
+        "pre_delete_verdict must fold the codes through first_delete_failure, so a not-found stays \
+         benign and anything else becomes the failure StaleKeyPolicy then rules on:\n{verdict}"
+    );
+    // Deliberately NOT pinned here: which policy arm each engage takes. That
+    // is behaviour, and behaviour is tested directly — the specs' policies in
+    // `the_stale_key_policy_follows_what_the_caller_does_with_a_failed_engage`
+    // and the arms themselves in
+    // `a_refused_pre_delete_fails_a_lockdown_engage_and_degrades_a_transient_one`.
+    // With the `spec.stale_key` hand-off pinned below, a later edit that put
+    // the lockdown engage on the fail-open `Degrade` arm has to red one of
+    // those three; a source scan would only restate them, more weakly.
+    //
     // The label mapping is only worth testing if production actually uses it;
     // a hardcoded string here would leave `pre_delete_label` dead and every
     // abort message identical.
