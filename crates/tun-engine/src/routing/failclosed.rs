@@ -47,7 +47,7 @@ pub enum StateFile<T> {
     /// the sweep that then runs with no token to hand `pfctl -X` clears the
     /// file as well, leaking pf's enable refcount until reboot. `None` is the
     /// honest answer for bytes that yielded nothing — an unreadable file, or
-    /// JSON with no usable `pf_token` — not a licence to stop looking.
+    /// JSON with no usable `pf_token`.
     Unusable { pf_token: Option<String> },
     /// A file exists and parsed at the current schema version.
     Present(T),

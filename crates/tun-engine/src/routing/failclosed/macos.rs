@@ -4,9 +4,9 @@
 //!   `pfctl -E`) and loads a self-contained ruleset (see `build_pf_ruleset`,
 //!   via `pfctl -f -`, NO `-Fa`) blocking everything but loopback, the
 //!   server, and the pinned resolver. Disengage restores the canonical
-//!   `/etc/pf.conf` and drops the refcount. Dropping `-Fa` (bindreams/hole#997)
-//!   is load-bearing: `-Fa` flushes ALL pf state as its own, separately
-//!   committed kernel operation, so `-Fa -f -` was two transactions with a
+//!   `/etc/pf.conf` and drops the refcount. Dropping `-Fa` is load-bearing:
+//!   `-Fa` flushes ALL pf state as its own, separately committed kernel
+//!   operation, so `-Fa -f -` was two transactions with a
 //!   pass-all host briefly live between them — including across a cover
 //!   TRANSITION (a second `engage` replacing a still-live one, with no
 //!   intervening `disengage`). A bare `pfctl -f -` load is a single pf
@@ -24,7 +24,7 @@
 //!   `skip on lo0` re-exposes loopback to the previous ruleset's `block out
 //!   all` for the whole parse. `LOOPBACK_PASSES` is what closes it; see that
 //!   const. Reading "no permit opens" as "no failure" is the same
-//!   merge-two-causes-on-one-consequence mistake bindreams/hole#1015 was.
+//!   merge-two-causes-on-one-consequence mistake.
 //!   A COLD engage (pf currently disabled) has NO gap of that class, and both
 //!   engages deliberately keep `-E` first there. pf enforces nothing while
 //!   disabled, so the pre-`-E` host is already maximally open and `-E` can
@@ -151,8 +151,7 @@ pub const LOOPBACK_SKIP: &str = "set skip on lo0\n";
 
 /// The rule half of the loopback exemption, holding the one window
 /// [`LOOPBACK_SKIP`] cannot hold for itself. Both halves are mandatory in every
-/// cover ruleset; dropping either re-opens bindreams/hole#1015 — loopback
-/// silently severed — by its own route.
+/// cover ruleset; dropping either silently severs loopback, by its own route.
 ///
 /// `set skip` is not part of the rule ticket. `pfctl`'s `main()` clears every
 /// interface's skip flag (`DIOCCLRIFFLAG`, via `pfctl_clear_interface_flags`)
@@ -258,9 +257,30 @@ pub fn labels_listing_carries_our_label(labels_output: &str) -> bool {
 ///
 /// `None` — not `Some(false)` — is what keeps the two-source design honest: a
 /// pfctl that could not run is no evidence the cover is gone.
+///
+/// Both failures warn, and warn apart. `None` is the right ANSWER but a silent
+/// one, indistinguishable in a log from a pfctl that ran and found nothing —
+/// and this feeds `lockdown_presence_and_state`, so an operator debugging a
+/// stuck disengage would otherwise have no trace that pf was never asked.
 pub(crate) fn pf_label_answer(out: Result<std::process::Output, RoutingError>) -> Option<bool> {
-    let out = out.ok()?;
+    let out = match out {
+        Ok(out) => out,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "`pfctl -s labels` could not be run, so pf's own answer about the lockdown cover \
+                 is unavailable and presence falls back to the state file alone"
+            );
+            return None;
+        }
+    };
     if !out.status.success() {
+        tracing::warn!(
+            status = ?out.status,
+            stderr = %String::from_utf8_lossy(&out.stderr).trim(),
+            "`pfctl -s labels` ran but exited non-zero, so pf's own answer about the lockdown \
+             cover is unavailable and presence falls back to the state file alone"
+        );
         return None;
     }
     Some(labels_listing_carries_our_label(&String::from_utf8_lossy(&out.stdout)))
@@ -409,9 +429,9 @@ impl Cover {
 /// state entry when a cover loads keeps flowing past `block out all` until its
 /// entry expires: `tcp.established` defaults to 86400s and every packet
 /// refreshes it, so a long-lived upload, an SSH session or a WebSocket never
-/// expires at all. `-Fa` used to purge state as a side effect of flushing
-/// everything; the bare `pfctl -f -` that replaced it (bindreams/hole#997)
-/// does not (bindreams/hole#1015).
+/// expires at all. Dropping `-Fa` (see this module's doc) no longer purges
+/// state as a side effect, so each engage that needs one purges explicitly
+/// here.
 ///
 /// - [`CoverKind::Transient`] — **purge**. Reachable whenever pf was already
 ///   enabled ahead of us: Internet Sharing, another VPN, a hand-run
@@ -458,8 +478,8 @@ const fn purges_state(kind: CoverKind) -> bool {
 /// A failed purge is logged, not propagated. Engage failure is fatal to the
 /// start and the transient path unwinds by reloading `/etc/pf.conf` — a fully
 /// open host. A live cover whose purge did not land is the pre-existing
-/// bindreams/hole#1015 residue; an open host is worse, so the purge never
-/// promotes itself into an engage failure.
+/// residue; an open host is worse, so the purge never promotes itself into an
+/// engage failure.
 fn load_cover_ruleset<T: CoverRulesetOps + ?Sized>(
     kind: CoverKind,
     ruleset: &str,
@@ -583,10 +603,9 @@ fn engage_with(
         return Err(e);
     }
 
-    // 4. Load our self-contained blocking ruleset from stdin — NO `-Fa`
-    //    (bindreams/hole#997), see this module's doc for why that is atomic
-    //    for the rules. The state purge that follows is [`purges_state`]'s
-    //    call, not this site's.
+    // 4. Load our self-contained blocking ruleset from stdin — NO `-Fa`; see
+    //    this module's doc for why that is atomic for the rules. The state
+    //    purge that follows is [`purges_state`]'s call, not this site's.
     let ruleset = build_pf_ruleset(server_ip, resolver_ip);
     if let Err(e) = load_cover_ruleset(CoverKind::Transient, &ruleset, ops) {
         // A *failed engage* is the sole place this module fails OPEN on its own
@@ -1160,8 +1179,7 @@ fn drop_token_or_warn(ops: &mut dyn PfOps, token: &str, message: &str) {
 
 /// [`drop_token_or_warn`] for a token that may or may not have survived an
 /// unusable record ([`StateFile::Unusable`]'s `pf_token`). The `None` arm is
-/// the disclosure that used to be the WHOLE behaviour of both `Unusable` arms,
-/// before the token was carried on the variant: a refcount nothing can now
+/// the same warn both `Unusable` arms emit when there is truly no token to
 /// release. `what` names which state file, since one `release_all` handles both.
 fn drop_salvaged_token_or_warn(ops: &mut dyn PfOps, token: Option<&str>, what: &str, message: &str) {
     match token {

@@ -1896,6 +1896,66 @@ fn pf_label_answer_maps_a_failed_pfctl_to_none() {
     assert_eq!(pf_label_answer(Ok(clean)), Some(false));
 }
 
+/// Both ways pf can fail to answer must be DISCLOSED, and disclosed apart.
+///
+/// `None` is the right semantic answer, but in a log it is indistinguishable
+/// from a `pfctl` that ran and found nothing. This feeds
+/// `lockdown_presence_and_state` and from there `disengage_lockdown_with`'s
+/// presence-based dispatch, so without a line here an operator debugging a
+/// stuck disengage has no trace that pf was never asked — while every other
+/// `pfctl` call site in this module warns where it fails.
+///
+/// A spawn failure and a non-success exit are different causes with different
+/// remedies, so they get different lines rather than one shared "could not ask".
+#[skuld::test]
+fn pf_label_answer_warns_which_way_pfctl_failed_to_answer() {
+    use tracing_subscriber::layer::{Layer, SubscriberExt};
+
+    let capture = |out: Result<std::process::Output, RoutingError>| {
+        let writer = garter::test_utils::WaitableWriter::new();
+        let subscriber = tracing_subscriber::registry().with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(writer.clone())
+                .with_ansi(false)
+                .with_filter(tracing_subscriber::filter::LevelFilter::WARN),
+        );
+        {
+            let _guard = garter::tracing_test::set_default_in_current_thread(subscriber);
+            assert_eq!(
+                pf_label_answer(out),
+                None,
+                "this test's premise: both inputs fold to the same None"
+            );
+        }
+        writer.snapshot()
+    };
+
+    let spawned = capture(Err(RoutingError::RouteSetup("mock pfctl spawn failure".into())));
+    assert!(
+        spawned.contains("pfctl -s labels") && spawned.contains("mock pfctl spawn failure"),
+        "a pfctl that never ran must be disclosed, carrying the error that stopped it: {spawned}"
+    );
+
+    let exited = capture(output_with_status(1));
+    assert!(
+        exited.contains("pfctl -s labels"),
+        "a pfctl that ran and exited non-zero must be disclosed too: {exited}"
+    );
+
+    // The distinctness is the point: one line reused for both would leave the
+    // operator unable to tell "pf was never asked" from "pf refused to answer".
+    let only_in = |a: &str, b: &str| {
+        a.split_whitespace()
+            .filter(|w| !b.contains(*w))
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+    };
+    assert!(
+        !only_in(&spawned, &exited).is_empty() && !only_in(&exited, &spawned).is_empty(),
+        "the two causes must not share one disclosure:\nspawn: {spawned}\nexit: {exited}"
+    );
+}
+
 // Self-capture guard ==================================================================================================
 
 #[skuld::test]

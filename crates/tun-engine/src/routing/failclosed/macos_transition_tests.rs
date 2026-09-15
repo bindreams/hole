@@ -1,13 +1,16 @@
 //! Privileged-lane real-engage tests for the macOS transient cover's
-//! TRANSITION behaviour (bindreams/hole#997), for its pf state purge
-//! (bindreams/hole#1015), and for what a `pfctl -f -` does to loopback while it
-//! loads: a second `engage()` replacing a still-live cover must never open a
-//! window, an engage must not let a flow established before it survive it, and
-//! no load may drop a loopback packet during the interval in which `pfctl` has
-//! cleared the interface skip flags but not yet committed the new rules. All
-//! engage the REAL OS cover, so they run on the elevated `tun` lane only — the `TUN` label gates them out of the unprivileged
-//! `SKULD_LABELS="!tun"` pass, and `serial = TUN` + `GLOBAL_NET_STATE`
-//! serialize them against every other test that mutates host network state.
+//! TRANSITION behaviour, for its pf state purge, and for what a `pfctl -f -`
+//! does to loopback while it loads: a second `engage()` replacing a still-live
+//! cover must never open a window, an engage must not let a flow established
+//! before it survive it, and no load may drop a loopback packet during the
+//! interval in which `pfctl` has cleared the interface skip flags but not yet
+//! committed the new rules. Each engages the REAL OS cover, so it runs on the
+//! elevated `tun` lane only — the `TUN` label gates them out of the
+//! unprivileged `SKULD_LABELS="!tun"` pass, and `serial = TUN` +
+//! `GLOBAL_NET_STATE` serialize them against every other test that mutates host
+//! network state. [`publish_on_commit_brackets_its_load_with_a_generation_change`]
+//! is the one unlabelled test here: it pins [`PublishOnCommit`]'s bracket, the
+//! only part of this file's machinery provable without root.
 //!
 //! A DESCENDANT module of `platform` (mounted from `macos.rs`) rather than a
 //! sibling of `lockdown_privileged_tests.rs` under `failclosed`: these tests
@@ -20,26 +23,34 @@ use std::net::IpAddr;
 
 use crate::{GLOBAL_NET_STATE, TUN};
 
-/// Engage a transient cover exactly like the public [`engage`], except
+/// Engage a transient cover exactly like the public [`engage`], except that
 /// `permitted_idx` and `commit_gen` are published from INSIDE the engage path,
-/// synchronously right after `pfctl -f -` returns success — the instant the new
-/// ruleset actually takes effect — rather than after `engage`/`engage_with`
-/// return.
+/// around the `pfctl -f -` that makes them true, rather than after
+/// `engage`/`engage_with` return.
 ///
-/// That gap is real, not cosmetic: a successful load is followed by
+/// The gap that closes is real, not cosmetic: a successful load is followed by
 /// `load_cover_ruleset`'s `pfctl -F states` purge (`purges_state(Transient)
 /// == true`) — a second `pfctl` fork/exec/ioctl/exit — before control climbs
 /// back out to the caller. On a 24-36ms transition period that is enough for a
 /// whole probe attempt's window to fall inside it, so a marker published only
 /// on return can be stale for that attempt's entire span, not merely racy with
-/// it. Publishing at the real commit, from inside the same call that produced
-/// it, removes that gap instead of describing it.
+/// it.
 ///
-/// `permitted_idx` is stored BEFORE `commit_gen` is bumped, and the consumer
-/// reads `commit_gen` before `permitted_idx` (see the control thread). That
-/// order is what makes the generation check conservative in the safe
-/// direction: an attempt can be excluded needlessly, never counted against a
-/// target that changed under it.
+/// Publishing from inside the engage does NOT make the marker exact, and this
+/// comment does not claim it does: the kernel commits at `DIOCXCOMMIT` inside
+/// the child, and the load call returns only once that child has exited and
+/// been reaped, so any store placed after it is still late by the reap.
+/// [`PublishOnCommit`] therefore BRACKETS the load — one generation bump
+/// before it, one after the target is stored — so an attempt overlapping the
+/// commit, or the unobservable reap lag behind it, straddles a generation
+/// change and is EXCLUDED rather than mis-attributed. That is the conservative
+/// direction: attempts are excluded needlessly, never counted against a target
+/// that changed under them.
+///
+/// `permitted_idx` is stored BEFORE the closing bump, and the consumer reads
+/// `commit_gen` before `permitted_idx` (see the control thread), so the window
+/// the generation check covers always starts no later than the target read it
+/// is vouching for.
 ///
 /// Test-only: wraps [`RealEngageOps`] rather than reimplementing it, and leaves
 /// production `engage`/`engage_with` untouched.
@@ -50,51 +61,6 @@ fn engage_publishing(
     commit_gen: &std::sync::atomic::AtomicUsize,
     server_idx: usize,
 ) -> Result<Cover, RoutingError> {
-    struct PublishOnCommit<'a> {
-        inner: RealEngageOps<'a>,
-        permitted_idx: &'a std::sync::atomic::AtomicUsize,
-        commit_gen: &'a std::sync::atomic::AtomicUsize,
-        server_idx: usize,
-    }
-
-    impl CoverRulesetOps for PublishOnCommit<'_> {
-        fn load_ruleset(&mut self, text: &str) -> Result<(), RoutingError> {
-            self.inner.load_ruleset(text)?;
-            // The commit `engage_publishing`'s doc comment promises: this runs
-            // the instant `pfctl -f -` reports success, before the state purge
-            // that follows it in `load_cover_ruleset`.
-            self.permitted_idx
-                .store(self.server_idx, std::sync::atomic::Ordering::SeqCst);
-            // Monotonic, so two commits inside one attempt's window are
-            // distinguishable from none. `permitted_idx` alone cannot say that:
-            // it only ever alternates 0/1.
-            self.commit_gen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            Ok(())
-        }
-
-        fn flush_states(&mut self) -> Result<(), RoutingError> {
-            self.inner.flush_states()
-        }
-    }
-
-    impl EngageOps for PublishOnCommit<'_> {
-        fn pf_enabled(&mut self) -> Result<bool, RoutingError> {
-            self.inner.pf_enabled()
-        }
-        fn enable_capture_token(&mut self) -> Result<String, RoutingError> {
-            self.inner.enable_capture_token()
-        }
-        fn save_transient(&mut self, st: &state::FailClosedState) -> Result<(), RoutingError> {
-            self.inner.save_transient(st)
-        }
-        fn drop_token(&mut self, token: &str) -> Result<(), RoutingError> {
-            self.inner.drop_token(token)
-        }
-        fn transient_restore(&mut self, token: &str) {
-            self.inner.transient_restore(token)
-        }
-    }
-
     let mut ops = PublishOnCommit {
         inner: RealEngageOps { state_dir, owner: None },
         permitted_idx,
@@ -107,6 +73,154 @@ fn engage_publishing(
         state_dir: state_dir.to_owned(),
         kind: CoverKind::Transient,
     })
+}
+
+/// [`engage_publishing`]'s publisher, generic over the wrapped ops so the
+/// bracket it puts around the load is pinned by a unit test
+/// ([`publish_on_commit_brackets_its_load_with_a_generation_change`]) instead of
+/// only by the privileged run that cannot be executed without root.
+struct PublishOnCommit<'a, I> {
+    inner: I,
+    permitted_idx: &'a std::sync::atomic::AtomicUsize,
+    commit_gen: &'a std::sync::atomic::AtomicUsize,
+    server_idx: usize,
+}
+
+impl<I: CoverRulesetOps> CoverRulesetOps for PublishOnCommit<'_, I> {
+    fn load_ruleset(&mut self, text: &str) -> Result<(), RoutingError> {
+        // Opens the in-flight window BEFORE the load, because the commit
+        // happens inside the child and the reap lag after it is unobservable
+        // from here: an attempt spanning either now straddles a generation
+        // change and is excluded rather than mis-attributed. The bump survives
+        // the `?` below on purpose — a failed load can have committed too.
+        self.commit_gen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.inner.load_ruleset(text)?;
+        self.permitted_idx
+            .store(self.server_idx, std::sync::atomic::Ordering::SeqCst);
+        // Closes it. Monotonic, so two commits inside one attempt's window are
+        // distinguishable from none. `permitted_idx` alone cannot say that:
+        // it only ever alternates 0/1.
+        self.commit_gen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn flush_states(&mut self) -> Result<(), RoutingError> {
+        self.inner.flush_states()
+    }
+}
+
+impl<I: EngageOps> EngageOps for PublishOnCommit<'_, I> {
+    fn pf_enabled(&mut self) -> Result<bool, RoutingError> {
+        self.inner.pf_enabled()
+    }
+    fn enable_capture_token(&mut self) -> Result<String, RoutingError> {
+        self.inner.enable_capture_token()
+    }
+    fn save_transient(&mut self, st: &state::FailClosedState) -> Result<(), RoutingError> {
+        self.inner.save_transient(st)
+    }
+    fn drop_token(&mut self, token: &str) -> Result<(), RoutingError> {
+        self.inner.drop_token(token)
+    }
+    fn transient_restore(&mut self, token: &str) {
+        self.inner.transient_restore(token)
+    }
+}
+
+/// The generation must BRACKET the load, not trail it.
+///
+/// `DIOCXCOMMIT` happens inside the `pfctl` child; `inner.load_ruleset` only
+/// returns once that child has written its output, exited and been reaped. A
+/// publish that lands after the reap leaves an interval in which the kernel
+/// already enforces the new ruleset while `commit_gen` still advertises the old
+/// one — so a control attempt whose whole window falls inside it reads equal
+/// generations, dials the arm the LIVE ruleset now blocks, and is counted as a
+/// non-hit against a target that changed under it.
+///
+/// Unprivileged deliberately: this is the one property of
+/// [`engage_publishing`] that can be pinned without root, and it is the
+/// property the file's privileged tests rely on but cannot themselves assert.
+#[skuld::test]
+fn publish_on_commit_brackets_its_load_with_a_generation_change() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Samples `commit_gen` at the instant of the load — standing in for the
+    /// commit itself, which the real publisher cannot observe directly.
+    struct SamplingLoad<'a> {
+        commit_gen: &'a AtomicUsize,
+        observed: Option<usize>,
+        fail: bool,
+    }
+    impl CoverRulesetOps for SamplingLoad<'_> {
+        fn load_ruleset(&mut self, _text: &str) -> Result<(), RoutingError> {
+            self.observed = Some(self.commit_gen.load(Ordering::SeqCst));
+            if self.fail {
+                Err(RoutingError::RouteSetup("mock load_ruleset failure".into()))
+            } else {
+                Ok(())
+            }
+        }
+        fn flush_states(&mut self) -> Result<(), RoutingError> {
+            Ok(())
+        }
+    }
+
+    let permitted_idx = AtomicUsize::new(0);
+    // Not 0: a bracket that happened to publish the right value from a zeroed
+    // counter would pass a test that started there.
+    let commit_gen = AtomicUsize::new(7);
+    let publisher = |inner, server_idx| PublishOnCommit {
+        inner,
+        permitted_idx: &permitted_idx,
+        commit_gen: &commit_gen,
+        server_idx,
+    };
+
+    let mut ops = publisher(
+        SamplingLoad {
+            commit_gen: &commit_gen,
+            observed: None,
+            fail: false,
+        },
+        1,
+    );
+    ops.load_ruleset("irrelevant").expect("the mock load succeeds");
+    assert_eq!(
+        ops.inner.observed,
+        Some(8),
+        "the generation must ALREADY have moved while the load is in flight — an attempt spanning \
+         the commit has to straddle a generation change, or it is counted against a target that \
+         changed under it"
+    );
+    assert_eq!(
+        commit_gen.load(Ordering::SeqCst),
+        9,
+        "and move again after the new target is published, closing the bracket"
+    );
+    assert_eq!(permitted_idx.load(Ordering::SeqCst), 1, "the new target is published");
+
+    // A FAILED load can have committed too — `pfctl` applies its `set` ioctls
+    // as it parses, outside the rule ticket — so the OPENING bump must survive
+    // the `?`, excluding an attempt that spanned it rather than mis-counting it.
+    let mut failed = publisher(
+        SamplingLoad {
+            commit_gen: &commit_gen,
+            observed: None,
+            fail: true,
+        },
+        0,
+    );
+    failed.load_ruleset("irrelevant").expect_err("the mock load fails");
+    assert_eq!(
+        commit_gen.load(Ordering::SeqCst),
+        10,
+        "a failed load leaves its opening bump in place"
+    );
+    assert_eq!(
+        permitted_idx.load(Ordering::SeqCst),
+        1,
+        "but publishes no new target: the load that would have made it true never committed one"
+    );
 }
 
 /// Floor the positive control of
@@ -167,7 +281,7 @@ const CONTROL_RATE_FLOOR_PCT: f64 = 25.0;
 ///   filtered regardless of what is loaded.
 /// - **Every transition** (each later `engage()`, replacing a still-live
 ///   cover). Asserted STRICTLY: the prober pool runs continuously across all
-///   of them and not one probe may succeed. This is the actual #997 property.
+///   of them and not one probe may succeed. This is the actual property here.
 ///   The pool starts only after the cold engage's post-condition has been
 ///   verified, so from the instant the first prober SYN goes out the host is
 ///   KNOWN blocked and any success at all is a leak — no phase filtering, no
@@ -179,8 +293,8 @@ const CONTROL_RATE_FLOOR_PCT: f64 = 25.0;
 /// outright fails already surfaces as an Err from `engage`; only a settled
 /// connect catches the silent half.
 ///
-/// EVIDENTIARY SCOPE (the #997 caveat, `macos.rs`'s module doc has the
-/// ticket-discipline argument in full): a pass here is strong empirical
+/// EVIDENTIARY SCOPE (`macos.rs`'s module doc has the ticket-discipline
+/// argument in full): a pass here is strong empirical
 /// evidence, not a mathematical proof, of atomicity across `TRANSITIONS` real
 /// transitions — `PROBER_THREADS` concurrent short-timeout probers give an
 /// `-Fa`-shaped regression many overlapping, independent chances to be caught.
@@ -199,31 +313,36 @@ const CONTROL_RATE_FLOOR_PCT: f64 = 25.0;
 /// survives a PASS. See the printed line itself for what it means and its own
 /// caveats — this comment does not restate them.
 ///
-/// LAST MEASURED — from this branch's own green privileged darwin run, and
-/// nowhere else; not carried over from a previous filter's run, since the
-/// commit-generation check below changed which attempts are counted.
+/// LAST MEASURED — PENDING. The commit-generation check now BRACKETS the load
+/// instead of trailing it, which changes which attempts are counted, so the
+/// previous run's figures do not describe this code and are deliberately not
+/// carried forward rather than replaced by guesses. Fill this in from this
+/// branch's own next green privileged darwin run and from nowhere else; the
+/// printed `[sensitivity]` line below carries every column.
 ///
-/// | lane  | filtered       | raw (unfiltered) | pool                                              |
-/// |-------|----------------|------------------|---------------------------------------------------|
-/// | arm64 | 191/191 100.0% | 208/214 97.2%    | 480 probes / 16 threads / 627.470417ms = 1307 us   |
-/// | amd64 | 184/184 100.0% | 200/206 97.1%    | 416 probes / 16 threads / 523.110046ms = 1257 us   |
+/// | lane  | filtered | raw (unfiltered) | pool |
+/// |-------|----------|------------------|------|
+/// | arm64 |          |                  |      |
+/// | amd64 |          |                  |      |
 ///
 /// The raw rate is what [`CONTROL_RATE_FLOOR_PCT`] is set from; see that const
-/// for why the floor sits where it does.
+/// for why the floor sits where it does. Only `filtered` can move on the
+/// bracket's account — raw and pool are measured upstream of the filter — but
+/// none of the three is transcribed from a build that did not carry it.
 ///
-/// Those figures answer the question the printed caveat leaves open. The window
-/// this guards is NOT sub-millisecond: `-Fa`'s gap spans the `/etc/pf.os`
-/// fingerprint reload plus the rule parse, and a bare `pfctl -n -f -` round
-/// trip measures 2.0-2.7ms. The pool's ~1.3ms probe interval is the same order
-/// — roughly two probes per window — which is why the guard works at all rather
-/// than being structurally coarser than what it hunts.
+/// What those figures answer is the question the printed caveat leaves open:
+/// whether the pool's probe interval is the same order as the window being
+/// hunted. That window is NOT sub-millisecond — `-Fa`'s gap spans the
+/// `/etc/pf.os` fingerprint reload plus the rule parse, and a bare
+/// `pfctl -n -f -` round trip measures 2.0-2.7ms — so the `pool` column is what
+/// has to be read against it, and the guard works only while it is.
 ///
-/// An attempt is excluded by the generation filter exactly when a commit lands
-/// inside its window, so the exclusion rate is attempt duration over transition
-/// period. Both lanes measured ~11% (arm64 23/214, amd64 22/206) — close,
-/// because their attempt durations and transition periods scale together. A leg
-/// with slow attempts against fast transitions would exclude most of its
-/// sample, and that too would be the filter working, not a defect.
+/// An attempt is excluded when its window overlaps a LOAD, not merely the
+/// instant one commits: the bracket opens before the child runs and closes
+/// after its target is published, so the excluded span is the whole load. The
+/// exclusion rate is therefore that span over the transition period. A leg with
+/// slow attempts against fast transitions would exclude most of its sample, and
+/// that too would be the filter working, not a defect.
 #[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
 fn macos_failclosed_cover_transition_never_admits_blocked_flow() {
     use std::net::TcpStream;
@@ -399,13 +518,13 @@ fn macos_failclosed_cover_transition_never_admits_blocked_flow() {
         // ABA, and the measured figures put it inside the operating range
         // rather than outside it — an attempt can run the full
         // `PROBER_TIMEOUT` against a transition period of the same order. The
-        // monotonic `commit_gen`, bumped inside the same call that stores
+        // monotonic `commit_gen`, bumped on BOTH sides of the load that stores
         // `permitted_idx`, cannot alias: equal generations across the attempt
-        // means zero commits landed in its window, full stop.
+        // mean no load was in flight during it, full stop.
         //
         // `commit_gen` is read BEFORE `permitted_idx`, mirroring the publisher's
-        // store-then-bump order, so the window the generation check covers
-        // always starts no later than the target read it is vouching for.
+        // store-then-closing-bump order, so the window the generation check
+        // covers always starts no later than the target read it is vouching for.
         //
         // Both a RAW count (every successful connect, uncounted attempts
         // included) and the filtered `hits`/`permitted_attempts` are tracked, so
@@ -494,7 +613,7 @@ fn macos_failclosed_cover_transition_never_admits_blocked_flow() {
     // doc comment): a green with no number attached says only that nothing was
     // caught, not that anything would have been. `permitted_attempts` (not
     // `control_total_attempts`) is `hits`' denominator: some control attempts
-    // straddle a commit and are excluded by the generation check even though
+    // straddle a load and are excluded by the generation check even though
     // every attempt targets the believed-permitted arm (see the control
     // thread's doc comment above).
     let hits = control_hits.load(Ordering::SeqCst);
@@ -588,7 +707,7 @@ fn macos_failclosed_cover_transition_never_admits_blocked_flow() {
     );
 }
 
-// pf state purge on a transient engage (bindreams/hole#1015, transient half) ==========================================
+// pf state purge on a transient engage ================================================================================
 
 /// Proves the behavioural half of [`purges_state`]: a flow that already holds
 /// a pf state entry when the transient cover engages does **not** survive it.
@@ -605,7 +724,7 @@ fn macos_failclosed_cover_transition_never_admits_blocked_flow() {
 /// `!pf_is_enabled`), and stock macOS ships pf loaded but never enabled. So the
 /// test stands in for the third party that enabled it — Internet Sharing,
 /// another VPN, a hand-run `pfctl -e` — with its own `pfctl -E` plus a
-/// permissive keep-state ruleset, exactly the case #1015 calls its case 2. The
+/// permissive keep-state ruleset. The
 /// `-E` refcount this takes is returned at the end; the cover's own `-E`/`-X`
 /// pair nests inside it, so pf's enable state is exactly as this test found it
 /// once both are released.
