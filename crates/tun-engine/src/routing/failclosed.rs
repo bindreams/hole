@@ -142,12 +142,18 @@ pub fn recover_cover(state_dir: &Path, adopting: bool) {
 /// the start. `app_ids` is empty on macOS (pf has no per-process matching).
 ///
 /// On a platform whose standing cover arms boot-time keys
-/// (`platform::STANDING_COVER_ARMS_BOOT_TIME`) a success also records the
-/// [`boottime_witness`]: this is the moment the fact becomes true, and
-/// recording it here — rather than leaving it to the first sweep that observes
-/// a sibling — covers the host whose sibling is removed by something that is
-/// not a sweep at all (an external FWPM delete, a firewall reset), where no
-/// sweep ever had the evidence to copy.
+/// (`platform::STANDING_COVER_ARMS_BOOT_TIME`) the engage also records the
+/// [`boottime_witness`], covering the host whose sibling is removed by
+/// something that is not a sweep at all (an external FWPM delete, a firewall
+/// reset), where no sweep ever had the evidence to copy.
+///
+/// That write does NOT live here, and bindreams/hole#1010's F3 is why: the
+/// moment the fact becomes true is the moment the transaction commits, and
+/// `platform::engage_lockdown` has post-commit work after it whose failure
+/// leaves the cover standing. A `?` at this level skipped the record for
+/// exactly the host class it exists to cover. The record is written inside
+/// the platform engage, bound to the commit — see `windows.rs`'s
+/// `commit_and_record`.
 pub fn engage_lockdown(
     server_ip: IpAddr,
     tun_name: &str,
@@ -158,18 +164,14 @@ pub fn engage_lockdown(
 ) -> Result<Cover, RoutingError> {
     #[cfg(target_os = "windows")]
     let inner = {
-        let _ = owner;
         let luid = resolver.resolve(tun_name)?;
-        platform::engage_lockdown(server_ip, luid, app_ids, state_dir)?
+        platform::engage_lockdown(server_ip, luid, app_ids, state_dir, owner)?
     };
     #[cfg(target_os = "macos")]
     let inner = {
         let _ = (resolver, app_ids);
         platform::engage_lockdown(server_ip, tun_name, state_dir, owner)?
     };
-    if platform::STANDING_COVER_ARMS_BOOT_TIME {
-        boottime_witness::record_armed(state_dir, owner);
-    }
     Ok(Cover { _inner: inner })
 }
 
@@ -362,11 +364,12 @@ pub fn lockdown_cover_presence(state_dir: &Path) -> crate::routing::CoverPresenc
 ///    **`Ok` is therefore qualified, not absolute**, and [`Clearance`] — the
 ///    `Ok` payload — carries the qualification. `Ok` says every delete this
 ///    call issued either removed an object or came back empty;
-///    [`Clearance::is_proven`] is the narrower claim that an empty answer
-///    *proved* the key carries nothing. The two differ for exactly one key
-///    class, [`KeyLifetime::BootTime`]. The uninstall gate is the caller that
-///    must read the narrower one: it is about to delete the only binary that
-///    could act on the difference.
+///    [`Clearance::is_proven`] is the narrower claim that what a key answered
+///    *proved* it carries nothing. The two differ for exactly one key class,
+///    [`KeyLifetime::BootTime`], where NO answer proves that — not an empty
+///    one, and not a removal watched happen. The uninstall gate is the caller
+///    that must read the narrower one: it is about to delete the only binary
+///    that could act on the difference.
 /// 5. **Bookkeeping is best-effort, except the state-file clear.** The macOS
 ///    `pfctl -X` refcount drop and the Windows sublayer/provider delete log a
 ///    warning on failure and do not fail the call. A cover's state-file clear
@@ -410,6 +413,17 @@ pub enum KeyLifetime {
     /// boots at all — is unmeasured: it needs a reboot-capable elevated lane
     /// that does not exist. See CONTRIBUTING.md's fail-closed residuals.
     ///
+    /// **No outcome proves such a key empty**, not even a removal somebody
+    /// watched happen ([`KeyObservation::proves_empty`] is `false` for the
+    /// whole row). Every read this crate can take — `FwpmFilterDeleteByKey0`'s
+    /// code, a `BOOTTIME_ONLY` enumeration, `netsh wfp show boottimepolicy` —
+    /// goes through the Base Filtering Engine, and the record in question is
+    /// by definition what applies BEFORE BFE starts at the next boot. So a
+    /// delete's `ERROR_SUCCESS` says the runtime object is gone and stops
+    /// there. The asymmetry is deliberate and is the same one `engage_lockdown`
+    /// uses in the other direction: a twin read back out of the boot-time view
+    /// makes a record POSSIBLE (report it), and nothing makes one impossible.
+    ///
     /// The harm is bounded: BFE's start is what takes a boot-time filter out
     /// of effect, so a stranded record blocks egress across the boot→BFE
     /// window only. How long that window is has not been measured here — the
@@ -435,9 +449,10 @@ pub enum KeyLifetime {
 /// strength of. See CLAUDE.md's "per-variant policy lives on the type".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeyOutcome {
-    /// The delete removed a live object (`ERROR_SUCCESS`). Proof of removal
-    /// for ANY lifetime — this is the half #1010 measured for boot-time keys
-    /// (the filter leaves the `BOOTTIME_ONLY` view).
+    /// The delete removed a live object (`ERROR_SUCCESS`). Proof that the
+    /// RUNTIME OBJECT is gone — for a boot-time key that is what #1010
+    /// measured (the filter leaves the `BOOTTIME_ONLY` view), and it is only
+    /// half the question; see [`KeyLifetime::BootTime`] for the other half.
     Removed,
     /// The delete found nothing on the key (`FWP_E_FILTER_NOT_FOUND`). Proof
     /// of absence only for [`KeyLifetime::Persistent`].
@@ -509,16 +524,21 @@ impl KeyObservation {
     /// happen to share a consequence.
     pub fn proves_empty(&self) -> bool {
         match (self.lifetime, self.outcome) {
-            // A removal we watched happen is proof regardless of lifetime.
-            (_, KeyOutcome::Removed) => true,
+            // Nothing this crate can call reads a boot-time key's policy
+            // record, so no outcome proves one gone — including a removal
+            // somebody watched happen, which proves only that the RUNTIME
+            // object went. Writing a negative conclusion off a return code is
+            // the one thing bindreams/hole#1010's remediation forbids, and
+            // this row is where it would have been written.
+            (KeyLifetime::BootTime, _) => false,
+            // A removal we watched happen is proof for a key whose runtime
+            // object and record are the same thing.
+            (KeyLifetime::Persistent, KeyOutcome::Removed) => true,
             // The by-key delete addresses a persistent key's only record, so
             // an empty answer proves the key carries nothing.
             (KeyLifetime::Persistent, KeyOutcome::NotFound) => true,
-            // A boot-time key answers empty on any boot where its runtime
-            // object is not live, whether or not a record survives behind it.
-            (KeyLifetime::BootTime, KeyOutcome::NotFound) => false,
             // The delete never got an answer about the key at all.
-            (_, KeyOutcome::Failed) => false,
+            (KeyLifetime::Persistent, KeyOutcome::Failed) => false,
         }
     }
 }
@@ -546,8 +566,10 @@ impl KeyObservation {
 ///
 /// It carries a SECOND, independent answer, and the two must not be confused.
 /// [`Self::is_proven`] is what the sweep proved and never moves; it is false
-/// on essentially every Windows sweep, because the twins answer empty whenever
-/// no bridge engaged in this boot. [`Self::leftover_keys`] is what is worth
+/// on EVERY Windows sweep, because no outcome proves a boot-time key empty —
+/// not a not-found on a boot where no bridge engaged, and not a removal
+/// watched happen on the boot that armed it (bindreams/hole#1010's F2; see
+/// [`KeyLifetime::BootTime`]). [`Self::leftover_keys`] is what is worth
 /// telling an operator, which is narrower: an unproven key on a host where no
 /// boot-time twin could ever have been armed did not strand anything, and
 /// reporting one every time is how the host where it is real gets ignored
@@ -565,6 +587,12 @@ impl KeyObservation {
 /// removes it, after which every later sweep reads an empty sibling set as "no
 /// cover was ever here" and goes silent for good; the record is lost by a
 /// wiped state dir. See [`boottime_witness`] for the full argument.
+///
+/// **The record is write-once and nothing here retracts it**, so on a host
+/// that ever armed a twin `leftover_keys` reports for the life of the
+/// `state_dir` — including after a genuine, watched cleanup. That residual is
+/// disclosed in [`boottime_witness`]'s module doc and is the price of refusing
+/// to conclude anything negative about a boot-time record from a return code.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[must_use = "the uninstall gate reads this; dropping it restores the silent `Ok` of #1003"]
 pub struct Clearance {
@@ -633,9 +661,11 @@ enum BootTimeSightings {
     /// The sweep touched no boot-time key at all — macOS, and any future sweep
     /// list that drops them. It has nothing to say about the record.
     None,
-    /// Every boot-time key the sweep touched proved itself empty.
-    AllProven,
-    /// At least one boot-time key's absence went unproven.
+    /// The sweep touched at least one boot-time key, whose absence it could
+    /// not prove. There is no second answer here: a boot-time key has no
+    /// outcome that proves its record empty ([`KeyLifetime::BootTime`]), so
+    /// "the sweep saw one" and "the sweep left one unproven" are the same
+    /// finding.
     SomeUnproven,
 }
 
@@ -821,20 +851,20 @@ impl Clearance {
     /// What this sweep's own observations say the persisted record should now
     /// hold — derived here, once, and never at a write site.
     ///
-    /// Total over the pair. The load-bearing cell is the last one: an unproven
-    /// boot-time key on a host whose siblings all answered empty writes
-    /// NOTHING. Writing `Disarm` there would re-create the defect this record
-    /// exists to fix, one level down — "no cover is installed now" is not
-    /// evidence about a twin's record, which is the entire premise of
-    /// [`KeyLifetime::BootTime`].
+    /// Total over the pair, and it only ever moves toward reporting. No cell
+    /// clears the record, because no sweep observation can: see
+    /// [`KeyLifetime::BootTime`] and [`boottime_witness::WitnessUpdate`].
+    ///
+    /// The load-bearing cell is the last one: an unproven boot-time key on a
+    /// host whose siblings all answered empty writes NOTHING rather than
+    /// arming. "No cover is installed now" is not evidence about a twin's
+    /// record in EITHER direction, so it neither reports nor suppresses.
     pub(crate) fn witness_update(&self) -> boottime_witness::WitnessUpdate {
         use boottime_witness::WitnessUpdate;
         match (self.boot_time, self.sibling) {
             // The sweep touched no boot-time key, so it saw nothing the record
             // is about.
             (BootTimeSightings::None, _) => WitnessUpdate::Leave,
-            // Watched every one of them go — proof for any lifetime.
-            (BootTimeSightings::AllProven, _) => WitnessUpdate::Disarm,
             // A record is possible here and the live evidence for that is
             // about to be deleted by this very sweep. Copy it out first.
             (BootTimeSightings::SomeUnproven, SiblingEvidence::Installed | SiblingEvidence::Unknown) => {
@@ -850,19 +880,22 @@ impl Clearance {
 ///
 /// Reads [`KeyObservation::proves_empty`] rather than re-deriving which
 /// outcomes count, so this and [`Clearance::unproven`] cannot disagree about
-/// whether a given key was proven.
+/// whether a given key was proven. The read is a `debug_assert` because there
+/// is nothing left to branch on — no boot-time outcome proves its key empty —
+/// and an assertion is what keeps that from being an assumption this function
+/// quietly makes on its own.
 fn boot_time_sightings(observations: &[KeyObservation]) -> BootTimeSightings {
-    let mut seen = false;
-    let mut unproven = false;
+    let mut sightings = BootTimeSightings::None;
     for o in observations.iter().filter(|o| o.lifetime == KeyLifetime::BootTime) {
-        seen = true;
-        unproven |= !o.proves_empty();
+        debug_assert!(
+            !o.proves_empty(),
+            "a boot-time key cannot prove its policy record empty: {} answered {:?}",
+            o.key,
+            o.outcome
+        );
+        sightings = BootTimeSightings::SomeUnproven;
     }
-    match (seen, unproven) {
-        (false, _) => BootTimeSightings::None,
-        (true, true) => BootTimeSightings::SomeUnproven,
-        (true, false) => BootTimeSightings::AllProven,
-    }
+    sightings
 }
 
 /// One sweep's whole interaction with the persisted boot-time record: consult
@@ -872,26 +905,100 @@ fn boot_time_sightings(observations: &[KeyObservation]) -> BootTimeSightings {
 /// through here, which is what makes the three sites that DISCARD the returned
 /// [`Clearance`] safe — `recover_lockdown`'s `Sweep` arm, `SystemRouting::
 /// release_all_covers`, and the reconciler's `CoverStep::Release` through it.
-/// The evidence is persisted before the value they drop is built, so dropping
-/// it costs an operator message on that one call and nothing beyond it.
+/// The evidence is persisted before anything is returned AT ALL — before the
+/// `Ok` those three drop, and before the `Err` a failing sweep hands its
+/// caller — so dropping the value costs an operator message on that one call
+/// and nothing beyond it.
 ///
 /// Generic over the sweep so the SEQUENCE this exists for — a sweep that
 /// removes the sibling, followed by one that can no longer see it — is
 /// drivable without a firewall, on every platform's lane. A single observation
 /// slice cannot express it, which is why the defect was invisible to tests
-/// built from one.
+/// built from one. The sweep returns a [`SweepOutcome`] rather than a `Result`
+/// for the reason that type gives: a FAILING sweep is holding observations
+/// too, and the sequence where that matters is equally undrivable from a type
+/// that throws them away.
 fn sweep_with_witness(
     state_dir: &Path,
     owner: Option<(u32, u32)>,
-    sweep: impl FnOnce(ArmingWitness) -> Result<Clearance, RoutingError>,
+    sweep: impl FnOnce(ArmingWitness) -> SweepOutcome,
 ) -> Result<Clearance, RoutingError> {
     let witness = boottime_witness::load(state_dir);
-    // A sweep that FAILED observed nothing it can write down: `Err` means a
-    // delete was refused or the engine could not be reached, and neither says
-    // anything about a key. The record keeps whatever it held.
-    let clearance = sweep(witness)?;
+    let SweepOutcome { clearance, failure } = sweep(witness);
+    // The record is written from what the sweep OBSERVED, before its failure
+    // reaches the caller. A failing sweep is not an unobservant one: this
+    // codebase's own sweeps issue every delete before inspecting any code, so
+    // `Err` arrives after the sibling's delete already succeeded — see
+    // [`SweepOutcome`].
     boottime_witness::apply(state_dir, witness, clearance.witness_update(), owner);
-    Ok(clearance)
+    match failure {
+        Some(e) => Err(e),
+        None => Ok(clearance),
+    }
+}
+
+/// One sweep's whole result: the verdict built from every observation it made,
+/// and the failure — if any — it must still report.
+///
+/// Deliberately NOT a `Result<Clearance, _>`, and that is bindreams/hole#1010's
+/// F1. Both Windows sweeps ISSUE every delete before inspecting any code (a
+/// structural property `release_all` and `disengage_lockdown` both state), so
+/// a sweep that ends in `Err` has already removed whatever it removed — up to
+/// and including the standing cover's `PERSISTENT` sibling, the one piece of
+/// live evidence no later sweep can re-derive. A `Result` drops those
+/// observations along the `?`, which loses BOTH evidence sources in one act:
+/// the sibling gone from the host, the record never written. The defence the
+/// discard used to carry — "a sweep that failed observed nothing it can write
+/// down" — is false for exactly that reason.
+pub(crate) struct SweepOutcome {
+    clearance: Clearance,
+    failure: Option<RoutingError>,
+}
+
+impl SweepOutcome {
+    /// Every delete was issued and answered, and none failed.
+    pub(crate) fn completed(clearance: Clearance) -> Self {
+        Self {
+            clearance,
+            failure: None,
+        }
+    }
+
+    /// The sweep failed. `clearance` is folded from what it DID observe, which
+    /// is a complete observation set for a sweep that issued every delete
+    /// before reading any code, and the empty fold for one that never reached
+    /// the firewall at all.
+    pub(crate) fn failed(clearance: Clearance, error: RoutingError) -> Self {
+        Self {
+            clearance,
+            failure: Some(error),
+        }
+    }
+
+    /// What the sweep observed, whether or not it also failed. This is the
+    /// half the `?` used to throw away.
+    #[cfg(test)]
+    pub(crate) fn clearance(&self) -> &Clearance {
+        &self.clearance
+    }
+
+    /// Collapse into the `Result` a caller with no record to update wants.
+    ///
+    /// [`sweep_with_witness`] deliberately does NOT use this: it destructures
+    /// the struct so the observations reach the record before the failure
+    /// reaches the caller. This is for the two callers that have no record in
+    /// play at all — macOS's `Drop` wrapper (no boot-time key class) and the
+    /// unit tests of the verdict folds.
+    ///
+    /// What it is NOT for is the sweeps: reaching for it there is how the
+    /// observations got discarded in the first place.
+    #[cfg(any(test, target_os = "macos"))]
+    pub(crate) fn into_result(self) -> Result<Clearance, RoutingError> {
+        match self.failure {
+            Some(e) => Err(e),
+            None => Ok(self.clearance),
+        }
+    }
 }
 
 /// Windows-only test helper: resolve the LUID then build the spec, exercising

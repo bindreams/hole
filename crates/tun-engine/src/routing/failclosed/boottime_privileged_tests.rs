@@ -165,6 +165,24 @@ impl Drop for DeleteProbeOnDrop {
 /// `netsh` that never ran — wrong verb, missing binary, unsupported argument —
 /// was indistinguishable from a green run, which is not a cross-check.
 ///
+/// **An assertion on the content could not settle the open premise anyway**,
+/// and that is worth stating because it looks like it is one assertion away.
+/// The open question is whether a by-key delete purges the boot-time POLICY
+/// RECORD — the thing the kernel provisions and enforces at the NEXT boot,
+/// before the Base Filtering Engine starts. `netsh wfp` is an FWPM client: it
+/// reads through BFE, exactly as `enum_boottime`'s `BOOTTIME_ONLY` template
+/// does, and this test ALREADY asserts the probe leaves that view after the
+/// delete. A second reading of the same surface is not a second source. The
+/// record is by construction what applies before that surface exists, so
+/// nothing short of a reboot separates "purged" from "still provisioned and
+/// invisible" — and Microsoft's own description of this subcommand ("the
+/// policy and filters in effect when the computer first starts") does not
+/// disambiguate a snapshot of the boot that already happened from the set
+/// staged for the next one. The dump stays as an operator's cross-check, not
+/// as evidence this lane can grade. Until a reboot-capable elevated lane
+/// exists, `failclosed.rs` treats a boot-time key as unprovable in BOTH
+/// directions rather than picking a reading (bindreams/hole#1010's F2).
+///
 /// Where the line is drawn and why: exit status is a property of the COMMAND,
 /// and `file=-` writing its XML to stdout with status 0 is measured on a real
 /// elevated host. Whether the dump is non-empty is a property of the machine's
@@ -517,6 +535,12 @@ fn boottime_global_net_state_every_engage_rearms_the_twins_instead_of_reporting_
     .expect("first engage of the real WFP lockdown cover");
     let first_twins = twins("after the first engage");
     let first_floor = floor("after the first engage");
+    // The engage is the only site that knows a twin was armed at the moment
+    // the fact becomes true, and it is the ONLY evidence for the host whose
+    // sibling is later removed by something that is not a sweep at all. This
+    // is the one lane where that write happens against the real firewall
+    // rather than through a hand-built observation slice.
+    let recorded_at_engage = crate::routing::failclosed::boottime_witness::load(dir.path());
 
     // Re-engage over the still-held cover. This is the live path, not a
     // contrivance: a bridge restart adopts a standing cover and re-engages over
@@ -543,7 +567,16 @@ fn boottime_global_net_state_every_engage_rearms_the_twins_instead_of_reporting_
         "twins after 1st engage: {first_twins:#?}\n\
          twins after 2nd engage: {second_twins:#?}\n\
          persistent floor after 1st: {first_floor:#?}\n\
-         persistent floor after 2nd: {second_floor:#?}"
+         persistent floor after 2nd: {second_floor:#?}\n\
+         boot-time witness after 1st engage: {recorded_at_engage:?}"
+    );
+
+    assert_eq!(
+        recorded_at_engage,
+        crate::routing::failclosed::ArmingWitness::Armed,
+        "a real engage must record the boot-time witness; without it the host whose sibling is \
+         removed by an external FWPM delete or a firewall reset has nothing left to report from, \
+         because no sweep ever saw the sibling to copy it (bindreams/hole#1010 F3)\n{evidence}"
     );
 
     for guid in LOCKDOWN_BOOTTIME_BLOCK_ALL_GUIDS {

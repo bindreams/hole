@@ -81,17 +81,52 @@ fn a_boot_time_key_that_answered_not_found_is_not_proven_empty() {
 }
 
 #[skuld::test]
-fn a_boot_time_key_the_delete_actually_removed_is_proven_empty() {
-    // The half #1010 measured: against a LIVE boot-time object the delete
-    // returns ERROR_SUCCESS and the filter leaves the BOOTTIME_ONLY view.
-    // A removal we watched happen is proof; only the empty answer is not.
+fn a_boot_time_key_the_delete_removed_still_cannot_prove_its_record_gone() {
+    // bindreams/hole#1010 F2. What #1010 measured is that against a LIVE
+    // boot-time object the delete returns `ERROR_SUCCESS` and the filter
+    // leaves the BOOTTIME_ONLY view — i.e. the runtime OBJECT is gone. The
+    // boot-time POLICY RECORD behind it is a different thing, it is what
+    // serves the next boot, and `failclosed/windows.rs`'s module doc records
+    // as OPEN whether a by-key delete purges it. Every read available here
+    // goes through the Base Filtering Engine, and the record is by definition
+    // what applies before BFE starts, so no observation this crate can make
+    // settles it; only a reboot would.
+    //
+    // So a boot-time key has no outcome that proves it empty, and the one
+    // place the code wrote a NEGATIVE conclusion about one — off a return
+    // code, against its own founding rule — is gone.
     let c = fold(&[obs(
         "lockdown boot-time block-all V4",
         KeyLifetime::BootTime,
         KeyOutcome::Removed,
     )]);
-    assert!(c.is_proven());
-    assert!(c.unproven_keys().is_empty());
+    assert!(!c.is_proven());
+    assert_eq!(c.unproven_keys(), ["lockdown boot-time block-all V4"]);
+}
+
+#[skuld::test]
+fn a_failing_sweep_outcome_carries_its_observations_beside_the_error() {
+    // bindreams/hole#1010 F1, at the type. The failure and the clearance
+    // travel together in one value, so no `?` can take the second away with
+    // the first — which is what happened while the sweeps returned a
+    // `Result`, on a codebase whose sweeps issue every delete before reading
+    // any code.
+    let outcome = SweepOutcome::failed(
+        fold(&[sibling(KeyOutcome::Removed), unproven_twin()]),
+        RoutingError::RouteSetup("one delete was refused".into()),
+    );
+    assert_eq!(
+        outcome.clearance().witness_update(),
+        crate::routing::failclosed::boottime_witness::WitnessUpdate::Arm,
+        "the sibling this sweep already removed is still evidence, and the record is written \
+         from it"
+    );
+    assert_eq!(outcome.clearance().leftover_keys(), ["lockdown boot-time block-all V4"]);
+    assert!(outcome.into_result().is_err(), "and the failure still travels");
+
+    let clean = SweepOutcome::completed(Clearance::proven());
+    assert!(clean.clearance().is_proven());
+    assert!(clean.into_result().is_ok());
 }
 
 #[skuld::test]
@@ -113,8 +148,13 @@ fn a_mixed_sweep_names_every_unproven_key_and_only_those() {
     assert!(!c.is_proven());
     assert_eq!(
         c.unproven_keys(),
-        ["boot-time block-all V4", "boot-time block-all V6 twin"],
-        "only the boot-time keys that answered not-found are unproven"
+        [
+            "boot-time block-all V4",
+            "boot-time block-all V6",
+            "boot-time block-all V6 twin"
+        ],
+        "every boot-time key is unproven and no persistent one is — the outcome does not enter \
+         into it for the boot-time row (#1010 F2)"
     );
 }
 
@@ -139,15 +179,18 @@ fn a_delete_that_failed_proves_nothing_for_either_lifetime() {
 }
 
 #[skuld::test]
-fn every_outcome_lifetime_pair_has_one_answer_and_only_removal_is_universal() {
+fn every_outcome_lifetime_pair_has_one_answer_and_no_boot_time_one_proves_anything() {
     // The whole table, so the rule is readable in one place and a new variant
-    // cannot be added without landing here. `Removed` is the only outcome that
-    // proves anything on a boot-time key; `Failed` proves nothing anywhere.
+    // cannot be added without landing here. The boot-time row is `false`
+    // throughout — not because each outcome fails for its own reason but
+    // because the QUESTION is not one a by-key delete answers (#1010 F2); only
+    // the lifetime's own second record could, and nothing reads it. `Failed`
+    // proves nothing anywhere.
     let table = [
         (KeyLifetime::Persistent, KeyOutcome::Removed, true),
         (KeyLifetime::Persistent, KeyOutcome::NotFound, true),
         (KeyLifetime::Persistent, KeyOutcome::Failed, false),
-        (KeyLifetime::BootTime, KeyOutcome::Removed, true),
+        (KeyLifetime::BootTime, KeyOutcome::Removed, false),
         (KeyLifetime::BootTime, KeyOutcome::NotFound, false),
         (KeyLifetime::BootTime, KeyOutcome::Failed, false),
     ];
@@ -252,11 +295,14 @@ fn one_removed_sibling_outweighs_an_empty_one() {
 }
 
 #[skuld::test]
-fn a_proven_sweep_reports_nothing_however_live_the_cover_was() {
-    // An uninstall on the boot that engaged: the sibling AND the twin were
-    // both removed and watched going. A cover was certainly installed, and
-    // there is still nothing to report, because the report is about unproven
-    // keys and not about covers.
+fn an_uninstall_on_the_boot_that_engaged_still_reports_the_twin_it_removed() {
+    // #1010 F2, at the gate itself. The MSI stops the bridge and runs
+    // `release-covers` on the boot the kill switch was armed, so the sibling
+    // AND the twin are both live and both answer `ERROR_SUCCESS`. Reading that
+    // as proof empties the unproven set, which empties `leftover_keys`
+    // whatever the evidence says — and no persisted record can rescue it,
+    // because this sweep IS the gate. The removal is real; what it proves
+    // stops at the runtime object.
     let c = fold(&[
         sibling(KeyOutcome::Removed),
         obs(
@@ -265,8 +311,9 @@ fn a_proven_sweep_reports_nothing_however_live_the_cover_was() {
             KeyOutcome::Removed,
         ),
     ]);
-    assert!(c.is_proven());
-    assert!(c.leftover_keys().is_empty());
+    assert!(!c.is_proven());
+    assert_eq!(c.leftover_keys(), ["lockdown boot-time block-all V4"]);
+    // A platform with no boot-time key class still has nothing to say.
     assert!(Clearance::proven().leftover_keys().is_empty());
 }
 
@@ -364,18 +411,16 @@ fn every_evidence_pair_has_one_answer_and_only_both_ruling_out_suppresses() {
 }
 
 #[skuld::test]
-fn a_proven_sweep_reports_nothing_however_loudly_both_sources_speak() {
-    // The report is about unproven KEYS, not about covers or records. With
-    // every key watched going there is nothing to name, whatever the evidence
-    // says about what this host once armed.
+fn a_sweep_with_no_boot_time_key_reports_nothing_however_loudly_both_sources_speak() {
+    // The report is about unproven KEYS, not about covers or records. A sweep
+    // list carrying no boot-time key — macOS's shape — has nothing to name
+    // whatever the evidence says about what this host once armed, and that is
+    // what keeps `leftover_keys` a key report rather than a second presence
+    // probe.
     let c = Clearance::from_observations(
         &[
             sibling(KeyOutcome::Removed),
-            obs(
-                "lockdown boot-time block-all V4",
-                KeyLifetime::BootTime,
-                KeyOutcome::Removed,
-            ),
+            obs("lockdown filter", KeyLifetime::Persistent, KeyOutcome::Removed),
         ],
         ArmingWitness::Armed,
     );
@@ -417,13 +462,20 @@ fn corroboration_moves_only_toward_reporting() {
 }
 
 #[skuld::test]
-fn every_sighting_and_sibling_pair_has_one_write_answer() {
+fn every_sighting_and_sibling_pair_has_one_write_answer_and_none_retracts() {
     // What a sweep tells the record, as distinct from what it tells the
-    // operator. The load-bearing cell is the last: an unproven twin on a host
-    // whose siblings all answered empty writes NOTHING. `Disarm` there would
-    // re-create the consumed-witness defect one level down, and `Arm` would
-    // manufacture a report out of a host that never armed anything.
+    // operator. Two load-bearing properties. First: an unproven twin on a host
+    // whose siblings all answered empty writes NOTHING — `Arm` there would
+    // manufacture a report out of a host that never armed anything, and a
+    // retraction would re-create the consumed-witness defect one level down.
+    // Second: NO cell retracts, whatever the twin's own delete returned
+    // (#1010 F2) — the `Removed` rows below are the ones that used to.
     use crate::routing::failclosed::boottime_witness::WitnessUpdate;
+    let removed_twin = obs(
+        "lockdown boot-time block-all V4",
+        KeyLifetime::BootTime,
+        KeyOutcome::Removed,
+    );
     let table = [
         (vec![sibling(KeyOutcome::Removed)], WitnessUpdate::Leave),
         (vec![sibling(KeyOutcome::NotFound)], WitnessUpdate::Leave),
@@ -435,28 +487,8 @@ fn every_sighting_and_sibling_pair_has_one_write_answer() {
             vec![sibling(KeyOutcome::NotFound), unproven_twin()],
             WitnessUpdate::Leave,
         ),
-        (
-            vec![
-                sibling(KeyOutcome::Removed),
-                obs(
-                    "lockdown boot-time block-all V4",
-                    KeyLifetime::BootTime,
-                    KeyOutcome::Removed,
-                ),
-            ],
-            WitnessUpdate::Disarm,
-        ),
-        (
-            vec![
-                sibling(KeyOutcome::NotFound),
-                obs(
-                    "lockdown boot-time block-all V4",
-                    KeyLifetime::BootTime,
-                    KeyOutcome::Removed,
-                ),
-            ],
-            WitnessUpdate::Disarm,
-        ),
+        (vec![sibling(KeyOutcome::Removed), removed_twin], WitnessUpdate::Arm),
+        (vec![sibling(KeyOutcome::NotFound), removed_twin], WitnessUpdate::Leave),
         (
             vec![
                 obs("twin A", KeyLifetime::BootTime, KeyOutcome::Removed),

@@ -1299,7 +1299,7 @@ Evidence therefore comes from two places, and never from a return code:
 - **Armed** — only a read of the boot-time enumeration view while the object is
   live. A commit code says the transaction reached the object store and nothing
   about the record behind it, so `engage_lockdown` reads the twins back through
-  `verify_boottime_twins` after `FwpmTransactionCommit0` and refuses the engage
+  `verify_boottime_twins` after `commit_and_record` and refuses the engage
   when a view that *was* readable does not hold the twin, or holds one that is
   not boot-time or is disabled. Without that read the shipped success claim was
   wider than anything the code checked: the add returned zero, the caller marked
@@ -1308,8 +1308,20 @@ Evidence therefore comes from two places, and never from a return code:
   because `FwpmFilterGetByKey0` would answer for any object under that key
   whatever its lifetime, and being classified boot-time is the only property a
   twin exists for.
-- **Gone** — only `KeyOutcome::Removed`, a removal somebody watched happen
-  (`KeyObservation::proves_empty`).
+- **Gone** — *nothing*. `KeyObservation::proves_empty` is `false` for the whole
+  boot-time row, including `KeyOutcome::Removed`
+  ([#1010](https://github.com/bindreams/hole/issues/1010) F2). A removal
+  somebody watched happen proves the *runtime object* went — that is what the
+  privileged lane measured — and the record behind it is a different thing.
+  Every read available is an FWPM/BFE one (`FwpmFilterDeleteByKey0`'s code, a
+  `BOOTTIME_ONLY` enumeration, `netsh wfp show boottimepolicy`), and the record
+  is by definition what applies *before* BFE starts at the next boot, so only a
+  reboot could separate "purged" from "still provisioned and invisible". The
+  earlier reading — `Removed` as universal proof — was the one place the code
+  drew a *negative* conclusion from a return code, against this very rule, and
+  it made an uninstall on the boot that armed the switch silent: every key
+  answers `ERROR_SUCCESS`, the unproven set empties, and `leftover_keys` has
+  nothing to name however loudly the other evidence speaks.
 - **Possible on this host at all** — the twins' `PERSISTENT` sibling, the other
   half of the same rule (`KeyRole::BootTimeSibling`). BFE re-adds it from its
   own store at every boot and a twin is never installed without it, so a sibling
@@ -1389,21 +1401,48 @@ never fires again, on the one host where it is real.
 
 So a sweep that can still see a sibling copies the finding into
 `bridge-boottime.json` (`failclosed::boottime_witness`) before deleting it, and
-a Windows `engage_lockdown` records it at the moment the twins are committed and
-read back — which also covers a host whose sibling is removed by something that
-is not a sweep at all. `leftover_keys` reports when **either** the sibling or
-the record says a twin is possible; it is silent only where both rule one out.
-The two fail in different directions, which is the point: a wiped `state_dir`
-still has its sibling, a consumed sibling still has its record.
+a Windows `engage_lockdown` records it the instant `FwpmTransactionCommit0`
+returns — `commit_and_record`, one step, deliberately *not* after
+`verify_boottime_twins` — which also covers a host whose sibling is removed by
+something that is not a sweep at all. `leftover_keys` reports when **either**
+the sibling or the record says a twin is possible; it is silent only where both
+rule one out. The two fail in different directions, which is the point: a wiped
+`state_dir` still has its sibling, a consumed sibling still has its record.
 
-The record is cleared only by proof — a sweep that watched every boot-time key
-it touched being removed, which is what turning the switch off in the same boot
-that engaged it looks like. It is never cleared by an empty sibling set: that
-would recreate the same defect one release later. A sweep that *failed* writes
-nothing at all, and a sweep carrying no boot-time key writes nothing either
-("every boot-time key proved empty" is vacuously true of none).
+The ordering is load-bearing, not tidiness. The read-back reports on a cover
+that is already committed and in force, so writing the record after it meant a
+read-back failure left the twins standing with nothing recorded — and that is
+exactly the class no sweep can rescue, since no sweep ever saw the sibling to
+copy ([#1010](https://github.com/bindreams/hole/issues/1010) F3).
 
-Disclosed residuals. The record is per-`state_dir` while the WFP filters it
+**The record is never cleared.** Clearing it is a negative conclusion about a
+boot-time policy record, and the only thing a sweep holds to draw one from is a
+delete's return code — see *Gone* above. So the record is write-once: an engage
+arms it, an unproven twin beside a live-or-unreadable sibling arms it, and
+nothing retracts it. It is never armed by an empty sibling set either (that
+would manufacture a report out of a host that never armed anything), and a
+sweep carrying no boot-time key says nothing about it at all.
+
+A sweep that *failed* still writes what it saw, which is the other half of
+[#1010](https://github.com/bindreams/hole/issues/1010) F1. Both Windows sweeps
+issue every delete before inspecting any code, so `Err` arrives *after* the
+sibling's own delete succeeded: the sibling is gone from the host and its
+`Removed` is sitting in the observation set. Returning early on the failure
+threw that away, and one act then consumed both evidence sources. The sweep
+hands back a `SweepOutcome` — clearance *and* failure — rather than a `Result`
+that can only carry one, and `sweep_with_witness` applies the record before
+surfacing the error. The one failure that genuinely observed nothing is
+`FwpmEngineOpen0` refusing: no delete was issued, so it folds the *empty*
+observation set and the record keeps what it held.
+
+Disclosed residuals. **A host that genuinely cleaned up keeps reporting**: arm
+the kill switch once and every later `bridge release-covers` on that
+`state_dir` names the two twin keys, for the life of the dir. That is the price
+of the paragraph above, and it is bounded to hosts that ever armed a twin — one
+that never did has no record and no live sibling and stays silent. An
+over-report costs an operator a paragraph; the silence it replaces costs #1003's
+unrecoverable host. Clearing it needs a measurement no single-boot lane can
+make. The record is per-`state_dir` while the WFP filters it
 describes are machine-wide, so the uninstall gate folds in every peer dir it
 already locks against a live bridge (`cutover::release_covers_with`); a bridge
 given an explicit `--state-dir` outside that set is invisible to the record for
@@ -1772,12 +1811,14 @@ on almost every uninstall.
 
 #998/#1010's boot-time twins are the first and only keys Hole sweeps that are
 not `Persistent`, and the gate landed **before** them on purpose, so they could
-not arrive as a silent false `Ok`. On a not-found sweep the unproven set is now
+not arrive as a silent false `Ok`. On a not-found sweep the unproven set is
 exactly those two keys and nothing else
-(`a_not_found_sweep_proves_every_key_but_the_boot_time_twins`); a sweep that
-watched them go answers `ERROR_SUCCESS` and is fully proven
-(`a_sweep_that_watched_the_twins_go_proves_them_empty`), which is the half that
-keeps `proves_empty` keyed on the *outcome* and not on the lifetime alone.
+(`a_not_found_sweep_proves_every_key_but_the_boot_time_twins`) — and so it is on
+a sweep that *watched them go*
+(`a_sweep_that_watched_the_twins_go_still_cannot_prove_them_empty`). The outcome
+does not enter into it for a boot-time key: see *Gone* above. `is_proven` is
+therefore false on every Windows sweep, which is why the operator-facing report
+reads `leftover_keys` and not the proof record.
 
 **The mis-tag is now unrepresentable, not merely detectable.** `FilterLifetime`
 is a newtype over `KeyLifetime` with a private field: `filter_flags` — the

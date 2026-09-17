@@ -32,6 +32,7 @@ use super::failclosed_state as state;
 use super::lockdown_pf_state as lockdown_state;
 use super::Clearance;
 use super::StateFile;
+use super::SweepOutcome;
 use super::RESOLVER_PERMIT_PORT;
 
 /// Whether this platform's standing cover arms [`super::KeyLifetime::BootTime`]
@@ -43,6 +44,18 @@ use super::RESOLVER_PERMIT_PORT;
 /// answer [`Clearance::proven`] unconditionally, which carries no unproven key
 /// for a witness to qualify.
 pub(crate) const STANDING_COVER_ARMS_BOOT_TIME: bool = false;
+
+/// The other half of that sentence, checked by the compiler. Windows writes
+/// the record inside its own engage (`windows.rs`'s `commit_and_record`),
+/// gated on this flag; macOS has no such site at all. Giving this platform
+/// boot-time keys without also giving it a record write would leave the
+/// uninstall gate blind on a platform that could strand one — so flipping the
+/// constant fails the build until the write exists.
+const _: () = assert!(
+    !STANDING_COVER_ARMS_BOOT_TIME,
+    "macOS arms no boot-time key and has no site that records the boot-time witness; a platform \
+     that arms one needs both"
+);
 
 /// Build the self-contained pf ruleset (loaded via `pfctl -f -`).
 ///
@@ -568,13 +581,20 @@ pub fn engage_lockdown(
 /// survive a reboot at all — so every macOS cover key is
 /// [`super::KeyLifetime::Persistent`] and a disengage has nothing to leave
 /// unproven.
-pub fn disengage_lockdown(state_dir: &Path, _witness: super::ArmingWitness) -> Result<Clearance, RoutingError> {
-    disengage_lockdown_with(
+pub fn disengage_lockdown(state_dir: &Path, _witness: super::ArmingWitness) -> SweepOutcome {
+    // `Clearance::proven` on both arms: this platform has no boot-time key
+    // class, so a macOS disengage carries nothing for the record to learn
+    // from whether it succeeded or failed. The failing arm's clearance is
+    // dropped by `sweep_with_witness` in any case — only its
+    // `witness_update` is read, and that is `Leave` here.
+    match disengage_lockdown_with(
         lockdown_cover_presence(state_dir),
         lockdown_state::load(state_dir),
         &mut RealPfOps { state_dir },
-    )?;
-    Ok(Clearance::proven())
+    ) {
+        Ok(()) => SweepOutcome::completed(Clearance::proven()),
+        Err(e) => SweepOutcome::failed(Clearance::proven(), e),
+    }
 }
 
 /// `disengage_lockdown`'s sequencing, with presence and the [`PfOps`] seam
@@ -663,7 +683,7 @@ fn lockdown_disengage(state_dir: &Path) {
     // `Unset`: this platform arms no boot-time key
     // ([`STANDING_COVER_ARMS_BOOT_TIME`]), so there is never a record to
     // consult and the argument is inert.
-    match disengage_lockdown(state_dir, super::ArmingWitness::Unset) {
+    match disengage_lockdown(state_dir, super::ArmingWitness::Unset).into_result() {
         // Always `Clearance::proven` on macOS, and `Drop` has no reader for
         // it either way.
         Ok(_clearance_is_unconditional_here) => {}
@@ -892,11 +912,16 @@ impl PfOps for RealPfOps<'_> {
 /// release can leave unproven. macOS's own "`Ok` over a still-blocked host" residual is a
 /// different one (an entirely absent state file, clause 1) and is not what
 /// this type tracks.
-pub fn release_all(state_dir: &Path, _witness: super::ArmingWitness) -> Result<Clearance, RoutingError> {
+pub fn release_all(state_dir: &Path, _witness: super::ArmingWitness) -> SweepOutcome {
     let transient = state::load_presence(state_dir);
     let standing = lockdown_state::load_presence(state_dir);
-    release_all_with(transient, standing, &mut RealPfOps { state_dir })?;
-    Ok(Clearance::proven())
+    // Both arms `Clearance::proven`, for the reason `disengage_lockdown`
+    // gives: no boot-time key class here, so nothing a failure could have
+    // observed and withheld.
+    match release_all_with(transient, standing, &mut RealPfOps { state_dir }) {
+        Ok(()) => SweepOutcome::completed(Clearance::proven()),
+        Err(e) => SweepOutcome::failed(Clearance::proven(), e),
+    }
 }
 
 #[cfg(test)]

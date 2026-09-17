@@ -12,8 +12,10 @@
 
 use std::path::Path;
 
-use super::super::{ArmingWitness, Clearance, KeyLifetime, KeyObservation, KeyOutcome, KeyRole, RoutingError};
-use super::{next_record, WitnessUpdate};
+use super::super::{
+    ArmingWitness, Clearance, KeyLifetime, KeyObservation, KeyOutcome, KeyRole, RoutingError, SweepOutcome,
+};
+use super::{should_arm, WitnessUpdate};
 
 /// An ordinary key, whose outcome speaks only for itself.
 fn obs(key: &'static str, lifetime: KeyLifetime, outcome: KeyOutcome) -> KeyObservation {
@@ -55,9 +57,22 @@ fn twin_removed() -> KeyObservation {
 /// `disengage_lockdown` do — consult, fold, write back.
 fn sweep(state_dir: &Path, observations: &[KeyObservation]) -> Clearance {
     super::super::sweep_with_witness(state_dir, None, |witness| {
-        Ok(Clearance::from_observations(observations, witness))
+        SweepOutcome::completed(Clearance::from_observations(observations, witness))
     })
     .expect("the sweep body cannot fail")
+}
+
+/// A sweep that issued every delete, observed `observations`, and THEN found a
+/// failing code among them — the shape both Windows sweeps have, where no
+/// code is inspected until all of them are in.
+fn failing_sweep(state_dir: &Path, observations: &[KeyObservation]) -> RoutingError {
+    super::super::sweep_with_witness(state_dir, None, |witness| {
+        SweepOutcome::failed(
+            Clearance::from_observations(observations, witness),
+            RoutingError::RouteSetup("the firewall refused one of the deletes".into()),
+        )
+    })
+    .expect_err("the sweep body failed")
 }
 
 fn dir() -> tempfile::TempDir {
@@ -111,25 +126,64 @@ fn a_host_that_never_armed_a_twin_stays_silent_across_every_sweep() {
 }
 
 #[skuld::test]
-fn a_sweep_that_watched_every_twin_go_clears_the_record() {
-    // The other direction, and what keeps the report from becoming permanent
-    // noise: turning the kill switch off in the SAME boot that engaged it
-    // deletes a live boot-time object and watches it happen, which is proof for
-    // any lifetime. A later uninstall has nothing to warn about.
+fn arming_then_unblocking_in_one_boot_still_leaves_the_uninstall_gate_able_to_report() {
+    // bindreams/hole#1010 F2, and the most ordinary kill-switch lifecycle
+    // there is: arm the switch, then hit "Unblock Network" (or turn it off) in
+    // the SAME boot, then uninstall later.
+    //
+    // The unblock deletes a LIVE twin and gets `ERROR_SUCCESS` back. That
+    // return code says the runtime FWPM object is gone — measured — and says
+    // NOTHING about the boot-time policy record behind it, which is what
+    // serves the next boot and which no call in this crate can read
+    // (`failclosed/windows.rs`'s module doc records that as open). Writing
+    // `armed: false` off it is a NEGATIVE conclusion drawn from a return code,
+    // which is the one thing this whole remediation forbids — and it left the
+    // uninstall with both sources saying no over a host that may hold a
+    // stranded pre-BFE block-all.
     let state = dir();
     super::record_armed(state.path(), None);
 
     let off = sweep(state.path(), &[sibling(KeyOutcome::Removed), twin_removed()]);
-    assert!(off.is_proven());
-    assert!(off.leftover_keys().is_empty());
-    assert_eq!(super::load(state.path()), ArmingWitness::Disarmed);
+    assert_eq!(
+        off.leftover_keys(),
+        [TWIN],
+        "the twin's own delete cannot report on its record, so the unblock itself already has \
+         something to say"
+    );
+    assert_eq!(
+        super::load(state.path()),
+        ArmingWitness::Armed,
+        "a delete's return code must never write the record off"
+    );
 
     let uninstall = sweep(state.path(), &[sibling(KeyOutcome::NotFound), twin_not_found()]);
-    assert!(
-        uninstall.leftover_keys().is_empty(),
-        "every twin this host armed was watched being removed: {:?}",
-        uninstall.leftover_keys()
+    assert_eq!(
+        uninstall.leftover_keys(),
+        [TWIN],
+        "the sibling was consumed by the unblock and the record is all that is left; going silent \
+         here is what deletes hole.exe over a host that may still block its own boot"
     );
+}
+
+#[skuld::test]
+fn an_uninstall_on_the_boot_that_armed_the_twin_is_never_silent() {
+    // The same defect without the record in play at all: arm the kill switch,
+    // then uninstall straight away. The MSI stops the bridge and runs
+    // `release-covers` while the twins are still live, so every key — sibling
+    // and twin alike — answers `ERROR_SUCCESS`. A sweep that reads that as
+    // proof has an EMPTY unproven set, so `leftover_keys` is empty however
+    // loudly the evidence speaks, and `RemoveFiles` takes the binary away in
+    // silence. No persisted record can rescue this one: the gate is the very
+    // sweep doing the removing.
+    let state = dir();
+    super::record_armed(state.path(), None);
+
+    let uninstall = sweep(state.path(), &[sibling(KeyOutcome::Removed), twin_removed()]);
+    assert!(
+        !uninstall.is_proven(),
+        "nothing this crate can call proves a boot-time key's record gone"
+    );
+    assert_eq!(uninstall.leftover_keys(), [TWIN]);
 }
 
 #[skuld::test]
@@ -167,22 +221,68 @@ fn the_engage_records_the_twin_before_any_sweep_could_have_seen_it() {
 }
 
 #[skuld::test]
-fn a_sweep_that_failed_writes_nothing_down() {
-    // `Err` means a delete was refused or the engine could not be reached.
-    // Neither says anything about a key, so the record keeps what it held —
-    // the same rule `KeyOutcome::Failed` states for a single key, applied to a
-    // whole sweep.
+fn a_failed_sweep_that_already_removed_the_sibling_still_records_what_it_saw() {
+    // bindreams/hole#1010 F1. Both Windows sweeps ISSUE every delete before
+    // inspecting ANY code, so `Err` arrives AFTER the sibling's own delete
+    // succeeded: the sibling is gone from the host and its `Removed` is
+    // sitting in the observation set. Returning early on the failure threw
+    // that away, and one act then consumed BOTH evidence sources — the live
+    // sibling deleted, the record never written.
+    //
+    // The state dir starts empty on purpose: this is the host the disjointness
+    // argument names the sibling as the fallback for (an OS in-place reset, a
+    // profile migration, a user deleting the folder), so the record is the
+    // thing that has to be created here, not merely preserved.
     let state = dir();
-    super::record_armed(state.path(), None);
-
-    let failed: Result<Clearance, RoutingError> = super::super::sweep_with_witness(state.path(), None, |_| {
-        Err(RoutingError::RouteSetup("the firewall refused the delete".into()))
-    });
-    assert!(failed.is_err());
+    let err = failing_sweep(
+        state.path(),
+        &[
+            sibling(KeyOutcome::Removed),
+            twin_not_found(),
+            obs("lockdown app-id filter", KeyLifetime::Persistent, KeyOutcome::Failed),
+        ],
+    );
+    assert!(format!("{err}").contains("refused"), "the failure still travels: {err}");
     assert_eq!(
         super::load(state.path()),
         ArmingWitness::Armed,
-        "a sweep that learned nothing must not overwrite what an earlier one learned"
+        "the sibling's delete succeeded before any code was read; discarding that observation is \
+         what let one failing app-id delete silence every later sweep"
+    );
+
+    let uninstall = sweep(state.path(), &[sibling(KeyOutcome::NotFound), twin_not_found()]);
+    assert_eq!(
+        uninstall.leftover_keys(),
+        [TWIN],
+        "the sibling is gone because the FAILED sweep removed it, so the record is the only \
+         evidence left and it must be there"
+    );
+}
+
+#[skuld::test]
+fn a_sweep_that_never_reached_the_firewall_writes_nothing_down() {
+    // The other failure cause, and it is a different one: `FwpmEngineOpen0`
+    // failing means no delete was ever ISSUED, so there is no observation to
+    // carry — the empty fold, not a discarded one. Nothing about a key was
+    // learned, so the record keeps what it held, in BOTH directions: a host
+    // with no record must not gain one, and a host with one must not lose it.
+    let fresh = dir();
+    let err = failing_sweep(fresh.path(), &[]);
+    assert!(format!("{err}").contains("refused"), "{err}");
+    assert_eq!(
+        super::load(fresh.path()),
+        ArmingWitness::Unset,
+        "an unreachable firewall observed nothing, so it must not litter a host that never armed \
+         a twin with a record saying it did"
+    );
+
+    let armed = dir();
+    super::record_armed(armed.path(), None);
+    failing_sweep(armed.path(), &[]);
+    assert_eq!(
+        super::load(armed.path()),
+        ArmingWitness::Armed,
+        "and it must not overwrite what an earlier sweep learned"
     );
 }
 
@@ -223,29 +323,47 @@ fn a_recorded_twin_survives_being_read_back() {
 }
 
 #[skuld::test]
-fn every_update_and_record_pair_has_one_answer_and_only_proof_writes_false() {
-    // The whole write table in one place. The two cells that matter: `Disarm`
-    // over `Unset` writes NOTHING (a host that never armed a twin must not be
-    // littered with a record), and `Disarm` over `Unreadable` DOES write (a
-    // corrupt file would otherwise report forever, and this sweep just proved
-    // there is nothing to report).
+fn every_update_and_record_pair_has_one_answer_and_none_of_them_retracts() {
+    // The whole write table in one place, and what it no longer has is a
+    // `Disarm` column: there is no update that clears the record, because
+    // clearing it is a negative conclusion about a boot-time policy record and
+    // the only thing a sweep holds to draw it from is a delete's return code
+    // (#1010 F2). `Arm` over `Disarmed` DOES write — a file that says "not
+    // armed" was written by something that claimed a proof, and this sweep
+    // just found a twin it could not prove gone.
     let table = [
-        (ArmingWitness::Armed, WitnessUpdate::Leave, None),
-        (ArmingWitness::Disarmed, WitnessUpdate::Leave, None),
-        (ArmingWitness::Unset, WitnessUpdate::Leave, None),
-        (ArmingWitness::Unreadable, WitnessUpdate::Leave, None),
-        (ArmingWitness::Armed, WitnessUpdate::Arm, None),
-        (ArmingWitness::Disarmed, WitnessUpdate::Arm, Some(true)),
-        (ArmingWitness::Unset, WitnessUpdate::Arm, Some(true)),
-        (ArmingWitness::Unreadable, WitnessUpdate::Arm, Some(true)),
-        (ArmingWitness::Armed, WitnessUpdate::Disarm, Some(false)),
-        (ArmingWitness::Disarmed, WitnessUpdate::Disarm, None),
-        (ArmingWitness::Unset, WitnessUpdate::Disarm, None),
-        (ArmingWitness::Unreadable, WitnessUpdate::Disarm, Some(false)),
+        (ArmingWitness::Armed, WitnessUpdate::Leave, false),
+        (ArmingWitness::Disarmed, WitnessUpdate::Leave, false),
+        (ArmingWitness::Unset, WitnessUpdate::Leave, false),
+        (ArmingWitness::Unreadable, WitnessUpdate::Leave, false),
+        (ArmingWitness::Armed, WitnessUpdate::Arm, false),
+        (ArmingWitness::Disarmed, WitnessUpdate::Arm, true),
+        (ArmingWitness::Unset, WitnessUpdate::Arm, true),
+        (ArmingWitness::Unreadable, WitnessUpdate::Arm, true),
     ];
     for (current, update, want) in table {
-        assert_eq!(next_record(current, update), want, "{current:?} + {update:?}");
+        assert_eq!(should_arm(current, update), want, "{current:?} + {update:?}");
     }
+}
+
+#[skuld::test]
+fn a_record_that_says_not_armed_is_re_armed_rather_than_left_alone() {
+    // The one cell above that actually writes over an existing file, driven
+    // end to end. Nothing in this version writes `armed: false`, so such a
+    // file can only come from a hand-edit or a future version with a
+    // reboot-capable measurement behind it — and either way a sweep that finds
+    // an unproven twin beside a live cover has just contradicted it.
+    let state = dir();
+    std::fs::write(
+        state.path().join(super::STATE_FILE_NAME),
+        format!(r#"{{"version": {}, "armed": false}}"#, super::SCHEMA_VERSION),
+    )
+    .expect("write");
+    assert_eq!(super::load(state.path()), ArmingWitness::Disarmed);
+
+    let c = sweep(state.path(), &[sibling(KeyOutcome::Removed), twin_not_found()]);
+    assert_eq!(c.leftover_keys(), [TWIN]);
+    assert_eq!(super::load(state.path()), ArmingWitness::Armed);
 }
 
 #[skuld::test]

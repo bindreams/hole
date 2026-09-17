@@ -101,13 +101,24 @@
 //!   `FwpmTransactionCommit0` returning zero says the transaction reached the
 //!   object store and nothing about the record behind it.
 //!   [`verify_boottime_twins`] takes that read on the shipped path and fails
-//!   the engage when a view that WAS readable does not hold the twin.
-//! - **That a twin is GONE** — only [`KeyOutcome::Removed`], a removal
-//!   somebody watched happen. `FWP_E_FILTER_NOT_FOUND` is never evidence: on
-//!   any boot where no object is live the key answers empty whether or not a
-//!   record survives behind it. That is [`KeyObservation::proves_empty`], and
-//!   it is why [`release_all`] AND [`disengage_lockdown`] both return a
-//!   [`Clearance`] rather than a bare `Ok`.
+//!   the engage when a view that WAS readable does not hold the twin. The
+//!   record is written one statement EARLIER, bound to the commit itself
+//!   ([`commit_and_record`]): a failed verification leaves the committed cover
+//!   in force, so a record written after it would be skipped for precisely the
+//!   host class it exists to cover (bindreams/hole#1010 F3).
+//! - **That a twin is GONE** — *nothing*. [`KeyObservation::proves_empty`] is
+//!   `false` for the whole boot-time row. `FWP_E_FILTER_NOT_FOUND` was never
+//!   evidence (on any boot where no object is live the key answers empty
+//!   whether or not a record survives behind it), and neither is
+//!   [`KeyOutcome::Removed`]: it proves the RUNTIME OBJECT went, which is what
+//!   `boottime_privileged_tests` measured, and every read reachable from here
+//!   — the delete's code, a `BOOTTIME_ONLY` enumeration, `netsh wfp show
+//!   boottimepolicy` — is a read through BFE, while the record is by
+//!   definition what applies before BFE starts. Reading `Removed` as proof was
+//!   the one place this file drew a NEGATIVE conclusion from a return code
+//!   (bindreams/hole#1010 F2), and it made an uninstall on the boot that armed
+//!   the switch silent. This is why [`release_all`] AND [`disengage_lockdown`]
+//!   both return a [`Clearance`] rather than a bare `Ok`.
 //! - **That a record could exist on this host AT ALL** — the twins'
 //!   `Persistent` sibling, the other half of the same rule
 //!   ([`KeyRole::BootTimeSibling`]). BFE re-adds it from its own store at every
@@ -183,7 +194,7 @@ use windows::Win32::NetworkManagement::WindowsFilteringPlatform::*;
 use windows::Win32::System::Rpc::RPC_C_AUTHN_WINNT;
 
 use super::RESOLVER_PERMIT_PORT;
-use super::{ArmingWitness, Clearance, KeyLifetime, KeyObservation, KeyOutcome, KeyRole};
+use super::{ArmingWitness, Clearance, KeyLifetime, KeyObservation, KeyOutcome, KeyRole, SweepOutcome};
 use crate::error::RoutingError;
 
 // Fixed Hole identifiers. Compiled in so recovery can delete by key with no
@@ -1371,7 +1382,8 @@ pub fn engage_lockdown(
     server_ip: IpAddr,
     tun_luid: u64,
     app_ids: &[std::path::PathBuf],
-    _state_dir: &Path,
+    state_dir: &Path,
+    owner: Option<(u32, u32)>,
 ) -> Result<Cover, RoutingError> {
     let spec = build_lockdown_spec(server_ip, tun_luid, app_ids);
     unsafe {
@@ -1442,13 +1454,15 @@ pub fn engage_lockdown(
             for f in &spec.filters {
                 add_filter(engine, spec.provider, spec.sublayer, f, spec.stale_key)?;
             }
-            wfp_check(FwpmTransactionCommit0(engine), "FwpmTransactionCommit0")?;
+            commit_and_record(engine, state_dir, owner)?;
             // A commit code is not evidence about a boot-time key: it says the
             // transaction reached the FWPM object store, not that the next
             // boot's pre-BFE window is covered. Read the twins back out of the
             // boot-time view before claiming the switch is armed — see
             // `verify_boottime_twins` for what that does and does not settle,
             // and for why a failure here leaves the committed cover standing.
+            // The record is already written by then, deliberately: see
+            // `commit_and_record`.
             verify_boottime_twins(engine)?;
             Ok(())
         })();
@@ -1462,6 +1476,33 @@ pub fn engage_lockdown(
             kind: CoverKind::Lockdown,
         })
     }
+}
+
+/// Commit the lockdown transaction and persist the [`super::boottime_witness`]
+/// as ONE step.
+///
+/// They are one step because the fact the record describes becomes true at the
+/// instant `FwpmTransactionCommit0` returns `ERROR_SUCCESS`: the twins are in
+/// the store and the cover is in force, and every statement after this one can
+/// fail over a cover that still stands ([`verify_boottime_twins`] says so in
+/// its own doc). Splitting them is bindreams/hole#1010's F3 — the record used
+/// to be written by the cfg-free facade AFTER the whole engage returned `Ok`,
+/// so a read-back failure took the record with it, for precisely the host
+/// class the record exists to cover: the one whose sibling is later removed by
+/// something that is not a sweep (an external FWPM delete, a firewall reset),
+/// where no sweep ever held the evidence to copy.
+///
+/// Gated on [`STANDING_COVER_ARMS_BOOT_TIME`] rather than on the fact that
+/// this is the Windows file: retiring the twins must retire the record with
+/// them, not leave an engage writing a witness for a key class that no longer
+/// exists.
+#[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
+unsafe fn commit_and_record(engine: HANDLE, state_dir: &Path, owner: Option<(u32, u32)>) -> Result<(), RoutingError> {
+    wfp_check(FwpmTransactionCommit0(engine), "FwpmTransactionCommit0")?;
+    if STANDING_COVER_ARMS_BOOT_TIME {
+        super::boottime_witness::record_armed(state_dir, owner);
+    }
+    Ok(())
 }
 
 #[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
@@ -2073,7 +2114,7 @@ pub fn lockdown_cover_presence(_state_dir: &Path) -> crate::routing::CoverPresen
 /// engine open but not the write — would leave the kill switch engaged while
 /// the intent reads "off", with nothing left to reconcile it. The macOS arm
 /// has always propagated its `pfctl` failures; this is the same rule.
-pub fn disengage_lockdown(_state_dir: &Path, witness: ArmingWitness) -> Result<Clearance, RoutingError> {
+pub fn disengage_lockdown(_state_dir: &Path, witness: ArmingWitness) -> SweepOutcome {
     let swept = unsafe {
         let mut engine = HANDLE::default();
         #[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
@@ -2115,24 +2156,28 @@ pub fn disengage_lockdown(_state_dir: &Path, witness: ArmingWitness) -> Result<C
 /// empty. The two causes are kept apart because they say different things to
 /// the operator: "the firewall could not be reached" versus "the firewall
 /// refused the delete".
-fn disengage_verdict(
-    open_failure: Option<u32>,
-    swept: &[(SweptKey, u32)],
-    witness: ArmingWitness,
-) -> Result<Clearance, RoutingError> {
+fn disengage_verdict(open_failure: Option<u32>, swept: &[(SweptKey, u32)], witness: ArmingWitness) -> SweepOutcome {
     if let Some(rc) = open_failure {
-        return Err(RoutingError::RouteSetup(format!(
-            "FwpmEngineOpen0 failed (0x{rc:08x}): the firewall could not be reached, so the lockdown \
-             cover could not be disengaged"
-        )));
+        return SweepOutcome::failed(
+            // The empty fold, not a discarded one: no delete was issued, so
+            // there is no observation to carry.
+            Clearance::from_observations(&[], witness),
+            RoutingError::RouteSetup(format!(
+                "FwpmEngineOpen0 failed (0x{rc:08x}): the firewall could not be reached, so the lockdown \
+                 cover could not be disengaged"
+            )),
+        );
     }
     let codes: Vec<(&'static str, u32)> = swept.iter().map(|(k, code)| (k.label, *code)).collect();
+    // Both folds off one pass, as in `release_all`: "does anything still
+    // fail?" and "what did the empty answers prove?" cannot disagree about
+    // which key answered what. The clearance is built EITHER WAY — every
+    // delete above was issued before any code was read, so a failure verdict
+    // does not make the observations beside it any less real (#1010 F1).
+    let clearance = Clearance::from_observations(&observations(swept), witness);
     match first_delete_failure(&codes) {
-        Some(e) => Err(e),
-        // Both folds off one pass, as in `release_all`: "does anything still
-        // fail?" and "what did the empty answers prove?" cannot disagree
-        // about which key answered what.
-        None => Ok(Clearance::from_observations(&observations(swept), witness)),
+        Some(e) => SweepOutcome::failed(clearance, e),
+        None => SweepOutcome::completed(clearance),
     }
 }
 
@@ -2200,15 +2245,19 @@ unsafe fn delete_all(engine: HANDLE) {
 /// that this call can see — but it is only *proof of absence* for a
 /// [`KeyLifetime::Persistent`] one. See [`Clearance`] for why collapsing the
 /// two lets the MSI delete `hole.exe` over a key it never observed.
-pub fn release_all(_state_dir: &Path, witness: ArmingWitness) -> Result<Clearance, RoutingError> {
+pub fn release_all(_state_dir: &Path, witness: ArmingWitness) -> SweepOutcome {
     unsafe {
         let mut engine = HANDLE::default();
         #[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
         let rc = FwpmEngineOpen0(PCWSTR::null(), RPC_C_AUTHN_WINNT, None, None, &mut engine);
         if rc != ERROR_SUCCESS.0 {
-            return Err(RoutingError::RouteSetup(format!(
-                "FwpmEngineOpen0 failed (0x{rc:08x}): the firewall could not be reached, so nothing could have been deleted"
-            )));
+            return SweepOutcome::failed(
+                // The empty fold: nothing was issued, so nothing was observed.
+                Clearance::from_observations(&[], witness),
+                RoutingError::RouteSetup(format!(
+                    "FwpmEngineOpen0 failed (0x{rc:08x}): the firewall could not be reached, so nothing could have been deleted"
+                )),
+            );
         }
 
         // One pass, both folds: each key carries its lifetime out of the
@@ -2234,10 +2283,16 @@ pub fn release_all(_state_dir: &Path, witness: ArmingWitness) -> Result<Clearanc
         let _ = FwpmEngineClose0(engine);
 
         let codes: Vec<(&'static str, u32)> = swept.iter().map(|(k, code)| (k.label, *code)).collect();
-        if let Some(e) = first_delete_failure(&codes) {
-            return Err(e);
+        // Folded before the failure verdict is consulted, for the reason
+        // `disengage_verdict` gives: every delete above was ISSUED before any
+        // code was read, so a sweep that ends in `Err` is still holding a
+        // complete observation set — including the sibling it just removed
+        // (#1010 F1).
+        let clearance = Clearance::from_observations(&observations(&swept), witness);
+        match first_delete_failure(&codes) {
+            Some(e) => SweepOutcome::failed(clearance, e),
+            None => SweepOutcome::completed(clearance),
         }
-        Ok(Clearance::from_observations(&observations(&swept), witness))
     }
 }
 

@@ -33,8 +33,36 @@
 //! has its sibling to fall back on, a consumed sibling still has its record —
 //! so the union is silent only when both are lost.
 //!
+//! # Why the record is never cleared
+//!
+//! The record is WRITE-ONCE: an engage arms it, and nothing in this version
+//! clears it. That is bindreams/hole#1010's F2, and the reason is the same one
+//! the whole remediation rests on — *evidence about a boot-time key never
+//! comes from a return code*. Clearing the record is a NEGATIVE conclusion
+//! about the boot-time policy record, and the only thing a sweep holds to draw
+//! it from is `FwpmFilterDeleteByKey0`'s `ERROR_SUCCESS`. That code says the
+//! runtime FWPM object went; whether the policy record behind it was purged is
+//! recorded as open in `failclosed/windows.rs`'s module doc and cannot be
+//! closed from here, because every read available — the delete's code, a
+//! `BOOTTIME_ONLY` enumeration, `netsh wfp show boottimepolicy` — goes through
+//! the Base Filtering Engine, and the record in question is by definition what
+//! applies BEFORE BFE starts at the next boot. Only a reboot separates them,
+//! and no lane reboots.
+//!
+//! So the twin's removal stays the unprovable event it always was, and the
+//! record says "a twin was armed on this host", never "and it is gone".
+//!
 //! # Disclosed residuals
 //!
+//! - **A host that genuinely cleaned up keeps reporting.** Arm the kill switch
+//!   once, turn it off, and every later `bridge release-covers` on that
+//!   `state_dir` names the two twin keys — for the life of the state dir. That
+//!   is the cost of the paragraph above, and it is bounded to hosts that ever
+//!   armed a twin: one that never did has no record and no live sibling, and
+//!   stays silent (`a_host_that_never_armed_a_twin_stays_silent_across_every_sweep`).
+//!   The trade is deliberate: an over-report costs an operator a paragraph, and
+//!   the silence it replaces costs #1003's unrecoverable host. Clearing it
+//!   needs a measurement no single-boot lane can make.
 //! - A `record` write that FAILS (an unwritable `state_dir`) loses the witness
 //!   with nothing left to re-derive it from. The sweep that failed to write
 //!   still reports — it holds the sibling evidence itself — but a later one
@@ -108,14 +136,21 @@ pub fn load(state_dir: &Path) -> ArmingWitness {
     }
 }
 
-/// Atomically persist `armed` (temp file + same-dir rename, `sync_all` before
-/// persist), the same write shape `lockdown_state` uses. Creates `state_dir`.
-fn save(state_dir: &Path, armed: bool, owner: Option<(u32, u32)>) -> std::io::Result<()> {
+/// Atomically persist the armed record (temp file + same-dir rename,
+/// `sync_all` before persist), the same write shape `lockdown_state` uses.
+/// Creates `state_dir`.
+///
+/// Always writes `armed: true`: nothing in this version can conclude a
+/// boot-time record gone (see [`WitnessUpdate`]). The FIELD stays a `bool`
+/// because [`load`] must keep classifying a `false` — written by a hand-edit,
+/// or by a future version with a reboot-capable measurement behind it — as
+/// [`ArmingWitness::Disarmed`] rather than as a schema error.
+fn save(state_dir: &Path, owner: Option<(u32, u32)>) -> std::io::Result<()> {
     std::fs::create_dir_all(state_dir)?;
     util::ownership::chown_if_some(state_dir, owner);
     let state = BootTimeState {
         version: SCHEMA_VERSION,
-        armed,
+        armed: true,
     };
     let json =
         serde_json::to_vec_pretty(&state).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
@@ -130,15 +165,27 @@ fn save(state_dir: &Path, armed: bool, owner: Option<(u32, u32)>) -> std::io::Re
 
 /// Record that a twin is outstanding on this host.
 ///
-/// Called from the facade's `engage_lockdown` on a platform whose standing
-/// cover arms boot-time keys, at the moment the fact becomes true — the twins
-/// are committed AND read back out of the boot-time view. Doing it here rather
-/// than leaving it to the first sweep covers the host whose sibling is removed
-/// by something that is not a sweep at all (an external FWPM delete, a
+/// Called at the moment the fact becomes true: `FwpmTransactionCommit0`
+/// returning `ERROR_SUCCESS`, on a platform whose standing cover arms
+/// boot-time keys (`platform::commit_and_record`). Doing it at the engage
+/// rather than leaving it to the first sweep covers the host whose sibling is
+/// removed by something that is not a sweep at all (an external FWPM delete, a
 /// firewall reset): no sweep ever observed the sibling, so no sweep could have
 /// copied the evidence.
+///
+/// **Not after the twins read back.** The read-back
+/// (`platform::verify_boottime_twins`) reports on a cover that is already
+/// committed and in force, so a failure there leaves the twins standing with
+/// nothing recorded — bindreams/hole#1010's F3, and the one class no sweep can
+/// rescue.
+///
+/// Compiled out of a macOS PRODUCTION build — `commit_and_record` is its only
+/// caller and it is Windows-only — but kept for every lane's TESTS, for the
+/// reason `readback` gives: the rule it encodes is platform-free and a rule
+/// proved only where the hazard lives is proved nowhere else.
+#[cfg(any(target_os = "windows", test, feature = "test-utils"))]
 pub(crate) fn record_armed(state_dir: &Path, owner: Option<(u32, u32)>) {
-    write_or_warn(state_dir, true, owner);
+    write_or_warn(state_dir, owner);
 }
 
 /// Arm the record from a test in a DOWNSTREAM crate, which cannot reach
@@ -160,14 +207,18 @@ pub fn record_armed_for_test(state_dir: &Path) {
 /// Derived once, in [`super::Clearance::witness_update`], from what the sweep
 /// saw — never re-derived at a write site.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// **There is no `Disarm`**, and that is bindreams/hole#1010's F2. Clearing
+/// the record is a NEGATIVE conclusion about a boot-time policy record, and
+/// the only thing a sweep holds to draw it from is a delete's return code —
+/// the one source this remediation's founding rule excludes. Every read
+/// available here goes through the Base Filtering Engine; the record is what
+/// applies before BFE starts at the next boot. So the record is write-once:
+/// an engage arms it and nothing in this version can clear it. What that costs
+/// is in the module doc's residuals.
 pub(crate) enum WitnessUpdate {
     /// A boot-time key went unproven on a host where a record is possible:
     /// copy that finding into the file before the evidence for it is gone.
     Arm,
-    /// Every boot-time key this sweep touched was watched being removed, which
-    /// is proof for any lifetime ([`super::KeyObservation::proves_empty`]).
-    /// Nothing is outstanding.
-    Disarm,
     /// The sweep says nothing about a boot-time key's record, so the file
     /// keeps whatever it held. Two causes, and the second is the one that
     /// matters: the sweep touched no boot-time key at all, or it found an
@@ -177,35 +228,32 @@ pub(crate) enum WitnessUpdate {
     Leave,
 }
 
-/// The record's next value, or `None` when nothing needs writing. Pure, so the
-/// one rule that must never write `false` over a real `Armed` is a table
-/// rather than a condition spread over a write site.
-fn next_record(current: ArmingWitness, update: WitnessUpdate) -> Option<bool> {
+/// Whether this update needs the record written. Pure, so the rule that no
+/// sweep can retract a real `Armed` is a table rather than a condition spread
+/// over a write site.
+///
+/// The return is a bare `bool` and not `Option<bool>` because there is only
+/// one value anything here can write. See [`WitnessUpdate`].
+fn should_arm(current: ArmingWitness, update: WitnessUpdate) -> bool {
     match update {
-        WitnessUpdate::Leave => None,
+        WitnessUpdate::Leave => false,
         // Already recorded; rewriting it would only risk an I/O failure.
-        WitnessUpdate::Arm => (current != ArmingWitness::Armed).then_some(true),
-        // `Unset` is a host with no file and nothing outstanding — writing
-        // `false` there would litter every host that never armed a twin.
-        // `Unreadable` IS written, because a corrupt file reports forever
-        // otherwise and this sweep just proved there is nothing to report.
-        WitnessUpdate::Disarm => (!matches!(current, ArmingWitness::Disarmed | ArmingWitness::Unset)).then_some(false),
+        WitnessUpdate::Arm => current != ArmingWitness::Armed,
     }
 }
 
 /// Apply a sweep's [`WitnessUpdate`] to the record it was folded against.
 pub(crate) fn apply(state_dir: &Path, current: ArmingWitness, update: WitnessUpdate, owner: Option<(u32, u32)>) {
-    if let Some(armed) = next_record(current, update) {
-        write_or_warn(state_dir, armed, owner);
+    if should_arm(current, update) {
+        write_or_warn(state_dir, owner);
     }
 }
 
 /// Warn, never propagate — see the module doc's residuals.
-fn write_or_warn(state_dir: &Path, armed: bool, owner: Option<(u32, u32)>) {
-    if let Err(e) = save(state_dir, armed, owner) {
+fn write_or_warn(state_dir: &Path, owner: Option<(u32, u32)>) {
+    if let Err(e) = save(state_dir, owner) {
         tracing::warn!(
             error = %e,
-            armed,
             path = %state_file(state_dir).display(),
             "the boot-time witness could not be written; a later sweep that can no longer see a \
              standing cover's PERSISTENT sibling will have nothing to fall back on"

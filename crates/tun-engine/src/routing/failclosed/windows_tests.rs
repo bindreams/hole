@@ -921,6 +921,7 @@ fn a_refused_delete_fails_the_disengage_instead_of_reporting_success() {
     // elevation but refuses the write, so this is the reachable case, not an
     // exotic one. The previous body discarded every code and returned Ok.
     let err = disengage_verdict(None, &[swept("lockdown block-all V4", 5)], ArmingWitness::Unset)
+        .into_result()
         .expect_err("a refused delete must fail loud");
     assert!(
         format!("{err}").contains("lockdown block-all V4"),
@@ -930,12 +931,16 @@ fn a_refused_delete_fails_the_disengage_instead_of_reporting_success() {
 
 #[skuld::test]
 fn an_unreachable_firewall_and_a_refused_delete_are_distinct_failures() {
-    let unreachable = disengage_verdict(Some(0x8032_0001), &[], ArmingWitness::Unset).expect_err("engine open failure");
+    let unreachable = disengage_verdict(Some(0x8032_0001), &[], ArmingWitness::Unset)
+        .into_result()
+        .expect_err("engine open failure");
     assert!(
         format!("{unreachable}").contains("could not be reached"),
         "{unreachable}"
     );
-    let refused = disengage_verdict(None, &[swept("k", 5)], ArmingWitness::Unset).expect_err("refused delete");
+    let refused = disengage_verdict(None, &[swept("k", 5)], ArmingWitness::Unset)
+        .into_result()
+        .expect_err("refused delete");
     assert_ne!(
         format!("{unreachable}"),
         format!("{refused}"),
@@ -957,8 +962,9 @@ fn a_clean_or_already_swept_host_disengages_successfully() {
         ],
         ArmingWitness::Unset
     )
+    .into_result()
     .is_ok());
-    assert!(disengage_verdict(None, &[], ArmingWitness::Unset).is_ok());
+    assert!(disengage_verdict(None, &[], ArmingWitness::Unset).into_result().is_ok());
 }
 
 // What `bridge unlock` hands back -------------------------------------------------------------------------------------
@@ -980,6 +986,7 @@ fn a_disengage_that_found_nothing_still_reports_what_it_could_not_prove() {
         &sweep_answering(FWP_E_FILTER_NOT_FOUND_DWORD, FWP_E_FILTER_NOT_FOUND_DWORD),
         ArmingWitness::Unset,
     )
+    .into_result()
     .expect("a not-found sweep must not fail the escape hatch");
     assert_eq!(
         clearance.unproven_keys(),
@@ -1003,8 +1010,44 @@ fn a_disengage_over_a_live_cover_hands_back_something_to_say() {
         &sweep_answering(FWP_E_FILTER_NOT_FOUND_DWORD, ERROR_SUCCESS.0),
         ArmingWitness::Unset,
     )
+    .into_result()
     .expect("a live cover disengages");
     assert_eq!(clearance.leftover_keys(), TWIN_LABELS);
+}
+
+#[skuld::test]
+fn a_disengage_that_failed_still_carries_the_sibling_it_already_removed() {
+    // bindreams/hole#1010's F1, at the Windows fold that produces the
+    // evidence. Every delete is ISSUED before any code is read (this
+    // function's own documented property), so a third code from ONE app-id
+    // permit says nothing about the block-all sibling whose delete succeeded
+    // a few entries earlier. That sibling is gone from the host either way,
+    // and its `Removed` is the only live evidence any later sweep could have
+    // had. The verdict fails AND the observation travels; returning early on
+    // the failure lost both in one call.
+    let mut swept = sweep_answering(FWP_E_FILTER_NOT_FOUND_DWORD, ERROR_SUCCESS.0);
+    let denied = swept
+        .iter_mut()
+        .find(|(k, _)| k.label == "lockdown app-id filter")
+        .expect("the lockdown sweep list carries App-ID permits");
+    // ERROR_ACCESS_DENIED: the unelevated run, or a DACL on one filter.
+    denied.1 = 5;
+
+    let outcome = disengage_verdict(None, &swept, ArmingWitness::Unset);
+    assert_eq!(
+        outcome.clearance().witness_update(),
+        crate::routing::failclosed::boottime_witness::WitnessUpdate::Arm,
+        "a failing sweep still holds the sibling it removed, and the record is written from it"
+    );
+    assert_eq!(
+        outcome.clearance().leftover_keys(),
+        TWIN_LABELS,
+        "the same observations that arm the record are the ones that name the keys"
+    );
+    assert!(
+        outcome.into_result().is_err(),
+        "and the failure still reaches the caller"
+    );
 }
 
 #[skuld::test]
@@ -1088,25 +1131,35 @@ fn a_not_found_sweep_proves_every_key_but_the_boot_time_twins() {
 }
 
 #[skuld::test]
-fn a_sweep_that_watched_the_twins_go_proves_them_empty() {
-    // The other half, and the reason `proves_empty` keys on the OUTCOME and
-    // not on the lifetime alone: `ERROR_SUCCESS` is a removal somebody
-    // watched happen, which is proof for a boot-time key exactly as it is for
-    // a persistent one (`boottime_privileged_tests` measures that a live
-    // twin's by-key delete returns it and that the filter leaves the
-    // BOOTTIME_ONLY view). An uninstall on the boot that engaged is therefore
-    // still an unqualified clearance; it is only the boot where no twin is
-    // live that cannot be proven.
+fn a_sweep_that_watched_the_twins_go_still_cannot_prove_them_empty() {
+    // The other half, over the REAL sweep lists, and bindreams/hole#1010's F2:
+    // the answer does NOT change with the outcome for a boot-time key.
+    // `ERROR_SUCCESS` is a removal somebody watched happen and
+    // `boottime_privileged_tests` measures exactly what it settles — the
+    // filter leaves the BOOTTIME_ONLY view, i.e. the RUNTIME OBJECT is gone.
+    // The boot-time policy record behind it is the thing that serves the next
+    // boot, every read available here goes through BFE, and the record is by
+    // definition what applies before BFE starts. So an uninstall on the boot
+    // that engaged — the MSI stopping the bridge and running `release-covers`
+    // while the twins are still live — is qualified too, and the twins are
+    // still named. The alternative is an empty unproven set at the one gate
+    // that deletes `hole.exe`.
     let swept: Vec<(SweptKey, u32)> = swept_lockdown_keys()
         .into_iter()
         .chain(swept_transient_keys())
         .map(|k| (k, ERROR_SUCCESS.0))
         .collect();
     let clearance = Clearance::from_observations(&observations(&swept), ArmingWitness::Unset);
-    assert!(
-        clearance.is_proven(),
-        "a removal that was watched happen proves the key empty whatever its lifetime: {:?}",
-        clearance.unproven_keys()
+    assert_eq!(
+        clearance.unproven_keys(),
+        TWIN_LABELS,
+        "exactly the twins stay unproven; every persistent key the sweep watched go IS proven"
+    );
+    assert_eq!(
+        clearance.leftover_keys(),
+        TWIN_LABELS,
+        "the siblings answered ERROR_SUCCESS, so a standing cover is installed here and the \
+         operator hears about the twins that went with it"
     );
 }
 
@@ -2069,22 +2122,32 @@ fn an_unhealthy_twin_is_still_found_so_the_health_checks_can_reject_it() {
 }
 
 #[skuld::test]
-fn the_standing_cover_reports_that_it_arms_boot_time_keys() {
-    // The flag the facade's `engage_lockdown` reads to decide whether a
-    // successful engage has a `boottime_witness` to record. It is DERIVED from
-    // the twins table rather than written as a literal, so what this pins is
-    // that the derivation and the table still agree on the platform that
-    // actually has twins — the macOS lane can only ever see the `false` arm.
-    // Removing the twins must retire the record with them, not leave an engage
-    // writing a witness for a key class that no longer exists.
+fn a_platform_that_arms_boot_time_keys_also_sweeps_them() {
+    // The flag `commit_and_record` reads to decide whether an engage has a
+    // `boottime_witness` to record. Comparing it against the table it is
+    // DEFINED from would be `x == x` and could not fail; what can is the other
+    // end of the promise — the record is only ever useful if some sweep can
+    // also produce a `WitnessUpdate` for it, and that needs a boot-time key in
+    // the sweep list. The two are built from one table but by different
+    // functions, so a sweep list that stopped carrying the twins would leave
+    // an engage arming a record no sweep ever speaks about again.
     let twins: &[BootTimeTwin] = &LOCKDOWN_BOOTTIME_TWINS;
     assert!(
         !twins.is_empty(),
         "Windows arms boot-time twins; an empty table would make every engage's witness a lie"
     );
+    let swept_boot_time: Vec<&str> = swept_lockdown_keys()
+        .iter()
+        .filter(|k| k.lifetime.key_lifetime() == KeyLifetime::BootTime)
+        .map(|k| k.label)
+        .collect();
+    assert_eq!(
+        swept_boot_time, TWIN_LABELS,
+        "every twin this platform arms must also be a key some sweep observes"
+    );
     assert_eq!(
         STANDING_COVER_ARMS_BOOT_TIME,
-        !twins.is_empty(),
-        "the flag must track the table it is derived from"
+        !swept_boot_time.is_empty(),
+        "a platform that says it arms boot-time keys must sweep at least one"
     );
 }
