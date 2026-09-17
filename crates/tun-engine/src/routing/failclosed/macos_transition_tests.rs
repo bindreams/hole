@@ -236,18 +236,18 @@ fn publish_on_commit_brackets_its_load_with_a_generation_change() {
 ///
 /// 25%, sited between the measurement and the cliff:
 ///
-/// - ABOVE: both lanes measured ~97% (see LAST MEASURED on the test). A runner
+/// - ABOVE: both lanes measured 98.3% (see LAST MEASURED on the test). A runner
 ///   would have to fail more than three of every four handshakes to a healthy
 ///   anycast host inside 20ms to breach this — a different runner, not
 ///   variance. Near-measurement floors are what turn ordinary runner load into
 ///   a red, and this repo pays for flakes.
-/// - BELOW: the pool emits ~0.8 probes/ms, so a 2-3ms window sees ~2 probes and
-///   24 transitions offer ~46 independent chances. At a 5% control rate the
-///   chance of missing every one is already ~10%; at the ~0.08% a genuine
-///   collapse produces it is ~97%. The floor sits ~5x above where the guard
-///   starts failing to detect, and ~4x below where it was measured — roughly
-///   the geometric mean, which is where a threshold with an order of magnitude
-///   of slack on each side belongs.
+/// - BELOW: the pool emits one probe per ~1.3-1.4ms, so a 2-3ms window sees ~2
+///   probes and 24 transitions offer ~46 independent chances. At a 5% control
+///   rate the chance of missing every one is already ~10%; at the ~0.08% a
+///   genuine collapse produces it is ~97%. The floor sits ~5x above where the
+///   guard starts failing to detect, and ~4x below where it was measured —
+///   roughly the geometric mean, which is where a threshold with an order of
+///   magnitude of slack on each side belongs.
 const CONTROL_RATE_FLOOR_PCT: f64 = 25.0;
 
 /// Proves a transient-cover TRANSITION — a second real `engage()` replacing a
