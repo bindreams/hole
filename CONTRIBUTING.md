@@ -1322,6 +1322,37 @@ fail an engage, for the same reason a not-found delete does not prove a key
 empty — and a spurious refusal there would block a kill-switch-armed user from
 connecting at all.
 
+The read-back takes two enumeration types (`FULLY_CONTAINED` and `OVERLAPPING`)
+only because WFP's reference does not pin down what `enumType` means for a
+condition-less template, so **only one of them may hold the twin**. Absence is
+therefore concluded only from a *complete* set of readable views
+(`failclosed::readback::verdict`, the platform-free rule behind
+`classify_twin_readback`): one view erroring makes the other's `Ok(vec![])`
+evidence of nothing, and since `install_lockdown` is fail-fatal, treating it as
+evidence refuses the connect outright. A positive find outranks an unreadable
+sibling view — the search runs first, so a twin held by the view that *was* read
+is verified whatever the other answered. `enum_boottime_on` discarding a
+partially-collected page set on a mid-enumeration error is the same rule, not a
+lapse from it: the discard turns an incomplete read into an error, which
+classifies unreadable and warns, where keeping the partial could only turn that
+warning into a failed engage.
+
+**A failed read-back leaves the committed cover standing, and on a first engage
+that is a behaviour change.** The transaction has already committed when
+`verify_boottime_twins` runs, so `engage_lockdown` returns `Err` with the
+filters installed and no guard over them. They are not orphaned — the next start
+reads `Live` off the fixed GUIDs, `decide_cover_recovery` yields `Adopt`, and
+`record_intent_on` repairs `bridge-lockdown.json`. But over a **clean host on a
+first engage** a pre-commit abort used to leave the host untouched, and this
+path instead leaves a full block-all in force while the start fails: the permits
+alongside it are loopback, the server IP, the TUN and Hole's own App-IDs, so
+every other application loses egress until the cover is released, and a retry
+that fails the same way repeats it. The escape is in-band (the tray's "Unblock
+Network", `hole bridge unlock`), so this is recoverable rather than a brick, and
+it is the chosen direction — claiming the switch is armed over a pre-BFE window
+nothing covers is a silent failure to protect rather than a visible failure to
+connect — but it is a disclosed residual, not the status quo.
+
 Two consequences follow on the paths that used to disagree with the engage.
 
 `disengage_lockdown` returns a `Clearance` too, not a bare `Ok`. It is the one
@@ -1341,10 +1372,47 @@ which is what an ordinary uninstall looks like, so the unproven set alone fired
 that warning on essentially every Windows uninstall — naming two filter keys
 that were never installed, and training operators to ignore the one host where
 a leftover is real, which is the hazard the function's own doc names.
-`leftover_keys` is the same set filtered by the sibling evidence above: a host
-holding no standing cover never had a twin to strand. `is_proven` is unchanged
-and still false there — what a sweep *proved* and what is worth *reporting* are
-two questions, and only the second is filtered.
+`leftover_keys` is the same set filtered by whether a twin could be outstanding
+on this host at all. `is_proven` is unchanged and still false there — what a
+sweep *proved* and what is worth *reporting* are two questions, and only the
+second is filtered.
+
+**Two independent things answer that question, and either one reporting is
+enough.** The sibling evidence above is live but *consumable*: the sibling and
+its twin are guaranteed to be added together and never removed together, so the
+first sweep that removes the sibling while the twin answers not-found destroys
+the only live evidence there was. "Turn the kill switch off, then uninstall" is
+an ordinary sequence that does exactly that — as is the tray's Unblock item, and
+as is startup recovery's `Sweep` arm — and with the sibling alone, every sweep
+after it reads the empty sibling set as *no cover was ever here* and the warning
+never fires again, on the one host where it is real.
+
+So a sweep that can still see a sibling copies the finding into
+`bridge-boottime.json` (`failclosed::boottime_witness`) before deleting it, and
+a Windows `engage_lockdown` records it at the moment the twins are committed and
+read back — which also covers a host whose sibling is removed by something that
+is not a sweep at all. `leftover_keys` reports when **either** the sibling or
+the record says a twin is possible; it is silent only where both rule one out.
+The two fail in different directions, which is the point: a wiped `state_dir`
+still has its sibling, a consumed sibling still has its record.
+
+The record is cleared only by proof — a sweep that watched every boot-time key
+it touched being removed, which is what turning the switch off in the same boot
+that engaged it looks like. It is never cleared by an empty sibling set: that
+would recreate the same defect one release later. A sweep that *failed* writes
+nothing at all, and a sweep carrying no boot-time key writes nothing either
+("every boot-time key proved empty" is vacuously true of none).
+
+Disclosed residuals. The record is per-`state_dir` while the WFP filters it
+describes are machine-wide, so the uninstall gate folds in every peer dir it
+already locks against a live bridge (`cutover::release_covers_with`); a bridge
+given an explicit `--state-dir` outside that set is invisible to the record for
+the same reason it is invisible to the liveness probe. A write that *fails* (an
+unwritable `state_dir`) loses the witness with nothing to re-derive it from — it
+is warned, never propagated, because refusing the release over bookkeeping trades
+a bounded early-boot block for a permanently unremovable product. And losing
+both sources at once — a wiped state dir on a host whose sibling an earlier
+sweep already removed — is still silent.
 
 **Its limit, which must travel with the result.** The probe's enumeration
 template names *no provider* — deliberately, since filtering by ours would make

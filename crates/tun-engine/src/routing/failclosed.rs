@@ -56,6 +56,15 @@ pub use luid::{LuidResolver, SystemLuidResolver};
 
 pub mod lockdown_state;
 
+pub mod boottime_witness;
+
+// Compiled out of a macOS PRODUCTION build — Windows' boot-time twin read-back
+// is its only caller — but kept for every lane's TESTS, because the rule it
+// encodes is platform-free and a rule proved only where the hazard lives is
+// proved nowhere else.
+#[cfg(any(target_os = "windows", test))]
+pub(crate) mod readback;
+
 // `pub(crate)` (not the default private) ONLY on the Windows arm:
 // `dns_confine::spec` — a sibling module outside this file's own subtree —
 // needs `platform::{FILTER_GUIDS, LOCKDOWN_FILTER_GUIDS, PROVIDER_GUID,
@@ -131,6 +140,14 @@ pub fn recover_cover(state_dir: &Path, adopting: bool) {
 /// On Windows the LUID is re-resolved here every engage (never persisted). On
 /// failure the host is left uncovered; the bridge's fail-FATAL caller aborts
 /// the start. `app_ids` is empty on macOS (pf has no per-process matching).
+///
+/// On a platform whose standing cover arms boot-time keys
+/// (`platform::STANDING_COVER_ARMS_BOOT_TIME`) a success also records the
+/// [`boottime_witness`]: this is the moment the fact becomes true, and
+/// recording it here — rather than leaving it to the first sweep that observes
+/// a sibling — covers the host whose sibling is removed by something that is
+/// not a sweep at all (an external FWPM delete, a firewall reset), where no
+/// sweep ever had the evidence to copy.
 pub fn engage_lockdown(
     server_ip: IpAddr,
     tun_name: &str,
@@ -140,20 +157,20 @@ pub fn engage_lockdown(
     owner: Option<(u32, u32)>,
 ) -> Result<Cover, RoutingError> {
     #[cfg(target_os = "windows")]
-    {
+    let inner = {
         let _ = owner;
         let luid = resolver.resolve(tun_name)?;
-        Ok(Cover {
-            _inner: platform::engage_lockdown(server_ip, luid, app_ids, state_dir)?,
-        })
-    }
+        platform::engage_lockdown(server_ip, luid, app_ids, state_dir)?
+    };
     #[cfg(target_os = "macos")]
-    {
+    let inner = {
         let _ = (resolver, app_ids);
-        Ok(Cover {
-            _inner: platform::engage_lockdown(server_ip, tun_name, state_dir, owner)?,
-        })
+        platform::engage_lockdown(server_ip, tun_name, state_dir, owner)?
+    };
+    if platform::STANDING_COVER_ARMS_BOOT_TIME {
+        boottime_witness::record_armed(state_dir, owner);
     }
+    Ok(Cover { _inner: inner })
 }
 
 /// Whether startup recovery disengages the standing cover for a given
@@ -225,11 +242,17 @@ pub fn recover_lockdown(decision: crate::routing::CoverRecovery, state_dir: &Pat
         RecoveryDispatch::Disengage => {
             tracing::info!("lockdown recovery: sweeping leftover cover (intent off)");
             // Named discard: startup recovery has no operator to report a
-            // qualification to, and unlike `bridge unlock` it does not write
-            // the intent — whatever it leaves unproven, the next start sweeps
-            // again.
+            // qualification to. What it must NOT discard is the evidence — and
+            // it does not, because `disengage_lockdown` persists the
+            // [`boottime_witness`] before returning. This is the one sweep in
+            // the whole lifecycle that can still see a standing cover's
+            // `PERSISTENT` sibling on a host whose kill switch was armed in an
+            // earlier boot and recorded off in this one; the sweep itself then
+            // deletes that sibling, so no later sweep can re-derive it. "The
+            // next start sweeps again" — the justification this discard used
+            // to carry — is false for exactly that reason.
             match disengage_lockdown(state_dir) {
-                Ok(_clearance_has_no_reader_at_startup) => {}
+                Ok(_clearance_is_persisted_not_reported_at_startup) => {}
                 Err(e) => tracing::warn!(error = %e, "lockdown sweep could not disengage the cover"),
             }
         }
@@ -282,7 +305,9 @@ pub fn reclaim_stale_tun_permit(tun_name: &str) {
 /// [`Clearance::proven`]: pf has no boot-time analogue, a ruleset does not
 /// survive a reboot at all, so a macOS disengage has nothing to leave unproven.
 pub fn disengage_lockdown(state_dir: &Path) -> Result<Clearance, RoutingError> {
-    platform::disengage_lockdown(state_dir)
+    sweep_with_witness(state_dir, None, |witness| {
+        platform::disengage_lockdown(state_dir, witness)
+    })
 }
 
 /// Ask the OS whether a standing lockdown cover from a prior run is present,
@@ -354,7 +379,7 @@ pub fn lockdown_cover_presence(state_dir: &Path) -> crate::routing::CoverPresenc
 /// fixed GUIDs, so there is no bookkeeping that can be corrupt or
 /// version-skewed and nothing to erase — only GUID sweeps run there.
 pub fn release_all(state_dir: &Path) -> Result<Clearance, RoutingError> {
-    platform::release_all(state_dir)
+    sweep_with_witness(state_dir, None, |witness| platform::release_all(state_dir, witness))
 }
 
 // Release clearance ===================================================================================================
@@ -524,15 +549,94 @@ impl KeyObservation {
 /// on essentially every Windows sweep, because the twins answer empty whenever
 /// no bridge engaged in this boot. [`Self::leftover_keys`] is what is worth
 /// telling an operator, which is narrower: an unproven key on a host where no
-/// standing cover is installed at all could never have had a record behind it,
-/// and reporting one every time is how the host where it is real gets ignored
-/// (see `cutover::release_clearance_report`). The discriminator is
-/// [`KeyRole::BootTimeSibling`], collected in the same sweep.
+/// boot-time twin could ever have been armed did not strand anything, and
+/// reporting one every time is how the host where it is real gets ignored
+/// (see `cutover::release_clearance_report`).
+///
+/// Two independent things can say a record is possible, and `leftover_keys`
+/// reports when EITHER does:
+///
+/// * [`KeyRole::BootTimeSibling`], collected in the same sweep — live
+///   evidence, and the only one that survives a wiped `state_dir`;
+/// * [`ArmingWitness`], the persisted record — the only one that survives the
+///   sweep that REMOVES the sibling.
+///
+/// Neither alone is sound. The sibling is consumed by the first sweep that
+/// removes it, after which every later sweep reads an empty sibling set as "no
+/// cover was ever here" and goes silent for good; the record is lost by a
+/// wiped state dir. See [`boottime_witness`] for the full argument.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[must_use = "the uninstall gate reads this; dropping it restores the silent `Ok` of #1003"]
 pub struct Clearance {
     unproven: Vec<&'static str>,
     sibling: SiblingEvidence,
+    witness: ArmingWitness,
+    boot_time: BootTimeSightings,
+}
+
+/// What the persisted record ([`boottime_witness`]) says about whether a
+/// boot-time twin is outstanding on this host.
+///
+/// Four causes, mirroring [`lockdown_state::Intent`]'s split for the same
+/// reason: "no file" and "a file that could not be read" are different
+/// findings, and only one of them is consent to stay quiet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArmingWitness {
+    /// The record parsed and says a twin was armed here and has not since been
+    /// watched being removed.
+    Armed,
+    /// The record parsed and says nothing is outstanding: every twin this host
+    /// armed was later watched going.
+    Disarmed,
+    /// No record file at all. A host that never armed a twin — or one whose
+    /// `state_dir` was wiped, which is why this is not the only evidence
+    /// [`Clearance::leftover_keys`] consults.
+    Unset,
+    /// A record exists but could not be read, parsed, or matched the schema.
+    /// Reports, for the same reason [`SiblingEvidence::Unknown`] does.
+    Unreadable,
+}
+
+impl ArmingWitness {
+    /// Whether this record leaves a boot-time record possible on this host.
+    /// The whole rule, in one exhaustive match, so no call site re-derives it.
+    fn record_possible(self) -> bool {
+        match self {
+            ArmingWitness::Armed | ArmingWitness::Unreadable => true,
+            ArmingWitness::Disarmed | ArmingWitness::Unset => false,
+        }
+    }
+
+    /// Fold two state dirs' records into one answer, the more cautious
+    /// winning. The WFP filters a record describes are machine-wide while the
+    /// record is per-`state_dir`, so the uninstall gate reads its peers' too —
+    /// see [`Clearance::corroborate`].
+    fn or(self, other: Self) -> Self {
+        if self.record_possible() {
+            self
+        } else {
+            other
+        }
+    }
+}
+
+/// What a sweep observed about the [`KeyLifetime::BootTime`] keys
+/// specifically — the only class the persisted record speaks about.
+///
+/// Separate from [`Clearance::unproven`], which spans every lifetime: a
+/// persistent key that a sweep could not delete is a real finding, but it says
+/// nothing about whether a boot-time twin is outstanding, and writing the
+/// record off it would be the same "shared consequence" merge
+/// [`KeyOutcome`] refuses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BootTimeSightings {
+    /// The sweep touched no boot-time key at all — macOS, and any future sweep
+    /// list that drops them. It has nothing to say about the record.
+    None,
+    /// Every boot-time key the sweep touched proved itself empty.
+    AllProven,
+    /// At least one boot-time key's absence went unproven.
+    SomeUnproven,
 }
 
 /// What a sweep's [`KeyRole::BootTimeSibling`] keys said about whether a
@@ -556,6 +660,22 @@ enum SiblingEvidence {
     /// sibling key at all. Absence of evidence, which this whole type exists
     /// to stop reading as evidence of absence.
     Unknown,
+}
+
+impl SiblingEvidence {
+    /// Whether this sweep's siblings leave a boot-time record possible on this
+    /// host. The whole rule, in one exhaustive match, so no call site
+    /// re-derives it.
+    ///
+    /// `Absent` is the only answer that rules one out, and it does so only for
+    /// THIS sweep's own live evidence — it says nothing about what an earlier
+    /// sweep removed, which is why [`ArmingWitness`] is consulted beside it.
+    fn record_possible(self) -> bool {
+        match self {
+            SiblingEvidence::Installed | SiblingEvidence::Unknown => true,
+            SiblingEvidence::Absent => false,
+        }
+    }
 }
 
 /// Fold the sibling keys' outcomes into the one question a boot-time key
@@ -600,6 +720,11 @@ impl Clearance {
             // whatever the sibling evidence would have been; `Absent` states
             // the platform's own reason rather than leaving a placeholder.
             sibling: SiblingEvidence::Absent,
+            // Same reason, for the second evidence source: a platform with no
+            // boot-time key class never writes a record, so `Unset` is its
+            // standing answer rather than a placeholder.
+            witness: ArmingWitness::Unset,
+            boot_time: BootTimeSightings::None,
         }
     }
 
@@ -611,7 +736,13 @@ impl Clearance {
     /// restated here — an observation is unproven iff it did not prove itself
     /// empty, so a new [`KeyOutcome`] or [`KeyLifetime`] variant cannot slip
     /// past this fold by failing to match a filter predicate written here.
-    pub fn from_observations(observations: &[KeyObservation]) -> Self {
+    ///
+    /// `witness` is the persisted record this sweep was folded against, and it
+    /// is a PARAMETER rather than a default so no sweep can be built without
+    /// answering the question. A sweep that has no record to consult (macOS,
+    /// whose pf ruleset has no boot-time key class) passes
+    /// [`ArmingWitness::Unset`] and says so.
+    pub fn from_observations(observations: &[KeyObservation], witness: ArmingWitness) -> Self {
         Self {
             unproven: observations
                 .iter()
@@ -619,7 +750,23 @@ impl Clearance {
                 .map(|o| o.key)
                 .collect(),
             sibling: sibling_evidence(observations),
+            witness,
+            boot_time: boot_time_sightings(observations),
         }
+    }
+
+    /// Fold another `state_dir`'s persisted record into this verdict.
+    ///
+    /// The record is per-`state_dir`; the WFP filters it describes are
+    /// machine-wide. An elevated non-`--service` bridge keeps its state in the
+    /// interactive user's profile, so the record of a twin IT armed does not
+    /// sit where the MSI's SYSTEM-context `release-covers` reads. The
+    /// uninstall gate therefore folds in every peer dir it already locks
+    /// against a live bridge (`cutover::release_covers_with`); the more
+    /// cautious answer wins.
+    pub fn corroborate(mut self, witness: ArmingWitness) -> Self {
+        self.witness = self.witness.or(witness);
+        self
     }
 
     /// Whether the sweep proved every key it touched is empty. `false` does
@@ -640,25 +787,111 @@ impl Clearance {
     /// sweep proved.
     ///
     /// Empty is NOT "the sweep proved everything": [`Self::is_proven`] is
-    /// still the proof record and still false. Empty here means the sweep
-    /// found no standing cover installed at all
-    /// ([`SiblingEvidence::Absent`]), and a twin is only ever added in the
-    /// same transaction as that cover — so on such a host every unproven key
-    /// is unproven for the ordinary reason that it was never installed. That
-    /// is what almost every uninstall looks like, and reporting it every time
-    /// is how the one host where a leftover is real gets ignored.
+    /// still the proof record and still false. Empty here means BOTH evidence
+    /// sources agree no twin could be outstanding on this host — the sweep
+    /// found no standing cover installed ([`SiblingEvidence::Absent`]) AND no
+    /// record says one was ever armed ([`ArmingWitness::Unset`] or
+    /// `Disarmed`). That is what almost every uninstall looks like, and
+    /// reporting it every time is how the one host where a leftover is real
+    /// gets ignored.
     ///
-    /// Both other [`SiblingEvidence`] answers report. `Installed` is the
-    /// dangerous case this exists to keep visible — a kill switch armed in an
-    /// earlier boot, BFE re-adding the persistent half at this one, the twins
-    /// answering empty because no twin is ever live once BFE has started.
-    /// `Unknown` reports for the opposite reason, that nothing was ruled out.
+    /// **Either source reporting is enough**, and the union is the whole fix
+    /// for the alternative: the sibling ALONE is consumed by the first sweep
+    /// that removes it. An ordinary "turn the kill switch off, then uninstall"
+    /// removes the sibling at the first step, and every sweep after it reads
+    /// the empty sibling set as "no cover was ever here" — permanently silent,
+    /// which is the direction that deletes `hole.exe` over a live twin. The
+    /// record alone is lost by a wiped `state_dir`. Neither loss takes the
+    /// other with it.
+    ///
+    /// The other [`SiblingEvidence`] answers report for two different reasons.
+    /// `Installed` is the dangerous case this exists to keep visible — a kill
+    /// switch armed in an earlier boot, BFE re-adding the persistent half at
+    /// this one, the twins answering empty because no twin is ever live once
+    /// BFE has started. `Unknown` reports for the opposite reason, that
+    /// nothing was ruled out. [`ArmingWitness`] splits the same way.
     pub fn leftover_keys(&self) -> &[&'static str] {
-        match self.sibling {
-            SiblingEvidence::Absent => &[],
-            SiblingEvidence::Installed | SiblingEvidence::Unknown => &self.unproven,
+        if self.sibling.record_possible() || self.witness.record_possible() {
+            &self.unproven
+        } else {
+            &[]
         }
     }
+
+    /// What this sweep's own observations say the persisted record should now
+    /// hold — derived here, once, and never at a write site.
+    ///
+    /// Total over the pair. The load-bearing cell is the last one: an unproven
+    /// boot-time key on a host whose siblings all answered empty writes
+    /// NOTHING. Writing `Disarm` there would re-create the defect this record
+    /// exists to fix, one level down — "no cover is installed now" is not
+    /// evidence about a twin's record, which is the entire premise of
+    /// [`KeyLifetime::BootTime`].
+    pub(crate) fn witness_update(&self) -> boottime_witness::WitnessUpdate {
+        use boottime_witness::WitnessUpdate;
+        match (self.boot_time, self.sibling) {
+            // The sweep touched no boot-time key, so it saw nothing the record
+            // is about.
+            (BootTimeSightings::None, _) => WitnessUpdate::Leave,
+            // Watched every one of them go — proof for any lifetime.
+            (BootTimeSightings::AllProven, _) => WitnessUpdate::Disarm,
+            // A record is possible here and the live evidence for that is
+            // about to be deleted by this very sweep. Copy it out first.
+            (BootTimeSightings::SomeUnproven, SiblingEvidence::Installed | SiblingEvidence::Unknown) => {
+                WitnessUpdate::Arm
+            }
+            (BootTimeSightings::SomeUnproven, SiblingEvidence::Absent) => WitnessUpdate::Leave,
+        }
+    }
+}
+
+/// Fold the boot-time keys' outcomes into what this sweep can say about the
+/// persisted record. Pure and total over the slice.
+///
+/// Reads [`KeyObservation::proves_empty`] rather than re-deriving which
+/// outcomes count, so this and [`Clearance::unproven`] cannot disagree about
+/// whether a given key was proven.
+fn boot_time_sightings(observations: &[KeyObservation]) -> BootTimeSightings {
+    let mut seen = false;
+    let mut unproven = false;
+    for o in observations.iter().filter(|o| o.lifetime == KeyLifetime::BootTime) {
+        seen = true;
+        unproven |= !o.proves_empty();
+    }
+    match (seen, unproven) {
+        (false, _) => BootTimeSightings::None,
+        (true, true) => BootTimeSightings::SomeUnproven,
+        (true, false) => BootTimeSightings::AllProven,
+    }
+}
+
+/// One sweep's whole interaction with the persisted boot-time record: consult
+/// it before the fold, then update it from what the sweep itself observed.
+///
+/// Every path that can remove a standing cover's `PERSISTENT` sibling goes
+/// through here, which is what makes the three sites that DISCARD the returned
+/// [`Clearance`] safe — `recover_lockdown`'s `Sweep` arm, `SystemRouting::
+/// release_all_covers`, and the reconciler's `CoverStep::Release` through it.
+/// The evidence is persisted before the value they drop is built, so dropping
+/// it costs an operator message on that one call and nothing beyond it.
+///
+/// Generic over the sweep so the SEQUENCE this exists for — a sweep that
+/// removes the sibling, followed by one that can no longer see it — is
+/// drivable without a firewall, on every platform's lane. A single observation
+/// slice cannot express it, which is why the defect was invisible to tests
+/// built from one.
+fn sweep_with_witness(
+    state_dir: &Path,
+    owner: Option<(u32, u32)>,
+    sweep: impl FnOnce(ArmingWitness) -> Result<Clearance, RoutingError>,
+) -> Result<Clearance, RoutingError> {
+    let witness = boottime_witness::load(state_dir);
+    // A sweep that FAILED observed nothing it can write down: `Err` means a
+    // delete was refused or the engine could not be reached, and neither says
+    // anything about a key. The record keeps whatever it held.
+    let clearance = sweep(witness)?;
+    boottime_witness::apply(state_dir, witness, clearance.witness_update(), owner);
+    Ok(clearance)
 }
 
 /// Windows-only test helper: resolve the LUID then build the spec, exercising

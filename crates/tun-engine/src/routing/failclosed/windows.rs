@@ -183,7 +183,7 @@ use windows::Win32::NetworkManagement::WindowsFilteringPlatform::*;
 use windows::Win32::System::Rpc::RPC_C_AUTHN_WINNT;
 
 use super::RESOLVER_PERMIT_PORT;
-use super::{Clearance, KeyLifetime, KeyObservation, KeyOutcome, KeyRole};
+use super::{ArmingWitness, Clearance, KeyLifetime, KeyObservation, KeyOutcome, KeyRole};
 use crate::error::RoutingError;
 
 // Fixed Hole identifiers. Compiled in so recovery can delete by key with no
@@ -315,6 +315,13 @@ const LOCKDOWN_BOOTTIME_TWINS: [BootTimeTwin; LOCKDOWN_BOOTTIME_BLOCK_ALL_GUIDS.
         sibling: LOCKDOWN_FILTER_GUIDS[7], // block-all V6
     },
 ];
+
+/// Whether this platform's standing cover arms [`KeyLifetime::BootTime`] keys,
+/// and therefore whether an engage has a [`super::boottime_witness`] to
+/// record. Read off [`LOCKDOWN_BOOTTIME_TWINS`] rather than written as a
+/// literal, so removing the twins retires the record with them instead of
+/// leaving an engage writing a witness for a key class that no longer exists.
+pub(crate) const STANDING_COVER_ARMS_BOOT_TIME: bool = !LOCKDOWN_BOOTTIME_TWINS.is_empty();
 
 /// Whether `guid` is the `Persistent` half of a rule a boot-time twin copies.
 ///
@@ -2066,13 +2073,13 @@ pub fn lockdown_cover_presence(_state_dir: &Path) -> crate::routing::CoverPresen
 /// engine open but not the write — would leave the kill switch engaged while
 /// the intent reads "off", with nothing left to reconcile it. The macOS arm
 /// has always propagated its `pfctl` failures; this is the same rule.
-pub fn disengage_lockdown(_state_dir: &Path) -> Result<Clearance, RoutingError> {
+pub fn disengage_lockdown(_state_dir: &Path, witness: ArmingWitness) -> Result<Clearance, RoutingError> {
     let swept = unsafe {
         let mut engine = HANDLE::default();
         #[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
         let rc = FwpmEngineOpen0(PCWSTR::null(), RPC_C_AUTHN_WINNT, None, None, &mut engine);
         if rc != ERROR_SUCCESS.0 {
-            return disengage_verdict(Some(rc), &[]);
+            return disengage_verdict(Some(rc), &[], witness);
         }
         // Every delete is ISSUED before any code is inspected, matching
         // `release_all`: a short-circuit would leave a later lockdown filter
@@ -2092,7 +2099,7 @@ pub fn disengage_lockdown(_state_dir: &Path) -> Result<Clearance, RoutingError> 
         let _ = FwpmEngineClose0(engine);
         swept
     };
-    disengage_verdict(None, &swept)
+    disengage_verdict(None, &swept, witness)
 }
 
 /// Whether a lockdown disengage may report success. Pure and separated from
@@ -2108,7 +2115,11 @@ pub fn disengage_lockdown(_state_dir: &Path) -> Result<Clearance, RoutingError> 
 /// empty. The two causes are kept apart because they say different things to
 /// the operator: "the firewall could not be reached" versus "the firewall
 /// refused the delete".
-fn disengage_verdict(open_failure: Option<u32>, swept: &[(SweptKey, u32)]) -> Result<Clearance, RoutingError> {
+fn disengage_verdict(
+    open_failure: Option<u32>,
+    swept: &[(SweptKey, u32)],
+    witness: ArmingWitness,
+) -> Result<Clearance, RoutingError> {
     if let Some(rc) = open_failure {
         return Err(RoutingError::RouteSetup(format!(
             "FwpmEngineOpen0 failed (0x{rc:08x}): the firewall could not be reached, so the lockdown \
@@ -2121,7 +2132,7 @@ fn disengage_verdict(open_failure: Option<u32>, swept: &[(SweptKey, u32)]) -> Re
         // Both folds off one pass, as in `release_all`: "does anything still
         // fail?" and "what did the empty answers prove?" cannot disagree
         // about which key answered what.
-        None => Ok(Clearance::from_observations(&observations(swept))),
+        None => Ok(Clearance::from_observations(&observations(swept), witness)),
     }
 }
 
@@ -2189,7 +2200,7 @@ unsafe fn delete_all(engine: HANDLE) {
 /// that this call can see — but it is only *proof of absence* for a
 /// [`KeyLifetime::Persistent`] one. See [`Clearance`] for why collapsing the
 /// two lets the MSI delete `hole.exe` over a key it never observed.
-pub fn release_all(_state_dir: &Path) -> Result<Clearance, RoutingError> {
+pub fn release_all(_state_dir: &Path, witness: ArmingWitness) -> Result<Clearance, RoutingError> {
     unsafe {
         let mut engine = HANDLE::default();
         #[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
@@ -2226,7 +2237,7 @@ pub fn release_all(_state_dir: &Path) -> Result<Clearance, RoutingError> {
         if let Some(e) = first_delete_failure(&codes) {
             return Err(e);
         }
-        Ok(Clearance::from_observations(&observations(&swept)))
+        Ok(Clearance::from_observations(&observations(&swept), witness))
     }
 }
 
@@ -2361,6 +2372,20 @@ unsafe fn enum_boottime_on(
     result.map(|()| found)
 }
 
+/// What a set of boot-time view reads says about one twin's key.
+///
+/// The rule itself is platform-free and lives in [`super::readback`], where
+/// every lane can falsify it; this is the typed wrapper that names what a
+/// "view" and a "match" are for a twin.
+pub(crate) type TwinReadback = super::readback::Readback<FilterRecord>;
+
+/// Classify a twin's read-back — see [`super::readback::verdict`] for the rule
+/// and for why absence may be concluded only from a COMPLETE set of readable
+/// views (bindreams/hole#1010 F2).
+fn classify_twin_readback(views: &[Result<Vec<FilterRecord>, u32>], key: GUID) -> TwinReadback {
+    super::readback::verdict(views, |r| r.key == key)
+}
+
 /// Read the boot-time twins back after a COMMITTED [`engage_lockdown`], and
 /// refuse the engage when the boot-time view does not hold a healthy one
 /// under each twin's key.
@@ -2394,10 +2419,19 @@ unsafe fn enum_boottime_on(
 /// **An unreadable view does not fail the engage**, and that is the same rule
 /// the rest of this file runs on rather than a softening of it: absence of
 /// evidence is not evidence of absence. A view that could not be enumerated
-/// says nothing about the twin, so it is warned. Only a view that WAS read and
-/// does not hold the twin is evidence, and that fails. The asymmetry matters
-/// because of what a false failure costs — [`StaleKeyPolicy::Fail`], so a
-/// spurious refusal here blocks a lockdown-armed user from connecting at all.
+/// says nothing about the twin, so it is warned. Only a COMPLETE set of
+/// readable views that does not hold the twin is evidence, and that fails —
+/// see [`classify_twin_readback`], which is where the rule lives and why it is
+/// `any(is_err)` rather than `all`. The asymmetry matters because of what a
+/// false failure costs: [`StaleKeyPolicy::Fail`], so a spurious refusal here
+/// blocks a lockdown-armed user from connecting at all.
+///
+/// [`enum_boottime_on`] discarding a partially-collected page set on a
+/// mid-enumeration error is the same rule, not a lapse from it: the discard
+/// turns an incomplete read into `Err`, which classifies `Unreadable` and
+/// warns. Keeping the partial could only turn that warning into a FAILED
+/// engage — the health checks would then run against a record found by a read
+/// that did not finish — which is the direction this whole asymmetry refuses.
 ///
 /// The container mismatch is WARNED, not failed, and the split is deliberate.
 /// A twin under someone else's `subLayerKey` is not governed by this cover's
@@ -2408,11 +2442,30 @@ unsafe fn enum_boottime_on(
 ///
 /// **A failed verification leaves the committed cover in force.** The
 /// transaction has already committed when this runs, so there is nothing to
-/// roll back; `engage_lockdown` returns `Err` with the filters installed and no
-/// [`Cover`] guard over them. That is the fail-closed direction and it is what
-/// an aborted `install_lockdown` does anyway — the host keeps a cover, the
-/// start fails, `lockdown_cover_presence` reads `Live`, and the next start
-/// adopts it.
+/// roll back; `engage_lockdown` returns `Err` with the filters installed and
+/// no [`Cover`] guard over them.
+///
+/// Those filters are NOT orphaned: nothing treats the `Err` as "no cover
+/// installed", the next start probes the OS via [`lockdown_cover_presence`],
+/// reads `Live` off the fixed GUIDs, and `decide_cover_recovery` yields
+/// `Adopt`, with `record_intent_on` repairing `bridge-lockdown.json`.
+///
+/// **What it is NOT is what an aborted `install_lockdown` does.** That claim
+/// held only where a cover ALREADY existed. Over a clean host on a FIRST
+/// engage, a pre-commit abort leaves the host untouched; this path leaves a
+/// full block-all standing while the start fails. The permits installed
+/// alongside it are loopback, the server IP, the TUN and the App-IDs for
+/// Hole's own binaries — so **every other application on the host loses
+/// egress** until the cover is released, and a retry that fails the same way
+/// repeats it. The escape exists and is in-band (the tray's "Unblock Network",
+/// `hole bridge unlock`), so this is recoverable rather than a brick, but it
+/// is a real behaviour change over the pre-#998 engage and is disclosed in
+/// CONTRIBUTING.md's fail-closed residuals rather than described as the status
+/// quo.
+///
+/// It is still the chosen direction: the alternative is claiming the kill
+/// switch is armed over a pre-BFE window nothing covers, which is a silent
+/// failure to protect rather than a visible failure to connect.
 ///
 /// # Safety
 ///
@@ -2423,26 +2476,24 @@ unsafe fn verify_boottime_twins(engine: HANDLE) -> Result<(), RoutingError> {
             enum_boottime_on(engine, twin.layer, FWP_FILTER_ENUM_FULLY_CONTAINED),
             enum_boottime_on(engine, twin.layer, FWP_FILTER_ENUM_OVERLAPPING),
         ];
-        if views.iter().all(Result::is_err) {
-            tracing::warn!(
-                key = twin.label,
-                codes = ?views.iter().map(|v| v.as_ref().err().map(|c| format!("0x{c:08x}"))).collect::<Vec<_>>(),
-                "boot-time twin read-back could not be taken; not failing the engage on it — a view \
-                 that could not be enumerated is not evidence the twin is missing"
-            );
-            continue;
-        }
-        let found = views
-            .iter()
-            .filter_map(|v| v.as_ref().ok())
-            .flatten()
-            .find(|r| r.key == twin.guid);
-        let Some(record) = found else {
-            return Err(RoutingError::RouteSetup(format!(
-                "{} committed but is absent from the boot-time view, so the kill switch would report \
-                 armed over a pre-BFE window nothing covers",
-                twin.label
-            )));
+        let record = match classify_twin_readback(&views, twin.guid) {
+            TwinReadback::Found(record) => record,
+            TwinReadback::Unreadable => {
+                tracing::warn!(
+                    key = twin.label,
+                    codes = ?views.iter().map(|v| v.as_ref().err().map(|c| format!("0x{c:08x}"))).collect::<Vec<_>>(),
+                    "boot-time twin read-back could not be taken; not failing the engage on it — a view \
+                     that could not be enumerated is not evidence the twin is missing"
+                );
+                continue;
+            }
+            TwinReadback::Absent => {
+                return Err(RoutingError::RouteSetup(format!(
+                    "{} committed but is absent from the boot-time view, so the kill switch would report \
+                     armed over a pre-BFE window nothing covers",
+                    twin.label
+                )))
+            }
         };
         if !record.is_boottime() || record.is_disabled() {
             return Err(RoutingError::RouteSetup(format!(

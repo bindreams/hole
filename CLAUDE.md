@@ -174,7 +174,14 @@ before editing; the sections linked below are the authoritative source.
   is possible at all is read off the twins' `Persistent` sibling
   (`KeyRole::BootTimeSibling`) — which is why `disengage_lockdown` returns a
   `Clearance` like `release_all`, and why `release_clearance_report` fires on
-  `leftover_keys` rather than on every unproven key. The
+  `leftover_keys` rather than on every unproven key. That sibling is **live
+  evidence a sweep consumes**: it is added with its twin and never removed with
+  it, so the sweep that deletes it destroys the only thing that could report.
+  Every sweep therefore copies the finding into `bridge-boottime.json`
+  (`failclosed::boottime_witness`) before deleting the sibling, an engage
+  records it when the twins read back, and `leftover_keys` reports when
+  **either** source says a twin is possible — the sibling survives a wiped
+  state dir, the record survives the sweep. The
   transient one is swept unconditionally on next start, the standing one only
   on an explicit recorded off — full reconciliation table (`decide_cover_recovery`)
   and disclosed residuals in CONTRIBUTING.md. A single persisted `Target`

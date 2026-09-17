@@ -586,7 +586,7 @@ fn the_windows_peer_set_reaches_accounts_other_than_this_process() {
 // `bridge release-covers` is the last moment `hole.exe` exists on an
 // uninstalling host. What it reports here is all that survives `RemoveFiles`.
 
-use tun_engine::routing::failclosed::{KeyLifetime, KeyObservation, KeyOutcome, KeyRole};
+use tun_engine::routing::failclosed::{ArmingWitness, KeyLifetime, KeyObservation, KeyOutcome, KeyRole};
 
 /// A sweep whose boot-time twins answered empty, on a host where the twins'
 /// `PERSISTENT` sibling was REMOVED — i.e. a standing cover really is
@@ -614,7 +614,10 @@ fn clearance_with_sibling(sibling: KeyOutcome, keys: &[&'static str]) -> Clearan
         outcome: KeyOutcome::NotFound,
         role: KeyRole::Plain,
     }));
-    Clearance::from_observations(&obs)
+    // `Unset`: no persisted boot-time record, which is what every host that
+    // never armed the kill switch is in. The sibling is the only evidence
+    // these fixtures carry.
+    Clearance::from_observations(&obs, ArmingWitness::Unset)
 }
 
 #[skuld::test]
@@ -630,6 +633,37 @@ fn release_covers_reports_what_the_sweep_could_not_prove() {
 
     assert!(!clearance.is_proven());
     assert_eq!(clearance.unproven_keys(), ["lockdown boot-time block-all V4"]);
+}
+
+#[skuld::test]
+fn the_uninstall_gate_reads_a_twin_recorded_in_a_peer_state_dir() {
+    // The boot-time record is per-state-dir; the WFP filters it describes are
+    // machine-wide. An elevated non-`--service` bridge keeps its state in the
+    // interactive user's profile, so a twin IT armed — and then consumed the
+    // sibling for, by turning the kill switch off — is recorded where this
+    // SYSTEM-context call would never look. The sweep itself sees an empty
+    // sibling set and has nothing; the peer's record is the only survivor.
+    let dir = tempfile::tempdir().unwrap();
+    let peer = tempfile::tempdir().unwrap();
+    let twins = ["lockdown boot-time block-all V4"];
+
+    let quiet = release_covers_with(dir.path(), &[peer.path().to_path_buf()], || {
+        Ok(clearance_with_sibling(KeyOutcome::NotFound, &twins))
+    })
+    .expect("an unproven clearance is not a failure");
+    assert_eq!(
+        release_clearance_report(&quiet),
+        None,
+        "no evidence anywhere: this is what almost every uninstall looks like"
+    );
+
+    tun_engine::routing::failclosed::boottime_witness::record_armed_for_test(peer.path());
+    let loud = release_covers_with(dir.path(), &[peer.path().to_path_buf()], || {
+        Ok(clearance_with_sibling(KeyOutcome::NotFound, &twins))
+    })
+    .expect("an unproven clearance is not a failure");
+    let report = release_clearance_report(&loud).expect("the peer's record must reach the operator");
+    assert!(report.contains("lockdown boot-time block-all V4"), "{report}");
 }
 
 #[skuld::test]

@@ -261,10 +261,17 @@ pub fn release_covers() -> std::io::Result<Clearance> {
 /// The twins go unproven on EVERY boot where no bridge engaged, which is what
 /// an ordinary uninstall looks like, so the unproven set alone would fire this
 /// message on essentially every Windows uninstall and carry no information at
-/// all. `leftover_keys` is the same set filtered by the one thing a sweep can
-/// still establish: whether a standing cover is installed on this host, read
-/// off the twins' `PERSISTENT` siblings (`failclosed::KeyRole`). A host with
-/// no cover installed never had a twin to strand.
+/// all. `leftover_keys` is the same set filtered by the two things that can
+/// still say a twin could be outstanding here — the standing cover's
+/// `PERSISTENT` siblings in this very sweep (`failclosed::KeyRole`) and the
+/// persisted `failclosed::boottime_witness` — reporting when EITHER speaks.
+///
+/// The union is not belt-and-braces. The sibling alone is CONSUMED by the
+/// first sweep that removes it, and "turn the kill switch off, then uninstall"
+/// is an ordinary sequence that does exactly that; after it, every sweep reads
+/// the empty sibling set as "no cover was ever here" and this message never
+/// fires again. The record alone is lost by a wiped `state_dir`. Silence
+/// requires losing both.
 ///
 /// The remedy it names has to be one that exists. `netsh wfp` is a
 /// **diagnostics-only** context — its verbs are `capture`, `dump`, `help`,
@@ -447,7 +454,17 @@ fn release_covers_with(
 
     crate::target::apply(state_dir, None, |_| crate::target::Target::Off)
         .map_err(|e| std::io::Error::other(format!("could not record target off: {e}")))?;
-    let clearance = release()?;
+    let mut clearance = release()?;
+    // The boot-time record is per-state-dir; the WFP filters it describes are
+    // machine-wide. An elevated non-`--service` bridge keeps its state in the
+    // interactive user's profile, so a twin IT armed is recorded where this
+    // SYSTEM-context call would never look. Fold in every peer already probed
+    // above — the same set, so a dir outside it is invisible to the record for
+    // exactly the reason it is invisible to the liveness probe, and
+    // `peer_state_dirs` discloses it once for both.
+    for peer in &probed {
+        clearance = clearance.corroborate(tun_engine::routing::failclosed::boottime_witness::load(peer));
+    }
 
     // Best-effort from here — see the fatality note on `release_covers`.
     if let Err(e) = crate::target::apply_startup_preference(state_dir, None, |pref| pref.candidate = None) {

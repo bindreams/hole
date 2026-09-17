@@ -354,6 +354,10 @@ pub async fn reconcile_once<P, R, D>(
 
     for phase in step_order(cover, tunnel) {
         match phase {
+            // The `Clearance` is dropped at the trait boundary, not here — see
+            // `Routing::release_all_covers` for why that costs the operator
+            // message and not the evidence (the sweep persists the boot-time
+            // witness before returning).
             Phase::Cover(CoverStep::Release) => match pm.routing_handle().release_all_covers() {
                 Ok(()) => pm.set_standing_cover_adopted(false),
                 Err(error) => {

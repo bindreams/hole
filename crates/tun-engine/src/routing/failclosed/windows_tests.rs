@@ -903,7 +903,7 @@ fn a_code_that_is_neither_success_nor_not_found_is_a_failure_not_a_removal() {
         (key("persistent", FilterLifetime::PERSISTENT), 5u32),
         (key("boot-time", FilterLifetime::BOOT_TIME), 5u32),
     ];
-    let clearance = Clearance::from_observations(&observations(&swept));
+    let clearance = Clearance::from_observations(&observations(&swept), ArmingWitness::Unset);
     assert!(!clearance.is_proven());
     assert_eq!(clearance.unproven_keys(), ["persistent", "boot-time"]);
 }
@@ -920,8 +920,8 @@ fn a_refused_delete_fails_the_disengage_instead_of_reporting_success() {
     // ERROR_ACCESS_DENIED: the unelevated run. FWPM opens the engine without
     // elevation but refuses the write, so this is the reachable case, not an
     // exotic one. The previous body discarded every code and returned Ok.
-    let err =
-        disengage_verdict(None, &[swept("lockdown block-all V4", 5)]).expect_err("a refused delete must fail loud");
+    let err = disengage_verdict(None, &[swept("lockdown block-all V4", 5)], ArmingWitness::Unset)
+        .expect_err("a refused delete must fail loud");
     assert!(
         format!("{err}").contains("lockdown block-all V4"),
         "the failing key must be named: {err}"
@@ -930,12 +930,12 @@ fn a_refused_delete_fails_the_disengage_instead_of_reporting_success() {
 
 #[skuld::test]
 fn an_unreachable_firewall_and_a_refused_delete_are_distinct_failures() {
-    let unreachable = disengage_verdict(Some(0x8032_0001), &[]).expect_err("engine open failure");
+    let unreachable = disengage_verdict(Some(0x8032_0001), &[], ArmingWitness::Unset).expect_err("engine open failure");
     assert!(
         format!("{unreachable}").contains("could not be reached"),
         "{unreachable}"
     );
-    let refused = disengage_verdict(None, &[swept("k", 5)]).expect_err("refused delete");
+    let refused = disengage_verdict(None, &[swept("k", 5)], ArmingWitness::Unset).expect_err("refused delete");
     assert_ne!(
         format!("{unreachable}"),
         format!("{refused}"),
@@ -954,10 +954,11 @@ fn a_clean_or_already_swept_host_disengages_successfully() {
             swept("a", ERROR_SUCCESS.0),
             swept("b", FWP_E_FILTER_NOT_FOUND_DWORD),
             swept("c", FWP_E_FILTER_NOT_FOUND_DWORD),
-        ]
+        ],
+        ArmingWitness::Unset
     )
     .is_ok());
-    assert!(disengage_verdict(None, &[]).is_ok());
+    assert!(disengage_verdict(None, &[], ArmingWitness::Unset).is_ok());
 }
 
 // What `bridge unlock` hands back -------------------------------------------------------------------------------------
@@ -977,6 +978,7 @@ fn a_disengage_that_found_nothing_still_reports_what_it_could_not_prove() {
     let clearance = disengage_verdict(
         None,
         &sweep_answering(FWP_E_FILTER_NOT_FOUND_DWORD, FWP_E_FILTER_NOT_FOUND_DWORD),
+        ArmingWitness::Unset,
     )
     .expect("a not-found sweep must not fail the escape hatch");
     assert_eq!(
@@ -996,8 +998,12 @@ fn a_disengage_over_a_live_cover_hands_back_something_to_say() {
     // block-all, so its delete removes a live object; the twins answer empty
     // because no twin is ever live once BFE has started. After this call the
     // intent is off and nothing will ever pre-delete those keys again.
-    let clearance = disengage_verdict(None, &sweep_answering(FWP_E_FILTER_NOT_FOUND_DWORD, ERROR_SUCCESS.0))
-        .expect("a live cover disengages");
+    let clearance = disengage_verdict(
+        None,
+        &sweep_answering(FWP_E_FILTER_NOT_FOUND_DWORD, ERROR_SUCCESS.0),
+        ArmingWitness::Unset,
+    )
+    .expect("a live cover disengages");
     assert_eq!(clearance.leftover_keys(), TWIN_LABELS);
 }
 
@@ -1072,7 +1078,7 @@ fn a_not_found_sweep_proves_every_key_but_the_boot_time_twins() {
         .chain(swept_transient_keys())
         .map(|k| (k, FWP_E_FILTER_NOT_FOUND_DWORD))
         .collect();
-    let clearance = Clearance::from_observations(&observations(&swept));
+    let clearance = Clearance::from_observations(&observations(&swept), ArmingWitness::Unset);
     assert_eq!(
         clearance.unproven_keys(),
         ["lockdown boot-time block-all V4", "lockdown boot-time block-all V6"],
@@ -1096,7 +1102,7 @@ fn a_sweep_that_watched_the_twins_go_proves_them_empty() {
         .chain(swept_transient_keys())
         .map(|k| (k, ERROR_SUCCESS.0))
         .collect();
-    let clearance = Clearance::from_observations(&observations(&swept));
+    let clearance = Clearance::from_observations(&observations(&swept), ArmingWitness::Unset);
     assert!(
         clearance.is_proven(),
         "a removal that was watched happen proves the key empty whatever its lifetime: {:?}",
@@ -1178,10 +1184,13 @@ fn a_clean_host_reports_no_leftover_and_a_still_covered_one_does() {
     // End-to-end over the REAL sweep lists, on the two hosts an uninstall
     // actually meets. Both leave the twins UNPROVEN — that never changes —
     // and they differ only in whether anyone should be told.
-    let clean = Clearance::from_observations(&observations(&sweep_answering(
-        FWP_E_FILTER_NOT_FOUND_DWORD,
-        FWP_E_FILTER_NOT_FOUND_DWORD,
-    )));
+    let clean = Clearance::from_observations(
+        &observations(&sweep_answering(
+            FWP_E_FILTER_NOT_FOUND_DWORD,
+            FWP_E_FILTER_NOT_FOUND_DWORD,
+        )),
+        ArmingWitness::Unset,
+    );
     assert_eq!(clean.unproven_keys(), TWIN_LABELS);
     assert!(
         clean.leftover_keys().is_empty(),
@@ -1190,10 +1199,10 @@ fn a_clean_host_reports_no_leftover_and_a_still_covered_one_does() {
         clean.leftover_keys()
     );
 
-    let still_covered = Clearance::from_observations(&observations(&sweep_answering(
-        FWP_E_FILTER_NOT_FOUND_DWORD,
-        ERROR_SUCCESS.0,
-    )));
+    let still_covered = Clearance::from_observations(
+        &observations(&sweep_answering(FWP_E_FILTER_NOT_FOUND_DWORD, ERROR_SUCCESS.0)),
+        ArmingWitness::Unset,
+    );
     assert_eq!(
         still_covered.leftover_keys(),
         TWIN_LABELS,
@@ -1968,5 +1977,114 @@ fn reclaim_stale_tun_permit_does_not_discard_delete_codes() {
     assert!(
         body.contains("first_delete_failure"),
         "reclaim_stale_tun_permit must fold its delete codes through first_delete_failure:\n{body}"
+    );
+}
+
+// Boot-time twin read-back ============================================================================================
+
+/// A live boot-time filter as the read-back sees it: in this cover's
+/// containers, carrying the boot-time flag, not disabled.
+fn healthy(key: GUID) -> FilterRecord {
+    FilterRecord {
+        key,
+        flags: FWPM_FILTER_FLAG_BOOTTIME.0 | FWPM_FILTER_FLAG_PERSISTENT.0,
+        provider: Some(PROVIDER_GUID),
+        sublayer: SUBLAYER_GUID,
+        layer: layer_guid(Layer::ConnectV4),
+        filter_id: 7,
+    }
+}
+
+const OTHER_KEY: GUID = GUID::from_u128(0xdead_beef_0000_0000_0000_0000_0000_0001);
+
+#[skuld::test]
+fn an_unreadable_view_never_concludes_the_twin_is_absent() {
+    // bindreams/hole#1010 F2. The ONLY reason both enumeration types are read
+    // is that WFP's reference does not pin down what `enumType` means for a
+    // condition-less template, so only one of them may hold the twin. Under
+    // that premise the other's `Ok(vec![])` proves nothing — and concluding
+    // `Absent` from it fails a fail-FATAL engage, so a lockdown-armed user
+    // cannot connect at all.
+    let key = LOCKDOWN_BOOTTIME_TWINS[0].guid;
+    let views = [Err(0x8032_0005u32), Ok(vec![])];
+    assert_eq!(
+        classify_twin_readback(&views, key),
+        TwinReadback::Unreadable,
+        "one view errored, so the other's empty answer is evidence of nothing"
+    );
+
+    // The mirror: both views read, neither holds it. That IS evidence, and the
+    // only thing that may refuse an engage.
+    assert_eq!(
+        classify_twin_readback(&[Ok(vec![]), Ok(vec![healthy(OTHER_KEY)])], key),
+        TwinReadback::Absent
+    );
+}
+
+#[skuld::test]
+fn a_twin_held_by_the_readable_view_outranks_the_one_that_errored() {
+    // The search runs before the error check, so the read that DID find the
+    // object is what decides. An error on the other view costs nothing here —
+    // finding the twin is the whole point of the read.
+    let key = LOCKDOWN_BOOTTIME_TWINS[0].guid;
+    let record = healthy(key);
+    assert_eq!(
+        classify_twin_readback(&[Err(0x8032_0005), Ok(vec![record])], key),
+        TwinReadback::Found(record)
+    );
+    assert_eq!(
+        classify_twin_readback(&[Ok(vec![record]), Err(0x8032_0005)], key),
+        TwinReadback::Found(record)
+    );
+}
+
+#[skuld::test]
+fn a_read_back_with_no_view_at_all_is_unreadable_and_never_absent() {
+    // "No readable view holds it" is vacuously true of nothing read, and the
+    // vacuous reading is the one that fails an engage — the same trap
+    // `sibling_evidence` refuses for an empty sibling set.
+    assert_eq!(
+        classify_twin_readback(&[], LOCKDOWN_BOOTTIME_TWINS[0].guid),
+        TwinReadback::Unreadable
+    );
+    assert_eq!(
+        classify_twin_readback(&[Err(0x8032_0005), Err(0x8032_0005)], LOCKDOWN_BOOTTIME_TWINS[0].guid),
+        TwinReadback::Unreadable
+    );
+}
+
+#[skuld::test]
+fn an_unhealthy_twin_is_still_found_so_the_health_checks_can_reject_it() {
+    // `Found` is about the KEY, not about the object's health: a disabled or
+    // non-boot-time record must reach `verify_boottime_twins`'s flag checks
+    // rather than being classified away as absent, or the two failure messages
+    // collapse into one that names the wrong cause.
+    let key = LOCKDOWN_BOOTTIME_TWINS[0].guid;
+    let mut sick = healthy(key);
+    sick.flags = FWPM_FILTER_FLAG_DISABLED.0;
+    assert_eq!(
+        classify_twin_readback(&[Ok(vec![sick]), Ok(vec![])], key),
+        TwinReadback::Found(sick)
+    );
+}
+
+#[skuld::test]
+fn the_standing_cover_reports_that_it_arms_boot_time_keys() {
+    // The flag the facade's `engage_lockdown` reads to decide whether a
+    // successful engage has a `boottime_witness` to record. It is DERIVED from
+    // the twins table rather than written as a literal, so what this pins is
+    // that the derivation and the table still agree on the platform that
+    // actually has twins — the macOS lane can only ever see the `false` arm.
+    // Removing the twins must retire the record with them, not leave an engage
+    // writing a witness for a key class that no longer exists.
+    let twins: &[BootTimeTwin] = &LOCKDOWN_BOOTTIME_TWINS;
+    assert!(
+        !twins.is_empty(),
+        "Windows arms boot-time twins; an empty table would make every engage's witness a lie"
+    );
+    assert_eq!(
+        STANDING_COVER_ARMS_BOOT_TIME,
+        !twins.is_empty(),
+        "the flag must track the table it is derived from"
     );
 }

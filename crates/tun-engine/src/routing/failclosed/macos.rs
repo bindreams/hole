@@ -34,6 +34,16 @@ use super::Clearance;
 use super::StateFile;
 use super::RESOLVER_PERMIT_PORT;
 
+/// Whether this platform's standing cover arms [`super::KeyLifetime::BootTime`]
+/// keys, and therefore whether an engage has a [`super::boottime_witness`] to
+/// record. **False on macOS**: pf has no boot-time analogue — a ruleset does
+/// not survive a reboot at all (bindreams/hole#617) — so no macOS engage can
+/// strand one and no macOS sweep consults or writes the record. That is also
+/// why both sweep entry points here ignore their `witness` argument; they
+/// answer [`Clearance::proven`] unconditionally, which carries no unproven key
+/// for a witness to qualify.
+pub(crate) const STANDING_COVER_ARMS_BOOT_TIME: bool = false;
+
 /// Build the self-contained pf ruleset (loaded via `pfctl -f -`).
 ///
 /// `set block-policy drop` silently drops blocked packets (no RST/ICMP).
@@ -558,7 +568,7 @@ pub fn engage_lockdown(
 /// survive a reboot at all — so every macOS cover key is
 /// [`super::KeyLifetime::Persistent`] and a disengage has nothing to leave
 /// unproven.
-pub fn disengage_lockdown(state_dir: &Path) -> Result<Clearance, RoutingError> {
+pub fn disengage_lockdown(state_dir: &Path, _witness: super::ArmingWitness) -> Result<Clearance, RoutingError> {
     disengage_lockdown_with(
         lockdown_cover_presence(state_dir),
         lockdown_state::load(state_dir),
@@ -650,7 +660,10 @@ pub fn lockdown_cover_presence(state_dir: &Path) -> crate::routing::CoverPresenc
 /// Best-effort wrapper for `Drop` (user-stop): disengage and swallow. Drop has
 /// no caller to surface an error to.
 fn lockdown_disengage(state_dir: &Path) {
-    match disengage_lockdown(state_dir) {
+    // `Unset`: this platform arms no boot-time key
+    // ([`STANDING_COVER_ARMS_BOOT_TIME`]), so there is never a record to
+    // consult and the argument is inert.
+    match disengage_lockdown(state_dir, super::ArmingWitness::Unset) {
         // Always `Clearance::proven` on macOS, and `Drop` has no reader for
         // it either way.
         Ok(_clearance_is_unconditional_here) => {}
@@ -879,7 +892,7 @@ impl PfOps for RealPfOps<'_> {
 /// release can leave unproven. macOS's own "`Ok` over a still-blocked host" residual is a
 /// different one (an entirely absent state file, clause 1) and is not what
 /// this type tracks.
-pub fn release_all(state_dir: &Path) -> Result<Clearance, RoutingError> {
+pub fn release_all(state_dir: &Path, _witness: super::ArmingWitness) -> Result<Clearance, RoutingError> {
     let transient = state::load_presence(state_dir);
     let standing = lockdown_state::load_presence(state_dir);
     release_all_with(transient, standing, &mut RealPfOps { state_dir })?;
