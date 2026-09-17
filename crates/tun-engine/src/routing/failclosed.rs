@@ -950,6 +950,8 @@ fn sweep_with_witness(
 /// the sibling gone from the host, the record never written. The defence the
 /// discard used to carry — "a sweep that failed observed nothing it can write
 /// down" — is false for exactly that reason.
+#[must_use = "this carries a `Clearance` AND a failure; dropping it discards both at once, which \
+              is the pair this type exists to keep"]
 pub(crate) struct SweepOutcome {
     clearance: Clearance,
     failure: Option<RoutingError>,

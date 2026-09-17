@@ -276,6 +276,10 @@ fn a_sweep_that_never_reached_the_firewall_writes_nothing_down() {
          a twin with a record saying it did"
     );
 
+    // Forward-compat, and weaker than the direction above on purpose: while
+    // the record is write-once (see `WitnessUpdate`), `Armed` is the only
+    // reachable outcome here, so no mutation to the fold can red this half. It
+    // becomes live the day a `Disarm` exists.
     let armed = dir();
     super::record_armed(armed.path(), None);
     failing_sweep(armed.path(), &[]);
@@ -382,5 +386,101 @@ fn a_sweep_carrying_no_boot_time_key_at_all_leaves_the_record_alone() {
         super::load(state.path()),
         ArmingWitness::Armed,
         "a sweep with no boot-time key observed nothing the record is about"
+    );
+}
+
+// Where the engage arms the record ====================================================================================
+
+/// The text of the item starting at `head`, bounded by its own column-0
+/// closing brace, so a guard cannot drift onto a neighbour or read its own
+/// prose. (The same helper `windows_tests` uses for its source tripwires; it
+/// is copied rather than shared because that module compiles only on Windows,
+/// which is exactly what the guard below must not depend on.)
+fn item_body<'a>(src: &'a str, head: &str) -> &'a str {
+    let start = src
+        .find(head)
+        .unwrap_or_else(|| panic!("{head} must exist in windows.rs"));
+    let after = &src[start..];
+    let end = after.find("\n}\n").map(|i| i + 2).unwrap_or(after.len());
+    &after[..end]
+}
+
+#[skuld::test]
+fn the_engage_arms_the_record_at_the_commit_and_nowhere_downstream_of_it() {
+    // Source tripwire, the technique and the reason of `windows_tests`'
+    // `neither_engage_discards_its_pre_delete_codes`: no fixture in any lane
+    // can make a real `FwpmTransactionCommit0` succeed and the read-back after
+    // it fail, and that single run is the only one where this ordering is
+    // observable at all. The privileged lane's
+    // `..._every_engage_rearms_the_twins_...` asserts `load(dir) == Armed`
+    // after an engage that already returned `Ok`, so it cannot tell "recorded
+    // at the commit" from "recorded after the read-back".
+    //
+    // It lives here rather than beside that guard for the reason this module's
+    // doc and `record_armed`'s own doc both give: the hazard is Windows-only
+    // and its proof must not live only on Windows.
+    //
+    // What it holds. `commit_and_record` is one step because the fact the
+    // record describes becomes true the instant the commit returns
+    // `ERROR_SUCCESS` — the twins are in the store, the cover is in force —
+    // and every statement after it can fail over a cover that still stands.
+    // Moving the record down beside `verify_boottime_twins`, so it "only goes
+    // in once the twins are confirmed", reads as MORE careful and is
+    // bindreams/hole#1003: a host whose read-back fails then holds a
+    // committed, in-force boot-time block-all with nothing recorded, and when
+    // its `PERSISTENT` sibling is later cleared by something that is not a
+    // sweep — an external FWPM delete, a firewall reset — no sweep ever held
+    // the evidence to copy. That is not hypothetical: this PR introduced that
+    // exact split once, in the round that fixed its predecessor, with the
+    // whole suite green.
+    let src = include_str!("windows.rs");
+
+    let engage = item_body(src, "pub fn engage_lockdown(");
+    // Matched on the call, not on the name: this body's own prose names
+    // `commit_and_record` (the comment under the call says why the record
+    // precedes the read-back), so a `contains("commit_and_record")` would go
+    // on passing over a body that had inlined the commit and kept only the
+    // sentence about it.
+    assert_eq!(
+        engage.matches("commit_and_record(engine, state_dir, owner)?").count(),
+        1,
+        "engage_lockdown must commit through commit_and_record, exactly once:\n{engage}"
+    );
+    assert_eq!(
+        engage.matches("FwpmTransactionCommit0").count(),
+        0,
+        "engage_lockdown must reach its commit only through commit_and_record — inlining it for \
+         readability is what separates the commit from the record it has to carry:\n{engage}"
+    );
+
+    let commit = item_body(src, "unsafe fn commit_and_record(");
+    let commit_at = commit
+        .find("FwpmTransactionCommit0")
+        .unwrap_or_else(|| panic!("commit_and_record must be the site that commits:\n{commit}"));
+    let record_at = commit
+        .find("record_armed(")
+        .unwrap_or_else(|| panic!("commit_and_record must be the site that arms the record:\n{commit}"));
+    assert!(
+        commit_at < record_at,
+        "the record must be written AFTER the commit that makes it true — written first, it \
+         survives an aborted transaction and claims a twin on a host that has none:\n{commit}"
+    );
+
+    // Counted on the call site, file-wide: a record moved out of
+    // `commit_and_record` lands wherever the mover found convenient, and only
+    // one of those places is inside any one body. Matched on `record_armed(`
+    // rather than the bare name so a doc link — the shape a prose mention
+    // takes in this file — is not read as a write.
+    let arming_sites: Vec<&str> = src.lines().filter(|l| l.contains("record_armed(")).collect();
+    assert_eq!(
+        arming_sites.len(),
+        1,
+        "windows.rs may arm the boot-time record in exactly one place; found {arming_sites:?}"
+    );
+    assert!(
+        commit.contains(arming_sites[0].trim()),
+        "the one site that arms the record must sit inside commit_and_record, beside the commit \
+         that makes it true — not downstream of a read-back that can fail over a cover already in \
+         force: {arming_sites:?}"
     );
 }

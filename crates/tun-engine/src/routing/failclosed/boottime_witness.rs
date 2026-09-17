@@ -206,7 +206,7 @@ pub fn record_armed_for_test(state_dir: &Path) {
 ///
 /// Derived once, in [`super::Clearance::witness_update`], from what the sweep
 /// saw — never re-derived at a write site.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
 /// **There is no `Disarm`**, and that is bindreams/hole#1010's F2. Clearing
 /// the record is a NEGATIVE conclusion about a boot-time policy record, and
 /// the only thing a sweep holds to draw it from is a delete's return code —
@@ -215,6 +215,7 @@ pub fn record_armed_for_test(state_dir: &Path) {
 /// applies before BFE starts at the next boot. So the record is write-once:
 /// an engage arms it and nothing in this version can clear it. What that costs
 /// is in the module doc's residuals.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum WitnessUpdate {
     /// A boot-time key went unproven on a host where a record is possible:
     /// copy that finding into the file before the evidence for it is gone.
