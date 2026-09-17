@@ -313,22 +313,20 @@ const CONTROL_RATE_FLOOR_PCT: f64 = 25.0;
 /// survives a PASS. See the printed line itself for what it means and its own
 /// caveats — this comment does not restate them.
 ///
-/// LAST MEASURED — PENDING. The commit-generation check now BRACKETS the load
-/// instead of trailing it, which changes which attempts are counted, so the
-/// previous run's figures do not describe this code and are deliberately not
-/// carried forward rather than replaced by guesses. Fill this in from this
-/// branch's own next green privileged darwin run and from nowhere else; the
-/// printed `[sensitivity]` line below carries every column.
+/// LAST MEASURED at `23a529ff` — from this branch's own green privileged darwin
+/// run, and nowhere else; nothing is carried over from the pre-bracket filter's
+/// run, which counted a different set of attempts.
 ///
-/// | lane  | filtered | raw (unfiltered) | pool |
-/// |-------|----------|------------------|------|
-/// | arm64 |          |                  |      |
-/// | amd64 |          |                  |      |
+/// | lane  | filtered       | raw (unfiltered) | pool                                              |
+/// |-------|----------------|------------------|---------------------------------------------------|
+/// | arm64 | 191/191 100.0% | 229/233 98.3%    | 496 probes / 16 threads / 658.981375ms = 1329 us   |
+/// | amd64 | 496/496 100.0% | 532/541 98.3%    | 1541 probes / 16 threads / 2.225901559s = 1444 us  |
 ///
 /// The raw rate is what [`CONTROL_RATE_FLOOR_PCT`] is set from; see that const
-/// for why the floor sits where it does. Only `filtered` can move on the
-/// bracket's account — raw and pool are measured upstream of the filter — but
-/// none of the three is transcribed from a build that did not carry it.
+/// for why the floor sits where it does. Only `filtered` could move on the
+/// bracket's account — raw and pool are measured upstream of the filter — and
+/// that held: raw read 97.2% / 97.1% before the bracket against 98.3% on both
+/// lanes here, sampling variance across runs with different attempt counts.
 ///
 /// What those figures answer is the question the printed caveat leaves open:
 /// whether the pool's probe interval is the same order as the window being
