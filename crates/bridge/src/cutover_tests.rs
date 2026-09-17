@@ -38,12 +38,39 @@ fn unlock_successful_disengage_flips_intent_off() {
     let dir = tempfile::tempdir().unwrap();
     lockdown_state::set_enabled(dir.path(), true, None).unwrap();
 
-    let result = unlock_with(dir.path(), || Ok(()));
+    let result = unlock_with(dir.path(), || Ok(Clearance::proven()));
 
     assert!(result.is_ok());
     assert!(
         !lockdown_state::load_enabled(dir.path()),
         "intent flips off only after a confirmed disengage"
+    );
+}
+
+#[skuld::test]
+fn unlock_hands_back_what_the_disengage_could_not_prove() {
+    // #1010: `unlock_with` used to swallow the disengage's verdict and return
+    // `()`. It writes the kill-switch intent OFF in the statement after the
+    // disengage, so there is no next engage to re-arm or re-delete a
+    // boot-time key — the pre-delete runs only from `engage_lockdown`, which
+    // an off intent prevents. This is the last moment the qualification can
+    // reach anybody, which is why `hole bridge unlock` prints it.
+    let dir = tempfile::tempdir().unwrap();
+    lockdown_state::set_enabled(dir.path(), true, None).unwrap();
+
+    let clearance = unlock_with(dir.path(), || {
+        Ok(unproven_clearance(&["lockdown boot-time block-all V4"]))
+    })
+    .expect("an unproven disengage is not a failure");
+
+    assert_eq!(clearance.unproven_keys(), ["lockdown boot-time block-all V4"]);
+    assert!(
+        release_clearance_report(&clearance).is_some(),
+        "the CLI prints this report; a dropped clearance leaves it with nothing to print"
+    );
+    assert!(
+        !lockdown_state::load_enabled(dir.path()),
+        "the intent still flips off — an unproven key must never block the escape from a blocked host"
     );
 }
 
@@ -88,7 +115,7 @@ fn unlock_records_the_target_off_before_releasing() {
             crate::target::Target::Off,
             "target must already be recorded off before the release call"
         );
-        Ok(())
+        Ok(Clearance::proven())
     });
 
     assert!(result.is_ok(), "{result:?}");
@@ -114,7 +141,7 @@ fn unlock_holds_the_liveness_lock_across_the_whole_sequence() {
                 .is_none(),
             "a bridge starting mid-unlock must contend on the same lock, not observe it free"
         );
-        Ok(())
+        Ok(Clearance::proven())
     });
 
     assert!(result.is_ok(), "{result:?}");
@@ -559,17 +586,34 @@ fn the_windows_peer_set_reaches_accounts_other_than_this_process() {
 // `bridge release-covers` is the last moment `hole.exe` exists on an
 // uninstalling host. What it reports here is all that survives `RemoveFiles`.
 
-use tun_engine::routing::failclosed::{KeyLifetime, KeyObservation, KeyOutcome};
+use tun_engine::routing::failclosed::{KeyLifetime, KeyObservation, KeyOutcome, KeyRole};
 
+/// A sweep whose boot-time twins answered empty, on a host where the twins'
+/// `PERSISTENT` sibling was REMOVED — i.e. a standing cover really is
+/// installed here, so an unproven twin is worth reporting.
+///
+/// The sibling is not decoration: `release_clearance_report` reads
+/// `leftover_keys`, and without a sibling saying a cover is installed these
+/// same unproven keys are the ordinary shape of a clean uninstall.
 fn unproven_clearance(keys: &[&'static str]) -> Clearance {
-    let obs: Vec<KeyObservation> = keys
-        .iter()
-        .map(|&key| KeyObservation {
-            key,
-            lifetime: KeyLifetime::BootTime,
-            outcome: KeyOutcome::NotFound,
-        })
-        .collect();
+    clearance_with_sibling(KeyOutcome::Removed, keys)
+}
+
+/// As [`unproven_clearance`], with what the twins' `PERSISTENT` sibling
+/// answered spelled out.
+fn clearance_with_sibling(sibling: KeyOutcome, keys: &[&'static str]) -> Clearance {
+    let mut obs = vec![KeyObservation {
+        key: "lockdown filter",
+        lifetime: KeyLifetime::Persistent,
+        outcome: sibling,
+        role: KeyRole::BootTimeSibling,
+    }];
+    obs.extend(keys.iter().map(|&key| KeyObservation {
+        key,
+        lifetime: KeyLifetime::BootTime,
+        outcome: KeyOutcome::NotFound,
+        role: KeyRole::Plain,
+    }));
     Clearance::from_observations(&obs)
 }
 
@@ -593,6 +637,40 @@ fn a_proven_release_says_nothing_extra() {
     // The common case by far — no cover, or one this sweep watched go away. A
     // warning here would train operators to ignore the one that matters.
     assert_eq!(release_clearance_report(&Clearance::proven()), None);
+}
+
+#[skuld::test]
+fn an_unproven_release_on_a_host_that_holds_no_cover_says_nothing_either() {
+    // The case that made this message worthless. A Windows sweep leaves the
+    // two boot-time twins unproven on EVERY boot where no bridge engaged —
+    // which is what an ordinary uninstall is — so gating on `is_proven` alone
+    // fired this warning on essentially every Windows uninstall, naming two
+    // filter keys that were never installed. The doc above says why that is
+    // the hazard: crying leftover every time is how the one host where it is
+    // real gets ignored.
+    //
+    // The sibling is what separates them. It is `PERSISTENT`, so BFE re-adds
+    // it at every boot from its own store; answering not-found means no
+    // standing cover is installed here, and a twin is only ever added in the
+    // same transaction as one.
+    let clearance = clearance_with_sibling(
+        KeyOutcome::NotFound,
+        &["lockdown boot-time block-all V4", "lockdown boot-time block-all V6"],
+    );
+    assert!(
+        !clearance.is_proven(),
+        "the sweep still proved nothing about the twins — only the REPORT is suppressed"
+    );
+    assert_eq!(release_clearance_report(&clearance), None);
+}
+
+#[skuld::test]
+fn an_unreadable_sibling_still_reports() {
+    // `Failed` is the unelevated or DACL-denied sweep: it rules nothing out,
+    // so it must not buy the silence an empty answer does.
+    let clearance = clearance_with_sibling(KeyOutcome::Failed, &["lockdown boot-time block-all V4"]);
+    let report = release_clearance_report(&clearance).expect("a sibling that could not be read rules nothing out");
+    assert!(report.contains("lockdown boot-time block-all V4"), "{report}");
 }
 
 #[skuld::test]

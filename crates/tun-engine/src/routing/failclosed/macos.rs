@@ -553,12 +553,18 @@ pub fn engage_lockdown(
 /// Caveat: pf exposes no dump of prior `set` options, so the restore reloads the
 /// host's filter+nat rules under pf defaults (same class of limitation the
 /// transient cover documents for its `/etc/pf.conf` reload).
-pub fn disengage_lockdown(state_dir: &Path) -> Result<(), RoutingError> {
+/// The clearance is unconditionally [`Clearance::proven`], for the reason
+/// [`release_all`] gives: pf has no boot-time analogue — a ruleset does not
+/// survive a reboot at all — so every macOS cover key is
+/// [`super::KeyLifetime::Persistent`] and a disengage has nothing to leave
+/// unproven.
+pub fn disengage_lockdown(state_dir: &Path) -> Result<Clearance, RoutingError> {
     disengage_lockdown_with(
         lockdown_cover_presence(state_dir),
         lockdown_state::load(state_dir),
         &mut RealPfOps { state_dir },
-    )
+    )?;
+    Ok(Clearance::proven())
 }
 
 /// `disengage_lockdown`'s sequencing, with presence and the [`PfOps`] seam
@@ -644,8 +650,11 @@ pub fn lockdown_cover_presence(state_dir: &Path) -> crate::routing::CoverPresenc
 /// Best-effort wrapper for `Drop` (user-stop): disengage and swallow. Drop has
 /// no caller to surface an error to.
 fn lockdown_disengage(state_dir: &Path) {
-    if let Err(e) = disengage_lockdown(state_dir) {
-        tracing::warn!(error = %e, "lockdown disengage failed during Drop");
+    match disengage_lockdown(state_dir) {
+        // Always `Clearance::proven` on macOS, and `Drop` has no reader for
+        // it either way.
+        Ok(_clearance_is_unconditional_here) => {}
+        Err(e) => tracing::warn!(error = %e, "lockdown disengage failed during Drop"),
     }
 }
 

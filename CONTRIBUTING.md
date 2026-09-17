@@ -1289,6 +1289,63 @@ it proceeds without claiming a proof nobody made, and
 exists to name them. #1008's provider-enumeration sweep does not close the
 underlying question either — that also reads live objects.
 
+**What counts as evidence about a boot-time key**, stated once because three
+paths depend on it and they must not disagree. Such a key has two things behind
+it: the runtime FWPM object, live only between kernel start and BFE start (or
+inside the session that just added it), and the boot-time *policy record*,
+which is what serves the next boot and which nothing this crate can call reads.
+Evidence therefore comes from two places, and never from a return code:
+
+- **Armed** — only a read of the boot-time enumeration view while the object is
+  live. A commit code says the transaction reached the object store and nothing
+  about the record behind it, so `engage_lockdown` reads the twins back through
+  `verify_boottime_twins` after `FwpmTransactionCommit0` and refuses the engage
+  when a view that *was* readable does not hold the twin, or holds one that is
+  not boot-time or is disabled. Without that read the shipped success claim was
+  wider than anything the code checked: the add returned zero, the caller marked
+  the cover adopted, and the GUI reported the switch armed, with no step in
+  between having looked at a twin. It reads the *view* rather than the key,
+  because `FwpmFilterGetByKey0` would answer for any object under that key
+  whatever its lifetime, and being classified boot-time is the only property a
+  twin exists for.
+- **Gone** — only `KeyOutcome::Removed`, a removal somebody watched happen
+  (`KeyObservation::proves_empty`).
+- **Possible on this host at all** — the twins' `PERSISTENT` sibling, the other
+  half of the same rule (`KeyRole::BootTimeSibling`). BFE re-adds it from its
+  own store at every boot and a twin is never installed without it, so a sibling
+  removed at this boot says a standing cover is installed *here*, and every
+  sibling answering empty says none is.
+
+The rule is symmetric on purpose: absence of evidence is never evidence of
+absence, in either direction. An enumeration that could not be *read* does not
+fail an engage, for the same reason a not-found delete does not prove a key
+empty — and a spurious refusal there would block a kill-switch-armed user from
+connecting at all.
+
+Two consequences follow on the paths that used to disagree with the engage.
+
+`disengage_lockdown` returns a `Clearance` too, not a bare `Ok`. It is the one
+disengage where the qualification cannot be deferred: `hole bridge unlock`
+writes the kill-switch intent **off** in the statement after it, so there is no
+next engage to re-arm or re-delete a boot-time key — the pre-delete runs only
+from `engage_lockdown`, which an off intent prevents. The older doc defended
+dropping the verdict with "the next engage re-arms the key", which is false on
+exactly the path that needed it. `hole bridge unlock` now prints the same
+`release_clearance_report` the uninstall does. It still does not *fail* the
+disengage: refusing the escape from a hard-blocked host over a bounded
+boot-window block is the trade `Clearance` exists to refuse.
+
+`release_clearance_report` reads `Clearance::leftover_keys`, not
+`unproven_keys`. The twins go unproven on *every* boot where no bridge engaged,
+which is what an ordinary uninstall looks like, so the unproven set alone fired
+that warning on essentially every Windows uninstall — naming two filter keys
+that were never installed, and training operators to ignore the one host where
+a leftover is real, which is the hazard the function's own doc names.
+`leftover_keys` is the same set filtered by the sibling evidence above: a host
+holding no standing cover never had a twin to strand. `is_proven` is unchanged
+and still false there — what a sweep *proved* and what is worth *reporting* are
+two questions, and only the second is filtered.
+
 **Its limit, which must travel with the result.** The probe's enumeration
 template names *no provider* — deliberately, since filtering by ours would make
 "the record dropped its provider" and "there is no record" the same empty

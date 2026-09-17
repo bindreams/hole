@@ -301,15 +301,15 @@ allow-invalid = true
 
 [[disallowed-methods]]
 path = "windows::Win32::NetworkManagement::WindowsFilteringPlatform::FwpmFilterCreateEnumHandle0"
-reason = "The boot-time filter view (`FWP_FILTER_ENUM_FLAG_BOOTTIME_ONLY`) must be read through `routing::failclosed`'s `enum_boottime`. Only `failclosed/windows.rs` and `dns_confine/windows.rs` may call FWPM. See bindreams/hole#468, #846, #1008."
+reason = "The boot-time filter view (`FWP_FILTER_ENUM_FLAG_BOOTTIME_ONLY`) must be read through `routing::failclosed`'s `enum_boottime_on` — the one reader both the shipped engage read-back and the privileged probe go through. Only `failclosed/windows.rs` and `dns_confine/windows.rs` may call FWPM. See bindreams/hole#468, #846, #1008."
 allow-invalid = true
 
 [[disallowed-methods]]
 path = "windows::Win32::NetworkManagement::WindowsFilteringPlatform::FwpmFilterEnum0"
-reason = "The boot-time filter view (`FWP_FILTER_ENUM_FLAG_BOOTTIME_ONLY`) must be read through `routing::failclosed`'s `enum_boottime`. Only `failclosed/windows.rs` and `dns_confine/windows.rs` may call FWPM. See bindreams/hole#468, #846, #1008."
+reason = "The boot-time filter view (`FWP_FILTER_ENUM_FLAG_BOOTTIME_ONLY`) must be read through `routing::failclosed`'s `enum_boottime_on` — the one reader both the shipped engage read-back and the privileged probe go through. Only `failclosed/windows.rs` and `dns_confine/windows.rs` may call FWPM. See bindreams/hole#468, #846, #1008."
 allow-invalid = true
 
 [[disallowed-methods]]
 path = "windows::Win32::NetworkManagement::WindowsFilteringPlatform::FwpmFilterDestroyEnumHandle0"
-reason = "The boot-time filter view (`FWP_FILTER_ENUM_FLAG_BOOTTIME_ONLY`) must be read through `routing::failclosed`'s `enum_boottime`. Only `failclosed/windows.rs` and `dns_confine/windows.rs` may call FWPM. See bindreams/hole#468, #846, #1008."
+reason = "The boot-time filter view (`FWP_FILTER_ENUM_FLAG_BOOTTIME_ONLY`) must be read through `routing::failclosed`'s `enum_boottime_on` — the one reader both the shipped engage read-back and the privileged probe go through. Only `failclosed/windows.rs` and `dns_confine/windows.rs` may call FWPM. See bindreams/hole#468, #846, #1008."
 allow-invalid = true

@@ -23,8 +23,7 @@
 //! stay true, so the equality holds no matter what a later change does — and
 //! a guard that can no longer fail in the direction that matters is worse than
 //! no guard, because it still reads like evidence. The equality is gone rather
-//! than left standing. This file's own doc predicted that and said to make the
-//! call here.
+//! than left standing.
 //!
 //! ## What it guards now
 //!

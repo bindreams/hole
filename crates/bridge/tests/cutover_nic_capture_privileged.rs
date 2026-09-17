@@ -228,7 +228,7 @@ fn cutover_global_net_state_nic_capture_no_udp_leak() {
         // severed. The capture verdicts are already in hand.
         drop(cover);
         lockdown_state::set_enabled(dir.path(), false, None).ok();
-        disengage_lockdown(dir.path()).ok();
+        let _clearance_has_no_reader_in_cleanup = disengage_lockdown(dir.path());
 
         // Rendezvous: the permitted tail egressed (server permit beats block-all),
         // proving the capture window covered the leak marker's decision too.

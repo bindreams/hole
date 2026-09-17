@@ -224,8 +224,13 @@ pub fn recover_lockdown(decision: crate::routing::CoverRecovery, state_dir: &Pat
         }
         RecoveryDispatch::Disengage => {
             tracing::info!("lockdown recovery: sweeping leftover cover (intent off)");
-            if let Err(e) = disengage_lockdown(state_dir) {
-                tracing::warn!(error = %e, "lockdown sweep could not disengage the cover");
+            // Named discard: startup recovery has no operator to report a
+            // qualification to, and unlike `bridge unlock` it does not write
+            // the intent — whatever it leaves unproven, the next start sweeps
+            // again.
+            match disengage_lockdown(state_dir) {
+                Ok(_clearance_has_no_reader_at_startup) => {}
+                Err(e) => tracing::warn!(error = %e, "lockdown sweep could not disengage the cover"),
             }
         }
     }
@@ -268,7 +273,15 @@ pub fn reclaim_stale_tun_permit(tun_name: &str) {
 /// flip the intent off) while the cover is still engaged. An absent cover is
 /// `Ok` (nothing to disengage); a real failure (not elevated / engine open /
 /// pfctl) is `Err`.
-pub fn disengage_lockdown(state_dir: &Path) -> Result<(), RoutingError> {
+///
+/// `Ok` carries a [`Clearance`] for the same reason [`release_all`]'s does,
+/// and this is the path where it matters most. `bridge unlock` writes the
+/// kill-switch intent OFF right after this returns, so — unlike every other
+/// disengage — there is no next engage to re-arm or re-delete a boot-time key,
+/// and this is the last moment anything will look at one. macOS answers
+/// [`Clearance::proven`]: pf has no boot-time analogue, a ruleset does not
+/// survive a reboot at all, so a macOS disengage has nothing to leave unproven.
+pub fn disengage_lockdown(state_dir: &Path) -> Result<Clearance, RoutingError> {
     platform::disengage_lockdown(state_dir)
 }
 
@@ -417,6 +430,39 @@ pub enum KeyOutcome {
     Failed,
 }
 
+/// What a key's outcome is allowed to say about OTHER keys in the same sweep.
+///
+/// [`KeyOutcome`] answers "what happened to THIS key". That is the whole
+/// answer for a [`KeyLifetime::Persistent`] key and only half of it for a
+/// [`KeyLifetime::BootTime`] one, because a boot-time key cannot report on
+/// itself: on the boot where a sweep actually runs its runtime object is not
+/// live, so it answers [`KeyOutcome::NotFound`] on a host that armed the kill
+/// switch years ago and on a host that never armed it at all. Some OTHER key
+/// has to separate those, and exactly one can.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyRole {
+    /// Speaks only for itself. Every key whose own outcome is the whole
+    /// answer about it.
+    Plain,
+    /// The `FWPM_FILTER_FLAG_PERSISTENT` half of the rule a
+    /// [`KeyLifetime::BootTime`] twin copies — installed in the SAME
+    /// transaction as that twin and never without it.
+    ///
+    /// This is the one key in a sweep whose outcome is evidence about the
+    /// twin, and it is evidence because of the lifetime it does NOT share:
+    /// BFE re-adds a persistent filter from its own store at every boot, so
+    /// removing a live object under this key says a standing cover is
+    /// installed HERE — on this boot, whichever boot armed it. Every sibling
+    /// answering empty says the opposite, that no standing cover is installed
+    /// and so no twin was added alongside one.
+    ///
+    /// The evidence is about the host, not about the twin's own record: it
+    /// says whether a boot-time record is POSSIBLE here, never whether one
+    /// exists. Nothing an FWPM sweep can call says the latter — see
+    /// [`KeyLifetime::BootTime`].
+    BootTimeSibling,
+}
+
 /// One key's contribution to a release verdict.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct KeyObservation {
@@ -425,6 +471,9 @@ pub struct KeyObservation {
     pub key: &'static str,
     pub lifetime: KeyLifetime,
     pub outcome: KeyOutcome,
+    /// What this key's outcome says about the OTHER keys in the sweep — see
+    /// [`KeyRole`].
+    pub role: KeyRole,
 }
 
 impl KeyObservation {
@@ -469,10 +518,70 @@ impl KeyObservation {
 /// block would trade it for a permanently unremovable product, which is
 /// strictly worse. The gate's job is to stop claiming proof it does not have,
 /// not to withhold an uninstall.
+///
+/// It carries a SECOND, independent answer, and the two must not be confused.
+/// [`Self::is_proven`] is what the sweep proved and never moves; it is false
+/// on essentially every Windows sweep, because the twins answer empty whenever
+/// no bridge engaged in this boot. [`Self::leftover_keys`] is what is worth
+/// telling an operator, which is narrower: an unproven key on a host where no
+/// standing cover is installed at all could never have had a record behind it,
+/// and reporting one every time is how the host where it is real gets ignored
+/// (see `cutover::release_clearance_report`). The discriminator is
+/// [`KeyRole::BootTimeSibling`], collected in the same sweep.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[must_use = "the uninstall gate reads this; dropping it restores the silent `Ok` of #1003"]
 pub struct Clearance {
     unproven: Vec<&'static str>,
+    sibling: SiblingEvidence,
+}
+
+/// What a sweep's [`KeyRole::BootTimeSibling`] keys said about whether a
+/// boot-time record could exist on this host at all.
+///
+/// Three causes, kept apart even though two of them share the consequence
+/// "report it": a host that demonstrably holds a standing cover and a host
+/// whose sibling deletes could not be read are not the same finding, and
+/// merging them at the point of observation would leave nothing able to tell
+/// them apart later. They are folded once, in [`Clearance::leftover_keys`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SiblingEvidence {
+    /// A sibling's delete removed a live object: a standing cover is
+    /// installed on this host, so a twin was added alongside it.
+    Installed,
+    /// Every sibling answered [`KeyOutcome::NotFound`]: no standing cover is
+    /// installed here. The only [`SiblingEvidence`] that suppresses a report.
+    Absent,
+    /// The sweep could not rule a cover out — a sibling's delete neither
+    /// removed an object nor found the key empty, or the sweep carried no
+    /// sibling key at all. Absence of evidence, which this whole type exists
+    /// to stop reading as evidence of absence.
+    Unknown,
+}
+
+/// Fold the sibling keys' outcomes into the one question a boot-time key
+/// cannot answer about itself. Pure and total over the slice.
+///
+/// A sweep with NO sibling observation is [`SiblingEvidence::Unknown`], never
+/// `Absent`: an empty set trivially satisfies "every sibling answered empty",
+/// so the natural reading of the fold is also the one that would silently
+/// suppress every report the moment a boot-time key outlived its sibling in
+/// some future sweep list.
+fn sibling_evidence(observations: &[KeyObservation]) -> SiblingEvidence {
+    let outcomes: Vec<KeyOutcome> = observations
+        .iter()
+        .filter(|o| o.role == KeyRole::BootTimeSibling)
+        .map(|o| o.outcome)
+        .collect();
+    if outcomes.is_empty() {
+        return SiblingEvidence::Unknown;
+    }
+    if outcomes.contains(&KeyOutcome::Removed) {
+        return SiblingEvidence::Installed;
+    }
+    if outcomes.iter().all(|&o| o == KeyOutcome::NotFound) {
+        return SiblingEvidence::Absent;
+    }
+    SiblingEvidence::Unknown
 }
 
 impl Clearance {
@@ -485,7 +594,13 @@ impl Clearance {
     /// that did not watch them go is unproven and must build its verdict with
     /// [`Self::from_observations`] rather than reach for this.
     pub fn proven() -> Self {
-        Self { unproven: Vec::new() }
+        Self {
+            unproven: Vec::new(),
+            // No key went unproven, so no report can be built from this
+            // whatever the sibling evidence would have been; `Absent` states
+            // the platform's own reason rather than leaving a placeholder.
+            sibling: SiblingEvidence::Absent,
+        }
     }
 
     /// Fold per-key observations into a verdict. Pure and total over the
@@ -503,6 +618,7 @@ impl Clearance {
                 .filter(|o| !o.proves_empty())
                 .map(|o| o.key)
                 .collect(),
+            sibling: sibling_evidence(observations),
         }
     }
 
@@ -517,6 +633,31 @@ impl Clearance {
     /// much of the sweep was unproven.
     pub fn unproven_keys(&self) -> &[&'static str] {
         &self.unproven
+    }
+
+    /// The unproven keys that could actually have a record behind them ON
+    /// THIS HOST — what an operator is told about, as distinct from what the
+    /// sweep proved.
+    ///
+    /// Empty is NOT "the sweep proved everything": [`Self::is_proven`] is
+    /// still the proof record and still false. Empty here means the sweep
+    /// found no standing cover installed at all
+    /// ([`SiblingEvidence::Absent`]), and a twin is only ever added in the
+    /// same transaction as that cover — so on such a host every unproven key
+    /// is unproven for the ordinary reason that it was never installed. That
+    /// is what almost every uninstall looks like, and reporting it every time
+    /// is how the one host where a leftover is real gets ignored.
+    ///
+    /// Both other [`SiblingEvidence`] answers report. `Installed` is the
+    /// dangerous case this exists to keep visible — a kill switch armed in an
+    /// earlier boot, BFE re-adding the persistent half at this one, the twins
+    /// answering empty because no twin is ever live once BFE has started.
+    /// `Unknown` reports for the opposite reason, that nothing was ruled out.
+    pub fn leftover_keys(&self) -> &[&'static str] {
+        match self.sibling {
+            SiblingEvidence::Absent => &[],
+            SiblingEvidence::Installed | SiblingEvidence::Unknown => &self.unproven,
+        }
     }
 }
 

@@ -167,7 +167,14 @@ before editing; the sections linked below are the authoritative source.
   stores them under our containers; a by-key delete removes a LIVE one; every
   engage re-arms) versus unverified (anything spanning a reboot, including the
   later-boot delete that #1009's uninstall gate depends on) is in
-  CONTRIBUTING.md. The
+  CONTRIBUTING.md. **Evidence about a boot-time key never comes from a return
+  code:** an engage proves a twin armed by reading it back out of the
+  `BOOTTIME_ONLY` view (`verify_boottime_twins`) instead of trusting the
+  commit, only a watched removal proves one gone, and whether a stranded record
+  is possible at all is read off the twins' `Persistent` sibling
+  (`KeyRole::BootTimeSibling`) — which is why `disengage_lockdown` returns a
+  `Clearance` like `release_all`, and why `release_clearance_report` fires on
+  `leftover_keys` rather than on every unproven key. The
   transient one is swept unconditionally on next start, the standing one only
   on an explicit recorded off — full reconciliation table (`decide_cover_recovery`)
   and disclosed residuals in CONTRIBUTING.md. A single persisted `Target`

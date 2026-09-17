@@ -144,7 +144,8 @@ fn cutover_global_net_state_disarm_preserves_the_standing_egress_block() {
     // Cleanup: fully disengage via the persisted state (no live guard remains
     // after disarm), restoring egress so the box is left open.
     lockdown_state::set_enabled(dir.path(), false, None).unwrap();
-    disengage_lockdown(dir.path()).expect("disengage the persisted cover to restore egress");
+    let _clearance_has_no_reader_in_cleanup =
+        disengage_lockdown(dir.path()).expect("disengage the persisted cover to restore egress");
     assert!(
         connect(NON_PERMITTED).is_ok(),
         "cleanup disengage must restore egress: {NON_PERMITTED}"
