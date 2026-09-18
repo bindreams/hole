@@ -778,47 +778,47 @@ fn an_unproven_release_does_not_claim_a_cover_is_present() {
 }
 
 #[skuld::test]
-fn an_unproven_release_does_not_call_every_key_it_names_a_boot_time_one() {
-    // `Clearance::leftover_keys` is the unproven set GATED on whether a
-    // boot-time record could be outstanding here — not a boot-time-only subset
-    // of it. A sweep that failed over one App-ID permit carries that
-    // `Persistent` key into the same list (tun-engine's
-    // `a_disengage_that_failed_still_carries_the_sibling_it_already_removed`),
-    // and naming it under a "boot-time filter key(s)" heading sends the
-    // operator to `show boottimepolicy` hunting a record that class of key
-    // never had.
-    let mut obs = vec![KeyObservation {
-        key: "lockdown filter",
-        lifetime: KeyLifetime::Persistent,
-        outcome: KeyOutcome::Removed,
-        role: KeyRole::BootTimeSibling,
-    }];
-    obs.push(KeyObservation {
-        key: "lockdown boot-time block-all V4",
-        lifetime: KeyLifetime::BootTime,
-        outcome: KeyOutcome::NotFound,
-        role: KeyRole::Plain,
-    });
-    obs.push(KeyObservation {
-        key: "lockdown app-id filter",
-        lifetime: KeyLifetime::Persistent,
-        outcome: KeyOutcome::Failed,
-        role: KeyRole::Plain,
-    });
-    let report = release_clearance_report(&Clearance::from_observations(&obs, ArmingWitness::Unset)).expect("reported");
+fn an_unproven_release_calls_its_keys_boot_time_ones_because_that_is_all_it_can_name() {
+    // The message is read after `RemoveFiles` has deleted the binary, so the
+    // one thing it must not do is hedge about what the operator is holding.
+    // Every key it can EVER name is a boot-time twin, and this pins both
+    // halves of that: the wording, and the premise underneath it.
+    let report = release_clearance_report(&unproven_clearance(&["lockdown boot-time block-all V4"]))
+        .expect("an unproven clearance must be reported");
+    assert!(
+        report.contains("boot-time filter key"),
+        "the keys are boot-time twins and the message must say so, not hedge: {report}"
+    );
+    for hedge in ["Usually", "can also be"] {
+        assert!(
+            !report.contains(hedge),
+            "a hedge here describes a state this message is never printed in ({hedge}): {report}"
+        );
+    }
 
-    assert!(
-        report.contains("lockdown app-id filter"),
-        "the permit the sweep could not delete must reach the operator too: {report}"
-    );
-    assert!(
-        !report.contains("boot-time filter key"),
-        "the list is not all boot-time keys, so it must not be labelled as though it were: {report}"
-    );
-    assert!(
-        report.contains("netsh wfp show boottimepolicy"),
-        "the boot-time diagnostic still has to be there for the twins in the same list: {report}"
-    );
+    // The premise, on the lane that always runs. A `Persistent` key goes
+    // unproven under exactly one outcome — `Failed` — and `Failed` is what
+    // `first_delete_failure` turns into a `SweepOutcome::failed`, so a
+    // clearance carrying one reaches its caller as `Err` and is dropped by the
+    // `?` in `unlock_with`/`release_covers_with` before any render site. The
+    // Windows half of that chain is
+    // `a_disengage_that_failed_still_carries_the_sibling_it_already_removed`,
+    // which asserts the same clearance's `into_result().is_err()`.
+    for outcome in [KeyOutcome::Removed, KeyOutcome::NotFound, KeyOutcome::Failed] {
+        let obs = KeyObservation {
+            key: "lockdown app-id filter",
+            lifetime: KeyLifetime::Persistent,
+            outcome,
+            role: KeyRole::Plain,
+        };
+        assert_eq!(
+            obs.proves_empty(),
+            outcome != KeyOutcome::Failed,
+            "a persistent key unproven under anything but a failed delete would put a key with no \
+             boot-time record into a message that calls every key it names a boot-time one \
+             ({outcome:?})"
+        );
+    }
 }
 
 #[skuld::test]

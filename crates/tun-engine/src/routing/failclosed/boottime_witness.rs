@@ -92,7 +92,11 @@
 //!   machine-wide. The uninstall gate reads its peers' records too
 //!   (`cutover::release_covers_with`); a bridge given an explicit `--state-dir`
 //!   outside that set is still invisible, the same residual `peer_state_dirs`
-//!   already discloses for the liveness probe.
+//!   already discloses for the liveness probe. The read is one-way: a sweep
+//!   writes its `Disarm` only to its OWN dir, so a peer's `Armed` — one a
+//!   user-profile bridge wrote — survives a SYSTEM sweep that watched those
+//!   very twins go, and keeps reporting. Over-report, the same direction as
+//!   `Cover::drop` above.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};

@@ -1081,11 +1081,16 @@ fn a_disengage_that_failed_still_carries_the_sibling_it_already_removed() {
     );
     // The two answers are about different sets and are deliberately not the
     // same list. ARMING is about the boot-time keys only: the twins answered
-    // empty, so a record is possible and the sibling says so. NAMING spans
-    // every key the sweep could not prove empty, whatever its lifetime — and
-    // the App-ID permit that answered `ERROR_ACCESS_DENIED` is exactly such a
-    // key. Dropping it would hand an operator a report that omits the one
-    // filter this call is failing over.
+    // empty, so a record is possible and the sibling says so. The KEY SET is
+    // what the sweep could not settle, whatever its lifetime — and the App-ID
+    // permit that answered `ERROR_ACCESS_DENIED` is exactly such a key.
+    //
+    // No operator reads THIS set. The same `ERROR_ACCESS_DENIED` makes
+    // `into_result` an `Err` (asserted below), and both callers of a release
+    // drop the clearance on `Err` — so `cutover::release_clearance_report`
+    // never renders a clearance carrying a `Persistent` key, which is why that
+    // message may call every key it names a boot-time one. What travels to the
+    // caller here is the failure itself, which names the same filter.
     assert_eq!(
         outcome.clearance().leftover_keys(),
         [
@@ -1093,13 +1098,13 @@ fn a_disengage_that_failed_still_carries_the_sibling_it_already_removed() {
             "lockdown boot-time block-all V6",
             "lockdown app-id filter",
         ],
-        "the report names the twins the sweep could not prove AND the permit it could not delete"
+        "the set carries the twins the sweep could not prove AND the permit it could not delete"
     );
     assert_eq!(
         outcome.clearance().leftover_keys(),
         outcome.clearance().unproven_keys(),
-        "on a host where a record is possible the operator is told everything the sweep left \
-         unsettled, not a boot-time subset of it"
+        "on a host where a record is possible the gate keeps everything the sweep left unsettled, \
+         not a boot-time subset of it"
     );
     assert!(
         outcome.into_result().is_err(),

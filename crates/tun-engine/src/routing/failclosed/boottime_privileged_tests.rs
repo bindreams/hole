@@ -2,9 +2,9 @@
 //! filter (#998), on the real firewall, with no reboot.
 //!
 //! `FWPM_FILTER_FLAG_BOOTTIME` is the one part of the standing lockdown cover
-//! whose lifecycle Microsoft's documentation does not settle. Five questions
+//! whose lifecycle Microsoft's documentation does not settle. Six questions
 //! decide whether a boot-time twin of the block-all floor is safe to ship, and
-//! all five are answerable here — the elevated Windows lane already drives
+//! all six are answerable here — the elevated Windows lane already drives
 //! real `FwpmFilterAdd0`/`FwpmFilterDeleteByKey0` (see
 //! `lockdown_privileged_tests.rs`, `release_privileged_tests.rs`):
 //!
@@ -53,6 +53,11 @@
 //!    `boottime_global_net_state_every_engage_rearms_the_twins_instead_of_reporting_already_exists`.
 //!    That test engages the REAL kill switch, so unlike the probe below it does
 //!    install a live block; see its own doc.
+//! 6. **Is a live boot-time filter out of the DEFAULT filter view?** The
+//!    softness of the twins is defended by the two halves never being
+//!    arbitrated against each other, which until now rested on WFP's own prose.
+//!    The same enumeration minus `FWP_FILTER_ENUM_FLAG_BOOTTIME_ONLY` answers
+//!    it directly, with that one flag the only difference between the reads.
 //!
 //! **The probe filter is a PERMIT on 203.0.113.1 (RFC 5737 TEST-NET-3), never
 //! a block.** That is the structural safety property, not a cleanup guard:
@@ -249,7 +254,7 @@ impl std::fmt::Display for PolicyDump {
 /// Measures the whole boot-time filter lifecycle in one pass and asserts on
 /// the complete picture: every observation is gathered BEFORE any assertion,
 /// so a failure reports what WFP did at each step rather than stopping at the
-/// first surprise. Answers questions 1-3 in the module doc.
+/// first surprise. Answers questions 1-4 and 6 in the module doc.
 #[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
 fn boottime_global_net_state_filter_is_accepted_keeps_its_containers_and_is_deletable_by_key() {
     let spec = probe_spec();
@@ -276,6 +281,22 @@ fn boottime_global_net_state_filter_is_accepted_keeps_its_containers_and_is_dele
         ]
     };
 
+    // The same two reads minus `FWP_FILTER_ENUM_FLAG_BOOTTIME_ONLY`, taken
+    // while the probe is live: one flag is the only difference, so what it
+    // returns is that flag's effect and nothing else.
+    let both_default = |layer| {
+        [
+            (
+                "FULLY_CONTAINED",
+                boottime_probe::enum_default(layer, FWP_FILTER_ENUM_FULLY_CONTAINED),
+            ),
+            (
+                "OVERLAPPING",
+                boottime_probe::enum_default(layer, FWP_FILTER_ENUM_OVERLAPPING),
+            ),
+        ]
+    };
+
     // Pre-state: nothing of ours may already be there, or every observation
     // below is about someone else's filter.
     let before = both(Layer::ConnectV4);
@@ -283,22 +304,42 @@ fn boottime_global_net_state_filter_is_accepted_keeps_its_containers_and_is_dele
 
     let added = boottime_probe::add(&spec);
     let after_add = both(Layer::ConnectV4);
+    let default_after_add = both_default(Layer::ConnectV4);
     let get_after_add = boottime_probe::get_by_key(PROBE_GUID);
     let policy_after_add = PolicyDump::capture();
     let deleted = boottime_probe::delete_by_key(PROBE_GUID);
     let after_delete = both(Layer::ConnectV4);
     let policy_after_delete = PolicyDump::capture();
 
+    // Summarised, never dumped: the default view at this layer holds every
+    // filter on the host, and `{:#?}` of it would bury the rest of the
+    // evidence. What matters is how many each view could read and whether the
+    // probe was among them.
+    let default_summary: Vec<String> = default_after_add
+        .iter()
+        .map(|(name, view)| match view {
+            Ok(Ok(records)) => format!(
+                "{name}: {} filters, probe present: {}",
+                records.len(),
+                records.iter().any(|f| f.key == PROBE_GUID)
+            ),
+            Ok(Err(code)) => format!("{name}: enumeration failed 0x{code:08x}"),
+            Err(code) => format!("{name}: FwpmEngineOpen0 failed 0x{code:08x}"),
+        })
+        .collect();
+
     let evidence = format!(
         "probe={PROBE_GUID:?} provider={PROVIDER_GUID:?} sublayer={SUBLAYER_GUID:?}\n\
          boottime enum BEFORE add:  {before:#?}\n\
          add:                       {added:#?}\n\
          boottime enum AFTER add:   {after_add:#?}\n\
+         default enum AFTER add:    {}\n\
          get_by_key AFTER add:      {get_after_add:#?}\n\
          delete_by_key:             {deleted:#?}\n\
          boottime enum AFTER delete:{after_delete:#?}\n\
          `netsh wfp show boottimepolicy` AFTER add:\n{policy_after_add}\n\
-         `netsh wfp show boottimepolicy` AFTER delete:\n{policy_after_delete}"
+         `netsh wfp show boottimepolicy` AFTER delete:\n{policy_after_delete}",
+        default_summary.join(" | ")
     );
 
     // The union across both enumeration types, plus the one hard requirement
@@ -368,6 +409,39 @@ fn boottime_global_net_state_filter_is_accepted_keeps_its_containers_and_is_dele
         "a boot-time twin must be stored with CLEAR_ACTION_RIGHT, or its block is hard and \
          nothing in the pre-BFE window can override it\n{evidence}"
     );
+    // The twins' softness is sound only because the two halves are never in
+    // the same arbitration set — the module doc's "The twins do not enter that
+    // argument", which until now was a quoted sentence from WFP's own pages.
+    // Here it is measured: the filter WFP just returned from the BOOTTIME_ONLY
+    // view is absent from the DEFAULT one, taken seconds later on the same
+    // host, with `FWP_FILTER_ENUM_FLAG_BOOTTIME_ONLY` the only difference
+    // between the two reads. A boot-time filter visible in the default view
+    // would put a SOFT block-all beside the persistent set's hard one, and the
+    // weight-ordering argument that set rests on no longer follows.
+    let mut default_readable = 0usize;
+    for (name, view) in &default_after_add {
+        let records = match view {
+            Ok(Ok(records)) => records,
+            Ok(Err(code)) => panic!("the default enumeration ({name}) failed: 0x{code:08x}\n{evidence}"),
+            Err(code) => panic!("FwpmEngineOpen0 must succeed on the elevated lane ({name}): 0x{code:08x}"),
+        };
+        default_readable += records.len();
+        assert!(
+            !records.iter().any(|f| f.key == PROBE_GUID),
+            "a live boot-time filter is visible in the DEFAULT filter view ({name}), so the two \
+             halves of a twin pair share one arbitration set and softening the boot-time half \
+             reaches the persistent one\n{evidence}"
+        );
+    }
+    // Non-vacuity: a view that returned nothing would make the absence above
+    // free. Both enum types are summed because what an empty template means to
+    // each is the documented unknown this test already reads both for.
+    assert!(
+        default_readable > 0,
+        "neither default enumeration returned a single filter at ALE_AUTH_CONNECT_V4, so the \
+         absence asserted above measures nothing\n{evidence}"
+    );
+
     // Necessary for #1008, not sufficient: the template names no provider, so
     // this says the record CARRIES our providerKey, not that a provider-filtered
     // BOOTTIME_ONLY enumeration returns it. See the module doc's question 2.

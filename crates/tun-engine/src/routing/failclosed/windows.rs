@@ -96,6 +96,20 @@
 //! it, and the residual is the same class it was — an armed host whose boot needs
 //! egress.
 //!
+//! **The override runs BOTH ways, and that is what the choice costs.** The flag
+//! does not know which connect it is relieving. The same higher-weight permit
+//! in another sublayer that lets a host finish booting lets an ordinary
+//! outbound flow leave too — unencrypted, outside the tunnel, on an armed host,
+//! in the exact window #998 exists to cover. The hard block vetoed that flow;
+//! the soft one does not, and these twins carry no permit of ours for it to
+//! outrank. Nor is the candidate hypothetical in kind: Windows provisions a
+//! boot-time policy of its own, and what a boot-time policy holds is permits.
+//! One unknown decides both directions at once — the cross-sublayer question
+//! above — so the two hazards cannot be traded apart: whatever narrows the
+//! brick narrows the block by the same amount. The owner took an unbootable
+//! host as the worse outcome. A leak in that window is the price, and an
+//! operator arming the kill switch is entitled to know it is part of the deal.
+//!
 //! Both twins reference the same [`PROVIDER_GUID`]/[`SUBLAYER_GUID`] the
 //! persistent filters already use, which is a MEASURED choice rather than a
 //! documented one. **CONTRIBUTING.md's "Windows, boot-time coverage" is the
@@ -2458,10 +2472,33 @@ unsafe fn enum_boottime_on(
     layer: Layer,
     enum_type: FWP_FILTER_ENUM_TYPE,
 ) -> Result<Vec<FilterRecord>, u32> {
+    enum_filters_on(
+        engine,
+        layer,
+        enum_type,
+        FWP_FILTER_ENUM_FLAG_BOOTTIME_ONLY | FWP_FILTER_ENUM_FLAG_INCLUDE_DISABLED,
+    )
+}
+
+/// [`enum_boottime_on`] with the view flags left to the caller, so a test can
+/// read the SAME enumeration with and without
+/// `FWP_FILTER_ENUM_FLAG_BOOTTIME_ONLY` and have the flag be the only
+/// difference between the two reads.
+///
+/// # Safety
+///
+/// `engine` must be a live FWPM engine handle with no open transaction.
+#[allow(clippy::disallowed_methods)] // sanctioned FWPM call site
+unsafe fn enum_filters_on(
+    engine: HANDLE,
+    layer: Layer,
+    enum_type: FWP_FILTER_ENUM_TYPE,
+    flags: u32,
+) -> Result<Vec<FilterRecord>, u32> {
     let template = FWPM_FILTER_ENUM_TEMPLATE0 {
         layerKey: layer_guid(layer),
         enumType: enum_type,
-        flags: FWP_FILTER_ENUM_FLAG_BOOTTIME_ONLY | FWP_FILTER_ENUM_FLAG_INCLUDE_DISABLED,
+        flags,
         actionMask: 0xffff_ffff,
         ..Default::default()
     };
@@ -2759,6 +2796,20 @@ pub(crate) mod boottime_probe {
     /// sees cannot differ.
     pub(crate) fn enum_boottime(layer: Layer, enum_type: FWP_FILTER_ENUM_TYPE) -> EnumResult {
         with_engine(|engine| unsafe { enum_boottime_on(engine, layer, enum_type) })
+    }
+
+    /// [`enum_boottime`] minus `FWP_FILTER_ENUM_FLAG_BOOTTIME_ONLY`: the
+    /// DEFAULT filter view, which is what every other reader of the firewall —
+    /// and the arbitration the persistent half's weight ordering describes —
+    /// sees.
+    ///
+    /// One flag is the only difference between the two reads, so a filter
+    /// present in one and absent from the other is measuring that flag and
+    /// nothing else.
+    pub(crate) fn enum_default(layer: Layer, enum_type: FWP_FILTER_ENUM_TYPE) -> EnumResult {
+        with_engine(|engine| unsafe {
+            enum_filters_on(engine, layer, enum_type, FWP_FILTER_ENUM_FLAG_INCLUDE_DISABLED)
+        })
     }
 }
 

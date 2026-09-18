@@ -156,7 +156,12 @@ before editing; the sections linked below are the authoritative source.
   has no permits at all — which is exactly why the block is **soft**
   (`CLEAR_ACTION_RIGHT`, on the boot-time arm of `FilterLifetime::filter_flags`
   and nowhere else): a hard one could not be overridden by the egress a host
-  may need to FINISH booting and so to reach the BFE start that lifts it. The
+  may need to FINISH booting and so to reach the BFE start that lifts it.
+  **Overridable cuts both ways** — the same higher-weight permit in another
+  sublayer that unblocks a boot lets an ordinary flow out of an armed host
+  unencrypted, the #998 leak in the window #998 covers; the owner took an
+  unbootable host as the worse outcome and the leak is the disclosed price,
+  not an oversight. The
   persistent half stays hard, and its weight-ordering argument is untouched —
   the two halves are never in force at once, and hardness never decides
   within-sublayer arbitration. The flag a twin is installed

@@ -1257,6 +1257,25 @@ whose boot needs egress; it does not close it. That WFP accepts and stores
 `BOOTTIME | CLEAR_ACTION_RIGHT` together rather than rejecting or dropping the
 flag is asserted on the real firewall by `boottime_privileged_tests`.
 
+**The override runs both ways — the disclosed price of that choice.** A flag
+cannot tell which connect it is relieving. The same higher-weight permit in
+another sublayer that lets a host finish booting lets an ordinary outbound flow
+leave it: on an armed host, between tcpip.sys start and BFE start, a flow the
+hard block vetoed now goes out unencrypted and outside the tunnel — the #998
+leak, in the window #998 exists to cover. The twins carry no permit of Hole's
+for it to outrank, and the candidate is not hypothetical in kind: Windows
+provisions a boot-time policy of its own, and what a boot-time policy holds is
+permits. The unknown above decides both directions at once, so the two hazards
+cannot be traded apart — whatever narrows the brick narrows the block by the
+same amount. The repo owner took an unbootable host as the worse outcome; a
+leak in that window is what it costs, and an operator arming the kill switch is
+entitled to see it stated here rather than infer it.
+
+The `PERSISTENT` half is untouched by this in both directions, and that is
+measurable rather than argued: a boot-time filter is absent from the default
+enumeration view while it is live, so the two halves are never in the same
+arbitration set (`boottime_global_net_state_filter_is_accepted_keeps_its_containers_and_is_deletable_by_key`).
+
 Two things that decide whether this is safe are undocumented by WFP, so they
 are **measured on the real firewall** by
 [`boottime_privileged_tests.rs`](crates/tun-engine/src/routing/failclosed/boottime_privileged_tests.rs)
@@ -1866,11 +1885,18 @@ uninstall and why the operator-facing report reads `leftover_keys` and not the
 proof record.
 
 `leftover_keys` is the unproven set *gated* on whether a twin could be
-outstanding here, not a boot-time-only subset of it: when it reports, it names
-every key the sweep could not settle, including a `Persistent` one whose delete
-was refused. That is deliberate — a sweep that fails over one App-ID permit
-hands back both the failure and the name of the filter it could not delete
+outstanding here, not a boot-time-only subset of it: it carries every key the
+sweep could not settle, including a `Persistent` one whose delete was refused,
+so a sweep that fails over one App-ID permit hands back both the failure and
+the name of the filter it could not delete
 (`a_disengage_that_failed_still_carries_the_sibling_it_already_removed`).
+
+That set is wider than anything an operator reads. A `Persistent` key goes
+unproven under exactly one outcome — a delete that `Failed` — and that same
+outcome makes the sweep `Err`, which every caller drops the clearance on. So
+`release_clearance_report` renders only clearances whose every key is a
+boot-time twin, and says so outright rather than hedging
+(`an_unproven_release_calls_its_keys_boot_time_ones_because_that_is_all_it_can_name`).
 
 **The mis-tag is now unrepresentable, not merely detectable.** `FilterLifetime`
 is a newtype over `KeyLifetime` with a private field: `filter_flags` — the
