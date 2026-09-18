@@ -70,7 +70,9 @@
 //! reboot-capable elevated lane to add the case to, so a pass says nothing
 //! about whether the kernel actually ENFORCES the filter during the boot→BFE
 //! window, whether the by-key delete purges the underlying boot-time record so
-//! the filter does not reappear at the NEXT boot, or whether the record is
+//! the filter does not reappear at the NEXT boot (ASSUMED by
+//! `KeyObservation::proves_empty`, tracked as bindreams/hole#1043 — this lane
+//! cannot grade it), or whether the record is
 //! re-provisioned at boots after that (Microsoft documents no answer to the
 //! last one either way — see the `windows.rs` module doc). Those need a real
 //! reboot, which no CI runner offers — the same disclosed limit
@@ -87,7 +89,8 @@
 
 use windows::Win32::Foundation::ERROR_SUCCESS;
 use windows::Win32::NetworkManagement::WindowsFilteringPlatform::{
-    FWPM_FILTER_FLAG_PERSISTENT, FWP_FILTER_ENUM_FULLY_CONTAINED, FWP_FILTER_ENUM_OVERLAPPING,
+    FWPM_FILTER_FLAG_CLEAR_ACTION_RIGHT, FWPM_FILTER_FLAG_PERSISTENT, FWP_FILTER_ENUM_FULLY_CONTAINED,
+    FWP_FILTER_ENUM_OVERLAPPING,
 };
 
 use super::platform::{
@@ -179,9 +182,11 @@ impl Drop for DeleteProbeOnDrop {
 /// policy and filters in effect when the computer first starts") does not
 /// disambiguate a snapshot of the boot that already happened from the set
 /// staged for the next one. The dump stays as an operator's cross-check, not
-/// as evidence this lane can grade. Until a reboot-capable elevated lane
-/// exists, `failclosed.rs` treats a boot-time key as unprovable in BOTH
-/// directions rather than picking a reading (bindreams/hole#1010's F2).
+/// as evidence this lane can grade. The repo owner has since taken the purge as
+/// an ASSUMPTION — `KeyObservation::proves_empty` is `true` for a boot-time
+/// key's `Removed` — and verifying it needs the reboot-capable elevated lane
+/// that does not exist here; that is bindreams/hole#1043, and nothing in this
+/// file grades it.
 ///
 /// Where the line is drawn and why: exit status is a property of the COMMAND,
 /// and `file=-` writing its XML to stdout with status 0 is measured on a real
@@ -350,6 +355,18 @@ fn boottime_global_net_state_filter_is_accepted_keeps_its_containers_and_is_dele
         0,
         "add_filter must not also set PERSISTENT on a Boottime spec — the two flags are mutually \
          exclusive on one filter\n{evidence}"
+    );
+    // The twins' block is deliberately SOFT (see `FilterLifetime::filter_flags`
+    // and the module doc's "Boot-time coverage"), and this is the only lane
+    // that can show WFP took the combination rather than rejecting or dropping
+    // it. A silent drop would leave the boot→BFE window carrying an
+    // unoverridable block-all on a host whose boot may need egress — the exact
+    // outcome the flag was added to avoid, with a green suite.
+    assert_ne!(
+        probe.flags & FWPM_FILTER_FLAG_CLEAR_ACTION_RIGHT.0,
+        0,
+        "a boot-time twin must be stored with CLEAR_ACTION_RIGHT, or its block is hard and \
+         nothing in the pre-BFE window can override it\n{evidence}"
     );
     // Necessary for #1008, not sufficient: the template names no provider, so
     // this says the record CARRIES our providerKey, not that a provider-filtered

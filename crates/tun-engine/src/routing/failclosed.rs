@@ -365,11 +365,12 @@ pub fn lockdown_cover_presence(state_dir: &Path) -> crate::routing::CoverPresenc
 ///    `Ok` payload — carries the qualification. `Ok` says every delete this
 ///    call issued either removed an object or came back empty;
 ///    [`Clearance::is_proven`] is the narrower claim that what a key answered
-///    *proved* it carries nothing. The two differ for exactly one key class,
-///    [`KeyLifetime::BootTime`], where NO answer proves that — not an empty
-///    one, and not a removal watched happen. The uninstall gate is the caller
-///    that must read the narrower one: it is about to delete the only binary
-///    that could act on the difference.
+///    *proved* it carries nothing. The two differ for exactly one
+///    key-and-answer pair: a [`KeyLifetime::BootTime`] key that came back
+///    [`KeyOutcome::NotFound`], where the delete issued and answered and the
+///    answer proves nothing. The uninstall gate is the caller that must read
+///    the narrower one: it is about to delete the only binary that could act on
+///    the difference.
 /// 5. **Bookkeeping is best-effort, except the state-file clear.** The macOS
 ///    `pfctl -X` refcount drop and the Windows sublayer/provider delete log a
 ///    warning on failure and do not fail the call. A cover's state-file clear
@@ -408,21 +409,30 @@ pub enum KeyLifetime {
     /// Windows `FWPM_FILTER_FLAG_BOOTTIME`: the runtime object exists only
     /// between kernel start and Base Filtering Engine start, so on any boot
     /// where it is not live the key answers "not found" **whether or not a
-    /// boot-time policy record is still provisioned behind it**. Whether such
-    /// a record survives a by-key delete — or is re-provisioned at later
-    /// boots at all — is unmeasured: it needs a reboot-capable elevated lane
-    /// that does not exist. See CONTRIBUTING.md's fail-closed residuals.
+    /// boot-time policy record is still provisioned behind it**. That is the
+    /// cell that makes this lifetime a separate variant, and no assumption
+    /// softens it: an empty answer is what the key gives on a host that armed
+    /// the kill switch years ago AND on one that never armed it at all.
     ///
-    /// **No outcome proves such a key empty**, not even a removal somebody
-    /// watched happen ([`KeyObservation::proves_empty`] is `false` for the
-    /// whole row). Every read this crate can take — `FwpmFilterDeleteByKey0`'s
-    /// code, a `BOOTTIME_ONLY` enumeration, `netsh wfp show boottimepolicy` —
-    /// goes through the Base Filtering Engine, and the record in question is
-    /// by definition what applies BEFORE BFE starts at the next boot. So a
-    /// delete's `ERROR_SUCCESS` says the runtime object is gone and stops
-    /// there. The asymmetry is deliberate and is the same one `engage_lockdown`
-    /// uses in the other direction: a twin read back out of the boot-time view
-    /// makes a record POSSIBLE (report it), and nothing makes one impossible.
+    /// **A watched removal is treated as proof** ([`KeyOutcome::Removed`] →
+    /// [`KeyObservation::proves_empty`]), on an ASSUMPTION rather than a
+    /// measurement: that `FwpmFilterDeleteByKey0` purges the boot-time policy
+    /// record along with the runtime object it demonstrably removes. Nothing
+    /// here can check it — every read this crate can take (the delete's code, a
+    /// `BOOTTIME_ONLY` enumeration, `netsh wfp show boottimepolicy`) goes
+    /// through the Base Filtering Engine, and the record in question is by
+    /// definition what applies BEFORE BFE starts at the next boot, so only a
+    /// reboot separates "purged" from "provisioned and invisible". The
+    /// assumption is the repo owner's, and verifying it on real hardware is
+    /// tracked as **bindreams/hole#1043**; if it is wrong, a host that watched
+    /// its twins go is silent over a stranded pre-BFE block-all.
+    ///
+    /// Read the assumption as "the record UNDER THAT KEY" — a filter key is
+    /// unique in FWPM, so a delete that removes the object standing under it
+    /// leaves no second record there for an earlier boot to have staged. That
+    /// is a reading of the assumption, not a separate measurement, and it is
+    /// what makes the delete on boot N+1 speak for boot N's provisioning too.
+    /// See CONTRIBUTING.md's fail-closed residuals.
     ///
     /// The harm is bounded: BFE's start is what takes a boot-time filter out
     /// of effect, so a stranded record blocks egress across the boot→BFE
@@ -449,10 +459,12 @@ pub enum KeyLifetime {
 /// strength of. See CLAUDE.md's "per-variant policy lives on the type".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeyOutcome {
-    /// The delete removed a live object (`ERROR_SUCCESS`). Proof that the
-    /// RUNTIME OBJECT is gone — for a boot-time key that is what #1010
-    /// measured (the filter leaves the `BOOTTIME_ONLY` view), and it is only
-    /// half the question; see [`KeyLifetime::BootTime`] for the other half.
+    /// The delete removed a live object (`ERROR_SUCCESS`). Proof of removal
+    /// for ANY lifetime — directly for [`KeyLifetime::Persistent`], whose
+    /// runtime object and record are the same thing, and for
+    /// [`KeyLifetime::BootTime`] under the purge assumption that variant's doc
+    /// states (bindreams/hole#1043). What the privileged lane measured is the
+    /// runtime half: the filter leaves the `BOOTTIME_ONLY` view.
     Removed,
     /// The delete found nothing on the key (`FWP_E_FILTER_NOT_FOUND`). Proof
     /// of absence only for [`KeyLifetime::Persistent`].
@@ -461,24 +473,25 @@ pub enum KeyOutcome {
     /// refused or failed (not elevated, engine error, RPC failure). Proof of
     /// NOTHING, for any lifetime.
     ///
-    /// Such a code also fails the release outright, so on the Windows sweep
-    /// path this variant does not survive to the clearance fold. It exists
-    /// anyway because the fold must be total over its own input — a verdict
-    /// that is only correct while a *different* function short-circuits first
-    /// is the coupling that lets an unproven state masquerade as proof the
-    /// moment either side moves.
+    /// Such a code also fails the release outright — but it reaches the
+    /// clearance fold all the same, because a Windows sweep issues every
+    /// delete before reading any code and hands back both halves
+    /// ([`SweepOutcome`]). So a refused delete shows up in
+    /// [`Clearance::unproven_keys`] beside the failure, and an operator is
+    /// told which key the sweep could not settle rather than only that one
+    /// could not be.
     Failed,
 }
 
 /// What a key's outcome is allowed to say about OTHER keys in the same sweep.
 ///
 /// [`KeyOutcome`] answers "what happened to THIS key". That is the whole
-/// answer for a [`KeyLifetime::Persistent`] key and only half of it for a
-/// [`KeyLifetime::BootTime`] one, because a boot-time key cannot report on
-/// itself: on the boot where a sweep actually runs its runtime object is not
-/// live, so it answers [`KeyOutcome::NotFound`] on a host that armed the kill
-/// switch years ago and on a host that never armed it at all. Some OTHER key
-/// has to separate those, and exactly one can.
+/// answer for a [`KeyLifetime::Persistent`] key, and for a
+/// [`KeyLifetime::BootTime`] one only when its object was live enough to be
+/// REMOVED. On every other boot a boot-time key cannot report on itself: its
+/// runtime object is not live, so it answers [`KeyOutcome::NotFound`] on a host
+/// that armed the kill switch years ago and on a host that never armed it at
+/// all. Some OTHER key has to separate those, and exactly one can.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeyRole {
     /// Speaks only for itself. Every key whose own outcome is the whole
@@ -488,8 +501,8 @@ pub enum KeyRole {
     /// [`KeyLifetime::BootTime`] twin copies — installed in the SAME
     /// transaction as that twin and never without it.
     ///
-    /// This is the one key in a sweep whose outcome is evidence about the
-    /// twin, and it is evidence because of the lifetime it does NOT share:
+    /// This is the one key in a sweep whose outcome is evidence about ANOTHER
+    /// key, and it is evidence because of the lifetime it does NOT share:
     /// BFE re-adds a persistent filter from its own store at every boot, so
     /// removing a live object under this key says a standing cover is
     /// installed HERE — on this boot, whichever boot armed it. Every sibling
@@ -498,8 +511,9 @@ pub enum KeyRole {
     ///
     /// The evidence is about the host, not about the twin's own record: it
     /// says whether a boot-time record is POSSIBLE here, never whether one
-    /// exists. Nothing an FWPM sweep can call says the latter — see
-    /// [`KeyLifetime::BootTime`].
+    /// exists. Only the twin's OWN delete can say that, and only when it
+    /// removed a live object — see [`KeyLifetime::BootTime`]. On the boots
+    /// where it cannot, this key is what is left.
     BootTimeSibling,
 }
 
@@ -524,21 +538,26 @@ impl KeyObservation {
     /// happen to share a consequence.
     pub fn proves_empty(&self) -> bool {
         match (self.lifetime, self.outcome) {
-            // Nothing this crate can call reads a boot-time key's policy
-            // record, so no outcome proves one gone — including a removal
-            // somebody watched happen, which proves only that the RUNTIME
-            // object went. Writing a negative conclusion off a return code is
-            // the one thing bindreams/hole#1010's remediation forbids, and
-            // this row is where it would have been written.
-            (KeyLifetime::BootTime, _) => false,
             // A removal we watched happen is proof for a key whose runtime
             // object and record are the same thing.
             (KeyLifetime::Persistent, KeyOutcome::Removed) => true,
             // The by-key delete addresses a persistent key's only record, so
             // an empty answer proves the key carries nothing.
             (KeyLifetime::Persistent, KeyOutcome::NotFound) => true,
+            // A removal we watched happen is proof for a boot-time key too,
+            // under bindreams/hole#1043's assumption that the by-key delete
+            // purges the policy record along with the runtime object it
+            // demonstrably removed. That assumption is the one thing here no
+            // lane can measure — see [`KeyLifetime::BootTime`].
+            (KeyLifetime::BootTime, KeyOutcome::Removed) => true,
+            // A boot-time key answers empty on any boot where its runtime
+            // object is not live, whether or not a record survives behind it.
+            // This cell never moved and is not covered by #1043's assumption:
+            // an empty answer is what the key gives on a host that armed the
+            // switch years ago AND on one that never armed it.
+            (KeyLifetime::BootTime, KeyOutcome::NotFound) => false,
             // The delete never got an answer about the key at all.
-            (KeyLifetime::Persistent, KeyOutcome::Failed) => false,
+            (_, KeyOutcome::Failed) => false,
         }
     }
 }
@@ -565,10 +584,9 @@ impl KeyObservation {
 /// not to withhold an uninstall.
 ///
 /// It carries a SECOND, independent answer, and the two must not be confused.
-/// [`Self::is_proven`] is what the sweep proved and never moves; it is false
-/// on EVERY Windows sweep, because no outcome proves a boot-time key empty —
-/// not a not-found on a boot where no bridge engaged, and not a removal
-/// watched happen on the boot that armed it (bindreams/hole#1010's F2; see
+/// [`Self::is_proven`] is what the sweep proved; it is false on every Windows
+/// sweep run on a boot where no bridge engaged, because the twins answer empty
+/// there and an empty answer proves nothing about a boot-time key (see
 /// [`KeyLifetime::BootTime`]). [`Self::leftover_keys`] is what is worth
 /// telling an operator, which is narrower: an unproven key on a host where no
 /// boot-time twin could ever have been armed did not strand anything, and
@@ -588,11 +606,10 @@ impl KeyObservation {
 /// cover was ever here" and goes silent for good; the record is lost by a
 /// wiped state dir. See [`boottime_witness`] for the full argument.
 ///
-/// **The record is write-once and nothing here retracts it**, so on a host
-/// that ever armed a twin `leftover_keys` reports for the life of the
-/// `state_dir` — including after a genuine, watched cleanup. That residual is
-/// disclosed in [`boottime_witness`]'s module doc and is the price of refusing
-/// to conclude anything negative about a boot-time record from a return code.
+/// **Exactly one observation retracts the record**: a twin whose delete
+/// removed a live object, which is [`boottime_witness::WitnessUpdate::Disarm`]
+/// and rests on bindreams/hole#1043's purge assumption. A twin that answered
+/// EMPTY never retracts anything — that reading is #1003 itself.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[must_use = "the uninstall gate reads this; dropping it restores the silent `Ok` of #1003"]
 pub struct Clearance {
@@ -661,11 +678,11 @@ enum BootTimeSightings {
     /// The sweep touched no boot-time key at all — macOS, and any future sweep
     /// list that drops them. It has nothing to say about the record.
     None,
-    /// The sweep touched at least one boot-time key, whose absence it could
-    /// not prove. There is no second answer here: a boot-time key has no
-    /// outcome that proves its record empty ([`KeyLifetime::BootTime`]), so
-    /// "the sweep saw one" and "the sweep left one unproven" are the same
-    /// finding.
+    /// Every boot-time key the sweep touched proved itself empty — i.e. every
+    /// one of them was watched being removed, the single outcome that can say
+    /// so ([`KeyLifetime::BootTime`]).
+    AllProven,
+    /// At least one boot-time key's absence went unproven.
     SomeUnproven,
 }
 
@@ -851,20 +868,23 @@ impl Clearance {
     /// What this sweep's own observations say the persisted record should now
     /// hold — derived here, once, and never at a write site.
     ///
-    /// Total over the pair, and it only ever moves toward reporting. No cell
-    /// clears the record, because no sweep observation can: see
-    /// [`KeyLifetime::BootTime`] and [`boottime_witness::WitnessUpdate`].
-    ///
-    /// The load-bearing cell is the last one: an unproven boot-time key on a
-    /// host whose siblings all answered empty writes NOTHING rather than
-    /// arming. "No cover is installed now" is not evidence about a twin's
-    /// record in EITHER direction, so it neither reports nor suppresses.
+    /// Total over the pair. Two load-bearing cells. The `AllProven` one
+    /// ignores the sibling entirely — a twin this sweep watched being removed
+    /// is direct evidence about the twin, so there is nothing for a key that
+    /// only speaks about the HOST to corroborate. The last one is the reverse:
+    /// an unproven boot-time key on a host whose siblings all answered empty
+    /// writes NOTHING rather than arming. "No cover is installed now" is not
+    /// evidence about a twin's record in EITHER direction, so it neither
+    /// reports nor suppresses.
     pub(crate) fn witness_update(&self) -> boottime_witness::WitnessUpdate {
         use boottime_witness::WitnessUpdate;
         match (self.boot_time, self.sibling) {
             // The sweep touched no boot-time key, so it saw nothing the record
             // is about.
             (BootTimeSightings::None, _) => WitnessUpdate::Leave,
+            // Watched every one of them go — proof for any lifetime, under
+            // bindreams/hole#1043's purge assumption.
+            (BootTimeSightings::AllProven, _) => WitnessUpdate::Disarm,
             // A record is possible here and the live evidence for that is
             // about to be deleted by this very sweep. Copy it out first.
             (BootTimeSightings::SomeUnproven, SiblingEvidence::Installed | SiblingEvidence::Unknown) => {
@@ -880,31 +900,38 @@ impl Clearance {
 ///
 /// Reads [`KeyObservation::proves_empty`] rather than re-deriving which
 /// outcomes count, so this and [`Clearance::unproven`] cannot disagree about
-/// whether a given key was proven. The read is a `debug_assert` because there
-/// is nothing left to branch on — no boot-time outcome proves its key empty —
-/// and an assertion is what keeps that from being an assumption this function
-/// quietly makes on its own.
+/// whether a given key was proven.
+///
+/// `seen` is tracked separately from `unproven` rather than inferred from an
+/// empty loop: "every boot-time key proved empty" is vacuously true of a sweep
+/// that touched none, and that reading would clear a real record the moment
+/// the twins left the sweep list.
 fn boot_time_sightings(observations: &[KeyObservation]) -> BootTimeSightings {
-    let mut sightings = BootTimeSightings::None;
+    let mut seen = false;
+    let mut unproven = false;
     for o in observations.iter().filter(|o| o.lifetime == KeyLifetime::BootTime) {
-        debug_assert!(
-            !o.proves_empty(),
-            "a boot-time key cannot prove its policy record empty: {} answered {:?}",
-            o.key,
-            o.outcome
-        );
-        sightings = BootTimeSightings::SomeUnproven;
+        seen = true;
+        unproven |= !o.proves_empty();
     }
-    sightings
+    match (seen, unproven) {
+        (false, _) => BootTimeSightings::None,
+        (true, true) => BootTimeSightings::SomeUnproven,
+        (true, false) => BootTimeSightings::AllProven,
+    }
 }
 
 /// One sweep's whole interaction with the persisted boot-time record: consult
 /// it before the fold, then update it from what the sweep itself observed.
 ///
-/// Every path that can remove a standing cover's `PERSISTENT` sibling goes
+/// Every SWEEP that can remove a standing cover's `PERSISTENT` sibling goes
 /// through here, which is what makes the three sites that DISCARD the returned
 /// [`Clearance`] safe — `recover_lockdown`'s `Sweep` arm, `SystemRouting::
 /// release_all_covers`, and the reconciler's `CoverStep::Release` through it.
+///
+/// Not every DELETE does. The Windows guard's `Drop` (`platform::Cover`'s
+/// `Lockdown` arm) removes the same key list with no `state_dir` to write to,
+/// so it can neither arm nor retract; the residual that leaves is disclosed in
+/// [`boottime_witness`]'s module doc, and it is an over-report.
 /// The evidence is persisted before anything is returned AT ALL — before the
 /// `Ok` those three drop, and before the `Err` a failing sweep hands its
 /// caller — so dropping the value costs an operator message on that one call
@@ -1035,6 +1062,13 @@ mod clearance_tests;
 #[cfg(test)]
 #[path = "failclosed/boot_time_tripwire_tests.rs"]
 mod boot_time_tripwire_tests;
+
+// Also a source-tree scan, also deliberately NOT platform-gated. The type it
+// guards is Windows-only; the invariant (CLAUDE.md's "per-variant policy lives
+// on the type") is not, and neither is reading text.
+#[cfg(test)]
+#[path = "failclosed/stale_key_policy_tests.rs"]
+mod stale_key_policy_tests;
 
 // Privileged-lane real-engage verification (#527): engages the REAL OS cover and
 // asserts it blocks egress. Gated to the elevated `hole-tests` TUN lane by the

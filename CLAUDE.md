@@ -153,8 +153,13 @@ before editing; the sections linked below are the authoritative source.
   standing cover's Windows block-all pair additionally installs `BOOTTIME`
   twins — two more filters, aimed at the kernel-start→BFE-start window
   `PERSISTENT` alone cannot reach. They carry the block only, so that window
-  has no permits at all, and it is a HARD block (no `CLEAR_ACTION_RIGHT`) whose
-  effect on early boot is disclosed as unanalysed. The flag a twin is installed
+  has no permits at all — which is exactly why the block is **soft**
+  (`CLEAR_ACTION_RIGHT`, on the boot-time arm of `FilterLifetime::filter_flags`
+  and nowhere else): a hard one could not be overridden by the egress a host
+  may need to FINISH booting and so to reach the BFE start that lifts it. The
+  persistent half stays hard, and its weight-ordering argument is untouched —
+  the two halves are never in force at once, and hardness never decides
+  within-sublayer arbitration. The flag a twin is installed
   with and the `KeyLifetime` its key is swept under are **one value**
   (`FilterLifetime`, a newtype over `KeyLifetime`, read by both sites out of
   `LOCKDOWN_BOOTTIME_TWINS`), so a boot-time filter whose key a sweep calls
@@ -167,12 +172,15 @@ before editing; the sections linked below are the authoritative source.
   stores them under our containers; a by-key delete removes a LIVE one; every
   engage re-arms) versus unverified (anything spanning a reboot, including the
   later-boot delete that #1009's uninstall gate depends on) is in
-  CONTRIBUTING.md. **Evidence about a boot-time key never comes from a return
+  CONTRIBUTING.md. **Evidence about a boot-time key never comes from a commit
   code:** an engage proves a twin armed by reading it back out of the
   `BOOTTIME_ONLY` view (`verify_boottime_twins`) instead of trusting the
-  commit, **nothing proves one gone** — a delete's `ERROR_SUCCESS` says the
-  runtime object went and every read available is a BFE read, while the record
-  is what applies before BFE starts — and whether a stranded record is possible
+  commit. Going the other way, only a delete that REMOVED a live twin proves
+  one gone, and only under bindreams/hole#1043's assumption that the by-key
+  delete purges the boot-time policy record with the runtime object (unmeasured
+  — every read available is a BFE read, while the record is what applies before
+  BFE starts). A not-found proves nothing and never will: it is the answer on
+  every boot where no object is live. Whether a stranded record is possible
   at all is read off the twins' `Persistent` sibling
   (`KeyRole::BootTimeSibling`) — which is why `disengage_lockdown` returns a
   `Clearance` like `release_all`, and why `release_clearance_report` fires on
@@ -186,8 +194,8 @@ before editing; the sections linked below are the authoritative source.
   records it the instant the transaction commits (`commit_and_record`, before
   the read-back that can fail over a cover already in force), and
   `leftover_keys` reports when **either** source says a twin is possible — the
-  sibling survives a wiped state dir, the record survives the sweep and is
-  never retracted. The
+  sibling survives a wiped state dir, the record survives the sweep that
+  consumes the sibling, and only a watched removal retracts it. The
   transient one is swept unconditionally on next start, the standing one only
   on an explicit recorded off — full reconciliation table (`decide_cover_recovery`)
   and disclosed residuals in CONTRIBUTING.md. A single persisted `Target`
@@ -248,7 +256,8 @@ before editing; the sections linked below are the authoritative source.
   [→](CONTRIBUTING.md#logging--diagnostics)
 - **Per-variant policy lives on the type, never at a call site** — a decision
   keyed to an enum variant belongs in ONE exhaustive match on that type
-  (`SessionEvent::preserves_death_reason`, `CoverPresence::is_present`), and
+  (`SessionEvent::preserves_death_reason`, `CoverPresence::is_present`,
+  `StaleKeyPolicy::refuses_a_stale_key`), and
   two variants are never grouped because they happen to share a consequence.
   Grouping by consequence is what let `ProcessExiting` inherit an answer chosen
   for a cutover; re-deriving the rule at each site is what let `== Live` drop
@@ -256,7 +265,8 @@ before editing; the sections linked below are the authoritative source.
   in one change — each a contract stated in prose at the definition site and
   violated at a call site far away — so it is test-enforced
   (`session_event_policy_lives_on_the_type_not_at_call_sites`,
-  `cover_presence_is_never_compared_against_a_variant`). Prefer removing the
+  `cover_presence_is_never_compared_against_a_variant`,
+  `stale_key_policy_lives_on_the_type_not_at_call_sites`). Prefer removing the
   hazard outright over guarding it: `CoverGuard::disarm` had a "call only
   before process exit" precondition that no test could enforce, and closing the
   handle it leaked deleted the rule instead of policing it.

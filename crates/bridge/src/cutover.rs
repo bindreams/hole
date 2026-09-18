@@ -266,6 +266,14 @@ pub fn release_covers() -> std::io::Result<Clearance> {
 /// `PERSISTENT` siblings in this very sweep (`failclosed::KeyRole`) and the
 /// persisted `failclosed::boottime_witness` — reporting when EITHER speaks.
 ///
+/// It is a GATE on the whole set, not a boot-time-only filter of it: when it
+/// fires, the list is every key the sweep could not settle, which on a sweep
+/// that FAILED includes a `Persistent` one whose delete was refused. The
+/// message therefore does not call what it names a boot-time key
+/// (`an_unproven_release_does_not_call_every_key_it_names_a_boot_time_one`) —
+/// sending an operator to `show boottimepolicy` after an App-ID permit is
+/// hunting a record that class of key never had.
+///
 /// The union is not belt-and-braces. The sibling alone is CONSUMED by the
 /// first sweep that removes it, and "turn the kill switch off, then uninstall"
 /// is an ordinary sequence that does exactly that; after it, every sweep reads
@@ -292,10 +300,12 @@ pub fn release_clearance_report(clearance: &Clearance) -> Option<String> {
         return None;
     }
     Some(format!(
-        "covers released, but {} boot-time filter key(s) could not be proven empty: {}. \
-         A boot-time filter is live only between kernel start and Base Filtering Engine start, \
-         so a delete-by-key finds nothing on any later boot whether or not a policy record \
-         survives behind it. To check after this uninstall, run `netsh wfp show boottimepolicy` \
+        "covers released, but {} filter key(s) could not be proven empty: {}. \
+         Usually these are the boot-time twins: such a filter is live only between kernel start \
+         and Base Filtering Engine start, so a delete-by-key finds nothing on any later boot \
+         whether or not a policy record survives behind it. A key here can also be an ordinary \
+         one whose own delete was REFUSED, in which case this release also failed and said so. \
+         To check after this uninstall, run `netsh wfp show boottimepolicy` \
          elevated and look for these keys; if egress is blocked early in boot, that is where it \
          would show. `netsh wfp` cannot remove one — it has no delete verb, only capture/dump/\
          help/set/show — and removing a WFP filter takes an FWPM call, which no binary left on this \

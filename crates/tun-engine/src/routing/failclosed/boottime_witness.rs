@@ -9,8 +9,10 @@
 //! [`super::KeyRole::BootTimeSibling`] is the one key in a sweep that can say
 //! whether a record was ever POSSIBLE here — but only while the sibling is
 //! still installed, and the sibling and the twin are guaranteed to be added
-//! together, never removed together. The twin's removal is precisely the
-//! unprovable event.
+//! together, never removed together. On a boot where the twin's own delete
+//! could settle the question (its object is live, so the delete REMOVES it —
+//! see below) the sweep needs none of this; on every other boot it is all the
+//! sweep has.
 //!
 //! So any sweep that removes the sibling while the twin answers not-found
 //! CONSUMES the only live evidence. Every later sweep sees an empty sibling
@@ -33,36 +35,52 @@
 //! has its sibling to fall back on, a consumed sibling still has its record —
 //! so the union is silent only when both are lost.
 //!
-//! # Why the record is never cleared
+//! # What clears the record, and the assumption under it
 //!
-//! The record is WRITE-ONCE: an engage arms it, and nothing in this version
-//! clears it. That is bindreams/hole#1010's F2, and the reason is the same one
-//! the whole remediation rests on — *evidence about a boot-time key never
-//! comes from a return code*. Clearing the record is a NEGATIVE conclusion
-//! about the boot-time policy record, and the only thing a sweep holds to draw
-//! it from is `FwpmFilterDeleteByKey0`'s `ERROR_SUCCESS`. That code says the
-//! runtime FWPM object went; whether the policy record behind it was purged is
-//! recorded as open in `failclosed/windows.rs`'s module doc and cannot be
-//! closed from here, because every read available — the delete's code, a
-//! `BOOTTIME_ONLY` enumeration, `netsh wfp show boottimepolicy` — goes through
-//! the Base Filtering Engine, and the record in question is by definition what
-//! applies BEFORE BFE starts at the next boot. Only a reboot separates them,
-//! and no lane reboots.
+//! Exactly one observation: a by-key delete that REMOVED a live twin
+//! ([`super::KeyOutcome::Removed`]). Nothing else — and in particular not an
+//! empty answer, which is what the key gives on every boot where its runtime
+//! object is not live, on a host that armed the switch years ago and on one
+//! that never armed it at all.
 //!
-//! So the twin's removal stays the unprovable event it always was, and the
-//! record says "a twin was armed on this host", never "and it is gone".
+//! That one cell rests on an ASSUMPTION the repo owner has taken, tracked for
+//! verification on real hardware as **bindreams/hole#1043**: that
+//! `FwpmFilterDeleteByKey0` purges the boot-time POLICY RECORD along with the
+//! runtime FWPM object it demonstrably removes. Nothing in this crate can
+//! measure that — every read available (the delete's code, a `BOOTTIME_ONLY`
+//! enumeration, `netsh wfp show boottimepolicy`) goes through the Base
+//! Filtering Engine, and the record in question is by definition what applies
+//! BEFORE BFE starts at the next boot. Only a reboot separates them, and no
+//! lane reboots.
+//!
+//! What the assumption buys is the ordinary cleanup going quiet: arm the kill
+//! switch, turn it off, uninstall, and the sweep that watched both halves of
+//! the rule go has nothing to warn about. What it costs is stated in #1043 —
+//! if a delete does NOT purge the record, that same host is silent over a
+//! stranded pre-BFE block-all. The asymmetry against not-found is deliberate
+//! and is what keeps #1003's own shape out: a twin nobody watched go is still
+//! reported.
 //!
 //! # Disclosed residuals
 //!
-//! - **A host that genuinely cleaned up keeps reporting.** Arm the kill switch
-//!   once, turn it off, and every later `bridge release-covers` on that
-//!   `state_dir` names the two twin keys — for the life of the state dir. That
-//!   is the cost of the paragraph above, and it is bounded to hosts that ever
-//!   armed a twin: one that never did has no record and no live sibling, and
-//!   stays silent (`a_host_that_never_armed_a_twin_stays_silent_across_every_sweep`).
-//!   The trade is deliberate: an over-report costs an operator a paragraph, and
-//!   the silence it replaces costs #1003's unrecoverable host. Clearing it
-//!   needs a measurement no single-boot lane can make.
+//! - **A host cleaned up by `Cover::drop` keeps reporting.** The Windows guard's
+//!   `Drop` (`failclosed/windows.rs`, the `Lockdown` arm) deletes the whole
+//!   `swept_lockdown_keys` list — twins included — and is the ONE twin-removing
+//!   path that does not run through `super::sweep_with_witness`, because the
+//!   guard carries no `state_dir` to write to. It fires when an engage COMMITS
+//!   (so the record is already `Armed`) and a later fatal phase of the same
+//!   start fails, unwinding `ProxyManager`'s locally-owned guard; an ordinary
+//!   disconnect is unaffected, since that releases through
+//!   `Routing::release_all_covers` first and drops an already-swept cover. The
+//!   twins were genuinely watched going, so this is an OVER-report: the record
+//!   stays `Armed`, the sibling is gone, and every later `release-covers` on
+//!   that `state_dir` names the two twin keys. Safe direction, and the same
+//!   one this file has always failed in — but not the same claim as "only a
+//!   non-sweep cause leaves a stale record", which is why it is spelled out.
+//! - Other causes with the same shape and no fix here at all: an external FWPM
+//!   delete, a firewall reset, an image restore. No sweep ever held the
+//!   evidence, so nothing could have copied it — which is the case
+//!   `record_armed`-at-engage exists for in the first place.
 //! - A `record` write that FAILS (an unwritable `state_dir`) loses the witness
 //!   with nothing left to re-derive it from. The sweep that failed to write
 //!   still reports — it holds the sibling evidence itself — but a later one
@@ -136,21 +154,14 @@ pub fn load(state_dir: &Path) -> ArmingWitness {
     }
 }
 
-/// Atomically persist the armed record (temp file + same-dir rename,
-/// `sync_all` before persist), the same write shape `lockdown_state` uses.
-/// Creates `state_dir`.
-///
-/// Always writes `armed: true`: nothing in this version can conclude a
-/// boot-time record gone (see [`WitnessUpdate`]). The FIELD stays a `bool`
-/// because [`load`] must keep classifying a `false` — written by a hand-edit,
-/// or by a future version with a reboot-capable measurement behind it — as
-/// [`ArmingWitness::Disarmed`] rather than as a schema error.
-fn save(state_dir: &Path, owner: Option<(u32, u32)>) -> std::io::Result<()> {
+/// Atomically persist `armed` (temp file + same-dir rename, `sync_all` before
+/// persist), the same write shape `lockdown_state` uses. Creates `state_dir`.
+fn save(state_dir: &Path, armed: bool, owner: Option<(u32, u32)>) -> std::io::Result<()> {
     std::fs::create_dir_all(state_dir)?;
     util::ownership::chown_if_some(state_dir, owner);
     let state = BootTimeState {
         version: SCHEMA_VERSION,
-        armed: true,
+        armed,
     };
     let json =
         serde_json::to_vec_pretty(&state).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
@@ -185,7 +196,7 @@ fn save(state_dir: &Path, owner: Option<(u32, u32)>) -> std::io::Result<()> {
 /// proved only where the hazard lives is proved nowhere else.
 #[cfg(any(target_os = "windows", test, feature = "test-utils"))]
 pub(crate) fn record_armed(state_dir: &Path, owner: Option<(u32, u32)>) {
-    write_or_warn(state_dir, owner);
+    write_or_warn(state_dir, true, owner);
 }
 
 /// Arm the record from a test in a DOWNSTREAM crate, which cannot reach
@@ -207,19 +218,19 @@ pub fn record_armed_for_test(state_dir: &Path) {
 /// Derived once, in [`super::Clearance::witness_update`], from what the sweep
 /// saw — never re-derived at a write site.
 ///
-/// **There is no `Disarm`**, and that is bindreams/hole#1010's F2. Clearing
-/// the record is a NEGATIVE conclusion about a boot-time policy record, and
-/// the only thing a sweep holds to draw it from is a delete's return code —
-/// the one source this remediation's founding rule excludes. Every read
-/// available here goes through the Base Filtering Engine; the record is what
-/// applies before BFE starts at the next boot. So the record is write-once:
-/// an engage arms it and nothing in this version can clear it. What that costs
-/// is in the module doc's residuals.
+/// The only update that CLEARS the record is [`Self::Disarm`], and the only
+/// observation that produces it is a twin whose delete removed a live object.
+/// What that rests on — bindreams/hole#1043's purge assumption — is in the
+/// module doc.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum WitnessUpdate {
     /// A boot-time key went unproven on a host where a record is possible:
     /// copy that finding into the file before the evidence for it is gone.
     Arm,
+    /// Every boot-time key this sweep touched was watched being removed, which
+    /// is proof for any lifetime ([`super::KeyObservation::proves_empty`]).
+    /// Nothing is outstanding.
+    Disarm,
     /// The sweep says nothing about a boot-time key's record, so the file
     /// keeps whatever it held. Two causes, and the second is the one that
     /// matters: the sweep touched no boot-time key at all, or it found an
@@ -229,32 +240,40 @@ pub(crate) enum WitnessUpdate {
     Leave,
 }
 
-/// Whether this update needs the record written. Pure, so the rule that no
-/// sweep can retract a real `Armed` is a table rather than a condition spread
-/// over a write site.
+/// The record's next value, or `None` when nothing needs writing.
 ///
-/// The return is a bare `bool` and not `Option<bool>` because there is only
-/// one value anything here can write. See [`WitnessUpdate`].
-fn should_arm(current: ArmingWitness, update: WitnessUpdate) -> bool {
+/// Pure, and a table rather than a condition spread over the write site,
+/// because the two rules that matter are both about which CURRENT values a
+/// write may land on: an `Arm` never rewrites an existing `Armed` (pointless
+/// I/O that can only fail), and a `Disarm` never writes `false` over `Unset`
+/// or `Disarmed` — the first would litter every host that never armed a twin
+/// with a file saying so, on every `release-covers` it ever runs.
+fn next_record(current: ArmingWitness, update: WitnessUpdate) -> Option<bool> {
     match update {
-        WitnessUpdate::Leave => false,
+        WitnessUpdate::Leave => None,
         // Already recorded; rewriting it would only risk an I/O failure.
-        WitnessUpdate::Arm => current != ArmingWitness::Armed,
+        WitnessUpdate::Arm => (current != ArmingWitness::Armed).then_some(true),
+        // `Unset` is a host with no file and nothing outstanding — writing
+        // `false` there would litter every host that never armed a twin.
+        // `Unreadable` IS written, because a corrupt file reports forever
+        // otherwise and this sweep just proved there is nothing to report.
+        WitnessUpdate::Disarm => (!matches!(current, ArmingWitness::Disarmed | ArmingWitness::Unset)).then_some(false),
     }
 }
 
 /// Apply a sweep's [`WitnessUpdate`] to the record it was folded against.
 pub(crate) fn apply(state_dir: &Path, current: ArmingWitness, update: WitnessUpdate, owner: Option<(u32, u32)>) {
-    if should_arm(current, update) {
-        write_or_warn(state_dir, owner);
+    if let Some(armed) = next_record(current, update) {
+        write_or_warn(state_dir, armed, owner);
     }
 }
 
 /// Warn, never propagate — see the module doc's residuals.
-fn write_or_warn(state_dir: &Path, owner: Option<(u32, u32)>) {
-    if let Err(e) = save(state_dir, owner) {
+fn write_or_warn(state_dir: &Path, armed: bool, owner: Option<(u32, u32)>) {
+    if let Err(e) = save(state_dir, armed, owner) {
         tracing::warn!(
             error = %e,
+            armed,
             path = %state_file(state_dir).display(),
             "the boot-time witness could not be written; a later sweep that can no longer see a \
              standing cover's PERSISTENT sibling will have nothing to fall back on"

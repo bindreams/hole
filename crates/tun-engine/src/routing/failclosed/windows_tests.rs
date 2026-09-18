@@ -97,9 +97,10 @@ fn spec_permits_v6_server_on_v6_layer_only() {
     assert_eq!(server_permits[0].layer, Layer::ConnectV6);
 }
 
-// Arbitration within our single sublayer is pure weight (no CLEAR_ACTION_RIGHT on
-// any filter): the permits must outweigh block-all, else block-all wins and the
-// cover blocks everything. A compile-time invariant, not a runtime check.
+// Arbitration within our single sublayer is pure weight (hardness is a
+// cross-sublayer question): the permits must outweigh block-all, else block-all
+// wins and the cover blocks everything. A compile-time invariant, not a runtime
+// check.
 const _: () = assert!(PERMIT_WEIGHT > BLOCK_WEIGHT);
 
 #[skuld::test]
@@ -152,8 +153,47 @@ fn a_lifetime_hands_out_its_wfp_flag_and_its_key_class_from_one_value() {
         FWPM_FILTER_FLAG_PERSISTENT.0
     );
     assert_eq!(FilterLifetime::PERSISTENT.key_lifetime(), KeyLifetime::Persistent);
-    assert_eq!(FilterLifetime::BOOT_TIME.filter_flags().0, FWPM_FILTER_FLAG_BOOTTIME.0);
+    assert_eq!(
+        FilterLifetime::BOOT_TIME.filter_flags().0,
+        FWPM_FILTER_FLAG_BOOTTIME.0 | FWPM_FILTER_FLAG_CLEAR_ACTION_RIGHT.0
+    );
     assert_eq!(FilterLifetime::BOOT_TIME.key_lifetime(), KeyLifetime::BootTime);
+}
+
+#[skuld::test]
+fn only_the_boot_time_lifetime_clears_its_action_right() {
+    // The boot→BFE window carries the block and NO permit of ours — not
+    // loopback, not the TUN, not the server, not an App-ID — so a hard block
+    // there cannot be overridden by anything, including whatever the host
+    // needs to finish booting (PXE, iSCSI root, a network-key volume unlock).
+    // `CLEAR_ACTION_RIGHT` makes the twin's action SOFT so a higher-weight
+    // permit in another sublayer can win. Fort Firewall's boot-time blocks do
+    // this; Mullvad's do not.
+    //
+    // The PERSISTENT half must NOT gain it. That half ships with our own
+    // permits beside it and is the kill switch proper: soft there would let a
+    // third-party sublayer's permit override the block a user asked for.
+    assert_ne!(
+        FilterLifetime::BOOT_TIME.filter_flags().0 & FWPM_FILTER_FLAG_CLEAR_ACTION_RIGHT.0,
+        0,
+        "a boot-time twin must be overridable — nothing else covers that window and nothing \
+         lifts the block until BFE starts"
+    );
+    assert_eq!(
+        FilterLifetime::PERSISTENT.filter_flags().0 & FWPM_FILTER_FLAG_CLEAR_ACTION_RIGHT.0,
+        0,
+        "the persistent half is the kill switch and stays HARD"
+    );
+    // The two lifetime flags stay mutually exclusive on one object whatever
+    // else rides along (WFP's own FWPM_FILTER0 docs).
+    for lifetime in [FilterLifetime::PERSISTENT, FilterLifetime::BOOT_TIME] {
+        let bits = lifetime.filter_flags().0;
+        assert_ne!(
+            bits & FWPM_FILTER_FLAG_PERSISTENT.0 != 0,
+            bits & FWPM_FILTER_FLAG_BOOTTIME.0 != 0,
+            "{lifetime:?} must carry exactly one of the two lifetime flags"
+        );
+    }
 }
 
 // That `add_filter` really carries a spec's lifetime through to the live WFP
@@ -1039,10 +1079,27 @@ fn a_disengage_that_failed_still_carries_the_sibling_it_already_removed() {
         crate::routing::failclosed::boottime_witness::WitnessUpdate::Arm,
         "a failing sweep still holds the sibling it removed, and the record is written from it"
     );
+    // The two answers are about different sets and are deliberately not the
+    // same list. ARMING is about the boot-time keys only: the twins answered
+    // empty, so a record is possible and the sibling says so. NAMING spans
+    // every key the sweep could not prove empty, whatever its lifetime — and
+    // the App-ID permit that answered `ERROR_ACCESS_DENIED` is exactly such a
+    // key. Dropping it would hand an operator a report that omits the one
+    // filter this call is failing over.
     assert_eq!(
         outcome.clearance().leftover_keys(),
-        TWIN_LABELS,
-        "the same observations that arm the record are the ones that name the keys"
+        [
+            "lockdown boot-time block-all V4",
+            "lockdown boot-time block-all V6",
+            "lockdown app-id filter",
+        ],
+        "the report names the twins the sweep could not prove AND the permit it could not delete"
+    );
+    assert_eq!(
+        outcome.clearance().leftover_keys(),
+        outcome.clearance().unproven_keys(),
+        "on a host where a record is possible the operator is told everything the sweep left \
+         unsettled, not a boot-time subset of it"
     );
     assert!(
         outcome.into_result().is_err(),
@@ -1131,36 +1188,32 @@ fn a_not_found_sweep_proves_every_key_but_the_boot_time_twins() {
 }
 
 #[skuld::test]
-fn a_sweep_that_watched_the_twins_go_still_cannot_prove_them_empty() {
-    // The other half, over the REAL sweep lists, and bindreams/hole#1010's F2:
-    // the answer does NOT change with the outcome for a boot-time key.
-    // `ERROR_SUCCESS` is a removal somebody watched happen and
-    // `boottime_privileged_tests` measures exactly what it settles — the
-    // filter leaves the BOOTTIME_ONLY view, i.e. the RUNTIME OBJECT is gone.
-    // The boot-time policy record behind it is the thing that serves the next
-    // boot, every read available here goes through BFE, and the record is by
-    // definition what applies before BFE starts. So an uninstall on the boot
-    // that engaged — the MSI stopping the bridge and running `release-covers`
-    // while the twins are still live — is qualified too, and the twins are
-    // still named. The alternative is an empty unproven set at the one gate
-    // that deletes `hole.exe`.
+fn a_sweep_that_watched_the_twins_go_proves_the_whole_list_empty() {
+    // The other half, over the REAL sweep lists: an uninstall on the boot that
+    // engaged, the MSI stopping the bridge and running `release-covers` while
+    // the twins are still live, so every key answers `ERROR_SUCCESS`.
+    //
+    // Nothing is left unproven — including the twins, under
+    // bindreams/hole#1043's assumption that the by-key delete purges the
+    // boot-time record along with the runtime object
+    // `boottime_privileged_tests` measures it removing. This is the case that
+    // flipped: it used to be the loud one. The silence is about keys this very
+    // sweep watched being deleted, not about keys nobody measured, which is
+    // the distinction #1003 collapsed.
     let swept: Vec<(SweptKey, u32)> = swept_lockdown_keys()
         .into_iter()
         .chain(swept_transient_keys())
         .map(|k| (k, ERROR_SUCCESS.0))
         .collect();
     let clearance = Clearance::from_observations(&observations(&swept), ArmingWitness::Unset);
-    assert_eq!(
-        clearance.unproven_keys(),
-        TWIN_LABELS,
-        "exactly the twins stay unproven; every persistent key the sweep watched go IS proven"
+    assert!(
+        clearance.is_proven(),
+        "every key in both lists was watched going: {:?}",
+        clearance.unproven_keys()
     );
-    assert_eq!(
-        clearance.leftover_keys(),
-        TWIN_LABELS,
-        "the siblings answered ERROR_SUCCESS, so a standing cover is installed here and the \
-         operator hears about the twins that went with it"
-    );
+    assert!(clearance.leftover_keys().is_empty(), "{:?}", clearance.leftover_keys());
+    // The not-found sweep on the same lists is the one that still reports —
+    // `a_not_found_sweep_proves_every_key_but_the_boot_time_twins` above.
 }
 
 // Which key vouches for a twin ========================================================================================
@@ -1294,6 +1347,22 @@ fn every_boot_time_filter_belongs_to_a_spec_that_fails_on_a_stale_key() {
                 StaleKeyPolicy::Fail,
                 "boot-time filter {:?} sits in a spec that DEGRADES on a stale key, so a duplicate \
                  add reports Ok and the twin is never re-armed",
+                f.guid
+            );
+            // The other pairing the type does not couple, and the one
+            // `CLEAR_ACTION_RIGHT` created. `FilterLifetime::filter_flags`
+            // makes every BOOT_TIME filter SOFT, and the justification for
+            // that is a property of the twins being BLOCKS: the pre-BFE window
+            // carries no permit of ours, so a hard block there is
+            // unoverridable by the egress a host may need to finish booting.
+            // A boot-time PERMIT would inherit the flag with no such argument
+            // — a soft permit any third-party hard block can veto, silently.
+            assert_eq!(
+                f.action,
+                Action::Block,
+                "boot-time filter {:?} is a PERMIT, and `filter_flags` would make it soft: \
+                 CLEAR_ACTION_RIGHT is justified by the twins carrying the block and nothing \
+                 else, and a soft permit is vetoable by any hard block in another sublayer",
                 f.guid
             );
         }

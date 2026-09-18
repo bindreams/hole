@@ -18,19 +18,27 @@
 //!
 //! One sublayer, weight-based arbitration: the permits sit at weight 15 and the
 //! block-all at weight 0, so within the sublayer the higher-weight permit wins.
-//! NO filter sets `CLEAR_ACTION_RIGHT`. That flag makes THIS filter's own action
-//! soft (cross-sublayer overridable); omitting it makes the action HARD. Hardness
-//! only governs cross-sublayer arbitration — within a sublayer it does nothing.
-//! The old bug: it set the flag on the permits (making them soft) but not on the
-//! block-all (a default-HARD block), so block-all vetoed every permit and the
-//! cover blocked everything. With the flag off everywhere, within-sublayer
-//! arbitration is pure weight: the weight-15 permits beat the weight-0 block-all.
-//! This is the wireguard-windows recipe — its loopback/TUN/DHCP permits and
-//! block-all are weight-ordered with the flag off; it sets `CLEAR_ACTION_RIGHT`
-//! only on its own service app-ID permit, none of ours. The trade-off: a
-//! higher-weight third-party sublayer could in principle override us (accepted —
-//! wireguard ships the same all-but-one-soft layout); a two-sublayer
-//! hard-permit/soft-block layout is a possible future hardening.
+//! No PERSISTENT filter sets `CLEAR_ACTION_RIGHT` (the boot-time twins do, and
+//! only they — see "Boot-time coverage" below). That flag makes THIS filter's own
+//! action soft (cross-sublayer overridable); omitting it makes the action HARD.
+//! Hardness only governs cross-sublayer arbitration — within a sublayer it does
+//! nothing. The old bug: it set the flag on the permits (making them soft) but not
+//! on the block-all (a default-HARD block), so block-all vetoed every permit and
+//! the cover blocked everything. With the flag off across the persistent set,
+//! within-sublayer arbitration is pure weight: the weight-15 permits beat the
+//! weight-0 block-all. This is the wireguard-windows recipe — its
+//! loopback/TUN/DHCP permits and block-all are weight-ordered with the flag off;
+//! it sets `CLEAR_ACTION_RIGHT` only on its own service app-ID permit, none of
+//! ours. The trade-off: a higher-weight third-party sublayer could in principle
+//! override us (accepted — wireguard ships the same all-but-one-soft layout); a
+//! two-sublayer hard-permit/soft-block layout is a possible future hardening.
+//!
+//! **The twins do not enter that argument.** A boot-time filter is enforced only
+//! between kernel start and BFE start and the persistent set exists only once BFE
+//! has started, so the two halves are never arbitrated against each other; and
+//! hardness never affects within-sublayer weight ordering, which is what the
+//! paragraph above rests on. Softening the twins therefore leaves the persistent
+//! half's arbitration untouched.
 //!
 //! PERSISTENT filters — NOT a dynamic session — so a coordinator crash
 //! mid-cutover leaves traffic blocked (fail-closed), not leaked; `recover_cover`
@@ -69,15 +77,24 @@
 //! never spans a reboot, so it is `Persistent`-only throughout — see
 //! [`build_cover_spec`].
 //!
-//! **What that block does to the machine around it is NOT analysed here, and
-//! saying so is the point.** The twins are [`Condition::Any`] +
-//! [`Action::Block`] with no `CLEAR_ACTION_RIGHT`, hence default-HARD: between
-//! tcpip.sys start and BFE start, on a host with the kill switch armed, every
-//! outbound connect fails, loopback included, and no other sublayer can
-//! override it. Whether anything in that window needs egress — early-boot
-//! drivers, a domain network provider, PXE or iSCSI boot, a network-key volume
-//! unlock — has not been established, and this change ships without
-//! establishing it.
+//! **The twins are OVERRIDABLE, and that is a deliberate choice about the
+//! hazard, not an oversight.** They are [`Condition::Any`] + [`Action::Block`]
+//! *with* `FWPM_FILTER_FLAG_CLEAR_ACTION_RIGHT` ([`FilterLifetime`]), so the
+//! block is soft and a higher-weight permit in another sublayer can win. The
+//! reason is that this window carries no permit of ours at all: with a HARD
+//! block, every outbound connect between tcpip.sys start and BFE start fails,
+//! loopback included, and nothing can lift it — including whatever a host needs
+//! to FINISH BOOTING and so to reach the BFE start that would take the block out
+//! of effect (PXE or iSCSI boot, a network-key volume unlock). Fort Firewall's
+//! boot-time blocks are soft for the same reason; Mullvad's are hard.
+//!
+//! What that leaves open, stated rather than argued away: the flag is a
+//! *permission* to be overridden, not a guarantee anything will. Whether the
+//! pre-BFE kernel arbitrates boot-time filters across sublayers at all, and
+//! whether any of those early-boot paths ships a filter that would win, has not
+//! been established here. So a soft block narrows the hazard; it does not close
+//! it, and the residual is the same class it was — an armed host whose boot needs
+//! egress.
 //!
 //! Both twins reference the same [`PROVIDER_GUID`]/[`SUBLAYER_GUID`] the
 //! persistent filters already use, which is a MEASURED choice rather than a
@@ -93,8 +110,8 @@
 //! behind it: the runtime FWPM object, which exists only between kernel start
 //! and BFE start (or inside the session that just added it), and the boot-time
 //! POLICY RECORD, which is what actually serves the next boot and which no call
-//! in this crate can read. So evidence comes from two places and never from a
-//! return code:
+//! in this crate can read. So no read-back or return code speaks about the
+//! record directly, and the three questions are answered separately:
 //!
 //! - **That a twin is ARMED** — only a read of the boot-time enumeration view
 //!   while its object is live. A commit code is not evidence:
@@ -106,19 +123,23 @@
 //!   ([`commit_and_record`]): a failed verification leaves the committed cover
 //!   in force, so a record written after it would be skipped for precisely the
 //!   host class it exists to cover (bindreams/hole#1010 F3).
-//! - **That a twin is GONE** — *nothing*. [`KeyObservation::proves_empty`] is
-//!   `false` for the whole boot-time row. `FWP_E_FILTER_NOT_FOUND` was never
-//!   evidence (on any boot where no object is live the key answers empty
-//!   whether or not a record survives behind it), and neither is
-//!   [`KeyOutcome::Removed`]: it proves the RUNTIME OBJECT went, which is what
-//!   `boottime_privileged_tests` measured, and every read reachable from here
-//!   — the delete's code, a `BOOTTIME_ONLY` enumeration, `netsh wfp show
-//!   boottimepolicy` — is a read through BFE, while the record is by
-//!   definition what applies before BFE starts. Reading `Removed` as proof was
-//!   the one place this file drew a NEGATIVE conclusion from a return code
-//!   (bindreams/hole#1010 F2), and it made an uninstall on the boot that armed
-//!   the switch silent. This is why [`release_all`] AND [`disengage_lockdown`]
-//!   both return a [`Clearance`] rather than a bare `Ok`.
+//! - **That a twin is GONE** — only [`KeyOutcome::Removed`], a delete that
+//!   removed a LIVE object, and only under an assumption this file cannot
+//!   discharge: that the by-key delete purges the boot-time policy record
+//!   along with the runtime object `boottime_privileged_tests` measured it
+//!   removing. Every read reachable from here — the delete's code, a
+//!   `BOOTTIME_ONLY` enumeration, `netsh wfp show boottimepolicy` — is a read
+//!   through BFE, while the record is by definition what applies before BFE
+//!   starts, so only a reboot could tell "purged" from "provisioned and
+//!   invisible". The assumption is the repo owner's, and verifying it on real
+//!   hardware is tracked as **bindreams/hole#1043**.
+//!
+//!   `FWP_E_FILTER_NOT_FOUND` is NOT evidence and no assumption makes it one:
+//!   on any boot where no object is live the key answers empty whether or not
+//!   a record survives behind it — on a host that armed the switch years ago
+//!   and on one that never armed it. That asymmetry is the whole reason
+//!   [`release_all`] AND [`disengage_lockdown`] both return a [`Clearance`]
+//!   rather than a bare `Ok`: the ordinary uninstall sees exactly that answer.
 //! - **That a record could exist on this host AT ALL** — the twins'
 //!   `Persistent` sibling, the other half of the same rule
 //!   ([`KeyRole::BootTimeSibling`]). BFE re-adds it from its own store at every
@@ -160,11 +181,16 @@
 //! "disabled" it is the only thing that replaces a spent twin instead of
 //! letting [`ok_or_exists`] report `Ok` over it.
 //!
-//! Open, and not claimed: whether a by-key delete purges the record; whether
-//! the kernel ENFORCES a twin during the boot→BFE window at all (the twins
-//! name containers BFE itself provisions, and what the pre-BFE kernel does
-//! with those is undocumented); and whether a twin covers boots after the one
-//! following its install.
+//! ASSUMED rather than measured, and tracked as **bindreams/hole#1043**: that
+//! a by-key delete purges the boot-time record. [`KeyObservation::proves_empty`]
+//! is `true` for [`KeyOutcome::Removed`] on the strength of it, which is what
+//! lets an ordinary "arm, unblock, uninstall" go quiet. Nothing in a
+//! single-boot lane can check it.
+//!
+//! Open, and not claimed: whether the kernel ENFORCES a twin during the
+//! boot→BFE window at all (the twins name containers BFE itself provisions,
+//! and what the pre-BFE kernel does with those is undocumented); and whether a
+//! twin covers boots after the one following its install.
 //!
 //! **Disclosed, NOT closed by this change:** a fixed-GUID sweep reaches only a
 //! boot-time filter whose GUID the RUNNING binary knows. A stranded PERSISTENT
@@ -173,7 +199,12 @@
 //! and an older binary that never learned a newer one's GUID cannot find it.
 //! Bounding that needs a version-independent sweep (enumerate by
 //! [`PROVIDER_GUID`] rather than a fixed array), tracked as #1008 and
-//! deliberately not part of this change. **Per #1008's own ordering constraint
+//! deliberately not part of this change. The [`super::boottime_witness`] record
+//! does not narrow it either, and now narrows it slightly LESS: it is one
+//! machine-wide `armed` bool, not a per-GUID set, so a build that watches its
+//! OWN twins go writes the record off even where another build's GUID could
+//! still be stranded. That is the same class #1008 covers, and #1008's ordering
+//! constraint below is what holds it. **Per #1008's own ordering constraint
 //! this must not ship in a release a user could downgrade from until #1008
 //! lands** — also recorded in RELEASE-OPS.md's "Ship blockers", because a
 //! module doc is not where a release operator looks.
@@ -735,10 +766,25 @@ impl FilterLifetime {
     /// The `FWPM_FILTER0::flags` value for this lifetime, and the only place
     /// in this crate those bits are produced. Pure and total, so `add_filter`'s
     /// FFI mapping is unit-testable without FWPM.
+    ///
+    /// `FWPM_FILTER_FLAG_CLEAR_ACTION_RIGHT` rides on the BOOT_TIME arm and
+    /// only there, which makes a twin's block SOFT — overridable by a
+    /// higher-weight permit in another sublayer. It belongs to the LIFETIME
+    /// rather than to the filter because it follows from what else is in force
+    /// in that lifetime's window: the boot→BFE window carries the block and no
+    /// permit of ours at all (see the module doc's "Boot-time coverage"), so a
+    /// hard block there is unoverridable by anything, including whatever a host
+    /// needs to finish booting and reach the BFE start that would lift it. The
+    /// persistent half is the opposite case — it ships with our own permits
+    /// beside it and is the kill switch proper, so it stays HARD.
+    ///
+    /// Within our own sublayer this changes nothing either way: hardness
+    /// governs only CROSS-sublayer arbitration, and the two halves are never in
+    /// force at the same time in any case.
     fn filter_flags(self) -> FWPM_FILTER_FLAGS {
         FWPM_FILTER_FLAGS(match self.0 {
             KeyLifetime::Persistent => FWPM_FILTER_FLAG_PERSISTENT.0,
-            KeyLifetime::BootTime => FWPM_FILTER_FLAG_BOOTTIME.0,
+            KeyLifetime::BootTime => FWPM_FILTER_FLAG_BOOTTIME.0 | FWPM_FILTER_FLAG_CLEAR_ACTION_RIGHT.0,
         })
     }
 }
@@ -884,6 +930,29 @@ pub enum StaleKeyPolicy {
     Degrade,
 }
 
+impl StaleKeyPolicy {
+    /// Whether an engage under this policy REFUSES to proceed over a key it
+    /// could not clear, rather than keeping whatever the key already held.
+    ///
+    /// The whole rule, in one exhaustive match on the type, because every site
+    /// that asked it by comparison — `policy == StaleKeyPolicy::Fail` — would
+    /// silently group a future third variant with [`Self::Degrade`], the arm
+    /// that keeps a stale filter. That is CLAUDE.md's "per-variant policy lives
+    /// on the type", and it is enforced by `stale_key_policy_tests`.
+    ///
+    /// One question, asked at both ends of the same decision: the pre-delete's
+    /// verdict on a failed delete ([`pre_delete_verdict`]) and [`add_filter`]'s
+    /// choice between a strict add and [`ok_or_exists`]. They MUST agree — a
+    /// strict add under a degrading pre-delete would abort the engage anyway
+    /// and make the degrade a no-op — so they read one answer rather than two.
+    fn refuses_a_stale_key(self) -> bool {
+        match self {
+            StaleKeyPolicy::Fail => true,
+            StaleKeyPolicy::Degrade => false,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct CoverSpec {
     pub provider: GUID,
@@ -904,8 +973,8 @@ pub struct CoverSpec {
 
 /// Filter weight (0..=15) for the permits — higher than [`BLOCK_WEIGHT`] so
 /// loopback/server-IP permits win over block-all. Within our single sublayer
-/// WFP arbitrates by weight alone (no `CLEAR_ACTION_RIGHT`), so the higher
-/// weight is what makes the permit beat the block — as in wireguard-windows
+/// WFP arbitrates by weight alone (hardness is a cross-sublayer question), so
+/// the higher weight is what makes the permit beat the block — as in wireguard-windows
 /// (weight-ordered permits ~13-15 over a weight-0 block-all in one sublayer).
 pub const PERMIT_WEIGHT: u8 = 15;
 /// Filter weight for the block-all filters.
@@ -1040,10 +1109,10 @@ pub fn build_cover_spec(server_ip: IpAddr, resolver_ip: Option<IpAddr>) -> Cover
 /// (the accept side a loopback connect also authorizes — the flag is unreliable
 /// there, so the range is the only matcher). Block stays CONNECT-only — egress
 /// kill switch, not inbound. Permits at `PERMIT_WEIGHT`, block at `BLOCK_WEIGHT`;
-/// within the single sublayer the higher-weight permit wins (no
-/// `CLEAR_ACTION_RIGHT`). The block-all pair also gets a `Boottime` twin (see
-/// the module doc's "Boot-time coverage" section) — every permit stays
-/// `Persistent`-only. The twins' keys go in `pre_delete` so every engage
+/// within the single sublayer the higher-weight permit wins. The block-all pair
+/// also gets a `Boottime` twin (see the module doc's "Boot-time coverage"
+/// section — the twins are the only filters here whose block is SOFT) — every
+/// permit stays `Persistent`-only. The twins' keys go in `pre_delete` so every engage
 /// RE-ARMS them rather than short-circuiting on `FWP_E_ALREADY_EXISTS` — see
 /// [`lockdown_pre_delete_guids`]. Pure — no FFI.
 pub fn build_lockdown_spec(server_ip: IpAddr, tun_luid: u64, app_ids: &[std::path::PathBuf]) -> CoverSpec {
@@ -1316,17 +1385,15 @@ fn pre_delete_verdict(policy: StaleKeyPolicy, codes: &[(&'static str, u32)]) -> 
     let Some(e) = first_delete_failure(codes) else {
         return Ok(());
     };
-    match policy {
-        StaleKeyPolicy::Fail => Err(e),
-        StaleKeyPolicy::Degrade => {
-            tracing::warn!(
-                error = %e,
-                "fail-closed cover refresh could not clear a key; keeping the stale filter rather \
-                 than failing the engage, which would leave the host with no cover at all"
-            );
-            Ok(())
-        }
+    if policy.refuses_a_stale_key() {
+        return Err(e);
     }
+    tracing::warn!(
+        error = %e,
+        "fail-closed cover refresh could not clear a key; keeping the stale filter rather \
+         than failing the engage, which would leave the host with no cover at all"
+    );
+    Ok(())
 }
 
 #[allow(clippy::disallowed_methods)] // THIS is the sanctioned FWPM call site
@@ -1585,15 +1652,18 @@ unsafe fn add_filter(
         Action::Block => FWP_ACTION_BLOCK,
     };
     // Lifetime flag (PERSISTENT or BOOTTIME, see `FilterLifetime` and the
-    // module doc's "Boot-time coverage" section) — NO CLEAR_ACTION_RIGHT.
-    // Setting that flag makes a filter's action SOFT (cross-sublayer
-    // overridable); omitting it makes the action HARD, and hardness governs
-    // only cross-sublayer arbitration. A BLOCK with the flag omitted is thus
-    // a default-HARD block — and the old code set the flag on the permits
-    // (soft) but not the block (hard), so block-all vetoed every permit (the
-    // cover blocked everything). With the flag off everywhere, within-sublayer
-    // arbitration is pure weight: the weight-15 permits beat the weight-0
-    // block-all (the wireguard-windows recipe — see the module doc).
+    // module doc's "Boot-time coverage" section), plus CLEAR_ACTION_RIGHT on
+    // the boot-time arm and only there. Setting that flag makes a filter's
+    // action SOFT (cross-sublayer overridable); omitting it makes the action
+    // HARD, and hardness governs only cross-sublayer arbitration. A BLOCK with
+    // the flag omitted is thus a default-HARD block — and the old code set the
+    // flag on the permits (soft) but not the block (hard), so block-all vetoed
+    // every permit (the cover blocked everything). With the flag off across
+    // the persistent set, within-sublayer arbitration is pure weight: the
+    // weight-15 permits beat the weight-0 block-all (the wireguard-windows
+    // recipe — see the module doc). The twins are outside that argument: they
+    // are never in force while the persistent set is, and hardness does
+    // nothing within a sublayer anyway.
     // `FilterLifetime::filter_flags` is the ONLY producer of these bits in
     // the crate, and it cannot be reached without a `KeyLifetime` — see
     // `FilterLifetime`. Writing the bits here directly would install a filter
@@ -1832,13 +1902,13 @@ unsafe fn add_filter(
     // which covers the specs that exist, where this covers the ones that do
     // not yet.
     debug_assert!(
-        f.lifetime != FilterLifetime::BOOT_TIME || policy == StaleKeyPolicy::Fail,
+        f.lifetime != FilterLifetime::BOOT_TIME || policy.refuses_a_stale_key(),
         "boot-time filter {:?} submitted under {:?}: a duplicate add would be downgraded to Ok and \
          a twin spent by the boot it covered kept in place",
         f.guid,
         policy
     );
-    if f.requires_fresh_add() && policy == StaleKeyPolicy::Fail {
+    if f.requires_fresh_add() && policy.refuses_a_stale_key() {
         wfp_check(code, "FwpmFilterAdd0")
     } else {
         ok_or_exists(code, "FwpmFilterAdd0")

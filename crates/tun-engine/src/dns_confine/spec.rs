@@ -88,8 +88,10 @@ pub struct ConfineSpec {
 
 /// Weight for every `Permit` filter — higher than [`BLOCK_WEIGHT`] so a
 /// permit always outranks the block-all within this confinement's own
-/// sublayer (no `CLEAR_ACTION_RIGHT`, matching `failclosed/windows.rs`'s
-/// weight-only arbitration).
+/// sublayer (no `CLEAR_ACTION_RIGHT` on any filter here, matching
+/// `failclosed/windows.rs`'s PERSISTENT set — that file's boot-time twins do
+/// set it, and this module has no boot-time half at all: its session is
+/// dynamic, which WFP refuses a boot-time filter on).
 pub const PERMIT_WEIGHT: u8 = 15;
 /// Weight for every `Block` filter. `0`, matching
 /// `failclosed/windows.rs:245` — an unexplained number in a module whose
