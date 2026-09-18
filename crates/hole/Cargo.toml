@@ -58,7 +58,7 @@ tempfile = "3"
 base64 = "0.22"
 uuid = { version = "1", features = ["v4"] }
 contracts = "0.6"
-dirs = "6"
+dirs = "7"
 hyper = { version = "1", features = ["http1", "client"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 # Support-bundle redaction on collection, and the #572 cross-uid ownership
