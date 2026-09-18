@@ -18,7 +18,11 @@ import (
 )
 
 var (
+<<<<<<< HEAD
 	version  = "5.52.0"
+=======
+	version  = "5.53.0"
+>>>>>>> refs/subrepo/crates/ex-ray/third_party/v2ray-core/fetch
 	build    = "Custom"
 	codename = "V2Fly, a community-driven edition of V2Ray."
 	intro    = "A unified platform for anti-censorship."
