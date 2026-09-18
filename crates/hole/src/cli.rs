@@ -816,8 +816,16 @@ fn handle_bridge(action: BridgeAction) -> i32 {
                 1
             }
         },
+        // Same report `release-covers` prints, for the same reason: this is
+        // the last thing that will ever address the boot-time keys, because
+        // it writes the kill-switch intent off.
         BridgeAction::Unlock => match hole_bridge::cutover::unlock() {
-            Ok(()) => 0,
+            Ok(clearance) => {
+                if let Some(report) = hole_bridge::cutover::release_clearance_report(&clearance) {
+                    cli_log!(warn, "{report}");
+                }
+                0
+            }
             Err(e) => {
                 cli_log!(error, "unlock failed: {e}");
                 1

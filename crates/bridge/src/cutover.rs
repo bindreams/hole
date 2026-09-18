@@ -131,7 +131,14 @@ pub fn run_detached(_payload: &Path, _target_version: &str) -> std::io::Result<(
 /// exists to prevent. The in-app "Unblock Network" action is the live-bridge
 /// equivalent, so refusal names it as the alternative. The exclusion is
 /// structural, not a point-in-time probe: see [`unlock_with`].
-pub fn unlock() -> std::io::Result<()> {
+/// **`Ok` is qualified, and the caller must surface it.** The returned
+/// [`Clearance`] is what the disengage could not prove — on Windows, the two
+/// boot-time twins on any boot where no bridge engaged. This is the ONE
+/// disengage where that matters: the next statement writes the kill-switch
+/// intent off, so there is no next engage to re-arm or re-delete those keys
+/// and nothing will look at them again. `hole bridge unlock` prints
+/// [`release_clearance_report`] for exactly that reason.
+pub fn unlock() -> std::io::Result<Clearance> {
     let state_dir = service_state_dir();
     unlock_with(&state_dir, || {
         tun_engine::routing::failclosed::disengage_lockdown(&state_dir).map_err(std::io::Error::other)
@@ -155,7 +162,7 @@ pub fn unlock() -> std::io::Result<()> {
 /// (single-instance is separately enforced by the IPC socket bind, so no
 /// second real bridge is racing this token itself) rather than interleaving
 /// with it.
-fn unlock_with(state_dir: &Path, disengage: impl FnOnce() -> std::io::Result<()>) -> std::io::Result<()> {
+fn unlock_with(state_dir: &Path, disengage: impl FnOnce() -> std::io::Result<Clearance>) -> std::io::Result<Clearance> {
     let Some(_liveness) = crate::liveness::BridgeLiveness::try_acquire(state_dir, None)? else {
         return Err(std::io::Error::other(
             "a bridge instance is running; use the in-app \"Unblock Network\" action instead of `hole bridge unlock`",
@@ -163,14 +170,17 @@ fn unlock_with(state_dir: &Path, disengage: impl FnOnce() -> std::io::Result<()>
     };
     crate::target::apply(state_dir, None, |_| crate::target::Target::Off)
         .map_err(|e| std::io::Error::other(format!("could not record target off: {e}")))?;
-    disengage()?;
+    let clearance = disengage()?;
     // Same reason `handle_unblock` clears it: `resolve_startup_target` feeds
     // the candidate to `AlwaysConnect` over an `Off` target, so leaving it
     // would let the next boot reconnect to the server this escape just freed
     // the host from.
     crate::target::apply_startup_preference(state_dir, None, |pref| pref.candidate = None)
         .map_err(|e| std::io::Error::other(format!("could not clear the auto-connect candidate: {e}")))?;
-    tun_engine::routing::failclosed::lockdown_state::set_enabled(state_dir, false, None)
+    tun_engine::routing::failclosed::lockdown_state::set_enabled(state_dir, false, None)?;
+    // Handed back, never dropped. The intent is now off, so nothing after this
+    // will pre-delete a boot-time key or look at one again — see [`unlock`].
+    Ok(clearance)
 }
 
 /// The uninstaller's escape: clear EVERY fail-closed cover and record the
@@ -247,6 +257,34 @@ pub fn release_covers() -> std::io::Result<Clearance> {
 /// be on almost every uninstall — and crying leftover every time is how the
 /// one host where it is real gets ignored.
 ///
+/// So it reads [`Clearance::leftover_keys`], not [`Clearance::unproven_keys`].
+/// The twins go unproven on EVERY boot where no bridge engaged, which is what
+/// an ordinary uninstall looks like, so the unproven set alone would fire this
+/// message on essentially every Windows uninstall and carry no information at
+/// all. `leftover_keys` is the same set filtered by the two things that can
+/// still say a twin could be outstanding here — the standing cover's
+/// `PERSISTENT` siblings in this very sweep (`failclosed::KeyRole`) and the
+/// persisted `failclosed::boottime_witness` — reporting when EITHER speaks.
+///
+/// `leftover_keys` is a GATE on the whole set rather than a boot-time-only
+/// filter of it, and every key that reaches THIS message is nonetheless a
+/// boot-time twin. A `Persistent` key goes unproven under exactly one outcome,
+/// `failclosed::KeyOutcome::Failed`; that outcome is what `first_delete_failure`
+/// turns into a `SweepOutcome::failed`, so the clearance holding it reaches
+/// `unlock_with`/`release_covers_with` as `Err` and is dropped by their `?`
+/// before any of the three render sites runs. The message therefore states
+/// what its keys are instead of hedging
+/// (`an_unproven_release_calls_its_keys_boot_time_ones_because_that_is_all_it_can_name`)
+/// — a hedge here describes a state it is never printed in, in the one message
+/// an operator reads after `hole.exe` has been deleted.
+///
+/// The union is not belt-and-braces. The sibling alone is CONSUMED by the
+/// first sweep that removes it, and "turn the kill switch off, then uninstall"
+/// is an ordinary sequence that does exactly that; after it, every sweep reads
+/// the empty sibling set as "no cover was ever here" and this message never
+/// fires again. The record alone is lost by a wiped `state_dir`. Silence
+/// requires losing both.
+///
 /// The remedy it names has to be one that exists. `netsh wfp` is a
 /// **diagnostics-only** context — its verbs are `capture`, `dump`, `help`,
 /// `set` and `show`, with no `delete`
@@ -261,7 +299,8 @@ pub fn release_covers() -> std::io::Result<Clearance> {
 /// Removing a WFP filter takes an FWPM call, and `RemoveFiles` just deleted
 /// the only caller on the host. So the only honest remedy is to put one back.
 pub fn release_clearance_report(clearance: &Clearance) -> Option<String> {
-    if clearance.is_proven() {
+    let keys = clearance.leftover_keys();
+    if keys.is_empty() {
         return None;
     }
     Some(format!(
@@ -271,11 +310,11 @@ pub fn release_clearance_report(clearance: &Clearance) -> Option<String> {
          survives behind it. To check after this uninstall, run `netsh wfp show boottimepolicy` \
          elevated and look for these keys; if egress is blocked early in boot, that is where it \
          would show. `netsh wfp` cannot remove one — it has no delete verb, only capture/dump/\
-         set/show — and removing a WFP filter takes an FWPM call, which no binary left on this \
+         help/set/show — and removing a WFP filter takes an FWPM call, which no binary left on this \
          host can make. Reinstalling Hole and running `hole bridge release-covers` elevated puts \
          back the only tool that addresses these keys.",
-        clearance.unproven_keys().len(),
-        clearance.unproven_keys().join(", "),
+        keys.len(),
+        keys.join(", "),
     ))
 }
 
@@ -427,7 +466,17 @@ fn release_covers_with(
 
     crate::target::apply(state_dir, None, |_| crate::target::Target::Off)
         .map_err(|e| std::io::Error::other(format!("could not record target off: {e}")))?;
-    let clearance = release()?;
+    let mut clearance = release()?;
+    // The boot-time record is per-state-dir; the WFP filters it describes are
+    // machine-wide. An elevated non-`--service` bridge keeps its state in the
+    // interactive user's profile, so a twin IT armed is recorded where this
+    // SYSTEM-context call would never look. Fold in every peer already probed
+    // above — the same set, so a dir outside it is invisible to the record for
+    // exactly the reason it is invisible to the liveness probe, and
+    // `peer_state_dirs` discloses it once for both.
+    for peer in &probed {
+        clearance = clearance.corroborate(tun_engine::routing::failclosed::boottime_witness::load(peer));
+    }
 
     // Best-effort from here — see the fatality note on `release_covers`.
     if let Err(e) = crate::target::apply_startup_preference(state_dir, None, |pref| pref.candidate = None) {

@@ -928,7 +928,10 @@ egress set and blocking everything else; they differ in lifetime and which set
 they permit.
 
 Both are deliberately **persistent** WFP filters, surviving an update-cutover
-restart on purpose. The Windows DNS-egress confinement
+restart on purpose (Windows: the standing lockdown cover's block-all is
+ADDITIONALLY twinned by a boot-time filter, aimed at a window `PERSISTENT`
+alone cannot reach — see [Lockdown mode](#lockdown-mode) for what that is
+measured to do and what it is not). The Windows DNS-egress confinement
 ([`tun_engine::dns_confine`](crates/tun-engine/src/dns_confine.rs), see
 [DNS forwarder](#dns-forwarder)) is the opposite: a **dynamic**, process-scoped
 FWPM session that dies with the engine handle, including on an abnormal exit —
@@ -1052,15 +1055,21 @@ sweep only knows the first ten) leaves those two permits un-swept; they are
 so this is bounded and self-healing (a later upgrade's sweep cleans them up),
 not a leak of blocked traffic. Disclosed as a source comment on
 `FILTER_GUIDS` itself. Tracked separately:
-[#754](https://github.com/bindreams/hole/issues/754). **Windows only, also
-pre-existing:** the repair's release step deletes the held cover's filters by
-fixed GUID and discards the result; if a delete genuinely fails, the
-subsequent re-engage's add for that same GUID reports success
+[#754](https://github.com/bindreams/hole/issues/754). **Windows only, was
+pre-existing, now closed:** the repair's release step deletes the held cover's
+filters by fixed GUID and discards the result; if a delete genuinely failed,
+the subsequent re-engage's add for that same GUID reported success
 (`FWP_E_ALREADY_EXISTS` is treated as OK, by design, for the crash-recovery
-idempotency case) while the LIVE filter still carries the OLD value — a
-stale permit surviving, not a leaked block. Disclosed as a source comment on
-`ok_or_exists`. Tracked separately:
-[#761](https://github.com/bindreams/hole/issues/761).
+idempotency case) while the LIVE filter still carried the OLD value — a stale
+permit surviving, not a leaked block. The same shape reached the lockdown
+cover's App-ID permits across an update-cutover, where the stale value is the
+*pre-update* `hole.exe` path and the running binary is the one left blocked.
+Both engages now pre-delete every filter whose condition carries a
+runtime-discovered value (`Condition::carries_runtime_value` —
+`transient_pre_delete_guids`, `appid_pre_delete_guids`) inside their own
+transaction, and `add_filter` refuses a duplicate on such a filter rather than
+papering over it, so the case is removed rather than documented
+([#761](https://github.com/bindreams/hole/issues/761)).
 
 It is **name-agnostic** — it does *not* permit the TUN interface. The new
 bridge's start-time DNS-forwarder self-test runs over loopback to the SS client
@@ -1085,8 +1094,10 @@ milliseconds.
   load-bearing; it is kept at CONNECT only as belt-and-suspenders. The server IP
   is permitted on CONNECT, all else blocked on CONNECT (egress kill switch).
   **One sublayer, weight-based arbitration**: permits sit at weight 15, block-all
-  at weight 0, and the higher-weight permit wins within the sublayer. **No filter
-  sets `CLEAR_ACTION_RIGHT`** — that flag makes a filter's own action *soft*
+  at weight 0, and the higher-weight permit wins within the sublayer. **No
+  `PERSISTENT` filter sets `CLEAR_ACTION_RIGHT`** (the standing cover's boot-time
+  twins do, and only they — see "Windows, boot-time coverage" below) — that flag
+  makes a filter's own action *soft*
   (cross-sublayer overridable); omitting it makes the action *hard*, and hardness
   governs only cross-sublayer arbitration, never within one. A `FWP_ACTION_BLOCK`
   with the flag omitted is therefore a *default hard* block; setting the flag only
@@ -1176,6 +1187,425 @@ identified at runtime via `TunIdentity`, on macOS), the onward server
 connection, and (Windows) the plugin + bridge binaries by App-ID — so normal
 traffic flows while connected and the block holds across a bridge restart for
 free. When disabled, behavior is byte-identical to a Hole without it.
+
+**Windows, boot-time coverage ([#998](https://github.com/bindreams/hole/issues/998)).**
+A merely-`PERSISTENT` filter is re-added by the Base Filtering Engine (BFE)
+once it starts, not enforced before that — the kernel enforces only
+`FWPM_FILTER_FLAG_BOOTTIME` filters from boot until BFE takes over, so a
+`PERSISTENT`-only block-all left the host open on every reboot with the kill
+switch armed. The block-all half of the standing cover now additionally
+installs `BOOTTIME` twins (`LOCKDOWN_BOOTTIME_BLOCK_ALL_GUIDS`); the two flags
+are mutually exclusive on one filter object, so these are two more filters, not
+two more bits, and WFP documents the hand-off between them as atomic. Every
+permit, including loopback, stays `PERSISTENT`-only: a boot-time permit either
+carries a runtime-discovered value nothing can refresh pre-BFE, or has no
+hand-off to its narrower persistent counterpart — and the leak this closes is
+network egress, not loopback. So the boot→BFE window gets the block and nothing
+else: no loopback, TUN, server or App-ID permit, a total egress block rather
+than a scaled-down copy of the cover BFE later installs. Egress-only all the
+same — the twins sit on `ALE_AUTH_CONNECT_V4`/`_V6`, nothing at `RECV_ACCEPT`.
+The twins carry fixed GUIDs and are **pre-deleted at every engage**
+(`lockdown_pre_delete_guids`), not merely re-added: a boot-time filter is spent
+by the boot it covered, and under the reading where the spent object survives
+with its key occupied, an add would hit `FWP_E_ALREADY_EXISTS`, `ok_or_exists`
+would report success, and the kill switch would arm once and then silently
+stop. Deleting the key first is correct under both readings of what BFE does.
+
+The twin-pair shape and the blocks-only choice both follow shipped precedent:
+Mullvad and TinyWall each install a rule twice, `BOOTTIME` and `PERSISTENT`,
+under their own persistent containers. Of the two boot-time rule sets that
+could be read — Fort's and Mullvad's — every filter is a `BLOCK`; neither ships
+a boot-time *permit*. TinyWall is cited for the twin-pair shape only; its
+boot-time rule set was not read. Mullvad differs from Hole in when: its blocks go in as
+the daemon shuts down under a blocking policy and are swept by provider
+enumeration on the way back up, where Hole's go in at engage and stay while the
+kill switch is armed — a much wider window for a version skew to strand one.
+Two implementations ship without boot-time filters and belong in the same survey:
+`wireguard-windows` defines `cFWPM_FILTER_FLAG_BOOTTIME` and never uses it
+(`blocker.go` runs a fully dynamic session under a per-run random provider
+GUID), and OpenVPN's `wfp_block.c` sets `FWPM_SESSION_FLAG_DYNAMIC` under the
+comment "Add temporary filters which don't survive reboots or crashes".
+wireguard-windows is where this file's weight-arbitration recipe comes from, so
+it was read closely — grounds for trusting the survey did not simply miss a
+boot-time usage, not grounds for claiming its authors weighed boot-time and
+rejected it. Neither project ships an always-on kill switch meant to survive an
+arbitrary reboot, which is the requirement that makes `PERSISTENT`-only
+insufficient.
+
+**The twins are overridable, deliberately.** They are `Condition::Any` +
+`Action::Block` *with* `CLEAR_ACTION_RIGHT`, so the block is *soft* and a
+higher-weight permit in another sublayer can win. The flag rides on the
+boot-time arm of `FilterLifetime::filter_flags` and nowhere else, because it
+follows from what else is in force in that window: the boot→BFE window carries
+the block and no permit of ours at all, so a hard block there is unoverridable
+by *anything* — including whatever a host needs to finish booting and so to
+reach the BFE start that would take the block out of effect (PXE or iSCSI boot,
+a network-key volume unlock). Fort Firewall's boot-time blocks are soft for the
+same reason; Mullvad's are hard.
+
+The persistent half stays *hard*, and softening the twins does not touch its
+weight-ordering argument above: a boot-time filter is enforced only before BFE
+starts and the persistent set exists only after, so the two are never arbitrated
+against each other — and hardness governs cross-sublayer arbitration only, never
+the within-sublayer weight ordering that argument rests on.
+
+**Still not established:** the flag is *permission* to be overridden, not a
+guarantee anything will. Whether the pre-BFE kernel arbitrates boot-time filters
+across sublayers at all, and whether any early-boot path ships a filter that
+would win, has not been determined. A soft block narrows the hazard for a host
+whose boot needs egress; it does not close it. That WFP accepts and stores
+`BOOTTIME | CLEAR_ACTION_RIGHT` together rather than rejecting or dropping the
+flag is asserted on the real firewall by `boottime_privileged_tests`.
+
+**The override runs both ways — the disclosed price of that choice.** A flag
+cannot tell which connect it is relieving. The same higher-weight permit in
+another sublayer that lets a host finish booting lets an ordinary outbound flow
+leave it: on an armed host, between tcpip.sys start and BFE start, a flow the
+hard block vetoed now goes out unencrypted and outside the tunnel — the #998
+leak, in the window #998 exists to cover. The twins carry no permit of Hole's
+for it to outrank, and the candidate is not hypothetical in kind: Windows
+provisions a boot-time policy of its own, and what a boot-time policy holds is
+permits. The unknown above decides both directions at once, so the two hazards
+cannot be traded apart — whatever narrows the brick narrows the block by the
+same amount. The repo owner took an unbootable host as the worse outcome; a
+leak in that window is what it costs, and an operator arming the kill switch is
+entitled to see it stated here rather than infer it.
+
+The `PERSISTENT` half is untouched by this in both directions, and that is
+measurable rather than argued: a boot-time filter is absent from the default
+enumeration view while it is live, so the two halves are never in the same
+arbitration set (`boottime_global_net_state_filter_is_accepted_keeps_its_containers_and_is_deletable_by_key`).
+
+Two things that decide whether this is safe are undocumented by WFP, so they
+are **measured on the real firewall** by
+[`boottime_privileged_tests.rs`](crates/tun-engine/src/routing/failclosed/boottime_privileged_tests.rs)
+rather than argued, in the elevated `tun` lane, with no reboot. The dangerous
+one is deletion: the default enumeration view *excludes* boot-time filters, so
+a delete that could not see them would return `FWP_E_FILTER_NOT_FOUND` — which
+`first_delete_failure` whitelists — and `release_all` would report success over
+a still-blocked host. The probe filter is deliberately a *permit* on an RFC
+5737 documentation address, never a block, so the test cannot itself brick the
+machine it is ruling out bricking.
+
+**What that measurement returned**, for a boot-time filter added through the
+production `add_filter` under the covers' own persistent provider and sublayer:
+WFP accepted it; the stored record carries `FWPM_FILTER_FLAG_BOOTTIME` and not
+`FWPM_FILTER_FLAG_PERSISTENT`, our `providerKey` and our `subLayerKey`
+(`flags` read back as `0x2` on the host this was measured on; what the test
+*asserts* is the weaker and more portable claim that `FWPM_FILTER_FLAG_DISABLED`
+and `PERSISTENT` are both clear, since WFP may set flags of its own such as
+`INDEXED`); a by-key
+`FwpmFilterGetByKey0` of it returns `ERROR_SUCCESS`, so boot-time filters *are*
+visible to `lockdown_cover_presence` despite having no by-key equivalent of the
+enumeration opt-in; and `FwpmFilterDeleteByKey0` returned `ERROR_SUCCESS` (not
+`FWP_E_FILTER_NOT_FOUND`) after which the filter was gone from the boot-time
+view. A second test drives
+the real `engage_lockdown` twice in one boot and asserts, on WFP's own
+`filterId`, that the twins were genuinely re-created while the persistent
+block-all beside them was not.
+
+**Read the delete result at its scope.** That delete removed a *live* FWPM
+object in the same session that added it. The delete this design is actually
+exposed to is the one issued in a *later* boot, where no live object remains and
+`FwpmFilterDeleteByKey0` answers `FWP_E_FILTER_NOT_FOUND` — which
+`first_delete_failure` whitelists as benign. So the question the measurement is often
+cited as settling — does the delete purge the *record* — is still open, only a
+reboot can close it, and it is
+[#1043](https://github.com/bindreams/hole/issues/1043). That matters
+most at one call site: [#1009](https://github.com/bindreams/hole/issues/1009)
+made `release_covers` → `failclosed::release_all` the MSI's `Return="check"`
+uninstall gate. On a boot where the bridge never engaged, both twin keys answer
+not-found, and a bare `Ok` there would be
+[#1003](https://github.com/bindreams/hole/issues/1003) recreated for the pre-BFE
+window, with nothing left to clear it.
+
+The *claim* is closed even though the question is not: the twins' swept keys
+carry `KeyLifetime::BootTime`, so `KeyObservation::proves_empty` answers false
+for their not-found and `release_all` reports them **unproven** in its
+`Clearance`. The uninstall still proceeds — refusing it over a bounded
+boot-window block would trade that for a permanently unremovable product — but
+it proceeds without claiming a proof nobody made, and
+`cutover::release_clearance_report` names the keys while `hole.exe` still
+exists to name them. #1008's provider-enumeration sweep does not close the
+underlying question either — that also reads live objects.
+
+**What counts as evidence about a boot-time key**, stated once because three
+paths depend on it and they must not disagree. Such a key has two things behind
+it: the runtime FWPM object, live only between kernel start and BFE start (or
+inside the session that just added it), and the boot-time *policy record*,
+which is what serves the next boot and which nothing this crate can call reads.
+No read-back or return code speaks about the record directly, so the three
+questions below are answered separately — and the one answered by a return code
+is answered by an *assumption* about what that code implies, stated as one:
+
+- **Armed** — only a read of the boot-time enumeration view while the object is
+  live. A commit code says the transaction reached the object store and nothing
+  about the record behind it, so `engage_lockdown` reads the twins back through
+  `verify_boottime_twins` after `commit_and_record` and refuses the engage
+  when a view that *was* readable does not hold the twin, or holds one that is
+  not boot-time or is disabled. Without that read the shipped success claim was
+  wider than anything the code checked: the add returned zero, the caller marked
+  the cover adopted, and the GUI reported the switch armed, with no step in
+  between having looked at a twin. It reads the *view* rather than the key,
+  because `FwpmFilterGetByKey0` would answer for any object under that key
+  whatever its lifetime, and being classified boot-time is the only property a
+  twin exists for.
+
+- **Gone** — only `KeyOutcome::Removed`, a delete that removed a *live* object,
+  and only under an **assumption**: that `FwpmFilterDeleteByKey0` purges the
+  boot-time policy record along with the runtime object the privileged lane
+  measured it removing. Nothing here can check it: every read available is an
+  FWPM/BFE one (the delete's code, a `BOOTTIME_ONLY` enumeration,
+  `netsh wfp show boottimepolicy`), and the record is by definition what
+  applies *before* BFE starts at the next boot, so only a reboot could
+  separate "purged" from "still provisioned and invisible". It is the owner's;
+  verifying it on real hardware is tracked as
+  [#1043](https://github.com/bindreams/hole/issues/1043). If it is wrong, a host
+  that watched its twins go is silent over a stranded pre-BFE block-all.
+
+  `FWP_E_FILTER_NOT_FOUND` is **not** evidence and no assumption makes it one:
+  the key answers empty on every boot where no object is live — on a host that
+  armed the switch years ago and on one that never armed it at all. That
+  asymmetry is the whole reason `Clearance` exists, because an ordinary
+  uninstall sees exactly that answer. What #1043 buys is that the *other*
+  ordinary sequence — arm, unblock, uninstall, all watched — goes quiet instead
+  of warning about two keys the sweep itself deleted.
+
+- **Possible on this host at all** — the twins' `PERSISTENT` sibling, the other
+  half of the same rule (`KeyRole::BootTimeSibling`). BFE re-adds it from its
+  own store at every boot and a twin is never installed without it, so a sibling
+  removed at this boot says a standing cover is installed *here*, and every
+  sibling answering empty says none is.
+
+The rule is symmetric on purpose: absence of evidence is never evidence of
+absence, in either direction. An enumeration that could not be *read* does not
+fail an engage, for the same reason a not-found delete does not prove a key
+empty — and a spurious refusal there would block a kill-switch-armed user from
+connecting at all.
+
+The read-back takes two enumeration types (`FULLY_CONTAINED` and `OVERLAPPING`)
+only because WFP's reference does not pin down what `enumType` means for a
+condition-less template, so **only one of them may hold the twin**. Absence is
+therefore concluded only from a *complete* set of readable views
+(`failclosed::readback::verdict`, the platform-free rule behind
+`classify_twin_readback`): one view erroring makes the other's `Ok(vec![])`
+evidence of nothing, and since `install_lockdown` is fail-fatal, treating it as
+evidence refuses the connect outright. A positive find outranks an unreadable
+sibling view — the search runs first, so a twin held by the view that *was* read
+is verified whatever the other answered. `enum_boottime_on` discarding a
+partially-collected page set on a mid-enumeration error is the same rule, not a
+lapse from it: the discard turns an incomplete read into an error, which
+classifies unreadable and warns, where keeping the partial could only turn that
+warning into a failed engage.
+
+**A failed read-back leaves the committed cover standing, and on a first engage
+that is a behaviour change.** The transaction has already committed when
+`verify_boottime_twins` runs, so `engage_lockdown` returns `Err` with the
+filters installed and no guard over them. They are not orphaned — the next start
+reads `Live` off the fixed GUIDs, `decide_cover_recovery` yields `Adopt`, and
+`record_intent_on` repairs `bridge-lockdown.json`. But over a **clean host on a
+first engage** a pre-commit abort used to leave the host untouched, and this
+path instead leaves a full block-all in force while the start fails: the permits
+alongside it are loopback, the server IP, the TUN and Hole's own App-IDs, so
+every other application loses egress until the cover is released, and a retry
+that fails the same way repeats it. The escape is in-band (the tray's "Unblock
+Network", `hole bridge unlock`), so this is recoverable rather than a brick, and
+it is the chosen direction — claiming the switch is armed over a pre-BFE window
+nothing covers is a silent failure to protect rather than a visible failure to
+connect — but it is a disclosed residual, not the status quo.
+
+Two consequences follow on the paths that used to disagree with the engage.
+
+`disengage_lockdown` returns a `Clearance` too, not a bare `Ok`. It is the one
+disengage where the qualification cannot be deferred: `hole bridge unlock`
+writes the kill-switch intent **off** in the statement after it, so there is no
+next engage to re-arm or re-delete a boot-time key — the pre-delete runs only
+from `engage_lockdown`, which an off intent prevents. The older doc defended
+dropping the verdict with "the next engage re-arms the key", which is false on
+exactly the path that needed it. `hole bridge unlock` now prints the same
+`release_clearance_report` the uninstall does. It still does not *fail* the
+disengage: refusing the escape from a hard-blocked host over a bounded
+boot-window block is the trade `Clearance` exists to refuse.
+
+`release_clearance_report` reads `Clearance::leftover_keys`, not
+`unproven_keys`. The twins go unproven on *every* boot where no bridge engaged,
+which is what an ordinary uninstall looks like, so the unproven set alone fired
+that warning on essentially every Windows uninstall — naming two filter keys
+that were never installed, and training operators to ignore the one host where
+a leftover is real, which is the hazard the function's own doc names.
+`leftover_keys` is the same set filtered by whether a twin could be outstanding
+on this host at all. `is_proven` is unchanged and still false there — what a
+sweep *proved* and what is worth *reporting* are two questions, and only the
+second is filtered.
+
+**Two independent things answer that question, and either one reporting is
+enough.** The sibling evidence above is live but *consumable*: the sibling and
+its twin are guaranteed to be added together and never removed together, so the
+first sweep that removes the sibling while the twin answers not-found destroys
+the only live evidence there was. "Turn the kill switch off, then uninstall" is
+an ordinary sequence that does exactly that — as is the tray's Unblock item, and
+as is startup recovery's `Sweep` arm — and with the sibling alone, every sweep
+after it reads the empty sibling set as *no cover was ever here* and the warning
+never fires again, on the one host where it is real.
+
+So a sweep that can still see a sibling copies the finding into
+`bridge-boottime.json` (`failclosed::boottime_witness`) before deleting it, and
+a Windows `engage_lockdown` records it the instant `FwpmTransactionCommit0`
+returns — `commit_and_record`, one step, deliberately *not* after
+`verify_boottime_twins` — which also covers a host whose sibling is removed by
+something that is not a sweep at all. `leftover_keys` reports when **either**
+the sibling or the record says a twin is possible; it is silent only where both
+rule one out. The two fail in different directions, which is the point: a wiped
+`state_dir` still has its sibling, a consumed sibling still has its record.
+
+The ordering is load-bearing, not tidiness. The read-back reports on a cover
+that is already committed and in force, so writing the record after it meant a
+read-back failure left the twins standing with nothing recorded — and that is
+exactly the class no sweep can rescue, since no sweep ever saw the sibling to
+copy ([#1010](https://github.com/bindreams/hole/issues/1010) F3).
+
+**Exactly one observation clears the record**, and it is the one *Gone* above
+names: a sweep that watched every boot-time key it touched being removed
+(`WitnessUpdate::Disarm`). It does not consult the sibling — a watched removal
+is evidence about the twin itself, where the sibling only ever spoke about the
+host — and it writes nothing over an `Unset` record, which would litter every
+host that never armed a twin. Everything else only ever arms: an engage, or an
+unproven twin beside a live-or-unreadable sibling. An *empty* sibling set never
+arms (that would manufacture a report out of a host that never armed anything),
+an empty answer from a twin never disarms (that reading is #1003 itself), and a
+sweep carrying no boot-time key says nothing about the record at all.
+
+A sweep that *failed* still writes what it saw, which is the other half of
+[#1010](https://github.com/bindreams/hole/issues/1010) F1. Both Windows sweeps
+issue every delete before inspecting any code, so `Err` arrives *after* the
+sibling's own delete succeeded: the sibling is gone from the host and its
+`Removed` is sitting in the observation set. Returning early on the failure
+threw that away, and one act then consumed both evidence sources. The sweep
+hands back a `SweepOutcome` — clearance *and* failure — rather than a `Result`
+that can only carry one, and `sweep_with_witness` applies the record before
+surfacing the error. The one failure that genuinely observed nothing is
+`FwpmEngineOpen0` refusing: no delete was issued, so it folds the *empty*
+observation set and the record keeps what it held.
+
+Disclosed residuals. **A host whose twins went without a sweep watching keeps
+reporting**: the record stays `Armed`, the sibling is gone, and every later
+`bridge release-covers` on that `state_dir` names the two twin keys for the life
+of the dir. Two causes. One is outside Hole entirely — an external FWPM delete,
+a firewall reset, an image restore — and is the case `record_armed`-at-engage
+exists for, since no sweep ever held the evidence to copy. The other is Hole's
+own: the Windows guard's `Drop` (`Cover`'s `Lockdown` arm) deletes the whole
+`swept_lockdown_keys` list, twins included, and is the one twin-removing path
+that does not run through `sweep_with_witness` — it carries no `state_dir`. It
+fires when an engage commits and a *later* fatal phase of the same start fails,
+unwinding `ProxyManager`'s locally-owned guard; an ordinary disconnect releases
+through `Routing::release_all_covers` first and then drops an already-swept
+cover, so it is unaffected. Both are over-reports — an over-report costs an
+operator a paragraph, where the silence it replaces costs #1003's unrecoverable
+host — and both are bounded to hosts that ever armed a twin; one that never did
+has no record and no live sibling and stays silent. The record is
+per-`state_dir` while the WFP filters it
+describes are machine-wide, so the uninstall gate folds in every peer dir it
+already locks against a live bridge (`cutover::release_covers_with`); a bridge
+given an explicit `--state-dir` outside that set is invisible to the record for
+the same reason it is invisible to the liveness probe. A write that *fails* (an
+unwritable `state_dir`) loses the witness with nothing to re-derive it from — it
+is warned, never propagated, because refusing the release over bookkeeping trades
+a bounded early-boot block for a permanently unremovable product. And losing
+both sources at once — a wiped state dir on a host whose sibling an earlier
+sweep already removed — is still silent.
+
+**Its limit, which must travel with the result.** The probe's enumeration
+template names *no provider* — deliberately, since filtering by ours would make
+"the record dropped its provider" and "there is no record" the same empty
+answer. So what is proven is that the stored record *carries* our `providerKey`,
+**not** that a `BOOTTIME_ONLY` template filtered *by* `providerKey` returns it.
+Those are one step apart and
+[#1008](https://github.com/bindreams/hole/issues/1008) needs the second. The
+result rules out the outcome that would have made #1008 impossible; it does not
+demonstrate #1008's mechanism.
+
+**Not settled by any test, and not claimed.** Everything above holds *within a
+single boot* — that is the whole reach of the elevated lane, which does not
+reboot, and there is no reboot-capable elevated lane to add the case to. Green
+CI on this change is not coverage of any of: whether the kernel enforces a twin
+during the boot→BFE window (the twins name a provider and sublayer that BFE
+itself provisions, so what the pre-BFE kernel does with them is not merely
+unmeasured but undocumented — Fort's use of the *default sublayer* for its
+boot-time filters only, against its own sublayer for its persistent ones, is
+consistent with treating that as a hazard; its provider-less-ness is not
+evidence either way, since `FORT_PROV_INIT_FILTER_ARGS` has no `providerKey`
+field and *no* Fort filter names a provider); whether a by-key delete purges the
+underlying boot-time record rather than the runtime copy — **assumed** rather
+than measured, and tracked as
+[#1043](https://github.com/bindreams/hole/issues/1043); and whether a twin
+covers boots after the one following its install. Microsoft's own pages disagree
+on the underlying mechanic — `FwpmFilterAdd0`'s Remarks and "Object Management"
+say boot-time filters are "removed" once BFE finishes initializing; "Basic
+Operation of WFP" says twice that they are "disabled" — and, more to the point,
+**none of them addresses re-provisioning at later boots at all**. That is
+silence, not contradiction, and it stays recorded as silence rather than resolved
+by picking the convenient reading. What it *does* settle is a constraint: every
+path must be correct under both readings, which is why the twins are pre-deleted
+rather than re-added.
+
+`FWPM_FILTER_FLAG_DISABLED` does not adjudicate it, despite the name. Microsoft
+defines that bit as a *provider* property — set when BFE starts if the provider
+has no associated Windows service name or its service is not auto-start — and
+says it cannot be set when adding a filter. The privileged tests read it on both lifetimes, but only as a check that WFP
+honours its own add-time rule: both reads are taken on filters the test process
+added seconds earlier, so BFE has not started since they existed and the bit
+cannot be set on them. **It is not evidence that Hole's provider survives a BFE
+start.** That question is open and separate: `add_provider` passes no
+`serviceName`, which is the first condition Microsoft names for a provider whose
+filters BFE disables at startup — and if it applies, the `PERSISTENT` half of the
+kill switch comes back disabled every boot. Settling it needs
+`FwpmProviderGetByKey0` against a provider that outlived a reboot, which no
+single-boot lane can produce.
+
+A stranded boot-time leftover has no self-healing path the way a stranded
+persistent one does: BFE re-adds a persistent leftover at every start whatever
+build is running, so a later GUID-aware build can still reach it by key, while
+nothing any build runs re-adds a boot-time one — an older binary that never
+learned its GUID cannot find it. How much that matters rides on the same
+unanswered re-provisioning question, and it cuts both ways: if a record is
+re-provisioned every boot, the twins work every boot *and* a stranded one blocks
+every boot; if it is spent after one, the hazard mostly evaporates and so does
+most of the protection. Hole assumes the worse branch for safety and claims the
+weaker one for coverage. Bounding the hazard is
+[#1008](https://github.com/bindreams/hole/issues/1008).
+
+**Size that worst case correctly.** Both Microsoft readings agree the filter
+stops applying once BFE starts, so a stranded twin blocks egress from tcpip.sys
+until BFE and then stops — seconds per boot. #998 and #1008 both describe it as
+"a permanent block-all with no way to remove it"; that is the `PERSISTENT`
+failure mode, not this one, and overstates the boot-time hazard by the length of
+a whole session.
+
+That recalibration is **conditional on the unanalysed hazard above** and must
+travel with it: it holds for a host whose boot does not itself need egress. On a
+PXE- or iSCSI-booted machine, or one unlocking a volume against a network key
+server, a hard total-egress block in that window could stop the boot from
+reaching BFE — and a boot that never reaches BFE never reaches the thing that
+lifts the block, which *is* the bricked machine this paragraph otherwise rules
+out. "Boot-window outage" for an ordinary workstation; unestablished, and
+possibly worse, for a network-booted one. The genuinely
+unrecoverable case is narrower: **BFE failing to start**, where `FwpmEngineOpen0`
+fails and `release_all` and `bridge unlock` both return `Err` having issued
+nothing.
+
+Out-of-band recovery, at the confidence it deserves: there is no in-box one. `netsh wfp` is a
+**diagnostics-only** context — its verbs are `capture`, `dump`, `help`, `set` (capture options
+only) and `show` ([netsh
+wfp](https://learn.microsoft.com/windows-server/administration/windows-commands/netsh-wfp)), none
+of which takes a filter key — so the usual "recover with `netsh wfp`" advice does not apply to any
+WFP filter. There is no `netsh wfp reset`: `reset` belongs to other contexts (`netsh advfirewall reset`, `netsh int ip reset`) and resets firewall/TCP-IP policy, not WFP's filter store. What
+`netsh wfp` *can* do here is `show boottimepolicy`, the OS's own view of the boot-time policy
+store; `show filters` lists what is active *now*, which excludes a boot-time filter once BFE has
+started — i.e. at every moment an operator reads it. Seeing is not removing: the only removal API
+is FWPM. The one other hatch worth recording, and not worth offering a user, is removing
+`HKLM\SYSTEM\CurrentControlSet\Services\BFE\Parameters\Policy\BootTime`, where boot-time
+filter blobs are reported to live — **not Microsoft-documented at all** (third-party reverse
+engineering) and untested here.
 
 It contrasts with the [transient cutover cover](#transient-cutover-cover) on
 three axes:
@@ -1442,33 +1872,76 @@ It deliberately does not assert a leftover is *present* — an unproven key is
 equally consistent with never having been installed, which is what it will be
 on almost every uninstall.
 
-Today every key Hole sweeps is `Persistent`, so the unproven set is empty and
-the report never fires (`a_sweep_of_todays_keys_proves_every_one_of_them_empty`
-pins that). The ordering is on purpose: the gate lands **before** the
-boot-time filters of #998/#1010 do, so they cannot arrive as a silent false
-`Ok`. `a_boot_time_flag_cannot_be_introduced_without_classifying_its_key` is
-the tripwire — a source-level check, because the fact it guards spans a runtime
-`FilterSpec` and a static sweep array and no type holds both. It reads every
-production source in tun-engine off disk, symlinks followed (`rustc` resolves a
-`mod` through one, so a symlinked source ships), rather than one hardcoded file:
-an add landing in a new submodule — or at the crate's other sanctioned FWPM
-site, `dns_confine/windows.rs` — cannot slip past both halves. The `*_tests.rs`
-siblings are excluded, or the scan would read an install out of test code. The
-classification half skips exactly one file, the one defining the `proves_empty`
-fold and so naming `BootTime` by construction; that exclusion is anchored to
-where `fn proves_empty` actually is, so relocating the fold fails the guard
-instead of turning its own mention into a classification and letting an
-unclassified install pass in silence.
+#998/#1010's boot-time twins are the first and only keys Hole sweeps that are
+not `Persistent`, and the gate landed **before** them on purpose, so they could
+not arrive as a silent false `Ok`. On a not-found sweep the unproven set is
+exactly those two keys and nothing else
+(`a_not_found_sweep_proves_every_key_but_the_boot_time_twins`); on a sweep that
+*watched them go* nothing is left unproven at all
+(`a_sweep_that_watched_the_twins_go_proves_the_whole_list_empty`), under #1043's
+purge assumption — see *Gone* above. `is_proven` is therefore false on every
+Windows sweep run on a boot where no bridge engaged, which is the ordinary
+uninstall and why the operator-facing report reads `leftover_keys` and not the
+proof record.
 
-What it matches is identifiers in **lexed** code (`proc-macro2`), not
-substrings: comments of every shape and string literals are gone before the
-scan, so prose cannot satisfy it, and an alias (`use ... FWPM_FILTER_FLAG_BOOTTIME as BOOT_FLAG`) cannot hide from it — the import names the symbol in full and the
-install half spans every production source. The disclosed residual is a flag
-that names no symbol at all: `FWPM_FILTER_FLAGS(0x4)` written as raw bits
-installs a boot-time filter nothing here can see. Closing that needs a
-constructor that cannot hand out the bits without a `KeyLifetime`, which is
-#1010's to land — introducing it now would put both symbols into production
-code and leave this guard permanently satisfied.
+`leftover_keys` is the unproven set *gated* on whether a twin could be
+outstanding here, not a boot-time-only subset of it: it carries every key the
+sweep could not settle, including a `Persistent` one whose delete was refused,
+so a sweep that fails over one App-ID permit hands back both the failure and
+the name of the filter it could not delete
+(`a_disengage_that_failed_still_carries_the_sibling_it_already_removed`).
+
+That set is wider than anything an operator reads. A `Persistent` key goes
+unproven under exactly one outcome — a delete that `Failed` — and that same
+outcome makes the sweep `Err`, which every caller drops the clearance on. So
+`release_clearance_report` renders only clearances whose every key is a
+boot-time twin, and says so outright rather than hedging
+(`an_unproven_release_calls_its_keys_boot_time_ones_because_that_is_all_it_can_name`).
+
+**The mis-tag is now unrepresentable, not merely detectable.** `FilterLifetime`
+is a newtype over `KeyLifetime` with a private field: `filter_flags` — the
+crate's only producer of `FWPM_FILTER0::flags` — reads the very variant
+`key_lifetime` hands a sweep, so the flag and the classification are one value.
+`SweptKey` carries a `FilterLifetime` too, and the twins' key, layer, label and
+lifetime all come out of one `LOCKDOWN_BOOTTIME_TWINS` entry that both
+`build_lockdown_spec` and `swept_lockdown_keys` read. Installing a boot-time
+filter whose key a sweep calls `Persistent` is not a mistake that can be
+written. `every_lockdown_filter_is_swept_under_the_lifetime_it_is_installed_with`
+asserts it for every filter, including the App-ID ones whose two lists are still
+built independently.
+
+That is what retired the tripwire's original form.
+`a_boot_time_flag_cannot_be_introduced_without_classifying_its_key` asserted
+that the crate's sources install boot-time filters *iff* they classify
+boot-time keys. Once the coupling landed, both halves became permanently true
+— the equality holds no matter what a later change does, so it could no longer
+fail in the direction it existed for. A guard that still reads like evidence
+and cannot fail is worse than none, so the equality is gone and the scan is
+re-pointed at the property the type *cannot* enforce: that the type is the only
+way in. `the_boot_time_flag_is_named_only_where_a_key_lifetime_produces_it`
+asserts `FWPM_FILTER_FLAG_BOOTTIME` is named by exactly one production source
+— the one defining `fn filter_flags`, found by that definition rather than by a
+path, so moving the mapping re-anchors the guard instead of widening it.
+
+`the_raw_flag_bits_are_named_only_where_they_cannot_reach_the_boot_window`
+closes what the old form disclosed as a residual: `FWPM_FILTER_FLAGS(0x4)`
+written as raw bits names no flag symbol. `FWPM_FILTER_FLAGS` may be named only
+by the mapping's own source, plus any source opening its engine
+`FWPM_SESSION_FLAG_DYNAMIC` — WFP refuses a boot-time filter on a
+dynamic-session object, so bits written there cannot reach the boot window, and
+anchoring the exemption on the session flag means `dns_confine/windows.rs`
+stops being exempt the moment it stops being dynamic. Clippy cannot cover this:
+`disallowed_types` fires on a type in a signature but **not** on a bare
+tuple-struct construction expression (measured against clippy, not assumed).
+
+Both scans read every production source in tun-engine off disk, symlinks
+followed (`rustc` resolves a `mod` through one, so a symlinked source ships),
+rather than one hardcoded file — a boot-time flag landing in a new submodule, or
+at the crate's other sanctioned FWPM site, cannot slip past. The `*_tests.rs`
+siblings are excluded, or the scan would read an install out of test code. What
+they match is identifiers in **lexed** code (`proc-macro2`), not substrings:
+comments of every shape and string literals are gone before the scan, so prose
+cannot satisfy them, and an alias (`use ... FWPM_FILTER_FLAG_BOOTTIME as BOOT_FLAG`) cannot hide from them — the import names the symbol in full.
 
 The in-process escapes (`disengage_lockdown`, `ProxyManager::turn_lockdown_off`,
 the tray's Unblock) share the same boot-time blind spot and deliberately do
@@ -1476,11 +1949,15 @@ the tray's Unblock) share the same boot-time blind spot and deliberately do
 key, and `hole bridge unlock` stays reachable. `Routing::release_all_covers` is
 the one site sanctioned to drop the `Clearance`, and says so.
 
-Not established by any of this, and not claimed: whether a by-key delete purges
-the underlying boot-time policy record, and whether such a record is
-re-provisioned at later boots at all. Both need a reboot-capable elevated lane
-that does not exist (see #1010). The design holds under either answer rather
-than picking one.
+Not established by any of this: whether a by-key delete purges the underlying
+boot-time policy record, and whether such a record is re-provisioned at later
+boots at all. Both need a reboot-capable elevated lane that does not exist.
+The design no longer holds under either answer for the first of them — the repo
+owner has taken the purge as an **assumption** (`KeyObservation::proves_empty`
+is `true` for a boot-time `Removed`), and verifying it on real hardware is
+[#1043](https://github.com/bindreams/hole/issues/1043). The second stays
+unanswered and every path is still correct under both of its readings, which is
+why the twins are pre-deleted rather than re-added.
 
 **The release deletes no file, anywhere** — not a peer tree, and not the
 service's own state dir. Its records are not the release's to take:
@@ -1555,9 +2032,12 @@ Disclosed residuals:
    `Unreadable` intent, never inferred.
 
    `Live` means **any residue**, not the whole cover: the Windows sweeps loop
-   delete-by-key with every return code discarded over persistent filters, so
-   a sweep interrupted mid-loop survives a reboot as a partial cover that a
-   single-GUID probe would call `Absent` forever.
+   delete-by-key with every return code discarded, over the persistent filters
+   and — for lockdown — the boot-time twins in the same array, so a sweep
+   interrupted mid-loop leaves a partial cover that a single-GUID probe would
+   call `Absent` forever. The persistent half of such a residue certainly
+   survives a reboot; what the boot-time half does is the open question in
+   [Lockdown mode](#lockdown-mode).
 
    `Adopt` never disengages the cover, on either platform. The server-permit
    volatile-refresh it used to perform moved into `engage_lockdown`, which
