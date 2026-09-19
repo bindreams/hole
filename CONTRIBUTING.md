@@ -1111,10 +1111,31 @@ milliseconds.
   session would auto-delete the filters when the engaging process exits, reopening
   the leak mid-gap. Recovery deletes the fixed compiled-in GUIDs (idempotent), so
   no state file is needed. The FWPM FFIs are clippy-disallowed outside this module.
+
 - **macOS** ([`routing/failclosed/macos.rs`](crates/tun-engine/src/routing/failclosed/macos.rs)):
-  `pfctl -E` (refcounted) + a self-contained ruleset loaded over stdin (`pfctl -Fa -f -`). Disengage restores `/etc/pf.conf` and drops the refcount (`pfctl -X <token>`). The token is persisted to `bridge-failclosed.json` *before* the
-  blocking ruleset loads, so recovery can `-X` it cleanly. Caveat: restore reloads
-  the on-disk `/etc/pf.conf`, not a snapshot of a live ruleset (matches wg-quick).
+  `pfctl -E` (refcounted) + a self-contained ruleset loaded over stdin
+  (`pfctl -f -`, absolute `/sbin/pfctl` — `PFCTL`'s own doc has the hardening
+  caveat and the 28 other equally exposed root spawns it does not close).
+  Disengage restores `/etc/pf.conf` and drops the refcount (`pfctl -X <token>`);
+  the token is persisted to `bridge-failclosed.json` *before* the blocking
+  ruleset loads (persist-before-mutate), and a failed persist unwinds the `-E`
+  before propagating, mirroring `engage_lockdown`'s `FreshEnable`/`Reenable`
+  arms.
+  **That module's doc is the single source for the pf argument itself** — why
+  there is no `-Fa`, why loopback is exempted twice over, why every `pass` is
+  `no state`, why pf is enabled before the load, and which cover purges pf
+  state — each claim naming the const or function that owns it and the test
+  that holds it. Deliberately not restated here.
+  Proven at the kernel by `macos_transition_tests.rs` (cover transition, state
+  purge, loopback across a load — the last with its own positive control) and
+  `live_tun_permit_privileged_tests.rs` (a non-`lo0` permit carrying a
+  mid-stream segment); the transition test prints its own measured sensitivity,
+  which `success-output` in `.config/nextest.toml` is what preserves on a PASS.
+  Disclosed, not fixed here: a *failed* re-engage during a transition still
+  reloads `/etc/pf.conf` over a still-good prior cover (bindreams/hole#1004 — it
+  warns where it fires), two privileged test files' own bare `pfctl` calls
+  (bindreams/hole#1005), and the lockdown half of the state-purge question
+  (bindreams/hole#1015, sequenced behind bindreams/hole#1002).
 
 Each platform splits a pure, unit-tested rule/spec builder (transient:
 `build_cover_spec` / `build_pf_ruleset`; lockdown: `build_lockdown_spec` /

@@ -31,9 +31,17 @@ pub struct FailClosedState {
     /// Opaque enable token returned by `pfctl -E`, replayed to `pfctl -X` on
     /// recovery. Stored as a string — it is an opaque handle, not arithmetic.
     pub pf_token: String,
-    /// Whether pf reported `Status: Enabled` before we engaged. Diagnostic;
-    /// recovery restores `/etc/pf.conf` and drops our refcount regardless.
-    pub pf_was_enabled: bool,
+    /// Whether pf reported `Status: Enabled` before we engaged, or `None` if
+    /// the read failed and it was never established. Diagnostic only — its one
+    /// reader is a log field in `recover_cover`, and recovery restores
+    /// `/etc/pf.conf` and drops our refcount regardless. Tri-state rather than
+    /// `bool` so a failed read records the unknown honestly instead of
+    /// asserting a value nothing measured; the engage does not fail on it (see
+    /// `macos::engage_with`'s step 1).
+    ///
+    /// Reads an older file written as `true`/`false` unchanged, so
+    /// [`SCHEMA_VERSION`] is not bumped.
+    pub pf_was_enabled: Option<bool>,
 }
 
 fn state_file(state_dir: &Path) -> PathBuf {
@@ -69,7 +77,8 @@ pub fn load_presence(state_dir: &Path) -> super::StateFile<FailClosedState> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return StateFile::Absent,
         Err(e) => {
             tracing::warn!(error = %e, path = %path.display(), "failclosed-state read failed");
-            return StateFile::Unusable;
+            // No bytes, so nothing to salvage a token from.
+            return StateFile::Unusable { pf_token: None };
         }
     };
     match serde_json::from_slice::<FailClosedState>(&bytes) {
@@ -78,13 +87,13 @@ pub fn load_presence(state_dir: &Path) -> super::StateFile<FailClosedState> {
             tracing::warn!(
                 got = other.version,
                 want = SCHEMA_VERSION,
-                "failclosed-state schema mismatch, discarding"
+                "failclosed-state schema mismatch, discarding the record but salvaging its pf token"
             );
-            StateFile::Unusable
+            StateFile::unusable(&bytes)
         }
         Err(e) => {
             tracing::warn!(error = %e, path = %path.display(), "failclosed-state parse failed");
-            StateFile::Unusable
+            StateFile::unusable(&bytes)
         }
     }
 }
@@ -96,7 +105,7 @@ pub fn load_presence(state_dir: &Path) -> super::StateFile<FailClosedState> {
 pub fn load(state_dir: &Path) -> Option<FailClosedState> {
     match load_presence(state_dir) {
         super::StateFile::Present(s) => Some(s),
-        super::StateFile::Absent | super::StateFile::Unusable => None,
+        super::StateFile::Absent | super::StateFile::Unusable { .. } => None,
     }
 }
 
