@@ -382,7 +382,7 @@ pub fn install_bridge(repair_user_data_dir: Option<&Path>) -> Result<(), Box<dyn
     // Idempotent: if already installed, stop and uninstall first
     if hole_bridge::platform::os::is_installed() {
         cli_log!(info, "bridge already installed, reinstalling...");
-        let _ = hole_bridge::platform::os::stop();
+        let _ = hole_bridge::platform::os::ensure_stopped();
         let _ = hole_bridge::platform::os::uninstall();
     }
 
@@ -398,22 +398,119 @@ pub fn install_bridge(repair_user_data_dir: Option<&Path>) -> Result<(), Box<dyn
 }
 
 /// Run `bridge uninstall`.
-pub fn uninstall_bridge() -> Result<(), Box<dyn std::error::Error>> {
-    if !hole_bridge::platform::os::is_installed() {
-        cli_log!(warn, "bridge is not installed");
-        return Ok(());
+///
+/// `keep_covers` leaves every fail-closed cover engaged and the target
+/// untouched — see [`uninstall_bridge_with`] for who needs that.
+pub fn uninstall_bridge(keep_covers: bool) -> Result<(), Box<dyn std::error::Error>> {
+    uninstall_bridge_with(
+        keep_covers,
+        // Statement form, not `Ok(..?)`: the platforms return different error
+        // types (macOS `io::Error`, Windows `Box<dyn Error>`), so on Windows
+        // the `?` inside an `Ok` would convert nothing and trip
+        // `clippy::needless_question_mark`.
+        || {
+            hole_bridge::platform::os::ensure_stopped()?;
+            Ok(())
+        },
+        hole_bridge::platform::os::is_installed,
+        || {
+            hole_bridge::platform::os::uninstall()?;
+
+            // Cosmetic leftovers, not a block: neither can strand the host.
+            let _ = std::fs::remove_file(hole_common::protocol::default_bridge_socket_path());
+            let _ = hole_bridge::group::delete_group();
+
+            cli_log!(info, "bridge uninstalled");
+            Ok(())
+        },
+        // `bridge uninstall` reaches the same release the MSI's own
+        // `release-covers` action does, so it must tell the same story about
+        // it — a clearance reported in one path and dropped in the other is
+        // how the two drift.
+        || {
+            let clearance = hole_bridge::cutover::release_covers()?;
+            if let Some(report) = hole_bridge::cutover::release_clearance_report(&clearance) {
+                cli_log!(warn, "{report}");
+            }
+            Ok(())
+        },
+    )
+}
+
+/// `uninstall_bridge`'s ordering, with the four effects injected so tests can
+/// drive it without touching SCM/launchd or the host firewall.
+///
+/// **Stop, deregister, release — and the stop is gated on nothing.** Whether a
+/// bridge is running and whether a registration record still names it are
+/// independent facts; the fail-closed covers are held by the live process, not
+/// by the record. Gating the stop on `is_installed` made the two look like one,
+/// and that is what turned an uninstall into a dead end: a `DeleteService`
+/// against a live service marks the entry for deletion, `OpenService` then
+/// answers `ERROR_SERVICE_MARKED_FOR_DELETE`, `is_installed` goes false, and
+/// every retry skips the teardown that would have stopped the bridge — whose
+/// liveness lock then refuses the release forever. macOS reaches the same place
+/// through a plist deleted over a still-loaded job.
+///
+/// **Deregistration requires a confirmed stop.** The registration is the only
+/// handle a later attempt has, so a stop that could not be confirmed leaves it
+/// alone: the uninstall fails, and the next one still has something to work
+/// with. The platform `uninstall()`s enforce the same rule at their own level.
+///
+/// **The release is unconditional** — never gated on `is_installed`, never
+/// skipped because an earlier step failed. Cover existence is independent of
+/// service registration: the Windows filters are keyed on compile-time GUIDs
+/// and are machine-wide, so a lost registration (a failed install, `sc delete`,
+/// an aborted prior uninstall) must not turn the release into a no-op over a
+/// live block. It is also the one failure worth being loud about — the MSI runs
+/// it `Return="check"` so a failed release aborts before `RemoveFiles` deletes
+/// the only binary that could remove a persistent WFP filter
+/// (bindreams/hole#1003). Releasing against a bridge this run failed to stop is
+/// safe by construction: `release_covers` holds that bridge's liveness lock and
+/// refuses rather than desyncing its posture.
+///
+/// **Every failure surfaces.** The steps do not short-circuit each other, and
+/// the report names all of them — an early `?` on the release would have
+/// swallowed the stop or deregister error that explains why it refused.
+///
+/// `keep_covers` skips the release entirely. Its one caller is the MSI, whose
+/// major-upgrade path (`RemoveExistingProducts`) must tear the old service down
+/// so its image can be replaced WITHOUT disarming the kill switch: the standing
+/// cover is what holds the update-cutover gap, and the new bridge re-adopts it.
+fn uninstall_bridge_with(
+    keep_covers: bool,
+    ensure_stopped: impl FnOnce() -> Result<(), Box<dyn std::error::Error>>,
+    is_installed: impl FnOnce() -> bool,
+    deregister: impl FnOnce() -> Result<(), Box<dyn std::error::Error>>,
+    release: impl FnOnce() -> Result<(), Box<dyn std::error::Error>>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut failures: Vec<String> = Vec::new();
+
+    let stopped = ensure_stopped();
+    if let Err(e) = &stopped {
+        failures.push(format!("could not stop the bridge: {e}"));
     }
 
-    hole_bridge::platform::os::uninstall()?;
+    if stopped.is_ok() {
+        if is_installed() {
+            if let Err(e) = deregister() {
+                failures.push(format!("could not deregister the bridge service: {e}"));
+            }
+        } else {
+            cli_log!(warn, "bridge is not installed");
+        }
+    }
 
-    // Remove socket file
-    let _ = std::fs::remove_file(hole_common::protocol::default_bridge_socket_path());
+    if !keep_covers {
+        if let Err(e) = release() {
+            failures.push(format!("could not release the fail-closed covers: {e}"));
+        }
+    }
 
-    // Best-effort: remove the access group
-    let _ = hole_bridge::group::delete_group();
-
-    cli_log!(info, "bridge uninstalled");
-    Ok(())
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(failures.join("; ").into())
+    }
 }
 
 // GUI install prompt ==================================================================================================

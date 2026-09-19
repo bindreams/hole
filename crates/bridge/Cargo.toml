@@ -128,6 +128,8 @@ tar = "0.4"
 [target.'cfg(target_os = "windows")'.dependencies]
 payload-archive = { path = "../payload-archive" }
 windows-service = "0.8"
+# Safe HKLM reads for `cutover::windows_profiles` (ProfileList enumeration).
+windows-registry = "0.6"
 windows = { version = "0.62", features = [
     "Wdk_Foundation",
     "Wdk_System_SystemInformation",
@@ -139,7 +141,14 @@ windows = { version = "0.62", features = [
     "Win32_Storage_FileSystem",
     "Win32_System_Diagnostics_Etw",
     "Win32_System_Diagnostics_ToolHelp",
+    # ExpandEnvironmentStringsW for `cutover::windows_profiles`: the service
+    # SIDs store ProfileImagePath unexpanded.
+    "Win32_System_Environment",
     "Win32_System_JobObjects",
+    # RegQueryInfoKeyW/RegEnumKeyExW for `cutover::windows_profiles`: the
+    # ProfileList pass is written out because `windows-registry`'s iterator
+    # reads any enumeration error as end-of-list.
+    "Win32_System_Registry",
     "Win32_System_RemoteDesktop",
     "Win32_System_Services",
     "Win32_System_Threading",

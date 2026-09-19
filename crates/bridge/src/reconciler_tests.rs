@@ -455,12 +455,19 @@ fn reconcile_once_honours_an_always_connect_startup_preference_with_a_candidate(
 // call is deliberate — it must work while a wedged teardown holds
 // `state.proxy.lock()`, so it cannot route through the reconciler/manager at
 // all. So this guards the WEAKER, achievable property instead: every real
-// caller is one of the four independently-reasoned-about sites below, each
+// caller is one of the five independently-reasoned-about sites below, each
 // with its own doc explaining why it releases directly rather than through
-// the others. A fifth, undocumented caller is exactly the kind of divergent,
+// the others. A sixth, undocumented caller is exactly the kind of divergent,
 // re-introduced `ReleaseWarrant`-style release path this stage exists to
 // prevent. Same walk pattern as `proxy_manager_tests.rs`'s
 // `no_bridge_source_derives_cover_state_from_a_session`.
+//
+// The pattern matches the free function `failclosed::release_all` as well as
+// the `Routing` trait method that wraps it. Matching only the trait method
+// left a hole a whole release path walked through: `cutover::release_covers`
+// calls the free function directly (it has no `Routing` handle — there is no
+// bridge), and the guard stayed silent while the sanctioned set was reported
+// as unchanged (#1003).
 
 /// Regex for a Rust function declaration, used to attribute a call site to the
 /// function that lexically encloses it. A backwards line walk is a heuristic —
@@ -497,12 +504,20 @@ pub(crate) fn call_sites_by_function(text: &str, pattern: &regex::Regex) -> Vec<
     out
 }
 
-/// An undocumented fifth caller of `release_all_covers()` would mean a new
-/// release path was added outside the four reasoned-about sites — the exact
-/// kind of divergent teardown route this stage collapses cover-release onto.
+/// Every form the cover release is reachable through: the `Routing` trait
+/// method, and the `failclosed::release_all` free function it wraps. A caller
+/// with no bridge (and so no `Routing` handle) can only use the latter, so a
+/// pattern naming only the former guards nothing against it.
+fn cover_release_pattern() -> regex::Regex {
+    regex::Regex::new(r"\brelease_all(?:_covers)?\s*\(").expect("cover-release regex must compile")
+}
+
+/// An undocumented sixth caller of the cover release would mean a new release
+/// path was added outside the five reasoned-about sites — the exact kind of
+/// divergent teardown route this stage collapses cover-release onto.
 #[skuld::test]
 fn cover_release_has_the_known_sanctioned_caller_set() {
-    let pattern = regex::Regex::new(r"release_all_covers\s*\(").unwrap();
+    let pattern = cover_release_pattern();
     let src_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
 
     // (file suffix, enclosing fn) for every caller reasoned about above.
@@ -516,6 +531,11 @@ fn cover_release_has_the_known_sanctioned_caller_set() {
         ("proxy_manager.rs", "turn_lockdown_off"), // the explicit off-toggle.
         ("proxy_manager.rs", "apply_cover_disposition"), // session teardown, ordered after routes.
         ("reconciler.rs", "reconcile_once"),       // boot-time reconciliation.
+        // The uninstaller's escape: no bridge, so no `Routing` handle and no
+        // reconciler to route through, and it is the LAST thing that can clear
+        // a persistent WFP filter before the binary is deleted (#1003). Its
+        // own liveness refusal is what keeps it from desyncing a live posture.
+        ("cutover.rs", "release_covers"),
     ];
 
     let mut matches: Vec<(String, String, String)> = Vec::new();
@@ -556,7 +576,7 @@ fn cover_release_has_the_known_sanctioned_caller_set() {
         msg.push_str(
             "A failure here means one of three things: a new, undocumented release path was added \
              (the real defect — add it to `sanctioned` above only after writing down, next to the \
-             call, why it cannot route through one of the existing four), a sanctioned call was \
+             call, why it cannot route through one of the existing five), a sanctioned call was \
              renamed or removed (update `sanctioned` to match), or a comment/doc string in a walked \
              file now quotes the pattern, which is a false positive and should be reworded.",
         );
@@ -609,6 +629,32 @@ fn the_sanctioned_caller_guard_survives_line_shifts() {
         "a line shift changed the guard's view of the call site: {before:?} vs {after:?}"
     );
     assert_eq!(before[0].0, "beta", "call site attributed to the wrong function");
+}
+
+/// The hole the guard shipped with: it matched `release_all_covers(` only, so
+/// a caller that reached past the trait to `failclosed::release_all` was
+/// invisible to it — and the first such caller (`cutover::release_covers`)
+/// landed while the sanctioned set was still reported as unchanged. Pinning the
+/// pattern against both forms is what makes an injected stray caller fail
+/// `cover_release_has_the_known_sanctioned_caller_set` rather than pass it.
+#[skuld::test]
+fn the_cover_release_pattern_catches_the_free_function_too() {
+    let src = "fn stray() {\n    tun_engine::routing::failclosed::release_all(&state_dir)?;\n}\n\n\
+               fn viaz_trait() {\n    routing.release_all_covers()?;\n}\n";
+    let sites = call_sites_by_function(src, &cover_release_pattern());
+
+    let names: Vec<&str> = sites.iter().map(|(f, _)| f.as_str()).collect();
+    assert_eq!(names, vec!["stray", "viaz_trait"], "{sites:?}");
+}
+
+/// The other half of the pattern's contract: `release_all_with` and
+/// `release_covers_with` are internals of the release, not new release paths,
+/// and matching them would make the guard fail on every refactor of the impl.
+#[skuld::test]
+fn the_cover_release_pattern_ignores_the_release_internals() {
+    let src = "fn inner() {\n    release_all_with(t, s, ops)?;\n    release_covers_with(d, p, r, q)?;\n}\n";
+    let sites = call_sites_by_function(src, &cover_release_pattern());
+    assert!(sites.is_empty(), "{sites:?}");
 }
 
 /// A call inside a closure belongs to the function that lexically encloses the

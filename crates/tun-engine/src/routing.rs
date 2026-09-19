@@ -1537,6 +1537,26 @@ pub trait Routing: Send + Sync {
     /// [`failclosed::release_all`] for the full contract. This is the escape
     /// from a stranded cover; a required method (no default) so every
     /// `Routing` implementation, including every test mock, commits to one.
+    ///
+    /// Drops [`failclosed::Clearance`] deliberately, and this is the ONE site
+    /// allowed to. What it drops is the operator MESSAGE: every caller of this
+    /// method is in-process — the tray's Unblock action, `turn_lockdown_off`,
+    /// session teardown — and for them `hole.exe` is still on disk and `hole
+    /// bridge unlock` remains reachable, so an unproven boot-time key binds
+    /// nothing HERE. The distinction matters where the binary is about to be
+    /// removed, which is `cutover::release_covers` — and that caller reaches
+    /// the free function directly, not this trait.
+    ///
+    /// What it does NOT drop is the evidence, and that correction is
+    /// bindreams/hole#1010's F1. The old justification added "the next engage
+    /// re-arms and pre-deletes the key", which is false for the two callers
+    /// that matter most: `turn_lockdown_off` and the tray's Unblock write the
+    /// intent OFF, so there is no next engage — and this very sweep DELETES
+    /// the standing cover's `PERSISTENT` sibling, the only live evidence that
+    /// a boot-time twin could be outstanding. [`failclosed::release_all`]
+    /// persists that evidence (`failclosed::boottime_witness`) before
+    /// returning, which is what makes the discard here cost a message and not
+    /// the finding.
     fn release_all_covers(&self) -> Result<(), RoutingError>;
 
     /// Measure whether a standing lockdown cover is present on the host right
@@ -1685,7 +1705,19 @@ impl Routing for SystemRouting {
     }
 
     fn release_all_covers(&self) -> Result<(), RoutingError> {
-        failclosed::release_all(&self.state_dir)
+        // Named discard, not `?;` — see the trait method's doc for why the
+        // in-process escape is the one caller the clearance does not bind.
+        //
+        // What is dropped here is the operator MESSAGE, never the evidence:
+        // `failclosed::release_all` persists the `boottime_witness` before it
+        // returns. That matters because this is the sweep the tray's "Unblock
+        // Network" and `turn_lockdown_off` both reach the host through, and it
+        // is what DELETES a standing cover's `PERSISTENT` sibling — the live
+        // evidence that a boot-time twin could be outstanding. Without the
+        // persisted copy, every later sweep (including the uninstall gate's)
+        // would read the empty sibling set as "no cover was ever here" and go
+        // silent for good.
+        failclosed::release_all(&self.state_dir).map(|_clearance_binds_only_the_uninstall_gate| ())
     }
 
     fn lockdown_cover_presence(&self) -> CoverPresence {

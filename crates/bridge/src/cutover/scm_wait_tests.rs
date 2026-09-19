@@ -116,6 +116,34 @@ fn stop_re_arms_after_a_non_terminal_callback() {
     );
 }
 
+/// A stop wait that observes RUNNING saw a service that never took the
+/// control: the SCM refuses `ControlService(STOP)` outright while a service is
+/// START_PENDING, and that refusal resolves to RUNNING, not to STOPPED. The
+/// wait must send the control again rather than re-arm into a STOPPED nothing
+/// asked for — the uninstall dead end #1003 turns on this wait completing.
+#[skuld::test]
+fn stop_reissues_the_control_when_the_service_is_observed_running() {
+    let log: RefCell<Vec<&'static str>> = RefCell::new(vec![]);
+    let mut fake = FakeScm::new(&log, [Observed::Running, Observed::Pending, Observed::Stopped].into());
+    stop_via_notify(&mut fake).unwrap();
+    assert_eq!(
+        *log.borrow(),
+        vec![
+            "arm_stopped",
+            "control_stop",
+            "wait",
+            "got_running",
+            "control_stop", // the refused control, re-issued now it can be accepted
+            "arm_stopped",
+            "wait",
+            "got_pending",
+            "arm_stopped",
+            "wait",
+            "got_stopped",
+        ]
+    );
+}
+
 #[skuld::test]
 fn start_via_notify_arms_running_before_start_then_gates_on_running() {
     let log: RefCell<Vec<&'static str>> = RefCell::new(vec![]);

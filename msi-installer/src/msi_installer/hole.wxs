@@ -23,7 +23,36 @@
     Version="$(ProductVersion)"
     UpgradeCode="6F2A8C1D-3E4B-4F5A-9D7E-1C2B3A4F5E6D">
 
+    <!-- Schedule is explicit, and load-bearing. The upgrade path deliberately
+         leaves the fail-closed covers armed (BridgeUninstall passes the
+         keep-covers flag, BridgeRelease is skipped under UPGRADINGPRODUCTCODE)
+         because the standing cover is what holds the update-cutover gap. That
+         is only survivable if a FAILED upgrade puts the old product back: the
+         covers are persistent WFP filters the Base Filtering Engine re-adds
+         every boot, and hole.exe is the only thing that can remove them
+         (bindreams/hole#1003).
+
+         WiX's default, `afterInstallValidate`, removes the old product in a
+         separate transaction — a failed upgrade leaves the machine with
+         neither version installed, i.e. armed covers and no binary.
+         `afterInstallInitialize` schedules RemoveExistingProducts after
+         InstallInitialize, inside the new install's transaction, so a failed
+         upgrade rolls the removal back and reinstalls the old product
+         (docs.firegiant.com/wix/schema/wxs/majorupgrade).
+
+         The two later placements (afterInstallExecute / afterInstallFinalize)
+         also survive a failed upgrade, but install the new files FIRST: over a
+         still-running old service holding hole.exe open, and with the old
+         product's PathRemove landing after the new product's PathAdd. Only
+         afterInstallInitialize gives both properties. Pinned by
+         test_major_upgrade_removal_is_undone_when_the_upgrade_fails and
+         test_major_upgrade_removes_the_old_product_before_the_new_files_land.
+
+         AppSearch (sequence 400) still precedes RemoveExistingProducts (1525),
+         so the sticky-shortcut RegistrySearches below still read the old
+         install's regkeys. -->
     <MajorUpgrade
+      Schedule="afterInstallInitialize"
       AllowSameVersionUpgrades="yes"
       DowngradeErrorMessage="A newer version of Hole is already installed." />
 
@@ -243,11 +272,73 @@
       Impersonate="no"
       Return="ignore" />
 
+    <!-- Release every fail-closed cover and disarm the kill switch, before
+         RemoveFiles deletes the only binary that could do it later. The WFP
+         filters are FWPM_FILTER_FLAG_PERSISTENT, so the Base Filtering Engine
+         re-adds them on every boot: leaving them behind blocks the host
+         permanently, and nothing shipped with Windows takes them off again.
+         `netsh wfp` is diagnostics-only — capture, dump, help, set, show, and
+         no delete verb — and removing a WFP filter takes an FWPM call, whose
+         only caller on the host is the hole.exe this uninstall is about to
+         delete. Reinstalling Hole is the way back (#1003).
+
+         Return="check", uniquely among the uninstall CAs: a failed release
+         MUST abort and roll the uninstall back, leaving hole.exe in place, and
+         is the only failure here worth blocking on. Its sibling below stays
+         Return="ignore" — a service that will not deregister is untidy, not a
+         lockout.
+
+         NOT UPGRADINGPRODUCTCODE, also uniquely: during a major upgrade's
+         RemoveExistingProducts the old product uninstalls with REMOVE=ALL, and
+         disarming there would break the cover's whole purpose. The standing
+         cover is what holds the update-cutover gap; the new bridge re-adopts
+         it (decide_cover_recovery(On, Live) == Adopt).
+
+         HOLE_KEEP_COVERS is the escape from the escape: Return="check" means a
+         release that can never succeed (BFE stopped, hole.exe quarantined)
+         would otherwise make the product permanently unremovable. Secure="yes"
+         so the value survives into the server-side execute sequence under UAC.
+         Documented in RELEASE-OPS.md as a last resort; it leaves the block in
+         place, and reinstalling Hole is the only thing that clears it. -->
+    <Property Id="HOLE_KEEP_COVERS" Secure="yes" />
+
+    <CustomAction
+      Id="BridgeRelease"
+      FileRef="hole.exe"
+      ExeCommand="bridge release-covers"
+      Execute="deferred"
+      Impersonate="no"
+      Return="check" />
+
+    <!-- Stop and deregister the service. Runs on a major upgrade too, so the
+         old service releases its image before RemoveFiles replaces it. The
+         keep-covers flag is what makes that safe: it leaves the cover and the
+         kill-switch intent to BridgeRelease above, which the upgrade skips. -->
     <CustomAction
       Id="BridgeUninstall"
       FileRef="hole.exe"
-      ExeCommand="bridge uninstall"
+      ExeCommand="bridge uninstall --keep-covers"
       Execute="deferred"
+      Impersonate="no"
+      Return="ignore" />
+
+    <!-- Undo the teardown above if the uninstall rolls back. BridgeRelease is
+         Return="check", so the action immediately after BridgeUninstall can
+         abort the whole transaction; without this, the product is still
+         installed but its service is stopped and deregistered, and nothing
+         puts it back. Re-runs exactly what BridgeInstall runs, so the restored
+         state is the state the uninstall found.
+
+         Sequenced Before="BridgeUninstall" because a rollback action must be
+         written into the script ahead of the deferred action it undoes; MSI
+         executes the rollback script in reverse, so it runs after. Its return
+         value is ignored by MSI during rollback, so it can only add recovery,
+         never block one. -->
+    <CustomAction
+      Id="BridgeUninstallRollback"
+      FileRef="hole.exe"
+      ExeCommand="bridge install"
+      Execute="rollback"
       Impersonate="no"
       Return="ignore" />
 
@@ -271,12 +362,26 @@
       <Custom Action="PathAdd" After="BridgeInstall"
         Condition="NOT Installed AND NOT REMOVE" />
 
-      <!-- Pre-uninstall: PATH remove then bridge uninstall.
-           Each uninstall CA must be transitively anchored Before RemoveFiles
-           via explicit Before attributes, so ordering is fully determined. -->
-      <Custom Action="PathRemove" Before="BridgeUninstall"
+      <!-- Pre-uninstall: deregister the service, release the covers, then
+           strip PATH. Each uninstall CA must be transitively anchored Before
+           RemoveFiles via explicit Before attributes, so ordering is fully
+           determined.
+
+           The service goes first so the release runs against a DEAD bridge:
+           clearing a cover out of process under a live one leaves its posture
+           claiming a cover that no longer exists, and the next covered start
+           would skip re-engagement and run uncovered.
+
+           PATH goes last so an aborted release (Return="check") leaves the
+           entry intact — PathRemove is deferred with no rollback partner, so
+           anything sequenced after it survives a rollback stripped. -->
+      <Custom Action="BridgeUninstallRollback" Before="BridgeUninstall"
         Condition="REMOVE=&quot;ALL&quot;" />
-      <Custom Action="BridgeUninstall" Before="RemoveFiles"
+      <Custom Action="BridgeUninstall" Before="BridgeRelease"
+        Condition="REMOVE=&quot;ALL&quot;" />
+      <Custom Action="BridgeRelease" Before="PathRemove"
+        Condition="REMOVE=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE AND NOT HOLE_KEEP_COVERS" />
+      <Custom Action="PathRemove" Before="RemoveFiles"
         Condition="REMOVE=&quot;ALL&quot;" />
 
       <!-- Launch app after fresh install (not upgrades, not silent) -->

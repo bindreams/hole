@@ -743,6 +743,18 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
     /// FAILED release would delete the user's only retry affordance while
     /// the host is still held closed. The intent moves only after the clear
     /// confirms (or after this decided no clear was owed).
+    ///
+    /// "Confirms" is bounded by what a delete-by-key can observe, and on
+    /// Windows that is narrower for a `FWPM_FILTER_FLAG_BOOTTIME` key than for
+    /// a persistent one — see `failclosed::Clearance`. Disarming in a boot
+    /// where the bridge never engaged reports success over a key that may
+    /// still have a boot-time record behind it.
+    ///
+    /// That is not gated here. This escape leaves the binary in place, so the
+    /// difference stays recoverable: the next engage re-arms the key, and
+    /// `hole bridge unlock` is still on disk. The uninstall gate
+    /// (`cutover::release_covers`) is the one caller for which it is not, and
+    /// it reads the `Clearance` this path drops.
     pub fn turn_lockdown_off(&mut self) -> Result<(), ProxyError> {
         // Drop any held transient guard's in-process authority first. Not a
         // condition — a no-op when nothing is pending — it exists so no live

@@ -38,12 +38,39 @@ fn unlock_successful_disengage_flips_intent_off() {
     let dir = tempfile::tempdir().unwrap();
     lockdown_state::set_enabled(dir.path(), true, None).unwrap();
 
-    let result = unlock_with(dir.path(), || Ok(()));
+    let result = unlock_with(dir.path(), || Ok(Clearance::proven()));
 
     assert!(result.is_ok());
     assert!(
         !lockdown_state::load_enabled(dir.path()),
         "intent flips off only after a confirmed disengage"
+    );
+}
+
+#[skuld::test]
+fn unlock_hands_back_what_the_disengage_could_not_prove() {
+    // #1010: `unlock_with` used to swallow the disengage's verdict and return
+    // `()`. It writes the kill-switch intent OFF in the statement after the
+    // disengage, so there is no next engage to re-arm or re-delete a
+    // boot-time key — the pre-delete runs only from `engage_lockdown`, which
+    // an off intent prevents. This is the last moment the qualification can
+    // reach anybody, which is why `hole bridge unlock` prints it.
+    let dir = tempfile::tempdir().unwrap();
+    lockdown_state::set_enabled(dir.path(), true, None).unwrap();
+
+    let clearance = unlock_with(dir.path(), || {
+        Ok(unproven_clearance(&["lockdown boot-time block-all V4"]))
+    })
+    .expect("an unproven disengage is not a failure");
+
+    assert_eq!(clearance.unproven_keys(), ["lockdown boot-time block-all V4"]);
+    assert!(
+        release_clearance_report(&clearance).is_some(),
+        "the CLI prints this report; a dropped clearance leaves it with nothing to print"
+    );
+    assert!(
+        !lockdown_state::load_enabled(dir.path()),
+        "the intent still flips off — an unproven key must never block the escape from a blocked host"
     );
 }
 
@@ -88,7 +115,7 @@ fn unlock_records_the_target_off_before_releasing() {
             crate::target::Target::Off,
             "target must already be recorded off before the release call"
         );
-        Ok(())
+        Ok(Clearance::proven())
     });
 
     assert!(result.is_ok(), "{result:?}");
@@ -114,7 +141,7 @@ fn unlock_holds_the_liveness_lock_across_the_whole_sequence() {
                 .is_none(),
             "a bridge starting mid-unlock must contend on the same lock, not observe it free"
         );
-        Ok(())
+        Ok(Clearance::proven())
     });
 
     assert!(result.is_ok(), "{result:?}");
@@ -245,4 +272,560 @@ fn plan_windows_images_covers_full_bindir_set() {
         );
         assert!(img.staged.exists(), "staged source resolved: {:?}", img.staged);
     }
+}
+
+// `bridge release-covers` (the uninstaller's escape) shares `unlock`'s
+// ordering over a wider reach — both cover kinds. It records the target off
+// FIRST, so a release that never lands still converges: a later start
+// reconciles toward `Off` and sweeps. And it refuses against a live bridge for
+// the same reason `unlock` does — an out-of-process clear would leave the
+// bridge's posture claiming a cover that no longer exists (#1003).
+
+/// `release_covers_with` with no peer dirs, for the assertions about the
+/// sequencing around the release itself.
+fn release_covers_probe(dir: &std::path::Path, release: impl FnOnce() -> std::io::Result<()>) -> std::io::Result<()> {
+    // These probes are about the sequencing around the release (liveness,
+    // target write), not about what the sweep proved — so they hand it
+    // the fully-proven clearance and drop it again. The propagation itself is
+    // pinned by `release_covers_reports_what_the_sweep_could_not_prove`.
+    release_covers_with(dir, &[], || release().map(|()| Clearance::proven())).map(|_| ())
+}
+
+#[skuld::test]
+fn release_covers_refuses_against_a_live_bridge() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let _bridge = crate::liveness::BridgeLiveness::acquire(dir.path(), None).unwrap();
+
+    let result = release_covers_probe(dir.path(), || {
+        panic!("the release must never run while a bridge instance is live")
+    });
+
+    result.expect_err("release-covers must refuse while a bridge instance is running");
+}
+
+/// The covers `release_all` sweeps are machine-wide (Windows keys them on
+/// compile-time GUIDs), but the liveness lock is per-state-dir. A bridge run
+/// with a different `--state-dir` — which is what `cli.rs` gives every
+/// foreground and elevated non-`--service` run — holds a lock the service dir
+/// knows nothing about, and clearing its filters out from under it leaves its
+/// posture claiming covers that no longer exist.
+#[skuld::test]
+fn release_covers_refuses_against_a_bridge_live_in_a_peer_state_dir() {
+    let service = tempfile::tempdir().unwrap();
+    let peer = tempfile::tempdir().unwrap();
+
+    let _bridge = crate::liveness::BridgeLiveness::acquire(peer.path(), None).unwrap();
+
+    let result = release_covers_with(service.path(), &[peer.path().to_path_buf()], || {
+        panic!("the release must never run while a bridge instance is live")
+    });
+
+    result.expect_err("a bridge alive in a peer state dir must refuse the release too");
+}
+
+/// The exclusion is what this function IS, so it is taken over every peer
+/// unconditionally — a peer whose dir is not there yet is the one an absent
+/// lock hurts most. `release_all` sweeps Windows' covers machine-wide, so a
+/// bridge that starts under that account mid-release engages a cover, records
+/// the posture, has the filters deleted underneath it, and skips
+/// re-engagement on its next covered start: a VPN running uncovered.
+#[skuld::test]
+fn release_covers_locks_a_peer_state_dir_that_is_not_there_yet() {
+    let service = tempfile::tempdir().unwrap();
+    let absent = service.path().join("no-such-user").join("state");
+
+    let result = release_covers_with(service.path(), std::slice::from_ref(&absent), || {
+        assert!(
+            crate::liveness::BridgeLiveness::try_acquire(&absent, None)
+                .unwrap()
+                .is_none(),
+            "a bridge starting under an account with no state dir yet must contend on the \
+                 same lock, not find it free"
+        );
+        Ok(Clearance::proven())
+    });
+
+    assert!(result.is_ok(), "{result:?}");
+}
+
+/// The litter the lock above costs, and why it is kept. The peer locks are
+/// released when this call returns, and every bridge takes its own with the
+/// BLOCKING `BridgeLiveness::acquire` — so the bridge this exclusion exists to
+/// keep out is woken by that release and writes `bridge-lockdown.json` into the
+/// very tree a cleanup would then remove. A cover with no record is the end
+/// state the whole uninstall path exists to prevent, so nothing under a peer
+/// dir is removed: an empty dir holding a lock file is litter, a stranded
+/// persistent cover is not recoverable in-band.
+#[skuld::test]
+fn release_covers_leaves_every_peer_tree_it_provisioned() {
+    let service = tempfile::tempdir().unwrap();
+    let profile = service.path().join("no-such-user");
+    let peer = profile.join("state");
+
+    let result = release_covers_with(service.path(), std::slice::from_ref(&peer), || Ok(Clearance::proven()));
+
+    assert!(result.is_ok(), "{result:?}");
+    assert!(
+        peer.join("bridge-liveness.lock").exists(),
+        "the release must remove nothing under a peer dir: the lock it took there is released \
+         before it returns, so anything it deleted afterwards could belong to the bridge that \
+         woke on that release"
+    );
+}
+
+/// A peer path can run through a symlink — a state dir relocated onto a volume
+/// that is not mounted at uninstall time, or a redirected Windows profile.
+///
+/// A tripwire, by construction: there is no removal code for it to reach, and
+/// that is the property. It catches the shape that was there before — an
+/// existence probe that follows links (`try_exists`) reads a dangling one as
+/// absent, names it as a level this call is about to create, and hands it to a
+/// `remove_dir_all` that does NOT follow links and so removes the link itself,
+/// one level above anything Hole owns.
+#[cfg(unix)]
+#[skuld::test]
+fn release_covers_never_removes_a_symlink_on_a_peer_path() {
+    let service = tempfile::tempdir().unwrap();
+    let base = tempfile::tempdir().unwrap();
+    let link = base.path().join("profile");
+    std::os::unix::fs::symlink(base.path().join("volume-not-mounted"), &link).unwrap();
+
+    let result = release_covers_with(service.path(), &[link.join("hole").join("state")], || {
+        Ok(Clearance::proven())
+    });
+
+    assert!(result.is_ok(), "{result:?}");
+    assert!(
+        std::fs::symlink_metadata(&link).is_ok(),
+        "a dangling symlink on a peer path reads absent to anything that follows links; \
+         removing it takes out a user's relocation, one level above anything Hole owns"
+    );
+}
+
+/// The same rule from the other side, and the one that was never in doubt: a
+/// peer dir that was already there belongs to the account that owns it, and its
+/// crash-recovery records are that bridge's, not this call's to delete.
+#[skuld::test]
+fn release_covers_leaves_a_peer_state_dir_that_was_already_there() {
+    let service = tempfile::tempdir().unwrap();
+    let peer = tempfile::tempdir().unwrap();
+    let record = peer.path().join("bridge-routes.json");
+    std::fs::write(&record, b"{}").unwrap();
+
+    let result = release_covers_with(service.path(), &[peer.path().to_path_buf()], || Ok(Clearance::proven()));
+
+    assert!(result.is_ok(), "{result:?}");
+    assert!(
+        record.exists(),
+        "a pre-existing peer state dir is not this call's to remove"
+    );
+}
+
+/// The liveness lock contends per open handle, not per owning process, so a
+/// path probed twice would refuse against this call's OWN guard. Duplicates are
+/// ordinary: an un-elevated run resolves `default_state_dir` and the real
+/// user's dir to one and the same path, and the service dir can appear in the
+/// peer list too.
+#[skuld::test]
+fn release_covers_does_not_refuse_against_its_own_guard() {
+    let service = tempfile::tempdir().unwrap();
+    let peer = tempfile::tempdir().unwrap();
+    let peers = vec![
+        service.path().to_path_buf(),
+        peer.path().to_path_buf(),
+        peer.path().to_path_buf(),
+    ];
+
+    let result = release_covers_with(service.path(), &peers, || Ok(Clearance::proven()));
+
+    assert!(
+        result.is_ok(),
+        "a repeated peer path must not read as a live bridge: {result:?}"
+    );
+}
+
+#[skuld::test]
+fn release_covers_records_the_target_off_before_releasing() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let result = release_covers_probe(dir.path(), || {
+        assert_eq!(
+            crate::target::load(dir.path()),
+            crate::target::Target::Off,
+            "target must already be recorded off before the release call"
+        );
+        Ok(())
+    });
+
+    assert!(result.is_ok(), "{result:?}");
+    assert_eq!(crate::target::load(dir.path()), crate::target::Target::Off);
+}
+
+#[skuld::test]
+fn release_covers_fails_loud_when_it_cannot_release() {
+    let dir = tempfile::tempdir().unwrap();
+    lockdown_state::set_enabled(dir.path(), true, None).unwrap();
+
+    let result = release_covers_probe(dir.path(), || Err(std::io::Error::other("not elevated")));
+
+    assert!(
+        result.is_err(),
+        "a failed release must abort before RemoveFiles deletes the only binary that could retry it"
+    );
+    assert!(
+        lockdown_state::load_enabled(dir.path()),
+        "the legacy intent must not read disarmed over a host still covered"
+    );
+}
+
+#[skuld::test]
+fn release_covers_disarms_the_kill_switch_on_a_confirmed_release() {
+    let dir = tempfile::tempdir().unwrap();
+    lockdown_state::set_enabled(dir.path(), true, None).unwrap();
+
+    let result = release_covers_probe(dir.path(), || Ok(()));
+
+    assert!(result.is_ok());
+    assert!(
+        !lockdown_state::load_enabled(dir.path()),
+        "a confirmed release must disarm, not leave the switch armed over an open host"
+    );
+}
+
+/// The release writes records; it deletes none. `scripts/network-reset.py` —
+/// the out-of-band escape, whose whole reason to exist is a host with no
+/// working bridge — reads `bridge-routes.json` and `bridge-dns{,.superseded}
+/// .json` straight out of `service_state_dir()`, and `plugin_recovery`'s record
+/// may be deleted only by something that has accounted for every plugin in it.
+/// An uninstall is the one moment the in-band escapes are already gone:
+/// deleting these would leave a leaked bypass route, a rewritten adapter's DNS
+/// and orphaned plugin processes on the host with the only record of how to
+/// undo them destroyed by the uninstall itself.
+#[skuld::test]
+fn release_covers_deletes_no_crash_recovery_record() {
+    const ESCAPE_RECORDS: [&str; 4] = [
+        "bridge-routes.json",
+        "bridge-dns.json",
+        "bridge-dns.superseded.json",
+        "bridge-plugins.json",
+    ];
+    let dir = tempfile::tempdir().unwrap();
+    for name in ESCAPE_RECORDS {
+        std::fs::write(dir.path().join(name), b"{}").unwrap();
+    }
+
+    let result = release_covers_with(dir.path(), &[], || Ok(Clearance::proven()));
+
+    assert!(result.is_ok(), "{result:?}");
+    for name in ESCAPE_RECORDS {
+        assert!(
+            dir.path().join(name).exists(),
+            "{name} is what the out-of-band escape reads; the uninstall that makes it the only \
+             escape left must not be what deletes it"
+        );
+    }
+}
+
+// Peer state dirs -----------------------------------------------------------------------------------------------------
+//
+// The liveness probe's reach. A peer set that resolves to nothing is not a
+// quiet degradation: `release_covers_with` reads "no lock held anywhere" and
+// clears machine-wide WFP filters out from under a live bridge whose posture
+// still claims them. The whole check silently passes.
+
+#[skuld::test]
+fn the_windows_profile_mapping_is_the_local_appdata_layout() {
+    // `%LOCALAPPDATA%` is `<profile>\AppData\Local`, so a profile maps to the
+    // same leaf `default_state_dir()` builds for the account that owns it.
+    // Compiled everywhere — it is a pure join, and pinning it only on Windows
+    // would put the proof on the one lane that already has the platform test
+    // below.
+    let mapped = hole_common::paths::windows_profile_state_dir(std::path::Path::new("C:/Users/alice"));
+    assert_eq!(
+        mapped,
+        std::path::PathBuf::from("C:/Users/alice")
+            .join("AppData")
+            .join("Local")
+            .join("hole")
+            .join("state")
+    );
+}
+
+#[cfg(target_os = "windows")]
+#[skuld::test]
+fn the_windows_peer_mapping_matches_what_a_bridge_resolves() {
+    // Falsifies the mapping against the real resolver rather than restating
+    // it: a bridge started by this account resolves its state dir through
+    // `default_state_dir()` (i.e. `dirs::data_local_dir`), and the peer probe
+    // has to arrive at the same path from the profile directory alone. If the
+    // two ever diverge the probe looks in the wrong place and always passes.
+    let profile = std::path::PathBuf::from(std::env::var("USERPROFILE").expect("USERPROFILE"));
+    assert_eq!(
+        hole_common::paths::windows_profile_state_dir(&profile),
+        hole_common::paths::default_state_dir()
+    );
+}
+
+#[cfg(target_os = "windows")]
+#[skuld::test]
+fn the_windows_peer_set_reaches_accounts_other_than_this_process() {
+    // A peer set that resolves to only this process's own dir is
+    // indistinguishable from `release_covers_with`'s already-probed skip, and
+    // the probe reports no other bridges every time.
+    let dirs = peer_state_dirs();
+    let profile = std::path::PathBuf::from(std::env::var("USERPROFILE").expect("USERPROFILE"));
+    assert!(
+        dirs.contains(&hole_common::paths::windows_profile_state_dir(&profile)),
+        "the profile enumeration must reach this host's real profiles: {dirs:?}"
+    );
+}
+
+// Release clearance ---------------------------------------------------------------------------------------------------
+//
+// `bridge release-covers` is the last moment `hole.exe` exists on an
+// uninstalling host. What it reports here is all that survives `RemoveFiles`.
+
+use tun_engine::routing::failclosed::{ArmingWitness, KeyLifetime, KeyObservation, KeyOutcome, KeyRole};
+
+/// A sweep whose boot-time twins answered empty, on a host where the twins'
+/// `PERSISTENT` sibling was REMOVED — i.e. a standing cover really is
+/// installed here, so an unproven twin is worth reporting.
+///
+/// The sibling is not decoration: `release_clearance_report` reads
+/// `leftover_keys`, and without a sibling saying a cover is installed these
+/// same unproven keys are the ordinary shape of a clean uninstall.
+fn unproven_clearance(keys: &[&'static str]) -> Clearance {
+    clearance_with_sibling(KeyOutcome::Removed, keys)
+}
+
+/// As [`unproven_clearance`], with what the twins' `PERSISTENT` sibling
+/// answered spelled out.
+fn clearance_with_sibling(sibling: KeyOutcome, keys: &[&'static str]) -> Clearance {
+    let mut obs = vec![KeyObservation {
+        key: "lockdown filter",
+        lifetime: KeyLifetime::Persistent,
+        outcome: sibling,
+        role: KeyRole::BootTimeSibling,
+    }];
+    obs.extend(keys.iter().map(|&key| KeyObservation {
+        key,
+        lifetime: KeyLifetime::BootTime,
+        outcome: KeyOutcome::NotFound,
+        role: KeyRole::Plain,
+    }));
+    // `Unset`: no persisted boot-time record, which is what every host that
+    // never armed the kill switch is in. The sibling is the only evidence
+    // these fixtures carry.
+    Clearance::from_observations(&obs, ArmingWitness::Unset)
+}
+
+#[skuld::test]
+fn release_covers_reports_what_the_sweep_could_not_prove() {
+    // The propagation itself: `release_covers_with` must hand the caller the
+    // sweep's verdict, not a bare `Ok`. Collapsing it here would put the
+    // silent `Ok` of #1003 back one layer up from where it was removed.
+    let dir = tempfile::tempdir().unwrap();
+    let clearance = release_covers_with(dir.path(), &[], || {
+        Ok(unproven_clearance(&["lockdown boot-time block-all V4"]))
+    })
+    .expect("an unproven clearance is not a failure");
+
+    assert!(!clearance.is_proven());
+    assert_eq!(clearance.unproven_keys(), ["lockdown boot-time block-all V4"]);
+}
+
+#[skuld::test]
+fn the_uninstall_gate_reads_a_twin_recorded_in_a_peer_state_dir() {
+    // The boot-time record is per-state-dir; the WFP filters it describes are
+    // machine-wide. An elevated non-`--service` bridge keeps its state in the
+    // interactive user's profile, so a twin IT armed — and then consumed the
+    // sibling for, by turning the kill switch off — is recorded where this
+    // SYSTEM-context call would never look. The sweep itself sees an empty
+    // sibling set and has nothing; the peer's record is the only survivor.
+    let dir = tempfile::tempdir().unwrap();
+    let peer = tempfile::tempdir().unwrap();
+    let twins = ["lockdown boot-time block-all V4"];
+
+    let quiet = release_covers_with(dir.path(), &[peer.path().to_path_buf()], || {
+        Ok(clearance_with_sibling(KeyOutcome::NotFound, &twins))
+    })
+    .expect("an unproven clearance is not a failure");
+    assert_eq!(
+        release_clearance_report(&quiet),
+        None,
+        "no evidence anywhere: this is what almost every uninstall looks like"
+    );
+
+    tun_engine::routing::failclosed::boottime_witness::record_armed_for_test(peer.path());
+    let loud = release_covers_with(dir.path(), &[peer.path().to_path_buf()], || {
+        Ok(clearance_with_sibling(KeyOutcome::NotFound, &twins))
+    })
+    .expect("an unproven clearance is not a failure");
+    let report = release_clearance_report(&loud).expect("the peer's record must reach the operator");
+    assert!(report.contains("lockdown boot-time block-all V4"), "{report}");
+}
+
+#[skuld::test]
+fn a_proven_release_says_nothing_extra() {
+    // The common case by far — no cover, or one this sweep watched go away. A
+    // warning here would train operators to ignore the one that matters.
+    assert_eq!(release_clearance_report(&Clearance::proven()), None);
+}
+
+#[skuld::test]
+fn an_unproven_release_on_a_host_that_holds_no_cover_says_nothing_either() {
+    // The case that made this message worthless. A Windows sweep leaves the
+    // two boot-time twins unproven on EVERY boot where no bridge engaged —
+    // which is what an ordinary uninstall is — so gating on `is_proven` alone
+    // fired this warning on essentially every Windows uninstall, naming two
+    // filter keys that were never installed. The doc above says why that is
+    // the hazard: crying leftover every time is how the one host where it is
+    // real gets ignored.
+    //
+    // The sibling is what separates them. It is `PERSISTENT`, so BFE re-adds
+    // it at every boot from its own store; answering not-found means no
+    // standing cover is installed here, and a twin is only ever added in the
+    // same transaction as one.
+    let clearance = clearance_with_sibling(
+        KeyOutcome::NotFound,
+        &["lockdown boot-time block-all V4", "lockdown boot-time block-all V6"],
+    );
+    assert!(
+        !clearance.is_proven(),
+        "the sweep still proved nothing about the twins — only the REPORT is suppressed"
+    );
+    assert_eq!(release_clearance_report(&clearance), None);
+}
+
+#[skuld::test]
+fn an_unreadable_sibling_still_reports() {
+    // `Failed` is the unelevated or DACL-denied sweep: it rules nothing out,
+    // so it must not buy the silence an empty answer does.
+    let clearance = clearance_with_sibling(KeyOutcome::Failed, &["lockdown boot-time block-all V4"]);
+    let report = release_clearance_report(&clearance).expect("a sibling that could not be read rules nothing out");
+    assert!(report.contains("lockdown boot-time block-all V4"), "{report}");
+}
+
+#[skuld::test]
+fn an_unproven_release_names_the_keys_and_a_command_that_exists() {
+    // The diagnostic has to be a command the operator can actually run, and
+    // the one that shows a surviving boot-time record specifically:
+    // `netsh wfp show boottimepolicy` (learn.microsoft.com/windows-server/
+    // administration/windows-commands/netsh-wfp). `show filters` lists what is
+    // active NOW, which by definition excludes a boot-time filter after BFE
+    // has started — the only moment this message is ever read.
+    let report = release_clearance_report(&unproven_clearance(&["lockdown boot-time block-all V4"]))
+        .expect("an unproven clearance must be reported");
+    assert!(
+        report.contains("lockdown boot-time block-all V4"),
+        "the key must be named — with the binary gone, the label is all an operator can look it up by: {report}"
+    );
+    assert!(
+        report.contains("netsh wfp show boottimepolicy"),
+        "the diagnostic must name the one netsh command that shows a surviving boot-time record: {report}"
+    );
+}
+
+#[skuld::test]
+fn an_unproven_release_does_not_send_the_operator_to_a_command_that_cannot_help() {
+    // `netsh wfp` is diagnostics-only — its verbs are capture, dump, help, set
+    // and show; there is no delete. Telling a user in the one state where they
+    // have no other tool that "`netsh wfp` can remove it" is a dead end
+    // dressed as a remedy, and the previous test pinned that exact string.
+    let report = release_clearance_report(&unproven_clearance(&["k"])).expect("reported");
+    let lowered = report.to_lowercase();
+    for claim in ["netsh wfp` can remove", "netsh wfp can remove", "netsh wfp delete"] {
+        assert!(
+            !lowered.contains(claim),
+            "netsh wfp has no delete verb; the message must not imply otherwise ({claim}): {report}"
+        );
+    }
+    assert!(
+        lowered.contains("no delete verb"),
+        "the message must say plainly that netsh cannot remove a filter, or the reader will try: {report}"
+    );
+}
+
+#[skuld::test]
+fn an_unproven_release_names_something_that_can_actually_remove_the_filter() {
+    // Removing a WFP filter takes an FWPM call. Once `RemoveFiles` has run,
+    // no such caller is left on the host — so the honest remedy is to put one
+    // back, and the message must say so rather than trail off.
+    let report = release_clearance_report(&unproven_clearance(&["k"])).expect("reported");
+    assert!(
+        report.contains("release-covers"),
+        "the remedy must name the command that addresses these keys: {report}"
+    );
+    let lowered = report.to_lowercase();
+    assert!(
+        lowered.contains("reinstall"),
+        "and must say how to get it back, since RemoveFiles just deleted it: {report}"
+    );
+}
+
+#[skuld::test]
+fn an_unproven_release_does_not_claim_a_cover_is_present() {
+    // "Could not be proven absent" is not "is there". Asserting the latter
+    // would send an operator hunting a filter that most likely never existed,
+    // on every clean uninstall of a build that ships a boot-time key.
+    let report = release_clearance_report(&unproven_clearance(&["k"])).expect("reported");
+    let lowered = report.to_lowercase();
+    assert!(
+        !lowered.contains("still blocking") && !lowered.contains("is still installed"),
+        "must not assert presence it did not measure: {report}"
+    );
+}
+
+#[skuld::test]
+fn an_unproven_release_calls_its_keys_boot_time_ones_because_that_is_all_it_can_name() {
+    // The message is read after `RemoveFiles` has deleted the binary, so the
+    // one thing it must not do is hedge about what the operator is holding.
+    // Every key it can EVER name is a boot-time twin, and this pins both
+    // halves of that: the wording, and the premise underneath it.
+    let report = release_clearance_report(&unproven_clearance(&["lockdown boot-time block-all V4"]))
+        .expect("an unproven clearance must be reported");
+    assert!(
+        report.contains("boot-time filter key"),
+        "the keys are boot-time twins and the message must say so, not hedge: {report}"
+    );
+    for hedge in ["Usually", "can also be"] {
+        assert!(
+            !report.contains(hedge),
+            "a hedge here describes a state this message is never printed in ({hedge}): {report}"
+        );
+    }
+
+    // The premise, on the lane that always runs. A `Persistent` key goes
+    // unproven under exactly one outcome — `Failed` — and `Failed` is what
+    // `first_delete_failure` turns into a `SweepOutcome::failed`, so a
+    // clearance carrying one reaches its caller as `Err` and is dropped by the
+    // `?` in `unlock_with`/`release_covers_with` before any render site. The
+    // Windows half of that chain is
+    // `a_disengage_that_failed_still_carries_the_sibling_it_already_removed`,
+    // which asserts the same clearance's `into_result().is_err()`.
+    for outcome in [KeyOutcome::Removed, KeyOutcome::NotFound, KeyOutcome::Failed] {
+        let obs = KeyObservation {
+            key: "lockdown app-id filter",
+            lifetime: KeyLifetime::Persistent,
+            outcome,
+            role: KeyRole::Plain,
+        };
+        assert_eq!(
+            obs.proves_empty(),
+            outcome != KeyOutcome::Failed,
+            "a persistent key unproven under anything but a failed delete would put a key with no \
+             boot-time record into a message that calls every key it names a boot-time one \
+             ({outcome:?})"
+        );
+    }
+}
+
+#[skuld::test]
+fn an_unproven_release_names_every_key_not_just_the_first() {
+    let report = release_clearance_report(&unproven_clearance(&["alpha-key", "beta-key"])).expect("reported");
+    assert!(
+        report.contains("alpha-key") && report.contains("beta-key"),
+        "every unproven key must be named: {report}"
+    );
 }

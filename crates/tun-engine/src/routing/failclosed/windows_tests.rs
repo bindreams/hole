@@ -3,6 +3,16 @@ use std::net::IpAddr;
 
 use crate::GLOBAL_NET_STATE;
 
+// GUID-only views of the swept key lists. The production lists carry each
+// key's `KeyLifetime` (see `SweptKey`); the tests below are about GUID set
+// membership and disjointness, which the lifetime does not bear on.
+fn swept_lockdown_guids() -> Vec<GUID> {
+    swept_lockdown_keys().into_iter().map(|k| k.guid).collect()
+}
+fn swept_transient_guids() -> Vec<GUID> {
+    swept_transient_keys().into_iter().map(|k| k.guid).collect()
+}
+
 fn v4() -> IpAddr {
     "203.0.113.7".parse().unwrap()
 }
@@ -87,9 +97,10 @@ fn spec_permits_v6_server_on_v6_layer_only() {
     assert_eq!(server_permits[0].layer, Layer::ConnectV6);
 }
 
-// Arbitration within our single sublayer is pure weight (no CLEAR_ACTION_RIGHT on
-// any filter): the permits must outweigh block-all, else block-all wins and the
-// cover blocks everything. A compile-time invariant, not a runtime check.
+// Arbitration within our single sublayer is pure weight (hardness is a
+// cross-sublayer question): the permits must outweigh block-all, else block-all
+// wins and the cover blocks everything. A compile-time invariant, not a runtime
+// check.
 const _: () = assert!(PERMIT_WEIGHT > BLOCK_WEIGHT);
 
 #[skuld::test]
@@ -109,6 +120,90 @@ fn spec_uses_the_fixed_hole_guids() {
     assert_eq!(s.provider, PROVIDER_GUID);
     assert_eq!(s.sublayer, SUBLAYER_GUID);
 }
+
+// Boot-time lifetime (#998) ===========================================================================================
+
+#[skuld::test]
+fn transient_spec_is_never_boottime() {
+    // The transient cover (bounded-window RAII guard held only while the
+    // bridge process is already running) has no boot window to cover, so
+    // none of its filters may be `Boottime` — #998's scope decision is that
+    // only the standing lockdown's block-all floor gets a twin.
+    let s = build_cover_spec(v4(), Some(resolver_v4()));
+    for f in &s.filters {
+        assert_eq!(
+            f.lifetime,
+            FilterLifetime::PERSISTENT,
+            "transient cover filter {:?} must be Persistent, never Boottime",
+            f.guid
+        );
+    }
+}
+
+#[skuld::test]
+fn a_lifetime_hands_out_its_wfp_flag_and_its_key_class_from_one_value() {
+    // The #1010 coupling, at its two ends. `filter_flags` is the crate's only
+    // producer of the `FWPM_FILTER0::flags` bits and `key_lifetime` is what a
+    // sweep records; both read the SAME private `KeyLifetime`, so a filter
+    // installed boot-time cannot have its key swept as persistent. Before
+    // this there were two enums and two hand-written match arms, and nothing
+    // said they had to agree.
+    assert_eq!(
+        FilterLifetime::PERSISTENT.filter_flags().0,
+        FWPM_FILTER_FLAG_PERSISTENT.0
+    );
+    assert_eq!(FilterLifetime::PERSISTENT.key_lifetime(), KeyLifetime::Persistent);
+    assert_eq!(
+        FilterLifetime::BOOT_TIME.filter_flags().0,
+        FWPM_FILTER_FLAG_BOOTTIME.0 | FWPM_FILTER_FLAG_CLEAR_ACTION_RIGHT.0
+    );
+    assert_eq!(FilterLifetime::BOOT_TIME.key_lifetime(), KeyLifetime::BootTime);
+}
+
+#[skuld::test]
+fn only_the_boot_time_lifetime_clears_its_action_right() {
+    // The boot→BFE window carries the block and NO permit of ours — not
+    // loopback, not the TUN, not the server, not an App-ID — so a hard block
+    // there cannot be overridden by anything, including whatever the host
+    // needs to finish booting (PXE, iSCSI root, a network-key volume unlock).
+    // `CLEAR_ACTION_RIGHT` makes the twin's action SOFT so a higher-weight
+    // permit in another sublayer can win. Fort Firewall's boot-time blocks do
+    // this; Mullvad's do not.
+    //
+    // The PERSISTENT half must NOT gain it. That half ships with our own
+    // permits beside it and is the kill switch proper: soft there would let a
+    // third-party sublayer's permit override the block a user asked for.
+    assert_ne!(
+        FilterLifetime::BOOT_TIME.filter_flags().0 & FWPM_FILTER_FLAG_CLEAR_ACTION_RIGHT.0,
+        0,
+        "a boot-time twin must be overridable — nothing else covers that window and nothing \
+         lifts the block until BFE starts"
+    );
+    assert_eq!(
+        FilterLifetime::PERSISTENT.filter_flags().0 & FWPM_FILTER_FLAG_CLEAR_ACTION_RIGHT.0,
+        0,
+        "the persistent half is the kill switch and stays HARD"
+    );
+    // The two lifetime flags stay mutually exclusive on one object whatever
+    // else rides along (WFP's own FWPM_FILTER0 docs).
+    for lifetime in [FilterLifetime::PERSISTENT, FilterLifetime::BOOT_TIME] {
+        let bits = lifetime.filter_flags().0;
+        assert_ne!(
+            bits & FWPM_FILTER_FLAG_PERSISTENT.0 != 0,
+            bits & FWPM_FILTER_FLAG_BOOTTIME.0 != 0,
+            "{lifetime:?} must carry exactly one of the two lifetime flags"
+        );
+    }
+}
+
+// That `add_filter` really carries a spec's lifetime through to the live WFP
+// object — the literal bug #998 reports, a block-all hardcoded to PERSISTENT
+// regardless of its spec — is proven against the real firewall by
+// `boottime_privileged_tests`, which adds a `Boottime` spec through THIS
+// `add_filter` and reads `FWPM_FILTER_FLAG_BOOTTIME` (and not PERSISTENT) back
+// off the filter WFP stored. Nothing here can prove that: the mapping is
+// FFI-side, and a source-text guard over `windows.rs` asserts the shape of the
+// code rather than its effect.
 
 // resolver permit =====================================================================================================
 
@@ -346,6 +441,105 @@ fn lockdown_spec_v6_server_lands_on_v6_layer() {
     assert_eq!(server[0].layer, Layer::ConnectV6);
 }
 
+#[skuld::test]
+fn lockdown_spec_blockall_has_boottime_twins() {
+    // #998: the block-all floor must be enforced from boot, before BFE starts
+    // re-adding the Persistent pair — so each of ConnectV4/ConnectV6 needs
+    // both a Persistent AND a Boottime block, the latter keyed on the fixed
+    // LOCKDOWN_BOOTTIME_BLOCK_ALL_GUIDS pair (see the module doc's "Boot-time
+    // coverage" section).
+    let s = build_lockdown_spec(v4(), luid(), &[plugin_path()]);
+    let blocks: Vec<_> = s.filters.iter().filter(|f| f.action == Action::Block).collect();
+
+    for (layer, boottime_guid) in [
+        (Layer::ConnectV4, LOCKDOWN_BOOTTIME_BLOCK_ALL_GUIDS[0]),
+        (Layer::ConnectV6, LOCKDOWN_BOOTTIME_BLOCK_ALL_GUIDS[1]),
+    ] {
+        assert!(
+            blocks
+                .iter()
+                .any(|f| f.layer == layer && f.lifetime == FilterLifetime::PERSISTENT),
+            "expected a Persistent block on {layer:?}"
+        );
+        let boottime = blocks
+            .iter()
+            .find(|f| f.layer == layer && f.lifetime == FilterLifetime::BOOT_TIME)
+            .unwrap_or_else(|| panic!("expected a Boottime block on {layer:?}"));
+        assert_eq!(boottime.guid, boottime_guid);
+    }
+}
+
+#[skuld::test]
+fn every_lockdown_filter_is_swept_under_the_lifetime_it_is_installed_with() {
+    // The #1003 invariant, stated over the two lists that used to be able to
+    // disagree. `build_lockdown_spec` stamps a WFP lifetime flag on an object;
+    // `swept_lockdown_keys` records what a delete of that object's key PROVES.
+    // A filter added `FWPM_FILTER_FLAG_BOOTTIME` whose key is swept as
+    // `Persistent` makes `release_all` report a proof of removal it never
+    // observed, and the MSI deletes `hole.exe` on the strength of it.
+    //
+    // #1010 made that unrepresentable for the twins (one
+    // `LOCKDOWN_BOOTTIME_TWINS` entry feeds both sites) — this asserts it for
+    // EVERY lockdown filter, including the App-ID ones, whose two lists are
+    // still built independently.
+    let spec = build_lockdown_spec(v4(), luid(), &[plugin_path()]);
+    let swept: std::collections::HashMap<GUID, FilterLifetime> = swept_lockdown_keys()
+        .into_iter()
+        .map(|k| (k.guid, k.lifetime))
+        .collect();
+    for f in &spec.filters {
+        let sweep_lifetime = swept
+            .get(&f.guid)
+            .unwrap_or_else(|| panic!("lockdown filter {:?} is installed but never swept", f.guid));
+        assert_eq!(
+            *sweep_lifetime, f.lifetime,
+            "filter {:?} is installed {:?} but its key is swept as {:?}",
+            f.guid, f.lifetime, sweep_lifetime
+        );
+    }
+}
+
+#[skuld::test]
+fn every_transient_filter_is_swept_under_the_lifetime_it_is_installed_with() {
+    // Same invariant for the transient cover. It has no boot-time half today,
+    // which is exactly why it needs the guard: nothing else would notice one
+    // arriving on only one of the two lists.
+    let spec = build_cover_spec(v4(), Some(resolver_v4()));
+    let swept: std::collections::HashMap<GUID, FilterLifetime> = swept_transient_keys()
+        .into_iter()
+        .map(|k| (k.guid, k.lifetime))
+        .collect();
+    for f in &spec.filters {
+        let sweep_lifetime = swept
+            .get(&f.guid)
+            .unwrap_or_else(|| panic!("transient filter {:?} is installed but never swept", f.guid));
+        assert_eq!(
+            *sweep_lifetime, f.lifetime,
+            "filter {:?} is installed {:?} but its key is swept as {:?}",
+            f.guid, f.lifetime, sweep_lifetime
+        );
+    }
+}
+
+#[skuld::test]
+fn lockdown_spec_permits_are_never_boottime() {
+    // Only the block-all floor gets a boot-time twin (#998's scope decision:
+    // TUN-LUID/server-IP permits carry runtime-discovered values that would
+    // be stale pre-BFE, and a boot-time loopback/App-ID permit has no
+    // hand-off to its persistent counterpart). See the module doc's
+    // "Boot-time coverage" section.
+    let s = build_lockdown_spec(v4(), luid(), &[plugin_path()]);
+    for f in s.filters.iter().filter(|f| f.action == Action::Permit) {
+        assert_eq!(
+            f.lifetime,
+            FilterLifetime::PERSISTENT,
+            "lockdown permit {:?} on {:?} must be Persistent, never Boottime",
+            f.guid,
+            f.layer
+        );
+    }
+}
+
 // lockdown sweep / Adopt GUID sets ====================================================================================
 
 #[skuld::test]
@@ -355,6 +549,9 @@ fn all_swept_guids_cover_both_covers() {
     let swept = swept_lockdown_guids();
     for g in LOCKDOWN_FILTER_GUIDS {
         assert!(swept.contains(&g), "lockdown GUID {g:?} must be swept");
+    }
+    for g in LOCKDOWN_BOOTTIME_BLOCK_ALL_GUIDS {
+        assert!(swept.contains(&g), "boot-time block-all GUID {g:?} must be swept");
     }
     for i in 0..MAX_APPID_BINARIES {
         assert!(swept.contains(&appid_filter_guid(i, false)));
@@ -370,11 +567,17 @@ fn all_swept_guids_are_mutually_distinct() {
     // derives Hash + Eq, so collect directly (no to_u128 — it doesn't exist).
     let mut all: Vec<GUID> = swept_transient_guids(); // fixed transient GUIDs
     all.extend(swept_lockdown_guids());
+    // The boot-time probe's GUID belongs in the same set. Its disjointness from
+    // every cover GUID is what keeps the probe a probe: a collision would make
+    // it install a real cover filter under a cover key — a boot-time PERMIT
+    // sitting where a swept object is expected — and its documented "no sweep
+    // can reach it" would be false in the worst possible direction.
+    all.push(crate::routing::failclosed::boottime_privileged_tests::PROBE_GUID);
     let unique: std::collections::HashSet<GUID> = all.iter().copied().collect();
     assert_eq!(
         unique.len(),
         all.len(),
-        "every filter GUID (transient + lockdown + App-ID) must be distinct"
+        "every filter GUID (transient + lockdown + App-ID + the boot-time probe) must be distinct"
     );
 }
 
@@ -681,6 +884,500 @@ fn release_all_first_delete_failure_reports_the_first_real_error_and_inspects_ev
     );
 }
 
+// Clearance wiring ----------------------------------------------------------------------------------------------------
+
+fn key(label: &'static str, lifetime: FilterLifetime) -> SweptKey {
+    SweptKey {
+        guid: GUID::from_u128(0x0000_0000_0000_0000_0000_0000_0000_0001),
+        label,
+        lifetime,
+        role: KeyRole::Plain,
+    }
+}
+
+/// One `(key, code)` pair on the shape `disengage_lockdown` and `release_all`
+/// both build.
+fn swept(label: &'static str, code: u32) -> (SweptKey, u32) {
+    (key(label, FilterLifetime::PERSISTENT), code)
+}
+
+/// The REAL sweep lists with every key answering `code`, except the twins'
+/// `PERSISTENT` siblings, which answer `sibling_code`.
+///
+/// That split is the whole shape of the boot where this matters: the kill
+/// switch was armed in an EARLIER boot, BFE re-added the persistent half from
+/// its own store at this one, and the twins — which BFE never re-adds —
+/// answer empty.
+fn sweep_answering(code: u32, sibling_code: u32) -> Vec<(SweptKey, u32)> {
+    swept_lockdown_keys()
+        .into_iter()
+        .chain(swept_transient_keys())
+        .map(|k| {
+            let answer = if k.role == KeyRole::BootTimeSibling {
+                sibling_code
+            } else {
+                code
+            };
+            (k, answer)
+        })
+        .collect()
+}
+
+/// Both twins, by the label every diagnostic names them with.
+const TWIN_LABELS: [&str; 2] = ["lockdown boot-time block-all V4", "lockdown boot-time block-all V6"];
+
+#[skuld::test]
+fn a_code_that_is_neither_success_nor_not_found_is_a_failure_not_a_removal() {
+    // The #1003/F4 anti-pattern, at the one place a raw DWORD becomes a
+    // verdict. `ERROR_ACCESS_DENIED` (5) is the live example: an unelevated
+    // sweep, an object still installed, and — under a "not NotFound therefore
+    // Removed" mapping — a `KeyOutcome::Removed` that proves the key empty.
+    assert_eq!(classify_delete_code(5), KeyOutcome::Failed);
+    assert_eq!(classify_delete_code(0xDEAD_BEEF), KeyOutcome::Failed);
+    assert_eq!(classify_delete_code(ERROR_SUCCESS.0), KeyOutcome::Removed);
+    assert_eq!(classify_delete_code(FWP_E_FILTER_NOT_FOUND_DWORD), KeyOutcome::NotFound);
+
+    // ...and that failure can never reach the gate as proof, whatever the
+    // key's lifetime.
+    let swept = [
+        (key("persistent", FilterLifetime::PERSISTENT), 5u32),
+        (key("boot-time", FilterLifetime::BOOT_TIME), 5u32),
+    ];
+    let clearance = Clearance::from_observations(&observations(&swept), ArmingWitness::Unset);
+    assert!(!clearance.is_proven());
+    assert_eq!(clearance.unproven_keys(), ["persistent", "boot-time"]);
+}
+
+// `disengage_lockdown`'s fail-loud verdict ----------------------------------------------------------------------------
+//
+// `hole bridge unlock` flips the persisted kill-switch intent off ONLY on this
+// function's success (`cutover::unlock_with`). An `Ok` over a host it did not
+// unlock leaves the cover engaged with the intent reading "off" — egress
+// blocked and nothing left that will reconcile it.
+
+#[skuld::test]
+fn a_refused_delete_fails_the_disengage_instead_of_reporting_success() {
+    // ERROR_ACCESS_DENIED: the unelevated run. FWPM opens the engine without
+    // elevation but refuses the write, so this is the reachable case, not an
+    // exotic one. The previous body discarded every code and returned Ok.
+    let err = disengage_verdict(None, &[swept("lockdown block-all V4", 5)], ArmingWitness::Unset)
+        .into_result()
+        .expect_err("a refused delete must fail loud");
+    assert!(
+        format!("{err}").contains("lockdown block-all V4"),
+        "the failing key must be named: {err}"
+    );
+}
+
+#[skuld::test]
+fn an_unreachable_firewall_and_a_refused_delete_are_distinct_failures() {
+    let unreachable = disengage_verdict(Some(0x8032_0001), &[], ArmingWitness::Unset)
+        .into_result()
+        .expect_err("engine open failure");
+    assert!(
+        format!("{unreachable}").contains("could not be reached"),
+        "{unreachable}"
+    );
+    let refused = disengage_verdict(None, &[swept("k", 5)], ArmingWitness::Unset)
+        .into_result()
+        .expect_err("refused delete");
+    assert_ne!(
+        format!("{unreachable}"),
+        format!("{refused}"),
+        "the two causes must not collapse into one message"
+    );
+}
+
+#[skuld::test]
+fn a_clean_or_already_swept_host_disengages_successfully() {
+    // Idempotency: a host that never engaged answers not-found on every key,
+    // and that must stay an unqualified success — the escape hatch is meant to
+    // be runnable at any time.
+    assert!(disengage_verdict(
+        None,
+        &[
+            swept("a", ERROR_SUCCESS.0),
+            swept("b", FWP_E_FILTER_NOT_FOUND_DWORD),
+            swept("c", FWP_E_FILTER_NOT_FOUND_DWORD),
+        ],
+        ArmingWitness::Unset
+    )
+    .into_result()
+    .is_ok());
+    assert!(disengage_verdict(None, &[], ArmingWitness::Unset).into_result().is_ok());
+}
+
+// What `bridge unlock` hands back -------------------------------------------------------------------------------------
+//
+// #1010: `disengage_lockdown` used to return a bare `Ok`, defended by "the
+// next engage re-arms the key". `unlock` exists precisely so there is no next
+// engage — `cutover::unlock_with` writes the intent OFF in the statement after
+// it, and the pre-delete that would clear the key runs only from
+// `engage_lockdown`, which an off intent prevents. So the verdict has to
+// travel.
+
+#[skuld::test]
+fn a_disengage_that_found_nothing_still_reports_what_it_could_not_prove() {
+    // Over the REAL sweep list, with the clean-host answer. `Ok` — nothing
+    // failed, the escape hatch must stay runnable at any time — but the twins
+    // are not proven, and this is the LAST moment anything looks at them.
+    let clearance = disengage_verdict(
+        None,
+        &sweep_answering(FWP_E_FILTER_NOT_FOUND_DWORD, FWP_E_FILTER_NOT_FOUND_DWORD),
+        ArmingWitness::Unset,
+    )
+    .into_result()
+    .expect("a not-found sweep must not fail the escape hatch");
+    assert_eq!(
+        clearance.unproven_keys(),
+        TWIN_LABELS,
+        "a bare `Ok` here is what let the intent be written off over two keys nobody measured"
+    );
+    // ...and on a host holding no standing cover there is still nothing to
+    // TELL anyone: no cover means no twin was ever added beside one.
+    assert!(clearance.leftover_keys().is_empty(), "{:?}", clearance.leftover_keys());
+}
+
+#[skuld::test]
+fn a_disengage_over_a_live_cover_hands_back_something_to_say() {
+    // The boot that matters: armed in an earlier session, rebooted, and the
+    // user now runs `hole bridge unlock`. BFE re-added the PERSISTENT
+    // block-all, so its delete removes a live object; the twins answer empty
+    // because no twin is ever live once BFE has started. After this call the
+    // intent is off and nothing will ever pre-delete those keys again.
+    let clearance = disengage_verdict(
+        None,
+        &sweep_answering(FWP_E_FILTER_NOT_FOUND_DWORD, ERROR_SUCCESS.0),
+        ArmingWitness::Unset,
+    )
+    .into_result()
+    .expect("a live cover disengages");
+    assert_eq!(clearance.leftover_keys(), TWIN_LABELS);
+}
+
+#[skuld::test]
+fn a_disengage_that_failed_still_carries_the_sibling_it_already_removed() {
+    // bindreams/hole#1010's F1, at the Windows fold that produces the
+    // evidence. Every delete is ISSUED before any code is read (this
+    // function's own documented property), so a third code from ONE app-id
+    // permit says nothing about the block-all sibling whose delete succeeded
+    // a few entries earlier. That sibling is gone from the host either way,
+    // and its `Removed` is the only live evidence any later sweep could have
+    // had. The verdict fails AND the observation travels; returning early on
+    // the failure lost both in one call.
+    let mut swept = sweep_answering(FWP_E_FILTER_NOT_FOUND_DWORD, ERROR_SUCCESS.0);
+    let denied = swept
+        .iter_mut()
+        .find(|(k, _)| k.label == "lockdown app-id filter")
+        .expect("the lockdown sweep list carries App-ID permits");
+    // ERROR_ACCESS_DENIED: the unelevated run, or a DACL on one filter.
+    denied.1 = 5;
+
+    let outcome = disengage_verdict(None, &swept, ArmingWitness::Unset);
+    assert_eq!(
+        outcome.clearance().witness_update(),
+        crate::routing::failclosed::boottime_witness::WitnessUpdate::Arm,
+        "a failing sweep still holds the sibling it removed, and the record is written from it"
+    );
+    // The two answers are about different sets and are deliberately not the
+    // same list. ARMING is about the boot-time keys only: the twins answered
+    // empty, so a record is possible and the sibling says so. The KEY SET is
+    // what the sweep could not settle, whatever its lifetime — and the App-ID
+    // permit that answered `ERROR_ACCESS_DENIED` is exactly such a key.
+    //
+    // No operator reads THIS set. The same `ERROR_ACCESS_DENIED` makes
+    // `into_result` an `Err` (asserted below), and both callers of a release
+    // drop the clearance on `Err` — so `cutover::release_clearance_report`
+    // never renders a clearance carrying a `Persistent` key, which is why that
+    // message may call every key it names a boot-time one. What travels to the
+    // caller here is the failure itself, which names the same filter.
+    assert_eq!(
+        outcome.clearance().leftover_keys(),
+        [
+            "lockdown boot-time block-all V4",
+            "lockdown boot-time block-all V6",
+            "lockdown app-id filter",
+        ],
+        "the set carries the twins the sweep could not prove AND the permit it could not delete"
+    );
+    assert_eq!(
+        outcome.clearance().leftover_keys(),
+        outcome.clearance().unproven_keys(),
+        "on a host where a record is possible the gate keeps everything the sweep left unsettled, \
+         not a boot-time subset of it"
+    );
+    assert!(
+        outcome.into_result().is_err(),
+        "and the failure still reaches the caller"
+    );
+}
+
+#[skuld::test]
+fn the_failure_verdict_and_the_clearance_read_the_same_classifier() {
+    // Two folds, one classifier: a code `first_delete_failure` calls a genuine
+    // failure is exactly a code `observations` refuses to call a removal. Were
+    // they independent, a code added to one and not the other would fail the
+    // release while the clearance still reported it proven — or, worse, the
+    // reverse.
+    for code in [ERROR_SUCCESS.0, FWP_E_FILTER_NOT_FOUND_DWORD, 5, 0x8032_0009] {
+        let fails = first_delete_failure(&[("k", code)]).is_some();
+        let observed_failed = classify_delete_code(code) == KeyOutcome::Failed;
+        assert_eq!(fails, observed_failed, "code 0x{code:08x}");
+    }
+}
+
+#[skuld::test]
+fn observations_map_not_found_apart_from_a_real_removal() {
+    // The FWPM half of the gate: `FWP_E_FILTER_NOT_FOUND` is the only code
+    // that means "the key answered empty", and `ERROR_SUCCESS` the only one
+    // that means "an object was removed".
+    let swept = [
+        (key("persistent", FilterLifetime::PERSISTENT), ERROR_SUCCESS.0),
+        (
+            key("persistent", FilterLifetime::PERSISTENT),
+            FWP_E_FILTER_NOT_FOUND_DWORD,
+        ),
+        (key("boot-time", FilterLifetime::BOOT_TIME), ERROR_SUCCESS.0),
+        (
+            key("boot-time", FilterLifetime::BOOT_TIME),
+            FWP_E_FILTER_NOT_FOUND_DWORD,
+        ),
+    ];
+    let obs = observations(&swept);
+    assert_eq!(
+        obs.iter().map(|o| o.outcome).collect::<Vec<_>>(),
+        [
+            KeyOutcome::Removed,
+            KeyOutcome::NotFound,
+            KeyOutcome::Removed,
+            KeyOutcome::NotFound
+        ]
+    );
+    // ...and the lifetime rides through untouched, so the fold sees the class
+    // the sweep list declared rather than one re-derived here.
+    assert_eq!(
+        obs.iter().map(|o| o.lifetime).collect::<Vec<_>>(),
+        [
+            KeyLifetime::Persistent,
+            KeyLifetime::Persistent,
+            KeyLifetime::BootTime,
+            KeyLifetime::BootTime
+        ]
+    );
+}
+
+#[skuld::test]
+fn a_not_found_sweep_proves_every_key_but_the_boot_time_twins() {
+    // End-to-end over the REAL sweep lists with the "clean host" answer
+    // (`FWP_E_FILTER_NOT_FOUND` everywhere). This is what stopped being an
+    // unqualified clearance the moment #998's boot-time keys joined the
+    // sweep, and the inversion is the point: a persistent key's by-key delete
+    // addresses its only record, so empty proves empty; a boot-time key's
+    // runtime object exists only between kernel start and BFE start, so on
+    // every boot where `release_all` actually runs it answers empty whether
+    // or not a policy record survives behind it. Reporting that as proof is
+    // what lets `RemoveFiles` delete `hole.exe` over a live boot-window block
+    // (bindreams/hole#1003).
+    let swept: Vec<(SweptKey, u32)> = swept_lockdown_keys()
+        .into_iter()
+        .chain(swept_transient_keys())
+        .map(|k| (k, FWP_E_FILTER_NOT_FOUND_DWORD))
+        .collect();
+    let clearance = Clearance::from_observations(&observations(&swept), ArmingWitness::Unset);
+    assert_eq!(
+        clearance.unproven_keys(),
+        ["lockdown boot-time block-all V4", "lockdown boot-time block-all V6"],
+        "exactly the boot-time twins go unproven on a not-found sweep — no persistent key may \
+         join them, and neither twin may drop out"
+    );
+}
+
+#[skuld::test]
+fn a_sweep_that_watched_the_twins_go_proves_the_whole_list_empty() {
+    // The other half, over the REAL sweep lists: an uninstall on the boot that
+    // engaged, the MSI stopping the bridge and running `release-covers` while
+    // the twins are still live, so every key answers `ERROR_SUCCESS`.
+    //
+    // Nothing is left unproven — including the twins, under
+    // bindreams/hole#1043's assumption that the by-key delete purges the
+    // boot-time record along with the runtime object
+    // `boottime_privileged_tests` measures it removing. This is the case that
+    // flipped: it used to be the loud one. The silence is about keys this very
+    // sweep watched being deleted, not about keys nobody measured, which is
+    // the distinction #1003 collapsed.
+    let swept: Vec<(SweptKey, u32)> = swept_lockdown_keys()
+        .into_iter()
+        .chain(swept_transient_keys())
+        .map(|k| (k, ERROR_SUCCESS.0))
+        .collect();
+    let clearance = Clearance::from_observations(&observations(&swept), ArmingWitness::Unset);
+    assert!(
+        clearance.is_proven(),
+        "every key in both lists was watched going: {:?}",
+        clearance.unproven_keys()
+    );
+    assert!(clearance.leftover_keys().is_empty(), "{:?}", clearance.leftover_keys());
+    // The not-found sweep on the same lists is the one that still reports —
+    // `a_not_found_sweep_proves_every_key_but_the_boot_time_twins` above.
+}
+
+// Which key vouches for a twin ========================================================================================
+
+#[skuld::test]
+fn each_twin_names_the_persistent_block_all_it_copies() {
+    // A twin cannot report on itself — its object is not live on the boot a
+    // sweep runs — so `KeyRole::BootTimeSibling` makes some other key answer
+    // "could a record exist here at all". That key has to be the PERSISTENT
+    // half of the same rule, and nothing else: it is added in the same
+    // transaction, never without the twin, and BFE re-adds it every boot.
+    let spec = build_lockdown_spec(v4(), luid(), &[plugin_path()]);
+    assert_eq!(
+        LOCKDOWN_BOOTTIME_TWINS.iter().map(|t| t.sibling).collect::<Vec<_>>(),
+        vec![LOCKDOWN_FILTER_GUIDS[6], LOCKDOWN_FILTER_GUIDS[7]],
+        "the siblings must be the persistent block-all pair"
+    );
+    for twin in LOCKDOWN_BOOTTIME_TWINS.iter() {
+        let sibling = spec
+            .filters
+            .iter()
+            .find(|f| f.guid == twin.sibling)
+            .unwrap_or_else(|| panic!("twin {:?} names a sibling no engage installs", twin.guid));
+        assert_eq!(
+            sibling.lifetime,
+            FilterLifetime::PERSISTENT,
+            "a boot-time sibling would answer empty on the same boots the twin does, vouching for \
+             nothing"
+        );
+        assert_eq!(sibling.action, Action::Block, "the twin copies a BLOCK, not a permit");
+        assert_eq!(
+            sibling.layer, twin.layer,
+            "the two halves of one rule cover the same layer"
+        );
+        assert!(
+            !spec.pre_delete.contains(&twin.sibling),
+            "the sibling is the live floor — an engage that dropped it would also destroy the only \
+             evidence a later sweep has about {:?}",
+            twin.guid
+        );
+    }
+}
+
+#[skuld::test]
+fn the_sweep_marks_exactly_the_twins_siblings_and_nothing_else() {
+    let marked: Vec<GUID> = swept_lockdown_keys()
+        .into_iter()
+        .filter(|k| k.role == KeyRole::BootTimeSibling)
+        .map(|k| k.guid)
+        .collect();
+    assert_eq!(
+        marked,
+        vec![LOCKDOWN_FILTER_GUIDS[6], LOCKDOWN_FILTER_GUIDS[7]],
+        "only the persistent block-all pair vouches for a twin"
+    );
+    // The twin itself vouches for nothing: its own empty answer is the thing
+    // in question, and marking it would make it prove itself.
+    for k in swept_lockdown_keys() {
+        if LOCKDOWN_BOOTTIME_BLOCK_ALL_GUIDS.contains(&k.guid) {
+            assert_eq!(k.role, KeyRole::Plain, "a twin must not vouch for itself");
+        }
+    }
+    // The transient cover has no boot-time half, so none of its keys is
+    // evidence about one — a stranded transient cover on a host that never
+    // armed the kill switch must not make the report fire.
+    assert!(
+        swept_transient_keys().iter().all(|k| k.role == KeyRole::Plain),
+        "no transient key vouches for a boot-time twin"
+    );
+}
+
+#[skuld::test]
+fn a_clean_host_reports_no_leftover_and_a_still_covered_one_does() {
+    // End-to-end over the REAL sweep lists, on the two hosts an uninstall
+    // actually meets. Both leave the twins UNPROVEN — that never changes —
+    // and they differ only in whether anyone should be told.
+    let clean = Clearance::from_observations(
+        &observations(&sweep_answering(
+            FWP_E_FILTER_NOT_FOUND_DWORD,
+            FWP_E_FILTER_NOT_FOUND_DWORD,
+        )),
+        ArmingWitness::Unset,
+    );
+    assert_eq!(clean.unproven_keys(), TWIN_LABELS);
+    assert!(
+        clean.leftover_keys().is_empty(),
+        "the kill switch was never armed here, so naming two filter keys that were never installed \
+         is noise on every Windows uninstall: {:?}",
+        clean.leftover_keys()
+    );
+
+    let still_covered = Clearance::from_observations(
+        &observations(&sweep_answering(FWP_E_FILTER_NOT_FOUND_DWORD, ERROR_SUCCESS.0)),
+        ArmingWitness::Unset,
+    );
+    assert_eq!(
+        still_covered.leftover_keys(),
+        TWIN_LABELS,
+        "a standing cover BFE re-added at this boot is exactly the host where a stranded twin is \
+         possible"
+    );
+}
+
+#[skuld::test]
+fn every_boot_time_filter_belongs_to_a_spec_that_fails_on_a_stale_key() {
+    // The one pairing `FilterLifetime` does not couple. Lifetime-to-flag-bits
+    // is a single value; lifetime-to-stale-key-policy is two, chosen at
+    // different sites. `add_filter` downgrades `FWP_E_ALREADY_EXISTS` to `Ok`
+    // for ANY `requires_fresh_add` filter under `Degrade` — a boot-time twin
+    // included — so a twin spent by a previous boot would be silently kept,
+    // with no error and, until this test, no failing assertion.
+    //
+    // `the_stale_key_policy_follows_what_the_caller_does_with_a_failed_engage`
+    // checks each builder's own policy in isolation; this is the cross-cutting
+    // property neither of those two states. Every spec both builders can
+    // produce, so a future boot-time filter in either one has to land here.
+    let specs = [
+        build_lockdown_spec(v4(), luid(), &[]),
+        build_lockdown_spec(v4(), luid(), &[plugin_path(), bridge_path()]),
+        build_lockdown_spec(v6(), luid(), &[plugin_path()]),
+        build_cover_spec(v4(), None),
+        build_cover_spec(v4(), Some(resolver_v4())),
+        build_cover_spec(v6(), Some(resolver_v6())),
+    ];
+    let mut boot_time_filters = 0;
+    for spec in &specs {
+        for f in spec.filters.iter().filter(|f| f.lifetime == FilterLifetime::BOOT_TIME) {
+            boot_time_filters += 1;
+            assert_eq!(
+                spec.stale_key,
+                StaleKeyPolicy::Fail,
+                "boot-time filter {:?} sits in a spec that DEGRADES on a stale key, so a duplicate \
+                 add reports Ok and the twin is never re-armed",
+                f.guid
+            );
+            // The other pairing the type does not couple, and the one
+            // `CLEAR_ACTION_RIGHT` created. `FilterLifetime::filter_flags`
+            // makes every BOOT_TIME filter SOFT, and the justification for
+            // that is a property of the twins being BLOCKS: the pre-BFE window
+            // carries no permit of ours, so a hard block there is
+            // unoverridable by the egress a host may need to finish booting.
+            // A boot-time PERMIT would inherit the flag with no such argument
+            // — a soft permit any third-party hard block can veto, silently.
+            assert_eq!(
+                f.action,
+                Action::Block,
+                "boot-time filter {:?} is a PERMIT, and `filter_flags` would make it soft: \
+                 CLEAR_ACTION_RIGHT is justified by the twins carrying the block and nothing \
+                 else, and a soft permit is vetoable by any hard block in another sublayer",
+                f.guid
+            );
+        }
+    }
+    assert!(
+        boot_time_filters > 0,
+        "no spec produced a boot-time filter, so the assertion above never ran"
+    );
+}
+
 #[skuld::test]
 fn adopt_does_not_delete_the_address_range_loopback_floor() {
     // The address-range loopback permits are floor, not volatile: Adopt must keep
@@ -779,8 +1476,9 @@ fn presence_probes_every_swept_lockdown_guid() {
     let probed = swept_lockdown_guids();
     assert_eq!(
         probed.len(),
-        LOCKDOWN_FILTER_GUIDS.len() + MAX_APPID_BINARIES * 2,
-        "the probe must cover the fixed lockdown GUIDs plus every App-ID slot"
+        LOCKDOWN_FILTER_GUIDS.len() + LOCKDOWN_BOOTTIME_BLOCK_ALL_GUIDS.len() + MAX_APPID_BINARIES * 2,
+        "the probe must cover the fixed lockdown GUIDs, the boot-time block-all pair (#998), \
+         and every App-ID slot"
     );
     assert!(
         probed.contains(&LOCKDOWN_FILTER_GUIDS[6]),
@@ -789,6 +1487,14 @@ fn presence_probes_every_swept_lockdown_guid() {
     assert!(
         probed.contains(&LOCKDOWN_FILTER_GUIDS[7]),
         "block-all V6 must be probed"
+    );
+    assert!(
+        probed.contains(&LOCKDOWN_BOOTTIME_BLOCK_ALL_GUIDS[0]),
+        "boot-time block-all V4 must be probed"
+    );
+    assert!(
+        probed.contains(&LOCKDOWN_BOOTTIME_BLOCK_ALL_GUIDS[1]),
+        "boot-time block-all V6 must be probed"
     );
     for i in 0..MAX_APPID_BINARIES {
         assert!(probed.contains(&appid_filter_guid(i, false)), "App-ID slot {i} V4");
@@ -804,11 +1510,30 @@ fn engage_lockdown_refreshes_the_volatile_permits() {
     // re-add of a fixed-key filter as success, so without a delete first the
     // stale TUN LUID and the previous server IP would survive a reconnect.
     let spec = build_lockdown_spec(v4(), luid(), &[plugin_path(), bridge_path()]);
+    // Pinned as LITERALS, not as `lockdown_pre_delete_guids()`: comparing the
+    // spec against the same expression `build_lockdown_spec` used to build it
+    // is a tautology that cannot fail, and it would silently bless any future
+    // edit to that helper.
     assert_eq!(
         spec.pre_delete,
-        adopt_delete_guids(),
-        "engage must drop exactly the volatile permits — the TUN pair and BOTH server-family \
-         permits — before adding anything"
+        vec![
+            LOCKDOWN_FILTER_GUIDS[2], // TUN V4
+            LOCKDOWN_FILTER_GUIDS[3], // TUN V6
+            LOCKDOWN_FILTER_GUIDS[4], // server V4
+            LOCKDOWN_FILTER_GUIDS[5], // server V6
+            appid_filter_guid(0, false),
+            appid_filter_guid(0, true),
+            appid_filter_guid(1, false),
+            appid_filter_guid(1, true),
+            appid_filter_guid(2, false),
+            appid_filter_guid(2, true),
+            appid_filter_guid(3, false),
+            appid_filter_guid(3, true),
+            LOCKDOWN_BOOTTIME_BLOCK_ALL_GUIDS[0],
+            LOCKDOWN_BOOTTIME_BLOCK_ALL_GUIDS[1],
+        ],
+        "engage must drop exactly the runtime-valued permits — the TUN pair, BOTH server-family \
+         permits and EVERY App-ID slot — plus the boot-time twins, before adding anything"
     );
 
     // Every deleted key is either re-added with this attempt's fresh values
@@ -844,18 +1569,261 @@ fn engage_lockdown_refreshes_the_volatile_permits() {
             "engage must not delete the fail-closed floor {guid:?}"
         );
     }
+    // The App-ID slots are the opposite case, and the reason is the same one
+    // that puts the TUN and server permits here: the key is derived from the
+    // SLOT INDEX, the value is a process image path, and an update-cutover
+    // reuses a slot's key with a new path. Leaving that to `ok_or_exists` kept
+    // the pre-update `hole.exe` permitted and blocked the running one, under a
+    // cover reporting success (bindreams/hole#1010, finding F2). Every slot is
+    // dropped, including the ones this engage will not re-add — a config that
+    // loses its plugin shortens `app_ids`, and the vacated slot's permit would
+    // otherwise stand for a binary this bridge no longer runs.
     for i in 0..MAX_APPID_BINARIES {
-        assert!(!spec.pre_delete.contains(&appid_filter_guid(i, false)));
-        assert!(!spec.pre_delete.contains(&appid_filter_guid(i, true)));
+        assert!(
+            spec.pre_delete.contains(&appid_filter_guid(i, false)),
+            "App-ID slot {i} V4 must be dropped before the adds"
+        );
+        assert!(
+            spec.pre_delete.contains(&appid_filter_guid(i, true)),
+            "App-ID slot {i} V6 must be dropped before the adds"
+        );
+    }
+    assert!(
+        added.contains(&appid_filter_guid(0, false)) && added.contains(&appid_filter_guid(1, false)),
+        "the slots in use must be re-added with this engage's paths"
+    );
+    assert!(
+        !added.contains(&appid_filter_guid(2, false)),
+        "an unused slot stays deleted, not re-added stale"
+    );
+}
+
+#[skuld::test]
+fn engage_lockdown_rearms_the_boottime_twins_rather_than_leaving_them_to_ok_or_exists() {
+    // The twins carry FIXED keys, like the volatile permits and unlike nothing
+    // else in the floor — but a boot-time filter is SPENT by the boot it
+    // covered, and Microsoft's pages disagree on what "spent" leaves behind.
+    // Under the "removed" reading (`FwpmFilterAdd0`, "Object Management") a
+    // plain add is enough. Under the "disabled" reading ("Basic Operation",
+    // twice) the object survives with its key occupied, so the add returns
+    // FWP_E_ALREADY_EXISTS, `ok_or_exists` reports Ok, and every engage after
+    // the first re-arms nothing: the kill switch would cover one boot and then
+    // silently stop. This PR refuses to adjudicate that disagreement, so it has
+    // to be right under both — which means the keys must be pre-deleted.
+    let spec = build_lockdown_spec(v4(), luid(), &[plugin_path(), bridge_path()]);
+    for g in LOCKDOWN_BOOTTIME_BLOCK_ALL_GUIDS {
+        assert!(
+            spec.pre_delete.contains(&g),
+            "the boot-time twin {g:?} must be deleted before it is re-added, or a second engage \
+             in one boot short-circuits on FWP_E_ALREADY_EXISTS and re-arms nothing"
+        );
+    }
+
+    // A pre-delete only helps if the same engage adds the key back — otherwise
+    // it is a disarm, not a re-arm.
+    let added: std::collections::HashSet<GUID> = spec.filters.iter().map(|f| f.guid).collect();
+    for g in LOCKDOWN_BOOTTIME_BLOCK_ALL_GUIDS {
+        assert!(
+            added.contains(&g),
+            "the boot-time twin {g:?} must be re-added by the same engage that deletes it"
+        );
+    }
+
+    // The PERSISTENT block-all is live and enforcing right now; a refresh must
+    // never drop the floor, not even inside a transaction.
+    for guid in [LOCKDOWN_FILTER_GUIDS[6], LOCKDOWN_FILTER_GUIDS[7]] {
+        assert!(
+            !spec.pre_delete.contains(&guid),
+            "the persistent block-all {guid:?} stays in force across a refresh"
+        );
     }
 }
 
 #[skuld::test]
-fn the_transient_cover_deletes_nothing_at_engage() {
-    // Only the lockdown cover has fixed-key volatile permits to refresh; the
-    // transient cover is engaged once per attempt over a swept host.
-    assert!(build_cover_spec(v4(), None).pre_delete.is_empty());
-    assert!(build_cover_spec(v6(), Some(resolver_v4())).pre_delete.is_empty());
+fn the_transient_cover_refreshes_its_runtime_valued_permits_too() {
+    // It is normally engaged over a swept host, which is why this used to
+    // delete nothing. "Normally" is not "always": `ok_or_exists`'s own
+    // disclosed residual was a repair (release, then re-engage with a
+    // corrected server) landing on a key whose release delete had failed, so
+    // the re-add reported success and the OLD address stayed permitted
+    // (bindreams/hole#1010, finding F2). Both families of both permits, for
+    // the same reason the lockdown spec drops both: a V4->V6 server switch
+    // must not leave the V4 permit standing.
+    for spec in [
+        build_cover_spec(v4(), None),
+        build_cover_spec(v6(), Some(resolver_v4())),
+    ] {
+        assert_eq!(
+            spec.pre_delete,
+            vec![
+                FILTER_GUIDS[2],  // server V4
+                FILTER_GUIDS[3],  // server V6
+                FILTER_GUIDS[10], // resolver V4
+                FILTER_GUIDS[11], // resolver V6
+            ]
+        );
+        // The floor is never dropped — deleting a BLOCK is the one thing that
+        // could open the host mid-refresh.
+        for guid in [
+            FILTER_GUIDS[4],
+            FILTER_GUIDS[5],
+            FILTER_GUIDS[0],
+            FILTER_GUIDS[1],
+            FILTER_GUIDS[6],
+            FILTER_GUIDS[7],
+            FILTER_GUIDS[8],
+            FILTER_GUIDS[9],
+        ] {
+            assert!(
+                !spec.pre_delete.contains(&guid),
+                "engage must not delete the transient fail-closed floor {guid:?}"
+            );
+        }
+    }
+}
+
+#[skuld::test]
+fn a_condition_carrying_a_runtime_value_is_told_apart_from_one_that_merely_holds_data() {
+    // The predicate that decides whether `FWP_E_ALREADY_EXISTS` is benign.
+    // `LoopbackNet` is the trap: it CARRIES an `IpAddr` and is still fixed,
+    // because only the address family is read and the family is a property of
+    // the key's layer. Grouping by "holds data" instead of by "can the data
+    // differ between two engages of the same key" would put it on the wrong
+    // side and make every re-engage over an unswept cover fail.
+    for fixed in [
+        Condition::Loopback,
+        Condition::LoopbackNet(v4()),
+        Condition::LoopbackNet(v6()),
+        Condition::Any,
+    ] {
+        assert!(!fixed.carries_runtime_value(), "{fixed:?} is fixed by its key");
+    }
+    for runtime in [
+        Condition::RemoteIp(v4()),
+        Condition::RemoteIpPortTcp(resolver_v4(), RESOLVER_PERMIT_PORT),
+        Condition::LocalInterface(luid()),
+        Condition::AppId(plugin_path()),
+    ] {
+        assert!(
+            runtime.carries_runtime_value(),
+            "{runtime:?} can differ between two engages of the same key"
+        );
+    }
+}
+
+#[skuld::test]
+fn a_boot_time_twin_needs_a_fresh_add_though_its_condition_carries_nothing() {
+    // The gap a condition-only predicate had. A twin's condition is
+    // `Condition::Any` — it carries no value at all — so
+    // `carries_runtime_value` is false and the duplicate-add backstop skipped
+    // exactly the two keys #998 exists to add. Under the "disabled" reading of
+    // BFE startup, a twin dropping out of the pre-delete list would then give
+    // a silent `Ok` over a kill switch that armed once and stopped.
+    let twin = build_lockdown_spec(v4(), luid(), &[plugin_path()])
+        .filters
+        .into_iter()
+        .find(|f| f.guid == LOCKDOWN_BOOTTIME_BLOCK_ALL_GUIDS[0])
+        .expect("the V4 boot-time twin");
+    assert_eq!(twin.condition, Condition::Any);
+    assert!(!twin.condition.carries_runtime_value());
+    assert!(
+        twin.requires_fresh_add(),
+        "a boot-time twin is spent by the boot it covered, so its key must be empty when the \
+         re-arm adds it"
+    );
+
+    // The PERSISTENT block-all beside it is the control: fixed by its key, so
+    // a re-add over an unswept cover stays idempotent — which is what lets an
+    // adopted cover be re-engaged at all.
+    let floor = build_lockdown_spec(v4(), luid(), &[plugin_path()])
+        .filters
+        .into_iter()
+        .find(|f| f.guid == LOCKDOWN_FILTER_GUIDS[6])
+        .expect("the V4 persistent block-all");
+    assert!(!floor.requires_fresh_add());
+}
+
+#[skuld::test]
+fn the_stale_key_policy_follows_what_the_caller_does_with_a_failed_engage() {
+    // Not a property of which cover it is — a property of its caller, which is
+    // why the two answers differ and why neither is safe for the other.
+    //
+    // `install_lockdown` is fail-fatal in `ProxyManager`: an aborted engage
+    // rolls the transaction back and leaves whatever cover was in force still
+    // in force, so failing costs a connection and never a cover.
+    assert_eq!(
+        build_lockdown_spec(v4(), luid(), &[plugin_path()]).stale_key,
+        StaleKeyPolicy::Fail
+    );
+    // The transient cover's caller logs "host NOT blocked, proceeding open"
+    // and runs UNCOVERED when this engage returns `Err` — and on the repair
+    // path it has ALREADY released the cover it held, so there is nothing for
+    // a rollback to preserve. Failing there would trade "covered, one stale
+    // address permitted" for "no cover at all" on the exact path #1010's
+    // finding F2 is about.
+    assert_eq!(build_cover_spec(v4(), None).stale_key, StaleKeyPolicy::Degrade);
+    assert_eq!(
+        build_cover_spec(v6(), Some(resolver_v6())).stale_key,
+        StaleKeyPolicy::Degrade
+    );
+}
+
+#[skuld::test]
+fn a_refused_pre_delete_fails_a_lockdown_engage_and_degrades_a_transient_one() {
+    // The decision itself, on the `(label, code)` shape `issue_pre_deletes`
+    // builds. `ERROR_ACCESS_DENIED` is the reachable case: FWPM opens the
+    // engine unelevated but refuses the write.
+    let refused = [("server-IP permit V4", ERROR_ACCESS_DENIED_DWORD)];
+    let err = pre_delete_verdict(StaleKeyPolicy::Fail, &refused)
+        .expect_err("a refused pre-delete must abort a kill-switch-armed start");
+    assert!(
+        err.to_string().contains("server-IP permit V4"),
+        "the abort must name which key failed: {err}"
+    );
+    assert!(
+        pre_delete_verdict(StaleKeyPolicy::Degrade, &refused).is_ok(),
+        "the transient engage must keep the stale filter rather than lose the cover entirely"
+    );
+
+    // Benign for BOTH: every ordinary engage pre-deletes keys that are not
+    // there. If not-found failed under `Fail`, the kill switch could never arm.
+    let absent = [
+        ("TUN-LUID permit V4", FWP_E_FILTER_NOT_FOUND_DWORD),
+        ("lockdown boot-time block-all V4", FWP_E_FILTER_NOT_FOUND_DWORD),
+    ];
+    assert!(pre_delete_verdict(StaleKeyPolicy::Fail, &absent).is_ok());
+    assert!(pre_delete_verdict(StaleKeyPolicy::Degrade, &absent).is_ok());
+    // A removal that happened is benign too, and an empty list is a no-op.
+    assert!(pre_delete_verdict(StaleKeyPolicy::Fail, &[("k", ERROR_SUCCESS.0)]).is_ok());
+    assert!(pre_delete_verdict(StaleKeyPolicy::Fail, &[]).is_ok());
+}
+
+#[skuld::test]
+fn no_spec_leaves_a_filter_that_needs_a_fresh_add_to_ok_or_exists() {
+    // The F2 invariant over both covers, keyed on `requires_fresh_add` and NOT
+    // on `carries_runtime_value`: every filter whose content can differ from
+    // what is already stored under its key is pre-deleted in the same
+    // transaction. That is two causes — a runtime-discovered value, and a
+    // boot-time twin spent by the boot it covered — and the condition-only
+    // predicate saw only the first, so it skipped exactly the keys #998
+    // exists to add.
+    let specs = [
+        build_lockdown_spec(v4(), luid(), &[plugin_path(), bridge_path()]),
+        build_lockdown_spec(v6(), luid(), &[plugin_path()]),
+        build_cover_spec(v4(), Some(resolver_v4())),
+        build_cover_spec(v6(), None),
+    ];
+    for spec in &specs {
+        for f in spec.filters.iter().filter(|f| f.requires_fresh_add()) {
+            assert!(
+                spec.pre_delete.contains(&f.guid),
+                "{:?}/{:?} needs an empty key but is not pre-deleted, so a re-engage would keep \
+                 whatever the previous one stored",
+                f.condition,
+                f.lifetime
+            );
+        }
+    }
 }
 
 // Recovery-time TUN-permit reclaim ====================================================================================
@@ -921,6 +1889,190 @@ fn first_delete_failure_treats_access_denied_as_a_genuine_failure() {
 }
 
 #[skuld::test]
+fn a_not_found_pre_delete_is_benign_but_any_other_code_aborts_the_engage() {
+    // The VERDICT function `engage_lockdown` folds its pre-delete codes
+    // through, exercised on the exact `(label, code)` shape it builds. This
+    // pins the decision, not the FFI wiring — that the real codes reach this
+    // fold at all is `neither_engage_discards_its_pre_delete_codes`.
+    // Two directions matter and they pull opposite ways:
+    //
+    // BENIGN — every ordinary engage pre-deletes keys that are not there. The
+    // first engage on a clean host finds none of the six; the "removed" reading
+    // of BFE startup means a spent twin is gone too. If not-found were fatal,
+    // the kill switch could never arm at all.
+    let every_key: Vec<GUID> = lockdown_pre_delete_guids()
+        .into_iter()
+        .chain(transient_pre_delete_guids())
+        .collect();
+    let all_absent: Vec<(&'static str, u32)> = every_key
+        .iter()
+        .map(|g| (pre_delete_label(g), FWP_E_FILTER_NOT_FOUND_DWORD))
+        .collect();
+    assert!(
+        first_delete_failure(&all_absent).is_none(),
+        "a first engage on a clean host pre-deletes every key and finds none of them; that must \
+         not abort the start"
+    );
+
+    // FATAL — anything else means the key is still occupied, so the add that
+    // follows returns FWP_E_ALREADY_EXISTS, `ok_or_exists` reports success, and
+    // the engage hands back a cover that was never actually refreshed. That is
+    // the silent failure the pre-delete exists to prevent.
+    for (i, guid) in every_key.iter().enumerate() {
+        let mut codes = all_absent.clone();
+        codes[i] = (pre_delete_label(guid), ERROR_ACCESS_DENIED_DWORD);
+        let err = first_delete_failure(&codes)
+            .unwrap_or_else(|| panic!("an access-denied pre-delete of {guid:?} must abort the engage"));
+        assert!(
+            err.to_string().contains(pre_delete_label(guid)),
+            "the abort must name which key failed, not just that one did: {err}"
+        );
+    }
+}
+
+#[skuld::test]
+fn every_pre_delete_guid_has_its_own_label() {
+    // A failing pre-delete now ABORTS a kill-switch-armed start, and
+    // `first_delete_failure`'s `"{what} delete failed"` string is the whole
+    // diagnostic — it carries no GUID. So the label must identify the key on
+    // its own, down to the address family: a V6-only failure has ordinary
+    // causes (a host with no IPv6 binding) that a V4 one does not.
+    let guids: Vec<GUID> = lockdown_pre_delete_guids()
+        .into_iter()
+        .chain(transient_pre_delete_guids())
+        .collect();
+    let labels: Vec<&'static str> = guids.iter().map(pre_delete_label).collect();
+    assert!(
+        !labels.contains(&"unnamed pre-delete key"),
+        "every pre-delete key must be named for the operator who sees the abort: {labels:?}"
+    );
+    // One name per key across every diagnostic: the pre-delete abort reads
+    // the same `LOCKDOWN_BOOTTIME_TWINS` label `bridge release-covers` prints
+    // for an unproven key, so an operator handed one string can find the
+    // other.
+    assert_eq!(
+        pre_delete_label(&LOCKDOWN_BOOTTIME_BLOCK_ALL_GUIDS[0]),
+        "lockdown boot-time block-all V4"
+    );
+    assert_eq!(
+        pre_delete_label(&LOCKDOWN_BOOTTIME_BLOCK_ALL_GUIDS[1]),
+        "lockdown boot-time block-all V6"
+    );
+    assert_eq!(pre_delete_label(&LOCKDOWN_FILTER_GUIDS[2]), "TUN-LUID permit V4");
+    assert_eq!(pre_delete_label(&LOCKDOWN_FILTER_GUIDS[5]), "server-IP permit V6");
+    assert_eq!(pre_delete_label(&appid_filter_guid(1, true)), "App-ID permit slot 1 V6");
+    // The two covers are separate objects with separate GUIDs, so their
+    // same-role keys are named apart: an operator reading which delete failed
+    // needs to know which engage aborted.
+    assert_eq!(pre_delete_label(&FILTER_GUIDS[3]), "transient server-IP permit V6");
+    assert_eq!(pre_delete_label(&FILTER_GUIDS[10]), "transient resolver permit V4");
+    // One label per key — no two pre-delete failures read alike.
+    let distinct: std::collections::HashSet<&'static str> = labels.iter().copied().collect();
+    assert_eq!(
+        distinct.len(),
+        guids.len(),
+        "each pre-delete key needs its own label, including per family: {labels:?}"
+    );
+}
+
+/// The text of the item starting at `head`, bounded by its own column-0
+/// closing brace, so a guard cannot drift onto a neighbour or read its own
+/// prose.
+fn item_body<'a>(src: &'a str, head: &str) -> &'a str {
+    let start = src
+        .find(head)
+        .unwrap_or_else(|| panic!("{head} must exist in windows.rs"));
+    let after = &src[start..];
+    let end = after.find("\n}\n").map(|i| i + 2).unwrap_or(after.len());
+    &after[..end]
+}
+
+#[skuld::test]
+fn neither_engage_discards_its_pre_delete_codes() {
+    // A pre-delete is the ONLY thing standing between a re-engage and a filter
+    // that was never replaced. Unlike a sweep, where a failed delete is warned
+    // and life goes on, a failed pre-delete must abort: the add that follows
+    // finds the key still occupied, and for a runtime-valued filter
+    // `add_filter` then fails with a bare FWPM code naming nothing.
+    //
+    // Structural guard, same technique and same reason as
+    // `reclaim_stale_tun_permit_does_not_discard_delete_codes` below: there is
+    // no fixture in this file that can make a real FwpmFilterDeleteByKey0 fail
+    // with an access-denied DACL. Both engages are covered because both now
+    // pre-delete — the transient one gained its own list with #1010's finding
+    // F2, and a guard scoped to `engage_lockdown` alone would have gone on
+    // passing while the new path discarded everything.
+    let src = include_str!("windows.rs");
+
+    let fold = item_body(src, "unsafe fn issue_pre_deletes(");
+    // Counted, not pattern-matched for a discard: `let _ = f(..)`,
+    // `let _rc = f(..)` and a bare `f(..);` statement all discard a `u32`
+    // without a warning, so a guard that only rejected the first spelling
+    // read as coverage it did not have. Exactly one call, and the assertion
+    // below pins that it is the one feeding `codes`.
+    assert_eq!(
+        fold.matches("FwpmFilterDeleteByKey0").count(),
+        1,
+        "issue_pre_deletes must issue its deletes in exactly one place, the labelled map whose \
+         codes are folded:\n{fold}"
+    );
+    // Two links, because the fold is no longer in this body: the
+    // `StaleKeyPolicy` split moved it down into `pre_delete_verdict`, and a
+    // guard that chased the move by swapping one literal for the other would
+    // have stopped checking its own subject — that the codes reach
+    // `first_delete_failure` at all. Pin the hand-off AND the fold, so
+    // severing either one reds this test.
+    //
+    // Link one is `ends_with`, not `contains`: the call has to be the tail
+    // expression. That is the same discard hazard as above and the one
+    // spelling of it a `contains` cannot see — `let _ = pre_delete_verdict(..)`
+    // followed by `Ok(())` would satisfy a `contains` while throwing the
+    // verdict away.
+    assert!(
+        fold.trim_end().ends_with("pre_delete_verdict(policy, &codes)\n}"),
+        "issue_pre_deletes must RETURN the verdict on the codes it just collected, as its tail \
+         expression:\n{fold}"
+    );
+    let verdict = item_body(src, "fn pre_delete_verdict(");
+    assert!(
+        verdict.contains("first_delete_failure(codes)"),
+        "pre_delete_verdict must fold the codes through first_delete_failure, so a not-found stays \
+         benign and anything else becomes the failure StaleKeyPolicy then rules on:\n{verdict}"
+    );
+    // Deliberately NOT pinned here: which policy arm each engage takes. That
+    // is behaviour, and behaviour is tested directly — the specs' policies in
+    // `the_stale_key_policy_follows_what_the_caller_does_with_a_failed_engage`
+    // and the arms themselves in
+    // `a_refused_pre_delete_fails_a_lockdown_engage_and_degrades_a_transient_one`.
+    // With the `spec.stale_key` hand-off pinned below, a later edit that put
+    // the lockdown engage on the fail-open `Degrade` arm has to red one of
+    // those three; a source scan would only restate them, more weakly.
+    //
+    // The label mapping is only worth testing if production actually uses it;
+    // a hardcoded string here would leave `pre_delete_label` dead and every
+    // abort message identical.
+    assert!(
+        fold.contains("pre_delete_label(g)"),
+        "issue_pre_deletes must label each pre-delete via pre_delete_label, or the abort cannot \
+         say which key failed:\n{fold}"
+    );
+
+    for head in ["pub fn engage(", "pub fn engage_lockdown("] {
+        let body = item_body(src, head);
+        assert!(
+            body.contains("issue_pre_deletes(engine, &spec.pre_delete, spec.stale_key)"),
+            "{head} must issue its spec's pre-deletes through the shared fold:\n{body}"
+        );
+        assert_eq!(
+            body.matches("FwpmFilterDeleteByKey0").count(),
+            0,
+            "{head} must reach its pre-deletes only through issue_pre_deletes, where the codes \
+             are folded — a call of its own could discard one:\n{body}"
+        );
+    }
+}
+
+#[skuld::test]
 fn reclaim_stale_tun_permit_does_not_discard_delete_codes() {
     // Structural guard, not a proof (mirrors
     // `route_recovery::recover_routes_has_exactly_one_bridge_caller` in the
@@ -952,5 +2104,124 @@ fn reclaim_stale_tun_permit_does_not_discard_delete_codes() {
     assert!(
         body.contains("first_delete_failure"),
         "reclaim_stale_tun_permit must fold its delete codes through first_delete_failure:\n{body}"
+    );
+}
+
+// Boot-time twin read-back ============================================================================================
+
+/// A live boot-time filter as the read-back sees it: in this cover's
+/// containers, carrying the boot-time flag, not disabled.
+fn healthy(key: GUID) -> FilterRecord {
+    FilterRecord {
+        key,
+        flags: FWPM_FILTER_FLAG_BOOTTIME.0 | FWPM_FILTER_FLAG_PERSISTENT.0,
+        provider: Some(PROVIDER_GUID),
+        sublayer: SUBLAYER_GUID,
+        layer: layer_guid(Layer::ConnectV4),
+        filter_id: 7,
+    }
+}
+
+const OTHER_KEY: GUID = GUID::from_u128(0xdead_beef_0000_0000_0000_0000_0000_0001);
+
+#[skuld::test]
+fn an_unreadable_view_never_concludes_the_twin_is_absent() {
+    // bindreams/hole#1010 F2. The ONLY reason both enumeration types are read
+    // is that WFP's reference does not pin down what `enumType` means for a
+    // condition-less template, so only one of them may hold the twin. Under
+    // that premise the other's `Ok(vec![])` proves nothing — and concluding
+    // `Absent` from it fails a fail-FATAL engage, so a lockdown-armed user
+    // cannot connect at all.
+    let key = LOCKDOWN_BOOTTIME_TWINS[0].guid;
+    let views = [Err(0x8032_0005u32), Ok(vec![])];
+    assert_eq!(
+        classify_twin_readback(&views, key),
+        TwinReadback::Unreadable,
+        "one view errored, so the other's empty answer is evidence of nothing"
+    );
+
+    // The mirror: both views read, neither holds it. That IS evidence, and the
+    // only thing that may refuse an engage.
+    assert_eq!(
+        classify_twin_readback(&[Ok(vec![]), Ok(vec![healthy(OTHER_KEY)])], key),
+        TwinReadback::Absent
+    );
+}
+
+#[skuld::test]
+fn a_twin_held_by_the_readable_view_outranks_the_one_that_errored() {
+    // The search runs before the error check, so the read that DID find the
+    // object is what decides. An error on the other view costs nothing here —
+    // finding the twin is the whole point of the read.
+    let key = LOCKDOWN_BOOTTIME_TWINS[0].guid;
+    let record = healthy(key);
+    assert_eq!(
+        classify_twin_readback(&[Err(0x8032_0005), Ok(vec![record])], key),
+        TwinReadback::Found(record)
+    );
+    assert_eq!(
+        classify_twin_readback(&[Ok(vec![record]), Err(0x8032_0005)], key),
+        TwinReadback::Found(record)
+    );
+}
+
+#[skuld::test]
+fn a_read_back_with_no_view_at_all_is_unreadable_and_never_absent() {
+    // "No readable view holds it" is vacuously true of nothing read, and the
+    // vacuous reading is the one that fails an engage — the same trap
+    // `sibling_evidence` refuses for an empty sibling set.
+    assert_eq!(
+        classify_twin_readback(&[], LOCKDOWN_BOOTTIME_TWINS[0].guid),
+        TwinReadback::Unreadable
+    );
+    assert_eq!(
+        classify_twin_readback(&[Err(0x8032_0005), Err(0x8032_0005)], LOCKDOWN_BOOTTIME_TWINS[0].guid),
+        TwinReadback::Unreadable
+    );
+}
+
+#[skuld::test]
+fn an_unhealthy_twin_is_still_found_so_the_health_checks_can_reject_it() {
+    // `Found` is about the KEY, not about the object's health: a disabled or
+    // non-boot-time record must reach `verify_boottime_twins`'s flag checks
+    // rather than being classified away as absent, or the two failure messages
+    // collapse into one that names the wrong cause.
+    let key = LOCKDOWN_BOOTTIME_TWINS[0].guid;
+    let mut sick = healthy(key);
+    sick.flags = FWPM_FILTER_FLAG_DISABLED.0;
+    assert_eq!(
+        classify_twin_readback(&[Ok(vec![sick]), Ok(vec![])], key),
+        TwinReadback::Found(sick)
+    );
+}
+
+#[skuld::test]
+fn a_platform_that_arms_boot_time_keys_also_sweeps_them() {
+    // The flag `commit_and_record` reads to decide whether an engage has a
+    // `boottime_witness` to record. Comparing it against the table it is
+    // DEFINED from would be `x == x` and could not fail; what can is the other
+    // end of the promise — the record is only ever useful if some sweep can
+    // also produce a `WitnessUpdate` for it, and that needs a boot-time key in
+    // the sweep list. The two are built from one table but by different
+    // functions, so a sweep list that stopped carrying the twins would leave
+    // an engage arming a record no sweep ever speaks about again.
+    let twins: &[BootTimeTwin] = &LOCKDOWN_BOOTTIME_TWINS;
+    assert!(
+        !twins.is_empty(),
+        "Windows arms boot-time twins; an empty table would make every engage's witness a lie"
+    );
+    let swept_boot_time: Vec<&str> = swept_lockdown_keys()
+        .iter()
+        .filter(|k| k.lifetime.key_lifetime() == KeyLifetime::BootTime)
+        .map(|k| k.label)
+        .collect();
+    assert_eq!(
+        swept_boot_time, TWIN_LABELS,
+        "every twin this platform arms must also be a key some sweep observes"
+    );
+    assert_eq!(
+        STANDING_COVER_ARMS_BOOT_TIME,
+        !swept_boot_time.is_empty(),
+        "a platform that says it arms boot-time keys must sweep at least one"
     );
 }

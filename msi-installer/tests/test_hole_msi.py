@@ -203,20 +203,25 @@ def test_sequence_install_order(decompiled_tree: ET.ElementTree) -> None:
 
 
 def test_sequence_uninstall_order(decompiled_tree: ET.ElementTree) -> None:
-    """Uninstall CAs must be ordered: PathRemove < BridgeUninstall < RemoveFiles."""
+    """Uninstall CAs: rollback < BridgeUninstall < BridgeRelease < PathRemove < RemoveFiles.
+
+    The service is deregistered before the covers are released, so the release
+    runs against a dead bridge (an out-of-process clear under a live one
+    desyncs its cover posture). PathRemove trails the release because
+    BridgeRelease is Return='check' and PathRemove has no rollback partner
+    (bindreams/hole#1003). BridgeUninstallRollback leads, because a rollback
+    action is scripted before the deferred action it undoes.
+    """
     entries = _get_decompiled_sequence_map(decompiled_tree)
 
-    assert "BridgeUninstall" in entries, "BridgeUninstall not found in InstallExecuteSequence"
-    assert "PathRemove" in entries, "PathRemove not found in InstallExecuteSequence"
+    chain = ["BridgeUninstallRollback", "BridgeUninstall", "BridgeRelease", "PathRemove"]
+    for action in chain:
+        assert action in entries, f"{action} not found in InstallExecuteSequence"
 
-    assert entries["BridgeUninstall"]["before"] == "RemoveFiles", (
-        f"BridgeUninstall should be Before='RemoveFiles', "
-        f"got Before='{entries['BridgeUninstall']['before']}'"
-    )
-    assert entries["PathRemove"]["before"] == "BridgeUninstall", (
-        f"PathRemove should be Before='BridgeUninstall', "
-        f"got Before='{entries['PathRemove']['before']}'"
-    )
+    for action, following in zip(chain, chain[1:] + ["RemoveFiles"]):
+        assert entries[action]["before"] == following, (
+            f"{action} should be Before='{following}', got Before='{entries[action]['before']}'"
+        )
 
 
 # Component bitness tests ==============================================================================================
