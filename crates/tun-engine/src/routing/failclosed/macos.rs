@@ -9,7 +9,11 @@
 //!   operation, so `-Fa -f -` was two transactions with a
 //!   pass-all host briefly live between them — including across a cover
 //!   TRANSITION (a second `engage` replacing a still-live one, with no
-//!   intervening `disengage`). A bare `pfctl -f -` load is a single pf
+//!   intervening `disengage`). That makes `engage` itself safe over a live
+//!   cover; it does NOT make the bridge's cover transitions gap-free. The
+//!   bridge's repair path and its lockdown-newly-enabled path both drop the held
+//!   [`Cover`] first, and `Drop` reloads `/etc/pf.conf`, so the host is open
+//!   until the next engage (bindreams/hole#758). A bare `pfctl -f -` load is a single pf
 //!   transaction FOR THE RULES (DIOCADDRULE stages into an inactive ruleset
 //!   under a ticket, DIOCXCOMMIT swaps it in atomically under `pf_lock`), so
 //!   the old ruleset stays authoritative right up until the new one is fully
@@ -379,14 +383,16 @@ const PFCONF: &str = "/etc/pf.conf";
 /// directory on it shadow the real binary. `/sbin/pfctl` is where macOS ships
 /// it, unconditionally.
 ///
-/// NOT a closed hardening. Every other root spawn in the tree is still
-/// PATH-resolved through `Command::new(&cmd[0])`: `routing.rs`'s bare
-/// `"route"`, `device/ipv6_addr/macos.rs`'s `"ifconfig"`, and
-/// `bridge/src/dns/system/macos.rs`'s `const NETWORKSETUP: &str =
-/// "networksetup"`. A `--service` bridge inherits launchd's fixed `PATH`, but a
-/// GUI-elevated one inherits the user's, `/opt/homebrew/bin` included. Pinning
-/// this one call site is correct in itself and delivers no net attack-surface
-/// reduction while the rest stand; widening it is tracked separately.
+/// NOT a closed hardening. Every other macOS root spawn in the tree is still
+/// PATH-resolved: `route` (`routing.rs`, `device/ipv6_addr/macos.rs`),
+/// `ifconfig` (`device/ipv6_addr/macos.rs`), `networksetup`, `dscacheutil` and
+/// `killall` (`bridge/src/dns/system/macos.rs`), `launchctl`
+/// (`bridge/src/platform/macos.rs`, `bridge/src/cutover/os/macos.rs`) and
+/// `dseditgroup`, `stat` and `logname` (`bridge/src/group.rs`). A `--service`
+/// bridge inherits launchd's fixed `PATH`, but a GUI-elevated one inherits the
+/// user's, `/opt/homebrew/bin` included. Pinning this one call site is correct
+/// in itself and delivers no net attack-surface reduction while the rest
+/// stand; widening it is tracked separately.
 const PFCTL: &str = "/sbin/pfctl";
 
 /// Build the argv `pfctl` runs with: [`PFCTL`]'s absolute path followed by
@@ -499,10 +505,14 @@ const fn purges_state(kind: CoverKind) -> bool {
 /// A failed load never committed, so there is no new policy for a purge to
 /// enforce and none is attempted.
 ///
-/// A failed purge is logged, not propagated. Engage failure is fatal to the
-/// start and the transient path unwinds by reloading `/etc/pf.conf` — a fully
-/// open host. A live cover whose purge did not land is the pre-existing
-/// residue; an open host is worse, so the purge never promotes itself into an
+/// A failed purge is logged, not propagated — the chosen contract (owner
+/// decision), not an oversight. The engage then returns `Ok` with the cover
+/// loaded, but flows that already held a state entry keep passing it
+/// (pf matches state before rules); the only trace is the warn in
+/// `bridge.log`, and nothing is surfaced to the caller or the user. Failing the
+/// engage instead is fatal to the start and the transient path unwinds by
+/// reloading `/etc/pf.conf` — a fully open host, which is worse than a cover
+/// whose purge did not land. So the purge never promotes itself into an
 /// engage failure.
 fn load_cover_ruleset<T: CoverRulesetOps + ?Sized>(
     kind: CoverKind,
@@ -580,16 +590,17 @@ fn engage_with(
     //    would fail the cover OPEN — `install_failclosed_cover`'s caller logs
     //    "host NOT blocked, proceeding open" and starts the session uncovered —
     //    over a read that none of the cover-establishing steps below needs. A
-    //    failure is recorded as `None`, not guessed at.
+    //    failure is recorded as `false`: the field is a `bool` because a
+    //    rolled-back binary must still parse the state file (see its doc).
     let was_enabled = match ops.pf_enabled() {
-        Ok(enabled) => Some(enabled),
+        Ok(enabled) => enabled,
         Err(e) => {
             tracing::warn!(
                 error = %e,
-                "could not read whether pf was already enabled; recording it as unknown and \
+                "could not read whether pf was already enabled; recording it as not enabled and \
                  continuing the engage — this read is diagnostic and the cover does not depend on it"
             );
-            None
+            false
         }
     };
 
@@ -812,14 +823,11 @@ pub fn recover_cover(state_dir: &Path, adopting: bool) {
 /// `Unusable` into `None` alongside `Absent`, and for a SWEEP those two are
 /// opposite facts. `Absent` is "no cover was ever engaged". `Unusable` is
 /// Hole's own unreconciled record that one WAS engaged and never confirmed
-/// released — a corrupt file, a truncated write, or the reachable one: a
-/// ROLLBACK, where a newer bridge persisted a field an older binary's schema
-/// rejects (see [`state::FailClosedState::pf_was_enabled`], whose `null` an
-/// older `bool` cannot read). Collapsing it would leave a crashed covered run's
-/// `block out all` on the host with the automatic sweep declining to act, and
-/// only the manual `bridge unlock` left to escape — the same conflation
-/// `release_all_with` already refuses to make. Bumping [`state::SCHEMA_VERSION`]
-/// does not help: a version mismatch is `Unusable` too.
+/// released — a corrupt file, a truncated write, or a version skew (a rollback
+/// across a bumped [`state::SCHEMA_VERSION`]). Collapsing it would leave a
+/// crashed covered run's `block out all` on the host with the automatic sweep
+/// declining to act, and only the manual `bridge unlock` left to escape — the
+/// same conflation `release_all_with` already refuses to make.
 fn recover_cover_with(file: StateFile<state::FailClosedState>, adopting: bool, ops: &mut dyn RecoverOps) {
     match file {
         StateFile::Absent => tracing::debug!("no failclosed-state file, nothing to recover"),

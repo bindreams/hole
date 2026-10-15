@@ -809,14 +809,12 @@ impl RecoverOps for RecordingRecoverOps {
     }
 }
 
-/// A record whose `pf_was_enabled` is the tri-state `None` a failed
-/// `pfctl -s info` read persists — the exact shape an older binary cannot
-/// parse.
-fn unknown_pf_cover(token: &str) -> state::FailClosedState {
+/// A recorded transient cover holding `token`.
+fn recorded_cover(token: &str) -> state::FailClosedState {
     state::FailClosedState {
         version: state::SCHEMA_VERSION,
         pf_token: token.to_owned(),
-        pf_was_enabled: None,
+        pf_was_enabled: false,
     }
 }
 
@@ -834,7 +832,7 @@ fn recover_cover_with_no_state_file_does_nothing() {
 #[skuld::test]
 fn recover_cover_with_a_recorded_cover_restores_and_drops_its_token() {
     let mut ops = RecordingRecoverOps::default();
-    recover_cover_with(StateFile::Present(unknown_pf_cover("42")), true, &mut ops);
+    recover_cover_with(StateFile::Present(recorded_cover("42")), true, &mut ops);
     assert_eq!(ops.restores, vec![(Some("42".to_owned()), true)]);
 }
 
@@ -843,11 +841,9 @@ fn recover_cover_with_a_recorded_cover_restores_and_drops_its_token() {
 /// `Absent` and `Unusable` are opposite facts for a sweep: the first says no
 /// cover was ever engaged, the second is Hole's own unreconciled record that
 /// one WAS and was never confirmed released. The reachable production cause is
-/// a ROLLBACK — a newer bridge persists `"pf_was_enabled": null` for a failed
-/// `pfctl -s info` read, and an older binary's `bool` field cannot read it, so
-/// its whole sweep sees "nothing to recover" while the crashed run's
-/// `block out all` still holds the host. Only the manual `bridge unlock` would
-/// escape it.
+/// a ROLLBACK across a bumped schema version, or a corrupt file — the sweep must
+/// not read it as "nothing to recover" while the crashed run's `block out all`
+/// still holds the host. Only the manual `bridge unlock` would escape it.
 #[skuld::test]
 fn recover_cover_with_an_unreadable_state_file_still_restores_the_host() {
     let mut ops = RecordingRecoverOps::default();
@@ -900,7 +896,7 @@ fn a_pf_token_is_salvaged_from_unusable_bytes_only_when_one_is_really_there() {
         other => panic!("`unusable` must always produce `Unusable`: {other:?}"),
     };
     assert_eq!(
-        token(r#"{"version":99,"pf_token":"7","pf_was_enabled":null,"future_field":1}"#),
+        token(r#"{"version":99,"pf_token":"7","pf_was_enabled":false,"future_field":1}"#),
         Some("7".to_owned()),
         "a version skew and an unknown field are exactly what `deny_unknown_fields` + the version \
          check reject, and exactly where the token is still readable"
@@ -913,42 +909,15 @@ fn a_pf_token_is_salvaged_from_unusable_bytes_only_when_one_is_really_there() {
 
 /// A rolled-back bridge's sweep, driven from persisted bytes through the REAL
 /// [`state::load_presence`] into [`recover_cover_with`] — so `Unusable` is
-/// pinned to a payload rather than hand-constructed at the seam.
-///
-/// Rollback reaches `Unusable` by two vectors, and this binary can only DRIVE
-/// one of them. FIELD skew: a newer bridge persists `"pf_was_enabled": null`
-/// for a failed `pfctl -s info` read and an older binary's `bool` schema
-/// rejects it — asserted below against the real persisted bytes, because this
-/// binary reads that `null` fine and so cannot classify its own write as
-/// unusable. VERSION skew: the same rollback across a bumped
-/// [`state::SCHEMA_VERSION`], which this binary DOES classify as `Unusable` —
-/// so that is the payload the round trip carries.
+/// pinned to a payload rather than hand-constructed at the seam. The payload is
+/// a record one [`state::SCHEMA_VERSION`] ahead, which this binary classifies as
+/// `Unusable`.
 #[skuld::test]
 fn a_rolled_back_bridges_sweep_reads_a_newer_record_as_a_cover_to_clear() {
-    #[derive(serde::Deserialize)]
-    #[serde(deny_unknown_fields)]
-    #[allow(dead_code)]
-    struct OlderFailClosedState {
-        version: u32,
-        pf_token: String,
-        /// The pre-tri-state shape a released binary still carries.
-        pf_was_enabled: bool,
-    }
-
     let dir = tempfile::tempdir().unwrap();
-    state::save(dir.path(), &unknown_pf_cover("7"), None).expect("persist the newer shape");
     let path = dir.path().join(state::STATE_FILE_NAME);
-    let bytes = std::fs::read(&path).unwrap();
-
-    assert!(
-        serde_json::from_slice::<OlderFailClosedState>(&bytes).is_err(),
-        "this test's premise: an older bridge's `bool` schema must reject the `null` a newer one \
-         writes — {}",
-        String::from_utf8_lossy(&bytes)
-    );
-
     let newer = format!(
-        r#"{{"version":{},"pf_token":"7","pf_was_enabled":null}}"#,
+        r#"{{"version":{},"pf_token":"7","pf_was_enabled":false}}"#,
         state::SCHEMA_VERSION + 1
     );
     std::fs::write(&path, &newer).unwrap();
@@ -1288,7 +1257,7 @@ fn a_failed_transient_load_warns_that_the_restore_reopens_the_host() {
 }
 
 #[skuld::test]
-fn a_failed_pf_enabled_read_records_unknown_and_still_engages() {
+fn a_failed_pf_enabled_read_records_not_enabled_and_still_engages() {
     // Step 1 (`pf_enabled`) is DIAGNOSTIC ONLY — `pf_was_enabled`'s single
     // reader is a `tracing::info!` field in `recover_cover`. Aborting the
     // engage on it fails the cover OPEN: `install_failclosed_cover`'s caller
@@ -1317,8 +1286,8 @@ fn a_failed_pf_enabled_read_records_unknown_and_still_engages() {
     );
     assert_eq!(
         ops.saved.iter().map(|st| st.pf_was_enabled).collect::<Vec<_>>(),
-        vec![None],
-        "the record must say UNKNOWN, not assert a value that was never read: {:?}",
+        vec![false],
+        "a failed read is recorded as `false` (the field is a `bool` so a rolled-back binary can parse it): {:?}",
         ops.saved
     );
     assert!(
@@ -1328,11 +1297,53 @@ fn a_failed_pf_enabled_read_records_unknown_and_still_engages() {
     );
 }
 
+/// The previous release's `FailClosedState`, verbatim from `c66ceebf`: a `bool`
+/// `pf_was_enabled` under `deny_unknown_fields`. A binary rolled back to it
+/// reads whatever this one wrote, and a file it cannot parse is `Unusable` to it,
+/// which `state::load` collapses into "nothing to recover" — the crashed run's
+/// `block out all` then stays on the host.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+#[allow(dead_code)]
+struct PreviousReleaseFailClosedState {
+    version: u32,
+    pf_token: String,
+    pf_was_enabled: bool,
+}
+
+/// What an engage persists must parse under [`PreviousReleaseFailClosedState`],
+/// whether or not the `pfctl -s info` read succeeded. Driven through
+/// `engage_with` and the real `state::save`, so it covers what the engage
+/// writes, not a hand-built value.
+#[skuld::test]
+fn what_an_engage_persists_parses_under_the_previous_releases_schema() {
+    for (fail_pf_enabled, pf_enabled) in [(false, true), (false, false), (true, false)] {
+        let mut ops = RecordingEngageOps {
+            fail_pf_enabled,
+            pf_enabled,
+            ..recording_engage_ops()
+        };
+        engage_with(v4(), None, &mut ops).expect("engage_with");
+        let [saved] = ops.saved.as_slice() else {
+            panic!("an engage persists exactly once: {:?}", ops.saved);
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        state::save(dir.path(), saved, None).expect("persist");
+        let bytes = std::fs::read(dir.path().join(state::STATE_FILE_NAME)).unwrap();
+        let parsed = serde_json::from_slice::<PreviousReleaseFailClosedState>(&bytes);
+        assert!(
+            parsed.is_ok(),
+            "the previous release must be able to read this record (pf_enabled read \
+             failed: {fail_pf_enabled}, read value: {pf_enabled}): {} -> {:?}",
+            String::from_utf8_lossy(&bytes),
+            parsed.err()
+        );
+    }
+}
+
 #[skuld::test]
 fn a_successful_pf_enabled_read_is_recorded_as_read() {
-    // The positive half of the tri-state: `None` must mean "could not be read",
-    // never "read as false", or the honest record is indistinguishable from a
-    // measured one.
     let mut ops = RecordingEngageOps {
         pf_enabled: true,
         ..recording_engage_ops()
@@ -1340,7 +1351,7 @@ fn a_successful_pf_enabled_read_is_recorded_as_read() {
     engage_with(v4(), None, &mut ops).expect("engage_with");
     assert_eq!(
         ops.saved.iter().map(|st| st.pf_was_enabled).collect::<Vec<_>>(),
-        vec![Some(true)],
+        vec![true],
         "a read that succeeded must be recorded as the value it read: {:?}",
         ops.saved
     );
@@ -1496,7 +1507,7 @@ fn transient_state() -> state::FailClosedState {
     state::FailClosedState {
         version: state::SCHEMA_VERSION,
         pf_token: "111".into(),
-        pf_was_enabled: Some(false),
+        pf_was_enabled: false,
     }
 }
 

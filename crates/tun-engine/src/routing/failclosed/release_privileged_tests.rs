@@ -440,11 +440,7 @@ fn macos_release_all_clears_a_cover_whose_state_file_is_unreadable() {
 /// `block out all`. The reachable production cause is a ROLLBACK, and the
 /// payload below is the vector of it THIS binary classifies as `Unusable`: a
 /// record one schema version ahead, as a newer bridge writes and a rolled-back
-/// one reads. (The sibling field-skew vector — a newer bridge's
-/// `"pf_was_enabled": null` against an older binary's `bool` — is the same
-/// rollback, but this binary's own schema reads that `null` fine, so writing
-/// it here would exercise `Present` and certify nothing. See
-/// `macos_tests::a_rolled_back_bridges_sweep_reads_a_newer_record_as_a_cover_to_clear`.)
+/// one reads.
 ///
 /// The classification is asserted, not assumed: a payload that quietly parses
 /// takes the `Present` arm, which `recover_cover` handled identically before
@@ -475,7 +471,7 @@ fn macos_recover_cover_clears_a_cover_whose_state_file_is_unreadable() {
     cover.disarm(); // stand in for the crash: no guard remains
 
     let rolled_back = format!(
-        r#"{{"version":{},"pf_token":"{token}","pf_was_enabled":null}}"#,
+        r#"{{"version":{},"pf_token":"{token}","pf_was_enabled":false}}"#,
         super::failclosed_state::SCHEMA_VERSION + 1
     );
     std::fs::write(dir.path().join(super::failclosed_state::STATE_FILE_NAME), &rolled_back).unwrap();

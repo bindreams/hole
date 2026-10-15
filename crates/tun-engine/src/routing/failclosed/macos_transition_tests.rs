@@ -12,6 +12,11 @@
 //! is the one unlabelled test here: it pins [`PublishOnCommit`]'s bracket, the
 //! only part of this file's machinery provable without root.
 //!
+//! These tests drive `engage()` over a live cover. They do not show that the
+//! bridge's own transitions are gap-free: its repair path and its
+//! lockdown-newly-enabled path drop the held `Cover` before engaging, which
+//! reloads `/etc/pf.conf` (bindreams/hole#758).
+//!
 //! A DESCENDANT module of `platform` (mounted from `macos.rs`) rather than a
 //! sibling of `lockdown_privileged_tests.rs` under `failclosed`: these tests
 //! reach for `Cover`'s private `token` field and the private `pfctl` helper,
