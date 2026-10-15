@@ -2572,7 +2572,16 @@ line numbers (the Windows `hole.pdb` analog; see #393). `bundle.macOS.files` is
 bundle-time-only (not validated by `tauri_build::build()` like `resources`), so the
 dSYM — the build's own output — needs no `build.rs` stub. cargo's `split-debuginfo = "packed"` emits `target/release/hole.dSYM` as a *symlink* into `deps/`, which the
 bundler would ship dangling; the `hole-dmg` build dereferences it into `.cache/`
-(the source `macOS.files` points at) before bundling. The `hole-dmg-tests` pytest
+(the source `macOS.files` points at) before bundling.
+
+The dSYM and the shipped binary must come from **one link**: the symbolizer matches
+them by Mach-O UUID, and every build of `hole` links a fresh UUID whenever any input
+differs (#1066 — `tauri build` bumped to 2.12 rewrites `crates/hole/Cargo.toml`
+before compiling, so the tree is dirty and the baked `HOLE_VERSION` gains `.dirty`;
+it also sets `MACOSX_DEPLOYMENT_TARGET`, so cargo rebuilds every crate after a preceding
+plain `cargo build`). So `hole-dmg` runs `npx tauri build --no-bundle`, takes the dSYM
+from that build, then `npx tauri bundle` assembles the `.app` from the already-built
+binary. Never put a `cargo build -p hole` before it. The `hole-dmg-tests` pytest
 derives its expected payload from `cargo xtask bindir-names --os darwin`, so the
 Tauri config can't silently drift.
 

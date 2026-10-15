@@ -76,8 +76,8 @@ jobs:
       # carries the platform information. Node.js is installed by the
       # `setup-build` composite action above; `hole-msi` cascades through
       # the `frontend-build` xtask target (which runs `npm ci` + `npm run
-      # build`), and `hole-dmg`'s `npx tauri build` runs the
-      # `beforeBuildCommand` itself. See bindreams/hole#372.
+      # build`), and `hole-dmg`'s `npx tauri build --no-bundle` runs
+      # the `beforeBuildCommand` itself. See bindreams/hole#372.
       - name: Build artifact
         shell: bash
         run: cargo xtask build "hole-${{ matrix.ext }}"
