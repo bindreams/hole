@@ -412,13 +412,23 @@ synchronously (blocks the worker on `netsh`/`route`); converting it to the
 
 ### Windows service stop reporting
 
-`run_service` reports `SERVICE_STOP_PENDING` for each teardown phase
-([`StopPhase`](crates/bridge/src/service_stop.rs): proxy stop, ETW close, runtime
-shutdown), and `Stopped` only after the last. A phase is reported when the
-previous one finishes and nothing reports on a timer, so a wedged phase freezes
-the checkpoint where `sc query` and the cutover/uninstall `NotifyServiceStatusChange`
-waiters can see it. The wait hints are estimates the bridge does not enforce; they
-add no bound to teardown. Only Windows CI exercises the SCM side.
+`run_service` reports `SERVICE_STOP_PENDING` for each stop phase
+([`StopPhase`](crates/bridge/src/service_stop.rs): stop requested, proxy stop, ETW
+close, runtime shutdown), and `Stopped` only after the last. The first report is
+made by the control handler the moment Stop/Shutdown arrives, before the main
+task is signalled, so a stop that lands during a startup await no longer reads as
+`Running`. A later phase is reported when the previous one finishes and nothing
+reports on a timer, so a wedged phase freezes the checkpoint where `sc queryex`
+and the cutover/uninstall `NotifyServiceStatusChange` waiters can see it. Each
+phase entered is also logged at info (`service stop phase`, with its checkpoint)
+to `bridge.log`; on an msiexec timeout the CI diagnostics print `sc queryex HoleBridge` and those lines. A path that fails before teardown (bind failure)
+skips the proxy and ETW phases.
+
+The wait hints are per-phase estimates, not measurements. The bridge does not
+enforce them and they add no bound to teardown, but the `SERVICE_STATUS` docs let
+the SCM or a service control program treat a checkpoint that stays put past the
+hint as a failed stop, so a client may read a slow phase as hung. Only Windows CI
+exercises the SCM side.
 
 ### Spawn-retry & file-contention
 

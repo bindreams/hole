@@ -133,6 +133,30 @@ if (-not $proc.WaitForExit([int]($BoundMinutes * 60000))) {
         Write-Host "(failed to query HoleBridge service: $($_.Exception.Message))"
     }
 
+    # `Get-Service` above shows `StopPending` but not how far the stop got. The
+    # bridge reports a checkpoint per stop phase (1 stop requested, 2 proxy stop,
+    # 3 ETW close, 4 runtime shutdown) and logs each phase entered, so the
+    # checkpoint here plus the last "service stop phase" line name the phase it
+    # wedged in.
+    Write-Host "--- HoleBridge SCM status (STATE, CHECKPOINT, WAIT_HINT) ---"
+    try {
+        sc.exe queryex HoleBridge
+    } catch {
+        Write-Host "(failed to run sc.exe queryex HoleBridge: $($_.Exception.Message))"
+    }
+
+    Write-Host "--- bridge.log: last stop phases entered ---"
+    try {
+        $bridgeLog = Join-Path (Join-Path $env:ProgramData 'hole\logs') 'bridge.log'
+        if (Test-Path $bridgeLog) {
+            Select-String -Path $bridgeLog -Pattern 'service stop phase' -ErrorAction Stop | Select-Object -Last 8 | ForEach-Object { $_.Line }
+        } else {
+            Write-Host "(log not found at $bridgeLog)"
+        }
+    } catch {
+        Write-Host "(failed to read bridge.log: $($_.Exception.Message))"
+    }
+
     Write-Host "--- hole.exe processes ---"
     try {
         $holeProcs = Get-Process hole -ErrorAction SilentlyContinue

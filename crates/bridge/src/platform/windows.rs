@@ -16,7 +16,7 @@ use windows_service::service_control_handler::{self, ServiceControlHandlerResult
 use windows_service::service_dispatcher;
 use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 
-use crate::service_stop::{StopPhase, StopProgress};
+use crate::service_stop::{self, StopPhase, StopProgress};
 
 // Constants ===========================================================================================================
 
@@ -63,14 +63,35 @@ fn run_service() -> Result<(), Box<dyn std::error::Error>> {
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
     let shutdown_tx = std::sync::Mutex::new(Some(shutdown_tx));
 
+    // `StopPending` is reported from the control handler (an SCM thread) as well
+    // as from the main task, so the progress is shared and the status handle,
+    // which only exists once `register` returns, is filled in afterwards. The
+    // SCM delivers no Stop before `Running`, which is reported after that.
+    let status_cell: std::sync::Arc<OnceLock<service_control_handler::ServiceStatusHandle>> =
+        std::sync::Arc::new(OnceLock::new());
+    let stop = std::sync::Arc::new(StopProgress::new({
+        let status_cell = std::sync::Arc::clone(&status_cell);
+        move |phase| match status_cell.get() {
+            Some(handle) => handle
+                .set_service_status(stop_pending_status(phase))
+                .map_err(std::io::Error::other),
+            None => Err(std::io::Error::other("service status handle not registered yet")),
+        }
+    }));
+
+    let handler_stop = std::sync::Arc::clone(&stop);
     let event_handler = move |control_event| -> ServiceControlHandlerResult {
         match control_event {
             ServiceControl::Stop | ServiceControl::Shutdown => {
-                if let Ok(mut guard) = shutdown_tx.lock() {
-                    if let Some(tx) = guard.take() {
-                        let _ = tx.send(());
+                // StopPending first, so the SCM stops seeing `Running` the moment
+                // the Stop lands, whatever the main task is still awaiting.
+                service_stop::request_stop(&handler_stop, || {
+                    if let Ok(mut guard) = shutdown_tx.lock() {
+                        if let Some(tx) = guard.take() {
+                            let _ = tx.send(());
+                        }
                     }
-                }
+                });
                 ServiceControlHandlerResult::NoError
             }
             ServiceControl::Interrogate => ServiceControlHandlerResult::NoError,
@@ -79,6 +100,7 @@ fn run_service() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let status_handle = service_control_handler::register(SERVICE_NAME, event_handler)?;
+    let _ = status_cell.set(status_handle);
 
     // Report StartPending, NOT Running: the cutover child exits on the SCM
     // `Running` edge, so `Running` is deferred until after the socket binds AND
@@ -103,12 +125,7 @@ fn run_service() -> Result<(), Box<dyn std::error::Error>> {
     let status_handle_ready = status_handle;
     // Each teardown phase is reported `StopPending` when it begins, i.e. when the
     // previous one has finished; the checkpoint never advances on its own.
-    let mut stop = StopProgress::new(|phase| {
-        status_handle
-            .set_service_status(stop_pending_status(phase))
-            .map_err(std::io::Error::other)
-    });
-    let stop_progress = &mut stop;
+    let stop_progress = std::sync::Arc::clone(&stop);
     let run_result: Result<(), Box<dyn std::error::Error>> = rt.block_on(async move {
         let state_dir = STATE_DIR_OVERRIDE
             .get()
@@ -250,21 +267,23 @@ fn run_service() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        stop_progress.enter(StopPhase::StopProxy);
-
         // Clean shutdown: stop proxy before exiting. Neither event is a user
         // disconnect, so the target is left unchanged either way; only the
         // event differs, distinguishing an update cutover from a plain
         // machine shutdown for anyone reading the log/history.
-        let mut pm = proxy_shutdown.lock().await;
-        let event = crate::foreground::shutdown_reason(hole_common::update_marker::is_present(&log_dir));
-        if let Err(e) = pm.stop_with(event).await {
-            error!(error = %e, "error stopping proxy during shutdown");
-        }
-        drop(pm);
-
-        stop_progress.enter(StopPhase::CloseEtw);
-        drop(etw_guard);
+        service_stop::tear_down(
+            &stop_progress,
+            async {
+                let mut pm = proxy_shutdown.lock().await;
+                let event = crate::foreground::shutdown_reason(hole_common::update_marker::is_present(&log_dir));
+                if let Err(e) = pm.stop_with(event).await {
+                    error!(error = %e, "error stopping proxy during shutdown");
+                }
+                drop(pm);
+            },
+            || drop(etw_guard),
+        )
+        .await;
 
         Ok(())
     });
@@ -274,22 +293,24 @@ fn run_service() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Runtime drop joins outstanding blocking tasks, so it is a teardown phase of
-    // its own and `Stopped` is reported only after it.
-    stop.enter(StopPhase::ShutdownRuntime);
-    drop(rt);
-
-    // Always report stopped to SCM, even on error.
-    // Use a non-zero exit code if the runtime failed.
+    // its own and `Stopped` is reported only after it. Always report stopped to
+    // SCM, even on error; use a non-zero exit code if the runtime failed.
     let exit_code = if run_result.is_err() { 1 } else { 0 };
-    let _ = status_handle.set_service_status(ServiceStatus {
-        service_type: ServiceType::OWN_PROCESS,
-        current_state: ServiceState::Stopped,
-        controls_accepted: ServiceControlAccept::empty(),
-        exit_code: ServiceExitCode::Win32(exit_code),
-        checkpoint: 0,
-        wait_hint: Duration::ZERO,
-        process_id: None,
-    });
+    service_stop::finish_stop(
+        &stop,
+        || drop(rt),
+        || {
+            let _ = status_handle.set_service_status(ServiceStatus {
+                service_type: ServiceType::OWN_PROCESS,
+                current_state: ServiceState::Stopped,
+                controls_accepted: ServiceControlAccept::empty(),
+                exit_code: ServiceExitCode::Win32(exit_code),
+                checkpoint: 0,
+                wait_hint: Duration::ZERO,
+                process_id: None,
+            });
+        },
+    );
 
     run_result
 }
