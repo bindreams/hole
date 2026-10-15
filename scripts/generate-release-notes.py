@@ -764,6 +764,23 @@ def test_integration_filtering_against_real_history():
         bullet = "- " + PR_NUMBER_RE.sub("", subject).strip()
         if pr_match:
             bullet += f" (#{pr_match.group(1)})"
+        # Positive control: the hole track, over the SAME range, must render
+        # this exact bullet. Without it, a `bullet` that stops matching the
+        # generator's rendering makes the absence check below vacuous.
+        hole_config = load_config(repo_root, "hole")
+        hole_commits = [
+            c for c in list_commits(repo_root, f"{prev_tag}..HEAD") if any(hole_spec.match_file(f) for f in c.files)
+        ]
+        hole_notes = render_notes(
+            categorize(hole_commits, hole_config.categories),
+            new_tag="releases/hole/v999.0.0",
+            previous_tag=prev_tag,
+            repo_url="https://github.com/bindreams/hole",
+        )
+        assert bullet in hole_notes.splitlines(), (
+            f"hole-track notes lack the probe bullet {bullet!r} for hole-only commit {sha[:8]}; "
+            f"the test's bullet no longer matches how the generator renders one"
+        )
         assert bullet not in out.splitlines(), (
             f"ex-ray notes contain hole-only commit {sha[:8]}; include-path filtering may be broken. "
             f"Subject: {subject}"
