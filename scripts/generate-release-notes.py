@@ -757,13 +757,16 @@ def test_integration_filtering_against_real_history():
             encoding="utf-8",
             check=True,
         ).stdout.strip()
-        m = re.search(r"\(#(\d+)\)\s*$", subject)
-        if not m:
-            continue
-        pr_num = m.group(1)
-        assert not re.search(rf"#{pr_num}\b", out), (
-            f"ex-ray notes contain hole-only PR #{pr_num} ({sha[:8]}); "
-            f"include-path filtering may be broken. Subject: {subject}"
+        # Look for the commit's own bullet line, not its number: `#N` also
+        # appears in other commits' subjects as an issue reference
+        # ("closes #N"), and issue and PR numbers share one number space.
+        pr_match = PR_NUMBER_RE.search(subject)
+        bullet = "- " + PR_NUMBER_RE.sub("", subject).strip()
+        if pr_match:
+            bullet += f" (#{pr_match.group(1)})"
+        assert bullet not in out.splitlines(), (
+            f"ex-ray notes contain hole-only commit {sha[:8]}; include-path filtering may be broken. "
+            f"Subject: {subject}"
         )
         return
     # No qualifying hole-only commit in range. Common; not a failure.
