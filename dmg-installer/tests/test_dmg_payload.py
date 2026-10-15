@@ -109,26 +109,40 @@ def test_dsym_uuid_matches_binary(installed_app: Path) -> None:
     )
 
 
+def _embeds_version(data: bytes, version: bytes) -> bool:
+    """Whether `data` embeds `version` as a string of its own.
+
+    A bare tag version (`0.7.0`) also occurs in dependency paths such as
+    `.../foo-0.7.0/src/lib.rs`, so a match inside a longer version or after `-`
+    and before `/` is not the embedded string.
+    """
+    pattern = rb"(?<![0-9.])" + re.escape(version) + rb"(?![0-9]|\.[0-9])"
+    return any(
+        not (data[m.start() - 1:m.start()] == b"-" and data[m.end():m.end() + 1] == b"/")
+        for m in re.finditer(pattern, data)
+    )
+
+
 def test_shipped_version_is_not_dirty(installed_app: Path) -> None:
     """The shipped binary must embed a clean version, never `<version>.dirty` (#1066).
 
     `xtask-lib::display_version` appends `.dirty` when tracked files differ from
-    HEAD at build time, and the result is baked into the binary. The binary is
-    read, not run: the quarantined test copy is killed by Gatekeeper on exec.
-    The clean string is `cargo xtask version --group hole` minus its `.dirty` suffix, so
-    the check cannot pass vacuously. Run this on a clean checkout (CI always is);
-    local edits legitimately produce `.dirty`.
+    HEAD at build time. The binary is read, not run: Gatekeeper kills the
+    quarantined copy on exec. The clean version is `cargo xtask version --group
+    hole` minus `.dirty`; it must be embedded as a string of its own, so a
+    dependency path containing the same bare version does not satisfy the check.
+    Requires a clean checkout.
     """
-    shown = subprocess.run(
+    result = subprocess.run(
         ["cargo", "xtask", "version", "--group", "hole"],
         cwd=REPO_ROOT,
         capture_output=True,
         text=True,
-        check=True,
-    ).stdout.strip()
-    clean = shown.removesuffix(".dirty").encode()
+    )
+    assert result.returncode == 0, f"`cargo xtask version` failed:\n{result.stderr}"
+    clean = result.stdout.strip().removesuffix(".dirty").encode()
     data = (installed_app / "Contents" / "MacOS" / "hole").read_bytes()
-    assert clean in data, f"the hole binary does not embed its version {clean.decode()!r}"
+    assert _embeds_version(data, clean), f"the hole binary does not embed its version {clean.decode()!r}"
     assert clean + b".dirty" not in data, (
         f"the hole binary embeds {clean.decode()}.dirty: the build dirtied tracked files "
         f"before `hole` was compiled. See test_build_leaves_tracked_files_unmodified for which."
@@ -136,21 +150,18 @@ def test_shipped_version_is_not_dirty(installed_app: Path) -> None:
 
 
 def test_build_leaves_tracked_files_unmodified() -> None:
-    """The DMG build must not rewrite any tracked file (#1066).
-
-    The Tauri CLI normalizes `crates/hole/Cargo.toml` (and anything else it
-    decides to touch) before compiling; unless the committed file already has the
-    CLI's form, the tree is dirty and the shipped version ends in `.dirty`.
-    Run this on a clean checkout (CI always is); local edits fail it too.
+    """The Tauri CLI rewrites tracked files (e.g. `crates/hole/Cargo.toml`) before
+    compiling, which dirties the tree and the shipped version (#1066).
+    Requires a clean checkout.
     """
-    out = subprocess.run(
+    result = subprocess.run(
         ["git", "status", "--porcelain", "--untracked-files=no"],
         cwd=REPO_ROOT,
         capture_output=True,
         text=True,
-        check=True,
-    ).stdout
-    assert not out, (
-        f"tracked files differ from HEAD after the build:\n{out}"
+    )
+    assert result.returncode == 0, f"`git status` failed:\n{result.stderr}"
+    assert not result.stdout, (
+        f"tracked files differ from HEAD after the build:\n{result.stdout}"
         f"Commit the form the Tauri CLI writes so it leaves them alone."
     )

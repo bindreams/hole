@@ -131,8 +131,7 @@ path = "tests/elevated_ownership_privileged.rs"
 harness = false
 
 [build-dependencies]
-# Written in the form the Tauri CLI normalizes to: any other spelling is rewritten
-# by `tauri build`, dirtying the tree and so the baked `HOLE_VERSION`.
+# Spelled as the Tauri CLI rewrites it; any other form dirties the tree (and `HOLE_VERSION`) on build.
 tauri-build = { version = "2", features = [] }
 xtask-lib = { path = "../../xtask-lib", features = ["version"] }
 resvg = "0.47"
