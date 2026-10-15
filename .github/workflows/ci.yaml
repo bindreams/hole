@@ -1024,7 +1024,7 @@ jobs:
     # sets the requirement: `macos-15-intel` runs ~1.7x slower than the arm64
     # runner across every phase — ~25 min on a warm sccache, and 45m45s measured
     # on a fully cold one (5% hit rate, the first run after a 7-day cache
-    # eviction). Roughly 8 min of that is the duplicated Rust build in #714.
+    # eviction).
     #
     # Re-measured over the last 150 runs (2026-09-11 -> 2026-10-15, every
     # attempt, #1044): darwin/amd64 passed up to 59m12s (median 34m), 99% of

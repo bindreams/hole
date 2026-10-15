@@ -10,7 +10,7 @@ import re
 import subprocess
 from pathlib import Path
 
-from conftest import canonical_darwin_bindir
+from conftest import REPO_ROOT, canonical_darwin_bindir
 
 # Canonical Mach-O UUID shape (8-4-4-4-12 hex), matching
 # msi-installer/tests/test_hole_wxs.py. Unanchored for use with finditer.
@@ -106,4 +106,62 @@ def test_dsym_uuid_matches_binary(installed_app: Path) -> None:
         f"binary UUID(s) {binary_uuids} not all present in dSYM DWARF UUID(s) {dwarf_uuids}; "
         f"std's backtrace symbolizer would skip the dSYM and panic frames would render "
         f"<unknown> (#393)"
+    )
+
+
+def _embeds_version(data: bytes, version: bytes) -> bool:
+    """Whether `data` embeds `version` as a string of its own.
+
+    A bare tag version (`0.7.0`) also occurs in dependency paths such as
+    `.../foo-0.7.0/src/lib.rs`, so a match inside a longer version or after `-`
+    and before `/` is not the embedded string.
+    """
+    pattern = rb"(?<![0-9.])" + re.escape(version) + rb"(?![0-9]|\.[0-9])"
+    return any(
+        not (data[m.start() - 1:m.start()] == b"-" and data[m.end():m.end() + 1] == b"/")
+        for m in re.finditer(pattern, data)
+    )
+
+
+def test_shipped_version_is_not_dirty(installed_app: Path) -> None:
+    """The shipped binary must embed a clean version, never `<version>.dirty` (#1066).
+
+    `xtask-lib::display_version` appends `.dirty` when tracked files differ from
+    HEAD at build time. The binary is read, not run: Gatekeeper kills the
+    quarantined copy on exec. The clean version is `cargo xtask version --group
+    hole` minus `.dirty`; it must be embedded as a string of its own, so a
+    dependency path containing the same bare version does not satisfy the check.
+    Requires a clean checkout.
+    """
+    result = subprocess.run(
+        ["cargo", "xtask", "version", "--group", "hole"],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, f"`cargo xtask version` failed:\n{result.stderr}"
+    clean = result.stdout.strip().removesuffix(".dirty").encode()
+    data = (installed_app / "Contents" / "MacOS" / "hole").read_bytes()
+    assert _embeds_version(data, clean), f"the hole binary does not embed its version {clean.decode()!r}"
+    assert clean + b".dirty" not in data, (
+        f"the hole binary embeds {clean.decode()}.dirty: the build dirtied tracked files "
+        f"before `hole` was compiled. See test_build_leaves_tracked_files_unmodified for which."
+    )
+
+
+def test_build_leaves_tracked_files_unmodified() -> None:
+    """The Tauri CLI rewrites tracked files (e.g. `crates/hole/Cargo.toml`) before
+    compiling, which dirties the tree and the shipped version (#1066).
+    Requires a clean checkout.
+    """
+    result = subprocess.run(
+        ["git", "status", "--porcelain", "--untracked-files=no"],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, f"`git status` failed:\n{result.stderr}"
+    assert not result.stdout, (
+        f"tracked files differ from HEAD after the build:\n{result.stdout}"
+        f"Commit the form the Tauri CLI writes so it leaves them alone."
     )
