@@ -2576,14 +2576,20 @@ bundler would ship dangling; the `hole-dmg` build dereferences it into `.cache/`
 
 The dSYM and the shipped binary must come from **one link**: the symbolizer matches
 them by Mach-O UUID, and every build of `hole` links a fresh UUID whenever any input
-differs (#1066 — `tauri build` bumped to 2.12 rewrites `crates/hole/Cargo.toml`
-before compiling, so the tree is dirty and the baked `HOLE_VERSION` gains `.dirty`;
-it also sets `MACOSX_DEPLOYMENT_TARGET`, so cargo rebuilds every crate after a preceding
-plain `cargo build`). So `hole-dmg` runs `npx tauri build --no-bundle`, takes the dSYM
+differs (#1066 — `tauri build` sets `MACOSX_DEPLOYMENT_TARGET`, so cargo rebuilds
+every crate after a preceding plain `cargo build`, and the Cargo.toml rewrite below
+changed `HOLE_VERSION` between the two links). So `hole-dmg` runs `npx tauri build --no-bundle`, takes the dSYM
 from that build, then `npx tauri bundle` assembles the `.app` from the already-built
-binary. Never put a `cargo build -p hole` before it. The `hole-dmg-tests` pytest
-derives its expected payload from `cargo xtask bindir-names --os darwin`, so the
-Tauri config can't silently drift.
+binary. Never put a `cargo build -p hole` before it.
+
+The same CLI rewrites `crates/hole/Cargo.toml` (`tauri-build = "2"` becomes
+`{ version = "2", features = [] }`) before compiling. That dirties the tree, so the
+baked `HOLE_VERSION` gains `.dirty` on every build, release tags included. The
+committed file therefore already has the CLI's form, and `hole-dmg-tests` fails if a
+build modifies any tracked file or the binary embeds `<version>.dirty`.
+
+The `hole-dmg-tests` pytest derives its expected payload from
+`cargo xtask bindir-names --os darwin`, so the Tauri config can't silently drift.
 
 ## Development
 
