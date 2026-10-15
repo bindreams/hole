@@ -49,13 +49,21 @@ fn all_lists_every_phase_in_teardown_order() {
     fn position(p: StopPhase) -> usize {
         match p {
             StopPhase::StopRequested => 0,
-            StopPhase::StopProxy => 1,
-            StopPhase::CloseEtw => 2,
-            StopPhase::ShutdownRuntime => 3,
+            StopPhase::AcquireProxy => 1,
+            StopPhase::PersistTarget => 2,
+            StopPhase::RestoreDns => 3,
+            StopPhase::StopEngine => 4,
+            StopPhase::ReapPlugins => 5,
+            StopPhase::StopProxy => 6,
+            StopPhase::TearDownRoutes => 7,
+            StopPhase::SettleCover => 8,
+            StopPhase::CloseEtw => 9,
+            StopPhase::DropResources => 10,
+            StopPhase::ShutdownRuntime => 11,
         }
     }
     let positions: Vec<usize> = StopPhase::ALL.iter().map(|p| position(*p)).collect();
-    assert_eq!(positions, vec![0, 1, 2, 3]);
+    assert_eq!(positions, (0..12).collect::<Vec<_>>());
 }
 
 #[skuld::test]
@@ -196,23 +204,35 @@ fn a_stop_control_is_reported_before_the_main_task_is_signalled() {
 }
 
 #[skuld::test]
-fn proxy_stop_is_bracketed_by_its_own_report_and_etw_close_follows_its_own() {
+fn teardown_enters_the_proxy_phases_through_the_progress_it_hands_the_stop_work() {
+    // The proxy stop reports its own sub-phases; `tear_down` only brackets them
+    // with AcquireProxy before and CloseEtw / DropResources after.
     let log = Log::default();
-    let progress = log.progress();
+    let progress = Arc::new(log.progress());
     block_on(tear_down(
         &progress,
-        async {
-            log.step("stop_proxy");
+        |progress| {
+            let log = log.clone();
+            async move {
+                log.step("stop_proxy_begin");
+                progress.enter(StopPhase::RestoreDns);
+                log.step("stop_proxy_end");
+            }
         },
         || log.step("close_etw"),
+        || log.step("drop_resources"),
     ));
     assert_eq!(
         log.events(),
         vec![
-            Event::Reported(StopPhase::StopProxy),
-            Event::Step("stop_proxy"),
+            Event::Reported(StopPhase::AcquireProxy),
+            Event::Step("stop_proxy_begin"),
+            Event::Reported(StopPhase::RestoreDns),
+            Event::Step("stop_proxy_end"),
             Event::Reported(StopPhase::CloseEtw),
             Event::Step("close_etw"),
+            Event::Reported(StopPhase::DropResources),
+            Event::Step("drop_resources"),
         ]
     );
 }
@@ -230,4 +250,107 @@ fn stopped_is_reported_only_after_the_runtime_is_dropped() {
             Event::Step("stopped"),
         ]
     );
+}
+
+/// Subscriber capturing `service stop phase` lines into `writer`, for tests that
+/// assert where the log write falls relative to the report and the signal.
+fn capture_info(writer: &VecWriter) -> impl tracing::Subscriber + Send + Sync {
+    tracing_subscriber::registry().with(
+        tracing_subscriber::fmt::layer()
+            .with_writer(writer.clone())
+            .with_ansi(false)
+            .with_filter(tracing_subscriber::filter::LevelFilter::INFO),
+    )
+}
+
+#[skuld::test]
+fn a_phase_is_reported_to_the_scm_before_it_is_logged() {
+    // A log writer that back-pressures (`lossy(false)` on a wedged disk) must not
+    // stand between a phase and its StopPending report.
+    let writer = VecWriter::new();
+    let _guard = garter::tracing_test::set_default_in_current_thread(capture_info(&writer));
+    let seen_at_report = Mutex::new(None);
+    let progress = StopProgress::new(|_| {
+        *seen_at_report.lock().unwrap() = Some(writer.snapshot_string());
+        Ok(())
+    });
+    progress.enter(StopPhase::CloseEtw);
+    let seen = seen_at_report.lock().unwrap().clone().expect("no report");
+    assert!(
+        !seen.contains("service stop phase"),
+        "logged before the report:\n{seen}"
+    );
+    assert!(writer.snapshot_string().contains("service stop phase"));
+}
+
+#[skuld::test]
+fn a_failed_report_is_logged_as_a_warning() {
+    let writer = VecWriter::new();
+    let _guard = garter::tracing_test::set_default_in_current_thread(capture_info(&writer));
+    let progress = StopProgress::new(|_| Err(std::io::Error::other("SCM refused")));
+    progress.enter(StopPhase::CloseEtw);
+    let out = writer.snapshot_string();
+    assert!(
+        out.contains("failed to report StopPending"),
+        "failure not logged:\n{out}"
+    );
+}
+
+#[skuld::test]
+fn a_stop_control_signals_the_main_task_before_it_logs() {
+    let writer = VecWriter::new();
+    let _guard = garter::tracing_test::set_default_in_current_thread(capture_info(&writer));
+    let log = Log::default();
+    let progress = log.progress();
+    let seen_at_signal = Mutex::new(None);
+    request_stop(&progress, || {
+        log.step("signal");
+        *seen_at_signal.lock().unwrap() = Some(writer.snapshot_string());
+    });
+    let seen = seen_at_signal.lock().unwrap().clone().expect("no signal");
+    assert!(
+        !seen.contains("service stop phase"),
+        "logged before the signal:\n{seen}"
+    );
+    assert!(writer.snapshot_string().contains("StopRequested"));
+    assert_eq!(
+        log.events(),
+        vec![Event::Reported(StopPhase::StopRequested), Event::Step("signal")]
+    );
+}
+
+#[skuld::test]
+fn a_stop_control_does_not_wait_for_a_report_in_flight_on_another_thread() {
+    // The main task is mid-report for a later phase (an SCM call that has not
+    // returned). The control handler must still signal shutdown: whatever that
+    // thread is reporting is later than StopRequested, so the handler's own
+    // report is superseded and there is nothing to wait for.
+    let in_report = std::sync::mpsc::channel::<()>();
+    let release = std::sync::mpsc::channel::<()>();
+    let release_rx = Mutex::new(release.1);
+    let reported = Arc::new(Mutex::new(Vec::new()));
+    let progress = {
+        let reported = Arc::clone(&reported);
+        Arc::new(StopProgress::new(move |p| {
+            if p == StopPhase::StopProxy {
+                in_report.0.send(()).unwrap();
+                release_rx.lock().unwrap().recv().unwrap();
+            }
+            reported.lock().unwrap().push(p);
+            Ok(())
+        }))
+    };
+    let main_task = {
+        let progress = Arc::clone(&progress);
+        std::thread::spawn(move || progress.enter(StopPhase::StopProxy))
+    };
+    in_report.1.recv().unwrap();
+
+    let signalled = std::cell::Cell::new(false);
+    request_stop(&progress, || signalled.set(true));
+    assert!(signalled.get(), "shutdown was not signalled");
+
+    release.0.send(()).unwrap();
+    main_task.join().unwrap();
+    assert_eq!(*reported.lock().unwrap(), vec![StopPhase::StopProxy]);
 }

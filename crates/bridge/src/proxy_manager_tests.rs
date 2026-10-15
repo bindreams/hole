@@ -29,6 +29,8 @@ use tun_engine::{RoutingError, TunIdentity};
 #[derive(Default)]
 struct MockProxyState {
     start_calls: AtomicU32,
+    /// Completed `RunningProxy::stop` calls.
+    stop_calls: AtomicU32,
     fail_start: AtomicBool,
     /// If true, `MockRunning::is_alive` returns false — used to simulate
     /// a crashed ss task for `check_health_detects_crashed_task`.
@@ -139,6 +141,7 @@ impl RunningProxy for MockRunning {
         if let Some(h) = self.handle.take() {
             h.abort();
         }
+        self.state.stop_calls.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
 
@@ -1605,6 +1608,128 @@ fn user_stop_tears_down_routes_before_disengaging_the_lockdown_cover() {
             "the standing cover's persistent filters must outlive the routes they cover"
         );
     });
+}
+
+// Stop-phase reporting (Windows StopPending) --------------------------------------------------------------------------
+
+use crate::service_stop::StopPhase;
+
+/// Runs `stop_with_progress(UserStopped)` and returns each entered phase with
+/// the teardown work already finished at that moment: (phase, DNS restored,
+/// proxy stops completed, route teardowns completed).
+async fn stop_recording_phases<D: crate::dns::system::Dns>(
+    pm: &mut ProxyManager<MockProxy, MockRouting, D>,
+    dns_restored: impl Fn() -> bool,
+    proxy: &MockProxyState,
+    routing: &MockRoutingState,
+) -> Vec<(StopPhase, bool, u32, u32)> {
+    let mut seen = Vec::new();
+    pm.stop_with_progress(SessionEvent::UserStopped, |phase| {
+        seen.push((
+            phase,
+            dns_restored(),
+            proxy.stop_calls.load(Ordering::SeqCst),
+            routing.teardown_calls.load(Ordering::SeqCst),
+        ));
+    })
+    .await
+    .unwrap();
+    seen
+}
+
+#[skuld::test]
+fn a_full_session_stop_enters_each_phase_before_the_work_it_names() {
+    rt().block_on(async {
+        let upstream = crate::test_support::socks5_dns_upstream::Socks5DnsUpstream::bind()
+            .await
+            .unwrap();
+        let dns = crate::test_support::mock_dns::MockDns::new();
+        let dns_state = dns.state_handle();
+        let dir = tempfile::tempdir().unwrap();
+        let routing = MockRouting::new(dir.path().to_path_buf());
+        let routing_state = routing.state();
+        let proxy = MockProxy::new();
+        let proxy_state = proxy.state_handle();
+        let mut pm = ProxyManager::new_with_dns(proxy, routing, dns).with_state_dir(dir.path().to_path_buf());
+        let mut config = test_config();
+        config.local_port = upstream.port();
+        config.dns.enabled = true;
+        config.dns.protocol = hole_common::config::DnsProtocol::PlainTcp;
+        config.dns.servers = vec![IpAddr::V4(Ipv4Addr::new(198, 51, 100, 53))];
+        pm.start(&config).await.unwrap();
+
+        let seen = stop_recording_phases(&mut pm, || dns_state.shutdown_called(), &proxy_state, &routing_state).await;
+
+        // The dispatcher and plugin chain do not exist under the mocks, so their
+        // phases are not entered: a phase names work that is about to run.
+        assert_eq!(
+            seen,
+            vec![
+                (StopPhase::PersistTarget, false, 0, 0),
+                (StopPhase::RestoreDns, false, 0, 0),
+                (StopPhase::StopProxy, true, 0, 0),
+                (StopPhase::TearDownRoutes, true, 1, 0),
+                (StopPhase::SettleCover, true, 1, 1),
+            ]
+        );
+    });
+}
+
+#[skuld::test]
+fn a_socks_only_stop_without_a_state_dir_enters_only_the_phases_with_work() {
+    rt().block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        let routing = MockRouting::new(dir.path().to_path_buf());
+        let routing_state = routing.state();
+        let proxy = MockProxy::new();
+        let proxy_state = proxy.state_handle();
+        let mut pm = ProxyManager::new(proxy, routing);
+        let mut config = test_config();
+        config.tunnel_mode = TunnelMode::SocksOnly;
+        pm.start(&config).await.unwrap();
+
+        let seen = stop_recording_phases(&mut pm, || false, &proxy_state, &routing_state).await;
+
+        assert_eq!(
+            seen,
+            vec![
+                (StopPhase::StopProxy, false, 0, 0),
+                (StopPhase::SettleCover, false, 1, 0)
+            ]
+        );
+    });
+}
+
+#[skuld::test]
+fn stopping_an_idle_manager_enters_no_phase() {
+    rt().block_on(async {
+        let (mut pm, _dir) = new_manager(MockProxy::new());
+        let mut seen = Vec::new();
+        pm.stop_with_progress(SessionEvent::UserStopped, |phase| seen.push(phase))
+            .await
+            .unwrap();
+        assert_eq!(seen, vec![]);
+    });
+}
+
+/// The dispatcher and plugin chain are absent under the mocks, so no behavioral
+/// test can show their phases precede their work; pin the source order instead.
+#[skuld::test]
+fn the_engine_and_plugin_phases_are_entered_before_their_work() {
+    let src = include_str!("proxy_manager.rs");
+    let body = &src[src.find("pub async fn stop_with_progress").expect("stop_with_progress")..];
+    let at = |needle: &str| {
+        body.find(needle)
+            .unwrap_or_else(|| panic!("missing in stop_with_progress: {needle}"))
+    };
+    assert!(
+        at("on_phase(StopPhase::StopEngine)") < at("match d.shutdown().await"),
+        "StopEngine must be entered before the dispatcher shutdown"
+    );
+    assert!(
+        at("on_phase(StopPhase::ReapPlugins)") < at("chain.kill_tracked()"),
+        "ReapPlugins must be entered before the plugin reap"
+    );
 }
 
 #[skuld::test]

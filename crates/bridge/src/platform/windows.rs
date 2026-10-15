@@ -271,17 +271,26 @@ fn run_service() -> Result<(), Box<dyn std::error::Error>> {
         // disconnect, so the target is left unchanged either way; only the
         // event differs, distinguishing an update cutover from a plain
         // machine shutdown for anyone reading the log/history.
+        //
+        // The stop future gets its own handle on the proxy manager so that the
+        // last handle, whose drop is the manager's, goes in `DropResources`.
+        let proxy_for_stop = std::sync::Arc::clone(&proxy_shutdown);
         service_stop::tear_down(
             &stop_progress,
-            async {
-                let mut pm = proxy_shutdown.lock().await;
+            |progress| async move {
+                let mut pm = proxy_for_stop.lock().await;
                 let event = crate::foreground::shutdown_reason(hole_common::update_marker::is_present(&log_dir));
-                if let Err(e) = pm.stop_with(event).await {
+                if let Err(e) = pm.stop_with_progress(event, |phase| progress.enter(phase)).await {
                     error!(error = %e, "error stopping proxy during shutdown");
                 }
                 drop(pm);
             },
             || drop(etw_guard),
+            move || {
+                drop(_liveness);
+                drop(shutdown);
+                drop(proxy_shutdown);
+            },
         )
         .await;
 
