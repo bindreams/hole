@@ -410,6 +410,16 @@ defused by `shutdown()` and is constructed only in the `Ok` branch of
 synchronously (blocks the worker on `netsh`/`route`); converting it to the
 `shutdown` + `DebugDropBomb` discipline is tracked.
 
+### Windows service stop reporting
+
+`run_service` reports `SERVICE_STOP_PENDING` for each teardown phase
+([`StopPhase`](crates/bridge/src/service_stop.rs): proxy stop, ETW close, runtime
+shutdown), and `Stopped` only after the last. A phase is reported when the
+previous one finishes and nothing reports on a timer, so a wedged phase freezes
+the checkpoint where `sc query` and the cutover/uninstall `NotifyServiceStatusChange`
+waiters can see it. The wait hints are estimates the bridge does not enforce; they
+add no bound to teardown. Only Windows CI exercises the SCM side.
+
 ### Spawn-retry & file-contention
 
 Transient `Command::spawn` contention (Windows Defender scanning a fresh

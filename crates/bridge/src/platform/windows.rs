@@ -16,6 +16,8 @@ use windows_service::service_control_handler::{self, ServiceControlHandlerResult
 use windows_service::service_dispatcher;
 use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 
+use crate::service_stop::{StopPhase, StopProgress};
+
 // Constants ===========================================================================================================
 
 pub const SERVICE_NAME: &str = "HoleBridge";
@@ -99,6 +101,14 @@ fn run_service() -> Result<(), Box<dyn std::error::Error>> {
     // `ServiceStatusHandle` is Copy (a raw SCM handle wrapper); capture it for the
     // deferred `Running` report inside the async block.
     let status_handle_ready = status_handle;
+    // Each teardown phase is reported `StopPending` when it begins, i.e. when the
+    // previous one has finished; the checkpoint never advances on its own.
+    let mut stop = StopProgress::new(|phase| {
+        status_handle
+            .set_service_status(stop_pending_status(phase))
+            .map_err(std::io::Error::other)
+    });
+    let stop_progress = &mut stop;
     let run_result: Result<(), Box<dyn std::error::Error>> = rt.block_on(async move {
         let state_dir = STATE_DIR_OVERRIDE
             .get()
@@ -221,7 +231,7 @@ fn run_service() -> Result<(), Box<dyn std::error::Error>> {
         // Always-on ETW consumer, held for the service's run lifetime; Drop
         // may abandon rather than join its processing thread if reclaim
         // can't be confirmed (see `etw.rs` module doc, "Drain on Drop").
-        let _etw_guard = match crate::diagnostics::etw::start_consumer() {
+        let etw_guard = match crate::diagnostics::etw::start_consumer() {
             Ok(g) => Some(g),
             Err(e) => {
                 tracing::error!(error = %e, "etw consumer failed to start");
@@ -240,6 +250,8 @@ fn run_service() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
+        stop_progress.enter(StopPhase::StopProxy);
+
         // Clean shutdown: stop proxy before exiting. Neither event is a user
         // disconnect, so the target is left unchanged either way; only the
         // event differs, distinguishing an update cutover from a plain
@@ -249,6 +261,10 @@ fn run_service() -> Result<(), Box<dyn std::error::Error>> {
         if let Err(e) = pm.stop_with(event).await {
             error!(error = %e, "error stopping proxy during shutdown");
         }
+        drop(pm);
+
+        stop_progress.enter(StopPhase::CloseEtw);
+        drop(etw_guard);
 
         Ok(())
     });
@@ -256,6 +272,11 @@ fn run_service() -> Result<(), Box<dyn std::error::Error>> {
     if let Err(e) = &run_result {
         error!(error = %e, "bridge runtime error");
     }
+
+    // Runtime drop joins outstanding blocking tasks, so it is a teardown phase of
+    // its own and `Stopped` is reported only after it.
+    stop.enter(StopPhase::ShutdownRuntime);
+    drop(rt);
 
     // Always report stopped to SCM, even on error.
     // Use a non-zero exit code if the runtime failed.
@@ -271,6 +292,19 @@ fn run_service() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     run_result
+}
+
+/// The `StopPending` status reported while `phase` is in progress.
+fn stop_pending_status(phase: StopPhase) -> ServiceStatus {
+    ServiceStatus {
+        service_type: ServiceType::OWN_PROCESS,
+        current_state: ServiceState::StopPending,
+        controls_accepted: ServiceControlAccept::empty(),
+        exit_code: ServiceExitCode::Win32(0),
+        checkpoint: phase.checkpoint(),
+        wait_hint: phase.wait_hint(),
+        process_id: None,
+    }
 }
 
 /// Clear a stale update-in-progress marker on the new bridge's post-bind sweep.
