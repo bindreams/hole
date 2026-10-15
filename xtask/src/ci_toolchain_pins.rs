@@ -286,6 +286,55 @@ fn if_conditions_match(a: &Option<String>, b: &Option<String>) -> bool {
     }
 }
 
+/// Can a step with this `if:` run after an earlier step in its job failed,
+/// was cancelled, or was skipped?
+///
+/// A step with no status function in its `if:` gets an implicit `success()`.
+/// Any of `always()`, `failure()`, `cancelled()` drops it, and `success()`
+/// written out still admits a failed predecessor under `!` or `||`. Boolean
+/// structure is not evaluated, so the answer is conservative: a status
+/// function other than a bare conjunct `success()` always counts.
+/// GitHub matches function names case-insensitively.
+fn if_admits_failed_predecessor(raw: &str) -> bool {
+    let expr = normalize_if_expr(raw).to_ascii_lowercase();
+
+    // Blank out string literals: `'always()'` is data, not a call.
+    let mut code = String::with_capacity(expr.len());
+    let mut in_literal = false;
+    for c in expr.chars() {
+        if c == '\'' {
+            in_literal = !in_literal;
+            code.push(' ');
+        } else {
+            code.push(if in_literal { ' ' } else { c });
+        }
+    }
+    let code: String = code.split_whitespace().collect::<Vec<_>>().join("");
+
+    let calls = |name: &str| code.matches(&format!("{name}(")).count();
+    if calls("always") + calls("failure") + calls("cancelled") > 0 {
+        return true;
+    }
+    if calls("success") == 0 {
+        return false;
+    }
+
+    // Only `success()`. It restricts the step to a succeeded predecessor only
+    // as a plain conjunct: any `||`, any negation (`!` not part of `!=`), or
+    // any comparison touching the call lets the step run after a failure.
+    let negated = code
+        .match_indices('!')
+        .any(|(i, _)| code.as_bytes().get(i + 1) != Some(&b'='));
+    let compared = code.contains("success()=")
+        || code.contains("success()!")
+        || code.contains("success()<")
+        || code.contains("success()>")
+        || code.contains("=success()")
+        || code.contains("<success()")
+        || code.contains(">success()");
+    code.contains("||") || negated || compared
+}
+
 /// Resolves which local composite actions read the Rust toolchain pin file,
 /// directly or transitively through calls to other local composite actions.
 ///
@@ -415,10 +464,16 @@ pub fn audit_checkout_gating(
             }
 
             // Shape 2: consumes a known reader's output, independent of any checkout.
-            // An unconditional reader has run by the time this step is reached, so
-            // its output is set whatever condition the consumer adds.
+            // An unconditional reader has run and succeeded by the time a consumer
+            // with no status function in its `if:` is reached (implicit `success()`),
+            // so its output is set whatever other condition the consumer adds.
             if let Some((_, producer_if)) = reader_if.iter().find(|(id, _)| step_references_output_of(step, id)) {
-                if producer_if.is_some() && !if_conditions_match(&step_if, producer_if) {
+                let consumer_may_outrun_reader = match (producer_if, &step_if) {
+                    (None, Some(consumer)) => if_admits_failed_predecessor(consumer),
+                    (None, None) => false,
+                    (Some(_), _) => !if_conditions_match(&step_if, producer_if),
+                };
+                if consumer_may_outrun_reader {
                     out.push(UngatedRead {
                         file: file.to_owned(),
                         job: job_name.to_owned(),
