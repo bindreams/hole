@@ -3,7 +3,7 @@
 dmgbuild writes the `.DS_Store` (icon size/positions, window, background) directly
 via the ds_store library — no Finder, no osascript — so the layout is
 reproducible on any runner. Run by the `hole-dmg` build.yaml target after
-`npx tauri build` (app-only) and `cargo xtask dmg-background`.
+`npx tauri bundle` (app-only) and `cargo xtask dmg-background`.
 
 Entry point: `uv run --directory dmg-installer build`.
 """
@@ -36,7 +36,7 @@ def build_dmg_at(root: Path, app: Path, dmg_path: Path, background_dir: Path | N
     pass a private dir so they never share the repo-global cache.
     """
     if not app.is_dir():
-        raise dmg_installer.DmgTestError(f"{app.name} not found at {app} — build the app (npx tauri build) first")
+        raise dmg_installer.DmgTestError(f"{app.name} not found at {app} — build the app (npx tauri bundle) first")
     bg_dir = background_dir or root / ".cache" / "dmg"
     background = bg_dir / "background.png"
     background_2x = bg_dir / "background@2x.png"  # dmgbuild's lookForHiDPI pairs it

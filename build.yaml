@@ -124,22 +124,22 @@ targets:
     depends: [galoshes, frontend-build]
     platforms: [darwin/amd64, darwin/arm64]
     build:
-      # Stage hole.dSYM for `bundle.macOS.files`. cargo's `split-debuginfo =
-      # "packed"` emits target/release/hole.dSYM as a SYMLINK into
-      # deps/<hash>.dSYM; the tauri bundler copies macOS.files verbatim and ships
-      # a symlink root as-is, so it would dangle in the .app. Build first, then
-      # dereference (`cp -RL`) into a real directory under .cache — the same
-      # place externalBin sidecars are staged, and a stable path (relative to the
-      # build's repo-root CWD) that `bundle.macOS.files` points at. `npx tauri
-      # build`'s own release build is then an incremental no-op.
-      - cargo build --release -p hole
+      # The dSYM must come from the same link as the shipped binary: std's
+      # backtrace symbolizer matches it by Mach-O UUID, and any second build of
+      # `hole` links a different one. So tauri builds once (`--no-bundle`), the
+      # dSYM is taken from that build, and `tauri bundle` assembles the .app
+      # from the already-built binary.
+      - npx tauri build --no-bundle -v
+      # Packed debuginfo leaves hole.dSYM as a symlink into deps/, which the
+      # bundler would ship dangling; copy it dereferenced to the stable .cache
+      # path `bundle.macOS.files` points at.
       - rm -rf .cache/hole.dSYM && cp -RL target/release/hole.dSYM .cache/hole.dSYM
       # Render the installer background (resvg → background.png + @2x) before assembly.
       - cargo xtask dmg-background
-      # tauri builds only the ad-hoc-signed Hole.app (bundle.targets = ["app"]); the
+      # tauri bundles only the ad-hoc-signed Hole.app (bundle.targets = ["app"]); the
       # DMG itself is assembled deterministically by dmgbuild in the next step — no
-      # Finder/osascript, unlike tauri's bundle_dmg. `-v` keeps the build verbose.
-      - npx tauri build -v
+      # Finder/osascript, unlike tauri's bundle_dmg.
+      - npx tauri bundle -v
       # dmgbuild wraps Hole.app in the styled DMG, writing .DS_Store directly.
       - uv run --directory dmg-installer build
 
