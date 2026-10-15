@@ -18,8 +18,9 @@ jobs:
     # every attempt, n=154): passed up to 12m54s (median 9m), 86% of the old
     # 15; killed once, at 15m06s, in `Post Run setup-build` (cache save) after
     # `Test release scripts` had finished at 11m30s. That post step passed in
-    # 0.4m median and 1.5m max, so the kill was a stall of unknown length and
-    # 15m06s is a floor. Same rule as `test-hole`: 1.25 x 15.1m = 18.9m -> 20.
+    # 0.4m median and 1.5m max; the kill was a tar-then-reserve cache save that
+    # no longer runs on PRs (see `setup-build`), and 15m06s is a floor. Same
+    # rule as `test-hole`: 1.25 x 15.1m = 18.9m -> 20.
     # Raised only, never tightened.
     timeout-minutes: 20
     steps:
@@ -399,9 +400,11 @@ jobs:
     # windows/amd64 (same 150 runs): passed n=87 up to 59m30s (median 52m30s);
     # killed 5 of 150, every time in `Post Run setup-build` (the cache save)
     # after the tests had finished, 51m - 59m into the job. That step passed in
-    # 0m median, 2m24s p90 and 7m06s max, so the kills are stalls: the worst
-    # reconstructed finish is 61m30s (start of the post step plus the p90 of
-    # the step) and it is a floor. 1.25 x 61.5m = 76.9m -> 80.
+    # 0m median, 2m24s p90 and 7m06s max: a Windows tar of ~/.cargo that runs
+    # 1.3m - 7.6m and then loses the key reservation to a parallel job (PR
+    # saves are gone, see `setup-build`). The worst reconstructed finish is
+    # 61m30s (start of the post step plus the p90 of the step) and it is a
+    # floor. 1.25 x 61.5m = 76.9m -> 80.
     #
     # crash_marker_abort was a confirmed, recurring cause of darwin/amd64
     # kills — fixed in tombstone (#842); whether the wall can now drop is unmeasured.
@@ -1096,7 +1099,18 @@ jobs:
       - uses: ./.github/actions/setup-rust
         id: setup-rust
 
+      # Only `main` saves; see `.github/actions/setup-build/action.yaml`.
+      - uses: actions/cache/restore@v6
+        if: github.ref != 'refs/heads/main'
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: cargo-${{ runner.os }}-${{ steps.setup-rust.outputs.cachekey }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-${{ runner.os }}-${{ steps.setup-rust.outputs.cachekey }}-
+
       - uses: actions/cache@v6
+        if: github.ref == 'refs/heads/main'
         with:
           path: |
             ~/.cargo/registry

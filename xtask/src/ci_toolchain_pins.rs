@@ -415,8 +415,10 @@ pub fn audit_checkout_gating(
             }
 
             // Shape 2: consumes a known reader's output, independent of any checkout.
+            // An unconditional reader has run by the time this step is reached, so
+            // its output is set whatever condition the consumer adds.
             if let Some((_, producer_if)) = reader_if.iter().find(|(id, _)| step_references_output_of(step, id)) {
-                if !if_conditions_match(&step_if, producer_if) {
+                if producer_if.is_some() && !if_conditions_match(&step_if, producer_if) {
                     out.push(UngatedRead {
                         file: file.to_owned(),
                         job: job_name.to_owned(),

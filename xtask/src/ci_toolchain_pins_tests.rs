@@ -149,6 +149,18 @@ fn consumer_matching_the_readers_condition_is_clean() {
     );
 }
 
+/// An unconditional reader has run by the time any later step is reached, so
+/// its output is never empty there: the consumer may carry any condition of
+/// its own (`setup-build`'s cache restore/save split on `github.ref`).
+#[skuld::test]
+fn consumer_with_its_own_condition_of_an_unconditional_reader_is_clean() {
+    let yaml = "runs:\n  using: composite\n  steps:\n    - id: rust-version\n      run: sed rust-toolchain.toml >> \"$GITHUB_OUTPUT\"\n    - uses: dtolnay/rust-toolchain@master\n      if: ${{ inputs.y }}\n      with:\n        toolchain: ${{ steps.rust-version.outputs.toolchain }}\n";
+    assert_eq!(
+        audit_checkout_gating("action.yaml", yaml, &BTreeMap::new()).unwrap(),
+        vec![]
+    );
+}
+
 #[skuld::test]
 fn bare_if_and_wrapped_if_are_the_same_condition() {
     let yaml = "jobs:\n  a:\n    steps:\n      - uses: actions/checkout@v7\n        if: inputs.x\n      - name: read\n        if: ${{ inputs.x }}\n        run: sed rust-toolchain.toml >> \"$GITHUB_OUTPUT\"\n";
