@@ -76,6 +76,11 @@ jobs:
     # to clear the censored region so the true tail becomes observable next
     # time this is re-measured; tighten once it is.
     #
+    # Re-measured for #1044 over the last 150 runs (2026-09-11 -> 2026-10-15):
+    # darwin/amd64 passed at up to 42m41s (median 21m47s), 85% of the 50, so
+    # it goes to 55 by the rule `Test hole` uses (1.25 x max, rounded up to
+    # 5m). No run was killed at the 50 in that sample.
+    #
     # The other five legs were never killed, so they KEEP the existing 30 —
     # measured here, deliberately not tightened. Their observed maxima would
     # justify lower walls (1.4-2.2x headroom), but a timeout that has never
@@ -100,7 +105,7 @@ jobs:
       matrix:
         include:
           - { os: windows, arch: amd64, runner: windows-latest,     timeout: 30 }
-          - { os: darwin,  arch: amd64, runner: macos-15-intel,     timeout: 50 }
+          - { os: darwin,  arch: amd64, runner: macos-15-intel,     timeout: 55 }
           - { os: darwin,  arch: arm64, runner: macos-latest,       timeout: 30 }
           - { os: linux,   arch: amd64, runner: ubuntu-latest,      timeout: 30 }
           - { os: linux,   arch: arm64, runner: ubuntu-24.04-arm,   timeout: 30 }
@@ -355,37 +360,40 @@ jobs:
     runs-on: ${{ matrix.runner }}
     # Per-leg, because the legs differ by ~2x: one number would either
     # under-budget darwin/amd64 or push every leg's hang-detection deadline out
-    # to suit the slowest. Whole-job wall clock, 29 runs on `main` (2026-08-27 →
-    # 2026-09-07), re-measured for #989 after darwin/arm64 was killed at its
-    # wall:
+    # to suit the slowest. Whole-job wall clock, last 150 runs of this workflow
+    # (2026-09-11 -> 2026-10-15, main + PRs, every attempt), re-measured for
+    # #1044 after darwin/amd64 was killed at its wall mid-run:
     #
-    #   darwin/arm64   19m54s - 43m12s, 1 killed  -> 70
-    #   windows/amd64  23m48s - 42m06s, 0 killed  -> 60  (38-run sample, kept)
-    #   darwin/amd64   22m22s - 72m30s, 8 killed  -> 90  (see below)
+    #                  passed (min / med / max)   killed at wall   reconstructed
+    #                                                              finish of kills
+    #   darwin/amd64   n=74  47m / 70m / 89m28s   14 of 150        84m - 117m
+    #   darwin/arm64   n=91  22m / 41m / 59m34s    0 of 150
     #
-    # darwin/arm64 is what #989 measured. Its old 45 came from a 16m31s-32m01s
-    # sample taken before #893/#982 gave the macOS privileged lane real work,
-    # and before the `hole`→`hole-tests` cascade grew; the leg reached 43m12s
-    # (96% of the wall) on 2026-09-03 and was killed four days later on the
-    # #988 tauri bump, whose cold-ish rebuild pushed `Build hole test binaries`
-    # to 16m36s against 10m54s/11m18s on the two runs before it. Build is the
-    # dominant and most volatile term on this leg (6m42s - 17m48s observed).
-    # 70 is ~1.6x the largest passing run, chosen to clear the censored region
-    # so the true tail becomes observable; tighten once it is.
+    # A kill reports `cancelled`, and one cancelled at the wall is told apart
+    # from a superseded run by its duration (>= wall - 2m). Its finish is
+    # reconstructed as the offset of the step it died in plus that leg's
+    # p90 for the steps still to run, so the true tail is not the passing max.
+    # Per-step maxima over passing steps, darwin/amd64: setup-build 21m,
+    # `Build hole test binaries` 52m, `Verify` steps 11m + 6m,
+    # `Test (non-TUN)` 22m, `Test (TUN, macOS)` 14m; build is again the
+    # volatile term (23m median, 36m p90).
     #
-    # NOT a hang: the killed job had already spent 39m54s of its 45 before the
-    # TUN step began, so it was doomed whatever that step did. The step's own
-    # 5m12s sits mid-distribution for the leg (3m18s - 6m24s over 28 passing
-    # runs). See #989 for the full step-by-step timeline.
+    # Rule: wall = 1.25x the worst measured-or-reconstructed finish, rounded up
+    # to 5m. darwin/amd64 1.25 x 117m = 146m -> 150. darwin/arm64 had no kill,
+    # but its 59m34s max sat at 85% of the old 70, so the same rule gives
+    # 1.25 x 59.6m = 74.5m -> 75. Raised only, never tightened: that is the
+    # owner's ruling on CI budgets.
     #
-    # darwin/amd64's 90 is unchanged and still holds: its own distribution was
-    # right-CENSORED by the 45min wall this replaced, and the leg has since been
-    # observed at 72m30s, inside 90 but well past the 56min the censored runs
-    # were reconstructed to. windows/amd64 has never been killed and its 38-run
-    # sample still stands.
+    # NOT a hang: every killed amd64 job was inside the non-TUN or TUN lane,
+    # or past both, with the build step alone at 30m - 52m; the TUN step
+    # itself runs 9m50s median (13m42s max).
+    # See #989 for the arm64 step-by-step timeline of an earlier kill.
+    #
+    # windows/amd64's 60 is not re-derived here: it was killed 5 of 150 times
+    # (all in post-job cleanup) and its passing max is 59m30s.
     #
     # crash_marker_abort was a confirmed, recurring cause of darwin/amd64
-    # kills — fixed in tombstone (#842); whether 90 can now drop is unmeasured.
+    # kills — fixed in tombstone (#842); whether the wall can now drop is unmeasured.
     #
     # These are whole-JOB budgets, shared across build + verify + test. A slow
     # build therefore eats the test steps' headroom — which is exactly how #989
@@ -403,8 +411,8 @@ jobs:
       matrix:
         include:
           - { os: windows, arch: amd64, runner: windows-latest, timeout: 60 }
-          - { os: darwin,  arch: amd64, runner: macos-15-intel, timeout: 90 }
-          - { os: darwin,  arch: arm64, runner: macos-latest,   timeout: 70 }
+          - { os: darwin,  arch: amd64, runner: macos-15-intel, timeout: 150 }
+          - { os: darwin,  arch: arm64, runner: macos-latest,   timeout: 75 }
     steps:
       - uses: actions/checkout@v7
         with:
