@@ -19,7 +19,7 @@ jobs:
     # 15; killed once, at 15m06s, in `Post Run setup-build` (cache save) after
     # `Test release scripts` had finished at 11m30s. That post step passed in
     # 0.4m median and 1.5m max; the kill was a tar-then-reserve cache save that
-    # no longer runs on PRs (see `setup-build`), and 15m06s is a floor. Same
+    # this job no longer runs (see `setup-build`), and 15m06s is a floor. Same
     # rule as `test-hole`: 1.25 x 15.1m = 18.9m -> 20.
     # Raised only, never tightened.
     timeout-minutes: 20
@@ -112,10 +112,16 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { os: windows, arch: amd64, runner: windows-latest,     timeout: 30 }
+          # `cache-saver` marks the one job per cargo cache key that saves
+          # `~/.cargo` on `main`. The key is `runner.os` + rustc commit, with
+          # no arch (dtolnay/rust-toolchain's `cachekey`), so it is one per OS:
+          # windows/amd64, darwin/arm64 (the Intel leg has the longest wall)
+          # and linux/amd64. This matrix compiles the whole workspace, so its
+          # `~/.cargo` is the fullest of any job. No other job saves.
+          - { os: windows, arch: amd64, runner: windows-latest,     timeout: 30, cache-saver: true }
           - { os: darwin,  arch: amd64, runner: macos-15-intel,     timeout: 55 }
-          - { os: darwin,  arch: arm64, runner: macos-latest,       timeout: 30 }
-          - { os: linux,   arch: amd64, runner: ubuntu-latest,      timeout: 30 }
+          - { os: darwin,  arch: arm64, runner: macos-latest,       timeout: 30, cache-saver: true }
+          - { os: linux,   arch: amd64, runner: ubuntu-latest,      timeout: 30, cache-saver: true }
           - { os: linux,   arch: arm64, runner: ubuntu-24.04-arm,   timeout: 30 }
           - { os: windows, arch: arm64, runner: windows-11-arm,     timeout: 30 }
     steps:
@@ -124,6 +130,8 @@ jobs:
           fetch-depth: 0
 
       - uses: ./.github/actions/setup-build
+        with:
+          save-cache: ${{ matrix.cache-saver == true }}
 
       - uses: cargo-bins/cargo-binstall@v1.25.1
 
@@ -401,8 +409,8 @@ jobs:
     # killed 5 of 150, every time in `Post Run setup-build` (the cache save)
     # after the tests had finished, 51m - 59m into the job. That step passed in
     # 0m median, 2m24s p90 and 7m06s max: a Windows tar of ~/.cargo that runs
-    # 1.3m - 7.6m and then loses the key reservation to a parallel job (PR
-    # saves are gone, see `setup-build`). The worst reconstructed finish is
+    # 1.3m - 7.6m and then loses the key reservation to a parallel job (only
+    # `build` saves now, see `setup-build`). The worst reconstructed finish is
     # 61m30s (start of the post step plus the p90 of the step) and it is a
     # floor. 1.25 x 61.5m = 76.9m -> 80.
     #
@@ -1099,18 +1107,9 @@ jobs:
       - uses: ./.github/actions/setup-rust
         id: setup-rust
 
-      # Only `main` saves; see `.github/actions/setup-build/action.yaml`.
+      # Restore only: the `Linux` key is saved by `build` (linux/amd64); see
+      # `.github/actions/setup-build/action.yaml`.
       - uses: actions/cache/restore@v6
-        if: github.ref != 'refs/heads/main'
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-          key: cargo-${{ runner.os }}-${{ steps.setup-rust.outputs.cachekey }}-${{ hashFiles('Cargo.lock') }}
-          restore-keys: cargo-${{ runner.os }}-${{ steps.setup-rust.outputs.cachekey }}-
-
-      - uses: actions/cache@v6
-        if: github.ref == 'refs/heads/main'
         with:
           path: |
             ~/.cargo/registry

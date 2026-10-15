@@ -1,6 +1,15 @@
 name: Setup Build
 description: Set up a compilable Rust workspace (toolchains, cache, runtime deps)
 
+inputs:
+  save-cache:
+    description: >-
+      Save the cargo cache at job end. Set by exactly one job per cache key
+      (runner OS + rustc commit, no arch), and it saves only on `main`. Every
+      other job, and every other ref, restores only.
+    required: false
+    default: "false"
+
 runs:
   using: composite
   steps:
@@ -32,16 +41,17 @@ runs:
         node-version-file: package.json
         cache: npm
 
-    # Only `main` saves. `actions/cache` post-saves by tarring first and
-    # reserving the key after, so every parallel job sharing the key pays the
-    # full tar and all but the first to finish then fail with "Unable to
-    # reserve cache ... another job may be creating this cache". On Windows
-    # that tar takes 1.3-7.6 min, which is what ran past the job wall in
-    # bindreams/hole#1044. A PR-ref cache is also visible to that PR alone,
-    # so a PR save fed nothing but the repo's 10 GB cache quota. PRs restore
-    # `main`'s cache through `restore-keys`.
+    # `actions/cache` post-saves by tarring first and reserving the key after,
+    # so every parallel job sharing a key pays the full tar and all but the
+    # first to finish then fail with "Unable to reserve cache ... another job
+    # may be creating this cache". On Windows that tar takes 1.3-7.6 min, which
+    # is what ran past the job wall in bindreams/hole#1044. So a job saves only
+    # when it is the one designated saver for its key (`save-cache`) and the
+    # ref is `main`: a PR-ref cache is visible to that PR alone and would only
+    # fill the repo's 10 GB cache quota. Everything else restores; PRs
+    # read `main`'s cache through `restore-keys`.
     - uses: actions/cache/restore@v6
-      if: github.ref != 'refs/heads/main'
+      if: github.ref != 'refs/heads/main' || inputs.save-cache != 'true'
       with:
         path: |
           ~/.cargo/registry
@@ -50,7 +60,7 @@ runs:
         restore-keys: cargo-${{ runner.os }}-${{ steps.setup-rust.outputs.cachekey }}-
 
     - uses: actions/cache@v6
-      if: github.ref == 'refs/heads/main'
+      if: github.ref == 'refs/heads/main' && inputs.save-cache == 'true'
       with:
         path: |
           ~/.cargo/registry
