@@ -10,7 +10,7 @@ import re
 import subprocess
 from pathlib import Path
 
-from conftest import canonical_darwin_bindir
+from conftest import REPO_ROOT, canonical_darwin_bindir
 
 # Canonical Mach-O UUID shape (8-4-4-4-12 hex), matching
 # msi-installer/tests/test_hole_wxs.py. Unanchored for use with finditer.
@@ -106,4 +106,51 @@ def test_dsym_uuid_matches_binary(installed_app: Path) -> None:
         f"binary UUID(s) {binary_uuids} not all present in dSYM DWARF UUID(s) {dwarf_uuids}; "
         f"std's backtrace symbolizer would skip the dSYM and panic frames would render "
         f"<unknown> (#393)"
+    )
+
+
+def test_shipped_version_is_not_dirty(installed_app: Path) -> None:
+    """The shipped binary must embed a clean version, never `<version>.dirty` (#1066).
+
+    `xtask-lib::display_version` appends `.dirty` when tracked files differ from
+    HEAD at build time, and the result is baked into the binary. The binary is
+    read, not run: the quarantined test copy is killed by Gatekeeper on exec.
+    The clean string is `cargo xtask version --group hole` minus its `.dirty` suffix, so
+    the check cannot pass vacuously. Run this on a clean checkout (CI always is);
+    local edits legitimately produce `.dirty`.
+    """
+    shown = subprocess.run(
+        ["cargo", "xtask", "version", "--group", "hole"],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    clean = shown.removesuffix(".dirty").encode()
+    data = (installed_app / "Contents" / "MacOS" / "hole").read_bytes()
+    assert clean in data, f"the hole binary does not embed its version {clean.decode()!r}"
+    assert clean + b".dirty" not in data, (
+        f"the hole binary embeds {clean.decode()}.dirty: the build dirtied tracked files "
+        f"before `hole` was compiled. See test_build_leaves_tracked_files_unmodified for which."
+    )
+
+
+def test_build_leaves_tracked_files_unmodified() -> None:
+    """The DMG build must not rewrite any tracked file (#1066).
+
+    The Tauri CLI normalizes `crates/hole/Cargo.toml` (and anything else it
+    decides to touch) before compiling; unless the committed file already has the
+    CLI's form, the tree is dirty and the shipped version ends in `.dirty`.
+    Run this on a clean checkout (CI always is); local edits fail it too.
+    """
+    out = subprocess.run(
+        ["git", "status", "--porcelain", "--untracked-files=no"],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    assert not out, (
+        f"tracked files differ from HEAD after the build:\n{out}"
+        f"Commit the form the Tauri CLI writes so it leaves them alone."
     )
