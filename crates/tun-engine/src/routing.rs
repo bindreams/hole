@@ -392,24 +392,35 @@ pub(crate) fn log_route_command(phase: &str, cmd: &str) {
     info!(phase, cmd, "running route command");
 }
 
-/// The tool's bare name (`route`, `netsh`) for [`RouteCommandError`], whose
-/// `Display` reaches a GUI toast and stays free of paths.
-fn program_name(tool: SystemTool) -> String {
-    tool.path()
-        .file_stem()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default()
-}
-
 /// Spawn one command, log it, and report whether the route's state is now
 /// CONFIRMED for this phase's own question — "did it go in" for the FATAL
 /// install phase, "is it now gone" for every BEST_EFFORT phase (see the
 /// Success-oracle section above). The unit both phase runners are built
 /// from.
 fn exec_one<P: Phase>(tool: SystemTool, args: &[String], phase: P) -> Result<(), CommandFailure> {
-    let mut command = tool.command();
-    command.args(args);
-    run_command(command, tool.display_with(args), phase)
+    let built = tool.command().map(|mut command| {
+        command.args(args);
+        command
+    });
+    run_built(built, tool.display_with(args), phase)
+}
+
+/// [`run_command`] for a command that may not have been buildable. A tool with
+/// no trustworthy path (Windows system directory unreadable) is the same spawn
+/// failure a missing binary gives, so a best-effort teardown logs it and goes
+/// on; it is never a panic and never a bare-name spawn.
+fn run_built<P: Phase>(built: std::io::Result<Command>, cmd: String, phase: P) -> Result<(), CommandFailure> {
+    match built {
+        Ok(command) => run_command(command, cmd, phase),
+        Err(e) => Err(spawn_failed(phase.name(), &cmd, e)),
+    }
+}
+
+/// Log a route command that never ran and wrap the cause. A missing
+/// `netsh`/`route` is never expected, in any phase.
+fn spawn_failed(phase_name: &str, cmd: &str, e: std::io::Error) -> CommandFailure {
+    warn!(phase = phase_name, cmd, error = %e, "route command failed to spawn");
+    CommandFailure::Spawn(e)
 }
 
 /// The spawn-and-judge half of [`exec_one`], split out so tests can drive the
@@ -423,11 +434,7 @@ fn run_command<P: Phase>(mut command: Command, cmd: String, phase: P) -> Result<
 
     let output = match command.output() {
         Ok(output) => output,
-        Err(e) => {
-            // A missing `netsh`/`route` is never expected, in any phase.
-            warn!(phase = phase_name, cmd, error = %e, "route command failed to spawn");
-            return Err(CommandFailure::Spawn(e));
-        }
+        Err(e) => return Err(spawn_failed(phase_name, &cmd, e)),
     };
     let exit_code = output.status.code().unwrap_or(-1);
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -542,7 +549,7 @@ where
         if let Err(e) = checkpoint(installed) {
             installed.pop();
             return Err(RouteCommandError {
-                program: program_name(cmd.tool),
+                program: cmd.tool.name().to_string(),
                 index,
                 total,
                 failure: CommandFailure::Spawn(e),
@@ -576,7 +583,7 @@ where
                 }
             }
             return Err(RouteCommandError {
-                program: program_name(cmd.tool),
+                program: cmd.tool.name().to_string(),
                 index,
                 total,
                 failure,
@@ -963,7 +970,7 @@ pub(crate) fn run_capturing<P: Phase>(
         "running cover command"
     );
     let mut child = tool
-        .command()
+        .command()?
         .args(args)
         .stdin(if stdin.is_some() { Stdio::piped() } else { Stdio::null() })
         .stdout(Stdio::piped())

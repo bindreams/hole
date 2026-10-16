@@ -75,7 +75,9 @@ pub fn log_snapshot(phase: &'static str) {
          ForEach-Object { Get-VMSwitchExtension -VMSwitchName $_.Name } | \
          Format-Table -AutoSize -Wrap",
     );
-    let drivers = run_probe("pnputil", "pnputil /enum-drivers");
+    // Run directly by absolute path, not as a command inside PowerShell, which
+    // would find `pnputil` through the process `PATH`.
+    let drivers = run_tool_probe("pnputil", SystemTool::Pnputil, &["/enum-drivers"]);
 
     let adapter_matches = watched_matches(&adapters);
     let binding_matches = watched_matches(&bindings);
@@ -138,11 +140,12 @@ pub fn log_snapshot(phase: &'static str) {
 /// would force every probe to fail the whole snapshot, which is worse
 /// than "one probe says nothing, three others proceed."
 fn run_probe(label: &'static str, ps_command: &str) -> String {
-    match SystemTool::Powershell
-        .command()
-        .args(["-NoProfile", "-Command", ps_command])
-        .output()
-    {
+    run_tool_probe(label, SystemTool::Powershell, &["-NoProfile", "-Command", ps_command])
+}
+
+/// [`run_probe`]'s spawn-and-report half for any [`SystemTool`].
+fn run_tool_probe(label: &'static str, tool: SystemTool, args: &[&str]) -> String {
+    match tool.command().and_then(|mut c| c.args(args).output()) {
         Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).into_owned(),
         Ok(o) => format!(
             "<probe '{label}' exited {:?}; stderr: {}>",

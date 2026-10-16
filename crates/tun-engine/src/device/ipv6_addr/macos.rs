@@ -94,7 +94,7 @@ pub(super) fn assign(if_index: u32, cidr: Ipv6Cidr) -> Result<Assigned, DeviceEr
     // the argv carries no PII (an interface name and a link-local-scoped
     // CIDR), so it needs no redaction and no separate extraction point.
     info!(interface = %if_name, cmd = SystemTool::Ifconfig.display_with(&args), "running ifconfig alias command");
-    let output = match SystemTool::Ifconfig.command().args(&args).output() {
+    let output = match SystemTool::Ifconfig.command().and_then(|mut c| c.args(&args).output()) {
         Ok(output) => output,
         Err(e) => {
             warn!(interface = %if_name, error = %e, "spawning ifconfig failed; no IPv6 address on the TUN");
@@ -200,8 +200,7 @@ fn prefix_route(cidr: Ipv6Cidr) -> PrefixRoute {
     };
     let Ok(output) = SystemTool::Route
         .command()
-        .args(["-n", "get", "-inet6", &probe.to_string()])
-        .output()
+        .and_then(|mut c| c.args(["-n", "get", "-inet6", &probe.to_string()]).output())
     else {
         return PrefixRoute::Indeterminate("route(8) could not be spawned");
     };

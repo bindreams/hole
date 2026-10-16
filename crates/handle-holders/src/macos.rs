@@ -32,7 +32,8 @@ pub(super) fn find_holders_impl(path: &Path) -> io::Result<Vec<FileHolder>> {
     //   --    : end of options, next arg is a filename
     // Exit codes: 0 = matches found, 1 = no matches (NOT an error here).
     #[allow(clippy::disallowed_methods)]
-    // diagnostic for the test harness only (bridge `test_support`); never runs in the privileged service
+    // `lsof` is found by PATH: this is a public library fn, and its only caller is the bridge's test harness
+    // (`test_support::dist_harness`), never the privileged service; a new caller must not run it as root
     let out = Command::new("lsof")
         .args(["-F", "pc", "--"])
         .arg(&path)

@@ -167,7 +167,7 @@ fn macos_release_all_clears_a_stranded_lockdown_cover() {
         "release_all_covers must restore egress: {NON_PERMITTED}={:?}",
         connect(NON_PERMITTED).err().map(|e| e.kind()),
     );
-    let sr = SystemTool::Pfctl.command().args(["-sr"]).output().unwrap();
+    let sr = SystemTool::Pfctl.command().unwrap().args(["-sr"]).output().unwrap();
     assert!(
         !String::from_utf8_lossy(&sr.stdout).contains("block drop out quick all"),
         "the lockdown block rule must be gone from the live ruleset"
@@ -361,10 +361,23 @@ fn macos_release_all_on_a_clean_host_is_ok() {
     // Compare only -sr / -sn (the RULES) and the enabled flag — `-s info`'s
     // counters move on their own and would make this test flaky for reasons
     // unrelated to the cover.
-    let sr_before = SystemTool::Pfctl.command().args(["-sr"]).output().unwrap().stdout;
-    let sn_before = SystemTool::Pfctl.command().args(["-sn"]).output().unwrap().stdout;
+    let sr_before = SystemTool::Pfctl
+        .command()
+        .unwrap()
+        .args(["-sr"])
+        .output()
+        .unwrap()
+        .stdout;
+    let sn_before = SystemTool::Pfctl
+        .command()
+        .unwrap()
+        .args(["-sn"])
+        .output()
+        .unwrap()
+        .stdout;
     let info_before = SystemTool::Pfctl
         .command()
+        .unwrap()
         .args(["-s", "info"])
         .output()
         .unwrap()
@@ -373,10 +386,23 @@ fn macos_release_all_on_a_clean_host_is_ok() {
 
     routing.release_all_covers().expect("a clean host must return Ok");
 
-    let sr_after = SystemTool::Pfctl.command().args(["-sr"]).output().unwrap().stdout;
-    let sn_after = SystemTool::Pfctl.command().args(["-sn"]).output().unwrap().stdout;
+    let sr_after = SystemTool::Pfctl
+        .command()
+        .unwrap()
+        .args(["-sr"])
+        .output()
+        .unwrap()
+        .stdout;
+    let sn_after = SystemTool::Pfctl
+        .command()
+        .unwrap()
+        .args(["-sn"])
+        .output()
+        .unwrap()
+        .stdout;
     let info_after = SystemTool::Pfctl
         .command()
+        .unwrap()
         .args(["-s", "info"])
         .output()
         .unwrap()
@@ -504,7 +530,7 @@ fn macos_recover_cover_clears_a_cover_whose_state_file_is_unreadable() {
     // stays so that a sweep whose own `-X` failed cannot leave the runner's pf
     // enabled under an unreferenced token until reboot. Best-effort and AFTER
     // the measurement, so it can neither mask nor cause the verdict.
-    let _ = SystemTool::Pfctl.command().args(["-X", &token]).output();
+    let _ = SystemTool::Pfctl.command().unwrap().args(["-X", &token]).output();
 
     assert!(
         restored.is_ok(),

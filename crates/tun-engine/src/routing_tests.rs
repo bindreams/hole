@@ -58,7 +58,7 @@ fn on_link_gw() -> GatewayInfo {
 /// A command as `program arg…`, the program shown by its bare name. The
 /// string-oracle assertions below read the whole command line, tool included.
 fn argv_of(tool: SystemTool, args: &[String]) -> Vec<String> {
-    std::iter::once(program_name(tool))
+    std::iter::once(tool.name().to_string())
         .chain(args.iter().cloned())
         .collect()
 }
@@ -149,10 +149,13 @@ fn route_commands_are_built_with_a_typed_tool() {
     assert!(!seen.is_empty());
     for (tool, args) in seen {
         assert!(allowed.contains(&tool), "{tool:?} is not a route tool on this OS");
-        assert!(tool.path().is_absolute(), "{tool:?} must resolve to an absolute path");
+        assert!(
+            tool.path().unwrap().is_absolute(),
+            "{tool:?} must resolve to an absolute path"
+        );
         assert_ne!(
             args.first().map(String::as_str),
-            Some(program_name(tool).as_str()),
+            Some(tool.name()),
             "{tool:?} args {args:?} start with a program name"
         );
     }
@@ -765,7 +768,7 @@ fn a_non_fatal_failure_does_not_mask_a_later_fatal_one() {
 fn setup_error_does_not_leak_the_command_arguments() {
     let cmds = build_setup_commands("hole-tun", ipv4_server(), &ipv4_gw(), true);
     let err = RouteCommandError {
-        program: program_name(cmds[4].tool),
+        program: cmds[4].tool.name().to_string(),
         index: 4,
         total: cmds.len(),
         failure: CommandFailure::Exit(1),
@@ -2806,7 +2809,7 @@ mod windows_bypass_teardown_scoping {
             .find(|c| c.id == RouteId::ServerBypass)
             .expect("bypass delete must be present");
         assert_eq!(
-            cmd.argv,
+            argv_of(cmd.tool, &cmd.args),
             vec![
                 "netsh".to_string(),
                 "interface".to_string(),
@@ -3570,4 +3573,16 @@ fn a_stale_server_bypass_inside_the_carried_forward_group_is_also_cleared() {
         "the stale group's ServerBypass must be cleared and the now-empty group dropped: {:?}",
         on_disk.stale
     );
+}
+
+/// A tool whose path cannot be resolved (Windows: `GetSystemDirectoryW`
+/// failed) reaches the caller as `CommandFailure::Spawn` in every phase, the
+/// failure a missing binary would give.
+#[skuld::test]
+fn an_unresolvable_tool_is_a_spawn_failure_in_every_phase() {
+    let unresolvable = || Err(std::io::Error::other("no system directory"));
+    let fatal = run_built(unresolvable(), "route add".into(), FatalPhase::Setup);
+    assert!(matches!(fatal, Err(CommandFailure::Spawn(_))), "{fatal:?}");
+    let best_effort = run_built(unresolvable(), "route delete".into(), BestEffortPhase::Teardown);
+    assert!(matches!(best_effort, Err(CommandFailure::Spawn(_))), "{best_effort:?}");
 }

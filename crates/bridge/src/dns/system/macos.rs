@@ -85,7 +85,7 @@ pub struct Networksetup;
 impl MacDnsBackend for Networksetup {
     fn get_settings(&self, service: &str) -> io::Result<Option<DnsPriorAdapter>> {
         let output = SystemTool::Networksetup
-            .command()
+            .command()?
             .args(["-getdnsservers", service])
             .output()?;
         if !output.status.success() {
@@ -174,8 +174,12 @@ impl MacDnsBackend for Networksetup {
     fn flush(&self) -> io::Result<()> {
         // Fire-and-forget the cache flush. `dscacheutil` is fast; the
         // SIGHUP to mDNSResponder is a courtesy notification.
-        let _ = SystemTool::Dscacheutil.command().arg("-flushcache").status();
-        let _ = SystemTool::Killall.command().args(["-HUP", "mDNSResponder"]).status();
+        let _ = SystemTool::Dscacheutil
+            .command()
+            .and_then(|mut c| c.arg("-flushcache").status());
+        let _ = SystemTool::Killall
+            .command()
+            .and_then(|mut c| c.args(["-HUP", "mDNSResponder"]).status());
         Ok(())
     }
 }
@@ -238,7 +242,7 @@ fn split_v4_v6(combined: DnsPrior) -> (DnsPrior, DnsPrior) {
 }
 
 fn set_dnsservers(svc: &str, ips: &[IpAddr]) -> io::Result<()> {
-    let mut cmd = SystemTool::Networksetup.command();
+    let mut cmd = SystemTool::Networksetup.command()?;
     cmd.arg("-setdnsservers").arg(svc);
     if ips.is_empty() {
         cmd.arg("Empty");

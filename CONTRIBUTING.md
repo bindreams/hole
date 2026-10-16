@@ -363,16 +363,33 @@ directory and the *current directory* before System32
 and a lower-privileged user can influence all of those. Every OS tool is a
 [`util::system_tool::SystemTool`](crates/util/src/system_tool.rs) variant
 (`route`, `ifconfig`, `pfctl`, `networksetup`, `launchctl`, `dseditgroup`, … on
-macOS; `route`, `netsh`, `net`, `powershell` on Windows), and
+macOS; `route`, `netsh`, `net`, `powershell`, `pnputil` on Windows), and
 `SystemTool::command()` is the only way to build its `Command`: the program is an
-absolute path, on Windows under the directory `GetSystemDirectoryW` reports.
+absolute path, on Windows under the directory `GetSystemDirectoryW` reports. If
+that call fails, `path()`/`command()` return the error and the caller carries it
+as its spawn error (`CommandFailure::Spawn`, or the `io::Error` it already
+returns), so a best-effort teardown logs it and goes on. The root PowerShell
+child gets `PSModulePath` set to the system module directory alone: its default
+begins with the invoking user's writable `Documents\WindowsPowerShell\Modules`,
+and cmdlet autoload would run a planted module as SYSTEM/admin.
 `RouteCommand`/`SetupCommand` carry a `SystemTool` plus the arguments, not an argv
 whose first element is a program name. Compile-time enforcement is
-[`clippy.toml`](clippy.toml): `std::process::Command::new` and
-`tokio::process::Command::new` are disallowed. A spawn that is not an OS tool
-(Hole's own executable, the unprivileged GUI's `osascript`, the developer's `sudo`,
-`xtask`/`dev-console` tooling, test harnesses) takes an `#[allow]` with its reason;
-test files and tooling files take a module-level one.
+[`clippy.toml`](clippy.toml): `std::process::Command::new`,
+`tokio::process::Command::new` and every `cosca` command constructor
+(`Command::new`, `run`, `run_line`, sync and `tokio`) are disallowed, and so are
+the `cosca::Command` methods that name its program (`executable`, `arg`, `args`,
+`commandline`), because `Command: Default` is a constructor no path can ban. A
+spawn that is not an OS tool (Hole's own executable, the unprivileged GUI's
+`osascript`, the developer's `sudo`, `xtask`/`dev-console` tooling, test
+harnesses) takes an `#[allow]` with its reason; test files and tooling files take
+a module-level one. Test and tooling code that runs under `sudo`/an admin shell
+in CI (the privileged lanes) is attended and keeps bare names.
+
+The plugin spawn is the one root spawn this does not cover:
+`resolve_plugin_path_inner` returns a bare plugin name when no sibling binary
+exists next to the bridge, and `garter::BinaryPlugin::run` (which carries the
+per-site allow) passes it to cosca, which searches `PATH`. Closing it changes what
+users can configure; it is bindreams/hole#1072.
 
 `Dns` has a two-layer seam — outer (`MockDns` at `ProxyManager::new_with_dns`)
 and inner per-platform backend (`MockBackend` at `SystemDns::new_with_backend`).

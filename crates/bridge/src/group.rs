@@ -111,7 +111,7 @@ mod os {
         // "create succeeded" to "the group exists at end of attempt", which
         // is what idempotency requires.
         let output = SystemTool::Dseditgroup
-            .command()
+            .command()?
             .args(["-o", "create", GROUP_NAME])
             .output()?;
 
@@ -131,7 +131,7 @@ mod os {
         // Use `getgrnam` to verify post-failure and avoid stderr-substring
         // matching that breaks under non-English locales.
         let output = SystemTool::Dseditgroup
-            .command()
+            .command()?
             .args(["-o", "delete", GROUP_NAME])
             .output()?;
 
@@ -147,7 +147,7 @@ mod os {
 
     pub fn add_user_to_group(username: &str) -> io::Result<()> {
         let output = SystemTool::Dseditgroup
-            .command()
+            .command()?
             .args(["-o", "edit", "-a", username, "-t", "user", GROUP_NAME])
             .output()?;
 
@@ -172,7 +172,7 @@ mod os {
 
         // 2. stat /dev/console to find the GUI login user
         let output = SystemTool::Stat
-            .command()
+            .command()?
             .args(["-f", "%Su", "/dev/console"])
             .output()?;
         if output.status.success() {
@@ -183,7 +183,7 @@ mod os {
         }
 
         // 3. logname as last resort
-        let output = SystemTool::Logname.command().output()?;
+        let output = SystemTool::Logname.command()?.output()?;
         if output.status.success() {
             let user = String::from_utf8_lossy(&output.stdout).trim().to_string();
             if !user.is_empty() && user != "root" {
@@ -250,7 +250,7 @@ mod os {
 
     pub fn create_group() -> io::Result<()> {
         let output = SystemTool::Net
-            .command()
+            .command()?
             .args(["localgroup", GROUP_NAME, "/add", "/comment:Hole bridge access"])
             .output()?;
 
@@ -272,7 +272,7 @@ mod os {
 
     pub fn delete_group() -> io::Result<()> {
         let output = SystemTool::Net
-            .command()
+            .command()?
             .args(["localgroup", GROUP_NAME, "/delete"])
             .output()?;
 
@@ -294,7 +294,7 @@ mod os {
 
     pub fn add_user_to_group(username: &str) -> io::Result<()> {
         let output = SystemTool::Net
-            .command()
+            .command()?
             .args(["localgroup", GROUP_NAME, username, "/add"])
             .output()?;
 

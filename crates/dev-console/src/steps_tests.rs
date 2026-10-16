@@ -1,3 +1,5 @@
+#![allow(clippy::disallowed_methods)] // build/dev tooling: runs as the invoking developer or CI user, never privileged; see clippy.toml System tools
+
 use crate::steps::{resolve_tool, stage_dir_path, StageDirGuard};
 
 use tokio::io::AsyncReadExt as _;

@@ -184,6 +184,7 @@ fn pfctl_normalized(ruleset: &str) -> Vec<String> {
 
     let mut child = SystemTool::Pfctl
         .command()
+        .unwrap()
         .args(["-vn", "-f", "-"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

@@ -207,10 +207,15 @@ impl ChainPlugin for BinaryPlugin {
         ready: oneshot::Sender<Result<PluginReady, StartError>>,
     ) -> crate::Result<()> {
         let env = self.sip003_env(local, remote)?;
+        // Spawns `self.path` exactly as the caller supplied it. Whether a bare name
+        // reaches here is the caller's resolution (bindreams/hole#1072).
+        #[allow(clippy::disallowed_methods)]
         let mut cmd = Command::new();
+        #[allow(clippy::disallowed_methods)]
         cmd.executable(&self.path);
         // argv[0]: `executable()` only OVERRIDES which file is loaded; the argv is
         // still what names the program, and a command with none is refused.
+        #[allow(clippy::disallowed_methods)]
         cmd.arg(&self.path);
         cmd.env("SS_LOCAL_HOST", env.ss_local_host);
         cmd.env("SS_LOCAL_PORT", env.ss_local_port.to_string());

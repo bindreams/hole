@@ -75,8 +75,7 @@ pub fn remove_adapter(tun_name: &str) {
 
     let result = SystemTool::Powershell
         .command()
-        .args(["-NoProfile", "-Command", &ps])
-        .output();
+        .and_then(|mut c| c.args(["-NoProfile", "-Command", &ps]).output());
 
     match result {
         Ok(out) if out.status.success() => {

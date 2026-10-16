@@ -72,7 +72,7 @@ pub fn log_snapshot(phase: &'static str) {
 /// back to its provider without needing a second `show providers` call.
 fn run_netsh() -> std::io::Result<String> {
     let output = SystemTool::Netsh
-        .command()
+        .command()?
         .args([
             "wfp",
             "show",

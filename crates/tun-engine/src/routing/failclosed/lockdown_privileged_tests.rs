@@ -237,7 +237,7 @@ fn macos_lockdown_permits_server_ip_blocks_other_egress_and_restores() {
         .expect("engage real pf lockdown cover");
 
     // (a) The live main ruleset carries our authoritative block rule.
-    let sr = SystemTool::Pfctl.command().args(["-sr"]).output().unwrap();
+    let sr = SystemTool::Pfctl.command().unwrap().args(["-sr"]).output().unwrap();
     let rules = String::from_utf8_lossy(&sr.stdout);
     assert!(
         rules.contains("block drop out quick all"),
@@ -248,7 +248,12 @@ fn macos_lockdown_permits_server_ip_blocks_other_egress_and_restores() {
     // macOS `Live` in this feature flows through this one measurement, so a
     // failure here means the intent repair and the self-capture guard are dead
     // code that still passes its unit tests — fix the ruleset, never relax this.
-    let labels = SystemTool::Pfctl.command().args(["-s", "labels"]).output().unwrap();
+    let labels = SystemTool::Pfctl
+        .command()
+        .unwrap()
+        .args(["-s", "labels"])
+        .output()
+        .unwrap();
     let labels = String::from_utf8_lossy(&labels.stdout);
     assert!(
         super::platform::labels_listing_carries_our_label(&labels),
@@ -279,7 +284,7 @@ fn macos_lockdown_permits_server_ip_blocks_other_egress_and_restores() {
 
     // (c) Drop restores the pre-lockdown snapshot: block rule gone, egress restored.
     drop(cover);
-    let after = SystemTool::Pfctl.command().args(["-sr"]).output().unwrap();
+    let after = SystemTool::Pfctl.command().unwrap().args(["-sr"]).output().unwrap();
     assert!(
         !String::from_utf8_lossy(&after.stdout).contains("block drop out quick all"),
         "snapshot restore must remove our lockdown block rule"
@@ -355,10 +360,16 @@ fn a_simulated_reboot_rearms_the_cover() {
     // OS state is gone, the filesystem is not.
     SystemTool::Pfctl
         .command()
+        .unwrap()
         .args(["-F", "all"])
         .output()
         .expect("pfctl -F all");
-    SystemTool::Pfctl.command().args(["-d"]).output().expect("pfctl -d");
+    SystemTool::Pfctl
+        .command()
+        .unwrap()
+        .args(["-d"])
+        .output()
+        .expect("pfctl -d");
     // std::mem::forget was not used: `cover`'s Drop would call
     // `disengage_lockdown`, which would (correctly) no-op against the
     // already-torn-down pf state below and clear the state file this test
@@ -368,6 +379,7 @@ fn a_simulated_reboot_rearms_the_cover() {
     // vacuous.
     let info = SystemTool::Pfctl
         .command()
+        .unwrap()
         .args(["-s", "info"])
         .output()
         .expect("pfctl -s info");
@@ -577,7 +589,7 @@ fn macos_failclosed_permits_server_blocks_other_egress() {
     let cover = engage(server_ip, None, dir.path(), None).expect("engage real pf transient cover");
 
     // (a) The live ruleset carries our block-all.
-    let sr = SystemTool::Pfctl.command().args(["-sr"]).output().unwrap();
+    let sr = SystemTool::Pfctl.command().unwrap().args(["-sr"]).output().unwrap();
     let rules = String::from_utf8_lossy(&sr.stdout);
     assert!(
         rules.contains("block") && rules.contains("all"),
@@ -638,7 +650,7 @@ fn macos_failclosed_permits_resolver_blocks_other_egress() {
     let cover = engage(server_ip, Some(resolver_ip), dir.path(), None)
         .expect("engage real pf transient cover with a resolver permit");
 
-    let sr = SystemTool::Pfctl.command().args(["-sr"]).output().unwrap();
+    let sr = SystemTool::Pfctl.command().unwrap().args(["-sr"]).output().unwrap();
     let rules = String::from_utf8_lossy(&sr.stdout);
     assert!(
         rules.contains("1.0.0.1"),

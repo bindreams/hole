@@ -23,7 +23,10 @@ pub struct MacosCutoverOs {
 
 impl MacosCutoverOs {
     fn launchctl(args: &[&str]) -> std::io::Result<()> {
-        let out = util::system_tool::SystemTool::Launchctl.command().args(args).output()?;
+        let out = util::system_tool::SystemTool::Launchctl
+            .command()?
+            .args(args)
+            .output()?;
         if !out.status.success() {
             return Err(std::io::Error::other(format!(
                 "launchctl {args:?} failed: {}",
