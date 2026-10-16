@@ -424,9 +424,10 @@ so a wedged phase freezes the checkpoint where `sc queryex` and the
 cutover/uninstall `NotifyServiceStatusChange` waiters can see it.
 
 Each phase entered is logged at info (`service stop phase`, with its
-checkpoint) to `bridge.log`, by the main task: the control handler does no log
-I/O (see the `service_stop.rs` module doc) and catches a panicking report, since
-an unwinding panic aborts the service. The main task logs the first phase's
+checkpoint) to `bridge.log`, never by the control handler: it does no log I/O of
+its own (a panic still passes through the process-wide panic hook; see the
+`service_stop.rs` module doc) and catches a panicking report, since an unwinding
+panic aborts the service. The shutdown forwarder task logs the first phase's
 hand-off the moment it wakes from the shutdown signal, so a stop wedged before
 its first entry still leaves a line. On an msiexec timeout the CI
 diagnostics print `sc queryex HoleBridge` and those lines. A path that fails
