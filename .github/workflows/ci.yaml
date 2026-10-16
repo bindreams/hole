@@ -224,7 +224,7 @@ jobs:
       # `--features garter/test-utils` builds garter's feature-gated test-utils
       # targets (tap_integration) into the archive; the mock-plugin fixture bin
       # is ungated and always archived (crates/garter/tests/common/mod.rs).
-      # `df` records disk use per phase: one VM now holds the debug workspace,
+      # `df` records disk use per phase: one VM holds the debug workspace,
       # this archive and the release builds.
       - id: archive
         name: Build test archive (ex-Galoshes + tooling crates)
@@ -497,7 +497,9 @@ jobs:
         if: ${{ !cancelled() && steps.hole-build.outcome == 'success' }}
         timeout-minutes: 15
         shell: bash
-        run: cargo xtask verify-skuld-label-coverage
+        env:
+          CARGO_LOG: cargo::core::compiler::fingerprint=info
+        run: .github/scripts/fail-on-compile.sh cargo xtask verify-skuld-label-coverage
 
       # A rename applied to only one of the two places that must agree — the
       # `.config/nextest.toml` name-substring filter and the skuld label
@@ -515,7 +517,11 @@ jobs:
         if: ${{ !cancelled() && steps.hole-build.outcome == 'success' }}
         timeout-minutes: 10
         shell: bash
-        run: cargo xtask verify-global-net-state-labels --record target/global-net-state-expected.json
+        env:
+          CARGO_LOG: cargo::core::compiler::fingerprint=info
+        run: >
+          .github/scripts/fail-on-compile.sh
+          cargo xtask verify-global-net-state-labels --record target/global-net-state-expected.json
 
       # `--no-default-features` mirrors the `hole-tests` xtask target. Without
       # it Cargo recompiles `hole` with `tauri/custom-protocol` ON (different
@@ -539,9 +545,10 @@ jobs:
       #
       # Both keep their earlier budgets (raised only, never tightened).
       #
-      # NO COMPILING. Each test lane runs under `fail-on-compile.sh`, which fails
-      # the step if cargo prints a `Compiling` line: the lanes only re-execute
-      # what `hole-build` compiled, and one that compiles has a different
+      # NO COMPILING. Every cargo step after `hole-build` (the verify steps and the
+      # test lanes) runs under `fail-on-compile.sh`, which fails the step if
+      # cargo prints a `Compiling` line: they only re-execute what `hole-build`
+      # compiled, and one that compiles has a different
       # fingerprint from the build (a leaked environment variable, a build script
       # that reruns on every invocation) while still passing. `CARGO_LOG` makes
       # cargo log why each unit was dirty, so a failure names its cause.
@@ -580,8 +587,11 @@ jobs:
       # Installer install + E2E (Windows) ===============================================================================
       # The E2E drives the INSTALLED binary through WebDriver over loopback, so
       # it runs before the TUN lane. The block is self-cleaning (Uninstall and
-      # Verify uninstall run `always()`), so the TUN lane starts on a VM with the
-      # service removed.
+      # Verify uninstall run `always()`), and the TUN lane runs only once nothing
+      # is left installed: Verify uninstall passed, or the MSI was never
+      # installed. Otherwise the MSI's SYSTEM `HoleBridge` service would share
+      # WFP, routes and the adapter with the TUN tests and confound their
+      # verdicts.
 
       - id: installer-install
         name: Install
@@ -731,8 +741,8 @@ jobs:
       # the liveness lock, IPC bind -- none of which appears in the MSI logs. On
       # failure only: this repo has an unresolved uninstall-hang history (#790)
       # this is meant to help close. Named apart from the test lane's
-      # `bridge-logs-windows-amd64`: both steps now run in one job, and an
-      # artifact name is unique per run.
+      # `bridge-logs-windows-amd64`: both run in one job and an artifact name
+      # is unique per run.
       - id: installer-upload-bridge-logs
         name: Upload installed-bridge logs on failure
         if: ${{ failure() && matrix.installer == true }}
@@ -748,7 +758,7 @@ jobs:
       # Quoted: an unquoted ` #` opens a YAML comment and truncates the name.
       - id: hole-test-tun
         name: "Test (TUN, last test lane for #200)"
-        if: ${{ !cancelled() && steps.hole-build.outcome == 'success' && matrix.os == 'windows' && matrix.arch == 'amd64' }}
+        if: ${{ !cancelled() && steps.hole-build.outcome == 'success' && matrix.os == 'windows' && matrix.arch == 'amd64' && (steps.installer-install.outcome == 'skipped' || steps.installer-verify-uninstall.outcome == 'success') }}
         timeout-minutes: 25
         shell: bash
         env:
@@ -800,7 +810,10 @@ jobs:
         if: ${{ !cancelled() && steps.hole-test-non-tun.outcome == 'success' && steps.hole-test-tun.outcome == 'success' }}
         timeout-minutes: 3
         shell: bash
+        env:
+          CARGO_LOG: cargo::core::compiler::fingerprint=info
         run: >
+          .github/scripts/fail-on-compile.sh
           cargo xtask verify-global-net-state-executed
           --expected target/global-net-state-expected.json
           --junit target/nextest/non-tun/junit.xml
@@ -824,7 +837,7 @@ jobs:
       # write a ROOT-owned `target/nextest/default/junit.xml` that no
       # subsequent unprivileged `cargo nextest run` in this checkout could
       # overwrite or clean up (exit 110) even though the tests themselves had
-      # already passed — the failure mode M1 in the #1012 review names. It is
+      # already passed. It is
       # the ONLY step here that runs privileged, and the last that runs a
       # toolchain.
       - id: hole-test-tun-macos

@@ -18,6 +18,8 @@ pub fn maybe_run() {
     match mode.as_str() {
         "interrupt-parent" => run_interrupt_parent(),
         "interrupt-child" => run_interrupt_child(),
+        "list-env" => list_env(),
+        "strip-then-list-env-in-child" => strip_then_list_env_in_child(),
         other => {
             eprintln!("unknown {MODE_ENV} mode: {other}");
             std::process::exit(2);
@@ -89,4 +91,23 @@ fn run_interrupt_child() -> ! {
             Err(_) => std::process::exit(CHILD_ERROR_EXIT),
         }
     }
+}
+
+/// Print the name of every variable this process has, one per line.
+fn list_env() -> ! {
+    for (name, _) in std::env::vars_os() {
+        println!("{}", name.to_string_lossy());
+    }
+    std::process::exit(0);
+}
+
+/// Strip the way `main` does, then report what a spawned child inherits.
+fn strip_then_list_env_in_child() -> ! {
+    crate::child_env::strip_run_injected();
+    let out = std::process::Command::new(std::env::current_exe().expect("current_exe"))
+        .env(MODE_ENV, "list-env")
+        .output()
+        .expect("spawn child");
+    print!("{}", String::from_utf8_lossy(&out.stdout));
+    std::process::exit(i32::from(!out.status.success()));
 }

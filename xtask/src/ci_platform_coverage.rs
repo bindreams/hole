@@ -21,6 +21,7 @@
 //! is an error, so the grammar cannot silently widen.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 use anyhow::{anyhow, bail, ensure, Context, Result};
 use indexmap::IndexMap;
@@ -91,16 +92,22 @@ fn step_id(step: &Step, index: usize) -> Result<&str> {
 #[derive(Debug, Clone)]
 pub struct Leg {
     fields: IndexMap<String, serde_yml::Value>,
+    /// Every key any entry of the matrix defines. A key outside it is a typo;
+    /// a key inside it that this leg lacks is an unset flag.
+    known_keys: Arc<BTreeSet<String>>,
 }
 
 impl Leg {
-    fn string(&self, key: &str) -> &str {
-        self.fields.get(key).and_then(serde_yml::Value::as_str).unwrap_or("")
-    }
-
-    /// `<os>/<arch>`, the platform spelling used throughout the repo.
+    /// `<os>/<arch>`, the platform spelling used throughout the repo. [`legs`]
+    /// guarantees both are strings.
     pub fn name(&self) -> String {
-        format!("{}/{}", self.string("os"), self.string("arch"))
+        let part = |key: &str| {
+            self.fields
+                .get(key)
+                .and_then(serde_yml::Value::as_str)
+                .unwrap_or_default()
+        };
+        format!("{}/{}", part("os"), part("arch"))
     }
 
     /// The leg's job wall (`matrix.timeout`) in minutes, if it is a literal.
@@ -108,18 +115,25 @@ impl Leg {
         self.fields.get("timeout").and_then(serde_yml::Value::as_u64)
     }
 
-    fn value(&self, key: &str) -> Val {
+    /// `matrix.<key>`: `Null` for a flag this leg does not set, an error for a
+    /// key no leg sets or a value that is not a scalar.
+    fn value(&self, key: &str) -> Result<Val> {
+        ensure!(
+            self.known_keys.contains(key),
+            "`matrix.{key}` is defined by no `include` entry of the matrix"
+        );
         match self.fields.get(key) {
-            None | Some(serde_yml::Value::Null) => Val::Null,
-            Some(serde_yml::Value::Bool(b)) => Val::Bool(*b),
-            Some(serde_yml::Value::String(s)) => Val::Str(s.clone()),
-            Some(serde_yml::Value::Number(n)) => Val::Num(n.as_f64()),
-            Some(_) => Val::Null,
+            None | Some(serde_yml::Value::Null) => Ok(Val::Null),
+            Some(serde_yml::Value::Bool(b)) => Ok(Val::Bool(*b)),
+            Some(serde_yml::Value::String(s)) => Ok(Val::Str(s.clone())),
+            Some(serde_yml::Value::Number(n)) => Ok(Val::Num(n.as_f64())),
+            Some(_) => bail!("`matrix.{key}` is a sequence or mapping, which an `if:` expression cannot compare"),
         }
     }
 }
 
-/// The matrix legs of `job_id`.
+/// The matrix legs of `job_id`. Every entry must name its `os` and `arch` as
+/// strings, so a leg is never nameless.
 pub fn legs(ci_yaml: &str, job_id: &str) -> Result<Vec<Leg>> {
     let ci: CiYaml = serde_yml::from_str(ci_yaml).context("parsing ci.yaml")?;
     let include = job(&ci, job_id)?
@@ -128,7 +142,22 @@ pub fn legs(ci_yaml: &str, job_id: &str) -> Result<Vec<Leg>> {
         .and_then(|s| s.matrix.as_ref())
         .map(|m| m.include.clone())
         .with_context(|| format!("job {job_id:?} has no strategy.matrix.include"))?;
-    Ok(include.into_iter().map(|fields| Leg { fields }).collect())
+    for (i, fields) in include.iter().enumerate() {
+        for key in ["os", "arch"] {
+            ensure!(
+                fields.get(key).is_some_and(serde_yml::Value::is_string),
+                "matrix.include[{i}] has no string `{key}`"
+            );
+        }
+    }
+    let known_keys: Arc<BTreeSet<String>> = Arc::new(include.iter().flat_map(|f| f.keys().cloned()).collect());
+    Ok(include
+        .into_iter()
+        .map(|fields| Leg {
+            fields,
+            known_keys: Arc::clone(&known_keys),
+        })
+        .collect())
 }
 
 // Step selection ======================================================================================================
@@ -607,7 +636,7 @@ impl Ctx<'_> {
             _ => {}
         }
         if let Some(key) = name.strip_prefix("matrix.") {
-            return Ok(self.leg.value(key));
+            return self.leg.value(key);
         }
         if let Some(rest) = name.strip_prefix("steps.") {
             let id = rest

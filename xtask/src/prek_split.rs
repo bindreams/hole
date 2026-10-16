@@ -19,7 +19,7 @@ use serde::Deserialize;
 
 /// The hook the per-leg `clippy-*` steps run instead of prek, so neither prek
 /// run does.
-const CLIPPY_HOOK: &str = "cargo-clippy";
+pub const CLIPPY_HOOK: &str = "cargo-clippy";
 
 /// Which of the two derived runs to perform.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -71,11 +71,19 @@ impl LintSplit {
     pub fn parse(lint_toml: &str, prek_toml: &str) -> Result<Self> {
         let parsed: LintToml = toml::from_str(lint_toml).context("parsing .github/lint.toml")?;
         let hooks = hook_ids(prek_toml)?;
+        ensure!(
+            hooks.contains(CLIPPY_HOOK),
+            "prek.toml has no {CLIPPY_HOOK:?} hook, which the portable run skips by id"
+        );
         let mut platform_dependent: Vec<String> = Vec::new();
         for id in parsed.platform_dependent {
             ensure!(
                 hooks.contains(&id),
                 ".github/lint.toml lists {id:?} as platform-dependent, but prek.toml has no such hook"
+            );
+            ensure!(
+                id != CLIPPY_HOOK,
+                ".github/lint.toml lists {CLIPPY_HOOK:?}, which the per-leg clippy steps already run"
             );
             if !platform_dependent.contains(&id) {
                 platform_dependent.push(id);
@@ -129,7 +137,6 @@ pub fn run(which: PrekRun, repo_root: &Path) -> Result<()> {
     };
     println!("xtask: prek {}", args.join(" "));
     let mut cmd = Command::new("prek");
-    crate::child_env::scrub(&mut cmd);
     let status = cmd
         .args(&args)
         .current_dir(repo_root)

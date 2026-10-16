@@ -19,14 +19,36 @@ if [[ $# -eq 0 ]]; then
 fi
 
 log="$(mktemp)"
-trap 'rm -f "$log"' EXIT
+plain="$(mktemp)"
+trap 'rm -f "$log" "$plain"' EXIT
 
-status=0
-"$@" 2>&1 | tee "$log" || status="${PIPESTATUS[0]}"
+# Both pipeline stages count: a `tee` that cannot write the log (a full disk)
+# leaves a truncated log that would read as "nothing compiled".
+statuses=(0 0)
+"$@" 2>&1 | tee "$log" || statuses=("${PIPESTATUS[@]}")
+status="${statuses[0]}"
+if [[ "${statuses[1]}" -ne 0 ]]; then
+    echo "::error title=Compile gate blind::could not write the command's output to its log (tee exit ${statuses[1]}); cannot tell whether anything compiled"
+    if [[ "$status" -eq 0 ]]; then
+        status=1
+    fi
+fi
 
+# The log is test output, so it may hold NULs or invalid UTF-8: match bytes,
+# not characters. A sed or grep failure (grep status above 1) is a failed gate;
+# only grep's status 1, no match, means nothing compiled.
 # cargo colors its "Compiling" label under CARGO_TERM_COLOR=always.
 esc=$'\033'
-compiled="$(sed -E "s/${esc}\\[[0-9;]*m//g" "$log" | grep -E '^[[:space:]]*Compiling [^[:space:]]+ v[0-9]' || true)"
+if ! LC_ALL=C sed -E "s/${esc}\\[[0-9;]*m//g" "$log" > "$plain"; then
+    echo "::error title=Compile gate blind::could not strip colour codes from the log; cannot tell whether anything compiled"
+    exit 1
+fi
+grep_status=0
+compiled="$(LC_ALL=C grep -a -E '^[[:space:]]*Compiling [^[:space:]]+ v[0-9]' "$plain")" || grep_status=$?
+if [[ "$grep_status" -gt 1 ]]; then
+    echo "::error title=Compile gate blind::grep failed (exit ${grep_status}); cannot tell whether anything compiled"
+    exit 1
+fi
 
 if [[ -n "$compiled" ]]; then
     count="$(printf '%s\n' "$compiled" | wc -l | tr -d ' ')"

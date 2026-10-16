@@ -155,6 +155,37 @@ pub fn test_job(ci_yaml: &str, job_id: &str, step_prefix: Option<&str>) -> Resul
     Ok(TestJob { target, runs, launches })
 }
 
+/// Every cargo command of `job_id` that runs after the step compiling the
+/// `step_prefix` lanes' target, as `(step label, launch)`.
+///
+/// Not only nextest runs: `nextest list` and `cargo xtask` build too, and a
+/// compile in a verify step leaves fresh artifacts that mask the drift from
+/// every lane after it. A command mentioning `cargo` as a token is one.
+pub fn post_build_cargo_launches(ci_yaml: &str, job_id: &str, step_prefix: &str) -> Result<Vec<(String, Launch)>> {
+    let target = test_job(ci_yaml, job_id, Some(step_prefix))?.target;
+    let ci: CiYaml = serde_yml::from_str(ci_yaml).context("parsing ci.yaml")?;
+    let job = ci
+        .jobs
+        .get(job_id)
+        .with_context(|| format!("ci.yaml declares no job {job_id:?}"))?;
+
+    let mut built = false;
+    let mut out = Vec::new();
+    for (i, step) in job.steps.iter().enumerate() {
+        let Some(run) = &step.run else { continue };
+        for cmd in split_commands(&join_line_continuations(run)) {
+            if !built {
+                built = xtask_target(&cmd)? == Some(target.as_str());
+                continue;
+            }
+            if cmd.split_whitespace().map(unquote).any(|t| t == "cargo") {
+                out.push((step_label(step, i), split_launch(&cmd)?.0));
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// The nextest-RUN command of build.yaml target `name`, normalized the same way
 /// as [`test_job`]'s. Exactly one is required: zero or several make "the command
 /// this target runs" ambiguous, and guessing would compare the CI steps against

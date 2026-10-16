@@ -2779,12 +2779,15 @@ and a rerun repeats the platform's whole job.
   leg; `cargo xtask prek portable` runs every other hook once, in linux/amd64.
   A new hook is portable unless it is listed; a listed id that `prek.toml` lacks
   is an error.
-- **Test lanes compile nothing.** The `hole-test-*` steps run under
+- **Test lanes compile nothing.** Every cargo step after `hole-build` (the
+  `hole-verify-*` steps and the `hole-test-*` lanes) runs under
   `.github/scripts/fail-on-compile.sh`, which fails the step if cargo prints a
-  `Compiling` line, with `CARGO_LOG` set so the log says why each unit was
-  dirty. The causes found when it was introduced: `cargo xtask` leaked
-  `cargo run`'s `CARGO_MANIFEST_DIR` to its children, whose `ring` build script
-  hashes it (`xtask/src/child_env.rs`); build scripts named `.git/packed-refs`
+  `Compiling` line or cannot tell (a log it cannot write or scan), with
+  `CARGO_LOG` set so the log says why each unit was dirty. The causes found
+  when it was introduced: `cargo xtask` leaked `cargo run`'s
+  `CARGO_MANIFEST_DIR` to its children, whose `ring` build script hashes it
+  (xtask now strips the injected variables from its own environment at startup,
+  `xtask/src/child_env.rs`); build scripts named `.git/packed-refs`
   or a packed branch ref in `rerun-if-changed`, and a missing path reruns the
   script on every invocation (`xtask-lib/src/git_rerun.rs`); and `sudo env`
   dropped `CARGO_INCREMENTAL`, which is part of every workspace unit's profile.

@@ -10,6 +10,9 @@ use std::process::ExitCode;
 use clap::Parser;
 
 fn main() -> ExitCode {
+    // First, before `install_transparent_interrupt` (`ctrlc` starts a thread): the
+    // strip is sound only while this is the only thread.
+    xtask::child_env::strip_run_injected();
     xtask::install_transparent_interrupt();
     let cli = xtask::Cli::parse();
     match xtask::dispatch(cli) {

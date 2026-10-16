@@ -165,7 +165,6 @@ pub(crate) fn stale_files_to_remove(dir: &Path, keep: &HashSet<String>) -> Resul
 fn run_cargo_test_no_run(profile: Profile) -> Result<Vec<TestArtifact>> {
     let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
     let mut cmd = Command::new(cargo);
-    crate::child_env::scrub(&mut cmd);
     cmd.arg("test")
         .arg("--no-run")
         .arg("--workspace")

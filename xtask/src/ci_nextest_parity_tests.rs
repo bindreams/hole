@@ -3,7 +3,7 @@
 
 use std::fs;
 
-use crate::ci_nextest_parity::{target_nextest_run, test_job, NO_COMPILE_GATE};
+use crate::ci_nextest_parity::{post_build_cargo_launches, target_nextest_run, test_job, NO_COMPILE_GATE};
 use crate::manifest::Manifest;
 
 // ===== test_job ======================================================================================================
@@ -47,7 +47,8 @@ fn a_sudo_env_prefix_is_stripped() {
 jobs:
   j:
     steps:
-      - run: cargo xtask build tests
+      - id: hole-build
+        run: cargo xtask build tests
       - name: root
         run: sudo env "PATH=$PATH" "HOME=$HOME" SKULD_LABELS=tun cargo nextest run -E 'package(a)'
 "#;
@@ -264,7 +265,8 @@ jobs:
 jobs:
   j:
     steps:
-      - run: cargo xtask build tests
+      - id: hole-build
+        run: cargo xtask build tests
       - name: root
         run: sudo env "PATH=$PATH" "HOME=$HOME" NEXTEST_PROFILE=tun cargo nextest run -E 'package(a)'
 "#;
@@ -307,7 +309,8 @@ fn a_forwarded_variable_is_a_launcher_not_a_change() {
 jobs:
   j:
     steps:
-      - run: cargo xtask build tests
+      - id: hole-build
+        run: cargo xtask build tests
       - name: root
         run: sudo env "PATH=$PATH" "HOME=$HOME" "CARGO_INCREMENTAL=$CARGO_INCREMENTAL" cargo nextest run -E 'package(a)'
 "#;
@@ -336,7 +339,8 @@ fn a_set_or_renamed_variable_is_not_a_forward() {
 jobs:
   j:
     steps:
-      - run: cargo xtask build tests
+      - id: hole-build
+        run: cargo xtask build tests
       - name: root
         run: sudo env "{assignment}" cargo nextest run -E 'package(a)'
 "#
@@ -356,7 +360,8 @@ fn a_braced_forward_is_recognized() {
 jobs:
   j:
     steps:
-      - run: cargo xtask build tests
+      - id: hole-build
+        run: cargo xtask build tests
       - name: root
         run: sudo env "CARGO_INCREMENTAL=${CARGO_INCREMENTAL}" cargo nextest run -E 'package(a)'
 "#;
@@ -479,6 +484,75 @@ fn an_unknown_prefix_is_an_error_not_an_empty_pass() {
     assert!(format!("{err:#}").contains("hole-"), "unexpected error: {err:#}");
 }
 
+// ===== post_build_cargo_launches =====================================================================================
+
+/// Every cargo command after the build step is a place cargo can compile, not
+/// just the nextest runs: `nextest list` builds test binaries too.
+#[skuld::test]
+fn a_cargo_xtask_step_after_the_build_is_reported_with_its_gate_state() {
+    let ci = "
+jobs:
+  j:
+    steps:
+      - name: before
+        run: cargo xtask run lint
+      - id: hole-build
+        run: cargo xtask build tests
+      - name: gated
+        run: .github/scripts/fail-on-compile.sh cargo xtask verify-a
+      - name: bare
+        run: cargo xtask verify-b
+      - name: no cargo
+        run: echo done
+";
+    let launches = post_build_cargo_launches(ci, "j", "hole-").expect("analyze");
+    let got: Vec<(&str, bool)> = launches.iter().map(|(l, launch)| (l.as_str(), launch.gated)).collect();
+    assert_eq!(got, vec![("gated", true), ("bare", false)]);
+}
+
+/// A step that mentions cargo only after `sudo env …` is still a cargo step.
+#[skuld::test]
+fn a_privileged_cargo_step_after_the_build_is_reported() {
+    let ci = r#"
+jobs:
+  j:
+    steps:
+      - id: hole-build
+        run: cargo xtask build tests
+      - name: root
+        run: sudo env "PATH=$PATH" cargo xtask verify-b
+"#;
+    let launches = post_build_cargo_launches(ci, "j", "hole-").expect("analyze");
+    assert_eq!(launches.len(), 1);
+    assert!(launches[0].1.privileged && !launches[0].1.gated);
+}
+
+/// Each cargo command of a multi-command step counts on its own.
+#[skuld::test]
+fn every_cargo_command_in_a_step_after_the_build_is_reported() {
+    let ci = "
+jobs:
+  j:
+    steps:
+      - id: hole-build
+        run: cargo xtask build tests
+      - name: two
+        run: |
+          .github/scripts/fail-on-compile.sh cargo xtask a
+          cargo xtask b
+";
+    let launches = post_build_cargo_launches(ci, "j", "hole-").expect("analyze");
+    let gated: Vec<bool> = launches.iter().map(|(_, l)| l.gated).collect();
+    assert_eq!(gated, vec![true, false]);
+}
+
+#[skuld::test]
+fn a_job_with_no_build_step_is_an_error_for_the_post_build_scan() {
+    let ci = "jobs:\n  j:\n    steps:\n      - run: cargo xtask verify\n";
+    let err = post_build_cargo_launches(ci, "j", "hole-").unwrap_err();
+    assert!(format!("{err:#}").contains("hole-"), "unexpected error: {err:#}");
+}
+
 // ===== conformance ===================================================================================================
 
 /// `hole-` steps of `ci.yaml`'s `ci` job that we require to be nextest runs.
@@ -528,20 +602,38 @@ fn ci_test_hole_steps_match_the_hole_tests_target() {
     }
 }
 
-/// A test lane that compiles anything is not re-executing what `hole-build`
-/// built: on Windows it recompiled `hole`, `galoshes` and `garter-bin`, on macOS
-/// the root step recompiled twenty workspace crates as root. Every `hole-` test
-/// lane therefore runs under the gate, which fails the step if cargo prints a
-/// `Compiling` line, so the property is checked on every run rather than
-/// remembered.
+/// A step that compiles after `hole-build` is not re-executing what it built: on
+/// Windows a lane recompiled `hole`, `galoshes` and `garter-bin`, on macOS the
+/// root step recompiled twenty workspace crates as root. And a compile in a
+/// verify step masks drift: the lanes after it find fresh artifacts and pass.
+/// Every cargo command after the build therefore runs under the gate, which
+/// fails the step if cargo prints a `Compiling` line, so the property is checked
+/// on every run rather than remembered.
 #[skuld::test]
-fn every_hole_test_lane_runs_under_the_no_compile_gate() {
+fn every_cargo_step_after_hole_build_runs_under_the_no_compile_gate() {
+    // Guard the guard by MEMBERSHIP: a step renamed out of detection would leave
+    // the scan green while its gate state went unwatched.
+    const MUST_BE_SCANNED: [&str; 6] = [
+        "Verify SKULD_LABELS TUN/non-TUN partition",
+        "Verify global_net_state label matches the nextest.toml filter",
+        "Test (non-TUN)",
+        "Test (TUN, last test lane for #200)",
+        "Verify every global_net_state test executed (windows leg, #999)",
+        "Test (TUN, macOS — root for pfctl)",
+    ];
     let root = crate::repo_root().expect("repo root");
     let ci_yaml = fs::read_to_string(root.join(".github/workflows/ci.yaml")).expect("read ci.yaml");
-    let job = test_job(&ci_yaml, "ci", Some("hole-")).expect("analyze ci.yaml");
+    let launches = post_build_cargo_launches(&ci_yaml, "ci", "hole-").expect("analyze ci.yaml");
 
-    let ungated: Vec<&str> = job
-        .launches
+    let scanned: Vec<&str> = launches.iter().map(|(label, _)| label.as_str()).collect();
+    for step in MUST_BE_SCANNED {
+        assert!(
+            scanned.contains(&step),
+            "ci.yaml step {step:?} is no longer scanned as a cargo step after the build (found {scanned:?})"
+        );
+    }
+
+    let ungated: Vec<&str> = launches
         .iter()
         .filter(|(_, launch)| !launch.gated)
         .map(|(label, _)| label.as_str())
@@ -549,7 +641,7 @@ fn every_hole_test_lane_runs_under_the_no_compile_gate() {
     assert_eq!(
         ungated,
         Vec::<&str>::new(),
-        "these hole- test lanes can compile without failing; start them with {NO_COMPILE_GATE}"
+        "these steps run cargo after hole-build and can compile without failing; start them with {NO_COMPILE_GATE}"
     );
     assert!(
         root.join(NO_COMPILE_GATE).is_file(),

@@ -20,7 +20,7 @@ pub fn rerun_paths(repo_root: &Path) -> Result<Vec<PathBuf>> {
     let mut out = Vec::new();
 
     let head = git_path(repo_root, "HEAD")?;
-    if let Ok(head_text) = std::fs::read_to_string(&head) {
+    if let Some(head_text) = read_head(&head)? {
         out.push(head);
         if let Some(branch) = head_text.trim().strip_prefix("ref: ") {
             out.extend(tracked_or_nearest_ancestor(&git_path(repo_root, branch)?, &refs));
@@ -38,18 +38,38 @@ pub fn rerun_paths(repo_root: &Path) -> Result<Vec<PathBuf>> {
     Ok(out)
 }
 
+/// The text of the `HEAD` file at `path`; `None` only when it does not exist.
+/// Any other failure is an error: swallowing it would drop HEAD and the branch
+/// ref from the tracked paths with nothing to say so.
+pub(crate) fn read_head(path: &Path) -> Result<Option<String>> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => Ok(Some(text)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
+    }
+}
+
 /// Print a `cargo:rerun-if-changed` line per [`rerun_paths`] entry. A failure to
 /// ask git is a warning, not an error: the version stamp itself degrades the
 /// same way (`display_version`), and a build script must not panic over it.
 pub fn emit_rerun_if_changed(repo_root: &Path) {
+    write_rerun_if_changed(repo_root, &mut std::io::stdout().lock()).expect("writing cargo directives to stdout");
+}
+
+/// [`emit_rerun_if_changed`] into `out`.
+pub(crate) fn write_rerun_if_changed(repo_root: &Path, out: &mut impl std::io::Write) -> std::io::Result<()> {
     match rerun_paths(repo_root) {
         Ok(paths) => {
             for p in paths {
-                println!("cargo:rerun-if-changed={}", p.display());
+                writeln!(out, "cargo:rerun-if-changed={}", p.display())?;
             }
         }
-        Err(e) => println!("cargo:warning=cannot resolve git paths for the version stamp: {e:#}"),
+        Err(e) => writeln!(
+            out,
+            "cargo:warning=cannot resolve git paths for the version stamp: {e:#}"
+        )?,
     }
+    Ok(())
 }
 
 /// `path` if it exists, else its nearest existing ancestor that is `floor` or

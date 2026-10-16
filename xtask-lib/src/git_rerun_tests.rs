@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use crate::git_rerun::{rerun_paths, tracked_or_nearest_ancestor};
+use crate::git_rerun::{read_head, rerun_paths, tracked_or_nearest_ancestor, write_rerun_if_changed};
 
 fn git(dir: &Path, args: &[&str]) {
     let ok = Command::new("git")
@@ -141,5 +141,56 @@ fn a_new_tag_lands_under_a_tracked_path() {
         paths.iter().any(|p| new_tag.starts_with(p) && p != &git_dir(r.path())),
         "no tracked path covers {}: {paths:?}",
         new_tag.display()
+    );
+}
+
+/// Only a missing HEAD means "no HEAD to track" (a linked worktree's `.git` is a
+/// file). Any other read failure is an error, or the stamp would silently stop
+/// following commits.
+#[skuld::test]
+fn only_a_missing_head_is_absent() {
+    let dir = tempfile::tempdir().unwrap();
+    assert_eq!(read_head(&dir.path().join("HEAD")).unwrap(), None);
+
+    let head = dir.path().join("HEAD");
+    std::fs::write(&head, "ref: refs/heads/work\n").unwrap();
+    assert_eq!(read_head(&head).unwrap().as_deref(), Some("ref: refs/heads/work\n"));
+
+    // A directory where the file belongs fails to read with a kind other than NotFound.
+    let not_a_file = dir.path().join("dir");
+    std::fs::create_dir(&not_a_file).unwrap();
+    let err = read_head(&not_a_file).unwrap_err();
+    assert!(format!("{err:#}").contains("dir"), "{err:#}");
+}
+
+fn emitted(root: &Path) -> Vec<String> {
+    let mut out = Vec::new();
+    write_rerun_if_changed(root, &mut out).unwrap();
+    String::from_utf8(out).unwrap().lines().map(str::to_string).collect()
+}
+
+/// One `cargo:rerun-if-changed=<path>` line per tracked path, and nothing else.
+#[skuld::test]
+fn the_emitted_lines_are_one_rerun_directive_per_tracked_path() {
+    let r = repo();
+    let want: Vec<String> = rerun_paths(r.path())
+        .unwrap()
+        .iter()
+        .map(|p| format!("cargo:rerun-if-changed={}", p.display()))
+        .collect();
+    assert!(want.len() >= 2, "fixture: HEAD and a branch ref at least");
+    assert_eq!(emitted(r.path()), want);
+}
+
+/// Outside a repository git cannot answer: the build script must print a
+/// warning and carry on, not panic and not print a rerun path.
+#[skuld::test]
+fn outside_a_repository_the_emission_is_a_warning() {
+    let dir = tempfile::tempdir().unwrap();
+    let lines = emitted(dir.path());
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert!(
+        lines[0].starts_with("cargo:warning=cannot resolve git paths for the version stamp: "),
+        "{lines:?}"
     );
 }

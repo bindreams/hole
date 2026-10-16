@@ -155,6 +155,152 @@ jobs:
     assert!(format!("{err:#}").contains("contains"), "unexpected error: {err:#}");
 }
 
+/// A one-step job whose probe step carries `condition`, on a two-leg matrix.
+fn probe_job(condition: &str) -> String {
+    format!(
+        "
+jobs:
+  ci:
+    strategy:
+      matrix:
+        include:
+          - {{ os: windows, arch: amd64, name: Windows, flag: true, off: false }}
+          - {{ os: linux, arch: amd64, name: Linux }}
+    steps:
+      - id: first
+        run: echo
+      - id: probe
+        if: ${{{{ {condition} }}}}
+        run: echo
+      - id: later
+        run: echo
+"
+    )
+}
+
+/// Does the probe step run on the first leg, or why not evaluable.
+fn probe_runs(condition: &str) -> anyhow::Result<bool> {
+    let ci = probe_job(condition);
+    let all = legs(&ci, "ci")?;
+    Ok(steps_on(&all[0], &ci, "ci")?.contains("probe"))
+}
+
+fn probe_error(condition: &str) -> String {
+    format!("{:#}", probe_runs(condition).expect_err(condition))
+}
+
+/// A `matrix.<key>` that no include entry defines is a typo, not a flag a leg
+/// happens to lack: it must not quietly evaluate to a truth value.
+#[skuld::test]
+fn a_matrix_key_no_leg_defines_is_an_error() {
+    let err = probe_error("matrix.hloe == true");
+    assert!(err.contains("hloe"), "unexpected error: {err}");
+    let err = probe_error("matrix.hloe != true");
+    assert!(err.contains("hloe"), "unexpected error: {err}");
+    // Defined on one leg only: the other leg lacks it, which is normal.
+    assert!(probe_runs("matrix.flag == true").unwrap());
+    let ci = probe_job("matrix.flag == true");
+    let all = legs(&ci, "ci").unwrap();
+    assert!(!steps_on(&all[1], &ci, "ci").unwrap().contains("probe"));
+}
+
+#[skuld::test]
+fn a_non_scalar_matrix_value_is_an_error() {
+    let ci = "
+jobs:
+  ci:
+    strategy:
+      matrix:
+        include:
+          - { os: linux, arch: amd64, tags: [a, b] }
+    steps:
+      - id: probe
+        if: matrix.tags == 'a'
+        run: echo
+";
+    let all = legs(ci, "ci").unwrap();
+    let err = format!("{:#}", steps_on(&all[0], ci, "ci").unwrap_err());
+    assert!(err.contains("tags"), "unexpected error: {err}");
+}
+
+/// A leg without `os` or `arch` string values would be named "/" and sort with
+/// every other such leg, so the matrix is rejected where it is read.
+#[skuld::test]
+fn a_leg_without_os_and_arch_strings_is_an_error() {
+    for entry in ["{ arch: amd64 }", "{ os: linux }", "{ os: linux, arch: [amd64] }"] {
+        let ci = format!(
+            "
+jobs:
+  ci:
+    strategy:
+      matrix:
+        include:
+          - {entry}
+    steps:
+      - id: a
+        run: echo
+"
+        );
+        let err = format!("{:#}", legs(&ci, "ci").unwrap_err());
+        assert!(
+            err.contains("os") || err.contains("arch"),
+            "{entry}: unexpected error: {err}"
+        );
+    }
+}
+
+// ===== expression evaluator ==========================================================================================
+
+#[skuld::test]
+fn a_forward_step_reference_is_an_error() {
+    let err = probe_error("steps.later.outcome == 'success'");
+    assert!(err.contains("later"), "unexpected error: {err}");
+}
+
+#[skuld::test]
+fn each_malformed_expression_is_an_error_naming_the_problem() {
+    for (condition, expected) in [
+        ("matrix.flag matrix.flag", "trailing input"),
+        ("matrix.name == 'Win", "unterminated string"),
+        ("(matrix.flag", "missing `)`"),
+        ("always(1)", "takes arguments"),
+        ("steps.first.conclusion == 'success'", "only `steps.<id>.outcome`"),
+        ("matrix.flag &&", "unexpected end"),
+        ("matrix.flag & matrix.flag", "unsupported character"),
+        ("github.ref == 'x'", "unsupported context reference"),
+        ("hashFiles('x')", "takes arguments"),
+        ("contains()", "contains"),
+    ] {
+        let err = probe_error(condition);
+        assert!(err.contains(expected), "{condition}: expected {expected:?} in {err}");
+    }
+}
+
+/// `&&` binds tighter than `||`: `true || false && false` is true. Left to
+/// right it would be false.
+#[skuld::test]
+fn and_binds_tighter_than_or_without_parentheses() {
+    assert!(probe_runs("matrix.flag == true || matrix.off == true && matrix.off == true").unwrap());
+    assert!(!probe_runs("matrix.off == true && matrix.off == true || matrix.off == true").unwrap());
+    assert!(probe_runs("matrix.off == true && matrix.off == true || matrix.flag == true").unwrap());
+}
+
+/// `!` binds tighter than `==`: `!'x' == 'false'` is `false == 'false'`, which
+/// compares 0 with NaN and is false. Read as `!('x' == 'false')` it would be true.
+#[skuld::test]
+fn not_binds_tighter_than_equality() {
+    assert!(!probe_runs("!'x' == 'false'").unwrap());
+    assert!(probe_runs("!'x' == '0'").unwrap());
+}
+
+/// String equality ignores case, as GitHub's does.
+#[skuld::test]
+fn string_equality_ignores_case() {
+    assert!(probe_runs("matrix.name == 'WINDOWS'").unwrap());
+    assert!(probe_runs("'Windows' == 'windows'").unwrap());
+    assert!(!probe_runs("matrix.name != 'windows'").unwrap());
+}
+
 #[skuld::test]
 fn every_step_must_carry_an_id() {
     let ci = "
@@ -758,8 +904,8 @@ fn no_step_budget_exceeds_the_wall_of_a_leg_it_runs_on() {
     }
 }
 
-/// The longest `timeout-minutes` of any job before #1073 that now runs on the
-/// leg (owner, 2026-09-10: job walls are raised, never lowered). Read off
+/// The longest `timeout-minutes` any pre-merge job allowed for the lanes that
+/// run on the leg (owner, 2026-09-10: job walls are raised, never lowered). Read off
 /// `origin/main` at b834d335 and independent of ci.yaml.
 const WALL_FLOOR: [(&str, u64); 6] = [
     ("windows/amd64", 80),
@@ -809,6 +955,26 @@ fn a_failed_installer_e2e_still_cleans_up_and_leaves_the_other_lanes_running() {
         "hole-test-tun",
     ] {
         assert!(ran.contains(id), "{id} must run after installer-e2e fails");
+    }
+}
+
+/// The TUN lane shares the VM with the installer block. If the MSI's SYSTEM
+/// service may still be installed (the uninstall verification failed), the lane
+/// would run next to a live production bridge on the same WFP, route and adapter
+/// state, so its verdicts would be confounded. A failure that leaves nothing
+/// installed (the MSI never built, or the E2E failed and the uninstall verified
+/// clean) does not stop it.
+#[skuld::test]
+fn the_tun_lane_does_not_run_beside_an_installation_that_may_remain() {
+    assert!(
+        !ran_after_failure("windows/amd64", "installer-verify-uninstall").contains("hole-test-tun"),
+        "hole-test-tun ran although the uninstall verification failed"
+    );
+    for failing in ["installer-e2e", "installer-install", "installer-build-msi"] {
+        assert!(
+            ran_after_failure("windows/amd64", failing).contains("hole-test-tun"),
+            "hole-test-tun must still run when only {failing} failed"
+        );
     }
 }
 

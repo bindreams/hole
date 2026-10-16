@@ -325,7 +325,6 @@ pub fn run_step(step: &Step, repo_root: &Path) -> Result<()> {
     match step {
         Step::Bash { command, environment } => {
             let mut cmd = Command::new(resolve_bash()?);
-            crate::child_env::scrub(&mut cmd);
             // `-e` so multi-line bash heredocs fail fast on the first error,
             // matching the driver's overall fail-fast contract.
             cmd.arg("-e")
@@ -344,7 +343,6 @@ pub fn run_step(step: &Step, repo_root: &Path) -> Result<()> {
                 .ok_or_else(|| anyhow!("process step has empty args list"))?;
             let program = resolve_program(program, repo_root);
             let mut cmd = Command::new(&program);
-            crate::child_env::scrub(&mut cmd);
             cmd.args(rest).current_dir(repo_root);
             for (k, v) in environment {
                 cmd.env(k, v);

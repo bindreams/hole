@@ -726,4 +726,28 @@ fn ci_hole_lanes_share_one_list_template() {
         .expect("parse build.yaml");
     let template = job_list_template(&ci_yaml, &manifest, "ci", Some("hole-")).expect("one shared shape");
     assert_eq!(&template[..3], ["cargo", "nextest", "list"]);
+
+    // The list must select what the lanes run: the same `-E` expression and the
+    // same feature flags as the `hole-tests` target, read off build.yaml.
+    let collapse = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
+    let run = crate::ci_nextest_parity::target_nextest_run(&manifest, "hole-tests").expect("hole-tests run");
+    let (flags, expr) = run.split_once(" -E ").expect("hole-tests has an -E expression");
+    let listed = collapse(&template.join(" "));
+    let (list_flags, list_expr) = listed.split_once(" -E ").expect("the template has an -E expression");
+    assert_eq!(
+        list_expr.trim_matches('\''),
+        expr.trim_matches('\''),
+        "the list template selects a different set than hole-tests runs"
+    );
+    let build_flags = flags
+        .split_whitespace()
+        .skip_while(|t| *t != "run")
+        .skip(1)
+        .filter(|t| !crate::skuld_label_coverage::RUN_ONLY_FLAGS.contains(t));
+    for flag in build_flags {
+        assert!(
+            list_flags.split_whitespace().any(|t| t == flag),
+            "the list template lacks {flag:?} of hole-tests ({list_flags:?})"
+        );
+    }
 }
