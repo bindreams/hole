@@ -255,8 +255,18 @@ impl IpcServer {
     /// Run the server loop, accepting connections indefinitely.
     /// Each connection is handled in a separate task.
     pub async fn run(self) -> std::io::Result<()> {
+        self.run_until(std::future::pending()).await
+    }
+
+    /// [`Self::run`] until `stop` completes, then abort the connection tasks
+    /// and wait for them to finish. On return nothing holds this server's
+    /// state (the proxy manager among it), so the caller can drop the last
+    /// handle itself instead of leaving the drop to a task the runtime has
+    /// not yet polled again.
+    pub async fn run_until(self, stop: impl std::future::Future<Output = ()>) -> std::io::Result<()> {
         info!("IPC server listening");
         let mut tasks = tokio::task::JoinSet::new();
+        tokio::pin!(stop);
         loop {
             // Reap completed tasks to avoid unbounded memory growth
             while let Some(result) = tasks.try_join_next() {
@@ -265,22 +275,28 @@ impl IpcServer {
                 }
             }
 
-            match self.listener.accept().await {
-                Ok(stream) => {
-                    info!("IPC client connected");
-                    let router = self.router.clone();
-                    tasks.spawn(async move {
-                        if let Err(e) = serve_connection(TokioIo::new(stream), router).await {
-                            debug!(error = %e, "HTTP connection ended");
-                        }
-                        info!("IPC client disconnected");
-                    });
-                }
-                Err(e) => {
-                    error!(error = %e, "failed to accept IPC connection");
-                }
+            tokio::select! {
+                biased;
+                () = &mut stop => break,
+                accepted = self.listener.accept() => match accepted {
+                    Ok(stream) => {
+                        info!("IPC client connected");
+                        let router = self.router.clone();
+                        tasks.spawn(async move {
+                            if let Err(e) = serve_connection(TokioIo::new(stream), router).await {
+                                debug!(error = %e, "HTTP connection ended");
+                            }
+                            info!("IPC client disconnected");
+                        });
+                    }
+                    Err(e) => {
+                        error!(error = %e, "failed to accept IPC connection");
+                    }
+                },
             }
         }
+        tasks.shutdown().await;
+        Ok(())
     }
 }
 

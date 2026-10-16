@@ -410,6 +410,30 @@ defused by `shutdown()` and is constructed only in the `Ok` branch of
 synchronously (blocks the worker on `netsh`/`route`); converting it to the
 `shutdown` + `DebugDropBomb` discipline is tracked.
 
+### Windows service stop reporting
+
+`run_service` reports `SERVICE_STOP_PENDING` with one checkpoint per teardown
+phase ([`StopPhase`](crates/bridge/src/service_stop.rs)), and `Stopped` only
+after the last. The proxy-side phases are entered by
+`ProxyManager::stop_with_progress`, each just before the work it names and only
+when that work exists in the session. The first report is made by the control
+handler the moment Stop/Shutdown arrives, before the main task is signalled, so
+a stop that lands during a startup await does not read as `Running`. A later
+phase is reported when the previous one finishes and nothing reports on a timer,
+so a wedged phase freezes the checkpoint where `sc queryex` and the
+cutover/uninstall `NotifyServiceStatusChange` waiters can see it.
+
+Each phase entered is logged at info (`service stop phase`, with its
+checkpoint) to `bridge.log`, never by the control handler: it does no log I/O of
+its own (a panic still passes through the process-wide panic hook; see the
+`service_stop.rs` module doc) and catches a panicking report, since an unwinding
+panic aborts the service. The shutdown forwarder task logs the first phase's
+hand-off the moment it wakes from the shutdown signal, so a stop wedged before
+its first entry still leaves a line. On an msiexec timeout the CI
+diagnostics print `sc queryex HoleBridge` and those lines. A path that fails
+before teardown (bind failure) skips the proxy and ETW phases. Only Windows CI
+exercises the SCM side.
+
 ### Spawn-retry & file-contention
 
 Transient `Command::spawn` contention (Windows Defender scanning a fresh

@@ -16,6 +16,8 @@ use windows_service::service_control_handler::{self, ServiceControlHandlerResult
 use windows_service::service_dispatcher;
 use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 
+use crate::service_stop::{self, StopPhase, StopProgress};
+
 // Constants ===========================================================================================================
 
 pub const SERVICE_NAME: &str = "HoleBridge";
@@ -61,14 +63,28 @@ fn run_service() -> Result<(), Box<dyn std::error::Error>> {
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
     let shutdown_tx = std::sync::Mutex::new(Some(shutdown_tx));
 
+    // `StopPending` is reported from the control handler (an SCM thread) as well
+    // as from the main task, so the progress is shared and the status handle,
+    // which only exists once `register` returns, is filled in afterwards. The
+    // SCM delivers no Stop before `Running`, which is reported after that.
+    let status_cell: std::sync::Arc<OnceLock<service_control_handler::ServiceStatusHandle>> =
+        std::sync::Arc::new(OnceLock::new());
+    let stop = std::sync::Arc::new(StopProgress::new(service_stop::scm_reporter(
+        std::sync::Arc::clone(&status_cell),
+        |handle: &service_control_handler::ServiceStatusHandle, phase| {
+            handle
+                .set_service_status(stop_pending_status(phase))
+                .map_err(std::io::Error::other)
+        },
+    )));
+
+    let handler_stop = std::sync::Arc::clone(&stop);
     let event_handler = move |control_event| -> ServiceControlHandlerResult {
         match control_event {
             ServiceControl::Stop | ServiceControl::Shutdown => {
-                if let Ok(mut guard) = shutdown_tx.lock() {
-                    if let Some(tx) = guard.take() {
-                        let _ = tx.send(());
-                    }
-                }
+                // StopPending first, so the SCM stops seeing `Running` the moment
+                // the Stop lands, whatever the main task is still awaiting.
+                service_stop::stop_control(&handler_stop, &shutdown_tx);
                 ServiceControlHandlerResult::NoError
             }
             ServiceControl::Interrogate => ServiceControlHandlerResult::NoError,
@@ -77,6 +93,7 @@ fn run_service() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let status_handle = service_control_handler::register(SERVICE_NAME, event_handler)?;
+    let _ = status_cell.set(status_handle);
 
     // Report StartPending, NOT Running: the cutover child exits on the SCM
     // `Running` edge, so `Running` is deferred until after the socket binds AND
@@ -99,6 +116,7 @@ fn run_service() -> Result<(), Box<dyn std::error::Error>> {
     // `ServiceStatusHandle` is Copy (a raw SCM handle wrapper); capture it for the
     // deferred `Running` report inside the async block.
     let status_handle_ready = status_handle;
+    let stop_progress = std::sync::Arc::clone(&stop);
     let run_result: Result<(), Box<dyn std::error::Error>> = rt.block_on(async move {
         let state_dir = STATE_DIR_OVERRIDE
             .get()
@@ -177,9 +195,9 @@ fn run_service() -> Result<(), Box<dyn std::error::Error>> {
         let shutdown = tokio_util::sync::CancellationToken::new();
         {
             let shutdown = shutdown.clone();
+            let stop_progress = std::sync::Arc::clone(&stop_progress);
             tokio::spawn(async move {
-                let _ = shutdown_rx.await;
-                shutdown.cancel();
+                service_stop::forward_stop(&stop_progress, shutdown_rx, || shutdown.cancel()).await;
             });
         }
 
@@ -221,7 +239,7 @@ fn run_service() -> Result<(), Box<dyn std::error::Error>> {
         // Always-on ETW consumer, held for the service's run lifetime; Drop
         // may abandon rather than join its processing thread if reclaim
         // can't be confirmed (see `etw.rs` module doc, "Drain on Drop").
-        let _etw_guard = match crate::diagnostics::etw::start_consumer() {
+        let etw_guard = match crate::diagnostics::etw::start_consumer() {
             Ok(g) => Some(g),
             Err(e) => {
                 tracing::error!(error = %e, "etw consumer failed to start");
@@ -229,26 +247,25 @@ fn run_service() -> Result<(), Box<dyn std::error::Error>> {
             }
         };
 
-        tokio::select! {
-            result = server.run() => {
-                if let Err(e) = result {
-                    error!(error = %e, "IPC server error");
-                }
-            }
-            _ = shutdown.cancelled() => {
-                info!("shutdown signal received");
-            }
+        // Returns once the connection tasks are gone, so the proxy manager's
+        // last handle is the one dropped in `DropResources`.
+        if let Err(e) = server.run_until(shutdown.cancelled()).await {
+            error!(error = %e, "IPC server error");
         }
+        info!("shutdown signal received");
 
         // Clean shutdown: stop proxy before exiting. Neither event is a user
         // disconnect, so the target is left unchanged either way; only the
         // event differs, distinguishing an update cutover from a plain
         // machine shutdown for anyone reading the log/history.
-        let mut pm = proxy_shutdown.lock().await;
-        let event = crate::foreground::shutdown_reason(hole_common::update_marker::is_present(&log_dir));
-        if let Err(e) = pm.stop_with(event).await {
-            error!(error = %e, "error stopping proxy during shutdown");
-        }
+        service_stop::tear_down_service(
+            &stop_progress,
+            proxy_shutdown,
+            || crate::foreground::shutdown_reason(hole_common::update_marker::is_present(&log_dir)),
+            etw_guard,
+            (_liveness, shutdown),
+        )
+        .await;
 
         Ok(())
     });
@@ -257,10 +274,38 @@ fn run_service() -> Result<(), Box<dyn std::error::Error>> {
         error!(error = %e, "bridge runtime error");
     }
 
-    // Always report stopped to SCM, even on error.
-    // Use a non-zero exit code if the runtime failed.
+    // Dropping the runtime joins blocking tasks, so `Stopped` follows it. Report
+    // stopped even on error; non-zero exit code if the runtime failed.
     let exit_code = if run_result.is_err() { 1 } else { 0 };
-    let _ = status_handle.set_service_status(ServiceStatus {
+    service_stop::finish_stop(
+        &stop,
+        || drop(rt),
+        || {
+            status_handle
+                .set_service_status(stopped_status(exit_code))
+                .map_err(std::io::Error::other)
+        },
+    );
+
+    run_result
+}
+
+/// The `StopPending` status reported while `phase` is in progress.
+fn stop_pending_status(phase: StopPhase) -> ServiceStatus {
+    ServiceStatus {
+        service_type: ServiceType::OWN_PROCESS,
+        current_state: ServiceState::StopPending,
+        controls_accepted: ServiceControlAccept::empty(),
+        exit_code: ServiceExitCode::Win32(0),
+        checkpoint: phase.checkpoint(),
+        wait_hint: phase.wait_hint(),
+        process_id: None,
+    }
+}
+
+/// The terminal `Stopped` status.
+fn stopped_status(exit_code: u32) -> ServiceStatus {
+    ServiceStatus {
         service_type: ServiceType::OWN_PROCESS,
         current_state: ServiceState::Stopped,
         controls_accepted: ServiceControlAccept::empty(),
@@ -268,9 +313,7 @@ fn run_service() -> Result<(), Box<dyn std::error::Error>> {
         checkpoint: 0,
         wait_hint: Duration::ZERO,
         process_id: None,
-    });
-
-    run_result
+    }
 }
 
 /// Clear a stale update-in-progress marker on the new bridge's post-bind sweep.

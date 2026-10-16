@@ -48,6 +48,7 @@ use tun_engine::routing::failclosed::lockdown_state::{self, Intent};
 use tun_engine::routing::{CoverGuard, CoverPresence, RoutesInstalled, Routing, SystemRouting};
 
 use crate::reconciler::{teardown_cover_disposition, transient_cover_disposition, CoverDisposition};
+use crate::service_stop::{run_phase, StopPhase};
 use crate::target::{self, target_after, SessionEvent, Target};
 
 use crate::dns::self_test::{
@@ -1904,6 +1905,23 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
     /// `apply_cover_disposition`); `Session`
     /// runs the full teardown below.
     pub async fn stop_with(&mut self, event: SessionEvent) -> Result<(), ProxyError> {
+        self.stop_with_progress(event, |_| {}).await
+    }
+
+    /// [`Self::stop_with`], calling `on_phase` as each teardown step is about to
+    /// start, in teardown order. The service reports these to the SCM as
+    /// `StopPending` checkpoints, so a wedged step is attributable. A phase is
+    /// entered only when its work exists in this session (no dispatcher in
+    /// SOCKS-only mode, no plugin chain without a plugin), and always before
+    /// that work, never after it.
+    pub async fn stop_with_progress(
+        &mut self,
+        event: SessionEvent,
+        mut on_phase: impl FnMut(StopPhase),
+    ) -> Result<(), ProxyError> {
+        if self.state_dir.is_some() {
+            on_phase(StopPhase::PersistTarget);
+        }
         let target = self.persist_session_event(event).await;
 
         match std::mem::replace(&mut self.posture, Posture::Idle) {
@@ -1913,6 +1931,7 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
                 // left engaged. Clear the stale error/death so a
                 // Disconnect-from-blocked lands the same clean state a normal
                 // stop does.
+                on_phase(StopPhase::SettleCover);
                 match transient_cover_disposition(event) {
                     CoverDisposition::ReleaseNow => drop(b.cover),
                     CoverDisposition::KeepEngaged => b.cover.disarm(),
@@ -1943,19 +1962,22 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
                 // Async shutdown — defuses the `DebugDropBomb` in `SystemDnsApplied`
                 // before the field drops. Skipping the await would panic in debug
                 // builds (catching missed-shutdown bugs at first test run).
-                if let Some(mut d) = dns {
-                    d.shutdown().await;
-                }
+                run_phase(&mut on_phase, StopPhase::RestoreDns, dns, |mut d| async move {
+                    d.shutdown().await
+                })
+                .await;
 
                 // 1. Shut down dispatcher (closes TUN, cancels all handlers).
-                if let Some(mut d) = dispatcher {
-                    match d.shutdown().await {
-                        exit @ (crate::dispatcher::DriverExit::Drained
-                        | crate::dispatcher::DriverExit::AlreadyDrained) => {
-                            debug!(?exit, "dispatcher driver exited");
-                        }
-                        exit => warn!(?exit, "dispatcher driver did not exit cleanly"),
-                    }
+                let engine_exit = run_phase(&mut on_phase, StopPhase::StopEngine, dispatcher, |mut d| async move {
+                    d.shutdown().await
+                })
+                .await;
+                match engine_exit {
+                    Some(
+                        exit @ (crate::dispatcher::DriverExit::Drained | crate::dispatcher::DriverExit::AlreadyDrained),
+                    ) => debug!(?exit, "dispatcher driver exited"),
+                    Some(exit) => warn!(?exit, "dispatcher driver did not exit cleanly"),
+                    None => {}
                 }
 
                 // 2. Stop plugin chain: reap the tracked identities explicitly — the
@@ -1964,19 +1986,28 @@ impl<P: Proxy, R: Routing, D: Dns> ProxyManager<P, R, D> {
                 // cancels the chain's token and aborts its task. Drop must not touch
                 // the file: the abort cannot know whether teardown finished, so a
                 // clear there would forget still-live plugins.
-                if let Some(ref chain) = plugin_chain {
-                    chain.kill_tracked();
-                }
+                run_phase(
+                    &mut on_phase,
+                    StopPhase::ReapPlugins,
+                    plugin_chain.as_ref(),
+                    |chain| async move { chain.kill_tracked() },
+                )
+                .await;
                 drop(plugin_chain);
 
                 // 3. Graceful proxy shutdown (stops SS SOCKS5).
+                on_phase(StopPhase::StopProxy);
                 let res = proxy.stop().await;
 
                 // 4. Routes tear down via RAII Drop.
-                drop(routes);
+                run_phase(&mut on_phase, StopPhase::TearDownRoutes, routes, |routes| async move {
+                    drop(routes)
+                })
+                .await;
 
                 // 5. Standing lockdown cover: decided by `cover_step` against
                 // the target `event` just moved us to, not by `event` itself.
+                on_phase(StopPhase::SettleCover);
                 let presence = self.routing.lockdown_cover_presence();
                 let intent = self.effective_lockdown_intent();
                 let disposition = teardown_cover_disposition(event, intent, presence, &target);

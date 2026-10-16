@@ -29,6 +29,8 @@ use tun_engine::{RoutingError, TunIdentity};
 #[derive(Default)]
 struct MockProxyState {
     start_calls: AtomicU32,
+    /// Completed `RunningProxy::stop` calls.
+    stop_calls: AtomicU32,
     fail_start: AtomicBool,
     /// If true, `MockRunning::is_alive` returns false — used to simulate
     /// a crashed ss task for `check_health_detects_crashed_task`.
@@ -139,6 +141,7 @@ impl RunningProxy for MockRunning {
         if let Some(h) = self.handle.take() {
             h.abort();
         }
+        self.state.stop_calls.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
 
@@ -1604,6 +1607,122 @@ fn user_stop_tears_down_routes_before_disengaging_the_lockdown_cover() {
             vec!["routes", "lockdown"],
             "the standing cover's persistent filters must outlive the routes they cover"
         );
+    });
+}
+
+// Stop-phase reporting (Windows StopPending) --------------------------------------------------------------------------
+
+use crate::service_stop::StopPhase;
+
+/// Runs `stop_with_progress(UserStopped)` and returns each entered phase with
+/// the teardown work already finished at that moment: (phase, DNS restored,
+/// proxy stops completed, route teardowns completed).
+async fn stop_recording_phases<D: crate::dns::system::Dns>(
+    pm: &mut ProxyManager<MockProxy, MockRouting, D>,
+    dns_restored: impl Fn() -> bool,
+    proxy: &MockProxyState,
+    routing: &MockRoutingState,
+) -> Vec<(StopPhase, bool, u32, u32)> {
+    let mut seen = Vec::new();
+    pm.stop_with_progress(SessionEvent::UserStopped, |phase| {
+        seen.push((
+            phase,
+            dns_restored(),
+            proxy.stop_calls.load(Ordering::SeqCst),
+            routing.teardown_calls.load(Ordering::SeqCst),
+        ));
+    })
+    .await
+    .unwrap();
+    seen
+}
+
+#[skuld::test]
+fn a_full_session_stop_enters_each_phase_before_the_work_it_names() {
+    rt().block_on(async {
+        let upstream = crate::test_support::socks5_dns_upstream::Socks5DnsUpstream::bind()
+            .await
+            .unwrap();
+        let dns = crate::test_support::mock_dns::MockDns::new();
+        let dns_state = dns.state_handle();
+        let dir = tempfile::tempdir().unwrap();
+        let routing = MockRouting::new(dir.path().to_path_buf());
+        let routing_state = routing.state();
+        let proxy = MockProxy::new();
+        let proxy_state = proxy.state_handle();
+        let mut pm = ProxyManager::new_with_dns(proxy, routing, dns).with_state_dir(dir.path().to_path_buf());
+        let mut config = test_config();
+        config.local_port = upstream.port();
+        config.dns.enabled = true;
+        config.dns.protocol = hole_common::config::DnsProtocol::PlainTcp;
+        config.dns.servers = vec![IpAddr::V4(Ipv4Addr::new(198, 51, 100, 53))];
+        pm.start(&config).await.unwrap();
+
+        let seen = stop_recording_phases(&mut pm, || dns_state.shutdown_called(), &proxy_state, &routing_state).await;
+
+        // The dispatcher and plugin chain do not exist under the mocks, so their
+        // phases are not entered: a phase names work that is about to run.
+        assert_eq!(
+            seen,
+            vec![
+                (StopPhase::PersistTarget, false, 0, 0),
+                (StopPhase::RestoreDns, false, 0, 0),
+                (StopPhase::StopProxy, true, 0, 0),
+                (StopPhase::TearDownRoutes, true, 1, 0),
+                (StopPhase::SettleCover, true, 1, 1),
+            ]
+        );
+    });
+}
+
+#[skuld::test]
+fn a_socks_only_stop_without_a_state_dir_enters_only_the_phases_with_work() {
+    rt().block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        let routing = MockRouting::new(dir.path().to_path_buf());
+        let routing_state = routing.state();
+        let proxy = MockProxy::new();
+        let proxy_state = proxy.state_handle();
+        let mut pm = ProxyManager::new(proxy, routing);
+        let mut config = test_config();
+        config.tunnel_mode = TunnelMode::SocksOnly;
+        pm.start(&config).await.unwrap();
+
+        let seen = stop_recording_phases(&mut pm, || false, &proxy_state, &routing_state).await;
+
+        assert_eq!(
+            seen,
+            vec![
+                (StopPhase::StopProxy, false, 0, 0),
+                (StopPhase::SettleCover, false, 1, 0)
+            ]
+        );
+    });
+}
+
+#[skuld::test]
+fn stopping_an_idle_manager_without_a_state_dir_enters_no_phase() {
+    rt().block_on(async {
+        let (mut pm, _dir) = new_manager(MockProxy::new());
+        let mut seen = Vec::new();
+        pm.stop_with_progress(SessionEvent::UserStopped, |phase| seen.push(phase))
+            .await
+            .unwrap();
+        assert_eq!(seen, vec![]);
+    });
+}
+
+#[skuld::test]
+fn stopping_an_idle_manager_with_a_state_dir_enters_only_the_target_persist() {
+    rt().block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        let routing = MockRouting::new(dir.path().to_path_buf());
+        let mut pm = ProxyManager::new(MockProxy::new(), routing).with_state_dir(dir.path().to_path_buf());
+        let mut seen = Vec::new();
+        pm.stop_with_progress(SessionEvent::UserStopped, |phase| seen.push(phase))
+            .await
+            .unwrap();
+        assert_eq!(seen, vec![StopPhase::PersistTarget]);
     });
 }
 
@@ -3184,6 +3303,52 @@ mod self_test {
                 "lockdown-on subsumes the transient cover"
             );
             assert!(!pm.blocked_until_connected());
+        });
+    }
+
+    /// A pending-start stop releases the transient cover (a WFP release on
+    /// Windows) under a phase of its own: the checkpoint must not still read
+    /// the target-file write while that release runs. Each tuple is a phase and
+    /// the transient-cover disengages completed when it was entered.
+    #[skuld::test]
+    fn a_pending_start_stop_enters_a_phase_before_the_transient_cover_is_released() {
+        rt().block_on(async {
+            let (mut pm, cfg, st, _dir) = covered_gate_setup(false);
+            pm.start_cancellable(&cfg, true, CancellationToken::new())
+                .await
+                .unwrap_err();
+            assert!(pm.blocked_until_connected());
+
+            let mut seen = Vec::new();
+            pm.stop_with_progress(SessionEvent::UserStopped, |phase| {
+                seen.push((phase, st.cover_disengage_calls.load(Ordering::SeqCst)));
+            })
+            .await
+            .unwrap();
+
+            assert_eq!(
+                seen,
+                vec![(StopPhase::PersistTarget, 0), (StopPhase::SettleCover, 0)],
+                "the cover release must follow its phase"
+            );
+            assert_eq!(st.cover_disengage_calls.load(Ordering::SeqCst), 1);
+        });
+    }
+
+    /// The disarm half of the same arm (cutover) has OS work too: closing the
+    /// cover's handle. It is entered under the same phase.
+    #[skuld::test]
+    fn a_pending_start_cutover_stop_enters_the_same_phase_before_disarming() {
+        rt().block_on(async {
+            let (mut pm, cfg, _st, _dir) = covered_gate_setup(false);
+            pm.start_cancellable(&cfg, true, CancellationToken::new())
+                .await
+                .unwrap_err();
+            let mut seen = Vec::new();
+            pm.stop_with_progress(SessionEvent::CutoverRestart, |phase| seen.push(phase))
+                .await
+                .unwrap();
+            assert_eq!(seen, vec![StopPhase::PersistTarget, StopPhase::SettleCover]);
         });
     }
 

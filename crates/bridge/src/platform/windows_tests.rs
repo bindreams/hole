@@ -16,6 +16,33 @@ fn service_description_is_set() {
 }
 
 #[skuld::test]
+fn stop_pending_status_carries_the_phase_checkpoint_and_hint() {
+    use crate::service_stop::StopPhase;
+    for phase in StopPhase::ALL {
+        let st = super::stop_pending_status(phase);
+        assert_eq!(st.current_state, ServiceState::StopPending, "{phase:?}");
+        assert_eq!(st.checkpoint, phase.checkpoint(), "{phase:?}");
+        assert_eq!(st.wait_hint, phase.wait_hint(), "{phase:?}");
+        // No controls while stopping: a second Stop must not re-enter teardown.
+        assert_eq!(st.controls_accepted, ServiceControlAccept::empty(), "{phase:?}");
+        assert_eq!(st.exit_code, ServiceExitCode::Win32(0), "{phase:?}");
+    }
+}
+
+#[skuld::test]
+fn stopped_status_is_terminal_and_carries_the_exit_code() {
+    for code in [0, 1] {
+        let st = super::stopped_status(code);
+        assert_eq!(st.current_state, ServiceState::Stopped);
+        assert_eq!(st.exit_code, ServiceExitCode::Win32(code));
+        // Checkpoint 0 and a zero hint: no operation is pending any more.
+        assert_eq!(st.checkpoint, 0);
+        assert_eq!(st.wait_hint, std::time::Duration::ZERO);
+        assert_eq!(st.controls_accepted, ServiceControlAccept::empty());
+    }
+}
+
+#[skuld::test]
 fn post_bind_sweep_clears_marker() {
     let dir = tempfile::tempdir().unwrap();
     hole_common::update_marker::write(dir.path(), &super::test_marker(), None).unwrap();
