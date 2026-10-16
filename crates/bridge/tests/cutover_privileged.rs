@@ -91,6 +91,11 @@ struct ProvisionedService;
 #[cfg(target_os = "windows")]
 impl ProvisionedService {
     fn install(helper: &std::path::Path) -> Self {
+        Self::install_with_args(helper, vec![])
+    }
+
+    /// `install`, with `launch_arguments` appended to the service's ImagePath.
+    fn install_with_args(helper: &std::path::Path, launch_arguments: Vec<std::ffi::OsString>) -> Self {
         use hole_bridge::platform::os::SERVICE_NAME;
         use windows_service::service::{
             ServiceAccess, ServiceErrorControl, ServiceInfo, ServiceStartType, ServiceType,
@@ -116,7 +121,7 @@ impl ProvisionedService {
             start_type: ServiceStartType::OnDemand,
             error_control: ServiceErrorControl::Normal,
             executable_path: helper.to_path_buf(),
-            launch_arguments: vec![],
+            launch_arguments,
             dependencies: vec![],
             account_name: None, // LocalSystem
             account_password: None,
@@ -195,6 +200,139 @@ fn cutover_global_net_state_real_scm_restart_gates_on_running_callback() {
         .expect("SCM stop must reach STOPPED via NotifyServiceStatusChange");
     os.start_service_wait_running()
         .expect("SCM restart must reach RUNNING via NotifyServiceStatusChange");
+}
+
+/// Which controls the SCM delivers to a service that already handled Stop, and
+/// that each one reaches the handler: `windows-service` frees its handler
+/// closure on the first Stop while the SCM keeps the pointer, so a later
+/// control would read freed memory. The service holds in STOP_PENDING on a
+/// named event the test owns, so the controls are sent while it stops; no
+/// timing is involved. The SCM's answer to each control is printed (the lane
+/// keeps this test's output) — that is the measurement of what the SCM delivers.
+///
+/// The handler logs each control it receives before returning, and the SCM
+/// answers a control only once the handler has returned, so the log holds
+/// exactly the controls whose `ControlService` call succeeded.
+#[cfg(target_os = "windows")]
+#[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
+fn cutover_global_net_state_service_controls_after_stop_reach_the_handler() {
+    use hole_bridge::cutover::os::windows::WindowsCutoverOs;
+    use hole_bridge::cutover::os::CutoverOs;
+    use hole_bridge::platform::os::SERVICE_NAME;
+    use windows::core::{HSTRING, PCWSTR};
+    use windows::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows::Win32::System::Services::{
+        CloseServiceHandle, ControlService, OpenSCManagerW, OpenServiceW, QueryServiceStatus, SC_HANDLE,
+        SC_MANAGER_CONNECT, SERVICE_CONTROL_INTERROGATE, SERVICE_CONTROL_STOP, SERVICE_INTERROGATE,
+        SERVICE_QUERY_STATUS, SERVICE_STATUS, SERVICE_STOP, SERVICE_STOPPED, SERVICE_STOP_PENDING,
+    };
+    use windows::Win32::System::Threading::{CreateEventW, SetEvent};
+
+    struct Event(HANDLE);
+    impl Drop for Event {
+        fn drop(&mut self) {
+            // SAFETY: the handle is the live event `CreateEventW` returned.
+            let _ = unsafe { CloseHandle(self.0) };
+        }
+    }
+    struct ScHandle(SC_HANDLE);
+    impl Drop for ScHandle {
+        fn drop(&mut self) {
+            // SAFETY: the handle is a live one returned by the SCM open calls.
+            let _ = unsafe { CloseServiceHandle(self.0) };
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("controls.log");
+    let event_name = format!("Global\\HoleServiceCtrlRelease{}", std::process::id());
+    // Manual-reset, unsignalled: the service waits on it in STOP_PENDING.
+    // SAFETY: plain FFI call with no pointers beyond the valid name.
+    let release = Event(
+        unsafe { CreateEventW(None, true, false, &HSTRING::from(event_name.as_str())) }
+            .expect("create the release event (the TUN lane runs elevated)"),
+    );
+
+    let helper = std::path::Path::new(env!("CARGO_BIN_EXE_test_service"));
+    let _service = ProvisionedService::install_with_args(
+        helper,
+        vec![
+            "--control-log".into(),
+            log.clone().into_os_string(),
+            "--release-event".into(),
+            event_name.into(),
+        ],
+    );
+    let mut os = WindowsCutoverOs {
+        images: vec![],
+        target_version: "test".into(),
+    };
+    os.start_service_wait_running()
+        .expect("bring the throwaway service up via the production start seam");
+
+    let name: Vec<u16> = SERVICE_NAME.encode_utf16().chain(std::iter::once(0)).collect();
+    // SAFETY: plain FFI calls; `name` is NUL-terminated and outlives them.
+    let scm = ScHandle(unsafe { OpenSCManagerW(PCWSTR::null(), PCWSTR::null(), SC_MANAGER_CONNECT) }.unwrap());
+    let service = ScHandle(
+        unsafe {
+            OpenServiceW(
+                scm.0,
+                PCWSTR(name.as_ptr()),
+                SERVICE_QUERY_STATUS | SERVICE_STOP | SERVICE_INTERROGATE,
+            )
+        }
+        .unwrap(),
+    );
+    let send = |control: u32| -> Result<SERVICE_STATUS, windows::core::Error> {
+        let mut status = SERVICE_STATUS::default();
+        // SAFETY: `service` is a live handle and `status` outlives the call.
+        unsafe { ControlService(service.0, control, &mut status) }.map(|()| status)
+    };
+
+    // The service reports STOP_PENDING from its handler before it returns, so
+    // this is the state the SCM answers with, and the service stays there.
+    let first_stop = send(SERVICE_CONTROL_STOP).expect("the first Stop is delivered");
+    assert_eq!(first_stop.dwCurrentState, SERVICE_STOP_PENDING);
+
+    let interrogate = send(SERVICE_CONTROL_INTERROGATE);
+    let second_stop = send(SERVICE_CONTROL_STOP);
+    let describe = |result: &Result<SERVICE_STATUS, windows::core::Error>| match result {
+        Ok(status) => format!("delivered (state {})", status.dwCurrentState.0),
+        Err(e) => format!("refused by the SCM ({e})"),
+    };
+    eprintln!(
+        "SCM controls after Stop, service in STOP_PENDING: Interrogate -> {}; second Stop -> {}",
+        describe(&interrogate),
+        describe(&second_stop),
+    );
+
+    // SAFETY: `release.0` is the live event the service waits on.
+    unsafe { SetEvent(release.0) }.unwrap();
+    os.stop_service_wait_stopped()
+        .expect("the service reaches STOPPED once released");
+
+    let mut final_status = SERVICE_STATUS::default();
+    // SAFETY: `service` is a live handle and `final_status` outlives the call.
+    unsafe { QueryServiceStatus(service.0, &mut final_status) }.unwrap();
+    assert_eq!(final_status.dwCurrentState, SERVICE_STOPPED);
+    assert_eq!(
+        final_status.dwWin32ExitCode, 0,
+        "the service process must exit cleanly, not crash on a control after Stop"
+    );
+
+    let mut expected = vec!["Stop"];
+    if interrogate.is_ok() {
+        expected.push("Interrogate");
+    }
+    if second_stop.is_ok() {
+        expected.push("Stop");
+    }
+    let observed = std::fs::read_to_string(&log).expect("the handler logged the first Stop");
+    assert_eq!(
+        observed.lines().collect::<Vec<_>>(),
+        expected,
+        "the handler must observe exactly the controls the SCM reported delivering"
+    );
 }
 
 /// macOS: renamex_np-swap the `.app` (a dir) + plain-rename the helper (a file)
