@@ -28,11 +28,11 @@ param(
     # No direct cold-run measurement exists for this job -- CI here runs
     # often enough that sccache has never been observed to go fully cold --
     # so this is derived, not measured: the sibling `test-dmg-signing` job
-    # (same `timeout-minutes: 80`, held equal by
+    # (same `timeout-minutes`, held equal by
     # `ci_installer_assembly_jobs_share_a_timeout_budget`) recorded its
     # darwin/amd64 leg at 1.83x slower cold than warm (45m45s vs ~25min).
     # Applied to this job's observed ~17-27min warm range, a cold run could
-    # reach ~49min, leaving ~31min of the 80min wall if both Install and
+    # reach ~49min, leaving the rest of the job wall if both Install and
     # Uninstall wedge in the same run -- and a wedge on Install skips the
     # E2E/tauri-driver steps that make up part of that warm baseline, so this
     # is already a pessimistic estimate. 3 minutes each leaves comfortable
@@ -47,16 +47,16 @@ param(
     # survive. Spent in evidentiary order (bridge first), so an exhausted
     # budget costs the least-informative capture, not the decisive one.
     #
-    # Sized against what is actually spare in the 80min job budget, which is
-    # NOT the ~31min above: 6 of those minutes are already committed to the
-    # two 3-minute bounds when both steps wedge, leaving ~25min.
+    # Sized against what is actually spare in the job budget, which is NOT
+    # the whole remainder above: 6 minutes of it are already committed to the
+    # two 3-minute bounds when both steps wedge.
     #
     # This budget covers the capture loop only, so the wedge branch's real
     # worst case is the sum of every bound in it: two 15s CIM probes before
     # the loop, this 60s, and a 5s reap per process killed (one cdb, at most
     # one per target, at most one per msiexec-tree member) -- about 2min 10s
     # for a plausible four targets. Both steps wedging spends that twice,
-    # ~4.5min of the ~25min spare, and the artifact upload -- the whole reason
+    # ~4.5min of what is left, and the artifact upload -- the whole reason
     # the bound exists -- still runs.
     #
     # Measured cost is far under the cap: 33s for one process against a cold

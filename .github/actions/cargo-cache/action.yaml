@@ -1,0 +1,60 @@
+name: Cargo cache
+description: Restore (and, for the one designated job per key, save) the cargo registry cache
+
+# The one place that spells the cache's paths, key and restore-keys, so the
+# saver and every restorer cannot drift apart: a saver whose key no restorer
+# reads leaves the job green and the cache never hit.
+
+inputs:
+  cachekey:
+    description: "`setup-rust`'s `cachekey` output (tracks the pinned rustc)"
+    required: true
+  save:
+    description: >-
+      Save the cache at job end. Set by exactly one job per cache key (runner
+      OS + rustc commit, no arch), and it saves only on `main`. Every other
+      job, and every other ref, restores only; the release workflows never set
+      it.
+    required: false
+    default: "false"
+
+runs:
+  using: composite
+  steps:
+    - name: Compute cache key
+      id: spec
+      shell: bash
+      env:
+        CACHEKEY: ${{ inputs.cachekey }}
+        LOCK_HASH: ${{ hashFiles('Cargo.lock') }}
+      run: |
+        {
+          echo "key=cargo-$RUNNER_OS-$CACHEKEY-$LOCK_HASH"
+          echo "restore-keys=cargo-$RUNNER_OS-$CACHEKEY-"
+          echo "path<<EOF"
+          echo "~/.cargo/registry"
+          echo "~/.cargo/git"
+          echo "EOF"
+        } >> "$GITHUB_OUTPUT"
+
+    # `actions/cache` post-saves by tarring first and reserving the key after,
+    # so every parallel job sharing a key pays the full tar and all but the
+    # first to finish then fail with "Unable to reserve cache ... another job
+    # may be creating this cache". On Windows that tar takes minutes. So a job
+    # saves only when it is the designated saver for its key and the ref is
+    # `main`: a PR-ref cache is visible to that PR alone and would only fill
+    # the repo's 10 GB cache quota. PRs read `main`'s cache through
+    # `restore-keys`.
+    - uses: actions/cache/restore@v6
+      if: github.ref != 'refs/heads/main' || inputs.save != 'true'
+      with:
+        path: ${{ steps.spec.outputs.path }}
+        key: ${{ steps.spec.outputs.key }}
+        restore-keys: ${{ steps.spec.outputs.restore-keys }}
+
+    - uses: actions/cache@v6
+      if: github.ref == 'refs/heads/main' && inputs.save == 'true'
+      with:
+        path: ${{ steps.spec.outputs.path }}
+        key: ${{ steps.spec.outputs.key }}
+        restore-keys: ${{ steps.spec.outputs.restore-keys }}
