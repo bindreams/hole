@@ -55,12 +55,19 @@ fn on_link_gw() -> GatewayInfo {
     }
 }
 
+/// A command as `program arg…`, the program shown by its bare name.
+fn argv_of(tool: SystemTool, args: &[String]) -> Vec<String> {
+    std::iter::once(tool.name().to_string())
+        .chain(args.iter().cloned())
+        .collect()
+}
+
 fn argvs(cmds: &[SetupCommand]) -> Vec<Vec<String>> {
-    cmds.iter().map(|c| c.argv.clone()).collect()
+    cmds.iter().map(|c| argv_of(c.tool, &c.args)).collect()
 }
 
 fn is_ipv6_split(cmd: &SetupCommand) -> bool {
-    cmd.argv.iter().any(|arg| arg == "::/1" || arg == "8000::/1")
+    cmd.args.iter().any(|arg| arg == "::/1" || arg == "8000::/1")
 }
 
 /// The setup commands' bare argv, for the string-oracle assertions below.
@@ -82,7 +89,7 @@ fn teardown_argv(tun_name: &str, server_ip: IpAddr, interface_name: &str) -> Vec
         state::RouteForm::Via,
     )
     .into_iter()
-    .map(|c| c.argv)
+    .map(|c| argv_of(c.tool, &c.args))
     .collect()
 }
 
@@ -104,6 +111,50 @@ fn teardown_cmds_joined(server_ip: IpAddr) -> String {
 fn mentions_addr(cmds: &[Vec<String>], ip: &str) -> bool {
     let slash128 = format!("{ip}/128");
     cmds.iter().flatten().any(|arg| arg == ip || arg == &slash128)
+}
+
+/// No route command repeats its program in `args` (it would run `route route ...`).
+#[skuld::test]
+fn route_commands_are_built_with_a_typed_tool() {
+    #[cfg(windows)]
+    let allowed = [SystemTool::Route, SystemTool::Netsh];
+    #[cfg(not(windows))]
+    let allowed = [SystemTool::Route];
+    let mut seen: Vec<(SystemTool, Vec<String>)> = Vec::new();
+    for server in [ipv4_server(), ipv6_server()] {
+        for ipv6 in [true, false] {
+            seen.extend(
+                build_setup_commands("utun7", server, &ipv4_gw(), ipv6)
+                    .into_iter()
+                    .map(|c| (c.tool, c.args)),
+            );
+        }
+        for form in [state::RouteForm::Via, state::RouteForm::OnLink] {
+            seen.extend(
+                build_teardown_commands("utun7", server, "en0", Some(ipv4_gateway()), form)
+                    .into_iter()
+                    .map(|c| (c.tool, c.args)),
+            );
+        }
+    }
+    seen.extend(
+        build_split_route_teardown_commands("utun7")
+            .into_iter()
+            .map(|c| (c.tool, c.args)),
+    );
+    assert!(!seen.is_empty());
+    for (tool, args) in seen {
+        assert!(allowed.contains(&tool), "{tool:?} is not a route tool on this OS");
+        assert!(
+            tool.path().unwrap().is_absolute(),
+            "{tool:?} must resolve to an absolute path"
+        );
+        assert_ne!(
+            args.first().map(String::as_str),
+            Some(tool.name()),
+            "{tool:?} args {args:?} start with a program name"
+        );
+    }
 }
 
 // Success oracle ======================================================================================================
@@ -443,7 +494,11 @@ fn split_teardown_generates_four_commands() {
 #[skuld::test]
 fn split_teardown_includes_ipv4_low_half() {
     let cmds = build_split_route_teardown_commands("utun7");
-    let joined = cmds.iter().map(|c| c.argv.join(" ")).collect::<Vec<_>>().join("\n");
+    let joined = cmds
+        .iter()
+        .map(|c| argv_of(c.tool, &c.args).join(" "))
+        .collect::<Vec<_>>()
+        .join("\n");
     assert!(
         joined.contains("0.0.0.0/1"),
         "missing IPv4 low-half route in:\n{joined}"
@@ -453,7 +508,11 @@ fn split_teardown_includes_ipv4_low_half() {
 #[skuld::test]
 fn split_teardown_includes_ipv4_high_half() {
     let cmds = build_split_route_teardown_commands("utun7");
-    let joined = cmds.iter().map(|c| c.argv.join(" ")).collect::<Vec<_>>().join("\n");
+    let joined = cmds
+        .iter()
+        .map(|c| argv_of(c.tool, &c.args).join(" "))
+        .collect::<Vec<_>>()
+        .join("\n");
     assert!(
         joined.contains("128.0.0.0/1"),
         "missing IPv4 high-half route in:\n{joined}"
@@ -463,14 +522,22 @@ fn split_teardown_includes_ipv4_high_half() {
 #[skuld::test]
 fn split_teardown_includes_ipv6_low_half() {
     let cmds = build_split_route_teardown_commands("utun7");
-    let joined = cmds.iter().map(|c| c.argv.join(" ")).collect::<Vec<_>>().join("\n");
+    let joined = cmds
+        .iter()
+        .map(|c| argv_of(c.tool, &c.args).join(" "))
+        .collect::<Vec<_>>()
+        .join("\n");
     assert!(joined.contains("::/1"), "missing IPv6 low-half route in:\n{joined}");
 }
 
 #[skuld::test]
 fn split_teardown_includes_ipv6_high_half() {
     let cmds = build_split_route_teardown_commands("utun7");
-    let joined = cmds.iter().map(|c| c.argv.join(" ")).collect::<Vec<_>>().join("\n");
+    let joined = cmds
+        .iter()
+        .map(|c| argv_of(c.tool, &c.args).join(" "))
+        .collect::<Vec<_>>()
+        .join("\n");
     assert!(
         joined.contains("8000::/1"),
         "missing IPv6 high-half route in:\n{joined}"
@@ -542,8 +609,10 @@ fn ipv4_splits_and_bypass_stay_fatal_without_tun_ipv6() {
 }
 
 /// Fails exactly the two IPv6 adds, as an IPv6-unbound adapter does.
-fn fail_ipv6_splits(seen: &RefCell<Vec<String>>) -> impl Fn(&[String], FatalPhase) -> Result<(), CommandFailure> + '_ {
-    |argv: &[String], _| {
+fn fail_ipv6_splits(
+    seen: &RefCell<Vec<String>>,
+) -> impl Fn(SystemTool, &[String], FatalPhase) -> Result<(), CommandFailure> + '_ {
+    |_, argv: &[String], _| {
         seen.borrow_mut().push(argv.join(" "));
         if argv.iter().any(|arg| arg == "::/1" || arg == "8000::/1") {
             return Err(CommandFailure::Exit(1));
@@ -590,20 +659,56 @@ fn a_host_with_ipv6_aborts_when_an_ipv6_add_fails() {
 // routing state is touched. The second group injects a recording executor to
 // assert each loop's failure policy (fatal aborts, best-effort does not).
 
-/// A command that always exits with `code`. `cfg!` is a runtime branch, so
-/// both arms compile on every target.
+/// The arguments of a command that always exits with `code`. The `tool` of a
+/// command carrying them is a placeholder: [`exits_with_its_code`] never spawns
+/// it, it reads the code from the arguments.
 fn always_exits(code: i32) -> Vec<String> {
-    if cfg!(windows) {
-        vec!["cmd".into(), "/c".into(), format!("exit {code}")]
+    vec!["exit".into(), code.to_string()]
+}
+
+/// Real [`run_command`] driven by a shell that only sets an exit code, so no
+/// `route`/`netsh` runs.
+#[allow(clippy::disallowed_methods)] // a shell that only sets an exit code is not an OS route tool
+fn exits_with_its_code<P: Phase>(_tool: SystemTool, args: &[String], phase: P) -> Result<(), CommandFailure> {
+    let [verb, code] = args else {
+        panic!("exits_with_its_code runs the arguments `always_exits` builds (`exit <code>`), got {args:?}");
+    };
+    assert_eq!(verb, "exit", "arguments not built by `always_exits`: {args:?}");
+    let command = if cfg!(windows) {
+        let mut c = Command::new("cmd");
+        c.args(["/c", &format!("exit {code}")]);
+        c
     } else {
-        vec!["sh".into(), "-c".into(), format!("exit {code}")]
-    }
+        let mut c = Command::new("sh");
+        c.args(["-c", &format!("exit {code}")]);
+        c
+    };
+    run_command(command, format!("exit {code}"), phase)
+}
+
+/// What production's [`exec_one`] spawns and logs for a tool and its arguments:
+/// the tool's own absolute path, then exactly the arguments, never a program
+/// name repeated among them. Built without spawning, so no route changes.
+#[skuld::test]
+fn a_route_command_runs_the_tools_path_with_exactly_its_arguments() {
+    let args: Vec<String> = ["add", "-net", "0.0.0.0/1", "10.0.0.1"].map(String::from).to_vec();
+    let (built, logged) = route_command(SystemTool::Route, &args);
+    let command = built.unwrap();
+
+    let path = SystemTool::Route.path().unwrap();
+    assert_eq!(command.get_program(), path.as_os_str());
+    assert_eq!(
+        command.get_args().map(|a| a.to_str().unwrap()).collect::<Vec<_>>(),
+        ["add", "-net", "0.0.0.0/1", "10.0.0.1"]
+    );
+    assert_eq!(logged, format!("{} add -net 0.0.0.0/1 10.0.0.1", path.display()));
 }
 
 fn fatal_exits(code: i32) -> SetupCommand {
     SetupCommand {
         id: RouteId::SplitV4Low,
-        argv: always_exits(code),
+        tool: SystemTool::Route,
+        args: always_exits(code),
         fatal: true,
     }
 }
@@ -612,7 +717,13 @@ fn fatal_exits(code: i32) -> SetupCommand {
 fn a_failed_setup_command_is_an_error() {
     let mut installed = Vec::new();
     assert!(
-        run_setup_commands(&[fatal_exits(3)], &mut installed, exec_one::<FatalPhase>, |_| Ok(())).is_err(),
+        run_setup_commands(
+            &[fatal_exits(3)],
+            &mut installed,
+            exits_with_its_code::<FatalPhase>,
+            |_| Ok(())
+        )
+        .is_err(),
         "a non-zero exit during route setup must surface as an error — returning Ok \
          reports split routes that were never installed, and traffic egresses outside \
          the tunnel while the UI says it is protected (#901)"
@@ -622,7 +733,13 @@ fn a_failed_setup_command_is_an_error() {
 #[skuld::test]
 fn a_successful_setup_command_is_ok() {
     let mut installed = Vec::new();
-    assert!(run_setup_commands(&[fatal_exits(0)], &mut installed, exec_one::<FatalPhase>, |_| Ok(())).is_ok());
+    assert!(run_setup_commands(
+        &[fatal_exits(0)],
+        &mut installed,
+        exits_with_its_code::<FatalPhase>,
+        |_| Ok(())
+    )
+    .is_ok());
 }
 
 #[skuld::test]
@@ -631,7 +748,7 @@ fn setup_error_carries_the_exit_code_and_position() {
     let err = run_setup_commands(
         &[fatal_exits(0), fatal_exits(3)],
         &mut installed,
-        exec_one::<FatalPhase>,
+        exits_with_its_code::<FatalPhase>,
         |_| Ok(()),
     )
     .unwrap_err();
@@ -647,13 +764,14 @@ fn a_non_fatal_failure_does_not_mask_a_later_fatal_one() {
     let cmds = vec![
         SetupCommand {
             id: RouteId::SplitV6Low,
-            argv: always_exits(1),
+            tool: SystemTool::Route,
+            args: always_exits(1),
             fatal: false,
         },
         fatal_exits(7),
     ];
     let mut installed = Vec::new();
-    let err = run_setup_commands(&cmds, &mut installed, exec_one::<FatalPhase>, |_| Ok(())).unwrap_err();
+    let err = run_setup_commands(&cmds, &mut installed, exits_with_its_code::<FatalPhase>, |_| Ok(())).unwrap_err();
     assert_eq!(err.index, 1);
     assert!(err.to_string().contains("exited with code 7"), "got {err}");
 }
@@ -665,7 +783,7 @@ fn a_non_fatal_failure_does_not_mask_a_later_fatal_one() {
 fn setup_error_does_not_leak_the_command_arguments() {
     let cmds = build_setup_commands("hole-tun", ipv4_server(), &ipv4_gw(), true);
     let err = RouteCommandError {
-        program: cmds[4].argv[0].clone(),
+        program: cmds[4].tool.name().to_string(),
         index: 4,
         total: cmds.len(),
         failure: CommandFailure::Exit(1),
@@ -680,9 +798,11 @@ fn setup_error_does_not_leak_the_command_arguments() {
 /// gone) by default.
 type Captured = Vec<(BestEffortPhase, Vec<String>)>;
 
-fn capturing_runner(log: &RefCell<Captured>) -> impl Fn(&[String], BestEffortPhase) -> Result<(), CommandFailure> + '_ {
-    |cmd: &[String], phase: BestEffortPhase| {
-        log.borrow_mut().push((phase, cmd.to_vec()));
+fn capturing_runner(
+    log: &RefCell<Captured>,
+) -> impl Fn(SystemTool, &[String], BestEffortPhase) -> Result<(), CommandFailure> + '_ {
+    |tool, args: &[String], phase: BestEffortPhase| {
+        log.borrow_mut().push((phase, argv_of(tool, args)));
         Ok(())
     }
 }
@@ -700,15 +820,15 @@ fn a_failed_cleanup_command_is_reported_but_not_returned() {
     // No error channel at all: `run_teardown_commands` narrows `still_installed`
     // instead, and a failed command simply stays in it.
     let cmds = vec![
-        RouteCommand::new(RouteId::SplitV4Low, always_exits(3)),
-        RouteCommand::new(RouteId::SplitV4High, always_exits(0)),
+        RouteCommand::new(RouteId::SplitV4Low, SystemTool::Route, always_exits(3)),
+        RouteCommand::new(RouteId::SplitV4High, SystemTool::Route, always_exits(0)),
     ];
     let mut still_installed = vec![RouteId::SplitV4Low, RouteId::SplitV4High];
     run_teardown_commands(
         &cmds,
         BestEffortPhase::Teardown,
         &mut still_installed,
-        exec_one::<BestEffortPhase>,
+        exits_with_its_code::<BestEffortPhase>,
         |_| {},
     );
     assert_eq!(
@@ -723,10 +843,10 @@ fn a_failed_cleanup_command_is_reported_but_not_returned() {
 fn recording_exec<'a>(
     seen: &'a RefCell<Vec<String>>,
     fail_at: &'a [usize],
-) -> impl Fn(&[String], BestEffortPhase) -> Result<(), CommandFailure> + 'a {
-    move |cmd: &[String], _phase: BestEffortPhase| {
+) -> impl Fn(SystemTool, &[String], BestEffortPhase) -> Result<(), CommandFailure> + 'a {
+    move |tool, args: &[String], _phase: BestEffortPhase| {
         let index = seen.borrow().len();
-        seen.borrow_mut().push(cmd.join(" "));
+        seen.borrow_mut().push(argv_of(tool, args).join(" "));
         if fail_at.contains(&index) {
             return Err(CommandFailure::Exit(1));
         }
@@ -745,7 +865,7 @@ fn numbered_teardown_commands(count: usize) -> Vec<RouteCommand> {
         RouteId::ServerBypass,
     ];
     (0..count)
-        .map(|i| RouteCommand::new(IDS[i % IDS.len()], vec!["route".into(), format!("cmd{i}")]))
+        .map(|i| RouteCommand::new(IDS[i % IDS.len()], SystemTool::Route, vec![format!("cmd{i}")]))
         .collect()
 }
 
@@ -779,8 +899,8 @@ fn cleanup_survives_a_spawn_failure_and_keeps_going() {
         &cmds,
         BestEffortPhase::RecoverSplit,
         &mut still_installed,
-        |cmd, _| {
-            seen.borrow_mut().push(cmd.join(" "));
+        |tool, args, _| {
+            seen.borrow_mut().push(argv_of(tool, args).join(" "));
             Err(CommandFailure::Spawn(std::io::Error::other("no such program")))
         },
         |_| {},
@@ -798,7 +918,8 @@ fn setup_stops_at_the_first_failing_command() {
     let cmds: Vec<SetupCommand> = (0..5)
         .map(|i| SetupCommand {
             id: RouteId::SplitV4Low,
-            argv: vec!["route".into(), format!("cmd{i}")],
+            tool: SystemTool::Route,
+            args: vec![format!("cmd{i}")],
             fatal: true,
         })
         .collect();
@@ -806,9 +927,9 @@ fn setup_stops_at_the_first_failing_command() {
     let err = run_setup_commands(
         &cmds,
         &mut installed,
-        |cmd, _| {
+        |tool, args, _| {
             let index = seen.borrow().len();
-            seen.borrow_mut().push(cmd.join(" "));
+            seen.borrow_mut().push(argv_of(tool, args).join(" "));
             if index == 1 {
                 Err(CommandFailure::Exit(1))
             } else {
@@ -841,8 +962,8 @@ fn install_hands_back_no_guard_when_a_setup_command_fails() {
         "hole-tun",
         ipv4_server(),
         &ipv4_gw(),
-        |_, _| Err(CommandFailure::Exit(1)),
-        |_, _| Ok(()),
+        |_, _, _| Err(CommandFailure::Exit(1)),
+        |_, _, _| Ok(()),
     );
 
     assert!(
@@ -866,7 +987,7 @@ fn install_rolls_back_and_clears_state_when_a_setup_command_fails() {
         "hole-tun",
         ipv4_server(),
         &ipv4_gw(),
-        |_, _| {
+        |_, _, _| {
             calls.set(calls.get() + 1);
             if calls.get() == 1 {
                 Ok(())
@@ -874,7 +995,7 @@ fn install_rolls_back_and_clears_state_when_a_setup_command_fails() {
                 Err(CommandFailure::Exit(1))
             }
         },
-        |argv, _| {
+        |_, argv, _| {
             torn_down.borrow_mut().push(argv.to_vec());
             Ok(())
         },
@@ -903,11 +1024,11 @@ fn install_persists_state_before_the_setup_phase_runs() {
         "hole-tun",
         ipv4_server(),
         &ipv4_gw(),
-        |_, _| {
+        |_, _, _| {
             state_seen.set(tmp.path().join(STATE_FILE_NAME).exists());
             Err(CommandFailure::Exit(1))
         },
-        |_, _| Ok(()),
+        |_, _, _| Ok(()),
     );
 
     assert!(
@@ -926,8 +1047,8 @@ fn install_returns_a_guard_when_every_setup_command_succeeds() {
             "hole-tun",
             ipv4_server(),
             &ipv4_gw(),
-            |_, _| Ok(()),
-            |_, _| unreachable!("a successful install must not roll back"),
+            |_, _, _| Ok(()),
+            |_, _, _| unreachable!("a successful install must not roll back"),
         )
         .expect("install must succeed when the setup phase does");
 
@@ -1169,7 +1290,7 @@ fn recover_keeps_state_file_when_every_command_fails_to_spawn() {
     };
     state::save(tmp.path(), &persisted_state, None).unwrap();
 
-    let failing = |_cmd: &[String], _phase: BestEffortPhase| -> Result<(), CommandFailure> {
+    let failing = |_, _cmd: &[String], _phase: BestEffortPhase| -> Result<(), CommandFailure> {
         Err(CommandFailure::Spawn(std::io::Error::other("simulated runner failure")))
     };
     recover_routes_with(
@@ -1206,7 +1327,7 @@ fn recover_narrows_the_state_file_to_the_command_that_failed_to_spawn() {
     };
     state::save(tmp.path(), &persisted_state, None).unwrap();
 
-    let failing_one = |cmd: &[String], _phase: BestEffortPhase| -> Result<(), CommandFailure> {
+    let failing_one = |_, cmd: &[String], _phase: BestEffortPhase| -> Result<(), CommandFailure> {
         if cmd.iter().any(|a| a == "::/1") {
             Err(CommandFailure::Spawn(std::io::Error::other("simulated runner failure")))
         } else {
@@ -1366,7 +1487,7 @@ fn recover_orders_lockdown_before_transient_sweep_and_passes_adopting() {
         dir.path(),
         None,
         Some("hole-tun"),
-        |_cmd, _phase| Ok(()),
+        |_, _cmd, _phase| Ok(()),
         |_state_dir, adopting| {
             order.borrow_mut().push("sweep_cover");
             *adopting_seen.borrow_mut() = Some(adopting);
@@ -1528,7 +1649,7 @@ fn recover_passes_adopting_only_on_adopt() {
             dir.path(),
             None,
             Some("hole-tun"),
-            |_c, _p| Ok(()),
+            |_, _c, _p| Ok(()),
             |_d, adopting| *adopting_seen.borrow_mut() = Some(adopting),
             intent,
             || presence,
@@ -1602,7 +1723,7 @@ fn recover_over(dir: &Path, presence: CoverPresence) -> (Recovery, Option<CoverR
         dir,
         None,
         Some("hole-tun"),
-        |_c, _p| Ok(()),
+        |_, _c, _p| Ok(()),
         |_d, _a| {},
         failclosed::lockdown_state::load_intent(dir),
         || presence,
@@ -1643,7 +1764,7 @@ fn recover_records_the_intent_before_acting_on_it() {
         dir.path(),
         None,
         Some("hole-tun"),
-        |_c, _p| Ok(()),
+        |_, _c, _p| Ok(()),
         |_d, _a| {},
         failclosed::lockdown_state::load_intent(dir.path()),
         || Live,
@@ -1727,7 +1848,7 @@ fn recover_prefers_its_own_route_state_tun_name_over_the_fallback() {
         dir.path(),
         None,
         Some("hole-tun-fallback"),
-        |_c, _p| Ok(()),
+        |_, _c, _p| Ok(()),
         |_d, _a| {},
         Intent::On,
         || Live,
@@ -1755,7 +1876,7 @@ fn recover_falls_back_to_the_given_tun_name_when_no_route_state_exists() {
         dir.path(),
         None,
         Some("hole-tun-fallback"),
-        |_c, _p| Ok(()),
+        |_, _c, _p| Ok(()),
         |_d, _a| {},
         Intent::On,
         || Live,
@@ -1778,7 +1899,7 @@ fn recover_returns_its_decision() {
             dir.path(),
             None,
             Some("hole-tun"),
-            |_c, _p| Ok(()),
+            |_, _c, _p| Ok(()),
             |_d, _a| {},
             intent,
             || presence,
@@ -1837,7 +1958,7 @@ mod macos_teardown_names_no_interface {
     fn crash_recovery_split_deletes_carry_no_interface_operand() {
         for cmd in build_split_route_teardown_commands("utun7") {
             assert!(
-                !names_an_interface(&cmd.argv),
+                !names_an_interface(&cmd.args),
                 "recovery delete names an interface: {cmd:?}"
             );
         }
@@ -1915,7 +2036,7 @@ fn teardown_deletes_nothing_when_nothing_was_installed() {
     )
     .into_iter()
     .filter(|c| [].contains(&c.id))
-    .map(|c| c.argv)
+    .map(|c| argv_of(c.tool, &c.args))
     .collect();
     assert!(
         cmds.is_empty(),
@@ -1935,7 +2056,7 @@ fn teardown_deletes_only_the_recorded_routes() {
     )
     .into_iter()
     .filter(|c| installed.contains(&c.id))
-    .map(|c| c.argv)
+    .map(|c| argv_of(c.tool, &c.args))
     .collect();
     assert_eq!(cmds.len(), 1, "expected exactly the recorded delete, got {cmds:?}");
     assert!(
@@ -1959,7 +2080,7 @@ fn teardown_omits_the_bypass_when_it_was_not_installed() {
     )
     .into_iter()
     .filter(|c| SPLIT_ROUTES.contains(&c.id))
-    .map(|c| c.argv)
+    .map(|c| argv_of(c.tool, &c.args))
     .collect();
     assert!(
         !mentions_addr(&cmds, "1.2.3.4"),
@@ -2140,7 +2261,7 @@ fn recover_keeps_the_file_when_only_the_stale_group_fails_to_confirm_gone() {
     // The primary record's own command confirms gone; the stale group's
     // does not.
     let stale_attempted = std::cell::Cell::new(false);
-    let runner = |argv: &[String], _phase: BestEffortPhase| -> Result<(), CommandFailure> {
+    let runner = |_, argv: &[String], _phase: BestEffortPhase| -> Result<(), CommandFailure> {
         if argv.iter().any(|a| a == "9.9.9.9") {
             stale_attempted.set(true);
             return Err(CommandFailure::Exit(1));
@@ -2204,7 +2325,7 @@ fn setup_routes_pops_a_route_the_runner_reports_not_installed() {
     let result = run_setup_commands(
         &cmds,
         &mut installed,
-        |argv, _phase| {
+        |_, argv, _phase| {
             if argv.iter().any(|a| a == "8000::/1") {
                 Err(CommandFailure::Exit(1))
             } else {
@@ -2232,7 +2353,7 @@ fn setup_routes_excludes_a_spawn_failure_from_installed_but_not_from_the_last_ch
     let result = run_setup_commands(
         &cmds,
         &mut installed,
-        |argv, _phase| {
+        |_, argv, _phase| {
             if argv.iter().any(|a| a == "::/1") {
                 Err(CommandFailure::Spawn(std::io::Error::other("simulated spawn failure")))
             } else {
@@ -2271,7 +2392,7 @@ fn setup_routes_aborts_when_a_pre_command_checkpoint_fails() {
     let result = run_setup_commands(
         &cmds,
         &mut installed,
-        |_argv, _phase| Ok(()),
+        |_, _argv, _phase| Ok(()),
         |_ids| {
             checkpoint_calls += 1;
             // Fail the pre-command checkpoint of the 2nd command (call
@@ -2307,7 +2428,7 @@ fn setup_routes_continues_when_a_post_command_checkpoint_fails() {
     let result = run_setup_commands(
         &cmds,
         &mut installed,
-        |_argv, _phase| Ok(()),
+        |_, _argv, _phase| Ok(()),
         |_ids| {
             checkpoint_calls += 1;
             // Fail the post-command checkpoint of the 1st command (call
@@ -2338,7 +2459,7 @@ fn run_teardown_commands_keeps_an_id_whose_delete_fails_to_spawn() {
         &cmds,
         BestEffortPhase::Teardown,
         &mut still_installed,
-        |argv, _phase| {
+        |_, argv, _phase| {
             if argv.iter().any(|a| a == "::/1") {
                 Err(CommandFailure::Spawn(std::io::Error::other("simulated spawn failure")))
             } else {
@@ -2365,7 +2486,7 @@ fn run_teardown_commands_keeps_an_id_the_runner_says_is_not_confirmed_gone() {
         &cmds,
         BestEffortPhase::Teardown,
         &mut still_installed,
-        |argv, _phase| {
+        |_, argv, _phase| {
             if argv.iter().any(|a| a == "0.0.0.0/1") {
                 Err(CommandFailure::Exit(1))
             } else {
@@ -2390,7 +2511,7 @@ fn run_teardown_commands_checkpoints_after_every_command() {
         &cmds,
         BestEffortPhase::Teardown,
         &mut still_installed,
-        |_argv, _phase| Ok(()),
+        |_, _argv, _phase| Ok(()),
         |ids| checkpoints.borrow_mut().push(ids.to_vec()),
     );
     let checkpoints = checkpoints.into_inner();
@@ -2427,7 +2548,7 @@ fn teardown_routes_with_nothing_installed_does_not_panic() {
         Some(ipv4_gateway()),
         state::RouteForm::Via,
         &[],
-        |argv, _phase| panic!("no command should run for an empty installed set: {argv:?}"),
+        |_, argv, _phase| panic!("no command should run for an empty installed set: {argv:?}"),
         |_ids| {},
     );
     assert!(remaining.is_empty());
@@ -2466,7 +2587,7 @@ fn teardown_routes_deletes_everything_on_full_success() {
         Some(ipv4_gateway()),
         state::RouteForm::Via,
         &planned_routes(ipv4_server()),
-        |_argv, _phase| Ok(()),
+        |_, _argv, _phase| Ok(()),
         |_ids| {},
     );
     assert!(
@@ -2487,7 +2608,7 @@ fn teardown_routes_only_attempts_the_recorded_subset() {
         Some(ipv4_gateway()),
         state::RouteForm::Via,
         &[RouteId::SplitV4High, RouteId::ServerBypass],
-        |argv, _phase| {
+        |_, argv, _phase| {
             if argv.iter().any(|a| a == "128.0.0.0/1") {
                 attempted.borrow_mut().push(RouteId::SplitV4High);
             } else if argv.iter().any(|a| a == "1.2.3.4") {
@@ -2518,7 +2639,7 @@ fn teardown_routes_keeps_the_id_whose_delete_fails_to_spawn() {
         Some(ipv4_gateway()),
         state::RouteForm::Via,
         &planned_routes(ipv4_server()),
-        |argv, _phase| {
+        |_, argv, _phase| {
             if argv.iter().any(|a| a == "1.2.3.4") {
                 Err(CommandFailure::Spawn(std::io::Error::other("simulated spawn failure")))
             } else {
@@ -2681,10 +2802,10 @@ mod windows_bypass_teardown_scoping {
         let cmds = build_teardown_commands("utun7", server_ip, "en0", Some(gateway), state::RouteForm::Via);
         let cmd = cmds
             .iter()
-            .find(|c| c.argv.iter().any(|a| a == "1.2.3.4"))
+            .find(|c| c.args.iter().any(|a| a == "1.2.3.4"))
             .expect("bypass delete must be present");
         assert!(
-            cmd.argv.iter().any(|a| a == "192.168.1.1"),
+            cmd.args.iter().any(|a| a == "192.168.1.1"),
             "the delete must be scoped by the install-time gateway so it cannot take out \
              a co-resident VPN's route to the same destination, got {cmd:?}"
         );
@@ -2703,7 +2824,7 @@ mod windows_bypass_teardown_scoping {
             .find(|c| c.id == RouteId::ServerBypass)
             .expect("bypass delete must be present");
         assert_eq!(
-            cmd.argv,
+            argv_of(cmd.tool, &cmd.args),
             vec![
                 "netsh".to_string(),
                 "interface".to_string(),
@@ -2727,10 +2848,10 @@ mod windows_bypass_teardown_scoping {
         let cmds = build_teardown_commands("utun7", server_ip, "en0", None, state::RouteForm::Via);
         let cmd = cmds
             .iter()
-            .find(|c| c.argv.iter().any(|a| a == "1.2.3.4"))
+            .find(|c| c.args.iter().any(|a| a == "1.2.3.4"))
             .expect("bypass delete must still be attempted without a known gateway");
         assert!(
-            !cmd.argv.iter().any(|a| a == "192.168.1.1"),
+            !cmd.args.iter().any(|a| a == "192.168.1.1"),
             "no gateway known => no gateway operand, got {cmd:?}"
         );
     }
@@ -2779,7 +2900,7 @@ fn install_sweep_carries_forward_a_still_unconfirmed_leftover_instead_of_losing_
 
     // The sweep's delete fails the same way it did before — never confirmed
     // gone — the exact scenario the sweep exists for.
-    sweep_leftover_before_install(tmp.path(), None, &mut persisted, |_argv, _phase| {
+    sweep_leftover_before_install(tmp.path(), None, &mut persisted, |_, _argv, _phase| {
         Err(CommandFailure::Exit(1))
     });
 
@@ -2839,7 +2960,7 @@ fn install_sweep_drops_a_fully_confirmed_leftover() {
         stale: Vec::new(),
     };
 
-    sweep_leftover_before_install(tmp.path(), None, &mut persisted, |_argv, _phase| Ok(()));
+    sweep_leftover_before_install(tmp.path(), None, &mut persisted, |_, _argv, _phase| Ok(()));
 
     assert!(
         persisted.stale.is_empty(),
@@ -2891,7 +3012,7 @@ fn install_sweep_also_retries_debt_carried_by_an_earlier_sweep() {
     };
 
     let attempted: RefCell<Vec<String>> = RefCell::new(Vec::new());
-    sweep_leftover_before_install(tmp.path(), None, &mut persisted, |argv, _phase| {
+    sweep_leftover_before_install(tmp.path(), None, &mut persisted, |_, argv, _phase| {
         if argv.iter().any(|a| a == "9.9.9.9") {
             attempted.borrow_mut().push("9.9.9.9".into());
         }
@@ -3031,7 +3152,7 @@ fn install_sweep_merges_a_new_leftover_into_an_existing_stale_group_of_the_same_
     };
 
     // Never confirms gone — both records must fold into ONE retried entry.
-    sweep_leftover_before_install(tmp.path(), None, &mut persisted, |_argv, _phase| {
+    sweep_leftover_before_install(tmp.path(), None, &mut persisted, |_, _argv, _phase| {
         Err(CommandFailure::Exit(1))
     });
 
@@ -3322,7 +3443,7 @@ fn rollback_never_erases_extra_unconfirmed_mid_loop() {
     state::save(tmp.path(), &persisted, None).unwrap();
 
     let checked_mid_loop = std::cell::Cell::new(false);
-    let runner = |_argv: &[String], _phase: BestEffortPhase| -> Result<(), CommandFailure> {
+    let runner = |_, _argv: &[String], _phase: BestEffortPhase| -> Result<(), CommandFailure> {
         let on_disk = state::load(tmp.path()).expect("record must exist mid-rollback");
         assert!(
             on_disk.installed.contains(&RouteId::ServerBypass),
@@ -3381,7 +3502,7 @@ fn a_stale_server_bypass_is_not_what_the_lookup_returns() {
     state::save(tmp.path(), &leftover, None).unwrap();
 
     let calls = std::cell::RefCell::new(Vec::new());
-    clear_stale_server_bypass(tmp.path(), None, ipv4_server(), |argv, _phase| {
+    clear_stale_server_bypass(tmp.path(), None, ipv4_server(), |_, argv, _phase| {
         calls.borrow_mut().push(argv.to_vec());
         Ok(())
     });
@@ -3421,7 +3542,7 @@ fn a_stale_bypass_to_a_different_server_is_left_alone() {
 
     let calls = std::cell::RefCell::new(Vec::new());
     // Query for a DIFFERENT destination than the leftover's own server_ip.
-    clear_stale_server_bypass(tmp.path(), None, ipv4_server(), |argv, _phase| {
+    clear_stale_server_bypass(tmp.path(), None, ipv4_server(), |_, argv, _phase| {
         calls.borrow_mut().push(argv.to_vec());
         Ok(())
     });
@@ -3459,7 +3580,7 @@ fn a_stale_server_bypass_inside_the_carried_forward_group_is_also_cleared() {
     };
     state::save(tmp.path(), &leftover, None).unwrap();
 
-    clear_stale_server_bypass(tmp.path(), None, ipv4_server(), |_argv, _phase| Ok(()));
+    clear_stale_server_bypass(tmp.path(), None, ipv4_server(), |_, _argv, _phase| Ok(()));
 
     let on_disk = state::load(tmp.path()).unwrap();
     assert!(
@@ -3467,4 +3588,16 @@ fn a_stale_server_bypass_inside_the_carried_forward_group_is_also_cleared() {
         "the stale group's ServerBypass must be cleared and the now-empty group dropped: {:?}",
         on_disk.stale
     );
+}
+
+/// A tool whose path cannot be resolved (Windows: `GetSystemDirectoryW`
+/// failed) reaches the caller as `CommandFailure::Spawn` in every phase, the
+/// failure a missing binary would give.
+#[skuld::test]
+fn an_unresolvable_tool_is_a_spawn_failure_in_every_phase() {
+    let unresolvable = || Err(std::io::Error::other("no system directory"));
+    let fatal = run_built(unresolvable(), "route add".into(), FatalPhase::Setup);
+    assert!(matches!(fatal, Err(CommandFailure::Spawn(_))), "{fatal:?}");
+    let best_effort = run_built(unresolvable(), "route delete".into(), BestEffortPhase::Teardown);
+    assert!(matches!(best_effort, Err(CommandFailure::Spawn(_))), "{best_effort:?}");
 }

@@ -9,6 +9,8 @@
 //! Renovate/CI awareness — the caller decides `tag`, and the "commit anyway
 //! despite conflicts" CI-only policy is `force_commit_conflicted`.
 
+#![allow(clippy::disallowed_methods)] // dev tooling, never privileged
+
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 

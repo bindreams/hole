@@ -28,6 +28,8 @@
 //! for tests that need to observe post-stop state (e.g. state-file
 //! cleanup).
 
+#![allow(clippy::disallowed_methods)] // attended test: bare-name host tools
+
 use crate::socket::LocalStream;
 use bytes::Bytes;
 use hole_common::protocol::{

@@ -329,6 +329,7 @@ fn ready_notify_tolerates_malformed_spec_and_dead_listener() {
 /// binary as a contained child (=> CREATE_NEW_PROCESS_GROUP) and delivers
 /// the real console signal.
 #[cfg(windows)]
+#[allow(clippy::disallowed_methods)] // re-execs the test binary itself, not an OS tool
 #[skuld::test]
 fn ctrl_break_resolves_shutdown_signal() {
     let rt = tokio::runtime::Runtime::new().unwrap();

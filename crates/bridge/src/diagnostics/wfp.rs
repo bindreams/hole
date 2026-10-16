@@ -17,8 +17,8 @@
 //! NDIS / driver / Hyper-V vSwitch layers.
 
 use super::{truncate_utf8, watched_matches, DEBUG_OUTPUT_CAP_BYTES};
-use std::process::Command;
 use tracing::{debug, info, warn};
+use util::system_tool::SystemTool;
 
 /// Emit a WFP filter snapshot for the loopback outbound path.
 ///
@@ -71,7 +71,8 @@ pub fn log_snapshot(phase: &'static str) {
 /// debug-level output has enough information to trace a leaked filter
 /// back to its provider without needing a second `show providers` call.
 fn run_netsh() -> std::io::Result<String> {
-    let output = Command::new("netsh")
+    let output = SystemTool::Netsh
+        .command()?
         .args([
             "wfp",
             "show",

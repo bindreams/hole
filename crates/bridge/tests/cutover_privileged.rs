@@ -25,6 +25,8 @@
 //! `.config/nextest.toml` drops the test from the group → a silent cross-binary
 //! race with the other real-net tests. Change both together.
 
+#![allow(clippy::disallowed_methods)] // test spawns its own test binaries (attended)
+
 hole_test_observability::register!();
 
 fn main() {

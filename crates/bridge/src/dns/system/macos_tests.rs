@@ -465,3 +465,44 @@ fn macos_dns_global_net_state_real_steerer_engages_and_withdraws() {
         .withdraw()
         .expect("withdrawing through the trait object must reach Steering's inherent withdraw");
 }
+
+/// `flush` is best-effort, but the trait promises its failures are logged: a
+/// spawn or path error and a non-success exit each leave a warning naming the
+/// tool; a success leaves none.
+#[skuld::test]
+fn macos_flush_logs_each_failed_step_and_only_those() {
+    use super::log_flush_step;
+    use crate::test_support::log_capture::VecWriter;
+    use garter::tracing_test::set_default_in_current_thread;
+    use std::os::unix::process::ExitStatusExt;
+    use std::process::ExitStatus;
+    use tracing_subscriber::fmt;
+    use tracing_subscriber::layer::{Layer, SubscriberExt};
+    use util::system_tool::SystemTool;
+
+    let writer = VecWriter::new();
+    let subscriber = tracing_subscriber::registry().with(
+        fmt::layer()
+            .with_writer(writer.clone())
+            .with_ansi(false)
+            .with_filter(tracing_subscriber::filter::LevelFilter::WARN),
+    );
+    let _guard = set_default_in_current_thread(subscriber);
+
+    log_flush_step(SystemTool::Dscacheutil, Ok(ExitStatus::from_raw(0)));
+    assert_eq!(writer.snapshot_string(), "", "a successful step is not warned about");
+
+    log_flush_step(SystemTool::Dscacheutil, Ok(ExitStatus::from_raw(3 << 8)));
+    let output = writer.snapshot_string();
+    assert!(
+        output.contains("WARN") && output.contains("dscacheutil") && output.contains("exit status: 3"),
+        "a non-success exit must be warned about, naming the tool and the status; got:\n{output}"
+    );
+
+    log_flush_step(SystemTool::Killall, Err(io::Error::other("no such tool")));
+    let output = writer.snapshot_string();
+    assert!(
+        output.contains("killall") && output.contains("no such tool"),
+        "a spawn or path error must be warned about, naming the tool and the cause; got:\n{output}"
+    );
+}

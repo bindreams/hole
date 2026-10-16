@@ -9,6 +9,8 @@
 //! `<out_dir>/<target-name>.test<.exe>` — a stable path that Firewall can cache.
 //! On Windows we also stage the companion `.pdb` so staged-crash symbolication keeps working.
 
+#![allow(clippy::disallowed_methods)] // dev tooling, never privileged
+
 use std::collections::{HashMap, HashSet};
 use std::io::BufRead;
 use std::path::{Path, PathBuf};

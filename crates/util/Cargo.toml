@@ -27,7 +27,7 @@ aho-corasick = "1"
 libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
-windows = { version = "0.62", features = ["Win32_Networking_WinSock", "Win32_System_IO"] }
+windows = { version = "0.62", features = ["Win32_Networking_WinSock", "Win32_System_IO", "Win32_System_SystemInformation"] }
 
 [dev-dependencies]
 skuld = { workspace = true }

@@ -39,6 +39,8 @@ use crate::routing::{CoverGuard, Routing, SystemRouting};
 // `GLOBAL_NET_STATE` — in one binary panics at test-runner startup with
 // "label declared multiple times").
 use crate::{GLOBAL_NET_STATE, TUN};
+#[cfg(target_os = "macos")]
+use util::system_tool::SystemTool;
 
 // Two routable anycast hosts on :443 (the runner has outbound internet), as
 // `lockdown_privileged_tests` uses — see that module's doc for why these two
@@ -139,8 +141,6 @@ fn windows_release_all_clears_a_stranded_lockdown_cover() {
 #[cfg(target_os = "macos")]
 #[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
 fn macos_release_all_clears_a_stranded_lockdown_cover() {
-    use std::process::Command;
-
     let dir = tempfile::tempdir().unwrap();
     let _release_guard = ReleaseOnDrop(dir.path().to_path_buf());
     let routing = SystemRouting::new(dir.path().to_path_buf(), None);
@@ -167,7 +167,7 @@ fn macos_release_all_clears_a_stranded_lockdown_cover() {
         "release_all_covers must restore egress: {NON_PERMITTED}={:?}",
         connect(NON_PERMITTED).err().map(|e| e.kind()),
     );
-    let sr = Command::new("pfctl").args(["-sr"]).output().unwrap();
+    let sr = SystemTool::Pfctl.command().unwrap().args(["-sr"]).output().unwrap();
     assert!(
         !String::from_utf8_lossy(&sr.stdout).contains("block drop out quick all"),
         "the lockdown block rule must be gone from the live ruleset"
@@ -353,8 +353,6 @@ fn windows_release_all_on_a_clean_host_is_ok() {
 #[cfg(target_os = "macos")]
 #[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
 fn macos_release_all_on_a_clean_host_is_ok() {
-    use std::process::Command;
-
     let dir = tempfile::tempdir().unwrap();
     let routing = SystemRouting::new(dir.path().to_path_buf(), None);
 
@@ -363,16 +361,52 @@ fn macos_release_all_on_a_clean_host_is_ok() {
     // Compare only -sr / -sn (the RULES) and the enabled flag — `-s info`'s
     // counters move on their own and would make this test flaky for reasons
     // unrelated to the cover.
-    let sr_before = Command::new("pfctl").args(["-sr"]).output().unwrap().stdout;
-    let sn_before = Command::new("pfctl").args(["-sn"]).output().unwrap().stdout;
-    let info_before = Command::new("pfctl").args(["-s", "info"]).output().unwrap().stdout;
+    let sr_before = SystemTool::Pfctl
+        .command()
+        .unwrap()
+        .args(["-sr"])
+        .output()
+        .unwrap()
+        .stdout;
+    let sn_before = SystemTool::Pfctl
+        .command()
+        .unwrap()
+        .args(["-sn"])
+        .output()
+        .unwrap()
+        .stdout;
+    let info_before = SystemTool::Pfctl
+        .command()
+        .unwrap()
+        .args(["-s", "info"])
+        .output()
+        .unwrap()
+        .stdout;
     let enabled_before = super::platform::parse_pf_enabled(&String::from_utf8_lossy(&info_before));
 
     routing.release_all_covers().expect("a clean host must return Ok");
 
-    let sr_after = Command::new("pfctl").args(["-sr"]).output().unwrap().stdout;
-    let sn_after = Command::new("pfctl").args(["-sn"]).output().unwrap().stdout;
-    let info_after = Command::new("pfctl").args(["-s", "info"]).output().unwrap().stdout;
+    let sr_after = SystemTool::Pfctl
+        .command()
+        .unwrap()
+        .args(["-sr"])
+        .output()
+        .unwrap()
+        .stdout;
+    let sn_after = SystemTool::Pfctl
+        .command()
+        .unwrap()
+        .args(["-sn"])
+        .output()
+        .unwrap()
+        .stdout;
+    let info_after = SystemTool::Pfctl
+        .command()
+        .unwrap()
+        .args(["-s", "info"])
+        .output()
+        .unwrap()
+        .stdout;
     let enabled_after = super::platform::parse_pf_enabled(&String::from_utf8_lossy(&info_after));
 
     assert_eq!(
@@ -449,8 +483,6 @@ fn macos_release_all_clears_a_cover_whose_state_file_is_unreadable() {
 #[cfg(target_os = "macos")]
 #[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
 fn macos_recover_cover_clears_a_cover_whose_state_file_is_unreadable() {
-    use std::process::Command;
-
     let dir = tempfile::tempdir().unwrap();
     let _release_guard = ReleaseOnDrop(dir.path().to_path_buf());
     let routing = SystemRouting::new(dir.path().to_path_buf(), None);
@@ -498,7 +530,7 @@ fn macos_recover_cover_clears_a_cover_whose_state_file_is_unreadable() {
     // stays so that a sweep whose own `-X` failed cannot leave the runner's pf
     // enabled under an unreferenced token until reboot. Best-effort and AFTER
     // the measurement, so it can neither mask nor cause the verdict.
-    let _ = Command::new("/sbin/pfctl").args(["-X", &token]).output();
+    let _ = SystemTool::Pfctl.command().unwrap().args(["-X", &token]).output();
 
     assert!(
         restored.is_ok(),

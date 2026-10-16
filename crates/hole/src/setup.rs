@@ -289,6 +289,8 @@ fn cmdline_roundtrips(cmdline: &str, expected: &[&str]) -> bool {
 pub fn run_elevated(program: &Path, args: &[&str]) -> Result<(), SetupError> {
     let script = build_elevation_script(program, args);
 
+    #[allow(clippy::disallowed_methods)]
+    // runs in the unprivileged GUI as the user (osascript is what elevates), so a PATH lookup gains nothing
     let output = std::process::Command::new("osascript").args(["-e", &script]).output()?;
 
     if output.status.success() {

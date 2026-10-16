@@ -9,6 +9,8 @@
 //! no `.await` separates that return from the probe, so nothing else can
 //! run in between. See CONTRIBUTING.md#proxy-shutdown-contract.
 
+#![allow(clippy::disallowed_methods)] // attended test: bare-name host tools
+
 use super::ShadowsocksRunning;
 use crate::proxy::{build_ss_config, Proxy, ProxyError, RunningProxy, ShadowsocksProxy};
 use crate::test_support::port_alloc::allocate_ephemeral_port;

@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)] // test fixture: re-execs its own binary, not an OS tool
 use std::net::SocketAddr;
 
 use garter::sitrep::{SitrepEvent, Transports, SITREP_PROTOCOL};

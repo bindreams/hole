@@ -11,6 +11,8 @@
 //! to a temp dir on the runner). Fall back to the compile-time value
 //! via `env!()` for plain `cargo test` invocations on the build host.
 
+#![allow(clippy::disallowed_methods)] // attended test: bare-name host tools
+
 use handle_holders::{find_holders, FileHolder};
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;

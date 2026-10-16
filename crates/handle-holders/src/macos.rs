@@ -31,6 +31,9 @@ pub(super) fn find_holders_impl(path: &Path) -> io::Result<Vec<FileHolder>> {
     //   -F pc : emit only pid (p) and command (c) fields
     //   --    : end of options, next arg is a filename
     // Exit codes: 0 = matches found, 1 = no matches (NOT an error here).
+    #[allow(clippy::disallowed_methods)]
+    // `lsof` is found by PATH. Not an OS-tool spawn by `SystemTool`: the bridge depends on this crate only as a
+    // dev-dependency, so the privileged binary cannot call it.
     let out = Command::new("lsof")
         .args(["-F", "pc", "--"])
         .arg(&path)

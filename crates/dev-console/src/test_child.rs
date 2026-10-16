@@ -24,6 +24,8 @@
 //! - `echo-argv` — print this process's own argv, one entry per line, to
 //!   stdout and exit 0. Lets a test observe exactly what a spawn delivered.
 
+#![allow(clippy::disallowed_methods)] // dev tooling, never privileged
+
 use std::io::Write as _;
 use std::net::TcpStream;
 
