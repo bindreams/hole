@@ -242,7 +242,7 @@ pub fn non_upload_steps_after(ci_yaml: &str, job_id: &str, id: &str, ran: &BTree
 
 /// `(step id, budget)` of the steps that run on `leg` in a healthy run and
 /// declare a `timeout-minutes` above the leg's job wall. Such a step's own bound
-/// can never fire: the wall ends the job first and GitHub drops the log (#989).
+/// can never fire: the wall ends the job first and cancels the later lanes.
 /// A step with no literal budget is `ci_steps_declare_a_literal_timeout`'s
 /// concern. Steps that run only after a failure are not checked.
 pub fn steps_over_wall(leg: &Leg, ci_yaml: &str, job_id: &str) -> Result<Vec<(String, u64)>> {

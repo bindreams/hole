@@ -888,8 +888,7 @@ fn step_runs(ci_yaml: &str) -> BTreeMap<String, String> {
 }
 
 /// A step's own `timeout-minutes` can only fire if the job wall is not reached
-/// first: when the wall fires instead, GitHub never uploads the log and the run
-/// is a bare `cancelled` (#989). So no step that runs on a leg has a budget
+/// first: when the wall fires instead, the lanes after it do not run. So no step that runs on a leg has a budget
 /// above that leg's wall.
 #[skuld::test]
 fn no_step_budget_exceeds_the_wall_of_a_leg_it_runs_on() {

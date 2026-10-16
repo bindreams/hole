@@ -17,7 +17,7 @@
 //!
 //! Budgets live on steps, not on the job: the unified job's own
 //! `timeout-minutes` is a per-leg matrix expression (the wall), and a step with
-//! no bound of its own runs to that wall, which destroys its log (#989).
+//! no bound of its own runs to that wall, which cancels every lane after it.
 //!
 //! Scope is `ci.yaml` deliberately. The release workflows also assemble
 //! installers, but on a cold cache and with extra packaging work, so their
