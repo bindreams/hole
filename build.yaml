@@ -24,8 +24,8 @@
 #
 # `*-tests` targets keep their `--no-run` build for compile-only validation,
 # and their `run:` carries the canonical local nextest invocation. CI may
-# still hand-roll its own nextest call (e.g. archive-based paths in
-# test-garter / test-galoshes, or SKULD_LABELS gating in test-hole) where CI
+# still hand-roll its own nextest call (e.g. the archive-based test-garter /
+# test-galoshes steps, or SKULD_LABELS gating in the hole- steps) where CI
 # policy diverges from the canonical local invocation.
 
 targets:
@@ -212,7 +212,7 @@ targets:
     # `tests_targets_run_matches_build_minus_no_run` (xtask) checks
     # "run == build minus --no-run, plus RUN_ONLY_FLAGS", not plain equality.
     # `ci_test_hole_steps_match_the_hole_tests_target` (xtask) holds every
-    # `test-hole` nextest step in ci.yaml — including the non-TUN one — to
+    # `hole-` nextest step in ci.yaml — including the non-TUN one — to
     # this exact `run:` command, so all three carry the flag too.
     run: >
       cargo nextest run --no-default-features --features tombstone/crash-dumps,tombstone/crash-child --no-fail-fast
@@ -229,13 +229,13 @@ targets:
     # artifacts: ex-ray + galoshes (via `cargo xtask deps` and the
     # `depends: galoshes` chain) and the pinned stock v2ray-plugin (provisioned
     # in `build:` below). Deliberately NOT on the archive lane — that lane ships
-    # no on-disk binaries — so this target gets its own `test-plugin-e2e` CI job.
+    # no on-disk binaries — so this target gets its own `test-plugin-e2e` CI step.
     #
     # `depends: galoshes` chains ex-ray → galoshes, so both are on disk before
     # these build steps run; only the stock upstream binary needs a dedicated
     # provisioning step (a near-instant no-network cache hit on re-run). So
     # `cargo xtask run plugin-e2e-tests` provisions-then-tests in one command
-    # locally, and CI's `test-plugin-e2e` job calls the same.
+    # locally, and CI's `test-plugin-e2e` step calls the same.
     depends: galoshes
     platforms:
       matrix: { os: [windows, linux, darwin], arch: [amd64, arm64] }
@@ -341,16 +341,37 @@ targets:
     run: cargo clippy -p garter -p garter-bin -p galoshes -p plugin-e2e -p util -p stepstool -p dev-console --all-targets --features garter/test-utils -- -D warnings
 
   prek:
-    # cargo-fmt + repo-wide hooks. SKIP=cargo-clippy because clippy lives in
-    # the per-platform clippy-* targets above. Platforms wide-open so devs on
-    # any host can `cargo xtask run prek` locally; CI's lint job pins its own
-    # runner, the target's platform list doesn't dictate where CI runs it.
+    # cargo-fmt + repo-wide hooks, for a developer's own machine. SKIP=cargo-clippy
+    # because clippy lives in the per-platform clippy-* targets above. Platforms
+    # wide-open so devs on any host can `cargo xtask run prek` locally. CI runs
+    # the same hooks as the two targets below, split by whether a hook's verdict
+    # depends on the host.
     platforms:
       matrix: { os: [windows, linux, darwin], arch: [amd64, arm64] }
     run:
       - bash:
           command: prek run --all-files --show-diff-on-failure
           environment: { SKIP: cargo-clippy }
+
+  prek-portable:
+    # Every hook whose verdict is the same on any host; CI runs it once, in the
+    # linux/amd64 leg. SKIP names exactly the hooks `prek-host-bound` runs plus
+    # cargo-clippy (see `prek` above); `prek_split_tests.rs` holds this list to
+    # a per-hook classification, so a new hook cannot default into "run once".
+    platforms:
+      matrix: { os: [windows, linux, darwin], arch: [amd64, arm64] }
+    run:
+      - bash:
+          command: prek run --all-files --show-diff-on-failure
+          environment: { SKIP: "cargo-clippy,go-lint" }
+
+  prek-host-bound:
+    # Hooks whose verdict depends on the host: golangci-lint type-checks under
+    # the host's GOOS, so `_windows`/`_linux`/`_darwin` Go files are linted only
+    # on their own platform. CI runs it in every leg.
+    platforms:
+      matrix: { os: [windows, linux, darwin], arch: [amd64, arm64] }
+    run: prek run go-lint --all-files --show-diff-on-failure
 
   frontend-check:
     # tsc --noEmit + Vitest unit tests. Platform-independent (tsc and

@@ -11,122 +11,104 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  lint:
-    name: Lint
-    runs-on: windows-latest
-    # Passed up to 12m54s (median 9m) over 150 runs to 2026-10-15; 1.25 x 15.1m
-    # (the one kill, a floor) = 18.9m -> 20, the rule `test-hole` uses.
-    timeout-minutes: 20
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          fetch-depth: 0
-
-      - uses: actions/setup-python@v7
-        with:
-          python-version: "3.x"
-      - uses: astral-sh/setup-uv@v10.2.0
-
-      - uses: ./.github/actions/setup-build
-
-      - name: Install prek
-        run: uv tool install prek
-
-      # cargo-clippy is skipped here because it's run per-platform in the
-      # build job (see ci.yaml below). cargo-fmt stays active — it is
-      # platform-independent, one Windows invocation covers the workspace.
-      # SKIP=cargo-clippy lives in the prek target's `run.environment:`.
-      - name: Run linters
-        run: cargo xtask run prek
-
-      # `scripts/*.py` keep their tests inline, and the filenames are
-      # hyphenated, so pytest's default `test_*.py` collection finds nothing —
-      # which is why sign-release.py's stale asset-count check reached a release
-      # unnoticed (#682). `python_files` collects every script rather than a
-      # hand-listed set, so a new script's tests run without touching CI.
-      - name: Test release scripts
-        run: uv run --with pytest --with PyYAML --with pathspec pytest -o python_files="*.py" scripts/
-
-  # Per-platform build job: compiles clippy + test binaries once and publishes
-  # them as a platform-scoped artifact (`build-<os>-<arch>`). Test jobs below
-  # download the archive and run filtered tests without invoking the Rust
-  # toolchain. See .tmp/claude/plans/i-want-to-refactor-polymorphic-catmull.md
-  # for the full design (esp. the matrix `needs:` trade-off: compile errors
-  # in any crate fail `build[P]` and skip all `test-*[P]` cells).
-  build:
-    name: Build (${{ matrix.os }}/${{ matrix.arch }})
+  # One job per platform, each building, linting and testing everything that
+  # platform ships: six runners per PR instead of forty-odd, two of them macOS.
+  #
+  # A leg checks out and provisions once, then runs the lanes its matrix flags
+  # select, in a fixed order, on one target dir and one sccache. Every lane step
+  # carries `!cancelled()`, so one failing lane hides nothing, and its own
+  # `timeout-minutes`, so a hang fails that step with its log instead of running
+  # into the job wall (#989). Every lane gates the merge: no `continue-on-error`,
+  # and a rerun repeats the whole platform job. The xtask audits that read this
+  # file (`ci_platform_coverage`, `ci_timeouts`, `ci_nextest_parity`,
+  # `skuld_label_coverage`, `global_net_state_conformance`) address lanes by
+  # step id, so ids are API: `hole-*` is the Hole test lane, `installer-*` and
+  # `dmg` assemble an installer.
+  #
+  # ORDER matters, and the audits hold it:
+  #   - Everything that rebuilds the ex-ray/galoshes sidecars (plugin-e2e, the
+  #     MSI and DMG builds) runs BEFORE `hole-build`. Both sidecars are
+  #     `rerun-if-changed` inputs of the `hole` and `galoshes` build scripts, so
+  #     rewriting them afterwards makes the test lanes recompile `hole`, uncached
+  #     and on macOS as root.
+  #   - Windows: every user of loopback (compiles through sccache, tests, the
+  #     installer E2E) runs before the TUN lane, which corrupts NDIS loopback
+  #     (#200). Only the #999 proof step, and uploads, follow it.
+  #   - macOS: the TUN lane runs as root and leaves root-owned files in
+  #     `target/`, so it is the last step that runs a toolchain.
+  #
+  # LINT: prek hooks whose verdict is the same on any host run once, in
+  # linux/amd64 (`prek-portable`); hooks that depend on the host run on every leg
+  # (`prek-host-bound`, today golangci-lint, which type-checks under the host's
+  # GOOS). `prek_split_tests.rs` classifies every hook with its evidence.
+  #
+  # WALL (`timeout`, per leg): 1.25 x the sum of the lanes' worst measured steps
+  # over 200 runs (2026-09-11 -> 2026-10-16), rounded up to 5m, and never below
+  # what a previous layout allowed these lanes. The sum is pessimistic (the legs
+  # share one compile now) and the step budgets below add up to more than the
+  # wall, so a leg whose steps all run near their maxima can hit the wall before
+  # a late step's own bound: the #989 residual, kept and stated. The GitHub cap
+  # is 360m. Raised only, never tightened.
+  ci:
+    name: Build, lint, test (${{ matrix.os }}/${{ matrix.arch }})
     runs-on: ${{ matrix.runner }}
-    # Per-leg, because the legs differ by ~6x (linux/arm64's 4m36s max vs
-    # darwin/amd64's 29m42s+): one shared wall either hides a regression on
-    # the fast legs or keeps killing the slow one, which is exactly what
-    # happened here — #995. Whole-job wall clock, 31 runs on `main`
-    # (2026-08-27 -> 2026-09-10), the re-measure #995 asked for across every
-    # leg, not just the one that surfaced:
-    #
-    #   linux/arm64    2m52s - 4m36s,   0 killed -> 10
-    #   linux/amd64    2m48s - 5m16s,   0 killed -> 10
-    #   windows/arm64  7m36s - 11m39s,  0 killed -> 20
-    #   darwin/arm64   7m17s - 16m05s,  0 killed -> 25
-    #   windows/amd64  11m10s - 17m32s, 0 killed -> 25
-    #   darwin/amd64   10m07s - 29m42s, 5 killed  -> 50  (see below)
-    #
-    # darwin/amd64's distribution is right-CENSORED by the old 30m wall: 5 of
-    # 31 runs were killed at 30m00s-30m34s, and 10 of 31 (32%) landed within 3
-    # minutes of it, so 29m42s — the largest run that actually finished — is a
-    # floor on the true tail, not its ceiling. 50 is ~1.7x that floor, chosen
-    # the same way #989/#990 picked 70 for `Test hole (darwin/arm64)`: enough
-    # to clear the censored region so the true tail becomes observable next
-    # time this is re-measured; tighten once it is.
-    #
-    # darwin/amd64: up to 42m41s over 150 runs (median 21m47s); wall = 1.25 x
-    # max, rounded up to 5m -> 55, the rule `Test hole` uses.
-    #
-    # The other five legs were never killed, so they KEEP the existing 30 —
-    # measured here, deliberately not tightened. Their observed maxima would
-    # justify lower walls (1.4-2.2x headroom), but a timeout that has never
-    # fired is not costing anything, and this change exists to stop kills, not
-    # to introduce new ones on legs that were fine. Tightening them is a
-    # separate decision with its own evidence, not a rider on this fix.
-    #
-    # Whether darwin/amd64 got slower from genuine growth or sccache hit-rate
-    # is NOT settled, only narrowed: step-level timing (setup-build's dep
-    # fetch, Clippy, and the nextest-archive build) scales by roughly the same
-    # factor between its fastest and slowest runs (correlation with the job
-    # total: 0.66 / 0.96 / 0.85) rather than one step alone accounting for the
-    # swing, which argues against one crate's code having grown and toward a
-    # global factor — consistent with the cache-rate variance
-    # `test-dmg-signing` documents for the same macos-15-intel runner (25m
-    # warm vs 45m45s cold, 5% hit rate). But CI never runs `sccache
-    # --show-stats`, so there's no per-run hit-rate number to confirm that
-    # directly.
     timeout-minutes: ${{ matrix.timeout }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          # `cache-saver` marks the one job per cargo cache key that saves
-          # `~/.cargo` on `main`. The key is `runner.os` + rustc commit, with
-          # no arch (dtolnay/rust-toolchain's `cachekey`), so it is one per OS:
-          # windows/amd64, darwin/arm64 and linux/amd64. This matrix compiles
-          # the whole workspace, so its `~/.cargo` is the fullest of any job.
-          - { os: windows, arch: amd64, runner: windows-latest,     timeout: 30, cache-saver: true }
-          - { os: darwin,  arch: amd64, runner: macos-15-intel,     timeout: 55 }
-          - { os: darwin,  arch: arm64, runner: macos-latest,       timeout: 30, cache-saver: true }
-          - { os: linux,   arch: amd64, runner: ubuntu-latest,      timeout: 30, cache-saver: true }
-          - { os: linux,   arch: arm64, runner: ubuntu-24.04-arm,   timeout: 30 }
-          - { os: windows, arch: arm64, runner: windows-11-arm,     timeout: 30 }
+          # `cache-saver` marks the one leg per cargo cache key that saves
+          # `~/.cargo` on `main`; the key is the runner OS + rustc commit with no
+          # arch, so there is one per OS.
+          #
+          # Lane flags: `hole` = the Hole workspace builds here (clippy-hole, the
+          # `hole-*` lanes); `installer` = MSI; `dmg` = DMG signing;
+          # `ex-ray-unit` = ex-ray's Go tests on its build-tagged platforms;
+          # `ech` = the ECH-gate Go tests; `portable-lint` = the platform-
+          # independent lint and the renovate config check; `frontend` = the
+          # Vite bundle and type check.
+          - { os: windows, arch: amd64, runner: windows-latest,   timeout: 175, cache-saver: true, hole: true, installer: true, ex-ray-unit: true }
+          - { os: windows, arch: arm64, runner: windows-11-arm,   timeout: 60 }
+          - { os: darwin,  arch: amd64, runner: macos-15-intel,   timeout: 305, hole: true, dmg: true }
+          - { os: darwin,  arch: arm64, runner: macos-latest,     timeout: 155, cache-saver: true, hole: true, dmg: true, ex-ray-unit: true }
+          - { os: linux,   arch: amd64, runner: ubuntu-latest,    timeout: 40,  cache-saver: true, portable-lint: true, ech: true, frontend: true }
+          - { os: linux,   arch: arm64, runner: ubuntu-24.04-arm, timeout: 25 }
     steps:
-      - uses: actions/checkout@v7
+      # Provisioning ===================================================================================================
+      # Step budgets: 1.25 x the worst measured step, rounded up to 5m; a step
+      # that was a whole job keeps that job's budget. Steps measured under 4m get
+      # 5m. One number per step, the slowest leg's, as for the old per-step
+      # budgets: the spread within a step is smaller than the margin.
+
+      - id: checkout
+        uses: actions/checkout@v7
+        timeout-minutes: 10
         with:
           fetch-depth: 0
 
-      - uses: ./.github/actions/setup-build
+      - id: setup-python
+        uses: actions/setup-python@v7
+        timeout-minutes: 5
+        with:
+          python-version: "3.x"
+
+      - id: setup-uv
+        uses: astral-sh/setup-uv@v10.2.0
+        timeout-minutes: 5
+
+      - id: setup-build
+        uses: ./.github/actions/setup-build
+        timeout-minutes: 30
         with:
           save-cache: ${{ matrix.cache-saver == true }}
 
-      - uses: cargo-bins/cargo-binstall@v1.25.2
+      - id: cargo-binstall
+        uses: cargo-bins/cargo-binstall@v1.25.2
+        timeout-minutes: 5
 
-      - name: Install nextest
+      - id: install-nextest
+        name: Install nextest
+        timeout-minutes: 10
         shell: bash
         env:
           # Authenticated GitHub API has a 5000 req/h limit; without this,
@@ -136,83 +118,128 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
         run: cargo binstall --no-confirm --locked cargo-nextest
 
-      # Clippy coverage is platform-gated by the targets' `platforms:` lists.
-      # `clippy-hole` covers Hole platforms (windows/amd64, darwin/*) with
-      # `--workspace`; `clippy-ex-galoshes` covers the platforms Hole doesn't
-      # ship on (linux/*, windows/arm64) with the ex-Galoshes -p filter set.
-      # The `if:` gates here just suppress the "doesn't apply to host" error
-      # from xtask on the wrong-platform half of the matrix.
-      - name: Clippy (Hole workspace)
-        if: matrix.os == 'darwin' || (matrix.os == 'windows' && matrix.arch == 'amd64')
+      # `package(xtask)` (run on every leg) drives a real `prek` hook through
+      # `pull_subrepo`/`finish_vendor_bump`, and per this repo's policy those
+      # tests must not skip on a missing dependency. Go comes from `setup-build`.
+      - id: install-prek
+        name: Install prek
+        timeout-minutes: 5
+        shell: bash
+        run: uv tool install prek
+
+      # macOS runners ship only Apple's frozen Bash 3.2.57 on /usr/bin/bash,
+      # ahead of Homebrew's on PATH; git-subrepo's `#!/usr/bin/env bash`
+      # shebang hard-requires Bash 4+. Linux and Windows (Git for Windows)
+      # already ship it.
+      - id: install-bash
+        name: Install Bash 4+ (macOS only, for git-subrepo)
+        if: ${{ matrix.os == 'darwin' }}
+        timeout-minutes: 10
+        shell: bash
+        run: brew install bash
+
+      # The last provisioning step: every later step requires its success, so a
+      # broken VM fails once instead of once per lane.
+      - id: provision
+        name: Install git-subrepo 0.4.9
+        timeout-minutes: 5
+        shell: bash
+        run: |
+          git clone --branch 0.4.9 --depth 1 https://github.com/ingydotnet/git-subrepo "$RUNNER_TEMP/git-subrepo"
+          echo "$RUNNER_TEMP/git-subrepo/lib" >> "$GITHUB_PATH"
+
+      # Lint ===========================================================================================================
+
+      - id: lint
+        name: Lint (platform-independent hooks)
+        if: ${{ !cancelled() && steps.provision.outcome == 'success' && matrix.portable-lint == true }}
+        timeout-minutes: 10
+        shell: bash
+        run: cargo xtask run prek-portable
+
+      # `scripts/*.py` keep their tests inline, and the filenames are
+      # hyphenated, so pytest's default `test_*.py` collection finds nothing —
+      # which is why sign-release.py's stale asset-count check reached a release
+      # unnoticed (#682). `python_files` collects every script rather than a
+      # hand-listed set, so a new script's tests run without touching CI.
+      - id: lint-release-scripts
+        name: Test release scripts
+        if: ${{ !cancelled() && steps.provision.outcome == 'success' && matrix.portable-lint == true }}
+        timeout-minutes: 5
+        shell: bash
+        run: uv run --with pytest --with PyYAML --with pathspec pytest -o python_files="*.py" scripts/
+
+      - id: lint-host
+        name: Lint (hooks that depend on the host)
+        if: ${{ !cancelled() && steps.provision.outcome == 'success' }}
+        timeout-minutes: 15
+        shell: bash
+        run: cargo xtask run prek-host-bound
+
+      # Renovate npm safety gate: the Vite bundle and the type check are required
+      # status checks for npm dependency PRs to automerge (see
+      # .github/renovate.json). `npm run check` and `vite build` are platform-
+      # independent; the per-OS Tauri shell is exercised by the release pipeline.
+      - id: frontend-build
+        name: Build frontend
+        if: ${{ !cancelled() && steps.provision.outcome == 'success' && matrix.frontend == true }}
+        timeout-minutes: 5
+        shell: bash
+        run: cargo xtask build frontend-build
+
+      - id: frontend-check
+        name: Type-check frontend
+        if: ${{ !cancelled() && steps.provision.outcome == 'success' && matrix.frontend == true }}
+        timeout-minutes: 5
+        shell: bash
+        run: cargo xtask run frontend-check
+
+      # Clippy ==========================================================================================================
+      # Platform-gated by the targets' `platforms:` lists. `clippy-hole` covers the
+      # Hole platforms with `--workspace`; `clippy-ex-galoshes` covers the
+      # platforms Hole doesn't ship on with the ex-Galoshes `-p` filter set.
+      - id: clippy-hole
+        name: Clippy (Hole workspace)
+        if: ${{ !cancelled() && steps.provision.outcome == 'success' && matrix.hole == true }}
+        timeout-minutes: 40
+        shell: bash
         run: cargo xtask run clippy-hole
 
-      - name: Clippy (ex-Galoshes only)
-        if: matrix.os == 'linux' || (matrix.os == 'windows' && matrix.arch == 'arm64')
+      - id: clippy-ex-galoshes
+        name: Clippy (ex-Galoshes only)
+        if: ${{ !cancelled() && steps.provision.outcome == 'success' && matrix.hole != true }}
+        timeout-minutes: 40
+        shell: bash
         run: cargo xtask run clippy-ex-galoshes
 
-      # Archive the ex-Galoshes crates plus the workspace tooling crates
-      # (stepstool, dev-console, xtask, xtask-lib, payload-archive;
-      # #454) — consumed by test-garter / test-galoshes / test-tooling on all
-      # platforms. Hole crates' compileability is already covered by `Clippy
-      # (Hole workspace)` above; test-hole runs in its own build+test job below.
-      # `--features garter/test-utils` builds garter's feature-gated
-      # test-utils targets (tap_integration) into the archive — do not
-      # rely on a sibling's dev-dep edge to unify the feature in. The
-      # mock-plugin fixture bin is ungated and always archived (see
-      # crates/garter/tests/common/mod.rs).
-      - name: Build test archive (ex-Galoshes + tooling crates)
+      # Archive lanes ===================================================================================================
+      # The ex-Galoshes crates plus the workspace tooling crates (stepstool,
+      # dev-console, xtask, xtask-lib, payload-archive; #454), archived once and
+      # run by the three steps below. These run first, before anything writes
+      # outside gitignored paths, so tooling's git/prek tests see a clean tree.
+      # `--features garter/test-utils` builds garter's feature-gated test-utils
+      # targets (tap_integration) into the archive; the mock-plugin fixture bin
+      # is ungated and always archived (crates/garter/tests/common/mod.rs).
+      # `df` records disk use per phase: one VM now holds the debug workspace,
+      # this archive and the release builds.
+      - id: archive
+        name: Build test archive (ex-Galoshes + tooling crates)
+        if: ${{ !cancelled() && steps.provision.outcome == 'success' }}
+        timeout-minutes: 10
         shell: bash
         run: |
           mkdir -p ci-artifacts
           cargo nextest archive -p garter -p garter-bin -p galoshes -p stepstool -p dev-console -p xtask -p xtask-lib -p payload-archive -p util --features garter/test-utils --archive-file ci-artifacts/tests.tar.zst
+          df -h .
 
-      # The artifact is consumed by test-garter, test-galoshes, and
-      # test-tooling; test-hole does its own build.
-      - name: Upload build artifact
-        uses: actions/upload-artifact@v7
-        with:
-          name: build-${{ matrix.os }}-${{ matrix.arch }}
-          path: ci-artifacts/tests.tar.zst
-          retention-days: 3
-          if-no-files-found: error
-
-  # Three per-project test jobs, all consuming the `build-<os>-<arch>` artifact
-  # and running `cargo nextest run --archive-file`. They install the nextest
-  # binary via taiki-e/install-action (no Rust toolchain needed) and skip the
-  # `setup-build` composite action entirely.
-  test-garter:
-    name: Test garter (${{ matrix.os }}/${{ matrix.arch }})
-    needs: build
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 10
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - { os: windows, arch: amd64, runner: windows-latest }
-          - { os: darwin,  arch: amd64, runner: macos-15-intel }
-          - { os: darwin,  arch: arm64, runner: macos-latest }
-          - { os: linux,   arch: amd64, runner: ubuntu-latest }
-          - { os: linux,   arch: arm64, runner: ubuntu-24.04-arm }
-          - { os: windows, arch: arm64, runner: windows-11-arm }
-    steps:
-      - uses: actions/checkout@v7
-
-      - name: Install nextest (pre-built binary)
-        uses: taiki-e/install-action@v2
-        with:
-          tool: nextest
-
-      - uses: actions/download-artifact@v8
-        with:
-          name: build-${{ matrix.os }}-${{ matrix.arch }}
-          path: ci-artifacts
-
-      # `cargo nextest run --archive-file` refuses `-p`; the archive's
-      # package set is frozen at build time. Filter by `-E package(...)`
-      # instead. `target/debug/` must exist because skuld writes its
-      # test-coordination SQLite DB at `<workspace>/target/debug/.skuld.db`.
-      - name: Run tests
+      # `cargo nextest run --archive-file` refuses `-p`; the archive's package
+      # set is frozen at build time. Filter by `-E package(...)` instead.
+      # `target/debug/` must exist because skuld writes its test-coordination
+      # SQLite DB at `<workspace>/target/debug/.skuld.db`.
+      - id: test-garter
+        name: Test garter
+        if: ${{ !cancelled() && steps.archive.outcome == 'success' }}
+        timeout-minutes: 10
         shell: bash
         run: |
           mkdir -p target/debug
@@ -221,35 +248,10 @@ jobs:
             --workspace-remap "${{ github.workspace }}" \
             -E 'package(garter) + package(garter-bin)'
 
-  test-galoshes:
-    name: Test galoshes (${{ matrix.os }}/${{ matrix.arch }})
-    needs: build
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 10
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - { os: windows, arch: amd64, runner: windows-latest }
-          - { os: darwin,  arch: amd64, runner: macos-15-intel }
-          - { os: darwin,  arch: arm64, runner: macos-latest }
-          - { os: linux,   arch: amd64, runner: ubuntu-latest }
-          - { os: linux,   arch: arm64, runner: ubuntu-24.04-arm }
-          - { os: windows, arch: arm64, runner: windows-11-arm }
-    steps:
-      - uses: actions/checkout@v7
-
-      - name: Install nextest (pre-built binary)
-        uses: taiki-e/install-action@v2
-        with:
-          tool: nextest
-
-      - uses: actions/download-artifact@v8
-        with:
-          name: build-${{ matrix.os }}-${{ matrix.arch }}
-          path: ci-artifacts
-
-      - name: Run tests
+      - id: test-galoshes
+        name: Test galoshes
+        if: ${{ !cancelled() && steps.archive.outcome == 'success' }}
+        timeout-minutes: 10
         shell: bash
         run: |
           mkdir -p target/debug
@@ -258,95 +260,18 @@ jobs:
             --workspace-remap "${{ github.workspace }}" \
             -E 'package(galoshes)'
 
-  test-tooling:
-    name: Test tooling (${{ matrix.os }}/${{ matrix.arch }})
-    needs: build
-    runs-on: ${{ matrix.runner }}
-    # windows/arm64 sets the requirement and had almost no margin at 10: it ran
-    # 8m52s green, then 10m18s (killed) on an unchanged test set. The other legs
-    # are nowhere near — linux ~1m, windows/amd64 ~5m30s. Pinning Go adds
-    # a toolchain download on images that ship a different one, worth ~1min on
-    # this runner and enough to matter at 10.
-    timeout-minutes: 20
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - { os: windows, arch: amd64, runner: windows-latest }
-          - { os: darwin,  arch: amd64, runner: macos-15-intel }
-          - { os: darwin,  arch: arm64, runner: macos-latest }
-          - { os: linux,   arch: amd64, runner: ubuntu-latest }
-          - { os: linux,   arch: arm64, runner: ubuntu-24.04-arm }
-          - { os: windows, arch: arm64, runner: windows-11-arm }
-    steps:
-      - uses: actions/checkout@v7
-
-      - uses: actions/setup-python@v7
-        with:
-          python-version: "3.x"
-      - uses: astral-sh/setup-uv@v10.2.0
-
-      # `pull_subrepo`/`conflict.rs`'s tests (part of `package(xtask)`, run
-      # by this job) shell to `go mod edit -json` to exercise the
-      # allowlisted go.mod-conflict auto-resolution path for real — this
-      # job builds nothing itself (it runs the `build` job's prebuilt
-      # artifact), so unlike jobs that use `./.github/actions/setup-build`,
-      # `go` isn't otherwise provisioned here. Some runner images happen to
-      # ship a usable `go` anyway.
-      - uses: actions/setup-go@v7
-        with:
-          go-version-file: crates/ex-ray/go.mod
-
-      # `check_vendoring_integrity_tests`'s `always_run_hazard_end_to_end_*`
-      # tests (part of `package(xtask)`, run by this job) install a real
-      # `prek` hook and drive `pull_subrepo`/`finish_vendor_bump` through
-      # it for real — unlike every other tool this job provisions,
-      # `prek` isn't otherwise on PATH here (only the `lint` job installs
-      # it), and per this repo's policy these tests must not skip on a
-      # missing dependency.
-      - name: Install prek
-        shell: bash
-        run: uv tool install prek
-
-      # macOS runners ship only Apple's frozen Bash 3.2.57 on
-      # /usr/bin/bash, ahead of Homebrew's bash on PATH; git-subrepo's
-      # `#!/usr/bin/env bash` shebang hard-requires Bash 4+ and refuses to run
-      # under 3.2. `brew install bash` puts a 4+ build in /opt/homebrew/bin
-      # (arm64) or /usr/local/bin (intel), both of which precede /usr/bin on
-      # the runner's default PATH. Linux and Windows (Git for Windows) already
-      # ship Bash 4+, so this is scoped to macOS only.
-      - name: Install Bash 4+ (macOS only, for git-subrepo)
-        if: runner.os == 'macOS'
-        shell: bash
-        run: brew install bash
-
-      - name: Install git-subrepo 0.4.9
-        shell: bash
-        run: |
-          git clone --branch 0.4.9 --depth 1 https://github.com/ingydotnet/git-subrepo "$RUNNER_TEMP/git-subrepo"
-          echo "$RUNNER_TEMP/git-subrepo/lib" >> "$GITHUB_PATH"
-
-      - name: Install nextest (pre-built binary)
-        uses: taiki-e/install-action@v2
-        with:
-          tool: nextest
-
-      - uses: actions/download-artifact@v8
-        with:
-          name: build-${{ matrix.os }}-${{ matrix.arch }}
-          path: ci-artifacts
-
-      # `cargo nextest run --archive-file` refuses `-p`; the archive's
-      # package set is frozen at build time. Filter by `-E package(...)`
-      # instead. `target/debug/` must exist because skuld writes its
-      # test-coordination SQLite DB at `<workspace>/target/debug/.skuld.db`.
-      #
       # `!windows_console` excludes dev-console's labeled console-corruption
       # test: it panics loudly on a non-interactive console, so it only runs
       # manually from an interactive Windows terminal:
       #   SKULD_LABELS=windows_console cargo nextest run -p dev-console \
       #     -E 'test(null_stdin_child_cannot_corrupt_console_mode)'
-      - name: Run tests
+      #
+      # Budget 20: windows/arm64 ran 8m52s green, then 10m18s on an unchanged
+      # test set, under a budget of 10.
+      - id: test-tooling
+        name: Test tooling
+        if: ${{ !cancelled() && steps.archive.outcome == 'success' }}
+        timeout-minutes: 20
         shell: bash
         env:
           SKULD_LABELS: "!windows_console"
@@ -357,87 +282,205 @@ jobs:
             --workspace-remap "${{ github.workspace }}" \
             -E 'package(stepstool) + package(dev-console) + package(xtask) + package(xtask-lib) + package(payload-archive) + package(util)'
 
-  # test-hole runs a fresh build + nextest run (no archive). Hole tests have
-  # too many environmental couplings (trybuild --offline registry, dist_fixture
-  # workspace state, ipc_tests) for the archive-then-test pattern to work
-  # reliably without significant additional plumbing — see #266 for the
-  # tracking work to move test-hole onto the archive once those are addressed.
-  test-hole:
-    name: Test hole (${{ matrix.os }}/${{ matrix.arch }})
-    runs-on: ${{ matrix.runner }}
-    # Per-leg, because the legs differ by ~2x: one number would either
-    # under-budget darwin/amd64 or push every leg's hang-detection deadline out
-    # to suit the slowest. Whole-job wall clock, last 150 runs of this workflow
-    # (2026-09-11 -> 2026-10-15, main + PRs, every attempt):
-    #
-    #                  passed (min / med / max)   killed at wall   reconstructed
-    #                                                              finish of kills
-    #   darwin/amd64   n=74  47m / 70m / 89m28s   14 of 150        84m - 117m
-    #   darwin/arm64   n=91  22m / 41m / 59m34s    0 of 150
-    #
-    # Kills (cancelled at the wall) are censored; their finish is
-    # reconstructed as the offset of the step they died in plus that leg's p90
-    # for the steps still to run, so the true tail is not the passing max.
-    #
-    # Rule: wall = 1.25x the worst measured-or-reconstructed finish, rounded up
-    # to 5m. darwin/amd64 1.25 x 117m = 146m -> 150. darwin/arm64 had no kill,
-    # but its 59m34s max sat at 85% of the old 70, so the same rule gives
-    # 1.25 x 59.6m = 74.5m -> 75. Raised only, never tightened: that is the
-    # owner's ruling on CI budgets.
-    #
-    # NOT a hang: every killed amd64 job was inside the non-TUN or TUN lane,
-    # or past both, with the build step alone at 30m - 52m; the TUN step
-    # itself runs 9m50s median (13m42s max).
-    #
-    # windows/amd64: passed up to 59m30s; 5 kills in the cache-save post step
-    # (see `cargo-cache`); worst reconstructed finish 61m30s, a floor.
-    # 1.25 x 61.5m -> 80.
-    #
-    # crash_marker_abort was a confirmed, recurring cause of darwin/amd64
-    # kills — fixed in tombstone (#842); whether the wall can now drop is unmeasured.
-    #
-    # These are whole-JOB budgets, shared across build + verify + test. A slow
-    # build therefore eats the test steps' headroom — which is exactly how #989
-    # happened. The per-step `timeout-minutes` further down decouple the two, so
-    # a genuinely hung test fails its own step instead of consuming the wall.
-    #
-    # The `ci_installer_assembly_jobs_share_a_timeout_budget` conformance test
-    # does not cover these: it selects jobs whose xtask cascade reaches a
-    # `uv run --directory <name>-installer build` handoff, and `hole-tests`
-    # (-> hole -> galoshes -> ex-ray) reaches none. Should that cascade ever
-    # gain an installer edge, this job joins that class and must match it.
-    timeout-minutes: ${{ matrix.timeout }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - { os: windows, arch: amd64, runner: windows-latest, timeout: 80 }
-          - { os: darwin,  arch: amd64, runner: macos-15-intel, timeout: 150 }
-          - { os: darwin,  arch: arm64, runner: macos-latest,   timeout: 75 }
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          fetch-depth: 0
+      # Loopback users that precede the Hole build ======================================================================
 
-      - uses: ./.github/actions/setup-build
-
-      - uses: cargo-bins/cargo-binstall@v1.25.2
-
-      - name: Install nextest
+      # Plugin interop/e2e (crate `plugin-e2e`, #435): ex-ray<->stock interop on
+      # all 6 platforms (QUIC not(windows)) + galoshes server<->client
+      # roundtrips (WS all platforms; WS-TLS/QUIC not(windows)). A fresh build,
+      # not the archive lane: these spawn plugin BINARIES and need on-disk
+      # artifacts (ex-ray + galoshes from `setup-build`'s `cargo xtask deps`, and
+      # the pinned stock v2ray-plugin the `plugin-e2e-tests` target provisions).
+      # It re-runs the sidecar cascade, so it precedes `hole-build`.
+      - id: test-plugin-e2e
+        name: Test plugin-e2e
+        if: ${{ !cancelled() && steps.provision.outcome == 'success' }}
+        timeout-minutes: 45
         shell: bash
+        run: cargo xtask run plugin-e2e-tests
+
+      # ex-ray Go tests (the `ex-ray-tests` build.yaml target): the ECH
+      # fail-closed gate plus the patched vendored tls/quic/hysteria2 (incl. utls)
+      # gate/refuse/round-trip tests. The gate logic is platform-independent
+      # (domainsocket is !windows), so one Linux leg runs it.
+      - id: test-ex-ray-ech
+        name: Test ex-ray Go (ECH gate)
+        if: ${{ !cancelled() && steps.provision.outcome == 'success' && matrix.ech == true }}
+        timeout-minutes: 20
+        shell: bash
+        run: cargo xtask run ex-ray-tests
+
+      # ex-ray's own Go tests on the platforms with build-tagged files
+      # (keepalive_{windows,darwin}.go), which a Linux lane never compiles. See
+      # the `ex-ray-unit-tests` target for why it is split from the ECH tests.
+      - id: test-ex-ray-unit
+        name: Test ex-ray Go (platform files)
+        if: ${{ !cancelled() && steps.provision.outcome == 'success' && matrix.ex-ray-unit == true }}
+        timeout-minutes: 20
+        shell: bash
+        run: cargo xtask run ex-ray-unit-tests
+
+      # Installer assembly ==============================================================================================
+      # Release builds; they re-run the sidecar cascade, so they precede
+      # `hole-build`. Budget 80 for both assembly steps, held equal by
+      # `ci_installer_assembly_steps_share_a_timeout_budget`; sized for a cold
+      # sccache (GitHub evicts entries untouched for 7 days). Observed maxima over
+      # 200 runs: MSI 21.8m, DMG 46.4m on darwin/amd64 (cold: 45m45s, 5% hit rate).
+
+      # `scripts/*` of the MSI project: unit tests of the assembly, no build.
+      - id: installer-pytest
+        name: Test MSI assembly scripts
+        if: ${{ !cancelled() && steps.provision.outcome == 'success' && matrix.installer == true }}
+        timeout-minutes: 5
+        shell: pwsh
+        working-directory: msi-installer
+        run: uv run --group dev pytest -v
+
+      - id: installer-build-msi
+        name: Build MSI
+        if: ${{ !cancelled() && steps.provision.outcome == 'success' && matrix.installer == true }}
+        timeout-minutes: 80
+        shell: pwsh
+        run: cargo xtask build hole-msi
+
+      - id: installer-smoke
+        name: Smoke-test binary
+        if: ${{ !cancelled() && steps.installer-build-msi.outcome == 'success' }}
+        timeout-minutes: 5
+        shell: pwsh
+        run: target\release\hole.exe version
+
+      # tauri-driver is installed via `cargo install`; the cargo registry cache
+      # and sccache from setup-build keep this fast. `--locked` and a pinned
+      # version guard against flakes from unrelated bumps in the crate. It, the
+      # driver and gsudo are tool installs that need nothing from the MSI, so
+      # they sit before `hole-build` with the rest of the toolchain users.
+      - id: installer-tauri-driver
+        name: Install tauri-driver
+        if: ${{ !cancelled() && steps.provision.outcome == 'success' && matrix.installer == true }}
+        timeout-minutes: 5
+        shell: pwsh
+        run: cargo install --locked --version 2.0.6 tauri-driver
+
+      # tauri-driver speaks to WebView2 via Microsoft Edge's WebDriver. The
+      # runner's bundled msedgedriver (`$EDGEWEBDRIVER`) targets the Edge BROWSER
+      # version on the image, but the WebView2 RUNTIME (which hole.exe actually
+      # loads) auto-updates independently and is typically a higher version;
+      # msedgedriver then rejects the session with "only supports Microsoft Edge
+      # version N". Detect the installed runtime version and download the
+      # matching msedgedriver from Microsoft's CDN. See bindreams/hole#372.
+      - id: installer-msedgedriver
+        name: Install msedgedriver matching WebView2 runtime
+        if: ${{ !cancelled() && steps.provision.outcome == 'success' && matrix.installer == true }}
+        timeout-minutes: 5
+        shell: pwsh
+        run: |
+          $key = "HKLM:\SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}"
+          $webview2 = (Get-ItemProperty -Path $key -Name pv).pv
+          Write-Host "WebView2 runtime version: $webview2"
+          $url = "https://msedgedriver.microsoft.com/$webview2/edgedriver_win64.zip"
+          $zip = "$env:RUNNER_TEMP\edgedriver.zip"
+          $out = "$env:RUNNER_TEMP\edgedriver"
+          Invoke-WebRequest -Uri $url -OutFile $zip
+          Expand-Archive -Path $zip -DestinationPath $out -Force
+          Add-Content -Path $env:GITHUB_PATH -Value $out
+
+      # gsudo runs the dashboard E2E at Medium integrity. GitHub runners run
+      # every process at High integrity (admin + UAC disabled), and WebView2
+      # Runtime 150 broke the DevTools loopback for High-integrity hosts
+      # (MicrosoftEdge/WebView2Feedback#5640) so tauri-driver can't attach.
+      # Real users run the GUI unprivileged (Medium), where 150 works.
+      - id: installer-gsudo
+        name: Install gsudo (de-elevation for the E2E)
+        if: ${{ !cancelled() && steps.provision.outcome == 'success' && matrix.installer == true }}
+        timeout-minutes: 5
+        shell: pwsh
         env:
-          GITHUB_TOKEN: ${{ github.token }}
-        run: cargo binstall --no-confirm --locked cargo-nextest
+          # renovate: datasource=github-releases depName=gerardog/gsudo
+          GSUDO_VERSION: "2.6.1"
+        run: |
+          $zip = "$env:RUNNER_TEMP\gsudo.zip"
+          $dir = "$env:RUNNER_TEMP\gsudo"
+          Invoke-WebRequest -Uri "https://github.com/gerardog/gsudo/releases/download/v$env:GSUDO_VERSION/gsudo.portable.zip" -OutFile $zip
+          Expand-Archive -Path $zip -DestinationPath $dir -Force
+          $exe = "$dir\x64\gsudo.exe"
+          if (-not (Test-Path $exe)) { throw "gsudo.exe not found at $exe after extract" }
+          "$dir\x64" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
 
-      # Compile test binaries via the orchestrator (resolves the full DAG:
-      # ex-ray → galoshes → wintun → hole → hole-tests) but don't run
-      # them yet — running tests is not part of the build process. The two
-      # nextest invocations below execute the pre-built binaries with
-      # different SKULD_LABELS filters; see #200 for the NDIS-loopback
-      # corruption that motivates running TUN tests last (Windows only).
-      - name: Build hole test binaries
+      # DMG assembly + signature-consistency tests (`dmg-installer/`): catches an
+      # unsigned .app bundle that launches "damaged" under Gatekeeper quarantine
+      # (#364). One build+test via the run-cascade (builds hole-dmg once, then the
+      # signing pytest); a separate `build hole-dmg` step would double-roll the
+      # flaky bundle_dmg.sh/hdiutil pipeline (#446).
+      #
+      # Local time, the zone `log show --start` reads, so the diagnostics below
+      # span this step whatever its budget is.
+      - id: dmg-start
+        name: Record DMG start
+        if: ${{ !cancelled() && steps.provision.outcome == 'success' && matrix.dmg == true }}
+        timeout-minutes: 5
         shell: bash
-        run: cargo xtask build hole-tests
+        run: |
+          echo "DMG_START=$(date +'%Y-%m-%d %H:%M:%S')" >> "$GITHUB_ENV"
+          # The DMG tests require a clean tracked tree; name any earlier step that dirtied it.
+          git status --porcelain --untracked-files=no
+
+      - id: dmg
+        name: Build DMG and test signing
+        if: ${{ !cancelled() && steps.dmg-start.outcome == 'success' }}
+        timeout-minutes: 80
+        shell: bash
+        run: |
+          cargo xtask run hole-dmg-tests
+          df -h .
+
+      # hdiutil DMG creation/mounting is a non-deterministic macOS
+      # DiskArbitration race; capture system state when the DMG step fails (build
+      # or the pytest mount) to diagnose the next occurrence (#446). A step
+      # timeout is a failure of the step, so this fires on it too.
+      - id: dmg-diagnostics
+        name: Capture DiskArbitration/hdiutil state on failure
+        if: ${{ !cancelled() && steps.dmg.outcome == 'failure' }}
+        timeout-minutes: 5
+        shell: bash
+        run: |
+          set +e
+          OUT="$RUNNER_TEMP/dmg-flake-diag"
+          mkdir -p "$OUT"
+          hdiutil info    > "$OUT/hdiutil-info.txt" 2>&1
+          ls -la /Volumes > "$OUT/volumes.txt"      2>&1
+          mount           > "$OUT/mount.txt"        2>&1
+          log show --start "$DMG_START" --predicate \
+            'process == "diskarbitrationd" OR process == "diskimagesiod" OR process == "mds" OR process == "mds_stores"' \
+            > "$OUT/diskarb-log.txt" 2>&1
+          echo "captured DMG-flake diagnostics to $OUT"
+
+      - id: dmg-upload-diagnostics
+        name: Upload DMG flake diagnostics
+        if: ${{ !cancelled() && steps.dmg.outcome == 'failure' }}
+        timeout-minutes: 5
+        uses: actions/upload-artifact@v7
+        with:
+          name: dmg-flake-diag-${{ matrix.os }}-${{ matrix.arch }}
+          path: ${{ runner.temp }}/dmg-flake-diag/**
+          if-no-files-found: ignore
+          retention-days: 14
+
+      # Hole test lanes =================================================================================================
+      # Compile test binaries via the orchestrator (resolves the full DAG:
+      # ex-ray -> galoshes -> wintun -> hole -> hole-tests) but don't run them
+      # yet. Nothing after this step rewrites the sidecars or builds in the debug
+      # profile, so the lanes below re-execute these binaries (see #200 for the
+      # NDIS-loopback corruption that motivates running TUN tests last).
+      #
+      # Budget 70: worst measured 52.4m on darwin/amd64 (median 28.6m, p90 38.4m).
+      - id: hole-build
+        name: Build hole test binaries
+        if: ${{ !cancelled() && steps.provision.outcome == 'success' && matrix.hole == true }}
+        timeout-minutes: 70
+        shell: bash
+        run: |
+          cargo xtask build hole-tests
+          df -h .
 
       # A SKULD_LABELS value that stops matching anything leaves its step a
       # silent no-op: the complementary one absorbs the whole suite and both
@@ -445,9 +488,12 @@ jobs:
       # pair below parses as exact complements and that each side still
       # selects at least one compiled-in test. Per-package contribution is
       # NOT checked — see `xtask::skuld_label_coverage` for why it can't be.
-      - name: Verify SKULD_LABELS TUN/non-TUN partition
+      - id: hole-verify-partition
+        name: Verify SKULD_LABELS TUN/non-TUN partition
+        if: ${{ !cancelled() && steps.hole-build.outcome == 'success' }}
+        timeout-minutes: 15
         shell: bash
-        run: cargo xtask verify-skuld-label-coverage --job test-hole
+        run: cargo xtask verify-skuld-label-coverage
 
       # A rename applied to only one of the two places that must agree — the
       # `.config/nextest.toml` name-substring filter and the skuld label
@@ -456,76 +502,41 @@ jobs:
       # intermittent flake, not the rename that caused it — see
       # bindreams/hole#894.
       #
-      # `--record` writes the membership just verified for guard 3 (below) to
-      # read back after the test steps — see `verify` in
+      # `--record` writes the membership just verified for the proof step (below)
+      # to read back after the lanes — see `verify` in
       # global_net_state_conformance.rs for why it isn't re-listed there
       # instead. bindreams/hole#999.
-      - name: Verify global_net_state label matches the nextest.toml filter
+      - id: hole-verify-labels
+        name: Verify global_net_state label matches the nextest.toml filter
+        if: ${{ !cancelled() && steps.hole-build.outcome == 'success' }}
+        timeout-minutes: 10
         shell: bash
-        run: >
-          cargo xtask verify-global-net-state-labels --job test-hole
-          --record target/global-net-state-expected.json
+        run: cargo xtask verify-global-net-state-labels --record target/global-net-state-expected.json
 
       # `--no-default-features` mirrors the `hole-tests` xtask target. Without
       # it Cargo recompiles `hole` with `tauri/custom-protocol` ON (different
-      # feature set → different fingerprint → fresh build), which expands
+      # feature set -> different fingerprint -> fresh build), which expands
       # `tauri::generate_context!()` in production mode and panics on
       # missing `ui/dist/`. See bindreams/hole#372. The
       # `--features tombstone/crash-dumps,tombstone/crash-child` + `package(tombstone)`
       # also mirror `hole-tests` so the crash-marker tests `build hole-tests`
-      # compiled actually run (matching feature set → no rebuild). See #522.
+      # compiled actually run (matching feature set -> no rebuild). See #522.
       # The `ci_test_hole_steps_match_the_hole_tests_target` conformance test
-      # holds every nextest step here equal to that target's `run:`.
+      # holds every nextest step of the `hole-` lanes equal to that target's `run:`.
       #
-      # STEP-LEVEL BUDGETS (#989). The job wall above is shared across build +
-      # verify + test, so a slow build silently eats the test steps' headroom;
-      # when the wall then fires it kills the JOB, GitHub never uploads the log
-      # blob, and the run yields nothing but a `cancelled` with a 404 log. A
-      # step that blows its own budget instead fails normally: the job runs on,
-      # `Upload bridge logs` still fires (its `if` covers `failure()`), and the
-      # step's captured output survives. Same evidence-preservation move as #970
-      # made for the installer job's external wait, one level up from #972's
-      # per-test `slow-timeout`s in `.config/nextest.toml`.
+      # STEP-LEVEL BUDGETS (#989). A step that blows its own budget fails
+      # normally: the job runs on, the log uploads still fire, and the step's
+      # captured output survives; when the job WALL fires instead, GitHub never
+      # uploads the log and the run yields a bare `cancelled` with a 404 log.
+      # Sized off per-step maxima over 200 runs (2026-09-11 -> 2026-10-16):
       #
-      # Sized off 29 runs on `main` (2026-08-27 → 2026-09-07), per-step maxima
-      # across all three legs:
+      #   non-TUN   windows 23.6m   darwin/amd64 24.8m   darwin/arm64 13.7m  -> 35
+      #   TUN       windows  6.4m   darwin/amd64 14.8m   darwin/arm64  7.9m  -> 25
       #
-      #   non-TUN   windows 19m30s   darwin/amd64 16m24s   darwin/arm64 10m36s  -> 35
-      #   TUN       windows  5m30s   darwin/amd64 10m30s   darwin/arm64  6m24s  -> 25
-      #
-      # One number per step rather than per leg: the spread within a step is
-      # smaller than the margin, and a per-leg matrix entry here would have to
-      # be kept in step with the job budgets above for no measured gain.
-      #
-      # DISCLOSED RESIDUAL (hung TUN step): these are not a guarantee that the
-      # step always loses the race to the job wall. At the measured maxima a
-      # hung TUN step still fails first (windows: 17 + 4 + 19 + 25 = 65, under
-      # the 80 wall), but a build or non-TUN step running past its measured
-      # maximum hands the hung step to the job wall. The #999 execution proof
-      # step below does NOT add to this sum: its `if:` names no status
-      # function, so GitHub ANDs in `success()`, and a failed/timed-out TUN step makes that
-      # condition false — the proof step is skipped, not run, and spends none
-      # of its budget. Bounding a hung step away entirely would mean either
-      # budgets too tight to survive an honest slow run or a wall raised past
-      # what the measurements support, so it is left stated rather than fixed;
-      # the common case — one step hangs while the others run normally — is
-      # covered on every leg.
-      #
-      # DISCLOSED RESIDUAL (thin post-TUN margin): a SLOW-BUT-PASSING TUN step
-      # — one that stays under its own 25-minute step budget rather than
-      # hanging — reaches the #999 execution proof step with whatever wall
-      # remains after build + both verify steps + non-TUN + TUN, and the
-      # per-step budgets above do not bound that remainder: they cap each step
-      # alone, not their sum against the shared job wall. If what is
-      # left is under the proof step's own 3-minute budget, the JOB wall can
-      # kill the whole job mid-proof instead of letting the step's own timeout
-      # fail it cleanly — the exact #989/#970 failure mode this per-step
-      # design otherwise avoids: a bare `cancelled`, no log blob, destroying
-      # the evidence the proof step exists to produce. Narrowing this away has
-      # the same cost as the residual above and is left stated rather than
-      # fixed.
-      - name: Test (non-TUN)
-        id: test-non-tun
+      # Both keep their earlier budgets (raised only, never tightened).
+      - id: hole-test-non-tun
+        name: Test (non-TUN)
+        if: ${{ !cancelled() && steps.hole-build.outcome == 'success' }}
         timeout-minutes: 35
         shell: bash
         env:
@@ -539,7 +550,7 @@ jobs:
           # overwritten by it; see that file's comment. Set via env rather
           # than a `--profile` flag because
           # `ci_test_hole_steps_match_the_hole_tests_target` holds every
-          # test-hole nextest step's command text equal to build.yaml's
+          # `hole-` nextest step's command text equal to build.yaml's
           # `hole-tests` target — `NEXTEST_PROFILE` is exempted from that
           # comparison (`ci_nextest_parity::FINGERPRINT_NEUTRAL_ENV`) because
           # nextest reads it at its own run/list time, never cargo's.
@@ -553,10 +564,178 @@ jobs:
               + package(handle-holders) + package(tombstone)
               + package(hole-test-observability)'
 
+      # Installer install + E2E (Windows) ===============================================================================
+      # The E2E drives the INSTALLED binary through WebDriver over loopback, so
+      # it runs before the TUN lane. The block is self-cleaning (Uninstall and
+      # Verify uninstall run `always()`), so the TUN lane starts on a VM with the
+      # service removed.
+
+      - id: installer-install
+        name: Install
+        if: ${{ !cancelled() && steps.installer-build-msi.outcome == 'success' }}
+        timeout-minutes: 15
+        shell: pwsh
+        run: |
+          & .github/scripts/invoke-msiexec-bounded.ps1 -Verb /i -MsiPath target\release\hole.msi -LogPath "$env:RUNNER_TEMP\msi-install.log" -FailOnNonZeroExit
+
+      - id: installer-verify-install
+        name: Verify install
+        if: ${{ !cancelled() && steps.installer-install.outcome == 'success' }}
+        timeout-minutes: 5
+        shell: pwsh
+        run: |
+          $binDir = "C:\Program Files\hole\bin"
+          foreach ($f in @("hole.exe", "ex-ray.exe", "galoshes.exe", "wintun.dll")) {
+            if (!(Test-Path "$binDir\$f")) { throw "$f not found" }
+          }
+          $svc = Get-Service -Name HoleBridge -ErrorAction SilentlyContinue
+          if (!$svc) { throw "HoleBridge service not registered" }
+          $path = [Environment]::GetEnvironmentVariable("Path", "Machine")
+          if ($path -notmatch [regex]::Escape($binDir)) { throw "$binDir not in PATH" }
+
+      # The MSI's `LaunchApp` custom action runs `hole.exe --show-dashboard`
+      # after a fresh install. Tauri's single-instance plugin would route
+      # tauri-driver's new launch into that already-running instance, so we
+      # need a clean slate. The shared script resolves the processes before
+      # killing them and waits on those objects, so an SCM-restarted bridge
+      # cannot be mistaken for one that never died.
+      - id: installer-kill-launch
+        name: Kill any running hole.exe (post-install LaunchApp)
+        if: ${{ !cancelled() && steps.installer-install.outcome == 'success' }}
+        timeout-minutes: 5
+        shell: pwsh
+        run: |
+          & .github/scripts/kill-hole-processes.ps1
+
+      # Prove on the real runner that de-elevation preserves everything the E2E
+      # needs — integrity (Medium), env vars, PATH (npm), streamed stdout, and
+      # the exact exit code — via the SAME gsudo -> powershell -File launcher
+      # the E2E uses. Fails loud here rather than as an opaque session timeout.
+      - id: installer-verify-gsudo
+        name: Verify gsudo de-elevation contract
+        if: ${{ !cancelled() && steps.installer-install.outcome == 'success' && steps.installer-gsudo.outcome == 'success' }}
+        timeout-minutes: 5
+        shell: pwsh
+        run: |
+          $env:HOLE_SELFTEST_CANARY = "canary-ok"
+          # The child streams its IL=.../PROBE_OK line straight to the log and
+          # exits 7 only when every contract check passes -- a nonzero sentinel
+          # that also proves the exit code survives the launcher. Gate on that
+          # and set the step's exit code explicitly (a lingering $LASTEXITCODE=7
+          # would otherwise fail the step under GitHub's pwsh wrapper).
+          pwsh -NoProfile -File .github/scripts/run-at-medium.ps1 -Script .github/scripts/verify-gsudo-deelevation.ps1
+          $code = $LASTEXITCODE
+          if ($code -ne 7) { Write-Host "::error::gsudo de-elevation contract failed (exit $code); see child output above"; exit 1 }
+          Write-Host "OK: de-elevation verified (Medium + env + PATH + stdout + exit code)"
+          exit 0
+
+      # WebDriverIO smoke test against the INSTALLED binary, gating
+      # bindreams/hole#372 (dashboard loads bundled frontend, not the WebView2
+      # "localhost refused" error page). Runs at Medium integrity through the
+      # shared launcher. The installed-binary guard lives in e2e-medium.ps1
+      # (inside the child), so it runs where wdio actually reads
+      # HOLE_TEST_APP_PATH. `node_modules/` is reused from the `frontend-build`
+      # that produced the MSI.
+      - id: installer-e2e
+        name: E2E dashboard test (Medium integrity)
+        if: ${{ !cancelled() && steps.installer-verify-gsudo.outcome == 'success' && steps.installer-tauri-driver.outcome == 'success' && steps.installer-msedgedriver.outcome == 'success' }}
+        timeout-minutes: 5
+        shell: pwsh
+        env:
+          HOLE_TEST_APP_PATH: 'C:\Program Files\hole\bin\hole.exe'
+        run: |
+          pwsh -NoProfile -File .github/scripts/run-at-medium.ps1 -Script .github/scripts/e2e-medium.ps1
+          exit $LASTEXITCODE
+
+      # Same TerminateProcess-returns-before-reap gap as the earlier "Kill any
+      # running hole.exe" step above, and the same script: without the wait,
+      # the Uninstall step's msiexec can start while hole.exe still holds
+      # file/service handles it needs to release.
+      - id: installer-kill
+        name: Kill hole.exe after E2E
+        if: ${{ always() && matrix.installer == true && steps.installer-install.outcome != 'skipped' }}
+        timeout-minutes: 5
+        shell: pwsh
+        run: |
+          & .github/scripts/kill-hole-processes.ps1
+
+      - id: installer-dump-log
+        name: Dump install log on failure
+        if: ${{ failure() && matrix.installer == true }}
+        timeout-minutes: 5
+        shell: pwsh
+        run: |
+          $log = "$env:RUNNER_TEMP\msi-install.log"
+          if (Test-Path $log) { Get-Content $log -Tail 200 }
+
+      - id: installer-uninstall
+        name: Uninstall
+        if: ${{ always() && matrix.installer == true && steps.installer-install.outcome != 'skipped' }}
+        timeout-minutes: 15
+        shell: pwsh
+        run: |
+          & .github/scripts/invoke-msiexec-bounded.ps1 -Verb /x -MsiPath target\release\hole.msi -LogPath "$env:RUNNER_TEMP\msi-uninstall.log"
+
+      - id: installer-verify-uninstall
+        name: Verify uninstall
+        if: ${{ always() && matrix.installer == true && steps.installer-install.outcome != 'skipped' }}
+        timeout-minutes: 5
+        shell: pwsh
+        run: |
+          $binDir = "C:\Program Files\hole\bin"
+          if (Test-Path $binDir) { throw "$binDir still exists" }
+          $svc = Get-Service -Name HoleBridge -ErrorAction SilentlyContinue
+          if ($svc) { throw "HoleBridge service still registered" }
+          $path = [Environment]::GetEnvironmentVariable("Path", "Machine")
+          if ($path -match [regex]::Escape($binDir)) { throw "$binDir still in PATH" }
+
+      # Evidence outlives the runner. The bounded wait in
+      # invoke-msiexec-bounded.ps1 is what lets a wedged msiexec fail its step
+      # instead of the whole job, so this step is reached to upload it.
+      # `/l*vx` writes both logs regardless of exit code once Install/
+      # Uninstall start msiexec, so `if-no-files-found: ignore` only covers a
+      # job that failed before either did. `*-stack-*.txt` are the per-thread
+      # native stacks a wedge captures; they are echoed into the job log too,
+      # and exist only when a step wedged; `*-cdbout-*.log` is the debugger's
+      # stdout, the backstop for a capture whose log file never opened.
+      - id: installer-upload-msi-logs
+        name: Upload MSI logs
+        if: ${{ always() && matrix.installer == true }}
+        timeout-minutes: 5
+        uses: actions/upload-artifact@v7
+        with:
+          name: msi-logs-windows-amd64
+          path: |
+            ${{ runner.temp }}/msi-install.log
+            ${{ runner.temp }}/msi-uninstall.log
+            ${{ runner.temp }}/*-stack-*.txt
+            ${{ runner.temp }}/*-cdbout-*.log
+          if-no-files-found: ignore
+          retention-days: 14
+
+      # bridge.log (C:\ProgramData\hole\logs) has the only record of what the
+      # HoleBridge SERVICE process itself was doing -- SCM start/stop/restart,
+      # the liveness lock, IPC bind -- none of which appears in the MSI logs. On
+      # failure only: this repo has an unresolved uninstall-hang history (#790)
+      # this is meant to help close. Named apart from the test lane's
+      # `bridge-logs-windows-amd64`: both steps now run in one job, and an
+      # artifact name is unique per run.
+      - id: installer-upload-bridge-logs
+        name: Upload installed-bridge logs on failure
+        if: ${{ failure() && matrix.installer == true }}
+        timeout-minutes: 5
+        uses: actions/upload-artifact@v7
+        with:
+          name: bridge-logs-installer-windows-amd64
+          path: C:\ProgramData\hole\logs\**
+          if-no-files-found: ignore
+          retention-days: 14
+
+      # TUN lanes =======================================================================================================
       # Quoted: an unquoted ` #` opens a YAML comment and truncates the name.
-      - name: "Test (TUN, runs last for #200)"
-        if: matrix.os == 'windows' && matrix.arch == 'amd64'
-        id: test-tun
+      - id: hole-test-tun
+        name: "Test (TUN, runs last for #200)"
+        if: ${{ !cancelled() && steps.hole-build.outcome == 'success' && matrix.os == 'windows' && matrix.arch == 'amd64' }}
         timeout-minutes: 25
         shell: bash
         env:
@@ -581,32 +760,29 @@ jobs:
               + package(handle-holders) + package(tombstone)
               + package(hole-test-observability)'
 
-      # Guard 2 above (`verify-global-net-state-labels`) only proves the
-      # `global_net_state` group's tests were SELECTABLE; a job that silently
-      # ran zero of them (e.g. nextest's own group/filter machinery
-      # mis-scheduling on Windows) would still read as green. This diffs the
-      # membership guard 2 recorded against the two lanes' own-profile JUnit
-      # reports above and fails on any member that never shows up as executed
-      # — bindreams/hole#999.
+      # The `global_net_state` check above only proves the group's tests were
+      # SELECTABLE; a job that silently ran zero of them (e.g. nextest's own
+      # group/filter machinery mis-scheduling on Windows) would still read as
+      # green. This diffs the membership that check recorded against the two
+      # lanes' own-profile JUnit reports and fails on any member that never shows
+      # up as executed — bindreams/hole#999.
       #
-      # WINDOWS LEG ONLY, and the name says so: the darwin legs would need
-      # their own pair of `non-tun`/`tun` profiles too, but their job walls
-      # are the scarce resource this repo protects, so extending the proof
-      # there is a separate, separately-measured decision. Nothing here claims
-      # the group is proven executed anywhere else.
+      # WINDOWS LEG ONLY, and the name says so: the darwin legs would need their
+      # own pair of `non-tun`/`tun` profiles too, but their walls are the scarce
+      # resource this repo protects, so extending the proof there is a
+      # separately-measured decision. Nothing here claims the group is proven
+      # executed anywhere else.
       #
-      # No status function in the `if:`, so GitHub ANDs in `success()`: when a
-      # test step fails, this is skipped. Deliberate — the proof answers "did
-      # everything run", which is only interesting once "did everything pass"
-      # is already yes; a failed test step is its own, louder signal, and the
-      # lane reports it leaves behind are partial by construction.
-      #
-      # Blocking (no `continue-on-error`): the check is a set diff over two
-      # files plus a recorded listing, with no network, no test execution and
-      # no timing — it has no flake surface of its own, and a non-blocking
-      # version of it could not distinguish a real regression from noise.
-      - name: "Verify every global_net_state test executed (windows leg, #999)"
-        if: matrix.os == 'windows' && matrix.arch == 'amd64'
+      # Gated on both lanes passing rather than on `success()`: the proof answers
+      # "did everything run", which is only interesting once "did everything
+      # pass" is yes, and a failed lane is its own, louder signal that leaves
+      # partial reports. Naming the two outcomes (not the whole job) keeps an
+      # unrelated lane's failure from hiding it. This is the one toolchain user
+      # after the TUN lane (#200): a set diff over two files and a recorded
+      # listing, no network, no test execution, no timing.
+      - id: hole-verify-executed
+        name: "Verify every global_net_state test executed (windows leg, #999)"
+        if: ${{ !cancelled() && steps.hole-test-non-tun.outcome == 'success' && steps.hole-test-tun.outcome == 'success' }}
         timeout-minutes: 3
         shell: bash
         run: >
@@ -620,23 +796,21 @@ jobs:
       # and the user-owned `target/` are reused via `sudo env PATH/HOME` (the
       # binaries are prebuilt above; nextest only re-executes them). macOS
       # runners have passwordless sudo. Windows engages WFP from the elevated
-      # token above; macOS has no such token, so root is the equivalent.
+      # token; macOS has no such token, so root is the equivalent.
       #
-      # `--features` must match `Build hole test binaries` and the non-TUN
-      # step above (see that comment) or cargo rebuilds instead of reusing
-      # the prebuilt binaries.
+      # `--features` must match `hole-build` and the non-TUN step above or cargo
+      # rebuilds instead of reusing the prebuilt binaries.
       # NEXTEST_PROFILE=tun (see the windows TUN step's comment above): this
       # step runs under `sudo`, so without a lane-specific profile it would
       # write a ROOT-owned `target/nextest/default/junit.xml` that no
       # subsequent unprivileged `cargo nextest run` in this checkout could
       # overwrite or clean up (exit 110) even though the tests themselves had
-      # already passed — the failure mode M1 in the #1012 review names. The
-      # darwin leg does not feed guard 3 (windows leg only, see below), but it
-      # is the ONLY step here that runs privileged, so it is the one place
-      # this problem can actually occur.
-      - name: Test (TUN, macOS — root for pfctl)
-        if: matrix.os == 'darwin'
-        id: test-tun-macos
+      # already passed — the failure mode M1 in the #1012 review names. It is
+      # the ONLY step here that runs privileged, and the last that runs a
+      # toolchain.
+      - id: hole-test-tun-macos
+        name: Test (TUN, macOS — root for pfctl)
+        if: ${{ !cancelled() && steps.hole-build.outcome == 'success' && matrix.os == 'darwin' }}
         timeout-minutes: 25
         shell: bash
         run: >
@@ -649,101 +823,22 @@ jobs:
               + package(handle-holders) + package(tombstone)
               + package(hole-test-observability)'
 
-      # Upload bridge.log produced by `DistHarness` subprocesses. Matches
-      # files that the test harness redirected to `$RUNNER_TEMP` (see
-      # `crates/bridge/src/test_support/dist_harness.rs::new_tempdir`).
+      # Renovate config =================================================================================================
+      # `.github/renovate.json` is only ever executed by Renovate's own bot, so a
+      # typo in it (`matchDepNamez`, a number where a duration string belongs) is
+      # silently ignored rather than reported anywhere this repo can see. This
+      # catches that the config is schema-valid; it says nothing about whether a
+      # given rule actually applies to a given dependency — see
+      # xtask/src/schemars_pin.rs's module doc for why that's not verified here.
       #
-      # Unconditional on darwin: nextest suppresses captured output on success, and a passing darwin run is currently the only way to see the macOS IPv6-assignment path's tracing output, which nothing asserts on yet.
-      - name: Upload bridge logs (darwin always; else on failure)
-        if: ${{ matrix.os == 'darwin' || failure() || cancelled() }}
-        uses: actions/upload-artifact@v7
-        with:
-          name: bridge-logs-${{ matrix.os }}-${{ matrix.arch }}
-          path: ${{ runner.temp }}/**/bridge.log
-          if-no-files-found: ignore
-          retention-days: 14
-
-  # Plugin interop/e2e area (crate `plugin-e2e`, #435): ex-ray<->stock interop on
-  # all 6 platforms (QUIC not(windows)) + galoshes server<->client roundtrips
-  # (WS all platforms; WS-TLS/QUIC not(windows)). A fresh build (NOT the archive lane that test-garter /
-  # test-galoshes use) because these spawn plugin BINARIES and need on-disk
-  # artifacts: ex-ray + galoshes (from setup-build's `cargo xtask deps`) and the
-  # pinned stock v2ray-plugin (provisioned by the `plugin-e2e-tests` build.yaml
-  # target). Shaped like `test-hole`.
-  test-plugin-e2e:
-    name: Test plugin-e2e (${{ matrix.os }}/${{ matrix.arch }})
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 45
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - { os: windows, arch: amd64, runner: windows-latest }
-          - { os: darwin,  arch: amd64, runner: macos-15-intel }
-          - { os: darwin,  arch: arm64, runner: macos-latest }
-          - { os: linux,   arch: amd64, runner: ubuntu-latest }
-          - { os: linux,   arch: arm64, runner: ubuntu-24.04-arm }
-          - { os: windows, arch: arm64, runner: windows-11-arm }
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          fetch-depth: 0
-
-      - uses: ./.github/actions/setup-build
-
-      - uses: cargo-bins/cargo-binstall@v1.25.2
-
-      - name: Install nextest
-        shell: bash
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
-        run: cargo binstall --no-confirm --locked cargo-nextest
-
-      # `cargo xtask run plugin-e2e-tests` runs the target's build cascade
-      # (provision-upstream-v2ray + the `--no-run` compile; ex-ray + galoshes via
-      # the `depends: galoshes` chain) and then the nextest run. setup-build's
-      # `cargo xtask deps` has already built ex-ray + galoshes. Interop runs on
-      # all 6 platforms (QUIC not(windows)); galoshes roundtrips run on all (WS-TLS/QUIC not(windows)).
-      - name: Test plugin-e2e
-        shell: bash
-        run: cargo xtask run plugin-e2e-tests
-
-  # ex-ray Go unit tests (the `ex-ray-tests` build.yaml target). This is the
-  # ONLY CI that runs Go tests: prek runs golangci-lint on the ex-ray wrapper
-  # but excludes third_party/v2ray-core and executes no tests. It gives the ECH
-  # fail-closed gate CI teeth — ex-ray's buildTLSConfig plus the patched vendored
-  # tls/quic/hysteria2 (incl. utls) gate/refuse/round-trip tests. The two ECH
-  # client transports ex-ray can't select (uTLS, hysteria2) are exercised here
-  # since the plugin-e2e roundtrips can only drive ws-tls + QUIC. Single linux
-  # runner: the gate logic is platform-independent (domainsocket is !windows).
-  test-ex-ray:
-    name: Test ex-ray (Go)
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    steps:
-      - uses: actions/checkout@v7
-
-      - uses: ./.github/actions/setup-build
-
-      - name: Test ex-ray Go (ECH gate)
-        run: cargo xtask run ex-ray-tests
-
-  # `.github/renovate.json` is only ever executed by Renovate's own bot, so a
-  # typo in it (`matchDepNamez`, a number where a duration string belongs) is
-  # silently ignored rather than reported anywhere this repo can see. This
-  # catches that the config is schema-valid; it says nothing about whether a
-  # given rule actually applies to a given dependency — see
-  # xtask/src/schemars_pin.rs's module doc for why that's not verified here.
-  # Linux, measured at 25s for the step and 31s for the job; deliberately not
-  # folded into `Lint`, which is a Windows job with a Rust toolchain it does not
-  # need.
-  renovate-config:
-    name: Validate renovate config
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-node@v7
+      # Last, because it swaps Node: the validator is deliberately run on the
+      # newest LTS (the bot that reads this config is always Renovate's latest
+      # release), while every other step uses the Node 24 that `package.json`
+      # pins.
+      - id: setup-node-lts
+        uses: actions/setup-node@v7
+        if: ${{ !cancelled() && steps.provision.outcome == 'success' && matrix.portable-lint == true }}
+        timeout-minutes: 5
         with:
           node-version: lts/*
 
@@ -754,345 +849,30 @@ jobs:
       # instead. Without a file argument at all, the validator silently skips
       # every default config filename that doesn't exist and exits 0 with only
       # a warning logged, so a renovate.json moved or deleted in a refactor
-      # would pass this job having validated nothing.
-      #
-      # Unpinned on purpose, and the one place in this repo where that is the
-      # correct answer: the bot that reads this config is always Renovate's
-      # latest release, so validating against anything older would assert a
-      # schema nothing uses. `--strict` makes warnings fatal.
-      - name: Validate .github/renovate.json
+      # would pass this job having validated nothing. Unpinned on purpose.
+      # `--strict` makes warnings fatal.
+      - id: renovate-config
+        name: Validate .github/renovate.json
+        if: ${{ !cancelled() && steps.setup-node-lts.outcome == 'success' }}
+        timeout-minutes: 5
+        shell: bash
         run: npx --yes --package renovate renovate-config-validator --strict --no-global .github/renovate.json
 
-  # Runs the ex-ray-unit-tests target (build.yaml) on windows/darwin -- see there
-  # for why it is split from test-ex-ray.
-  test-ex-ray-platforms:
-    name: Test ex-ray (Go, ${{ matrix.os }})
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [windows-latest, macos-latest]
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 20
-    steps:
-      - uses: actions/checkout@v7
-
-      - uses: ./.github/actions/setup-build
-
-      - name: Test ex-ray Go
-        shell: bash
-        run: cargo xtask run ex-ray-unit-tests
-
-  test-installer:
-    name: Test installer (windows/amd64)
-    runs-on: windows-latest
-    # The installer-assembly budget, held equal to `test-dmg-signing` by
-    # `ci_installer_assembly_jobs_share_a_timeout_budget`. Sized for a cold
-    # sccache: GitHub evicts cache entries untouched for 7 days, so the first
-    # run after a quiet week compiles the workspace from scratch. This job's
-    # own max over 150 runs is 29m54s.
-    timeout-minutes: 80
-    env:
-      # renovate: datasource=github-releases depName=gerardog/gsudo
-      GSUDO_VERSION: "2.6.1"
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          fetch-depth: 0
-
-      - uses: astral-sh/setup-uv@v10.2.0
-      - uses: ./.github/actions/setup-build
-
-      - name: Test
-        working-directory: msi-installer
-        run: uv run --group dev pytest -v
-
-      - name: Build MSI
-        run: cargo xtask build hole-msi
-
-      - name: Smoke-test binary
-        run: target\release\hole.exe version
-
-      - name: Install
-        shell: pwsh
-        run: |
-          & .github/scripts/invoke-msiexec-bounded.ps1 -Verb /i -MsiPath target\release\hole.msi -LogPath "$env:RUNNER_TEMP\msi-install.log" -FailOnNonZeroExit
-
-      - name: Verify install
-        shell: pwsh
-        run: |
-          $binDir = "C:\Program Files\hole\bin"
-          foreach ($f in @("hole.exe", "ex-ray.exe", "galoshes.exe", "wintun.dll")) {
-            if (!(Test-Path "$binDir\$f")) { throw "$f not found" }
-          }
-          $svc = Get-Service -Name HoleBridge -ErrorAction SilentlyContinue
-          if (!$svc) { throw "HoleBridge service not registered" }
-          $path = [Environment]::GetEnvironmentVariable("Path", "Machine")
-          if ($path -notmatch [regex]::Escape($binDir)) { throw "$binDir not in PATH" }
-
-      # WebDriverIO smoke test against the INSTALLED binary, gating
-      # bindreams/hole#372 (dashboard loads bundled frontend, not the
-      # WebView2 "localhost refused" error page).
+      # Logs ============================================================================================================
+      # Upload bridge.log produced by `DistHarness` subprocesses. Matches files
+      # the test harness redirected to `$RUNNER_TEMP` (see
+      # `crates/bridge/src/test_support/dist_harness.rs::new_tempdir`).
       #
-      # tauri-driver is installed via `cargo install`; the cargo registry
-      # cache + sccache from setup-build keep this fast across runs.
-      # `--locked` and a pinned version guard against flakes from
-      # unrelated bumps in the tauri-driver crate.
-      - name: Install tauri-driver
-        run: cargo install --locked --version 2.0.6 tauri-driver
-
-      # tauri-driver speaks to WebView2 via Microsoft Edge's WebDriver.
-      # The runner's bundled msedgedriver (`$EDGEWEBDRIVER`) targets the
-      # Edge BROWSER version on the image, but WebView2 RUNTIME (which
-      # hole.exe actually loads) auto-updates independently and is
-      # typically a higher version — msedgedriver then rejects the
-      # session with "only supports Microsoft Edge version N". Detect
-      # the installed WebView2 runtime version and download the matching
-      # msedgedriver from Microsoft's CDN. See bindreams/hole#372.
-      - name: Install msedgedriver matching WebView2 runtime
-        shell: pwsh
-        run: |
-          $key = "HKLM:\SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}"
-          $webview2 = (Get-ItemProperty -Path $key -Name pv).pv
-          Write-Host "WebView2 runtime version: $webview2"
-          $url = "https://msedgedriver.microsoft.com/$webview2/edgedriver_win64.zip"
-          $zip = "$env:RUNNER_TEMP\edgedriver.zip"
-          $out = "$env:RUNNER_TEMP\edgedriver"
-          Invoke-WebRequest -Uri $url -OutFile $zip
-          Expand-Archive -Path $zip -DestinationPath $out -Force
-          Add-Content -Path $env:GITHUB_PATH -Value $out
-
-      # The MSI's `LaunchApp` custom action runs `hole.exe --show-dashboard`
-      # after a fresh install. Tauri's single-instance plugin would route
-      # tauri-driver's new launch into that already-running instance, so we
-      # need a clean slate. The shared script resolves the processes before
-      # killing them and waits on those objects, so an SCM-restarted bridge
-      # cannot be mistaken for one that never died.
-      - name: Kill any running hole.exe (post-install LaunchApp)
-        shell: pwsh
-        run: |
-          & .github/scripts/kill-hole-processes.ps1
-
-      # gsudo runs the dashboard E2E at Medium integrity. GitHub runners run
-      # every process at High integrity (admin + UAC disabled), and WebView2
-      # Runtime 150 broke the DevTools loopback for High-integrity hosts
-      # (MicrosoftEdge/WebView2Feedback#5640) so tauri-driver can't attach.
-      # Real users run the GUI unprivileged (Medium), where 150 works.
-      - name: Install gsudo (de-elevation for the E2E)
-        shell: pwsh
-        run: |
-          $zip = "$env:RUNNER_TEMP\gsudo.zip"
-          $dir = "$env:RUNNER_TEMP\gsudo"
-          Invoke-WebRequest -Uri "https://github.com/gerardog/gsudo/releases/download/v$env:GSUDO_VERSION/gsudo.portable.zip" -OutFile $zip
-          Expand-Archive -Path $zip -DestinationPath $dir -Force
-          $exe = "$dir\x64\gsudo.exe"
-          if (-not (Test-Path $exe)) { throw "gsudo.exe not found at $exe after extract" }
-          "$dir\x64" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
-
-      # Prove on the real runner that de-elevation preserves everything the E2E
-      # needs — integrity (Medium), env vars, PATH (npm), streamed stdout, and
-      # the exact exit code — via the SAME gsudo -> powershell -File launcher
-      # the E2E uses. Fails loud here rather than as an opaque session timeout.
-      - name: Verify gsudo de-elevation contract
-        shell: pwsh
-        run: |
-          $env:HOLE_SELFTEST_CANARY = "canary-ok"
-          # The child streams its IL=.../PROBE_OK line straight to the log and
-          # exits 7 only when every contract check passes -- a nonzero sentinel
-          # that also proves the exit code survives the launcher. Gate on that
-          # and set the step's exit code explicitly (a lingering $LASTEXITCODE=7
-          # would otherwise fail the step under GitHub's pwsh wrapper).
-          pwsh -NoProfile -File .github/scripts/run-at-medium.ps1 -Script .github/scripts/verify-gsudo-deelevation.ps1
-          $code = $LASTEXITCODE
-          if ($code -ne 7) { Write-Host "::error::gsudo de-elevation contract failed (exit $code); see child output above"; exit 1 }
-          Write-Host "OK: de-elevation verified (Medium + env + PATH + stdout + exit code)"
-          exit 0
-
-      # Run the dashboard E2E at Medium integrity through the shared launcher.
-      # The installed-binary guard lives in e2e-medium.ps1 (inside the child),
-      # so it runs where wdio actually reads HOLE_TEST_APP_PATH. `node_modules/`
-      # is reused from the `frontend-build` that produced the MSI.
-      - name: E2E dashboard test (Medium integrity)
-        shell: pwsh
-        env:
-          HOLE_TEST_APP_PATH: 'C:\Program Files\hole\bin\hole.exe'
-        run: |
-          pwsh -NoProfile -File .github/scripts/run-at-medium.ps1 -Script .github/scripts/e2e-medium.ps1
-          exit $LASTEXITCODE
-
-      # Same TerminateProcess-returns-before-reap gap as the earlier "Kill any
-      # running hole.exe" step above, and the same script: without the wait,
-      # the Uninstall step's msiexec can start while hole.exe still holds
-      # file/service handles it needs to release.
-      - name: Kill hole.exe after E2E
-        if: always()
-        shell: pwsh
-        run: |
-          & .github/scripts/kill-hole-processes.ps1
-
-      - name: Dump install log on failure
-        if: failure()
-        shell: pwsh
-        run: |
-          $log = "$env:RUNNER_TEMP\msi-install.log"
-          if (Test-Path $log) { Get-Content $log -Tail 200 }
-
-      - name: Uninstall
-        if: always()
-        shell: pwsh
-        run: |
-          & .github/scripts/invoke-msiexec-bounded.ps1 -Verb /x -MsiPath target\release\hole.msi -LogPath "$env:RUNNER_TEMP\msi-uninstall.log"
-
-      - name: Verify uninstall
-        if: always()
-        shell: pwsh
-        run: |
-          $binDir = "C:\Program Files\hole\bin"
-          if (Test-Path $binDir) { throw "$binDir still exists" }
-          $svc = Get-Service -Name HoleBridge -ErrorAction SilentlyContinue
-          if ($svc) { throw "HoleBridge service still registered" }
-          $path = [Environment]::GetEnvironmentVariable("Path", "Machine")
-          if ($path -match [regex]::Escape($binDir)) { throw "$binDir still in PATH" }
-
-      # Evidence outlives the runner. The bounded wait in
-      # invoke-msiexec-bounded.ps1 is what lets a wedged msiexec fail this
-      # step instead of the whole job, so this step is reached to upload it.
-      # `/l*vx` writes both logs regardless of exit code once Install/
-      # Uninstall start msiexec, so `if-no-files-found: ignore` only covers a
-      # job that failed before either did. `*-stack-*.txt` are the per-thread
-      # native stacks a wedge captures; they are echoed into the job log too,
-      # and exist only when a step wedged; `*-cdbout-*.log` is the debugger's
-      # stdout, the backstop for a capture whose log file never opened.
-      - name: Upload MSI logs
-        if: always()
+      # Unconditional on darwin: nextest suppresses captured output on success,
+      # and a passing darwin run is currently the only way to see the macOS
+      # IPv6-assignment path's tracing output, which nothing asserts on yet.
+      - id: hole-upload-bridge-logs
+        name: Upload bridge logs (darwin always; else on failure)
+        if: ${{ matrix.hole == true && (matrix.os == 'darwin' || failure() || cancelled()) }}
+        timeout-minutes: 5
         uses: actions/upload-artifact@v7
         with:
-          name: msi-logs-windows-amd64
-          path: |
-            ${{ runner.temp }}/msi-install.log
-            ${{ runner.temp }}/msi-uninstall.log
-            ${{ runner.temp }}/*-stack-*.txt
-            ${{ runner.temp }}/*-cdbout-*.log
+          name: bridge-logs-${{ matrix.os }}-${{ matrix.arch }}
+          path: ${{ runner.temp }}/**/bridge.log
           if-no-files-found: ignore
           retention-days: 14
-
-      # bridge.log (C:\ProgramData\hole\logs) has this job's only record of
-      # what the HoleBridge service process itself was doing -- SCM
-      # start/stop/restart, the liveness lock, IPC bind -- none of which
-      # appears in the MSI logs above. On failure only: this repo has an
-      # unresolved uninstall-hang history (#790) this is meant to help close.
-      - name: Upload bridge logs on failure
-        if: failure()
-        uses: actions/upload-artifact@v7
-        with:
-          name: bridge-logs-windows-amd64
-          path: C:\ProgramData\hole\logs\**
-          if-no-files-found: ignore
-          retention-days: 14
-
-  # Darwin-only counterpart to `test-installer`: build the DMG and run the
-  # signature-consistency tests in `dmg-installer/`. Catches issue #364 —
-  # an unsigned .app bundle that launches "damaged" under Gatekeeper
-  # quarantine. Always runs (no path filter) so this stays a stable
-  # required check on every PR.
-  test-dmg-signing:
-    name: Test DMG signing (${{ matrix.os }}/${{ matrix.arch }})
-    runs-on: ${{ matrix.runner }}
-    # The installer-assembly budget, held equal to `test-installer` by
-    # `ci_installer_assembly_jobs_share_a_timeout_budget`. The darwin/amd64 leg
-    # sets the requirement: `macos-15-intel` runs ~1.7x slower than the arm64
-    # runner across every phase — ~25 min on a warm sccache, and 45m45s measured
-    # on a fully cold one (5% hit rate, the first run after a 7-day cache
-    # eviction).
-    #
-    # darwin/amd64 passed up to 59m12s (median 34m) over 150 runs and was
-    # killed once at 60m24s (a floor): 1.25 x 60.4m -> 80.
-    timeout-minutes: 80
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - { os: darwin, arch: amd64, runner: macos-15-intel }
-          - { os: darwin, arch: arm64, runner: macos-latest }
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          fetch-depth: 0
-
-      # Local time, the zone `log show --start` reads, so the capture below
-      # spans the job's lifetime whatever `timeout-minutes` is.
-      - name: Record job start
-        shell: bash
-        run: echo "JOB_START=$(date +'%Y-%m-%d %H:%M:%S')" >> "$GITHUB_ENV"
-
-      - uses: astral-sh/setup-uv@v10.2.0
-      - uses: ./.github/actions/setup-build
-
-      # One build+test via the run-cascade (builds hole-dmg once, then the
-      # signing pytest). A separate `build hole-dmg` step would double-roll the
-      # flaky bundle_dmg.sh/hdiutil pipeline. See #446.
-      - name: Build DMG and test signing
-        run: cargo xtask run hole-dmg-tests
-
-      # hdiutil DMG creation/mounting is a non-deterministic macOS
-      # DiskArbitration race; capture system state on any failure (build or the
-      # pytest mount) to diagnose the next occurrence (#446). Note `if: failure()`
-      # does not fire when a timeout kills the job — that surfaces as `cancelled`,
-      # so a budget overrun leaves no diagnostics here.
-      - name: Capture DiskArbitration/hdiutil state on failure
-        if: failure()
-        shell: bash
-        run: |
-          set +e
-          OUT="$RUNNER_TEMP/dmg-flake-diag"
-          mkdir -p "$OUT"
-          hdiutil info    > "$OUT/hdiutil-info.txt" 2>&1
-          ls -la /Volumes > "$OUT/volumes.txt"      2>&1
-          mount           > "$OUT/mount.txt"        2>&1
-          log show --start "$JOB_START" --predicate \
-            'process == "diskarbitrationd" OR process == "diskimagesiod" OR process == "mds" OR process == "mds_stores"' \
-            > "$OUT/diskarb-log.txt" 2>&1
-          echo "captured DMG-flake diagnostics to $OUT"
-
-      - name: Upload DMG flake diagnostics
-        if: failure()
-        uses: actions/upload-artifact@v7
-        with:
-          name: dmg-flake-diag-${{ matrix.os }}-${{ matrix.arch }}
-          path: ${{ runner.temp }}/dmg-flake-diag/**
-          if-no-files-found: ignore
-          retention-days: 14
-
-  # Renovate npm safety gate: builds the Vite bundle (via `cargo xtask build
-  # frontend-build`) and type-checks (via `cargo xtask run frontend-check`,
-  # which does its own `npm ci` + `npm run check` — tsc reads source directly
-  # so it doesn't need the Vite bundle as a dep). Both steps are required
-  # status checks for npm dependency PRs to automerge — see
-  # .github/renovate.json. Single platform: `npm run check` / `vite build`
-  # are platform-independent; the per-OS Tauri shell is exercised by the
-  # release pipeline.
-  frontend-check:
-    name: Frontend check
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@v7
-
-      - uses: actions/setup-node@v7
-        with:
-          node-version-file: package.json
-          cache: npm
-
-      - uses: ./.github/actions/setup-rust
-        id: setup-rust
-
-      # Restore only: the `Linux` key is saved by `build` (linux/amd64); see
-      # `.github/actions/setup-build/action.yaml`.
-      - uses: ./.github/actions/cargo-cache
-        with:
-          cachekey: ${{ steps.setup-rust.outputs.cachekey }}
-
-      - name: Build frontend
-        run: cargo xtask build frontend-build
-
-      - name: Type-check frontend
-        run: cargo xtask run frontend-check

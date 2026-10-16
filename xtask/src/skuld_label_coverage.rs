@@ -1,7 +1,8 @@
 //! Guards `.github/workflows/ci.yaml`'s complementary `SKULD_LABELS` step
 //! pair against going stale (bindreams/hole#891).
 //!
-//! `test-hole` splits ten packages across two `cargo nextest run` steps —
+//! The `hole-` steps of the `ci` job split ten packages across two `cargo
+//! nextest run` steps —
 //! `SKULD_LABELS: "!tun"`, then `SKULD_LABELS: "tun"` last for #200 — and
 //! skuld drops label-filtered-out tests before libtest ever sees them. A value
 //! that selects nothing therefore produces no signal: no `filtered out` count,
@@ -12,7 +13,7 @@
 //! itself (via `extract_lane_candidates`) so this guard cannot drift from
 //! the steps it checks:
 //!
-//! - the job's nextest-run steps agree on one package set and declare exactly
+//! - the in-scope nextest-run steps agree on one package set and declare exactly
 //!   two `SKULD_LABELS` values over it, which **parse** to exact logical
 //!   complements. Parsed, not textual: skuld binds `!` tighter than `&`/`|`,
 //!   so comparing `off` against `"!"` + `on` accepts `"tun | slow"` /
@@ -50,7 +51,9 @@ use indexmap::IndexMap;
 use serde::Deserialize;
 use skuld::LabelFilter;
 
-use crate::ci_coverage::{is_nextest_run, join_line_continuations, package_tokens, split_commands, unquote};
+use crate::ci_coverage::{
+    is_nextest_run, join_line_continuations, package_tokens, scoped_steps, split_commands, unquote,
+};
 
 // ci.yaml shape (local, minimal) — mirrors the pattern in `ci_coverage.rs` /
 // `ci_nextest_parity.rs`: serde ignores every field this module doesn't name. =========================================
@@ -68,6 +71,8 @@ struct Job {
 
 #[derive(Deserialize)]
 struct CiStep {
+    #[serde(default)]
+    id: Option<String>,
     #[serde(default)]
     run: Option<String>,
     #[serde(default)]
@@ -88,10 +93,15 @@ pub(crate) struct LaneCandidate {
     pub list_command: Vec<String>,
 }
 
-/// Every `cargo nextest run` command in `job_id`, each paired with the
-/// `SKULD_LABELS` value it runs under. Errors if a nextest-run command sets
-/// no `SKULD_LABELS` at all — this guard has nothing to check without one.
-pub(crate) fn extract_lane_candidates(ci_yaml: &str, job_id: &str) -> Result<Vec<LaneCandidate>> {
+/// Every `cargo nextest run` command in `job_id`'s steps that `step_prefix`
+/// selects (see [`scoped_steps`]), each paired with the `SKULD_LABELS` value it
+/// runs under. Errors if an in-scope nextest-run command sets no `SKULD_LABELS`
+/// at all — this guard has nothing to check without one.
+pub(crate) fn extract_lane_candidates(
+    ci_yaml: &str,
+    job_id: &str,
+    step_prefix: Option<&str>,
+) -> Result<Vec<LaneCandidate>> {
     let ci: CiYaml = serde_yml::from_str(ci_yaml).context("parsing ci.yaml")?;
     let job = ci
         .jobs
@@ -99,7 +109,7 @@ pub(crate) fn extract_lane_candidates(ci_yaml: &str, job_id: &str) -> Result<Vec
         .with_context(|| format!("ci.yaml declares no job {job_id:?}"))?;
 
     let mut out = Vec::new();
-    for step in &job.steps {
+    for (_, step) in scoped_steps(job_id, &job.steps, |s| s.id.as_deref(), step_prefix)? {
         let Some(run) = &step.run else { continue };
         let joined = join_line_continuations(run);
         for cmd in split_commands(&joined) {
@@ -396,7 +406,7 @@ pub(crate) fn selects_nothing(side: &BTreeMap<String, BTreeSet<String>>) -> bool
 /// compiled-in test) lists that neither `off` nor `on` selects. Empty when
 /// every compiled test is covered by at least one of the two complementary
 /// steps — including binaries with an empty `on` set entirely, which is the
-/// expected shape for most `test-hole` packages (no `tun`-labeled tests at
+/// expected shape for most `hole-` lane packages (no `tun`-labeled tests at
 /// all, on any platform).
 pub(crate) fn stranded_tests(
     baseline: &BTreeMap<String, BTreeSet<String>>,
@@ -469,9 +479,9 @@ pub(crate) fn run_nextest_list(
 /// complementary `SKULD_LABELS` step pair, list each side plus an unfiltered
 /// baseline, and fail if either side selects nothing or any compiled-in test
 /// is selected by neither.
-pub fn verify(repo_root: &Path, job_id: &str) -> Result<()> {
+pub fn verify(repo_root: &Path, job_id: &str, step_prefix: Option<&str>) -> Result<()> {
     let ci_yaml = std::fs::read_to_string(repo_root.join(".github/workflows/ci.yaml")).context("read ci.yaml")?;
-    let candidates = extract_lane_candidates(&ci_yaml, job_id)?;
+    let candidates = extract_lane_candidates(&ci_yaml, job_id, step_prefix)?;
     let (off, on) = pick_complementary_pair(&candidates)?;
 
     let baseline = run_nextest_list(repo_root, &off.list_command, None)?;

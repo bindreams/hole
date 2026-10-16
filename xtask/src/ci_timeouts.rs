@@ -1,21 +1,27 @@
-//! Which `.github/workflows/ci.yaml` jobs assemble a release installer, and what
-//! timeout budget does each one carry?
+//! Which `.github/workflows/ci.yaml` steps assemble a release installer, what
+//! timeout budget does each carry, and does every step of the unified `ci` job
+//! carry one?
 //!
-//! Backs the `ci_installer_assembly_jobs_share_a_timeout_budget` conformance
-//! test. Assembling an installer is the most expensive thing CI does — a full
-//! release build of `hole`, then the bundler, then the package's own test suite
-//! — so those jobs sit closest to their `timeout-minutes` wall. When two jobs do
-//! that same work but disagree on the budget, the smaller one is killed
-//! mid-compile on the slower runner while its sibling passes.
+//! Backs the `ci_installer_assembly_steps_share_a_timeout_budget` and
+//! `ci_steps_declare_a_literal_timeout` conformance tests. Assembling an
+//! installer is the most expensive thing CI does — a full release build of
+//! `hole`, then the bundler, then the package's own test suite — so those steps
+//! sit closest to their `timeout-minutes`. When two of them do that same work
+//! but disagree on the budget, the smaller one is killed mid-compile on the
+//! slower runner while its sibling passes.
 //!
 //! The test asserts EQUALITY, not a floor: there is no defensible magic number
-//! for "long enough", but there is a defensible invariant that sibling jobs
-//! doing the same work on the same runner matrix get the same budget. Raising
-//! the class budget stays a one-line edit; under-budgeting one member does not.
+//! for "long enough", but there is a defensible invariant that steps doing the
+//! same work get the same budget. Raising the class budget stays a one-line
+//! edit; under-budgeting one member does not.
+//!
+//! Budgets live on steps, not on the job: the unified job's own
+//! `timeout-minutes` is a per-leg matrix expression (the wall), and a step with
+//! no bound of its own runs to that wall, which destroys its log (#989).
 //!
 //! Scope is `ci.yaml` deliberately. The release workflows also assemble
 //! installers, but on a cold cache and with extra packaging work, so their
-//! budget is a separate question and equality with the CI jobs would be wrong.
+//! budget is a separate question and equality with the CI steps would be wrong.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -27,7 +33,7 @@ use crate::ci_coverage::{join_line_continuations, split_commands, step_command, 
 use crate::manifest::Manifest;
 
 // Minimal `ci.yaml` shape — serde ignores every field we don't name, so this
-// tracks only `jobs.<id>.{timeout-minutes,steps[].run}`.
+// tracks only `jobs.<id>.steps[].{id,name,run,timeout-minutes}`.
 
 #[derive(Deserialize)]
 struct CiYaml {
@@ -36,33 +42,53 @@ struct CiYaml {
 
 #[derive(Deserialize)]
 struct Job {
-    /// Left uninterpreted so an unexpected scalar on an unrelated job cannot
-    /// abort the whole document — see [`resolve_timeout`].
-    #[serde(rename = "timeout-minutes")]
-    timeout_minutes: Option<serde_yml::Value>,
     #[serde(default)]
     steps: Vec<CiStep>,
 }
 
+#[derive(Deserialize)]
+struct CiStep {
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    run: Option<String>,
+    /// Left uninterpreted so an unexpected scalar on an unrelated step cannot
+    /// abort the whole document — see [`resolve_timeout`].
+    #[serde(default, rename = "timeout-minutes")]
+    timeout_minutes: Option<serde_yml::Value>,
+}
+
+impl CiStep {
+    /// The step's identity in a report: its `id`, else its `name`, else its
+    /// position. Every step has one of the three.
+    fn label(&self, index: usize) -> String {
+        self.id
+            .clone()
+            .or_else(|| self.name.clone())
+            .unwrap_or_else(|| format!("steps[{index}]"))
+    }
+}
+
 /// A declared `timeout-minutes` as a literal minute count.
 ///
-/// GitHub accepts a number or a workflow expression here; `test-hole` uses an
-/// expression to budget each matrix leg separately. An expression cannot be
-/// compared against a sibling statically, so it is an error for a job in the
-/// class — but only there, which is why the value is interpreted at use rather
-/// than at deserialization.
+/// GitHub accepts a number or a workflow expression here. An expression cannot
+/// be compared against a sibling statically, so it is an error for a step in
+/// the class — but only there, which is why the value is interpreted at use
+/// rather than at deserialization.
 ///
 /// Classification is on the `${{` syntax, matching [`xtask_target`], not on
 /// which serde shape the scalar took: `"60"` is a quoted literal, not an
 /// expression.
-fn resolve_timeout(id: &str, value: &serde_yml::Value) -> Result<u64> {
+fn resolve_timeout(label: &str, value: &serde_yml::Value) -> Result<u64> {
     if let Some(n) = value.as_u64() {
         return Ok(n);
     }
     if let Some(s) = value.as_str() {
         if s.contains("${{") {
             bail!(
-                "job {id:?} declares timeout-minutes as the expression {s:?} — \
+                "step {label:?} declares timeout-minutes as the expression {s:?} — \
                  it cannot be compared against its siblings' budgets statically"
             );
         }
@@ -70,13 +96,7 @@ fn resolve_timeout(id: &str, value: &serde_yml::Value) -> Result<u64> {
             return Ok(n);
         }
     }
-    bail!("job {id:?} declares timeout-minutes as {value:?}, which is not a whole number of minutes")
-}
-
-#[derive(Deserialize)]
-struct CiStep {
-    #[serde(default)]
-    run: Option<String>,
+    bail!("step {label:?} declares timeout-minutes as {value:?}, which is not a whole number of minutes")
 }
 
 /// Does `cmd` assemble an installer package?
@@ -94,7 +114,7 @@ pub fn assembles_installer(cmd: &str) -> bool {
 
 /// The build.yaml target of a `cargo xtask run <target>` / `cargo xtask build
 /// <target>` command, if `cmd` is one. Both spellings enter the same cascade;
-/// `test-installer` uses `build`, `test-dmg-signing` uses `run`.
+/// the MSI step uses `build`, the DMG step `run`.
 ///
 /// Errors on a target name carrying a `${{ … }}` expression: it cannot be
 /// resolved against build.yaml statically, and silently treating it as
@@ -117,37 +137,68 @@ pub fn xtask_target(cmd: &str) -> Result<Option<&str>> {
     Ok(Some(target))
 }
 
-/// CI job id → declared `timeout-minutes`, for every job whose xtask cascade
-/// transitively assembles an installer package. A `None` value means the job
-/// declares no timeout at all (GitHub then applies its 6-hour default, which is
+/// (job id, step label) → declared `timeout-minutes`, for every step whose xtask
+/// cascade transitively assembles an installer package. A `None` value means
+/// the step declares no timeout at all (it then runs to the job wall, which is
 /// never what this class wants).
-pub fn installer_assembly_job_timeouts(ci_yaml: &str, manifest: &Manifest) -> Result<BTreeMap<String, Option<u64>>> {
+pub fn installer_assembly_step_timeouts(
+    ci_yaml: &str,
+    manifest: &Manifest,
+) -> Result<BTreeMap<(String, String), Option<u64>>> {
     let ci: CiYaml = serde_yml::from_str(ci_yaml).context("parsing ci.yaml")?;
     let mut out = BTreeMap::new();
 
-    for (id, job) in &ci.jobs {
-        let mut assembles = false;
-        for run in job.steps.iter().filter_map(|s| s.run.as_ref()) {
+    for (job_id, job) in &ci.jobs {
+        for (i, step) in job.steps.iter().enumerate() {
+            let Some(run) = &step.run else { continue };
+            let label = step.label(i);
+            let mut assembles = false;
             for cmd in split_commands(&join_line_continuations(run)) {
                 if command_reaches_installer(&cmd, manifest, &mut BTreeSet::new())
-                    .with_context(|| format!("in job {id:?}"))?
+                    .with_context(|| format!("in step {label:?} of job {job_id:?}"))?
                 {
                     assembles = true;
                 }
             }
+            if !assembles {
+                continue;
+            }
+            let minutes = step
+                .timeout_minutes
+                .as_ref()
+                .map(|v| resolve_timeout(&label, v))
+                .transpose()?;
+            out.insert((job_id.clone(), label), minutes);
         }
-        if !assembles {
-            continue;
-        }
-        let minutes = job
-            .timeout_minutes
-            .as_ref()
-            .map(|v| resolve_timeout(id, v))
-            .transpose()?;
-        out.insert(id.clone(), minutes);
     }
 
     Ok(out)
+}
+
+/// Labels of the steps of `job_id` that declare no literal `timeout-minutes` —
+/// absent, an expression, or not a whole number. A step with no bound of its
+/// own runs to the job wall, and a wall that fires destroys the step's log
+/// (#989). `uses:` steps count: they hang too.
+pub fn steps_without_literal_timeout(ci_yaml: &str, job_id: &str) -> Result<Vec<String>> {
+    let ci: CiYaml = serde_yml::from_str(ci_yaml).context("parsing ci.yaml")?;
+    let job = ci
+        .jobs
+        .get(job_id)
+        .with_context(|| format!("ci.yaml declares no job {job_id:?}"))?;
+
+    Ok(job
+        .steps
+        .iter()
+        .enumerate()
+        .filter(|(i, step)| {
+            let label = step.label(*i);
+            !step
+                .timeout_minutes
+                .as_ref()
+                .is_some_and(|v| resolve_timeout(&label, v).is_ok())
+        })
+        .map(|(i, step)| step.label(i))
+        .collect())
 }
 
 /// Does `cmd` — directly, or through the build.yaml target it invokes and that

@@ -27,7 +27,7 @@ jobs:
           cargo nextest run --no-default-features \\
             -E 'package(a) + package(b)'
 ";
-    let job = test_job(ci, "j").expect("analyze");
+    let job = test_job(ci, "j", None).expect("analyze");
     let cmds: Vec<&str> = job.runs.iter().map(|(_, c)| c.as_str()).collect();
     assert_eq!(
         cmds,
@@ -51,7 +51,7 @@ jobs:
       - name: root
         run: sudo env "PATH=$PATH" "HOME=$HOME" SKULD_LABELS=tun cargo nextest run -E 'package(a)'
 "#;
-    let job = test_job(ci, "j").expect("analyze");
+    let job = test_job(ci, "j", None).expect("analyze");
     assert_eq!(
         job.runs,
         vec![("root".into(), "cargo nextest run -E 'package(a)'".into())]
@@ -70,7 +70,7 @@ jobs:
       - name: s
         run: cargo nextest run --config-file=x.toml -E 'package(a)'
 ";
-    let job = test_job(ci, "j").expect("analyze");
+    let job = test_job(ci, "j", None).expect("analyze");
     assert_eq!(job.runs[0].1, "cargo nextest run --config-file=x.toml -E 'package(a)'");
 }
 
@@ -87,7 +87,7 @@ jobs:
       - name: build
         run: cargo nextest run --no-run -E 'package(a)'
 ";
-    assert!(test_job(ci, "j").expect("analyze").runs.is_empty());
+    assert!(test_job(ci, "j", None).expect("analyze").runs.is_empty());
 }
 
 /// Several nextest runs in one `run:` block each get their own entry rather than
@@ -104,7 +104,7 @@ jobs:
           cargo nextest run -E 'package(a)'
           cargo nextest run -E 'package(b)'
 ";
-    let job = test_job(ci, "j").expect("analyze");
+    let job = test_job(ci, "j", None).expect("analyze");
     assert_eq!(job.runs.len(), 2);
     assert_eq!(job.runs[0].1, "cargo nextest run -E 'package(a)'");
     assert_eq!(job.runs[1].1, "cargo nextest run -E 'package(b)'");
@@ -122,7 +122,7 @@ jobs:
         run: cargo nextest run -E 'package(a)'
       - run: cargo nextest run -E 'package(b)'
 ";
-    let job = test_job(ci, "j").expect("analyze");
+    let job = test_job(ci, "j", None).expect("analyze");
     assert_eq!(job.runs[0].0, "has-id");
     assert_eq!(job.runs[1].0, "steps[2]");
 }
@@ -138,7 +138,7 @@ jobs:
       - run: cargo xtask build tests
       - run: cargo nextest run -E 'package(a)'
 ";
-    assert_eq!(test_job(ci, "j").expect("analyze").target, "tests");
+    assert_eq!(test_job(ci, "j", None).expect("analyze").target, "tests");
 }
 
 /// Nothing ties the runs to a build.yaml target, so there is no defensible thing
@@ -151,7 +151,7 @@ jobs:
     steps:
       - run: cargo nextest run -E 'package(a)'
 ";
-    let err = test_job(ci, "j").unwrap_err();
+    let err = test_job(ci, "j", None).unwrap_err();
     assert!(
         format!("{err:#}").contains("no `cargo xtask"),
         "unexpected error: {err:#}"
@@ -168,13 +168,13 @@ jobs:
       - run: cargo xtask build other
       - run: cargo nextest run -E 'package(a)'
 ";
-    let err = test_job(ci, "j").unwrap_err();
+    let err = test_job(ci, "j", None).unwrap_err();
     assert!(format!("{err:#}").contains("ambiguous"), "unexpected error: {err:#}");
 }
 
 #[skuld::test]
 fn a_missing_job_is_an_error() {
-    let err = test_job("jobs:\n  j:\n    steps: []\n", "gone").unwrap_err();
+    let err = test_job("jobs:\n  j:\n    steps: []\n", "gone", None).unwrap_err();
     assert!(
         format!("{err:#}").contains("no job \"gone\""),
         "unexpected error: {err:#}"
@@ -222,7 +222,7 @@ jobs:
         (on_the_build_step, "\"CARGO_TARGET_DIR\""),
         (inline, "\"RUSTC_WRAPPER\""),
     ] {
-        let err = test_job(ci, "j").unwrap_err();
+        let err = test_job(ci, "j", None).unwrap_err();
         assert!(format!("{err:#}").contains(needle), "unexpected error: {err:#}");
     }
 }
@@ -240,7 +240,7 @@ jobs:
           SKULD_LABELS: "!tun"
         run: cargo nextest run -E 'package(a)'
 "#;
-    assert_eq!(test_job(ci, "j").expect("analyze").runs.len(), 1);
+    assert_eq!(test_job(ci, "j", None).expect("analyze").runs.len(), 1);
 }
 
 /// `NEXTEST_PROFILE` picks a per-lane nextest profile (bindreams/hole#999's
@@ -258,7 +258,7 @@ jobs:
           NEXTEST_PROFILE: non-tun
         run: cargo nextest run -E 'package(a)'
 "#;
-    assert_eq!(test_job(step_level, "j").expect("analyze").runs.len(), 1);
+    assert_eq!(test_job(step_level, "j", None).expect("analyze").runs.len(), 1);
 
     let inline = r#"
 jobs:
@@ -269,7 +269,7 @@ jobs:
         run: sudo env "PATH=$PATH" "HOME=$HOME" NEXTEST_PROFILE=tun cargo nextest run -E 'package(a)'
 "#;
     assert_eq!(
-        test_job(inline, "j").expect("analyze").runs,
+        test_job(inline, "j", None).expect("analyze").runs,
         vec![("root".into(), "cargo nextest run -E 'package(a)'".into())]
     );
 }
@@ -343,16 +343,62 @@ fn a_missing_target_is_an_error() {
     );
 }
 
+// ===== step_prefix ===================================================================================================
+
+#[skuld::test]
+fn test_job_ignores_xtask_steps_outside_the_prefix() {
+    let ci = r"
+jobs:
+  ci:
+    steps:
+      - id: test-plugin-e2e
+        run: cargo xtask run plugin-e2e-tests
+      - id: hole-build
+        run: cargo xtask build hole-tests
+      - id: hole-test
+        run: cargo nextest run -E 'package(a)'
+";
+    let job = test_job(ci, "ci", Some("hole-")).expect("analyze");
+    assert_eq!(job.target, "hole-tests");
+    assert_eq!(job.runs.len(), 1);
+
+    // Unscoped, the plugin step is a second compile target, as before.
+    let err = test_job(ci, "ci", None).unwrap_err();
+    assert!(format!("{err:#}").contains("builds both"), "unexpected error: {err:#}");
+}
+
+#[skuld::test]
+fn two_build_steps_inside_the_prefix_are_still_ambiguous() {
+    let ci = r"
+jobs:
+  ci:
+    steps:
+      - id: hole-build
+        run: cargo xtask build hole-tests
+      - id: hole-other
+        run: cargo xtask run other
+";
+    let err = test_job(ci, "ci", Some("hole-")).unwrap_err();
+    assert!(format!("{err:#}").contains("builds both"), "unexpected error: {err:#}");
+}
+
+#[skuld::test]
+fn an_unknown_prefix_is_an_error_not_an_empty_pass() {
+    let ci = "jobs:\n  ci:\n    steps:\n      - id: a\n        run: cargo xtask build t\n";
+    let err = test_job(ci, "ci", Some("hole-")).unwrap_err();
+    assert!(format!("{err:#}").contains("hole-"), "unexpected error: {err:#}");
+}
+
 // ===== conformance ===================================================================================================
 
-/// Steps of `ci.yaml`'s `test-hole` job that we require to be nextest runs.
+/// `hole-` steps of `ci.yaml`'s `ci` job that we require to be nextest runs.
 const TEST_HOLE_RUN_STEPS: [&str; 3] = [
     "Test (non-TUN)",
     "Test (TUN, runs last for #200)",
     "Test (TUN, macOS — root for pfctl)",
 ];
 
-/// Every nextest run in `ci.yaml`'s `test-hole` job invokes exactly the command
+/// Every nextest run in `ci.yaml`'s `hole-` steps invokes exactly the command
 /// build.yaml's `hole-tests` target runs — see [`crate::ci_nextest_parity`] for why.
 ///
 /// `hole-tests` is read off the job's build step rather than assumed, and pinned
@@ -365,10 +411,10 @@ fn ci_test_hole_steps_match_the_hole_tests_target() {
         .expect("parse build.yaml");
     let ci_yaml = fs::read_to_string(root.join(".github/workflows/ci.yaml")).expect("read ci.yaml");
 
-    let job = test_job(&ci_yaml, "test-hole").expect("analyze ci.yaml");
+    let job = test_job(&ci_yaml, "ci", Some("hole-")).expect("analyze ci.yaml");
     assert_eq!(
         job.target, "hole-tests",
-        "ci.yaml test-hole now compiles a different build.yaml target"
+        "ci.yaml's hole- steps now compile a different build.yaml target"
     );
     let expected = target_nextest_run(&manifest, &job.target).expect("resolve the compiled target");
 
@@ -378,14 +424,14 @@ fn ci_test_hole_steps_match_the_hole_tests_target() {
     for step in TEST_HOLE_RUN_STEPS {
         assert!(
             labels.contains(&step),
-            "ci.yaml test-hole step {step:?} no longer resolves as a nextest run (found {labels:?})"
+            "ci.yaml hole- step {step:?} no longer resolves as a nextest run (found {labels:?})"
         );
     }
 
     for (label, cmd) in &job.runs {
         assert_eq!(
             cmd, &expected,
-            "ci.yaml test-hole step {label:?} must run exactly what build.yaml's {:?} target runs \
+            "ci.yaml hole- step {label:?} must run exactly what build.yaml's {:?} target runs \
              (see module docs for why)",
             job.target
         );

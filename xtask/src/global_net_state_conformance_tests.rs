@@ -115,7 +115,7 @@ jobs:
     steps:
       - run: echo hello
 ";
-    let err = job_list_template(ci, &empty_manifest(), "test-hole").expect_err("should error");
+    let err = job_list_template(ci, &empty_manifest(), "test-hole", None).expect_err("should error");
     assert!(err.to_string().contains("test-hole"), "{err}");
 }
 
@@ -128,7 +128,7 @@ jobs:
       - run: cargo nextest run -p a -E 'package(a)'
       - run: cargo nextest run -p a -E 'package(b)'
 ";
-    let err = job_list_template(ci, &empty_manifest(), "test-hole").expect_err("should error on -E divergence");
+    let err = job_list_template(ci, &empty_manifest(), "test-hole", None).expect_err("should error on -E divergence");
     assert!(
         err.to_string().contains("test-hole") || err.to_string().to_lowercase().contains("diverge"),
         "{err}"
@@ -144,7 +144,7 @@ jobs:
       - run: cargo nextest run -p a -E 'package(a)'
       - run: cargo nextest run -p a -E 'package(a)'
 ";
-    let template = job_list_template(ci, &empty_manifest(), "test-hole").expect("agree");
+    let template = job_list_template(ci, &empty_manifest(), "test-hole", None).expect("agree");
     assert_eq!(
         template,
         argv(&[
@@ -159,6 +159,33 @@ jobs:
             "package(a)"
         ])
     );
+}
+
+const MIXED_CI: &str = r"
+jobs:
+  ci:
+    steps:
+      - id: test-garter
+        run: cargo-nextest nextest run --archive-file x.tar.zst -E 'package(garter)'
+      - id: hole-test-a
+        run: cargo nextest run -p a -E 'package(a)'
+      - id: hole-test-b
+        run: cargo nextest run -p a -E 'package(a)'
+";
+
+#[skuld::test]
+fn list_template_ignores_other_argv_shapes_outside_the_prefix() {
+    let template = job_list_template(MIXED_CI, &empty_manifest(), "ci", Some("hole-")).expect("agree in scope");
+    assert_eq!(template.last().map(String::as_str), Some("package(a)"));
+
+    let err = job_list_template(MIXED_CI, &empty_manifest(), "ci", None).expect_err("unscoped, shapes diverge");
+    assert!(err.to_string().contains("argv shape"), "{err}");
+}
+
+#[skuld::test]
+fn an_unknown_prefix_is_an_error_not_an_empty_pass() {
+    let err = job_list_template(MIXED_CI, &empty_manifest(), "ci", Some("nope-")).expect_err("should error");
+    assert!(err.to_string().contains("nope-"), "{err}");
 }
 
 // ===== narrow_filter =================================================================================================
@@ -641,7 +668,7 @@ fn verify_with_records_the_label_matched_set_not_the_name_matched_one() {
     };
 
     let record_path = dir.path().join("expected.json");
-    verify_with(dir.path(), "test-hole", Some(Path::new("expected.json")), list).expect("conformant");
+    verify_with(dir.path(), "test-hole", None, Some(Path::new("expected.json")), list).expect("conformant");
 
     let recorded = read_expectation(&record_path).expect("read back");
     assert!(
@@ -662,7 +689,7 @@ fn verify_with_writes_nothing_when_record_is_none() {
         Ok(binmap(&[("pkg::bin_a", &["t1"])]))
     };
 
-    verify_with(dir.path(), "test-hole", None, list).expect("conformant");
+    verify_with(dir.path(), "test-hole", None, None, list).expect("conformant");
 
     assert!(!dir.path().join("expected.json").exists());
 }
@@ -683,7 +710,20 @@ fn verify_with_writes_nothing_when_the_conformance_check_fails() {
     };
 
     let record_path = dir.path().join("expected.json");
-    verify_with(dir.path(), "test-hole", Some(Path::new("expected.json")), list).expect_err("mismatch should fail");
+    verify_with(dir.path(), "test-hole", None, Some(Path::new("expected.json")), list)
+        .expect_err("mismatch should fail");
 
     assert!(!record_path.exists());
+}
+
+/// The real ci.yaml's `hole-` nextest steps share one list-argv shape, which is
+/// what `verify-global-net-state-labels` derives its `nextest list` from.
+#[skuld::test]
+fn ci_hole_lanes_share_one_list_template() {
+    let root = crate::repo_root().expect("repo root");
+    let ci_yaml = std::fs::read_to_string(root.join(".github/workflows/ci.yaml")).expect("read ci.yaml");
+    let manifest = Manifest::parse(&std::fs::read_to_string(root.join("build.yaml")).expect("read build.yaml"))
+        .expect("parse build.yaml");
+    let template = job_list_template(&ci_yaml, &manifest, "ci", Some("hole-")).expect("one shared shape");
+    assert_eq!(&template[..3], ["cargo", "nextest", "list"]);
 }

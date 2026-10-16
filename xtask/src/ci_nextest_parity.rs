@@ -1,8 +1,9 @@
-//! Does a `.github/workflows/ci.yaml` test job run the binaries it compiled?
+//! Does a `.github/workflows/ci.yaml` test lane run the binaries it compiled?
 //!
 //! Backs the `ci_test_hole_steps_match_the_hole_tests_target` conformance test.
-//! `test-hole` compiles once via `cargo xtask build hole-tests`, then its nextest
-//! steps are only supposed to re-execute those binaries. Cargo keys that reuse on
+//! The `hole-` steps of the `ci` job compile once via `cargo xtask build
+//! hole-tests`, then their nextest steps are only supposed to re-execute those
+//! binaries. Cargo keys that reuse on
 //! the resolved feature set, so a step missing one `--features` flag rebuilds the
 //! whole workspace instead — silently, staying green at roughly twice the wall
 //! clock, which is how #720 went unnoticed.
@@ -27,7 +28,7 @@ use indexmap::IndexMap;
 use serde::Deserialize;
 
 use crate::ci_coverage::{
-    is_nextest_run, join_line_continuations, split_commands, step_command, step_environment, unquote,
+    is_nextest_run, join_line_continuations, scoped_steps, split_commands, step_command, step_environment, unquote,
 };
 use crate::ci_timeouts::xtask_target;
 use crate::manifest::Manifest;
@@ -86,11 +87,12 @@ pub struct TestJob {
 }
 
 /// Resolve `job_id`'s chain: the single build.yaml target it compiles, and every
-/// nextest RUN command it then executes.
+/// nextest RUN command it then executes, over the steps `step_prefix` selects
+/// (see [`scoped_steps`]).
 ///
 /// `--no-run` compiles are not runs — compiling is a separate operation, stated
 /// separately in build.yaml as `build:`.
-pub fn test_job(ci_yaml: &str, job_id: &str) -> Result<TestJob> {
+pub fn test_job(ci_yaml: &str, job_id: &str, step_prefix: Option<&str>) -> Result<TestJob> {
     let ci: CiYaml = serde_yml::from_str(ci_yaml).context("parsing ci.yaml")?;
     let job = ci
         .jobs
@@ -100,7 +102,8 @@ pub fn test_job(ci_yaml: &str, job_id: &str) -> Result<TestJob> {
     let mut target: Option<String> = None;
     let mut runs = Vec::new();
 
-    for (i, step) in job.steps.iter().enumerate() {
+    let in_scope = scoped_steps(job_id, &job.steps, |s| s.id.as_deref(), step_prefix)?;
+    for (i, step) in in_scope {
         let Some(run) = &step.run else { continue };
         let label = step_label(step, i);
         for cmd in split_commands(&join_line_continuations(run)) {

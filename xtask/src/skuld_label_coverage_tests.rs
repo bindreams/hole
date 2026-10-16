@@ -4,6 +4,7 @@
 //! [`on_side_is_nonempty`] (bindreams/hole#894).
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
 
 use crate::skuld_label_coverage::{
     extract_lane_candidates, matching_test_names, on_side_is_nonempty, pick_complementary_pair, selects_nothing,
@@ -58,7 +59,7 @@ jobs:
           sudo env "PATH=$PATH" "HOME=$HOME" SKULD_LABELS=tun
           cargo nextest run --no-default-features -E 'package(hole) + package(dump)'
 "#;
-    let candidates = extract_lane_candidates(ci, "test-hole").expect("extract");
+    let candidates = extract_lane_candidates(ci, "test-hole", None).expect("extract");
     assert_eq!(candidates.len(), 3);
 
     let expected_list_command = argv(&[
@@ -105,7 +106,7 @@ jobs:
             --workspace-remap "/w" \
             -E 'package(garter) + package(garter-bin)'
 "#;
-    let candidates = extract_lane_candidates(ci, "test-garter").expect("extract");
+    let candidates = extract_lane_candidates(ci, "test-garter", None).expect("extract");
     assert_eq!(candidates.len(), 1);
     assert_eq!(candidates[0].packages, set(&["garter", "garter-bin"]));
     assert_eq!(
@@ -140,7 +141,7 @@ jobs:
           SKULD_LABELS: "!tun"
         run: cargo nextest run --no-default-features --no-fail-fast -E 'package(hole) + package(dump)'
 "#;
-    let candidates = extract_lane_candidates(ci, "test-hole").expect("extract");
+    let candidates = extract_lane_candidates(ci, "test-hole", None).expect("extract");
     assert_eq!(candidates.len(), 1);
     assert_eq!(
         candidates[0].list_command,
@@ -169,7 +170,7 @@ jobs:
       - name: clippy
         run: cargo clippy -p hole
 "#;
-    let candidates = extract_lane_candidates(ci, "test-hole").expect("extract");
+    let candidates = extract_lane_candidates(ci, "test-hole", None).expect("extract");
     assert!(candidates.is_empty());
 }
 
@@ -182,14 +183,57 @@ jobs:
       - name: unlabeled
         run: cargo nextest run -E 'package(hole)'
 "#;
-    let err = extract_lane_candidates(ci, "test-hole").expect_err("should error");
+    let err = extract_lane_candidates(ci, "test-hole", None).expect_err("should error");
     assert!(err.to_string().contains("no SKULD_LABELS"), "{err}");
 }
 
 #[skuld::test]
 fn unknown_job_is_an_error() {
     let ci = "jobs:\n  other:\n    steps: []\n";
-    assert!(extract_lane_candidates(ci, "test-hole").is_err());
+    assert!(extract_lane_candidates(ci, "test-hole", None).is_err());
+}
+
+/// One job holds archive-lane nextest steps (no `SKULD_LABELS`) beside the
+/// labelled `hole-` lanes.
+const MIXED_CI: &str = r#"
+jobs:
+  ci:
+    steps:
+      - id: test-garter
+        run: cargo nextest run -E 'package(garter)'
+      - id: hole-test-non-tun
+        env:
+          SKULD_LABELS: "!tun"
+        run: cargo nextest run -E 'package(hole)'
+"#;
+
+#[skuld::test]
+fn lane_extraction_ignores_unlabelled_nextest_steps_outside_the_prefix() {
+    let candidates = extract_lane_candidates(MIXED_CI, "ci", Some("hole-")).expect("extract");
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(candidates[0].label_value, "!tun");
+
+    let err = extract_lane_candidates(MIXED_CI, "ci", None).expect_err("unscoped, the archive step has no label");
+    assert!(err.to_string().contains("no SKULD_LABELS"), "{err}");
+}
+
+#[skuld::test]
+fn an_unlabelled_nextest_step_inside_the_prefix_is_still_an_error() {
+    let ci = r#"
+jobs:
+  ci:
+    steps:
+      - id: hole-test
+        run: cargo nextest run -E 'package(hole)'
+"#;
+    let err = extract_lane_candidates(ci, "ci", Some("hole-")).expect_err("should error");
+    assert!(err.to_string().contains("no SKULD_LABELS"), "{err}");
+}
+
+#[skuld::test]
+fn an_unknown_prefix_is_an_error_not_an_empty_pass() {
+    let err = extract_lane_candidates(MIXED_CI, "ci", Some("nope-")).expect_err("should error");
+    assert!(err.to_string().contains("nope-"), "{err}");
 }
 
 // ===== pick_complementary_pair =======================================================================================
@@ -468,4 +512,19 @@ fn on_side_is_nonempty_false_when_every_binary_is_empty() {
 
     let no_binaries_at_all: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     assert!(!on_side_is_nonempty(&no_binaries_at_all));
+}
+
+// ===== conformance ===================================================================================================
+
+/// The real ci.yaml's `hole-` lanes still form a complementary pair, read the
+/// way `verify-skuld-label-coverage` reads them (default `--job ci --step-prefix
+/// hole-`). Needs no nextest: this is the static half of the guard, so a renamed
+/// step id or a drifted label fails here, before the macOS-only live check runs.
+#[skuld::test]
+fn ci_hole_lanes_form_a_complementary_label_pair() {
+    let root = crate::repo_root().expect("repo root");
+    let ci_yaml = fs::read_to_string(root.join(".github/workflows/ci.yaml")).expect("read ci.yaml");
+    let candidates = extract_lane_candidates(&ci_yaml, "ci", Some("hole-")).expect("extract");
+    let (off, on) = pick_complementary_pair(&candidates).expect("complementary pair");
+    assert_eq!((off.label_value.as_str(), on.label_value.as_str()), ("!tun", "tun"));
 }

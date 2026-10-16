@@ -17,6 +17,7 @@ pub mod bindir;
 pub mod check_vendoring_integrity;
 pub mod ci_coverage;
 pub mod ci_nextest_parity;
+pub mod ci_platform_coverage;
 pub mod ci_timeouts;
 pub mod ci_toolchain_pins;
 // macOS-only: renders with the system font via the Typst library (a macOS-only
@@ -33,6 +34,7 @@ pub mod golangci_lint;
 pub mod interrupt;
 pub mod manifest;
 pub mod orchestrate;
+pub mod prek_split;
 pub mod pull_subrepo;
 pub mod schemars_pin;
 pub mod skuld_label_coverage;
@@ -56,6 +58,9 @@ mod ci_coverage_tests;
 #[cfg(test)]
 #[path = "ci_nextest_parity_tests.rs"]
 mod ci_nextest_parity_tests;
+#[cfg(test)]
+#[path = "ci_platform_coverage_tests.rs"]
+mod ci_platform_coverage_tests;
 #[cfg(test)]
 #[path = "ci_timeouts_tests.rs"]
 mod ci_timeouts_tests;
@@ -92,6 +97,9 @@ mod manifest_tests;
 #[cfg(test)]
 #[path = "orchestrate_tests.rs"]
 mod orchestrate_tests;
+#[cfg(test)]
+#[path = "prek_split_tests.rs"]
+mod prek_split_tests;
 #[cfg(test)]
 #[path = "pull_subrepo_tests.rs"]
 mod pull_subrepo_tests;
@@ -349,20 +357,28 @@ pub enum Command {
     /// (`"!tun"` / `"tun"`) parses as exact complements and that each side
     /// still selects something — see `xtask::skuld_label_coverage`.
     VerifySkuldLabelCoverage {
-        /// ci.yaml job id to check (its steps must include exactly one
-        /// complementary `SKULD_LABELS` pair).
-        #[arg(long, default_value = "test-hole")]
+        /// ci.yaml job id to check (its in-scope steps must include exactly
+        /// one complementary `SKULD_LABELS` pair).
+        #[arg(long, default_value = "ci")]
         job: String,
+        /// Only steps whose `id` starts with this are in scope; a prefix that
+        /// matches no step is an error.
+        #[arg(long, default_value = "hole-")]
+        step_prefix: String,
     },
     /// Verify that `.config/nextest.toml`'s `global_net_state` test-group
     /// name-substring filter and the `global_net_state` skuld label select
     /// the exact same live tests, and that the group's `max-threads` is
     /// still `1` — see `xtask::global_net_state_conformance` (bindreams/hole#894).
     VerifyGlobalNetStateLabels {
-        /// ci.yaml job id to check (its steps must include exactly one
-        /// test-running nextest command shape).
-        #[arg(long, default_value = "test-hole")]
+        /// ci.yaml job id to check (its in-scope steps must include exactly
+        /// one test-running nextest command shape).
+        #[arg(long, default_value = "ci")]
         job: String,
+        /// Only steps whose `id` starts with this are in scope; a prefix that
+        /// matches no step is an error.
+        #[arg(long, default_value = "hole-")]
+        step_prefix: String,
         /// Also record the verified group membership here (relative to the
         /// repo root unless absolute), for a later
         /// `verify-global-net-state-executed` step in the same job to read
@@ -472,10 +488,14 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             println!("{}", xtask_lib::asset::host_update_asset_suffix());
             Ok(())
         }
-        Command::VerifySkuldLabelCoverage { job } => skuld_label_coverage::verify(&repo_root()?, &job),
-        Command::VerifyGlobalNetStateLabels { job, record } => {
-            global_net_state_conformance::verify(&repo_root()?, &job, record.as_deref())
+        Command::VerifySkuldLabelCoverage { job, step_prefix } => {
+            skuld_label_coverage::verify(&repo_root()?, &job, Some(&step_prefix))
         }
+        Command::VerifyGlobalNetStateLabels {
+            job,
+            step_prefix,
+            record,
+        } => global_net_state_conformance::verify(&repo_root()?, &job, Some(&step_prefix), record.as_deref()),
         Command::VerifyGlobalNetStateExecuted { expected, junits } => {
             global_net_state_conformance::verify_executed(&repo_root()?, &expected, &junits)
         }
