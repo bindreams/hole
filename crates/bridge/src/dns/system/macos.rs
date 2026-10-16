@@ -174,13 +174,29 @@ impl MacDnsBackend for Networksetup {
     fn flush(&self) -> io::Result<()> {
         // Fire-and-forget the cache flush. `dscacheutil` is fast; the
         // SIGHUP to mDNSResponder is a courtesy notification.
-        let _ = SystemTool::Dscacheutil
-            .command()
-            .and_then(|mut c| c.arg("-flushcache").status());
-        let _ = SystemTool::Killall
-            .command()
-            .and_then(|mut c| c.args(["-HUP", "mDNSResponder"]).status());
+        log_flush_step(
+            SystemTool::Dscacheutil,
+            SystemTool::Dscacheutil
+                .command()
+                .and_then(|mut c| c.arg("-flushcache").status()),
+        );
+        log_flush_step(
+            SystemTool::Killall,
+            SystemTool::Killall
+                .command()
+                .and_then(|mut c| c.args(["-HUP", "mDNSResponder"]).status()),
+        );
         Ok(())
+    }
+}
+
+/// Warn when a flush step could not be built or spawned, or exited non-zero.
+/// The flush stays best-effort, so nothing is returned.
+fn log_flush_step(tool: SystemTool, outcome: io::Result<std::process::ExitStatus>) {
+    match outcome {
+        Ok(status) if status.success() => {}
+        Ok(status) => tracing::warn!(tool = tool.name(), %status, "DNS cache flush step exited unsuccessfully"),
+        Err(error) => tracing::warn!(tool = tool.name(), %error, "DNS cache flush step failed to run"),
     }
 }
 
