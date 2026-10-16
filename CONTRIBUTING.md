@@ -2753,6 +2753,34 @@ cargo test --workspace --no-default-features     # plain cargo equivalent
 npm run test:e2e                                 # E2E (requires a release build)
 ```
 
+### CI layout
+
+`.github/workflows/ci.yaml` has one job, `ci`, run as a six-leg matrix
+(`windows`, `darwin`, `linux` x `amd64`, `arm64`); each leg builds, lints and
+tests what its platform ships, so a PR costs six runners, two of them macOS. A
+leg provisions once, then runs the lanes its matrix flags select (`hole`,
+`installer`, `dmg`, ...) as steps in a fixed order on one target dir. Every lane
+step runs under `!cancelled()` so one failure hides nothing, carries its own
+literal `timeout-minutes`, and gates the merge: there is no `continue-on-error`,
+and a rerun repeats the platform's whole job.
+
+- **Step ids are API.** The xtask audits address lanes by id: `hole-*` is the
+  Hole test lane (`--step-prefix` on `verify-skuld-label-coverage` and
+  `verify-global-net-state-labels`, default `hole-`), `installer-*` and `dmg`
+  assemble an installer. A prefix that matches no step is an error.
+- **Order is enforced.** Steps that rebuild the ex-ray/galoshes sidecars (plugin
+  e2e, the MSI and DMG builds) precede `hole-build`, because the sidecars are
+  `rerun-if-changed` inputs of the `hole` build script. On Windows nothing that
+  uses loopback follows the TUN lane (#200); on macOS the root TUN lane is the
+  last step that runs a toolchain. See `xtask/src/ci_platform_coverage.rs`.
+- **Lint is split by host dependence.** `cargo xtask run prek-portable` runs the
+  hooks whose verdict is the same on any host, once, in linux/amd64;
+  `prek-host-bound` runs the rest (golangci-lint) on every leg. Every hook in
+  `prek.toml` is classified in `xtask/src/prek_split_tests.rs`, with evidence; a
+  new hook fails that test until it is.
+- **Required checks** are the six `Build, lint, test (<os>/<arch>)` contexts
+  plus `Validate PR title`.
+
 ### Avoiding Windows Firewall prompts
 
 Bridge tests bind a TCP listener on all interfaces, so Windows Firewall prompts
@@ -2798,8 +2826,8 @@ through these IN ORDER before proposing any timeout bump:
 **Do NOT:** bump timeouts in `server_test_tests.rs` before steps 1–5; mark tests
 `#[cfg_attr(windows, ignore)]`; add `--test-threads=1`; serialize via bare
 `#[skuld::test(serial)]` (use a fixture/resource label); or add per-test
-timeouts. Job-level timeouts (`build` 30m, `test-hole` 20m, `test-garter`/
-`test-galoshes` 10m) are the only global timeouts.
+timeouts. The per-step `timeout-minutes` of `ci.yaml` (every step declares a
+literal one) and the per-leg job wall are the only global timeouts.
 
 ### Known coverage gap: macOS reopen
 
@@ -2843,10 +2871,10 @@ Spotlight "Hole" must reveal it.
   no runnable tests — get an `UNTESTED_IN_CI` entry with a reason. (#526) A
   general per-crate-per-platform version of this guard (asserting non-zero test
   *counts*, not just presence) was found to be undetectable at package
-  granularity — every `test-hole` package already has ungated tests on every
+  granularity — every package of the `hole-` CI lane already has ungated tests on every
   platform it runs on — and was not built (#894). In its place,
   `skuld_label_coverage::verify` asserts the `tun` skuld label's live listing
-  for `test-hole` is non-empty on the platform running it, catching the one
+  for the `hole-` CI lane is non-empty on the platform running it, catching the one
   demonstrated regression class (a platform's whole privileged/TUN lane
   silently going empty).
 - **`global_net_state` label conformance** — `.config/nextest.toml`'s
@@ -2858,7 +2886,7 @@ Spotlight "Hole" must reveal it.
   checking live that both select the exact same tests and that the group's
   `max-threads` is still `1` (#894). It does not catch a higher-precedence
   `[[profile.default.overrides]]` entry stealing these tests into a different
-  group, and its universe is `test-hole`'s package set even though the
+  group, and its universe is the `hole-` lane's package set even though the
   nextest.toml filter applies workspace-wide.
 - **`global_net_state` execution proof** — membership being correct still says
   nothing about whether those tests *ran*; a job that silently executed zero of

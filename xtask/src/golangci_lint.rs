@@ -5,8 +5,8 @@
 //! via its v2 `formatters` section). The `go-fmt` / `go-lint` prek hooks in
 //! `prek.toml` reach the binary through this subcommand, so provisioning it
 //! through `cargo xtask deps` makes it available identically at pre-commit and
-//! in CI (CI's `Lint` job runs `setup-build` → `cargo xtask deps` →
-//! `cargo xtask run prek`). No `go install` and no PATH dependency.
+//! in CI (every CI leg runs `setup-build` → `cargo xtask deps`, then the lint
+//! steps `cargo xtask run prek-portable` / `prek-host-bound`). No `go install` and no PATH dependency.
 //!
 //! Mirrors `wintun.rs`: pin a version + per-platform archive SHA256, download
 //! via `ureq`, verify, extract the binary into

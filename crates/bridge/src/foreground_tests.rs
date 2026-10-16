@@ -363,7 +363,7 @@ fn ctrl_break_resolves_shutdown_signal() {
 // after is non-fatal and is observed by the returned future — deterministic,
 // no spawn/poll race (a prior spawn+yield_now form raced and killed the test
 // process with SIGTERM's default disposition on iteration 0). macOS-gated to
-// match libc's dependency gating; test-hole's only POSIX hosts are macOS, and
+// match libc's dependency gating; the Hole test lane's only POSIX hosts are macOS, and
 // nextest isolates each test in its own process so the raise can't disturb
 // siblings.
 #[cfg(target_os = "macos")]

@@ -424,8 +424,8 @@ pub(crate) fn read_module_path(go_mod_path: &Path) -> Result<String> {
         .ok_or_else(|| anyhow::anyhow!("{} has no `module` line", go_mod_path.display()))
 }
 
-/// Matches `build.yaml`'s `ex-ray-tests` target exactly (what `ci.yaml`'s
-/// "Test ex-ray (Go)" job runs): `crates/ex-ray`'s own `go test ./...`,
+/// Matches `build.yaml`'s `ex-ray-tests` target exactly (what ci.yaml's
+/// `test-ex-ray-ech` step runs): `crates/ex-ray`'s own `go test ./...`,
 /// plus a scoped `go test` inside `crates/ex-ray/third_party/v2ray-core`
 /// specifically. Both commands are unconditional in build.yaml — this is
 /// the single whole-crate CI test target, run identically regardless of

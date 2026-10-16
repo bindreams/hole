@@ -46,8 +46,8 @@
 //! costs a noisy reopened PR — never a broken build, and never a shipped
 //! defect. Guarding the guard was the part of this that needed to stop.
 //!
-//! `.github/renovate.json` is still schema-validated — the `Validate renovate
-//! config` CI job runs `renovate-config-validator --strict` against it — so a
+//! `.github/renovate.json` is still schema-validated — the `renovate-config`
+//! CI step runs `renovate-config-validator --strict` against it — so a
 //! typo that Renovate's schema itself rejects is still caught. What is gone is
 //! this module deciding, on Renovate's behalf, whether a *schema-valid* rule
 //! would actually reach `schemars`.
@@ -102,7 +102,7 @@
 //!   [`check_renovate_boundary`]), and runs where a registry exists: the
 //!   `check-schemars-pin` prek hook, which `prek.toml` gates by `files` to
 //!   commits touching any of the four files this check reads — and
-//!   unconditionally in the `Lint` CI job, which runs prek `--all-files`.
+//!   unconditionally in the `lint` CI step, which runs prek `--all-files`.
 //!
 //! Nothing is skipped: each lane runs every check it can source data for, and
 //! the declared-requirement check fails loudly rather than passing when
