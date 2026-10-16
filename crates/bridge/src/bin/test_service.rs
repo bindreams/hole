@@ -12,9 +12,10 @@
 //! - `--release-event <name>`: on STOP, hold until the named event is signalled,
 //!   then report STOPPED.
 //! - `--on-stop <stop-pending|stay-running>`: what the held service reports on
-//!   STOP. `stop-pending` (the default) reports STOP_PENDING, which makes the
-//!   SCM refuse further controls; `stay-running` reports nothing, so the SCM
-//!   still sees RUNNING with STOP accepted and delivers every later control.
+//!   STOP. `stop-pending` (the default) reports STOP_PENDING; `stay-running`
+//!   reports nothing, so the service still reports RUNNING with STOP accepted.
+//!   The SCM refuses later controls in both cases (measured; see
+//!   `measure_controls_after_first_stop`).
 
 #[cfg(target_os = "windows")]
 use std::ffi::OsString;

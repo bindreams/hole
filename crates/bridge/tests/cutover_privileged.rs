@@ -220,6 +220,16 @@ impl OnStop {
             OnStop::StayRunning => "stay-running",
         }
     }
+
+    /// The state the SCM must answer the first Stop with, where the handler
+    /// decides it. A handler that reports nothing leaves it to the SCM, which
+    /// is what the measurement prints.
+    fn first_stop_state(self) -> Option<windows::Win32::System::Services::SERVICE_STATUS_CURRENT_STATE> {
+        match self {
+            OnStop::ReportStopPending => Some(windows::Win32::System::Services::SERVICE_STOP_PENDING),
+            OnStop::StayRunning => None,
+        }
+    }
 }
 
 /// What the SCM delivered to the throwaway service after its first Stop, and
@@ -374,29 +384,35 @@ fn deliver_controls_after_first_stop(on_stop: OnStop) -> Delivery {
 }
 
 /// Which controls the SCM delivers to a service that already handled Stop, and
-/// that each one reaches the handler: `windows-service` frees its handler
-/// closure on the first Stop while the SCM keeps the pointer, so a later
+/// that each delivered one reaches the handler: `windows-service` frees its
+/// handler closure on the first Stop while the SCM keeps the pointer, so a later
 /// control would read freed memory.
 ///
-/// Here the service reports STOP_PENDING from its handler. The SCM's answer to
-/// each control is printed (the lane keeps this test's output): that is the
-/// measurement of what the SCM delivers to a stopping service. It refuses both
-/// later controls, so this case alone cannot catch the defect; see
-/// `..._reach_the_handler_while_the_service_is_running`.
+/// The SCM's answer to each later control is printed (the lane keeps this test's
+/// output): that line is the measurement. Measured on windows-latest: the SCM
+/// refuses an Interrogate and a second Stop after the first Stop
+/// (`ERROR_SERVICE_CANNOT_ACCEPT_CTRL`) whether the service reported
+/// STOP_PENDING or kept reporting RUNNING, so no `ControlService` call reaches
+/// the handler after the first Stop and these cases cannot catch the defect.
+/// `service_ctrl_tests::handler_survives_every_control_the_scm_can_send_after_a_stop`
+/// and the clippy bans on the freeing registration paths pin the fix instead.
 #[cfg(target_os = "windows")]
-#[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
-fn cutover_global_net_state_service_controls_after_stop_reach_the_handler() {
-    use windows::Win32::System::Services::{SERVICE_STATUS, SERVICE_STOPPED, SERVICE_STOP_PENDING};
+fn measure_controls_after_first_stop(on_stop: OnStop) {
+    use windows::Win32::System::Services::{SERVICE_STATUS, SERVICE_STOPPED};
 
-    let delivery = deliver_controls_after_first_stop(OnStop::ReportStopPending);
+    let delivery = deliver_controls_after_first_stop(on_stop);
 
-    assert_eq!(delivery.first_stop.dwCurrentState, SERVICE_STOP_PENDING);
+    if let Some(state) = on_stop.first_stop_state() {
+        assert_eq!(delivery.first_stop.dwCurrentState, state);
+    }
     let describe = |result: &Result<SERVICE_STATUS, windows::core::Error>| match result {
         Ok(status) => format!("delivered (state {})", status.dwCurrentState.0),
         Err(e) => format!("refused by the SCM ({e})"),
     };
     eprintln!(
-        "SCM controls after Stop, service in STOP_PENDING: Interrogate -> {}; second Stop -> {}",
+        "SCM controls after Stop, service {} (first Stop answered state {}): Interrogate -> {}; second Stop -> {}",
+        on_stop.flag_value(),
+        delivery.first_stop.dwCurrentState.0,
         describe(&delivery.interrogate),
         describe(&delivery.second_stop),
     );
@@ -419,34 +435,21 @@ fn cutover_global_net_state_service_controls_after_stop_reach_the_handler() {
     );
 }
 
-/// The case the defect is reachable in: the handler takes a Stop without
-/// reporting STOP_PENDING (as when its report fails), so the SCM still sees
-/// RUNNING with STOP accepted and delivers a second Stop and an Interrogate.
-/// `windows-service` freed the handler on the first Stop, so both would read
-/// freed memory: the handler's captured log path is garbage, the service
-/// aborts, `ControlService` fails and the log lacks them. With the handler owned
-/// for the process lifetime all three reach it and the process exits cleanly.
+/// [`measure_controls_after_first_stop`] for a handler that reports STOP_PENDING,
+/// as the bridge's does.
 #[cfg(target_os = "windows")]
 #[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
-fn cutover_global_net_state_service_controls_after_stop_reach_the_handler_while_the_service_is_running() {
-    use windows::Win32::System::Services::SERVICE_STOPPED;
+fn cutover_global_net_state_service_controls_after_stop_reach_the_handler() {
+    measure_controls_after_first_stop(OnStop::ReportStopPending);
+}
 
-    let delivery = deliver_controls_after_first_stop(OnStop::StayRunning);
-
-    delivery
-        .interrogate
-        .as_ref()
-        .expect("an Interrogate is delivered to a RUNNING service that accepts STOP");
-    delivery
-        .second_stop
-        .as_ref()
-        .expect("a second Stop is delivered to a RUNNING service that accepts STOP");
-    assert_eq!(delivery.observed, ["Stop", "Interrogate", "Stop"]);
-    assert_eq!(delivery.final_status.dwCurrentState, SERVICE_STOPPED);
-    assert_eq!(
-        delivery.final_status.dwWin32ExitCode, 0,
-        "the service process must exit cleanly, not crash on a control after Stop"
-    );
+/// [`measure_controls_after_first_stop`] for a handler that takes a Stop without
+/// reporting STOP_PENDING (as when its report fails), so the service still
+/// reports RUNNING with STOP accepted.
+#[cfg(target_os = "windows")]
+#[skuld::test(labels = [TUN, GLOBAL_NET_STATE], serial = TUN)]
+fn cutover_global_net_state_service_controls_after_stop_reach_the_handler_while_the_service_reports_running() {
+    measure_controls_after_first_stop(OnStop::StayRunning);
 }
 
 /// macOS: renamex_np-swap the `.app` (a dir) + plain-rename the helper (a file)
