@@ -4,6 +4,8 @@
 //! (bounds here are small — a few hundred ms — unlike `CHILD_WAIT_BOUND`'s
 //! production 60s).
 
+#![allow(clippy::disallowed_methods)] // test spawns its own test binaries (attended); see clippy.toml System tools
+
 use crate::{crash_child_bin, scrub_reexec_env, wait_bounded};
 use std::time::Duration;
 

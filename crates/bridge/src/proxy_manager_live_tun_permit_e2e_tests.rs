@@ -52,6 +52,8 @@
 //! `serial = TUN` reuses `crate::test_support::skuld_fixtures::TUN` — the
 //! same label `e2e_none_full_tunnel_local_networking_intact` carries — never redeclared.
 
+#![allow(clippy::disallowed_methods)] // test spawns host tools by name (attended); see clippy.toml System tools
+
 use std::net::{IpAddr, SocketAddr, TcpStream};
 use std::path::Path;
 use std::process::Command;

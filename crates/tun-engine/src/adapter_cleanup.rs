@@ -46,8 +46,8 @@ fn build_remove_adapter_script(tun_name: &str) -> String {
 
 #[cfg(target_os = "windows")]
 pub fn remove_adapter(tun_name: &str) {
-    use std::process::Command;
     use tracing::{debug, warn};
+    use util::system_tool::SystemTool;
 
     // Provenance canary, not a charset filter — `build_remove_adapter_script`
     // itself now escapes any `'` safely, so this is not standing in for that,
@@ -73,7 +73,8 @@ pub fn remove_adapter(tun_name: &str) {
 
     let ps = build_remove_adapter_script(tun_name);
 
-    let result = Command::new("powershell")
+    let result = SystemTool::Powershell
+        .command()
         .args(["-NoProfile", "-Command", &ps])
         .output();
 

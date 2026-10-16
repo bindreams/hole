@@ -5,6 +5,8 @@
 //! `pull_subrepo.rs`, which keeps the clean-pull/stale-parent-fixup
 //! concern and the shared `Outcome`/`run` entry point.
 
+#![allow(clippy::disallowed_methods)] // build/dev tooling: runs as the invoking developer or CI user, never privileged; see clippy.toml System tools
+
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 

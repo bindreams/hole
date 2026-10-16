@@ -12,6 +12,8 @@
 //! Pure orchestration only — no incremental / up-to-date checks. The leaf
 //! commands (`cargo build`, `cargo xtask ex-ray`, etc.) own that.
 
+#![allow(clippy::disallowed_methods)] // build/dev tooling: runs as the invoking developer or CI user, never privileged; see clippy.toml System tools
+
 use std::collections::HashMap;
 use std::ffi::OsString;
 #[cfg(windows)]

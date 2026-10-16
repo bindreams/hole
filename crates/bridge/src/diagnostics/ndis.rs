@@ -43,8 +43,8 @@
 //! [`pnputil /enum-drivers`]: https://learn.microsoft.com/en-us/windows-hardware/drivers/devtest/pnputil-command-syntax
 
 use super::{truncate_utf8, watched_matches, DEBUG_OUTPUT_CAP_BYTES};
-use std::process::Command;
 use tracing::{debug, info, warn};
+use util::system_tool::SystemTool;
 
 /// Emit an NDIS / driver / Hyper-V snapshot.
 ///
@@ -138,7 +138,8 @@ pub fn log_snapshot(phase: &'static str) {
 /// would force every probe to fail the whole snapshot, which is worse
 /// than "one probe says nothing, three others proceed."
 fn run_probe(label: &'static str, ps_command: &str) -> String {
-    match Command::new("powershell")
+    match SystemTool::Powershell
+        .command()
         .args(["-NoProfile", "-Command", ps_command])
         .output()
     {

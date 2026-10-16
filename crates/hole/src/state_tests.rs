@@ -935,6 +935,7 @@ async fn real_live_driver_holds_via_send() {
 #[cfg(target_os = "windows")]
 #[skuld::test]
 async fn real_dead_driver_unmasks_once() {
+    #[allow(clippy::disallowed_methods)] // test spawns a throwaway shell (attended); see clippy.toml System tools
     let mut child = std::process::Command::new("cmd").args(["/c", "exit"]).spawn().unwrap();
     // Resolve BEFORE reaping: a record can only be built from a resolvable
     // identity, and the retained handle is what keeps it resolvable afterwards.

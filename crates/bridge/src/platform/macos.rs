@@ -74,7 +74,7 @@ pub fn generate_plist(binary_path: &str) -> String {
 /// have — so it does not come through here; it runs
 /// [`launchctl_status`] and classifies what launchd has afterwards.
 fn run_launchctl(label: &str, args: &[&str]) -> std::io::Result<std::process::Output> {
-    let output = std::process::Command::new("launchctl").args(args).output()?;
+    let output = util::system_tool::SystemTool::Launchctl.command().args(args).output()?;
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     if !output.status.success() {
@@ -104,7 +104,7 @@ fn run_launchctl(label: &str, args: &[&str]) -> std::io::Result<std::process::Ou
 /// which — that is the entire reason this function does not judge. Severity is
 /// [`ensure_stopped_verdict`]'s, which knows the cause.
 fn launchctl_status(label: &str, args: &[&str]) -> std::io::Result<Option<i32>> {
-    let output = std::process::Command::new("launchctl").args(args).output()?;
+    let output = util::system_tool::SystemTool::Launchctl.command().args(args).output()?;
     info!(
         stdout = %String::from_utf8_lossy(&output.stdout),
         stderr = %String::from_utf8_lossy(&output.stderr),
@@ -192,7 +192,8 @@ fn classify_registration(status: std::io::Result<Option<i32>>) -> Registration {
 /// Ask launchd whether it still has the bridge's job.
 fn probe_registration() -> Registration {
     classify_registration(
-        std::process::Command::new("launchctl")
+        util::system_tool::SystemTool::Launchctl
+            .command()
             .args(["print", &format!("system/{LAUNCHD_LABEL}")])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())

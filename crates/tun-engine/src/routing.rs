@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
+use util::system_tool::SystemTool;
 
 use crate::error::{CommandFailure, RouteCommandError, RoutingError};
 use crate::gateway::{self, get_default_gateway_info, tun_ipv6_available, GatewayInfo, NextHop};
@@ -114,16 +115,23 @@ fn route_form_of(gateway: &GatewayInfo) -> state::RouteForm {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SetupCommand {
     pub id: RouteId,
-    /// Program plus arguments.
-    pub argv: Vec<String>,
+    /// The program, as a typed absolute path: a bare name is not expressible.
+    pub tool: SystemTool,
+    /// Arguments after the program.
+    pub args: Vec<String>,
     /// `false` means a non-zero exit is logged and the phase continues.
     pub fatal: bool,
 }
 
 impl SetupCommand {
     /// A command whose failure aborts the install.
-    fn fatal(id: RouteId, argv: Vec<String>) -> Self {
-        Self { id, argv, fatal: true }
+    fn fatal(id: RouteId, tool: SystemTool, args: Vec<String>) -> Self {
+        Self {
+            id,
+            tool,
+            args,
+            fatal: true,
+        }
     }
 }
 
@@ -132,12 +140,15 @@ impl SetupCommand {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RouteCommand {
     pub id: RouteId,
-    pub argv: Vec<String>,
+    /// The program, as a typed absolute path: a bare name is not expressible.
+    pub tool: SystemTool,
+    /// Arguments after the program.
+    pub args: Vec<String>,
 }
 
 impl RouteCommand {
-    fn new(id: RouteId, argv: Vec<String>) -> Self {
-        Self { id, argv }
+    fn new(id: RouteId, tool: SystemTool, args: Vec<String>) -> Self {
+        Self { id, tool, args }
     }
 }
 
@@ -377,8 +388,17 @@ fn route_confirmed_absent(output: &std::process::Output) -> bool {
 /// redacting log sink covers it, along with every other producer this crate
 /// does not author. Extracted so recovery tests can drive the real log site
 /// without spawning a subprocess.
-pub(crate) fn log_route_command(phase: &str, cmd: &[String]) {
-    info!(phase, cmd = cmd.join(" "), "running route command");
+pub(crate) fn log_route_command(phase: &str, cmd: &str) {
+    info!(phase, cmd, "running route command");
+}
+
+/// The tool's bare name (`route`, `netsh`) for [`RouteCommandError`], whose
+/// `Display` reaches a GUI toast and stays free of paths.
+fn program_name(tool: SystemTool) -> String {
+    tool.path()
+        .file_stem()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default()
 }
 
 /// Spawn one command, log it, and report whether the route's state is now
@@ -386,17 +406,26 @@ pub(crate) fn log_route_command(phase: &str, cmd: &[String]) {
 /// install phase, "is it now gone" for every BEST_EFFORT phase (see the
 /// Success-oracle section above). The unit both phase runners are built
 /// from.
-fn exec_one<P: Phase>(cmd: &[String], phase: P) -> Result<(), CommandFailure> {
-    debug_assert!(!cmd.is_empty(), "route command must not be empty");
+fn exec_one<P: Phase>(tool: SystemTool, args: &[String], phase: P) -> Result<(), CommandFailure> {
+    let mut command = tool.command();
+    command.args(args);
+    run_command(command, tool.display_with(args), phase)
+}
+
+/// The spawn-and-judge half of [`exec_one`], split out so tests can drive the
+/// real exit-code handling with a harmless command (a shell that only sets an
+/// exit code) instead of a `route`/`netsh` that would touch the host table.
+/// `cmd` is the argv text for logs.
+fn run_command<P: Phase>(mut command: Command, cmd: String, phase: P) -> Result<(), CommandFailure> {
     let phase_name = phase.name();
     ROUTING_SUBPROCESS_SPAWN_COUNT.fetch_add(1, Ordering::SeqCst);
-    log_route_command(phase_name, cmd);
+    log_route_command(phase_name, &cmd);
 
-    let output = match Command::new(&cmd[0]).args(&cmd[1..]).output() {
+    let output = match command.output() {
         Ok(output) => output,
         Err(e) => {
             // A missing `netsh`/`route` is never expected, in any phase.
-            warn!(phase = phase_name, cmd = cmd.join(" "), error = %e, "route command failed to spawn");
+            warn!(phase = phase_name, cmd, error = %e, "route command failed to spawn");
             return Err(CommandFailure::Spawn(e));
         }
     };
@@ -416,7 +445,7 @@ fn exec_one<P: Phase>(cmd: &[String], phase: P) -> Result<(), CommandFailure> {
         // on hole_bridge=debug. stdout/stderr included because netsh sometimes
         // prints a non-empty stdout on success (e.g. "Ok.") that is still
         // worth having in the trace.
-        debug!(phase = phase_name, cmd = cmd.join(" "), exit_code,
+        debug!(phase = phase_name, cmd, exit_code,
                stdout = %stdout.trim(), stderr = %stderr.trim(),
                "route command confirmed");
         return Ok(());
@@ -426,7 +455,7 @@ fn exec_one<P: Phase>(cmd: &[String], phase: P) -> Result<(), CommandFailure> {
         // Non-zero exits here are the unavoidable consequence of
         // non-transactional install + best-effort cleanup; warning would drown
         // legitimate signal.
-        debug!(phase = phase_name, cmd = cmd.join(" "), exit_code, stderr = %stderr,
+        debug!(phase = phase_name, cmd, exit_code, stderr = %stderr,
                "best-effort command not confirmed (expected if route absent)");
     } else {
         // An unconfirmed outcome during initial route install IS a real
@@ -434,7 +463,7 @@ fn exec_one<P: Phase>(cmd: &[String], phase: P) -> Result<(), CommandFailure> {
         // returned error's `Display` is deliberately PII-free. Whether it
         // aborts the start is the caller's per-command call
         // (`SetupCommand::fatal`).
-        warn!(phase = phase_name, cmd = cmd.join(" "), exit_code,
+        warn!(phase = phase_name, cmd, exit_code,
               stdout = %stdout.trim(), stderr = %stderr.trim(),
               "route command not confirmed — investigate (setup phase only)");
     }
@@ -485,7 +514,7 @@ pub(crate) fn setup_routes<R>(
     checkpoint: impl FnMut(&[RouteId]) -> std::io::Result<()>,
 ) -> Result<(), RouteCommandError>
 where
-    R: Fn(&[String], FatalPhase) -> Result<(), CommandFailure>,
+    R: Fn(SystemTool, &[String], FatalPhase) -> Result<(), CommandFailure>,
 {
     let ipv6 = tun_ipv6_available(tun_name);
     let commands = build_setup_commands(tun_name, server_ip, gateway, ipv6);
@@ -505,7 +534,7 @@ fn run_setup_commands<R>(
     mut checkpoint: impl FnMut(&[RouteId]) -> std::io::Result<()>,
 ) -> Result<(), RouteCommandError>
 where
-    R: Fn(&[String], FatalPhase) -> Result<(), CommandFailure>,
+    R: Fn(SystemTool, &[String], FatalPhase) -> Result<(), CommandFailure>,
 {
     let total = commands.len();
     for (index, cmd) in commands.iter().enumerate() {
@@ -513,18 +542,18 @@ where
         if let Err(e) = checkpoint(installed) {
             installed.pop();
             return Err(RouteCommandError {
-                program: cmd.argv.first().cloned().unwrap_or_default(),
+                program: program_name(cmd.tool),
                 index,
                 total,
                 failure: CommandFailure::Spawn(e),
             });
         }
-        if let Err(failure) = runner(&cmd.argv, FatalPhase::Setup) {
+        if let Err(failure) = runner(cmd.tool, &cmd.args, FatalPhase::Setup) {
             installed.pop();
             if !cmd.fatal {
                 // The runner already logged the exit code and child output.
                 warn!(
-                    cmd = cmd.argv.join(" "),
+                    cmd = cmd.tool.display_with(&cmd.args),
                     "route command failed but is not fatal on this host — continuing"
                 );
                 if let Err(e) = checkpoint(installed) {
@@ -547,7 +576,7 @@ where
                 }
             }
             return Err(RouteCommandError {
-                program: cmd.argv.first().cloned().unwrap_or_default(),
+                program: program_name(cmd.tool),
                 index,
                 total,
                 failure,
@@ -569,9 +598,9 @@ where
 /// own single-`Vec` narrowing).
 fn run_teardown_command<R>(cmd: &RouteCommand, phase: BestEffortPhase, runner: &R) -> bool
 where
-    R: Fn(&[String], BestEffortPhase) -> Result<(), CommandFailure>,
+    R: Fn(SystemTool, &[String], BestEffortPhase) -> Result<(), CommandFailure>,
 {
-    match runner(&cmd.argv, phase) {
+    match runner(cmd.tool, &cmd.args, phase) {
         Ok(()) => true,
         Err(e) => {
             warn!(
@@ -604,7 +633,7 @@ fn run_teardown_commands<R>(
     runner: R,
     mut checkpoint: impl FnMut(&[RouteId]),
 ) where
-    R: Fn(&[String], BestEffortPhase) -> Result<(), CommandFailure>,
+    R: Fn(SystemTool, &[String], BestEffortPhase) -> Result<(), CommandFailure>,
 {
     for cmd in cmds {
         if run_teardown_command(cmd, phase, &runner) {
@@ -635,7 +664,7 @@ pub(crate) fn teardown_routes<R>(
     checkpoint: impl FnMut(&[RouteId]),
 ) -> Vec<RouteId>
 where
-    R: Fn(&[String], BestEffortPhase) -> Result<(), CommandFailure>,
+    R: Fn(SystemTool, &[String], BestEffortPhase) -> Result<(), CommandFailure>,
 {
     let cmds: Vec<RouteCommand> =
         build_teardown_commands(tun_name, server_ip, interface_name, original_gateway, route_form)
@@ -679,16 +708,18 @@ fn recover_groups<R>(
     mut checkpoint: impl FnMut(&[state::StaleRecord]),
 ) -> Vec<state::StaleRecord>
 where
-    R: Fn(&[String], BestEffortPhase) -> Result<(), CommandFailure>,
+    R: Fn(SystemTool, &[String], BestEffortPhase) -> Result<(), CommandFailure>,
 {
-    let mut issued_split_argv: Vec<Vec<String>> = Vec::new();
+    let mut issued_split: Vec<(SystemTool, Vec<String>)> = Vec::new();
     for i in 0..groups.len() {
         let cmds: Vec<RouteCommand> = build_split_route_teardown_commands(&groups[i].tun_name)
             .into_iter()
-            .filter(|c| groups[i].installed.contains(&c.id) && !issued_split_argv.contains(&c.argv))
+            .filter(|c| {
+                groups[i].installed.contains(&c.id) && !issued_split.iter().any(|(t, a)| *t == c.tool && *a == c.args)
+            })
             .collect();
         for cmd in cmds {
-            issued_split_argv.push(cmd.argv.clone());
+            issued_split.push((cmd.tool, cmd.args.clone()));
             if run_teardown_command(&cmd, BestEffortPhase::RecoverSplit, runner) {
                 // The command's argv is keyed on tun_name alone, so narrow
                 // every group whose own split command for this id would be
@@ -697,7 +728,7 @@ where
                     if g.installed.contains(&cmd.id) {
                         let same_route = build_split_route_teardown_commands(&g.tun_name)
                             .into_iter()
-                            .any(|c| c.id == cmd.id && c.argv == cmd.argv);
+                            .any(|c| c == cmd);
                         if same_route {
                             g.installed.retain(|id| *id != cmd.id);
                         }
@@ -708,7 +739,7 @@ where
         }
     }
 
-    let mut issued_bypass_argv: Vec<Vec<String>> = Vec::new();
+    let mut issued_bypass: Vec<(SystemTool, Vec<String>)> = Vec::new();
     for i in 0..groups.len() {
         let cmds: Vec<RouteCommand> = platform_bypass_teardown_command(
             groups[i].server_ip,
@@ -717,10 +748,12 @@ where
             groups[i].route_form,
         )
         .into_iter()
-        .filter(|c| groups[i].installed.contains(&c.id) && !issued_bypass_argv.contains(&c.argv))
+        .filter(|c| {
+            groups[i].installed.contains(&c.id) && !issued_bypass.iter().any(|(t, a)| *t == c.tool && *a == c.args)
+        })
         .collect();
         for cmd in cmds {
-            issued_bypass_argv.push(cmd.argv.clone());
+            issued_bypass.push((cmd.tool, cmd.args.clone()));
             if run_teardown_command(&cmd, BestEffortPhase::RecoverBypass, runner) {
                 // The command's argv is keyed on server_ip (plus, on
                 // Windows, interface_name/gateway/route_form) alone — never
@@ -734,7 +767,7 @@ where
                             g.original_gateway,
                             g.route_form,
                         )
-                        .is_some_and(|c| c.id == cmd.id && c.argv == cmd.argv);
+                        .is_some_and(|c| c == cmd);
                         if same_route {
                             g.installed.retain(|id| *id != cmd.id);
                         }
@@ -766,7 +799,7 @@ fn sweep_leftover_before_install<R>(
     persisted: &mut state::RouteState,
     runner: R,
 ) where
-    R: Fn(&[String], BestEffortPhase) -> Result<(), CommandFailure>,
+    R: Fn(SystemTool, &[String], BestEffortPhase) -> Result<(), CommandFailure>,
 {
     let Some(leftover) = state::load(state_dir) else {
         return;
@@ -826,7 +859,7 @@ fn sweep_leftover_before_install<R>(
 /// not confirm gone.
 fn clear_stale_server_bypass<R>(state_dir: &Path, owner: Option<(u32, u32)>, dest: IpAddr, runner: R)
 where
-    R: Fn(&[String], BestEffortPhase) -> Result<(), CommandFailure>,
+    R: Fn(SystemTool, &[String], BestEffortPhase) -> Result<(), CommandFailure>,
 {
     let Some(mut leftover) = state::load(state_dir) else {
         return;
@@ -876,7 +909,7 @@ fn run_stale_bypass_delete<R>(
     runner: &R,
 ) -> bool
 where
-    R: Fn(&[String], BestEffortPhase) -> Result<(), CommandFailure>,
+    R: Fn(SystemTool, &[String], BestEffortPhase) -> Result<(), CommandFailure>,
 {
     if !installed.contains(&RouteId::ServerBypass) {
         return false;
@@ -916,17 +949,22 @@ fn checkpoint_installed(
 /// engage too). Used by the macOS pf cover; not for route commands.
 #[cfg(target_os = "macos")]
 pub(crate) fn run_capturing<P: Phase>(
-    cmd: &[String],
+    tool: SystemTool,
+    args: &[&str],
     stdin: Option<&[u8]>,
     phase: P,
 ) -> std::io::Result<std::process::Output> {
     use std::io::Write;
     use std::process::Stdio;
-    debug_assert!(!cmd.is_empty(), "command must not be empty");
     ROUTING_SUBPROCESS_SPAWN_COUNT.fetch_add(1, Ordering::SeqCst);
-    info!(phase = phase.name(), cmd = cmd.join(" "), "running cover command");
-    let mut child = Command::new(&cmd[0])
-        .args(&cmd[1..])
+    info!(
+        phase = phase.name(),
+        cmd = tool.display_with(args),
+        "running cover command"
+    );
+    let mut child = tool
+        .command()
+        .args(args)
         .stdin(if stdin.is_some() { Stdio::piped() } else { Stdio::null() })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1190,7 +1228,7 @@ pub(crate) fn recover_routes_with<R, S, P, L>(
     lockdown_recover: L,
 ) -> Recovery
 where
-    R: Fn(&[String], BestEffortPhase) -> Result<(), CommandFailure>,
+    R: Fn(SystemTool, &[String], BestEffortPhase) -> Result<(), CommandFailure>,
     S: FnOnce(&Path, bool),
     P: FnOnce() -> CoverPresence,
     L: FnOnce(CoverRecovery, Option<&str>),
@@ -1610,7 +1648,7 @@ impl SystemRouting {
         extra_unconfirmed: Vec<RouteId>,
         runner: R,
     ) where
-        R: Fn(&[String], BestEffortPhase) -> Result<(), CommandFailure>,
+        R: Fn(SystemTool, &[String], BestEffortPhase) -> Result<(), CommandFailure>,
     {
         persisted.installed = union_ids(confirmed, &extra_unconfirmed);
         if let Err(e) = state::save(&self.state_dir, &persisted, self.owner) {
@@ -1764,8 +1802,8 @@ impl SystemRouting {
         teardown_runner: Rt,
     ) -> Result<SystemRoutes, RoutingError>
     where
-        Rs: Fn(&[String], FatalPhase) -> Result<(), CommandFailure>,
-        Rt: Fn(&[String], BestEffortPhase) -> Result<(), CommandFailure> + Copy,
+        Rs: Fn(SystemTool, &[String], FatalPhase) -> Result<(), CommandFailure>,
+        Rt: Fn(SystemTool, &[String], BestEffortPhase) -> Result<(), CommandFailure> + Copy,
     {
         let interface_name = gateway.interface_name.as_str();
         // Checkpoint template: `setup_routes` calls `checkpoint(ids)` before
@@ -2026,8 +2064,8 @@ fn platform_setup_commands(
         // IPv4 low half: 0.0.0.0/1 via TUN
         SetupCommand::fatal(
             RouteId::SplitV4Low,
+            SystemTool::Netsh,
             vec![
-                "netsh".into(),
                 "interface".into(),
                 "ip".into(),
                 "add".into(),
@@ -2039,8 +2077,8 @@ fn platform_setup_commands(
         // IPv4 high half: 128.0.0.0/1 via TUN
         SetupCommand::fatal(
             RouteId::SplitV4High,
+            SystemTool::Netsh,
             vec![
-                "netsh".into(),
                 "interface".into(),
                 "ip".into(),
                 "add".into(),
@@ -2052,8 +2090,8 @@ fn platform_setup_commands(
         // IPv6 low half: ::/1 via TUN
         SetupCommand {
             id: RouteId::SplitV6Low,
-            argv: vec![
-                "netsh".into(),
+            tool: SystemTool::Netsh,
+            args: vec![
                 "interface".into(),
                 "ipv6".into(),
                 "add".into(),
@@ -2066,8 +2104,8 @@ fn platform_setup_commands(
         // IPv6 high half: 8000::/1 via TUN
         SetupCommand {
             id: RouteId::SplitV6High,
-            argv: vec![
-                "netsh".into(),
+            tool: SystemTool::Netsh,
+            args: vec![
                 "interface".into(),
                 "ipv6".into(),
                 "add".into(),
@@ -2083,24 +2121,23 @@ fn platform_setup_commands(
     // see `build_setup_commands` (loopback is on-link, a gateway bypass would
     // hijack it).
     if !server_ip.to_canonical().is_loopback() {
-        cmds.push(SetupCommand::fatal(
-            RouteId::ServerBypass,
-            match (server_ip, gateway.next_hop) {
-                // On-link: no gateway to name, so this names the interface
-                // instead — the same `netsh interface ip` command family the
-                // IPv6 arm below already uses, unlike the gateway form's
-                // classic `route add`.
-                // `store=active`: `netsh interface ip add route`'s own
-                // documented default is `store=persistent` (registry-written,
-                // survives reboot). The gateway-form sibling below (classic
-                // `route add`, no `-p`) is active-only; without this operand
-                // the two forms would give the same logical bypass different
-                // lifetimes, and a persistent on-link route naming an
-                // upstream adapter alias can outlive the session, the
-                // process, and an uninstall — see CONTRIBUTING's Route
-                // ownership section.
-                (IpAddr::V4(_), NextHop::OnLink) => vec![
-                    "netsh".into(),
+        let (tool, args) = match (server_ip, gateway.next_hop) {
+            // On-link: no gateway to name, so this names the interface
+            // instead — the same `netsh interface ip` command family the
+            // IPv6 arm below already uses, unlike the gateway form's
+            // classic `route add`.
+            // `store=active`: `netsh interface ip add route`'s own
+            // documented default is `store=persistent` (registry-written,
+            // survives reboot). The gateway-form sibling below (classic
+            // `route add`, no `-p`) is active-only; without this operand
+            // the two forms would give the same logical bypass different
+            // lifetimes, and a persistent on-link route naming an
+            // upstream adapter alias can outlive the session, the
+            // process, and an uninstall — see CONTRIBUTING's Route
+            // ownership section.
+            (IpAddr::V4(_), NextHop::OnLink) => (
+                SystemTool::Netsh,
+                vec![
                     "interface".into(),
                     "ip".into(),
                     "add".into(),
@@ -2109,16 +2146,20 @@ fn platform_setup_commands(
                     gateway.interface_name.clone(),
                     "store=active".into(),
                 ],
-                (IpAddr::V4(_), NextHop::Via(via)) => vec![
-                    "route".into(),
+            ),
+            (IpAddr::V4(_), NextHop::Via(via)) => (
+                SystemTool::Route,
+                vec![
                     "add".into(),
                     format!("{server_ip}"),
                     "mask".into(),
                     "255.255.255.255".into(),
                     format!("{via}"),
                 ],
-                (IpAddr::V6(_), _) => vec![
-                    "netsh".into(),
+            ),
+            (IpAddr::V6(_), _) => (
+                SystemTool::Netsh,
+                vec![
                     "interface".into(),
                     "ipv6".into(),
                     "add".into(),
@@ -2126,8 +2167,9 @@ fn platform_setup_commands(
                     format!("{server_ip}/128"),
                     gateway.interface_name.clone(),
                 ],
-            },
-        ));
+            ),
+        };
+        cmds.push(SetupCommand::fatal(RouteId::ServerBypass, tool, args));
     }
 
     cmds
@@ -2138,8 +2180,8 @@ fn platform_split_teardown_commands(tun_name: &str) -> Vec<RouteCommand> {
     vec![
         RouteCommand::new(
             RouteId::SplitV4Low,
+            SystemTool::Netsh,
             vec![
-                "netsh".into(),
                 "interface".into(),
                 "ip".into(),
                 "delete".into(),
@@ -2150,8 +2192,8 @@ fn platform_split_teardown_commands(tun_name: &str) -> Vec<RouteCommand> {
         ),
         RouteCommand::new(
             RouteId::SplitV4High,
+            SystemTool::Netsh,
             vec![
-                "netsh".into(),
                 "interface".into(),
                 "ip".into(),
                 "delete".into(),
@@ -2162,8 +2204,8 @@ fn platform_split_teardown_commands(tun_name: &str) -> Vec<RouteCommand> {
         ),
         RouteCommand::new(
             RouteId::SplitV6Low,
+            SystemTool::Netsh,
             vec![
-                "netsh".into(),
                 "interface".into(),
                 "ipv6".into(),
                 "delete".into(),
@@ -2174,8 +2216,8 @@ fn platform_split_teardown_commands(tun_name: &str) -> Vec<RouteCommand> {
         ),
         RouteCommand::new(
             RouteId::SplitV6High,
+            SystemTool::Netsh,
             vec![
-                "netsh".into(),
                 "interface".into(),
                 "ipv6".into(),
                 "delete".into(),
@@ -2210,11 +2252,10 @@ fn platform_bypass_teardown_command(
     if server_ip.to_canonical().is_loopback() {
         return None;
     }
-    Some(RouteCommand::new(
-        RouteId::ServerBypass,
-        match server_ip {
-            IpAddr::V4(_) if route_form == state::RouteForm::OnLink => vec![
-                "netsh".into(),
+    let (tool, args) = match server_ip {
+        IpAddr::V4(_) if route_form == state::RouteForm::OnLink => (
+            SystemTool::Netsh,
+            vec![
                 "interface".into(),
                 "ip".into(),
                 "delete".into(),
@@ -2222,21 +2263,22 @@ fn platform_bypass_teardown_command(
                 format!("{server_ip}/32"),
                 interface_name.into(),
             ],
-            IpAddr::V4(_) => {
-                let mut argv = vec![
-                    "route".into(),
-                    "delete".into(),
-                    format!("{server_ip}"),
-                    "mask".into(),
-                    "255.255.255.255".into(),
-                ];
-                if let Some(gw) = original_gateway {
-                    argv.push(format!("{gw}"));
-                }
-                argv
+        ),
+        IpAddr::V4(_) => {
+            let mut args = vec![
+                "delete".into(),
+                format!("{server_ip}"),
+                "mask".into(),
+                "255.255.255.255".into(),
+            ];
+            if let Some(gw) = original_gateway {
+                args.push(format!("{gw}"));
             }
-            IpAddr::V6(_) => vec![
-                "netsh".into(),
+            (SystemTool::Route, args)
+        }
+        IpAddr::V6(_) => (
+            SystemTool::Netsh,
+            vec![
                 "interface".into(),
                 "ipv6".into(),
                 "delete".into(),
@@ -2244,8 +2286,9 @@ fn platform_bypass_teardown_command(
                 format!("{server_ip}/128"),
                 interface_name.into(),
             ],
-        },
-    ))
+        ),
+    };
+    Some(RouteCommand::new(RouteId::ServerBypass, tool, args))
 }
 
 #[cfg(target_os = "macos")]
@@ -2272,8 +2315,8 @@ fn platform_setup_commands(
         // IPv4 low half: 0.0.0.0/1 via TUN
         SetupCommand::fatal(
             RouteId::SplitV4Low,
+            SystemTool::Route,
             vec![
-                "route".into(),
                 "-n".into(),
                 "add".into(),
                 "-net".into(),
@@ -2285,8 +2328,8 @@ fn platform_setup_commands(
         // IPv4 high half: 128.0.0.0/1 via TUN
         SetupCommand::fatal(
             RouteId::SplitV4High,
+            SystemTool::Route,
             vec![
-                "route".into(),
                 "-n".into(),
                 "add".into(),
                 "-net".into(),
@@ -2298,8 +2341,8 @@ fn platform_setup_commands(
         // IPv6 low half: ::/1 via TUN
         SetupCommand {
             id: RouteId::SplitV6Low,
-            argv: vec![
-                "route".into(),
+            tool: SystemTool::Route,
+            args: vec![
                 "-n".into(),
                 "add".into(),
                 "-inet6".into(),
@@ -2312,8 +2355,8 @@ fn platform_setup_commands(
         // IPv6 high half: 8000::/1 via TUN
         SetupCommand {
             id: RouteId::SplitV6High,
-            argv: vec![
-                "route".into(),
+            tool: SystemTool::Route,
+            args: vec![
                 "-n".into(),
                 "add".into(),
                 "-inet6".into(),
@@ -2330,29 +2373,25 @@ fn platform_setup_commands(
     // hijack it).
     if !server_ip.to_canonical().is_loopback() {
         let original_gateway = gateway.gateway_ip;
-        cmds.push(SetupCommand::fatal(
-            RouteId::ServerBypass,
-            match server_ip {
-                IpAddr::V4(_) => vec![
-                    "route".into(),
-                    "-n".into(),
-                    "add".into(),
-                    "-host".into(),
-                    format!("{server_ip}"),
-                    format!("{original_gateway}"),
-                ],
-                IpAddr::V6(_) => vec![
-                    "route".into(),
-                    "-n".into(),
-                    "add".into(),
-                    "-inet6".into(),
-                    "-host".into(),
-                    format!("{server_ip}"),
-                    "-interface".into(),
-                    gateway.interface_name.clone(),
-                ],
-            },
-        ));
+        let args = match server_ip {
+            IpAddr::V4(_) => vec![
+                "-n".into(),
+                "add".into(),
+                "-host".into(),
+                format!("{server_ip}"),
+                format!("{original_gateway}"),
+            ],
+            IpAddr::V6(_) => vec![
+                "-n".into(),
+                "add".into(),
+                "-inet6".into(),
+                "-host".into(),
+                format!("{server_ip}"),
+                "-interface".into(),
+                gateway.interface_name.clone(),
+            ],
+        };
+        cmds.push(SetupCommand::fatal(RouteId::ServerBypass, SystemTool::Route, args));
     }
 
     cmds
@@ -2368,43 +2407,23 @@ fn platform_split_teardown_commands(_tun_name: &str) -> Vec<RouteCommand> {
     vec![
         RouteCommand::new(
             RouteId::SplitV4Low,
-            vec![
-                "route".into(),
-                "-n".into(),
-                "delete".into(),
-                "-net".into(),
-                "0.0.0.0/1".into(),
-            ],
+            SystemTool::Route,
+            vec!["-n".into(), "delete".into(), "-net".into(), "0.0.0.0/1".into()],
         ),
         RouteCommand::new(
             RouteId::SplitV4High,
-            vec![
-                "route".into(),
-                "-n".into(),
-                "delete".into(),
-                "-net".into(),
-                "128.0.0.0/1".into(),
-            ],
+            SystemTool::Route,
+            vec!["-n".into(), "delete".into(), "-net".into(), "128.0.0.0/1".into()],
         ),
         RouteCommand::new(
             RouteId::SplitV6Low,
-            vec![
-                "route".into(),
-                "-n".into(),
-                "delete".into(),
-                "-inet6".into(),
-                "::/1".into(),
-            ],
+            SystemTool::Route,
+            vec!["-n".into(), "delete".into(), "-inet6".into(), "::/1".into()],
         ),
         RouteCommand::new(
             RouteId::SplitV6High,
-            vec![
-                "route".into(),
-                "-n".into(),
-                "delete".into(),
-                "-inet6".into(),
-                "8000::/1".into(),
-            ],
+            SystemTool::Route,
+            vec!["-n".into(), "delete".into(), "-inet6".into(), "8000::/1".into()],
         ),
     ]
 }
@@ -2432,26 +2451,17 @@ fn platform_bypass_teardown_command(
     if server_ip.to_canonical().is_loopback() {
         return None;
     }
-    Some(RouteCommand::new(
-        RouteId::ServerBypass,
-        match server_ip {
-            IpAddr::V4(_) => vec![
-                "route".into(),
-                "-n".into(),
-                "delete".into(),
-                "-host".into(),
-                format!("{server_ip}"),
-            ],
-            IpAddr::V6(_) => vec![
-                "route".into(),
-                "-n".into(),
-                "delete".into(),
-                "-inet6".into(),
-                "-host".into(),
-                format!("{server_ip}"),
-            ],
-        },
-    ))
+    let args = match server_ip {
+        IpAddr::V4(_) => vec!["-n".into(), "delete".into(), "-host".into(), format!("{server_ip}")],
+        IpAddr::V6(_) => vec![
+            "-n".into(),
+            "delete".into(),
+            "-inet6".into(),
+            "-host".into(),
+            format!("{server_ip}"),
+        ],
+    };
+    Some(RouteCommand::new(RouteId::ServerBypass, SystemTool::Route, args))
 }
 
 #[cfg(test)]

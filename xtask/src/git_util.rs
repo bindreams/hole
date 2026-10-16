@@ -1,5 +1,7 @@
 //! Small shared helpers for xtask modules that shell out to `git`.
 
+#![allow(clippy::disallowed_methods)] // build/dev tooling: runs as the invoking developer or CI user, never privileged; see clippy.toml System tools
+
 use std::path::Path;
 use std::process::Command;
 

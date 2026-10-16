@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)] // test spawns host tools by name (attended); see clippy.toml System tools
 use super::*;
 
 // CommandLineToArgvW roundtrip ========================================================================================

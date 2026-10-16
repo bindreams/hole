@@ -69,10 +69,9 @@
 //! it), so no polling was added on an unverified guess. That gap is
 //! unresolved, not silently closed.
 
-use std::process::Command;
-
 use smoltcp::wire::Ipv6Cidr;
 use tracing::{info, warn};
+use util::system_tool::SystemTool;
 
 use super::Assigned;
 use crate::error::DeviceError;
@@ -90,12 +89,12 @@ pub(super) fn assign(if_index: u32, cidr: Ipv6Cidr) -> Result<Assigned, DeviceEr
         return Ok(Assigned::Ipv6StackAbsent);
     };
 
-    let argv = ifconfig_alias_argv(&if_name, cidr);
+    let args = ifconfig_alias_args(&if_name, cidr);
     // Logged before spawning, same as `routing.rs`'s `log_route_command`:
     // the argv carries no PII (an interface name and a link-local-scoped
     // CIDR), so it needs no redaction and no separate extraction point.
-    info!(interface = %if_name, cmd = argv.join(" "), "running ifconfig alias command");
-    let output = match Command::new(&argv[0]).args(&argv[1..]).output() {
+    info!(interface = %if_name, cmd = SystemTool::Ifconfig.display_with(&args), "running ifconfig alias command");
+    let output = match SystemTool::Ifconfig.command().args(&args).output() {
         Ok(output) => output,
         Err(e) => {
             warn!(interface = %if_name, error = %e, "spawning ifconfig failed; no IPv6 address on the TUN");
@@ -147,9 +146,9 @@ fn interface_name(if_index: u32) -> Option<String> {
     )
 }
 
-pub(super) fn ifconfig_alias_argv(if_name: &str, cidr: Ipv6Cidr) -> Vec<String> {
+/// The arguments `ifconfig` runs with; the program is always [`SystemTool::Ifconfig`].
+pub(super) fn ifconfig_alias_args(if_name: &str, cidr: Ipv6Cidr) -> Vec<String> {
     vec![
-        "ifconfig".into(),
         if_name.into(),
         "inet6".into(),
         cidr.address().to_string(),
@@ -199,7 +198,8 @@ fn prefix_route(cidr: Ipv6Cidr) -> PrefixRoute {
     let Some(probe) = probe_address_for(cidr) else {
         return PrefixRoute::Indeterminate("no address inside the prefix differs from the configured one");
     };
-    let Ok(output) = Command::new("route")
+    let Ok(output) = SystemTool::Route
+        .command()
         .args(["-n", "get", "-inet6", &probe.to_string()])
         .output()
     else {

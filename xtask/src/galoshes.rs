@@ -6,6 +6,8 @@
 //! Output: `<repo>/target/release/galoshes{.exe}`, plus a Tauri-sidecar copy
 //! at `<repo>/.cache/galoshes/galoshes-<triple>{.exe}` for the macOS DMG.
 
+#![allow(clippy::disallowed_methods)] // build/dev tooling: runs as the invoking developer or CI user, never privileged; see clippy.toml System tools
+
 use std::path::{Path, PathBuf};
 use std::process::Command;
 

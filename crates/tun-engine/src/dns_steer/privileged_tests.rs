@@ -43,6 +43,8 @@
 //! under the default unprivileged pass — opening a utun and writing the
 //! dynamic store both need root.
 
+#![allow(clippy::disallowed_methods)] // test spawns host tools by name (attended); see clippy.toml System tools
+
 use std::ffi::CString;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, ToSocketAddrs, UdpSocket};

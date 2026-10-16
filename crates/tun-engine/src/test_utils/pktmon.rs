@@ -17,6 +17,8 @@
 //! `hole-bridge`'s `cutover_nic_capture_privileged.rs` so the two crates
 //! cannot drift — see this crate's `test_utils` module doc.
 
+#![allow(clippy::disallowed_methods)] // test spawns host tools by name (attended); see clippy.toml System tools
+
 use std::net::SocketAddr;
 use std::path::Path;
 use std::process::Command;

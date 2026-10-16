@@ -94,7 +94,7 @@ pub fn group_sid() -> io::Result<String> {
 #[cfg(target_os = "macos")]
 mod os {
     use std::io;
-    use std::process::Command;
+    use util::system_tool::SystemTool;
 
     use super::{group_exists, RealUser, GROUP_NAME};
 
@@ -110,7 +110,8 @@ mod os {
         // and we return success — broadening the success condition from
         // "create succeeded" to "the group exists at end of attempt", which
         // is what idempotency requires.
-        let output = Command::new("dseditgroup")
+        let output = SystemTool::Dseditgroup
+            .command()
             .args(["-o", "create", GROUP_NAME])
             .output()?;
 
@@ -129,7 +130,8 @@ mod os {
         // missing group exits non-zero with a localized "not found" stderr.
         // Use `getgrnam` to verify post-failure and avoid stderr-substring
         // matching that breaks under non-English locales.
-        let output = Command::new("dseditgroup")
+        let output = SystemTool::Dseditgroup
+            .command()
             .args(["-o", "delete", GROUP_NAME])
             .output()?;
 
@@ -144,7 +146,8 @@ mod os {
     }
 
     pub fn add_user_to_group(username: &str) -> io::Result<()> {
-        let output = Command::new("dseditgroup")
+        let output = SystemTool::Dseditgroup
+            .command()
             .args(["-o", "edit", "-a", username, "-t", "user", GROUP_NAME])
             .output()?;
 
@@ -168,7 +171,10 @@ mod os {
         }
 
         // 2. stat /dev/console to find the GUI login user
-        let output = Command::new("stat").args(["-f", "%Su", "/dev/console"]).output()?;
+        let output = SystemTool::Stat
+            .command()
+            .args(["-f", "%Su", "/dev/console"])
+            .output()?;
         if output.status.success() {
             let user = String::from_utf8_lossy(&output.stdout).trim().to_string();
             if !user.is_empty() && user != "root" {
@@ -177,7 +183,7 @@ mod os {
         }
 
         // 3. logname as last resort
-        let output = Command::new("logname").output()?;
+        let output = SystemTool::Logname.command().output()?;
         if output.status.success() {
             let user = String::from_utf8_lossy(&output.stdout).trim().to_string();
             if !user.is_empty() && user != "root" {
@@ -238,12 +244,13 @@ mod os {
 #[cfg(target_os = "windows")]
 mod os {
     use std::io;
-    use std::process::Command;
+    use util::system_tool::SystemTool;
 
     use super::GROUP_NAME;
 
     pub fn create_group() -> io::Result<()> {
-        let output = Command::new("net")
+        let output = SystemTool::Net
+            .command()
             .args(["localgroup", GROUP_NAME, "/add", "/comment:Hole bridge access"])
             .output()?;
 
@@ -264,7 +271,8 @@ mod os {
     }
 
     pub fn delete_group() -> io::Result<()> {
-        let output = Command::new("net")
+        let output = SystemTool::Net
+            .command()
             .args(["localgroup", GROUP_NAME, "/delete"])
             .output()?;
 
@@ -285,7 +293,8 @@ mod os {
     }
 
     pub fn add_user_to_group(username: &str) -> io::Result<()> {
-        let output = Command::new("net")
+        let output = SystemTool::Net
+            .command()
             .args(["localgroup", GROUP_NAME, username, "/add"])
             .output()?;
 

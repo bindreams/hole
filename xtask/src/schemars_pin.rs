@@ -130,6 +130,8 @@
 //! will roll our own IR" (oxidecomputer/typify#886), so when this fires, read
 //! that issue before assuming the answer is `schemars = "1"`.
 
+#![allow(clippy::disallowed_methods)] // build/dev tooling: runs as the invoking developer or CI user, never privileged; see clippy.toml System tools
+
 use std::cmp::Ordering;
 use std::ops::Bound::{self, Excluded, Included, Unbounded};
 use std::path::Path;

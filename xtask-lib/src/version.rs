@@ -24,6 +24,8 @@
 //! (`is_valid_next` one-bump-ahead rule, strict `releases/ex-ray/v<X.Y.Z>`
 //! tags).
 
+#![allow(clippy::disallowed_methods)] // dev tooling: runs as the invoking developer or CI user, never privileged; see clippy.toml System tools
+
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::process::Command;

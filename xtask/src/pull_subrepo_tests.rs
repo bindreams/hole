@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)] // build/dev tooling: runs as the invoking developer or CI user, never privileged; see clippy.toml System tools
 use std::process::Command;
 
 use super::pull_subrepo::test_support::{git, git_output, install_rejecting_pre_commit_hook, ConflictKind, Fixture};

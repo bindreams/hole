@@ -354,6 +354,26 @@ Compile-time enforcement is in the root [`clippy.toml`](clippy.toml)
 DNS FFIs `SetInterfaceDnsSettings`/`GetInterfaceDnsSettings`). See #165 (the
 incident) and #397 (the `Dns` extension).
 
+### System tools (absolute paths)
+
+The bridge runs as root/SYSTEM, so it never spawns an OS tool by bare name: a bare
+name is resolved through `PATH` (macOS) or, on Windows, through the application
+directory and the *current directory* before System32
+([`CreateProcess`, "lpApplicationName"](https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-createprocessw)),
+and a lower-privileged user can influence all of those. Every OS tool is a
+[`util::system_tool::SystemTool`](crates/util/src/system_tool.rs) variant
+(`route`, `ifconfig`, `pfctl`, `networksetup`, `launchctl`, `dseditgroup`, … on
+macOS; `route`, `netsh`, `net`, `powershell` on Windows), and
+`SystemTool::command()` is the only way to build its `Command`: the program is an
+absolute path, on Windows under the directory `GetSystemDirectoryW` reports.
+`RouteCommand`/`SetupCommand` carry a `SystemTool` plus the arguments, not an argv
+whose first element is a program name. Compile-time enforcement is
+[`clippy.toml`](clippy.toml): `std::process::Command::new` and
+`tokio::process::Command::new` are disallowed. A spawn that is not an OS tool
+(Hole's own executable, the unprivileged GUI's `osascript`, the developer's `sudo`,
+`xtask`/`dev-console` tooling, test harnesses) takes an `#[allow]` with its reason;
+test files and tooling files take a module-level one.
+
 `Dns` has a two-layer seam — outer (`MockDns` at `ProxyManager::new_with_dns`)
 and inner per-platform backend (`MockBackend` at `SystemDns::new_with_backend`).
 Both are necessary: an outer-only mock can pass while `SystemDns::apply` ignores
@@ -1116,8 +1136,8 @@ milliseconds.
 
 - **macOS** ([`routing/failclosed/macos.rs`](crates/tun-engine/src/routing/failclosed/macos.rs)):
   `pfctl -E` (refcounted) + a self-contained ruleset loaded over stdin
-  (`pfctl -f -`, absolute `/sbin/pfctl` — `PFCTL`'s own doc has the hardening
-  caveat and lists the other macOS root spawns it does not close).
+  (`pfctl -f -`, spawned as `SystemTool::Pfctl`, so by absolute path — see
+  [System tools](#system-tools-absolute-paths)).
   Disengage restores `/etc/pf.conf` and drops the refcount (`pfctl -X <token>`);
   the token is persisted to `bridge-failclosed.json` *before* the blocking
   ruleset loads (persist-before-mutate), and a failed persist unwinds the `-E`
@@ -1142,8 +1162,7 @@ milliseconds.
   passing (the chosen contract; `load_cover_ruleset`'s doc).
   Disclosed, not fixed here: a *failed* re-engage during a transition still
   reloads `/etc/pf.conf` over a still-good prior cover (bindreams/hole#1004 — it
-  warns where it fires), two privileged test files' own bare `pfctl` calls
-  (bindreams/hole#1005), and the lockdown half of the state-purge question
+  warns where it fires) and the lockdown half of the state-purge question
   (bindreams/hole#1015, sequenced behind bindreams/hole#1002).
 
 Each platform splits a pure, unit-tested rule/spec builder (transient:
@@ -2788,8 +2807,9 @@ through these IN ORDER before proposing any timeout bump:
 1. **Run `cargo clippy --workspace --no-default-features`** — `disallowed_methods`
    rejects raw `routing::setup_routes`/`teardown_routes` and
    `shadowsocks_service::local::Server::new` outside trait impls.
-1. **Check for new `std::process::Command::new` in `crates/bridge/src/`** — not
-   clippy-covered; each is a potential test-time subprocess leak.
+1. **Check for new `std::process::Command::new` in `crates/bridge/src/`** — clippy
+   rejects it (see [System tools](#system-tools-absolute-paths)), so a hit carries an
+   `#[allow]`; each is a potential test-time subprocess leak.
 1. **Check skuld's per-test `pass (NN ms)` lines** for a duration outlier.
 1. **Compare with a recent main CI run** on the same runner image.
 1. **Only if all the above rule out code issues**, consider the runner image

@@ -19,6 +19,27 @@ reason = "Route setup must go through `Routing::install`. Only `SystemRouting::i
 path = "tun_engine::routing::teardown_routes"
 reason = "Route teardown must go through `Routing::Installed`'s Drop. Only `SystemRoutes::drop` in tun-engine and `recover_routes` may call this. See #165."
 
+# System tools — spawn by absolute path --------------------------------------------------------------------------------
+#
+# The bridge runs as root/SYSTEM. A program named without a directory is
+# resolved through `PATH` (macOS) or, on Windows, the application directory and
+# the current directory before System32 — all of which a lower-privileged user
+# can influence. `util::system_tool::SystemTool::command` builds the `Command`
+# for every OS tool from an absolute path; the bans below keep a bare name from
+# being typed again. A spawn of something that is not an OS tool (Hole's own
+# executable, dev tooling, a user-privilege helper) takes a per-site
+# `#[allow(clippy::disallowed_methods)]` with a reason; test files use a
+# module-level one. See bindreams/hole#1027.
+
+[[disallowed-methods]]
+path = "std::process::Command::new"
+reason = "Use `util::system_tool::SystemTool::command` for an OS tool (absolute path, no PATH / current-directory lookup). A spawn that is not an OS tool carries a per-site `#[allow(clippy::disallowed_methods)]` with the reason. See bindreams/hole#1027."
+
+[[disallowed-methods]]
+path = "tokio::process::Command::new"
+reason = "Use `util::system_tool::SystemTool::command` for an OS tool (absolute path, no PATH / current-directory lookup). A spawn that is not an OS tool carries a per-site `#[allow(clippy::disallowed_methods)]` with the reason. See bindreams/hole#1027."
+allow-invalid = true  # only crates with tokio's `process` feature can resolve the path.
+
 # Port allocation — enforce bind_ephemeral over raw free_port ----------------------------------------------------------
 #
 # Direct callers of `port_alloc::free_port` skip the divorced-port-number

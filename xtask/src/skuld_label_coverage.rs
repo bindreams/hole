@@ -41,6 +41,8 @@
 //! hardcoded list — the thing reading ci.yaml exists to avoid — and could not
 //! catch a rename anyway, since the scan for the label moves along with it.
 
+#![allow(clippy::disallowed_methods)] // build/dev tooling: runs as the invoking developer or CI user, never privileged; see clippy.toml System tools
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::process::Command;

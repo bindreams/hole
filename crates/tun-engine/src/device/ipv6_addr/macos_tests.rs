@@ -1,4 +1,4 @@
-//! Unprivileged unit tests for the macOS path's pure logic — the argv shape,
+//! Unprivileged unit tests for the macOS path's pure logic — the argument shape,
 //! and the network-address arithmetic behind [`prefix_route`]'s
 //! probe-address choice. See the module doc for why the rest (the actual
 //! `ifconfig`/`route` shell-outs) is unreachable without root and why the
@@ -9,21 +9,13 @@ use std::net::Ipv6Addr;
 use super::*;
 
 #[skuld::test]
-fn ifconfig_alias_argv_names_the_interface_address_and_prefix() {
+fn ifconfig_alias_args_name_the_interface_address_and_prefix() {
     let cidr: Ipv6Cidr = "fdf8:f6d5:536e::1/64".parse().unwrap();
-    let argv = ifconfig_alias_argv("utun7", cidr);
+    let args = ifconfig_alias_args("utun7", cidr);
 
     assert_eq!(
-        argv.iter().map(String::as_str).collect::<Vec<_>>(),
-        [
-            "ifconfig",
-            "utun7",
-            "inet6",
-            "fdf8:f6d5:536e::1",
-            "prefixlen",
-            "64",
-            "alias"
-        ],
+        args.iter().map(String::as_str).collect::<Vec<_>>(),
+        ["utun7", "inet6", "fdf8:f6d5:536e::1", "prefixlen", "64", "alias"],
         "the address carries no prefix suffix and the prefix length is its own argument"
     );
 }

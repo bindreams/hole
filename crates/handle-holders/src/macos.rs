@@ -31,6 +31,8 @@ pub(super) fn find_holders_impl(path: &Path) -> io::Result<Vec<FileHolder>> {
     //   -F pc : emit only pid (p) and command (c) fields
     //   --    : end of options, next arg is a filename
     // Exit codes: 0 = matches found, 1 = no matches (NOT an error here).
+    #[allow(clippy::disallowed_methods)]
+    // diagnostic for the test harness only (bridge `test_support`); never runs in the privileged service
     let out = Command::new("lsof")
         .args(["-F", "pc", "--"])
         .arg(&path)

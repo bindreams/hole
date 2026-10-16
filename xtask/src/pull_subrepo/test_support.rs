@@ -2,6 +2,8 @@
 //! used by both `pull_subrepo_tests.rs` (clean-pull/stale-parent) and
 //! `pull_subrepo/conflict_tests.rs` (conflict-handling).
 
+#![allow(clippy::disallowed_methods)] // build/dev tooling: runs as the invoking developer or CI user, never privileged; see clippy.toml System tools
+
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Mutex;

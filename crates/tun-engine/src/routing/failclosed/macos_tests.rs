@@ -180,15 +180,16 @@ fn ruleset_resolver_pass_is_scoped_to_tcp_443_not_unrestricted() {
 /// this host's own `pfctl` will not parse is a bug on its own terms.
 fn pfctl_normalized(ruleset: &str) -> Vec<String> {
     use std::io::Write;
-    use std::process::{Command, Stdio};
+    use std::process::Stdio;
 
-    let mut child = Command::new(PFCTL)
+    let mut child = SystemTool::Pfctl
+        .command()
         .args(["-vn", "-f", "-"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .unwrap_or_else(|e| panic!("{PFCTL} must be present to normalize a cover ruleset: {e}"));
+        .unwrap_or_else(|e| panic!("pfctl must be present to normalize a cover ruleset: {e}"));
     // Dropped at the end of this statement, closing the pipe — `pfctl` reads to
     // EOF before it prints, and a cover ruleset is far under a pipe buffer, so
     // the write cannot block against the stdout this thread is not yet reading.
@@ -307,23 +308,6 @@ fn transient_cover_permits_are_never_syn_only() {
 #[skuld::test]
 fn lockdown_permits_are_never_syn_only() {
     assert_no_permit_is_syn_only(&build_lockdown_main_ruleset(TUN_IF, v4(), ""), "the standing lockdown");
-}
-
-#[skuld::test]
-fn pfctl_cmd_uses_the_absolute_path() {
-    // Pins the hardening PFCTL's doc claims: reverting to a bare "pfctl"
-    // (PATH-resolved, spoofable by an earlier writable directory since this
-    // runs as root) must fail this test, not silently stay green.
-    let cmd = pfctl_cmd(&["-X", "12345"]);
-    assert_eq!(
-        cmd[0], "/sbin/pfctl",
-        "pfctl must be invoked by its absolute path: {cmd:?}"
-    );
-    assert_eq!(
-        cmd[1..],
-        ["-X", "12345"],
-        "pfctl_cmd must forward args unchanged after the binary: {cmd:?}"
-    );
 }
 
 #[skuld::test]
