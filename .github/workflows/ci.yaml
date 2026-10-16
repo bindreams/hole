@@ -498,12 +498,12 @@ jobs:
       # be kept in step with the job budgets above for no measured gain.
       #
       # DISCLOSED RESIDUAL (hung TUN step): these are not a guarantee that the
-      # step always loses the race to the job wall. On the windows leg a hung
-      # TUN step could reach the wall first when the build and non-TUN steps
-      # both run long (17 + 4 + 19 + 25 = 65, under the 80 wall). The #999
-      # execution proof step below does NOT add to this sum: its `if:` names no
-      # status function, so
-      # GitHub ANDs in `success()`, and a failed/timed-out TUN step makes that
+      # step always loses the race to the job wall. At the measured maxima a
+      # hung TUN step still fails first (windows: 17 + 4 + 19 + 25 = 65, under
+      # the 80 wall), but a build or non-TUN step running past its measured
+      # maximum hands the hung step to the job wall. The #999 execution proof
+      # step below does NOT add to this sum: its `if:` names no status
+      # function, so GitHub ANDs in `success()`, and a failed/timed-out TUN step makes that
       # condition false — the proof step is skipped, not run, and spends none
       # of its budget. Bounding a hung step away entirely would mean either
       # budgets too tight to survive an honest slow run or a wall raised past

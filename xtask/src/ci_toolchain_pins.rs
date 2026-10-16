@@ -97,9 +97,10 @@ impl Reader {
     /// Can a consumer with `consumer_if` run when this reader's output is unset?
     fn consumer_may_outrun(&self, consumer_if: &Option<String>) -> bool {
         match (&self.if_, consumer_if) {
-            // Reader has no `if:` and may fail without failing the job: the
-            // consumer's implicit `success()` no longer proves it succeeded.
-            (None, _) if self.may_fail_without_failing_job => !if_conditions_match(consumer_if, &self.if_),
+            // A reader that may fail without failing the job leaves `success()`
+            // true, so neither the consumer's implicit `success()` nor a
+            // matching condition proves its output is set.
+            _ if self.may_fail_without_failing_job => true,
             // Reader has no `if:` and fails the job: a consumer with no status
             // function implies `success()`, so the reader already ran.
             (None, Some(consumer)) => if_admits_failed_predecessor(consumer),

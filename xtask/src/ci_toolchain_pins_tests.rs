@@ -164,8 +164,7 @@ fn consumer_with_its_own_condition_of_an_unconditional_reader_is_clean() {
 }
 
 /// A reader with `continue-on-error` keeps the job's `success()` true after it
-/// fails, so a consumer with no status function still runs on its empty
-/// output: only a matching condition is safe.
+/// fails, so every consumer may run on its empty output.
 fn reader_with_continue_on_error_consumed_under(continue_on_error: &str, consumer_if: &str) -> Vec<UngatedRead> {
     let yaml = format!(
         "runs:\n  using: composite\n  steps:\n    - id: rust-version\n      continue-on-error: {continue_on_error}\n      run: sed rust-toolchain.toml >> \"$GITHUB_OUTPUT\"\n    - uses: dtolnay/rust-toolchain@master\n      if: {consumer_if}\n      with:\n        toolchain: ${{{{ steps.rust-version.outputs.toolchain }}}}\n"
@@ -182,13 +181,21 @@ fn consumer_of_a_continue_on_error_reader_with_its_own_condition_is_flagged() {
     }
 }
 
+/// A failed `continue-on-error` reader leaves `success()` true, so even an
+/// unconditional consumer runs on its empty output.
 #[skuld::test]
-fn unconditional_consumer_of_a_continue_on_error_reader_is_clean() {
+fn unconditional_consumer_of_a_continue_on_error_reader_is_flagged() {
     let yaml = "runs:\n  using: composite\n  steps:\n    - id: rust-version\n      continue-on-error: true\n      run: sed rust-toolchain.toml >> \"$GITHUB_OUTPUT\"\n    - uses: dtolnay/rust-toolchain@master\n      with:\n        toolchain: ${{ steps.rust-version.outputs.toolchain }}\n";
-    assert_eq!(
-        audit_checkout_gating("action.yaml", yaml, &BTreeMap::new()).unwrap(),
-        vec![]
-    );
+    let found = audit_checkout_gating("action.yaml", yaml, &BTreeMap::new()).unwrap();
+    assert_eq!(found.len(), 1, "{found:?}");
+}
+
+/// A matching condition proves the reader ran, not that it succeeded.
+#[skuld::test]
+fn matching_consumer_of_a_conditioned_continue_on_error_reader_is_flagged() {
+    let yaml = "runs:\n  using: composite\n  steps:\n    - id: rust-version\n      if: ${{ inputs.y }}\n      continue-on-error: true\n      run: sed rust-toolchain.toml >> \"$GITHUB_OUTPUT\"\n    - uses: dtolnay/rust-toolchain@master\n      if: ${{ inputs.y }}\n      with:\n        toolchain: ${{ steps.rust-version.outputs.toolchain }}\n";
+    let found = audit_checkout_gating("action.yaml", yaml, &BTreeMap::new()).unwrap();
+    assert_eq!(found.len(), 1, "{found:?}");
 }
 
 #[skuld::test]
@@ -253,7 +260,8 @@ fn status_function_name_is_case_insensitive() {
     assert_eq!(found.len(), 1, "{found:?}");
 }
 
-/// A condition on `github.ref` and an input string compare, no status function, so the implicit `success()` stays.
+/// A condition on `github.ref` and an input string compare, no status
+/// function, so the implicit `success()` stays.
 #[skuld::test]
 fn consumer_with_a_non_status_condition_of_an_unconditional_reader_is_clean() {
     let found =
