@@ -10,6 +10,8 @@
 //! but writes NO marker, so the garter inside its child is itself a root and
 //! keeps containing its own plugin chains.
 
+#![allow(clippy::disallowed_methods)] // test fixture: spawns the workspace's own mock-plugin binary, not an OS tool
+
 use cosca::tokio::Command;
 use cosca::Stdio;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};

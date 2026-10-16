@@ -13,6 +13,8 @@
 //! not `shadowsocks-service`'s `PluginConfig`; readiness is deterministic, so
 //! there is no `wait_for_port`.)
 
+#![allow(clippy::disallowed_methods)] // attended test: bare-name host tools
+
 // skuld's harness (`harness = false`) needs a `main` on every platform.
 hole_test_observability::register!();
 

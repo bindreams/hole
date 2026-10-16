@@ -1,5 +1,7 @@
 //! Shelling out, with the diagnostics a first CI run needs.
 
+#![allow(clippy::disallowed_methods)] // attended test: bare-name host tools
+
 use std::process::{Command, Output};
 
 /// Render a completed process's exit status AND both streams. `netsh` writes

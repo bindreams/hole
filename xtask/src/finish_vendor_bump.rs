@@ -3,6 +3,8 @@
 //! `go.mod`, and the identity build/test check. A human who resolved a
 //! real conflict by hand runs this on its own once they're done.
 
+#![allow(clippy::disallowed_methods)] // dev tooling, never privileged
+
 use std::path::Path;
 use std::process::Command;
 

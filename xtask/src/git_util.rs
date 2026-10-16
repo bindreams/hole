@@ -1,5 +1,7 @@
 //! Small shared helpers for xtask modules that shell out to `git`.
 
+#![allow(clippy::disallowed_methods)] // dev tooling, never privileged
+
 use std::path::Path;
 use std::process::Command;
 

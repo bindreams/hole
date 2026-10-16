@@ -1,5 +1,7 @@
 //! The supervision sequence (dev.py main(), with the spec's Deltas).
 
+#![allow(clippy::disallowed_methods)] // dev tooling, never privileged
+
 use std::path::Path;
 use std::process::ExitCode;
 use std::time::Duration;

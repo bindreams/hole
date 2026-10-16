@@ -554,11 +554,14 @@ pub fn resolve_plugin_path(name: &str) -> String {
 ///
 /// Looks for the plugin binary in the same directory as the bridge executable.
 /// On Windows, appends `.exe` if the name doesn't already end with it.
-/// Falls back to the bare name so that shadowsocks does a PATH lookup.
+/// Falls back to the bare name, which is then found by a `PATH` lookup
+/// (current directory first, then `PATH`, on Windows).
 ///
-/// The PATH fallback is safe because `is_valid_plugin_name()` ensures the name
-/// contains no path separators — PATH lookup can only find binaries in directories
-/// that an administrator placed on PATH (standard system-level trust model).
+/// That fallback is NOT safe for a bridge elevated from the GUI: it inherits the
+/// user's `PATH`, which commonly has user-writable directories, so a binary a
+/// user-level process drops there under the configured plugin name runs with the
+/// bridge's privileges. `is_valid_plugin_name()` only keeps the name free of path
+/// separators.
 pub(crate) fn resolve_plugin_path_inner(name: &str, bridge_exe: Option<PathBuf>) -> String {
     // Map the config token to its on-disk binary name. A known friendly
     // name (`v2ray-plugin`) resolves to its `binary_name` (`ex-ray`); an

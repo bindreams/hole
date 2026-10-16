@@ -59,6 +59,7 @@
 //! entry was needed, only the documentation list update alongside this file.
 
 #![cfg(target_os = "macos")]
+#![allow(clippy::disallowed_methods)] // attended test: bare-name host tools
 
 use std::ffi::CString;
 use std::io;

@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)] // attended test: bare-name host tools
 use super::*;
 use crate::config::ServerEntry;
 use skuld::temp_dir;

@@ -5,6 +5,8 @@
 //! `#[cfg(windows)]`; `spawn_and_rendezvous` is shared. Mirrors
 //! crates/dev-console/src/interrupts_tests.rs.
 
+#![allow(clippy::disallowed_methods)] // dev tooling, never privileged
+
 /// After installing the transparent handler, a SIGINT must NOT terminate the
 /// process (default disposition would). Reaching the line past the raise is the
 /// proof of survival — no timing (raise delivers synchronously before return).

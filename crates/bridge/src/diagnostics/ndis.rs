@@ -43,8 +43,8 @@
 //! [`pnputil /enum-drivers`]: https://learn.microsoft.com/en-us/windows-hardware/drivers/devtest/pnputil-command-syntax
 
 use super::{truncate_utf8, watched_matches, DEBUG_OUTPUT_CAP_BYTES};
-use std::process::Command;
 use tracing::{debug, info, warn};
+use util::system_tool::{SystemPowershell, SystemTool};
 
 /// Emit an NDIS / driver / Hyper-V snapshot.
 ///
@@ -75,7 +75,15 @@ pub fn log_snapshot(phase: &'static str) {
          ForEach-Object { Get-VMSwitchExtension -VMSwitchName $_.Name } | \
          Format-Table -AutoSize -Wrap",
     );
-    let drivers = run_probe("pnputil", "pnputil /enum-drivers");
+    // Run directly by absolute path, not as a command inside PowerShell, which
+    // would find `pnputil` through the process `PATH`.
+    let drivers = report_probe(
+        "pnputil",
+        SystemTool::Pnputil.command().map(|mut c| {
+            c.arg("/enum-drivers");
+            c
+        }),
+    );
 
     let adapter_matches = watched_matches(&adapters);
     let binding_matches = watched_matches(&bindings);
@@ -138,10 +146,14 @@ pub fn log_snapshot(phase: &'static str) {
 /// would force every probe to fail the whole snapshot, which is worse
 /// than "one probe says nothing, three others proceed."
 fn run_probe(label: &'static str, ps_command: &str) -> String {
-    match Command::new("powershell")
-        .args(["-NoProfile", "-Command", ps_command])
-        .output()
-    {
+    report_probe(label, SystemPowershell::command(ps_command))
+}
+
+/// Run `built` and return its stdout, or the error marker string [`run_probe`]
+/// describes: a command that could not be built or spawned yields
+/// `<probe '...' failed to spawn: ...>`.
+fn report_probe(label: &'static str, built: std::io::Result<std::process::Command>) -> String {
+    match built.and_then(|mut c| c.output()) {
         Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).into_owned(),
         Ok(o) => format!(
             "<probe '{label}' exited {:?}; stderr: {}>",

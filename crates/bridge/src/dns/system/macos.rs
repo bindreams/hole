@@ -28,11 +28,9 @@
 
 use std::io;
 use std::net::IpAddr;
-use std::process::Command;
+use util::system_tool::SystemTool;
 
 use crate::dns_state::{AdapterId, DnsPrior, DnsPriorAdapter};
-
-const NETWORKSETUP: &str = "networksetup";
 
 // MacDnsBackend trait =================================================================================================
 
@@ -86,7 +84,10 @@ pub struct Networksetup;
 
 impl MacDnsBackend for Networksetup {
     fn get_settings(&self, service: &str) -> io::Result<Option<DnsPriorAdapter>> {
-        let output = Command::new(NETWORKSETUP).args(["-getdnsservers", service]).output()?;
+        let output = SystemTool::Networksetup
+            .command()?
+            .args(["-getdnsservers", service])
+            .output()?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             if stderr.contains("not a recognized network service") {
@@ -173,9 +174,29 @@ impl MacDnsBackend for Networksetup {
     fn flush(&self) -> io::Result<()> {
         // Fire-and-forget the cache flush. `dscacheutil` is fast; the
         // SIGHUP to mDNSResponder is a courtesy notification.
-        let _ = Command::new("dscacheutil").arg("-flushcache").status();
-        let _ = Command::new("killall").args(["-HUP", "mDNSResponder"]).status();
+        log_flush_step(
+            SystemTool::Dscacheutil,
+            SystemTool::Dscacheutil
+                .command()
+                .and_then(|mut c| c.arg("-flushcache").status()),
+        );
+        log_flush_step(
+            SystemTool::Killall,
+            SystemTool::Killall
+                .command()
+                .and_then(|mut c| c.args(["-HUP", "mDNSResponder"]).status()),
+        );
         Ok(())
+    }
+}
+
+/// Warn when a flush step could not be built or spawned, or exited non-zero.
+/// The flush stays best-effort, so nothing is returned.
+fn log_flush_step(tool: SystemTool, outcome: io::Result<std::process::ExitStatus>) {
+    match outcome {
+        Ok(status) if status.success() => {}
+        Ok(status) => tracing::warn!(tool = tool.name(), %status, "DNS cache flush step exited unsuccessfully"),
+        Err(error) => tracing::warn!(tool = tool.name(), %error, "DNS cache flush step failed to run"),
     }
 }
 
@@ -237,7 +258,7 @@ fn split_v4_v6(combined: DnsPrior) -> (DnsPrior, DnsPrior) {
 }
 
 fn set_dnsservers(svc: &str, ips: &[IpAddr]) -> io::Result<()> {
-    let mut cmd = Command::new(NETWORKSETUP);
+    let mut cmd = SystemTool::Networksetup.command()?;
     cmd.arg("-setdnsservers").arg(svc);
     if ips.is_empty() {
         cmd.arg("Empty");

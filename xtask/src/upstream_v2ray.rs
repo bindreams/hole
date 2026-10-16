@@ -23,6 +23,8 @@
 //!
 //! Output: `<repo>/.cache/upstream-v2ray-plugin/<commit>/v2ray-plugin-<host-triple>{.exe}`.
 
+#![allow(clippy::disallowed_methods)] // dev tooling, never privileged
+
 use std::path::{Path, PathBuf};
 use std::process::Command;
 

@@ -52,6 +52,8 @@
 //! synthetic-service DNS keys (one per test, TEST-NET-1 resolvers) and, for
 //! Step 2b, spawns and `SIGKILL`s a child process of this same binary.
 
+#![allow(clippy::disallowed_methods)] // attended test: bare-name host tools
+
 hole_test_observability::register!();
 
 /// Set only on the child side of Step 2b's self re-exec — see the module

@@ -37,6 +37,8 @@ pub fn prime_sudo() -> Result<(), PrimeSudoError> {
 
 /// Testable core: the `sudo` binary is injected.
 pub fn prime_sudo_with(sudo: &Path) -> Result<(), PrimeSudoError> {
+    #[allow(clippy::disallowed_methods)]
+    // runs as the invoking developer, who elevates via their own `sudo` on PATH; no privilege gain
     let probe = Command::new(sudo)
         .args(["-n", "true"])
         .status()
@@ -44,6 +46,8 @@ pub fn prime_sudo_with(sudo: &Path) -> Result<(), PrimeSudoError> {
     if probe.success() {
         return Ok(());
     }
+    #[allow(clippy::disallowed_methods)]
+    // runs as the invoking developer, who elevates via their own `sudo` on PATH; no privilege gain
     let interactive = Command::new(sudo)
         .arg("-v")
         .status()
@@ -69,6 +73,8 @@ pub fn prime_sudo_with(sudo: &Path) -> Result<(), PrimeSudoError> {
 /// it exists for external consumers and the planned `elevated:`-flag
 /// revival (bindreams/hole#453).
 pub fn sudo_command(program: impl AsRef<OsStr>, preserve_env: &[&str]) -> Command {
+    #[allow(clippy::disallowed_methods)]
+    // runs as the invoking developer, who elevates via their own `sudo` on PATH; no privilege gain
     let mut cmd = Command::new("sudo");
     cmd.arg(crate::preserve_env_arg(preserve_env));
     cmd.arg(program.as_ref());

@@ -9,6 +9,8 @@
 //! kinds. Relying on the terminal to broadcast Ctrl+C to the child's group
 //! instead would cover neither descendants nor a programmatic SIGTERM.
 
+#![allow(clippy::disallowed_methods)] // dev tooling, never privileged
+
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, Result};

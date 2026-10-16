@@ -7,6 +7,8 @@
 // JSON result file at `HOLE_LOGGING_TEST_OUTPUT` and exits, and the parent
 // reads + asserts on it.
 
+#![allow(clippy::disallowed_methods)] // attended test: bare-name host tools
+
 use serde::{Deserialize, Serialize};
 use skuld::temp_dir;
 use std::path::Path;

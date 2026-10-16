@@ -94,7 +94,6 @@ mod system {
     //! Real `windows`-crate SCM impl. Raw FFI is sanctioned here (the #165
     //! isolation contract): the alertable `SleepEx(INFINITE, TRUE)` wait is a
     //! kernel rendezvous for an SCM-delivered APC, not a timeout-poll.
-    #![allow(clippy::disallowed_methods)]
 
     use std::ffi::c_void;
     use std::io;
