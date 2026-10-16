@@ -1067,9 +1067,11 @@ separately: [#753](https://github.com/bindreams/hole/issues/753) (filed
 narrower than this; scope correction pending). Finally, the
 release-then-reengage repair itself has a brief window with NO cover at all
 between the release and the corrected (or restored) re-engage — disclosed in
-the repair's own `warn!` lines, not silent, but not eliminated either: both
-platforms' engage primitives are delete-then-add / flush-then-reload, not an
-atomic in-place update. Tracked separately:
+the repair's own `warn!` lines, not silent, but not eliminated either: Windows'
+engage is delete-then-add, not an atomic in-place update, and on macOS the gap is
+the release itself (the drop reloads `/etc/pf.conf`), although the macOS engage
+is now atomic over a live cover. The same release-first gap applies when lockdown
+is newly enabled on a covered retry. Tracked separately:
 [#758](https://github.com/bindreams/hole/issues/758). If BOTH the corrected
 engage AND the compensating restore fail — two independent OS-level
 failures back to back — the attempt proceeds fully uncovered: the same
@@ -1140,10 +1142,38 @@ milliseconds.
   session would auto-delete the filters when the engaging process exits, reopening
   the leak mid-gap. Recovery deletes the fixed compiled-in GUIDs (idempotent), so
   no state file is needed. The FWPM FFIs are clippy-disallowed outside this module.
+
 - **macOS** ([`routing/failclosed/macos.rs`](crates/tun-engine/src/routing/failclosed/macos.rs)):
-  `pfctl -E` (refcounted) + a self-contained ruleset loaded over stdin (`pfctl -Fa -f -`). Disengage restores `/etc/pf.conf` and drops the refcount (`pfctl -X <token>`). The token is persisted to `bridge-failclosed.json` *before* the
-  blocking ruleset loads, so recovery can `-X` it cleanly. Caveat: restore reloads
-  the on-disk `/etc/pf.conf`, not a snapshot of a live ruleset (matches wg-quick).
+  `pfctl -E` (refcounted) + a self-contained ruleset loaded over stdin
+  (`pfctl -f -`, absolute `/sbin/pfctl` — `PFCTL`'s own doc has the hardening
+  caveat and lists the other macOS root spawns it does not close).
+  Disengage restores `/etc/pf.conf` and drops the refcount (`pfctl -X <token>`);
+  the token is persisted to `bridge-failclosed.json` *before* the blocking
+  ruleset loads (persist-before-mutate), and a failed persist unwinds the `-E`
+  before propagating, mirroring `engage_lockdown`'s `FreshEnable`/`Reenable`
+  arms.
+  **That module's doc is the single source for the pf argument itself** — why
+  there is no `-Fa`, why loopback is exempted twice over, why every `pass` is
+  `no state`, why pf is enabled before the load, and which cover purges pf
+  state — each claim naming the const or function that owns it and the test
+  that holds it. Deliberately not restated here.
+  Proven at the kernel by `macos_transition_tests.rs` (cover transition, state
+  purge, loopback across a load — the last with its own positive control) and
+  `live_tun_permit_privileged_tests.rs` (a non-`lo0` permit carrying a
+  mid-stream segment); the transition test prints its own measured sensitivity,
+  which `success-output` in `.config/nextest.toml` is what preserves on a PASS.
+  `engage` is atomic over a live cover, but the bridge's own cover transitions
+  are not gap-free: the repair path and the lockdown-newly-enabled path drop the
+  held cover first, and its `Drop` reloads `/etc/pf.conf`, so the host is open
+  until the next engage (bindreams/hole#758, deferred together with
+  bindreams/hole#754). A failed `pfctl -F states` purge after a transient engage
+  is logged only: the engage reports success and flows that predate it keep
+  passing (the chosen contract; `load_cover_ruleset`'s doc).
+  Disclosed, not fixed here: a *failed* re-engage during a transition still
+  reloads `/etc/pf.conf` over a still-good prior cover (bindreams/hole#1004 — it
+  warns where it fires), two privileged test files' own bare `pfctl` calls
+  (bindreams/hole#1005), and the lockdown half of the state-purge question
+  (bindreams/hole#1015, sequenced behind bindreams/hole#1002).
 
 Each platform splits a pure, unit-tested rule/spec builder (transient:
 `build_cover_spec` / `build_pf_ruleset`; lockdown: `build_lockdown_spec` /

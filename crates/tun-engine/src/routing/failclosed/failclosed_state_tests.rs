@@ -12,6 +12,32 @@ fn save_then_load_roundtrips() {
     assert_eq!(load(tmp.path()), Some(st));
 }
 
+/// A file written by the previous release, whose `pf_was_enabled` was a bare
+/// `bool`, reads unchanged.
+///
+/// Driven from BYTES, not from `save`, and the version is the LITERAL `1`, never
+/// `{SCHEMA_VERSION}`: the claim is about files already on disk, which carry the
+/// version they were written at. The opposite direction (what this binary
+/// writes, read by the previous release) is
+/// `macos_tests::what_an_engage_persists_parses_under_the_previous_releases_schema`.
+#[skuld::test]
+fn load_reads_an_older_files_bare_bool_pf_was_enabled() {
+    for written in [true, false] {
+        let tmp = tempfile::tempdir().unwrap();
+        let older = format!(r#"{{"version":1,"pf_token":"5","pf_was_enabled":{written}}}"#);
+        std::fs::write(tmp.path().join(STATE_FILE_NAME), &older).unwrap();
+        assert_eq!(
+            load(tmp.path()),
+            Some(FailClosedState {
+                version: 1,
+                pf_token: "5".into(),
+                pf_was_enabled: written,
+            }),
+            "a record already on disk at schema 1 must read unchanged: {older}"
+        );
+    }
+}
+
 #[skuld::test]
 fn load_absent_is_none() {
     let tmp = tempfile::tempdir().unwrap();

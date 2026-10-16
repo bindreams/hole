@@ -757,13 +757,33 @@ def test_integration_filtering_against_real_history():
             encoding="utf-8",
             check=True,
         ).stdout.strip()
-        m = re.search(r"\(#(\d+)\)\s*$", subject)
-        if not m:
-            continue
-        pr_num = m.group(1)
-        assert not re.search(rf"#{pr_num}\b", out), (
-            f"ex-ray notes contain hole-only PR #{pr_num} ({sha[:8]}); "
-            f"include-path filtering may be broken. Subject: {subject}"
+        # Look for the commit's own bullet line, not its number: `#N` also
+        # appears in other commits' subjects as an issue reference
+        # ("closes #N"), and issue and PR numbers share one number space.
+        pr_match = PR_NUMBER_RE.search(subject)
+        bullet = "- " + PR_NUMBER_RE.sub("", subject).strip()
+        if pr_match:
+            bullet += f" (#{pr_match.group(1)})"
+        # Positive control: the hole track, over the SAME range, must render
+        # this exact bullet. Without it, a `bullet` that stops matching the
+        # generator's rendering makes the absence check below vacuous.
+        hole_config = load_config(repo_root, "hole")
+        hole_commits = [
+            c for c in list_commits(repo_root, f"{prev_tag}..HEAD") if any(hole_spec.match_file(f) for f in c.files)
+        ]
+        hole_notes = render_notes(
+            categorize(hole_commits, hole_config.categories),
+            new_tag="releases/hole/v999.0.0",
+            previous_tag=prev_tag,
+            repo_url="https://github.com/bindreams/hole",
+        )
+        assert bullet in hole_notes.splitlines(), (
+            f"hole-track notes lack the probe bullet {bullet!r} for hole-only commit {sha[:8]}; "
+            f"the test's bullet no longer matches how the generator renders one"
+        )
+        assert bullet not in out.splitlines(), (
+            f"ex-ray notes contain hole-only commit {sha[:8]}; include-path filtering may be broken. "
+            f"Subject: {subject}"
         )
         return
     # No qualifying hole-only commit in range. Common; not a failure.

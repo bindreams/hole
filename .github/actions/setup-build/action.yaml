@@ -1,6 +1,16 @@
 name: Setup Build
 description: Set up a compilable Rust workspace (toolchains, cache, runtime deps)
 
+inputs:
+  save-cache:
+    description: >-
+      Save the cargo cache at job end (see `cargo-cache`). Set by exactly one
+      job per cache key (runner OS + rustc commit, no arch), and it saves only
+      on `main`. Every other job, and every other ref, restores only; the
+      release workflows deliberately never set it.
+    required: false
+    default: "false"
+
 runs:
   using: composite
   steps:
@@ -32,13 +42,10 @@ runs:
         node-version-file: package.json
         cache: npm
 
-    - uses: actions/cache@v6
+    - uses: ./.github/actions/cargo-cache
       with:
-        path: |
-          ~/.cargo/registry
-          ~/.cargo/git
-        key: cargo-${{ runner.os }}-${{ steps.setup-rust.outputs.cachekey }}-${{ hashFiles('Cargo.lock') }}
-        restore-keys: cargo-${{ runner.os }}-${{ steps.setup-rust.outputs.cachekey }}-
+        cachekey: ${{ steps.setup-rust.outputs.cachekey }}
+        save: ${{ inputs.save-cache }}
 
     - uses: mozilla-actions/sccache-action@v0.0.11
 
