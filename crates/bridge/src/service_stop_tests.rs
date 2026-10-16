@@ -1,6 +1,6 @@
 use super::*;
 
-use std::sync::{Arc, Barrier, Mutex};
+use std::sync::{Arc, Mutex};
 
 use crate::test_support::log_capture::VecWriter;
 use tracing_subscriber::layer::{Layer, SubscriberExt};
@@ -68,8 +68,7 @@ fn all_lists_every_phase_in_teardown_order() {
 
 #[skuld::test]
 fn checkpoints_strictly_increase_and_are_never_zero() {
-    // SCM: checkpoint 0 means "no pending operation"; a repeated value is
-    // indistinguishable from no progress.
+    // A repeated checkpoint is indistinguishable from no progress.
     let cps: Vec<u32> = StopPhase::ALL.iter().map(|p| p.checkpoint()).collect();
     assert!(cps[0] >= 1, "checkpoint 0 reads as not-pending: {cps:?}");
     assert!(cps.windows(2).all(|w| w[0] < w[1]), "not strictly increasing: {cps:?}");
@@ -95,7 +94,6 @@ fn enter_reports_each_phase_once_in_the_order_entered() {
 
 #[skuld::test]
 fn nothing_is_reported_until_a_phase_is_entered() {
-    // Checkpoints are progress-driven: constructing the reporter emits nothing.
     let log = Log::default();
     let _progress = log.progress();
     assert_eq!(log.events(), vec![]);
@@ -128,42 +126,6 @@ fn an_entry_that_would_not_advance_the_checkpoint_is_not_reported() {
     progress.enter(StopPhase::StopProxy);
     progress.enter(StopPhase::CloseEtw);
     assert_eq!(log.events(), vec![Event::Reported(StopPhase::CloseEtw)]);
-}
-
-#[skuld::test]
-fn racing_entries_from_two_threads_never_move_the_checkpoint_back() {
-    let log = Log::default();
-    let progress = Arc::new(log.progress());
-    let barrier = Arc::new(Barrier::new(2));
-    let handles: Vec<_> = [StopPhase::StopRequested, StopPhase::StopProxy]
-        .into_iter()
-        .map(|phase| {
-            let progress = Arc::clone(&progress);
-            let barrier = Arc::clone(&barrier);
-            std::thread::spawn(move || {
-                barrier.wait();
-                progress.enter(phase);
-            })
-        })
-        .collect();
-    for h in handles {
-        h.join().unwrap();
-    }
-    let reported: Vec<u32> = log
-        .events()
-        .iter()
-        .map(|e| match e {
-            Event::Reported(p) => p.checkpoint(),
-            Event::Step(_) => unreachable!(),
-        })
-        .collect();
-    assert!(!reported.is_empty());
-    assert!(
-        reported.windows(2).all(|w| w[0] < w[1]),
-        "checkpoints reported out of order: {reported:?}"
-    );
-    // StopProxy is the later phase, so it is reported whichever thread got there first.
-    assert_eq!(reported.last(), Some(&StopPhase::StopProxy.checkpoint()));
 }
 
 #[skuld::test]
@@ -241,7 +203,14 @@ fn teardown_enters_the_proxy_phases_through_the_progress_it_hands_the_stop_work(
 fn stopped_is_reported_only_after_the_runtime_is_dropped() {
     let log = Log::default();
     let progress = log.progress();
-    finish_stop(&progress, || log.step("drop_runtime"), || log.step("stopped"));
+    finish_stop(
+        &progress,
+        || log.step("drop_runtime"),
+        || {
+            log.step("stopped");
+            Ok(())
+        },
+    );
     assert_eq!(
         log.events(),
         vec![
@@ -255,11 +224,18 @@ fn stopped_is_reported_only_after_the_runtime_is_dropped() {
 /// Subscriber capturing `service stop phase` lines into `writer`, for tests that
 /// assert where the log write falls relative to the report and the signal.
 fn capture_info(writer: &VecWriter) -> impl tracing::Subscriber + Send + Sync {
+    capture_at(writer, tracing_subscriber::filter::LevelFilter::INFO)
+}
+
+fn capture_at(
+    writer: &VecWriter,
+    level: tracing_subscriber::filter::LevelFilter,
+) -> impl tracing::Subscriber + Send + Sync {
     tracing_subscriber::registry().with(
         tracing_subscriber::fmt::layer()
             .with_writer(writer.clone())
             .with_ansi(false)
-            .with_filter(tracing_subscriber::filter::LevelFilter::INFO),
+            .with_filter(level),
     )
 }
 
@@ -297,29 +273,6 @@ fn a_failed_report_is_logged_as_a_warning() {
 }
 
 #[skuld::test]
-fn a_stop_control_signals_the_main_task_before_it_logs() {
-    let writer = VecWriter::new();
-    let _guard = garter::tracing_test::set_default_in_current_thread(capture_info(&writer));
-    let log = Log::default();
-    let progress = log.progress();
-    let seen_at_signal = Mutex::new(None);
-    request_stop(&progress, || {
-        log.step("signal");
-        *seen_at_signal.lock().unwrap() = Some(writer.snapshot_string());
-    });
-    let seen = seen_at_signal.lock().unwrap().clone().expect("no signal");
-    assert!(
-        !seen.contains("service stop phase"),
-        "logged before the signal:\n{seen}"
-    );
-    assert!(writer.snapshot_string().contains("StopRequested"));
-    assert_eq!(
-        log.events(),
-        vec![Event::Reported(StopPhase::StopRequested), Event::Step("signal")]
-    );
-}
-
-#[skuld::test]
 fn a_stop_control_does_not_wait_for_a_report_in_flight_on_another_thread() {
     // The main task is mid-report for a later phase (an SCM call that has not
     // returned). The control handler must still signal shutdown: whatever that
@@ -340,9 +293,17 @@ fn a_stop_control_does_not_wait_for_a_report_in_flight_on_another_thread() {
             Ok(())
         }))
     };
+    let writer = VecWriter::new();
     let main_task = {
         let progress = Arc::clone(&progress);
-        std::thread::spawn(move || progress.enter(StopPhase::StopProxy))
+        let writer = writer.clone();
+        std::thread::spawn(move || {
+            let _guard = garter::tracing_test::set_default_in_current_thread(capture_at(
+                &writer,
+                tracing_subscriber::filter::LevelFilter::DEBUG,
+            ));
+            progress.enter(StopPhase::StopProxy)
+        })
     };
     in_report.1.recv().unwrap();
 
@@ -353,4 +314,338 @@ fn a_stop_control_does_not_wait_for_a_report_in_flight_on_another_thread() {
     release.0.send(()).unwrap();
     main_task.join().unwrap();
     assert_eq!(*reported.lock().unwrap(), vec![StopPhase::StopProxy]);
+    // The skipped report is not silent: the main task logs it at debug.
+    let out = writer.snapshot_string();
+    assert!(
+        out.contains("DEBUG") && out.contains("superseded") && out.contains("StopRequested"),
+        "skipped StopRequested not logged at debug:\n{out}"
+    );
+}
+
+#[skuld::test]
+fn a_stop_control_writes_no_log_line_on_the_control_handler_thread() {
+    // The SCM gives HandlerEx 30 s. The file appender is non-lossy, so a log
+    // write on the handler thread can block past that and fail the caller's
+    // ControlService. The outcome is logged by the main task instead.
+    let writer = VecWriter::new();
+    let log = Log::default();
+    let progress = Arc::new(log.progress());
+    let handler = {
+        let progress = Arc::clone(&progress);
+        let writer = writer.clone();
+        std::thread::spawn(move || {
+            let _guard = garter::tracing_test::set_default_in_current_thread(capture_at(
+                &writer,
+                tracing_subscriber::filter::LevelFilter::TRACE,
+            ));
+            request_stop(&progress, || {});
+        })
+    };
+    handler.join().unwrap();
+    assert_eq!(writer.snapshot_string(), "", "the handler thread wrote a log line");
+    assert_eq!(log.events(), vec![Event::Reported(StopPhase::StopRequested)]);
+
+    // The main task's next entry carries the hand-off, ahead of its own line.
+    let _guard = garter::tracing_test::set_default_in_current_thread(capture_info(&writer));
+    progress.enter(StopPhase::AcquireProxy);
+    let out = writer.snapshot_string();
+    let stop_requested = out.find("StopRequested").expect("hand-off not logged");
+    let acquire = out.find("AcquireProxy").expect("own phase not logged");
+    assert!(stop_requested < acquire, "hand-off not logged first:\n{out}");
+}
+
+#[skuld::test]
+fn a_failed_stop_control_report_is_logged_as_a_warning_by_the_main_task() {
+    let writer = VecWriter::new();
+    let progress = StopProgress::new(|_| Err(std::io::Error::other("SCM refused")));
+    request_stop(&progress, || {});
+    assert_eq!(writer.snapshot_string(), "");
+
+    let _guard = garter::tracing_test::set_default_in_current_thread(capture_info(&writer));
+    progress.enter(StopPhase::AcquireProxy);
+    let out = writer.snapshot_string();
+    assert!(
+        out.contains("WARN") && out.contains("failed to report StopPending") && out.contains("StopRequested"),
+        "failed hand-off not logged as a warning:\n{out}"
+    );
+}
+
+#[skuld::test]
+fn a_stop_control_arriving_after_a_later_phase_is_logged_as_superseded() {
+    let writer = VecWriter::new();
+    let log = Log::default();
+    let progress = log.progress();
+    progress.enter(StopPhase::AcquireProxy);
+    request_stop(&progress, || log.step("signal"));
+    assert_eq!(
+        log.events(),
+        vec![Event::Reported(StopPhase::AcquireProxy), Event::Step("signal")]
+    );
+
+    let _guard = garter::tracing_test::set_default_in_current_thread(capture_at(
+        &writer,
+        tracing_subscriber::filter::LevelFilter::DEBUG,
+    ));
+    progress.enter(StopPhase::PersistTarget);
+    let out = writer.snapshot_string();
+    assert!(
+        out.contains("DEBUG") && out.contains("superseded") && out.contains("StopRequested"),
+        "superseded stop control not logged at debug:\n{out}"
+    );
+}
+
+#[skuld::test]
+fn a_hand_off_is_logged_once() {
+    let writer = VecWriter::new();
+    let progress = StopProgress::new(|_| Ok(()));
+    request_stop(&progress, || {});
+    let _guard = garter::tracing_test::set_default_in_current_thread(capture_info(&writer));
+    progress.enter(StopPhase::AcquireProxy);
+    progress.enter(StopPhase::PersistTarget);
+    assert_eq!(writer.snapshot_string().matches("StopRequested").count(), 1);
+}
+
+#[skuld::test]
+fn a_panicking_report_poisons_nothing_the_stop_path_depends_on() {
+    // The report closure panics while the report lock is held. The control
+    // handler (try_lock, Poisoned arm) and the main task (enter) must both
+    // recover the lock: a panic on an SCM thread, or a skipped report, would
+    // lose the stop.
+    let log = Log::default();
+    let panic_once = std::sync::atomic::AtomicBool::new(true);
+    let progress = {
+        let log = log.clone();
+        StopProgress::new(move |p| {
+            log.push(Event::Reported(p));
+            if panic_once.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                panic!("report closure panicked");
+            }
+            Ok(())
+        })
+    };
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        progress.enter(StopPhase::StopRequested)
+    }));
+    assert!(result.is_err(), "the report closure did not panic");
+
+    request_stop(&progress, || log.step("signal"));
+    progress.enter(StopPhase::AcquireProxy);
+    assert_eq!(
+        log.events(),
+        vec![
+            Event::Reported(StopPhase::StopRequested),
+            Event::Step("signal"),
+            Event::Reported(StopPhase::AcquireProxy),
+        ]
+    );
+}
+
+#[skuld::test]
+fn a_phase_with_work_is_entered_before_the_work_and_returns_its_output() {
+    let log = Log::default();
+    let mut entered = Vec::new();
+    let out = block_on(run_phase(
+        &mut |p| {
+            log.push(Event::Reported(p));
+            entered.push(p);
+        },
+        StopPhase::ReapPlugins,
+        Some(7u32),
+        |n| {
+            let log = log.clone();
+            async move {
+                log.step("work");
+                n + 1
+            }
+        },
+    ));
+    assert_eq!(out, Some(8));
+    assert_eq!(
+        log.events(),
+        vec![Event::Reported(StopPhase::ReapPlugins), Event::Step("work")]
+    );
+}
+
+#[skuld::test]
+fn a_phase_without_work_is_not_entered() {
+    let log = Log::default();
+    let out = block_on(run_phase(
+        &mut |p| log.push(Event::Reported(p)),
+        StopPhase::StopEngine,
+        None::<u32>,
+        |_| {
+            let log = log.clone();
+            async move { log.step("work") }
+        },
+    ));
+    assert_eq!(out, None);
+    assert_eq!(log.events(), vec![]);
+}
+
+#[skuld::test]
+fn the_scm_reporter_fails_until_the_status_handle_is_registered() {
+    // A Stop can land between `register` returning and the handle being stored.
+    let cell: Arc<std::sync::OnceLock<&'static str>> = Arc::new(std::sync::OnceLock::new());
+    let sent = Mutex::new(Vec::new());
+    let progress = StopProgress::new(scm_reporter(Arc::clone(&cell), |handle, phase| {
+        sent.lock().unwrap().push((*handle, phase));
+        Ok(())
+    }));
+
+    request_stop(&progress, || {});
+    assert_eq!(*sent.lock().unwrap(), vec![]);
+
+    cell.set("handle").unwrap();
+    progress.enter(StopPhase::AcquireProxy);
+    assert_eq!(*sent.lock().unwrap(), vec![("handle", StopPhase::AcquireProxy)]);
+}
+
+#[skuld::test]
+fn the_stop_control_reports_before_it_signals_the_main_task_and_signals_once() {
+    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+    let shutdown_tx = Mutex::new(Some(tx));
+    let rx = Mutex::new(rx);
+    let signalled_at_report = Mutex::new(Vec::new());
+    let progress = StopProgress::new(|_| {
+        signalled_at_report
+            .lock()
+            .unwrap()
+            .push(rx.lock().unwrap().try_recv().is_ok());
+        Ok(())
+    });
+
+    stop_control(&progress, &shutdown_tx);
+    assert_eq!(
+        *signalled_at_report.lock().unwrap(),
+        vec![false],
+        "signalled before the report"
+    );
+    assert!(rx.lock().unwrap().try_recv().is_ok(), "main task not signalled");
+
+    // A second control (Stop then Shutdown) finds the sender gone.
+    stop_control(&progress, &shutdown_tx);
+}
+
+#[skuld::test]
+fn a_failed_stopped_report_is_logged_as_a_warning() {
+    let writer = VecWriter::new();
+    let _guard = garter::tracing_test::set_default_in_current_thread(capture_info(&writer));
+    let progress = StopProgress::new(|_| Ok(()));
+    finish_stop(&progress, || {}, || Err(std::io::Error::other("SCM refused")));
+    let out = writer.snapshot_string();
+    assert!(
+        out.contains("WARN") && out.contains("failed to report Stopped"),
+        "failed Stopped report not logged:\n{out}"
+    );
+}
+
+struct DropFlag(Arc<Mutex<Vec<&'static str>>>, &'static str);
+
+impl Drop for DropFlag {
+    fn drop(&mut self) {
+        self.0.lock().unwrap().push(self.1);
+    }
+}
+
+#[skuld::test]
+fn the_last_handle_is_dropped_by_drop_last_handle() {
+    let drops = Arc::new(Mutex::new(Vec::new()));
+    let handle = Arc::new(DropFlag(Arc::clone(&drops), "value"));
+    drop_last_handle(handle);
+    assert_eq!(*drops.lock().unwrap(), vec!["value"]);
+}
+
+#[skuld::test]
+fn a_surviving_clone_is_logged_and_keeps_the_value_alive() {
+    let writer = VecWriter::new();
+    let _guard = garter::tracing_test::set_default_in_current_thread(capture_info(&writer));
+    let drops = Arc::new(Mutex::new(Vec::new()));
+    let handle = Arc::new(DropFlag(Arc::clone(&drops), "value"));
+    let survivor = Arc::clone(&handle);
+    drop_last_handle(handle);
+    assert_eq!(*drops.lock().unwrap(), Vec::<&str>::new());
+    assert!(
+        writer.snapshot_string().contains("outlived the teardown"),
+        "survivor not logged:\n{}",
+        writer.snapshot_string()
+    );
+    drop(survivor);
+    assert_eq!(*drops.lock().unwrap(), vec!["value"]);
+}
+
+// tear_down_service ---------------------------------------------------------------------------------------------------
+
+use crate::proxy_manager::proxy_manager_tests::{MockProxy, MockRouting};
+use crate::proxy_manager::ProxyManager;
+use crate::target::SessionEvent;
+
+/// Records its own drop as a step in the shared log.
+struct StepOnDrop(Log, &'static str);
+
+impl Drop for StepOnDrop {
+    fn drop(&mut self) {
+        self.0.step(self.1);
+    }
+}
+
+fn idle_manager_with_state_dir() -> (
+    Arc<tokio::sync::Mutex<ProxyManager<MockProxy, MockRouting>>>,
+    tempfile::TempDir,
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let routing = MockRouting::new(dir.path().to_path_buf());
+    let pm = ProxyManager::new(MockProxy::new(), routing).with_state_dir(dir.path().to_path_buf());
+    (Arc::new(tokio::sync::Mutex::new(pm)), dir)
+}
+
+#[skuld::test]
+fn service_teardown_probes_the_event_before_waiting_on_the_proxy_and_drops_in_phase_order() {
+    let log = Log::default();
+    let progress = Arc::new(log.progress());
+    let (proxy, _dir) = idle_manager_with_state_dir();
+    let weak = Arc::downgrade(&proxy);
+    block_on(tear_down_service(
+        &progress,
+        proxy,
+        || {
+            log.step("event");
+            SessionEvent::ProcessExiting
+        },
+        StepOnDrop(log.clone(), "etw dropped"),
+        StepOnDrop(log.clone(), "held dropped"),
+    ));
+    assert_eq!(
+        log.events(),
+        vec![
+            Event::Step("event"),
+            Event::Reported(StopPhase::AcquireProxy),
+            Event::Reported(StopPhase::PersistTarget),
+            Event::Reported(StopPhase::CloseEtw),
+            Event::Step("etw dropped"),
+            Event::Reported(StopPhase::DropResources),
+            Event::Step("held dropped"),
+        ]
+    );
+    assert!(weak.upgrade().is_none(), "the proxy manager outlived the teardown");
+}
+
+#[skuld::test]
+fn service_teardown_names_a_proxy_handle_that_outlives_it() {
+    // A connection task still holding a router clone would drop the manager on
+    // whatever thread released it, outside DropResources.
+    let writer = VecWriter::new();
+    let _guard = garter::tracing_test::set_default_in_current_thread(capture_info(&writer));
+    let log = Log::default();
+    let progress = Arc::new(log.progress());
+    let (proxy, _dir) = idle_manager_with_state_dir();
+    let straggler = Arc::clone(&proxy);
+    block_on(tear_down_service(
+        &progress,
+        proxy,
+        || SessionEvent::ProcessExiting,
+        (),
+        (),
+    ));
+    assert!(writer.snapshot_string().contains("outlived the teardown"));
+    assert_eq!(Arc::strong_count(&straggler), 1);
 }

@@ -1701,7 +1701,7 @@ fn a_socks_only_stop_without_a_state_dir_enters_only_the_phases_with_work() {
 }
 
 #[skuld::test]
-fn stopping_an_idle_manager_enters_no_phase() {
+fn stopping_an_idle_manager_without_a_state_dir_enters_no_phase() {
     rt().block_on(async {
         let (mut pm, _dir) = new_manager(MockProxy::new());
         let mut seen = Vec::new();
@@ -1712,24 +1712,18 @@ fn stopping_an_idle_manager_enters_no_phase() {
     });
 }
 
-/// The dispatcher and plugin chain are absent under the mocks, so no behavioral
-/// test can show their phases precede their work; pin the source order instead.
 #[skuld::test]
-fn the_engine_and_plugin_phases_are_entered_before_their_work() {
-    let src = include_str!("proxy_manager.rs");
-    let body = &src[src.find("pub async fn stop_with_progress").expect("stop_with_progress")..];
-    let at = |needle: &str| {
-        body.find(needle)
-            .unwrap_or_else(|| panic!("missing in stop_with_progress: {needle}"))
-    };
-    assert!(
-        at("on_phase(StopPhase::StopEngine)") < at("match d.shutdown().await"),
-        "StopEngine must be entered before the dispatcher shutdown"
-    );
-    assert!(
-        at("on_phase(StopPhase::ReapPlugins)") < at("chain.kill_tracked()"),
-        "ReapPlugins must be entered before the plugin reap"
-    );
+fn stopping_an_idle_manager_with_a_state_dir_enters_only_the_target_persist() {
+    rt().block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        let routing = MockRouting::new(dir.path().to_path_buf());
+        let mut pm = ProxyManager::new(MockProxy::new(), routing).with_state_dir(dir.path().to_path_buf());
+        let mut seen = Vec::new();
+        pm.stop_with_progress(SessionEvent::UserStopped, |phase| seen.push(phase))
+            .await
+            .unwrap();
+        assert_eq!(seen, vec![StopPhase::PersistTarget]);
+    });
 }
 
 #[skuld::test]
@@ -3309,6 +3303,52 @@ mod self_test {
                 "lockdown-on subsumes the transient cover"
             );
             assert!(!pm.blocked_until_connected());
+        });
+    }
+
+    /// A pending-start stop releases the transient cover (a WFP release on
+    /// Windows) under a phase of its own: the checkpoint must not still read
+    /// the target-file write while that release runs. Each tuple is a phase and
+    /// the transient-cover disengages completed when it was entered.
+    #[skuld::test]
+    fn a_pending_start_stop_enters_a_phase_before_the_transient_cover_is_released() {
+        rt().block_on(async {
+            let (mut pm, cfg, st, _dir) = covered_gate_setup(false);
+            pm.start_cancellable(&cfg, true, CancellationToken::new())
+                .await
+                .unwrap_err();
+            assert!(pm.blocked_until_connected());
+
+            let mut seen = Vec::new();
+            pm.stop_with_progress(SessionEvent::UserStopped, |phase| {
+                seen.push((phase, st.cover_disengage_calls.load(Ordering::SeqCst)));
+            })
+            .await
+            .unwrap();
+
+            assert_eq!(
+                seen,
+                vec![(StopPhase::PersistTarget, 0), (StopPhase::SettleCover, 0)],
+                "the cover release must follow its phase"
+            );
+            assert_eq!(st.cover_disengage_calls.load(Ordering::SeqCst), 1);
+        });
+    }
+
+    /// The disarm half of the same arm (cutover) has OS work too: closing the
+    /// cover's handle. It is entered under the same phase.
+    #[skuld::test]
+    fn a_pending_start_cutover_stop_enters_the_same_phase_before_disarming() {
+        rt().block_on(async {
+            let (mut pm, cfg, _st, _dir) = covered_gate_setup(false);
+            pm.start_cancellable(&cfg, true, CancellationToken::new())
+                .await
+                .unwrap_err();
+            let mut seen = Vec::new();
+            pm.stop_with_progress(SessionEvent::CutoverRestart, |phase| seen.push(phase))
+                .await
+                .unwrap();
+            assert_eq!(seen, vec![StopPhase::PersistTarget, StopPhase::SettleCover]);
         });
     }
 

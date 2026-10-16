@@ -413,30 +413,21 @@ synchronously (blocks the worker on `netsh`/`route`); converting it to the
 ### Windows service stop reporting
 
 `run_service` reports `SERVICE_STOP_PENDING` with one checkpoint per teardown
-phase ([`StopPhase`](crates/bridge/src/service_stop.rs), in teardown order: stop
-requested, proxy-lock wait, target persist, DNS restore, TUN engine stop, plugin
-reap, proxy stop, route teardown, cover/diagnostics settle, ETW close, resource
-drop, runtime shutdown), and `Stopped` only after the last. The proxy-side phases
-are entered by `ProxyManager::stop_with_progress`, each just before the work it
-names and only when that work exists in the session. The first report is made by
-the control handler the moment Stop/Shutdown arrives, before the main task is
-signalled, so a stop that lands during a startup await no longer reads as
-`Running`. A later phase is reported when the previous one finishes and nothing
-reports on a timer, so a wedged phase freezes the checkpoint where `sc queryex`
-and the cutover/uninstall `NotifyServiceStatusChange` waiters can see it.
+phase ([`StopPhase`](crates/bridge/src/service_stop.rs)), and `Stopped` only
+after the last. The proxy-side phases are entered by
+`ProxyManager::stop_with_progress`, each just before the work it names and only
+when that work exists in the session. The first report is made by the control
+handler the moment Stop/Shutdown arrives, before the main task is signalled, so
+a stop that lands during a startup await does not read as `Running`. A later
+phase is reported when the previous one finishes and nothing reports on a timer,
+so a wedged phase freezes the checkpoint where `sc queryex` and the
+cutover/uninstall `NotifyServiceStatusChange` waiters can see it.
 
-Nothing before the shutdown signal can wait on a log write or on another
-thread: the handler tries the report lock without blocking (a holder is reporting
-a later phase, which supersedes the handler's), signals, and only then logs; the
-main task logs after its report and outside the lock. Each phase entered is
-logged at info (`service stop phase`, with its checkpoint) to `bridge.log`; on an
-msiexec timeout the CI diagnostics print `sc queryex HoleBridge` and those lines.
-A path that fails before teardown (bind failure) skips the proxy and ETW phases.
-
-The wait hints are per-phase estimates, not measurements. The bridge does not
-enforce them and they add no bound to teardown, but the `SERVICE_STATUS` docs let
-the SCM or a service control program treat a checkpoint that stays put past the
-hint as a failed stop, so a client may read a slow phase as hung. Only Windows CI
+Each phase entered is logged at info (`service stop phase`, with its
+checkpoint) to `bridge.log`, by the main task: the control handler does no log
+I/O (see the `service_stop.rs` module doc). On an msiexec timeout the CI
+diagnostics print `sc queryex HoleBridge` and those lines. A path that fails
+before teardown (bind failure) skips the proxy and ETW phases. Only Windows CI
 exercises the SCM side.
 
 ### Spawn-retry & file-contention
