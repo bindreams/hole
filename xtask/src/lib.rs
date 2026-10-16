@@ -783,7 +783,7 @@ pub fn run_version(group: Option<xtask_lib::version::Group>, check: bool, exact:
     Ok(())
 }
 
-pub use xtask_lib::repo_root::repo_root;
+pub use child_env::repo_root;
 
 #[cfg(test)]
 pub mod test_child;

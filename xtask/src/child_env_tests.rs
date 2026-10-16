@@ -114,3 +114,51 @@ fn main_strips_before_anything_else_runs() {
         .expect("main has a body");
     assert_eq!(first_statement, "xtask::child_env::strip_run_injected();");
 }
+
+/// Run a copy of this binary, placed outside the repository (a `CARGO_TARGET_DIR`
+/// or `build.target-dir` elsewhere), in `strip-then-repo-root` mode from a
+/// directory outside it too, with `CARGO_MANIFEST_DIR` set as `cargo run` sets it.
+fn repo_root_from_a_binary_outside_the_repo(manifest_dir: Option<&std::path::Path>) -> std::process::Output {
+    let outside = tempfile::tempdir().expect("tempdir");
+    let exe = outside
+        .path()
+        .join(std::env::current_exe().expect("current_exe").file_name().unwrap());
+    std::fs::copy(std::env::current_exe().expect("current_exe"), &exe).expect("copy the binary out of the repo");
+    let mut cmd = std::process::Command::new(&exe);
+    cmd.env(MODE_ENV, "strip-then-repo-root").current_dir(outside.path());
+    match manifest_dir {
+        Some(dir) => cmd.env("CARGO_MANIFEST_DIR", dir),
+        // The test runner has its own; the control must not inherit it.
+        None => cmd.env_remove("CARGO_MANIFEST_DIR"),
+    };
+    cmd.output().expect("spawn the copied binary")
+}
+
+/// `cargo run` tells the program where its crate is, and the strip removes that
+/// before any subcommand looks for the workspace. Every subcommand must still
+/// find it, whatever the target directory.
+#[skuld::test]
+fn the_workspace_root_is_found_after_the_strip_when_the_binary_lives_outside_the_repo() {
+    let xtask_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let expected = xtask_dir.parent().expect("the xtask crate sits in the workspace");
+
+    // Control: with no `CARGO_MANIFEST_DIR` to start from, the copy cannot find the
+    // repository from where it lives, so the next assertion proves the pin.
+    let control = repo_root_from_a_binary_outside_the_repo(None);
+    assert!(!control.status.success(), "control found a root: {control:?}");
+
+    let out = repo_root_from_a_binary_outside_the_repo(Some(xtask_dir));
+    assert!(
+        out.status.success(),
+        "{:?}\n{}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let found = String::from_utf8(out.stdout).expect("utf-8 path");
+    assert_eq!(
+        std::path::Path::new(found.trim())
+            .canonicalize()
+            .expect("found root exists"),
+        expected.canonicalize().expect("expected root exists")
+    );
+}

@@ -22,6 +22,7 @@ pub fn maybe_run() {
         "interrupt-child" => run_interrupt_child(),
         "list-env" => list_env(),
         "strip-then-list-env-in-child" => strip_then_list_env_in_child(),
+        "strip-then-repo-root" => strip_then_repo_root(),
         other => {
             eprintln!("unknown {MODE_ENV} mode: {other}");
             std::process::exit(2);
@@ -112,4 +113,19 @@ fn strip_then_list_env_in_child() -> ! {
         .expect("spawn child");
     print!("{}", String::from_utf8_lossy(&out.stdout));
     std::process::exit(i32::from(!out.status.success()));
+}
+
+/// Strip the way `main` does, then locate the workspace the way every subcommand does.
+fn strip_then_repo_root() -> ! {
+    crate::child_env::strip_run_injected();
+    match crate::repo_root() {
+        Ok(root) => {
+            println!("{}", root.display());
+            std::process::exit(0);
+        }
+        Err(e) => {
+            eprintln!("{e:#}");
+            std::process::exit(1);
+        }
+    }
 }

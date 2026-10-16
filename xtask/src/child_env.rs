@@ -11,8 +11,31 @@
 //! [`strip_run_injected`] removes the variables from xtask's own environment
 //! once, at startup, so no spawn can inherit them and both spellings of a build
 //! share one set of fingerprints.
+//!
+//! `CARGO_MANIFEST_DIR` is also how [`xtask_lib::repo_root::repo_root`] finds
+//! the workspace when the binary does not live under it (a `CARGO_TARGET_DIR`
+//! or `build.target-dir` elsewhere). The strip therefore resolves the root
+//! first and [`repo_root`] answers from that, so no caller has to know the
+//! variable is gone.
 
 use std::ffi::OsString;
+use std::path::PathBuf;
+use std::sync::OnceLock;
+
+use anyhow::Result;
+
+/// The workspace root, resolved by [`strip_run_injected`] before it removed
+/// the variables the lookup reads.
+static WORKSPACE_ROOT: OnceLock<PathBuf> = OnceLock::new();
+
+/// The workspace root. After [`strip_run_injected`] this is the root it
+/// resolved at startup; before it (tests, library callers) it is looked up now.
+pub fn repo_root() -> Result<PathBuf> {
+    match WORKSPACE_ROOT.get() {
+        Some(root) => Ok(root.clone()),
+        None => xtask_lib::repo_root::repo_root(),
+    }
+}
 
 /// Is `name` one of the variables `cargo run` sets for the program it launches?
 ///
@@ -23,11 +46,17 @@ pub fn is_run_injected(name: &str) -> bool {
     name.starts_with("CARGO_PKG_") || name.starts_with("CARGO_MANIFEST_")
 }
 
-/// Remove the variables `cargo run` injected from this process's environment.
+/// Remove the variables `cargo run` injected from this process's environment,
+/// after resolving the workspace root from them (see the module doc). A root
+/// that cannot be found here is not an error yet: [`repo_root`] looks again
+/// and reports it to the subcommand that needs it.
 ///
 /// Call it first thing in `main`, before any thread exists: `remove_var` races
 /// with every concurrent environment read.
 pub fn strip_run_injected() {
+    if let Ok(root) = xtask_lib::repo_root::repo_root() {
+        let _ = WORKSPACE_ROOT.set(root);
+    }
     let injected: Vec<OsString> = std::env::vars_os()
         .map(|(name, _)| name)
         .filter(|name| name.to_str().is_some_and(is_run_injected))
