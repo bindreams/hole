@@ -9,6 +9,8 @@
 //! from that one list, and a listed id that `prek.toml` does not have is an
 //! error rather than a hook that quietly never runs.
 
+#![allow(clippy::disallowed_methods)] // dev tooling, never privileged
+
 use std::collections::BTreeSet;
 use std::path::Path;
 use std::process::Command;

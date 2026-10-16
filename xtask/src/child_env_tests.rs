@@ -1,3 +1,5 @@
+#![allow(clippy::disallowed_methods)] // dev tooling, never privileged
+
 use crate::child_env::is_run_injected;
 use crate::test_child::MODE_ENV;
 

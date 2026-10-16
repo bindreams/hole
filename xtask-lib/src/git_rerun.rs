@@ -8,6 +8,8 @@
 //! `.git/HEAD` at all (`.git` is a file), so the same happens there. [`rerun_paths`]
 //! therefore resolves every path through git and reports only paths that exist.
 
+#![allow(clippy::disallowed_methods)] // build-script helper: runs as the invoking developer or CI user, never privileged
+
 use std::path::{Path, PathBuf};
 use std::process::Command;
 

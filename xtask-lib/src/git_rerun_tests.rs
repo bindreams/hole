@@ -1,3 +1,5 @@
+#![allow(clippy::disallowed_methods)] // build-script helper tests: run as the invoking developer or CI user, never privileged
+
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
