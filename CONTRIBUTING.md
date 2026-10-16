@@ -363,7 +363,7 @@ directory and the *current directory* before System32
 and a lower-privileged user can influence all of those. Every OS tool is a
 [`util::system_tool::SystemTool`](crates/util/src/system_tool.rs) variant
 (`route`, `ifconfig`, `pfctl`, `networksetup`, `launchctl`, `dseditgroup`, … on
-macOS; `route`, `netsh`, `net`, `powershell`, `pnputil` on Windows), and
+macOS; `route`, `netsh`, `net`, `pnputil` on Windows), and
 `SystemTool::command()` is the only way to build its `Command`: the program is an
 absolute path, on Windows under the directory `GetSystemDirectoryW` reports. A
 root PowerShell is deliberately not a `SystemTool` variant:
