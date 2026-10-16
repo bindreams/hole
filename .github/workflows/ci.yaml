@@ -44,9 +44,10 @@ jobs:
   #
   # WALL (`timeout`, per leg): the largest of 1.25 x the sum of the lanes' worst
   # measured steps over 200 runs (2026-09-11 -> 2026-10-16) rounded up to 5m, the
-  # longest wall a previous job allowed these lanes, and the longest step budget
-  # on the leg plus the time before it, so every step's own bound can fire
-  # (`no_step_budget_exceeds_the_wall_of_a_leg_it_runs_on`). The sum is
+  # longest wall a previous job allowed these lanes, and every step's budget plus
+  # the minute it started on the green run 38897413771, so its own bound fires
+  # before the wall. The audit (`no_step_budget_exceeds_the_wall_of_a_leg_it_runs_on`)
+  # checks only budget <= wall; the start offset is measured, not audited. The sum is
   # pessimistic (the legs share one compile now) and the step budgets below add
   # up to more than the wall, so a leg whose steps all run near their maxima can
   # hit the wall before a late step's own bound: the #989 residual, kept and
@@ -71,7 +72,7 @@ jobs:
           # hooks and the renovate config check; `frontend` = the Vite bundle and
           # type check.
           - { os: windows, arch: amd64, runner: windows-latest,   timeout: 175, cache-saver: true, hole: true, installer: true, ex-ray-unit: true }
-          - { os: windows, arch: arm64, runner: windows-11-arm,   timeout: 60 }
+          - { os: windows, arch: arm64, runner: windows-11-arm,   timeout: 90 }
           - { os: darwin,  arch: amd64, runner: macos-15-intel,   timeout: 305, hole: true, dmg: true }
           - { os: darwin,  arch: arm64, runner: macos-latest,     timeout: 155, cache-saver: true, hole: true, dmg: true, ex-ray-unit: true }
           - { os: linux,   arch: amd64, runner: ubuntu-latest,    timeout: 60,  cache-saver: true, portable-lint: true, ech: true, frontend: true }
