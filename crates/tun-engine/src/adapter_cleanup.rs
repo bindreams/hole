@@ -47,7 +47,7 @@ fn build_remove_adapter_script(tun_name: &str) -> String {
 #[cfg(target_os = "windows")]
 pub fn remove_adapter(tun_name: &str) {
     use tracing::{debug, warn};
-    use util::system_tool::SystemTool;
+    use util::system_tool::SystemPowershell;
 
     // Provenance canary, not a charset filter — `build_remove_adapter_script`
     // itself now escapes any `'` safely, so this is not standing in for that,
@@ -73,7 +73,7 @@ pub fn remove_adapter(tun_name: &str) {
 
     let ps = build_remove_adapter_script(tun_name);
 
-    let result = SystemTool::powershell_command(&ps).and_then(|mut c| c.output());
+    let result = SystemPowershell::command(&ps).and_then(|mut c| c.output());
 
     match result {
         Ok(out) if out.status.success() => {

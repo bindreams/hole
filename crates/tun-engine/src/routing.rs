@@ -2133,6 +2133,8 @@ fn platform_setup_commands(
     // hijack it).
     if !server_ip.to_canonical().is_loopback() {
         let (tool, args) = match (server_ip, gateway.next_hop) {
+            // On-link has no gateway to name, so the route names the interface; only
+            // `netsh interface ip` can do that, unlike the gateway form's `route add`.
             // `store=active`: netsh defaults to `persistent`, which would outlive the
             // session and uninstall; see CONTRIBUTING's Route ownership section.
             (IpAddr::V4(_), NextHop::OnLink) => (

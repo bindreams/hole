@@ -44,7 +44,7 @@
 
 use super::{truncate_utf8, watched_matches, DEBUG_OUTPUT_CAP_BYTES};
 use tracing::{debug, info, warn};
-use util::system_tool::SystemTool;
+use util::system_tool::{SystemPowershell, SystemTool};
 
 /// Emit an NDIS / driver / Hyper-V snapshot.
 ///
@@ -146,7 +146,7 @@ pub fn log_snapshot(phase: &'static str) {
 /// would force every probe to fail the whole snapshot, which is worse
 /// than "one probe says nothing, three others proceed."
 fn run_probe(label: &'static str, ps_command: &str) -> String {
-    report_probe(label, SystemTool::powershell_command(ps_command))
+    report_probe(label, SystemPowershell::command(ps_command))
 }
 
 /// Run `built` and return its stdout, or the error marker string [`run_probe`]

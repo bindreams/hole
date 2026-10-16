@@ -290,7 +290,7 @@ pub fn run_elevated(program: &Path, args: &[&str]) -> Result<(), SetupError> {
     let script = build_elevation_script(program, args);
 
     #[allow(clippy::disallowed_methods)]
-    // runs in the unprivileged GUI as the user (osascript is what elevates), so a PATH lookup gains nothing; see clippy.toml System tools
+    // runs in the unprivileged GUI as the user (osascript is what elevates), so a PATH lookup gains nothing
     let output = std::process::Command::new("osascript").args(["-e", &script]).output()?;
 
     if output.status.success() {

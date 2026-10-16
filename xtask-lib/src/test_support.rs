@@ -1,7 +1,7 @@
 //! Test-only helpers shared across `version_tests.rs` and
 //! `ex_ray_version_tests.rs`. Compiled only under `#[cfg(test)]`.
 
-#![allow(clippy::disallowed_methods)] // dev tooling: runs as the invoking developer or CI user, never privileged; see clippy.toml System tools
+#![allow(clippy::disallowed_methods)] // dev tooling: runs as the invoking developer or CI user, never privileged
 
 use std::path::Path;
 use std::process::Command;

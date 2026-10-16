@@ -1,3 +1,5 @@
+#[cfg(windows)]
+use crate::system_tool::SystemPowershell;
 use crate::system_tool::SystemTool;
 
 /// Where each variant must resolve to (the whole path on macOS, the tail under
@@ -22,7 +24,6 @@ fn expected_path(tool: SystemTool) -> &'static str {
         SystemTool::Route => "route.exe",
         SystemTool::Netsh => "netsh.exe",
         SystemTool::Net => "net.exe",
-        SystemTool::Powershell => "WindowsPowerShell/v1.0/powershell.exe",
         SystemTool::Pnputil => "pnputil.exe",
     };
 }
@@ -218,20 +219,25 @@ fn a_powershell_script_starts_by_setting_the_module_path() {
     );
 }
 
-/// A root PowerShell has no bare-`command()` form: its module path is set by
-/// the script it is given, so the only constructor takes the script.
+/// `SystemPowershell` is not a `SystemTool`, so `SystemTool::command` cannot
+/// build a PowerShell without a script; its path is still absolute, existing
+/// and under the system directory.
 #[cfg(windows)]
 #[skuld::test]
-fn powershell_has_no_scriptless_command() {
-    let err = SystemTool::Powershell.command().unwrap_err();
-    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+fn powershell_resolves_to_its_binary_under_the_system_directory() {
+    let path = SystemPowershell::path().expect("the OS reports its system directory");
+    assert!(path.is_absolute(), "{path:?}");
+    assert!(path.exists(), "{path:?}");
+    assert!(path.ends_with("WindowsPowerShell/v1.0/powershell.exe"), "{path:?}");
+    let system32 = SystemTool::Route.path().unwrap().parent().unwrap().to_path_buf();
+    assert!(path.starts_with(&system32), "{path:?} is outside {system32:?}");
 }
 
 #[cfg(windows)]
 #[skuld::test]
 fn powershell_command_runs_its_script_without_a_profile_after_setting_the_module_path() {
-    let cmd = SystemTool::powershell_command("Get-Date").unwrap();
-    assert_eq!(cmd.get_program(), SystemTool::Powershell.path().unwrap().as_os_str());
+    let cmd = SystemPowershell::command("Get-Date").unwrap();
+    assert_eq!(cmd.get_program(), SystemPowershell::path().unwrap().as_os_str());
     let args: Vec<_> = cmd.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
     assert_eq!(&args[..2], ["-NoProfile", "-Command"]);
     assert_eq!(args.len(), 3);
@@ -242,60 +248,73 @@ fn powershell_command_runs_its_script_without_a_profile_after_setting_the_module
     );
 }
 
-/// PowerShell keeps a `PSModulePath` that differs from the machine's and
-/// rebuilds one that equals it, putting the invoking user's writable
-/// `Documents\WindowsPowerShell\Modules` first. The script's own assignment
-/// must hold in that case too, so the process value is set to the machine value.
-#[cfg(windows)]
-#[skuld::test]
-fn powershell_sees_only_the_system_module_directory_when_the_process_value_is_the_machine_value() {
-    let system32 = SystemTool::Route.path().unwrap().parent().unwrap().to_path_buf();
-    let expected = system32.join("WindowsPowerShell").join("v1.0").join("Modules");
-
-    let machine = SystemTool::powershell_command(
-        "[Console]::Out.Write([Environment]::GetEnvironmentVariable('PSModulePath', 'Machine'))",
-    )
-    .unwrap()
-    .output()
-    .unwrap();
-    assert!(machine.status.success(), "{machine:?}");
-    let machine = String::from_utf8(machine.stdout).unwrap();
-    assert!(!machine.is_empty(), "the machine PSModulePath is unset");
-
-    let out = SystemTool::powershell_command("[Console]::Out.Write($env:PSModulePath)")
-        .unwrap()
-        .env("PSModulePath", &machine) // after the pin: the process value now equals the machine value
-        .output()
-        .unwrap();
-    assert!(out.status.success(), "{out:?}");
-    let seen = String::from_utf8_lossy(&out.stdout).into_owned();
-    assert!(
-        seen.eq_ignore_ascii_case(&expected.to_string_lossy()),
-        "expected only {expected:?}, saw {seen:?} (machine value {machine:?})"
-    );
-}
-
 #[cfg(windows)]
 #[skuld::test]
 fn powershell_command_pins_psmodulepath_to_the_system_module_directory() {
-    let cmd = SystemTool::Powershell.command().unwrap();
+    let cmd = SystemPowershell::command("Get-Date").unwrap();
     let pinned = cmd
         .get_envs()
         .find(|(k, _)| k.eq_ignore_ascii_case("PSModulePath"))
         .and_then(|(_, v)| v)
         .expect("a root PowerShell must not inherit PSModulePath");
-    let system32 = SystemTool::Route.path().unwrap().parent().unwrap().to_path_buf();
-    let expected = system32.join("WindowsPowerShell").join("v1.0").join("Modules");
-    assert_eq!(std::path::Path::new(pinned), expected);
+    assert_eq!(std::path::Path::new(pinned), system_module_directory());
 }
 
+#[cfg(windows)]
+fn system_module_directory() -> std::path::PathBuf {
+    let system32 = SystemTool::Route.path().unwrap().parent().unwrap().to_path_buf();
+    system32.join("WindowsPowerShell").join("v1.0").join("Modules")
+}
+
+/// Runs `script` in a root PowerShell with stdout as UTF-8, and returns it.
+#[cfg(windows)]
+fn powershell_stdout(script: &str, process_module_path: Option<&str>) -> String {
+    let script = format!("[Console]::OutputEncoding = New-Object System.Text.UTF8Encoding $false; {script}");
+    let mut cmd = SystemPowershell::command(&script).unwrap();
+    if let Some(value) = process_module_path {
+        cmd.env("PSModulePath", value); // after the pin: overrides it
+    }
+    let out = cmd.output().unwrap();
+    assert!(out.status.success(), "{out:?}");
+    String::from_utf8(out.stdout).unwrap()
+}
+
+/// PowerShell keeps a `PSModulePath` that differs from the machine's and
+/// rebuilds one that equals it, putting the invoking user's writable
+/// `Documents\WindowsPowerShell\Modules` first. With the process value forced
+/// to the machine value, the modules PowerShell can resolve are the oracle:
+/// every one must live under the system module directory.
+#[cfg(windows)]
+#[skuld::test]
+fn powershell_resolves_modules_only_from_the_system_module_directory_when_the_process_value_is_the_machine_value() {
+    let machine = powershell_stdout(
+        "[Console]::Out.Write([Environment]::GetEnvironmentVariable('PSModulePath', 'Machine'))",
+        None,
+    );
+    assert!(!machine.is_empty(), "the machine PSModulePath is unset");
+
+    let bases = powershell_stdout(
+        "[Console]::Out.Write(((Get-Module -ListAvailable | ForEach-Object { $_.ModuleBase }) -join '|'))",
+        Some(&machine),
+    );
+    assert!(
+        !bases.is_empty(),
+        "no module is resolvable, so the check proves nothing"
+    );
+    let allowed = system_module_directory().to_string_lossy().to_ascii_lowercase();
+    for base in bases.split('|') {
+        assert!(
+            base.to_ascii_lowercase().starts_with(&allowed),
+            "module at {base:?} resolved from outside {allowed:?} (machine value {machine:?})"
+        );
+    }
+}
+
+/// None of the `SystemTool`s is a PowerShell, so none carries its module pin.
 #[cfg(windows)]
 #[skuld::test]
 fn the_other_windows_tools_leave_psmodulepath_alone() {
     for &tool in SystemTool::ALL {
-        if tool == SystemTool::Powershell {
-            continue;
-        }
         let cmd = tool.command().unwrap();
         assert!(
             cmd.get_envs().all(|(k, _)| !k.eq_ignore_ascii_case("PSModulePath")),

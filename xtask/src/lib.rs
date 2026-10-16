@@ -547,7 +547,7 @@ pub fn run_golangci_lint(args: &[String]) -> Result<()> {
     // directory, so it has to run inside the Go module rather than the root.
     let module = repo_root.join("crates").join("ex-ray");
     #[allow(clippy::disallowed_methods)]
-    // dev tooling: the golangci-lint this xtask just installed, run as the developer; see clippy.toml System tools
+    // dev tooling: the golangci-lint this xtask just installed, run as the developer
     let status = std::process::Command::new(&path)
         .args(args)
         .current_dir(&module)

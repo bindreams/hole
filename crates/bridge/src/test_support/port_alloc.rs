@@ -185,7 +185,7 @@ pub(crate) async fn wait_for_port(addr: SocketAddr, timeout: Duration) {
 /// source — different code path (kernel NETSTAT IOCTL vs NetTCPIP WMI),
 /// rules out PowerShell-module corruption.
 #[cfg(windows)]
-#[allow(clippy::disallowed_methods)] // test diagnostics spawn host tools by name (attended); see clippy.toml System tools
+#[allow(clippy::disallowed_methods)] // test diagnostics spawn host tools by name (attended)
 fn capture_windows_tcp_state(port: u16) {
     // Primary: PowerShell Get-NetTCPConnection.
     let ps_cmd = format!(

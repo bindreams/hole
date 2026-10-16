@@ -60,7 +60,7 @@ fn successor_env(show_dashboard: bool) -> Option<&'static str> {
 pub fn spawn_successor(canonical: &Path, show_dashboard: bool) -> std::io::Result<()> {
     use std::io::BufRead;
     #[allow(clippy::disallowed_methods)]
-    // spawns Hole's own canonical image (an absolute path), not an OS tool; see clippy.toml System tools
+    // spawns Hole's own canonical image (an absolute path), not an OS tool
     let mut command = std::process::Command::new(canonical);
     command
         .args(successor_args(show_dashboard))

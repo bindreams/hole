@@ -364,14 +364,16 @@ and a lower-privileged user can influence all of those. Every OS tool is a
 [`util::system_tool::SystemTool`](crates/util/src/system_tool.rs) variant
 (`route`, `ifconfig`, `pfctl`, `networksetup`, `launchctl`, `dseditgroup`, … on
 macOS; `route`, `netsh`, `net`, `powershell`, `pnputil` on Windows), and
-`SystemTool::command()` is the only way to build its `Command` (a root PowerShell
-is built by `SystemTool::powershell_command(script)` instead): the program is an
-absolute path, on Windows under the directory `GetSystemDirectoryW` reports. If
+`SystemTool::command()` is the only way to build its `Command`: the program is an
+absolute path, on Windows under the directory `GetSystemDirectoryW` reports. A
+root PowerShell is deliberately not a `SystemTool` variant:
+`util::system_tool::SystemPowershell::command(script)` is its only constructor, so
+a PowerShell without the module pin below cannot be written. If
 that call fails, `path()`/`command()` return the error and the caller carries it
 as its spawn error (`CommandFailure::Spawn`, or the `io::Error` it already
 returns), so a best-effort teardown logs it and goes on. The root PowerShell
 child gets `PSModulePath` set to the system module directory alone, both in its
-environment and by an assignment `powershell_command` prepends to every script
+environment and by an assignment `SystemPowershell::command` prepends to every script
 (PowerShell rebuilds an inherited value equal to the machine's, so the
 environment alone does not hold): its default begins with the invoking user's
 writable `Documents\WindowsPowerShell\Modules`, and cmdlet autoload would run a

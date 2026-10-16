@@ -205,7 +205,7 @@ mod windows {
     ) -> std::io::Result<std::process::Child> {
         let exe = std::env::current_exe()?;
         #[allow(clippy::disallowed_methods)]
-        // Hole's own executable by absolute path, not an OS tool; see clippy.toml System tools
+        // Hole's own executable by absolute path, not an OS tool
         let mut cmd = std::process::Command::new(exe);
         cmd.args([
             "bridge",
@@ -230,7 +230,7 @@ mod windows {
             None => (cmdline, ""),
         };
         #[allow(clippy::disallowed_methods)]
-        // test seam: spawns the test's own observable command (attended); see clippy.toml System tools
+        // test seam: spawns the test's own observable command (attended)
         let mut cmd = std::process::Command::new(program);
         if !rest.is_empty() {
             cmd.raw_arg(rest);

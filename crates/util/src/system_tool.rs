@@ -6,7 +6,9 @@
 //! *current directory* before System32 (see
 //! <https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-createprocessw>,
 //! "lpApplicationName"). [`SystemTool::command`] is the only way to build a
-//! `Command` for these tools, and its program is always an absolute path.
+//! `Command` for these tools, and its program is always an absolute path. A root
+//! PowerShell is the one tool that is not a [`SystemTool`]: it needs a script
+//! that confines its module path, so `SystemPowershell` (Windows) builds it.
 //!
 //! The Windows directory is read from the OS (`GetSystemDirectoryW`), never
 //! assumed to be `C:\Windows` and never replaced by a bare name when the read
@@ -36,7 +38,6 @@ macro_rules! system_tools {
 mod tools {
     use std::io;
     use std::path::PathBuf;
-    use std::process::Command;
 
     system_tools! {
         "An OS tool the macOS bridge spawns, at its fixed absolute path.",
@@ -85,15 +86,6 @@ mod tools {
                 Self::Logname => "logname",
             }
         }
-
-        pub(super) fn pin_environment(self, _command: &mut Command) -> io::Result<()> {
-            Ok(())
-        }
-
-        /// Every macOS tool is built by [`command`](SystemTool::command) alone.
-        pub(super) fn ensure_scriptless(self) -> io::Result<()> {
-            Ok(())
-        }
     }
 }
 
@@ -109,7 +101,6 @@ mod tools {
         Route,
         Netsh,
         Net,
-        Powershell,
         Pnputil,
     }
 
@@ -121,7 +112,6 @@ mod tools {
                 Self::Route => system32.join("route.exe"),
                 Self::Netsh => system32.join("netsh.exe"),
                 Self::Net => system32.join("net.exe"),
-                Self::Powershell => system32.join("WindowsPowerShell").join("v1.0").join("powershell.exe"),
                 Self::Pnputil => system32.join("pnputil.exe"),
             })
         }
@@ -132,43 +122,56 @@ mod tools {
                 Self::Route => "route",
                 Self::Netsh => "netsh",
                 Self::Net => "net",
-                Self::Powershell => "powershell",
                 Self::Pnputil => "pnputil",
-            }
-        }
-
-        /// A root PowerShell autoloads cmdlets from `PSModulePath`, whose default
-        /// begins with the invoking user's `Documents\WindowsPowerShell\Modules`
-        /// (user-writable), so the child gets only the system module directory.
-        /// This pin alone is not enough: PowerShell rebuilds a `PSModulePath`
-        /// equal to the machine's, so [`SystemTool::powershell_command`] also
-        /// sets it from inside the script.
-        pub(super) fn pin_environment(self, command: &mut Command) -> io::Result<()> {
-            match self {
-                Self::Powershell => {
-                    command.env("PSModulePath", powershell_module_directory()?);
-                }
-                Self::Route | Self::Netsh | Self::Net | Self::Pnputil => {}
-            }
-            Ok(())
-        }
-
-        /// Whether [`command`](SystemTool::command) may build this tool without
-        /// more input. A root PowerShell may not: its module path is set by the
-        /// script it runs, so it is built only by
-        /// [`powershell_command`](SystemTool::powershell_command).
-        pub(super) fn ensure_scriptless(self) -> io::Result<()> {
-            match self {
-                Self::Powershell => Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "PowerShell is built with SystemTool::powershell_command, which sets its module path",
-                )),
-                Self::Route | Self::Netsh | Self::Net | Self::Pnputil => Ok(()),
             }
         }
     }
 
-    pub(super) fn powershell_module_directory() -> io::Result<PathBuf> {
+    /// The system `powershell.exe`. Not a [`SystemTool`](super::SystemTool): a
+    /// root PowerShell autoloads cmdlets from `PSModulePath`, whose default
+    /// begins with the invoking user's writable
+    /// `Documents\WindowsPowerShell\Modules`, so it may only be built together
+    /// with the script that confines that path, and [`command`](Self::command)
+    /// is its only constructor.
+    pub struct SystemPowershell;
+
+    impl SystemPowershell {
+        /// The absolute path of `powershell.exe`.
+        ///
+        /// # Errors
+        ///
+        /// When `GetSystemDirectoryW` fails (see
+        /// [`SystemTool::path`](super::SystemTool::path)).
+        pub fn path() -> io::Result<PathBuf> {
+            Ok(system_directory()?
+                .join("WindowsPowerShell")
+                .join("v1.0")
+                .join("powershell.exe"))
+        }
+
+        /// `powershell.exe -NoProfile -Command <script>`, where the script first
+        /// sets `$env:PSModulePath` to the system module directory. The child's
+        /// environment carries the same value, but that alone does not hold:
+        /// PowerShell rebuilds an inherited value equal to the machine's with the
+        /// user's writable directory in front, whereas autoload reads
+        /// `$env:PSModulePath` as the script left it.
+        ///
+        /// # Errors
+        ///
+        /// As [`path`](Self::path).
+        #[allow(clippy::disallowed_methods)] // a sanctioned constructor, like `SystemTool::command`
+        pub fn command(script: &str) -> io::Result<Command> {
+            let modules = module_directory()?;
+            let mut command = Command::new(Self::path()?);
+            command
+                .env("PSModulePath", &modules)
+                .args(["-NoProfile", "-Command"])
+                .arg(super::module_path_script(&modules.to_string_lossy(), script));
+            Ok(command)
+        }
+    }
+
+    fn module_directory() -> io::Result<PathBuf> {
         Ok(system_directory()?
             .join("WindowsPowerShell")
             .join("v1.0")
@@ -229,6 +232,9 @@ mod tools {
 pub use tools::SystemTool;
 
 #[cfg(windows)]
+pub use tools::SystemPowershell;
+
+#[cfg(windows)]
 #[cfg(test)]
 pub(crate) use tools::{cached_system_directory, read_system_directory};
 
@@ -244,43 +250,14 @@ impl SystemTool {
     }
 
     /// The only sanctioned constructor of a `Command` for a system tool. Its
-    /// program is [`path`](Self::path), never a bare name, and its environment is
-    /// pinned where the tool would otherwise search a user-writable place.
+    /// program is [`path`](Self::path), never a bare name.
     ///
     /// # Errors
     ///
     /// As [`path`](Self::path).
     #[allow(clippy::disallowed_methods)] // this IS the sanctioned constructor; clippy.toml routes every other site here
     pub fn command(self) -> io::Result<Command> {
-        self.ensure_scriptless()?;
-        self.build()
-    }
-
-    #[allow(clippy::disallowed_methods)] // as `command`
-    fn build(self) -> io::Result<Command> {
-        let mut command = Command::new(self.path()?);
-        self.pin_environment(&mut command)?;
-        Ok(command)
-    }
-
-    /// The only constructor of a root PowerShell `Command`: `-NoProfile
-    /// -Command <script>`, where the script first sets `$env:PSModulePath` to
-    /// the system module directory. Autoload reads `$env:PSModulePath`, so
-    /// setting it from inside the script holds on a host where PowerShell would
-    /// rebuild the inherited value with the invoking user's writable module
-    /// directory in front.
-    ///
-    /// # Errors
-    ///
-    /// As [`path`](Self::path).
-    #[cfg(windows)]
-    pub fn powershell_command(script: &str) -> io::Result<Command> {
-        let modules = tools::powershell_module_directory()?;
-        let mut command = Self::Powershell.build()?;
-        command
-            .args(["-NoProfile", "-Command"])
-            .arg(module_path_script(&modules.to_string_lossy(), script));
-        Ok(command)
+        Ok(Command::new(self.path()?))
     }
 
     /// The argv text for logging: the absolute path followed by `args`. When the
