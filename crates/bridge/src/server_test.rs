@@ -7,7 +7,7 @@
 //! reports a granular per-phase outcome. Concurrent calls are safe — each
 //! gets its own plugin process and its own [`ProxyClientStream`].
 
-use crate::proxy::resolve_plugin_path_inner;
+use crate::proxy::{resolve_plugin_path_inner, PluginPath};
 use hole_common::config::ServerEntry;
 use hole_common::protocol::{ServerTestOutcome, LATENCY_VALIDATED_ON_CONNECT};
 use shadowsocks::config::{ServerAddr, ServerConfig, ServerType};
@@ -48,8 +48,8 @@ pub struct TestConfig {
     /// Optional override for the plugin path. `None` → use
     /// [`resolve_plugin_path_inner`]. Tests use this to point at a specific
     /// on-disk plugin binary (the xtask-built `ex-ray`, or a provisioned
-    /// upstream v2ray-plugin) without depending on `PATH`.
-    pub plugin_path_override: Option<String>,
+    /// upstream v2ray-plugin) rather than the one next to the test binary.
+    pub plugin_path_override: Option<PluginPath>,
     /// User's resolver config for the private-DoH server bootstrap.
     pub dns: hole_common::config::DnsConfig,
     /// Test-only DoH querier override. When present, `run_server_test` resolves
@@ -356,10 +356,11 @@ async fn maybe_start_plugin(
         return Ok(None);
     };
 
-    let plugin_path = cfg
-        .plugin_path_override
-        .clone()
-        .unwrap_or_else(|| resolve_plugin_path_inner(plugin_name, std::env::current_exe().ok()));
+    let plugin_path = match cfg.plugin_path_override.clone() {
+        Some(path) => path,
+        None => resolve_plugin_path_inner(plugin_name, std::env::current_exe().ok())
+            .map_err(|e| ServerTestOutcome::PluginStartFailed { detail: e.to_string() })?,
+    };
 
     // Hand the chain the DoH-resolved bracket-safe host (not the entry's
     // unresolved hostname), so garter recombines a valid `host:port`.

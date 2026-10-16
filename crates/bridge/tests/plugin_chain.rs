@@ -22,6 +22,7 @@ fn main() {
 
 use std::path::PathBuf;
 
+use hole_bridge::proxy::config::PluginPath;
 use hole_bridge::proxy::plugin::start_plugin_chain;
 use tokio_util::sync::CancellationToken;
 
@@ -29,10 +30,11 @@ use tokio_util::sync::CancellationToken;
 /// remaps it under `--archive-file`); the compile-time value covers plain
 /// `cargo test`. Never invoke cargo here — a concurrent build's uplift
 /// deletes+recreates `target/debug/<bin>`, racing this spawn.
-fn test_plugin_path() -> PathBuf {
-    std::env::var("CARGO_BIN_EXE_test_plugin")
+fn test_plugin_path() -> PluginPath {
+    let path: PathBuf = std::env::var("CARGO_BIN_EXE_test_plugin")
         .unwrap_or_else(|_| env!("CARGO_BIN_EXE_test_plugin").to_string())
-        .into()
+        .into();
+    PluginPath::from_absolute(path).expect("cargo hands out an absolute bin path")
 }
 
 /// Two properties in one spawn: the options Hole merges must arrive in the
@@ -44,7 +46,7 @@ async fn the_merged_options_reach_the_child_and_its_output_reaches_the_ring() {
     let cancel = CancellationToken::new();
     let chain = start_plugin_chain(
         "v2ray-plugin",
-        test_plugin_path().to_str().expect("utf-8 path"),
+        &test_plugin_path(),
         Some("host=example.com;path=/foo"),
         "127.0.0.1",
         9,
@@ -84,7 +86,7 @@ async fn a_bind_conflict_is_retried_on_a_fresh_port() {
     let cancel = CancellationToken::new();
     let chain = start_plugin_chain(
         "v2ray-plugin",
-        test_plugin_path().to_str().expect("utf-8 path"),
+        &test_plugin_path(),
         Some(&opts),
         "127.0.0.1",
         9,
@@ -154,12 +156,13 @@ async fn a_failed_chain_start_reports_the_plugin_ring() {
             .with_filter(tracing_subscriber::filter::LevelFilter::WARN),
     );
 
+    let dir = tempfile::tempdir().expect("tempdir");
     let cancel = CancellationToken::new();
     {
         let _guard = garter::tracing_test::set_default_in_current_thread(subscriber);
         let err = start_plugin_chain(
             "v2ray-plugin",
-            "/nonexistent/plugin-binary",
+            &PluginPath::from_absolute(dir.path().join("plugin-binary")).expect("absolute"),
             Some("host=example.com"),
             "127.0.0.1",
             9,
@@ -208,7 +211,7 @@ async fn a_crash_on_stderr_reaches_the_ring_before_the_chain_reports_failure() {
         let _guard = garter::tracing_test::set_default_in_current_thread(subscriber);
         let err = start_plugin_chain(
             "v2ray-plugin",
-            test_plugin_path().to_str().expect("utf-8 path"),
+            &test_plugin_path(),
             Some("host=example.com;fail-stderr-then-exit=fatal: injected crash on stderr"),
             "127.0.0.1",
             9,

@@ -15,7 +15,7 @@
 //!
 //! Each `DistHarness::spawn()` call runs `hole bridge run` from that
 //! directory, which means `current_exe()` is `dist/bin/hole` and
-//! `resolve_plugin_path` finds the named plugin next to it — the same
+//! `resolve_plugin_path_inner` finds the named plugin next to it — the same
 //! resolution path production uses. The plugin found depends on the
 //! config name: `v2ray-plugin` → `ex-ray`, `galoshes` → `galoshes`.
 //!

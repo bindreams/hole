@@ -207,7 +207,8 @@ impl ChainPlugin for BinaryPlugin {
         ready: oneshot::Sender<Result<PluginReady, StartError>>,
     ) -> crate::Result<()> {
         let env = self.sip003_env(local, remote)?;
-        // A bare name reaches here only if the caller's resolution left one.
+        // Hole's bridge passes an absolute `PluginPath`; a bare name reaches here only
+        // from other callers (tests, tooling), which are not privileged.
         #[allow(clippy::disallowed_methods)]
         let mut cmd = Command::new();
         #[allow(clippy::disallowed_methods)]

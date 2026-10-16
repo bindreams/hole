@@ -1784,52 +1784,55 @@ fn stop_with_cutover_disarms_lockdown_but_user_stop_disengages() {
 
 // lockdown_app_ids ====================================================================================================
 //
-// `resolve_plugin_path` deliberately falls back to the bare binary name when
-// it can't find the plugin next to the bridge exe, so shadowsocks can still
-// do a PATH lookup at spawn (see its own doc). `FwpmGetAppIdFromFileName0`
-// does no PATH search, so that bare name is not a resolvable path for it.
+// The plugin's App-ID permit is derived from the `PluginPath` the plugin chain
+// was spawned from, so there is no unresolvable-plugin case to handle: a bare
+// name is not expressible as a `PluginPath`.
 
-/// A bare (no directory component) plugin name must be omitted from the
-/// App-ID list with a `warn!`, mirroring the `current_exe()`-failure
-/// handling — a narrowed permit set, never a fatal error, and never a bare
-/// name fed to the Win32 App-ID API.
+/// The permit list holds the very file the chain spawned, then the bridge exe.
 #[cfg(target_os = "windows")]
 #[skuld::test]
-fn lockdown_app_ids_skips_an_unresolvable_plugin_path() {
-    use crate::test_support::log_capture::VecWriter;
-    use tracing_subscriber::fmt;
-    use tracing_subscriber::layer::{Layer, SubscriberExt};
+fn lockdown_app_ids_permits_the_spawned_plugin_binary_and_the_bridge_exe() {
+    let dir = tempfile::tempdir().unwrap();
+    let plugin = crate::proxy::config::PluginPath::from_absolute(dir.path().join("ex-ray.exe")).unwrap();
 
-    let writer = VecWriter::new();
-    let subscriber = tracing_subscriber::registry().with(
-        fmt::layer()
-            .with_writer(writer.clone())
-            .with_ansi(false)
-            .with_filter(tracing_subscriber::filter::LevelFilter::WARN),
-    );
-    let _guard = garter::tracing_test::set_default_in_current_thread(subscriber);
+    let ids = lockdown_app_ids(Some(&plugin));
 
-    let mut config = test_config();
-    // Not a known friendly plugin name and not a file that exists next to
-    // the test binary — `resolve_plugin_path` falls back to this bare
-    // string verbatim.
-    config.server.plugin = Some("definitely-not-a-real-plugin-binary".into());
+    assert_eq!(ids.first().map(PathBuf::as_path), Some(plugin.as_path()));
+    assert_eq!(ids.last(), std::env::current_exe().ok().as_ref());
+}
 
-    let ids = lockdown_app_ids(&config);
-
-    assert!(
-        ids.iter()
-            .all(|p| p.parent().is_some_and(|d| !d.as_os_str().is_empty())),
-        "no bare (unresolvable) path may reach the App-ID list: {ids:?}"
-    );
-    let output = writer.snapshot_string();
-    assert!(
-        output.contains("WARN") && output.contains("App-ID"),
-        "expected a WARN log naming the omitted App-ID permit; got:\n{output}"
-    );
+#[cfg(target_os = "windows")]
+#[skuld::test]
+fn lockdown_app_ids_without_a_plugin_holds_only_the_bridge_exe() {
+    assert_eq!(lockdown_app_ids(None), vec![std::env::current_exe().unwrap()]);
 }
 
 // last_error coverage for early-failure paths =========================================================================
+
+/// A plugin Hole does not ship is refused with the typed error before the
+/// proxy is ever started; the user-visible `last_error` names the plugin and
+/// lists the bundled ones.
+#[skuld::test]
+fn unbundled_plugin_is_refused_before_anything_starts() {
+    rt().block_on(async {
+        let backend = MockProxy::new();
+        let state = backend.state_handle();
+        let (mut pm, _dir) = new_manager(backend);
+        let mut config = test_config();
+        config.server.plugin = Some("kcptun".into());
+
+        let err = pm.start(&config).await.unwrap_err();
+
+        assert!(
+            matches!(&err, ProxyError::PluginResolve(crate::proxy::config::PluginResolveError::NotBundled { name }) if name == "kcptun"),
+            "got: {err:?}"
+        );
+        assert_eq!(state.start_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(pm.state(), ProxyState::Stopped);
+        let last = pm.last_error().expect("refusal must set last_error");
+        assert!(last.contains("kcptun") && last.contains("Bundled plugins:"), "{last}");
+    });
+}
 
 #[skuld::test]
 fn build_config_failure_sets_last_error() {
@@ -2746,9 +2749,10 @@ fn bare_ss_dials_doh_resolved_ip_not_hostname() {
 #[skuld::test]
 fn socks_only_with_plugin_resolves_via_doh_for_handoff() {
     // SocksOnly returns early (no routing), but the plugin-chain handoff still
-    // needs the DoH-resolved IP. The plugin binary is nonexistent so the chain
-    // fails; we assert the FAILURE is the plugin spawn (resolve already ran and
-    // succeeded) — i.e. NOT a DohBootstrap error.
+    // needs the DoH-resolved IP. No `ex-ray` sits next to the test binary so
+    // the plugin cannot be resolved; we assert the FAILURE is the plugin
+    // resolution (the DoH resolve already ran and succeeded) — i.e. NOT a
+    // DohBootstrap error.
     let expected: IpAddr = "203.0.113.7".parse().unwrap();
     rt().block_on(async {
         let (mut pm, _dir) = new_manager(MockProxy::new());
@@ -2757,11 +2761,11 @@ fn socks_only_with_plugin_resolves_via_doh_for_handoff() {
             ip: expected,
         }));
         let mut config = doh_config_with_server_host("proxy.example", TunnelMode::SocksOnly);
-        config.server.plugin = Some("definitely-not-a-real-plugin-binary".into());
+        config.server.plugin = Some("v2ray-plugin".into());
         let err = pm.start(&config).await.unwrap_err();
         assert!(
-            matches!(err, ProxyError::Plugin(_)),
-            "expected plugin-spawn failure AFTER a successful DoH resolve, got {err:?}"
+            matches!(err, ProxyError::PluginResolve(_)),
+            "expected plugin-resolution failure AFTER a successful DoH resolve, got {err:?}"
         );
         assert!(
             !matches!(err, ProxyError::DohBootstrap(_)),
@@ -3655,9 +3659,8 @@ mod self_test {
             cfg.server.plugin = Some("ex-ray".into());
             cfg.server.plugin_opts = Some(ECH_CAPABLE_OPTS.into());
             // Forces the forwarder self-test gate, which MockProxy cannot satisfy —
-            // deterministic regardless of whether a real `ex-ray` happens to be on
-            // PATH on this host (resolve_plugin_path_inner falls back to a bare-name
-            // PATH lookup when no sibling binary exists).
+            // deterministic: no `ex-ray` sits next to the test binary, so the plugin
+            // cannot start whatever else is installed on this host.
             cfg.dns.enabled = true;
             cfg.dns.servers = vec![failing_resolver, answering_resolver];
             let _ = pm
@@ -4825,6 +4828,18 @@ mod self_test {
                 let dir = tempfile::tempdir().unwrap();
                 let routing = MockRouting::new(dir.path().to_path_buf());
                 let (mut pm, _dir) = new_manager_with_lockdown(MockProxy::new(), routing, dir, false);
+                // The real spawn only happens once the plugin resolves: give it an
+                // install dir holding a (non-executable) `ex-ray`, so the spawn is
+                // reached and fails after `inject_plugin_directives` has run.
+                let install = tempfile::tempdir().unwrap();
+                let exe = install.path().join(if cfg!(windows) { "hole.exe" } else { "hole" });
+                std::fs::write(&exe, b"fake").unwrap();
+                std::fs::write(
+                    install.path().join(if cfg!(windows) { "ex-ray.exe" } else { "ex-ray" }),
+                    b"not a program",
+                )
+                .unwrap();
+                pm.set_bridge_exe_for_test(exe);
                 let mut cfg = test_config();
                 cfg.server.server = "203.0.113.9".into();
                 cfg.server.plugin = Some("ex-ray".into());

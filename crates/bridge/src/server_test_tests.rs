@@ -311,12 +311,11 @@ fn run_test_returns_server_cannot_reach_internet_when_sentinels_close_empty() {
     });
 }
 
-/// Test 9: plugin start failure for a non-existent plugin binary.
+/// Test 9: a plugin Hole does not ship is refused, not looked up.
 ///
 /// The runner asks for a plugin called `plugin-that-does-not-exist`, which
-/// is not on PATH and not next to any plugin directory. `Plugin::start`
-/// returns Err immediately, surfaced as
-/// [`ServerTestOutcome::PluginStartFailed`].
+/// Hole does not bundle. Resolution refuses it before any spawn, surfaced as
+/// [`ServerTestOutcome::PluginStartFailed`] naming the bundled plugins.
 #[skuld::test(labels = [PORT_ALLOC], serial = PORT_ALLOC)]
 fn run_test_returns_plugin_start_failed_for_bad_plugin_path() {
     rt().block_on(async {
@@ -336,7 +335,10 @@ fn run_test_returns_plugin_start_failed_for_bad_plugin_path() {
         let outcome = run_server_test(&entry, &cfg).await;
         match outcome {
             ServerTestOutcome::PluginStartFailed { detail } => {
-                assert!(!detail.is_empty(), "detail should describe the failure");
+                assert!(
+                    detail.contains("plugin-that-does-not-exist") && detail.contains("Bundled plugins:"),
+                    "detail should name the plugin and list the bundled ones: {detail}"
+                );
             }
             other => panic!("expected PluginStartFailed, got {other:?}"),
         }
@@ -425,7 +427,9 @@ fn run_test_with_v2ray_plugin_happy_path() {
         // Generous plugin window for cold start. fast_test_config's 800 ms
         // SS/sentinel timeouts are too short for the WS handshake.
         let cfg = TestConfig {
-            plugin_path_override: Some(plugin_path.to_str().unwrap().to_string()),
+            plugin_path_override: Some(
+                crate::proxy::config::PluginPath::from_absolute(plugin_path.clone()).expect("absolute"),
+            ),
             // Generous SS connect/sentinel timeouts because the WS handshake
             // adds latency on top of the raw TCP connect.
             ss_connect_timeout: Duration::from_secs(5),
@@ -482,7 +486,9 @@ fn maybe_start_plugin_preserves_eih_identity_keys() {
         let (sentinel_a, _sa) = start_fake_sentinel(b"HTTP/1.0 200 OK\r\n\r\n".to_vec()).await;
         let (sentinel_b, _sb) = start_fake_sentinel(b"HTTP/1.0 200 OK\r\n\r\n".to_vec()).await;
         let cfg = TestConfig {
-            plugin_path_override: Some(plugin_path.to_str().unwrap().to_string()),
+            plugin_path_override: Some(
+                crate::proxy::config::PluginPath::from_absolute(plugin_path.clone()).expect("absolute"),
+            ),
             ..fast_test_config(sentinel_a, sentinel_b)
         };
 
@@ -887,8 +893,8 @@ fn run_test_reclassify_cannot_reach_reset_is_network_blocked() {
 }
 
 /// The plugin path runs the same IPv6 preflight before spawning the plugin. A
-/// live `[::1]:port` listener makes preflight pass; a bogus plugin name then
-/// fails at spawn → `PluginStartFailed`. Reaching plugin-start proves preflight
+/// live `[::1]:port` listener makes preflight pass; an unbundled plugin name then
+/// is refused at plugin start → `PluginStartFailed`. Reaching plugin-start proves preflight
 /// connected to the raw IPv6 IP rather than failing `DnsFailed` on the bracket.
 #[skuld::test]
 fn plugin_preflight_uses_raw_ipv6_not_bracketed_host() {
@@ -907,7 +913,7 @@ fn plugin_preflight_uses_raw_ipv6_not_bracketed_host() {
             ServerTestOutcome::PluginStartFailed { detail } => {
                 assert!(!detail.is_empty(), "detail should describe the failure");
             }
-            other => panic!("plugin preflight must pass on raw IPv6 then fail at spawn, got {other:?}"),
+            other => panic!("plugin preflight must pass on raw IPv6 then fail at plugin start, got {other:?}"),
         }
     });
 }

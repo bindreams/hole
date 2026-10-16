@@ -14,6 +14,7 @@ use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 use util::port_alloc;
 
+use super::config::{bundled_plugin, PluginPath};
 use super::ProxyError;
 
 const READINESS_TIMEOUT: Duration = Duration::from_secs(30);
@@ -133,7 +134,7 @@ impl Drop for PluginChain {
 #[allow(clippy::too_many_arguments)] // bundling into a struct adds more noise than the warning; matches spawn_plugin_runner_at below.
 pub async fn start_plugin_chain(
     plugin_name: &str,
-    plugin_path: &str,
+    plugin_path: &PluginPath,
     plugin_opts: Option<&str>,
     server_host: &str,
     server_port: u16,
@@ -143,16 +144,16 @@ pub async fn start_plugin_chain(
     cancel: &CancellationToken,
     ech_doh: Option<&crate::dns::ech::EchDoh>,
 ) -> Result<PluginChain, ProxyError> {
+    // Refuse a plugin Hole does not ship before anything is allocated or
+    // spawned, whatever `plugin_path` says: the privileged bridge runs only
+    // bundled plugins.
+    let descriptor = bundled_plugin(plugin_name)?;
     // Inject Hole-owned SIP003 directives — see `inject_plugin_directives`.
     let merged_opts = inject_plugin_directives(plugin_name, plugin_opts, ech_doh)?;
-    // Resolve the config name to its on-disk binary name before sizing the
-    // handoff port — `plugin_alloc_protocols` is keyed by binary name so
-    // `v2ray-plugin` (→ `ex-ray`) and unknown plugins get a TCP-only port
-    // while galoshes gets a UDP-capable one (#414).
-    let binary = hole_common::plugin::lookup(plugin_name)
-        .map(|d| d.binary_name)
-        .unwrap_or(plugin_name);
-    let protocols = hole_common::plugin::plugin_alloc_protocols(binary);
+    // Size the handoff port by the on-disk binary name —
+    // `plugin_alloc_protocols` is keyed by it, so `v2ray-plugin` (→ `ex-ray`)
+    // gets a TCP-only port while galoshes gets a UDP-capable one (#414).
+    let protocols = hole_common::plugin::plugin_alloc_protocols(descriptor.binary_name);
     // Built before `bind_ephemeral` so every bind-retry attempt feeds the same
     // ring — a losing attempt's output explains the retry.
     let log = crate::proxy::plugin_log::PluginLog::new();
@@ -288,7 +289,7 @@ fn resolve_tap_source(diagnostic_tap: bool) -> TapSource {
 #[allow(clippy::too_many_arguments)] // 11 args — bundling into a struct adds more noise than the warning.
 async fn spawn_plugin_runner_at(
     plugin_name: &str,
-    plugin_path: &str,
+    plugin_path: &PluginPath,
     merged_opts: Option<&str>,
     local_addr: SocketAddr,
     server_host: &str,
@@ -307,7 +308,8 @@ async fn spawn_plugin_runner_at(
     ),
     ProxyError,
 > {
-    let mut plugin = garter::BinaryPlugin::new(plugin_path, merged_opts).readiness(readiness_for(plugin_name));
+    let mut plugin =
+        garter::BinaryPlugin::new(plugin_path.as_path(), merged_opts).readiness(readiness_for(plugin_name));
     // Before the tap wrap: `TapPlugin` delegates `run`, so the sink still fires.
     plugin = plugin.log_sink(log.sink());
 
@@ -1284,8 +1286,8 @@ fn inject_plugin_directives(
 /// handshake, so [`ReadinessMode::ExpectSitrep`] reads their AUTHORITATIVE
 /// transports — the UDP-drop policy needs `tcp,udp` from galoshes, which the
 /// `Probe` self-probe (a TCP connect, hardcoded TCP-only) would discard (#536).
-/// An unknown plugin (an arbitrary binary resolved via PATH — see
-/// [`resolve_plugin_path`] / #414) may not speak sitrep, so it keeps the
+/// A name outside the bundled set (the bridge refuses those before reaching
+/// here — see [`resolve_plugin_path_inner`]) may not speak sitrep, so it keeps the
 /// conservative `Probe` readiness rather than hanging until the readiness
 /// timeout waiting for a sitrep that never comes.
 ///
