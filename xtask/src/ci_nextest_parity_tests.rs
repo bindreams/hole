@@ -3,7 +3,9 @@
 
 use std::fs;
 
-use crate::ci_nextest_parity::{post_build_cargo_launches, target_nextest_run, test_job, NO_COMPILE_GATE};
+use crate::ci_nextest_parity::{
+    post_build_cargo_launches, quiet_post_build_cargo_steps, target_nextest_run, test_job, NO_COMPILE_GATE,
+};
 use crate::manifest::Manifest;
 
 // ===== test_job ======================================================================================================
@@ -553,6 +555,146 @@ fn a_job_with_no_build_step_is_an_error_for_the_post_build_scan() {
     assert!(format!("{err:#}").contains("hole-"), "unexpected error: {err:#}");
 }
 
+// ===== quiet_post_build_cargo_steps ==================================================================================
+
+/// A job whose build step is followed by `steps`, each a `(name, run)` pair.
+fn job_with_steps(steps: &[(&str, &str)]) -> String {
+    let mut ci =
+        String::from("jobs:\n  j:\n    steps:\n      - id: hole-build\n        run: cargo xtask build tests\n");
+    for (name, run) in steps {
+        ci.push_str(&format!("      - name: {name}\n        run: {run}\n"));
+    }
+    ci
+}
+
+const QUIET_ALIAS_CONFIG: &str = "[alias]\nxtask = \"run --package xtask --quiet --\"\n";
+
+/// `--quiet` hides cargo's `Compiling` lines, the only thing the gate reads, so
+/// a gated step that runs through an alias carrying it can never fail the gate.
+#[skuld::test]
+fn a_step_through_an_alias_that_carries_quiet_is_reported() {
+    let ci = job_with_steps(&[("via alias", ".github/scripts/fail-on-compile.sh cargo xtask verify-a")]);
+    let quiet = quiet_post_build_cargo_steps(&ci, "j", "hole-", QUIET_ALIAS_CONFIG).expect("analyze");
+    assert_eq!(quiet, vec!["via alias"]);
+}
+
+#[skuld::test]
+fn an_alias_given_as_an_array_is_read_too() {
+    let config = "[alias]\nxtask = [\"run\", \"--package\", \"xtask\", \"-q\", \"--\"]\n";
+    let ci = job_with_steps(&[("via alias", ".github/scripts/fail-on-compile.sh cargo xtask verify-a")]);
+    let quiet = quiet_post_build_cargo_steps(&ci, "j", "hole-", config).expect("analyze");
+    assert_eq!(quiet, vec!["via alias"]);
+}
+
+/// An alias may name another alias; cargo expands until none is left.
+#[skuld::test]
+fn quiet_reached_through_a_chain_of_aliases_is_reported() {
+    let config = "[alias]\nx = \"xtask\"\nxtask = \"run --package xtask --quiet --\"\n";
+    let ci = job_with_steps(&[("chained", ".github/scripts/fail-on-compile.sh cargo x verify-a")]);
+    let quiet = quiet_post_build_cargo_steps(&ci, "j", "hole-", config).expect("analyze");
+    assert_eq!(quiet, vec!["chained"]);
+}
+
+/// An alias that names itself must end the walk, not loop it.
+#[skuld::test]
+fn a_self_referential_alias_terminates() {
+    let config = "[alias]\nloop = \"loop\"\n";
+    let ci = job_with_steps(&[("loops", ".github/scripts/fail-on-compile.sh cargo loop")]);
+    let quiet = quiet_post_build_cargo_steps(&ci, "j", "hole-", config).expect("analyze");
+    assert_eq!(quiet, Vec::<String>::new());
+}
+
+#[skuld::test]
+fn quiet_flags_on_the_command_line_are_reported() {
+    let ci = job_with_steps(&[
+        (
+            "long",
+            ".github/scripts/fail-on-compile.sh cargo run --package xtask --quiet -- verify-a",
+        ),
+        (
+            "short",
+            ".github/scripts/fail-on-compile.sh cargo run -q --package xtask -- verify-a",
+        ),
+        (
+            "cluster",
+            ".github/scripts/fail-on-compile.sh cargo run -qq --package xtask -- verify-a",
+        ),
+        (
+            "nextest",
+            ".github/scripts/fail-on-compile.sh cargo nextest run --cargo-quiet",
+        ),
+        (
+            "after the flag terminator",
+            ".github/scripts/fail-on-compile.sh cargo run --package xtask -- verify-a -q",
+        ),
+        (
+            "loud",
+            ".github/scripts/fail-on-compile.sh cargo run --package xtask -- verify-a",
+        ),
+    ]);
+    let quiet = quiet_post_build_cargo_steps(&ci, "j", "hole-", "").expect("analyze");
+    // `-q` after `--` belongs to the program, not to cargo.
+    assert_eq!(quiet, vec!["long", "short", "cluster", "nextest"]);
+}
+
+/// `[term] quiet = true` quiets every cargo the repository runs.
+#[skuld::test]
+fn quiet_set_for_all_of_cargo_is_reported() {
+    let ci = job_with_steps(&[(
+        "plain",
+        ".github/scripts/fail-on-compile.sh cargo run --package xtask -- verify-a",
+    )]);
+    let quiet = quiet_post_build_cargo_steps(&ci, "j", "hole-", "[term]\nquiet = true\n").expect("analyze");
+    assert_eq!(quiet, vec!["plain"]);
+}
+
+#[skuld::test]
+fn quiet_set_through_the_environment_is_reported() {
+    let ci = "
+env:
+  CARGO_TERM_QUIET: true
+jobs:
+  j:
+    env:
+      OTHER: 1
+    steps:
+      - id: hole-build
+        run: cargo xtask build tests
+      - name: workflow level
+        run: cargo run --package xtask -- verify-a
+      - name: step level
+        env:
+          CARGO_TERM_QUIET: true
+        run: cargo run --package xtask -- verify-b
+";
+    let quiet = quiet_post_build_cargo_steps(ci, "j", "hole-", "").expect("analyze");
+    assert_eq!(quiet, vec!["workflow level", "step level"]);
+
+    let ci_job = ci
+        .replace("env:\n  CARGO_TERM_QUIET: true\njobs:", "jobs:")
+        .replace("OTHER: 1", "CARGO_TERM_QUIET: true");
+    let quiet = quiet_post_build_cargo_steps(&ci_job, "j", "hole-", "").expect("analyze");
+    assert_eq!(quiet, vec!["workflow level", "step level"]);
+}
+
+#[skuld::test]
+fn a_loud_step_and_an_unrelated_alias_are_not_reported() {
+    let config = "[alias]\nxtask = \"run --package xtask --quiet --\"\n";
+    let ci = job_with_steps(&[
+        (
+            "loud",
+            ".github/scripts/fail-on-compile.sh cargo run --package xtask -- verify-a",
+        ),
+        (
+            "lane",
+            ".github/scripts/fail-on-compile.sh cargo nextest run -E 'package(a)'",
+        ),
+        ("no cargo", "echo xtask --quiet"),
+    ]);
+    let quiet = quiet_post_build_cargo_steps(&ci, "j", "hole-", config).expect("analyze");
+    assert_eq!(quiet, Vec::<String>::new());
+}
+
 // ===== conformance ===================================================================================================
 
 /// `hole-` steps of `ci.yaml`'s `ci` job that we require to be nextest runs.
@@ -646,6 +788,23 @@ fn every_cargo_step_after_hole_build_runs_under_the_no_compile_gate() {
     assert!(
         root.join(NO_COMPILE_GATE).is_file(),
         "{NO_COMPILE_GATE} is referenced by ci.yaml but missing"
+    );
+}
+
+/// The gate reads cargo's `Compiling` lines, and `--quiet` (here via the
+/// `cargo xtask` alias) is exactly what hides them: a quiet step recompiles and
+/// passes. Gated steps must therefore invoke cargo loudly.
+#[skuld::test]
+fn no_cargo_step_after_hole_build_hides_cargos_compiling_lines() {
+    let root = crate::repo_root().expect("repo root");
+    let ci_yaml = fs::read_to_string(root.join(".github/workflows/ci.yaml")).expect("read ci.yaml");
+    let cargo_config = fs::read_to_string(root.join(".cargo/config.toml")).expect("read .cargo/config.toml");
+    let quiet = quiet_post_build_cargo_steps(&ci_yaml, "ci", "hole-", &cargo_config).expect("analyze ci.yaml");
+    assert_eq!(
+        quiet,
+        Vec::<String>::new(),
+        "these steps run cargo quietly after hole-build, so the no-compile gate cannot see a compile; \
+         invoke `cargo run --package xtask --` instead of the quiet `cargo xtask` alias"
     );
 }
 

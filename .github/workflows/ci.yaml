@@ -18,12 +18,13 @@ jobs:
   # select, in a fixed order, on one target dir and one sccache. Every lane step
   # carries `!cancelled()`, so one failing lane hides nothing, and its own
   # `timeout-minutes`, so a hang fails that step and the later lanes still run,
-  # instead of running into the job wall, which cancels them (#989). Every lane gates the merge: no `continue-on-error`,
-  # and a rerun repeats the whole platform job. The xtask audits that read this
-  # file (`ci_platform_coverage`, `ci_timeouts`, `ci_nextest_parity`,
-  # `skuld_label_coverage`, `global_net_state_conformance`) address lanes by
-  # step id, so ids are API: `hole-*` is the Hole test lane, `installer-*` and
-  # `dmg` assemble an installer.
+  # instead of running into the job wall, which cancels them (#989). Every lane
+  # gates the merge: no `continue-on-error`, and a rerun repeats the whole
+  # platform job. The xtask audits that read this file (`ci_platform_coverage`,
+  # `ci_timeouts`, `ci_nextest_parity`, `skuld_label_coverage`,
+  # `global_net_state_conformance`) address lanes by step id, so ids are API:
+  # `hole-*` is the Hole test lane, `installer-*` and `dmg` assemble an
+  # installer.
   #
   # ORDER matters, and the audits hold it:
   #   - Everything that rebuilds the ex-ray/galoshes sidecars (plugin-e2e, the
@@ -497,7 +498,7 @@ jobs:
         shell: bash
         env:
           CARGO_LOG: cargo::core::compiler::fingerprint=info
-        run: .github/scripts/fail-on-compile.sh cargo xtask verify-skuld-label-coverage
+        run: .github/scripts/fail-on-compile.sh cargo run --package xtask -- verify-skuld-label-coverage
 
       # A rename applied to only one of the two places that must agree — the
       # `.config/nextest.toml` name-substring filter and the skuld label
@@ -519,7 +520,7 @@ jobs:
           CARGO_LOG: cargo::core::compiler::fingerprint=info
         run: >
           .github/scripts/fail-on-compile.sh
-          cargo xtask verify-global-net-state-labels --record target/global-net-state-expected.json
+          cargo run --package xtask -- verify-global-net-state-labels --record target/global-net-state-expected.json
 
       # `--no-default-features` mirrors the `hole-tests` xtask target. Without
       # it Cargo recompiles `hole` with `tauri/custom-protocol` ON (different
@@ -549,6 +550,11 @@ jobs:
       # fingerprint from the build (a leaked environment variable, a build script
       # that reruns on every invocation) while still passing. `CARGO_LOG` makes
       # cargo log why each unit was dirty, so a failure names its cause.
+      #
+      # The gate reads cargo's `Compiling` lines and `--quiet` hides them, which
+      # the `cargo xtask` alias carries, so a gated xtask step runs
+      # `cargo run --package xtask --` instead (same build, same fingerprints).
+      # `no_cargo_step_after_hole_build_hides_cargos_compiling_lines` holds it.
       - id: hole-test-non-tun
         name: Test (non-TUN)
         if: ${{ !cancelled() && steps.hole-build.outcome == 'success' }}
@@ -811,7 +817,7 @@ jobs:
           CARGO_LOG: cargo::core::compiler::fingerprint=info
         run: >
           .github/scripts/fail-on-compile.sh
-          cargo xtask verify-global-net-state-executed
+          cargo run --package xtask -- verify-global-net-state-executed
           --expected target/global-net-state-expected.json
           --junit target/nextest/non-tun/junit.xml
           --junit target/nextest/tun/junit.xml

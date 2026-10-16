@@ -26,7 +26,7 @@
 //! hands the child the value it already has. The latter is how a `sudo env`
 //! child gets back a variable `sudo` dropped.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::{bail, Context, Result};
 use indexmap::IndexMap;
@@ -64,11 +64,15 @@ pub const NO_COMPILE_GATE: &str = ".github/scripts/fail-on-compile.sh";
 
 #[derive(Deserialize)]
 struct CiYaml {
+    #[serde(default)]
+    env: IndexMap<String, serde_yml::Value>,
     jobs: IndexMap<String, Job>,
 }
 
 #[derive(Deserialize)]
 struct Job {
+    #[serde(default)]
+    env: IndexMap<String, serde_yml::Value>,
     #[serde(default)]
     steps: Vec<CiStep>,
 }
@@ -162,6 +166,22 @@ pub fn test_job(ci_yaml: &str, job_id: &str, step_prefix: Option<&str>) -> Resul
 /// compile in a verify step leaves fresh artifacts that mask the drift from
 /// every lane after it. A command mentioning `cargo` as a token is one.
 pub fn post_build_cargo_launches(ci_yaml: &str, job_id: &str, step_prefix: &str) -> Result<Vec<(String, Launch)>> {
+    post_build_cargo_commands(ci_yaml, job_id, step_prefix)?
+        .into_iter()
+        .map(|c| Ok((c.label, split_launch(&c.command)?.0)))
+        .collect()
+}
+
+/// One cargo command that runs after the build step.
+struct PostBuildCommand {
+    /// The step's label.
+    label: String,
+    command: String,
+    /// Whether the workflow, job or step sets [`QUIET_ENV`].
+    env_quiet: bool,
+}
+
+fn post_build_cargo_commands(ci_yaml: &str, job_id: &str, step_prefix: &str) -> Result<Vec<PostBuildCommand>> {
     let target = test_job(ci_yaml, job_id, Some(step_prefix))?.target;
     let ci: CiYaml = serde_yml::from_str(ci_yaml).context("parsing ci.yaml")?;
     let job = ci
@@ -173,17 +193,126 @@ pub fn post_build_cargo_launches(ci_yaml: &str, job_id: &str, step_prefix: &str)
     let mut out = Vec::new();
     for (i, step) in job.steps.iter().enumerate() {
         let Some(run) = &step.run else { continue };
-        for cmd in split_commands(&join_line_continuations(run)) {
+        let env_quiet = [&ci.env, &job.env, &step.env]
+            .iter()
+            .any(|env| env.contains_key(QUIET_ENV));
+        for command in split_commands(&join_line_continuations(run)) {
             if !built {
-                built = xtask_target(&cmd)? == Some(target.as_str());
+                built = xtask_target(&command)? == Some(target.as_str());
                 continue;
             }
-            if cmd.split_whitespace().map(unquote).any(|t| t == "cargo") {
-                out.push((step_label(step, i), split_launch(&cmd)?.0));
+            if command.split_whitespace().map(unquote).any(|t| t == "cargo") {
+                out.push(PostBuildCommand {
+                    label: step_label(step, i),
+                    command,
+                    env_quiet,
+                });
             }
         }
     }
     Ok(out)
+}
+
+/// The steps whose cargo commands after the build step print no `Compiling`
+/// lines, so [`NO_COMPILE_GATE`], which reads only those lines, cannot see them
+/// compile.
+///
+/// A command is quiet when cargo's `--quiet`/`-q` (nextest's `--cargo-quiet`)
+/// reaches it before the `--` that ends cargo's own arguments: written out,
+/// carried by an alias in `cargo_config` (the text of `.cargo/config.toml`,
+/// followed through aliases that name aliases), or implied by `[term] quiet` or
+/// [`QUIET_ENV`] anywhere in the workflow. Over-reporting is loud and costs one
+/// edit; missing a quiet command silently un-gates its step.
+pub fn quiet_post_build_cargo_steps(
+    ci_yaml: &str,
+    job_id: &str,
+    step_prefix: &str,
+    cargo_config: &str,
+) -> Result<Vec<String>> {
+    let config = CargoConfig::parse(cargo_config)?;
+    let mut quiet = Vec::new();
+    for c in post_build_cargo_commands(ci_yaml, job_id, step_prefix)? {
+        let remainder = split_launch(&c.command)?.1;
+        let args: Vec<&str> = remainder
+            .split_whitespace()
+            .map(unquote)
+            .skip_while(|t| *t != "cargo")
+            .skip(1)
+            .collect();
+        if (c.env_quiet || config.quiet || config.is_quiet(&args, &mut BTreeSet::new())) && !quiet.contains(&c.label) {
+            quiet.push(c.label);
+        }
+    }
+    Ok(quiet)
+}
+
+/// The environment variable that quiets every cargo it reaches.
+const QUIET_ENV: &str = "CARGO_TERM_QUIET";
+
+/// The parts of `.cargo/config.toml` that decide whether cargo prints `Compiling`.
+struct CargoConfig {
+    /// `[alias]`, each value as the arguments it expands to.
+    aliases: BTreeMap<String, Vec<String>>,
+    /// `[term] quiet`.
+    quiet: bool,
+}
+
+impl CargoConfig {
+    fn parse(text: &str) -> Result<Self> {
+        let table: toml::Table = text.parse().context("parsing .cargo/config.toml")?;
+        let mut aliases = BTreeMap::new();
+        if let Some(toml::Value::Table(declared)) = table.get("alias") {
+            for (name, value) in declared {
+                let args = match value {
+                    toml::Value::String(s) => s.split_whitespace().map(str::to_string).collect(),
+                    toml::Value::Array(items) => items.iter().filter_map(|v| v.as_str()).map(str::to_string).collect(),
+                    other => bail!(
+                        "alias {name:?} is a {}, expected a string or an array",
+                        other.type_str()
+                    ),
+                };
+                aliases.insert(name.clone(), args);
+            }
+        }
+        let quiet = table
+            .get("term")
+            .and_then(|t| t.get("quiet"))
+            .and_then(toml::Value::as_bool)
+            .unwrap_or(false);
+        Ok(Self { aliases, quiet })
+    }
+
+    /// Does cargo, given `args` (everything after the word `cargo`), run quietly?
+    /// `seen` holds the aliases already expanded on this path: cargo rejects a
+    /// cycle, and the walk ends there too.
+    fn is_quiet(&self, args: &[&str], seen: &mut BTreeSet<String>) -> bool {
+        let own: Vec<&str> = args.iter().copied().take_while(|t| *t != "--").collect();
+        if own.iter().any(|t| is_quiet_flag(t)) {
+            return true;
+        }
+        let Some(subcommand) = own.iter().find(|t| !t.starts_with('-') && !t.starts_with('+')) else {
+            return false;
+        };
+        let Some(expansion) = self.aliases.get(*subcommand) else {
+            return false;
+        };
+        if !seen.insert((*subcommand).to_string()) {
+            return false;
+        }
+        let expanded: Vec<&str> = expansion.iter().map(String::as_str).collect();
+        self.is_quiet(&expanded, seen)
+    }
+}
+
+/// `--quiet`, nextest's `--cargo-quiet`, or a short-flag cluster holding `q`.
+fn is_quiet_flag(tok: &str) -> bool {
+    tok == "--quiet"
+        || tok == "--cargo-quiet"
+        || (tok.starts_with('-')
+            && !tok.starts_with("--")
+            && tok.len() > 1
+            && tok[1..].chars().all(|c| c.is_ascii_alphabetic())
+            && tok.contains('q'))
 }
 
 /// The nextest-RUN command of build.yaml target `name`, normalized the same way
