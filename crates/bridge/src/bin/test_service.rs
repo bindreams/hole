@@ -9,19 +9,43 @@
 //! Optional arguments (the service's ImagePath) for the control-delivery test:
 //! - `--control-log <path>`: append the `Debug` form of every control the
 //!   handler receives to `<path>`, one per line, before the handler returns.
-//! - `--release-event <name>`: on STOP, report STOP_PENDING and hold there until
-//!   the named event is signalled, then report STOPPED.
+//! - `--release-event <name>`: on STOP, hold until the named event is signalled,
+//!   then report STOPPED.
+//! - `--on-stop <stop-pending|stay-running>`: what the held service reports on
+//!   STOP. `stop-pending` (the default) reports STOP_PENDING, which makes the
+//!   SCM refuse further controls; `stay-running` reports nothing, so the SCM
+//!   still sees RUNNING with STOP accepted and delivers every later control.
 
 #[cfg(target_os = "windows")]
 use std::ffi::OsString;
 #[cfg(target_os = "windows")]
 use std::path::PathBuf;
 
+/// What the held service reports to the SCM when it takes a Stop.
+#[cfg(target_os = "windows")]
+#[derive(Default, Clone, Copy)]
+enum OnStop {
+    #[default]
+    ReportStopPending,
+    StayRunning,
+}
+
+#[cfg(target_os = "windows")]
+impl OnStop {
+    fn reports_stop_pending(self) -> bool {
+        match self {
+            OnStop::ReportStopPending => true,
+            OnStop::StayRunning => false,
+        }
+    }
+}
+
 #[cfg(target_os = "windows")]
 #[derive(Default)]
 struct Args {
     control_log: Option<PathBuf>,
     release_event: Option<String>,
+    on_stop: OnStop,
 }
 
 #[cfg(target_os = "windows")]
@@ -35,6 +59,13 @@ fn parse_args(mut raw: impl Iterator<Item = OsString>) -> Args {
         match flag.to_str() {
             Some("--control-log") => args.control_log = Some(PathBuf::from(value)),
             Some("--release-event") => args.release_event = Some(value.into_string().expect("event name is UTF-8")),
+            Some("--on-stop") => {
+                args.on_stop = match value.to_str() {
+                    Some("stop-pending") => OnStop::ReportStopPending,
+                    Some("stay-running") => OnStop::StayRunning,
+                    _ => panic!("unknown --on-stop value {value:?}"),
+                }
+            }
             _ => panic!("unknown flag {flag:?}"),
         }
     }
@@ -85,7 +116,7 @@ fn service_main(_arguments: Vec<OsString>) {
     // `register` returns; no Stop arrives before RUNNING, which is reported after.
     let status_cell: Arc<OnceLock<StatusHandle>> = Arc::new(OnceLock::new());
     let handler_status = Arc::clone(&status_cell);
-    let hold = release.is_some();
+    let report_stop_pending = release.is_some() && args.on_stop.reports_stop_pending();
     let control_log = args.control_log.clone();
     let event_handler = move |control: Control| {
         if let Some(path) = &control_log {
@@ -97,7 +128,7 @@ fn service_main(_arguments: Vec<OsString>) {
             writeln!(file, "{control:?}").expect("write the control log");
         }
         control.handle(|| {
-            if hold {
+            if report_stop_pending {
                 if let Some(handle) = handler_status.get() {
                     let _ = handle.set_service_status(&report(
                         ServiceState::StopPending,

@@ -212,6 +212,18 @@ path = "windows::Win32::NetworkManagement::Dns::DnsFlushResolverCache"
 reason = "Must go through `WinDnsBackend::flush` so unit tests can substitute MockBackend. Only `Win32Real` in `crates/bridge/src/dns/system/windows.rs` may call this. See bindreams/hole#397."
 allow-invalid = true
 
+# Windows service control handler --------------------------------------------------------------------------------------
+#
+# `windows-service`'s `register` frees the handler on the first Stop, Shutdown
+# or Preshutdown while the SCM keeps the pointer, so a later control reads
+# freed memory. `service_ctrl::register` leaks the handler for the process
+# lifetime instead; the crate's registration must not be typed again.
+
+[[disallowed-methods]]
+path = "windows_service::service_control_handler::register"
+reason = "Frees the handler on the first Stop while the SCM still holds it. Register through `service_ctrl::register`, which owns the handler via `service_ctrl::own`."
+allow-invalid = true  # windows-service is a Windows-only dependency; other targets cannot resolve the path.
+
 # Bridge cancellation contract -----------------------------------------------------------------------------------------
 #
 # Fresh `CancellationToken::new()` inside `crates/bridge/src/` defeats

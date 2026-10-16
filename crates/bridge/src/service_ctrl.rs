@@ -85,16 +85,38 @@ impl ControlResult {
 }
 
 /// The `LPHANDLER_FUNCTION_EX` signature the SCM calls.
-pub type RawHandler = unsafe extern "system" fn(u32, u32, *mut c_void, *mut c_void) -> u32;
+type RawHandler = unsafe extern "system" fn(u32, u32, *mut c_void, *mut c_void) -> u32;
 
-/// Hand `handler` to the process for the rest of its life, returning the entry
-/// point and context to register with the SCM. The handler is never dropped, so
-/// no control can reach freed memory.
+/// A handler leaked for the rest of the process, with the entry point that
+/// calls it. The two fields are private and only [`own`] fills them, so an
+/// entry point cannot be paired with another handler's context; `scm`
+/// registers them together.
+#[cfg_attr(not(any(windows, test)), allow(dead_code))] // read by `scm` and by `deliver`
+pub struct OwnedHandler {
+    entry: RawHandler,
+    context: *const c_void,
+}
+
+impl OwnedHandler {
+    /// Deliver `raw` the way the SCM does, through the registered entry point.
+    #[cfg(test)]
+    fn deliver(&self, raw: u32) -> u32 {
+        // SAFETY: `entry` and `context` were paired by `own`; the event
+        // arguments are unused by the entry point.
+        unsafe { (self.entry)(raw, 0, std::ptr::null_mut(), self.context.cast_mut()) }
+    }
+}
+
+/// Hand `handler` to the process for the rest of its life. It is never
+/// dropped, so no control can reach freed memory.
 ///
 /// `Fn + Sync`: the entry point only ever holds a shared reference to it.
-pub fn own<F: Fn(Control) -> ControlResult + Send + Sync + 'static>(handler: F) -> (RawHandler, *const c_void) {
+pub fn own<F: Fn(Control) -> ControlResult + Send + Sync + 'static>(handler: F) -> OwnedHandler {
     let context: &'static F = Box::leak(Box::new(handler));
-    (entry_point::<F>, std::ptr::from_ref(context).cast())
+    OwnedHandler {
+        entry: entry_point::<F>,
+        context: std::ptr::from_ref(context).cast(),
+    }
 }
 
 /// The entry point the SCM calls for every control. The event type and data

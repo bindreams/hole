@@ -10,7 +10,7 @@ use windows::Win32::System::Services::{
 };
 use windows_service::service::{ServiceExitCode, ServiceStatus};
 
-use super::{own, Control, ControlResult, CONTROL_INTERROGATE, CONTROL_SHUTDOWN, CONTROL_STOP};
+use super::{own, Control, ControlResult, OwnedHandler, CONTROL_INTERROGATE, CONTROL_SHUTDOWN, CONTROL_STOP};
 
 const _: () = {
     assert!(CONTROL_STOP == SERVICE_CONTROL_STOP);
@@ -48,9 +48,9 @@ pub fn register<F>(name: &str, handler: F) -> io::Result<StatusHandle>
 where
     F: Fn(Control) -> ControlResult + Send + Sync + 'static,
 {
-    let (entry, context) = own(handler);
+    let OwnedHandler { entry, context } = own(handler);
     // SAFETY: `entry` is a valid `LPHANDLER_FUNCTION_EX` for the context
-    // `own` returned with it, and that context is never freed.
+    // `own` paired it with, and that context is never freed.
     let handle = unsafe { RegisterServiceCtrlHandlerExW(&HSTRING::from(name), Some(entry), Some(context)) }
         .map_err(io::Error::from)?;
     Ok(StatusHandle(handle))

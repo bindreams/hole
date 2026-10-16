@@ -70,19 +70,14 @@ fn handler_survives_every_control_the_scm_can_send_after_a_stop() {
     let seen = Arc::new(Mutex::new(Vec::new()));
     let counter = DropCounter(Arc::clone(&drops));
     let seen_in_handler = Arc::clone(&seen);
-    let (entry, context) = own(move |control| {
+    let owned = own(move |control| {
         let _owned = &counter;
         seen_in_handler.lock().unwrap().push(control);
         ControlResult::Handled
     });
 
-    let deliver = |raw: u32| {
-        // SAFETY: `entry` and `context` come from `own`, which is what the
-        // SCM is handed; the event arguments are unused by the entry point.
-        unsafe { entry(raw, 0, std::ptr::null_mut(), context.cast_mut()) }
-    };
     for raw in [STOP, INTERROGATE, STOP, SHUTDOWN, PRESHUTDOWN, INTERROGATE] {
-        assert_eq!(deliver(raw), NO_ERROR, "control {raw:#x}");
+        assert_eq!(owned.deliver(raw), NO_ERROR, "control {raw:#x}");
     }
 
     assert_eq!(
@@ -105,11 +100,10 @@ fn handler_survives_every_control_the_scm_can_send_after_a_stop() {
 
 #[skuld::test]
 fn entry_point_returns_the_handlers_result_code() {
-    let (entry, context) = own(|control| match control {
+    let owned = own(|control| match control {
         Control::Interrogate => ControlResult::Handled,
         _ => ControlResult::NotImplemented,
     });
-    let deliver = |raw: u32| unsafe { entry(raw, 0, std::ptr::null_mut(), context.cast_mut()) };
-    assert_eq!(deliver(INTERROGATE), NO_ERROR);
-    assert_eq!(deliver(PAUSE), ERROR_CALL_NOT_IMPLEMENTED);
+    assert_eq!(owned.deliver(INTERROGATE), NO_ERROR);
+    assert_eq!(owned.deliver(PAUSE), ERROR_CALL_NOT_IMPLEMENTED);
 }
