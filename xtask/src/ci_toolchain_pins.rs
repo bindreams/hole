@@ -65,6 +65,9 @@ struct Step {
     if_: Option<String>,
     #[serde(default)]
     name: Option<String>,
+    /// A bool or a `${{ }}` expression; see [`Step::may_fail_without_failing_job`].
+    #[serde(default, rename = "continue-on-error")]
+    continue_on_error: Option<serde_yml::Value>,
     #[serde(default)]
     uses: Option<String>,
     #[serde(default)]
@@ -73,6 +76,38 @@ struct Step {
     /// we only care that it is present and non-empty.
     #[serde(default)]
     with: Option<BTreeMap<String, serde_yml::Value>>,
+}
+
+impl Step {
+    /// Can this step fail while the job's `success()` stays true? Anything but
+    /// an absent key or a literal `false` may: an expression is not evaluated.
+    fn may_fail_without_failing_job(&self) -> bool {
+        !matches!(&self.continue_on_error, None | Some(serde_yml::Value::Bool(false)))
+    }
+}
+
+/// A step that reads the pin file, as a later step sees it.
+struct Reader {
+    if_: Option<String>,
+    /// Set when the reader may fail with the job still succeeding.
+    may_fail_without_failing_job: bool,
+}
+
+impl Reader {
+    /// Can a consumer with `consumer_if` run when this reader's output is unset?
+    fn consumer_may_outrun(&self, consumer_if: &Option<String>) -> bool {
+        match (&self.if_, consumer_if) {
+            // A reader that may fail without failing the job leaves `success()`
+            // true, so neither the consumer's implicit `success()` nor a
+            // matching condition proves its output is set.
+            _ if self.may_fail_without_failing_job => true,
+            // Reader has no `if:` and fails the job: a consumer with no status
+            // function implies `success()`, so the reader already ran.
+            (None, Some(consumer)) => if_admits_failed_predecessor(consumer),
+            (None, None) => false,
+            (Some(_), _) => !if_conditions_match(consumer_if, &self.if_),
+        }
+    }
 }
 
 /// One step that installs a toolchain without naming the pin.
@@ -286,6 +321,77 @@ fn if_conditions_match(a: &Option<String>, b: &Option<String>) -> bool {
     }
 }
 
+/// Can a step with this `if:` run after an earlier step in its job failed,
+/// was cancelled, or was skipped?
+///
+/// A step with no status function in its `if:` gets an implicit `success()`.
+/// Any of `always()`, `failure()`, `cancelled()` drops it. So does a written
+/// `success()` unless it is a top-level `&&` conjunct: anywhere else (under a
+/// top-level `||`, in a call or a group, beside `!` or a comparison) it is a
+/// value, not the guard. The answer is conservative: when in doubt, it admits.
+/// GitHub matches function names case-insensitively.
+fn if_admits_failed_predecessor(raw: &str) -> bool {
+    let expr = normalize_if_expr(raw).to_ascii_lowercase();
+
+    let mut code = String::with_capacity(expr.len());
+    let mut in_literal = false;
+    for c in expr.chars() {
+        if c == '\'' {
+            in_literal = !in_literal;
+            code.push(' ');
+        } else {
+            code.push(if in_literal { ' ' } else { c });
+        }
+    }
+    let code: String = code.split_whitespace().collect::<Vec<_>>().join("");
+
+    let calls = |name: &str| code.matches(&format!("{name}(")).count();
+    if calls("always") + calls("failure") + calls("cancelled") > 0 {
+        return true;
+    }
+    if calls("success") == 0 {
+        return false;
+    }
+    if has_top_level_or(&code) {
+        return true;
+    }
+    // Every `success(` must be a whole `success()` that is a top-level conjunct.
+    code.match_indices("success(")
+        .any(|(i, _)| !is_top_level_conjunct(&code, i, "success()"))
+}
+
+/// Is there a `||` outside every pair of parentheses? `code` has its string
+/// literals blanked.
+fn has_top_level_or(code: &str) -> bool {
+    let mut depth = 0usize;
+    let bytes = code.as_bytes();
+    for (i, &b) in bytes.iter().enumerate() {
+        match b {
+            b'(' => depth += 1,
+            b')' => depth = depth.saturating_sub(1),
+            b'|' if depth == 0 && bytes.get(i + 1) == Some(&b'|') => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
+/// Is `call` at byte `at` of `code` a whole operand of a top-level `&&`:
+/// outside every parenthesis and touching only `&&` or an end of the
+/// expression?
+fn is_top_level_conjunct(code: &str, at: usize, call: &str) -> bool {
+    let end = at + call.len();
+    if !code[at..].starts_with(call) {
+        return false;
+    }
+    let depth = code[..at].bytes().fold(0isize, |d, b| match b {
+        b'(' => d + 1,
+        b')' => d - 1,
+        _ => d,
+    });
+    depth == 0 && (at == 0 || code[..at].ends_with("&&")) && (end == code.len() || code[end..].starts_with("&&"))
+}
+
 /// Resolves which local composite actions read the Rust toolchain pin file,
 /// directly or transitively through calls to other local composite actions.
 ///
@@ -354,7 +460,7 @@ pub fn audit_checkout_gating(
     let mut out = Vec::new();
     for (job_name, steps, is_composite) in jobs.chain(composite) {
         let mut last_checkout_if: Option<Option<String>> = None;
-        let mut reader_if: BTreeMap<String, Option<String>> = BTreeMap::new();
+        let mut readers: BTreeMap<String, Reader> = BTreeMap::new();
 
         for step in &steps.steps {
             if is_checkout(step) {
@@ -410,19 +516,25 @@ pub fn audit_checkout_gating(
                 }
 
                 if let Some(id) = &step.id {
-                    reader_if.insert(id.clone(), step_if.clone());
+                    readers.insert(
+                        id.clone(),
+                        Reader {
+                            if_: step_if.clone(),
+                            may_fail_without_failing_job: step.may_fail_without_failing_job(),
+                        },
+                    );
                 }
             }
 
             // Shape 2: consumes a known reader's output, independent of any checkout.
-            if let Some((_, producer_if)) = reader_if.iter().find(|(id, _)| step_references_output_of(step, id)) {
-                if !if_conditions_match(&step_if, producer_if) {
+            if let Some((_, reader)) = readers.iter().find(|(id, _)| step_references_output_of(step, id)) {
+                if reader.consumer_may_outrun(&step_if) {
                     out.push(UngatedRead {
                         file: file.to_owned(),
                         job: job_name.to_owned(),
                         step: step_label(),
                         step_if: step_if.clone(),
-                        depends_on_if: producer_if.clone(),
+                        depends_on_if: reader.if_.clone(),
                     });
                 }
             }

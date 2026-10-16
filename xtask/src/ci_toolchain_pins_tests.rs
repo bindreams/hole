@@ -5,7 +5,9 @@
 use std::collections::BTreeMap;
 use std::fs;
 
-use crate::ci_toolchain_pins::{audit_checkout_gating, audit_document, resolve_local_pin_readers, GO_VERSION_FILE};
+use crate::ci_toolchain_pins::{
+    audit_checkout_gating, audit_document, resolve_local_pin_readers, UngatedRead, GO_VERSION_FILE,
+};
 
 #[skuld::test]
 fn setup_go_naming_the_pinned_go_mod_is_clean() {
@@ -147,6 +149,194 @@ fn consumer_matching_the_readers_condition_is_clean() {
         audit_checkout_gating("action.yaml", yaml, &BTreeMap::new()).unwrap(),
         vec![]
     );
+}
+
+/// An unconditional reader has run and succeeded by the time a consumer with
+/// no status function is reached, so its output is never empty there: the
+/// consumer may carry any such condition of its own.
+#[skuld::test]
+fn consumer_with_its_own_condition_of_an_unconditional_reader_is_clean() {
+    let yaml = "runs:\n  using: composite\n  steps:\n    - id: rust-version\n      run: sed rust-toolchain.toml >> \"$GITHUB_OUTPUT\"\n    - uses: dtolnay/rust-toolchain@master\n      if: ${{ inputs.y }}\n      with:\n        toolchain: ${{ steps.rust-version.outputs.toolchain }}\n";
+    assert_eq!(
+        audit_checkout_gating("action.yaml", yaml, &BTreeMap::new()).unwrap(),
+        vec![]
+    );
+}
+
+/// A reader with `continue-on-error` keeps the job's `success()` true after it
+/// fails, so every consumer may run on its empty output.
+fn reader_with_continue_on_error_consumed_under(continue_on_error: &str, consumer_if: &str) -> Vec<UngatedRead> {
+    let yaml = format!(
+        "runs:\n  using: composite\n  steps:\n    - id: rust-version\n      continue-on-error: {continue_on_error}\n      run: sed rust-toolchain.toml >> \"$GITHUB_OUTPUT\"\n    - uses: dtolnay/rust-toolchain@master\n      if: {consumer_if}\n      with:\n        toolchain: ${{{{ steps.rust-version.outputs.toolchain }}}}\n"
+    );
+    audit_checkout_gating("action.yaml", &yaml, &BTreeMap::new()).unwrap()
+}
+
+#[skuld::test]
+fn consumer_of_a_continue_on_error_reader_with_its_own_condition_is_flagged() {
+    for coe in ["true", "${{ inputs.lenient }}"] {
+        let found = reader_with_continue_on_error_consumed_under(coe, "${{ inputs.y }}");
+        assert_eq!(found.len(), 1, "{coe}: {found:?}");
+        assert_eq!(found[0].depends_on_if, None);
+    }
+}
+
+/// A failed `continue-on-error` reader leaves `success()` true, so even an
+/// unconditional consumer runs on its empty output.
+#[skuld::test]
+fn unconditional_consumer_of_a_continue_on_error_reader_is_flagged() {
+    let yaml = "runs:\n  using: composite\n  steps:\n    - id: rust-version\n      continue-on-error: true\n      run: sed rust-toolchain.toml >> \"$GITHUB_OUTPUT\"\n    - uses: dtolnay/rust-toolchain@master\n      with:\n        toolchain: ${{ steps.rust-version.outputs.toolchain }}\n";
+    let found = audit_checkout_gating("action.yaml", yaml, &BTreeMap::new()).unwrap();
+    assert_eq!(found.len(), 1, "{found:?}");
+}
+
+/// A matching condition proves the reader ran, not that it succeeded.
+#[skuld::test]
+fn matching_consumer_of_a_conditioned_continue_on_error_reader_is_flagged() {
+    let yaml = "runs:\n  using: composite\n  steps:\n    - id: rust-version\n      if: ${{ inputs.y }}\n      continue-on-error: true\n      run: sed rust-toolchain.toml >> \"$GITHUB_OUTPUT\"\n    - uses: dtolnay/rust-toolchain@master\n      if: ${{ inputs.y }}\n      with:\n        toolchain: ${{ steps.rust-version.outputs.toolchain }}\n";
+    let found = audit_checkout_gating("action.yaml", yaml, &BTreeMap::new()).unwrap();
+    assert_eq!(found.len(), 1, "{found:?}");
+}
+
+#[skuld::test]
+fn continue_on_error_false_keeps_the_reader_strictly_succeeding() {
+    let found = reader_with_continue_on_error_consumed_under("false", "${{ inputs.y }}");
+    assert_eq!(found, vec![]);
+}
+
+/// A status function in the consumer's `if:` drops the implicit `success()`,
+/// so the consumer runs after the unconditional reader failed or was skipped,
+/// when the output is empty.
+fn unconditional_reader_consumed_under(consumer_if: &str) -> Vec<UngatedRead> {
+    let yaml = format!(
+        "runs:\n  using: composite\n  steps:\n    - id: rust-version\n      run: sed rust-toolchain.toml >> \"$GITHUB_OUTPUT\"\n    - uses: dtolnay/rust-toolchain@master\n      if: {consumer_if}\n      with:\n        toolchain: ${{{{ steps.rust-version.outputs.toolchain }}}}\n"
+    );
+    audit_checkout_gating("action.yaml", &yaml, &BTreeMap::new()).unwrap()
+}
+
+#[skuld::test]
+fn consumer_under_always_of_an_unconditional_reader_is_flagged() {
+    let found = unconditional_reader_consumed_under("${{ always() }}");
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!(found[0].depends_on_if, None);
+}
+
+#[skuld::test]
+fn consumer_under_failure_of_an_unconditional_reader_is_flagged() {
+    let found = unconditional_reader_consumed_under("failure()");
+    assert_eq!(found.len(), 1, "{found:?}");
+}
+
+#[skuld::test]
+fn consumer_under_cancelled_of_an_unconditional_reader_is_flagged() {
+    let found = unconditional_reader_consumed_under("cancelled()");
+    assert_eq!(found.len(), 1, "{found:?}");
+}
+
+#[skuld::test]
+fn consumer_under_not_cancelled_of_an_unconditional_reader_is_flagged() {
+    let found = unconditional_reader_consumed_under("${{ !cancelled() }}");
+    assert_eq!(found.len(), 1, "{found:?}");
+}
+
+#[skuld::test]
+fn consumer_under_negated_success_of_an_unconditional_reader_is_flagged() {
+    let found = unconditional_reader_consumed_under("${{ !success() }}");
+    assert_eq!(found.len(), 1, "{found:?}");
+}
+
+/// Boolean logic around a status function is not analysed: any status
+/// function drops the implicit `success()`, so `|| inputs.y` can run the
+/// consumer after the reader failed.
+#[skuld::test]
+fn consumer_with_status_function_inside_a_larger_condition_is_flagged() {
+    let found = unconditional_reader_consumed_under("${{ success() || inputs.y }}");
+    assert_eq!(found.len(), 1, "{found:?}");
+}
+
+#[skuld::test]
+fn status_function_name_is_case_insensitive() {
+    let found = unconditional_reader_consumed_under("${{ Always() }}");
+    assert_eq!(found.len(), 1, "{found:?}");
+}
+
+/// A condition on `github.ref` and an input string compare, no status
+/// function, so the implicit `success()` stays.
+#[skuld::test]
+fn consumer_with_a_non_status_condition_of_an_unconditional_reader_is_clean() {
+    let found =
+        unconditional_reader_consumed_under("${{ github.ref == 'refs/heads/main' && inputs.save-cache == 'true' }}");
+    assert_eq!(found, vec![]);
+}
+
+/// An explicit `success()` that is a plain conjunct is the implicit default.
+#[skuld::test]
+fn consumer_with_success_as_a_conjunct_of_an_unconditional_reader_is_clean() {
+    let found = unconditional_reader_consumed_under("${{ success() && inputs.a != 'b' }}");
+    assert_eq!(found, vec![]);
+}
+
+#[skuld::test]
+fn consumer_comparing_success_to_false_is_flagged() {
+    let found = unconditional_reader_consumed_under("${{ success() == false }}");
+    assert_eq!(found.len(), 1, "{found:?}");
+}
+
+/// `success()` is the implicit default only as a top-level `&&` conjunct. As a
+/// call argument, inside a grouping, or beside a comparison it is a value, and
+/// the implicit `success()` is gone.
+#[skuld::test]
+fn consumer_with_success_as_a_call_argument_is_flagged() {
+    for cond in [
+        "${{ format('{0}', success()) == 'false' }}",
+        "${{ toJSON(success()) == 'false' }}",
+        "${{ (success()) == false }}",
+        "${{ (success()) }}",
+        "${{ !(inputs.a && success()) }}",
+        "${{ !(inputs.a && success() && inputs.b) }}",
+    ] {
+        let found = unconditional_reader_consumed_under(cond);
+        assert_eq!(found.len(), 1, "{cond}: {found:?}");
+    }
+}
+
+/// A `!` negates its own operand only: it is `!success()` that drops the
+/// implicit `success()`, not a `!` on another conjunct.
+#[skuld::test]
+fn negating_another_conjunct_keeps_success_a_plain_conjunct() {
+    for cond in [
+        "${{ success() && !inputs.x }}",
+        "${{ !inputs.x && success() }}",
+        "${{ inputs.a != 'b' && success() && !inputs.x }}",
+    ] {
+        let found = unconditional_reader_consumed_under(cond);
+        assert_eq!(found, vec![], "{cond}");
+    }
+}
+
+#[skuld::test]
+fn success_compared_from_either_side_is_flagged() {
+    for cond in ["${{ inputs.x == success() }}", "${{ success() == true }}"] {
+        let found = unconditional_reader_consumed_under(cond);
+        assert_eq!(found.len(), 1, "{cond}: {found:?}");
+    }
+}
+
+/// Only a `||` at the top level lets the step run without `success()`; one
+/// inside a group is just another conjunct.
+#[skuld::test]
+fn or_binds_success_only_at_the_top_level() {
+    let found = unconditional_reader_consumed_under("${{ success() && (inputs.a || inputs.b) }}");
+    assert_eq!(found, vec![]);
+    let found = unconditional_reader_consumed_under("${{ success() && inputs.a || inputs.b }}");
+    assert_eq!(found.len(), 1, "{found:?}");
+}
+
+/// A status function's name inside a string literal is data, not a call.
+#[skuld::test]
+fn status_function_name_in_a_string_literal_is_not_a_status_function() {
+    let found = unconditional_reader_consumed_under("${{ inputs.mode == 'always()' }}");
+    assert_eq!(found, vec![]);
 }
 
 #[skuld::test]

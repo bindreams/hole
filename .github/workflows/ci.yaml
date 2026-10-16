@@ -14,7 +14,9 @@ jobs:
   lint:
     name: Lint
     runs-on: windows-latest
-    timeout-minutes: 15
+    # Passed up to 12m54s (median 9m) over 150 runs to 2026-10-15; 1.25 x 15.1m
+    # (the one kill, a floor) = 18.9m -> 20, the rule `test-hole` uses.
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
         with:
@@ -76,6 +78,9 @@ jobs:
     # to clear the censored region so the true tail becomes observable next
     # time this is re-measured; tighten once it is.
     #
+    # darwin/amd64: up to 42m41s over 150 runs (median 21m47s); wall = 1.25 x
+    # max, rounded up to 5m -> 55, the rule `Test hole` uses.
+    #
     # The other five legs were never killed, so they KEEP the existing 30 —
     # measured here, deliberately not tightened. Their observed maxima would
     # justify lower walls (1.4-2.2x headroom), but a timeout that has never
@@ -99,10 +104,15 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { os: windows, arch: amd64, runner: windows-latest,     timeout: 30 }
-          - { os: darwin,  arch: amd64, runner: macos-15-intel,     timeout: 50 }
-          - { os: darwin,  arch: arm64, runner: macos-latest,       timeout: 30 }
-          - { os: linux,   arch: amd64, runner: ubuntu-latest,      timeout: 30 }
+          # `cache-saver` marks the one job per cargo cache key that saves
+          # `~/.cargo` on `main`. The key is `runner.os` + rustc commit, with
+          # no arch (dtolnay/rust-toolchain's `cachekey`), so it is one per OS:
+          # windows/amd64, darwin/arm64 and linux/amd64. This matrix compiles
+          # the whole workspace, so its `~/.cargo` is the fullest of any job.
+          - { os: windows, arch: amd64, runner: windows-latest,     timeout: 30, cache-saver: true }
+          - { os: darwin,  arch: amd64, runner: macos-15-intel,     timeout: 55 }
+          - { os: darwin,  arch: arm64, runner: macos-latest,       timeout: 30, cache-saver: true }
+          - { os: linux,   arch: amd64, runner: ubuntu-latest,      timeout: 30, cache-saver: true }
           - { os: linux,   arch: arm64, runner: ubuntu-24.04-arm,   timeout: 30 }
           - { os: windows, arch: arm64, runner: windows-11-arm,     timeout: 30 }
     steps:
@@ -111,6 +121,8 @@ jobs:
           fetch-depth: 0
 
       - uses: ./.github/actions/setup-build
+        with:
+          save-cache: ${{ matrix.cache-saver == true }}
 
       - uses: cargo-bins/cargo-binstall@v1.25.2
 
@@ -355,37 +367,34 @@ jobs:
     runs-on: ${{ matrix.runner }}
     # Per-leg, because the legs differ by ~2x: one number would either
     # under-budget darwin/amd64 or push every leg's hang-detection deadline out
-    # to suit the slowest. Whole-job wall clock, 29 runs on `main` (2026-08-27 →
-    # 2026-09-07), re-measured for #989 after darwin/arm64 was killed at its
-    # wall:
+    # to suit the slowest. Whole-job wall clock, last 150 runs of this workflow
+    # (2026-09-11 -> 2026-10-15, main + PRs, every attempt):
     #
-    #   darwin/arm64   19m54s - 43m12s, 1 killed  -> 70
-    #   windows/amd64  23m48s - 42m06s, 0 killed  -> 60  (38-run sample, kept)
-    #   darwin/amd64   22m22s - 72m30s, 8 killed  -> 90  (see below)
+    #                  passed (min / med / max)   killed at wall   reconstructed
+    #                                                              finish of kills
+    #   darwin/amd64   n=74  47m / 70m / 89m28s   14 of 150        84m - 117m
+    #   darwin/arm64   n=91  22m / 41m / 59m34s    0 of 150
     #
-    # darwin/arm64 is what #989 measured. Its old 45 came from a 16m31s-32m01s
-    # sample taken before #893/#982 gave the macOS privileged lane real work,
-    # and before the `hole`→`hole-tests` cascade grew; the leg reached 43m12s
-    # (96% of the wall) on 2026-09-03 and was killed four days later on the
-    # #988 tauri bump, whose cold-ish rebuild pushed `Build hole test binaries`
-    # to 16m36s against 10m54s/11m18s on the two runs before it. Build is the
-    # dominant and most volatile term on this leg (6m42s - 17m48s observed).
-    # 70 is ~1.6x the largest passing run, chosen to clear the censored region
-    # so the true tail becomes observable; tighten once it is.
+    # Kills (cancelled at the wall) are censored; their finish is
+    # reconstructed as the offset of the step they died in plus that leg's p90
+    # for the steps still to run, so the true tail is not the passing max.
     #
-    # NOT a hang: the killed job had already spent 39m54s of its 45 before the
-    # TUN step began, so it was doomed whatever that step did. The step's own
-    # 5m12s sits mid-distribution for the leg (3m18s - 6m24s over 28 passing
-    # runs). See #989 for the full step-by-step timeline.
+    # Rule: wall = 1.25x the worst measured-or-reconstructed finish, rounded up
+    # to 5m. darwin/amd64 1.25 x 117m = 146m -> 150. darwin/arm64 had no kill,
+    # but its 59m34s max sat at 85% of the old 70, so the same rule gives
+    # 1.25 x 59.6m = 74.5m -> 75. Raised only, never tightened: that is the
+    # owner's ruling on CI budgets.
     #
-    # darwin/amd64's 90 is unchanged and still holds: its own distribution was
-    # right-CENSORED by the 45min wall this replaced, and the leg has since been
-    # observed at 72m30s, inside 90 but well past the 56min the censored runs
-    # were reconstructed to. windows/amd64 has never been killed and its 38-run
-    # sample still stands.
+    # NOT a hang: every killed amd64 job was inside the non-TUN or TUN lane,
+    # or past both, with the build step alone at 30m - 52m; the TUN step
+    # itself runs 9m50s median (13m42s max).
+    #
+    # windows/amd64: passed up to 59m30s; 5 kills in the cache-save post step
+    # (see `cargo-cache`); worst reconstructed finish 61m30s, a floor.
+    # 1.25 x 61.5m -> 80.
     #
     # crash_marker_abort was a confirmed, recurring cause of darwin/amd64
-    # kills — fixed in tombstone (#842); whether 90 can now drop is unmeasured.
+    # kills — fixed in tombstone (#842); whether the wall can now drop is unmeasured.
     #
     # These are whole-JOB budgets, shared across build + verify + test. A slow
     # build therefore eats the test steps' headroom — which is exactly how #989
@@ -402,9 +411,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { os: windows, arch: amd64, runner: windows-latest, timeout: 60 }
-          - { os: darwin,  arch: amd64, runner: macos-15-intel, timeout: 90 }
-          - { os: darwin,  arch: arm64, runner: macos-latest,   timeout: 70 }
+          - { os: windows, arch: amd64, runner: windows-latest, timeout: 80 }
+          - { os: darwin,  arch: amd64, runner: macos-15-intel, timeout: 150 }
+          - { os: darwin,  arch: arm64, runner: macos-latest,   timeout: 75 }
     steps:
       - uses: actions/checkout@v7
         with:
@@ -489,24 +498,25 @@ jobs:
       # be kept in step with the job budgets above for no measured gain.
       #
       # DISCLOSED RESIDUAL (hung TUN step): these are not a guarantee that the
-      # step always loses the race to the job wall. On the windows leg (60) a
-      # hung TUN step can still reach the wall first when the build and
-      # non-TUN steps both run long (17 + 4 + 19 + 25 = 65, already past the
-      # wall on its own). The #999 execution proof step below does NOT add to
-      # this sum: its `if:` names no status function, so GitHub ANDs in
-      # `success()`, and a failed/timed-out TUN step makes that condition
-      # false — the proof step is skipped, not run, and spends none of its
-      # budget. Bounding the 65 away would mean either budgets too tight to
-      # survive an honest slow run or a wall raised past what the measurements
-      # support, so it is left stated rather than fixed; the common case — one
-      # step hangs while the others run normally — is covered on every leg.
+      # step always loses the race to the job wall. At the measured maxima a
+      # hung TUN step still fails first (windows: 17 + 4 + 19 + 25 = 65, under
+      # the 80 wall), but a build or non-TUN step running past its measured
+      # maximum hands the hung step to the job wall. The #999 execution proof
+      # step below does NOT add to this sum: its `if:` names no status
+      # function, so GitHub ANDs in `success()`, and a failed/timed-out TUN step makes that
+      # condition false — the proof step is skipped, not run, and spends none
+      # of its budget. Bounding a hung step away entirely would mean either
+      # budgets too tight to survive an honest slow run or a wall raised past
+      # what the measurements support, so it is left stated rather than fixed;
+      # the common case — one step hangs while the others run normally — is
+      # covered on every leg.
       #
       # DISCLOSED RESIDUAL (thin post-TUN margin): a SLOW-BUT-PASSING TUN step
       # — one that stays under its own 25-minute step budget rather than
       # hanging — reaches the #999 execution proof step with whatever wall
       # remains after build + both verify steps + non-TUN + TUN, and the
       # per-step budgets above do not bound that remainder: they cap each step
-      # alone, not their sum against the shared 60-minute wall. If what is
+      # alone, not their sum against the shared job wall. If what is
       # left is under the proof step's own 3-minute budget, the JOB wall can
       # kill the whole job mid-proof instead of letting the step's own timeout
       # fail it cleanly — the exact #989/#970 failure mode this per-step
@@ -778,8 +788,9 @@ jobs:
     # The installer-assembly budget, held equal to `test-dmg-signing` by
     # `ci_installer_assembly_jobs_share_a_timeout_budget`. Sized for a cold
     # sccache: GitHub evicts cache entries untouched for 7 days, so the first
-    # run after a quiet week compiles the workspace from scratch.
-    timeout-minutes: 60
+    # run after a quiet week compiles the workspace from scratch. This job's
+    # own max over 150 runs is 29m54s.
+    timeout-minutes: 80
     env:
       # renovate: datasource=github-releases depName=gerardog/gsudo
       GSUDO_VERSION: "2.6.1"
@@ -992,7 +1003,10 @@ jobs:
     # runner across every phase — ~25 min on a warm sccache, and 45m45s measured
     # on a fully cold one (5% hit rate, the first run after a 7-day cache
     # eviction).
-    timeout-minutes: 60
+    #
+    # darwin/amd64 passed up to 59m12s (median 34m) over 150 runs and was
+    # killed once at 60m24s (a floor): 1.25 x 60.4m -> 80.
+    timeout-minutes: 80
     strategy:
       fail-fast: false
       matrix:
@@ -1003,6 +1017,12 @@ jobs:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
+
+      # Local time, the zone `log show --start` reads, so the capture below
+      # spans the job's lifetime whatever `timeout-minutes` is.
+      - name: Record job start
+        shell: bash
+        run: echo "JOB_START=$(date +'%Y-%m-%d %H:%M:%S')" >> "$GITHUB_ENV"
 
       - uses: astral-sh/setup-uv@v10.2.0
       - uses: ./.github/actions/setup-build
@@ -1018,7 +1038,6 @@ jobs:
       # pytest mount) to diagnose the next occurrence (#446). Note `if: failure()`
       # does not fire when a timeout kills the job — that surfaces as `cancelled`,
       # so a budget overrun leaves no diagnostics here.
-      # `--last 60m` spans the job's whole lifetime (timeout-minutes: 60).
       - name: Capture DiskArbitration/hdiutil state on failure
         if: failure()
         shell: bash
@@ -1029,7 +1048,7 @@ jobs:
           hdiutil info    > "$OUT/hdiutil-info.txt" 2>&1
           ls -la /Volumes > "$OUT/volumes.txt"      2>&1
           mount           > "$OUT/mount.txt"        2>&1
-          log show --last 60m --predicate \
+          log show --start "$JOB_START" --predicate \
             'process == "diskarbitrationd" OR process == "diskimagesiod" OR process == "mds" OR process == "mds_stores"' \
             > "$OUT/diskarb-log.txt" 2>&1
           echo "captured DMG-flake diagnostics to $OUT"
@@ -1066,13 +1085,11 @@ jobs:
       - uses: ./.github/actions/setup-rust
         id: setup-rust
 
-      - uses: actions/cache@v6
+      # Restore only: the `Linux` key is saved by `build` (linux/amd64); see
+      # `.github/actions/setup-build/action.yaml`.
+      - uses: ./.github/actions/cargo-cache
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-          key: cargo-${{ runner.os }}-${{ steps.setup-rust.outputs.cachekey }}-${{ hashFiles('Cargo.lock') }}
-          restore-keys: cargo-${{ runner.os }}-${{ steps.setup-rust.outputs.cachekey }}-
+          cachekey: ${{ steps.setup-rust.outputs.cachekey }}
 
       - name: Build frontend
         run: cargo xtask build frontend-build
