@@ -77,7 +77,13 @@ pub fn log_snapshot(phase: &'static str) {
     );
     // Run directly by absolute path, not as a command inside PowerShell, which
     // would find `pnputil` through the process `PATH`.
-    let drivers = run_tool_probe("pnputil", SystemTool::Pnputil, &["/enum-drivers"]);
+    let drivers = report_probe(
+        "pnputil",
+        SystemTool::Pnputil.command().map(|mut c| {
+            c.arg("/enum-drivers");
+            c
+        }),
+    );
 
     let adapter_matches = watched_matches(&adapters);
     let binding_matches = watched_matches(&bindings);
@@ -140,12 +146,14 @@ pub fn log_snapshot(phase: &'static str) {
 /// would force every probe to fail the whole snapshot, which is worse
 /// than "one probe says nothing, three others proceed."
 fn run_probe(label: &'static str, ps_command: &str) -> String {
-    run_tool_probe(label, SystemTool::Powershell, &["-NoProfile", "-Command", ps_command])
+    report_probe(label, SystemTool::powershell_command(ps_command))
 }
 
-/// [`run_probe`]'s spawn-and-report half for any [`SystemTool`].
-fn run_tool_probe(label: &'static str, tool: SystemTool, args: &[&str]) -> String {
-    match tool.command().and_then(|mut c| c.args(args).output()) {
+/// Run `built` and return its stdout, or the error marker string [`run_probe`]
+/// describes: a command that could not be built or spawned yields
+/// `<probe '...' failed to spawn: ...>`.
+fn report_probe(label: &'static str, built: std::io::Result<std::process::Command>) -> String {
+    match built.and_then(|mut c| c.output()) {
         Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).into_owned(),
         Ok(o) => format!(
             "<probe '{label}' exited {:?}; stderr: {}>",

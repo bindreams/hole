@@ -89,10 +89,24 @@ fn windows_tools_live_under_the_system_directory() {
 
 #[skuld::test]
 fn display_with_is_the_absolute_path_then_the_arguments() {
-    let tool = SystemTool::ALL[0];
-    let path = tool.path().unwrap().display().to_string();
-    assert_eq!(tool.display_with::<&str>(&[]), path);
-    assert_eq!(tool.display_with(&["-n", "add"]), format!("{path} -n add"));
+    for &tool in SystemTool::ALL {
+        let path = tool.path().unwrap().display().to_string();
+        assert_eq!(tool.display_with::<&str>(&[]), path, "{tool:?}");
+        assert_eq!(tool.display_with(&["-n", "add"]), format!("{path} -n add"), "{tool:?}");
+    }
+}
+
+/// The text is only logged, never run, so an unavailable path names the tool.
+#[skuld::test]
+fn display_names_the_tool_when_its_path_is_unavailable() {
+    for &tool in SystemTool::ALL {
+        let unavailable = || Err(std::io::Error::other("no system directory"));
+        assert_eq!(
+            tool.display_from(unavailable(), &["-n", "add"]),
+            format!("{} -n add", tool.name())
+        );
+        assert_eq!(tool.display_from::<&str>(unavailable(), &[]), tool.name());
+    }
 }
 
 /// `name` is what a user-facing error says instead of a path: the program's
@@ -119,8 +133,46 @@ fn a_failing_system_directory_call_is_an_error_not_a_panic() {
     // Reports a length, then fails to fill the buffer.
     assert!(crate::system_tool::read_system_directory(|buf| if buf.is_none() { 8 } else { 0 }).is_err());
     // The buffer filled is not shorter than the reported length (the directory
-    // changed between the two calls): no valid slice to return.
+    // changed between the two calls): no valid slice to return. Both the
+    // grown case and the equal boundary, where the length written would
+    // include a NUL.
     assert!(crate::system_tool::read_system_directory(|buf| if buf.is_none() { 8 } else { 9 }).is_err());
+    assert!(crate::system_tool::read_system_directory(|buf| if buf.is_none() { 8 } else { 8 }).is_err());
+}
+
+/// A failure is not cached: the next call asks the OS again, so one transient
+/// failure does not turn every later spawn into an error.
+#[cfg(windows)]
+#[skuld::test]
+fn a_failed_system_directory_read_is_not_cached() {
+    use std::sync::OnceLock;
+    static CELL: OnceLock<std::path::PathBuf> = OnceLock::new();
+    let calls = std::cell::Cell::new(0u32);
+    let read = |fail: bool| {
+        crate::system_tool::cached_system_directory(&CELL, |buf| {
+            calls.set(calls.get() + 1);
+            match (fail, buf) {
+                (true, _) => 0,
+                (false, None) => 4,
+                (false, Some(b)) => {
+                    for (slot, c) in b.iter_mut().zip("C:\\".encode_utf16()) {
+                        *slot = c;
+                    }
+                    3
+                }
+            }
+        })
+        .cloned()
+    };
+    assert!(read(true).is_err());
+    assert_eq!(read(false).unwrap(), std::path::PathBuf::from("C:\\"));
+    let after_success = calls.get();
+    assert_eq!(
+        read(true).unwrap(),
+        std::path::PathBuf::from("C:\\"),
+        "a cached success is not re-read"
+    );
+    assert_eq!(calls.get(), after_success);
 }
 
 #[cfg(windows)]
@@ -139,39 +191,90 @@ fn the_system_directory_call_returns_what_the_os_wrote() {
     assert_eq!(dir, std::path::PathBuf::from("C:\\"));
 }
 
-/// Every root PowerShell resolves modules from machine-scoped directories
-/// only: the default `PSModulePath` starts with the invoking user's
-/// `Documents\WindowsPowerShell\Modules`, which that user can write. Asks a real
-/// child what it sees.
+/// PowerShell reads single quotes as a string delimiter in their ASCII and
+/// typographic forms alike; each is doubled to stay inside the literal.
+#[skuld::test]
+fn a_powershell_literal_cannot_be_closed_early() {
+    use crate::system_tool::powershell_literal;
+    assert_eq!(powershell_literal("C:\\Win\\Modules"), "'C:\\Win\\Modules'");
+    assert_eq!(powershell_literal("a'b"), "'a''b'");
+    for quote in ['\u{2018}', '\u{2019}', '\u{201A}', '\u{201B}'] {
+        assert_eq!(
+            powershell_literal(&format!("a{quote}b")),
+            format!("'a{quote}{quote}b'"),
+            "U+{:04X}",
+            quote as u32
+        );
+    }
+}
+
+#[skuld::test]
+fn a_powershell_script_starts_by_setting_the_module_path() {
+    use crate::system_tool::module_path_script;
+    assert_eq!(
+        module_path_script(
+            "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\Modules",
+            "Get-NetAdapter"
+        ),
+        "$env:PSModulePath = 'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\Modules'; Get-NetAdapter"
+    );
+}
+
+/// A root PowerShell has no bare-`command()` form: its module path is set by
+/// the script it is given, so the only constructor takes the script.
 #[cfg(windows)]
 #[skuld::test]
-fn powershell_sees_no_user_writable_module_directory() {
+fn powershell_has_no_scriptless_command() {
+    let err = SystemTool::Powershell.command().unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+}
+
+#[cfg(windows)]
+#[skuld::test]
+fn powershell_command_runs_its_script_without_a_profile_after_setting_the_module_path() {
+    let cmd = SystemTool::powershell_command("Get-Date").unwrap();
+    assert_eq!(cmd.get_program(), SystemTool::Powershell.path().unwrap().as_os_str());
+    let args: Vec<_> = cmd.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
+    assert_eq!(&args[..2], ["-NoProfile", "-Command"]);
+    assert_eq!(args.len(), 3);
+    assert!(
+        args[2].starts_with("$env:PSModulePath = '") && args[2].ends_with("; Get-Date"),
+        "{:?}",
+        args[2]
+    );
+}
+
+/// PowerShell keeps a `PSModulePath` that differs from the machine's and
+/// rebuilds one that equals it, putting the invoking user's writable
+/// `Documents\WindowsPowerShell\Modules` first. The script's own assignment
+/// must hold in that case too, so the process value is set to the machine value.
+#[cfg(windows)]
+#[skuld::test]
+fn powershell_sees_only_the_system_module_directory_when_the_process_value_is_the_machine_value() {
     let system32 = SystemTool::Route.path().unwrap().parent().unwrap().to_path_buf();
     let expected = system32.join("WindowsPowerShell").join("v1.0").join("Modules");
-    let out = SystemTool::Powershell
-        .command()
+
+    let machine = SystemTool::powershell_command(
+        "[Console]::Out.Write([Environment]::GetEnvironmentVariable('PSModulePath', 'Machine'))",
+    )
+    .unwrap()
+    .output()
+    .unwrap();
+    assert!(machine.status.success(), "{machine:?}");
+    let machine = String::from_utf8(machine.stdout).unwrap();
+    assert!(!machine.is_empty(), "the machine PSModulePath is unset");
+
+    let out = SystemTool::powershell_command("[Console]::Out.Write($env:PSModulePath)")
         .unwrap()
-        .args(["-NoProfile", "-Command", "[Console]::Out.Write($env:PSModulePath)"])
+        .env("PSModulePath", &machine) // after the pin: the process value now equals the machine value
         .output()
         .unwrap();
     assert!(out.status.success(), "{out:?}");
     let seen = String::from_utf8_lossy(&out.stdout).into_owned();
-    let entries: Vec<&str> = seen.split(';').filter(|e| !e.is_empty()).collect();
     assert!(
-        entries
-            .iter()
-            .any(|e| e.eq_ignore_ascii_case(&expected.to_string_lossy())),
-        "the system module directory is missing from {seen:?}"
+        seen.eq_ignore_ascii_case(&expected.to_string_lossy()),
+        "expected only {expected:?}, saw {seen:?} (machine value {machine:?})"
     );
-    let system_root = std::env::var("SystemRoot").unwrap().to_ascii_lowercase();
-    let program_files = std::env::var("ProgramFiles").unwrap().to_ascii_lowercase();
-    for e in entries {
-        let e = e.to_ascii_lowercase();
-        assert!(
-            e.starts_with(&system_root) || e.starts_with(&program_files),
-            "{e:?} is outside the machine-scoped directories, in {seen:?}"
-        );
-    }
 }
 
 #[cfg(windows)]

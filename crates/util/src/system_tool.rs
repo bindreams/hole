@@ -20,15 +20,31 @@ use std::io;
 use std::path::PathBuf;
 use std::process::Command;
 
+/// Declares `SystemTool` and its `ALL` from one variant list, so a variant
+/// cannot be left out of `ALL`.
+macro_rules! system_tools {
+    ($doc:literal, $($(#[$vmeta:meta])* $variant:ident),+ $(,)?) => {
+        #[doc = $doc]
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+        pub enum SystemTool {
+            $($(#[$vmeta])* $variant),+
+        }
+
+        impl SystemTool {
+            /// Every variant, for tests that must cover the whole set.
+            pub const ALL: &'static [SystemTool] = &[$(Self::$variant),+];
+        }
+    };
+}
+
 #[cfg(target_os = "macos")]
 mod tools {
     use std::io;
     use std::path::PathBuf;
     use std::process::Command;
 
-    /// An OS tool the macOS bridge spawns, at its fixed absolute path.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-    pub enum SystemTool {
+    system_tools! {
+        "An OS tool the macOS bridge spawns, at its fixed absolute path.",
         /// `/sbin/route`
         Route,
         /// `/sbin/ifconfig`
@@ -52,20 +68,6 @@ mod tools {
     }
 
     impl SystemTool {
-        /// Every variant, for tests that must cover the whole set.
-        pub const ALL: &'static [SystemTool] = &[
-            Self::Route,
-            Self::Ifconfig,
-            Self::Pfctl,
-            Self::Networksetup,
-            Self::Dscacheutil,
-            Self::Killall,
-            Self::Launchctl,
-            Self::Dseditgroup,
-            Self::Stat,
-            Self::Logname,
-        ];
-
         /// The tool's absolute path. These are SIP-protected locations that are
         /// stable across the macOS versions Hole supports, so this never fails
         /// here; the `Result` is the Windows signature.
@@ -104,6 +106,11 @@ mod tools {
         pub(super) fn pin_environment(self, _command: &mut Command) -> io::Result<()> {
             Ok(())
         }
+
+        /// Every macOS tool is built by [`command`](SystemTool::command) alone.
+        pub(super) fn ensure_scriptless(self) -> io::Result<()> {
+            Ok(())
+        }
     }
 }
 
@@ -114,9 +121,8 @@ mod tools {
     use std::process::Command;
     use std::sync::OnceLock;
 
-    /// An OS tool the Windows bridge spawns, under the system directory.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-    pub enum SystemTool {
+    system_tools! {
+        "An OS tool the Windows bridge spawns, under the system directory.",
         /// `System32\route.exe`
         Route,
         /// `System32\netsh.exe`
@@ -130,9 +136,6 @@ mod tools {
     }
 
     impl SystemTool {
-        /// Every variant, for tests that must cover the whole set.
-        pub const ALL: &'static [SystemTool] = &[Self::Route, Self::Netsh, Self::Net, Self::Powershell, Self::Pnputil];
-
         /// The tool's absolute path under the OS-reported system directory.
         pub(super) fn resolve_path(self) -> io::Result<PathBuf> {
             let system32 = system_directory()?;
@@ -159,6 +162,9 @@ mod tools {
         /// A root PowerShell autoloads cmdlets from `PSModulePath`, whose default
         /// begins with the invoking user's `Documents\WindowsPowerShell\Modules`
         /// (user-writable), so the child gets only the system module directory.
+        /// This pin alone is not enough: PowerShell rebuilds a `PSModulePath`
+        /// equal to the machine's, so [`SystemTool::powershell_command`] also
+        /// sets it from inside the script.
         /// The other tools resolve nothing by search order once launched by
         /// absolute path.
         pub(super) fn pin_environment(self, command: &mut Command) -> io::Result<()> {
@@ -170,9 +176,23 @@ mod tools {
             }
             Ok(())
         }
+
+        /// Whether [`command`](SystemTool::command) may build this tool without
+        /// more input. A root PowerShell may not: its module path is set by the
+        /// script it runs, so it is built only by
+        /// [`powershell_command`](SystemTool::powershell_command).
+        pub(super) fn ensure_scriptless(self) -> io::Result<()> {
+            match self {
+                Self::Powershell => Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "PowerShell is built with SystemTool::powershell_command, which sets its module path",
+                )),
+                Self::Route | Self::Netsh | Self::Net | Self::Pnputil => Ok(()),
+            }
+        }
     }
 
-    fn powershell_module_directory() -> io::Result<PathBuf> {
+    pub(super) fn powershell_module_directory() -> io::Result<PathBuf> {
         Ok(system_directory()?
             .join("WindowsPowerShell")
             .join("v1.0")
@@ -183,15 +203,24 @@ mod tools {
     /// asks the OS again.
     fn system_directory() -> io::Result<&'static PathBuf> {
         static DIR: OnceLock<PathBuf> = OnceLock::new();
-        if let Some(dir) = DIR.get() {
-            return Ok(dir);
-        }
-        let dir = read_system_directory(|buf| {
+        cached_system_directory(&DIR, |buf| {
             use windows::Win32::System::SystemInformation::GetSystemDirectoryW;
             // SAFETY: `GetSystemDirectoryW` writes only into the slice it is given.
             unsafe { GetSystemDirectoryW(buf) }
-        })?;
-        Ok(DIR.get_or_init(|| dir))
+        })
+    }
+
+    /// [`read_system_directory`] behind `cell`: a success is kept, a failure
+    /// leaves `cell` empty so the next call reads again.
+    pub(crate) fn cached_system_directory(
+        cell: &'static OnceLock<PathBuf>,
+        get: impl FnMut(Option<&mut [u16]>) -> u32,
+    ) -> io::Result<&'static PathBuf> {
+        if let Some(dir) = cell.get() {
+            return Ok(dir);
+        }
+        let dir = read_system_directory(get)?;
+        Ok(cell.get_or_init(|| dir))
     }
 
     /// `GetSystemDirectoryW`'s two-call protocol over an injectable `get`: with
@@ -225,7 +254,7 @@ pub use tools::SystemTool;
 
 #[cfg(windows)]
 #[cfg(test)]
-pub(crate) use tools::read_system_directory;
+pub(crate) use tools::{cached_system_directory, read_system_directory};
 
 impl SystemTool {
     /// The tool's absolute path.
@@ -247,8 +276,34 @@ impl SystemTool {
     /// As [`path`](Self::path).
     #[allow(clippy::disallowed_methods)] // this IS the sanctioned constructor; clippy.toml routes every other site here
     pub fn command(self) -> io::Result<Command> {
+        self.ensure_scriptless()?;
+        self.build()
+    }
+
+    #[allow(clippy::disallowed_methods)] // as `command`
+    fn build(self) -> io::Result<Command> {
         let mut command = Command::new(self.path()?);
         self.pin_environment(&mut command)?;
+        Ok(command)
+    }
+
+    /// The only constructor of a root PowerShell `Command`: `-NoProfile
+    /// -Command <script>`, where the script first sets `$env:PSModulePath` to
+    /// the system module directory. Autoload reads `$env:PSModulePath`, so
+    /// setting it from inside the script holds on a host where PowerShell would
+    /// rebuild the inherited value with the invoking user's writable module
+    /// directory in front.
+    ///
+    /// # Errors
+    ///
+    /// As [`path`](Self::path).
+    #[cfg(windows)]
+    pub fn powershell_command(script: &str) -> io::Result<Command> {
+        let modules = tools::powershell_module_directory()?;
+        let mut command = Self::Powershell.build()?;
+        command
+            .args(["-NoProfile", "-Command"])
+            .arg(module_path_script(&modules.to_string_lossy(), script));
         Ok(command)
     }
 
@@ -256,7 +311,11 @@ impl SystemTool {
     /// path is unavailable (see [`path`](Self::path)) it names the tool instead,
     /// since the text is only ever logged, never run.
     pub fn display_with<S: AsRef<str>>(self, args: &[S]) -> String {
-        let mut out = match self.path() {
+        self.display_from(self.path(), args)
+    }
+
+    fn display_from<S: AsRef<str>>(self, path: io::Result<PathBuf>, args: &[S]) -> String {
+        let mut out = match path {
             Ok(path) => path.display().to_string(),
             Err(_) => self.name().to_string(),
         };
@@ -266,6 +325,28 @@ impl SystemTool {
         }
         out
     }
+}
+
+/// `script` preceded by an assignment of `$env:PSModulePath`.
+#[cfg(any(windows, test))]
+fn module_path_script(modules: &str, script: &str) -> String {
+    format!("$env:PSModulePath = {}; {script}", powershell_literal(modules))
+}
+
+/// `text` as a PowerShell single-quoted string. PowerShell treats U+2018..U+201B
+/// as single quotes too, so each is doubled along with the ASCII one.
+#[cfg(any(windows, test))]
+fn powershell_literal(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() + 2);
+    out.push('\'');
+    for c in text.chars() {
+        out.push(c);
+        if matches!(c, '\'' | '\u{2018}' | '\u{2019}' | '\u{201A}' | '\u{201B}') {
+            out.push(c);
+        }
+    }
+    out.push('\'');
+    out
 }
 
 #[cfg(test)]

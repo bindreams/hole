@@ -73,9 +73,7 @@ pub fn remove_adapter(tun_name: &str) {
 
     let ps = build_remove_adapter_script(tun_name);
 
-    let result = SystemTool::Powershell
-        .command()
-        .and_then(|mut c| c.args(["-NoProfile", "-Command", &ps]).output());
+    let result = SystemTool::powershell_command(&ps).and_then(|mut c| c.output());
 
     match result {
         Ok(out) if out.status.success() => {
